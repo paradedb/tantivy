@@ -3,7 +3,6 @@ use std::ops::BitOr;
 pub use common::DateTimePrecision;
 use serde::{Deserialize, Serialize};
 
-use super::is_false;
 use crate::schema::flags::{FastFlag, IndexedFlag, SchemaFlagList, StoredFlag};
 
 /// The precision of the indexed date/time values in the inverted index.
@@ -15,8 +14,6 @@ pub struct DateOptions {
     indexed: bool,
     // This boolean has no effect if the field is not marked as indexed true.
     fieldnorms: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    posting_norms: bool,
     #[serde(default)]
     fast: bool,
     stored: bool,
@@ -43,19 +40,6 @@ impl DateOptions {
     #[inline]
     pub fn fieldnorms(&self) -> bool {
         self.fieldnorms && self.indexed
-    }
-
-    /// Returns whether posting-local norms are enabled for this field.
-    pub fn posting_norms(&self) -> bool {
-        self.posting_norms && self.fieldnorms()
-    }
-
-    /// Enables posting-local norms for faster top-k BM25 queries, at the cost of more storage
-    /// and longer index builds and merges. Defaults to false; requires indexing and fieldnorms.
-    #[must_use]
-    pub fn set_posting_norms(mut self) -> Self {
-        self.posting_norms = true;
-        self
     }
 
     /// Returns true iff the value is a fast field.
@@ -166,7 +150,6 @@ impl<T: Into<DateOptions>> BitOr<T> for DateOptions {
         DateOptions {
             indexed: self.indexed | other.indexed,
             fieldnorms: self.fieldnorms | other.fieldnorms,
-            posting_norms: self.posting_norms | other.posting_norms,
             stored: self.stored | other.stored,
             fast: self.fast | other.fast,
             precision: self.precision,

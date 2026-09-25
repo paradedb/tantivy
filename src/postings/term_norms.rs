@@ -264,10 +264,7 @@ mod tests {
         use crate::indexer::NoMergePolicy;
         use crate::postings::Postings;
         use crate::query::TermQuery;
-        use crate::schema::{
-            BytesOptions, DateOptions, IndexRecordOption, IpAddrOptions, NumericOptions, Schema,
-            INDEXED, TEXT,
-        };
+        use crate::schema::{IndexRecordOption, Schema, INDEXED, TEXT};
         use crate::{DateTime, DocSet, Index, Term, TERMINATED};
 
         let mut schema = Schema::builder();
@@ -282,12 +279,10 @@ mod tests {
             "unnormed",
             TEXT.set_indexing_options(indexing.set_fieldnorms(false)),
         );
-        let number =
-            schema.add_u64_field("number", NumericOptions::from(INDEXED).set_posting_norms());
-        let date = schema.add_date_field("date", DateOptions::from(INDEXED).set_posting_norms());
-        let bytes =
-            schema.add_bytes_field("bytes", BytesOptions::from(INDEXED).set_posting_norms());
-        let ip = schema.add_ip_addr_field("ip", IpAddrOptions::from(INDEXED).set_posting_norms());
+        let number = schema.add_u64_field("number", INDEXED);
+        let date = schema.add_date_field("date", INDEXED);
+        let bytes = schema.add_bytes_field("bytes", INDEXED);
+        let ip = schema.add_ip_addr_field("ip", INDEXED);
         let schema = schema.build();
         let directory = RamDirectory::create();
         let index = Index::create(directory.clone(), schema.clone(), Default::default())?;
@@ -344,9 +339,10 @@ mod tests {
                     Term::from_field_ip_addr(ip, address),
                 ] {
                     let field = term.field();
-                    assert!(composite.open_read(field).is_some());
+                    let enabled = field == text;
+                    assert_eq!(composite.open_read(field).is_some(), enabled);
                     let inverted = segment.inverted_index(field)?;
-                    assert!(inverted.has_posting_norms());
+                    assert_eq!(inverted.has_posting_norms(), enabled);
                     let norms = segment.get_fieldnorms_reader(field)?;
                     let mut postings = inverted
                         .read_postings(&term, IndexRecordOption::Basic)?
@@ -354,7 +350,7 @@ mod tests {
                     while postings.doc() != TERMINATED {
                         assert_eq!(
                             postings.fieldnorm_id(),
-                            Some(norms.fieldnorm_id(postings.doc()))
+                            enabled.then(|| norms.fieldnorm_id(postings.doc()))
                         );
                         postings.advance();
                     }

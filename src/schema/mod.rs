@@ -155,10 +155,6 @@ pub use self::term::{Term, ValueBytes};
 pub use self::text_options::{TextFieldIndexing, TextOptions, STRING, TEXT};
 pub use self::vector_options::{Metric, VectorDType, VectorOptions};
 
-fn is_false(val: &bool) -> bool {
-    !val
-}
-
 /// Validator for a potential `field_name`.
 /// Returns true if the name can be use for a field name.
 ///

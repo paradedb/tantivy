@@ -222,46 +222,40 @@ mod tests {
             BytesOptions, DateOptions, IpAddrOptions, NumericOptions, FAST, INDEXED,
         };
 
-        for field_type in [
-            FieldType::Str(
-                TEXT.set_indexing_options(TextFieldIndexing::default().set_posting_norms(true))
-                    | FAST,
-            ),
-            FieldType::U64(NumericOptions::from(INDEXED).set_posting_norms() | FAST),
-            FieldType::I64(NumericOptions::from(INDEXED).set_posting_norms() | FAST),
-            FieldType::F64(NumericOptions::from(INDEXED).set_posting_norms() | FAST),
-            FieldType::Bool(NumericOptions::from(INDEXED).set_posting_norms() | FAST),
-            FieldType::Date(DateOptions::from(INDEXED).set_posting_norms() | FAST),
-            FieldType::Bytes(BytesOptions::from(INDEXED).set_posting_norms() | FAST),
-            FieldType::IpAddr(IpAddrOptions::from(INDEXED).set_posting_norms() | FAST),
-        ] {
-            assert!(field_type.has_posting_norms());
-            let mut serialized = serde_json::to_value(&field_type).unwrap();
-            assert_eq!(
-                serde_json::from_value::<FieldType>(serialized.clone()).unwrap(),
-                field_type
-            );
-            let options = if field_type.is_str() {
-                &mut serialized["options"]["indexing"]
-            } else {
-                &mut serialized["options"]
-            };
-            assert_eq!(options["posting_norms"], true);
-            options.as_object_mut().unwrap().remove("posting_norms");
-            let legacy: FieldType = serde_json::from_value(serialized.clone()).unwrap();
-            assert!(!legacy.has_posting_norms());
-            assert_eq!(serde_json::to_value(&legacy).unwrap(), serialized);
-        }
+        let field_type = FieldType::Str(
+            TEXT.set_indexing_options(TextFieldIndexing::default().set_posting_norms(true)) | FAST,
+        );
+        assert!(field_type.has_posting_norms());
+        let mut serialized = serde_json::to_value(&field_type).unwrap();
+        assert_eq!(
+            serde_json::from_value::<FieldType>(serialized.clone()).unwrap(),
+            field_type
+        );
+        let options = &mut serialized["options"]["indexing"];
+        assert_eq!(options["posting_norms"], true);
+        options.as_object_mut().unwrap().remove("posting_norms");
+        let legacy: FieldType = serde_json::from_value(serialized.clone()).unwrap();
+        assert!(!legacy.has_posting_norms());
+        assert_eq!(serde_json::to_value(&legacy).unwrap(), serialized);
         assert!(!TextFieldIndexing::default()
             .set_posting_norms(true)
             .set_fieldnorms(false)
             .posting_norms());
-        assert!(!NumericOptions::default()
-            .set_posting_norms()
-            .posting_norms());
-        assert!(!DateOptions::default().set_posting_norms().posting_norms());
-        assert!(!BytesOptions::default().set_posting_norms().posting_norms());
-        assert!(!IpAddrOptions::default().set_posting_norms().posting_norms());
+
+        for field_type in [
+            FieldType::U64(NumericOptions::from(INDEXED)),
+            FieldType::I64(NumericOptions::from(INDEXED)),
+            FieldType::F64(NumericOptions::from(INDEXED)),
+            FieldType::Bool(NumericOptions::from(INDEXED)),
+            FieldType::Date(DateOptions::from(INDEXED)),
+            FieldType::Bytes(BytesOptions::from(INDEXED)),
+            FieldType::IpAddr(IpAddrOptions::from(INDEXED)),
+        ] {
+            assert!(field_type.has_fieldnorms());
+            assert!(!field_type.has_posting_norms());
+            let serialized = serde_json::to_value(&field_type).unwrap();
+            assert!(serialized["options"].get("posting_norms").is_none());
+        }
     }
 
     #[test]

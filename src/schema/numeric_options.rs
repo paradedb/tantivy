@@ -3,7 +3,6 @@ use std::ops::BitOr;
 use serde::{Deserialize, Serialize};
 
 use super::flags::CoerceFlag;
-use super::is_false;
 use crate::schema::flags::{FastFlag, IndexedFlag, SchemaFlagList, StoredFlag};
 
 /// Define how an `u64`, `i64`, or `f64` field should be handled by tantivy.
@@ -13,12 +12,14 @@ pub struct NumericOptions {
     indexed: bool,
     // This boolean has no effect if the field is not marked as indexed too.
     fieldnorms: bool, // This attribute only has an effect if indexed is true.
-    #[serde(default, skip_serializing_if = "is_false")]
-    posting_norms: bool,
     fast: bool,
     stored: bool,
     #[serde(skip_serializing_if = "is_false")]
     coerce: bool,
+}
+
+fn is_false(val: &bool) -> bool {
+    !val
 }
 
 /// For backward compatibility we add an intermediary to interpret the
@@ -32,8 +33,6 @@ struct NumericOptionsDeser {
     #[serde(default)]
     fieldnorms: Option<bool>, // This attribute only has an effect if indexed is true.
     #[serde(default)]
-    posting_norms: bool,
-    #[serde(default)]
     fast: bool,
     stored: bool,
     #[serde(default)]
@@ -45,7 +44,6 @@ impl From<NumericOptionsDeser> for NumericOptions {
         NumericOptions {
             indexed: deser.indexed,
             fieldnorms: deser.fieldnorms.unwrap_or(deser.indexed),
-            posting_norms: deser.posting_norms,
             fast: deser.fast,
             stored: deser.stored,
             coerce: deser.coerce,
@@ -70,19 +68,6 @@ impl NumericOptions {
     #[inline]
     pub fn fieldnorms(&self) -> bool {
         self.fieldnorms && self.indexed
-    }
-
-    /// Returns whether posting-local norms are enabled for this field.
-    pub fn posting_norms(&self) -> bool {
-        self.posting_norms && self.fieldnorms()
-    }
-
-    /// Enables posting-local norms for faster top-k BM25 queries, at the cost of more storage
-    /// and longer index builds and merges. Defaults to false; requires indexing and fieldnorms.
-    #[must_use]
-    pub fn set_posting_norms(mut self) -> Self {
-        self.posting_norms = true;
-        self
     }
 
     /// Returns true iff the value is a fast field.
@@ -157,7 +142,6 @@ impl From<CoerceFlag> for NumericOptions {
         NumericOptions {
             indexed: false,
             fieldnorms: false,
-            posting_norms: false,
             stored: false,
             fast: false,
             coerce: true,
@@ -170,7 +154,6 @@ impl From<FastFlag> for NumericOptions {
         NumericOptions {
             indexed: false,
             fieldnorms: false,
-            posting_norms: false,
             stored: false,
             fast: true,
             coerce: false,
@@ -183,7 +166,6 @@ impl From<StoredFlag> for NumericOptions {
         NumericOptions {
             indexed: false,
             fieldnorms: false,
-            posting_norms: false,
             stored: true,
             fast: false,
             coerce: false,
@@ -196,7 +178,6 @@ impl From<IndexedFlag> for NumericOptions {
         NumericOptions {
             indexed: true,
             fieldnorms: true,
-            posting_norms: false,
             stored: false,
             fast: false,
             coerce: false,
@@ -212,7 +193,6 @@ impl<T: Into<NumericOptions>> BitOr<T> for NumericOptions {
         NumericOptions {
             indexed: self.indexed | other.indexed,
             fieldnorms: self.fieldnorms | other.fieldnorms,
-            posting_norms: self.posting_norms | other.posting_norms,
             stored: self.stored | other.stored,
             fast: self.fast | other.fast,
             coerce: self.coerce | other.coerce,
@@ -247,7 +227,6 @@ mod tests {
             &NumericOptions {
                 indexed: true,
                 fieldnorms: true,
-                posting_norms: false,
                 fast: false,
                 stored: false,
                 coerce: false,
@@ -267,7 +246,6 @@ mod tests {
             &NumericOptions {
                 indexed: false,
                 fieldnorms: false,
-                posting_norms: false,
                 fast: false,
                 stored: false,
                 coerce: false,
@@ -288,7 +266,6 @@ mod tests {
             &NumericOptions {
                 indexed: true,
                 fieldnorms: false,
-                posting_norms: false,
                 fast: false,
                 stored: false,
                 coerce: false,
@@ -310,7 +287,6 @@ mod tests {
             &NumericOptions {
                 indexed: false,
                 fieldnorms: true,
-                posting_norms: false,
                 fast: false,
                 stored: false,
                 coerce: false,
@@ -333,7 +309,6 @@ mod tests {
             &NumericOptions {
                 indexed: false,
                 fieldnorms: true,
-                posting_norms: false,
                 fast: false,
                 stored: false,
                 coerce: true,

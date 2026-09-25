@@ -4,7 +4,6 @@ use std::ops::BitOr;
 use serde::{Deserialize, Serialize};
 
 use super::flags::{CoerceFlag, FastFlag};
-use super::is_false;
 use crate::index::Bm25Params;
 use crate::schema::flags::{SchemaFlagList, StoredFlag};
 use crate::schema::IndexRecordOption;
@@ -95,6 +94,10 @@ pub(super) mod fast_field_text_options_serde {
             })),
         }
     }
+}
+
+fn is_false(val: &bool) -> bool {
+    !val
 }
 
 impl TextOptions {

@@ -4,7 +4,6 @@ use std::ops::BitOr;
 use serde::{Deserialize, Serialize};
 
 use super::flags::{FastFlag, IndexedFlag, SchemaFlagList, StoredFlag};
-use super::is_false;
 
 /// Trait to convert into an Ipv6Addr.
 pub trait IntoIpv6Addr {
@@ -28,8 +27,6 @@ pub struct IpAddrOptions {
     stored: bool,
     indexed: bool,
     fieldnorms: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    posting_norms: bool,
 }
 
 impl IpAddrOptions {
@@ -55,19 +52,6 @@ impl IpAddrOptions {
     #[inline]
     pub fn fieldnorms(&self) -> bool {
         self.fieldnorms
-    }
-
-    /// Returns whether posting-local norms are enabled for this field.
-    pub fn posting_norms(&self) -> bool {
-        self.posting_norms && self.fieldnorms() && self.indexed
-    }
-
-    /// Enables posting-local norms for faster top-k BM25 queries, at the cost of more storage
-    /// and longer index builds and merges. Defaults to false; requires indexing and fieldnorms.
-    #[must_use]
-    pub fn set_posting_norms(mut self) -> Self {
-        self.posting_norms = true;
-        self
     }
 
     /// Set the field as normed.
@@ -120,7 +104,6 @@ impl From<FastFlag> for IpAddrOptions {
     fn from(_: FastFlag) -> Self {
         IpAddrOptions {
             fieldnorms: false,
-            posting_norms: false,
             indexed: false,
             stored: false,
             fast: true,
@@ -132,7 +115,6 @@ impl From<StoredFlag> for IpAddrOptions {
     fn from(_: StoredFlag) -> Self {
         IpAddrOptions {
             fieldnorms: false,
-            posting_norms: false,
             indexed: false,
             stored: true,
             fast: false,
@@ -144,7 +126,6 @@ impl From<IndexedFlag> for IpAddrOptions {
     fn from(_: IndexedFlag) -> Self {
         IpAddrOptions {
             fieldnorms: true,
-            posting_norms: false,
             indexed: true,
             stored: false,
             fast: false,
@@ -159,7 +140,6 @@ impl<T: Into<IpAddrOptions>> BitOr<T> for IpAddrOptions {
         let other = other.into();
         IpAddrOptions {
             fieldnorms: self.fieldnorms | other.fieldnorms,
-            posting_norms: self.posting_norms | other.posting_norms,
             indexed: self.indexed | other.indexed,
             stored: self.stored | other.stored,
             fast: self.fast | other.fast,

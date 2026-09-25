@@ -3,15 +3,12 @@ use std::ops::BitOr;
 use serde::{Deserialize, Serialize};
 
 use super::flags::{FastFlag, IndexedFlag, SchemaFlagList, StoredFlag};
-use super::is_false;
 /// Define how a bytes field should be handled by tantivy.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "BytesOptionsDeser")]
 pub struct BytesOptions {
     indexed: bool,
     fieldnorms: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    posting_norms: bool,
     fast: bool,
     stored: bool,
 }
@@ -26,8 +23,6 @@ struct BytesOptionsDeser {
     indexed: bool,
     #[serde(default)]
     fieldnorms: Option<bool>,
-    #[serde(default)]
-    posting_norms: bool,
     fast: bool,
     stored: bool,
 }
@@ -37,7 +32,6 @@ impl From<BytesOptionsDeser> for BytesOptions {
         BytesOptions {
             indexed: deser.indexed,
             fieldnorms: deser.fieldnorms.unwrap_or(deser.indexed),
-            posting_norms: deser.posting_norms,
             fast: deser.fast,
             stored: deser.stored,
         }
@@ -55,19 +49,6 @@ impl BytesOptions {
     #[inline]
     pub fn fieldnorms(&self) -> bool {
         self.fieldnorms
-    }
-
-    /// Returns whether posting-local norms are enabled for this field.
-    pub fn posting_norms(&self) -> bool {
-        self.posting_norms && self.fieldnorms() && self.indexed
-    }
-
-    /// Enables posting-local norms for faster top-k BM25 queries, at the cost of more storage
-    /// and longer index builds and merges. Defaults to false; requires indexing and fieldnorms.
-    #[must_use]
-    pub fn set_posting_norms(mut self) -> Self {
-        self.posting_norms = true;
-        self
     }
 
     /// Returns true if the value is a fast field.
@@ -130,7 +111,6 @@ impl<T: Into<BytesOptions>> BitOr<T> for BytesOptions {
         BytesOptions {
             indexed: self.indexed | other.indexed,
             fieldnorms: self.fieldnorms | other.fieldnorms,
-            posting_norms: self.posting_norms | other.posting_norms,
             stored: self.stored | other.stored,
             fast: self.fast | other.fast,
         }
@@ -148,7 +128,6 @@ impl From<FastFlag> for BytesOptions {
         BytesOptions {
             indexed: false,
             fieldnorms: false,
-            posting_norms: false,
             stored: false,
             fast: true,
         }
@@ -160,7 +139,6 @@ impl From<StoredFlag> for BytesOptions {
         BytesOptions {
             indexed: false,
             fieldnorms: false,
-            posting_norms: false,
             stored: true,
             fast: false,
         }
@@ -172,7 +150,6 @@ impl From<IndexedFlag> for BytesOptions {
         BytesOptions {
             indexed: true,
             fieldnorms: true,
-            posting_norms: false,
             stored: false,
             fast: false,
         }
@@ -250,7 +227,6 @@ mod tests {
             &BytesOptions {
                 indexed: true,
                 fieldnorms: true,
-                posting_norms: false,
                 fast: false,
                 stored: false
             }
@@ -270,7 +246,6 @@ mod tests {
             &BytesOptions {
                 indexed: false,
                 fieldnorms: false,
-                posting_norms: false,
                 fast: false,
                 stored: false
             }
@@ -291,7 +266,6 @@ mod tests {
             &BytesOptions {
                 indexed: true,
                 fieldnorms: false,
-                posting_norms: false,
                 fast: false,
                 stored: false
             }
@@ -313,7 +287,6 @@ mod tests {
             &BytesOptions {
                 indexed: false,
                 fieldnorms: true,
-                posting_norms: false,
                 fast: false,
                 stored: false
             }
