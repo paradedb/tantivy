@@ -126,7 +126,7 @@ impl SegmentPlugin for InvertedIndexPlugin {
         ]);
         if let Ok(file) = segment_reader.open_read(SegmentComponent::Custom("pnorm".into())) {
             usage.insert(
-                "posting_norms".into(),
+                "pnorm".into(),
                 ComponentSpaceUsage::PerField(CompositeFile::open(&file)?.space_usage(schema)),
             );
         }

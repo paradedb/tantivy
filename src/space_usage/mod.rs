@@ -382,9 +382,9 @@ fn merge_column_space_usage(
 
 #[cfg(test)]
 mod test {
-    use crate::index::Index;
+    use crate::index::{Index, SegmentComponent};
     use crate::schema::{Schema, FAST, INDEXED, STORED, TEXT};
-    use crate::space_usage::PerFieldSpaceUsage;
+    use crate::space_usage::{ComponentSpaceUsage, PerFieldSpaceUsage};
     use crate::{IndexWriter, Term};
 
     #[test]
@@ -491,6 +491,27 @@ mod test {
         // TODO: understand why the following fails
         //        assert_eq!(0, segment.store().total());
         assert_eq!(segment.deletes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_posting_norms_component() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut index_writer = index.writer_for_tests()?;
+        index_writer.add_document(doc!(text => "one two"))?;
+        index_writer.commit()?;
+
+        let reader = index.reader()?;
+        let usage = reader.searcher().space_usage()?;
+        assert_eq!(usage.segments().len(), 1);
+        let norms = usage.segments()[0].component(SegmentComponent::Custom("pnorm".into()));
+        assert_eq!(norms.total(), 2u64);
+        let ComponentSpaceUsage::PerField(norms) = norms else {
+            panic!("posting norms should report per-field space usage");
+        };
+        expect_single_field(&norms, "text", 2, 2);
         Ok(())
     }
 
