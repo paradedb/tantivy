@@ -787,6 +787,9 @@ struct ProbeController {
     pricing: UnitPricing,
     work_spent: WorkUnits,
     termination: ProbeTermination,
+    /// Clusters in the segment and clusters pulled from the ranking so far.
+    clusters: usize,
+    pulled: usize,
     /// APS over the ranked clusters; `None` when APS is off.
     estimator: Option<RecallEstimator>,
     recall_target: f32,
@@ -794,11 +797,18 @@ struct ProbeController {
 }
 
 impl ProbeController {
-    fn new(pricing: UnitPricing, estimator: Option<RecallEstimator>, recall_target: f32) -> Self {
+    fn new(
+        pricing: UnitPricing,
+        clusters: usize,
+        estimator: Option<RecallEstimator>,
+        recall_target: f32,
+    ) -> Self {
         Self {
             pricing,
             work_spent: WorkUnits::ZERO,
             termination: ProbeTermination::Exhausted,
+            clusters,
+            pulled: 0,
             estimator,
             recall_target,
             recall_estimate: None,
@@ -810,6 +820,7 @@ impl ProbeController {
     /// existed, keeping `Ceiling` and `RecallTarget` distinct from
     /// `Exhausted`.
     fn admit(&mut self) -> bool {
+        self.pulled += 1;
         if self
             .recall_estimate
             .is_some_and(|estimate| estimate >= self.recall_target)
@@ -847,7 +858,17 @@ impl ProbeController {
     }
 
     fn finish(&self, stats: &mut ProbeStats) {
-        stats.termination = self.termination;
+        // A stacked ranking is sized to the budget, so it can run out just
+        // as the budget is spent, short of the segment's clusters; that stop
+        // is the ceiling's, not exhaustion.
+        stats.termination = match self.termination {
+            ProbeTermination::Exhausted
+                if self.pulled < self.clusters && self.work_spent >= self.pricing.budget =>
+            {
+                ProbeTermination::Ceiling
+            }
+            termination => termination,
+        };
         stats.work_charged += self.work_spent.to_f32();
         stats.work_budget += self.pricing.budget.to_f32();
         stats.recall_estimate = self.recall_estimate;
@@ -2169,7 +2190,12 @@ impl<T: VectorElement> VectorBackend<T> {
             let ranked = index.rank_clusters(&mut routing_ws, query.query(), routing);
             let estimator =
                 index.recall_estimator(&ranked, query.query(), self.adaptive.recall_target)?;
-            let controller = ProbeController::new(pricing, estimator, self.adaptive.recall_target);
+            let controller = ProbeController::new(
+                pricing,
+                index.num_clusters(),
+                estimator,
+                self.adaptive.recall_target,
+            );
             (ranked, controller)
         };
         let mut routing_ns = routing_start.elapsed().as_nanos() as u64;
@@ -2701,7 +2727,12 @@ impl<T: VectorElement> VectorBackend<T> {
             let ranked = index.rank_clusters(&mut routing_ws, &query_f32, routing);
             let estimator =
                 index.recall_estimator(&ranked, &query_f32, self.adaptive.recall_target)?;
-            let controller = ProbeController::new(pricing, estimator, self.adaptive.recall_target);
+            let controller = ProbeController::new(
+                pricing,
+                num_centroids,
+                estimator,
+                self.adaptive.recall_target,
+            );
             (ranked, controller)
         };
         let mut routing_ns = routing_start.elapsed().as_nanos() as u64;
@@ -4279,7 +4310,7 @@ mod tests {
         };
         let (_, stats) = run_top_n(&index, embed_field, vec![10.0, 10.0], 3, params)?;
         assert_eq!(stats.termination, ProbeTermination::Ceiling);
-        // Stopped at exactly the cap, short of the ranked list.
+        // Stopped at exactly the cap.
         assert_eq!(stats.clusters_probed(), 1);
         assert_eq!(
             stats.vectors_visited,
@@ -4679,7 +4710,7 @@ mod tests {
         let centroids = [[0.0f32, 0.0], [2.0, 0.0], [0.0, 2.0]];
         let rows: Vec<&[f32]> = centroids.iter().map(|row| &row[..]).collect();
         let estimator = RecallEstimator::new(&query, &rows, Metric::L2);
-        let mut controller = ProbeController::new(pricing, Some(estimator), 0.5);
+        let mut controller = ProbeController::new(pricing, centroids.len(), Some(estimator), 0.5);
 
         assert!(controller.admit());
         controller.cover(None);
