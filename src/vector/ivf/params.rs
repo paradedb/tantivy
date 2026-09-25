@@ -105,21 +105,18 @@ pub(crate) const MIN_PROBE_CLUSTERS: usize = 16;
 /// Default [`AdaptiveProbeParams::router_recall_target`].
 pub const DEFAULT_ROUTER_RECALL: f32 = 0.99;
 
-/// Headroom on the stacked router's candidate count over the clusters the
-/// budget is expected to buy: ranked clusters near the query can be
-/// smaller than average, and bounds-gate skips charge only the open share.
-pub(crate) const ROUTER_K_MARGIN: f64 = 1.25;
-
 impl AdaptiveProbeParams {
     /// The number of clusters the stacked router is asked to rank for a
     /// segment whose resolved work budget is `budget` units.
     ///
     /// An average cluster costs `open_share + (1 - open_share) ×
     /// match_fraction` units, since only filter matches charge row work, so
-    /// the budget buys `budget / that` clusters: `~budget` unfiltered, up to
+    /// the budget buys `budget / that` clusters: `budget` unfiltered, up to
     /// `budget / open_share` as the filter approaches empty. The count is
-    /// scaled by [`ROUTER_K_MARGIN`], floored at `min_probe_clusters` and
-    /// capped at the segment's cluster count.
+    /// floored at `min_probe_clusters` and capped at the segment's cluster
+    /// count. There is no headroom: when ranked clusters run smaller than
+    /// average or the bounds gate skips some, the ranking can run out
+    /// before the budget and the scan ends `Exhausted`.
     ///
     /// * `open_share` (`f64`) — the per-index open share `x`.
     /// * `match_fraction` (`f64`) — the share of the segment's docs the filter matches, in `(0,
@@ -134,7 +131,7 @@ impl AdaptiveProbeParams {
         let match_fraction = match_fraction.clamp(0.0, 1.0);
         let cluster_cost =
             (open_share + (1.0 - open_share) * match_fraction).max(f64::MIN_POSITIVE);
-        let clusters = (budget.max(0.0) / cluster_cost * ROUTER_K_MARGIN).ceil();
+        let clusters = (budget.max(0.0) / cluster_cost).ceil();
         (clusters as usize)
             .max(self.min_probe_clusters)
             .min(clusters_in_segment)
@@ -267,25 +264,24 @@ mod tests {
         Ok(())
     }
 
-    /// Unfiltered, the stacked router is asked for about the budget; a
-    /// selective filter stretches it toward `budget / open_share`. Either
-    /// way it is lifted to the probe floor and capped at the segment's
-    /// clusters.
+    /// Unfiltered, the stacked router is asked for the budget; a selective
+    /// filter stretches it toward `budget / open_share`. Either way it is
+    /// lifted to the probe floor and capped at the segment's clusters.
     #[test]
     fn router_k_tracks_budget_and_filter_selectivity() {
         let params = AdaptiveProbeParams::default();
         let x = 0.2;
-        assert_eq!(params.router_k(20.0, x, 1.0, 1000), 25);
-        assert_eq!(params.router_k(20.4, x, 1.0, 1000), 26);
+        assert_eq!(params.router_k(20.0, x, 1.0, 1000), 20);
+        assert_eq!(params.router_k(20.4, x, 1.0, 1000), 21);
         // Half the docs match: a cluster costs 0.2 + 0.8 * 0.5 = 0.6 units.
-        assert_eq!(params.router_k(20.0, x, 0.5, 1000), 42);
+        assert_eq!(params.router_k(20.0, x, 0.5, 1000), 34);
         // Nothing matches: only opens charge.
-        assert_eq!(params.router_k(20.0, x, 0.0, 1000), 125);
+        assert_eq!(params.router_k(20.0, x, 0.0, 1000), 100);
         assert_eq!(
             params.router_k(2.0, x, 1.0, 1000),
             super::MIN_PROBE_CLUSTERS
         );
-        assert_eq!(params.router_k(20.0, x, 1.0, 22), 22);
+        assert_eq!(params.router_k(20.0, x, 1.0, 18), 18);
         assert_eq!(params.router_k(20.0, 0.0, 0.0, 1000), 1000);
         assert_eq!(params.router_k(0.0, x, 1.0, 0), 1);
     }
