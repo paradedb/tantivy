@@ -1877,6 +1877,22 @@ impl QuantizedScanCtx {
         ))
     }
 
+    /// The lowest point estimate among the running top-k rows, `None`
+    /// until `top_n` rows are in. `top_n` rows score at least this, so it
+    /// never exceeds the k-th best estimate; unlike
+    /// [`Self::running_pessimistic_kth`] it carries no confidence margin,
+    /// so it must not drive pruning.
+    fn running_estimate_kth(&self, top_n: usize) -> Option<Score> {
+        debug_assert!(!self.boundary_passed);
+        if top_n == 0 || self.bound_top.len() < top_n {
+            return None;
+        }
+        self.bound_top
+            .iter()
+            .map(|&index| self.candidates.estimates[index])
+            .min_by(f32::total_cmp)
+    }
+
     /// Select by lower endpoint itself; ordering by estimate can prune a true top-k row
     /// even when every confidence interval encloses its exact score.
     fn pessimistic_kth(&mut self, top_n: usize, kappa: f32) -> Option<Threshold> {
@@ -2217,11 +2233,14 @@ impl<T: VectorElement> VectorBackend<T> {
                 break;
             }
             let cluster = node as usize;
-            // The pessimistic kth keeps APS's radius on the safe side of
-            // the estimate error, as it does for the bounds gate.
+            // The bounds gate needs the pessimistic kth so a skip never
+            // drops a true top-k row; APS takes the point estimate, since
+            // the pessimistic radius inflates the query ball and
+            // underestimates recall.
             let kth = scan
                 .running_pessimistic_kth(top_n, QUANTIZED_BOUNDARY_KAPPA)
                 .map(|score| score.0 .0);
+            let aps_kth = scan.running_estimate_kth(top_n);
             let query_bound = kth.map_or(QueryBound::Filling, |score| QueryBound::Armed {
                 t: to_bound_space(metric, score),
             });
@@ -2253,7 +2272,7 @@ impl<T: VectorElement> VectorBackend<T> {
             });
             if verdict == Verdict::Skip {
                 controller.charge_open();
-                controller.cover(kth);
+                controller.cover(aps_kth);
                 bounds_skips += 1;
                 continue;
             }
@@ -2278,7 +2297,7 @@ impl<T: VectorElement> VectorBackend<T> {
             if selected_count == 0 {
                 postings_skipped += 1;
                 stats.clusters_skipped_empty += 1;
-                controller.cover(kth);
+                controller.cover(aps_kth);
                 continue;
             }
 
@@ -2363,7 +2382,7 @@ impl<T: VectorElement> VectorBackend<T> {
             if armed_probe.is_none() && kth.is_some() {
                 armed_probe = Some((postings_row + postings_skipped - 1) as u32);
             }
-            controller.cover(kth);
+            controller.cover(scan.running_estimate_kth(top_n));
         }
         stats.record_routing(ranked.metrics());
         stats.postings_row += postings_row;
@@ -4971,6 +4990,29 @@ mod tests {
             scan.pessimistic_kth(2, 2.0),
             Some(Threshold(LowerEndpoint(7.0)))
         );
+    }
+
+    /// The APS kth is the lowest point estimate in the lower-endpoint
+    /// top-k: above the pessimistic kth, and never above the true k-th
+    /// best estimate.
+    #[test]
+    fn running_estimate_kth_bounds_the_kth_estimate() {
+        let mut scan = QuantizedScanCtx::new(3, 3);
+        assert_eq!(scan.running_estimate_kth(2), None);
+        scan.begin_cluster(2);
+        // Lower endpoints at kappa 2: 10, 7, 4. The top-2 by lower endpoint
+        // is rows 0 and 1; the top-2 by estimate is rows 2 and 0.
+        for (row, score, sigma) in [(0, 10.0, 0.0), (1, 9.0, 1.0), (2, 12.0, 4.0)] {
+            push_test_candidate(&mut scan, row, row as DocId, score, sigma);
+        }
+        scan.finish_cluster_bound_with_kappa(2.0);
+
+        assert_eq!(
+            scan.running_pessimistic_kth(2, 2.0),
+            Some(Threshold(LowerEndpoint(7.0)))
+        );
+        assert_eq!(scan.running_estimate_kth(2), Some(9.0));
+        assert_eq!(scan.running_estimate_kth(4), None);
     }
 
     #[test]
