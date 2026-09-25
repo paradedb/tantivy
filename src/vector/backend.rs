@@ -513,6 +513,10 @@ pub struct ProbeStats {
     /// Ceiling terminations.
     /// Work units charged by the probe loop.
     pub work_charged: f32,
+    /// The resolved work budget the probe loop ran against: the
+    /// `max_probe_fraction` ceiling in work units, floored by
+    /// `min_probe_clusters`. `0` when no IVF probe loop ran.
+    pub work_budget: f32,
     /// The APS recall estimate when the probe loop stopped; absent when
     /// APS was off or the heap never held `k` results. Per-segment.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -845,6 +849,7 @@ impl ProbeController {
     fn finish(&self, stats: &mut ProbeStats) {
         stats.termination = self.termination;
         stats.work_charged += self.work_spent.to_f32();
+        stats.work_budget += self.pricing.budget.to_f32();
         stats.recall_estimate = self.recall_estimate;
     }
 }
@@ -4710,6 +4715,8 @@ mod tests {
         assert_ne!(off.termination, ProbeTermination::RecallTarget, "{off:?}");
         assert_eq!(off.recall_estimate, None, "{off:?}");
         assert!(aps.work_charged < off.work_charged, "{aps:?} {off:?}");
+        assert_eq!(aps.work_budget, off.work_budget, "{aps:?} {off:?}");
+        assert!(aps.work_charged < aps.work_budget, "{aps:?}");
         Ok(())
     }
 
@@ -4773,6 +4780,10 @@ mod tests {
         )?;
         assert_eq!(stats.termination, ProbeTermination::Ceiling);
         assert!(
+            (stats.work_budget as f64 - budget).abs() <= 1e-6 * budget,
+            "the resolved budget is recorded: {stats:?}"
+        );
+        assert!(
             stats.clusters_probed() < clusters,
             "the budget must bind before exhaustion: {stats:?}"
         );
@@ -4815,6 +4826,7 @@ mod tests {
             bounds_skips: 2,
             termination: ProbeTermination::Ceiling,
             work_charged: 1.75,
+            work_budget: 1.5,
             segment_rows: Some(100),
             segment_clusters: Some(5),
             ..Default::default()
@@ -4876,6 +4888,7 @@ mod tests {
                 "bound_armed_probe_sum": 1,
                 "termination": "Ceiling",
                 "work_charged": 1.75,
+                "work_budget": 1.5,
                 "segment_rows": 100,
                 "segment_clusters": 5
             })
