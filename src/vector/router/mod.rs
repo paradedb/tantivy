@@ -214,12 +214,12 @@ impl OpenedRouter {
         query: &[f32],
         metric: Metric,
         recall: f32,
-    ) -> crate::Result<Option<RecallEstimator>> {
+    ) -> Option<RecallEstimator<'_>> {
         match (self, ranking) {
             (Self::Stacked(router), RouterIter::Stacked(ranking)) => {
                 stacked::recall_estimator(router, ranking, query, metric, recall)
             }
-            _ => Ok(None),
+            _ => None,
         }
     }
 }
