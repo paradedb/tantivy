@@ -44,9 +44,10 @@ use super::tie_break::NoTieBreak;
 use super::{enter_vector_stage, Stage, VectorElement};
 use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::{SegmentSortKeyComputer, TopNComputer};
+use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::error::DataCorruption;
 use crate::fastfield::AliveBitSet;
-use crate::query::Weight;
+use crate::query::{for_each_docset_buffered, AllScorer, Weight};
 use crate::schema::{Field, Metric};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
 
@@ -1833,40 +1834,84 @@ fn candidate_docs(candidates: &QuantizedCandidates) -> Vec<DocId> {
     docs
 }
 
+/// How a cluster row is tested before scoring: the filter's matches
+/// intersected with the alive docs.
+enum RowGate<'a> {
+    Open,
+    AliveOnly(&'a AliveBitSet),
+    FilterOnly(&'a BitSet),
+    FilterAndAlive {
+        filter: &'a BitSet,
+        filter_and_alive: BitSet,
+    },
+}
+
+impl<'a> RowGate<'a> {
+    fn new(filter: &'a SegmentFilter, alive: Option<&'a AliveBitSet>) -> Self {
+        match (filter.docs(), alive) {
+            (None, None) => RowGate::Open,
+            (None, Some(alive)) => RowGate::AliveOnly(alive),
+            (Some(filter), None) => RowGate::FilterOnly(filter),
+            (Some(filter), Some(alive)) => {
+                let mut filter_and_alive = filter.clone();
+                filter_and_alive.intersect_update(alive.bitset());
+                RowGate::FilterAndAlive {
+                    filter,
+                    filter_and_alive,
+                }
+            }
+        }
+    }
+}
+
+enum RowVerdict {
+    Keep,
+    Filtered,
+    Dead,
+}
+
 fn select_cluster_rows<'a>(
     reader: &VectorIndexReader,
     rows: Range<usize>,
-    eligibility: &BitSet,
-    filter: &BitSet,
-    filter_is_all: bool,
-    alive: Option<&AliveBitSet>,
+    gate: &RowGate,
     offsets: &'a mut Vec<usize>,
     docs: &mut Vec<DocId>,
 ) -> (Selection<'a>, usize, usize, usize) {
     offsets.clear();
     docs.clear();
     let visited = rows.len();
-    if filter_is_all && alive.is_none() {
-        docs.extend(rows.map(|row| reader.doc_id_at(row)));
-        return (Selection::All, visited, 0, 0);
-    }
-
-    let mut pruned_filter = 0usize;
-    let mut pruned_dead = 0usize;
-    for (offset, row) in rows.enumerate() {
-        let doc = reader.doc_id_at(row);
-        if !eligibility.contains(doc) {
-            if !filter.contains(doc) {
-                pruned_filter += 1;
-            } else {
-                debug_assert!(alive.is_some_and(|alive| !alive.is_alive(doc)));
-                pruned_dead += 1;
-            }
-            continue;
+    let (pruned_filter, pruned_dead) = match gate {
+        RowGate::Open => {
+            docs.extend(rows.map(|row| reader.doc_id_at(row)));
+            return (Selection::All, visited, 0, 0);
         }
-        offsets.push(offset);
-        docs.push(doc);
-    }
+        RowGate::AliveOnly(alive) => select_rows(reader, rows, offsets, docs, |doc| {
+            if alive.is_alive(doc) {
+                RowVerdict::Keep
+            } else {
+                RowVerdict::Dead
+            }
+        }),
+        RowGate::FilterOnly(filter) => select_rows(reader, rows, offsets, docs, |doc| {
+            if filter.contains(doc) {
+                RowVerdict::Keep
+            } else {
+                RowVerdict::Filtered
+            }
+        }),
+        RowGate::FilterAndAlive {
+            filter,
+            filter_and_alive,
+        } => select_rows(reader, rows, offsets, docs, |doc| {
+            if filter_and_alive.contains(doc) {
+                RowVerdict::Keep
+            } else if !filter.contains(doc) {
+                RowVerdict::Filtered
+            } else {
+                RowVerdict::Dead
+            }
+        }),
+    };
     if offsets.is_empty() {
         (Selection::None, visited, pruned_filter, pruned_dead)
     } else {
@@ -1877,6 +1922,31 @@ fn select_cluster_rows<'a>(
             pruned_dead,
         )
     }
+}
+
+/// Returns `(pruned_filter, pruned_dead)`.
+#[inline(always)]
+fn select_rows(
+    reader: &VectorIndexReader,
+    rows: Range<usize>,
+    offsets: &mut Vec<usize>,
+    docs: &mut Vec<DocId>,
+    verdict: impl Fn(DocId) -> RowVerdict,
+) -> (usize, usize) {
+    let mut pruned_filter = 0usize;
+    let mut pruned_dead = 0usize;
+    for (offset, row) in rows.enumerate() {
+        let doc = reader.doc_id_at(row);
+        match verdict(doc) {
+            RowVerdict::Keep => {
+                offsets.push(offset);
+                docs.push(doc);
+            }
+            RowVerdict::Filtered => pruned_filter += 1,
+            RowVerdict::Dead => pruned_dead += 1,
+        }
+    }
+    (pruned_filter, pruned_dead)
 }
 
 fn candidate_selection<'a>(
@@ -1934,26 +2004,21 @@ impl<T: VectorElement> VectorBackend<T> {
         let max_doc = segment_reader.max_doc();
         let non_vector_start = Instant::now();
         let non_vector_stage = enter_vector_stage(Stage::NonVectorSearch);
-        let filter = build_filter_bitset(weight, segment_reader, max_doc)?;
+        let filter = build_segment_filter(weight, segment_reader, max_doc)?;
         let alive = segment_reader.alive_bitset();
         drop(non_vector_stage);
         let non_vector_search_ns = non_vector_start.elapsed().as_nanos() as u64;
         stats.non_vector_search_ns = stats
             .non_vector_search_ns
             .saturating_add(non_vector_search_ns);
-        if filter.len() == 0 {
+        if filter.is_empty() {
             drop(init_stage);
             stats.scan_init_ns = stats.scan_init_ns.saturating_add(
                 (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
             );
             return Ok(Vec::new());
         }
-        let eligibility = alive.map(|alive| {
-            let mut eligibility = filter.clone();
-            eligibility.intersect_update(alive.bitset());
-            eligibility
-        });
-        let filter_is_all = filter.len() == max_doc as usize;
+        let row_gate = RowGate::new(&filter, alive);
         let scan_levels = query.active_layers();
         let quantized = self
             .reader
@@ -2073,10 +2138,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 select_cluster_rows(
                     &self.reader,
                     rows.clone(),
-                    eligibility.as_ref().unwrap_or(&filter),
-                    &filter,
-                    filter_is_all,
-                    alive,
+                    &row_gate,
                     &mut selection_offsets,
                     &mut cluster_docs,
                 )
@@ -2466,13 +2528,13 @@ impl<T: VectorElement> VectorBackend<T> {
 
         let non_vector_start = Instant::now();
         let non_vector_stage = enter_vector_stage(Stage::NonVectorSearch);
-        let filter = build_filter_bitset(weight, segment_reader, max_doc)?;
+        let filter = build_segment_filter(weight, segment_reader, max_doc)?;
         drop(non_vector_stage);
         let non_vector_search_ns = non_vector_start.elapsed().as_nanos() as u64;
         stats.non_vector_search_ns = stats
             .non_vector_search_ns
             .saturating_add(non_vector_search_ns);
-        if filter.len() == 0 {
+        if filter.is_empty() {
             drop(init_stage);
             stats.scan_init_ns = stats.scan_init_ns.saturating_add(
                 (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
@@ -2533,7 +2595,7 @@ impl<T: VectorElement> VectorBackend<T> {
             index,
             &mut ranked,
             pricing,
-            &filter,
+            filter.docs(),
             alive,
             top_n,
             tie_break,
@@ -2597,7 +2659,7 @@ impl<T: VectorElement> VectorBackend<T> {
         index: &IvfIndex,
         ranked: &mut impl Iterator<Item = Candidate>,
         pricing: UnitPricing,
-        filter: &BitSet,
+        filter: Option<&BitSet>,
         alive: Option<&AliveBitSet>,
         top_n: usize,
         tie_break: &mut K,
@@ -2794,7 +2856,7 @@ impl<T: VectorElement> VectorBackend<T> {
     fn collect_cluster_survivors(
         &self,
         rows: Range<usize>,
-        filter: &BitSet,
+        filter: Option<&BitSet>,
         alive: Option<&AliveBitSet>,
         survivors: &mut Vec<Survivor>,
     ) -> (usize, usize, usize, usize) {
@@ -2806,7 +2868,7 @@ impl<T: VectorElement> VectorBackend<T> {
         for row in rows {
             let doc = self.reader.doc_id_at(row);
             visited += 1;
-            if !filter.contains(doc) {
+            if filter.is_some_and(|filter| !filter.contains(doc)) {
                 pruned_filter += 1;
                 continue;
             }
@@ -2823,26 +2885,58 @@ impl<T: VectorElement> VectorBackend<T> {
     }
 }
 
+/// A segment's filter matches, as consumed by the IVF probes.
+enum SegmentFilter {
+    /// Every doc id below `max_doc` matches (deleted docs included); no
+    /// bitset is materialized.
+    All,
+    /// The matching doc ids.
+    Docs(BitSet),
+}
+
+impl SegmentFilter {
+    fn is_empty(&self) -> bool {
+        matches!(self, SegmentFilter::Docs(filter) if filter.len() == 0)
+    }
+
+    fn docs(&self) -> Option<&BitSet> {
+        match self {
+            SegmentFilter::All => None,
+            SegmentFilter::Docs(filter) => Some(filter),
+        }
+    }
+}
+
 /// Drain the filter `DocSet` into a dense BitSet for O(1) random membership
 /// testing per cluster doc. The BitSet allocates `max_doc / 8` bytes regardless
 /// of filter selectivity — inherent to IVF needing membership tests on
-/// out-of-order doc ids. `#[inline(never)]` so it forms its own flamegraph
-/// frame; at low selectivity over a large segment this drain is real cost
-/// otherwise hidden in the search entry.
-/// Materializes a filter doc set as a dense eligibility bitset.
+/// out-of-order doc ids. A filter whose scorer is an [`AllScorer`] (match-all,
+/// including boolean queries that collapse to one) skips the drain entirely,
+/// as does a drained bitset that turns out full. `#[inline(never)]` so it
+/// forms its own flamegraph frame; at low selectivity over a large segment
+/// this drain is real cost otherwise hidden in the search entry.
+/// Materializes a filter doc set as a dense bitset unless it matches all docs.
 #[inline(never)]
-fn build_filter_bitset(
+fn build_segment_filter(
     weight: &dyn Weight,
     segment_reader: &SegmentReader,
     max_doc: DocId,
-) -> crate::Result<BitSet> {
+) -> crate::Result<SegmentFilter> {
+    let mut scorer = weight.scorer(segment_reader, 1.0)?;
+    if scorer.is::<AllScorer>() {
+        return Ok(SegmentFilter::All);
+    }
     let mut filter = BitSet::with_max_value(max_doc);
-    weight.for_each_no_score(segment_reader, &mut |docs| {
+    let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
+    for_each_docset_buffered(scorer.as_mut(), &mut buffer, |docs| {
         for &doc in docs {
             filter.insert(doc);
         }
-    })?;
-    Ok(filter)
+    });
+    if filter.len() == max_doc as usize {
+        return Ok(SegmentFilter::All);
+    }
+    Ok(SegmentFilter::Docs(filter))
 }
 
 #[cfg(test)]
@@ -2868,7 +2962,8 @@ mod tests {
     use crate::index::IndexSettings;
     use crate::indexer::NoMergePolicy;
     use crate::query::{
-        AllQuery, BitSetDocSet, ConstScorer, EnableScoring, Explanation, Query, Scorer, TermQuery,
+        AllQuery, BitSetDocSet, BooleanQuery, ConstScorer, EnableScoring, Explanation, Occur,
+        Query, Scorer, TermQuery,
     };
     use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
     use crate::vector::prepared::QuantizedIndexCtx;
@@ -3834,6 +3929,60 @@ mod tests {
         )?;
         assert_eq!(actual.len(), FIXTURE_NUM_DOCS);
         assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    /// Match-all filters, including a boolean that collapses to one, skip
+    /// the bitset drain; selective and empty filters still materialize.
+    #[test]
+    fn segment_filter_skips_bitset_for_match_all() -> crate::Result<()> {
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .metric(Metric::L2)
+            .vector_storage_format(VectorStorageFormat::Ivf)
+            .selectivities(&[0.1])
+            .build()?;
+        let searcher = index.index.reader()?.searcher();
+        let label = |text: &str| -> Box<dyn Query> {
+            Box::new(TermQuery::new(
+                Term::from_field_text(index.label_field(), text),
+                IndexRecordOption::Basic,
+            ))
+        };
+        let all_and_all = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(AllQuery) as Box<dyn Query>),
+            (Occur::Should, Box::new(AllQuery)),
+        ]);
+        let all_or_label = BooleanQuery::new(vec![
+            (Occur::Should, Box::new(AllQuery) as Box<dyn Query>),
+            (Occur::Should, label("selectivity_0.1")),
+        ]);
+        let selective = label("selectivity_0.1");
+        let missing = label("no_such_label");
+
+        let mut saw_partial = false;
+        for segment_reader in searcher.segment_readers() {
+            let max_doc = segment_reader.max_doc();
+            let weight_for =
+                |query: &dyn Query| query.weight(EnableScoring::disabled_from_searcher(&searcher));
+            let filter_for = |query: &dyn Query| -> crate::Result<SegmentFilter> {
+                build_segment_filter(weight_for(query)?.as_ref(), segment_reader, max_doc)
+            };
+
+            assert!(matches!(filter_for(&AllQuery)?, SegmentFilter::All));
+            assert!(matches!(filter_for(&all_and_all)?, SegmentFilter::All));
+            assert!(matches!(filter_for(&all_or_label)?, SegmentFilter::All));
+            assert!(filter_for(missing.as_ref())?.is_empty());
+
+            let matching = weight_for(selective.as_ref())?.count(segment_reader)? as usize;
+            match filter_for(selective.as_ref())? {
+                SegmentFilter::All => assert_eq!(matching, max_doc as usize),
+                SegmentFilter::Docs(docs) => {
+                    assert_eq!(docs.len(), matching);
+                    saw_partial |= matching > 0;
+                }
+            }
+        }
+        assert!(saw_partial, "fixture must exercise a partial filter");
         Ok(())
     }
 
