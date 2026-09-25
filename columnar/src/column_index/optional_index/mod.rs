@@ -17,8 +17,7 @@ use crate::{DocId, RowId};
 /// The threshold for for number of elements after which we switch to dense block encoding.
 ///
 /// We simply pick the value that minimize the size of the blocks.
-const DENSE_BLOCK_THRESHOLD: u32 =
-    set_block::DENSE_BLOCK_NUM_BYTES / std::mem::size_of::<u16>() as u32; //< 5_120
+const DENSE_BLOCK_THRESHOLD: u32 = DENSE_BLOCK_NUM_BYTES / std::mem::size_of::<u16>() as u32; //< 5_120
 
 const ELEMENTS_PER_BLOCK: u32 = u16::MAX as u32 + 1;
 
@@ -41,7 +40,7 @@ impl BlockVariant {
     }
     pub fn num_bytes_in_block(&self) -> u32 {
         match *self {
-            BlockVariant::Dense => set_block::DENSE_BLOCK_NUM_BYTES,
+            BlockVariant::Dense => DENSE_BLOCK_NUM_BYTES,
             BlockVariant::Sparse { num_vals } => num_vals as u32 * 2,
         }
     }
