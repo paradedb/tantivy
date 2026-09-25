@@ -58,7 +58,7 @@ pub use self::phrase_prefix_query::PhrasePrefixQuery;
 pub use self::phrase_query::regex_phrase_query::{wildcard_query_to_regex_str, RegexPhraseQuery};
 pub use self::phrase_query::regex_phrase_weight::RegexPhraseWeight;
 pub use self::phrase_query::PhraseQuery;
-pub use self::query::{EnableScoring, Query, QueryClone};
+pub use self::query::{DisjunctionPruning, EnableScoring, Query, QueryClone};
 pub use self::query_parser::{QueryParser, QueryParserError};
 pub use self::range_query::*;
 pub use self::regex_query::RegexQuery;
@@ -70,6 +70,7 @@ pub use self::term_set_query::*;
 pub use self::union::{BufferedUnionScorer, SimpleUnion};
 #[cfg(test)]
 pub use self::vec_docset::VecDocSet;
+pub(crate) use self::weight::for_each_docset_buffered;
 pub use self::weight::Weight;
 
 #[cfg(test)]
