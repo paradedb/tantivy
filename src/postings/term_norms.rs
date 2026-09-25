@@ -139,6 +139,60 @@ mod tests {
     }
 
     #[test]
+    fn scoring_does_not_open_document_norms() -> crate::Result<()> {
+        use crate::collector::TopDocs;
+        use crate::directory::Directory;
+        use crate::index::SegmentComponent;
+        use crate::query::{BooleanQuery, Occur, PhraseQuery, Query, TermQuery};
+        use crate::schema::{IndexRecordOption, Schema, TEXT};
+        use crate::{Index, Term};
+
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer = index.writer_for_tests()?;
+        for body in ["red apple", "red apple pie", "green apple pie"] {
+            writer.add_document(doc!(text => body))?;
+        }
+        writer.commit()?;
+        let red = Term::from_field_text(text, "red");
+        let apple = Term::from_field_text(text, "apple");
+        let queries: Vec<Box<dyn Query>> = vec![
+            Box::new(TermQuery::new(red.clone(), IndexRecordOption::WithFreqs)),
+            Box::new(BooleanQuery::new(vec![
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(red.clone(), IndexRecordOption::WithFreqs)),
+                ),
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(apple.clone(), IndexRecordOption::WithFreqs)),
+                ),
+            ])),
+            Box::new(PhraseQuery::new(vec![red, apple])),
+        ];
+        let searcher = index.reader()?.searcher();
+        let expected = queries
+            .iter()
+            .map(|query| searcher.search(&**query, &TopDocs::with_limit(3).order_by_score()))
+            .collect::<crate::Result<Vec<_>>>()?;
+        for segment in index.searchable_segments()? {
+            index
+                .directory()
+                .delete(&segment.relative_path(SegmentComponent::FieldNorms))
+                .unwrap();
+        }
+        let searcher = index.reader()?.searcher();
+        for (query, expected) in queries.iter().zip(expected) {
+            assert_eq!(
+                searcher.search(&**query, &TopDocs::with_limit(3).order_by_score())?,
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn scores_seeks_deletes_and_merges() -> crate::Result<()> {
         use crate::collector::TopDocs;
         use crate::merge_policy::NoMergePolicy;

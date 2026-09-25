@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap};
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::{fmt, io};
@@ -10,7 +9,7 @@ use fnv::FnvHashMap;
 use itertools::Itertools;
 
 use crate::directory::error::OpenReadError;
-use crate::directory::{CompositeFile, CompositeWrite, Directory, FileSlice};
+use crate::directory::{CompositeFile, Directory, FileSlice};
 use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders, NormStorage};
@@ -19,13 +18,12 @@ use crate::index::{
     Index, IndexSettings, InvertedIndexReader, Segment, SegmentComponent, SegmentId,
 };
 use crate::json_utils::json_path_sep_to_dot;
-use crate::postings::Postings;
 use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
 use crate::vector::{RouterKind, VectorIndexReader};
-use crate::{DocId, DocSet, Opstamp};
+use crate::{DocId, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
 ///
@@ -55,7 +53,6 @@ pub struct SegmentReader {
     positions_composite: Arc<OnceLock<CompositeFile>>,
     fast_fields_readers: Arc<OnceLock<FastFieldReaders>>,
     fieldnorm_readers: Arc<OnceLock<FieldNormReaders>>,
-    compatible_fieldnorm_readers: Arc<OnceLock<FieldNormReaders>>,
 
     store_file: Arc<OnceLock<FileSlice>>,
     has_deletes: bool,
@@ -144,9 +141,8 @@ impl SegmentReader {
     /// Field norms are the length (in tokens) of the fields.
     /// It is used in the computation of the [TfIdf](https://fulmicoton.gitbooks.io/tantivy-doc/content/tfidf.html).
     ///
-    /// Legacy segments use the document-addressed `.fieldnorm` component. For posting-local
-    /// segments this compatibility API scans the field's postings and allocates one byte per
-    /// document. Scorers must use `scoring_fieldnorm_reader` and the current posting instead.
+    /// Reads document-addressed norms for merge statistics and compatibility APIs.
+    /// Scorers use `scoring_fieldnorm_reader` and the current posting instead.
     pub fn get_fieldnorms_reader(&self, field: Field) -> crate::Result<FieldNormReader> {
         let entry = self.schema.get_field_entry(field);
         if !entry.is_indexed() || !entry.has_fieldnorms() {
@@ -154,19 +150,6 @@ impl SegmentReader {
                 "Field norms disabled for {:?}",
                 entry.name()
             )));
-        }
-        let inverted = self.inverted_index(field)?;
-        if inverted.terms().num_terms() == 0 {
-            return Ok(FieldNormReader::constant(self.max_doc(), 0));
-        }
-        match inverted.norm_storage() {
-            NormStorage::Posting => return self.reconstruct_fieldnorms(field),
-            NormStorage::Disabled => {
-                return Err(crate::TantivyError::SchemaError(
-                    "Field norms disabled in segment metadata".into(),
-                ))
-            }
-            NormStorage::Legacy => {}
         }
         self.fieldnorm_readers().get_field(field)?.ok_or_else(|| {
             let field_name = self.schema.get_field_name(field);
@@ -207,71 +190,10 @@ impl SegmentReader {
         ))
     }
 
-    /// Reconstructs document-addressed norms by scanning all postings for this field.
-    /// This allocates one byte per document and is intended for merges and compatibility APIs.
-    pub fn reconstruct_fieldnorms(&self, field: Field) -> crate::Result<FieldNormReader> {
-        let inverted = self.inverted_index(field)?;
-        if inverted.norm_storage() != NormStorage::Posting {
-            return self.get_fieldnorms_reader(field);
-        }
-        let mut norms = vec![0u8; self.max_doc() as usize];
-        let mut terms = inverted.terms().stream()?;
-        while terms.advance() {
-            let mut postings =
-                inverted.read_postings_from_terminfo(terms.value(), IndexRecordOption::Basic)?;
-            while postings.doc() != crate::TERMINATED {
-                let destination = norms.get_mut(postings.doc() as usize).ok_or_else(|| {
-                    DataCorruption::comment_only("posting document exceeds segment max_doc")
-                })?;
-                *destination = postings
-                    .fieldnorm_id()
-                    .ok_or_else(|| DataCorruption::comment_only("missing required posting norm"))?;
-                postings.advance();
-            }
-        }
-        Ok(FieldNormReader::open(FileSlice::from(norms)))
-    }
-
-    /// Returns document-addressed norms for all fields. Posting-local segments are
-    /// reconstructed once and cached, allocating one byte per document per normed field.
+    /// Returns document-addressed norms for all fields.
     #[doc(hidden)]
     pub fn fieldnorms_readers(&self) -> &FieldNormReaders {
-        self.compatible_fieldnorm_readers.get_or_init(|| {
-            self.open_compatible_fieldnorm_readers()
-                .expect("should be able to open field norms readers")
-        })
-    }
-
-    fn open_compatible_fieldnorm_readers(&self) -> crate::Result<FieldNormReaders> {
-        let fields: Vec<Field> = self
-            .schema
-            .fields()
-            .filter_map(|(field, entry)| {
-                (entry.is_indexed() && entry.has_fieldnorms()).then_some(field)
-            })
-            .collect();
-        let mut has_posting_norms = false;
-        let mut has_legacy_norms = false;
-        for &field in &fields {
-            let inverted = self.inverted_index(field)?;
-            has_posting_norms |= inverted.norm_storage() == NormStorage::Posting;
-            has_legacy_norms |=
-                inverted.norm_storage() == NormStorage::Legacy && inverted.terms().num_terms() > 0;
-        }
-        if has_legacy_norms && !has_posting_norms {
-            return FieldNormReaders::open(self.open_read(SegmentComponent::FieldNorms)?);
-        }
-        let mut bytes = Vec::new();
-        let mut composite = CompositeWrite::wrap(&mut bytes);
-        for field in fields {
-            let norms = self.get_fieldnorms_reader(field)?;
-            let writer = composite.for_field(field);
-            for doc in 0..self.max_doc() {
-                writer.write_all(&[norms.fieldnorm_id(doc)])?;
-            }
-        }
-        composite.close()?;
-        FieldNormReaders::open(FileSlice::from(bytes))
+        self.fieldnorm_readers()
     }
 
     /// Accessor to the segment's [`StoreReader`](crate::store::StoreReader).
@@ -335,7 +257,6 @@ impl SegmentReader {
             positions_composite: Default::default(),
             fast_fields_readers: Default::default(),
             fieldnorm_readers: Default::default(),
-            compatible_fieldnorm_readers: Default::default(),
 
             store_file: Default::default(),
             has_deletes: segment.meta().has_deletes(),

@@ -446,7 +446,7 @@ mod test {
         expect_single_field(segment.postings(), &field_name, 1, 512);
         assert_eq!(segment.positions().total(), 0);
         expect_single_field(segment.fast_fields(), &field_name, 1, 512);
-        assert_eq!(segment.fieldnorms().total(), 0);
+        expect_single_field(segment.fieldnorms(), &field_name, 4, 4);
         // TODO: understand why the following fails
         //        assert_eq!(0, segment.store().total());
         assert_eq!(segment.deletes(), 0);
@@ -487,7 +487,7 @@ mod test {
         expect_single_field(segment.postings(), &field_name, 1, 512);
         expect_single_field(segment.positions(), &field_name, 1, 512);
         assert_eq!(segment.fast_fields().total(), 0);
-        assert_eq!(segment.fieldnorms().total(), 0);
+        expect_single_field(segment.fieldnorms(), &field_name, 4, 4);
         // TODO: understand why the following fails
         //        assert_eq!(0, segment.store().total());
         assert_eq!(segment.deletes(), 0);
@@ -506,6 +506,7 @@ mod test {
         let reader = index.reader()?;
         let usage = reader.searcher().space_usage()?;
         assert_eq!(usage.segments().len(), 1);
+        expect_single_field(usage.segments()[0].fieldnorms(), "text", 1, 1);
         let norms = usage.segments()[0].component(SegmentComponent::Custom("pnorm".into()));
         assert_eq!(norms.total(), 2u64);
         let ComponentSpaceUsage::PerField(norms) = norms else {
@@ -599,7 +600,7 @@ mod test {
         expect_single_field(segment_space_usage.postings(), &field_name, 1, 512);
         assert_eq!(segment_space_usage.positions().total(), 0u64);
         assert_eq!(segment_space_usage.fast_fields().total(), 0u64);
-        assert_eq!(segment_space_usage.fieldnorms().total(), 0);
+        expect_single_field(segment_space_usage.fieldnorms(), &field_name, 4, 4);
         assert!(segment_space_usage.deletes() > 0);
         Ok(())
     }
