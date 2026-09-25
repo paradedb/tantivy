@@ -405,6 +405,40 @@ mod tests {
     }
 
     #[test]
+    fn test_posting_norm_requirement_survives_upgrade_and_merge() -> crate::Result<()> {
+        use crate::core::META_FILEPATH;
+        use crate::directory::{Directory, RamDirectory};
+        use crate::index::list_segment_files;
+        use crate::indexer::NoMergePolicy;
+
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field("text", TEXT);
+        let directory = RamDirectory::create();
+        let index = Index::create(directory.clone(), schema.build(), Default::default())?;
+        assert_eq!(index.load_metas()?.persisted_custom_extensions, ["pnorm"]);
+
+        let mut legacy_meta = index.load_metas()?;
+        legacy_meta.persisted_custom_extensions.clear();
+        directory.atomic_write(&META_FILEPATH, &serde_json::to_vec(&legacy_meta)?)?;
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for value in ["one", "one two"] {
+            writer.add_document(crate::doc!(text => value))?;
+            writer.commit()?;
+            assert_eq!(index.load_metas()?.persisted_custom_extensions, ["pnorm"]);
+        }
+        writer.merge(&index.searchable_segment_ids()?).wait()?;
+        let metas = index.load_metas()?;
+        assert_eq!(metas.persisted_custom_extensions, ["pnorm"]);
+        let live_files = list_segment_files(&metas.segments, &metas.persisted_custom_extensions);
+        let norm_path = metas.segments[0].relative_path(SegmentComponent::Custom("pnorm".into()));
+        assert!(live_files.contains(&norm_path));
+        writer.garbage_collect_files().wait()?;
+        assert!(directory.exists(&norm_path)?);
+        Ok(())
+    }
+
+    #[test]
     fn test_reopen_without_plugin_fails_closed() -> crate::Result<()> {
         use crate::directory::RamDirectory;
         use crate::TantivyError;
@@ -431,7 +465,7 @@ mod tests {
         assert_eq!(segment_metas.len(), 1);
         assert_eq!(
             index.load_metas()?.persisted_custom_extensions,
-            vec!["marker".to_string()]
+            vec!["marker".to_string(), "pnorm".to_string()]
         );
 
         // Reopen without re-registering the plugin: writing must fail closed

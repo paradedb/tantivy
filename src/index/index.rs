@@ -141,7 +141,7 @@ fn save_new_metas(
         opstamp: 0u64,
         payload: None,
     };
-    save_metas(&empty_metas, &empty_metas, directory)?;
+    save_metas(empty_metas.clone(), &empty_metas, directory)?;
     directory.sync_directory()?;
     Ok(())
 }
@@ -877,6 +877,7 @@ impl Index {
             .persisted_custom_extensions
             .iter()
             .map(String::as_str)
+            .filter(|&ext| ext != "pnorm")
             .collect();
         let registered_custom_extensions = self.custom_extensions();
 

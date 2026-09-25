@@ -414,9 +414,9 @@ pub struct IndexMeta {
     /// `IndexSettings` to configure index options.
     #[serde(default)]
     pub index_settings: IndexSettings,
-    /// Custom (non-built-in) plugin extensions this index was created with.
+    /// Required plugin extensions, including `pnorm` to exclude legacy writers.
     ///
-    /// Fixed at index creation. This is the single source of truth for which
+    /// Custom extensions are fixed at index creation. This is the source of truth for which
     /// custom plugins the index requires: garbage collection keeps their files,
     /// and the writer/merger fails closed if an owning plugin is not registered.
     /// An index created before this field existed deserializes to empty, i.e.
