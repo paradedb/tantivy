@@ -297,6 +297,23 @@ impl LazyStore {
     pub fn len(&self) -> usize {
         self.arena.num_vectors(self.dim)
     }
+
+    /// Appends row `index` to `out`.
+    pub(crate) fn extend_with_row(&self, index: u32, out: &mut Vec<f32>) -> io::Result<()> {
+        match &self.pinned {
+            Some(rows) => out.extend_from_slice(&rows[index as usize * self.dim..][..self.dim]),
+            None => {
+                let bytes = self.arena.row_bytes(self.dim, index)?;
+                out.extend(
+                    bytes
+                        .as_slice()
+                        .chunks_exact(mem::size_of::<f32>())
+                        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("4-byte chunk"))),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl VectorArena for LazyStore {
@@ -934,7 +951,8 @@ where
                     &matrix[j * dim..(j + 1) * dim]
                 })
                 .collect();
-            RecallEstimator::new(query, &rows, metric)
+            let sims: Vec<Similarity> = candidates.iter().map(|c| c.sim).collect();
+            RecallEstimator::new(query, &sims, Box::new(rows), metric)
         });
 
         let mut result = BinaryHeap::with_capacity(k);
@@ -948,7 +966,10 @@ where
                 .peek()
                 .filter(|_| result.len() >= k)
                 .map(|Reverse(kth)| kth.sim);
-            if estimator.cover_next(kth).is_some_and(|est| est >= recall) {
+            let estimate = estimator
+                .cover_next(kth)
+                .expect("in-memory centroid rows cannot fail to load");
+            if estimate.is_some_and(|est| est >= recall) {
                 break;
             }
         }

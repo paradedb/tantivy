@@ -14,6 +14,7 @@ mod training;
 pub(crate) const CENTROIDS_EXT: &str = "centroids";
 
 pub use aps::APS_MAX_DIM;
+pub(crate) use aps::{CandidateRows, RecallEstimator};
 pub use bkt::{BKTree, BKTreeNode, BKTreeSearchIterator, NodeId as BktNodeId};
 pub use graph::{
     Candidate, Graph, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
