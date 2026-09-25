@@ -32,7 +32,8 @@ pub struct InvertedIndexReader {
     termdict: TermDictionary,
     postings_file_slice: FileSlice,
     positions_file_slice: DeferredFileSlice,
-    posting_norms_file_slice: Option<std::sync::Arc<DeferredFileSlice>>,
+    posting_norms_file_slice:
+        Option<std::sync::Arc<crate::postings::term_norms::PostingNormsReader>>,
     record_option: IndexRecordOption,
     total_num_tokens: u64,
 }
@@ -84,7 +85,9 @@ impl InvertedIndexReader {
     }
 
     pub(crate) fn set_posting_norms_file(&mut self, source: DeferredFileSlice) {
-        self.posting_norms_file_slice = Some(std::sync::Arc::new(source));
+        self.posting_norms_file_slice = Some(std::sync::Arc::new(
+            crate::postings::term_norms::PostingNormsReader::new(source),
+        ));
     }
 
     /// Creates an empty `InvertedIndexReader` object, which
@@ -192,7 +195,10 @@ impl InvertedIndexReader {
             .slice(term_info.postings_range.clone());
         let postings_bytes = postings_slice.read_bytes()?;
         block_postings.reset(term_info.doc_freq, postings_bytes)?;
-        block_postings.set_term_norm_source(self.posting_norms_file_slice.clone())?;
+        block_postings.set_term_norm_source(
+            self.posting_norms_file_slice.clone(),
+            term_info.postings_range.start,
+        );
         Ok(())
     }
 
@@ -228,7 +234,10 @@ impl InvertedIndexReader {
             self.record_option,
             requested_option,
         )?;
-        postings.set_term_norm_source(self.posting_norms_file_slice.clone())?;
+        postings.set_term_norm_source(
+            self.posting_norms_file_slice.clone(),
+            term_info.postings_range.start,
+        );
         Ok(postings)
     }
 

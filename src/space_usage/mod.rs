@@ -496,6 +496,8 @@ mod test {
 
     #[test]
     fn test_posting_norms_component() -> crate::Result<()> {
+        use common::HasLen;
+
         let mut schema_builder = Schema::builder();
         let text = schema_builder.add_text_field("text", TEXT);
         let index = Index::builder()
@@ -513,12 +515,21 @@ mod test {
         let usage = reader.searcher().space_usage()?;
         assert_eq!(usage.segments().len(), 1);
         expect_single_field(usage.segments()[0].fieldnorms(), "text", 1, 1);
+        let file = reader
+            .searcher()
+            .segment_reader(0)
+            .open_read(SegmentComponent::Custom("pnorm".into()))?;
+        let field_file = crate::directory::CompositeFile::open(&file)?
+            .open_read(text)
+            .unwrap();
+        let bytes = field_file.len() as u64;
+        assert!(bytes > 2);
         let norms = usage.segments()[0].component(SegmentComponent::Custom("pnorm".into()));
-        assert_eq!(norms.total(), 2u64);
+        assert_eq!(norms.total(), bytes);
         let ComponentSpaceUsage::PerField(norms) = norms else {
             panic!("posting norms should report per-field space usage");
         };
-        expect_single_field(&norms, "text", 2, 2);
+        expect_single_field(&norms, "text", bytes, bytes);
         Ok(())
     }
 

@@ -94,7 +94,7 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
             payload: None,
         };
         let previous_meta = index.load_metas()?;
-        let index_meta = save_metas(index_meta, &previous_meta, index.directory())?;
+        save_metas(&index_meta, &previous_meta, index.directory())?;
         index.directory().sync_directory()?;
 
         if did_remapping {

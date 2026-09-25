@@ -1,37 +1,109 @@
 use std::cell::RefCell;
-use std::io;
+use std::io::{self, Write};
 use std::sync::Arc;
 
 use common::file_slice::DeferredFileSlice;
-use common::{BinarySerializable, HasLen};
+use common::{BinarySerializable, CountingWriter, HasLen};
+use once_cell::sync::OnceCell;
 
-use crate::directory::{BufferedFileSlice, OwnedBytes};
+use crate::directory::{BufferedFileSlice, FileSlice, OwnedBytes};
 
-pub(crate) const MAGIC: [u8; 10] = [127, 127, 127, 127, 127, 127, 127, 127, 127, 130];
 const BUFFER_SIZE: usize = 8192;
 
-pub(crate) fn read_header(mut bytes: OwnedBytes) -> io::Result<(Option<u64>, OwnedBytes)> {
-    if !bytes.starts_with(&MAGIC) {
-        return Ok((None, bytes));
+// Each field contains norm bytes, an FST (postings offset -> norm offset), and the FST length.
+pub(crate) struct TermNormsWriter<'a, W: Write> {
+    write: &'a mut CountingWriter<W>,
+    start_offset: u64,
+    offsets: tantivy_fst::MapBuilder<Vec<u8>>,
+}
+
+impl<'a, W: Write> TermNormsWriter<'a, W> {
+    pub(crate) fn new(write: &'a mut CountingWriter<W>) -> io::Result<Self> {
+        Ok(Self {
+            start_offset: write.written_bytes(),
+            write,
+            offsets: tantivy_fst::MapBuilder::new(Vec::new()).map_err(io::Error::other)?,
+        })
     }
-    bytes.advance(MAGIC.len());
-    let offset = u64::deserialize(&mut bytes)?;
-    Ok((Some(offset), bytes))
+
+    pub(crate) fn write(&mut self, postings_offset: usize, norms: &[u8]) -> io::Result<()> {
+        self.offsets
+            .insert(
+                (postings_offset as u64).to_be_bytes(),
+                self.write.written_bytes() - self.start_offset,
+            )
+            .map_err(io::Error::other)?;
+        self.write.write_all(norms)
+    }
+
+    pub(crate) fn close(self) -> io::Result<()> {
+        let offsets = self.offsets.into_inner().map_err(io::Error::other)?;
+        self.write.write_all(&offsets)?;
+        (offsets.len() as u64).serialize(self.write)
+    }
+}
+
+pub(crate) struct PostingNormsReader {
+    source: DeferredFileSlice,
+    index: OnceCell<(FileSlice, tantivy_fst::Map<OwnedBytes>)>,
+}
+
+impl PostingNormsReader {
+    pub(crate) fn new(source: DeferredFileSlice) -> Self {
+        Self {
+            source,
+            index: OnceCell::new(),
+        }
+    }
+
+    fn term_slice(&self, postings_offset: usize, len: usize) -> io::Result<FileSlice> {
+        let (norms, offsets) = self.index.get_or_try_init(|| {
+            let source = self.source.open()?;
+            if source.len() < 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated posting norms",
+                ));
+            }
+            let (body, footer) = source.clone().split_from_end(8);
+            let index_len = u64::deserialize(&mut footer.read_bytes()?)?;
+            if index_len > body.len() as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid posting norm index length",
+                ));
+            }
+            let (norms, index) = body.split_from_end(index_len as usize);
+            let fst = tantivy_fst::raw::Fst::new(index.read_bytes()?)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+            Ok((norms, tantivy_fst::Map::from(fst)))
+        })?;
+        let offset = offsets
+            .get((postings_offset as u64).to_be_bytes())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing posting norm term")
+            })?;
+        let end = offset
+            .checked_add(len as u64)
+            .filter(|&end| end <= norms.len() as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated posting norms"))?;
+        Ok(norms.slice(offset as usize..end as usize))
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct TermNormReader {
-    source: Arc<DeferredFileSlice>,
-    offset: usize,
+    source: Arc<PostingNormsReader>,
+    postings_offset: usize,
     len: usize,
     buffer: RefCell<Option<BufferedFileSlice>>,
 }
 
 impl TermNormReader {
-    pub(crate) fn new(source: Arc<DeferredFileSlice>, offset: u64, len: u32) -> Self {
+    pub(crate) fn new(source: Arc<PostingNormsReader>, postings_offset: usize, len: u32) -> Self {
         Self {
             source,
-            offset: offset as usize,
+            postings_offset,
             len: len as usize,
             buffer: RefCell::new(None),
         }
@@ -47,16 +119,8 @@ impl TermNormReader {
         }
         let mut buffer = self.buffer.borrow_mut();
         if buffer.is_none() {
-            let source = self.source.open()?;
-            let end = self
-                .offset
-                .checked_add(self.len)
-                .filter(|&end| end <= source.len())
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "truncated posting norms")
-                })?;
             *buffer = Some(BufferedFileSlice::new(
-                source.slice(self.offset..end),
+                self.source.term_slice(self.postings_offset, self.len)?,
                 BUFFER_SIZE,
             ));
         }
@@ -76,20 +140,19 @@ mod tests {
     #[derive(Debug)]
     struct TrackedFile {
         reads: Arc<Mutex<Vec<Range<usize>>>>,
+        data: Vec<u8>,
     }
 
     impl HasLen for TrackedFile {
         fn len(&self) -> usize {
-            30000
+            self.data.len()
         }
     }
 
     impl FileHandle for TrackedFile {
         fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
             self.reads.lock().unwrap().push(range.clone());
-            Ok(OwnedBytes::new(
-                range.map(|i| (i % 251) as u8).collect::<Vec<_>>(),
-            ))
+            Ok(OwnedBytes::new(self.data[range].to_vec()))
         }
     }
 
@@ -97,45 +160,101 @@ mod tests {
     fn lazy_reads_and_retained_bytes() {
         let reads = Arc::new(Mutex::new(Vec::new()));
         let opens = Arc::new(AtomicUsize::new(0));
+        let data: Vec<u8> = (0..30000).map(|i| (i % 251) as u8).collect();
+        let mut bytes = Vec::new();
+        let mut write = CountingWriter::wrap(&mut bytes);
+        let mut writer = TermNormsWriter::new(&mut write).unwrap();
+        writer.write(0, &data[..10]).unwrap();
+        writer.write(42, &data[10..29010]).unwrap();
+        writer.write(100, &data[29010..]).unwrap();
+        writer.close().unwrap();
         let file = FileSlice::new(Arc::new(TrackedFile {
             reads: reads.clone(),
+            data: bytes,
         }));
         let open_count = opens.clone();
-        let source = Arc::new(DeferredFileSlice::new(move || {
+        let source = Arc::new(PostingNormsReader::new(DeferredFileSlice::new(move || {
             open_count.fetch_add(1, Ordering::Relaxed);
             Ok(file.clone())
-        }));
-        let reader = TermNormReader::new(source, 10, 29000);
+        })));
+        let reader = TermNormReader::new(source.clone(), 42, 29000);
         assert_eq!(opens.load(Ordering::Relaxed), 0);
         assert!(reads.lock().unwrap().is_empty());
         for ordinal in [0, 127, 8000, 8191] {
             assert_eq!(reader.read(ordinal).unwrap(), ((ordinal + 10) % 251) as u8);
         }
-        assert_eq!(*reads.lock().unwrap(), vec![10..8202]);
+        assert_eq!(reads.lock().unwrap().last().unwrap(), &(10..8202));
+        let num_reads = reads.lock().unwrap().len();
         let clone = reader.clone();
         assert_eq!(clone.read(8001).unwrap(), (8011 % 251) as u8);
-        assert_eq!(reads.lock().unwrap().len(), 1);
+        assert_eq!(reads.lock().unwrap().len(), num_reads);
         assert_eq!(reader.read(20000).unwrap(), (20010 % 251) as u8);
-        assert_eq!(*reads.lock().unwrap(), vec![10..8202, 20010..28202]);
+        assert_eq!(reads.lock().unwrap().last().unwrap(), &(20010..28202));
+        assert_eq!(reads.lock().unwrap().len(), num_reads + 1);
         assert_eq!(reader.read(28192).unwrap(), (28202 % 251) as u8);
         assert_eq!(reader.read(28999).unwrap(), (29009 % 251) as u8);
         assert_eq!(reads.lock().unwrap().last().unwrap(), &(28202..29010));
         assert_eq!(opens.load(Ordering::Relaxed), 1);
         assert!(reader.read(29000).is_err());
+        assert!(TermNormReader::new(source.clone(), 43, 1).read(0).is_err());
+        assert!(TermNormReader::new(source, 100, 1000).read(0).is_err());
         let empty = BufferedFileSlice::empty();
         assert!(empty.read_byte(0).is_err());
         assert!(empty.read_byte(u64::MAX).is_err());
     }
 
     #[test]
-    fn malformed_header_and_stream() {
-        assert!(read_header(OwnedBytes::new(MAGIC.to_vec())).is_err());
-        let reader = TermNormReader::new(
-            Arc::new(DeferredFileSlice::new(|| Ok(FileSlice::from(vec![1])))),
-            0,
-            2,
-        );
-        assert!(reader.read(0).is_err());
+    fn malformed_index_and_stream() {
+        for data in [vec![1], vec![255; 8], vec![0; 16]] {
+            let source = Arc::new(PostingNormsReader::new(DeferredFileSlice::new(move || {
+                Ok(FileSlice::from(data.clone()))
+            })));
+            assert!(TermNormReader::new(source, 0, 2).read(0).is_err());
+        }
+    }
+
+    #[test]
+    fn posting_norms_leave_builtin_files_unchanged() -> crate::Result<()> {
+        use crate::index::SegmentComponent;
+        use crate::schema::{Schema, TEXT};
+        use crate::{Index, IndexSettings};
+
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field("text", TEXT);
+        let schema = schema.build();
+        let mut segments = Vec::new();
+        for posting_norms in [false, true] {
+            let index = Index::builder()
+                .schema(schema.clone())
+                .settings(IndexSettings {
+                    posting_norms,
+                    ..Default::default()
+                })
+                .create_in_ram()?;
+            let mut writer = index.writer_for_tests()?;
+            for id in 0..300 {
+                writer.add_document(
+                    doc!(text => format!("common anchor rare{id} {}", "padding ".repeat(id % 40))),
+                )?;
+            }
+            writer.commit()?;
+            segments.push(index.searchable_segments()?.pop().unwrap());
+        }
+        for component in [
+            SegmentComponent::Postings,
+            SegmentComponent::Terms,
+            SegmentComponent::Positions,
+            SegmentComponent::FieldNorms,
+        ] {
+            assert_eq!(
+                segments[0]
+                    .open_read(component.clone())?
+                    .read_bytes()?
+                    .as_slice(),
+                segments[1].open_read(component)?.read_bytes()?.as_slice()
+            );
+        }
+        Ok(())
     }
 
     #[test]

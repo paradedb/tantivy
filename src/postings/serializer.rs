@@ -103,10 +103,10 @@ impl InvertedIndexSerializer {
             bm25_params,
         )?;
         if let Some(posting_norms_write) = self.posting_norms_write.as_mut() {
-            let posting_norms_write = posting_norms_write.for_field(field);
-            serializer.posting_norms_start_offset = posting_norms_write.written_bytes();
-            serializer.posting_norms_write = Some(posting_norms_write);
             if serializer.postings_serializer.fieldnorm_reader.is_some() {
+                serializer.posting_norms_writer = Some(super::term_norms::TermNormsWriter::new(
+                    posting_norms_write.for_field(field),
+                )?);
                 serializer.postings_serializer.posting_norms = Some(Vec::new());
             }
         }
@@ -135,8 +135,7 @@ pub struct FieldSerializer<'a, W: Write = WritePtr> {
     term_open: bool,
     postings_write: &'a mut CountingWriter<W>,
     postings_start_offset: u64,
-    posting_norms_write: Option<&'a mut CountingWriter<W>>,
-    posting_norms_start_offset: u64,
+    posting_norms_writer: Option<super::term_norms::TermNormsWriter<'a, W>>,
 }
 
 impl<'a, W: Write> FieldSerializer<'a, W> {
@@ -177,8 +176,7 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             term_open: false,
             postings_write,
             postings_start_offset,
-            posting_norms_write: None,
-            posting_norms_start_offset: 0,
+            posting_norms_writer: None,
         })
     }
 
@@ -260,22 +258,14 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             return Ok(());
         };
 
-        let has_posting_norms = self.posting_norms_write.is_some()
-            && self.postings_serializer.fieldnorm_reader.is_some();
-        if has_posting_norms {
-            let offset = self.posting_norms_write.as_ref().unwrap().written_bytes()
-                - self.posting_norms_start_offset;
-            self.postings_write.write_all(&super::term_norms::MAGIC)?;
-            offset.serialize(self.postings_write)?;
-        }
         self.postings_serializer
             .close_term(self.current_term_info.doc_freq, self.postings_write)?;
         if let Some(norms) = self.postings_serializer.posting_norms.as_ref() {
             assert_eq!(norms.len(), self.current_term_info.doc_freq as usize);
-            self.posting_norms_write
+            self.posting_norms_writer
                 .as_mut()
                 .unwrap()
-                .write_all(norms)?;
+                .write(self.current_term_info.postings_range.start, norms)?;
         }
         self.current_term_info.postings_range.end = self.postings_offset();
         if let Some(positions_serializer) = self.positions_serializer_opt.as_mut() {
@@ -292,6 +282,9 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
     /// Closes the current field.
     pub fn close(mut self) -> io::Result<()> {
         self.close_term()?;
+        if let Some(posting_norms_writer) = self.posting_norms_writer {
+            posting_norms_writer.close()?;
+        }
         if let Some(positions_serializer) = self.positions_serializer_opt {
             positions_serializer.close()?;
         }

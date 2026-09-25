@@ -35,26 +35,16 @@ use crate::{FutureResult, Opstamp, TantivyError};
 ///
 /// This method is not part of tantivy's public API
 pub(crate) fn save_metas(
-    mut metas: IndexMeta,
+    metas: &IndexMeta,
     previous_metas: &IndexMeta,
     directory: &dyn Directory,
-) -> crate::Result<IndexMeta> {
+) -> crate::Result<()> {
     debug!("save metas");
 
-    // Older writers reject this required extension and their GC keeps its files.
-    if metas.index_settings.posting_norms
-        && !metas
-            .persisted_custom_extensions
-            .iter()
-            .any(|ext| ext == "pnorm")
-    {
-        metas.persisted_custom_extensions.push("pnorm".to_string());
-    }
-
-    match directory.save_metas(&metas, previous_metas, &mut ()) {
+    match directory.save_metas(metas, previous_metas, &mut ()) {
         Ok(_) => Ok(()),
         Err(crate::TantivyError::InternalError(_)) => {
-            let mut buffer = serde_json::to_vec_pretty(&metas)?;
+            let mut buffer = serde_json::to_vec_pretty(metas)?;
             // Just adding a new line at the end of the buffer.
             writeln!(&mut buffer)?;
             crate::fail_point!("save_metas", |msg| Err(crate::TantivyError::from(
@@ -66,8 +56,7 @@ pub(crate) fn save_metas(
             Ok(())
         }
         Err(e) => Err(e),
-    }?;
-    Ok(metas)
+    }
 }
 
 /// Describes a routine for allowing an operation in tantivy to be cleanly cancelled
@@ -348,7 +337,7 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         opstamp: 0u64,
         payload: None,
     };
-    save_metas(index_meta, &previous_meta, merged_index.directory_mut())?;
+    save_metas(&index_meta, &previous_meta, merged_index.directory_mut())?;
 
     Ok(merged_index)
 }
@@ -550,8 +539,8 @@ impl SegmentUpdater {
                 payload: commit_message,
             };
             // TODO add context to the error.
-            let index_meta = save_metas(
-                index_meta,
+            save_metas(
+                &index_meta,
                 &previous_metas,
                 directory.box_clone().borrow_mut(),
             )?;

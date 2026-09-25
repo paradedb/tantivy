@@ -293,9 +293,10 @@ impl Eq for Bm25Params {}
 pub struct IndexSettings {
     /// Write posting-local field norms for query scoring. Defaults to false.
     ///
-    /// Adds one byte per posting and extra indexing and merge work. Document-addressed
-    /// `.fieldnorm` data is retained. Applies to newly written and merged segments;
-    /// readers choose the norm source by file presence, independently of this setting.
+    /// Adds one byte per posting, a term-offset index, and extra indexing and merge work.
+    /// Document-addressed `.fieldnorm` data is retained. Applies to newly written and merged
+    /// segments; readers choose the norm source by file presence, independently of this
+    /// setting.
     #[serde(default, skip_serializing_if = "is_false")]
     pub posting_norms: bool,
     /// Sorts the documents by information
@@ -439,9 +440,9 @@ pub struct IndexMeta {
     /// `IndexSettings` to configure index options.
     #[serde(default)]
     pub index_settings: IndexSettings,
-    /// Required plugin extensions, including `pnorm` to exclude legacy writers.
+    /// Custom (non-built-in) plugin extensions this index was created with.
     ///
-    /// Custom extensions are fixed at index creation. This is the source of truth for which
+    /// Fixed at index creation. This is the single source of truth for which
     /// custom plugins the index requires: garbage collection keeps their files,
     /// and the writer/merger fails closed if an owning plugin is not registered.
     /// An index created before this field existed deserializes to empty, i.e.

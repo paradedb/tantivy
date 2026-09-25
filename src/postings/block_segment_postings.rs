@@ -31,7 +31,6 @@ pub struct BlockSegmentPostings {
     doc_freq: u32,
     data: OwnedBytes,
     skip_reader: SkipReader,
-    term_norm_offset: Option<u64>,
     term_norms: Option<super::term_norms::TermNormReader>,
 }
 
@@ -102,7 +101,6 @@ impl BlockSegmentPostings {
         mut record_option: IndexRecordOption,
         requested_option: IndexRecordOption,
     ) -> io::Result<BlockSegmentPostings> {
-        let (term_norm_offset, bytes) = super::term_norms::read_header(bytes)?;
         let (skip_data_opt, postings_data) = split_into_skips_and_postings(doc_freq, bytes)?;
         let skip_reader = match skip_data_opt {
             Some(skip_data) => {
@@ -136,7 +134,6 @@ impl BlockSegmentPostings {
             doc_freq,
             data: postings_data,
             skip_reader,
-            term_norm_offset,
             term_norms: None,
         };
         block_segment_postings.load_block();
@@ -188,23 +185,12 @@ impl BlockSegmentPostings {
 
     pub(crate) fn set_term_norm_source(
         &mut self,
-        source: Option<std::sync::Arc<common::file_slice::DeferredFileSlice>>,
-    ) -> io::Result<()> {
-        self.term_norms = match (source, self.term_norm_offset) {
-            (Some(source), Some(offset)) => Some(super::term_norms::TermNormReader::new(
-                source,
-                offset,
-                self.doc_freq,
-            )),
-            (Some(_), None) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "missing required posting norm header",
-                ));
-            }
-            (None, _) => None,
-        };
-        Ok(())
+        source: Option<std::sync::Arc<super::term_norms::PostingNormsReader>>,
+        postings_offset: usize,
+    ) {
+        self.term_norms = source.map(|source| {
+            super::term_norms::TermNormReader::new(source, postings_offset, self.doc_freq)
+        });
     }
 
     pub(crate) fn disable_term_norms(&mut self) {
@@ -238,8 +224,6 @@ impl BlockSegmentPostings {
     //
     // This does not reset the positions list.
     pub(crate) fn reset(&mut self, doc_freq: u32, postings_data: OwnedBytes) -> io::Result<()> {
-        let (term_norm_offset, postings_data) = super::term_norms::read_header(postings_data)?;
-        self.term_norm_offset = term_norm_offset;
         self.term_norms = None;
         let (skip_data_opt, postings_data) =
             split_into_skips_and_postings(doc_freq, postings_data)?;
@@ -479,7 +463,6 @@ impl BlockSegmentPostings {
             doc_freq: 0,
             data: OwnedBytes::empty(),
             skip_reader: SkipReader::new(OwnedBytes::empty(), 0, IndexRecordOption::Basic),
-            term_norm_offset: None,
             term_norms: None,
         }
     }
