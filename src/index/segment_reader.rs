@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::{fmt, io};
@@ -9,7 +10,7 @@ use fnv::FnvHashMap;
 use itertools::Itertools;
 
 use crate::directory::error::OpenReadError;
-use crate::directory::{CompositeFile, Directory, FileSlice};
+use crate::directory::{CompositeFile, CompositeWrite, Directory, FileSlice};
 use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders, NormStorage};
@@ -52,6 +53,7 @@ pub struct SegmentReader {
     positions_composite: Arc<OnceLock<CompositeFile>>,
     fast_fields_readers: Arc<OnceLock<FastFieldReaders>>,
     fieldnorm_readers: Arc<OnceLock<FieldNormReaders>>,
+    compatible_fieldnorm_readers: Arc<OnceLock<FieldNormReaders>>,
 
     store_file: Arc<OnceLock<FileSlice>>,
     has_deletes: bool,
@@ -224,9 +226,46 @@ impl SegmentReader {
         Ok(FieldNormReader::open(FileSlice::from(norms)))
     }
 
+    /// Returns document-addressed norms for all fields. Posting-local segments are
+    /// reconstructed once and cached, allocating one byte per document per normed field.
     #[doc(hidden)]
     pub fn fieldnorms_readers(&self) -> &FieldNormReaders {
-        self.fieldnorm_readers()
+        self.compatible_fieldnorm_readers.get_or_init(|| {
+            self.open_compatible_fieldnorm_readers()
+                .expect("should be able to open field norms readers")
+        })
+    }
+
+    fn open_compatible_fieldnorm_readers(&self) -> crate::Result<FieldNormReaders> {
+        let fields: Vec<Field> = self
+            .schema
+            .fields()
+            .filter_map(|(field, entry)| {
+                (entry.is_indexed() && entry.has_fieldnorms()).then_some(field)
+            })
+            .collect();
+        let mut has_posting_norms = false;
+        let mut has_legacy_norms = false;
+        for &field in &fields {
+            let inverted = self.inverted_index(field)?;
+            has_posting_norms |= inverted.norm_storage() == NormStorage::Posting;
+            has_legacy_norms |=
+                inverted.norm_storage() == NormStorage::Legacy && inverted.terms().num_terms() > 0;
+        }
+        if has_legacy_norms && !has_posting_norms {
+            return FieldNormReaders::open(self.open_read(SegmentComponent::FieldNorms)?);
+        }
+        let mut bytes = Vec::new();
+        let mut composite = CompositeWrite::wrap(&mut bytes);
+        for field in fields {
+            let norms = self.get_fieldnorms_reader(field)?;
+            let writer = composite.for_field(field);
+            for doc in 0..self.max_doc() {
+                writer.write_all(&[norms.fieldnorm_id(doc)])?;
+            }
+        }
+        composite.close()?;
+        FieldNormReaders::open(FileSlice::from(bytes))
     }
 
     /// Accessor to the segment's [`StoreReader`](crate::store::StoreReader).
@@ -290,6 +329,7 @@ impl SegmentReader {
             positions_composite: Default::default(),
             fast_fields_readers: Default::default(),
             fieldnorm_readers: Default::default(),
+            compatible_fieldnorm_readers: Default::default(),
 
             store_file: Default::default(),
             has_deletes: segment.meta().has_deletes(),
@@ -903,6 +943,45 @@ mod test {
     use crate::index::Index;
     use crate::schema::{Term, STORED, TEXT};
     use crate::IndexWriter;
+
+    #[test]
+    fn test_plural_fieldnorms_for_posting_segments() -> crate::Result<()> {
+        use crate::schema::{TextFieldIndexing, TextOptions};
+
+        for empty in [false, true] {
+            let mut schema = Schema::builder();
+            let text = schema.add_text_field("text", TEXT);
+            let absent = schema.add_text_field("absent", TEXT);
+            let stored = schema.add_text_field("stored", STORED);
+            let disabled = schema.add_text_field(
+                "disabled",
+                TextOptions::default()
+                    .set_indexing_options(TextFieldIndexing::default().set_fieldnorms(false)),
+            );
+            let index = Index::create_in_ram(schema.build());
+            let mut writer = index.writer_for_tests()?;
+            for value in ["one", "one two three", ""] {
+                writer.add_document(doc!(text => if empty { "" } else { value }))?;
+            }
+            writer.commit()?;
+            let searcher = index.reader()?.searcher();
+            let segment = searcher.segment_reader(0);
+            let readers = segment.fieldnorms_readers();
+            assert!(std::ptr::eq(readers, segment.fieldnorms_readers()));
+            assert!(readers.get_field(stored)?.is_none());
+            assert!(readers.get_field(disabled)?.is_none());
+            for field in [text, absent] {
+                let plural = readers.get_field(field)?.unwrap();
+                let singular = segment.get_fieldnorms_reader(field)?;
+                assert_eq!(plural.num_docs(), segment.max_doc());
+                for doc in 0..segment.max_doc() {
+                    assert_eq!(plural.fieldnorm_id(doc), singular.fieldnorm_id(doc));
+                }
+                assert!(readers.get_inner_file().open_read(field).is_some());
+            }
+        }
+        Ok(())
+    }
 
     #[track_caller]
     fn assert_merge(fields_metadatas: &[Vec<FieldMetadata>], expected: &[FieldMetadata]) {
