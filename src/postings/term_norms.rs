@@ -258,6 +258,59 @@ mod tests {
     }
 
     #[test]
+    fn posting_norms_follow_document_remapping() -> crate::Result<()> {
+        use crate::directory::RamDirectory;
+        use crate::indexer::DocIdMapping;
+        use crate::schema::{IndexRecordOption, Schema, TEXT};
+        use crate::{DocSet, Index, IndexSettings, TantivyDocument, Term, TERMINATED};
+
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field("text", TEXT);
+        let schema = schema.build();
+        let mapping = DocIdMapping::new_permutation(vec![1, 2, 0])?;
+        for posting_norms in [false, true] {
+            let mut writer = Index::builder()
+                .schema(schema.clone())
+                .settings(IndexSettings {
+                    posting_norms,
+                    manual_doc_id_mapping: true,
+                    ..Default::default()
+                })
+                .single_segment_index_writer(RamDirectory::default(), 15_000_000)?;
+            writer.add_document(doc!(text => "common padding padding"))?;
+            writer.add_document(TantivyDocument::default())?;
+            writer.add_document(doc!(text => "common"))?;
+            let index = writer.finalize_with_doc_id_mapping(&mapping)?;
+            let searcher = index.reader()?.searcher();
+            let segment = searcher.segment_reader(0);
+            let norms = segment.get_fieldnorms_reader(text)?;
+            assert_eq!(
+                (0..3).map(|doc| norms.fieldnorm(doc)).collect::<Vec<_>>(),
+                [0, 1, 3]
+            );
+            let inverted = segment.inverted_index(text)?;
+            let mut postings = inverted
+                .read_postings(
+                    &Term::from_field_text(text, "common"),
+                    IndexRecordOption::WithFreqs,
+                )?
+                .unwrap();
+            for doc in [1, 2] {
+                assert_eq!(postings.doc(), doc);
+                assert_eq!(
+                    postings
+                        .block_cursor
+                        .posting_fieldnorm_id_at(postings.block_offset()),
+                    posting_norms.then(|| norms.fieldnorm_id(doc))
+                );
+                postings.advance();
+            }
+            assert_eq!(postings.doc(), TERMINATED);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn scoring_selects_norms_by_file_presence() -> crate::Result<()> {
         use crate::collector::TopDocs;
         use crate::directory::Directory;

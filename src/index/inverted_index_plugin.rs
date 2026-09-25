@@ -411,15 +411,18 @@ impl PluginWriter for InvertedIndexPluginWriter {
         doc_id_map: Option<&DocIdMapping>,
     ) -> crate::Result<()> {
         self.fieldnorms_writer.fill_up_to_max_doc(self.max_doc);
+        if let Some(doc_id_map) = doc_id_map {
+            self.fieldnorms_writer.remap(doc_id_map);
+        }
         self.fieldnorms_writer.serialize(
             FieldNormsSerializer::from_write(segment.open_write(SegmentComponent::FieldNorms)?)?,
-            doc_id_map,
+            None,
         )?;
         serialize_postings(
             self.ctx,
             self.schema,
             &self.per_field_postings_writers,
-            |field| Ok(self.fieldnorms_writer.take_field(field, doc_id_map)),
+            |field| Ok(self.fieldnorms_writer.take_field(field)),
             doc_id_map,
             &mut self.postings_serializer,
         )?;
