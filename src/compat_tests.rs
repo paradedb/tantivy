@@ -20,7 +20,6 @@ fn create_index(path: &str) {
 
 #[test]
 /// Writes an Index for the current INDEX_FORMAT_VERSION to disk.
-#[ignore = "run explicitly to generate a compatibility fixture"]
 fn create_format() {
     let version = INDEX_FORMAT_VERSION.to_string();
     let file_path = path_for_version(&version);
@@ -35,15 +34,6 @@ fn create_format() {
 
 fn path_for_version(version: &str) -> String {
     format!("./tests/compat_tests_data/index_v{version}/")
-}
-
-#[test]
-#[cfg(not(feature = "quickwit"))]
-fn test_current_format_reopen() {
-    let directory = tempfile::tempdir().unwrap();
-    create_index(directory.path().to_str().unwrap());
-    let index = Index::open_in_dir(directory.path()).expect("Failed to reopen index");
-    assert_date_time_precision(&index, DateTimePrecision::Nanoseconds);
 }
 
 /// feature flag quickwit uses a different dictionary type

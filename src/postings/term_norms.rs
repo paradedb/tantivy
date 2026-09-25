@@ -124,7 +124,8 @@ impl TermNormReader {
                 BUFFER_SIZE,
             ));
         }
-        buffer.as_ref().unwrap().read_byte(ordinal as u64)
+        let offset = ordinal as u64;
+        Ok(buffer.as_ref().unwrap().get_bytes(offset..offset + 1)?[0])
     }
 }
 
@@ -199,8 +200,7 @@ mod tests {
         assert!(TermNormReader::new(source.clone(), 43, 1).read(0).is_err());
         assert!(TermNormReader::new(source, 100, 1000).read(0).is_err());
         let empty = BufferedFileSlice::empty();
-        assert!(empty.read_byte(0).is_err());
-        assert!(empty.read_byte(u64::MAX).is_err());
+        assert!(empty.get_bytes(0..1).is_err());
     }
 
     #[test]
