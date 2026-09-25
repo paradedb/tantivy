@@ -234,10 +234,6 @@ fn is_true(val: &bool) -> bool {
     *val
 }
 
-fn is_false(val: &bool) -> bool {
-    !val
-}
-
 /// BM25 scoring parameters.
 ///
 /// `k1` controls term-frequency saturation (must be non-negative).
@@ -292,12 +288,6 @@ impl Eq for Bm25Params {}
 /// index, like presort documents.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct IndexSettings {
-    /// Write posting-local field norms for query scoring. Defaults to false.
-    ///
-    /// Can speed up top-k BM25 queries at the cost of more storage and longer index builds
-    /// and merges.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub posting_norms: bool,
     /// Sorts the documents by information
     /// provided in `IndexSortByField`
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -364,7 +354,6 @@ fn is_default_vector_clustering_threshold(threshold: &usize) -> bool {
 impl Default for IndexSettings {
     fn default() -> Self {
         Self {
-            posting_norms: false,
             sort_by_field: None,
             manual_doc_id_mapping: false,
             docstore_compression: Compressor::default(),
@@ -661,7 +650,6 @@ mod tests {
         assert_eq!(
             index_settings,
             IndexSettings {
-                posting_norms: false,
                 sort_by_field: None,
                 manual_doc_id_mapping: false,
                 docstore_compression: Compressor::default(),

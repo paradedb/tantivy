@@ -84,7 +84,7 @@ impl InvertedIndexReader {
         })
     }
 
-    pub(crate) fn set_posting_norms_file(&mut self, source: DeferredFileSlice) {
+    pub(crate) fn set_posting_norms_file(&mut self, source: FileSlice) {
         self.posting_norms_file_slice = Some(std::sync::Arc::new(
             crate::postings::term_norms::PostingNormsReader::new(source),
         ));

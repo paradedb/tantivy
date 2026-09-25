@@ -405,16 +405,23 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_posting_norms_survive_upgrade_and_merge() -> crate::Result<()> {
+    fn test_builtin_posting_norms_survive_missing_source_and_merge() -> crate::Result<()> {
         use crate::directory::{Directory, RamDirectory};
         use crate::index::list_segment_files;
         use crate::indexer::NoMergePolicy;
 
         let mut schema = Schema::builder();
-        let text = schema.add_text_field("text", TEXT);
+        let text = schema.add_text_field(
+            "text",
+            TEXT.set_indexing_options(
+                TEXT.get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_posting_norms(true),
+            ),
+        );
         let directory = RamDirectory::create();
-        let mut index = Index::create(directory.clone(), schema.build(), Default::default())?;
-        assert!(!index.settings().posting_norms);
+        let index = Index::create(directory.clone(), schema.build(), Default::default())?;
         assert!(index.load_metas()?.persisted_custom_extensions.is_empty());
         {
             let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
@@ -422,9 +429,9 @@ mod tests {
             writer.commit()?;
         }
         let legacy_segment = index.searchable_segments()?.pop().unwrap();
-        assert!(!directory.exists(&legacy_segment.relative_path(SegmentComponent::PostingNorms))?);
-
-        index.settings_mut().posting_norms = true;
+        directory
+            .delete(&legacy_segment.relative_path(SegmentComponent::PostingNorms))
+            .unwrap();
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
         for value in ["one", "one two"] {
@@ -433,8 +440,8 @@ mod tests {
             assert!(index.load_metas()?.persisted_custom_extensions.is_empty());
         }
         drop(writer);
-        let mut index = Index::open(directory.clone())?;
-        assert!(index.settings().posting_norms);
+        let index = Index::open(directory.clone())?;
+        assert!(index.schema().get_field_entry(text).has_posting_norms());
         assert_eq!(index.searchable_segment_ids()?.len(), 3);
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.merge(&index.searchable_segment_ids()?).wait()?;
@@ -447,13 +454,6 @@ mod tests {
         writer.garbage_collect_files().wait()?;
         assert!(directory.exists(&norm_path)?);
         drop(writer);
-        index.settings_mut().posting_norms = false;
-        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
-        writer.merge(&index.searchable_segment_ids()?).wait()?;
-        let segment = index.searchable_segments()?.pop().unwrap();
-        assert!(!directory.exists(&segment.relative_path(SegmentComponent::PostingNorms))?);
-        assert!(directory.exists(&segment.relative_path(SegmentComponent::FieldNorms))?);
-        assert!(!Index::open(directory)?.settings().posting_norms);
         Ok(())
     }
 

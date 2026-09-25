@@ -501,13 +501,17 @@ mod test {
         use common::HasLen;
 
         let mut schema_builder = Schema::builder();
-        let text = schema_builder.add_text_field("text", TEXT);
+        let text = schema_builder.add_text_field(
+            "text",
+            TEXT.set_indexing_options(
+                TEXT.get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_posting_norms(true),
+            ),
+        );
         let index = Index::builder()
             .schema(schema_builder.build())
-            .settings(crate::IndexSettings {
-                posting_norms: true,
-                ..Default::default()
-            })
             .create_in_ram()?;
         let mut index_writer = index.writer_for_tests()?;
         index_writer.add_document(doc!(text => "one two"))?;

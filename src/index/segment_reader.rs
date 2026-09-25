@@ -161,7 +161,7 @@ impl SegmentReader {
         })
     }
 
-    /// Uses posting-local norms when `.pnorm` exists, otherwise reads `.fieldnorm`.
+    /// Uses posting-local norms when `.pnorm` contains the field, otherwise reads `.fieldnorm`.
     pub fn scoring_fieldnorm_reader(&self, field: Field) -> crate::Result<FieldNormReader> {
         if !self.schema.get_field_entry(field).has_fieldnorms() {
             return Ok(FieldNormReader::constant(self.max_doc(), 1));
@@ -336,16 +336,9 @@ impl SegmentReader {
         if field_entry.has_fieldnorms() {
             match self.open_read(SegmentComponent::PostingNorms) {
                 Ok(source) => {
-                    inv_idx_reader.set_posting_norms_file(DeferredFileSlice::new(move || {
-                        CompositeFile::open(&source)?
-                            .open_read(field)
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "missing posting norm field",
-                                )
-                            })
-                    }));
+                    if let Some(file) = CompositeFile::open(&source)?.open_read(field) {
+                        inv_idx_reader.set_posting_norms_file(file);
+                    }
                 }
                 Err(OpenReadError::FileDoesNotExist(_)) => {}
                 Err(error) => return Err(error.into()),

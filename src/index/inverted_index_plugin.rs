@@ -731,18 +731,27 @@ mod tests {
 
         for sorted in [false, true] {
             let mut schema = Schema::builder();
-            let text = schema.add_text_field("text", TEXT);
+            let text = schema.add_text_field(
+                "text",
+                TEXT.set_indexing_options(
+                    TEXT.get_indexing_options()
+                        .unwrap()
+                        .clone()
+                        .set_posting_norms(true),
+                ),
+            );
             let basic = schema.add_text_field(
                 "basic",
                 TextOptions::default().set_indexing_options(
-                    TextFieldIndexing::default().set_index_option(IndexRecordOption::Basic),
+                    TextFieldIndexing::default()
+                        .set_index_option(IndexRecordOption::Basic)
+                        .set_posting_norms(true),
                 ),
             );
             let id = schema.add_u64_field("id", INDEXED | FAST);
             let index = Index::builder()
                 .schema(schema.build())
                 .settings(IndexSettings {
-                    posting_norms: true,
                     sort_by_field: sorted.then(|| IndexSortByField {
                         field: "id".into(),
                         order: Order::Asc,

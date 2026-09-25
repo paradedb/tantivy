@@ -63,7 +63,11 @@ impl InvertedIndexSerializer {
             postings_write: CompositeWrite::wrap(segment.open_write(Postings)?),
             positions_write: CompositeWrite::wrap(segment.open_write(Positions)?),
             schema: segment.schema(),
-            posting_norms_write: if segment.index().settings().posting_norms {
+            posting_norms_write: if segment
+                .schema()
+                .fields()
+                .any(|(_, entry)| entry.has_posting_norms())
+            {
                 Some(CompositeWrite::wrap(
                     segment.open_write(crate::index::SegmentComponent::PostingNorms)?,
                 ))
@@ -103,7 +107,7 @@ impl InvertedIndexSerializer {
             bm25_params,
         )?;
         if let Some(posting_norms_write) = self.posting_norms_write.as_mut() {
-            if serializer.postings_serializer.fieldnorm_reader.is_some() {
+            if field_entry.has_posting_norms() {
                 serializer.posting_norms_writer = Some(super::term_norms::TermNormsWriter::new(
                     posting_norms_write.for_field(field),
                 )?);

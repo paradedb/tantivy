@@ -362,6 +362,26 @@ impl FieldType {
         }
     }
 
+    /// Returns true if posting-local norms are enabled for this field.
+    pub fn has_posting_norms(&self) -> bool {
+        match self {
+            FieldType::Str(options) => options
+                .get_indexing_options()
+                .is_some_and(TextFieldIndexing::posting_norms),
+            FieldType::U64(options)
+            | FieldType::I64(options)
+            | FieldType::F64(options)
+            | FieldType::Bool(options) => options.posting_norms(),
+            FieldType::Date(options) => options.posting_norms(),
+            FieldType::Bytes(options) => options.posting_norms(),
+            FieldType::IpAddr(options) => options.posting_norms(),
+            FieldType::Facet(_)
+            | FieldType::JsonObject(_)
+            | FieldType::Custom(_)
+            | FieldType::Vector(_) => false,
+        }
+    }
+
     /// Given a field configuration, return the maximal possible
     /// `IndexRecordOption` available.
     ///

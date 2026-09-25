@@ -4,6 +4,7 @@ use std::ops::BitOr;
 use serde::{Deserialize, Serialize};
 
 use super::flags::{CoerceFlag, FastFlag};
+use super::is_false;
 use crate::index::Bm25Params;
 use crate::schema::flags::{SchemaFlagList, StoredFlag};
 use crate::schema::IndexRecordOption;
@@ -94,10 +95,6 @@ pub(super) mod fast_field_text_options_serde {
             })),
         }
     }
-}
-
-fn is_false(val: &bool) -> bool {
-    !val
 }
 
 impl TextOptions {
@@ -194,6 +191,8 @@ pub struct TextFieldIndexing {
     record: IndexRecordOption,
     #[serde(default = "default_fieldnorms")]
     fieldnorms: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    posting_norms: bool,
     #[serde(default = "default_tokenizer")]
     tokenizer: Cow<'static, str>,
     #[serde(default)]
@@ -215,6 +214,7 @@ impl Default for TextFieldIndexing {
             tokenizer: default_tokenizer(),
             record: IndexRecordOption::default(),
             fieldnorms: default_fieldnorms(),
+            posting_norms: false,
             bm25_params: Bm25Params::default(),
         }
     }
@@ -243,6 +243,19 @@ impl TextFieldIndexing {
     /// Returns true if and only if [fieldnorms](crate::fieldnorm) are stored.
     pub fn fieldnorms(&self) -> bool {
         self.fieldnorms
+    }
+
+    /// Returns whether posting-local norms are enabled for this field.
+    pub fn posting_norms(&self) -> bool {
+        self.posting_norms && self.fieldnorms()
+    }
+
+    /// Enables posting-local norms for faster top-k BM25 queries, at the cost of more storage
+    /// and longer index builds and merges. Defaults to false; requires indexing and fieldnorms.
+    #[must_use]
+    pub fn set_posting_norms(mut self, posting_norms: bool) -> Self {
+        self.posting_norms = posting_norms;
+        self
     }
 
     /// Sets which information should be indexed with the tokens.
@@ -279,6 +292,7 @@ pub const STRING: TextOptions = TextOptions {
     indexing: Some(TextFieldIndexing {
         tokenizer: Cow::Borrowed(RAW_TOKENIZER_NAME),
         fieldnorms: true,
+        posting_norms: false,
         record: IndexRecordOption::Basic,
         bm25_params: Bm25Params::DEFAULT,
     }),
@@ -292,6 +306,7 @@ pub const TEXT: TextOptions = TextOptions {
     indexing: Some(TextFieldIndexing {
         tokenizer: Cow::Borrowed(DEFAULT_TOKENIZER_NAME),
         fieldnorms: true,
+        posting_norms: false,
         record: IndexRecordOption::WithFreqsAndPositions,
         bm25_params: Bm25Params::DEFAULT,
     }),

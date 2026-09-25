@@ -332,15 +332,26 @@ mod tests {
 
     #[test]
     fn test_unscored_regex_phrase_does_not_read_posting_norms() -> crate::Result<()> {
+        use std::io::Write;
+
         use crate::collector::Count;
         use crate::directory::CompositeWrite;
         use crate::index::SegmentComponent;
+        use crate::schema::{Schema, TEXT};
         use crate::Directory;
 
         let documents: Vec<String> = (0..1000).map(|i| format!("rare{i:04} common")).collect();
-        let mut index = create_index(&[] as &[&str])?;
-        index.settings_mut().posting_norms = true;
-        let text = index.schema().get_field("text")?;
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field(
+            "text",
+            TEXT.set_indexing_options(
+                TEXT.get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_posting_norms(true),
+            ),
+        );
+        let index = crate::Index::create_in_ram(schema.build());
         let mut writer = index.writer_for_tests()?;
         for document in documents {
             writer.add_document(doc!(text => document))?;
@@ -349,7 +360,9 @@ mod tests {
         for segment in index.searchable_segments()? {
             let path = segment.relative_path(SegmentComponent::PostingNorms);
             index.directory().delete(&path).unwrap();
-            CompositeWrite::wrap(index.directory().open_write(&path)?).close()?;
+            let mut composite = CompositeWrite::wrap(index.directory().open_write(&path)?);
+            composite.for_field(text).write_all(&[255])?;
+            composite.close()?;
         }
         let query = RegexPhraseQuery::new(text, vec!["rare.*".into(), "common".into()]);
         assert_eq!(index.reader()?.searcher().search(&query, &Count)?, 1000);
