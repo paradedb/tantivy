@@ -26,7 +26,7 @@ use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperK
 
 use crate::directory::FileSlice;
 use crate::schema::Metric;
-use crate::vector::ivf::aps;
+use crate::vector::ivf::aps::RecallEstimator;
 use crate::vector::{Candidate, FileSliceArena, Similarity, VectorArena, VectorElement};
 
 /// Row index into a level's centroid or member arena. Not a graph [`super::NodeId`].
@@ -69,9 +69,6 @@ pub const PARENT_RECALL_TARGET: f32 = 0.99;
 
 /// Default fan-out of the Multi-level IVF index
 pub const DEFAULT_BRANCHING_FACTOR: usize = 100;
-
-/// Default relative change in `ρ` that triggers an APS recall profile recompute.
-pub const APS_RECOMPUTE_THRESHOLD: f32 = 0.10;
 
 /// Search and clustering knobs for this level. Not persisted.
 #[derive(Clone, Debug)]
@@ -928,9 +925,7 @@ where
             return (Vec::new(), stats);
         }
 
-        // Query-to-bisector distances are independent of the radius, so
-        // compute them once; the recall profile is re-derived per scan.
-        let boundary = if can_aps {
+        let mut estimator = can_aps.then(|| {
             let (matrix, _) = self.centroids.centroid_matrix().expect("can_aps");
             let rows: Vec<&[f32]> = candidates
                 .iter()
@@ -939,39 +934,21 @@ where
                     &matrix[j * dim..(j + 1) * dim]
                 })
                 .collect();
-            aps::compute_boundary_distances(query, &rows, aps::is_euclidean(metric))
-        } else {
-            Vec::new()
-        };
-
-        let mut rho: Option<f32> = None;
-        let mut profile: Vec<f32> = Vec::new();
-        let mut est = 0.0f32;
+            RecallEstimator::new(query, &rows, metric)
+        });
 
         let mut result = BinaryHeap::with_capacity(k);
-        for (i, c) in candidates.iter().enumerate() {
+        for c in &candidates {
             stats.members_scored += self.scan_cluster(query, metric, c.node, &mut result, k);
             stats.lists_scanned += 1;
-            if !can_aps {
-                continue;
-            }
-
-            let Some(Reverse(kth)) = result.peek().filter(|_| result.len() >= k) else {
+            let Some(estimator) = estimator.as_mut() else {
                 continue;
             };
-            let new_rho = aps::radius_from_kth(kth.sim, metric);
-            let recompute = rho.map_or(true, |old| {
-                (old - new_rho).abs() > APS_RECOMPUTE_THRESHOLD * old
-            });
-            if recompute {
-                rho = Some(new_rho);
-                profile =
-                    aps::compute_recall_profile(&boundary, new_rho, dim, aps::is_euclidean(metric));
-                est = profile[..=i].iter().sum();
-            } else {
-                est += profile.get(i).copied().unwrap_or(0.0);
-            }
-            if est >= recall {
+            let kth = result
+                .peek()
+                .filter(|_| result.len() >= k)
+                .map(|Reverse(kth)| kth.sim);
+            if estimator.cover_next(kth).is_some_and(|est| est >= recall) {
                 break;
             }
         }
