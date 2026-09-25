@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::io;
 use std::sync::Arc;
 
@@ -9,25 +9,6 @@ use crate::directory::{BufferedFileSlice, OwnedBytes};
 
 pub(crate) const MAGIC: [u8; 10] = [127, 127, 127, 127, 127, 127, 127, 127, 127, 130];
 const BUFFER_SIZE: usize = 8192;
-
-thread_local! {
-    #[cfg(test)]
-    static READS: Cell<u64> = const { Cell::new(0) };
-    static ENABLED: Cell<bool> = const { Cell::new(true) };
-}
-
-/// Selects term-local norm reads for newly opened scorers in this thread.
-pub fn set_posting_norms_enabled(enabled: bool) -> bool {
-    #[cfg(test)]
-    READS.set(0);
-    ENABLED.replace(enabled)
-}
-
-/// Returns the number of term-local norm lookups since the last mode change.
-#[cfg(test)]
-pub fn posting_norm_reads() -> u64 {
-    READS.get()
-}
 
 pub(crate) fn read_header(mut bytes: OwnedBytes) -> io::Result<(Option<u64>, OwnedBytes)> {
     if !bytes.starts_with(&MAGIC) {
@@ -47,18 +28,13 @@ pub(crate) struct TermNormReader {
 }
 
 impl TermNormReader {
-    pub(crate) fn new(
-        source: Arc<DeferredFileSlice>,
-        offset: u64,
-        len: u32,
-        required: bool,
-    ) -> Option<Self> {
-        (required || ENABLED.get()).then(|| Self {
+    pub(crate) fn new(source: Arc<DeferredFileSlice>, offset: u64, len: u32) -> Self {
+        Self {
             source,
             offset: offset as usize,
             len: len as usize,
             buffer: RefCell::new(None),
-        })
+        }
     }
 
     #[inline]
@@ -69,8 +45,6 @@ impl TermNormReader {
                 "posting norm ordinal out of bounds",
             ));
         }
-        #[cfg(test)]
-        READS.set(READS.get() + 1);
         let mut buffer = self.buffer.borrow_mut();
         if buffer.is_none() {
             let source = self.source.open()?;
@@ -121,7 +95,6 @@ mod tests {
 
     #[test]
     fn lazy_reads_and_retained_bytes() {
-        set_posting_norms_enabled(true);
         let reads = Arc::new(Mutex::new(Vec::new()));
         let opens = Arc::new(AtomicUsize::new(0));
         let file = FileSlice::new(Arc::new(TrackedFile {
@@ -132,7 +105,7 @@ mod tests {
             open_count.fetch_add(1, Ordering::Relaxed);
             Ok(file.clone())
         }));
-        let reader = TermNormReader::new(source, 10, 29000, false).unwrap();
+        let reader = TermNormReader::new(source, 10, 29000);
         assert_eq!(opens.load(Ordering::Relaxed), 0);
         assert!(reads.lock().unwrap().is_empty());
         for ordinal in [0, 127, 8000, 8191] {
@@ -157,14 +130,11 @@ mod tests {
     #[test]
     fn malformed_header_and_stream() {
         assert!(read_header(OwnedBytes::new(MAGIC.to_vec())).is_err());
-        set_posting_norms_enabled(true);
         let reader = TermNormReader::new(
             Arc::new(DeferredFileSlice::new(|| Ok(FileSlice::from(vec![1])))),
             0,
             2,
-            false,
-        )
-        .unwrap();
+        );
         assert!(reader.read(0).is_err());
     }
 
@@ -227,10 +197,8 @@ mod tests {
                 ])) as Box<dyn Query>,
             ];
             for query in queries {
-                set_posting_norms_enabled(true);
                 let actual = searcher.search(&*query, &TopDocs::with_limit(25).order_by_score())?;
                 assert!(!actual.is_empty());
-                assert!(posting_norm_reads() > 0);
             }
             for segment in searcher.segment_readers() {
                 let inv = segment.inverted_index(title)?;
@@ -241,19 +209,15 @@ mod tests {
                 let weight = query.weight(crate::query::EnableScoring::disabled_from_searcher(
                     &searcher,
                 ))?;
-                set_posting_norms_enabled(true);
                 let mut scorer = weight.scorer(segment, 1.0)?;
                 while scorer.doc() != TERMINATED {
                     scorer.score();
                     scorer.advance();
                 }
-                assert_eq!(posting_norm_reads(), 0);
                 let mut postings = inv
                     .read_postings(&term, IndexRecordOption::WithFreqs)?
                     .unwrap();
-                set_posting_norms_enabled(true);
                 postings.seek(150);
-                assert_eq!(posting_norm_reads(), 0);
                 while postings.doc() != TERMINATED {
                     assert_eq!(
                         postings
@@ -273,7 +237,6 @@ mod tests {
                 );
             }
         }
-        set_posting_norms_enabled(true);
         Ok(())
     }
 }

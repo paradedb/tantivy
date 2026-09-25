@@ -198,9 +198,9 @@ impl BlockSegmentPostings {
                 "missing required posting norm header",
             ));
         }
-        self.term_norms = self.term_norm_offset.and_then(|offset| {
-            super::term_norms::TermNormReader::new(source, offset, self.doc_freq, required)
-        });
+        self.term_norms = self
+            .term_norm_offset
+            .map(|offset| super::term_norms::TermNormReader::new(source, offset, self.doc_freq));
         Ok(())
     }
 
