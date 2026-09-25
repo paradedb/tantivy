@@ -13,8 +13,8 @@ mod training;
 /// The IVF cluster-routing file. Written per field, only for IVF segments.
 pub(crate) const CENTROIDS_EXT: &str = "centroids";
 
-pub(crate) use aps::RecallEstimator;
 pub use aps::APS_MAX_DIM;
+pub(crate) use aps::{CandidateRows, RecallEstimator};
 pub use bkt::{BKTree, BKTreeNode, BKTreeSearchIterator, NodeId as BktNodeId};
 pub use graph::{
     Candidate, Graph, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,

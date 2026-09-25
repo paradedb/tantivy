@@ -1,12 +1,12 @@
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::ivf::{
-    Candidate, ClusterId, InMemoryStackedIvf, IvfConfig, IvfIndexBuilder, LazyStackedIvf,
-    RecallEstimator, StackedSearchStats, SuperKMeansLevelClusterer, APS_MAX_DIM,
-    PARENT_NPROBE_FRACTION,
+    Candidate, CandidateRows, ClusterId, InMemoryStackedIvf, IvfConfig, IvfIndexBuilder,
+    LazyStackedIvf, LazyStore, RecallEstimator, StackedSearchStats, SuperKMeansLevelClusterer,
+    APS_MAX_DIM, PARENT_NPROBE_FRACTION,
 };
 use crate::vector::router::{RouterMetrics, RoutingParams};
-use crate::vector::IvfCentroids;
+use crate::vector::{IvfCentroids, Similarity};
 use crate::TantivyError;
 
 /// The router's [`IvfConfig`]. The segment's own IVF (`.vec` rows under
@@ -117,25 +117,40 @@ pub(super) fn rank(
 /// or `None` when APS is off for `recall` at this dimension. Call before
 /// the first pull: the estimator covers the whole candidate set. The
 /// bottom router level's members are the segment centroids, row for row,
-/// so candidate rows come from its member store.
-pub(super) fn recall_estimator(
-    index: &LazyStackedIvf,
+/// so candidate rows come from its member store, fetched only as the
+/// estimator needs them.
+pub(super) fn recall_estimator<'a>(
+    index: &'a LazyStackedIvf,
     ranking: &Ranking,
     query: &[f32],
     metric: Metric,
     recall: f32,
-) -> crate::Result<Option<RecallEstimator>> {
+) -> Option<RecallEstimator<'a>> {
     let candidates = ranking.ranked.as_slice();
     if effective_recall(query.len(), recall) >= 1.0 || candidates.is_empty() {
-        return Ok(None);
+        return None;
     }
-    let dim = query.len();
-    let mut rows = Vec::with_capacity(candidates.len() * dim);
-    for candidate in candidates {
-        index.vectors.extend_with_row(candidate.node.0, &mut rows)?;
+    let sims: Vec<Similarity> = candidates.iter().map(|candidate| candidate.sim).collect();
+    let rows = MemberRows {
+        members: &index.vectors,
+        clusters: candidates
+            .iter()
+            .map(|candidate| candidate.node.0)
+            .collect(),
+    };
+    Some(RecallEstimator::new(query, &sims, Box::new(rows), metric))
+}
+
+/// Ranked candidates' centroid rows, read from the bottom level's members.
+struct MemberRows<'a> {
+    members: &'a LazyStore,
+    clusters: Vec<u32>,
+}
+
+impl CandidateRows for MemberRows<'_> {
+    fn append_row(&self, rank: usize, out: &mut Vec<f32>) -> std::io::Result<()> {
+        self.members.extend_with_row(self.clusters[rank], out)
     }
-    let rows: Vec<&[f32]> = rows.chunks_exact(dim).collect();
-    Ok(Some(RecallEstimator::new(query, &rows, metric)))
 }
 
 pub(crate) struct Ranking {

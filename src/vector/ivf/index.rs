@@ -312,7 +312,7 @@ impl IvfIndex {
         ranked: &RouterIter<'_, '_>,
         query: &[f32],
         recall: f32,
-    ) -> crate::Result<Option<RecallEstimator>> {
+    ) -> Option<RecallEstimator<'_>> {
         self.router
             .recall_estimator(ranked, query, self.metric, recall)
     }

@@ -951,7 +951,8 @@ where
                     &matrix[j * dim..(j + 1) * dim]
                 })
                 .collect();
-            RecallEstimator::new(query, &rows, metric)
+            let sims: Vec<Similarity> = candidates.iter().map(|c| c.sim).collect();
+            RecallEstimator::new(query, &sims, Box::new(rows), metric)
         });
 
         let mut result = BinaryHeap::with_capacity(k);
@@ -965,7 +966,10 @@ where
                 .peek()
                 .filter(|_| result.len() >= k)
                 .map(|Reverse(kth)| kth.sim);
-            if estimator.cover_next(kth).is_some_and(|est| est >= recall) {
+            let estimate = estimator
+                .cover_next(kth)
+                .expect("in-memory centroid rows cannot fail to load");
+            if estimate.is_some_and(|est| est >= recall) {
                 break;
             }
         }

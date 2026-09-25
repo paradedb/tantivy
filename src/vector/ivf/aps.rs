@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::f64::consts::PI;
+use std::io;
 use std::sync::{Mutex, OnceLock};
 
 use crate::schema::Metric;
@@ -136,6 +137,7 @@ pub(crate) fn boundary_distance(query: &[f32], c0: &[f32], cj: &[f32], euclidean
 
 /// Distances from `query` to each candidate's bisector with `centroids[0]`.
 /// `out[0]` is 0.
+#[cfg(test)]
 pub(crate) fn compute_boundary_distances(
     query: &[f32],
     centroids: &[&[f32]],
@@ -283,6 +285,19 @@ pub(crate) fn is_euclidean(metric: Metric) -> bool {
 /// Relative change in `ρ` that triggers a recall profile recompute.
 pub const APS_RECOMPUTE_THRESHOLD: f32 = 0.10;
 
+/// Centroid rows of a ranked candidate set, fetched on demand.
+pub(crate) trait CandidateRows {
+    /// Appends candidate `rank`'s centroid row to `out`.
+    fn append_row(&self, rank: usize, out: &mut Vec<f32>) -> io::Result<()>;
+}
+
+impl CandidateRows for Vec<&[f32]> {
+    fn append_row(&self, rank: usize, out: &mut Vec<f32>) -> io::Result<()> {
+        out.extend_from_slice(self[rank]);
+        Ok(())
+    }
+}
+
 /// Running APS recall estimate over a ranked candidate set.
 ///
 /// Candidates are covered in rank order, so the covered set is always a
@@ -290,23 +305,56 @@ pub const APS_RECOMPUTE_THRESHOLD: f32 = 0.10;
 /// and is recomputed only when `ρ` moves by more than
 /// [`APS_RECOMPUTE_THRESHOLD`]; otherwise each newly covered candidate adds
 /// its cached probability.
-pub(crate) struct RecallEstimator {
-    boundary: Vec<f32>,
-    dim: usize,
+///
+/// Boundaries are computed lazily. Under L2, candidate `j`'s bisector with
+/// the nearest centroid is at least `(δ_j - δ_0) / 2` from the query (`δ`
+/// the query-to-centroid distance, by the triangle inequality), so once
+/// `δ_j ≥ δ_0 + 2ρ` that candidate and every later one lie outside the
+/// query ball and have zero cap volume. Only the candidates before that
+/// cutoff are fetched, which keeps the profile identical to one over the
+/// whole ranking. Other metrics fetch every candidate at the first estimate.
+pub(crate) struct RecallEstimator<'a> {
+    query: Vec<f32>,
     metric: Metric,
+    rows: Box<dyn CandidateRows + 'a>,
+    /// `δ_j` per candidate under L2, ascending; empty for other metrics.
+    dists: Vec<f32>,
+    len: usize,
+    nearest: Vec<f32>,
+    row: Vec<f32>,
+    /// Boundary distances of the fetched candidate prefix.
+    boundary: Vec<f32>,
     rho: Option<f32>,
     profile: Vec<f32>,
     covered: usize,
     estimate: f32,
 }
 
-impl RecallEstimator {
-    /// `centroids[i]` is candidate `i`'s centroid, nearest first.
-    pub(crate) fn new(query: &[f32], centroids: &[&[f32]], metric: Metric) -> Self {
+impl<'a> RecallEstimator<'a> {
+    /// `sims[i]` is candidate `i`'s similarity to `query`, nearest first,
+    /// and `rows` serves its centroid.
+    pub(crate) fn new(
+        query: &[f32],
+        sims: &[Similarity],
+        rows: Box<dyn CandidateRows + 'a>,
+        metric: Metric,
+    ) -> Self {
+        let dists = if is_euclidean(metric) {
+            sims.iter()
+                .map(|sim| (-sim.score()).max(0.0).sqrt())
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
-            boundary: compute_boundary_distances(query, centroids, is_euclidean(metric)),
-            dim: query.len(),
+            query: query.to_vec(),
             metric,
+            rows,
+            dists,
+            len: sims.len(),
+            nearest: Vec::new(),
+            row: Vec::new(),
+            boundary: Vec::new(),
             rho: None,
             profile: Vec::new(),
             covered: 0,
@@ -314,27 +362,90 @@ impl RecallEstimator {
         }
     }
 
+    /// An estimator over in-memory `rows`, nearest first, scoring each
+    /// against `query` under `metric`.
+    #[cfg(test)]
+    pub(crate) fn from_rows(query: &[f32], rows: Vec<&'a [f32]>, metric: Metric) -> Self {
+        let sims: Vec<Similarity> = rows
+            .iter()
+            .map(|row| {
+                let score = if is_euclidean(metric) {
+                    -query
+                        .iter()
+                        .zip(*row)
+                        .map(|(q, c)| (q - c) * (q - c))
+                        .sum::<f32>()
+                } else {
+                    query.iter().zip(*row).map(|(q, c)| q * c).sum()
+                };
+                Similarity::new(score)
+            })
+            .collect();
+        Self::new(query, &sims, Box::new(rows), metric)
+    }
+
     /// Covers the next candidate and returns the estimated recall of the
     /// covered prefix. `kth` is the current k-th result, `None` until the
     /// result heap holds `k`; the estimate is `None` until then too.
-    pub(crate) fn cover_next(&mut self, kth: Option<Similarity>) -> Option<f32> {
+    pub(crate) fn cover_next(&mut self, kth: Option<Similarity>) -> io::Result<Option<f32>> {
         let i = self.covered;
         self.covered += 1;
-        let rho = radius_from_kth(kth?, self.metric);
+        let Some(kth) = kth else {
+            return Ok(None);
+        };
+        let rho = radius_from_kth(kth, self.metric);
         let recompute = self.rho.map_or(true, |old| {
             (old - rho).abs() > APS_RECOMPUTE_THRESHOLD * old
         });
         if recompute {
             self.rho = Some(rho);
-            self.profile =
-                compute_recall_profile(&self.boundary, rho, self.dim, is_euclidean(self.metric));
+            self.fetch_boundaries(self.cutoff(rho))?;
+            self.profile = compute_recall_profile(
+                &self.boundary,
+                rho,
+                self.query.len(),
+                is_euclidean(self.metric),
+            );
             self.estimate = self.profile[..self.covered.min(self.profile.len())]
                 .iter()
                 .sum();
         } else {
             self.estimate += self.profile.get(i).copied().unwrap_or(0.0);
         }
-        Some(self.estimate)
+        Ok(Some(self.estimate))
+    }
+
+    /// Candidates that can reach a query ball of radius `rho`: a prefix of
+    /// the ranking, never empty.
+    fn cutoff(&self, rho: f32) -> usize {
+        let Some(&nearest) = self.dists.first() else {
+            return self.len;
+        };
+        self.dists
+            .partition_point(|&dist| dist < nearest + 2.0 * rho)
+            .max(1)
+    }
+
+    /// Computes boundary distances through candidate `cutoff - 1`. The
+    /// fetched prefix only grows; candidates past a later, smaller cutoff
+    /// keep their boundaries and contribute zero volume.
+    fn fetch_boundaries(&mut self, cutoff: usize) -> io::Result<()> {
+        if self.boundary.is_empty() && self.len > 0 {
+            self.rows.append_row(0, &mut self.nearest)?;
+            self.boundary.push(0.0);
+        }
+        let euclidean = is_euclidean(self.metric);
+        for rank in self.boundary.len()..cutoff.min(self.len) {
+            self.row.clear();
+            self.rows.append_row(rank, &mut self.row)?;
+            self.boundary.push(boundary_distance(
+                &self.query,
+                &self.nearest,
+                &self.row,
+                euclidean,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -407,10 +518,10 @@ mod tests {
     fn estimator_waits_for_a_full_heap() {
         let (q, c) = three_cells();
         let rows: Vec<&[f32]> = c.iter().map(|r| &r[..]).collect();
-        let mut est = RecallEstimator::new(&q, &rows, Metric::L2);
-        assert_eq!(est.cover_next(None), None);
+        let mut est = RecallEstimator::from_rows(&q, rows, Metric::L2);
+        assert_eq!(est.cover_next(None).unwrap(), None);
         // The first estimate covers every candidate seen so far.
-        let got = est.cover_next(Some(kth_at(1.5))).unwrap();
+        let got = est.cover_next(Some(kth_at(1.5))).unwrap().unwrap();
         let profile = compute_recall_profile(&est.boundary, 1.5, 2, true);
         assert!(
             (got - (profile[0] + profile[1])).abs() < 1e-6,
@@ -422,15 +533,15 @@ mod tests {
     fn estimator_reuses_profile_within_threshold() {
         let (q, c) = three_cells();
         let rows: Vec<&[f32]> = c.iter().map(|r| &r[..]).collect();
-        let mut est = RecallEstimator::new(&q, &rows, Metric::L2);
-        let first = est.cover_next(Some(kth_at(1.5))).unwrap();
+        let mut est = RecallEstimator::from_rows(&q, rows, Metric::L2);
+        let first = est.cover_next(Some(kth_at(1.5))).unwrap().unwrap();
         let profile = est.profile.clone();
         // A 5% radius change keeps the cached profile.
-        let second = est.cover_next(Some(kth_at(1.5 * 0.95))).unwrap();
+        let second = est.cover_next(Some(kth_at(1.5 * 0.95))).unwrap().unwrap();
         assert_eq!(est.profile, profile);
         assert!((second - (first + profile[1])).abs() < 1e-6);
         // Covering everything under one profile reaches full recall.
-        let third = est.cover_next(Some(kth_at(1.5 * 0.95))).unwrap();
+        let third = est.cover_next(Some(kth_at(1.5 * 0.95))).unwrap().unwrap();
         assert!((third - 1.0).abs() < 1e-5, "{third}");
     }
 
@@ -438,11 +549,62 @@ mod tests {
     fn estimator_recomputes_past_threshold() {
         let (q, c) = three_cells();
         let rows: Vec<&[f32]> = c.iter().map(|r| &r[..]).collect();
-        let mut est = RecallEstimator::new(&q, &rows, Metric::L2);
-        est.cover_next(Some(kth_at(1.5)));
-        let got = est.cover_next(Some(kth_at(0.5))).unwrap();
+        let mut est = RecallEstimator::from_rows(&q, rows, Metric::L2);
+        est.cover_next(Some(kth_at(1.5))).unwrap();
+        let got = est.cover_next(Some(kth_at(0.5))).unwrap().unwrap();
         let profile = compute_recall_profile(&est.boundary, 0.5, 2, true);
         assert_eq!(est.profile, profile);
         assert!((got - (profile[0] + profile[1])).abs() < 1e-6);
+    }
+
+    /// Serves in-memory rows and records which ranks were fetched.
+    struct CountingRows<'a> {
+        rows: Vec<&'a [f32]>,
+        fetched: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+    }
+
+    impl CandidateRows for CountingRows<'_> {
+        fn append_row(&self, rank: usize, out: &mut Vec<f32>) -> io::Result<()> {
+            self.fetched.borrow_mut().push(rank);
+            out.extend_from_slice(self.rows[rank]);
+            Ok(())
+        }
+    }
+
+    /// Only candidates with `δ_j < δ_0 + 2ρ` are fetched, and the estimate
+    /// matches a profile over the whole ranking.
+    #[test]
+    fn estimator_fetches_only_candidates_the_ball_can_reach() {
+        let q = [0.1f32, 0.0];
+        let centroids: Vec<[f32; 2]> = (0..10).map(|j| [j as f32, 0.0]).collect();
+        let rows: Vec<&[f32]> = centroids.iter().map(|r| &r[..]).collect();
+        let sims: Vec<Similarity> = centroids
+            .iter()
+            .map(|c| Similarity::new(-((c[0] - q[0]).powi(2) + (c[1] - q[1]).powi(2))))
+            .collect();
+        let fetched = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut est = RecallEstimator::new(
+            &q,
+            &sims,
+            Box::new(CountingRows {
+                rows: rows.clone(),
+                fetched: fetched.clone(),
+            }),
+            Metric::L2,
+        );
+
+        assert_eq!(est.cover_next(None).unwrap(), None);
+        assert!(fetched.borrow().is_empty(), "nothing fetched while filling");
+
+        // δ = 0.1, 0.9, 1.9, ...; ρ = 0.5 reaches δ < 1.1: ranks 0 and 1.
+        let got = est.cover_next(Some(kth_at(0.5))).unwrap().unwrap();
+        assert_eq!(*fetched.borrow(), vec![0, 1]);
+        let all =
+            compute_recall_profile(&compute_boundary_distances(&q, &rows, true), 0.5, 2, true);
+        assert!((got - (all[0] + all[1])).abs() < 1e-6, "{got} {all:?}");
+
+        // A smaller ball fetches nothing new.
+        est.cover_next(Some(kth_at(0.2))).unwrap();
+        assert_eq!(*fetched.borrow(), vec![0, 1]);
     }
 }

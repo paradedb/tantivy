@@ -783,7 +783,7 @@ struct UnitPricing {
 /// Cost accounting and termination for the probe loop: charges each
 /// cluster's work against the budget, tracks the APS recall estimate, and
 /// decides whether the next ranked cluster is opened.
-struct ProbeController {
+struct ProbeController<'a> {
     pricing: UnitPricing,
     work_spent: WorkUnits,
     termination: ProbeTermination,
@@ -791,16 +791,16 @@ struct ProbeController {
     clusters: usize,
     pulled: usize,
     /// APS over the ranked clusters; `None` when APS is off.
-    estimator: Option<RecallEstimator>,
+    estimator: Option<RecallEstimator<'a>>,
     recall_target: f32,
     recall_estimate: Option<f32>,
 }
 
-impl ProbeController {
+impl<'a> ProbeController<'a> {
     fn new(
         pricing: UnitPricing,
         clusters: usize,
-        estimator: Option<RecallEstimator>,
+        estimator: Option<RecallEstimator<'a>>,
         recall_target: f32,
     ) -> Self {
         Self {
@@ -849,12 +849,13 @@ impl ProbeController {
     /// gate, or without survivors. Either way no result inside the query
     /// ball remains there. `kth` is the k-th result score after it,
     /// `None` while the heap is filling.
-    fn cover(&mut self, kth: Option<Score>) {
+    fn cover(&mut self, kth: Option<Score>) -> crate::Result<()> {
         if let Some(estimator) = self.estimator.as_mut() {
-            if let Some(estimate) = estimator.cover_next(kth.map(Similarity::new)) {
+            if let Some(estimate) = estimator.cover_next(kth.map(Similarity::new))? {
                 self.recall_estimate = Some(estimate);
             }
         }
+        Ok(())
     }
 
     fn finish(&self, stats: &mut ProbeStats) {
@@ -2205,7 +2206,7 @@ impl<T: VectorElement> VectorBackend<T> {
             let _routing_stage = enter_vector_stage(Stage::Routing);
             let ranked = index.rank_clusters(&mut routing_ws, query.query(), routing);
             let estimator =
-                index.recall_estimator(&ranked, query.query(), self.adaptive.recall_target)?;
+                index.recall_estimator(&ranked, query.query(), self.adaptive.recall_target);
             let controller = ProbeController::new(
                 pricing,
                 index.num_clusters(),
@@ -2272,7 +2273,7 @@ impl<T: VectorElement> VectorBackend<T> {
             });
             if verdict == Verdict::Skip {
                 controller.charge_open();
-                controller.cover(aps_kth);
+                controller.cover(aps_kth)?;
                 bounds_skips += 1;
                 continue;
             }
@@ -2297,7 +2298,7 @@ impl<T: VectorElement> VectorBackend<T> {
             if selected_count == 0 {
                 postings_skipped += 1;
                 stats.clusters_skipped_empty += 1;
-                controller.cover(aps_kth);
+                controller.cover(aps_kth)?;
                 continue;
             }
 
@@ -2382,7 +2383,7 @@ impl<T: VectorElement> VectorBackend<T> {
             if armed_probe.is_none() && kth.is_some() {
                 armed_probe = Some((postings_row + postings_skipped - 1) as u32);
             }
-            controller.cover(scan.running_estimate_kth(top_n));
+            controller.cover(scan.running_estimate_kth(top_n))?;
         }
         stats.record_routing(ranked.metrics());
         stats.postings_row += postings_row;
@@ -2745,7 +2746,7 @@ impl<T: VectorElement> VectorBackend<T> {
             let _routing_stage = enter_vector_stage(Stage::Routing);
             let ranked = index.rank_clusters(&mut routing_ws, &query_f32, routing);
             let estimator =
-                index.recall_estimator(&ranked, &query_f32, self.adaptive.recall_target)?;
+                index.recall_estimator(&ranked, &query_f32, self.adaptive.recall_target);
             let controller = ProbeController::new(
                 pricing,
                 num_centroids,
@@ -2826,7 +2827,7 @@ impl<T: VectorElement> VectorBackend<T> {
         &self,
         index: &IvfIndex,
         ranked: &mut impl Iterator<Item = Candidate>,
-        mut controller: ProbeController,
+        mut controller: ProbeController<'_>,
         filter: Option<&BitSet>,
         alive: Option<&AliveBitSet>,
         top_n: usize,
@@ -2928,7 +2929,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 // and free skips break the work identity (validated to
                 // +-0.03% in benchmarks). No row work is spent.
                 controller.charge_open();
-                controller.cover(kth);
+                controller.cover(kth)?;
                 bounds_skips += 1;
                 continue;
             }
@@ -2979,7 +2980,7 @@ impl<T: VectorElement> VectorBackend<T> {
             let probe_idx = (postings_row + postings_skipped - 1) as u32;
             kth = topn.kth_best().map(|(score, _tie)| score);
             bound_tracker.observe(metric, HeapPeek::from_kth(kth), probe_idx);
-            controller.cover(kth);
+            controller.cover(kth)?;
         }
         // The armed index exists exactly when the bound armed.
         debug_assert!(
@@ -4728,14 +4729,14 @@ mod tests {
         let query = [0.1f32, 0.0];
         let centroids = [[0.0f32, 0.0], [2.0, 0.0], [0.0, 2.0]];
         let rows: Vec<&[f32]> = centroids.iter().map(|row| &row[..]).collect();
-        let estimator = RecallEstimator::new(&query, &rows, Metric::L2);
+        let estimator = RecallEstimator::from_rows(&query, rows, Metric::L2);
         let mut controller = ProbeController::new(pricing, centroids.len(), Some(estimator), 0.5);
 
         assert!(controller.admit());
-        controller.cover(None);
+        controller.cover(None).unwrap();
         assert!(controller.admit(), "no estimate while the heap fills");
         // A ball of radius 0.2 lies inside the nearest cell.
-        controller.cover(Some(-(0.2f32 * 0.2)));
+        controller.cover(Some(-(0.2f32 * 0.2))).unwrap();
         assert!(!controller.admit());
 
         let mut stats = ProbeStats::default();
