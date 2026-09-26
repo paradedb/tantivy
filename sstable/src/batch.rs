@@ -124,6 +124,8 @@ pub struct BatchedTermInfoIter<'a, K: AsRef<[u8]>, TSSTable: SSTable> {
     sorted_keys: SortedTermSlice<'a, K>,
     input_cursor: usize,
     current_block_addr: Option<BlockAddr>,
+    // The lookahead can also establish that the next key is past the dictionary end.
+    next_block_addr: Option<Option<BlockAddr>>,
     delta_reader: Option<DeltaReader<TSSTable::ValueReader>>,
     current_entry_key: Vec<u8>,
     entry_loaded: bool,
@@ -143,6 +145,7 @@ impl<'a, K: AsRef<[u8]>, TSSTable: SSTable> BatchedTermInfoIter<'a, K, TSSTable>
             sorted_keys,
             input_cursor: 0,
             current_block_addr: None,
+            next_block_addr: None,
             delta_reader: None,
             current_entry_key: Vec::new(),
             entry_loaded: false,
@@ -175,7 +178,10 @@ where
             // `target` sorts past the last block; since input is sorted,
             // every remaining input is also past the last block — `?`
             // short-circuits the whole iterator in that case.
-            let target_block = self.dict.sstable_index.get_block_with_key(target)?;
+            let target_block = self
+                .next_block_addr
+                .take()
+                .unwrap_or_else(|| self.dict.sstable_index.get_block_with_key(target))?;
 
             // Transition to a new block if needed. `BlockAddr` derives
             // `PartialEq`, so direct comparison is correct.
@@ -189,7 +195,9 @@ where
                             .and_then(|key| {
                                 self.dict.sstable_index.get_block_with_key(key.as_ref())
                             });
-                        if next_block.as_ref() != Some(&target_block) {
+                        let single_key = next_block.as_ref() != Some(&target_block);
+                        self.next_block_addr = Some(next_block);
+                        if single_key {
                             let index = self.input_cursor;
                             self.input_cursor += 1;
                             match self.dict.do_get(target, reader) {
