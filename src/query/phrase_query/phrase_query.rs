@@ -1,6 +1,5 @@
 use super::PhraseWeight;
-use crate::query::bm25::Bm25Weight;
-use crate::query::resolved_terms::{ResolvedStatistics, ResolvedTerms};
+use crate::query::bm25::{Bm25Weight, ResolvedStatistics, ResolvedTerms};
 use crate::query::{EnableScoring, Query, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::SegmentReader;

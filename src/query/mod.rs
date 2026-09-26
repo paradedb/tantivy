@@ -21,7 +21,6 @@ mod query_parser;
 mod range_query;
 mod regex_query;
 mod reqopt_scorer;
-mod resolved_terms;
 mod scorer;
 mod size_hint;
 mod term_query;

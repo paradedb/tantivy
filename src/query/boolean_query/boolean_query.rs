@@ -1,5 +1,5 @@
 use super::boolean_weight::BooleanWeight;
-use crate::query::resolved_terms::ResolvedTerms;
+use crate::query::bm25::ResolvedTerms;
 use crate::query::{EnableScoring, Occur, Query, SumCombiner, TermQuery, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::SegmentReader;

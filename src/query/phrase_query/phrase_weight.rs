@@ -1,10 +1,9 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use super::PhraseScorer;
 use crate::fieldnorm::FieldNormReader;
-use crate::index::{SegmentId, SegmentReader};
-use crate::postings::{SegmentPostings, TermInfo};
+use crate::index::SegmentReader;
+use crate::postings::{ResolvedTermInfo, SegmentPostings};
 use crate::query::bm25::Bm25Weight;
 use crate::query::explanation::does_not_match;
 use crate::query::scorer::{BasicPruningScorer, PruningScorer};
@@ -16,7 +15,7 @@ pub struct PhraseWeight {
     phrase_terms: Vec<(usize, Term)>,
     similarity_weight_opt: Option<Bm25Weight>,
     slop: u32,
-    pub(crate) term_infos: BTreeMap<Term, Arc<BTreeMap<SegmentId, Option<TermInfo>>>>,
+    pub(crate) term_infos: BTreeMap<Term, ResolvedTermInfo>,
 }
 
 impl PhraseWeight {
@@ -57,21 +56,11 @@ impl PhraseWeight {
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
         let mut term_postings_list = Vec::new();
         for &(offset, ref term) in &self.phrase_terms {
-            let inverted_index = reader.inverted_index(term.field())?;
-            let resolved = self
+            let postings = self
                 .term_infos
                 .get(term)
-                .and_then(|infos| infos.get(&reader.segment_id()));
-            let postings =
-                match resolved {
-                    Some(Some(info)) => Some(inverted_index.read_postings_from_terminfo(
-                        info,
-                        IndexRecordOption::WithFreqsAndPositions,
-                    )?),
-                    Some(None) => None,
-                    None => inverted_index
-                        .read_postings(term, IndexRecordOption::WithFreqsAndPositions)?,
-                };
+                .unwrap_or(&ResolvedTermInfo::default())
+                .read_postings(reader, term, IndexRecordOption::WithFreqsAndPositions)?;
             if let Some(postings) = postings {
                 term_postings_list.push((offset, postings));
             } else {

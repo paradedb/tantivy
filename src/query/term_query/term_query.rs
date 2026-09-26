@@ -3,9 +3,8 @@ use std::ops::Bound;
 
 use super::term_weight::TermWeight;
 use crate::index::Bm25Params;
-use crate::query::bm25::Bm25Weight;
+use crate::query::bm25::{Bm25Weight, ResolvedStatistics, ResolvedTerms};
 use crate::query::range_query::is_type_valid_for_fastfield_range_query;
-use crate::query::resolved_terms::{ResolvedStatistics, ResolvedTerms};
 use crate::query::{EnableScoring, Explanation, Query, RangeQuery, Weight};
 use crate::schema::{Field, IndexRecordOption};
 use crate::{SegmentReader, Term};
@@ -138,9 +137,10 @@ impl TermQuery {
             bm25_weight,
             scoring_enabled,
         );
-        weight.term_infos = resolved
+        weight.resolved_term_info = resolved
             .and_then(|terms| terms.term_infos.get(&self.term))
-            .cloned();
+            .cloned()
+            .unwrap_or_default();
         Ok(weight)
     }
 }
