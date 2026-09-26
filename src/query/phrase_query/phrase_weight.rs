@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use rustc_hash::FxHashMap;
 
 use super::PhraseScorer;
 use crate::fieldnorm::FieldNormReader;
@@ -15,7 +15,7 @@ pub struct PhraseWeight {
     phrase_terms: Vec<(usize, Term)>,
     similarity_weight_opt: Option<Bm25Weight>,
     slop: u32,
-    pub(crate) term_infos: BTreeMap<Term, ResolvedTermInfo>,
+    pub(crate) term_infos: FxHashMap<Term, ResolvedTermInfo>,
 }
 
 impl PhraseWeight {
@@ -30,7 +30,7 @@ impl PhraseWeight {
             phrase_terms,
             similarity_weight_opt,
             slop,
-            term_infos: BTreeMap::new(),
+            term_infos: FxHashMap::default(),
         }
     }
 

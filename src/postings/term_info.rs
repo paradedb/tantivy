@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
 use std::io;
 use std::ops::Range;
 use std::sync::Arc;
 
 use common::{BinarySerializable, FixedSize};
+use rustc_hash::FxHashMap;
 
 use super::SegmentPostings;
 use crate::index::{SegmentId, SegmentReader};
@@ -25,7 +25,7 @@ pub struct TermInfo {
 #[derive(Clone, Default)]
 pub(crate) struct ResolvedTermInfo {
     pub doc_freq: u64,
-    pub segments: Option<Arc<BTreeMap<SegmentId, Option<TermInfo>>>>,
+    pub segments: Option<Arc<FxHashMap<SegmentId, Option<TermInfo>>>>,
 }
 
 impl ResolvedTermInfo {
@@ -137,14 +137,15 @@ mod tests {
         let info = segment.inverted_index(field)?.get_term_info(&term)?;
         let resolved = ResolvedTermInfo {
             doc_freq: 1,
-            segments: Some(Arc::new(BTreeMap::from([(
-                segment.segment_id(),
-                info.clone(),
-            )]))),
+            segments: Some(Arc::new(
+                [(segment.segment_id(), info.clone())].into_iter().collect(),
+            )),
         };
         let absent = ResolvedTermInfo {
             doc_freq: 0,
-            segments: Some(Arc::new(BTreeMap::from([(segment.segment_id(), None)]))),
+            segments: Some(Arc::new(
+                [(segment.segment_id(), None)].into_iter().collect(),
+            )),
         };
         let reopened = index.reader()?.searcher();
         let same_segment = reopened.segment_reader(0);

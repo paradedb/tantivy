@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
 
 use crate::fieldnorm::FieldNormReader;
 use crate::index::Bm25Params;
@@ -66,7 +67,7 @@ impl Bm25StatisticsProvider for Searcher {
 }
 
 pub(crate) struct ResolvedTerms {
-    pub term_infos: BTreeMap<Term, ResolvedTermInfo>,
+    pub term_infos: FxHashMap<Term, ResolvedTermInfo>,
 }
 
 impl ResolvedTerms {
@@ -92,7 +93,14 @@ impl ResolvedTerms {
         terms.sort_unstable();
         terms.dedup();
         let mut doc_freqs = vec![0; terms.len()];
-        let mut infos = vec![BTreeMap::new(); terms.len()];
+        let mut infos: Vec<_> = (0..terms.len())
+            .map(|_| {
+                FxHashMap::with_capacity_and_hasher(
+                    searcher.segment_readers().len(),
+                    Default::default(),
+                )
+            })
+            .collect();
         let mut start = 0;
         while start < terms.len() {
             let field = terms[start].field();
