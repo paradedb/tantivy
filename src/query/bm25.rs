@@ -205,6 +205,18 @@ impl Bm25Weight {
         self.weight * self.tf_factor(fieldnorm_id, term_freq)
     }
 
+    #[inline]
+    pub fn score_fieldnorm(&self, fieldnorm: u32, term_freq: u32) -> Score {
+        let norm = cached_tf_component(
+            fieldnorm,
+            self.average_fieldnorm,
+            self.params.k1(),
+            self.params.b(),
+        );
+        let term_freq = term_freq as Score;
+        self.weight * (term_freq / (term_freq + norm))
+    }
+
     pub fn max_score(&self) -> Score {
         self.score(255u8, 2_013_265_944)
     }

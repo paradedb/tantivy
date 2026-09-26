@@ -111,7 +111,9 @@ impl InvertedIndexSerializer {
                 serializer.pnorms_writer = Some(super::term_norms::TermNormsWriter::new(
                     pnorms_write.for_field(field),
                 )?);
-                serializer.postings_serializer.pnorms = Some(Vec::new());
+                serializer.postings_serializer.pnorm_bitwidths = Some(Vec::new());
+                serializer.postings_serializer.pnorm_blocks = Some(Vec::new());
+                serializer.postings_serializer.pnorm_tail = Some(Vec::new());
             }
         }
         Ok(serializer)
@@ -241,8 +243,21 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
     /// Term frequencies and positions may be ignored by the serializer depending
     /// on the configuration of the field in the `Schema`.
     pub fn write_doc(&mut self, doc_id: DocId, term_freq: u32, position_deltas: &[u32]) {
+        self.write_doc_with_norm(doc_id, term_freq, position_deltas, None);
+    }
+
+    /// Serialize the information that a document contains for the current term,
+    /// with an optional pre-resolved fieldnorm length.
+    pub fn write_doc_with_norm(
+        &mut self,
+        doc_id: DocId,
+        term_freq: u32,
+        position_deltas: &[u32],
+        norm: Option<u32>,
+    ) {
         self.current_term_info.doc_freq += 1;
-        self.postings_serializer.write_doc(doc_id, term_freq);
+        self.postings_serializer
+            .write_doc_with_norm(doc_id, term_freq, norm);
         if let Some(ref mut positions_serializer) = self.positions_serializer_opt.as_mut() {
             assert_eq!(term_freq as usize, position_deltas.len());
             positions_serializer.write_positions_delta(position_deltas);
@@ -264,12 +279,29 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
 
         self.postings_serializer
             .close_term(self.current_term_info.doc_freq, self.postings_write)?;
-        if let Some(norms) = self.postings_serializer.pnorms.as_ref() {
-            assert_eq!(norms.len(), self.current_term_info.doc_freq as usize);
-            self.pnorms_writer
-                .as_mut()
-                .unwrap()
-                .write(self.current_term_info.postings_range.start, norms)?;
+        if let Some(pnorms_writer) = self.pnorms_writer.as_mut() {
+            let bitwidths = self
+                .postings_serializer
+                .pnorm_bitwidths
+                .as_deref()
+                .unwrap_or(&[]);
+            let packed_blocks = self
+                .postings_serializer
+                .pnorm_blocks
+                .as_deref()
+                .unwrap_or(&[]);
+            let tail_vint = self
+                .postings_serializer
+                .pnorm_tail
+                .as_deref()
+                .unwrap_or(&[]);
+            pnorms_writer.write_term(
+                self.current_term_info.postings_range.start,
+                bitwidths,
+                packed_blocks,
+                tail_vint,
+            )?;
+            self.postings_serializer.clear_pnorms();
         }
         self.current_term_info.postings_range.end = self.postings_offset();
         if let Some(positions_serializer) = self.positions_serializer_opt.as_mut() {
@@ -301,6 +333,7 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
 struct Block {
     doc_ids: [DocId; COMPRESSION_BLOCK_SIZE],
     term_freqs: [u32; COMPRESSION_BLOCK_SIZE],
+    fieldnorms: [u32; COMPRESSION_BLOCK_SIZE],
     len: usize,
 }
 
@@ -309,6 +342,7 @@ impl Block {
         Block {
             doc_ids: [0u32; COMPRESSION_BLOCK_SIZE],
             term_freqs: [0u32; COMPRESSION_BLOCK_SIZE],
+            fieldnorms: [0u32; COMPRESSION_BLOCK_SIZE],
             len: 0,
         }
     }
@@ -321,14 +355,19 @@ impl Block {
         &self.term_freqs[..self.len]
     }
 
+    fn fieldnorms(&self) -> &[u32] {
+        &self.fieldnorms[..self.len]
+    }
+
     fn clear(&mut self) {
         self.len = 0;
     }
 
-    fn append_doc(&mut self, doc: DocId, term_freq: u32) {
+    fn append_doc(&mut self, doc: DocId, term_freq: u32, fieldnorm: u32) {
         let len = self.len;
         self.doc_ids[len] = doc;
         self.term_freqs[len] = term_freq;
+        self.fieldnorms[len] = fieldnorm;
         self.len = len + 1;
     }
 
@@ -363,7 +402,9 @@ pub struct PostingsSerializer {
     avg_fieldnorm: Score,
     bm25_params: Bm25Params,
     term_has_freq: bool,
-    pnorms: Option<Vec<u8>>,
+    pub(crate) pnorm_bitwidths: Option<Vec<u8>>,
+    pub(crate) pnorm_blocks: Option<Vec<u8>>,
+    pub(crate) pnorm_tail: Option<Vec<u8>>,
 }
 
 impl PostingsSerializer {
@@ -391,16 +432,16 @@ impl PostingsSerializer {
             avg_fieldnorm,
             bm25_params,
             term_has_freq: false,
-            pnorms: None,
+            pnorm_bitwidths: None,
+            pnorm_blocks: None,
+            pnorm_tail: None,
         }
     }
 
     /// Starts the serialization for a new term.
     /// * term_doc_freq - the number of documents containing the term.
     pub fn new_term(&mut self, term_doc_freq: u32, record_term_freq: bool) {
-        if let Some(norms) = self.pnorms.as_mut() {
-            norms.clear();
-        }
+        self.clear_pnorms();
         self.bm25_weight = None;
 
         self.term_has_freq = self.mode.has_freq() && record_term_freq;
@@ -456,16 +497,12 @@ impl PostingsSerializer {
             if let Some(bm25_weight) = self.bm25_weight.as_ref() {
                 if let Some(fieldnorm_reader) = self.fieldnorm_reader.as_ref() {
                     let term_freqs = self.block.term_freqs().iter().cloned();
-                    let fieldnorms =
-                        self.block
-                            .doc_ids()
-                            .iter()
-                            .enumerate()
-                            .map(|(offset, &doc)| match self.pnorms.as_ref() {
-                                Some(norms) => norms[norms.len() - self.block.len + offset],
-                                None => fieldnorm_reader.fieldnorm_id(doc),
-                            });
-                    blockwand_params = fieldnorms
+                    let fieldnorm_ids = self
+                        .block
+                        .doc_ids()
+                        .iter()
+                        .map(|&doc| fieldnorm_reader.fieldnorm_id(doc));
+                    blockwand_params = fieldnorm_ids
                         .zip(term_freqs)
                         .max_by(
                             |(left_fieldnorm_id, left_term_freq),
@@ -479,11 +516,21 @@ impl PostingsSerializer {
                                     .unwrap_or(Ordering::Equal)
                             },
                         )
-                        .unwrap();
+                        .unwrap_or((0u8, 0u32));
                 }
             }
             let (fieldnorm_id, term_freq) = blockwand_params;
             self.skip_write.write_blockwand_max(fieldnorm_id, term_freq);
+        }
+        if self.pnorm_bitwidths.is_some() {
+            let (num_bits, block_encoded): (u8, &[u8]) = self
+                .block_encoder
+                .compress_block_unsorted(self.block.fieldnorms(), false);
+            self.pnorm_bitwidths.as_mut().unwrap().push(num_bits);
+            self.pnorm_blocks
+                .as_mut()
+                .unwrap()
+                .extend_from_slice(block_encoded);
         }
         self.block.clear();
     }
@@ -492,10 +539,21 @@ impl PostingsSerializer {
     /// * doc_id - the document id.
     /// * term_freq - the term frequency within the document.
     pub fn write_doc(&mut self, doc_id: DocId, term_freq: u32) {
-        if let Some(norms) = self.pnorms.as_mut() {
-            norms.push(self.fieldnorm_reader.as_ref().unwrap().fieldnorm_id(doc_id));
-        }
-        self.block.append_doc(doc_id, term_freq);
+        self.write_doc_with_norm(doc_id, term_freq, None);
+    }
+
+    /// Register that the given document contains the current term, with an optional fieldnorm
+    /// length.
+    pub fn write_doc_with_norm(&mut self, doc_id: DocId, term_freq: u32, fieldnorm: Option<u32>) {
+        let norm = match fieldnorm {
+            Some(n) => n,
+            None => self
+                .fieldnorm_reader
+                .as_ref()
+                .map(|reader| reader.fieldnorm(doc_id))
+                .unwrap_or(0),
+        };
+        self.block.append_doc(doc_id, term_freq, norm);
         if self.block.is_full() {
             self.write_block();
         }
@@ -527,6 +585,15 @@ impl PostingsSerializer {
                     .compress_vint_unsorted(self.block.term_freqs());
                 self.postings_write.write_all(block_encoded)?;
             }
+            if self.pnorm_bitwidths.is_some() {
+                let tail_encoded = self
+                    .block_encoder
+                    .compress_vint_unsorted(self.block.fieldnorms());
+                self.pnorm_tail
+                    .as_mut()
+                    .unwrap()
+                    .extend_from_slice(tail_encoded);
+            }
             self.block.clear();
         }
         if doc_freq >= COMPRESSION_BLOCK_SIZE as u32 {
@@ -544,5 +611,18 @@ impl PostingsSerializer {
     fn clear(&mut self) {
         self.block.clear();
         self.last_doc_id_encoded = 0;
+        self.clear_pnorms();
+    }
+
+    pub(crate) fn clear_pnorms(&mut self) {
+        if let Some(bitwidths) = self.pnorm_bitwidths.as_mut() {
+            bitwidths.clear();
+        }
+        if let Some(blocks) = self.pnorm_blocks.as_mut() {
+            blocks.clear();
+        }
+        if let Some(tail) = self.pnorm_tail.as_mut() {
+            tail.clear();
+        }
     }
 }

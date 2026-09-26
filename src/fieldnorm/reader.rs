@@ -65,6 +65,7 @@ enum ReaderImplEnum {
     FromFileSlice(FileSlice),
     Posting { num_docs: u32 },
     Const { num_docs: u32, fieldnorm_id: u8 },
+    U32(Arc<[u32]>),
 }
 
 impl FieldNormReader {
@@ -89,6 +90,10 @@ impl FieldNormReader {
         ReaderImplEnum::Posting { num_docs }.into()
     }
 
+    pub(crate) fn from_u32_slice(lengths: Arc<[u32]>) -> Self {
+        ReaderImplEnum::U32(lengths).into()
+    }
+
     /// Returns the number of documents in this segment.
     pub fn num_docs(&self) -> u32 {
         match &self.0 {
@@ -96,12 +101,16 @@ impl FieldNormReader {
             ReaderImplEnum::Const { num_docs, .. } | ReaderImplEnum::Posting { num_docs } => {
                 *num_docs
             }
+            ReaderImplEnum::U32(lengths) => lengths.len() as u32,
         }
     }
 
     /// Returns the `fieldnorm` associated with a doc id.
     pub fn fieldnorm(&self, doc_id: DocId) -> u32 {
-        id_to_fieldnorm(self.fieldnorm_id(doc_id))
+        match &self.0 {
+            ReaderImplEnum::U32(lengths) => lengths[doc_id as usize],
+            _ => id_to_fieldnorm(self.fieldnorm_id(doc_id)),
+        }
     }
 
     /// Returns the `fieldnorm_id` associated with a document.
@@ -115,6 +124,7 @@ impl FieldNormReader {
             ReaderImplEnum::Posting { .. } => {
                 panic!("posting-local norms require a matching posting")
             }
+            ReaderImplEnum::U32(lengths) => fieldnorm_to_id(lengths[doc_id as usize]),
         }
     }
 
