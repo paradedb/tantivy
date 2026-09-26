@@ -410,6 +410,17 @@ mod tests {
         use crate::index::list_segment_files;
         use crate::indexer::NoMergePolicy;
 
+        let mut legacy_schema = Schema::builder();
+        let text_legacy = legacy_schema.add_text_field("text", TEXT);
+        let directory = RamDirectory::create();
+        let mut index =
+            Index::create(directory.clone(), legacy_schema.build(), Default::default())?;
+        assert!(index.load_metas()?.persisted_custom_extensions.is_empty());
+        {
+            let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+            writer.add_document(crate::doc!(text_legacy => "one"))?;
+            writer.commit()?;
+        }
         let mut schema = Schema::builder();
         let text = schema.add_text_field(
             "text",
@@ -420,18 +431,13 @@ mod tests {
                     .set_pnorms(true),
             ),
         );
-        let directory = RamDirectory::create();
-        let index = Index::create(directory.clone(), schema.build(), Default::default())?;
-        assert!(index.load_metas()?.persisted_custom_extensions.is_empty());
-        {
-            let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
-            writer.add_document(crate::doc!(text => "one"))?;
-            writer.commit()?;
-        }
-        let legacy_segment = index.searchable_segments()?.pop().unwrap();
-        directory
-            .delete(&legacy_segment.relative_path(SegmentComponent::PostingNorms))
-            .unwrap();
+        let mut metas = index.load_metas()?;
+        metas.schema = schema.build();
+        index.directory_mut().atomic_write(
+            std::path::Path::new("meta.json"),
+            &serde_json::to_vec(&metas)?,
+        )?;
+        index = Index::open(directory.clone())?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
         for value in ["one", "one two"] {

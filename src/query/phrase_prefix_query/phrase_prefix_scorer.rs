@@ -169,6 +169,14 @@ impl<TPostings: Postings> PhrasePrefixScorer<TPostings> {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn fieldnorm(&self) -> Option<u32> {
+        match &self.phrase_scorer {
+            PhraseKind::SinglePrefix { postings, .. } => postings.fieldnorm(),
+            PhraseKind::MultiPrefix(scorer) => scorer.fieldnorm(),
+        }
+    }
+
     pub fn phrase_count(&self) -> u32 {
         self.phrase_count
     }

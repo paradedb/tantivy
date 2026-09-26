@@ -19,8 +19,8 @@ pub struct LoadedPostings {
     pub position_offsets: Box<[u32]>,
     pub positions: Box<[u32]>,
     pub cursor: usize,
-    /// Optional norm byte for each loaded posting.
-    pub fieldnorms: Option<Box<[u8]>>,
+    /// Optional norm length for each loaded posting.
+    pub fieldnorms: Option<Box<[u32]>>,
 }
 
 impl LoadedPostings {
@@ -36,7 +36,7 @@ impl LoadedPostings {
         while segment_postings.doc() != TERMINATED {
             position_offsets.push(positions.len() as u32);
             doc_ids.push(segment_postings.doc());
-            if let Some(norm) = segment_postings.fieldnorm_id() {
+            if let Some(norm) = segment_postings.fieldnorm() {
                 fieldnorms
                     .get_or_insert_with(|| Vec::with_capacity(num_docs))
                     .push(norm);
@@ -98,7 +98,7 @@ impl DocSet for LoadedPostings {
     }
 }
 impl Postings for LoadedPostings {
-    fn fieldnorm_id(&self) -> Option<u8> {
+    fn fieldnorm(&self) -> Option<u32> {
         self.fieldnorms.as_ref().map(|norms| norms[self.cursor])
     }
 

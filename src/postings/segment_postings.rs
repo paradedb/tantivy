@@ -137,6 +137,7 @@ impl SegmentPostings {
             FileSlice::from(buffer).read_bytes().unwrap(),
             IndexRecordOption::Basic,
             IndexRecordOption::Basic,
+            false,
         )
         .unwrap();
         SegmentPostings::from_block_postings(block_segment_postings, None)
@@ -185,6 +186,7 @@ impl SegmentPostings {
             FileSlice::from(buffer).read_bytes().unwrap(),
             IndexRecordOption::WithFreqs,
             IndexRecordOption::WithFreqs,
+            false,
         )
         .unwrap();
         SegmentPostings::from_block_postings(block_segment_postings, None)
@@ -263,6 +265,10 @@ impl HasLen for SegmentPostings {
 }
 
 impl Postings for SegmentPostings {
+    fn fieldnorm(&self) -> Option<u32> {
+        self.block_cursor.posting_fieldnorm_at(self.block_offset())
+    }
+
     fn fieldnorm_id(&self) -> Option<u8> {
         self.block_cursor
             .posting_fieldnorm_id_at(self.block_offset())
