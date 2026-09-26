@@ -466,3 +466,52 @@ fn test_non_text_json_term_freq_bitpacked() {
         assert_eq!(postings.term_freq(), 1u32);
     }
 }
+
+#[test]
+fn test_posting_norms_require_fieldnorms_at_creation() {
+    use crate::schema::TextFieldIndexing;
+
+    for indexing in [
+        TextFieldIndexing::default()
+            .set_posting_norms(true)
+            .set_fieldnorms(false),
+        TextFieldIndexing::default()
+            .set_fieldnorms(false)
+            .set_posting_norms(true),
+    ] {
+        let mut builder = Schema::builder();
+        builder.add_text_field("body", TEXT.set_indexing_options(indexing));
+        let schema = builder.build();
+        let decoded: Schema =
+            serde_json::from_str(&serde_json::to_string(&schema).unwrap()).unwrap();
+        for schema in [schema, decoded] {
+            let directory = RamDirectory::create();
+            for result in [
+                Index::create(directory.clone(), schema.clone(), IndexSettings::default()),
+                Index::open_or_create(directory.clone(), schema.clone()),
+                Index::builder().schema(schema).create_in_ram(),
+            ] {
+                assert!(
+                    matches!(result, Err(crate::TantivyError::InvalidArgument(ref message))
+                    if message == "Field `body`: posting_norms requires fieldnorms to be enabled")
+                );
+                assert!(!Index::exists(&directory).unwrap());
+            }
+        }
+    }
+    for (fieldnorms, posting_norms) in [(false, false), (true, false), (true, true)] {
+        let mut builder = Schema::builder();
+        builder.add_text_field(
+            "body",
+            TEXT.set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_fieldnorms(fieldnorms)
+                    .set_posting_norms(posting_norms),
+            ),
+        );
+        assert!(Index::builder()
+            .schema(builder.build())
+            .create_in_ram()
+            .is_ok());
+    }
+}

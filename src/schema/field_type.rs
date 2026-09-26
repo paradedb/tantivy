@@ -367,7 +367,7 @@ impl FieldType {
         match self {
             FieldType::Str(options) => options
                 .get_indexing_options()
-                .is_some_and(TextFieldIndexing::posting_norms),
+                .is_some_and(|indexing| indexing.posting_norms() && indexing.fieldnorms()),
             _ => false,
         }
     }

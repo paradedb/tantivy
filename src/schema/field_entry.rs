@@ -237,7 +237,7 @@ mod tests {
         let legacy: FieldType = serde_json::from_value(serialized.clone()).unwrap();
         assert!(!legacy.has_posting_norms());
         assert_eq!(serde_json::to_value(&legacy).unwrap(), serialized);
-        assert!(!TextFieldIndexing::default()
+        assert!(TextFieldIndexing::default()
             .set_posting_norms(true)
             .set_fieldnorms(false)
             .posting_norms());

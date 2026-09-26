@@ -248,9 +248,9 @@ impl TextFieldIndexing {
         self.fieldnorms
     }
 
-    /// Returns whether posting-local norms are enabled for this field.
+    /// Returns whether posting-local norms are requested for this field.
     pub fn posting_norms(&self) -> bool {
-        self.posting_norms && self.fieldnorms()
+        self.posting_norms
     }
 
     /// Enables posting-local norms for faster top-k BM25 queries, at the cost of more storage

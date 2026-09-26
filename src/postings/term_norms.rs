@@ -277,7 +277,7 @@ mod tests {
         let fallback = schema.add_text_field("fallback", TEXT);
         let unnormed = schema.add_text_field(
             "unnormed",
-            TEXT.set_indexing_options(indexing.set_fieldnorms(false)),
+            TEXT.set_indexing_options(indexing.set_fieldnorms(false).set_posting_norms(false)),
         );
         let number = schema.add_u64_field("number", INDEXED);
         let date = schema.add_date_field("date", INDEXED);

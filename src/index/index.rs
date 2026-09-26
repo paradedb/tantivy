@@ -357,6 +357,18 @@ impl IndexBuilder {
             ));
         }
         if let Some(schema) = self.schema.as_ref() {
+            for (_, entry) in schema.fields() {
+                if let FieldType::Str(options) = entry.field_type() {
+                    if let Some(indexing) = options.get_indexing_options() {
+                        if indexing.posting_norms() && !indexing.fieldnorms() {
+                            return Err(TantivyError::InvalidArgument(format!(
+                                "Field `{}`: posting_norms requires fieldnorms to be enabled",
+                                entry.name()
+                            )));
+                        }
+                    }
+                }
+            }
             self.index_settings.validate_vector_quantization(schema)?;
             if self.index_settings.manual_doc_id_mapping
                 && self.index_settings.sort_by_field.is_some()
