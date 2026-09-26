@@ -45,11 +45,11 @@ impl<TDocSet: DocSet> SimpleUnion<TDocSet> {
 }
 
 impl<TDocSet: Postings> Postings for SimpleUnion<TDocSet> {
-    fn fieldnorm_id(&self) -> Option<u8> {
+    fn fieldnorm(&self) -> Option<u32> {
         self.docsets
             .iter()
             .find(|postings| postings.doc() == self.doc)
-            .and_then(Postings::fieldnorm_id)
+            .and_then(Postings::fieldnorm)
     }
 
     fn term_freq(&self) -> u32 {

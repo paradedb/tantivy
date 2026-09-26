@@ -31,14 +31,14 @@ impl<TDocSet: DocSet> BitSetPostingUnion<TDocSet> {
 }
 
 impl<TDocSet: Postings> Postings for BitSetPostingUnion<TDocSet> {
-    fn fieldnorm_id(&self) -> Option<u8> {
+    fn fieldnorm(&self) -> Option<u32> {
         let doc = self.bitset.doc();
         for postings in self.docsets.borrow_mut().iter_mut() {
             if postings.doc() < doc {
                 postings.seek(doc);
             }
             if postings.doc() == doc {
-                return postings.fieldnorm_id();
+                return postings.fieldnorm();
             }
         }
         None

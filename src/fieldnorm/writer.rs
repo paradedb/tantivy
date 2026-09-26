@@ -13,6 +13,7 @@ use crate::DocId;
 /// byte per document per field.
 pub struct FieldNormsWriter {
     fieldnorms_buffers: Vec<Option<Vec<u8>>>,
+    pnorms_buffers: Vec<Option<Vec<u32>>>,
 }
 
 impl FieldNormsWriter {
@@ -37,19 +38,36 @@ impl FieldNormsWriter {
         let mut fieldnorms_buffers: Vec<Option<Vec<u8>>> = iter::repeat_with(|| None)
             .take(schema.num_fields())
             .collect();
+        let mut pnorms_buffers: Vec<Option<Vec<u32>>> = iter::repeat_with(|| None)
+            .take(schema.num_fields())
+            .collect();
         for field in FieldNormsWriter::fields_with_fieldnorm(schema) {
             fieldnorms_buffers[field.field_id() as usize] = Some(Vec::with_capacity(1_000));
+            if schema.get_field_entry(field).has_pnorms() {
+                pnorms_buffers[field.field_id() as usize] = Some(Vec::with_capacity(1_000));
+            }
         }
-        FieldNormsWriter { fieldnorms_buffers }
+        FieldNormsWriter {
+            fieldnorms_buffers,
+            pnorms_buffers,
+        }
     }
 
     /// The memory used inclusive childs
     pub fn mem_usage(&self) -> usize {
-        self.fieldnorms_buffers
+        let u8_mem: usize = self
+            .fieldnorms_buffers
             .iter()
             .flatten()
             .map(|buf| buf.capacity())
-            .sum()
+            .sum();
+        let u32_mem: usize = self
+            .pnorms_buffers
+            .iter()
+            .flatten()
+            .map(|buf| buf.capacity() * std::mem::size_of::<u32>())
+            .sum();
+        u8_mem + u32_mem
     }
     /// Ensure that all documents in 0..max_doc have a byte associated with them
     /// in each of the fieldnorm vectors.
@@ -59,6 +77,11 @@ impl FieldNormsWriter {
         for fieldnorms_buffer_opt in self.fieldnorms_buffers.iter_mut() {
             if let Some(fieldnorms_buffer) = fieldnorms_buffer_opt.as_mut() {
                 fieldnorms_buffer.resize(max_doc as usize, 0u8);
+            }
+        }
+        for pnorms_buffer_opt in self.pnorms_buffers.iter_mut() {
+            if let Some(pnorms_buffer) = pnorms_buffer_opt.as_mut() {
+                pnorms_buffer.resize(max_doc as usize, 0u32);
             }
         }
     }
@@ -89,18 +112,43 @@ impl FieldNormsWriter {
             }
             fieldnorm_buffer.push(fieldnorm_to_id(fieldnorm));
         }
+        if let Some(pnorm_buffer) = self
+            .pnorms_buffers
+            .get_mut(field.field_id() as usize)
+            .and_then(Option::as_mut)
+        {
+            match pnorm_buffer.len().cmp(&(doc as usize)) {
+                Ordering::Less => {
+                    pnorm_buffer.resize(doc as usize, 0u32);
+                }
+                Ordering::Equal => {}
+                Ordering::Greater => {
+                    panic!("Cannot register a given fieldnorm twice")
+                }
+            }
+            pnorm_buffer.push(fieldnorm);
+        }
     }
 
     pub(crate) fn remap(&mut self, doc_id_map: &DocIdMapping) {
         for norms in self.fieldnorms_buffers.iter_mut().flatten() {
             *norms = doc_id_map.remap(norms);
         }
+        for norms in self.pnorms_buffers.iter_mut().flatten() {
+            *norms = doc_id_map.remap(norms);
+        }
     }
 
     pub(crate) fn take_field(&mut self, field: Field) -> Option<super::FieldNormReader> {
-        self.fieldnorms_buffers[field.field_id() as usize]
-            .take()
-            .map(|norms| super::FieldNormReader::open(crate::directory::FileSlice::from(norms)))
+        let field_id = field.field_id() as usize;
+        if let Some(pnorms) = self.pnorms_buffers.get_mut(field_id).and_then(Option::take) {
+            self.fieldnorms_buffers[field_id].take();
+            Some(super::FieldNormReader::from_u32_slice(pnorms.into()))
+        } else {
+            self.fieldnorms_buffers[field_id]
+                .take()
+                .map(|norms| super::FieldNormReader::open(crate::directory::FileSlice::from(norms)))
+        }
     }
 
     /// Serialize the seen fieldnorm values to the serializer for all fields.
