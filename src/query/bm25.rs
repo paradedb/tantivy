@@ -450,9 +450,10 @@ mod tests {
         for term in &terms {
             assert_eq!(resolved.term_infos[term].doc_freq, searcher.doc_freq(term)?);
             for segment in searcher.segment_readers() {
+                let inverted_index = segment.inverted_index(term.field())?;
                 assert_eq!(
-                    resolved.term_infos[term].get(segment, term)?,
-                    segment.inverted_index(term.field())?.get_term_info(term)?
+                    resolved.term_infos[term].get(segment.segment_id(), &inverted_index, term)?,
+                    inverted_index.get_term_info(term)?
                 );
             }
         }

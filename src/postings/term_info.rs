@@ -6,7 +6,7 @@ use common::{BinarySerializable, FixedSize};
 use rustc_hash::FxHashMap;
 
 use super::SegmentPostings;
-use crate::index::{SegmentId, SegmentReader};
+use crate::index::{InvertedIndexReader, SegmentId};
 use crate::schema::IndexRecordOption;
 use crate::Term;
 
@@ -31,31 +31,33 @@ pub(crate) struct ResolvedTermInfo {
 }
 
 impl ResolvedTermInfo {
-    pub fn get(&self, reader: &SegmentReader, term: &Term) -> crate::Result<Option<TermInfo>> {
+    pub fn get(
+        &self,
+        segment_id: SegmentId,
+        reader: &InvertedIndexReader,
+        term: &Term,
+    ) -> crate::Result<Option<TermInfo>> {
         match self
             .segments
             .as_ref()
-            .and_then(|segments| segments.get(&reader.segment_id()))
+            .and_then(|segments| segments.get(&segment_id))
         {
             Some(info) => Ok(info.clone()),
-            None => Ok(reader.inverted_index(term.field())?.get_term_info(term)?),
+            None => Ok(reader.get_term_info(term)?),
         }
     }
 
     pub fn read_postings(
         &self,
-        reader: &SegmentReader,
+        segment_id: SegmentId,
+        reader: &InvertedIndexReader,
         term: &Term,
         option: IndexRecordOption,
     ) -> crate::Result<Option<SegmentPostings>> {
-        let Some(info) = self.get(reader, term)? else {
+        let Some(info) = self.get(segment_id, reader, term)? else {
             return Ok(None);
         };
-        Ok(Some(
-            reader
-                .inverted_index(term.field())?
-                .read_postings_from_terminfo(&info, option)?,
-        ))
+        Ok(Some(reader.read_postings_from_terminfo(&info, option)?))
     }
 }
 
@@ -136,7 +138,8 @@ mod tests {
         let segment = searcher.segment_reader(0);
         let term = Term::from_field_text(field, "rust");
         let missing = Term::from_field_text(field, "missing");
-        let info = segment.inverted_index(field)?.get_term_info(&term)?;
+        let inverted_index = segment.inverted_index(field)?;
+        let info = inverted_index.get_term_info(&term)?;
         let resolved = ResolvedTermInfo {
             doc_freq: 1,
             segments: Some(Arc::new(
@@ -151,19 +154,36 @@ mod tests {
         };
         let reopened = index.reader()?.searcher();
         let same_segment = reopened.segment_reader(0);
+        let reopened_index = same_segment.inverted_index(field)?;
         // Mismatched lookup keys prove the cached entry wins over the dictionary.
-        assert_eq!(resolved.get(same_segment, &missing)?, info);
+        assert_eq!(
+            resolved.get(same_segment.segment_id(), &reopened_index, &missing)?,
+            info
+        );
         assert_eq!(
             resolved
-                .read_postings(same_segment, &missing, IndexRecordOption::Basic)?
+                .read_postings(
+                    same_segment.segment_id(),
+                    &reopened_index,
+                    &missing,
+                    IndexRecordOption::Basic
+                )?
                 .unwrap()
                 .doc(),
             0
         );
         assert!(absent
-            .read_postings(same_segment, &term, IndexRecordOption::Basic)?
+            .read_postings(
+                same_segment.segment_id(),
+                &reopened_index,
+                &term,
+                IndexRecordOption::Basic
+            )?
             .is_none());
-        assert_eq!(ResolvedTermInfo::default().get(segment, &term)?, info);
+        assert_eq!(
+            ResolvedTermInfo::default().get(segment.segment_id(), &inverted_index, &term)?,
+            info
+        );
 
         writer.add_document(doc!(field => "rust rust"))?;
         writer.commit()?;
@@ -173,11 +193,14 @@ mod tests {
             .iter()
             .find(|other| other.segment_id() != segment.segment_id())
             .unwrap();
+        let new_index = new_segment.inverted_index(field)?;
         assert_eq!(
-            resolved.get(new_segment, &term)?,
-            new_segment.inverted_index(field)?.get_term_info(&term)?
+            resolved.get(new_segment.segment_id(), &new_index, &term)?,
+            new_index.get_term_info(&term)?
         );
-        assert!(resolved.get(new_segment, &missing)?.is_none());
+        assert!(resolved
+            .get(new_segment.segment_id(), &new_index, &missing)?
+            .is_none());
         Ok(())
     }
 }

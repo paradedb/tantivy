@@ -79,7 +79,10 @@ impl Weight for TermWeight {
         if let Some(alive_bitset) = reader.alive_bitset() {
             Ok(self.scorer(reader, 1.0)?.count(alive_bitset))
         } else {
-            let term_info = self.resolved_term_info.get(reader, &self.term)?;
+            let inverted_index = reader.inverted_index(self.term.field())?;
+            let term_info =
+                self.resolved_term_info
+                    .get(reader.segment_id(), &inverted_index, &self.term)?;
             Ok(term_info.map(|term_info| term_info.doc_freq).unwrap_or(0))
         }
     }
@@ -207,7 +210,10 @@ impl TermWeight {
     ) -> crate::Result<TermOrEmptyOrAllScorer> {
         let field = self.term.field();
         let inverted_index = reader.inverted_index(field)?;
-        let Some(term_info) = self.resolved_term_info.get(reader, &self.term)? else {
+        let Some(term_info) =
+            self.resolved_term_info
+                .get(reader.segment_id(), &inverted_index, &self.term)?
+        else {
             // The term was not found.
             return Ok(TermOrEmptyOrAllScorer::Empty);
         };

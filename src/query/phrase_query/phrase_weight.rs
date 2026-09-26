@@ -54,11 +54,17 @@ impl PhraseWeight {
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
         let mut term_postings_list = Vec::new();
         for &(offset, ref term) in &self.phrase_terms {
+            let inverted_index = reader.inverted_index(term.field())?;
             let postings = self
                 .term_infos
                 .get(term)
                 .unwrap_or(&ResolvedTermInfo::default())
-                .read_postings(reader, term, IndexRecordOption::WithFreqsAndPositions)?;
+                .read_postings(
+                    reader.segment_id(),
+                    &inverted_index,
+                    term,
+                    IndexRecordOption::WithFreqsAndPositions,
+                )?;
             if let Some(postings) = postings {
                 term_postings_list.push((offset, postings));
             } else {
