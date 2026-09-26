@@ -2,8 +2,8 @@ use std::fmt;
 
 use downcast_rs::impl_downcast;
 
-use super::bm25::Bm25StatisticsProvider;
-use super::Weight;
+use super::bm25::{Bm25StatisticsProvider, ResolvedTerms};
+use super::{TermQuery, Weight};
 use crate::core::searcher::Searcher;
 use crate::query::Explanation;
 use crate::schema::{Field, Schema};
@@ -73,6 +73,19 @@ impl<'a> EnableScoring<'a> {
             searcher,
             disjunction_pruning: DisjunctionPruning::Auto,
         }
+    }
+
+    pub(crate) fn weight_with_resolved_terms(
+        self,
+        query: &dyn Query,
+        resolved: Option<&ResolvedTerms>,
+    ) -> crate::Result<Box<dyn Weight>> {
+        if let (Some(resolved), Some(term_query)) = (resolved, query.downcast_ref::<TermQuery>()) {
+            return Ok(Box::new(
+                term_query.specialized_weight_with_resolved_terms(self, Some(resolved))?,
+            ));
+        }
+        query.weight(self)
     }
 
     /// Override disjunction pruning for this scoring context. Constructors default

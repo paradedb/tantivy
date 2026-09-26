@@ -1,7 +1,9 @@
+use rustc_hash::FxHashMap;
+
 use super::PhraseScorer;
 use crate::fieldnorm::FieldNormReader;
 use crate::index::SegmentReader;
-use crate::postings::SegmentPostings;
+use crate::postings::{ResolvedTermInfo, SegmentPostings};
 use crate::query::bm25::Bm25Weight;
 use crate::query::explanation::does_not_match;
 use crate::query::scorer::{BasicPruningScorer, PruningScorer};
@@ -13,6 +15,7 @@ pub struct PhraseWeight {
     phrase_terms: Vec<(usize, Term)>,
     similarity_weight_opt: Option<Bm25Weight>,
     slop: u32,
+    pub(crate) term_infos: FxHashMap<Term, ResolvedTermInfo>,
 }
 
 impl PhraseWeight {
@@ -27,6 +30,7 @@ impl PhraseWeight {
             phrase_terms,
             similarity_weight_opt,
             slop,
+            term_infos: FxHashMap::default(),
         }
     }
 
@@ -50,10 +54,18 @@ impl PhraseWeight {
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
         let mut term_postings_list = Vec::new();
         for &(offset, ref term) in &self.phrase_terms {
-            if let Some(postings) = reader
-                .inverted_index(term.field())?
-                .read_postings(term, IndexRecordOption::WithFreqsAndPositions)?
-            {
+            let inverted_index = reader.inverted_index(term.field())?;
+            let postings = self
+                .term_infos
+                .get(term)
+                .unwrap_or(&ResolvedTermInfo::default())
+                .read_postings(
+                    reader.segment_id(),
+                    &inverted_index,
+                    term,
+                    IndexRecordOption::WithFreqsAndPositions,
+                )?;
+            if let Some(postings) = postings {
                 term_postings_list.push((offset, postings));
             } else {
                 return Ok(None);

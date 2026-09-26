@@ -34,6 +34,7 @@ pub(crate) use self::postings_writer::{serialize_postings, IndexingPosition, Pos
 pub use self::segment_postings::SegmentPostings;
 pub use self::serializer::{FieldSerializer, InvertedIndexSerializer};
 pub(crate) use self::skip::{BlockInfo, SkipReader};
+pub(crate) use self::term_info::ResolvedTermInfo;
 pub use self::term_info::TermInfo;
 
 #[expect(clippy::enum_variant_names)]

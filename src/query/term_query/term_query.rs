@@ -3,7 +3,7 @@ use std::ops::Bound;
 
 use super::term_weight::TermWeight;
 use crate::index::Bm25Params;
-use crate::query::bm25::Bm25Weight;
+use crate::query::bm25::{Bm25Weight, ResolvedStatistics, ResolvedTerms};
 use crate::query::range_query::is_type_valid_for_fastfield_range_query;
 use crate::query::{EnableScoring, Explanation, Query, RangeQuery, Weight};
 use crate::schema::{Field, IndexRecordOption};
@@ -92,6 +92,15 @@ impl TermQuery {
         &self,
         enable_scoring: EnableScoring<'_>,
     ) -> crate::Result<TermWeight> {
+        let resolved = ResolvedTerms::for_scoring(enable_scoring, [&self.term])?;
+        self.specialized_weight_with_resolved_terms(enable_scoring, resolved.as_ref())
+    }
+
+    pub(crate) fn specialized_weight_with_resolved_terms(
+        &self,
+        enable_scoring: EnableScoring<'_>,
+        resolved: Option<&ResolvedTerms>,
+    ) -> crate::Result<TermWeight> {
         let schema = enable_scoring.schema();
         let field_entry = schema.get_field_entry(self.term.field());
         if !field_entry.is_indexed() {
@@ -102,7 +111,13 @@ impl TermQuery {
             EnableScoring::Enabled {
                 statistics_provider,
                 ..
-            } => Bm25Weight::for_terms(statistics_provider, std::slice::from_ref(&self.term))?,
+            } => Bm25Weight::for_terms(
+                &ResolvedStatistics {
+                    terms: resolved,
+                    provider: statistics_provider,
+                },
+                std::slice::from_ref(&self.term),
+            )?,
             EnableScoring::Disabled { .. } => Bm25Weight::new(
                 Explanation::new("<no score>", 1.0f32),
                 1.0f32,
@@ -116,12 +131,17 @@ impl TermQuery {
             IndexRecordOption::Basic
         };
 
-        Ok(TermWeight::new(
+        let mut weight = TermWeight::new(
             self.term.clone(),
             index_record_option,
             bm25_weight,
             scoring_enabled,
-        ))
+        );
+        weight.resolved_term_info = resolved
+            .and_then(|terms| terms.term_infos.get(&self.term))
+            .cloned()
+            .unwrap_or_default();
+        Ok(weight)
     }
 }
 

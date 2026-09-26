@@ -1,7 +1,14 @@
 use std::io;
 use std::ops::Range;
+use std::sync::Arc;
 
 use common::{BinarySerializable, FixedSize};
+use rustc_hash::FxHashMap;
+
+use super::SegmentPostings;
+use crate::index::{InvertedIndexReader, SegmentId};
+use crate::schema::IndexRecordOption;
+use crate::Term;
 
 /// `TermInfo` wraps the metadata associated with a Term.
 /// It is segment-local.
@@ -13,6 +20,45 @@ pub struct TermInfo {
     pub postings_range: Range<usize>,
     /// Byte range of the positions of this terms in the positions (`.pos`) file.
     pub positions_range: Range<usize>,
+}
+
+/// A term's document frequency and per-segment postings metadata, retained by query
+/// weights to avoid repeating dictionary lookups when constructing scorers.
+#[derive(Clone, Default)]
+pub(crate) struct ResolvedTermInfo {
+    pub doc_freq: u64,
+    pub segments: Option<Arc<FxHashMap<SegmentId, Option<TermInfo>>>>,
+}
+
+impl ResolvedTermInfo {
+    pub fn get(
+        &self,
+        segment_id: SegmentId,
+        reader: &InvertedIndexReader,
+        term: &Term,
+    ) -> crate::Result<Option<TermInfo>> {
+        match self
+            .segments
+            .as_ref()
+            .and_then(|segments| segments.get(&segment_id))
+        {
+            Some(info) => Ok(info.clone()),
+            None => Ok(reader.get_term_info(term)?),
+        }
+    }
+
+    pub fn read_postings(
+        &self,
+        segment_id: SegmentId,
+        reader: &InvertedIndexReader,
+        term: &Term,
+        option: IndexRecordOption,
+    ) -> crate::Result<Option<SegmentPostings>> {
+        let Some(info) = self.get(segment_id, reader, term)? else {
+            return Ok(None);
+        };
+        Ok(Some(reader.read_postings_from_terminfo(&info, option)?))
+    }
 }
 
 impl TermInfo {
@@ -66,13 +112,95 @@ impl BinarySerializable for TermInfo {
 #[cfg(test)]
 mod tests {
 
-    use super::TermInfo;
+    use super::*;
+    use crate::indexer::NoMergePolicy;
+    use crate::schema::{Schema, TEXT};
     use crate::tests::fixed_size_test;
+    use crate::{DocSet, Index, IndexWriter};
 
     // TODO add serialize/deserialize test for terminfo
 
     #[test]
     fn test_fixed_size() {
         fixed_size_test::<TermInfo>();
+    }
+
+    #[test]
+    fn resolved_term_info_reuses_metadata_and_falls_back() -> crate::Result<()> {
+        let mut schema = Schema::builder();
+        let field = schema.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        writer.add_document(doc!(field => "rust memory"))?;
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let segment = searcher.segment_reader(0);
+        let term = Term::from_field_text(field, "rust");
+        let missing = Term::from_field_text(field, "missing");
+        let inverted_index = segment.inverted_index(field)?;
+        let info = inverted_index.get_term_info(&term)?;
+        let resolved = ResolvedTermInfo {
+            doc_freq: 1,
+            segments: Some(Arc::new(
+                [(segment.segment_id(), info.clone())].into_iter().collect(),
+            )),
+        };
+        let absent = ResolvedTermInfo {
+            doc_freq: 0,
+            segments: Some(Arc::new(
+                [(segment.segment_id(), None)].into_iter().collect(),
+            )),
+        };
+        let reopened = index.reader()?.searcher();
+        let same_segment = reopened.segment_reader(0);
+        let reopened_index = same_segment.inverted_index(field)?;
+        // Mismatched lookup keys prove the cached entry wins over the dictionary.
+        assert_eq!(
+            resolved.get(same_segment.segment_id(), &reopened_index, &missing)?,
+            info
+        );
+        assert_eq!(
+            resolved
+                .read_postings(
+                    same_segment.segment_id(),
+                    &reopened_index,
+                    &missing,
+                    IndexRecordOption::Basic
+                )?
+                .unwrap()
+                .doc(),
+            0
+        );
+        assert!(absent
+            .read_postings(
+                same_segment.segment_id(),
+                &reopened_index,
+                &term,
+                IndexRecordOption::Basic
+            )?
+            .is_none());
+        assert_eq!(
+            ResolvedTermInfo::default().get(segment.segment_id(), &inverted_index, &term)?,
+            info
+        );
+
+        writer.add_document(doc!(field => "rust rust"))?;
+        writer.commit()?;
+        let updated = index.reader()?.searcher();
+        let new_segment = updated
+            .segment_readers()
+            .iter()
+            .find(|other| other.segment_id() != segment.segment_id())
+            .unwrap();
+        let new_index = new_segment.inverted_index(field)?;
+        assert_eq!(
+            resolved.get(new_segment.segment_id(), &new_index, &term)?,
+            new_index.get_term_info(&term)?
+        );
+        assert!(resolved
+            .get(new_segment.segment_id(), &new_index, &missing)?
+            .is_none());
+        Ok(())
     }
 }

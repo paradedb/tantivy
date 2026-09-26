@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
+use rustc_hash::FxHashMap;
+
 use crate::fieldnorm::FieldNormReader;
-use crate::index::Bm25Params;
-use crate::query::Explanation;
+use crate::index::{Bm25Params, SegmentId};
+use crate::postings::{ResolvedTermInfo, TermInfo};
+use crate::query::{EnableScoring, Explanation};
 use crate::schema::Field;
 use crate::{Score, Searcher, Term};
 
@@ -21,6 +24,19 @@ pub trait Bm25StatisticsProvider {
 
     /// Returns the number of documents containing `term`.
     fn doc_freq(&self, term: &Term) -> crate::Result<u64>;
+
+    /// Returns document frequencies in input order, optionally reporting postings metadata.
+    /// The callback identifies the input term by index and its segment by ID; `None`
+    /// records a known-absent term. Unreported entries use ordinary dictionary lookups.
+    /// Metadata must belong to that term and segment; scoring always uses the returned frequencies.
+    /// The default calls `doc_freq` and reports no metadata.
+    fn doc_freqs_with_term_info(
+        &self,
+        terms: &[Term],
+        _on_term_info: &mut dyn FnMut(usize, SegmentId, Option<TermInfo>),
+    ) -> crate::Result<Vec<u64>> {
+        terms.iter().map(|term| self.doc_freq(term)).collect()
+    }
 
     /// Returns the BM25 parameters (`k1`, `b`) for `field`.
     ///
@@ -54,12 +70,116 @@ impl Bm25StatisticsProvider for Searcher {
         self.doc_freq(term)
     }
 
+    #[cfg(feature = "quickwit")]
+    fn doc_freqs_with_term_info(
+        &self,
+        terms: &[Term],
+        on_term_info: &mut dyn FnMut(usize, SegmentId, Option<TermInfo>),
+    ) -> crate::Result<Vec<u64>> {
+        let mut order: Vec<_> = (0..terms.len()).collect();
+        order.sort_unstable_by(|&left, &right| terms[left].cmp(&terms[right]));
+        let mut doc_freqs = vec![0; terms.len()];
+        let mut start = 0;
+        while start < order.len() {
+            let field = terms[order[start]].field();
+            let end =
+                start + order[start..].partition_point(|&index| terms[index].field() == field);
+            for segment in self.segment_readers() {
+                let reader = segment.inverted_index(field)?;
+                for &index in &order[start..end] {
+                    let info = reader.get_term_info(&terms[index])?;
+                    doc_freqs[index] += info.as_ref().map_or(0, |info| u64::from(info.doc_freq));
+                    on_term_info(index, segment.segment_id(), info);
+                }
+            }
+            start = end;
+        }
+        Ok(doc_freqs)
+    }
+
     fn bm25_params(&self, field: Field) -> Bm25Params {
         self.schema()
             .get_field_entry(field)
             .field_type()
             .bm25_params()
             .unwrap_or_default()
+    }
+}
+
+/// Collects metadata for distinct query terms so BM25 statistics and scorer
+/// construction can share the same dictionary lookups.
+pub(crate) struct ResolvedTerms {
+    pub term_infos: FxHashMap<Term, ResolvedTermInfo>,
+}
+
+impl ResolvedTerms {
+    pub fn for_scoring<'a>(
+        enable_scoring: EnableScoring<'_>,
+        terms: impl IntoIterator<Item = &'a Term>,
+    ) -> crate::Result<Option<Self>> {
+        match enable_scoring {
+            EnableScoring::Enabled {
+                statistics_provider,
+                ..
+            } => Self::new(statistics_provider, terms).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn new<'a>(
+        provider: &dyn Bm25StatisticsProvider,
+        terms: impl IntoIterator<Item = &'a Term>,
+    ) -> crate::Result<Self> {
+        let mut terms: Vec<_> = terms.into_iter().cloned().collect();
+        terms.sort_unstable();
+        terms.dedup();
+        let mut infos = vec![None; terms.len()];
+        let doc_freqs =
+            provider.doc_freqs_with_term_info(&terms, &mut |index, segment, info| {
+                infos[index]
+                    .get_or_insert_with(FxHashMap::default)
+                    .insert(segment, info);
+            })?;
+        Ok(Self {
+            term_infos: terms
+                .into_iter()
+                .zip(
+                    doc_freqs
+                        .into_iter()
+                        .zip(infos)
+                        .map(|(doc_freq, segments)| ResolvedTermInfo {
+                            doc_freq,
+                            segments: segments.map(Arc::new),
+                        }),
+                )
+                .collect(),
+        })
+    }
+}
+
+pub(crate) struct ResolvedStatistics<'a> {
+    pub terms: Option<&'a ResolvedTerms>,
+    pub provider: &'a dyn Bm25StatisticsProvider,
+}
+
+impl Bm25StatisticsProvider for ResolvedStatistics<'_> {
+    fn total_num_tokens(&self, field: Field) -> crate::Result<u64> {
+        self.provider.total_num_tokens(field)
+    }
+
+    fn total_num_docs(&self) -> crate::Result<u64> {
+        self.provider.total_num_docs()
+    }
+
+    fn doc_freq(&self, term: &Term) -> crate::Result<u64> {
+        match self.terms.and_then(|terms| terms.term_infos.get(term)) {
+            Some(info) => Ok(info.doc_freq),
+            None => self.provider.doc_freq(term),
+        }
+    }
+
+    fn bm25_params(&self, field: Field) -> crate::index::Bm25Params {
+        self.provider.bm25_params(field)
     }
 }
 
@@ -295,5 +415,183 @@ mod tests {
     fn test_bm25_params_rejects_b_out_of_range() {
         use crate::index::Bm25Params;
         Bm25Params::new(1.2, 1.5);
+    }
+
+    #[test]
+    fn resolved_terms_preserve_scores_and_statistics_fallback() -> crate::Result<()> {
+        use super::{Bm25StatisticsProvider, ResolvedTerms, SegmentId, TermInfo};
+        use crate::collector::TopDocs;
+        use crate::indexer::NoMergePolicy;
+        use crate::query::{
+            BooleanQuery, BoostQuery, EnableScoring, Occur, PhraseQuery, Query, TermQuery,
+        };
+        use crate::schema::{Field, IndexRecordOption, Schema, TEXT};
+        use crate::{Index, IndexWriter, Searcher, Term};
+
+        struct CustomStatistics<'a>(&'a Searcher, Option<u64>);
+        impl Bm25StatisticsProvider for CustomStatistics<'_> {
+            fn total_num_tokens(&self, field: Field) -> crate::Result<u64> {
+                Bm25StatisticsProvider::total_num_tokens(self.0, field)
+            }
+            fn total_num_docs(&self) -> crate::Result<u64> {
+                Bm25StatisticsProvider::total_num_docs(self.0)
+            }
+            fn doc_freq(&self, term: &Term) -> crate::Result<u64> {
+                match self.1 {
+                    Some(doc_freq) => Ok(doc_freq),
+                    None => self.0.doc_freq(term),
+                }
+            }
+        }
+
+        struct WithMetadata<'a>(CustomStatistics<'a>);
+        impl Bm25StatisticsProvider for WithMetadata<'_> {
+            fn total_num_tokens(&self, field: Field) -> crate::Result<u64> {
+                self.0.total_num_tokens(field)
+            }
+            fn total_num_docs(&self) -> crate::Result<u64> {
+                self.0.total_num_docs()
+            }
+            fn doc_freq(&self, term: &Term) -> crate::Result<u64> {
+                self.0.doc_freq(term)
+            }
+            fn doc_freqs_with_term_info(
+                &self,
+                terms: &[Term],
+                on_term_info: &mut dyn FnMut(usize, SegmentId, Option<TermInfo>),
+            ) -> crate::Result<Vec<u64>> {
+                self.0 .0.doc_freqs_with_term_info(terms, on_term_info)?;
+                terms.iter().map(|term| self.doc_freq(term)).collect()
+            }
+        }
+
+        let mut schema = Schema::builder();
+        let first = schema.add_text_field("first", TEXT);
+        let second = schema.add_text_field("second", TEXT);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for text in ["rust rust memory", "memory safety"] {
+            writer.add_document(doc!(first => text, second => "rust"))?;
+            writer.commit()?;
+        }
+        let searcher = index.reader()?.searcher();
+        let terms = [
+            Term::from_field_text(first, "rust"),
+            Term::from_field_text(first, "missing"),
+            Term::from_field_text(second, "rust"),
+        ];
+        let resolved = ResolvedTerms::new(&searcher, terms.iter().chain([&terms[0]]))?;
+        assert_eq!(resolved.term_infos.len(), terms.len());
+        for term in &terms {
+            assert_eq!(resolved.term_infos[term].doc_freq, searcher.doc_freq(term)?);
+            assert_eq!(
+                resolved.term_infos[term].segments.is_some(),
+                cfg!(feature = "quickwit")
+            );
+            for segment in searcher.segment_readers() {
+                let inverted_index = segment.inverted_index(term.field())?;
+                assert_eq!(
+                    resolved.term_infos[term].get(segment.segment_id(), &inverted_index, term)?,
+                    inverted_index.get_term_info(term)?
+                );
+            }
+        }
+        let unordered = [
+            terms[2].clone(),
+            terms[1].clone(),
+            terms[0].clone(),
+            terms[2].clone(),
+        ];
+        let frequencies =
+            searcher.doc_freqs_with_term_info(&unordered, &mut |index, segment, info| {
+                assert_eq!(
+                    resolved.term_infos[&unordered[index]]
+                        .segments
+                        .as_ref()
+                        .unwrap()[&segment],
+                    info
+                );
+            })?;
+        assert_eq!(
+            frequencies,
+            unordered
+                .iter()
+                .map(|term| searcher.doc_freq(term))
+                .collect::<crate::Result<Vec<_>>>()?
+        );
+        let term_query = |term: &Term| -> Box<dyn Query> {
+            Box::new(TermQuery::new(term.clone(), IndexRecordOption::WithFreqs))
+        };
+        let queries: Vec<Box<dyn Query>> = vec![
+            term_query(&terms[0]),
+            term_query(&terms[1]),
+            Box::new(PhraseQuery::new(vec![terms[0].clone(), terms[0].clone()])),
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, term_query(&terms[0])),
+                (
+                    Occur::Should,
+                    Box::new(BoostQuery::new(term_query(&terms[0]), 2.0)),
+                ),
+                (Occur::Should, term_query(&terms[2])),
+                (Occur::MustNot, term_query(&terms[1])),
+            ])),
+        ];
+        let custom = CustomStatistics(&searcher, None);
+        let collector = TopDocs::with_limit(10).order_by_score();
+        for query in queries {
+            assert_eq!(
+                searcher.search(query.as_ref(), &collector)?,
+                searcher.search_with_statistics_provider(query.as_ref(), &collector, &custom)?
+            );
+        }
+        let query = term_query(&terms[0]);
+        assert_ne!(
+            searcher.search(query.as_ref(), &collector)?,
+            searcher.search_with_statistics_provider(
+                query.as_ref(),
+                &collector,
+                &CustomStatistics(&searcher, Some(0)),
+            )?
+        );
+        assert!(ResolvedTerms::for_scoring(
+            EnableScoring::Enabled {
+                searcher: &searcher,
+                statistics_provider: &searcher,
+                disjunction_pruning: Default::default(),
+            },
+            &terms
+        )?
+        .is_some());
+        assert!(ResolvedTerms::for_scoring(
+            EnableScoring::disabled_from_searcher(&searcher),
+            &terms
+        )?
+        .is_none());
+        let custom = CustomStatistics(&searcher, Some(0));
+        let resolved = ResolvedTerms::for_scoring(
+            EnableScoring::enabled_from_statistics_provider(&custom, &searcher),
+            &terms,
+        )?
+        .unwrap();
+        for info in resolved.term_infos.values() {
+            assert_eq!(info.doc_freq, 0);
+            assert!(info.segments.is_none());
+        }
+        let with_metadata = WithMetadata(custom);
+        let resolved = ResolvedTerms::new(&with_metadata, &terms)?;
+        for info in resolved.term_infos.values() {
+            assert_eq!(info.doc_freq, 0);
+            assert_eq!(info.segments.is_some(), cfg!(feature = "quickwit"));
+        }
+        assert_eq!(
+            searcher.search_with_statistics_provider(
+                query.as_ref(),
+                &collector,
+                &with_metadata.0
+            )?,
+            searcher.search_with_statistics_provider(query.as_ref(), &collector, &with_metadata)?
+        );
+        Ok(())
     }
 }

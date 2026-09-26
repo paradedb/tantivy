@@ -1,4 +1,5 @@
 use super::boolean_weight::BooleanWeight;
+use crate::query::bm25::ResolvedTerms;
 use crate::query::{EnableScoring, Occur, Query, SumCombiner, TermQuery, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::SegmentReader;
@@ -156,10 +157,20 @@ impl From<Vec<(Occur, Box<dyn Query>)>> for BooleanQuery {
 
 impl Query for BooleanQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+        let resolved = ResolvedTerms::for_scoring(
+            enable_scoring,
+            self.subqueries
+                .iter()
+                .filter_map(|(_, query)| query.downcast_ref::<TermQuery>().map(TermQuery::term)),
+        )?;
         let sub_weights = self
             .subqueries
             .iter()
-            .map(|(occur, subquery)| Ok((*occur, subquery.weight(enable_scoring)?)))
+            .map(|(occur, subquery)| {
+                let weight = enable_scoring
+                    .weight_with_resolved_terms(subquery.as_ref(), resolved.as_ref())?;
+                Ok((*occur, weight))
+            })
             .collect::<crate::Result<_>>()?;
         Ok(Box::new(
             BooleanWeight::with_minimum_number_should_match(

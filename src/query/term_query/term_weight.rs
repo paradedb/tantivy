@@ -2,7 +2,7 @@ use super::term_scorer::TermScorer;
 use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN};
 use crate::fieldnorm::FieldNormReader;
 use crate::index::SegmentReader;
-use crate::postings::SegmentPostings;
+use crate::postings::{ResolvedTermInfo, SegmentPostings};
 use crate::query::bm25::Bm25Weight;
 use crate::query::boolean_query::BlockWandSingleScorer;
 use crate::query::explanation::does_not_match;
@@ -17,6 +17,7 @@ pub struct TermWeight {
     index_record_option: IndexRecordOption,
     similarity_weight: Bm25Weight,
     scoring_enabled: bool,
+    pub(crate) resolved_term_info: ResolvedTermInfo,
 }
 
 enum TermOrEmptyOrAllScorer {
@@ -78,9 +79,10 @@ impl Weight for TermWeight {
         if let Some(alive_bitset) = reader.alive_bitset() {
             Ok(self.scorer(reader, 1.0)?.count(alive_bitset))
         } else {
-            let field = self.term.field();
-            let inv_index = reader.inverted_index(field)?;
-            let term_info = inv_index.get_term_info(&self.term)?;
+            let inverted_index = reader.inverted_index(self.term.field())?;
+            let term_info =
+                self.resolved_term_info
+                    .get(reader.segment_id(), &inverted_index, &self.term)?;
             Ok(term_info.map(|term_info| term_info.doc_freq).unwrap_or(0))
         }
     }
@@ -177,6 +179,7 @@ impl TermWeight {
             index_record_option,
             similarity_weight,
             scoring_enabled,
+            resolved_term_info: ResolvedTermInfo::default(),
         }
     }
 
@@ -207,7 +210,10 @@ impl TermWeight {
     ) -> crate::Result<TermOrEmptyOrAllScorer> {
         let field = self.term.field();
         let inverted_index = reader.inverted_index(field)?;
-        let Some(term_info) = inverted_index.get_term_info(&self.term)? else {
+        let Some(term_info) =
+            self.resolved_term_info
+                .get(reader.segment_id(), &inverted_index, &self.term)?
+        else {
             // The term was not found.
             return Ok(TermOrEmptyOrAllScorer::Empty);
         };
