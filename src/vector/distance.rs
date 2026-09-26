@@ -220,6 +220,14 @@ pub fn dot_bytes<T: VectorElement>(query: &[T], doc_bytes: &[u8]) -> f32 {
     acc
 }
 
+/// Runs the binary32 byte-backed dot kernel.
+#[cfg(feature = "unstable")]
+#[doc(hidden)]
+#[inline(never)]
+pub fn quantization_bench_dot_bytes_f32(query: &[f32], doc_bytes: &[u8]) -> f32 {
+    dot_bytes::<f32>(query, doc_bytes)
+}
+
 /// `norm_squared` over little-endian bytes encoding `T`.
 #[inline]
 pub fn norm_squared_bytes<T: VectorElement>(doc_bytes: &[u8]) -> f32 {

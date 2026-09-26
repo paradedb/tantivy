@@ -14,7 +14,9 @@ use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
 use crate::index::merge_optimized_inverted_index_reader::MergeOptimizedInvertedIndexReader;
-use crate::index::{Index, InvertedIndexReader, Segment, SegmentComponent, SegmentId};
+use crate::index::{
+    Index, IndexSettings, InvertedIndexReader, Segment, SegmentComponent, SegmentId,
+};
 use crate::json_utils::json_path_sep_to_dot;
 use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
@@ -79,6 +81,10 @@ impl SegmentReader {
     /// Returns the schema of the index this segment belongs to.
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    pub(crate) fn index_settings(&self) -> &IndexSettings {
+        self.index.settings()
     }
 
     pub(crate) fn sort_by_field(&self) -> Option<&crate::IndexSortByField> {
