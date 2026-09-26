@@ -130,6 +130,15 @@ fn align_scorers(
 // Advance term_scorers[..pivot_len] and out of these removes the terminated scores.
 // Restores the ordering of term_scorers.
 fn advance_all_scorers_on_pivot(term_scorers: &mut Vec<TermScorerWithMaxScore>, pivot_len: usize) {
+    if pivot_len == 1 {
+        if term_scorers[0].advance() == TERMINATED {
+            term_scorers.swap_remove(0);
+        }
+        if !term_scorers.is_empty() {
+            restore_ordering(term_scorers, 0);
+        }
+        return;
+    }
     for term_scorer in &mut term_scorers[..pivot_len] {
         term_scorer.advance();
     }
@@ -657,6 +666,43 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_advance_single_pivot_ties_and_termination() {
+        for (first, expected) in [
+            (vec![(0, 1), (5, 1)], vec![(2, 2), (5, 1), (5, 3), (5, 4)]),
+            (vec![(0, 1)], vec![(2, 2), (5, 4), (5, 3)]),
+        ] {
+            let mut scorers: Vec<super::TermScorerWithMaxScore> =
+                [first, vec![(2, 2)], vec![(5, 3)], vec![(5, 4)]]
+                    .iter()
+                    .map(|postings| {
+                        TermScorer::create_for_test(
+                            postings,
+                            &[4; 6],
+                            Bm25Weight::for_one_term(
+                                postings.len() as u64,
+                                6,
+                                4.0,
+                                Bm25Params::default(),
+                            ),
+                        )
+                        .into()
+                    })
+                    .collect();
+            super::advance_all_scorers_on_pivot(&mut scorers, 1);
+            assert_eq!(
+                scorers
+                    .iter()
+                    .map(|scorer| (scorer.doc(), scorer.term_freq()))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            scorers.truncate(1);
+            super::advance_all_scorers_on_pivot(&mut scorers, 1);
+            assert!(scorers.is_empty());
         }
     }
 
