@@ -106,18 +106,37 @@ pub struct DenseBlock<'a>(&'a [u8]);
 pub struct DenseBlockSelectCursor<'a> {
     block_id: u16,
     dense_block: DenseBlock<'a>,
+    current_bitvec: u64,
+    current_rank: u16,
+    next_miniblock_rank: u16,
 }
 
 impl SelectCursor<u16> for DenseBlockSelectCursor<'_> {
     #[inline]
     fn select(&mut self, rank: u16) -> u16 {
-        self.block_id = self
-            .dense_block
-            .find_miniblock_containing_rank(rank, self.block_id)
-            .unwrap();
-        let index_block = self.dense_block.mini_block(self.block_id);
-        let in_block_rank = rank - index_block.rank;
-        self.block_id * ELEMENTS_PER_MINI_BLOCK + select_u64(index_block.bitvec, in_block_rank)
+        if rank >= self.next_miniblock_rank {
+            self.block_id = self
+                .dense_block
+                .find_miniblock_containing_rank(rank, self.block_id)
+                .unwrap();
+            let index_block = self.dense_block.mini_block(self.block_id);
+            self.current_bitvec = index_block.bitvec;
+            self.current_rank = index_block.rank;
+            let num_miniblocks = (DENSE_BLOCK_NUM_BYTES / MINI_BLOCK_NUM_BYTES as u32) as u16;
+            self.next_miniblock_rank = if self.block_id + 1 < num_miniblocks {
+                self.dense_block.mini_block(self.block_id + 1).rank
+            } else {
+                u16::MAX
+            };
+        }
+
+        debug_assert!(rank >= self.current_rank);
+        let step = rank - self.current_rank;
+        for _ in 0..step {
+            self.current_bitvec &= self.current_bitvec - 1;
+        }
+        self.current_rank = rank;
+        self.block_id * ELEMENTS_PER_MINI_BLOCK + self.current_bitvec.trailing_zeros() as u16
     }
 }
 
@@ -170,6 +189,9 @@ impl<'a> Set<u16> for DenseBlock<'a> {
         DenseBlockSelectCursor {
             block_id: 0,
             dense_block: *self,
+            current_bitvec: 0,
+            current_rank: 0,
+            next_miniblock_rank: 0,
         }
     }
 }

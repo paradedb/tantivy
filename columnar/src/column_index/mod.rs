@@ -12,7 +12,10 @@ use std::ops::Range;
 
 pub use merge::merge_column_index;
 pub(crate) use multivalued_index::SerializableMultivalueIndex;
-pub use optional_index::{OptionalIndex, Set, open_optional_index, serialize_optional_index};
+pub use optional_index::{
+    OptionalIndex, OptionalIndexSelectCursor, SelectCursor, Set, open_optional_index,
+    serialize_optional_index,
+};
 pub use serialize::{
     SerializableColumnIndex, SerializableOptionalIndex, open_column_index, serialize_column_index,
 };

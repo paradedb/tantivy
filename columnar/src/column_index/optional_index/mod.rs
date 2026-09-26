@@ -174,6 +174,13 @@ impl SelectCursor<RowId> for OptionalIndexSelectCursor<'_> {
     }
 }
 
+impl OptionalIndexSelectCursor<'_> {
+    #[inline(always)]
+    pub fn select(&mut self, rank: RowId) -> RowId {
+        SelectCursor::select(self, rank)
+    }
+}
+
 impl Set<RowId> for OptionalIndex {
     type SelectCursor<'b>
         = OptionalIndexSelectCursor<'b>
@@ -337,6 +344,11 @@ impl OptionalIndex {
         let mut select_batch = self.select_cursor();
         (0..self.num_non_null_docs).map(move |rank| select_batch.select(rank))
     }
+    #[inline]
+    pub fn select_cursor(&self) -> OptionalIndexSelectCursor<'_> {
+        <Self as Set<RowId>>::select_cursor(self)
+    }
+
     pub fn select_batch(&self, ranks: &mut [RowId]) {
         let mut select_cursor = self.select_cursor();
         for rank in ranks.iter_mut() {
