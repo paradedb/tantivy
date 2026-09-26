@@ -269,6 +269,14 @@ impl ColumnValues for BlockwiseLinearReader {
     fn num_vals(&self) -> u32 {
         self.stats.num_rows
     }
+
+    #[inline]
+    fn get_u32_vals(&self, indexes: &[u32], output: &mut [u32]) {
+        assert_eq!(indexes.len(), output.len());
+        for (out, idx) in output.iter_mut().zip(indexes) {
+            *out = self.get_val(*idx) as u32;
+        }
+    }
 }
 
 #[cfg(test)]
