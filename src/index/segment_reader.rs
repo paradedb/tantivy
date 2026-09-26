@@ -87,8 +87,14 @@ impl SegmentReader {
         self.index.settings()
     }
 
-    pub(crate) fn sort_by_field(&self) -> Option<&crate::IndexSortByField> {
-        self.index.settings().sort_by_field.as_ref()
+    /// Returns the primary sort-by field if the index is sorted.
+    pub fn sort_by_field(&self) -> Option<&crate::IndexSortByField> {
+        self.index.settings().primary_sort_by_field()
+    }
+
+    /// Returns the sort-by fields configuring the index.
+    pub fn sort_by_fields(&self) -> &[crate::IndexSortByField] {
+        self.index.settings().sort_by_fields()
     }
 
     pub(crate) fn ivf_router(&self) -> Option<RouterKind> {
