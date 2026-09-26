@@ -225,7 +225,7 @@ fn mixed_fields_duplicates_boosts_and_phrases_preserve_semantics() -> crate::Res
 }
 
 #[test]
-fn failed_resolution_is_retryable_and_new_readers_do_not_reuse_addresses() -> crate::Result<()> {
+fn failed_resolution_is_retryable_and_reopened_segments_reuse_metadata() -> crate::Result<()> {
     let (index, searcher, reads, field, _) = fixture(2)?;
     let terms = [
         Term::from_field_text(field, "run"),
@@ -237,37 +237,54 @@ fn failed_resolution_is_retryable_and_new_readers_do_not_reuse_addresses() -> cr
     let resolved = ResolvedTerms::new(&searcher, &terms)?;
     let other = index.reader()?.searcher();
     for term in &terms {
-        let info = resolved.get(term).unwrap();
-        assert_eq!(info.doc_freq, searcher.doc_freq(term)?);
+        let info = resolved.term_infos.get(term).unwrap();
+        assert_eq!(resolved.doc_freqs[term], searcher.doc_freq(term)?);
         for segment in searcher.segment_readers() {
-            assert!(info.get(&segment.inverted_index(field)?).is_some());
+            assert!(info.get(&segment.segment_id()).is_some());
         }
         for segment in other.segment_readers() {
-            assert!(info.get(&segment.inverted_index(field)?).is_none());
+            assert!(info.get(&segment.segment_id()).is_some());
         }
     }
+    let mut writer: IndexWriter = index.writer_for_tests()?;
+    writer.set_merge_policy(Box::new(NoMergePolicy));
+    writer.delete_term(Term::from_field_text(field, "memory"));
+    writer.commit()?;
+    writer.wait_merging_threads()?;
+    let deleted = index.reader()?.searcher();
+    assert!(deleted
+        .segment_readers()
+        .iter()
+        .all(|segment| segment.num_deleted_docs() > 0));
     let queries: Vec<Box<dyn Query>> = vec![
         term_query(field, "rust"),
         Box::new(PhraseQuery::new(terms.to_vec())),
     ];
+    let (_, unrelated, unrelated_reads, _, _) = fixture(2)?;
     for query in queries {
         let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
-        let fallback = query.weight(EnableScoring::enabled_from_statistics_provider(
-            &Unresolved(&other),
-            &other,
-        ))?;
-        reads.count.store(0, Ordering::Relaxed);
-        for segment in other.segment_readers() {
-            let mut actual = weight.scorer(segment, 1.0)?;
-            assert!(reads.count.load(Ordering::Relaxed) > 0);
-            let mut expected = fallback.scorer(segment, 1.0)?;
-            while actual.doc() != crate::TERMINATED {
-                assert_eq!(actual.doc(), expected.doc());
-                assert_eq!(actual.score(), expected.score());
-                actual.advance();
-                expected.advance();
+        for (target, target_reads, known) in [
+            (&other, &reads, true),
+            (&deleted, &reads, true),
+            (&unrelated, &unrelated_reads, false),
+        ] {
+            let fallback = query.weight(EnableScoring::enabled_from_statistics_provider(
+                &Unresolved(target),
+                target,
+            ))?;
+            for segment in target.segment_readers() {
+                target_reads.count.store(0, Ordering::Relaxed);
+                let mut actual = weight.scorer(segment, 1.0)?;
+                assert_eq!(target_reads.count.load(Ordering::Relaxed) == 0, known);
+                let mut expected = fallback.scorer(segment, 1.0)?;
+                while actual.doc() != crate::TERMINATED {
+                    assert_eq!(actual.doc(), expected.doc());
+                    assert_eq!(actual.score(), expected.score());
+                    actual.advance();
+                    expected.advance();
+                }
+                assert_eq!(expected.doc(), crate::TERMINATED);
             }
-            assert_eq!(expected.doc(), crate::TERMINATED);
         }
     }
     Ok(())
@@ -284,16 +301,16 @@ fn many_segments_preserve_metadata_and_cached_absence() -> crate::Result<()> {
         Term::from_field_text(second, "missing"),
     ];
     let resolved = ResolvedTerms::new(&searcher, &terms)?;
-    let unfamiliar = Arc::new(InvertedIndexReader::empty(IndexRecordOption::WithFreqs));
+    let unfamiliar = crate::index::SegmentId::generate_random();
     for term in &terms {
-        let info = resolved.get(term).unwrap();
-        assert_eq!(info.doc_freq, searcher.doc_freq(term)?);
+        let info = resolved.term_infos.get(term).unwrap();
+        assert_eq!(resolved.doc_freqs[term], searcher.doc_freq(term)?);
         assert_eq!(info.get(&unfamiliar), None);
         for segment in searcher.segment_readers().iter().rev() {
             let reader = segment.inverted_index(term.field())?;
             let expected = reader.get_term_info(term)?;
             reads.fail.store(true, Ordering::Relaxed);
-            assert_eq!(info.get(&Arc::clone(&reader)), Some(expected.as_ref()));
+            assert_eq!(info.get(&segment.segment_id()), Some(&expected));
             reads.fail.store(false, Ordering::Relaxed);
         }
     }

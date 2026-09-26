@@ -138,7 +138,9 @@ impl TermQuery {
             bm25_weight,
             scoring_enabled,
         );
-        weight.resolved_term_info = resolved.and_then(|terms| terms.get(&self.term)).cloned();
+        weight.term_infos = resolved
+            .and_then(|terms| terms.term_infos.get(&self.term))
+            .cloned();
         Ok(weight)
     }
 }

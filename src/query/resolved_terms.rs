@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::index::InvertedIndexReader;
+use crate::index::SegmentId;
 use crate::postings::TermInfo;
 use crate::query::{Bm25StatisticsProvider, EnableScoring};
 use crate::schema::Field;
@@ -9,22 +10,9 @@ use crate::{Searcher, Term};
 #[cfg(all(test, feature = "quickwit"))]
 mod tests;
 
-pub(crate) struct ResolvedTermInfo {
-    pub doc_freq: u64,
-    segments: Vec<(Arc<InvertedIndexReader>, Option<TermInfo>)>,
-}
-
-impl ResolvedTermInfo {
-    pub fn get(&self, reader: &Arc<InvertedIndexReader>) -> Option<Option<&TermInfo>> {
-        self.segments
-            .binary_search_by_key(&Arc::as_ptr(reader), |(source, _)| Arc::as_ptr(source))
-            .ok()
-            .map(|index| self.segments[index].1.as_ref())
-    }
-}
-
 pub(crate) struct ResolvedTerms {
-    terms: Vec<(Term, Arc<ResolvedTermInfo>)>,
+    pub doc_freqs: BTreeMap<Term, u64>,
+    pub term_infos: BTreeMap<Term, Arc<BTreeMap<SegmentId, Option<TermInfo>>>>,
 }
 
 impl ResolvedTerms {
@@ -51,13 +39,8 @@ impl ResolvedTerms {
         let mut terms: Vec<_> = terms.into_iter().cloned().collect();
         terms.sort_unstable();
         terms.dedup();
-        let mut infos: Vec<_> = terms
-            .iter()
-            .map(|_| ResolvedTermInfo {
-                doc_freq: 0,
-                segments: Vec::with_capacity(searcher.segment_readers().len()),
-            })
-            .collect();
+        let mut doc_freqs = vec![0; terms.len()];
+        let mut infos = vec![BTreeMap::new(); terms.len()];
         let mut start = 0;
         while start < terms.len() {
             let field = terms[start].field();
@@ -68,30 +51,24 @@ impl ResolvedTerms {
                 for (term, info) in terms[start..end].iter().zip(&mut segment_infos) {
                     *info = reader.get_term_info(term)?;
                 }
-                for (resolved, info) in infos[start..end].iter_mut().zip(segment_infos) {
-                    resolved.doc_freq += info.as_ref().map_or(0, |info| u64::from(info.doc_freq));
-                    resolved.segments.push((Arc::clone(&reader), info));
+                for ((doc_freq, segments), info) in doc_freqs[start..end]
+                    .iter_mut()
+                    .zip(&mut infos[start..end])
+                    .zip(segment_infos)
+                {
+                    *doc_freq += info.as_ref().map_or(0, |info| u64::from(info.doc_freq));
+                    segments.insert(segment.segment_id(), info);
                 }
             }
             start = end;
         }
-        for info in &mut infos {
-            info.segments
-                .sort_unstable_by_key(|(reader, _)| Arc::as_ptr(reader));
-        }
         Ok(Self {
-            terms: terms
+            doc_freqs: terms.iter().cloned().zip(doc_freqs).collect(),
+            term_infos: terms
                 .into_iter()
                 .zip(infos.into_iter().map(Arc::new))
                 .collect(),
         })
-    }
-
-    pub fn get(&self, term: &Term) -> Option<&Arc<ResolvedTermInfo>> {
-        self.terms
-            .binary_search_by(|(key, _)| key.cmp(term))
-            .ok()
-            .map(|index| &self.terms[index].1)
     }
 }
 
@@ -110,8 +87,8 @@ impl Bm25StatisticsProvider for ResolvedStatistics<'_> {
     }
 
     fn doc_freq(&self, term: &Term) -> crate::Result<u64> {
-        match self.terms.and_then(|terms| terms.get(term)) {
-            Some(info) => Ok(info.doc_freq),
+        match self.terms.and_then(|terms| terms.doc_freqs.get(term)) {
+            Some(&doc_freq) => Ok(doc_freq),
             None => self.provider.doc_freq(term),
         }
     }

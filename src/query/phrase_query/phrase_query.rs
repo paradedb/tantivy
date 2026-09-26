@@ -134,7 +134,7 @@ impl PhraseQuery {
             EnableScoring::Disabled { .. } => None,
         };
         let mut weight = PhraseWeight::new(self.phrase_terms.clone(), bm25_weight_opt);
-        weight.resolved_terms = resolved;
+        weight.term_infos = resolved.map(|terms| terms.term_infos).unwrap_or_default();
         if self.slop > 0 {
             weight.slop(self.slop);
         }
