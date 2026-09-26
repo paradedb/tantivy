@@ -40,9 +40,6 @@ pub enum EnableScoring<'a> {
         /// one to adjust the statistics.
         statistics_provider: &'a dyn Bm25StatisticsProvider,
 
-        /// Whether document frequencies are defined by this searcher's segments.
-        use_local_statistics: bool,
-
         /// Pruning strategy for scored term disjunctions.
         disjunction_pruning: DisjunctionPruning,
     },
@@ -62,7 +59,6 @@ impl<'a> EnableScoring<'a> {
         EnableScoring::Enabled {
             searcher,
             statistics_provider: searcher,
-            use_local_statistics: true,
             disjunction_pruning: DisjunctionPruning::Auto,
         }
     }
@@ -75,7 +71,6 @@ impl<'a> EnableScoring<'a> {
         EnableScoring::Enabled {
             statistics_provider,
             searcher,
-            use_local_statistics: false,
             disjunction_pruning: DisjunctionPruning::Auto,
         }
     }

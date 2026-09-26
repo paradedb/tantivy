@@ -182,13 +182,7 @@ impl Searcher {
         query: &dyn Query,
         collector: &C,
     ) -> crate::Result<C::Fruit> {
-        let enabled_scoring = if collector.requires_scoring() {
-            EnableScoring::enabled_from_searcher(self)
-        } else {
-            EnableScoring::disabled_from_searcher(self)
-        };
-        let executor = self.inner.index.search_executor();
-        self.search_with_executor(query, collector, executor, enabled_scoring)
+        self.search_with_statistics_provider(query, collector, self)
     }
 
     /// Same as [`search(...)`](Searcher::search) but allows specifying
