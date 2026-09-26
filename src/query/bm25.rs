@@ -22,6 +22,12 @@ pub trait Bm25StatisticsProvider {
     /// Returns the number of documents containing `term`.
     fn doc_freq(&self, term: &Term) -> crate::Result<u64>;
 
+    /// Returns the local searcher whose segment frequencies define `doc_freq` exactly.
+    /// Providers with custom or distributed frequencies should retain the default.
+    fn local_searcher(&self) -> Option<&Searcher> {
+        None
+    }
+
     /// Returns the BM25 parameters (`k1`, `b`) for `field`.
     ///
     /// Defaults to [`Bm25Params::DEFAULT`] (`k1 = 1.2`, `b = 0.75`).
@@ -31,6 +37,10 @@ pub trait Bm25StatisticsProvider {
 }
 
 impl Bm25StatisticsProvider for Searcher {
+    fn local_searcher(&self) -> Option<&Searcher> {
+        cfg!(feature = "quickwit").then_some(self)
+    }
+
     fn total_num_tokens(&self, field: Field) -> crate::Result<u64> {
         let mut total_num_tokens = 0u64;
 

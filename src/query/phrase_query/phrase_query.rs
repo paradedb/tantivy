@@ -1,5 +1,6 @@
 use super::PhraseWeight;
 use crate::query::bm25::Bm25Weight;
+use crate::query::resolved_terms::{ResolvedStatistics, ResolvedTerms};
 use crate::query::{EnableScoring, Query, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::SegmentReader;
@@ -118,14 +119,22 @@ impl PhraseQuery {
             )));
         }
         let terms = self.phrase_terms();
+        let resolved = ResolvedTerms::for_scoring(enable_scoring, &terms)?;
         let bm25_weight_opt = match enable_scoring {
             EnableScoring::Enabled {
                 statistics_provider,
                 ..
-            } => Some(Bm25Weight::for_terms(statistics_provider, &terms)?),
+            } => Some(Bm25Weight::for_terms(
+                &ResolvedStatistics {
+                    terms: resolved.as_ref(),
+                    provider: statistics_provider,
+                },
+                &terms,
+            )?),
             EnableScoring::Disabled { .. } => None,
         };
         let mut weight = PhraseWeight::new(self.phrase_terms.clone(), bm25_weight_opt);
+        weight.resolved_terms = resolved;
         if self.slop > 0 {
             weight.slop(self.slop);
         }

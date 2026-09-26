@@ -4,6 +4,7 @@ use crate::index::SegmentReader;
 use crate::postings::SegmentPostings;
 use crate::query::bm25::Bm25Weight;
 use crate::query::explanation::does_not_match;
+use crate::query::resolved_terms::ResolvedTerms;
 use crate::query::scorer::{BasicPruningScorer, PruningScorer};
 use crate::query::{EmptyScorer, Explanation, Scorer, Weight};
 use crate::schema::{IndexRecordOption, Term};
@@ -13,6 +14,7 @@ pub struct PhraseWeight {
     phrase_terms: Vec<(usize, Term)>,
     similarity_weight_opt: Option<Bm25Weight>,
     slop: u32,
+    pub(crate) resolved_terms: Option<ResolvedTerms>,
 }
 
 impl PhraseWeight {
@@ -27,6 +29,7 @@ impl PhraseWeight {
             phrase_terms,
             similarity_weight_opt,
             slop,
+            resolved_terms: None,
         }
     }
 
@@ -52,10 +55,23 @@ impl PhraseWeight {
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
         let mut term_postings_list = Vec::new();
         for &(offset, ref term) in &self.phrase_terms {
-            if let Some(postings) = reader
-                .inverted_index(term.field())?
-                .read_postings(term, IndexRecordOption::WithFreqsAndPositions)?
-            {
+            let inverted_index = reader.inverted_index(term.field())?;
+            let resolved = self
+                .resolved_terms
+                .as_ref()
+                .and_then(|terms| terms.get(term))
+                .and_then(|info| info.get(&inverted_index));
+            let postings =
+                match resolved {
+                    Some(Some(info)) => Some(inverted_index.read_postings_from_terminfo(
+                        info,
+                        IndexRecordOption::WithFreqsAndPositions,
+                    )?),
+                    Some(None) => None,
+                    None => inverted_index
+                        .read_postings(term, IndexRecordOption::WithFreqsAndPositions)?,
+                };
+            if let Some(postings) = postings {
                 term_postings_list.push((offset, postings));
             } else {
                 return Ok(None);

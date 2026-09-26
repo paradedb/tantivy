@@ -1,11 +1,14 @@
+use std::sync::Arc;
+
 use super::term_scorer::TermScorer;
 use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN};
 use crate::fieldnorm::FieldNormReader;
-use crate::index::SegmentReader;
-use crate::postings::SegmentPostings;
+use crate::index::{InvertedIndexReader, SegmentReader};
+use crate::postings::{SegmentPostings, TermInfo};
 use crate::query::bm25::Bm25Weight;
 use crate::query::boolean_query::BlockWandSingleScorer;
 use crate::query::explanation::does_not_match;
+use crate::query::resolved_terms::ResolvedTermInfo;
 use crate::query::scorer::BasicPruningScorer;
 use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
 use crate::query::{AllScorer, AllWeight, EmptyScorer, Explanation, Scorer, Weight};
@@ -17,6 +20,7 @@ pub struct TermWeight {
     index_record_option: IndexRecordOption,
     similarity_weight: Bm25Weight,
     scoring_enabled: bool,
+    pub(crate) resolved_term_info: Option<Arc<ResolvedTermInfo>>,
 }
 
 enum TermOrEmptyOrAllScorer {
@@ -80,7 +84,7 @@ impl Weight for TermWeight {
         } else {
             let field = self.term.field();
             let inv_index = reader.inverted_index(field)?;
-            let term_info = inv_index.get_term_info(&self.term)?;
+            let term_info = self.term_info(&inv_index)?;
             Ok(term_info.map(|term_info| term_info.doc_freq).unwrap_or(0))
         }
     }
@@ -177,7 +181,19 @@ impl TermWeight {
             index_record_option,
             similarity_weight,
             scoring_enabled,
+            resolved_term_info: None,
         }
+    }
+
+    fn term_info(&self, reader: &Arc<InvertedIndexReader>) -> crate::Result<Option<TermInfo>> {
+        if let Some(info) = self
+            .resolved_term_info
+            .as_ref()
+            .and_then(|resolved| resolved.get(reader))
+        {
+            return Ok(info.cloned());
+        }
+        Ok(reader.get_term_info(&self.term)?)
     }
 
     pub fn term(&self) -> &Term {
@@ -207,7 +223,7 @@ impl TermWeight {
     ) -> crate::Result<TermOrEmptyOrAllScorer> {
         let field = self.term.field();
         let inverted_index = reader.inverted_index(field)?;
-        let Some(term_info) = inverted_index.get_term_info(&self.term)? else {
+        let Some(term_info) = self.term_info(&inverted_index)? else {
             // The term was not found.
             return Ok(TermOrEmptyOrAllScorer::Empty);
         };
