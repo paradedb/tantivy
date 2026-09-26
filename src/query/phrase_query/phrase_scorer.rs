@@ -432,6 +432,13 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             .unwrap_or_else(|| self.fieldnorm_reader.fieldnorm_id(self.doc()))
     }
 
+    pub fn fieldnorm(&self) -> Option<u32> {
+        self.intersection_docset
+            .docset_specialized(0)
+            .postings
+            .fieldnorm()
+    }
+
     pub fn phrase_count(&self) -> u32 {
         self.phrase_count
     }
@@ -441,10 +448,23 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         &self.left_positions
     }
 
+    #[inline]
+    fn compute_score(&self, count: u32) -> Score {
+        if let Some(similarity_weight) = self.similarity_weight_opt.as_ref() {
+            if let Some(fieldnorm) = self.fieldnorm() {
+                similarity_weight.score_fieldnorm(fieldnorm, count)
+            } else {
+                let fieldnorm_id = self.fieldnorm_id();
+                similarity_weight.score(fieldnorm_id, count)
+            }
+        } else {
+            1.0f32
+        }
+    }
+
     fn phrase_match(&mut self) -> bool {
         self.cached_score = None;
         if self.similarity_weight_opt.is_some() {
-            let fieldnorm_id = self.pruning_threshold.map(|_| self.fieldnorm_id());
             let mut max_phrase_score = None;
             if !self.has_slop() {
                 if let Some(threshold) = self.pruning_threshold {
@@ -457,11 +477,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
                         })
                         .min()
                         .unwrap();
-                    let upper_bound = self
-                        .similarity_weight_opt
-                        .as_ref()
-                        .unwrap()
-                        .score(fieldnorm_id.unwrap(), max_phrase_count);
+                    let upper_bound = self.compute_score(max_phrase_count);
                     max_phrase_score = Some((max_phrase_count, upper_bound));
                     // Negative boosts reverse the term-frequency bound.
                     if upper_bound.is_finite()
@@ -480,11 +496,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             if let Some(threshold) = self.pruning_threshold {
                 let score = match max_phrase_score {
                     Some((max_count, score)) if count == max_count => score,
-                    _ => self
-                        .similarity_weight_opt
-                        .as_ref()
-                        .unwrap()
-                        .score(fieldnorm_id.unwrap(), count),
+                    _ => self.compute_score(count),
                 };
                 self.cached_score = Some(score);
                 score > threshold
@@ -656,12 +668,7 @@ impl<TPostings: Postings> Scorer for PhraseScorer<TPostings> {
         if let Some(score) = self.cached_score {
             return score;
         }
-        if let Some(similarity_weight) = self.similarity_weight_opt.as_ref() {
-            let fieldnorm_id = self.fieldnorm_id();
-            similarity_weight.score(fieldnorm_id, self.phrase_count)
-        } else {
-            1.0f32
-        }
+        self.compute_score(self.phrase_count)
     }
 }
 

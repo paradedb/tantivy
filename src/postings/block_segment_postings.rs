@@ -1,3 +1,4 @@
+use std::cell::{Cell, Ref, RefCell};
 use std::io;
 
 use common::{HasLen, VInt};
@@ -12,9 +13,6 @@ use crate::query::Bm25Weight;
 use crate::schema::IndexRecordOption;
 use crate::{DocId, Score, TERMINATED};
 
-pub(crate) fn max_score<I: Iterator<Item = Score>>(mut it: I) -> Option<Score> {
-    it.next().map(|first| it.fold(first, Score::max))
-}
 /// `BlockSegmentPostings` is a cursor iterating over blocks
 /// of documents.
 ///
@@ -26,7 +24,9 @@ pub(crate) fn max_score<I: Iterator<Item = Score>>(mut it: I) -> Option<Score> {
 pub struct BlockSegmentPostings {
     pub(crate) doc_decoder: BlockDecoder,
     block_loaded: bool,
-    freq_decoder: BlockDecoder,
+    pub(crate) freq_decoder: BlockDecoder,
+    fieldnorm_decoder: RefCell<BlockDecoder>,
+    fieldnorm_loaded: Cell<bool>,
     freq_reading_option: FreqReadingOption,
     block_max_score_cache: Option<Score>,
     doc_freq: u32,
@@ -135,6 +135,7 @@ impl BlockSegmentPostings {
         bytes: OwnedBytes,
         record_option: IndexRecordOption,
         requested_option: IndexRecordOption,
+        has_pnorms: bool,
     ) -> io::Result<BlockSegmentPostings> {
         let (skip_data_opt, postings_data) = split_into_skips_and_postings(doc_freq, bytes)?;
         Self::from_parts(
@@ -143,6 +144,7 @@ impl BlockSegmentPostings {
             PostingData::Eager(postings_data),
             record_option,
             requested_option,
+            has_pnorms,
         )
     }
 
@@ -151,6 +153,7 @@ impl BlockSegmentPostings {
         file: FileSlice,
         record_option: IndexRecordOption,
         requested_option: IndexRecordOption,
+        has_pnorms: bool,
     ) -> io::Result<Self> {
         if file.storage_block_len().is_none()
             || file.len() <= SHORT_POSTINGS_THRESHOLD
@@ -161,6 +164,7 @@ impl BlockSegmentPostings {
                 file.read_bytes()?,
                 record_option,
                 requested_option,
+                has_pnorms,
             );
         }
         let header = file.read_bytes_slice(0..file.len().min(10))?;
@@ -182,6 +186,7 @@ impl BlockSegmentPostings {
             PostingData::Lazy(postings_slice, len),
             record_option,
             requested_option,
+            has_pnorms,
         )
     }
 
@@ -191,22 +196,36 @@ impl BlockSegmentPostings {
         data: PostingData,
         mut record_option: IndexRecordOption,
         requested_option: IndexRecordOption,
+        has_pnorms: bool,
     ) -> io::Result<Self> {
         let skip_reader = match skip_data_opt {
             Some(skip_data) => {
                 let block_count = doc_freq as usize / COMPRESSION_BLOCK_SIZE;
-                // 8 is the minimum size of a block with frequency (can be more if pos are stored
-                // too)
-                if skip_data.len() < 8 * block_count {
+                let has_pnorms = if skip_data.len() == 6 * block_count
+                    || skip_data.len() == 9 * block_count
+                    || skip_data.len() == 13 * block_count
+                {
+                    true
+                } else if skip_data.len() == 5 * block_count
+                    || skip_data.len() == 8 * block_count
+                    || skip_data.len() == 12 * block_count
+                {
+                    false
+                } else {
+                    has_pnorms
+                };
+                // 8 is the minimum size of a block with frequency (9 if pnorms are stored too)
+                let min_freq_skip_len = if has_pnorms { 9 } else { 8 };
+                if skip_data.len() < min_freq_skip_len * block_count {
                     // the field might be encoded with frequency, but this term in particular isn't.
                     // This can happen for JSON field with term frequencies:
                     // - text terms are encoded with term freqs.
                     // - numerical terms are encoded without term freqs.
                     record_option = IndexRecordOption::Basic;
                 }
-                SkipReader::new(skip_data, doc_freq, record_option)
+                SkipReader::new(skip_data, doc_freq, record_option, has_pnorms)
             }
-            None => SkipReader::new(OwnedBytes::empty(), doc_freq, record_option),
+            None => SkipReader::new(OwnedBytes::empty(), doc_freq, record_option, has_pnorms),
         };
 
         let freq_reading_option = match (record_option, requested_option) {
@@ -219,6 +238,8 @@ impl BlockSegmentPostings {
             doc_decoder: BlockDecoder::with_val(TERMINATED),
             block_loaded: false,
             freq_decoder: BlockDecoder::with_val(1),
+            fieldnorm_decoder: RefCell::new(BlockDecoder::with_val(0)),
+            fieldnorm_loaded: Cell::new(false),
             freq_reading_option,
             block_max_score_cache: None,
             doc_freq,
@@ -252,13 +273,38 @@ impl BlockSegmentPostings {
         // this is the last block of the segment posting list.
         // If it is actually loaded, we can compute block max manually.
         if self.block_is_loaded() {
-            let docs = self.doc_decoder.output_array().iter().cloned();
-            let freqs = self.freq_decoder.output_array().iter().cloned();
-            let bm25_scores = docs.zip(freqs).enumerate().map(|(offset, (_, term_freq))| {
-                let fieldnorm_id = self.fieldnorm_id_at(offset, fieldnorm_reader);
-                bm25_weight.score(fieldnorm_id, term_freq)
-            });
-            let block_max_score = max_score(bm25_scores).unwrap_or(0.0);
+            let block_len = self.block_len();
+            let block_max_score = if self.term_norms.is_some() {
+                self.load_fieldnorm_block();
+                let decoder = self.fieldnorm_decoder.borrow();
+                let norms = decoder.output_array();
+                let freqs = self.freq_decoder.output_array();
+                let norm_const = bm25_weight.norm_const();
+                let norm_factor = bm25_weight.norm_factor();
+                let weight = bm25_weight.weight();
+                let mut max_s = 0.0f32;
+                for i in 0..block_len {
+                    let tf = freqs[i] as f32;
+                    let norm = norm_const + norm_factor * (norms[i] as f32);
+                    let s = weight * (tf / (tf + norm));
+                    if s > max_s {
+                        max_s = s;
+                    }
+                }
+                max_s
+            } else {
+                let docs = self.doc_decoder.output_array();
+                let freqs = self.freq_decoder.output_array();
+                let mut max_s = 0.0f32;
+                for i in 0..block_len {
+                    let fieldnorm_id = fieldnorm_reader.fieldnorm_id(docs[i]);
+                    let s = bm25_weight.score(fieldnorm_id, freqs[i]);
+                    if s > max_s {
+                        max_s = s;
+                    }
+                }
+                max_s
+            };
             self.block_max_score_cache = Some(block_max_score);
             return block_max_score;
         }
@@ -278,29 +324,98 @@ impl BlockSegmentPostings {
         source: Option<FileSlice>,
         norm_offset: Option<u64>,
     ) {
-        self.term_norms = source.zip(norm_offset).map(|(source, offset)| {
-            super::term_norms::TermNormReader::new(source, offset, self.doc_freq)
-        });
+        self.term_norms = source
+            .zip(norm_offset)
+            .map(|(source, offset)| super::term_norms::TermNormReader::new(source, offset));
+        self.fieldnorm_loaded.set(false);
     }
 
     pub(crate) fn disable_term_norms(&mut self) {
         self.term_norms = None;
+        self.fieldnorm_loaded.set(false);
+    }
+
+    #[inline]
+    pub(crate) fn has_term_norms(&self) -> bool {
+        self.term_norms.is_some()
+    }
+
+    #[inline]
+    pub(crate) fn load_fieldnorm_block(&self) {
+        if !self.fieldnorm_loaded.get() {
+            self.load_fieldnorm_block_cold();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn load_fieldnorm_block_cold(&self) {
+        if let Some(norms) = self.term_norms.as_ref() {
+            let offset = self.skip_reader.pnorm_byte_offset();
+            match self.skip_reader.block_info() {
+                BlockInfo::BitPacked { pnorm_num_bits, .. } => {
+                    norms
+                        .decode_packed_block(
+                            offset,
+                            pnorm_num_bits,
+                            &mut self.fieldnorm_decoder.borrow_mut(),
+                        )
+                        .expect("failed to decode fieldnorm block");
+                }
+                BlockInfo::VInt { num_docs } => {
+                    norms
+                        .decode_vint_block(
+                            offset,
+                            num_docs as usize,
+                            &mut self.fieldnorm_decoder.borrow_mut(),
+                        )
+                        .expect("failed to decode fieldnorm vint block");
+                }
+            }
+        }
+        self.fieldnorm_loaded.set(true);
+    }
+
+    #[inline]
+    pub(crate) fn fieldnorm_decoder(&self) -> Ref<'_, BlockDecoder> {
+        self.load_fieldnorm_block();
+        self.fieldnorm_decoder.borrow()
+    }
+
+    #[inline]
+    pub(crate) fn fieldnorm_at(&self, offset: usize, fallback: &FieldNormReader) -> u32 {
+        if self.term_norms.is_some() {
+            self.load_fieldnorm_block();
+            self.fieldnorm_decoder.borrow().output(offset)
+        } else {
+            fallback.fieldnorm(self.doc(offset))
+        }
     }
 
     #[inline]
     pub(crate) fn fieldnorm_id_at(&self, offset: usize, fallback: &FieldNormReader) -> u8 {
-        self.posting_fieldnorm_id_at(offset)
-            .unwrap_or_else(|| fallback.fieldnorm_id(self.doc(offset)))
+        if self.term_norms.is_some() {
+            self.load_fieldnorm_block();
+            FieldNormReader::fieldnorm_to_id(self.fieldnorm_decoder.borrow().output(offset))
+        } else {
+            fallback.fieldnorm_id(self.doc(offset))
+        }
+    }
+
+    #[inline]
+    pub(crate) fn posting_fieldnorm_at(&self, offset: usize) -> Option<u32> {
+        if self.term_norms.is_some() {
+            self.load_fieldnorm_block();
+            Some(self.fieldnorm_decoder.borrow().output(offset))
+        } else {
+            None
+        }
     }
 
     #[inline]
     pub(crate) fn posting_fieldnorm_id_at(&self, offset: usize) -> Option<u8> {
-        self.term_norms.as_ref().map(|norms| {
-            let ordinal = (self.doc_freq - self.skip_reader.remaining_docs()) as usize + offset;
-            norms
-                .read(ordinal)
-                .expect("failed to read posting fieldnorm")
-        })
+        self.posting_fieldnorm_at(offset)
+            .map(FieldNormReader::fieldnorm_to_id)
     }
 
     // Resets the block segment postings on another position
@@ -320,6 +435,7 @@ impl BlockSegmentPostings {
         self.data = PostingData::Eager(postings_data);
         self.block_max_score_cache = None;
         self.block_loaded = false;
+        self.fieldnorm_loaded.set(false);
         if let Some(skip_data) = skip_data_opt {
             self.skip_reader.reset(skip_data, doc_freq);
         } else {
@@ -450,6 +566,7 @@ impl BlockSegmentPostings {
         if self.skip_reader.seek(target_doc) {
             self.block_max_score_cache = None;
             self.block_loaded = false;
+            self.fieldnorm_loaded.set(false);
         }
     }
 
@@ -547,6 +664,7 @@ impl BlockSegmentPostings {
                 })?;
             }
         }
+        self.fieldnorm_loaded.set(false);
         self.block_loaded = true;
         Ok(())
     }
@@ -555,6 +673,7 @@ impl BlockSegmentPostings {
     pub fn advance(&mut self) {
         self.skip_reader.advance();
         self.block_loaded = false;
+        self.fieldnorm_loaded.set(false);
         self.block_max_score_cache = None;
         self.load_block();
     }
@@ -565,11 +684,13 @@ impl BlockSegmentPostings {
             doc_decoder: BlockDecoder::with_val(TERMINATED),
             block_loaded: true,
             freq_decoder: BlockDecoder::with_val(1),
+            fieldnorm_decoder: RefCell::new(BlockDecoder::with_val(0)),
+            fieldnorm_loaded: Cell::new(true),
             freq_reading_option: FreqReadingOption::NoFreq,
             block_max_score_cache: None,
             doc_freq: 0,
             data: PostingData::Eager(OwnedBytes::empty()),
-            skip_reader: SkipReader::new(OwnedBytes::empty(), 0, IndexRecordOption::Basic),
+            skip_reader: SkipReader::new(OwnedBytes::empty(), 0, IndexRecordOption::Basic, false),
             term_norms: None,
         }
     }
@@ -678,6 +799,7 @@ mod tests {
                     file,
                     record_option,
                     option,
+                    false,
                 )?;
                 let opening_reads = reads.lock().unwrap();
                 assert!(opening_reads.iter().map(|range| range.len()).sum::<usize>() < bytes.len());
@@ -687,6 +809,7 @@ mod tests {
                     bytes.clone(),
                     record_option,
                     option,
+                    false,
                 )?;
                 let mut lazy_seek = lazy.clone();
                 let mut eager_seek = eager.clone();
@@ -733,6 +856,7 @@ mod tests {
                 file,
                 record_option,
                 IndexRecordOption::WithFreqs,
+                false,
             )
             .is_err());
         }
@@ -757,6 +881,7 @@ mod tests {
                 file,
                 IndexRecordOption::WithFreqs,
                 IndexRecordOption::WithFreqs,
+                false,
             )
             .is_err());
         }

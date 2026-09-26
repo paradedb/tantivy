@@ -180,12 +180,18 @@ impl ValueReader for TermInfoValueReader {
         };
 
         self.term_infos.reserve_exact(num_els as usize);
-        for _ in 0..num_els {
+        for i in 0..num_els {
             let doc_freq = VInt::deserialize_u64(&mut data)? as u32;
             let postings_num_bytes = VInt::deserialize_u64(&mut data)?;
             let positions_num_bytes = VInt::deserialize_u64(&mut data)?;
             let postings_end = postings_start + postings_num_bytes as usize;
             let positions_end = positions_start + positions_num_bytes as usize;
+            if i > 0 {
+                if let Some(offset) = &mut pnorms_offset {
+                    let delta = VInt::deserialize_u64(&mut data)?;
+                    *offset += delta;
+                }
+            }
             let term_info = TermInfo {
                 doc_freq,
                 postings_range: postings_start..postings_end,
@@ -195,9 +201,6 @@ impl ValueReader for TermInfoValueReader {
             self.term_infos.push(term_info);
             postings_start = postings_end;
             positions_start = positions_end;
-            if let Some(offset) = &mut pnorms_offset {
-                *offset += u64::from(doc_freq);
-            }
         }
         let consumed_len = len_before - data.len();
         Ok(consumed_len)
@@ -231,19 +234,26 @@ impl ValueWriter for TermInfoValueWriter {
         }
         VInt(self.term_infos[0].postings_range.start as u64).serialize_into_vec(buffer);
         VInt(self.term_infos[0].positions_range.start as u64).serialize_into_vec(buffer);
-        let mut pnorms_offset = self.term_infos[0].pnorms_offset;
+        let mut prev_pnorms_offset = None;
         if has_pnorms {
-            // One norm byte per document makes each next offset implicit in doc_freq.
-            VInt(pnorms_offset.expect("posting norms must be enabled for every term"))
-                .serialize_into_vec(buffer);
+            let start = self.term_infos[0]
+                .pnorms_offset
+                .expect("posting norms must be enabled for every term");
+            VInt(start).serialize_into_vec(buffer);
+            prev_pnorms_offset = Some(start);
         }
-        for term_info in &self.term_infos {
+        for (i, term_info) in self.term_infos.iter().enumerate() {
             VInt(term_info.doc_freq as u64).serialize_into_vec(buffer);
             VInt(term_info.postings_range.len() as u64).serialize_into_vec(buffer);
             VInt(term_info.positions_range.len() as u64).serialize_into_vec(buffer);
-            assert_eq!(term_info.pnorms_offset, pnorms_offset);
-            if let Some(offset) = &mut pnorms_offset {
-                *offset += u64::from(term_info.doc_freq);
+            if has_pnorms && i > 0 {
+                let current_offset = term_info
+                    .pnorms_offset
+                    .expect("posting norms must be enabled for every term");
+                debug_assert!(current_offset >= prev_pnorms_offset.unwrap());
+                let delta = current_offset - prev_pnorms_offset.unwrap();
+                VInt(delta).serialize_into_vec(buffer);
+                prev_pnorms_offset = Some(current_offset);
             }
         }
     }
@@ -290,28 +300,27 @@ mod tests {
     }
 
     #[test]
-    fn norm_offset_overhead_is_constant_per_block() {
-        let mut overhead = None;
+    fn roundtrip_variable_norm_offsets() {
         for count in [1, 64, 1_024] {
-            let mut plain = super::TermInfoValueWriter::default();
-            let mut norms = super::TermInfoValueWriter::default();
+            let mut writer = super::TermInfoValueWriter::default();
+            let mut reader = TermInfoValueReader::default();
+            let mut infos = Vec::new();
+            let mut offset = 1 << 40;
             for i in 0..count {
-                let mut info = TermInfo {
-                    doc_freq: 1,
-                    postings_range: i * 4..(i + 1) * 4,
-                    positions_range: i..i + 1,
-                    pnorms_offset: None,
+                let info = TermInfo {
+                    doc_freq: ((i % 5) + 1) as u32,
+                    postings_range: (i * 4)..((i + 1) * 4),
+                    positions_range: i..(i + 1),
+                    pnorms_offset: Some(offset),
                 };
-                plain.write(&info);
-                info.pnorms_offset = Some((1 << 40) + i as u64);
-                norms.write(&info);
+                offset += ((i % 7) + 2) as u64;
+                writer.write(&info);
+                infos.push(info);
             }
-            let mut plain_bytes = Vec::new();
-            let mut norm_bytes = Vec::new();
-            plain.serialize_block(&mut plain_bytes);
-            norms.serialize_block(&mut norm_bytes);
-            let extra_bytes = norm_bytes.len() - plain_bytes.len();
-            assert_eq!(*overhead.get_or_insert(extra_bytes), extra_bytes);
+            let mut bytes = Vec::new();
+            writer.serialize_block(&mut bytes);
+            reader.load(&bytes).unwrap();
+            assert_eq!(reader.term_infos, infos);
         }
     }
 

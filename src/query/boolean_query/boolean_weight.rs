@@ -816,7 +816,13 @@ mod tests {
                                     Score::MIN,
                                     reader,
                                     &mut |doc, score| {
-                                        assert!((score - all[&doc]).abs() <= 1e-5);
+                                        assert!(
+                                            (score - all[&doc]).abs() <= 1e-5,
+                                            "{expression}, boost={boost}, {mode:?}, \
+                                             pnorms={pnorms}, doc={doc}: actual {score} != \
+                                             expected {}",
+                                            all[&doc]
+                                        );
                                         actual.push((doc, score));
                                         actual.sort_unstable_by(|a, b| {
                                             b.1.total_cmp(&a.1).then(a.0.cmp(&b.0))
@@ -829,7 +835,12 @@ mod tests {
                                         }
                                     },
                                 )?;
-                                assert_eq!(actual.len(), expected.len().min(top_k));
+                                assert_eq!(
+                                    actual.len(),
+                                    expected.len().min(top_k),
+                                    "{expression}, boost={boost}, {mode:?}, pnorms={pnorms}, \
+                                     k={top_k}"
+                                );
                                 for (actual, expected) in actual.iter().zip(&expected) {
                                     assert!(
                                         (actual.1 - expected.1).abs() <= 1e-5,

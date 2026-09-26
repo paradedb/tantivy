@@ -288,6 +288,7 @@ impl InvertedIndexReader {
             postings_data,
             self.record_option,
             requested_option,
+            self.has_pnorms(),
         )?;
         postings.set_term_norm_source(self.pnorms_file_slice.clone(), term_info.pnorms_offset);
         Ok(postings)

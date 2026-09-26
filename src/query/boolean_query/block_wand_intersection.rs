@@ -42,9 +42,10 @@ pub struct BlockWandIntersectionScorer {
 
     candidate_doc_ids: [u32; COMPRESSION_BLOCK_SIZE],
     candidate_scores: [f32; COMPRESSION_BLOCK_SIZE],
-    /// Leader fieldnorm IDs for `candidate_doc_ids[..num_candidates]`, reused by secondaries
-    /// when `shared_fieldnorms` is true.
-    candidate_norms: [u8; COMPRESSION_BLOCK_SIZE],
+    /// Leader fieldnorm IDs (or full fieldnorms when `has_term_norms` is true) for
+    /// `candidate_doc_ids[..num_candidates]`, reused by secondaries when `shared_fieldnorms` is
+    /// true.
+    candidate_norms: [u32; COMPRESSION_BLOCK_SIZE],
     num_candidates: usize,
     candidate_idx: usize,
 
@@ -57,6 +58,7 @@ pub struct BlockWandIntersectionScorer {
     /// fieldnorm IDs to be reused for secondary scoring.
     // TODO: Extend fieldnorm reuse to other scorers.
     shared_fieldnorms: bool,
+    has_term_norms: bool,
 }
 impl BlockWandIntersectionScorer {
     /// Construction positions `current` on the first match
@@ -81,6 +83,7 @@ impl BlockWandIntersectionScorer {
         // extract them once upfront.
         let fieldnorm_reader = leader.fieldnorm_reader().clone();
         let bm25_weight = leader.bm25_weight().clone();
+        let has_term_norms = leader.has_term_norms();
 
         let internal_doc = leader.doc();
 
@@ -94,7 +97,7 @@ impl BlockWandIntersectionScorer {
             bm25_weight,
             candidate_doc_ids: [0u32; COMPRESSION_BLOCK_SIZE],
             candidate_scores: [0f32; COMPRESSION_BLOCK_SIZE],
-            candidate_norms: [0u8; COMPRESSION_BLOCK_SIZE],
+            candidate_norms: [0u32; COMPRESSION_BLOCK_SIZE],
             num_candidates: 0,
             candidate_idx: 0,
             threshold,
@@ -103,6 +106,7 @@ impl BlockWandIntersectionScorer {
             internal_doc,
             window_end: 0,
             shared_fieldnorms,
+            has_term_norms,
         };
         scorer.advance();
         scorer
@@ -124,15 +128,33 @@ impl BlockWandIntersectionScorer {
                 }
             }
 
-            let norm = self.leader.fieldnorm_id();
-            let mut score = self.bm25_weight.score(norm, self.leader.term_freq());
-            for secondary in &mut self.secondaries {
-                score += if self.shared_fieldnorms {
-                    secondary.bm25_weight().score(norm, secondary.term_freq())
-                } else {
-                    secondary.score()
-                };
-            }
+            let score = if self.has_term_norms {
+                let norm = self.leader.fieldnorm();
+                let mut score = self
+                    .bm25_weight
+                    .score_fieldnorm(norm, self.leader.term_freq());
+                for secondary in &mut self.secondaries {
+                    score += if self.shared_fieldnorms {
+                        secondary
+                            .bm25_weight()
+                            .score_fieldnorm(norm, secondary.term_freq())
+                    } else {
+                        secondary.score()
+                    };
+                }
+                score
+            } else {
+                let norm = self.leader.fieldnorm_id();
+                let mut score = self.bm25_weight.score(norm, self.leader.term_freq());
+                for secondary in &mut self.secondaries {
+                    score += if self.shared_fieldnorms {
+                        secondary.bm25_weight().score(norm, secondary.term_freq())
+                    } else {
+                        secondary.score()
+                    };
+                }
+                score
+            };
             self.internal_doc = candidate + 1;
             if score > self.threshold {
                 self.current = (candidate, score);
@@ -146,38 +168,65 @@ impl BlockWandIntersectionScorer {
     }
 
     fn handle_candidates(&mut self) -> Option<DocId> {
-        if self.shared_fieldnorms {
-            self.handle_candidates_with_norms::<true>()
-        } else {
-            self.handle_candidates_with_norms::<false>()
+        match (self.shared_fieldnorms, self.has_term_norms) {
+            (true, true) => self.handle_candidates_with_norms::<true, true>(),
+            (true, false) => self.handle_candidates_with_norms::<true, false>(),
+            (false, true) => self.handle_candidates_with_norms::<false, true>(),
+            (false, false) => self.handle_candidates_with_norms::<false, false>(),
         }
     }
 
-    fn handle_candidates_with_norms<const SHARED_NORMS: bool>(&mut self) -> Option<DocId> {
+    #[inline]
+    fn advance_candidate_idx_to(&mut self, target: DocId) {
+        self.candidate_idx += 1;
+        if self.candidate_idx < self.num_candidates
+            && self.candidate_doc_ids[self.candidate_idx] < target
+        {
+            let remaining = &self.candidate_doc_ids[self.candidate_idx..self.num_candidates];
+            self.candidate_idx += remaining.partition_point(|&doc| doc < target);
+        }
+    }
+
+    fn handle_candidates_with_norms<const SHARED_NORMS: bool, const HAS_TERM_NORMS: bool>(
+        &mut self,
+    ) -> Option<DocId> {
+        let secondary_block_max_sum =
+            self.secondary_block_max_scores[0] + self.secondary_suffix_block_max[0];
         // Pass 2: Check intersection membership only for survivors.
-        // score_threshold may be stale (threshold can increase from callbacks),
-        // but that's conservative — we may check a few extra candidates, never miss one.
         'next_candidate: while self.candidate_idx < self.num_candidates {
             let candidate_doc = self.candidate_doc_ids[self.candidate_idx];
             let mut total_score: Score = self.candidate_scores[self.candidate_idx];
 
+            if total_score + secondary_block_max_sum <= self.threshold {
+                self.candidate_idx += 1;
+                continue 'next_candidate;
+            }
+
             for (secondary_idx, secondary) in self.secondaries.iter_mut().enumerate() {
                 // If a previous candidate already advanced this secondary past
                 // candidate_doc, the candidate can't be in the intersection.
-                if secondary.doc() > candidate_doc {
-                    self.candidate_idx += 1;
+                let sec_doc = secondary.doc();
+                if sec_doc > candidate_doc {
+                    self.advance_candidate_idx_to(sec_doc);
                     continue 'next_candidate;
                 }
                 let seek_result = secondary.seek(candidate_doc);
                 if seek_result != candidate_doc {
-                    self.candidate_idx += 1;
+                    self.advance_candidate_idx_to(seek_result);
                     continue 'next_candidate;
                 }
                 total_score += if SHARED_NORMS {
-                    secondary.bm25_weight().score(
-                        self.candidate_norms[self.candidate_idx],
-                        secondary.term_freq(),
-                    )
+                    if HAS_TERM_NORMS {
+                        secondary.bm25_weight().score_fieldnorm(
+                            self.candidate_norms[self.candidate_idx],
+                            secondary.term_freq(),
+                        )
+                    } else {
+                        secondary.bm25_weight().score(
+                            self.candidate_norms[self.candidate_idx] as u8,
+                            secondary.term_freq(),
+                        )
+                    }
                 } else {
                     secondary.score()
                 };
@@ -299,19 +348,81 @@ impl DocSet for BlockWandIntersectionScorer {
             let score_threshold = self.threshold - secondary_block_max_sum;
 
             let mut num_candidates = 0usize;
-            for (offset, (candidate_doc, term_freq)) in block_docs
-                .iter()
-                .copied()
-                .zip(block_freqs.iter().copied())
-                .enumerate()
-            {
-                let fieldnorm_id =
-                    block_cursor.fieldnorm_id_at(start_idx + offset, &self.fieldnorm_reader);
-                let leader_score = self.bm25_weight.score(fieldnorm_id, term_freq);
-                self.candidate_doc_ids[num_candidates] = candidate_doc;
-                self.candidate_scores[num_candidates] = leader_score;
-                self.candidate_norms[num_candidates] = fieldnorm_id;
-                num_candidates += (leader_score > score_threshold) as usize;
+            if block_cursor.has_term_norms() {
+                let norms_decoder = block_cursor.fieldnorm_decoder();
+                let block_fieldnorms = &norms_decoder.output_array()[start_idx..end_idx];
+                let len = block_docs.len();
+                let mut scores = [0.0f32; COMPRESSION_BLOCK_SIZE];
+
+                let norm_const = self.bm25_weight.norm_const();
+                let norm_factor = self.bm25_weight.norm_factor();
+                let weight = self.bm25_weight.weight();
+
+                let freqs = &block_freqs[..len];
+                let norms = &block_fieldnorms[..len];
+                let sc = &mut scores[..len];
+
+                // Compute leader BM25 scores without a loop-carried dependency on max_score
+                // to enable LLVM auto-vectorization.
+                // TODO: Consider manual SIMD unrolling or explicit NEON/AVX intrinsics if
+                // auto-vectorization is insufficient.
+                for i in 0..len {
+                    let tf = freqs[i] as f32;
+                    let norm = norm_const + norm_factor * (norms[i] as f32);
+                    sc[i] = weight * (tf / (tf + norm));
+                }
+
+                let mut max_score = 0.0f32;
+                for &s in &sc[..len] {
+                    if s > max_score {
+                        max_score = s;
+                    }
+                }
+
+                if max_score <= score_threshold {
+                    self.internal_doc = self.window_end + 1;
+                    continue;
+                }
+
+                if self.shared_fieldnorms {
+                    for i in 0..len {
+                        let leader_score = scores[i];
+                        if leader_score > score_threshold {
+                            self.candidate_doc_ids[num_candidates] = block_docs[i];
+                            self.candidate_scores[num_candidates] = leader_score;
+                            self.candidate_norms[num_candidates] = norms[i];
+                            num_candidates += 1;
+                        }
+                    }
+                } else {
+                    for i in 0..len {
+                        let leader_score = scores[i];
+                        if leader_score > score_threshold {
+                            self.candidate_doc_ids[num_candidates] = block_docs[i];
+                            self.candidate_scores[num_candidates] = leader_score;
+                            num_candidates += 1;
+                        }
+                    }
+                }
+            } else {
+                for (offset, (candidate_doc, term_freq)) in block_docs
+                    .iter()
+                    .copied()
+                    .zip(block_freqs.iter().copied())
+                    .enumerate()
+                {
+                    let fieldnorm_id =
+                        block_cursor.fieldnorm_id_at(start_idx + offset, &self.fieldnorm_reader);
+                    let leader_score = self.bm25_weight.score(fieldnorm_id, term_freq);
+                    if leader_score > score_threshold {
+                        self.candidate_doc_ids[num_candidates] = candidate_doc;
+                        self.candidate_scores[num_candidates] = leader_score;
+                        if self.shared_fieldnorms {
+                            self.candidate_norms[num_candidates] = fieldnorm_id as u32;
+                        }
+                        num_candidates += 1;
+                    }
+                }
             }
             self.num_candidates = num_candidates;
             self.candidate_idx = 0;

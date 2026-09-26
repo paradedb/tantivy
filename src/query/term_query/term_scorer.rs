@@ -45,6 +45,11 @@ impl TermScorer {
         self.fieldnorm_source.is_some() && self.fieldnorm_source == other.fieldnorm_source
     }
 
+    #[inline]
+    pub(crate) fn has_term_norms(&self) -> bool {
+        self.postings.block_cursor.has_term_norms()
+    }
+
     pub(crate) fn seek_block(&mut self, target_doc: DocId) {
         self.postings.block_cursor.seek_block(target_doc);
     }
@@ -125,6 +130,12 @@ impl TermScorer {
             .fieldnorm_id_at(self.postings.block_offset(), &self.fieldnorm_reader)
     }
 
+    pub fn fieldnorm(&self) -> u32 {
+        self.postings
+            .block_cursor
+            .fieldnorm_at(self.postings.block_offset(), &self.fieldnorm_reader)
+    }
+
     pub fn explain(&self) -> Explanation {
         let fieldnorm_id = self.fieldnorm_id();
         let term_freq = self.term_freq();
@@ -186,9 +197,14 @@ impl DocSet for TermScorer {
 impl Scorer for TermScorer {
     #[inline]
     fn score(&mut self) -> Score {
-        let fieldnorm_id = self.fieldnorm_id();
         let term_freq = self.term_freq();
-        self.similarity_weight.score(fieldnorm_id, term_freq)
+        if self.postings.block_cursor.has_term_norms() {
+            let fieldnorm = self.fieldnorm();
+            self.similarity_weight.score_fieldnorm(fieldnorm, term_freq)
+        } else {
+            let fieldnorm_id = self.fieldnorm_id();
+            self.similarity_weight.score(fieldnorm_id, term_freq)
+        }
     }
 }
 
