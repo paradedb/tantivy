@@ -405,7 +405,7 @@ pub struct FilterAggReqData {
     pub req: FilterAggregation,
     /// The segment reader
     pub segment_reader: SegmentReader,
-    /// Document evaluator for the filter query (precomputed BitSet).
+    /// Document evaluator for the filter query (a precomputed BitSet unless it matches all).
     /// Wrapped in `Rc` so cloning the request data does not duplicate the (potentially large)
     /// underlying BitSet.
     pub evaluator: Rc<DocumentQueryEvaluator>,
@@ -417,18 +417,20 @@ impl FilterAggReqData {
     pub(crate) fn get_memory_consumption(&self) -> usize {
         // Estimate: name + segment reader reference + bitset
         self.name.len()
-        + std::mem::size_of::<SegmentReader>()
-        + self.evaluator.bitset.len() / 8 // BitSet memory (bits to bytes)
-        + std::mem::size_of::<bool>()
+            + std::mem::size_of::<SegmentReader>()
+            + self
+                .evaluator
+                .bitset
+                .as_ref()
+                .map_or(0, |bitset| bitset.len() / 8)
+            + std::mem::size_of::<bool>()
     }
 }
 
-/// Document evaluator for filter queries using BitSet
+/// Document evaluator for filter queries, with an allocation-free match-all case.
 pub struct DocumentQueryEvaluator {
-    /// BitSet containing all matching documents for this segment.
-    /// For AllQuery, this is a full BitSet (all bits set).
-    /// For other queries, only matching document bits are set.
-    pub(crate) bitset: BitSet,
+    /// None accepts every document supplied by the outer query.
+    pub(crate) bitset: Option<BitSet>,
 }
 
 impl DocumentQueryEvaluator {
@@ -442,11 +444,8 @@ impl DocumentQueryEvaluator {
     ) -> crate::Result<Self> {
         let max_doc = segment_reader.max_doc();
 
-        // Optimization: Detect AllQuery and create a full BitSet
         if query.as_any().downcast_ref::<AllQuery>().is_some() {
-            return Ok(Self {
-                bitset: BitSet::with_max_value_and_full(max_doc),
-            });
+            return Ok(Self { bitset: None });
         }
 
         // Get the weight for the query
@@ -466,24 +465,32 @@ impl DocumentQueryEvaluator {
             doc = scorer.advance();
         }
 
-        Ok(Self { bitset })
+        Ok(Self {
+            bitset: Some(bitset),
+        })
     }
 
     /// Evaluate if a document matches the filter query
-    /// O(1) lookup in the precomputed BitSet
+    /// Match-all filters accept every document; others consult the precomputed BitSet.
     #[inline]
     pub fn matches_document(&self, doc: DocId) -> bool {
-        self.bitset.contains(doc)
+        self.bitset
+            .as_ref()
+            .is_none_or(|bitset| bitset.contains(doc))
     }
 
     /// Filter a batch of documents
     /// Returns matching documents from the input batch
     #[inline]
     pub fn filter_batch(&self, docs: &[DocId], output: &mut Vec<DocId>) {
-        for &doc in docs {
-            if self.bitset.contains(doc) {
-                output.push(doc);
+        if let Some(bitset) = &self.bitset {
+            for &doc in docs {
+                if bitset.contains(doc) {
+                    output.push(doc);
+                }
             }
+        } else {
+            output.extend_from_slice(docs);
         }
     }
 }
@@ -491,7 +498,8 @@ impl DocumentQueryEvaluator {
 impl Debug for DocumentQueryEvaluator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DocumentQueryEvaluator")
-            .field("num_matches", &self.bitset.len())
+            .field("matches_all", &self.bitset.is_none())
+            .field("num_matches", &self.bitset.as_ref().map(BitSet::len))
             .finish()
     }
 }
@@ -830,6 +838,78 @@ mod tests {
             deserialized,
             AggContextParams::new(Default::default(), index.tokenizers().clone()),
         ))
+    }
+
+    #[test]
+    fn test_all_query_evaluator_scalar_and_batch() -> crate::Result<()> {
+        let index = create_standard_test_index()?;
+        let searcher = index.reader()?.searcher();
+        for segment in searcher.segment_readers() {
+            let evaluator =
+                DocumentQueryEvaluator::new(Box::new(AllQuery), index.schema(), segment)?;
+            assert!(evaluator.bitset.is_none());
+            let docs: Vec<_> = (0..segment.max_doc()).rev().chain([0, 0]).collect();
+            assert!(docs.iter().all(|&doc| evaluator.matches_document(doc)));
+            let mut output = vec![crate::TERMINATED];
+            evaluator.filter_batch(&docs, &mut output);
+            assert_eq!(&output[1..], docs);
+            let expected = output.clone();
+            evaluator.filter_batch(&[], &mut output);
+            assert_eq!(output, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_all_filter_respects_outer_query_and_deletes() -> crate::Result<()> {
+        let index = create_standard_test_index()?;
+        let schema = index.schema();
+        let category = schema.get_field("category")?;
+        let brand = schema.get_field("brand")?;
+        let agg: Aggregations = serde_json::from_value(json!({
+            "all": {
+                "filter": "*",
+                "aggs": { "sum_price": { "sum": { "field": "price" } } }
+            }
+        }))?;
+        for deleted in [false, true] {
+            if deleted {
+                let mut writer: IndexWriter = index.writer_for_tests()?;
+                writer.delete_term(Term::from_field_text(brand, "samsung"));
+                writer.commit()?;
+            }
+            let searcher = index.reader()?.searcher();
+            for (category_value, count, sum) in [
+                (
+                    None,
+                    if deleted { 3 } else { 4 },
+                    if deleted { 1144 } else { 1943 },
+                ),
+                (
+                    Some("electronics"),
+                    if deleted { 1 } else { 2 },
+                    if deleted { 999 } else { 1798 },
+                ),
+                (Some("furniture"), 0, 0),
+            ] {
+                let query: Box<dyn Query> = match category_value {
+                    Some(value) => Box::new(TermQuery::new(
+                        Term::from_field_text(category, value),
+                        IndexRecordOption::Basic,
+                    )),
+                    None => Box::new(AllQuery),
+                };
+                let result =
+                    searcher.search(query.as_ref(), &create_collector(&index, agg.clone())?)?;
+                assert_agg_results!(
+                    &result,
+                    json!({
+                        "all": { "doc_count": count, "sum_price": { "value": sum } }
+                    })
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]
