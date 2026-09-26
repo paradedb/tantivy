@@ -113,6 +113,11 @@ impl FieldEntry {
         self.field_type.has_fieldnorms()
     }
 
+    /// Returns true if posting-local norms are enabled for this field.
+    pub fn has_pnorms(&self) -> bool {
+        self.field_type.has_pnorms()
+    }
+
     /// Returns true if the field is a fast field
     pub fn is_fast(&self) -> bool {
         self.field_type.is_fast()
@@ -208,6 +213,48 @@ mod tests {
         match field_entry.field_type {
             FieldType::Str(_) => {}
             _ => panic!("expected FieldType::Str"),
+        }
+    }
+
+    #[test]
+    fn test_posting_norm_options_roundtrip_and_defaults() {
+        use crate::schema::{
+            BytesOptions, DateOptions, IpAddrOptions, NumericOptions, FAST, INDEXED,
+        };
+
+        let field_type = FieldType::Str(
+            TEXT.set_indexing_options(TextFieldIndexing::default().set_pnorms(true)) | FAST,
+        );
+        assert!(field_type.has_pnorms());
+        let mut serialized = serde_json::to_value(&field_type).unwrap();
+        assert_eq!(
+            serde_json::from_value::<FieldType>(serialized.clone()).unwrap(),
+            field_type
+        );
+        let options = &mut serialized["options"]["indexing"];
+        assert_eq!(options["pnorms"], true);
+        options.as_object_mut().unwrap().remove("pnorms");
+        let legacy: FieldType = serde_json::from_value(serialized.clone()).unwrap();
+        assert!(!legacy.has_pnorms());
+        assert_eq!(serde_json::to_value(&legacy).unwrap(), serialized);
+        assert!(TextFieldIndexing::default()
+            .set_pnorms(true)
+            .set_fieldnorms(false)
+            .pnorms());
+
+        for field_type in [
+            FieldType::U64(NumericOptions::from(INDEXED)),
+            FieldType::I64(NumericOptions::from(INDEXED)),
+            FieldType::F64(NumericOptions::from(INDEXED)),
+            FieldType::Bool(NumericOptions::from(INDEXED)),
+            FieldType::Date(DateOptions::from(INDEXED)),
+            FieldType::Bytes(BytesOptions::from(INDEXED)),
+            FieldType::IpAddr(IpAddrOptions::from(INDEXED)),
+        ] {
+            assert!(field_type.has_fieldnorms());
+            assert!(!field_type.has_pnorms());
+            let serialized = serde_json::to_value(&field_type).unwrap();
+            assert!(serialized["options"].get("pnorms").is_none());
         }
     }
 

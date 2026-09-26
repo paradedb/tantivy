@@ -48,9 +48,7 @@ impl RegexPhraseWeight {
 
     fn fieldnorm_reader(&self, reader: &SegmentReader) -> crate::Result<FieldNormReader> {
         if self.similarity_weight_opt.is_some() {
-            if let Some(fieldnorm_reader) = reader.fieldnorms_readers().get_field(self.field)? {
-                return Ok(fieldnorm_reader);
-            }
+            return reader.scoring_fieldnorm_reader(self.field);
         }
         Ok(FieldNormReader::constant(reader.max_doc(), 1))
     }
@@ -85,7 +83,12 @@ impl RegexPhraseWeight {
                     "Phrase query exceeded max expansions {num_terms}"
                 )));
             }
-            let union = Self::get_union_from_term_infos(&term_infos, reader, &inverted_index)?;
+            let union = Self::get_union_from_term_infos(
+                &term_infos,
+                reader,
+                &inverted_index,
+                similarity_weight_opt.is_some(),
+            )?;
 
             posting_lists.push((offset, union));
         }
@@ -177,6 +180,7 @@ impl RegexPhraseWeight {
         term_infos: &[TermInfo],
         reader: &SegmentReader,
         inverted_index: &InvertedIndexReader,
+        scoring_enabled: bool,
     ) -> crate::Result<UnionType> {
         let max_doc = reader.max_doc();
 
@@ -198,6 +202,9 @@ impl RegexPhraseWeight {
         for term_info in term_infos {
             let mut term_posting = inverted_index
                 .read_postings_from_terminfo(term_info, IndexRecordOption::WithFreqsAndPositions)?;
+            if !scoring_enabled {
+                term_posting.block_cursor.disable_term_norms();
+            }
             let num_docs = term_posting.doc_freq();
 
             if num_docs < SPARSE_TERM_DOC_THRESHOLD {
@@ -303,8 +310,7 @@ impl Weight for RegexPhraseWeight {
         if scorer.seek(doc) != doc {
             return Err(does_not_match(doc));
         }
-        let fieldnorm_reader = self.fieldnorm_reader(reader)?;
-        let fieldnorm_id = fieldnorm_reader.fieldnorm_id(doc);
+        let fieldnorm_id = scorer.fieldnorm_id();
         let phrase_count = scorer.phrase_count();
         let mut explanation = Explanation::new("Phrase Scorer", scorer.score());
         if let Some(similarity_weight) = self.similarity_weight_opt.as_ref() {
@@ -323,6 +329,45 @@ mod tests {
     use crate::docset::TERMINATED;
     use crate::query::{wildcard_query_to_regex_str, EnableScoring, RegexPhraseQuery};
     use crate::DocSet;
+
+    #[test]
+    fn test_unscored_regex_phrase_does_not_read_pnorms() -> crate::Result<()> {
+        use std::io::Write;
+
+        use crate::collector::Count;
+        use crate::directory::CompositeWrite;
+        use crate::index::SegmentComponent;
+        use crate::schema::{Schema, TEXT};
+        use crate::Directory;
+
+        let documents: Vec<String> = (0..1000).map(|i| format!("rare{i:04} common")).collect();
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field(
+            "text",
+            TEXT.set_indexing_options(
+                TEXT.get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_pnorms(true),
+            ),
+        );
+        let index = crate::Index::create_in_ram(schema.build());
+        let mut writer = index.writer_for_tests()?;
+        for document in documents {
+            writer.add_document(doc!(text => document))?;
+        }
+        writer.commit()?;
+        for segment in index.searchable_segments()? {
+            let path = segment.relative_path(SegmentComponent::PostingNorms);
+            index.directory().delete(&path).unwrap();
+            let mut composite = CompositeWrite::wrap(index.directory().open_write(&path)?);
+            composite.for_field(text).write_all(&[255])?;
+            composite.close()?;
+        }
+        let query = RegexPhraseQuery::new(text, vec!["rare.*".into(), "common".into()]);
+        assert_eq!(index.reader()?.searcher().search(&query, &Count)?, 1000);
+        Ok(())
+    }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(50))]

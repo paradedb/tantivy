@@ -405,6 +405,59 @@ mod tests {
     }
 
     #[test]
+    fn test_builtin_pnorms_survive_missing_source_and_merge() -> crate::Result<()> {
+        use crate::directory::{Directory, RamDirectory};
+        use crate::index::list_segment_files;
+        use crate::indexer::NoMergePolicy;
+
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field(
+            "text",
+            TEXT.set_indexing_options(
+                TEXT.get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_pnorms(true),
+            ),
+        );
+        let directory = RamDirectory::create();
+        let index = Index::create(directory.clone(), schema.build(), Default::default())?;
+        assert!(index.load_metas()?.persisted_custom_extensions.is_empty());
+        {
+            let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+            writer.add_document(crate::doc!(text => "one"))?;
+            writer.commit()?;
+        }
+        let legacy_segment = index.searchable_segments()?.pop().unwrap();
+        directory
+            .delete(&legacy_segment.relative_path(SegmentComponent::PostingNorms))
+            .unwrap();
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for value in ["one", "one two"] {
+            writer.add_document(crate::doc!(text => value))?;
+            writer.commit()?;
+            assert!(index.load_metas()?.persisted_custom_extensions.is_empty());
+        }
+        drop(writer);
+        let index = Index::open(directory.clone())?;
+        assert!(index.schema().get_field_entry(text).has_pnorms());
+        assert_eq!(index.searchable_segment_ids()?.len(), 3);
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.merge(&index.searchable_segment_ids()?).wait()?;
+        let metas = index.load_metas()?;
+        assert!(metas.persisted_custom_extensions.is_empty());
+        assert!(index.custom_plugins().is_empty());
+        let live_files = list_segment_files(&metas.segments, &metas.persisted_custom_extensions);
+        let norm_path = metas.segments[0].relative_path(SegmentComponent::PostingNorms);
+        assert!(live_files.contains(&norm_path));
+        writer.garbage_collect_files().wait()?;
+        assert!(directory.exists(&norm_path)?);
+        drop(writer);
+        Ok(())
+    }
+
+    #[test]
     fn test_reopen_without_plugin_fails_closed() -> crate::Result<()> {
         use crate::directory::RamDirectory;
         use crate::TantivyError;
