@@ -11,6 +11,11 @@ use crate::docset::DocSet;
 /// but other implementations mocking `SegmentPostings` exist,
 /// for merging segments or for testing.
 pub trait Postings: DocSet + 'static {
+    /// Norm byte for the current posting, or None when legacy document-addressed norms apply.
+    fn fieldnorm_id(&self) -> Option<u8> {
+        None
+    }
+
     /// The number of times the term appears in the document.
     fn term_freq(&self) -> u32;
 
@@ -34,6 +39,10 @@ pub trait Postings: DocSet + 'static {
 }
 
 impl Postings for Box<dyn Postings> {
+    fn fieldnorm_id(&self) -> Option<u8> {
+        (**self).fieldnorm_id()
+    }
+
     fn term_freq(&self) -> u32 {
         (**self).term_freq()
     }

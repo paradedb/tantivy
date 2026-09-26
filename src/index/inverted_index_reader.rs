@@ -32,6 +32,7 @@ pub struct InvertedIndexReader {
     termdict: TermDictionary,
     postings_file_slice: FileSlice,
     positions_file_slice: DeferredFileSlice,
+    pnorms_file_slice: Option<std::sync::Arc<crate::postings::term_norms::PostingNormsReader>>,
     record_option: IndexRecordOption,
     total_num_tokens: u64,
 }
@@ -76,9 +77,16 @@ impl InvertedIndexReader {
             termdict,
             postings_file_slice: postings_body,
             positions_file_slice,
+            pnorms_file_slice: None,
             record_option,
             total_num_tokens,
         })
+    }
+
+    pub(crate) fn set_pnorms_file(&mut self, source: FileSlice) {
+        self.pnorms_file_slice = Some(std::sync::Arc::new(
+            crate::postings::term_norms::PostingNormsReader::new(source),
+        ));
     }
 
     /// Creates an empty `InvertedIndexReader` object, which
@@ -88,9 +96,14 @@ impl InvertedIndexReader {
             termdict: TermDictionary::empty(),
             postings_file_slice: FileSlice::empty(),
             positions_file_slice: DeferredFileSlice::new(|| Ok(FileSlice::empty())),
+            pnorms_file_slice: None,
             record_option,
             total_num_tokens: 0u64,
         }
+    }
+
+    pub(crate) fn has_pnorms(&self) -> bool {
+        self.pnorms_file_slice.is_some()
     }
 
     /// Returns the term info associated with the term.
@@ -181,6 +194,10 @@ impl InvertedIndexReader {
             .slice(term_info.postings_range.clone());
         let postings_bytes = postings_slice.read_bytes()?;
         block_postings.reset(term_info.doc_freq, postings_bytes)?;
+        block_postings.set_term_norm_source(
+            self.pnorms_file_slice.clone(),
+            term_info.postings_range.start,
+        );
         Ok(())
     }
 
@@ -210,12 +227,17 @@ impl InvertedIndexReader {
         let postings_data = self
             .postings_file_slice
             .slice(term_info.postings_range.clone());
-        BlockSegmentPostings::open(
+        let mut postings = BlockSegmentPostings::open(
             term_info.doc_freq,
             postings_data.read_bytes()?,
             self.record_option,
             requested_option,
-        )
+        )?;
+        postings.set_term_norm_source(
+            self.pnorms_file_slice.clone(),
+            term_info.postings_range.start,
+        );
+        Ok(postings)
     }
 
     /// Returns a posting object given a `term_info`.

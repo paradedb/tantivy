@@ -16,6 +16,8 @@ pub enum SegmentComponent {
     /// Stores the sum  of the length (in terms) of each field for each document.
     /// Field norms are stored as a special u64 fast field.
     FieldNorms,
+    /// Optional field norms stored in posting order for scoring.
+    PostingNorms,
     /// Dictionary associating `Term`s to `TermInfo`s which is
     /// simply an address into the `postings` file and the `positions` file.
     Terms,
@@ -45,6 +47,7 @@ impl TryFrom<&str> for SegmentComponent {
             "temp" => Ok(SegmentComponent::TempStore),
             "fast" => Ok(SegmentComponent::FastFields),
             "fieldnorm" => Ok(SegmentComponent::FieldNorms),
+            "pnorm" => Ok(SegmentComponent::PostingNorms),
             "del" => Ok(SegmentComponent::Delete),
             other => Ok(SegmentComponent::Custom(other.to_string())),
         }
@@ -58,6 +61,7 @@ impl Display for SegmentComponent {
             SegmentComponent::Positions => write!(f, "pos"),
             SegmentComponent::FastFields => write!(f, "fast"),
             SegmentComponent::FieldNorms => write!(f, "fieldnorm"),
+            SegmentComponent::PostingNorms => write!(f, "pnorm"),
             SegmentComponent::Terms => write!(f, "term"),
             SegmentComponent::Store => write!(f, "store"),
             SegmentComponent::TempStore => write!(f, "temp"),

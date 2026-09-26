@@ -131,6 +131,7 @@ impl SegmentMeta {
             SegmentComponent::TempStore => ".store.temp".to_string(),
             SegmentComponent::FastFields => ".fast".to_string(),
             SegmentComponent::FieldNorms => ".fieldnorm".to_string(),
+            SegmentComponent::PostingNorms => ".pnorm".to_string(),
             SegmentComponent::Delete => format!(".{}.del", self.delete_opstamp().unwrap_or(0)),
             SegmentComponent::Custom(ext) => format!(".{ext}"),
         });

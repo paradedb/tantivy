@@ -54,6 +54,10 @@ impl SegmentPostings {
         self.block_cursor.doc_freq()
     }
 
+    pub(crate) fn block_offset(&self) -> usize {
+        self.cur
+    }
+
     /// Creates a segment postings object with the given documents
     /// and no frequency encoded.
     ///
@@ -213,6 +217,11 @@ impl HasLen for SegmentPostings {
 }
 
 impl Postings for SegmentPostings {
+    fn fieldnorm_id(&self) -> Option<u8> {
+        self.block_cursor
+            .posting_fieldnorm_id_at(self.block_offset())
+    }
+
     /// Returns the frequency associated with the current document.
     /// If the schema is set up so that no frequency have been encoded,
     /// this method should always return 1.

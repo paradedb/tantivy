@@ -19,6 +19,8 @@ pub struct LoadedPostings {
     pub position_offsets: Box<[u32]>,
     pub positions: Box<[u32]>,
     pub cursor: usize,
+    /// Optional norm byte for each loaded posting.
+    pub fieldnorms: Option<Box<[u8]>>,
 }
 
 impl LoadedPostings {
@@ -28,11 +30,17 @@ impl LoadedPostings {
     pub fn load(segment_postings: &mut SegmentPostings) -> LoadedPostings {
         let num_docs = segment_postings.doc_freq() as usize;
         let mut doc_ids = Vec::with_capacity(num_docs);
+        let mut fieldnorms = None;
         let mut positions = Vec::with_capacity(num_docs);
         let mut position_offsets = Vec::with_capacity(num_docs);
         while segment_postings.doc() != TERMINATED {
             position_offsets.push(positions.len() as u32);
             doc_ids.push(segment_postings.doc());
+            if let Some(norm) = segment_postings.fieldnorm_id() {
+                fieldnorms
+                    .get_or_insert_with(|| Vec::with_capacity(num_docs))
+                    .push(norm);
+            }
             segment_postings.append_positions_with_offset(0, &mut positions);
             segment_postings.advance();
         }
@@ -42,6 +50,7 @@ impl LoadedPostings {
             positions: positions.into_boxed_slice(),
             position_offsets: position_offsets.into_boxed_slice(),
             cursor: 0,
+            fieldnorms: fieldnorms.map(Vec::into_boxed_slice),
         }
     }
 }
@@ -62,6 +71,7 @@ impl From<(Vec<DocId>, Vec<Vec<u32>>)> for LoadedPostings {
             positions: all_positions.into_boxed_slice(),
             position_offsets: position_offsets.into_boxed_slice(),
             cursor: 0,
+            fieldnorms: None,
         }
     }
 }
@@ -88,6 +98,10 @@ impl DocSet for LoadedPostings {
     }
 }
 impl Postings for LoadedPostings {
+    fn fieldnorm_id(&self) -> Option<u8> {
+        self.fieldnorms.as_ref().map(|norms| norms[self.cursor])
+    }
+
     fn term_freq(&self) -> u32 {
         let start = self.position_offsets[self.cursor] as usize;
         let end = self.position_offsets[self.cursor + 1] as usize;

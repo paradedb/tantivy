@@ -51,6 +51,7 @@ pub struct InvertedIndexSerializer {
     postings_write: CompositeWrite<WritePtr>,
     positions_write: CompositeWrite<WritePtr>,
     schema: Schema,
+    pnorms_write: Option<CompositeWrite<WritePtr>>,
 }
 
 impl InvertedIndexSerializer {
@@ -62,6 +63,17 @@ impl InvertedIndexSerializer {
             postings_write: CompositeWrite::wrap(segment.open_write(Postings)?),
             positions_write: CompositeWrite::wrap(segment.open_write(Positions)?),
             schema: segment.schema(),
+            pnorms_write: if segment
+                .schema()
+                .fields()
+                .any(|(_, entry)| entry.has_pnorms())
+            {
+                Some(CompositeWrite::wrap(
+                    segment.open_write(crate::index::SegmentComponent::PostingNorms)?,
+                ))
+            } else {
+                None
+            },
         };
         Ok(inv_index_serializer)
     }
@@ -85,7 +97,7 @@ impl InvertedIndexSerializer {
             .index_record_option()
             .unwrap_or(IndexRecordOption::Basic);
         let bm25_params = field_entry.field_type().bm25_params().unwrap_or_default();
-        FieldSerializer::create(
+        let mut serializer = FieldSerializer::create(
             index_record_option,
             total_num_tokens,
             term_dictionary_write,
@@ -93,7 +105,16 @@ impl InvertedIndexSerializer {
             positions_write,
             fieldnorm_reader,
             bm25_params,
-        )
+        )?;
+        if let Some(pnorms_write) = self.pnorms_write.as_mut() {
+            if field_entry.has_pnorms() {
+                serializer.pnorms_writer = Some(super::term_norms::TermNormsWriter::new(
+                    pnorms_write.for_field(field),
+                )?);
+                serializer.postings_serializer.pnorms = Some(Vec::new());
+            }
+        }
+        Ok(serializer)
     }
 
     /// Closes the serializer.
@@ -101,6 +122,9 @@ impl InvertedIndexSerializer {
         self.terms_write.close()?;
         self.postings_write.close()?;
         self.positions_write.close()?;
+        if let Some(pnorms_write) = self.pnorms_write {
+            pnorms_write.close()?;
+        }
         Ok(())
     }
 }
@@ -115,6 +139,7 @@ pub struct FieldSerializer<'a, W: Write = WritePtr> {
     term_open: bool,
     postings_write: &'a mut CountingWriter<W>,
     postings_start_offset: u64,
+    pnorms_writer: Option<super::term_norms::TermNormsWriter<'a, W>>,
 }
 
 impl<'a, W: Write> FieldSerializer<'a, W> {
@@ -155,6 +180,7 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             term_open: false,
             postings_write,
             postings_start_offset,
+            pnorms_writer: None,
         })
     }
 
@@ -238,6 +264,13 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
 
         self.postings_serializer
             .close_term(self.current_term_info.doc_freq, self.postings_write)?;
+        if let Some(norms) = self.postings_serializer.pnorms.as_ref() {
+            assert_eq!(norms.len(), self.current_term_info.doc_freq as usize);
+            self.pnorms_writer
+                .as_mut()
+                .unwrap()
+                .write(self.current_term_info.postings_range.start, norms)?;
+        }
         self.current_term_info.postings_range.end = self.postings_offset();
         if let Some(positions_serializer) = self.positions_serializer_opt.as_mut() {
             positions_serializer.close_term()?;
@@ -253,6 +286,9 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
     /// Closes the current field.
     pub fn close(mut self) -> io::Result<()> {
         self.close_term()?;
+        if let Some(pnorms_writer) = self.pnorms_writer {
+            pnorms_writer.close()?;
+        }
         if let Some(positions_serializer) = self.positions_serializer_opt {
             positions_serializer.close()?;
         }
@@ -327,6 +363,7 @@ pub struct PostingsSerializer {
     avg_fieldnorm: Score,
     bm25_params: Bm25Params,
     term_has_freq: bool,
+    pnorms: Option<Vec<u8>>,
 }
 
 impl PostingsSerializer {
@@ -354,12 +391,16 @@ impl PostingsSerializer {
             avg_fieldnorm,
             bm25_params,
             term_has_freq: false,
+            pnorms: None,
         }
     }
 
     /// Starts the serialization for a new term.
     /// * term_doc_freq - the number of documents containing the term.
     pub fn new_term(&mut self, term_doc_freq: u32, record_term_freq: bool) {
+        if let Some(norms) = self.pnorms.as_mut() {
+            norms.clear();
+        }
         self.bm25_weight = None;
 
         self.term_has_freq = self.mode.has_freq() && record_term_freq;
@@ -414,9 +455,16 @@ impl PostingsSerializer {
             let mut blockwand_params = (0u8, 0u32);
             if let Some(bm25_weight) = self.bm25_weight.as_ref() {
                 if let Some(fieldnorm_reader) = self.fieldnorm_reader.as_ref() {
-                    let docs = self.block.doc_ids().iter().cloned();
                     let term_freqs = self.block.term_freqs().iter().cloned();
-                    let fieldnorms = docs.map(|doc| fieldnorm_reader.fieldnorm_id(doc));
+                    let fieldnorms =
+                        self.block
+                            .doc_ids()
+                            .iter()
+                            .enumerate()
+                            .map(|(offset, &doc)| match self.pnorms.as_ref() {
+                                Some(norms) => norms[norms.len() - self.block.len + offset],
+                                None => fieldnorm_reader.fieldnorm_id(doc),
+                            });
                     blockwand_params = fieldnorms
                         .zip(term_freqs)
                         .max_by(
@@ -444,6 +492,9 @@ impl PostingsSerializer {
     /// * doc_id - the document id.
     /// * term_freq - the term frequency within the document.
     pub fn write_doc(&mut self, doc_id: DocId, term_freq: u32) {
+        if let Some(norms) = self.pnorms.as_mut() {
+            norms.push(self.fieldnorm_reader.as_ref().unwrap().fieldnorm_id(doc_id));
+        }
         self.block.append_doc(doc_id, term_freq);
         if self.block.is_full() {
             self.write_block();
