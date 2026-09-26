@@ -609,9 +609,8 @@ fn write_postings_for_field(
         for (segment_ord, term_info) in merged_terms.current_segment_ords_and_term_infos() {
             let segment_reader = &readers[segment_ord];
             let inverted_index: &InvertedIndexReader = &field_readers[segment_ord];
-            let mut segment_postings =
+            let segment_postings =
                 inverted_index.read_postings_from_terminfo(&term_info, segment_postings_option)?;
-            segment_postings.block_cursor.disable_term_norms();
             let alive_bitset_opt = segment_reader.alive_bitset();
             let doc_freq = if let Some(alive_bitset) = alive_bitset_opt {
                 segment_postings.doc_freq_given_deletes(alive_bitset)
@@ -660,8 +659,9 @@ fn write_postings_for_field(
                         positions_buffer.clear();
                         0
                     };
+                    let norm = postings.fieldnorm();
                     let delta_positions = delta_computer.compute_delta(&positions_buffer);
-                    field_serializer.write_doc(doc, term_freq, delta_positions);
+                    field_serializer.write_doc_with_norm(doc, term_freq, delta_positions, norm);
                     postings.advance();
                 }
             }
@@ -680,8 +680,14 @@ fn write_postings_for_field(
                     positions_buffer.clear();
                     0
                 };
+                let norm = merger.fieldnorm();
                 let delta_positions = delta_computer.compute_delta(&positions_buffer);
-                field_serializer.write_doc(merger.doc(), term_freq, delta_positions);
+                field_serializer.write_doc_with_norm(
+                    merger.doc(),
+                    term_freq,
+                    delta_positions,
+                    norm,
+                );
             }
         }
         field_serializer.close_term()?;
@@ -721,7 +727,6 @@ mod tests {
     fn test_merge_uses_document_norms() -> crate::Result<()> {
         use crate::collector::TopDocs;
         use crate::directory::Directory;
-        use crate::index::SegmentComponent;
         use crate::indexer::NoMergePolicy;
         use crate::query::TermQuery;
         use crate::schema::{
@@ -730,6 +735,44 @@ mod tests {
         use crate::{DocSet, Index, IndexSettings, IndexSortByField, Order, Term, TERMINATED};
 
         for sorted in [false, true] {
+            let mut legacy_schema = Schema::builder();
+            let text_legacy = legacy_schema.add_text_field("text", TEXT);
+            let basic_legacy = legacy_schema.add_text_field(
+                "basic",
+                TextOptions::default().set_indexing_options(
+                    TextFieldIndexing::default().set_index_option(IndexRecordOption::Basic),
+                ),
+            );
+            let id_legacy = legacy_schema.add_u64_field("id", INDEXED | FAST);
+            let directory = crate::directory::RamDirectory::create();
+            let mut index = Index::create(
+                directory.clone(),
+                legacy_schema.build(),
+                IndexSettings {
+                    sort_by_field: sorted.then(|| IndexSortByField {
+                        field: "id".into(),
+                        order: Order::Asc,
+                    }),
+                    ..Default::default()
+                },
+            )?;
+            let mut writer: crate::IndexWriter = index.writer_for_tests()?;
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            for batch in [
+                vec![(4u64, "red apple"), (0, "green apple pie")],
+                vec![(3, "red cherry pie"), (1, ""), (2, "red")],
+            ] {
+                for (value, body) in batch {
+                    writer.add_document(
+                        doc!(id_legacy => value, text_legacy => body, basic_legacy => body),
+                    )?;
+                }
+                writer.commit()?;
+            }
+            writer.delete_term(Term::from_field_u64(id_legacy, 0));
+            writer.commit()?;
+            drop(writer);
+
             let mut schema = Schema::builder();
             let text = schema.add_text_field(
                 "text",
@@ -748,36 +791,17 @@ mod tests {
                         .set_pnorms(true),
                 ),
             );
-            let id = schema.add_u64_field("id", INDEXED | FAST);
-            let index = Index::builder()
-                .schema(schema.build())
-                .settings(IndexSettings {
-                    sort_by_field: sorted.then(|| IndexSortByField {
-                        field: "id".into(),
-                        order: Order::Asc,
-                    }),
-                    ..Default::default()
-                })
-                .create_in_ram()?;
-            let mut writer = index.writer_for_tests()?;
+            let _id = schema.add_u64_field("id", INDEXED | FAST);
+
+            let mut metas = index.load_metas()?;
+            metas.schema = schema.build();
+            index.directory_mut().atomic_write(
+                std::path::Path::new("meta.json"),
+                &serde_json::to_vec(&metas)?,
+            )?;
+            let index = Index::open(directory.clone())?;
+            let mut writer: crate::IndexWriter = index.writer_for_tests()?;
             writer.set_merge_policy(Box::new(NoMergePolicy));
-            for batch in [
-                vec![(4u64, "red apple"), (0, "green apple pie")],
-                vec![(3, "red cherry pie"), (1, ""), (2, "red")],
-            ] {
-                for (value, body) in batch {
-                    writer.add_document(doc!(id => value, text => body, basic => body))?;
-                }
-                writer.commit()?;
-            }
-            writer.delete_term(Term::from_field_u64(id, 0));
-            writer.commit()?;
-            for segment in index.searchable_segments()? {
-                index
-                    .directory()
-                    .delete(&segment.relative_path(SegmentComponent::PostingNorms))
-                    .unwrap();
-            }
             let reader = index.reader()?;
             for field in [text, basic] {
                 assert_eq!(

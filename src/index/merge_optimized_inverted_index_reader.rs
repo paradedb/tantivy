@@ -72,6 +72,7 @@ impl MergeOptimizedInvertedIndexReader {
             postings_data,
             self.record_option,
             requested_option,
+            false,
         )
     }
 

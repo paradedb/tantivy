@@ -199,12 +199,17 @@ impl BlockWandIntersectionScorer {
         &mut self,
         inner_threshold: Score,
     ) -> Option<DocId> {
+        let secondary_block_max_sum =
+            self.secondary_block_max_scores[0] + self.secondary_suffix_block_max[0];
         // Pass 2: Check intersection membership only for survivors.
-        // score_threshold may be stale (threshold can increase from callbacks),
-        // but that's conservative — we may check a few extra candidates, never miss one.
         'next_candidate: while self.candidate_idx < self.num_candidates {
             let candidate_doc = self.candidate_doc_ids[self.candidate_idx];
             let mut total_score: Score = self.candidate_scores[self.candidate_idx];
+
+            if total_score + secondary_block_max_sum <= inner_threshold {
+                self.candidate_idx += 1;
+                continue 'next_candidate;
+            }
 
             if let Some(ref mut filter) = self.filter {
                 if filter.seek_danger(candidate_doc) != SeekDangerResult::Found {
@@ -216,13 +221,24 @@ impl BlockWandIntersectionScorer {
             for (secondary_idx, secondary) in self.secondaries.iter_mut().enumerate() {
                 // If a previous candidate already advanced this secondary past
                 // candidate_doc, the candidate can't be in the intersection.
-                if secondary.doc() > candidate_doc {
+                let sec_doc = secondary.doc();
+                if sec_doc > candidate_doc {
                     self.candidate_idx += 1;
+                    while self.candidate_idx < self.num_candidates
+                        && self.candidate_doc_ids[self.candidate_idx] < sec_doc
+                    {
+                        self.candidate_idx += 1;
+                    }
                     continue 'next_candidate;
                 }
                 let seek_result = secondary.seek(candidate_doc);
                 if seek_result != candidate_doc {
                     self.candidate_idx += 1;
+                    while self.candidate_idx < self.num_candidates
+                        && self.candidate_doc_ids[self.candidate_idx] < seek_result
+                    {
+                        self.candidate_idx += 1;
+                    }
                     continue 'next_candidate;
                 }
                 total_score += if SHARED_NORMS {
@@ -365,19 +381,57 @@ impl DocSet for BlockWandIntersectionScorer {
             let score_threshold = inner_threshold - secondary_block_max_sum;
 
             let mut num_candidates = 0usize;
-            for (offset, (candidate_doc, term_freq)) in block_docs
-                .iter()
-                .copied()
-                .zip(block_freqs.iter().copied())
-                .enumerate()
-            {
-                let fieldnorm_id =
-                    block_cursor.fieldnorm_id_at(start_idx + offset, &self.fieldnorm_reader);
-                let leader_score = self.bm25_weight.score(fieldnorm_id, term_freq);
-                self.candidate_doc_ids[num_candidates] = candidate_doc;
-                self.candidate_scores[num_candidates] = leader_score;
-                self.candidate_norms[num_candidates] = fieldnorm_id;
-                num_candidates += (leader_score > score_threshold) as usize;
+            if block_cursor.has_term_norms() {
+                let norms_decoder = block_cursor.fieldnorm_decoder();
+                let block_fieldnorms = &norms_decoder.output_array()[start_idx..end_idx];
+                let len = block_docs.len();
+                let mut scores = [0.0f32; COMPRESSION_BLOCK_SIZE];
+
+                let norm_const = self.bm25_weight.norm_const();
+                let norm_factor = self.bm25_weight.norm_factor();
+                let weight = self.bm25_weight.weight();
+
+                let freqs = &block_freqs[..len];
+                let norms = &block_fieldnorms[..len];
+                let sc = &mut scores[..len];
+
+                let mut max_score = 0.0f32;
+                for i in 0..len {
+                    let tf = freqs[i] as f32;
+                    let norm = norm_const + norm_factor * (norms[i] as f32);
+                    let s = weight * (tf / (tf + norm));
+                    sc[i] = s;
+                    max_score = max_score.max(s);
+                }
+
+                if max_score <= score_threshold {
+                    self.internal_doc = self.window_end + 1;
+                    continue;
+                }
+
+                for i in 0..len {
+                    let leader_score = scores[i];
+                    self.candidate_doc_ids[num_candidates] = block_docs[i];
+                    self.candidate_scores[num_candidates] = leader_score;
+                    self.candidate_norms[num_candidates] =
+                        FieldNormReader::fieldnorm_to_id(norms[i]);
+                    num_candidates += (leader_score > score_threshold) as usize;
+                }
+            } else {
+                for (offset, (candidate_doc, term_freq)) in block_docs
+                    .iter()
+                    .copied()
+                    .zip(block_freqs.iter().copied())
+                    .enumerate()
+                {
+                    let fieldnorm_id =
+                        block_cursor.fieldnorm_id_at(start_idx + offset, &self.fieldnorm_reader);
+                    let leader_score = self.bm25_weight.score(fieldnorm_id, term_freq);
+                    self.candidate_doc_ids[num_candidates] = candidate_doc;
+                    self.candidate_scores[num_candidates] = leader_score;
+                    self.candidate_norms[num_candidates] = fieldnorm_id;
+                    num_candidates += (leader_score > score_threshold) as usize;
+                }
             }
             self.num_candidates = num_candidates;
             self.candidate_idx = 0;

@@ -183,6 +183,8 @@ pub struct Bm25Weight {
     cache: Arc<[Score; 256]>,
     average_fieldnorm: Score,
     params: Bm25Params,
+    norm_const: Score,
+    norm_factor: Score,
 }
 
 impl Bm25Weight {
@@ -196,6 +198,8 @@ impl Bm25Weight {
             cache: self.cache.clone(),
             average_fieldnorm: self.average_fieldnorm,
             params: self.params,
+            norm_const: self.norm_const,
+            norm_factor: self.norm_factor,
         }
     }
 
@@ -295,12 +299,20 @@ impl Bm25Weight {
         params: Bm25Params,
     ) -> Bm25Weight {
         let weight = idf_explain.value() * (1.0 + params.k1());
+        let norm_const = params.k1() * (1.0 - params.b());
+        let norm_factor = if average_fieldnorm > 0.0 {
+            (params.k1() * params.b()) / average_fieldnorm
+        } else {
+            0.0
+        };
         Bm25Weight {
             idf_explain: Some(idf_explain),
             weight,
             cache: compute_tf_cache(average_fieldnorm, params.k1(), params.b()),
             average_fieldnorm,
             params,
+            norm_const,
+            norm_factor,
         }
     }
 
@@ -310,18 +322,48 @@ impl Bm25Weight {
         params: Bm25Params,
     ) -> Bm25Weight {
         let weight = idf * (1.0 + params.k1());
+        let norm_const = params.k1() * (1.0 - params.b());
+        let norm_factor = if average_fieldnorm > 0.0 {
+            (params.k1() * params.b()) / average_fieldnorm
+        } else {
+            0.0
+        };
         Bm25Weight {
             idf_explain: None,
             weight,
             cache: compute_tf_cache(average_fieldnorm, params.k1(), params.b()),
             average_fieldnorm,
             params,
+            norm_const,
+            norm_factor,
         }
+    }
+
+    #[inline]
+    pub fn norm_const(&self) -> Score {
+        self.norm_const
+    }
+
+    #[inline]
+    pub fn norm_factor(&self) -> Score {
+        self.norm_factor
+    }
+
+    #[inline]
+    pub fn weight(&self) -> Score {
+        self.weight
     }
 
     #[inline]
     pub fn score(&self, fieldnorm_id: u8, term_freq: u32) -> Score {
         self.weight * self.tf_factor(fieldnorm_id, term_freq)
+    }
+
+    #[inline]
+    pub fn score_fieldnorm(&self, fieldnorm: u32, term_freq: u32) -> Score {
+        let norm = self.norm_const + self.norm_factor * (fieldnorm as Score);
+        let term_freq = term_freq as Score;
+        self.weight * (term_freq / (term_freq + norm))
     }
 
     pub fn max_score(&self) -> Score {

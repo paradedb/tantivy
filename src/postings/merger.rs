@@ -169,6 +169,15 @@ impl<'a> PostingsMerger<'a> {
             .postings
             .positions(output);
     }
+
+    pub(crate) fn fieldnorm(&self) -> Option<u32> {
+        self.heap
+            .peek()
+            .expect("advance() returned true")
+            .0
+            .postings
+            .fieldnorm()
+    }
 }
 
 #[cfg(test)]
