@@ -51,7 +51,7 @@ pub struct InvertedIndexSerializer {
     postings_write: CompositeWrite<WritePtr>,
     positions_write: CompositeWrite<WritePtr>,
     schema: Schema,
-    posting_norms_write: Option<CompositeWrite<WritePtr>>,
+    pnorms_write: Option<CompositeWrite<WritePtr>>,
 }
 
 impl InvertedIndexSerializer {
@@ -63,10 +63,10 @@ impl InvertedIndexSerializer {
             postings_write: CompositeWrite::wrap(segment.open_write(Postings)?),
             positions_write: CompositeWrite::wrap(segment.open_write(Positions)?),
             schema: segment.schema(),
-            posting_norms_write: if segment
+            pnorms_write: if segment
                 .schema()
                 .fields()
-                .any(|(_, entry)| entry.has_posting_norms())
+                .any(|(_, entry)| entry.has_pnorms())
             {
                 Some(CompositeWrite::wrap(
                     segment.open_write(crate::index::SegmentComponent::PostingNorms)?,
@@ -106,12 +106,12 @@ impl InvertedIndexSerializer {
             fieldnorm_reader,
             bm25_params,
         )?;
-        if let Some(posting_norms_write) = self.posting_norms_write.as_mut() {
-            if field_entry.has_posting_norms() {
-                serializer.posting_norms_writer = Some(super::term_norms::TermNormsWriter::new(
-                    posting_norms_write.for_field(field),
+        if let Some(pnorms_write) = self.pnorms_write.as_mut() {
+            if field_entry.has_pnorms() {
+                serializer.pnorms_writer = Some(super::term_norms::TermNormsWriter::new(
+                    pnorms_write.for_field(field),
                 )?);
-                serializer.postings_serializer.posting_norms = Some(Vec::new());
+                serializer.postings_serializer.pnorms = Some(Vec::new());
             }
         }
         Ok(serializer)
@@ -122,8 +122,8 @@ impl InvertedIndexSerializer {
         self.terms_write.close()?;
         self.postings_write.close()?;
         self.positions_write.close()?;
-        if let Some(posting_norms_write) = self.posting_norms_write {
-            posting_norms_write.close()?;
+        if let Some(pnorms_write) = self.pnorms_write {
+            pnorms_write.close()?;
         }
         Ok(())
     }
@@ -139,7 +139,7 @@ pub struct FieldSerializer<'a, W: Write = WritePtr> {
     term_open: bool,
     postings_write: &'a mut CountingWriter<W>,
     postings_start_offset: u64,
-    posting_norms_writer: Option<super::term_norms::TermNormsWriter<'a, W>>,
+    pnorms_writer: Option<super::term_norms::TermNormsWriter<'a, W>>,
 }
 
 impl<'a, W: Write> FieldSerializer<'a, W> {
@@ -180,7 +180,7 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             term_open: false,
             postings_write,
             postings_start_offset,
-            posting_norms_writer: None,
+            pnorms_writer: None,
         })
     }
 
@@ -264,9 +264,9 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
 
         self.postings_serializer
             .close_term(self.current_term_info.doc_freq, self.postings_write)?;
-        if let Some(norms) = self.postings_serializer.posting_norms.as_ref() {
+        if let Some(norms) = self.postings_serializer.pnorms.as_ref() {
             assert_eq!(norms.len(), self.current_term_info.doc_freq as usize);
-            self.posting_norms_writer
+            self.pnorms_writer
                 .as_mut()
                 .unwrap()
                 .write(self.current_term_info.postings_range.start, norms)?;
@@ -286,8 +286,8 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
     /// Closes the current field.
     pub fn close(mut self) -> io::Result<()> {
         self.close_term()?;
-        if let Some(posting_norms_writer) = self.posting_norms_writer {
-            posting_norms_writer.close()?;
+        if let Some(pnorms_writer) = self.pnorms_writer {
+            pnorms_writer.close()?;
         }
         if let Some(positions_serializer) = self.positions_serializer_opt {
             positions_serializer.close()?;
@@ -363,7 +363,7 @@ pub struct PostingsSerializer {
     avg_fieldnorm: Score,
     bm25_params: Bm25Params,
     term_has_freq: bool,
-    posting_norms: Option<Vec<u8>>,
+    pnorms: Option<Vec<u8>>,
 }
 
 impl PostingsSerializer {
@@ -391,14 +391,14 @@ impl PostingsSerializer {
             avg_fieldnorm,
             bm25_params,
             term_has_freq: false,
-            posting_norms: None,
+            pnorms: None,
         }
     }
 
     /// Starts the serialization for a new term.
     /// * term_doc_freq - the number of documents containing the term.
     pub fn new_term(&mut self, term_doc_freq: u32, record_term_freq: bool) {
-        if let Some(norms) = self.posting_norms.as_mut() {
+        if let Some(norms) = self.pnorms.as_mut() {
             norms.clear();
         }
         self.bm25_weight = None;
@@ -461,7 +461,7 @@ impl PostingsSerializer {
                             .doc_ids()
                             .iter()
                             .enumerate()
-                            .map(|(offset, &doc)| match self.posting_norms.as_ref() {
+                            .map(|(offset, &doc)| match self.pnorms.as_ref() {
                                 Some(norms) => norms[norms.len() - self.block.len + offset],
                                 None => fieldnorm_reader.fieldnorm_id(doc),
                             });
@@ -492,7 +492,7 @@ impl PostingsSerializer {
     /// * doc_id - the document id.
     /// * term_freq - the term frequency within the document.
     pub fn write_doc(&mut self, doc_id: DocId, term_freq: u32) {
-        if let Some(norms) = self.posting_norms.as_mut() {
+        if let Some(norms) = self.pnorms.as_mut() {
             norms.push(self.fieldnorm_reader.as_ref().unwrap().fieldnorm_id(doc_id));
         }
         self.block.append_doc(doc_id, term_freq);

@@ -32,8 +32,7 @@ pub struct InvertedIndexReader {
     termdict: TermDictionary,
     postings_file_slice: FileSlice,
     positions_file_slice: DeferredFileSlice,
-    posting_norms_file_slice:
-        Option<std::sync::Arc<crate::postings::term_norms::PostingNormsReader>>,
+    pnorms_file_slice: Option<std::sync::Arc<crate::postings::term_norms::PostingNormsReader>>,
     record_option: IndexRecordOption,
     total_num_tokens: u64,
 }
@@ -78,14 +77,14 @@ impl InvertedIndexReader {
             termdict,
             postings_file_slice: postings_body,
             positions_file_slice,
-            posting_norms_file_slice: None,
+            pnorms_file_slice: None,
             record_option,
             total_num_tokens,
         })
     }
 
-    pub(crate) fn set_posting_norms_file(&mut self, source: FileSlice) {
-        self.posting_norms_file_slice = Some(std::sync::Arc::new(
+    pub(crate) fn set_pnorms_file(&mut self, source: FileSlice) {
+        self.pnorms_file_slice = Some(std::sync::Arc::new(
             crate::postings::term_norms::PostingNormsReader::new(source),
         ));
     }
@@ -97,14 +96,14 @@ impl InvertedIndexReader {
             termdict: TermDictionary::empty(),
             postings_file_slice: FileSlice::empty(),
             positions_file_slice: DeferredFileSlice::new(|| Ok(FileSlice::empty())),
-            posting_norms_file_slice: None,
+            pnorms_file_slice: None,
             record_option,
             total_num_tokens: 0u64,
         }
     }
 
-    pub(crate) fn has_posting_norms(&self) -> bool {
-        self.posting_norms_file_slice.is_some()
+    pub(crate) fn has_pnorms(&self) -> bool {
+        self.pnorms_file_slice.is_some()
     }
 
     /// Returns the term info associated with the term.
@@ -196,7 +195,7 @@ impl InvertedIndexReader {
         let postings_bytes = postings_slice.read_bytes()?;
         block_postings.reset(term_info.doc_freq, postings_bytes)?;
         block_postings.set_term_norm_source(
-            self.posting_norms_file_slice.clone(),
+            self.pnorms_file_slice.clone(),
             term_info.postings_range.start,
         );
         Ok(())
@@ -235,7 +234,7 @@ impl InvertedIndexReader {
             requested_option,
         )?;
         postings.set_term_norm_source(
-            self.posting_norms_file_slice.clone(),
+            self.pnorms_file_slice.clone(),
             term_info.postings_range.start,
         );
         Ok(postings)

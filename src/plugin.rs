@@ -405,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_posting_norms_survive_missing_source_and_merge() -> crate::Result<()> {
+    fn test_builtin_pnorms_survive_missing_source_and_merge() -> crate::Result<()> {
         use crate::directory::{Directory, RamDirectory};
         use crate::index::list_segment_files;
         use crate::indexer::NoMergePolicy;
@@ -417,7 +417,7 @@ mod tests {
                 TEXT.get_indexing_options()
                     .unwrap()
                     .clone()
-                    .set_posting_norms(true),
+                    .set_pnorms(true),
             ),
         );
         let directory = RamDirectory::create();
@@ -441,7 +441,7 @@ mod tests {
         }
         drop(writer);
         let index = Index::open(directory.clone())?;
-        assert!(index.schema().get_field_entry(text).has_posting_norms());
+        assert!(index.schema().get_field_entry(text).has_pnorms());
         assert_eq!(index.searchable_segment_ids()?.len(), 3);
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.merge(&index.searchable_segment_ids()?).wait()?;

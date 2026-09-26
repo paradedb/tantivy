@@ -257,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn posting_norms_are_per_field_after_reopen_and_merge() -> crate::Result<()> {
+    fn pnorms_are_per_field_after_reopen_and_merge() -> crate::Result<()> {
         use crate::collector::TopDocs;
         use crate::directory::{CompositeFile, Directory, RamDirectory};
         use crate::index::SegmentComponent;
@@ -272,12 +272,12 @@ mod tests {
             .get_indexing_options()
             .unwrap()
             .clone()
-            .set_posting_norms(true);
+            .set_pnorms(true);
         let text = schema.add_text_field("text", TEXT.set_indexing_options(indexing.clone()));
         let fallback = schema.add_text_field("fallback", TEXT);
         let unnormed = schema.add_text_field(
             "unnormed",
-            TEXT.set_indexing_options(indexing.set_fieldnorms(false).set_posting_norms(false)),
+            TEXT.set_indexing_options(indexing.set_fieldnorms(false).set_pnorms(false)),
         );
         let number = schema.add_u64_field("number", INDEXED);
         let date = schema.add_date_field("date", INDEXED);
@@ -329,7 +329,7 @@ mod tests {
                     CompositeFile::open(&segment.open_read(SegmentComponent::PostingNorms)?)?;
                 for field in [fallback, unnormed] {
                     assert!(composite.open_read(field).is_none());
-                    assert!(!segment.inverted_index(field)?.has_posting_norms());
+                    assert!(!segment.inverted_index(field)?.has_pnorms());
                 }
                 for term in [
                     Term::from_field_text(text, "one"),
@@ -342,7 +342,7 @@ mod tests {
                     let enabled = field == text;
                     assert_eq!(composite.open_read(field).is_some(), enabled);
                     let inverted = segment.inverted_index(field)?;
-                    assert_eq!(inverted.has_posting_norms(), enabled);
+                    assert_eq!(inverted.has_pnorms(), enabled);
                     let norms = segment.get_fieldnorms_reader(field)?;
                     let mut postings = inverted
                         .read_postings(&term, IndexRecordOption::Basic)?
@@ -365,13 +365,13 @@ mod tests {
     }
 
     #[test]
-    fn posting_norms_leave_builtin_files_unchanged() -> crate::Result<()> {
+    fn pnorms_leave_builtin_files_unchanged() -> crate::Result<()> {
         use crate::index::SegmentComponent;
         use crate::schema::{Schema, TEXT};
         use crate::Index;
 
         let mut segments = Vec::new();
-        for posting_norms in [false, true] {
+        for pnorms in [false, true] {
             let mut schema = Schema::builder();
             let text = schema.add_text_field(
                 "text",
@@ -379,7 +379,7 @@ mod tests {
                     TEXT.get_indexing_options()
                         .unwrap()
                         .clone()
-                        .set_posting_norms(posting_norms),
+                        .set_pnorms(pnorms),
                 ),
             );
             let index = Index::create_in_ram(schema.build());
@@ -393,7 +393,7 @@ mod tests {
             let segment = index.searchable_segments()?.pop().unwrap();
             assert_eq!(
                 segment.open_read(SegmentComponent::PostingNorms).is_ok(),
-                posting_norms
+                pnorms
             );
             segments.push(segment);
         }
@@ -415,14 +415,14 @@ mod tests {
     }
 
     #[test]
-    fn posting_norms_follow_document_remapping() -> crate::Result<()> {
+    fn pnorms_follow_document_remapping() -> crate::Result<()> {
         use crate::directory::RamDirectory;
         use crate::indexer::DocIdMapping;
         use crate::schema::{IndexRecordOption, Schema, TEXT};
         use crate::{DocSet, Index, IndexSettings, TantivyDocument, Term, TERMINATED};
 
         let mapping = DocIdMapping::new_permutation(vec![1, 2, 0])?;
-        for posting_norms in [false, true] {
+        for pnorms in [false, true] {
             let mut schema = Schema::builder();
             let text = schema.add_text_field(
                 "text",
@@ -430,7 +430,7 @@ mod tests {
                     TEXT.get_indexing_options()
                         .unwrap()
                         .clone()
-                        .set_posting_norms(posting_norms),
+                        .set_pnorms(pnorms),
                 ),
             );
             let mut writer = Index::builder()
@@ -464,7 +464,7 @@ mod tests {
                     postings
                         .block_cursor
                         .posting_fieldnorm_id_at(postings.block_offset()),
-                    posting_norms.then(|| norms.fieldnorm_id(doc))
+                    pnorms.then(|| norms.fieldnorm_id(doc))
                 );
                 postings.advance();
             }
@@ -492,7 +492,7 @@ mod tests {
                     TEXT.get_indexing_options()
                         .unwrap()
                         .clone()
-                        .set_posting_norms(true),
+                        .set_pnorms(true),
                 ),
             );
             let directory = RamDirectory::create();
@@ -519,7 +519,7 @@ mod tests {
                     &serde_json::to_vec(&metas)?,
                 )?;
                 index = Index::open(directory.clone())?;
-                assert!(!index.schema().get_field_entry(text).has_posting_norms());
+                assert!(!index.schema().get_field_entry(text).has_pnorms());
             }
             let red = Term::from_field_text(text, "red");
             let apple = Term::from_field_text(text, "apple");
@@ -579,7 +579,7 @@ mod tests {
                 TEXT.get_indexing_options()
                     .unwrap()
                     .clone()
-                    .set_posting_norms(true),
+                    .set_pnorms(true),
             ),
         );
         let id = schema.add_u64_field("id", INDEXED);

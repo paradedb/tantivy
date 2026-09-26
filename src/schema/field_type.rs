@@ -363,11 +363,11 @@ impl FieldType {
     }
 
     /// Returns true if posting-local norms are enabled for this field.
-    pub fn has_posting_norms(&self) -> bool {
+    pub fn has_pnorms(&self) -> bool {
         match self {
             FieldType::Str(options) => options
                 .get_indexing_options()
-                .is_some_and(|indexing| indexing.posting_norms() && indexing.fieldnorms()),
+                .is_some_and(|indexing| indexing.pnorms() && indexing.fieldnorms()),
             _ => false,
         }
     }

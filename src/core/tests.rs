@@ -468,16 +468,16 @@ fn test_non_text_json_term_freq_bitpacked() {
 }
 
 #[test]
-fn test_posting_norms_require_fieldnorms_at_creation() {
+fn test_pnorms_require_fieldnorms_at_creation() {
     use crate::schema::TextFieldIndexing;
 
     for indexing in [
         TextFieldIndexing::default()
-            .set_posting_norms(true)
+            .set_pnorms(true)
             .set_fieldnorms(false),
         TextFieldIndexing::default()
             .set_fieldnorms(false)
-            .set_posting_norms(true),
+            .set_pnorms(true),
     ] {
         let mut builder = Schema::builder();
         builder.add_text_field("body", TEXT.set_indexing_options(indexing));
@@ -493,20 +493,20 @@ fn test_posting_norms_require_fieldnorms_at_creation() {
             ] {
                 assert!(
                     matches!(result, Err(crate::TantivyError::InvalidArgument(ref message))
-                    if message == "Field `body`: posting_norms requires fieldnorms to be enabled")
+                    if message == "Field `body`: pnorms requires fieldnorms to be enabled")
                 );
                 assert!(!Index::exists(&directory).unwrap());
             }
         }
     }
-    for (fieldnorms, posting_norms) in [(false, false), (true, false), (true, true)] {
+    for (fieldnorms, pnorms) in [(false, false), (true, false), (true, true)] {
         let mut builder = Schema::builder();
         builder.add_text_field(
             "body",
             TEXT.set_indexing_options(
                 TextFieldIndexing::default()
                     .set_fieldnorms(fieldnorms)
-                    .set_posting_norms(posting_norms),
+                    .set_pnorms(pnorms),
             ),
         );
         assert!(Index::builder()

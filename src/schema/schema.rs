@@ -301,6 +301,23 @@ fn locate_splitting_dots(field_path: &str) -> Vec<usize> {
 }
 
 impl Schema {
+    /// Validates field option combinations before index creation.
+    pub fn validate(&self) -> crate::Result<()> {
+        for (_, entry) in self.fields() {
+            if let FieldType::Str(options) = entry.field_type() {
+                if let Some(indexing) = options.get_indexing_options() {
+                    if indexing.pnorms() && !indexing.fieldnorms() {
+                        return Err(TantivyError::InvalidArgument(format!(
+                            "Field `{}`: pnorms requires fieldnorms to be enabled",
+                            entry.name()
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Return the `FieldEntry` associated with a `Field`.
     #[inline]
     pub fn get_field_entry(&self, field: Field) -> &FieldEntry {

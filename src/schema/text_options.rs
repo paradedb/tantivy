@@ -195,7 +195,7 @@ pub struct TextFieldIndexing {
     #[serde(default = "default_fieldnorms")]
     fieldnorms: bool,
     #[serde(default, skip_serializing_if = "is_false")]
-    posting_norms: bool,
+    pnorms: bool,
     #[serde(default = "default_tokenizer")]
     tokenizer: Cow<'static, str>,
     #[serde(default)]
@@ -217,7 +217,7 @@ impl Default for TextFieldIndexing {
             tokenizer: default_tokenizer(),
             record: IndexRecordOption::default(),
             fieldnorms: default_fieldnorms(),
-            posting_norms: false,
+            pnorms: false,
             bm25_params: Bm25Params::default(),
         }
     }
@@ -249,15 +249,15 @@ impl TextFieldIndexing {
     }
 
     /// Returns whether posting-local norms are requested for this field.
-    pub fn posting_norms(&self) -> bool {
-        self.posting_norms
+    pub fn pnorms(&self) -> bool {
+        self.pnorms
     }
 
     /// Enables posting-local norms for faster top-k BM25 queries, at the cost of more storage
     /// and longer index builds and merges. Defaults to false; requires indexing and fieldnorms.
     #[must_use]
-    pub fn set_posting_norms(mut self, posting_norms: bool) -> Self {
-        self.posting_norms = posting_norms;
+    pub fn set_pnorms(mut self, pnorms: bool) -> Self {
+        self.pnorms = pnorms;
         self
     }
 
@@ -295,7 +295,7 @@ pub const STRING: TextOptions = TextOptions {
     indexing: Some(TextFieldIndexing {
         tokenizer: Cow::Borrowed(RAW_TOKENIZER_NAME),
         fieldnorms: true,
-        posting_norms: false,
+        pnorms: false,
         record: IndexRecordOption::Basic,
         bm25_params: Bm25Params::DEFAULT,
     }),
@@ -309,7 +309,7 @@ pub const TEXT: TextOptions = TextOptions {
     indexing: Some(TextFieldIndexing {
         tokenizer: Cow::Borrowed(DEFAULT_TOKENIZER_NAME),
         fieldnorms: true,
-        posting_norms: false,
+        pnorms: false,
         record: IndexRecordOption::WithFreqsAndPositions,
         bm25_params: Bm25Params::DEFAULT,
     }),

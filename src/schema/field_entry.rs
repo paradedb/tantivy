@@ -114,8 +114,8 @@ impl FieldEntry {
     }
 
     /// Returns true if posting-local norms are enabled for this field.
-    pub fn has_posting_norms(&self) -> bool {
-        self.field_type.has_posting_norms()
+    pub fn has_pnorms(&self) -> bool {
+        self.field_type.has_pnorms()
     }
 
     /// Returns true if the field is a fast field
@@ -223,24 +223,24 @@ mod tests {
         };
 
         let field_type = FieldType::Str(
-            TEXT.set_indexing_options(TextFieldIndexing::default().set_posting_norms(true)) | FAST,
+            TEXT.set_indexing_options(TextFieldIndexing::default().set_pnorms(true)) | FAST,
         );
-        assert!(field_type.has_posting_norms());
+        assert!(field_type.has_pnorms());
         let mut serialized = serde_json::to_value(&field_type).unwrap();
         assert_eq!(
             serde_json::from_value::<FieldType>(serialized.clone()).unwrap(),
             field_type
         );
         let options = &mut serialized["options"]["indexing"];
-        assert_eq!(options["posting_norms"], true);
-        options.as_object_mut().unwrap().remove("posting_norms");
+        assert_eq!(options["pnorms"], true);
+        options.as_object_mut().unwrap().remove("pnorms");
         let legacy: FieldType = serde_json::from_value(serialized.clone()).unwrap();
-        assert!(!legacy.has_posting_norms());
+        assert!(!legacy.has_pnorms());
         assert_eq!(serde_json::to_value(&legacy).unwrap(), serialized);
         assert!(TextFieldIndexing::default()
-            .set_posting_norms(true)
+            .set_pnorms(true)
             .set_fieldnorms(false)
-            .posting_norms());
+            .pnorms());
 
         for field_type in [
             FieldType::U64(NumericOptions::from(INDEXED)),
@@ -252,9 +252,9 @@ mod tests {
             FieldType::IpAddr(IpAddrOptions::from(INDEXED)),
         ] {
             assert!(field_type.has_fieldnorms());
-            assert!(!field_type.has_posting_norms());
+            assert!(!field_type.has_pnorms());
             let serialized = serde_json::to_value(&field_type).unwrap();
-            assert!(serialized["options"].get("posting_norms").is_none());
+            assert!(serialized["options"].get("pnorms").is_none());
         }
     }
 

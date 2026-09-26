@@ -331,7 +331,7 @@ mod tests {
     use crate::DocSet;
 
     #[test]
-    fn test_unscored_regex_phrase_does_not_read_posting_norms() -> crate::Result<()> {
+    fn test_unscored_regex_phrase_does_not_read_pnorms() -> crate::Result<()> {
         use std::io::Write;
 
         use crate::collector::Count;
@@ -348,7 +348,7 @@ mod tests {
                 TEXT.get_indexing_options()
                     .unwrap()
                     .clone()
-                    .set_posting_norms(true),
+                    .set_pnorms(true),
             ),
         );
         let index = crate::Index::create_in_ram(schema.build());

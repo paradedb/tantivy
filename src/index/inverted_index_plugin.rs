@@ -737,7 +737,7 @@ mod tests {
                     TEXT.get_indexing_options()
                         .unwrap()
                         .clone()
-                        .set_posting_norms(true),
+                        .set_pnorms(true),
                 ),
             );
             let basic = schema.add_text_field(
@@ -745,7 +745,7 @@ mod tests {
                 TextOptions::default().set_indexing_options(
                     TextFieldIndexing::default()
                         .set_index_option(IndexRecordOption::Basic)
-                        .set_posting_norms(true),
+                        .set_pnorms(true),
                 ),
             );
             let id = schema.add_u64_field("id", INDEXED | FAST);

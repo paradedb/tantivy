@@ -497,7 +497,7 @@ mod test {
     }
 
     #[test]
-    fn test_posting_norms_component() -> crate::Result<()> {
+    fn test_pnorms_component() -> crate::Result<()> {
         use common::HasLen;
 
         let mut schema_builder = Schema::builder();
@@ -507,7 +507,7 @@ mod test {
                 TEXT.get_indexing_options()
                     .unwrap()
                     .clone()
-                    .set_posting_norms(true),
+                    .set_pnorms(true),
             ),
         );
         let index = Index::builder()
