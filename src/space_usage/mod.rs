@@ -26,6 +26,7 @@ pub(crate) const POSTINGS: &str = "postings";
 pub(crate) const POSITIONS: &str = "positions";
 pub(crate) const FAST_FIELDS: &str = "fast_fields";
 pub(crate) const FIELDNORMS: &str = "fieldnorms";
+pub(crate) const POSTING_NORMS: &str = "pnorm";
 pub(crate) const STORE: &str = "store";
 pub(crate) const DELETES: &str = "deletes";
 
@@ -131,6 +132,7 @@ impl SegmentSpaceUsage {
             Positions => POSITIONS,
             FastFields => FAST_FIELDS,
             FieldNorms => FIELDNORMS,
+            PostingNorms => POSTING_NORMS,
             Terms => TERMDICT,
             Store | TempStore => STORE,
             Delete => DELETES,
@@ -382,9 +384,9 @@ fn merge_column_space_usage(
 
 #[cfg(test)]
 mod test {
-    use crate::index::Index;
+    use crate::index::{Index, SegmentComponent};
     use crate::schema::{Schema, FAST, INDEXED, STORED, TEXT};
-    use crate::space_usage::PerFieldSpaceUsage;
+    use crate::space_usage::{ComponentSpaceUsage, PerFieldSpaceUsage};
     use crate::{IndexWriter, Term};
 
     #[test]
@@ -446,7 +448,7 @@ mod test {
         expect_single_field(segment.postings(), &field_name, 1, 512);
         assert_eq!(segment.positions().total(), 0);
         expect_single_field(segment.fast_fields(), &field_name, 1, 512);
-        expect_single_field(segment.fieldnorms(), &field_name, 1, 512);
+        expect_single_field(segment.fieldnorms(), &field_name, 4, 4);
         // TODO: understand why the following fails
         //        assert_eq!(0, segment.store().total());
         assert_eq!(segment.deletes(), 0);
@@ -487,10 +489,53 @@ mod test {
         expect_single_field(segment.postings(), &field_name, 1, 512);
         expect_single_field(segment.positions(), &field_name, 1, 512);
         assert_eq!(segment.fast_fields().total(), 0);
-        expect_single_field(segment.fieldnorms(), &field_name, 1, 512);
+        expect_single_field(segment.fieldnorms(), &field_name, 4, 4);
         // TODO: understand why the following fails
         //        assert_eq!(0, segment.store().total());
         assert_eq!(segment.deletes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_pnorms_component() -> crate::Result<()> {
+        use common::HasLen;
+
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field(
+            "text",
+            TEXT.set_indexing_options(
+                TEXT.get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_pnorms(true),
+            ),
+        );
+        let index = Index::builder()
+            .schema(schema_builder.build())
+            .create_in_ram()?;
+        let mut index_writer = index.writer_for_tests()?;
+        index_writer.add_document(doc!(text => "one two"))?;
+        index_writer.commit()?;
+
+        let reader = index.reader()?;
+        let usage = reader.searcher().space_usage()?;
+        assert_eq!(usage.segments().len(), 1);
+        expect_single_field(usage.segments()[0].fieldnorms(), "text", 1, 1);
+        let file = reader
+            .searcher()
+            .segment_reader(0)
+            .open_read(SegmentComponent::PostingNorms)?;
+        let field_file = crate::directory::CompositeFile::open(&file)?
+            .open_read(text)
+            .unwrap();
+        let bytes = field_file.len() as u64;
+        assert!(bytes > 2);
+        let norms = usage.segments()[0].component(SegmentComponent::PostingNorms);
+        assert_eq!(norms.total(), bytes);
+        let ComponentSpaceUsage::PerField(norms) = norms else {
+            panic!("posting norms should report per-field space usage");
+        };
+        expect_single_field(&norms, "text", bytes, bytes);
         Ok(())
     }
 
@@ -578,7 +623,7 @@ mod test {
         expect_single_field(segment_space_usage.postings(), &field_name, 1, 512);
         assert_eq!(segment_space_usage.positions().total(), 0u64);
         assert_eq!(segment_space_usage.fast_fields().total(), 0u64);
-        expect_single_field(segment_space_usage.fieldnorms(), &field_name, 1, 512);
+        expect_single_field(segment_space_usage.fieldnorms(), &field_name, 4, 4);
         assert!(segment_space_usage.deletes() > 0);
         Ok(())
     }

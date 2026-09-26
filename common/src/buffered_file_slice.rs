@@ -16,6 +16,7 @@ const DEFAULT_BUFFER_MAX_SIZE: usize = 512 * 1024; // 512K
 /// TODO: Rather than wrapping a `FileSlice` in buffering, it will usually be better to adjust a
 /// `FileHandle` to directly handle buffering itself.
 /// TODO: See: https://github.com/paradedb/paradedb/issues/3374
+#[derive(Clone)]
 pub struct BufferedFileSlice {
     file_slice: FileSlice,
     buffer: RefCell<OwnedBytes>,
@@ -45,6 +46,20 @@ impl BufferedFileSlice {
     /// Creates an empty `BufferedFileSlice`.
     pub fn empty() -> Self {
         Self::new(FileSlice::empty(), 0)
+    }
+
+    /// Reads a byte without cloning the retained buffer on a cache hit.
+    #[inline]
+    pub fn read_byte(&self, offset: u64) -> io::Result<u8> {
+        let range = self.buffer_range.borrow();
+        if range.contains(&offset) {
+            return Ok(self.buffer.borrow()[(offset - range.start) as usize]);
+        }
+        drop(range);
+        let end = offset.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "byte offset out of bounds")
+        })?;
+        Ok(self.get_bytes(offset..end)?[0])
     }
 
     /// Returns an `OwnedBytes` corresponding to the given `required_range`.

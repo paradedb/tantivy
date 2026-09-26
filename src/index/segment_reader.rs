@@ -141,9 +141,16 @@ impl SegmentReader {
     /// Field norms are the length (in tokens) of the fields.
     /// It is used in the computation of the [TfIdf](https://fulmicoton.gitbooks.io/tantivy-doc/content/tfidf.html).
     ///
-    /// They are simply stored as a fast field, serialized in
-    /// the `.fieldnorm` file of the segment.
+    /// Reads document-addressed norms for merge statistics and compatibility APIs.
+    /// Scorers use `scoring_fieldnorm_reader` and the current posting instead.
     pub fn get_fieldnorms_reader(&self, field: Field) -> crate::Result<FieldNormReader> {
+        let entry = self.schema.get_field_entry(field);
+        if !entry.is_indexed() || !entry.has_fieldnorms() {
+            return Err(crate::TantivyError::SchemaError(format!(
+                "Field norms disabled for {:?}",
+                entry.name()
+            )));
+        }
         self.fieldnorm_readers().get_field(field)?.ok_or_else(|| {
             let field_name = self.schema.get_field_name(field);
             let err_msg = format!(
@@ -154,6 +161,18 @@ impl SegmentReader {
         })
     }
 
+    /// Uses posting-local norms when `.pnorm` contains the field, otherwise reads `.fieldnorm`.
+    pub fn scoring_fieldnorm_reader(&self, field: Field) -> crate::Result<FieldNormReader> {
+        if !self.schema.get_field_entry(field).has_fieldnorms() {
+            return Ok(FieldNormReader::constant(self.max_doc(), 1));
+        }
+        if self.inverted_index(field)?.has_pnorms() {
+            return Ok(FieldNormReader::posting(self.max_doc()));
+        }
+        self.get_fieldnorms_reader(field)
+    }
+
+    /// Returns document-addressed norms for all fields.
     #[doc(hidden)]
     pub fn fieldnorms_readers(&self) -> &FieldNormReaders {
         self.fieldnorm_readers()
@@ -308,12 +327,24 @@ impl SegmentReader {
             }
         };
 
-        let inv_idx_reader = Arc::new(InvertedIndexReader::new(
+        let mut inv_idx_reader = InvertedIndexReader::new(
             TermDictionary::open(termdict_file)?,
             postings_file,
             DeferredFileSlice::new(positions_file_opener),
             record_option,
-        )?);
+        )?;
+        if field_entry.has_fieldnorms() {
+            match self.open_read(SegmentComponent::PostingNorms) {
+                Ok(source) => {
+                    if let Some(file) = CompositeFile::open(&source)?.open_read(field) {
+                        inv_idx_reader.set_pnorms_file(file);
+                    }
+                }
+                Err(OpenReadError::FileDoesNotExist(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let inv_idx_reader = Arc::new(inv_idx_reader);
 
         // by releasing the lock in between, we may end up opening the inverting index
         // twice, but this is fine.
@@ -603,6 +634,7 @@ impl SegmentReader {
             SegmentComponent::TempStore => ".store.temp".to_string(),
             SegmentComponent::FastFields => ".fast".to_string(),
             SegmentComponent::FieldNorms => ".fieldnorm".to_string(),
+            SegmentComponent::PostingNorms => ".pnorm".to_string(),
             SegmentComponent::Delete => format!(".{}.del", self.delete_opstamp().unwrap_or(0)),
             SegmentComponent::Custom(ext) => format!(".{ext}"),
         });
@@ -819,6 +851,45 @@ mod test {
     use crate::index::Index;
     use crate::schema::{Term, STORED, TEXT};
     use crate::IndexWriter;
+
+    #[test]
+    fn test_plural_fieldnorms_for_posting_segments() -> crate::Result<()> {
+        use crate::schema::{TextFieldIndexing, TextOptions};
+
+        for empty in [false, true] {
+            let mut schema = Schema::builder();
+            let text = schema.add_text_field("text", TEXT);
+            let absent = schema.add_text_field("absent", TEXT);
+            let stored = schema.add_text_field("stored", STORED);
+            let disabled = schema.add_text_field(
+                "disabled",
+                TextOptions::default()
+                    .set_indexing_options(TextFieldIndexing::default().set_fieldnorms(false)),
+            );
+            let index = Index::create_in_ram(schema.build());
+            let mut writer = index.writer_for_tests()?;
+            for value in ["one", "one two three", ""] {
+                writer.add_document(doc!(text => if empty { "" } else { value }))?;
+            }
+            writer.commit()?;
+            let searcher = index.reader()?.searcher();
+            let segment = searcher.segment_reader(0);
+            let readers = segment.fieldnorms_readers();
+            assert!(std::ptr::eq(readers, segment.fieldnorms_readers()));
+            assert!(readers.get_field(stored)?.is_none());
+            assert!(readers.get_field(disabled)?.is_none());
+            for field in [text, absent] {
+                let plural = readers.get_field(field)?.unwrap();
+                let singular = segment.get_fieldnorms_reader(field)?;
+                assert_eq!(plural.num_docs(), segment.max_doc());
+                for doc in 0..segment.max_doc() {
+                    assert_eq!(plural.fieldnorm_id(doc), singular.fieldnorm_id(doc));
+                }
+                assert!(readers.get_inner_file().open_read(field).is_some());
+            }
+        }
+        Ok(())
+    }
 
     #[track_caller]
     fn assert_merge(fields_metadatas: &[Vec<FieldMetadata>], expected: &[FieldMetadata]) {
