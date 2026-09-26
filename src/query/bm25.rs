@@ -24,12 +24,6 @@ pub trait Bm25StatisticsProvider {
     /// Returns the number of documents containing `term`.
     fn doc_freq(&self, term: &Term) -> crate::Result<u64>;
 
-    /// Returns the local searcher whose segment frequencies define `doc_freq` exactly.
-    /// Providers with custom or distributed frequencies should retain the default.
-    fn local_searcher(&self) -> Option<&Searcher> {
-        None
-    }
-
     /// Returns the BM25 parameters (`k1`, `b`) for `field`.
     ///
     /// Defaults to [`Bm25Params::DEFAULT`] (`k1 = 1.2`, `b = 0.75`).
@@ -39,10 +33,6 @@ pub trait Bm25StatisticsProvider {
 }
 
 impl Bm25StatisticsProvider for Searcher {
-    fn local_searcher(&self) -> Option<&Searcher> {
-        cfg!(feature = "quickwit").then_some(self)
-    }
-
     fn total_num_tokens(&self, field: Field) -> crate::Result<u64> {
         let mut total_num_tokens = 0u64;
 
@@ -86,13 +76,11 @@ impl ResolvedTerms {
     ) -> crate::Result<Option<Self>> {
         match enable_scoring {
             EnableScoring::Enabled {
-                statistics_provider,
+                searcher,
+                use_local_statistics: true,
                 ..
-            } => statistics_provider
-                .local_searcher()
-                .map(|searcher| Self::new(searcher, terms))
-                .transpose(),
-            EnableScoring::Disabled { .. } => Ok(None),
+            } if cfg!(feature = "quickwit") => Self::new(searcher, terms).map(Some),
+            _ => Ok(None),
         }
     }
 
@@ -409,11 +397,13 @@ mod tests {
         use super::{Bm25StatisticsProvider, ResolvedTerms};
         use crate::collector::TopDocs;
         use crate::indexer::NoMergePolicy;
-        use crate::query::{BooleanQuery, EnableScoring, Occur, PhraseQuery, Query, TermQuery};
+        use crate::query::{
+            BooleanQuery, BoostQuery, EnableScoring, Occur, PhraseQuery, Query, TermQuery,
+        };
         use crate::schema::{Field, IndexRecordOption, Schema, TEXT};
         use crate::{Index, IndexWriter, Searcher, Term};
 
-        struct CustomStatistics<'a>(&'a Searcher);
+        struct CustomStatistics<'a>(&'a Searcher, Option<u64>);
         impl Bm25StatisticsProvider for CustomStatistics<'_> {
             fn total_num_tokens(&self, field: Field) -> crate::Result<u64> {
                 Bm25StatisticsProvider::total_num_tokens(self.0, field)
@@ -422,7 +412,10 @@ mod tests {
                 Bm25StatisticsProvider::total_num_docs(self.0)
             }
             fn doc_freq(&self, term: &Term) -> crate::Result<u64> {
-                self.0.doc_freq(term)
+                match self.1 {
+                    Some(doc_freq) => Ok(doc_freq),
+                    None => self.0.doc_freq(term),
+                }
             }
         }
 
@@ -462,12 +455,15 @@ mod tests {
             Box::new(PhraseQuery::new(vec![terms[0].clone(), terms[0].clone()])),
             Box::new(BooleanQuery::new(vec![
                 (Occur::Must, term_query(&terms[0])),
-                (Occur::Should, term_query(&terms[0])),
+                (
+                    Occur::Should,
+                    Box::new(BoostQuery::new(term_query(&terms[0]), 2.0)),
+                ),
                 (Occur::Should, term_query(&terms[2])),
                 (Occur::MustNot, term_query(&terms[1])),
             ])),
         ];
-        let custom = CustomStatistics(&searcher);
+        let custom = CustomStatistics(&searcher, None);
         let collector = TopDocs::with_limit(10).order_by_score();
         for query in queries {
             assert_eq!(
@@ -475,6 +471,20 @@ mod tests {
                 searcher.search_with_statistics_provider(query.as_ref(), &collector, &custom)?
             );
         }
+        let query = term_query(&terms[0]);
+        assert_ne!(
+            searcher.search(query.as_ref(), &collector)?,
+            searcher.search_with_statistics_provider(
+                query.as_ref(),
+                &collector,
+                &CustomStatistics(&searcher, Some(0)),
+            )?
+        );
+        assert!(ResolvedTerms::for_scoring(
+            EnableScoring::enabled_from_searcher(&searcher),
+            &terms
+        )?
+        .is_some());
         assert!(ResolvedTerms::for_scoring(
             EnableScoring::disabled_from_searcher(&searcher),
             &terms

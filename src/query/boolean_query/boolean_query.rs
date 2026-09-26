@@ -167,14 +167,9 @@ impl Query for BooleanQuery {
             .subqueries
             .iter()
             .map(|(occur, subquery)| {
-                if let (Some(resolved), Some(term_query)) =
-                    (&resolved, subquery.downcast_ref::<TermQuery>())
-                {
-                    let weight = term_query
-                        .specialized_weight_with_resolved_terms(enable_scoring, Some(resolved))?;
-                    return Ok((*occur, Box::new(weight) as Box<dyn Weight>));
-                }
-                Ok((*occur, subquery.weight(enable_scoring)?))
+                let weight = enable_scoring
+                    .weight_with_resolved_terms(subquery.as_ref(), resolved.as_ref())?;
+                Ok((*occur, weight))
             })
             .collect::<crate::Result<_>>()?;
         Ok(Box::new(

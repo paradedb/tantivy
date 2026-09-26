@@ -2,8 +2,8 @@ use std::fmt;
 
 use downcast_rs::impl_downcast;
 
-use super::bm25::Bm25StatisticsProvider;
-use super::Weight;
+use super::bm25::{Bm25StatisticsProvider, ResolvedTerms};
+use super::{TermQuery, Weight};
 use crate::core::searcher::Searcher;
 use crate::query::Explanation;
 use crate::schema::{Field, Schema};
@@ -40,6 +40,9 @@ pub enum EnableScoring<'a> {
         /// one to adjust the statistics.
         statistics_provider: &'a dyn Bm25StatisticsProvider,
 
+        /// Whether document frequencies are defined by this searcher's segments.
+        use_local_statistics: bool,
+
         /// Pruning strategy for scored term disjunctions.
         disjunction_pruning: DisjunctionPruning,
     },
@@ -59,6 +62,7 @@ impl<'a> EnableScoring<'a> {
         EnableScoring::Enabled {
             searcher,
             statistics_provider: searcher,
+            use_local_statistics: true,
             disjunction_pruning: DisjunctionPruning::Auto,
         }
     }
@@ -71,8 +75,22 @@ impl<'a> EnableScoring<'a> {
         EnableScoring::Enabled {
             statistics_provider,
             searcher,
+            use_local_statistics: false,
             disjunction_pruning: DisjunctionPruning::Auto,
         }
+    }
+
+    pub(crate) fn weight_with_resolved_terms(
+        self,
+        query: &dyn Query,
+        resolved: Option<&ResolvedTerms>,
+    ) -> crate::Result<Box<dyn Weight>> {
+        if let (Some(resolved), Some(term_query)) = (resolved, query.downcast_ref::<TermQuery>()) {
+            return Ok(Box::new(
+                term_query.specialized_weight_with_resolved_terms(self, Some(resolved))?,
+            ));
+        }
+        query.weight(self)
     }
 
     /// Override disjunction pruning for this scoring context. Constructors default
