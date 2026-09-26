@@ -410,6 +410,13 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             .unwrap_or_else(|| self.fieldnorm_reader.fieldnorm_id(self.doc()))
     }
 
+    pub fn fieldnorm(&self) -> Option<u32> {
+        self.intersection_docset
+            .docset_specialized(0)
+            .postings
+            .fieldnorm()
+    }
+
     pub fn phrase_count(&self) -> u32 {
         self.phrase_count
     }
@@ -585,8 +592,12 @@ impl<TPostings: Postings> Scorer for PhraseScorer<TPostings> {
     #[inline]
     fn score(&mut self) -> Score {
         if let Some(similarity_weight) = self.similarity_weight_opt.as_ref() {
-            let fieldnorm_id = self.fieldnorm_id();
-            similarity_weight.score(fieldnorm_id, self.phrase_count)
+            if let Some(fieldnorm) = self.fieldnorm() {
+                similarity_weight.score_fieldnorm(fieldnorm, self.phrase_count)
+            } else {
+                let fieldnorm_id = self.fieldnorm_id();
+                similarity_weight.score(fieldnorm_id, self.phrase_count)
+            }
         } else {
             1.0f32
         }

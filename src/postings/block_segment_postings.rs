@@ -1,3 +1,4 @@
+use std::cell::{Cell, Ref, RefCell};
 use std::io;
 
 use common::VInt;
@@ -26,6 +27,8 @@ pub struct BlockSegmentPostings {
     pub(crate) doc_decoder: BlockDecoder,
     block_loaded: bool,
     freq_decoder: BlockDecoder,
+    fieldnorm_decoder: RefCell<BlockDecoder>,
+    fieldnorm_loaded: Cell<bool>,
     freq_reading_option: FreqReadingOption,
     block_max_score_cache: Option<Score>,
     doc_freq: u32,
@@ -129,6 +132,8 @@ impl BlockSegmentPostings {
             doc_decoder: BlockDecoder::with_val(TERMINATED),
             block_loaded: false,
             freq_decoder: BlockDecoder::with_val(1),
+            fieldnorm_decoder: RefCell::new(BlockDecoder::with_val(0)),
+            fieldnorm_loaded: Cell::new(false),
             freq_reading_option,
             block_max_score_cache: None,
             doc_freq,
@@ -165,8 +170,8 @@ impl BlockSegmentPostings {
             let docs = self.doc_decoder.output_array().iter().cloned();
             let freqs = self.freq_decoder.output_array().iter().cloned();
             let bm25_scores = docs.zip(freqs).enumerate().map(|(offset, (_, term_freq))| {
-                let fieldnorm_id = self.fieldnorm_id_at(offset, fieldnorm_reader);
-                bm25_weight.score(fieldnorm_id, term_freq)
+                let fieldnorm = self.fieldnorm_at(offset, fieldnorm_reader);
+                bm25_weight.score_fieldnorm(fieldnorm, term_freq)
             });
             let block_max_score = max_score(bm25_scores).unwrap_or(0.0);
             self.block_max_score_cache = Some(block_max_score);
@@ -191,26 +196,66 @@ impl BlockSegmentPostings {
         self.term_norms = source.map(|source| {
             super::term_norms::TermNormReader::new(source, postings_offset, self.doc_freq)
         });
+        self.fieldnorm_loaded.set(false);
     }
 
     pub(crate) fn disable_term_norms(&mut self) {
         self.term_norms = None;
+        self.fieldnorm_loaded.set(false);
+    }
+
+    #[inline]
+    pub(crate) fn has_term_norms(&self) -> bool {
+        self.term_norms.is_some()
+    }
+
+    pub(crate) fn load_fieldnorm_block(&self) {
+        if self.fieldnorm_loaded.get() {
+            return;
+        }
+        if let Some(norms) = self.term_norms.as_ref() {
+            let docs_before_block = (self.doc_freq - self.skip_reader.remaining_docs()) as usize;
+            let block_idx = docs_before_block / COMPRESSION_BLOCK_SIZE;
+            norms
+                .decode_block(block_idx, &mut self.fieldnorm_decoder.borrow_mut())
+                .expect("failed to decode fieldnorm block");
+        }
+        self.fieldnorm_loaded.set(true);
+    }
+
+    #[inline]
+    pub(crate) fn fieldnorm_decoder(&self) -> Ref<'_, BlockDecoder> {
+        self.load_fieldnorm_block();
+        self.fieldnorm_decoder.borrow()
+    }
+
+    #[inline]
+    pub(crate) fn fieldnorm_at(&self, offset: usize, fallback: &FieldNormReader) -> u32 {
+        self.posting_fieldnorm_at(offset)
+            .unwrap_or_else(|| fallback.fieldnorm(self.doc(offset)))
     }
 
     #[inline]
     pub(crate) fn fieldnorm_id_at(&self, offset: usize, fallback: &FieldNormReader) -> u8 {
-        self.posting_fieldnorm_id_at(offset)
+        self.posting_fieldnorm_at(offset)
+            .map(FieldNormReader::fieldnorm_to_id)
             .unwrap_or_else(|| fallback.fieldnorm_id(self.doc(offset)))
     }
 
     #[inline]
+    pub(crate) fn posting_fieldnorm_at(&self, offset: usize) -> Option<u32> {
+        if self.term_norms.is_some() {
+            self.load_fieldnorm_block();
+            Some(self.fieldnorm_decoder.borrow().output(offset))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
     pub(crate) fn posting_fieldnorm_id_at(&self, offset: usize) -> Option<u8> {
-        self.term_norms.as_ref().map(|norms| {
-            let ordinal = (self.doc_freq - self.skip_reader.remaining_docs()) as usize + offset;
-            norms
-                .read(ordinal)
-                .expect("failed to read posting fieldnorm")
-        })
+        self.posting_fieldnorm_at(offset)
+            .map(FieldNormReader::fieldnorm_to_id)
     }
 
     // Resets the block segment postings on another position
@@ -230,6 +275,7 @@ impl BlockSegmentPostings {
         self.data = postings_data;
         self.block_max_score_cache = None;
         self.block_loaded = false;
+        self.fieldnorm_loaded.set(false);
         if let Some(skip_data) = skip_data_opt {
             self.skip_reader.reset(skip_data, doc_freq);
         } else {
@@ -360,6 +406,7 @@ impl BlockSegmentPostings {
         if self.skip_reader.seek(target_doc) {
             self.block_max_score_cache = None;
             self.block_loaded = false;
+            self.fieldnorm_loaded.set(false);
         }
     }
 
@@ -448,6 +495,7 @@ impl BlockSegmentPostings {
     pub fn advance(&mut self) {
         self.skip_reader.advance();
         self.block_loaded = false;
+        self.fieldnorm_loaded.set(false);
         self.block_max_score_cache = None;
         self.load_block();
     }
@@ -458,6 +506,8 @@ impl BlockSegmentPostings {
             doc_decoder: BlockDecoder::with_val(TERMINATED),
             block_loaded: true,
             freq_decoder: BlockDecoder::with_val(1),
+            fieldnorm_decoder: RefCell::new(BlockDecoder::with_val(0)),
+            fieldnorm_loaded: Cell::new(true),
             freq_reading_option: FreqReadingOption::NoFreq,
             block_max_score_cache: None,
             doc_freq: 0,

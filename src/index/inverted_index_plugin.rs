@@ -609,9 +609,8 @@ fn write_postings_for_field(
         for (segment_ord, term_info) in merged_terms.current_segment_ords_and_term_infos() {
             let segment_reader = &readers[segment_ord];
             let inverted_index: &InvertedIndexReader = &field_readers[segment_ord];
-            let mut segment_postings =
+            let segment_postings =
                 inverted_index.read_postings_from_terminfo(&term_info, segment_postings_option)?;
-            segment_postings.block_cursor.disable_term_norms();
             let alive_bitset_opt = segment_reader.alive_bitset();
             let doc_freq = if let Some(alive_bitset) = alive_bitset_opt {
                 segment_postings.doc_freq_given_deletes(alive_bitset)
@@ -660,8 +659,9 @@ fn write_postings_for_field(
                         positions_buffer.clear();
                         0
                     };
+                    let norm = postings.fieldnorm();
                     let delta_positions = delta_computer.compute_delta(&positions_buffer);
-                    field_serializer.write_doc(doc, term_freq, delta_positions);
+                    field_serializer.write_doc_with_norm(doc, term_freq, delta_positions, norm);
                     postings.advance();
                 }
             }
@@ -680,8 +680,14 @@ fn write_postings_for_field(
                     positions_buffer.clear();
                     0
                 };
+                let norm = merger.fieldnorm();
                 let delta_positions = delta_computer.compute_delta(&positions_buffer);
-                field_serializer.write_doc(merger.doc(), term_freq, delta_positions);
+                field_serializer.write_doc_with_norm(
+                    merger.doc(),
+                    term_freq,
+                    delta_positions,
+                    norm,
+                );
             }
         }
         field_serializer.close_term()?;

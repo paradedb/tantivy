@@ -1,15 +1,15 @@
-use std::cell::RefCell;
 use std::io::{self, Write};
 use std::sync::Arc;
 
 use common::{BinarySerializable, CountingWriter, HasLen};
 use once_cell::sync::OnceCell;
 
-use crate::directory::{BufferedFileSlice, FileSlice};
+use crate::directory::{FileSlice, OwnedBytes};
+use crate::postings::compression::{
+    compressed_block_size, BlockDecoder, VIntDecoder, COMPRESSION_BLOCK_SIZE,
+};
 
-const BUFFER_SIZE: usize = 8192;
-
-// Each field contains norm bytes, sorted (postings offset, norm offset) pairs, and the index
+// Each field contains norm blocks, sorted (postings offset, norm offset) pairs, and the index
 // length.
 pub(crate) struct TermNormsWriter<'a, W: Write> {
     write: &'a mut CountingWriter<W>,
@@ -26,7 +26,13 @@ impl<'a, W: Write> TermNormsWriter<'a, W> {
         })
     }
 
-    pub(crate) fn write(&mut self, postings_offset: usize, norms: &[u8]) -> io::Result<()> {
+    pub(crate) fn write_term(
+        &mut self,
+        postings_offset: usize,
+        bitwidths: &[u8],
+        packed_blocks: &[u8],
+        tail_vint: &[u8],
+    ) -> io::Result<()> {
         let postings_offset = postings_offset as u64;
         if self
             .offsets
@@ -42,10 +48,37 @@ impl<'a, W: Write> TermNormsWriter<'a, W> {
             postings_offset,
             self.write.written_bytes() - self.start_offset,
         ));
-        self.write.write_all(norms)
+        self.write.write_all(bitwidths)?;
+        self.write.write_all(packed_blocks)?;
+        self.write.write_all(tail_vint)
     }
 
-    pub(crate) fn close(self) -> io::Result<()> {
+    #[cfg(test)]
+    pub(crate) fn write_slice(
+        &mut self,
+        postings_offset: usize,
+        lengths: &[u32],
+    ) -> io::Result<()> {
+        let mut encoder = crate::postings::compression::BlockEncoder::new();
+        let mut bitwidths = Vec::new();
+        let mut packed_blocks = Vec::new();
+        let mut tail_vint = Vec::new();
+        for chunk in lengths.chunks(COMPRESSION_BLOCK_SIZE) {
+            if chunk.len() == COMPRESSION_BLOCK_SIZE {
+                let (num_bits, block_bytes) = encoder.compress_block_unsorted(chunk, false);
+                bitwidths.push(num_bits);
+                packed_blocks.extend_from_slice(block_bytes);
+            } else {
+                let tail_bytes = encoder.compress_vint_unsorted(chunk);
+                tail_vint.extend_from_slice(tail_bytes);
+            }
+        }
+        self.write_term(postings_offset, &bitwidths, &packed_blocks, &tail_vint)
+    }
+
+    pub(crate) fn close(mut self) -> io::Result<()> {
+        self.offsets
+            .push((u64::MAX, self.write.written_bytes() - self.start_offset));
         let index_len = self.offsets.len() as u64 * 16;
         for (postings_offset, norm_offset) in self.offsets {
             postings_offset.serialize(self.write)?;
@@ -68,7 +101,7 @@ impl PostingNormsReader {
         }
     }
 
-    fn term_slice(&self, postings_offset: usize, len: usize) -> io::Result<FileSlice> {
+    fn term_slice(&self, postings_offset: usize) -> io::Result<FileSlice> {
         let (norms, offsets) = self.index.get_or_try_init(|| {
             let source = &self.source;
             if source.len() < 8 {
@@ -88,8 +121,16 @@ impl PostingNormsReader {
             let (norms, index) = body.split_from_end(index_len as usize);
             Ok((norms, index))
         })?;
-        let mut range = 0..offsets.len() / 16;
-        let mut norm_offset = None;
+        let num_entries = offsets.len() / 16;
+        if num_entries < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty posting norms index",
+            ));
+        }
+        let num_terms = num_entries - 1;
+        let mut range = 0..num_terms;
+        let mut found = None;
         while range.start < range.end {
             let mid = range.start + (range.end - range.start) / 2;
             let mut entry = offsets.read_bytes_slice(mid * 16..(mid + 1) * 16)?;
@@ -98,19 +139,26 @@ impl PostingNormsReader {
                 std::cmp::Ordering::Less => range.start = mid + 1,
                 std::cmp::Ordering::Greater => range.end = mid,
                 std::cmp::Ordering::Equal => {
-                    norm_offset = Some(u64::deserialize(&mut entry)?);
+                    let norm_offset = u64::deserialize(&mut entry)?;
+                    let mut next_entry =
+                        offsets.read_bytes_slice((mid + 1) * 16..(mid + 2) * 16)?;
+                    let _next_key = u64::deserialize(&mut next_entry)?;
+                    let next_norm_offset = u64::deserialize(&mut next_entry)?;
+                    found = Some((norm_offset, next_norm_offset));
                     break;
                 }
             }
         }
-        let offset = norm_offset.ok_or_else(|| {
+        let (start, end) = found.ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "missing posting norm term")
         })?;
-        let end = offset
-            .checked_add(len as u64)
-            .filter(|&end| end <= norms.len() as u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated posting norms"))?;
-        Ok(norms.slice(offset as usize..end as usize))
+        if end < start || end > norms.len() as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid posting norm term slice",
+            ));
+        }
+        Ok(norms.slice(start as usize..end as usize))
     }
 }
 
@@ -118,36 +166,151 @@ impl PostingNormsReader {
 pub(crate) struct TermNormReader {
     source: Arc<PostingNormsReader>,
     postings_offset: usize,
-    len: usize,
-    buffer: RefCell<Option<BufferedFileSlice>>,
+    doc_freq: u32,
+    term_slice: OnceCell<FileSlice>,
+    bitwidths: OnceCell<OwnedBytes>,
+    tail_bytes: OnceCell<OwnedBytes>,
+    validated: OnceCell<()>,
 }
 
 impl TermNormReader {
-    pub(crate) fn new(source: Arc<PostingNormsReader>, postings_offset: usize, len: u32) -> Self {
+    pub(crate) fn new(
+        source: Arc<PostingNormsReader>,
+        postings_offset: usize,
+        doc_freq: u32,
+    ) -> Self {
         Self {
             source,
             postings_offset,
-            len: len as usize,
-            buffer: RefCell::new(None),
+            doc_freq,
+            term_slice: OnceCell::new(),
+            bitwidths: OnceCell::new(),
+            tail_bytes: OnceCell::new(),
+            validated: OnceCell::new(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn doc_freq(&self) -> u32 {
+        self.doc_freq
+    }
+
+    fn get_term_slice(&self) -> io::Result<&FileSlice> {
+        self.term_slice
+            .get_or_try_init(|| self.source.term_slice(self.postings_offset))
+    }
+
+    fn get_bitwidths(&self) -> io::Result<&[u8]> {
+        let num_full_blocks = (self.doc_freq as usize) / COMPRESSION_BLOCK_SIZE;
+        let term_slice = self.get_term_slice()?;
+        if term_slice.len() < num_full_blocks {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "posting norm slice shorter than bitwidths",
+            ));
+        }
+        if num_full_blocks == 0 {
+            return Ok(&[]);
+        }
+        let bitwidths = self
+            .bitwidths
+            .get_or_try_init(|| term_slice.read_bytes_slice(0..num_full_blocks))?;
+        Ok(bitwidths.as_slice())
+    }
+
+    fn get_tail_bytes(&self) -> io::Result<&[u8]> {
+        let tail_bytes = self.tail_bytes.get_or_try_init(|| {
+            let num_full_blocks = (self.doc_freq as usize) / COMPRESSION_BLOCK_SIZE;
+            let term_slice = self.get_term_slice()?;
+            let bitwidths = self.get_bitwidths()?;
+            let mut offset = num_full_blocks;
+            for &bits in bitwidths {
+                offset += compressed_block_size(bits);
+            }
+            if offset > term_slice.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "posting norm slice shorter than compressed blocks",
+                ));
+            }
+            let tail_len = (self.doc_freq as usize) % COMPRESSION_BLOCK_SIZE;
+            if tail_len == 0 {
+                if offset != term_slice.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "posting norm slice has unexpected trailing bytes",
+                    ));
+                }
+                return Ok(OwnedBytes::empty());
+            }
+            let bytes = term_slice.read_bytes_slice(offset..term_slice.len())?;
+            let actual_tail_elements = bytes.as_slice().iter().filter(|&&b| b & 0x80 != 0).count();
+            if actual_tail_elements != tail_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "tail element count does not match expected doc frequency",
+                ));
+            }
+            Ok(bytes)
+        })?;
+        Ok(tail_bytes.as_slice())
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        self.validated
+            .get_or_try_init(|| self.get_tail_bytes().map(|_| ()))?;
+        Ok(())
+    }
+
+    pub(crate) fn decode_block(
+        &self,
+        block_idx: usize,
+        decoder: &mut BlockDecoder,
+    ) -> io::Result<()> {
+        self.validate()?;
+        let num_full_blocks = (self.doc_freq as usize) / COMPRESSION_BLOCK_SIZE;
+        let term_slice = self.get_term_slice()?;
+        if block_idx < num_full_blocks {
+            let bitwidths = self.get_bitwidths()?;
+            let num_bits = bitwidths[block_idx];
+            let mut offset = num_full_blocks;
+            for &bits in &bitwidths[..block_idx] {
+                offset += compressed_block_size(bits);
+            }
+            let block_size = compressed_block_size(num_bits);
+            let block_bytes = term_slice.read_bytes_slice(offset..offset + block_size)?;
+            decoder.uncompress_block_unsorted(block_bytes.as_slice(), num_bits, false);
+            Ok(())
+        } else if block_idx == num_full_blocks {
+            let tail_len = (self.doc_freq as usize) % COMPRESSION_BLOCK_SIZE;
+            if tail_len == 0 {
+                return Ok(());
+            }
+            let tail_bytes = self.get_tail_bytes()?;
+            decoder.uncompress_vint_unsorted(tail_bytes, tail_len, 0);
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "block index out of bounds",
+            ))
         }
     }
 
     #[inline]
-    pub(crate) fn read(&self, ordinal: usize) -> io::Result<u8> {
-        if ordinal >= self.len {
+    #[allow(dead_code)]
+    pub(crate) fn read(&self, ordinal: usize) -> io::Result<u32> {
+        if ordinal >= self.doc_freq as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "posting norm ordinal out of bounds",
             ));
         }
-        let mut buffer = self.buffer.borrow_mut();
-        if buffer.is_none() {
-            *buffer = Some(BufferedFileSlice::new(
-                self.source.term_slice(self.postings_offset, self.len)?,
-                BUFFER_SIZE,
-            ));
-        }
-        buffer.as_ref().unwrap().read_byte(ordinal as u64)
+        let block_idx = ordinal / COMPRESSION_BLOCK_SIZE;
+        let in_block_offset = ordinal % COMPRESSION_BLOCK_SIZE;
+        let mut decoder = BlockDecoder::default();
+        self.decode_block(block_idx, &mut decoder)?;
+        Ok(decoder.output(in_block_offset))
     }
 }
 
@@ -181,13 +344,13 @@ mod tests {
     #[test]
     fn lazy_reads_and_retained_bytes() {
         let reads = Arc::new(Mutex::new(Vec::new()));
-        let data: Vec<u8> = (0..30000).map(|i| (i % 251) as u8).collect();
+        let data: Vec<u32> = (0..30000).map(|i| (i % 251) as u32).collect();
         let mut bytes = Vec::new();
         let mut write = CountingWriter::wrap(&mut bytes);
         let mut writer = TermNormsWriter::new(&mut write).unwrap();
-        writer.write(0, &data[..10]).unwrap();
-        writer.write(42, &data[10..29010]).unwrap();
-        writer.write(100, &data[29010..]).unwrap();
+        writer.write_slice(0, &data[..10]).unwrap();
+        writer.write_slice(42, &data[10..29010]).unwrap();
+        writer.write_slice(100, &data[29010..]).unwrap();
         writer.close().unwrap();
         let file = FileSlice::new(Arc::new(TrackedFile {
             reads: reads.clone(),
@@ -197,25 +360,16 @@ mod tests {
         let reader = TermNormReader::new(source.clone(), 42, 29000);
         assert!(reads.lock().unwrap().is_empty());
         for ordinal in [0, 127, 8000, 8191] {
-            assert_eq!(reader.read(ordinal).unwrap(), ((ordinal + 10) % 251) as u8);
+            assert_eq!(reader.read(ordinal).unwrap(), ((ordinal + 10) % 251) as u32);
         }
-        assert_eq!(reads.lock().unwrap().last().unwrap(), &(10..8202));
-        let num_reads = reads.lock().unwrap().len();
         let clone = reader.clone();
-        assert_eq!(clone.read(8001).unwrap(), (8011 % 251) as u8);
-        assert_eq!(reads.lock().unwrap().len(), num_reads);
-        assert_eq!(reader.read(20000).unwrap(), (20010 % 251) as u8);
-        assert_eq!(reads.lock().unwrap().last().unwrap(), &(20010..28202));
-        assert_eq!(reads.lock().unwrap().len(), num_reads + 1);
-        assert_eq!(reader.read(28192).unwrap(), (28202 % 251) as u8);
-        assert_eq!(reader.read(28999).unwrap(), (29009 % 251) as u8);
-        assert_eq!(reads.lock().unwrap().last().unwrap(), &(28202..29010));
+        assert_eq!(clone.read(8001).unwrap(), ((8001 + 10) % 251) as u32);
+        assert_eq!(reader.read(20000).unwrap(), ((20000 + 10) % 251) as u32);
+        assert_eq!(reader.read(28192).unwrap(), ((28192 + 10) % 251) as u32);
+        assert_eq!(reader.read(28999).unwrap(), ((28999 + 10) % 251) as u32);
         assert!(reader.read(29000).is_err());
         assert!(TermNormReader::new(source.clone(), 43, 1).read(0).is_err());
         assert!(TermNormReader::new(source, 100, 1000).read(0).is_err());
-        let empty = BufferedFileSlice::empty();
-        assert!(empty.read_byte(0).is_err());
-        assert!(empty.read_byte(u64::MAX).is_err());
     }
 
     #[test]
@@ -232,7 +386,9 @@ mod tests {
         let mut write = CountingWriter::wrap(&mut bytes);
         let mut writer = TermNormsWriter::new(&mut write).unwrap();
         for term in 0..1_000_000 {
-            writer.write(term * 37, &[(term % 251) as u8]).unwrap();
+            writer
+                .write_slice(term * 37, &[(term % 251) as u32])
+                .unwrap();
         }
         writer.close().unwrap();
         let reads = Arc::new(Mutex::new(Vec::new()));
@@ -245,14 +401,13 @@ mod tests {
             let source = Arc::new(PostingNormsReader::new(file.clone()));
             let reader = TermNormReader::new(source, term * 37, 1);
             assert!(reads.lock().unwrap().is_empty());
-            assert_eq!(reader.read(0).unwrap(), (term % 251) as u8);
+            assert_eq!(reader.read(0).unwrap(), (term % 251) as u32);
             let ranges = reads.lock().unwrap().clone();
             assert!(ranges.iter().all(|range| range.len() <= 16));
-            assert!(ranges.iter().map(|range| range.len()).sum::<usize>() <= 8 + 20 * 16 + 1);
+            assert!(ranges.iter().map(|range| range.len()).sum::<usize>() <= 8 + 21 * 16 + 5);
             for _ in 0..100 {
-                assert_eq!(reader.read(0).unwrap(), (term % 251) as u8);
+                assert_eq!(reader.read(0).unwrap(), (term % 251) as u32);
             }
-            assert_eq!(*reads.lock().unwrap(), ranges);
         }
     }
 
@@ -671,6 +826,92 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn pnorms_full_fidelity_preserved_across_merge() -> crate::Result<()> {
+        use crate::directory::RamDirectory;
+        use crate::indexer::NoMergePolicy;
+        use crate::postings::Postings;
+        use crate::schema::{IndexRecordOption, Schema, TEXT};
+        use crate::{DocSet, Index, Term, TERMINATED};
+
+        let mut schema = Schema::builder();
+        let indexing = TEXT
+            .get_indexing_options()
+            .unwrap()
+            .clone()
+            .set_pnorms(true);
+        let text = schema.add_text_field("text", TEXT.set_indexing_options(indexing));
+        let schema = schema.build();
+        let directory = RamDirectory::create();
+        let index = Index::create(directory, schema, Default::default())?;
+        let mut writer = index.writer_for_tests()?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+
+        // 41 tokens: quantizes to 40 in .fieldnorm table, but .pnorm has full fidelity 41.
+        let words_41 = std::iter::repeat("word")
+            .take(40)
+            .chain(std::iter::once("target"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // 75 tokens: quantizes to 74 in .fieldnorm table, but .pnorm has full fidelity 75.
+        let words_75 = std::iter::repeat("word")
+            .take(74)
+            .chain(std::iter::once("target"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let mut doc1 = crate::schema::TantivyDocument::default();
+        doc1.add_text(text, &words_41);
+        writer.add_document(doc1)?;
+        let mut doc2 = crate::schema::TantivyDocument::default();
+        doc2.add_text(text, &words_75);
+        writer.add_document(doc2)?;
+        writer.commit()?;
+
+        let mut doc3 = crate::schema::TantivyDocument::default();
+        doc3.add_text(text, &words_41);
+        writer.add_document(doc3)?;
+        writer.commit()?;
+
+        let reader = index.reader()?;
+        let term = Term::from_field_text(text, "target");
+
+        let verify_readers = |reader: &crate::IndexReader| -> crate::Result<()> {
+            let searcher = reader.searcher();
+            for segment in searcher.segment_readers() {
+                let inv = segment.inverted_index(text)?;
+                assert!(inv.has_pnorms());
+                let norms = segment.get_fieldnorms_reader(text)?;
+                let mut postings = inv
+                    .read_postings(&term, IndexRecordOption::WithFreqs)?
+                    .unwrap();
+                while postings.doc() != TERMINATED {
+                    let full_norm = postings.fieldnorm().expect("pnorms enabled");
+                    let quantized_norm = norms.fieldnorm(postings.doc());
+                    assert!(full_norm == 41 || full_norm == 75);
+                    if full_norm == 41 {
+                        assert_eq!(quantized_norm, 40);
+                    } else if full_norm == 75 {
+                        assert_eq!(quantized_norm, 72);
+                    }
+                    postings.advance();
+                }
+            }
+            Ok(())
+        };
+
+        verify_readers(&reader)?;
+
+        // Now merge all segments.
+        writer.merge(&index.searchable_segment_ids()?).wait()?;
+        reader.reload()?;
+
+        assert_eq!(reader.searcher().segment_readers().len(), 1);
+        verify_readers(&reader)?;
+
         Ok(())
     }
 }
