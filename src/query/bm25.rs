@@ -66,6 +66,8 @@ impl Bm25StatisticsProvider for Searcher {
     }
 }
 
+/// Collects metadata for distinct query terms so BM25 statistics and scorer
+/// construction can share the same dictionary lookups.
 pub(crate) struct ResolvedTerms {
     pub term_infos: FxHashMap<Term, ResolvedTermInfo>,
 }

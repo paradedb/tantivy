@@ -22,6 +22,8 @@ pub struct TermInfo {
     pub positions_range: Range<usize>,
 }
 
+/// A term's document frequency and per-segment postings metadata, retained by query
+/// weights to avoid repeating dictionary lookups when constructing scorers.
 #[derive(Clone, Default)]
 pub(crate) struct ResolvedTermInfo {
     pub doc_freq: u64,
