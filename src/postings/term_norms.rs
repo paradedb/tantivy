@@ -91,6 +91,24 @@ impl PostingNormsReader {
         let mut range = 0..offsets.len() / 16;
         let mut norm_offset = None;
         while range.start < range.end {
+            let bytes = range.start * 16..range.end * 16;
+            if offsets
+                .storage_block_ord(bytes.start)
+                .zip(offsets.storage_block_ord(bytes.end - 1))
+                .is_some_and(|(first, last)| first == last)
+            {
+                // Finish searching a single storage page without repeatedly reopening its bytes.
+                let bytes = offsets.read_bytes_slice(bytes)?;
+                let (entries, _) = bytes.as_chunks::<16>();
+                if let Ok(index) = entries
+                    .binary_search_by_key(&(postings_offset as u64), |entry| {
+                        u64::from_le_bytes(entry[..8].try_into().unwrap())
+                    })
+                {
+                    norm_offset = Some(u64::from_le_bytes(entries[index][8..].try_into().unwrap()));
+                }
+                break;
+            }
             let mid = range.start + (range.end - range.start) / 2;
             let mut entry = offsets.read_bytes_slice(mid * 16..(mid + 1) * 16)?;
             let key = u64::deserialize(&mut entry)?;
@@ -176,6 +194,10 @@ mod tests {
             self.reads.lock().unwrap().push(range.clone());
             Ok(OwnedBytes::new(self.data[range].to_vec()))
         }
+
+        fn storage_block_len(&self) -> Option<usize> {
+            Some(8192)
+        }
     }
 
     #[test]
@@ -247,8 +269,16 @@ mod tests {
             assert!(reads.lock().unwrap().is_empty());
             assert_eq!(reader.read(0).unwrap(), (term % 251) as u8);
             let ranges = reads.lock().unwrap().clone();
-            assert!(ranges.iter().all(|range| range.len() <= 16));
-            assert!(ranges.iter().map(|range| range.len()).sum::<usize>() <= 8 + 20 * 16 + 1);
+            assert!(ranges.iter().all(|range| range.len() <= 8192));
+            assert!(
+                ranges.iter().map(|range| range.len()).sum::<usize>() <= 8 + 20 * 16 + 8192 + 1
+            );
+            assert!(ranges.len() <= 22, "{term}: {ranges:?}");
+            assert_eq!(ranges.iter().filter(|range| range.len() > 16).count(), 1);
+            assert!(ranges
+                .iter()
+                .filter(|range| range.len() > 16)
+                .all(|range| { range.start / 8192 == (range.end - 1) / 8192 }));
             for _ in 0..100 {
                 assert_eq!(reader.read(0).unwrap(), (term % 251) as u8);
             }
