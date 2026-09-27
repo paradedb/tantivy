@@ -1,4 +1,5 @@
 use super::boolean_weight::BooleanWeight;
+use crate::query::bm25::BatchedStatistics;
 use crate::query::{EnableScoring, Occur, Query, SumCombiner, TermQuery, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::SegmentReader;
@@ -156,10 +157,42 @@ impl From<Vec<(Occur, Box<dyn Query>)>> for BooleanQuery {
 
 impl Query for BooleanQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+        let statistics;
+        let term_scoring = if let EnableScoring::Enabled {
+            searcher,
+            statistics_provider,
+            disjunction_pruning,
+        } = enable_scoring
+        {
+            let terms: Vec<_> = self
+                .subqueries
+                .iter()
+                .filter_map(|(_, query)| query.downcast_ref::<TermQuery>().map(TermQuery::term))
+                .collect();
+            if terms.len() > 1 {
+                statistics = BatchedStatistics::new(statistics_provider, &terms)?;
+                EnableScoring::Enabled {
+                    searcher,
+                    statistics_provider: &statistics,
+                    disjunction_pruning,
+                }
+            } else {
+                enable_scoring
+            }
+        } else {
+            enable_scoring
+        };
         let sub_weights = self
             .subqueries
             .iter()
-            .map(|(occur, subquery)| Ok((*occur, subquery.weight(enable_scoring)?)))
+            .map(|(occur, subquery)| {
+                let scoring = if subquery.is::<TermQuery>() {
+                    term_scoring
+                } else {
+                    enable_scoring
+                };
+                Ok((*occur, subquery.weight(scoring)?))
+            })
             .collect::<crate::Result<_>>()?;
         Ok(Box::new(
             BooleanWeight::with_minimum_number_should_match(
