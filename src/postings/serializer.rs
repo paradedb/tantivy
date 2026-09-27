@@ -262,15 +262,18 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             return Ok(());
         };
 
-        self.postings_serializer
-            .close_term(self.current_term_info.doc_freq, self.postings_write)?;
         if let Some(norms) = self.postings_serializer.pnorms.as_ref() {
             assert_eq!(norms.len(), self.current_term_info.doc_freq as usize);
-            self.pnorms_writer
+            let offset = self
+                .pnorms_writer
                 .as_mut()
                 .unwrap()
                 .write(self.current_term_info.postings_range.start, norms)?;
+            self.postings_write.write_all(&super::term_norms::MAGIC)?;
+            offset.serialize(self.postings_write)?;
         }
+        self.postings_serializer
+            .close_term(self.current_term_info.doc_freq, self.postings_write)?;
         self.current_term_info.postings_range.end = self.postings_offset();
         if let Some(positions_serializer) = self.positions_serializer_opt.as_mut() {
             positions_serializer.close_term()?;
