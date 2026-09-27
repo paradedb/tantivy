@@ -16,7 +16,7 @@
 // - This bench isolates boolean iteration speed and intersection/union cost.
 // - Use `cargo bench --bench boolean_conjunction` to run.
 
-use binggan::{black_box, BenchGroup, BenchRunner};
+use binggan::{black_box, BenchRunner};
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -25,6 +25,12 @@ use tantivy::collector::{Collector, Count, TopDocs};
 use tantivy::query::QueryParser;
 use tantivy::schema::{Schema, FAST, TEXT};
 use tantivy::{doc, Index, Order, ReloadPolicy, Searcher};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostingNorms {
+    Disabled,
+    Enabled,
+}
 
 #[derive(Clone)]
 struct BenchIndex {
@@ -38,11 +44,26 @@ struct BenchIndex {
 /// return two BenchIndex views:
 /// - single_field: QueryParser defaults to only "body"
 /// - multi_field:  QueryParser defaults to ["title", "body"]
-fn build_index(num_docs: usize, terms: &[(&str, f32)]) -> (BenchIndex, BenchIndex) {
+fn build_index(
+    num_docs: usize,
+    terms: &[(&str, f32)],
+    pnorms: PostingNorms,
+) -> (BenchIndex, BenchIndex) {
     // Unified schema (two text fields)
     let mut schema_builder = Schema::builder();
-    let f_title = schema_builder.add_text_field("title", TEXT);
-    let f_body = schema_builder.add_text_field("body", TEXT);
+    let text_options = match pnorms {
+        PostingNorms::Enabled => {
+            let indexing = TEXT
+                .get_indexing_options()
+                .unwrap()
+                .clone()
+                .set_pnorms(true);
+            TEXT.set_indexing_options(indexing)
+        }
+        PostingNorms::Disabled => TEXT,
+    };
+    let f_title = schema_builder.add_text_field("title", text_options.clone());
+    let f_body = schema_builder.add_text_field("body", text_options);
     let f_score = schema_builder.add_u64_field("score", FAST);
     let f_score2 = schema_builder.add_u64_field("score2", FAST);
     let schema = schema_builder.build();
@@ -127,6 +148,21 @@ fn query_label(query_str: &str, term_pcts: &[(&str, String)]) -> String {
 }
 
 fn main() {
+    println!("PID: {}", std::process::id());
+    println!("Sleeping for 10 seconds before starting benchmark...");
+    std::thread::sleep(std::time::Duration::from_secs(10));
+
+    // Can be disabled via BENCH_BASELINE=0 / false, or SKIP_BASELINE=1 / true.
+    let run_baseline = match std::env::var("BENCH_BASELINE") {
+        Ok(v) => v != "0" && v.to_lowercase() != "false",
+        Err(_) => std::env::var("SKIP_BASELINE")
+            .map(|v| v == "0" || v.to_lowercase() == "false")
+            .unwrap_or(true),
+    };
+    if !run_baseline {
+        println!("Baseline variant disabled via environment variable.");
+    }
+
     // terms with varying selectivity, ordered from rarest to most common.
     // With 1M docs, we expect:
     // a: 0.01% (100), b: 1% (10k), c: 5% (50k), d: 15% (150k), e: 30% (300k)
@@ -155,56 +191,87 @@ fn main() {
     ];
 
     let mut runner = BenchRunner::new();
-    let (only_title, title_and_body) = build_index(num_docs, terms);
+    if let Some(num_iter) = std::env::var("NUM_ITER_GROUP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        runner.config().set_num_iter_for_group(num_iter);
+    }
+
+    let bench_indices_baseline = if run_baseline {
+        Some(build_index(num_docs, terms, PostingNorms::Disabled))
+    } else {
+        None
+    };
+    let bench_indices_pnorms = build_index(num_docs, terms, PostingNorms::Enabled);
+
     let term_pcts: Vec<(&str, String)> = terms
         .iter()
         .map(|&(term, p)| (term, format_pct(p)))
         .collect();
 
-    for (view_name, bench_index) in [
-        ("single_field", only_title),
-        ("multi_field", title_and_body),
-    ] {
+    let views = match &bench_indices_baseline {
+        Some((b_single, b_multi)) => vec![
+            ("single_field", Some(b_single), &bench_indices_pnorms.0),
+            ("multi_field", Some(b_multi), &bench_indices_pnorms.1),
+        ],
+        None => vec![
+            ("single_field", None, &bench_indices_pnorms.0),
+            ("multi_field", None, &bench_indices_pnorms.1),
+        ],
+    };
+
+    for (view_name, bench_index_baseline, bench_index_pnorms) in views {
         for (category_name, category_queries) in queries {
             for query_str in *category_queries {
-                let mut group = runner.new_group();
                 let query_label = query_label(query_str, &term_pcts);
-                group.set_name(format!("{}_{}_{}", view_name, category_name, query_label));
-                add_bench_task(&mut group, &bench_index, query_str, Count, "count");
-                add_bench_task(
-                    &mut group,
-                    &bench_index,
-                    query_str,
-                    TopDocs::with_limit(10).order_by_score(),
-                    "top10_inv_idx",
-                );
-                add_bench_task(
-                    &mut group,
-                    &bench_index,
-                    query_str,
-                    (Count, TopDocs::with_limit(10).order_by_score()),
-                    "count+top10",
-                );
+                let base_name = format!("{}_{}_{}", view_name, category_name, query_label);
 
                 add_bench_task(
-                    &mut group,
-                    &bench_index,
+                    &mut runner,
+                    format!("{base_name} — count"),
+                    bench_index_baseline,
+                    bench_index_pnorms,
                     query_str,
-                    TopDocs::with_limit(10).order_by_fast_field::<u64>("score", Order::Asc),
-                    "top10_by_ff",
+                    || Count,
                 );
                 add_bench_task(
-                    &mut group,
-                    &bench_index,
+                    &mut runner,
+                    format!("{base_name} — top10_inv_idx"),
+                    bench_index_baseline,
+                    bench_index_pnorms,
                     query_str,
-                    TopDocs::with_limit(10).order_by((
-                        SortByStaticFastValue::<u64>::for_field("score"),
-                        SortByStaticFastValue::<u64>::for_field("score2"),
-                    )),
-                    "top10_by_2ff",
+                    || TopDocs::with_limit(10).order_by_score(),
                 );
-
-                group.run();
+                add_bench_task(
+                    &mut runner,
+                    format!("{base_name} — count+top10"),
+                    bench_index_baseline,
+                    bench_index_pnorms,
+                    query_str,
+                    || (Count, TopDocs::with_limit(10).order_by_score()),
+                );
+                add_bench_task(
+                    &mut runner,
+                    format!("{base_name} — top10_by_ff"),
+                    bench_index_baseline,
+                    bench_index_pnorms,
+                    query_str,
+                    || TopDocs::with_limit(10).order_by_fast_field::<u64>("score", Order::Asc),
+                );
+                add_bench_task(
+                    &mut runner,
+                    format!("{base_name} — top10_by_2ff"),
+                    bench_index_baseline,
+                    bench_index_pnorms,
+                    query_str,
+                    || {
+                        TopDocs::with_limit(10).order_by((
+                            SortByStaticFastValue::<u64>::for_field("score"),
+                            SortByStaticFastValue::<u64>::for_field("score2"),
+                        ))
+                    },
+                );
             }
         }
     }
@@ -232,18 +299,40 @@ impl<A: FruitCount, B> FruitCount for (A, B) {
     }
 }
 
-fn add_bench_task<C: Collector + 'static>(
-    bench_group: &mut BenchGroup,
-    bench_index: &BenchIndex,
+fn add_bench_task<C: Collector + 'static, F: Fn() -> C + Copy + 'static>(
+    runner: &mut BenchRunner,
+    group_name: String,
+    bench_index_baseline: Option<&BenchIndex>,
+    bench_index_pnorms: &BenchIndex,
     query_str: &str,
-    collector: C,
-    collector_name: &str,
+    make_collector: F,
 ) where
     C::Fruit: FruitCount,
 {
-    let query = bench_index.query_parser.parse_query(query_str).unwrap();
-    let searcher = bench_index.searcher.clone();
-    bench_group.register(collector_name.to_string(), move |_| {
+    let mut group = runner.new_group();
+    group.set_name(group_name);
+
+    if let Some(bench_index_baseline) = bench_index_baseline {
+        let query = bench_index_baseline
+            .query_parser
+            .parse_query(query_str)
+            .unwrap();
+        let searcher = bench_index_baseline.searcher.clone();
+        let collector = make_collector();
+        group.register("baseline", move |_| {
+            black_box(searcher.search(&query, &collector).unwrap().count())
+        });
+    }
+
+    let query = bench_index_pnorms
+        .query_parser
+        .parse_query(query_str)
+        .unwrap();
+    let searcher = bench_index_pnorms.searcher.clone();
+    let collector = make_collector();
+    group.register("pnorms", move |_| {
         black_box(searcher.search(&query, &collector).unwrap().count())
     });
+
+    group.run();
 }
