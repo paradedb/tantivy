@@ -635,7 +635,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         Ok(None)
     }
 
-    fn do_get<K: AsRef<[u8]>>(
+    pub(crate) fn do_get<K: AsRef<[u8]>>(
         &self,
         key: K,
         mut reader: DeltaReader<TSSTable::ValueReader>,

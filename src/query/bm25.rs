@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use rustc_hash::FxHashMap;
+
 use crate::fieldnorm::FieldNormReader;
 use crate::index::Bm25Params;
 use crate::query::Explanation;
@@ -21,6 +23,12 @@ pub trait Bm25StatisticsProvider {
 
     /// Returns the number of documents containing `term`.
     fn doc_freq(&self, term: &Term) -> crate::Result<u64>;
+
+    /// Returns document frequencies in input order, including repeated terms.
+    /// Defaults to looking up each term separately.
+    fn doc_freqs(&self, terms: &[&Term]) -> crate::Result<Vec<u64>> {
+        terms.iter().map(|term| self.doc_freq(term)).collect()
+    }
 
     /// Returns the BM25 parameters (`k1`, `b`) for `field`.
     ///
@@ -54,12 +62,97 @@ impl Bm25StatisticsProvider for Searcher {
         self.doc_freq(term)
     }
 
+    #[cfg(feature = "quickwit")]
+    fn doc_freqs(&self, terms: &[&Term]) -> crate::Result<Vec<u64>> {
+        let mut sorted_terms = terms.to_vec();
+        sorted_terms.sort_unstable();
+        sorted_terms.dedup();
+        let mut doc_freqs = vec![0u64; sorted_terms.len()];
+        let mut start = 0;
+        while start < sorted_terms.len() {
+            let field = sorted_terms[start].field();
+            let end = start + sorted_terms[start..].partition_point(|term| term.field() == field);
+            let keys: Vec<_> = sorted_terms[start..end]
+                .iter()
+                .map(|term| term.serialized_value_bytes())
+                .collect();
+            // Term ordering includes a type tag that dictionary keys omit.
+            let batch_lookup =
+                keys.len() > 1 && crate::termdict::SortedTermSlice::new(&keys).is_some();
+            for segment in self.segment_readers() {
+                let reader = segment.inverted_index(field)?;
+                if batch_lookup {
+                    let keys = crate::termdict::SortedTermSlice::new_assume_sorted(&keys);
+                    for entry in reader.terms().batch_term_info_exact(keys) {
+                        let (index, info) = entry?;
+                        doc_freqs[start + index] += u64::from(info.doc_freq);
+                    }
+                } else {
+                    for (term, doc_freq) in sorted_terms[start..end]
+                        .iter()
+                        .zip(&mut doc_freqs[start..end])
+                    {
+                        *doc_freq += u64::from(reader.doc_freq(term)?);
+                    }
+                }
+            }
+            start = end;
+        }
+        Ok(terms
+            .iter()
+            .map(|term| doc_freqs[sorted_terms.binary_search(term).unwrap()])
+            .collect())
+    }
+
     fn bm25_params(&self, field: Field) -> Bm25Params {
         self.schema()
             .get_field_entry(field)
             .field_type()
             .bm25_params()
             .unwrap_or_default()
+    }
+}
+
+pub(crate) struct BatchedStatistics<'a> {
+    provider: &'a dyn Bm25StatisticsProvider,
+    doc_freqs: FxHashMap<&'a Term, u64>,
+}
+
+impl<'a> BatchedStatistics<'a> {
+    pub fn new(
+        provider: &'a dyn Bm25StatisticsProvider,
+        terms: &[&'a Term],
+    ) -> crate::Result<Self> {
+        let doc_freqs = terms
+            .iter()
+            .copied()
+            .zip(provider.doc_freqs(terms)?)
+            .collect();
+        Ok(Self {
+            provider,
+            doc_freqs,
+        })
+    }
+}
+
+impl Bm25StatisticsProvider for BatchedStatistics<'_> {
+    fn total_num_tokens(&self, field: Field) -> crate::Result<u64> {
+        self.provider.total_num_tokens(field)
+    }
+
+    fn total_num_docs(&self) -> crate::Result<u64> {
+        self.provider.total_num_docs()
+    }
+
+    fn doc_freq(&self, term: &Term) -> crate::Result<u64> {
+        match self.doc_freqs.get(term) {
+            Some(&doc_freq) => Ok(doc_freq),
+            None => self.provider.doc_freq(term),
+        }
+    }
+
+    fn bm25_params(&self, field: Field) -> Bm25Params {
+        self.provider.bm25_params(field)
     }
 }
 
@@ -134,8 +227,7 @@ impl Bm25Weight {
             ))
         } else {
             let mut idf_sum: Score = 0.0;
-            for term in terms {
-                let term_doc_freq = statistics.doc_freq(term)?;
+            for term_doc_freq in statistics.doc_freqs(&terms.iter().collect::<Vec<_>>())? {
                 idf_sum += idf(term_doc_freq, total_num_docs);
             }
             let idf_explain = Explanation::new("idf", idf_sum);
