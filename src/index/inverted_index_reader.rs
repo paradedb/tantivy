@@ -1,5 +1,4 @@
 use std::io;
-#[cfg(feature = "quickwit")]
 use std::sync::OnceLock;
 
 use common::file_slice::DeferredFileSlice;
@@ -9,9 +8,7 @@ use common::{BinarySerializable, ByteCount};
 use futures_util::{FutureExt, StreamExt, TryStreamExt};
 #[cfg(feature = "quickwit")]
 use itertools::Itertools;
-#[cfg(feature = "quickwit")]
 use lru::LruCache;
-#[cfg(feature = "quickwit")]
 use parking_lot::Mutex;
 #[cfg(feature = "quickwit")]
 use tantivy_fst::automaton::{AlwaysMatch, Automaton};
@@ -36,8 +33,6 @@ use crate::termdict::TermDictionary;
 /// [`SegmentReader::inverted_index()`](crate::SegmentReader::inverted_index).
 pub struct InvertedIndexReader {
     termdict: TermDictionary,
-    // FST lookups do not pay SSTable block decompression costs.
-    #[cfg(feature = "quickwit")]
     term_info_cache: OnceLock<Mutex<LruCache<Vec<u8>, Option<TermInfo>>>>,
     postings_file_slice: FileSlice,
     positions_file_slice: DeferredFileSlice,
@@ -84,7 +79,6 @@ impl InvertedIndexReader {
         let total_num_tokens = u64::deserialize(&mut total_num_tokens_slice.read_bytes()?)?;
         Ok(InvertedIndexReader {
             termdict,
-            #[cfg(feature = "quickwit")]
             term_info_cache: OnceLock::new(),
             postings_file_slice: postings_body,
             positions_file_slice,
@@ -105,7 +99,6 @@ impl InvertedIndexReader {
     pub fn empty(record_option: IndexRecordOption) -> InvertedIndexReader {
         InvertedIndexReader {
             termdict: TermDictionary::empty(),
-            #[cfg(feature = "quickwit")]
             term_info_cache: OnceLock::new(),
             postings_file_slice: FileSlice::empty(),
             positions_file_slice: DeferredFileSlice::new(|| Ok(FileSlice::empty())),
@@ -122,16 +115,13 @@ impl InvertedIndexReader {
     /// Returns the term info associated with the term.
     pub fn get_term_info(&self, term: &Term) -> io::Result<Option<TermInfo>> {
         let key = term.serialized_value_bytes();
-        #[cfg(feature = "quickwit")]
         let cache = self
             .term_info_cache
             .get_or_init(|| Mutex::new(LruCache::new(std::num::NonZeroUsize::new(128).unwrap())));
-        #[cfg(feature = "quickwit")]
         if let Some(info) = cache.lock().get(key).cloned() {
             return Ok(info);
         }
         let info = self.termdict.get(key)?;
-        #[cfg(feature = "quickwit")]
         cache.lock().put(key.to_vec(), info.clone());
         Ok(info)
     }
@@ -553,7 +543,7 @@ impl InvertedIndexReader {
     }
 }
 
-#[cfg(all(test, feature = "quickwit"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::indexer::NoMergePolicy;
@@ -580,11 +570,17 @@ mod tests {
                 for value in ["rust", "memory", "missing"] {
                     let term = Term::from_field_text(field, value);
                     let expected = reader.terms().get(term.serialized_value_bytes())?;
+                    #[cfg(feature = "quickwit")]
                     assert_eq!(
                         futures::executor::block_on(reader.get_term_info_async(&term).boxed())?,
                         expected
                     );
                     assert_eq!(reader.get_term_info(&term)?, expected);
+                    assert_eq!(
+                        reader.doc_freq(&term)?,
+                        expected.as_ref().map_or(0, |info| info.doc_freq)
+                    );
+                    #[cfg(feature = "quickwit")]
                     assert_eq!(
                         futures::executor::block_on(reader.get_term_info_async(&term))?,
                         expected
