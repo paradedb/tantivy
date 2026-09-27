@@ -1,4 +1,6 @@
 use std::io;
+#[cfg(feature = "quickwit")]
+use std::sync::OnceLock;
 
 use common::file_slice::DeferredFileSlice;
 use common::json_path_writer::JSON_END_OF_PATH;
@@ -8,12 +10,18 @@ use futures_util::{FutureExt, StreamExt, TryStreamExt};
 #[cfg(feature = "quickwit")]
 use itertools::Itertools;
 #[cfg(feature = "quickwit")]
+use lru::LruCache;
+#[cfg(feature = "quickwit")]
+use parking_lot::Mutex;
+#[cfg(feature = "quickwit")]
 use tantivy_fst::automaton::{AlwaysMatch, Automaton};
 
 use crate::directory::FileSlice;
 use crate::positions::PositionReader;
 use crate::postings::{BlockSegmentPostings, SegmentPostings, TermInfo};
 use crate::schema::{IndexRecordOption, Term, Type};
+#[cfg(feature = "quickwit")]
+use crate::termdict::SortedTermSlice;
 use crate::termdict::TermDictionary;
 
 /// The inverted index reader is in charge of accessing
@@ -30,6 +38,9 @@ use crate::termdict::TermDictionary;
 /// [`SegmentReader::inverted_index()`](crate::SegmentReader::inverted_index).
 pub struct InvertedIndexReader {
     termdict: TermDictionary,
+    // FST lookups do not pay SSTable block decompression costs.
+    #[cfg(feature = "quickwit")]
+    term_info_cache: OnceLock<Mutex<LruCache<Vec<u8>, Option<TermInfo>>>>,
     postings_file_slice: FileSlice,
     positions_file_slice: DeferredFileSlice,
     pnorms_file_slice: Option<std::sync::Arc<crate::postings::term_norms::PostingNormsReader>>,
@@ -75,6 +86,8 @@ impl InvertedIndexReader {
         let total_num_tokens = u64::deserialize(&mut total_num_tokens_slice.read_bytes()?)?;
         Ok(InvertedIndexReader {
             termdict,
+            #[cfg(feature = "quickwit")]
+            term_info_cache: OnceLock::new(),
             postings_file_slice: postings_body,
             positions_file_slice,
             pnorms_file_slice: None,
@@ -94,6 +107,8 @@ impl InvertedIndexReader {
     pub fn empty(record_option: IndexRecordOption) -> InvertedIndexReader {
         InvertedIndexReader {
             termdict: TermDictionary::empty(),
+            #[cfg(feature = "quickwit")]
+            term_info_cache: OnceLock::new(),
             postings_file_slice: FileSlice::empty(),
             positions_file_slice: DeferredFileSlice::new(|| Ok(FileSlice::empty())),
             pnorms_file_slice: None,
@@ -108,7 +123,52 @@ impl InvertedIndexReader {
 
     /// Returns the term info associated with the term.
     pub fn get_term_info(&self, term: &Term) -> io::Result<Option<TermInfo>> {
-        self.termdict.get(term.serialized_value_bytes())
+        let key = term.serialized_value_bytes();
+        #[cfg(feature = "quickwit")]
+        let cache = self.term_info_cache();
+        #[cfg(feature = "quickwit")]
+        if let Some(info) = cache.lock().get(key).cloned() {
+            return Ok(info);
+        }
+        let info = self.termdict.get(key)?;
+        #[cfg(feature = "quickwit")]
+        cache.lock().put(key.to_vec(), info.clone());
+        Ok(info)
+    }
+
+    /// Looks up sorted terms in a batch, retaining hits and misses for scorer creation.
+    #[cfg(feature = "quickwit")]
+    pub(crate) fn get_term_infos(
+        &self,
+        terms: SortedTermSlice<'_>,
+    ) -> io::Result<Vec<Option<TermInfo>>> {
+        let keys = terms.as_slice();
+        let cache = self.term_info_cache();
+        let mut infos = vec![None; keys.len()];
+        let mut missing = Vec::new();
+        {
+            let mut cache = cache.lock();
+            for (index, key) in keys.iter().enumerate() {
+                if let Some(info) = cache.get(*key) {
+                    infos[index] = info.clone();
+                } else {
+                    missing.push(index);
+                }
+            }
+        }
+        if !missing.is_empty() {
+            let missing_keys: Vec<_> = missing.iter().map(|&index| keys[index]).collect();
+            let terms = SortedTermSlice::new_assume_sorted(&missing_keys);
+            for entry in self.termdict.batch_term_info_exact(terms) {
+                let (index, info) = entry?;
+                infos[missing[index]] = Some(info);
+            }
+            let mut cache = cache.lock();
+            for index in missing {
+                cache.put(keys[index].to_vec(), infos[index].clone());
+            }
+        }
+        Ok(infos)
     }
 
     /// Return the term dictionary datastructure.
@@ -307,8 +367,20 @@ impl InvertedIndexReader {
 
 #[cfg(feature = "quickwit")]
 impl InvertedIndexReader {
+    fn term_info_cache(&self) -> &Mutex<LruCache<Vec<u8>, Option<TermInfo>>> {
+        self.term_info_cache
+            .get_or_init(|| Mutex::new(LruCache::new(std::num::NonZeroUsize::new(128).unwrap())))
+    }
+
     pub(crate) async fn get_term_info_async(&self, term: &Term) -> io::Result<Option<TermInfo>> {
-        self.termdict.get_async(term.serialized_value_bytes()).await
+        let key = term.serialized_value_bytes();
+        let cache = self.term_info_cache();
+        if let Some(info) = cache.lock().get(key).cloned() {
+            return Ok(info);
+        }
+        let info = self.termdict.get_async(key).await?;
+        cache.lock().put(key.to_vec(), info.clone());
+        Ok(info)
     }
 
     async fn get_term_range_async<'a, A: Automaton + 'a>(
@@ -516,5 +588,95 @@ impl InvertedIndexReader {
             .await?
             .map(|term_info| term_info.doc_freq)
             .unwrap_or(0u32))
+    }
+}
+
+#[cfg(all(test, feature = "quickwit"))]
+mod tests {
+    use super::*;
+    use crate::indexer::NoMergePolicy;
+    use crate::schema::{Schema, TEXT};
+    use crate::{Index, IndexWriter};
+
+    #[test]
+    fn term_info_cache_preserves_hits_misses_and_eviction() -> crate::Result<()> {
+        let mut schema = Schema::builder();
+        let first = schema.add_text_field("first", TEXT);
+        let second = schema.add_text_field("second", TEXT);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        writer.add_document(doc!(first => "rust", second => "memory"))?;
+        writer.commit()?;
+        writer.add_document(doc!(first => "memory", second => "rust"))?;
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        for segment in searcher.segment_readers() {
+            for field in [first, second] {
+                let reader = segment.inverted_index(field)?;
+                assert!(reader.term_info_cache.get().is_none());
+                let keys: Vec<_> = ["memory", "missing", "rust"]
+                    .iter()
+                    .map(|value| value.as_bytes())
+                    .collect();
+                for _ in 0..2 {
+                    let infos = reader.get_term_infos(SortedTermSlice::new(&keys).unwrap())?;
+                    for (key, info) in keys.iter().zip(infos) {
+                        assert_eq!(info, reader.terms().get(key)?);
+                        assert_eq!(
+                            reader.term_info_cache.get().unwrap().lock().peek(*key),
+                            Some(&info)
+                        );
+                    }
+                }
+                let mixed = [b"another".as_slice(), b"rust".as_slice()];
+                let infos = reader.get_term_infos(SortedTermSlice::new(&mixed).unwrap())?;
+                assert_eq!(infos, vec![None, reader.terms().get(b"rust")?]);
+                assert_eq!(
+                    reader
+                        .term_info_cache
+                        .get()
+                        .unwrap()
+                        .lock()
+                        .peek(b"another".as_slice()),
+                    Some(&None)
+                );
+                for value in ["rust", "memory", "missing"] {
+                    let term = Term::from_field_text(field, value);
+                    let expected = reader.terms().get(term.serialized_value_bytes())?;
+                    assert_eq!(
+                        futures::executor::block_on(reader.get_term_info_async(&term).boxed())?,
+                        expected
+                    );
+                    assert_eq!(reader.get_term_info(&term)?, expected);
+                    assert_eq!(
+                        futures::executor::block_on(reader.get_term_info_async(&term))?,
+                        expected
+                    );
+                    assert_eq!(
+                        reader
+                            .term_info_cache
+                            .get()
+                            .unwrap()
+                            .lock()
+                            .peek(value.as_bytes()),
+                        Some(&expected)
+                    );
+                }
+                let absent: Vec<_> = (0..130).map(|n| format!("absent{n:03}")).collect();
+                let keys: Vec<_> = absent.iter().map(|term| term.as_bytes()).collect();
+                let infos = reader.get_term_infos(SortedTermSlice::new(&keys).unwrap())?;
+                assert_eq!(infos, vec![None; keys.len()]);
+                let cache = reader.term_info_cache.get().unwrap();
+                assert_eq!(cache.lock().len(), 128);
+                assert!(!cache.lock().contains(b"rust".as_slice()));
+                let term = Term::from_field_text(field, "rust");
+                assert_eq!(
+                    reader.get_term_info(&term)?,
+                    reader.terms().get(term.serialized_value_bytes())?
+                );
+            }
+        }
+        Ok(())
     }
 }
