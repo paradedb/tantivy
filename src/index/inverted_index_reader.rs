@@ -20,6 +20,8 @@ use crate::directory::FileSlice;
 use crate::positions::PositionReader;
 use crate::postings::{BlockSegmentPostings, SegmentPostings, TermInfo};
 use crate::schema::{IndexRecordOption, Term, Type};
+#[cfg(feature = "quickwit")]
+use crate::termdict::SortedTermSlice;
 use crate::termdict::TermDictionary;
 
 /// The inverted index reader is in charge of accessing
@@ -134,6 +136,43 @@ impl InvertedIndexReader {
         #[cfg(feature = "quickwit")]
         cache.lock().put(key.to_vec(), info.clone());
         Ok(info)
+    }
+
+    /// Looks up sorted terms in a batch, retaining hits and misses for scorer creation.
+    #[cfg(feature = "quickwit")]
+    pub(crate) fn get_term_infos(
+        &self,
+        terms: SortedTermSlice<'_>,
+    ) -> io::Result<Vec<Option<TermInfo>>> {
+        let keys = terms.as_slice();
+        let cache = self
+            .term_info_cache
+            .get_or_init(|| Mutex::new(LruCache::new(std::num::NonZeroUsize::new(128).unwrap())));
+        let mut infos = vec![None; keys.len()];
+        let mut missing = Vec::new();
+        {
+            let mut cache = cache.lock();
+            for (index, key) in keys.iter().enumerate() {
+                if let Some(info) = cache.get(*key) {
+                    infos[index] = info.clone();
+                } else {
+                    missing.push(index);
+                }
+            }
+        }
+        if !missing.is_empty() {
+            let missing_keys: Vec<_> = missing.iter().map(|&index| keys[index]).collect();
+            let terms = SortedTermSlice::new_assume_sorted(&missing_keys);
+            for entry in self.termdict.batch_term_info_exact(terms) {
+                let (index, info) = entry?;
+                infos[missing[index]] = Some(info);
+            }
+            let mut cache = cache.lock();
+            for index in missing {
+                cache.put(keys[index].to_vec(), infos[index].clone());
+            }
+        }
+        Ok(infos)
     }
 
     /// Return the term dictionary datastructure.
@@ -577,6 +616,32 @@ mod tests {
             for field in [first, second] {
                 let reader = segment.inverted_index(field)?;
                 assert!(reader.term_info_cache.get().is_none());
+                let keys: Vec<_> = ["memory", "missing", "rust"]
+                    .iter()
+                    .map(|value| value.as_bytes())
+                    .collect();
+                for _ in 0..2 {
+                    let infos = reader.get_term_infos(SortedTermSlice::new(&keys).unwrap())?;
+                    for (key, info) in keys.iter().zip(infos) {
+                        assert_eq!(info, reader.terms().get(key)?);
+                        assert_eq!(
+                            reader.term_info_cache.get().unwrap().lock().peek(*key),
+                            Some(&info)
+                        );
+                    }
+                }
+                let mixed = [b"another".as_slice(), b"rust".as_slice()];
+                let infos = reader.get_term_infos(SortedTermSlice::new(&mixed).unwrap())?;
+                assert_eq!(infos, vec![None, reader.terms().get(b"rust")?]);
+                assert_eq!(
+                    reader
+                        .term_info_cache
+                        .get()
+                        .unwrap()
+                        .lock()
+                        .peek(b"another".as_slice()),
+                    Some(&None)
+                );
                 for value in ["rust", "memory", "missing"] {
                     let term = Term::from_field_text(field, value);
                     let expected = reader.terms().get(term.serialized_value_bytes())?;
@@ -599,11 +664,10 @@ mod tests {
                         Some(&expected)
                     );
                 }
-                for n in 0..130 {
-                    assert!(reader
-                        .get_term_info(&Term::from_field_text(field, &format!("absent{n}")))?
-                        .is_none());
-                }
+                let absent: Vec<_> = (0..130).map(|n| format!("absent{n:03}")).collect();
+                let keys: Vec<_> = absent.iter().map(|term| term.as_bytes()).collect();
+                let infos = reader.get_term_infos(SortedTermSlice::new(&keys).unwrap())?;
+                assert_eq!(infos, vec![None; keys.len()]);
                 let cache = reader.term_info_cache.get().unwrap();
                 assert_eq!(cache.lock().len(), 128);
                 assert!(!cache.lock().contains(b"rust".as_slice()));
