@@ -1,10 +1,11 @@
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use common::DateTime;
 
 use super::MonotonicallyMappableToU128;
-use crate::RowId;
+use crate::{ColumnValues, RowId};
 
 /// Monotonic maps a value to u64 value space.
 /// Monotonic mapping enables `PartialOrd` on u64 space without conversion to original space.
@@ -19,6 +20,23 @@ pub trait MonotonicallyMappableToU64: 'static + PartialOrd + Debug + Copy + Send
     /// Internally all fast field values are encoded as u64.
     /// **Note: To be used for converting encoded Term, Posting values.**
     fn from_u64(val: u64) -> Self;
+
+    /// Wraps a column reader of u64 internal values into a column reader of Self.
+    ///
+    /// By default, wraps the reader with `monotonic_map_column` using the inverse
+    /// of `StrictlyMonotonicMappingToInternal::<Self>::new()`.
+    ///
+    /// For `u64`, this is specialized to directly return `Arc::new(reader)` without
+    /// the wrapping overhead.
+    fn wrap_column<C: ColumnValues<u64> + 'static>(reader: C) -> Arc<dyn ColumnValues<Self>> {
+        let reader_typed = super::monotonic_map_column(
+            reader,
+            StrictlyMonotonicMappingInverter::from(
+                StrictlyMonotonicMappingToInternal::<Self>::new(),
+            ),
+        );
+        Arc::new(reader_typed)
+    }
 }
 
 /// Values need to be strictly monotonic mapped to a `Internal` value (u64 or u128) that can be
@@ -121,6 +139,11 @@ impl MonotonicallyMappableToU64 for u64 {
     #[inline(always)]
     fn from_u64(val: u64) -> Self {
         val
+    }
+
+    #[inline(always)]
+    fn wrap_column<C: ColumnValues<u64> + 'static>(reader: C) -> Arc<dyn ColumnValues<Self>> {
+        Arc::new(reader)
     }
 }
 

@@ -13,16 +13,13 @@ use std::sync::Arc;
 use common::BinarySerializable;
 use common::file_slice::FileSlice;
 
-use crate::column_values::monotonic_mapping::{
-    StrictlyMonotonicMappingInverter, StrictlyMonotonicMappingToInternal,
-};
+use crate::column_values::ColumnStats;
 pub use crate::column_values::u64_based::bitpacked::BitpackedCodec;
 pub use crate::column_values::u64_based::blockwise_linear::BlockwiseLinearCodec;
 #[cfg(feature = "paradedb")]
 pub(crate) use crate::column_values::u64_based::blockwise_linear_v2::BlockwiseLinearV2Codec;
 pub use crate::column_values::u64_based::linear::LinearCodec;
 pub use crate::column_values::u64_based::stats_collector::StatsCollector;
-use crate::column_values::{ColumnStats, monotonic_map_column};
 use crate::iterable::Iterable;
 use crate::{ColumnValues, MonotonicallyMappableToU64};
 
@@ -155,11 +152,7 @@ fn load_specific_codec<C: ColumnCodec, T: MonotonicallyMappableToU64>(
     file_slice: FileSlice,
 ) -> io::Result<Arc<dyn ColumnValues<T>>> {
     let reader = C::load(file_slice)?;
-    let reader_typed = monotonic_map_column(
-        reader,
-        StrictlyMonotonicMappingInverter::from(StrictlyMonotonicMappingToInternal::<T>::new()),
-    );
-    Ok(Arc::new(reader_typed))
+    Ok(T::wrap_column(reader))
 }
 
 impl CodecType {

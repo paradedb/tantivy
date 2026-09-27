@@ -313,14 +313,9 @@ impl BlockwiseLinearV2Reader {
             .expect("failed to read block meta");
         parse_block_meta(&entry)
     }
-}
 
-impl ColumnValues for BlockwiseLinearV2Reader {
     #[inline(always)]
-    fn get_val(&self, idx: u32) -> u64 {
-        let block_id = idx / BLOCK_SIZE;
-        let idx_within_block = idx % BLOCK_SIZE;
-        let mut cache = self.cache.0.borrow_mut();
+    fn load_block(&self, block_id: u32, cache: &mut CachedBlock) {
         if cache.block_id != block_id {
             let meta = self.block_meta(block_id as usize);
             let range = meta.data_byte_range(self.data.len());
@@ -333,6 +328,16 @@ impl ColumnValues for BlockwiseLinearV2Reader {
                 .read_bytes()
                 .expect("failed to read block data");
         }
+    }
+}
+
+impl ColumnValues for BlockwiseLinearV2Reader {
+    #[inline(always)]
+    fn get_val(&self, idx: u32) -> u64 {
+        let block_id = idx / BLOCK_SIZE;
+        let idx_within_block = idx % BLOCK_SIZE;
+        let mut cache = self.cache.0.borrow_mut();
+        self.load_block(block_id, &mut cache);
         let interpoled_val: u64 = cache.line.eval(idx_within_block);
         let bitpacked_diff = cache.bit_unpacker.get(idx_within_block, &cache.data);
         self.stats.min_value
@@ -341,6 +346,88 @@ impl ColumnValues for BlockwiseLinearV2Reader {
                 .gcd
                 .get()
                 .wrapping_mul(interpoled_val.wrapping_add(bitpacked_diff))
+    }
+
+    fn get_u32_vals(&self, indexes: &[u32], output: &mut [u32]) {
+        assert_eq!(indexes.len(), output.len());
+        if indexes.is_empty() {
+            return;
+        }
+
+        let min_value = self.stats.min_value;
+        let gcd = self.stats.gcd.get();
+        let mut cache = self.cache.0.borrow_mut();
+
+        debug_assert!(
+            indexes.windows(2).all(|w| w[0] <= w[1]),
+            "indexes must be sorted"
+        );
+
+        if indexes[0] > indexes[indexes.len() - 1] {
+            for (&idx, out) in indexes.iter().zip(output.iter_mut()) {
+                *out = self.get_val(idx) as u32;
+            }
+            return;
+        }
+
+        let mut residuals = [0u32; BLOCK_SIZE as usize];
+        let mut cur_idx = 0;
+        while cur_idx < indexes.len() {
+            let start_idx = cur_idx;
+            let block_id = indexes[start_idx] / BLOCK_SIZE;
+            let block_end_row = (block_id as u64 + 1) * BLOCK_SIZE as u64;
+
+            while cur_idx < indexes.len() && (indexes[cur_idx] as u64) < block_end_row {
+                cur_idx += 1;
+            }
+
+            let block_indexes = &indexes[start_idx..cur_idx];
+            let block_output = &mut output[start_idx..cur_idx];
+
+            self.load_block(block_id, &mut cache);
+
+            let line = cache.line;
+            let bit_width = cache.bit_unpacker.bit_width();
+
+            if bit_width == 0 {
+                if line.slope == 0 {
+                    let const_val = min_value.wrapping_add(gcd.wrapping_mul(line.intercept)) as u32;
+                    block_output.fill(const_val);
+                } else {
+                    for (&idx, out) in block_indexes.iter().zip(block_output.iter_mut()) {
+                        let idx_within_block = idx % BLOCK_SIZE;
+                        let interpoled_val = line.eval(idx_within_block);
+                        *out = min_value.wrapping_add(gcd.wrapping_mul(interpoled_val)) as u32;
+                    }
+                }
+            } else if bit_width <= 32 && block_indexes.len() >= 32 {
+                let num_rows_in_block =
+                    (self.stats.num_rows.saturating_sub(block_id * BLOCK_SIZE)).min(BLOCK_SIZE);
+                cache.bit_unpacker.get_batch_u32s(
+                    0,
+                    0,
+                    &cache.data,
+                    &mut residuals[..num_rows_in_block as usize],
+                );
+                for (&idx, out) in block_indexes.iter().zip(block_output.iter_mut()) {
+                    let idx_within_block = idx % BLOCK_SIZE;
+                    let interpoled_val = line.eval(idx_within_block);
+                    let diff = residuals[idx_within_block as usize] as u64;
+                    *out = min_value
+                        .wrapping_add(gcd.wrapping_mul(interpoled_val.wrapping_add(diff)))
+                        as u32;
+                }
+            } else {
+                for (&idx, out) in block_indexes.iter().zip(block_output.iter_mut()) {
+                    let idx_within_block = idx % BLOCK_SIZE;
+                    let interpoled_val = line.eval(idx_within_block);
+                    let diff = cache.bit_unpacker.get(idx_within_block, &cache.data);
+                    *out = min_value
+                        .wrapping_add(gcd.wrapping_mul(interpoled_val.wrapping_add(diff)))
+                        as u32;
+                }
+            }
+        }
     }
 
     fn get_row_ids_for_value_range(
