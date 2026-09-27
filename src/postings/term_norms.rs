@@ -1,9 +1,9 @@
-use std::cell::RefCell;
 use std::io::{self, Write};
 use std::sync::Arc;
 
 use common::{BinarySerializable, CountingWriter, HasLen};
 use once_cell::sync::OnceCell;
+use once_cell::unsync::OnceCell as LocalOnceCell;
 
 use crate::directory::{BufferedFileSlice, FileSlice, OwnedBytes};
 
@@ -152,7 +152,7 @@ pub(crate) struct TermNormReader {
     postings_offset: usize,
     norm_offset: Option<u64>,
     len: usize,
-    buffer: RefCell<Option<BufferedFileSlice>>,
+    buffer: LocalOnceCell<BufferedFileSlice>,
 }
 
 impl TermNormReader {
@@ -167,7 +167,7 @@ impl TermNormReader {
             postings_offset,
             norm_offset,
             len: len as usize,
-            buffer: RefCell::new(None),
+            buffer: LocalOnceCell::new(),
         }
     }
 
@@ -179,15 +179,19 @@ impl TermNormReader {
                 "posting norm ordinal out of bounds",
             ));
         }
-        let mut buffer = self.buffer.borrow_mut();
-        if buffer.is_none() {
-            *buffer = Some(BufferedFileSlice::new(
-                self.source
-                    .term_slice(self.postings_offset, self.len, self.norm_offset)?,
-                BUFFER_SIZE,
-            ));
-        }
-        buffer.as_ref().unwrap().read_byte(ordinal as u64)
+        self.buffer
+            .get_or_try_init(|| self.open_buffer())?
+            .read_byte(ordinal as u64)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn open_buffer(&self) -> io::Result<BufferedFileSlice> {
+        Ok(BufferedFileSlice::new(
+            self.source
+                .term_slice(self.postings_offset, self.len, self.norm_offset)?,
+            BUFFER_SIZE,
+        ))
     }
 }
 
