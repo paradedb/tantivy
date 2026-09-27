@@ -17,6 +17,7 @@ fn convert_fst_error(e: tantivy_fst::Error) -> io::Error {
 }
 
 const FST_VERSION: u32 = 1;
+const FST_PNORMS_VERSION: u32 = 2;
 
 /// Builder for the new term dictionary.
 ///
@@ -83,7 +84,12 @@ where W: Write
                 .serialize(&mut counting_writer)?;
             let footer_size = counting_writer.written_bytes();
             footer_size.serialize(&mut counting_writer)?;
-            FST_VERSION.serialize(&mut counting_writer)?;
+            let version = if self.term_info_store_writer.has_pnorms() {
+                FST_PNORMS_VERSION
+            } else {
+                FST_VERSION
+            };
+            version.serialize(&mut counting_writer)?;
         }
         Ok(file)
     }
@@ -127,7 +133,7 @@ impl TermDictionary {
         let mut footer_len_bytes = footer_len_slice.read_bytes()?;
         let footer_size = u64::deserialize(&mut footer_len_bytes)?;
         let version = u32::deserialize(&mut footer_len_bytes)?;
-        if version != FST_VERSION {
+        if version != FST_VERSION && version != FST_PNORMS_VERSION {
             return Err(io::Error::other(format!(
                 "Unsupported fst version, expected {version}, found {FST_VERSION}",
             )));
@@ -135,7 +141,8 @@ impl TermDictionary {
 
         let (fst_file_slice, values_file_slice) = main_slice.split_from_end(footer_size as usize);
         let fst_index = open_fst_index(fst_file_slice)?;
-        let term_info_store = TermInfoStore::open(values_file_slice)?;
+        let term_info_store =
+            TermInfoStore::open(values_file_slice, version == FST_PNORMS_VERSION)?;
         Ok(TermDictionary {
             fst_index: Arc::new(fst_index),
             term_info_store,

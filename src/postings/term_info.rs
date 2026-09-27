@@ -13,6 +13,8 @@ pub struct TermInfo {
     pub postings_range: Range<usize>,
     /// Byte range of the positions of this terms in the positions (`.pos`) file.
     pub positions_range: Range<usize>,
+    /// Byte offset of this term's norms in the field's `.pnorm` data, when enabled.
+    pub pnorms_offset: Option<u64>,
 }
 
 impl TermInfo {
@@ -34,11 +36,13 @@ impl FixedSize for TermInfo {
     /// This is large, but in practise, `TermInfo` are encoded in blocks and
     /// only the first `TermInfo` of a block is serialized uncompressed.
     /// The subsequent `TermInfo` are delta encoded and bitpacked.
-    const SIZE_IN_BYTES: usize = 3 * u32::SIZE_IN_BYTES + 2 * u64::SIZE_IN_BYTES;
+    const SIZE_IN_BYTES: usize = Self::LEGACY_SIZE_IN_BYTES + u64::SIZE_IN_BYTES;
 }
 
-impl BinarySerializable for TermInfo {
-    fn serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
+impl TermInfo {
+    pub(crate) const LEGACY_SIZE_IN_BYTES: usize = 3 * u32::SIZE_IN_BYTES + 2 * u64::SIZE_IN_BYTES;
+
+    pub(crate) fn serialize_legacy<W: io::Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
         self.doc_freq.serialize(writer)?;
         (self.postings_range.start as u64).serialize(writer)?;
         self.posting_num_bytes().serialize(writer)?;
@@ -47,7 +51,7 @@ impl BinarySerializable for TermInfo {
         Ok(())
     }
 
-    fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
+    pub(crate) fn deserialize_legacy<R: io::Read>(reader: &mut R) -> io::Result<Self> {
         let doc_freq = u32::deserialize(reader)?;
         let postings_start_offset = u64::deserialize(reader)? as usize;
         let postings_num_bytes = u32::deserialize(reader)? as usize;
@@ -59,7 +63,22 @@ impl BinarySerializable for TermInfo {
             doc_freq,
             postings_range: postings_start_offset..postings_end_offset,
             positions_range: positions_start_offset..positions_end_offset,
+            pnorms_offset: None,
         })
+    }
+}
+
+impl BinarySerializable for TermInfo {
+    fn serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
+        self.serialize_legacy(writer)?;
+        self.pnorms_offset.unwrap_or(u64::MAX).serialize(writer)
+    }
+
+    fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
+        let mut info = Self::deserialize_legacy(reader)?;
+        let offset = u64::deserialize(reader)?;
+        info.pnorms_offset = (offset != u64::MAX).then_some(offset);
+        Ok(info)
     }
 }
 

@@ -552,6 +552,7 @@ mod tests {
         assert_eq!(
             term_info,
             TermInfo {
+                pnorms_offset: None,
                 doc_freq: 1,
                 postings_range: 2..4,
                 positions_range: 2..5
@@ -591,6 +592,7 @@ mod tests {
         assert_eq!(
             term_info,
             TermInfo {
+                pnorms_offset: None,
                 doc_freq: 1,
                 postings_range: 0..1,
                 positions_range: 0..0

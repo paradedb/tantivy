@@ -2,7 +2,7 @@ use std::cmp;
 use std::io::{self, Read, Write};
 
 use byteorder::{ByteOrder, LittleEndian};
-use common::{BinarySerializable, FixedSize};
+use common::{BinarySerializable, FixedSize, HasLen};
 use tantivy_bitpacker::{compute_num_bits, BitPacker};
 
 use crate::directory::{FileSlice, OwnedBytes};
@@ -23,7 +23,7 @@ struct TermInfoBlockMeta {
 impl BinarySerializable for TermInfoBlockMeta {
     fn serialize<W: Write + ?Sized>(&self, write: &mut W) -> io::Result<()> {
         self.offset.serialize(write)?;
-        self.ref_term_info.serialize(write)?;
+        self.ref_term_info.serialize_legacy(write)?;
         write.write_all(&[
             self.doc_freq_nbits,
             self.postings_offset_nbits,
@@ -34,7 +34,7 @@ impl BinarySerializable for TermInfoBlockMeta {
 
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
         let offset = u64::deserialize(reader)?;
-        let ref_term_info = TermInfo::deserialize(reader)?;
+        let ref_term_info = TermInfo::deserialize_legacy(reader)?;
         let mut buffer = [0u8; 3];
         reader.read_exact(&mut buffer)?;
         Ok(TermInfoBlockMeta {
@@ -48,7 +48,7 @@ impl BinarySerializable for TermInfoBlockMeta {
 }
 
 impl FixedSize for TermInfoBlockMeta {
-    const SIZE_IN_BYTES: usize = u64::SIZE_IN_BYTES + TermInfo::SIZE_IN_BYTES + 3;
+    const SIZE_IN_BYTES: usize = u64::SIZE_IN_BYTES + TermInfo::LEGACY_SIZE_IN_BYTES + 3;
 }
 
 impl TermInfoBlockMeta {
@@ -88,6 +88,7 @@ impl TermInfoBlockMeta {
             doc_freq,
             postings_range: postings_start_offset..postings_end_offset,
             positions_range: positions_start_offset..positions_end_offset,
+            pnorms_offset: None,
         }
     }
 }
@@ -97,6 +98,7 @@ pub struct TermInfoStore {
     num_terms: usize,
     block_meta_bytes: OwnedBytes,
     term_info_bytes: OwnedBytes,
+    pnorms_offsets: Option<OwnedBytes>,
 }
 
 fn extract_bits(data: &[u8], addr_bits: usize, num_bits: u8) -> u64 {
@@ -121,17 +123,30 @@ fn extract_bits(data: &[u8], addr_bits: usize, num_bits: u8) -> u64 {
 }
 
 impl TermInfoStore {
-    pub fn open(term_info_store_file: FileSlice) -> io::Result<TermInfoStore> {
+    pub fn open(term_info_store_file: FileSlice, has_pnorms: bool) -> io::Result<TermInfoStore> {
         let (len_slice, main_slice) = term_info_store_file.split(16);
         let mut bytes = len_slice.read_bytes()?;
         let len = u64::deserialize(&mut bytes)? as usize;
         let num_terms = u64::deserialize(&mut bytes)? as usize;
         let (block_meta_file, term_info_file) = main_slice.split(len);
+        let (term_info_file, pnorms_offsets) = if has_pnorms {
+            let offsets_len = num_terms
+                .checked_mul(8)
+                .filter(|&len| len <= term_info_file.len())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "truncated pnorm offsets")
+                })?;
+            let (terms, offsets) = term_info_file.split_from_end(offsets_len);
+            (terms, Some(offsets.read_bytes()?))
+        } else {
+            (term_info_file, None)
+        };
         let term_info_bytes = term_info_file.read_bytes()?;
         Ok(TermInfoStore {
             num_terms,
             block_meta_bytes: block_meta_file.read_bytes()?,
             term_info_bytes,
+            pnorms_offsets,
         })
     }
 
@@ -142,14 +157,19 @@ impl TermInfoStore {
         let term_info_block_data = TermInfoBlockMeta::deserialize(&mut block_data)
             .expect("Failed to deserialize terminfoblockmeta");
         let inner_offset = (term_ord as usize) % BLOCK_LEN;
-        if inner_offset == 0 {
-            return term_info_block_data.ref_term_info;
+        let mut info = if inner_offset == 0 {
+            term_info_block_data.ref_term_info
+        } else {
+            term_info_block_data.deserialize_term_info(
+                &self.term_info_bytes[term_info_block_data.offset as usize..],
+                inner_offset - 1,
+            )
+        };
+        if let Some(offsets) = &self.pnorms_offsets {
+            let offset = LittleEndian::read_u64(&offsets[term_ord as usize * 8..]);
+            info.pnorms_offset = (offset != u64::MAX).then_some(offset);
         }
-        let term_info_data = self.term_info_bytes.as_slice();
-        term_info_block_data.deserialize_term_info(
-            &term_info_data[term_info_block_data.offset as usize..],
-            inner_offset - 1,
-        )
+        info
     }
 
     pub fn num_terms(&self) -> usize {
@@ -162,6 +182,7 @@ pub struct TermInfoStoreWriter {
     buffer_term_infos: Vec<u8>,
     term_infos: Vec<TermInfo>,
     num_terms: u64,
+    pnorms_offsets: Option<Vec<u64>>,
 }
 
 fn bitpack_serialize<W: Write>(
@@ -195,7 +216,12 @@ impl TermInfoStoreWriter {
             buffer_term_infos: Vec::new(),
             term_infos: Vec::with_capacity(BLOCK_LEN),
             num_terms: 0u64,
+            pnorms_offsets: None,
         }
+    }
+
+    pub fn has_pnorms(&self) -> bool {
+        self.pnorms_offsets.is_some()
     }
 
     fn flush_block(&mut self) -> io::Result<()> {
@@ -264,6 +290,12 @@ impl TermInfoStoreWriter {
     }
 
     pub fn write_term_info(&mut self, term_info: &TermInfo) -> io::Result<()> {
+        if term_info.pnorms_offset.is_some() && self.pnorms_offsets.is_none() {
+            self.pnorms_offsets = Some(vec![u64::MAX; self.num_terms as usize]);
+        }
+        if let Some(offsets) = &mut self.pnorms_offsets {
+            offsets.push(term_info.pnorms_offset.unwrap_or(u64::MAX));
+        }
         self.num_terms += 1u64;
         self.term_infos.push(term_info.clone());
         if self.term_infos.len() >= BLOCK_LEN {
@@ -281,6 +313,11 @@ impl TermInfoStoreWriter {
         self.num_terms.serialize(write)?;
         write.write_all(&self.buffer_block_metas)?;
         write.write_all(&self.buffer_term_infos)?;
+        if let Some(offsets) = &self.pnorms_offsets {
+            for offset in offsets {
+                offset.serialize(write)?;
+            }
+        }
         Ok(())
     }
 }
@@ -325,6 +362,7 @@ mod tests {
                 doc_freq: 512,
                 postings_range: 51..57,
                 positions_range: 110..134,
+                pnorms_offset: None,
             },
             doc_freq_nbits: 10,
             postings_offset_nbits: 5,
@@ -347,13 +385,14 @@ mod tests {
                 doc_freq: i as u32,
                 postings_range: offset(i)..offset(i + 1),
                 positions_range: offset(i) * 3..offset(i + 1) * 3,
+                pnorms_offset: None,
             };
             store_writer.write_term_info(&term_info)?;
             term_infos.push(term_info);
         }
         let mut buffer = Vec::new();
         store_writer.serialize(&mut buffer)?;
-        let term_info_store = TermInfoStore::open(FileSlice::from(buffer))?;
+        let term_info_store = TermInfoStore::open(FileSlice::from(buffer), false)?;
         for i in 0..1000 {
             assert_eq!(
                 term_info_store.get(i as u64),

@@ -2,7 +2,7 @@ use std::io;
 
 use common::VInt;
 
-use crate::directory::OwnedBytes;
+use crate::directory::{FileSlice, OwnedBytes};
 use crate::fieldnorm::FieldNormReader;
 use crate::postings::compression::{BlockDecoder, VIntDecoder, COMPRESSION_BLOCK_SIZE};
 use crate::postings::{BlockInfo, FreqReadingOption, SkipReader};
@@ -185,11 +185,15 @@ impl BlockSegmentPostings {
 
     pub(crate) fn set_term_norm_source(
         &mut self,
-        source: Option<std::sync::Arc<super::term_norms::PostingNormsReader>>,
-        postings_offset: usize,
+        source: Option<FileSlice>,
+        norm_offset: Option<u64>,
     ) {
         self.term_norms = source.map(|source| {
-            super::term_norms::TermNormReader::new(source, postings_offset, self.doc_freq)
+            super::term_norms::TermNormReader::new(
+                source,
+                norm_offset.unwrap_or(u64::MAX),
+                self.doc_freq,
+            )
         });
     }
 

@@ -58,6 +58,17 @@ use crate::postings::TermInfo;
 enum DictionaryType {
     Fst = 1,
     SSTable = 2,
+    FstWithPnorms = 3,
+    SSTableWithPnorms = 4,
+}
+
+impl DictionaryType {
+    fn with_pnorms(&self) -> Self {
+        match self {
+            Self::Fst | Self::FstWithPnorms => Self::FstWithPnorms,
+            Self::SSTable | Self::SSTableWithPnorms => Self::SSTableWithPnorms,
+        }
+    }
 }
 
 impl TryFrom<u32> for DictionaryType {
@@ -67,6 +78,8 @@ impl TryFrom<u32> for DictionaryType {
         match value {
             1 => Ok(DictionaryType::Fst),
             2 => Ok(DictionaryType::SSTable),
+            3 => Ok(DictionaryType::FstWithPnorms),
+            4 => Ok(DictionaryType::SSTableWithPnorms),
             _ => Err("Invalid value for DictionaryType"),
         }
     }
@@ -93,7 +106,7 @@ impl TermDictionary {
             io::Error::other(format!("Unsupported dictionary type, found {dict_type}"))
         })?;
 
-        if dict_type != CURRENT_TYPE {
+        if dict_type != CURRENT_TYPE && dict_type != CURRENT_TYPE.with_pnorms() {
             return Err(io::Error::other(format!(
                 "Unsupported dictionary type, compiled tantivy with {CURRENT_TYPE:?}, but got \
                  {dict_type:?}",
@@ -223,19 +236,26 @@ impl TermDictionary {
 }
 
 /// A TermDictionaryBuilder wrapping either an FST or a SSTable dictionary builder.
-pub struct TermDictionaryBuilder<W: io::Write>(InnerTermDictBuilder<W>);
+pub struct TermDictionaryBuilder<W: io::Write> {
+    inner: InnerTermDictBuilder<W>,
+    has_pnorms: bool,
+}
 
 impl<W: io::Write> TermDictionaryBuilder<W> {
     /// Creates a new `TermDictionaryBuilder`
     pub fn create(w: W) -> io::Result<Self> {
-        InnerTermDictBuilder::create(w).map(TermDictionaryBuilder)
+        InnerTermDictBuilder::create(w).map(|inner| Self {
+            inner,
+            has_pnorms: false,
+        })
     }
 
     /// Inserts a `(key, value)` pair in the term dictionary.
     ///
     /// *Keys have to be inserted in order.*
     pub fn insert<K: AsRef<[u8]>>(&mut self, key_ref: K, value: &TermInfo) -> io::Result<()> {
-        self.0.insert(key_ref, value)
+        self.has_pnorms |= value.pnorms_offset.is_some();
+        self.inner.insert(key_ref, value)
     }
 
     /// # Warning
@@ -246,21 +266,27 @@ impl<W: io::Write> TermDictionaryBuilder<W> {
     ///
     /// Prefer using `.insert(key, value)`
     pub fn insert_key(&mut self, key: &[u8]) -> io::Result<()> {
-        self.0.insert_key(key)
+        self.inner.insert_key(key)
     }
 
     /// # Warning
     ///
     /// Horribly dangerous internal API. See `.insert_key(...)`.
     pub fn insert_value(&mut self, term_info: &TermInfo) -> io::Result<()> {
-        self.0.insert_value(term_info)
+        self.has_pnorms |= term_info.pnorms_offset.is_some();
+        self.inner.insert_value(term_info)
     }
 
     /// Finalize writing the builder, and returns the underlying
     /// `Write` object.
     pub fn finish(self) -> io::Result<W> {
-        let mut writer = self.0.finish()?;
-        (CURRENT_TYPE as u32).serialize(&mut writer)?;
+        let mut writer = self.inner.finish()?;
+        let dict_type = if self.has_pnorms {
+            CURRENT_TYPE.with_pnorms()
+        } else {
+            CURRENT_TYPE
+        };
+        (dict_type as u32).serialize(&mut writer)?;
         Ok(writer)
     }
 }

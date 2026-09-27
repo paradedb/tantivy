@@ -529,7 +529,7 @@ mod test {
             .open_read(text)
             .unwrap();
         let bytes = field_file.len() as u64;
-        assert!(bytes > 2);
+        assert_eq!(bytes, 2);
         let norms = usage.segments()[0].component(SegmentComponent::PostingNorms);
         assert_eq!(norms.total(), bytes);
         let ComponentSpaceUsage::PerField(norms) = norms else {

@@ -143,6 +143,8 @@ impl SSTable for TermSSTable {
     type ValueWriter = TermInfoValueWriter;
 }
 
+const PNORMS_BLOCK_FLAG: u64 = 1 << 63;
+
 #[derive(Default)]
 pub struct TermInfoValueReader {
     term_infos: Vec<TermInfo>,
@@ -158,7 +160,9 @@ impl ValueReader for TermInfoValueReader {
 
     fn load(&mut self, mut data: &[u8]) -> io::Result<usize> {
         let len_before = data.len();
-        let num_els = VInt::deserialize_u64(&mut data)?;
+        let header = VInt::deserialize_u64(&mut data)?;
+        let has_pnorms = header & PNORMS_BLOCK_FLAG != 0;
+        let num_els = header & !PNORMS_BLOCK_FLAG;
         let mut postings_start = VInt::deserialize_u64(&mut data)? as usize;
         let mut positions_start = VInt::deserialize_u64(&mut data)? as usize;
 
@@ -168,12 +172,19 @@ impl ValueReader for TermInfoValueReader {
             let doc_freq = VInt::deserialize_u64(&mut data)? as u32;
             let postings_num_bytes = VInt::deserialize_u64(&mut data)?;
             let positions_num_bytes = VInt::deserialize_u64(&mut data)?;
+            let pnorms_offset = if has_pnorms {
+                let offset = VInt::deserialize_u64(&mut data)?;
+                (offset != u64::MAX).then_some(offset)
+            } else {
+                None
+            };
             let postings_end = postings_start + postings_num_bytes as usize;
             let positions_end = positions_start + positions_num_bytes as usize;
             let term_info = TermInfo {
                 doc_freq,
                 postings_range: postings_start..postings_end,
                 positions_range: positions_start..positions_end,
+                pnorms_offset,
             };
             self.term_infos.push(term_info);
             postings_start = postings_end;
@@ -197,7 +208,12 @@ impl ValueWriter for TermInfoValueWriter {
     }
 
     fn serialize_block(&self, buffer: &mut Vec<u8>) {
-        VInt(self.term_infos.len() as u64).serialize_into_vec(buffer);
+        let has_pnorms = self
+            .term_infos
+            .iter()
+            .any(|info| info.pnorms_offset.is_some());
+        let header = self.term_infos.len() as u64 | if has_pnorms { PNORMS_BLOCK_FLAG } else { 0 };
+        VInt(header).serialize_into_vec(buffer);
         if self.term_infos.is_empty() {
             return;
         }
@@ -207,6 +223,9 @@ impl ValueWriter for TermInfoValueWriter {
             VInt(term_info.doc_freq as u64).serialize_into_vec(buffer);
             VInt(term_info.postings_range.len() as u64).serialize_into_vec(buffer);
             VInt(term_info.positions_range.len() as u64).serialize_into_vec(buffer);
+            if has_pnorms {
+                VInt(term_info.pnorms_offset.unwrap_or(u64::MAX)).serialize_into_vec(buffer);
+            }
         }
     }
 
@@ -229,16 +248,19 @@ mod tests {
             doc_freq: 120u32,
             postings_range: 17..45,
             positions_range: 10..122,
+            pnorms_offset: None,
         });
         term_info_writer.write(&TermInfo {
             doc_freq: 10u32,
             postings_range: 45..450,
             positions_range: 122..1100,
+            pnorms_offset: None,
         });
         term_info_writer.write(&TermInfo {
             doc_freq: 17u32,
             postings_range: 450..462,
             positions_range: 1100..1302,
+            pnorms_offset: None,
         });
         let mut buffer = Vec::new();
         term_info_writer.serialize_block(&mut buffer);
@@ -247,6 +269,7 @@ mod tests {
         assert_eq!(
             term_info_reader.value(0),
             &TermInfo {
+                pnorms_offset: None,
                 doc_freq: 120u32,
                 postings_range: 17..45,
                 positions_range: 10..122
