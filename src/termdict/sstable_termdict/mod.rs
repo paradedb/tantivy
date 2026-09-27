@@ -170,6 +170,10 @@ impl ValueReader for TermInfoValueReader {
         };
         let mut postings_start = VInt::deserialize_u64(&mut data)? as usize;
         let mut positions_start = VInt::deserialize_u64(&mut data)? as usize;
+        let mut pnorms_offset = match version {
+            TermInfoVersion::V1 => None,
+            TermInfoVersion::V2 => Some(VInt::deserialize_u64(&mut data)?),
+        };
 
         self.term_infos.clear();
         self.term_infos.reserve_exact(num_els as usize);
@@ -177,13 +181,6 @@ impl ValueReader for TermInfoValueReader {
             let doc_freq = VInt::deserialize_u64(&mut data)? as u32;
             let postings_num_bytes = VInt::deserialize_u64(&mut data)?;
             let positions_num_bytes = VInt::deserialize_u64(&mut data)?;
-            let pnorms_offset = match version {
-                TermInfoVersion::V1 => None,
-                TermInfoVersion::V2 => {
-                    let offset = VInt::deserialize_u64(&mut data)?;
-                    (offset != u64::MAX).then_some(offset)
-                }
-            };
             let postings_end = postings_start + postings_num_bytes as usize;
             let positions_end = positions_start + positions_num_bytes as usize;
             let term_info = TermInfo {
@@ -195,6 +192,9 @@ impl ValueReader for TermInfoValueReader {
             self.term_infos.push(term_info);
             postings_start = postings_end;
             positions_start = positions_end;
+            if let Some(offset) = &mut pnorms_offset {
+                *offset += u64::from(doc_freq);
+            }
         }
         let consumed_len = len_before - data.len();
         Ok(consumed_len)
@@ -228,12 +228,19 @@ impl ValueWriter for TermInfoValueWriter {
         }
         VInt(self.term_infos[0].postings_range.start as u64).serialize_into_vec(buffer);
         VInt(self.term_infos[0].positions_range.start as u64).serialize_into_vec(buffer);
+        let mut pnorms_offset = self.term_infos[0].pnorms_offset;
+        if has_pnorms {
+            // One norm byte per document makes each next offset implicit in doc_freq.
+            VInt(pnorms_offset.expect("posting norms must be enabled for every term"))
+                .serialize_into_vec(buffer);
+        }
         for term_info in &self.term_infos {
             VInt(term_info.doc_freq as u64).serialize_into_vec(buffer);
             VInt(term_info.postings_range.len() as u64).serialize_into_vec(buffer);
             VInt(term_info.positions_range.len() as u64).serialize_into_vec(buffer);
-            if has_pnorms {
-                VInt(term_info.pnorms_offset.unwrap_or(u64::MAX)).serialize_into_vec(buffer);
+            assert_eq!(term_info.pnorms_offset, pnorms_offset);
+            if let Some(offset) = &mut pnorms_offset {
+                *offset += u64::from(term_info.doc_freq);
             }
         }
     }
@@ -261,6 +268,32 @@ mod tests {
         let error = TermInfoValueReader::default().load(&bytes).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("version 3"));
+    }
+
+    #[test]
+    fn norm_offset_overhead_is_constant_per_block() {
+        let mut overhead = None;
+        for count in [1, 64, 1_024] {
+            let mut plain = super::TermInfoValueWriter::default();
+            let mut norms = super::TermInfoValueWriter::default();
+            for i in 0..count {
+                let mut info = TermInfo {
+                    doc_freq: 1,
+                    postings_range: i * 4..(i + 1) * 4,
+                    positions_range: i..i + 1,
+                    pnorms_offset: None,
+                };
+                plain.write(&info);
+                info.pnorms_offset = Some((1 << 40) + i as u64);
+                norms.write(&info);
+            }
+            let mut plain_bytes = Vec::new();
+            let mut norm_bytes = Vec::new();
+            plain.serialize_block(&mut plain_bytes);
+            norms.serialize_block(&mut norm_bytes);
+            let extra_bytes = norm_bytes.len() - plain_bytes.len();
+            assert_eq!(*overhead.get_or_insert(extra_bytes), extra_bytes);
+        }
     }
 
     #[test]

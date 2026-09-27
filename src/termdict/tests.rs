@@ -456,44 +456,47 @@ fn v1_dictionary_remains_readable_and_byte_identical() -> crate::Result<()> {
 
 #[test]
 fn dictionary_preserves_norm_offsets_in_lookups_and_streams() -> crate::Result<()> {
-    let keys: Vec<_> = (0..1_000).map(|i| format!("term{i:04}")).collect();
-    let infos: Vec<_> = (0..1_000)
-        .map(|i| {
-            let mut info = make_term_info(i);
-            info.pnorms_offset =
-                (i % 5 != 1).then_some(i * 719 + if i >= 500 { 1 << 40 } else { 0 });
-            info
-        })
-        .collect();
-    let mut writer = TermDictionaryBuilder::create(Vec::new())?;
-    for (key, info) in keys.iter().zip(&infos) {
-        writer.insert(key, info)?;
-    }
-    let bytes = writer.finish()?;
-    let tag = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
-    assert_eq!(tag, super::VERSIONED_FOOTER_MAGIC);
-    let dictionary = TermDictionary::open(FileSlice::from(bytes))?;
-    let mut stream = dictionary.stream()?;
-    for (key, info) in keys.iter().zip(&infos) {
-        assert_eq!(dictionary.get(key)?, Some(info.clone()));
-        assert!(stream.advance());
-        assert_eq!(stream.key(), key.as_bytes());
-        assert_eq!(stream.value(), info);
+    for initial_offset in [0, 1 << 40] {
+        let mut offset = initial_offset;
+        let keys: Vec<_> = (0..1_000).map(|i| format!("term{i:04}")).collect();
+        let infos: Vec<_> = (0..1_000)
+            .map(|i| {
+                let mut info = make_term_info(i);
+                info.pnorms_offset = Some(offset);
+                offset += u64::from(info.doc_freq);
+                info
+            })
+            .collect();
+        let mut writer = TermDictionaryBuilder::create(Vec::new())?;
+        for (key, info) in keys.iter().zip(&infos) {
+            writer.insert(key, info)?;
+        }
+        let bytes = writer.finish()?;
+        let tag = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
+        assert_eq!(tag, super::VERSIONED_FOOTER_MAGIC);
+        let dictionary = TermDictionary::open(FileSlice::from(bytes))?;
+        let mut stream = dictionary.stream()?;
+        for (key, info) in keys.iter().zip(&infos) {
+            assert_eq!(dictionary.get(key)?, Some(info.clone()));
+            assert!(stream.advance());
+            assert_eq!(stream.key(), key.as_bytes());
+            assert_eq!(stream.value(), info);
+            #[cfg(feature = "quickwit")]
+            assert_eq!(
+                futures::executor::block_on(dictionary.get_async(key))?,
+                Some(info.clone())
+            );
+        }
+        assert!(!stream.advance());
+        assert!(dictionary.get("absent")?.is_none());
         #[cfg(feature = "quickwit")]
-        assert_eq!(
-            futures::executor::block_on(dictionary.get_async(key))?,
-            Some(info.clone())
-        );
-    }
-    assert!(!stream.advance());
-    assert!(dictionary.get("absent")?.is_none());
-    #[cfg(feature = "quickwit")]
-    {
-        let keys = super::SortedTermSlice::new(&keys).unwrap();
-        let batch: Vec<_> = dictionary
-            .batch_term_info_exact(keys)
-            .collect::<io::Result<_>>()?;
-        assert_eq!(batch, infos.into_iter().enumerate().collect::<Vec<_>>());
+        {
+            let keys = super::SortedTermSlice::new(&keys).unwrap();
+            let batch: Vec<_> = dictionary
+                .batch_term_info_exact(keys)
+                .collect::<io::Result<_>>()?;
+            assert_eq!(batch, infos.into_iter().enumerate().collect::<Vec<_>>());
+        }
     }
     Ok(())
 }
