@@ -143,8 +143,8 @@ impl SSTable for TermSSTable {
     type ValueWriter = TermInfoValueWriter;
 }
 
-// Nonempty V1 blocks start with their term count; zero introduces a versioned header.
-const VERSIONED_BLOCK: u64 = 0;
+// V1 blocks start with their term count; reserve an impossible count for versioned blocks.
+const VERSIONED_BLOCK: u64 = u64::MAX;
 
 #[derive(Default)]
 pub struct TermInfoValueReader {
@@ -168,6 +168,10 @@ impl ValueReader for TermInfoValueReader {
         } else {
             (TermInfoVersion::V1, header)
         };
+        self.term_infos.clear();
+        if num_els == 0 {
+            return Ok(len_before - data.len());
+        }
         let mut postings_start = VInt::deserialize_u64(&mut data)? as usize;
         let mut positions_start = VInt::deserialize_u64(&mut data)? as usize;
         let mut pnorms_offset = match version {
@@ -175,7 +179,6 @@ impl ValueReader for TermInfoValueReader {
             TermInfoVersion::V2 => Some(VInt::deserialize_u64(&mut data)?),
         };
 
-        self.term_infos.clear();
         self.term_infos.reserve_exact(num_els as usize);
         for _ in 0..num_els {
             let doc_freq = VInt::deserialize_u64(&mut data)? as u32;
@@ -259,6 +262,22 @@ mod tests {
 
     use crate::postings::TermInfo;
     use crate::termdict::sstable_termdict::TermInfoValueReader;
+
+    #[test]
+    fn empty_block_clears_previous_values() {
+        let mut writer = super::TermInfoValueWriter::default();
+        let mut reader = TermInfoValueReader::default();
+        writer.write(&TermInfo::default());
+        let mut bytes = Vec::new();
+        writer.serialize_block(&mut bytes);
+        reader.load(&bytes).unwrap();
+        assert_eq!(reader.term_infos.len(), 1);
+        writer.clear();
+        bytes.clear();
+        writer.serialize_block(&mut bytes);
+        assert_eq!(reader.load(&bytes).unwrap(), bytes.len());
+        assert!(reader.term_infos.is_empty());
+    }
 
     #[test]
     fn rejects_unknown_block_version() {

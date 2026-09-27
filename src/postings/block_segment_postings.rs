@@ -188,12 +188,8 @@ impl BlockSegmentPostings {
         source: Option<FileSlice>,
         norm_offset: Option<u64>,
     ) {
-        self.term_norms = source.map(|source| {
-            super::term_norms::TermNormReader::new(
-                source,
-                norm_offset.unwrap_or(u64::MAX),
-                self.doc_freq,
-            )
+        self.term_norms = source.zip(norm_offset).map(|(source, offset)| {
+            super::term_norms::TermNormReader::new(source, offset, self.doc_freq)
         });
     }
 
@@ -481,6 +477,7 @@ mod tests {
     use common::HasLen;
 
     use super::BlockSegmentPostings;
+    use crate::directory::FileSlice;
     use crate::docset::{DocSet, TERMINATED};
     use crate::index::Index;
     use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
@@ -488,6 +485,22 @@ mod tests {
     use crate::postings::SegmentPostings;
     use crate::schema::{IndexRecordOption, Schema, Term, INDEXED};
     use crate::DocId;
+
+    #[test]
+    fn term_norms_require_source_and_offset() {
+        let source = FileSlice::from(vec![7u8]);
+        let mut postings = BlockSegmentPostings::empty();
+        for (file, offset) in [
+            (Some(source.clone()), Some(0)),
+            (Some(source.clone()), None),
+            (None, Some(0)),
+            (None, None),
+        ] {
+            let present = file.is_some() && offset.is_some();
+            postings.set_term_norm_source(file, offset);
+            assert_eq!(postings.term_norms.is_some(), present);
+        }
+    }
 
     #[test]
     fn test_empty_segment_postings() {
