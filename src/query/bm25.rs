@@ -83,9 +83,10 @@ impl Bm25StatisticsProvider for Searcher {
                 let reader = segment.inverted_index(field)?;
                 if batch_lookup {
                     let keys = crate::termdict::SortedTermSlice::new_assume_sorted(&keys);
-                    for entry in reader.terms().batch_term_info_exact(keys) {
-                        let (index, info) = entry?;
-                        doc_freqs[start + index] += u64::from(info.doc_freq);
+                    for (index, info) in reader.get_term_infos(keys)?.into_iter().enumerate() {
+                        if let Some(info) = info {
+                            doc_freqs[start + index] += u64::from(info.doc_freq);
+                        }
                     }
                 } else {
                     for (term, doc_freq) in sorted_terms[start..end]
