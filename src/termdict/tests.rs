@@ -432,11 +432,11 @@ fn test_automaton_search() -> crate::Result<()> {
 }
 
 #[test]
-fn legacy_dictionary_remains_readable_and_byte_identical() -> crate::Result<()> {
+fn v1_dictionary_remains_readable_and_byte_identical() -> crate::Result<()> {
     #[cfg(feature = "quickwit")]
-    let bytes = include_bytes!("testdata/legacy-sstable.term").as_slice();
+    let bytes = include_bytes!("testdata/v1-sstable.term").as_slice();
     #[cfg(not(feature = "quickwit"))]
-    let bytes = include_bytes!("testdata/legacy-fst.term").as_slice();
+    let bytes = include_bytes!("testdata/v1-fst.term").as_slice();
     let dictionary = TermDictionary::open(FileSlice::from(bytes.to_vec()))?;
     let mut writer = TermDictionaryBuilder::create(Vec::new())?;
     for i in 0..300usize {
@@ -471,7 +471,7 @@ fn dictionary_preserves_norm_offsets_in_lookups_and_streams() -> crate::Result<(
     }
     let bytes = writer.finish()?;
     let tag = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
-    assert_eq!(tag, super::CURRENT_TYPE.with_pnorms() as u32);
+    assert_eq!(tag, super::VERSIONED_FOOTER_MAGIC);
     let dictionary = TermDictionary::open(FileSlice::from(bytes))?;
     let mut stream = dictionary.stream()?;
     for (key, info) in keys.iter().zip(&infos) {
@@ -496,4 +496,30 @@ fn dictionary_preserves_norm_offsets_in_lookups_and_streams() -> crate::Result<(
         assert_eq!(batch, infos.into_iter().enumerate().collect::<Vec<_>>());
     }
     Ok(())
+}
+
+#[test]
+fn dictionary_rejects_unknown_versions() -> crate::Result<()> {
+    let mut writer = TermDictionaryBuilder::create(Vec::new())?;
+    let mut info = make_term_info(1);
+    info.pnorms_offset = Some(0);
+    writer.insert("term", &info)?;
+    let mut bytes = writer.finish()?;
+    let version_offset = bytes.len() - 8;
+    bytes[version_offset..version_offset + 4].copy_from_slice(&3u32.to_le_bytes());
+    let error = TermDictionary::open(FileSlice::from(bytes)).err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("version 3"));
+    Ok(())
+}
+
+#[test]
+fn dictionary_rejects_truncated_footer() {
+    for bytes in [
+        Vec::new(),
+        super::VERSIONED_FOOTER_MAGIC.to_le_bytes().to_vec(),
+    ] {
+        let error = TermDictionary::open(FileSlice::from(bytes)).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
 }

@@ -4,7 +4,7 @@ mod merger;
 
 use std::iter::ExactSizeIterator;
 
-use common::VInt;
+use common::{BinarySerializable, VInt};
 use sstable::streamer::StreamerWithState;
 use sstable::value::{ValueReader, ValueWriter};
 use sstable::SSTable;
@@ -12,7 +12,7 @@ use tantivy_fst::automaton::AlwaysMatch;
 use tantivy_fst::Automaton;
 
 pub use self::merger::TermMerger;
-use crate::postings::TermInfo;
+use crate::postings::{TermInfo, TermInfoVersion};
 
 pub struct TermWithStateStreamerBuilder<'a, A>
 where
@@ -143,7 +143,8 @@ impl SSTable for TermSSTable {
     type ValueWriter = TermInfoValueWriter;
 }
 
-const PNORMS_BLOCK_FLAG: u64 = 1 << 63;
+// Nonempty V1 blocks start with their term count; zero introduces a versioned header.
+const VERSIONED_BLOCK: u64 = 0;
 
 #[derive(Default)]
 pub struct TermInfoValueReader {
@@ -161,8 +162,12 @@ impl ValueReader for TermInfoValueReader {
     fn load(&mut self, mut data: &[u8]) -> io::Result<usize> {
         let len_before = data.len();
         let header = VInt::deserialize_u64(&mut data)?;
-        let has_pnorms = header & PNORMS_BLOCK_FLAG != 0;
-        let num_els = header & !PNORMS_BLOCK_FLAG;
+        let (version, num_els) = if header == VERSIONED_BLOCK {
+            let version = TermInfoVersion::deserialize(&mut data)?;
+            (version, VInt::deserialize_u64(&mut data)?)
+        } else {
+            (TermInfoVersion::V1, header)
+        };
         let mut postings_start = VInt::deserialize_u64(&mut data)? as usize;
         let mut positions_start = VInt::deserialize_u64(&mut data)? as usize;
 
@@ -172,11 +177,12 @@ impl ValueReader for TermInfoValueReader {
             let doc_freq = VInt::deserialize_u64(&mut data)? as u32;
             let postings_num_bytes = VInt::deserialize_u64(&mut data)?;
             let positions_num_bytes = VInt::deserialize_u64(&mut data)?;
-            let pnorms_offset = if has_pnorms {
-                let offset = VInt::deserialize_u64(&mut data)?;
-                (offset != u64::MAX).then_some(offset)
-            } else {
-                None
+            let pnorms_offset = match version {
+                TermInfoVersion::V1 => None,
+                TermInfoVersion::V2 => {
+                    let offset = VInt::deserialize_u64(&mut data)?;
+                    (offset != u64::MAX).then_some(offset)
+                }
             };
             let postings_end = postings_start + postings_num_bytes as usize;
             let positions_end = positions_start + positions_num_bytes as usize;
@@ -212,8 +218,11 @@ impl ValueWriter for TermInfoValueWriter {
             .term_infos
             .iter()
             .any(|info| info.pnorms_offset.is_some());
-        let header = self.term_infos.len() as u64 | if has_pnorms { PNORMS_BLOCK_FLAG } else { 0 };
-        VInt(header).serialize_into_vec(buffer);
+        if has_pnorms {
+            VInt(VERSIONED_BLOCK).serialize_into_vec(buffer);
+            TermInfoVersion::V2.serialize(buffer).unwrap();
+        }
+        VInt(self.term_infos.len() as u64).serialize_into_vec(buffer);
         if self.term_infos.is_empty() {
             return;
         }
@@ -236,10 +245,23 @@ impl ValueWriter for TermInfoValueWriter {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
+    use common::{BinarySerializable, VInt};
     use sstable::value::{ValueReader, ValueWriter};
 
     use crate::postings::TermInfo;
     use crate::termdict::sstable_termdict::TermInfoValueReader;
+
+    #[test]
+    fn rejects_unknown_block_version() {
+        let mut bytes = Vec::new();
+        VInt(super::VERSIONED_BLOCK).serialize_into_vec(&mut bytes);
+        3u32.serialize(&mut bytes).unwrap();
+        let error = TermInfoValueReader::default().load(&bytes).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("version 3"));
+    }
 
     #[test]
     fn test_block_terminfos() {

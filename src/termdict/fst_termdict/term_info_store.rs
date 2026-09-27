@@ -6,7 +6,7 @@ use common::{BinarySerializable, FixedSize, HasLen};
 use tantivy_bitpacker::{compute_num_bits, BitPacker};
 
 use crate::directory::{FileSlice, OwnedBytes};
-use crate::postings::TermInfo;
+use crate::postings::{TermInfo, TermInfoVersion};
 use crate::termdict::TermOrdinal;
 
 const BLOCK_LEN: usize = 256;
@@ -23,7 +23,8 @@ struct TermInfoBlockMeta {
 impl BinarySerializable for TermInfoBlockMeta {
     fn serialize<W: Write + ?Sized>(&self, write: &mut W) -> io::Result<()> {
         self.offset.serialize(write)?;
-        self.ref_term_info.serialize_legacy(write)?;
+        self.ref_term_info
+            .serialize_versioned(write, TermInfoVersion::V1)?;
         write.write_all(&[
             self.doc_freq_nbits,
             self.postings_offset_nbits,
@@ -34,7 +35,7 @@ impl BinarySerializable for TermInfoBlockMeta {
 
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
         let offset = u64::deserialize(reader)?;
-        let ref_term_info = TermInfo::deserialize_legacy(reader)?;
+        let ref_term_info = TermInfo::deserialize_versioned(reader, TermInfoVersion::V1)?;
         let mut buffer = [0u8; 3];
         reader.read_exact(&mut buffer)?;
         Ok(TermInfoBlockMeta {
@@ -48,7 +49,7 @@ impl BinarySerializable for TermInfoBlockMeta {
 }
 
 impl FixedSize for TermInfoBlockMeta {
-    const SIZE_IN_BYTES: usize = u64::SIZE_IN_BYTES + TermInfo::LEGACY_SIZE_IN_BYTES + 3;
+    const SIZE_IN_BYTES: usize = u64::SIZE_IN_BYTES + TermInfoVersion::V1.serialized_size() + 3;
 }
 
 impl TermInfoBlockMeta {
@@ -123,23 +124,27 @@ fn extract_bits(data: &[u8], addr_bits: usize, num_bits: u8) -> u64 {
 }
 
 impl TermInfoStore {
-    pub fn open(term_info_store_file: FileSlice, has_pnorms: bool) -> io::Result<TermInfoStore> {
+    pub fn open(
+        term_info_store_file: FileSlice,
+        version: TermInfoVersion,
+    ) -> io::Result<TermInfoStore> {
         let (len_slice, main_slice) = term_info_store_file.split(16);
         let mut bytes = len_slice.read_bytes()?;
         let len = u64::deserialize(&mut bytes)? as usize;
         let num_terms = u64::deserialize(&mut bytes)? as usize;
         let (block_meta_file, term_info_file) = main_slice.split(len);
-        let (term_info_file, pnorms_offsets) = if has_pnorms {
-            let offsets_len = num_terms
-                .checked_mul(8)
-                .filter(|&len| len <= term_info_file.len())
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "truncated pnorm offsets")
-                })?;
-            let (terms, offsets) = term_info_file.split_from_end(offsets_len);
-            (terms, Some(offsets.read_bytes()?))
-        } else {
-            (term_info_file, None)
+        let (term_info_file, pnorms_offsets) = match version {
+            TermInfoVersion::V1 => (term_info_file, None),
+            TermInfoVersion::V2 => {
+                let offsets_len = num_terms
+                    .checked_mul(8)
+                    .filter(|&len| len <= term_info_file.len())
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "truncated pnorm offsets")
+                    })?;
+                let (terms, offsets) = term_info_file.split_from_end(offsets_len);
+                (terms, Some(offsets.read_bytes()?))
+            }
         };
         let term_info_bytes = term_info_file.read_bytes()?;
         Ok(TermInfoStore {
@@ -330,7 +335,7 @@ mod tests {
 
     use super::{extract_bits, TermInfoBlockMeta, TermInfoStore, TermInfoStoreWriter};
     use crate::directory::FileSlice;
-    use crate::postings::TermInfo;
+    use crate::postings::{TermInfo, TermInfoVersion};
 
     #[test]
     fn test_term_info_block() {
@@ -392,7 +397,7 @@ mod tests {
         }
         let mut buffer = Vec::new();
         store_writer.serialize(&mut buffer)?;
-        let term_info_store = TermInfoStore::open(FileSlice::from(buffer), false)?;
+        let term_info_store = TermInfoStore::open(FileSlice::from(buffer), TermInfoVersion::V1)?;
         for i in 0..1000 {
             assert_eq!(
                 term_info_store.get(i as u64),

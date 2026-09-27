@@ -37,7 +37,7 @@ pub type TermOrdinal = u64;
 use std::io;
 
 use common::file_slice::FileSlice;
-use common::BinarySerializable;
+use common::{BinarySerializable, HasLen};
 #[cfg(feature = "quickwit")]
 pub use sstable::{sort_and_dedupe_terms, BatchedTermInfoIter, SortedTermSlice};
 use tantivy_fst::Automaton;
@@ -51,24 +51,13 @@ use self::termdict::{
     TermStreamerBuilder, TermWithStateStreamerBuilder,
 };
 pub use self::termdict::{TermMerger, TermStreamer, TermWithStateStreamer};
-use crate::postings::TermInfo;
+use crate::postings::{TermInfo, TermInfoVersion};
 
 #[derive(Debug, Eq, PartialEq)]
 #[repr(u32)]
 enum DictionaryType {
     Fst = 1,
     SSTable = 2,
-    FstWithPnorms = 3,
-    SSTableWithPnorms = 4,
-}
-
-impl DictionaryType {
-    fn with_pnorms(&self) -> Self {
-        match self {
-            Self::Fst | Self::FstWithPnorms => Self::FstWithPnorms,
-            Self::SSTable | Self::SSTableWithPnorms => Self::SSTableWithPnorms,
-        }
-    }
 }
 
 impl TryFrom<u32> for DictionaryType {
@@ -78,12 +67,13 @@ impl TryFrom<u32> for DictionaryType {
         match value {
             1 => Ok(DictionaryType::Fst),
             2 => Ok(DictionaryType::SSTable),
-            3 => Ok(DictionaryType::FstWithPnorms),
-            4 => Ok(DictionaryType::SSTableWithPnorms),
             _ => Err("Invalid value for DictionaryType"),
         }
     }
 }
+
+// V2+ footers contain the backend, metadata version, and this marker.
+const VERSIONED_FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"TDIC");
 
 #[cfg(not(feature = "quickwit"))]
 const CURRENT_TYPE: DictionaryType = DictionaryType::Fst;
@@ -99,14 +89,35 @@ pub struct TermDictionary(InnerTermDict);
 impl TermDictionary {
     /// Opens a `TermDictionary`.
     pub fn open(file: FileSlice) -> io::Result<Self> {
-        let (main_slice, dict_type) = file.split_from_end(4);
-        let mut dict_type = dict_type.read_bytes()?;
-        let dict_type = u32::deserialize(&mut dict_type)?;
+        if file.len() < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "missing dictionary footer",
+            ));
+        }
+        let footer = file
+            .slice_from(file.len().saturating_sub(12))
+            .read_bytes()?;
+        let dict_type = u32::deserialize(&mut &footer[footer.len() - 4..])?;
+        let (dict_type, footer_len) = if dict_type == VERSIONED_FOOTER_MAGIC {
+            if footer.len() < 12 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated dictionary footer",
+                ));
+            }
+            let mut footer = &footer[..8];
+            let dict_type = u32::deserialize(&mut footer)?;
+            TermInfoVersion::deserialize(&mut footer)?;
+            (dict_type, 12)
+        } else {
+            (dict_type, 4)
+        };
         let dict_type = DictionaryType::try_from(dict_type).map_err(|_| {
             io::Error::other(format!("Unsupported dictionary type, found {dict_type}"))
         })?;
-
-        if dict_type != CURRENT_TYPE && dict_type != CURRENT_TYPE.with_pnorms() {
+        let (main_slice, _) = file.split_from_end(footer_len);
+        if dict_type != CURRENT_TYPE {
             return Err(io::Error::other(format!(
                 "Unsupported dictionary type, compiled tantivy with {CURRENT_TYPE:?}, but got \
                  {dict_type:?}",
@@ -281,12 +292,11 @@ impl<W: io::Write> TermDictionaryBuilder<W> {
     /// `Write` object.
     pub fn finish(self) -> io::Result<W> {
         let mut writer = self.inner.finish()?;
-        let dict_type = if self.has_pnorms {
-            CURRENT_TYPE.with_pnorms()
-        } else {
-            CURRENT_TYPE
-        };
-        (dict_type as u32).serialize(&mut writer)?;
+        (CURRENT_TYPE as u32).serialize(&mut writer)?;
+        if self.has_pnorms {
+            TermInfoVersion::V2.serialize(&mut writer)?;
+            VERSIONED_FOOTER_MAGIC.serialize(&mut writer)?;
+        }
         Ok(writer)
     }
 }
