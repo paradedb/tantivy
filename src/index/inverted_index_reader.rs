@@ -125,9 +125,7 @@ impl InvertedIndexReader {
     pub fn get_term_info(&self, term: &Term) -> io::Result<Option<TermInfo>> {
         let key = term.serialized_value_bytes();
         #[cfg(feature = "quickwit")]
-        let cache = self
-            .term_info_cache
-            .get_or_init(|| Mutex::new(LruCache::new(std::num::NonZeroUsize::new(128).unwrap())));
+        let cache = self.term_info_cache();
         #[cfg(feature = "quickwit")]
         if let Some(info) = cache.lock().get(key).cloned() {
             return Ok(info);
@@ -145,9 +143,7 @@ impl InvertedIndexReader {
         terms: SortedTermSlice<'_>,
     ) -> io::Result<Vec<Option<TermInfo>>> {
         let keys = terms.as_slice();
-        let cache = self
-            .term_info_cache
-            .get_or_init(|| Mutex::new(LruCache::new(std::num::NonZeroUsize::new(128).unwrap())));
+        let cache = self.term_info_cache();
         let mut infos = vec![None; keys.len()];
         let mut missing = Vec::new();
         {
@@ -371,11 +367,14 @@ impl InvertedIndexReader {
 
 #[cfg(feature = "quickwit")]
 impl InvertedIndexReader {
+    fn term_info_cache(&self) -> &Mutex<LruCache<Vec<u8>, Option<TermInfo>>> {
+        self.term_info_cache
+            .get_or_init(|| Mutex::new(LruCache::new(std::num::NonZeroUsize::new(128).unwrap())))
+    }
+
     pub(crate) async fn get_term_info_async(&self, term: &Term) -> io::Result<Option<TermInfo>> {
         let key = term.serialized_value_bytes();
-        let cache = self
-            .term_info_cache
-            .get_or_init(|| Mutex::new(LruCache::new(std::num::NonZeroUsize::new(128).unwrap())));
+        let cache = self.term_info_cache();
         if let Some(info) = cache.lock().get(key).cloned() {
             return Ok(info);
         }
