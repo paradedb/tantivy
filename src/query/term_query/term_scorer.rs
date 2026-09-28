@@ -192,11 +192,15 @@ impl DocSet for TermScorer {
 impl Scorer for TermScorer {
     #[inline]
     fn score(&mut self) -> Score {
-        let term_freq = self.term_freq();
         if self.postings.block_cursor.has_term_norms() {
-            let fieldnorm = self.fieldnorm();
+            let offset = self.postings.block_offset();
+            let (term_freq, fieldnorm) = self
+                .postings
+                .block_cursor
+                .term_freq_and_fieldnorm_at_mut(offset);
             self.similarity_weight.score_fieldnorm(fieldnorm, term_freq)
         } else {
+            let term_freq = self.term_freq();
             let fieldnorm_id = self.fieldnorm_id();
             self.similarity_weight.score(fieldnorm_id, term_freq)
         }

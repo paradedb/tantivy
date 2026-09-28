@@ -28,9 +28,9 @@ pub(crate) fn max_score<I: Iterator<Item = Score>>(mut it: I) -> Option<Score> {
 pub struct BlockSegmentPostings {
     pub(crate) doc_decoder: BlockDecoder,
     block_loaded: bool,
-    pub(crate) freq_decoder: BlockDecoder,
+    freq_decoder: RefCell<BlockDecoder>,
     fieldnorm_decoder: RefCell<BlockDecoder>,
-    fieldnorm_loaded: Cell<bool>,
+    scoring_loaded: Cell<bool>,
     freq_reading_option: FreqReadingOption,
     block_max_score_cache: Option<Score>,
     doc_freq: u32,
@@ -241,9 +241,9 @@ impl BlockSegmentPostings {
         let mut block_segment_postings = BlockSegmentPostings {
             doc_decoder: BlockDecoder::with_val(TERMINATED),
             block_loaded: false,
-            freq_decoder: BlockDecoder::with_val(1),
+            freq_decoder: RefCell::new(BlockDecoder::with_val(1)),
             fieldnorm_decoder: RefCell::new(BlockDecoder::with_val(0)),
-            fieldnorm_loaded: Cell::new(false),
+            scoring_loaded: Cell::new(false),
             freq_reading_option,
             block_max_score_cache: None,
             doc_freq,
@@ -277,13 +277,19 @@ impl BlockSegmentPostings {
         // this is the last block of the segment posting list.
         // If it is actually loaded, we can compute block max manually.
         if self.block_is_loaded() {
-            let docs = self.doc_decoder.output_array().iter().cloned();
-            let freqs = self.freq_decoder.output_array().iter().cloned();
-            let bm25_scores = docs.zip(freqs).enumerate().map(|(offset, (_, term_freq))| {
-                let fieldnorm = self.fieldnorm_at(offset, fieldnorm_reader);
-                bm25_weight.score_fieldnorm(fieldnorm, term_freq)
-            });
-            let block_max_score = max_score(bm25_scores).unwrap_or(0.0);
+            let block_max_score = {
+                let docs = self.doc_decoder.output_array().iter().cloned();
+                let freqs = self.freqs();
+                let freqs_iter = freqs.iter().cloned();
+                let bm25_scores =
+                    docs.zip(freqs_iter)
+                        .enumerate()
+                        .map(|(offset, (_, term_freq))| {
+                            let fieldnorm = self.fieldnorm_at(offset, fieldnorm_reader);
+                            bm25_weight.score_fieldnorm(fieldnorm, term_freq)
+                        });
+                max_score(bm25_scores).unwrap_or(0.0)
+            };
             self.block_max_score_cache = Some(block_max_score);
             return block_max_score;
         }
@@ -306,12 +312,12 @@ impl BlockSegmentPostings {
         self.term_norms = source
             .zip(norm_offset)
             .map(|(source, offset)| super::term_norms::TermNormReader::new(source, offset));
-        self.fieldnorm_loaded.set(false);
+        self.scoring_loaded.set(false);
     }
 
     pub(crate) fn disable_term_norms(&mut self) {
         self.term_norms = None;
-        self.fieldnorm_loaded.set(false);
+        self.scoring_loaded.set(false);
     }
 
     #[inline]
@@ -320,51 +326,112 @@ impl BlockSegmentPostings {
     }
 
     #[inline]
-    pub(crate) fn load_fieldnorm_block(&self) {
-        if !self.fieldnorm_loaded.get() {
-            self.load_fieldnorm_block_cold();
+    pub(crate) fn has_pnorms(&self) -> bool {
+        self.skip_reader.has_pnorms()
+    }
+
+    #[inline]
+    pub(crate) fn load_scoring_block(&self) {
+        if !self.scoring_loaded.get() {
+            self.load_scoring_block_cold();
         }
     }
 
     #[cold]
     #[inline(never)]
-    fn load_fieldnorm_block_cold(&self) {
+    fn load_scoring_block_cold(&self) {
         if let Some(norms) = self.term_norms.as_ref() {
             let offset = self.skip_reader.pnorm_byte_offset();
             match self.skip_reader.block_info() {
-                BlockInfo::BitPacked { pnorm_num_bits, .. } => {
+                BlockInfo::BitPacked {
+                    tf_num_bits,
+                    pnorm_num_bits,
+                    ..
+                } => {
                     norms
-                        .decode_packed_block(
+                        .decode_scoring_packed_block(
                             offset,
-                            pnorm_num_bits,
+                            super::term_norms::BlockBitwidths {
+                                tf: tf_num_bits,
+                                pnorm: pnorm_num_bits,
+                            },
+                            &mut self.freq_decoder.borrow_mut(),
                             &mut self.fieldnorm_decoder.borrow_mut(),
                         )
-                        .expect("failed to decode fieldnorm block");
+                        .expect("failed to decode scoring packed block");
                 }
                 BlockInfo::VInt { num_docs } => {
                     norms
-                        .decode_vint_block(
+                        .decode_scoring_vint_block(
                             offset,
                             num_docs as usize,
+                            self.freq_reading_option != FreqReadingOption::NoFreq,
+                            &mut self.freq_decoder.borrow_mut(),
                             &mut self.fieldnorm_decoder.borrow_mut(),
                         )
-                        .expect("failed to decode fieldnorm vint block");
+                        .expect("failed to decode scoring vint block");
+                }
+            }
+        } else {
+            match self.skip_reader.block_info() {
+                BlockInfo::BitPacked { .. } => {
+                    self.freq_decoder
+                        .borrow_mut()
+                        .fill_val(1, COMPRESSION_BLOCK_SIZE);
+                    self.fieldnorm_decoder
+                        .borrow_mut()
+                        .fill_val(0, COMPRESSION_BLOCK_SIZE);
+                }
+                BlockInfo::VInt { num_docs } => {
+                    self.freq_decoder
+                        .borrow_mut()
+                        .fill_val(1, num_docs as usize);
+                    self.fieldnorm_decoder
+                        .borrow_mut()
+                        .fill_val(0, num_docs as usize);
                 }
             }
         }
-        self.fieldnorm_loaded.set(true);
+        self.scoring_loaded.set(true);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn is_scoring_loaded(&self) -> bool {
+        self.scoring_loaded.get()
     }
 
     #[inline]
-    pub(crate) fn fieldnorm_decoder(&self) -> Ref<'_, BlockDecoder> {
-        self.load_fieldnorm_block();
-        self.fieldnorm_decoder.borrow()
+    pub(crate) fn term_norms_buffers(&mut self) -> (&[u32], &[u32], &[u32]) {
+        self.load_scoring_block();
+        (
+            self.doc_decoder.output_array(),
+            self.freq_decoder.get_mut().output_array(),
+            self.fieldnorm_decoder.get_mut().output_array(),
+        )
+    }
+
+    #[inline]
+    pub(crate) fn term_freq_and_fieldnorm_at_mut(&mut self, offset: usize) -> (u32, u32) {
+        self.load_scoring_block();
+        (
+            self.freq_decoder.get_mut().output(offset),
+            self.fieldnorm_decoder.get_mut().output(offset),
+        )
+    }
+
+    #[inline]
+    pub(crate) fn freq_decoder(&self) -> Ref<'_, BlockDecoder> {
+        if self.has_pnorms() {
+            self.load_scoring_block();
+        }
+        self.freq_decoder.borrow()
     }
 
     #[inline]
     pub(crate) fn fieldnorm_at(&self, offset: usize, fallback: &FieldNormReader) -> u32 {
         if self.term_norms.is_some() {
-            self.load_fieldnorm_block();
+            self.load_scoring_block();
             self.fieldnorm_decoder.borrow().output(offset)
         } else {
             fallback.fieldnorm(self.doc(offset))
@@ -374,7 +441,7 @@ impl BlockSegmentPostings {
     #[inline]
     pub(crate) fn fieldnorm_id_at(&self, offset: usize, fallback: &FieldNormReader) -> u8 {
         if self.term_norms.is_some() {
-            self.load_fieldnorm_block();
+            self.load_scoring_block();
             FieldNormReader::fieldnorm_to_id(self.fieldnorm_decoder.borrow().output(offset))
         } else {
             fallback.fieldnorm_id(self.doc(offset))
@@ -384,7 +451,7 @@ impl BlockSegmentPostings {
     #[inline]
     pub(crate) fn posting_fieldnorm_at(&self, offset: usize) -> Option<u32> {
         if self.term_norms.is_some() {
-            self.load_fieldnorm_block();
+            self.load_scoring_block();
             Some(self.fieldnorm_decoder.borrow().output(offset))
         } else {
             None
@@ -414,7 +481,7 @@ impl BlockSegmentPostings {
         self.data = PostingData::Eager(postings_data);
         self.block_max_score_cache = None;
         self.block_loaded = false;
-        self.fieldnorm_loaded.set(false);
+        self.scoring_loaded.set(false);
         if let Some(skip_data) = skip_data_opt {
             self.skip_reader.reset(skip_data, doc_freq);
         } else {
@@ -452,24 +519,22 @@ impl BlockSegmentPostings {
 
     /// Return the array of `term freq` in the block.
     #[inline]
-    pub fn freqs(&self) -> &[u32] {
+    pub fn freqs(&self) -> Ref<'_, [u32]> {
         debug_assert!(self.block_is_loaded());
-        self.freq_decoder.output_array()
+        if self.has_pnorms() {
+            self.load_scoring_block();
+        }
+        Ref::map(self.freq_decoder.borrow(), |d| d.output_array())
     }
 
     /// Return the frequency at index `idx` of the block.
     #[inline]
     pub fn freq(&self, idx: usize) -> u32 {
         debug_assert!(self.block_is_loaded());
-        self.freq_decoder.output(idx)
-    }
-
-    /// Returns the length of the current block.
-    ///
-    /// Returns the decoded term-frequency buffer for the current block.
-    #[inline]
-    pub(crate) fn freq_output_array(&self) -> &[u32] {
-        self.freq_decoder.output_array()
+        if self.has_pnorms() {
+            self.load_scoring_block();
+        }
+        self.freq_decoder.borrow().output(idx)
     }
 
     /// All blocks have a length of `NUM_DOCS_PER_BLOCK`,
@@ -545,7 +610,7 @@ impl BlockSegmentPostings {
         if self.skip_reader.seek(target_doc) {
             self.block_max_score_cache = None;
             self.block_loaded = false;
-            self.fieldnorm_loaded.set(false);
+            self.scoring_loaded.set(false);
         }
     }
 
@@ -592,7 +657,13 @@ impl BlockSegmentPostings {
                 doc_num_bits,
                 tf_num_bits,
                 ..
-            } => start + compressed_block_size(doc_num_bits + tf_num_bits),
+            } => {
+                if self.has_pnorms() {
+                    start + compressed_block_size(doc_num_bits)
+                } else {
+                    start + compressed_block_size(doc_num_bits + tf_num_bits)
+                }
+            }
             BlockInfo::VInt { num_docs: 0 } => start,
             BlockInfo::VInt { .. } => self.data.len(),
         };
@@ -604,6 +675,11 @@ impl BlockSegmentPostings {
             return Ok(());
         }
         let range = self.block_data_range();
+        let has_pnorms = self.has_pnorms();
+        let last_doc = self.skip_reader.last_doc_in_previous_block;
+        let freq_reading_option = self.freq_reading_option;
+        let doc_decoder = &mut self.doc_decoder;
+        let freq_decoder = self.freq_decoder.get_mut();
         match self.skip_reader.block_info() {
             BlockInfo::BitPacked {
                 doc_num_bits,
@@ -612,38 +688,57 @@ impl BlockSegmentPostings {
                 ..
             } => {
                 self.data.with_bytes(range, |data| {
-                    decode_bitpacked_block(
-                        &mut self.doc_decoder,
-                        if let FreqReadingOption::ReadFreq = self.freq_reading_option {
-                            Some(&mut self.freq_decoder)
-                        } else {
-                            None
-                        },
-                        data,
-                        self.skip_reader.last_doc_in_previous_block,
-                        doc_num_bits,
-                        tf_num_bits,
-                        strict_delta_encoded,
-                    );
+                    if has_pnorms {
+                        doc_decoder.uncompress_block_sorted(
+                            data,
+                            last_doc,
+                            doc_num_bits,
+                            strict_delta_encoded,
+                        );
+                    } else {
+                        decode_bitpacked_block(
+                            doc_decoder,
+                            if let FreqReadingOption::ReadFreq = freq_reading_option {
+                                Some(freq_decoder)
+                            } else {
+                                None
+                            },
+                            data,
+                            last_doc,
+                            doc_num_bits,
+                            tf_num_bits,
+                            strict_delta_encoded,
+                        );
+                    }
                 })?;
             }
             BlockInfo::VInt { num_docs } => {
                 self.data.with_bytes(range, |data| {
-                    decode_vint_block(
-                        &mut self.doc_decoder,
-                        if let FreqReadingOption::ReadFreq = self.freq_reading_option {
-                            Some(&mut self.freq_decoder)
-                        } else {
-                            None
-                        },
-                        data,
-                        self.skip_reader.last_doc_in_previous_block,
-                        num_docs as usize,
-                    );
+                    let data = if num_docs == 0 { &[] } else { data };
+                    if has_pnorms {
+                        doc_decoder.uncompress_vint_sorted(
+                            data,
+                            last_doc,
+                            num_docs as usize,
+                            TERMINATED,
+                        );
+                    } else {
+                        decode_vint_block(
+                            doc_decoder,
+                            if let FreqReadingOption::ReadFreq = freq_reading_option {
+                                Some(freq_decoder)
+                            } else {
+                                None
+                            },
+                            data,
+                            last_doc,
+                            num_docs as usize,
+                        );
+                    }
                 })?;
             }
         }
-        self.fieldnorm_loaded.set(false);
+        self.scoring_loaded.set(false);
         self.block_loaded = true;
         Ok(())
     }
@@ -652,7 +747,7 @@ impl BlockSegmentPostings {
     pub fn advance(&mut self) {
         self.skip_reader.advance();
         self.block_loaded = false;
-        self.fieldnorm_loaded.set(false);
+        self.scoring_loaded.set(false);
         self.block_max_score_cache = None;
         self.load_block();
     }
@@ -662,9 +757,9 @@ impl BlockSegmentPostings {
         BlockSegmentPostings {
             doc_decoder: BlockDecoder::with_val(TERMINATED),
             block_loaded: true,
-            freq_decoder: BlockDecoder::with_val(1),
+            freq_decoder: RefCell::new(BlockDecoder::with_val(1)),
             fieldnorm_decoder: RefCell::new(BlockDecoder::with_val(0)),
-            fieldnorm_loaded: Cell::new(true),
+            scoring_loaded: Cell::new(true),
             freq_reading_option: FreqReadingOption::NoFreq,
             block_max_score_cache: None,
             doc_freq: 0,
@@ -798,12 +893,12 @@ mod tests {
                 lazy_clone.advance();
                 eager_clone.advance();
                 assert_eq!(lazy_clone.docs(), eager_clone.docs());
-                assert_eq!(lazy_clone.freqs(), eager_clone.freqs());
+                assert_eq!(&*lazy_clone.freqs(), &*eager_clone.freqs());
                 assert_eq!(reads.lock().unwrap().len(), reads_before);
 
                 loop {
                     assert_eq!(lazy.docs(), eager.docs());
-                    assert_eq!(lazy.freqs(), eager.freqs());
+                    assert_eq!(&*lazy.freqs(), &*eager.freqs());
                     if eager.docs().is_empty() {
                         break;
                     }
@@ -815,12 +910,12 @@ mod tests {
                 ] {
                     assert_eq!(lazy_seek.seek(target), eager_seek.seek(target));
                     assert_eq!(lazy_seek.docs(), eager_seek.docs());
-                    assert_eq!(lazy_seek.freqs(), eager_seek.freqs());
+                    assert_eq!(&*lazy_seek.freqs(), &*eager_seek.freqs());
                 }
                 lazy_seek.reset(info.doc_freq, bytes.clone())?;
                 eager_seek.reset(info.doc_freq, bytes.clone())?;
                 assert_eq!(lazy_seek.docs(), eager_seek.docs());
-                assert_eq!(lazy_seek.freqs(), eager_seek.freqs());
+                assert_eq!(&*lazy_seek.freqs(), &*eager_seek.freqs());
             }
             let header = bytes.slice(0..10);
             let (skip_len, header_len) =
