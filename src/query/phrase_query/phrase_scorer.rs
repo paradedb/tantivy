@@ -4,6 +4,7 @@ use crate::docset::{DocSet, SeekDangerResult, TERMINATED};
 use crate::fieldnorm::FieldNormReader;
 use crate::postings::Postings;
 use crate::query::bm25::Bm25Weight;
+use crate::query::scorer::PruningScorer;
 use crate::query::{Intersection, Scorer};
 use crate::{DocId, Score};
 
@@ -49,6 +50,7 @@ pub struct PhraseScorer<TPostings: Postings> {
     left_positions: Vec<u32>,
     right_positions: Vec<u32>,
     phrase_count: u32,
+    pruning_threshold: Option<Score>,
     fieldnorm_reader: FieldNormReader,
     similarity_weight_opt: Option<Bm25Weight>,
     slop: u32,
@@ -389,6 +391,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             left_positions: Vec::with_capacity(100),
             right_positions: Vec::with_capacity(100),
             phrase_count: 0u32,
+            pruning_threshold: None,
             similarity_weight_opt,
             fieldnorm_reader,
             slop,
@@ -421,9 +424,39 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
 
     fn phrase_match(&mut self) -> bool {
         if self.similarity_weight_opt.is_some() {
+            let fieldnorm_id = self.pruning_threshold.map(|threshold| {
+                let fieldnorm_id = self.fieldnorm_id();
+                let max_phrase_count = (0..self.num_terms)
+                    .map(|ord| {
+                        self.intersection_docset
+                            .docset_specialized(ord)
+                            .postings
+                            .term_freq()
+                    })
+                    .min()
+                    .unwrap();
+                let upper_bound = self
+                    .similarity_weight_opt
+                    .as_ref()
+                    .unwrap()
+                    .score(fieldnorm_id, max_phrase_count);
+                // Leave room for rounding in BM25's floating-point arithmetic.
+                let upper_bound = upper_bound * (1.0 + 4.0 * Score::EPSILON);
+                (fieldnorm_id, upper_bound > threshold)
+            });
+            if matches!(fieldnorm_id, Some((_, false))) {
+                return false;
+            }
             let count = self.compute_phrase_count();
             self.phrase_count = count;
             count > 0u32
+                && self.pruning_threshold.is_none_or(|threshold| {
+                    self.similarity_weight_opt
+                        .as_ref()
+                        .unwrap()
+                        .score(fieldnorm_id.unwrap().0, count)
+                        > threshold
+                })
         } else {
             self.phrase_exists()
         }
@@ -590,6 +623,12 @@ impl<TPostings: Postings> Scorer for PhraseScorer<TPostings> {
         } else {
             1.0f32
         }
+    }
+}
+
+impl<TPostings: Postings> PruningScorer for PhraseScorer<TPostings> {
+    fn set_threshold(&mut self, threshold: Score) {
+        self.pruning_threshold = Some(threshold);
     }
 }
 
