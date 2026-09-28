@@ -1,160 +1,62 @@
-use std::cell::RefCell;
 use std::io::{self, Write};
-use std::sync::Arc;
 
-use common::{BinarySerializable, CountingWriter, HasLen};
-use once_cell::sync::OnceCell;
+use common::{CountingWriter, HasLen};
 
 use crate::directory::{BufferedFileSlice, FileSlice};
 
 const BUFFER_SIZE: usize = 8192;
 
-// Each field contains norm bytes, sorted (postings offset, norm offset) pairs, and the index
-// length.
 pub(crate) struct TermNormsWriter<'a, W: Write> {
     write: &'a mut CountingWriter<W>,
     start_offset: u64,
-    offsets: Vec<(u64, u64)>,
 }
 
 impl<'a, W: Write> TermNormsWriter<'a, W> {
-    pub(crate) fn new(write: &'a mut CountingWriter<W>) -> io::Result<Self> {
-        Ok(Self {
-            start_offset: write.written_bytes(),
-            write,
-            offsets: Vec::new(),
-        })
-    }
-
-    pub(crate) fn write(&mut self, postings_offset: usize, norms: &[u8]) -> io::Result<()> {
-        let postings_offset = postings_offset as u64;
-        if self
-            .offsets
-            .last()
-            .is_some_and(|&(previous, _)| previous >= postings_offset)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "posting offsets must increase",
-            ));
-        }
-        self.offsets.push((
-            postings_offset,
-            self.write.written_bytes() - self.start_offset,
-        ));
-        self.write.write_all(norms)
-    }
-
-    pub(crate) fn close(self) -> io::Result<()> {
-        let index_len = self.offsets.len() as u64 * 16;
-        for (postings_offset, norm_offset) in self.offsets {
-            postings_offset.serialize(self.write)?;
-            norm_offset.serialize(self.write)?;
-        }
-        index_len.serialize(self.write)
-    }
-}
-
-pub(crate) struct PostingNormsReader {
-    source: FileSlice,
-    index: OnceCell<(FileSlice, FileSlice)>,
-}
-
-impl PostingNormsReader {
-    pub(crate) fn new(source: FileSlice) -> Self {
+    pub(crate) fn new(write: &'a mut CountingWriter<W>) -> Self {
+        let start_offset = write.written_bytes();
         Self {
-            source,
-            index: OnceCell::new(),
+            write,
+            start_offset,
         }
     }
 
-    fn term_slice(&self, postings_offset: usize, len: usize) -> io::Result<FileSlice> {
-        let (norms, offsets) = self.index.get_or_try_init(|| {
-            let source = &self.source;
-            if source.len() < 8 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "truncated posting norms",
-                ));
-            }
-            let (body, footer) = source.clone().split_from_end(8);
-            let index_len = u64::deserialize(&mut footer.read_bytes()?)?;
-            if index_len > body.len() as u64 || index_len % 16 != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid posting norm index length",
-                ));
-            }
-            let (norms, index) = body.split_from_end(index_len as usize);
-            Ok((norms, index))
-        })?;
-        let mut range = 0..offsets.len() / 16;
-        let mut norm_offset = None;
-        while range.start < range.end {
-            let mid = range.start + (range.end - range.start) / 2;
-            let mut entry = offsets.read_bytes_slice(mid * 16..(mid + 1) * 16)?;
-            let key = u64::deserialize(&mut entry)?;
-            match key.cmp(&(postings_offset as u64)) {
-                std::cmp::Ordering::Less => range.start = mid + 1,
-                std::cmp::Ordering::Greater => range.end = mid,
-                std::cmp::Ordering::Equal => {
-                    norm_offset = Some(u64::deserialize(&mut entry)?);
-                    break;
-                }
-            }
-        }
-        let offset = norm_offset.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "missing posting norm term")
-        })?;
-        let end = offset
-            .checked_add(len as u64)
-            .filter(|&end| end <= norms.len() as u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated posting norms"))?;
-        Ok(norms.slice(offset as usize..end as usize))
+    pub(crate) fn write(&mut self, norms: &[u8]) -> io::Result<u64> {
+        let offset = self.write.written_bytes() - self.start_offset;
+        self.write.write_all(norms)?;
+        Ok(offset)
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct TermNormReader {
-    source: Arc<PostingNormsReader>,
-    postings_offset: usize,
-    len: usize,
-    buffer: RefCell<Option<BufferedFileSlice>>,
+    buffer: Option<BufferedFileSlice>,
 }
 
 impl TermNormReader {
-    pub(crate) fn new(source: Arc<PostingNormsReader>, postings_offset: usize, len: u32) -> Self {
-        Self {
-            source,
-            postings_offset,
-            len: len as usize,
-            buffer: RefCell::new(None),
-        }
+    pub(crate) fn new(source: FileSlice, offset: u64, len: u32) -> Self {
+        // Unscored queries must not fail on a norm stream they never read.
+        let buffer = offset
+            .checked_add(u64::from(len))
+            .filter(|&end| end <= source.len() as u64)
+            .map(|end| {
+                BufferedFileSlice::new(source.slice(offset as usize..end as usize), BUFFER_SIZE)
+            });
+        Self { buffer }
     }
 
     #[inline]
     pub(crate) fn read(&self, ordinal: usize) -> io::Result<u8> {
-        if ordinal >= self.len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "posting norm ordinal out of bounds",
-            ));
-        }
-        let mut buffer = self.buffer.borrow_mut();
-        if buffer.is_none() {
-            *buffer = Some(BufferedFileSlice::new(
-                self.source.term_slice(self.postings_offset, self.len)?,
-                BUFFER_SIZE,
-            ));
-        }
-        buffer.as_ref().unwrap().read_byte(ordinal as u64)
+        self.buffer
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated posting norms"))?
+            .read_byte(ordinal as u64)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::directory::{FileHandle, FileSlice, OwnedBytes};
@@ -184,17 +86,16 @@ mod tests {
         let data: Vec<u8> = (0..30000).map(|i| (i % 251) as u8).collect();
         let mut bytes = Vec::new();
         let mut write = CountingWriter::wrap(&mut bytes);
-        let mut writer = TermNormsWriter::new(&mut write).unwrap();
-        writer.write(0, &data[..10]).unwrap();
-        writer.write(42, &data[10..29010]).unwrap();
-        writer.write(100, &data[29010..]).unwrap();
-        writer.close().unwrap();
+        let mut writer = TermNormsWriter::new(&mut write);
+        assert_eq!(writer.write(&data[..10]).unwrap(), 0);
+        assert_eq!(writer.write(&data[10..29010]).unwrap(), 10);
+        assert_eq!(writer.write(&data[29010..]).unwrap(), 29010);
+        assert_eq!(bytes, data);
         let file = FileSlice::new(Arc::new(TrackedFile {
             reads: reads.clone(),
             data: bytes,
         }));
-        let source = Arc::new(PostingNormsReader::new(file));
-        let reader = TermNormReader::new(source.clone(), 42, 29000);
+        let reader = TermNormReader::new(file.clone(), 10, 29000);
         assert!(reads.lock().unwrap().is_empty());
         for ordinal in [0, 127, 8000, 8191] {
             assert_eq!(reader.read(ordinal).unwrap(), ((ordinal + 10) % 251) as u8);
@@ -211,48 +112,30 @@ mod tests {
         assert_eq!(reader.read(28999).unwrap(), (29009 % 251) as u8);
         assert_eq!(reads.lock().unwrap().last().unwrap(), &(28202..29010));
         assert!(reader.read(29000).is_err());
-        assert!(TermNormReader::new(source.clone(), 43, 1).read(0).is_err());
-        assert!(TermNormReader::new(source, 100, 1000).read(0).is_err());
+        assert!(TermNormReader::new(file.clone(), u64::MAX, 1)
+            .read(0)
+            .is_err());
+        assert!(TermNormReader::new(file, 29999, 2).read(0).is_err());
         let empty = BufferedFileSlice::empty();
         assert!(empty.read_byte(0).is_err());
         assert!(empty.read_byte(u64::MAX).is_err());
     }
 
     #[test]
-    fn malformed_index_and_stream() {
-        for data in [vec![1], vec![255; 8], vec![0; 16]] {
-            let source = Arc::new(PostingNormsReader::new(FileSlice::from(data)));
-            assert!(TermNormReader::new(source, 0, 2).read(0).is_err());
-        }
-    }
-
-    #[test]
-    fn million_term_lookup_reads_bounded_ranges() {
-        let mut bytes = Vec::new();
-        let mut write = CountingWriter::wrap(&mut bytes);
-        let mut writer = TermNormsWriter::new(&mut write).unwrap();
-        for term in 0..1_000_000 {
-            writer.write(term * 37, &[(term % 251) as u8]).unwrap();
-        }
-        writer.close().unwrap();
+    fn direct_norm_read_needs_no_metadata_io() {
         let reads = Arc::new(Mutex::new(Vec::new()));
         let file = FileSlice::new(Arc::new(TrackedFile {
             reads: reads.clone(),
-            data: bytes,
+            data: (0..1_000_000).map(|n| (n % 251) as u8).collect(),
         }));
-        for term in [0, 123_456, 999_999] {
+        for offset in [0, 123_456, 999_999] {
             reads.lock().unwrap().clear();
-            let source = Arc::new(PostingNormsReader::new(file.clone()));
-            let reader = TermNormReader::new(source, term * 37, 1);
+            let reader = TermNormReader::new(file.clone(), offset as u64, 1);
             assert!(reads.lock().unwrap().is_empty());
-            assert_eq!(reader.read(0).unwrap(), (term % 251) as u8);
-            let ranges = reads.lock().unwrap().clone();
-            assert!(ranges.iter().all(|range| range.len() <= 16));
-            assert!(ranges.iter().map(|range| range.len()).sum::<usize>() <= 8 + 20 * 16 + 1);
             for _ in 0..100 {
-                assert_eq!(reader.read(0).unwrap(), (term % 251) as u8);
+                assert_eq!(reader.read(0).unwrap(), (offset % 251) as u8);
             }
-            assert_eq!(*reads.lock().unwrap(), ranges);
+            assert_eq!(*reads.lock().unwrap(), vec![offset..offset + 1]);
         }
     }
 
@@ -365,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn pnorms_leave_builtin_files_unchanged() -> crate::Result<()> {
+    fn pnorms_leave_postings_positions_and_fieldnorms_unchanged() -> crate::Result<()> {
         use crate::index::SegmentComponent;
         use crate::schema::{Schema, TEXT};
         use crate::Index;
@@ -399,7 +282,6 @@ mod tests {
         }
         for component in [
             SegmentComponent::Postings,
-            SegmentComponent::Terms,
             SegmentComponent::Positions,
             SegmentComponent::FieldNorms,
         ] {
