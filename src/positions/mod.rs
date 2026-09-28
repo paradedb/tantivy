@@ -41,12 +41,16 @@ const COMPRESSION_BLOCK_SIZE: usize = BitPacker4x::BLOCK_LEN;
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::io;
+    use std::ops::Range;
+    use std::sync::{Arc, Mutex};
 
+    use common::HasLen;
     use proptest::prelude::*;
     use proptest::sample::select;
 
     use super::PositionSerializer;
-    use crate::directory::OwnedBytes;
+    use crate::directory::{FileHandle, FileSlice, OwnedBytes};
     use crate::positions::reader::PositionReader;
 
     fn create_positions_data(vals: &[u32]) -> crate::Result<OwnedBytes> {
@@ -56,6 +60,29 @@ pub(crate) mod tests {
         serializer.close_term()?;
         serializer.close()?;
         Ok(OwnedBytes::new(positions_buffer))
+    }
+
+    #[derive(Debug)]
+    struct BlockBackedFile {
+        data: Vec<u8>,
+        reads: Arc<Mutex<Vec<Range<usize>>>>,
+    }
+
+    impl HasLen for BlockBackedFile {
+        fn len(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    impl FileHandle for BlockBackedFile {
+        fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+            self.reads.lock().unwrap().push(range.clone());
+            Ok(OwnedBytes::new(self.data[range].to_vec()))
+        }
+
+        fn storage_block_len(&self) -> Option<usize> {
+            Some(17)
+        }
     }
 
     fn gen_delta_positions() -> BoxedStrategy<Vec<u32>> {
@@ -144,6 +171,44 @@ pub(crate) mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_position_blocks_are_loaded_lazily() -> crate::Result<()> {
+        let position_deltas: Vec<u32> = (0..2_000).map(|position| position % 257).collect();
+        let positions_data = create_positions_data(&position_deltas)?;
+        let positions_len = positions_data.len();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let file = FileSlice::new(Arc::new(BlockBackedFile {
+            data: positions_data.as_slice().to_vec(),
+            reads: reads.clone(),
+        }));
+        let mut position_reader = PositionReader::open_file_slice(file)?;
+
+        assert!(
+            reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|range| range.len() < positions_len)
+        );
+
+        for &(offset, len) in &[(0, 300), (127, 257), (900, 600), (31, 129)] {
+            let mut output = vec![0; len];
+            position_reader.read(offset, &mut output);
+            assert_eq!(
+                output,
+                position_deltas[offset as usize..offset as usize + len]
+            );
+        }
+        assert!(
+            reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|range| range.len() < positions_len)
+        );
         Ok(())
     }
 
