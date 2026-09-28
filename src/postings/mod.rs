@@ -35,6 +35,7 @@ pub use self::segment_postings::SegmentPostings;
 pub use self::serializer::{FieldSerializer, InvertedIndexSerializer};
 pub(crate) use self::skip::{BlockInfo, SkipReader};
 pub use self::term_info::TermInfo;
+pub(crate) use self::term_info::TermInfoVersion;
 
 #[expect(clippy::enum_variant_names)]
 #[derive(Debug, PartialEq, Clone, Copy, Eq)]

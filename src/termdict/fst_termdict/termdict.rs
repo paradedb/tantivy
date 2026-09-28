@@ -9,14 +9,12 @@ use tantivy_fst::Automaton;
 use super::term_info_store::{TermInfoStore, TermInfoStoreWriter};
 use super::{TermStreamer, TermStreamerBuilder, TermWithStateStreamerBuilder};
 use crate::directory::{FileSlice, OwnedBytes};
-use crate::postings::TermInfo;
+use crate::postings::{TermInfo, TermInfoVersion};
 use crate::termdict::TermOrdinal;
 
 fn convert_fst_error(e: tantivy_fst::Error) -> io::Error {
     io::Error::other(e)
 }
-
-const FST_VERSION: u32 = 1;
 
 /// Builder for the new term dictionary.
 ///
@@ -83,7 +81,12 @@ where W: Write
                 .serialize(&mut counting_writer)?;
             let footer_size = counting_writer.written_bytes();
             footer_size.serialize(&mut counting_writer)?;
-            FST_VERSION.serialize(&mut counting_writer)?;
+            let version = if self.term_info_store_writer.has_pnorms() {
+                TermInfoVersion::V2
+            } else {
+                TermInfoVersion::V1
+            };
+            version.serialize(&mut counting_writer)?;
         }
         Ok(file)
     }
@@ -126,16 +129,11 @@ impl TermDictionary {
         let (main_slice, footer_len_slice) = file.split_from_end(12);
         let mut footer_len_bytes = footer_len_slice.read_bytes()?;
         let footer_size = u64::deserialize(&mut footer_len_bytes)?;
-        let version = u32::deserialize(&mut footer_len_bytes)?;
-        if version != FST_VERSION {
-            return Err(io::Error::other(format!(
-                "Unsupported fst version, expected {version}, found {FST_VERSION}",
-            )));
-        }
+        let version = TermInfoVersion::deserialize(&mut footer_len_bytes)?;
 
         let (fst_file_slice, values_file_slice) = main_slice.split_from_end(footer_size as usize);
         let fst_index = open_fst_index(fst_file_slice)?;
-        let term_info_store = TermInfoStore::open(values_file_slice)?;
+        let term_info_store = TermInfoStore::open(values_file_slice, version)?;
         Ok(TermDictionary {
             fst_index: Arc::new(fst_index),
             term_info_store,

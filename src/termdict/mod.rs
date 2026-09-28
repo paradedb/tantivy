@@ -37,7 +37,7 @@ pub type TermOrdinal = u64;
 use std::io;
 
 use common::file_slice::FileSlice;
-use common::BinarySerializable;
+use common::{BinarySerializable, HasLen};
 #[cfg(feature = "quickwit")]
 pub use sstable::{sort_and_dedupe_terms, BatchedTermInfoIter, SortedTermSlice};
 use tantivy_fst::Automaton;
@@ -51,7 +51,7 @@ use self::termdict::{
     TermStreamerBuilder, TermWithStateStreamerBuilder,
 };
 pub use self::termdict::{TermMerger, TermStreamer, TermWithStateStreamer};
-use crate::postings::TermInfo;
+use crate::postings::{TermInfo, TermInfoVersion};
 
 #[derive(Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -72,6 +72,9 @@ impl TryFrom<u32> for DictionaryType {
     }
 }
 
+// V2+ footers contain the backend, metadata version, and this marker.
+const VERSIONED_FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"TDIC");
+
 #[cfg(not(feature = "quickwit"))]
 const CURRENT_TYPE: DictionaryType = DictionaryType::Fst;
 
@@ -86,13 +89,34 @@ pub struct TermDictionary(InnerTermDict);
 impl TermDictionary {
     /// Opens a `TermDictionary`.
     pub fn open(file: FileSlice) -> io::Result<Self> {
-        let (main_slice, dict_type) = file.split_from_end(4);
-        let mut dict_type = dict_type.read_bytes()?;
-        let dict_type = u32::deserialize(&mut dict_type)?;
+        if file.len() < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "missing dictionary footer",
+            ));
+        }
+        let footer = file
+            .slice_from(file.len().saturating_sub(12))
+            .read_bytes()?;
+        let dict_type = u32::deserialize(&mut &footer[footer.len() - 4..])?;
+        let (dict_type, footer_len) = if dict_type == VERSIONED_FOOTER_MAGIC {
+            if footer.len() < 12 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated dictionary footer",
+                ));
+            }
+            let mut footer = &footer[..8];
+            let dict_type = u32::deserialize(&mut footer)?;
+            TermInfoVersion::deserialize(&mut footer)?;
+            (dict_type, 12)
+        } else {
+            (dict_type, 4)
+        };
         let dict_type = DictionaryType::try_from(dict_type).map_err(|_| {
             io::Error::other(format!("Unsupported dictionary type, found {dict_type}"))
         })?;
-
+        let (main_slice, _) = file.split_from_end(footer_len);
         if dict_type != CURRENT_TYPE {
             return Err(io::Error::other(format!(
                 "Unsupported dictionary type, compiled tantivy with {CURRENT_TYPE:?}, but got \
@@ -223,19 +247,26 @@ impl TermDictionary {
 }
 
 /// A TermDictionaryBuilder wrapping either an FST or a SSTable dictionary builder.
-pub struct TermDictionaryBuilder<W: io::Write>(InnerTermDictBuilder<W>);
+pub struct TermDictionaryBuilder<W: io::Write> {
+    inner: InnerTermDictBuilder<W>,
+    has_pnorms: bool,
+}
 
 impl<W: io::Write> TermDictionaryBuilder<W> {
     /// Creates a new `TermDictionaryBuilder`
     pub fn create(w: W) -> io::Result<Self> {
-        InnerTermDictBuilder::create(w).map(TermDictionaryBuilder)
+        InnerTermDictBuilder::create(w).map(|inner| Self {
+            inner,
+            has_pnorms: false,
+        })
     }
 
     /// Inserts a `(key, value)` pair in the term dictionary.
     ///
     /// *Keys have to be inserted in order.*
     pub fn insert<K: AsRef<[u8]>>(&mut self, key_ref: K, value: &TermInfo) -> io::Result<()> {
-        self.0.insert(key_ref, value)
+        self.has_pnorms |= value.pnorms_offset.is_some();
+        self.inner.insert(key_ref, value)
     }
 
     /// # Warning
@@ -246,21 +277,26 @@ impl<W: io::Write> TermDictionaryBuilder<W> {
     ///
     /// Prefer using `.insert(key, value)`
     pub fn insert_key(&mut self, key: &[u8]) -> io::Result<()> {
-        self.0.insert_key(key)
+        self.inner.insert_key(key)
     }
 
     /// # Warning
     ///
     /// Horribly dangerous internal API. See `.insert_key(...)`.
     pub fn insert_value(&mut self, term_info: &TermInfo) -> io::Result<()> {
-        self.0.insert_value(term_info)
+        self.has_pnorms |= term_info.pnorms_offset.is_some();
+        self.inner.insert_value(term_info)
     }
 
     /// Finalize writing the builder, and returns the underlying
     /// `Write` object.
     pub fn finish(self) -> io::Result<W> {
-        let mut writer = self.0.finish()?;
+        let mut writer = self.inner.finish()?;
         (CURRENT_TYPE as u32).serialize(&mut writer)?;
+        if self.has_pnorms {
+            TermInfoVersion::V2.serialize(&mut writer)?;
+            VERSIONED_FOOTER_MAGIC.serialize(&mut writer)?;
+        }
         Ok(writer)
     }
 }

@@ -110,7 +110,7 @@ impl InvertedIndexSerializer {
             if field_entry.has_pnorms() {
                 serializer.pnorms_writer = Some(super::term_norms::TermNormsWriter::new(
                     pnorms_write.for_field(field),
-                )?);
+                ));
                 serializer.postings_serializer.pnorms = Some(Vec::new());
             }
         }
@@ -200,6 +200,7 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             doc_freq: 0,
             postings_range: addr..addr,
             positions_range: positions_start..positions_start,
+            pnorms_offset: None,
         }
     }
 
@@ -266,10 +267,8 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             .close_term(self.current_term_info.doc_freq, self.postings_write)?;
         if let Some(norms) = self.postings_serializer.pnorms.as_ref() {
             assert_eq!(norms.len(), self.current_term_info.doc_freq as usize);
-            self.pnorms_writer
-                .as_mut()
-                .unwrap()
-                .write(self.current_term_info.postings_range.start, norms)?;
+            self.current_term_info.pnorms_offset =
+                Some(self.pnorms_writer.as_mut().unwrap().write(norms)?);
         }
         self.current_term_info.postings_range.end = self.postings_offset();
         if let Some(positions_serializer) = self.positions_serializer_opt.as_mut() {
@@ -286,9 +285,6 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
     /// Closes the current field.
     pub fn close(mut self) -> io::Result<()> {
         self.close_term()?;
-        if let Some(pnorms_writer) = self.pnorms_writer {
-            pnorms_writer.close()?;
-        }
         if let Some(positions_serializer) = self.positions_serializer_opt {
             positions_serializer.close()?;
         }
