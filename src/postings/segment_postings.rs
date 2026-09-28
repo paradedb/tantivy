@@ -17,6 +17,29 @@ pub struct SegmentPostings {
     pub(crate) block_cursor: BlockSegmentPostings,
     cur: usize,
     position_reader: Option<PositionReader>,
+    position_offset_cache: PositionOffsetCache,
+}
+
+/// Caches the absolute position offset for a document in the current postings block.
+///
+/// Documents are visited in order, so extending the cached prefix makes the total work
+/// proportional to the number of postings crossed instead of repeatedly summing from the
+/// beginning of the block.
+#[derive(Clone)]
+struct PositionOffsetCache {
+    block_offset: u64,
+    cur: usize,
+    offset: u64,
+}
+
+impl Default for PositionOffsetCache {
+    fn default() -> Self {
+        PositionOffsetCache {
+            block_offset: u64::MAX,
+            cur: 0,
+            offset: 0,
+        }
+    }
 }
 
 impl SegmentPostings {
@@ -26,6 +49,7 @@ impl SegmentPostings {
             block_cursor: BlockSegmentPostings::empty(),
             cur: 0,
             position_reader: None,
+            position_offset_cache: PositionOffsetCache::default(),
         }
     }
 
@@ -158,7 +182,30 @@ impl SegmentPostings {
             block_cursor: segment_block_postings,
             cur: 0, // cursor within the block
             position_reader,
+            position_offset_cache: PositionOffsetCache::default(),
         }
+    }
+
+    #[inline]
+    fn position_offset(&mut self) -> u64 {
+        let block_offset = self.block_cursor.position_offset();
+        if self.position_offset_cache.block_offset != block_offset
+            || self.position_offset_cache.cur > self.cur
+        {
+            self.position_offset_cache = PositionOffsetCache {
+                block_offset,
+                cur: 0,
+                offset: block_offset,
+            };
+        }
+        self.position_offset_cache.offset += self.block_cursor.freqs()
+            [self.position_offset_cache.cur..self.cur]
+            .iter()
+            .copied()
+            .map(u64::from)
+            .sum::<u64>();
+        self.position_offset_cache.cur = self.cur;
+        self.position_offset_cache.offset
     }
 }
 
@@ -246,16 +293,13 @@ impl Postings for SegmentPostings {
     fn append_positions_with_offset(&mut self, offset: u32, output: &mut Vec<u32>) {
         let term_freq = self.term_freq();
         let prev_len = output.len();
-        if let Some(position_reader) = self.position_reader.as_mut() {
+        if self.position_reader.is_some() {
             debug_assert!(
                 !self.block_cursor.freqs().is_empty(),
                 "No positions available"
             );
-            let read_offset = self.block_cursor.position_offset()
-                + (self.block_cursor.freqs()[..self.cur]
-                    .iter()
-                    .cloned()
-                    .sum::<u32>() as u64);
+            let read_offset = self.position_offset();
+            let position_reader = self.position_reader.as_mut().unwrap();
             // TODO: instead of zeroing the output, we could use MaybeUninit or similar.
             output.resize(prev_len + term_freq as usize, 0u32);
             position_reader.read(read_offset, &mut output[prev_len..]);
