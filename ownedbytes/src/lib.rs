@@ -1,8 +1,11 @@
 use std::ops::{Deref, Range};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::{fmt, io};
 
 pub use stable_deref_trait::StableDeref;
+
+type BoxedDeref = Box<dyn Deref<Target = [u8]> + Send + Sync>;
+type BoxedLoader = Box<dyn FnOnce() -> (BoxedDeref, &'static [u8]) + Send>;
 
 /// An OwnedBytes simply wraps an object that owns a slice of data and exposes
 /// this data as a slice.
@@ -10,8 +13,30 @@ pub use stable_deref_trait::StableDeref;
 /// The backing object is required to be `StableDeref`.
 #[derive(Clone)]
 pub struct OwnedBytes {
-    data: &'static [u8],
-    box_stable_deref: Arc<dyn Deref<Target = [u8]> + Sync + Send>,
+    inner: OwnedBytesInner,
+}
+
+#[derive(Clone)]
+enum OwnedBytesInner {
+    Eager {
+        data: &'static [u8],
+        box_stable_deref: Arc<dyn Deref<Target = [u8]> + Sync + Send>,
+    },
+    Lazy {
+        range: Range<usize>,
+        source: Arc<LazySource>,
+    },
+}
+
+struct LazySource {
+    inner: LazyLock<(BoxedDeref, &'static [u8]), BoxedLoader>,
+}
+
+impl LazySource {
+    #[inline]
+    fn get_slice(&self) -> &'static [u8] {
+        self.inner.deref().1
+    }
 }
 
 impl OwnedBytes {
@@ -28,8 +53,42 @@ impl OwnedBytes {
         let bytes: &[u8] = box_stable_deref.deref();
         let data = unsafe { &*(bytes as *const [u8]) };
         OwnedBytes {
-            data,
-            box_stable_deref,
+            inner: OwnedBytesInner::Eager {
+                data,
+                box_stable_deref,
+            },
+        }
+    }
+
+    /// Creates a lazy `OwnedBytes` instance that will only invoke `loader()`
+    /// when the underlying bytes are accessed for the first time.
+    ///
+    /// The `len` parameter must equal the length of the slice expected to be returned.
+    pub fn new_lazy<T, F>(len: usize, loader: F) -> OwnedBytes
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Deref<Target = [u8]> + Send + Sync + 'static,
+    {
+        let source = Arc::new(LazySource {
+            inner: LazyLock::new(Box::new(move || {
+                let boxed: BoxedDeref = Box::new(loader());
+                let bytes: &[u8] = boxed.deref();
+                assert!(
+                    bytes.len() >= len,
+                    "lazy loader returned slice of unexpected length (expected at least {}, got {})",
+                    len,
+                    bytes.len(),
+                );
+                let slice = &bytes[..len];
+                let slice: &'static [u8] = unsafe { &*(slice as *const [u8]) };
+                (boxed, slice)
+            })),
+        });
+        OwnedBytes {
+            inner: OwnedBytesInner::Lazy {
+                range: 0..len,
+                source,
+            },
         }
     }
 
@@ -37,9 +96,35 @@ impl OwnedBytes {
     #[must_use]
     #[inline]
     pub fn slice(&self, range: Range<usize>) -> Self {
-        OwnedBytes {
-            data: &self.data[range],
-            box_stable_deref: self.box_stable_deref.clone(),
+        match &self.inner {
+            OwnedBytesInner::Eager {
+                data,
+                box_stable_deref,
+            } => OwnedBytes {
+                inner: OwnedBytesInner::Eager {
+                    data: &data[range],
+                    box_stable_deref: box_stable_deref.clone(),
+                },
+            },
+            OwnedBytesInner::Lazy {
+                range: cur_range,
+                source,
+            } => {
+                assert!(
+                    range.end <= cur_range.len(),
+                    "range end {} exceeds slice length {}",
+                    range.end,
+                    cur_range.len()
+                );
+                let new_start = cur_range.start + range.start;
+                let new_end = cur_range.start + range.end;
+                OwnedBytes {
+                    inner: OwnedBytesInner::Lazy {
+                        range: new_start..new_end,
+                        source: source.clone(),
+                    },
+                }
+            }
         }
     }
 
@@ -47,19 +132,28 @@ impl OwnedBytes {
     /// `Deref` and `AsRef` are also available.
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        self.data
+        match &self.inner {
+            OwnedBytesInner::Eager { data, .. } => data,
+            OwnedBytesInner::Lazy { range, source } => {
+                let full = source.get_slice();
+                &full[range.clone()]
+            }
+        }
     }
 
     /// Returns the len of the slice.
     #[inline]
     pub fn len(&self) -> usize {
-        self.data.len()
+        match &self.inner {
+            OwnedBytesInner::Eager { data, .. } => data.len(),
+            OwnedBytesInner::Lazy { range, .. } => range.len(),
+        }
     }
 
     /// Returns true iff this `OwnedBytes` is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.len() == 0
     }
 
     /// Splits the OwnedBytes into two OwnedBytes `(left, right)`.
@@ -73,17 +167,50 @@ impl OwnedBytes {
     #[inline]
     #[must_use]
     pub fn split(self, split_len: usize) -> (OwnedBytes, OwnedBytes) {
-        let (left_data, right_data) = self.data.split_at(split_len);
-        let right_box_stable_deref = self.box_stable_deref.clone();
-        let left = OwnedBytes {
-            data: left_data,
-            box_stable_deref: self.box_stable_deref,
-        };
-        let right = OwnedBytes {
-            data: right_data,
-            box_stable_deref: right_box_stable_deref,
-        };
-        (left, right)
+        match self.inner {
+            OwnedBytesInner::Eager {
+                data,
+                box_stable_deref,
+            } => {
+                let (left_data, right_data) = data.split_at(split_len);
+                let right_box_stable_deref = box_stable_deref.clone();
+                let left = OwnedBytes {
+                    inner: OwnedBytesInner::Eager {
+                        data: left_data,
+                        box_stable_deref,
+                    },
+                };
+                let right = OwnedBytes {
+                    inner: OwnedBytesInner::Eager {
+                        data: right_data,
+                        box_stable_deref: right_box_stable_deref,
+                    },
+                };
+                (left, right)
+            }
+            OwnedBytesInner::Lazy { range, source } => {
+                assert!(
+                    split_len <= range.len(),
+                    "split_len {} exceeds slice length {}",
+                    split_len,
+                    range.len()
+                );
+                let mid = range.start + split_len;
+                let left = OwnedBytes {
+                    inner: OwnedBytesInner::Lazy {
+                        range: range.start..mid,
+                        source: source.clone(),
+                    },
+                };
+                let right = OwnedBytes {
+                    inner: OwnedBytesInner::Lazy {
+                        range: mid..range.end,
+                        source,
+                    },
+                };
+                (left, right)
+            }
+        }
     }
 
     /// Splits the OwnedBytes into two OwnedBytes `(left, right)`.
@@ -97,7 +224,7 @@ impl OwnedBytes {
     #[inline]
     #[must_use]
     pub fn rsplit(self, split_len: usize) -> (OwnedBytes, OwnedBytes) {
-        let data_len = self.data.len();
+        let data_len = self.len();
         self.split(data_len - split_len)
     }
 
@@ -105,22 +232,65 @@ impl OwnedBytes {
     ///
     /// `self` is truncated to `split_len`, left with the remaining bytes.
     pub fn split_off(&mut self, split_len: usize) -> OwnedBytes {
-        let (left, right) = self.data.split_at(split_len);
-        let right_box_stable_deref = self.box_stable_deref.clone();
-        let right_piece = OwnedBytes {
-            data: right,
-            box_stable_deref: right_box_stable_deref,
-        };
-        self.data = left;
-        right_piece
+        match &mut self.inner {
+            OwnedBytesInner::Eager {
+                data,
+                box_stable_deref,
+            } => {
+                let (left, right) = data.split_at(split_len);
+                let right_box_stable_deref = box_stable_deref.clone();
+                let right_piece = OwnedBytes {
+                    inner: OwnedBytesInner::Eager {
+                        data: right,
+                        box_stable_deref: right_box_stable_deref,
+                    },
+                };
+                *data = left;
+                right_piece
+            }
+            OwnedBytesInner::Lazy { range, source } => {
+                assert!(
+                    split_len <= range.len(),
+                    "split_len {} exceeds slice length {}",
+                    split_len,
+                    range.len()
+                );
+                let mid = range.start + split_len;
+                let right_piece = OwnedBytes {
+                    inner: OwnedBytesInner::Lazy {
+                        range: mid..range.end,
+                        source: source.clone(),
+                    },
+                };
+                *range = range.start..mid;
+                right_piece
+            }
+        }
     }
 
     /// Drops the left most `advance_len` bytes.
     #[inline]
     pub fn advance(&mut self, advance_len: usize) -> &[u8] {
-        let (data, rest) = self.data.split_at(advance_len);
-        self.data = rest;
-        data
+        match &mut self.inner {
+            OwnedBytesInner::Eager { data, .. } => {
+                let (head, rest) = data.split_at(advance_len);
+                *data = rest;
+                head
+            }
+            OwnedBytesInner::Lazy { range, source } => {
+                assert!(
+                    advance_len <= range.len(),
+                    "advance_len {} exceeds slice length {}",
+                    advance_len,
+                    range.len()
+                );
+                let full = source.get_slice();
+                let start = range.start;
+                let mid = start + advance_len;
+                range.start = mid;
+                &full[start..mid]
+            }
+        }
     }
 
     /// Reads an `u8` from the `OwnedBytes` and advance by one byte.
@@ -207,25 +377,26 @@ impl AsRef<[u8]> for OwnedBytes {
 impl io::Read for OwnedBytes {
     #[inline]
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let data_len = self.data.len();
-        let buf_len = buf.len();
-        if data_len >= buf_len {
-            let data = self.advance(buf_len);
-            buf.copy_from_slice(data);
-            Ok(buf_len)
-        } else {
-            buf[..data_len].copy_from_slice(self.data);
-            self.data = &[];
-            Ok(data_len)
+        let to_read = self.len().min(buf.len());
+        if to_read == 0 {
+            return Ok(0);
         }
+        let data = self.advance(to_read);
+        buf[..to_read].copy_from_slice(data);
+        Ok(to_read)
     }
+
     #[inline]
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
-        buf.extend(self.data);
-        let read_len = self.data.len();
-        self.data = &[];
+        let read_len = self.len();
+        if read_len == 0 {
+            return Ok(0);
+        }
+        let data = self.advance(read_len);
+        buf.extend_from_slice(data);
         Ok(read_len)
     }
+
     #[inline]
     fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
         let read_len = self.read(buf)?;
@@ -359,5 +530,98 @@ mod tests {
         assert_eq!(data, "ab");
         assert_eq!(data.split_off(1), "b");
         assert_eq!(data, "a");
+    }
+
+    struct CountingBytes {
+        data: Vec<u8>,
+        eval_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl std::ops::Deref for CountingBytes {
+        type Target = [u8];
+        fn deref(&self) -> &Self::Target {
+            self.eval_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            &self.data
+        }
+    }
+
+    #[test]
+    fn test_lazy_owned_bytes_deferred_eval() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let eval_count = Arc::new(AtomicUsize::new(0));
+        let holder = CountingBytes {
+            data: b"hello world".to_vec(),
+            eval_count: eval_count.clone(),
+        };
+
+        let lazy = OwnedBytes::new_lazy(11, move || holder);
+        assert_eq!(eval_count.load(Ordering::SeqCst), 0);
+        assert_eq!(lazy.len(), 11);
+        assert!(!lazy.is_empty());
+        assert_eq!(eval_count.load(Ordering::SeqCst), 0);
+
+        // Slice without triggering eval
+        let sub = lazy.slice(0..5);
+        assert_eq!(sub.len(), 5);
+        assert_eq!(eval_count.load(Ordering::SeqCst), 0);
+
+        // Sub-slice of sub-slice
+        let sub_sub = sub.slice(1..4);
+        assert_eq!(sub_sub.len(), 3);
+        assert_eq!(eval_count.load(Ordering::SeqCst), 0);
+
+        // Now deref sub_sub: should trigger exactly once
+        assert_eq!(sub_sub.as_slice(), b"ell");
+        assert_eq!(eval_count.load(Ordering::SeqCst), 1);
+
+        // Accessing the parent slices should NOT trigger another eval
+        assert_eq!(sub.as_slice(), b"hello");
+        assert_eq!(lazy.as_slice(), b"hello world");
+        assert_eq!(eval_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_lazy_owned_bytes_split_and_advance() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let eval_count = Arc::new(AtomicUsize::new(0));
+        let holder = CountingBytes {
+            data: b"abcdefghi".to_vec(),
+            eval_count: eval_count.clone(),
+        };
+
+        let mut lazy = OwnedBytes::new_lazy(9, move || holder);
+        assert_eq!(eval_count.load(Ordering::SeqCst), 0);
+
+        let (left, right) = lazy.clone().split(3);
+        assert_eq!(eval_count.load(Ordering::SeqCst), 0);
+        assert_eq!(left.len(), 3);
+        assert_eq!(right.len(), 6);
+
+        let advanced = lazy.advance(2);
+        assert_eq!(advanced, b"ab");
+        assert_eq!(eval_count.load(Ordering::SeqCst), 1);
+        assert_eq!(lazy.len(), 7);
+        assert_eq!(lazy.as_slice(), b"cdefghi");
+        assert_eq!(eval_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "lazy loader returned slice of unexpected length")]
+    fn test_lazy_owned_bytes_length_mismatch() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        let holder = CountingBytes {
+            data: b"short".to_vec(),
+            eval_count: Arc::new(AtomicUsize::new(0)),
+        };
+        // Claim length is 10, but data is only 5 bytes
+        let lazy = OwnedBytes::new_lazy(10, move || holder);
+        let _ = lazy.as_slice();
     }
 }
