@@ -89,6 +89,7 @@ impl TermNormReader {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn decode_packed_block(
         &self,
         offset: usize,
@@ -117,6 +118,7 @@ impl TermNormReader {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn decode_vint_block(
         &self,
         offset: usize,
@@ -141,6 +143,99 @@ impl TermNormReader {
         decoder.uncompress_vint_unsorted(&tail_bytes, num_docs, 0);
         Ok(())
     }
+
+    pub(crate) fn decode_scoring_packed_block(
+        &self,
+        offset: usize,
+        bitwidths: BlockBitwidths,
+        freq_decoder: &mut BlockDecoder,
+        fieldnorm_decoder: &mut BlockDecoder,
+    ) -> io::Result<()> {
+        let buffer = self
+            .buffer
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated posting norms"))?;
+        let tf_size = compressed_block_size(bitwidths.tf);
+        let norm_size = compressed_block_size(bitwidths.pnorm);
+        let total_size = tf_size.checked_add(norm_size).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "overflow in scoring block size")
+        })?;
+        let end = offset.checked_add(total_size).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "scoring slice shorter than compressed block",
+            )
+        })?;
+        if end > self.slice_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "scoring slice shorter than compressed block",
+            ));
+        }
+        let bytes = buffer.get_bytes(offset as u64..end as u64)?;
+        if bitwidths.tf > 0 {
+            freq_decoder.uncompress_block_unsorted(&bytes[..tf_size], bitwidths.tf, true);
+        } else {
+            freq_decoder.fill_val(1, crate::postings::compression::COMPRESSION_BLOCK_SIZE);
+        }
+        if bitwidths.pnorm > 0 {
+            fieldnorm_decoder.uncompress_block_unsorted(
+                &bytes[tf_size..total_size],
+                bitwidths.pnorm,
+                false,
+            );
+        } else {
+            fieldnorm_decoder.fill_val(0, crate::postings::compression::COMPRESSION_BLOCK_SIZE);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn decode_scoring_vint_block(
+        &self,
+        offset: usize,
+        num_docs: usize,
+        has_freq: bool,
+        freq_decoder: &mut BlockDecoder,
+        fieldnorm_decoder: &mut BlockDecoder,
+    ) -> io::Result<()> {
+        if num_docs == 0 {
+            return Ok(());
+        }
+        let buffer = self
+            .buffer
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated posting norms"))?;
+        if offset >= self.slice_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "scoring slice offset out of bounds",
+            ));
+        }
+        let max_bytes_per_doc = if has_freq { 10 } else { 5 };
+        let max_vint_len = (num_docs * max_bytes_per_doc).min(self.slice_len - offset);
+        let bytes = buffer.get_bytes(offset as u64..(offset + max_vint_len) as u64)?;
+        let tf_consumed = if has_freq {
+            freq_decoder.uncompress_vint_unsorted(&bytes, num_docs, 1)
+        } else {
+            freq_decoder.fill_val(1, num_docs);
+            0
+        };
+        if tf_consumed > bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "scoring slice offset out of bounds for fieldnorm vint",
+            ));
+        }
+        let norm_bytes = &bytes[tf_consumed..];
+        fieldnorm_decoder.uncompress_vint_unsorted(norm_bytes, num_docs, 0);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BlockBitwidths {
+    pub(crate) tf: u8,
+    pub(crate) pnorm: u8,
 }
 
 #[cfg(test)]
@@ -431,15 +526,16 @@ mod tests {
                 "Component {component:?} should be identical",
             );
         }
-        // SkipData lives in SegmentComponent::Postings (.idx). When pnorms are enabled,
-        // each bitpacked block in SkipData includes an additional byte for pnorm_num_bits.
+        // Postings without pnorms contain [postings][termfreqs].
+        // When pnorms are enabled, term frequencies are moved out of Postings (.idx) into
+        // PostingNorms (.pnorm), making Postings strictly smaller.
         let postings_without_pnorms = segments[0]
             .open_read(SegmentComponent::Postings)?
             .read_bytes()?;
         let postings_with_pnorms = segments[1]
             .open_read(SegmentComponent::Postings)?
             .read_bytes()?;
-        assert!(postings_with_pnorms.len() > postings_without_pnorms.len());
+        assert!(postings_with_pnorms.len() < postings_without_pnorms.len());
         Ok(())
     }
 
@@ -785,6 +881,99 @@ mod tests {
 
         assert_eq!(reader.searcher().segment_readers().len(), 1);
         verify_readers(&reader)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn scoring_data_lazily_loaded() -> crate::Result<()> {
+        use crate::postings::Postings;
+        use crate::schema::{IndexRecordOption, Schema, TEXT};
+        use crate::{DocSet, Index, Term, TERMINATED};
+
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field(
+            "text",
+            TEXT.set_indexing_options(
+                TEXT.get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_pnorms(true),
+            ),
+        );
+        let index = Index::create_in_ram(schema.build());
+        let mut writer = index.writer_for_tests()?;
+        // Index 200 documents so we span across block 0 (128 docs) and tail vint (72 docs)
+        for i in 0..200 {
+            let freq = (i % 5) + 1;
+            let doc_text = format!("{} other", "target ".repeat(freq));
+            writer.add_document(doc!(text => doc_text))?;
+        }
+        writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let segment = &searcher.segment_readers()[0];
+        let inv = segment.inverted_index(text)?;
+        assert!(inv.has_pnorms());
+
+        let term = Term::from_field_text(text, "target");
+        let info = inv.get_term_info(&term)?.unwrap();
+        let mut block =
+            inv.read_block_postings_from_terminfo(&info, IndexRecordOption::WithFreqs)?;
+
+        // Freshly loaded block has not loaded scoring data yet
+        assert!(!block.is_scoring_loaded());
+
+        // Inspecting docs does not load scoring data
+        assert_eq!(block.doc(0), 0);
+        assert_eq!(block.doc(10), 10);
+        assert!(!block.is_scoring_loaded());
+
+        // Accessing freq on doc 0 triggers lazy loading of scoring data
+        let freq_0 = block.freq(0);
+        assert_eq!(freq_0, 1);
+        assert!(block.is_scoring_loaded());
+
+        // Verify freqs across the first block (128 docs)
+        for i in 0..128 {
+            let expected_freq = ((i % 5) + 1) as u32;
+            assert_eq!(block.freq(i), expected_freq);
+        }
+
+        // Advance to next block (tail vint block)
+        block.advance();
+        // In the new block, scoring data is again not loaded yet
+        assert!(!block.is_scoring_loaded());
+
+        // Checking doc ID in the tail block does not load scoring data
+        assert_eq!(block.doc(0), 128);
+        assert!(!block.is_scoring_loaded());
+
+        // Accessing freq loads scoring data for tail block
+        assert_eq!(block.freq(0), ((128 % 5) + 1) as u32);
+        assert!(block.is_scoring_loaded());
+
+        // Verify all docs in tail block
+        for i in 0..block.block_len() {
+            let doc_id = block.doc(i);
+            let expected_freq = ((doc_id % 5) + 1) as u32;
+            assert_eq!(block.freq(i), expected_freq);
+        }
+
+        // Also verify SegmentPostings API
+        let mut postings = inv
+            .read_postings(&term, IndexRecordOption::WithFreqs)?
+            .unwrap();
+        let mut doc_count = 0;
+        while postings.doc() != TERMINATED {
+            let doc = postings.doc();
+            let expected_freq = ((doc % 5) + 1) as u32;
+            assert_eq!(postings.term_freq(), expected_freq);
+            doc_count += 1;
+            postings.advance();
+        }
+        assert_eq!(doc_count, 200);
 
         Ok(())
     }

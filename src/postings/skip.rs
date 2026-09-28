@@ -226,6 +226,11 @@ impl SkipReader {
         self.pnorm_byte_offset.0
     }
 
+    #[inline]
+    pub fn has_pnorms(&self) -> bool {
+        self.has_pnorms
+    }
+
     fn read_block_info(&mut self) {
         let bytes = self.owned_read.as_slice();
         let mut advance_len: usize;
@@ -302,9 +307,14 @@ impl SkipReader {
                 ..
             } => {
                 self.remaining_docs -= COMPRESSION_BLOCK_SIZE as u32;
-                self.byte_offset += compressed_block_size(doc_num_bits + tf_num_bits);
+                if self.has_pnorms {
+                    self.byte_offset += compressed_block_size(doc_num_bits);
+                    self.pnorm_byte_offset.0 += compressed_block_size(tf_num_bits + pnorm_num_bits);
+                } else {
+                    self.byte_offset += compressed_block_size(doc_num_bits + tf_num_bits);
+                    self.pnorm_byte_offset.0 += compressed_block_size(pnorm_num_bits);
+                }
                 self.position_offset += tf_sum as u64;
-                self.pnorm_byte_offset.0 += compressed_block_size(pnorm_num_bits);
             }
             BlockInfo::VInt { num_docs } => {
                 debug_assert_eq!(num_docs, self.remaining_docs);
@@ -513,6 +523,7 @@ mod tests {
             true,
         );
         assert_eq!(skip_reader.last_doc_in_block(), 1u32);
+        assert_eq!(skip_reader.byte_offset(), 0);
         assert_eq!(skip_reader.pnorm_byte_offset(), 0);
         assert_eq!(
             skip_reader.block_info(),
@@ -528,7 +539,11 @@ mod tests {
         );
         skip_reader.advance();
         assert_eq!(skip_reader.last_doc_in_block(), 5u32);
-        assert_eq!(skip_reader.pnorm_byte_offset(), compressed_block_size(4));
+        assert_eq!(skip_reader.byte_offset(), compressed_block_size(2));
+        assert_eq!(
+            skip_reader.pnorm_byte_offset(),
+            compressed_block_size(3 + 4)
+        );
         assert_eq!(
             skip_reader.block_info(),
             BlockInfo::BitPacked {
@@ -543,8 +558,12 @@ mod tests {
         );
         skip_reader.advance();
         assert_eq!(
+            skip_reader.byte_offset(),
+            compressed_block_size(2) + compressed_block_size(5)
+        );
+        assert_eq!(
             skip_reader.pnorm_byte_offset(),
-            compressed_block_size(4) + compressed_block_size(6)
+            compressed_block_size(3 + 4) + compressed_block_size(2 + 6)
         );
         assert_eq!(skip_reader.block_info(), BlockInfo::VInt { num_docs: 3u32 });
     }

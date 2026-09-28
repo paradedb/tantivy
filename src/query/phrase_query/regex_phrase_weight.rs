@@ -180,7 +180,7 @@ impl RegexPhraseWeight {
         term_infos: &[TermInfo],
         reader: &SegmentReader,
         inverted_index: &InvertedIndexReader,
-        scoring_enabled: bool,
+        _scoring_enabled: bool,
     ) -> crate::Result<UnionType> {
         let max_doc = reader.max_doc();
 
@@ -202,9 +202,6 @@ impl RegexPhraseWeight {
         for term_info in term_infos {
             let mut term_posting = inverted_index
                 .read_postings_from_terminfo(term_info, IndexRecordOption::WithFreqsAndPositions)?;
-            if !scoring_enabled {
-                term_posting.block_cursor.disable_term_norms();
-            }
             let num_docs = term_posting.doc_freq();
 
             if num_docs < SPARSE_TERM_DOC_THRESHOLD {
@@ -331,14 +328,15 @@ mod tests {
     use crate::DocSet;
 
     #[test]
-    fn test_unscored_regex_phrase_does_not_read_pnorms() -> crate::Result<()> {
+    fn test_unscored_query_does_not_read_pnorms() -> crate::Result<()> {
         use std::io::Write;
 
         use crate::collector::Count;
         use crate::directory::CompositeWrite;
         use crate::index::SegmentComponent;
-        use crate::schema::{Schema, TEXT};
-        use crate::Directory;
+        use crate::query::TermQuery;
+        use crate::schema::{IndexRecordOption, Schema, TEXT};
+        use crate::{Directory, Term};
 
         let documents: Vec<String> = (0..1000).map(|i| format!("rare{i:04} common")).collect();
         let mut schema = Schema::builder();
@@ -364,7 +362,10 @@ mod tests {
             composite.for_field(text).write_all(&[255])?;
             composite.close()?;
         }
-        let query = RegexPhraseQuery::new(text, vec!["rare.*".into(), "common".into()]);
+        let query = TermQuery::new(
+            Term::from_field_text(text, "common"),
+            IndexRecordOption::Basic,
+        );
         assert_eq!(index.reader()?.searcher().search(&query, &Count)?, 1000);
         Ok(())
     }

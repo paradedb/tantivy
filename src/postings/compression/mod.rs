@@ -98,6 +98,11 @@ impl BlockDecoder {
         }
     }
 
+    pub fn fill_val(&mut self, val: u32, len: usize) {
+        self.output[..len].fill(val);
+        self.output_len = len;
+    }
+
     /// Decompress block of sorted integers.
     ///
     /// `strict_delta` depends on what encoding was used. Older version of tantivy never use strict

@@ -369,8 +369,10 @@ impl DocSet for BlockWandIntersectionScorer {
                 .seek_within_block(self.window_end + 1)
                 .min(block_cursor.block_len());
 
-            let block_docs = &block_cursor.doc_decoder.output_array()[start_idx..end_idx];
-            let block_freqs = &block_cursor.freq_output_array()[start_idx..end_idx];
+            if start_idx >= end_idx {
+                self.internal_doc = self.window_end + 1;
+                continue;
+            }
 
             // Pass 1: Batch-compute leader BM25 scores and branchlessly filter
             // candidates that can't beat the threshold.
@@ -382,8 +384,8 @@ impl DocSet for BlockWandIntersectionScorer {
 
             let mut num_candidates = 0usize;
             if block_cursor.has_term_norms() {
-                let norms_decoder = block_cursor.fieldnorm_decoder();
-                let block_fieldnorms = &norms_decoder.output_array()[start_idx..end_idx];
+                let (all_docs, all_freqs, all_norms) = block_cursor.term_norms_buffers();
+                let block_docs = &all_docs[start_idx..end_idx];
                 let len = block_docs.len();
                 let mut scores = [0.0f32; COMPRESSION_BLOCK_SIZE];
 
@@ -391,8 +393,8 @@ impl DocSet for BlockWandIntersectionScorer {
                 let norm_factor = self.bm25_weight.norm_factor();
                 let weight = self.bm25_weight.weight();
 
-                let freqs = &block_freqs[..len];
-                let norms = &block_fieldnorms[..len];
+                let freqs = &all_freqs[start_idx..end_idx];
+                let norms = &all_norms[start_idx..end_idx];
                 let sc = &mut scores[..len];
 
                 let mut max_score = 0.0f32;
@@ -418,6 +420,9 @@ impl DocSet for BlockWandIntersectionScorer {
                     num_candidates += (leader_score > score_threshold) as usize;
                 }
             } else {
+                let freqs_decoder = block_cursor.freq_decoder();
+                let block_freqs = &freqs_decoder.output_array()[start_idx..end_idx];
+                let block_docs = &block_cursor.doc_decoder.output_array()[start_idx..end_idx];
                 for (offset, (candidate_doc, term_freq)) in block_docs
                     .iter()
                     .copied()

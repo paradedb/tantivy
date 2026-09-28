@@ -471,7 +471,14 @@ impl PostingsSerializer {
             let (num_bits, block_encoded): (u8, &[u8]) = self
                 .block_encoder
                 .compress_block_unsorted(self.block.term_freqs(), true);
-            self.postings_write.extend(block_encoded);
+            if self.pnorm_blocks.is_some() {
+                self.pnorm_blocks
+                    .as_mut()
+                    .unwrap()
+                    .extend_from_slice(block_encoded);
+            } else {
+                self.postings_write.extend(block_encoded);
+            }
             self.skip_write.write_term_freq(num_bits);
             if self.mode.has_positions() {
                 // We serialize the sum of term freqs within the skip information
@@ -569,7 +576,14 @@ impl PostingsSerializer {
                 let block_encoded = self
                     .block_encoder
                     .compress_vint_unsorted(self.block.term_freqs());
-                self.postings_write.write_all(block_encoded)?;
+                if self.pnorm_blocks.is_some() {
+                    self.pnorm_tail
+                        .as_mut()
+                        .unwrap()
+                        .extend_from_slice(block_encoded);
+                } else {
+                    self.postings_write.write_all(block_encoded)?;
+                }
             }
             if self.pnorm_blocks.is_some() {
                 let tail_encoded = self
