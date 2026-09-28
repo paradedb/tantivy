@@ -39,6 +39,15 @@ impl LazySource {
     }
 }
 
+impl Deref for LazySource {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.get_slice()
+    }
+}
+
 impl OwnedBytes {
     /// Creates an empty `OwnedBytes`.
     pub fn empty() -> OwnedBytes {
@@ -67,7 +76,7 @@ impl OwnedBytes {
     pub fn new_lazy<T, F>(len: usize, loader: F) -> OwnedBytes
     where
         F: FnOnce() -> T + Send + 'static,
-        T: Deref<Target = [u8]> + Send + Sync + 'static,
+        T: StableDeref + Deref<Target = [u8]> + Send + Sync + 'static,
     {
         let source = Arc::new(LazySource {
             inner: LazyLock::new(Box::new(move || {
@@ -75,7 +84,8 @@ impl OwnedBytes {
                 let bytes: &[u8] = boxed.deref();
                 assert!(
                     bytes.len() >= len,
-                    "lazy loader returned slice of unexpected length (expected at least {}, got {})",
+                    "lazy loader returned slice of unexpected length (expected at least {}, got \
+                     {})",
                     len,
                     bytes.len(),
                 );
@@ -110,6 +120,12 @@ impl OwnedBytes {
                 range: cur_range,
                 source,
             } => {
+                assert!(
+                    range.start <= range.end,
+                    "slice index starts at {} but ends at {}",
+                    range.start,
+                    range.end
+                );
                 assert!(
                     range.end <= cur_range.len(),
                     "range end {} exceeds slice length {}",
@@ -225,6 +241,12 @@ impl OwnedBytes {
     #[must_use]
     pub fn rsplit(self, split_len: usize) -> (OwnedBytes, OwnedBytes) {
         let data_len = self.len();
+        assert!(
+            split_len <= data_len,
+            "split_len {} exceeds slice length {}",
+            split_len,
+            data_len
+        );
         self.split(data_len - split_len)
     }
 
@@ -271,6 +293,9 @@ impl OwnedBytes {
     /// Drops the left most `advance_len` bytes.
     #[inline]
     pub fn advance(&mut self, advance_len: usize) -> &[u8] {
+        if advance_len == 0 {
+            return &[];
+        }
         match &mut self.inner {
             OwnedBytesInner::Eager { data, .. } => {
                 let (head, rest) = data.split_at(advance_len);
@@ -287,8 +312,15 @@ impl OwnedBytes {
                 let full = source.get_slice();
                 let start = range.start;
                 let mid = start + advance_len;
-                range.start = mid;
-                &full[start..mid]
+                let end = range.end;
+                let head = &full[start..mid];
+                let rest = &full[mid..end];
+                let box_stable_deref: Arc<dyn Deref<Target = [u8]> + Sync + Send> = source.clone();
+                self.inner = OwnedBytesInner::Eager {
+                    data: rest,
+                    box_stable_deref,
+                };
+                head
             }
         }
     }
@@ -332,7 +364,7 @@ impl fmt::Debug for OwnedBytes {
 
 impl PartialEq for OwnedBytes {
     fn eq(&self, other: &OwnedBytes) -> bool {
-        self.as_slice() == other.as_slice()
+        self.len() == other.len() && self.as_slice() == other.as_slice()
     }
 }
 
@@ -340,13 +372,13 @@ impl Eq for OwnedBytes {}
 
 impl PartialEq<[u8]> for OwnedBytes {
     fn eq(&self, other: &[u8]) -> bool {
-        self.as_slice() == other
+        self.len() == other.len() && self.as_slice() == other
     }
 }
 
 impl PartialEq<str> for OwnedBytes {
     fn eq(&self, other: &str) -> bool {
-        self.as_slice() == other.as_bytes()
+        self.len() == other.len() && self.as_slice() == other.as_bytes()
     }
 }
 
