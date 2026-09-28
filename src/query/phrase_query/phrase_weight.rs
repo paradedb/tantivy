@@ -7,7 +7,7 @@ use crate::query::explanation::does_not_match;
 use crate::query::scorer::{BasicPruningScorer, PruningScorer};
 use crate::query::{EmptyScorer, Explanation, Scorer, Weight};
 use crate::schema::{IndexRecordOption, Term};
-use crate::{DocId, DocSet, Score};
+use crate::{DocId, DocSet, Score, TERMINATED};
 
 pub struct PhraseWeight {
     phrase_terms: Vec<(usize, Term)>,
@@ -87,11 +87,24 @@ impl Weight for PhraseWeight {
         boost: Score,
         init_threshold: Score,
     ) -> crate::Result<Box<dyn PruningScorer>> {
-        if let Some(scorer) = self.phrase_scorer(reader, boost)? {
-            Ok(Box::new(BasicPruningScorer::new(
-                Box::new(scorer),
-                init_threshold,
-            )))
+        if let Some(mut scorer) = self.phrase_scorer(reader, boost)? {
+            let can_prune_positions = self.slop == 0
+                && self.similarity_weight_opt.as_ref().is_some_and(|weight| {
+                    let max_score = weight.max_score() * boost;
+                    max_score.is_finite() && max_score >= 0.0
+                });
+            if can_prune_positions {
+                scorer.set_threshold(init_threshold);
+                if scorer.doc() != TERMINATED && scorer.score() <= init_threshold {
+                    scorer.advance();
+                }
+                Ok(Box::new(scorer))
+            } else {
+                Ok(Box::new(BasicPruningScorer::new(
+                    Box::new(scorer),
+                    init_threshold,
+                )))
+            }
         } else {
             Ok(Box::new(EmptyScorer))
         }
@@ -119,6 +132,7 @@ impl Weight for PhraseWeight {
 #[cfg(test)]
 mod tests {
     use super::super::tests::create_index;
+    use super::*;
     use crate::docset::TERMINATED;
     use crate::query::{EnableScoring, PhraseQuery};
     use crate::{DocSet, Term};
@@ -144,6 +158,103 @@ mod tests {
         assert_eq!(phrase_scorer.doc(), 2);
         assert_eq!(phrase_scorer.phrase_count(), 1);
         assert_eq!(phrase_scorer.advance(), TERMINATED);
+        Ok(())
+    }
+
+    #[test]
+    fn test_phrase_pruning_matches_unpruned() -> crate::Result<()> {
+        let mut texts = vec![
+            "a b".to_string(),
+            "a a b d a b c".to_string(),
+            "a x b".to_string(),
+            "b a".to_string(),
+            "a a a".to_string(),
+            "a c b".to_string(),
+            "c".to_string(),
+            String::new(),
+        ];
+        let mut seed = 42u32;
+        for len in 1..320 {
+            let mut text = String::new();
+            for _ in 0..len {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                text.push_str(["a ", "b ", "c ", "x "][(seed >> 24) as usize % 4]);
+            }
+            texts.push(text);
+        }
+        let index = create_index(&texts)?;
+        let field = index.schema().get_field("text")?;
+        let searcher = index.reader()?.searcher();
+        for offsets in [
+            vec![(0, "a"), (1, "b")],
+            vec![(0, "a"), (1, "a")],
+            vec![(0, "a"), (1, "b"), (2, "c")],
+            vec![(0, "a"), (2, "b")],
+            vec![(0, "missing"), (1, "b")],
+        ] {
+            for slop in [0, 1, 2] {
+                let mut query = PhraseQuery::new_with_offset(
+                    offsets
+                        .iter()
+                        .map(|(offset, text)| (*offset, Term::from_field_text(field, text)))
+                        .collect(),
+                );
+                query.set_slop(slop);
+                for scoring in [true, false] {
+                    let enable_scoring = if scoring {
+                        EnableScoring::enabled_from_searcher(&searcher)
+                    } else {
+                        EnableScoring::disabled_from_schema(searcher.schema())
+                    };
+                    let weight = query.phrase_weight(enable_scoring)?;
+                    for reader in searcher.segment_readers() {
+                        for boost in [0.0, 1.0, 2.5, -1.0] {
+                            let mut baseline = weight.scorer(reader, boost)?;
+                            let mut expected = Vec::new();
+                            while baseline.doc() != TERMINATED {
+                                expected.push((baseline.doc(), baseline.score()));
+                                baseline.advance();
+                            }
+                            let mut thresholds = vec![Score::MIN, -1.0, 0.0, Score::MAX];
+                            for &(_, score) in expected.iter().step_by(17) {
+                                thresholds.extend([score.next_down(), score, score.next_up()]);
+                            }
+                            for threshold in thresholds {
+                                let mut scorer = weight.pruning_scorer(reader, boost, threshold)?;
+                                let mut actual = Vec::new();
+                                while scorer.doc() != TERMINATED {
+                                    actual.push((scorer.doc(), scorer.score()));
+                                    scorer.advance();
+                                }
+                                let expected: Vec<_> = expected
+                                    .iter()
+                                    .copied()
+                                    .filter(|(_, score)| *score > threshold)
+                                    .collect();
+                                assert_eq!(
+                                    actual, expected,
+                                    "{offsets:?}, slop={slop}, scoring={scoring}, boost={boost}, \
+                                     threshold={threshold}"
+                                );
+                            }
+                            let mut baseline =
+                                BasicPruningScorer::new(weight.scorer(reader, boost)?, Score::MIN);
+                            let mut optimized = weight.pruning_scorer(reader, boost, Score::MIN)?;
+                            while baseline.doc() != TERMINATED {
+                                assert_eq!(optimized.doc(), baseline.doc());
+                                assert_eq!(optimized.score(), baseline.score());
+                                let threshold = baseline.score();
+                                baseline.set_threshold(threshold);
+                                optimized.set_threshold(threshold);
+                                baseline.advance();
+                                optimized.advance();
+                            }
+                            assert_eq!(optimized.doc(), TERMINATED);
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
