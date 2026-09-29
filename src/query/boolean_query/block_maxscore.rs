@@ -8,7 +8,14 @@ pub(super) const MIN_BOUND_WINDOW: u32 = 8192;
 const WINDOW: usize = 4096;
 
 pub(super) fn should_use_block_maxscore(scorers: &[TermScorer], max_doc: DocId) -> bool {
-    // Benchmark cutoffs keep WAND for 1-2 terms or fewer than 256 postings.
+    if scorers.len() == 2 {
+        let left = u64::from(scorers[0].size_hint());
+        let right = u64::from(scorers[1].size_hint());
+        if left.min(right) * 64 < left.max(right) {
+            return false;
+        }
+    }
+    // Keep WAND for a single term or fewer than 256 postings.
     // Require one posting per 256 doc IDs to avoid sparse-query regressions:
     // 32 expected term matches per 8192-doc window, counting overlapping terms.
     let postings: u64 = scorers
@@ -16,7 +23,7 @@ pub(super) fn should_use_block_maxscore(scorers: &[TermScorer], max_doc: DocId) 
         .map(|scorer| u64::from(scorer.size_hint()))
         .sum();
     let max_docs_per_posting = 256;
-    scorers.len() >= 3
+    scorers.len() >= 2
         && postings >= 256
         && postings.saturating_mul(max_docs_per_posting) >= u64::from(max_doc)
 }
@@ -70,6 +77,20 @@ pub(super) fn block_maxscore(
             term.priority = term.bound * term.inv_cost;
             end = end.min(last.saturating_add(1));
         }
+        if min_window == 0
+            && terms.iter().map(|term| term.bound).sum::<f64>() > threshold as f64
+            && terms
+                .iter()
+                .map(|term| term.scorer.block_score_hint() as f64)
+                .sum::<f64>()
+                * rounding
+                <= threshold as f64
+        {
+            for term in &mut terms {
+                term.bound = term.scorer.refine_block_max_score() as f64 * rounding;
+                term.priority = term.bound * term.inv_cost;
+            }
+        }
         // Low bound per posting cost goes first: these terms are candidates for deferred scoring.
         terms.sort_unstable_by(|a, b| a.priority.total_cmp(&b.priority));
         let mut bound = 0.0;
@@ -102,22 +123,20 @@ pub(super) fn block_maxscore(
             let mut matches_len = 0;
             if strong.len() == 1 {
                 let scorer = &mut strong[0].scorer;
-                while scorer.doc() < window_end {
-                    let score = scorer.score() as f64;
+                scorer.for_each_score_until(window_end, |doc, score| {
+                    let score = score as f64;
                     let keep = score * rounding + weak_bound > threshold as f64;
-                    matches[matches_len] = (scorer.doc(), score);
+                    matches[matches_len] = (doc, score);
                     matches_len += keep as usize;
-                    scorer.advance();
-                }
+                });
             } else {
                 // Accumulate strong terms into a dense batch; the bitmap tracks touched entries.
                 for term in strong.iter_mut() {
-                    while term.scorer.doc() < window_end {
-                        let offset = (term.scorer.doc() - base) as usize;
+                    term.scorer.for_each_score_until(window_end, |doc, score| {
+                        let offset = (doc - base) as usize;
                         candidates[offset / 64] |= 1u64 << (offset % 64);
-                        scores[offset] += term.scorer.score() as f64;
-                        term.scorer.advance();
-                    }
+                        scores[offset] += score as f64;
+                    });
                 }
                 for (word, bits) in candidates.iter_mut().enumerate() {
                     while *bits != 0 {

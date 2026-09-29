@@ -230,6 +230,12 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
     }
 
     fn should_use_block_maxscore(&self, scorers: &[TermScorer], max_doc: DocId) -> bool {
+        if scorers
+            .iter()
+            .any(|scorer| !scorer.bm25_weight().supports_pruning(1.0))
+        {
+            return false;
+        }
         match self.disjunction_pruning {
             DisjunctionPruning::Auto => {
                 super::block_maxscore::should_use_block_maxscore(scorers, max_doc)
@@ -639,11 +645,13 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                         for_each_pruning_scorer(&mut scorer, callback);
                     }
                     _ if self.should_use_block_maxscore(&scorers, reader.max_doc()) => {
+                        let min_window = if scorers.len() == 2 {
+                            0
+                        } else {
+                            super::block_maxscore::MIN_BOUND_WINDOW
+                        };
                         super::block_maxscore::block_maxscore(
-                            scorers,
-                            threshold,
-                            super::block_maxscore::MIN_BOUND_WINDOW,
-                            callback,
+                            scorers, threshold, min_window, callback,
                         );
                     }
                     _ => {
@@ -714,9 +722,26 @@ mod tests {
     use crate::Bm25Params;
 
     #[test]
+    fn test_negative_term_weight_disables_maxscore() {
+        let weight = Bm25Weight::for_one_term(256, 1024, 1.0, Bm25Params::default());
+        let docs: Vec<_> = (0..256).map(|doc| (doc, 1)).collect();
+        let norms = vec![1; 256];
+        let scorers = vec![
+            TermScorer::create_for_test(&docs, &norms, weight.clone()),
+            TermScorer::create_for_test(&docs, &norms, weight.boost_by(-1.0)),
+        ];
+        for mode in [DisjunctionPruning::Auto, DisjunctionPruning::BlockMaxScore] {
+            let boolean = BooleanWeight::new(Vec::new(), true, Box::new(SumCombiner::default))
+                .with_disjunction_pruning(mode);
+            assert!(!boolean.should_use_block_maxscore(&scorers, 1024));
+        }
+    }
+
+    #[test]
     fn test_disjunction_pruning_overrides_cutoffs() {
         for (term_count, doc_freq, max_doc, auto_maxscore) in [
             (2, 1, 1_024, false),
+            (2, 128, 1_024, true),
             (3, 128, 1_024, true),
             (3, 128, 1_048_576, false),
         ] {

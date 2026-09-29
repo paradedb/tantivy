@@ -261,13 +261,26 @@ impl DocSet for BlockWandUnionScorer {
             debug_assert_ne!(pivot_doc, TERMINATED);
             debug_assert!(before_pivot_len < pivot_len);
 
-            let block_max_score_upperbound: Score = self.scorers[..pivot_len]
+            let mut block_max_score_upperbound: Score = self.scorers[..pivot_len]
                 .iter_mut()
                 .map(|scorer| {
                     scorer.seek_block(pivot_doc);
                     scorer.block_max_score()
                 })
                 .sum();
+
+            if block_max_score_upperbound > threshold
+                && self.scorers[..pivot_len]
+                    .iter()
+                    .map(|scorer| scorer.block_score_hint())
+                    .sum::<Score>()
+                    <= threshold
+            {
+                block_max_score_upperbound = self.scorers[..pivot_len]
+                    .iter_mut()
+                    .map(|scorer| scorer.refine_block_max_score())
+                    .sum();
+            }
 
             // Beware after shallow advance, skip readers can be in advance compared to
             // the segment posting lists.
@@ -378,7 +391,10 @@ impl DocSet for BlockWandSingleScorer {
         'outer: loop {
             // We position the scorer on a block that can reach
             // the threshold.
-            while self.scorer.block_max_score() <= threshold {
+            while self.scorer.block_max_score() <= threshold
+                || (self.scorer.block_score_hint() <= threshold
+                    && self.scorer.refine_block_max_score() <= threshold)
+            {
                 let last_doc_in_block = self.scorer.last_doc_in_block();
                 if last_doc_in_block == TERMINATED {
                     self.current = (TERMINATED, Score::MIN);
@@ -663,6 +679,50 @@ mod tests {
                             nearly_equals(score, expected_score),
                             "{mode:?}, k={top_k}: {score} != {expected_score}"
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_disjunction_with_different_segment_average() {
+        let fieldnorms: Vec<_> = (0..1000).map(|doc| 1 + (doc * 71) % 300).collect();
+        for average in [2.0, 50.0, 150.0, 1000.0] {
+            let scorers: Vec<_> = [2, 3, 5]
+                .into_iter()
+                .map(|step| {
+                    let postings: Vec<_> = (0..1000)
+                        .step_by(step)
+                        .map(|doc| (doc, 1 + doc % 13))
+                        .collect();
+                    TermScorer::create_for_test(
+                        &postings,
+                        &fieldnorms,
+                        Bm25Weight::for_one_term(
+                            postings.len() as u64,
+                            1000,
+                            average,
+                            Bm25Params::default(),
+                        ),
+                    )
+                })
+                .collect();
+            for top_k in [1, 3, 10, 100] {
+                let expected =
+                    compute_checkpoints(scorers.clone(), top_k, 1000, PruningMode::NoPruning);
+                for mode in [PruningMode::Wand, PruningMode::MaxScore(0)] {
+                    let actual = compute_checkpoints(scorers.clone(), top_k, 1000, mode);
+                    assert_eq!(
+                        actual.len(),
+                        expected.len(),
+                        "average={average}, k={top_k}, {mode:?}"
+                    );
+                    for (&(doc, score), &(expected_doc, expected_score)) in
+                        actual.iter().zip(&expected)
+                    {
+                        assert_eq!(doc, expected_doc);
+                        assert!(nearly_equals(score, expected_score));
                     }
                 }
             }
