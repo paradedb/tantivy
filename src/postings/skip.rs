@@ -177,8 +177,18 @@ impl SkipReader {
             BlockInfo::BitPacked {
                 block_wand_fieldnorm_id,
                 block_wand_term_freq,
+                strict_delta_encoded,
+                tf_num_bits,
                 ..
-            } => Some(bm25_weight.score(block_wand_fieldnorm_id, block_wand_term_freq)),
+            } => {
+                let max_tf = ((1u64 << tf_num_bits) - 1 + u64::from(strict_delta_encoded))
+                    .min(u64::from(u32::MAX)) as u32;
+                Some(bm25_weight.block_max_score(
+                    block_wand_fieldnorm_id,
+                    block_wand_term_freq,
+                    max_tf,
+                ))
+            }
             BlockInfo::VInt { .. } => None,
         }
     }
