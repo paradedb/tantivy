@@ -221,9 +221,13 @@ impl QuantizedIndexCtx {
             .layers
             .iter()
             .map(|layer| LayerSpec {
+                kind: if layer.bits == 1 {
+                    cascade::LayerKind::Sign
+                } else {
+                    cascade::LayerKind::Grid
+                },
                 bits: layer.bits,
-                seed: layer.seed,
-                rotate: true,
+                rotation: cascade::Rotation::SeededFhtChaCha8 { seed: layer.seed },
             })
             .collect();
         let grids: Vec<Grid> = config

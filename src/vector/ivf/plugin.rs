@@ -437,9 +437,13 @@ fn quantization_runtime(
         .layers
         .iter()
         .map(|layer| LayerSpec {
+            kind: if layer.bits == 1 {
+                cascade::LayerKind::Sign
+            } else {
+                cascade::LayerKind::Grid
+            },
             bits: layer.bits,
-            seed: layer.seed,
-            rotate: true,
+            rotation: cascade::Rotation::SeededFhtChaCha8 { seed: layer.seed },
         })
         .collect();
     let grids = config
@@ -2062,48 +2066,6 @@ mod tests {
     }
 
     #[test]
-    fn layer_zero_io_matches_requested_page_spans() -> crate::Result<()> {
-        use crate::vector::storage_io::test_support::{PagedDirectory, PAGE_BYTES};
-        use crate::vector::Stage;
-        let directory = PagedDirectory::default();
-        let index =
-            build_quantized_fixture_in_directory(64, Metric::L2, &[1], true, directory.clone())?;
-        let field = index.schema().get_field("embedding")?;
-        let searcher = index.reader()?.searcher();
-        directory.reads.lock().unwrap().clear();
-        let result = searcher.search(
-            &AllQuery,
-            &TopDocsByVectorSimilarity::new(field, fixture_search_query(Metric::L2, 64), 16)
-                .with_adaptive_params(AdaptiveProbeParams {
-                    max_probe_fraction: 1.0,
-                    min_probe_clusters: 2,
-                    ..Default::default()
-                }),
-        )?;
-        let reads = directory.reads.lock().unwrap();
-        let ranges: Vec<_> = reads
-            .iter()
-            .filter_map(|(stage, range)| matches!(stage, Stage::LayerScan(0)).then_some(range))
-            .collect();
-        let io = result.stats[0].layers.get(0).unwrap().io;
-        assert!(io.reads > 0);
-        assert_eq!(io.reads, ranges.len() as u64);
-        assert_eq!(
-            io.bytes_read,
-            ranges.iter().map(|r| r.len() as u64).sum::<u64>()
-        );
-        assert_eq!(
-            io.storage_blocks,
-            ranges
-                .iter()
-                .filter(|r| !r.is_empty())
-                .map(|r| ((r.end - 1) / PAGE_BYTES - r.start / PAGE_BYTES + 1) as u64)
-                .sum::<u64>()
-        );
-        Ok(())
-    }
-
-    #[test]
     fn bridge_exactness_d768_and_d100() -> crate::Result<()> {
         assert_quantized_bridge_exactness(768)?;
         assert_quantized_bridge_exactness(100)
@@ -2814,6 +2776,47 @@ mod tests {
             .aggregate()
             .iter()
             .all(|moments| moments.sample_count == 7));
+        Ok(())
+    }
+    #[test]
+    fn layer_zero_io_matches_requested_page_spans() -> crate::Result<()> {
+        use crate::vector::storage_io::test_support::{PagedDirectory, PAGE_BYTES};
+        use crate::vector::Stage;
+        let directory = PagedDirectory::default();
+        let index =
+            build_quantized_fixture_in_directory(64, Metric::L2, &[1], true, directory.clone())?;
+        let field = index.schema().get_field("embedding")?;
+        let searcher = index.reader()?.searcher();
+        directory.reads.lock().unwrap().clear();
+        let result = searcher.search(
+            &AllQuery,
+            &TopDocsByVectorSimilarity::new(field, fixture_search_query(Metric::L2, 64), 16)
+                .with_adaptive_params(AdaptiveProbeParams {
+                    max_probe_fraction: 1.0,
+                    min_probe_clusters: 2,
+                    ..Default::default()
+                }),
+        )?;
+        let reads = directory.reads.lock().unwrap();
+        let ranges: Vec<_> = reads
+            .iter()
+            .filter_map(|(stage, range)| matches!(stage, Stage::LayerScan(0)).then_some(range))
+            .collect();
+        let io = result.stats[0].layers.get(0).unwrap().io;
+        assert!(io.reads > 0);
+        assert_eq!(io.reads, ranges.len() as u64);
+        assert_eq!(
+            io.bytes_read,
+            ranges.iter().map(|r| r.len() as u64).sum::<u64>()
+        );
+        assert_eq!(
+            io.storage_blocks,
+            ranges
+                .iter()
+                .filter(|r| !r.is_empty())
+                .map(|r| ((r.end - 1) / PAGE_BYTES - r.start / PAGE_BYTES + 1) as u64)
+                .sum::<u64>()
+        );
         Ok(())
     }
 }

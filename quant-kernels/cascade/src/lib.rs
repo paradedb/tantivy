@@ -4,7 +4,9 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::sync::Arc;
 
-use fht::Rotation;
+use fht::Rotation as FhtRotation;
+/// Packed GridPlane row width, including its tail word.
+pub use grid_plane::packed_len as grid_code_stride;
 use grid_plane::{
     build_lut, build_packed_lut_4, encode_f32 as encode_grid,
     encode_f32_with_scratch as encode_grid_with_scratch, score as score_grid,
@@ -26,15 +28,37 @@ pub const GAMMA_MIN: f32 = 1.0;
 /// Maximum stored gamma coefficient.
 pub const GAMMA_MAX: f32 = 4.0;
 
-/// Quantization parameters for one residual layer.
+/// Tagged encoder/scorer contract, independent of the numeric code width.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LayerKind {
+    Sign,
+    Grid,
+}
+
+/// Pins the complete rotation construction; semantic changes require a new variant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Rotation {
+    None,
+    SeededFhtChaCha8 { seed: u64 },
+}
+impl Rotation {
+    fn build(self, dim: usize) -> Option<FhtRotation> {
+        match self {
+            Self::None => None,
+            Self::SeededFhtChaCha8 { seed } => Some(FhtRotation::new(dim, seed)),
+        }
+    }
+}
+
+/// Quantization parameters resolved from a segment's explicit tags.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LayerSpec {
-    /// Code width.
+    /// Encoder and scorer contract.
+    pub kind: LayerKind,
+    /// Grid code width, or one for Sign.
     pub bits: u8,
-    /// Rotation seed.
-    pub seed: u64,
-    /// Whether this layer rotates its input.
-    pub rotate: bool,
+    /// Transform applied before encoding and query preparation.
+    pub rotation: Rotation,
 }
 
 /// Encoded layers for one vector.
@@ -127,10 +151,9 @@ impl BatchEncodeWorkspace {
                 constants: Vec::new(),
             });
         for (spec, layer) in specs.iter().zip(&mut self.encoded.layers) {
-            let code_stride = if spec.bits == 1 {
-                d.div_ceil(64) * 8
-            } else {
-                grid_plane::packed_len(d, spec.bits)
+            let code_stride = match spec.kind {
+                LayerKind::Sign => d.div_ceil(64) * 8,
+                LayerKind::Grid => grid_plane::packed_len(d, spec.bits),
             };
             layer.codes.reserve(rows * code_stride);
             layer.scales.reserve(rows);
@@ -282,18 +305,14 @@ pub struct PreparedFpQuery {
 pub struct QueryRotationPlan {
     d: usize,
     specs: Vec<LayerSpec>,
-    rotations: Vec<Option<Rotation>>,
+    rotations: Vec<Option<FhtRotation>>,
 }
 
 impl QueryRotationPlan {
     /// Expands layer seeds into rotations.
     pub fn new(d: usize, specs: &[LayerSpec]) -> Self {
         validate_specs(d, specs);
-        let rotations = specs
-            .iter()
-            .enumerate()
-            .map(|(layer, spec)| (layer == 0 || spec.rotate).then(|| Rotation::new(d, spec.seed)))
-            .collect();
+        let rotations = specs.iter().map(|spec| spec.rotation.build(d)).collect();
         Self {
             d,
             specs: specs.to_vec(),
@@ -393,15 +412,18 @@ pub fn prepare_split_query_with_plan(
     let rotated_layers = plan.prepare_layers(query, specs.len());
     let mut layers = Vec::with_capacity(specs.len());
     for ((spec, grid), current) in specs.iter().zip(grids).zip(rotated_layers) {
-        if spec.bits == 1 {
-            layers.push(PreparedSplitLayer::Sign(prepare_query(
-                &current,
-                sign_query_bits,
-            )));
-        } else {
-            let lut = build_lut(&current, &grid.points, spec.bits);
-            let packed_lut_4 = (spec.bits == 4).then(|| build_packed_lut_4(&lut, query.len()));
-            layers.push(PreparedSplitLayer::Grid { lut, packed_lut_4 });
+        match spec.kind {
+            LayerKind::Sign => {
+                layers.push(PreparedSplitLayer::Sign(prepare_query(
+                    &current,
+                    sign_query_bits,
+                )));
+            }
+            LayerKind::Grid => {
+                let lut = build_lut(&current, &grid.points, spec.bits);
+                let packed_lut_4 = (spec.bits == 4).then(|| build_packed_lut_4(&lut, query.len()));
+                layers.push(PreparedSplitLayer::Grid { lut, packed_lut_4 });
+            }
         }
     }
     PreparedSplitQuery {
@@ -722,7 +744,7 @@ fn encode_batch_in_place_reusing<F>(
             constants: Vec::new(),
         });
     for (layer, (spec, grid)) in specs.iter().zip(grids).enumerate() {
-        if layer == 0 || spec.rotate {
+        if spec.rotation != Rotation::None {
             let rotation = centroid.rotation_plan.rotations[layer]
                 .as_ref()
                 .expect("rotating layer must have a prepared rotation");
@@ -734,10 +756,9 @@ fn encode_batch_in_place_reusing<F>(
             }
         }
 
-        let code_stride = if spec.bits == 1 {
-            d.div_ceil(64) * 8
-        } else {
-            grid_plane::packed_len(d, spec.bits)
+        let code_stride = match spec.kind {
+            LayerKind::Sign => d.div_ceil(64) * 8,
+            LayerKind::Grid => grid_plane::packed_len(d, spec.bits),
         };
         let EncodedLayerBatch {
             codes,
@@ -764,75 +785,78 @@ fn encode_batch_in_place_reusing<F>(
             .zip(prefix_reconstructions.chunks_exact_mut(d))
             .enumerate()
         {
-            if spec.bits == 1 {
-                pack_sign(residual, sign_words);
-                let scale = residual.iter().map(|value| value.abs()).sum::<f32>() / d as f32;
-                let constant = if compute_constants {
-                    let mut constant = 0.0_f32;
-                    for i in 0..d {
-                        let sign = if sign_words[i / 64] & (1_u64 << (i % 64)) != 0 {
-                            1.0
-                        } else {
-                            -1.0
-                        };
-                        let reconstruction = scale * sign;
-                        constant += centroid.layers[layer][i] * reconstruction;
-                        prefix_reconstruction[i] += reconstruction;
-                        residual[i] -= reconstruction;
+            match spec.kind {
+                LayerKind::Sign => {
+                    pack_sign(residual, sign_words);
+                    let scale = residual.iter().map(|value| value.abs()).sum::<f32>() / d as f32;
+                    let constant = if compute_constants {
+                        let mut constant = 0.0_f32;
+                        for i in 0..d {
+                            let sign = if sign_words[i / 64] & (1_u64 << (i % 64)) != 0 {
+                                1.0
+                            } else {
+                                -1.0
+                            };
+                            let reconstruction = scale * sign;
+                            constant += centroid.layers[layer][i] * reconstruction;
+                            prefix_reconstruction[i] += reconstruction;
+                            residual[i] -= reconstruction;
+                        }
+                        Some(constant)
+                    } else {
+                        for i in 0..d {
+                            let sign = if sign_words[i / 64] & (1_u64 << (i % 64)) != 0 {
+                                1.0
+                            } else {
+                                -1.0
+                            };
+                            let reconstruction = scale * sign;
+                            prefix_reconstruction[i] += reconstruction;
+                            residual[i] -= reconstruction;
+                        }
+                        None
+                    };
+                    for &word in sign_words.iter() {
+                        codes.extend_from_slice(&word.to_le_bytes());
                     }
-                    Some(constant)
-                } else {
-                    for i in 0..d {
-                        let sign = if sign_words[i / 64] & (1_u64 << (i % 64)) != 0 {
-                            1.0
-                        } else {
-                            -1.0
-                        };
-                        let reconstruction = scale * sign;
-                        prefix_reconstruction[i] += reconstruction;
-                        residual[i] -= reconstruction;
+                    scales.push(scale);
+                    if let Some(constant) = constant {
+                        constants.push(constant);
                     }
-                    None
-                };
-                for &word in sign_words.iter() {
-                    codes.extend_from_slice(&word.to_le_bytes());
                 }
-                scales.push(scale);
-                if let Some(constant) = constant {
-                    constants.push(constant);
-                }
-            } else {
-                let code_start = codes.len();
-                codes.resize(code_start + code_stride, 0);
-                let scale = encode_grid_with_scratch(
-                    residual,
-                    &grid.points,
-                    spec.bits,
-                    &mut codes[code_start..],
-                    grid_code_scratch,
-                );
-                let constant = if compute_constants {
-                    let mut constant = 0.0_f32;
-                    for i in 0..d {
-                        let point = grid.points[grid_code_scratch[i] as usize];
-                        let reconstruction = scale * point;
-                        constant += centroid.layers[layer][i] * reconstruction;
-                        prefix_reconstruction[i] += reconstruction;
-                        residual[i] -= reconstruction;
+                LayerKind::Grid => {
+                    let code_start = codes.len();
+                    codes.resize(code_start + code_stride, 0);
+                    let scale = encode_grid_with_scratch(
+                        residual,
+                        &grid.points,
+                        spec.bits,
+                        &mut codes[code_start..],
+                        grid_code_scratch,
+                    );
+                    let constant = if compute_constants {
+                        let mut constant = 0.0_f32;
+                        for i in 0..d {
+                            let point = grid.points[grid_code_scratch[i] as usize];
+                            let reconstruction = scale * point;
+                            constant += centroid.layers[layer][i] * reconstruction;
+                            prefix_reconstruction[i] += reconstruction;
+                            residual[i] -= reconstruction;
+                        }
+                        Some(constant)
+                    } else {
+                        for i in 0..d {
+                            let point = grid.points[grid_code_scratch[i] as usize];
+                            let reconstruction = scale * point;
+                            prefix_reconstruction[i] += reconstruction;
+                            residual[i] -= reconstruction;
+                        }
+                        None
+                    };
+                    scales.push(scale);
+                    if let Some(constant) = constant {
+                        constants.push(constant);
                     }
-                    Some(constant)
-                } else {
-                    for i in 0..d {
-                        let point = grid.points[grid_code_scratch[i] as usize];
-                        let reconstruction = scale * point;
-                        prefix_reconstruction[i] += reconstruction;
-                        residual[i] -= reconstruction;
-                    }
-                    None
-                };
-                scales.push(scale);
-                if let Some(constant) = constant {
-                    constants.push(constant);
                 }
             }
             let prefix_dot = residual
@@ -886,46 +910,51 @@ pub fn encode_layers(
     let mut constants = Vec::with_capacity(specs.len());
 
     for (layer, (spec, grid)) in specs.iter().zip(grids).enumerate() {
-        if layer == 0 || spec.rotate {
+        if spec.rotation != Rotation::None {
             if let Some(rotation) =
                 centroid.and_then(|context| context.rotation_plan.rotations[layer].as_ref())
             {
                 rotation.apply(&mut residual);
             } else {
-                Rotation::new(r.len(), spec.seed).apply(&mut residual);
+                spec.rotation.build(r.len()).unwrap().apply(&mut residual);
             }
         }
-        if spec.bits == 1 {
-            let mut words = vec![0_u64; r.len().div_ceil(64)];
-            let scale = encode_sign(&residual, &mut words);
-            let signs = unpack_sign(&words, r.len());
-            let mut constant = 0.0;
-            for (i, (value, sign)) in residual.iter_mut().zip(signs).enumerate() {
-                let reconstruction = scale * sign;
-                if let Some(context) = centroid {
-                    constant += context.layers[layer][i] * reconstruction;
+        match spec.kind {
+            LayerKind::Sign => {
+                let mut words = vec![0_u64; r.len().div_ceil(64)];
+                let scale = encode_sign(&residual, &mut words);
+                let signs = unpack_sign(&words, r.len());
+                let mut constant = 0.0;
+                for (i, (value, sign)) in residual.iter_mut().zip(signs).enumerate() {
+                    let reconstruction = scale * sign;
+                    if let Some(context) = centroid {
+                        constant += context.layers[layer][i] * reconstruction;
+                    }
+                    *value -= reconstruction;
                 }
-                *value -= reconstruction;
+                all_codes.push(words_to_bytes(&words));
+                scales.push(scale);
+                constants.push(constant);
             }
-            all_codes.push(words_to_bytes(&words));
-            scales.push(scale);
-            constants.push(constant);
-        } else {
-            let mut codes = vec![0_u8; grid_plane::packed_len(r.len(), spec.bits)];
-            let scale = encode_grid(&residual, &grid.points, spec.bits, &mut codes);
-            let reconstructed = unpack_grid(&codes, r.len(), spec.bits)
-                .into_iter()
-                .map(|code| scale * grid.points[code as usize]);
-            let mut constant = 0.0;
-            for (i, (value, reconstruction)) in residual.iter_mut().zip(reconstructed).enumerate() {
-                if let Some(context) = centroid {
-                    constant += context.layers[layer][i] * reconstruction;
+            LayerKind::Grid => {
+                let mut codes = vec![0_u8; grid_plane::packed_len(r.len(), spec.bits)];
+                let scale = encode_grid(&residual, &grid.points, spec.bits, &mut codes);
+                let reconstructed = unpack_grid(&codes, r.len(), spec.bits)
+                    .into_iter()
+                    .map(|code| scale * grid.points[code as usize]);
+                let mut constant = 0.0;
+                for (i, (value, reconstruction)) in
+                    residual.iter_mut().zip(reconstructed).enumerate()
+                {
+                    if let Some(context) = centroid {
+                        constant += context.layers[layer][i] * reconstruction;
+                    }
+                    *value -= reconstruction;
                 }
-                *value -= reconstruction;
+                all_codes.push(codes);
+                scales.push(scale);
+                constants.push(constant);
             }
-            all_codes.push(codes);
-            scales.push(scale);
-            constants.push(constant);
         }
     }
     Encoded {
@@ -1007,21 +1036,24 @@ pub fn audit_prefix_error_model(
             rotation.apply(&mut prefix_reconstruction);
         }
 
-        let (codes, scale, reconstruction) = if spec.bits == 1 {
-            let mut words = vec![0_u64; d.div_ceil(64)];
-            let scale = encode_sign(&residual, &mut words);
-            let signs = unpack_sign(&words, d);
-            let reconstruction: Vec<f32> = signs.into_iter().map(|sign| scale * sign).collect();
-            (words_to_bytes(&words), scale, reconstruction)
-        } else {
-            let mut codes = vec![0_u8; grid_plane::packed_len(d, spec.bits)];
-            let scale = encode_grid(&residual, &grid.points, spec.bits, &mut codes);
-            let unpacked = unpack_grid(&codes, d, spec.bits);
-            let reconstruction: Vec<f32> = unpacked
-                .into_iter()
-                .map(|code| scale * grid.points[code as usize])
-                .collect();
-            (codes, scale, reconstruction)
+        let (codes, scale, reconstruction) = match spec.kind {
+            LayerKind::Sign => {
+                let mut words = vec![0_u64; d.div_ceil(64)];
+                let scale = encode_sign(&residual, &mut words);
+                let signs = unpack_sign(&words, d);
+                let reconstruction: Vec<f32> = signs.into_iter().map(|sign| scale * sign).collect();
+                (words_to_bytes(&words), scale, reconstruction)
+            }
+            LayerKind::Grid => {
+                let mut codes = vec![0_u8; grid_plane::packed_len(d, spec.bits)];
+                let scale = encode_grid(&residual, &grid.points, spec.bits, &mut codes);
+                let unpacked = unpack_grid(&codes, d, spec.bits);
+                let reconstruction: Vec<f32> = unpacked
+                    .into_iter()
+                    .map(|code| scale * grid.points[code as usize])
+                    .collect();
+                (codes, scale, reconstruction)
+            }
         };
 
         let mut original_space_contribution = reconstruction.clone();
@@ -1143,13 +1175,14 @@ fn estimate_prepared_fp_layers(
         .iter()
         .zip(grids)
         .enumerate()
-        .map(|(layer, (spec, grid))| {
-            if spec.bits == 1 {
+        .map(|(layer, (spec, grid))| match spec.kind {
+            LayerKind::Sign => {
                 let words = aligned_le_words(&encoded.codes[layer]);
                 let estimate =
                     encoded.scales[layer] * estimate_sign_fp(words.as_ref(), &query.layers[layer]);
                 estimate
-            } else {
+            }
+            LayerKind::Grid => {
                 let lut = build_lut(&query.layers[layer], &grid.points, spec.bits);
                 encoded.scales[layer] * score_grid(&encoded.codes[layer], &lut, d, spec.bits)
             }
@@ -1175,22 +1208,27 @@ pub fn reconstruct_first_space(
     let mut total = vec![0.0; d];
     for layer in 0..specs.len() {
         let spec = specs[layer];
-        let mut reconstruction: Vec<f32> = if spec.bits == 1 {
-            let words = aligned_le_words(&encoded.codes[layer]);
-            let signs = unpack_sign(words.as_ref(), d);
-            signs
-                .into_iter()
-                .map(|sign| encoded.scales[layer] * sign)
-                .collect()
-        } else {
-            unpack_grid(&encoded.codes[layer], d, spec.bits)
+        let mut reconstruction: Vec<f32> = match spec.kind {
+            LayerKind::Sign => {
+                let words = aligned_le_words(&encoded.codes[layer]);
+                let signs = unpack_sign(words.as_ref(), d);
+                signs
+                    .into_iter()
+                    .map(|sign| encoded.scales[layer] * sign)
+                    .collect()
+            }
+            LayerKind::Grid => unpack_grid(&encoded.codes[layer], d, spec.bits)
                 .into_iter()
                 .map(|code| encoded.scales[layer] * grids[layer].points[code as usize])
-                .collect()
+                .collect(),
         };
         for earlier_layer in (1..=layer).rev() {
-            if specs[earlier_layer].rotate {
-                Rotation::new(d, specs[earlier_layer].seed).apply_inverse(&mut reconstruction);
+            if specs[earlier_layer].rotation != Rotation::None {
+                specs[earlier_layer]
+                    .rotation
+                    .build(d)
+                    .unwrap()
+                    .apply_inverse(&mut reconstruction);
             }
         }
         for (sum, value) in total.iter_mut().zip(reconstruction) {
@@ -1247,7 +1285,12 @@ fn validate(d: usize, specs: &[LayerSpec], grids: &[Grid]) {
 fn validate_specs(d: usize, specs: &[LayerSpec]) {
     assert!(d > 0);
     assert!((1..=3).contains(&specs.len()));
-    assert!(specs[0].rotate, "layer 0 must rotate");
+    for spec in specs {
+        match spec.kind {
+            LayerKind::Sign => assert_eq!(spec.bits, 1),
+            LayerKind::Grid => assert!(matches!(spec.bits, 2..=4)),
+        }
+    }
 }
 
 fn words_to_bytes(words: &[u64]) -> Vec<u8> {
@@ -1354,14 +1397,14 @@ mod tests {
         let d = 100;
         let specs = [
             LayerSpec {
+                kind: LayerKind::Sign,
                 bits: 1,
-                seed: 11,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 4,
-                seed: 22,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 22 },
             },
         ];
         let grids = [build_grid(d, 1), build_grid(d, 4)];
@@ -1370,9 +1413,9 @@ mod tests {
 
         let mut direct_current = query.clone();
         let mut direct_layers = Vec::new();
-        for (layer, spec) in specs.iter().enumerate() {
-            if layer == 0 || spec.rotate {
-                Rotation::new(d, spec.seed).apply(&mut direct_current);
+        for spec in &specs {
+            if spec.rotation != Rotation::None {
+                spec.rotation.build(d).unwrap().apply(&mut direct_current);
             }
             direct_layers.push(direct_current.clone());
         }
@@ -1408,19 +1451,19 @@ mod tests {
         let d = 100;
         let specs = [
             LayerSpec {
+                kind: LayerKind::Sign,
                 bits: 1,
-                seed: 11,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 2,
-                seed: 22,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 22 },
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 4,
-                seed: 33,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 33 },
             },
         ];
         let grids = [build_grid(d, 1), build_grid(d, 2), build_grid(d, 4)];
@@ -1437,7 +1480,7 @@ mod tests {
         #[cfg(debug_assertions)]
         assert_eq!(fht::debug_apply_count(), 2);
         let mut expected = query;
-        Rotation::new(d, specs[0].seed).apply(&mut expected);
+        specs[0].rotation.build(d).unwrap().apply(&mut expected);
         assert_eq!(fp.layers[0], expected);
     }
 
@@ -1447,14 +1490,14 @@ mod tests {
         let d = 100;
         let specs = [
             LayerSpec {
+                kind: LayerKind::Sign,
                 bits: 1,
-                seed: 11,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 4,
-                seed: 22,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 22 },
             },
         ];
         let plan = Arc::new(QueryRotationPlan::new(d, &specs));
@@ -1519,19 +1562,19 @@ mod tests {
         let d = 100;
         let specs = [
             LayerSpec {
+                kind: LayerKind::Sign,
                 bits: 1,
-                seed: 11,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 2,
-                seed: 22,
-                rotate: false,
+                rotation: Rotation::None,
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 4,
-                seed: 33,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 33 },
             },
         ];
         let grids = [build_grid(d, 1), build_grid(d, 2), build_grid(d, 4)];
@@ -1539,10 +1582,10 @@ mod tests {
         let plan = QueryRotationPlan::new(d, &specs);
 
         let mut layer_0 = query.clone();
-        Rotation::new(d, specs[0].seed).apply(&mut layer_0);
+        specs[0].rotation.build(d).unwrap().apply(&mut layer_0);
         let layer_1 = layer_0.clone();
         let mut layer_2 = layer_1.clone();
-        Rotation::new(d, specs[2].seed).apply(&mut layer_2);
+        specs[2].rotation.build(d).unwrap().apply(&mut layer_2);
 
         let prefix_fp = prepare_fp_query_with_plan(&query, &plan, 2);
         assert_eq!(prefix_fp.layers, [layer_0.clone(), layer_1.clone()]);
@@ -1580,14 +1623,14 @@ mod tests {
         let d = 64;
         let specs = [
             LayerSpec {
+                kind: LayerKind::Sign,
                 bits: 1,
-                seed: 11,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 4,
-                seed: 22,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 22 },
             },
         ];
         let grids = [build_grid(d, 1), build_grid(d, 4)];
@@ -1597,7 +1640,7 @@ mod tests {
     #[test]
     fn layered_space_bookkeeping_is_exact() {
         let d = 128;
-        let rotation = Rotation::new(d, 22);
+        let rotation = FhtRotation::new(d, 22);
         let u1: Vec<f32> = (0..d).map(|i| (i as f32 * 0.021).sin()).collect();
         let y1: Vec<f32> = (0..d).map(|i| (i as f32 * 0.037).cos()).collect();
         let mut u2 = u1.clone();
@@ -1620,22 +1663,26 @@ mod tests {
         let d = 64;
         let specs = [
             LayerSpec {
+                kind: LayerKind::Sign,
                 bits: 1,
-                seed: 17,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 17 },
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 4,
-                seed: 23,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 23 },
             },
         ];
         let grids = [build_grid(d, 1), build_grid(d, 4)];
         let target = vec![0.5; d];
         let mut input = target.clone();
-        Rotation::new(d, specs[0].seed).apply_inverse(&mut input);
+        specs[0]
+            .rotation
+            .build(d)
+            .unwrap()
+            .apply_inverse(&mut input);
         let mut rotated = input.clone();
-        Rotation::new(d, specs[0].seed).apply(&mut rotated);
+        specs[0].rotation.build(d).unwrap().apply(&mut rotated);
         assert_eq!(rotated, target);
         let encoded = encode_layers(&input, None, &specs, &grids);
         assert_eq!(encoded.scales[1], 0.0);
@@ -1647,14 +1694,14 @@ mod tests {
         let d = 128;
         let specs = [
             LayerSpec {
+                kind: LayerKind::Sign,
                 bits: 1,
-                seed: 11,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 4,
-                seed: 22,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 22 },
             },
         ];
         let grids = [build_grid(d, 1), build_grid(d, 4)];
@@ -1781,14 +1828,14 @@ mod tests {
         let max_rows = 8;
         let specs = [
             LayerSpec {
+                kind: LayerKind::Sign,
                 bits: 1,
-                seed: 11,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 4,
-                seed: 22,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 22 },
             },
         ];
         let grids = [build_grid(d, 1), build_grid(d, 4)];
@@ -1864,9 +1911,15 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(layer, &bits)| LayerSpec {
+                        kind: if bits == 1 {
+                            LayerKind::Sign
+                        } else {
+                            LayerKind::Grid
+                        },
                         bits,
-                        seed: 0x4741_4d4d_4100 + layer as u64,
-                        rotate: true,
+                        rotation: Rotation::SeededFhtChaCha8 {
+                            seed: 0x4741_4d4d_4100 + layer as u64,
+                        },
                     })
                     .collect();
                 let grids: Vec<Grid> = bits.iter().map(|&bits| build_grid(d, bits)).collect();
@@ -1934,9 +1987,15 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(layer, &bits)| LayerSpec {
+                    kind: if bits == 1 {
+                        LayerKind::Sign
+                    } else {
+                        LayerKind::Grid
+                    },
                     bits,
-                    seed: 0xDEC0_DE00 + layer as u64,
-                    rotate: true,
+                    rotation: Rotation::SeededFhtChaCha8 {
+                        seed: 0xDEC0_DE00 + layer as u64,
+                    },
                 })
                 .collect();
             let grids: Vec<Grid> = bits.iter().map(|&bits| build_grid(D, bits)).collect();
@@ -1992,20 +2051,19 @@ mod tests {
 
                 let mut prefix_reconstruction = vec![0.0_f32; D];
                 for (layer, (spec, grid)) in specs.iter().zip(&grids).enumerate() {
-                    let rotation = Rotation::new(D, spec.seed);
+                    let rotation = spec.rotation.build(D).unwrap();
                     rotation.apply(&mut residual);
                     rotation.apply(&mut prefix_reconstruction);
 
-                    let stride = if spec.bits == 1 {
-                        D.div_ceil(64) * std::mem::size_of::<u64>()
-                    } else {
-                        grid_plane::packed_len(D, spec.bits)
+                    let stride = match spec.kind {
+                        LayerKind::Sign => D.div_ceil(64) * std::mem::size_of::<u64>(),
+                        LayerKind::Grid => grid_plane::packed_len(D, spec.bits),
                     };
                     let codes =
                         &batch.layers[layer].codes[row_index * stride..(row_index + 1) * stride];
                     let scale = batch.layers[layer].scales[row_index];
-                    let contribution: Vec<f32> = if spec.bits == 1 {
-                        (0..D)
+                    let contribution: Vec<f32> = match spec.kind {
+                        LayerKind::Sign => (0..D)
                             .map(|i| {
                                 let byte = codes[i / 8];
                                 let sign = if byte & (1 << (i % 8)) != 0 {
@@ -2015,12 +2073,11 @@ mod tests {
                                 };
                                 scale * sign
                             })
-                            .collect()
-                    } else {
-                        unpack_grid(codes, D, spec.bits)
+                            .collect(),
+                        LayerKind::Grid => unpack_grid(codes, D, spec.bits)
                             .into_iter()
                             .map(|code| scale * grid.points[code as usize])
-                            .collect()
+                            .collect(),
                     };
                     for ((residual, prefix), reconstruction) in residual
                         .iter_mut()
@@ -2078,14 +2135,14 @@ mod tests {
         let d = 65;
         let specs = [
             LayerSpec {
+                kind: LayerKind::Sign,
                 bits: 1,
-                seed: 11,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 4,
-                seed: 22,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 22 },
             },
         ];
         let grids = [build_grid(d, 1), build_grid(d, 4)];
@@ -2110,14 +2167,14 @@ mod tests {
         let d = 100;
         let specs = [
             LayerSpec {
+                kind: LayerKind::Sign,
                 bits: 1,
-                seed: 11,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 4,
-                seed: 22,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 22 },
             },
         ];
         let grids = [build_grid(d, 1), build_grid(d, 4)];
@@ -2182,14 +2239,18 @@ mod tests {
         let d = 100;
         let specs = [
             LayerSpec {
+                kind: LayerKind::Sign,
                 bits: 1,
-                seed: 0x4741_4d4d_4101,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 {
+                    seed: 0x4741_4d4d_4101,
+                },
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 4,
-                seed: 0x4741_4d4d_4102,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 {
+                    seed: 0x4741_4d4d_4102,
+                },
             },
         ];
         let grids = [build_grid(d, 1), build_grid(d, 4)];
@@ -2207,10 +2268,9 @@ mod tests {
         {
             assert_eq!(prefix.layer_scale, scale);
             assert_eq!(&prefix.codes, codes);
-            let expected_stride = if spec.bits == 1 {
-                d.div_ceil(64) * std::mem::size_of::<u64>()
-            } else {
-                grid_plane::packed_len(d, spec.bits)
+            let expected_stride = match spec.kind {
+                LayerKind::Sign => d.div_ceil(64) * std::mem::size_of::<u64>(),
+                LayerKind::Grid => grid_plane::packed_len(d, spec.bits),
             };
             assert_eq!(prefix.codes.len(), expected_stride);
             assert_eq!(prefix.gamma.f16, f32_to_f16(prefix.gamma.clamped));
@@ -2231,14 +2291,14 @@ mod tests {
         let d = 769;
         let specs = [
             LayerSpec {
+                kind: LayerKind::Sign,
                 bits: 1,
-                seed: 11,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 4,
-                seed: 22,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 22 },
             },
         ];
         let grids = [build_grid(d, 1), build_grid(d, 4)];
@@ -2266,14 +2326,14 @@ mod tests {
         let d = 65;
         let specs = [
             LayerSpec {
+                kind: LayerKind::Sign,
                 bits: 1,
-                seed: 11,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 4,
-                seed: 22,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 22 },
             },
         ];
         let grids = [build_grid(d, 1), build_grid(d, 4)];
@@ -2294,14 +2354,14 @@ mod tests {
         let d = 100;
         let specs = [
             LayerSpec {
+                kind: LayerKind::Sign,
                 bits: 1,
-                seed: 11,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 4,
-                seed: 22,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 22 },
             },
         ];
         let grids = [build_grid(d, 1), build_grid(d, 4)];
@@ -2314,9 +2374,9 @@ mod tests {
         let sign_specs = [
             specs[0],
             LayerSpec {
+                kind: LayerKind::Sign,
                 bits: 1,
-                seed: specs[1].seed,
-                rotate: true,
+                rotation: specs[1].rotation,
             },
         ];
         let sign_grids = [build_grid(d, 1), build_grid(d, 1)];
@@ -2337,14 +2397,14 @@ mod tests {
         let d = 100;
         let specs = [
             LayerSpec {
+                kind: LayerKind::Sign,
                 bits: 1,
-                seed: 11,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 4,
-                seed: 22,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 22 },
             },
         ];
         let grids = [build_grid(d, 1), build_grid(d, 4)];
@@ -2401,9 +2461,15 @@ mod tests {
             let query: Vec<f32> = (0..d).map(|i| ((i as f32 + 0.25) * 0.019).cos()).collect();
             for bits in 1..=4 {
                 let spec = LayerSpec {
+                    kind: if bits == 1 {
+                        LayerKind::Sign
+                    } else {
+                        LayerKind::Grid
+                    },
                     bits,
-                    seed: 0x00b2_1d00 + u64::from(bits),
-                    rotate: true,
+                    rotation: Rotation::SeededFhtChaCha8 {
+                        seed: 0x00b2_1d00 + u64::from(bits),
+                    },
                 };
                 let grid = build_grid(d, bits);
                 let prepared = prepare_split_query(&query, &[spec], &[grid.clone()], 4);
@@ -2464,16 +2530,17 @@ mod tests {
         }
     }
 
+    // An explicit identity transform is valid even for the first layer.
     #[test]
-    #[should_panic(expected = "layer 0 must rotate")]
-    fn layer_zero_rejects_rotation_ablation() {
+    fn layer_zero_supports_identity_rotation() {
         let specs = [LayerSpec {
             bits: 1,
-            seed: 17,
-            rotate: false,
+            kind: LayerKind::Sign,
+            rotation: Rotation::None,
         }];
         let grids = [build_grid(64, 1)];
-        encode_layers(&[0.25; 64], None, &specs, &grids);
+        let encoded = encode_layers(&[0.25; 64], None, &specs, &grids);
+        assert_eq!(encoded.scales, [0.25]);
     }
 
     #[test]
@@ -2481,14 +2548,14 @@ mod tests {
         let d = 768;
         let specs = [
             LayerSpec {
+                kind: LayerKind::Sign,
                 bits: 1,
-                seed: 11,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 4,
-                seed: 22,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 22 },
             },
         ];
         let grids = [build_grid(d, 1), build_grid(d, 4)];
@@ -2506,7 +2573,7 @@ mod tests {
             let vector = random_unit(&mut rng, d);
             let encoded = encode_layers(&vector, None, &specs, &grids);
             let mut first_space = vector.clone();
-            Rotation::new(d, specs[0].seed).apply(&mut first_space);
+            specs[0].rotation.build(d).unwrap().apply(&mut first_space);
             let reconstructed = reconstruct_first_space(&encoded, &specs, &grids, d);
             for (&actual, estimated) in first_space.iter().zip(reconstructed) {
                 error_energy += f64::from(actual - estimated).powi(2);
@@ -2538,14 +2605,14 @@ mod tests {
         ] {
             let specs = [
                 LayerSpec {
+                    kind: LayerKind::Sign,
                     bits: 1,
-                    seed: 11,
-                    rotate: true,
+                    rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
                 },
                 LayerSpec {
+                    kind: LayerKind::Grid,
                     bits: 4,
-                    seed: 22,
-                    rotate: true,
+                    rotation: Rotation::SeededFhtChaCha8 { seed: 22 },
                 },
             ];
             let grids = [build_grid(d, 1), build_grid(d, 4)];
@@ -2564,7 +2631,7 @@ mod tests {
                 let vector = random_unit(&mut rng, d);
                 let encoded = encode_layers(&vector, None, &specs, &grids);
                 let mut first_space = vector.clone();
-                Rotation::new(d, specs[0].seed).apply(&mut first_space);
+                specs[0].rotation.build(d).unwrap().apply(&mut first_space);
                 let reconstructed = reconstruct_first_space(&encoded, &specs, &grids, d);
                 for (&actual, estimated) in first_space.iter().zip(reconstructed) {
                     error_energy += f64::from(actual - estimated).powi(2);
@@ -2602,26 +2669,26 @@ mod tests {
         let schedules = [
             [
                 LayerSpec {
+                    kind: LayerKind::Sign,
                     bits: 1,
-                    seed: 11,
-                    rotate: true,
+                    rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
                 },
                 LayerSpec {
+                    kind: LayerKind::Grid,
                     bits: 4,
-                    seed: 22,
-                    rotate: true,
+                    rotation: Rotation::SeededFhtChaCha8 { seed: 22 },
                 },
             ],
             [
                 LayerSpec {
+                    kind: LayerKind::Sign,
                     bits: 1,
-                    seed: 11,
-                    rotate: true,
+                    rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
                 },
                 LayerSpec {
+                    kind: LayerKind::Grid,
                     bits: 4,
-                    seed: 22,
-                    rotate: false,
+                    rotation: Rotation::None,
                 },
             ],
         ];
@@ -2668,14 +2735,14 @@ mod tests {
         let d = 768;
         let specs = [
             LayerSpec {
+                kind: LayerKind::Sign,
                 bits: 1,
-                seed: 11,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
             },
             LayerSpec {
+                kind: LayerKind::Grid,
                 bits: 4,
-                seed: 22,
-                rotate: true,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 22 },
             },
         ];
         let grids = [build_grid(d, 1), build_grid(d, 4)];
@@ -2772,5 +2839,37 @@ mod tests {
             absolute <= 1e-7 || relative <= 1e-5,
             "actual={actual}, expected={expected}, absolute={absolute}, relative={relative}"
         );
+    }
+}
+
+#[cfg(test)]
+mod storage_contract_tests {
+    use super::*;
+
+    /// Each quantizer/rotation pair has literal code, scale and transform expectations.
+    #[test]
+    fn tagged_encoder_literal_cases() {
+        let input = [-0.5, 0.25, 0.75, -0.125, 0.375, -0.625, 0.0, 0.5];
+        let transformed = [0.30935916, 0.044194173, 0.0, 0.44194174, -0.26516503, 0.08838839, -0.92807764, 0.6629126];
+        let cases = [
+            (LayerKind::Sign, Rotation::None, [150, 0, 0, 0, 0, 0, 0, 0], 0.390625_f32),
+            (LayerKind::Sign, Rotation::SeededFhtChaCha8 { seed: 7 }, [169, 0, 0, 0, 0, 0, 0, 0], 0.37565047),
+            (LayerKind::Grid, Rotation::None, [120, 146, 0, 0, 0, 0, 0, 0], 0.45285556),
+            (LayerKind::Grid, Rotation::SeededFhtChaCha8 { seed: 7 }, [151, 201, 0, 0, 0, 0, 0, 0], 0.45285556),
+        ];
+        for (kind, rotation, codes, scale) in cases {
+            let bits = if kind == LayerKind::Sign { 1 } else { 2 };
+            let specs = [LayerSpec { kind, bits, rotation }];
+            let grid = Grid { bits, points: if bits == 1 { vec![-1.0, 1.0] } else { vec![-1.5, -0.5, 0.5, 1.5] }, rho_model: 0.5 };
+            let mut rotated = input;
+            if let Some(transform) = rotation.build(input.len()) { transform.apply(&mut rotated); }
+            let expected = if rotation == Rotation::None { input } else { transformed };
+            assert_eq!(rotated.map(f32::to_bits), expected.map(f32::to_bits), "{kind:?} {rotation:?} transform");
+            let mut values = input;
+            let centroid = prepare_centroid(&[0.125; 8], &specs);
+            let encoded = encode_batch_in_place(&mut values, 1, &centroid, &specs, &[grid]);
+            assert_eq!(encoded.layers[0].codes, codes, "{kind:?} {rotation:?} codes");
+            assert_eq!(encoded.layers[0].scales[0].to_bits(), scale.to_bits(), "{kind:?} {rotation:?} scale");
+        }
     }
 }

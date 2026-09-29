@@ -10,14 +10,14 @@ const ROWS: usize = 100;
 fn writer_context_encode(c: &mut Criterion) {
     let specs = [
         LayerSpec {
+            kind: cascade::LayerKind::Sign,
             bits: 1,
-            seed: 0x1111,
-            rotate: true,
+            rotation: cascade::Rotation::SeededFhtChaCha8 { seed: 0x1111 },
         },
         LayerSpec {
+            kind: cascade::LayerKind::Grid,
             bits: 4,
-            seed: 0x2222,
-            rotate: true,
+            rotation: cascade::Rotation::SeededFhtChaCha8 { seed: 0x2222 },
         },
     ];
     let grids = [build_grid(DIM, 1), build_grid(DIM, 4)];
