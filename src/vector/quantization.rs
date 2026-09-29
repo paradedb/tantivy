@@ -9,7 +9,7 @@ use crate::schema::{FieldType, Metric, Schema, VectorDType, VectorOptions};
 use crate::TantivyError;
 
 /// Settings identifier for the vector quantization format.
-pub const VECTOR_QUANTIZATION_FORMAT_VERSION: u32 = super::header::VECTOR_FILE_FORMAT_VERSION;
+pub const VECTOR_QUANTIZATION_FORMAT_VERSION: u32 = 3;
 /// Version of the persisted exact-density Lloyd-Max grid representation.
 pub const GRID_FORMAT_VERSION: u32 = 1;
 /// Maximum number of residual layers stored by the vector format.

@@ -410,3 +410,7 @@ impl<T: VectorElement> VectorArena for FileSliceArena<T> {
 
 mod storage_io;
 pub use storage_io::VectorIoStats;
+
+mod element;
+mod metadata;
+pub use element::MAX_ELEM_BYTES;

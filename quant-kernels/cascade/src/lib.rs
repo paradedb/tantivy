@@ -2850,26 +2850,84 @@ mod storage_contract_tests {
     #[test]
     fn tagged_encoder_literal_cases() {
         let input = [-0.5, 0.25, 0.75, -0.125, 0.375, -0.625, 0.0, 0.5];
-        let transformed = [0.30935916, 0.044194173, 0.0, 0.44194174, -0.26516503, 0.08838839, -0.92807764, 0.6629126];
+        let transformed = [
+            0.30935916,
+            0.044194173,
+            0.0,
+            0.44194174,
+            -0.26516503,
+            0.08838839,
+            -0.92807764,
+            0.6629126,
+        ];
         let cases = [
-            (LayerKind::Sign, Rotation::None, [150, 0, 0, 0, 0, 0, 0, 0], 0.390625_f32),
-            (LayerKind::Sign, Rotation::SeededFhtChaCha8 { seed: 7 }, [169, 0, 0, 0, 0, 0, 0, 0], 0.37565047),
-            (LayerKind::Grid, Rotation::None, [120, 146, 0, 0, 0, 0, 0, 0], 0.45285556),
-            (LayerKind::Grid, Rotation::SeededFhtChaCha8 { seed: 7 }, [151, 201, 0, 0, 0, 0, 0, 0], 0.45285556),
+            (
+                LayerKind::Sign,
+                Rotation::None,
+                [150, 0, 0, 0, 0, 0, 0, 0],
+                0.390625_f32,
+            ),
+            (
+                LayerKind::Sign,
+                Rotation::SeededFhtChaCha8 { seed: 7 },
+                [169, 0, 0, 0, 0, 0, 0, 0],
+                0.37565047,
+            ),
+            (
+                LayerKind::Grid,
+                Rotation::None,
+                [120, 146, 0, 0, 0, 0, 0, 0],
+                0.45285556,
+            ),
+            (
+                LayerKind::Grid,
+                Rotation::SeededFhtChaCha8 { seed: 7 },
+                [151, 201, 0, 0, 0, 0, 0, 0],
+                0.45285556,
+            ),
         ];
         for (kind, rotation, codes, scale) in cases {
             let bits = if kind == LayerKind::Sign { 1 } else { 2 };
-            let specs = [LayerSpec { kind, bits, rotation }];
-            let grid = Grid { bits, points: if bits == 1 { vec![-1.0, 1.0] } else { vec![-1.5, -0.5, 0.5, 1.5] }, rho_model: 0.5 };
+            let specs = [LayerSpec {
+                kind,
+                bits,
+                rotation,
+            }];
+            let grid = Grid {
+                bits,
+                points: if bits == 1 {
+                    vec![-1.0, 1.0]
+                } else {
+                    vec![-1.5, -0.5, 0.5, 1.5]
+                },
+                rho_model: 0.5,
+            };
             let mut rotated = input;
-            if let Some(transform) = rotation.build(input.len()) { transform.apply(&mut rotated); }
-            let expected = if rotation == Rotation::None { input } else { transformed };
-            assert_eq!(rotated.map(f32::to_bits), expected.map(f32::to_bits), "{kind:?} {rotation:?} transform");
+            if let Some(transform) = rotation.build(input.len()) {
+                transform.apply(&mut rotated);
+            }
+            let expected = if rotation == Rotation::None {
+                input
+            } else {
+                transformed
+            };
+            assert_eq!(
+                rotated.map(f32::to_bits),
+                expected.map(f32::to_bits),
+                "{kind:?} {rotation:?} transform"
+            );
             let mut values = input;
             let centroid = prepare_centroid(&[0.125; 8], &specs);
             let encoded = encode_batch_in_place(&mut values, 1, &centroid, &specs, &[grid]);
-            assert_eq!(encoded.layers[0].codes, codes, "{kind:?} {rotation:?} codes");
-            assert_eq!(encoded.layers[0].scales[0].to_bits(), scale.to_bits(), "{kind:?} {rotation:?} scale");
+            assert_eq!(
+                encoded.layers[0].codes, codes,
+                "{kind:?} {rotation:?} codes"
+            );
+            assert_eq!(
+                encoded.layers[0].scales[0].to_bits(),
+                scale.to_bits(),
+                "{kind:?} {rotation:?} scale"
+            );
         }
     }
 }
