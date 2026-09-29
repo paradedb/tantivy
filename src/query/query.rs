@@ -182,6 +182,12 @@ pub trait Query: QueryClone + Send + Sync + downcast_rs::Downcast + fmt::Debug {
     /// See [`Weight`].
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>>;
 
+    /// Estimate unscored matches and traversal cost for planning from metadata, without opening
+    /// posting lists. Counts may include deleted documents. `None` means unsupported.
+    fn estimate_docs(&self, _reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        Ok(None)
+    }
+
     /// Returns an `Explanation` for the score of the document.
     fn explain(&self, searcher: &Searcher, doc_address: DocAddress) -> crate::Result<Explanation> {
         let weight = self.weight(EnableScoring::enabled_from_searcher(searcher))?;
@@ -223,7 +229,8 @@ pub trait QueryClone {
 }
 
 impl<T> QueryClone for T
-where T: 'static + Query + Clone
+where
+    T: 'static + Query + Clone,
 {
     fn box_clone(&self) -> Box<dyn Query> {
         Box::new(self.clone())
@@ -231,6 +238,10 @@ where T: 'static + Query + Clone
 }
 
 impl Query for Box<dyn Query> {
+    fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        self.as_ref().estimate_docs(reader)
+    }
+
     fn weight(&self, enabled_scoring: EnableScoring) -> crate::Result<Box<dyn Weight>> {
         self.as_ref().weight(enabled_scoring)
     }

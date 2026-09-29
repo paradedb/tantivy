@@ -12,6 +12,10 @@ use crate::{DocId, Score};
 pub struct AllQuery;
 
 impl Query for AllQuery {
+    fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        Ok(Some((reader.max_doc(), u64::from(reader.max_doc()))))
+    }
+
     fn weight(&self, _: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         Ok(Box::new(AllWeight))
     }

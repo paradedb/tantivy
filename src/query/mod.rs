@@ -29,6 +29,9 @@ mod union;
 mod weight;
 
 #[cfg(test)]
+mod metadata_estimate_tests;
+
+#[cfg(test)]
 mod vec_docset;
 
 pub(crate) mod score_combiner;
