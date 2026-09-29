@@ -90,14 +90,19 @@ impl Weight for PhraseWeight {
     ) -> crate::Result<Box<dyn PruningScorer>> {
         if let Some(scorer) = self.phrase_scorer(reader, boost)? {
             let can_prune_positions = self.slop == 0
-                && self.similarity_weight_opt.as_ref().is_some_and(|weight| {
-                    let max_score = weight.max_score() * boost;
-                    max_score.is_finite() && max_score >= 0.0
-                });
+                && self
+                    .similarity_weight_opt
+                    .as_ref()
+                    .is_some_and(|weight| weight.supports_pruning(boost));
             if can_prune_positions {
+                let indexing_average = reader
+                    .inverted_index(self.phrase_terms[0].1.field())?
+                    .total_num_tokens() as Score
+                    / reader.max_doc() as Score;
                 Ok(Box::new(BlockPruningPhraseScorer::new(
                     scorer,
                     init_threshold,
+                    indexing_average,
                 )))
             } else {
                 Ok(Box::new(BasicPruningScorer::new(
@@ -194,8 +199,12 @@ mod tests {
             let field = schema.add_text_field("text", options);
             let index = crate::Index::create_in_ram(schema.build());
             let mut writer = index.writer_for_tests()?;
-            for text in &texts {
+            writer.set_merge_policy(Box::new(crate::merge_policy::NoMergePolicy));
+            for (ordinal, text) in texts.iter().enumerate() {
                 writer.add_document(doc!(field => text.as_str()))?;
+                if ordinal == 7 {
+                    writer.commit()?;
+                }
             }
             writer.commit()?;
             drop(writer);

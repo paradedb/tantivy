@@ -299,7 +299,34 @@ impl Bm25Weight {
     }
 
     pub fn max_score(&self) -> Score {
-        self.score(255u8, 2_013_265_944)
+        self.weight.max(0.0)
+    }
+
+    pub(crate) fn supports_pruning(&self, boost: Score) -> bool {
+        let weight = self.weight * boost;
+        weight.is_finite() && weight >= 0.0
+    }
+
+    pub(crate) fn for_block_max_score(&self, indexing_average: Score) -> Option<Self> {
+        if !self.supports_pruning(1.0)
+            || !indexing_average.is_finite()
+            || indexing_average <= 0.0
+            || !self.average_fieldnorm.is_finite()
+            || self.average_fieldnorm <= 0.0
+        {
+            return None;
+        }
+        let mut bound = self.boost_by(1.0 + 4.0 * Score::EPSILON);
+        bound.cache = compute_tf_cache(indexing_average, self.params.k1(), self.params.b());
+        let scale = (indexing_average / self.average_fieldnorm).min(1.0);
+        // Uniform scaling preserves the index-time winner and bounds the query-time TF factor.
+        for value in Arc::make_mut(&mut bound.cache) {
+            *value *= scale;
+            if !value.is_finite() || *value < 0.0 {
+                return None;
+            }
+        }
+        Some(bound)
     }
 
     #[inline]
@@ -350,6 +377,25 @@ mod tests {
     fn test_idf() {
         let score: Score = 2.0;
         assert_nearly_equals!(idf(1, 2), score.ln());
+    }
+
+    #[test]
+    fn test_global_bound_covers_norm_quantization() {
+        use super::Bm25Weight;
+        use crate::Bm25Params;
+
+        for average in [1.0, 10.0, 100.0, 10_000.0] {
+            for params in [Bm25Params::default(), Bm25Params::new(2.0, 1.0)] {
+                for boost in [-2.0, 0.0, 1.0, 3.0] {
+                    let weight = Bm25Weight::for_one_term(10, 100, average, params).boost_by(boost);
+                    for norm in 0..=255 {
+                        for frequency in [1, 4, 128, 1000, u32::MAX] {
+                            assert!(weight.score(norm, frequency) <= weight.max_score());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub struct TermScorer {
     postings: SegmentPostings,
     fieldnorm_reader: FieldNormReader,
     similarity_weight: Bm25Weight,
+    block_max_weight: Option<Bm25Weight>,
 }
 
 impl TermScorer {
@@ -22,6 +23,22 @@ impl TermScorer {
             postings,
             fieldnorm_reader,
             similarity_weight,
+            block_max_weight: None,
+        }
+    }
+
+    pub(crate) fn for_segment(
+        postings: SegmentPostings,
+        fieldnorm_reader: FieldNormReader,
+        similarity_weight: Bm25Weight,
+        indexing_average: Score,
+    ) -> Self {
+        let block_max_weight = similarity_weight.for_block_max_score(indexing_average);
+        Self {
+            postings,
+            fieldnorm_reader,
+            similarity_weight,
+            block_max_weight,
         }
     }
 
@@ -47,7 +64,14 @@ impl TermScorer {
         let segment_postings =
             SegmentPostings::create_from_docs_and_tfs(doc_and_tfs, Some(fieldnorms));
         let fieldnorm_reader = FieldNormReader::for_test(fieldnorms);
-        TermScorer::new(segment_postings, fieldnorm_reader, similarity_weight)
+        let indexing_average = fieldnorms.iter().map(|&len| u64::from(len)).sum::<u64>() as Score
+            / fieldnorms.len() as Score;
+        TermScorer::for_segment(
+            segment_postings,
+            fieldnorm_reader,
+            similarity_weight,
+            indexing_average,
+        )
     }
 
     /// See `FreqReadingOption`.
@@ -57,29 +81,23 @@ impl TermScorer {
 
     /// Returns the maximum score for the current block.
     ///
-    /// In some rare case, the result may not be exact. In this case a lower value is returned,
-    /// (and may lead us to return a lesser document).
-    ///
-    /// At index time, we store the (fieldnorm_id, term frequency) pair that maximizes the
-    /// score assuming the average fieldnorm computed on this segment.
-    ///
-    /// Though extremely rare, it is theoretically possible that the actual average fieldnorm
-    /// is different enough from the current segment average fieldnorm that the maximum over a
-    /// specific is achieved on a different document.
-    ///
-    /// (The result is on the other hand guaranteed to be correct if there is only one segment).
+    /// The bound preserves the index-time maximum when segment and query averages differ.
     pub fn block_max_score(&mut self) -> Score {
+        let Some(weight) = self.block_max_weight.as_ref() else {
+            return self.max_score();
+        };
         self.postings
             .block_cursor
-            .block_max_score(&self.fieldnorm_reader, &self.similarity_weight)
+            .block_max_score(&self.fieldnorm_reader, weight)
     }
 
     pub(crate) fn block_max_score_up_to(&mut self, target: DocId) -> (Score, DocId) {
-        self.postings.block_cursor.block_max_score_up_to(
-            target,
-            &self.fieldnorm_reader,
-            &self.similarity_weight,
-        )
+        let Some(weight) = self.block_max_weight.as_ref() else {
+            return (self.max_score(), crate::TERMINATED);
+        };
+        self.postings
+            .block_cursor
+            .block_max_score_up_to(target, &self.fieldnorm_reader, weight)
     }
 
     pub fn term_freq(&self) -> u32 {
@@ -183,10 +201,11 @@ mod tests {
             bm25_weight,
         );
         let max_scorer = term_scorer.max_score();
-        crate::assert_nearly_equals!(max_scorer, 1.3990127);
+        crate::assert_nearly_equals!(max_scorer, 1.5249238);
         assert_eq!(term_scorer.doc(), 2);
         assert_eq!(term_scorer.term_freq(), 3);
-        assert_nearly_equals!(term_scorer.block_max_score(), 1.3676447);
+        assert!(term_scorer.block_max_score() >= 1.3676447);
+        assert!(term_scorer.block_max_score() <= max_scorer);
         assert_nearly_equals!(term_scorer.score(), 1.0892314);
         assert_eq!(term_scorer.advance(), 3);
         assert_eq!(term_scorer.doc(), 3);
@@ -283,9 +302,45 @@ mod tests {
         assert_nearly_equals!(docs.block_max_score(), 3.4597192);
         docs.seek_block(256);
         // the block is not loaded yet.
-        assert_nearly_equals!(docs.block_max_score(), 5.2971773);
+        assert_nearly_equals!(docs.block_max_score(), docs.max_score());
         assert_eq!(256, docs.seek(256));
         assert_nearly_equals!(docs.block_max_score(), 3.9539647);
+    }
+
+    #[test]
+    fn test_block_bounds_with_different_segment_average() {
+        use crate::query::boolean_query::BlockWandSingleScorer;
+
+        let mut norms = vec![30; 300];
+        norms[0] = 1;
+        norms[1] = 68;
+        let postings: Vec<_> = (0..300)
+            .map(|doc| (doc, if doc == 1 { 4 } else { 1 }))
+            .collect();
+        for average in [1.0, 10.0, 30.0, 90.0, 900.0] {
+            let weight = Bm25Weight::for_one_term(300, 1000, average, Bm25Params::default());
+            let mut scorer = TermScorer::create_for_test(&postings, &norms, weight.clone());
+            let mut expected = Vec::new();
+            while scorer.doc() != TERMINATED {
+                let score = scorer.score();
+                assert!(scorer.block_max_score() >= score, "average={average}");
+                assert!(scorer.max_score() >= score);
+                expected.push((scorer.doc(), score));
+                scorer.advance();
+            }
+            let threshold = weight
+                .score(crate::fieldnorm::FieldNormReader::fieldnorm_to_id(68), 4)
+                .next_down();
+            expected.retain(|&(_, score)| score > threshold);
+            let scorer = TermScorer::create_for_test(&postings, &norms, weight);
+            let mut pruned = BlockWandSingleScorer::new(scorer, threshold);
+            let mut actual = Vec::new();
+            while pruned.doc() != TERMINATED {
+                actual.push((pruned.doc(), pruned.score()));
+                pruned.advance();
+            }
+            assert_eq!(actual, expected, "average={average}");
+        }
     }
 
     fn test_block_wand_aux(term_query: &TermQuery, searcher: &Searcher) -> crate::Result<()> {
