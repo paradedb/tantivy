@@ -769,6 +769,10 @@ impl BlockSegmentPostings {
         }
     }
 
+    pub(crate) fn disable_freq_reading(&mut self) {
+        self.freq_reading_option = FreqReadingOption::NoFreq;
+    }
+
     pub(crate) fn skip_reader(&self) -> &SkipReader {
         &self.skip_reader
     }

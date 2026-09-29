@@ -142,6 +142,18 @@ impl TinySet {
         TinySet(self.0 | other.0)
     }
 
+    /// Creates a `TinySet` directly from raw 64-bit mask.
+    #[inline]
+    pub fn from_bits(bits: u64) -> TinySet {
+        TinySet(bits)
+    }
+
+    /// Unions raw 64-bit mask in place.
+    #[inline]
+    pub fn insert_bits_mut(&mut self, bits: u64) {
+        self.0 |= bits;
+    }
+
     /// Returns true iff the `TinySet` is empty.
     #[inline]
     pub fn is_empty(self) -> bool {

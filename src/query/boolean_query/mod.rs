@@ -3,11 +3,13 @@ mod block_wand_intersection;
 mod block_wand_union;
 mod boolean_query;
 mod boolean_weight;
+mod lazy_windowed_intersection;
 
 pub use self::block_wand_intersection::BlockWandIntersectionScorer;
 pub use self::block_wand_union::{BlockWandSingleScorer, BlockWandUnionScorer};
 pub use self::boolean_query::BooleanQuery;
-pub use self::boolean_weight::BooleanWeight;
+pub use self::boolean_weight::{BooleanWeight, ConjunctionPruning};
+pub use self::lazy_windowed_intersection::LazyWindowedIntersectionScorer;
 
 #[cfg(test)]
 mod tests {
