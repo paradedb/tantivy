@@ -55,6 +55,7 @@ pub struct PhraseScorer<TPostings: Postings> {
     pruning_threshold: Option<Score>,
     fieldnorm_reader: FieldNormReader,
     similarity_weight_opt: Option<Bm25Weight>,
+    indexing_average: Score,
     slop: u32,
     left_slops: Vec<u8>,
     positions_buffer: Vec<u32>,
@@ -395,6 +396,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             phrase_count: 0u32,
             pruning_threshold: None,
             similarity_weight_opt,
+            indexing_average: Score::NAN,
             fieldnorm_reader,
             slop,
             left_slops: Vec::with_capacity(100),
@@ -407,6 +409,11 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         scorer
     }
 
+    pub(crate) fn with_indexing_average(mut self, indexing_average: Score) -> Self {
+        self.indexing_average = indexing_average;
+        self
+    }
+
     pub fn fieldnorm_id(&self) -> u8 {
         self.intersection_docset
             .docset_specialized(0)
@@ -417,6 +424,13 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
 
     pub fn phrase_count(&self) -> u32 {
         self.phrase_count
+    }
+
+    pub(crate) fn global_score_bound(&self) -> Option<Score> {
+        if self.slop != 0 {
+            return None;
+        }
+        self.similarity_weight_opt.as_ref()?.global_score_bound()
     }
 
     pub(crate) fn get_intersection(&mut self) -> &[u32] {
@@ -574,12 +588,6 @@ impl<TPostings: Postings> DocSet for PhraseScorer<TPostings> {
     }
 
     fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
-        debug_assert!(
-            target >= self.doc(),
-            "target ({}) should be greater than or equal to doc ({})",
-            target,
-            self.doc()
-        );
         let seek_res = self.intersection_docset.seek_danger(target);
         if seek_res != SeekDangerResult::Found {
             return seek_res;
@@ -634,6 +642,26 @@ impl<TPostings: Postings> PruningScorer for PhraseScorer<TPostings> {
     }
 }
 
+impl PhraseScorer<SegmentPostings> {
+    pub(crate) fn block_bound_scorer(&self) -> TermScorer {
+        // An exact phrase cannot occur more often than its rarest constituent term.
+        let bound_weight = self
+            .similarity_weight_opt
+            .as_ref()
+            .unwrap()
+            .boost_by(1.0 + 4.0 * Score::EPSILON);
+        TermScorer::for_segment(
+            self.intersection_docset
+                .docset_specialized(0)
+                .postings
+                .clone(),
+            self.fieldnorm_reader.clone(),
+            bound_weight,
+            self.indexing_average,
+        )
+    }
+}
+
 pub(crate) struct BlockPruningPhraseScorer {
     phrase: PhraseScorer<SegmentPostings>,
     approximation: BlockWandSingleScorer,
@@ -646,22 +674,8 @@ impl BlockPruningPhraseScorer {
         threshold: Score,
         indexing_average: Score,
     ) -> Self {
-        // An exact phrase cannot occur more often than its rarest constituent term.
-        let bound_weight = phrase
-            .similarity_weight_opt
-            .as_ref()
-            .unwrap()
-            .boost_by(1.0 + 4.0 * Score::EPSILON);
-        let term = TermScorer::for_segment(
-            phrase
-                .intersection_docset
-                .docset_specialized(0)
-                .postings
-                .clone(),
-            phrase.fieldnorm_reader.clone(),
-            bound_weight,
-            indexing_average,
-        );
+        phrase.indexing_average = indexing_average;
+        let term = phrase.block_bound_scorer();
         phrase.set_threshold(threshold);
         let approximation = BlockWandSingleScorer::new(term, threshold);
         let mut scorer = Self {
