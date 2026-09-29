@@ -1,8 +1,8 @@
-use common::file_slice::FileSlice;
 use std::io::{self, Read, Write};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
+use common::file_slice::FileSlice;
 use common::{BinarySerializable, FixedSize, HasLen, OwnedBytes};
 use tantivy_bitpacker::{BitPacker, compute_num_bits};
 use tantivy_fst::raw::Fst;
@@ -863,14 +863,14 @@ mod tests {
 
 #[cfg(test)]
 mod paging_tests {
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use common::file_slice::FileHandle;
+
     use super::*;
     use crate::SSTableIndexBuilder;
-    use common::file_slice::FileHandle;
-    use std::collections::BTreeSet;
-    use std::sync::{
-        Mutex,
-        atomic::{AtomicBool, Ordering},
-    };
 
     #[derive(Debug)]
     struct RecordingFile {
@@ -942,7 +942,8 @@ mod paging_tests {
             .collect();
         let fetched: usize = reads.iter().map(|range| range.len()).sum();
         println!(
-            "index {size} bytes; open + lookup requested {fetched} bytes across {} storage pages vs {} eager pages",
+            "index {size} bytes; open + lookup requested {fetched} bytes across {} storage pages \
+             vs {} eager pages",
             pages.len(),
             (prefix + size).div_ceil(8192)
         );
