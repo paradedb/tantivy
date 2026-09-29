@@ -49,10 +49,16 @@ struct AssignedVector {
     source_doc_id: DocId,
 }
 
-/// Per-field IVF build timings (one phase per field), emitted at end of build
-/// as a parseable `log::info!` line on target `paradedb::ivf_build`.
+/// Per-field IVF build counters and timings, reported on `paradedb::ivf_build`.
 #[derive(Default)]
 struct IvfBuildTimings {
+    /// Source vector lookups, including lookups for documents without a vector.
+    source_reads: usize,
+    spill_bytes: usize,
+    /// Bytes written to this field's vector entries, including entry padding.
+    /// File headers and the composite footer are excluded.
+    vec_bytes: u64,
+    pad_bytes: usize,
     train: Duration,
     assign: Duration,
     posting_write: Duration,
@@ -352,13 +358,14 @@ impl QuantizedTempSlots {
         vec_write: &mut CompositeWrite,
         field: Field,
         cancel: &dyn CancelSentinel,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<usize> {
+        let mut padding = 0;
         self.residual_norms.splice_into(
             vec_write.for_field_with_idx(field, VectorSlot::ResidualNorms.index()),
             cancel,
         )?;
         for (layer, temp) in self.layers.iter_mut().enumerate() {
-            vec_write.align_next_field(QUANTIZED_CODE_ALIGNMENT, HEADER_LEN)?;
+            padding += vec_write.align_next_field(QUANTIZED_CODE_ALIGNMENT, HEADER_LEN)?;
             temp.codes.splice_into(
                 vec_write.for_field_with_idx(field, VectorSlot::codes(layer).index()),
                 cancel,
@@ -374,7 +381,7 @@ impl QuantizedTempSlots {
                 )?;
             }
         }
-        Ok(())
+        Ok(padding)
     }
 }
 
@@ -667,6 +674,7 @@ pub(crate) fn merge_ivf(
                 let mut sampled_count = 0usize;
                 for source_doc_addr in ctx.doc_id_mapping.iter_source_doc_addrs() {
                     let reader = &field_readers[source_doc_addr.segment_ord as usize];
+                    timings.source_reads += 1;
                     if let Some(bytes) = reader.vector_bytes(source_doc_addr.doc_id)? {
                         let should_sample = sampled_count < training_sample_size
                             && present_vector_ord % training_sample_interval == 0;
@@ -834,6 +842,7 @@ pub(crate) fn merge_ivf(
                         };
                     for source_doc_addr in ctx.doc_id_mapping.iter_source_doc_addrs() {
                         let reader = &field_readers[source_doc_addr.segment_ord as usize];
+                        timings.source_reads += 1;
                         if let Some(bytes) = reader.vector_bytes(source_doc_addr.doc_id)? {
                             batch_doc_ids.push(target_doc_id);
                             decode_row_append::<f32>(&bytes, opts.dim(), &mut batch_values)?;
@@ -900,6 +909,7 @@ pub(crate) fn merge_ivf(
                 }
 
                 let posting_start = Instant::now();
+                let vec_start = vec_write.written_bytes();
                 {
                     let id_map_w = vec_write.for_field_with_idx(field, VectorSlot::IdMap.index());
                     let row_doc_ids: Vec<DocId> = assigned_vectors
@@ -920,6 +930,7 @@ pub(crate) fn merge_ivf(
                             return Err(TantivyError::Cancelled);
                         }
                         let reader = &field_readers[assigned_vector.source_segment_ord];
+                        timings.source_reads += 1;
                         let bytes = reader
                             .vector_bytes(assigned_vector.source_doc_id)?
                             .ok_or_else(|| {
@@ -973,6 +984,16 @@ pub(crate) fn merge_ivf(
                     let quantize_start = Instant::now();
                     let (specs, grids) = quantization_runtime(config, opts)?;
                     let quantized_layout = QuantizedWriteLayout::build(config, &cluster_offsets)?;
+                    timings.spill_bytes = quantized_layout.residual_norms.total_bytes
+                        + quantized_layout
+                            .layers
+                            .iter()
+                            .map(|l| {
+                                l.codes.total_bytes
+                                    + l.sidecar.total_bytes
+                                    + l.constants.as_ref().map_or(0, |c| c.total_bytes)
+                            })
+                            .sum::<usize>();
                     let rotation_plan = Arc::new(QueryRotationPlan::new(opts.dim(), &specs));
                     let mut centroid_workspace = PreparedCentroidWorkspace::new(rotation_plan);
                     let mut temp_slots = QuantizedTempSlots::create(directory, &quantized_layout)?;
@@ -1029,6 +1050,7 @@ pub(crate) fn merge_ivf(
                             batch_values.clear();
                             for assigned_vector in tile {
                                 let reader = &field_readers[assigned_vector.source_segment_ord];
+                                timings.source_reads += 1;
                                 let bytes = reader
                                     .vector_bytes(assigned_vector.source_doc_id)?
                                     .ok_or_else(|| {
@@ -1104,7 +1126,8 @@ pub(crate) fn merge_ivf(
                         }
                         temp_slots.validate_cluster_boundary(&quantized_layout, cluster + 1)?;
                     }
-                    temp_slots.splice_into(&mut vec_write, field, ctx.cancel)?;
+                    timings.pad_bytes =
+                        temp_slots.splice_into(&mut vec_write, field, ctx.cancel)?;
                     timings.quantize = quantize_start.elapsed();
                 }
 
@@ -1145,10 +1168,11 @@ pub(crate) fn merge_ivf(
                 router.serialize(router_w)?;
                 router_w.flush()?;
 
+                timings.vec_bytes = vec_write.written_bytes() - vec_start;
                 log::info!(
                     target: "paradedb::ivf_build",
                     "ivf_build timings_ms train={} assign={} posting_write={} quantize={} total={} \
-                     centroids={} vectors={}",
+                     centroids={} vectors={} source_reads={} spill_bytes={} vec_bytes={} pad_bytes={} encode_ms={}",
                     timings.train.as_millis(),
                     timings.assign.as_millis(),
                     timings.posting_write.as_millis(),
@@ -1156,6 +1180,8 @@ pub(crate) fn merge_ivf(
                     field_build_start.elapsed().as_millis(),
                     num_centroids,
                     vector_count,
+                    timings.source_reads, timings.spill_bytes, timings.vec_bytes, timings.pad_bytes,
+                    (timings.posting_write + timings.quantize).as_millis(),
                 );
             }
         }
@@ -1562,6 +1588,41 @@ mod tests {
         quantized: bool,
         router: RouterKind,
     ) -> crate::Result<Index> {
+        build_quantized_fixture_in_directory_with_router(
+            dim,
+            metric,
+            schedule,
+            quantized,
+            crate::directory::RamDirectory::create(),
+            router,
+        )
+    }
+
+    fn build_quantized_fixture_in_directory(
+        dim: usize,
+        metric: Metric,
+        schedule: &[u8],
+        quantized: bool,
+        directory: impl crate::directory::Directory,
+    ) -> crate::Result<Index> {
+        build_quantized_fixture_in_directory_with_router(
+            dim,
+            metric,
+            schedule,
+            quantized,
+            directory,
+            RouterKind::Rng,
+        )
+    }
+
+    fn build_quantized_fixture_in_directory_with_router(
+        dim: usize,
+        metric: Metric,
+        schedule: &[u8],
+        quantized: bool,
+        directory: impl crate::directory::Directory,
+        router: RouterKind,
+    ) -> crate::Result<Index> {
         let mut schema_builder = Schema::builder();
         let field = schema_builder.add_vector_field("embedding", VectorOptions::new(dim, metric));
         let label_field = schema_builder.add_text_field("label", STRING | STORED);
@@ -1578,9 +1639,10 @@ mod tests {
             .settings(settings)
             .ivf_clusterer(Arc::new(QuantFixtureClusterer { dim, metric }))
             .ivf_router(router)?
-            .create_in_ram()?;
+            .create(directory)?;
         let mut writer = index.writer_with_num_threads(1, 30_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
+        let mut segments = Vec::new();
         for doc in 0..8 {
             let vector = fixture_vector(metric, dim, doc);
             let mut document = TantivyDocument::new();
@@ -1592,10 +1654,13 @@ mod tests {
             writer.add_document(document)?;
             if doc == 3 || doc == 7 {
                 writer.commit()?;
+                for id in index.searchable_segment_ids()? {
+                    if !segments.contains(&id) {
+                        segments.push(id);
+                    }
+                }
             }
         }
-        let mut segments = index.searchable_segment_ids()?;
-        segments.sort();
         writer.merge(&segments).wait()?;
         writer.wait_merging_threads()?;
         Ok(index)
@@ -1993,6 +2058,48 @@ mod tests {
             }
             assert_relative_1e5(scan_sum, harness_sum, &format!("d={dim} row={row} summed"));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn layer_zero_io_matches_requested_page_spans() -> crate::Result<()> {
+        use crate::vector::storage_io::test_support::{PagedDirectory, PAGE_BYTES};
+        use crate::vector::Stage;
+        let directory = PagedDirectory::default();
+        let index =
+            build_quantized_fixture_in_directory(64, Metric::L2, &[1], true, directory.clone())?;
+        let field = index.schema().get_field("embedding")?;
+        let searcher = index.reader()?.searcher();
+        directory.reads.lock().unwrap().clear();
+        let result = searcher.search(
+            &AllQuery,
+            &TopDocsByVectorSimilarity::new(field, fixture_search_query(Metric::L2, 64), 16)
+                .with_adaptive_params(AdaptiveProbeParams {
+                    max_probe_fraction: 1.0,
+                    min_probe_clusters: 2,
+                    ..Default::default()
+                }),
+        )?;
+        let reads = directory.reads.lock().unwrap();
+        let ranges: Vec<_> = reads
+            .iter()
+            .filter_map(|(stage, range)| matches!(stage, Stage::LayerScan(0)).then_some(range))
+            .collect();
+        let io = result.stats[0].layers.get(0).unwrap().io;
+        assert!(io.reads > 0);
+        assert_eq!(io.reads, ranges.len() as u64);
+        assert_eq!(
+            io.bytes_read,
+            ranges.iter().map(|r| r.len() as u64).sum::<u64>()
+        );
+        assert_eq!(
+            io.storage_blocks,
+            ranges
+                .iter()
+                .filter(|r| !r.is_empty())
+                .map(|r| ((r.end - 1) / PAGE_BYTES - r.start / PAGE_BYTES + 1) as u64)
+                .sum::<u64>()
+        );
         Ok(())
     }
 

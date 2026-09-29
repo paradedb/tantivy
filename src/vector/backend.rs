@@ -172,6 +172,8 @@ impl<T: VectorElement> VectorBackend<T> {
         K: SegmentSortKeyComputer,
         CTail: Comparator<K::SegmentSortKey>,
     {
+        let io_before = super::storage_io::snapshot();
+        let fallbacks_before = cascade::sign_word_fallback_counts();
         let mut stats = ProbeStats {
             scan_init_ns: self.scan_init_ns,
             query_prep_ns: self.query_prep_ns,
@@ -208,6 +210,13 @@ impl<T: VectorElement> VectorBackend<T> {
                 )?,
             },
         };
+        let io_after = super::storage_io::snapshot();
+        let fallbacks_after = cascade::sign_word_fallback_counts();
+        for (layer, stats) in stats.layers.0.iter_mut().enumerate() {
+            stats.io = io_after[layer].since(io_before[layer]);
+            stats.sign_word_fallbacks = fallbacks_after[layer] - fallbacks_before[layer];
+        }
+        stats.rerank_io = io_after[3].since(io_before[3]);
         Ok((hits, stats))
     }
 
@@ -340,6 +349,10 @@ pub enum ProbeTermination {
 /// Per-segment probe instrumentation.
 #[derive(Debug, Default)]
 pub struct LayerProbeStats {
+    /// Owned-word decoding fallbacks in sign-plane scoring.
+    pub sign_word_fallbacks: u64,
+    /// Actual read requests issued while scoring this layer.
+    pub io: super::VectorIoStats,
     scan_ns: u64,
     boundary_ns: u64,
     scored: usize,
@@ -386,6 +399,16 @@ impl serde::Serialize for LayerProbeStatsSet {
 
         let mut map = serializer.serialize_map(None)?;
         for (index, layer) in self.0.iter().enumerate() {
+            map.serialize_entry(
+                &format!("layer{index}_sign_word_fallbacks"),
+                &layer.sign_word_fallbacks,
+            )?;
+            map.serialize_entry(&format!("layer{index}_reads"), &layer.io.reads)?;
+            map.serialize_entry(&format!("layer{index}_bytes_read"), &layer.io.bytes_read)?;
+            map.serialize_entry(
+                &format!("layer{index}_storage_blocks"),
+                &layer.io.storage_blocks,
+            )?;
             map.serialize_entry(&format!("layer{index}_scan_ns"), &layer.scan_ns)?;
             map.serialize_entry(&format!("layer{index}_scored"), &layer.scored)?;
             map.serialize_entry(&format!("layer{index}_survivors"), &layer.survivors)?;
@@ -420,6 +443,8 @@ impl LayerProbeStats {
 #[derive(Debug, Default, serde::Serialize)]
 /// Timing and funnel counters for one vector probe.
 pub struct ProbeStats {
+    /// Actual row-fetch requests during exact reranking.
+    pub rerank_io: super::VectorIoStats,
     /// Docs that passed filter + alive + seen and were scored against the
     /// query. This stays the "scored" bucket and equals the final survivor
     /// `candidates`.
@@ -4945,7 +4970,24 @@ mod tests {
         }));
         stats.record_bound_armed(Some(1));
 
-        let value = serde_json::to_value(&stats).expect("ProbeStats should serialize to JSON");
+        let mut value = serde_json::to_value(&stats).expect("ProbeStats should serialize to JSON");
+        let object = value.as_object_mut().unwrap();
+        for key in [
+            "layer0_sign_word_fallbacks",
+            "layer0_reads",
+            "layer0_bytes_read",
+            "layer0_storage_blocks",
+            "layer1_sign_word_fallbacks",
+            "layer1_reads",
+            "layer1_bytes_read",
+            "layer1_storage_blocks",
+        ] {
+            assert_eq!(object.remove(key).unwrap(), 0);
+        }
+        assert_eq!(
+            object.remove("rerank_io").unwrap(),
+            serde_json::json!({"reads": 0, "bytes_read": 0, "storage_blocks": 0})
+        );
         assert_eq!(
             value,
             serde_json::json!({
