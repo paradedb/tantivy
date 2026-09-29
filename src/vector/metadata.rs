@@ -14,58 +14,128 @@ pub(crate) const FLAT_ROWS_PER_BLOCK: u32 = 16_384;
 
 /// Per-field storage contract, also the query-preparation cache key.
 #[derive(Clone, Debug)]
-pub(crate) enum VectorColMetadata {
+#[non_exhaustive]
+pub enum VectorColMetadata {
+    /// Full-precision rows without quantized columns.
     Plain(VectorFieldMeta),
+    /// Full-precision rows plus ordered residual quantization layers.
     Quantized {
+        /// Schema contract and row grouping.
         field: VectorFieldMeta,
+        /// Ordered encoder and scorer contracts.
         layers: Vec<Quantizer>,
     },
 }
 /// Schema and block geometry stored in every Data entry.
 #[derive(Clone, Debug)]
-pub(crate) struct VectorFieldMeta {
-    pub dim: u32,
-    pub dtype: VectorDType,
-    pub metric: Metric,
-    pub norm_policy: VectorNormPolicy,
-    pub partition: Partition,
+pub struct VectorFieldMeta {
+    pub(crate) dim: u32,
+    pub(crate) dtype: VectorDType,
+    pub(crate) metric: Metric,
+    pub(crate) norm_policy: VectorNormPolicy,
+    pub(crate) partition: Partition,
 }
 /// Source of block row boundaries; cluster offsets reside in the centroid file.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Partition {
+#[non_exhaustive]
+pub enum Partition {
+    /// One block per IVF cluster, with offsets stored in the centroid file.
     Clusters,
-    Uniform { rows_per_block: u32 },
+    /// Fixed-size row groups, with a possibly shorter final block.
+    Uniform {
+        /// Maximum number of rows in a block.
+        rows_per_block: u32,
+    },
 }
 /// Tagged encode/decode contract; a semantic change requires a new variant.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub(crate) enum Quantizer {
+#[non_exhaustive]
+pub enum Quantizer {
+    /// One-bit signs scored as popcounted words.
     SignPlane {
+        /// Transform applied before encoding and query preparation.
         rotation: Rotation,
+        /// Exact model parameter bits.
         rho_model: F64Bits,
     },
+    /// Packed scalar codes scored against persisted reconstruction points.
     GridPlane {
+        /// Code width in bits.
         bits: u8,
+        /// Transform applied before encoding and query preparation.
         rotation: Rotation,
+        /// Persisted reconstruction and error model.
         grid: Grid,
     },
 }
 /// Pins the transform, random generator and seed expansion semantics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub(crate) enum Rotation {
+#[non_exhaustive]
+pub enum Rotation {
+    /// Coordinates are used directly.
     None,
-    SeededFhtChaCha8 { seed: u64 },
+    /// Seeded FHT with ChaCha8 and the pinned seed expansion contract.
+    SeededFhtChaCha8 {
+        /// Seed used to construct the transform.
+        seed: u64,
+    },
 }
 /// Exact binary64 identity for persisted model parameters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub(crate) struct F64Bits(pub u64);
+pub struct F64Bits(pub(crate) u64);
+impl F64Bits {
+    /// Exact stored bits, preserving signed zero and NaN payloads.
+    pub fn to_bits(self) -> u64 {
+        self.0
+    }
+    /// Stored model parameter interpreted as binary64.
+    pub fn value(self) -> f64 {
+        f64::from_bits(self.0)
+    }
+}
 /// Persisted reconstruction points; version is descriptive, not query-relevant.
 #[derive(Clone, Debug)]
-pub(crate) struct Grid {
-    pub version: u32,
-    pub points: Vec<f32>,
-    pub rho_model: f64,
+pub struct Grid {
+    pub(crate) version: u32,
+    pub(crate) points: Vec<f32>,
+    pub(crate) rho_model: f64,
+}
+impl VectorFieldMeta {
+    /// Number of coordinates per vector.
+    pub fn dim(&self) -> u32 {
+        self.dim
+    }
+    /// Stored full-precision element representation.
+    pub fn dtype(&self) -> VectorDType {
+        self.dtype
+    }
+    /// Similarity metric used when the segment was built.
+    pub fn metric(&self) -> Metric {
+        self.metric
+    }
+    /// Normalization applied to stored rows.
+    pub fn norm_policy(&self) -> VectorNormPolicy {
+        self.norm_policy
+    }
+    /// Source of the segment's block row boundaries.
+    pub fn partition(&self) -> &Partition {
+        &self.partition
+    }
 }
 impl Grid {
+    /// Descriptive grid-generation version; not part of query identity.
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+    /// Persisted reconstruction points in code order.
+    pub fn points(&self) -> &[f32] {
+        &self.points
+    }
+    /// Persisted error-model parameter.
+    pub fn rho_model(&self) -> f64 {
+        self.rho_model
+    }
+
     fn query_fields(&self) -> (u64, Vec<u32>) {
         (
             self.rho_model.to_bits(),
@@ -96,7 +166,8 @@ pub(crate) struct Slot {
 }
 impl Slot {
     /// Width of the element consumed by the decoder, also the column alignment.
-    pub(crate) const fn type_bytes(&self) -> usize {
+    pub(crate) fn type_bytes(&self) -> usize {
+        debug_assert_eq!(self.elem, self.slot_type.elem());
         self.elem.size()
     }
 }
@@ -112,6 +183,20 @@ pub(crate) enum SlotType {
     QuantLayerConstants { layer: u8 },
 }
 impl SlotType {
+    /// Element required by this column's decoder contract.
+    fn elem(&self) -> ElemType {
+        match self {
+            Self::Rows {
+                dtype: VectorDType::F32,
+            } => ElemType::F32,
+            Self::QuantLayerCodes { quant, .. } => quant.codes_elem(),
+            Self::QuantLayerGammas { .. } | Self::QuantLayerErrors { .. } => ElemType::F16,
+            Self::ResidualNorms
+            | Self::QuantLayerScales { .. }
+            | Self::QuantLayerConstants { .. } => ElemType::F32,
+        }
+    }
+
     /// Norms share band zero so a first-layer scan needs one contiguous read.
     pub(crate) fn band(&self) -> Option<u8> {
         match self {
@@ -135,14 +220,14 @@ impl Quantizer {
     }
 
     /// Returns the numeric width without using it to infer the quantizer kind.
-    pub(crate) fn bits(&self) -> u8 {
+    pub fn bits(&self) -> u8 {
         match self {
             Self::SignPlane { .. } => 1,
             Self::GridPlane { bits, .. } => *bits,
         }
     }
     /// Returns the tagged transform for this encoding contract.
-    pub(crate) fn rotation(&self) -> Rotation {
+    pub fn rotation(&self) -> Rotation {
         match self {
             Self::SignPlane { rotation, .. } | Self::GridPlane { rotation, .. } => *rotation,
         }
@@ -203,16 +288,30 @@ fn invalid(message: &str) -> crate::TantivyError {
 }
 impl VectorColMetadata {
     /// Resolves the field contract without consulting mutable index settings.
-    pub(crate) fn field(&self) -> &VectorFieldMeta {
+    pub fn field(&self) -> &VectorFieldMeta {
         match self {
             Self::Plain(field) | Self::Quantized { field, .. } => field,
         }
     }
     /// Returns the ordered quantizers, or no layers for plain row storage.
-    pub(crate) fn layers(&self) -> &[Quantizer] {
+    pub fn layers(&self) -> &[Quantizer] {
         match self {
             Self::Plain(_) => &[],
             Self::Quantized { layers, .. } => layers,
+        }
+    }
+    /// Logical quantized bytes per row, including residual norms and layer columns.
+    /// Excludes full-precision rows and alignment padding; plain storage returns `None`.
+    pub fn quantized_bytes_per_row(&self) -> Option<usize> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Quantized { .. } => Some(
+                self.slots()
+                    .iter()
+                    .skip(1)
+                    .map(|slot| slot.stride as usize)
+                    .sum(),
+            ),
         }
     }
     /// Rows come first for streaming writes; all remaining columns form scan bands.
@@ -662,6 +761,13 @@ mod tests {
             }
             let plain = VectorColMetadata::build_flat(&VectorOptions::new(100, metric));
             assert_eq!(plain.slots().len(), 1);
+            assert!(matches!(
+                plain.slots()[0].slot_type,
+                SlotType::Rows {
+                    dtype: VectorDType::F32
+                }
+            ));
+            assert_eq!(plain.slots()[0].slot_type.band(), None);
             assert_eq!(plain.slots()[0].stride, 400);
             assert_eq!(plain.slots()[0].elem, ElemType::F32);
             assert_eq!(

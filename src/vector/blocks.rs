@@ -74,6 +74,48 @@ pub(crate) fn write_metadata(
     pad(writer, start - 4 - bytes.len())?;
     Ok(start)
 }
+/// Validated field metadata and the deferred Data entry.
+#[derive(Clone)]
+pub(crate) struct BlockMetadata {
+    entry: FileSlice,
+    pub(crate) meta: Arc<VectorColMetadata>,
+    header_len: usize,
+}
+impl BlockMetadata {
+    pub(crate) fn open(
+        entry: FileSlice,
+        opts: &VectorOptions,
+        clustered: bool,
+    ) -> crate::Result<Self> {
+        if entry.len() < 4 {
+            return Err(bad("missing metadata length"));
+        }
+        let len = u32::from_le_bytes(
+            entry
+                .slice_to(4)
+                .read_bytes()?
+                .as_slice()
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        if len > entry.len() - 4 {
+            return Err(bad("truncated metadata"));
+        }
+        let meta = Arc::new(VectorColMetadata::from_bytes(
+            &entry.slice(4..4 + len).read_bytes()?,
+        )?);
+        meta.validate(opts, clustered)?;
+        let header_len = align_up(4 + len, block_align(&meta.slots()));
+        if header_len > entry.len() {
+            return Err(bad("truncated metadata padding"));
+        }
+        Ok(Self {
+            entry,
+            meta,
+            header_len,
+        })
+    }
+}
 /// Data entry plus derived geometry. Per-column offsets are recomputed, never cached per block.
 pub(crate) struct Blocks {
     entry: FileSlice,
@@ -94,24 +136,24 @@ impl Blocks {
         num_rows: usize,
         clusters: Option<Vec<usize>>,
     ) -> crate::Result<Self> {
-        if entry.len() < 4 {
-            return Err(bad("missing metadata length"));
-        }
-        let len = u32::from_le_bytes(
-            entry
-                .slice_to(4)
-                .read_bytes()?
-                .as_slice()
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        if len > entry.len() - 4 {
-            return Err(bad("truncated metadata"));
-        }
-        let meta = Arc::new(VectorColMetadata::from_bytes(
-            &entry.slice(4..4 + len).read_bytes()?,
-        )?);
-        meta.validate(opts, clusters.is_some())?;
+        Self::from_metadata(
+            BlockMetadata::open(entry, opts, clusters.is_some())?,
+            num_rows,
+            clusters,
+        )
+    }
+
+    /// Validates row geometry before exposing any column bytes.
+    pub(crate) fn from_metadata(
+        metadata: BlockMetadata,
+        num_rows: usize,
+        clusters: Option<Vec<usize>>,
+    ) -> crate::Result<Self> {
+        let BlockMetadata {
+            entry,
+            meta,
+            header_len,
+        } = metadata;
         let block_rows: Vec<usize> = match (&meta.field().partition, clusters) {
             (Partition::Clusters, Some(rows)) => rows,
             (Partition::Uniform { rows_per_block }, None) => (0..num_rows)
@@ -128,26 +170,45 @@ impl Blocks {
         }
         let slots = meta.slots();
         let align = block_align(&slots);
-        let mut position = align_up(4 + len, align);
+        let mut position = header_len;
         let mut block_starts = vec![position as u64];
+        let max_rows = block_rows
+            .windows(2)
+            .map(|r| r[1] - r[0])
+            .max()
+            .unwrap_or(0);
+        let row_bytes: usize = slots.iter().map(|slot| slot.stride as usize).sum();
+        if max_rows
+            .checked_mul(row_bytes)
+            .is_none_or(|size| size > entry.len())
+        {
+            return Err(bad("truncated block"));
+        }
+        // Each row count has one layout; repeated cluster sizes share its checked length.
+        let mut lengths = vec![None; max_rows + 1];
         for rows in block_rows.windows(2) {
-            // Bound arithmetic by the entry length before computing each column's offsets.
             let n = rows[1] - rows[0];
-            let mut size = 0usize;
-            for slot in &slots {
+            let size = if let Some(size) = lengths[n] {
+                size
+            } else {
+                let mut size = 0usize;
+                for slot in &slots {
+                    size = size
+                        .checked_add(slot.type_bytes() - 1)
+                        .map(|s| s & !(slot.type_bytes() - 1))
+                        .and_then(|s| {
+                            n.checked_mul(slot.stride as usize)
+                                .and_then(|len| s.checked_add(len))
+                        })
+                        .ok_or_else(|| bad("block length overflow"))?;
+                }
                 size = size
-                    .checked_add(slot.type_bytes() - 1)
-                    .map(|s| s & !(slot.type_bytes() - 1))
-                    .and_then(|s| {
-                        n.checked_mul(slot.stride as usize)
-                            .and_then(|len| s.checked_add(len))
-                    })
-                    .ok_or_else(|| bad("block length overflow"))?;
-            }
-            size = size
-                .checked_add(align - 1)
-                .map(|s| s & !(align - 1))
-                .ok_or_else(|| bad("block padding overflow"))?;
+                    .checked_add(align - 1)
+                    .map(|s| s & !(align - 1))
+                    .ok_or_else(|| bad("block padding overflow"))?;
+                lengths[n] = Some(size);
+                size
+            };
             position = position
                 .checked_add(size)
                 .ok_or_else(|| bad("entry length overflow"))?;

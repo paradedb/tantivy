@@ -1,10 +1,9 @@
 //! Per-segment row→doc_id map for vector fields.
 //!
-//! Stored as slot `[0]` of the `.vec` composite file, parallel to the dense
-//! row blob in slot `[1]`. The variant is the storage-mode discriminator: the
-//! flat backend writes `Identity` (dense) or `Bitmap` (sparse); the future IVF
-//! backend writes `Explicit`. Reading the variant tag is all it takes to learn
-//! the mode — there is no separate format byte or metadata file.
+//! Stored as the IdMap entry of the `.vec` composite, paired with a Data entry
+//! containing metadata and row-group columns. The flat backend writes Identity
+//! or Bitmap; IVF writes Explicit. Metadata partition validation enforces that
+//! the map variant agrees with routing availability. See [FORMAT.md](../FORMAT.md).
 //!
 //! For the flat variants the map also addresses the dense row array via rank
 //! (`rank(doc_id) -> row_id`) and distinguishes "missing vector" from "zero

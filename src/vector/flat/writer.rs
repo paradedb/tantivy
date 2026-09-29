@@ -9,9 +9,11 @@ use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::plugin::PluginWriter;
 use crate::schema::document::{ErasedDocument, ErasedValue, ReferenceValueLeaf};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
+use crate::vector::blocks::{align_up, block_align, finish_data, pad, write_metadata};
 use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
-use crate::vector::header::write_vector_header;
-use crate::vector::VEC_EXT;
+use crate::vector::header::{write_vector_header, VectorEntry, HEADER_LEN};
+use crate::vector::metadata::{VectorColMetadata, FLAT_ROWS_PER_BLOCK};
+use crate::vector::{MAX_ELEM_BYTES, VEC_EXT};
 use crate::{DocId, TantivyError};
 
 /// Buffers one vector field before serialization.
@@ -124,6 +126,7 @@ impl PluginWriter for FlatVecWriter {
         write_vector_header(&mut write)?;
         let mut composite = CompositeWrite::wrap(write);
 
+        let mut id_maps = Vec::new();
         for (field, buf) in self.fields {
             // Compute (present, row_bytes) in target doc-id order. For
             // the no-remap case the writer already accumulates in
@@ -144,17 +147,30 @@ impl PluginWriter for FlatVecWriter {
                 (buf.present_doc_ids, buf.row_bytes)
             };
 
-            // Slice (field, 0): row→doc_id map. Picks Identity if every
-            // doc is present (typical for dense embeddings, just one
-            // tag byte) or Bitmap otherwise.
-            let id_map_w = composite.for_field_with_idx(field, 0);
-            IdMap::serialize(&present, self.num_docs, id_map_w)?;
-            id_map_w.flush()?;
-
-            // Slice (field, 1): dense LE byte rows, one per present doc.
-            let rows_w = composite.for_field_with_idx(field, 1);
-            rows_w.write_all(&row_bytes)?;
-            rows_w.flush()?;
+            // Data entries precede IdMaps so their exact lengths exclude alignment padding.
+            id_maps.push((field, present));
+            let meta = VectorColMetadata::build_flat(&buf.opts);
+            let align = block_align(&meta.slots());
+            composite.align_next_field(MAX_ELEM_BYTES, HEADER_LEN)?;
+            let data = composite.for_field_with_idx(field, VectorEntry::Data.index());
+            let start = data.written_bytes();
+            write_metadata(data, &meta)?;
+            // A full row group or the final partial group forms one aligned Rows column.
+            for block in row_bytes.chunks(FLAT_ROWS_PER_BLOCK as usize * stride) {
+                data.write_all(block)?;
+                pad(data, align_up(block.len(), align) - block.len())?;
+            }
+            let len = (data.written_bytes() - start) as usize;
+            finish_data(data, len)?;
+            assert_eq!((data.written_bytes() - start) as usize % MAX_ELEM_BYTES, 0);
+            data.flush()?;
+        }
+        for (field, present) in id_maps {
+            IdMap::serialize(
+                &present,
+                self.num_docs,
+                composite.for_field_with_idx(field, VectorEntry::IdMap.index()),
+            )?;
         }
         composite.close()?;
         Ok(())

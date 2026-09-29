@@ -223,7 +223,6 @@ impl<T: VectorElement> VectorBackend<T> {
     /// Flat/exact scan: drain the filter DocSet doc-by-doc, scoring each
     /// survivor from one stride-sized row read. Fills only the
     /// `exact_rows_read` stat.
-    /// Scans full-precision rows matching a filter.
     fn exact_top_n<K, CTail>(
         &self,
         weight: &dyn Weight,
@@ -351,7 +350,7 @@ pub enum ProbeTermination {
 pub struct LayerProbeStats {
     /// Owned-word decoding fallbacks in sign-plane scoring.
     pub sign_word_fallbacks: u64,
-    /// Actual read requests issued while scoring this layer.
+    /// Actual read requests made by this layer.
     pub io: super::VectorIoStats,
     scan_ns: u64,
     boundary_ns: u64,
@@ -441,14 +440,12 @@ impl LayerProbeStats {
 /// [`VectorBackend::top_n`] alongside the hits. The flat/exact path fills
 /// only `exact_rows_read`; every other field is IVF-probe-only.
 #[derive(Debug, Default, serde::Serialize)]
-/// Timing and funnel counters for one vector probe.
 pub struct ProbeStats {
     /// Actual row-fetch requests during exact reranking.
     pub rerank_io: super::VectorIoStats,
     /// Docs that passed filter + alive + seen and were scored against the
     /// query. This stays the "scored" bucket and equals the final survivor
     /// `candidates`.
-    /// Rows scored by the active path.
     pub candidates_scored: usize,
     /// Eligible layer-0 posting rows.
     pub layer0_eligible: usize,
@@ -1568,8 +1565,8 @@ fn combine_refinement_decoded(
 fn score_layer(
     query: &QuantizedQueryCtx,
     layer_idx: usize,
-    metric: Metric,
     layer: &QuantizedLayerReader,
+    residual_norms: Option<&mut Vec<f32>>,
     rows: Range<usize>,
     selection: &Selection<'_>,
     kernel_scores: &mut Vec<f32>,
@@ -1582,6 +1579,7 @@ fn score_layer(
     selected_rows: &mut Vec<usize>,
     row_offsets: &mut Vec<usize>,
 ) -> crate::Result<usize> {
+    let metric = query.index.meta.field().metric();
     let selected_count = selection.len(&rows);
     if selected_count == 0 {
         unreachable!("empty selections are skipped before scoring");
@@ -1597,6 +1595,16 @@ fn score_layer(
     if matches!(selection, Selection::All) {
         let first_row = rows.start;
         let batch = layer.read_batch(rows)?;
+        if let Some(out) = residual_norms {
+            out.resize(selected_count, 0.0);
+            decode_f32s(
+                batch
+                    .residual_norms
+                    .as_ref()
+                    .expect("layer zero band contains norms"),
+                out,
+            );
+        }
         query.score_layer_batch_unscaled(
             layer_idx,
             batch.codes(),
@@ -1656,36 +1664,36 @@ fn score_layer(
     }
     debug_assert_eq!(selected_start, selected_count);
 
-    layer.plan_sidecar_reads(rows.clone(), selected_rows, read_ranges, block_scratch);
-    selected_start = 0;
-    for read_range in read_ranges.iter().cloned() {
-        let sidecar = layer.read_sidecar(read_range.clone())?;
-        while selected_start < selected_count && selected_rows[selected_start] < read_range.end {
-            let row = selected_rows[selected_start];
-            debug_assert!(row >= read_range.start);
-            let scale_offset = (row - read_range.start) * std::mem::size_of::<f32>();
-            decoded_scales[selected_start] = f32::from_le_bytes(
-                sidecar.scales()[scale_offset..scale_offset + 4]
-                    .try_into()
-                    .unwrap(),
-            );
-            let f16_offset = (row - read_range.start) * std::mem::size_of::<u16>();
-            let gamma_bits = u16::from_le_bytes(
-                sidecar.gammas()[f16_offset..f16_offset + 2]
-                    .try_into()
-                    .unwrap(),
-            );
-            let error_ratio_bits = u16::from_le_bytes(
-                sidecar.error_ratios()[f16_offset..f16_offset + 2]
-                    .try_into()
-                    .unwrap(),
-            );
-            decoded_gammas[selected_start] = f16_to_f32(gamma_bits);
-            decoded_error_ratios[selected_start] = f16_to_f32(error_ratio_bits);
-            selected_start += 1;
+    // Each sidecar column gets a plan against its own physical storage blocks.
+    for (kind, idx) in layer.sidecar_columns().into_iter().enumerate() {
+        layer.plan_column_reads(idx, rows.clone(), selected_rows, read_ranges, block_scratch);
+        selected_start = 0;
+        for read_range in read_ranges.iter().cloned() {
+            let bytes = layer.read_column(idx, read_range.clone())?;
+            while selected_start < selected_count && selected_rows[selected_start] < read_range.end
+            {
+                let local = selected_rows[selected_start] - read_range.start;
+                match kind {
+                    0 => {
+                        decoded_scales[selected_start] =
+                            f32::from_le_bytes(bytes[local * 4..local * 4 + 4].try_into().unwrap())
+                    }
+                    1 => {
+                        decoded_gammas[selected_start] = f16_to_f32(u16::from_le_bytes(
+                            bytes[local * 2..local * 2 + 2].try_into().unwrap(),
+                        ))
+                    }
+                    _ => {
+                        decoded_error_ratios[selected_start] = f16_to_f32(u16::from_le_bytes(
+                            bytes[local * 2..local * 2 + 2].try_into().unwrap(),
+                        ))
+                    }
+                }
+                selected_start += 1;
+            }
         }
+        debug_assert_eq!(selected_start, selected_count);
     }
-    debug_assert_eq!(selected_start, selected_count);
     // For sparse selections, the reported error row is approximate after the first selected row.
     validate_decoded_sidecar(
         &decoded_gammas[..selected_count],
@@ -2190,7 +2198,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut postings_row = 0usize;
         let mut postings_skipped = 0usize;
         let bounds = index.bounds();
-        let metric = query.index.config.metric;
+        let metric = query.index.meta.field().metric;
         let q_norm = norm_squared_wide(query.query()).sqrt() as f32;
         let mut bounds_skips = 0u32;
         let mut armed_probe = None;
@@ -2332,8 +2340,8 @@ impl<T: VectorElement> VectorBackend<T> {
             score_layer(
                 query,
                 0,
-                metric,
                 layer,
+                Some(&mut decoded_residual_norms),
                 rows.clone(),
                 &selection,
                 &mut kernel_scores,
@@ -2346,15 +2354,17 @@ impl<T: VectorElement> VectorBackend<T> {
                 &mut selected_rows,
                 &mut indexed_row_offsets,
             )?;
-            decode_selected_residual_norms(
-                quantized,
-                rows.clone(),
-                &selection,
-                &mut decoded_residual_norms,
-                &mut survivor_read_ranges,
-                &mut survivor_block_scratch,
-                &mut selected_rows,
-            )?;
+            if !matches!(selection, Selection::All) {
+                decode_selected_residual_norms(
+                    quantized,
+                    rows.clone(),
+                    &selection,
+                    &mut decoded_residual_norms,
+                    &mut survivor_read_ranges,
+                    &mut survivor_block_scratch,
+                    &mut selected_rows,
+                )?;
+            }
             base_scores.resize(selected_count, 0.0);
             estimate_scores.resize(selected_count, 0.0);
             sigma_scores.resize(selected_count, 0.0);
@@ -2364,7 +2374,7 @@ impl<T: VectorElement> VectorBackend<T> {
             let cluster_score = sim.score();
             combine_initial_decoded(
                 metric,
-                query.index.config.dim,
+                query.index.meta.field().dim as usize,
                 &mut kernel_scores,
                 &mut base_scores,
                 &mut estimate_scores,
@@ -2468,8 +2478,8 @@ impl<T: VectorElement> VectorBackend<T> {
                     let rows = score_layer(
                         query,
                         layer_idx,
-                        metric,
                         layer,
+                        None,
                         available_rows,
                         &selection,
                         &mut kernel_scores,
@@ -2487,14 +2497,15 @@ impl<T: VectorElement> VectorBackend<T> {
                     } else {
                         &[]
                     };
-                    let sign_query_error_squared = if query.index.specs[layer_idx].bits == 1 {
-                        query.query_error_squared(layer_idx) as f32
-                    } else {
-                        0.0
-                    };
+                    let sign_query_error_squared =
+                        if matches!(query.index.specs[layer_idx].kind, cascade::LayerKind::Sign) {
+                            query.query_error_squared(layer_idx) as f32
+                        } else {
+                            0.0
+                        };
                     combine_refinement_decoded(
                         metric,
-                        query.index.config.dim,
+                        query.index.meta.field().dim as usize,
                         &mut scan.candidates,
                         candidate_range,
                         &kernel_scores[..rows],
@@ -2548,8 +2559,8 @@ impl<T: VectorElement> VectorBackend<T> {
                     let rows = score_layer(
                         query,
                         layer_idx,
-                        metric,
                         layer,
+                        None,
                         cluster_rows,
                         &selection,
                         &mut kernel_scores,
@@ -2567,14 +2578,15 @@ impl<T: VectorElement> VectorBackend<T> {
                     } else {
                         &[]
                     };
-                    let sign_query_error_squared = if query.index.specs[layer_idx].bits == 1 {
-                        query.query_error_squared(layer_idx) as f32
-                    } else {
-                        0.0
-                    };
+                    let sign_query_error_squared =
+                        if matches!(query.index.specs[layer_idx].kind, cascade::LayerKind::Sign) {
+                            query.query_error_squared(layer_idx) as f32
+                        } else {
+                            0.0
+                        };
                     combine_refinement_decoded(
                         metric,
-                        query.index.config.dim,
+                        query.index.meta.field().dim as usize,
                         &mut scan.candidates,
                         candidate_range,
                         &kernel_scores[..rows],
@@ -3190,7 +3202,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let index = Arc::new(QuantizedIndexCtx::new(config).unwrap());
+        let index = Arc::new(QuantizedIndexCtx::from_config(config).unwrap());
         let query = QuantizedQueryCtx::new(
             Arc::clone(&index),
             (0..DIM)
@@ -3874,7 +3886,7 @@ mod tests {
             .find(|l| l.contains("ivf_build timings_ms") && l.contains("centroids=200"))
             .expect("expected an ivf_build timings line for the 200-centroid build");
         assert!(line.contains("train="));
-        assert!(line.contains("posting_write="));
+        assert!(line.contains("id_map_write="));
         eprintln!("IVF_BUILD_SAMPLE {line}");
         Ok(())
     }

@@ -1,4 +1,4 @@
-//! Header and slot assignments for per-segment vector files.
+//! Header and entry assignments for per-segment vector files.
 
 use std::io::{self, Read, Write};
 
@@ -17,6 +17,8 @@ pub enum VectorFileVersion {
     V2 = 2,
     /// `.centroids` includes a tagged router and `.vec` includes quantized slots.
     V3 = 3,
+    /// Block-major vector columns with per-field metadata.
+    V4 = 4,
 }
 
 impl BinarySerializable for VectorFileVersion {
@@ -29,6 +31,7 @@ impl BinarySerializable for VectorFileVersion {
             1 => Ok(Self::V1),
             2 => Ok(Self::V2),
             3 => Ok(Self::V3),
+            4 => Ok(Self::V4),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported vector file format version: {other}"),
@@ -38,9 +41,9 @@ impl BinarySerializable for VectorFileVersion {
 }
 
 /// Format identifier written to `.vec` files.
-pub(crate) const VECTOR_FILE_FORMAT_VERSION: u32 = VectorFileVersion::V3 as u32;
+pub(crate) const VECTOR_FILE_FORMAT_VERSION: u32 = VectorFileVersion::V4 as u32;
 /// Version written to `.vec` files.
-pub(crate) const CURRENT_VECTOR: VectorFileVersion = VectorFileVersion::V3;
+pub(crate) const CURRENT_VECTOR: VectorFileVersion = VectorFileVersion::V4;
 /// Version written to `.centroids` files.
 pub(crate) const CURRENT_CENTROID: VectorFileVersion = VectorFileVersion::V3;
 
@@ -76,70 +79,22 @@ impl CentroidSlot {
     }
 }
 
-/// Slots in a vector composite file.
+/// Composite entries of every vector field. Column slots live inside Data blocks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
-pub(crate) enum VectorSlot {
-    /// Row-to-document map.
+pub(crate) enum VectorEntry {
+    /// Row-to-document map, read whole at open.
     IdMap = 0,
-    /// Full-precision vectors.
-    Rows = 1,
-    /// Residual squared norms.
-    ResidualNorms = 2,
-    /// Layer-0 packed codes.
-    Layer0Codes = 3,
-    /// Layer-0 scale, gamma, and error sidecar.
-    Layer0Sidecar = 4,
-    /// Layer-0 L2 constants.
-    Layer0Constants = 5,
-    /// Layer-1 packed codes.
-    Layer1Codes = 6,
-    /// Layer-1 scale, gamma, and error sidecar.
-    Layer1Sidecar = 7,
-    /// Layer-1 L2 constants.
-    Layer1Constants = 8,
-    /// Layer-2 packed codes.
-    Layer2Codes = 9,
-    /// Layer-2 scale, gamma, and error sidecar.
-    Layer2Sidecar = 10,
-    /// Layer-2 L2 constants.
-    Layer2Constants = 11,
+    /// Stored metadata and block columns.
+    Data = 1,
 }
-
-impl VectorSlot {
-    pub(crate) const COUNT: usize = 12;
-
+impl VectorEntry {
     pub(crate) const fn index(self) -> usize {
         self as usize
     }
-
-    pub(crate) const fn codes(layer: usize) -> Self {
-        match layer {
-            0 => Self::Layer0Codes,
-            1 => Self::Layer1Codes,
-            2 => Self::Layer2Codes,
-            _ => panic!("vector quantization supports at most three layers"),
-        }
-    }
-
-    pub(crate) const fn sidecar(layer: usize) -> Self {
-        match layer {
-            0 => Self::Layer0Sidecar,
-            1 => Self::Layer1Sidecar,
-            2 => Self::Layer2Sidecar,
-            _ => panic!("vector quantization supports at most three layers"),
-        }
-    }
-
-    pub(crate) const fn constants(layer: usize) -> Self {
-        match layer {
-            0 => Self::Layer0Constants,
-            1 => Self::Layer1Constants,
-            2 => Self::Layer2Constants,
-            _ => panic!("vector quantization supports at most three layers"),
-        }
-    }
 }
+/// Accepted vector grammars; all other versions require rebuilding.
+pub(crate) const SUPPORTED_VECTOR: &[VectorFileVersion] = &[VectorFileVersion::V4];
 
 fn write_header<W: Write + ?Sized>(writer: &mut W, version: VectorFileVersion) -> io::Result<()> {
     version.serialize(writer)
@@ -159,13 +114,14 @@ fn parse_header(file: &FileSlice, file_kind: &str) -> io::Result<(VectorFileVers
 
 /// Writes a `.vec` header.
 pub(crate) fn write_vector_header<W: Write + ?Sized>(writer: &mut W) -> io::Result<()> {
+    debug_assert_eq!(CURRENT_VECTOR as u32, VECTOR_FILE_FORMAT_VERSION);
     write_header(writer, CURRENT_VECTOR)
 }
 
 /// Validates a `.vec` header and returns its version and composite body.
 pub(crate) fn read_vector_header(file: &FileSlice) -> io::Result<(VectorFileVersion, FileSlice)> {
     let (version, body) = parse_header(file, "vector")?;
-    if version != CURRENT_VECTOR {
+    if !SUPPORTED_VECTOR.contains(&version) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -195,10 +151,10 @@ mod tests {
     fn vector_header_round_trip() {
         let mut buf = Vec::new();
         write_vector_header(&mut buf).unwrap();
-        assert_eq!(buf, [3, 0, 0, 0]);
+        assert_eq!(buf, [4, 0, 0, 0]);
 
         let (version, body) = read_vector_header(&FileSlice::from(buf)).unwrap();
-        assert_eq!(version, VectorFileVersion::V3);
+        assert_eq!(version, VectorFileVersion::V4);
         assert_eq!(body.len(), 0);
     }
 
@@ -213,8 +169,12 @@ mod tests {
     }
 
     #[test]
-    fn vector_headers_before_v3_require_rebuild() {
-        for version in [VectorFileVersion::V1, VectorFileVersion::V2] {
+    fn vector_headers_before_v4_require_rebuild() {
+        for version in [
+            VectorFileVersion::V1,
+            VectorFileVersion::V2,
+            VectorFileVersion::V3,
+        ] {
             let mut buf = Vec::new();
             version.serialize(&mut buf).unwrap();
             let error = read_vector_header(&FileSlice::from(buf)).unwrap_err();
@@ -226,22 +186,5 @@ mod tests {
     fn truncated_vector_header_is_rejected() {
         let error = read_vector_header(&FileSlice::from(vec![2u8, 0])).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
-    }
-
-    #[test]
-    fn quantized_slots_are_layer_separated() {
-        assert_eq!(VectorSlot::IdMap.index(), 0);
-        assert_eq!(VectorSlot::Rows.index(), 1);
-        assert_eq!(VectorSlot::ResidualNorms.index(), 2);
-        assert_eq!(VectorSlot::codes(0).index(), 3);
-        assert_eq!(VectorSlot::sidecar(0).index(), 4);
-        assert_eq!(VectorSlot::constants(0).index(), 5);
-        assert_eq!(VectorSlot::codes(1).index(), 6);
-        assert_eq!(VectorSlot::sidecar(1).index(), 7);
-        assert_eq!(VectorSlot::constants(1).index(), 8);
-        assert_eq!(VectorSlot::codes(2).index(), 9);
-        assert_eq!(VectorSlot::sidecar(2).index(), 10);
-        assert_eq!(VectorSlot::constants(2).index(), 11);
-        assert_eq!(VectorSlot::COUNT, 12);
     }
 }

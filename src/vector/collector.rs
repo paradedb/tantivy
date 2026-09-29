@@ -18,12 +18,14 @@
 //! never the ordering rule.
 //! Top-N vector-similarity collection.
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use super::backend::{ProbeStats, VectorBackend};
 use super::index_reader::QuantizedFieldReader;
 use super::ivf::AdaptiveProbeParams;
+use super::metadata::VectorColMetadata;
 use super::prepared::{QuantizedQueryCtx, VectorQuery};
 use super::tie_break::NoTieBreak;
 use super::{enter_vector_stage, Stage, VectorElement};
@@ -36,6 +38,9 @@ use crate::index::SegmentReader;
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Schema};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal, TantivyError};
+
+/// Shared initialization cell so each metadata key prepares its query exactly once.
+type PreparedCell = Arc<OnceLock<Arc<QuantizedQueryCtx>>>;
 
 /// Top-N by vector similarity. Returns documents in descending
 /// similarity order. Only docs that actually have a vector are
@@ -57,8 +62,8 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     offset: usize,
     adaptive: AdaptiveProbeParams,
     max_scan_levels: usize,
-    /// Prepared on the first quantized segment and shared by the rest.
-    quantized_query: OnceLock<Arc<QuantizedQueryCtx>>,
+    /// Exactly one prepared query for each distinct segment encoding.
+    quantized_queries: Mutex<HashMap<Arc<VectorColMetadata>, PreparedCell>>,
     tie_break: S,
 }
 
@@ -72,7 +77,7 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
             offset: 0,
             adaptive: AdaptiveProbeParams::default(),
             max_scan_levels: usize::MAX,
-            quantized_query: OnceLock::new(),
+            quantized_queries: Mutex::new(HashMap::new()),
             tie_break: NoTieBreak,
         }
     }
@@ -134,7 +139,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
             offset: self.offset,
             adaptive: self.adaptive,
             max_scan_levels: self.max_scan_levels,
-            quantized_query: self.quantized_query,
+            quantized_queries: self.quantized_queries,
             tie_break,
         }
     }
@@ -151,8 +156,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
         Ok(VectorQuery::new(Arc::clone(&self.query), quantized))
     }
 
-    /// A collector reused on another index may meet a different quantization
-    /// config; such segments get their own query instead of the shared one.
+    /// Prepares once per metadata key, releasing the map lock before expensive preparation.
     fn quantized_query(&self, field: &QuantizedFieldReader) -> Arc<QuantizedQueryCtx> {
         let index_ctx = field.index_ctx();
         let prepare = || {
@@ -164,17 +168,19 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
                 active_layers,
             ))
         };
-        let shared = self.quantized_query.get_or_init(prepare);
-        if shared.is_prepared_for(index_ctx) {
-            Arc::clone(shared)
-        } else {
-            prepare()
-        }
+        let cell = Arc::clone(
+            self.quantized_queries
+                .lock()
+                .unwrap()
+                .entry(Arc::clone(&index_ctx.meta))
+                .or_default(),
+        );
+        Arc::clone(cell.get_or_init(prepare))
     }
 
     #[cfg(test)]
-    pub(crate) fn has_quantized_query(&self) -> bool {
-        self.quantized_query.get().is_some()
+    pub(crate) fn quantized_query_count(&self) -> usize {
+        self.quantized_queries.lock().unwrap().len()
     }
 }
 

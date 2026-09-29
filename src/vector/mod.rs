@@ -15,11 +15,17 @@ use std::cell::Cell;
 use std::io;
 
 mod backend;
+mod blocks;
+mod element;
+pub use element::MAX_ELEM_BYTES;
 mod bounds;
 mod collector;
 mod distance;
-mod header;
-mod index_reader;
+pub(crate) mod header;
+pub(crate) mod index_reader;
+mod metadata;
+mod storage_io;
+pub use storage_io::VectorIoStats;
 mod plugin;
 mod prepared;
 pub(crate) mod quantization;
@@ -69,6 +75,9 @@ pub use ivf::{
     MultiLevelIvf, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
     StackedSearchStats, SuperKMeansLevelClusterer, Workspace, APS_MAX_DIM,
+};
+pub use metadata::{
+    F64Bits, Grid, Partition, Quantizer, Rotation, VectorColMetadata, VectorFieldMeta,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
@@ -407,12 +416,3 @@ impl<T: VectorElement> VectorArena for FileSliceArena<T> {
         metric.similarity_bytes(query, &bytes)
     }
 }
-
-mod storage_io;
-pub use storage_io::VectorIoStats;
-
-mod element;
-mod metadata;
-pub use element::MAX_ELEM_BYTES;
-
-mod blocks;

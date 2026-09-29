@@ -116,7 +116,7 @@ fn l2_cluster(
             } else {
                 cascade::LayerKind::Grid
             },
-            bits: bits,
+            bits,
             rotation: cascade::Rotation::SeededFhtChaCha8 {
                 seed: seed + layer as u64,
             },
