@@ -227,9 +227,16 @@ impl TermWeight {
         }
 
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
+        let indexing_average =
+            inverted_index.total_num_tokens() as Score / fieldnorm_reader.num_docs() as Score;
         let similarity_weight = self.similarity_weight.boost_by(boost);
         Ok(TermOrEmptyOrAllScorer::TermScorer(Box::new(
-            TermScorer::new(segment_postings, fieldnorm_reader, similarity_weight),
+            TermScorer::for_segment(
+                segment_postings,
+                fieldnorm_reader,
+                similarity_weight,
+                indexing_average,
+            ),
         )))
     }
 
