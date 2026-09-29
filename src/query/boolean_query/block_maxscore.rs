@@ -8,7 +8,14 @@ pub(super) const MIN_BOUND_WINDOW: u32 = 8192;
 const WINDOW: usize = 4096;
 
 pub(super) fn should_use_block_maxscore(scorers: &[TermScorer], max_doc: DocId) -> bool {
-    // Benchmark cutoffs keep WAND for 1-2 terms or fewer than 256 postings.
+    if scorers.len() == 2 {
+        let left = u64::from(scorers[0].size_hint());
+        let right = u64::from(scorers[1].size_hint());
+        if left.min(right) * 64 < left.max(right) {
+            return false;
+        }
+    }
+    // Keep WAND for a single term or fewer than 256 postings.
     // Require one posting per 256 doc IDs to avoid sparse-query regressions:
     // 32 expected term matches per 8192-doc window, counting overlapping terms.
     let postings: u64 = scorers
@@ -16,7 +23,7 @@ pub(super) fn should_use_block_maxscore(scorers: &[TermScorer], max_doc: DocId) 
         .map(|scorer| u64::from(scorer.size_hint()))
         .sum();
     let max_docs_per_posting = 256;
-    scorers.len() >= 3
+    scorers.len() >= 2
         && postings >= 256
         && postings.saturating_mul(max_docs_per_posting) >= u64::from(max_doc)
 }
@@ -69,6 +76,20 @@ pub(super) fn block_maxscore(
             term.bound = bound as f64 * rounding;
             term.priority = term.bound * term.inv_cost;
             end = end.min(last.saturating_add(1));
+        }
+        if min_window == 0
+            && terms.iter().map(|term| term.bound).sum::<f64>() > threshold as f64
+            && terms
+                .iter()
+                .map(|term| term.scorer.block_score_hint() as f64)
+                .sum::<f64>()
+                * rounding
+                <= threshold as f64
+        {
+            for term in &mut terms {
+                term.bound = term.scorer.refine_block_max_score() as f64 * rounding;
+                term.priority = term.bound * term.inv_cost;
+            }
         }
         // Low bound per posting cost goes first: these terms are candidates for deferred scoring.
         terms.sort_unstable_by(|a, b| a.priority.total_cmp(&b.priority));
