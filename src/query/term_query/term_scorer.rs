@@ -121,10 +121,13 @@ impl TermScorer {
                 return score;
             }
         }
-        if !self.similarity_weight.supports_pruning(1.0) {
+        if self.freq_reading_option() != FreqReadingOption::ReadFreq
+            || !self.similarity_weight.supports_pruning(1.0)
+        {
             return self.max_score();
         }
         // Shallow seeks must not change the logical document or its decoded block.
+        self.postings.block_cursor.cache_block_data();
         let mut block = self.postings.block_cursor.clone();
         block.load_block();
         let len = block.block_len();
