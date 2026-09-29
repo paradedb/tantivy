@@ -178,23 +178,35 @@ where
             // `target` sorts past the last block; since input is sorted,
             // every remaining input is also past the last block — `?`
             // short-circuits the whole iterator in that case.
-            let target_block = self
-                .next_block_addr
-                .take()
-                .unwrap_or_else(|| self.dict.sstable_index.get_block_with_key(target))?;
+            let target_block = match self.next_block_addr.take() {
+                Some(block) => block,
+                None => match self.dict.sstable_index.get_block_with_key(target) {
+                    Ok(block) => block,
+                    Err(error) => {
+                        self.errored = true;
+                        return Some(Err(error));
+                    }
+                },
+            }?;
 
             // Transition to a new block if needed. `BlockAddr` derives
             // `PartialEq`, so direct comparison is correct.
             if self.current_block_addr.as_ref() != Some(&target_block) {
                 match self.dict.sstable_delta_reader_block(target_block.clone()) {
                     Ok(reader) => {
-                        let next_block = self
+                        let next_block = match self
                             .sorted_keys
                             .as_slice()
                             .get(self.input_cursor + 1)
-                            .and_then(|key| {
-                                self.dict.sstable_index.get_block_with_key(key.as_ref())
-                            });
+                            .map(|key| self.dict.sstable_index.get_block_with_key(key.as_ref()))
+                            .transpose()
+                        {
+                            Ok(block) => block.flatten(),
+                            Err(error) => {
+                                self.errored = true;
+                                return Some(Err(error));
+                            }
+                        };
                         let single_key = next_block.as_ref() != Some(&target_block);
                         self.next_block_addr = Some(next_block);
                         if single_key {
