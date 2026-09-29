@@ -8,7 +8,7 @@ use crate::{DocId, DocSet, Score, TERMINATED};
 
 pub(super) enum MixedScorer {
     Term(TermScorer),
-    Phrase(DeferredPhraseScorer, Score),
+    Phrase(DeferredPhraseScorer, Box<TermScorer>),
 }
 
 pub(super) struct DeferredPhraseScorer {
@@ -21,7 +21,8 @@ pub(super) struct DeferredPhraseScorer {
 
 impl MixedScorer {
     pub(super) fn from_phrase(scorer: PhraseScorer<SegmentPostings>) -> Self {
-        let bound = scorer.global_score_bound().unwrap();
+        assert!(scorer.global_score_bound().is_some());
+        let bound = Box::new(scorer.block_bound_scorer());
         let phrase = DeferredPhraseScorer {
             doc: scorer.doc(),
             verified: true,
@@ -158,8 +159,9 @@ impl Scorer for MixedScorer {
 impl BlockMaxScorer for MixedScorer {
     #[inline]
     fn seek_block(&mut self, target: DocId) {
-        if let Self::Term(scorer) = self {
-            scorer.seek_block(target);
+        match self {
+            Self::Term(scorer) => scorer.seek_block(target),
+            Self::Phrase(_, bound) => bound.seek_block(target),
         }
     }
 
@@ -167,7 +169,7 @@ impl BlockMaxScorer for MixedScorer {
     fn block_max_score_up_to(&mut self, target: DocId) -> (Score, DocId) {
         match self {
             Self::Term(scorer) => scorer.block_max_score_up_to(target),
-            Self::Phrase(_, bound) => (*bound, TERMINATED),
+            Self::Phrase(_, bound) => bound.block_max_score_up_to(target),
         }
     }
 
@@ -175,7 +177,7 @@ impl BlockMaxScorer for MixedScorer {
     fn block_score_hint(&self) -> Score {
         match self {
             Self::Term(scorer) => scorer.block_score_hint(),
-            Self::Phrase(_, bound) => *bound,
+            Self::Phrase(_, bound) => bound.block_score_hint(),
         }
     }
 
@@ -183,7 +185,7 @@ impl BlockMaxScorer for MixedScorer {
     fn refine_block_max_score(&mut self) -> Score {
         match self {
             Self::Term(scorer) => scorer.refine_block_max_score(),
-            Self::Phrase(_, bound) => *bound,
+            Self::Phrase(_, bound) => bound.refine_block_max_score(),
         }
     }
 
@@ -304,55 +306,98 @@ mod tests {
 
     #[test]
     fn test_deferred_phrase_checks_and_scoring_windows() -> crate::Result<()> {
-        let mut schema = Schema::builder();
-        let field = schema.add_text_field("text", TEXT);
-        let index = Index::create_in_ram(schema.build());
-        let mut writer = index.writer_for_tests()?;
-        for text in ["a x b", "a b", "x", "a x b", "a b a b", "a x b"] {
-            writer.add_document(doc!(field => text))?;
-        }
-        writer.commit()?;
-        drop(writer);
-        let searcher = index.reader()?.searcher();
-        let query = QueryParser::for_index(&index, vec![field]).parse_query("\"a b\"")?;
-        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
-        let reader = searcher.segment_reader(0);
-        let mut expected = Vec::new();
-        let mut ordinary = weight.scorer(reader, 1.0)?;
-        while ordinary.doc() != TERMINATED {
-            expected.push((ordinary.doc(), ordinary.score()));
-            ordinary.advance();
-        }
-        let mut before_first = weight.scorer(reader, 1.0)?;
-        assert_eq!(
-            before_first.seek_danger(0),
-            SeekDangerResult::SeekLowerBound(1)
-        );
-        assert_eq!(before_first.seek_danger(1), SeekDangerResult::Found);
-        assert_eq!(before_first.score(), expected[0].1);
-        for candidate in [0, 1, 2, 3, 4, 5, TERMINATED] {
-            let phrase = weight
-                .scorer(reader, 1.0)?
-                .downcast::<PhraseScorer<SegmentPostings>>()
-                .map_err(|_| ())
-                .unwrap();
-            let mut scorer = MixedScorer::from_phrase(*phrase);
-            let reference = expected
-                .iter()
-                .find(|&&(doc, _)| doc == candidate)
-                .map(|&(_, score)| score);
-            assert_eq!(scorer.score_at(candidate), reference);
-            assert_eq!(scorer.score_at(candidate), reference);
-            let mut actual = Vec::new();
-            scorer.for_each_score_until(TERMINATED, |doc, score| actual.push((doc, score)));
-            assert_eq!(
-                actual,
-                expected
-                    .iter()
-                    .copied()
-                    .filter(|&(doc, _)| doc >= candidate)
-                    .collect::<Vec<_>>()
+        for pnorms in [false, true] {
+            let mut schema = Schema::builder();
+            let options = TEXT.set_indexing_options(
+                TEXT.get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_pnorms(pnorms),
             );
+            let field = schema.add_text_field("text", options);
+            let index = Index::create_in_ram(schema.build());
+            let mut writer = index.writer_for_tests()?;
+            for text in ["a x b", "a b", "x", "a x b", "a b a b", "a x b"] {
+                writer.add_document(doc!(field => text))?;
+            }
+            for ordinal in 0..20_000 {
+                let text = if ordinal % 7 == 0 {
+                    "a b ".repeat(1 + ordinal % 11)
+                } else if ordinal % 5 == 0 {
+                    "a x b ".repeat(1 + ordinal % 101)
+                } else {
+                    "x".to_owned()
+                };
+                writer.add_document(doc!(field => text))?;
+            }
+            writer.commit()?;
+            drop(writer);
+            let searcher = index.reader()?.searcher();
+            let query = QueryParser::for_index(&index, vec![field]).parse_query("\"a b\"")?;
+            let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+            let reader = searcher.segment_reader(0);
+            let mut expected = Vec::new();
+            let mut ordinary = weight.scorer(reader, 1.0)?;
+            while ordinary.doc() != TERMINATED {
+                expected.push((ordinary.doc(), ordinary.score()));
+                ordinary.advance();
+            }
+            let mut before_first = weight.scorer(reader, 1.0)?;
+            assert_eq!(
+                before_first.seek_danger(0),
+                SeekDangerResult::SeekLowerBound(1)
+            );
+            assert_eq!(before_first.seek_danger(1), SeekDangerResult::Found);
+            assert_eq!(before_first.score(), expected[0].1);
+            for unknown_average in [false, true] {
+                for candidate in [
+                    0, 1, 2, 3, 4, 5, 4095, 4096, 8191, 8192, 16383, 19000, TERMINATED,
+                ] {
+                    let phrase = weight
+                        .scorer(reader, 1.0)?
+                        .downcast::<PhraseScorer<SegmentPostings>>()
+                        .map_err(|_| ())
+                        .unwrap();
+                    let phrase = if unknown_average {
+                        (*phrase).with_indexing_average(Score::NAN)
+                    } else {
+                        *phrase
+                    };
+                    let mut scorer = MixedScorer::from_phrase(phrase);
+                    let logical_doc = scorer.doc();
+                    scorer.seek_block(candidate);
+                    let (bound, end) = scorer
+                        .block_max_score_up_to(candidate.saturating_add(8191).min(TERMINATED));
+                    assert_eq!(scorer.doc(), logical_doc);
+                    for &(doc, score) in &expected {
+                        if doc >= candidate && doc <= end {
+                            assert!(score <= bound, "doc={doc}, score={score}, bound={bound}");
+                        }
+                    }
+                    let refined = scorer.refine_block_max_score();
+                    assert!(refined.is_finite());
+                    assert_eq!(scorer.doc(), logical_doc);
+                    let reference = expected
+                        .iter()
+                        .find(|&&(doc, _)| doc == candidate)
+                        .map(|&(_, score)| score);
+                    assert_eq!(scorer.score_at(candidate), reference);
+                    assert_eq!(scorer.score_at(candidate), reference);
+                    let logical_doc = scorer.doc();
+                    scorer.seek_block(candidate.saturating_add(1024).min(TERMINATED));
+                    assert_eq!(scorer.doc(), logical_doc);
+                    let mut actual = Vec::new();
+                    scorer.for_each_score_until(TERMINATED, |doc, score| actual.push((doc, score)));
+                    assert_eq!(
+                        actual,
+                        expected
+                            .iter()
+                            .copied()
+                            .filter(|&(doc, _)| doc >= candidate)
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
         }
         Ok(())
     }

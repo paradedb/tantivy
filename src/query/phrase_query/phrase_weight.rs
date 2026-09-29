@@ -49,6 +49,14 @@ impl PhraseWeight {
             .as_ref()
             .map(|similarity_weight| similarity_weight.boost_by(boost));
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
+        let indexing_average = if similarity_weight_opt.is_some() {
+            reader
+                .inverted_index(self.phrase_terms[0].1.field())?
+                .total_num_tokens() as Score
+                / reader.max_doc() as Score
+        } else {
+            Score::NAN
+        };
         if self.slop == 0
             && self.phrase_terms.len() > 2
             && self
@@ -80,11 +88,10 @@ impl PhraseWeight {
                     };
                     postings.push((offsets, term_postings));
                 }
-                return Ok(Some(PhraseScorer::new_grouped(
-                    postings,
-                    similarity_weight_opt,
-                    fieldnorm_reader,
-                )));
+                return Ok(Some(
+                    PhraseScorer::new_grouped(postings, similarity_weight_opt, fieldnorm_reader)
+                        .with_indexing_average(indexing_average),
+                ));
             }
         }
         let mut term_postings_list = Vec::new();
@@ -98,12 +105,15 @@ impl PhraseWeight {
                 return Ok(None);
             }
         }
-        Ok(Some(PhraseScorer::new(
-            term_postings_list,
-            similarity_weight_opt,
-            fieldnorm_reader,
-            self.slop,
-        )))
+        Ok(Some(
+            PhraseScorer::new(
+                term_postings_list,
+                similarity_weight_opt,
+                fieldnorm_reader,
+                self.slop,
+            )
+            .with_indexing_average(indexing_average),
+        ))
     }
 
     pub fn slop(&mut self, slop: u32) {
