@@ -164,7 +164,8 @@ pub(crate) fn hyperspherical_cap_volume(
             return 0.0;
         }
         let ratio = boundary_distance / radius;
-        let x = (1.0 - ratio * ratio).sqrt().clamp(0.0, 1.0);
+        // Li (2011): V_cap / V_ball = ½ I_{1-(h/r)²}((d+1)/2, ½).
+        let x = (1.0 - ratio * ratio).clamp(0.0, 1.0);
         let i = incomplete_beta_lookup(x, dim);
         (0.5 * i).clamp(0.0, 0.5)
     } else {
@@ -296,6 +297,20 @@ mod tests {
     fn cap_volume_plane_through_center_is_half() {
         let vol = hyperspherical_cap_volume(1.0, 0.0, 2, true);
         assert!((vol - 0.5).abs() < 1e-6, "{vol}");
+    }
+
+    #[test]
+    fn cap_volume_matches_exact_2d_and_3d() {
+        for ratio in [0.2f64, 0.5, 0.8] {
+            let theta = 2.0 * ratio.acos();
+            let disk = (theta - theta.sin()) / (2.0 * PI);
+            let h = 1.0 - ratio;
+            let ball = h * h * (3.0 - h) / 4.0;
+            let vol2 = hyperspherical_cap_volume(1.0, ratio, 2, true);
+            let vol3 = hyperspherical_cap_volume(1.0, ratio, 3, true);
+            assert!((vol2 - disk).abs() < 1e-3, "d=2 h/r={ratio}: {vol2} vs {disk}");
+            assert!((vol3 - ball).abs() < 1e-3, "d=3 h/r={ratio}: {vol3} vs {ball}");
+        }
     }
 
     #[test]
