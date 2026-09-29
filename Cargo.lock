@@ -2091,7 +2091,7 @@ dependencies = [
 [[package]]
 name = "tantivy-fst"
 version = "0.5.0"
-source = "git+https://github.com/paradedb/fst.git?rev=d15c201955180125151aea6614b591f8e68b3ec5#d15c201955180125151aea6614b591f8e68b3ec5"
+source = "git+https://github.com/paradedb/fst.git?branch=codex%2Fpaged-fst#d15c201955180125151aea6614b591f8e68b3ec5"
 dependencies = [
  "byteorder",
  "regex-syntax",
