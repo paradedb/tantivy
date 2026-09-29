@@ -119,18 +119,29 @@ pub(crate) fn write_vector_header<W: Write + ?Sized>(writer: &mut W) -> io::Resu
 }
 
 /// Validates a `.vec` header and returns its version and composite body.
-pub(crate) fn read_vector_header(file: &FileSlice) -> io::Result<(VectorFileVersion, FileSlice)> {
-    let (version, body) = parse_header(file, "vector")?;
-    if !SUPPORTED_VECTOR.contains(&version) {
+pub(crate) fn read_vector_header(
+    file: &FileSlice,
+) -> crate::Result<(VectorFileVersion, FileSlice)> {
+    if file.len() < HEADER_LEN {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "vector file format version {} is unsupported; rebuild required",
-                version as u32
-            ),
-        ));
+            io::ErrorKind::UnexpectedEof,
+            "vector file is smaller than its header",
+        )
+        .into());
     }
-    Ok((version, body))
+    let bytes = file.slice_to(HEADER_LEN).read_bytes()?;
+    let index_version = u32::deserialize(&mut bytes.as_slice())?;
+    let version = SUPPORTED_VECTOR
+        .iter()
+        .copied()
+        .find(|version| *version as u32 == index_version)
+        .ok_or(crate::TantivyError::IncompatibleIndex(
+            crate::directory::error::Incompatibility::VectorFormatMismatch {
+                index_version,
+                supported_version: VECTOR_FILE_FORMAT_VERSION,
+            },
+        ))?;
+    Ok((version, file.slice_from(HEADER_LEN)))
 }
 
 /// Writes a `.centroids` header.
@@ -185,6 +196,8 @@ mod tests {
     #[test]
     fn truncated_vector_header_is_rejected() {
         let error = read_vector_header(&FileSlice::from(vec![2u8, 0])).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            matches!(error, crate::TantivyError::IoError(ref error) if error.kind() == io::ErrorKind::UnexpectedEof)
+        );
     }
 }

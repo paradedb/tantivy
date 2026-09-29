@@ -218,9 +218,7 @@ impl SegmentReader {
     /// Segments without a vector file are accepted.
     pub fn validate_vector_format(&self) -> crate::Result<()> {
         match self.open_read(SegmentComponent::Custom(crate::vector::VEC_EXT.to_string())) {
-            Ok(file) => crate::vector::header::read_vector_header(&file)
-                .map(|_| ())
-                .map_err(|error| DataCorruption::comment_only(error.to_string()).into()),
+            Ok(file) => crate::vector::header::read_vector_header(&file).map(|_| ()),
             Err(OpenReadError::FileDoesNotExist(_)) => Ok(()),
             Err(error) => Err(error.into()),
         }

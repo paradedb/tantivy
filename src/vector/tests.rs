@@ -1477,3 +1477,53 @@ fn flat_uniform_boundary_survives_merge_and_sparse_presence() -> crate::Result<(
     }
     Ok(())
 }
+
+#[test]
+fn unsupported_vector_versions_remain_typed_on_open_and_merge() -> crate::Result<()> {
+    use crate::directory::error::Incompatibility;
+    use crate::directory::{Directory, RamDirectory};
+    use crate::index::SegmentComponent;
+    for version in [3u32, 99] {
+        let directory = RamDirectory::create();
+        let mut schema = Schema::builder();
+        let field = schema.add_vector_field("v", VectorOptions::new(2, Metric::L2));
+        let index = Index::create(directory.clone(), schema.build(), IndexSettings::default())?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for value in [1.0, 2.0] {
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(field, &[value, 0.0]);
+            writer.add_document(doc)?;
+            writer.commit()?;
+        }
+        let segment = index.searchable_segments()?.remove(0);
+        let path = segment.relative_path(SegmentComponent::Custom(super::VEC_EXT.into()));
+        let mut bytes = directory.atomic_read(&path)?;
+        bytes[..4].copy_from_slice(&version.to_le_bytes());
+        directory.atomic_write(&path, &bytes)?;
+        let reader = crate::SegmentReader::open(&segment)?;
+        let assert_typed = |error| {
+            assert!(
+                matches!(error,
+            crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch {
+                index_version, supported_version: 4,
+            }) if index_version == version),
+                "version {version}: {error:?}"
+            )
+        };
+        assert_typed(reader.validate_vector_format().unwrap_err());
+        assert_typed(
+            reader
+                .vector_index(field)
+                .err()
+                .expect("unsupported vector reader"),
+        );
+        assert_typed(reader.vector_metadata(field).unwrap_err());
+        assert_typed(
+            writer
+                .merge_foreground(&index.searchable_segment_ids()?, true)
+                .unwrap_err(),
+        );
+    }
+    Ok(())
+}

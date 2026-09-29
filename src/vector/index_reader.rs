@@ -1604,8 +1604,7 @@ impl VectorFieldReader {
             }
             Err(err) => return Err(err.into()),
         };
-        let (_, body) = read_vector_header(&vec_file)
-            .map_err(|e| DataCorruption::comment_only(e.to_string()))?;
+        let (_, body) = read_vector_header(&vec_file)?;
         let vec_composite = CompositeFile::open(&body)?;
         validate_vector_entries(&vec_composite, field)?;
         let data = vec_composite
