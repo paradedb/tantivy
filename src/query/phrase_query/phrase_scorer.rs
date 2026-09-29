@@ -2,9 +2,11 @@ use std::cmp::Ordering;
 
 use crate::docset::{DocSet, SeekDangerResult, TERMINATED};
 use crate::fieldnorm::FieldNormReader;
-use crate::postings::Postings;
+use crate::postings::{Postings, SegmentPostings};
 use crate::query::bm25::Bm25Weight;
+use crate::query::boolean_query::BlockWandSingleScorer;
 use crate::query::scorer::PruningScorer;
+use crate::query::term_query::TermScorer;
 use crate::query::{Intersection, Scorer};
 use crate::{DocId, Score};
 
@@ -629,6 +631,91 @@ impl<TPostings: Postings> Scorer for PhraseScorer<TPostings> {
 impl<TPostings: Postings> PruningScorer for PhraseScorer<TPostings> {
     fn set_threshold(&mut self, threshold: Score) {
         self.pruning_threshold = Some(threshold);
+    }
+}
+
+pub(crate) struct BlockPruningPhraseScorer {
+    phrase: PhraseScorer<SegmentPostings>,
+    approximation: BlockWandSingleScorer,
+    current: (DocId, Score),
+}
+
+impl BlockPruningPhraseScorer {
+    pub(crate) fn new(mut phrase: PhraseScorer<SegmentPostings>, threshold: Score) -> Self {
+        // An exact phrase cannot occur more often than its rarest constituent term.
+        let bound_weight = phrase
+            .similarity_weight_opt
+            .as_ref()
+            .unwrap()
+            .boost_by(1.0 + 4.0 * Score::EPSILON);
+        let term = TermScorer::new(
+            phrase
+                .intersection_docset
+                .docset_specialized(0)
+                .postings
+                .clone(),
+            phrase.fieldnorm_reader.clone(),
+            bound_weight,
+        );
+        phrase.set_threshold(threshold);
+        let approximation = BlockWandSingleScorer::new(term, threshold);
+        let mut scorer = Self {
+            phrase,
+            approximation,
+            current: (TERMINATED, Score::MIN),
+        };
+        scorer.find_match();
+        scorer
+    }
+
+    fn find_match(&mut self) -> DocId {
+        loop {
+            let doc = self.approximation.doc();
+            if doc == TERMINATED {
+                self.current = (TERMINATED, Score::MIN);
+                return TERMINATED;
+            }
+            match self.phrase.intersection_docset.seek_danger(doc) {
+                SeekDangerResult::Found => {
+                    if self.phrase.phrase_match() {
+                        self.current = (doc, self.phrase.score());
+                        return doc;
+                    }
+                    self.approximation.advance();
+                }
+                SeekDangerResult::SeekLowerBound(target) => {
+                    self.approximation.seek(target);
+                }
+            }
+        }
+    }
+}
+
+impl DocSet for BlockPruningPhraseScorer {
+    fn advance(&mut self) -> DocId {
+        self.approximation.advance();
+        self.find_match()
+    }
+
+    fn doc(&self) -> DocId {
+        self.current.0
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.phrase.size_hint()
+    }
+}
+
+impl Scorer for BlockPruningPhraseScorer {
+    fn score(&mut self) -> Score {
+        self.current.1
+    }
+}
+
+impl PruningScorer for BlockPruningPhraseScorer {
+    fn set_threshold(&mut self, threshold: Score) {
+        self.approximation.set_threshold(threshold);
+        self.phrase.set_threshold(threshold);
     }
 }
 
