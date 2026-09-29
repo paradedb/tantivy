@@ -414,16 +414,18 @@ mod tests {
 
     #[test]
     fn effective_recall_guards() {
-        assert_eq!(stacked::effective_recall(2, 0.9), 0.9);
-        assert_eq!(stacked::effective_recall(2, 1.0), 1.0);
-        assert_eq!(stacked::effective_recall(2, 1.5), 1.0);
-        assert_eq!(stacked::effective_recall(2, f32::NAN), 1.0);
+        assert_eq!(stacked::effective_recall(2, Metric::L2, 0.9), 0.9);
+        assert_eq!(stacked::effective_recall(2, Metric::Cosine, 0.9), 0.9);
+        assert_eq!(stacked::effective_recall(2, Metric::Dot, 0.9), 1.0);
+        assert_eq!(stacked::effective_recall(2, Metric::L2, 1.0), 1.0);
+        assert_eq!(stacked::effective_recall(2, Metric::L2, 1.5), 1.0);
+        assert_eq!(stacked::effective_recall(2, Metric::L2, f32::NAN), 1.0);
         assert_eq!(
-            stacked::effective_recall(crate::vector::ivf::APS_MAX_DIM, 0.9),
+            stacked::effective_recall(crate::vector::ivf::APS_MAX_DIM, Metric::L2, 0.9),
             0.9
         );
         assert_eq!(
-            stacked::effective_recall(crate::vector::ivf::APS_MAX_DIM + 1, 0.9),
+            stacked::effective_recall(crate::vector::ivf::APS_MAX_DIM + 1, Metric::L2, 0.9),
             1.0
         );
     }

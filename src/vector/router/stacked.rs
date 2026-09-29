@@ -1,8 +1,9 @@
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::ivf::{
-    Candidate, ClusterId, InMemoryStackedIvf, IvfConfig, IvfIndexBuilder, LazyStackedIvf,
-    StackedSearchStats, SuperKMeansLevelClusterer, APS_MAX_DIM, PARENT_NPROBE_FRACTION,
+    aps_supports_metric, Candidate, ClusterId, InMemoryStackedIvf, IvfConfig, IvfIndexBuilder,
+    LazyStackedIvf, StackedSearchStats, SuperKMeansLevelClusterer, APS_MAX_DIM,
+    PARENT_NPROBE_FRACTION,
 };
 use crate::vector::router::{RouterMetrics, RoutingParams};
 use crate::vector::IvfCentroids;
@@ -75,11 +76,11 @@ pub(super) fn open(
 }
 
 /// The recall target the bottom router level runs with: the caller's,
-/// unless APS is off (`recall >= 1.0`) or the dimension is past
-/// [`APS_MAX_DIM`], where the cap-volume estimate is unreliable and the
-/// fixed nprobe path is used instead.
-pub(crate) fn effective_recall(dim: usize, recall: f32) -> f32 {
-    if dim > APS_MAX_DIM || !(recall < 1.0) {
+/// unless APS is off (`recall >= 1.0`), the metric has no query ball
+/// (Dot), or the dimension is past [`APS_MAX_DIM`], where the cap-volume
+/// estimate is unreliable. The fixed nprobe path is used instead.
+pub(crate) fn effective_recall(dim: usize, metric: Metric, recall: f32) -> f32 {
+    if dim > APS_MAX_DIM || !aps_supports_metric(metric) || !(recall < 1.0) {
         1.0
     } else {
         recall.max(0.0)
@@ -92,7 +93,7 @@ pub(super) fn rank(
     metric: Metric,
     params: RoutingParams,
 ) -> Ranking {
-    let recall = effective_recall(query.len(), params.recall);
+    let recall = effective_recall(query.len(), metric, params.recall);
     // Always return at most `params.k` L0 centroids. That `k` tracks the
     // caller's probe budget (`router_k` ← `max_probe`), so easy queries
     // request fewer candidates and harder ones more.

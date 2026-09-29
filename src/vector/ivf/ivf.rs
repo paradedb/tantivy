@@ -899,7 +899,9 @@ where
         }
 
         let dim = query.len();
-        let can_aps = recall < 1.0 && self.centroids.centroid_matrix().is_some();
+        let can_aps = recall < 1.0
+            && aps::supports_metric(metric)
+            && self.centroids.centroid_matrix().is_some();
 
         // Candidate lists, nearest centroid first; `candidates[0]` is P0.
         let (candidates, mut stats) = if let Some(parent) = &self.parent {
@@ -1480,5 +1482,23 @@ mod tests {
         let (full, _) = index.search(&query, 4, 1.0, Metric::L2);
         assert!(!leaf.is_empty());
         assert_eq!(leaf[0].node, full[0].node);
+    }
+
+    /// Dot scores past 1 would clamp the query radius to zero and stop
+    /// APS after the first full heap; Dot scans its full nprobe instead.
+    #[test]
+    fn test_aps_is_off_for_dot() {
+        let n_per = 32;
+        let data = two_blobs(n_per);
+        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let (mut index, _) =
+            InMemoryStackedIvf::build(data, n_per * 2, 2, &clusterer, test_config(2));
+        index.config.nprobe_fraction = 1.0;
+        let query = [1.0f32, 0.0];
+        let (full_hits, full) = index.search(&query, 4, 1.0, Metric::Dot);
+        let (low_hits, low) = index.search(&query, 4, 0.5, Metric::Dot);
+        assert!(full.lists_scanned > 1);
+        assert_eq!(low.lists_scanned, full.lists_scanned);
+        assert_eq!(low_hits, full_hits);
     }
 }

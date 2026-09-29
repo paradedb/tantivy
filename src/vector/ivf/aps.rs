@@ -277,6 +277,12 @@ pub(crate) fn radius_from_kth(kth: Similarity, metric: Metric) -> f32 {
     }
 }
 
+/// Whether APS can estimate recall under `metric`. The estimate needs a
+/// query ball; Dot scores are unbounded inner products with no radius.
+pub(crate) fn supports_metric(metric: Metric) -> bool {
+    matches!(metric, Metric::L2 | Metric::Cosine)
+}
+
 pub(crate) fn is_euclidean(metric: Metric) -> bool {
     matches!(metric, Metric::L2)
 }
@@ -308,8 +314,14 @@ mod tests {
             let ball = h * h * (3.0 - h) / 4.0;
             let vol2 = hyperspherical_cap_volume(1.0, ratio, 2, true);
             let vol3 = hyperspherical_cap_volume(1.0, ratio, 3, true);
-            assert!((vol2 - disk).abs() < 1e-3, "d=2 h/r={ratio}: {vol2} vs {disk}");
-            assert!((vol3 - ball).abs() < 1e-3, "d=3 h/r={ratio}: {vol3} vs {ball}");
+            assert!(
+                (vol2 - disk).abs() < 1e-3,
+                "d=2 h/r={ratio}: {vol2} vs {disk}"
+            );
+            assert!(
+                (vol3 - ball).abs() < 1e-3,
+                "d=3 h/r={ratio}: {vol3} vs {ball}"
+            );
         }
     }
 
