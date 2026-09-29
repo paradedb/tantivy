@@ -4789,6 +4789,35 @@ mod tests {
         Ok(())
     }
 
+    /// Dot has no query ball, so a stacked segment ignores the recall
+    /// target and scans to its budget.
+    #[test]
+    fn probe_stats_recall_target_ignored_for_dot() -> crate::Result<()> {
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .vector_storage_format(VectorStorageFormat::Ivf)
+            .metric(Metric::Dot)
+            .build()?;
+        let (_, stats) = run_top_n(
+            &index.index,
+            index.embedding_field(),
+            vec![1.0_f32, 0.0],
+            3,
+            AdaptiveProbeParams {
+                max_probe_fraction: 1.0,
+                min_probe_clusters: 1,
+                recall_target: 0.5,
+                ..Default::default()
+            },
+        )?;
+        assert_ne!(
+            stats.termination,
+            ProbeTermination::RecallTarget,
+            "{stats:?}"
+        );
+        assert_eq!(stats.recall_estimate, None, "{stats:?}");
+        Ok(())
+    }
+
     /// APS is stacked-only: other routers ignore the recall target.
     #[test]
     fn probe_stats_recall_target_ignored_without_stacked_router() -> crate::Result<()> {
