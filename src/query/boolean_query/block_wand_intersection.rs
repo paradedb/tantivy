@@ -50,6 +50,7 @@ pub struct BlockWandIntersectionScorer {
     current: (DocId, Score),
     internal_doc: DocId,
     window_end: DocId,
+    wide_windows: bool,
 }
 impl BlockWandIntersectionScorer {
     /// Construction positions `current` on the first match
@@ -61,6 +62,8 @@ impl BlockWandIntersectionScorer {
         let leader = scorers.remove(0);
         let secondaries = scorers;
         let secondaries_len = secondaries.len();
+        let wide_windows =
+            u64::from(secondaries[0].size_hint()) >= u64::from(leader.size_hint()) * 4;
 
         let secondaries_global_max_sum: Score = secondaries.iter().map(TermScorer::max_score).sum();
         let maximum_possible_score = leader.max_score() + secondaries_global_max_sum;
@@ -91,6 +94,7 @@ impl BlockWandIntersectionScorer {
             current: (0, Score::MIN),
             internal_doc,
             window_end: 0,
+            wide_windows,
         };
         scorer.advance();
         scorer
@@ -213,10 +217,7 @@ impl DocSet for BlockWandIntersectionScorer {
             self.leader.seek_block(self.internal_doc);
             let leader_block_max: Score = self.leader.block_max_score();
 
-            // Compute the window end as the minimum last_doc_in_block across all scorers.
-            // This ensures the block_max values are valid for all docs in [doc, window_end].
-            // Different scorers have independently aligned blocks, so we must use the
-            // smallest window where all block_max values hold.
+            // Balanced lists narrow this window at their own block boundaries.
             self.window_end = self.leader.last_doc_in_block();
 
             let mut secondary_block_max_sum: Score = 0.0;
@@ -227,8 +228,12 @@ impl DocSet for BlockWandIntersectionScorer {
                     self.current = (TERMINATED, Score::MIN);
                     return TERMINATED;
                 }
-                self.window_end = self.window_end.min(secondary.last_doc_in_block());
-                let bms = secondary.block_max_score();
+                let bms = if self.wide_windows {
+                    secondary.block_max_score_up_to(self.window_end).0
+                } else {
+                    self.window_end = self.window_end.min(secondary.last_doc_in_block());
+                    secondary.block_max_score()
+                };
                 self.secondary_block_max_scores[idx] = bms;
                 secondary_block_max_sum += bms;
             }
@@ -564,6 +569,74 @@ mod tests {
             (posting_lists, fieldnorms) in gen_term_scorers(3)
         ) {
             test_block_wand_intersection_aux(&posting_lists[..], &fieldnorms[..]);
+        }
+    }
+
+    #[test]
+    fn test_intersection_bounds_with_different_averages() {
+        use crate::directory::FileSlice;
+        use crate::fieldnorm::FieldNormReader;
+        use crate::Bm25Params;
+
+        let norms: Vec<_> = (0..3000).map(|doc| 1 + (doc * 37) % 300).collect();
+        for pnorms in [false, true] {
+            for steps in [
+                [2, 3, 5],
+                [1, 2, 7],
+                [1, 2, 8],
+                [1, 2, 9],
+                [1, 2, 16],
+                [1, 2, 17],
+                [1, 2, 32],
+            ] {
+                for average in [2.0, 50.0, 150.0, 1000.0] {
+                    let scorers: Vec<_> = steps
+                        .into_iter()
+                        .map(|step| {
+                            let docs: Vec<_> = (0..3000)
+                                .step_by(step)
+                                .map(|doc| (doc, 1 + doc % 13))
+                                .collect();
+                            let weight = Bm25Weight::for_one_term(
+                                docs.len() as u64,
+                                3000,
+                                average,
+                                Bm25Params::default(),
+                            );
+                            let mut scorer = TermScorer::create_for_test(&docs, &norms, weight);
+                            if pnorms {
+                                let bytes: Vec<_> = docs
+                                    .iter()
+                                    .map(|&(doc, _)| {
+                                        FieldNormReader::fieldnorm_to_id(norms[doc as usize])
+                                    })
+                                    .collect();
+                                scorer
+                                    .block_cursor()
+                                    .set_term_norm_source(Some(FileSlice::from(bytes)), Some(0));
+                            }
+                            scorer
+                        })
+                        .collect();
+                    for top_k in [1, 3, 10, 100] {
+                        let expected =
+                            compute_checkpoints_naive_intersection(scorers.clone(), top_k);
+                        let actual =
+                            compute_checkpoints_block_wand_intersection(scorers.clone(), top_k);
+                        assert_eq!(
+                            actual.len(),
+                            expected.len(),
+                            "average={average}, k={top_k}, pnorms={pnorms}"
+                        );
+                        for ((doc, score), (expected_doc, expected_score)) in
+                            actual.into_iter().zip(expected)
+                        {
+                            assert_eq!(doc, expected_doc);
+                            assert!(nearly_equals(score, expected_score));
+                        }
+                    }
+                }
+            }
         }
     }
 
