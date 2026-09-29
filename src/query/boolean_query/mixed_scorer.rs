@@ -2,6 +2,7 @@ use super::block_maxscore::BlockMaxScorer;
 use crate::docset::SeekDangerResult;
 use crate::postings::SegmentPostings;
 use crate::query::phrase_query::PhraseScorer;
+use crate::query::scorer::PruningScorer;
 use crate::query::{Scorer, TermScorer};
 use crate::{DocId, DocSet, Score, TERMINATED};
 
@@ -209,6 +210,90 @@ impl BlockMaxScorer for MixedScorer {
             Self::Term(scorer) => scorer.score_at(doc),
             Self::Phrase(scorer, _) => scorer.matches(doc).then(|| scorer.score()),
         }
+    }
+}
+
+pub(super) struct TermPhraseIntersectionScorer {
+    term: TermScorer,
+    phrase: PhraseScorer<SegmentPostings>,
+    phrase_bound: Score,
+    threshold: Score,
+    next_doc: DocId,
+    current: (DocId, Score),
+    size_hint: u32,
+}
+
+impl TermPhraseIntersectionScorer {
+    pub(super) fn new(
+        term: TermScorer,
+        phrase: PhraseScorer<SegmentPostings>,
+        threshold: Score,
+    ) -> Self {
+        let next_doc = term.doc().max(phrase.doc());
+        let phrase_bound = phrase.global_score_bound().unwrap();
+        let size_hint = term.size_hint().min(phrase.size_hint());
+        let mut scorer = Self {
+            term,
+            phrase,
+            phrase_bound,
+            threshold,
+            next_doc,
+            current: (TERMINATED, Score::MIN),
+            size_hint,
+        };
+        scorer.advance();
+        scorer
+    }
+}
+
+impl DocSet for TermPhraseIntersectionScorer {
+    fn advance(&mut self) -> DocId {
+        while self.next_doc < TERMINATED {
+            let doc = self.term.seek(self.next_doc);
+            if doc == TERMINATED {
+                break;
+            }
+            self.next_doc = doc + 1;
+            let term_score = self.term.score();
+            if term_score + self.phrase_bound <= self.threshold {
+                continue;
+            }
+            self.phrase
+                .set_threshold((self.threshold - term_score).next_down());
+            match self.phrase.seek_danger(doc) {
+                SeekDangerResult::Found => {
+                    let score = term_score + self.phrase.score();
+                    if score > self.threshold {
+                        self.current = (doc, score);
+                        return doc;
+                    }
+                }
+                SeekDangerResult::SeekLowerBound(next) => self.next_doc = next,
+            }
+        }
+        self.next_doc = TERMINATED;
+        self.current = (TERMINATED, Score::MIN);
+        TERMINATED
+    }
+
+    fn doc(&self) -> DocId {
+        self.current.0
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.size_hint
+    }
+}
+
+impl Scorer for TermPhraseIntersectionScorer {
+    fn score(&mut self) -> Score {
+        self.current.1
+    }
+}
+
+impl PruningScorer for TermPhraseIntersectionScorer {
+    fn set_threshold(&mut self, threshold: Score) {
+        self.threshold = threshold;
     }
 }
 
