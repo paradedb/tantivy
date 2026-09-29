@@ -228,9 +228,11 @@ impl TermWeight {
 
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
         let similarity_weight = self.similarity_weight.boost_by(boost);
-        Ok(TermOrEmptyOrAllScorer::TermScorer(Box::new(
-            TermScorer::new(segment_postings, fieldnorm_reader, similarity_weight),
-        )))
+        let mut scorer = TermScorer::new(segment_postings, fieldnorm_reader, similarity_weight);
+        if self.scoring_enabled {
+            scorer = scorer.with_fieldnorm_source(reader.segment_id(), field);
+        }
+        Ok(TermOrEmptyOrAllScorer::TermScorer(Box::new(scorer)))
     }
 
     fn fieldnorm_reader(&self, segment_reader: &SegmentReader) -> crate::Result<FieldNormReader> {
