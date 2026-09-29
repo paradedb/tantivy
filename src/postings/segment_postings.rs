@@ -1,6 +1,6 @@
-use common::HasLen;
+use common::{HasLen, TinySet};
 
-use crate::docset::DocSet;
+use crate::docset::{DocSet, BLOCK_NUM_TINYBITSETS};
 use crate::fastfield::AliveBitSet;
 use crate::positions::PositionReader;
 use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
@@ -101,6 +101,75 @@ impl SegmentPostings {
 
     pub(crate) fn block_offset(&self) -> usize {
         self.cur
+    }
+
+    pub(crate) fn disable_freq_reading(&mut self) {
+        self.block_cursor.disable_freq_reading();
+    }
+
+    pub(crate) fn seek_block_cursor(&mut self, target_doc: DocId) -> usize {
+        let idx = self.block_cursor.seek(target_doc);
+        self.cur = idx;
+        idx
+    }
+
+    /// Fills the local window bitmask with documents present in `[window_start, window_end)`.
+    ///
+    /// If a block crosses the `window_end` boundary, the in-block index `self.cur` is preserved
+    /// so the next window can resume reading from the already-decoded block without re-decoding.
+    pub(crate) fn fill_bitset_window(
+        &mut self,
+        window_start: DocId,
+        window_end: DocId,
+        mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
+    ) {
+        if self.doc() < window_start {
+            self.seek(window_start);
+        }
+        loop {
+            if self.doc() >= window_end {
+                return;
+            }
+            let docs = self.block_cursor.docs();
+            let len = docs.len();
+            let mut i = self.cur;
+            let mut current_bucket = usize::MAX;
+            let mut current_word = 0u64;
+            while i < len {
+                let doc = docs[i];
+                if doc >= window_end {
+                    if current_bucket < BLOCK_NUM_TINYBITSETS {
+                        mask[current_bucket].insert_bits_mut(current_word);
+                    }
+                    self.cur = i;
+                    return;
+                }
+                let delta = doc - window_start;
+                let bucket = (delta >> 6) as usize;
+                let bit = delta & 63;
+                if bucket == current_bucket {
+                    current_word |= 1u64 << bit;
+                } else {
+                    if current_bucket < BLOCK_NUM_TINYBITSETS {
+                        mask[current_bucket].insert_bits_mut(current_word);
+                    }
+                    current_bucket = bucket;
+                    current_word = 1u64 << bit;
+                }
+                i += 1;
+            }
+            if current_bucket < BLOCK_NUM_TINYBITSETS {
+                mask[current_bucket].insert_bits_mut(current_word);
+            }
+            if len < COMPRESSION_BLOCK_SIZE {
+                // We reached the end of the last (VInt) block.
+                // At index `len` in the doc buffer, the value is padded with `TERMINATED`.
+                self.cur = len;
+                return;
+            }
+            self.cur = 0;
+            self.block_cursor.advance();
+        }
     }
 
     /// Creates a segment postings object with the given documents
@@ -227,16 +296,18 @@ impl DocSet for SegmentPostings {
 
     #[inline]
     fn seek(&mut self, target: DocId) -> DocId {
-        debug_assert!(self.doc() <= target);
-        if self.doc() >= target {
-            return self.doc();
-        }
+        if self.block_cursor.block_is_loaded() {
+            debug_assert!(self.doc() <= target);
+            if self.doc() >= target {
+                return self.doc();
+            }
 
-        // As an optimization, if the block is already loaded, we can
-        // cheaply check the next doc.
-        self.cur = (self.cur + 1).min(COMPRESSION_BLOCK_SIZE - 1);
-        if self.doc() >= target {
-            return self.doc();
+            // As an optimization, if the block is already loaded, we can
+            // cheaply check the next doc.
+            self.cur = (self.cur + 1).min(COMPRESSION_BLOCK_SIZE - 1);
+            if self.doc() >= target {
+                return self.doc();
+            }
         }
 
         // Delegate block-local search to BlockSegmentPostings::seek, which returns
