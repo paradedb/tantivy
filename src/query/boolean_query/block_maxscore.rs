@@ -123,22 +123,20 @@ pub(super) fn block_maxscore(
             let mut matches_len = 0;
             if strong.len() == 1 {
                 let scorer = &mut strong[0].scorer;
-                while scorer.doc() < window_end {
-                    let score = scorer.score() as f64;
+                scorer.for_each_score_until(window_end, |doc, score| {
+                    let score = score as f64;
                     let keep = score * rounding + weak_bound > threshold as f64;
-                    matches[matches_len] = (scorer.doc(), score);
+                    matches[matches_len] = (doc, score);
                     matches_len += keep as usize;
-                    scorer.advance();
-                }
+                });
             } else {
                 // Accumulate strong terms into a dense batch; the bitmap tracks touched entries.
                 for term in strong.iter_mut() {
-                    while term.scorer.doc() < window_end {
-                        let offset = (term.scorer.doc() - base) as usize;
+                    term.scorer.for_each_score_until(window_end, |doc, score| {
+                        let offset = (doc - base) as usize;
                         candidates[offset / 64] |= 1u64 << (offset % 64);
-                        scores[offset] += term.scorer.score() as f64;
-                        term.scorer.advance();
-                    }
+                        scores[offset] += score as f64;
+                    });
                 }
                 for (word, bits) in candidates.iter_mut().enumerate() {
                     while *bits != 0 {

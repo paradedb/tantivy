@@ -257,6 +257,7 @@ impl DocSet for BlockWandIntersectionScorer {
 
             let block_docs = &block_cursor.doc_decoder.output_array()[start_idx..end_idx];
             let block_freqs = &block_cursor.freq_output_array()[start_idx..end_idx];
+            let posting_norms = block_cursor.posting_fieldnorms(end_idx);
 
             // Pass 1: Batch-compute leader BM25 scores and branchlessly filter
             // candidates that can't beat the threshold.
@@ -273,8 +274,10 @@ impl DocSet for BlockWandIntersectionScorer {
                 .zip(block_freqs.iter().copied())
                 .enumerate()
             {
-                let fieldnorm_id =
-                    block_cursor.fieldnorm_id_at(start_idx + offset, &self.fieldnorm_reader);
+                let fieldnorm_id = posting_norms.as_ref().map_or_else(
+                    || self.fieldnorm_reader.fieldnorm_id(candidate_doc),
+                    |norms| norms[start_idx + offset],
+                );
                 let leader_score = self.bm25_weight.score(fieldnorm_id, term_freq);
                 self.candidate_doc_ids[num_candidates] = candidate_doc;
                 self.candidate_scores[num_candidates] = leader_score;
