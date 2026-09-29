@@ -63,7 +63,7 @@ impl BlockWandIntersectionScorer {
         let secondaries = scorers;
         let secondaries_len = secondaries.len();
         let wide_windows =
-            u64::from(secondaries[0].size_hint()) >= u64::from(leader.size_hint()) * 8;
+            u64::from(secondaries[0].size_hint()) >= u64::from(leader.size_hint()) * 4;
 
         let secondaries_global_max_sum: Score = secondaries.iter().map(TermScorer::max_score).sum();
         let maximum_possible_score = leader.max_score() + secondaries_global_max_sum;
@@ -583,7 +583,15 @@ mod tests {
 
         let norms: Vec<_> = (0..3000).map(|doc| 1 + (doc * 37) % 300).collect();
         for pnorms in [false, true] {
-            for steps in [[2, 3, 5], [1, 2, 16], [1, 2, 17], [1, 2, 32]] {
+            for steps in [
+                [2, 3, 5],
+                [1, 2, 7],
+                [1, 2, 8],
+                [1, 2, 9],
+                [1, 2, 16],
+                [1, 2, 17],
+                [1, 2, 32],
+            ] {
                 for average in [2.0, 50.0, 150.0, 1000.0] {
                     let scorers: Vec<_> = steps
                         .into_iter()
