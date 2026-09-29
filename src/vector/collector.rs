@@ -40,7 +40,7 @@ use crate::query::Weight;
 use crate::schema::{Field, FieldType, Schema};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal, TantivyError};
 
-/// Query identity excludes storage geometry and descriptive grid versions.
+/// Query identity consists of dimension, metric tag and structural layer metadata.
 #[derive(Clone, Debug)]
 struct PreparedKey(Arc<VectorColMetadata>);
 impl PreparedKey {
@@ -1011,17 +1011,14 @@ mod prepared_key_tests {
         key(meta).hash(&mut h);
         h.finish()
     }
-    // Storage geometry and descriptive grid versions never split prepared-query cache keys.
+    // Storage geometry does not split prepared-query cache keys.
     #[test]
     fn query_identity_uses_only_semantic_bits() {
         let original = metadata(Metric::L2, &[1, 4]);
         let mut changed = original.clone();
-        if let VectorColMetadata::Quantized { field, layers } = &mut changed {
+        if let VectorColMetadata::Quantized { field, .. } = &mut changed {
             field.norm_policy = VectorNormPolicy::UnitL2;
             field.partition = Partition::Uniform { rows_per_block: 7 };
-            if let Quantizer::GridPlane { grid, .. } = &mut layers[1] {
-                grid.version += 1;
-            }
         }
         assert_eq!(key(&original), key(&changed));
         assert_eq!(hash(&original), hash(&changed));
@@ -1067,7 +1064,6 @@ mod prepared_key_tests {
             assert_ne!(key(&original), key(&changed));
         }
         let g = Grid {
-            version: 1,
             points: vec![0.0],
             rho_model: 1.0,
         };

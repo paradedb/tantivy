@@ -146,7 +146,7 @@ field      := dim:u32 dtype:u8 metric:u8 norm_policy:u8 partition
 partition  := kind:u8 [rows_per_block:u32 if kind=1]
 quantizer  := kind:u8 payload
   SignPlane := rotation rho_model:f64
-  GridPlane := bits:u8 rotation grid_version:u32 rho_model:f64
+  GridPlane := bits:u8 rotation rho_model:f64
                n_points:u16 points:f32{n_points}
 rotation   := kind:u8 [seed:u64 if kind=1]
 ```
@@ -173,9 +173,9 @@ DataCorruption before payload access.
 
 Quantized metadata compares and hashes `(dim, metric, layers)`. A quantizer's
 identity includes its tag, width, rotation tag and seed, and model bits. Grid
-identity is `(rho_model.to_bits(), points.map(to_bits))`; its descriptive version
-is excluded. Signed zero and all floating-point bit distinctions are preserved.
-Equality and hashing share the same field helper.
+identity is `(rho_model.to_bits(), points.map(to_bits))`. Quantizer equality and
+hashing include every field, with floating-point values compared by bit pattern.
+Signed zero and all floating-point bit distinctions are preserved.
 
 Plain metadata compares by variant only and is never a prepared-query key.
 Normalization, dtype and partition do not affect preparation. Full

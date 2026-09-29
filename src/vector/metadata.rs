@@ -48,7 +48,7 @@ pub enum Partition {
     },
 }
 /// Tagged encode/decode contract; a semantic change requires a new variant.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum Quantizer {
     /// One-bit signs scored as popcounted words.
@@ -93,10 +93,9 @@ impl F64Bits {
         f64::from_bits(self.0)
     }
 }
-/// Persisted reconstruction points; version is descriptive, not query-relevant.
+/// Persisted reconstruction points and error-model parameter.
 #[derive(Clone, Debug)]
 pub struct Grid {
-    pub(crate) version: u32,
     pub(crate) points: Vec<f32>,
     pub(crate) rho_model: f64,
 }
@@ -123,10 +122,6 @@ impl VectorFieldMeta {
     }
 }
 impl Grid {
-    /// Descriptive grid-generation version; not part of query identity.
-    pub fn version(&self) -> u32 {
-        self.version
-    }
     /// Persisted reconstruction points in code order.
     pub fn points(&self) -> &[f32] {
         &self.points
@@ -136,36 +131,30 @@ impl Grid {
         self.rho_model
     }
 }
-/// Compares encoder and query parameters by their exact stored bits.
-impl PartialEq for Quantizer {
+/// Compares every reconstruction point and model parameter by its exact stored bits.
+impl PartialEq for Grid {
     fn eq(&self, other: &Self) -> bool {
-        self.query_fields() == other.query_fields()
+        let Self { points, rho_model } = self;
+        let Self {
+            points: other_points,
+            rho_model: other_rho,
+        } = other;
+        rho_model.to_bits() == other_rho.to_bits()
+            && points.len() == other_points.len()
+            && points
+                .iter()
+                .zip(other_points)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
     }
 }
-impl Eq for Quantizer {}
-impl Hash for Quantizer {
+impl Eq for Grid {}
+impl Hash for Grid {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.query_fields().hash(state);
-    }
-}
-impl Quantizer {
-    fn query_fields(&self) -> (u8, u8, Rotation, u64, Vec<u32>) {
-        match self {
-            Self::SignPlane {
-                rotation,
-                rho_model,
-            } => (0, 1, *rotation, rho_model.0, Vec::new()),
-            Self::GridPlane {
-                bits,
-                rotation,
-                grid,
-            } => (
-                1,
-                *bits,
-                *rotation,
-                grid.rho_model.to_bits(),
-                grid.points.iter().map(|p| p.to_bits()).collect(),
-            ),
+        let Self { points, rho_model } = self;
+        rho_model.to_bits().hash(state);
+        points.len().hash(state);
+        for point in points {
+            point.to_bits().hash(state);
         }
     }
 }
@@ -396,7 +385,6 @@ impl VectorColMetadata {
                         bits: layer.bits,
                         rotation,
                         grid: Grid {
-                            version: grid.version,
                             points: grid.points.clone(),
                             rho_model: grid.rho_model,
                         },
@@ -565,7 +553,6 @@ impl VectorColMetadata {
                     } => {
                         out.extend([1, *bits]);
                         rotation.write(&mut out);
-                        out.extend(grid.version.to_le_bytes());
                         out.extend(grid.rho_model.to_le_bytes());
                         out.extend((grid.points.len() as u16).to_le_bytes());
                         for p in &grid.points {
@@ -651,7 +638,6 @@ impl VectorColMetadata {
                             1 => {
                                 let bits = u8::deserialize(input)?;
                                 let rotation = Rotation::read(input)?;
-                                let version = u32::deserialize(input)?;
                                 let rho_model = f64::from_bits(u64::deserialize(input)?);
                                 let count = u16::deserialize(input)? as usize;
                                 if !(2..=4).contains(&bits) || count != 1 << bits {
@@ -666,11 +652,7 @@ impl VectorColMetadata {
                                 Quantizer::GridPlane {
                                     bits,
                                     rotation,
-                                    grid: Grid {
-                                        version,
-                                        rho_model,
-                                        points,
-                                    },
+                                    grid: Grid { rho_model, points },
                                 }
                             }
                             _ => {
@@ -956,6 +938,119 @@ mod tests {
             .is_err());
     }
     // Exact byte sequences freeze metadata framing and the explicit tag assignments.
+    #[test]
+    fn quantizer_equality_and_hash_cover_every_field() {
+        fn hash(value: &impl Hash) -> u64 {
+            let mut state = std::collections::hash_map::DefaultHasher::new();
+            value.hash(&mut state);
+            state.finish()
+        }
+        let sign = Quantizer::SignPlane {
+            rotation: Rotation::SeededFhtChaCha8 { seed: 7 },
+            rho_model: F64Bits(0.25f64.to_bits()),
+        };
+        assert_eq!(sign, sign.clone());
+        assert_eq!(hash(&sign), hash(&sign.clone()));
+        for change in 0..3 {
+            let mut other = sign.clone();
+            let Quantizer::SignPlane {
+                rotation,
+                rho_model,
+            } = &mut other
+            else {
+                unreachable!()
+            };
+            match change {
+                0 => *rotation = Rotation::None,
+                1 => *rotation = Rotation::SeededFhtChaCha8 { seed: 11 },
+                _ => rho_model.0 ^= 1,
+            }
+            assert_ne!(sign, other, "sign field change {change}");
+            assert_ne!(hash(&sign), hash(&other), "sign hash field change {change}");
+        }
+        let grid = Quantizer::GridPlane {
+            bits: 2,
+            rotation: Rotation::SeededFhtChaCha8 { seed: 7 },
+            grid: Grid {
+                points: vec![-1.0, -0.5, 0.5, 1.0],
+                rho_model: 0.25,
+            },
+        };
+        assert_ne!(sign, grid);
+        assert_eq!(grid, grid.clone());
+        assert_eq!(hash(&grid), hash(&grid.clone()));
+        for change in 0..7 {
+            let mut other = grid.clone();
+            let Quantizer::GridPlane {
+                bits,
+                rotation,
+                grid: values,
+            } = &mut other
+            else {
+                unreachable!()
+            };
+            match change {
+                0 => *bits = 3,
+                1 => *rotation = Rotation::None,
+                2 => *rotation = Rotation::SeededFhtChaCha8 { seed: 11 },
+                3 => values.rho_model = f64::from_bits(values.rho_model.to_bits() ^ 1),
+                4 => values.points[1] = f32::from_bits(values.points[1].to_bits() ^ 1),
+                5 => {
+                    values.points.pop();
+                }
+                _ => values.points.swap(0, 1),
+            }
+            assert_ne!(grid, other, "grid field change {change}");
+            assert_ne!(hash(&grid), hash(&other), "grid hash field change {change}");
+        }
+        for (point, rho) in [
+            (0.0, 0.0),
+            (
+                f32::from_bits(0x7fc00001),
+                f64::from_bits(0x7ff8000000000001),
+            ),
+        ] {
+            let original = Grid {
+                points: vec![point],
+                rho_model: rho,
+            };
+            assert_eq!(original, original.clone());
+            assert_eq!(hash(&original), hash(&original.clone()));
+            let mut changed = original.clone();
+            changed.points[0] = f32::from_bits(point.to_bits() ^ 0x80000000);
+            assert_ne!(original, changed);
+            assert_ne!(hash(&original), hash(&changed));
+            let mut changed = original.clone();
+            changed.rho_model = f64::from_bits(rho.to_bits() ^ 0x8000000000000000);
+            assert_ne!(original, changed);
+            assert_ne!(hash(&original), hash(&changed));
+        }
+    }
+
+    #[test]
+    fn grid_metadata_grammar_literal() {
+        let mut meta = metadata(Metric::Dot, &[2]);
+        let VectorColMetadata::Quantized { layers, .. } = &mut meta else {
+            unreachable!()
+        };
+        layers[0] = Quantizer::GridPlane {
+            bits: 2,
+            rotation: Rotation::None,
+            grid: Grid {
+                points: vec![-1.0, -0.5, 0.5, 1.0],
+                rho_model: 0.25,
+            },
+        };
+        let expected = [
+            1, 100, 0, 0, 0, 0, 1, 0, 0, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 208, 63, 4, 0, 0, 0, 128,
+            191, 0, 0, 0, 191, 0, 0, 0, 63, 0, 0, 128, 63,
+        ];
+        assert_eq!(meta.to_bytes(), expected);
+        let decoded = VectorColMetadata::from_bytes(&expected).unwrap();
+        assert_eq!(meta.layers(), decoded.layers());
+        assert_eq!(decoded.to_bytes(), expected);
+    }
+
     #[test]
     fn metadata_grammar_golden_bytes() {
         let opts = VectorOptions::new(100, Metric::Dot);

@@ -35,8 +35,6 @@ pub(crate) fn validate_quantization_values<'a>(
 
 /// Settings identifier for the vector quantization format.
 pub const VECTOR_QUANTIZATION_FORMAT_VERSION: u32 = 3;
-/// Version of the persisted exact-density Lloyd-Max grid representation.
-pub const GRID_FORMAT_VERSION: u32 = 1;
 /// Maximum number of residual layers stored by the vector format.
 pub const MAX_QUANTIZATION_LAYERS: usize = 3;
 /// Code sections begin at a 64-byte-aligned file offset.
@@ -95,8 +93,6 @@ pub struct VectorQuantizationLayer {
 pub struct VectorQuantizationGrid {
     /// Code width.
     pub bits: u8,
-    /// Grid representation identifier.
-    pub version: u32,
     /// Reconstruction points.
     pub points: Vec<f32>,
     /// Exact-density normalized RMSE resolved when the grid is materialized.
@@ -106,7 +102,6 @@ pub struct VectorQuantizationGrid {
 impl PartialEq for VectorQuantizationGrid {
     fn eq(&self, other: &Self) -> bool {
         self.bits == other.bits
-            && self.version == other.version
             && self.rho_model.to_bits() == other.rho_model.to_bits()
             && self.points.len() == other.points.len()
             && self
@@ -179,7 +174,6 @@ impl VectorQuantizationConfig {
                 let grid = build_grid(options.dim(), bits);
                 VectorQuantizationGrid {
                     bits,
-                    version: GRID_FORMAT_VERSION,
                     points: grid.points,
                     rho_model: grid.rho_model,
                 }
@@ -272,12 +266,6 @@ impl VectorQuantizationConfig {
                 return Err(invalid(format!(
                     "grid width {} is present more than once",
                     grid.bits
-                )));
-            }
-            if grid.version != GRID_FORMAT_VERSION {
-                return Err(invalid(format!(
-                    "grid width {} has version {}; expected {GRID_FORMAT_VERSION}",
-                    grid.bits, grid.version
                 )));
             }
             if !(1..=4).contains(&grid.bits) {
@@ -395,7 +383,6 @@ mod tests {
         let count = 1usize << bits;
         VectorQuantizationGrid {
             bits,
-            version: GRID_FORMAT_VERSION,
             points: (0..count).map(|point| point as f32).collect(),
             rho_model: 0.25,
         }
@@ -418,6 +405,33 @@ mod tests {
                 })
                 .collect(),
             grids: grid_bits.into_iter().map(grid).collect(),
+        }
+    }
+
+    #[test]
+    fn settings_ignore_unknown_grid_fields() {
+        let settings = crate::index::IndexSettings {
+            vector_quantization: vec![config(&[1, 4])],
+            ..Default::default()
+        };
+        let mut json = serde_json::to_value(&settings).unwrap();
+        for grid in json["vector_quantization"][0]["grids"]
+            .as_array_mut()
+            .unwrap()
+        {
+            grid["version"] = serde_json::json!(1);
+        }
+        let decoded: crate::index::IndexSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.vector_quantization, settings.vector_quantization);
+        decoded.vector_quantization[0]
+            .validate(&VectorOptions::new(768, Metric::Dot))
+            .unwrap();
+        let encoded = serde_json::to_value(decoded).unwrap();
+        for grid in encoded["vector_quantization"][0]["grids"]
+            .as_array()
+            .unwrap()
+        {
+            assert!(grid.get("version").is_none());
         }
     }
 
@@ -487,7 +501,6 @@ mod tests {
         assert_eq!(materialized.grids.len(), 2);
         for persisted in &materialized.grids {
             let recomputed = build_grid(materialized.dim, persisted.bits);
-            assert_eq!(persisted.version, GRID_FORMAT_VERSION);
             assert_eq!(persisted.points.len(), 1usize << persisted.bits);
             assert_eq!(persisted.points, recomputed.points);
             assert_eq!(persisted.rho_model, recomputed.rho_model);
