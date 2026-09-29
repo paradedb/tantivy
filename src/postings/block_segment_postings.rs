@@ -36,7 +36,7 @@ pub struct BlockSegmentPostings {
     term_norms: Option<super::term_norms::TermNormReader>,
 }
 
-const POSTINGS_BUFFER_SIZE: usize = 8192;
+const POSTINGS_BUFFER_SIZE: usize = 1024;
 
 #[derive(Clone)]
 enum PostingData {
