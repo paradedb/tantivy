@@ -301,6 +301,16 @@ impl FileSlice {
         self.data.storage_block_len()
     }
 
+    /// The containing storage block, clipped to this slice in slice-relative bytes.
+    pub fn storage_block_range(&self, offset: usize) -> Option<Range<usize>> {
+        let block_len = self.storage_block_len()?;
+        let start = self.storage_block_ord(offset)? * block_len;
+        Some(
+            start.saturating_sub(self.range.start)
+                ..start.saturating_add(block_len).min(self.range.end) - self.range.start,
+        )
+    }
+
     /// Reads a specific slice of data.
     ///
     /// This is equivalent to running `file_slice.slice(from, to).read_bytes()`.
@@ -520,6 +530,16 @@ mod tests {
         assert_eq!(slot.storage_block_ord(0), Some(0));
         assert_eq!(slot.storage_block_ord(1), Some(1));
         assert_eq!(slot.storage_block_ord(5), Some(2));
+        assert_eq!(slot.storage_block_range(0), Some(0..1));
+        assert_eq!(slot.storage_block_range(1), Some(1..5));
+        assert_eq!(slot.storage_block_range(5), Some(5..8));
+        let nested = slot.slice(2..7);
+        assert_eq!(nested.storage_block_range(0), Some(0..3));
+        assert_eq!(nested.storage_block_range(3), Some(3..5));
+        assert_eq!(
+            FileSlice::new(Arc::new(&b"abcdef"[..])).storage_block_range(0),
+            None
+        );
     }
 
     #[test]

@@ -176,7 +176,10 @@ impl BlockSegmentPostings {
             })?;
         let skips = file.read_bytes_slice(header_len..postings_start)?;
         let len = file.len() - postings_start;
-        let buffer = BufferedFileSlice::new(file.slice_from(postings_start), POSTINGS_BUFFER_SIZE);
+        let buffer = BufferedFileSlice::new_block_bounded(
+            file.slice_from(postings_start),
+            POSTINGS_BUFFER_SIZE,
+        );
         Self::from_parts(
             doc_freq,
             Some(skips),

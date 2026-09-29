@@ -40,7 +40,10 @@ impl TermNormReader {
             .checked_add(u64::from(len))
             .filter(|&end| end <= source.len() as u64)
             .map(|end| {
-                BufferedFileSlice::new(source.slice(offset as usize..end as usize), BUFFER_SIZE)
+                BufferedFileSlice::new_block_bounded(
+                    source.slice(offset as usize..end as usize),
+                    BUFFER_SIZE,
+                )
             });
         Self { buffer }
     }
