@@ -1,4 +1,5 @@
 use super::block_maxscore::BlockMaxScorer;
+use crate::docset::SeekDangerResult;
 use crate::postings::SegmentPostings;
 use crate::query::phrase_query::PhraseScorer;
 use crate::query::{Scorer, TermScorer};
@@ -6,7 +7,101 @@ use crate::{DocId, DocSet, Score, TERMINATED};
 
 pub(super) enum MixedScorer {
     Term(TermScorer),
-    Phrase(PhraseScorer<SegmentPostings>, Score),
+    Phrase(DeferredPhraseScorer, Score),
+}
+
+pub(super) struct DeferredPhraseScorer {
+    scorer: PhraseScorer<SegmentPostings>,
+    doc: DocId,
+    verified: bool,
+    size_hint: u32,
+    cost: u64,
+}
+
+impl MixedScorer {
+    pub(super) fn from_phrase(scorer: PhraseScorer<SegmentPostings>) -> Self {
+        let bound = scorer.global_score_bound().unwrap();
+        let phrase = DeferredPhraseScorer {
+            doc: scorer.doc(),
+            verified: true,
+            size_hint: scorer.size_hint(),
+            cost: scorer.cost(),
+            scorer,
+        };
+        Self::Phrase(phrase, bound)
+    }
+}
+
+impl DeferredPhraseScorer {
+    fn matches(&mut self, target: DocId) -> bool {
+        if target < self.doc {
+            return false;
+        }
+        if target == TERMINATED {
+            self.doc = TERMINATED;
+            self.verified = false;
+            return false;
+        }
+        if self.verified && target == self.doc {
+            return true;
+        }
+        match self.scorer.seek_danger(target) {
+            SeekDangerResult::Found => {
+                self.doc = target;
+                self.verified = true;
+                true
+            }
+            SeekDangerResult::SeekLowerBound(next) => {
+                self.doc = next;
+                self.verified = false;
+                false
+            }
+        }
+    }
+}
+
+impl DocSet for DeferredPhraseScorer {
+    fn advance(&mut self) -> DocId {
+        if self.doc == TERMINATED {
+            return TERMINATED;
+        }
+        if !self.verified {
+            return self.seek(self.doc);
+        }
+        self.doc = self.scorer.advance();
+        self.doc
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        let mut target = target.max(self.doc);
+        while target < TERMINATED {
+            if self.matches(target) {
+                return self.doc;
+            }
+            target = self.doc;
+        }
+        self.doc = TERMINATED;
+        self.doc
+    }
+
+    fn doc(&self) -> DocId {
+        self.doc
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.size_hint
+    }
+
+    fn cost(&self) -> u64 {
+        self.cost
+    }
+}
+
+impl Scorer for DeferredPhraseScorer {
+    fn score(&mut self) -> Score {
+        debug_assert!(self.verified && self.doc != TERMINATED);
+        self.scorer.score()
+    }
 }
 
 impl DocSet for MixedScorer {
@@ -96,11 +191,77 @@ impl BlockMaxScorer for MixedScorer {
         match self {
             Self::Term(scorer) => scorer.for_each_score_until(end, callback),
             Self::Phrase(scorer, _) => {
+                // A deferred phrase check can leave the current document unverified.
+                scorer.seek(scorer.doc());
                 while scorer.doc() < end {
                     callback(scorer.doc(), scorer.score());
                     scorer.advance();
                 }
             }
         }
+    }
+
+    #[inline]
+    fn score_at(&mut self, doc: DocId) -> Option<Score> {
+        match self {
+            Self::Term(scorer) => scorer.score_at(doc),
+            Self::Phrase(scorer, _) => scorer.matches(doc).then(|| scorer.score()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::{EnableScoring, QueryParser};
+    use crate::schema::{Schema, TEXT};
+    use crate::Index;
+
+    #[test]
+    fn test_deferred_phrase_checks_and_scoring_windows() -> crate::Result<()> {
+        let mut schema = Schema::builder();
+        let field = schema.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer = index.writer_for_tests()?;
+        for text in ["a x b", "a b", "x", "a x b", "a b a b", "a x b"] {
+            writer.add_document(doc!(field => text))?;
+        }
+        writer.commit()?;
+        drop(writer);
+        let searcher = index.reader()?.searcher();
+        let query = QueryParser::for_index(&index, vec![field]).parse_query("\"a b\"")?;
+        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let reader = searcher.segment_reader(0);
+        let mut expected = Vec::new();
+        let mut ordinary = weight.scorer(reader, 1.0)?;
+        while ordinary.doc() != TERMINATED {
+            expected.push((ordinary.doc(), ordinary.score()));
+            ordinary.advance();
+        }
+        for candidate in [0, 1, 2, 3, 4, 5, TERMINATED] {
+            let phrase = weight
+                .scorer(reader, 1.0)?
+                .downcast::<PhraseScorer<SegmentPostings>>()
+                .map_err(|_| ())
+                .unwrap();
+            let mut scorer = MixedScorer::from_phrase(*phrase);
+            let reference = expected
+                .iter()
+                .find(|&&(doc, _)| doc == candidate)
+                .map(|&(_, score)| score);
+            assert_eq!(scorer.score_at(candidate), reference);
+            assert_eq!(scorer.score_at(candidate), reference);
+            let mut actual = Vec::new();
+            scorer.for_each_score_until(TERMINATED, |doc, score| actual.push((doc, score)));
+            assert_eq!(
+                actual,
+                expected
+                    .iter()
+                    .copied()
+                    .filter(|&(doc, _)| doc >= candidate)
+                    .collect::<Vec<_>>()
+            );
+        }
+        Ok(())
     }
 }

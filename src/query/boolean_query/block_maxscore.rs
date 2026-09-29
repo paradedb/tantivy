@@ -34,6 +34,14 @@ pub(super) trait BlockMaxScorer: Scorer {
     fn block_score_hint(&self) -> Score;
     fn refine_block_max_score(&mut self) -> Score;
     fn for_each_score_until(&mut self, end: DocId, callback: impl FnMut(DocId, Score));
+
+    #[inline]
+    fn score_at(&mut self, doc: DocId) -> Option<Score> {
+        if self.doc() < doc {
+            self.seek(doc);
+        }
+        (doc != TERMINATED && self.doc() == doc).then(|| self.score())
+    }
 }
 
 impl BlockMaxScorer for TermScorer {
@@ -194,11 +202,8 @@ pub(super) fn block_maxscore<TScorer: BlockMaxScorer>(
                     if score * rounding + term.bound + term.remaining <= threshold as f64 {
                         continue;
                     }
-                    if term.scorer.doc() < doc {
-                        term.scorer.seek(doc);
-                    }
-                    if term.scorer.doc() == doc {
-                        score += term.scorer.score() as f64;
+                    if let Some(contribution) = term.scorer.score_at(doc) {
+                        score += contribution as f64;
                     }
                     let keep = score * rounding + term.remaining > threshold as f64;
                     matches[len] = (doc, score);

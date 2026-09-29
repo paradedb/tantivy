@@ -107,8 +107,7 @@ where
                         .downcast::<PhraseScorer<SegmentPostings>>()
                         .map_err(|_| ())
                         .unwrap();
-                    let bound = phrase.global_score_bound().unwrap();
-                    MixedScorer::Phrase(*phrase, bound)
+                    MixedScorer::from_phrase(*phrase)
                 }
             })
             .collect();
