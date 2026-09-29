@@ -306,6 +306,15 @@ impl Bm25Weight {
         self.weight.max(0.0)
     }
 
+    pub(crate) fn global_score_bound(&self) -> Option<Score> {
+        (self.supports_pruning(1.0)
+            && self
+                .cache
+                .iter()
+                .all(|norm| norm.is_finite() && *norm >= 0.0))
+        .then(|| self.max_score())
+    }
+
     pub(crate) fn supports_pruning(&self, boost: Score) -> bool {
         let weight = self.weight * boost;
         weight.is_finite() && weight >= 0.0

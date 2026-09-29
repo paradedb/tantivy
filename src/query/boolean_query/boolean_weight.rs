@@ -2,12 +2,14 @@ use std::collections::HashMap;
 
 use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN};
 use crate::index::SegmentReader;
-use crate::postings::FreqReadingOption;
+use crate::postings::{FreqReadingOption, SegmentPostings};
+use crate::query::boolean_query::mixed_scorer::MixedScorer;
 use crate::query::boolean_query::{
     BlockWandIntersectionScorer, BlockWandSingleScorer, BlockWandUnionScorer,
 };
 use crate::query::disjunction::Disjunction;
 use crate::query::explanation::does_not_match;
+use crate::query::phrase_query::PhraseScorer;
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
 use crate::query::scorer::BasicPruningScorer;
 use crate::query::term_query::TermScorer;
@@ -20,6 +22,7 @@ use crate::{DocId, Score, TERMINATED};
 
 enum SpecializedScorer {
     TermUnion(Vec<TermScorer>),
+    MixedUnion(Vec<MixedScorer>),
     TermIntersection(Vec<TermScorer>),
     Other(Box<dyn Scorer>),
 }
@@ -82,6 +85,34 @@ where
             }
         }
     }
+    if TScoreCombiner::SUPPORTS_BLOCK_WAND
+        && scorers.iter().all(|scorer| {
+            if let Some(term) = scorer.downcast_ref::<TermScorer>() {
+                term.freq_reading_option() == FreqReadingOption::ReadFreq
+                    && term.bm25_weight().global_score_bound().is_some()
+            } else {
+                scorer
+                    .downcast_ref::<PhraseScorer<SegmentPostings>>()
+                    .and_then(PhraseScorer::global_score_bound)
+                    .is_some()
+            }
+        })
+    {
+        let scorers = scorers
+            .into_iter()
+            .map(|scorer| match scorer.downcast::<TermScorer>() {
+                Ok(term) => MixedScorer::Term(*term),
+                Err(scorer) => {
+                    let phrase = scorer
+                        .downcast::<PhraseScorer<SegmentPostings>>()
+                        .map_err(|_| ())
+                        .unwrap();
+                    MixedScorer::from_phrase(*phrase)
+                }
+            })
+            .collect();
+        return SpecializedScorer::MixedUnion(scorers);
+    }
     SpecializedScorer::Other(Box::new(BufferedUnionScorer::build(
         scorers,
         score_combiner_fn,
@@ -104,6 +135,11 @@ fn into_box_scorer<TScoreCombiner: ScoreCombiner>(
                 Box::new(union_scorer)
             }
         }
+        SpecializedScorer::MixedUnion(scorers) => Box::new(BufferedUnionScorer::build(
+            scorers,
+            score_combiner_fn,
+            num_docs,
+        )),
         SpecializedScorer::TermIntersection(term_scorers) => {
             let boxed_scorers: Vec<Box<dyn Scorer>> = term_scorers
                 .into_iter()
@@ -540,6 +576,14 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     _ => Ok(Box::new(BlockWandUnionScorer::new(scorers, init_threshold))),
                 }
             }
+            SpecializedScorer::MixedUnion(scorers) => {
+                let union =
+                    BufferedUnionScorer::build(scorers, &self.score_combiner_fn, reader.num_docs());
+                Ok(Box::new(BasicPruningScorer::new(
+                    Box::new(union),
+                    init_threshold,
+                )))
+            }
             SpecializedScorer::TermIntersection(scorers) => Ok(Box::new(
                 BlockWandIntersectionScorer::new(scorers, init_threshold),
             )),
@@ -586,6 +630,11 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                         BufferedUnionScorer::build(term_scorers, &self.score_combiner_fn, num_docs);
                     for_each_scorer(&mut union_scorer, callback);
                 }
+            }
+            SpecializedScorer::MixedUnion(scorers) => {
+                let mut union =
+                    BufferedUnionScorer::build(scorers, &self.score_combiner_fn, num_docs);
+                for_each_scorer(&mut union, callback);
             }
             SpecializedScorer::TermIntersection(term_scorers) => {
                 let boxed_scorers: Vec<Box<dyn Scorer>> = term_scorers
@@ -660,6 +709,24 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     }
                 }
             }
+            SpecializedScorer::MixedUnion(scorers) => {
+                if self.disjunction_pruning == DisjunctionPruning::BlockWand {
+                    let union = BufferedUnionScorer::build(
+                        scorers,
+                        &self.score_combiner_fn,
+                        reader.num_docs(),
+                    );
+                    let mut scorer = BasicPruningScorer::new(Box::new(union), threshold);
+                    for_each_pruning_scorer(&mut scorer, callback);
+                } else {
+                    super::block_maxscore::block_maxscore(
+                        scorers,
+                        threshold,
+                        super::block_maxscore::MIN_BOUND_WINDOW,
+                        callback,
+                    );
+                }
+            }
             SpecializedScorer::TermIntersection(scorers) => {
                 let mut scorer = BlockWandIntersectionScorer::new(scorers, threshold);
                 for_each_pruning_scorer(&mut scorer, callback);
@@ -692,6 +759,11 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     for_each_docset_buffered(&mut union_scorer, &mut buffer, callback);
                 }
             }
+            SpecializedScorer::MixedUnion(scorers) => {
+                let mut union =
+                    BufferedUnionScorer::build(scorers, &self.score_combiner_fn, num_docs);
+                for_each_docset_buffered(&mut union, &mut buffer, callback);
+            }
             SpecializedScorer::TermIntersection(term_scorers) => {
                 let boxed_scorers: Vec<Box<dyn Scorer>> = term_scorers
                     .into_iter()
@@ -720,6 +792,249 @@ mod tests {
     use super::BooleanWeight;
     use crate::query::{Bm25Weight, DisjunctionPruning, SumCombiner, TermScorer};
     use crate::Bm25Params;
+
+    #[test]
+    fn test_mixed_phrase_queries_match_exhaustive() -> crate::Result<()> {
+        use crate::query::{
+            BooleanQuery, BoostQuery, DisjunctionMaxQuery, EnableScoring, Occur, Query, QueryParser,
+        };
+        use crate::schema::{Schema, TEXT};
+        use crate::{Index, Score, TERMINATED};
+
+        for pnorms in [false, true] {
+            let mut schema = Schema::builder();
+            let options = TEXT.set_indexing_options(
+                TEXT.get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_pnorms(pnorms),
+            );
+            let field = schema.add_text_field("text", options.clone());
+            let other = schema.add_text_field("other", options);
+            let index = Index::create_in_ram(schema.build());
+            let mut writer = index.writer_for_tests()?;
+            writer.set_merge_policy(Box::new(crate::merge_policy::NoMergePolicy));
+            let mut seed = 71u32;
+            for ordinal in 0..10000 {
+                let len = if ordinal < 32 { 4 } else { 1 + ordinal % 160 };
+                let mut text = String::new();
+                for _ in 0..len {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    text.push_str(["a ", "b ", "c ", "x ", "1 ", "2 "][(seed >> 24) as usize % 6]);
+                }
+                writer.add_document(
+                    doc!(field => text, other => if ordinal % 3 == 0 { "a" } else { "x a b" }),
+                )?;
+                if ordinal == 31 {
+                    writer.commit()?;
+                }
+            }
+            writer.commit()?;
+            drop(writer);
+            let searcher = index.reader()?.searcher();
+            let parser = QueryParser::for_index(&index, vec![field]);
+            let reader = searcher.segment_reader(0);
+            let mut scorers = Vec::new();
+            for expression in ["a", "\"a b\""] {
+                scorers.push(
+                    parser
+                        .parse_query(expression)?
+                        .weight(EnableScoring::enabled_from_searcher(&searcher))?
+                        .scorer(reader, 1.0)?,
+                );
+            }
+            assert!(matches!(
+                super::scorer_union(scorers, SumCombiner::default, reader.num_docs()),
+                super::SpecializedScorer::MixedUnion(_)
+            ));
+            let mut queries = Vec::new();
+            for expression in [
+                "a OR \"a b\"",
+                "a OR a OR \"a b\"",
+                "\"a b\" OR \"b c\"",
+                "a OR \"a a\" OR \"a b\"",
+                "a OR \"a b a\"",
+                "\"a b a b\" OR \"b a b\"",
+                "(a OR \"a b b a\") AND c",
+                "a OR \"missing b\"",
+                "a OR \"a b\" OR missing",
+                "a OR \"a b\"^2.5",
+                "a OR \"a b\"~2",
+                "(a OR \"a b\") AND c",
+                "a OR b OR c OR 1,2 OR x",
+                "a AND \"a b\"",
+                "\"a b\" AND a",
+                "a AND \"a b a\"",
+                "a AND \"a a\"",
+                "a AND \"a b\"^2.5",
+                "a AND \"a b\"~2",
+                "a AND \"missing b\"",
+                "a AND b",
+                "a AND b AND c",
+                "a AND other:b",
+                "a AND other:b AND c",
+                "a^2.5 AND b^0.5",
+                "a AND b AND \"a b\"",
+                "\"a b\" AND \"b c\"",
+                "(a AND \"a b\") OR x",
+                "a AND \"a b\" AND NOT \"x x x\"",
+                "other:a AND text:\"a b\"",
+            ] {
+                queries.push((expression, parser.parse_query(expression)?));
+            }
+            queries.push((
+                "negative phrase",
+                Box::new(BooleanQuery::union(vec![
+                    parser.parse_query("a")?,
+                    Box::new(BoostQuery::new(parser.parse_query("\"a b\"")?, -1.0)),
+                ])),
+            ));
+            queries.push((
+                "negative required phrase",
+                Box::new(BooleanQuery::intersection(vec![
+                    parser.parse_query("a")?,
+                    Box::new(BoostQuery::new(parser.parse_query("\"a b\"")?, -1.0)),
+                ])),
+            ));
+            queries.push((
+                "all should required",
+                Box::new(BooleanQuery::union_with_minimum_required_clauses(
+                    vec![parser.parse_query("a")?, parser.parse_query("\"a b\"")?],
+                    2,
+                )),
+            ));
+            queries.push((
+                "minimum two",
+                Box::new(BooleanQuery::union_with_minimum_required_clauses(
+                    vec![
+                        parser.parse_query("a")?,
+                        parser.parse_query("\"a b\"")?,
+                        parser.parse_query("\"b c\"")?,
+                    ],
+                    2,
+                )),
+            ));
+            queries.push((
+                "dismax",
+                Box::new(DisjunctionMaxQuery::new(vec![
+                    parser.parse_query("a")?,
+                    parser.parse_query("\"a b\"")?,
+                ])),
+            ));
+            queries.push((
+                "exclusion",
+                Box::new(BooleanQuery::new(vec![
+                    (Occur::Should, parser.parse_query("a")?),
+                    (Occur::Should, parser.parse_query("\"a b\"")?),
+                    (Occur::MustNot, parser.parse_query("\"x x x\"")?),
+                ])),
+            ));
+            for (expression, parsed) in queries {
+                for boost in [0.0, 1.0, 2.5, -1.0] {
+                    let query = BoostQuery::new(parsed.box_clone(), boost);
+                    for mode in [
+                        DisjunctionPruning::Auto,
+                        DisjunctionPruning::BlockMaxScore,
+                        DisjunctionPruning::BlockWand,
+                    ] {
+                        let weight = query.weight(
+                            EnableScoring::enabled_from_searcher(&searcher)
+                                .with_disjunction_pruning(mode),
+                        )?;
+                        for reader in searcher.segment_readers() {
+                            let mut baseline = weight.scorer(reader, 1.0)?;
+                            let mut expected = Vec::new();
+                            while baseline.doc() != TERMINATED {
+                                expected.push((baseline.doc(), baseline.score()));
+                                baseline.advance();
+                            }
+                            if boost == 1.0 && mode == DisjunctionPruning::Auto {
+                                let disabled = query
+                                    .weight(EnableScoring::disabled_from_searcher(&searcher))?;
+                                let mut docs = Vec::new();
+                                disabled.for_each_no_score(reader, &mut |block| {
+                                    docs.extend_from_slice(block);
+                                })?;
+                                assert_eq!(docs, expected.iter().map(|v| v.0).collect::<Vec<_>>());
+                                if expression == "a AND \"a b\"" {
+                                    let mut thresholds = vec![Score::MIN, 0.0, Score::MAX];
+                                    for &(_, score) in
+                                        expected.iter().step_by((expected.len() / 4).max(1))
+                                    {
+                                        thresholds.extend([
+                                            score.next_down(),
+                                            score,
+                                            score.next_up(),
+                                        ]);
+                                    }
+                                    for threshold in thresholds {
+                                        let reference: Vec<_> = expected
+                                            .iter()
+                                            .copied()
+                                            .filter(|&(_, score)| score > threshold)
+                                            .collect();
+                                        let mut scorer =
+                                            weight.pruning_scorer(reader, 1.0, threshold)?;
+                                        let mut actual = Vec::new();
+                                        while scorer.doc() != TERMINATED {
+                                            actual.push((scorer.doc(), scorer.score()));
+                                            scorer.advance();
+                                        }
+                                        assert_eq!(actual, reference, "threshold={threshold}");
+                                        actual.clear();
+                                        weight.for_each_pruning(
+                                            threshold,
+                                            reader,
+                                            &mut |doc, score| {
+                                                actual.push((doc, score));
+                                                threshold
+                                            },
+                                        )?;
+                                        assert_eq!(actual, reference, "threshold={threshold}");
+                                    }
+                                }
+                            }
+                            let all = expected
+                                .iter()
+                                .copied()
+                                .collect::<std::collections::HashMap<_, _>>();
+                            expected
+                                .sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                            for top_k in [1, 3, 10, 50] {
+                                let mut actual: Vec<(u32, Score)> = Vec::new();
+                                weight.for_each_pruning(
+                                    Score::MIN,
+                                    reader,
+                                    &mut |doc, score| {
+                                        assert!((score - all[&doc]).abs() <= 1e-5);
+                                        actual.push((doc, score));
+                                        actual.sort_unstable_by(|a, b| {
+                                            b.1.total_cmp(&a.1).then(a.0.cmp(&b.0))
+                                        });
+                                        actual.truncate(top_k);
+                                        if actual.len() == top_k {
+                                            actual.last().unwrap().1
+                                        } else {
+                                            Score::MIN
+                                        }
+                                    },
+                                )?;
+                                assert_eq!(actual.len(), expected.len().min(top_k));
+                                for (actual, expected) in actual.iter().zip(&expected) {
+                                    assert!(
+                                        (actual.1 - expected.1).abs() <= 1e-5,
+                                        "{expression}, boost={boost}, {mode:?}, pnorms={pnorms}, \
+                                         k={top_k}: {actual:?} != {expected:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_negative_term_weight_disables_maxscore() {

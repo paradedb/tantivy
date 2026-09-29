@@ -28,16 +28,59 @@ pub(super) fn should_use_block_maxscore(scorers: &[TermScorer], max_doc: DocId) 
         && postings.saturating_mul(max_docs_per_posting) >= u64::from(max_doc)
 }
 
-struct Term {
-    scorer: Box<TermScorer>,
+pub(super) trait BlockMaxScorer: Scorer {
+    fn seek_block(&mut self, target: DocId);
+    fn block_max_score_up_to(&mut self, target: DocId) -> (Score, DocId);
+    fn block_score_hint(&self) -> Score;
+    fn refine_block_max_score(&mut self) -> Score;
+    fn for_each_score_until(&mut self, end: DocId, callback: impl FnMut(DocId, Score));
+
+    #[inline]
+    fn score_at(&mut self, doc: DocId) -> Option<Score> {
+        if self.doc() < doc {
+            self.seek(doc);
+        }
+        (doc != TERMINATED && self.doc() == doc).then(|| self.score())
+    }
+}
+
+impl BlockMaxScorer for TermScorer {
+    #[inline]
+    fn seek_block(&mut self, target: DocId) {
+        self.seek_block(target);
+    }
+
+    #[inline]
+    fn block_max_score_up_to(&mut self, target: DocId) -> (Score, DocId) {
+        self.block_max_score_up_to(target)
+    }
+
+    #[inline]
+    fn block_score_hint(&self) -> Score {
+        self.block_score_hint()
+    }
+
+    #[inline]
+    fn refine_block_max_score(&mut self) -> Score {
+        self.refine_block_max_score()
+    }
+
+    #[inline]
+    fn for_each_score_until(&mut self, end: DocId, callback: impl FnMut(DocId, Score)) {
+        self.for_each_score_until(end, callback);
+    }
+}
+
+struct Term<TScorer> {
+    scorer: Box<TScorer>,
     bound: f64,
     inv_cost: f64,
     priority: f64,
     remaining: f64,
 }
 
-pub(super) fn block_maxscore(
-    scorers: Vec<TermScorer>,
+pub(super) fn block_maxscore<TScorer: BlockMaxScorer>(
+    scorers: Vec<TScorer>,
     mut threshold: Score,
     min_window: u32,
     callback: &mut dyn FnMut(DocId, Score) -> Score,
@@ -47,7 +90,7 @@ pub(super) fn block_maxscore(
     let mut terms: Vec<_> = scorers
         .into_iter()
         .map(|scorer| Term {
-            inv_cost: 1.0 / scorer.size_hint().max(1) as f64,
+            inv_cost: 1.0 / scorer.cost().max(1) as f64,
             priority: 0.0,
             scorer: Box::new(scorer),
             bound: 0.0,
@@ -159,11 +202,8 @@ pub(super) fn block_maxscore(
                     if score * rounding + term.bound + term.remaining <= threshold as f64 {
                         continue;
                     }
-                    if term.scorer.doc() < doc {
-                        term.scorer.seek(doc);
-                    }
-                    if term.scorer.doc() == doc {
-                        score += term.scorer.score() as f64;
+                    if let Some(contribution) = term.scorer.score_at(doc) {
+                        score += contribution as f64;
                     }
                     let keep = score * rounding + term.remaining > threshold as f64;
                     matches[len] = (doc, score);

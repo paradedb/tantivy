@@ -49,6 +49,14 @@ impl PhraseWeight {
             .as_ref()
             .map(|similarity_weight| similarity_weight.boost_by(boost));
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
+        let indexing_average = if similarity_weight_opt.is_some() {
+            reader
+                .inverted_index(self.phrase_terms[0].1.field())?
+                .total_num_tokens() as Score
+                / reader.max_doc() as Score
+        } else {
+            Score::NAN
+        };
         let mut term_postings_list = Vec::new();
         for &(offset, ref term) in &self.phrase_terms {
             if let Some(postings) = reader
@@ -60,12 +68,15 @@ impl PhraseWeight {
                 return Ok(None);
             }
         }
-        Ok(Some(PhraseScorer::new(
-            term_postings_list,
-            similarity_weight_opt,
-            fieldnorm_reader,
-            self.slop,
-        )))
+        Ok(Some(
+            PhraseScorer::new(
+                term_postings_list,
+                similarity_weight_opt,
+                fieldnorm_reader,
+                self.slop,
+            )
+            .with_indexing_average(indexing_average),
+        ))
     }
 
     pub fn slop(&mut self, slop: u32) {

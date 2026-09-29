@@ -3,6 +3,7 @@ mod block_wand_intersection;
 mod block_wand_union;
 mod boolean_query;
 mod boolean_weight;
+mod mixed_scorer;
 
 pub use self::block_wand_intersection::BlockWandIntersectionScorer;
 pub use self::block_wand_union::{BlockWandSingleScorer, BlockWandUnionScorer};
