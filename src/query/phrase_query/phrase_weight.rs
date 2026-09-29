@@ -13,6 +13,10 @@ use crate::{DocId, DocSet, Score};
 
 pub struct PhraseWeight {
     phrase_terms: Vec<(usize, Term)>,
+    // Cached once per weight to share one postings cursor per distinct term in exact phrases.
+    // Each tuple stores the first index into `phrase_terms` and that term's deduplicated
+    // offsets, normalized as `max_phrase_offset - offset`. Empty unless terms repeat
+    // and at least two distinct terms remain; ignored for sloppy phrases.
     grouped_terms: Vec<(usize, Vec<u32>)>,
     similarity_weight_opt: Option<Bm25Weight>,
     slop: u32,
