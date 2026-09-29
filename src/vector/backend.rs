@@ -1575,7 +1575,6 @@ fn score_layer(
     decoded_error_ratios: &mut Vec<f32>,
     decoded_constants: &mut Vec<f32>,
     read_ranges: &mut Vec<Range<usize>>,
-    block_scratch: &mut Vec<(usize, usize)>,
     selected_rows: &mut Vec<usize>,
     row_offsets: &mut Vec<usize>,
 ) -> crate::Result<usize> {
@@ -1638,61 +1637,50 @@ fn score_layer(
     selected_rows.clear();
     selected_rows.extend(offsets.iter().map(|&offset| rows.start + offset));
 
-    layer.plan_code_reads(rows.clone(), selected_rows, read_ranges, block_scratch);
-    let mut selected_start = 0usize;
-    for read_range in read_ranges.iter().cloned() {
-        let mut selected_end = selected_start;
-        while selected_end < selected_count && selected_rows[selected_end] < read_range.end {
-            debug_assert!(selected_rows[selected_end] >= read_range.start);
-            selected_end += 1;
-        }
-        row_offsets.clear();
-        row_offsets.extend(
-            selected_rows[selected_start..selected_end]
-                .iter()
-                .map(|&row| row - read_range.start),
-        );
-        let codes = layer.read_codes(read_range)?;
-        query.score_layer_batch_unscaled_indexed(
-            layer_idx,
-            codes.as_slice(),
-            layer.code_stride(),
-            row_offsets,
-            &mut kernel_scores[selected_start..selected_end],
-        );
-        selected_start = selected_end;
-    }
-    debug_assert_eq!(selected_start, selected_count);
-
-    // Each sidecar column gets a plan against its own physical storage blocks.
-    for (kind, idx) in layer.sidecar_columns().into_iter().enumerate() {
-        layer.plan_column_reads(idx, rows.clone(), selected_rows, read_ranges, block_scratch);
-        selected_start = 0;
+    // Selected rows and their code ranges are ordered, so each cluster can be consumed
+    // directly without allocating request/view lists or sorting them.
+    let mut cluster_start = 0;
+    while cluster_start < selected_count {
+        let cluster = layer.cluster(selected_rows[cluster_start]);
+        let cluster_end = cluster_start
+            + selected_rows[cluster_start..].partition_point(|&row| row < cluster.rows.end);
+        cluster.plan_codes(&selected_rows[cluster_start..cluster_end], read_ranges);
+        let mut selected_start = cluster_start;
         for read_range in read_ranges.iter().cloned() {
-            let bytes = layer.read_column(idx, read_range.clone())?;
-            while selected_start < selected_count && selected_rows[selected_start] < read_range.end
-            {
-                let local = selected_rows[selected_start] - read_range.start;
-                match kind {
-                    0 => {
-                        decoded_scales[selected_start] =
-                            f32::from_le_bytes(bytes[local * 4..local * 4 + 4].try_into().unwrap())
-                    }
-                    1 => {
-                        decoded_gammas[selected_start] = f16_to_f32(u16::from_le_bytes(
-                            bytes[local * 2..local * 2 + 2].try_into().unwrap(),
-                        ))
-                    }
-                    _ => {
-                        decoded_error_ratios[selected_start] = f16_to_f32(u16::from_le_bytes(
-                            bytes[local * 2..local * 2 + 2].try_into().unwrap(),
-                        ))
-                    }
-                }
-                selected_start += 1;
+            let mut selected_end = selected_start;
+            while selected_end < cluster_end && selected_rows[selected_end] < read_range.end {
+                debug_assert!(selected_rows[selected_end] >= read_range.start);
+                selected_end += 1;
             }
+            row_offsets.clear();
+            row_offsets.extend(
+                selected_rows[selected_start..selected_end]
+                    .iter()
+                    .map(|&row| row - read_range.start),
+            );
+            let codes = cluster.read_codes(read_range)?;
+            query.score_layer_batch_unscaled_indexed(
+                layer_idx,
+                codes.as_slice(),
+                layer.code_stride(),
+                row_offsets,
+                &mut kernel_scores[selected_start..selected_end],
+            );
+            selected_start = selected_end;
         }
-        debug_assert_eq!(selected_start, selected_count);
+        debug_assert_eq!(selected_start, cluster_end);
+        cluster.read_sidecar()?.decode_selected(
+            &selected_rows[cluster_start..cluster_end],
+            &mut decoded_scales[cluster_start..cluster_end],
+            &mut decoded_gammas[cluster_start..cluster_end],
+            &mut decoded_error_ratios[cluster_start..cluster_end],
+            if metric == Metric::L2 {
+                &mut decoded_constants[cluster_start..cluster_end]
+            } else {
+                &mut []
+            },
+        )?;
+        cluster_start = cluster_end;
     }
     // For sparse selections, the reported error row is approximate after the first selected row.
     validate_decoded_sidecar(
@@ -1701,27 +1689,6 @@ fn score_layer(
         selected_rows[0],
     )?;
 
-    if metric == Metric::L2 {
-        layer.plan_constant_reads(rows, selected_rows, read_ranges, block_scratch)?;
-        selected_start = 0;
-        for read_range in read_ranges.iter().cloned() {
-            let constants = layer.read_constants(read_range.clone())?.ok_or_else(|| {
-                TantivyError::DataCorruption(DataCorruption::comment_only(
-                    "quantized L2 field is missing a constants slot",
-                ))
-            })?;
-            while selected_start < selected_count && selected_rows[selected_start] < read_range.end
-            {
-                let row = selected_rows[selected_start];
-                debug_assert!(row >= read_range.start);
-                let offset = (row - read_range.start) * std::mem::size_of::<f32>();
-                decoded_constants[selected_start] =
-                    f32::from_le_bytes(constants[offset..offset + 4].try_into().unwrap());
-                selected_start += 1;
-            }
-        }
-        debug_assert_eq!(selected_start, selected_count);
-    }
     Ok(selected_count)
 }
 
@@ -2350,7 +2317,6 @@ impl<T: VectorElement> VectorBackend<T> {
                 &mut decoded_error_ratios,
                 &mut decoded_constants,
                 &mut survivor_read_ranges,
-                &mut survivor_block_scratch,
                 &mut selected_rows,
                 &mut indexed_row_offsets,
             )?;
@@ -2488,7 +2454,6 @@ impl<T: VectorElement> VectorBackend<T> {
                         &mut decoded_error_ratios,
                         &mut decoded_constants,
                         &mut survivor_read_ranges,
-                        &mut survivor_block_scratch,
                         &mut selected_rows,
                         &mut indexed_row_offsets,
                     )?;
@@ -2569,7 +2534,6 @@ impl<T: VectorElement> VectorBackend<T> {
                         &mut decoded_error_ratios,
                         &mut decoded_constants,
                         &mut survivor_read_ranges,
-                        &mut survivor_block_scratch,
                         &mut selected_rows,
                         &mut indexed_row_offsets,
                     )?;

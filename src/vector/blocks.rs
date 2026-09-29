@@ -273,6 +273,11 @@ impl Blocks {
         self.entry
             .slice(self.block_start(b) + range.start..self.block_start(b) + range.end)
     }
+    /// Resolves a byte span relative to a validated block while preserving storage geometry.
+    pub(crate) fn block_slice(&self, b: usize, range: Range<usize>) -> FileSlice {
+        let start = self.block_start(b);
+        self.entry.slice(start + range.start..start + range.end)
+    }
     /// Rejects row spans crossing a block, including malformed and out-of-range spans.
     pub(crate) fn block_for_range(&self, rows: &Range<usize>) -> crate::Result<usize> {
         if rows.start >= rows.end || rows.end > *self.block_rows.last().unwrap() {
