@@ -42,6 +42,7 @@ pub struct BlockWandIntersectionScorer {
 
     candidate_doc_ids: [u32; COMPRESSION_BLOCK_SIZE],
     candidate_scores: [f32; COMPRESSION_BLOCK_SIZE],
+    candidate_norms: [u8; COMPRESSION_BLOCK_SIZE],
     num_candidates: usize,
     candidate_idx: usize,
 
@@ -51,6 +52,7 @@ pub struct BlockWandIntersectionScorer {
     internal_doc: DocId,
     window_end: DocId,
     wide_windows: bool,
+    shared_fieldnorms: bool,
 }
 impl BlockWandIntersectionScorer {
     /// Construction positions `current` on the first match
@@ -62,6 +64,9 @@ impl BlockWandIntersectionScorer {
         let leader = scorers.remove(0);
         let secondaries = scorers;
         let secondaries_len = secondaries.len();
+        let shared_fieldnorms = secondaries
+            .iter()
+            .all(|secondary| leader.shares_fieldnorms_with(secondary));
         let wide_windows =
             u64::from(secondaries[0].size_hint()) >= u64::from(leader.size_hint()) * 4;
 
@@ -87,6 +92,7 @@ impl BlockWandIntersectionScorer {
             bm25_weight,
             candidate_doc_ids: [0u32; COMPRESSION_BLOCK_SIZE],
             candidate_scores: [0f32; COMPRESSION_BLOCK_SIZE],
+            candidate_norms: [0u8; COMPRESSION_BLOCK_SIZE],
             num_candidates: 0,
             candidate_idx: 0,
             threshold,
@@ -95,6 +101,7 @@ impl BlockWandIntersectionScorer {
             internal_doc,
             window_end: 0,
             wide_windows,
+            shared_fieldnorms,
         };
         scorer.advance();
         scorer
@@ -116,9 +123,14 @@ impl BlockWandIntersectionScorer {
                 }
             }
 
-            let mut score = self.leader.score();
+            let norm = self.leader.fieldnorm_id();
+            let mut score = self.bm25_weight.score(norm, self.leader.term_freq());
             for secondary in &mut self.secondaries {
-                score += secondary.score();
+                score += if self.shared_fieldnorms {
+                    secondary.bm25_weight().score(norm, secondary.term_freq())
+                } else {
+                    secondary.score()
+                };
             }
             self.internal_doc = candidate + 1;
             if score > self.threshold {
@@ -133,6 +145,14 @@ impl BlockWandIntersectionScorer {
     }
 
     fn handle_candidates(&mut self) -> Option<DocId> {
+        if self.shared_fieldnorms {
+            self.handle_candidates_with_norms::<true>()
+        } else {
+            self.handle_candidates_with_norms::<false>()
+        }
+    }
+
+    fn handle_candidates_with_norms<const SHARED_NORMS: bool>(&mut self) -> Option<DocId> {
         // Pass 2: Check intersection membership only for survivors.
         // score_threshold may be stale (threshold can increase from callbacks),
         // but that's conservative — we may check a few extra candidates, never miss one.
@@ -152,7 +172,14 @@ impl BlockWandIntersectionScorer {
                     self.candidate_idx += 1;
                     continue 'next_candidate;
                 }
-                total_score += secondary.score();
+                total_score += if SHARED_NORMS {
+                    secondary.bm25_weight().score(
+                        self.candidate_norms[self.candidate_idx],
+                        secondary.term_freq(),
+                    )
+                } else {
+                    secondary.score()
+                };
 
                 // Prune: even if all remaining secondaries score at their block max,
                 // can we still beat the threshold?
@@ -286,6 +313,7 @@ impl DocSet for BlockWandIntersectionScorer {
                 let leader_score = self.bm25_weight.score(fieldnorm_id, term_freq);
                 self.candidate_doc_ids[num_candidates] = candidate_doc;
                 self.candidate_scores[num_candidates] = leader_score;
+                self.candidate_norms[num_candidates] = fieldnorm_id;
                 num_candidates += (leader_score > score_threshold) as usize;
             }
             self.num_candidates = num_candidates;
@@ -530,6 +558,10 @@ mod tests {
                         crate::Bm25Params::default(),
                     );
                     TermScorer::create_for_test(postings, &fieldnorms_expanded[..], bm25_weight)
+                        .with_fieldnorm_source(
+                            crate::index::SegmentId::default(),
+                            crate::schema::Field::from_field_id(0),
+                        )
                 })
                 .collect()
         };
@@ -576,6 +608,35 @@ mod tests {
     }
 
     #[test]
+    fn test_shared_norms_do_not_read_secondary_streams() {
+        use crate::directory::FileSlice;
+        use crate::index::SegmentId;
+        use crate::schema::Field;
+
+        let norms: Vec<_> = (0..256).map(|doc| 10 + doc % 23).collect();
+        let scorers: Vec<_> = (1..=3)
+            .map(|offset| {
+                let postings: Vec<_> = (0..256).map(|doc| (doc, 1 + doc % offset)).collect();
+                TermScorer::create_for_test(
+                    &postings,
+                    &norms,
+                    Bm25Weight::for_one_term(256, 512, 100.0, crate::Bm25Params::default()),
+                )
+                .with_fieldnorm_source(SegmentId::default(), Field::from_field_id(0))
+            })
+            .collect();
+        let expected = compute_checkpoints_naive_intersection(scorers.clone(), 10);
+        let mut shared = scorers;
+        for secondary in &mut shared[1..] {
+            secondary
+                .block_cursor()
+                .set_term_norm_source(Some(FileSlice::empty()), Some(0));
+        }
+        let actual = compute_checkpoints_block_wand_intersection(shared, 10);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn test_intersection_bounds_with_different_averages() {
         use crate::directory::FileSlice;
         use crate::fieldnorm::FieldNormReader;
@@ -606,7 +667,11 @@ mod tests {
                                 average,
                                 Bm25Params::default(),
                             );
-                            let mut scorer = TermScorer::create_for_test(&docs, &norms, weight);
+                            let mut scorer = TermScorer::create_for_test(&docs, &norms, weight)
+                                .with_fieldnorm_source(
+                                    crate::index::SegmentId::default(),
+                                    crate::schema::Field::from_field_id(0),
+                                );
                             if pnorms {
                                 let bytes: Vec<_> = docs
                                     .iter()

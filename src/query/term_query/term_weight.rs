@@ -230,14 +230,16 @@ impl TermWeight {
         let indexing_average =
             inverted_index.total_num_tokens() as Score / fieldnorm_reader.num_docs() as Score;
         let similarity_weight = self.similarity_weight.boost_by(boost);
-        Ok(TermOrEmptyOrAllScorer::TermScorer(Box::new(
-            TermScorer::for_segment(
-                segment_postings,
-                fieldnorm_reader,
-                similarity_weight,
-                indexing_average,
-            ),
-        )))
+        let mut scorer = TermScorer::for_segment(
+            segment_postings,
+            fieldnorm_reader,
+            similarity_weight,
+            indexing_average,
+        );
+        if self.scoring_enabled {
+            scorer = scorer.with_fieldnorm_source(reader.segment_id(), field);
+        }
+        Ok(TermOrEmptyOrAllScorer::TermScorer(Box::new(scorer)))
     }
 
     fn fieldnorm_reader(&self, segment_reader: &SegmentReader) -> crate::Result<FieldNormReader> {

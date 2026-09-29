@@ -908,6 +908,23 @@ mod tests {
             let searcher = index.reader()?.searcher();
             let parser = QueryParser::for_index(&index, vec![field]);
             let reader = searcher.segment_reader(0);
+            let term_query = parser.parse_query("a")?;
+            let scored = term_query
+                .weight(EnableScoring::enabled_from_searcher(&searcher))?
+                .scorer(reader, 1.0)?;
+            let unscored = term_query
+                .weight(EnableScoring::disabled_from_searcher(&searcher))?
+                .scorer(reader, 1.0)?;
+            let other_field = parser
+                .parse_query("other:a")?
+                .weight(EnableScoring::enabled_from_searcher(&searcher))?
+                .scorer(reader, 1.0)?;
+            let scored = scored.downcast_ref::<TermScorer>().unwrap();
+            assert!(scored.shares_fieldnorms_with(scored));
+            assert!(!scored.shares_fieldnorms_with(unscored.downcast_ref::<TermScorer>().unwrap()));
+            assert!(
+                !scored.shares_fieldnorms_with(other_field.downcast_ref::<TermScorer>().unwrap())
+            );
             let mut scorers = Vec::new();
             for expression in ["a", "\"a b\""] {
                 scorers.push(
@@ -964,6 +981,11 @@ mod tests {
                 "a AND \"a b\"^2.5",
                 "a AND \"a b\"~2",
                 "a AND \"missing b\"",
+                "a AND b",
+                "a AND b AND c",
+                "a AND other:b",
+                "a AND other:b AND c",
+                "a^2.5 AND b^0.5",
                 "a AND b AND \"a b\"",
                 "\"a b\" AND \"b c\"",
                 "(a AND \"a b\") OR x",
