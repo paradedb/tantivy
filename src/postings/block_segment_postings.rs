@@ -36,7 +36,7 @@ pub struct BlockSegmentPostings {
     term_norms: Option<super::term_norms::TermNormReader>,
 }
 
-const POSTINGS_BUFFER_SIZE: usize = 8192;
+const POSTINGS_BUFFER_SIZE: usize = 1024;
 
 #[derive(Clone)]
 enum PostingData {
@@ -728,7 +728,7 @@ mod tests {
                     assert_eq!(scorer.doc(), original_doc);
                 }
                 let refinement_reads = reads.lock().unwrap().len() - reads_before;
-                assert!(refinement_reads <= 3, "{refinement_reads} refinement reads");
+                assert!(refinement_reads <= 8, "{refinement_reads} refinement reads");
 
                 loop {
                     assert_eq!(lazy.docs(), eager.docs());
