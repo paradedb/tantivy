@@ -1,6 +1,8 @@
 use crate::docset::DocSet;
 use crate::fieldnorm::FieldNormReader;
-use crate::postings::{BlockSegmentPostings, FreqReadingOption, Postings, SegmentPostings};
+use crate::postings::{
+    BlockInfo, BlockSegmentPostings, FreqReadingOption, Postings, SegmentPostings,
+};
 use crate::query::bm25::Bm25Weight;
 use crate::query::{Explanation, Scorer};
 use crate::{DocId, Score};
@@ -100,11 +102,16 @@ impl TermScorer {
     }
 
     pub(crate) fn block_score_hint(&self) -> Score {
-        self.postings
-            .block_cursor
-            .skip_reader()
-            .block_max_score(&self.similarity_weight)
-            .unwrap_or_else(|| self.max_score())
+        match self.postings.block_cursor.skip_reader().block_info() {
+            BlockInfo::BitPacked {
+                block_wand_fieldnorm_id,
+                block_wand_term_freq,
+                ..
+            } => self
+                .similarity_weight
+                .score(block_wand_fieldnorm_id, block_wand_term_freq),
+            BlockInfo::VInt { .. } => self.max_score(),
+        }
     }
 
     pub(crate) fn refine_block_max_score(&mut self) -> Score {
@@ -137,6 +144,9 @@ impl TermScorer {
     }
 
     pub(crate) fn block_max_score_up_to(&mut self, target: DocId) -> (Score, DocId) {
+        if self.last_doc_in_block() >= target {
+            return (self.block_max_score(), self.last_doc_in_block());
+        }
         let Some(weight) = self.block_max_weight.as_ref() else {
             return (self.max_score(), crate::TERMINATED);
         };

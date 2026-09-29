@@ -750,13 +750,19 @@ mod tests {
             for top_k in [1, 3, 10, 100] {
                 let expected =
                     compute_checkpoints(scorers.clone(), top_k, 1000, PruningMode::NoPruning);
-                let actual = compute_checkpoints(scorers.clone(), top_k, 1000, PruningMode::Wand);
-                assert_eq!(actual.len(), expected.len(), "average={average}, k={top_k}");
-                for ((doc, score), (expected_doc, expected_score)) in
-                    actual.into_iter().zip(expected)
-                {
-                    assert_eq!(doc, expected_doc);
-                    assert!(nearly_equals(score, expected_score));
+                for mode in [PruningMode::Wand, PruningMode::MaxScore(0)] {
+                    let actual = compute_checkpoints(scorers.clone(), top_k, 1000, mode);
+                    assert_eq!(
+                        actual.len(),
+                        expected.len(),
+                        "average={average}, k={top_k}, {mode:?}"
+                    );
+                    for (&(doc, score), &(expected_doc, expected_score)) in
+                        actual.iter().zip(&expected)
+                    {
+                        assert_eq!(doc, expected_doc);
+                        assert!(nearly_equals(score, expected_score));
+                    }
                 }
             }
         }

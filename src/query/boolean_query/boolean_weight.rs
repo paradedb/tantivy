@@ -639,11 +639,13 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                         for_each_pruning_scorer(&mut scorer, callback);
                     }
                     _ if self.should_use_block_maxscore(&scorers, reader.max_doc()) => {
+                        let min_window = if scorers.len() == 2 {
+                            0
+                        } else {
+                            super::block_maxscore::MIN_BOUND_WINDOW
+                        };
                         super::block_maxscore::block_maxscore(
-                            scorers,
-                            threshold,
-                            super::block_maxscore::MIN_BOUND_WINDOW,
-                            callback,
+                            scorers, threshold, min_window, callback,
                         );
                     }
                     _ => {
