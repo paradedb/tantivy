@@ -645,11 +645,13 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                         for_each_pruning_scorer(&mut scorer, callback);
                     }
                     _ if self.should_use_block_maxscore(&scorers, reader.max_doc()) => {
+                        let min_window = if scorers.len() == 2 {
+                            0
+                        } else {
+                            super::block_maxscore::MIN_BOUND_WINDOW
+                        };
                         super::block_maxscore::block_maxscore(
-                            scorers,
-                            threshold,
-                            super::block_maxscore::MIN_BOUND_WINDOW,
-                            callback,
+                            scorers, threshold, min_window, callback,
                         );
                     }
                     _ => {
@@ -739,6 +741,7 @@ mod tests {
     fn test_disjunction_pruning_overrides_cutoffs() {
         for (term_count, doc_freq, max_doc, auto_maxscore) in [
             (2, 1, 1_024, false),
+            (2, 128, 1_024, true),
             (3, 128, 1_024, true),
             (3, 128, 1_048_576, false),
         ] {
