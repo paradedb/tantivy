@@ -183,12 +183,24 @@ enum ShouldScorersCombinationMethod {
     Required(SpecializedScorer),
 }
 
+/// Policy for pruning or intersecting conjunction queries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConjunctionPruning {
+    /// Automatically choose based on term densities and segment size.
+    Auto,
+    /// Always use Block-WAND intersection leapfrog.
+    BlockWand,
+    /// Always use lazy windowed bitset intersection.
+    LazyWindowed,
+}
+
 /// Weight associated to the `BoolQuery`.
 pub struct BooleanWeight<TScoreCombiner: ScoreCombiner> {
     weights: Vec<(Occur, Box<dyn Weight>)>,
     minimum_number_should_match: usize,
     scoring_enabled: bool,
     disjunction_pruning: DisjunctionPruning,
+    conjunction_pruning: ConjunctionPruning,
     score_combiner_fn: Box<dyn Fn() -> TScoreCombiner + Sync + Send>,
 }
 
@@ -205,6 +217,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
             score_combiner_fn,
             minimum_number_should_match: 1,
             disjunction_pruning: DisjunctionPruning::Auto,
+            conjunction_pruning: ConjunctionPruning::Auto,
         }
     }
 
@@ -221,11 +234,17 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
             scoring_enabled,
             score_combiner_fn,
             disjunction_pruning: DisjunctionPruning::Auto,
+            conjunction_pruning: ConjunctionPruning::Auto,
         }
     }
 
     pub(crate) fn with_disjunction_pruning(mut self, pruning: DisjunctionPruning) -> Self {
         self.disjunction_pruning = pruning;
+        self
+    }
+
+    pub(crate) fn with_conjunction_pruning(mut self, pruning: ConjunctionPruning) -> Self {
+        self.conjunction_pruning = pruning;
         self
     }
 
@@ -236,6 +255,29 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
             }
             DisjunctionPruning::BlockWand => false,
             DisjunctionPruning::BlockMaxScore => true,
+        }
+    }
+
+    fn should_use_lazy_windowed_intersection(
+        &self,
+        scorers: &[TermScorer],
+        max_doc: DocId,
+    ) -> bool {
+        match self.conjunction_pruning {
+            ConjunctionPruning::Auto => {
+                // Two-term conjunctions have high match cardinality (p^2) where Block-WAND's
+                // score threshold pruning is highly effective, and leapfrogging across only two
+                // lists has no cascading thrashing. For 3 or more dense terms, leapfrog
+                // thrashes doc-by-doc across all terms, and the windowed bitset intersection
+                // provides substantial speedups.
+                if scorers.len() < 3 || max_doc == 0 {
+                    return false;
+                }
+                let min_cost = scorers.iter().map(|s| s.cost()).min().unwrap_or(0);
+                (min_cost as f64) / (max_doc as f64) >= 0.15
+            }
+            ConjunctionPruning::BlockWand => false,
+            ConjunctionPruning::LazyWindowed => true,
         }
     }
 
@@ -534,9 +576,21 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     _ => Ok(Box::new(BlockWandUnionScorer::new(scorers, init_threshold))),
                 }
             }
-            SpecializedScorer::TermIntersection(scorers) => Ok(Box::new(
-                BlockWandIntersectionScorer::new(scorers, init_threshold),
-            )),
+            SpecializedScorer::TermIntersection(scorers) => {
+                if self.should_use_lazy_windowed_intersection(&scorers, reader.max_doc()) {
+                    Ok(Box::new(
+                        super::lazy_windowed_intersection::LazyWindowedIntersectionScorer::new(
+                            scorers,
+                            init_threshold,
+                        ),
+                    ))
+                } else {
+                    Ok(Box::new(BlockWandIntersectionScorer::new(
+                        scorers,
+                        init_threshold,
+                    )))
+                }
+            }
             SpecializedScorer::Other(scorer) => {
                 Ok(Box::new(BasicPruningScorer::new(scorer, init_threshold)))
             }
@@ -653,8 +707,16 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                 }
             }
             SpecializedScorer::TermIntersection(scorers) => {
-                let mut scorer = BlockWandIntersectionScorer::new(scorers, threshold);
-                for_each_pruning_scorer(&mut scorer, callback);
+                if self.should_use_lazy_windowed_intersection(&scorers, reader.max_doc()) {
+                    let mut scorer =
+                        super::lazy_windowed_intersection::LazyWindowedIntersectionScorer::new(
+                            scorers, threshold,
+                        );
+                    for_each_pruning_scorer(&mut scorer, callback);
+                } else {
+                    let mut scorer = BlockWandIntersectionScorer::new(scorers, threshold);
+                    for_each_pruning_scorer(&mut scorer, callback);
+                }
             }
             SpecializedScorer::Other(scorer) => {
                 let mut scorer = BasicPruningScorer::new(scorer, threshold);
@@ -709,7 +771,11 @@ fn is_include_occur(occur: Occur) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::BooleanWeight;
+    use common::HasLen;
+
+    use super::{BooleanWeight, ConjunctionPruning};
+    use crate::fieldnorm::FieldNormReader;
+    use crate::postings::SegmentPostings;
     use crate::query::{Bm25Weight, DisjunctionPruning, SumCombiner, TermScorer};
     use crate::Bm25Params;
 
@@ -888,5 +954,39 @@ mod tests {
                 assert!(weight.should_use_block_maxscore(&scorers, max_doc));
             }
         }
+    }
+
+    #[test]
+    fn test_conjunction_pruning_overrides() {
+        let max_doc = 1_000;
+        let scorers: Vec<TermScorer> = [200, 300, 500]
+            .into_iter()
+            .map(|doc_freq| {
+                let segment_postings =
+                    SegmentPostings::create_from_docs(&(0..doc_freq).collect::<Vec<_>>());
+                let fieldnorm_reader = FieldNormReader::constant(10, 10);
+                let bm25_weight = Bm25Weight::for_one_term(
+                    1,
+                    segment_postings.len() as u64,
+                    10.0,
+                    crate::Bm25Params::default(),
+                );
+                TermScorer::new(segment_postings, fieldnorm_reader, bm25_weight)
+            })
+            .collect();
+
+        let weight = BooleanWeight::new(Vec::new(), true, Box::new(SumCombiner::default));
+        // All 3 terms >= 15% -> Auto gives true.
+        assert!(weight.should_use_lazy_windowed_intersection(&scorers, max_doc));
+
+        let weight = weight.with_conjunction_pruning(ConjunctionPruning::BlockWand);
+        assert!(!weight.should_use_lazy_windowed_intersection(&scorers, max_doc));
+
+        let weight = weight.with_conjunction_pruning(ConjunctionPruning::LazyWindowed);
+        assert!(weight.should_use_lazy_windowed_intersection(&scorers, max_doc));
+
+        // 2 terms should return false under Auto even if dense
+        let weight_auto = BooleanWeight::new(Vec::new(), true, Box::new(SumCombiner::default));
+        assert!(!weight_auto.should_use_lazy_windowed_intersection(&scorers[..2], max_doc));
     }
 }
