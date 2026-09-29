@@ -231,7 +231,7 @@ impl TermDictionary {
         &self,
         key_range: impl std::ops::RangeBounds<[u8]>,
         limit: Option<u64>,
-    ) -> FileSlice {
+    ) -> io::Result<FileSlice> {
         self.0.file_slice_for_range(key_range, limit)
     }
 

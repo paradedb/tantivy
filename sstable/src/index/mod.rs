@@ -3,8 +3,10 @@ pub(crate) mod v3;
 
 use std::io::{self, Read, Write};
 use std::ops::Range;
+use std::sync::Arc;
 
-use common::{BinarySerializable, FixedSize, OwnedBytes};
+use common::file_slice::FileSlice;
+use common::{BinarySerializable, FixedSize};
 use tantivy_fst::{Automaton, MapBuilder};
 
 use crate::{TermOrdinal, common_prefix_len};
@@ -20,107 +22,98 @@ impl SSTableIndex {
     pub(crate) fn open(
         version: u32,
         index_offset: u64,
-        index_bytes: OwnedBytes,
+        index_bytes: FileSlice,
     ) -> io::Result<Self> {
-        let index = match version {
-            2 => {
-                SSTableIndex::V2(v2::SSTableIndex::load(index_bytes).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption")
-                })?)
-            }
-            3 => {
-                let (index_bytes, mut footerv3_len_bytes) = index_bytes.rsplit(8);
-                let store_offset = u64::deserialize(&mut footerv3_len_bytes)?;
-                if store_offset != 0 {
-                    SSTableIndex::V3(v3::SSTableIndexV3::load(index_bytes, store_offset).map_err(
-                        |_| io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption"),
-                    )?)
-                } else {
-                    // if store_offset is zero, there is no index, so we build a pseudo-index
-                    // assuming a single block of sstable covering everything.
-                    SSTableIndex::V3Empty(v3::SSTableIndexV3Empty::load(index_offset as usize))
+        // Keep bulk reads for backends without page-granular access.
+        let index_bytes =
+            if index_bytes.num_bytes() > 0 && index_bytes.storage_block_ord(0).is_none() {
+                FileSlice::new(Arc::new(index_bytes.read_bytes()?))
+            } else {
+                index_bytes
+            };
+        let index =
+            match version {
+                2 => SSTableIndex::V2(v2::SSTableIndex::load(index_bytes.read_bytes()?).map_err(
+                    |_| io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption"),
+                )?),
+                3 => {
+                    let (index_bytes, footerv3_len_bytes) = index_bytes.split_from_end(8);
+                    let store_offset = u64::deserialize(&mut footerv3_len_bytes.read_bytes()?)?;
+                    if store_offset != 0 {
+                        SSTableIndex::V3(v3::SSTableIndexV3::load(index_bytes, store_offset)?)
+                    } else {
+                        // if store_offset is zero, there is no index, so we build a pseudo-index
+                        // assuming a single block of sstable covering everything.
+                        SSTableIndex::V3Empty(v3::SSTableIndexV3Empty::load(index_offset as usize))
+                    }
                 }
-            }
-            _ => {
-                return Err(io::Error::other(format!(
-                    "Unsupported sstable version, expected one of [2, 3], found {version}"
-                )));
-            }
-        };
+                _ => {
+                    return Err(io::Error::other(format!(
+                        "Unsupported sstable version, expected one of [2, 3], found {version}"
+                    )));
+                }
+            };
         Ok(index)
     }
 
-    /// Get the [`BlockAddr`] of the requested block.
-    pub(crate) fn get_block(&self, block_id: u64) -> Option<BlockAddr> {
+    pub(crate) fn get_block(&self, block_id: u64) -> io::Result<Option<BlockAddr>> {
         match self {
-            SSTableIndex::V2(v2_index) => v2_index.get_block(block_id as usize),
-            SSTableIndex::V3(v3_index) => v3_index.get_block(block_id),
-            SSTableIndex::V3Empty(v3_empty) => v3_empty.get_block(block_id),
+            Self::V2(index) => Ok(index.get_block(block_id as usize)),
+            Self::V3(index) => index.get_block(block_id),
+            Self::V3Empty(index) => Ok(index.get_block(block_id)),
         }
     }
 
-    /// Get the block id of the block that would contain `key`.
-    ///
-    /// Returns None if `key` is lexicographically after the last key recorded.
-    pub(crate) fn locate_with_key(&self, key: &[u8]) -> Option<u64> {
+    pub(crate) fn locate_with_key(&self, key: &[u8]) -> io::Result<Option<u64>> {
         match self {
-            SSTableIndex::V2(v2_index) => v2_index.locate_with_key(key).map(|i| i as u64),
-            SSTableIndex::V3(v3_index) => v3_index.locate_with_key(key),
-            SSTableIndex::V3Empty(v3_empty) => v3_empty.locate_with_key(key),
+            Self::V2(index) => Ok(index.locate_with_key(key).map(|id| id as u64)),
+            Self::V3(index) => index.locate_with_key(key),
+            Self::V3Empty(index) => Ok(index.locate_with_key(key)),
         }
     }
 
-    /// Get the [`BlockAddr`] of the block that would contain `key`.
-    ///
-    /// Returns None if `key` is lexicographically after the last key recorded.
-    pub fn get_block_with_key(&self, key: &[u8]) -> Option<BlockAddr> {
-        match self {
-            SSTableIndex::V2(v2_index) => v2_index.get_block_with_key(key),
-            SSTableIndex::V3(v3_index) => v3_index.get_block_with_key(key),
-            SSTableIndex::V3Empty(v3_empty) => v3_empty.get_block_with_key(key),
+    pub fn get_block_with_key(&self, key: &[u8]) -> io::Result<Option<BlockAddr>> {
+        match self.locate_with_key(key)? {
+            Some(id) => self.get_block(id),
+            None => Ok(None),
         }
     }
 
-    pub(crate) fn locate_with_ord(&self, ord: TermOrdinal) -> u64 {
+    pub(crate) fn locate_with_ord(&self, ord: TermOrdinal) -> io::Result<u64> {
         match self {
-            SSTableIndex::V2(v2_index) => v2_index.locate_with_ord(ord) as u64,
-            SSTableIndex::V3(v3_index) => v3_index.locate_with_ord(ord),
-            SSTableIndex::V3Empty(v3_empty) => v3_empty.locate_with_ord(ord),
+            Self::V2(index) => Ok(index.locate_with_ord(ord) as u64),
+            Self::V3(index) => index.locate_with_ord(ord),
+            Self::V3Empty(index) => Ok(index.locate_with_ord(ord)),
         }
     }
 
-    /// Get the [`BlockAddr`] of the block containing the `ord`-th term.
-    pub fn get_block_with_ord(&self, ord: TermOrdinal) -> BlockAddr {
+    pub fn get_block_with_ord(&self, ord: TermOrdinal) -> io::Result<BlockAddr> {
         match self {
-            SSTableIndex::V2(v2_index) => v2_index.get_block_with_ord(ord),
-            SSTableIndex::V3(v3_index) => v3_index.get_block_with_ord(ord),
-            SSTableIndex::V3Empty(v3_empty) => v3_empty.get_block_with_ord(ord),
+            Self::V2(index) => Ok(index.get_block_with_ord(ord)),
+            Self::V3(index) => index.get_block_with_ord(ord),
+            Self::V3Empty(index) => Ok(index.get_block_with_ord(ord)),
         }
     }
 
-    pub(crate) fn get_and_locate_with_ord(&self, ord: TermOrdinal) -> (BlockAddr, u64) {
+    pub(crate) fn get_and_locate_with_ord(&self, ord: TermOrdinal) -> io::Result<(BlockAddr, u64)> {
         match self {
-            SSTableIndex::V2(v2_index) => v2_index.get_and_locate_with_ord(ord),
-            SSTableIndex::V3(v3_index) => v3_index.get_and_locate_with_ord(ord),
-            SSTableIndex::V3Empty(v3_empty) => v3_empty.get_and_locate_with_ord(ord),
+            Self::V2(index) => Ok(index.get_and_locate_with_ord(ord)),
+            Self::V3(index) => index.get_and_locate_with_ord(ord),
+            Self::V3Empty(index) => Ok(index.get_and_locate_with_ord(ord)),
         }
     }
 
     pub fn get_block_for_automaton<'a>(
         &'a self,
         automaton: &'a impl Automaton,
-    ) -> impl Iterator<Item = (u64, BlockAddr)> + 'a {
-        match self {
-            SSTableIndex::V2(v2_index) => {
-                BlockIter::V2(v2_index.get_block_for_automaton(automaton))
+    ) -> io::Result<impl Iterator<Item = io::Result<(u64, BlockAddr)>> + 'a> {
+        Ok(match self {
+            Self::V2(index) => BlockIter::V2(index.get_block_for_automaton(automaton).map(Ok)),
+            Self::V3(index) => BlockIter::V3(index.get_block_for_automaton(automaton)?),
+            Self::V3Empty(index) => {
+                BlockIter::V3Empty(std::iter::once(Ok((0, index.block_addr.clone()))))
             }
-            SSTableIndex::V3(v3_index) => {
-                BlockIter::V3(v3_index.get_block_for_automaton(automaton))
-            }
-            SSTableIndex::V3Empty(v3_empty) => {
-                BlockIter::V3Empty(std::iter::once((0, v3_empty.block_addr.clone())))
-            }
-        }
+        })
     }
 }
 

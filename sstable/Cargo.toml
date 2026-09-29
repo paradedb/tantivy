@@ -14,7 +14,7 @@ common = {version= "0.11", path="../common", package="tantivy-common"}
 futures-util = "0.3.30"
 itertools = "0.14.0"
 tantivy-bitpacker = { version= "0.10", path="../bitpacker" }
-tantivy-fst = { git = "https://github.com/paradedb/fst.git" }
+tantivy-fst = { git = "https://github.com/paradedb/fst.git", rev = "1d2e473c6de63d17749030eb8538ba4d647f3430" }
 # experimental gives us access to Decompressor::upper_bound
 zstd = { version = "0.13", optional = true, features = ["experimental"] }
 
