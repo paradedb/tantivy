@@ -126,6 +126,20 @@ impl TermQuery {
 }
 
 impl Query for TermQuery {
+    fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        if !reader
+            .schema()
+            .get_field_entry(self.term.field())
+            .is_indexed()
+        {
+            return Ok(None);
+        }
+        let count = reader
+            .inverted_index(self.term.field())?
+            .doc_freq(&self.term)?;
+        Ok(Some((count, u64::from(count))))
+    }
+
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         // If the field is not indexed but is a suitable fast field, fall back to a range query
         // on the fast field matching exactly this term.
