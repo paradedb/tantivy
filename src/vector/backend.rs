@@ -1578,6 +1578,7 @@ fn score_layer(
     layer_idx: usize,
     layer: &QuantizedLayerReader,
     first_layer: Option<(&QuantizedLayerBatch, &mut Vec<f32>)>,
+    known_block: Option<usize>,
     rows: Range<usize>,
     selection: &Selection<'_>,
     kernel_scores: &mut Vec<f32>,
@@ -1610,7 +1611,10 @@ fn score_layer(
         let batch = match pinned {
             Some(batch) => batch,
             None => {
-                owned_batch = layer.read_batch(rows)?;
+                owned_batch = match known_block {
+                    Some(block) => layer.read_batch_in_block(block, rows)?,
+                    None => layer.read_batch(rows)?,
+                };
                 &owned_batch
             }
         };
@@ -1697,7 +1701,10 @@ fn score_layer(
     // directly without allocating request/view lists or sorting them.
     let mut cluster_start = 0;
     while cluster_start < selected_count {
-        let cluster = layer.cluster(selected_rows[cluster_start]);
+        let cluster = match known_block {
+            Some(block) => layer.cluster_in_block(block),
+            None => layer.cluster(selected_rows[cluster_start]),
+        }?;
         let cluster_end = cluster_start
             + selected_rows[cluster_start..].partition_point(|&row| row < cluster.rows.end);
         cluster.plan_codes(&selected_rows[cluster_start..cluster_end], read_ranges);
@@ -2288,7 +2295,7 @@ impl<T: VectorElement> VectorBackend<T> {
             controller.charge_open();
             let rows = index.cluster_range(cluster);
             let layer = &quantized.layers()[0];
-            let batch = layer.read_batch(rows.clone())?;
+            let batch = layer.read_batch_in_block(cluster, rows.clone())?;
             let selection_start = Instant::now();
             let (selection, visited, pruned_filter, pruned_dead) = {
                 let _routing_stage = enter_vector_stage(Stage::Routing);
@@ -2317,6 +2324,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 0,
                 layer,
                 Some((&batch, &mut decoded_residual_norms)),
+                Some(cluster),
                 rows.clone(),
                 &selection,
                 &mut kernel_scores,
@@ -2443,6 +2451,7 @@ impl<T: VectorElement> VectorBackend<T> {
                         layer_idx,
                         layer,
                         None,
+                        None,
                         available_rows,
                         &selection,
                         &mut kernel_scores,
@@ -2523,6 +2532,7 @@ impl<T: VectorElement> VectorBackend<T> {
                         layer_idx,
                         layer,
                         None,
+                        Some(cluster),
                         cluster_rows,
                         &selection,
                         &mut kernel_scores,

@@ -1032,6 +1032,15 @@ impl QuantizedLayerReader {
     /// Pins one band's columns in a single request, then restricts views to the requested rows.
     pub(crate) fn read_batch(&self, rows: Range<usize>) -> crate::Result<QuantizedLayerBatch> {
         let b = self.blocks.block_for_range(&rows)?;
+        self.read_batch_in_block(b, rows)
+    }
+    /// Uses a known block without resolving its global row range again.
+    pub(crate) fn read_batch_in_block(
+        &self,
+        b: usize,
+        rows: Range<usize>,
+    ) -> crate::Result<QuantizedLayerBatch> {
+        self.blocks.check_block_rows(b, &rows)?;
         let (span, bytes) = self.blocks.read_band(b, self.layer)?;
         let view = |idx: usize| -> OwnedBytes {
             let column =
@@ -1190,7 +1199,7 @@ impl QuantizedLayerReader {
         ranges: &mut Vec<Range<usize>>,
         scratch: &mut Vec<(usize, usize)>,
     ) {
-        plan_block_column(&self.blocks, idx, available, rows, ranges, scratch);
+        plan_block_column(&self.blocks, idx, available, rows, ranges, scratch).unwrap();
     }
     #[cfg(test)]
     pub(crate) fn plan_code_reads(
@@ -1203,14 +1212,20 @@ impl QuantizedLayerReader {
         self.plan_column_reads(self.codes, available, rows, ranges, scratch);
     }
     /// Resolves a cluster once so ordered code reads need no repeated block lookup.
-    pub(crate) fn cluster(&self, row: usize) -> QuantizedClusterReader<'_> {
-        let block = self.blocks.block_of(row);
-        QuantizedClusterReader {
+    pub(crate) fn cluster(&self, row: usize) -> crate::Result<QuantizedClusterReader<'_>> {
+        self.cluster_in_block(self.blocks.block_of(row))
+    }
+    /// Preserves a cluster address already established by the scan.
+    pub(crate) fn cluster_in_block(
+        &self,
+        block: usize,
+    ) -> crate::Result<QuantizedClusterReader<'_>> {
+        Ok(QuantizedClusterReader {
             layer: self,
             block,
             rows: self.blocks.block_rows[block]..self.blocks.block_rows[block + 1],
-            codes: self.blocks.column(block, self.codes),
-        }
+            codes: self.blocks.column(block, self.codes)?,
+        })
     }
     #[cfg(test)]
     pub(crate) fn read_column(&self, idx: usize, rows: Range<usize>) -> crate::Result<OwnedBytes> {
@@ -1277,7 +1292,7 @@ impl QuantizedClusterReader<'_> {
         let first = column_range(&blocks.slots, n, layer.scales).start;
         let last = column_range(&blocks.slots, n, layer.constants.unwrap_or(layer.errors)).end;
         let bytes = blocks
-            .block_slice(self.block, first..last)
+            .block_slice(self.block, first..last)?
             .read_vector_bytes()?;
         let view = |idx| {
             let column = column_range(&blocks.slots, n, idx);
@@ -1294,6 +1309,7 @@ impl QuantizedClusterReader<'_> {
 }
 
 /// Splits increasing rows by block before consulting storage geometry.
+#[cfg(test)]
 fn plan_block_column(
     blocks: &Blocks,
     idx: usize,
@@ -1301,7 +1317,7 @@ fn plan_block_column(
     rows: &[usize],
     ranges: &mut Vec<Range<usize>>,
     scratch: &mut Vec<(usize, usize)>,
-) {
+) -> crate::Result<()> {
     ranges.clear();
     let mut selected = rows;
     while let Some(&row) = selected.first() {
@@ -1314,7 +1330,7 @@ fn plan_block_column(
             SlotType::QuantLayerCodes { .. }
         ) {
             QuantizedLayerReader::plan_code_slot_reads(
-                &blocks.column(b, idx),
+                &blocks.column(b, idx)?,
                 blocks.slots[idx].stride as usize,
                 first,
                 &selected[..count],
@@ -1322,7 +1338,7 @@ fn plan_block_column(
             );
         } else {
             QuantizedLayerReader::plan_slot_reads(
-                &blocks.column(b, idx),
+                &blocks.column(b, idx)?,
                 blocks.slots[idx].stride as usize,
                 first,
                 available.start.max(first)..available.end.min(end),
@@ -1333,6 +1349,7 @@ fn plan_block_column(
         }
         selected = &selected[count..];
     }
+    Ok(())
 }
 
 /// Stored layer readers and shared query-preparation metadata.
@@ -1733,7 +1750,9 @@ impl VectorIndexReader {
         super::blocks::write_metadata(&mut bytes, &VectorColMetadata::build_flat(&options))
             .unwrap();
         let end = bytes.len();
-        super::blocks::finish_data(&mut bytes, end).unwrap();
+        super::blocks::BlockDirectory::new(end as u64)
+            .finish(&mut bytes)
+            .unwrap();
         let rows_slice = Arc::new(Blocks::open(FileSlice::from(bytes), &options, 0, None).unwrap());
         Self {
             options,
@@ -2294,7 +2313,7 @@ impl VectorIndexReader {
             candidates.sigmas.reserve(row_count);
             for cluster in 0..index.num_clusters() {
                 let rows = index.cluster_range(cluster);
-                let layer = quantization.layers()[0].read_batch(rows.clone())?;
+                let layer = quantization.layers()[0].read_batch_in_block(cluster, rows.clone())?;
                 for row in rows {
                     let doc = self.doc_id_at(row);
                     if alive.is_some_and(|alive| !alive.is_alive(doc)) {
@@ -2529,7 +2548,7 @@ impl VectorIndexReader {
             let start = location.local as usize * stride;
             return Ok(Some(
                 self.rows_slice
-                    .column(location.cluster as usize, 0)
+                    .column(location.cluster as usize, 0)?
                     .slice(start..start + stride)
                     .read_vector_bytes()?,
             ));
@@ -2589,23 +2608,36 @@ impl VectorIndexReader {
         }
 
         let stride = self.options.bytes_per_vector();
-        plan_block_column(
-            &self.rows_slice,
-            0,
-            0..num_rows,
-            rows,
-            read_ranges,
-            block_scratch,
-        );
-
-        let mut chunks = Vec::with_capacity(read_ranges.len());
-        for row_range in read_ranges.iter().cloned() {
-            let bytes = self.rows_slice.read_column(0, row_range.clone())?;
-            debug_assert_eq!(bytes.len(), row_range.len() * stride);
-            chunks.push(VectorRowChunk {
-                rows: row_range,
-                bytes,
-            });
+        read_ranges.clear();
+        let mut chunks = Vec::with_capacity(read_ranges.capacity().min(rows.len()));
+        let mut selected = rows;
+        while let Some(&row) = selected.first() {
+            let block = self.rows_slice.block_of(row);
+            let first = self.rows_slice.block_rows[block];
+            let end = self.rows_slice.block_rows[block + 1];
+            let count = selected.partition_point(|&r| r < end);
+            let column = self.rows_slice.column(block, 0)?;
+            let range_start = read_ranges.len();
+            QuantizedLayerReader::plan_slot_reads(
+                &column,
+                stride,
+                first,
+                first..end,
+                &selected[..count],
+                read_ranges,
+                block_scratch,
+            );
+            // The plan already establishes the block and row origin; reads keep that address.
+            for row_range in read_ranges[range_start..].iter().cloned() {
+                let bytes = column
+                    .slice((row_range.start - first) * stride..(row_range.end - first) * stride)
+                    .read_vector_bytes()?;
+                chunks.push(VectorRowChunk {
+                    rows: row_range,
+                    bytes,
+                });
+            }
+            selected = &selected[count..];
         }
         Ok(VectorRowBatch {
             selected_rows: rows.to_vec(),
@@ -2755,6 +2787,7 @@ mod tests {
         let slots = meta.slots();
         let mut out = Vec::new();
         write_metadata(&mut out, &meta).unwrap();
+        let mut directory = super::super::blocks::BlockDirectory::new(out.len() as u64);
         let codes = codes.read_bytes().unwrap();
         let sidecar = sidecar.read_bytes().unwrap();
         let constants = constants.map(|s| s.read_bytes().unwrap());
@@ -2796,9 +2829,9 @@ mod tests {
             }
             let padding = start + block_len(&slots, n) - out.len();
             pad(&mut out, padding).unwrap();
+            directory.push(out.len() as u64, rows[1] as u32);
         }
-        let end = out.len();
-        super::super::blocks::finish_data(&mut out, end).unwrap();
+        directory.finish(&mut out).unwrap();
         let entry = if let Some((reads, block_len)) = tracking {
             FileSlice::new(Arc::new(BlockTrackedBytes {
                 bytes: out,
@@ -2953,7 +2986,11 @@ mod tests {
         )?;
         data.extend([0; 12]);
         let end = data.len();
-        super::super::blocks::finish_data(&mut data, end)?;
+        let mut directory = super::super::blocks::BlockDirectory::new(prefix as u64);
+        directory.push(end as u64, 1);
+        directory.finish(&mut data)?;
+        let footer = data.len() - 8;
+        let directory_start = footer - 2 * 12;
         let mut ids = Vec::new();
         IdMap::serialize(&[1], 3, &mut ids)?;
         let data_reads = Arc::new(Mutex::new(Vec::new()));
@@ -2991,6 +3028,19 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         assert!(readers.iter().all(|r| Arc::ptr_eq(r, &readers[0])));
+        let reads = data_reads.lock().unwrap();
+        assert_eq!(
+            reads.iter().filter(|r| **r == (footer..footer + 8)).count(),
+            1
+        );
+        assert_eq!(
+            reads
+                .iter()
+                .filter(|r| **r == (directory_start..footer))
+                .count(),
+            1
+        );
+        drop(reads);
         assert_eq!(
             id_reads
                 .lock()
@@ -3011,7 +3061,7 @@ mod tests {
         let mut data = Vec::new();
         super::super::blocks::write_metadata(&mut data, &VectorColMetadata::build_flat(&options))?;
         let end = data.len();
-        super::super::blocks::finish_data(&mut data, end)?;
+        super::super::blocks::BlockDirectory::new(end as u64).finish(&mut data)?;
         let id_reads = Arc::new(Mutex::new(Vec::new()));
         let field = VectorFieldReader {
             source: Some(VectorSource {
@@ -3052,8 +3102,9 @@ mod tests {
         let prefix =
             super::super::blocks::write_metadata(&mut data, &VectorColMetadata::build_flat(&opts))?;
         data.extend_from_slice(&expected_bytes);
-        let padding = super::super::blocks::data_entry_len(data.len()) - data.len();
-        super::super::blocks::pad(&mut data, padding)?;
+        let mut directory = super::super::blocks::BlockDirectory::new(prefix as u64);
+        directory.push(data.len() as u64, ROWS as u32);
+        directory.finish(&mut data)?;
         let storage = Arc::new(BlockTrackedBytes {
             bytes: data,
             reads: Arc::clone(&reads),
@@ -3498,7 +3549,7 @@ mod tests {
 
     #[test]
     fn sparse_cluster_reads_pin_one_sidecar_span() -> crate::Result<()> {
-        use super::super::blocks::{block_len, column_range, finish_data, write_metadata};
+        use super::super::blocks::{block_len, column_range, write_metadata, BlockDirectory};
         use super::super::{enter_vector_stage, storage_io, Stage, VectorQuantizationLayer};
         for metric in [Metric::Cosine, Metric::Dot, Metric::L2] {
             let opts = VectorOptions::new(1024, metric);
@@ -3514,6 +3565,7 @@ mod tests {
             let slots = meta.slots();
             let mut data = Vec::new();
             write_metadata(&mut data, &meta)?;
+            let mut directory = BlockDirectory::new(data.len() as u64);
             let boundaries = [0, 59, 59, 118];
             for rows in boundaries.windows(2) {
                 let n = rows[1] - rows[0];
@@ -3546,9 +3598,9 @@ mod tests {
                         _ => {}
                     }
                 }
+                directory.push(data.len() as u64, rows[1] as u32);
             }
-            let end = data.len();
-            finish_data(&mut data, end)?;
+            directory.finish(&mut data)?;
             for block_len in [0, 16, 8160] {
                 for prefix in [0, 3, 8171] {
                     let reads = Arc::new(Mutex::new(Vec::new()));
@@ -3588,7 +3640,7 @@ mod tests {
                         let mut ranges = Vec::new();
                         let mut start = 0;
                         while start < selected.len() {
-                            let cluster = reader.cluster(selected[start]);
+                            let cluster = reader.cluster(selected[start])?;
                             let end = start
                                 + selected[start..].partition_point(|&r| r < cluster.rows.end);
                             cluster.plan_codes(&selected[start..end], &mut ranges);

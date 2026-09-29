@@ -7,7 +7,7 @@ use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
 use crate::plugin::PluginMergeContext;
 use crate::schema::FieldType;
-use crate::vector::blocks::{align_up, block_align, finish_data, pad, write_metadata};
+use crate::vector::blocks::{align_up, block_align, pad, write_metadata, BlockDirectory};
 use crate::vector::header::{write_vector_header, VectorEntry, HEADER_LEN};
 use crate::vector::metadata::{VectorColMetadata, FLAT_ROWS_PER_BLOCK};
 use crate::vector::{MAX_ELEM_BYTES, VEC_EXT};
@@ -57,6 +57,7 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
             let rows_w = composite.for_field_with_idx(field, VectorEntry::Data.index());
             let start = rows_w.written_bytes();
             write_metadata(rows_w, &meta)?;
+            let mut directory = BlockDirectory::new(rows_w.written_bytes() - start);
             let mut block_bytes = 0;
             // Row groups can be streamed without knowing the final vector count.
 
@@ -71,14 +72,17 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
                     block_bytes += bytes.len();
                     if target_present.len() % FLAT_ROWS_PER_BLOCK as usize == 0 {
                         pad(rows_w, align_up(block_bytes, align) - block_bytes)?;
+                        directory.push(rows_w.written_bytes() - start, target_present.len() as u32);
                         block_bytes = 0;
                     }
                 }
                 target_doc_id += 1;
             }
             pad(rows_w, align_up(block_bytes, align) - block_bytes)?;
-            let len = (rows_w.written_bytes() - start) as usize;
-            finish_data(rows_w, len)?;
+            if block_bytes != 0 {
+                directory.push(rows_w.written_bytes() - start, target_present.len() as u32);
+            }
+            directory.finish(rows_w)?;
             assert_eq!(
                 (rows_w.written_bytes() - start) as usize % MAX_ELEM_BYTES,
                 0

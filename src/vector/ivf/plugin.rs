@@ -27,7 +27,7 @@ use crate::plugin::PluginMergeContext;
 #[cfg(test)]
 use crate::schema::Metric;
 use crate::schema::{Field, FieldType, VectorDType, VectorOptions};
-use crate::vector::blocks::{block_len, column_range, finish_data, pad, write_metadata};
+use crate::vector::blocks::{block_len, column_range, pad, write_metadata, BlockDirectory};
 #[cfg(test)]
 use crate::vector::distance::l2_squared;
 use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
@@ -101,8 +101,8 @@ fn write_empty_field_slots(
     vec_write.align_next_field(MAX_ELEM_BYTES, HEADER_LEN)?;
     let data = vec_write.for_field_with_idx(field, VectorEntry::Data.index());
     let start = data.written_bytes();
-    let len = write_metadata(data, &meta)?;
-    finish_data(data, len)?;
+    write_metadata(data, &meta)?;
+    BlockDirectory::new(data.written_bytes() - start).finish(data)?;
     assert_eq!((data.written_bytes() - start) as usize % MAX_ELEM_BYTES, 0);
     {
         let centroids_w =
@@ -514,6 +514,7 @@ pub(crate) fn merge_ivf(
                 let data = vec_write.for_field_with_idx(field, VectorEntry::Data.index());
                 let entry_start = data.written_bytes();
                 let mut pos = write_metadata(data, &meta)?;
+                let mut directory = BlockDirectory::new(data.written_bytes() - entry_start);
                 timings.pad_bytes += pos - 4 - meta.to_bytes().len();
                 let (specs, grids) = meta.runtime();
                 let row_bytes = opts.bytes_per_vector();
@@ -542,6 +543,7 @@ pub(crate) fn merge_ivf(
                     let end = offsets[1] as usize;
                     let n = end - start;
                     if n == 0 {
+                        directory.push(data.written_bytes() - entry_start, offsets[1] as u32);
                         continue;
                     }
                     let block_start = pos;
@@ -648,10 +650,11 @@ pub(crate) fn merge_ivf(
                     timings.pad_bytes += padding;
                     pos += padding;
                     assert_eq!(data.written_bytes() - entry_start, pos as u64);
+                    directory.push(data.written_bytes() - entry_start, offsets[1] as u32);
                 }
                 id_maps.push((field, locations));
-                let entry_len = finish_data(data, pos)?;
-                timings.pad_bytes += entry_len - pos;
+                let entry_len = directory.finish(data)?;
+                timings.pad_bytes += entry_len - pos - (num_centroids + 1) * 12 - 8;
                 assert_eq!(
                     (data.written_bytes() - entry_start) as usize % MAX_ELEM_BYTES,
                     0
@@ -933,7 +936,10 @@ mod tests {
             let blocks = Blocks::open(data.clone(), &opts, count, Some(rows))?;
             assert_eq!(
                 data.len(),
-                data_entry_len(*blocks.block_starts.last().unwrap() as usize)
+                data_entry_len(
+                    *blocks.block_starts.last().unwrap() as usize,
+                    blocks.block_rows.len() - 1
+                )
             );
             aligns.push(block_align(&blocks.slots));
             data_ends.push(start + data.len());
@@ -2410,6 +2416,7 @@ mod tests {
             data_entry_len(
                 align_up(4 + meta.to_bytes().len(), block_align(&meta.slots()))
                     + 2 * block_len(&meta.slots(), ROWS / 2),
+                2,
             )
         };
         let expected_growth = entry_len(&quant_meta) - entry_len(&plain_meta);

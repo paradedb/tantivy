@@ -40,16 +40,47 @@ pub(crate) fn block_len(slots: &[Slot], n: usize) -> usize {
 pub(crate) fn block_align(slots: &[Slot]) -> usize {
     slots.iter().map(Slot::type_bytes).max().expect("Rows slot")
 }
-/// Logical Data entry length, including its element-aligned trailer.
-pub(crate) fn data_entry_len(blocks_end: usize) -> usize {
-    align_up(blocks_end, MAX_ELEM_BYTES)
+/// Logical Data entry length, including its directory and terminal block count.
+pub(crate) fn data_entry_len(blocks_end: usize, num_blocks: usize) -> usize {
+    let directory_start = align_up(blocks_end, MAX_ELEM_BYTES);
+    align_up(directory_start + (num_blocks + 1) * 12, MAX_ELEM_BYTES) + 8
 }
-/// Completes a Data entry with zero bytes so the next Data entry needs no inter-entry gap.
-pub(crate) fn finish_data(writer: &mut impl Write, blocks_end: usize) -> io::Result<usize> {
-    let len = data_entry_len(blocks_end);
-    pad(writer, len - blocks_end)?;
-    assert_eq!(len % MAX_ELEM_BYTES, 0);
-    Ok(len)
+/// Records actual entry-relative positions while blocks stream to storage.
+pub(crate) struct BlockDirectory {
+    byte_starts: Vec<u64>,
+    row_starts: Vec<u32>,
+}
+impl BlockDirectory {
+    pub(crate) fn new(first: u64) -> Self {
+        Self {
+            byte_starts: vec![first],
+            row_starts: vec![0],
+        }
+    }
+    pub(crate) fn push(&mut self, end: u64, rows: u32) {
+        self.byte_starts.push(end);
+        self.row_starts.push(rows);
+    }
+    /// Aligns the directory, writes both arrays, then pads the terminal count to eight bytes.
+    pub(crate) fn finish(mut self, writer: &mut impl Write) -> io::Result<usize> {
+        let blocks_end = *self.byte_starts.last().unwrap() as usize;
+        let directory_start = align_up(blocks_end, MAX_ELEM_BYTES);
+        pad(writer, directory_start - blocks_end)?;
+        *self.byte_starts.last_mut().unwrap() = directory_start as u64;
+        for offset in &self.byte_starts {
+            writer.write_all(&offset.to_le_bytes())?;
+        }
+        for row in &self.row_starts {
+            writer.write_all(&row.to_le_bytes())?;
+        }
+        let num_blocks = self.row_starts.len() - 1;
+        let arrays_end = directory_start + self.row_starts.len() * 12;
+        let len = data_entry_len(blocks_end, num_blocks);
+        pad(writer, len - 8 - arrays_end)?;
+        writer.write_all(&(num_blocks as u64).to_le_bytes())?;
+        assert_eq!(len % MAX_ELEM_BYTES, 0);
+        Ok(len)
+    }
 }
 /// Writes zero padding without allocating in proportion to the alignment.
 pub(crate) fn pad(writer: &mut impl Write, bytes: usize) -> io::Result<()> {
@@ -79,7 +110,7 @@ pub(crate) fn write_metadata(
 pub(crate) struct BlockMetadata {
     entry: FileSlice,
     pub(crate) meta: Arc<VectorColMetadata>,
-    header_len: usize,
+    metadata_end: usize,
 }
 impl BlockMetadata {
     pub(crate) fn open(
@@ -105,18 +136,15 @@ impl BlockMetadata {
             &entry.slice(4..4 + len).read_bytes()?,
         )?);
         meta.validate(opts, clustered)?;
-        let header_len = align_up(4 + len, block_align(&meta.slots()));
-        if header_len > entry.len() {
-            return Err(bad("truncated metadata padding"));
-        }
         Ok(Self {
             entry,
             meta,
-            header_len,
+            metadata_end: 4 + len,
         })
     }
 }
-/// Data entry plus derived geometry. Per-column offsets are recomputed, never cached per block.
+/// Data entry plus its validated stored directory. Per-column offsets are recomputed, never cached
+/// per block.
 pub(crate) struct Blocks {
     entry: FileSlice,
     pub(crate) meta: Arc<VectorColMetadata>,
@@ -129,7 +157,7 @@ fn bad(message: &str) -> crate::TantivyError {
     DataCorruption::comment_only(format!("invalid vector blocks: {message}")).into()
 }
 impl Blocks {
-    /// Opens validated metadata and checks the exact logical entry length using row counts.
+    /// Opens metadata and validates the stored directory against the field row counts.
     pub(crate) fn open(
         entry: FileSlice,
         opts: &VectorOptions,
@@ -152,85 +180,114 @@ impl Blocks {
         let BlockMetadata {
             entry,
             meta,
-            header_len,
+            metadata_end,
         } = metadata;
-        let block_rows: Vec<usize> = match (&meta.field().partition, clusters) {
-            (Partition::Clusters, Some(rows)) => rows,
-            (Partition::Uniform { rows_per_block }, None) => (0..num_rows)
-                .step_by(*rows_per_block as usize)
-                .chain(std::iter::once(num_rows))
-                .collect(),
-            _ => return Err(bad("partition/backend mismatch")),
-        };
-        if block_rows.first() != Some(&0)
-            || block_rows.last() != Some(&num_rows)
-            || block_rows.windows(2).any(|r| r[0] > r[1])
-        {
-            return Err(bad("invalid row boundaries"));
+        if entry.len() < 8 || entry.len() % MAX_ELEM_BYTES != 0 {
+            return Err(bad("missing or misaligned directory footer"));
+        }
+        let footer = entry.len() - 8;
+        let count = u64::from_le_bytes(
+            entry
+                .slice_from(footer)
+                .read_bytes()?
+                .as_slice()
+                .try_into()
+                .unwrap(),
+        );
+        let count = usize::try_from(count).map_err(|_| bad("block count overflow"))?;
+        let entries = count
+            .checked_add(1)
+            .ok_or_else(|| bad("block count overflow"))?;
+        let array_bytes = entries
+            .checked_mul(12)
+            .ok_or_else(|| bad("directory size overflow"))?;
+        let row_bytes = entries
+            .checked_mul(4)
+            .ok_or_else(|| bad("directory size overflow"))?;
+        let padded_rows = row_bytes
+            .checked_add(MAX_ELEM_BYTES - 1)
+            .map(|n| n & !(MAX_ELEM_BYTES - 1))
+            .ok_or_else(|| bad("directory padding overflow"))?;
+        let padded_bytes = entries
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(padded_rows))
+            .ok_or_else(|| bad("directory size overflow"))?;
+        let directory_start = footer
+            .checked_sub(padded_bytes)
+            .filter(|&start| start >= metadata_end)
+            .ok_or_else(|| bad("truncated directory"))?;
+        let directory = entry.slice(directory_start..footer).read_bytes()?;
+        let block_starts: Vec<u64> = directory[..entries * 8]
+            .chunks_exact(8)
+            .map(|v| u64::from_le_bytes(v.try_into().unwrap()))
+            .collect();
+        let block_rows: Vec<usize> = directory[entries * 8..array_bytes]
+            .chunks_exact(4)
+            .map(|v| u32::from_le_bytes(v.try_into().unwrap()) as usize)
+            .collect();
+        if directory[array_bytes..].iter().any(|&v| v != 0) {
+            return Err(bad("nonzero directory padding"));
         }
         let slots = meta.slots();
         let align = block_align(&slots);
-        let mut position = header_len;
-        let mut block_starts = vec![position as u64];
-        let max_rows = block_rows
-            .windows(2)
-            .map(|r| r[1] - r[0])
-            .max()
-            .unwrap_or(0);
-        let row_bytes: usize = slots.iter().map(|slot| slot.stride as usize).sum();
-        if max_rows
-            .checked_mul(row_bytes)
-            .is_none_or(|size| size > entry.len())
+        if block_starts[0] < metadata_end as u64
+            || block_starts[0] - metadata_end as u64 >= MAX_ELEM_BYTES as u64
+            || block_starts.last() != Some(&(directory_start as u64))
+            || block_starts.iter().any(|&v| v % align as u64 != 0)
+            || block_starts.windows(2).any(|v| v[0] > v[1])
         {
-            return Err(bad("truncated block"));
+            return Err(bad("invalid byte boundaries"));
         }
-        // Each row count has one layout; repeated cluster sizes share its checked length.
-        let mut lengths = vec![None; max_rows + 1];
-        for rows in block_rows.windows(2) {
-            let n = rows[1] - rows[0];
-            let size = if let Some(size) = lengths[n] {
-                size
-            } else {
-                let mut size = 0usize;
-                for slot in &slots {
-                    size = size
-                        .checked_add(slot.type_bytes() - 1)
-                        .map(|s| s & !(slot.type_bytes() - 1))
-                        .and_then(|s| {
-                            n.checked_mul(slot.stride as usize)
-                                .and_then(|len| s.checked_add(len))
-                        })
-                        .ok_or_else(|| bad("block length overflow"))?;
-                }
-                size = size
-                    .checked_add(align - 1)
-                    .map(|s| s & !(align - 1))
-                    .ok_or_else(|| bad("block padding overflow"))?;
-                lengths[n] = Some(size);
-                size
-            };
-            position = position
-                .checked_add(size)
-                .ok_or_else(|| bad("entry length overflow"))?;
-            if position > entry.len() {
+        if block_rows[0] != 0
+            || block_rows.last() != Some(&num_rows)
+            || block_rows.windows(2).any(|v| v[0] > v[1])
+        {
+            return Err(bad("invalid row boundaries"));
+        }
+        match (&meta.field().partition, clusters) {
+            (Partition::Clusters, Some(rows)) if block_rows == rows => {}
+            (Partition::Uniform { rows_per_block }, None)
+                if count == num_rows.div_ceil(*rows_per_block as usize)
+                    && block_rows.iter().enumerate().all(|(b, &row)| {
+                        row == b.saturating_mul(*rows_per_block as usize).min(num_rows)
+                    }) => {}
+            _ => return Err(bad("directory/partition row boundaries mismatch")),
+        }
+        // Bound row arithmetic before any column layout is evaluated. Individual column
+        // spans are checked against the stored next-block boundary before bytes are exposed.
+        let row_bytes: u64 = slots.iter().map(|slot| u64::from(slot.stride)).sum();
+        for (rows, bytes) in block_rows.windows(2).zip(block_starts.windows(2)) {
+            if ((rows[1] - rows[0]) as u64)
+                .checked_mul(row_bytes)
+                .is_none_or(|size| size > bytes[1] - bytes[0])
+            {
                 return Err(bad("truncated block"));
             }
-            block_starts.push(position as u64);
         }
-        let entry_len = position
-            .checked_add(MAX_ELEM_BYTES - 1)
-            .map(|p| p & !(MAX_ELEM_BYTES - 1))
-            .ok_or_else(|| bad("entry padding overflow"))?;
-        if entry_len != entry.len() {
-            return Err(bad("entry length mismatch"));
+        let payload_end = if count == 0 {
+            metadata_end
+        } else {
+            let last = count - 1;
+            let column_end = column_range(
+                &slots,
+                block_rows[count] - block_rows[last],
+                slots.len() - 1,
+            )
+            .end;
+            (block_starts[last] as usize)
+                .checked_add(column_end)
+                .ok_or_else(|| bad("last column overflow"))?
+        };
+        if payload_end > directory_start || directory_start - payload_end >= MAX_ELEM_BYTES {
+            return Err(bad("invalid block-area padding length"));
         }
         if entry
-            .slice(position..entry_len)
+            .slice(payload_end..directory_start)
             .read_bytes()?
             .iter()
-            .any(|&byte| byte != 0)
+            .any(|&v| v != 0)
         {
-            return Err(bad("nonzero entry trailer"));
+            return Err(bad("nonzero block-area padding"));
         }
         let mut bands: Vec<Range<usize>> = Vec::new();
         for (i, slot) in slots.iter().enumerate() {
@@ -268,15 +325,17 @@ impl Blocks {
         }
     }
     /// Resolves one complete column as a file slice preserving parent storage geometry.
-    pub(crate) fn column(&self, b: usize, idx: usize) -> FileSlice {
+    pub(crate) fn column(&self, b: usize, idx: usize) -> crate::Result<FileSlice> {
         let range = column_range(&self.slots, self.rows_in(b), idx);
-        self.entry
-            .slice(self.block_start(b) + range.start..self.block_start(b) + range.end)
+        self.block_slice(b, range)
     }
     /// Resolves a byte span relative to a validated block while preserving storage geometry.
-    pub(crate) fn block_slice(&self, b: usize, range: Range<usize>) -> FileSlice {
+    pub(crate) fn block_slice(&self, b: usize, range: Range<usize>) -> crate::Result<FileSlice> {
         let start = self.block_start(b);
-        self.entry.slice(start + range.start..start + range.end)
+        if range.start > range.end || range.end > self.block_start(b + 1) - start {
+            return Err(bad("column crosses stored block boundary"));
+        }
+        Ok(self.entry.slice(start + range.start..start + range.end))
     }
     /// Rejects row spans crossing a block, including malformed and out-of-range spans.
     pub(crate) fn block_for_range(&self, rows: &Range<usize>) -> crate::Result<usize> {
@@ -289,6 +348,17 @@ impl Blocks {
         }
         Ok(b)
     }
+    /// Checks a known block-local address without searching the row directory.
+    pub(crate) fn check_block_rows(&self, b: usize, rows: &Range<usize>) -> crate::Result<()> {
+        if b + 1 >= self.block_rows.len()
+            || rows.start < self.block_rows[b]
+            || rows.start >= rows.end
+            || rows.end > self.block_rows[b + 1]
+        {
+            return Err(bad("invalid block-local row range"));
+        }
+        Ok(())
+    }
     /// Reads a block-local row span from one column.
     pub(crate) fn read_column(&self, idx: usize, rows: Range<usize>) -> crate::Result<OwnedBytes> {
         if rows.start == rows.end && rows.end <= *self.block_rows.last().unwrap() {
@@ -298,7 +368,7 @@ impl Blocks {
         let stride = self.slots[idx].stride as usize;
         let first = self.block_rows[b];
         Ok(self
-            .column(b, idx)
+            .column(b, idx)?
             .slice((rows.start - first) * stride..(rows.end - first) * stride)
             .read_vector_bytes()?)
     }
@@ -322,7 +392,11 @@ impl Blocks {
     }
     /// Reads a complete exact span and exposes rows and optional document ids as views.
     pub(crate) fn read_exact(&self, b: usize) -> crate::Result<(OwnedBytes, Option<OwnedBytes>)> {
-        let bytes = self.entry.slice(self.exact_span(b)).read_vector_bytes()?;
+        let span = self.exact_span(b);
+        let start = self.block_start(b);
+        let bytes = self
+            .block_slice(b, span.start - start..span.end - start)?
+            .read_vector_bytes()?;
         let rows = bytes.slice(column_range(&self.slots, self.rows_in(b), 0));
         let docs = self
             .clustered()
@@ -344,7 +418,10 @@ impl Blocks {
         layer: usize,
     ) -> crate::Result<(Range<usize>, OwnedBytes)> {
         let range = self.layer_span(b, layer);
-        let bytes = self.entry.slice(range.clone()).read_vector_bytes()?;
+        let start = self.block_start(b);
+        let bytes = self
+            .block_slice(b, range.start - start..range.end - start)?
+            .read_vector_bytes()?;
         Ok((range, bytes))
     }
 }
@@ -369,6 +446,7 @@ mod tests {
                 };
                 let mut bytes = Vec::new();
                 write_metadata(&mut bytes, &meta).unwrap();
+                let mut directory = BlockDirectory::new(bytes.len() as u64);
                 for start in (0..n).step_by(r) {
                     let end = (start + r).min(n);
                     for row in start..end {
@@ -379,12 +457,15 @@ mod tests {
                         block_len(&meta.slots(), end - start) - (end - start) * 12,
                     )
                     .unwrap();
+                    directory.push(bytes.len() as u64, end as u32);
                 }
-                let end = bytes.len();
-                finish_data(&mut bytes, end).unwrap();
+                directory.finish(&mut bytes).unwrap();
                 let blocks = Blocks::open(FileSlice::from(bytes.clone()), &opts, n, None).unwrap();
                 assert_eq!(
-                    data_entry_len(*blocks.block_starts.last().unwrap() as usize),
+                    data_entry_len(
+                        *blocks.block_starts.last().unwrap() as usize,
+                        blocks.block_rows.len() - 1
+                    ),
                     bytes.len()
                 );
                 for row in 0..n {
@@ -402,26 +483,69 @@ mod tests {
             }
         }
     }
-    // The entry trailer has an exact bounded length and must contain only zero bytes.
+    // Footer framing, both arrays, and every padding region have corruption checks.
     #[test]
-    fn rejects_nonzero_or_wrong_length_entry_trailer() {
+    fn directory_round_trip_and_corruption() {
         let opts = VectorOptions::new(3, Metric::L2);
         let meta = VectorColMetadata::build_flat(&opts);
-        let mut bytes = Vec::new();
-        write_metadata(&mut bytes, &meta).unwrap();
-        bytes.extend([0; 24]);
-        let end = bytes.len();
-        assert_ne!(data_entry_len(end), end);
-        finish_data(&mut bytes, end).unwrap();
-        assert!(Blocks::open(FileSlice::from(bytes.clone()), &opts, 2, None).is_ok());
-        bytes[end] = 1;
-        assert!(matches!(
-            Blocks::open(FileSlice::from(bytes.clone()), &opts, 2, None),
-            Err(crate::TantivyError::DataCorruption(_))
-        ));
-        bytes[end] = 0;
-        bytes.pop();
-        assert!(Blocks::open(FileSlice::from(bytes), &opts, 2, None).is_err());
+        for n in [0, 1, 2] {
+            let mut bytes = Vec::new();
+            write_metadata(&mut bytes, &meta).unwrap();
+            let first = bytes.len();
+            let mut directory = BlockDirectory::new(first as u64);
+            bytes.extend(vec![0; n * 12]);
+            let block_end = bytes.len();
+            if n != 0 {
+                directory.push(block_end as u64, n as u32);
+            }
+            directory.finish(&mut bytes).unwrap();
+            let blocks = Blocks::open(FileSlice::from(bytes.clone()), &opts, n, None).unwrap();
+            let b = usize::from(n != 0);
+            let start = align_up(block_end, MAX_ELEM_BYTES);
+            assert_eq!(blocks.block_starts[b], start as u64);
+            assert_eq!(blocks.block_rows[b], n);
+            assert_eq!(
+                u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()),
+                b as u64
+            );
+            let reject = |corrupt: Vec<u8>| {
+                assert!(matches!(
+                    Blocks::open(FileSlice::from(corrupt), &opts, n, None),
+                    Err(crate::TantivyError::DataCorruption(_))
+                ))
+            };
+            for offset in block_end..start {
+                let mut corrupt = bytes.clone();
+                corrupt[offset] = 1;
+                reject(corrupt);
+            }
+            for offset in start + (b + 1) * 12..bytes.len() - 8 {
+                let mut corrupt = bytes.clone();
+                corrupt[offset] = 1;
+                reject(corrupt);
+            }
+            let mut corrupt = bytes.clone();
+            corrupt[start + b * 8] ^= 1;
+            reject(corrupt);
+            let mut corrupt = bytes.clone();
+            corrupt[start + (b + 1) * 8 + b * 4] ^= 1;
+            reject(corrupt);
+            let mut corrupt = bytes.clone();
+            let footer = corrupt.len() - 8;
+            corrupt[footer..].fill(255);
+            reject(corrupt);
+            let mut corrupt = bytes.clone();
+            corrupt.pop();
+            reject(corrupt);
+            if n != 0 {
+                let mut corrupt = bytes.clone();
+                corrupt[start..start + 8].copy_from_slice(&(start as u64 + 8).to_le_bytes());
+                reject(corrupt);
+                let mut corrupt = bytes.clone();
+                corrupt[start..start + 8].copy_from_slice(&((first + 1) as u64).to_le_bytes());
+                reject(corrupt);
+            }
+        }
     }
 
     // Band views agree with columns, alignment is absolute within blocks, and padding is zero.
@@ -443,6 +567,8 @@ mod tests {
                 let slots = meta.slots();
                 let mut bytes = Vec::new();
                 write_metadata(&mut bytes, &meta).unwrap();
+                let mut directory = BlockDirectory::new(bytes.len() as u64);
+                let mut rows = 0;
                 for n in [0, 3, 0, 5, 0] {
                     let start = bytes.len();
                     for idx in 0..slots.len() {
@@ -455,7 +581,17 @@ mod tests {
                     let padding = start + block_len(&slots, n) - bytes.len();
                     pad(&mut bytes, padding).unwrap();
                     assert_eq!(bytes.len() - start, block_len(&slots, n));
+                    rows += n as u32;
+                    directory.push(bytes.len() as u64, rows);
                 }
+                directory.finish(&mut bytes).unwrap();
+                assert!(Blocks::open(
+                    FileSlice::from(bytes.clone()),
+                    &opts,
+                    8,
+                    Some(vec![0, 0, 2, 3, 8, 8])
+                )
+                .is_err());
                 let blocks = Blocks::open(
                     FileSlice::from(bytes.clone()),
                     &opts,
@@ -486,7 +622,12 @@ mod tests {
                             let view = pinned.slice(start..start + col.len());
                             assert_eq!(
                                 view.as_slice(),
-                                blocks.column(b, idx).read_bytes().unwrap().as_slice()
+                                blocks
+                                    .column(b, idx)
+                                    .unwrap()
+                                    .read_bytes()
+                                    .unwrap()
+                                    .as_slice()
                             );
                         }
                     }

@@ -9,7 +9,7 @@ use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::plugin::PluginWriter;
 use crate::schema::document::{ErasedDocument, ErasedValue, ReferenceValueLeaf};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
-use crate::vector::blocks::{align_up, block_align, finish_data, pad, write_metadata};
+use crate::vector::blocks::{align_up, block_align, pad, write_metadata, BlockDirectory};
 use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::header::{write_vector_header, VectorEntry, HEADER_LEN};
 use crate::vector::metadata::{VectorColMetadata, FLAT_ROWS_PER_BLOCK};
@@ -155,13 +155,16 @@ impl PluginWriter for FlatVecWriter {
             let data = composite.for_field_with_idx(field, VectorEntry::Data.index());
             let start = data.written_bytes();
             write_metadata(data, &meta)?;
+            let mut directory = BlockDirectory::new(data.written_bytes() - start);
+            let mut rows = 0u32;
             // A full row group or the final partial group forms one aligned Rows column.
             for block in row_bytes.chunks(FLAT_ROWS_PER_BLOCK as usize * stride) {
                 data.write_all(block)?;
                 pad(data, align_up(block.len(), align) - block.len())?;
+                rows += (block.len() / stride) as u32;
+                directory.push(data.written_bytes() - start, rows);
             }
-            let len = (data.written_bytes() - start) as usize;
-            finish_data(data, len)?;
+            directory.finish(data)?;
             assert_eq!((data.written_bytes() - start) as usize % MAX_ELEM_BYTES, 0);
             data.flush()?;
         }
