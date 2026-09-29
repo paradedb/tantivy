@@ -125,7 +125,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
         let match_all = automaton.will_always_match(&automaton.start());
         if match_all {
-            let slice = self.file_slice_for_range(key_range, limit);
+            let slice = self.file_slice_for_range(key_range, limit)?;
             let data = slice.read_bytes_async().await?;
             Ok(TSSTable::delta_reader(data))
         } else {
@@ -133,17 +133,16 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                 key_range,
                 automaton,
                 merge_holes_under_bytes,
-            ));
+            )?);
             let data = blocks
-                .map(|block_addr| {
+                .map(|block_addr| async move {
+                    let block_addr = block_addr?;
                     let first_ordinal = block_addr.first_ordinal;
-                    async move {
-                        let bytes = self
-                            .sstable_slice
-                            .read_bytes_slice_async(block_addr.byte_range)
-                            .await?;
-                        io::Result::Ok((bytes, first_ordinal))
-                    }
+                    let bytes = self
+                        .sstable_slice
+                        .read_bytes_slice_async(block_addr.byte_range)
+                        .await?;
+                    io::Result::Ok((bytes, first_ordinal))
                 })
                 .buffered(5)
                 .try_collect::<Vec<_>>()
@@ -160,15 +159,17 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
         let match_all = automaton.will_always_match(&automaton.start());
         if match_all {
-            let slice = self.file_slice_for_range(key_range, limit);
+            let slice = self.file_slice_for_range(key_range, limit)?;
             let data = slice.read_bytes()?;
             Ok(TSSTable::delta_reader(data))
         } else {
             // if operations are sync, we assume latency is almost null, and there is no point in
             // merging across holes
-            let blocks = self.get_block_iterator_for_range_and_automaton(key_range, automaton, 0);
+            let blocks =
+                self.get_block_iterator_for_range_and_automaton(key_range, automaton, 0)?;
             let data = blocks
                 .map(|block_addr| {
+                    let block_addr = block_addr?;
                     let first_ordinal = block_addr.first_ordinal;
                     self.sstable_slice
                         .read_bytes_slice(block_addr.byte_range)
@@ -220,11 +221,11 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         &self,
         key_range: impl RangeBounds<[u8]>,
         limit: Option<u64>,
-    ) -> FileSlice {
+    ) -> io::Result<FileSlice> {
         let first_block_id = match key_range.start_bound() {
             Bound::Included(key) | Bound::Excluded(key) => {
-                let Some(first_block_id) = self.sstable_index.locate_with_key(key) else {
-                    return FileSlice::empty();
+                let Some(first_block_id) = self.sstable_index.locate_with_key(key)? else {
+                    return Ok(FileSlice::empty());
                 };
                 Some(first_block_id)
             }
@@ -232,13 +233,15 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         };
 
         let last_block_id = match key_range.end_bound() {
-            Bound::Included(key) | Bound::Excluded(key) => self.sstable_index.locate_with_key(key),
+            Bound::Included(key) | Bound::Excluded(key) => {
+                self.sstable_index.locate_with_key(key)?
+            }
             Bound::Unbounded => None,
         };
 
         let start_bound = if let Some(first_block_id) = first_block_id {
-            let Some(block_addr) = self.sstable_index.get_block(first_block_id) else {
-                return FileSlice::empty();
+            let Some(block_addr) = self.sstable_index.get_block(first_block_id)? else {
+                return Ok(FileSlice::empty());
             };
             Bound::Included(block_addr.byte_range.start)
         } else {
@@ -247,9 +250,9 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
         let last_block_id = if let Some(limit) = limit {
             let second_block_id = first_block_id.map(|id| id + 1).unwrap_or(0);
-            if let Some(block_addr) = self.sstable_index.get_block(second_block_id) {
+            if let Some(block_addr) = self.sstable_index.get_block(second_block_id)? {
                 let ordinal_limit = block_addr.first_ordinal + limit;
-                let last_block_limit = self.sstable_index.locate_with_ord(ordinal_limit);
+                let last_block_limit = self.sstable_index.locate_with_ord(ordinal_limit)?;
                 if let Some(last_block_id) = last_block_id {
                     Some(last_block_id.min(last_block_limit))
                 } else {
@@ -262,11 +265,13 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             last_block_id
         };
         let end_bound = last_block_id
-            .and_then(|block_id| self.sstable_index.get_block(block_id))
+            .map(|block_id| self.sstable_index.get_block(block_id))
+            .transpose()?
+            .flatten()
             .map(|block_addr| Bound::Excluded(block_addr.byte_range.end))
             .unwrap_or(Bound::Unbounded);
 
-        self.sstable_slice.slice((start_bound, end_bound))
+        Ok(self.sstable_slice.slice((start_bound, end_bound)))
     }
 
     fn get_block_iterator_for_range_and_automaton<'a>(
@@ -274,35 +279,40 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         key_range: impl RangeBounds<[u8]>,
         automaton: &'a impl Automaton,
         merge_holes_under_bytes: usize,
-    ) -> impl Iterator<Item = BlockAddr> + 'a {
+    ) -> io::Result<impl Iterator<Item = io::Result<BlockAddr>> + 'a> {
         let lower_bound = match key_range.start_bound() {
             Bound::Included(key) | Bound::Excluded(key) => {
-                self.sstable_index.locate_with_key(key).unwrap_or(u64::MAX)
+                self.sstable_index.locate_with_key(key)?.unwrap_or(u64::MAX)
             }
             Bound::Unbounded => 0,
         };
 
         let upper_bound = match key_range.end_bound() {
             Bound::Included(key) | Bound::Excluded(key) => {
-                self.sstable_index.locate_with_key(key).unwrap_or(u64::MAX)
+                self.sstable_index.locate_with_key(key)?.unwrap_or(u64::MAX)
             }
             Bound::Unbounded => u64::MAX,
         };
         let block_range = lower_bound..=upper_bound;
-        self.sstable_index
-            .get_block_for_automaton(automaton)
-            .filter(move |(block_id, _)| block_range.contains(block_id))
-            .map(|(_, block_addr)| block_addr)
-            .coalesce(move |first, second| {
-                if first.byte_range.end + merge_holes_under_bytes >= second.byte_range.start {
-                    Ok(BlockAddr {
-                        first_ordinal: first.first_ordinal,
-                        byte_range: first.byte_range.start..second.byte_range.end,
-                    })
-                } else {
-                    Err((first, second))
-                }
+        Ok(self
+            .sstable_index
+            .get_block_for_automaton(automaton)?
+            .filter(move |item| {
+                item.as_ref()
+                    .map(|(id, _)| block_range.contains(id))
+                    .unwrap_or(true)
             })
+            .map(|item| item.map(|(_, addr)| addr))
+            .coalesce(move |first, second| match (first, second) {
+                (Ok(mut first), Ok(second))
+                    if second.byte_range.start - first.byte_range.end
+                        <= merge_holes_under_bytes =>
+                {
+                    first.byte_range.end = second.byte_range.end;
+                    Ok(Ok(first))
+                }
+                pair => Err(pair),
+            }))
     }
 
     /// Opens a `TermDictionary`.
@@ -314,9 +324,8 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         let num_terms = u64::deserialize(&mut footer_len_bytes)?;
         let version = u32::deserialize(&mut footer_len_bytes)?;
         let (sstable_slice, index_slice) = main_slice.split(index_offset as usize);
-        let sstable_index_bytes = index_slice.read_bytes()?;
 
-        let sstable_index = SSTableIndex::open(version, index_offset, sstable_index_bytes)?;
+        let sstable_index = SSTableIndex::open(version, index_offset, index_slice)?;
 
         Ok(Dictionary {
             sstable_slice,
@@ -363,11 +372,11 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             return Ok(None);
         }
         let end_incl = (ord_range.end - 1).min(self.num_terms - 1);
-        let first_block_id = self.sstable_index.locate_with_ord(ord_range.start);
+        let first_block_id = self.sstable_index.locate_with_ord(ord_range.start)?;
         let last_block_id = if end_incl == ord_range.start {
             first_block_id
         } else {
-            self.sstable_index.locate_with_ord(end_incl)
+            self.sstable_index.locate_with_ord(end_incl)?
         };
         Ok(Some(first_block_id..=last_block_id))
     }
@@ -541,7 +550,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     pub fn term_ord<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TermOrdinal>> {
         let key_bytes = key.as_ref();
 
-        let Some(block_addr) = self.sstable_index.get_block_with_key(key_bytes) else {
+        let Some(block_addr) = self.sstable_index.get_block_with_key(key_bytes)? else {
             return Ok(None);
         };
 
@@ -556,7 +565,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     pub fn term_ord_or_next<K: AsRef<[u8]>>(&self, key: K) -> io::Result<TermOrdHit> {
         let key_bytes = key.as_ref();
 
-        let Some(block_addr) = self.sstable_index.get_block_with_key(key_bytes) else {
+        let Some(block_addr) = self.sstable_index.get_block_with_key(key_bytes)? else {
             // TODO: Would be more consistent to return last_term id + 1
             return Ok(TermOrdHit::Next(u64::MAX));
         };
@@ -617,7 +626,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     /// the buffer may be modified.
     pub fn ord_to_term(&self, ord: TermOrdinal, bytes: &mut Vec<u8>) -> io::Result<bool> {
         // find block in which the term would be
-        let block_addr = self.sstable_index.get_block_with_ord(ord);
+        let block_addr = self.sstable_index.get_block_with_ord(ord)?;
         let first_ordinal = block_addr.first_ordinal;
 
         // then search inside that block only
@@ -642,10 +651,10 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         if ord >= self.num_terms {
             return Ok(None);
         }
-        let (block_addr, block_id) = self.sstable_index.get_and_locate_with_ord(ord);
+        let (block_addr, block_id) = self.sstable_index.get_and_locate_with_ord(ord)?;
         let end_ord = self
             .sstable_index
-            .get_block(block_id + 1)
+            .get_block(block_id + 1)?
             .map(|next| next.first_ordinal)
             .unwrap_or(self.num_terms);
         Ok(Some((block_addr, end_ord)))
@@ -667,13 +676,13 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
         // Open the block for the first ordinal.
         let mut bytes = Vec::new();
-        let (mut current_block_addr, block_id) = self.sstable_index.get_and_locate_with_ord(ord);
+        let (mut current_block_addr, block_id) = self.sstable_index.get_and_locate_with_ord(ord)?;
         let mut current_sstable_delta_reader =
             self.sstable_delta_reader_block(current_block_addr.clone())?;
         let mut current_block_ordinal = current_block_addr.first_ordinal;
         let mut current_block_end_bound = self
             .sstable_index
-            .get_block(block_id + 1)
+            .get_block(block_id + 1)?
             .map(|block_addr| block_addr.first_ordinal)
             .unwrap_or(u64::MAX);
 
@@ -706,7 +715,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
             if next_ord >= current_block_end_bound {
                 let (new_block_addr, block_id) =
-                    self.sstable_index.get_and_locate_with_ord(next_ord);
+                    self.sstable_index.get_and_locate_with_ord(next_ord)?;
                 current_block_addr = new_block_addr;
                 current_block_ordinal = current_block_addr.first_ordinal;
                 current_sstable_delta_reader =
@@ -714,7 +723,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                 bytes.clear();
                 current_block_end_bound = self
                     .sstable_index
-                    .get_block(block_id + 1)
+                    .get_block(block_id + 1)?
                     .map(|block_addr| block_addr.first_ordinal)
                     .unwrap_or(u64::MAX)
             }
@@ -725,7 +734,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     /// Returns the number of terms in the dictionary.
     pub fn term_info_from_ord(&self, term_ord: TermOrdinal) -> io::Result<Option<TSSTable::Value>> {
         // find block in which the term would be
-        let block_addr = self.sstable_index.get_block_with_ord(term_ord);
+        let block_addr = self.sstable_index.get_block_with_ord(term_ord)?;
         let first_ordinal = block_addr.first_ordinal;
 
         // then search inside that block only
@@ -740,7 +749,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
     /// Lookups the value corresponding to the key.
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TSSTable::Value>> {
-        if let Some(block_addr) = self.sstable_index.get_block_with_key(key.as_ref()) {
+        if let Some(block_addr) = self.sstable_index.get_block_with_key(key.as_ref())? {
             let sstable_reader = self.sstable_delta_reader_block(block_addr)?;
             return self.do_get(key, sstable_reader);
         }
@@ -750,20 +759,35 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     /// Batched exact-key lookup over a sorted input slice.
     ///
     /// Returns an iterator yielding `Ok((input_index, value))` for each
-    /// `sorted_keys[input_index]` present in the dictionary, in input
-    /// order. Keys not present in the dictionary are silently skipped.
+    /// `sorted_keys[input_index]` that exists in the dictionary, in input
+    /// order. Keys not present in the dictionary are silently skipped
+    /// (no iterator turn wasted). I/O errors during block decode
+    /// propagate via `Err(_)`; the iterator is fused on error (returns
+    /// `None` on every call after the first `Err`).
     ///
-    /// Each SSTable block touched by one or more input keys is
-    /// decompressed and scanned forward at most once. When many query
-    /// terms fall into the same block (dense dictionaries, clustered
-    /// numeric keys), this avoids the repeated block decompression paid
-    /// by calling [`Dictionary::get`] per key.
+    /// The implementation walks the input forward, decoding each touched
+    /// SSTable block exactly once. For inputs where multiple query terms
+    /// fall in the same block, this amortises the zstd-decompression
+    /// cost that K independent [`get`](Self::get) calls would pay
+    /// repeatedly.
     ///
-    /// # Performance envelope
+    /// # Precondition
     ///
-    /// Expected work is O(K log B + U * block_decode), where K is
-    /// `sorted_keys.len()`, B is the number of blocks in the SSTable,
-    /// and U <= min(K, B) is the number of distinct blocks touched.
+    /// `sorted_keys` must be strictly ascending in byte order with no
+    /// duplicates. This is enforced at the type level by
+    /// [`SortedTermSlice`]; callers with unsorted input can use
+    /// [`sort_and_dedupe_terms`] first.
+    ///
+    /// # Complexity
+    ///
+    /// Best case (all query terms in one block): one block decode plus
+    /// one forward walk of that block. Worst case (each query term in
+    /// its own block): K block decodes — the same cost as K
+    /// [`get`](Self::get) calls. Always at most one decode per touched
+    /// block regardless of how many query terms map to it.
+    ///
+    /// [`SortedTermSlice`]: crate::SortedTermSlice
+    /// [`sort_and_dedupe_terms`]: crate::sort_and_dedupe_terms
     pub fn batch_term_info_exact<'a, K: AsRef<[u8]>>(
         &'a self,
         sorted_keys: crate::batch::SortedTermSlice<'a, K>,
@@ -786,7 +810,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
     /// Lookups the value corresponding to the key.
     pub async fn get_async<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TSSTable::Value>> {
-        if let Some(block_addr) = self.sstable_index.get_block_with_key(key.as_ref()) {
+        if let Some(block_addr) = self.sstable_index.get_block_with_key(key.as_ref())? {
             let sstable_reader = self.sstable_delta_reader_block_async(block_addr).await?;
             return self.do_get(key, sstable_reader);
         }
@@ -920,7 +944,10 @@ mod tests {
         let dictionary = Dictionary::<MonotonicU64SSTable>::open(slice).unwrap();
 
         // if the last block is id 0, tests are meaningless
-        assert_ne!(dictionary.sstable_index.locate_with_ord(u64::MAX), 0);
+        assert_ne!(
+            dictionary.sstable_index.locate_with_ord(u64::MAX).unwrap(),
+            0
+        );
         assert_eq!(dictionary.num_terms(), 0x3ffff);
         (dictionary, table)
     }
@@ -1063,7 +1090,7 @@ mod tests {
     fn test_ord_term_conversion() {
         let (dic, slice) = make_test_sstable();
 
-        let block = dic.sstable_index.get_block_with_ord(100_000);
+        let block = dic.sstable_index.get_block_with_ord(100_000).unwrap();
         slice.restrict(block.byte_range);
 
         let mut res = Vec::new();
@@ -1089,7 +1116,11 @@ mod tests {
 
         // end of a block
         let ordinal = block.first_ordinal - 1;
-        let new_range = dic.sstable_index.get_block_with_ord(ordinal).byte_range;
+        let new_range = dic
+            .sstable_index
+            .get_block_with_ord(ordinal)
+            .unwrap()
+            .byte_range;
         slice.restrict(new_range);
         assert!(dic.ord_to_term(ordinal, &mut res).unwrap());
         assert_eq!(res, format!("{ordinal:05X}").into_bytes());
@@ -1099,7 +1130,7 @@ mod tests {
 
         // before first block
         // 1st block must be loaded for key-related operations
-        let block = dic.sstable_index.get_block_with_ord(0);
+        let block = dic.sstable_index.get_block_with_ord(0).unwrap();
         slice.restrict(block.byte_range);
 
         assert!(dic.get(b"$$$").unwrap().is_none());
@@ -1108,7 +1139,11 @@ mod tests {
         // after last block
         // last block must be loaded for ord related operations
         let ordinal = 0x40000 + 10;
-        let new_range = dic.sstable_index.get_block_with_ord(ordinal).byte_range;
+        let new_range = dic
+            .sstable_index
+            .get_block_with_ord(ordinal)
+            .unwrap()
+            .byte_range;
         slice.restrict(new_range);
         assert!(!dic.ord_to_term(ordinal, &mut res).unwrap());
         assert!(dic.term_info_from_ord(ordinal).unwrap().is_none());
@@ -1227,10 +1262,12 @@ mod tests {
             .sstable_index
             .get_block_with_key(b"10000")
             .unwrap()
+            .unwrap()
             .byte_range;
         let end = dic
             .sstable_index
             .get_block_with_key(b"18000")
+            .unwrap()
             .unwrap()
             .byte_range;
         slice.restrict(start.start..end.end);
