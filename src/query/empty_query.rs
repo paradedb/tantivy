@@ -13,6 +13,10 @@ use crate::{DocId, DocSet, Score, Searcher};
 pub struct EmptyQuery;
 
 impl Query for EmptyQuery {
+    fn estimate_docs(&self, _reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        Ok(Some((0, 0)))
+    }
+
     fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         Ok(Box::new(EmptyWeight))
     }

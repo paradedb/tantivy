@@ -40,6 +40,10 @@ impl fmt::Debug for BoostQuery {
 }
 
 impl Query for BoostQuery {
+    fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        self.query.estimate_docs(reader)
+    }
+
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let weight_without_boost = self.query.weight(enable_scoring)?;
         let boosted_weight = if enable_scoring.is_scoring_enabled() {
