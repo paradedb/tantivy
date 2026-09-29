@@ -90,4 +90,17 @@ impl BlockMaxScorer for MixedScorer {
             Self::Phrase(_, bound) => *bound,
         }
     }
+
+    #[inline]
+    fn for_each_score_until(&mut self, end: DocId, mut callback: impl FnMut(DocId, Score)) {
+        match self {
+            Self::Term(scorer) => scorer.for_each_score_until(end, callback),
+            Self::Phrase(scorer, _) => {
+                while scorer.doc() < end {
+                    callback(scorer.doc(), scorer.score());
+                    scorer.advance();
+                }
+            }
+        }
+    }
 }

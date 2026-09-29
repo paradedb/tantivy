@@ -165,6 +165,33 @@ impl TermScorer {
             .fieldnorm_id_at(self.postings.block_offset(), &self.fieldnorm_reader)
     }
 
+    pub(crate) fn for_each_score_until(
+        &mut self,
+        end: DocId,
+        mut callback: impl FnMut(DocId, Score),
+    ) {
+        while self.doc() < end {
+            let next = {
+                let block = &self.postings.block_cursor;
+                let start = self.postings.block_offset();
+                let docs = &block.doc_decoder.output_array()[..block.block_len()];
+                let stop = start + docs[start..].partition_point(|&doc| doc < end);
+                let freqs = block.freq_output_array();
+                let norms = block.posting_fieldnorms(stop);
+                for offset in start..stop {
+                    let doc = docs[offset];
+                    let norm = norms.as_ref().map_or_else(
+                        || self.fieldnorm_reader.fieldnorm_id(doc),
+                        |norms| norms[offset],
+                    );
+                    callback(doc, self.similarity_weight.score(norm, freqs[offset]));
+                }
+                docs[stop - 1] + 1
+            };
+            self.postings.seek(next);
+        }
+    }
+
     pub fn explain(&self) -> Explanation {
         let fieldnorm_id = self.fieldnorm_id();
         let term_freq = self.term_freq();
@@ -246,6 +273,48 @@ mod tests {
     use crate::{
         assert_nearly_equals, DocId, DocSet, Index, IndexWriter, Score, Searcher, Term, TERMINATED,
     };
+
+    #[test]
+    fn test_batched_scores_preserve_cursor_and_boundaries() {
+        use crate::directory::FileSlice;
+        use crate::fieldnorm::FieldNormReader;
+
+        let norms: Vec<_> = (0..10000).map(|doc| 1 + doc % 1000).collect();
+        let postings: Vec<_> = (0..3000).map(|doc| (doc * 3, 1 + doc % 23)).collect();
+        for (pnorms, seek_step) in [(false, 0), (false, 7), (true, 0), (true, 7)] {
+            let weight = Bm25Weight::for_one_term(3000, 10000, 150.0, Bm25Params::default());
+            let mut scorer = TermScorer::create_for_test(&postings, &norms, weight);
+            if pnorms {
+                let bytes: Vec<_> = postings
+                    .iter()
+                    .map(|&(doc, _)| FieldNormReader::fieldnorm_to_id(norms[doc as usize]))
+                    .collect();
+                scorer
+                    .postings
+                    .block_cursor
+                    .set_term_norm_source(Some(FileSlice::from(bytes)), Some(0));
+            }
+            let mut baseline = scorer.clone();
+            for end in [
+                0, 1, 3, 127, 384, 386, 1000, 4096, 4096, 8192, 8998, TERMINATED,
+            ] {
+                let mut expected = Vec::new();
+                while baseline.doc() < end {
+                    expected.push((baseline.doc(), baseline.score()));
+                    baseline.advance();
+                }
+                let mut actual = Vec::new();
+                scorer.for_each_score_until(end, |doc, score| actual.push((doc, score)));
+                assert_eq!(actual, expected, "end={end}, pnorms={pnorms}");
+                assert_eq!(scorer.doc(), baseline.doc());
+                if scorer.doc() != TERMINATED {
+                    assert_eq!(scorer.score(), baseline.score());
+                    let next = end.saturating_add(seek_step).max(scorer.doc());
+                    assert_eq!(scorer.seek(next), baseline.seek(next));
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_term_scorer_max_score() -> crate::Result<()> {
