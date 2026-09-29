@@ -2596,4 +2596,7 @@ mod tests {
         );
         Ok(())
     }
+    mod storage_properties {
+        include!("storage_properties.rs");
+    }
 }

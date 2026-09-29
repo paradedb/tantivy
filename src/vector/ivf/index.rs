@@ -301,6 +301,10 @@ impl IvfIndex {
         query: &'router [f32],
         params: RoutingParams,
     ) -> RouterIter<'router, 'workspace> {
+        #[cfg(test)]
+        if let Some(clusters) = crate::vector::router::test_clusters() {
+            return clusters;
+        }
         self.router.rank(workspace, query, self.metric, params)
     }
 

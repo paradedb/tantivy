@@ -2294,6 +2294,13 @@ impl<T: VectorElement> VectorBackend<T> {
             }
             controller.charge_open();
             let rows = index.cluster_range(cluster);
+            // Empty clusters have no band to read and use the probe's empty-cluster counter.
+            if rows.is_empty() {
+                postings_skipped += 1;
+                stats.clusters_skipped_empty += 1;
+                controller.cover(aps_kth)?;
+                continue;
+            }
             let layer = &quantized.layers()[0];
             let batch = layer.read_batch_in_block(cluster, rows.clone())?;
             let selection_start = Instant::now();
