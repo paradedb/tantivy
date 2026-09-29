@@ -84,16 +84,18 @@ pub(crate) mod test_support {
 
     pub(crate) const PAGE_BYTES: usize = 8192;
 
+    type ReadLog = Arc<Mutex<Vec<(Stage, Range<usize>)>>>;
+
     /// Records vector read requests against a PostgreSQL-sized page geometry.
     #[derive(Clone, Debug, Default)]
     pub(crate) struct PagedDirectory {
         inner: RamDirectory,
-        pub(crate) reads: Arc<Mutex<Vec<(Stage, Range<usize>)>>>,
+        pub(crate) reads: ReadLog,
     }
     #[derive(Debug)]
     struct PagedFile {
         inner: Arc<dyn FileHandle>,
-        reads: Arc<Mutex<Vec<(Stage, Range<usize>)>>>,
+        reads: ReadLog,
     }
     impl HasLen for PagedFile {
         fn len(&self) -> usize {

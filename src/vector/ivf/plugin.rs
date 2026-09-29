@@ -1000,7 +1000,7 @@ mod tests {
             writer.delete_term(Term::from_field_text(label, "d1"));
             writer.delete_term(Term::from_field_text(label, "extra5"));
             writer.commit()?;
-            let capture = || -> crate::Result<BTreeMap<String, Option<(usize, Vec<u8>)>>> {
+            let capture = || -> crate::Result<_> {
                 let searcher = index.reader()?.searcher();
                 let mut out = BTreeMap::new();
                 for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {

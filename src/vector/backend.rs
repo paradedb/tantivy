@@ -360,6 +360,7 @@ pub struct LayerProbeStats {
 #[derive(Debug, Default)]
 pub(crate) struct QuantizedStageTrace {
     pub(crate) scored_docs: Vec<DocId>,
+    pub(crate) estimates: Vec<Vec<(usize, DocId, u32)>>,
     pub(crate) boundary_docs: Vec<Vec<DocId>>,
     pub(crate) rerank_docs: Vec<DocId>,
 }
@@ -984,6 +985,13 @@ struct QuantizedCandidates {
 }
 
 impl QuantizedCandidates {
+    #[cfg(test)]
+    fn estimate_trace(&self) -> Vec<(usize, DocId, u32)> {
+        (0..self.len())
+            .map(|i| (self.rows[i], self.docs[i], self.estimates[i].to_bits()))
+            .collect()
+    }
+
     fn with_capacity(capacity: usize) -> Self {
         Self {
             rows: Vec::with_capacity(capacity),
@@ -2418,6 +2426,10 @@ impl<T: VectorElement> VectorBackend<T> {
         #[cfg(test)]
         {
             stats.quantized_trace.scored_docs = candidate_docs(&scan.candidates);
+            stats
+                .quantized_trace
+                .estimates
+                .push(scan.candidates.estimate_trace());
         }
 
         let boundary_start = Instant::now();
@@ -2584,6 +2596,11 @@ impl<T: VectorElement> VectorBackend<T> {
                 layer_scored,
                 layer_start.elapsed().as_nanos() as u64,
             );
+            #[cfg(test)]
+            stats
+                .quantized_trace
+                .estimates
+                .push(scan.candidates.estimate_trace());
             let boundary_start = Instant::now();
             let boundary_stage = enter_vector_stage(Stage::Boundary(layer_idx as u8));
             scan.band(top_n, QUANTIZED_BOUNDARY_KAPPA);
