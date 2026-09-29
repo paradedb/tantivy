@@ -42,6 +42,8 @@ pub struct BlockWandIntersectionScorer {
 
     candidate_doc_ids: [u32; COMPRESSION_BLOCK_SIZE],
     candidate_scores: [f32; COMPRESSION_BLOCK_SIZE],
+    /// Leader fieldnorm IDs for `candidate_doc_ids[..num_candidates]`, reused by secondaries
+    /// when `shared_fieldnorms` is true.
     candidate_norms: [u8; COMPRESSION_BLOCK_SIZE],
     num_candidates: usize,
     candidate_idx: usize,
@@ -51,6 +53,9 @@ pub struct BlockWandIntersectionScorer {
     current: (DocId, Score),
     internal_doc: DocId,
     window_end: DocId,
+    /// True when every scorer has the same known segment and field, allowing the leader's
+    /// fieldnorm IDs to be reused for secondary scoring.
+    // TODO: Extend fieldnorm reuse to other scorers.
     shared_fieldnorms: bool,
 }
 impl BlockWandIntersectionScorer {
