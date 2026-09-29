@@ -1,8 +1,10 @@
 use crate::docset::DocSet;
 use crate::fieldnorm::FieldNormReader;
+use crate::index::SegmentId;
 use crate::postings::{BlockSegmentPostings, FreqReadingOption, Postings, SegmentPostings};
 use crate::query::bm25::Bm25Weight;
 use crate::query::{Explanation, Scorer};
+use crate::schema::Field;
 use crate::{DocId, Score};
 
 #[derive(Clone)]
@@ -10,6 +12,7 @@ pub struct TermScorer {
     postings: SegmentPostings,
     fieldnorm_reader: FieldNormReader,
     similarity_weight: Bm25Weight,
+    fieldnorm_source: Option<(SegmentId, Field)>,
 }
 
 impl TermScorer {
@@ -22,7 +25,17 @@ impl TermScorer {
             postings,
             fieldnorm_reader,
             similarity_weight,
+            fieldnorm_source: None,
         }
+    }
+
+    pub(crate) fn with_fieldnorm_source(mut self, segment: SegmentId, field: Field) -> Self {
+        self.fieldnorm_source = Some((segment, field));
+        self
+    }
+
+    pub(crate) fn shares_fieldnorms_with(&self, other: &Self) -> bool {
+        self.fieldnorm_source.is_some() && self.fieldnorm_source == other.fieldnorm_source
     }
 
     pub(crate) fn seek_block(&mut self, target_doc: DocId) {
