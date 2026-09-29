@@ -60,6 +60,15 @@ pub trait FileHandle: 'static + Send + Sync + HasLen + fmt::Debug {
     fn storage_block_len(&self) -> Option<usize> {
         None
     }
+
+    /// Preferred read-ahead size for incremental reads from this handle.
+    ///
+    /// Backends where small range reads are cheaper than materializing an entire
+    /// logical value can return a positive size. Consumers that do not support
+    /// incremental reads may ignore this hint.
+    fn preferred_read_buffer_size(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -296,6 +305,11 @@ impl FileSlice {
         Some((self.range.start + offset) / block_len)
     }
 
+    /// Returns the underlying storage backend's preferred incremental read size.
+    pub fn preferred_read_buffer_size(&self) -> Option<usize> {
+        self.data.preferred_read_buffer_size()
+    }
+
     /// Reads a specific slice of data.
     ///
     /// This is equivalent to running `file_slice.slice(from, to).read_bytes()`.
@@ -384,6 +398,10 @@ impl FileHandle for FileSlice {
 
     fn as_slice(&self) -> Option<&[u8]> {
         self.as_slice()
+    }
+
+    fn preferred_read_buffer_size(&self) -> Option<usize> {
+        FileSlice::preferred_read_buffer_size(self)
     }
 }
 
@@ -506,6 +524,10 @@ mod tests {
         fn storage_block_len(&self) -> Option<usize> {
             Some(4)
         }
+
+        fn preferred_read_buffer_size(&self) -> Option<usize> {
+            Some(7)
+        }
     }
 
     #[test]
@@ -515,6 +537,9 @@ mod tests {
         assert_eq!(slot.storage_block_ord(0), Some(0));
         assert_eq!(slot.storage_block_ord(1), Some(1));
         assert_eq!(slot.storage_block_ord(5), Some(2));
+        assert_eq!(slot.preferred_read_buffer_size(), Some(7));
+        let nested = FileSlice::new(Arc::new(slot));
+        assert_eq!(nested.preferred_read_buffer_size(), Some(7));
     }
 
     #[test]

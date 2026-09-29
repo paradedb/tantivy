@@ -283,9 +283,9 @@ impl InvertedIndexReader {
         let postings_data = self
             .postings_file_slice
             .slice(term_info.postings_range.clone());
-        let mut postings = BlockSegmentPostings::open(
+        let mut postings = BlockSegmentPostings::open_from_file(
             term_info.doc_freq,
-            postings_data.read_bytes()?,
+            postings_data,
             self.record_option,
             requested_option,
         )?;
