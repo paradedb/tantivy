@@ -8,6 +8,13 @@ pub(super) const MIN_BOUND_WINDOW: u32 = 8192;
 const WINDOW: usize = 4096;
 
 pub(super) fn should_use_block_maxscore(scorers: &[TermScorer], max_doc: DocId) -> bool {
+    if scorers.len() == 2 {
+        let left = u64::from(scorers[0].size_hint());
+        let right = u64::from(scorers[1].size_hint());
+        if left.min(right) * 64 < left.max(right) {
+            return false;
+        }
+    }
     // Keep WAND for a single term or fewer than 256 postings.
     // Require one posting per 256 doc IDs to avoid sparse-query regressions:
     // 32 expected term matches per 8192-doc window, counting overlapping terms.
@@ -21,16 +28,45 @@ pub(super) fn should_use_block_maxscore(scorers: &[TermScorer], max_doc: DocId) 
         && postings.saturating_mul(max_docs_per_posting) >= u64::from(max_doc)
 }
 
-struct Term {
-    scorer: Box<TermScorer>,
+pub(super) trait BlockMaxScorer: Scorer {
+    fn seek_block(&mut self, target: DocId);
+    fn block_max_score_up_to(&mut self, target: DocId) -> (Score, DocId);
+    fn block_score_hint(&self) -> Score;
+    fn refine_block_max_score(&mut self) -> Score;
+}
+
+impl BlockMaxScorer for TermScorer {
+    #[inline]
+    fn seek_block(&mut self, target: DocId) {
+        self.seek_block(target);
+    }
+
+    #[inline]
+    fn block_max_score_up_to(&mut self, target: DocId) -> (Score, DocId) {
+        self.block_max_score_up_to(target)
+    }
+
+    #[inline]
+    fn block_score_hint(&self) -> Score {
+        self.block_score_hint()
+    }
+
+    #[inline]
+    fn refine_block_max_score(&mut self) -> Score {
+        self.refine_block_max_score()
+    }
+}
+
+struct Term<TScorer> {
+    scorer: Box<TScorer>,
     bound: f64,
     inv_cost: f64,
     priority: f64,
     remaining: f64,
 }
 
-pub(super) fn block_maxscore(
-    scorers: Vec<TermScorer>,
+pub(super) fn block_maxscore<TScorer: BlockMaxScorer>(
+    scorers: Vec<TScorer>,
     mut threshold: Score,
     min_window: u32,
     callback: &mut dyn FnMut(DocId, Score) -> Score,
@@ -40,7 +76,7 @@ pub(super) fn block_maxscore(
     let mut terms: Vec<_> = scorers
         .into_iter()
         .map(|scorer| Term {
-            inv_cost: 1.0 / scorer.size_hint().max(1) as f64,
+            inv_cost: 1.0 / scorer.cost().max(1) as f64,
             priority: 0.0,
             scorer: Box::new(scorer),
             bound: 0.0,

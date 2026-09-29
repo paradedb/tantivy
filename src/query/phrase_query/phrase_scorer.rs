@@ -419,6 +419,13 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         self.phrase_count
     }
 
+    pub(crate) fn global_score_bound(&self) -> Option<Score> {
+        if self.slop != 0 {
+            return None;
+        }
+        self.similarity_weight_opt.as_ref()?.global_score_bound()
+    }
+
     pub(crate) fn get_intersection(&mut self) -> &[u32] {
         intersection(&mut self.left_positions, &self.right_positions);
         &self.left_positions

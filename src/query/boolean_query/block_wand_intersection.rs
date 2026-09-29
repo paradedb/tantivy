@@ -257,6 +257,7 @@ impl DocSet for BlockWandIntersectionScorer {
 
             let block_docs = &block_cursor.doc_decoder.output_array()[start_idx..end_idx];
             let block_freqs = &block_cursor.freq_output_array()[start_idx..end_idx];
+            let posting_norms = block_cursor.posting_fieldnorms(end_idx);
 
             // Pass 1: Batch-compute leader BM25 scores and branchlessly filter
             // candidates that can't beat the threshold.
@@ -273,8 +274,10 @@ impl DocSet for BlockWandIntersectionScorer {
                 .zip(block_freqs.iter().copied())
                 .enumerate()
             {
-                let fieldnorm_id =
-                    block_cursor.fieldnorm_id_at(start_idx + offset, &self.fieldnorm_reader);
+                let fieldnorm_id = posting_norms.as_ref().map_or_else(
+                    || self.fieldnorm_reader.fieldnorm_id(candidate_doc),
+                    |norms| norms[start_idx + offset],
+                );
                 let leader_score = self.bm25_weight.score(fieldnorm_id, term_freq);
                 self.candidate_doc_ids[num_candidates] = candidate_doc;
                 self.candidate_scores[num_candidates] = leader_score;
@@ -564,6 +567,63 @@ mod tests {
             (posting_lists, fieldnorms) in gen_term_scorers(3)
         ) {
             test_block_wand_intersection_aux(&posting_lists[..], &fieldnorms[..]);
+        }
+    }
+
+    #[test]
+    fn test_intersection_bounds_with_different_averages() {
+        use crate::directory::FileSlice;
+        use crate::fieldnorm::FieldNormReader;
+        use crate::Bm25Params;
+
+        let norms: Vec<_> = (0..3000).map(|doc| 1 + (doc * 37) % 300).collect();
+        for pnorms in [false, true] {
+            for average in [2.0, 50.0, 150.0, 1000.0] {
+                let scorers: Vec<_> = [2, 3, 5]
+                    .into_iter()
+                    .map(|step| {
+                        let docs: Vec<_> = (0..3000)
+                            .step_by(step)
+                            .map(|doc| (doc, 1 + doc % 13))
+                            .collect();
+                        let weight = Bm25Weight::for_one_term(
+                            docs.len() as u64,
+                            3000,
+                            average,
+                            Bm25Params::default(),
+                        );
+                        let mut scorer = TermScorer::create_for_test(&docs, &norms, weight);
+                        if pnorms {
+                            let bytes: Vec<_> = docs
+                                .iter()
+                                .map(|&(doc, _)| {
+                                    FieldNormReader::fieldnorm_to_id(norms[doc as usize])
+                                })
+                                .collect();
+                            scorer
+                                .block_cursor()
+                                .set_term_norm_source(Some(FileSlice::from(bytes)), Some(0));
+                        }
+                        scorer
+                    })
+                    .collect();
+                for top_k in [1, 3, 10, 100] {
+                    let expected = compute_checkpoints_naive_intersection(scorers.clone(), top_k);
+                    let actual =
+                        compute_checkpoints_block_wand_intersection(scorers.clone(), top_k);
+                    assert_eq!(
+                        actual.len(),
+                        expected.len(),
+                        "average={average}, k={top_k}, pnorms={pnorms}"
+                    );
+                    for ((doc, score), (expected_doc, expected_score)) in
+                        actual.into_iter().zip(expected)
+                    {
+                        assert_eq!(doc, expected_doc);
+                        assert!(nearly_equals(score, expected_score));
+                    }
+                }
+            }
         }
     }
 
