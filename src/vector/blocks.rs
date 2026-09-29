@@ -7,7 +7,7 @@ use common::{HasLen, OwnedBytes};
 
 use super::metadata::{Partition, Slot, VectorColMetadata};
 use super::storage_io::VectorRead;
-use super::MAX_ELEM_BYTES;
+use super::ENTRY_ALIGN;
 use crate::directory::FileSlice;
 use crate::error::DataCorruption;
 use crate::schema::VectorOptions;
@@ -42,8 +42,8 @@ pub(crate) fn block_align(slots: &[Slot]) -> usize {
 }
 /// Logical Data entry length, including its directory and terminal block count.
 pub(crate) fn data_entry_len(blocks_end: usize, num_blocks: usize) -> usize {
-    let directory_start = align_up(blocks_end, MAX_ELEM_BYTES);
-    align_up(directory_start + (num_blocks + 1) * 12, MAX_ELEM_BYTES) + 8
+    let directory_start = align_up(blocks_end, ENTRY_ALIGN);
+    align_up(directory_start + (num_blocks + 1) * 12, ENTRY_ALIGN) + 8
 }
 /// Records actual entry-relative positions while blocks stream to storage.
 pub(crate) struct BlockDirectory {
@@ -64,7 +64,7 @@ impl BlockDirectory {
     /// Aligns the directory, writes both arrays, then pads the terminal count to eight bytes.
     pub(crate) fn finish(mut self, writer: &mut impl Write) -> io::Result<usize> {
         let blocks_end = *self.byte_starts.last().unwrap() as usize;
-        let directory_start = align_up(blocks_end, MAX_ELEM_BYTES);
+        let directory_start = align_up(blocks_end, ENTRY_ALIGN);
         pad(writer, directory_start - blocks_end)?;
         *self.byte_starts.last_mut().unwrap() = directory_start as u64;
         for offset in &self.byte_starts {
@@ -78,7 +78,7 @@ impl BlockDirectory {
         let len = data_entry_len(blocks_end, num_blocks);
         pad(writer, len - 8 - arrays_end)?;
         writer.write_all(&(num_blocks as u64).to_le_bytes())?;
-        assert_eq!(len % MAX_ELEM_BYTES, 0);
+        assert_eq!(len % ENTRY_ALIGN, 0);
         Ok(len)
     }
 }
@@ -183,7 +183,7 @@ impl Blocks {
             meta,
             metadata_end,
         } = metadata;
-        if entry.len() < 8 || entry.len() % MAX_ELEM_BYTES != 0 {
+        if entry.len() < 8 || entry.len() % ENTRY_ALIGN != 0 {
             return Err(crate::TantivyError::DataCorruption(
                 DataCorruption::comment_only(
                     "invalid vector blocks: missing or misaligned directory footer",
@@ -220,8 +220,8 @@ impl Blocks {
             ))
         })?;
         let padded_rows = row_bytes
-            .checked_add(MAX_ELEM_BYTES - 1)
-            .map(|n| n & !(MAX_ELEM_BYTES - 1))
+            .checked_add(ENTRY_ALIGN - 1)
+            .map(|n| n & !(ENTRY_ALIGN - 1))
             .ok_or_else(|| {
                 crate::TantivyError::DataCorruption(DataCorruption::comment_only(
                     "invalid vector blocks: directory padding overflow",
@@ -259,8 +259,10 @@ impl Blocks {
         }
         let slots = meta.slots();
         let align = block_align(&slots);
+        // With no blocks, the first boundary is the entry-aligned directory itself.
         if block_starts[0] < metadata_end as u64
-            || block_starts[0] - metadata_end as u64 >= MAX_ELEM_BYTES as u64
+            || block_starts[0] - metadata_end as u64
+                >= if count == 0 { ENTRY_ALIGN } else { align } as u64
             || block_starts.last() != Some(&(directory_start as u64))
             || block_starts.iter().any(|&v| v % align as u64 != 0)
             || block_starts.windows(2).any(|v| v[0] > v[1])
@@ -323,7 +325,7 @@ impl Blocks {
                     ))
                 })?
         };
-        if payload_end > directory_start || directory_start - payload_end >= MAX_ELEM_BYTES {
+        if payload_end > directory_start || directory_start - payload_end >= ENTRY_ALIGN {
             return Err(crate::TantivyError::DataCorruption(
                 DataCorruption::comment_only(
                     "invalid vector blocks: invalid block-area padding length",
@@ -543,7 +545,7 @@ mod tests {
             directory.finish(&mut bytes).unwrap();
             let blocks = Blocks::open(FileSlice::from(bytes.clone()), &opts, n, None).unwrap();
             let b = usize::from(n != 0);
-            let start = align_up(block_end, MAX_ELEM_BYTES);
+            let start = align_up(block_end, ENTRY_ALIGN);
             assert_eq!(blocks.block_starts[b], start as u64);
             assert_eq!(blocks.block_rows[b], n);
             assert_eq!(

@@ -39,7 +39,7 @@ use crate::vector::header::{
 use crate::vector::metadata::{SlotType, VectorColMetadata};
 use crate::vector::router::{BuiltRouter, RouterKind};
 use crate::vector::{
-    residual_norm, BoundKind, BoundsBuilder, VectorQuantizationConfig, MAX_ELEM_BYTES, VEC_EXT,
+    residual_norm, BoundKind, BoundsBuilder, VectorQuantizationConfig, ENTRY_ALIGN, VEC_EXT,
 };
 use crate::{DocId, TantivyError};
 
@@ -98,12 +98,12 @@ fn write_empty_field_slots(
     quantization: Option<&VectorQuantizationConfig>,
 ) -> crate::Result<()> {
     let meta = VectorColMetadata::build_ivf(opts, quantization)?;
-    vec_write.align_next_field(MAX_ELEM_BYTES, HEADER_LEN)?;
+    vec_write.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
     let data = vec_write.for_field_with_idx(field, VectorEntry::Data.index());
     let start = data.written_bytes();
     write_metadata(data, &meta)?;
     BlockDirectory::new(data.written_bytes() - start).finish(data)?;
-    assert_eq!((data.written_bytes() - start) as usize % MAX_ELEM_BYTES, 0);
+    assert_eq!((data.written_bytes() - start) as usize % ENTRY_ALIGN, 0);
     {
         let centroids_w =
             centroids_write.for_field_with_idx(field, CentroidSlot::Centroids.index());
@@ -509,7 +509,7 @@ pub(crate) fn merge_ivf(
                 let encode_start = Instant::now();
                 let meta = VectorColMetadata::build_ivf(opts, quantization)?;
                 let slots = meta.slots();
-                timings.pad_bytes += vec_write.align_next_field(MAX_ELEM_BYTES, HEADER_LEN)?;
+                timings.pad_bytes += vec_write.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
                 let data_start = vec_write.written_bytes();
                 let data = vec_write.for_field_with_idx(field, VectorEntry::Data.index());
                 let entry_start = data.written_bytes();
@@ -656,7 +656,7 @@ pub(crate) fn merge_ivf(
                 let entry_len = directory.finish(data)?;
                 timings.pad_bytes += entry_len - pos - (num_centroids + 1) * 12 - 8;
                 assert_eq!(
-                    (data.written_bytes() - entry_start) as usize % MAX_ELEM_BYTES,
+                    (data.written_bytes() - entry_start) as usize % ENTRY_ALIGN,
                     0
                 );
                 data.flush()?;
@@ -899,7 +899,7 @@ mod tests {
             let ivf = vector.index().unwrap();
             for b in 0..ivf.num_clusters() {
                 let range = ivf.cluster_range(b);
-                let docs = vector.cluster_doc_ids(b).unwrap();
+                let docs = vector.cluster_doc_ids(b).unwrap().unwrap();
                 assert!(docs.windows(2).all(|pair| pair[0] < pair[1]));
                 for (row, doc) in range.zip(docs) {
                     assert_eq!(vector.row_id(doc)?, Some(row));
@@ -931,8 +931,8 @@ mod tests {
                 .unwrap();
             assert_eq!(id_map.len(), 1 + segment.max_doc() as usize * 8);
             let start = data.storage_block_ord(0).unwrap();
-            assert_eq!(start % MAX_ELEM_BYTES, 0);
-            assert_eq!(data.len() % MAX_ELEM_BYTES, 0);
+            assert_eq!(start % ENTRY_ALIGN, 0);
+            assert_eq!(data.len() % ENTRY_ALIGN, 0);
             let blocks = Blocks::open(data.clone(), &opts, count, Some(rows))?;
             assert_eq!(
                 data.len(),
@@ -1008,7 +1008,7 @@ mod tests {
                     let ivf = vectors.index().expect("IVF source");
                     let mut rows_by_doc = BTreeMap::new();
                     for cluster in 0..ivf.num_clusters() {
-                        let docs = vectors.cluster_doc_ids(cluster).unwrap();
+                        let docs = vectors.cluster_doc_ids(cluster).unwrap().unwrap();
                         for (row, doc) in ivf.cluster_range(cluster).zip(docs) {
                             rows_by_doc.insert(
                                 doc,
@@ -2500,7 +2500,7 @@ mod tests {
         let vector_reader = segment.vector_index(field)?;
         let alive = crate::fastfield::AliveBitSet::for_test_from_deleted_docs(&[1, 3], 8);
         let live_posting_rows = (0..vector_reader.index().unwrap().num_rows())
-            .filter(|&row| alive.is_alive(vector_reader.doc_id_at(row)))
+            .filter(|&row| alive.is_alive(vector_reader.doc_id_at(row).unwrap()))
             .count();
         assert_eq!(live_posting_rows, 6);
 

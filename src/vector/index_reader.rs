@@ -115,6 +115,7 @@ impl VectorEstimatorMoments {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VectorEstimatorMeasurements {
     source: VectorEstimatorSource,
+    schedule: Vec<(&'static str, u8)>,
     aggregate: Vec<VectorEstimatorMoments>,
     per_query: Vec<Vec<VectorEstimatorMoments>>,
     sample_rows: u64,
@@ -362,12 +363,18 @@ const ERROR_CONE_QUERY_COUNT: usize = 100;
 const ERROR_CONE_TOP_K: usize = 10;
 
 impl VectorErrorAuditMeasurements {
+    /// Ordered quantizer kinds and widths, independent of rotation seeds.
+    pub fn schedule(&self) -> &[(&'static str, u8)] {
+        self.estimator.schedule()
+    }
+
     /// Merges compatible audit measurements.
     ///
     /// # Errors
     ///
-    /// Returns an error when sources or depth counts differ.
+    /// Returns an error when schedules, sources or depth counts differ.
     pub fn merge(&mut self, other: &Self) -> crate::Result<()> {
+        self.estimator.check_schedule(&other.estimator)?;
         if self.source != other.source || self.depths.len() != other.depths.len() {
             return Err(TantivyError::InvalidArgument(
                 "cannot merge exact-E audit measurements with different sources or depths"
@@ -614,6 +621,21 @@ fn observe_error_cone_depth(
 }
 
 impl VectorEstimatorMeasurements {
+    /// Ordered quantizer kinds and widths, independent of rotation seeds.
+    pub fn schedule(&self) -> &[(&'static str, u8)] {
+        &self.schedule
+    }
+
+    fn check_schedule(&self, other: &Self) -> crate::Result<()> {
+        if self.schedule != other.schedule {
+            return Err(TantivyError::InvalidArgument(format!(
+                "cannot merge vector measurements with different schedules: {:?} and {:?}",
+                self.schedule, other.schedule
+            )));
+        }
+        Ok(())
+    }
+
     /// Returns aggregate moments by prefix depth.
     pub fn aggregate(&self) -> &[VectorEstimatorMoments] {
         &self.aggregate
@@ -643,8 +665,9 @@ impl VectorEstimatorMeasurements {
     ///
     /// # Errors
     ///
-    /// Returns an error when measurement shapes differ.
+    /// Returns an error when schedules or measurement shapes differ.
     pub fn merge(&mut self, other: &Self) -> crate::Result<()> {
+        self.check_schedule(other)?;
         if self.aggregate.is_empty() {
             *self = other.clone();
             return Ok(());
@@ -1868,12 +1891,19 @@ impl VectorIndexReader {
         }
 
         let mut first_row_by_doc = BTreeMap::new();
-        for row in 0..index.num_rows() {
-            let doc_id = self.doc_id_at(row);
-            if alive.is_some_and(|alive| !alive.is_alive(doc_id)) {
+        let mut docs = Vec::new();
+        for cluster in 0..index.num_clusters() {
+            let rows = index.cluster_range(cluster);
+            if rows.is_empty() {
                 continue;
             }
-            first_row_by_doc.entry(doc_id).or_insert(row);
+            self.read_doc_ids(cluster, &mut docs)?;
+            for (row, &doc_id) in rows.zip(&docs) {
+                if alive.is_some_and(|alive| !alive.is_alive(doc_id)) {
+                    continue;
+                }
+                first_row_by_doc.entry(doc_id).or_insert(row);
+            }
         }
         let target = count.min(first_row_by_doc.len());
         if target == 0 {
@@ -1894,7 +1924,7 @@ impl VectorIndexReader {
     }
 
     /// Counts distinct live IVF documents without decoding vector rows.
-    pub fn live_distinct_vector_count(&self, alive: Option<&AliveBitSet>) -> usize {
+    pub fn live_distinct_vector_count(&self, alive: Option<&AliveBitSet>) -> crate::Result<usize> {
         self.live_posting_row_count(alive)
     }
 
@@ -1950,6 +1980,21 @@ impl VectorIndexReader {
             source,
             estimator: VectorEstimatorMeasurements {
                 source,
+                schedule: quantization
+                    .index_ctx()
+                    .meta
+                    .layers()
+                    .iter()
+                    .map(|q| {
+                        (
+                            match q {
+                                super::metadata::Quantizer::SignPlane { .. } => "SignPlane",
+                                super::metadata::Quantizer::GridPlane { .. } => "GridPlane",
+                            },
+                            q.bits(),
+                        )
+                    })
+                    .collect(),
                 aggregate: vec![VectorEstimatorMoments::default(); layer_count],
                 per_query: vec![
                     vec![VectorEstimatorMoments::default(); layer_count];
@@ -1977,7 +2022,7 @@ impl VectorIndexReader {
             .iter()
             .map(|query| PreparedQuery::new(self.options.metric(), Arc::new(query.values.clone())))
             .collect();
-        let live_row_count = self.live_posting_row_count(alive);
+        let live_row_count = self.live_posting_row_count(alive)?;
         let target_rows = sample_rows.min(live_row_count);
         measurements.estimator.sample_rows = u64::try_from(target_rows).map_err(|_| {
             TantivyError::InvalidArgument(
@@ -1993,11 +2038,16 @@ impl VectorIndexReader {
         let mut live_rows_seen = 0usize;
         let mut next_sample_ordinal = 0usize;
 
+        let mut docs = Vec::new();
         for cluster in 0..index.num_clusters() {
+            let rows = index.cluster_range(cluster);
+            if rows.is_empty() {
+                continue;
+            }
+            self.read_doc_ids(cluster, &mut docs)?;
             let centroid_row = &centroid_bytes[cluster * centroid_stride..][..centroid_stride];
             let centroid = decode_row::<f32>(centroid_row, self.options.dim())?;
-            for row in index.cluster_range(cluster) {
-                let row_doc = self.doc_id_at(row);
+            for (row, &row_doc) in rows.zip(&docs) {
                 if alive.is_some_and(|alive| !alive.is_alive(row_doc)) {
                     continue;
                 }
@@ -2223,7 +2273,7 @@ impl VectorIndexReader {
         }
 
         let measurement_ctx = Arc::clone(quantization.index_ctx());
-        let live_docs = self.live_distinct_vector_count(alive);
+        let live_docs = self.live_distinct_vector_count(alive)?;
         if live_docs < ERROR_CONE_TOP_K {
             return Err(TantivyError::InvalidArgument(format!(
                 "exact-E cone audit requires at least {ERROR_CONE_TOP_K} live documents; found \
@@ -2240,9 +2290,14 @@ impl VectorIndexReader {
         let centroid_stride = self.options.bytes_per_vector();
         let centroid_bytes = index.centroid_bytes()?;
 
+        let mut docs = Vec::new();
         for cluster in 0..index.num_clusters() {
-            for row in index.cluster_range(cluster) {
-                let doc = self.doc_id_at(row);
+            let rows = index.cluster_range(cluster);
+            if rows.is_empty() {
+                continue;
+            }
+            self.read_doc_ids(cluster, &mut docs)?;
+            for (row, &doc) in rows.zip(&docs) {
                 if alive.is_some_and(|alive| !alive.is_alive(doc)) {
                     continue;
                 }
@@ -2300,9 +2355,12 @@ impl VectorIndexReader {
             candidates.sigmas.reserve(row_count);
             for cluster in 0..index.num_clusters() {
                 let rows = index.cluster_range(cluster);
+                if rows.is_empty() {
+                    continue;
+                }
+                self.read_doc_ids(cluster, &mut docs)?;
                 let layer = quantization.layers()[0].read_batch_in_block(cluster, rows.clone())?;
-                for row in rows {
-                    let doc = self.doc_id_at(row);
+                for (row, &doc) in rows.zip(&docs) {
                     if alive.is_some_and(|alive| !alive.is_alive(doc)) {
                         continue;
                     }
@@ -2489,34 +2547,28 @@ impl VectorIndexReader {
     }
 
     /// Returns the number of live IVF posting rows.
-    pub fn live_posting_row_count(&self, alive: Option<&AliveBitSet>) -> usize {
+    pub fn live_posting_row_count(&self, alive: Option<&AliveBitSet>) -> crate::Result<usize> {
         let Some(index) = &self.index else {
-            return 0;
+            return Ok(0);
         };
         let Some(alive) = alive else {
-            return index.num_rows();
+            return Ok(index.num_rows());
         };
-        (0..index.num_clusters())
-            .map(|cluster| {
-                self.row_doc_ids(index.cluster_range(cluster))
-                    .expect("readable document ids")
-                    .into_iter()
-                    .filter(|&doc| alive.is_alive(doc))
-                    .count()
-            })
-            .sum()
+        let mut docs = Vec::new();
+        let mut count = 0;
+        for cluster in 0..index.num_clusters() {
+            self.read_doc_ids(cluster, &mut docs)?;
+            count += docs.iter().filter(|&&doc| alive.is_alive(doc)).count();
+        }
+        Ok(count)
     }
 
-    /// `true` if `doc_id` has a stored vector.
-    pub fn contains(&self, doc_id: DocId) -> bool {
-        self.row_id(doc_id)
-            .expect("readable document location")
-            .is_some()
+    /// Returns whether the document has a vector, propagating storage errors.
+    pub fn contains(&self, doc_id: DocId) -> crate::Result<bool> {
+        Ok(self.row_id(doc_id)?.is_some())
     }
 
-    /// The raw little-endian bytes of `doc_id`'s vector, fetched with one
-    /// stride-sized ranged read; `None` if the doc has no vector.
-    /// Returns one document's raw little-endian vector bytes.
+    /// Returns one document's raw little-endian vector bytes, or None if absent.
     ///
     /// # Errors
     ///
@@ -2546,12 +2598,7 @@ impl VectorIndexReader {
         self.vector_bytes_for_row(row).map(Some)
     }
 
-    /// The raw bytes of the single vector row at `row` of the dense rows
-    /// slot, fetched with one stride-sized ranged read
-    /// (`row * stride..(row + 1) * stride`). The caller resolves `row`
-    /// beforehand (e.g. from a cluster's row range), so no doc→row lookup
-    /// happens here.
-    /// Returns one dense vector row by row index.
+    /// Returns one dense vector row by row index without a document lookup.
     ///
     /// # Errors
     ///
@@ -2634,10 +2681,13 @@ impl VectorIndexReader {
     }
 
     /// Reads a clustered document id from its Data column, or selects a flat bitmap row.
-    /// Panics if storage is corrupt or unreadable; fallible operations use `row_doc_ids`.
-    pub fn doc_id_at(&self, row: usize) -> DocId {
-        self.row_doc_ids(row..row + 1)
-            .expect("readable document ids")[0]
+    pub fn doc_id_at(&self, row: usize) -> crate::Result<DocId> {
+        if row >= self.num_vectors() {
+            return Err(TantivyError::InvalidArgument(format!(
+                "vector row {row} is out of bounds"
+            )));
+        }
+        Ok(self.row_doc_ids(row..row + 1)?[0])
     }
     /// Reads and validates ascending document ids without opening the clustered IdMap.
     pub(crate) fn row_doc_ids(&self, rows: Range<usize>) -> crate::Result<Vec<DocId>> {
@@ -2659,12 +2709,16 @@ impl VectorIndexReader {
         Ok(result)
     }
     /// Returns sorted document ids assigned to a cluster, or None for an invalid cluster.
-    pub fn cluster_doc_ids(&self, cluster: usize) -> Option<Vec<DocId>> {
-        let index = self.index.as_ref()?;
-        (cluster < index.num_clusters()).then(|| {
-            self.row_doc_ids(index.cluster_range(cluster))
-                .expect("readable document ids")
-        })
+    pub fn cluster_doc_ids(&self, cluster: usize) -> crate::Result<Option<Vec<DocId>>> {
+        let Some(index) = &self.index else {
+            return Ok(None);
+        };
+        if cluster >= index.num_clusters() {
+            return Ok(None);
+        }
+        let mut docs = Vec::new();
+        self.read_doc_ids(cluster, &mut docs)?;
+        Ok(Some(docs))
     }
     /// Resolves one document by direct location or flat bitmap rank, validating stored coordinates.
     pub(crate) fn row_id(&self, doc_id: DocId) -> crate::Result<Option<usize>> {
@@ -2717,32 +2771,6 @@ impl VectorIndexReader {
     pub(crate) fn read_cluster_rows(&self, cluster: usize) -> crate::Result<OwnedBytes> {
         let rows = self.rows_slice.block_rows[cluster]..self.rows_slice.block_rows[cluster + 1];
         self.rows_slice.read_column(0, rows)
-    }
-
-    /// Walks source blocks in row order, decoding document ids separately from rows.
-    pub(crate) fn for_each_row(
-        &self,
-        mut visit: impl FnMut(usize, DocId, &[u8]) -> crate::Result<()>,
-    ) -> crate::Result<()> {
-        let mut docs = Vec::new();
-        for b in 0..self.rows_slice.block_rows.len() - 1 {
-            let bytes = self.read_cluster_rows(b)?;
-            if self.rows_slice.clustered() {
-                self.read_doc_ids(b, &mut docs)?;
-            } else {
-                docs = self.row_doc_ids(
-                    self.rows_slice.block_rows[b]..self.rows_slice.block_rows[b + 1],
-                )?;
-            }
-            for (local, (row, &doc)) in bytes
-                .chunks_exact(self.options.bytes_per_vector())
-                .zip(&docs)
-                .enumerate()
-            {
-                visit(self.rows_slice.block_rows[b] + local, doc, row)?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -3057,6 +3085,14 @@ mod tests {
                 matches!(error, TantivyError::DataCorruption(_)),
                 "column=DocIds values={docs:?}: {error}"
             );
+            assert!(matches!(
+                reader.doc_id_at(0),
+                Err(TantivyError::DataCorruption(_))
+            ));
+            assert!(matches!(
+                reader.doc_id_at(3),
+                Err(TantivyError::InvalidArgument(_))
+            ));
         }
         Ok(())
     }
@@ -3337,6 +3373,7 @@ mod tests {
     fn estimator_merge_sums_rows_and_preserves_query_count() {
         let measurement = |sample_rows, query_count, value| VectorEstimatorMeasurements {
             source: VectorEstimatorSource::Provided,
+            schedule: vec![("SignPlane", 1)],
             aggregate: vec![VectorEstimatorMoments {
                 sample_count: 1,
                 normalized_error_sum: value,
@@ -3366,9 +3403,56 @@ mod tests {
     }
 
     #[test]
+    fn measurement_merges_reject_different_schedules() {
+        let measurement = |bits: &[u8]| VectorEstimatorMeasurements {
+            source: VectorEstimatorSource::Provided,
+            schedule: bits
+                .iter()
+                .map(|&bits| (if bits == 1 { "SignPlane" } else { "GridPlane" }, bits))
+                .collect(),
+            aggregate: vec![VectorEstimatorMoments::default(); bits.len()],
+            per_query: vec![vec![VectorEstimatorMoments::default(); bits.len()]],
+            sample_rows: 0,
+            query_count: 1,
+        };
+        for (left, right) in [(&[1][..], &[1, 4][..]), (&[1, 4], &[2, 4])] {
+            let a = measurement(left);
+            let b = measurement(right);
+            let expected = format!(
+                "different schedules: {:?} and {:?}",
+                a.schedule(),
+                b.schedule()
+            );
+            assert!(a
+                .clone()
+                .merge(&b)
+                .unwrap_err()
+                .to_string()
+                .contains(&expected));
+            let mut audit = VectorErrorAuditMeasurements {
+                source: VectorEstimatorSource::Provided,
+                depths: vec![VectorErrorDepthMeasurements::default(); left.len()],
+                estimator: a,
+            };
+            assert_eq!(audit.schedule(), audit.estimator.schedule());
+            let other = VectorErrorAuditMeasurements {
+                source: VectorEstimatorSource::Provided,
+                depths: vec![VectorErrorDepthMeasurements::default(); right.len()],
+                estimator: b,
+            };
+            assert!(audit
+                .merge(&other)
+                .unwrap_err()
+                .to_string()
+                .contains(&expected));
+        }
+    }
+
+    #[test]
     fn estimator_error_sign_is_estimate_minus_exact() {
         let mut measurements = VectorEstimatorMeasurements {
             source: VectorEstimatorSource::Provided,
+            schedule: vec![("SignPlane", 1)],
             aggregate: vec![VectorEstimatorMoments::default()],
             per_query: vec![vec![VectorEstimatorMoments::default()]],
             sample_rows: 1,

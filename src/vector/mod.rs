@@ -18,6 +18,9 @@ mod backend;
 mod blocks;
 mod element;
 pub use element::MAX_ELEM_BYTES;
+/// Fixed alignment of Data entries and their block directories.
+pub const ENTRY_ALIGN: usize = 8;
+const _: () = assert!(MAX_ELEM_BYTES <= ENTRY_ALIGN);
 mod bounds;
 mod collector;
 mod distance;

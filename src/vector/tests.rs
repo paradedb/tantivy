@@ -409,6 +409,7 @@ fn ivf_fixture_uses_custom_centroids_for_assignment() -> crate::Result<()> {
         for cluster_ord in 0..centroids.len() {
             let doc_ids = vec_reader
                 .cluster_doc_ids(cluster_ord)
+                .unwrap()
                 .expect("in-bounds cluster");
             for doc in doc_ids {
                 let vector: Vec<f32> = vec_reader

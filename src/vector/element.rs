@@ -40,6 +40,6 @@ const fn max_elem_bytes() -> usize {
     largest
 }
 
-/// Alignment of vector Data entry boundaries, derived from all decoder element sizes.
+/// Maximum decoder element size, bounding column and block alignment.
 /// Storage providers can use this to check page-data starts and usable page lengths.
 pub const MAX_ELEM_BYTES: usize = max_elem_bytes();

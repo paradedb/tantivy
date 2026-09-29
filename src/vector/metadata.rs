@@ -12,7 +12,7 @@ use crate::schema::{Metric, VectorDType, VectorOptions};
 /// Default flat row-group size; the actual size is persisted with each field.
 pub(crate) const FLAT_ROWS_PER_BLOCK: u32 = 16_384;
 
-/// Per-field storage contract, also the query-preparation cache key.
+/// Per-field storage and decoding contract.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum VectorColMetadata {
@@ -48,7 +48,7 @@ pub enum Partition {
     },
 }
 /// Tagged encode/decode contract; a semantic change requires a new variant.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Quantizer {
     /// One-bit signs scored as popcounted words.
@@ -135,25 +135,38 @@ impl Grid {
     pub fn rho_model(&self) -> f64 {
         self.rho_model
     }
-
-    fn query_fields(&self) -> (u64, Vec<u32>) {
-        (
-            self.rho_model.to_bits(),
-            self.points.iter().map(|p| p.to_bits()).collect(),
-        )
-    }
 }
-/// Uses precisely the same query fields as Hash, including signed zero.
-impl PartialEq for Grid {
+/// Compares encoder and query parameters by their exact stored bits.
+impl PartialEq for Quantizer {
     fn eq(&self, other: &Self) -> bool {
         self.query_fields() == other.query_fields()
     }
 }
-impl Eq for Grid {}
-/// Hashes query-relevant bits without the descriptive grid version.
-impl Hash for Grid {
+impl Eq for Quantizer {}
+impl Hash for Quantizer {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.query_fields().hash(state);
+    }
+}
+impl Quantizer {
+    fn query_fields(&self) -> (u8, u8, Rotation, u64, Vec<u32>) {
+        match self {
+            Self::SignPlane {
+                rotation,
+                rho_model,
+            } => (0, 1, *rotation, rho_model.0, Vec::new()),
+            Self::GridPlane {
+                bits,
+                rotation,
+                grid,
+            } => (
+                1,
+                *bits,
+                *rotation,
+                grid.rho_model.to_bits(),
+                grid.points.iter().map(|p| p.to_bits()).collect(),
+            ),
+        }
     }
 }
 
@@ -433,6 +446,20 @@ impl VectorColMetadata {
                     DataCorruption::comment_only("invalid vector metadata: layer count"),
                 ));
             }
+            super::quantization::validate_quantization_values(
+                f.dim as usize,
+                layers.iter().map(|q| match q {
+                    Quantizer::SignPlane { rho_model, .. } => (rho_model.value(), None),
+                    Quantizer::GridPlane { grid, .. } => {
+                        (grid.rho_model, Some(grid.points.as_slice()))
+                    }
+                }),
+            )
+            .map_err(|message| {
+                crate::TantivyError::DataCorruption(DataCorruption::comment_only(format!(
+                    "invalid vector metadata: {message}"
+                )))
+            })?;
             for quant in layers {
                 if let Quantizer::GridPlane { bits, grid, .. } = quant {
                     if !(2..=4).contains(bits) || grid.points.len() != 1 << bits {
@@ -497,14 +524,6 @@ impl VectorColMetadata {
                 }
             })
             .unzip()
-    }
-    fn query_fields(&self) -> Option<(u32, u8, &[Quantizer])> {
-        match self {
-            Self::Plain(_) => None,
-            Self::Quantized { field, layers } => {
-                Some((field.dim, metric_tag(field.metric), layers))
-            }
-        }
     }
     /// Serializes the V4 grammar using explicit tag maps, never Rust discriminants.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
@@ -708,24 +727,8 @@ impl Rotation {
         }
     }
 }
-/// Compares only query inputs; full storage identity must use serialized bytes.
-impl PartialEq for VectorColMetadata {
-    fn eq(&self, other: &Self) -> bool {
-        self.query_fields() == other.query_fields()
-    }
-}
-impl Eq for VectorColMetadata {}
-/// Shares the equality helper so omitted storage geometry cannot split cache keys.
-impl Hash for VectorColMetadata {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.query_fields().hash(state);
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::hash_map::DefaultHasher;
-
     use super::super::quantization::VectorQuantizationLayer;
     use super::*;
     fn metadata(metric: Metric, schedule: &[u8]) -> VectorColMetadata {
@@ -740,11 +743,6 @@ mod tests {
         )
         .unwrap();
         VectorColMetadata::build_ivf(&opts, Some(&config)).unwrap()
-    }
-    fn hash(meta: &VectorColMetadata) -> u64 {
-        let mut h = DefaultHasher::new();
-        meta.hash(&mut h);
-        h.finish()
     }
     // Pins ordered slot semantics, widths, strides, and scan-band ownership.
     #[test]
@@ -877,70 +875,52 @@ mod tests {
             }
         }
     }
-    // Storage geometry and descriptive grid versions never split prepared-query cache keys.
     #[test]
-    fn query_identity_uses_only_semantic_bits() {
-        let original = metadata(Metric::L2, &[1, 4]);
-        let mut changed = original.clone();
-        if let VectorColMetadata::Quantized { field, layers } = &mut changed {
-            field.norm_policy = VectorNormPolicy::UnitL2;
-            field.partition = Partition::Uniform { rows_per_block: 7 };
-            if let Quantizer::GridPlane { grid, .. } = &mut layers[1] {
-                grid.version += 1;
-            }
-        }
-        assert_eq!(original, changed);
-        assert_eq!(hash(&original), hash(&changed));
-        assert_ne!(original.to_bytes(), changed.to_bytes());
-        for change in 0..8 {
-            let mut changed = original.clone();
-            if let VectorColMetadata::Quantized { field, layers } = &mut changed {
-                match change {
-                    0 => field.dim += 1,
-                    1 => field.metric = Metric::Dot,
-                    2 => {
-                        if let Quantizer::SignPlane { rotation, .. } = &mut layers[0] {
-                            *rotation = Rotation::None;
-                        }
-                    }
-                    3 => {
-                        if let Quantizer::SignPlane { rho_model, .. } = &mut layers[0] {
-                            rho_model.0 += 1;
-                        }
-                    }
-                    4 => {
-                        if let Quantizer::GridPlane { bits, .. } = &mut layers[1] {
-                            *bits = 3;
-                        }
-                    }
-                    5 => {
-                        if let Quantizer::GridPlane { grid, .. } = &mut layers[1] {
-                            grid.points[0] = f32::from_bits(grid.points[0].to_bits() ^ 1);
-                        }
-                    }
-                    6 => {
-                        if let Quantizer::SignPlane { rotation, .. } = &mut layers[0] {
-                            *rotation = Rotation::SeededFhtChaCha8 { seed: 18 };
-                        }
-                    }
-                    _ => {
-                        if let Quantizer::GridPlane { grid, .. } = &mut layers[1] {
-                            grid.rho_model = f64::from_bits(grid.rho_model.to_bits() + 1);
-                        }
+    fn invalid_model_values_fail_at_open() {
+        use crate::directory::FileSlice;
+        use crate::vector::blocks::{write_metadata, BlockMetadata};
+        for case in 0..7 {
+            let mut meta = metadata(Metric::L2, &[1, 4]);
+            let VectorColMetadata::Quantized { field, layers } = &mut meta else {
+                unreachable!()
+            };
+            match case {
+                0..=3 => {
+                    let Quantizer::GridPlane { grid, .. } = &mut layers[1] else {
+                        unreachable!()
+                    };
+                    match case {
+                        0 => grid.points[0] = f32::NAN,
+                        1 => grid.points[1] = grid.points[0],
+                        2 => grid.rho_model = -1.0,
+                        _ => grid.rho_model = f64::NAN,
                     }
                 }
+                4 | 5 => {
+                    let Quantizer::SignPlane { rho_model, .. } = &mut layers[0] else {
+                        unreachable!()
+                    };
+                    rho_model.0 = if case == 4 {
+                        (-1.0_f64).to_bits()
+                    } else {
+                        f64::NAN.to_bits()
+                    };
+                }
+                _ => field.dim = 63,
             }
-            assert_ne!(original, changed);
+            let opts = VectorOptions::new(field.dim as usize, Metric::L2);
+            let mut bytes = Vec::new();
+            write_metadata(&mut bytes, &meta).unwrap();
+            assert!(
+                matches!(
+                    BlockMetadata::open(FileSlice::from(bytes), &opts, true),
+                    Err(crate::TantivyError::DataCorruption(_))
+                ),
+                "model corruption case {case}"
+            );
         }
-        let g = Grid {
-            version: 1,
-            points: vec![0.0],
-            rho_model: 1.0,
-        };
-        let mut other = g.clone();
-        other.points[0] = -0.0;
-        assert_ne!(g, other);
     }
+
     // Unknown tags and malformed field contracts must fail before opening payloads.
     #[test]
     fn metadata_rejects_corruption() {

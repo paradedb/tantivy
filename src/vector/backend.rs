@@ -4793,6 +4793,7 @@ mod tests {
         let admitted: Vec<DocId> = segment_reader
             .vector_index(embed_field)?
             .cluster_doc_ids(0)
+            .unwrap()
             .expect("cluster 0 doc ids")
             .into_iter()
             .take(3)
@@ -5709,6 +5710,7 @@ mod tests {
         let cluster0 = segment_reader
             .vector_index(embed_field)?
             .cluster_doc_ids(0)
+            .unwrap()
             .expect("ivf cluster 0");
         assert_eq!(cluster0.len(), DOCS_PER_CLUSTER);
         assert!(

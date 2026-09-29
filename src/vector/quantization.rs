@@ -8,6 +8,31 @@ use serde::{Deserialize, Serialize};
 use crate::schema::{FieldType, Metric, Schema, VectorDType, VectorOptions};
 use crate::TantivyError;
 
+/// Validates model values shared by settings and stored segment metadata.
+pub(crate) fn validate_quantization_values<'a>(
+    dim: usize,
+    models: impl IntoIterator<Item = (f64, Option<&'a [f32]>)>,
+) -> Result<(), String> {
+    if dim < 64 {
+        return Err(
+            "quantization requires dimension ≥ 64; the quantization error model is not validated \
+             below this"
+                .into(),
+        );
+    }
+    for (rho, points) in models {
+        if !rho.is_finite() || rho < 0.0 {
+            return Err("rho_model must be finite and non-negative".into());
+        }
+        if points.is_some_and(|points| {
+            points.iter().any(|p| !p.is_finite()) || points.windows(2).any(|p| p[0] >= p[1])
+        }) {
+            return Err("grid points must be finite and strictly increasing".into());
+        }
+    }
+    Ok(())
+}
+
 /// Settings identifier for the vector quantization format.
 pub const VECTOR_QUANTIZATION_FORMAT_VERSION: u32 = 3;
 /// Version of the persisted exact-density Lloyd-Max grid representation.
@@ -192,13 +217,7 @@ impl VectorQuantizationConfig {
                 self.format_version
             )));
         }
-        if self.dim < 64 {
-            return Err(invalid(
-                "quantization requires dimension ≥ 64; the quantization error model is not \
-                 validated below this"
-                    .to_string(),
-            ));
-        }
+        validate_quantization_values(self.dim, std::iter::empty()).map_err(invalid)?;
         if self.dim != options.dim() {
             return Err(invalid(format!(
                 "dimension {} does not match schema dimension {}",
@@ -275,20 +294,11 @@ impl VectorQuantizationConfig {
                     grid.points.len()
                 )));
             }
-            if grid.points.iter().any(|point| !point.is_finite())
-                || grid.points.windows(2).any(|pair| pair[0] >= pair[1])
-            {
-                return Err(invalid(format!(
-                    "grid width {} points must be finite and strictly increasing",
-                    grid.bits
-                )));
-            }
-            if !grid.rho_model.is_finite() || grid.rho_model < 0.0 {
-                return Err(invalid(format!(
-                    "grid width {} rho_model must be finite and non-negative",
-                    grid.bits
-                )));
-            }
+            validate_quantization_values(
+                self.dim,
+                std::iter::once((grid.rho_model, Some(grid.points.as_slice()))),
+            )
+            .map_err(invalid)?;
         }
         if present_grids != model_widths || !required_point_grids.is_subset(&present_grids) {
             return Err(invalid(format!(

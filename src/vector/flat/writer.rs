@@ -13,7 +13,7 @@ use crate::vector::blocks::{align_up, block_align, pad, write_metadata, BlockDir
 use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::header::{write_vector_header, VectorEntry, HEADER_LEN};
 use crate::vector::metadata::{VectorColMetadata, FLAT_ROWS_PER_BLOCK};
-use crate::vector::{MAX_ELEM_BYTES, VEC_EXT};
+use crate::vector::{ENTRY_ALIGN, VEC_EXT};
 use crate::{DocId, TantivyError};
 
 /// Buffers one vector field before serialization.
@@ -151,7 +151,7 @@ impl PluginWriter for FlatVecWriter {
             id_maps.push((field, present));
             let meta = VectorColMetadata::build_flat(&buf.opts);
             let align = block_align(&meta.slots());
-            composite.align_next_field(MAX_ELEM_BYTES, HEADER_LEN)?;
+            composite.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
             let data = composite.for_field_with_idx(field, VectorEntry::Data.index());
             let start = data.written_bytes();
             write_metadata(data, &meta)?;
@@ -165,7 +165,7 @@ impl PluginWriter for FlatVecWriter {
                 directory.push(data.written_bytes() - start, rows);
             }
             directory.finish(data)?;
-            assert_eq!((data.written_bytes() - start) as usize % MAX_ELEM_BYTES, 0);
+            assert_eq!((data.written_bytes() - start) as usize % ENTRY_ALIGN, 0);
             data.flush()?;
         }
         for (field, present) in id_maps {

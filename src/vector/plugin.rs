@@ -49,7 +49,7 @@ impl SegmentPlugin for VectorPlugin {
     }
 }
 
-/// Resolves target-document order to source rows by walking each source's exact block spans.
+/// Resolves target-document order to source rows using document columns or flat maps.
 /// Target order fixes training samples and assignment batches independently of source clustering.
 pub(crate) fn merge_source_rows(
     ctx: &PluginMergeContext,
@@ -68,7 +68,7 @@ pub(crate) fn merge_source_rows(
     }
     let mut source_rows = vec![None; count];
     for (segment, reader) in readers.iter().enumerate() {
-        reader.for_each_row(|row, doc, _bytes| {
+        let mut record = |row, doc| -> crate::Result<()> {
             if ctx.cancel.wants_cancel() {
                 return Err(crate::TantivyError::Cancelled);
             }
@@ -81,7 +81,24 @@ pub(crate) fn merge_source_rows(
                 source_rows[*new_doc as usize] = Some((segment, row));
             }
             Ok(())
-        })?;
+        };
+        if let Some(index) = reader.index() {
+            let mut docs = Vec::new();
+            for cluster in 0..index.num_clusters() {
+                reader.read_doc_ids(cluster, &mut docs)?;
+                for (row, &doc) in index.cluster_range(cluster).zip(&docs) {
+                    record(row, doc)?;
+                }
+            }
+        } else {
+            for (row, doc) in reader
+                .row_doc_ids(0..reader.num_vectors())?
+                .into_iter()
+                .enumerate()
+            {
+                record(row, doc)?;
+            }
+        }
     }
     Ok(source_rows)
 }

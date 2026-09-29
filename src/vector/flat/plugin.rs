@@ -10,7 +10,7 @@ use crate::schema::FieldType;
 use crate::vector::blocks::{align_up, block_align, pad, write_metadata, BlockDirectory};
 use crate::vector::header::{write_vector_header, VectorEntry, HEADER_LEN};
 use crate::vector::metadata::{VectorColMetadata, FLAT_ROWS_PER_BLOCK};
-use crate::vector::{MAX_ELEM_BYTES, VEC_EXT};
+use crate::vector::{ENTRY_ALIGN, VEC_EXT};
 use crate::DocId;
 
 /// Merges source vectors into a flat target segment.
@@ -53,7 +53,7 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
         {
             let meta = VectorColMetadata::build_flat(opts);
             let align = block_align(&meta.slots());
-            composite.align_next_field(MAX_ELEM_BYTES, HEADER_LEN)?;
+            composite.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
             let rows_w = composite.for_field_with_idx(field, VectorEntry::Data.index());
             let start = rows_w.written_bytes();
             write_metadata(rows_w, &meta)?;
@@ -83,10 +83,7 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
                 directory.push(rows_w.written_bytes() - start, target_present.len() as u32);
             }
             directory.finish(rows_w)?;
-            assert_eq!(
-                (rows_w.written_bytes() - start) as usize % MAX_ELEM_BYTES,
-                0
-            );
+            assert_eq!((rows_w.written_bytes() - start) as usize % ENTRY_ALIGN, 0);
             rows_w.flush()?;
         }
 

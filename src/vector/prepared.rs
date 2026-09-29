@@ -475,14 +475,14 @@ mod tests {
         .unwrap();
         let first_index = Arc::new(QuantizedIndexCtx::from_config(config.clone()).unwrap());
         let query = QuantizedQueryCtx::new(Arc::clone(&first_index), vec![0.5_f32; 100]);
-        assert!(query.index.meta == first_index.meta);
+        assert!(Arc::ptr_eq(&query.index.meta, &first_index.meta));
 
         let other_segment = Arc::new(QuantizedIndexCtx::from_config(config.clone()).unwrap());
-        assert!(query.index.meta == other_segment.meta);
+        assert_eq!(query.index.meta.to_bytes(), other_segment.meta.to_bytes());
 
         config.layers[0].seed = 0xfeed_2002;
         let reseeded_index = Arc::new(QuantizedIndexCtx::from_config(config).unwrap());
-        assert!(query.index.meta != reseeded_index.meta);
+        assert_ne!(query.index.meta.to_bytes(), reseeded_index.meta.to_bytes());
     }
 
     #[test]

@@ -958,3 +958,108 @@ fn exact_filter_reads_only_survivor_pages() -> crate::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn diagnostics_skip_empty_clusters() -> crate::Result<()> {
+    use crate::vector::index_reader::{VectorEstimatorQuery, VectorEstimatorSource};
+    let (index, _) = fixture(Metric::Cosine, &[1, 4])?;
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let segment = &searcher.segment_readers()[0];
+    let vectors = segment.vector_index(index.schema().get_field("embedding")?)?;
+    assert!(vectors.index().unwrap().cluster_range(0).is_empty());
+    let queries = vectors
+        .sample_estimator_pseudo_queries(3, segment.alive_bitset())?
+        .unwrap();
+    assert_eq!(queries.len(), 3);
+    let audit = vectors
+        .audit_error_queries(
+            VectorEstimatorSource::HeldOut,
+            &queries,
+            30,
+            segment.alive_bitset(),
+        )?
+        .unwrap();
+    assert_eq!(audit.schedule(), &[("SignPlane", 1), ("GridPlane", 4)]);
+    assert_eq!(audit.estimator.sample_rows(), 30);
+    let estimates = vectors
+        .measure_estimator_queries(
+            VectorEstimatorSource::HeldOut,
+            &queries,
+            30,
+            segment.alive_bitset(),
+        )?
+        .unwrap();
+    assert_eq!(estimates, audit.estimator);
+    let external: Vec<_> = (0..100)
+        .map(|doc| VectorEstimatorQuery {
+            values: input_vector(doc + DOCS),
+            excluded_doc_id: None,
+        })
+        .collect();
+    let cone = vectors
+        .audit_error_cone(&external, segment.alive_bitset())?
+        .unwrap();
+    assert_eq!(cone.query_count, 100);
+    assert_eq!(cone.depths.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn merge_source_addresses_read_only_document_columns() -> crate::Result<()> {
+    use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
+    let (index, directory) = fixture(Metric::Cosine, &[1, 4])?;
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let segments = searcher.segment_readers();
+    let segment = &segments[0];
+    let vectors = segment.vector_index(index.schema().get_field("embedding")?)?;
+    let ranges = doc_column_ranges(&vectors, &directory)?;
+    let docs: Vec<_> = (0..segment.max_doc())
+        .filter(|&doc| {
+            segment
+                .alive_bitset()
+                .is_none_or(|alive| alive.is_alive(doc))
+        })
+        .map(|doc| crate::DocAddress::new(0, doc))
+        .collect();
+    let mapping =
+        SegmentDocIdMapping::new(docs.clone(), MappingType::StackedWithDeletes, vec![None]);
+    let target = index.new_segment();
+    let schema = index.schema();
+    let context = crate::plugin::PluginMergeContext {
+        readers: segments,
+        doc_id_mapping: &mapping,
+        target_segment: &target,
+        schema: &schema,
+        settings: index.settings(),
+        ignore_store: false,
+        cancel: &|| false,
+    };
+    directory.reads.lock().unwrap().clear();
+    let rows = crate::vector::plugin::merge_source_rows(&context, &[Arc::clone(&vectors)])?;
+    let reads = directory.reads.lock().unwrap().clone();
+    let expected: Vec<_> = ranges.into_iter().flatten().collect();
+    assert_eq!(
+        reads
+            .iter()
+            .map(|(_, range)| range.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(rows.len(), docs.len());
+    for (source, target) in rows.into_iter().zip(docs) {
+        match source {
+            Some((segment, row)) => {
+                assert_eq!(segment, 0);
+                assert_eq!(
+                    vectors.doc_id_at(row)?,
+                    target.doc_id,
+                    "row={row} column=DocIds"
+                );
+            }
+            None => assert!(!vectors.contains(target.doc_id)?),
+        }
+    }
+    Ok(())
+}

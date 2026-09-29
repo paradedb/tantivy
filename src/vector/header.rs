@@ -83,7 +83,7 @@ impl CentroidSlot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
 pub(crate) enum VectorEntry {
-    /// Row-to-document map, read whole at open.
+    /// Lazy doc-to-location map for clustered fields; identity or bitmap for flat fields.
     IdMap = 0,
     /// Stored metadata and block columns.
     Data = 1,

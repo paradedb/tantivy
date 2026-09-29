@@ -16,7 +16,7 @@ Each vector field declares exactly these composite entries:
 | 1 | Data | Field metadata, aligned blocks, and a stored block directory |
 
 Missing entries or any additional entry index are corruption. All Data entries
-precede all IdMaps. Data entries start and end on `MAX_ELEM_BYTES` boundaries
+precede all IdMaps. Data entries start and end on `ENTRY_ALIGN` (8-byte) boundaries
 in absolute file offsets. IdMaps follow all Data entries and need no alignment.
 The composite directory derives each entry's length from its successor's start;
 entry-end padding belongs to Data, so no gap is added to an IdMap. The first
@@ -53,7 +53,9 @@ Each slot declares its decoder element: U8, F16, F32, U32 or U64. `ElemType::siz
 uses `size_of` on the corresponding fixed-width representation (u16 for F16),
 never ABI alignment. A const assertion requires every size to be a power of two.
 `MAX_ELEM_BYTES` is the maximum over `ElemType::ALL` and is publicly exported
-for storage-provider alignment checks. There is no stored alignment field.
+for storage-provider alignment checks. `ENTRY_ALIGN` is fixed at 8 bytes and must
+be at least `MAX_ELEM_BYTES`; it governs entry and directory padding. There is no
+stored alignment field.
 
 A column starts at the next multiple of its own element size, relative to the
 block start, and contains `n * stride` bytes. Every stride must be a multiple
@@ -78,7 +80,7 @@ row count. Equal boundaries represent empty IVF clusters. The final byte
 boundary equals `directory_start`. The last block's column end bounds the zero
 padding before the directory; zero padding after the row array is also checked.
 Column reads cannot exceed their stored block boundary. The writer asserts that
-every Data entry length is a multiple of `MAX_ELEM_BYTES`. All padding is zero.
+every Data entry length is a multiple of `ENTRY_ALIGN`. All padding is zero.
 
 `Clusters` requires `row_starts` to equal the posting offsets in `.centroids`,
 a DocLocations IdMap, and centroid data. `Uniform { rows_per_block }` requires

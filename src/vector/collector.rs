@@ -19,6 +19,7 @@
 //! Top-N vector-similarity collection.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -38,6 +39,36 @@ use crate::index::SegmentReader;
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Schema};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal, TantivyError};
+
+/// Query identity excludes storage geometry and descriptive grid versions.
+#[derive(Clone, Debug)]
+struct PreparedKey(Arc<VectorColMetadata>);
+impl PreparedKey {
+    fn query_fields(&self) -> Option<(u32, u8, &[super::metadata::Quantizer])> {
+        match self.0.as_ref() {
+            VectorColMetadata::Plain(_) => None,
+            VectorColMetadata::Quantized { field, layers } => {
+                let metric = match field.metric {
+                    crate::schema::Metric::L2 => 0,
+                    crate::schema::Metric::Dot => 1,
+                    crate::schema::Metric::Cosine => 2,
+                };
+                Some((field.dim, metric, layers))
+            }
+        }
+    }
+}
+impl PartialEq for PreparedKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.query_fields() == other.query_fields()
+    }
+}
+impl Eq for PreparedKey {}
+impl Hash for PreparedKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.query_fields().hash(state);
+    }
+}
 
 /// Shared initialization cell so each metadata key prepares its query exactly once.
 type PreparedCell = Arc<OnceLock<Arc<QuantizedQueryCtx>>>;
@@ -63,7 +94,7 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     adaptive: AdaptiveProbeParams,
     max_scan_levels: usize,
     /// Exactly one prepared query for each distinct segment encoding.
-    quantized_queries: Mutex<HashMap<Arc<VectorColMetadata>, PreparedCell>>,
+    quantized_queries: Mutex<HashMap<PreparedKey, PreparedCell>>,
     tie_break: S,
 }
 
@@ -172,7 +203,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
             self.quantized_queries
                 .lock()
                 .unwrap()
-                .entry(Arc::clone(&index_ctx.meta))
+                .entry(PreparedKey(Arc::clone(&index_ctx.meta)))
                 .or_default(),
         );
         Arc::clone(cell.get_or_init(prepare))
@@ -948,5 +979,105 @@ mod ivf_e2e_tests {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod prepared_key_tests {
+    use super::*;
+    use crate::schema::{Metric, VectorOptions};
+    use crate::vector::metadata::{Grid, Partition, Quantizer, Rotation};
+    use crate::vector::quantization::{
+        VectorNormPolicy, VectorQuantizationConfig, VectorQuantizationLayer,
+    };
+    fn metadata(metric: Metric, schedule: &[u8]) -> VectorColMetadata {
+        let opts = VectorOptions::new(100, metric);
+        let config = VectorQuantizationConfig::materialize(
+            "v".into(),
+            &opts,
+            schedule
+                .iter()
+                .map(|&bits| VectorQuantizationLayer { bits, seed: 17 })
+                .collect(),
+        )
+        .unwrap();
+        VectorColMetadata::build_ivf(&opts, Some(&config)).unwrap()
+    }
+    fn key(meta: &VectorColMetadata) -> PreparedKey {
+        PreparedKey(Arc::new(meta.clone()))
+    }
+    fn hash(meta: &VectorColMetadata) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key(meta).hash(&mut h);
+        h.finish()
+    }
+    // Storage geometry and descriptive grid versions never split prepared-query cache keys.
+    #[test]
+    fn query_identity_uses_only_semantic_bits() {
+        let original = metadata(Metric::L2, &[1, 4]);
+        let mut changed = original.clone();
+        if let VectorColMetadata::Quantized { field, layers } = &mut changed {
+            field.norm_policy = VectorNormPolicy::UnitL2;
+            field.partition = Partition::Uniform { rows_per_block: 7 };
+            if let Quantizer::GridPlane { grid, .. } = &mut layers[1] {
+                grid.version += 1;
+            }
+        }
+        assert_eq!(key(&original), key(&changed));
+        assert_eq!(hash(&original), hash(&changed));
+        assert_ne!(original.to_bytes(), changed.to_bytes());
+        for change in 0..8 {
+            let mut changed = original.clone();
+            if let VectorColMetadata::Quantized { field, layers } = &mut changed {
+                match change {
+                    0 => field.dim += 1,
+                    1 => field.metric = Metric::Dot,
+                    2 => {
+                        if let Quantizer::SignPlane { rotation, .. } = &mut layers[0] {
+                            *rotation = Rotation::None;
+                        }
+                    }
+                    3 => {
+                        if let Quantizer::SignPlane { rho_model, .. } = &mut layers[0] {
+                            rho_model.0 += 1;
+                        }
+                    }
+                    4 => {
+                        if let Quantizer::GridPlane { bits, .. } = &mut layers[1] {
+                            *bits = 3;
+                        }
+                    }
+                    5 => {
+                        if let Quantizer::GridPlane { grid, .. } = &mut layers[1] {
+                            grid.points[0] = f32::from_bits(grid.points[0].to_bits() ^ 1);
+                        }
+                    }
+                    6 => {
+                        if let Quantizer::SignPlane { rotation, .. } = &mut layers[0] {
+                            *rotation = Rotation::SeededFhtChaCha8 { seed: 18 };
+                        }
+                    }
+                    _ => {
+                        if let Quantizer::GridPlane { grid, .. } = &mut layers[1] {
+                            grid.rho_model = f64::from_bits(grid.rho_model.to_bits() + 1);
+                        }
+                    }
+                }
+            }
+            assert_ne!(key(&original), key(&changed));
+        }
+        let g = Grid {
+            version: 1,
+            points: vec![0.0],
+            rho_model: 1.0,
+        };
+        let mut other = g.clone();
+        other.points[0] = -0.0;
+        let quant = |grid| super::super::metadata::Quantizer::GridPlane {
+            bits: 2,
+            rotation: Rotation::None,
+            grid,
+        };
+        assert_ne!(quant(g), quant(other));
     }
 }
