@@ -118,19 +118,33 @@ pub(crate) fn boundary_distance(query: &[f32], c0: &[f32], cj: &[f32], euclidean
         let b = 0.5 * (cj_norm_sq - c0_norm_sq);
         (dot_qv - b).abs() / (v_norm + 1e-12)
     } else {
-        let mut v_norm_sq = 0.0f32;
-        let mut dot_qv = 0.0f32;
+        // Angular distance to the great hypersphere equidistant from ĉ0 and
+        // ĉj: asin(|q̂·v| / ‖v‖) with v = ĉj - ĉ0. Neither the query nor
+        // router centroids are unit length, so every vector is normalized.
+        let mut q_norm_sq = 0.0f32;
+        let mut c0_norm_sq = 0.0f32;
+        let mut cj_norm_sq = 0.0f32;
+        let mut dot_q0 = 0.0f32;
+        let mut dot_qj = 0.0f32;
+        let mut dot_0j = 0.0f32;
         for i in 0..dim {
-            let v = cj[i] - c0[i];
-            v_norm_sq += v * v;
-            dot_qv += query[i] * v;
+            q_norm_sq += query[i] * query[i];
+            c0_norm_sq += c0[i] * c0[i];
+            cj_norm_sq += cj[i] * cj[i];
+            dot_q0 += query[i] * c0[i];
+            dot_qj += query[i] * cj[i];
+            dot_0j += c0[i] * cj[i];
         }
-        let v_norm = v_norm_sq.sqrt();
+        let (q_norm, c0_norm, cj_norm) = (q_norm_sq.sqrt(), c0_norm_sq.sqrt(), cj_norm_sq.sqrt());
+        if q_norm == 0.0 || c0_norm == 0.0 || cj_norm == 0.0 {
+            return 0.0;
+        }
+        let v_norm = (2.0 - 2.0 * dot_0j / (c0_norm * cj_norm)).max(0.0).sqrt();
         if v_norm == 0.0 {
             return 0.0;
         }
-        let s = (dot_qv / v_norm).abs().clamp(0.0, 1.0);
-        s.asin()
+        let dot_qv = (dot_qj / cj_norm - dot_q0 / c0_norm) / q_norm;
+        (dot_qv / v_norm).abs().clamp(0.0, 1.0).asin()
     }
 }
 
@@ -338,6 +352,15 @@ mod tests {
         let cj = [2.0f32, 0.0];
         let d = boundary_distance(&q, &c0, &cj, true);
         assert!((d - 1.0).abs() < 1e-5, "{d}");
+    }
+
+    #[test]
+    fn cosine_bisector_distance_ignores_vector_norms() {
+        let unit = boundary_distance(&[1.0, 0.0], &[1.0, 0.0], &[0.0, 1.0], false);
+        let scaled = boundary_distance(&[3.0, 0.0], &[2.0, 0.0], &[0.0, 5.0], false);
+        let quarter = std::f32::consts::FRAC_PI_4;
+        assert!((unit - quarter).abs() < 1e-5, "{unit}");
+        assert!((scaled - quarter).abs() < 1e-5, "{scaled}");
     }
 
     #[test]

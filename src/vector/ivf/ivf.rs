@@ -1484,6 +1484,33 @@ mod tests {
         assert_eq!(leaf[0].node, full[0].node);
     }
 
+    /// Cosine APS depends only on direction: scaling the query or the
+    /// data leaves the scan unchanged, and a low target scans no more than
+    /// the full nprobe.
+    #[test]
+    fn test_aps_cosine_ignores_vector_norms() {
+        let n = 256;
+        let angle = |i: usize| i as f32 * std::f32::consts::TAU / n as f32;
+        let data: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let norm = 1.0 + (i % 7) as f32;
+                [norm * angle(i).cos(), norm * angle(i).sin()]
+            })
+            .collect();
+        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let (mut index, _) = InMemoryStackedIvf::build(data, n, 2, &clusterer, test_config(2));
+        index.config.nprobe_fraction = 1.0;
+        let query = [0.3f32.cos(), 0.3f32.sin()];
+        let scaled = [query[0] * 10.0, query[1] * 10.0];
+        let (_, full) = index.search(&query, 8, 1.0, Metric::Cosine);
+        let (unit_hits, unit) = index.search(&query, 8, 0.8, Metric::Cosine);
+        let (scaled_hits, scaled) = index.search(&scaled, 8, 0.8, Metric::Cosine);
+        assert!(unit.lists_scanned <= full.lists_scanned);
+        assert_eq!(unit.lists_scanned, scaled.lists_scanned);
+        let nodes = |hits: &[Candidate<ClusterId>]| hits.iter().map(|h| h.node).collect::<Vec<_>>();
+        assert_eq!(nodes(&unit_hits), nodes(&scaled_hits));
+    }
+
     /// Dot scores past 1 would clamp the query radius to zero and stop
     /// APS after the first full heap; Dot scans its full nprobe instead.
     #[test]
