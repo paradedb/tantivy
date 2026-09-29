@@ -183,6 +183,7 @@ pub struct Bm25Weight {
     cache: Arc<[Score; 256]>,
     average_fieldnorm: Score,
     params: Bm25Params,
+    block_tf_correction: Score,
 }
 
 impl Bm25Weight {
@@ -196,6 +197,7 @@ impl Bm25Weight {
             cache: self.cache.clone(),
             average_fieldnorm: self.average_fieldnorm,
             params: self.params,
+            block_tf_correction: self.block_tf_correction,
         }
     }
 
@@ -275,6 +277,7 @@ impl Bm25Weight {
             cache: compute_tf_cache(average_fieldnorm, params.k1(), params.b()),
             average_fieldnorm,
             params,
+            block_tf_correction: 0.0,
         }
     }
 
@@ -290,6 +293,7 @@ impl Bm25Weight {
             cache: compute_tf_cache(average_fieldnorm, params.k1(), params.b()),
             average_fieldnorm,
             params,
+            block_tf_correction: 0.0,
         }
     }
 
@@ -299,7 +303,47 @@ impl Bm25Weight {
     }
 
     pub fn max_score(&self) -> Score {
-        self.score(255u8, 2_013_265_944)
+        self.weight.max(0.0)
+    }
+
+    pub(crate) fn supports_pruning(&self, boost: Score) -> bool {
+        let weight = self.weight * boost;
+        weight.is_finite() && weight >= 0.0
+    }
+
+    pub(crate) fn for_block_max_score(&self, indexing_average: Score) -> Option<Self> {
+        if !self.supports_pruning(1.0)
+            || !indexing_average.is_finite()
+            || indexing_average <= 0.0
+            || !self.average_fieldnorm.is_finite()
+            || self.average_fieldnorm <= 0.0
+        {
+            return None;
+        }
+        let mut bound = self.boost_by(1.0 + 4.0 * Score::EPSILON);
+        bound.cache = compute_tf_cache(indexing_average, self.params.k1(), self.params.b());
+        let scale = (indexing_average / self.average_fieldnorm).min(1.0);
+        // Uniform scaling preserves the index-time winner and bounds the query-time TF factor.
+        for value in Arc::make_mut(&mut bound.cache) {
+            *value *= scale;
+            if !value.is_finite() || *value < 0.0 {
+                return None;
+            }
+        }
+        bound.block_tf_correction =
+            (self.cache[0] - bound.cache[0]).max(0.0) * (1.0 - 4.0 * Score::EPSILON);
+        Some(bound)
+    }
+
+    pub(crate) fn block_max_score(&self, norm: u8, freq: u32, max_freq: u32) -> Score {
+        if max_freq == 0 {
+            return self.max_score();
+        }
+        let freq = freq as Score;
+        // c_query/tf >= c_bound(winner)/tf_winner + correction/tf_max.
+        let norm =
+            self.cache[norm as usize] + self.block_tf_correction * (freq / max_freq as Score);
+        self.weight * (freq / (freq + norm))
     }
 
     #[inline]
@@ -350,6 +394,68 @@ mod tests {
     fn test_idf() {
         let score: Score = 2.0;
         assert_nearly_equals!(idf(1, 2), score.ln());
+    }
+
+    #[test]
+    fn test_global_bound_covers_norm_quantization() {
+        use super::Bm25Weight;
+        use crate::Bm25Params;
+
+        for average in [1.0, 10.0, 100.0, 10_000.0] {
+            for params in [Bm25Params::default(), Bm25Params::new(2.0, 1.0)] {
+                for boost in [-2.0, 0.0, 1.0, 3.0] {
+                    let weight = Bm25Weight::for_one_term(10, 100, average, params).boost_by(boost);
+                    for norm in 0..=255 {
+                        for frequency in [1, 4, 128, 1000, u32::MAX] {
+                            assert!(weight.score(norm, frequency) <= weight.max_score());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_block_frequency_bound_tightens_single_occurrences() {
+        use super::Bm25Weight;
+        use crate::Bm25Params;
+
+        let query = Bm25Weight::for_one_term(10, 100, 90.0, Bm25Params::default());
+        let bound = query.for_block_max_score(28.0).unwrap();
+        for norm in 0..=255 {
+            let score = bound.block_max_score(norm, 1, 1);
+            assert!(score >= query.score(norm, 1));
+            assert_nearly_equals!(score, query.score(norm, 1));
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_block_frequency_bound_is_conservative(
+            pairs in proptest::collection::vec((0u8..=255, 1u32..1000), 1..129),
+            index_average in 1.0f32..2000.0,
+            query_average in 1.0f32..2000.0,
+            k1 in 0.0f32..4.0,
+            b in 0.0f32..1.0,
+        ) {
+            use super::Bm25Weight;
+            use crate::Bm25Params;
+            use crate::postings::skip::{encode_block_wand_max_tf, decode_block_wand_max_tf};
+
+            let params = Bm25Params::new(k1, b);
+            let index = Bm25Weight::for_one_term(10, 100, index_average, params);
+            let query = Bm25Weight::for_one_term(10, 100, query_average, params);
+            let &(norm, freq) = pairs.iter().max_by(|&&(a, af), &&(b, bf)| {
+                index.tf_factor(a, af).total_cmp(&index.tf_factor(b, bf))
+            }).unwrap();
+            let stored_freq = decode_block_wand_max_tf(encode_block_wand_max_tf(freq));
+            let max_freq = pairs.iter().map(|&(_, tf)| tf).max().unwrap().next_power_of_two();
+            let bound = query.for_block_max_score(index_average).unwrap()
+                .block_max_score(norm, stored_freq, max_freq);
+            for (norm, freq) in pairs {
+                assert!(bound >= query.score(norm, freq), "{bound} < {}", query.score(norm, freq));
+            }
+        }
     }
 
     #[test]
