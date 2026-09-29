@@ -382,7 +382,11 @@ mod tests {
                     scorer.seek_block(chunk[0].0);
                     let bound = scorer.refine_block_max_score();
                     assert_eq!(scorer.doc(), old_doc);
-                    assert_eq!(scorer.term_freq(), old_freq);
+                    assert_eq!(
+                        scorer.postings.block_cursor.freq_output_array()
+                            [scorer.postings.block_offset()],
+                        old_freq
+                    );
                     assert_eq!(scorer.refine_block_max_score(), bound);
                     assert_eq!(scorer.block_max_score(), bound);
                     let expected = chunk
