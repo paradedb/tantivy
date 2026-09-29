@@ -45,6 +45,7 @@ use super::quantization::{
     QUANTIZED_ERROR_RATIO_STRIDE, QUANTIZED_GAMMA_STRIDE, QUANTIZED_RESIDUAL_NORM_STRIDE,
     QUANTIZED_SCALE_STRIDE, QUANTIZED_SIDECAR_STRIDE,
 };
+use super::storage_io::VectorRead;
 use super::VEC_EXT;
 use crate::directory::error::OpenReadError;
 use crate::directory::{CompositeFile, FileSlice};
@@ -1045,7 +1046,7 @@ impl QuantizedLayerReader {
             let (scales, remainder) = self
                 .sidecar
                 .slice(scale_range.start..error_ratio_range.end)
-                .read_bytes()?
+                .read_vector_bytes()?
                 .split(scale_len);
             let (gammas, error_ratios) = remainder.split(gamma_len);
             (scales, gammas, error_ratios)
@@ -1065,7 +1066,7 @@ impl QuantizedLayerReader {
                 let bytes = self
                     .sidecar
                     .slice(scale_range.start..error_ratio_range.end)
-                    .read_bytes()?;
+                    .read_vector_bytes()?;
                 let scales = bytes.slice(0..scale_range.len());
                 let gamma_start = gamma_range.start - scale_range.start;
                 let gammas = bytes.slice(gamma_start..gamma_start + gamma_range.len());
@@ -1075,9 +1076,9 @@ impl QuantizedLayerReader {
                 (scales, gammas, error_ratios)
             } else {
                 (
-                    self.sidecar.slice(scale_range).read_bytes()?,
-                    self.sidecar.slice(gamma_range).read_bytes()?,
-                    self.sidecar.slice(error_ratio_range).read_bytes()?,
+                    self.sidecar.slice(scale_range).read_vector_bytes()?,
+                    self.sidecar.slice(gamma_range).read_vector_bytes()?,
+                    self.sidecar.slice(error_ratio_range).read_vector_bytes()?,
                 )
             }
         };
@@ -1093,7 +1094,7 @@ impl QuantizedLayerReader {
         let codes = self
             .codes
             .slice(rows.start * self.code_stride..rows.end * self.code_stride)
-            .read_bytes()?;
+            .read_vector_bytes()?;
         for (local, code) in codes.chunks_exact(self.code_stride).enumerate() {
             if !quantized_code_tail_is_zero(code, self.dim, self.bits) {
                 let row = rows.start + local;
@@ -1114,7 +1115,7 @@ impl QuantizedLayerReader {
         Ok(Some(
             constants
                 .slice(rows.start * QUANTIZED_CONSTANT_STRIDE..rows.end * QUANTIZED_CONSTANT_STRIDE)
-                .read_bytes()?,
+                .read_vector_bytes()?,
         ))
     }
 
@@ -1382,7 +1383,7 @@ impl QuantizedLayerReader {
         let bytes = self
             .codes
             .slice(row * self.code_stride..(row + 1) * self.code_stride)
-            .read_bytes()
+            .read_vector_bytes()
             .map_err(TantivyError::from)?;
         if !quantized_code_tail_is_zero(bytes.as_slice(), self.dim, self.bits) {
             return Err(DataCorruption::comment_only(format!(
@@ -1412,7 +1413,7 @@ impl QuantizedLayerReader {
         };
         let bytes = constants
             .slice(row * QUANTIZED_CONSTANT_STRIDE..(row + 1) * QUANTIZED_CONSTANT_STRIDE)
-            .read_bytes()?;
+            .read_vector_bytes()?;
         Ok(Some(f32::from_le_bytes(
             bytes.as_slice().try_into().unwrap(),
         )))
@@ -1505,7 +1506,7 @@ impl QuantizedFieldReader {
         let bytes = self
             .residual_norms
             .slice(row * QUANTIZED_RESIDUAL_NORM_STRIDE..(row + 1) * QUANTIZED_RESIDUAL_NORM_STRIDE)
-            .read_bytes()?;
+            .read_vector_bytes()?;
         Ok(f32::from_le_bytes(bytes.as_slice().try_into().unwrap()))
     }
 
@@ -1519,7 +1520,7 @@ impl QuantizedFieldReader {
                 rows.start * QUANTIZED_RESIDUAL_NORM_STRIDE
                     ..rows.end * QUANTIZED_RESIDUAL_NORM_STRIDE,
             )
-            .read_bytes()?;
+            .read_vector_bytes()?;
         Ok(QuantizedResidualNormBatch { bytes, rows })
     }
 
@@ -1547,7 +1548,7 @@ impl QuantizedFieldReader {
                 rows.start * QUANTIZED_RESIDUAL_NORM_STRIDE
                     ..rows.end * QUANTIZED_RESIDUAL_NORM_STRIDE,
             )
-            .read_bytes()?)
+            .read_vector_bytes()?)
     }
 
     pub(crate) fn index_ctx(&self) -> &Arc<QuantizedIndexCtx> {
@@ -1569,7 +1570,7 @@ fn logical_slice(
         .into());
     }
     if physical_len != logical_len {
-        let trailer = slice.slice(logical_len..physical_len).read_bytes()?;
+        let trailer = slice.slice(logical_len..physical_len).read_vector_bytes()?;
         if trailer.iter().any(|&byte| byte != 0) {
             return Err(DataCorruption::comment_only(format!(
                 "{description} has a non-zero alignment trailer"
@@ -2717,7 +2718,7 @@ impl VectorIndexReader {
         let bytes = self
             .rows_slice
             .slice(row * stride..(row + 1) * stride)
-            .read_bytes()?;
+            .read_vector_bytes()?;
         Ok(bytes)
     }
 
@@ -2772,7 +2773,7 @@ impl VectorIndexReader {
             let bytes = self
                 .rows_slice
                 .slice(row_range.start * stride..row_range.end * stride)
-                .read_bytes()?;
+                .read_vector_bytes()?;
             debug_assert_eq!(bytes.len(), row_range.len() * stride);
             chunks.push(VectorRowChunk {
                 rows: row_range,

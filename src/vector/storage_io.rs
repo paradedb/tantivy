@@ -1,0 +1,64 @@
+//! Deterministic storage I/O attribution for vector search stages.
+use std::cell::Cell;
+
+use common::{HasLen, OwnedBytes};
+
+use super::{current_vector_stage, Stage};
+use crate::directory::FileSlice;
+
+/// Summable physical read requests; storage blocks count repetitions across requests.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct VectorIoStats {
+    /// Successful byte-read requests.
+    pub reads: u64,
+    /// Total requested bytes, including padding in bands.
+    pub bytes_read: u64,
+    /// Sum of physical storage blocks touched per request, when geometry is known.
+    pub storage_blocks: u64,
+}
+impl VectorIoStats {
+    pub(crate) fn since(self, before: Self) -> Self {
+        Self {
+            reads: self.reads - before.reads,
+            bytes_read: self.bytes_read - before.bytes_read,
+            storage_blocks: self.storage_blocks - before.storage_blocks,
+        }
+    }
+}
+thread_local! {
+    static COUNTERS: Cell<[VectorIoStats; 4]> = const { Cell::new([VectorIoStats { reads: 0, bytes_read: 0, storage_blocks: 0 }; 4]) };
+}
+pub(crate) fn snapshot() -> [VectorIoStats; 4] {
+    COUNTERS.get()
+}
+
+/// Reads vector bytes while attributing the actual range to the active scan stage.
+pub(crate) trait VectorRead {
+    fn read_vector_bytes(&self) -> std::io::Result<OwnedBytes>;
+}
+impl VectorRead for FileSlice {
+    fn read_vector_bytes(&self) -> std::io::Result<OwnedBytes> {
+        let bytes = self.read_bytes()?;
+        let slot = match current_vector_stage() {
+            Stage::LayerScan(l) if l < 3 => Some(l as usize),
+            Stage::RerankFetch => Some(3),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            let mut counters = COUNTERS.get();
+            let counter = &mut counters[slot];
+            counter.reads += 1;
+            counter.bytes_read += self.len() as u64;
+            if self.len() != 0 {
+                if let (Some(first), Some(last)) = (
+                    self.storage_block_ord(0),
+                    self.storage_block_ord(self.len() - 1),
+                ) {
+                    counter.storage_blocks += (last - first + 1) as u64;
+                }
+            }
+            COUNTERS.set(counters);
+        }
+        Ok(bytes)
+    }
+}

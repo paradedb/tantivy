@@ -400,3 +400,6 @@ impl<T: VectorElement> VectorArena for FileSliceArena<T> {
         metric.similarity_bytes(query, &bytes)
     }
 }
+
+mod storage_io;
+pub use storage_io::VectorIoStats;

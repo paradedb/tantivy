@@ -53,6 +53,10 @@ struct AssignedVector {
 /// as a parseable `log::info!` line on target `paradedb::ivf_build`.
 #[derive(Default)]
 struct IvfBuildTimings {
+    source_reads: usize,
+    spill_bytes: usize,
+    vec_bytes: u64,
+    pad_bytes: usize,
     train: Duration,
     assign: Duration,
     posting_write: Duration,
@@ -352,13 +356,14 @@ impl QuantizedTempSlots {
         vec_write: &mut CompositeWrite,
         field: Field,
         cancel: &dyn CancelSentinel,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<usize> {
+        let mut padding = 0;
         self.residual_norms.splice_into(
             vec_write.for_field_with_idx(field, VectorSlot::ResidualNorms.index()),
             cancel,
         )?;
         for (layer, temp) in self.layers.iter_mut().enumerate() {
-            vec_write.align_next_field(QUANTIZED_CODE_ALIGNMENT, HEADER_LEN)?;
+            padding += vec_write.align_next_field(QUANTIZED_CODE_ALIGNMENT, HEADER_LEN)?;
             temp.codes.splice_into(
                 vec_write.for_field_with_idx(field, VectorSlot::codes(layer).index()),
                 cancel,
@@ -374,7 +379,7 @@ impl QuantizedTempSlots {
                 )?;
             }
         }
-        Ok(())
+        Ok(padding)
     }
 }
 
@@ -667,6 +672,7 @@ pub(crate) fn merge_ivf(
                 let mut sampled_count = 0usize;
                 for source_doc_addr in ctx.doc_id_mapping.iter_source_doc_addrs() {
                     let reader = &field_readers[source_doc_addr.segment_ord as usize];
+                    timings.source_reads += 1;
                     if let Some(bytes) = reader.vector_bytes(source_doc_addr.doc_id)? {
                         let should_sample = sampled_count < training_sample_size
                             && present_vector_ord % training_sample_interval == 0;
@@ -834,6 +840,7 @@ pub(crate) fn merge_ivf(
                         };
                     for source_doc_addr in ctx.doc_id_mapping.iter_source_doc_addrs() {
                         let reader = &field_readers[source_doc_addr.segment_ord as usize];
+                        timings.source_reads += 1;
                         if let Some(bytes) = reader.vector_bytes(source_doc_addr.doc_id)? {
                             batch_doc_ids.push(target_doc_id);
                             decode_row_append::<f32>(&bytes, opts.dim(), &mut batch_values)?;
@@ -920,6 +927,7 @@ pub(crate) fn merge_ivf(
                             return Err(TantivyError::Cancelled);
                         }
                         let reader = &field_readers[assigned_vector.source_segment_ord];
+                        timings.source_reads += 1;
                         let bytes = reader
                             .vector_bytes(assigned_vector.source_doc_id)?
                             .ok_or_else(|| {
@@ -973,6 +981,16 @@ pub(crate) fn merge_ivf(
                     let quantize_start = Instant::now();
                     let (specs, grids) = quantization_runtime(config, opts)?;
                     let quantized_layout = QuantizedWriteLayout::build(config, &cluster_offsets)?;
+                    timings.spill_bytes = quantized_layout.residual_norms.total_bytes
+                        + quantized_layout
+                            .layers
+                            .iter()
+                            .map(|l| {
+                                l.codes.total_bytes
+                                    + l.sidecar.total_bytes
+                                    + l.constants.as_ref().map_or(0, |c| c.total_bytes)
+                            })
+                            .sum::<usize>();
                     let rotation_plan = Arc::new(QueryRotationPlan::new(opts.dim(), &specs));
                     let mut centroid_workspace = PreparedCentroidWorkspace::new(rotation_plan);
                     let mut temp_slots = QuantizedTempSlots::create(directory, &quantized_layout)?;
@@ -1029,6 +1047,7 @@ pub(crate) fn merge_ivf(
                             batch_values.clear();
                             for assigned_vector in tile {
                                 let reader = &field_readers[assigned_vector.source_segment_ord];
+                                timings.source_reads += 1;
                                 let bytes = reader
                                     .vector_bytes(assigned_vector.source_doc_id)?
                                     .ok_or_else(|| {
@@ -1104,7 +1123,8 @@ pub(crate) fn merge_ivf(
                         }
                         temp_slots.validate_cluster_boundary(&quantized_layout, cluster + 1)?;
                     }
-                    temp_slots.splice_into(&mut vec_write, field, ctx.cancel)?;
+                    timings.pad_bytes =
+                        temp_slots.splice_into(&mut vec_write, field, ctx.cancel)?;
                     timings.quantize = quantize_start.elapsed();
                 }
 
@@ -1145,10 +1165,15 @@ pub(crate) fn merge_ivf(
                 router.serialize(router_w)?;
                 router_w.flush()?;
 
+                timings.vec_bytes = (1
+                    + assigned_vectors.len()
+                        * (std::mem::size_of::<DocId>() + opts.bytes_per_vector())
+                    + timings.spill_bytes
+                    + timings.pad_bytes) as u64;
                 log::info!(
                     target: "paradedb::ivf_build",
                     "ivf_build timings_ms train={} assign={} posting_write={} quantize={} total={} \
-                     centroids={} vectors={}",
+                     centroids={} vectors={} source_reads={} spill_bytes={} vec_bytes={} pad_bytes={} encode_ms={}",
                     timings.train.as_millis(),
                     timings.assign.as_millis(),
                     timings.posting_write.as_millis(),
@@ -1156,6 +1181,8 @@ pub(crate) fn merge_ivf(
                     field_build_start.elapsed().as_millis(),
                     num_centroids,
                     vector_count,
+                    timings.source_reads, timings.spill_bytes, timings.vec_bytes, timings.pad_bytes,
+                    (timings.posting_write + timings.quantize).as_millis(),
                 );
             }
         }
@@ -1344,6 +1371,111 @@ mod tests {
             Err(TantivyError::Cancelled)
         ));
         assert_eq!(destination.len(), 1024 * 1024);
+        Ok(())
+    }
+
+    // Pins column bytes, score bits, top-k, stage traces and survivors.
+    #[test]
+    fn block_storage_equivalence_oracle() -> crate::Result<()> {
+        fn hash(bytes: &[u8]) -> u64 {
+            bytes.iter().fold(0xcbf29ce484222325, |h, b| {
+                (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
+            })
+        }
+        let mut oracle = String::new();
+        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+            for schedule in [&[1][..], &[1, 4], &[1, 2, 4]] {
+                let index = build_quantized_fixture_case(64, metric, schedule, true)?;
+                let searcher = index.reader()?.searcher();
+                let field = index.schema().get_field("embedding")?;
+                let vector = searcher.segment_readers()[0].vector_index(field)?;
+                let ivf = vector.index().unwrap();
+                let quant = vector.quantization().unwrap();
+                oracle.push_str(&format!("{metric:?} {schedule:?}\n"));
+                for cluster in 0..ivf.num_clusters() {
+                    let rows = ivf.cluster_range(cluster);
+                    oracle.push_str(&format!(
+                        "norms {:016x}\n",
+                        hash(&quant.read_residual_norms(rows.clone())?)
+                    ));
+                    for layer in quant.layers() {
+                        let sidecar = layer.read_sidecar(rows.clone())?;
+                        let codes = layer.read_codes(rows.clone())?;
+                        let constants = layer.read_constants(rows.clone())?;
+                        oracle.push_str(&format!(
+                            "columns {:016x} {:016x} {:016x} {:016x} {:016x}\n",
+                            hash(&codes),
+                            hash(sidecar.scales()),
+                            hash(sidecar.gammas()),
+                            hash(sidecar.error_ratios()),
+                            hash(constants.as_deref().unwrap_or(&[]))
+                        ));
+                    }
+                }
+                for query in [
+                    fixture_search_query(metric, 64),
+                    fixture_vector(metric, 64, 6),
+                ] {
+                    let fruit = searcher.search(
+                        &AllQuery,
+                        &TopDocsByVectorSimilarity::new(field, query, 3).with_adaptive_params(
+                            AdaptiveProbeParams {
+                                max_probe_fraction: 1.0,
+                                min_probe_clusters: 2,
+                                ..Default::default()
+                            },
+                        ),
+                    )?;
+                    oracle.push_str(&format!(
+                        "hits {:?}\n",
+                        fruit
+                            .results
+                            .iter()
+                            .map(|(s, d)| (s.to_bits(), d.doc_id))
+                            .collect::<Vec<_>>()
+                    ));
+                    let stats = &fruit.stats[0];
+                    oracle.push_str(&format!("trace {:?}\n", stats.quantized_trace));
+                    for layer in 0..schedule.len() {
+                        let stats = stats.layers.get(layer).unwrap();
+                        oracle.push_str(&format!(
+                            "counts {} {}\n",
+                            stats.scored(),
+                            stats.survivors()
+                        ));
+                    }
+                }
+            }
+        }
+        for sparse in [false, true] {
+            for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+                let mut schema = Schema::builder();
+                let field = schema.add_vector_field("embedding", VectorOptions::new(64, metric));
+                let index = Index::create_in_ram(schema.build());
+                let mut writer = index.writer_with_num_threads(1, 30_000_000)?;
+                for doc in 0..8 {
+                    let mut document = TantivyDocument::new();
+                    if !sparse || doc % 2 == 0 {
+                        document.add_vector(field, &fixture_vector(metric, 64, doc));
+                    }
+                    writer.add_document(document)?;
+                }
+                writer.commit()?;
+                let fruit = index.reader()?.searcher().search(
+                    &AllQuery,
+                    &TopDocsByVectorSimilarity::new(field, fixture_search_query(metric, 64), 3),
+                )?;
+                oracle.push_str(&format!(
+                    "flat {sparse} {metric:?} {:?}\n",
+                    fruit
+                        .results
+                        .iter()
+                        .map(|(s, d)| (s.to_bits(), d.doc_id))
+                        .collect::<Vec<_>>()
+                ));
+            }
+        }
+        assert_eq!(oracle, include_str!("../storage_oracle.txt"));
         Ok(())
     }
 
@@ -1571,6 +1703,7 @@ mod tests {
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 30_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
+        let mut segments = Vec::new();
         for doc in 0..8 {
             let vector = fixture_vector(metric, dim, doc);
             let mut document = TantivyDocument::new();
@@ -1582,10 +1715,13 @@ mod tests {
             writer.add_document(document)?;
             if doc == 3 || doc == 7 {
                 writer.commit()?;
+                for id in index.searchable_segment_ids()? {
+                    if !segments.contains(&id) {
+                        segments.push(id);
+                    }
+                }
             }
         }
-        let mut segments = index.searchable_segment_ids()?;
-        segments.sort();
         writer.merge(&segments).wait()?;
         writer.wait_merging_threads()?;
         Ok(index)

@@ -1,0 +1,141 @@
+L2 [1]
+norms 6a82b8507c2b2105
+columns fb09cec213ea38fc c02a8ddc12e944f0 e967e73c1c954a05 c7eb97534232a180 88201fb960ff6465
+norms d6cfabae379998e9
+columns 6cd73884b8513bad 30be1f905bbb1983 0ddbf17d0b8bffb3 bdda9bccfecc59f3 1f4177699216de87
+hits [(3174435490, 0), (3177586616, 2), (3188074199, 1)]
+trace QuantizedStageTrace { scored_docs: [0, 1, 2, 3], boundary_docs: [[0, 1, 2]], rerank_docs: [0, 1, 2] }
+counts 4 3
+hits [(2147483648, 6), (3183909611, 7), (3205981856, 5)]
+trace QuantizedStageTrace { scored_docs: [4, 5, 6, 7], boundary_docs: [[5, 6, 7]], rerank_docs: [5, 6, 7] }
+counts 4 3
+L2 [1, 4]
+norms 6a82b8507c2b2105
+columns fb09cec213ea38fc c02a8ddc12e944f0 e967e73c1c954a05 c7eb97534232a180 88201fb960ff6465
+columns f0ddca9f6ec781d4 5c91252fc9788f33 d329dd504f849b1c 07e0aa8d521c7df2 88201fb960ff6465
+norms d6cfabae379998e9
+columns 6cd73884b8513bad 30be1f905bbb1983 0ddbf17d0b8bffb3 bdda9bccfecc59f3 1f4177699216de87
+columns 0e94dfd4cac3eb87 4f245602825cab4b be69b060f4b80866 12167be3a30f7068 b8ce795639aee92f
+hits [(3174435490, 0), (3177586616, 2), (3188074199, 1)]
+trace QuantizedStageTrace { scored_docs: [0, 1, 2, 3], boundary_docs: [[0, 1, 2], [0, 1, 2]], rerank_docs: [0, 1, 2] }
+counts 4 3
+counts 3 3
+hits [(2147483648, 6), (3183909611, 7), (3205981856, 5)]
+trace QuantizedStageTrace { scored_docs: [4, 5, 6, 7], boundary_docs: [[5, 6, 7], [5, 6, 7]], rerank_docs: [5, 6, 7] }
+counts 4 3
+counts 3 3
+L2 [1, 2, 4]
+norms 6a82b8507c2b2105
+columns fb09cec213ea38fc c02a8ddc12e944f0 e967e73c1c954a05 c7eb97534232a180 88201fb960ff6465
+columns 26e47ac97b21db72 5c91252fc9788f33 9d2deb6cf0321b3c 01e097a615b7d908 88201fb960ff6465
+columns e7e1594e759cfe22 7923643b1898e25f d59f0120dda7a9ba 9aeadb14098df78e 88201fb960ff6465
+norms d6cfabae379998e9
+columns 6cd73884b8513bad 30be1f905bbb1983 0ddbf17d0b8bffb3 bdda9bccfecc59f3 1f4177699216de87
+columns a059b37314bc80ae 4f245602825cab4b f61ddb43c31dc9b7 f22dadbcb0e53f0a c99fe6b656cdc3cd
+columns 0f46235e9f43819b 9cbab71d317d6859 7729237dc358dda4 ce7ed50865fa0749 73ba7b8c699ece20
+hits [(3174435490, 0), (3177586616, 2), (3188074199, 1)]
+trace QuantizedStageTrace { scored_docs: [0, 1, 2, 3], boundary_docs: [[0, 1, 2], [0, 1, 2], [0, 1, 2]], rerank_docs: [0, 1, 2] }
+counts 4 3
+counts 3 3
+counts 3 3
+hits [(2147483648, 6), (3183909611, 7), (3205981856, 5)]
+trace QuantizedStageTrace { scored_docs: [4, 5, 6, 7], boundary_docs: [[5, 6, 7], [5, 6, 7], [5, 6, 7]], rerank_docs: [5, 6, 7] }
+counts 4 3
+counts 3 3
+counts 3 3
+Dot [1]
+norms e278849c1fdf415d
+columns fb09cec213ea38fc 7dea8073d398eb1a e967e73c1c954a05 c7eb97534232a180 cbf29ce484222325
+norms 3c260072ae789bab
+columns 6cd73884b8513bad f69894f1e6f691ea 0ddbf17d0b8bffb3 bdda9bccfecc59f3 cbf29ce484222325
+hits [(1062808035, 1), (1062727777, 2), (1062199852, 0)]
+trace QuantizedStageTrace { scored_docs: [0, 1, 2, 3, 4, 5, 6, 7], boundary_docs: [[0, 1, 2, 3]], rerank_docs: [0, 1, 2, 3] }
+counts 8 4
+hits [(1065810327, 7), (1065628164, 6), (1065065909, 5)]
+trace QuantizedStageTrace { scored_docs: [4, 5, 6, 7], boundary_docs: [[4, 5, 6, 7]], rerank_docs: [4, 5, 6, 7] }
+counts 4 4
+Dot [1, 4]
+norms e278849c1fdf415d
+columns fb09cec213ea38fc 7dea8073d398eb1a e967e73c1c954a05 c7eb97534232a180 cbf29ce484222325
+columns f0ddca9f6ec781d4 3f197c0b7083e6a6 d329dd504f849b1c 07e0aa8d521c7df2 cbf29ce484222325
+norms 3c260072ae789bab
+columns 6cd73884b8513bad f69894f1e6f691ea 0ddbf17d0b8bffb3 bdda9bccfecc59f3 cbf29ce484222325
+columns 0e94dfd4cac3eb87 46f3fac5199506c5 be69b060f4b80866 12167be3a30f7068 cbf29ce484222325
+hits [(1062808035, 1), (1062727777, 2), (1062199852, 0)]
+trace QuantizedStageTrace { scored_docs: [0, 1, 2, 3, 4, 5, 6, 7], boundary_docs: [[0, 1, 2, 3], [0, 1, 2]], rerank_docs: [0, 1, 2] }
+counts 8 4
+counts 4 3
+hits [(1065810327, 7), (1065628164, 6), (1065065909, 5)]
+trace QuantizedStageTrace { scored_docs: [4, 5, 6, 7], boundary_docs: [[4, 5, 6, 7], [5, 6, 7]], rerank_docs: [5, 6, 7] }
+counts 4 4
+counts 4 3
+Dot [1, 2, 4]
+norms e278849c1fdf415d
+columns fb09cec213ea38fc 7dea8073d398eb1a e967e73c1c954a05 c7eb97534232a180 cbf29ce484222325
+columns 26e47ac97b21db72 3f197c0b7083e6a6 9d2deb6cf0321b3c 01e097a615b7d908 cbf29ce484222325
+columns e7e1594e759cfe22 d9b503a0a86f2d22 d59f0120dda7a9ba 9aeadb14098df78e cbf29ce484222325
+norms 3c260072ae789bab
+columns 6cd73884b8513bad f69894f1e6f691ea 0ddbf17d0b8bffb3 bdda9bccfecc59f3 cbf29ce484222325
+columns a059b37314bc80ae 46f3fac5199506c5 f61ddb43c31dc9b7 f22dadbcb0e53f0a cbf29ce484222325
+columns 0f46235e9f43819b a35258bf2966acad 7729237dc358dda4 ce7ed50865fa0749 cbf29ce484222325
+hits [(1062808035, 1), (1062727777, 2), (1062199852, 0)]
+trace QuantizedStageTrace { scored_docs: [0, 1, 2, 3, 4, 5, 6, 7], boundary_docs: [[0, 1, 2, 3], [0, 1, 2, 3], [0, 1, 2]], rerank_docs: [0, 1, 2] }
+counts 8 4
+counts 4 4
+counts 4 3
+hits [(1065810327, 7), (1065628164, 6), (1065065909, 5)]
+trace QuantizedStageTrace { scored_docs: [4, 5, 6, 7], boundary_docs: [[4, 5, 6, 7], [5, 6, 7], [5, 6, 7]], rerank_docs: [5, 6, 7] }
+counts 4 4
+counts 4 3
+counts 3 3
+Cosine [1]
+norms 1f062941a9172ee1
+columns c4cfddefa1989de2 4fd6c69e1056854c a70b6fa1e60880d8 71a6eaaf3722b77c cbf29ce484222325
+norms 7cac62c2c5d98622
+columns d973cbee5a347d8b c2cfec828e99558a d889c47d523f0aa0 613820cbfb46314a cbf29ce484222325
+hits [(1062176968, 2), (1062063018, 1), (1061915025, 0)]
+trace QuantizedStageTrace { scored_docs: [0, 1, 2, 3], boundary_docs: [[0, 1, 2, 3]], rerank_docs: [0, 1, 2, 3] }
+counts 4 4
+hits [(1065353217, 6), (1065309720, 7), (1065051681, 5)]
+trace QuantizedStageTrace { scored_docs: [4, 5, 6, 7], boundary_docs: [[4, 5, 6, 7]], rerank_docs: [4, 5, 6, 7] }
+counts 4 4
+Cosine [1, 4]
+norms 1f062941a9172ee1
+columns c4cfddefa1989de2 4fd6c69e1056854c a70b6fa1e60880d8 71a6eaaf3722b77c cbf29ce484222325
+columns 406c6e50f3548451 7580d6230fb166d2 3d21a011d0b7e7af 54c41b0d04a75dd5 cbf29ce484222325
+norms 7cac62c2c5d98622
+columns d973cbee5a347d8b c2cfec828e99558a d889c47d523f0aa0 613820cbfb46314a cbf29ce484222325
+columns 7c8f869f7191d9d7 364f1b7e9db15fb9 577965965efc5f87 0dba54e3bc5f173a cbf29ce484222325
+hits [(1062176968, 2), (1062063018, 1), (1061915025, 0)]
+trace QuantizedStageTrace { scored_docs: [0, 1, 2, 3], boundary_docs: [[0, 1, 2, 3], [0, 1, 2]], rerank_docs: [0, 1, 2] }
+counts 4 4
+counts 4 3
+hits [(1065353217, 6), (1065309720, 7), (1065051681, 5)]
+trace QuantizedStageTrace { scored_docs: [4, 5, 6, 7], boundary_docs: [[4, 5, 6, 7], [5, 6, 7]], rerank_docs: [5, 6, 7] }
+counts 4 4
+counts 4 3
+Cosine [1, 2, 4]
+norms 1f062941a9172ee1
+columns c4cfddefa1989de2 4fd6c69e1056854c a70b6fa1e60880d8 71a6eaaf3722b77c cbf29ce484222325
+columns e05cb96a0288e11e 7580d6230fb166d2 f3b64f42bc95fbc2 05516134b1527dfe cbf29ce484222325
+columns 26ccc56020e5814e 2571d4d4121d2182 beb7aededea9c6ce ff65476c477e604e cbf29ce484222325
+norms 7cac62c2c5d98622
+columns d973cbee5a347d8b c2cfec828e99558a d889c47d523f0aa0 613820cbfb46314a cbf29ce484222325
+columns 5f12aea6b02e87d7 364f1b7e9db15fb9 3872be2ec1e7f30b 0b5f4a3c3b4f37a0 cbf29ce484222325
+columns 7f8c427bbef1cf50 eb89b354441bd998 1d932bcfb309d8e1 de8f9c02316a90e1 cbf29ce484222325
+hits [(1062176968, 2), (1062063018, 1), (1061915025, 0)]
+trace QuantizedStageTrace { scored_docs: [0, 1, 2, 3], boundary_docs: [[0, 1, 2, 3], [0, 1, 2, 3], [0, 1, 2]], rerank_docs: [0, 1, 2] }
+counts 4 4
+counts 4 4
+counts 4 3
+hits [(1065353217, 6), (1065309720, 7), (1065051681, 5)]
+trace QuantizedStageTrace { scored_docs: [4, 5, 6, 7], boundary_docs: [[4, 5, 6, 7], [5, 6, 7], [5, 6, 7]], rerank_docs: [5, 6, 7] }
+counts 4 4
+counts 4 3
+counts 3 3
+flat false L2 [(3174435490, 0), (3177586616, 2), (3188074199, 1)]
+flat false Dot [(1062808035, 1), (1062727777, 2), (1062199852, 0)]
+flat false Cosine [(1062176968, 2), (1062063018, 1), (1061915025, 0)]
+flat true L2 [(3174435490, 0), (3177586616, 2), (3258694352, 4)]
+flat true Dot [(1062727777, 2), (1062199852, 0), (1059014690, 6)]
+flat true Cosine [(1062176968, 2), (1061915025, 0), (1058694114, 6)]
