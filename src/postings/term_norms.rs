@@ -1,8 +1,9 @@
 use std::io::{self, Write};
+use std::ops::Range;
 
 use common::{CountingWriter, HasLen};
 
-use crate::directory::{BufferedFileSlice, FileSlice};
+use crate::directory::{BufferedFileSlice, FileSlice, OwnedBytes};
 
 const BUFFER_SIZE: usize = 8192;
 
@@ -50,6 +51,13 @@ impl TermNormReader {
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated posting norms"))?
             .read_byte(ordinal as u64)
+    }
+
+    pub(crate) fn read_range(&self, ordinals: Range<usize>) -> io::Result<OwnedBytes> {
+        self.buffer
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated posting norms"))?
+            .get_bytes(ordinals.start as u64..ordinals.end as u64)
     }
 }
 

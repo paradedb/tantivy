@@ -213,6 +213,15 @@ impl BlockSegmentPostings {
         })
     }
 
+    pub(crate) fn posting_fieldnorms(&self, len: usize) -> Option<OwnedBytes> {
+        self.term_norms.as_ref().map(|norms| {
+            let start = (self.doc_freq - self.skip_reader.remaining_docs()) as usize;
+            norms
+                .read_range(start..start + len)
+                .expect("failed to read posting fieldnorms")
+        })
+    }
+
     // Resets the block segment postings on another position
     // in the postings file.
     //

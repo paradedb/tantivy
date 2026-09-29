@@ -11,6 +11,7 @@ pub struct TermScorer {
     fieldnorm_reader: FieldNormReader,
     similarity_weight: Bm25Weight,
     block_max_weight: Option<Bm25Weight>,
+    refined_block_max: Option<(DocId, Score)>,
 }
 
 impl TermScorer {
@@ -24,6 +25,7 @@ impl TermScorer {
             fieldnorm_reader,
             similarity_weight,
             block_max_weight: None,
+            refined_block_max: None,
         }
     }
 
@@ -39,6 +41,7 @@ impl TermScorer {
             fieldnorm_reader,
             similarity_weight,
             block_max_weight,
+            refined_block_max: None,
         }
     }
 
@@ -83,12 +86,54 @@ impl TermScorer {
     ///
     /// The bound preserves the index-time maximum when segment and query averages differ.
     pub fn block_max_score(&mut self) -> Score {
+        if let Some((last_doc, score)) = self.refined_block_max {
+            if last_doc == self.last_doc_in_block() {
+                return score;
+            }
+        }
         let Some(weight) = self.block_max_weight.as_ref() else {
             return self.max_score();
         };
         self.postings
             .block_cursor
             .block_max_score(&self.fieldnorm_reader, weight)
+    }
+
+    pub(crate) fn block_score_hint(&self) -> Score {
+        self.postings
+            .block_cursor
+            .skip_reader()
+            .block_max_score(&self.similarity_weight)
+            .unwrap_or_else(|| self.max_score())
+    }
+
+    pub(crate) fn refine_block_max_score(&mut self) -> Score {
+        let last_doc = self.last_doc_in_block();
+        if let Some((cached_doc, score)) = self.refined_block_max {
+            if cached_doc == last_doc {
+                return score;
+            }
+        }
+        if !self.similarity_weight.supports_pruning(1.0) {
+            return self.max_score();
+        }
+        // Shallow seeks must not change the logical document or its decoded block.
+        let mut block = self.postings.block_cursor.clone();
+        block.load_block();
+        let len = block.block_len();
+        let freqs = &block.freq_output_array()[..len];
+        let norms = self.postings.block_cursor.posting_fieldnorms(len);
+        let mut bound: Score = 0.0;
+        for (offset, &freq) in freqs.iter().enumerate() {
+            let norm = norms.as_ref().map_or_else(
+                || self.fieldnorm_reader.fieldnorm_id(block.doc(offset)),
+                |norms| norms[offset],
+            );
+            bound = bound.max(self.similarity_weight.score(norm, freq));
+        }
+        bound *= 1.0 + 4.0 * Score::EPSILON;
+        self.refined_block_max = Some((last_doc, bound));
+        bound
     }
 
     pub(crate) fn block_max_score_up_to(&mut self, target: DocId) -> (Score, DocId) {
@@ -305,6 +350,55 @@ mod tests {
         assert_nearly_equals!(docs.block_max_score(), docs.max_score());
         assert_eq!(256, docs.seek(256));
         assert_nearly_equals!(docs.block_max_score(), 3.9539647);
+    }
+
+    #[test]
+    fn test_refined_block_bounds_preserve_shallow_position() {
+        use crate::directory::FileSlice;
+        use crate::fieldnorm::FieldNormReader;
+
+        let norms: Vec<_> = (0..1200).map(|doc| 1 + (doc * 37) % 1000).collect();
+        let postings: Vec<_> = (0..300).map(|doc| (doc * 3, 1 + doc % 23)).collect();
+        for pnorms in [false, true] {
+            for average in [2.0, 100.0, 500.0, 2000.0] {
+                let weight = Bm25Weight::for_one_term(300, 1200, average, Bm25Params::default());
+                let mut scorer = TermScorer::create_for_test(&postings, &norms, weight.clone());
+                if pnorms {
+                    let bytes: Vec<u8> = postings
+                        .iter()
+                        .map(|&(doc, _)| FieldNormReader::fieldnorm_to_id(norms[doc as usize]))
+                        .collect();
+                    scorer
+                        .postings
+                        .block_cursor
+                        .set_term_norm_source(Some(FileSlice::from(bytes)), Some(0));
+                }
+                for chunk in postings.chunks(128) {
+                    let old_doc = scorer.doc();
+                    let old_freq = scorer.term_freq();
+                    scorer.seek_block(chunk[0].0);
+                    let bound = scorer.refine_block_max_score();
+                    assert_eq!(scorer.doc(), old_doc);
+                    assert_eq!(scorer.term_freq(), old_freq);
+                    assert_eq!(scorer.refine_block_max_score(), bound);
+                    assert_eq!(scorer.block_max_score(), bound);
+                    let expected = chunk
+                        .iter()
+                        .map(|&(doc, freq)| {
+                            weight
+                                .score(FieldNormReader::fieldnorm_to_id(norms[doc as usize]), freq)
+                        })
+                        .fold(0.0, Score::max);
+                    assert!(bound >= expected);
+                    assert_nearly_equals!(bound, expected);
+                    assert_eq!(scorer.seek(chunk[0].0), chunk[0].0);
+                    assert_eq!(scorer.term_freq(), chunk[0].1);
+                }
+                scorer.seek_block(TERMINATED);
+                assert!(scorer.refine_block_max_score().is_finite());
+                assert_eq!(scorer.seek(TERMINATED), TERMINATED);
+            }
+        }
     }
 
     #[test]
