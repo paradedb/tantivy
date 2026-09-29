@@ -49,6 +49,44 @@ impl PhraseWeight {
             .as_ref()
             .map(|similarity_weight| similarity_weight.boost_by(boost));
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
+        if self.slop == 0
+            && self.phrase_terms.len() > 2
+            && self
+                .phrase_terms
+                .iter()
+                .enumerate()
+                .any(|(ord, (_, term))| {
+                    self.phrase_terms[..ord]
+                        .iter()
+                        .any(|(_, other)| other == term)
+                })
+        {
+            let mut groups: Vec<(Vec<usize>, &Term)> = Vec::new();
+            for (offset, term) in &self.phrase_terms {
+                if let Some((offsets, _)) = groups.iter_mut().find(|(_, other)| *other == term) {
+                    offsets.push(*offset);
+                } else {
+                    groups.push((vec![*offset], term));
+                }
+            }
+            if groups.len() >= 2 && groups.len() < self.phrase_terms.len() {
+                let mut postings = Vec::with_capacity(groups.len());
+                for (offsets, term) in groups {
+                    let Some(term_postings) = reader
+                        .inverted_index(term.field())?
+                        .read_postings(term, IndexRecordOption::WithFreqsAndPositions)?
+                    else {
+                        return Ok(None);
+                    };
+                    postings.push((offsets, term_postings));
+                }
+                return Ok(Some(PhraseScorer::new_grouped(
+                    postings,
+                    similarity_weight_opt,
+                    fieldnorm_reader,
+                )));
+            }
+        }
         let mut term_postings_list = Vec::new();
         for &(offset, ref term) in &self.phrase_terms {
             if let Some(postings) = reader
@@ -177,6 +215,8 @@ mod tests {
             "a c b".to_string(),
             "c".to_string(),
             String::new(),
+            "a b a a b a b a a a a b a a b a b a a a".to_string(),
+            "a b a b a b a b a b a b a b".to_string(),
         ];
         let mut seed = 42u32;
         for len in 1..320 {
@@ -216,6 +256,24 @@ mod tests {
                 vec![(0, "a"), (1, "b"), (2, "c")],
                 vec![(0, "a"), (2, "b")],
                 vec![(0, "missing"), (1, "b")],
+                vec![(0, "a"), (1, "b"), (2, "a")],
+                vec![(0, "a"), (1, "b"), (2, "b"), (3, "a")],
+                vec![(0, "a"), (1, "b"), (2, "a"), (3, "b"), (4, "a")],
+                vec![(2, "a"), (5, "b"), (8, "a")],
+                vec![(0, "a"), (0, "a"), (1, "b")],
+                vec![(0, "a"), (1, "a"), (2, "a")],
+                vec![
+                    (0, "a"),
+                    (1, "b"),
+                    (2, "a"),
+                    (3, "a"),
+                    (4, "b"),
+                    (5, "a"),
+                    (6, "b"),
+                    (7, "a"),
+                    (8, "a"),
+                    (9, "a"),
+                ],
             ] {
                 for slop in [0, 1, 2] {
                     let mut query = PhraseQuery::new_with_offset(
@@ -240,6 +298,39 @@ mod tests {
                                     expected.push((baseline.doc(), baseline.score()));
                                     baseline.advance();
                                 }
+                                let mut term_postings = Vec::new();
+                                for (offset, term) in &weight.phrase_terms {
+                                    let Some(postings) =
+                                        reader.inverted_index(term.field())?.read_postings(
+                                            term,
+                                            IndexRecordOption::WithFreqsAndPositions,
+                                        )?
+                                    else {
+                                        term_postings.clear();
+                                        break;
+                                    };
+                                    term_postings.push((*offset, postings));
+                                }
+                                let mut legacy_matches = Vec::new();
+                                if !term_postings.is_empty() {
+                                    let mut legacy = PhraseScorer::new(
+                                        term_postings,
+                                        weight
+                                            .similarity_weight_opt
+                                            .as_ref()
+                                            .map(|weight| weight.boost_by(boost)),
+                                        weight.fieldnorm_reader(reader)?,
+                                        slop,
+                                    );
+                                    while legacy.doc() != TERMINATED {
+                                        legacy_matches.push((legacy.doc(), legacy.score()));
+                                        legacy.advance();
+                                    }
+                                }
+                                assert_eq!(
+                                    expected, legacy_matches,
+                                    "{offsets:?}, slop={slop}, scoring={scoring}, boost={boost}"
+                                );
                                 let mut thresholds = vec![Score::MIN, -1.0, 0.0, Score::MAX];
                                 for &(_, score) in expected.iter().step_by(17) {
                                     thresholds.extend([score.next_down(), score, score.next_up()]);

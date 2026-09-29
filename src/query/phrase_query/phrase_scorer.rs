@@ -12,6 +12,8 @@ use crate::{DocId, Score};
 
 struct PostingsWithOffset<TPostings> {
     offset: u32,
+    additional_offsets: Vec<u32>,
+    positions_buffer: Vec<u32>,
     postings: TPostings,
 }
 
@@ -19,12 +21,48 @@ impl<TPostings: Postings> PostingsWithOffset<TPostings> {
     pub fn new(segment_postings: TPostings, offset: u32) -> PostingsWithOffset<TPostings> {
         PostingsWithOffset {
             offset,
+            additional_offsets: Vec::new(),
+            positions_buffer: Vec::new(),
             postings: segment_postings,
         }
     }
 
     pub fn positions(&mut self, output: &mut Vec<u32>) {
-        self.postings.positions_with_offset(self.offset, output)
+        if self.additional_offsets.is_empty() {
+            self.postings.positions_with_offset(self.offset, output);
+            return;
+        }
+        if self.postings.term_freq() as usize <= self.additional_offsets.len() {
+            output.clear();
+            return;
+        }
+        self.postings.positions(&mut self.positions_buffer);
+        output.clear();
+        output.extend(
+            self.positions_buffer
+                .iter()
+                .map(|position| position + self.offset),
+        );
+        for &offset in &self.additional_offsets {
+            intersection_with_offset(output, &self.positions_buffer, offset);
+            if output.is_empty() {
+                break;
+            }
+        }
+    }
+
+    fn intersect_positions(&mut self, output: &mut Vec<u32>) {
+        if self.postings.term_freq() as usize <= self.additional_offsets.len() {
+            output.clear();
+            return;
+        }
+        self.postings.positions(&mut self.positions_buffer);
+        for offset in std::iter::once(self.offset).chain(self.additional_offsets.iter().copied()) {
+            intersection_with_offset(output, &self.positions_buffer, offset);
+            if output.is_empty() {
+                break;
+            }
+        }
     }
 }
 
@@ -113,6 +151,11 @@ pub(crate) fn intersection_count(left: &[u32], right: &[u32]) -> usize {
 /// Returns the length of the intersection
 #[inline]
 fn intersection(left: &mut Vec<u32>, right: &[u32]) {
+    intersection_with_offset(left, right, 0);
+}
+
+#[inline]
+fn intersection_with_offset(left: &mut Vec<u32>, right: &[u32], offset: u32) {
     let mut left_index = 0;
     let mut right_index = 0;
     let mut count = 0;
@@ -120,7 +163,7 @@ fn intersection(left: &mut Vec<u32>, right: &[u32]) {
     let right_len = right.len();
     while left_index < left_len && right_index < right_len {
         let left_val = left[left_index];
-        let right_val = right[right_index];
+        let right_val = right[right_index] + offset;
         match left_val.cmp(&right_val) {
             Ordering::Less => {
                 left_index += 1;
@@ -372,20 +415,62 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         slop: u32,
         offset: usize,
     ) -> PhraseScorer<TPostings> {
-        let num_docs = fieldnorm_reader.num_docs();
         let max_offset = term_postings_with_offset
             .iter()
             .map(|&(offset, _)| offset)
             .max()
             .unwrap_or(0)
             + offset;
-        let num_docsets = term_postings_with_offset.len();
         let postings_with_offsets = term_postings_with_offset
             .into_iter()
             .map(|(offset, postings)| {
                 PostingsWithOffset::new(postings, (max_offset - offset) as u32)
             })
             .collect::<Vec<_>>();
+        Self::from_postings(
+            postings_with_offsets,
+            similarity_weight_opt,
+            fieldnorm_reader,
+            slop,
+        )
+    }
+
+    pub(crate) fn new_grouped(
+        term_postings: Vec<(Vec<usize>, TPostings)>,
+        similarity_weight_opt: Option<Bm25Weight>,
+        fieldnorm_reader: FieldNormReader,
+    ) -> Self {
+        let max_offset = term_postings
+            .iter()
+            .flat_map(|(offsets, _)| offsets)
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let postings = term_postings
+            .into_iter()
+            .map(|(mut offsets, postings)| {
+                offsets.sort_unstable();
+                offsets.dedup();
+                let mut posting =
+                    PostingsWithOffset::new(postings, (max_offset - offsets[0]) as u32);
+                posting.additional_offsets = offsets[1..]
+                    .iter()
+                    .map(|offset| (max_offset - offset) as u32)
+                    .collect();
+                posting
+            })
+            .collect();
+        Self::from_postings(postings, similarity_weight_opt, fieldnorm_reader, 0)
+    }
+
+    fn from_postings(
+        postings_with_offsets: Vec<PostingsWithOffset<TPostings>>,
+        similarity_weight_opt: Option<Bm25Weight>,
+        fieldnorm_reader: FieldNormReader,
+        slop: u32,
+    ) -> Self {
+        let num_docs = fieldnorm_reader.num_docs();
+        let num_docsets = postings_with_offsets.len();
         let intersection_docset = Intersection::new(postings_with_offsets, num_docs);
         let mut scorer = PhraseScorer {
             intersection_docset,
@@ -437,10 +522,10 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
                 let fieldnorm_id = self.fieldnorm_id();
                 let max_phrase_count = (0..self.num_terms)
                     .map(|ord| {
-                        self.intersection_docset
-                            .docset_specialized(ord)
-                            .postings
+                        let term = self.intersection_docset.docset_specialized(ord);
+                        term.postings
                             .term_freq()
+                            .saturating_sub(term.additional_offsets.len() as u32)
                     })
                     .min()
                     .unwrap();
@@ -519,7 +604,18 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
                 self.left_slops.clear();
             }
         }
+        if self.left_positions.is_empty() {
+            return;
+        }
         for i in 1..self.num_terms - 1 {
+            let term = self.intersection_docset.docset_mut_specialized(i);
+            if !term.additional_offsets.is_empty() {
+                term.intersect_positions(&mut self.left_positions);
+                if self.left_positions.is_empty() {
+                    return;
+                }
+                continue;
+            }
             {
                 self.intersection_docset
                     .docset_mut_specialized(i)
@@ -551,9 +647,16 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
                 return;
             }
         }
-        self.intersection_docset
-            .docset_mut_specialized(self.num_terms - 1)
-            .positions(&mut self.right_positions);
+        let last = self
+            .intersection_docset
+            .docset_mut_specialized(self.num_terms - 1);
+        if last.additional_offsets.is_empty() {
+            last.positions(&mut self.right_positions);
+        } else {
+            last.intersect_positions(&mut self.left_positions);
+            self.right_positions.clear();
+            self.right_positions.extend_from_slice(&self.left_positions);
+        }
     }
 
     fn has_slop(&self) -> bool {
