@@ -130,6 +130,20 @@ fn align_scorers(
 // Advance term_scorers[..pivot_len] and out of these removes the terminated scores.
 // Restores the ordering of term_scorers.
 fn advance_all_scorers_on_pivot(term_scorers: &mut Vec<TermScorerWithMaxScore>, pivot_len: usize) {
+    if term_scorers.len() == 2 && pivot_len == 2 {
+        let left = term_scorers[0].advance();
+        let right = term_scorers[1].advance();
+        if left > right {
+            term_scorers.swap(0, 1);
+        }
+        if term_scorers[1].doc() == TERMINATED {
+            term_scorers.pop();
+            if term_scorers[0].doc() == TERMINATED {
+                term_scorers.clear();
+            }
+        }
+        return;
+    }
     if pivot_len == 1 {
         if term_scorers[0].advance() == TERMINATED {
             term_scorers.swap_remove(0);
@@ -181,13 +195,38 @@ pub fn block_wand_single_scorer(
 struct TermScorerWithMaxScore {
     scorer: Box<TermScorer>,
     max_score: Score,
+    doc: DocId,
+}
+
+impl TermScorerWithMaxScore {
+    #[inline]
+    fn doc(&self) -> DocId {
+        self.doc
+    }
+
+    #[inline]
+    fn advance(&mut self) -> DocId {
+        self.doc = self.scorer.advance();
+        self.doc
+    }
+
+    #[inline]
+    fn seek(&mut self, target: DocId) -> DocId {
+        self.doc = self.scorer.seek(target);
+        self.doc
+    }
 }
 
 impl From<TermScorer> for TermScorerWithMaxScore {
     fn from(scorer: TermScorer) -> Self {
         let scorer = Box::new(scorer);
         let max_score = scorer.max_score();
-        TermScorerWithMaxScore { scorer, max_score }
+        let doc = scorer.doc();
+        TermScorerWithMaxScore {
+            scorer,
+            max_score,
+            doc,
+        }
     }
 }
 
