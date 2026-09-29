@@ -180,7 +180,7 @@ fn l2_cluster(
                 0.0,
             );
             initial_sigmas = sigmas.clone();
-            let docs: Vec<_> = (0..n as u32).collect();
+            let docs: Vec<_> = (0..n as u32).flat_map(u32::to_le_bytes).collect();
             scan.candidates.append_selected(
                 0..n,
                 &Selection::All,

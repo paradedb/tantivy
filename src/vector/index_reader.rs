@@ -1,7 +1,8 @@
 //! Per-segment vector metadata, block columns and optional IVF routing.
 //!
 //! Metadata opens independently of search state. The first search-reader request
-//! pins IdMap and routing state and validates deferred row-group geometry.
+//! pins routing state and validates deferred row-group geometry. Clustered IdMap
+//! entries open only for document lookups.
 //! Cluster boundaries come from the centroid file. See FORMAT.md.
 
 use std::cmp::Ordering;
@@ -27,8 +28,7 @@ use super::prepared::{
 };
 use super::quantization::{
     quantized_code_tail_is_zero, QUANTIZED_BOUNDARY_KAPPA, QUANTIZED_CONSTANT_STRIDE,
-    QUANTIZED_ERROR_RATIO_STRIDE, QUANTIZED_GAMMA_STRIDE, QUANTIZED_RESIDUAL_NORM_STRIDE,
-    QUANTIZED_SCALE_STRIDE,
+    QUANTIZED_ERROR_RATIO_STRIDE, QUANTIZED_GAMMA_STRIDE, QUANTIZED_SCALE_STRIDE,
 };
 use super::storage_io::VectorRead;
 use super::VEC_EXT;
@@ -699,6 +699,7 @@ pub(crate) struct QuantizedLayerReader {
 /// Pinned SoA ranges for one contiguous cluster posting.
 pub(crate) struct QuantizedLayerBatch {
     pub(crate) residual_norms: Option<OwnedBytes>,
+    pub(crate) doc_ids: Option<OwnedBytes>,
     codes: OwnedBytes,
     scales: OwnedBytes,
     gammas: OwnedBytes,
@@ -1031,13 +1032,19 @@ impl QuantizedLayerReader {
     /// Pins one band's columns in a single request, then restricts views to the requested rows.
     pub(crate) fn read_batch(&self, rows: Range<usize>) -> crate::Result<QuantizedLayerBatch> {
         let b = self.blocks.block_for_range(&rows)?;
-        let views = self.blocks.read_band(b, self.layer)?;
+        let (span, bytes) = self.blocks.read_band(b, self.layer)?;
         let view = |idx: usize| -> OwnedBytes {
-            let bytes = &views.iter().find(|(i, _)| *i == idx).unwrap().1;
+            let column =
+                super::blocks::column_range(&self.blocks.slots, self.blocks.rows_in(b), idx);
+            let start = self.blocks.block_start(b) + column.start - span.start;
             let stride = self.blocks.slots[idx].stride as usize;
             let first = self.blocks.block_rows[b];
-            bytes.slice((rows.start - first) * stride..(rows.end - first) * stride)
+            bytes.slice(start + (rows.start - first) * stride..start + (rows.end - first) * stride)
         };
+        let doc_ids = (self.layer == 0 && self.blocks.clustered()).then(|| view(1));
+        if let Some(bytes) = &doc_ids {
+            validate_doc_ids(bytes)?;
+        }
         let codes = view(self.codes);
         self.validate_codes(&codes, &rows)?;
         Ok(QuantizedLayerBatch {
@@ -1046,7 +1053,9 @@ impl QuantizedLayerReader {
             gammas: view(self.gammas),
             error_ratios: view(self.errors),
             constants: self.constants.map(view),
-            residual_norms: (self.layer == 0).then(|| view(1)),
+            residual_norms: (self.layer == 0)
+                .then(|| view(if self.blocks.clustered() { 2 } else { 1 })),
+            doc_ids,
             rows,
             code_stride: self.code_stride,
         })
@@ -1326,17 +1335,12 @@ fn plan_block_column(
     }
 }
 
-/// Field-keyed quantized payloads resolved from immutable index metadata.
+/// Stored layer readers and shared query-preparation metadata.
 pub(crate) struct QuantizedFieldReader {
     index_ctx: Arc<QuantizedIndexCtx>,
     layers: Vec<QuantizedLayerReader>,
     blocks: Arc<Blocks>,
     norms: usize,
-}
-
-pub(crate) struct QuantizedResidualNormBatch {
-    bytes: OwnedBytes,
-    rows: Range<usize>,
 }
 
 /// Storage-planned borrowed views of selected fp32 rows.
@@ -1389,17 +1393,6 @@ impl<'a> Iterator for VectorRowBatchIter<'a> {
     }
 }
 
-impl QuantizedResidualNormBatch {
-    /// Returns the fixed-stride little-endian f32 range for one cluster pin.
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        debug_assert_eq!(
-            self.bytes.len(),
-            self.rows.len() * QUANTIZED_RESIDUAL_NORM_STRIDE
-        );
-        &self.bytes
-    }
-}
-
 impl QuantizedFieldReader {
     pub(crate) fn layers(&self) -> &[QuantizedLayerReader] {
         &self.layers
@@ -1408,26 +1401,8 @@ impl QuantizedFieldReader {
         let bytes = self.read_residual_norms(row..row + 1)?;
         Ok(f32::from_le_bytes(bytes.as_slice().try_into().unwrap()))
     }
-    pub(crate) fn read_residual_norm_batch(
-        &self,
-        rows: Range<usize>,
-    ) -> crate::Result<QuantizedResidualNormBatch> {
-        Ok(QuantizedResidualNormBatch {
-            bytes: self.read_residual_norms(rows.clone())?,
-            rows,
-        })
-    }
     pub(crate) fn read_residual_norms(&self, rows: Range<usize>) -> crate::Result<OwnedBytes> {
         self.blocks.read_column(self.norms, rows)
-    }
-    pub(crate) fn plan_residual_norm_reads(
-        &self,
-        available: Range<usize>,
-        rows: &[usize],
-        ranges: &mut Vec<Range<usize>>,
-        scratch: &mut Vec<(usize, usize)>,
-    ) {
-        plan_block_column(&self.blocks, self.norms, available, rows, ranges, scratch);
     }
     pub(crate) fn index_ctx(&self) -> &Arc<QuantizedIndexCtx> {
         &self.index_ctx
@@ -1437,9 +1412,9 @@ impl QuantizedFieldReader {
 /// Every vector field declares exactly the two format entries.
 fn validate_vector_entries(composite: &CompositeFile, field: Field) -> crate::Result<()> {
     if composite.field_indices().any(|(_, idx)| idx > 1)
-        || composite
-            .open_read_with_idx(field, VectorEntry::IdMap.index())
-            .is_none()
+        || !composite
+            .field_indices()
+            .any(|(f, idx)| f == field && idx == VectorEntry::IdMap.index())
         || composite
             .open_read_with_idx(field, VectorEntry::Data.index())
             .is_none()
@@ -1469,10 +1444,65 @@ type CentroidSlices = (
 
 struct VectorSource {
     metadata: BlockMetadata,
-    id_map: FileSlice,
+    composite: CompositeFile,
+    field: Field,
     max_doc: DocId,
-    field_name: String,
     centroid_slots: Option<CentroidSlices>,
+}
+
+/// Rejects duplicate or descending document ids before exposing a block to row selection.
+fn validate_doc_ids(bytes: &[u8]) -> crate::Result<()> {
+    let mut previous = None;
+    for bytes in bytes.chunks_exact(4) {
+        let doc = u32::from_le_bytes(bytes.try_into().unwrap());
+        if previous.is_some_and(|prev| prev >= doc) {
+            return Err(DataCorruption::comment_only("DocIds must ascend within a block").into());
+        }
+        previous = Some(doc);
+    }
+    Ok(())
+}
+/// Decodes validated block-local document ids.
+fn decode_doc_ids(bytes: &[u8]) -> crate::Result<Vec<DocId>> {
+    validate_doc_ids(bytes)?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .collect())
+}
+
+/// Opens an addressing entry only when a document lookup needs it; failures are shared.
+struct DeferredIdMap {
+    source: Option<(CompositeFile, Field, DocId)>,
+    value: OnceLock<crate::Result<IdMap>>,
+}
+impl DeferredIdMap {
+    /// Stores a map whose bytes need no deferred entry access.
+    fn ready(map: IdMap) -> Self {
+        Self {
+            source: None,
+            value: OnceLock::from(Ok(map)),
+        }
+    }
+    /// Initializes the entry once and checks its variant against the stored partition.
+    fn get(&self, clustered: bool) -> crate::Result<&IdMap> {
+        self.value
+            .get_or_init(|| {
+                let (composite, field, max_doc) =
+                    self.source.as_ref().expect("deferred entry source");
+                let entry = composite
+                    .open_read_with_idx(*field, VectorEntry::IdMap.index())
+                    .unwrap();
+                let map = IdMap::open(entry, *max_doc)
+                    .map_err(|e| DataCorruption::comment_only(e.to_string()))?;
+                if matches!(map, IdMap::DocLocations(_)) != clustered {
+                    return Err(DataCorruption::comment_only("partition/id-map mismatch").into());
+                }
+                Ok(map)
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
 }
 
 /// Per-(segment, field) vector reader: the row store plus, for IVF segments,
@@ -1485,8 +1515,8 @@ pub struct VectorIndexReader {
     /// `false` for the placeholder built by [`Self::empty`] — the segment has
     /// no vector data for this field at all.
     present: bool,
-    /// Row-to-document map.
-    id_map: IdMap,
+    /// Document addressing, deferred until a lookup requires the entry.
+    id_map: DeferredIdMap,
     /// Deferred row-group columns and their validated geometry.
     rows_slice: Arc<Blocks>,
     index: Option<IvfIndex>,
@@ -1557,9 +1587,6 @@ impl VectorFieldReader {
             .map_err(|e| DataCorruption::comment_only(e.to_string()))?;
         let vec_composite = CompositeFile::open(&body)?;
         validate_vector_entries(&vec_composite, field)?;
-        let id_map_slice = vec_composite
-            .open_read_with_idx(field, VectorEntry::IdMap.index())
-            .unwrap();
         let data = vec_composite
             .open_read_with_idx(field, VectorEntry::Data.index())
             .unwrap();
@@ -1568,9 +1595,9 @@ impl VectorFieldReader {
             options,
             source: Some(VectorSource {
                 metadata,
-                id_map: id_map_slice,
+                composite: vec_composite,
+                field,
                 max_doc: segment_reader.max_doc(),
-                field_name: entry.name().to_owned(),
                 centroid_slots,
             }),
             search: OnceLock::new(),
@@ -1599,42 +1626,27 @@ impl VectorIndexReader {
             return Ok(Self::empty(options));
         };
         let centroid_slots = source.centroid_slots.clone();
-        let id_map = IdMap::open(source.id_map.clone(), source.max_doc)
-            .map_err(|e| DataCorruption::comment_only(e.to_string()))?;
-
-        // The id-map variant and the `.centroids` sidecar are two signals of
-        // one write-path decision; a mismatch means a corrupt segment, never a
-        // fallback.
-        let index = match (&id_map, centroid_slots) {
-            (IdMap::Explicit(_), Some((version, centroids, offsets, router_slot, bounds))) => Some(
-                IvfIndex::open(version, &options, centroids, offsets, router_slot, bounds)?,
-            ),
-            (IdMap::Explicit(_), None) => {
-                return Err(DataCorruption::comment_only(format!(
-                    "vector field {:?} has cluster-sorted rows but no `.centroids` data",
-                    source.field_name
-                ))
-                .into());
-            }
-            (_, Some(_)) => {
-                return Err(DataCorruption::comment_only(format!(
-                    "vector field {:?} has `.centroids` data but doc-ordered rows",
-                    source.field_name
-                ))
-                .into());
-            }
-            (_, None) => None,
+        let id_map = DeferredIdMap {
+            source: Some((source.composite.clone(), source.field, source.max_doc)),
+            value: OnceLock::new(),
         };
-
-        let num_rows = id_map.num_rows() as usize;
-        if let Some(index) = &index {
-            if index.num_rows() != num_rows {
-                return Err(DataCorruption::comment_only(
-                    "IVF id-map length does not match the cluster offsets",
-                )
-                .into());
-            }
-        }
+        let index = if let Some((version, centroids, offsets, router_slot, bounds)) = centroid_slots
+        {
+            Some(IvfIndex::open(
+                version,
+                &options,
+                centroids,
+                offsets,
+                router_slot,
+                bounds,
+            )?)
+        } else {
+            None
+        };
+        let num_rows = match &index {
+            Some(index) => index.num_rows(),
+            None => id_map.get(false)?.num_rows() as usize,
+        };
         let cluster_rows = index.as_ref().map(|ivf| {
             (0..ivf.num_clusters())
                 .map(|b| ivf.cluster_range(b).start)
@@ -1692,7 +1704,7 @@ impl VectorIndexReader {
                     index_ctx: Arc::new(QuantizedIndexCtx::new(Arc::clone(&rows_slice.meta))?),
                     layers,
                     blocks: Arc::clone(&rows_slice),
-                    norms: 1,
+                    norms: if rows_slice.clustered() { 2 } else { 1 },
                 })
             } else {
                 None
@@ -1728,10 +1740,15 @@ impl VectorIndexReader {
             num_vectors: 0,
             present: false,
             rows_slice,
-            id_map: IdMap::Identity { num_docs: 0 },
+            id_map: DeferredIdMap::ready(IdMap::Identity { num_docs: 0 }),
             index: None,
             quantization: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn id_map_initialized(&self) -> bool {
+        self.id_map.value.get().is_some()
     }
 
     /// Returns this segment's stored field metadata, independent of index build settings.
@@ -1872,17 +1889,7 @@ impl VectorIndexReader {
 
     /// Counts distinct live IVF documents without decoding vector rows.
     pub fn live_distinct_vector_count(&self, alive: Option<&AliveBitSet>) -> usize {
-        let Some(index) = &self.index else {
-            return 0;
-        };
-        let mut docs = BTreeMap::new();
-        for row in 0..index.num_rows() {
-            let doc_id = self.doc_id_at(row);
-            if alive.is_none_or(|alive| alive.is_alive(doc_id)) {
-                docs.insert(doc_id, ());
-            }
-        }
-        docs.len()
+        self.live_posting_row_count(alive)
     }
 
     /// Measures normalized estimator errors over a deterministic posting-row sample.
@@ -2480,14 +2487,25 @@ impl VectorIndexReader {
         let Some(index) = &self.index else {
             return 0;
         };
-        (0..index.num_rows())
-            .filter(|&row| alive.is_none_or(|alive| alive.is_alive(self.doc_id_at(row))))
-            .count()
+        let Some(alive) = alive else {
+            return index.num_rows();
+        };
+        (0..index.num_clusters())
+            .map(|cluster| {
+                self.row_doc_ids(index.cluster_range(cluster))
+                    .expect("readable document ids")
+                    .into_iter()
+                    .filter(|&doc| alive.is_alive(doc))
+                    .count()
+            })
+            .sum()
     }
 
     /// `true` if `doc_id` has a stored vector.
     pub fn contains(&self, doc_id: DocId) -> bool {
-        self.row_id(doc_id).is_some()
+        self.row_id(doc_id)
+            .expect("readable document location")
+            .is_some()
     }
 
     /// The raw little-endian bytes of `doc_id`'s vector, fetched with one
@@ -2498,7 +2516,25 @@ impl VectorIndexReader {
     ///
     /// Returns an error when the vector row cannot be read.
     pub fn vector_bytes(&self, doc_id: DocId) -> crate::Result<Option<OwnedBytes>> {
-        let Some(row) = self.row_id(doc_id) else {
+        if self.rows_slice.clustered() {
+            let Some(location) = self
+                .id_map
+                .get(true)?
+                .locate(doc_id, &self.rows_slice.block_rows)
+                .map_err(|e| DataCorruption::comment_only(e.to_string()))?
+            else {
+                return Ok(None);
+            };
+            let stride = self.options.bytes_per_vector();
+            let start = location.local as usize * stride;
+            return Ok(Some(
+                self.rows_slice
+                    .column(location.cluster as usize, 0)
+                    .slice(start..start + stride)
+                    .read_vector_bytes()?,
+            ));
+        }
+        let Some(row) = self.row_id(doc_id)? else {
             return Ok(None);
         };
         self.vector_bytes_for_row(row).map(Some)
@@ -2515,7 +2551,7 @@ impl VectorIndexReader {
     ///
     /// Returns an error when `row` is out of bounds or cannot be read.
     pub fn vector_bytes_for_row(&self, row: usize) -> crate::Result<OwnedBytes> {
-        if row >= self.id_map.num_rows() as usize {
+        if row >= *self.rows_slice.block_rows.last().unwrap() {
             return Err(TantivyError::InvalidArgument(format!(
                 "vector row {row} is out of bounds"
             )));
@@ -2530,7 +2566,7 @@ impl VectorIndexReader {
         read_ranges: &mut Vec<Range<usize>>,
         block_scratch: &mut Vec<(usize, usize)>,
     ) -> crate::Result<VectorRowBatch> {
-        let num_rows = self.id_map.num_rows() as usize;
+        let num_rows = *self.rows_slice.block_rows.last().unwrap();
         if rows.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(TantivyError::InvalidArgument(
                 "planned vector rows must be strictly increasing".to_string(),
@@ -2578,70 +2614,70 @@ impl VectorIndexReader {
         })
     }
 
-    /// The doc id stored at `row` of the cluster-sorted permutation, decoded
-    /// on demand from the pinned `Explicit` id-map. IVF storage only.
-    /// Returns the document id at one IVF row.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the reader is not IVF-backed or `row` is out of bounds.
-    #[inline]
+    /// Reads a clustered document id from its Data column, or selects a flat bitmap row.
+    /// Panics if storage is corrupt or unreadable; fallible operations use `row_doc_ids`.
     pub fn doc_id_at(&self, row: usize) -> DocId {
-        let IdMap::Explicit(bytes) = &self.id_map else {
-            unreachable!("doc_id_at is only meaningful for cluster-sorted (IVF) storage");
-        };
-        let start = row * std::mem::size_of::<DocId>();
-        DocId::from_le_bytes(
-            bytes[start..start + std::mem::size_of::<DocId>()]
-                .try_into()
-                .unwrap(),
-        )
+        self.row_doc_ids(row..row + 1)
+            .expect("readable document ids")[0]
     }
-
-    /// The doc ids assigned to `cluster`, ascending; `None` if the storage is
-    /// not IVF or `cluster` is out of bounds.
-    /// Returns the sorted document ids assigned to an IVF cluster.
+    /// Reads and validates ascending document ids without opening the clustered IdMap.
+    pub(crate) fn row_doc_ids(&self, rows: Range<usize>) -> crate::Result<Vec<DocId>> {
+        if !self.rows_slice.clustered() {
+            let map = self.id_map.get(false)?;
+            return Ok(rows.map(|row| map.doc_at(row as u32)).collect());
+        }
+        let bytes = self.rows_slice.read_column(1, rows)?;
+        decode_doc_ids(&bytes)
+    }
+    /// Returns sorted document ids assigned to a cluster, or None for an invalid cluster.
     pub fn cluster_doc_ids(&self, cluster: usize) -> Option<Vec<DocId>> {
         let index = self.index.as_ref()?;
-        if cluster >= index.num_clusters() {
-            return None;
-        }
-        Some(
-            index
-                .cluster_range(cluster)
-                .map(|row| self.doc_id_at(row))
-                .collect(),
-        )
+        (cluster < index.num_clusters()).then(|| {
+            self.row_doc_ids(index.cluster_range(cluster))
+                .expect("readable document ids")
+        })
     }
-
-    /// Doc → dense row. For clustered storage, rows are cluster-sorted and
-    /// ascending by doc id within each cluster, so this scans clusters and
-    /// binary-searches each one over the pinned id-map bytes. For the flat
-    /// id-maps (`Identity`/`Bitmap`) the mapping is strictly ascending in
-    /// doc id — the property the exact path's run builder leans on.
-    /// Returns the dense row containing a document's vector.
-    pub(crate) fn row_id(&self, doc_id: DocId) -> Option<usize> {
-        match &self.id_map {
-            IdMap::Identity { num_docs } => (doc_id < *num_docs).then_some(doc_id as usize),
-            IdMap::Bitmap(_) => self.id_map.rank_if_exists(doc_id).map(|row| row as usize),
-            IdMap::Explicit(_) => {
-                let index = self.index.as_ref()?;
-                for cluster in 0..index.num_clusters() {
-                    let rows = index.cluster_range(cluster);
-                    let mut lo = rows.start;
-                    let mut hi = rows.end;
-                    while lo < hi {
-                        let mid = lo + (hi - lo) / 2;
-                        match self.doc_id_at(mid).cmp(&doc_id) {
-                            Ordering::Less => lo = mid + 1,
-                            Ordering::Greater => hi = mid,
-                            Ordering::Equal => return Some(mid),
-                        }
-                    }
-                }
-                None
+    /// Resolves one document by direct location or flat bitmap rank, validating stored coordinates.
+    pub(crate) fn row_id(&self, doc_id: DocId) -> crate::Result<Option<usize>> {
+        let clustered = self.rows_slice.clustered();
+        let map = self.id_map.get(clustered)?;
+        if clustered {
+            let location = map
+                .locate(doc_id, &self.rows_slice.block_rows)
+                .map_err(|e| DataCorruption::comment_only(e.to_string()))?;
+            Ok(location
+                .map(|loc| self.rows_slice.block_rows[loc.cluster as usize] + loc.local as usize))
+        } else {
+            Ok(map.rank_if_exists(doc_id).map(|row| row as usize))
+        }
+    }
+    /// Walks source blocks in row order with rows and document ids pinned together.
+    pub(crate) fn for_each_row(
+        &self,
+        mut visit: impl FnMut(usize, DocId, &[u8]) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        for b in 0..self.rows_slice.block_rows.len() - 1 {
+            let (bytes, docs) = self.rows_slice.read_exact(b)?;
+            let docs = match docs {
+                Some(bytes) => decode_doc_ids(&bytes)?,
+                None => self.row_doc_ids(
+                    self.rows_slice.block_rows[b]..self.rows_slice.block_rows[b + 1],
+                )?,
+            };
+            for (local, (row, doc)) in bytes
+                .chunks_exact(self.options.bytes_per_vector())
+                .zip(docs)
+                .enumerate()
+            {
+                visit(self.rows_slice.block_rows[b] + local, doc, row)?;
             }
         }
+        Ok(())
+    }
+    /// Pins rows and document ids together for one exact cluster scan.
+    pub(crate) fn exact_cluster(&self, cluster: usize) -> crate::Result<(OwnedBytes, Vec<DocId>)> {
+        let (rows, docs) = self.rows_slice.read_exact(cluster)?;
+        Ok((rows, decode_doc_ids(&docs.expect("clustered DocIds"))?))
     }
 }
 
@@ -2748,7 +2784,11 @@ mod tests {
                     }
                     _ => &[],
                 };
-                if bytes.is_empty() {
+                if matches!(slot.slot_type, SlotType::DocIds) {
+                    for row in rows[0]..rows[1] {
+                        out.extend_from_slice(&(row as u32).to_le_bytes());
+                    }
+                } else if bytes.is_empty() {
                     pad(&mut out, range.len()).unwrap();
                 } else {
                     out.extend_from_slice(bytes);
@@ -2780,11 +2820,11 @@ mod tests {
         QuantizedLayerReader {
             blocks,
             layer: 0,
-            codes: 2,
-            scales: 3,
-            gammas: 4,
-            errors: 5,
-            constants: constants.map(|_| 6),
+            codes: 3,
+            scales: 4,
+            gammas: 5,
+            errors: 6,
+            constants: constants.map(|_| 7),
             code_stride: stride,
             dim,
             bits,
@@ -2818,6 +2858,91 @@ mod tests {
             .collect()
     }
 
+    fn tracked_id_composite(ids: Vec<u8>, reads: &Arc<Mutex<Vec<Range<usize>>>>) -> CompositeFile {
+        let mut bytes = Vec::new();
+        let mut writer = crate::directory::CompositeWrite::wrap(&mut bytes);
+        writer
+            .for_field_with_idx(Field::from_field_id(0), VectorEntry::IdMap.index())
+            .write_all(&ids)
+            .unwrap();
+        writer.close().unwrap();
+        let composite = CompositeFile::open(&FileSlice::new(Arc::new(BlockTrackedBytes {
+            bytes,
+            reads: Arc::clone(reads),
+            block_len: 16,
+        })))
+        .unwrap();
+        reads.lock().unwrap().clear();
+        composite
+    }
+
+    // Opening reads only the tag; a lookup reads exactly its eight-byte record.
+    #[test]
+    fn location_lookup_reads_one_record_and_defers_entry() -> crate::Result<()> {
+        use super::super::flat::id_map::DocLocation;
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let mut bytes = Vec::new();
+        IdMap::serialize_locations(
+            &[
+                DocLocation::ABSENT,
+                DocLocation {
+                    cluster: 0,
+                    local: 0,
+                },
+                DocLocation {
+                    cluster: 0,
+                    local: 1,
+                },
+            ],
+            &mut bytes,
+        )?;
+        let map = DeferredIdMap {
+            source: Some((
+                tracked_id_composite(bytes, &reads),
+                Field::from_field_id(0),
+                3,
+            )),
+            value: OnceLock::new(),
+        };
+        assert!(reads.lock().unwrap().is_empty());
+        let opened = map.get(true)?;
+        assert_eq!(&*reads.lock().unwrap(), &[0..1]);
+        reads.lock().unwrap().clear();
+        assert_eq!(
+            opened.locate(2, &[0, 2])?,
+            Some(DocLocation {
+                cluster: 0,
+                local: 1
+            })
+        );
+        assert_eq!(&*reads.lock().unwrap(), &[17..25]);
+        Ok(())
+    }
+
+    // Both named scan spans pin a block with one request and expose column views.
+    #[test]
+    fn exact_and_layer_spans_read_once_per_block() -> crate::Result<()> {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let layer = test_layer_tracked(
+            FileSlice::from(Vec::new()),
+            FileSlice::from(Vec::new()),
+            None,
+            &[0, 3],
+            64,
+            1,
+            Some((Arc::clone(&reads), 32)),
+        );
+        reads.lock().unwrap().clear();
+        let (rows, docs) = layer.blocks.read_exact(0)?;
+        assert_eq!(rows.len(), 3 * 64 * 4);
+        assert_eq!(docs.unwrap().len(), 3 * 4);
+        assert_eq!(&*reads.lock().unwrap(), &[layer.blocks.exact_span(0)]);
+        reads.lock().unwrap().clear();
+        layer.read_batch(0..3)?;
+        assert_eq!(&*reads.lock().unwrap(), &[layer.blocks.layer_span(0, 0)]);
+        Ok(())
+    }
+
     #[test]
     fn metadata_defers_search_bytes_and_shares_initialization() -> crate::Result<()> {
         let options = VectorOptions::new(3, Metric::L2);
@@ -2846,13 +2971,9 @@ mod tests {
             options,
             source: Some(VectorSource {
                 metadata,
-                id_map: FileSlice::new(Arc::new(BlockTrackedBytes {
-                    bytes: ids,
-                    reads: Arc::clone(&id_reads),
-                    block_len: 16,
-                })),
+                composite: tracked_id_composite(ids, &id_reads),
+                field: Field::from_field_id(0),
                 max_doc: 3,
-                field_name: "v".into(),
                 centroid_slots: None,
             }),
             search: OnceLock::new(),
@@ -2880,7 +3001,7 @@ mod tests {
             1
         );
         assert_eq!(readers[0].num_vectors(), 1);
-        assert_eq!(readers[0].row_id(1), Some(0));
+        assert_eq!(readers[0].row_id(1)?, Some(0));
         Ok(())
     }
 
@@ -2895,13 +3016,9 @@ mod tests {
         let field = VectorFieldReader {
             source: Some(VectorSource {
                 metadata: BlockMetadata::open(FileSlice::from(data), &options, false)?,
-                id_map: FileSlice::new(Arc::new(BlockTrackedBytes {
-                    bytes: vec![0],
-                    reads: Arc::clone(&id_reads),
-                    block_len: 16,
-                })),
+                composite: tracked_id_composite(vec![0], &id_reads),
+                field: Field::from_field_id(0),
                 max_doc: 1,
-                field_name: "v".into(),
                 centroid_slots: None,
             }),
             options,
@@ -2948,9 +3065,9 @@ mod tests {
             options: VectorOptions::new(DIM, Metric::Dot),
             num_vectors: ROWS,
             present: true,
-            id_map: IdMap::Identity {
+            id_map: DeferredIdMap::ready(IdMap::Identity {
                 num_docs: ROWS as u32,
-            },
+            }),
             rows_slice: blocks,
             index: None,
             quantization: None,

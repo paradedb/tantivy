@@ -175,6 +175,7 @@ impl Slot {
 #[derive(Clone, Debug)]
 pub(crate) enum SlotType {
     Rows { dtype: VectorDType },
+    DocIds,
     ResidualNorms,
     QuantLayerCodes { layer: u8, quant: Quantizer },
     QuantLayerScales { layer: u8 },
@@ -189,6 +190,7 @@ impl SlotType {
             Self::Rows {
                 dtype: VectorDType::F32,
             } => ElemType::F32,
+            Self::DocIds => ElemType::U32,
             Self::QuantLayerCodes { quant, .. } => quant.codes_elem(),
             Self::QuantLayerGammas { .. } | Self::QuantLayerErrors { .. } => ElemType::F16,
             Self::ResidualNorms
@@ -200,7 +202,7 @@ impl SlotType {
     /// Norms share band zero so a first-layer scan needs one contiguous read.
     pub(crate) fn band(&self) -> Option<u8> {
         match self {
-            Self::Rows { .. } => None,
+            Self::Rows { .. } | Self::DocIds => None,
             Self::ResidualNorms => Some(0),
             Self::QuantLayerCodes { layer, .. }
             | Self::QuantLayerScales { layer }
@@ -308,13 +310,13 @@ impl VectorColMetadata {
             Self::Quantized { .. } => Some(
                 self.slots()
                     .iter()
-                    .skip(1)
+                    .filter(|slot| slot.slot_type.band().is_some())
                     .map(|slot| slot.stride as usize)
                     .sum(),
             ),
         }
     }
-    /// Rows come first for streaming writes; all remaining columns form scan bands.
+    /// Rows and clustered document ids precede residual norms and ordered layer bands.
     pub(crate) fn slots(&self) -> Vec<Slot> {
         let field = self.field();
         let mut slots = vec![Slot {
@@ -322,6 +324,13 @@ impl VectorColMetadata {
             elem: ElemType::F32,
             stride: field.dim * ElemType::F32.size() as u32,
         }];
+        if matches!(field.partition, Partition::Clusters) {
+            slots.push(Slot {
+                slot_type: SlotType::DocIds,
+                elem: ElemType::U32,
+                stride: ElemType::U32.size() as u32,
+            });
+        }
         if let Self::Quantized { layers, .. } = self {
             slots.push(Slot {
                 slot_type: SlotType::ResidualNorms,
@@ -685,97 +694,132 @@ mod tests {
     // Pins ordered slot semantics, widths, strides, and scan-band ownership.
     #[test]
     fn golden_slot_contract() {
-        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
-            for schedule in [&[1][..], &[2], &[3], &[4], &[1, 4], &[1, 2, 4]] {
-                let meta = metadata(metric, schedule);
-                let slots = meta.slots();
+        for clustered in [false, true] {
+            for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+                for schedule in [&[1][..], &[2], &[3], &[4], &[1, 4], &[1, 2, 4]] {
+                    let mut meta = metadata(metric, schedule);
+                    if !clustered {
+                        if let VectorColMetadata::Quantized { field, .. } = &mut meta {
+                            field.partition = Partition::Uniform {
+                                rows_per_block: FLAT_ROWS_PER_BLOCK,
+                            };
+                        }
+                    }
+                    let norms = if clustered { 2 } else { 1 };
+                    let slots = meta.slots();
+                    assert!(matches!(
+                        slots[0].slot_type,
+                        SlotType::Rows {
+                            dtype: VectorDType::F32
+                        }
+                    ));
+                    assert_eq!(
+                        (slots[0].elem, slots[0].stride, slots[0].slot_type.band()),
+                        (ElemType::F32, 400, None)
+                    );
+                    if clustered {
+                        assert!(matches!(slots[1].slot_type, SlotType::DocIds));
+                        assert_eq!(
+                            (slots[1].elem, slots[1].stride, slots[1].slot_type.band()),
+                            (ElemType::U32, 4, None)
+                        );
+                    }
+                    assert!(matches!(slots[norms].slot_type, SlotType::ResidualNorms));
+                    assert_eq!(
+                        (
+                            slots[norms].elem,
+                            slots[norms].stride,
+                            slots[norms].slot_type.band()
+                        ),
+                        (ElemType::F32, 4, Some(0))
+                    );
+                    let per_layer = if metric == Metric::L2 { 5 } else { 4 };
+                    assert_eq!(slots.len(), norms + 1 + schedule.len() * per_layer);
+                    for (l, &bits) in schedule.iter().enumerate() {
+                        let layer = l as u8;
+                        let cols =
+                            &slots[norms + 1 + l * per_layer..norms + 1 + (l + 1) * per_layer];
+                        assert!(
+                            matches!(&cols[0].slot_type, SlotType::QuantLayerCodes { layer: n, quant } if *n == layer && quant.bits() == bits)
+                        );
+                        assert!(
+                            matches!(cols[1].slot_type, SlotType::QuantLayerScales { layer: n } if n == layer)
+                        );
+                        assert!(
+                            matches!(cols[2].slot_type, SlotType::QuantLayerGammas { layer: n } if n == layer)
+                        );
+                        assert!(
+                            matches!(cols[3].slot_type, SlotType::QuantLayerErrors { layer: n } if n == layer)
+                        );
+                        let mut expected = vec![
+                            (
+                                if bits == 1 {
+                                    ElemType::U64
+                                } else {
+                                    ElemType::U8
+                                },
+                                match bits {
+                                    1 => 16,
+                                    2 => 32,
+                                    3 => 40,
+                                    4 => 56,
+                                    _ => unreachable!(),
+                                },
+                            ),
+                            (ElemType::F32, 4),
+                            (ElemType::F16, 2),
+                            (ElemType::F16, 2),
+                        ];
+                        if metric == Metric::L2 {
+                            assert!(
+                                matches!(cols[4].slot_type, SlotType::QuantLayerConstants { layer: n } if n == layer)
+                            );
+                            expected.push((ElemType::F32, 4));
+                        }
+                        assert_eq!(
+                            cols.iter().map(|c| (c.elem, c.stride)).collect::<Vec<_>>(),
+                            expected
+                        );
+                        assert!(cols.iter().all(|c| c.slot_type.band() == Some(layer)));
+                    }
+                    assert_eq!(
+                        VectorColMetadata::from_bytes(&meta.to_bytes())
+                            .unwrap()
+                            .to_bytes(),
+                        meta.to_bytes()
+                    );
+                }
+                let opts = VectorOptions::new(100, metric);
+                let plain = if clustered {
+                    VectorColMetadata::build_ivf(&opts, None).unwrap()
+                } else {
+                    VectorColMetadata::build_flat(&opts)
+                };
+                assert_eq!(plain.slots().len(), if clustered { 2 } else { 1 });
+                if clustered {
+                    let slot = &plain.slots()[1];
+                    assert!(matches!(slot.slot_type, SlotType::DocIds));
+                    assert_eq!(
+                        (slot.elem, slot.stride, slot.slot_type.band()),
+                        (ElemType::U32, 4, None)
+                    );
+                }
                 assert!(matches!(
-                    slots[0].slot_type,
+                    plain.slots()[0].slot_type,
                     SlotType::Rows {
                         dtype: VectorDType::F32
                     }
                 ));
+                assert_eq!(plain.slots()[0].slot_type.band(), None);
+                assert_eq!(plain.slots()[0].stride, 400);
+                assert_eq!(plain.slots()[0].elem, ElemType::F32);
                 assert_eq!(
-                    (slots[0].elem, slots[0].stride, slots[0].slot_type.band()),
-                    (ElemType::F32, 400, None)
-                );
-                assert!(matches!(slots[1].slot_type, SlotType::ResidualNorms));
-                assert_eq!(
-                    (slots[1].elem, slots[1].stride, slots[1].slot_type.band()),
-                    (ElemType::F32, 4, Some(0))
-                );
-                let per_layer = if metric == Metric::L2 { 5 } else { 4 };
-                assert_eq!(slots.len(), 2 + schedule.len() * per_layer);
-                for (l, &bits) in schedule.iter().enumerate() {
-                    let layer = l as u8;
-                    let cols = &slots[2 + l * per_layer..2 + (l + 1) * per_layer];
-                    assert!(
-                        matches!(&cols[0].slot_type, SlotType::QuantLayerCodes { layer: n, quant } if *n == layer && quant.bits() == bits)
-                    );
-                    assert!(
-                        matches!(cols[1].slot_type, SlotType::QuantLayerScales { layer: n } if n == layer)
-                    );
-                    assert!(
-                        matches!(cols[2].slot_type, SlotType::QuantLayerGammas { layer: n } if n == layer)
-                    );
-                    assert!(
-                        matches!(cols[3].slot_type, SlotType::QuantLayerErrors { layer: n } if n == layer)
-                    );
-                    let mut expected = vec![
-                        (
-                            if bits == 1 {
-                                ElemType::U64
-                            } else {
-                                ElemType::U8
-                            },
-                            match bits {
-                                1 => 16,
-                                2 => 32,
-                                3 => 40,
-                                4 => 56,
-                                _ => unreachable!(),
-                            },
-                        ),
-                        (ElemType::F32, 4),
-                        (ElemType::F16, 2),
-                        (ElemType::F16, 2),
-                    ];
-                    if metric == Metric::L2 {
-                        assert!(
-                            matches!(cols[4].slot_type, SlotType::QuantLayerConstants { layer: n } if n == layer)
-                        );
-                        expected.push((ElemType::F32, 4));
-                    }
-                    assert_eq!(
-                        cols.iter().map(|c| (c.elem, c.stride)).collect::<Vec<_>>(),
-                        expected
-                    );
-                    assert!(cols.iter().all(|c| c.slot_type.band() == Some(layer)));
-                }
-                assert_eq!(
-                    VectorColMetadata::from_bytes(&meta.to_bytes())
+                    VectorColMetadata::from_bytes(&plain.to_bytes())
                         .unwrap()
                         .to_bytes(),
-                    meta.to_bytes()
+                    plain.to_bytes()
                 );
             }
-            let plain = VectorColMetadata::build_flat(&VectorOptions::new(100, metric));
-            assert_eq!(plain.slots().len(), 1);
-            assert!(matches!(
-                plain.slots()[0].slot_type,
-                SlotType::Rows {
-                    dtype: VectorDType::F32
-                }
-            ));
-            assert_eq!(plain.slots()[0].slot_type.band(), None);
-            assert_eq!(plain.slots()[0].stride, 400);
-            assert_eq!(plain.slots()[0].elem, ElemType::F32);
-            assert_eq!(
-                VectorColMetadata::from_bytes(&plain.to_bytes())
-                    .unwrap()
-                    .to_bytes(),
-                plain.to_bytes()
-            );
         }
     }
     // Storage geometry and descriptive grid versions never split prepared-query cache keys.

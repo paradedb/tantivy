@@ -1,78 +1,46 @@
-//! Per-segment row→doc_id map for vector fields.
-//!
-//! Stored as the IdMap entry of the `.vec` composite, paired with a Data entry
-//! containing metadata and row-group columns. The flat backend writes Identity
-//! or Bitmap; IVF writes Explicit. Metadata partition validation enforces that
-//! the map variant agrees with routing availability. See [FORMAT.md](../FORMAT.md).
-//!
-//! For the flat variants the map also addresses the dense row array via rank
-//! (`rank(doc_id) -> row_id`) and distinguishes "missing vector" from "zero
-//! vector" at query time.
-//!
-//! Mirrors the `Full | Optional` cardinality split in `tantivy-columnar`. For
-//! dense columns (every doc present — the typical case for embeddings) the
-//! `Identity` variant skips the bitmap entirely: `row_id == doc_id` is the
-//! identity map, no rank lookup needed. For sparse columns we delegate to
-//! columnar's [`OptionalIndex`], a roaring-style bitmap with rank/select
-//! support that's also used by fast-field columns elsewhere in tantivy.
-//!
-//! ## On-disk layout
-//!
-//! ```text
-//! [u8 variant_tag] [body]
-//!   tag = 0  (Identity): no body — `num_docs` comes from the caller
-//!                        (typically `segment_reader.max_doc()`)
-//!   tag = 1  (Bitmap):   body = serialized columnar OptionalIndex
-//!   tag = 2  (Explicit): body = row→doc_id permutation, one u32 LE per row
-//! ```
-//!
-//! `Identity`/`Bitmap` are written by the flat backend (`row_id == doc_id` or a
-//! presence bitmap). `Explicit` is written by the IVF backend, where rows are
-//! cluster-sorted and bear no positional relationship to `doc_id`; the variant
-//! tag is therefore the flat-vs-IVF discriminator (`Explicit` ⟺ IVF ⟺ a
-//! sibling `.centroids` file is present).
-
+//! Document addressing for vector columns. Flat columns use identity or bitmap rank;
+//! clustered columns use fixed-width document locations read one entry at a time.
 use std::io::{self, Write};
-use std::mem::size_of;
 
 use columnar::column_index::{open_optional_index, serialize_optional_index, OptionalIndex, Set};
-use common::{BinarySerializable, HasLen, OwnedBytes};
+use common::HasLen;
 
 use crate::directory::FileSlice;
+use crate::vector::storage_io::VectorRead;
 use crate::DocId;
 
 const VARIANT_IDENTITY: u8 = 0;
 const VARIANT_BITMAP: u8 = 1;
-pub(crate) const VARIANT_EXPLICIT: u8 = 2;
+const VARIANT_DOC_LOCATIONS: u8 = 3;
 
-/// Decode the `row`-th doc_id from a packed little-endian `Explicit` body.
-/// Caller guarantees `row < bytes.len() / 4`.
-#[inline]
-fn explicit_doc_id_at(bytes: &[u8], row: usize) -> DocId {
-    let start = row * size_of::<DocId>();
-    DocId::from_le_bytes(bytes[start..start + size_of::<DocId>()].try_into().unwrap())
+/// A document's cluster and local row; the sentinel represents a missing vector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DocLocation {
+    pub(crate) cluster: u32,
+    pub(crate) local: u32,
+}
+impl DocLocation {
+    /// Sentinel for a document without a vector; local must be zero.
+    pub(crate) const ABSENT: Self = Self {
+        cluster: u32::MAX,
+        local: 0,
+    };
 }
 
-/// Per-field row→doc_id map. Dispatches on cardinality at open time so the hot
-/// path can skip the bitmap entirely when every doc has a value.
+/// Document addressing with deferred, fixed-width clustered lookups.
 pub enum IdMap {
-    /// Every doc has a value. `row_id == doc_id`; no bitmap stored.
+    /// Every document has a vector at the same row ordinal.
     Identity { num_docs: u32 },
-    /// Some docs may be absent. Rank/contains go through columnar's
-    /// `OptionalIndex` (roaring-style block bitmap).
+    /// Present documents address dense rows by bitmap rank.
     Bitmap(OptionalIndex),
-    /// IVF: maps each row to its doc_id. Held as the raw little-endian body
-    /// (one u32 per row) so it can be decoded a row at a time.
-    Explicit(OwnedBytes),
+    /// One cluster/local pair per segment document; the body remains on storage.
+    DocLocations(FileSlice),
 }
-
+fn bad(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
 impl IdMap {
-    /// Serialize the appropriate variant given a sorted list of present
-    /// `doc_id`s. Chooses `Identity` if every doc is present, `Bitmap`
-    /// otherwise.
-    ///
-    /// The Identity variant writes only the variant tag — `num_docs` is
-    /// supplied at open time (typically from `segment_reader.max_doc()`).
+    /// Serializes sorted flat document ids, eliding a fully populated bitmap.
     pub fn serialize<W: Write>(
         present_doc_ids: &[DocId],
         num_docs: u32,
@@ -86,94 +54,92 @@ impl IdMap {
         }
         Ok(())
     }
-
-    pub fn serialize_explicit<W: Write>(row_doc_ids: &[DocId], out: &mut W) -> io::Result<()> {
-        out.write_all(&[VARIANT_EXPLICIT])?;
-        for doc_id in row_doc_ids {
-            doc_id.serialize(out)?;
+    /// Serializes exactly one location for every segment document.
+    pub(crate) fn serialize_locations<W: Write>(
+        locations: &[DocLocation],
+        out: &mut W,
+    ) -> io::Result<()> {
+        out.write_all(&[VARIANT_DOC_LOCATIONS])?;
+        for location in locations {
+            out.write_all(&location.cluster.to_le_bytes())?;
+            out.write_all(&location.local.to_le_bytes())?;
         }
         Ok(())
     }
-
-    /// Parse a serialized id-map section, dispatching on the variant tag.
-    /// `num_docs` is used only when the variant is `Identity` — for `Bitmap`,
-    /// the count is read from the embedded `OptionalIndex` header.
-    pub fn open(file_slice: FileSlice, num_docs: u32) -> io::Result<IdMap> {
+    /// Validates the tag and table length without reading clustered table contents.
+    pub fn open(file_slice: FileSlice, num_docs: u32) -> io::Result<Self> {
         if file_slice.len() == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "id map section is empty",
-            ));
+            return Err(bad("id map section is empty"));
         }
-        let tag = file_slice.slice(0..1).read_bytes()?[0];
+        let tag = file_slice.slice_to(1).read_bytes()?[0];
         let body = file_slice.slice_from(1);
         match tag {
-            VARIANT_IDENTITY => Ok(IdMap::Identity { num_docs }),
-            VARIANT_BITMAP => Ok(IdMap::Bitmap(open_optional_index(body)?)),
-            VARIANT_EXPLICIT => {
-                let bytes = body.read_bytes()?;
-                if bytes.len() % size_of::<DocId>() != 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "explicit id map body is not a whole number of u32 doc ids",
-                    ));
-                }
-                Ok(IdMap::Explicit(bytes))
+            VARIANT_IDENTITY if body.len() == 0 => Ok(Self::Identity { num_docs }),
+            VARIANT_BITMAP => Ok(Self::Bitmap(open_optional_index(body)?)),
+            VARIANT_DOC_LOCATIONS if body.len() as u64 == u64::from(num_docs) * 8 => {
+                Ok(Self::DocLocations(body))
             }
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown id map variant tag: {other}"),
+            VARIANT_DOC_LOCATIONS => Err(bad(
+                "document location table length does not equal 8 * max_doc"
             )),
+            _ => Err(bad("invalid id map variant or length")),
         }
     }
-
-    /// Number of docs that have a value (= number of stored rows).
+    /// Reads one document location and validates both coordinates before exposing it.
+    pub(crate) fn locate(&self, doc: DocId, rows: &[usize]) -> io::Result<Option<DocLocation>> {
+        let Self::DocLocations(body) = self else {
+            return Err(bad("clustered lookup requires DocLocations"));
+        };
+        let Some(start) = (doc as usize).checked_mul(8) else {
+            return Ok(None);
+        };
+        if start >= body.len() {
+            return Ok(None);
+        }
+        let bytes = body.slice(start..start + 8).read_vector_bytes()?;
+        let cluster = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        let local = u32::from_le_bytes(bytes[4..].try_into().unwrap());
+        if cluster == u32::MAX {
+            return if local == 0 {
+                Ok(None)
+            } else {
+                Err(bad("absent document location has nonzero local row"))
+            };
+        }
+        let cluster_idx = cluster as usize;
+        if cluster_idx >= rows.len().saturating_sub(1)
+            || local as usize >= rows[cluster_idx + 1] - rows[cluster_idx]
+        {
+            return Err(bad("document location is outside its cluster"));
+        }
+        Ok(Some(DocLocation { cluster, local }))
+    }
+    /// Number of present flat rows; clustered row counts reside in cluster offsets.
     pub fn num_rows(&self) -> u32 {
         match self {
-            IdMap::Identity { num_docs } => *num_docs,
-            IdMap::Bitmap(idx) => idx.num_non_nulls(),
-            IdMap::Explicit(bytes) => (bytes.len() / size_of::<DocId>()) as u32,
+            Self::Identity { num_docs } => *num_docs,
+            Self::Bitmap(idx) => idx.num_non_nulls(),
+            Self::DocLocations(_) => unreachable!("cluster offsets determine row count"),
         }
     }
-
-    /// `true` if `doc_id` has a value. The `Explicit` arm is a linear scan —
-    /// the reference semantics the format tests exercise; the read path
-    /// ([`VectorIndexReader`](crate::vector::VectorIndexReader)) uses
-    /// cluster-local binary search instead.
     #[cfg(test)]
-    #[inline]
-    pub fn contains(&self, doc_id: DocId) -> bool {
+    pub fn contains(&self, doc: DocId) -> bool {
+        self.rank_if_exists(doc).is_some()
+    }
+    /// Resolves a flat document by rank without searching rows.
+    pub fn rank_if_exists(&self, doc: DocId) -> Option<u32> {
         match self {
-            IdMap::Identity { num_docs } => doc_id < *num_docs,
-            IdMap::Bitmap(idx) => Set::contains(idx, doc_id),
-            IdMap::Explicit(bytes) => {
-                let num_rows = bytes.len() / size_of::<DocId>();
-                (0..num_rows).any(|row| explicit_doc_id_at(bytes, row) == doc_id)
-            }
+            Self::Identity { num_docs } => (doc < *num_docs).then_some(doc),
+            Self::Bitmap(idx) => Set::rank_if_exists(idx, doc),
+            Self::DocLocations(_) => unreachable!("clustered documents require locate"),
         }
     }
-
-    /// Returns the dense row id for `doc_id` if it has a value, else `None`.
-    /// For `Identity`, this is the identity map — no bitmap consulted. For
-    /// `Explicit` this is a linear scan; the IVF read path uses cluster-local
-    /// binary search instead (see
-    /// [`VectorIndexReader`](crate::vector::VectorIndexReader)).
-    /// Callers must pass a `doc_id` within the segment (`doc_id < max_doc`);
-    /// this is asserted in debug builds.
-    #[inline]
-    pub fn rank_if_exists(&self, doc_id: DocId) -> Option<u32> {
+    /// Resolves a flat row by bitmap select or identity.
+    pub(crate) fn doc_at(&self, row: u32) -> DocId {
         match self {
-            IdMap::Identity { num_docs } => {
-                debug_assert!(doc_id < *num_docs, "doc_id {doc_id} >= num_docs {num_docs}");
-                Some(doc_id)
-            }
-            IdMap::Bitmap(idx) => Set::rank_if_exists(idx, doc_id),
-            IdMap::Explicit(bytes) => {
-                let num_rows = bytes.len() / size_of::<DocId>();
-                (0..num_rows)
-                    .find(|&row| explicit_doc_id_at(bytes, row) == doc_id)
-                    .map(|row| row as u32)
-            }
+            Self::Identity { .. } => row,
+            Self::Bitmap(idx) => idx.select(row),
+            Self::DocLocations(_) => unreachable!("clustered rows contain DocIds"),
         }
     }
 }
@@ -265,24 +231,64 @@ mod tests {
         assert!(!p.contains(100));
         assert_eq!(p.rank_if_exists(10), None);
     }
-
+    // Every present document resolves to a checked pair; sentinels and invalid pairs are distinct.
     #[test]
-    fn test_explicit_round_trip() {
-        // A cluster-sorted permutation: rows 0..2 are cluster 0 (docs 1,4),
-        // rows 2..4 are cluster 1 (docs 0,3) — not globally sorted.
-        let row_doc_ids: Vec<DocId> = vec![1, 4, 0, 3];
-        let mut buf = Vec::new();
-        IdMap::serialize_explicit(&row_doc_ids, &mut buf).unwrap();
-        assert_eq!(buf[0], VARIANT_EXPLICIT);
-
-        let p = IdMap::open(FileSlice::from(buf), 5).unwrap();
-        assert!(matches!(p, IdMap::Explicit(_)));
-        assert_eq!(p.num_rows(), 4);
-        for (row, &doc) in row_doc_ids.iter().enumerate() {
-            assert!(p.contains(doc));
-            assert_eq!(p.rank_if_exists(doc), Some(row as u32));
+    fn locations_round_trip_absence_and_corruption() {
+        let expected = [
+            DocLocation {
+                cluster: 1,
+                local: 0,
+            },
+            DocLocation {
+                cluster: 0,
+                local: 0,
+            },
+            DocLocation::ABSENT,
+            DocLocation {
+                cluster: 1,
+                local: 1,
+            },
+            DocLocation {
+                cluster: 0,
+                local: 1,
+            },
+        ];
+        let mut bytes = Vec::new();
+        IdMap::serialize_locations(&expected, &mut bytes).unwrap();
+        assert_eq!(bytes.len(), 1 + 8 * expected.len());
+        let map = IdMap::open(FileSlice::from(bytes.clone()), 5).unwrap();
+        for (doc, &location) in expected.iter().enumerate() {
+            assert_eq!(
+                map.locate(doc as u32, &[0, 2, 4]).unwrap(),
+                (location != DocLocation::ABSENT).then_some(location)
+            );
         }
-        assert!(!p.contains(2));
-        assert_eq!(p.rank_if_exists(2), None);
+        assert_eq!(map.locate(5, &[0, 2, 4]).unwrap(), None);
+        for location in [
+            DocLocation {
+                cluster: 2,
+                local: 0,
+            },
+            DocLocation {
+                cluster: 0,
+                local: 2,
+            },
+            DocLocation {
+                cluster: u32::MAX,
+                local: 1,
+            },
+        ] {
+            let mut corrupt = bytes.clone();
+            corrupt[1..5].copy_from_slice(&location.cluster.to_le_bytes());
+            corrupt[5..9].copy_from_slice(&location.local.to_le_bytes());
+            let map = IdMap::open(FileSlice::from(corrupt), 5).unwrap();
+            assert_eq!(
+                map.locate(0, &[0, 2, 4]).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        assert!(IdMap::open(FileSlice::from(bytes.clone()), 4).is_err());
+        bytes[0] = 2;
+        assert!(IdMap::open(FileSlice::from(bytes), 5).is_err());
     }
 }

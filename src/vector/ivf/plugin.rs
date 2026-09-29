@@ -31,6 +31,7 @@ use crate::vector::blocks::{block_len, column_range, finish_data, pad, write_met
 #[cfg(test)]
 use crate::vector::distance::l2_squared;
 use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
+use crate::vector::flat::id_map::DocLocation;
 use crate::vector::flat::IdMap;
 use crate::vector::header::{
     write_centroid_header, write_vector_header, CentroidSlot, VectorEntry, HEADER_LEN,
@@ -46,7 +47,7 @@ struct AssignedVector {
     cluster: usize,
     target_doc_id: DocId,
     source_segment_ord: usize,
-    source_doc_id: DocId,
+    source_row: usize,
 }
 
 /// Per-field IVF build counters and timings, reported on `paradedb::ivf_build`.
@@ -214,6 +215,8 @@ pub(crate) fn merge_ivf(
             .iter()
             .map(|reader| reader.vector_index(field))
             .collect::<crate::Result<Vec<_>>>()?;
+        let field_build_start = Instant::now();
+        let source_rows = crate::vector::plugin::merge_source_rows(ctx, &field_readers)?;
         let vector_count = field_readers
             .iter()
             .map(|reader| reader.num_vectors())
@@ -225,7 +228,7 @@ pub(crate) fn merge_ivf(
                 dims: opts.dim(),
             });
             let router = build_router(router, opts, &mut centroids)?;
-            id_maps.push((field, Vec::new()));
+            id_maps.push((field, vec![DocLocation::ABSENT; num_target_docs as usize]));
             write_empty_field_slots(
                 &mut vec_write,
                 &mut centroids_write,
@@ -250,17 +253,19 @@ pub(crate) fn merge_ivf(
 
         match opts.dtype() {
             VectorDType::F32 => {
-                let field_build_start = Instant::now();
-                let mut timings = IvfBuildTimings::default();
+                let mut timings = IvfBuildTimings {
+                    source_reads: vector_count,
+                    ..Default::default()
+                };
                 let mut training_values = Vec::with_capacity(training_sample_size * opts.dim());
                 let mut training_doc_ids = Vec::with_capacity(training_sample_size);
                 let mut target_doc_id: DocId = 0;
                 let mut present_vector_ord = 0usize;
                 let mut sampled_count = 0usize;
-                for source_doc_addr in ctx.doc_id_mapping.iter_source_doc_addrs() {
-                    let reader = &field_readers[source_doc_addr.segment_ord as usize];
-                    timings.source_reads += 1;
-                    if let Some(bytes) = reader.vector_bytes(source_doc_addr.doc_id)? {
+                for source in &source_rows {
+                    if let Some((segment, row)) = *source {
+                        timings.source_reads += 1;
+                        let bytes = field_readers[segment].vector_bytes_for_row(row)?;
                         let should_sample = sampled_count < training_sample_size
                             && present_vector_ord % training_sample_interval == 0;
                         if should_sample {
@@ -296,7 +301,7 @@ pub(crate) fn merge_ivf(
                         dims: opts.dim(),
                     });
                     let router = build_router(router, opts, &mut centroids)?;
-                    id_maps.push((field, Vec::new()));
+                    id_maps.push((field, vec![DocLocation::ABSENT; num_target_docs as usize]));
                     write_empty_field_slots(
                         &mut vec_write,
                         &mut centroids_write,
@@ -375,7 +380,7 @@ pub(crate) fn merge_ivf(
                     let mut flush_assign_batch =
                         |batch_values: &mut Vec<f32>,
                          batch_doc_ids: &mut Vec<DocId>,
-                         batch_sources: &mut Vec<(DocId, usize, DocId)>|
+                         batch_sources: &mut Vec<(DocId, usize, usize)>|
                          -> crate::Result<()> {
                             if batch_doc_ids.is_empty() {
                                 return Ok(());
@@ -405,7 +410,7 @@ pub(crate) fn merge_ivf(
                                     batch_len
                                 )));
                             }
-                            for (cluster, (target_doc_id, source_segment_ord, source_doc_id)) in
+                            for (cluster, (target_doc_id, source_segment_ord, source_row)) in
                                 clusters.into_iter().zip(batch_sources.drain(..))
                             {
                                 let cluster = cluster as usize;
@@ -419,24 +424,20 @@ pub(crate) fn merge_ivf(
                                     cluster,
                                     target_doc_id,
                                     source_segment_ord,
-                                    source_doc_id,
+                                    source_row,
                                 });
                             }
                             batch_values.clear();
                             batch_doc_ids.clear();
                             Ok(())
                         };
-                    for source_doc_addr in ctx.doc_id_mapping.iter_source_doc_addrs() {
-                        let reader = &field_readers[source_doc_addr.segment_ord as usize];
-                        timings.source_reads += 1;
-                        if let Some(bytes) = reader.vector_bytes(source_doc_addr.doc_id)? {
+                    for source in &source_rows {
+                        if let Some((segment, row)) = *source {
+                            timings.source_reads += 1;
+                            let bytes = field_readers[segment].vector_bytes_for_row(row)?;
                             batch_doc_ids.push(target_doc_id);
                             decode_row_append::<f32>(&bytes, opts.dim(), &mut batch_values)?;
-                            batch_sources.push((
-                                target_doc_id,
-                                source_doc_addr.segment_ord as usize,
-                                source_doc_addr.doc_id,
-                            ));
+                            batch_sources.push((target_doc_id, segment, row));
                             if batch_doc_ids.len() == settings.assign_batch_size {
                                 flush_assign_batch(
                                     &mut batch_values,
@@ -496,9 +497,12 @@ pub(crate) fn merge_ivf(
 
                 // IdMaps are emitted after Data so inter-entry padding never enters an id map.
                 let id_map_start = Instant::now();
-                let row_doc_ids: Vec<DocId> =
-                    assigned_vectors.iter().map(|v| v.target_doc_id).collect();
-                id_maps.push((field, row_doc_ids));
+                if num_centroids >= u32::MAX as usize {
+                    return Err(TantivyError::InvalidArgument(
+                        "too many clusters for document locations".into(),
+                    ));
+                }
+                let mut locations = vec![DocLocation::ABSENT; num_target_docs as usize];
                 timings.id_map_write = id_map_start.elapsed();
 
                 // Data entry: metadata followed by aligned cluster blocks.
@@ -552,6 +556,7 @@ pub(crate) fn merge_ivf(
                         .as_mut()
                         .map(|workspace| workspace.prepare(&centroid));
                     // Rows stream directly to disk; only encoded columns need cluster buffers.
+                    let mut local = 0u32;
                     for tile in assigned_vectors[start..end].chunks(tile_rows) {
                         if ctx.cancel.wants_cancel() {
                             return Err(TantivyError::Cancelled);
@@ -559,11 +564,14 @@ pub(crate) fn merge_ivf(
                         batch_values.clear();
                         for assigned in tile {
                             timings.source_reads += 1;
+                            bufs[1].extend_from_slice(&assigned.target_doc_id.to_le_bytes());
+                            locations[assigned.target_doc_id as usize] = DocLocation {
+                                cluster: cluster as u32,
+                                local,
+                            };
+                            local += 1;
                             let bytes = field_readers[assigned.source_segment_ord]
-                                .vector_bytes(assigned.source_doc_id)?
-                                .ok_or_else(|| {
-                                    TantivyError::InternalError("missing source vector".into())
-                                })?;
+                                .vector_bytes_for_row(assigned.source_row)?;
                             let row: &[u8] = if opts.needs_normalization() {
                                 normalized.clear();
                                 normalized.extend_from_slice(&bytes);
@@ -613,6 +621,7 @@ pub(crate) fn merge_ivf(
                                         &mut bufs[idx],
                                         &batch.layers[*layer as usize].constants,
                                     )?,
+                                    SlotType::DocIds => (),
                                     SlotType::Rows { .. } => unreachable!(),
                                 }
                             }
@@ -640,6 +649,7 @@ pub(crate) fn merge_ivf(
                     pos += padding;
                     assert_eq!(data.written_bytes() - entry_start, pos as u64);
                 }
+                id_maps.push((field, locations));
                 let entry_len = finish_data(data, pos)?;
                 timings.pad_bytes += entry_len - pos;
                 assert_eq!(
@@ -702,7 +712,7 @@ pub(crate) fn merge_ivf(
         let started = Instant::now();
         let id_map_start = vec_write.written_bytes();
         let id_map = vec_write.for_field_with_idx(field, VectorEntry::IdMap.index());
-        IdMap::serialize_explicit(&docs, id_map)?;
+        IdMap::serialize_locations(&docs, id_map)?;
         id_map.flush()?;
         if let Some((_, timings, total, num_centroids, vector_count)) =
             build_reports.iter_mut().find(|(f, ..)| *f == field)
@@ -818,6 +828,7 @@ mod tests {
         }
         let opts = VectorOptions::new(65, Metric::L2);
         let mut schema = Schema::builder();
+        let ordinal = schema.add_u64_field("ordinal", crate::schema::FAST);
         let plain = schema.add_vector_field("plain", opts.clone());
         let quant = schema.add_vector_field("quant", opts.clone());
         let config = VectorQuantizationConfig::materialize(
@@ -843,6 +854,7 @@ mod tests {
         for doc in 0..7 {
             let values = vec![doc as f32 / 7.0; 65];
             let mut document = TantivyDocument::new();
+            document.add_u64(ordinal, doc);
             document.add_vector(plain, &values);
             if !empty_second {
                 document.add_vector(quant, &values);
@@ -868,7 +880,42 @@ mod tests {
         for (field, count) in [(plain, 7), (quant, if empty_second { 0 } else { 7 })] {
             let vector = segment.vector_index(field)?;
             assert!(vector.metadata().is_some());
+            assert!(!vector.id_map_initialized());
+            let hits = searcher.search(
+                &AllQuery,
+                &TopDocsByVectorSimilarity::new(field, vec![0.25; 65], 3).with_adaptive_params(
+                    AdaptiveProbeParams {
+                        max_probe_fraction: 1.0,
+                        min_probe_clusters: 2,
+                        ..Default::default()
+                    },
+                ),
+            )?;
+            assert_eq!(hits.results.len(), count.min(3));
+            assert!(!vector.id_map_initialized(), "scan must not open IdMap");
             let ivf = vector.index().unwrap();
+            for b in 0..ivf.num_clusters() {
+                let range = ivf.cluster_range(b);
+                let docs = vector.cluster_doc_ids(b).unwrap();
+                assert!(docs.windows(2).all(|pair| pair[0] < pair[1]));
+                for (row, doc) in range.zip(docs) {
+                    assert_eq!(vector.row_id(doc)?, Some(row));
+                    let bytes = vector.vector_bytes_for_row(row)?;
+                    assert_eq!(Some(bytes.clone()), vector.vector_bytes(doc)?);
+                    assert_eq!(
+                        decode_row::<f32>(&bytes, 65)?,
+                        vec![
+                            segment.fast_fields().u64("ordinal")?.first(doc).unwrap() as f32 / 7.0;
+                            65
+                        ]
+                    );
+                }
+            }
+            if count == 0 {
+                for doc in 0..segment.max_doc() {
+                    assert!(vector.vector_bytes(doc)?.is_none());
+                }
+            }
             let rows = (0..ivf.num_clusters())
                 .map(|b| ivf.cluster_range(b).start)
                 .chain(std::iter::once(count))
@@ -879,7 +926,7 @@ mod tests {
             let id_map = composite
                 .open_read_with_idx(field, VectorEntry::IdMap.index())
                 .unwrap();
-            assert_eq!(id_map.len(), 1 + count * std::mem::size_of::<DocId>());
+            assert_eq!(id_map.len(), 1 + segment.max_doc() as usize * 8);
             let start = data.storage_block_ord(0).unwrap();
             assert_eq!(start % MAX_ELEM_BYTES, 0);
             assert_eq!(data.len() % MAX_ELEM_BYTES, 0);
@@ -900,7 +947,8 @@ mod tests {
         Ok(())
     }
 
-    // Empty quantized IVF fields still carry exact metadata-only Data and Explicit IdMap entries.
+    // Empty quantized IVF fields still carry exact metadata-only Data and DocLocations IdMap
+    // entries.
     #[test]
     fn two_field_ivf_includes_empty_field() -> crate::Result<()> {
         check_two_field_entries(true)
@@ -910,6 +958,86 @@ mod tests {
     #[test]
     fn mixed_plain_quantized_entries_have_exact_lengths() -> crate::Result<()> {
         check_two_field_entries(false)
+    }
+
+    // Block traversal preserves vectors and assignments while dropping deleted documents.
+    #[test]
+    fn clustered_merge_preserves_vectors_assignments_and_missing_docs() -> crate::Result<()> {
+        use std::collections::BTreeMap;
+
+        use crate::schema::Value;
+        for quantized in [false, true] {
+            let index = build_quantized_fixture(64, quantized)?;
+            let field = index.schema().get_field("embedding")?;
+            let label = index.schema().get_field("label")?;
+            let original = index.searchable_segment_ids()?;
+            let mut writer = index.writer_with_num_threads(1, 30_000_000)?;
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            for i in 0..8 {
+                let mut doc = TantivyDocument::new();
+                doc.add_text(label, format!("extra{i}"));
+                if i != 2 {
+                    doc.add_vector(field, &fixture_vector(Metric::L2, 64, i));
+                }
+                writer.add_document(doc)?;
+                if i == 3 {
+                    writer.commit()?;
+                }
+            }
+            writer.commit()?;
+            let additions: Vec<_> = index
+                .searchable_segment_ids()?
+                .into_iter()
+                .filter(|id| !original.contains(id))
+                .collect();
+            writer.merge(&additions).wait()?;
+            writer.delete_term(Term::from_field_text(label, "d1"));
+            writer.delete_term(Term::from_field_text(label, "extra5"));
+            writer.commit()?;
+            let capture = || -> crate::Result<BTreeMap<String, Option<(usize, Vec<u8>)>>> {
+                let searcher = index.reader()?.searcher();
+                let mut out = BTreeMap::new();
+                for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {
+                    let vectors = segment.vector_index(field)?;
+                    let ivf = vectors.index().expect("IVF source");
+                    let mut rows_by_doc = BTreeMap::new();
+                    for cluster in 0..ivf.num_clusters() {
+                        let docs = vectors.cluster_doc_ids(cluster).unwrap();
+                        for (row, doc) in ivf.cluster_range(cluster).zip(docs) {
+                            rows_by_doc.insert(
+                                doc,
+                                (cluster, vectors.vector_bytes_for_row(row)?.to_vec()),
+                            );
+                        }
+                    }
+                    for doc in 0..segment.max_doc() {
+                        if segment
+                            .alive_bitset()
+                            .is_some_and(|alive| !alive.is_alive(doc))
+                        {
+                            continue;
+                        }
+                        let stored: TantivyDocument =
+                            searcher.doc(crate::DocAddress::new(segment_ord as u32, doc))?;
+                        let name = stored
+                            .get_first(label)
+                            .unwrap()
+                            .as_str()
+                            .unwrap()
+                            .to_owned();
+                        out.insert(name, rows_by_doc.remove(&doc));
+                    }
+                    assert!(!vectors.id_map_initialized());
+                }
+                Ok(out)
+            };
+            let before = capture()?;
+            assert_eq!(before.get("extra2"), Some(&None));
+            writer.merge(&index.searchable_segment_ids()?).wait()?;
+            writer.wait_merging_threads()?;
+            assert_eq!(capture()?, before);
+        }
+        Ok(())
     }
 
     const QUANT_FIXTURE_DIM: usize = 64;

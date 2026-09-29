@@ -6,7 +6,7 @@
 //! - During merge, picks one of two output formats by target doc count: below
 //!   [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold)
 //!   it copies vectors forward into a flat `.vec`; at or above the threshold it writes an IVF
-//!   `.vec` (with `IdMap::Explicit`) plus a `.centroids` file.
+//!   `.vec` (with `IdMap::DocLocations`) plus a `.centroids` file.
 //! - During reads, [`VectorIndexReader`](super::VectorIndexReader) opens the field's `.vec` slots
 //!   (and the `.centroids` sidecar when present) via
 //!   [`SegmentReader::vector_index`](crate::SegmentReader::vector_index).
@@ -34,8 +34,7 @@ impl SegmentPlugin for VectorPlugin {
     }
 
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {
-        // simple merge strategy, may change later
-        // do clustering only if the target segment has more than the threshold number of docs
+        // Target cardinality selects uniform or clustered storage.
         let target_docs: u32 = ctx.readers.iter().map(|r| r.num_docs()).sum();
         let threshold = ctx.settings.vector_clustering_threshold();
         if (target_docs as usize) < threshold {
@@ -48,4 +47,41 @@ impl SegmentPlugin for VectorPlugin {
             )
         }
     }
+}
+
+/// Resolves target-document order to source rows by walking each source's exact block spans.
+/// Target order fixes training samples and assignment batches independently of source clustering.
+pub(crate) fn merge_source_rows(
+    ctx: &PluginMergeContext,
+    readers: &[std::sync::Arc<super::VectorIndexReader>],
+) -> crate::Result<Vec<Option<(usize, usize)>>> {
+    let mut target_docs: Vec<Vec<Option<crate::DocId>>> = ctx
+        .readers
+        .iter()
+        .map(|reader| vec![None; reader.max_doc() as usize])
+        .collect();
+    let mut count = 0;
+    for (new_doc, source) in ctx.doc_id_mapping.iter_source_doc_addrs().enumerate() {
+        target_docs[source.segment_ord as usize][source.doc_id as usize] =
+            Some(new_doc as crate::DocId);
+        count += 1;
+    }
+    let mut source_rows = vec![None; count];
+    for (segment, reader) in readers.iter().enumerate() {
+        reader.for_each_row(|row, doc, _bytes| {
+            if ctx.cancel.wants_cancel() {
+                return Err(crate::TantivyError::Cancelled);
+            }
+            let new_doc = target_docs[segment].get(doc as usize).ok_or_else(|| {
+                crate::error::DataCorruption::comment_only(
+                    "DocIds contains a document outside the segment",
+                )
+            })?;
+            if let Some(new_doc) = new_doc {
+                source_rows[*new_doc as usize] = Some((segment, row));
+            }
+            Ok(())
+        })?;
+    }
+    Ok(source_rows)
 }

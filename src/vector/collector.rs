@@ -600,7 +600,7 @@ mod ivf_e2e_tests {
                 let id_column = reader.fast_fields().u64("id")?;
                 let vector_reader = reader.vector_index(embedding_field)?;
                 for doc_id in 0..reader.max_doc() {
-                    let row = vector_reader.row_id(doc_id).unwrap();
+                    let row = vector_reader.row_id(doc_id)?.unwrap();
                     let bytes = vector_reader.vector_bytes_for_row(row)?;
                     expected.push((
                         -crate::vector::l2_squared_bytes(&query, &bytes),

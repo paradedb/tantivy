@@ -47,6 +47,7 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
             .map(|reader| reader.vector_index(field))
             .collect::<crate::Result<Vec<_>>>()?;
 
+        let source_rows = crate::vector::plugin::merge_source_rows(ctx, &field_readers)?;
         let mut target_present: Vec<DocId> = Vec::new();
         let mut target_doc_id: DocId = 0;
         {
@@ -59,12 +60,12 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
             let mut block_bytes = 0;
             // Row groups can be streamed without knowing the final vector count.
 
-            for source_doc_addr in ctx.doc_id_mapping.iter_source_doc_addrs() {
+            for source in source_rows {
                 if ctx.cancel.wants_cancel() {
                     return Err(crate::TantivyError::Cancelled);
                 }
-                let reader = &field_readers[source_doc_addr.segment_ord as usize];
-                if let Some(bytes) = reader.vector_bytes(source_doc_addr.doc_id)? {
+                if let Some((segment, row)) = source {
+                    let bytes = field_readers[segment].vector_bytes_for_row(row)?;
                     target_present.push(target_doc_id);
                     rows_w.write_all(&bytes)?;
                     block_bytes += bytes.len();

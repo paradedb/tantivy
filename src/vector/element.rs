@@ -7,11 +7,12 @@ pub(crate) enum ElemType {
     U8,
     F16,
     F32,
+    U32,
     U64,
 }
 impl ElemType {
     /// Complete element vocabulary used to derive the maximum entry alignment.
-    pub(crate) const ALL: [Self; 4] = [Self::U8, Self::F16, Self::F32, Self::U64];
+    pub(crate) const ALL: [Self; 5] = [Self::U8, Self::F16, Self::F32, Self::U32, Self::U64];
 
     /// Serialized element width, independent of the target's ABI alignment.
     pub(crate) const fn size(self) -> usize {
@@ -19,6 +20,7 @@ impl ElemType {
             Self::U8 => size_of::<u8>(),
             Self::F16 => size_of::<u16>(),
             Self::F32 => size_of::<f32>(),
+            Self::U32 => size_of::<u32>(),
             Self::U64 => size_of::<u64>(),
         }
     }

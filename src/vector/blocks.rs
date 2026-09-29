@@ -302,6 +302,33 @@ impl Blocks {
             .slice((rows.start - first) * stride..(rows.end - first) * stride)
             .read_vector_bytes()?)
     }
+    /// Exact scans pin full-precision rows and clustered document ids in one request.
+    pub(crate) fn exact_span(&self, b: usize) -> Range<usize> {
+        let last = if self.clustered() { 1 } else { 0 };
+        let end = column_range(&self.slots, self.rows_in(b), last).end;
+        self.block_start(b)..self.block_start(b) + end
+    }
+    /// Whether blocks carry a document-id column and use centroid row boundaries.
+    pub(crate) fn clustered(&self) -> bool {
+        matches!(self.meta.field().partition, Partition::Clusters)
+    }
+    /// Layer zero includes document ids so filtering and scoring share a single read.
+    pub(crate) fn layer_span(&self, b: usize, layer: usize) -> Range<usize> {
+        let mut range = self.band_range(b, layer);
+        if layer == 0 && self.clustered() {
+            range.start = self.block_start(b) + column_range(&self.slots, self.rows_in(b), 1).start;
+        }
+        range
+    }
+    /// Reads a complete exact span and exposes rows and optional document ids as views.
+    pub(crate) fn read_exact(&self, b: usize) -> crate::Result<(OwnedBytes, Option<OwnedBytes>)> {
+        let bytes = self.entry.slice(self.exact_span(b)).read_vector_bytes()?;
+        let rows = bytes.slice(column_range(&self.slots, self.rows_in(b), 0));
+        let docs = self
+            .clustered()
+            .then(|| bytes.slice(column_range(&self.slots, self.rows_in(b), 1)));
+        Ok((rows, docs))
+    }
     /// Range of one scan band within the Data entry; band zero includes residual norms.
     pub(crate) fn band_range(&self, b: usize, layer: usize) -> Range<usize> {
         let band = &self.bands[layer];
@@ -310,21 +337,15 @@ impl Blocks {
         let end = column_range(&self.slots, n, band.end - 1).end;
         self.block_start(b) + start..self.block_start(b) + end
     }
-    /// Pins a band with exactly one read and returns zero-copy views in column order.
+    /// Pins a band with exactly one read. Column views borrow this span without a heap list.
     pub(crate) fn read_band(
         &self,
         b: usize,
         layer: usize,
-    ) -> crate::Result<Vec<(usize, OwnedBytes)>> {
-        let range = self.band_range(b, layer);
+    ) -> crate::Result<(Range<usize>, OwnedBytes)> {
+        let range = self.layer_span(b, layer);
         let bytes = self.entry.slice(range.clone()).read_vector_bytes()?;
-        let mut views = Vec::new();
-        for idx in self.bands[layer].clone() {
-            let col = column_range(&self.slots, self.rows_in(b), idx);
-            let start = self.block_start(b) + col.start - range.start;
-            views.push((idx, bytes.slice(start..start + col.len())));
-        }
-        Ok(views)
+        Ok((range, bytes))
     }
 }
 
@@ -457,7 +478,12 @@ mod tests {
                         .iter()
                         .all(|&v| v == 0));
                     for l in 0..schedule.len() {
-                        for (idx, view) in blocks.read_band(b, l).unwrap() {
+                        let (span, pinned) = blocks.read_band(b, l).unwrap();
+                        let first = if l == 0 { 1 } else { blocks.bands[l].start };
+                        for idx in first..blocks.bands[l].end {
+                            let col = column_range(&slots, blocks.rows_in(b), idx);
+                            let start = blocks.block_start(b) + col.start - span.start;
+                            let view = pinned.slice(start..start + col.len());
                             assert_eq!(
                                 view.as_slice(),
                                 blocks.column(b, idx).read_bytes().unwrap().as_slice()
