@@ -111,14 +111,18 @@ must be zero. Rows come first to permit streaming source bytes immediately;
 encoded columns are buffered for one block, then flushed in column order.
 
 Band 0 includes ResidualNorms through the last layer-0 column. Higher bands run
-from that layer's codes through its final column. Named read spans are:
+from that layer's codes through its final column. `layer_span(b, l)` is band l;
+each band uses one read with columns exposed as views.
 
-- `exact_span(b)`: Rows through DocIds for clustered blocks, Rows only for flat.
-- `layer_span(b, 0)`: DocIds through the final layer-0 column for clustered blocks,
-  band 0 for flat.
-- `layer_span(b, l >= 1)`: band l.
+DocIds are read separately and validated as strictly ascending and below the
+segment's `max_doc`. Filters and deleted-document visibility select rows before
+any payload read; a cluster with no survivors reads only DocIds. With no filter
+or deletions, quantized scans read no DocIds until rerank resolves the final
+candidates, once per candidate-bearing cluster. Exact scans without a row gate
+read Rows alone and resolve DocIds only when a score reaches heap admission.
+Filtered exact scans plan reads over survivor rows in the Rows column.
 
-Each span uses one read, with columns exposed as views. Sparse code reads group
+Sparse code reads group
 selected rows only while their storage-page spans overlap; adjacent disjoint
 pages start a new group. Each range ends at its last selected row. Sidecars from
 scales through the last sidecar or constants column use one span per touched

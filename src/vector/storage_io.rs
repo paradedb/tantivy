@@ -86,6 +86,22 @@ pub(crate) mod test_support {
 
     type ReadLog = Arc<Mutex<Vec<(Stage, Range<usize>)>>>;
 
+    thread_local! {
+        static LOG_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    }
+
+    /// Builds trace fixtures before the probe's read log is armed, restoring nested state on exit.
+    pub(crate) fn with_unarmed_log<T>(prepare: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LOG_ARMED.set(self.0);
+            }
+        }
+        let _restore = Restore(LOG_ARMED.replace(false));
+        prepare()
+    }
+
     /// Records vector read requests against a PostgreSQL-sized page geometry.
     #[derive(Clone, Debug, Default)]
     pub(crate) struct PagedDirectory {
@@ -105,10 +121,12 @@ pub(crate) mod test_support {
     impl FileHandle for PagedFile {
         fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
             let bytes = self.inner.read_bytes(range.clone())?;
-            self.reads
-                .lock()
-                .unwrap()
-                .push((current_vector_stage(), range));
+            if LOG_ARMED.get() {
+                self.reads
+                    .lock()
+                    .unwrap()
+                    .push((current_vector_stage(), range));
+            }
             Ok(bytes)
         }
         fn storage_block_len(&self) -> Option<usize> {

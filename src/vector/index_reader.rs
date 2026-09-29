@@ -699,7 +699,6 @@ pub(crate) struct QuantizedLayerReader {
 /// Pinned SoA ranges for one contiguous cluster posting.
 pub(crate) struct QuantizedLayerBatch {
     pub(crate) residual_norms: Option<OwnedBytes>,
-    pub(crate) doc_ids: Option<OwnedBytes>,
     codes: OwnedBytes,
     scales: OwnedBytes,
     gammas: OwnedBytes,
@@ -1050,10 +1049,6 @@ impl QuantizedLayerReader {
             let first = self.blocks.block_rows[b];
             bytes.slice(start + (rows.start - first) * stride..start + (rows.end - first) * stride)
         };
-        let doc_ids = (self.layer == 0 && self.blocks.clustered()).then(|| view(1));
-        if let Some(bytes) = &doc_ids {
-            validate_doc_ids(bytes)?;
-        }
         let codes = view(self.codes);
         self.validate_codes(&codes, &rows)?;
         Ok(QuantizedLayerBatch {
@@ -1062,9 +1057,15 @@ impl QuantizedLayerReader {
             gammas: view(self.gammas),
             error_ratios: view(self.errors),
             constants: self.constants.map(view),
-            residual_norms: (self.layer == 0)
-                .then(|| view(if self.blocks.clustered() { 2 } else { 1 })),
-            doc_ids,
+            residual_norms: (self.layer == 0).then(|| {
+                view(
+                    self.blocks
+                        .slots
+                        .iter()
+                        .position(|slot| matches!(slot.slot_type, SlotType::ResidualNorms))
+                        .expect("validated residual norms column"),
+                )
+            }),
             rows,
             code_stride: self.code_stride,
         })
@@ -1467,27 +1468,6 @@ struct VectorSource {
     centroid_slots: Option<CentroidSlices>,
 }
 
-/// Rejects duplicate or descending document ids before exposing a block to row selection.
-fn validate_doc_ids(bytes: &[u8]) -> crate::Result<()> {
-    let mut previous = None;
-    for bytes in bytes.chunks_exact(4) {
-        let doc = u32::from_le_bytes(bytes.try_into().unwrap());
-        if previous.is_some_and(|prev| prev >= doc) {
-            return Err(DataCorruption::comment_only("DocIds must ascend within a block").into());
-        }
-        previous = Some(doc);
-    }
-    Ok(())
-}
-/// Decodes validated block-local document ids.
-fn decode_doc_ids(bytes: &[u8]) -> crate::Result<Vec<DocId>> {
-    validate_doc_ids(bytes)?;
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-        .collect())
-}
-
 /// Opens an addressing entry only when a document lookup needs it; failures are shared.
 struct DeferredIdMap {
     source: Option<(CompositeFile, Field, DocId)>,
@@ -1526,6 +1506,7 @@ impl DeferredIdMap {
 /// the routing index. See the module docs for the layout and the
 /// pinned-vs-deferred split.
 pub struct VectorIndexReader {
+    max_doc: DocId,
     options: VectorOptions,
     /// Distinct documents with a vector.
     num_vectors: usize,
@@ -1721,7 +1702,11 @@ impl VectorIndexReader {
                     index_ctx: Arc::new(QuantizedIndexCtx::new(Arc::clone(&rows_slice.meta))?),
                     layers,
                     blocks: Arc::clone(&rows_slice),
-                    norms: if rows_slice.clustered() { 2 } else { 1 },
+                    norms: rows_slice
+                        .slots
+                        .iter()
+                        .position(|slot| matches!(slot.slot_type, SlotType::ResidualNorms))
+                        .expect("validated residual norms column"),
                 })
             } else {
                 None
@@ -1732,6 +1717,7 @@ impl VectorIndexReader {
             None => num_rows,
         };
         Ok(Self {
+            max_doc: source.max_doc,
             options,
             num_vectors,
             present: true,
@@ -1755,6 +1741,7 @@ impl VectorIndexReader {
             .unwrap();
         let rows_slice = Arc::new(Blocks::open(FileSlice::from(bytes), &options, 0, None).unwrap());
         Self {
+            max_doc: 0,
             options,
             num_vectors: 0,
             present: false,
@@ -2658,8 +2645,18 @@ impl VectorIndexReader {
             let map = self.id_map.get(false)?;
             return Ok(rows.map(|row| map.doc_at(row as u32)).collect());
         }
-        let bytes = self.rows_slice.read_column(1, rows)?;
-        decode_doc_ids(&bytes)
+        let mut result = Vec::with_capacity(rows.len());
+        let mut docs = Vec::new();
+        let mut row = rows.start;
+        while row < rows.end {
+            let cluster = self.rows_slice.block_of(row);
+            self.read_doc_ids(cluster, &mut docs)?;
+            let first = self.rows_slice.block_rows[cluster];
+            let end = rows.end.min(self.rows_slice.block_rows[cluster + 1]);
+            result.extend_from_slice(&docs[row - first..end - first]);
+            row = end;
+        }
+        Ok(result)
     }
     /// Returns sorted document ids assigned to a cluster, or None for an invalid cluster.
     pub fn cluster_doc_ids(&self, cluster: usize) -> Option<Vec<DocId>> {
@@ -2683,33 +2680,69 @@ impl VectorIndexReader {
             Ok(map.rank_if_exists(doc_id).map(|row| row as usize))
         }
     }
-    /// Walks source blocks in row order with rows and document ids pinned together.
+    /// Reads only a cluster's document column, validating bounds and ordering while decoding.
+    pub(crate) fn read_doc_ids(&self, cluster: usize, out: &mut Vec<DocId>) -> crate::Result<()> {
+        out.clear();
+        let blocks = &self.rows_slice;
+        if !blocks.clustered() || cluster >= blocks.block_rows.len() - 1 {
+            return Err(DataCorruption::comment_only("invalid DocIds cluster").into());
+        }
+        if blocks.rows_in(cluster) == 0 {
+            return Ok(());
+        }
+        let idx = blocks
+            .slots
+            .iter()
+            .position(|slot| matches!(slot.slot_type, SlotType::DocIds))
+            .ok_or_else(|| DataCorruption::comment_only("missing DocIds column"))?;
+        let bytes = blocks.column(cluster, idx)?.read_vector_bytes()?;
+        out.reserve(blocks.rows_in(cluster));
+        let mut previous = None;
+        for bytes in bytes.chunks_exact(std::mem::size_of::<DocId>()) {
+            let doc = DocId::from_le_bytes(bytes.try_into().unwrap());
+            if doc >= self.max_doc || previous.is_some_and(|prev| prev >= doc) {
+                return Err(DataCorruption::comment_only(format!(
+                    "cluster {cluster} DocIds must ascend and be below max_doc {}",
+                    self.max_doc
+                ))
+                .into());
+            }
+            out.push(doc);
+            previous = Some(doc);
+        }
+        Ok(())
+    }
+
+    /// Reads a cluster's full-precision rows without document ids or quantized columns.
+    pub(crate) fn read_cluster_rows(&self, cluster: usize) -> crate::Result<OwnedBytes> {
+        let rows = self.rows_slice.block_rows[cluster]..self.rows_slice.block_rows[cluster + 1];
+        self.rows_slice.read_column(0, rows)
+    }
+
+    /// Walks source blocks in row order, decoding document ids separately from rows.
     pub(crate) fn for_each_row(
         &self,
         mut visit: impl FnMut(usize, DocId, &[u8]) -> crate::Result<()>,
     ) -> crate::Result<()> {
+        let mut docs = Vec::new();
         for b in 0..self.rows_slice.block_rows.len() - 1 {
-            let (bytes, docs) = self.rows_slice.read_exact(b)?;
-            let docs = match docs {
-                Some(bytes) => decode_doc_ids(&bytes)?,
-                None => self.row_doc_ids(
+            let bytes = self.read_cluster_rows(b)?;
+            if self.rows_slice.clustered() {
+                self.read_doc_ids(b, &mut docs)?;
+            } else {
+                docs = self.row_doc_ids(
                     self.rows_slice.block_rows[b]..self.rows_slice.block_rows[b + 1],
-                )?,
-            };
-            for (local, (row, doc)) in bytes
+                )?;
+            }
+            for (local, (row, &doc)) in bytes
                 .chunks_exact(self.options.bytes_per_vector())
-                .zip(docs)
+                .zip(&docs)
                 .enumerate()
             {
                 visit(self.rows_slice.block_rows[b] + local, doc, row)?;
             }
         }
         Ok(())
-    }
-    /// Pins rows and document ids together for one exact cluster scan.
-    pub(crate) fn exact_cluster(&self, cluster: usize) -> crate::Result<(OwnedBytes, Vec<DocId>)> {
-        let (rows, docs) = self.rows_slice.read_exact(cluster)?;
-        Ok((rows, decode_doc_ids(&docs.expect("clustered DocIds"))?))
     }
 }
 
@@ -2952,9 +2985,9 @@ mod tests {
         Ok(())
     }
 
-    // Both named scan spans pin a block with one request and expose column views.
+    // Rows and layer bands each pin their own columns with one request.
     #[test]
-    fn exact_and_layer_spans_read_once_per_block() -> crate::Result<()> {
+    fn rows_and_layer_spans_read_once_per_block() -> crate::Result<()> {
         let reads = Arc::new(Mutex::new(Vec::new()));
         let layer = test_layer_tracked(
             FileSlice::from(Vec::new()),
@@ -2966,13 +2999,65 @@ mod tests {
             Some((Arc::clone(&reads), 32)),
         );
         reads.lock().unwrap().clear();
-        let (rows, docs) = layer.blocks.read_exact(0)?;
+        let rows = layer.blocks.read_column(0, 0..3)?;
         assert_eq!(rows.len(), 3 * 64 * 4);
-        assert_eq!(docs.unwrap().len(), 3 * 4);
-        assert_eq!(&*reads.lock().unwrap(), &[layer.blocks.exact_span(0)]);
+        let start = layer.blocks.block_start(0);
+        assert_eq!(&*reads.lock().unwrap(), &[start..start + rows.len()]);
         reads.lock().unwrap().clear();
         layer.read_batch(0..3)?;
         assert_eq!(&*reads.lock().unwrap(), &[layer.blocks.layer_span(0, 0)]);
+        Ok(())
+    }
+
+    #[test]
+    fn doc_ids_reject_out_of_bounds_and_nonascending_values() -> crate::Result<()> {
+        use super::super::blocks::{block_len, column_range, pad, write_metadata, BlockDirectory};
+        for docs in [[0u32, 1, 3], [0, 0, 2], [1, 0, 2]] {
+            let options = VectorOptions::new(2, Metric::L2);
+            let meta = VectorColMetadata::build_ivf(&options, None)?;
+            let slots = meta.slots();
+            let mut data = Vec::new();
+            let first = write_metadata(&mut data, &meta)?;
+            for (idx, slot) in slots.iter().enumerate() {
+                let range = column_range(&slots, docs.len(), idx);
+                let padding = first + range.start - data.len();
+                pad(&mut data, padding)?;
+                if matches!(slot.slot_type, SlotType::DocIds) {
+                    for doc in docs {
+                        data.extend_from_slice(&doc.to_le_bytes());
+                    }
+                } else {
+                    pad(&mut data, range.len())?;
+                }
+            }
+            let padding = first + block_len(&slots, docs.len()) - data.len();
+            pad(&mut data, padding)?;
+            let mut directory = BlockDirectory::new(first as u64);
+            directory.push(data.len() as u64, docs.len() as u32);
+            directory.finish(&mut data)?;
+            let blocks = Arc::new(Blocks::open(
+                FileSlice::from(data),
+                &options,
+                3,
+                Some(vec![0, 3]),
+            )?);
+            let reader = VectorIndexReader {
+                max_doc: 3,
+                options,
+                num_vectors: 3,
+                present: true,
+                rows_slice: blocks,
+                id_map: DeferredIdMap::ready(IdMap::Identity { num_docs: 3 }),
+                index: None,
+                quantization: None,
+            };
+            let mut decoded = Vec::new();
+            let error = reader.read_doc_ids(0, &mut decoded).unwrap_err();
+            assert!(
+                matches!(error, TantivyError::DataCorruption(_)),
+                "column=DocIds values={docs:?}: {error}"
+            );
+        }
         Ok(())
     }
 
@@ -3113,6 +3198,7 @@ mod tests {
         let blocks = Arc::new(Blocks::open(FileSlice::new(storage), &opts, ROWS, None)?);
         reads.lock().unwrap().clear();
         let reader = VectorIndexReader {
+            max_doc: ROWS as DocId,
             options: VectorOptions::new(DIM, Metric::Dot),
             num_vectors: ROWS,
             present: true,

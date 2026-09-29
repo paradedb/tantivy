@@ -55,6 +55,13 @@ fn input_vector(doc: usize) -> Vec<f32> {
     row
 }
 fn fixture(metric: Metric, schedule: &[u8]) -> crate::Result<(Index, PagedDirectory)> {
+    fixture_with_deletes(metric, schedule, true)
+}
+fn fixture_with_deletes(
+    metric: Metric,
+    schedule: &[u8],
+    deletes: bool,
+) -> crate::Result<(Index, PagedDirectory)> {
     let mut schema = Schema::builder();
     let vector = schema.add_vector_field("embedding", VectorOptions::new(DIM, metric));
     let label = schema.add_text_field("label", STRING | STORED);
@@ -64,7 +71,11 @@ fn fixture(metric: Metric, schedule: &[u8]) -> crate::Result<(Index, PagedDirect
         .schema(schema.build())
         .settings(IndexSettings {
             vector_clustering_threshold: 1,
-            vector_quantization: vec![quant_fixture_config_for(DIM, metric, schedule)],
+            vector_quantization: if schedule.is_empty() {
+                Vec::new()
+            } else {
+                vec![quant_fixture_config_for(DIM, metric, schedule)]
+            },
             ..Default::default()
         })
         .ivf_clusterer(Arc::new(FixedClusters))
@@ -81,6 +92,7 @@ fn fixture(metric: Metric, schedule: &[u8]) -> crate::Result<(Index, PagedDirect
             document.add_text(label, "keep");
         }
         if present(doc) {
+            document.add_text(label, "vector");
             document.add_vector(vector, &input_vector(doc));
         }
         writer.add_document(document)?;
@@ -94,7 +106,7 @@ fn fixture(metric: Metric, schedule: &[u8]) -> crate::Result<(Index, PagedDirect
         }
     }
     writer.merge(&segments).wait()?;
-    for doc in [101, 202] {
+    for doc in [101, 202].into_iter().filter(|_| deletes) {
         writer.delete_term(Term::from_field_text(label, &format!("d{doc}")));
     }
     writer.commit()?;
@@ -170,7 +182,9 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
     );
     for cluster in 0..ivf.num_clusters() {
         let rows = ivf.cluster_range(cluster);
-        let (row_bytes, docs) = vectors.exact_cluster(cluster)?;
+        let row_bytes = vectors.read_cluster_rows(cluster)?;
+        let mut docs = Vec::new();
+        vectors.read_doc_ids(cluster, &mut docs)?;
         let centroid = floats(&centroids[cluster * DIM * 4..(cluster + 1) * DIM * 4]);
         let prepared = cascade::prepare_centroid(&centroid, &ctx.specs);
         let mut values = floats(&row_bytes);
@@ -379,13 +393,6 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                     );
                 }
                 if layer_idx == 0 {
-                    assert_eq!(
-                        band.doc_ids.as_ref().unwrap().as_slice(),
-                        docs.iter()
-                            .flat_map(|doc| doc.to_le_bytes())
-                            .collect::<Vec<_>>(),
-                        "cluster={cluster} row=all column=DocIds band"
-                    );
                     assert_eq!(
                         band.residual_norms.as_ref().unwrap().as_slice(),
                         f32_bytes(&encoded.residual_norms_squared),
@@ -658,6 +665,296 @@ fn zero_row_cluster_skips_band_reads() -> crate::Result<()> {
             .iter()
             .any(|(stage, _)| matches!(stage, crate::vector::Stage::LayerScan(0))),
         "cluster=0 row=all column=band0 requested ranges"
+    );
+    Ok(())
+}
+
+/// Captures one column request per nonempty cluster before the measured probe.
+fn doc_column_ranges(
+    vectors: &crate::vector::VectorIndexReader,
+    directory: &PagedDirectory,
+) -> crate::Result<Vec<Option<std::ops::Range<usize>>>> {
+    let mut docs = Vec::new();
+    let mut ranges = Vec::new();
+    for cluster in 0..vectors.index().unwrap().num_clusters() {
+        directory.reads.lock().unwrap().clear();
+        vectors.read_doc_ids(cluster, &mut docs)?;
+        let reads = directory.reads.lock().unwrap();
+        assert_eq!(
+            reads.len(),
+            usize::from(!docs.is_empty()),
+            "cluster={cluster} column=DocIds"
+        );
+        ranges.push(reads.first().map(|(_, range)| range.clone()));
+    }
+    directory.reads.lock().unwrap().clear();
+    Ok(ranges)
+}
+
+#[test]
+fn open_gate_reads_doc_ids_only_for_rerank() -> crate::Result<()> {
+    use crate::vector::Stage;
+    let (index, directory) = fixture_with_deletes(Metric::L2, &[1, 4], false)?;
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let segment = &searcher.segment_readers()[0];
+    assert!(segment.alive_bitset().is_none());
+    let field = index.schema().get_field("embedding")?;
+    let label = index.schema().get_field("label")?;
+    let vectors = segment.vector_index(field)?;
+    let ranges = doc_column_ranges(&vectors, &directory)?;
+    let collector = TopDocsByVectorSimilarity::new(field, input_vector(42), 3)
+        .with_adaptive_params(AdaptiveProbeParams {
+            max_probe_fraction: 1.0,
+            min_probe_clusters: 4,
+            ..Default::default()
+        });
+    let open = searcher.search(&AllQuery, &collector)?;
+    let reads = directory.reads.lock().unwrap().clone();
+    let overlaps =
+        |a: &std::ops::Range<usize>, b: &std::ops::Range<usize>| a.start < b.end && b.start < a.end;
+    for (stage, range) in &reads {
+        if matches!(stage, Stage::LayerScan(_)) {
+            assert!(
+                !ranges.iter().flatten().any(|docs| overlaps(range, docs)),
+                "stage={stage:?} range={range:?} touches DocIds"
+            );
+        }
+    }
+    let rerank_docs = &open.stats[0].quantized_trace.rerank_docs;
+    for (cluster, range) in ranges.iter().enumerate() {
+        let Some(range) = range else {
+            continue;
+        };
+        let mut docs = Vec::new();
+        vectors.read_doc_ids(cluster, &mut docs)?;
+        let expected = usize::from(docs.iter().any(|doc| rerank_docs.contains(doc)));
+        let actual = reads
+            .iter()
+            .filter(|(stage, read)| matches!(stage, Stage::RerankFetch) && read == range)
+            .count();
+        assert_eq!(
+            actual, expected,
+            "cluster={cluster} column=DocIds rerank requests"
+        );
+        assert_eq!(
+            reads.iter().filter(|(_, read)| read == range).count(),
+            expected,
+            "cluster={cluster} column=DocIds extra trace requests"
+        );
+    }
+    for layer in 0..2 {
+        let requested: Vec<_> = reads
+            .iter()
+            .filter(|(stage, _)| matches!(stage, Stage::LayerScan(l) if *l as usize == layer))
+            .map(|(_, r)| r)
+            .collect();
+        let stats = open.stats[0].layers.get(layer).unwrap();
+        assert_eq!(stats.io.reads, requested.len() as u64);
+        assert_eq!(
+            stats.io.bytes_read,
+            requested.iter().map(|r| r.len() as u64).sum::<u64>()
+        );
+    }
+    let all_vectors = TermQuery::new(
+        Term::from_field_text(label, "vector"),
+        IndexRecordOption::Basic,
+    );
+    let filtered = searcher.search(&all_vectors, &collector)?;
+    assert_eq!(open.results, filtered.results);
+    assert_eq!(
+        open.stats[0].quantized_trace.scored_docs,
+        filtered.stats[0].quantized_trace.scored_docs
+    );
+    assert_eq!(
+        open.stats[0].quantized_trace.estimates,
+        filtered.stats[0].quantized_trace.estimates
+    );
+    assert_eq!(
+        open.stats[0].quantized_trace.boundary_docs,
+        filtered.stats[0].quantized_trace.boundary_docs
+    );
+    Ok(())
+}
+
+#[test]
+fn filtered_clusters_read_doc_ids_before_payload() -> crate::Result<()> {
+    use crate::vector::Stage;
+    for schedule in [&[][..], &[1, 4][..]] {
+        let (index, directory) = fixture_with_deletes(Metric::L2, schedule, false)?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let field = index.schema().get_field("embedding")?;
+        let label = index.schema().get_field("label")?;
+        let vectors = searcher.segment_readers()[0].vector_index(field)?;
+        let ivf = vectors.index().unwrap();
+        let doc_ranges = doc_column_ranges(&vectors, &directory)?;
+        let mut row_ranges = Vec::new();
+        for cluster in 0..ivf.num_clusters() {
+            directory.reads.lock().unwrap().clear();
+            vectors.read_cluster_rows(cluster)?;
+            row_ranges.push(
+                directory
+                    .reads
+                    .lock()
+                    .unwrap()
+                    .first()
+                    .map(|(_, range)| range.clone()),
+            );
+        }
+        let query = input_vector(0);
+        let prepared =
+            crate::vector::prepared::PreparedQuery::new(Metric::L2, Arc::new(query.clone()));
+        let centroids = ivf.centroid_bytes()?;
+        let candidates = (0..ivf.num_clusters())
+            .map(|cluster| crate::vector::ivf::Candidate {
+                node: cluster as u32,
+                sim: Metric::L2.similarity_bytes::<f32>(
+                    prepared.query(),
+                    &centroids[cluster * DIM * 4..(cluster + 1) * DIM * 4],
+                ),
+            })
+            .collect();
+        let collector = TopDocsByVectorSimilarity::new(field, query, DOCS + 1)
+            .with_adaptive_params(AdaptiveProbeParams {
+                max_probe_fraction: 1.0,
+                min_probe_clusters: 4,
+                ..Default::default()
+            });
+        let filter = TermQuery::new(Term::from_field_text(label, "d0"), IndexRecordOption::Basic);
+        directory.reads.lock().unwrap().clear();
+        let result = crate::vector::router::with_test_clusters(candidates, || {
+            searcher.search(&filter, &collector)
+        })?;
+        assert_eq!(result.results.len(), 1);
+        let reads = directory.reads.lock().unwrap();
+        let scans: Vec<_> = reads
+            .iter()
+            .filter(|(stage, _)| {
+                if schedule.is_empty() {
+                    matches!(stage, Stage::ExactScan)
+                } else {
+                    matches!(stage, Stage::LayerScan(0))
+                }
+            })
+            .map(|(_, range)| range)
+            .collect();
+        for cluster in [2, 3] {
+            let docs = doc_ranges[cluster].as_ref().unwrap();
+            let start = row_ranges[cluster].as_ref().unwrap().start;
+            let end = doc_ranges
+                .iter()
+                .skip(cluster + 1)
+                .flatten()
+                .next()
+                .map_or(usize::MAX, |r| {
+                    row_ranges[cluster + 1].as_ref().unwrap().start.min(r.start)
+                });
+            let cluster_reads: Vec<_> = scans
+                .iter()
+                .filter(|r| r.start >= start && r.start < end)
+                .copied()
+                .collect();
+            assert_eq!(
+                cluster_reads,
+                vec![docs],
+                "schedule={schedule:?} cluster={cluster} column=DocIds only"
+            );
+        }
+        if schedule.is_empty() {
+            let mut expected: Vec<_> = doc_ranges.iter().flatten().collect();
+            expected.push(row_ranges[1].as_ref().unwrap());
+            expected.sort_by_key(|range| range.start);
+            let mut actual = scans.clone();
+            actual.sort_by_key(|range| range.start);
+            assert_eq!(
+                actual, expected,
+                "exact filter reads only DocIds and singleton survivor Rows"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn exact_filter_reads_only_survivor_pages() -> crate::Result<()> {
+    use crate::query::BooleanQuery;
+    use crate::vector::Stage;
+    let (index, directory) = fixture_with_deletes(Metric::L2, &[], false)?;
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let segment = &searcher.segment_readers()[0];
+    let field = index.schema().get_field("embedding")?;
+    let label = index.schema().get_field("label")?;
+    let vectors = segment.vector_index(field)?;
+    let doc_ranges = doc_column_ranges(&vectors, &directory)?;
+    let filter = BooleanQuery::union(
+        ["d42", "d242"]
+            .iter()
+            .map(|name| {
+                Box::new(TermQuery::new(
+                    Term::from_field_text(label, name),
+                    IndexRecordOption::Basic,
+                )) as Box<dyn Query>
+            })
+            .collect(),
+    );
+    let weight = filter.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+    let mut selected = Vec::new();
+    weight.for_each_no_score(segment, &mut |docs| selected.extend_from_slice(docs))?;
+    assert_eq!(selected.len(), 2);
+    let query = input_vector(42);
+    let prepared = crate::vector::prepared::PreparedQuery::new(Metric::L2, Arc::new(query.clone()));
+    let mut expected = Vec::new();
+    let mut pages = std::collections::BTreeSet::new();
+    for doc in selected {
+        directory.reads.lock().unwrap().clear();
+        let bytes = vectors.vector_bytes(doc)?.unwrap();
+        expected.push((
+            prepared.score_doc_bytes(&bytes),
+            crate::DocAddress::new(0, doc),
+        ));
+        let reads = directory.reads.lock().unwrap();
+        let (_, row) = reads.last().unwrap();
+        pages.extend(row.start / PAGE_BYTES..=(row.end - 1) / PAGE_BYTES);
+    }
+    assert!(
+        pages.len() >= 2,
+        "survivor rows span distinct storage pages"
+    );
+    expected.sort_by(|(a, ad), (b, bd)| b.total_cmp(a).then_with(|| ad.cmp(bd)));
+    let collector = TopDocsByVectorSimilarity::new(field, query, DOCS + 1).with_adaptive_params(
+        AdaptiveProbeParams {
+            max_probe_fraction: 1.0,
+            min_probe_clusters: 4,
+            ..Default::default()
+        },
+    );
+    directory.reads.lock().unwrap().clear();
+    let result = searcher.search(&filter, &collector)?;
+    assert_eq!(result.results, expected);
+    let reads = directory.reads.lock().unwrap();
+    let scans: Vec<_> = reads
+        .iter()
+        .filter(|(stage, _)| matches!(stage, Stage::ExactScan))
+        .map(|(_, range)| range)
+        .collect();
+    for docs in doc_ranges.iter().flatten() {
+        assert_eq!(
+            scans.iter().filter(|range| **range == docs).count(),
+            1,
+            "DocIds read once"
+        );
+    }
+    let mut payload_pages = std::collections::BTreeSet::new();
+    for range in scans {
+        if !doc_ranges.iter().flatten().any(|docs| docs == range) {
+            payload_pages.extend(range.start / PAGE_BYTES..=(range.end - 1) / PAGE_BYTES);
+        }
+    }
+    assert_eq!(
+        payload_pages, pages,
+        "Rows reads touch only selected-row pages"
     );
     Ok(())
 }

@@ -171,6 +171,18 @@ impl<T: VectorElement> VectorBackend<T> {
         K: SegmentSortKeyComputer,
         CTail: Comparator<K::SegmentSortKey>,
     {
+        #[cfg(test)]
+        let trace_docs = super::storage_io::test_support::with_unarmed_log(|| {
+            let mut mapping = Vec::new();
+            if let Some(index) = self.reader.index() {
+                let mut docs = Vec::new();
+                for cluster in 0..index.num_clusters() {
+                    self.reader.read_doc_ids(cluster, &mut docs)?;
+                    mapping.extend_from_slice(&docs);
+                }
+            }
+            Ok::<_, crate::TantivyError>(mapping)
+        })?;
         let io_before = super::storage_io::snapshot();
         let fallbacks_before = cascade::sign_word_fallback_counts();
         let mut stats = ProbeStats {
@@ -216,6 +228,8 @@ impl<T: VectorElement> VectorBackend<T> {
             stats.sign_word_fallbacks = fallbacks_after[layer] - fallbacks_before[layer];
         }
         stats.rerank_io = io_after[3].since(io_before[3]);
+        #[cfg(test)]
+        stats.quantized_trace.translate(&trace_docs);
         Ok((hits, stats))
     }
 
@@ -363,6 +377,37 @@ pub(crate) struct QuantizedStageTrace {
     pub(crate) estimates: Vec<Vec<(usize, DocId, u32)>>,
     pub(crate) boundary_docs: Vec<Vec<DocId>>,
     pub(crate) rerank_docs: Vec<DocId>,
+    scored_rows: Vec<usize>,
+    boundary_rows: Vec<Vec<usize>>,
+    estimate_rows: Vec<Vec<(usize, u32)>>,
+}
+
+#[cfg(test)]
+impl QuantizedStageTrace {
+    /// Translates recorded rows after the probe, without storage reads in trace hooks.
+    fn translate(&mut self, docs: &[DocId]) {
+        let translate = |rows: &[usize]| {
+            let mut result: Vec<_> = rows.iter().map(|&row| docs[row]).collect();
+            result.sort_unstable();
+            result
+        };
+        self.scored_docs = translate(&self.scored_rows);
+        self.boundary_docs = self
+            .boundary_rows
+            .iter()
+            .map(|rows| translate(rows))
+            .collect();
+        self.estimates = self
+            .estimate_rows
+            .iter()
+            .map(|trace| {
+                trace
+                    .iter()
+                    .map(|&(row, bits)| (row, docs[row], bits))
+                    .collect()
+            })
+            .collect();
+    }
 }
 
 /// Sparse per-layer instrumentation.
@@ -896,15 +941,6 @@ impl<'a> ProbeController<'a> {
     }
 }
 
-/// One gate survivor from the pre-pass over a cluster's rows: `row`
-/// indexes into the segment-wide dense rows slot.
-/// One row surviving the cluster pre-pass.
-#[derive(Clone, Copy)]
-struct Survivor {
-    row: usize,
-    doc: DocId,
-}
-
 /// A point estimate in score space. Pruning only compares its typed endpoints.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Estimate(pub(super) f32);
@@ -986,9 +1022,9 @@ struct QuantizedCandidates {
 
 impl QuantizedCandidates {
     #[cfg(test)]
-    fn estimate_trace(&self) -> Vec<(usize, DocId, u32)> {
+    fn estimate_trace(&self) -> Vec<(usize, u32)> {
         (0..self.len())
-            .map(|i| (self.rows[i], self.docs[i], self.estimates[i].to_bits()))
+            .map(|i| (self.rows[i], self.estimates[i].to_bits()))
             .collect()
     }
 
@@ -1044,7 +1080,7 @@ impl QuantizedCandidates {
         &mut self,
         rows: Range<usize>,
         selection: &Selection<'_>,
-        doc_ids: &[u8],
+        doc_ids: Option<&[DocId]>,
         bases: &[f32],
         raw_prefixes: &[f32],
         estimates: &[f32],
@@ -1055,7 +1091,7 @@ impl QuantizedCandidates {
         arithmetic_variances: &[ArithmeticError],
     ) {
         let len = selection.len(&rows);
-        debug_assert_eq!(doc_ids.len(), rows.len() * std::mem::size_of::<DocId>());
+        debug_assert!(doc_ids.is_none_or(|docs| docs.len() == rows.len()));
         debug_assert_eq!(bases.len(), len);
         debug_assert_eq!(raw_prefixes.len(), len);
         debug_assert_eq!(estimates.len(), len);
@@ -1072,20 +1108,13 @@ impl QuantizedCandidates {
             })),
             Selection::None => unreachable!("empty selections are skipped before scoring"),
         }
-        // Decode from the pinned column into the candidate array. Selection offsets address
-        // the same rows as the score columns, so no cluster-local document copy is needed.
-        match selection {
-            Selection::All => self.docs.extend(
-                doc_ids
-                    .chunks_exact(4)
-                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap())),
-            ),
-            Selection::Rows(offsets) => {
-                self.docs.extend(offsets.iter().map(|&row| {
-                    u32::from_le_bytes(doc_ids[row * 4..row * 4 + 4].try_into().unwrap())
-                }))
+        match (selection, doc_ids) {
+            (Selection::All, Some(docs)) => self.docs.extend_from_slice(docs),
+            (Selection::Rows(offsets), Some(docs)) => {
+                self.docs.extend(offsets.iter().map(|&row| docs[row]))
             }
-            Selection::None => unreachable!("empty selections are skipped before scoring"),
+            (_, None) => self.docs.resize(self.docs.len() + len, DocId::MAX),
+            (Selection::None, _) => unreachable!("empty selections are skipped before scoring"),
         }
         self.bases.extend_from_slice(bases);
         self.raw_prefixes.extend_from_slice(raw_prefixes);
@@ -1979,13 +2008,6 @@ impl QuantizedScanCtx {
     }
 }
 
-#[cfg(test)]
-fn candidate_docs(candidates: &QuantizedCandidates) -> Vec<DocId> {
-    let mut docs = candidates.docs.clone();
-    docs.sort_unstable();
-    docs
-}
-
 /// How a cluster row is tested before scoring: the filter's matches
 /// intersected with the alive docs.
 enum RowGate<'a> {
@@ -2023,7 +2045,7 @@ enum RowVerdict {
 }
 
 fn select_cluster_rows<'a>(
-    doc_ids: &[u8],
+    doc_ids: &[DocId],
     rows: Range<usize>,
     gate: &RowGate,
     offsets: &'a mut Vec<usize>,
@@ -2076,7 +2098,7 @@ fn select_cluster_rows<'a>(
 /// Returns `(pruned_filter, pruned_dead)`.
 #[inline(always)]
 fn select_rows(
-    doc_ids: &[u8],
+    doc_ids: &[DocId],
     rows: Range<usize>,
     offsets: &mut Vec<usize>,
     verdict: impl Fn(DocId) -> RowVerdict,
@@ -2084,7 +2106,7 @@ fn select_rows(
     let mut pruned_filter = 0usize;
     let mut pruned_dead = 0usize;
     for (offset, _row) in rows.enumerate() {
-        let doc = u32::from_le_bytes(doc_ids[offset * 4..offset * 4 + 4].try_into().unwrap());
+        let doc = doc_ids[offset];
         match verdict(doc) {
             RowVerdict::Keep => {
                 offsets.push(offset);
@@ -2166,6 +2188,7 @@ impl<T: VectorElement> VectorBackend<T> {
             return Ok(Vec::new());
         }
         let row_gate = RowGate::new(&filter, alive);
+        let mut cluster_docs = Vec::new();
         let scan_levels = query.active_layers();
         let quantized = self
             .reader
@@ -2310,12 +2333,14 @@ impl<T: VectorElement> VectorBackend<T> {
                 continue;
             }
             let layer = &quantized.layers()[0];
-            let batch = layer.read_batch_in_block(cluster, rows.clone())?;
+            if !matches!(row_gate, RowGate::Open) {
+                self.reader.read_doc_ids(cluster, &mut cluster_docs)?;
+            }
             let selection_start = Instant::now();
             let (selection, visited, pruned_filter, pruned_dead) = {
                 let _routing_stage = enter_vector_stage(Stage::Routing);
                 select_cluster_rows(
-                    batch.doc_ids.as_ref().expect("clustered layer zero DocIds"),
+                    &cluster_docs,
                     rows.clone(),
                     &row_gate,
                     &mut selection_offsets,
@@ -2333,6 +2358,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 continue;
             }
 
+            let batch = layer.read_batch_in_block(cluster, rows.clone())?;
             let score_query_norm = query.score_query_norm(sim.score());
             score_layer(
                 query,
@@ -2383,7 +2409,7 @@ impl<T: VectorElement> VectorBackend<T> {
             scan.candidates.append_selected(
                 rows.clone(),
                 &selection,
-                batch.doc_ids.as_ref().expect("clustered layer zero DocIds"),
+                (!matches!(row_gate, RowGate::Open)).then_some(cluster_docs.as_slice()),
                 &base_scores[..selected_count],
                 &kernel_scores[..selected_count],
                 &estimate_scores[..selected_count],
@@ -2425,10 +2451,10 @@ impl<T: VectorElement> VectorBackend<T> {
 
         #[cfg(test)]
         {
-            stats.quantized_trace.scored_docs = candidate_docs(&scan.candidates);
+            stats.quantized_trace.scored_rows = scan.candidates.rows.clone();
             stats
                 .quantized_trace
-                .estimates
+                .estimate_rows
                 .push(scan.candidates.estimate_trace());
         }
 
@@ -2438,8 +2464,8 @@ impl<T: VectorElement> VectorBackend<T> {
         #[cfg(test)]
         stats
             .quantized_trace
-            .boundary_docs
-            .push(candidate_docs(&scan.candidates));
+            .boundary_rows
+            .push(scan.candidates.rows.clone());
         drop(boundary_stage);
         stats.record_boundary(
             0,
@@ -2599,7 +2625,7 @@ impl<T: VectorElement> VectorBackend<T> {
             #[cfg(test)]
             stats
                 .quantized_trace
-                .estimates
+                .estimate_rows
                 .push(scan.candidates.estimate_trace());
             let boundary_start = Instant::now();
             let boundary_stage = enter_vector_stage(Stage::Boundary(layer_idx as u8));
@@ -2607,8 +2633,8 @@ impl<T: VectorElement> VectorBackend<T> {
             #[cfg(test)]
             stats
                 .quantized_trace
-                .boundary_docs
-                .push(candidate_docs(&scan.candidates));
+                .boundary_rows
+                .push(scan.candidates.rows.clone());
             drop(boundary_stage);
             stats.record_boundary(
                 layer_idx,
@@ -2626,6 +2652,26 @@ impl<T: VectorElement> VectorBackend<T> {
                 .all(|pair| pair[0] < pair[1]),
             "boundary survivors are row-sorted"
         );
+        let mut first = 0;
+        let mut cluster = 0;
+        while first < scan.candidates.len() {
+            while index.cluster_range(cluster).end <= scan.candidates.rows[first] {
+                cluster += 1;
+            }
+            let cluster_rows = index.cluster_range(cluster);
+            let end = first
+                + scan.candidates.rows[first..].partition_point(|&row| row < cluster_rows.end);
+            if scan.candidates.docs[first..end].contains(&DocId::MAX) {
+                self.reader.read_doc_ids(cluster, &mut cluster_docs)?;
+                for candidate in first..end {
+                    if scan.candidates.docs[candidate] == DocId::MAX {
+                        scan.candidates.docs[candidate] =
+                            cluster_docs[scan.candidates.rows[candidate] - cluster_rows.start];
+                    }
+                }
+            }
+            first = end;
+        }
         #[cfg(test)]
         {
             stats.quantized_trace.rerank_docs = scan.candidates.docs.clone();
@@ -2792,8 +2838,7 @@ impl<T: VectorElement> VectorBackend<T> {
             index,
             &mut ranked,
             controller,
-            filter.docs(),
-            alive,
+            &RowGate::new(&filter, alive),
             top_n,
             tie_break,
             tie_comparator,
@@ -2825,28 +2870,7 @@ impl<T: VectorElement> VectorBackend<T> {
         Ok(hits)
     }
 
-    /// Phase 2: the probe loop. Each ranked cluster first passes the
-    /// bounds verdict — armed, the cluster's stored bound is collided
-    /// with the query bound and a strict-negative margin skips it for
-    /// the open share, without touching its rows. A probed cluster is
-    /// then read as one Rows-through-DocIds span and gated by filter and liveness.
-    /// Cluster-order arrival of
-    /// survivors forbids the ascending-doc shortcut in `push`; use
-    /// `push_unordered`.
-    ///
-    /// Note on `NaturalComparator` (vs the `TopNComputer::new` default):
-    /// vector similarity is "higher = better", so we want top-N *largest*
-    /// scores. The default `new()` wires `ReverseComparator`, which keeps
-    /// top-N *smallest* — correct for ascending-distance metrics but inverted
-    /// for our convention.
-    ///
-    /// `ranked` is pulled lazily, one cluster per probe: with graph routing,
-    /// pulling past a converged batch resumes the beam search, so routing
-    /// work interleaves with (and is bounded by) probing.
-    ///
-    /// `#[inline(never)]` so it forms its own flamegraph frame carrying its
-    /// `score_doc_bytes` cost.
-    /// Probes ranked clusters under bounds and work-budget gates.
+    /// Probes ranked clusters under bounds and work-budget gates, filtering before payload reads.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn scan_clusters<K, CTail>(
@@ -2854,8 +2878,7 @@ impl<T: VectorElement> VectorBackend<T> {
         index: &IvfIndex,
         ranked: &mut impl Iterator<Item = Candidate>,
         mut controller: ProbeController<'_>,
-        filter: Option<&BitSet>,
-        alive: Option<&AliveBitSet>,
+        row_gate: &RowGate<'_>,
         top_n: usize,
         tie_break: &mut K,
         tie_comparator: CTail,
@@ -2890,7 +2913,11 @@ impl<T: VectorElement> VectorBackend<T> {
         let bounds = index.bounds();
         // The probed cluster's gate survivors; allocated once, reused
         // across clusters.
-        let mut survivors: Vec<Survivor> = Vec::new();
+        let mut cluster_docs = Vec::new();
+        let mut selection_offsets = Vec::new();
+        let mut selected_rows = Vec::new();
+        let mut read_ranges = Vec::new();
+        let mut block_scratch = Vec::new();
         // The heap's kth after the last covered cluster.
         let mut kth: Option<Score> = None;
 
@@ -2965,40 +2992,82 @@ impl<T: VectorElement> VectorBackend<T> {
 
             let rows = index.cluster_range(cluster);
 
-            let (cluster_bytes, cluster_docs) = self.reader.exact_cluster(cluster)?;
-            let first_row = rows.start;
-            let (v, pf, pd, scored_rows) =
-                self.collect_cluster_survivors(rows, &cluster_docs, filter, alive, &mut survivors);
+            if rows.is_empty() {
+                postings_skipped += 1;
+                controller.cover(kth)?;
+                continue;
+            }
+            let open = matches!(row_gate, RowGate::Open);
+            if !open {
+                self.reader.read_doc_ids(cluster, &mut cluster_docs)?;
+            }
+            let (selection, v, pf, pd) = select_cluster_rows(
+                &cluster_docs,
+                rows.clone(),
+                row_gate,
+                &mut selection_offsets,
+            );
             visited += v;
             pruned_filter += pf;
             pruned_dead += pd;
-
-            // Event-wise charging, part 2: the rows that survive the
-            // pre-pass — exactly the rows fetched and scored below.
-            // Rejected and deduped rows charge nothing.
+            let scored_rows = selection.len(&rows);
             controller.charge_rows(scored_rows);
-
-            if survivors.is_empty() {
+            candidates += scored_rows;
+            if scored_rows == 0 {
                 postings_skipped += 1;
             } else {
                 postings_row += 1;
-                #[cfg(test)]
-                stats
-                    .quantized_trace
-                    .scored_docs
-                    .extend(survivors.iter().map(|survivor| survivor.doc));
-                // Exact rows share the cluster span with document ids.
-                for &Survivor { row, doc } in &survivors {
-                    let stride = self.reader.options().bytes_per_vector();
-                    let offset = (row - first_row) * stride;
-                    let vbytes = &cluster_bytes[offset..offset + stride];
-                    let score = self.query.score_doc_bytes(vbytes);
-                    if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
-                        topn.push_unordered(key, doc);
+                if open {
+                    let bytes = self.reader.read_cluster_rows(cluster)?;
+                    let mut docs_resolved = false;
+                    for (local, vbytes) in bytes
+                        .chunks_exact(self.reader.options().bytes_per_vector())
+                        .enumerate()
+                    {
+                        #[cfg(test)]
+                        stats.quantized_trace.scored_rows.push(rows.start + local);
+                        let score = self.query.score_doc_bytes(vbytes);
+                        if topn
+                            .threshold
+                            .as_ref()
+                            .is_some_and(|((threshold, _), _)| score < *threshold)
+                        {
+                            continue;
+                        }
+                        if !docs_resolved {
+                            self.reader.read_doc_ids(cluster, &mut cluster_docs)?;
+                            docs_resolved = true;
+                        }
+                        let doc = cluster_docs[local];
+                        if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
+                            topn.push_unordered(key, doc);
+                        }
+                    }
+                } else {
+                    selected_rows.clear();
+                    match selection {
+                        Selection::All => selected_rows.extend(rows.clone()),
+                        Selection::Rows(offsets) => {
+                            selected_rows.extend(offsets.iter().map(|&offset| rows.start + offset))
+                        }
+                        Selection::None => unreachable!("nonempty selection"),
+                    }
+                    let batch = self.reader.read_vector_rows_planned(
+                        &selected_rows,
+                        &mut read_ranges,
+                        &mut block_scratch,
+                    )?;
+                    for (row, bytes) in batch.iter() {
+                        #[cfg(test)]
+                        stats.quantized_trace.scored_rows.push(row);
+                        let doc = cluster_docs[row - rows.start];
+                        let score = self.query.score_doc_bytes(bytes);
+                        if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
+                            topn.push_unordered(key, doc);
+                        }
                     }
                 }
             }
-            candidates += survivors.len();
 
             // P2: fold the exact kth into the bound at the cluster
             // boundary. `kth_best` is O(buffer) and force-truncates —
@@ -3031,46 +3100,6 @@ impl<T: VectorElement> VectorBackend<T> {
         }
 
         Ok(topn)
-    }
-
-    /// Filters the document ids pinned with exact rows, collecting scoreable rows.
-    /// Returns `(visited, pruned_filter, pruned_dead, pruned_seen,
-    /// scored_rows)` - the last being the survivor count, which is the
-    /// work-unit row-charge basis and equals the partition identity's
-    /// `scored` term.
-    /// `#[inline(never)]` so per-cluster gate cost forms its own frame,
-    /// while the per-row loop stays inlined inside it.
-    /// Collects scoreable rows from one cluster into `survivors`.
-    #[inline(never)]
-    fn collect_cluster_survivors(
-        &self,
-        rows: Range<usize>,
-        docs: &[DocId],
-        filter: Option<&BitSet>,
-        alive: Option<&AliveBitSet>,
-        survivors: &mut Vec<Survivor>,
-    ) -> (usize, usize, usize, usize) {
-        survivors.clear();
-        let mut visited = 0usize;
-        let mut pruned_filter = 0usize;
-        let mut pruned_dead = 0usize;
-        let mut scored_rows = 0usize;
-        for (row, &doc) in rows.zip(docs) {
-            visited += 1;
-            if filter.is_some_and(|filter| !filter.contains(doc)) {
-                pruned_filter += 1;
-                continue;
-            }
-            if let Some(bs) = alive {
-                if !bs.is_alive(doc) {
-                    pruned_dead += 1;
-                    continue;
-                }
-            }
-            survivors.push(Survivor { row, doc });
-            scored_rows += 1;
-        }
-        (visited, pruned_filter, pruned_dead, scored_rows)
     }
 }
 
@@ -3180,7 +3209,7 @@ mod tests {
     const DEFAULT_NUM_CENTROIDS: usize = 9;
 
     #[test]
-    fn pinned_doc_ids_follow_sparse_scores_across_clusters() {
+    fn selected_doc_ids_follow_scores_and_defer_open_gate() {
         let mut candidates = QuantizedCandidates::with_capacity(8);
         let docs_pointer = candidates.docs.as_ptr();
         let mut offsets = Vec::with_capacity(4);
@@ -3195,9 +3224,8 @@ mod tests {
             ),
             (200..202, vec![11u32, 13], RowGate::Open),
         ] {
-            let bytes: Vec<u8> = docs.iter().flat_map(|doc| doc.to_le_bytes()).collect();
             let (selection, visited, filtered, dead) =
-                select_cluster_rows(&bytes, rows.clone(), &gate, &mut offsets);
+                select_cluster_rows(&docs, rows.clone(), &gate, &mut offsets);
             assert_eq!(visited, docs.len());
             assert_eq!(filtered, docs.len() - 2);
             assert_eq!(dead, 0);
@@ -3205,7 +3233,7 @@ mod tests {
             candidates.append_selected(
                 rows,
                 &selection,
-                &bytes,
+                (!matches!(gate, RowGate::Open)).then_some(docs.as_slice()),
                 &scores,
                 &scores,
                 &scores,
@@ -3217,7 +3245,25 @@ mod tests {
             );
         }
         assert_eq!(candidates.rows, [100, 102, 200, 201]);
-        assert_eq!(candidates.docs, [4, 12, 11, 13]);
+        assert_eq!(candidates.docs, [4, 12, DocId::MAX, DocId::MAX]);
+        let mut trace = QuantizedStageTrace {
+            scored_rows: candidates.rows.clone(),
+            ..Default::default()
+        };
+        let mut mapping = vec![0; 202];
+        for (row, doc) in [(100, 4), (102, 12), (200, 11), (201, 13)] {
+            mapping[row] = doc;
+        }
+        assert_eq!(
+            candidates
+                .rows
+                .iter()
+                .map(|&row| mapping[row])
+                .collect::<Vec<_>>(),
+            [4, 12, 11, 13]
+        );
+        trace.translate(&mapping);
+        assert_eq!(trace.scored_docs, [4, 11, 12, 13]);
         assert_eq!(candidates.estimates, [0.25, 0.75, 0.25, 0.75]);
         assert_eq!(candidates.docs.as_ptr(), docs_pointer);
         assert_eq!(offsets.capacity(), 4);
