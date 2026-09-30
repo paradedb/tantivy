@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tantivy_fst::Regex;
 
 use crate::error::TantivyError;
-use crate::query::query_estimate::MAX_ESTIMATED_TERMS;
+use crate::query::query_estimate::{EstimationBudget, MAX_ESTIMATED_TERMS};
 use crate::query::{AutomatonWeight, EnableScoring, Query, QueryEstimate, Weight};
 use crate::schema::Field;
 
@@ -82,10 +82,15 @@ impl RegexQuery {
 }
 
 impl QueryEstimate for RegexQuery {
+    /// Unions document frequencies accepted by the regex within a fixed scan budget;
+    /// traversal cost sums matching frequencies, including overlap.
     fn estimate_docs(&self, reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         let mut remaining_terms = MAX_ESTIMATED_TERMS;
-        self.specialized_weight()
-            .estimate_docs(reader, &mut remaining_terms)
+        self.specialized_weight().estimate_docs(
+            reader,
+            &mut remaining_terms,
+            &mut EstimationBudget::default(),
+        )
     }
 }
 

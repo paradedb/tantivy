@@ -1,6 +1,6 @@
 pub(crate) use super::regex_phrase_weight::RegexPhraseWeight;
 use crate::query::bm25::Bm25Weight;
-use crate::query::query_estimate::{estimate_phrase, MAX_ESTIMATED_TERMS};
+use crate::query::query_estimate::{estimate_phrase, EstimationBudget, MAX_ESTIMATED_TERMS};
 use crate::query::{AutomatonWeight, EnableScoring, Query, QueryEstimate, Weight};
 use crate::schema::{Field, IndexRecordOption, Term, Type};
 
@@ -162,14 +162,19 @@ impl RegexPhraseQuery {
 }
 
 impl QueryEstimate for RegexPhraseQuery {
+    /// Estimates each regex term's union under a shared scan budget, then applies the phrase
+    /// positional/slop discount; cost adds expanded term traversal and candidate position checks.
     fn estimate_docs(&self, reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         let mut remaining_terms = MAX_ESTIMATED_TERMS.min(self.max_expansions as usize);
+        let mut budget = EstimationBudget::default();
         let mut terms = Vec::with_capacity(self.phrase_terms.len());
         for (_, pattern) in &self.phrase_terms {
             let regex = tantivy_fst::Regex::new(pattern)
                 .map_err(|e| crate::TantivyError::InvalidArgument(format!("Invalid regex: {e}")))?;
             let automaton = AutomatonWeight::new(self.field, regex);
-            let Some(estimate) = automaton.estimate_docs(reader, &mut remaining_terms)? else {
+            let Some(estimate) =
+                automaton.estimate_docs(reader, &mut remaining_terms, &mut budget)?
+            else {
                 // The expansion budget was exhausted before every phrase term was estimated.
                 return Ok(None);
             };

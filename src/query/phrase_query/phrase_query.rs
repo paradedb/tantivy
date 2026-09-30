@@ -135,6 +135,8 @@ impl PhraseQuery {
 }
 
 impl QueryEstimate for PhraseQuery {
+    /// Looks up each term's frequency and discounts their estimated intersection for positions
+    /// and slop; cost adds term traversal and candidate position checks. Reads no positions.
     fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         let inverted_index = reader.inverted_index(self.field)?;
         let terms = self

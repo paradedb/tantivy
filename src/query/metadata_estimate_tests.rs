@@ -1,7 +1,7 @@
 use super::{
-    AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, EmptyQuery, FuzzyTermQuery, Occur,
-    PhrasePrefixQuery, PhraseQuery, Query, QueryClone, QueryEstimate, RegexPhraseQuery, RegexQuery,
-    TermQuery,
+    AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, EmptyQuery, FuzzyTermQuery,
+    MoreLikeThisQuery, Occur, PhrasePrefixQuery, PhraseQuery, Query, QueryClone, QueryEstimate,
+    RegexPhraseQuery, RegexQuery, TermQuery,
 };
 use crate::merge_policy::NoMergePolicy;
 use crate::schema::{Field, IndexRecordOption, Schema, FAST, TEXT};
@@ -348,6 +348,19 @@ fn metadata_estimates_limit_expansion_without_using_partial_counts() -> crate::R
         None
     );
     assert_eq!(
+        RegexQuery::from_pattern(".*absent", text)?.estimate_docs(reader)?,
+        None
+    );
+    assert_eq!(
+        RegexQuery::from_pattern("token04096", text)?.estimate_docs(reader)?,
+        Some((1, 1))
+    );
+    assert_eq!(
+        FuzzyTermQuery::new(Term::from_field_text(text, "token04096"), 0, false)
+            .estimate_docs(reader)?,
+        Some((1, 1))
+    );
+    assert_eq!(
         FuzzyTermQuery::new_prefix(Term::from_field_text(text, "token"), 0, false)
             .estimate_docs(reader)?,
         None
@@ -360,11 +373,30 @@ fn metadata_estimates_limit_expansion_without_using_partial_counts() -> crate::R
     );
     prefix.set_max_expansions(MAX_ESTIMATED_TERMS as u32 + 1);
     assert_eq!(prefix.estimate_docs(reader)?, None);
+    prefix.set_max_expansions(0);
+    assert_eq!(prefix.estimate_docs(reader)?, Some((0, 0)));
     let mut regex_phrase =
         RegexPhraseQuery::new(text, vec!["token00000".into(), "token00001".into()]);
     regex_phrase.set_max_expansions(1);
     assert_eq!(regex_phrase.estimate_docs(reader)?, None);
     regex_phrase.set_max_expansions(2);
     assert!(regex_phrase.estimate_docs(reader)?.is_some());
+    Ok(())
+}
+
+#[test]
+fn metadata_estimates_mlt_without_loading_source() -> crate::Result<()> {
+    let (index, _writer, _, _) = fixture()?;
+    let searcher = index.reader()?.searcher();
+    let reader = searcher.segment_reader(0);
+    let queries = [
+        MoreLikeThisQuery::builder().with_document(crate::DocAddress::new(u32::MAX, u32::MAX)),
+        MoreLikeThisQuery::builder().with_document_fields(vec![]),
+    ];
+    for query in queries {
+        assert_eq!(query.estimate_docs(reader)?, Some((10, 1000)));
+        let wrapped = ConstScoreQuery::new(Box::new(BoostQuery::new(Box::new(query), 5.0)), 3.0);
+        assert_eq!(wrapped.estimate_docs(reader)?, Some((10, 1000)));
+    }
     Ok(())
 }

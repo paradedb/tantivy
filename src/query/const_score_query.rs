@@ -38,6 +38,7 @@ impl fmt::Debug for ConstScoreQuery {
 }
 
 impl QueryEstimate for ConstScoreQuery {
+    /// Delegates unchanged: replacing scores does not alter matching documents or traversal.
     fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         self.query.estimate_docs(reader)
     }

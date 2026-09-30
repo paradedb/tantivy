@@ -2,9 +2,11 @@ use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA};
 use once_cell::sync::OnceCell;
 use tantivy_fst::Automaton;
 
-use crate::query::query_estimate::MAX_ESTIMATED_TERMS;
-use crate::query::{AutomatonWeight, EnableScoring, Query, QueryEstimate, Weight};
-use crate::schema::{Term, Type};
+use crate::query::query_estimate::{EstimationBudget, MAX_ESTIMATED_TERMS};
+use crate::query::{
+    AutomatonWeight, EnableScoring, PhrasePrefixQuery, Query, QueryEstimate, TermQuery, Weight,
+};
+use crate::schema::{IndexRecordOption, Term, Type};
 use crate::TantivyError::InvalidArgument;
 
 pub(crate) struct DfaWrapper(pub DFA);
@@ -176,10 +178,25 @@ impl FuzzyTermQuery {
 }
 
 impl QueryEstimate for FuzzyTermQuery {
+    /// Uses a term lookup or prefix range at distance zero; otherwise unions frequencies
+    /// accepted by the fuzzy automaton within a fixed scan budget. Cost sums frequencies.
     fn estimate_docs(&self, reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        let weight = self.specialized_weight()?;
+        if self.distance == 0 {
+            if self.prefix {
+                let mut query = PhrasePrefixQuery::new(vec![self.term.clone()]);
+                query.set_max_expansions(u32::MAX);
+                return query.estimate_docs(reader);
+            }
+            return TermQuery::new(self.term.clone(), IndexRecordOption::Basic)
+                .estimate_docs(reader);
+        }
         let mut remaining_terms = MAX_ESTIMATED_TERMS;
-        self.specialized_weight()?
-            .estimate_docs(reader, &mut remaining_terms)
+        weight.estimate_docs(
+            reader,
+            &mut remaining_terms,
+            &mut EstimationBudget::default(),
+        )
     }
 }
 

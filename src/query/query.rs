@@ -233,6 +233,7 @@ where T: 'static + Query + Clone
 }
 
 impl QueryEstimate for Box<dyn Query> {
+    /// Forwards the wrapped query's estimate without changing its count or cost.
     fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         self.as_ref().estimate_docs(reader)
     }

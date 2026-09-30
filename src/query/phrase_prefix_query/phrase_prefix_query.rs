@@ -2,7 +2,9 @@ use std::ops::Bound;
 
 use super::{prefix_end, PhrasePrefixWeight};
 use crate::query::bm25::Bm25Weight;
-use crate::query::query_estimate::{estimate_phrase, estimate_term_union, MAX_ESTIMATED_TERMS};
+use crate::query::query_estimate::{
+    bounded_prefix_stream, estimate_phrase, estimate_term_union, EstimationBudget,
+};
 use crate::query::{EnableScoring, InvertedIndexRangeWeight, Query, QueryEstimate, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::SegmentReader;
@@ -129,7 +131,12 @@ impl PhrasePrefixQuery {
 }
 
 impl QueryEstimate for PhrasePrefixQuery {
+    /// Combines exact term frequencies with a budgeted prefix union, then applies the phrase
+    /// discount; cost adds term traversal and candidate position checks. Honors max expansions.
     fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        if self.max_expansions == 0 {
+            return Ok(Some((0, 0)));
+        }
         let inverted_index = reader.inverted_index(self.field)?;
         let mut terms = Vec::with_capacity(self.phrase_terms.len() + 1);
         for (_, term) in &self.phrase_terms {
@@ -140,20 +147,18 @@ impl QueryEstimate for PhrasePrefixQuery {
             terms.push((count, u64::from(count)));
         }
         let prefix = self.prefix.1.serialized_value_bytes();
-        let mut stream = inverted_index.terms().range().ge(prefix);
-        if let Some(end) = prefix_end(prefix) {
-            stream = stream.lt(&end);
-        }
-        #[cfg(feature = "quickwit")]
-        {
-            stream =
-                stream.limit(u64::from(self.max_expansions).min(MAX_ESTIMATED_TERMS as u64 + 1));
-        }
-        let mut stream = stream.into_stream()?;
+        let mut budget = EstimationBudget::default();
+        let limit = (self.max_expansions as usize).min(budget.remaining_terms + 1);
+        let Some(mut stream) =
+            bounded_prefix_stream(inverted_index.terms(), prefix, limit, &mut budget)?
+        else {
+            // The prefix range exceeds the dictionary payload read budget.
+            return Ok(None);
+        };
         let mut frequencies = Vec::new();
         while frequencies.len() < self.max_expansions as usize && stream.advance() {
-            if frequencies.len() == MAX_ESTIMATED_TERMS {
-                // The query expands beyond the metadata estimation budget.
+            if !budget.consume(stream.key()) {
+                // The query expands beyond the term or byte estimation budget.
                 return Ok(None);
             }
             frequencies.push(stream.value().doc_freq);
