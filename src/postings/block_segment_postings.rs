@@ -1,6 +1,7 @@
 use std::io;
 
 use common::{HasLen, VInt};
+use once_cell::unsync::OnceCell;
 
 use crate::directory::{BufferedFileSlice, FileSlice, OwnedBytes};
 use crate::fieldnorm::FieldNormReader;
@@ -27,7 +28,7 @@ pub(crate) fn max_score<I: Iterator<Item = Score>>(mut it: I) -> Option<Score> {
 pub struct BlockSegmentPostings {
     pub(crate) doc_decoder: BlockDecoder,
     block_loaded: bool,
-    freq_decoder: BlockDecoder,
+    freq_decoder: OnceCell<BlockDecoder>,
     freq_reading_option: FreqReadingOption,
     record_option: IndexRecordOption,
     requested_option: IndexRecordOption,
@@ -241,7 +242,7 @@ impl BlockSegmentPostings {
         let mut block_segment_postings = BlockSegmentPostings {
             doc_decoder: BlockDecoder::with_val(TERMINATED),
             block_loaded: false,
-            freq_decoder: BlockDecoder::with_val(1),
+            freq_decoder: OnceCell::from(BlockDecoder::with_val(1)),
             freq_reading_option,
             record_option: schema_record_option,
             requested_option,
@@ -279,7 +280,7 @@ impl BlockSegmentPostings {
         // If it is actually loaded, we can compute block max manually.
         if self.block_is_loaded() {
             let docs = self.doc_decoder.output_array().iter().cloned();
-            let freqs = self.freq_decoder.output_array().iter().cloned();
+            let freqs = self.freq_decoder().output_array().iter().cloned();
             let bm25_scores = docs.zip(freqs).enumerate().map(|(offset, (_, term_freq))| {
                 let fieldnorm_id = self.fieldnorm_id_at(offset, fieldnorm_reader);
                 bm25_weight.score(fieldnorm_id, term_freq)
@@ -375,7 +376,7 @@ impl BlockSegmentPostings {
             (_, IndexRecordOption::Basic) => FreqReadingOption::SkipFreq,
             _ => FreqReadingOption::ReadFreq,
         };
-        self.freq_decoder = BlockDecoder::with_val(1);
+        self.freq_decoder = OnceCell::from(BlockDecoder::with_val(1));
         self.doc_freq = doc_freq;
         self.try_load_block()
     }
@@ -409,14 +410,59 @@ impl BlockSegmentPostings {
     #[inline]
     pub fn freqs(&self) -> &[u32] {
         debug_assert!(self.block_is_loaded());
-        self.freq_decoder.output_array()
+        self.freq_decoder().output_array()
     }
 
     /// Return the frequency at index `idx` of the block.
     #[inline]
     pub fn freq(&self, idx: usize) -> u32 {
         debug_assert!(self.block_is_loaded());
-        self.freq_decoder.output(idx)
+        self.freq_decoder().output(idx)
+    }
+
+    #[inline]
+    fn freq_decoder(&self) -> &BlockDecoder {
+        self.freq_decoder
+            .get_or_try_init(|| {
+                let mut decoder = BlockDecoder::with_val(1);
+                if self.freq_reading_option == FreqReadingOption::ReadFreq {
+                    if let Some(freqs_data) = &self.freqs_data {
+                        let start = self.skip_reader.freq_byte_offset();
+                        match self.skip_reader.block_info() {
+                            BlockInfo::BitPacked {
+                                tf_num_bits,
+                                strict_delta_encoded,
+                                ..
+                            } => {
+                                freqs_data.with_bytes(
+                                    start..start + compressed_block_size(tf_num_bits),
+                                    |bytes| {
+                                        decoder.uncompress_block_unsorted(
+                                            bytes,
+                                            tf_num_bits,
+                                            strict_delta_encoded,
+                                        );
+                                    },
+                                )?;
+                            }
+                            BlockInfo::VInt { num_docs }
+                                if num_docs > 0 && start < freqs_data.len() =>
+                            {
+                                freqs_data.with_bytes(start..freqs_data.len(), |bytes| {
+                                    decoder.uncompress_vint_unsorted(
+                                        bytes,
+                                        num_docs as usize,
+                                        TERMINATED,
+                                    );
+                                })?;
+                            }
+                            BlockInfo::VInt { .. } => {}
+                        }
+                    }
+                }
+                Ok::<_, io::Error>(decoder)
+            })
+            .expect("term frequencies became unreadable after the reader was opened")
     }
 
     /// Returns the length of the current block.
@@ -424,7 +470,7 @@ impl BlockSegmentPostings {
     /// Returns the decoded term-frequency buffer for the current block.
     #[inline]
     pub(crate) fn freq_output_array(&self) -> &[u32] {
-        self.freq_decoder.output_array()
+        self.freq_decoder().output_array()
     }
 
     /// All blocks have a length of `NUM_DOCS_PER_BLOCK`,
@@ -567,6 +613,14 @@ impl BlockSegmentPostings {
         if self.block_is_loaded() {
             return Ok(());
         }
+        if self.freqs_data.is_some()
+            && !matches!(
+                self.skip_reader.block_info(),
+                BlockInfo::VInt { num_docs: 0 }
+            )
+        {
+            self.freq_decoder.take();
+        }
         let range = self.block_data_range();
         match self.skip_reader.block_info() {
             BlockInfo::BitPacked {
@@ -581,7 +635,7 @@ impl BlockSegmentPostings {
                         if self.freqs_data.is_none()
                             && self.freq_reading_option == FreqReadingOption::ReadFreq
                         {
-                            Some(&mut self.freq_decoder)
+                            self.freq_decoder.get_mut()
                         } else {
                             None
                         },
@@ -600,7 +654,7 @@ impl BlockSegmentPostings {
                         if self.freqs_data.is_none()
                             && self.freq_reading_option == FreqReadingOption::ReadFreq
                         {
-                            Some(&mut self.freq_decoder)
+                            self.freq_decoder.get_mut()
                         } else {
                             None
                         },
@@ -609,39 +663,6 @@ impl BlockSegmentPostings {
                         num_docs as usize,
                     );
                 })?;
-            }
-        }
-        if self.freq_reading_option == FreqReadingOption::ReadFreq {
-            if let Some(freqs_data) = &self.freqs_data {
-                let start = self.skip_reader.freq_byte_offset();
-                match self.skip_reader.block_info() {
-                    BlockInfo::BitPacked {
-                        tf_num_bits,
-                        strict_delta_encoded,
-                        ..
-                    } => {
-                        freqs_data.with_bytes(
-                            start..start + compressed_block_size(tf_num_bits),
-                            |bytes| {
-                                self.freq_decoder.uncompress_block_unsorted(
-                                    bytes,
-                                    tf_num_bits,
-                                    strict_delta_encoded,
-                                );
-                            },
-                        )?;
-                    }
-                    BlockInfo::VInt { num_docs } if num_docs > 0 && start < freqs_data.len() => {
-                        freqs_data.with_bytes(start..freqs_data.len(), |bytes| {
-                            self.freq_decoder.uncompress_vint_unsorted(
-                                bytes,
-                                num_docs as usize,
-                                TERMINATED,
-                            );
-                        })?;
-                    }
-                    BlockInfo::VInt { .. } => {}
-                }
             }
         }
         self.block_loaded = true;
@@ -661,7 +682,7 @@ impl BlockSegmentPostings {
         BlockSegmentPostings {
             doc_decoder: BlockDecoder::with_val(TERMINATED),
             block_loaded: true,
-            freq_decoder: BlockDecoder::with_val(1),
+            freq_decoder: OnceCell::from(BlockDecoder::with_val(1)),
             freq_reading_option: FreqReadingOption::NoFreq,
             record_option: IndexRecordOption::Basic,
             requested_option: IndexRecordOption::Basic,
@@ -855,14 +876,26 @@ mod tests {
                 }))
             });
             if failing_freqs.is_some() {
-                let mut docs = BlockSegmentPostings::open_file_slice(
-                    info.doc_freq,
-                    FileSlice::new(Arc::new(bytes.clone())),
-                    failing_freqs.clone(),
-                    record_option,
+                for option in [
                     IndexRecordOption::Basic,
-                )?;
-                docs.seek(149999);
+                    IndexRecordOption::WithFreqs,
+                    IndexRecordOption::WithFreqsAndPositions,
+                ] {
+                    let mut docs = BlockSegmentPostings::open_file_slice(
+                        info.doc_freq,
+                        FileSlice::new(Arc::new(bytes.clone())),
+                        failing_freqs.clone(),
+                        record_option,
+                        option,
+                    )?;
+                    docs.seek(149999);
+                    if option.has_freq() {
+                        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || docs.freq(0)
+                        ))
+                        .is_err());
+                    }
+                }
             }
             assert!(BlockSegmentPostings::open_file_slice(
                 info.doc_freq,
@@ -871,7 +904,106 @@ mod tests {
                 record_option,
                 IndexRecordOption::WithFreqs,
             )
+            .and_then(|mut postings| {
+                postings.seek_block(149999);
+                postings.try_load_block()
+            })
             .is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn separated_frequencies_are_read_only_on_access() -> crate::Result<()> {
+        for count in [1, 127, 128, 129, 4097] {
+            let mut schema = Schema::builder();
+            let text = schema.add_text_field("text", TEXT);
+            let index = Index::create_in_ram(schema.build());
+            let mut writer = index.writer_for_tests()?;
+            for doc in 0..count {
+                writer.add_document(doc!(text => "x ".repeat((doc % 17 + 1) as usize)))?;
+            }
+            writer.commit()?;
+            let searcher = index.reader()?.searcher();
+            let segment = searcher.segment_reader(0);
+            let inverted = segment.inverted_index(text)?;
+            let info = inverted
+                .get_term_info(&Term::from_field_text(text, "x"))?
+                .unwrap();
+            let docs = CompositeFile::open(&segment.open_read(SegmentComponent::Postings)?)?
+                .open_read(text)
+                .unwrap()
+                .slice_from(8)
+                .slice(info.postings_range)
+                .read_bytes()?;
+            let freqs =
+                CompositeFile::open(&segment.open_read(SegmentComponent::TermFrequencies)?)?
+                    .open_read(text)
+                    .unwrap()
+                    .slice(info.freqs_range.unwrap())
+                    .read_bytes()?;
+            for option in [
+                IndexRecordOption::Basic,
+                IndexRecordOption::WithFreqs,
+                IndexRecordOption::WithFreqsAndPositions,
+            ] {
+                let reads = Arc::new(Mutex::new(Vec::new()));
+                let file = FileSlice::new(Arc::new(BlockBackedFile {
+                    data: freqs.to_vec(),
+                    reads: reads.clone(),
+                    fail_after: None,
+                }));
+                let mut blocks = BlockSegmentPostings::open_file_slice(
+                    count,
+                    FileSlice::new(Arc::new(docs.clone())),
+                    Some(file.clone()),
+                    IndexRecordOption::WithFreqsAndPositions,
+                    option,
+                )?;
+                while !blocks.docs().is_empty() {
+                    blocks.advance();
+                }
+                blocks.reset(count, docs.clone(), Some(file.clone()))?;
+                let offset = blocks.seek(count / 2);
+                assert!(reads.lock().unwrap().is_empty());
+                let start = blocks.skip_reader().freq_byte_offset();
+                let expected = if option.has_freq() {
+                    (count / 2) % 17 + 1
+                } else {
+                    1
+                };
+                assert_eq!(blocks.freq(offset), expected);
+                if option.has_freq() {
+                    assert_eq!(reads.lock().unwrap()[0].start, start);
+                    for (doc, freq) in blocks.docs().iter().zip(blocks.freqs()) {
+                        assert_eq!(*freq, doc % 17 + 1);
+                    }
+                    assert_eq!(blocks.freq_output_array(), blocks.freqs());
+                } else {
+                    assert!(reads.lock().unwrap().is_empty());
+                }
+                let loaded = blocks.clone();
+                let accesses = reads.lock().unwrap().len();
+                assert_eq!(loaded.freq(offset), expected);
+                assert_eq!(blocks.freq(offset), expected);
+                let tail = blocks.seek(count - 1);
+                assert_eq!(reads.lock().unwrap().len(), accesses);
+                assert_eq!(
+                    blocks.freq(tail),
+                    if option.has_freq() {
+                        (count - 1) % 17 + 1
+                    } else {
+                        1
+                    }
+                );
+                assert_eq!(loaded.freq(offset), expected);
+                let accesses = reads.lock().unwrap().len();
+                blocks.reset(count, docs.clone(), Some(file))?;
+                while !blocks.docs().is_empty() {
+                    blocks.advance();
+                }
+                assert_eq!(reads.lock().unwrap().len(), accesses);
+            }
         }
         Ok(())
     }
