@@ -360,4 +360,9 @@ where
     fn score(&mut self) -> Score {
         self.score
     }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        TScoreCombiner::constant_score()
+    }
 }

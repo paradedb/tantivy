@@ -315,6 +315,20 @@ impl DocSet for BlockWandUnionScorer {
         TERMINATED
     }
 
+    fn seek(&mut self, target: DocId) -> DocId {
+        if target <= self.doc() {
+            return self.doc();
+        }
+        for scorer in &mut self.scorers {
+            if scorer.doc() < target {
+                scorer.seek(target);
+            }
+        }
+        self.scorers.retain(|s| s.doc() != TERMINATED);
+        self.scorers.sort_by_key(|s| s.doc());
+        self.advance()
+    }
+
     #[inline]
     fn doc(&self) -> DocId {
         self.current.0
@@ -378,6 +392,7 @@ impl DocSet for BlockWandSingleScorer {
         let mut doc = self.scorer.doc();
         // hoist threshold to a local so we avoid going to memory in the loop
         let threshold = self.threshold;
+        self.scorer.seek_block(doc);
         'outer: loop {
             // We position the scorer on a block that can reach
             // the threshold.
@@ -498,6 +513,44 @@ mod tests {
                 crate::postings::tests::test_skip_against_unoptimized(
                     || Box::new(super::BlockWandSingleScorer::new(term.clone(), threshold)),
                     vec![0, 1, 3, 381, 384, 385, 768, 769, 1536, 1537, TERMINATED],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_block_wand_union_seek_matches_advance() {
+        for len in [2, 127, 128, 129, 513] {
+            let fieldnorms = vec![8; len * 3];
+            let postings1: Vec<_> = (0..len as u32)
+                .map(|doc| (doc * 2, 1 + (doc / 128) % 2))
+                .collect();
+            let postings2: Vec<_> = (0..len as u32)
+                .map(|doc| (doc * 3, 1 + (doc / 64) % 2))
+                .collect();
+            let weight1 = Bm25Weight::for_one_term(
+                len as u64,
+                fieldnorms.len() as u64,
+                8.0,
+                Bm25Params::default(),
+            );
+            let weight2 = Bm25Weight::for_one_term(
+                len as u64,
+                fieldnorms.len() as u64,
+                6.0,
+                Bm25Params::default(),
+            );
+            let term1 = TermScorer::create_for_test(&postings1, &fieldnorms, weight1.clone());
+            let term2 = TermScorer::create_for_test(&postings2, &fieldnorms, weight2.clone());
+            for threshold in [Score::MIN, weight1.score(8, 1), Score::MAX] {
+                crate::postings::tests::test_skip_against_unoptimized(
+                    || {
+                        Box::new(super::BlockWandUnionScorer::new(
+                            vec![term1.clone(), term2.clone()],
+                            threshold,
+                        ))
+                    },
+                    vec![0, 1, 2, 3, 381, 384, 385, 768, 769, 1536, 1537, TERMINATED],
                 );
             }
         }

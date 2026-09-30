@@ -67,21 +67,40 @@ pub trait Weight: Send + Sync + 'static {
     ///
     /// `boost` is a multiplier to apply to the score. `init_threshold` is the
     /// initial score threshold below which documents may be pruned.
+    /// Returns a [`PruningScorer`] that prunes documents whose score cannot exceed
+    /// `init_threshold`, or `None` if this weight and segment do not support dynamic
+    /// block pruning (e.g. filters or scorers lacking block-max skip data).
     ///
-    /// The default implementation wraps [`Weight::scorer`] in a
-    /// [`BasicPruningScorer`], which simply filters out `(doc, score)` pairs
-    /// below the current threshold. Scorers that can prune more aggressively
-    /// (e.g. BlockWAND over a union or intersection) override this.
+    /// The default implementation returns `Ok(None)`. Scorers that can prune dynamically
+    /// (e.g. BlockWAND over a term, union, or intersection) override this. Callers like
+    /// [`Weight::for_each_pruning`] call this directly, falling back to exhaustive scoring
+    /// via [`BasicPruningScorer`] if `None` is returned.
     fn pruning_scorer(
         &self,
-        reader: &SegmentReader,
-        boost: Score,
-        init_threshold: Score,
-    ) -> crate::Result<Box<dyn PruningScorer>> {
-        Ok(Box::new(BasicPruningScorer::new(
-            self.scorer(reader, boost)?,
-            init_threshold,
-        )))
+        _reader: &SegmentReader,
+        _boost: Score,
+        _init_threshold: Score,
+    ) -> crate::Result<Option<Box<dyn PruningScorer>>> {
+        Ok(None)
+    }
+
+    /// Returns true if this weight can construct a [`PruningScorer`] that prunes
+    /// dynamically (e.g. BlockWAND).
+    ///
+    /// This is a lightweight capability check on `Weight` metadata (e.g. whether scoring
+    /// is enabled, phrase slop is zero, etc.) that does not touch [`SegmentReader`],
+    /// open inverted indexes, or allocate posting decoders.
+    ///
+    /// It exists alongside [`Weight::pruning_scorer`] for query combinators such as
+    /// filtered dynamic pruning: to calculate the `init_threshold` passed to `pruning_scorer`,
+    /// the combinator must first know which clause is the scoring driver versus the filters,
+    /// so it can instantiate the filters and read their constant score contribution.
+    /// Because [`PruningScorer`] implementations advance and decode blocks eagerly upon
+    /// construction, probing by calling `pruning_scorer` would require passing an arbitrary
+    /// threshold and then discarding the scorer. `is_pruning_supported` allows identifying
+    /// the single dynamic pruning driver upfront with zero cost.
+    fn is_pruning_supported(&self) -> bool {
+        false
     }
 
     /// Returns an [`Explanation`] for the given document.
@@ -139,8 +158,12 @@ pub trait Weight: Send + Sync + 'static {
         reader: &SegmentReader,
         callback: &mut dyn FnMut(DocId, Score) -> Score,
     ) -> crate::Result<()> {
-        let mut scorer = self.pruning_scorer(reader, 1.0, threshold)?;
-        for_each_pruning_scorer(scorer.as_mut(), callback);
+        if let Some(mut scorer) = self.pruning_scorer(reader, 1.0, threshold)? {
+            for_each_pruning_scorer(scorer.as_mut(), callback);
+        } else {
+            let mut scorer = BasicPruningScorer::new(self.scorer(reader, 1.0)?, threshold);
+            for_each_pruning_scorer(&mut scorer, callback);
+        }
         Ok(())
     }
 }

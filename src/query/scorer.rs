@@ -13,6 +13,12 @@ pub trait Scorer: downcast_rs::Downcast + DocSet + 'static {
     ///
     /// This method will perform a bit of computation and is not cached.
     fn score(&mut self) -> Score;
+
+    /// Returns the constant score produced for every document by this scorer,
+    /// or `None` if the scorer produces variable scores per document.
+    fn constant_score(&self) -> Option<Score> {
+        None
+    }
 }
 
 impl_downcast!(Scorer);
@@ -21,6 +27,11 @@ impl<TScorer: Scorer + ?Sized> Scorer for Box<TScorer> {
     #[inline]
     fn score(&mut self) -> Score {
         self.deref_mut().score()
+    }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        (**self).constant_score()
     }
 }
 
@@ -57,6 +68,11 @@ impl<TScorer: Scorer> Scorer for BasicPruningScorer<TScorer> {
     #[inline]
     fn score(&mut self) -> Score {
         self.current.1
+    }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        self.scorer.constant_score()
     }
 }
 impl<TScorer: Scorer> PruningScorer for BasicPruningScorer<TScorer> {

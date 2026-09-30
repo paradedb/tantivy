@@ -36,8 +36,8 @@ impl Weight for EmptyWeight {
         _reader: &SegmentReader,
         _boost: Score,
         _init_threshold: Score,
-    ) -> crate::Result<Box<dyn PruningScorer>> {
-        Ok(Box::new(EmptyScorer))
+    ) -> crate::Result<Option<Box<dyn PruningScorer>>> {
+        Ok(Some(Box::new(EmptyScorer)))
     }
 
     fn explain(&self, _reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
@@ -68,6 +68,11 @@ impl Scorer for EmptyScorer {
     #[inline]
     fn score(&mut self) -> Score {
         0.0
+    }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        Some(0.0)
     }
 }
 

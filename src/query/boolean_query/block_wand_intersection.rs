@@ -342,6 +342,32 @@ impl DocSet for BlockWandIntersectionScorer {
         TERMINATED
     }
 
+    fn seek(&mut self, target: DocId) -> DocId {
+        if target <= self.doc() {
+            return self.doc();
+        }
+        // Skip buffered candidates prior to target.
+        while self.candidate_idx < self.num_candidates
+            && self.candidate_doc_ids[self.candidate_idx] < target
+        {
+            self.candidate_idx += 1;
+        }
+        // Check any remaining candidates in the current window (all >= target).
+        if self.candidate_idx < self.num_candidates {
+            if let Some(doc_id) = self.handle_candidates() {
+                return doc_id;
+            }
+            self.num_candidates = 0;
+            self.candidate_idx = 0;
+            self.internal_doc = (self.window_end + 1).max(target);
+        } else {
+            self.num_candidates = 0;
+            self.candidate_idx = 0;
+            self.internal_doc = self.internal_doc.max(target);
+        }
+        self.advance()
+    }
+
     #[inline]
     fn doc(&self) -> DocId {
         self.current.0

@@ -151,6 +151,11 @@ impl<TDocSet: DocSet + 'static> Scorer for ConstScorer<TDocSet> {
     fn score(&mut self) -> Score {
         self.score
     }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        Some(self.score)
+    }
 }
 
 #[cfg(test)]

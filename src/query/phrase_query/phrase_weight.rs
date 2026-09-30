@@ -100,7 +100,7 @@ impl Weight for PhraseWeight {
         reader: &SegmentReader,
         boost: Score,
         init_threshold: Score,
-    ) -> crate::Result<Box<dyn PruningScorer>> {
+    ) -> crate::Result<Option<Box<dyn PruningScorer>>> {
         if let Some(mut scorer) = self.phrase_scorer_unpositioned(reader, boost)? {
             let field = self.phrase_terms[0].1.field();
             let block_max_weight = if self.slop == 0
@@ -115,19 +115,23 @@ impl Weight for PhraseWeight {
                 None
             };
             if let Some(block_max_weight) = block_max_weight {
-                Ok(Box::new(BlockPruningPhraseScorer::new(
+                Ok(Some(Box::new(BlockPruningPhraseScorer::new(
                     scorer,
                     init_threshold,
                     block_max_weight,
-                )))
+                ))))
             } else {
                 scorer.set_threshold(init_threshold);
                 scorer.seek(scorer.doc());
-                Ok(Box::new(scorer))
+                Ok(Some(Box::new(scorer)))
             }
         } else {
-            Ok(Box::new(EmptyScorer))
+            Ok(Some(Box::new(EmptyScorer)))
         }
+    }
+
+    fn is_pruning_supported(&self) -> bool {
+        self.similarity_weight_opt.is_some() && self.slop == 0
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
@@ -209,7 +213,7 @@ mod tests {
         let reader = searcher.segment_reader(0);
         for boost in [1.0, 2.5, -1.0] {
             let mut baseline = weight.scorer(reader, boost)?;
-            let mut pruned = weight.pruning_scorer(reader, boost, Score::MIN)?;
+            let mut pruned = weight.pruning_scorer(reader, boost, Score::MIN)?.unwrap();
             assert!(pruned.is::<PhraseScorer<SegmentPostings>>());
             for doc in 0..256 {
                 assert_eq!(baseline.doc(), doc);
@@ -311,7 +315,7 @@ mod tests {
                                 }
                                 for threshold in thresholds {
                                     let mut scorer =
-                                        weight.pruning_scorer(reader, boost, threshold)?;
+                                        weight.pruning_scorer(reader, boost, threshold)?.unwrap();
                                     let mut actual = Vec::new();
                                     while scorer.doc() != TERMINATED {
                                         actual.push((scorer.doc(), scorer.score()));
@@ -328,7 +332,7 @@ mod tests {
                                          boost={boost}, threshold={threshold}"
                                     );
                                     let mut scorer =
-                                        weight.pruning_scorer(reader, boost, threshold)?;
+                                        weight.pruning_scorer(reader, boost, threshold)?.unwrap();
                                     for target in
                                         [0, 1, 7, 127, 128, 129, 255, 256, 319, TERMINATED]
                                     {
@@ -355,7 +359,7 @@ mod tests {
                                     Score::MIN,
                                 );
                                 let mut optimized =
-                                    weight.pruning_scorer(reader, boost, Score::MIN)?;
+                                    weight.pruning_scorer(reader, boost, Score::MIN)?.unwrap();
                                 while baseline.doc() != TERMINATED {
                                     assert_eq!(optimized.doc(), baseline.doc());
                                     assert_eq!(optimized.score(), baseline.score());

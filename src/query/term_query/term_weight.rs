@@ -6,7 +6,6 @@ use crate::postings::SegmentPostings;
 use crate::query::bm25::Bm25Weight;
 use crate::query::boolean_query::BlockWandSingleScorer;
 use crate::query::explanation::does_not_match;
-use crate::query::scorer::BasicPruningScorer;
 use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
 use crate::query::{AllScorer, AllWeight, EmptyScorer, Explanation, Scorer, Weight};
 use crate::schema::IndexRecordOption;
@@ -45,18 +44,22 @@ impl Weight for TermWeight {
         reader: &SegmentReader,
         boost: Score,
         init_threshold: Score,
-    ) -> crate::Result<Box<dyn crate::query::scorer::PruningScorer>> {
+    ) -> crate::Result<Option<Box<dyn crate::query::scorer::PruningScorer>>> {
+        if !self.scoring_enabled {
+            return Ok(None);
+        }
         let specialized_scorer = self.specialized_scorer(reader, boost)?;
         match specialized_scorer {
-            TermOrEmptyOrAllScorer::TermScorer(term_scorer) => Ok(Box::new(
+            TermOrEmptyOrAllScorer::TermScorer(term_scorer) => Ok(Some(Box::new(
                 BlockWandSingleScorer::new(*term_scorer, init_threshold),
-            )),
-            TermOrEmptyOrAllScorer::Empty => Ok(Box::new(EmptyScorer)),
-            TermOrEmptyOrAllScorer::AllMatch(all_scorer) => Ok(Box::new(BasicPruningScorer::new(
-                all_scorer,
-                init_threshold,
             ))),
+            TermOrEmptyOrAllScorer::Empty => Ok(Some(Box::new(EmptyScorer))),
+            TermOrEmptyOrAllScorer::AllMatch(_) => Ok(None),
         }
+    }
+
+    fn is_pruning_supported(&self) -> bool {
+        self.scoring_enabled
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {

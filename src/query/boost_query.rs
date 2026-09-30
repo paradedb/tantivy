@@ -83,9 +83,13 @@ impl Weight for BoostWeight {
         reader: &SegmentReader,
         boost: Score,
         init_threshold: Score,
-    ) -> crate::Result<Box<dyn PruningScorer>> {
+    ) -> crate::Result<Option<Box<dyn PruningScorer>>> {
         self.weight
             .pruning_scorer(reader, boost * self.boost, init_threshold)
+    }
+
+    fn is_pruning_supported(&self) -> bool {
+        self.weight.is_pruning_supported()
     }
 
     fn explain(&self, reader: &SegmentReader, doc: u32) -> crate::Result<Explanation> {
@@ -154,6 +158,11 @@ impl<S: Scorer> Scorer for BoostScorer<S> {
     #[inline]
     fn score(&mut self) -> Score {
         self.underlying.score() * self.boost
+    }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        self.underlying.constant_score().map(|s| s * self.boost)
     }
 }
 

@@ -785,7 +785,9 @@ mod tests {
             crate::Term::from_field_text(field, "b"),
         ]);
         let weight = query.phrase_weight(EnableScoring::enabled_from_searcher(&searcher))?;
-        let mut scorer = weight.pruning_scorer(searcher.segment_reader(0), 1.0, 0.0)?;
+        let mut scorer = weight
+            .pruning_scorer(searcher.segment_reader(0), 1.0, 0.0)?
+            .unwrap();
         let scorer = scorer.downcast_mut::<BlockPruningPhraseScorer>().unwrap();
         assert_eq!(scorer.seek(130), 130);
         let score = scorer.score();
@@ -820,7 +822,9 @@ mod tests {
                 crate::Term::from_field_text(field, "b"),
             ]);
             let weight = query.phrase_weight(EnableScoring::enabled_from_searcher(&searcher))?;
-            let scorer = weight.pruning_scorer(searcher.segment_reader(0), 1.0, Score::MAX)?;
+            let scorer = weight
+                .pruning_scorer(searcher.segment_reader(0), 1.0, Score::MAX)?
+                .unwrap();
             assert_eq!(scorer.doc(), TERMINATED);
             let scorer = scorer.downcast_ref::<BlockPruningPhraseScorer>().unwrap();
             assert_eq!(scorer.phrase.doc(), 0);
