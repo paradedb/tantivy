@@ -296,8 +296,7 @@ impl FileSlice {
         Some((self.range.start + offset) / block_len)
     }
 
-    /// Logical byte capacity of one independently pinnable storage block, if
-    /// the underlying handle exposes block-granular caching.
+    /// Logical byte capacity of one independently readable storage block.
     pub fn storage_block_len(&self) -> Option<usize> {
         self.data.storage_block_len()
     }
