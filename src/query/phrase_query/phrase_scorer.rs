@@ -372,6 +372,25 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         slop: u32,
         offset: usize,
     ) -> PhraseScorer<TPostings> {
+        let mut scorer = Self::new_unpositioned(
+            term_postings_with_offset,
+            similarity_weight_opt,
+            fieldnorm_reader,
+            slop,
+            offset,
+        );
+        scorer.seek(scorer.doc());
+        scorer
+    }
+
+    /// Defers intersection and position checks until the caller drives the scorer.
+    pub(crate) fn new_unpositioned(
+        term_postings_with_offset: Vec<(usize, TPostings)>,
+        similarity_weight_opt: Option<Bm25Weight>,
+        fieldnorm_reader: FieldNormReader,
+        slop: u32,
+        offset: usize,
+    ) -> PhraseScorer<TPostings> {
         let num_docs = fieldnorm_reader.num_docs();
         let max_offset = term_postings_with_offset
             .iter()
@@ -386,8 +405,8 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
                 PostingsWithOffset::new(postings, (max_offset - offset) as u32)
             })
             .collect::<Vec<_>>();
-        let intersection_docset = Intersection::new(postings_with_offsets, num_docs);
-        let mut scorer = PhraseScorer {
+        let intersection_docset = Intersection::new_unpositioned(postings_with_offsets, num_docs);
+        PhraseScorer {
             intersection_docset,
             num_terms: num_docsets,
             left_positions: Vec::with_capacity(100),
@@ -400,11 +419,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             left_slops: Vec::with_capacity(100),
             slops_buffer: Vec::with_capacity(100),
             positions_buffer: Vec::with_capacity(100),
-        };
-        if scorer.doc() != TERMINATED && !scorer.phrase_match() {
-            scorer.advance();
         }
-        scorer
     }
 
     pub fn fieldnorm_id(&self) -> u8 {
@@ -727,6 +742,37 @@ impl PruningScorer for BlockPruningPhraseScorer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_phrase_pruning_before_first_match() -> crate::Result<()> {
+        use crate::query::{EnableScoring, PhraseQuery, Weight};
+
+        let mut late_match = vec!["b a"; 512];
+        late_match.push("a b");
+        for texts in [
+            vec!["b a"; 512],
+            late_match,
+            (0..512)
+                .map(|doc| if doc % 2 == 0 { "a" } else { "b" })
+                .collect(),
+        ] {
+            let index = super::super::tests::create_index(&texts)?;
+            let field = index.schema().get_field("text")?;
+            let searcher = index.reader()?.searcher();
+            let query = PhraseQuery::new(vec![
+                crate::Term::from_field_text(field, "a"),
+                crate::Term::from_field_text(field, "b"),
+            ]);
+            let weight = query.phrase_weight(EnableScoring::enabled_from_searcher(&searcher))?;
+            let scorer = weight.pruning_scorer(searcher.segment_reader(0), 1.0, Score::MAX)?;
+            assert_eq!(scorer.doc(), TERMINATED);
+            let scorer = scorer.downcast_ref::<BlockPruningPhraseScorer>().unwrap();
+            assert_eq!(scorer.phrase.doc(), 0);
+            assert!(scorer.phrase.left_positions.is_empty());
+            assert!(scorer.phrase.right_positions.is_empty());
+        }
+        Ok(())
+    }
 
     fn test_intersection_sym(left: &[u32], right: &[u32], expected: &[u32]) {
         test_intersection_aux(left, right, expected, 0);

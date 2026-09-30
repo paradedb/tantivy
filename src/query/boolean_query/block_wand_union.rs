@@ -343,6 +343,8 @@ pub struct BlockWandSingleScorer {
     scorer: TermScorer,
     threshold: Score,
     current: (DocId, Score),
+    #[cfg(test)]
+    scored_docs: usize,
 }
 impl BlockWandSingleScorer {
     /// Construction positions `current` on the first match
@@ -351,6 +353,8 @@ impl BlockWandSingleScorer {
             scorer: term_scorer,
             threshold,
             current: (0, Score::MIN),
+            #[cfg(test)]
+            scored_docs: 0,
         };
         // advance to fill current
         scorer.advance();
@@ -372,6 +376,9 @@ impl PruningScorer for BlockWandSingleScorer {
 
 impl DocSet for BlockWandSingleScorer {
     fn advance(&mut self) -> DocId {
+        if self.doc() == TERMINATED {
+            return TERMINATED;
+        }
         let mut doc = self.scorer.doc();
         // hoist threshold to a local so we avoid going to memory in the loop
         let threshold = self.threshold;
@@ -395,6 +402,10 @@ impl DocSet for BlockWandSingleScorer {
             }
             loop {
                 let score = self.scorer.score();
+                #[cfg(test)]
+                {
+                    self.scored_docs += 1;
+                }
                 if score > threshold {
                     self.current = (doc, score);
                     self.scorer.advance();
@@ -414,6 +425,20 @@ impl DocSet for BlockWandSingleScorer {
             self.scorer.seek_block(doc);
         }
         self.doc()
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        if self.doc() >= target {
+            return self.doc();
+        }
+        if target == TERMINATED {
+            self.current = (TERMINATED, Score::MIN);
+            return TERMINATED;
+        }
+        if self.scorer.doc() < target {
+            self.scorer.seek(target);
+        }
+        self.advance()
     }
 
     #[inline]
@@ -440,6 +465,49 @@ mod tests {
     use crate::query::term_query::TermScorer;
     use crate::query::{Bm25Weight, BufferedUnionScorer, Scorer};
     use crate::{DocId, DocSet, Score, TERMINATED};
+
+    #[test]
+    fn test_block_wand_single_seek_skips_scoring() {
+        let fieldnorms = vec![2; 4096];
+        let postings: Vec<_> = (0..4096).map(|doc| (doc, 1)).collect();
+        let weight = Bm25Weight::for_one_term(4096, 4096, 2.0, Bm25Params::default());
+        let term = TermScorer::create_for_test(&postings, &fieldnorms, weight);
+        let mut scorer = super::BlockWandSingleScorer::new(term, 0.0);
+        assert_eq!(scorer.doc(), 0);
+        assert_eq!(scorer.seek(3000), 3000);
+        assert_eq!(scorer.scored_docs, 2);
+        assert_eq!(scorer.seek(3000), 3000);
+        assert_eq!(scorer.scored_docs, 2);
+        assert_eq!(scorer.advance(), 3001);
+        let scored_docs = scorer.scored_docs;
+        assert_eq!(scorer.seek(TERMINATED), TERMINATED);
+        assert_eq!(scorer.scored_docs, scored_docs);
+        assert_eq!(scorer.advance(), TERMINATED);
+        assert_eq!(scorer.seek(TERMINATED), TERMINATED);
+    }
+
+    #[test]
+    fn test_block_wand_single_seek_matches_advance() {
+        for len in [1, 127, 128, 129, 513] {
+            let fieldnorms = vec![8; len * 3];
+            let postings: Vec<_> = (0..len as u32)
+                .map(|doc| (doc * 3, 1 + (doc / 128) % 2))
+                .collect();
+            let weight = Bm25Weight::for_one_term(
+                len as u64,
+                fieldnorms.len() as u64,
+                8.0,
+                Bm25Params::default(),
+            );
+            let term = TermScorer::create_for_test(&postings, &fieldnorms, weight.clone());
+            for threshold in [Score::MIN, weight.score(8, 1), Score::MAX] {
+                crate::postings::tests::test_skip_against_unoptimized(
+                    || Box::new(super::BlockWandSingleScorer::new(term.clone(), threshold)),
+                    vec![0, 1, 3, 381, 384, 385, 768, 769, 1536, 1537, TERMINATED],
+                );
+            }
+        }
+    }
 
     struct Float(Score);
 

@@ -44,6 +44,18 @@ impl PhraseWeight {
         reader: &SegmentReader,
         boost: Score,
     ) -> crate::Result<Option<PhraseScorer<SegmentPostings>>> {
+        let mut scorer = self.phrase_scorer_unpositioned(reader, boost)?;
+        if let Some(scorer) = scorer.as_mut() {
+            scorer.seek(scorer.doc());
+        }
+        Ok(scorer)
+    }
+
+    fn phrase_scorer_unpositioned(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+    ) -> crate::Result<Option<PhraseScorer<SegmentPostings>>> {
         let similarity_weight_opt = self
             .similarity_weight_opt
             .as_ref()
@@ -60,11 +72,12 @@ impl PhraseWeight {
                 return Ok(None);
             }
         }
-        Ok(Some(PhraseScorer::new(
+        Ok(Some(PhraseScorer::new_unpositioned(
             term_postings_list,
             similarity_weight_opt,
             fieldnorm_reader,
             self.slop,
+            0,
         )))
     }
 
@@ -88,11 +101,12 @@ impl Weight for PhraseWeight {
         boost: Score,
         init_threshold: Score,
     ) -> crate::Result<Box<dyn PruningScorer>> {
-        if let Some(scorer) = self.phrase_scorer(reader, boost)? {
-            let block_max_weight = if self.slop == 0 {
-                let indexing_average = reader
-                    .inverted_index(self.phrase_terms[0].1.field())?
-                    .total_num_tokens() as Score
+        if let Some(mut scorer) = self.phrase_scorer_unpositioned(reader, boost)? {
+            let field = self.phrase_terms[0].1.field();
+            let block_max_weight = if self.slop == 0
+                && reader.schema().get_field_entry(field).has_fieldnorms()
+            {
+                let indexing_average = reader.inverted_index(field)?.total_num_tokens() as Score
                     / reader.max_doc() as Score;
                 self.similarity_weight_opt
                     .as_ref()
@@ -107,6 +121,7 @@ impl Weight for PhraseWeight {
                     block_max_weight,
                 )))
             } else {
+                scorer.seek(scorer.doc());
                 Ok(Box::new(BasicPruningScorer::new(
                     Box::new(scorer),
                     init_threshold,
@@ -165,6 +180,45 @@ mod tests {
         assert_eq!(phrase_scorer.doc(), 2);
         assert_eq!(phrase_scorer.phrase_count(), 1);
         assert_eq!(phrase_scorer.advance(), TERMINATED);
+        Ok(())
+    }
+
+    #[test]
+    fn test_phrase_pruning_without_fieldnorms() -> crate::Result<()> {
+        let mut schema = crate::schema::Schema::builder();
+        let options = crate::schema::TEXT.set_indexing_options(
+            crate::schema::TEXT
+                .get_indexing_options()
+                .unwrap()
+                .clone()
+                .set_fieldnorms(false)
+                .set_pnorms(false),
+        );
+        let field = schema.add_text_field("text", options);
+        let index = crate::Index::create_in_ram(schema.build());
+        let mut writer = index.writer_for_tests()?;
+        for _ in 0..256 {
+            writer.add_document(doc!(field => "a b"))?;
+        }
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let query = PhraseQuery::new(vec![
+            Term::from_field_text(field, "a"),
+            Term::from_field_text(field, "b"),
+        ]);
+        let weight = query.phrase_weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let reader = searcher.segment_reader(0);
+        let mut baseline = weight.scorer(reader, 1.0)?;
+        let mut pruned = weight.pruning_scorer(reader, 1.0, 0.0)?;
+        for doc in 0..256 {
+            assert_eq!(baseline.doc(), doc);
+            assert!(baseline.score() > 0.0);
+            assert_eq!(pruned.doc(), doc);
+            assert_eq!(pruned.score(), baseline.score());
+            baseline.advance();
+            pruned.advance();
+        }
+        assert_eq!(pruned.doc(), TERMINATED);
         Ok(())
     }
 
