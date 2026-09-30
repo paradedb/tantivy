@@ -1,7 +1,6 @@
 use super::boolean_weight::BooleanWeight;
 use crate::query::bm25::BatchedStatistics;
-use crate::query::size_hint::{estimate_intersection, estimate_union};
-use crate::query::{EnableScoring, Occur, Query, SumCombiner, TermQuery, Weight};
+use crate::query::{EnableScoring, Occur, Query, QueryEstimate, SumCombiner, TermQuery, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::SegmentReader;
 
@@ -156,71 +155,13 @@ impl From<Vec<(Occur, Box<dyn Query>)>> for BooleanQuery {
     }
 }
 
-impl Query for BooleanQuery {
-    fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
-        if self.subqueries.is_empty() {
-            return Ok(Some((0, 0)));
-        }
-        let occur = self.subqueries[0].0;
-        if !matches!(
-            (occur, self.minimum_number_should_match),
-            (Occur::Must, 0) | (Occur::Should, 0 | 1)
-        ) || self
-            .subqueries
-            .iter()
-            .any(|(child_occur, _)| *child_occur != occur)
-        {
-            return Ok(None);
-        }
-
-        let mut estimates = Vec::with_capacity(self.subqueries.len());
-        for (_, child) in &self.subqueries {
-            let Some((count, cost)) = child.estimate_docs(reader)? else {
-                return Ok(None);
-            };
-            let is_empty = (count, cost) == (0, 0);
-            let is_all = (count, cost) == (reader.max_doc(), u64::from(reader.max_doc()));
-            if occur == Occur::Must {
-                if is_empty {
-                    return Ok(Some((0, 0)));
-                }
-                if !is_all {
-                    estimates.push((count, cost));
-                }
-            } else {
-                if is_all {
-                    return Ok(Some((count, cost)));
-                }
-                if !is_empty {
-                    estimates.push((count, cost));
-                }
-            }
-        }
-        if estimates.is_empty() {
-            let count = if occur == Occur::Must {
-                reader.max_doc()
-            } else {
-                0
-            };
-            return Ok(Some((count, u64::from(count))));
-        }
-        if estimates.len() == 1 {
-            return Ok(Some(estimates[0]));
-        }
-        if occur == Occur::Must {
-            estimates.sort_unstable_by_key(|&(_, cost)| cost);
-            Ok(Some((
-                estimate_intersection(estimates.iter().map(|&(count, _)| count), reader.num_docs()),
-                estimates[0].1,
-            )))
-        } else {
-            Ok(Some((
-                estimate_union(estimates.iter().map(|&(count, _)| count), reader.num_docs()),
-                estimates.iter().map(|&(_, cost)| cost).sum(),
-            )))
-        }
+impl QueryEstimate for BooleanQuery {
+    fn estimate_docs(&self, _reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        Ok(None)
     }
+}
 
+impl Query for BooleanQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let statistics;
         let term_scoring = if let EnableScoring::Enabled {

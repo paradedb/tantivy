@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{EnableScoring, Explanation, Query, QueryEstimate, Scorer, Weight};
 use crate::schema::Field;
 use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
 
@@ -37,11 +37,13 @@ impl fmt::Debug for ConstScoreQuery {
     }
 }
 
-impl Query for ConstScoreQuery {
+impl QueryEstimate for ConstScoreQuery {
     fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         self.query.estimate_docs(reader)
     }
+}
 
+impl Query for ConstScoreQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let inner_weight = self.query.weight(enable_scoring)?;
         Ok(if enable_scoring.is_scoring_enabled() {

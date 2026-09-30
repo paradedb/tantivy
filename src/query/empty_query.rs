@@ -3,7 +3,7 @@ use super::Scorer;
 use crate::docset::TERMINATED;
 use crate::index::SegmentReader;
 use crate::query::explanation::does_not_match;
-use crate::query::{EnableScoring, Explanation, Query, Weight};
+use crate::query::{EnableScoring, Explanation, Query, QueryEstimate, Weight};
 use crate::{DocId, DocSet, Score, Searcher};
 
 /// `EmptyQuery` is a dummy `Query` in which no document matches.
@@ -12,11 +12,13 @@ use crate::{DocId, DocSet, Score, Searcher};
 #[derive(Clone, Debug)]
 pub struct EmptyQuery;
 
-impl Query for EmptyQuery {
+impl QueryEstimate for EmptyQuery {
     fn estimate_docs(&self, _reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         Ok(Some((0, 0)))
     }
+}
 
+impl Query for EmptyQuery {
     fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         Ok(Box::new(EmptyWeight))
     }

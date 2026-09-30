@@ -3,7 +3,7 @@ use std::fmt;
 use downcast_rs::impl_downcast;
 
 use super::bm25::Bm25StatisticsProvider;
-use super::Weight;
+use super::{QueryEstimate, Weight};
 use crate::core::searcher::Searcher;
 use crate::query::Explanation;
 use crate::schema::{Field, Schema};
@@ -173,7 +173,9 @@ impl<'a> EnableScoring<'a> {
 ///
 /// [`Scorer`]: crate::query::Scorer
 /// [`SegmentReader`]: crate::SegmentReader
-pub trait Query: QueryClone + Send + Sync + downcast_rs::Downcast + fmt::Debug {
+pub trait Query:
+    QueryEstimate + QueryClone + Send + Sync + downcast_rs::Downcast + fmt::Debug
+{
     /// Create the weight associated with a query.
     ///
     /// If scoring is not required, setting `scoring_enabled` to `false`
@@ -181,16 +183,6 @@ pub trait Query: QueryClone + Send + Sync + downcast_rs::Downcast + fmt::Debug {
     ///
     /// See [`Weight`].
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>>;
-
-    /// Estimate `(matching_docs, traversal_cost)` for this segment from metadata, without decoding
-    /// posting lists. `None` means unsupported, so callers can fall back to a scorer.
-    ///
-    /// Counts may include deleted documents and Boolean estimates may round to zero despite
-    /// matches. These are planning heuristics, not exact counts or bounds for filtering
-    /// results.
-    fn estimate_docs(&self, _reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
-        Ok(None)
-    }
 
     /// Returns an `Explanation` for the score of the document.
     fn explain(&self, searcher: &Searcher, doc_address: DocAddress) -> crate::Result<Explanation> {
@@ -240,11 +232,13 @@ where T: 'static + Query + Clone
     }
 }
 
-impl Query for Box<dyn Query> {
+impl QueryEstimate for Box<dyn Query> {
     fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         self.as_ref().estimate_docs(reader)
     }
+}
 
+impl Query for Box<dyn Query> {
     fn weight(&self, enabled_scoring: EnableScoring) -> crate::Result<Box<dyn Weight>> {
         self.as_ref().weight(enabled_scoring)
     }

@@ -5,8 +5,8 @@ use super::term_weight::TermWeight;
 use crate::index::Bm25Params;
 use crate::query::bm25::Bm25Weight;
 use crate::query::range_query::is_type_valid_for_fastfield_range_query;
-use crate::query::{EnableScoring, Explanation, Query, RangeQuery, Weight};
-use crate::schema::{Field, IndexRecordOption};
+use crate::query::{EnableScoring, Explanation, Query, QueryEstimate, RangeQuery, Weight};
+use crate::schema::{Field, IndexRecordOption, Type};
 use crate::{SegmentReader, Term};
 
 /// A Term query matches all of the documents
@@ -125,8 +125,12 @@ impl TermQuery {
     }
 }
 
-impl Query for TermQuery {
+impl QueryEstimate for TermQuery {
     fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        let value = self.term.value();
+        if value.typ() != Type::Str && value.json_path_type() != Some(Type::Str) {
+            return Ok(None);
+        }
         if !reader
             .schema()
             .get_field_entry(self.term.field())
@@ -139,7 +143,9 @@ impl Query for TermQuery {
             .doc_freq(&self.term)?;
         Ok(Some((count, u64::from(count))))
     }
+}
 
+impl Query for TermQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         // If the field is not indexed but is a suitable fast field, fall back to a range query
         // on the fast field matching exactly this term.

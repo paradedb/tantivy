@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tantivy_fst::Regex;
 
 use crate::error::TantivyError;
-use crate::query::{AutomatonWeight, EnableScoring, Query, Weight};
+use crate::query::{AutomatonWeight, EnableScoring, Query, QueryEstimate, Weight};
 use crate::schema::Field;
 
 /// A Regex Query matches all of the documents
@@ -77,6 +77,12 @@ impl RegexQuery {
 
     fn specialized_weight(&self) -> AutomatonWeight<Regex> {
         AutomatonWeight::new(self.field, self.regex.clone())
+    }
+}
+
+impl QueryEstimate for RegexQuery {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        Ok(None)
     }
 }
 

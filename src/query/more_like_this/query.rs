@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 
 use super::MoreLikeThis;
-use crate::query::{EnableScoring, Query, Weight};
+use crate::query::{EnableScoring, Query, QueryEstimate, Weight};
 use crate::schema::{Field, OwnedValue};
 use crate::DocAddress;
 
@@ -40,6 +40,12 @@ impl MoreLikeThisQuery {
     /// Creates a new builder.
     pub fn builder() -> MoreLikeThisQueryBuilder {
         MoreLikeThisQueryBuilder::default()
+    }
+}
+
+impl QueryEstimate for MoreLikeThisQuery {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        Ok(None)
     }
 }
 

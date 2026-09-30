@@ -2,7 +2,7 @@ use std::ops::Bound;
 
 use super::{prefix_end, PhrasePrefixWeight};
 use crate::query::bm25::Bm25Weight;
-use crate::query::{EnableScoring, InvertedIndexRangeWeight, Query, Weight};
+use crate::query::{EnableScoring, InvertedIndexRangeWeight, Query, QueryEstimate, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::SegmentReader;
 
@@ -124,6 +124,12 @@ impl PhrasePrefixQuery {
             self.max_expansions,
         );
         Ok(Some(weight))
+    }
+}
+
+impl QueryEstimate for PhrasePrefixQuery {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        Ok(None)
     }
 }
 

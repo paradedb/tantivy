@@ -1,4 +1,6 @@
-use crate::query::{BooleanWeight, DisjunctionMaxCombiner, EnableScoring, Occur, Query, Weight};
+use crate::query::{
+    BooleanWeight, DisjunctionMaxCombiner, EnableScoring, Occur, Query, QueryEstimate, Weight,
+};
 use crate::schema::Field;
 use crate::{Score, SegmentReader, Term};
 
@@ -87,6 +89,12 @@ impl Clone for DisjunctionMaxQuery {
                 .collect::<Vec<_>>(),
             self.tie_breaker,
         )
+    }
+}
+
+impl QueryEstimate for DisjunctionMaxQuery {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        Ok(None)
     }
 }
 

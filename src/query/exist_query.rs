@@ -9,7 +9,9 @@ use crate::index::SegmentReader;
 use crate::query::all_query::AllScorer;
 use crate::query::boost_query::BoostScorer;
 use crate::query::explanation::does_not_match;
-use crate::query::{BitSetDocSet, EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{
+    BitSetDocSet, EnableScoring, Explanation, Query, QueryEstimate, Scorer, Weight,
+};
 use crate::schema::Type;
 use crate::{DocId, Score, TantivyError};
 
@@ -66,6 +68,12 @@ impl ExistsQuery {
             field_name: field,
             json_subpaths,
         }
+    }
+}
+
+impl QueryEstimate for ExistsQuery {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        Ok(None)
     }
 }
 

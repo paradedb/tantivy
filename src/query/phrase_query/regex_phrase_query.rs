@@ -1,6 +1,6 @@
 pub(crate) use super::regex_phrase_weight::RegexPhraseWeight;
 use crate::query::bm25::Bm25Weight;
-use crate::query::{EnableScoring, Query, Weight};
+use crate::query::{EnableScoring, Query, QueryEstimate, Weight};
 use crate::schema::{Field, IndexRecordOption, Term, Type};
 
 /// `RegexPhraseQuery` matches a specific sequence of regex queries.
@@ -157,6 +157,12 @@ impl RegexPhraseQuery {
             self.slop,
         );
         Ok(weight)
+    }
+}
+
+impl QueryEstimate for RegexPhraseQuery {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        Ok(None)
     }
 }
 

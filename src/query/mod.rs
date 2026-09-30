@@ -17,6 +17,7 @@ mod more_like_this;
 mod phrase_prefix_query;
 mod phrase_query;
 mod query;
+mod query_estimate;
 mod query_parser;
 mod range_query;
 mod regex_query;
@@ -62,6 +63,7 @@ pub use self::phrase_query::regex_phrase_query::{wildcard_query_to_regex_str, Re
 pub use self::phrase_query::regex_phrase_weight::RegexPhraseWeight;
 pub use self::phrase_query::PhraseQuery;
 pub use self::query::{DisjunctionPruning, EnableScoring, Query, QueryClone};
+pub use self::query_estimate::QueryEstimate;
 pub use self::query_parser::{QueryParser, QueryParserError};
 pub use self::range_query::*;
 pub use self::regex_query::RegexQuery;

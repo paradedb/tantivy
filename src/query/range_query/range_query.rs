@@ -8,7 +8,9 @@ use super::range_query_fastfield::FastFieldRangeWeight;
 use crate::index::SegmentReader;
 use crate::query::explanation::does_not_match;
 use crate::query::range_query::is_type_valid_for_fastfield_range_query;
-use crate::query::{BitSetDocSet, ConstScorer, EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{
+    BitSetDocSet, ConstScorer, EnableScoring, Explanation, Query, QueryEstimate, Scorer, Weight,
+};
 use crate::schema::{Field, IndexRecordOption, Term, Type};
 use crate::termdict::{TermDictionary, TermStreamer};
 use crate::{DocId, Score};
@@ -100,6 +102,12 @@ impl RangeQuery {
     }
 }
 
+impl QueryEstimate for RangeQuery {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        Ok(None)
+    }
+}
+
 impl Query for RangeQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let schema = enable_scoring.schema();
@@ -143,6 +151,12 @@ impl InvertedIndexRangeQuery {
     /// different terms that get matched.
     pub fn limit(&mut self, limit: u64) {
         self.limit = Some(limit);
+    }
+}
+
+impl QueryEstimate for InvertedIndexRangeQuery {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        Ok(None)
     }
 }
 

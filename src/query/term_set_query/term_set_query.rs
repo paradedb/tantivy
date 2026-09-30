@@ -7,7 +7,9 @@ use tantivy_fst::Map;
 use super::term_set_strategy::TermSetStrategyConfig;
 use super::term_set_weight::{SetDfaWrapper, TermSetWeight};
 use crate::query::score_combiner::DoNothingCombiner;
-use crate::query::{AutomatonWeight, BooleanWeight, EnableScoring, Occur, Query, Weight};
+use crate::query::{
+    AutomatonWeight, BooleanWeight, EnableScoring, Occur, Query, QueryEstimate, Weight,
+};
 use crate::schema::{Field, Schema};
 use crate::{SegmentReader, Term};
 
@@ -83,6 +85,12 @@ impl TermSetQuery {
     }
 }
 
+impl QueryEstimate for TermSetQuery {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        Ok(None)
+    }
+}
+
 impl Query for TermSetQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         Ok(Box::new(self.build_weight(enable_scoring.schema())?))
@@ -122,6 +130,12 @@ impl InvertedIndexTermSetQuery {
         }
 
         InvertedIndexTermSetQuery { terms_map }
+    }
+}
+
+impl QueryEstimate for InvertedIndexTermSetQuery {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        Ok(None)
     }
 }
 

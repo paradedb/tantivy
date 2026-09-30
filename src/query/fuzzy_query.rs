@@ -2,7 +2,7 @@ use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA};
 use once_cell::sync::OnceCell;
 use tantivy_fst::Automaton;
 
-use crate::query::{AutomatonWeight, EnableScoring, Query, Weight};
+use crate::query::{AutomatonWeight, EnableScoring, Query, QueryEstimate, Weight};
 use crate::schema::{Term, Type};
 use crate::TantivyError::InvalidArgument;
 
@@ -171,6 +171,12 @@ impl FuzzyTermQuery {
                 DfaWrapper(automaton),
             ))
         }
+    }
+}
+
+impl QueryEstimate for FuzzyTermQuery {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        Ok(None)
     }
 }
 

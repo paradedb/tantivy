@@ -3,7 +3,7 @@ use std::fmt;
 use super::scorer::PruningScorer;
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
 use crate::fastfield::AliveBitSet;
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{EnableScoring, Explanation, Query, QueryEstimate, Scorer, Weight};
 use crate::schema::Field;
 use crate::{DocId, DocSet, Score, SegmentReader, Term};
 
@@ -39,11 +39,13 @@ impl fmt::Debug for BoostQuery {
     }
 }
 
-impl Query for BoostQuery {
+impl QueryEstimate for BoostQuery {
     fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         self.query.estimate_docs(reader)
     }
+}
 
+impl Query for BoostQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let weight_without_boost = self.query.weight(enable_scoring)?;
         let boosted_weight = if enable_scoring.is_scoring_enabled() {

@@ -42,7 +42,7 @@ use crate::index::SegmentReader;
 use crate::query::score_combiner::DoNothingCombiner;
 use crate::query::{
     AutomatonWeight, BooleanWeight, ConstScorer, EmptyScorer, EnableScoring, Explanation, Occur,
-    Query, Scorer, Weight,
+    Query, QueryEstimate, Scorer, Weight,
 };
 use crate::schema::{Field, FieldType, Type};
 use crate::{DocId, DocSet, Score, TantivyError, Term, TERMINATED};
@@ -81,6 +81,12 @@ impl FastFieldTermSetQuery {
     pub fn with_strategy_config(mut self, cfg: TermSetStrategyConfig) -> Self {
         self.strategy_config = cfg;
         self
+    }
+}
+
+impl QueryEstimate for FastFieldTermSetQuery {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        Ok(None)
     }
 }
 
