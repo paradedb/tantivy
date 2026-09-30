@@ -180,18 +180,25 @@ pub(crate) fn expect_field_id_for_sort_field(
 
 // Generates a document mapping in the form of [index new doc_id] -> old doc_id
 // TODO detect if field is already sorted and discard mapping
-pub(crate) fn get_doc_id_mapping_from_field(
-    sort_by_field: IndexSortByField,
+pub(crate) fn get_doc_id_mapping_from_fields(
+    sort_by_fields: &[IndexSortByField],
     segment_writer: &SegmentWriter,
 ) -> crate::Result<DocIdMapping> {
     let schema = segment_writer.segment.schema();
-    expect_field_id_for_sort_field(&schema, &sort_by_field)?; // for now expect
-    let new_doc_id_to_old = segment_writer.fast_fields.writer().sort_order(
-        sort_by_field.field.as_str(),
-        segment_writer.max_doc(),
-        sort_by_field.order.is_desc(),
-    );
-    // create new doc_id to old doc_id index (used in fast_field_writers)
+    for sort_by_field in sort_by_fields {
+        expect_field_id_for_sort_field(&schema, sort_by_field)?;
+    }
+    let sort_columns: Vec<columnar::SortColumn> = sort_by_fields
+        .iter()
+        .map(|sbf| columnar::SortColumn {
+            name: sbf.field.as_str(),
+            reversed: sbf.order.is_desc(),
+        })
+        .collect();
+    let new_doc_id_to_old = segment_writer
+        .fast_fields
+        .writer()
+        .sort_order_compound(&sort_columns, segment_writer.max_doc());
     Ok(DocIdMapping::from_new_id_to_old_id(new_doc_id_to_old))
 }
 
