@@ -75,6 +75,11 @@ pub struct RangeQuery {
 }
 
 impl RangeQuery {
+    /// Returns the range endpoints.
+    pub fn bounds(&self) -> (&Bound<Term>, &Bound<Term>) {
+        (&self.bounds.lower_bound, &self.bounds.upper_bound)
+    }
+
     /// Creates a new `RangeQuery` from bounded start and end terms.
     ///
     /// If the value type is not correct, something may go terribly wrong when

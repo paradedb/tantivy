@@ -130,6 +130,11 @@ impl Query for DisjunctionMaxQuery {
 }
 
 impl DisjunctionMaxQuery {
+    /// Returns the queries combined by this disjunction.
+    pub fn disjuncts(&self) -> &[Box<dyn Query>] {
+        &self.disjuncts
+    }
+
     /// Creates a new `DisjunctionMaxQuery` with tie breaker.
     pub fn with_tie_breaker(
         disjuncts: Vec<Box<dyn Query>>,

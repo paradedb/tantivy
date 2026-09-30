@@ -21,6 +21,11 @@ pub struct TermSetQuery {
 }
 
 impl TermSetQuery {
+    /// Returns the terms in this set.
+    pub fn terms(&self) -> impl Iterator<Item = &Term> {
+        self.terms_map.values().flatten()
+    }
+
     /// Create a Term Set Query
     pub fn new<T: IntoIterator<Item = Term>>(terms: T) -> Self {
         let mut terms_map: HashMap<_, Vec<_>> = HashMap::new();

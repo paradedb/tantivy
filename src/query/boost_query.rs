@@ -18,6 +18,11 @@ pub struct BoostQuery {
 }
 
 impl BoostQuery {
+    /// Returns the query whose scores are adjusted.
+    pub fn query(&self) -> &dyn Query {
+        self.query.as_ref()
+    }
+
     /// Builds a boost query.
     pub fn new(query: Box<dyn Query>, boost: Score) -> BoostQuery {
         BoostQuery { query, boost }

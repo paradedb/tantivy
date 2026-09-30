@@ -41,6 +41,11 @@ pub struct ExistsQuery {
 }
 
 impl ExistsQuery {
+    /// Returns the field whose presence is tested.
+    pub fn field_name(&self) -> &str {
+        &self.field_name
+    }
+
     /// Creates a new `ExistQuery` from the given field.
     ///
     /// This query matches all documents with at least one non-null value in the specified field.

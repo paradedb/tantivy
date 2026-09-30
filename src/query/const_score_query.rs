@@ -16,6 +16,11 @@ pub struct ConstScoreQuery {
 }
 
 impl ConstScoreQuery {
+    /// Returns the query whose scores are adjusted.
+    pub fn query(&self) -> &dyn Query {
+        self.query.as_ref()
+    }
+
     /// Builds a const score query.
     pub fn new(query: Box<dyn Query>, score: Score) -> ConstScoreQuery {
         ConstScoreQuery { query, score }
