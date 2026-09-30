@@ -13,6 +13,7 @@ pub struct TermScorer {
     fieldnorm_reader: FieldNormReader,
     similarity_weight: Bm25Weight,
     fieldnorm_source: Option<(SegmentId, Field)>,
+    phrase_block_max_weight: Option<Bm25Weight>,
 }
 
 impl TermScorer {
@@ -26,7 +27,13 @@ impl TermScorer {
             fieldnorm_reader,
             similarity_weight,
             fieldnorm_source: None,
+            phrase_block_max_weight: None,
         }
+    }
+
+    pub(crate) fn with_phrase_block_max_weight(mut self, weight: Bm25Weight) -> Self {
+        self.phrase_block_max_weight = Some(weight);
+        self
     }
 
     pub(crate) fn with_fieldnorm_source(mut self, segment: SegmentId, field: Field) -> Self {
@@ -82,9 +89,22 @@ impl TermScorer {
     ///
     /// (The result is on the other hand guaranteed to be correct if there is only one segment).
     pub fn block_max_score(&mut self) -> Score {
-        self.postings
-            .block_cursor
-            .block_max_score(&self.fieldnorm_reader, &self.similarity_weight)
+        if let Some(weight) = &self.phrase_block_max_weight {
+            let block = &mut self.postings.block_cursor;
+            if !block.block_is_loaded()
+                && matches!(
+                    block.skip_reader().block_info(),
+                    crate::postings::BlockInfo::VInt { .. }
+                )
+            {
+                return Score::INFINITY;
+            }
+            block.block_max_score(&self.fieldnorm_reader, weight)
+        } else {
+            self.postings
+                .block_cursor
+                .block_max_score(&self.fieldnorm_reader, &self.similarity_weight)
+        }
     }
 
     pub(crate) fn block_max_score_up_to(&mut self, target: DocId) -> (Score, DocId) {

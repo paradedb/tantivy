@@ -644,7 +644,7 @@ impl BlockPruningPhraseScorer {
     pub(crate) fn new(
         mut phrase: PhraseScorer<SegmentPostings>,
         threshold: Score,
-        indexing_average: Score,
+        block_max_weight: Bm25Weight,
     ) -> Self {
         // An exact phrase cannot occur more often than its rarest constituent term.
         let bound_weight = phrase
@@ -652,7 +652,7 @@ impl BlockPruningPhraseScorer {
             .as_ref()
             .unwrap()
             .boost_by(1.0 + 4.0 * Score::EPSILON);
-        let term = TermScorer::for_segment(
+        let term = TermScorer::new(
             phrase
                 .intersection_docset
                 .docset_specialized(0)
@@ -660,8 +660,8 @@ impl BlockPruningPhraseScorer {
                 .clone(),
             phrase.fieldnorm_reader.clone(),
             bound_weight,
-            indexing_average,
-        );
+        )
+        .with_phrase_block_max_weight(block_max_weight);
         phrase.set_threshold(threshold);
         let approximation = BlockWandSingleScorer::new(term, threshold);
         let mut scorer = Self {

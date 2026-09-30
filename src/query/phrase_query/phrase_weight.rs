@@ -89,20 +89,22 @@ impl Weight for PhraseWeight {
         init_threshold: Score,
     ) -> crate::Result<Box<dyn PruningScorer>> {
         if let Some(scorer) = self.phrase_scorer(reader, boost)? {
-            let can_prune_positions = self.slop == 0
-                && self
-                    .similarity_weight_opt
-                    .as_ref()
-                    .is_some_and(|weight| weight.supports_pruning(boost));
-            if can_prune_positions {
+            let block_max_weight = if self.slop == 0 {
                 let indexing_average = reader
                     .inverted_index(self.phrase_terms[0].1.field())?
                     .total_num_tokens() as Score
                     / reader.max_doc() as Score;
+                self.similarity_weight_opt
+                    .as_ref()
+                    .and_then(|weight| weight.boost_by(boost).for_phrase_pruning(indexing_average))
+            } else {
+                None
+            };
+            if let Some(block_max_weight) = block_max_weight {
                 Ok(Box::new(BlockPruningPhraseScorer::new(
                     scorer,
                     init_threshold,
-                    indexing_average,
+                    block_max_weight,
                 )))
             } else {
                 Ok(Box::new(BasicPruningScorer::new(
