@@ -29,46 +29,50 @@ impl PhraseWeight {
         phrase_terms: Vec<(usize, Term)>,
         similarity_weight_opt: Option<Bm25Weight>,
     ) -> PhraseWeight {
-        let mut grouped_terms = Vec::new();
-        if phrase_terms.len() > 2 {
-            let mut term_groups = FxHashMap::default();
-            let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
-            for (term_index, (offset, term)) in phrase_terms.iter().enumerate() {
-                let group = *term_groups.entry(term).or_insert_with(|| {
-                    groups.push((term_index, Vec::new()));
-                    groups.len() - 1
-                });
-                groups[group].1.push(*offset);
-            }
-            if groups.len() >= 2 && groups.len() < phrase_terms.len() {
-                let max_offset = phrase_terms
-                    .iter()
-                    .map(|(offset, _)| *offset)
-                    .max()
-                    .unwrap();
-                grouped_terms = groups
-                    .into_iter()
-                    .map(|(term_index, mut offsets)| {
-                        offsets.sort_unstable();
-                        offsets.dedup();
-                        (
-                            term_index,
-                            offsets
-                                .into_iter()
-                                .map(|offset| (max_offset - offset) as u32)
-                                .collect(),
-                        )
-                    })
-                    .collect();
-            }
-        }
-        let slop = 0;
-        PhraseWeight {
+        let mut weight = PhraseWeight {
             phrase_terms,
-            grouped_terms,
+            grouped_terms: Vec::new(),
             similarity_weight_opt,
-            slop,
+            slop: 0,
+        };
+        if weight.phrase_terms.len() <= 2 {
+            return weight;
         }
+
+        let mut term_groups = FxHashMap::default();
+        let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (term_index, (offset, term)) in weight.phrase_terms.iter().enumerate() {
+            let group = *term_groups.entry(term).or_insert_with(|| {
+                groups.push((term_index, Vec::new()));
+                groups.len() - 1
+            });
+            groups[group].1.push(*offset);
+        }
+        if groups.len() < 2 || groups.len() == weight.phrase_terms.len() {
+            return weight;
+        }
+
+        let max_offset = weight
+            .phrase_terms
+            .iter()
+            .map(|(offset, _)| *offset)
+            .max()
+            .unwrap();
+        weight.grouped_terms = groups
+            .into_iter()
+            .map(|(term_index, mut offsets)| {
+                offsets.sort_unstable();
+                offsets.dedup();
+                (
+                    term_index,
+                    offsets
+                        .into_iter()
+                        .map(|offset| (max_offset - offset) as u32)
+                        .collect(),
+                )
+            })
+            .collect();
+        weight
     }
 
     fn fieldnorm_reader(&self, reader: &SegmentReader) -> crate::Result<FieldNormReader> {
@@ -89,40 +93,41 @@ impl PhraseWeight {
             .as_ref()
             .map(|similarity_weight| similarity_weight.boost_by(boost));
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
-        if self.slop == 0 && !self.grouped_terms.is_empty() {
-            let mut postings = Vec::with_capacity(self.grouped_terms.len());
-            for (term_index, offsets) in &self.grouped_terms {
-                let term = &self.phrase_terms[*term_index].1;
-                let Some(term_postings) = reader
+        if self.slop > 0 || self.grouped_terms.is_empty() {
+            let mut term_postings_list = Vec::new();
+            for &(offset, ref term) in &self.phrase_terms {
+                if let Some(postings) = reader
                     .inverted_index(term.field())?
                     .read_postings(term, IndexRecordOption::WithFreqsAndPositions)?
-                else {
+                {
+                    term_postings_list.push((offset, postings));
+                } else {
                     return Ok(None);
-                };
-                postings.push((offsets.as_slice(), term_postings));
+                }
             }
-            return Ok(Some(PhraseScorer::new_grouped(
-                postings,
+            return Ok(Some(PhraseScorer::new(
+                term_postings_list,
                 similarity_weight_opt,
                 fieldnorm_reader,
+                self.slop,
             )));
         }
-        let mut term_postings_list = Vec::new();
-        for &(offset, ref term) in &self.phrase_terms {
-            if let Some(postings) = reader
+
+        let mut postings = Vec::with_capacity(self.grouped_terms.len());
+        for (term_index, offsets) in &self.grouped_terms {
+            let term = &self.phrase_terms[*term_index].1;
+            let Some(term_postings) = reader
                 .inverted_index(term.field())?
                 .read_postings(term, IndexRecordOption::WithFreqsAndPositions)?
-            {
-                term_postings_list.push((offset, postings));
-            } else {
+            else {
                 return Ok(None);
-            }
+            };
+            postings.push((offsets.as_slice(), term_postings));
         }
-        Ok(Some(PhraseScorer::new(
-            term_postings_list,
+        Ok(Some(PhraseScorer::new_grouped(
+            postings,
             similarity_weight_opt,
             fieldnorm_reader,
-            self.slop,
         )))
     }
 
