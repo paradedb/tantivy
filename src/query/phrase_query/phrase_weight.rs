@@ -5,7 +5,7 @@ use crate::index::SegmentReader;
 use crate::postings::SegmentPostings;
 use crate::query::bm25::Bm25Weight;
 use crate::query::explanation::does_not_match;
-use crate::query::scorer::{BasicPruningScorer, PruningScorer};
+use crate::query::scorer::PruningScorer;
 use crate::query::{EmptyScorer, Explanation, Scorer, Weight};
 use crate::schema::{IndexRecordOption, Term};
 use crate::{DocId, DocSet, Score};
@@ -121,11 +121,9 @@ impl Weight for PhraseWeight {
                     block_max_weight,
                 )))
             } else {
+                scorer.set_threshold(init_threshold);
                 scorer.seek(scorer.doc());
-                Ok(Box::new(BasicPruningScorer::new(
-                    Box::new(scorer),
-                    init_threshold,
-                )))
+                Ok(Box::new(scorer))
             }
         } else {
             Ok(Box::new(EmptyScorer))
@@ -156,6 +154,7 @@ mod tests {
     use super::super::tests::create_index;
     use super::*;
     use crate::docset::TERMINATED;
+    use crate::query::scorer::BasicPruningScorer;
     use crate::query::{EnableScoring, PhraseQuery};
     use crate::{DocSet, Term};
 
@@ -208,17 +207,19 @@ mod tests {
         ]);
         let weight = query.phrase_weight(EnableScoring::enabled_from_searcher(&searcher))?;
         let reader = searcher.segment_reader(0);
-        let mut baseline = weight.scorer(reader, 1.0)?;
-        let mut pruned = weight.pruning_scorer(reader, 1.0, 0.0)?;
-        for doc in 0..256 {
-            assert_eq!(baseline.doc(), doc);
-            assert!(baseline.score() > 0.0);
-            assert_eq!(pruned.doc(), doc);
-            assert_eq!(pruned.score(), baseline.score());
-            baseline.advance();
-            pruned.advance();
+        for boost in [1.0, 2.5, -1.0] {
+            let mut baseline = weight.scorer(reader, boost)?;
+            let mut pruned = weight.pruning_scorer(reader, boost, Score::MIN)?;
+            assert!(pruned.is::<PhraseScorer<SegmentPostings>>());
+            for doc in 0..256 {
+                assert_eq!(baseline.doc(), doc);
+                assert_eq!(pruned.doc(), doc);
+                assert_eq!(pruned.score(), baseline.score());
+                baseline.advance();
+                pruned.advance();
+            }
+            assert_eq!(pruned.doc(), TERMINATED);
         }
-        assert_eq!(pruned.doc(), TERMINATED);
         Ok(())
     }
 
@@ -289,7 +290,15 @@ mod tests {
                         };
                         let weight = query.phrase_weight(enable_scoring)?;
                         for reader in searcher.segment_readers() {
-                            for boost in [0.0, 1.0, 2.5, -1.0] {
+                            for boost in [
+                                0.0,
+                                1.0,
+                                2.5,
+                                -1.0,
+                                Score::INFINITY,
+                                Score::NEG_INFINITY,
+                                Score::NAN,
+                            ] {
                                 let mut baseline = weight.scorer(reader, boost)?;
                                 let mut expected = Vec::new();
                                 while baseline.doc() != TERMINATED {
@@ -318,6 +327,28 @@ mod tests {
                                         "{offsets:?}, slop={slop}, scoring={scoring}, \
                                          boost={boost}, threshold={threshold}"
                                     );
+                                    let mut scorer =
+                                        weight.pruning_scorer(reader, boost, threshold)?;
+                                    for target in
+                                        [0, 1, 7, 127, 128, 129, 255, 256, 319, TERMINATED]
+                                    {
+                                        if target < scorer.doc() {
+                                            continue;
+                                        }
+                                        let expected_match =
+                                            expected.iter().find(|(doc, _)| *doc >= target);
+                                        let doc = scorer.seek(target);
+                                        assert_eq!(
+                                            doc,
+                                            expected_match.map_or(TERMINATED, |(doc, _)| *doc)
+                                        );
+                                        assert_eq!(scorer.doc(), doc);
+                                        assert_eq!(scorer.seek(doc), doc);
+                                        if let Some((_, score)) = expected_match {
+                                            assert_eq!(scorer.score(), *score);
+                                            assert_eq!(scorer.score(), *score);
+                                        }
+                                    }
                                 }
                                 let mut baseline = BasicPruningScorer::new(
                                     weight.scorer(reader, boost)?,

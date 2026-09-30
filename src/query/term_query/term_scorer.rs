@@ -13,7 +13,7 @@ pub struct TermScorer {
     fieldnorm_reader: FieldNormReader,
     similarity_weight: Bm25Weight,
     fieldnorm_source: Option<(SegmentId, Field)>,
-    phrase_block_max_weight: Option<Bm25Weight>,
+    block_max_weight_override: Option<Bm25Weight>,
 }
 
 impl TermScorer {
@@ -27,12 +27,12 @@ impl TermScorer {
             fieldnorm_reader,
             similarity_weight,
             fieldnorm_source: None,
-            phrase_block_max_weight: None,
+            block_max_weight_override: None,
         }
     }
 
-    pub(crate) fn with_phrase_block_max_weight(mut self, weight: Bm25Weight) -> Self {
-        self.phrase_block_max_weight = Some(weight);
+    pub(crate) fn with_block_max_weight_override(mut self, weight: Bm25Weight) -> Self {
+        self.block_max_weight_override = Some(weight);
         self
     }
 
@@ -89,7 +89,7 @@ impl TermScorer {
     ///
     /// (The result is on the other hand guaranteed to be correct if there is only one segment).
     pub fn block_max_score(&mut self) -> Score {
-        if let Some(weight) = &self.phrase_block_max_weight {
+        if let Some(weight) = &self.block_max_weight_override {
             let block = &mut self.postings.block_cursor;
             if !block.block_is_loaded()
                 && matches!(

@@ -52,6 +52,7 @@ pub struct PhraseScorer<TPostings: Postings> {
     left_positions: Vec<u32>,
     right_positions: Vec<u32>,
     phrase_count: u32,
+    cached_score: Option<Score>,
     pruning_threshold: Option<Score>,
     fieldnorm_reader: FieldNormReader,
     similarity_weight_opt: Option<Bm25Weight>,
@@ -412,6 +413,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             left_positions: Vec::with_capacity(100),
             right_positions: Vec::with_capacity(100),
             phrase_count: 0u32,
+            cached_score: None,
             pruning_threshold: None,
             similarity_weight_opt,
             fieldnorm_reader,
@@ -440,42 +442,59 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
     }
 
     fn phrase_match(&mut self) -> bool {
+        self.cached_score = None;
         if self.similarity_weight_opt.is_some() {
-            let fieldnorm_id = self.pruning_threshold.map(|threshold| {
-                let fieldnorm_id = self.fieldnorm_id();
-                let max_phrase_count = (0..self.num_terms)
-                    .map(|ord| {
-                        self.intersection_docset
-                            .docset_specialized(ord)
-                            .postings
-                            .term_freq()
-                    })
-                    .min()
-                    .unwrap();
-                let upper_bound = self
-                    .similarity_weight_opt
-                    .as_ref()
-                    .unwrap()
-                    .score(fieldnorm_id, max_phrase_count);
-                // Leave room for rounding in BM25's floating-point arithmetic.
-                let upper_bound = upper_bound * (1.0 + 4.0 * Score::EPSILON);
-                (fieldnorm_id, upper_bound > threshold)
-            });
-            if matches!(fieldnorm_id, Some((_, false))) {
-                return false;
+            let fieldnorm_id = self.pruning_threshold.map(|_| self.fieldnorm_id());
+            let mut max_phrase_score = None;
+            if !self.has_slop() {
+                if let Some(threshold) = self.pruning_threshold {
+                    let max_phrase_count = (0..self.num_terms)
+                        .map(|ord| {
+                            self.intersection_docset
+                                .docset_specialized(ord)
+                                .postings
+                                .term_freq()
+                        })
+                        .min()
+                        .unwrap();
+                    let upper_bound = self
+                        .similarity_weight_opt
+                        .as_ref()
+                        .unwrap()
+                        .score(fieldnorm_id.unwrap(), max_phrase_count);
+                    max_phrase_score = Some((max_phrase_count, upper_bound));
+                    // Negative boosts reverse the term-frequency bound.
+                    if upper_bound.is_finite()
+                        && upper_bound >= 0.0
+                        && upper_bound * (1.0 + 4.0 * Score::EPSILON) <= threshold
+                    {
+                        return false;
+                    }
+                }
             }
             let count = self.compute_phrase_count();
             self.phrase_count = count;
-            count > 0u32
-                && self.pruning_threshold.is_none_or(|threshold| {
-                    self.similarity_weight_opt
+            if count == 0 {
+                return false;
+            }
+            if let Some(threshold) = self.pruning_threshold {
+                let score = match max_phrase_score {
+                    Some((max_count, score)) if count == max_count => score,
+                    _ => self
+                        .similarity_weight_opt
                         .as_ref()
                         .unwrap()
-                        .score(fieldnorm_id.unwrap().0, count)
-                        > threshold
-                })
+                        .score(fieldnorm_id.unwrap(), count),
+                };
+                self.cached_score = Some(score);
+                score > threshold
+            } else {
+                true
+            }
         } else {
-            self.phrase_exists()
+            self.pruning_threshold
+                .is_none_or(|threshold| 1.0 > threshold)
+                && self.phrase_exists()
         }
     }
 
@@ -634,6 +653,9 @@ impl<TPostings: Postings> DocSet for PhraseScorer<TPostings> {
 impl<TPostings: Postings> Scorer for PhraseScorer<TPostings> {
     #[inline]
     fn score(&mut self) -> Score {
+        if let Some(score) = self.cached_score {
+            return score;
+        }
         if let Some(similarity_weight) = self.similarity_weight_opt.as_ref() {
             let fieldnorm_id = self.fieldnorm_id();
             similarity_weight.score(fieldnorm_id, self.phrase_count)
@@ -676,7 +698,7 @@ impl BlockPruningPhraseScorer {
             phrase.fieldnorm_reader.clone(),
             bound_weight,
         )
-        .with_phrase_block_max_weight(block_max_weight);
+        .with_block_max_weight_override(block_max_weight);
         phrase.set_threshold(threshold);
         let approximation = BlockWandSingleScorer::new(term, threshold);
         let mut scorer = Self {
@@ -717,6 +739,14 @@ impl DocSet for BlockPruningPhraseScorer {
         self.find_match()
     }
 
+    fn seek(&mut self, target: DocId) -> DocId {
+        if self.doc() >= target {
+            return self.doc();
+        }
+        self.approximation.seek(target);
+        self.find_match()
+    }
+
     fn doc(&self) -> DocId {
         self.current.0
     }
@@ -742,6 +772,32 @@ impl PruningScorer for BlockPruningPhraseScorer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_block_phrase_pruning_seek_termination() -> crate::Result<()> {
+        use crate::query::{EnableScoring, PhraseQuery, Weight};
+
+        let index = super::super::tests::create_index(&vec!["a b"; 4096])?;
+        let field = index.schema().get_field("text")?;
+        let searcher = index.reader()?.searcher();
+        let query = PhraseQuery::new(vec![
+            crate::Term::from_field_text(field, "a"),
+            crate::Term::from_field_text(field, "b"),
+        ]);
+        let weight = query.phrase_weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let mut scorer = weight.pruning_scorer(searcher.segment_reader(0), 1.0, 0.0)?;
+        let scorer = scorer.downcast_mut::<BlockPruningPhraseScorer>().unwrap();
+        assert_eq!(scorer.seek(130), 130);
+        let score = scorer.score();
+        assert_eq!(scorer.seek(130), 130);
+        assert_eq!(scorer.score(), score);
+        assert_eq!(scorer.seek(TERMINATED), TERMINATED);
+        assert_eq!(scorer.phrase.doc(), 130);
+        assert_eq!(scorer.advance(), TERMINATED);
+        assert_eq!(scorer.seek(TERMINATED), TERMINATED);
+        assert_eq!(scorer.phrase.doc(), 130);
+        Ok(())
+    }
 
     #[test]
     fn test_phrase_pruning_before_first_match() -> crate::Result<()> {
