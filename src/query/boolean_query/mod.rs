@@ -1,3 +1,4 @@
+mod block_maxscore;
 mod block_wand_intersection;
 mod block_wand_union;
 mod boolean_query;
