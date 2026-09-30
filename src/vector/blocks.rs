@@ -119,7 +119,9 @@ impl BlockMetadata {
         clustered: bool,
     ) -> crate::Result<Self> {
         if entry.len() < 4 {
-            return Err(bad("missing metadata length"));
+            return Err(crate::TantivyError::DataCorruption(
+                DataCorruption::comment_only("invalid vector blocks: missing metadata length"),
+            ));
         }
         let len = u32::from_le_bytes(
             entry
@@ -130,7 +132,9 @@ impl BlockMetadata {
                 .unwrap(),
         ) as usize;
         if len > entry.len() - 4 {
-            return Err(bad("truncated metadata"));
+            return Err(crate::TantivyError::DataCorruption(
+                DataCorruption::comment_only("invalid vector blocks: truncated metadata"),
+            ));
         }
         let meta = Arc::new(VectorColMetadata::from_bytes(
             &entry.slice(4..4 + len).read_bytes()?,
@@ -152,9 +156,6 @@ pub(crate) struct Blocks {
     bands: Vec<Range<usize>>,
     pub(crate) block_rows: Arc<[usize]>,
     pub(crate) block_starts: Arc<[u64]>,
-}
-fn bad(message: &str) -> crate::TantivyError {
-    DataCorruption::comment_only(format!("invalid vector blocks: {message}")).into()
 }
 impl Blocks {
     /// Opens metadata and validates the stored directory against the field row counts.
@@ -183,7 +184,11 @@ impl Blocks {
             metadata_end,
         } = metadata;
         if entry.len() < 8 || entry.len() % MAX_ELEM_BYTES != 0 {
-            return Err(bad("missing or misaligned directory footer"));
+            return Err(crate::TantivyError::DataCorruption(
+                DataCorruption::comment_only(
+                    "invalid vector blocks: missing or misaligned directory footer",
+                ),
+            ));
         }
         let footer = entry.len() - 8;
         let count = u64::from_le_bytes(
@@ -194,28 +199,50 @@ impl Blocks {
                 .try_into()
                 .unwrap(),
         );
-        let count = usize::try_from(count).map_err(|_| bad("block count overflow"))?;
-        let entries = count
-            .checked_add(1)
-            .ok_or_else(|| bad("block count overflow"))?;
-        let array_bytes = entries
-            .checked_mul(12)
-            .ok_or_else(|| bad("directory size overflow"))?;
-        let row_bytes = entries
-            .checked_mul(4)
-            .ok_or_else(|| bad("directory size overflow"))?;
+        let count = usize::try_from(count).map_err(|_| {
+            crate::TantivyError::DataCorruption(DataCorruption::comment_only(
+                "invalid vector blocks: block count overflow",
+            ))
+        })?;
+        let entries = count.checked_add(1).ok_or_else(|| {
+            crate::TantivyError::DataCorruption(DataCorruption::comment_only(
+                "invalid vector blocks: block count overflow",
+            ))
+        })?;
+        let array_bytes = entries.checked_mul(12).ok_or_else(|| {
+            crate::TantivyError::DataCorruption(DataCorruption::comment_only(
+                "invalid vector blocks: directory size overflow",
+            ))
+        })?;
+        let row_bytes = entries.checked_mul(4).ok_or_else(|| {
+            crate::TantivyError::DataCorruption(DataCorruption::comment_only(
+                "invalid vector blocks: directory size overflow",
+            ))
+        })?;
         let padded_rows = row_bytes
             .checked_add(MAX_ELEM_BYTES - 1)
             .map(|n| n & !(MAX_ELEM_BYTES - 1))
-            .ok_or_else(|| bad("directory padding overflow"))?;
+            .ok_or_else(|| {
+                crate::TantivyError::DataCorruption(DataCorruption::comment_only(
+                    "invalid vector blocks: directory padding overflow",
+                ))
+            })?;
         let padded_bytes = entries
             .checked_mul(8)
             .and_then(|n| n.checked_add(padded_rows))
-            .ok_or_else(|| bad("directory size overflow"))?;
+            .ok_or_else(|| {
+                crate::TantivyError::DataCorruption(DataCorruption::comment_only(
+                    "invalid vector blocks: directory size overflow",
+                ))
+            })?;
         let directory_start = footer
             .checked_sub(padded_bytes)
             .filter(|&start| start >= metadata_end)
-            .ok_or_else(|| bad("truncated directory"))?;
+            .ok_or_else(|| {
+                crate::TantivyError::DataCorruption(DataCorruption::comment_only(
+                    "invalid vector blocks: truncated directory",
+                ))
+            })?;
         let directory = entry.slice(directory_start..footer).read_bytes()?;
         let block_starts: Vec<u64> = directory[..entries * 8]
             .chunks_exact(8)
@@ -226,7 +253,9 @@ impl Blocks {
             .map(|v| u32::from_le_bytes(v.try_into().unwrap()) as usize)
             .collect();
         if directory[array_bytes..].iter().any(|&v| v != 0) {
-            return Err(bad("nonzero directory padding"));
+            return Err(crate::TantivyError::DataCorruption(
+                DataCorruption::comment_only("invalid vector blocks: nonzero directory padding"),
+            ));
         }
         let slots = meta.slots();
         let align = block_align(&slots);
@@ -236,13 +265,17 @@ impl Blocks {
             || block_starts.iter().any(|&v| v % align as u64 != 0)
             || block_starts.windows(2).any(|v| v[0] > v[1])
         {
-            return Err(bad("invalid byte boundaries"));
+            return Err(crate::TantivyError::DataCorruption(
+                DataCorruption::comment_only("invalid vector blocks: invalid byte boundaries"),
+            ));
         }
         if block_rows[0] != 0
             || block_rows.last() != Some(&num_rows)
             || block_rows.windows(2).any(|v| v[0] > v[1])
         {
-            return Err(bad("invalid row boundaries"));
+            return Err(crate::TantivyError::DataCorruption(
+                DataCorruption::comment_only("invalid vector blocks: invalid row boundaries"),
+            ));
         }
         match (&meta.field().partition, clusters) {
             (Partition::Clusters, Some(rows)) if block_rows == rows => {}
@@ -251,7 +284,13 @@ impl Blocks {
                     && block_rows.iter().enumerate().all(|(b, &row)| {
                         row == b.saturating_mul(*rows_per_block as usize).min(num_rows)
                     }) => {}
-            _ => return Err(bad("directory/partition row boundaries mismatch")),
+            _ => {
+                return Err(crate::TantivyError::DataCorruption(
+                    DataCorruption::comment_only(
+                        "invalid vector blocks: directory/partition row boundaries mismatch",
+                    ),
+                ))
+            }
         }
         // Bound row arithmetic before any column layout is evaluated. Individual column
         // spans are checked against the stored next-block boundary before bytes are exposed.
@@ -261,7 +300,9 @@ impl Blocks {
                 .checked_mul(row_bytes)
                 .is_none_or(|size| size > bytes[1] - bytes[0])
             {
-                return Err(bad("truncated block"));
+                return Err(crate::TantivyError::DataCorruption(
+                    DataCorruption::comment_only("invalid vector blocks: truncated block"),
+                ));
             }
         }
         let payload_end = if count == 0 {
@@ -276,10 +317,18 @@ impl Blocks {
             .end;
             (block_starts[last] as usize)
                 .checked_add(column_end)
-                .ok_or_else(|| bad("last column overflow"))?
+                .ok_or_else(|| {
+                    crate::TantivyError::DataCorruption(DataCorruption::comment_only(
+                        "invalid vector blocks: last column overflow",
+                    ))
+                })?
         };
         if payload_end > directory_start || directory_start - payload_end >= MAX_ELEM_BYTES {
-            return Err(bad("invalid block-area padding length"));
+            return Err(crate::TantivyError::DataCorruption(
+                DataCorruption::comment_only(
+                    "invalid vector blocks: invalid block-area padding length",
+                ),
+            ));
         }
         if entry
             .slice(payload_end..directory_start)
@@ -287,7 +336,9 @@ impl Blocks {
             .iter()
             .any(|&v| v != 0)
         {
-            return Err(bad("nonzero block-area padding"));
+            return Err(crate::TantivyError::DataCorruption(
+                DataCorruption::comment_only("invalid vector blocks: nonzero block-area padding"),
+            ));
         }
         let mut bands: Vec<Range<usize>> = Vec::new();
         for (i, slot) in slots.iter().enumerate() {
@@ -333,18 +384,28 @@ impl Blocks {
     pub(crate) fn block_slice(&self, b: usize, range: Range<usize>) -> crate::Result<FileSlice> {
         let start = self.block_start(b);
         if range.start > range.end || range.end > self.block_start(b + 1) - start {
-            return Err(bad("column crosses stored block boundary"));
+            return Err(crate::TantivyError::DataCorruption(
+                DataCorruption::comment_only(
+                    "invalid vector blocks: column crosses stored block boundary",
+                ),
+            ));
         }
         Ok(self.entry.slice(start + range.start..start + range.end))
     }
     /// Rejects row spans crossing a block, including malformed and out-of-range spans.
     pub(crate) fn block_for_range(&self, rows: &Range<usize>) -> crate::Result<usize> {
         if rows.start >= rows.end || rows.end > *self.block_rows.last().unwrap() {
-            return Err(bad("invalid row range"));
+            return Err(crate::TantivyError::DataCorruption(
+                DataCorruption::comment_only("invalid vector blocks: invalid row range"),
+            ));
         }
         let b = self.block_of(rows.start);
         if rows.end > self.block_rows[b + 1] {
-            return Err(bad("row range crosses block boundary"));
+            return Err(crate::TantivyError::DataCorruption(
+                DataCorruption::comment_only(
+                    "invalid vector blocks: row range crosses block boundary",
+                ),
+            ));
         }
         Ok(b)
     }
@@ -355,7 +416,11 @@ impl Blocks {
             || rows.start >= rows.end
             || rows.end > self.block_rows[b + 1]
         {
-            return Err(bad("invalid block-local row range"));
+            return Err(crate::TantivyError::DataCorruption(
+                DataCorruption::comment_only(
+                    "invalid vector blocks: invalid block-local row range",
+                ),
+            ));
         }
         Ok(())
     }

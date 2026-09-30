@@ -285,9 +285,6 @@ fn metric_tag(metric: Metric) -> u8 {
         Metric::Cosine => 2,
     }
 }
-fn invalid(message: &str) -> crate::TantivyError {
-    DataCorruption::comment_only(format!("invalid vector metadata: {message}")).into()
-}
 impl VectorColMetadata {
     /// Resolves the field contract without consulting mutable index settings.
     pub fn field(&self) -> &VectorFieldMeta {
@@ -370,7 +367,11 @@ impl VectorColMetadata {
                     .grids
                     .iter()
                     .find(|grid| grid.bits == layer.bits)
-                    .ok_or_else(|| invalid("missing persisted grid/model"))?;
+                    .ok_or_else(|| {
+                        crate::TantivyError::DataCorruption(DataCorruption::comment_only(
+                            "invalid vector metadata: missing persisted grid/model",
+                        ))
+                    })?;
                 let rotation = Rotation::SeededFhtChaCha8 { seed: layer.seed };
                 Ok(if layer.bits == 1 {
                     Quantizer::SignPlane {
@@ -411,21 +412,35 @@ impl VectorColMetadata {
             || f.metric != opts.metric()
             || f.norm_policy != VectorNormPolicy::for_options(opts)
         {
-            return Err(invalid("schema mismatch"));
+            return Err(crate::TantivyError::DataCorruption(
+                DataCorruption::comment_only("invalid vector metadata: schema mismatch"),
+            ));
         }
         match f.partition {
             Partition::Clusters if clustered => (),
             Partition::Uniform { rows_per_block } if !clustered && rows_per_block > 0 => (),
-            _ => return Err(invalid("partition/backend mismatch or zero block size")),
+            _ => {
+                return Err(crate::TantivyError::DataCorruption(
+                    DataCorruption::comment_only(
+                        "invalid vector metadata: partition/backend mismatch or zero block size",
+                    ),
+                ))
+            }
         }
         if let Self::Quantized { layers, .. } = self {
             if !(1..=MAX_QUANTIZATION_LAYERS).contains(&layers.len()) {
-                return Err(invalid("layer count"));
+                return Err(crate::TantivyError::DataCorruption(
+                    DataCorruption::comment_only("invalid vector metadata: layer count"),
+                ));
             }
             for quant in layers {
                 if let Quantizer::GridPlane { bits, grid, .. } = quant {
                     if !(2..=4).contains(bits) || grid.points.len() != 1 << bits {
-                        return Err(invalid("grid width or point count"));
+                        return Err(crate::TantivyError::DataCorruption(
+                            DataCorruption::comment_only(
+                                "invalid vector metadata: grid width or point count",
+                            ),
+                        ));
                     }
                 }
             }
@@ -435,7 +450,11 @@ impl VectorColMetadata {
             .iter()
             .any(|slot| slot.stride as usize % slot.type_bytes() != 0)
         {
-            return Err(invalid("stride is not a whole number of decoder elements"));
+            return Err(crate::TantivyError::DataCorruption(
+                DataCorruption::comment_only(
+                    "invalid vector metadata: stride is not a whole number of decoder elements",
+                ),
+            ));
         }
         Ok(())
     }
@@ -542,35 +561,49 @@ impl VectorColMetadata {
     /// Parses a bounded metadata record, rejecting unknown tags and trailing bytes.
     pub(crate) fn from_bytes(mut input: &[u8]) -> crate::Result<Self> {
         fn parse(input: &mut &[u8]) -> io::Result<VectorColMetadata> {
-            let bad = || {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unknown metadata tag; rebuild required",
-                )
-            };
             let repr = u8::deserialize(input)?;
             let dim = u32::deserialize(input)?;
             let dtype = match u8::deserialize(input)? {
                 0 => VectorDType::F32,
-                _ => return Err(bad()),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unknown metadata tag; rebuild required",
+                    ))
+                }
             };
             let metric = match u8::deserialize(input)? {
                 0 => Metric::L2,
                 1 => Metric::Dot,
                 2 => Metric::Cosine,
-                _ => return Err(bad()),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unknown metadata tag; rebuild required",
+                    ))
+                }
             };
             let norm_policy = match u8::deserialize(input)? {
                 0 => VectorNormPolicy::None,
                 1 => VectorNormPolicy::UnitL2,
-                _ => return Err(bad()),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unknown metadata tag; rebuild required",
+                    ))
+                }
             };
             let partition = match u8::deserialize(input)? {
                 0 => Partition::Clusters,
                 1 => Partition::Uniform {
                     rows_per_block: u32::deserialize(input)?,
                 },
-                _ => return Err(bad()),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unknown metadata tag; rebuild required",
+                    ))
+                }
             };
             let field = VectorFieldMeta {
                 dim,
@@ -584,7 +617,10 @@ impl VectorColMetadata {
                 1 => {
                     let count = u8::deserialize(input)? as usize;
                     if !(1..=MAX_QUANTIZATION_LAYERS).contains(&count) {
-                        return Err(bad());
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unknown metadata tag; rebuild required",
+                        ));
                     }
                     let mut layers = Vec::with_capacity(count);
                     for _ in 0..count {
@@ -600,7 +636,10 @@ impl VectorColMetadata {
                                 let rho_model = f64::from_bits(u64::deserialize(input)?);
                                 let count = u16::deserialize(input)? as usize;
                                 if !(2..=4).contains(&bits) || count != 1 << bits {
-                                    return Err(bad());
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "unknown metadata tag; rebuild required",
+                                    ));
                                 }
                                 let points = (0..count)
                                     .map(|_| u32::deserialize(input).map(f32::from_bits))
@@ -615,17 +654,33 @@ impl VectorColMetadata {
                                     },
                                 }
                             }
-                            _ => return Err(bad()),
+                            _ => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "unknown metadata tag; rebuild required",
+                                ))
+                            }
                         });
                     }
                     VectorColMetadata::Quantized { field, layers }
                 }
-                _ => return Err(bad()),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unknown metadata tag; rebuild required",
+                    ))
+                }
             })
         }
-        let meta = parse(&mut input).map_err(|e| invalid(&e.to_string()))?;
+        let meta = parse(&mut input).map_err(|e| {
+            crate::TantivyError::DataCorruption(DataCorruption::comment_only(format!(
+                "invalid vector metadata: {e}"
+            )))
+        })?;
         if !input.is_empty() {
-            return Err(invalid("trailing metadata bytes"));
+            return Err(crate::TantivyError::DataCorruption(
+                DataCorruption::comment_only("invalid vector metadata: trailing metadata bytes"),
+            ));
         }
         Ok(meta)
     }

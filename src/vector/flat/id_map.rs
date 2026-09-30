@@ -36,9 +36,6 @@ pub enum IdMap {
     /// One cluster/local pair per segment document; the body remains on storage.
     DocLocations(FileSlice),
 }
-fn bad(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
-}
 impl IdMap {
     /// Serializes sorted flat document ids, eliding a fully populated bitmap.
     pub fn serialize<W: Write>(
@@ -69,7 +66,10 @@ impl IdMap {
     /// Validates the tag and table length without reading clustered table contents.
     pub fn open(file_slice: FileSlice, num_docs: u32) -> io::Result<Self> {
         if file_slice.len() == 0 {
-            return Err(bad("id map section is empty"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "id map section is empty",
+            ));
         }
         let tag = file_slice.slice_to(1).read_bytes()?[0];
         let body = file_slice.slice_from(1);
@@ -79,16 +79,23 @@ impl IdMap {
             VARIANT_DOC_LOCATIONS if body.len() as u64 == u64::from(num_docs) * 8 => {
                 Ok(Self::DocLocations(body))
             }
-            VARIANT_DOC_LOCATIONS => Err(bad(
-                "document location table length does not equal 8 * max_doc"
+            VARIANT_DOC_LOCATIONS => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "document location table length does not equal 8 * max_doc",
             )),
-            _ => Err(bad("invalid id map variant or length")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid id map variant or length",
+            )),
         }
     }
     /// Reads one document location and validates both coordinates before exposing it.
     pub(crate) fn locate(&self, doc: DocId, rows: &[usize]) -> io::Result<Option<DocLocation>> {
         let Self::DocLocations(body) = self else {
-            return Err(bad("clustered lookup requires DocLocations"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "clustered lookup requires DocLocations",
+            ));
         };
         let Some(start) = (doc as usize).checked_mul(8) else {
             return Ok(None);
@@ -103,14 +110,20 @@ impl IdMap {
             return if local == 0 {
                 Ok(None)
             } else {
-                Err(bad("absent document location has nonzero local row"))
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "absent document location has nonzero local row",
+                ))
             };
         }
         let cluster_idx = cluster as usize;
         if cluster_idx >= rows.len().saturating_sub(1)
             || local as usize >= rows[cluster_idx + 1] - rows[cluster_idx]
         {
-            return Err(bad("document location is outside its cluster"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "document location is outside its cluster",
+            ));
         }
         Ok(Some(DocLocation { cluster, local }))
     }
