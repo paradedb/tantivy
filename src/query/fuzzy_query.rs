@@ -178,8 +178,10 @@ impl FuzzyTermQuery {
 }
 
 impl QueryEstimate for FuzzyTermQuery {
-    /// Uses a term lookup or prefix range at distance zero; otherwise unions frequencies
-    /// accepted by the fuzzy automaton within a fixed scan budget. Cost sums frequencies.
+    /// Read document counts for words matching within the allowed number of edits. Estimate how
+    /// many documents contain any of them, allowing for documents containing several matches.
+    /// With no edits allowed, use an exact word or prefix lookup. Return `None` if finding all
+    /// matching words exceeds our reading limits.
     fn estimate_docs(&self, reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         let weight = self.specialized_weight()?;
         if self.distance == 0 {

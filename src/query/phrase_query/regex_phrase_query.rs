@@ -162,8 +162,10 @@ impl RegexPhraseQuery {
 }
 
 impl QueryEstimate for RegexPhraseQuery {
-    /// Estimates each regex term's union under a shared scan budget, then applies the phrase
-    /// positional/slop discount; cost adds expanded term traversal and candidate position checks.
+    /// For each regex, use the stored document counts for matching words to estimate how many
+    /// documents contain any of them. Estimate how many documents match every part, then assume
+    /// 1 in `10 * phrase_length` has the words next to each other in order. Allowing gaps (`slop`)
+    /// increases that fraction. Return `None` if reading the words exceeds our shared limits.
     fn estimate_docs(&self, reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         let mut remaining_terms = MAX_ESTIMATED_TERMS.min(self.max_expansions as usize);
         let mut budget = EstimationBudget::default();

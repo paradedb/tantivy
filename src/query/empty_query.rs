@@ -13,7 +13,7 @@ use crate::{DocId, DocSet, Score, Searcher};
 pub struct EmptyQuery;
 
 impl QueryEstimate for EmptyQuery {
-    /// Returns zero matches and traversal cost because this query cannot match.
+    /// Nothing can match, so both the match count and work estimate are zero.
     fn estimate_docs(&self, _reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         Ok(Some((0, 0)))
     }

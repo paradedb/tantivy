@@ -157,7 +157,7 @@ impl From<Vec<(Occur, Box<dyn Query>)>> for BooleanQuery {
 
 impl QueryEstimate for BooleanQuery {
     fn estimate_docs(&self, _reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
-        // Boolean selectivity is composed by the caller.
+        // The caller combines estimates for the AND, OR, and NOT clauses.
         Ok(None)
     }
 }

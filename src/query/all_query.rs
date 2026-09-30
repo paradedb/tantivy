@@ -12,7 +12,7 @@ use crate::{DocId, Score};
 pub struct AllQuery;
 
 impl QueryEstimate for AllQuery {
-    /// Uses max_doc for both matches and traversal cost, including deleted documents.
+    /// Use the segment's total document count for both matches and work, including deleted docs.
     fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         Ok(Some((reader.max_doc(), u64::from(reader.max_doc()))))
     }

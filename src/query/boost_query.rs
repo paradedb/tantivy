@@ -40,7 +40,7 @@ impl fmt::Debug for BoostQuery {
 }
 
 impl QueryEstimate for BoostQuery {
-    /// Delegates unchanged: boosting alters scores, not matching documents or traversal.
+    /// Use the inner query's estimate because boosting scores doesn't change which documents match.
     fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         self.query.estimate_docs(reader)
     }

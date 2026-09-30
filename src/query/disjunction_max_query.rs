@@ -94,7 +94,7 @@ impl Clone for DisjunctionMaxQuery {
 
 impl QueryEstimate for DisjunctionMaxQuery {
     fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
-        // Disjunction selectivity is composed by the caller.
+        // The caller estimates how many documents match any of the subqueries.
         Ok(None)
     }
 }

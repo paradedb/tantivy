@@ -82,8 +82,10 @@ where
         Ok(term_infos)
     }
 
-    /// Estimates the union of matching term frequencies within fixed candidate and byte budgets;
-    /// cost sums their frequencies without opening postings or automaton-filtered streams.
+    /// Read the stored document count for each matching word and estimate how many documents
+    /// contain any of them, allowing for documents containing multiple matching words.
+    /// Work adds the counts because each word has its own document list to visit.
+    /// Return `None` if we cannot finish within the term and byte limits.
     pub(crate) fn estimate_docs(
         &self,
         reader: &SegmentReader,

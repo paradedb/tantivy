@@ -131,8 +131,10 @@ impl PhrasePrefixQuery {
 }
 
 impl QueryEstimate for PhrasePrefixQuery {
-    /// Combines exact term frequencies with a budgeted prefix union, then applies the phrase
-    /// discount; cost adds term traversal and candidate position checks. Honors max expansions.
+    /// For `"red ca*"`, use the stored document counts for `red` and words starting with `ca`.
+    /// Allow for documents containing multiple `ca*` words, then estimate how many also contain
+    /// `red`. Assume about 1 in 20 of those documents has the words next to each other in order.
+    /// In general, that fraction is 1 in `10 * phrase_length`; a prefix alone skips this reduction.
     fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         if self.max_expansions == 0 {
             return Ok(Some((0, 0)));

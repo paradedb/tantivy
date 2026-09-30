@@ -82,8 +82,9 @@ impl RegexQuery {
 }
 
 impl QueryEstimate for RegexQuery {
-    /// Unions document frequencies accepted by the regex within a fixed scan budget;
-    /// traversal cost sums matching frequencies, including overlap.
+    /// Find indexed words matching the regex and read how many documents contain each one.
+    /// Estimate how many contain at least one of those words, allowing for documents containing
+    /// several matches. Return `None` if finding all matching words exceeds our reading limits.
     fn estimate_docs(&self, reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         let mut remaining_terms = MAX_ESTIMATED_TERMS;
         self.specialized_weight().estimate_docs(

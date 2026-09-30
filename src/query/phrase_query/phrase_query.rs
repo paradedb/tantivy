@@ -135,8 +135,10 @@ impl PhraseQuery {
 }
 
 impl QueryEstimate for PhraseQuery {
-    /// Looks up each term's frequency and discounts their estimated intersection for positions
-    /// and slop; cost adds term traversal and candidate position checks. Reads no positions.
+    /// Read how many documents contain each word and estimate how many contain all of them.
+    /// Assume only 1 in `10 * phrase_length` has the words next to each other in order.
+    /// Allowing gaps (`slop`) increases that fraction, up to all documents containing every word.
+    /// This uses stored counts without reading the words' actual positions.
     fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         let inverted_index = reader.inverted_index(self.field)?;
         let terms = self

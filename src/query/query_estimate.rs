@@ -35,20 +35,23 @@ impl EstimationBudget {
     }
 }
 
-/// Explicit metadata-estimation support required by every [`super::Query`].
+/// Each [`super::Query`] must provide an estimate or explicitly return `None`.
 pub trait QueryEstimate {
-    /// Estimates `(matching_docs, traversal_cost)` without decoding posting lists.
-    /// Returns `None` when the caller must estimate this query itself or use a fallback.
-    /// Counts may include deleted documents and are not bounds for filtering results.
-    /// Expansions inspect at most 4,096 candidate terms (including nonmatches) and 1 MiB of
-    /// term bytes, plus one lookahead term, before returning `None`. SSTable payload reads are
-    /// also capped at 1 MiB per expansion estimate. They never scan documents.
-    /// Work also depends on query size, dictionary lookups and cold metadata initialization;
-    /// opening an uncached FST dictionary can load the dictionary into memory.
+    /// Estimate how many documents match and how much work the query would do, using stored
+    /// index statistics. Returns `(matching_docs, traversal_cost)`; cost is a rough work estimate,
+    /// not a time measurement. Returns `None` when the caller must supply an estimate or fallback.
+    /// Counts can include deleted documents and must not be used to exclude search results.
+    ///
+    /// Finding words for regex, fuzzy, and prefix queries stops at 4,096 terms (even nonmatches)
+    /// or 1 MiB of term bytes, plus one extra term to check whether we finished. Reading the
+    /// SSTable blocks containing those terms is also limited to 1 MiB. If we cannot finish
+    /// within these limits, we return `None`.
+    /// We never scan documents. Larger queries and dictionary lookups can still take more time;
+    /// opening an FST dictionary for the first time can load the whole dictionary into memory.
     fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>>;
 }
 
-/// Seeks to a prefix and bounds SSTable reads before opening the unfiltered term stream.
+/// Start reading at the prefix. For SSTables, check how much data we would load before reading it.
 pub(super) fn bounded_prefix_stream<'a>(
     dictionary: &'a TermDictionary,
     prefix: &[u8],
@@ -82,8 +85,11 @@ pub(super) fn bounded_prefix_stream<'a>(
     stream.into_stream().map(Some)
 }
 
-/// Uses the existing overlap-adjusted union heuristic, bounded below by the largest frequency;
-/// traversal cost is the sum of frequencies, including overlap.
+/// Estimate how many documents contain at least one term. Treat each term's share of documents
+/// as a chance of matching, reduced by 20% to allow for terms that often occur together.
+/// Multiply the chances of missing each term to estimate how many miss them all; the rest match.
+/// Keep the result between the largest term count and the total document count.
+/// Work adds the individual counts because each term has its own document list to visit.
 pub(super) fn estimate_term_union(frequencies: &[u32], max_doc: u32) -> (u32, u64) {
     if max_doc == 0 {
         return (0, 0);
@@ -96,8 +102,11 @@ pub(super) fn estimate_term_union(frequencies: &[u32], max_doc: u32) -> (u32, u6
     (count, cost)
 }
 
-/// Discounts the estimated term intersection by `(slop + 1) / (10 * terms)`, capped at one;
-/// cost includes term traversal and positional checks on intersection candidates.
+/// Estimate documents containing every term, assuming mostly independent occurrences with a
+/// small increase for words that occur together. Assume 1 in `10 * terms.len()` has the right
+/// word positions. Allowing gaps multiplies that fraction by `slop + 1`, up to 100%.
+/// Work adds the term counts and `10 * terms.len()` per document expected to contain every term,
+/// to account for checking word positions. These factors are guesses, not measured rates.
 pub(super) fn estimate_phrase(terms: &[(u32, u64)], max_doc: u32, slop: u32) -> (u32, u64) {
     if terms.len() == 1 {
         return terms[0];

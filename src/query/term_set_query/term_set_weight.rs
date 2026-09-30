@@ -86,7 +86,7 @@ impl FastFieldTermSetQuery {
 
 impl QueryEstimate for FastFieldTermSetQuery {
     fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
-        // Term-set union selectivity is composed by the caller.
+        // The caller estimates how many documents contain any of these terms.
         Ok(None)
     }
 }

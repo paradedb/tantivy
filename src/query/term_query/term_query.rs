@@ -126,12 +126,12 @@ impl TermQuery {
 }
 
 impl QueryEstimate for TermQuery {
-    /// Looks up the indexed text term's document frequency for both matches and traversal cost;
-    /// reads dictionary metadata, never postings, and retains deleted-document frequencies.
+    /// Read the stored number of documents containing this text term. Use that count for both
+    /// matches and work, without visiting the documents. The count can include deleted documents.
     fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         let value = self.term.value();
         if value.typ() != Type::Str && value.json_path_type() != Some(Type::Str) {
-            // Non-text selectivity is left to the caller's column statistics.
+            // The caller uses column statistics to estimate matches for non-text values.
             return Ok(None);
         }
         if !reader
