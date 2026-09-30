@@ -45,6 +45,7 @@ impl MoreLikeThisQuery {
 
 impl QueryEstimate for MoreLikeThisQuery {
     fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        // Term selection requires searcher context, not just a segment.
         Ok(None)
     }
 }

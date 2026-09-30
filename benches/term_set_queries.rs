@@ -410,6 +410,7 @@ impl QueryEstimate for DirectBitsetQuery {
         &self,
         _reader: &tantivy::SegmentReader,
     ) -> tantivy::Result<Option<(u32, u64)>> {
+        // Benchmark-only query; planning estimates are not needed.
         Ok(None)
     }
 }
@@ -536,6 +537,7 @@ impl QueryEstimate for BatchedBitsetQuery {
         &self,
         _reader: &tantivy::SegmentReader,
     ) -> tantivy::Result<Option<(u32, u64)>> {
+        // Benchmark-only query; planning estimates are not needed.
         Ok(None)
     }
 }

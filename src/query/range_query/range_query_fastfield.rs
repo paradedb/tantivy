@@ -38,6 +38,7 @@ impl FastFieldRangeQuery {
 
 impl QueryEstimate for FastFieldRangeQuery {
     fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        // Range selectivity is left to the caller's column statistics.
         Ok(None)
     }
 }

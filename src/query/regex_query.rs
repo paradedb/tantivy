@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tantivy_fst::Regex;
 
 use crate::error::TantivyError;
+use crate::query::query_estimate::MAX_ESTIMATED_TERMS;
 use crate::query::{AutomatonWeight, EnableScoring, Query, QueryEstimate, Weight};
 use crate::schema::Field;
 
@@ -81,8 +82,10 @@ impl RegexQuery {
 }
 
 impl QueryEstimate for RegexQuery {
-    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
-        Ok(None)
+    fn estimate_docs(&self, reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        let mut remaining_terms = MAX_ESTIMATED_TERMS;
+        self.specialized_weight()
+            .estimate_docs(reader, &mut remaining_terms)
     }
 }
 

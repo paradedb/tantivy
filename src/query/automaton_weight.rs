@@ -9,6 +9,7 @@ use super::BufferedUnionScorer;
 use crate::index::SegmentReader;
 use crate::postings::TermInfo;
 use crate::query::fuzzy_query::DfaWrapper;
+use crate::query::query_estimate::estimate_term_union;
 use crate::query::score_combiner::SumCombiner;
 use crate::query::{ConstScorer, Explanation, Scorer, Weight};
 use crate::schema::{Field, IndexRecordOption};
@@ -79,6 +80,25 @@ where
             term_infos.push(term_stream.value().clone());
         }
         Ok(term_infos)
+    }
+
+    pub(crate) fn estimate_docs(
+        &self,
+        reader: &SegmentReader,
+        remaining_terms: &mut usize,
+    ) -> crate::Result<Option<(u32, u64)>> {
+        let inverted_index = reader.inverted_index(self.field)?;
+        let mut stream = self.automaton_stream(inverted_index.terms())?;
+        let mut frequencies = Vec::new();
+        while stream.advance() {
+            if *remaining_terms == 0 {
+                // Partial expansion would omit matching terms and bias the estimate downward.
+                return Ok(None);
+            }
+            *remaining_terms -= 1;
+            frequencies.push(stream.value().doc_freq);
+        }
+        Ok(Some(estimate_term_union(&frequencies, reader.max_doc())))
     }
 }
 

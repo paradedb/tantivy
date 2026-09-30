@@ -1,5 +1,6 @@
 use super::PhraseWeight;
 use crate::query::bm25::Bm25Weight;
+use crate::query::query_estimate::estimate_phrase;
 use crate::query::{EnableScoring, Query, QueryEstimate, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::SegmentReader;
@@ -134,8 +135,17 @@ impl PhraseQuery {
 }
 
 impl QueryEstimate for PhraseQuery {
-    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
-        Ok(None)
+    fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        let inverted_index = reader.inverted_index(self.field)?;
+        let terms = self
+            .phrase_terms
+            .iter()
+            .map(|(_, term)| {
+                let count = inverted_index.doc_freq(term)?;
+                Ok((count, u64::from(count)))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        Ok(Some(estimate_phrase(&terms, reader.max_doc(), self.slop)))
     }
 }
 

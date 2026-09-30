@@ -129,6 +129,7 @@ impl QueryEstimate for TermQuery {
     fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         let value = self.term.value();
         if value.typ() != Type::Str && value.json_path_type() != Some(Type::Str) {
+            // Non-text selectivity is left to the caller's column statistics.
             return Ok(None);
         }
         if !reader
@@ -136,6 +137,7 @@ impl QueryEstimate for TermQuery {
             .get_field_entry(self.term.field())
             .is_indexed()
         {
+            // Unindexed fields have no term dictionary frequencies.
             return Ok(None);
         }
         let count = reader

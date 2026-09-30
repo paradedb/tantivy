@@ -73,6 +73,7 @@ impl ExistsQuery {
 
 impl QueryEstimate for ExistsQuery {
     fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        // Field presence is left to the caller's column statistics.
         Ok(None)
     }
 }

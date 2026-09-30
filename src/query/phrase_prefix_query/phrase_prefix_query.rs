@@ -2,6 +2,7 @@ use std::ops::Bound;
 
 use super::{prefix_end, PhrasePrefixWeight};
 use crate::query::bm25::Bm25Weight;
+use crate::query::query_estimate::{estimate_phrase, estimate_term_union, MAX_ESTIMATED_TERMS};
 use crate::query::{EnableScoring, InvertedIndexRangeWeight, Query, QueryEstimate, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::SegmentReader;
@@ -128,8 +129,37 @@ impl PhrasePrefixQuery {
 }
 
 impl QueryEstimate for PhrasePrefixQuery {
-    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
-        Ok(None)
+    fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        let inverted_index = reader.inverted_index(self.field)?;
+        let mut terms = Vec::with_capacity(self.phrase_terms.len() + 1);
+        for (_, term) in &self.phrase_terms {
+            let count = inverted_index.doc_freq(term)?;
+            if count == 0 {
+                return Ok(Some((0, 0)));
+            }
+            terms.push((count, u64::from(count)));
+        }
+        let prefix = self.prefix.1.serialized_value_bytes();
+        let mut stream = inverted_index.terms().range().ge(prefix);
+        if let Some(end) = prefix_end(prefix) {
+            stream = stream.lt(&end);
+        }
+        #[cfg(feature = "quickwit")]
+        {
+            stream =
+                stream.limit(u64::from(self.max_expansions).min(MAX_ESTIMATED_TERMS as u64 + 1));
+        }
+        let mut stream = stream.into_stream()?;
+        let mut frequencies = Vec::new();
+        while frequencies.len() < self.max_expansions as usize && stream.advance() {
+            if frequencies.len() == MAX_ESTIMATED_TERMS {
+                // The query expands beyond the metadata estimation budget.
+                return Ok(None);
+            }
+            frequencies.push(stream.value().doc_freq);
+        }
+        terms.push(estimate_term_union(&frequencies, reader.max_doc()));
+        Ok(Some(estimate_phrase(&terms, reader.max_doc(), 0)))
     }
 }
 

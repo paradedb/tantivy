@@ -104,6 +104,7 @@ impl RangeQuery {
 
 impl QueryEstimate for RangeQuery {
     fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        // Range selectivity is left to the caller's column statistics.
         Ok(None)
     }
 }
@@ -156,6 +157,7 @@ impl InvertedIndexRangeQuery {
 
 impl QueryEstimate for InvertedIndexRangeQuery {
     fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        // Range selectivity is left to the caller's column statistics.
         Ok(None)
     }
 }

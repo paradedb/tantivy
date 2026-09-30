@@ -1,6 +1,7 @@
 use super::{
-    AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, EmptyQuery, Occur, PhraseQuery, Query,
-    QueryClone, QueryEstimate, TermQuery,
+    AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, EmptyQuery, FuzzyTermQuery, Occur,
+    PhrasePrefixQuery, PhraseQuery, Query, QueryClone, QueryEstimate, RegexPhraseQuery, RegexQuery,
+    TermQuery,
 };
 use crate::merge_policy::NoMergePolicy;
 use crate::schema::{Field, IndexRecordOption, Schema, FAST, TEXT};
@@ -183,10 +184,6 @@ fn metadata_estimates_leave_unsupported_queries_to_the_caller() -> crate::Result
             vec![term(text, "rare"), term(text, "common")],
             2,
         )),
-        Box::new(PhraseQuery::new(vec![
-            Term::from_field_text(text, "all"),
-            Term::from_field_text(text, "common"),
-        ])),
         Box::new(TermQuery::new(
             Term::from_field_u64(number, 42),
             IndexRecordOption::Basic,
@@ -203,5 +200,171 @@ fn metadata_estimates_leave_unsupported_queries_to_the_caller() -> crate::Result
             assert_eq!(nested.estimate_docs(reader)?, None, "{nested:?}");
         }
     }
+    Ok(())
+}
+
+#[test]
+fn metadata_estimates_text_expansions() -> crate::Result<()> {
+    let (index, _writer, text, _) = fixture()?;
+    let searcher = index.reader()?.searcher();
+    let reader = searcher.segment_reader(0);
+    let queries: Vec<Box<dyn Query>> = vec![
+        Box::new(RegexQuery::from_pattern("rar.*", text)?),
+        Box::new(FuzzyTermQuery::new(
+            Term::from_field_text(text, "raer"),
+            1,
+            true,
+        )),
+        Box::new(FuzzyTermQuery::new_prefix(
+            Term::from_field_text(text, "rar"),
+            0,
+            false,
+        )),
+        Box::new(PhrasePrefixQuery::new(vec![Term::from_field_text(
+            text, "rar",
+        )])),
+    ];
+    for query in queries {
+        assert_eq!(query.count(&searcher)?, 100);
+        assert_eq!(query.estimate_docs(reader)?, Some((100, 100)), "{query:?}");
+        let wrapped = BoostQuery::new(Box::new(ConstScoreQuery::new(query, 2.0)), 3.0);
+        assert_eq!(wrapped.estimate_docs(reader)?, Some((100, 100)));
+    }
+    for query in [
+        Box::new(RegexQuery::from_pattern("absent.*", text)?) as Box<dyn Query>,
+        Box::new(FuzzyTermQuery::new(
+            Term::from_field_text(text, "absent"),
+            1,
+            true,
+        )),
+        Box::new(FuzzyTermQuery::new(
+            Term::from_field_text(text, "raer"),
+            1,
+            false,
+        )),
+    ] {
+        assert_eq!(query.count(&searcher)?, 0);
+        assert_eq!(query.estimate_docs(reader)?, Some((0, 0)));
+    }
+    let (count, cost) = RegexQuery::from_pattern("common|rare", text)?
+        .estimate_docs(reader)?
+        .unwrap();
+    assert!((600..=700).contains(&count));
+    assert_eq!(cost, 700);
+    assert_eq!(
+        RegexQuery::from_pattern(".*", text)?
+            .estimate_docs(reader)?
+            .unwrap()
+            .0,
+        1000
+    );
+    Ok(())
+}
+
+#[test]
+fn metadata_estimates_phrases_and_slop() -> crate::Result<()> {
+    let (index, _writer, text, _) = fixture()?;
+    let searcher = index.reader()?.searcher();
+    let reader = searcher.segment_reader(0);
+    let mut phrase = PhraseQuery::new(vec![
+        Term::from_field_text(text, "all"),
+        Term::from_field_text(text, "common"),
+    ]);
+    let strict = phrase.estimate_docs(reader)?.unwrap();
+    assert!(strict.0 > 0 && strict.0 < 600);
+    assert!(strict.1 > u64::from(strict.0));
+    phrase.set_slop(4);
+    let relaxed = phrase.estimate_docs(reader)?.unwrap();
+    assert!(relaxed.0 > strict.0 && relaxed.0 <= 600);
+    phrase.set_slop(u32::MAX);
+    assert_eq!(phrase.estimate_docs(reader)?.unwrap().0, 600);
+    let prefix = PhrasePrefixQuery::new(vec![
+        Term::from_field_text(text, "all"),
+        Term::from_field_text(text, "comm"),
+    ]);
+    let regex = RegexPhraseQuery::new(text, vec!["all".into(), "comm.*".into()]);
+    assert_eq!(prefix.estimate_docs(reader)?, Some(strict));
+    assert_eq!(regex.estimate_docs(reader)?, Some(strict));
+    for query in [
+        Box::new(PhraseQuery::new(vec![
+            Term::from_field_text(text, "all"),
+            Term::from_field_text(text, "absent"),
+        ])) as Box<dyn Query>,
+        Box::new(PhrasePrefixQuery::new(vec![
+            Term::from_field_text(text, "all"),
+            Term::from_field_text(text, "absent"),
+        ])),
+        Box::new(RegexPhraseQuery::new(
+            text,
+            vec!["all".into(), "absent.*".into()],
+        )),
+    ] {
+        assert_eq!(query.estimate_docs(reader)?, Some((0, 0)));
+    }
+    Ok(())
+}
+
+#[test]
+fn metadata_estimates_fuzzy_json_path() -> crate::Result<()> {
+    let mut schema = Schema::builder();
+    let json = schema.add_json_field("json", TEXT);
+    let index = Index::create_in_ram(schema.build());
+    let mut writer: IndexWriter = index.writer_for_tests()?;
+    writer.add_document(doc!(json => serde_json::json!({"a": "japan", "aa": "japan"})))?;
+    writer.add_document(doc!(json => serde_json::json!({"aa": "japan"})))?;
+    writer.commit()?;
+    let searcher = index.reader()?.searcher();
+    for (path, count) in [("a", 1), ("aa", 2), ("missing", 0)] {
+        let mut term = Term::from_field_json_path(json, path, false);
+        term.append_type_and_str("japam");
+        let query = FuzzyTermQuery::new(term, 1, true);
+        assert_eq!(query.count(&searcher)?, count as usize);
+        assert_eq!(
+            query.estimate_docs(searcher.segment_reader(0))?,
+            Some((count, u64::from(count)))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn metadata_estimates_limit_expansion_without_using_partial_counts() -> crate::Result<()> {
+    use super::query_estimate::MAX_ESTIMATED_TERMS;
+
+    let mut schema = Schema::builder();
+    let text = schema.add_text_field("text", TEXT);
+    let index = Index::create_in_ram(schema.build());
+    let mut writer: IndexWriter = index.writer_for_tests()?;
+    let body = (0..=MAX_ESTIMATED_TERMS)
+        .map(|id| format!("token{id:05}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    writer.add_document(doc!(text => body))?;
+    writer.commit()?;
+    let searcher = index.reader()?.searcher();
+    let reader = searcher.segment_reader(0);
+    assert_eq!(
+        RegexQuery::from_pattern("token.*", text)?.estimate_docs(reader)?,
+        None
+    );
+    assert_eq!(
+        FuzzyTermQuery::new_prefix(Term::from_field_text(text, "token"), 0, false)
+            .estimate_docs(reader)?,
+        None
+    );
+    let mut prefix = PhrasePrefixQuery::new(vec![Term::from_field_text(text, "token")]);
+    prefix.set_max_expansions(MAX_ESTIMATED_TERMS as u32);
+    assert_eq!(
+        prefix.estimate_docs(reader)?,
+        Some((1, MAX_ESTIMATED_TERMS as u64))
+    );
+    prefix.set_max_expansions(MAX_ESTIMATED_TERMS as u32 + 1);
+    assert_eq!(prefix.estimate_docs(reader)?, None);
+    let mut regex_phrase =
+        RegexPhraseQuery::new(text, vec!["token00000".into(), "token00001".into()]);
+    regex_phrase.set_max_expansions(1);
+    assert_eq!(regex_phrase.estimate_docs(reader)?, None);
+    regex_phrase.set_max_expansions(2);
+    assert!(regex_phrase.estimate_docs(reader)?.is_some());
     Ok(())
 }
