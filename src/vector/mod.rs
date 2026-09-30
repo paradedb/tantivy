@@ -373,6 +373,16 @@ impl<T> FileSliceArena<T> {
     }
 }
 
+impl<T: VectorElement> FileSliceArena<T> {
+    /// Row `index`'s little-endian bytes, one stride-sized ranged read.
+    pub(crate) fn row_bytes(&self, dim: usize, index: u32) -> std::io::Result<common::OwnedBytes> {
+        let stride = dim * T::SIZE_BYTES;
+        self.slice
+            .slice(index as usize * stride..(index as usize + 1) * stride)
+            .read_bytes()
+    }
+}
+
 impl<T: VectorElement> VectorArena for FileSliceArena<T> {
     type Elem = T;
 
@@ -391,11 +401,8 @@ impl<T: VectorElement> VectorArena for FileSliceArena<T> {
     /// `Directory` could not produce bytes it already promised via the slice.
     #[inline]
     fn similarity(&self, metric: Metric, dim: usize, index: u32, query: &[T]) -> Similarity {
-        let stride = dim * T::SIZE_BYTES;
         let bytes = self
-            .slice
-            .slice(index as usize * stride..(index as usize + 1) * stride)
-            .read_bytes()
+            .row_bytes(dim, index)
             .expect("failed to read vector arena row");
         metric.similarity_bytes(query, &bytes)
     }

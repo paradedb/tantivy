@@ -31,6 +31,7 @@ use common::{BinarySerializable, HasLen, OwnedBytes};
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
+use crate::vector::ivf::RecallEstimator;
 use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RouterWorkspace, RoutingParams};
 use crate::vector::{BoundKind, BoundStore};
 
@@ -301,5 +302,18 @@ impl IvfIndex {
         params: RoutingParams,
     ) -> RouterIter<'router, 'workspace> {
         self.router.rank(workspace, query, self.metric, params)
+    }
+
+    /// The APS estimator for scanning `ranked` (from
+    /// [`Self::rank_clusters`], not yet pulled) toward `recall`. `None`
+    /// unless the stacked router ranked it and APS is on.
+    pub(crate) fn recall_estimator(
+        &self,
+        ranked: &RouterIter<'_, '_>,
+        query: &[f32],
+        recall: f32,
+    ) -> Option<RecallEstimator<'_>> {
+        self.router
+            .recall_estimator(ranked, query, self.metric, recall)
     }
 }
