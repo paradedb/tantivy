@@ -1,11 +1,27 @@
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::ivf::{
-    Candidate, ClusterId, InMemoryStackedIvf, IvfConfig, IvfIndexBuilder, LazyStackedIvf,
-    SuperKMeansLevelClusterer,
+    aps_supports_metric, Candidate, CandidateRows, ClusterId, InMemoryStackedIvf, IvfConfig,
+    IvfIndexBuilder, LazyStackedIvf, LazyStore, RecallEstimator, StackedSearchStats,
+    SuperKMeansLevelClusterer, APS_MAX_DIM, PARENT_NPROBE_FRACTION,
 };
-use crate::vector::IvfCentroids;
+use crate::vector::router::{RouterMetrics, RoutingParams};
+use crate::vector::{IvfCentroids, Similarity};
 use crate::TantivyError;
+
+/// The router's [`IvfConfig`]. The segment's own IVF (`.vec` rows under
+/// `.centroids`) is L0 and is probed by the caller's work budget; every
+/// level of this router sits above it and is a parent, so the bottom router
+/// level uses [`PARENT_NPROBE_FRACTION`] too rather than the standalone
+/// L0 default. Build-only knobs (`branching_factor`, `max_leaf_size`) keep
+/// their defaults; the config is not persisted, so open must agree with
+/// build only on what search reads.
+fn router_config() -> IvfConfig {
+    IvfConfig {
+        nprobe_fraction: PARENT_NPROBE_FRACTION,
+        ..IvfConfig::default()
+    }
+}
 
 pub(super) fn build(
     options: &VectorOptions,
@@ -18,7 +34,7 @@ pub(super) fn build(
         matrix.rows,
         options.dim(),
         &clusterer,
-        IvfConfig::default(),
+        router_config(),
     )
     .build();
     let IvfCentroids::F32(matrix) = centroids;
@@ -55,27 +71,103 @@ pub(super) fn open(
         payload,
         centroids,
         options.dim(),
-        IvfConfig::default(),
+        router_config(),
     )?)
 }
 
-pub(super) fn rank(index: &LazyStackedIvf, query: &[f32], metric: Metric) -> Ranking {
-    let ranked = index.search(query, index.nlist(), 1.0, metric);
+/// The recall target the bottom router level runs with: the caller's,
+/// unless APS is off (`recall >= 1.0`), the metric has no query ball
+/// (Dot), or the dimension is past [`APS_MAX_DIM`], where the cap-volume
+/// estimate is unreliable. The fixed nprobe path is used instead.
+pub(crate) fn effective_recall(dim: usize, metric: Metric, recall: f32) -> f32 {
+    if dim > APS_MAX_DIM || !aps_supports_metric(metric) || !(recall < 1.0) {
+        1.0
+    } else {
+        recall.max(0.0)
+    }
+}
+
+pub(super) fn rank(
+    index: &LazyStackedIvf,
+    query: &[f32],
+    metric: Metric,
+    params: RoutingParams,
+) -> Ranking {
+    let recall = effective_recall(query.len(), metric, params.recall);
+    // Always return at most `params.k` L0 centroids. That `k` is the
+    // clusters the caller's probe budget buys under its filter
+    // (`router_k` ← `max_probe` and filter selectivity).
+    //
+    // The search still opens the parent nprobe lists and scores every
+    // member into a size-`k` heap: scanning all members of the selected
+    // lists avoids the classic IVF boundary miss; capping the heap (and
+    // thus `candidate_count`) is what ties the returned set to probe.
+    let k = params.k.clamp(1, index.vectors.len().max(1));
+    let (ranked, stats) = index.search(query, k, recall, metric);
     let candidate_count = ranked.len();
     Ranking {
         ranked: ranked.into_iter(),
         candidate_count,
+        stats,
+        recall_target: recall,
+    }
+}
+
+/// The APS estimator for the segment's own cluster scan over `ranking`,
+/// or `None` when APS is off for `recall` at this dimension. Call before
+/// the first pull: the estimator covers the whole candidate set. The
+/// bottom router level's members are the segment centroids, row for row,
+/// so candidate rows come from its member store, fetched only as the
+/// estimator needs them.
+pub(super) fn recall_estimator<'a>(
+    index: &'a LazyStackedIvf,
+    ranking: &Ranking,
+    query: &[f32],
+    metric: Metric,
+    recall: f32,
+) -> Option<RecallEstimator<'a>> {
+    let candidates = ranking.ranked.as_slice();
+    if effective_recall(query.len(), metric, recall) >= 1.0 || candidates.is_empty() {
+        return None;
+    }
+    let sims: Vec<Similarity> = candidates.iter().map(|candidate| candidate.sim).collect();
+    let rows = MemberRows {
+        members: &index.vectors,
+        clusters: candidates
+            .iter()
+            .map(|candidate| candidate.node.0)
+            .collect(),
+    };
+    Some(RecallEstimator::new(query, &sims, Box::new(rows), metric))
+}
+
+/// Ranked candidates' centroid rows, read from the bottom level's members.
+struct MemberRows<'a> {
+    members: &'a LazyStore,
+    clusters: Vec<u32>,
+}
+
+impl CandidateRows for MemberRows<'_> {
+    fn append_row(&self, rank: usize, out: &mut Vec<f32>) -> std::io::Result<()> {
+        self.members.extend_with_row(self.clusters[rank], out)
     }
 }
 
 pub(crate) struct Ranking {
     ranked: std::vec::IntoIter<Candidate<ClusterId>>,
     candidate_count: usize,
+    stats: StackedSearchStats,
+    recall_target: f32,
 }
 
 impl Ranking {
-    pub(super) fn candidate_count(&self) -> usize {
-        self.candidate_count
+    pub(super) fn metrics(&self) -> RouterMetrics {
+        RouterMetrics::Stacked {
+            candidate_count: self.candidate_count,
+            lists_scanned: self.stats.lists_scanned,
+            members_scored: self.stats.members_scored,
+            recall_target: self.recall_target,
+        }
     }
 }
 

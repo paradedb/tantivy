@@ -26,7 +26,7 @@ regex = { version = "1.5.5", default-features = false, features = [
   "unicode",
 ] }
 aho-corasick = "1.0"
-tantivy-fst = { git = "https://github.com/paradedb/fst.git" }
+tantivy-fst = { git = "https://github.com/paradedb/fst.git", rev = "1d2e473c6de63d17749030eb8538ba4d647f3430" }
 memmap2 = { version = "0.9.0", optional = true }
 lz4_flex = { version = "0.14", default-features = false, optional = true }
 zstd = { version = "0.13", optional = true, default-features = false }
@@ -100,6 +100,7 @@ parking_lot = "0.12.4"
 typetag = "0.2.21"
 unwrap-infallible = "1.0.0"
 superkmeans = { git = "https://github.com/paradedb/superkmeans-rs.git", package = "superkmeans-rs", rev = "c06dc2b6e9bd15fb5c4a0627178bebbe1fb37a64" }
+libm = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"
@@ -296,3 +297,7 @@ harness = false
 name = "vector_quantization_scan"
 harness = false
 required-features = ["unstable"]
+
+[[bench]]
+name = "ivf_recall"
+harness = false

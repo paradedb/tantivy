@@ -1720,22 +1720,9 @@ impl VectorIndexReader {
         // one write-path decision; a mismatch means a corrupt segment, never a
         // fallback.
         let index = match (&id_map, centroid_slots) {
-            (IdMap::Explicit(_), Some((version, centroids, offsets, router_slot, bounds))) => {
-                let router = segment_reader.ivf_router().ok_or_else(|| {
-                    TantivyError::InvalidArgument(
-                        "IVF index requires an explicitly configured Router".to_string(),
-                    )
-                })?;
-                Some(IvfIndex::open(
-                    version,
-                    &options,
-                    centroids,
-                    offsets,
-                    router_slot,
-                    router,
-                    bounds,
-                )?)
-            }
+            (IdMap::Explicit(_), Some((version, centroids, offsets, router_slot, bounds))) => Some(
+                IvfIndex::open(version, &options, centroids, offsets, router_slot, bounds)?,
+            ),
             (IdMap::Explicit(_), None) => {
                 return Err(TantivyError::InternalError(format!(
                     "vector field {:?} has cluster-sorted rows but no `.centroids` data",
