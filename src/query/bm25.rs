@@ -199,6 +199,32 @@ impl Bm25Weight {
         }
     }
 
+    pub(crate) fn for_phrase_pruning(&self, indexing_average: Score) -> Option<Self> {
+        if !self.weight.is_finite()
+            || self.weight < 0.0
+            || !indexing_average.is_finite()
+            || indexing_average <= 0.0
+            || !self.average_fieldnorm.is_finite()
+            || self.average_fieldnorm <= 0.0
+        {
+            return None;
+        }
+        let mut bound = self.boost_by(1.0 + 4.0 * Score::EPSILON);
+        if !bound.weight.is_finite() {
+            return None;
+        }
+        bound.cache = compute_tf_cache(indexing_average, self.params.k1(), self.params.b());
+        let scale = (indexing_average / self.average_fieldnorm).min(1.0);
+        // Uniform scaling preserves the index-time winner and bounds the query-time TF factor.
+        for value in Arc::make_mut(&mut bound.cache) {
+            *value *= scale;
+            if !value.is_finite() || *value < 0.0 {
+                return None;
+            }
+        }
+        Some(bound)
+    }
+
     pub fn for_terms(
         statistics: &dyn Bm25StatisticsProvider,
         terms: &[Term],
@@ -345,6 +371,44 @@ mod tests {
 
     use super::idf;
     use crate::{assert_nearly_equals, Score};
+
+    #[test]
+    fn phrase_pruning_rejects_unsupported_weights() {
+        let weight = super::Bm25Weight::for_one_term(10, 100, 20.0, crate::Bm25Params::default());
+        for average in [0.0, -1.0, Score::NAN, Score::INFINITY] {
+            assert!(weight.for_phrase_pruning(average).is_none());
+        }
+        for boost in [-1.0, Score::NAN, Score::INFINITY] {
+            assert!(weight.boost_by(boost).for_phrase_pruning(10.0).is_none());
+        }
+        assert!(weight.boost_by(0.0).for_phrase_pruning(10.0).is_some());
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn phrase_block_bound_covers_different_segment_averages(
+            pairs in proptest::collection::vec((0u8..=255, 1u32..1000), 1..129),
+            index_average in 1.0f32..2000.0,
+            query_average in 1.0f32..2000.0,
+            k1 in 0.0f32..4.0,
+            b in 0.0f32..1.0,
+        ) {
+            use super::Bm25Weight;
+            use crate::postings::skip::{decode_block_wand_max_tf, encode_block_wand_max_tf};
+
+            let params = crate::Bm25Params::new(k1, b);
+            let index = Bm25Weight::for_one_term(10, 100, index_average, params);
+            let query = Bm25Weight::for_one_term(10, 100, query_average, params);
+            let &(norm, freq) = pairs.iter().max_by(|&&(a, af), &&(b, bf)| {
+                index.tf_factor(a, af).total_cmp(&index.tf_factor(b, bf))
+            }).unwrap();
+            let stored_freq = decode_block_wand_max_tf(encode_block_wand_max_tf(freq));
+            let bound = query.for_phrase_pruning(index_average).unwrap().score(norm, stored_freq);
+            for (norm, freq) in pairs {
+                proptest::prop_assert!(bound >= query.score(norm, freq));
+            }
+        }
+    }
 
     #[test]
     fn test_idf() {
