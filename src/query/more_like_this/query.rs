@@ -44,8 +44,7 @@ impl MoreLikeThisQuery {
 }
 
 impl QueryEstimate for MoreLikeThisQuery {
-    /// Uses a 1% match prior, rounded up, and a full-segment traversal cost prior;
-    /// reads only max_doc, without loading the source document or selecting terms.
+    /// We don't have access to the reconstructed document here, so we use a 1% fallback.
     fn estimate_docs(&self, reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         let max_doc = reader.max_doc();
         let count = max_doc.div_ceil(100);
