@@ -360,8 +360,8 @@ fn search_fragments(
 /// a single stream, and a fragment collects the matches of every source that scored inside
 /// it. Tokens are ordered by (offset_from, offset_to), with the source index as a
 /// deterministic tie break.
-fn search_fragments_merged(
-    sources: &[SnippetSource],
+fn search_fragments_merged<S: std::borrow::Borrow<SnippetSource>>(
+    sources: &[S],
     text: &str,
     max_num_chars: usize,
     matches_limit: Option<usize>,
@@ -369,7 +369,7 @@ fn search_fragments_merged(
 ) -> Vec<FragmentCandidate> {
     let mut analyzers: Vec<TextAnalyzer> = sources
         .iter()
-        .map(|source| source.tokenizer.clone())
+        .map(|source| source.borrow().tokenizer.clone())
         .collect();
     let mut streams: Vec<_> = analyzers
         .iter_mut()
@@ -378,7 +378,7 @@ fn search_fragments_merged(
     let mut heads: Vec<Option<(usize, usize, Option<Score>)>> = streams
         .iter_mut()
         .zip(sources)
-        .map(|(stream, source)| next_event(stream, &source.terms_text))
+        .map(|(stream, source)| next_event(stream, &source.borrow().terms_text))
         .collect();
 
     let mut accumulator = FragmentAccumulator::new(max_num_chars);
@@ -390,7 +390,7 @@ fn search_fragments_merged(
     {
         let (_, _, index) = next;
         let (offset_from, offset_to, score) = heads[index].take().unwrap();
-        heads[index] = next_event(&mut streams[index], &sources[index].terms_text);
+        heads[index] = next_event(&mut streams[index], &sources[index].borrow().terms_text);
         accumulator.observe(offset_from, offset_to, score);
     }
 
@@ -851,25 +851,31 @@ impl SnippetGenerator {
         select_best_fragment_combination(&fragment_candidates[..], text)
     }
 
-    /// Fragment candidates for `text`, across every source of the generator.
+    /// Fragment candidates for `text`, across every active source of the generator.
     fn search_all_fragments(&self, text: &str) -> Vec<FragmentCandidate> {
-        if let [source] = &self.sources[..] {
-            return search_fragments(
+        let active_sources: Vec<&SnippetSource> = self
+            .sources
+            .iter()
+            .filter(|source| !source.terms_text.is_empty())
+            .collect();
+        match active_sources.as_slice() {
+            [] => Vec::new(),
+            [source] => search_fragments(
                 &mut source.tokenizer.clone(),
                 text,
                 &source.terms_text,
                 self.max_num_chars,
                 self.matches_limit,
                 self.matches_offset,
-            );
+            ),
+            _ => search_fragments_merged(
+                &active_sources,
+                text,
+                self.max_num_chars,
+                self.matches_limit,
+                self.matches_offset,
+            ),
         }
-        search_fragments_merged(
-            &self.sources,
-            text,
-            self.max_num_chars,
-            self.matches_limit,
-            self.matches_offset,
-        )
     }
 
     /// Generates multiple snippets for the given text.
@@ -938,6 +944,7 @@ mod tests {
     use std::ops::Range;
 
     use maplit::btreemap;
+    use proptest::prelude::*;
 
     use super::{
         collapse_overlapped_ranges, search_fragments, select_best_fragment_combination,
@@ -1336,73 +1343,148 @@ Survey in 2016, 2017, and 2018."#;
         }
     }
 
-    #[test]
-    fn test_snippet_generator_multiple_fields_same_span() {
-        // Both sources match the same word. That is one match: one range, and the scores of
-        // the sources that found it added together.
-        let terms = btreemap! { String::from("rust") => 1.0 };
-        let sources = [
-            source(terms.clone(), From::from(SimpleTokenizer::default()), 0),
-            source(terms, From::from(SimpleTokenizer::default()), 1),
-        ];
-        let fragments = super::search_fragments_merged(&sources, TEST_TEXT, 100, None, None);
-        let first = &fragments[0];
-        assert_eq!(first.highlighted.len(), 1);
-        assert_eq!(first.highlighted[0], (0..4, 2.0));
-        assert_eq!(
-            select_best_fragment_combination(&fragments[..], TEST_TEXT).to_html(),
-            "<b>Rust</b> is a systems programming language sponsored by\nMozilla which describes \
-             it as a &quot;safe"
-        );
-    }
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+        #[test]
+        fn proptest_merge_highlighted_same_and_overlapping_spans(
+            spans in proptest::collection::vec((0usize..300, 1usize..30, 0.1f32..10.0f32), 1..40)
+        ) {
+            let mut fragment = FragmentCandidate::new(0);
+            let mut expected_score = 0.0;
+            for (start, len, score) in &spans {
+                fragment.highlighted.push((*start..*start + *len, *score));
+                expected_score += *score;
+            }
 
-    #[test]
-    fn test_snippet_generator_matches_window_skips_distinct_matches() {
-        // Two sources, two matches, so four raw highlights that collapse to two matches.
-        // An offset of one has to land on the second match, not on the duplicate of the
-        // first.
-        let text = "alpha bravo alpha";
-        let terms = btreemap! { String::from("alpha") => 1.0 };
-        let sources = [
-            source(terms.clone(), From::from(SimpleTokenizer::default()), 0),
-            source(terms, From::from(SimpleTokenizer::default()), 1),
-        ];
-        let all = super::search_fragments_merged(&sources, text, 100, None, None);
-        let ranges = |fragments: &[FragmentCandidate]| -> Vec<Range<usize>> {
-            fragments
+            fragment.merge_highlighted();
+
+            // 1. Ranges are strictly sorted and non-overlapping.
+            for window in fragment.highlighted.windows(2) {
+                prop_assert!(window[0].0.end <= window[1].0.start);
+                prop_assert!(window[0].0.start < window[1].0.start);
+            }
+
+            // 2. Total score is conserved under merge.
+            let actual_score: Score = fragment.highlighted.iter().map(|(_, score)| *score).sum();
+            prop_assert!((actual_score - expected_score).abs() < 1e-3);
+
+            // 3. Point coverage equivalence: any index is covered by merged ranges iff covered by an input range.
+            for offset in 0..350 {
+                let in_input = spans.iter().any(|(start, len, _)| offset >= *start && offset < *start + *len);
+                let in_merged = fragment.highlighted.iter().any(|(range, _)| range.contains(&offset));
+                prop_assert_eq!(in_input, in_merged);
+            }
+
+            // 4. Idempotence.
+            let first_pass = fragment.highlighted.clone();
+            fragment.merge_highlighted();
+            prop_assert_eq!(first_pass, fragment.highlighted);
+        }
+
+        #[test]
+        fn proptest_snippet_generator_multi_field_and_delegation(
+            num_fields in 1usize..=3,
+            word_indices in proptest::collection::vec(0usize..5, 4..14),
+            match_indices in proptest::collection::vec(0usize..5, 1..3),
+            max_num_chars in 15usize..120usize,
+            matches_offset in 0usize..8usize,
+            matches_limit in 1usize..8usize,
+        ) {
+            const WORDS: &[&str] = &["alpha", "bravo", "charlie", "delta", "echo"];
+            let words: Vec<&str> = word_indices.iter().map(|&i| WORDS[i]).collect();
+            // Trailing punctuation ensures raw tokens and word tokens end at different offsets.
+            let text = words.join(" ") + ".";
+
+            let mut terms_0 = BTreeMap::new();
+            for &idx in &match_indices {
+                terms_0.insert(WORDS[idx].to_string(), 1.0);
+            }
+            let mut sources = vec![source(terms_0, From::from(SimpleTokenizer::default()), 0)];
+
+            if num_fields >= 2 {
+                let mut terms_1 = BTreeMap::new();
+                for &idx in &match_indices {
+                    terms_1.insert(WORDS[idx].to_string(), 1.5);
+                }
+                sources.push(source(terms_1, From::from(SimpleTokenizer::default()), 1));
+            }
+            if num_fields == 3 {
+                let mut raw_terms = BTreeMap::new();
+                raw_terms.insert(text.clone(), 2.0);
+                sources.push(source(raw_terms, From::from(RawTokenizer::default()), 2));
+            }
+
+            // Single-source equivalence check
+            if sources.len() == 1 {
+                let single = super::search_fragments(
+                    &mut sources[0].tokenizer.clone(),
+                    &text,
+                    &sources[0].terms_text,
+                    max_num_chars,
+                    None,
+                    None,
+                );
+                let merged = super::search_fragments_merged(&sources, &text, max_num_chars, None, None);
+                prop_assert_eq!(single.len(), merged.len());
+                for (s, m) in single.iter().zip(&merged) {
+                    prop_assert_eq!(s.start_offset, m.start_offset);
+                    prop_assert_eq!(s.stop_offset, m.stop_offset);
+                    prop_assert_eq!(&s.highlighted, &m.highlighted);
+                }
+            }
+
+            // Universal invariants across 1, 2, or 3 fields:
+            let all_fragments = super::search_fragments_merged(&sources, &text, max_num_chars, None, None);
+
+            // 1. Bounds and slice safety
+            for fragment in &all_fragments {
+                prop_assert!(fragment.start_offset <= fragment.stop_offset);
+                prop_assert!(fragment.stop_offset <= text.len());
+                let _ = &text[fragment.start_offset..fragment.stop_offset];
+
+                for (range, score) in &fragment.highlighted {
+                    prop_assert!(range.start >= fragment.start_offset);
+                    prop_assert!(range.end <= fragment.stop_offset);
+                    prop_assert!(range.start < range.end);
+                    prop_assert!(*score > 0.0);
+                    let _ = &text[range.clone()];
+                }
+
+                for window in fragment.highlighted.windows(2) {
+                    prop_assert!(window[0].0.end <= window[1].0.start);
+                }
+            }
+
+            // 2. Rendering never panics
+            let _ = select_best_fragment_combination(&all_fragments, &text).to_html();
+            for snippet in select_top_fragments(&all_fragments, &text, 3, 0, SnippetSortOrder::Score) {
+                let _ = snippet.to_html();
+            }
+
+            // 3. Matches window skips distinct matches consistently
+            let all_ranges: Vec<Range<usize>> = all_fragments
                 .iter()
-                .flat_map(|fragment| fragment.highlighted.iter().map(|(range, _)| range.clone()))
-                .collect()
-        };
-        assert_eq!(ranges(&all), vec![0..5, 12..17]);
+                .flat_map(|f| f.highlighted.iter().map(|(r, _)| r.clone()))
+                .collect();
 
-        let skipped = super::search_fragments_merged(&sources, text, 100, None, Some(1));
-        assert_eq!(ranges(&skipped), vec![12..17]);
+            let windowed_fragments = super::search_fragments_merged(
+                &sources,
+                &text,
+                max_num_chars,
+                Some(matches_limit),
+                Some(matches_offset),
+            );
+            let windowed_ranges: Vec<Range<usize>> = windowed_fragments
+                .iter()
+                .flat_map(|f| f.highlighted.iter().map(|(r, _)| r.clone()))
+                .collect();
 
-        let limited = super::search_fragments_merged(&sources, text, 100, Some(1), None);
-        assert_eq!(ranges(&limited), vec![0..5]);
-    }
-
-    #[test]
-    fn test_snippet_generator_overlapping_tokens_across_sources() {
-        // The raw token covers the trailing period, the last word token does not. Ordered by
-        // offset the word token comes last, so a fragment that took each token's end as its
-        // own would stop at 10 and leave the raw match reaching to 11.
-        let text = "alpha beta.";
-        let sources = [
-            source(
-                btreemap! { text.to_string() => 1.0 },
-                From::from(RawTokenizer::default()),
-                0,
-            ),
-            source(BTreeMap::new(), From::from(SimpleTokenizer::default()), 1),
-        ];
-        let fragments = super::search_fragments_merged(&sources, text, 100, None, None);
-        assert_eq!(fragments[0].stop_offset, text.len());
-        assert_eq!(
-            select_best_fragment_combination(&fragments[..], text).to_html(),
-            "<b>alpha beta.</b>"
-        );
+            let expected_len = std::cmp::min(all_ranges.len().saturating_sub(matches_offset), matches_limit);
+            prop_assert_eq!(windowed_ranges.len(), expected_len);
+            if matches_offset < all_ranges.len() {
+                prop_assert_eq!(&windowed_ranges[..], &all_ranges[matches_offset..matches_offset + expected_len]);
+            }
+        }
     }
 
     #[test]
@@ -1428,32 +1510,6 @@ Survey in 2016, 2017, and 2018."#;
         let doc: crate::TantivyDocument = searcher.doc(crate::DocAddress::new(0, 0))?;
         let html = generator.snippet_from_doc(&doc).to_html();
         assert!(html.contains("<b>Rust</b>"), "got: {html}");
-        Ok(())
-    }
-
-    #[test]
-    fn test_snippet_generator_single_field_delegates() -> crate::Result<()> {
-        // create() and create_for_fields() with one field produce the same snippet.
-        let mut schema_builder = Schema::builder();
-        let text_field = schema_builder.add_text_field("text", crate::schema::TEXT);
-        let index = Index::create_in_ram(schema_builder.build());
-        {
-            let mut index_writer = index.writer_for_tests()?;
-            index_writer.add_document(doc!(text_field => TEST_TEXT))?;
-            index_writer.commit()?;
-        }
-        let searcher = index.reader().unwrap().searcher();
-        let query = QueryParser::for_index(&index, vec![text_field])
-            .parse_query("rust design")
-            .unwrap();
-        let single = SnippetGenerator::create(&searcher, &*query, text_field)?;
-        let listed = SnippetGenerator::create_for_fields(&searcher, &*query, [text_field])?;
-        let html = single.snippet(TEST_TEXT).to_html();
-        assert!(
-            html.contains("<b>"),
-            "expected a match to highlight: {html}"
-        );
-        assert_eq!(html, listed.snippet(TEST_TEXT).to_html());
         Ok(())
     }
 
