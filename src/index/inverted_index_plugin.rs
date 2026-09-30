@@ -32,7 +32,7 @@ use crate::postings::{
 use crate::schema::document::{Document, Value};
 use crate::schema::{Field, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
 use crate::space_usage::{
-    ComponentSpaceUsage, FIELDNORMS, POSITIONS, POSTINGS, POSTING_NORMS, TERMDICT,
+    ComponentSpaceUsage, FIELDNORMS, POSITIONS, POSTINGS, POSTING_NORMS, TERMDICT, TERM_FREQUENCIES,
 };
 use crate::termdict::{TermMerger, TermOrdinal};
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
@@ -63,7 +63,7 @@ fn compute_initial_table_size(per_thread_memory_budget: usize) -> crate::Result<
 
 impl SegmentPlugin for InvertedIndexPlugin {
     fn extensions(&self) -> &[&str] {
-        &["fieldnorm", "term", "idx", "pos", "pnorm"]
+        &["fieldnorm", "term", "idx", "pos", "pnorm", "freqs"]
     }
 
     fn create_writer(&self, _ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
@@ -124,6 +124,12 @@ impl SegmentPlugin for InvertedIndexPlugin {
                 ComponentSpaceUsage::PerField(positions),
             ),
         ]);
+        if let Ok(file) = segment_reader.open_read(SegmentComponent::TermFrequencies) {
+            usage.insert(
+                TERM_FREQUENCIES.to_string(),
+                ComponentSpaceUsage::PerField(CompositeFile::open(&file)?.space_usage(schema)),
+            );
+        }
         if let Ok(file) = segment_reader.open_read(SegmentComponent::PostingNorms) {
             usage.insert(
                 POSTING_NORMS.to_string(),
