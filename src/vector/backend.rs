@@ -769,6 +769,51 @@ struct UnitPricing {
     row: WorkUnits,
 }
 
+/// Cost accounting and termination for the probe loop: charges each
+/// cluster's work against the budget and decides whether the next ranked
+/// cluster is opened.
+struct ProbeController {
+    pricing: UnitPricing,
+    work_spent: WorkUnits,
+    termination: ProbeTermination,
+}
+
+impl ProbeController {
+    fn new(pricing: UnitPricing) -> Self {
+        Self {
+            pricing,
+            work_spent: WorkUnits::ZERO,
+            termination: ProbeTermination::Exhausted,
+        }
+    }
+
+    /// Whether the cluster just pulled from the ranking may be opened.
+    /// Checked after the pull: a stop proves another ranked cluster
+    /// existed, keeping `Ceiling` distinct from `Exhausted`.
+    fn admit(&mut self) -> bool {
+        if self.work_spent >= self.pricing.budget {
+            self.termination = ProbeTermination::Ceiling;
+            return false;
+        }
+        true
+    }
+
+    /// Charges one cluster open, probed or skipped by the bounds gate.
+    fn charge_open(&mut self) {
+        self.work_spent += self.pricing.open;
+    }
+
+    /// Charges `rows` scored rows.
+    fn charge_rows(&mut self, rows: usize) {
+        self.work_spent += self.pricing.row * rows as f64;
+    }
+
+    fn finish(&self, stats: &mut ProbeStats) {
+        stats.termination = self.termination;
+        stats.work_charged += self.work_spent.to_f32();
+    }
+}
+
 /// One gate survivor from the pre-pass over a cluster's rows: `row`
 /// indexes into the segment-wide dense rows slot.
 /// One row surviving the cluster pre-pass.
@@ -1643,7 +1688,6 @@ struct QuantizedScanCtx {
     /// Top-k merge scratch.
     bound_merge: Vec<usize>,
     kth_scratch: Vec<usize>,
-    work_spent: WorkUnits,
 }
 
 impl QuantizedScanCtx {
@@ -1661,7 +1705,6 @@ impl QuantizedScanCtx {
             cluster_start: None,
             bound_merge: Vec::new(),
             kth_scratch: Vec::with_capacity(distinct_capacity),
-            work_spent: WorkUnits::ZERO,
         }
     }
 
@@ -2041,6 +2084,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let candidate_capacity =
             ((pricing.budget.get() / pricing.row.get()).ceil() as usize).min(index.num_rows());
         let mut scan = QuantizedScanCtx::new(max_doc, candidate_capacity);
+        let mut controller = ProbeController::new(pricing);
         let mut postings_row = 0usize;
         let mut postings_skipped = 0usize;
         let bounds = index.bounds();
@@ -2095,8 +2139,7 @@ impl<T: VectorElement> VectorBackend<T> {
             let Some(Candidate { sim, node }) = next else {
                 break;
             };
-            if scan.work_spent >= pricing.budget {
-                stats.termination = ProbeTermination::Ceiling;
+            if !controller.admit() {
                 break;
             }
             let cluster = node as usize;
@@ -2132,11 +2175,11 @@ impl<T: VectorElement> VectorBackend<T> {
                 }
             });
             if verdict == Verdict::Skip {
-                scan.work_spent += pricing.open;
+                controller.charge_open();
                 bounds_skips += 1;
                 continue;
             }
-            scan.work_spent += pricing.open;
+            controller.charge_open();
             let rows = index.cluster_range(cluster);
             let selection_start = Instant::now();
             let (selection, visited, pruned_filter, pruned_dead) = {
@@ -2231,7 +2274,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 &arithmetic_variances[..selected_count],
             );
             scan.finish_cluster_bound();
-            scan.work_spent += pricing.row * selected_count as f64;
+            controller.charge_rows(selected_count);
             stats.layer0_eligible += selected_count;
             stats.eligible_charged += selected_count;
             postings_row += 1;
@@ -2250,7 +2293,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let layer0_scored = scan.candidates.len();
         stats.bounds_skips += bounds_skips;
         stats.record_bound_armed(armed_probe);
-        stats.work_charged += scan.work_spent.to_f32();
+        controller.finish(stats);
         drop(layer0_stage);
         let scan_ns = scan_start.elapsed().as_nanos() as u64;
         stats.routing_ns += routing_ns;
@@ -2697,7 +2740,6 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut postings_row = 0usize;
         let mut postings_skipped = 0usize;
         let mut bounds_skips = 0u32;
-        let mut termination = ProbeTermination::Exhausted;
         // P2: the query bound, maintained at cluster boundaries. The
         // bound-space conversion runs on kth improvement only, inside the
         // tracker.
@@ -2710,9 +2752,7 @@ impl<T: VectorElement> VectorBackend<T> {
         // The probed cluster's gate survivors; allocated once, reused
         // across clusters.
         let mut survivors: Vec<Survivor> = Vec::new();
-        // f64 accumulation in the loop; f32 only at the telemetry fold.
-        let mut work_spent = WorkUnits::ZERO;
-        let work_budget = pricing.budget;
+        let mut controller = ProbeController::new(pricing);
 
         loop {
             let routing_start = Instant::now();
@@ -2724,11 +2764,7 @@ impl<T: VectorElement> VectorBackend<T> {
             let Some(Candidate { sim, node: cluster }) = next else {
                 break;
             };
-            // Boundary rule: open iff remaining > 0. The tripping pull
-            // proves another ranked cluster existed, keeping `Ceiling`
-            // distinct from `Exhausted`.
-            if work_spent >= work_budget {
-                termination = ProbeTermination::Ceiling;
+            if !controller.admit() {
                 break;
             }
             let cluster = cluster as usize;
@@ -2778,13 +2814,13 @@ impl<T: VectorElement> VectorBackend<T> {
                 // A skip charges the open share: skips are search work,
                 // and free skips break the work identity (validated to
                 // +-0.03% in benchmarks). No row work is spent.
-                work_spent += pricing.open;
+                controller.charge_open();
                 bounds_skips += 1;
                 continue;
             }
 
             // Event-wise charging, part 1: the open.
-            work_spent += pricing.open;
+            controller.charge_open();
 
             let rows = index.cluster_range(cluster);
 
@@ -2797,7 +2833,7 @@ impl<T: VectorElement> VectorBackend<T> {
             // Event-wise charging, part 2: the rows that survive the
             // pre-pass — exactly the rows fetched and scored below.
             // Rejected and deduped rows charge nothing.
-            work_spent += pricing.row * scored_rows as f64;
+            controller.charge_rows(scored_rows);
 
             if survivors.is_empty() {
                 postings_skipped += 1;
@@ -2844,8 +2880,7 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.candidates_scored += candidates;
         stats.bounds_skips += bounds_skips;
         stats.record_bound_armed(bound_tracker.armed_at_probe());
-        stats.termination = termination;
-        stats.work_charged += work_spent.to_f32();
+        controller.finish(stats);
         #[cfg(test)]
         {
             stats.quantized_trace.scored_docs.sort_unstable();
