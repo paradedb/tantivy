@@ -42,6 +42,27 @@ impl Default for PositionOffsetCache {
     }
 }
 
+impl PositionOffsetCache {
+    #[inline]
+    fn position_offset(&mut self, block_cursor: &BlockSegmentPostings, cur: usize) -> u64 {
+        let block_offset = block_cursor.position_offset();
+        if self.block_offset != block_offset || self.cur > cur {
+            *self = PositionOffsetCache {
+                block_offset,
+                cur: 0,
+                offset: block_offset,
+            };
+        }
+        self.offset += block_cursor.freqs()[self.cur..cur]
+            .iter()
+            .copied()
+            .map(u64::from)
+            .sum::<u64>();
+        self.cur = cur;
+        self.offset
+    }
+}
+
 impl SegmentPostings {
     /// Returns an empty segment postings object
     pub fn empty() -> Self {
@@ -185,28 +206,6 @@ impl SegmentPostings {
             position_offset_cache: PositionOffsetCache::default(),
         }
     }
-
-    #[inline]
-    fn position_offset(&mut self) -> u64 {
-        let block_offset = self.block_cursor.position_offset();
-        if self.position_offset_cache.block_offset != block_offset
-            || self.position_offset_cache.cur > self.cur
-        {
-            self.position_offset_cache = PositionOffsetCache {
-                block_offset,
-                cur: 0,
-                offset: block_offset,
-            };
-        }
-        self.position_offset_cache.offset += self.block_cursor.freqs()
-            [self.position_offset_cache.cur..self.cur]
-            .iter()
-            .copied()
-            .map(u64::from)
-            .sum::<u64>();
-        self.position_offset_cache.cur = self.cur;
-        self.position_offset_cache.offset
-    }
 }
 
 impl DocSet for SegmentPostings {
@@ -293,13 +292,14 @@ impl Postings for SegmentPostings {
     fn append_positions_with_offset(&mut self, offset: u32, output: &mut Vec<u32>) {
         let term_freq = self.term_freq();
         let prev_len = output.len();
-        if self.position_reader.is_some() {
+        if let Some(position_reader) = self.position_reader.as_mut() {
             debug_assert!(
                 !self.block_cursor.freqs().is_empty(),
                 "No positions available"
             );
-            let read_offset = self.position_offset();
-            let position_reader = self.position_reader.as_mut().unwrap();
+            let read_offset = self
+                .position_offset_cache
+                .position_offset(&self.block_cursor, self.cur);
             // TODO: instead of zeroing the output, we could use MaybeUninit or similar.
             output.resize(prev_len + term_freq as usize, 0u32);
             position_reader.read(read_offset, &mut output[prev_len..]);
