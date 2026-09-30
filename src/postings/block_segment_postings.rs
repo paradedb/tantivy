@@ -36,12 +36,12 @@ pub struct BlockSegmentPostings {
     term_norms: Option<super::term_norms::TermNormReader>,
 }
 
-const POSTINGS_BUFFER_SIZE: usize = 1024;
+const EAGER_POSTINGS_THRESHOLD: usize = 1024;
 
 #[derive(Clone)]
 enum PostingData {
     Eager(OwnedBytes),
-    Buffered(BufferedFileSlice, usize),
+    Buffered(BufferedFileSlice, FileSlice),
 }
 
 impl PostingData {
@@ -55,8 +55,20 @@ impl PostingData {
         }
         match self {
             Self::Eager(bytes) => Ok(consume(&bytes[range])),
-            Self::Buffered(buffer, _) => {
-                let bytes = buffer.get_bytes(range.start as u64..range.end as u64)?;
+            Self::Buffered(buffer, file) => {
+                if range.end > file.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "posting block extends beyond the end of the file slice",
+                    ));
+                }
+                let read_ahead_end = file
+                    .storage_block_end(range.end)
+                    .expect("buffered postings require block storage");
+                let bytes = buffer.get_bytes_with_read_ahead(
+                    range.start as u64..range.end as u64,
+                    read_ahead_end as u64,
+                )?;
                 Ok(consume(&bytes))
             }
         }
@@ -65,7 +77,7 @@ impl PostingData {
     fn len(&self) -> usize {
         match self {
             Self::Eager(bytes) => bytes.len(),
-            Self::Buffered(_, len) => *len,
+            Self::Buffered(_, file) => file.len(),
         }
     }
 }
@@ -154,7 +166,7 @@ impl BlockSegmentPostings {
         requested_option: IndexRecordOption,
     ) -> io::Result<Self> {
         if file.storage_block_len().is_none()
-            || file.len() <= POSTINGS_BUFFER_SIZE
+            || file.len() <= EAGER_POSTINGS_THRESHOLD
             || doc_freq < COMPRESSION_BLOCK_SIZE as u32
         {
             return Self::open(
@@ -175,12 +187,12 @@ impl BlockSegmentPostings {
                 io::Error::new(io::ErrorKind::InvalidData, "truncated postings skips")
             })?;
         let skips = file.read_bytes_slice(header_len..postings_start)?;
-        let len = file.len() - postings_start;
-        let buffer = BufferedFileSlice::new(file.slice_from(postings_start), POSTINGS_BUFFER_SIZE);
+        let postings = file.slice_from(postings_start);
+        let buffer = BufferedFileSlice::new_with_default_buffer_size(postings.clone());
         Self::from_parts(
             doc_freq,
             Some(skips),
-            PostingData::Buffered(buffer, len),
+            PostingData::Buffered(buffer, postings),
             record_option,
             requested_option,
         )
@@ -638,7 +650,7 @@ mod tests {
         }
 
         fn storage_block_len(&self) -> Option<usize> {
-            Some(4096)
+            Some(8160)
         }
     }
 
@@ -679,18 +691,24 @@ mod tests {
                 .slice_from(8)
                 .slice(info.postings_range.clone())
                 .read_bytes()?;
-            assert!(bytes.len() > super::POSTINGS_BUFFER_SIZE);
+            assert!(bytes.len() > super::EAGER_POSTINGS_THRESHOLD);
             for option in [
                 IndexRecordOption::Basic,
                 IndexRecordOption::WithFreqs,
                 IndexRecordOption::WithFreqsAndPositions,
             ] {
                 let reads = Arc::new(Mutex::new(Vec::new()));
+                let prefix_len = 67;
+                let mut data = vec![0; prefix_len];
+                data.extend_from_slice(&bytes);
+                data.extend_from_slice(&[0; 19]);
                 let file = FileSlice::new(Arc::new(BlockBackedFile {
-                    data: bytes.to_vec(),
+                    data,
                     reads: reads.clone(),
                     fail_after: None,
-                }));
+                }))
+                .slice(17..prefix_len + bytes.len())
+                .slice_from(prefix_len - 17);
                 let mut lazy = BlockSegmentPostings::open_file_slice(
                     info.doc_freq,
                     file,
@@ -699,6 +717,7 @@ mod tests {
                 )?;
                 let opening_reads = reads.lock().unwrap();
                 assert!(opening_reads.iter().map(|range| range.len()).sum::<usize>() < bytes.len());
+                let first_posting_read = opening_reads[2].clone();
                 drop(opening_reads);
                 let mut eager = BlockSegmentPostings::open(
                     info.doc_freq,
@@ -730,6 +749,7 @@ mod tests {
                 let refinement_reads = reads.lock().unwrap().len() - reads_before;
                 assert!(refinement_reads <= 8, "{refinement_reads} refinement reads");
 
+                reads.lock().unwrap().clear();
                 loop {
                     assert_eq!(lazy.docs(), eager.docs());
                     assert_eq!(lazy.freqs(), eager.freqs());
@@ -739,6 +759,18 @@ mod tests {
                     lazy.advance();
                     eager.advance();
                 }
+                let sequential_reads = reads.lock().unwrap();
+                let mut previous_end = first_posting_read.start;
+                for range in std::iter::once(&first_posting_read).chain(sequential_reads.iter()) {
+                    assert_eq!(
+                        range.start, previous_end,
+                        "posting bytes were reread or skipped"
+                    );
+                    assert!(range.end % 8160 == 0 || range.end == prefix_len + bytes.len());
+                    previous_end = range.end;
+                }
+                assert_eq!(previous_end, prefix_len + bytes.len());
+                drop(sequential_reads);
                 for target in [
                     0, 1, 127, 128, 129, 8191, 32000, 49999, 50000, 149999, 150000, TERMINATED,
                 ] {
@@ -754,10 +786,25 @@ mod tests {
             let header = bytes.slice(0..10);
             let (skip_len, header_len) =
                 common::VInt::deserialize_with_size(&mut header.as_slice())?;
+            let postings_start = header_len + skip_len.0 as usize;
+            let truncated = FileSlice::new(Arc::new(BlockBackedFile {
+                data: bytes[..postings_start + 1].to_vec(),
+                reads: Arc::default(),
+                fail_after: None,
+            }));
+            let error = BlockSegmentPostings::open_file_slice(
+                info.doc_freq,
+                truncated,
+                record_option,
+                IndexRecordOption::WithFreqs,
+            )
+            .err()
+            .expect("truncated posting block should fail");
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
             let file = FileSlice::new(Arc::new(BlockBackedFile {
                 data: bytes.to_vec(),
                 reads: Arc::default(),
-                fail_after: Some(header_len + skip_len.0 as usize),
+                fail_after: Some(postings_start),
             }));
             assert!(BlockSegmentPostings::open_file_slice(
                 info.doc_freq,
@@ -777,7 +824,7 @@ mod tests {
         for skip_len in [100_000, u64::MAX] {
             let mut data = Vec::new();
             common::VInt(skip_len).serialize(&mut data)?;
-            data.resize(super::POSTINGS_BUFFER_SIZE + 1, 0);
+            data.resize(super::EAGER_POSTINGS_THRESHOLD + 1, 0);
             let file = FileSlice::new(Arc::new(BlockBackedFile {
                 data,
                 reads: Arc::default(),

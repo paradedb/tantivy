@@ -301,6 +301,20 @@ impl FileSlice {
         self.data.storage_block_len()
     }
 
+    /// Extends an exclusive end to its storage block's end, clipped to this slice.
+    /// An empty prefix stays empty.
+    pub fn storage_block_end(&self, end: usize) -> Option<usize> {
+        assert!(end <= self.len(), "end exceeds the fileslice length");
+        let block_len = self.storage_block_len()?;
+        assert!(block_len > 0, "storage block length must be positive");
+        if end == 0 {
+            return Some(0);
+        }
+        let offset = (self.range.start + end) % block_len;
+        let padding = (block_len - offset) % block_len;
+        Some(end + padding.min(self.len() - end))
+    }
+
     /// Reads a specific slice of data.
     ///
     /// This is equivalent to running `file_slice.slice(from, to).read_bytes()`.
@@ -520,6 +534,26 @@ mod tests {
         assert_eq!(slot.storage_block_ord(0), Some(0));
         assert_eq!(slot.storage_block_ord(1), Some(1));
         assert_eq!(slot.storage_block_ord(5), Some(2));
+    }
+
+    #[test]
+    fn storage_block_end_includes_parent_slice_offset() {
+        let file = FileSlice::new(Arc::new(BlockHandle(b"abcdefghijkl")));
+        let slot = file.slice(1..12).slice(2..10);
+        for (end, expected) in [(0, 0), (1, 1), (2, 5), (5, 5), (6, 8), (8, 8)] {
+            assert_eq!(slot.storage_block_end(end), Some(expected));
+        }
+        assert_eq!(slot.slice(0..0).storage_block_end(0), Some(0));
+        assert_eq!(FileSlice::from(&b"abc"[..]).storage_block_end(1), None);
+    }
+
+    #[test]
+    fn storage_block_end_clips_before_overflow() {
+        let file = FileSlice::new_with_num_bytes(Arc::new(BlockHandle(b"")), usize::MAX)
+            .slice_from(usize::MAX - 6);
+        for (end, expected) in [(0, 0), (1, 3), (3, 3), (4, 6), (6, 6)] {
+            assert_eq!(file.storage_block_end(end), Some(expected));
+        }
     }
 
     #[test]
