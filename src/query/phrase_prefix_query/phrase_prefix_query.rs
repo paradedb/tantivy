@@ -2,9 +2,7 @@ use std::ops::Bound;
 
 use super::{prefix_end, PhrasePrefixWeight};
 use crate::query::bm25::Bm25Weight;
-use crate::query::query_estimate::{
-    bounded_prefix_stream, estimate_phrase, estimate_term_union, EstimationBudget,
-};
+use crate::query::query_estimate::{bounded_prefix_stream, estimate_term_union, EstimationBudget};
 use crate::query::{EnableScoring, InvertedIndexRangeWeight, Query, QueryEstimate, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::SegmentReader;
@@ -131,22 +129,30 @@ impl PhrasePrefixQuery {
 }
 
 impl QueryEstimate for PhrasePrefixQuery {
-    /// For `"red ca*"`, use the stored document counts for `red` and words starting with `ca`.
-    /// Allow for documents containing multiple `ca*` words, then estimate how many also contain
-    /// `red`. Assume about 1 in 20 of those documents has the words next to each other in order.
-    /// In general, that fraction is 1 in `10 * phrase_length`; a prefix alone skips this reduction.
+    /// For `"red fox ca*"`, use the smaller document count of `red` and `fox`. Every match must
+    /// contain both, so this can overestimate. We don't read the words starting with `ca`.
+    /// Work estimates cover the complete words and checking their positions, not prefix expansion.
+    /// With only a prefix, read matching words and estimate how many documents contain any of them.
     fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         if self.max_expansions == 0 {
             return Ok(Some((0, 0)));
         }
         let inverted_index = reader.inverted_index(self.field)?;
-        let mut terms = Vec::with_capacity(self.phrase_terms.len() + 1);
-        for (_, term) in &self.phrase_terms {
-            let count = inverted_index.doc_freq(term)?;
-            if count == 0 {
-                return Ok(Some((0, 0)));
+        if !self.phrase_terms.is_empty() {
+            let mut count = reader.max_doc();
+            let mut cost = 0u64;
+            for (_, term) in &self.phrase_terms {
+                let frequency = inverted_index.doc_freq(term)?;
+                if frequency == 0 {
+                    return Ok(Some((0, 0)));
+                }
+                count = count.min(frequency);
+                cost = cost.saturating_add(u64::from(frequency));
             }
-            terms.push((count, u64::from(count)));
+            // Use the same allowance for checking word positions as estimate_phrase.
+            let positional_cost = 10 * (self.phrase_terms.len() as u64 + 1);
+            cost = cost.saturating_add(u64::from(count).saturating_mul(positional_cost));
+            return Ok(Some((count, cost)));
         }
         let prefix = self.prefix.1.serialized_value_bytes();
         let mut budget = EstimationBudget::default();
@@ -165,8 +171,7 @@ impl QueryEstimate for PhrasePrefixQuery {
             }
             frequencies.push(stream.value().doc_freq);
         }
-        terms.push(estimate_term_union(&frequencies, reader.max_doc()));
-        Ok(Some(estimate_phrase(&terms, reader.max_doc(), 0)))
+        Ok(Some(estimate_term_union(&frequencies, reader.max_doc())))
     }
 }
 

@@ -278,22 +278,13 @@ fn metadata_estimates_phrases_and_slop() -> crate::Result<()> {
     assert!(relaxed.0 > strict.0 && relaxed.0 <= 600);
     phrase.set_slop(u32::MAX);
     assert_eq!(phrase.estimate_docs(reader)?.unwrap().0, 600);
-    let prefix = PhrasePrefixQuery::new(vec![
-        Term::from_field_text(text, "all"),
-        Term::from_field_text(text, "comm"),
-    ]);
     let regex = RegexPhraseQuery::new(text, vec!["all".into(), "comm.*".into()]);
-    assert_eq!(prefix.estimate_docs(reader)?, Some(strict));
     assert_eq!(regex.estimate_docs(reader)?, Some(strict));
     for query in [
         Box::new(PhraseQuery::new(vec![
             Term::from_field_text(text, "all"),
             Term::from_field_text(text, "absent"),
         ])) as Box<dyn Query>,
-        Box::new(PhrasePrefixQuery::new(vec![
-            Term::from_field_text(text, "all"),
-            Term::from_field_text(text, "absent"),
-        ])),
         Box::new(RegexPhraseQuery::new(
             text,
             vec!["all".into(), "absent.*".into()],
@@ -301,6 +292,42 @@ fn metadata_estimates_phrases_and_slop() -> crate::Result<()> {
     ] {
         assert_eq!(query.estimate_docs(reader)?, Some((0, 0)));
     }
+    Ok(())
+}
+
+#[test]
+fn metadata_estimates_phrase_prefix_uses_rarest_required_term() -> crate::Result<()> {
+    let (index, _writer, text, _) = fixture()?;
+    let searcher = index.reader()?.searcher();
+    let reader = searcher.segment_reader(0);
+    for (words, expected) in [
+        (vec!["all", "comm"], 1000),
+        (vec!["common", "rare", "s"], 100),
+        (vec!["rare", "common", "s"], 100),
+        (vec!["common", "all", "s"], 600),
+        (vec!["common", "rare", "absent"], 100),
+        (vec!["common", "absent", "r"], 0),
+    ] {
+        let query = PhrasePrefixQuery::new(
+            words
+                .into_iter()
+                .map(|word| Term::from_field_text(text, word))
+                .collect(),
+        );
+        let (count, cost) = query.estimate_docs(reader)?.unwrap();
+        assert_eq!(count, expected, "{query:?}");
+        assert!(query.count(&searcher)? <= count as usize);
+        assert!(cost >= u64::from(count));
+        if count == 0 {
+            assert_eq!(cost, 0);
+        }
+    }
+    let mut query = PhrasePrefixQuery::new(vec![
+        Term::from_field_text(text, "all"),
+        Term::from_field_text(text, "comm"),
+    ]);
+    query.set_max_expansions(0);
+    assert_eq!(query.estimate_docs(reader)?, Some((0, 0)));
     Ok(())
 }
 
@@ -373,6 +400,12 @@ fn metadata_estimates_limit_expansion_without_using_partial_counts() -> crate::R
     );
     prefix.set_max_expansions(MAX_ESTIMATED_TERMS as u32 + 1);
     assert_eq!(prefix.estimate_docs(reader)?, None);
+    let mut phrase_prefix = PhrasePrefixQuery::new(vec![
+        Term::from_field_text(text, "token00000"),
+        Term::from_field_text(text, "token"),
+    ]);
+    phrase_prefix.set_max_expansions(MAX_ESTIMATED_TERMS as u32 + 1);
+    assert_eq!(phrase_prefix.estimate_docs(reader)?.unwrap().0, 1);
     prefix.set_max_expansions(0);
     assert_eq!(prefix.estimate_docs(reader)?, Some((0, 0)));
     let mut regex_phrase =
