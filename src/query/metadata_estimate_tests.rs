@@ -1,6 +1,6 @@
 use super::{
     AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, EmptyQuery, Occur, PhraseQuery, Query,
-    TermQuery,
+    QueryClone, TermQuery,
 };
 use crate::merge_policy::NoMergePolicy;
 use crate::schema::{Field, IndexRecordOption, Schema, FAST, TEXT};
@@ -97,6 +97,85 @@ fn metadata_estimates_terms_and_flat_booleans() -> crate::Result<()> {
 }
 
 #[test]
+fn metadata_estimates_compose_wrappers_and_booleans() -> crate::Result<()> {
+    let (index, _writer, text, _) = fixture()?;
+    let searcher = index.reader()?.searcher();
+    let reader = searcher.segment_reader(0);
+    let wrap = |query: Box<dyn Query>, variant| -> Box<dyn Query> {
+        match variant {
+            0 => query,
+            1 => Box::new(BoostQuery::new(query, 2.0)),
+            2 => Box::new(ConstScoreQuery::new(query, 3.0)),
+            3 => Box::new(BoostQuery::new(
+                Box::new(ConstScoreQuery::new(query, 3.0)),
+                2.0,
+            )),
+            4 => Box::new(ConstScoreQuery::new(
+                Box::new(BoostQuery::new(query, 2.0)),
+                3.0,
+            )),
+            _ => Box::new(query),
+        }
+    };
+    for (inner_occur, outer_occur, expected) in [
+        (Occur::Must, Occur::Must, (52, 100)),
+        (Occur::Must, Occur::Should, (510, 700)),
+        (Occur::Should, Occur::Must, (376, 600)),
+        (Occur::Should, Occur::Should, (697, 1300)),
+    ] {
+        for leaf_wrapper in 0..6 {
+            for inner_wrapper in 0..6 {
+                for outer_wrapper in 0..6 {
+                    let inner = BooleanQuery::new(vec![
+                        (inner_occur, wrap(term(text, "rare"), leaf_wrapper)),
+                        (inner_occur, wrap(term(text, "common"), leaf_wrapper)),
+                    ]);
+                    let outer = BooleanQuery::new(vec![
+                        (outer_occur, wrap(Box::new(inner), inner_wrapper)),
+                        (outer_occur, wrap(term(text, "common"), leaf_wrapper)),
+                    ]);
+                    let query = wrap(Box::new(outer), outer_wrapper);
+                    assert_eq!(query.estimate_docs(reader)?, Some(expected), "{query:?}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn metadata_estimates_preserve_nested_costs() -> crate::Result<()> {
+    let (index, _writer, text, _) = fixture()?;
+    let searcher = index.reader()?.searcher();
+    let reader = searcher.segment_reader(0);
+    let rounded_zero =
+        BooleanQuery::intersection(vec![term(text, "singleton"), term(text, "unique")]);
+    let nested = BooleanQuery::union(vec![term(text, "common"), term(text, "rare")]);
+    let rounded_all = BooleanQuery::union((0..20).map(|_| term(text, "common")).collect());
+    assert_eq!(rounded_all.estimate_docs(reader)?, Some((1000, 12000)));
+    for child in [&rounded_zero, &nested, &rounded_all] {
+        for (occur, identity) in [
+            (Occur::Must, Box::new(AllQuery) as Box<dyn Query>),
+            (Occur::Should, Box::new(EmptyQuery)),
+        ] {
+            for children in [
+                vec![(occur, child.box_clone())],
+                vec![(occur, child.box_clone()), (occur, identity)],
+            ] {
+                let query = BooleanQuery::new(children);
+                assert_eq!(query.estimate_docs(reader)?, child.estimate_docs(reader)?);
+            }
+        }
+    }
+    let query = BooleanQuery::intersection(vec![rounded_zero.box_clone(), term(text, "rare")]);
+    assert_eq!(query.estimate_docs(reader)?, Some((0, 1)));
+    assert_eq!(query.count(&searcher)?, 1);
+    let query = BooleanQuery::union(vec![rounded_zero.box_clone(), term(text, "unique")]);
+    assert_eq!(query.estimate_docs(reader)?, Some((1, 2)));
+    Ok(())
+}
+
+#[test]
 fn metadata_estimates_keep_deleted_document_frequencies() -> crate::Result<()> {
     let (index, mut writer, text, _) = fixture()?;
     writer.delete_term(Term::from_field_text(text, "singleton"));
@@ -130,13 +209,6 @@ fn metadata_estimates_leave_unsupported_queries_to_the_caller() -> crate::Result
             vec![term(text, "rare"), term(text, "common")],
             2,
         )),
-        Box::new(BooleanQuery::intersection(vec![
-            Box::new(BooleanQuery::union(vec![
-                term(text, "rare"),
-                term(text, "common"),
-            ])),
-            term(text, "all"),
-        ])),
         Box::new(PhraseQuery::new(vec![
             Term::from_field_text(text, "all"),
             Term::from_field_text(text, "common"),
@@ -148,6 +220,14 @@ fn metadata_estimates_leave_unsupported_queries_to_the_caller() -> crate::Result
     ];
     for query in unsupported {
         assert_eq!(query.estimate_docs(reader)?, None, "{query:?}");
+        let wrapped = BoostQuery::new(Box::new(ConstScoreQuery::new(query, 3.0)), 2.0);
+        for occur in [Occur::Must, Occur::Should] {
+            let nested = BooleanQuery::new(vec![
+                (occur, term(text, "rare")),
+                (occur, wrapped.box_clone()),
+            ]);
+            assert_eq!(nested.estimate_docs(reader)?, None, "{nested:?}");
+        }
     }
     Ok(())
 }

@@ -168,33 +168,35 @@ impl Query for BooleanQuery {
         ) || self
             .subqueries
             .iter()
-            .any(|(child_occur, child)| *child_occur != occur || !child.is::<TermQuery>())
+            .any(|(child_occur, _)| *child_occur != occur)
         {
             return Ok(None);
         }
 
-        let mut sizes = Vec::with_capacity(self.subqueries.len());
+        let mut estimates = Vec::with_capacity(self.subqueries.len());
         for (_, child) in &self.subqueries {
-            let Some((count, _)) = child.estimate_docs(reader)? else {
+            let Some((count, cost)) = child.estimate_docs(reader)? else {
                 return Ok(None);
             };
+            let is_empty = (count, cost) == (0, 0);
+            let is_all = (count, cost) == (reader.max_doc(), u64::from(reader.max_doc()));
             if occur == Occur::Must {
-                if count == 0 {
+                if is_empty {
                     return Ok(Some((0, 0)));
                 }
-                if count != reader.max_doc() {
-                    sizes.push(count);
+                if !is_all {
+                    estimates.push((count, cost));
                 }
             } else {
-                if count == reader.max_doc() {
-                    return Ok(Some((count, u64::from(count))));
+                if is_all {
+                    return Ok(Some((count, cost)));
                 }
-                if count != 0 {
-                    sizes.push(count);
+                if !is_empty {
+                    estimates.push((count, cost));
                 }
             }
         }
-        if sizes.is_empty() {
+        if estimates.is_empty() {
             let count = if occur == Occur::Must {
                 reader.max_doc()
             } else {
@@ -202,19 +204,19 @@ impl Query for BooleanQuery {
             };
             return Ok(Some((count, u64::from(count))));
         }
-        if sizes.len() == 1 {
-            return Ok(Some((sizes[0], u64::from(sizes[0]))));
+        if estimates.len() == 1 {
+            return Ok(Some(estimates[0]));
         }
         if occur == Occur::Must {
-            sizes.sort_unstable();
+            estimates.sort_unstable_by_key(|&(_, cost)| cost);
             Ok(Some((
-                estimate_intersection(sizes.iter().copied(), reader.num_docs()),
-                u64::from(sizes[0]),
+                estimate_intersection(estimates.iter().map(|&(count, _)| count), reader.num_docs()),
+                estimates[0].1,
             )))
         } else {
             Ok(Some((
-                estimate_union(sizes.iter().copied(), reader.num_docs()),
-                sizes.iter().map(|&count| u64::from(count)).sum(),
+                estimate_union(estimates.iter().map(|&(count, _)| count), reader.num_docs()),
+                estimates.iter().map(|&(_, cost)| cost).sum(),
             )))
         }
     }
