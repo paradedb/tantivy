@@ -186,13 +186,11 @@ pub(crate) mod tests {
         }));
         let mut position_reader = PositionReader::open_file_slice(file)?;
 
-        assert!(
-            reads
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|range| range.len() < positions_len)
-        );
+        assert!(reads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|range| range.len() < positions_len));
 
         for &(offset, len) in &[(0, 300), (127, 257), (900, 600), (31, 129)] {
             let mut output = vec![0; len];
@@ -202,13 +200,11 @@ pub(crate) mod tests {
                 position_deltas[offset as usize..offset as usize + len]
             );
         }
-        assert!(
-            reads
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|range| range.len() < positions_len)
-        );
+        assert!(reads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|range| range.len() < positions_len));
         Ok(())
     }
 
