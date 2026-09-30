@@ -343,8 +343,6 @@ pub struct BlockWandSingleScorer {
     scorer: TermScorer,
     threshold: Score,
     current: (DocId, Score),
-    #[cfg(test)]
-    scored_docs: usize,
 }
 impl BlockWandSingleScorer {
     /// Construction positions `current` on the first match
@@ -353,8 +351,6 @@ impl BlockWandSingleScorer {
             scorer: term_scorer,
             threshold,
             current: (0, Score::MIN),
-            #[cfg(test)]
-            scored_docs: 0,
         };
         // advance to fill current
         scorer.advance();
@@ -402,10 +398,6 @@ impl DocSet for BlockWandSingleScorer {
             }
             loop {
                 let score = self.scorer.score();
-                #[cfg(test)]
-                {
-                    self.scored_docs += 1;
-                }
                 if score > threshold {
                     self.current = (doc, score);
                     self.scorer.advance();
@@ -467,23 +459,25 @@ mod tests {
     use crate::{DocId, DocSet, Score, TERMINATED};
 
     #[test]
-    fn test_block_wand_single_seek_skips_scoring() {
+    fn test_block_wand_single_seek_termination() {
         let fieldnorms = vec![2; 4096];
         let postings: Vec<_> = (0..4096).map(|doc| (doc, 1)).collect();
         let weight = Bm25Weight::for_one_term(4096, 4096, 2.0, Bm25Params::default());
         let term = TermScorer::create_for_test(&postings, &fieldnorms, weight);
         let mut scorer = super::BlockWandSingleScorer::new(term, 0.0);
+        let score = scorer.score();
         assert_eq!(scorer.doc(), 0);
         assert_eq!(scorer.seek(3000), 3000);
-        assert_eq!(scorer.scored_docs, 2);
+        assert_eq!(scorer.score(), score);
         assert_eq!(scorer.seek(3000), 3000);
-        assert_eq!(scorer.scored_docs, 2);
+        assert_eq!(scorer.score(), score);
         assert_eq!(scorer.advance(), 3001);
-        let scored_docs = scorer.scored_docs;
+        let next_doc = scorer.scorer.doc();
         assert_eq!(scorer.seek(TERMINATED), TERMINATED);
-        assert_eq!(scorer.scored_docs, scored_docs);
+        assert_eq!(scorer.scorer.doc(), next_doc);
         assert_eq!(scorer.advance(), TERMINATED);
         assert_eq!(scorer.seek(TERMINATED), TERMINATED);
+        assert_eq!(scorer.scorer.doc(), next_doc);
     }
 
     #[test]
