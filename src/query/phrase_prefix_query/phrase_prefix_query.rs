@@ -130,9 +130,7 @@ impl PhrasePrefixQuery {
 
 impl QueryEstimate for PhrasePrefixQuery {
     /// For `"red fox ca*"`, use the smaller document count of `red` and `fox`. Every match must
-    /// contain both, so this can overestimate. We don't read the words starting with `ca`.
-    /// Work estimates cover the complete words and checking their positions, not prefix expansion.
-    /// With only a prefix, read matching words and estimate how many documents contain any of them.
+    /// contain both, so this can overestimate.
     fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         if self.max_expansions == 0 {
             return Ok(Some((0, 0)));
