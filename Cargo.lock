@@ -2000,6 +2000,7 @@ dependencies = [
  "htmlescape",
  "itertools 0.14.0",
  "levenshtein_automata",
+ "libm",
  "log",
  "lru",
  "lz4_flex",
@@ -2091,7 +2092,7 @@ dependencies = [
 [[package]]
 name = "tantivy-fst"
 version = "0.5.0"
-source = "git+https://github.com/paradedb/fst.git#11e89334c578f26f9fbafbd1122ffb220ebbdbbf"
+source = "git+https://github.com/paradedb/fst.git?rev=1d2e473c6de63d17749030eb8538ba4d647f3430#1d2e473c6de63d17749030eb8538ba4d647f3430"
 dependencies = [
  "byteorder",
  "regex-syntax",

@@ -1552,6 +1552,16 @@ mod tests {
         schedule: &[u8],
         quantized: bool,
     ) -> crate::Result<Index> {
+        build_quantized_fixture_case_with_router(dim, metric, schedule, quantized, RouterKind::Rng)
+    }
+
+    fn build_quantized_fixture_case_with_router(
+        dim: usize,
+        metric: Metric,
+        schedule: &[u8],
+        quantized: bool,
+        router: RouterKind,
+    ) -> crate::Result<Index> {
         let mut schema_builder = Schema::builder();
         let field = schema_builder.add_vector_field("embedding", VectorOptions::new(dim, metric));
         let label_field = schema_builder.add_text_field("label", STRING | STORED);
@@ -1567,7 +1577,7 @@ mod tests {
             .schema(schema)
             .settings(settings)
             .ivf_clusterer(Arc::new(QuantFixtureClusterer { dim, metric }))
-            .ivf_router(RouterKind::Rng)?
+            .ivf_router(router)?
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 30_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -2332,6 +2342,49 @@ mod tests {
         assert_eq!(
             stats.vectors_visited,
             stats.pruned_filter + stats.pruned_dead + stats.candidates_scored,
+            "{stats:?}"
+        );
+        Ok(())
+    }
+
+    /// Under the stacked router the quantized loop runs APS: a loose
+    /// recall target stops before the full budget is spent.
+    #[test]
+    fn quantized_probe_terminates_at_recall_target() -> crate::Result<()> {
+        let index = build_quantized_fixture_case_with_router(
+            100,
+            Metric::L2,
+            &[1],
+            true,
+            RouterKind::Stacked,
+        )?;
+        let field = index.schema().get_field("embedding")?;
+        let query = fixture_search_query(Metric::L2, 100);
+        let searcher = index.reader()?.searcher();
+        let collector = TopDocsByVectorSimilarity::new(field, query.clone(), 3)
+            .with_adaptive_params(AdaptiveProbeParams {
+                max_probe_fraction: 1.0,
+                min_probe_clusters: 1,
+                recall_target: 0.5,
+                ..Default::default()
+            })
+            .with_max_scan_levels(1);
+        let fruit = searcher.search(&AllQuery, &collector)?;
+        let stats = &fruit.stats[0];
+        assert_eq!(
+            stats.termination,
+            crate::vector::ProbeTermination::RecallTarget,
+            "{stats:?}"
+        );
+        assert!(
+            stats
+                .recall_estimate
+                .is_some_and(|estimate| estimate >= 0.5),
+            "{stats:?}"
+        );
+        assert_eq!(
+            fruit.results,
+            fixture_exact_hits(&index, Metric::L2, &query, None, 3)?,
             "{stats:?}"
         );
         Ok(())

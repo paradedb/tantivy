@@ -32,16 +32,16 @@ use super::distance::norm_squared_wide;
 use super::index_reader::{
     validate_decoded_sidecar, QuantizedFieldReader, QuantizedLayerReader, VectorIndexReader,
 };
-use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex};
+use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, RecallEstimator};
 use super::prepared::{
     corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix,
     quantized_model_sigma, refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError,
     PreparedQuery, QuantizedQueryCtx, VectorQuery,
 };
 use super::quantization::QUANTIZED_BOUNDARY_KAPPA;
-use super::router::{RouterMetrics, RouterWorkspace};
+use super::router::{RouterMetrics, RouterWorkspace, RoutingParams};
 use super::tie_break::NoTieBreak;
-use super::{enter_vector_stage, Stage, VectorElement};
+use super::{enter_vector_stage, Similarity, Stage, VectorElement};
 use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::{SegmentSortKeyComputer, TopNComputer};
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
@@ -332,6 +332,9 @@ pub enum ProbeTermination {
     /// The centroid stream was exhausted.
     #[default]
     Exhausted,
+    /// The APS estimate of the covered clusters reached
+    /// [`AdaptiveProbeParams::recall_target`].
+    RecallTarget,
 }
 
 /// Per-segment probe instrumentation.
@@ -510,6 +513,14 @@ pub struct ProbeStats {
     /// Ceiling terminations.
     /// Work units charged by the probe loop.
     pub work_charged: f32,
+    /// The resolved work budget the probe loop ran against: the
+    /// `max_probe_fraction` ceiling in work units, floored by
+    /// `min_probe_clusters`. `0` when no IVF probe loop ran.
+    pub work_budget: f32,
+    /// The APS recall estimate when the probe loop stopped; absent when
+    /// APS was off or the heap never held `k` results. Per-segment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recall_estimate: Option<f32>,
     /// Vector rows in the segment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segment_rows: Option<usize>,
@@ -540,7 +551,9 @@ impl ProbeStats {
         self.routing = Some(routing);
         self.routing_visited_count += match routing {
             RouterMetrics::Rng(graph) => graph.visited_count,
-            RouterMetrics::Stacked { candidate_count } => candidate_count,
+            RouterMetrics::Stacked {
+                candidate_count, ..
+            } => candidate_count,
             RouterMetrics::Exact { visited_count } => visited_count,
         };
         if let RouterMetrics::Rng(graph) = routing {
@@ -765,6 +778,102 @@ struct UnitPricing {
     open: WorkUnits,
     /// `(1 - x)/n_avg`: what one scored row costs.
     row: WorkUnits,
+}
+
+/// Cost accounting and termination for the probe loop: charges each
+/// cluster's work against the budget, tracks the APS recall estimate, and
+/// decides whether the next ranked cluster is opened.
+struct ProbeController<'a> {
+    pricing: UnitPricing,
+    work_spent: WorkUnits,
+    termination: ProbeTermination,
+    /// Clusters in the segment and clusters pulled from the ranking so far.
+    clusters: usize,
+    pulled: usize,
+    /// APS over the ranked clusters; `None` when APS is off.
+    estimator: Option<RecallEstimator<'a>>,
+    recall_target: f32,
+    recall_estimate: Option<f32>,
+}
+
+impl<'a> ProbeController<'a> {
+    fn new(
+        pricing: UnitPricing,
+        clusters: usize,
+        estimator: Option<RecallEstimator<'a>>,
+        recall_target: f32,
+    ) -> Self {
+        Self {
+            pricing,
+            work_spent: WorkUnits::ZERO,
+            termination: ProbeTermination::Exhausted,
+            clusters,
+            pulled: 0,
+            estimator,
+            recall_target,
+            recall_estimate: None,
+        }
+    }
+
+    /// Whether the cluster just pulled from the ranking may be opened.
+    /// Checked after the pull: a stop proves another ranked cluster
+    /// existed, keeping `Ceiling` and `RecallTarget` distinct from
+    /// `Exhausted`.
+    fn admit(&mut self) -> bool {
+        self.pulled += 1;
+        if self
+            .recall_estimate
+            .is_some_and(|estimate| estimate >= self.recall_target)
+        {
+            self.termination = ProbeTermination::RecallTarget;
+            return false;
+        }
+        if self.work_spent >= self.pricing.budget {
+            self.termination = ProbeTermination::Ceiling;
+            return false;
+        }
+        true
+    }
+
+    /// Charges one cluster open, probed or skipped by the bounds gate.
+    fn charge_open(&mut self) {
+        self.work_spent += self.pricing.open;
+    }
+
+    /// Charges `rows` scored rows.
+    fn charge_rows(&mut self, rows: usize) {
+        self.work_spent += self.pricing.row * rows as f64;
+    }
+
+    /// Marks the admitted cluster covered: probed, skipped by the bounds
+    /// gate, or without survivors. Either way no result inside the query
+    /// ball remains there. `kth` is the k-th result score after it,
+    /// `None` while the heap is filling.
+    fn cover(&mut self, kth: Option<Score>) -> crate::Result<()> {
+        if let Some(estimator) = self.estimator.as_mut() {
+            if let Some(estimate) = estimator.cover_next(kth.map(Similarity::new))? {
+                self.recall_estimate = Some(estimate);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&self, stats: &mut ProbeStats) {
+        // A stacked ranking is sized to the budget, so it can run out just
+        // as the budget is spent, short of the segment's clusters; that stop
+        // is the ceiling's, not exhaustion.
+        stats.termination = match self.termination {
+            ProbeTermination::Exhausted
+                if self.pulled < self.clusters && self.work_spent >= self.pricing.budget =>
+            {
+                ProbeTermination::Ceiling
+            }
+            termination => termination,
+        };
+        stats.work_charged += self.work_spent.to_f32();
+        stats.work_budget += self.pricing.budget.to_f32();
+        stats.recall_estimate = self.recall_estimate;
+    }
 }
 
 /// One gate survivor from the pre-pass over a cluster's rows: `row`
@@ -1641,7 +1750,6 @@ struct QuantizedScanCtx {
     /// Top-k merge scratch.
     bound_merge: Vec<usize>,
     kth_scratch: Vec<usize>,
-    work_spent: WorkUnits,
 }
 
 impl QuantizedScanCtx {
@@ -1659,7 +1767,6 @@ impl QuantizedScanCtx {
             cluster_start: None,
             bound_merge: Vec::new(),
             kth_scratch: Vec::with_capacity(distinct_capacity),
-            work_spent: WorkUnits::ZERO,
         }
     }
 
@@ -1769,6 +1876,22 @@ impl QuantizedScanCtx {
                 .estimate(index)
                 .lower(self.candidates.sigmas[index], kappa),
         ))
+    }
+
+    /// The lowest point estimate among the running top-k rows, `None`
+    /// until `top_n` rows are in. `top_n` rows score at least this, so it
+    /// never exceeds the k-th best estimate; unlike
+    /// [`Self::running_pessimistic_kth`] it carries no confidence margin,
+    /// so it must not drive pruning.
+    fn running_estimate_kth(&self, top_n: usize) -> Option<Score> {
+        debug_assert!(!self.boundary_passed);
+        if top_n == 0 || self.bound_top.len() < top_n {
+            return None;
+        }
+        self.bound_top
+            .iter()
+            .map(|&index| self.candidates.estimates[index])
+            .min_by(f32::total_cmp)
     }
 
     /// Select by lower endpoint itself; ordering by estimate can prune a true top-k row
@@ -2069,10 +2192,28 @@ impl<T: VectorElement> VectorBackend<T> {
             (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
         );
 
+        let routing = RoutingParams {
+            k: self.adaptive.router_k(
+                work_budget,
+                x,
+                filter.match_fraction(max_doc),
+                index.num_clusters(),
+            ),
+            recall: self.adaptive.router_recall_target,
+        };
         let routing_start = Instant::now();
-        let mut ranked = {
+        let (mut ranked, mut controller) = {
             let _routing_stage = enter_vector_stage(Stage::Routing);
-            index.rank_clusters(&mut routing_ws, query.query())
+            let ranked = index.rank_clusters(&mut routing_ws, query.query(), routing);
+            let estimator =
+                index.recall_estimator(&ranked, query.query(), self.adaptive.recall_target);
+            let controller = ProbeController::new(
+                pricing,
+                index.num_clusters(),
+                estimator,
+                self.adaptive.recall_target,
+            );
+            (ranked, controller)
         };
         let mut routing_ns = routing_start.elapsed().as_nanos() as u64;
         let routing_before_scan = routing_ns;
@@ -2089,16 +2230,21 @@ impl<T: VectorElement> VectorBackend<T> {
             let Some(Candidate { sim, node }) = next else {
                 break;
             };
-            if scan.work_spent >= pricing.budget {
-                stats.termination = ProbeTermination::Ceiling;
+            if !controller.admit() {
                 break;
             }
             let cluster = node as usize;
-            let query_bound = scan
+            // The bounds gate needs the pessimistic kth so a skip never
+            // drops a true top-k row; APS takes the point estimate, since
+            // the pessimistic radius inflates the query ball and
+            // underestimates recall.
+            let kth = scan
                 .running_pessimistic_kth(top_n, QUANTIZED_BOUNDARY_KAPPA)
-                .map_or(QueryBound::Filling, |score| QueryBound::Armed {
-                    t: to_bound_space(metric, score.0 .0),
-                });
+                .map(|score| score.0 .0);
+            let aps_kth = scan.running_estimate_kth(top_n);
+            let query_bound = kth.map_or(QueryBound::Filling, |score| QueryBound::Armed {
+                t: to_bound_space(metric, score),
+            });
             let verdict = bounds_verdict(query_bound, || {
                 let QueryBound::Armed { t } = query_bound else {
                     return f32::INFINITY;
@@ -2126,11 +2272,12 @@ impl<T: VectorElement> VectorBackend<T> {
                 }
             });
             if verdict == Verdict::Skip {
-                scan.work_spent += pricing.open;
+                controller.charge_open();
+                controller.cover(aps_kth)?;
                 bounds_skips += 1;
                 continue;
             }
-            scan.work_spent += pricing.open;
+            controller.charge_open();
             let rows = index.cluster_range(cluster);
             let selection_start = Instant::now();
             let (selection, visited, pruned_filter, pruned_dead) = {
@@ -2151,6 +2298,7 @@ impl<T: VectorElement> VectorBackend<T> {
             if selected_count == 0 {
                 postings_skipped += 1;
                 stats.clusters_skipped_empty += 1;
+                controller.cover(aps_kth)?;
                 continue;
             }
 
@@ -2225,17 +2373,17 @@ impl<T: VectorElement> VectorBackend<T> {
                 &arithmetic_variances[..selected_count],
             );
             scan.finish_cluster_bound();
-            scan.work_spent += pricing.row * selected_count as f64;
+            controller.charge_rows(selected_count);
             stats.layer0_eligible += selected_count;
             stats.eligible_charged += selected_count;
             postings_row += 1;
-            if armed_probe.is_none()
-                && scan
-                    .running_pessimistic_kth(top_n, QUANTIZED_BOUNDARY_KAPPA)
-                    .is_some()
-            {
+            let kth = scan
+                .running_pessimistic_kth(top_n, QUANTIZED_BOUNDARY_KAPPA)
+                .map(|score| score.0 .0);
+            if armed_probe.is_none() && kth.is_some() {
                 armed_probe = Some((postings_row + postings_skipped - 1) as u32);
             }
+            controller.cover(scan.running_estimate_kth(top_n))?;
         }
         stats.record_routing(ranked.metrics());
         stats.postings_row += postings_row;
@@ -2244,7 +2392,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let layer0_scored = scan.candidates.len();
         stats.bounds_skips += bounds_skips;
         stats.record_bound_armed(armed_probe);
-        stats.work_charged += scan.work_spent.to_f32();
+        controller.finish(stats);
         drop(layer0_stage);
         let scan_ns = scan_start.elapsed().as_nanos() as u64;
         stats.routing_ns += routing_ns;
@@ -2581,10 +2729,31 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.scan_init_ns = stats.scan_init_ns.saturating_add(
             (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
         );
+        // The stacked router is told how many clusters this budget buys
+        // under the filter and the recall target; it drops to the fixed
+        // nprobe path itself when the dimension is past `APS_MAX_DIM`.
+        let routing = RoutingParams {
+            k: self.adaptive.router_k(
+                work_budget,
+                x,
+                filter.match_fraction(max_doc),
+                num_centroids,
+            ),
+            recall: self.adaptive.router_recall_target,
+        };
         let routing_start = Instant::now();
-        let mut ranked = {
+        let (mut ranked, controller) = {
             let _routing_stage = enter_vector_stage(Stage::Routing);
-            index.rank_clusters(&mut routing_ws, &query_f32)
+            let ranked = index.rank_clusters(&mut routing_ws, &query_f32, routing);
+            let estimator =
+                index.recall_estimator(&ranked, &query_f32, self.adaptive.recall_target);
+            let controller = ProbeController::new(
+                pricing,
+                num_centroids,
+                estimator,
+                self.adaptive.recall_target,
+            );
+            (ranked, controller)
         };
         let mut routing_ns = routing_start.elapsed().as_nanos() as u64;
         let routing_before_scan = routing_ns;
@@ -2594,7 +2763,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let topn = self.scan_clusters(
             index,
             &mut ranked,
-            pricing,
+            controller,
             filter.docs(),
             alive,
             top_n,
@@ -2658,7 +2827,7 @@ impl<T: VectorElement> VectorBackend<T> {
         &self,
         index: &IvfIndex,
         ranked: &mut impl Iterator<Item = Candidate>,
-        pricing: UnitPricing,
+        mut controller: ProbeController<'_>,
         filter: Option<&BitSet>,
         alive: Option<&AliveBitSet>,
         top_n: usize,
@@ -2684,7 +2853,6 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut postings_row = 0usize;
         let mut postings_skipped = 0usize;
         let mut bounds_skips = 0u32;
-        let mut termination = ProbeTermination::Exhausted;
         // P2: the query bound, maintained at cluster boundaries. The
         // bound-space conversion runs on kth improvement only, inside the
         // tracker.
@@ -2697,9 +2865,8 @@ impl<T: VectorElement> VectorBackend<T> {
         // The probed cluster's gate survivors; allocated once, reused
         // across clusters.
         let mut survivors: Vec<Survivor> = Vec::new();
-        // f64 accumulation in the loop; f32 only at the telemetry fold.
-        let mut work_spent = WorkUnits::ZERO;
-        let work_budget = pricing.budget;
+        // The heap's kth after the last covered cluster.
+        let mut kth: Option<Score> = None;
 
         loop {
             let routing_start = Instant::now();
@@ -2711,11 +2878,7 @@ impl<T: VectorElement> VectorBackend<T> {
             let Some(Candidate { sim, node: cluster }) = next else {
                 break;
             };
-            // Boundary rule: open iff remaining > 0. The tripping pull
-            // proves another ranked cluster existed, keeping `Ceiling`
-            // distinct from `Exhausted`.
-            if work_spent >= work_budget {
-                termination = ProbeTermination::Ceiling;
+            if !controller.admit() {
                 break;
             }
             let cluster = cluster as usize;
@@ -2765,13 +2928,14 @@ impl<T: VectorElement> VectorBackend<T> {
                 // A skip charges the open share: skips are search work,
                 // and free skips break the work identity (validated to
                 // +-0.03% in benchmarks). No row work is spent.
-                work_spent += pricing.open;
+                controller.charge_open();
+                controller.cover(kth)?;
                 bounds_skips += 1;
                 continue;
             }
 
             // Event-wise charging, part 1: the open.
-            work_spent += pricing.open;
+            controller.charge_open();
 
             let rows = index.cluster_range(cluster);
 
@@ -2784,7 +2948,7 @@ impl<T: VectorElement> VectorBackend<T> {
             // Event-wise charging, part 2: the rows that survive the
             // pre-pass — exactly the rows fetched and scored below.
             // Rejected and deduped rows charge nothing.
-            work_spent += pricing.row * scored_rows as f64;
+            controller.charge_rows(scored_rows);
 
             if survivors.is_empty() {
                 postings_skipped += 1;
@@ -2814,8 +2978,9 @@ impl<T: VectorElement> VectorBackend<T> {
             // only drops already-lost entries and tightens the push
             // threshold, which prunes pushes, not scoring).
             let probe_idx = (postings_row + postings_skipped - 1) as u32;
-            let peek = HeapPeek::from_kth(topn.kth_best().map(|(score, _tie)| score));
-            bound_tracker.observe(metric, peek, probe_idx);
+            kth = topn.kth_best().map(|(score, _tie)| score);
+            bound_tracker.observe(metric, HeapPeek::from_kth(kth), probe_idx);
+            controller.cover(kth)?;
         }
         // The armed index exists exactly when the bound armed.
         debug_assert!(
@@ -2831,8 +2996,7 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.candidates_scored += candidates;
         stats.bounds_skips += bounds_skips;
         stats.record_bound_armed(bound_tracker.armed_at_probe());
-        stats.termination = termination;
-        stats.work_charged += work_spent.to_f32();
+        controller.finish(stats);
         #[cfg(test)]
         {
             stats.quantized_trace.scored_docs.sort_unstable();
@@ -2903,6 +3067,14 @@ impl SegmentFilter {
         match self {
             SegmentFilter::All => None,
             SegmentFilter::Docs(filter) => Some(filter),
+        }
+    }
+
+    /// The share of doc ids below `max_doc` that match.
+    fn match_fraction(&self, max_doc: DocId) -> f64 {
+        match self {
+            SegmentFilter::All => 1.0,
+            SegmentFilter::Docs(filter) => filter.len() as f64 / f64::from(max_doc.max(1)),
         }
     }
 }
@@ -4158,7 +4330,7 @@ mod tests {
         };
         let (_, stats) = run_top_n(&index, embed_field, vec![10.0, 10.0], 3, params)?;
         assert_eq!(stats.termination, ProbeTermination::Ceiling);
-        // Stopped at exactly the cap, short of the ranked list.
+        // Stopped at exactly the cap.
         assert_eq!(stats.clusters_probed(), 1);
         assert_eq!(
             stats.vectors_visited,
@@ -4544,15 +4716,144 @@ mod tests {
         Ok(())
     }
 
+    /// The controller stops at the first pull after the estimate reaches
+    /// the target; clusters covered while the heap fills carry no estimate
+    /// but still count once it arms.
+    #[test]
+    fn probe_controller_stops_at_recall_target() {
+        let pricing = UnitPricing {
+            budget: WorkUnits::new(100.0),
+            open: WorkUnits::new(0.5),
+            row: WorkUnits::new(0.01),
+        };
+        let query = [0.1f32, 0.0];
+        let centroids = [[0.0f32, 0.0], [2.0, 0.0], [0.0, 2.0]];
+        let rows: Vec<&[f32]> = centroids.iter().map(|row| &row[..]).collect();
+        let estimator = RecallEstimator::from_rows(&query, rows, Metric::L2);
+        let mut controller = ProbeController::new(pricing, centroids.len(), Some(estimator), 0.5);
+
+        assert!(controller.admit());
+        controller.cover(None).unwrap();
+        assert!(controller.admit(), "no estimate while the heap fills");
+        // A ball of radius 0.2 lies inside the nearest cell.
+        controller.cover(Some(-(0.2f32 * 0.2))).unwrap();
+        assert!(!controller.admit());
+
+        let mut stats = ProbeStats::default();
+        controller.finish(&mut stats);
+        assert_eq!(stats.termination, ProbeTermination::RecallTarget);
+        assert!(stats
+            .recall_estimate
+            .is_some_and(|estimate| estimate >= 0.5));
+    }
+
+    /// A stacked segment with a loose recall target stops on the estimate
+    /// before the (exhaustive) budget binds; target `1.0` leaves APS off.
+    #[test]
+    fn probe_stats_recall_target_stops_before_budget() -> crate::Result<()> {
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .vector_storage_format(VectorStorageFormat::Ivf)
+            .build()?;
+        let params = |recall_target| AdaptiveProbeParams {
+            max_probe_fraction: 1.0,
+            min_probe_clusters: 1,
+            recall_target,
+            ..Default::default()
+        };
+
+        let (_, aps) = run_top_n(
+            &index.index,
+            index.embedding_field(),
+            vec![0.0_f32, 0.0],
+            3,
+            params(0.5),
+        )?;
+        assert_eq!(aps.termination, ProbeTermination::RecallTarget, "{aps:?}");
+        assert!(
+            aps.recall_estimate.is_some_and(|estimate| estimate >= 0.5),
+            "{aps:?}"
+        );
+
+        let (_, off) = run_top_n(
+            &index.index,
+            index.embedding_field(),
+            vec![0.0_f32, 0.0],
+            3,
+            params(1.0),
+        )?;
+        assert_ne!(off.termination, ProbeTermination::RecallTarget, "{off:?}");
+        assert_eq!(off.recall_estimate, None, "{off:?}");
+        assert!(aps.work_charged < off.work_charged, "{aps:?} {off:?}");
+        assert_eq!(aps.work_budget, off.work_budget, "{aps:?} {off:?}");
+        assert!(aps.work_charged < aps.work_budget, "{aps:?}");
+        Ok(())
+    }
+
+    /// Dot has no query ball, so a stacked segment ignores the recall
+    /// target and scans to its budget.
+    #[test]
+    fn probe_stats_recall_target_ignored_for_dot() -> crate::Result<()> {
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .vector_storage_format(VectorStorageFormat::Ivf)
+            .metric(Metric::Dot)
+            .build()?;
+        let (_, stats) = run_top_n(
+            &index.index,
+            index.embedding_field(),
+            vec![1.0_f32, 0.0],
+            3,
+            AdaptiveProbeParams {
+                max_probe_fraction: 1.0,
+                min_probe_clusters: 1,
+                recall_target: 0.5,
+                ..Default::default()
+            },
+        )?;
+        assert_ne!(
+            stats.termination,
+            ProbeTermination::RecallTarget,
+            "{stats:?}"
+        );
+        assert_eq!(stats.recall_estimate, None, "{stats:?}");
+        Ok(())
+    }
+
+    /// APS is stacked-only: other routers ignore the recall target.
+    #[test]
+    fn probe_stats_recall_target_ignored_without_stacked_router() -> crate::Result<()> {
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .vector_storage_format(VectorStorageFormat::Ivf)
+            .router(RouterKind::Exact)
+            .build()?;
+        let (_, stats) = run_top_n(
+            &index.index,
+            index.embedding_field(),
+            vec![0.0_f32, 0.0],
+            3,
+            AdaptiveProbeParams {
+                max_probe_fraction: 1.0,
+                min_probe_clusters: 1,
+                recall_target: 0.5,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(stats.termination, ProbeTermination::Exhausted, "{stats:?}");
+        assert_eq!(stats.recall_estimate, None, "{stats:?}");
+        Ok(())
+    }
+
     /// A budget below capacity binds, is attributed to the ceiling, and
     /// overshoots by at most one cluster's charge - the boundary rule on
     /// a real fixture rather than a hand-built one. The distance-ratio
     /// gate is parked (floor unreachable), so the stop point under test
-    /// is the budget's alone.
+    /// is the budget's alone. The exact router ranks every cluster; the
+    /// stacked router caps its ranking at `router_k`, which on this
+    /// fixture's empty clusters can run out before the budget binds.
     #[test]
     fn probe_stats_max_probe_fraction_ceiling() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
             .vector_storage_format(VectorStorageFormat::Ivf)
+            .router(RouterKind::Exact)
             .build()?;
         let params = AdaptiveProbeParams {
             max_probe_fraction: 0.2,
@@ -4576,6 +4877,10 @@ mod tests {
             params,
         )?;
         assert_eq!(stats.termination, ProbeTermination::Ceiling);
+        assert!(
+            (stats.work_budget as f64 - budget).abs() <= 1e-6 * budget,
+            "the resolved budget is recorded: {stats:?}"
+        );
         assert!(
             stats.clusters_probed() < clusters,
             "the budget must bind before exhaustion: {stats:?}"
@@ -4619,6 +4924,7 @@ mod tests {
             bounds_skips: 2,
             termination: ProbeTermination::Ceiling,
             work_charged: 1.75,
+            work_budget: 1.5,
             segment_rows: Some(100),
             segment_clusters: Some(5),
             ..Default::default()
@@ -4680,6 +4986,7 @@ mod tests {
                 "bound_armed_probe_sum": 1,
                 "termination": "Ceiling",
                 "work_charged": 1.75,
+                "work_budget": 1.5,
                 "segment_rows": 100,
                 "segment_clusters": 5
             })
@@ -4713,6 +5020,29 @@ mod tests {
             scan.pessimistic_kth(2, 2.0),
             Some(Threshold(LowerEndpoint(7.0)))
         );
+    }
+
+    /// The APS kth is the lowest point estimate in the lower-endpoint
+    /// top-k: above the pessimistic kth, and never above the true k-th
+    /// best estimate.
+    #[test]
+    fn running_estimate_kth_bounds_the_kth_estimate() {
+        let mut scan = QuantizedScanCtx::new(3, 3);
+        assert_eq!(scan.running_estimate_kth(2), None);
+        scan.begin_cluster(2);
+        // Lower endpoints at kappa 2: 10, 7, 4. The top-2 by lower endpoint
+        // is rows 0 and 1; the top-2 by estimate is rows 2 and 0.
+        for (row, score, sigma) in [(0, 10.0, 0.0), (1, 9.0, 1.0), (2, 12.0, 4.0)] {
+            push_test_candidate(&mut scan, row, row as DocId, score, sigma);
+        }
+        scan.finish_cluster_bound_with_kappa(2.0);
+
+        assert_eq!(
+            scan.running_pessimistic_kth(2, 2.0),
+            Some(Threshold(LowerEndpoint(7.0)))
+        );
+        assert_eq!(scan.running_estimate_kth(2), Some(9.0));
+        assert_eq!(scan.running_estimate_kth(4), None);
     }
 
     #[test]

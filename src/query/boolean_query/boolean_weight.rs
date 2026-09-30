@@ -714,6 +714,139 @@ mod tests {
     use crate::Bm25Params;
 
     #[test]
+    fn test_shared_conjunction_norms_match_exhaustive() -> crate::Result<()> {
+        use crate::query::{BoostQuery, EnableScoring, Query, QueryParser};
+        use crate::schema::{Schema, TEXT};
+        use crate::{Index, Score, TERMINATED};
+
+        for pnorms in [false, true] {
+            let mut schema = Schema::builder();
+            let options = TEXT.set_indexing_options(
+                TEXT.get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_pnorms(pnorms),
+            );
+            let field = schema.add_text_field("text", options.clone());
+            let other = schema.add_text_field("other", options);
+            let index = Index::create_in_ram(schema.build());
+            let mut writer = index.writer_for_tests()?;
+            writer.set_merge_policy(Box::new(crate::merge_policy::NoMergePolicy));
+            let mut seed = 71u32;
+            for ordinal in 0..10000 {
+                let len = if ordinal < 32 { 4 } else { 1 + ordinal % 160 };
+                let mut text = String::new();
+                for _ in 0..len {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    text.push_str(["a ", "b ", "c ", "x ", "1 ", "2 "][(seed >> 24) as usize % 6]);
+                }
+                writer.add_document(
+                    doc!(field => text, other => if ordinal % 3 == 0 { "a" } else { "x a b" }),
+                )?;
+            }
+            writer.commit()?;
+            drop(writer);
+            let searcher = index.reader()?.searcher();
+            let parser = QueryParser::for_index(&index, vec![field]);
+            let reader = searcher.segment_reader(0);
+            let term_query = parser.parse_query("a")?;
+            let scored = term_query
+                .weight(EnableScoring::enabled_from_searcher(&searcher))?
+                .scorer(reader, 1.0)?;
+            let unscored = term_query
+                .weight(EnableScoring::disabled_from_searcher(&searcher))?
+                .scorer(reader, 1.0)?;
+            let other_field = parser
+                .parse_query("other:a")?
+                .weight(EnableScoring::enabled_from_searcher(&searcher))?
+                .scorer(reader, 1.0)?;
+            let scored = scored.downcast_ref::<TermScorer>().unwrap();
+            assert!(scored.shares_fieldnorms_with(scored));
+            assert!(!scored.shares_fieldnorms_with(unscored.downcast_ref::<TermScorer>().unwrap()));
+            assert!(
+                !scored.shares_fieldnorms_with(other_field.downcast_ref::<TermScorer>().unwrap())
+            );
+            let queries = [
+                "a AND b",
+                "a AND b AND c",
+                "a AND other:b",
+                "a AND other:b AND c",
+                "a^2.5 AND b^0.5",
+            ]
+            .into_iter()
+            .map(|expression| Ok((expression, parser.parse_query(expression)?)))
+            .collect::<crate::Result<Vec<_>>>()?;
+            for (expression, parsed) in queries {
+                for boost in [0.0, 1.0, 2.5] {
+                    let query = BoostQuery::new(parsed.box_clone(), boost);
+                    for mode in [
+                        DisjunctionPruning::Auto,
+                        DisjunctionPruning::BlockMaxScore,
+                        DisjunctionPruning::BlockWand,
+                    ] {
+                        let weight = query.weight(
+                            EnableScoring::enabled_from_searcher(&searcher)
+                                .with_disjunction_pruning(mode),
+                        )?;
+                        for reader in searcher.segment_readers() {
+                            let mut baseline = weight.scorer(reader, 1.0)?;
+                            let mut expected = Vec::new();
+                            while baseline.doc() != TERMINATED {
+                                expected.push((baseline.doc(), baseline.score()));
+                                baseline.advance();
+                            }
+                            if boost == 1.0 && mode == DisjunctionPruning::Auto {
+                                let disabled = query
+                                    .weight(EnableScoring::disabled_from_searcher(&searcher))?;
+                                let mut docs = Vec::new();
+                                disabled.for_each_no_score(reader, &mut |block| {
+                                    docs.extend_from_slice(block);
+                                })?;
+                                assert_eq!(docs, expected.iter().map(|v| v.0).collect::<Vec<_>>());
+                            }
+                            let all = expected
+                                .iter()
+                                .copied()
+                                .collect::<std::collections::HashMap<_, _>>();
+                            expected
+                                .sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                            for top_k in [1, 3, 10, 50] {
+                                let mut actual: Vec<(u32, Score)> = Vec::new();
+                                weight.for_each_pruning(
+                                    Score::MIN,
+                                    reader,
+                                    &mut |doc, score| {
+                                        assert!((score - all[&doc]).abs() <= 1e-5);
+                                        actual.push((doc, score));
+                                        actual.sort_unstable_by(|a, b| {
+                                            b.1.total_cmp(&a.1).then(a.0.cmp(&b.0))
+                                        });
+                                        actual.truncate(top_k);
+                                        if actual.len() == top_k {
+                                            actual.last().unwrap().1
+                                        } else {
+                                            Score::MIN
+                                        }
+                                    },
+                                )?;
+                                assert_eq!(actual.len(), expected.len().min(top_k));
+                                for (actual, expected) in actual.iter().zip(&expected) {
+                                    assert!(
+                                        (actual.1 - expected.1).abs() <= 1e-5,
+                                        "{expression}, boost={boost}, {mode:?}, pnorms={pnorms}, \
+                                         k={top_k}: {actual:?} != {expected:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_disjunction_pruning_overrides_cutoffs() {
         for (term_count, doc_freq, max_doc, auto_maxscore) in [
             (2, 1, 1_024, false),

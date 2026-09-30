@@ -1,34 +1,102 @@
 use std::io::{self, Read, Write};
-use std::sync::Arc;
+use std::ops::Range;
+use std::sync::{Arc, OnceLock};
 
-use common::{BinarySerializable, FixedSize, OwnedBytes};
+use common::file_slice::FileSlice;
+use common::{BinarySerializable, FixedSize, HasLen, OwnedBytes};
 use tantivy_bitpacker::{BitPacker, compute_num_bits};
 use tantivy_fst::raw::Fst;
+use tantivy_fst::raw::paged::{PagedFst, ReadBytes};
 use tantivy_fst::{Automaton, IntoStreamer, Map, Streamer};
 
 use super::{BlockAddr, BlockStartAddr};
+use crate::TermOrdinal;
 use crate::block_match_automaton::can_block_match_automaton;
-use crate::{SSTableDataCorruption, TermOrdinal};
 
 #[derive(Debug, Clone)]
 pub struct SSTableIndexV3 {
-    fst_index: Arc<Map<OwnedBytes>>,
+    fst_index: Arc<FstIndex>,
     block_addr_store: BlockAddrStore,
+}
+
+#[derive(Debug)]
+struct FstBytes(FileSlice);
+
+impl ReadBytes for FstBytes {
+    type Bytes = OwnedBytes;
+    fn num_bytes(&self) -> usize {
+        self.0.len()
+    }
+    fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+        self.0.read_bytes_slice(range)
+    }
+}
+
+#[derive(Debug)]
+struct FstIndex {
+    file: FileSlice,
+    paged: Option<PagedFst<FstBytes>>,
+    resident: OnceLock<Map<OwnedBytes>>,
+}
+
+impl FstIndex {
+    fn open(file: FileSlice) -> io::Result<Self> {
+        let paged = if file.as_slice().is_none() {
+            Some(PagedFst::new(FstBytes(file.clone()))?)
+        } else {
+            None
+        };
+        let index = Self {
+            file,
+            paged,
+            resident: OnceLock::new(),
+        };
+        if index.paged.is_none() {
+            index.resident()?;
+        }
+        Ok(index)
+    }
+
+    fn lower_bound(&self, key: &[u8]) -> io::Result<Option<u64>> {
+        if let Some(resident) = self.resident.get() {
+            return Ok(resident
+                .range()
+                .ge(key)
+                .into_stream()
+                .next()
+                .map(|(_, id)| id));
+        }
+        Ok(self
+            .paged
+            .as_ref()
+            .unwrap()
+            .lower_bound(key)?
+            .map(|out| out.value()))
+    }
+
+    // Automaton routing already visits the entire FST; retain the existing full-scan reader.
+    fn resident(&self) -> io::Result<&Map<OwnedBytes>> {
+        if self.resident.get().is_none() {
+            let fst = Fst::new(self.file.read_bytes()?)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let _ = self.resident.set(fst.into());
+        }
+        Ok(self.resident.get().unwrap())
+    }
 }
 
 impl SSTableIndexV3 {
     /// Load an index from its binary representation
-    pub fn load(
-        data: OwnedBytes,
-        fst_length: u64,
-    ) -> Result<SSTableIndexV3, SSTableDataCorruption> {
+    pub fn load(data: FileSlice, fst_length: u64) -> io::Result<SSTableIndexV3> {
+        if fst_length as usize > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid FST length",
+            ));
+        }
         let (fst_slice, block_addr_store_slice) = data.split(fst_length as usize);
-        let fst_index = Fst::new(fst_slice)
-            .map_err(|_| SSTableDataCorruption)?
-            .into();
-        let block_addr_store =
-            BlockAddrStore::open(block_addr_store_slice).map_err(|_| SSTableDataCorruption)?;
-
+        let fst_index = FstIndex::open(fst_slice)?;
+        let block_addr_store = BlockAddrStore::open(block_addr_store_slice)?;
         Ok(SSTableIndexV3 {
             fst_index: Arc::new(fst_index),
             block_addr_store,
@@ -36,56 +104,51 @@ impl SSTableIndexV3 {
     }
 
     /// Get the [`BlockAddr`] of the requested block.
-    pub(crate) fn get_block(&self, block_id: u64) -> Option<BlockAddr> {
+    pub(crate) fn get_block(&self, block_id: u64) -> io::Result<Option<BlockAddr>> {
         self.block_addr_store.get(block_id)
     }
 
     /// Get the block id of the block that would contain `key`.
     ///
     /// Returns None if `key` is lexicographically after the last key recorded.
-    pub(crate) fn locate_with_key(&self, key: &[u8]) -> Option<u64> {
-        self.fst_index
-            .range()
-            .ge(key)
-            .into_stream()
-            .next()
-            .map(|(_key, id)| id)
+    pub(crate) fn locate_with_key(&self, key: &[u8]) -> io::Result<Option<u64>> {
+        self.fst_index.lower_bound(key)
     }
 
-    /// Get the [`BlockAddr`] of the block that would contain `key`.
-    ///
-    /// Returns None if `key` is lexicographically after the last key recorded.
-    pub fn get_block_with_key(&self, key: &[u8]) -> Option<BlockAddr> {
-        self.locate_with_key(key).and_then(|id| self.get_block(id))
+    pub fn get_block_with_key(&self, key: &[u8]) -> io::Result<Option<BlockAddr>> {
+        match self.locate_with_key(key)? {
+            Some(id) => self.get_block(id),
+            None => Ok(None),
+        }
     }
 
-    pub(crate) fn locate_with_ord(&self, ord: TermOrdinal) -> u64 {
-        self.block_addr_store.binary_search_ord(ord).0
+    pub(crate) fn locate_with_ord(&self, ord: TermOrdinal) -> io::Result<u64> {
+        Ok(self.block_addr_store.binary_search_ord(ord)?.0)
     }
 
     /// Get the [`BlockAddr`] of the block containing the `ord`-th term.
-    pub(crate) fn get_block_with_ord(&self, ord: TermOrdinal) -> BlockAddr {
-        self.block_addr_store.binary_search_ord(ord).1
+    pub(crate) fn get_block_with_ord(&self, ord: TermOrdinal) -> io::Result<BlockAddr> {
+        Ok(self.block_addr_store.binary_search_ord(ord)?.1)
     }
 
-    pub(crate) fn get_and_locate_with_ord(&self, ord: TermOrdinal) -> (BlockAddr, u64) {
-        let (location, block_addr) = self.block_addr_store.binary_search_ord(ord);
-        (block_addr, location)
+    pub(crate) fn get_and_locate_with_ord(&self, ord: TermOrdinal) -> io::Result<(BlockAddr, u64)> {
+        let (location, block_addr) = self.block_addr_store.binary_search_ord(ord)?;
+        Ok((block_addr, location))
     }
 
     pub(crate) fn get_block_for_automaton<'a>(
         &'a self,
         automaton: &'a impl Automaton,
-    ) -> impl Iterator<Item = (u64, BlockAddr)> + 'a {
+    ) -> io::Result<impl Iterator<Item = io::Result<(u64, BlockAddr)>> + 'a> {
         // this is more complicated than other index formats: we don't have a ready made list of
         // blocks, and instead need to stream-decode the sstable.
 
-        GetBlockForAutomaton {
-            streamer: self.fst_index.stream(),
+        Ok(GetBlockForAutomaton {
+            streamer: self.fst_index.resident()?.stream(),
             block_addr_store: &self.block_addr_store,
             prev_key: None,
             automaton,
-        }
+        })
     }
 }
 
@@ -104,7 +167,7 @@ struct GetBlockForAutomaton<'a, A: Automaton> {
 }
 
 impl<A: Automaton> Iterator for GetBlockForAutomaton<'_, A> {
-    type Item = (u64, BlockAddr);
+    type Item = io::Result<(u64, BlockAddr)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some((new_key, block_id)) = self.streamer.next() {
@@ -112,14 +175,22 @@ impl<A: Automaton> Iterator for GetBlockForAutomaton<'_, A> {
                 if can_block_match_automaton(Some(prev_key), new_key, self.automaton) {
                     prev_key.clear();
                     prev_key.extend_from_slice(new_key);
-                    return Some((block_id, self.block_addr_store.get(block_id).unwrap()));
+                    return Some(
+                        self.block_addr_store
+                            .get(block_id)
+                            .map(|addr| (block_id, addr.unwrap())),
+                    );
                 }
                 prev_key.clear();
                 prev_key.extend_from_slice(new_key);
             } else {
                 self.prev_key = Some(new_key.to_owned());
                 if can_block_match_automaton(None, new_key, self.automaton) {
-                    return Some((block_id, self.block_addr_store.get(block_id).unwrap()));
+                    return Some(
+                        self.block_addr_store
+                            .get(block_id)
+                            .map(|addr| (block_id, addr.unwrap())),
+                    );
                 }
             }
         }
@@ -335,68 +406,82 @@ impl FixedSize for BlockAddrBlockMetadata {
 
 #[derive(Debug, Clone)]
 struct BlockAddrStore {
-    block_meta_bytes: OwnedBytes,
-    addr_bytes: OwnedBytes,
+    block_meta_bytes: FileSlice,
+    addr_bytes: FileSlice,
 }
 
 impl BlockAddrStore {
-    fn open(term_info_store_file: OwnedBytes) -> io::Result<BlockAddrStore> {
-        let (mut len_slice, main_slice) = term_info_store_file.split(8);
-        let len = u64::deserialize(&mut len_slice)? as usize;
+    fn open(file: FileSlice) -> io::Result<Self> {
+        if file.len() < 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated block address store",
+            ));
+        }
+        let (len_slice, main_slice) = file.split(8);
+        let len = u64::deserialize(&mut len_slice.read_bytes()?)? as usize;
+        if len > main_slice.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid block metadata length",
+            ));
+        }
         let (block_meta_bytes, addr_bytes) = main_slice.split(len);
-        Ok(BlockAddrStore {
+        Ok(Self {
             block_meta_bytes,
             addr_bytes,
         })
     }
 
-    fn get_block_meta(&self, store_block_id: usize) -> Option<BlockAddrBlockMetadata> {
-        let mut block_data: &[u8] = self
-            .block_meta_bytes
-            .get(store_block_id * BlockAddrBlockMetadata::SIZE_IN_BYTES..)?;
-        BlockAddrBlockMetadata::deserialize(&mut block_data).ok()
+    fn get_block_meta(&self, id: usize) -> io::Result<Option<BlockAddrBlockMetadata>> {
+        let start = id * BlockAddrBlockMetadata::SIZE_IN_BYTES;
+        let end = start + BlockAddrBlockMetadata::SIZE_IN_BYTES;
+        if end > self.block_meta_bytes.len() {
+            return Ok(None);
+        }
+        let mut bytes = self.block_meta_bytes.read_bytes_slice(start..end)?;
+        BlockAddrBlockMetadata::deserialize(&mut bytes).map(Some)
     }
 
-    fn get(&self, block_id: u64) -> Option<BlockAddr> {
-        let store_block_id = (block_id as usize) / STORE_BLOCK_LEN;
-        let inner_offset = (block_id as usize) % STORE_BLOCK_LEN;
-        let block_addr_block_data = self.get_block_meta(store_block_id)?;
-        block_addr_block_data.deserialize_block_addr(
-            &self.addr_bytes[block_addr_block_data.offset as usize..],
-            inner_offset,
-        )
+    fn block_bytes(&self, meta: &BlockAddrBlockMetadata) -> io::Result<OwnedBytes> {
+        let start = meta.offset as usize;
+        let len = (meta.block_len as usize * meta.num_bits() as usize
+            + meta.range_start_nbits as usize)
+            .div_ceil(8);
+        self.addr_bytes.read_bytes_slice(start..start + len)
     }
 
-    fn binary_search_ord(&self, ord: TermOrdinal) -> (u64, BlockAddr) {
-        let max_block =
-            (self.block_meta_bytes.len() / BlockAddrBlockMetadata::SIZE_IN_BYTES) as u64;
-        let get_first_ordinal = |block_id| {
-            // we can unwrap because block_id < max_block
-            self.get(block_id * STORE_BLOCK_LEN as u64)
+    fn get(&self, block_id: u64) -> io::Result<Option<BlockAddr>> {
+        let Some(meta) = self.get_block_meta(block_id as usize / STORE_BLOCK_LEN)? else {
+            return Ok(None);
+        };
+        let bytes = self.block_bytes(&meta)?;
+        Ok(meta.deserialize_block_addr(&bytes, block_id as usize % STORE_BLOCK_LEN))
+    }
+
+    fn binary_search_ord(&self, ord: TermOrdinal) -> io::Result<(u64, BlockAddr)> {
+        let mut left = 0;
+        let mut right = self.block_meta_bytes.len() / BlockAddrBlockMetadata::SIZE_IN_BYTES;
+        while left < right {
+            let mid = left + (right - left) / 2;
+            if self
+                .get_block_meta(mid)?
                 .unwrap()
+                .ref_block_addr
                 .first_ordinal
-        };
-        let store_block_id =
-            binary_search(max_block, |block_id| get_first_ordinal(block_id).cmp(&ord));
-        let store_block_id = match store_block_id {
-            Ok(store_block_id) => {
-                let block_id = store_block_id * STORE_BLOCK_LEN as u64;
-                // we can unwrap because store_block_id < max_block
-                return (block_id, self.get(block_id).unwrap());
+                <= ord
+            {
+                left = mid + 1;
+            } else {
+                right = mid;
             }
-            Err(store_block_id) => store_block_id - 1,
-        };
-
-        // we can unwrap because store_block_id < max_block
-        let block_addr_block_data = self.get_block_meta(store_block_id as usize).unwrap();
-        let (inner_offset, block_addr) = block_addr_block_data.bisect_for_ord(
-            &self.addr_bytes[block_addr_block_data.offset as usize..],
-            ord,
-        );
-        (
-            store_block_id * STORE_BLOCK_LEN as u64 + inner_offset,
-            block_addr,
-        )
+        }
+        let id = left.saturating_sub(1);
+        let meta = self.get_block_meta(id)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "empty block address store")
+        })?;
+        let (offset, addr) = meta.bisect_for_ord(&self.block_bytes(&meta)?, ord);
+        Ok((id as u64 * STORE_BLOCK_LEN as u64 + offset, addr))
     }
 }
 
@@ -597,12 +682,11 @@ fn find_best_slope(elements: impl Iterator<Item = (usize, u64)> + Clone) -> (u32
 
 #[cfg(test)]
 mod tests {
-    use common::OwnedBytes;
 
     use super::*;
+    use crate::SSTableIndexBuilder;
     use crate::block_match_automaton::tests::EqBuffer;
     use crate::index::BlockMeta;
-    use crate::{SSTableDataCorruption, SSTableIndexBuilder};
 
     #[test]
     fn test_sstable_index() {
@@ -613,27 +697,26 @@ mod tests {
         sstable_builder.add_block(b"dddd", 40..50, 15u64);
         let mut buffer: Vec<u8> = Vec::new();
         let fst_len = sstable_builder.serialize(&mut buffer).unwrap();
-        let buffer = OwnedBytes::new(buffer);
-        let sstable_index = SSTableIndexV3::load(buffer, fst_len).unwrap();
+        let sstable_index = SSTableIndexV3::load(FileSlice::from(buffer), fst_len).unwrap();
         assert_eq!(
-            sstable_index.get_block_with_key(b"bbbde"),
+            sstable_index.get_block_with_key(b"bbbde").unwrap(),
             Some(BlockAddr {
                 first_ordinal: 10u64,
                 byte_range: 30..40
             })
         );
 
-        assert_eq!(sstable_index.locate_with_key(b"aa").unwrap(), 0);
-        assert_eq!(sstable_index.locate_with_key(b"aaa").unwrap(), 0);
-        assert_eq!(sstable_index.locate_with_key(b"aab").unwrap(), 1);
-        assert_eq!(sstable_index.locate_with_key(b"ccc").unwrap(), 2);
-        assert!(sstable_index.locate_with_key(b"e").is_none());
+        assert_eq!(sstable_index.locate_with_key(b"aa").unwrap().unwrap(), 0);
+        assert_eq!(sstable_index.locate_with_key(b"aaa").unwrap().unwrap(), 0);
+        assert_eq!(sstable_index.locate_with_key(b"aab").unwrap().unwrap(), 1);
+        assert_eq!(sstable_index.locate_with_key(b"ccc").unwrap().unwrap(), 2);
+        assert!(sstable_index.locate_with_key(b"e").unwrap().is_none());
 
-        assert_eq!(sstable_index.locate_with_ord(0), 0);
-        assert_eq!(sstable_index.locate_with_ord(1), 0);
-        assert_eq!(sstable_index.locate_with_ord(4), 0);
-        assert_eq!(sstable_index.locate_with_ord(5), 1);
-        assert_eq!(sstable_index.locate_with_ord(100), 3);
+        assert_eq!(sstable_index.locate_with_ord(0).unwrap(), 0);
+        assert_eq!(sstable_index.locate_with_ord(1).unwrap(), 0);
+        assert_eq!(sstable_index.locate_with_ord(4).unwrap(), 0);
+        assert_eq!(sstable_index.locate_with_ord(5).unwrap(), 1);
+        assert_eq!(sstable_index.locate_with_ord(100).unwrap(), 3);
     }
 
     #[test]
@@ -646,9 +729,10 @@ mod tests {
         let mut buffer: Vec<u8> = Vec::new();
         let fst_len = sstable_builder.serialize(&mut buffer).unwrap();
         buffer[2] = 9u8;
-        let buffer = OwnedBytes::new(buffer);
-        let data_corruption_err = SSTableIndexV3::load(buffer, fst_len).err().unwrap();
-        assert!(matches!(data_corruption_err, SSTableDataCorruption));
+        let data_corruption_err = SSTableIndexV3::load(FileSlice::from(buffer), fst_len)
+            .err()
+            .unwrap();
+        assert_eq!(data_corruption_err.kind(), io::ErrorKind::InvalidData);
     }
 
     //    use proptest::prelude::*;
@@ -695,11 +779,13 @@ mod tests {
             .serialize(&mut sstable_index_bytes)
             .unwrap();
 
-        let sstable = SSTableIndexV3::load(OwnedBytes::new(sstable_index_bytes), fst_len).unwrap();
+        let sstable = SSTableIndexV3::load(FileSlice::from(sstable_index_bytes), fst_len).unwrap();
 
         let res = sstable
             .get_block_for_automaton(&EqBuffer(vec![0, 1, 1]))
-            .collect::<Vec<_>>();
+            .unwrap()
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
         assert_eq!(
             res,
             vec![(
@@ -712,7 +798,9 @@ mod tests {
         );
         let res = sstable
             .get_block_for_automaton(&EqBuffer(vec![0, 2, 1]))
-            .collect::<Vec<_>>();
+            .unwrap()
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
         assert_eq!(
             res,
             vec![(
@@ -725,7 +813,9 @@ mod tests {
         );
         let res = sstable
             .get_block_for_automaton(&EqBuffer(vec![0, 3, 1]))
-            .collect::<Vec<_>>();
+            .unwrap()
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
         assert_eq!(
             res,
             vec![(
@@ -738,13 +828,17 @@ mod tests {
         );
         let res = sstable
             .get_block_for_automaton(&EqBuffer(vec![0, 4, 1]))
-            .collect::<Vec<_>>();
+            .unwrap()
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
         assert!(res.is_empty());
 
         let complex_automaton = EqBuffer(vec![0, 1, 1]).union(EqBuffer(vec![0, 3, 1]));
         let res = sstable
             .get_block_for_automaton(&complex_automaton)
-            .collect::<Vec<_>>();
+            .unwrap()
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
         assert_eq!(
             res,
             vec![
@@ -764,5 +858,153 @@ mod tests {
                 )
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use common::file_slice::FileHandle;
+
+    use super::*;
+    use crate::SSTableIndexBuilder;
+
+    #[derive(Debug)]
+    struct RecordingFile {
+        data: OwnedBytes,
+        reads: Mutex<Vec<Range<usize>>>,
+        fail: AtomicBool,
+    }
+    impl HasLen for RecordingFile {
+        fn len(&self) -> usize {
+            self.data.len()
+        }
+    }
+    impl FileHandle for RecordingFile {
+        fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(io::Error::other("injected read failure"));
+            }
+            self.reads.lock().unwrap().push(range.clone());
+            Ok(self.data.slice(range))
+        }
+        fn storage_block_len(&self) -> Option<usize> {
+            Some(8192)
+        }
+    }
+
+    #[test]
+    fn paging_reuses_existing_format_and_only_reads_relevant_pages() {
+        let mut builder = SSTableIndexBuilder::default();
+        let key = |i: u64| format!("term-{i:05}-{:016x}", i.wrapping_mul(0x9e3779b97f4a7c15));
+        for i in 0..25000 {
+            builder.add_block(
+                key(i).as_bytes(),
+                i as usize * 10..(i + 1) as usize * 10,
+                i * 7,
+            );
+        }
+        let mut bytes = Vec::new();
+        let fst_len = builder.serialize(&mut bytes).unwrap();
+        bytes.extend_from_slice(&fst_len.to_le_bytes());
+        let eager = crate::SSTableIndex::open(3, 0, FileSlice::from(bytes.clone())).unwrap();
+        let size = bytes.len();
+        let prefix = 8191;
+        let mut physical = vec![0; prefix];
+        physical.extend_from_slice(&bytes);
+        let file = Arc::new(RecordingFile {
+            data: OwnedBytes::new(physical),
+            reads: Mutex::new(Vec::new()),
+            fail: AtomicBool::new(false),
+        });
+        let paged =
+            crate::SSTableIndex::open(3, 0, FileSlice::new(file.clone()).slice(prefix..)).unwrap();
+        assert_eq!(
+            file.reads
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|range| range.len())
+                .sum::<usize>(),
+            48
+        );
+        assert_eq!(
+            paged.get_block_with_key(key(23000).as_bytes()).unwrap(),
+            eager.get_block_with_key(key(23000).as_bytes()).unwrap()
+        );
+        let reads = file.reads.lock().unwrap();
+        let pages: BTreeSet<_> = reads
+            .iter()
+            .flat_map(|range| range.start / 8192..=(range.end - 1) / 8192)
+            .collect();
+        let fetched: usize = reads.iter().map(|range| range.len()).sum();
+        println!(
+            "index {size} bytes; open + lookup requested {fetched} bytes across {} storage pages \
+             vs {} eager pages",
+            pages.len(),
+            (prefix + size).div_ceil(8192)
+        );
+        assert!(pages.len() < (size / 8192) / 4);
+        assert!(fetched < size / 100);
+        drop(reads);
+        for i in [0, 1, 127, 128, 255, 256, 16000, 24999] {
+            assert_eq!(
+                paged.get_block_with_key(key(i).as_bytes()).unwrap(),
+                eager.get_block_with_key(key(i).as_bytes()).unwrap()
+            );
+            assert_eq!(
+                paged.get_block_with_ord(i * 7 + 3).unwrap(),
+                eager.get_block_with_ord(i * 7 + 3).unwrap()
+            );
+        }
+        assert!(paged.get_block_with_key(b"zzzz").unwrap().is_none());
+        file.fail.store(true, Ordering::Relaxed);
+        assert!(paged.get_block_with_key(b"term-10000").is_err());
+        assert!(paged.get_block_with_ord(1000).is_err());
+    }
+    #[test]
+    fn dictionary_propagates_lazy_routing_errors() {
+        use crate::{Dictionary, MonotonicU64SSTable, SortedTermSlice};
+        let mut writer = Dictionary::<MonotonicU64SSTable>::builder(Vec::new()).unwrap();
+        for i in 0u64..10000 {
+            writer
+                .insert(format!("term-{i:05}").as_bytes(), &i)
+                .unwrap();
+        }
+        let file = Arc::new(RecordingFile {
+            data: OwnedBytes::new(writer.finish().unwrap()),
+            reads: Mutex::new(Vec::new()),
+            fail: AtomicBool::new(false),
+        });
+        let dictionary =
+            Dictionary::<MonotonicU64SSTable>::open(FileSlice::new(file.clone())).unwrap();
+        assert_eq!(dictionary.get(b"term-05000").unwrap(), Some(5000));
+        let mut stream = dictionary
+            .range()
+            .ge(b"term-04999")
+            .le(b"term-05001")
+            .into_stream()
+            .unwrap();
+        for value in 4999..=5001 {
+            assert!(stream.advance());
+            assert_eq!(*stream.value(), value);
+        }
+        assert!(!stream.advance());
+        let keys = [b"term-05000", b"term-05001"];
+        let values = dictionary
+            .batch_term_info_exact(SortedTermSlice::new(&keys).unwrap())
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(values.len(), 2);
+        file.fail.store(true, Ordering::Relaxed);
+        assert!(dictionary.get(b"term-05000").is_err());
+        assert!(dictionary.range().ge(b"term-05000").into_stream().is_err());
+        let keys = [b"term-05000", b"term-05001"];
+        let mut batch = dictionary.batch_term_info_exact(SortedTermSlice::new(&keys).unwrap());
+        assert!(batch.next().unwrap().is_err());
+        assert!(batch.next().is_none());
     }
 }
