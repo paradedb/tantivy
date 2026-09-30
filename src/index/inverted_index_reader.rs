@@ -6,7 +6,7 @@ use common::file_slice::DeferredFileSlice;
 use common::json_path_writer::JSON_END_OF_PATH;
 use common::{BinarySerializable, ByteCount, HasLen};
 #[cfg(feature = "quickwit")]
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::{FutureExt, StreamExt, TryStreamExt};
 #[cfg(feature = "quickwit")]
 use itertools::Itertools;
 #[cfg(feature = "quickwit")]
@@ -453,33 +453,6 @@ impl InvertedIndexReader {
         Ok(iter)
     }
 
-    async fn warm_postings_from_terminfo(
-        &self,
-        term_info: &TermInfo,
-        with_positions: bool,
-    ) -> io::Result<()> {
-        let postings = self
-            .postings_file_slice
-            .read_bytes_slice_async(term_info.postings_range.clone());
-        let freqs = async {
-            if let Some(file) = self.freqs_slice(term_info, true)? {
-                file.read_bytes_async().await?;
-            }
-            io::Result::Ok(())
-        };
-        let positions = async {
-            if with_positions {
-                self.positions_file_slice
-                    .open()?
-                    .read_bytes_slice_async(term_info.positions_range.clone())
-                    .await?;
-            }
-            io::Result::Ok(())
-        };
-        futures_util::future::try_join3(postings, freqs, positions).await?;
-        Ok(())
-    }
-
     /// Warmup a block postings given a `Term`.
     /// This method is for an advanced usage only.
     ///
@@ -487,8 +460,18 @@ impl InvertedIndexReader {
     pub async fn warm_postings(&self, term: &Term, with_positions: bool) -> io::Result<bool> {
         let term_info_opt: Option<TermInfo> = self.get_term_info_async(term).await?;
         if let Some(term_info) = term_info_opt {
-            self.warm_postings_from_terminfo(&term_info, with_positions)
-                .await?;
+            let postings = self
+                .postings_file_slice
+                .read_bytes_slice_async(term_info.postings_range.clone());
+            if with_positions {
+                let positions = self
+                    .positions_file_slice
+                    .open()?
+                    .read_bytes_slice_async(term_info.positions_range.clone());
+                futures_util::future::try_join(postings, positions).await?;
+            } else {
+                postings.await?;
+            }
             Ok(true)
         } else {
             Ok(false)
@@ -509,20 +492,29 @@ impl InvertedIndexReader {
             .get_term_range_async(terms, AlwaysMatch, limit, 0)
             .await?;
 
-        let Some(mut first_terminfo) = term_info.next() else {
+        let Some(first_terminfo) = term_info.next() else {
             // no key matches, nothing more to load
             return Ok(false);
         };
 
         let last_terminfo = term_info.last().unwrap_or_else(|| first_terminfo.clone());
 
-        first_terminfo.postings_range.end = last_terminfo.postings_range.end;
-        first_terminfo.positions_range.end = last_terminfo.positions_range.end;
-        if let Some(freqs) = &mut first_terminfo.freqs_range {
-            freqs.end = last_terminfo.freqs_range.unwrap().end;
+        let postings_range = first_terminfo.postings_range.start..last_terminfo.postings_range.end;
+        let positions_range =
+            first_terminfo.positions_range.start..last_terminfo.positions_range.end;
+
+        let postings = self
+            .postings_file_slice
+            .read_bytes_slice_async(postings_range);
+        if with_positions {
+            let positions = self
+                .positions_file_slice
+                .open()?
+                .read_bytes_slice_async(positions_range);
+            futures_util::future::try_join(postings, positions).await?;
+        } else {
+            postings.await?;
         }
-        self.warm_postings_from_terminfo(&first_terminfo, with_positions)
-            .await?;
         Ok(true)
     }
 
@@ -569,17 +561,13 @@ impl InvertedIndexReader {
             // we could do without an iterator, but this allows us access to coalesce which simplify
             // things
             let posting_ranges_iter =
-                std::iter::from_fn(move || stream.next().map(|(_k, v)| v.clone()));
+                std::iter::from_fn(move || stream.next().map(|(_k, v)| v.postings_range.clone()));
 
-            let merged_posting_ranges_iter = posting_ranges_iter.coalesce(|mut first, last| {
-                if first.postings_range.end + MERGE_HOLES_UNDER_BYTES >= last.postings_range.start {
-                    first.postings_range.end = last.postings_range.end;
-                    if let Some(freqs) = &mut first.freqs_range {
-                        freqs.end = last.freqs_range.unwrap().end;
-                    }
-                    Ok(first)
+            let merged_posting_ranges_iter = posting_ranges_iter.coalesce(|range1, range2| {
+                if range1.end + MERGE_HOLES_UNDER_BYTES >= range2.start {
+                    Ok(range1.start..range2.end)
                 } else {
-                    Err((first, last))
+                    Err((range1, range2))
                 }
             });
 
@@ -593,13 +581,14 @@ impl InvertedIndexReader {
         };
         let task_handle = executor(Box::new(cpu_bound_task));
 
-        let posting_downloader =
-            posting_ranges_to_load_stream
-                .map(|term_info| async move {
-                    self.warm_postings_from_terminfo(&term_info, false).await
-                })
-                .buffer_unordered(5)
-                .try_collect::<Vec<()>>();
+        let posting_downloader = posting_ranges_to_load_stream
+            .map(|posting_slice| {
+                self.postings_file_slice
+                    .read_bytes_slice_async(posting_slice)
+                    .map(|result| result.map(|_slice| ()))
+            })
+            .buffer_unordered(5)
+            .try_collect::<Vec<()>>();
 
         let (_, slices_downloaded) =
             futures_util::future::try_join(task_handle, posting_downloader).await?;
@@ -614,9 +603,6 @@ impl InvertedIndexReader {
     /// [`Self::warm_postings`] instead.
     pub async fn warm_postings_full(&self, with_positions: bool) -> io::Result<()> {
         self.postings_file_slice.read_bytes_async().await?;
-        if let Some(freqs) = &self.freqs_file_slice {
-            freqs.open()?.read_bytes_async().await?;
-        }
         if with_positions {
             self.positions_file_slice.open()?.read_bytes_async().await?;
         }
@@ -635,8 +621,6 @@ impl InvertedIndexReader {
 
 #[cfg(all(test, feature = "quickwit"))]
 mod tests {
-    use futures_util::FutureExt;
-
     use super::*;
     use crate::indexer::NoMergePolicy;
     use crate::schema::{Schema, TEXT};
@@ -719,85 +703,6 @@ mod tests {
                     reader.get_term_info(&term)?,
                     reader.terms().get(term.serialized_value_bytes())?
                 );
-            }
-        }
-        Ok(())
-    }
-    #[test]
-    fn warmups_include_separate_freqs() -> crate::Result<()> {
-        use std::ops::Range;
-        use std::sync::Arc;
-
-        use crate::directory::{CompositeFile, FileHandle, OwnedBytes};
-        use crate::index::SegmentComponent;
-
-        #[derive(Debug)]
-        struct SyncOnlyFile(OwnedBytes);
-        impl HasLen for SyncOnlyFile {
-            fn len(&self) -> usize {
-                self.0.len()
-            }
-        }
-        impl FileHandle for SyncOnlyFile {
-            fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
-                Ok(self.0.slice(range))
-            }
-        }
-
-        let mut schema = Schema::builder();
-        let text = schema.add_text_field("text", TEXT);
-        let index = Index::create_in_ram(schema.build());
-        let mut writer = index.writer_for_tests()?;
-        for _ in 0..129 {
-            writer.add_document(doc!(text => "a b b c c c"))?;
-        }
-        writer.commit()?;
-        let searcher = index.reader()?.searcher();
-        let segment = searcher.segment_reader(0);
-        let terms = CompositeFile::open(&segment.open_read(SegmentComponent::Terms)?)?
-            .open_read(text)
-            .unwrap();
-        let postings = CompositeFile::open(&segment.open_read(SegmentComponent::Postings)?)?
-            .open_read(text)
-            .unwrap();
-        let positions = CompositeFile::open(&segment.open_read(SegmentComponent::Positions)?)?
-            .open_read(text)
-            .unwrap();
-        let freqs = CompositeFile::open(&segment.open_read(SegmentComponent::TermFrequencies)?)?
-            .open_read(text)
-            .unwrap();
-        for async_supported in [false, true] {
-            for method in 0..4 {
-                let positions = positions.clone();
-                let mut reader = InvertedIndexReader::new(
-                    TermDictionary::open(terms.clone())?,
-                    postings.clone(),
-                    DeferredFileSlice::new(move || Ok(positions.clone())),
-                    IndexRecordOption::WithFreqsAndPositions,
-                )?;
-                let freqs = if async_supported {
-                    freqs.clone()
-                } else {
-                    FileSlice::new(Arc::new(SyncOnlyFile(freqs.read_bytes()?)))
-                };
-                reader.set_freqs_file(DeferredFileSlice::new(move || Ok(freqs.clone())));
-                let term = Term::from_field_text(text, "b");
-                let result = futures::executor::block_on(async {
-                    match method {
-                        0 => reader.warm_postings(&term, true).await.map(|_| ()),
-                        1 => reader.warm_postings_range(.., None, true).await.map(|_| ()),
-                        2 => reader
-                            .warm_postings_automaton(AlwaysMatch, |task| async move { task() })
-                            .await
-                            .map(|_| ()),
-                        _ => reader.warm_postings_full(true).await,
-                    }
-                });
-                if async_supported {
-                    result?;
-                } else {
-                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
-                }
             }
         }
         Ok(())
