@@ -81,22 +81,23 @@ fn go_to_first_doc<TDocSet: DocSet>(docsets: &mut [TDocSet]) -> DocId {
 impl<TDocSet: DocSet> Intersection<TDocSet, TDocSet> {
     /// num_docs is the number of documents in the segment.
     pub(crate) fn new(
+        docsets: Vec<TDocSet>,
+        segment_num_docs: u32,
+    ) -> Intersection<TDocSet, TDocSet> {
+        let mut intersection = Self::new_unpositioned(docsets, segment_num_docs);
+        intersection.seek(intersection.doc());
+        intersection
+    }
+
+    /// Call `seek` or `seek_danger` to align the document sets before using the intersection.
+    pub(crate) fn new_unpositioned(
         mut docsets: Vec<TDocSet>,
         segment_num_docs: u32,
     ) -> Intersection<TDocSet, TDocSet> {
         let num_docsets = docsets.len();
         assert!(num_docsets >= 2);
         docsets.sort_by_key(|docset| docset.cost());
-        go_to_first_doc(&mut docsets);
         let left = docsets.remove(0);
-        debug_assert!({
-            let doc = left.doc();
-            if doc == TERMINATED {
-                true
-            } else {
-                docsets.iter().all(|docset| docset.doc() == doc)
-            }
-        });
         let right = docsets.remove(0);
         Intersection {
             left,
