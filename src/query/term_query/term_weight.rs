@@ -220,8 +220,11 @@ impl TermWeight {
             )));
         }
 
-        let segment_postings: SegmentPostings =
+        let mut segment_postings: SegmentPostings =
             inverted_index.read_postings_from_terminfo(&term_info, self.index_record_option)?;
+        if !self.scoring_enabled {
+            segment_postings.block_cursor.disable_term_norms();
+        }
 
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
         let similarity_weight = self.similarity_weight.boost_by(boost);
@@ -232,12 +235,7 @@ impl TermWeight {
 
     fn fieldnorm_reader(&self, segment_reader: &SegmentReader) -> crate::Result<FieldNormReader> {
         if self.scoring_enabled {
-            if let Some(field_norm_reader) = segment_reader
-                .fieldnorms_readers()
-                .get_field(self.term.field())?
-            {
-                return Ok(field_norm_reader);
-            }
+            return segment_reader.scoring_fieldnorm_reader(self.term.field());
         }
         Ok(FieldNormReader::constant(segment_reader.max_doc(), 1))
     }

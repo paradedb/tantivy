@@ -2,7 +2,7 @@ use std::io;
 
 use common::VInt;
 
-use crate::directory::OwnedBytes;
+use crate::directory::{FileSlice, OwnedBytes};
 use crate::fieldnorm::FieldNormReader;
 use crate::postings::compression::{BlockDecoder, VIntDecoder, COMPRESSION_BLOCK_SIZE};
 use crate::postings::{BlockInfo, FreqReadingOption, SkipReader};
@@ -31,6 +31,7 @@ pub struct BlockSegmentPostings {
     doc_freq: u32,
     data: OwnedBytes,
     skip_reader: SkipReader,
+    term_norms: Option<super::term_norms::TermNormReader>,
 }
 
 pub(crate) fn decode_bitpacked_block(
@@ -133,6 +134,7 @@ impl BlockSegmentPostings {
             doc_freq,
             data: postings_data,
             skip_reader,
+            term_norms: None,
         };
         block_segment_postings.load_block();
         Ok(block_segment_postings)
@@ -162,8 +164,8 @@ impl BlockSegmentPostings {
         if self.block_is_loaded() {
             let docs = self.doc_decoder.output_array().iter().cloned();
             let freqs = self.freq_decoder.output_array().iter().cloned();
-            let bm25_scores = docs.zip(freqs).map(|(doc, term_freq)| {
-                let fieldnorm_id = fieldnorm_reader.fieldnorm_id(doc);
+            let bm25_scores = docs.zip(freqs).enumerate().map(|(offset, (_, term_freq))| {
+                let fieldnorm_id = self.fieldnorm_id_at(offset, fieldnorm_reader);
                 bm25_weight.score(fieldnorm_id, term_freq)
             });
             let block_max_score = max_score(bm25_scores).unwrap_or(0.0);
@@ -181,6 +183,36 @@ impl BlockSegmentPostings {
         self.freq_reading_option
     }
 
+    pub(crate) fn set_term_norm_source(
+        &mut self,
+        source: Option<FileSlice>,
+        norm_offset: Option<u64>,
+    ) {
+        self.term_norms = source.zip(norm_offset).map(|(source, offset)| {
+            super::term_norms::TermNormReader::new(source, offset, self.doc_freq)
+        });
+    }
+
+    pub(crate) fn disable_term_norms(&mut self) {
+        self.term_norms = None;
+    }
+
+    #[inline]
+    pub(crate) fn fieldnorm_id_at(&self, offset: usize, fallback: &FieldNormReader) -> u8 {
+        self.posting_fieldnorm_id_at(offset)
+            .unwrap_or_else(|| fallback.fieldnorm_id(self.doc(offset)))
+    }
+
+    #[inline]
+    pub(crate) fn posting_fieldnorm_id_at(&self, offset: usize) -> Option<u8> {
+        self.term_norms.as_ref().map(|norms| {
+            let ordinal = (self.doc_freq - self.skip_reader.remaining_docs()) as usize + offset;
+            norms
+                .read(ordinal)
+                .expect("failed to read posting fieldnorm")
+        })
+    }
+
     // Resets the block segment postings on another position
     // in the postings file.
     //
@@ -192,6 +224,7 @@ impl BlockSegmentPostings {
     //
     // This does not reset the positions list.
     pub(crate) fn reset(&mut self, doc_freq: u32, postings_data: OwnedBytes) -> io::Result<()> {
+        self.term_norms = None;
         let (skip_data_opt, postings_data) =
             split_into_skips_and_postings(doc_freq, postings_data)?;
         self.data = postings_data;
@@ -408,6 +441,7 @@ impl BlockSegmentPostings {
             doc_freq: 0,
             data: OwnedBytes::empty(),
             skip_reader: SkipReader::new(OwnedBytes::empty(), 0, IndexRecordOption::Basic),
+            term_norms: None,
         }
     }
 
@@ -421,6 +455,7 @@ mod tests {
     use common::HasLen;
 
     use super::BlockSegmentPostings;
+    use crate::directory::FileSlice;
     use crate::docset::{DocSet, TERMINATED};
     use crate::index::Index;
     use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
@@ -428,6 +463,22 @@ mod tests {
     use crate::postings::SegmentPostings;
     use crate::schema::{IndexRecordOption, Schema, Term, INDEXED};
     use crate::DocId;
+
+    #[test]
+    fn term_norms_require_source_and_offset() {
+        let source = FileSlice::from(vec![7u8]);
+        let mut postings = BlockSegmentPostings::empty();
+        for (file, offset) in [
+            (Some(source.clone()), Some(0)),
+            (Some(source.clone()), None),
+            (None, Some(0)),
+            (None, None),
+        ] {
+            let present = file.is_some() && offset.is_some();
+            postings.set_term_norm_source(file, offset);
+            assert_eq!(postings.term_norms.is_some(), present);
+        }
+    }
 
     #[test]
     fn test_empty_segment_postings() {

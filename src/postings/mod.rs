@@ -20,6 +20,7 @@ mod segment_postings;
 pub mod serializer;
 pub(crate) mod skip;
 mod term_info;
+pub(crate) mod term_norms;
 
 pub use loaded_postings::LoadedPostings;
 pub(crate) use merger::{next_mapped_doc, PostingsMerger};
@@ -34,6 +35,7 @@ pub use self::segment_postings::SegmentPostings;
 pub use self::serializer::{FieldSerializer, InvertedIndexSerializer};
 pub(crate) use self::skip::{BlockInfo, SkipReader};
 pub use self::term_info::TermInfo;
+pub(crate) use self::term_info::TermInfoVersion;
 
 #[expect(clippy::enum_variant_names)]
 #[derive(Debug, PartialEq, Clone, Copy, Eq)]
@@ -262,7 +264,7 @@ pub(crate) mod tests {
             segment_writer.finalize()?;
         }
         {
-            let segment_reader = SegmentReader::open(&segment)?;
+            let segment_reader = SegmentReader::open(&segment.with_max_doc(1000))?;
             {
                 let fieldnorm_reader = segment_reader.get_fieldnorms_reader(text_field)?;
                 assert_eq!(fieldnorm_reader.fieldnorm(0), 8 + 5);

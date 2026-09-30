@@ -227,10 +227,14 @@ impl DocSet for BlockWandIntersectionScorer {
             let score_threshold = self.threshold - secondary_block_max_sum;
 
             let mut num_candidates = 0usize;
-            for (candidate_doc, term_freq) in
-                block_docs.iter().copied().zip(block_freqs.iter().copied())
+            for (offset, (candidate_doc, term_freq)) in block_docs
+                .iter()
+                .copied()
+                .zip(block_freqs.iter().copied())
+                .enumerate()
             {
-                let fieldnorm_id = self.fieldnorm_reader.fieldnorm_id(candidate_doc);
+                let fieldnorm_id =
+                    block_cursor.fieldnorm_id_at(start_idx + offset, &self.fieldnorm_reader);
                 let leader_score = self.bm25_weight.score(fieldnorm_id, term_freq);
                 self.candidate_doc_ids[num_candidates] = candidate_doc;
                 self.candidate_scores[num_candidates] = leader_score;

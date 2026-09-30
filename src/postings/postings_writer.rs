@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use stacker::Addr;
 
-use crate::fieldnorm::FieldNormReaders;
+use crate::fieldnorm::FieldNormReader;
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::indexer::indexing_term::IndexingTerm;
 use crate::indexer::path_to_unordered_id::OrderedPathId;
@@ -50,7 +50,7 @@ pub(crate) fn serialize_postings(
     ctx: IndexingContext,
     schema: Schema,
     per_field_postings_writers: &PerFieldPostingsWriter,
-    fieldnorm_readers: FieldNormReaders,
+    mut fieldnorm_reader: impl FnMut(Field) -> crate::Result<Option<FieldNormReader>>,
     doc_id_map: Option<&DocIdMapping>,
     serializer: &mut InvertedIndexSerializer,
 ) -> crate::Result<()> {
@@ -81,7 +81,7 @@ pub(crate) fn serialize_postings(
     let field_offsets = make_field_partition(&term_offsets);
     for (field, byte_offsets) in field_offsets {
         let postings_writer = per_field_postings_writers.get_for_field(field);
-        let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
+        let fieldnorm_reader = fieldnorm_reader(field)?;
         let mut field_serializer =
             serializer.new_field(field, postings_writer.total_num_tokens(), fieldnorm_reader)?;
         postings_writer.serialize(

@@ -125,6 +125,15 @@ impl<TDocSet: DocSet> Intersection<TDocSet, TDocSet> {
 }
 
 impl<TDocSet: DocSet> Intersection<TDocSet, TDocSet> {
+    /// Returns a participating document set, positioned on the intersection's current document.
+    pub fn docset_specialized(&self, ord: usize) -> &TDocSet {
+        match ord {
+            0 => &self.left,
+            1 => &self.right,
+            n => &self.others[n - 2],
+        }
+    }
+
     pub fn docset_mut_specialized(&mut self, ord: usize) -> &mut TDocSet {
         match ord {
             0 => &mut self.left,

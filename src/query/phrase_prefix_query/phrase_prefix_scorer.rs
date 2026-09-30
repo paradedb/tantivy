@@ -14,6 +14,7 @@ enum PhraseKind<TPostings: Postings> {
         position_offset: u32,
         postings: TPostings,
         positions: Vec<u32>,
+        fieldnorm_reader: FieldNormReader,
     },
     MultiPrefix(PhraseScorer<TPostings>),
 }
@@ -25,6 +26,7 @@ impl<TPostings: Postings> PhraseKind<TPostings> {
                 position_offset,
                 postings,
                 positions,
+                ..
             } => {
                 if positions.is_empty() {
                     postings.positions_with_offset(*position_offset, positions);
@@ -138,6 +140,7 @@ impl<TPostings: Postings> PhrasePrefixScorer<TPostings> {
                 position_offset: offset as u32,
                 postings,
                 positions: Vec::with_capacity(100),
+                fieldnorm_reader,
             }
         };
         let mut phrase_prefix_scorer = PhrasePrefixScorer {
@@ -151,6 +154,19 @@ impl<TPostings: Postings> PhrasePrefixScorer<TPostings> {
             phrase_prefix_scorer.advance();
         }
         phrase_prefix_scorer
+    }
+
+    pub fn fieldnorm_id(&self) -> u8 {
+        match &self.phrase_scorer {
+            PhraseKind::SinglePrefix {
+                postings,
+                fieldnorm_reader,
+                ..
+            } => postings
+                .fieldnorm_id()
+                .unwrap_or_else(|| fieldnorm_reader.fieldnorm_id(postings.doc())),
+            PhraseKind::MultiPrefix(scorer) => scorer.fieldnorm_id(),
+        }
     }
 
     pub fn phrase_count(&self) -> u32 {

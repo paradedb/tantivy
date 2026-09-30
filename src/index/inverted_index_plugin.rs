@@ -1,10 +1,9 @@
 //! The inverted index as a [`SegmentPlugin`] implementation.
 //!
 //! Field norms, the term dictionary, postings, and positions form a single subsystem:
-//! field norms are produced by the same tokenization pass that feeds the postings, and
-//! postings serialization reads the field norms back. This plugin therefore owns all four
-//! files (`fieldnorm`, `term`, `idx`, `pos`) and drives them together, both while indexing
-//! (`add_document`) and while merging.
+//! field norms are produced by the same tokenization pass that feeds the postings.
+//! `.fieldnorm` retains document lengths for merge statistics and `.pnorm` stores
+//! posting-local copies for scoring. This plugin drives indexing and merging for both formats.
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -16,7 +15,7 @@ use itertools::Itertools;
 use measure_time::debug_time;
 use tokenizer_api::BoxTokenStream;
 
-use crate::directory::{CompositeFile, Directory};
+use crate::directory::CompositeFile;
 use crate::docset::DocSet;
 use crate::error::DataCorruption;
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders, FieldNormsSerializer, FieldNormsWriter};
@@ -32,7 +31,9 @@ use crate::postings::{
 };
 use crate::schema::document::{Document, Value};
 use crate::schema::{Field, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
-use crate::space_usage::{ComponentSpaceUsage, FIELDNORMS, POSITIONS, POSTINGS, TERMDICT};
+use crate::space_usage::{
+    ComponentSpaceUsage, FIELDNORMS, POSITIONS, POSTINGS, POSTING_NORMS, TERMDICT,
+};
 use crate::termdict::{TermMerger, TermOrdinal};
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
 use crate::{DocId, InvertedIndexReader, TantivyError};
@@ -62,7 +63,7 @@ fn compute_initial_table_size(per_thread_memory_budget: usize) -> crate::Result<
 
 impl SegmentPlugin for InvertedIndexPlugin {
     fn extensions(&self) -> &[&str] {
-        &["fieldnorm", "term", "idx", "pos"]
+        &["fieldnorm", "term", "idx", "pos", "pnorm"]
     }
 
     fn create_writer(&self, _ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
@@ -70,15 +71,13 @@ impl SegmentPlugin for InvertedIndexPlugin {
     }
 
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {
-        // Field norms first: postings merge reads them back from the target segment.
         merge_fieldnorms(&ctx)?;
-
         debug_time!("write-postings");
         debug!("write-postings");
         let target_segment = ctx.target_segment;
         let mut serializer = InvertedIndexSerializer::open(target_segment)?;
-        let fieldnorm_data = target_segment.open_read(SegmentComponent::FieldNorms)?;
-        let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
+        let fieldnorm_readers =
+            FieldNormReaders::open(target_segment.open_read(SegmentComponent::FieldNorms)?)?;
         write_postings_merge(
             ctx.readers,
             ctx.schema,
@@ -107,7 +106,7 @@ impl SegmentPlugin for InvertedIndexPlugin {
             Ok(file) => CompositeFile::open(&file)?.space_usage(schema),
             Err(_) => CompositeFile::empty().space_usage(schema),
         };
-        Ok(BTreeMap::from([
+        let mut usage = BTreeMap::from([
             (
                 FIELDNORMS.to_string(),
                 ComponentSpaceUsage::PerField(fieldnorms),
@@ -124,7 +123,14 @@ impl SegmentPlugin for InvertedIndexPlugin {
                 POSITIONS.to_string(),
                 ComponentSpaceUsage::PerField(positions),
             ),
-        ]))
+        ]);
+        if let Ok(file) = segment_reader.open_read(SegmentComponent::PostingNorms) {
+            usage.insert(
+                POSTING_NORMS.to_string(),
+                ComponentSpaceUsage::PerField(CompositeFile::open(&file)?.space_usage(schema)),
+            );
+        }
+        Ok(usage)
     }
 }
 
@@ -140,7 +146,6 @@ pub struct InvertedIndexPluginWriter {
     json_positions_per_path: IndexingPositionsPerPath,
     ctx: IndexingContext,
     postings_serializer: InvertedIndexSerializer,
-    fieldnorm_serializer: FieldNormsSerializer,
     max_doc: DocId,
 }
 
@@ -172,9 +177,6 @@ impl InvertedIndexPluginWriter {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let fieldnorm_path = segment.relative_path(SegmentComponent::FieldNorms);
-        let fieldnorm_write = segment.index().directory().open_write(&fieldnorm_path)?;
-
         let table_size = compute_initial_table_size(ctx.memory_budget_in_bytes)?;
         Ok(InvertedIndexPluginWriter {
             per_field_postings_writers: PerFieldPostingsWriter::for_schema(&schema),
@@ -185,7 +187,6 @@ impl InvertedIndexPluginWriter {
             json_positions_per_path: IndexingPositionsPerPath::default(),
             ctx: IndexingContext::new(table_size),
             postings_serializer: InvertedIndexSerializer::open(segment)?,
-            fieldnorm_serializer: FieldNormsSerializer::from_write(fieldnorm_write)?,
             schema,
             max_doc: 0,
         })
@@ -409,19 +410,19 @@ impl PluginWriter for InvertedIndexPluginWriter {
         segment: &Segment,
         doc_id_map: Option<&DocIdMapping>,
     ) -> crate::Result<()> {
-        // Field norms first: postings serialization reads them back below.
         self.fieldnorms_writer.fill_up_to_max_doc(self.max_doc);
-        self.fieldnorms_writer
-            .serialize(self.fieldnorm_serializer, doc_id_map)
-            .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?;
-
-        let fieldnorm_data = segment.open_read(SegmentComponent::FieldNorms)?;
-        let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
+        if let Some(doc_id_map) = doc_id_map {
+            self.fieldnorms_writer.remap(doc_id_map);
+        }
+        self.fieldnorms_writer.serialize(
+            FieldNormsSerializer::from_write(segment.open_write(SegmentComponent::FieldNorms)?)?,
+            None,
+        )?;
         serialize_postings(
             self.ctx,
             self.schema,
             &self.per_field_postings_writers,
-            fieldnorm_readers,
+            |field| Ok(self.fieldnorms_writer.take_field(field)),
             doc_id_map,
             &mut self.postings_serializer,
         )?;
@@ -442,13 +443,10 @@ impl PluginWriter for InvertedIndexPluginWriter {
     }
 }
 
-// --- Field norm merge ---
-
 fn merge_fieldnorms(ctx: &PluginMergeContext) -> crate::Result<()> {
-    let path = ctx
+    let write = ctx
         .target_segment
-        .relative_path(SegmentComponent::FieldNorms);
-    let write = ctx.target_segment.index().directory().open_write(&path)?;
+        .open_write(SegmentComponent::FieldNorms)?;
     let mut serializer = FieldNormsSerializer::from_write(write)?;
 
     let schema = ctx.schema;
@@ -461,6 +459,9 @@ fn merge_fieldnorms(ctx: &PluginMergeContext) -> crate::Result<()> {
     let mut fieldnorms_data = Vec::with_capacity(max_doc);
 
     for field in fields {
+        if ctx.cancel.wants_cancel() {
+            return Err(TantivyError::Cancelled);
+        }
         fieldnorms_data.clear();
         let fieldnorms_readers: Vec<FieldNormReader> = ctx
             .readers
@@ -511,7 +512,8 @@ fn estimate_total_num_tokens_in_single_segment(
     if !reader.has_deletes() {
         return Ok(reader.inverted_index(field)?.total_num_tokens());
     }
-    if let Some(fieldnorm_reader) = reader.fieldnorms_readers().get_field(field)? {
+    if reader.schema().get_field_entry(field).has_fieldnorms() {
+        let fieldnorm_reader = reader.get_fieldnorms_reader(field)?;
         let mut count: [usize; 256] = [0; 256];
         for doc in reader.doc_ids_alive() {
             let fieldnorm_id = fieldnorm_reader.fieldnorm_id(doc);
@@ -607,8 +609,9 @@ fn write_postings_for_field(
         for (segment_ord, term_info) in merged_terms.current_segment_ords_and_term_infos() {
             let segment_reader = &readers[segment_ord];
             let inverted_index: &InvertedIndexReader = &field_readers[segment_ord];
-            let segment_postings =
+            let mut segment_postings =
                 inverted_index.read_postings_from_terminfo(&term_info, segment_postings_option)?;
+            segment_postings.block_cursor.disable_term_norms();
             let alive_bitset_opt = segment_reader.alive_bitset();
             let doc_freq = if let Some(alive_bitset) = alive_bitset_opt {
                 segment_postings.doc_freq_given_deletes(alive_bitset)
@@ -695,8 +698,8 @@ fn write_postings_merge(
     doc_id_mapping: &SegmentDocIdMapping,
 ) -> crate::Result<()> {
     for (field, field_entry) in schema.fields() {
-        let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
         if field_entry.is_indexed() {
+            let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
             write_postings_for_field(
                 readers,
                 schema,
@@ -712,7 +715,121 @@ fn write_postings_merge(
 
 #[cfg(test)]
 mod tests {
-    use super::compute_initial_table_size;
+    use super::{compute_initial_table_size, estimate_total_num_tokens};
+
+    #[test]
+    fn test_merge_uses_document_norms() -> crate::Result<()> {
+        use crate::collector::TopDocs;
+        use crate::directory::Directory;
+        use crate::index::SegmentComponent;
+        use crate::indexer::NoMergePolicy;
+        use crate::query::TermQuery;
+        use crate::schema::{
+            IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, INDEXED, TEXT,
+        };
+        use crate::{DocSet, Index, IndexSettings, IndexSortByField, Order, Term, TERMINATED};
+
+        for sorted in [false, true] {
+            let mut schema = Schema::builder();
+            let text = schema.add_text_field(
+                "text",
+                TEXT.set_indexing_options(
+                    TEXT.get_indexing_options()
+                        .unwrap()
+                        .clone()
+                        .set_pnorms(true),
+                ),
+            );
+            let basic = schema.add_text_field(
+                "basic",
+                TextOptions::default().set_indexing_options(
+                    TextFieldIndexing::default()
+                        .set_index_option(IndexRecordOption::Basic)
+                        .set_pnorms(true),
+                ),
+            );
+            let id = schema.add_u64_field("id", INDEXED | FAST);
+            let index = Index::builder()
+                .schema(schema.build())
+                .settings(IndexSettings {
+                    sort_by_field: sorted.then(|| IndexSortByField {
+                        field: "id".into(),
+                        order: Order::Asc,
+                    }),
+                    ..Default::default()
+                })
+                .create_in_ram()?;
+            let mut writer = index.writer_for_tests()?;
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            for batch in [
+                vec![(4u64, "red apple"), (0, "green apple pie")],
+                vec![(3, "red cherry pie"), (1, ""), (2, "red")],
+            ] {
+                for (value, body) in batch {
+                    writer.add_document(doc!(id => value, text => body, basic => body))?;
+                }
+                writer.commit()?;
+            }
+            writer.delete_term(Term::from_field_u64(id, 0));
+            writer.commit()?;
+            for segment in index.searchable_segments()? {
+                index
+                    .directory()
+                    .delete(&segment.relative_path(SegmentComponent::PostingNorms))
+                    .unwrap();
+            }
+            let reader = index.reader()?;
+            for field in [text, basic] {
+                assert_eq!(
+                    estimate_total_num_tokens(reader.searcher().segment_readers(), field)?,
+                    6
+                );
+            }
+            writer.merge(&index.searchable_segment_ids()?).wait()?;
+            reader.reload()?;
+            let searcher = reader.searcher();
+            assert_eq!(searcher.segment_readers().len(), 1);
+            let segment = searcher.segment_reader(0);
+            let ids = segment.fast_fields().u64("id")?;
+            for field in [text, basic] {
+                let norms = segment.get_fieldnorms_reader(field)?;
+                assert_eq!(norms.num_docs(), 4);
+                for doc in 0..segment.max_doc() {
+                    let expected = match ids.first(doc).unwrap() {
+                        1 => 0,
+                        2 => 1,
+                        3 => 3,
+                        4 => 2,
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(norms.fieldnorm(doc), expected);
+                }
+                let inverted = segment.inverted_index(field)?;
+                assert_eq!(inverted.total_num_tokens(), 6);
+                let term = Term::from_field_text(field, "red");
+                let mut postings = inverted
+                    .read_postings(&term, IndexRecordOption::WithFreqs)?
+                    .unwrap();
+                while postings.doc() != TERMINATED {
+                    assert_eq!(
+                        postings
+                            .block_cursor
+                            .fieldnorm_id_at(postings.block_offset(), &norms),
+                        norms.fieldnorm_id(postings.doc())
+                    );
+                    postings.advance();
+                }
+                let query = TermQuery::new(term, IndexRecordOption::WithFreqs);
+                assert_eq!(
+                    searcher
+                        .search(&query, &TopDocs::with_limit(4).order_by_score())?
+                        .len(),
+                    3
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     #[cfg(not(feature = "compare_hash_only"))]

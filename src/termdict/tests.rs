@@ -13,6 +13,7 @@ fn make_term_info(term_ord: u64) -> TermInfo {
         doc_freq: term_ord as u32,
         postings_range: offset(term_ord)..offset(term_ord + 1),
         positions_range: offset(term_ord) * 2..offset(term_ord + 1) * 2,
+        pnorms_offset: None,
     }
 }
 
@@ -428,4 +429,100 @@ fn test_automaton_search() -> crate::Result<()> {
     assert_eq!("Spain".as_bytes(), range.key());
     assert!(!range.advance());
     Ok(())
+}
+
+#[test]
+fn v1_dictionary_remains_readable_and_byte_identical() -> crate::Result<()> {
+    #[cfg(feature = "quickwit")]
+    let bytes = include_bytes!("testdata/v1-sstable.term").as_slice();
+    #[cfg(not(feature = "quickwit"))]
+    let bytes = include_bytes!("testdata/v1-fst.term").as_slice();
+    let dictionary = TermDictionary::open(FileSlice::from(bytes.to_vec()))?;
+    let mut writer = TermDictionaryBuilder::create(Vec::new())?;
+    for i in 0..300usize {
+        let key = format!("term{i:04}");
+        let info = TermInfo {
+            doc_freq: i as u32 + 1,
+            postings_range: i * 13..(i + 1) * 13,
+            positions_range: i * 3..(i + 1) * 3,
+            pnorms_offset: None,
+        };
+        assert_eq!(dictionary.get(&key)?, Some(info.clone()));
+        writer.insert(key, &info)?;
+    }
+    assert_eq!(writer.finish()?, bytes);
+    Ok(())
+}
+
+#[test]
+fn dictionary_preserves_norm_offsets_in_lookups_and_streams() -> crate::Result<()> {
+    for initial_offset in [0, 1 << 40] {
+        let mut offset = initial_offset;
+        let keys: Vec<_> = (0..1_000).map(|i| format!("term{i:04}")).collect();
+        let infos: Vec<_> = (0..1_000)
+            .map(|i| {
+                let mut info = make_term_info(i);
+                info.pnorms_offset = Some(offset);
+                offset += u64::from(info.doc_freq);
+                info
+            })
+            .collect();
+        let mut writer = TermDictionaryBuilder::create(Vec::new())?;
+        for (key, info) in keys.iter().zip(&infos) {
+            writer.insert(key, info)?;
+        }
+        let bytes = writer.finish()?;
+        let tag = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
+        assert_eq!(tag, super::VERSIONED_FOOTER_MAGIC);
+        let dictionary = TermDictionary::open(FileSlice::from(bytes))?;
+        let mut stream = dictionary.stream()?;
+        for (key, info) in keys.iter().zip(&infos) {
+            assert_eq!(dictionary.get(key)?, Some(info.clone()));
+            assert!(stream.advance());
+            assert_eq!(stream.key(), key.as_bytes());
+            assert_eq!(stream.value(), info);
+            #[cfg(feature = "quickwit")]
+            assert_eq!(
+                futures::executor::block_on(dictionary.get_async(key))?,
+                Some(info.clone())
+            );
+        }
+        assert!(!stream.advance());
+        assert!(dictionary.get("absent")?.is_none());
+        #[cfg(feature = "quickwit")]
+        {
+            let keys = super::SortedTermSlice::new(&keys).unwrap();
+            let batch: Vec<_> = dictionary
+                .batch_term_info_exact(keys)
+                .collect::<io::Result<_>>()?;
+            assert_eq!(batch, infos.into_iter().enumerate().collect::<Vec<_>>());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn dictionary_rejects_unknown_versions() -> crate::Result<()> {
+    let mut writer = TermDictionaryBuilder::create(Vec::new())?;
+    let mut info = make_term_info(1);
+    info.pnorms_offset = Some(0);
+    writer.insert("term", &info)?;
+    let mut bytes = writer.finish()?;
+    let version_offset = bytes.len() - 8;
+    bytes[version_offset..version_offset + 4].copy_from_slice(&3u32.to_le_bytes());
+    let error = TermDictionary::open(FileSlice::from(bytes)).err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("version 3"));
+    Ok(())
+}
+
+#[test]
+fn dictionary_rejects_truncated_footer() {
+    for bytes in [
+        Vec::new(),
+        super::VERSIONED_FOOTER_MAGIC.to_le_bytes().to_vec(),
+    ] {
+        let error = TermDictionary::open(FileSlice::from(bytes)).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
 }

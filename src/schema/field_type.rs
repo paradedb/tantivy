@@ -362,6 +362,16 @@ impl FieldType {
         }
     }
 
+    /// Returns true if posting-local norms are enabled for this field.
+    pub fn has_pnorms(&self) -> bool {
+        match self {
+            FieldType::Str(options) => options
+                .get_indexing_options()
+                .is_some_and(|indexing| indexing.pnorms() && indexing.fieldnorms()),
+            _ => false,
+        }
+    }
+
     /// Given a field configuration, return the maximal possible
     /// `IndexRecordOption` available.
     ///

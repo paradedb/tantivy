@@ -79,7 +79,9 @@ impl TermScorer {
     }
 
     pub fn fieldnorm_id(&self) -> u8 {
-        self.fieldnorm_reader.fieldnorm_id(self.doc())
+        self.postings
+            .block_cursor
+            .fieldnorm_id_at(self.postings.block_offset(), &self.fieldnorm_reader)
     }
 
     pub fn explain(&self) -> Explanation {
