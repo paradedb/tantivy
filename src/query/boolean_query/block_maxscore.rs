@@ -47,9 +47,9 @@ pub(super) fn block_maxscore(
             remaining: 0.0,
         })
         .collect();
-    let mut scores = vec![0.0f64; WINDOW];
+    let mut scores = vec![0.0 as Score; WINDOW];
     let mut candidates = [0u64; WINDOW / 64];
-    let mut matches = vec![(0, 0.0); WINDOW];
+    let mut matches = vec![(0, 0.0 as Score); WINDOW];
     let mut start = terms
         .iter()
         .map(|t| t.scorer.doc())
@@ -103,8 +103,8 @@ pub(super) fn block_maxscore(
             if strong.len() == 1 {
                 let scorer = &mut strong[0].scorer;
                 while scorer.doc() < window_end {
-                    let score = scorer.score() as f64;
-                    let keep = score * rounding + weak_bound > threshold as f64;
+                    let score = scorer.score();
+                    let keep = score as f64 * rounding + weak_bound > threshold as f64;
                     matches[matches_len] = (scorer.doc(), score);
                     matches_len += keep as usize;
                     scorer.advance();
@@ -115,7 +115,7 @@ pub(super) fn block_maxscore(
                     while term.scorer.doc() < window_end {
                         let offset = (term.scorer.doc() - base) as usize;
                         candidates[offset / 64] |= 1u64 << (offset % 64);
-                        scores[offset] += term.scorer.score() as f64;
+                        scores[offset] += term.scorer.score();
                         term.scorer.advance();
                     }
                 }
@@ -126,7 +126,7 @@ pub(super) fn block_maxscore(
                         let offset = word * 64 + bit;
                         let score = scores[offset];
                         scores[offset] = 0.0;
-                        let keep = score * rounding + weak_bound > threshold as f64;
+                        let keep = score as f64 * rounding + weak_bound > threshold as f64;
                         matches[matches_len] = (base + offset as u32, score);
                         matches_len += keep as usize;
                     }
@@ -137,24 +137,24 @@ pub(super) fn block_maxscore(
                 let mut len = 0;
                 for i in 0..matches_len {
                     let (doc, mut score) = matches[i];
-                    if score * rounding + term.bound + term.remaining <= threshold as f64 {
+                    if score as f64 * rounding + term.bound + term.remaining <= threshold as f64 {
                         continue;
                     }
                     if term.scorer.doc() < doc {
                         term.scorer.seek(doc);
                     }
                     if term.scorer.doc() == doc {
-                        score += term.scorer.score() as f64;
+                        score += term.scorer.score();
                     }
-                    let keep = score * rounding + term.remaining > threshold as f64;
+                    let keep = score as f64 * rounding + term.remaining > threshold as f64;
                     matches[len] = (doc, score);
                     len += keep as usize;
                 }
                 matches_len = len;
             }
             for &(doc, score) in &matches[..matches_len] {
-                if score as Score > threshold {
-                    threshold = callback(doc, score as Score);
+                if score > threshold {
+                    threshold = callback(doc, score);
                 }
             }
         }

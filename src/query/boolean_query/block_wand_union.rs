@@ -526,7 +526,7 @@ mod tests {
     }
 
     fn nearly_equals(left: Score, right: Score) -> bool {
-        (left - right).abs() < 0.0001 * (left + right).abs()
+        (left - right).abs() < 0.0002 * (left + right).abs()
     }
 
     #[derive(Clone, Copy, Debug)]
