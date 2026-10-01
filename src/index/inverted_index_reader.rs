@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 
 use common::file_slice::DeferredFileSlice;
 use common::json_path_writer::JSON_END_OF_PATH;
-use common::{BinarySerializable, ByteCount};
+use common::{BinarySerializable, ByteCount, HasLen};
 #[cfg(feature = "quickwit")]
 use futures_util::{FutureExt, StreamExt, TryStreamExt};
 #[cfg(feature = "quickwit")]
@@ -44,6 +44,7 @@ pub struct InvertedIndexReader {
     postings_file_slice: FileSlice,
     positions_file_slice: DeferredFileSlice,
     pnorms_file_slice: Option<FileSlice>,
+    freqs_file_slice: Option<DeferredFileSlice>,
     record_option: IndexRecordOption,
     total_num_tokens: u64,
 }
@@ -91,6 +92,7 @@ impl InvertedIndexReader {
             postings_file_slice: postings_body,
             positions_file_slice,
             pnorms_file_slice: None,
+            freqs_file_slice: None,
             record_option,
             total_num_tokens,
         })
@@ -98,6 +100,36 @@ impl InvertedIndexReader {
 
     pub(crate) fn set_pnorms_file(&mut self, source: FileSlice) {
         self.pnorms_file_slice = Some(source);
+    }
+
+    pub(crate) fn set_freqs_file(&mut self, source: DeferredFileSlice) {
+        self.freqs_file_slice = Some(source);
+    }
+
+    fn freqs_slice(&self, term_info: &TermInfo, read_freqs: bool) -> io::Result<Option<FileSlice>> {
+        let Some(range) = &term_info.freqs_range else {
+            return Ok(None);
+        };
+        if !read_freqs {
+            return Ok(Some(FileSlice::empty()));
+        }
+        let file = self
+            .freqs_file_slice
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing term frequency component",
+                )
+            })?
+            .open()?;
+        if range.end > file.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated term frequencies",
+            ));
+        }
+        Ok(Some(file.slice(range.clone())))
     }
 
     /// Creates an empty `InvertedIndexReader` object, which
@@ -110,6 +142,7 @@ impl InvertedIndexReader {
             postings_file_slice: FileSlice::empty(),
             positions_file_slice: DeferredFileSlice::new(|| Ok(FileSlice::empty())),
             pnorms_file_slice: None,
+            freqs_file_slice: None,
             record_option,
             total_num_tokens: 0u64,
         }
@@ -251,7 +284,8 @@ impl InvertedIndexReader {
             .postings_file_slice
             .slice(term_info.postings_range.clone());
         let postings_bytes = postings_slice.read_bytes()?;
-        block_postings.reset(term_info.doc_freq, postings_bytes)?;
+        let freqs = self.freqs_slice(term_info, block_postings.requested_option().has_freq())?;
+        block_postings.reset(term_info.doc_freq, postings_bytes, freqs)?;
         block_postings
             .set_term_norm_source(self.pnorms_file_slice.clone(), term_info.pnorms_offset);
         Ok(())
@@ -286,6 +320,7 @@ impl InvertedIndexReader {
         let mut postings = BlockSegmentPostings::open_file_slice(
             term_info.doc_freq,
             postings_data,
+            self.freqs_slice(term_info, requested_option.has_freq())?,
             self.record_option,
             requested_option,
         )?;

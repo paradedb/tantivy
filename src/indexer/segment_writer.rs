@@ -553,8 +553,9 @@ mod tests {
             term_info,
             TermInfo {
                 pnorms_offset: None,
+                freqs_range: Some(1..2),
                 doc_freq: 1,
-                postings_range: 2..4,
+                postings_range: 1..2,
                 positions_range: 2..5
             }
         );
@@ -593,6 +594,7 @@ mod tests {
             term_info,
             TermInfo {
                 pnorms_offset: None,
+                freqs_range: None,
                 doc_freq: 1,
                 postings_range: 0..1,
                 positions_range: 0..0

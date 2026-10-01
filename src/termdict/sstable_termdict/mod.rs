@@ -177,8 +177,17 @@ impl ValueReader for TermInfoValueReader {
         let mut pnorms_offset = match version {
             TermInfoVersion::V1 => None,
             TermInfoVersion::V2 => Some(VInt::deserialize_u64(&mut data)?),
+            TermInfoVersion::V3 => {
+                let offset = VInt::deserialize_u64(&mut data)?;
+                (offset != u64::MAX).then_some(offset)
+            }
         };
 
+        let mut freqs_start = if version == TermInfoVersion::V3 {
+            Some(VInt::deserialize_u64(&mut data)? as usize)
+        } else {
+            None
+        };
         self.term_infos.reserve_exact(num_els as usize);
         for _ in 0..num_els {
             let doc_freq = VInt::deserialize_u64(&mut data)? as u32;
@@ -186,11 +195,20 @@ impl ValueReader for TermInfoValueReader {
             let positions_num_bytes = VInt::deserialize_u64(&mut data)?;
             let postings_end = postings_start + postings_num_bytes as usize;
             let positions_end = positions_start + positions_num_bytes as usize;
+            let freqs_range = if let Some(start) = &mut freqs_start {
+                let end = *start + VInt::deserialize_u64(&mut data)? as usize;
+                let range = *start..end;
+                *start = end;
+                Some(range)
+            } else {
+                None
+            };
             let term_info = TermInfo {
                 doc_freq,
                 postings_range: postings_start..postings_end,
                 positions_range: positions_start..positions_end,
                 pnorms_offset,
+                freqs_range,
             };
             self.term_infos.push(term_info);
             postings_start = postings_end;
@@ -221,9 +239,18 @@ impl ValueWriter for TermInfoValueWriter {
             .term_infos
             .iter()
             .any(|info| info.pnorms_offset.is_some());
-        if has_pnorms {
+        let has_freqs = self
+            .term_infos
+            .iter()
+            .any(|info| info.freqs_range.is_some());
+        if has_pnorms || has_freqs {
             VInt(VERSIONED_BLOCK).serialize_into_vec(buffer);
-            TermInfoVersion::V2.serialize(buffer).unwrap();
+            let version = if has_freqs {
+                TermInfoVersion::V3
+            } else {
+                TermInfoVersion::V2
+            };
+            version.serialize(buffer).unwrap();
         }
         VInt(self.term_infos.len() as u64).serialize_into_vec(buffer);
         if self.term_infos.is_empty() {
@@ -232,15 +259,28 @@ impl ValueWriter for TermInfoValueWriter {
         VInt(self.term_infos[0].postings_range.start as u64).serialize_into_vec(buffer);
         VInt(self.term_infos[0].positions_range.start as u64).serialize_into_vec(buffer);
         let mut pnorms_offset = self.term_infos[0].pnorms_offset;
-        if has_pnorms {
-            // One norm byte per document makes each next offset implicit in doc_freq.
-            VInt(pnorms_offset.expect("posting norms must be enabled for every term"))
-                .serialize_into_vec(buffer);
+        if has_pnorms || has_freqs {
+            VInt(pnorms_offset.unwrap_or(u64::MAX)).serialize_into_vec(buffer);
+        }
+        let mut freqs_start = self.term_infos[0]
+            .freqs_range
+            .as_ref()
+            .map(|range| range.start);
+        if let Some(start) = freqs_start {
+            VInt(start as u64).serialize_into_vec(buffer);
         }
         for term_info in &self.term_infos {
             VInt(term_info.doc_freq as u64).serialize_into_vec(buffer);
             VInt(term_info.postings_range.len() as u64).serialize_into_vec(buffer);
             VInt(term_info.positions_range.len() as u64).serialize_into_vec(buffer);
+            assert_eq!(
+                term_info.freqs_range.as_ref().map(|range| range.start),
+                freqs_start
+            );
+            if let Some(range) = &term_info.freqs_range {
+                VInt(term_info.freqs_num_bytes() as u64).serialize_into_vec(buffer);
+                freqs_start = Some(range.end);
+            }
             assert_eq!(term_info.pnorms_offset, pnorms_offset);
             if let Some(offset) = &mut pnorms_offset {
                 *offset += u64::from(term_info.doc_freq);
@@ -283,10 +323,10 @@ mod tests {
     fn rejects_unknown_block_version() {
         let mut bytes = Vec::new();
         VInt(super::VERSIONED_BLOCK).serialize_into_vec(&mut bytes);
-        3u32.serialize(&mut bytes).unwrap();
+        4u32.serialize(&mut bytes).unwrap();
         let error = TermInfoValueReader::default().load(&bytes).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("version 3"));
+        assert!(error.to_string().contains("version 4"));
     }
 
     #[test]
@@ -301,6 +341,7 @@ mod tests {
                     postings_range: i * 4..(i + 1) * 4,
                     positions_range: i..i + 1,
                     pnorms_offset: None,
+                    freqs_range: None,
                 };
                 plain.write(&info);
                 info.pnorms_offset = Some((1 << 40) + i as u64);
@@ -323,18 +364,21 @@ mod tests {
             postings_range: 17..45,
             positions_range: 10..122,
             pnorms_offset: None,
+            freqs_range: None,
         });
         term_info_writer.write(&TermInfo {
             doc_freq: 10u32,
             postings_range: 45..450,
             positions_range: 122..1100,
             pnorms_offset: None,
+            freqs_range: None,
         });
         term_info_writer.write(&TermInfo {
             doc_freq: 17u32,
             postings_range: 450..462,
             positions_range: 1100..1302,
             pnorms_offset: None,
+            freqs_range: None,
         });
         let mut buffer = Vec::new();
         term_info_writer.serialize_block(&mut buffer);
@@ -344,6 +388,7 @@ mod tests {
             term_info_reader.value(0),
             &TermInfo {
                 pnorms_offset: None,
+                freqs_range: None,
                 doc_freq: 120u32,
                 postings_range: 17..45,
                 positions_range: 10..122

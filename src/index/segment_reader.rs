@@ -329,6 +329,22 @@ impl SegmentReader {
             DeferredFileSlice::new(positions_file_opener),
             record_option,
         )?;
+        if record_option.has_freq() {
+            match self.open_read(SegmentComponent::TermFrequencies) {
+                Ok(source) => inv_idx_reader.set_freqs_file(DeferredFileSlice::new(move || {
+                    CompositeFile::open(&source)?
+                        .open_read(field)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "missing field in term frequency component",
+                            )
+                        })
+                })),
+                Err(OpenReadError::FileDoesNotExist(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         if field_entry.has_fieldnorms() {
             match self.open_read(SegmentComponent::PostingNorms) {
                 Ok(source) => {
@@ -412,10 +428,16 @@ impl SegmentReader {
             DataCorruption::comment_only(error_msg)
         })?;
 
+        let freqs_file = match self.open_read(SegmentComponent::TermFrequencies) {
+            Ok(file) => CompositeFile::open(&file)?.open_read(field),
+            Err(OpenReadError::FileDoesNotExist(_)) => None,
+            Err(error) => return Err(error.into()),
+        };
         let inv_idx_reader = Arc::new(MergeOptimizedInvertedIndexReader::new(
             TermDictionary::open(termdict_file)?,
             postings_file,
             positions_file,
+            freqs_file,
             record_option,
         )?);
 
@@ -630,6 +652,7 @@ impl SegmentReader {
             SegmentComponent::TempStore => ".store.temp".to_string(),
             SegmentComponent::FastFields => ".fast".to_string(),
             SegmentComponent::FieldNorms => ".fieldnorm".to_string(),
+            SegmentComponent::TermFrequencies => ".freqs".to_string(),
             SegmentComponent::PostingNorms => ".pnorm".to_string(),
             SegmentComponent::Delete => format!(".{}.del", self.delete_opstamp().unwrap_or(0)),
             SegmentComponent::Custom(ext) => format!(".{ext}"),

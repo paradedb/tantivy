@@ -20,6 +20,7 @@ pub(crate) struct MergeOptimizedInvertedIndexReader {
     termdict: TermDictionary,
     postings_reader: BufferedFileSlice,
     positions_reader: BufferedFileSlice,
+    freqs_reader: Option<BufferedFileSlice>,
     record_option: IndexRecordOption,
 }
 
@@ -28,6 +29,7 @@ impl MergeOptimizedInvertedIndexReader {
         termdict: TermDictionary,
         postings_file_slice: FileSlice,
         positions_file_slice: FileSlice,
+        freqs_file_slice: Option<FileSlice>,
         record_option: IndexRecordOption,
     ) -> io::Result<MergeOptimizedInvertedIndexReader> {
         let (_, postings_body) = postings_file_slice.split(8);
@@ -35,6 +37,7 @@ impl MergeOptimizedInvertedIndexReader {
             termdict,
             postings_reader: BufferedFileSlice::new_with_default_buffer_size(postings_body),
             positions_reader: BufferedFileSlice::new_with_default_buffer_size(positions_file_slice),
+            freqs_reader: freqs_file_slice.map(BufferedFileSlice::new_with_default_buffer_size),
             record_option,
         })
     }
@@ -46,6 +49,7 @@ impl MergeOptimizedInvertedIndexReader {
             termdict: TermDictionary::empty(),
             postings_reader: BufferedFileSlice::empty(),
             positions_reader: BufferedFileSlice::empty(),
+            freqs_reader: None,
             record_option,
         }
     }
@@ -67,9 +71,25 @@ impl MergeOptimizedInvertedIndexReader {
         let postings_data = self.postings_reader.get_bytes(
             term_info.postings_range.start as u64..term_info.postings_range.end as u64,
         )?;
+        let freqs = term_info
+            .freqs_range
+            .as_ref()
+            .map(|range| {
+                self.freqs_reader
+                    .as_ref()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "missing term frequency component",
+                        )
+                    })?
+                    .get_bytes(range.start as u64..range.end as u64)
+            })
+            .transpose()?;
         BlockSegmentPostings::open(
             term_info.doc_freq,
             postings_data,
+            freqs,
             self.record_option,
             requested_option,
         )
