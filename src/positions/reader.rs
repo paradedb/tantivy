@@ -1,8 +1,9 @@
 use std::io;
+use std::ops::Range;
 
-use common::{BinarySerializable, VInt};
+use common::{BinarySerializable, HasLen, VInt};
 
-use crate::directory::OwnedBytes;
+use crate::directory::{FileSlice, OwnedBytes};
 use crate::positions::COMPRESSION_BLOCK_SIZE;
 use crate::postings::compression::{BlockDecoder, VIntDecoder};
 
@@ -19,7 +20,8 @@ use crate::postings::compression::{BlockDecoder, VIntDecoder};
 #[derive(Clone)]
 pub struct PositionReader {
     bit_widths: OwnedBytes,
-    positions: OwnedBytes,
+    positions: PositionData,
+    positions_byte_offset: usize,
 
     block_decoder: BlockDecoder,
 
@@ -27,36 +29,145 @@ pub struct PositionReader {
     // block_offset is a multiple of COMPRESSION_BLOCK_SIZE.
     block_offset: u64,
     // offset, expressed in positions, for the position of the first block encoded
-    // in the `self.positions` bytes, and if bitpacked, compressed using the bitwidth in
-    // `self.bit_widths`.
+    // in `positions`, and if bitpacked, compressed using the bitwidth in `bit_widths`.
     //
     // As we advance, anchor increases simultaneously with bit_widths and positions get consumed.
     anchor_offset: u64,
 
-    // These are just copies used for .reset().
+    // These are copies used for .reset().
     original_bit_widths: OwnedBytes,
-    original_positions: OwnedBytes,
+    original_positions_byte_offset: usize,
+}
+
+#[derive(Clone)]
+enum PositionData {
+    Eager(OwnedBytes),
+    Lazy {
+        file: FileSlice,
+        buffer: OwnedBytes,
+        buffer_start: usize,
+    },
+}
+
+impl PositionData {
+    fn with_bytes<T>(
+        &mut self,
+        range: Range<usize>,
+        consume: impl FnOnce(&[u8]) -> T,
+    ) -> io::Result<T> {
+        if range.is_empty() {
+            return Ok(consume(&[]));
+        }
+        match self {
+            PositionData::Eager(bytes) => Ok(consume(&bytes.as_slice()[range])),
+            PositionData::Lazy {
+                file,
+                buffer,
+                buffer_start,
+            } => {
+                let buffer_end = *buffer_start + buffer.len();
+                if range.start < *buffer_start || range.end > buffer_end {
+                    let start = file.storage_block_range(range.start).unwrap().start;
+                    let end = file.storage_block_range(range.end - 1).unwrap().end;
+                    let overlap_start = start.max(*buffer_start);
+                    let overlap_end = end.min(buffer_end);
+                    *buffer = if overlap_start < overlap_end {
+                        let mut bytes = Vec::with_capacity(end - start);
+                        if start < overlap_start {
+                            bytes.extend_from_slice(&file.read_bytes_slice(start..overlap_start)?);
+                        }
+                        bytes.extend_from_slice(
+                            &buffer[overlap_start - *buffer_start..overlap_end - *buffer_start],
+                        );
+                        if overlap_end < end {
+                            bytes.extend_from_slice(&file.read_bytes_slice(overlap_end..end)?);
+                        }
+                        OwnedBytes::new(bytes)
+                    } else {
+                        file.read_bytes_slice(start..end)?
+                    };
+                    *buffer_start = start;
+                }
+                Ok(consume(
+                    &buffer[range.start - *buffer_start..range.end - *buffer_start],
+                ))
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            PositionData::Eager(bytes) => bytes.len(),
+            PositionData::Lazy { file, .. } => file.len(),
+        }
+    }
 }
 
 impl PositionReader {
-    /// Open and reads the term positions encoded into the positions_data owned bytes.
+    /// Opens term positions already loaded into contiguous memory.
     pub fn open(mut positions_data: OwnedBytes) -> io::Result<PositionReader> {
         let num_positions_bitpacked_blocks = VInt::deserialize(&mut positions_data)?.0 as usize;
         let (bit_widths, positions) = positions_data.split(num_positions_bitpacked_blocks);
-        Ok(PositionReader {
+        Ok(Self::from_parts(
+            bit_widths,
+            PositionData::Eager(positions),
+            0,
+        ))
+    }
+
+    /// Opens a term position stream, loading compressed blocks on demand for block-backed files.
+    pub(crate) fn open_file_slice(positions_data: FileSlice) -> io::Result<PositionReader> {
+        if positions_data.storage_block_len().is_none() {
+            return Self::open(positions_data.read_bytes()?);
+        }
+        let mut positions = PositionData::Lazy {
+            file: positions_data,
+            buffer: OwnedBytes::empty(),
+            buffer_start: 0,
+        };
+        let (num_positions_bitpacked_blocks, header_len) = positions
+            .with_bytes(0..positions.len().min(10), |mut bytes| {
+                VInt::deserialize_with_size(&mut bytes)
+            })??;
+        let num_positions_bitpacked_blocks = usize::try_from(num_positions_bitpacked_blocks.0)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "position block count is too large",
+                )
+            })?;
+        let positions_start = header_len
+            .checked_add(num_positions_bitpacked_blocks)
+            .filter(|&end| end <= positions.len())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "truncated position bit widths")
+            })?;
+        let bit_widths = positions.with_bytes(header_len..positions_start, |bytes| {
+            OwnedBytes::new(bytes.to_vec())
+        })?;
+        Ok(Self::from_parts(bit_widths, positions, positions_start))
+    }
+
+    fn from_parts(
+        bit_widths: OwnedBytes,
+        positions: PositionData,
+        positions_byte_offset: usize,
+    ) -> PositionReader {
+        PositionReader {
             bit_widths: bit_widths.clone(),
-            positions: positions.clone(),
+            positions,
+            positions_byte_offset,
             block_decoder: BlockDecoder::default(),
             block_offset: i64::MAX as u64,
             anchor_offset: 0u64,
             original_bit_widths: bit_widths,
-            original_positions: positions,
-        })
+            original_positions_byte_offset: positions_byte_offset,
+        }
     }
 
     fn reset(&mut self) {
-        self.positions = self.original_positions.clone();
         self.bit_widths = self.original_bit_widths.clone();
+        self.positions_byte_offset = self.original_positions_byte_offset;
         self.block_offset = i64::MAX as u64;
         self.anchor_offset = 0u64;
     }
@@ -72,7 +183,7 @@ impl PositionReader {
             .sum();
         let num_bytes_to_skip = num_bits * COMPRESSION_BLOCK_SIZE / 8;
         self.bit_widths.advance(num_blocks);
-        self.positions.advance(num_bytes_to_skip);
+        self.positions_byte_offset += num_bytes_to_skip;
         self.anchor_offset += (num_blocks * COMPRESSION_BLOCK_SIZE) as u64;
     }
 
@@ -87,17 +198,27 @@ impl PositionReader {
             .sum::<usize>()
             * COMPRESSION_BLOCK_SIZE
             / 8;
-        let compressed_data = &self.positions.as_slice()[byte_offset..];
-        if bit_widths.len() > block_rel_id {
-            // that block is bitpacked.
-            let bit_width = bit_widths[block_rel_id];
-            self.block_decoder
-                .uncompress_block_unsorted(compressed_data, bit_width, false);
+        let start = self.positions_byte_offset + byte_offset;
+        let is_bitpacked = bit_widths.len() > block_rel_id;
+        let end = if is_bitpacked {
+            start + bit_widths[block_rel_id] as usize * COMPRESSION_BLOCK_SIZE / 8
         } else {
-            // that block is vint encoded.
-            self.block_decoder
-                .uncompress_vint_unsorted_until_end(compressed_data);
-        }
+            self.positions.len()
+        };
+        let block_decoder = &mut self.block_decoder;
+        self.positions
+            .with_bytes(start..end, |compressed_data| {
+                if is_bitpacked {
+                    block_decoder.uncompress_block_unsorted(
+                        compressed_data,
+                        bit_widths[block_rel_id],
+                        false,
+                    );
+                } else {
+                    block_decoder.uncompress_vint_unsorted_until_end(compressed_data);
+                }
+            })
+            .expect("position data became unreadable after the reader was opened");
         self.block_offset = self.anchor_offset + (block_rel_id * COMPRESSION_BLOCK_SIZE) as u64;
     }
 
@@ -112,7 +233,7 @@ impl PositionReader {
         if !(0..128).contains(&delta_to_block_offset) {
             // The first position is not within the first block.
             // (Note that it could be before or after)
-            // We need to possibly skip a few blocks, and decompress the first relevant  block.
+            // We need to possibly skip a few blocks, and decompress the first relevant block.
             let delta_to_anchor_offset = offset - self.anchor_offset;
             let num_blocks_to_skip =
                 (delta_to_anchor_offset / (COMPRESSION_BLOCK_SIZE as u64)) as usize;
