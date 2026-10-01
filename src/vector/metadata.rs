@@ -1,6 +1,6 @@
 //! Stored field descriptions and the column contract. See FORMAT.md.
 use std::hash::{Hash, Hasher};
-use std::io;
+use std::{fmt, io};
 
 use common::BinarySerializable;
 
@@ -46,6 +46,32 @@ pub enum Partition {
         /// Maximum number of rows in a block.
         rows_per_block: u32,
     },
+}
+
+/// The stable public name of a quantizer family; adding a quantizer adds a variant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum QuantizerKind {
+    /// One-bit signs scored as popcounted words.
+    Sign,
+    /// Packed scalar codes scored against reconstruction points.
+    Grid,
+}
+
+impl QuantizerKind {
+    /// Returns the stable public name of this quantizer family.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Sign => "sign",
+            Self::Grid => "grid",
+        }
+    }
+}
+
+impl fmt::Display for QuantizerKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
 }
 /// Tagged encode/decode contract; a semantic change requires a new variant.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -215,6 +241,14 @@ impl SlotType {
     }
 }
 impl Quantizer {
+    /// Returns the quantizer family independently of its width and rotation.
+    pub const fn kind(&self) -> QuantizerKind {
+        match self {
+            Self::SignPlane { .. } => QuantizerKind::Sign,
+            Self::GridPlane { .. } => QuantizerKind::Grid,
+        }
+    }
+
     /// Sign codes are decoded as words; grid codes are decoded as bytes.
     pub(crate) const fn codes_elem(&self) -> ElemType {
         match self {
@@ -725,6 +759,17 @@ mod tests {
         )
         .unwrap();
         VectorColMetadata::build_ivf(&opts, Some(&config)).unwrap()
+    }
+
+    #[test]
+    fn quantizer_kind_names() {
+        for (kind, name) in [(QuantizerKind::Sign, "sign"), (QuantizerKind::Grid, "grid")] {
+            assert_eq!(kind.name(), name);
+            assert_eq!(kind.to_string(), name);
+        }
+        let meta = metadata(Metric::L2, &[1, 4]);
+        assert_eq!(meta.layers()[0].kind(), QuantizerKind::Sign);
+        assert_eq!(meta.layers()[1].kind(), QuantizerKind::Grid);
     }
     // Pins ordered slot semantics, widths, strides, and scan-band ownership.
     #[test]

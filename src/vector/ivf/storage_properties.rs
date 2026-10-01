@@ -62,6 +62,14 @@ fn fixture_with_deletes(
     schedule: &[u8],
     deletes: bool,
 ) -> crate::Result<(Index, PagedDirectory)> {
+    fixture_with_seed(metric, schedule, deletes, None)
+}
+fn fixture_with_seed(
+    metric: Metric,
+    schedule: &[u8],
+    deletes: bool,
+    seed: Option<u64>,
+) -> crate::Result<(Index, PagedDirectory)> {
     let mut schema = Schema::builder();
     let vector = schema.add_vector_field("embedding", VectorOptions::new(DIM, metric));
     let label = schema.add_text_field("label", STRING | STORED);
@@ -74,7 +82,13 @@ fn fixture_with_deletes(
             vector_quantization: if schedule.is_empty() {
                 Vec::new()
             } else {
-                vec![quant_fixture_config_for(DIM, metric, schedule)]
+                let mut config = quant_fixture_config_for(DIM, metric, schedule);
+                if let Some(seed) = seed {
+                    for (layer, quant) in config.layers.iter_mut().enumerate() {
+                        quant.seed = seed + layer as u64;
+                    }
+                }
+                vec![config]
             },
             ..Default::default()
         })
@@ -960,6 +974,44 @@ fn exact_filter_reads_only_survivor_pages() -> crate::Result<()> {
 }
 
 #[test]
+fn diagnostic_schedules_ignore_rotation_seeds() -> crate::Result<()> {
+    use crate::vector::{QuantizerKind, VectorEstimatorQuery, VectorEstimatorSource};
+
+    let measure = |seed| -> crate::Result<_> {
+        let (index, _) = fixture_with_seed(Metric::Cosine, &[1, 4], false, Some(seed))?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let segment = &searcher.segment_readers()[0];
+        let vectors = segment.vector_index(index.schema().get_field("embedding")?)?;
+        let rotation = vectors.metadata().unwrap().layers()[0].rotation();
+        let queries = [VectorEstimatorQuery {
+            values: input_vector(DOCS),
+            excluded_doc_id: None,
+        }];
+        let audit = vectors
+            .audit_error_queries(VectorEstimatorSource::Provided, &queries, 30, None)?
+            .unwrap();
+        let estimator = vectors
+            .measure_estimator_queries(VectorEstimatorSource::Provided, &queries, 30, None)?
+            .unwrap();
+        assert_eq!(audit.schedule(), estimator.schedule());
+        Ok((rotation, audit, estimator))
+    };
+    let (left_rotation, mut left_audit, mut left_estimator) = measure(7)?;
+    let (right_rotation, right_audit, right_estimator) = measure(11)?;
+    assert_ne!(left_rotation, right_rotation);
+    assert_eq!(left_audit.schedule(), right_audit.schedule());
+    assert_eq!(left_estimator.schedule(), right_estimator.schedule());
+    assert_eq!(
+        left_audit.schedule(),
+        &[(QuantizerKind::Sign, 1), (QuantizerKind::Grid, 4)]
+    );
+    left_estimator.merge(&right_estimator)?;
+    left_audit.merge(&right_audit)?;
+    Ok(())
+}
+
+#[test]
 fn diagnostics_skip_empty_clusters() -> crate::Result<()> {
     use crate::vector::index_reader::{VectorEstimatorQuery, VectorEstimatorSource};
     let (index, _) = fixture(Metric::Cosine, &[1, 4])?;
@@ -980,7 +1032,10 @@ fn diagnostics_skip_empty_clusters() -> crate::Result<()> {
             segment.alive_bitset(),
         )?
         .unwrap();
-    assert_eq!(audit.schedule(), &[("SignPlane", 1), ("GridPlane", 4)]);
+    assert_eq!(
+        audit.schedule(),
+        &[(crate::vector::QuantizerKind::Sign, 1), (crate::vector::QuantizerKind::Grid, 4)]
+    );
     assert_eq!(audit.estimator.sample_rows(), 30);
     let estimates = vectors
         .measure_estimator_queries(

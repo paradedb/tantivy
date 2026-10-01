@@ -20,7 +20,7 @@ use super::blocks::{BlockMetadata, Blocks};
 use super::flat::IdMap;
 use super::header::{read_centroid_header, read_vector_header, CentroidSlot, VectorEntry};
 use super::ivf::{decode_row, IvfIndex, CENTROIDS_EXT};
-use super::metadata::{SlotType, VectorColMetadata};
+use super::metadata::{QuantizerKind, SlotType, VectorColMetadata};
 use super::prepared::{
     corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix,
     quantized_model_sigma, refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError,
@@ -115,7 +115,7 @@ impl VectorEstimatorMoments {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VectorEstimatorMeasurements {
     source: VectorEstimatorSource,
-    schedule: Vec<(&'static str, u8)>,
+    schedule: Vec<(QuantizerKind, u8)>,
     aggregate: Vec<VectorEstimatorMoments>,
     per_query: Vec<Vec<VectorEstimatorMoments>>,
     sample_rows: u64,
@@ -364,7 +364,7 @@ const ERROR_CONE_TOP_K: usize = 10;
 
 impl VectorErrorAuditMeasurements {
     /// Ordered quantizer kinds and widths, independent of rotation seeds.
-    pub fn schedule(&self) -> &[(&'static str, u8)] {
+    pub fn schedule(&self) -> &[(QuantizerKind, u8)] {
         self.estimator.schedule()
     }
 
@@ -622,7 +622,7 @@ fn observe_error_cone_depth(
 
 impl VectorEstimatorMeasurements {
     /// Ordered quantizer kinds and widths, independent of rotation seeds.
-    pub fn schedule(&self) -> &[(&'static str, u8)] {
+    pub fn schedule(&self) -> &[(QuantizerKind, u8)] {
         &self.schedule
     }
 
@@ -1986,15 +1986,7 @@ impl VectorIndexReader {
                     .meta
                     .layers()
                     .iter()
-                    .map(|q| {
-                        (
-                            match q {
-                                super::metadata::Quantizer::SignPlane { .. } => "SignPlane",
-                                super::metadata::Quantizer::GridPlane { .. } => "GridPlane",
-                            },
-                            q.bits(),
-                        )
-                    })
+                    .map(|q| (q.kind(), q.bits()))
                     .collect(),
                 aggregate: vec![VectorEstimatorMoments::default(); layer_count],
                 per_query: vec![
@@ -3374,7 +3366,7 @@ mod tests {
     fn estimator_merge_sums_rows_and_preserves_query_count() {
         let measurement = |sample_rows, query_count, value| VectorEstimatorMeasurements {
             source: VectorEstimatorSource::Provided,
-            schedule: vec![("SignPlane", 1)],
+            schedule: vec![(QuantizerKind::Sign, 1)],
             aggregate: vec![VectorEstimatorMoments {
                 sample_count: 1,
                 normalized_error_sum: value,
@@ -3405,20 +3397,23 @@ mod tests {
 
     #[test]
     fn measurement_merges_reject_different_schedules() {
-        let measurement = |bits: &[u8]| VectorEstimatorMeasurements {
+        use QuantizerKind::{Grid, Sign};
+
+        let measurement = |schedule: &[(QuantizerKind, u8)]| VectorEstimatorMeasurements {
             source: VectorEstimatorSource::Provided,
-            schedule: bits
-                .iter()
-                .map(|&bits| (if bits == 1 { "SignPlane" } else { "GridPlane" }, bits))
-                .collect(),
-            aggregate: vec![VectorEstimatorMoments::default(); bits.len()],
-            per_query: vec![vec![VectorEstimatorMoments::default(); bits.len()]],
+            schedule: schedule.to_vec(),
+            aggregate: vec![VectorEstimatorMoments::default(); schedule.len()],
+            per_query: vec![vec![VectorEstimatorMoments::default(); schedule.len()]],
             sample_rows: 0,
             query_count: 1,
         };
-        for (left, right) in [(&[1][..], &[1, 4][..]), (&[1, 4], &[2, 4])] {
-            let a = measurement(left);
-            let b = measurement(right);
+        for (left, right) in [
+            (vec![(Sign, 1)], vec![(Sign, 1), (Grid, 4)]),
+            (vec![(Sign, 1), (Grid, 4)], vec![(Grid, 2), (Grid, 4)]),
+            (vec![(Sign, 1)], vec![(Grid, 1)]),
+        ] {
+            let a = measurement(&left);
+            let b = measurement(&right);
             let expected = format!(
                 "different schedules: {:?} and {:?}",
                 a.schedule(),
@@ -3453,7 +3448,7 @@ mod tests {
     fn estimator_error_sign_is_estimate_minus_exact() {
         let mut measurements = VectorEstimatorMeasurements {
             source: VectorEstimatorSource::Provided,
-            schedule: vec![("SignPlane", 1)],
+            schedule: vec![(QuantizerKind::Sign, 1)],
             aggregate: vec![VectorEstimatorMoments::default()],
             per_query: vec![vec![VectorEstimatorMoments::default()]],
             sample_rows: 1,
