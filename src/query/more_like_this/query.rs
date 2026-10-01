@@ -46,9 +46,7 @@ impl MoreLikeThisQuery {
 impl QueryEstimate for MoreLikeThisQuery {
     /// We don't have access to the reconstructed document here, so we use a 1% fallback.
     fn estimate_docs(&self, reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
-        let max_doc = reader.max_doc();
-        let count = max_doc.div_ceil(100);
-        Ok(Some((count, u64::from(max_doc))))
+        self.mlt.estimate_docs(reader)
     }
 }
 

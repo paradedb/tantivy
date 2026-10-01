@@ -4,7 +4,7 @@ use std::collections::{BinaryHeap, HashMap};
 use tokenizer_api::Token;
 
 use crate::query::bm25::idf;
-use crate::query::{BooleanQuery, BoostQuery, Occur, Query, TermQuery};
+use crate::query::{BooleanQuery, BoostQuery, Occur, Query, QueryEstimate, TermQuery};
 use crate::schema::document::{Document, Value};
 use crate::schema::{Field, FieldType, IndexRecordOption, Term};
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TokenStream, Tokenizer};
@@ -76,6 +76,14 @@ impl Default for MoreLikeThis {
             boost_factor: Some(1.0),
             stop_words: vec![],
         }
+    }
+}
+
+impl QueryEstimate for MoreLikeThis {
+    /// We don't have access to the reconstructed document here, so we use a 1% fallback.
+    fn estimate_docs(&self, reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        let max_doc = reader.max_doc();
+        Ok(Some((max_doc.div_ceil(100), u64::from(max_doc))))
     }
 }
 
