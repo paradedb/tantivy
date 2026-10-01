@@ -296,6 +296,11 @@ impl FileSlice {
         Some((self.range.start + offset) / block_len)
     }
 
+    /// Logical byte capacity of one independently readable storage block.
+    pub fn storage_block_len(&self) -> Option<usize> {
+        self.data.storage_block_len()
+    }
+
     /// Reads a specific slice of data.
     ///
     /// This is equivalent to running `file_slice.slice(from, to).read_bytes()`.
