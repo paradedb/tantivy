@@ -445,12 +445,7 @@ impl serde::Serialize for LayerProbeStatsSet {
                 &format!("layer{index}_sign_word_fallbacks"),
                 &layer.sign_word_fallbacks,
             )?;
-            map.serialize_entry(&format!("layer{index}_reads"), &layer.io.reads)?;
-            map.serialize_entry(&format!("layer{index}_bytes_read"), &layer.io.bytes_read)?;
-            map.serialize_entry(
-                &format!("layer{index}_storage_blocks"),
-                &layer.io.storage_blocks,
-            )?;
+            serialize_prefixed(&layer.io, &format!("layer{index}"), &mut map)?;
             map.serialize_entry(&format!("layer{index}_scan_ns"), &layer.scan_ns)?;
             map.serialize_entry(&format!("layer{index}_scored"), &layer.scored)?;
             map.serialize_entry(&format!("layer{index}_survivors"), &layer.survivors)?;
@@ -478,6 +473,28 @@ impl LayerProbeStats {
     }
 }
 
+fn serialize_prefixed<M>(
+    io: &super::VectorIoStats,
+    prefix: &str,
+    map: &mut M,
+) -> Result<(), M::Error>
+where
+    M: serde::ser::SerializeMap,
+{
+    map.serialize_entry(&format!("{prefix}_reads"), &io.reads)?;
+    map.serialize_entry(&format!("{prefix}_bytes_read"), &io.bytes_read)?;
+    map.serialize_entry(&format!("{prefix}_storage_blocks"), &io.storage_blocks)
+}
+
+fn serialize_rerank_io<S>(io: &super::VectorIoStats, serializer: S) -> Result<S::Ok, S::Error>
+where S: serde::Serializer {
+    use serde::ser::SerializeMap;
+
+    let mut map = serializer.serialize_map(Some(3))?;
+    serialize_prefixed(io, "rerank", &mut map)?;
+    map.end()
+}
+
 /// Per-segment probe-loop instrumentation: a prune breakdown of every
 /// doc the inner loop touched, plus posting-fetch counters. Returned by
 /// [`VectorBackend::top_n`] alongside the hits. The flat/exact path fills
@@ -485,6 +502,7 @@ impl LayerProbeStats {
 #[derive(Debug, Default, serde::Serialize)]
 pub struct ProbeStats {
     /// Actual row-fetch requests during exact reranking.
+    #[serde(flatten, serialize_with = "serialize_rerank_io")]
     pub rerank_io: super::VectorIoStats,
     /// Docs that passed filter + alive + seen and were scored against the
     /// query. This stays the "scored" bucket and equals the final survivor
@@ -5020,6 +5038,11 @@ mod tests {
     #[test]
     fn probe_stats_serializes_to_json() {
         let mut stats = ProbeStats {
+            rerank_io: super::super::VectorIoStats {
+                reads: 2,
+                bytes_read: 256,
+                storage_blocks: 3,
+            },
             candidates_scored: 10,
             layer0_eligible: 10,
             clusters_skipped_empty: 2,
@@ -5075,10 +5098,10 @@ mod tests {
         ] {
             assert_eq!(object.remove(key).unwrap(), 0);
         }
-        assert_eq!(
-            object.remove("rerank_io").unwrap(),
-            serde_json::json!({"reads": 0, "bytes_read": 0, "storage_blocks": 0})
-        );
+        assert_eq!(object.remove("rerank_reads").unwrap(), 2);
+        assert_eq!(object.remove("rerank_bytes_read").unwrap(), 256);
+        assert_eq!(object.remove("rerank_storage_blocks").unwrap(), 3);
+        assert!(!object.contains_key("rerank_io"));
         assert_eq!(
             value,
             serde_json::json!({

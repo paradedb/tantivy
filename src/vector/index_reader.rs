@@ -1546,7 +1546,8 @@ pub struct VectorIndexReader {
 
 impl VectorFieldReader {
     /// Opens `field`'s vector data in `segment_reader`'s segment. Returns the
-    /// metadata placeholder when the segment has no `.vec` file.
+    /// metadata placeholder when the segment has no `.vec` file. The vector header is
+    /// validated before reading centroid data so unsupported formats have a typed error.
     pub(crate) fn open(segment_reader: &SegmentReader, field: Field) -> crate::Result<Self> {
         let entry = segment_reader.schema().get_field_entry(field);
         let options = match entry.field_type() {
@@ -1558,6 +1559,20 @@ impl VectorFieldReader {
                 )));
             }
         };
+
+        let vec_file = match segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))
+        {
+            Ok(file) => file,
+            Err(OpenReadError::FileDoesNotExist(_)) => {
+                return Ok(Self {
+                    options,
+                    source: None,
+                    search: OnceLock::new(),
+                })
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let (_, body) = read_vector_header(&vec_file)?;
 
         let centroid_slots =
             match segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string())) {
@@ -1592,19 +1607,6 @@ impl VectorFieldReader {
                 Err(err) => return Err(err.into()),
             };
 
-        let vec_file = match segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))
-        {
-            Ok(file) => file,
-            Err(OpenReadError::FileDoesNotExist(_)) => {
-                return Ok(Self {
-                    options,
-                    source: None,
-                    search: OnceLock::new(),
-                })
-            }
-            Err(err) => return Err(err.into()),
-        };
-        let (_, body) = read_vector_header(&vec_file)?;
         let vec_composite = CompositeFile::open(&body)?;
         validate_vector_entries(&vec_composite, field)?;
         let data = vec_composite
