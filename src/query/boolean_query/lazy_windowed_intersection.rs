@@ -352,4 +352,49 @@ mod tests {
         let scorer = LazyWindowedIntersectionScorer::new(scorers, Score::MIN);
         assert_eq!(scorer.doc(), TERMINATED);
     }
+    #[test]
+    fn test_unscored_windowed_matches_oracle() {
+        for seed in 0u32..24 {
+            let lists: Vec<Vec<u32>> = (0..3)
+                .map(|term| {
+                    (0u32..10000)
+                        .filter(|doc| {
+                            doc.wrapping_mul(2654435761)
+                                .wrapping_add(seed * 97 + term * 113)
+                                .rotate_left(term * 7)
+                                % 10
+                                < 7
+                        })
+                        .collect()
+                })
+                .collect();
+            let expected: Vec<u32> = lists[0]
+                .iter()
+                .copied()
+                .filter(|doc| {
+                    lists[1].binary_search(doc).is_ok() && lists[2].binary_search(doc).is_ok()
+                })
+                .collect();
+            let mut scorer =
+                LazyWindowedIntersectionScorer::new_without_scoring(make_test_scorers(&lists));
+            let mut actual = Vec::new();
+            while scorer.doc() != TERMINATED {
+                actual.push(scorer.doc());
+                scorer.advance();
+            }
+            assert_eq!(actual, expected);
+            let mut scorer =
+                LazyWindowedIntersectionScorer::new_without_scoring(make_test_scorers(&lists));
+            for target in (0..11000).step_by(137) {
+                assert_eq!(
+                    scorer.seek(target),
+                    expected
+                        .iter()
+                        .copied()
+                        .find(|doc| *doc >= target)
+                        .unwrap_or(TERMINATED)
+                );
+            }
+        }
+    }
 }

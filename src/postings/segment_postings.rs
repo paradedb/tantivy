@@ -123,6 +123,7 @@ impl SegmentPostings {
         window_end: DocId,
         mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
     ) {
+        let window_end = window_end.min(TERMINATED);
         if self.doc() < window_start {
             self.seek(window_start);
         }
@@ -283,7 +284,13 @@ impl DocSet for SegmentPostings {
         min_doc: DocId,
         mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
     ) -> DocId {
-        self.fill_bitset_window(min_doc, min_doc.saturating_add(crate::docset::BLOCK_WINDOW).min(TERMINATED), mask);
+        self.fill_bitset_window(
+            min_doc,
+            min_doc
+                .saturating_add(crate::docset::BLOCK_WINDOW)
+                .min(TERMINATED),
+            mask,
+        );
         self.doc()
     }
 
@@ -432,5 +439,34 @@ mod tests {
         let all_deleted =
             AliveBitSet::for_test_from_deleted_docs(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], 12);
         assert_eq!(docs.doc_freq_given_deletes(&all_deleted), 0);
+    }
+    #[test]
+    fn test_batched_windows_match_posting_ids() {
+        use crate::docset::{BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW};
+        use common::TinySet;
+        for len in [0, 1, 127, 128, 129, 256, 1024, 8193] {
+            let docs: Vec<u32> = (0..len).map(|i| i * 3 + 7).collect();
+            let mut postings = SegmentPostings::create_from_docs(&docs);
+            let mut actual = Vec::new();
+            let mut start = 0;
+            while postings.doc() != TERMINATED {
+                let mut mask = [TinySet::empty(); BLOCK_NUM_TINYBITSETS];
+                postings.fill_bitset_block(start, &mut mask);
+                for (bucket, bits) in mask.iter_mut().enumerate() {
+                    while let Some(bit) = bits.pop_lowest() {
+                        actual.push(start + bucket as u32 * 64 + bit);
+                    }
+                }
+                start += BLOCK_WINDOW;
+            }
+            assert_eq!(actual, docs);
+        }
+        let mut postings = SegmentPostings::create_from_docs(&[TERMINATED - 2, TERMINATED - 1]);
+        let mut mask = [TinySet::empty(); BLOCK_NUM_TINYBITSETS];
+        assert_eq!(
+            postings.fill_bitset_block(TERMINATED - 64, &mut mask),
+            TERMINATED
+        );
+        assert_eq!(mask.iter().map(|m| m.len()).sum::<u32>(), 2);
     }
 }

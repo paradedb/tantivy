@@ -177,7 +177,6 @@ impl BlockWandIntersectionScorer {
                     continue 'next_candidate;
                 }
 
-
                 // Prune: even if all remaining secondaries score at their block max,
                 // can we still beat the threshold?
                 // Only evaluate scores if the suffix bound is below threshold, which
@@ -185,10 +184,11 @@ impl BlockWandIntersectionScorer {
                 if self.secondary_suffix_block_max[secondary_idx] < self.threshold {
                     for s in &mut self.secondaries[scored_up_to..=secondary_idx] {
                         total_score += if SHARED_NORMS {
-                        s.bm25_weight().score(self.candidate_norms[self.candidate_idx], s.term_freq())
-                    } else {
-                        s.score()
-                    };
+                            s.bm25_weight()
+                                .score(self.candidate_norms[self.candidate_idx], s.term_freq())
+                        } else {
+                            s.score()
+                        };
                     }
                     scored_up_to = secondary_idx + 1;
 
@@ -204,10 +204,11 @@ impl BlockWandIntersectionScorer {
             // All secondaries matched. Finish scoring any un-scored secondaries.
             for s in &mut self.secondaries[scored_up_to..] {
                 total_score += if SHARED_NORMS {
-                        s.bm25_weight().score(self.candidate_norms[self.candidate_idx], s.term_freq())
-                    } else {
-                        s.score()
-                    };
+                    s.bm25_weight()
+                        .score(self.candidate_norms[self.candidate_idx], s.term_freq())
+                } else {
+                    s.score()
+                };
             }
 
             if total_score > self.threshold {
