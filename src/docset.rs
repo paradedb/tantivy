@@ -337,3 +337,18 @@ impl<TDocSet: DocSet + ?Sized> DocSet for Box<TDocSet> {
         unboxed.count_including_deleted()
     }
 }
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use crate::query::AllScorer;
+
+    #[test]
+    fn bitmap_fill_does_not_rewind_a_child() {
+        let mut scorer = AllScorer::new(2000);
+        assert_eq!(scorer.seek(1000), 1000);
+        let mut mask = [TinySet::empty(); BLOCK_NUM_TINYBITSETS];
+        assert_eq!(scorer.fill_bitset_block(0, &mut mask), 1024);
+        assert_eq!(mask.iter().map(|m| m.len()).sum::<u32>(), 24);
+    }
+}
