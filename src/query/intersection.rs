@@ -27,6 +27,18 @@ pub fn intersect_scorers(
     if scorers.len() == 1 {
         return scorers.pop().unwrap();
     }
+    if scorers.iter().all(|scorer| scorer.is::<TermScorer>()) {
+        let term_scorers: Vec<TermScorer> = scorers
+            .into_iter()
+            .map(|scorer| *(scorer.downcast::<TermScorer>().map_err(|_| ()).unwrap()))
+            .collect();
+        let intersection = Intersection::new(term_scorers, segment_num_docs);
+        if intersection.doc() == TERMINATED {
+            return Box::new(EmptyScorer);
+        } else {
+            return Box::new(intersection);
+        }
+    }
     // Order by estimated cost to drive each scorer.
     scorers.sort_by_key(|scorer| scorer.cost());
     let doc = go_to_first_doc(&mut scorers[..]);
