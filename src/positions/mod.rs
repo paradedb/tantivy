@@ -41,12 +41,17 @@ const COMPRESSION_BLOCK_SIZE: usize = BitPacker4x::BLOCK_LEN;
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::collections::HashSet;
+    use std::io;
+    use std::ops::Range;
+    use std::sync::{Arc, Mutex};
 
+    use common::HasLen;
     use proptest::prelude::*;
     use proptest::sample::select;
 
     use super::PositionSerializer;
-    use crate::directory::OwnedBytes;
+    use crate::directory::{FileHandle, FileSlice, OwnedBytes};
     use crate::positions::reader::PositionReader;
 
     fn create_positions_data(vals: &[u32]) -> crate::Result<OwnedBytes> {
@@ -56,6 +61,30 @@ pub(crate) mod tests {
         serializer.close_term()?;
         serializer.close()?;
         Ok(OwnedBytes::new(positions_buffer))
+    }
+
+    #[derive(Debug)]
+    struct BlockBackedFile {
+        data: Vec<u8>,
+        reads: Arc<Mutex<Vec<Range<usize>>>>,
+        block_len: usize,
+    }
+
+    impl HasLen for BlockBackedFile {
+        fn len(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    impl FileHandle for BlockBackedFile {
+        fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+            self.reads.lock().unwrap().push(range.clone());
+            Ok(OwnedBytes::new(self.data[range].to_vec()))
+        }
+
+        fn storage_block_len(&self) -> Option<usize> {
+            Some(self.block_len)
+        }
     }
 
     fn gen_delta_positions() -> BoxedStrategy<Vec<u32>> {
@@ -144,6 +173,141 @@ pub(crate) mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_position_blocks_are_loaded_lazily() -> crate::Result<()> {
+        let position_deltas: Vec<u32> = (0..2_000).map(|position| position % 257).collect();
+        let positions_data = create_positions_data(&position_deltas)?;
+        let positions_len = positions_data.len();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let file = FileSlice::new(Arc::new(BlockBackedFile {
+            data: positions_data.as_slice().to_vec(),
+            reads: reads.clone(),
+            block_len: 17,
+        }));
+        let mut position_reader = PositionReader::open_file_slice(file)?;
+
+        assert!(reads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|range| range.len() < positions_len));
+
+        for &(offset, len) in &[(0, 300), (127, 257), (900, 600), (31, 129)] {
+            let mut output = vec![0; len];
+            position_reader.read(offset, &mut output);
+            assert_eq!(
+                output,
+                position_deltas[offset as usize..offset as usize + len]
+            );
+        }
+        assert!(reads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|range| range.len() < positions_len));
+        Ok(())
+    }
+
+    #[test]
+    fn test_position_storage_pages_are_reused() -> crate::Result<()> {
+        let mut repeated_pages = 0;
+        for (name, num_positions, step, block_len, term_offset, value) in [
+            ("tiny vint", 3, 1, 8192, 123, 255),
+            ("tiny bitpacked", 256, 128, 8192, 123, 255),
+            ("dense aligned", 262_161, 128, 8192, 0, 255),
+            ("dense unaligned", 262_161, 128, 8192, 123, 255),
+            (
+                "dense non-power-of-two pages",
+                262_161,
+                128,
+                8136,
+                16_395,
+                255,
+            ),
+            ("term straddling pages", 256, 128, 8192, 8191, 255),
+            ("sparse", 262_161, 16_384, 8192, 123, 255),
+            ("multi-page metadata", 1_049_233, 128, 8192, 8191, 255),
+            ("small pages", 2_049, 128, 17, 15, 255),
+            ("zero bit widths", 32_785, 128, 8192, 123, 0),
+        ] {
+            let position_deltas = vec![value; num_positions];
+            let positions_data = create_positions_data(&position_deltas)?;
+            let term_end = term_offset + positions_data.len();
+            let mut data = vec![0; term_offset];
+            data.extend_from_slice(&positions_data);
+            data.extend_from_slice(&[0; 32]);
+            let reads = Arc::new(Mutex::new(Vec::new()));
+            let file = FileSlice::new(Arc::new(BlockBackedFile {
+                data,
+                reads: reads.clone(),
+                block_len,
+            }))
+            .slice(term_offset / 2..term_end)
+            .slice_from(term_offset - term_offset / 2);
+            let mut reader = PositionReader::open_file_slice(file)?;
+            for offset in (0..num_positions).step_by(step) {
+                let mut output = vec![0; 128.min(num_positions - offset)];
+                reader.read(offset as u64, &mut output);
+                assert_eq!(output, position_deltas[offset..offset + output.len()]);
+            }
+            let reads = reads.lock().unwrap();
+            let mut pages = HashSet::new();
+            let mut page_accesses = 0;
+            for range in reads.iter().filter(|range| !range.is_empty()) {
+                assert!(range.start >= term_offset && range.end <= term_end);
+                assert!(range.start == term_offset || range.start % block_len == 0);
+                assert!(range.end == term_end || range.end % block_len == 0);
+                for page in range.start / block_len..=(range.end - 1) / block_len {
+                    page_accesses += 1;
+                    pages.insert(page);
+                }
+            }
+            eprintln!(
+                "{name}: {} reads, {page_accesses} page accesses, {} unique pages, {} bytes",
+                reads.len(),
+                pages.len(),
+                reads.iter().map(|range| range.len()).sum::<usize>()
+            );
+            repeated_pages += page_accesses - pages.len();
+            if step <= 128 {
+                assert_eq!(
+                    pages.len(),
+                    (term_end - 1) / block_len - term_offset / block_len + 1
+                );
+            } else {
+                assert!(pages.len() < (term_end - term_offset) / block_len);
+            }
+        }
+        assert_eq!(repeated_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_position_page_cache_survives_clone_and_reset() -> crate::Result<()> {
+        let position_deltas: Vec<u32> = (0..2_049).map(|position| position % 257).collect();
+        let positions_data = create_positions_data(&position_deltas)?;
+        let mut data = vec![0; 123];
+        data.extend_from_slice(&positions_data);
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let file = FileSlice::new(Arc::new(BlockBackedFile {
+            data,
+            reads: reads.clone(),
+            block_len: 8192,
+        }))
+        .slice_from(123);
+        let mut reader = PositionReader::open_file_slice(file)?;
+        reader.read(1_024, &mut [0; 128]);
+        for mut reader in [reader.clone(), reader] {
+            for (offset, len) in [(0, 256), (1_000, 500), (127, 1_922), (256, 1)] {
+                let mut output = vec![0; len];
+                reader.read(offset as u64, &mut output);
+                assert_eq!(output, position_deltas[offset..offset + len]);
+            }
+        }
+        assert_eq!(reads.lock().unwrap().len(), 1);
         Ok(())
     }
 

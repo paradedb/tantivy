@@ -310,8 +310,8 @@ impl InvertedIndexReader {
                 let positions_data = self
                     .positions_file_slice
                     .open()?
-                    .read_bytes_slice(term_info.positions_range.clone())?;
-                let position_reader = PositionReader::open(positions_data)?;
+                    .slice(term_info.positions_range.clone());
+                let position_reader = PositionReader::open_file_slice(positions_data)?;
                 Some(position_reader)
             } else {
                 None
