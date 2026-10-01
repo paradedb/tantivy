@@ -292,10 +292,7 @@ impl Weight for RegexPhraseWeight {
         init_threshold: Score,
     ) -> crate::Result<Box<dyn PruningScorer>> {
         if let Some(scorer) = self.phrase_scorer(reader, boost)? {
-            Ok(Box::new(BasicPruningScorer::new(
-                Box::new(scorer),
-                init_threshold,
-            )))
+            Ok(Box::new(BasicPruningScorer::new(scorer, init_threshold)))
         } else {
             Ok(Box::new(EmptyScorer))
         }
