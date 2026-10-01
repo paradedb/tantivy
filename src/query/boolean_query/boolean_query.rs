@@ -1,5 +1,6 @@
 use super::boolean_weight::BooleanWeight;
 use crate::query::bm25::BatchedStatistics;
+use crate::query::size_hint::{estimate_intersection, estimate_union};
 use crate::query::{EnableScoring, Occur, Query, SumCombiner, TermQuery, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::SegmentReader;
@@ -156,6 +157,68 @@ impl From<Vec<(Occur, Box<dyn Query>)>> for BooleanQuery {
 }
 
 impl Query for BooleanQuery {
+    fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        if self.subqueries.is_empty() {
+            return Ok(Some((0, 0)));
+        }
+        let occur = self.subqueries[0].0;
+        if !matches!(
+            (occur, self.minimum_number_should_match),
+            (Occur::Must, 0) | (Occur::Should, 0 | 1)
+        ) || self
+            .subqueries
+            .iter()
+            .any(|(child_occur, child)| *child_occur != occur || !child.is::<TermQuery>())
+        {
+            return Ok(None);
+        }
+
+        let mut sizes = Vec::with_capacity(self.subqueries.len());
+        for (_, child) in &self.subqueries {
+            let Some((count, _)) = child.estimate_docs(reader)? else {
+                return Ok(None);
+            };
+            if occur == Occur::Must {
+                if count == 0 {
+                    return Ok(Some((0, 0)));
+                }
+                if count != reader.max_doc() {
+                    sizes.push(count);
+                }
+            } else {
+                if count == reader.max_doc() {
+                    return Ok(Some((count, u64::from(count))));
+                }
+                if count != 0 {
+                    sizes.push(count);
+                }
+            }
+        }
+        if sizes.is_empty() {
+            let count = if occur == Occur::Must {
+                reader.max_doc()
+            } else {
+                0
+            };
+            return Ok(Some((count, u64::from(count))));
+        }
+        if sizes.len() == 1 {
+            return Ok(Some((sizes[0], u64::from(sizes[0]))));
+        }
+        if occur == Occur::Must {
+            sizes.sort_unstable();
+            Ok(Some((
+                estimate_intersection(sizes.iter().copied(), reader.num_docs()),
+                u64::from(sizes[0]),
+            )))
+        } else {
+            Ok(Some((
+                estimate_union(sizes.iter().copied(), reader.num_docs()),
+                sizes.iter().map(|&count| u64::from(count)).sum(),
+            )))
+        }
+    }
+
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let statistics;
         let term_scoring = if let EnableScoring::Enabled {

@@ -38,6 +38,10 @@ impl fmt::Debug for ConstScoreQuery {
 }
 
 impl Query for ConstScoreQuery {
+    fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        self.query.estimate_docs(reader)
+    }
+
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let inner_weight = self.query.weight(enable_scoring)?;
         Ok(if enable_scoring.is_scoring_enabled() {
