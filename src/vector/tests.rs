@@ -1511,6 +1511,7 @@ fn unsupported_vector_versions_remain_typed_on_open_and_merge() -> crate::Result
                 "version {version}: {error:?}"
             )
         };
+        assert_typed(segment.validate_vector_format().unwrap_err());
         assert_typed(reader.validate_vector_format().unwrap_err());
         assert_typed(
             reader
@@ -1574,16 +1575,49 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
             .err()
             .expect("unsupported segment");
         if version == 4 {
+            segment.validate_vector_format()?;
+            reader.validate_vector_format()?;
             assert!(
                 matches!(error, crate::TantivyError::InternalError(ref message) if message.contains("no router slot")),
                 "{error:?}"
             );
         } else {
+            for error in [
+                segment.validate_vector_format().unwrap_err(),
+                reader.validate_vector_format().unwrap_err(),
+            ] {
+                assert!(
+                    matches!(error, crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch { index_version, supported_version: 4 }) if index_version == version),
+                    "{error:?}"
+                );
+            }
             assert!(
                 matches!(error, crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch { index_version, supported_version: 4 }) if index_version == version),
                 "{error:?}"
             );
         }
     }
+    Ok(())
+}
+
+#[test]
+fn segments_without_vector_files_pass_format_validation() -> crate::Result<()> {
+    use crate::directory::RamDirectory;
+
+    let mut schema = Schema::builder();
+    let label = schema.add_text_field("label", STRING);
+    let index = Index::create(
+        RamDirectory::create(),
+        schema.build(),
+        IndexSettings::default(),
+    )?;
+    let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+    let mut doc = TantivyDocument::new();
+    doc.add_text(label, "present");
+    writer.add_document(doc)?;
+    writer.commit()?;
+    let segment = index.searchable_segments()?.remove(0);
+    segment.validate_vector_format()?;
+    crate::SegmentReader::open(&segment)?.validate_vector_format()?;
     Ok(())
 }

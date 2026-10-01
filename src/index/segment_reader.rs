@@ -14,7 +14,7 @@ use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
 use crate::index::merge_optimized_inverted_index_reader::MergeOptimizedInvertedIndexReader;
-use crate::index::{Index, InvertedIndexReader, Segment, SegmentComponent, SegmentId};
+use crate::index::{InvertedIndexReader, Segment, SegmentComponent, SegmentId};
 use crate::json_utils::json_path_sep_to_dot;
 use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
@@ -36,8 +36,7 @@ use crate::{DocId, Opstamp};
 /// as close to all of the memory data is mmapped.
 #[derive(Clone)]
 pub struct SegmentReader {
-    index: Index,
-    segment_id: SegmentId,
+    segment: Segment,
     custom_alive_bitset: Option<AliveBitSet>,
 
     inv_idx_reader_cache: Arc<RwLock<HashMap<Field, Arc<InvertedIndexReader>>>>,
@@ -83,7 +82,7 @@ impl SegmentReader {
     }
 
     pub(crate) fn sort_by_field(&self) -> Option<&crate::IndexSortByField> {
-        self.index.settings().sort_by_field.as_ref()
+        self.segment.index().settings().sort_by_field.as_ref()
     }
 
     /// Return the number of documents that have been
@@ -217,11 +216,7 @@ impl SegmentReader {
     /// Checks the vector format header without opening field readers or routing data.
     /// Segments without a vector file are accepted.
     pub fn validate_vector_format(&self) -> crate::Result<()> {
-        match self.open_read(SegmentComponent::Custom(crate::vector::VEC_EXT.to_string())) {
-            Ok(file) => crate::vector::header::read_vector_header(&file).map(|_| ()),
-            Err(OpenReadError::FileDoesNotExist(_)) => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        self.segment.validate_vector_format()
     }
 
     /// Open a new segment for reading.
@@ -235,8 +230,7 @@ impl SegmentReader {
         custom_bitset: Option<AliveBitSet>,
     ) -> crate::Result<SegmentReader> {
         Ok(SegmentReader {
-            index: segment.index().clone(),
-            segment_id: segment.id(),
+            segment: segment.clone(),
             custom_alive_bitset: custom_bitset,
 
             inv_idx_reader_cache: Default::default(),
@@ -315,7 +309,7 @@ impl SegmentReader {
         // we can defer opening the file until needed
         let positions_file_opener = {
             let path = self.relative_path(SegmentComponent::Positions);
-            let directory = self.index.directory().clone();
+            let directory = self.segment.index().directory().clone();
             let field_entry = field_entry.clone();
             move || {
                 let composite_file = if let Ok(positions_file) = &directory.open_read(&path) {
@@ -578,7 +572,7 @@ impl SegmentReader {
 
     /// Returns the segment id
     pub fn segment_id(&self) -> SegmentId {
-        self.segment_id
+        self.segment.id()
     }
 
     /// Returns the delete opstamp
@@ -615,7 +609,7 @@ impl SegmentReader {
     /// the non-plugin `deletes` entry (the alive bitset).
     pub fn space_usage(&self) -> io::Result<SegmentSpaceUsage> {
         let mut components: BTreeMap<String, ComponentSpaceUsage> = BTreeMap::new();
-        for plugin in self.index.all_plugins() {
+        for plugin in self.segment.index().all_plugins() {
             let plugin_usage = plugin
                 .space_usage(self)
                 .map_err(|err| io::Error::other(err.to_string()))?;
@@ -656,7 +650,7 @@ impl SegmentReader {
     /// Opens one of the component files for reading.
     pub fn open_read(&self, component: SegmentComponent) -> Result<FileSlice, OpenReadError> {
         let path = self.relative_path(component);
-        self.index.directory().open_read(&path)
+        self.segment.index().directory().open_read(&path)
     }
 
     #[inline]
