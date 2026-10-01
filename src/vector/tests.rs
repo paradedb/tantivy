@@ -305,7 +305,7 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
             let vec_file =
                 segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))?;
             let (version, body) = read_vector_header(&vec_file)?;
-            assert_eq!(version, VectorFileVersion::V3);
+            assert_eq!(version, VectorFileVersion::V4);
             // Body must be a valid composite — proves the stamp sits in front
             // of the framing, not inside a slot.
             CompositeFile::open(&body)?;
@@ -409,6 +409,7 @@ fn ivf_fixture_uses_custom_centroids_for_assignment() -> crate::Result<()> {
         for cluster_ord in 0..centroids.len() {
             let doc_ids = vec_reader
                 .cluster_doc_ids(cluster_ord)
+                .unwrap()
                 .expect("in-bounds cluster");
             for doc in doc_ids {
                 let vector: Vec<f32> = vec_reader
@@ -1411,4 +1412,118 @@ mod bounds_storage_tests {
         }
         Ok(())
     }
+}
+
+// Both flat write paths preserve rows across the stored uniform-group boundary.
+#[test]
+fn flat_uniform_boundary_survives_merge_and_sparse_presence() -> crate::Result<()> {
+    let r = super::metadata::FLAT_ROWS_PER_BLOCK as usize;
+    let mut schema = Schema::builder();
+    let dense = schema.add_vector_field("dense", VectorOptions::new(1, Metric::L2));
+    let sparse = schema.add_vector_field("sparse", VectorOptions::new(1, Metric::L2));
+    let index = Index::builder()
+        .schema(schema.build())
+        .settings(IndexSettings {
+            vector_clustering_threshold: usize::MAX,
+            ..Default::default()
+        })
+        .create_in_ram()?;
+    let mut writer = index.writer_with_num_threads(1, 30_000_000)?;
+    writer.set_merge_policy(Box::new(NoMergePolicy));
+    let mut segment_ids = Vec::new();
+    for doc in 0..2 * r + 3 {
+        let mut document = TantivyDocument::new();
+        document.add_vector(dense, &[doc as f32]);
+        if doc % 2 == 0 {
+            document.add_vector(sparse, &[doc as f32]);
+        }
+        writer.add_document(document)?;
+        if doc == r || doc == 2 * r + 2 {
+            writer.commit()?;
+            for id in index.searchable_segment_ids()? {
+                if !segment_ids.contains(&id) {
+                    segment_ids.push(id);
+                }
+            }
+        }
+    }
+    for merged in [false, true] {
+        if merged {
+            writer.merge(&segment_ids).wait()?;
+        }
+        let searcher = index.reader()?.searcher();
+        let mut doc_start = 0;
+        // Inspect each segment's exact bytes through the public row API. Its dense vector is the
+        // identity oracle.
+        for segment in searcher.segment_readers() {
+            let dense_reader = segment.vector_index(dense)?;
+            let sparse_reader = segment.vector_index(sparse)?;
+            for row in [0, r - 1, r, dense_reader.num_vectors().saturating_sub(1)] {
+                if row >= dense_reader.num_vectors() {
+                    continue;
+                }
+                let bytes = dense_reader.vector_bytes_for_row(row)?;
+                let value = f32::from_le_bytes(bytes.as_slice().try_into().unwrap()) as usize;
+                if let Some(sparse_bytes) = sparse_reader.vector_bytes(row as u32)? {
+                    assert_eq!(value % 2, 0);
+                    assert_eq!(bytes.as_slice(), sparse_bytes.as_slice());
+                } else {
+                    assert_eq!(value % 2, 1);
+                }
+            }
+            doc_start += dense_reader.num_vectors();
+        }
+        assert_eq!(doc_start, 2 * r + 3);
+    }
+    Ok(())
+}
+
+#[test]
+fn unsupported_vector_versions_remain_typed_on_open_and_merge() -> crate::Result<()> {
+    use crate::directory::error::Incompatibility;
+    use crate::directory::{Directory, RamDirectory};
+    use crate::index::SegmentComponent;
+    for version in [3u32, 99] {
+        let directory = RamDirectory::create();
+        let mut schema = Schema::builder();
+        let field = schema.add_vector_field("v", VectorOptions::new(2, Metric::L2));
+        let index = Index::create(directory.clone(), schema.build(), IndexSettings::default())?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for value in [1.0, 2.0] {
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(field, &[value, 0.0]);
+            writer.add_document(doc)?;
+            writer.commit()?;
+        }
+        let segment = index.searchable_segments()?.remove(0);
+        let path = segment.relative_path(SegmentComponent::Custom(super::VEC_EXT.into()));
+        let mut bytes = directory.atomic_read(&path)?;
+        bytes[..4].copy_from_slice(&version.to_le_bytes());
+        directory.atomic_write(&path, &bytes)?;
+        let reader = crate::SegmentReader::open(&segment)?;
+        let assert_typed = |error| {
+            assert!(
+                matches!(error,
+            crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch {
+                index_version, supported_version: 4,
+            }) if index_version == version),
+                "version {version}: {error:?}"
+            )
+        };
+        assert_typed(reader.validate_vector_format().unwrap_err());
+        assert_typed(
+            reader
+                .vector_index(field)
+                .err()
+                .expect("unsupported vector reader"),
+        );
+        assert_typed(reader.vector_metadata(field).unwrap_err());
+        assert_typed(
+            writer
+                .merge_foreground(&index.searchable_segment_ids()?, true)
+                .unwrap_err(),
+        );
+    }
+    Ok(())
 }

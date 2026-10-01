@@ -20,7 +20,10 @@ use cascade::{prepare_split_query_with_plan, LayerSpec, PreparedSplitQuery, Quer
 use quant_model::Grid;
 
 use super::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide};
-use super::quantization::{VectorQuantizationConfig, GAMMA_ANALYTICAL_SAFETY, SIGN_QUERY_BITS};
+use super::metadata::VectorColMetadata;
+#[cfg(test)]
+use super::quantization::VectorQuantizationConfig;
+use super::quantization::{GAMMA_ANALYTICAL_SAFETY, SIGN_QUERY_BITS};
 use super::VectorElement;
 use crate::schema::Metric;
 use crate::TantivyError;
@@ -48,7 +51,7 @@ enum QueryKind {
 /// Immutable quantization state for one segment's field, built when the
 /// segment's vector reader opens.
 pub(crate) struct QuantizedIndexCtx {
-    pub(crate) config: VectorQuantizationConfig,
+    pub(crate) meta: Arc<VectorColMetadata>,
     pub(crate) specs: Vec<LayerSpec>,
     pub(crate) grids: Vec<Grid>,
     rotation_plan: QueryRotationPlan,
@@ -216,45 +219,29 @@ pub(crate) fn quantized_model_sigma(
 }
 
 impl QuantizedIndexCtx {
-    pub(crate) fn new(config: VectorQuantizationConfig) -> crate::Result<Self> {
-        let specs: Vec<LayerSpec> = config
-            .layers
-            .iter()
-            .map(|layer| LayerSpec {
-                bits: layer.bits,
-                seed: layer.seed,
-                rotate: true,
-            })
-            .collect();
-        let grids: Vec<Grid> = config
-            .layers
-            .iter()
-            .map(|layer| {
-                let stored = config
-                    .grids
-                    .iter()
-                    .find(|grid| grid.bits == layer.bits)
-                    .ok_or_else(|| {
-                        TantivyError::InvalidArgument(format!(
-                            "quantization field {:?} layer width {} has no persisted grid/model \
-                             entry; rebuild required",
-                            config.field, layer.bits
-                        ))
-                    })?;
-                Ok(Grid {
-                    bits: layer.bits,
-                    points: stored.points.clone(),
-                    rho_model: stored.rho_model,
-                })
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
-        let rotation_plan = QueryRotationPlan::new(config.dim, &specs);
+    /// Builds query inputs only from the immutable segment metadata.
+    pub(crate) fn new(meta: Arc<VectorColMetadata>) -> crate::Result<Self> {
+        if !matches!(meta.as_ref(), VectorColMetadata::Quantized { .. }) {
+            return Err(TantivyError::InvalidArgument(
+                "prepared queries require quantized metadata".into(),
+            ));
+        }
+        let (specs, grids) = meta.runtime();
+        let rotation_plan = QueryRotationPlan::new(meta.field().dim as usize, &specs);
         Ok(Self {
-            config,
+            meta,
             specs,
             grids,
             rotation_plan,
         })
+    }
+    #[cfg(test)]
+    pub(crate) fn from_config(config: VectorQuantizationConfig) -> crate::Result<Self> {
+        let opts = crate::schema::VectorOptions::new(config.dim, config.metric);
+        Self::new(Arc::new(VectorColMetadata::build_ivf(
+            &opts,
+            Some(&config),
+        )?))
     }
 }
 
@@ -294,7 +281,7 @@ impl QuantizedQueryCtx {
         active_layers: usize,
     ) -> Self {
         assert!((1..=index.specs.len()).contains(&active_layers));
-        if index.config.metric == Metric::Cosine {
+        if index.meta.field().metric == Metric::Cosine {
             let norm = norm_squared_wide(&query).sqrt();
             if norm != 0.0 && norm.is_finite() {
                 let inv = (1.0 / norm) as f32;
@@ -325,11 +312,6 @@ impl QuantizedQueryCtx {
         self.active_layers
     }
 
-    /// Whether this query can score a segment quantized with `index`.
-    pub(crate) fn is_prepared_for(&self, index: &Arc<QuantizedIndexCtx>) -> bool {
-        Arc::ptr_eq(&self.index, index) || self.index.config == index.config
-    }
-
     /// Squared query-quantization error contributed by this layer alone: the
     /// sign-plane error for a 1-bit layer, zero for a grid layer. Callers that
     /// need the cumulative term sum it themselves (see `combine_refinement_decoded`).
@@ -344,7 +326,7 @@ impl QuantizedQueryCtx {
         scale: f32,
         constant: Option<f32>,
     ) -> crate::Result<f32> {
-        match (self.index.config.metric, constant) {
+        match (self.index.meta.field().metric, constant) {
             (Metric::L2, Some(constant)) => Ok(self.prepared.score_layer(
                 layer,
                 codes,
@@ -410,7 +392,7 @@ impl QuantizedQueryCtx {
 
     /// Returns the query-vector norm used by the layer error model.
     pub(crate) fn score_query_norm(&self, routing_score: f32) -> f32 {
-        if self.index.config.metric == Metric::L2 {
+        if self.index.meta.field().metric == Metric::L2 {
             (-routing_score).max(0.0).sqrt()
         } else {
             self.query_norm_sq.sqrt()
@@ -491,16 +473,16 @@ mod tests {
             }],
         )
         .unwrap();
-        let first_index = Arc::new(QuantizedIndexCtx::new(config.clone()).unwrap());
+        let first_index = Arc::new(QuantizedIndexCtx::from_config(config.clone()).unwrap());
         let query = QuantizedQueryCtx::new(Arc::clone(&first_index), vec![0.5_f32; 100]);
-        assert!(query.is_prepared_for(&first_index));
+        assert!(Arc::ptr_eq(&query.index.meta, &first_index.meta));
 
-        let other_segment = Arc::new(QuantizedIndexCtx::new(config.clone()).unwrap());
-        assert!(query.is_prepared_for(&other_segment));
+        let other_segment = Arc::new(QuantizedIndexCtx::from_config(config.clone()).unwrap());
+        assert_eq!(query.index.meta.to_bytes(), other_segment.meta.to_bytes());
 
         config.layers[0].seed = 0xfeed_2002;
-        let reseeded_index = Arc::new(QuantizedIndexCtx::new(config).unwrap());
-        assert!(!query.is_prepared_for(&reseeded_index));
+        let reseeded_index = Arc::new(QuantizedIndexCtx::from_config(config).unwrap());
+        assert_ne!(query.index.meta.to_bytes(), reseeded_index.meta.to_bytes());
     }
 
     #[test]
@@ -517,10 +499,10 @@ mod tests {
 
         let mut missing_grid = config.clone();
         missing_grid.grids.clear();
-        let error = QuantizedIndexCtx::new(missing_grid)
+        let error = QuantizedIndexCtx::from_config(missing_grid)
             .err()
             .expect("missing grid must be rejected");
-        assert!(error.to_string().contains("no persisted grid/model entry"));
+        assert!(error.to_string().contains("grid"));
     }
 
     #[test]
@@ -537,7 +519,7 @@ mod tests {
         let query_values = (0..100)
             .map(|coordinate| ((coordinate as f32 + 0.25) * 0.173).sin())
             .collect::<Vec<_>>();
-        let index = Arc::new(QuantizedIndexCtx::new(config).unwrap());
+        let index = Arc::new(QuantizedIndexCtx::from_config(config).unwrap());
         let expected = cascade::audit_split_query_layer_error_squared_with_plan(
             &query_values,
             &index.rotation_plan,

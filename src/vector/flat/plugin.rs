@@ -7,8 +7,10 @@ use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
 use crate::plugin::PluginMergeContext;
 use crate::schema::FieldType;
-use crate::vector::header::write_vector_header;
-use crate::vector::VEC_EXT;
+use crate::vector::blocks::{align_up, block_align, pad, write_metadata, BlockDirectory};
+use crate::vector::header::{write_vector_header, VectorEntry, HEADER_LEN};
+use crate::vector::metadata::{VectorColMetadata, FLAT_ROWS_PER_BLOCK};
+use crate::vector::{ENTRY_ALIGN, VEC_EXT};
 use crate::DocId;
 
 /// Merges source vectors into a flat target segment.
@@ -32,8 +34,9 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
 
     let num_target_docs: u32 = ctx.readers.iter().map(|r| r.num_docs()).sum::<u32>();
 
+    let mut id_maps = Vec::new();
     for (field, entry) in ctx.schema.fields() {
-        let _opts = match entry.field_type() {
+        let opts = match entry.field_type() {
             FieldType::Vector(opts) => opts,
             _ => continue,
         };
@@ -44,26 +47,56 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
             .map(|reader| reader.vector_index(field))
             .collect::<crate::Result<Vec<_>>>()?;
 
+        let source_rows = crate::vector::plugin::merge_source_rows(ctx, &field_readers)?;
         let mut target_present: Vec<DocId> = Vec::new();
         let mut target_doc_id: DocId = 0;
         {
-            let rows_w = composite.for_field_with_idx(field, 1);
-            for source_doc_addr in ctx.doc_id_mapping.iter_source_doc_addrs() {
-                let reader = &field_readers[source_doc_addr.segment_ord as usize];
-                if let Some(bytes) = reader.vector_bytes(source_doc_addr.doc_id)? {
+            let meta = VectorColMetadata::build_flat(opts);
+            let align = block_align(&meta.slots());
+            composite.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
+            let rows_w = composite.for_field_with_idx(field, VectorEntry::Data.index());
+            let start = rows_w.written_bytes();
+            write_metadata(rows_w, &meta)?;
+            let mut directory = BlockDirectory::new(rows_w.written_bytes() - start);
+            let mut block_bytes = 0;
+            // Row groups can be streamed without knowing the final vector count.
+
+            for source in source_rows {
+                if ctx.cancel.wants_cancel() {
+                    return Err(crate::TantivyError::Cancelled);
+                }
+                if let Some((segment, row)) = source {
+                    let bytes = field_readers[segment].vector_bytes_for_row(row)?;
                     target_present.push(target_doc_id);
                     rows_w.write_all(&bytes)?;
+                    block_bytes += bytes.len();
+                    if target_present.len() % FLAT_ROWS_PER_BLOCK as usize == 0 {
+                        pad(rows_w, align_up(block_bytes, align) - block_bytes)?;
+                        directory.push(rows_w.written_bytes() - start, target_present.len() as u32);
+                        block_bytes = 0;
+                    }
                 }
                 target_doc_id += 1;
             }
+            pad(rows_w, align_up(block_bytes, align) - block_bytes)?;
+            if block_bytes != 0 {
+                directory.push(rows_w.written_bytes() - start, target_present.len() as u32);
+            }
+            directory.finish(rows_w)?;
+            assert_eq!((rows_w.written_bytes() - start) as usize % ENTRY_ALIGN, 0);
             rows_w.flush()?;
         }
 
         debug_assert_eq!(target_doc_id, num_target_docs);
 
-        let id_map_w = composite.for_field_with_idx(field, 0);
-        IdMap::serialize(&target_present, num_target_docs, id_map_w)?;
-        id_map_w.flush()?;
+        id_maps.push((field, target_present));
+    }
+    for (field, present) in id_maps {
+        IdMap::serialize(
+            &present,
+            num_target_docs,
+            composite.for_field_with_idx(field, VectorEntry::IdMap.index()),
+        )?;
     }
     composite.close()?;
     Ok(())

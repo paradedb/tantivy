@@ -151,6 +151,8 @@ impl Default for RoutingParams {
 }
 
 pub(crate) enum RouterIter<'router, 'workspace> {
+    #[cfg(test)]
+    Explicit(std::vec::IntoIter<Candidate>),
     Rng(ResumableSearchIterator<'router, 'workspace, LazyStore>),
     Stacked(stacked::Ranking),
     Exact(exact::Ranking),
@@ -159,6 +161,8 @@ pub(crate) enum RouterIter<'router, 'workspace> {
 impl RouterIter<'_, '_> {
     pub(crate) fn metrics(&self) -> RouterMetrics {
         match self {
+            #[cfg(test)]
+            Self::Explicit(_) => RouterMetrics::Exact { visited_count: 0 },
             Self::Rng(ranking) => RouterMetrics::Rng(ranking.metrics()),
             Self::Stacked(ranking) => ranking.metrics(),
             Self::Exact(ranking) => RouterMetrics::Exact {
@@ -173,6 +177,8 @@ impl Iterator for RouterIter<'_, '_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
+            #[cfg(test)]
+            Self::Explicit(ranking) => ranking.next(),
             Self::Rng(ranking) => ranking.next(),
             Self::Stacked(ranking) => ranking.next(),
             Self::Exact(ranking) => ranking.next(),
@@ -243,6 +249,33 @@ pub enum RouterMetrics {
     Exact {
         visited_count: usize,
     },
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CLUSTERS: std::cell::RefCell<Option<Vec<Candidate>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Scans the supplied cluster similarities without invoking a router.
+#[cfg(test)]
+pub(crate) fn with_test_clusters<T>(clusters: Vec<Candidate>, scan: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Vec<Candidate>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_CLUSTERS.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(TEST_CLUSTERS.with(|slot| slot.replace(Some(clusters))));
+    scan()
+}
+
+#[cfg(test)]
+pub(crate) fn test_clusters() -> Option<RouterIter<'static, 'static>> {
+    TEST_CLUSTERS.with(|slot| {
+        slot.borrow()
+            .clone()
+            .map(|rows| RouterIter::Explicit(rows.into_iter()))
+    })
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 //! Flat vector storage and row mapping.
 
-mod id_map;
+pub(crate) mod id_map;
 mod plugin;
 mod writer;
 

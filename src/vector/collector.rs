@@ -18,12 +18,15 @@
 //! never the ordering rule.
 //! Top-N vector-similarity collection.
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use super::backend::{ProbeStats, VectorBackend};
 use super::index_reader::QuantizedFieldReader;
 use super::ivf::AdaptiveProbeParams;
+use super::metadata::VectorColMetadata;
 use super::prepared::{QuantizedQueryCtx, VectorQuery};
 use super::tie_break::NoTieBreak;
 use super::{enter_vector_stage, Stage, VectorElement};
@@ -36,6 +39,39 @@ use crate::index::SegmentReader;
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Schema};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal, TantivyError};
+
+/// Query identity consists of dimension, metric tag and structural layer metadata.
+#[derive(Clone, Debug)]
+struct PreparedKey(Arc<VectorColMetadata>);
+impl PreparedKey {
+    fn query_fields(&self) -> Option<(u32, u8, &[super::metadata::Quantizer])> {
+        match self.0.as_ref() {
+            VectorColMetadata::Plain(_) => None,
+            VectorColMetadata::Quantized { field, layers } => {
+                let metric = match field.metric {
+                    crate::schema::Metric::L2 => 0,
+                    crate::schema::Metric::Dot => 1,
+                    crate::schema::Metric::Cosine => 2,
+                };
+                Some((field.dim, metric, layers))
+            }
+        }
+    }
+}
+impl PartialEq for PreparedKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.query_fields() == other.query_fields()
+    }
+}
+impl Eq for PreparedKey {}
+impl Hash for PreparedKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.query_fields().hash(state);
+    }
+}
+
+/// Shared initialization cell so each metadata key prepares its query exactly once.
+type PreparedCell = Arc<OnceLock<Arc<QuantizedQueryCtx>>>;
 
 /// Top-N by vector similarity. Returns documents in descending
 /// similarity order. Only docs that actually have a vector are
@@ -57,8 +93,8 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     offset: usize,
     adaptive: AdaptiveProbeParams,
     max_scan_levels: usize,
-    /// Prepared on the first quantized segment and shared by the rest.
-    quantized_query: OnceLock<Arc<QuantizedQueryCtx>>,
+    /// Exactly one prepared query for each distinct segment encoding.
+    quantized_queries: Mutex<HashMap<PreparedKey, PreparedCell>>,
     tie_break: S,
 }
 
@@ -72,7 +108,7 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
             offset: 0,
             adaptive: AdaptiveProbeParams::default(),
             max_scan_levels: usize::MAX,
-            quantized_query: OnceLock::new(),
+            quantized_queries: Mutex::new(HashMap::new()),
             tie_break: NoTieBreak,
         }
     }
@@ -134,7 +170,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
             offset: self.offset,
             adaptive: self.adaptive,
             max_scan_levels: self.max_scan_levels,
-            quantized_query: self.quantized_query,
+            quantized_queries: self.quantized_queries,
             tie_break,
         }
     }
@@ -151,8 +187,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
         Ok(VectorQuery::new(Arc::clone(&self.query), quantized))
     }
 
-    /// A collector reused on another index may meet a different quantization
-    /// config; such segments get their own query instead of the shared one.
+    /// Prepares once per metadata key, releasing the map lock before expensive preparation.
     fn quantized_query(&self, field: &QuantizedFieldReader) -> Arc<QuantizedQueryCtx> {
         let index_ctx = field.index_ctx();
         let prepare = || {
@@ -164,17 +199,19 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
                 active_layers,
             ))
         };
-        let shared = self.quantized_query.get_or_init(prepare);
-        if shared.is_prepared_for(index_ctx) {
-            Arc::clone(shared)
-        } else {
-            prepare()
-        }
+        let cell = Arc::clone(
+            self.quantized_queries
+                .lock()
+                .unwrap()
+                .entry(PreparedKey(Arc::clone(&index_ctx.meta)))
+                .or_default(),
+        );
+        Arc::clone(cell.get_or_init(prepare))
     }
 
     #[cfg(test)]
-    pub(crate) fn has_quantized_query(&self) -> bool {
-        self.quantized_query.get().is_some()
+    pub(crate) fn quantized_query_count(&self) -> usize {
+        self.quantized_queries.lock().unwrap().len()
     }
 }
 
@@ -594,7 +631,7 @@ mod ivf_e2e_tests {
                 let id_column = reader.fast_fields().u64("id")?;
                 let vector_reader = reader.vector_index(embedding_field)?;
                 for doc_id in 0..reader.max_doc() {
-                    let row = vector_reader.row_id(doc_id).unwrap();
+                    let row = vector_reader.row_id(doc_id)?.unwrap();
                     let bytes = vector_reader.vector_bytes_for_row(row)?;
                     expected.push((
                         -crate::vector::l2_squared_bytes(&query, &bytes),
@@ -942,5 +979,101 @@ mod ivf_e2e_tests {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod prepared_key_tests {
+    use super::*;
+    use crate::schema::{Metric, VectorOptions};
+    use crate::vector::metadata::{Grid, Partition, Quantizer, Rotation};
+    use crate::vector::quantization::{
+        VectorNormPolicy, VectorQuantizationConfig, VectorQuantizationLayer,
+    };
+    fn metadata(metric: Metric, schedule: &[u8]) -> VectorColMetadata {
+        let opts = VectorOptions::new(100, metric);
+        let config = VectorQuantizationConfig::materialize(
+            "v".into(),
+            &opts,
+            schedule
+                .iter()
+                .map(|&bits| VectorQuantizationLayer { bits, seed: 17 })
+                .collect(),
+        )
+        .unwrap();
+        VectorColMetadata::build_ivf(&opts, Some(&config)).unwrap()
+    }
+    fn key(meta: &VectorColMetadata) -> PreparedKey {
+        PreparedKey(Arc::new(meta.clone()))
+    }
+    fn hash(meta: &VectorColMetadata) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key(meta).hash(&mut h);
+        h.finish()
+    }
+    // Storage geometry does not split prepared-query cache keys.
+    #[test]
+    fn query_identity_uses_only_semantic_bits() {
+        let original = metadata(Metric::L2, &[1, 4]);
+        let mut changed = original.clone();
+        if let VectorColMetadata::Quantized { field, .. } = &mut changed {
+            field.norm_policy = VectorNormPolicy::UnitL2;
+            field.partition = Partition::Uniform { rows_per_block: 7 };
+        }
+        assert_eq!(key(&original), key(&changed));
+        assert_eq!(hash(&original), hash(&changed));
+        assert_ne!(original.to_bytes(), changed.to_bytes());
+        for change in 0..8 {
+            let mut changed = original.clone();
+            if let VectorColMetadata::Quantized { field, layers } = &mut changed {
+                match change {
+                    0 => field.dim += 1,
+                    1 => field.metric = Metric::Dot,
+                    2 => {
+                        if let Quantizer::SignPlane { rotation, .. } = &mut layers[0] {
+                            *rotation = Rotation::None;
+                        }
+                    }
+                    3 => {
+                        if let Quantizer::SignPlane { rho_model, .. } = &mut layers[0] {
+                            rho_model.0 += 1;
+                        }
+                    }
+                    4 => {
+                        if let Quantizer::GridPlane { bits, .. } = &mut layers[1] {
+                            *bits = 3;
+                        }
+                    }
+                    5 => {
+                        if let Quantizer::GridPlane { grid, .. } = &mut layers[1] {
+                            grid.points[0] = f32::from_bits(grid.points[0].to_bits() ^ 1);
+                        }
+                    }
+                    6 => {
+                        if let Quantizer::SignPlane { rotation, .. } = &mut layers[0] {
+                            *rotation = Rotation::SeededFhtChaCha8 { seed: 18 };
+                        }
+                    }
+                    _ => {
+                        if let Quantizer::GridPlane { grid, .. } = &mut layers[1] {
+                            grid.rho_model = f64::from_bits(grid.rho_model.to_bits() + 1);
+                        }
+                    }
+                }
+            }
+            assert_ne!(key(&original), key(&changed));
+        }
+        let g = Grid {
+            points: vec![0.0],
+            rho_model: 1.0,
+        };
+        let mut other = g.clone();
+        other.points[0] = -0.0;
+        let quant = |grid| super::super::metadata::Quantizer::GridPlane {
+            bits: 2,
+            rotation: Rotation::None,
+            grid,
+        };
+        assert_ne!(quant(g), quant(other));
     }
 }

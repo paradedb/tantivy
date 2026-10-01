@@ -26,9 +26,9 @@ fn lcg_next(state: &mut u64) -> u64 {
 
 fn layer0_integrated_shape(c: &mut Criterion) {
     let spec = LayerSpec {
+        kind: cascade::LayerKind::Sign,
         bits: 1,
-        seed: 0x51_91_14,
-        rotate: true,
+        rotation: cascade::Rotation::SeededFhtChaCha8 { seed: 0x51_91_14 },
     };
     let grid = build_grid(DIM, 1);
     let query: Vec<f32> = (0..DIM)

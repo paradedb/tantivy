@@ -6,7 +6,7 @@
 //! The on-disk file is a 4-byte format-version stamp (see `vector::header`)
 //! followed by a [`CompositeFile`](crate::directory::CompositeFile). Written
 //! per field, only for IVF segments (⟺ the field's `.vec` `IdMap` is
-//! `Explicit`). The composite has four slots per field:
+//! `DocLocations`). The composite has four slots per field:
 //!
 //! ```text
 //! [0] num_centroids (u32) + num_docs (u32) + centroid_bytes (N · stride),
@@ -301,6 +301,10 @@ impl IvfIndex {
         query: &'router [f32],
         params: RoutingParams,
     ) -> RouterIter<'router, 'workspace> {
+        #[cfg(test)]
+        if let Some(clusters) = crate::vector::router::test_clusters() {
+            return clusters;
+        }
         self.router.rank(workspace, query, self.metric, params)
     }
 

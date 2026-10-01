@@ -92,6 +92,13 @@ impl OpenWriteError {
 /// Used to catch and provide a hint to solve this incompatibility issue
 #[derive(Clone)]
 pub enum Incompatibility {
+    /// The vector file grammar is unsupported by this library.
+    VectorFormatMismatch {
+        /// Raw version stored in the vector file header.
+        index_version: u32,
+        /// Vector file version supported by this library.
+        supported_version: u32,
+    },
     /// This library cannot decompress the index found on disk
     CompressionMismatch {
         /// Compression algorithm used by the current version of tantivy
@@ -111,6 +118,16 @@ pub enum Incompatibility {
 impl fmt::Debug for Incompatibility {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         match self {
+            Incompatibility::VectorFormatMismatch {
+                index_version,
+                supported_version,
+            } => {
+                write!(
+                    f,
+                    "vector file format version {index_version} is unsupported; supported version \
+                     is {supported_version}; rebuild required"
+                )?;
+            }
             Incompatibility::CompressionMismatch {
                 library_compression_format,
                 index_compression_format,
@@ -145,6 +162,12 @@ impl fmt::Debug for Incompatibility {
         }
 
         Ok(())
+    }
+}
+
+impl fmt::Display for Incompatibility {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
     }
 }
 
