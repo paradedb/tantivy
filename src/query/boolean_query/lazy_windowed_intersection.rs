@@ -33,6 +33,7 @@ pub struct LazyWindowedIntersectionScorer {
     matchers: Vec<SegmentPostings>,
     scorers: Vec<TermScorer>,
     threshold: Score,
+    scoring_enabled: bool,
     window_base: DocId,
     window_mask: [TinySet; BLOCK_NUM_TINYBITSETS],
     window_cursor: usize,
@@ -43,7 +44,15 @@ pub struct LazyWindowedIntersectionScorer {
 
 impl LazyWindowedIntersectionScorer {
     /// Creates a new `LazyWindowedIntersectionScorer`.
-    pub fn new(mut scorers: Vec<TermScorer>, threshold: Score) -> Self {
+    pub fn new(scorers: Vec<TermScorer>, threshold: Score) -> Self {
+        Self::build(scorers, threshold, true)
+    }
+
+    pub(crate) fn new_without_scoring(scorers: Vec<TermScorer>) -> Self {
+        Self::build(scorers, Score::MIN, false)
+    }
+
+    fn build(mut scorers: Vec<TermScorer>, threshold: Score, scoring_enabled: bool) -> Self {
         assert!(scorers.len() >= 2);
         // Sort scorers by cost ascending (lowest doc freq = leader)
         scorers.sort_by_key(|s| s.cost());
@@ -77,6 +86,7 @@ impl LazyWindowedIntersectionScorer {
             matchers,
             scorers,
             threshold,
+            scoring_enabled,
             window_base: initial_base,
             window_mask: [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS],
             window_cursor: BLOCK_NUM_TINYBITSETS,
@@ -163,7 +173,7 @@ impl LazyWindowedIntersectionScorer {
 
 impl DocSet for LazyWindowedIntersectionScorer {
     fn advance(&mut self) -> DocId {
-        if self.maximum_possible_score <= self.threshold {
+        if self.scoring_enabled && self.maximum_possible_score <= self.threshold {
             self.current = (TERMINATED, Score::MIN);
             return TERMINATED;
         }
@@ -171,6 +181,10 @@ impl DocSet for LazyWindowedIntersectionScorer {
         loop {
             // Drain remaining matches in the current window.
             'candidate: while let Some(candidate_doc) = self.pop_next_candidate_in_window() {
+                if !self.scoring_enabled {
+                    self.current = (candidate_doc, 1.0);
+                    return candidate_doc;
+                }
                 // candidate_doc is guaranteed to be in every term's postings!
                 // Compute BM25 score across terms with early threshold pruning.
                 let mut total_score: Score = 0.0;

@@ -387,7 +387,13 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                         .into_iter()
                         .map(|s| *(s.downcast::<TermScorer>().map_err(|_| ()).unwrap()))
                         .collect();
-                    if term_scorers
+                    if !self.scoring_enabled
+                        && self.should_use_lazy_windowed_intersection(&term_scorers, reader.max_doc())
+                    {
+                        SpecializedScorer::Other(Box::new(
+                            super::lazy_windowed_intersection::LazyWindowedIntersectionScorer::new_without_scoring(term_scorers),
+                        ))
+                    } else if term_scorers
                         .iter()
                         .all(|s| s.freq_reading_option() == FreqReadingOption::ReadFreq)
                     {
