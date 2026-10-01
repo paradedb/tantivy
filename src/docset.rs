@@ -178,8 +178,10 @@ pub trait DocSet: Send {
         min_doc: DocId,
         mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
     ) -> DocId {
-        self.seek(min_doc);
-        let horizon = min_doc + BLOCK_WINDOW;
+        if self.doc() < min_doc {
+            self.seek(min_doc);
+        }
+        let horizon = min_doc.saturating_add(BLOCK_WINDOW).min(TERMINATED);
         loop {
             let doc = self.doc();
             if doc >= horizon {
