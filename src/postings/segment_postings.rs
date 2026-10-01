@@ -278,6 +278,15 @@ impl SegmentPostings {
 }
 
 impl DocSet for SegmentPostings {
+    fn fill_bitset_block(
+        &mut self,
+        min_doc: DocId,
+        mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
+    ) -> DocId {
+        self.fill_bitset_window(min_doc, min_doc.saturating_add(crate::docset::BLOCK_WINDOW).min(TERMINATED), mask);
+        self.doc()
+    }
+
     // goes to the next element.
     // next needs to be called a first time to point to the correct element.
     #[inline]

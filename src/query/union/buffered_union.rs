@@ -1,6 +1,6 @@
 use common::TinySet;
 
-use crate::docset::{DocSet, SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
+use crate::docset::{DocSet, SeekDangerResult, BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
 use crate::query::size_hint::estimate_union;
 use crate::query::Scorer;
@@ -66,6 +66,22 @@ fn refill<TScorer: Scorer, TScoreCombiner: ScoreCombiner>(
     score_combiner: &mut [TScoreCombiner; HORIZON as usize],
     min_doc: DocId,
 ) {
+    if !TScoreCombiner::REQUIRES_SCORING {
+        unordered_drain_filter(scorers, |scorer| {
+            for (i, mask) in bitsets.chunks_exact_mut(BLOCK_NUM_TINYBITSETS).enumerate() {
+                let start = min_doc + i as u32 * BLOCK_WINDOW;
+                if start >= TERMINATED {
+                    break;
+                }
+                let mask = mask.try_into().unwrap();
+                if scorer.fill_bitset_block(start, mask) == TERMINATED {
+                    return true;
+                }
+            }
+            false
+        });
+        return;
+    }
     unordered_drain_filter(scorers, |scorer| {
         let horizon = min_doc + HORIZON;
         loop {

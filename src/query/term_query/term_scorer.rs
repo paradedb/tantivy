@@ -166,6 +166,14 @@ impl TermScorer {
 }
 
 impl DocSet for TermScorer {
+    fn fill_bitset_block(
+        &mut self,
+        min_doc: DocId,
+        mask: &mut [common::TinySet; crate::docset::BLOCK_NUM_TINYBITSETS],
+    ) -> DocId {
+        self.postings.fill_bitset_block(min_doc, mask)
+    }
+
     #[inline]
     fn advance(&mut self) -> DocId {
         self.postings.advance()
