@@ -9,6 +9,8 @@ use std::fmt::{Display, Formatter};
 pub enum SegmentComponent {
     /// Postings (or inverted list). Sorted lists of document ids, associated with terms
     Postings,
+    /// Term frequencies in posting order for fields that record them.
+    TermFrequencies,
     /// Positions of terms in each document.
     Positions,
     /// Column-oriented random-access storage of fields.
@@ -47,6 +49,7 @@ impl TryFrom<&str> for SegmentComponent {
             "temp" => Ok(SegmentComponent::TempStore),
             "fast" => Ok(SegmentComponent::FastFields),
             "fieldnorm" => Ok(SegmentComponent::FieldNorms),
+            "freqs" => Ok(SegmentComponent::TermFrequencies),
             "pnorm" => Ok(SegmentComponent::PostingNorms),
             "del" => Ok(SegmentComponent::Delete),
             other => Ok(SegmentComponent::Custom(other.to_string())),
@@ -61,6 +64,7 @@ impl Display for SegmentComponent {
             SegmentComponent::Positions => write!(f, "pos"),
             SegmentComponent::FastFields => write!(f, "fast"),
             SegmentComponent::FieldNorms => write!(f, "fieldnorm"),
+            SegmentComponent::TermFrequencies => write!(f, "freqs"),
             SegmentComponent::PostingNorms => write!(f, "pnorm"),
             SegmentComponent::Terms => write!(f, "term"),
             SegmentComponent::Store => write!(f, "store"),

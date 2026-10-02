@@ -110,6 +110,7 @@ mod bench {
             postings_range: offset(term_ord)..offset(term_ord + 1),
             positions_range: offset(term_ord)..offset(term_ord + 1),
             pnorms_offset: None,
+            freqs_range: None,
         }
     }
 
