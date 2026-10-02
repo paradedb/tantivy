@@ -1,6 +1,6 @@
 //! Stored field descriptions and the column contract. See FORMAT.md.
 use std::hash::{Hash, Hasher};
-use std::io;
+use std::{fmt, io};
 
 use common::BinarySerializable;
 
@@ -46,6 +46,61 @@ pub enum Partition {
         /// Maximum number of rows in a block.
         rows_per_block: u32,
     },
+}
+
+/// The stable public name of a quantizer family; adding a quantizer adds a variant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum QuantizerKind {
+    /// One-bit signs scored as popcounted words.
+    Sign,
+    /// Packed scalar codes scored against reconstruction points.
+    Grid,
+}
+
+impl QuantizerKind {
+    /// Returns the stable public name of this quantizer family.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Sign => "sign",
+            Self::Grid => "grid",
+        }
+    }
+}
+
+impl fmt::Display for QuantizerKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Ordered quantizer families and code widths, independent of rotation seeds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuantizationSchedule(Vec<(QuantizerKind, u8)>);
+
+impl QuantizationSchedule {
+    /// Constructs a schedule from its ordered layers.
+    pub fn new(layers: Vec<(QuantizerKind, u8)>) -> Self {
+        Self(layers)
+    }
+
+    /// Returns the quantizer family and code width of each layer in order.
+    pub fn layers(&self) -> &[(QuantizerKind, u8)] {
+        &self.0
+    }
+}
+
+impl fmt::Display for QuantizationSchedule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[")?;
+        for (index, (kind, bits)) in self.layers().iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{kind}:{bits}")?;
+        }
+        f.write_str("]")
+    }
 }
 /// Tagged encode/decode contract; a semantic change requires a new variant.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -215,6 +270,14 @@ impl SlotType {
     }
 }
 impl Quantizer {
+    /// Returns the quantizer family independently of its width and rotation.
+    pub const fn kind(&self) -> QuantizerKind {
+        match self {
+            Self::SignPlane { .. } => QuantizerKind::Sign,
+            Self::GridPlane { .. } => QuantizerKind::Grid,
+        }
+    }
+
     /// Sign codes are decoded as words; grid codes are decoded as bytes.
     pub(crate) const fn codes_elem(&self) -> ElemType {
         match self {
@@ -725,6 +788,20 @@ mod tests {
         )
         .unwrap();
         VectorColMetadata::build_ivf(&opts, Some(&config)).unwrap()
+    }
+
+    #[test]
+    fn quantizer_kind_and_schedule_names() {
+        for (kind, name) in [(QuantizerKind::Sign, "sign"), (QuantizerKind::Grid, "grid")] {
+            assert_eq!(kind.name(), name);
+            assert_eq!(kind.to_string(), name);
+        }
+        let meta = metadata(Metric::L2, &[1, 4]);
+        assert_eq!(meta.layers()[0].kind(), QuantizerKind::Sign);
+        assert_eq!(meta.layers()[1].kind(), QuantizerKind::Grid);
+        let schedule =
+            QuantizationSchedule::new(vec![(QuantizerKind::Sign, 1), (QuantizerKind::Grid, 4)]);
+        assert_eq!(schedule.to_string(), "[sign:1, grid:4]");
     }
     // Pins ordered slot semantics, widths, strides, and scan-band ownership.
     #[test]

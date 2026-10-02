@@ -20,7 +20,7 @@ use super::blocks::{BlockMetadata, Blocks};
 use super::flat::IdMap;
 use super::header::{read_centroid_header, read_vector_header, CentroidSlot, VectorEntry};
 use super::ivf::{decode_row, IvfIndex, CENTROIDS_EXT};
-use super::metadata::{SlotType, VectorColMetadata};
+use super::metadata::{QuantizationSchedule, SlotType, VectorColMetadata};
 use super::prepared::{
     corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix,
     quantized_model_sigma, refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError,
@@ -115,7 +115,7 @@ impl VectorEstimatorMoments {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VectorEstimatorMeasurements {
     source: VectorEstimatorSource,
-    schedule: Vec<(&'static str, u8)>,
+    schedule: QuantizationSchedule,
     aggregate: Vec<VectorEstimatorMoments>,
     per_query: Vec<Vec<VectorEstimatorMoments>>,
     sample_rows: u64,
@@ -364,7 +364,7 @@ const ERROR_CONE_TOP_K: usize = 10;
 
 impl VectorErrorAuditMeasurements {
     /// Ordered quantizer kinds and widths, independent of rotation seeds.
-    pub fn schedule(&self) -> &[(&'static str, u8)] {
+    pub fn schedule(&self) -> &QuantizationSchedule {
         self.estimator.schedule()
     }
 
@@ -622,14 +622,14 @@ fn observe_error_cone_depth(
 
 impl VectorEstimatorMeasurements {
     /// Ordered quantizer kinds and widths, independent of rotation seeds.
-    pub fn schedule(&self) -> &[(&'static str, u8)] {
+    pub fn schedule(&self) -> &QuantizationSchedule {
         &self.schedule
     }
 
     fn check_schedule(&self, other: &Self) -> crate::Result<()> {
         if self.schedule != other.schedule {
             return Err(TantivyError::InvalidArgument(format!(
-                "cannot merge vector measurements with different schedules: {:?} and {:?}",
+                "cannot merge vector measurements with different schedules: {} and {}",
                 self.schedule, other.schedule
             )));
         }
@@ -1546,7 +1546,8 @@ pub struct VectorIndexReader {
 
 impl VectorFieldReader {
     /// Opens `field`'s vector data in `segment_reader`'s segment. Returns the
-    /// metadata placeholder when the segment has no `.vec` file.
+    /// metadata placeholder when the segment has no `.vec` file. The vector header is
+    /// validated before reading centroid data so unsupported formats have a typed error.
     pub(crate) fn open(segment_reader: &SegmentReader, field: Field) -> crate::Result<Self> {
         let entry = segment_reader.schema().get_field_entry(field);
         let options = match entry.field_type() {
@@ -1558,6 +1559,20 @@ impl VectorFieldReader {
                 )));
             }
         };
+
+        let vec_file = match segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))
+        {
+            Ok(file) => file,
+            Err(OpenReadError::FileDoesNotExist(_)) => {
+                return Ok(Self {
+                    options,
+                    source: None,
+                    search: OnceLock::new(),
+                })
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let (_, body) = read_vector_header(&vec_file)?;
 
         let centroid_slots =
             match segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string())) {
@@ -1592,19 +1607,6 @@ impl VectorFieldReader {
                 Err(err) => return Err(err.into()),
             };
 
-        let vec_file = match segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))
-        {
-            Ok(file) => file,
-            Err(OpenReadError::FileDoesNotExist(_)) => {
-                return Ok(Self {
-                    options,
-                    source: None,
-                    search: OnceLock::new(),
-                })
-            }
-            Err(err) => return Err(err.into()),
-        };
-        let (_, body) = read_vector_header(&vec_file)?;
         let vec_composite = CompositeFile::open(&body)?;
         validate_vector_entries(&vec_composite, field)?;
         let data = vec_composite
@@ -1979,21 +1981,15 @@ impl VectorIndexReader {
             source,
             estimator: VectorEstimatorMeasurements {
                 source,
-                schedule: quantization
-                    .index_ctx()
-                    .meta
-                    .layers()
-                    .iter()
-                    .map(|q| {
-                        (
-                            match q {
-                                super::metadata::Quantizer::SignPlane { .. } => "SignPlane",
-                                super::metadata::Quantizer::GridPlane { .. } => "GridPlane",
-                            },
-                            q.bits(),
-                        )
-                    })
-                    .collect(),
+                schedule: QuantizationSchedule::new(
+                    quantization
+                        .index_ctx()
+                        .meta
+                        .layers()
+                        .iter()
+                        .map(|q| (q.kind(), q.bits()))
+                        .collect(),
+                ),
                 aggregate: vec![VectorEstimatorMoments::default(); layer_count],
                 per_query: vec![
                     vec![VectorEstimatorMoments::default(); layer_count];
@@ -2784,6 +2780,7 @@ mod tests {
     use super::super::quantization::{quantized_code_stride, VectorQuantizationConfig};
     use super::*;
     use crate::directory::{CompositeWrite, FileHandle};
+    use crate::vector::QuantizerKind;
 
     type TrackedReads = Arc<Mutex<Vec<Range<usize>>>>;
 
@@ -3372,7 +3369,7 @@ mod tests {
     fn estimator_merge_sums_rows_and_preserves_query_count() {
         let measurement = |sample_rows, query_count, value| VectorEstimatorMeasurements {
             source: VectorEstimatorSource::Provided,
-            schedule: vec![("SignPlane", 1)],
+            schedule: QuantizationSchedule::new(vec![(QuantizerKind::Sign, 1)]),
             aggregate: vec![VectorEstimatorMoments {
                 sample_count: 1,
                 normalized_error_sum: value,
@@ -3403,31 +3400,41 @@ mod tests {
 
     #[test]
     fn measurement_merges_reject_different_schedules() {
-        let measurement = |bits: &[u8]| VectorEstimatorMeasurements {
+        use QuantizerKind::{Grid, Sign};
+
+        let measurement = |schedule: &[(QuantizerKind, u8)]| VectorEstimatorMeasurements {
             source: VectorEstimatorSource::Provided,
-            schedule: bits
-                .iter()
-                .map(|&bits| (if bits == 1 { "SignPlane" } else { "GridPlane" }, bits))
-                .collect(),
-            aggregate: vec![VectorEstimatorMoments::default(); bits.len()],
-            per_query: vec![vec![VectorEstimatorMoments::default(); bits.len()]],
+            schedule: QuantizationSchedule::new(schedule.to_vec()),
+            aggregate: vec![VectorEstimatorMoments::default(); schedule.len()],
+            per_query: vec![vec![VectorEstimatorMoments::default(); schedule.len()]],
             sample_rows: 0,
             query_count: 1,
         };
-        for (left, right) in [(&[1][..], &[1, 4][..]), (&[1, 4], &[2, 4])] {
-            let a = measurement(left);
-            let b = measurement(right);
-            let expected = format!(
-                "different schedules: {:?} and {:?}",
-                a.schedule(),
-                b.schedule()
-            );
+        for (left, right, expected) in [
+            (
+                vec![(Sign, 1)],
+                vec![(Sign, 1), (Grid, 4)],
+                "different schedules: [sign:1] and [sign:1, grid:4]",
+            ),
+            (
+                vec![(Sign, 1), (Grid, 4)],
+                vec![(Grid, 2), (Grid, 4)],
+                "different schedules: [sign:1, grid:4] and [grid:2, grid:4]",
+            ),
+            (
+                vec![(Sign, 1)],
+                vec![(Grid, 1)],
+                "different schedules: [sign:1] and [grid:1]",
+            ),
+        ] {
+            let a = measurement(&left);
+            let b = measurement(&right);
             assert!(a
                 .clone()
                 .merge(&b)
                 .unwrap_err()
                 .to_string()
-                .contains(&expected));
+                .contains(expected));
             let mut audit = VectorErrorAuditMeasurements {
                 source: VectorEstimatorSource::Provided,
                 depths: vec![VectorErrorDepthMeasurements::default(); left.len()],
@@ -3443,7 +3450,7 @@ mod tests {
                 .merge(&other)
                 .unwrap_err()
                 .to_string()
-                .contains(&expected));
+                .contains(expected));
         }
     }
 
@@ -3451,7 +3458,7 @@ mod tests {
     fn estimator_error_sign_is_estimate_minus_exact() {
         let mut measurements = VectorEstimatorMeasurements {
             source: VectorEstimatorSource::Provided,
-            schedule: vec![("SignPlane", 1)],
+            schedule: QuantizationSchedule::new(vec![(QuantizerKind::Sign, 1)]),
             aggregate: vec![VectorEstimatorMoments::default()],
             per_query: vec![vec![VectorEstimatorMoments::default()]],
             sample_rows: 1,

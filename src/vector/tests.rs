@@ -1511,6 +1511,7 @@ fn unsupported_vector_versions_remain_typed_on_open_and_merge() -> crate::Result
                 "version {version}: {error:?}"
             )
         };
+        assert_typed(segment.validate_vector_format().unwrap_err());
         assert_typed(reader.validate_vector_format().unwrap_err());
         assert_typed(
             reader
@@ -1525,5 +1526,98 @@ fn unsupported_vector_versions_remain_typed_on_open_and_merge() -> crate::Result
                 .unwrap_err(),
         );
     }
+    Ok(())
+}
+
+#[test]
+fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()> {
+    use std::io::Write;
+
+    use common::TerminatingWrite;
+
+    use crate::directory::error::Incompatibility;
+    use crate::directory::{CompositeWrite, Directory, RamDirectory};
+    use crate::index::SegmentComponent;
+
+    let directory = RamDirectory::create();
+    let mut schema = Schema::builder();
+    let field = schema.add_vector_field("v", VectorOptions::new(2, Metric::L2));
+    let index = Index::create(directory.clone(), schema.build(), IndexSettings::default())?;
+    let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+    let mut doc = TantivyDocument::new();
+    doc.add_vector(field, &[1.0, 0.0]);
+    writer.add_document(doc)?;
+    writer.commit()?;
+    let segment = index.searchable_segments()?.remove(0);
+    let vec_path = segment.relative_path(SegmentComponent::Custom(super::VEC_EXT.into()));
+    let mut bytes = directory.atomic_read(&vec_path)?;
+    let mut centroids = 2u32.to_le_bytes().to_vec();
+    let mut composite = CompositeWrite::wrap(&mut centroids);
+    for slot in [
+        super::header::CentroidSlot::Centroids,
+        super::header::CentroidSlot::Offsets,
+    ] {
+        composite
+            .for_field_with_idx(field, slot.index())
+            .write_all(&[0; 8])?;
+    }
+    composite.close()?;
+    let mut centroid_file =
+        segment.open_write(SegmentComponent::Custom(super::ivf::CENTROIDS_EXT.into()))?;
+    centroid_file.write_all(&centroids)?;
+    centroid_file.terminate()?;
+    for version in [2u32, 3, 4] {
+        bytes[..4].copy_from_slice(&version.to_le_bytes());
+        directory.atomic_write(&vec_path, &bytes)?;
+        let reader = crate::SegmentReader::open(&segment)?;
+        let error = reader
+            .vector_index(field)
+            .err()
+            .expect("unsupported segment");
+        if version == 4 {
+            segment.validate_vector_format()?;
+            reader.validate_vector_format()?;
+            assert!(
+                matches!(error, crate::TantivyError::InternalError(ref message) if message.contains("no router slot")),
+                "{error:?}"
+            );
+        } else {
+            for error in [
+                segment.validate_vector_format().unwrap_err(),
+                reader.validate_vector_format().unwrap_err(),
+            ] {
+                assert!(
+                    matches!(error, crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch { index_version, supported_version: 4 }) if index_version == version),
+                    "{error:?}"
+                );
+            }
+            assert!(
+                matches!(error, crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch { index_version, supported_version: 4 }) if index_version == version),
+                "{error:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn segments_without_vector_files_pass_format_validation() -> crate::Result<()> {
+    use crate::directory::RamDirectory;
+
+    let mut schema = Schema::builder();
+    let label = schema.add_text_field("label", STRING);
+    let index = Index::create(
+        RamDirectory::create(),
+        schema.build(),
+        IndexSettings::default(),
+    )?;
+    let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+    let mut doc = TantivyDocument::new();
+    doc.add_text(label, "present");
+    writer.add_document(doc)?;
+    writer.commit()?;
+    let segment = index.searchable_segments()?.remove(0);
+    segment.validate_vector_format()?;
+    crate::SegmentReader::open(&segment)?.validate_vector_format()?;
     Ok(())
 }

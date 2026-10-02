@@ -4,6 +4,7 @@ use std::io::{self, Read, Write};
 
 use common::{BinarySerializable, HasLen};
 
+use crate::directory::error::OpenReadError;
 use crate::directory::FileSlice;
 
 /// Length of the version header in bytes.
@@ -144,6 +145,15 @@ pub(crate) fn read_vector_header(
     Ok((version, file.slice_from(HEADER_LEN)))
 }
 
+/// Checks only the vector header. A missing component means the segment has no vector data.
+pub(crate) fn check_vector_format(file: Result<FileSlice, OpenReadError>) -> crate::Result<()> {
+    match file {
+        Ok(file) => read_vector_header(&file).map(|_| ()),
+        Err(OpenReadError::FileDoesNotExist(_)) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Writes a `.centroids` header.
 pub(crate) fn write_centroid_header<W: Write + ?Sized>(writer: &mut W) -> io::Result<()> {
     write_header(writer, CURRENT_CENTROID)
@@ -167,6 +177,11 @@ mod tests {
         let (version, body) = read_vector_header(&FileSlice::from(buf)).unwrap();
         assert_eq!(version, VectorFileVersion::V4);
         assert_eq!(body.len(), 0);
+    }
+
+    #[test]
+    fn format_check_accepts_a_missing_vector_component() {
+        check_vector_format(Err(OpenReadError::FileDoesNotExist("segment.vec".into()))).unwrap();
     }
 
     #[test]
