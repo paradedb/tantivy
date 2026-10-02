@@ -84,11 +84,9 @@ impl Segment {
     /// Checks the vector format header without opening other components or vector readers.
     /// Segments without a vector file are accepted.
     pub fn validate_vector_format(&self) -> crate::Result<()> {
-        match self.open_read(SegmentComponent::Custom(crate::vector::VEC_EXT.to_string())) {
-            Ok(file) => crate::vector::header::read_vector_header(&file).map(|_| ()),
-            Err(OpenReadError::FileDoesNotExist(_)) => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        crate::vector::header::check_vector_format(
+            self.open_read(SegmentComponent::Custom(crate::vector::VEC_EXT.to_string())),
+        )
     }
 
     /// Open one of the component file for *regular* write.

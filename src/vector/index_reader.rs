@@ -628,9 +628,17 @@ impl VectorEstimatorMeasurements {
 
     fn check_schedule(&self, other: &Self) -> crate::Result<()> {
         if self.schedule != other.schedule {
+            let format_schedule = |schedule: &[(QuantizerKind, u8)]| {
+                let layers = schedule
+                    .iter()
+                    .map(|(kind, bits)| format!("{kind}:{bits}"))
+                    .collect::<Vec<_>>();
+                format!("[{}]", layers.join(", "))
+            };
             return Err(TantivyError::InvalidArgument(format!(
-                "cannot merge vector measurements with different schedules: {:?} and {:?}",
-                self.schedule, other.schedule
+                "cannot merge vector measurements with different schedules: {} and {}",
+                format_schedule(&self.schedule),
+                format_schedule(&other.schedule)
             )));
         }
         Ok(())
@@ -3407,24 +3415,31 @@ mod tests {
             sample_rows: 0,
             query_count: 1,
         };
-        for (left, right) in [
-            (vec![(Sign, 1)], vec![(Sign, 1), (Grid, 4)]),
-            (vec![(Sign, 1), (Grid, 4)], vec![(Grid, 2), (Grid, 4)]),
-            (vec![(Sign, 1)], vec![(Grid, 1)]),
+        for (left, right, expected) in [
+            (
+                vec![(Sign, 1)],
+                vec![(Sign, 1), (Grid, 4)],
+                "different schedules: [sign:1] and [sign:1, grid:4]",
+            ),
+            (
+                vec![(Sign, 1), (Grid, 4)],
+                vec![(Grid, 2), (Grid, 4)],
+                "different schedules: [sign:1, grid:4] and [grid:2, grid:4]",
+            ),
+            (
+                vec![(Sign, 1)],
+                vec![(Grid, 1)],
+                "different schedules: [sign:1] and [grid:1]",
+            ),
         ] {
             let a = measurement(&left);
             let b = measurement(&right);
-            let expected = format!(
-                "different schedules: {:?} and {:?}",
-                a.schedule(),
-                b.schedule()
-            );
             assert!(a
                 .clone()
                 .merge(&b)
                 .unwrap_err()
                 .to_string()
-                .contains(&expected));
+                .contains(expected));
             let mut audit = VectorErrorAuditMeasurements {
                 source: VectorEstimatorSource::Provided,
                 depths: vec![VectorErrorDepthMeasurements::default(); left.len()],
@@ -3440,7 +3455,7 @@ mod tests {
                 .merge(&other)
                 .unwrap_err()
                 .to_string()
-                .contains(&expected));
+                .contains(expected));
         }
     }
 

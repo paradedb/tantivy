@@ -217,8 +217,9 @@ impl SegmentReader {
     /// Checks the vector format header without opening field readers or routing data.
     /// Segments without a vector file are accepted.
     pub fn validate_vector_format(&self) -> crate::Result<()> {
-        let meta = self.index.new_segment_meta(self.segment_id, self.max_doc);
-        self.index.segment(meta).validate_vector_format()
+        crate::vector::header::check_vector_format(
+            self.open_read(SegmentComponent::Custom(crate::vector::VEC_EXT.to_string())),
+        )
     }
 
     /// Open a new segment for reading.
