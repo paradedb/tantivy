@@ -18,9 +18,17 @@ use crate::query::{
 };
 use crate::{DocId, Score, TERMINATED};
 
-enum SpecializedScorer {
+pub(crate) enum SpecializedScorer {
     TermUnion(Vec<TermScorer>),
     TermIntersection(Vec<TermScorer>),
+    FilteredTermUnion {
+        terms: Vec<TermScorer>,
+        filter: Box<dyn Scorer>,
+    },
+    FilteredTermIntersection {
+        terms: Vec<TermScorer>,
+        filter: Box<dyn Scorer>,
+    },
     Other(Box<dyn Scorer>),
 }
 
@@ -109,6 +117,26 @@ fn into_box_scorer<TScoreCombiner: ScoreCombiner>(
                 .into_iter()
                 .map(|s| Box::new(s) as Box<dyn Scorer>)
                 .collect();
+            intersect_scorers(boxed_scorers, num_docs)
+        }
+        SpecializedScorer::FilteredTermUnion { mut terms, filter } => {
+            let term_scorer: Box<dyn Scorer> = if terms.len() == 1 {
+                Box::new(terms.pop().unwrap())
+            } else {
+                Box::new(BufferedUnionScorer::build(
+                    terms,
+                    score_combiner_fn,
+                    num_docs,
+                ))
+            };
+            intersect_scorers(vec![term_scorer, filter], num_docs)
+        }
+        SpecializedScorer::FilteredTermIntersection { terms, filter } => {
+            let mut boxed_scorers: Vec<Box<dyn Scorer>> = terms
+                .into_iter()
+                .map(|s| Box::new(s) as Box<dyn Scorer>)
+                .collect();
+            boxed_scorers.push(filter);
             intersect_scorers(boxed_scorers, num_docs)
         }
         SpecializedScorer::Other(scorer) => scorer,
@@ -334,41 +362,69 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                 let combined_all_scorer_count = must_special_scorer_counts.num_all_scorers
                     + should_special_scorer_counts.num_all_scorers;
 
-                // Try to detect a pure TermScorer intersection for block-max optimization.
-                // Preconditions: no removed AllScorers, at least 2 scorers, all TermScorer
-                // with frequency reading enabled.
-                if combined_all_scorer_count == 0
-                    && must_scorers.len() >= 2
-                    && must_scorers.iter().all(|s| s.is::<TermScorer>())
-                {
-                    let term_scorers: Vec<TermScorer> = must_scorers
-                        .into_iter()
-                        .map(|s| *(s.downcast::<TermScorer>().map_err(|_| ()).unwrap()))
-                        .collect();
-                    if term_scorers
-                        .iter()
-                        .all(|s| s.freq_reading_option() == FreqReadingOption::ReadFreq)
-                    {
-                        SpecializedScorer::TermIntersection(term_scorers)
+                let mut term_scorers = Vec::new();
+                let mut other_scorers = Vec::new();
+                for scorer in must_scorers {
+                    if scorer.is::<TermScorer>() {
+                        let term_scorer =
+                            *(scorer.downcast::<TermScorer>().map_err(|_| ()).unwrap());
+                        if term_scorer.freq_reading_option() == FreqReadingOption::ReadFreq {
+                            term_scorers.push(term_scorer);
+                        } else {
+                            other_scorers.push(Box::new(term_scorer) as Box<dyn Scorer>);
+                        }
                     } else {
-                        let must_scorers: Vec<Box<dyn Scorer>> = term_scorers
-                            .into_iter()
-                            .map(|s| Box::new(s) as Box<dyn Scorer>)
-                            .collect();
-                        let boxed_scorer: Box<dyn Scorer> =
-                            effective_must_scorer(must_scorers, 0, reader.max_doc(), num_docs)
-                                .unwrap_or_else(|| Box::new(EmptyScorer));
-                        SpecializedScorer::Other(boxed_scorer)
+                        other_scorers.push(scorer);
+                    }
+                }
+
+                if combined_all_scorer_count == 0 && other_scorers.is_empty() {
+                    if term_scorers.len() >= 2 {
+                        SpecializedScorer::TermIntersection(term_scorers)
+                    } else if term_scorers.len() == 1 {
+                        SpecializedScorer::TermUnion(term_scorers)
+                    } else {
+                        SpecializedScorer::Other(Box::new(EmptyScorer))
+                    }
+                } else if combined_all_scorer_count == 0
+                    && !term_scorers.is_empty()
+                    && !other_scorers.is_empty()
+                {
+                    let filter = intersect_scorers(other_scorers, num_docs);
+                    if term_scorers.len() >= 2 {
+                        SpecializedScorer::FilteredTermIntersection {
+                            terms: term_scorers,
+                            filter,
+                        }
+                    } else {
+                        SpecializedScorer::FilteredTermUnion {
+                            terms: term_scorers,
+                            filter,
+                        }
                     }
                 } else {
-                    let boxed_scorer: Box<dyn Scorer> = effective_must_scorer(
-                        must_scorers,
-                        combined_all_scorer_count,
-                        reader.max_doc(),
-                        num_docs,
-                    )
-                    .unwrap_or_else(|| Box::new(EmptyScorer));
-                    SpecializedScorer::Other(boxed_scorer)
+                    let filter: Box<dyn Scorer> =
+                        if term_scorers.is_empty() && other_scorers.is_empty() {
+                            if combined_all_scorer_count > 0 {
+                                Box::new(AllScorer::new(reader.max_doc()))
+                            } else {
+                                Box::new(EmptyScorer)
+                            }
+                        } else {
+                            let mut all_scorers: Vec<Box<dyn Scorer>> = term_scorers
+                                .into_iter()
+                                .map(|s| Box::new(s) as Box<dyn Scorer>)
+                                .collect();
+                            all_scorers.extend(other_scorers);
+                            effective_must_scorer(
+                                all_scorers,
+                                combined_all_scorer_count,
+                                reader.max_doc(),
+                                num_docs,
+                            )
+                            .unwrap_or_else(|| Box::new(EmptyScorer))
+                        };
+                    SpecializedScorer::Other(filter)
                 }
             }
             (ShouldScorersCombinationMethod::Optional(should_scorer), must_scorers) => {
@@ -421,15 +477,28 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                         // No MUST constraint: SHOULD alone determines matching.
                         should_scorer
                     }
-                    Some(must_scorer) => {
-                        // Has MUST constraint: intersect MUST with SHOULD.
-                        let should_boxed =
-                            into_box_scorer(should_scorer, &score_combiner_fn, num_docs);
-                        SpecializedScorer::Other(intersect_scorers(
-                            vec![must_scorer, should_boxed],
-                            num_docs,
-                        ))
-                    }
+                    Some(must_scorer) => match should_scorer {
+                        SpecializedScorer::TermUnion(terms) => {
+                            SpecializedScorer::FilteredTermUnion {
+                                terms,
+                                filter: must_scorer,
+                            }
+                        }
+                        SpecializedScorer::TermIntersection(terms) => {
+                            SpecializedScorer::FilteredTermIntersection {
+                                terms,
+                                filter: must_scorer,
+                            }
+                        }
+                        _ => {
+                            let should_boxed =
+                                into_box_scorer(should_scorer, &score_combiner_fn, num_docs);
+                            SpecializedScorer::Other(intersect_scorers(
+                                vec![must_scorer, should_boxed],
+                                num_docs,
+                            ))
+                        }
+                    },
                 }
             }
         };
@@ -537,6 +606,75 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             SpecializedScorer::TermIntersection(scorers) => Ok(Box::new(
                 BlockWandIntersectionScorer::new(scorers, init_threshold),
             )),
+            SpecializedScorer::FilteredTermUnion { terms, filter } => {
+                if !TScoreCombiner::SUPPORTS_BLOCK_WAND
+                    || !self.scoring_enabled
+                    || filter.constant_score().is_none()
+                {
+                    let union_scorer = into_box_scorer(
+                        SpecializedScorer::FilteredTermUnion { terms, filter },
+                        &self.score_combiner_fn,
+                        reader.num_docs(),
+                    );
+                    return Ok(Box::new(BasicPruningScorer::new(
+                        union_scorer,
+                        init_threshold,
+                    )));
+                }
+                let filter_boost = filter.constant_score().unwrap();
+                let mut terms = terms;
+                terms.retain(|scorer| scorer.doc() < TERMINATED);
+                match terms.len() {
+                    0 => Ok(Box::new(EmptyScorer)),
+                    1 => Ok(Box::new(BlockWandSingleScorer::with_filter(
+                        terms.pop().unwrap(),
+                        init_threshold,
+                        filter,
+                        filter_boost,
+                    ))),
+                    _ => Ok(Box::new(BlockWandUnionScorer::with_filter(
+                        terms,
+                        init_threshold,
+                        filter,
+                        filter_boost,
+                    ))),
+                }
+            }
+            SpecializedScorer::FilteredTermIntersection { terms, filter } => {
+                if !self.scoring_enabled || filter.constant_score().is_none() {
+                    let intersection_scorer = into_box_scorer(
+                        SpecializedScorer::FilteredTermIntersection { terms, filter },
+                        &self.score_combiner_fn,
+                        reader.num_docs(),
+                    );
+                    return Ok(Box::new(BasicPruningScorer::new(
+                        intersection_scorer,
+                        init_threshold,
+                    )));
+                }
+                if terms.iter().any(|s| s.doc() == TERMINATED) {
+                    return Ok(Box::new(EmptyScorer));
+                }
+                let filter_boost = filter.constant_score().unwrap();
+                match terms.len() {
+                    0 => Ok(Box::new(EmptyScorer)),
+                    1 => {
+                        let mut terms = terms;
+                        Ok(Box::new(BlockWandSingleScorer::with_filter(
+                            terms.pop().unwrap(),
+                            init_threshold,
+                            filter,
+                            filter_boost,
+                        )))
+                    }
+                    _ => Ok(Box::new(BlockWandIntersectionScorer::with_filter(
+                        terms,
+                        init_threshold,
+                        filter,
+                        filter_boost,
+                    ))),
+                }
+            }
             SpecializedScorer::Other(scorer) => {
                 Ok(Box::new(BasicPruningScorer::new(scorer, init_threshold)))
             }
@@ -588,6 +726,11 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     .collect();
                 let mut intersection = intersect_scorers(boxed_scorers, num_docs);
                 for_each_scorer(intersection.as_mut(), callback);
+            }
+            SpecializedScorer::FilteredTermUnion { .. }
+            | SpecializedScorer::FilteredTermIntersection { .. } => {
+                let mut scorer = into_box_scorer(scorer, &self.score_combiner_fn, num_docs);
+                for_each_scorer(scorer.as_mut(), callback);
             }
             SpecializedScorer::Other(mut scorer) => {
                 for_each_scorer(scorer.as_mut(), callback);
@@ -656,6 +799,93 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                 let mut scorer = BlockWandIntersectionScorer::new(scorers, threshold);
                 for_each_pruning_scorer(&mut scorer, callback);
             }
+            SpecializedScorer::FilteredTermUnion { terms, mut filter } => {
+                if !TScoreCombiner::SUPPORTS_BLOCK_WAND
+                    || !self.scoring_enabled
+                    || filter.constant_score().is_none()
+                {
+                    let union_scorer = into_box_scorer(
+                        SpecializedScorer::FilteredTermUnion { terms, filter },
+                        &self.score_combiner_fn,
+                        reader.num_docs(),
+                    );
+                    let mut scorer = BasicPruningScorer::new(union_scorer, threshold);
+                    for_each_pruning_scorer(&mut scorer, callback);
+                    return Ok(());
+                }
+                let filter_boost = filter.constant_score().unwrap();
+                let mut terms = terms;
+                terms.retain(|scorer| scorer.doc() < TERMINATED);
+                match terms.len() {
+                    0 => {}
+                    1 => {
+                        let mut scorer = BlockWandSingleScorer::with_filter(
+                            terms.pop().unwrap(),
+                            threshold,
+                            filter,
+                            filter_boost,
+                        );
+                        for_each_pruning_scorer(&mut scorer, callback);
+                    }
+                    _ if self.should_use_block_maxscore(&terms, reader.max_doc()) => {
+                        super::block_maxscore::block_maxscore_filtered(
+                            terms,
+                            threshold,
+                            Some(&mut *filter),
+                            filter_boost,
+                            super::block_maxscore::MIN_BOUND_WINDOW,
+                            callback,
+                        );
+                    }
+                    _ => {
+                        let mut scorer = BlockWandUnionScorer::with_filter(
+                            terms,
+                            threshold,
+                            filter,
+                            filter_boost,
+                        );
+                        for_each_pruning_scorer(&mut scorer, callback);
+                    }
+                }
+            }
+            SpecializedScorer::FilteredTermIntersection { terms, filter } => {
+                if !self.scoring_enabled || filter.constant_score().is_none() {
+                    let intersection_scorer = into_box_scorer(
+                        SpecializedScorer::FilteredTermIntersection { terms, filter },
+                        &self.score_combiner_fn,
+                        reader.num_docs(),
+                    );
+                    let mut scorer = BasicPruningScorer::new(intersection_scorer, threshold);
+                    for_each_pruning_scorer(&mut scorer, callback);
+                    return Ok(());
+                }
+                if terms.iter().any(|s| s.doc() == TERMINATED) {
+                    return Ok(());
+                }
+                let filter_boost = filter.constant_score().unwrap();
+                match terms.len() {
+                    0 => {}
+                    1 => {
+                        let mut terms = terms;
+                        let mut scorer = BlockWandSingleScorer::with_filter(
+                            terms.pop().unwrap(),
+                            threshold,
+                            filter,
+                            filter_boost,
+                        );
+                        for_each_pruning_scorer(&mut scorer, callback);
+                    }
+                    _ => {
+                        let mut scorer = BlockWandIntersectionScorer::with_filter(
+                            terms,
+                            threshold,
+                            filter,
+                            filter_boost,
+                        );
+                        for_each_pruning_scorer(&mut scorer, callback);
+                    }
+                }
+            }
             SpecializedScorer::Other(scorer) => {
                 let mut scorer = BasicPruningScorer::new(scorer, threshold);
                 for_each_pruning_scorer(&mut scorer, callback);
@@ -691,6 +921,11 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     .collect();
                 let mut intersection = intersect_scorers(boxed_scorers, num_docs);
                 for_each_docset_buffered(intersection.as_mut(), &mut buffer, callback);
+            }
+            SpecializedScorer::FilteredTermUnion { .. }
+            | SpecializedScorer::FilteredTermIntersection { .. } => {
+                let mut scorer = into_box_scorer(scorer, DoNothingCombiner::default, num_docs);
+                for_each_docset_buffered(scorer.as_mut(), &mut buffer, callback);
             }
             SpecializedScorer::Other(mut scorer) => {
                 for_each_docset_buffered(scorer.as_mut(), &mut buffer, callback);
@@ -888,5 +1123,157 @@ mod tests {
                 assert!(weight.should_use_block_maxscore(&scorers, max_doc));
             }
         }
+    }
+
+    #[test]
+    fn test_specialized_scorer_unboxed_filters() -> crate::Result<()> {
+        use super::SpecializedScorer;
+        use crate::query::boolean_query::BlockWandUnionScorer;
+        use crate::query::scorer::BasicPruningScorer;
+        use crate::query::term_query::TermScorer;
+        use crate::query::{
+            ConstScoreQuery, EnableScoring, Occur, Query, SumCombiner, TermQuery, Weight,
+        };
+        use crate::schema::{IndexRecordOption, Schema, TEXT};
+        use crate::{Index, Term};
+
+        let mut schema_builder = Schema::builder();
+        let field = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer_for_tests()?;
+        writer.add_document(doc!(field => "a b c"))?;
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let reader = searcher.segment_reader(0);
+
+        let term_a = TermQuery::new(
+            Term::from_field_text(field, "a"),
+            IndexRecordOption::WithFreqsAndPositions,
+        );
+        let term_b = TermQuery::new(
+            Term::from_field_text(field, "b"),
+            IndexRecordOption::WithFreqsAndPositions,
+        );
+        let term_c = TermQuery::new(
+            Term::from_field_text(field, "c"),
+            IndexRecordOption::WithFreqsAndPositions,
+        );
+        let weight_a = term_a.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let weight_b = term_b.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let weight_c = term_c.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+
+        // Case 1: Should "a", "b" with Must "c" -> FilteredTermUnion with filter containing
+        // TermScorer
+        let bool_weight = BooleanWeight::new(
+            vec![
+                (Occur::Should, weight_a),
+                (Occur::Should, weight_b),
+                (Occur::Must, weight_c),
+            ],
+            true,
+            Box::new(SumCombiner::default),
+        );
+        let specialized =
+            bool_weight.complex_scorer(reader, 1.0, &bool_weight.score_combiner_fn)?;
+        match specialized {
+            SpecializedScorer::FilteredTermUnion { terms, filter } => {
+                assert_eq!(terms.len(), 2);
+                assert!(filter.is::<TermScorer>());
+            }
+            _ => panic!("Expected FilteredTermUnion with TermScorer filter"),
+        }
+        // Dynamic-score filter falls back to non-BMW pruning in pruning_scorer:
+        let scorer = bool_weight.pruning_scorer(reader, 1.0, 0.0)?;
+        assert!(scorer.is::<BasicPruningScorer>());
+        let mut count = 0;
+        bool_weight.for_each_pruning(0.0, reader, &mut |_doc, _score| {
+            count += 1;
+            0.0
+        })?;
+        assert_eq!(count, 1);
+
+        // Case 2: Must "a", "b", "c" -> SpecializedScorer::TermIntersection (3 terms)
+        let weight_a = term_a.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let weight_b = term_b.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let weight_c = term_c.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let bool_weight = BooleanWeight::with_minimum_number_should_match(
+            vec![
+                (Occur::Must, weight_a),
+                (Occur::Must, weight_b),
+                (Occur::Must, weight_c),
+            ],
+            0,
+            true,
+            Box::new(SumCombiner::default),
+        );
+        let specialized =
+            bool_weight.complex_scorer(reader, 1.0, &bool_weight.score_combiner_fn)?;
+        match specialized {
+            SpecializedScorer::TermIntersection(terms) => {
+                assert_eq!(terms.len(), 3);
+            }
+            _ => panic!("Expected TermIntersection"),
+        }
+
+        // Case 3: Must "a", "b" with Must basic (non-freq) "c" -> FilteredTermIntersection with
+        // filter containing TermScorer
+        let term_basic_c =
+            TermQuery::new(Term::from_field_text(field, "c"), IndexRecordOption::Basic);
+        let weight_a = term_a.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let weight_b = term_b.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let weight_basic_c =
+            term_basic_c.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let bool_weight = BooleanWeight::with_minimum_number_should_match(
+            vec![
+                (Occur::Must, weight_a),
+                (Occur::Must, weight_b),
+                (Occur::Must, weight_basic_c),
+            ],
+            0,
+            true,
+            Box::new(SumCombiner::default),
+        );
+        let specialized =
+            bool_weight.complex_scorer(reader, 1.0, &bool_weight.score_combiner_fn)?;
+        match specialized {
+            SpecializedScorer::FilteredTermIntersection { terms, filter } => {
+                assert_eq!(terms.len(), 2);
+                assert!(filter.is::<TermScorer>());
+            }
+            _ => panic!("Expected FilteredTermIntersection with TermScorer filter"),
+        }
+        let scorer = bool_weight.pruning_scorer(reader, 1.0, 0.0)?;
+        assert!(scorer.is::<BasicPruningScorer>());
+        let mut count = 0;
+        bool_weight.for_each_pruning(0.0, reader, &mut |_doc, _score| {
+            count += 1;
+            0.0
+        })?;
+        assert_eq!(count, 1);
+
+        // Case 4: Filter with constant score enables dynamic BlockWandUnionScorer
+        let weight_a = term_a.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let weight_b = term_b.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let const_c = ConstScoreQuery::new(term_c, 1.0);
+        let weight_const_c = const_c.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let bool_weight = BooleanWeight::new(
+            vec![
+                (Occur::Should, weight_a),
+                (Occur::Should, weight_b),
+                (Occur::Must, weight_const_c),
+            ],
+            true,
+            Box::new(SumCombiner::default),
+        );
+        let scorer = bool_weight.pruning_scorer(reader, 1.0, 0.0)?;
+        assert!(scorer.is::<BlockWandUnionScorer>());
+        let mut count = 0;
+        bool_weight.for_each_pruning(0.0, reader, &mut |_doc, _score| {
+            count += 1;
+            0.0
+        })?;
+        assert_eq!(count, 1);
+
+        Ok(())
     }
 }

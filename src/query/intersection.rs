@@ -354,6 +354,15 @@ where
             + self.right.score()
             + self.others.iter_mut().map(Scorer::score).sum::<Score>()
     }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        let mut sum = self.left.constant_score()? + self.right.constant_score()?;
+        for other in &self.others {
+            sum += other.constant_score()?;
+        }
+        Some(sum)
+    }
 }
 
 #[cfg(test)]
