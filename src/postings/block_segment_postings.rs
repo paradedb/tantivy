@@ -343,11 +343,11 @@ impl BlockSegmentPostings {
         if let Some(norms) = self.term_norms.as_ref() {
             let offset = self.skip_reader.pnorm_byte_offset();
             match self.skip_reader.block_info() {
-                BlockInfo::BitPacked { pnorm_num_bits, .. } => {
+                BlockInfo::BitPacked { .. } => {
                     norms
                         .decode_packed_block(
                             offset,
-                            pnorm_num_bits,
+                            self.skip_reader.pnorm_num_bits(),
                             &mut self.fieldnorm_decoder.borrow_mut(),
                         )
                         .expect("failed to decode fieldnorm block");

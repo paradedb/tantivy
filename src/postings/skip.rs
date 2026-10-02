@@ -104,6 +104,7 @@ pub(crate) struct SkipReader {
     owned_read: OwnedBytes,
     skip_info: IndexRecordOption,
     has_pnorms: bool,
+    pnorm_num_bits: u8,
     byte_offset: usize,
     pnorm_byte_offset: PnormOffset,
     remaining_docs: u32, // number of docs remaining, including the
@@ -122,7 +123,6 @@ pub(crate) enum BlockInfo {
         tf_sum: u32,
         block_wand_fieldnorm_id: u8,
         block_wand_term_freq: u32,
-        pnorm_num_bits: u8,
     },
     VInt {
         num_docs: u32,
@@ -152,6 +152,7 @@ impl SkipReader {
             owned_read: data,
             skip_info,
             has_pnorms,
+            pnorm_num_bits: 0,
             block_info: BlockInfo::VInt { num_docs: doc_freq },
             byte_offset: 0,
             pnorm_byte_offset: PnormOffset(0),
@@ -180,6 +181,7 @@ impl SkipReader {
         self.block_info = BlockInfo::VInt { num_docs: doc_freq };
         self.byte_offset = 0;
         self.pnorm_byte_offset = PnormOffset(0);
+        self.pnorm_num_bits = 0;
         self.remaining_docs = doc_freq;
         self.position_offset = 0u64;
         if doc_freq >= COMPRESSION_BLOCK_SIZE as u32 {
@@ -226,6 +228,11 @@ impl SkipReader {
         self.pnorm_byte_offset.0
     }
 
+    #[inline]
+    pub fn pnorm_num_bits(&self) -> u8 {
+        self.pnorm_num_bits
+    }
+
     fn read_block_info(&mut self) {
         let bytes = self.owned_read.as_slice();
         let mut advance_len: usize;
@@ -253,7 +260,7 @@ impl SkipReader {
                 advance_len = 12;
             }
         }
-        let pnorm_num_bits = if self.has_pnorms {
+        self.pnorm_num_bits = if self.has_pnorms {
             let bits = bytes[advance_len];
             advance_len += 1;
             bits
@@ -267,7 +274,6 @@ impl SkipReader {
             tf_sum,
             block_wand_fieldnorm_id,
             block_wand_term_freq,
-            pnorm_num_bits,
         };
         self.owned_read.advance(advance_len);
     }
@@ -298,13 +304,12 @@ impl SkipReader {
                 doc_num_bits,
                 tf_num_bits,
                 tf_sum,
-                pnorm_num_bits,
                 ..
             } => {
                 self.remaining_docs -= COMPRESSION_BLOCK_SIZE as u32;
                 self.byte_offset += compressed_block_size(doc_num_bits + tf_num_bits);
                 self.position_offset += tf_sum as u64;
-                self.pnorm_byte_offset.0 += compressed_block_size(pnorm_num_bits);
+                self.pnorm_byte_offset.0 += compressed_block_size(self.pnorm_num_bits);
             }
             BlockInfo::VInt { num_docs } => {
                 debug_assert_eq!(num_docs, self.remaining_docs);
@@ -381,7 +386,6 @@ mod tests {
                 tf_sum: 0,
                 block_wand_fieldnorm_id: 13,
                 block_wand_term_freq: 3,
-                pnorm_num_bits: 0,
             }
         );
         skip_reader.advance();
@@ -395,7 +399,6 @@ mod tests {
                 tf_sum: 0,
                 block_wand_fieldnorm_id: 8,
                 block_wand_term_freq: 2,
-                pnorm_num_bits: 0,
             }
         );
         skip_reader.advance();
@@ -431,7 +434,6 @@ mod tests {
                 tf_sum: 0u32,
                 block_wand_fieldnorm_id: 0,
                 block_wand_term_freq: 0,
-                pnorm_num_bits: 0,
             }
         );
         skip_reader.advance();
@@ -445,7 +447,6 @@ mod tests {
                 tf_sum: 0u32,
                 block_wand_fieldnorm_id: 0,
                 block_wand_term_freq: 0,
-                pnorm_num_bits: 0,
             }
         );
         skip_reader.advance();
@@ -480,7 +481,6 @@ mod tests {
                 tf_sum: 0u32,
                 block_wand_fieldnorm_id: 0,
                 block_wand_term_freq: 0,
-                pnorm_num_bits: 0,
             }
         );
         skip_reader.advance();
@@ -514,6 +514,7 @@ mod tests {
         );
         assert_eq!(skip_reader.last_doc_in_block(), 1u32);
         assert_eq!(skip_reader.pnorm_byte_offset(), 0);
+        assert_eq!(skip_reader.pnorm_num_bits(), 4);
         assert_eq!(
             skip_reader.block_info(),
             BlockInfo::BitPacked {
@@ -523,12 +524,12 @@ mod tests {
                 tf_sum: 0,
                 block_wand_fieldnorm_id: 13,
                 block_wand_term_freq: 3,
-                pnorm_num_bits: 4,
             }
         );
         skip_reader.advance();
         assert_eq!(skip_reader.last_doc_in_block(), 5u32);
         assert_eq!(skip_reader.pnorm_byte_offset(), compressed_block_size(4));
+        assert_eq!(skip_reader.pnorm_num_bits(), 6);
         assert_eq!(
             skip_reader.block_info(),
             BlockInfo::BitPacked {
@@ -538,7 +539,6 @@ mod tests {
                 tf_sum: 0,
                 block_wand_fieldnorm_id: 8,
                 block_wand_term_freq: 2,
-                pnorm_num_bits: 6,
             }
         );
         skip_reader.advance();
