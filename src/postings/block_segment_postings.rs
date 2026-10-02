@@ -29,7 +29,7 @@ pub struct BlockSegmentPostings {
     pub(crate) doc_decoder: BlockDecoder,
     block_loaded: bool,
     pub(crate) freq_decoder: BlockDecoder,
-    fieldnorm_decoder: RefCell<BlockDecoder>,
+    fieldnorm_decoder: RefCell<Box<BlockDecoder>>,
     fieldnorm_loaded: Cell<bool>,
     freq_reading_option: FreqReadingOption,
     block_max_score_cache: Option<Score>,
@@ -242,7 +242,7 @@ impl BlockSegmentPostings {
             doc_decoder: BlockDecoder::with_val(TERMINATED),
             block_loaded: false,
             freq_decoder: BlockDecoder::with_val(1),
-            fieldnorm_decoder: RefCell::new(BlockDecoder::with_val(0)),
+            fieldnorm_decoder: RefCell::new(Box::new(BlockDecoder::with_val(0))),
             fieldnorm_loaded: Cell::new(false),
             freq_reading_option,
             block_max_score_cache: None,
@@ -375,7 +375,7 @@ impl BlockSegmentPostings {
     #[inline]
     pub(crate) fn fieldnorm_decoder(&self) -> Ref<'_, BlockDecoder> {
         self.load_fieldnorm_block();
-        self.fieldnorm_decoder.borrow()
+        Ref::map(self.fieldnorm_decoder.borrow(), |decoder| decoder.as_ref())
     }
 
     #[inline]
@@ -680,7 +680,7 @@ impl BlockSegmentPostings {
             doc_decoder: BlockDecoder::with_val(TERMINATED),
             block_loaded: true,
             freq_decoder: BlockDecoder::with_val(1),
-            fieldnorm_decoder: RefCell::new(BlockDecoder::with_val(0)),
+            fieldnorm_decoder: RefCell::new(Box::new(BlockDecoder::with_val(0))),
             fieldnorm_loaded: Cell::new(true),
             freq_reading_option: FreqReadingOption::NoFreq,
             block_max_score_cache: None,
