@@ -162,7 +162,7 @@ impl SegmentReader {
         if !self.schema.get_field_entry(field).has_fieldnorms() {
             return Ok(FieldNormReader::constant(self.max_doc(), 1));
         }
-        if self.inverted_index(field)?.has_pnorms() {
+        if self.inverted_index(field)?.has_pnorms() && crate::fieldnorm::bp128_scoring_mode() != 3 {
             return Ok(FieldNormReader::posting(self.max_doc()));
         }
         self.get_fieldnorms_reader(field)
