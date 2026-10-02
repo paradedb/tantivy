@@ -301,17 +301,6 @@ impl FileSlice {
         self.data.storage_block_len()
     }
 
-    /// Relative byte range of the storage block containing `offset`, clipped to this slice.
-    /// Alignment accounts for the slice's absolute position in the underlying file handle.
-    pub fn storage_block_range(&self, offset: usize) -> Option<Range<usize>> {
-        assert!(offset < self.len(), "offset exceeds the fileslice length");
-        let block_len = self.data.storage_block_len()?;
-        debug_assert!(block_len > 0);
-        let start = (self.range.start + offset) / block_len * block_len;
-        let end = start.saturating_add(block_len).min(self.range.end);
-        Some(start.saturating_sub(self.range.start)..end - self.range.start)
-    }
-
     /// Reads a specific slice of data.
     ///
     /// This is equivalent to running `file_slice.slice(from, to).read_bytes()`.
@@ -531,18 +520,6 @@ mod tests {
         assert_eq!(slot.storage_block_ord(0), Some(0));
         assert_eq!(slot.storage_block_ord(1), Some(1));
         assert_eq!(slot.storage_block_ord(5), Some(2));
-    }
-
-    #[test]
-    fn storage_block_range_includes_parent_slice_offset() {
-        let file = FileSlice::new(Arc::new(BlockHandle(b"abcdefghijkl")));
-        let slot = file.slice(1..11).slice_from(2);
-        assert_eq!(slot.storage_block_range(0), Some(0..1));
-        assert_eq!(slot.storage_block_range(1), Some(1..5));
-        assert_eq!(slot.storage_block_range(4), Some(1..5));
-        assert_eq!(slot.storage_block_range(5), Some(5..8));
-        assert_eq!(slot.storage_block_range(7), Some(5..8));
-        assert_eq!(FileSlice::from(&b"abc"[..]).storage_block_range(1), None);
     }
 
     #[test]
