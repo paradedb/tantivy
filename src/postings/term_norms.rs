@@ -2,9 +2,7 @@ use std::io::{self, Write};
 
 use common::{CountingWriter, HasLen};
 
-use crate::directory::{BufferedFileSlice, FileSlice};
-
-const BUFFER_SIZE: usize = 8192;
+use crate::directory::FileSlice;
 
 pub(crate) struct TermNormsWriter<'a, W: Write> {
     write: &'a mut CountingWriter<W>,
@@ -29,27 +27,38 @@ impl<'a, W: Write> TermNormsWriter<'a, W> {
 
 #[derive(Clone)]
 pub(crate) struct TermNormReader {
-    buffer: Option<BufferedFileSlice>,
+    slice: Option<FileSlice>,
 }
 
 impl TermNormReader {
     pub(crate) fn new(source: FileSlice, offset: u64, len: u32) -> Self {
         // Unscored queries must not fail on a norm stream they never read.
-        let buffer = offset
+        let slice = offset
             .checked_add(u64::from(len))
             .filter(|&end| end <= source.len() as u64)
-            .map(|end| {
-                BufferedFileSlice::new(source.slice(offset as usize..end as usize), BUFFER_SIZE)
-            });
-        Self { buffer }
+            .map(|end| source.slice(offset as usize..end as usize));
+        Self { slice }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self { slice: None }
     }
 
     #[inline]
     pub(crate) fn read(&self, ordinal: usize) -> io::Result<u8> {
-        self.buffer
+        let slice = self
+            .slice
             .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated posting norms"))?
-            .read_byte(ordinal as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated posting norms"))?;
+        if ordinal >= slice.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "ordinal out of bounds",
+            ));
+        }
+        let bytes = slice.read_bytes_slice(ordinal..ordinal + 1)?;
+        Ok(bytes[0])
     }
 }
 
@@ -100,25 +109,25 @@ mod tests {
         for ordinal in [0, 127, 8000, 8191] {
             assert_eq!(reader.read(ordinal).unwrap(), ((ordinal + 10) % 251) as u8);
         }
-        assert_eq!(reads.lock().unwrap().last().unwrap(), &(10..8202));
+        assert_eq!(reads.lock().unwrap().last().unwrap(), &(8201..8202));
         let num_reads = reads.lock().unwrap().len();
         let clone = reader.clone();
         assert_eq!(clone.read(8001).unwrap(), (8011 % 251) as u8);
-        assert_eq!(reads.lock().unwrap().len(), num_reads);
-        assert_eq!(reader.read(20000).unwrap(), (20010 % 251) as u8);
-        assert_eq!(reads.lock().unwrap().last().unwrap(), &(20010..28202));
         assert_eq!(reads.lock().unwrap().len(), num_reads + 1);
+        assert_eq!(reader.read(20000).unwrap(), (20010 % 251) as u8);
+        assert_eq!(reads.lock().unwrap().last().unwrap(), &(20010..20011));
+        assert_eq!(reads.lock().unwrap().len(), num_reads + 2);
         assert_eq!(reader.read(28192).unwrap(), (28202 % 251) as u8);
         assert_eq!(reader.read(28999).unwrap(), (29009 % 251) as u8);
-        assert_eq!(reads.lock().unwrap().last().unwrap(), &(28202..29010));
+        assert_eq!(reads.lock().unwrap().last().unwrap(), &(29009..29010));
         assert!(reader.read(29000).is_err());
         assert!(TermNormReader::new(file.clone(), u64::MAX, 1)
             .read(0)
             .is_err());
         assert!(TermNormReader::new(file, 29999, 2).read(0).is_err());
-        let empty = BufferedFileSlice::empty();
-        assert!(empty.read_byte(0).is_err());
-        assert!(empty.read_byte(u64::MAX).is_err());
+        let empty = TermNormReader::empty();
+        assert!(empty.read(0).is_err());
+        assert!(empty.read(usize::MAX).is_err());
     }
 
     #[test]
@@ -132,9 +141,7 @@ mod tests {
             reads.lock().unwrap().clear();
             let reader = TermNormReader::new(file.clone(), offset as u64, 1);
             assert!(reads.lock().unwrap().is_empty());
-            for _ in 0..100 {
-                assert_eq!(reader.read(0).unwrap(), (offset % 251) as u8);
-            }
+            assert_eq!(reader.read(0).unwrap(), (offset % 251) as u8);
             assert_eq!(*reads.lock().unwrap(), vec![offset..offset + 1]);
         }
     }

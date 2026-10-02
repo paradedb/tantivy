@@ -42,16 +42,12 @@ pub struct PositionReader {
 #[derive(Clone)]
 enum PositionData {
     Eager(OwnedBytes),
-    Lazy {
-        file: FileSlice,
-        buffer: OwnedBytes,
-        buffer_start: usize,
-    },
+    Lazy(FileSlice),
 }
 
 impl PositionData {
     fn with_bytes<T>(
-        &mut self,
+        &self,
         range: Range<usize>,
         consume: impl FnOnce(&[u8]) -> T,
     ) -> io::Result<T> {
@@ -60,37 +56,9 @@ impl PositionData {
         }
         match self {
             PositionData::Eager(bytes) => Ok(consume(&bytes.as_slice()[range])),
-            PositionData::Lazy {
-                file,
-                buffer,
-                buffer_start,
-            } => {
-                let buffer_end = *buffer_start + buffer.len();
-                if range.start < *buffer_start || range.end > buffer_end {
-                    let start = file.storage_block_range(range.start).unwrap().start;
-                    let end = file.storage_block_range(range.end - 1).unwrap().end;
-                    let overlap_start = start.max(*buffer_start);
-                    let overlap_end = end.min(buffer_end);
-                    *buffer = if overlap_start < overlap_end {
-                        let mut bytes = Vec::with_capacity(end - start);
-                        if start < overlap_start {
-                            bytes.extend_from_slice(&file.read_bytes_slice(start..overlap_start)?);
-                        }
-                        bytes.extend_from_slice(
-                            &buffer[overlap_start - *buffer_start..overlap_end - *buffer_start],
-                        );
-                        if overlap_end < end {
-                            bytes.extend_from_slice(&file.read_bytes_slice(overlap_end..end)?);
-                        }
-                        OwnedBytes::new(bytes)
-                    } else {
-                        file.read_bytes_slice(start..end)?
-                    };
-                    *buffer_start = start;
-                }
-                Ok(consume(
-                    &buffer[range.start - *buffer_start..range.end - *buffer_start],
-                ))
+            PositionData::Lazy(file) => {
+                let bytes = file.read_bytes_slice(range)?;
+                Ok(consume(&bytes))
             }
         }
     }
@@ -98,7 +66,7 @@ impl PositionData {
     fn len(&self) -> usize {
         match self {
             PositionData::Eager(bytes) => bytes.len(),
-            PositionData::Lazy { file, .. } => file.len(),
+            PositionData::Lazy(file) => file.len(),
         }
     }
 }
@@ -120,11 +88,7 @@ impl PositionReader {
         if positions_data.storage_block_len().is_none() {
             return Self::open(positions_data.read_bytes()?);
         }
-        let mut positions = PositionData::Lazy {
-            file: positions_data,
-            buffer: OwnedBytes::empty(),
-            buffer_start: 0,
-        };
+        let positions = PositionData::Lazy(positions_data);
         let (num_positions_bitpacked_blocks, header_len) = positions
             .with_bytes(0..positions.len().min(10), |mut bytes| {
                 VInt::deserialize_with_size(&mut bytes)

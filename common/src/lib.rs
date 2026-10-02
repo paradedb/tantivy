@@ -6,7 +6,6 @@ pub use byteorder::LittleEndian as Endianness;
 
 mod bitset;
 pub mod bounds;
-pub mod buffered_file_slice;
 mod byte_count;
 mod datetime;
 pub mod file_slice;
