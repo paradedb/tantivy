@@ -274,19 +274,33 @@ impl BlockSegmentPostings {
         // If it is actually loaded, we can compute block max manually.
         if self.block_is_loaded() {
             let block_len = self.block_len();
+            let read_freq = matches!(self.freq_reading_option, FreqReadingOption::ReadFreq);
             let block_max_score = if self.term_norms.is_some() {
                 self.load_fieldnorm_block();
                 let decoder = self.fieldnorm_decoder.borrow();
                 let norms = decoder.output_array();
-                let freqs = self.freq_decoder.output_array();
                 let norm_const = bm25_weight.norm_const();
                 let norm_factor = bm25_weight.norm_factor();
                 let weight = bm25_weight.weight();
+                let mut scores = [0.0f32; COMPRESSION_BLOCK_SIZE];
+                let sc = &mut scores[..block_len];
+                if read_freq && self.freq_decoder.output_len >= block_len {
+                    let freqs = &self.freq_decoder.output_array()[..block_len];
+                    let norms = &norms[..block_len];
+                    for i in 0..block_len {
+                        let tf = freqs[i] as f32;
+                        let norm = norm_const + norm_factor * (norms[i] as f32);
+                        sc[i] = weight * (tf / (tf + norm));
+                    }
+                } else {
+                    let norms = &norms[..block_len];
+                    for i in 0..block_len {
+                        let norm = norm_const + norm_factor * (norms[i] as f32);
+                        sc[i] = weight * (1.0 / (1.0 + norm));
+                    }
+                }
                 let mut max_s = 0.0f32;
-                for i in 0..block_len {
-                    let tf = freqs[i] as f32;
-                    let norm = norm_const + norm_factor * (norms[i] as f32);
-                    let s = weight * (tf / (tf + norm));
+                for &s in sc.iter() {
                     if s > max_s {
                         max_s = s;
                     }
@@ -294,13 +308,23 @@ impl BlockSegmentPostings {
                 max_s
             } else {
                 let docs = self.doc_decoder.output_array();
-                let freqs = self.freq_decoder.output_array();
                 let mut max_s = 0.0f32;
-                for i in 0..block_len {
-                    let fieldnorm_id = fieldnorm_reader.fieldnorm_id(docs[i]);
-                    let s = bm25_weight.score(fieldnorm_id, freqs[i]);
-                    if s > max_s {
-                        max_s = s;
+                if read_freq && self.freq_decoder.output_len >= block_len {
+                    let freqs = self.freq_decoder.output_array();
+                    for i in 0..block_len {
+                        let fieldnorm_id = fieldnorm_reader.fieldnorm_id(docs[i]);
+                        let s = bm25_weight.score(fieldnorm_id, freqs[i]);
+                        if s > max_s {
+                            max_s = s;
+                        }
+                    }
+                } else {
+                    for i in 0..block_len {
+                        let fieldnorm_id = fieldnorm_reader.fieldnorm_id(docs[i]);
+                        let s = bm25_weight.score(fieldnorm_id, 1);
+                        if s > max_s {
+                            max_s = s;
+                        }
                     }
                 }
                 max_s

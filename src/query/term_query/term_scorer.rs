@@ -1,6 +1,7 @@
 use crate::docset::DocSet;
 use crate::fieldnorm::FieldNormReader;
 use crate::index::SegmentId;
+use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
 use crate::postings::{BlockSegmentPostings, FreqReadingOption, Postings, SegmentPostings};
 use crate::query::bm25::Bm25Weight;
 use crate::query::{Explanation, Scorer};
@@ -48,6 +49,78 @@ impl TermScorer {
     #[inline]
     pub(crate) fn has_term_norms(&self) -> bool {
         self.postings.block_cursor.has_term_norms()
+    }
+
+    /// If term norms are enabled, batch-evaluates BM25 scores for documents in the current block
+    /// strictly smaller than `window_end` and invokes `f(docs, scores)`.
+    ///
+    /// This auto-vectorizes the score calculation using SIMD across contiguous frequency and norm
+    /// buffers. Advances the underlying posting cursor across the consumed slice.
+    ///
+    /// Returns `true` if handled in batch, or `false` if term norms are not present.
+    pub(crate) fn for_each_block_slice_with_term_norms<F>(
+        &mut self,
+        window_end: DocId,
+        mut f: F,
+    ) -> bool
+    where
+        F: FnMut(&[DocId], &[Score]),
+    {
+        if !self.has_term_norms() {
+            return false;
+        }
+
+        let norm_const = self.similarity_weight.norm_const();
+        let norm_factor = self.similarity_weight.norm_factor();
+        let weight = self.similarity_weight.weight();
+        let read_freq = matches!(
+            self.postings.block_cursor.freq_reading_option(),
+            FreqReadingOption::ReadFreq
+        );
+
+        while self.doc() < window_end {
+            let start = self.postings.block_offset();
+            let block_docs = self.postings.block_cursor.docs();
+            let block_len = self.postings.block_cursor.block_len();
+            if start >= block_len {
+                break;
+            }
+            let slice_docs = &block_docs[start..block_len];
+            let count = slice_docs.partition_point(|&d| d < window_end);
+            if count == 0 {
+                break;
+            }
+            let end = start + count;
+
+            let mut batch_scores = [0.0f32; COMPRESSION_BLOCK_SIZE];
+            let sc = &mut batch_scores[..count];
+
+            {
+                let norms_decoder = self.postings.block_cursor.fieldnorm_decoder();
+                let norms = &norms_decoder.output_array()[start..end];
+
+                if read_freq {
+                    let freqs = &self.postings.block_cursor.freq_output_array()[start..end];
+                    for i in 0..count {
+                        let tf = freqs[i] as f32;
+                        let norm = norm_const + norm_factor * (norms[i] as f32);
+                        sc[i] = weight * (tf / (tf + norm));
+                    }
+                } else {
+                    for i in 0..count {
+                        let norm = norm_const + norm_factor * (norms[i] as f32);
+                        sc[i] = weight * (1.0 / (1.0 + norm));
+                    }
+                }
+            }
+
+            let docs = &self.postings.block_cursor.docs()[start..end];
+            f(docs, sc);
+
+            self.postings.advance_within_block_by(count);
+        }
+
+        true
     }
 
     pub(crate) fn seek_block(&mut self, target_doc: DocId) {
@@ -417,6 +490,79 @@ mod tests {
             assert_eq!(searcher.segment_readers().len(), 1);
             test_block_wand_aux(&term_query, &searcher)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_for_each_block_slice_with_term_norms() -> crate::Result<()> {
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field(
+            "text",
+            TEXT.set_indexing_options(
+                TEXT.get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_pnorms(true),
+            ),
+        );
+        let index = Index::create_in_ram(schema.build());
+        let mut writer = index.writer_for_tests()?;
+        for id in 0..250 {
+            let padding = "hello ".repeat((id % 13) + 1);
+            writer.add_document(doc!(text => format!("rust {}", padding)))?;
+        }
+        writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let term = Term::from_field_text(text, "rust");
+        let term_query = TermQuery::new(term, IndexRecordOption::WithFreqs);
+        let term_weight =
+            term_query.specialized_weight(EnableScoring::enabled_from_searcher(&searcher))?;
+
+        // 1. Collect reference doc IDs and scores via scalar advance() + score()
+        let mut ref_docs = Vec::new();
+        let mut ref_scores = Vec::new();
+        {
+            let mut scalar_scorer = term_weight
+                .term_scorer_for_test(segment_reader, 1.0)?
+                .unwrap();
+            while scalar_scorer.doc() != TERMINATED {
+                ref_docs.push(scalar_scorer.doc());
+                ref_scores.push(scalar_scorer.score());
+                scalar_scorer.advance();
+            }
+        }
+        assert_eq!(ref_docs.len(), 250);
+
+        // 2. Collect doc IDs and scores via for_each_block_slice_with_term_norms in chunks
+        let mut batch_docs = Vec::new();
+        let mut batch_scores = Vec::new();
+        {
+            let mut batch_scorer = term_weight
+                .term_scorer_for_test(segment_reader, 1.0)?
+                .unwrap();
+            assert!(batch_scorer.has_term_norms());
+
+            let mut window_end = 50;
+            while batch_scorer.doc() != TERMINATED {
+                let handled =
+                    batch_scorer.for_each_block_slice_with_term_norms(window_end, |docs, sc| {
+                        batch_docs.extend_from_slice(docs);
+                        batch_scores.extend_from_slice(sc);
+                    });
+                assert!(handled);
+                window_end += 50;
+            }
+        }
+
+        assert_eq!(batch_docs, ref_docs);
+        assert_eq!(batch_scores.len(), ref_scores.len());
+        for (b, r) in batch_scores.iter().zip(&ref_scores) {
+            assert_nearly_equals!(*b, *r);
+        }
+
         Ok(())
     }
 }

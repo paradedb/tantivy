@@ -102,21 +102,43 @@ pub(super) fn block_maxscore(
             let mut matches_len = 0;
             if strong.len() == 1 {
                 let scorer = &mut strong[0].scorer;
-                while scorer.doc() < window_end {
-                    let score = scorer.score() as f64;
-                    let keep = score * rounding + weak_bound > threshold as f64;
-                    matches[matches_len] = (scorer.doc(), score);
-                    matches_len += keep as usize;
-                    scorer.advance();
+                let handled =
+                    scorer.for_each_block_slice_with_term_norms(window_end, |docs, sc| {
+                        for (&doc, &score) in docs.iter().zip(sc) {
+                            let score_f64 = score as f64;
+                            let keep = score_f64 * rounding + weak_bound > threshold as f64;
+                            matches[matches_len] = (doc, score_f64);
+                            matches_len += keep as usize;
+                        }
+                    });
+                if !handled {
+                    while scorer.doc() < window_end {
+                        let score = scorer.score() as f64;
+                        let keep = score * rounding + weak_bound > threshold as f64;
+                        matches[matches_len] = (scorer.doc(), score);
+                        matches_len += keep as usize;
+                        scorer.advance();
+                    }
                 }
             } else {
                 // Accumulate strong terms into a dense batch; the bitmap tracks touched entries.
                 for term in strong.iter_mut() {
-                    while term.scorer.doc() < window_end {
-                        let offset = (term.scorer.doc() - base) as usize;
-                        candidates[offset / 64] |= 1u64 << (offset % 64);
-                        scores[offset] += term.scorer.score() as f64;
-                        term.scorer.advance();
+                    let handled =
+                        term.scorer
+                            .for_each_block_slice_with_term_norms(window_end, |docs, sc| {
+                                for (&doc, &score) in docs.iter().zip(sc) {
+                                    let offset = (doc - base) as usize;
+                                    candidates[offset / 64] |= 1u64 << (offset % 64);
+                                    scores[offset] += score as f64;
+                                }
+                            });
+                    if !handled {
+                        while term.scorer.doc() < window_end {
+                            let offset = (term.scorer.doc() - base) as usize;
+                            candidates[offset / 64] |= 1u64 << (offset % 64);
+                            scores[offset] += term.scorer.score() as f64;
+                            term.scorer.advance();
+                        }
                     }
                 }
                 for (word, bits) in candidates.iter_mut().enumerate() {
@@ -159,5 +181,89 @@ pub(super) fn block_maxscore(
             }
         }
         start = end;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::collector::TopDocs;
+    use crate::query::BooleanQuery;
+    use crate::schema::{Schema, TEXT};
+    use crate::Index;
+
+    #[test]
+    fn test_block_maxscore_with_pnorms_matches_standard() -> crate::Result<()> {
+        let mut top_results = Vec::new();
+        for pnorms in [false, true] {
+            let mut schema = Schema::builder();
+            let text = schema.add_text_field(
+                "text",
+                TEXT.set_indexing_options(
+                    TEXT.get_indexing_options()
+                        .unwrap()
+                        .clone()
+                        .set_pnorms(pnorms),
+                ),
+            );
+            let index = Index::create_in_ram(schema.build());
+            let mut writer = index.writer_for_tests()?;
+            for id in 0..400 {
+                let mut words = Vec::new();
+                if id % 2 == 0 {
+                    words.push("apple");
+                }
+                if id % 3 == 0 {
+                    words.push("banana");
+                }
+                if id % 5 == 0 {
+                    words.push("cherry");
+                }
+                let padding = "fruit ".repeat((id % 17) + 1);
+                writer.add_document(doc!(text => format!("{} {}", words.join(" "), padding)))?;
+            }
+            writer.commit()?;
+
+            let reader = index.reader()?;
+            let searcher = reader.searcher();
+            let query = BooleanQuery::union(vec![
+                Box::new(crate::query::TermQuery::new(
+                    crate::Term::from_field_text(text, "apple"),
+                    crate::schema::IndexRecordOption::WithFreqs,
+                )),
+                Box::new(crate::query::TermQuery::new(
+                    crate::Term::from_field_text(text, "banana"),
+                    crate::schema::IndexRecordOption::WithFreqs,
+                )),
+                Box::new(crate::query::TermQuery::new(
+                    crate::Term::from_field_text(text, "cherry"),
+                    crate::schema::IndexRecordOption::WithFreqs,
+                )),
+            ]);
+
+            let top_docs = searcher.search(&query, &TopDocs::with_limit(50).order_by_score())?;
+            assert!(!top_docs.is_empty());
+
+            // Verify top docs have valid positive decreasing scores
+            let mut prev_score = f32::INFINITY;
+            for &(score, _doc_address) in &top_docs {
+                assert!(score > 0.0);
+                assert!(score <= prev_score);
+                prev_score = score;
+            }
+            top_results.push(top_docs);
+        }
+
+        // Both pnorms and standard Tantivy should retrieve the same top hits.
+        // Due to 1-byte fieldnorm quantization vs exact pnorm lengths, scores may vary slightly,
+        // but the top matching documents overlap heavily.
+        let docs_no_pnorms: Vec<_> = top_results[0].iter().map(|&(_score, doc)| doc).collect();
+        let docs_pnorms: Vec<_> = top_results[1].iter().map(|&(_score, doc)| doc).collect();
+        let common = docs_no_pnorms
+            .iter()
+            .filter(|doc| docs_pnorms.contains(doc))
+            .count();
+        assert!(common >= 45, "Expected high top-k overlap, got {common}/50");
+
+        Ok(())
     }
 }

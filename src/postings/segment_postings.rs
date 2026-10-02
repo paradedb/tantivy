@@ -103,6 +103,15 @@ impl SegmentPostings {
         self.cur
     }
 
+    #[inline]
+    pub(crate) fn advance_within_block_by(&mut self, count: usize) {
+        self.cur += count;
+        if self.cur >= COMPRESSION_BLOCK_SIZE {
+            self.cur = 0;
+            self.block_cursor.advance();
+        }
+    }
+
     /// Creates a segment postings object with the given documents
     /// and no frequency encoded.
     ///

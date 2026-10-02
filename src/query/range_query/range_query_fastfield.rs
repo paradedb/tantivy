@@ -589,8 +589,7 @@ pub(crate) fn maps_to_u64_fastfield(typ: Type) -> bool {
     match typ {
         Type::U64 | Type::I64 | Type::F64 | Type::Bool | Type::Date => true,
         Type::IpAddr => false,
-        Type::Str | Type::Facet | Type::Bytes | Type::Json | Type::Custom => false,
-        Type::Str | Type::Facet | Type::Bytes | Type::Json | Type::Vector => false,
+        Type::Str | Type::Facet | Type::Bytes | Type::Json | Type::Custom | Type::Vector => false,
     }
 }
 
