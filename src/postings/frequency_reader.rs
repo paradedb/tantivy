@@ -45,6 +45,15 @@ impl FrequencyReader {
 
     #[inline]
     pub(super) fn read(&self, skip_reader: &SkipReader) -> &BlockDecoder {
+        // Keep initialization out of the cached-read path.
+        self.decoder
+            .get()
+            .map(Box::as_ref)
+            .unwrap_or_else(|| self.load(skip_reader))
+    }
+
+    #[inline(never)]
+    fn load(&self, skip_reader: &SkipReader) -> &BlockDecoder {
         self.decoder
             .get_or_try_init(|| {
                 let mut decoder = self
