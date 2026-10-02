@@ -21,10 +21,23 @@ mod reader;
 mod serializer;
 mod writer;
 
+pub(crate) use self::code::quantize_fieldnorm;
 use self::code::{fieldnorm_to_id, id_to_fieldnorm};
 pub use self::reader::{FieldNormReader, FieldNormReaders};
 pub use self::serializer::FieldNormsSerializer;
 pub use self::writer::FieldNormsWriter;
+
+pub(crate) fn bp128_scoring_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("TANTIVY_BP128_MODE").as_deref() {
+        Ok("full") | Err(_) => 0,
+        Ok("quantized") => 1,
+        Ok("legacy") => 2,
+        Ok("fieldnorms") => 3,
+        Ok("bounded") => 4,
+        Ok(mode) => panic!("unknown BP128 scoring experiment mode: {mode}"),
+    })
+}
 
 #[cfg(test)]
 mod tests {

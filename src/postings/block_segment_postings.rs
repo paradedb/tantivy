@@ -281,7 +281,11 @@ impl BlockSegmentPostings {
             let freqs = self.freq_decoder.output_array().iter().cloned();
             let bm25_scores = docs.zip(freqs).enumerate().map(|(offset, (_, term_freq))| {
                 let fieldnorm = self.fieldnorm_at(offset, fieldnorm_reader);
-                bm25_weight.score_fieldnorm(fieldnorm, term_freq)
+                if matches!(crate::fieldnorm::bp128_scoring_mode(), 2 | 3) {
+                    bm25_weight.score(FieldNormReader::fieldnorm_to_id(fieldnorm), term_freq)
+                } else {
+                    bm25_weight.score_fieldnorm(fieldnorm, term_freq)
+                }
             });
             let block_max_score = max_score(bm25_scores).unwrap_or(0.0);
             self.block_max_score_cache = Some(block_max_score);
@@ -303,9 +307,17 @@ impl BlockSegmentPostings {
         source: Option<FileSlice>,
         norm_offset: Option<u64>,
     ) {
-        self.term_norms = source
-            .zip(norm_offset)
-            .map(|(source, offset)| super::term_norms::TermNormReader::new(source, offset));
+        self.term_norms = source.zip(norm_offset).map(|(mut source, offset)| {
+            if crate::fieldnorm::bp128_scoring_mode() == 4 && offset <= source.len() as u64 {
+                let max_bytes =
+                    u64::from(self.doc_freq / 128) * 512 + u64::from(self.doc_freq % 128) * 5;
+                source = source.slice_to((offset + max_bytes).min(source.len() as u64) as usize);
+            }
+            super::term_norms::TermNormReader::new(source, offset)
+        });
+        if crate::fieldnorm::bp128_scoring_mode() == 3 {
+            self.disable_term_norms();
+        }
         self.fieldnorm_loaded.set(false);
     }
 
@@ -350,6 +362,11 @@ impl BlockSegmentPostings {
                         )
                         .expect("failed to decode fieldnorm vint block");
                 }
+            }
+        }
+        if matches!(crate::fieldnorm::bp128_scoring_mode(), 1 | 2) {
+            for norm in self.fieldnorm_decoder.borrow_mut().output_array_mut() {
+                *norm = crate::fieldnorm::quantize_fieldnorm(*norm);
             }
         }
         self.fieldnorm_loaded.set(true);

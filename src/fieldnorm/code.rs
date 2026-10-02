@@ -10,6 +10,16 @@ pub fn fieldnorm_to_id(fieldnorm: u32) -> u8 {
         .unwrap_or_else(|idx| idx - 1) as u8
 }
 
+pub(crate) fn quantize_fieldnorm(fieldnorm: u32) -> u32 {
+    if fieldnorm < 40 {
+        return fieldnorm;
+    }
+    let value = fieldnorm - 24;
+    let shift = 28 - value.leading_zeros();
+    let id = (24 + ((shift + 1) << 3) + ((value >> shift) & 7)).min(255);
+    id_to_fieldnorm(id as u8)
+}
+
 pub const FIELD_NORMS_TABLE: [u32; 256] = [
     0,
     1,

@@ -57,6 +57,7 @@ pub struct BlockWandIntersectionScorer {
     /// fieldnorm IDs to be reused for secondary scoring.
     // TODO: Extend fieldnorm reuse to other scorers.
     shared_fieldnorms: bool,
+    legacy_batch_scoring: bool,
 }
 impl BlockWandIntersectionScorer {
     /// Construction positions `current` on the first match
@@ -103,6 +104,7 @@ impl BlockWandIntersectionScorer {
             internal_doc,
             window_end: 0,
             shared_fieldnorms,
+            legacy_batch_scoring: matches!(crate::fieldnorm::bp128_scoring_mode(), 2 | 3),
         };
         scorer.advance();
         scorer
@@ -315,7 +317,7 @@ impl DocSet for BlockWandIntersectionScorer {
             let score_threshold = self.threshold - secondary_block_max_sum;
 
             let mut num_candidates = 0usize;
-            if block_cursor.has_term_norms() {
+            if block_cursor.has_term_norms() && !self.legacy_batch_scoring {
                 let norms_decoder = block_cursor.fieldnorm_decoder();
                 let block_fieldnorms = &norms_decoder.output_array()[start_idx..end_idx];
                 let len = block_docs.len();

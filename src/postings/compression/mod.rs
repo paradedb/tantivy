@@ -154,6 +154,10 @@ impl BlockDecoder {
         &self.output[..self.output_len]
     }
 
+    pub(crate) fn output_array_mut(&mut self) -> &mut [u32] {
+        &mut self.output[..self.output_len]
+    }
+
     /// Return in-block index of first value >= `target`.
     /// Uses the padded buffer to enable branchless search.
     #[inline]
