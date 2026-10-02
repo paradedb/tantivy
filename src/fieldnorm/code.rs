@@ -5,9 +5,12 @@ pub fn id_to_fieldnorm(id: u8) -> u32 {
 
 #[inline]
 pub fn fieldnorm_to_id(fieldnorm: u32) -> u8 {
-    FIELD_NORMS_TABLE
-        .binary_search(&fieldnorm)
-        .unwrap_or_else(|idx| idx - 1) as u8
+    if fieldnorm < 40 {
+        return fieldnorm as u8;
+    }
+    let value = fieldnorm - 24;
+    let shift = 28 - value.leading_zeros();
+    (24 + ((shift + 1) << 3) + ((value >> shift) & 7)).min(255) as u8
 }
 
 pub const FIELD_NORMS_TABLE: [u32; 256] = [
