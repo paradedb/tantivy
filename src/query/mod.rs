@@ -40,7 +40,7 @@ pub use self::bitset::BitSetDocSet;
 pub use self::bm25::{Bm25StatisticsProvider, Bm25Weight};
 pub use self::boolean_query::{
     BlockWandIntersectionScorer, BlockWandSingleScorer, BlockWandUnionScorer, BooleanQuery,
-    BooleanWeight,
+    BooleanWeight, ConjunctionPruning, LazyWindowedIntersectionScorer,
 };
 pub use self::boost_query::{BoostQuery, BoostWeight};
 pub use self::const_score_query::{ConstScoreQuery, ConstScorer};

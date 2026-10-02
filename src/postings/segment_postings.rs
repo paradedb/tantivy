@@ -1,6 +1,6 @@
-use common::HasLen;
+use common::{HasLen, TinySet};
 
-use crate::docset::DocSet;
+use crate::docset::{DocSet, BLOCK_NUM_TINYBITSETS};
 use crate::fastfield::AliveBitSet;
 use crate::positions::PositionReader;
 use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
@@ -101,6 +101,76 @@ impl SegmentPostings {
 
     pub(crate) fn block_offset(&self) -> usize {
         self.cur
+    }
+
+    pub(crate) fn disable_freq_reading(&mut self) {
+        self.block_cursor.disable_freq_reading();
+    }
+
+    pub(crate) fn seek_block_cursor(&mut self, target_doc: DocId) -> usize {
+        let idx = self.block_cursor.seek(target_doc);
+        self.cur = idx;
+        idx
+    }
+
+    /// Fills the local window bitmask with documents present in `[window_start, window_end)`.
+    ///
+    /// If a block crosses the `window_end` boundary, the in-block index `self.cur` is preserved
+    /// so the next window can resume reading from the already-decoded block without re-decoding.
+    pub(crate) fn fill_bitset_window(
+        &mut self,
+        window_start: DocId,
+        window_end: DocId,
+        mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
+    ) {
+        let window_end = window_end.min(TERMINATED);
+        if self.doc() < window_start {
+            self.seek(window_start);
+        }
+        loop {
+            if self.doc() >= window_end {
+                return;
+            }
+            let docs = self.block_cursor.docs();
+            let len = docs.len();
+            let mut i = self.cur;
+            let mut current_bucket = usize::MAX;
+            let mut current_word = 0u64;
+            while i < len {
+                let doc = docs[i];
+                if doc >= window_end {
+                    if current_bucket < BLOCK_NUM_TINYBITSETS {
+                        mask[current_bucket].insert_bits_mut(current_word);
+                    }
+                    self.cur = i;
+                    return;
+                }
+                let delta = doc - window_start;
+                let bucket = (delta >> 6) as usize;
+                let bit = delta & 63;
+                if bucket == current_bucket {
+                    current_word |= 1u64 << bit;
+                } else {
+                    if current_bucket < BLOCK_NUM_TINYBITSETS {
+                        mask[current_bucket].insert_bits_mut(current_word);
+                    }
+                    current_bucket = bucket;
+                    current_word = 1u64 << bit;
+                }
+                i += 1;
+            }
+            if current_bucket < BLOCK_NUM_TINYBITSETS {
+                mask[current_bucket].insert_bits_mut(current_word);
+            }
+            if len < COMPRESSION_BLOCK_SIZE {
+                // We reached the end of the last (VInt) block.
+                // At index `len` in the doc buffer, the value is padded with `TERMINATED`.
+                self.cur = len;
+                return;
+            }
+            self.cur = 0;
+            self.block_cursor.advance();
+        }
     }
 
     /// Creates a segment postings object with the given documents
@@ -209,6 +279,21 @@ impl SegmentPostings {
 }
 
 impl DocSet for SegmentPostings {
+    fn fill_bitset_block(
+        &mut self,
+        min_doc: DocId,
+        mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
+    ) -> DocId {
+        self.fill_bitset_window(
+            min_doc,
+            min_doc
+                .saturating_add(crate::docset::BLOCK_WINDOW)
+                .min(TERMINATED),
+            mask,
+        );
+        self.doc()
+    }
+
     // goes to the next element.
     // next needs to be called a first time to point to the correct element.
     #[inline]
@@ -225,16 +310,18 @@ impl DocSet for SegmentPostings {
 
     #[inline]
     fn seek(&mut self, target: DocId) -> DocId {
-        debug_assert!(self.doc() <= target);
-        if self.doc() >= target {
-            return self.doc();
-        }
+        if self.block_cursor.block_is_loaded() {
+            debug_assert!(self.doc() <= target);
+            if self.doc() >= target {
+                return self.doc();
+            }
 
-        // As an optimization, if the block is already loaded, we can
-        // cheaply check the next doc.
-        self.cur = (self.cur + 1).min(COMPRESSION_BLOCK_SIZE - 1);
-        if self.doc() >= target {
-            return self.doc();
+            // As an optimization, if the block is already loaded, we can
+            // cheaply check the next doc.
+            self.cur = (self.cur + 1).min(COMPRESSION_BLOCK_SIZE - 1);
+            if self.doc() >= target {
+                return self.doc();
+            }
         }
 
         // Delegate block-local search to BlockSegmentPostings::seek, which returns
@@ -352,5 +439,34 @@ mod tests {
         let all_deleted =
             AliveBitSet::for_test_from_deleted_docs(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], 12);
         assert_eq!(docs.doc_freq_given_deletes(&all_deleted), 0);
+    }
+    #[test]
+    fn test_batched_windows_match_posting_ids() {
+        use crate::docset::{BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW};
+        use common::TinySet;
+        for len in [0, 1, 127, 128, 129, 256, 1024, 8193] {
+            let docs: Vec<u32> = (0..len).map(|i| i * 3 + 7).collect();
+            let mut postings = SegmentPostings::create_from_docs(&docs);
+            let mut actual = Vec::new();
+            let mut start = 0;
+            while postings.doc() != TERMINATED {
+                let mut mask = [TinySet::empty(); BLOCK_NUM_TINYBITSETS];
+                postings.fill_bitset_block(start, &mut mask);
+                for (bucket, bits) in mask.iter_mut().enumerate() {
+                    while let Some(bit) = bits.pop_lowest() {
+                        actual.push(start + bucket as u32 * 64 + bit);
+                    }
+                }
+                start += BLOCK_WINDOW;
+            }
+            assert_eq!(actual, docs);
+        }
+        let mut postings = SegmentPostings::create_from_docs(&[TERMINATED - 2, TERMINATED - 1]);
+        let mut mask = [TinySet::empty(); BLOCK_NUM_TINYBITSETS];
+        assert_eq!(
+            postings.fill_bitset_block(TERMINATED - 64, &mut mask),
+            TERMINATED
+        );
+        assert_eq!(mask.iter().map(|m| m.len()).sum::<u32>(), 2);
     }
 }

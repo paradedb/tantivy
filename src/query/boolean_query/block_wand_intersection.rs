@@ -110,7 +110,11 @@ impl BlockWandIntersectionScorer {
 
     /// Finds the next document matching every term, then scores it, without checking score bounds.
     fn advance_without_pruning(&mut self) -> DocId {
-        let mut candidate = self.leader.seek(self.internal_doc);
+        let mut candidate = if self.leader.doc() < self.internal_doc {
+            self.leader.seek(self.internal_doc)
+        } else {
+            self.leader.doc()
+        };
         'candidate: while candidate != TERMINATED {
             for secondary in &mut self.secondaries {
                 let secondary_doc = if secondary.doc() < candidate {
@@ -161,36 +165,52 @@ impl BlockWandIntersectionScorer {
             let candidate_doc = self.candidate_doc_ids[self.candidate_idx];
             let mut total_score: Score = self.candidate_scores[self.candidate_idx];
 
-            for (secondary_idx, secondary) in self.secondaries.iter_mut().enumerate() {
-                // If a previous candidate already advanced this secondary past
-                // candidate_doc, the candidate can't be in the intersection.
-                if secondary.doc() > candidate_doc {
+            let mut scored_up_to = 0usize;
+            for secondary_idx in 0..self.secondaries.len() {
+                if self.secondaries[secondary_idx].doc() > candidate_doc {
                     self.candidate_idx += 1;
                     continue 'next_candidate;
                 }
-                let seek_result = secondary.seek(candidate_doc);
+                let seek_result = self.secondaries[secondary_idx].seek(candidate_doc);
                 if seek_result != candidate_doc {
                     self.candidate_idx += 1;
                     continue 'next_candidate;
                 }
-                total_score += if SHARED_NORMS {
-                    secondary.bm25_weight().score(
-                        self.candidate_norms[self.candidate_idx],
-                        secondary.term_freq(),
-                    )
-                } else {
-                    secondary.score()
-                };
 
                 // Prune: even if all remaining secondaries score at their block max,
                 // can we still beat the threshold?
-                if total_score + self.secondary_suffix_block_max[secondary_idx] <= self.threshold {
-                    self.candidate_idx += 1;
-                    continue 'next_candidate;
+                // Only evaluate scores if the suffix bound is below threshold, which
+                // is the only case where pruning is mathematically possible.
+                if self.secondary_suffix_block_max[secondary_idx] < self.threshold {
+                    for s in &mut self.secondaries[scored_up_to..=secondary_idx] {
+                        total_score += if SHARED_NORMS {
+                            s.bm25_weight()
+                                .score(self.candidate_norms[self.candidate_idx], s.term_freq())
+                        } else {
+                            s.score()
+                        };
+                    }
+                    scored_up_to = secondary_idx + 1;
+
+                    if total_score + self.secondary_suffix_block_max[secondary_idx]
+                        <= self.threshold
+                    {
+                        self.candidate_idx += 1;
+                        continue 'next_candidate;
+                    }
                 }
             }
 
-            // All secondaries matched.
+            // All secondaries matched. Finish scoring any un-scored secondaries.
+            for s in &mut self.secondaries[scored_up_to..] {
+                total_score += if SHARED_NORMS {
+                    s.bm25_weight()
+                        .score(self.candidate_norms[self.candidate_idx], s.term_freq())
+                } else {
+                    s.score()
+                };
+            }
+
             if total_score > self.threshold {
                 self.current = (candidate_doc, total_score);
                 self.candidate_idx += 1;
@@ -243,6 +263,10 @@ impl DocSet for BlockWandIntersectionScorer {
             // Position all skip readers on the block containing `doc`.
             // seek_block is cheap: it only advances the skip reader, no block decompression.
             self.leader.seek_block(self.internal_doc);
+            if !self.leader.block_cursor().has_remaining_docs() {
+                self.current = (TERMINATED, Score::MIN);
+                return TERMINATED;
+            }
             let leader_block_max: Score = self.leader.block_max_score();
 
             // Compute the window end as the minimum last_doc_in_block across all scorers.
@@ -271,14 +295,24 @@ impl DocSet for BlockWandIntersectionScorer {
                 continue;
             }
 
+            // If the sum of block maxes across all secondaries is >= threshold,
+            // score_threshold = threshold - secondary_block_max_sum <= 0, so Phase 1
+            // candidate filtering cannot prune any leader documents. Rather than
+            // fragmenting into tiny windows and decoding all leader docs, fall back
+            // to leapfrog intersection which skips non-matching candidates.
+            if secondary_block_max_sum >= self.threshold {
+                return self.advance_without_pruning();
+            }
+
             // --- Phase 2: Batch processing within the window ---
             //
             // Score-first approach: decode the leader's block, filter by threshold,
             // then check intersection membership only for survivors. This avoids expensive
             // secondary seeks for docs that can't beat the threshold.
+            // seek_block_cursor loads the block and returns the in-block index of the first doc >=
+            // `doc`, while keeping the postings cursor in sync.
+            let start_idx = self.leader.seek_block_cursor(self.internal_doc);
             let block_cursor = self.leader.block_cursor();
-            // seek loads the block and returns the in-block index of the first doc >= `doc`.
-            let start_idx = block_cursor.seek(self.internal_doc);
 
             // Use the branchless binary search on the doc decoder to find the first
             // index past window_end.
@@ -582,6 +616,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_block_wand_intersection_two_scorers_regression() {
+        let posting_lists = vec![
+            vec![
+                (1, 1),
+                (13, 1),
+                (30, 1),
+                (31, 1),
+                (36, 1),
+                (38, 1),
+                (39, 1),
+                (52, 1),
+                (56, 1),
+                (57, 4),
+                (58, 98),
+                (70, 76),
+                (71, 52),
+                (74, 19),
+            ],
+            vec![(16, 72), (36, 79), (39, 15), (51, 16), (72, 78)],
+        ];
+        let fieldnorms = vec![
+            888, 605, 30, 950, 51, 920, 854, 433, 284, 866, 16, 98, 716, 730, 433, 712, 394, 850,
+            252, 168, 43, 502, 969, 449, 840, 75, 110, 127, 351, 485, 419, 135, 937, 576, 814, 909,
+            966, 785, 370, 974, 131, 835, 607, 794, 218, 662, 9, 5, 138, 111, 950, 362, 731, 186,
+            130, 130, 302, 661, 80, 196, 554, 753, 632, 969, 553, 779, 857, 280, 611, 424, 789,
+            561, 789, 349, 923, 71,
+        ];
+        test_block_wand_intersection_aux(&posting_lists[..], &fieldnorms[..]);
     }
 
     proptest! {

@@ -13,6 +13,8 @@ pub trait ScoreCombiner: Default + Clone + Send + Copy + 'static {
     /// see every matching term, so it must not be pruned this way.
     const SUPPORTS_BLOCK_WAND: bool = false;
 
+    const REQUIRES_SCORING: bool = true;
+
     /// Aggregates the score combiner with the given scorer.
     ///
     /// The `ScoreCombiner` may decide to call `.scorer.score()`
@@ -34,6 +36,7 @@ pub trait ScoreCombiner: Default + Clone + Send + Copy + 'static {
 pub struct DoNothingCombiner;
 
 impl ScoreCombiner for DoNothingCombiner {
+    const REQUIRES_SCORING: bool = false;
     fn update<TScorer: Scorer>(&mut self, _scorer: &mut TScorer) {}
 
     fn clear(&mut self) {}

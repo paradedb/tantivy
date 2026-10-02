@@ -139,9 +139,19 @@ impl TermScorer {
         self.postings.block_cursor.skip_reader().last_doc_in_block()
     }
 
+    pub(crate) fn postings(&self) -> &SegmentPostings {
+        &self.postings
+    }
+
     /// Returns a mutable reference to the underlying block cursor.
     pub(crate) fn block_cursor(&mut self) -> &mut BlockSegmentPostings {
         &mut self.postings.block_cursor
+    }
+
+    /// Positions the block cursor at the block containing `target_doc`, loads the block,
+    /// and synchronizes the postings cursor offset with the returned in-block index.
+    pub(crate) fn seek_block_cursor(&mut self, target_doc: DocId) -> usize {
+        self.postings.seek_block_cursor(target_doc)
     }
 
     /// Returns a reference to the fieldnorm reader for batch lookups.
@@ -156,6 +166,14 @@ impl TermScorer {
 }
 
 impl DocSet for TermScorer {
+    fn fill_bitset_block(
+        &mut self,
+        min_doc: DocId,
+        mask: &mut [common::TinySet; crate::docset::BLOCK_NUM_TINYBITSETS],
+    ) -> DocId {
+        self.postings.fill_bitset_block(min_doc, mask)
+    }
+
     #[inline]
     fn advance(&mut self) -> DocId {
         self.postings.advance()
@@ -163,7 +181,6 @@ impl DocSet for TermScorer {
 
     #[inline]
     fn seek(&mut self, target: DocId) -> DocId {
-        debug_assert!(target >= self.doc());
         self.postings.seek(target)
     }
 
