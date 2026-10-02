@@ -1003,7 +1003,7 @@ fn diagnostic_schedules_ignore_rotation_seeds() -> crate::Result<()> {
     assert_eq!(left_audit.schedule(), right_audit.schedule());
     assert_eq!(left_estimator.schedule(), right_estimator.schedule());
     assert_eq!(
-        left_audit.schedule(),
+        left_audit.schedule().layers(),
         &[(QuantizerKind::Sign, 1), (QuantizerKind::Grid, 4)]
     );
     left_estimator.merge(&right_estimator)?;
@@ -1033,7 +1033,7 @@ fn diagnostics_skip_empty_clusters() -> crate::Result<()> {
         )?
         .unwrap();
     assert_eq!(
-        audit.schedule(),
+        audit.schedule().layers(),
         &[(crate::vector::QuantizerKind::Sign, 1), (crate::vector::QuantizerKind::Grid, 4)]
     );
     assert_eq!(audit.estimator.sample_rows(), 30);

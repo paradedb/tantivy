@@ -80,8 +80,8 @@ pub use ivf::{
     StackedSearchStats, SuperKMeansLevelClusterer, Workspace, APS_MAX_DIM,
 };
 pub use metadata::{
-    F64Bits, Grid, Partition, Quantizer, QuantizerKind, Rotation, VectorColMetadata,
-    VectorFieldMeta,
+    F64Bits, Grid, Partition, QuantizationSchedule, Quantizer, QuantizerKind, Rotation,
+    VectorColMetadata, VectorFieldMeta,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;

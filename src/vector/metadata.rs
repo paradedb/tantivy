@@ -73,6 +73,35 @@ impl fmt::Display for QuantizerKind {
         f.write_str(self.name())
     }
 }
+
+/// Ordered quantizer families and code widths, independent of rotation seeds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuantizationSchedule(Vec<(QuantizerKind, u8)>);
+
+impl QuantizationSchedule {
+    /// Constructs a schedule from its ordered layers.
+    pub fn new(layers: Vec<(QuantizerKind, u8)>) -> Self {
+        Self(layers)
+    }
+
+    /// Returns the quantizer family and code width of each layer in order.
+    pub fn layers(&self) -> &[(QuantizerKind, u8)] {
+        &self.0
+    }
+}
+
+impl fmt::Display for QuantizationSchedule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[")?;
+        for (index, (kind, bits)) in self.layers().iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{kind}:{bits}")?;
+        }
+        f.write_str("]")
+    }
+}
 /// Tagged encode/decode contract; a semantic change requires a new variant.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
@@ -762,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn quantizer_kind_names() {
+    fn quantizer_kind_and_schedule_names() {
         for (kind, name) in [(QuantizerKind::Sign, "sign"), (QuantizerKind::Grid, "grid")] {
             assert_eq!(kind.name(), name);
             assert_eq!(kind.to_string(), name);
@@ -770,6 +799,9 @@ mod tests {
         let meta = metadata(Metric::L2, &[1, 4]);
         assert_eq!(meta.layers()[0].kind(), QuantizerKind::Sign);
         assert_eq!(meta.layers()[1].kind(), QuantizerKind::Grid);
+        let schedule =
+            QuantizationSchedule::new(vec![(QuantizerKind::Sign, 1), (QuantizerKind::Grid, 4)]);
+        assert_eq!(schedule.to_string(), "[sign:1, grid:4]");
     }
     // Pins ordered slot semantics, widths, strides, and scan-band ownership.
     #[test]
