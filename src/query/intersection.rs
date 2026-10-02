@@ -27,6 +27,18 @@ pub fn intersect_scorers(
     if scorers.len() == 1 {
         return scorers.pop().unwrap();
     }
+    if scorers.iter().all(|scorer| scorer.is::<TermScorer>()) {
+        let term_scorers: Vec<TermScorer> = scorers
+            .into_iter()
+            .map(|scorer| *(scorer.downcast::<TermScorer>().map_err(|_| ()).unwrap()))
+            .collect();
+        let intersection = Intersection::new(term_scorers, segment_num_docs);
+        if intersection.doc() == TERMINATED {
+            return Box::new(EmptyScorer);
+        } else {
+            return Box::new(intersection);
+        }
+    }
     // Order by estimated cost to drive each scorer.
     scorers.sort_by_key(|scorer| scorer.cost());
     let doc = go_to_first_doc(&mut scorers[..]);
@@ -56,7 +68,7 @@ pub fn intersect_scorers(
 }
 
 /// Creates a `DocSet` that iterate through the intersection of two or more `DocSet`s.
-pub struct Intersection<TDocSet: DocSet, TOtherDocSet: DocSet = Box<dyn Scorer>> {
+pub struct Intersection<TDocSet: DocSet, TOtherDocSet: DocSet = TDocSet> {
     left: TDocSet,
     right: TDocSet,
     others: Vec<TOtherDocSet>,
@@ -81,12 +93,21 @@ fn go_to_first_doc<TDocSet: DocSet>(docsets: &mut [TDocSet]) -> DocId {
 impl<TDocSet: DocSet> Intersection<TDocSet, TDocSet> {
     /// num_docs is the number of documents in the segment.
     pub(crate) fn new(
-        docsets: Vec<TDocSet>,
+        mut docsets: Vec<TDocSet>,
         segment_num_docs: u32,
     ) -> Intersection<TDocSet, TDocSet> {
-        let mut intersection = Self::new_unpositioned(docsets, segment_num_docs);
-        intersection.seek(intersection.doc());
-        intersection
+        let num_docsets = docsets.len();
+        assert!(num_docsets >= 2);
+        docsets.sort_by_key(|docset| docset.cost());
+        go_to_first_doc(&mut docsets);
+        let left = docsets.remove(0);
+        let right = docsets.remove(0);
+        Intersection {
+            left,
+            right,
+            others: docsets,
+            segment_num_docs,
+        }
     }
 
     /// Call `seek` or `seek_danger` to align the document sets before using the intersection.

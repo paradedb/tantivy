@@ -53,7 +53,7 @@ impl Weight for TermWeight {
             )),
             TermOrEmptyOrAllScorer::Empty => Ok(Box::new(EmptyScorer)),
             TermOrEmptyOrAllScorer::AllMatch(all_scorer) => Ok(Box::new(BasicPruningScorer::new(
-                Box::new(all_scorer),
+                all_scorer,
                 init_threshold,
             ))),
         }

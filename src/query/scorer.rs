@@ -17,7 +17,7 @@ pub trait Scorer: downcast_rs::Downcast + DocSet + 'static {
 
 impl_downcast!(Scorer);
 
-impl Scorer for Box<dyn Scorer> {
+impl<TScorer: Scorer + ?Sized> Scorer for Box<TScorer> {
     #[inline]
     fn score(&mut self) -> Score {
         self.deref_mut().score()
@@ -30,27 +30,20 @@ pub trait PruningScorer: Scorer {
 
 impl_downcast!(PruningScorer);
 
-impl Scorer for Box<dyn PruningScorer> {
-    #[inline]
-    fn score(&mut self) -> Score {
-        self.deref_mut().score()
-    }
-}
-
-impl PruningScorer for Box<dyn PruningScorer> {
+impl<TScorer: PruningScorer + ?Sized> PruningScorer for Box<TScorer> {
     #[inline]
     fn set_threshold(&mut self, score: Score) {
         self.deref_mut().set_threshold(score);
     }
 }
 
-pub struct BasicPruningScorer {
-    scorer: Box<dyn Scorer>,
+pub struct BasicPruningScorer<TScorer = Box<dyn Scorer>> {
+    scorer: TScorer,
     threshold: Score,
     current: (DocId, Score),
 }
-impl BasicPruningScorer {
-    pub fn new(scorer: Box<dyn Scorer>, threshold: Score) -> Self {
+impl<TScorer: Scorer> BasicPruningScorer<TScorer> {
+    pub fn new(scorer: TScorer, threshold: Score) -> Self {
         let mut pruning = Self {
             scorer,
             threshold,
@@ -60,19 +53,19 @@ impl BasicPruningScorer {
         pruning
     }
 }
-impl Scorer for BasicPruningScorer {
+impl<TScorer: Scorer> Scorer for BasicPruningScorer<TScorer> {
     #[inline]
     fn score(&mut self) -> Score {
         self.current.1
     }
 }
-impl PruningScorer for BasicPruningScorer {
+impl<TScorer: Scorer> PruningScorer for BasicPruningScorer<TScorer> {
     #[inline]
     fn set_threshold(&mut self, score: Score) {
         self.threshold = score;
     }
 }
-impl DocSet for BasicPruningScorer {
+impl<TScorer: Scorer> DocSet for BasicPruningScorer<TScorer> {
     #[inline]
     fn doc(&self) -> crate::DocId {
         self.current.0
