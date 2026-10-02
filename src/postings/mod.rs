@@ -7,6 +7,7 @@ pub(crate) use self::block_search::search_block;
 pub(crate) mod block_segment_postings;
 
 pub(crate) mod compression;
+mod frequency_reader;
 mod indexing_context;
 mod json_postings_writer;
 mod loaded_postings;

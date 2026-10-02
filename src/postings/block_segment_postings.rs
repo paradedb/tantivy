@@ -1,13 +1,14 @@
 use std::io;
+use std::sync::Arc;
 
 use common::{HasLen, VInt};
-use once_cell::unsync::OnceCell;
 
 use crate::directory::{BufferedFileSlice, FileSlice, OwnedBytes};
 use crate::fieldnorm::FieldNormReader;
 use crate::postings::compression::{
     compressed_block_size, BlockDecoder, VIntDecoder, COMPRESSION_BLOCK_SIZE,
 };
+use crate::postings::frequency_reader::FrequencyReader;
 use crate::postings::{BlockInfo, FreqReadingOption, SkipReader};
 use crate::query::Bm25Weight;
 use crate::schema::IndexRecordOption;
@@ -28,14 +29,14 @@ pub(crate) fn max_score<I: Iterator<Item = Score>>(mut it: I) -> Option<Score> {
 pub struct BlockSegmentPostings {
     pub(crate) doc_decoder: BlockDecoder,
     block_loaded: bool,
-    freq_decoder: OnceCell<BlockDecoder>,
+    freq_decoder: BlockDecoder,
     freq_reading_option: FreqReadingOption,
     record_option: IndexRecordOption,
     requested_option: IndexRecordOption,
     block_max_score_cache: Option<Score>,
     doc_freq: u32,
     data: PostingData,
-    freqs_data: Option<PostingData>,
+    freqs_data: Option<FrequencyReader>,
     skip_reader: SkipReader,
     term_norms: Option<super::term_norms::TermNormReader>,
 }
@@ -49,11 +50,6 @@ enum PostingData {
 }
 
 impl PostingData {
-    fn buffered(file: FileSlice) -> Self {
-        let len = file.len();
-        Self::Buffered(BufferedFileSlice::new(file, POSTINGS_BUFFER_SIZE), len)
-    }
-
     fn with_bytes<T>(
         &self,
         range: std::ops::Range<usize>,
@@ -152,7 +148,7 @@ impl BlockSegmentPostings {
             doc_freq,
             skip_data_opt,
             PostingData::Eager(postings_data),
-            freqs.map(PostingData::Eager),
+            freqs.map(|bytes| FrequencyReader::new(FileSlice::new(Arc::new(bytes)))),
             record_option,
             requested_option,
         )
@@ -174,7 +170,7 @@ impl BlockSegmentPostings {
                 doc_freq,
                 skips,
                 PostingData::Eager(postings),
-                freqs.map(PostingData::buffered),
+                freqs.map(FrequencyReader::new),
                 record_option,
                 requested_option,
             );
@@ -196,7 +192,7 @@ impl BlockSegmentPostings {
             doc_freq,
             Some(skips),
             PostingData::Buffered(buffer, len),
-            freqs.map(PostingData::buffered),
+            freqs.map(FrequencyReader::new),
             record_option,
             requested_option,
         )
@@ -206,7 +202,7 @@ impl BlockSegmentPostings {
         doc_freq: u32,
         skip_data_opt: Option<OwnedBytes>,
         data: PostingData,
-        freqs_data: Option<PostingData>,
+        freqs_data: Option<FrequencyReader>,
         mut record_option: IndexRecordOption,
         requested_option: IndexRecordOption,
     ) -> io::Result<Self> {
@@ -242,7 +238,7 @@ impl BlockSegmentPostings {
         let mut block_segment_postings = BlockSegmentPostings {
             doc_decoder: BlockDecoder::with_val(TERMINATED),
             block_loaded: false,
-            freq_decoder: OnceCell::from(BlockDecoder::with_val(1)),
+            freq_decoder: BlockDecoder::with_val(1),
             freq_reading_option,
             record_option: schema_record_option,
             requested_option,
@@ -354,7 +350,10 @@ impl BlockSegmentPostings {
         let (skip_data_opt, postings_data) =
             split_into_skips_and_postings(doc_freq, postings_data)?;
         self.data = PostingData::Eager(postings_data);
-        self.freqs_data = freqs.map(PostingData::buffered);
+        match (&mut self.freqs_data, freqs) {
+            (Some(reader), Some(file)) => reader.reset(file),
+            (_, freqs) => self.freqs_data = freqs.map(FrequencyReader::new),
+        }
         self.block_max_score_cache = None;
         self.block_loaded = false;
         let skip_data = skip_data_opt.unwrap_or_else(OwnedBytes::empty);
@@ -376,7 +375,7 @@ impl BlockSegmentPostings {
             (_, IndexRecordOption::Basic) => FreqReadingOption::SkipFreq,
             _ => FreqReadingOption::ReadFreq,
         };
-        self.freq_decoder = OnceCell::from(BlockDecoder::with_val(1));
+        self.freq_decoder = BlockDecoder::with_val(1);
         self.doc_freq = doc_freq;
         self.try_load_block()
     }
@@ -422,47 +421,12 @@ impl BlockSegmentPostings {
 
     #[inline]
     fn freq_decoder(&self) -> &BlockDecoder {
-        self.freq_decoder
-            .get_or_try_init(|| {
-                let mut decoder = BlockDecoder::with_val(1);
-                if self.freq_reading_option == FreqReadingOption::ReadFreq {
-                    if let Some(freqs_data) = &self.freqs_data {
-                        let start = self.skip_reader.freq_byte_offset();
-                        match self.skip_reader.block_info() {
-                            BlockInfo::BitPacked {
-                                tf_num_bits,
-                                strict_delta_encoded,
-                                ..
-                            } => {
-                                freqs_data.with_bytes(
-                                    start..start + compressed_block_size(tf_num_bits),
-                                    |bytes| {
-                                        decoder.uncompress_block_unsorted(
-                                            bytes,
-                                            tf_num_bits,
-                                            strict_delta_encoded,
-                                        );
-                                    },
-                                )?;
-                            }
-                            BlockInfo::VInt { num_docs }
-                                if num_docs > 0 && start < freqs_data.len() =>
-                            {
-                                freqs_data.with_bytes(start..freqs_data.len(), |bytes| {
-                                    decoder.uncompress_vint_unsorted(
-                                        bytes,
-                                        num_docs as usize,
-                                        TERMINATED,
-                                    );
-                                })?;
-                            }
-                            BlockInfo::VInt { .. } => {}
-                        }
-                    }
-                }
-                Ok::<_, io::Error>(decoder)
-            })
-            .expect("term frequencies became unreadable after the reader was opened")
+        if self.freq_reading_option == FreqReadingOption::ReadFreq {
+            if let Some(freqs) = &self.freqs_data {
+                return freqs.read(&self.skip_reader);
+            }
+        }
+        &self.freq_decoder
     }
 
     /// Returns the length of the current block.
@@ -619,7 +583,7 @@ impl BlockSegmentPostings {
                 BlockInfo::VInt { num_docs: 0 }
             )
         {
-            self.freq_decoder.take();
+            self.freqs_data.as_mut().unwrap().invalidate();
         }
         let range = self.block_data_range();
         match self.skip_reader.block_info() {
@@ -635,7 +599,7 @@ impl BlockSegmentPostings {
                         if self.freqs_data.is_none()
                             && self.freq_reading_option == FreqReadingOption::ReadFreq
                         {
-                            self.freq_decoder.get_mut()
+                            Some(&mut self.freq_decoder)
                         } else {
                             None
                         },
@@ -654,7 +618,7 @@ impl BlockSegmentPostings {
                         if self.freqs_data.is_none()
                             && self.freq_reading_option == FreqReadingOption::ReadFreq
                         {
-                            self.freq_decoder.get_mut()
+                            Some(&mut self.freq_decoder)
                         } else {
                             None
                         },
@@ -682,7 +646,7 @@ impl BlockSegmentPostings {
         BlockSegmentPostings {
             doc_decoder: BlockDecoder::with_val(TERMINATED),
             block_loaded: true,
-            freq_decoder: OnceCell::from(BlockDecoder::with_val(1)),
+            freq_decoder: BlockDecoder::with_val(1),
             freq_reading_option: FreqReadingOption::NoFreq,
             record_option: IndexRecordOption::Basic,
             requested_option: IndexRecordOption::Basic,
@@ -915,7 +879,7 @@ mod tests {
 
     #[test]
     fn separated_frequencies_are_read_only_on_access() -> crate::Result<()> {
-        for count in [1, 127, 128, 129, 4097] {
+        for count in [1, 127, 128, 129, 4097, 25_601] {
             let mut schema = Schema::builder();
             let text = schema.add_text_field("text", TEXT);
             let index = Index::create_in_ram(schema.build());
@@ -948,11 +912,13 @@ mod tests {
                 IndexRecordOption::WithFreqsAndPositions,
             ] {
                 let reads = Arc::new(Mutex::new(Vec::new()));
+                let padding = 73;
                 let file = FileSlice::new(Arc::new(BlockBackedFile {
-                    data: freqs.to_vec(),
+                    data: [vec![0; padding], freqs.to_vec()].concat(),
                     reads: reads.clone(),
                     fail_after: None,
-                }));
+                }))
+                .slice_from(padding);
                 let mut blocks = BlockSegmentPostings::open_file_slice(
                     count,
                     FileSlice::new(Arc::new(docs.clone())),
@@ -974,7 +940,13 @@ mod tests {
                 };
                 assert_eq!(blocks.freq(offset), expected);
                 if option.has_freq() {
-                    assert_eq!(reads.lock().unwrap()[0].start, start);
+                    let first_read = reads.lock().unwrap()[0].clone();
+                    assert!(first_read.contains(&(start + padding)));
+                    assert_eq!(
+                        first_read.start,
+                        ((start + padding) / 4096 * 4096).max(padding)
+                    );
+                    assert!(first_read.end <= padding + freqs.len());
                     for (doc, freq) in blocks.docs().iter().zip(blocks.freqs()) {
                         assert_eq!(*freq, doc % 17 + 1);
                     }

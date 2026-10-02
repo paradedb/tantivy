@@ -590,6 +590,138 @@ impl PostingsSerializer {
     }
 }
 
+#[cfg(all(test, feature = "unstable"))]
+mod benches {
+    use std::sync::Arc;
+
+    use common::HasLen;
+    use test::{black_box, Bencher};
+
+    use super::*;
+    use crate::directory::{FileHandle, FileSlice, OwnedBytes};
+    use crate::postings::BlockSegmentPostings;
+
+    #[derive(Debug)]
+    struct PagedFile(OwnedBytes);
+
+    impl HasLen for PagedFile {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    impl FileHandle for PagedFile {
+        fn read_bytes(&self, range: std::ops::Range<usize>) -> io::Result<OwnedBytes> {
+            if !range.is_empty() && range.start / 8192 != (range.end - 1) / 8192 {
+                Ok(OwnedBytes::new(self.0[range].to_vec()))
+            } else {
+                Ok(self.0.slice(range))
+            }
+        }
+
+        fn storage_block_len(&self) -> Option<usize> {
+            Some(8192)
+        }
+    }
+
+    fn scan(
+        b: &mut Bencher,
+        separated: bool,
+        paged: bool,
+        freq_every: usize,
+        count: u32,
+        per_doc: bool,
+    ) {
+        let mode = IndexRecordOption::WithFreqsAndPositions;
+        let mut serializer = PostingsSerializer::new(20.0, mode, None, Bm25Params::default());
+        serializer.freqs = separated.then(Vec::new);
+        serializer.new_term(count, true);
+        for doc in 0..count {
+            serializer.write_doc(doc * 3, doc % 17 + 1);
+        }
+        let mut bytes = Vec::new();
+        serializer.close_term(count, &mut bytes).unwrap();
+        let file = |bytes| {
+            if paged {
+                FileSlice::new(Arc::new(PagedFile(OwnedBytes::new(bytes))))
+            } else {
+                FileSlice::from(bytes)
+            }
+        };
+        let docs = file(bytes);
+        let freqs = serializer.freqs.map(file);
+        b.iter(|| {
+            let mut blocks = BlockSegmentPostings::open_file_slice(
+                count,
+                docs.clone(),
+                freqs.clone(),
+                mode,
+                mode,
+            )
+            .unwrap();
+            let mut total = 0u64;
+            let mut block = 0;
+            while !blocks.docs().is_empty() {
+                total += blocks.docs()[0] as u64;
+                if freq_every != 0 && block % freq_every == 0 {
+                    if per_doc {
+                        for idx in 0..blocks.docs().len() {
+                            total += u64::from(blocks.freq(black_box(idx)));
+                        }
+                    } else {
+                        total += blocks
+                            .freqs()
+                            .iter()
+                            .map(|&freq| u64::from(freq))
+                            .sum::<u64>();
+                    }
+                }
+                blocks.advance();
+                block += 1;
+            }
+            black_box(total)
+        });
+    }
+
+    macro_rules! scan_bench {
+        ($name:ident, $separated:expr, $paged:expr, $freq_every:expr) => {
+            #[bench]
+            fn $name(b: &mut Bencher) {
+                scan(b, $separated, $paged, $freq_every, 262_145, false);
+            }
+        };
+    }
+
+    scan_bench!(freq_scan_legacy_resident, false, false, 1);
+    scan_bench!(freq_scan_split_resident, true, false, 1);
+    scan_bench!(freq_scan_legacy_paged, false, true, 1);
+    scan_bench!(freq_scan_split_paged, true, true, 1);
+    scan_bench!(freq_scan_legacy_sparse, false, true, 16);
+    scan_bench!(freq_scan_split_sparse, true, true, 16);
+    scan_bench!(freq_scan_legacy_docs, false, true, 0);
+    scan_bench!(freq_scan_split_docs, true, true, 0);
+
+    #[bench]
+    fn freq_scan_legacy_short(b: &mut Bencher) {
+        scan(b, false, true, 1, 33, false);
+    }
+
+    #[bench]
+    fn freq_scan_split_short(b: &mut Bencher) {
+        scan(b, true, true, 1, 33, false);
+    }
+
+    #[bench]
+    fn freq_scan_legacy_per_doc(b: &mut Bencher) {
+        scan(b, false, true, 1, 262_145, true);
+    }
+
+    #[bench]
+    fn freq_scan_split_per_doc(b: &mut Bencher) {
+        scan(b, true, true, 1, 262_145, true);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
