@@ -260,6 +260,7 @@ impl BlockSegmentPostings {
     /// after having called `.shallow_advance(..)`.
     ///
     /// See `TermScorer::block_max_score(..)` for more information.
+    #[inline]
     pub fn block_max_score(
         &mut self,
         fieldnorm_reader: &FieldNormReader,
@@ -274,6 +275,16 @@ impl BlockSegmentPostings {
             self.block_max_score_cache = Some(skip_reader_max_score);
             return skip_reader_max_score;
         }
+        self.tail_block_max_score(fieldnorm_reader, bm25_weight)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn tail_block_max_score(
+        &mut self,
+        fieldnorm_reader: &FieldNormReader,
+        bm25_weight: &Bm25Weight,
+    ) -> Score {
         // this is the last block of the segment posting list.
         // If it is actually loaded, we can compute block max manually.
         if self.block_is_loaded() {
