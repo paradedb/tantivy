@@ -4,7 +4,8 @@ use std::sync::Arc;
 use tantivy_fst::Regex;
 
 use crate::error::TantivyError;
-use crate::query::{AutomatonWeight, EnableScoring, Query, Weight};
+use crate::query::query_estimate::{EstimationBudget, MAX_ESTIMATED_TERMS};
+use crate::query::{AutomatonWeight, EnableScoring, Query, QueryEstimate, Weight};
 use crate::schema::Field;
 
 /// A Regex Query matches all of the documents
@@ -77,6 +78,20 @@ impl RegexQuery {
 
     fn specialized_weight(&self) -> AutomatonWeight<Regex> {
         AutomatonWeight::new(self.field, self.regex.clone())
+    }
+}
+
+impl QueryEstimate for RegexQuery {
+    /// Find indexed words matching the regex and read how many documents contain each one.
+    /// Estimate how many contain at least one of those words, allowing for documents containing
+    /// several matches. Return `None` if finding all matching words exceeds our reading limits.
+    fn estimate_docs(&self, reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        let mut remaining_terms = MAX_ESTIMATED_TERMS;
+        self.specialized_weight().estimate_docs(
+            reader,
+            &mut remaining_terms,
+            &mut EstimationBudget::default(),
+        )
     }
 }
 

@@ -9,7 +9,9 @@ use crate::index::SegmentReader;
 use crate::query::all_query::AllScorer;
 use crate::query::boost_query::BoostScorer;
 use crate::query::explanation::does_not_match;
-use crate::query::{BitSetDocSet, EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{
+    BitSetDocSet, EnableScoring, Explanation, Query, QueryEstimate, Scorer, Weight,
+};
 use crate::schema::Type;
 use crate::{DocId, Score, TantivyError};
 
@@ -39,6 +41,11 @@ pub struct ExistsQuery {
 }
 
 impl ExistsQuery {
+    /// Returns the field whose presence is tested.
+    pub fn field_name(&self) -> &str {
+        &self.field_name
+    }
+
     /// Creates a new `ExistQuery` from the given field.
     ///
     /// This query matches all documents with at least one non-null value in the specified field.
@@ -66,6 +73,13 @@ impl ExistsQuery {
             field_name: field,
             json_subpaths,
         }
+    }
+}
+
+impl QueryEstimate for ExistsQuery {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        // The caller uses column statistics to estimate how many documents have this field.
+        Ok(None)
     }
 }
 

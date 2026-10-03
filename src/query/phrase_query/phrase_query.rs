@@ -1,6 +1,7 @@
 use super::PhraseWeight;
 use crate::query::bm25::Bm25Weight;
-use crate::query::{EnableScoring, Query, Weight};
+use crate::query::query_estimate::estimate_phrase;
+use crate::query::{EnableScoring, Query, QueryEstimate, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::SegmentReader;
 
@@ -130,6 +131,25 @@ impl PhraseQuery {
             weight.slop(self.slop);
         }
         Ok(weight)
+    }
+}
+
+impl QueryEstimate for PhraseQuery {
+    /// Read how many documents contain each word and estimate how many contain all of them.
+    /// Assume only 1 in `10 * phrase_length` has the words next to each other in order.
+    /// Allowing gaps (`slop`) increases that fraction, up to all documents containing every word.
+    /// This uses stored counts without reading the words' actual positions.
+    fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        let inverted_index = reader.inverted_index(self.field)?;
+        let terms = self
+            .phrase_terms
+            .iter()
+            .map(|(_, term)| {
+                let count = inverted_index.doc_freq(term)?;
+                Ok((count, u64::from(count)))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        Ok(Some(estimate_phrase(&terms, reader.max_doc(), self.slop)))
     }
 }
 

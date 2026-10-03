@@ -2,7 +2,8 @@ use std::ops::Bound;
 
 use super::{prefix_end, PhrasePrefixWeight};
 use crate::query::bm25::Bm25Weight;
-use crate::query::{EnableScoring, InvertedIndexRangeWeight, Query, Weight};
+use crate::query::query_estimate::{bounded_prefix_stream, estimate_term_union, EstimationBudget};
+use crate::query::{EnableScoring, InvertedIndexRangeWeight, Query, QueryEstimate, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::SegmentReader;
 
@@ -124,6 +125,51 @@ impl PhrasePrefixQuery {
             self.max_expansions,
         );
         Ok(Some(weight))
+    }
+}
+
+impl QueryEstimate for PhrasePrefixQuery {
+    /// For `"red fox ca*"`, use the smaller document count of `red` and `fox`. Every match must
+    /// contain both, so this can overestimate.
+    fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        if self.max_expansions == 0 {
+            return Ok(Some((0, 0)));
+        }
+        let inverted_index = reader.inverted_index(self.field)?;
+        if !self.phrase_terms.is_empty() {
+            let mut count = reader.max_doc();
+            let mut cost = 0u64;
+            for (_, term) in &self.phrase_terms {
+                let frequency = inverted_index.doc_freq(term)?;
+                if frequency == 0 {
+                    return Ok(Some((0, 0)));
+                }
+                count = count.min(frequency);
+                cost = cost.saturating_add(u64::from(frequency));
+            }
+            // Use the same allowance for checking word positions as estimate_phrase.
+            let positional_cost = 10 * (self.phrase_terms.len() as u64 + 1);
+            cost = cost.saturating_add(u64::from(count).saturating_mul(positional_cost));
+            return Ok(Some((count, cost)));
+        }
+        let prefix = self.prefix.1.serialized_value_bytes();
+        let mut budget = EstimationBudget::default();
+        let limit = (self.max_expansions as usize).min(budget.remaining_terms + 1);
+        let Some(mut stream) =
+            bounded_prefix_stream(inverted_index.terms(), prefix, limit, &mut budget)?
+        else {
+            // The prefix range exceeds the dictionary payload read budget.
+            return Ok(None);
+        };
+        let mut frequencies = Vec::new();
+        while frequencies.len() < self.max_expansions as usize && stream.advance() {
+            if !budget.consume(stream.key()) {
+                // The query expands beyond the term or byte estimation budget.
+                return Ok(None);
+            }
+            frequencies.push(stream.value().doc_freq);
+        }
+        Ok(Some(estimate_term_union(&frequencies, reader.max_doc())))
     }
 }
 
