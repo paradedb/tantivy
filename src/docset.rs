@@ -193,6 +193,20 @@ pub trait DocSet: Send {
         }
     }
 
+    /// Returns true if the docset is known to have NO matching documents in the inclusive
+    /// range `[start, end]` (`start <= doc <= end`).
+    ///
+    /// Useful for block-level skipping prior to decoding postings blocks.
+    fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
+        if start > end {
+            return true;
+        }
+        match self.seek_danger(start) {
+            SeekDangerResult::Found => false,
+            SeekDangerResult::SeekLowerBound(bound) => bound > end,
+        }
+    }
+
     /// Returns the number documents matching.
     /// Calling this method consumes the `DocSet`.
     fn count(&mut self, alive_bitset: &AliveBitSet) -> u32 {
@@ -259,6 +273,10 @@ impl DocSet for &mut dyn DocSet {
         (**self).fill_bitset_block(min_doc, mask)
     }
 
+    fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
+        (**self).is_empty_in_range(start, end)
+    }
+
     fn doc(&self) -> u32 {
         (**self).doc()
     }
@@ -308,6 +326,11 @@ impl<TDocSet: DocSet + ?Sized> DocSet for Box<TDocSet> {
     ) -> DocId {
         let unboxed: &mut TDocSet = self.borrow_mut();
         unboxed.fill_bitset_block(min_doc, mask)
+    }
+
+    fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
+        let unboxed: &mut TDocSet = self.borrow_mut();
+        unboxed.is_empty_in_range(start, end)
     }
 
     fn doc(&self) -> DocId {

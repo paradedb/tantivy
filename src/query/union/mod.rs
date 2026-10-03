@@ -275,6 +275,26 @@ mod tests {
             SeekDangerResult::SeekLowerBound(TERMINATED)
         );
     }
+
+    #[test]
+    fn test_buffered_union_seek_danger_before_current_doc() {
+        let scorer1 = ConstScorer::new(VecDocSet::from(vec![2, 4]), 1.0);
+        let scorer2 = ConstScorer::new(VecDocSet::from(vec![3, 5]), 1.0);
+
+        let mut union_scorer =
+            BufferedUnionScorer::build(vec![scorer1, scorer2], DoNothingCombiner::default, 100);
+
+        assert_eq!(union_scorer.doc(), 2);
+
+        // Target before current doc (which was never in the union)
+        assert_eq!(
+            union_scorer.seek_danger(1),
+            SeekDangerResult::SeekLowerBound(2)
+        );
+
+        // Exact match on current doc
+        assert_eq!(union_scorer.seek_danger(2), SeekDangerResult::Found);
+    }
 }
 
 #[cfg(all(test, feature = "unstable"))]

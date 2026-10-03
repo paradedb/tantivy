@@ -65,14 +65,8 @@ fn metadata_estimates_delegate_through_nested_wrappers() -> crate::Result<()> {
             0 => query,
             1 => Box::new(BoostQuery::new(query, 2.0)),
             2 => Box::new(ConstScoreQuery::new(query, 3.0)),
-            3 => Box::new(BoostQuery::new(
-                Box::new(ConstScoreQuery::new(query, 3.0)),
-                2.0,
-            )),
-            4 => Box::new(ConstScoreQuery::new(
-                Box::new(BoostQuery::new(query, 2.0)),
-                3.0,
-            )),
+            3 => Box::new(BoostQuery::new(ConstScoreQuery::new(query, 3.0), 2.0)),
+            4 => Box::new(ConstScoreQuery::new(BoostQuery::new(query, 2.0), 3.0)),
             _ => Box::new(query),
         }
     };
@@ -191,7 +185,7 @@ fn metadata_estimates_leave_unsupported_queries_to_the_caller() -> crate::Result
     ];
     for query in unsupported {
         assert_eq!(query.estimate_docs(reader)?, None, "{query:?}");
-        let wrapped = BoostQuery::new(Box::new(ConstScoreQuery::new(query, 3.0)), 2.0);
+        let wrapped = BoostQuery::new(ConstScoreQuery::new(query, 3.0), 2.0);
         for occur in [Occur::Must, Occur::Should] {
             let nested = BooleanQuery::new(vec![
                 (occur, term(text, "rare")),
@@ -227,7 +221,7 @@ fn metadata_estimates_text_expansions() -> crate::Result<()> {
     for query in queries {
         assert_eq!(query.count(&searcher)?, 100);
         assert_eq!(query.estimate_docs(reader)?, Some((100, 100)), "{query:?}");
-        let wrapped = BoostQuery::new(Box::new(ConstScoreQuery::new(query, 2.0)), 3.0);
+        let wrapped = BoostQuery::new(ConstScoreQuery::new(query, 2.0), 3.0);
         assert_eq!(wrapped.estimate_docs(reader)?, Some((100, 100)));
     }
     for query in [
@@ -428,7 +422,7 @@ fn metadata_estimates_mlt_without_loading_source() -> crate::Result<()> {
     ];
     for query in queries {
         assert_eq!(query.estimate_docs(reader)?, Some((10, 1000)));
-        let wrapped = ConstScoreQuery::new(Box::new(BoostQuery::new(Box::new(query), 5.0)), 3.0);
+        let wrapped = ConstScoreQuery::new(BoostQuery::new(query, 5.0), 3.0);
         assert_eq!(wrapped.estimate_docs(reader)?, Some((10, 1000)));
     }
     Ok(())

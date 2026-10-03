@@ -15,11 +15,20 @@ use std::cell::Cell;
 use std::io;
 
 mod backend;
+mod blocks;
+mod element;
+pub use element::MAX_ELEM_BYTES;
+/// Fixed alignment of Data entries and their block directories.
+pub const ENTRY_ALIGN: usize = 8;
+const _: () = assert!(MAX_ELEM_BYTES <= ENTRY_ALIGN);
 mod bounds;
 mod collector;
 mod distance;
-mod header;
-mod index_reader;
+pub(crate) mod header;
+pub(crate) mod index_reader;
+mod metadata;
+mod storage_io;
+pub use storage_io::VectorIoStats;
 mod plugin;
 mod prepared;
 pub(crate) mod quantization;
@@ -70,14 +79,18 @@ pub use ivf::{
     RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
     StackedSearchStats, SuperKMeansLevelClusterer, Workspace, APS_MAX_DIM,
 };
+pub use metadata::{
+    F64Bits, Grid, Partition, QuantizationSchedule, Quantizer, QuantizerKind, Rotation,
+    VectorColMetadata, VectorFieldMeta,
+};
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
 pub use quantization::{
     quantized_code_stride, VectorNormPolicy, VectorQuantizationConfig, VectorQuantizationGrid,
-    VectorQuantizationLayer, GRID_FORMAT_VERSION, MAX_QUANTIZATION_LAYERS,
-    QUANTIZED_CODE_ALIGNMENT, QUANTIZED_CONSTANT_STRIDE, QUANTIZED_ERROR_RATIO_STRIDE,
-    QUANTIZED_GAMMA_STRIDE, QUANTIZED_RESIDUAL_NORM_STRIDE, QUANTIZED_SCALE_STRIDE,
-    QUANTIZED_SIDECAR_STRIDE, VECTOR_QUANTIZATION_FORMAT_VERSION,
+    VectorQuantizationLayer, MAX_QUANTIZATION_LAYERS, QUANTIZED_CODE_ALIGNMENT,
+    QUANTIZED_CONSTANT_STRIDE, QUANTIZED_ERROR_RATIO_STRIDE, QUANTIZED_GAMMA_STRIDE,
+    QUANTIZED_RESIDUAL_NORM_STRIDE, QUANTIZED_SCALE_STRIDE, QUANTIZED_SIDECAR_STRIDE,
+    VECTOR_QUANTIZATION_FORMAT_VERSION,
 };
 pub use router::{RouterKind, RouterMetrics, RoutingParams};
 pub use tie_break::NoTieBreak;

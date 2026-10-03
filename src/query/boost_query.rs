@@ -12,46 +12,51 @@ use crate::{DocId, DocSet, Score, SegmentReader, Term};
 /// The document set matched by the `BoostQuery` is strictly the same as the underlying query.
 /// The score of each document, is the score of the underlying query multiplied by the `boost`
 /// factor.
-pub struct BoostQuery {
-    query: Box<dyn Query>,
+pub struct BoostQuery<Q = Box<dyn Query>> {
+    query: Q,
     boost: Score,
 }
 
-impl BoostQuery {
-    /// Returns the query whose scores are adjusted.
-    pub fn query(&self) -> &dyn Query {
-        self.query.as_ref()
+impl<Q> BoostQuery<Q> {
+    /// Builds a boost query.
+    pub fn new(query: Q, boost: Score) -> BoostQuery<Q> {
+        BoostQuery { query, boost }
     }
 
-    /// Builds a boost query.
-    pub fn new(query: Box<dyn Query>, boost: Score) -> BoostQuery {
-        BoostQuery { query, boost }
+    /// Returns the underlying query.
+    pub fn query(&self) -> &Q {
+        &self.query
+    }
+
+    /// Returns the boost factor.
+    pub fn boost(&self) -> Score {
+        self.boost
     }
 }
 
-impl Clone for BoostQuery {
+impl<Q: Clone> Clone for BoostQuery<Q> {
     fn clone(&self) -> Self {
         BoostQuery {
-            query: self.query.box_clone(),
+            query: self.query.clone(),
             boost: self.boost,
         }
     }
 }
 
-impl fmt::Debug for BoostQuery {
+impl<Q: fmt::Debug> fmt::Debug for BoostQuery<Q> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Boost(query={:?}, boost={})", self.query, self.boost)
     }
 }
 
-impl QueryEstimate for BoostQuery {
+impl<Q: QueryEstimate> QueryEstimate for BoostQuery<Q> {
     /// Use the inner query's estimate because boosting scores doesn't change which documents match.
     fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         self.query.estimate_docs(reader)
     }
 }
 
-impl Query for BoostQuery {
+impl<Q: Query + Clone> Query for BoostQuery<Q> {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let weight_without_boost = self.query.weight(enable_scoring)?;
         let boosted_weight = if enable_scoring.is_scoring_enabled() {
@@ -167,6 +172,11 @@ impl<S: Scorer> Scorer for BoostScorer<S> {
     fn score(&mut self) -> Score {
         self.underlying.score() * self.boost
     }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        self.underlying.constant_score().map(|s| s * self.boost)
+    }
 }
 
 #[cfg(test)]
@@ -185,7 +195,7 @@ mod tests {
         index_writer.commit()?;
         let reader = index.reader()?;
         let searcher = reader.searcher();
-        let query = BoostQuery::new(Box::new(AllQuery), 0.2);
+        let query = BoostQuery::new(AllQuery, 0.2);
         let explanation = query.explain(&searcher, DocAddress::new(0, 0u32)).unwrap();
         assert_eq!(
             explanation.to_pretty_json(),

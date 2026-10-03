@@ -283,6 +283,20 @@ mod tests {
             assert_eq!(docset.advance(), TERMINATED);
         }
     }
+
+    #[test]
+    fn test_bitset_is_empty_in_range() {
+        let docs = vec![1, 5, 63, 64, 65, 127, 200];
+        let mut docset = create_docbitset(&docs, 300);
+
+        assert!(!docset.is_empty_in_range(0, 10)); // doc 1, 5 in range
+        assert!(docset.is_empty_in_range(6, 62)); // empty in [6, 62]
+        assert!(!docset.is_empty_in_range(63, 63)); // doc 63 matches
+        assert!(docset.is_empty_in_range(128, 199)); // empty in [128, 199]
+        assert!(!docset.is_empty_in_range(128, 200)); // doc 200 matches
+        assert!(docset.is_empty_in_range(201, 500)); // past last doc
+        assert!(docset.is_empty_in_range(10, 5)); // start > end
+    }
 }
 
 #[cfg(all(test, feature = "unstable"))]

@@ -23,7 +23,7 @@ mod tests {
         RequiredOptionalScorer, Scorer, SumCombiner, TermQuery,
     };
     use crate::schema::*;
-    use crate::{assert_nearly_equals, DocAddress, DocId, Index, IndexWriter, Score};
+    use crate::{assert_nearly_equals, DocAddress, DocId, Index, IndexWriter, Score, TERMINATED};
 
     fn aux_test_helper() -> crate::Result<(Index, Field)> {
         let mut schema_builder = Schema::builder();
@@ -671,6 +671,338 @@ mod tests {
             3,
             "AllScorer in both MUST and SHOULD"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_filtered_pruning_multi_block_skipping() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let num_field =
+            schema_builder.add_i64_field("num", NumericOptions::default().set_fast().set_indexed());
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            // Create 300 docs across multiple 128-doc blocks
+            for i in 0..300 {
+                let text = if i == 10 || i == 150 || i == 260 {
+                    "target"
+                } else {
+                    "other"
+                };
+                index_writer.add_document(doc!(text_field => text, num_field => i as i64))?;
+            }
+            index_writer.commit()?;
+        }
+
+        let searcher = index.reader()?.searcher();
+        let term_query = TermQuery::new(
+            Term::from_field_text(text_field, "target"),
+            IndexRecordOption::WithFreqsAndPositions,
+        );
+        // Filter out doc 10, keeping only docs in [100, 300]
+        let range_query = RangeQuery::new(
+            Bound::Included(Term::from_field_i64(num_field, 100)),
+            Bound::Included(Term::from_field_i64(num_field, 300)),
+        );
+
+        let query = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(term_query)),
+            (Occur::Must, Box::new(range_query)),
+        ]);
+
+        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let mut pruning_scorer = weight.pruning_scorer(searcher.segment_reader(0u32), 1.0, 0.0)?;
+        assert!(pruning_scorer.is::<BlockWandSingleScorer>());
+        // First match must be doc 150 (doc 10 was skipped because filter doc was >= 100)
+        assert_eq!(pruning_scorer.doc(), 150);
+        assert_eq!(pruning_scorer.advance(), 260);
+        assert_eq!(pruning_scorer.advance(), TERMINATED);
+
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(10).order_by_score())?;
+        assert_eq!(top_docs.len(), 2);
+        let doc_ids: Vec<DocId> = top_docs.iter().map(|(_, addr)| addr.doc_id).collect();
+        assert!(doc_ids.contains(&150));
+        assert!(doc_ids.contains(&260));
+
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_filtered_pruning_initial_threshold() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let num_field =
+            schema_builder.add_i64_field("num", NumericOptions::default().set_fast().set_indexed());
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            index_writer.add_document(doc!(text_field => "target other", num_field => 100i64))?;
+            index_writer.add_document(doc!(text_field => "unrelated", num_field => 0i64))?;
+            index_writer.commit()?;
+        }
+
+        let searcher = index.reader()?.searcher();
+        let term_query1 = TermQuery::new(
+            Term::from_field_text(text_field, "target"),
+            IndexRecordOption::WithFreqsAndPositions,
+        );
+        let term_query2 = TermQuery::new(
+            Term::from_field_text(text_field, "other"),
+            IndexRecordOption::WithFreqsAndPositions,
+        );
+        let range_query = RangeQuery::new(
+            Bound::Included(Term::from_field_i64(num_field, 50)),
+            Bound::Included(Term::from_field_i64(num_field, 150)),
+        );
+
+        // Case 1: Single term + filter
+        let single_query = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(term_query1.clone())),
+            (Occur::Must, Box::new(range_query.clone())),
+        ]);
+        let weight = single_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let mut baseline = weight.pruning_scorer(searcher.segment_reader(0u32), 1.0, 0.0)?;
+        assert_eq!(baseline.doc(), 0);
+        let total_score = baseline.score();
+        let init_threshold = total_score - 0.5;
+        let pruning_scorer =
+            weight.pruning_scorer(searcher.segment_reader(0u32), 1.0, init_threshold)?;
+        assert_eq!(pruning_scorer.doc(), 0);
+
+        // Case 2: Multi-term intersection + filter (FilteredTermIntersection)
+        let intersection_query = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(term_query1.clone())),
+            (Occur::Must, Box::new(term_query2.clone())),
+            (Occur::Must, Box::new(range_query.clone())),
+        ]);
+        let weight = intersection_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let mut baseline = weight.pruning_scorer(searcher.segment_reader(0u32), 1.0, 0.0)?;
+        assert_eq!(baseline.doc(), 0);
+        let total_score = baseline.score();
+        let init_threshold = total_score - 0.5;
+        let pruning_scorer =
+            weight.pruning_scorer(searcher.segment_reader(0u32), 1.0, init_threshold)?;
+        assert_eq!(pruning_scorer.doc(), 0);
+
+        // Case 3: Term union + filter (FilteredTermUnion)
+        let mut union_query = BooleanQuery::new(vec![
+            (Occur::Should, Box::new(term_query1.clone())),
+            (Occur::Should, Box::new(term_query2.clone())),
+            (Occur::Must, Box::new(range_query.clone())),
+        ]);
+        union_query.set_minimum_number_should_match(1);
+        let weight = union_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let mut baseline = weight.pruning_scorer(searcher.segment_reader(0u32), 1.0, 0.0)?;
+        assert_eq!(baseline.doc(), 0);
+        let total_score = baseline.score();
+        let init_threshold = total_score - 0.5;
+        let pruning_scorer =
+            weight.pruning_scorer(searcher.segment_reader(0u32), 1.0, init_threshold)?;
+        assert_eq!(pruning_scorer.doc(), 0);
+
+        // Case 4: Nested BooleanQuery + filter
+        let inner_boolean = BooleanQuery::new(vec![
+            (Occur::Should, Box::new(term_query1)),
+            (Occur::Should, Box::new(term_query2)),
+        ]);
+        let nested_query = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(inner_boolean)),
+            (Occur::Must, Box::new(range_query)),
+        ]);
+        let weight = nested_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let mut baseline = weight.pruning_scorer(searcher.segment_reader(0u32), 1.0, 0.0)?;
+        assert_eq!(baseline.doc(), 0);
+        let total_score = baseline.score();
+        let init_threshold = total_score - 0.5;
+        let pruning_scorer =
+            weight.pruning_scorer(searcher.segment_reader(0u32), 1.0, init_threshold)?;
+        assert_eq!(pruning_scorer.doc(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_filtered_pruning_constant_vs_dynamic_filter() -> crate::Result<()> {
+        use crate::query::scorer::BasicPruningScorer;
+        use crate::query::{ConstScoreQuery, PhraseQuery, TermSetQuery};
+
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let num_field =
+            schema_builder.add_i64_field("num", NumericOptions::default().set_fast().set_indexed());
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            index_writer.add_document(doc!(text_field => "quick brown fox", num_field => 10i64))?;
+            index_writer.add_document(doc!(text_field => "quick blue fox", num_field => 20i64))?;
+            index_writer.add_document(doc!(text_field => "lazy brown dog", num_field => 10i64))?;
+            index_writer.commit()?;
+        }
+
+        let searcher = index.reader()?.searcher();
+        let segment_reader = searcher.segment_reader(0u32);
+        let term_query1 = TermQuery::new(
+            Term::from_field_text(text_field, "quick"),
+            IndexRecordOption::WithFreqsAndPositions,
+        );
+        let term_query2 = TermQuery::new(
+            Term::from_field_text(text_field, "fox"),
+            IndexRecordOption::WithFreqsAndPositions,
+        );
+        let phrase_query = PhraseQuery::new(vec![
+            Term::from_field_text(text_field, "brown"),
+            Term::from_field_text(text_field, "fox"),
+        ]);
+
+        // Constant-scoring filter variants to test:
+        // 1. TermSetQuery (constant scorer)
+        // 2. RangeQuery (constant scorer)
+        // 3. ConstScoreQuery (wrapping a dynamic query like PhraseQuery)
+        let constant_filters: [(&str, Box<dyn Query>); 3] = [
+            (
+                "TermSetQuery",
+                Box::new(TermSetQuery::new(vec![Term::from_field_i64(num_field, 10)])),
+            ),
+            (
+                "RangeQuery",
+                Box::new(RangeQuery::new(
+                    Bound::Included(Term::from_field_i64(num_field, 5)),
+                    Bound::Included(Term::from_field_i64(num_field, 15)),
+                )),
+            ),
+            (
+                "ConstScoreQuery",
+                Box::new(ConstScoreQuery::new(phrase_query.clone(), 1.0)),
+            ),
+        ];
+
+        for (name, filter) in &constant_filters {
+            // Case 1: Single term + constant filter -> BlockWandSingleScorer
+            let single_query = BooleanQuery::new(vec![
+                (Occur::Must, Box::new(term_query1.clone())),
+                (Occur::Must, filter.box_clone()),
+            ]);
+            let weight = single_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+            let pruning = weight.pruning_scorer(segment_reader, 1.0, 0.0)?;
+            assert!(
+                pruning.is::<BlockWandSingleScorer>(),
+                "{name} with single term should enable BlockWandSingleScorer"
+            );
+
+            // Case 2: Term union + constant filter -> BlockWandUnionScorer
+            let mut union_query = BooleanQuery::new(vec![
+                (Occur::Should, Box::new(term_query1.clone())),
+                (Occur::Should, Box::new(term_query2.clone())),
+                (Occur::Must, filter.box_clone()),
+            ]);
+            union_query.set_minimum_number_should_match(1);
+            let weight = union_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+            let pruning = weight.pruning_scorer(segment_reader, 1.0, 0.0)?;
+            assert!(
+                pruning.is::<BlockWandUnionScorer>(),
+                "{name} with term union should enable BlockWandUnionScorer"
+            );
+
+            // Case 3: Term intersection + constant filter -> BlockWandIntersectionScorer
+            let intersection_query = BooleanQuery::new(vec![
+                (Occur::Must, Box::new(term_query1.clone())),
+                (Occur::Must, Box::new(term_query2.clone())),
+                (Occur::Must, filter.box_clone()),
+            ]);
+            let weight =
+                intersection_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+            let pruning = weight.pruning_scorer(segment_reader, 1.0, 0.0)?;
+            assert!(
+                pruning.is::<BlockWandIntersectionScorer>(),
+                "{name} with term intersection should enable BlockWandIntersectionScorer"
+            );
+
+            // Case 4: Disabled scoring -> falls back to BasicPruningScorer
+            let disabled_weight =
+                single_query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+            assert!(
+                disabled_weight
+                    .pruning_scorer(segment_reader, 1.0, 0.0)?
+                    .is::<BasicPruningScorer>(),
+                "{name} with disabled scoring must fall back to BasicPruningScorer"
+            );
+        }
+
+        // Dynamic-scoring filter (PhraseQuery without ConstScoreQuery wrapper).
+        // Must fall back to BasicPruningScorer to prevent false pruning.
+        {
+            let dynamic_single = BooleanQuery::new(vec![
+                (Occur::Must, Box::new(term_query1.clone())),
+                (Occur::Must, Box::new(phrase_query.clone())),
+            ]);
+            let weight = dynamic_single.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+            assert!(
+                weight
+                    .pruning_scorer(segment_reader, 1.0, 0.0)?
+                    .is::<BasicPruningScorer>(),
+                "Single term with dynamic filter must fall back to BasicPruningScorer"
+            );
+
+            let mut dynamic_union = BooleanQuery::new(vec![
+                (Occur::Should, Box::new(term_query1.clone())),
+                (Occur::Should, Box::new(term_query2.clone())),
+                (Occur::Must, Box::new(phrase_query.clone())),
+            ]);
+            dynamic_union.set_minimum_number_should_match(1);
+            let weight = dynamic_union.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+            assert!(
+                weight
+                    .pruning_scorer(segment_reader, 1.0, 0.0)?
+                    .is::<BasicPruningScorer>(),
+                "Union with dynamic filter must fall back to BasicPruningScorer"
+            );
+
+            let dynamic_intersection = BooleanQuery::new(vec![
+                (Occur::Must, Box::new(term_query1.clone())),
+                (Occur::Must, Box::new(term_query2.clone())),
+                (Occur::Must, Box::new(phrase_query.clone())),
+            ]);
+            let weight =
+                dynamic_intersection.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+            assert!(
+                weight
+                    .pruning_scorer(segment_reader, 1.0, 0.0)?
+                    .is::<BasicPruningScorer>(),
+                "Intersection with dynamic filter must fall back to BasicPruningScorer"
+            );
+
+            // PhraseQuery as scoring query with constant filter
+            let phrase_filter_query = BooleanQuery::new(vec![
+                (Occur::Must, Box::new(phrase_query.clone())),
+                (Occur::Must, constant_filters[0].1.box_clone()),
+            ]);
+            let weight =
+                phrase_filter_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+            assert!(
+                weight
+                    .pruning_scorer(segment_reader, 1.0, 0.0)?
+                    .is::<BasicPruningScorer>(),
+                "PhraseQuery as scoring query falls back to BasicPruningScorer"
+            );
+
+            // Verify search results still match accurately.
+            let top_docs =
+                searcher.search(&dynamic_single, &TopDocs::with_limit(10).order_by_score())?;
+            assert_eq!(top_docs.len(), 1);
+            assert_eq!(top_docs[0].1.doc_id, 0);
+
+            let top_docs_phrase = searcher.search(
+                &phrase_filter_query,
+                &TopDocs::with_limit(10).order_by_score(),
+            )?;
+            assert_eq!(top_docs_phrase.len(), 1);
+            assert_eq!(top_docs_phrase[0].1.doc_id, 0);
+        }
 
         Ok(())
     }

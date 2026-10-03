@@ -111,6 +111,11 @@ where
     fn score(&mut self) -> Score {
         self.underlying_docset.score()
     }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        self.underlying_docset.constant_score()
+    }
 }
 
 #[cfg(test)]

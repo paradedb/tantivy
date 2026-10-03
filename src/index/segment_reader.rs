@@ -14,15 +14,14 @@ use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
 use crate::index::merge_optimized_inverted_index_reader::MergeOptimizedInvertedIndexReader;
-use crate::index::{
-    Index, IndexSettings, InvertedIndexReader, Segment, SegmentComponent, SegmentId,
-};
+use crate::index::{Index, InvertedIndexReader, Segment, SegmentComponent, SegmentId};
 use crate::json_utils::json_path_sep_to_dot;
 use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
-use crate::vector::VectorIndexReader;
+use crate::vector::index_reader::VectorFieldReader;
+use crate::vector::{VectorColMetadata, VectorIndexReader};
 use crate::{DocId, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
@@ -42,7 +41,7 @@ pub struct SegmentReader {
     custom_alive_bitset: Option<AliveBitSet>,
 
     inv_idx_reader_cache: Arc<RwLock<HashMap<Field, Arc<InvertedIndexReader>>>>,
-    vector_reader_cache: Arc<RwLock<HashMap<Field, Arc<VectorIndexReader>>>>,
+    vector_reader_cache: Arc<RwLock<HashMap<Field, Arc<VectorFieldReader>>>>,
     delete_opstamp: Option<Opstamp>,
 
     max_doc: DocId,
@@ -81,10 +80,6 @@ impl SegmentReader {
     /// Returns the schema of the index this segment belongs to.
     pub fn schema(&self) -> &Schema {
         &self.schema
-    }
-
-    pub(crate) fn index_settings(&self) -> &IndexSettings {
-        self.index.settings()
     }
 
     pub(crate) fn sort_by_field(&self) -> Option<&crate::IndexSortByField> {
@@ -192,20 +187,39 @@ impl SegmentReader {
     /// (zero vectors, no index) rather than an error, so callers never branch
     /// on presence. Requesting a non-vector field is an error.
     pub fn vector_index(&self, field: Field) -> crate::Result<Arc<VectorIndexReader>> {
+        self.vector_field(field)?.search_reader()
+    }
+
+    /// Returns stored field metadata without reading IdMap, routing payloads or block geometry.
+    /// A segment without vector data returns `None`.
+    pub fn vector_metadata(&self, field: Field) -> crate::Result<Option<Arc<VectorColMetadata>>> {
+        Ok(self.vector_field(field)?.metadata())
+    }
+
+    fn vector_field(&self, field: Field) -> crate::Result<Arc<VectorFieldReader>> {
         if let Some(reader) = self
             .vector_reader_cache
             .read()
-            .expect("Lock poisoned. This should never happen")
+            .expect("Lock poisoned")
             .get(&field)
         {
             return Ok(Arc::clone(reader));
         }
-        let reader = Arc::new(VectorIndexReader::open(self, field)?);
-        self.vector_reader_cache
-            .write()
-            .expect("Lock poisoned. This should never happen")
-            .insert(field, Arc::clone(&reader));
+        let mut cache = self.vector_reader_cache.write().expect("Lock poisoned");
+        if let Some(reader) = cache.get(&field) {
+            return Ok(Arc::clone(reader));
+        }
+        let reader = Arc::new(VectorFieldReader::open(self, field)?);
+        cache.insert(field, Arc::clone(&reader));
         Ok(reader)
+    }
+
+    /// Checks the vector format header without opening field readers or routing data.
+    /// Segments without a vector file are accepted.
+    pub fn validate_vector_format(&self) -> crate::Result<()> {
+        crate::vector::header::check_vector_format(
+            self.open_read(SegmentComponent::Custom(crate::vector::VEC_EXT.to_string())),
+        )
     }
 
     /// Open a new segment for reading.

@@ -111,9 +111,15 @@ fn l2_cluster(
         .iter()
         .enumerate()
         .map(|(layer, &bits)| LayerSpec {
+            kind: if bits == 1 {
+                cascade::LayerKind::Sign
+            } else {
+                cascade::LayerKind::Grid
+            },
             bits,
-            seed: seed + layer as u64,
-            rotate: true,
+            rotation: cascade::Rotation::SeededFhtChaCha8 {
+                seed: seed + layer as u64,
+            },
         })
         .collect();
     let grids: Vec<_> = bits.iter().map(|&bits| build_grid(dim, bits)).collect();
@@ -178,7 +184,7 @@ fn l2_cluster(
             scan.candidates.append_selected(
                 0..n,
                 &Selection::All,
-                &docs,
+                Some(&docs),
                 &bases,
                 &scores,
                 &estimates,

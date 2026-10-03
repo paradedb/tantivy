@@ -180,6 +180,11 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> Scorer
     fn score(&mut self) -> Score {
         self.current_score
     }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        TScoreCombiner::constant_score()
+    }
 }
 
 #[cfg(test)]

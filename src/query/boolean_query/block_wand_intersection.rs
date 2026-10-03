@@ -1,3 +1,4 @@
+use crate::docset::SeekDangerResult;
 use crate::fieldnorm::FieldNormReader;
 use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
 use crate::query::scorer::PruningScorer;
@@ -26,6 +27,10 @@ pub(crate) fn block_wand_intersection(
 /// Within non-skipped blocks, individual documents are pruned by checking whether
 /// leader_score + sum(secondary block_max_scores) can exceed the threshold before
 /// performing the expensive intersection membership check (seeking into secondary scorers).
+///
+/// When an optional non-scoring filter docset is provided, entire windows are skipped
+/// if `filter.is_empty_in_range` indicates no matches, and candidate documents are
+/// tested against the filter before secondary scoring.
 ///
 /// # Preconditions
 /// - `scorers` has at least 2 elements
@@ -57,10 +62,35 @@ pub struct BlockWandIntersectionScorer {
     /// fieldnorm IDs to be reused for secondary scoring.
     // TODO: Extend fieldnorm reuse to other scorers.
     shared_fieldnorms: bool,
+    filter: Option<Box<dyn DocSet>>,
+    filter_boost: Score,
 }
 impl BlockWandIntersectionScorer {
     /// Construction positions `current` on the first match
-    pub fn new(mut scorers: Vec<TermScorer>, threshold: Score) -> Self {
+    pub fn new(scorers: Vec<TermScorer>, threshold: Score) -> Self {
+        Self::with_filter_and_boost(scorers, threshold, None, 0.0)
+    }
+
+    /// Creates a new `BlockWandIntersectionScorer` with an embedded non-scoring filter.
+    ///
+    /// Entire windows are skipped if `filter` has no matches in the window range.
+    /// `filter_boost` is added to matching document scores and accounted for in the
+    /// internal pruning threshold.
+    pub fn with_filter(
+        scorers: Vec<TermScorer>,
+        threshold: Score,
+        filter: Box<dyn DocSet>,
+        filter_boost: Score,
+    ) -> Self {
+        Self::with_filter_and_boost(scorers, threshold, Some(filter), filter_boost)
+    }
+
+    fn with_filter_and_boost(
+        mut scorers: Vec<TermScorer>,
+        threshold: Score,
+        filter: Option<Box<dyn DocSet>>,
+        filter_boost: Score,
+    ) -> Self {
         assert!(scorers.len() >= 2);
 
         // Sort by cost (ascending). scorers[0] becomes the "leader" (rarest term).
@@ -73,7 +103,7 @@ impl BlockWandIntersectionScorer {
             .all(|secondary| leader.shares_fieldnorms_with(secondary));
 
         let secondaries_global_max_sum: Score = secondaries.iter().map(TermScorer::max_score).sum();
-        let maximum_possible_score = leader.max_score() + secondaries_global_max_sum;
+        let maximum_possible_score = leader.max_score() + secondaries_global_max_sum + filter_boost;
 
         // Borrow fieldnorm reader and BM25 weight before the main loop.
         // These are immutable references to disjoint fields from block_cursor,
@@ -87,6 +117,8 @@ impl BlockWandIntersectionScorer {
         let mut scorer = Self {
             leader,
             secondaries,
+            filter,
+            filter_boost,
             maximum_possible_score,
             secondary_block_max_scores: vec![0.0f32; secondaries_len].into_boxed_slice(),
             secondary_suffix_block_max: vec![0.0f32; secondaries_len].into_boxed_slice(),
@@ -112,6 +144,15 @@ impl BlockWandIntersectionScorer {
     fn advance_without_pruning(&mut self) -> DocId {
         let mut candidate = self.leader.seek(self.internal_doc);
         'candidate: while candidate != TERMINATED {
+            if let Some(ref mut filter) = self.filter {
+                match filter.seek_danger(candidate) {
+                    SeekDangerResult::Found => {}
+                    SeekDangerResult::SeekLowerBound(bound) => {
+                        candidate = self.leader.seek(bound);
+                        continue 'candidate;
+                    }
+                }
+            }
             for secondary in &mut self.secondaries {
                 let secondary_doc = if secondary.doc() < candidate {
                     secondary.seek(candidate)
@@ -133,9 +174,10 @@ impl BlockWandIntersectionScorer {
                     secondary.score()
                 };
             }
+            let final_score = score + self.filter_boost;
             self.internal_doc = candidate + 1;
-            if score > self.threshold {
-                self.current = (candidate, score);
+            if final_score > self.threshold {
+                self.current = (candidate, final_score);
                 return candidate;
             }
             candidate = self.leader.seek(self.internal_doc);
@@ -145,21 +187,31 @@ impl BlockWandIntersectionScorer {
         TERMINATED
     }
 
-    fn handle_candidates(&mut self) -> Option<DocId> {
+    fn handle_candidates(&mut self, inner_threshold: Score) -> Option<DocId> {
         if self.shared_fieldnorms {
-            self.handle_candidates_with_norms::<true>()
+            self.handle_candidates_with_norms::<true>(inner_threshold)
         } else {
-            self.handle_candidates_with_norms::<false>()
+            self.handle_candidates_with_norms::<false>(inner_threshold)
         }
     }
 
-    fn handle_candidates_with_norms<const SHARED_NORMS: bool>(&mut self) -> Option<DocId> {
+    fn handle_candidates_with_norms<const SHARED_NORMS: bool>(
+        &mut self,
+        inner_threshold: Score,
+    ) -> Option<DocId> {
         // Pass 2: Check intersection membership only for survivors.
         // score_threshold may be stale (threshold can increase from callbacks),
         // but that's conservative — we may check a few extra candidates, never miss one.
         'next_candidate: while self.candidate_idx < self.num_candidates {
             let candidate_doc = self.candidate_doc_ids[self.candidate_idx];
             let mut total_score: Score = self.candidate_scores[self.candidate_idx];
+
+            if let Some(ref mut filter) = self.filter {
+                if filter.seek_danger(candidate_doc) != SeekDangerResult::Found {
+                    self.candidate_idx += 1;
+                    continue 'next_candidate;
+                }
+            }
 
             for (secondary_idx, secondary) in self.secondaries.iter_mut().enumerate() {
                 // If a previous candidate already advanced this secondary past
@@ -184,15 +236,16 @@ impl BlockWandIntersectionScorer {
 
                 // Prune: even if all remaining secondaries score at their block max,
                 // can we still beat the threshold?
-                if total_score + self.secondary_suffix_block_max[secondary_idx] <= self.threshold {
+                if total_score + self.secondary_suffix_block_max[secondary_idx] <= inner_threshold {
                     self.candidate_idx += 1;
                     continue 'next_candidate;
                 }
             }
 
             // All secondaries matched.
-            if total_score > self.threshold {
-                self.current = (candidate_doc, total_score);
+            let final_score = total_score + self.filter_boost;
+            if final_score > self.threshold {
+                self.current = (candidate_doc, final_score);
                 self.candidate_idx += 1;
                 return Some(candidate_doc);
             }
@@ -226,9 +279,15 @@ impl DocSet for BlockWandIntersectionScorer {
             return self.advance_without_pruning();
         }
 
+        let inner_threshold = if self.threshold == Score::MIN {
+            Score::MIN
+        } else {
+            (self.threshold - self.filter_boost) - Score::EPSILON * self.threshold.abs()
+        };
+
         // check for leftover candidates to handle
         if self.num_candidates > 0 {
-            if let Some(doc_id) = self.handle_candidates() {
+            if let Some(doc_id) = self.handle_candidates(inner_threshold) {
                 return doc_id;
             } else {
                 // no remaining candidates, so reset and advance the internal doc
@@ -265,10 +324,17 @@ impl DocSet for BlockWandIntersectionScorer {
                 secondary_block_max_sum += bms;
             }
 
-            if leader_block_max + secondary_block_max_sum <= self.threshold {
+            if leader_block_max + secondary_block_max_sum <= inner_threshold {
                 // The entire window cannot beat the threshold. Skip past it.
                 self.internal_doc = self.window_end + 1;
                 continue;
+            }
+
+            if let Some(ref mut filter) = self.filter {
+                if filter.is_empty_in_range(self.internal_doc, self.window_end) {
+                    self.internal_doc = self.window_end + 1;
+                    continue;
+                }
             }
 
             // --- Phase 2: Batch processing within the window ---
@@ -296,7 +362,7 @@ impl DocSet for BlockWandIntersectionScorer {
             // The trick: always write to the buffer at `num_candidates`, then
             // conditionally advance the count. The compiler can turn this into
             // a cmov instead of a branch, avoiding misprediction costs.
-            let score_threshold = self.threshold - secondary_block_max_sum;
+            let score_threshold = inner_threshold - secondary_block_max_sum;
 
             let mut num_candidates = 0usize;
             for (offset, (candidate_doc, term_freq)) in block_docs
@@ -330,7 +396,7 @@ impl DocSet for BlockWandIntersectionScorer {
                 running += self.secondary_block_max_scores[idx];
             }
 
-            if let Some(doc_id) = self.handle_candidates() {
+            if let Some(doc_id) = self.handle_candidates(inner_threshold) {
                 return doc_id;
             }
             // no candidates left, reset and advance internal doc
@@ -340,6 +406,33 @@ impl DocSet for BlockWandIntersectionScorer {
 
         self.current = (TERMINATED, Score::MIN);
         TERMINATED
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        if self.doc() >= target {
+            return self.doc();
+        }
+        if target == TERMINATED {
+            self.current = (TERMINATED, Score::MIN);
+            return TERMINATED;
+        }
+        while self.candidate_idx < self.num_candidates
+            && self.candidate_doc_ids[self.candidate_idx] < target
+        {
+            self.candidate_idx += 1;
+        }
+        if self.candidate_idx == self.num_candidates {
+            self.num_candidates = 0;
+            if self.internal_doc < target {
+                self.internal_doc = target;
+            }
+        }
+        while self.doc() < target {
+            if self.advance() == TERMINATED {
+                return TERMINATED;
+            }
+        }
+        self.doc()
     }
 
     #[inline]
@@ -357,11 +450,13 @@ impl DocSet for BlockWandIntersectionScorer {
 #[cfg(test)]
 mod tests {
     use std::cmp::Ordering;
-    use std::collections::BinaryHeap;
+    use std::collections::{BinaryHeap, HashSet};
 
     use proptest::prelude::*;
 
+    use super::BlockWandIntersectionScorer;
     use crate::query::term_query::TermScorer;
+    use crate::query::weight::for_each_pruning_scorer;
     use crate::query::{Bm25Weight, Scorer};
     use crate::{DocId, DocSet, Score, TERMINATED};
 
@@ -391,10 +486,41 @@ mod tests {
         (left - right).abs() < 0.0001 * (left + right).abs()
     }
 
+    #[derive(Clone, Debug)]
+    enum TestFilter {
+        None,
+        Range(f64, f64),
+        EveryNth(u32),
+    }
+
+    impl TestFilter {
+        fn to_docs(&self, max_doc: u32) -> Option<Vec<DocId>> {
+            match self {
+                TestFilter::None => None,
+                TestFilter::Range(start_f, end_f) => {
+                    let start = (*start_f * max_doc as f64) as DocId;
+                    let end = (*end_f * max_doc as f64) as DocId;
+                    let (min, max) = (start.min(end), start.max(end));
+                    Some((min..=max.min(max_doc.saturating_sub(1))).collect())
+                }
+                TestFilter::EveryNth(n) => Some((0..max_doc).filter(|d| d % n == 0).collect()),
+            }
+        }
+    }
+
+    fn arb_test_filter() -> impl Strategy<Value = TestFilter> {
+        prop_oneof![
+            3 => Just(TestFilter::None),
+            2 => (0.0f64..1.0f64, 0.0f64..1.0f64).prop_map(|(a, b)| TestFilter::Range(a, b)),
+            1 => (2u32..10u32).prop_map(TestFilter::EveryNth),
+        ]
+    }
+
     /// Run block_wand_intersection and collect (doc, score) pairs above threshold.
     fn compute_checkpoints_block_wand_intersection(
         term_scorers: Vec<TermScorer>,
         top_k: usize,
+        filter_docs: Option<&[DocId]>,
     ) -> Vec<(DocId, Score)> {
         let mut heap: BinaryHeap<Float> = BinaryHeap::with_capacity(top_k);
         let mut checkpoints: Vec<(DocId, Score)> = Vec::new();
@@ -414,7 +540,14 @@ mod tests {
             limit
         };
 
-        super::block_wand_intersection(term_scorers, Score::MIN, callback);
+        if let Some(docs) = filter_docs {
+            let filter = Box::new(crate::query::VecDocSet::from(docs.to_vec()));
+            let mut scorer =
+                BlockWandIntersectionScorer::with_filter(term_scorers, Score::MIN, filter, 0.0);
+            for_each_pruning_scorer(&mut scorer, callback);
+        } else {
+            super::block_wand_intersection(term_scorers, Score::MIN, callback);
+        }
         checkpoints
     }
 
@@ -422,10 +555,14 @@ mod tests {
     fn compute_checkpoints_naive_intersection(
         mut term_scorers: Vec<TermScorer>,
         top_k: usize,
+        filter_docs: Option<&[DocId]>,
     ) -> Vec<(DocId, Score)> {
         let mut heap: BinaryHeap<Float> = BinaryHeap::with_capacity(top_k);
         let mut checkpoints: Vec<(DocId, Score)> = Vec::new();
         let mut limit = Score::MIN;
+
+        let filter_set: Option<HashSet<DocId>> =
+            filter_docs.map(|docs| docs.iter().copied().collect());
 
         // Sort by cost to use the cheapest as driver.
         term_scorers.sort_by_key(|s| s.cost());
@@ -434,40 +571,42 @@ mod tests {
 
         let mut doc = leader.doc();
         while doc != TERMINATED {
-            let mut all_match = true;
-            for secondary in secondaries.iter_mut() {
-                let secondary_doc = secondary.doc();
-                let seek_result = if secondary_doc <= doc {
-                    secondary.seek(doc)
-                } else {
-                    secondary_doc
-                };
-                if seek_result != doc {
-                    all_match = false;
-                    break;
-                }
-            }
-
-            if all_match {
-                // Accumulate in the same left-to-right order as the WAND implementation
-                // (leader first, then each secondary in turn).  Float addition is not
-                // associative, so `leader + secondaries.sum()` gives a different bit
-                // pattern and can cause spurious nearly_equals failures.
-                let mut score: Score = leader.score();
+            if filter_set.as_ref().map_or(true, |f| f.contains(&doc)) {
+                let mut all_match = true;
                 for secondary in secondaries.iter_mut() {
-                    score += secondary.score();
+                    let secondary_doc = secondary.doc();
+                    let seek_result = if secondary_doc <= doc {
+                        secondary.seek(doc)
+                    } else {
+                        secondary_doc
+                    };
+                    if seek_result != doc {
+                        all_match = false;
+                        break;
+                    }
                 }
 
-                if score > limit {
-                    heap.push(Float(score));
-                    if heap.len() > top_k {
-                        heap.pop().unwrap();
+                if all_match {
+                    // Accumulate in the same left-to-right order as the WAND implementation
+                    // (leader first, then each secondary in turn).  Float addition is not
+                    // associative, so `leader + secondaries.sum()` gives a different bit
+                    // pattern and can cause spurious nearly_equals failures.
+                    let mut score: Score = leader.score();
+                    for secondary in secondaries.iter_mut() {
+                        score += secondary.score();
                     }
-                    if heap.len() == top_k {
-                        limit = heap.peek().unwrap().0;
-                    }
-                    if !nearly_equals(score, limit) {
-                        checkpoints.push((doc, score));
+
+                    if score > limit {
+                        heap.push(Float(score));
+                        if heap.len() > top_k {
+                            heap.pop().unwrap();
+                        }
+                        if heap.len() == top_k {
+                            limit = heap.peek().unwrap().0;
+                        }
+                        if !nearly_equals(score, limit) {
+                            checkpoints.push((doc, score));
+                        }
                     }
                 }
             }
@@ -508,7 +647,11 @@ mod tests {
             .boxed()
     }
 
-    fn test_block_wand_intersection_aux(posting_lists: &[Vec<(DocId, u32)>], fieldnorms: &[u32]) {
+    fn test_block_wand_intersection_aux(
+        posting_lists: &[Vec<(DocId, u32)>],
+        fieldnorms: &[u32],
+        filter: &TestFilter,
+    ) {
         // Repeat docs 64 times to create multi-block scenarios, matching block_wand.rs test
         // strategy.
         const REPEAT: usize = 64;
@@ -543,6 +686,7 @@ mod tests {
             .sum();
         let average_fieldnorm = (total_fieldnorms as Score) / (fieldnorms_expanded.len() as Score);
         let max_doc = fieldnorms_expanded.len();
+        let filter_docs = filter.to_docs(max_doc as u32);
 
         let make_scorers = || -> Vec<TermScorer> {
             postings_lists_expanded
@@ -564,21 +708,29 @@ mod tests {
         };
 
         for top_k in 1..4 {
-            let checkpoints_optimized =
-                compute_checkpoints_block_wand_intersection(make_scorers(), top_k);
-            let checkpoints_naive = compute_checkpoints_naive_intersection(make_scorers(), top_k);
+            let checkpoints_optimized = compute_checkpoints_block_wand_intersection(
+                make_scorers(),
+                top_k,
+                filter_docs.as_deref(),
+            );
+            let checkpoints_naive = compute_checkpoints_naive_intersection(
+                make_scorers(),
+                top_k,
+                filter_docs.as_deref(),
+            );
             assert_eq!(
                 checkpoints_optimized.len(),
                 checkpoints_naive.len(),
-                "Mismatch in checkpoint count for top_k={top_k}"
+                "Mismatch in checkpoint count for top_k={top_k}, filter={filter:?}"
             );
             for (&(left_doc, left_score), &(right_doc, right_score)) in
                 checkpoints_optimized.iter().zip(checkpoints_naive.iter())
             {
-                assert_eq!(left_doc, right_doc);
+                assert_eq!(left_doc, right_doc, "filter={filter:?}");
                 assert!(
                     nearly_equals(left_score, right_score),
-                    "Score mismatch for doc {left_doc}: {left_score} vs {right_score}"
+                    "Score mismatch for doc {left_doc}: {left_score} vs {right_score}, \
+                     filter={filter:?}"
                 );
             }
         }
@@ -588,9 +740,10 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(500))]
         #[test]
         fn test_block_wand_intersection_two_scorers(
-            (posting_lists, fieldnorms) in gen_term_scorers(2)
+            (posting_lists, fieldnorms) in gen_term_scorers(2),
+            test_filter in arb_test_filter(),
         ) {
-            test_block_wand_intersection_aux(&posting_lists[..], &fieldnorms[..]);
+            test_block_wand_intersection_aux(&posting_lists[..], &fieldnorms[..], &test_filter);
         }
     }
 
@@ -598,9 +751,10 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(500))]
         #[test]
         fn test_block_wand_intersection_three_scorers(
-            (posting_lists, fieldnorms) in gen_term_scorers(3)
+            (posting_lists, fieldnorms) in gen_term_scorers(3),
+            test_filter in arb_test_filter(),
         ) {
-            test_block_wand_intersection_aux(&posting_lists[..], &fieldnorms[..]);
+            test_block_wand_intersection_aux(&posting_lists[..], &fieldnorms[..], &test_filter);
         }
     }
 
@@ -793,7 +947,7 @@ mod tests {
         ];
         let posting_lists_owned: Vec<Vec<(DocId, u32)>> =
             posting_lists.iter().map(|pl| pl.to_vec()).collect();
-        test_block_wand_intersection_aux(&posting_lists_owned, fieldnorms);
+        test_block_wand_intersection_aux(&posting_lists_owned, fieldnorms, &TestFilter::None);
     }
 
     #[test]
@@ -815,7 +969,8 @@ mod tests {
             Bm25Weight::for_one_term(100, 200, average_fieldnorm, crate::Bm25Params::default()),
         );
 
-        let checkpoints = compute_checkpoints_block_wand_intersection(vec![scorer_a, scorer_b], 10);
+        let checkpoints =
+            compute_checkpoints_block_wand_intersection(vec![scorer_a, scorer_b], 10, None);
         assert!(checkpoints.is_empty());
     }
 
@@ -834,10 +989,13 @@ mod tests {
             )
         };
 
-        let checkpoints_opt =
-            compute_checkpoints_block_wand_intersection(vec![make_scorer(), make_scorer()], 5);
+        let checkpoints_opt = compute_checkpoints_block_wand_intersection(
+            vec![make_scorer(), make_scorer()],
+            5,
+            None,
+        );
         let checkpoints_naive =
-            compute_checkpoints_naive_intersection(vec![make_scorer(), make_scorer()], 5);
+            compute_checkpoints_naive_intersection(vec![make_scorer(), make_scorer()], 5, None);
         assert_eq!(checkpoints_opt.len(), checkpoints_naive.len());
     }
 
@@ -935,14 +1093,14 @@ mod tests {
                 .with_fieldnorm_source(SegmentId::default(), Field::from_field_id(0))
             })
             .collect();
-        let expected = compute_checkpoints_naive_intersection(scorers.clone(), 10);
+        let expected = compute_checkpoints_naive_intersection(scorers.clone(), 10, None);
         let mut shared = scorers;
         for secondary in &mut shared[1..] {
             secondary
                 .block_cursor()
                 .set_term_norm_source(Some(FileSlice::empty()), Some(0));
         }
-        let actual = compute_checkpoints_block_wand_intersection(shared, 10);
+        let actual = compute_checkpoints_block_wand_intersection(shared, 10, None);
         assert_eq!(actual, expected);
     }
 }

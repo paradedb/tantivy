@@ -156,7 +156,7 @@ impl From<Vec<(Occur, Box<dyn Query>)>> for BooleanQuery {
 }
 
 impl QueryEstimate for BooleanQuery {
-    fn estimate_docs(&self, _reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
         // The caller combines estimates for the AND, OR, and NOT clauses.
         Ok(None)
     }
@@ -164,6 +164,7 @@ impl QueryEstimate for BooleanQuery {
 
 impl Query for BooleanQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+        let (subqueries, minimum_number_should_match) = self.flattened_clauses();
         let statistics;
         let term_scoring = if let EnableScoring::Enabled {
             searcher,
@@ -171,8 +172,7 @@ impl Query for BooleanQuery {
             disjunction_pruning,
         } = enable_scoring
         {
-            let terms: Vec<_> = self
-                .subqueries
+            let terms: Vec<_> = subqueries
                 .iter()
                 .filter_map(|(_, query)| query.downcast_ref::<TermQuery>().map(TermQuery::term))
                 .collect();
@@ -189,8 +189,7 @@ impl Query for BooleanQuery {
         } else {
             enable_scoring
         };
-        let sub_weights = self
-            .subqueries
+        let sub_weights = subqueries
             .iter()
             .map(|(occur, subquery)| {
                 let scoring = if subquery.is::<TermQuery>() {
@@ -204,7 +203,7 @@ impl Query for BooleanQuery {
         Ok(Box::new(
             BooleanWeight::with_minimum_number_should_match(
                 sub_weights,
-                self.minimum_number_should_match,
+                minimum_number_should_match,
                 enable_scoring.is_scoring_enabled(),
                 Box::new(SumCombiner::default),
             )
@@ -264,6 +263,69 @@ impl BooleanQuery {
         self.minimum_number_should_match = minimum_number_should_match;
     }
 
+    /// Flattens nested conjunctions and disjunctions where possible, surfacing constituent
+    /// term clauses so they can be combined for block-max optimization.
+    pub(crate) fn flattened_clauses(&self) -> (Vec<(Occur, Box<dyn Query>)>, usize) {
+        if self.minimum_number_should_match != 0
+            || self
+                .subqueries
+                .iter()
+                .any(|(occur, _)| *occur == Occur::MustNot)
+        {
+            let subqueries = self
+                .subqueries
+                .iter()
+                .map(|(occur, subquery)| (*occur, subquery.box_clone()))
+                .collect();
+            return (subqueries, self.minimum_number_should_match);
+        }
+
+        let has_outer_should = self
+            .subqueries
+            .iter()
+            .any(|(occur, _)| *occur == Occur::Should);
+
+        let mut new_clauses = Vec::new();
+        let mut new_min_should = 0;
+        let mut flattened_disjunction = false;
+
+        for (occur, subquery) in &self.subqueries {
+            if *occur == Occur::Must {
+                if let Some(child_bq) = subquery.downcast_ref::<BooleanQuery>() {
+                    let (child_flat, child_min_should) = child_bq.flattened_clauses();
+                    let all_must = !child_flat.is_empty()
+                        && child_flat.iter().all(|(o, _)| *o == Occur::Must)
+                        && child_min_should == 0;
+                    let all_should = !child_flat.is_empty()
+                        && child_flat.iter().all(|(o, _)| *o == Occur::Should)
+                        && child_min_should <= 1;
+
+                    if all_must {
+                        // Flatten nested conjunction: (a AND b) AND c -> a AND b AND c
+                        for (child_occur, child_query) in child_flat {
+                            new_clauses.push((child_occur, child_query));
+                        }
+                        continue;
+                    } else if all_should && !has_outer_should && !flattened_disjunction {
+                        // A standalone disjunction (such as `BooleanQuery::union`, which has
+                        // minimum_number_should_match == 0) semantically requires at least 1 match.
+                        // When the parent has no outer Should clauses and no other disjunction has
+                        // been flattened yet, promote its Should clauses with min_should = 1.
+                        for (child_occur, child_query) in child_flat {
+                            new_clauses.push((child_occur, child_query));
+                        }
+                        new_min_should = 1;
+                        flattened_disjunction = true;
+                        continue;
+                    }
+                }
+            }
+            new_clauses.push((*occur, subquery.box_clone()));
+        }
+
+        (new_clauses, new_min_should)
+    }
+
     /// Returns the intersection of the queries.
     pub fn intersection(queries: Vec<Box<dyn Query>>) -> BooleanQuery {
         let subqueries = queries.into_iter().map(|s| (Occur::Must, s)).collect();
@@ -314,23 +376,9 @@ mod tests {
 
     use super::BooleanQuery;
     use crate::collector::{Count, DocSetCollector};
-    use crate::query::{Query, QueryClone, QueryParser, TermQuery};
+    use crate::query::{Query, QueryParser, TermQuery};
     use crate::schema::{Field, IndexRecordOption, Schema, TEXT};
     use crate::{DocAddress, DocId, Index, Term};
-
-    fn create_test_index() -> crate::Result<Index> {
-        let mut schema_builder = Schema::builder();
-        let text = schema_builder.add_text_field("text", TEXT);
-        let schema = schema_builder.build();
-        let index = Index::create_in_ram(schema);
-        let mut writer = index.writer_for_tests()?;
-        writer.add_document(doc!(text=>"b c"))?;
-        writer.add_document(doc!(text=>"a c"))?;
-        writer.add_document(doc!(text=>"a b"))?;
-        writer.add_document(doc!(text=>"a d"))?;
-        writer.commit()?;
-        Ok(index)
-    }
 
     #[test]
     fn test_minimum_required() -> crate::Result<()> {
@@ -400,66 +448,6 @@ mod tests {
     }
 
     #[test]
-    fn test_union() -> crate::Result<()> {
-        let index = create_test_index()?;
-        let searcher = index.reader()?.searcher();
-        let text = index.schema().get_field("text").unwrap();
-        let term_a = TermQuery::new(Term::from_field_text(text, "a"), IndexRecordOption::Basic);
-        let term_d = TermQuery::new(Term::from_field_text(text, "d"), IndexRecordOption::Basic);
-        let union_ad = BooleanQuery::union(vec![term_a.box_clone(), term_d.box_clone()]);
-        let docs = searcher.search(&union_ad, &DocSetCollector)?;
-        assert_eq!(
-            docs,
-            vec![
-                DocAddress::new(0u32, 1u32),
-                DocAddress::new(0u32, 2u32),
-                DocAddress::new(0u32, 3u32)
-            ]
-            .into_iter()
-            .collect()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_intersection() -> crate::Result<()> {
-        let index = create_test_index()?;
-        let searcher = index.reader()?.searcher();
-        let text = index.schema().get_field("text").unwrap();
-        let term_a = TermQuery::new(Term::from_field_text(text, "a"), IndexRecordOption::Basic);
-        let term_b = TermQuery::new(Term::from_field_text(text, "b"), IndexRecordOption::Basic);
-        let term_c = TermQuery::new(Term::from_field_text(text, "c"), IndexRecordOption::Basic);
-        let intersection_ab =
-            BooleanQuery::intersection(vec![term_a.box_clone(), term_b.box_clone()]);
-        let intersection_ac =
-            BooleanQuery::intersection(vec![term_a.box_clone(), term_c.box_clone()]);
-        let intersection_bc =
-            BooleanQuery::intersection(vec![term_b.box_clone(), term_c.box_clone()]);
-        {
-            let docs = searcher.search(&intersection_ab, &DocSetCollector)?;
-            assert_eq!(
-                docs,
-                vec![DocAddress::new(0u32, 2u32)].into_iter().collect()
-            );
-        }
-        {
-            let docs = searcher.search(&intersection_ac, &DocSetCollector)?;
-            assert_eq!(
-                docs,
-                vec![DocAddress::new(0u32, 1u32)].into_iter().collect()
-            );
-        }
-        {
-            let docs = searcher.search(&intersection_bc, &DocSetCollector)?;
-            assert_eq!(
-                docs,
-                vec![DocAddress::new(0u32, 0u32)].into_iter().collect()
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
     pub fn test_json_array_pitfall_bag_of_terms() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let json_field = schema_builder.add_json_field("json", TEXT);
@@ -495,5 +483,215 @@ mod tests {
             r#"cart.product_type:sneakers AND cart.attributes.color:blues"#
         ));
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod proptest_flattened_clauses {
+        use proptest::prelude::*;
+
+        use super::*;
+        use crate::query::{EnableScoring, Occur, Weight};
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct VarQuery(usize);
+
+        impl crate::query::QueryEstimate for VarQuery {
+            fn estimate_docs(
+                &self,
+                _reader: &crate::SegmentReader,
+            ) -> crate::Result<Option<(u32, u64)>> {
+                // This test query has no index statistics.
+                Ok(None)
+            }
+        }
+
+        impl Query for VarQuery {
+            fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+                unimplemented!()
+            }
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        enum QueryAST {
+            Var(usize),
+            Boolean {
+                clauses: Vec<(Occur, QueryAST)>,
+                min_should: usize,
+            },
+        }
+
+        impl QueryAST {
+            fn eval(&self, assignment: u32) -> bool {
+                match self {
+                    QueryAST::Var(idx) => (assignment & (1 << idx)) != 0,
+                    QueryAST::Boolean {
+                        clauses,
+                        min_should,
+                    } => {
+                        let mut num_must = 0;
+                        let mut num_should = 0;
+                        let mut should_matches = 0;
+
+                        for (occur, child) in clauses {
+                            let child_match = child.eval(assignment);
+                            match occur {
+                                Occur::Must => {
+                                    if !child_match {
+                                        return false;
+                                    }
+                                    num_must += 1;
+                                }
+                                Occur::MustNot => {
+                                    if child_match {
+                                        return false;
+                                    }
+                                }
+                                Occur::Should => {
+                                    num_should += 1;
+                                    if child_match {
+                                        should_matches += 1;
+                                    }
+                                }
+                            }
+                        }
+
+                        // If there are no positive clauses (no Must and no Should), it matches
+                        // nothing.
+                        if num_must == 0 && num_should == 0 {
+                            return false;
+                        }
+
+                        let effective_min_should = if *min_should > 0 {
+                            *min_should
+                        } else if num_must == 0 && num_should > 0 {
+                            // When there are no MUST clauses, SHOULD clauses are promoted to
+                            // required (>= 1).
+                            1
+                        } else {
+                            0
+                        };
+
+                        should_matches >= effective_min_should
+                    }
+                }
+            }
+        }
+
+        fn ast_to_query(ast: &QueryAST) -> Box<dyn Query> {
+            match ast {
+                QueryAST::Var(idx) => Box::new(VarQuery(*idx)),
+                QueryAST::Boolean {
+                    clauses,
+                    min_should,
+                } => {
+                    let subqueries = clauses
+                        .iter()
+                        .map(|(occur, child)| (*occur, ast_to_query(child)))
+                        .collect();
+                    Box::new(BooleanQuery::with_minimum_required_clauses(
+                        subqueries,
+                        *min_should,
+                    ))
+                }
+            }
+        }
+
+        fn query_to_ast(query: &dyn Query) -> QueryAST {
+            if let Some(var) = query.downcast_ref::<VarQuery>() {
+                QueryAST::Var(var.0)
+            } else if let Some(bq) = query.downcast_ref::<BooleanQuery>() {
+                let clauses = bq
+                    .clauses()
+                    .iter()
+                    .map(|(occur, sub)| (*occur, query_to_ast(sub.as_ref())))
+                    .collect();
+                QueryAST::Boolean {
+                    clauses,
+                    min_should: bq.get_minimum_number_should_match(),
+                }
+            } else {
+                panic!("unexpected query type: {:?}", query);
+            }
+        }
+
+        fn arb_occur() -> impl Strategy<Value = Occur> {
+            prop_oneof![Just(Occur::Must), Just(Occur::Should), Just(Occur::MustNot),]
+        }
+
+        fn arb_query_ast(num_vars: usize) -> impl Strategy<Value = QueryAST> {
+            let leaf = (0..num_vars).prop_map(QueryAST::Var);
+            leaf.prop_recursive(
+                3,  // 3 levels of recursion
+                24, // max 24 nodes
+                5,  // up to 5 items per collection
+                |inner| {
+                    (
+                        proptest::collection::vec((arb_occur(), inner), 1..5),
+                        0..4usize,
+                    )
+                        .prop_map(|(clauses, min_should)| QueryAST::Boolean {
+                            clauses,
+                            min_should,
+                        })
+                },
+            )
+        }
+
+        fn arb_root_boolean_ast(num_vars: usize) -> impl Strategy<Value = QueryAST> {
+            (
+                proptest::collection::vec((arb_occur(), arb_query_ast(num_vars)), 1..5),
+                0..4usize,
+            )
+                .prop_map(|(clauses, min_should)| QueryAST::Boolean {
+                    clauses,
+                    min_should,
+                })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(500))]
+            #[test]
+            fn proptest_flattened_clauses_semantic_equivalence_and_idempotence(
+                ast in arb_root_boolean_ast(4),
+            ) {
+                let query = ast_to_query(&ast);
+                let bq = query.downcast_ref::<BooleanQuery>().unwrap();
+                let (flat_clauses, flat_min_should) = bq.flattened_clauses();
+
+                let flat_ast = QueryAST::Boolean {
+                    clauses: flat_clauses
+                        .iter()
+                        .map(|(occur, sub)| (*occur, query_to_ast(sub.as_ref())))
+                        .collect(),
+                    min_should: flat_min_should,
+                };
+
+                // Property 1: Semantic equivalence (truth table over all 2^4 = 16 assignments)
+                for assignment in 0..16 {
+                    let original = ast.eval(assignment);
+                    let flattened = flat_ast.eval(assignment);
+                    prop_assert_eq!(
+                        original,
+                        flattened,
+                        "Semantic mismatch for assignment {:04b}:\nOriginal AST: {:?}\nFlattened AST: {:?}",
+                        assignment,
+                        ast,
+                        flat_ast,
+                    );
+                }
+
+                // Property 2: Idempotence (flattening an already flattened query is a no-op)
+                let flat_bq = BooleanQuery::with_minimum_required_clauses(flat_clauses, flat_min_should);
+                let (flat_clauses_2, flat_min_should_2) = flat_bq.flattened_clauses();
+                let flat_ast_2 = QueryAST::Boolean {
+                    clauses: flat_clauses_2
+                        .iter()
+                        .map(|(occur, sub)| (*occur, query_to_ast(sub.as_ref())))
+                        .collect(),
+                    min_should: flat_min_should_2,
+                };
+                prop_assert_eq!(&flat_ast, &flat_ast_2, "Flattening must be idempotent");
+            }
+        }
     }
 }

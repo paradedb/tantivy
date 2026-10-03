@@ -81,6 +81,14 @@ impl Segment {
         self.index.directory().open_read(&path)
     }
 
+    /// Checks the vector format header without opening other components or vector readers.
+    /// Segments without a vector file are accepted.
+    pub fn validate_vector_format(&self) -> crate::Result<()> {
+        crate::vector::header::check_vector_format(
+            self.open_read(SegmentComponent::Custom(crate::vector::VEC_EXT.to_string())),
+        )
+    }
+
     /// Open one of the component file for *regular* write.
     pub fn open_write(&self, component: SegmentComponent) -> Result<WritePtr, OpenWriteError> {
         let path = self.relative_path(component);

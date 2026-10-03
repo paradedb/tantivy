@@ -228,7 +228,14 @@ impl<T> QueryClone for T
 where T: 'static + Query + Clone
 {
     fn box_clone(&self) -> Box<dyn Query> {
-        Box::new(self.clone())
+        // If T is Box<dyn Query>, wrapping self.clone() in Box::new would double-box
+        // into Box<Box<dyn Query>>, breaking trait object downcasting and causing
+        // recursive calls. Delegate to the inner query directly instead.
+        if let Some(boxed) = (self as &dyn std::any::Any).downcast_ref::<Box<dyn Query>>() {
+            boxed.as_ref().box_clone()
+        } else {
+            Box::new(self.clone())
+        }
     }
 }
 
@@ -258,8 +265,8 @@ impl Query for Box<dyn Query> {
     }
 }
 
-impl QueryClone for Box<dyn Query> {
-    fn box_clone(&self) -> Box<dyn Query> {
+impl Clone for Box<dyn Query> {
+    fn clone(&self) -> Self {
         self.as_ref().box_clone()
     }
 }
@@ -268,7 +275,7 @@ impl_downcast!(Query);
 
 #[cfg(test)]
 mod tests {
-    use super::{DisjunctionPruning, EnableScoring};
+    use super::{DisjunctionPruning, EnableScoring, Query};
     use crate::schema::Schema;
     use crate::Index;
 
@@ -307,5 +314,20 @@ mod tests {
             assert_eq!(overridden.disjunction_pruning(), DisjunctionPruning::Auto);
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_box_dyn_query_clone_and_downcast() {
+        use crate::query::AllQuery;
+
+        let original: Box<dyn Query> = Box::new(AllQuery);
+        let cloned = original.clone();
+        assert!(cloned.downcast_ref::<AllQuery>().is_some());
+
+        let box_cloned = original.box_clone();
+        assert!(box_cloned.downcast_ref::<AllQuery>().is_some());
+
+        let boxed_box_cloned = box_cloned.box_clone();
+        assert!(boxed_box_cloned.downcast_ref::<AllQuery>().is_some());
     }
 }
