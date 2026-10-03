@@ -109,6 +109,11 @@ impl Scorer for AllScorer {
     fn score(&mut self) -> Score {
         1.0
     }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        Some(1.0)
+    }
 }
 
 #[cfg(test)]

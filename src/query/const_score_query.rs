@@ -10,34 +10,44 @@ use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
 ///
 /// The document set matched by the `ConstScoreQuery` is strictly the same as the underlying query.
 /// The configured score is used for each document.
-pub struct ConstScoreQuery {
-    query: Box<dyn Query>,
+pub struct ConstScoreQuery<Q = Box<dyn Query>> {
+    query: Q,
     score: Score,
 }
 
-impl ConstScoreQuery {
+impl<Q> ConstScoreQuery<Q> {
     /// Builds a const score query.
-    pub fn new(query: Box<dyn Query>, score: Score) -> ConstScoreQuery {
+    pub fn new(query: Q, score: Score) -> ConstScoreQuery<Q> {
         ConstScoreQuery { query, score }
+    }
+
+    /// Returns the underlying query.
+    pub fn query(&self) -> &Q {
+        &self.query
+    }
+
+    /// Returns the constant score.
+    pub fn score(&self) -> Score {
+        self.score
     }
 }
 
-impl Clone for ConstScoreQuery {
+impl<Q: Clone> Clone for ConstScoreQuery<Q> {
     fn clone(&self) -> Self {
         ConstScoreQuery {
-            query: self.query.box_clone(),
+            query: self.query.clone(),
             score: self.score,
         }
     }
 }
 
-impl fmt::Debug for ConstScoreQuery {
+impl<Q: fmt::Debug> fmt::Debug for ConstScoreQuery<Q> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Const(score={}, query={:?})", self.score, self.query)
     }
 }
 
-impl Query for ConstScoreQuery {
+impl<Q: Query + Clone> Query for ConstScoreQuery<Q> {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let inner_weight = self.query.weight(enable_scoring)?;
         Ok(if enable_scoring.is_scoring_enabled() {
@@ -151,6 +161,11 @@ impl<TDocSet: DocSet + 'static> Scorer for ConstScorer<TDocSet> {
     fn score(&mut self) -> Score {
         self.score
     }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        Some(self.score)
+    }
 }
 
 #[cfg(test)]
@@ -169,7 +184,7 @@ mod tests {
         index_writer.commit()?;
         let reader = index.reader()?;
         let searcher = reader.searcher();
-        let query = ConstScoreQuery::new(Box::new(AllQuery), 0.42);
+        let query = ConstScoreQuery::new(AllQuery, 0.42);
         let explanation = query.explain(&searcher, DocAddress::new(0, 0u32)).unwrap();
         assert_eq!(
             explanation.to_pretty_json(),

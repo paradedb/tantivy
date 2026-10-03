@@ -69,6 +69,11 @@ impl Scorer for EmptyScorer {
     fn score(&mut self) -> Score {
         0.0
     }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        Some(0.0)
+    }
 }
 
 impl PruningScorer for EmptyScorer {

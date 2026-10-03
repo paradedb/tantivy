@@ -274,6 +274,13 @@ where
         if target >= TERMINATED {
             return SeekDangerResult::SeekLowerBound(TERMINATED);
         }
+        if target <= self.doc {
+            if target == self.doc {
+                return SeekDangerResult::Found;
+            } else {
+                return SeekDangerResult::SeekLowerBound(self.doc);
+            }
+        }
         if self.is_in_horizon(target) {
             // Our value is within the buffered horizon and the docset may already have been
             // processed and removed, so we need to use seek, which uses the regular advance.
@@ -359,5 +366,10 @@ where
     #[inline]
     fn score(&mut self) -> Score {
         self.score
+    }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        TScoreCombiner::constant_score()
     }
 }

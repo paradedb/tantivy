@@ -38,6 +38,7 @@ use super::term_set_gallop::TermSetGallopDocSet;
 use super::term_set_strategy::{
     select_strategy, PlannerInputs, StrategyTag, TermSetStrategy, TermSetStrategyConfig,
 };
+use crate::docset::SeekDangerResult;
 use crate::index::SegmentReader;
 use crate::query::score_combiner::DoNothingCombiner;
 use crate::query::{
@@ -585,7 +586,7 @@ mod tests {
     use crate::collector::{Count, TopDocs};
     use crate::query::QueryParser;
     use crate::schema::{IntoIpv6Addr, Schema, FAST, INDEXED, STRING, TEXT};
-    use crate::{Index, IndexWriter, Term};
+    use crate::{DocSet, Index, IndexWriter, Term, TERMINATED};
 
     fn create_test_index() -> crate::Result<Index> {
         let mut schema_builder = Schema::builder();
@@ -787,6 +788,43 @@ mod tests {
         assert_eq!(doc_address.doc_id, 0);
         Ok(())
     }
+
+    #[test]
+    pub fn test_term_set_doc_set_seek_danger() -> crate::Result<()> {
+        let index = create_test_index()?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let segment_reader = searcher.segment_reader(0);
+        let column: columnar::Column<u64> = segment_reader.fast_fields().u64("u64_fast")?;
+
+        // In create_test_index, docs have u64_fast values: doc 0 -> 1, doc 1 -> 2, doc 2 -> 3
+        let mut values = rustc_hash::FxHashSet::default();
+        values.insert(2u64); // only matches doc 1
+        let mut docset = super::TermSetDocSet::new(column, values);
+
+        // doc 0 does not match: returns SeekLowerBound(1) without scanning
+        assert_eq!(
+            docset.seek_danger(0),
+            crate::docset::SeekDangerResult::SeekLowerBound(1)
+        );
+        // doc 1 matches: returns Found
+        assert_eq!(
+            docset.seek_danger(1),
+            crate::docset::SeekDangerResult::Found
+        );
+        assert_eq!(docset.doc(), 1);
+        // doc 2 does not match: returns SeekLowerBound(3)
+        assert_eq!(
+            docset.seek_danger(2),
+            crate::docset::SeekDangerResult::SeekLowerBound(3)
+        );
+        // past max_doc (3 docs in segment): returns SeekLowerBound(TERMINATED)
+        assert_eq!(
+            docset.seek_danger(10),
+            crate::docset::SeekDangerResult::SeekLowerBound(TERMINATED)
+        );
+        Ok(())
+    }
 }
 
 impl<T: Copy + Eq + std::hash::Hash + PartialOrd + std::fmt::Debug + Send + Sync + 'static> DocSet
@@ -829,6 +867,20 @@ impl<T: Copy + Eq + std::hash::Hash + PartialOrd + std::fmt::Debug + Send + Sync
         }
         self.doc_id = TERMINATED;
         TERMINATED
+    }
+
+    fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
+        if target >= self.max_doc {
+            self.doc_id = TERMINATED;
+            return SeekDangerResult::SeekLowerBound(TERMINATED);
+        }
+        for value in self.column.values_for_doc(target) {
+            if self.values.contains(&value) {
+                self.doc_id = target;
+                return SeekDangerResult::Found;
+            }
+        }
+        SeekDangerResult::SeekLowerBound(target + 1)
     }
 
     fn doc(&self) -> DocId {
