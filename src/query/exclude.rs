@@ -90,6 +90,30 @@ where
         self.advance()
     }
 
+    /// One lookup in the exclusion set settles the target. `seek` would walk the underlying
+    /// docset through every excluded doc, and a filter under block-WAND is probed once per
+    /// candidate.
+    fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
+        if target >= TERMINATED {
+            debug_assert!(target == TERMINATED);
+            return SeekDangerResult::SeekLowerBound(target);
+        }
+        match self.underlying_docset.seek_danger(target) {
+            SeekDangerResult::Found if self.exclusion_set.contains(target) => {
+                // The next doc we can accept is strictly after the excluded target.
+                SeekDangerResult::SeekLowerBound(target + 1)
+            }
+            // Excluding docs never adds any, so the underlying lower bound holds for us too.
+            result => result,
+        }
+    }
+
+    /// With no underlying docs in the range there is nothing to exclude. With some, the answer
+    /// needs the walk this type avoids, so it stays unknown.
+    fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
+        self.underlying_docset.is_empty_in_range(start, end)
+    }
+
     fn doc(&self) -> DocId {
         self.underlying_docset.doc()
     }
@@ -167,5 +191,130 @@ mod tests {
             },
             sample_skip,
         );
+    }
+
+    /// Counts the `advance` calls on a wrapped docset, to show when a walk happens.
+    struct CountingDocSet {
+        inner: VecDocSet,
+        advances: usize,
+    }
+
+    impl DocSet for CountingDocSet {
+        fn advance(&mut self) -> DocId {
+            self.advances += 1;
+            self.inner.advance()
+        }
+
+        fn seek(&mut self, target: DocId) -> DocId {
+            self.inner.seek(target)
+        }
+
+        fn doc(&self) -> DocId {
+            self.inner.doc()
+        }
+
+        fn size_hint(&self) -> u32 {
+            self.inner.size_hint()
+        }
+    }
+
+    fn exclude_with_counts(
+        include: Vec<DocId>,
+        exclude: Vec<DocId>,
+    ) -> Exclude<CountingDocSet, VecDocSet> {
+        Exclude::new(
+            CountingDocSet {
+                inner: VecDocSet::from(include),
+                advances: 0,
+            },
+            VecDocSet::from(exclude),
+        )
+    }
+
+    #[test]
+    fn seek_danger_found_leaves_valid_state() {
+        let mut exclude =
+            exclude_with_counts(vec![1, 2, 5, 8, 10, 15, 24], vec![1, 2, 3, 10, 16, 24]);
+        assert_eq!(exclude.seek_danger(5), SeekDangerResult::Found);
+        assert_eq!(exclude.doc(), 5);
+        assert_eq!(exclude.advance(), 8);
+    }
+
+    #[test]
+    fn seek_danger_on_an_excluded_doc_does_not_walk() {
+        // Docs 10 to 19 are all excluded, so a seek to 10 would step through every one of them.
+        let include: Vec<DocId> = (0..30).collect();
+        let exclude: Vec<DocId> = (10..20).collect();
+        let mut exclude = exclude_with_counts(include, exclude);
+        let advances_before = exclude.underlying_docset.advances;
+
+        assert_eq!(
+            exclude.seek_danger(10),
+            SeekDangerResult::SeekLowerBound(11)
+        );
+        assert_eq!(exclude.underlying_docset.advances, advances_before);
+
+        // Later probes recover. The first kept doc is found in a valid state.
+        assert_eq!(
+            exclude.seek_danger(19),
+            SeekDangerResult::SeekLowerBound(20)
+        );
+        assert_eq!(exclude.seek_danger(20), SeekDangerResult::Found);
+        assert_eq!(exclude.doc(), 20);
+        assert_eq!(exclude.advance(), 21);
+    }
+
+    #[test]
+    fn seek_danger_passes_the_underlying_lower_bound_through() {
+        let mut exclude =
+            exclude_with_counts(vec![1, 2, 5, 8, 10, 15, 24], vec![1, 2, 3, 10, 16, 24]);
+        // 6 is not in the underlying docset, whose own lower bound is its next doc, 8.
+        assert_eq!(exclude.seek_danger(6), SeekDangerResult::SeekLowerBound(8));
+        assert_eq!(
+            exclude.seek_danger(TERMINATED),
+            SeekDangerResult::SeekLowerBound(TERMINATED)
+        );
+    }
+
+    #[test]
+    fn seek_danger_matches_seek() {
+        let include = vec![1, 2, 5, 8, 10, 15, 24];
+        let exclude = vec![1, 2, 3, 10, 16, 24];
+        for target in 0..30 {
+            let mut fresh = Exclude::new(
+                VecDocSet::from(include.clone()),
+                VecDocSet::from(exclude.clone()),
+            );
+            // `seek` must not move backwards, and the leading excluded docs are already skipped.
+            if target < fresh.doc() {
+                continue;
+            }
+            let next = fresh.seek(target);
+            let mut probed = Exclude::new(
+                VecDocSet::from(include.clone()),
+                VecDocSet::from(exclude.clone()),
+            );
+            match probed.seek_danger(target) {
+                SeekDangerResult::Found => assert_eq!(next, target, "target {target}"),
+                SeekDangerResult::SeekLowerBound(bound) => {
+                    assert_ne!(next, target, "target {target}");
+                    assert!(
+                        bound > target && bound <= next,
+                        "target {target}: bound {bound}, next {next}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn is_empty_in_range_follows_the_underlying_docset() {
+        // A fresh docset per probe, since `seek_danger` targets must increase within one docset.
+        let fresh = || exclude_with_counts(vec![0, 5, 8], vec![5]);
+        assert!(fresh().is_empty_in_range(6, 7));
+        assert!(fresh().is_empty_in_range(9, 20));
+        // 5 is excluded, but telling needs the walk, so the range is not known to be empty.
+        assert!(!fresh().is_empty_in_range(5, 5));
+        assert!(!fresh().is_empty_in_range(0, 8));
     }
 }
