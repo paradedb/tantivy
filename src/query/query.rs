@@ -3,7 +3,7 @@ use std::fmt;
 use downcast_rs::impl_downcast;
 
 use super::bm25::Bm25StatisticsProvider;
-use super::Weight;
+use super::{QueryEstimate, Weight};
 use crate::core::searcher::Searcher;
 use crate::query::Explanation;
 use crate::schema::{Field, Schema};
@@ -173,7 +173,9 @@ impl<'a> EnableScoring<'a> {
 ///
 /// [`Scorer`]: crate::query::Scorer
 /// [`SegmentReader`]: crate::SegmentReader
-pub trait Query: QueryClone + Send + Sync + downcast_rs::Downcast + fmt::Debug {
+pub trait Query:
+    QueryEstimate + QueryClone + Send + Sync + downcast_rs::Downcast + fmt::Debug
+{
     /// Create the weight associated with a query.
     ///
     /// If scoring is not required, setting `scoring_enabled` to `false`
@@ -234,6 +236,13 @@ where T: 'static + Query + Clone
         } else {
             Box::new(self.clone())
         }
+    }
+}
+
+impl QueryEstimate for Box<dyn Query> {
+    /// Use the wrapped query's estimate.
+    fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        self.as_ref().estimate_docs(reader)
     }
 }
 

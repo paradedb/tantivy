@@ -1,4 +1,6 @@
-use crate::query::{BooleanWeight, DisjunctionMaxCombiner, EnableScoring, Occur, Query, Weight};
+use crate::query::{
+    BooleanWeight, DisjunctionMaxCombiner, EnableScoring, Occur, Query, QueryEstimate, Weight,
+};
 use crate::schema::Field;
 use crate::{Score, SegmentReader, Term};
 
@@ -90,6 +92,13 @@ impl Clone for DisjunctionMaxQuery {
     }
 }
 
+impl QueryEstimate for DisjunctionMaxQuery {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        // The caller estimates how many documents match any of the subqueries.
+        Ok(None)
+    }
+}
+
 impl Query for DisjunctionMaxQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let disjuncts = self
@@ -121,6 +130,11 @@ impl Query for DisjunctionMaxQuery {
 }
 
 impl DisjunctionMaxQuery {
+    /// Returns the queries combined by this disjunction.
+    pub fn disjuncts(&self) -> &[Box<dyn Query>] {
+        &self.disjuncts
+    }
+
     /// Creates a new `DisjunctionMaxQuery` with tie breaker.
     pub fn with_tie_breaker(
         disjuncts: Vec<Box<dyn Query>>,

@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 
 use super::MoreLikeThis;
-use crate::query::{EnableScoring, Query, Weight};
+use crate::query::{EnableScoring, Query, QueryEstimate, Weight};
 use crate::schema::{Field, OwnedValue};
 use crate::DocAddress;
 
@@ -40,6 +40,13 @@ impl MoreLikeThisQuery {
     /// Creates a new builder.
     pub fn builder() -> MoreLikeThisQueryBuilder {
         MoreLikeThisQueryBuilder::default()
+    }
+}
+
+impl QueryEstimate for MoreLikeThisQuery {
+    /// We don't have access to the reconstructed document here, so we use a 1% fallback.
+    fn estimate_docs(&self, reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        self.mlt.estimate_docs(reader)
     }
 }
 

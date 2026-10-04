@@ -16,7 +16,8 @@ use super::fast_field_range_doc_set::RangeDocSet;
 use super::sorted_internals::{binary_search_null_boundary, binary_search_sorted};
 use crate::index::SegmentReader;
 use crate::query::{
-    AllScorer, ConstScorer, EmptyScorer, EnableScoring, Explanation, Query, Scorer, Weight,
+    AllScorer, ConstScorer, EmptyScorer, EnableScoring, Explanation, Query, QueryEstimate, Scorer,
+    Weight,
 };
 use crate::schema::{Type, ValueBytes};
 use crate::{DocId, DocSet, Order, Score, TantivyError, Term};
@@ -32,6 +33,13 @@ impl FastFieldRangeQuery {
         Self {
             bounds: BoundsRange::new(lower_bound, upper_bound),
         }
+    }
+}
+
+impl QueryEstimate for FastFieldRangeQuery {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        // The caller uses column statistics to estimate how many values fall in this range.
+        Ok(None)
     }
 }
 
@@ -589,8 +597,7 @@ pub(crate) fn maps_to_u64_fastfield(typ: Type) -> bool {
     match typ {
         Type::U64 | Type::I64 | Type::F64 | Type::Bool | Type::Date => true,
         Type::IpAddr => false,
-        Type::Str | Type::Facet | Type::Bytes | Type::Json | Type::Custom => false,
-        Type::Str | Type::Facet | Type::Bytes | Type::Json | Type::Vector => false,
+        Type::Str | Type::Facet | Type::Bytes | Type::Json | Type::Custom | Type::Vector => false,
     }
 }
 

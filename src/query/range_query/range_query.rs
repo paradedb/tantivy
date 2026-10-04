@@ -8,7 +8,9 @@ use super::range_query_fastfield::FastFieldRangeWeight;
 use crate::index::SegmentReader;
 use crate::query::explanation::does_not_match;
 use crate::query::range_query::is_type_valid_for_fastfield_range_query;
-use crate::query::{BitSetDocSet, ConstScorer, EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{
+    BitSetDocSet, ConstScorer, EnableScoring, Explanation, Query, QueryEstimate, Scorer, Weight,
+};
 use crate::schema::{Field, IndexRecordOption, Term, Type};
 use crate::termdict::{TermDictionary, TermStreamer};
 use crate::{DocId, Score};
@@ -73,6 +75,11 @@ pub struct RangeQuery {
 }
 
 impl RangeQuery {
+    /// Returns the range endpoints.
+    pub fn bounds(&self) -> (&Bound<Term>, &Bound<Term>) {
+        (&self.bounds.lower_bound, &self.bounds.upper_bound)
+    }
+
     /// Creates a new `RangeQuery` from bounded start and end terms.
     ///
     /// If the value type is not correct, something may go terribly wrong when
@@ -97,6 +104,13 @@ impl RangeQuery {
         self.bounds
             .get_inner()
             .expect("At least one bound must be set")
+    }
+}
+
+impl QueryEstimate for RangeQuery {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        // The caller uses column statistics to estimate how many values fall in this range.
+        Ok(None)
     }
 }
 
@@ -143,6 +157,13 @@ impl InvertedIndexRangeQuery {
     /// different terms that get matched.
     pub fn limit(&mut self, limit: u64) {
         self.limit = Some(limit);
+    }
+}
+
+impl QueryEstimate for InvertedIndexRangeQuery {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        // The caller uses column statistics to estimate how many values fall in this range.
+        Ok(None)
     }
 }
 

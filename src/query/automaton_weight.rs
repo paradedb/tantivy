@@ -9,6 +9,7 @@ use super::BufferedUnionScorer;
 use crate::index::SegmentReader;
 use crate::postings::TermInfo;
 use crate::query::fuzzy_query::DfaWrapper;
+use crate::query::query_estimate::{bounded_prefix_stream, estimate_term_union, EstimationBudget};
 use crate::query::score_combiner::SumCombiner;
 use crate::query::{ConstScorer, Explanation, Scorer, Weight};
 use crate::schema::{Field, IndexRecordOption};
@@ -80,6 +81,96 @@ where
         }
         Ok(term_infos)
     }
+
+    /// Read the stored document count for each matching word and estimate how many documents
+    /// contain any of them, allowing for documents containing multiple matching words.
+    /// Work adds the counts because each word has its own document list to visit.
+    /// Return `None` if we cannot finish within the term and byte limits.
+    pub(crate) fn estimate_docs(
+        &self,
+        reader: &SegmentReader,
+        remaining_terms: &mut usize,
+        budget: &mut EstimationBudget,
+    ) -> crate::Result<Option<(u32, u64)>> {
+        let inverted_index = reader.inverted_index(self.field)?;
+        self.estimate_dictionary(
+            inverted_index.terms(),
+            reader.max_doc(),
+            remaining_terms,
+            budget,
+        )
+    }
+
+    fn estimate_dictionary(
+        &self,
+        dictionary: &TermDictionary,
+        max_doc: u32,
+        remaining_terms: &mut usize,
+        budget: &mut EstimationBudget,
+    ) -> crate::Result<Option<(u32, u64)>> {
+        let mut prefix = automaton_prefix(self.automaton.as_ref());
+        if let Some(json_path) = &self.json_path_bytes {
+            if json_path.starts_with(&prefix) {
+                prefix = json_path.to_vec();
+            } else if !prefix.starts_with(json_path) {
+                return Ok(Some((0, 0)));
+            }
+        }
+        let Some(mut stream) =
+            bounded_prefix_stream(dictionary, &prefix, budget.remaining_terms + 1, budget)?
+        else {
+            // The dictionary range exceeds the payload read budget.
+            return Ok(None);
+        };
+        let mut frequencies = Vec::new();
+        while stream.advance() {
+            if !budget.consume(stream.key()) {
+                // Unexamined candidates may match, even if every examined term was a nonmatch.
+                return Ok(None);
+            }
+            let mut state = self.automaton.start();
+            for &byte in stream.key() {
+                state = self.automaton.accept(&state, byte);
+                if !self.automaton.can_match(&state) {
+                    break;
+                }
+            }
+            if !self.automaton.is_match(&state) {
+                continue;
+            }
+            if *remaining_terms == 0 {
+                // The query's expansion limit was exceeded.
+                return Ok(None);
+            }
+            *remaining_terms -= 1;
+            frequencies.push(stream.value().doc_freq);
+        }
+        Ok(Some(estimate_term_union(&frequencies, max_doc)))
+    }
+}
+
+/// Extracts up to 64 mandatory prefix bytes using only the automaton, independent of index size.
+fn automaton_prefix(automaton: &impl Automaton) -> Vec<u8> {
+    let mut prefix = Vec::new();
+    let mut state = automaton.start();
+    while prefix.len() < 64 && !automaton.is_match(&state) {
+        let mut next = None;
+        for byte in 0..=u8::MAX {
+            let next_state = automaton.accept(&state, byte);
+            if automaton.can_match(&next_state) {
+                if next.is_some() {
+                    return prefix;
+                }
+                next = Some((byte, next_state));
+            }
+        }
+        let Some((byte, next_state)) = next else {
+            break;
+        };
+        prefix.push(byte);
+        state = next_state;
+    }
+    prefix
 }
 
 impl<A> Weight for AutomatonWeight<A>
@@ -138,13 +229,207 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use common::{HasLen, OwnedBytes};
     use tantivy_fst::Automaton;
 
     use super::AutomatonWeight;
+    use crate::directory::{FileHandle, FileSlice};
     use crate::docset::TERMINATED;
+    use crate::postings::TermInfo;
+    use crate::query::query_estimate::{EstimationBudget, MAX_ESTIMATED_TERMS};
     use crate::query::Weight;
     use crate::schema::{Schema, STRING};
+    use crate::termdict::{TermDictionary, TermDictionaryBuilder};
     use crate::{Index, IndexWriter};
+
+    #[derive(Debug)]
+    struct CountReads {
+        data: OwnedBytes,
+        bytes: Arc<AtomicUsize>,
+    }
+
+    impl HasLen for CountReads {
+        fn len(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    impl FileHandle for CountReads {
+        fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
+            self.bytes.fetch_add(range.len(), Ordering::Relaxed);
+            Ok(self.data.slice(range))
+        }
+    }
+
+    struct CountTransitions<A> {
+        inner: A,
+        transitions: Arc<AtomicUsize>,
+    }
+
+    impl<A: Automaton> Automaton for CountTransitions<A> {
+        type State = A::State;
+        fn start(&self) -> Self::State {
+            self.inner.start()
+        }
+        fn is_match(&self, state: &Self::State) -> bool {
+            self.inner.is_match(state)
+        }
+        fn can_match(&self, state: &Self::State) -> bool {
+            self.inner.can_match(state)
+        }
+        fn accept(&self, state: &Self::State, byte: u8) -> Self::State {
+            self.transitions.fetch_add(1, Ordering::Relaxed);
+            self.inner.accept(state, byte)
+        }
+    }
+
+    #[test]
+    fn metadata_estimates_bound_nonmatches_and_dictionary_reads() -> crate::Result<()> {
+        let field = Schema::builder().add_text_field("text", STRING);
+        let mut measurements = Vec::new();
+        for num_terms in [2_000, 20_000] {
+            let mut builder = TermDictionaryBuilder::create(Vec::new())?;
+            for id in 0..num_terms {
+                builder.insert(
+                    format!("token{id:08}"),
+                    &TermInfo {
+                        doc_freq: 1,
+                        postings_range: id * 100..(id + 1) * 100,
+                        positions_range: id * 200..(id + 1) * 200,
+                        pnorms_offset: None,
+                    },
+                )?;
+            }
+            let bytes = Arc::new(AtomicUsize::new(0));
+            let data = builder.finish()?;
+            let dictionary_len = data.len();
+            let dictionary = TermDictionary::open(FileSlice::new(Arc::new(CountReads {
+                data: OwnedBytes::new(data),
+                bytes: bytes.clone(),
+            })))?;
+            let mut results = Vec::new();
+            for pattern in [".*", ".*absent"] {
+                bytes.store(0, Ordering::Relaxed);
+                let transitions = Arc::new(AtomicUsize::new(0));
+                let weight = AutomatonWeight::new(
+                    field,
+                    CountTransitions {
+                        inner: tantivy_fst::Regex::new(pattern).unwrap(),
+                        transitions: transitions.clone(),
+                    },
+                );
+                let mut budget = EstimationBudget::default();
+                budget.remaining_terms = 32;
+                let mut expansions = MAX_ESTIMATED_TERMS;
+                assert_eq!(
+                    weight.estimate_dictionary(&dictionary, 1, &mut expansions, &mut budget)?,
+                    None
+                );
+                let work = transitions.load(Ordering::Relaxed);
+                assert!(work <= 32 * 13 + 256);
+                let read_bytes = bytes.load(Ordering::Relaxed);
+                if num_terms == 20_000 {
+                    assert!(read_bytes < dictionary_len / 2);
+                }
+                results.push((work, read_bytes));
+            }
+            measurements.push(results);
+        }
+        for (small, large) in measurements[0].iter().zip(&measurements[1]) {
+            assert_eq!(small.0, large.0);
+            assert!(large.1 <= small.1 + 16_384);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_estimates_bound_long_term_processing() -> crate::Result<()> {
+        let field = Schema::builder().add_text_field("text", STRING);
+        let mut builder = TermDictionaryBuilder::create(Vec::new())?;
+        for id in 0..32 {
+            builder.insert(
+                format!("{id:02}{}", "x".repeat(65_000)),
+                &TermInfo {
+                    doc_freq: 1,
+                    ..TermInfo::default()
+                },
+            )?;
+        }
+        let dictionary = TermDictionary::open(FileSlice::from(builder.finish()?))?;
+        let transitions = Arc::new(AtomicUsize::new(0));
+        let weight = AutomatonWeight::new(
+            field,
+            CountTransitions {
+                inner: tantivy_fst::Regex::new(".*").unwrap(),
+                transitions: transitions.clone(),
+            },
+        );
+        let mut expansions = MAX_ESTIMATED_TERMS;
+        assert_eq!(
+            weight.estimate_dictionary(
+                &dictionary,
+                1,
+                &mut expansions,
+                &mut EstimationBudget::default()
+            )?,
+            None
+        );
+        assert!(transitions.load(Ordering::Relaxed) <= 1 << 20);
+        Ok(())
+    }
+
+    #[cfg(feature = "quickwit")]
+    #[test]
+    fn metadata_estimates_reject_large_payload_before_reading() -> crate::Result<()> {
+        use rand::{RngCore, SeedableRng};
+
+        let field = Schema::builder().add_text_field("text", STRING);
+        let mut random = rand::rngs::StdRng::seed_from_u64(42);
+        let mut builder = TermDictionaryBuilder::create(Vec::new())?;
+        for id in 0..32u8 {
+            let mut key = vec![0u8; 65_000];
+            random.fill_bytes(&mut key);
+            key[0] = id;
+            builder.insert(
+                key,
+                &TermInfo {
+                    doc_freq: 1,
+                    ..TermInfo::default()
+                },
+            )?;
+        }
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let dictionary = TermDictionary::open(FileSlice::new(Arc::new(CountReads {
+            data: OwnedBytes::new(builder.finish()?),
+            bytes: bytes.clone(),
+        })))?;
+        bytes.store(0, Ordering::Relaxed);
+        let transitions = Arc::new(AtomicUsize::new(0));
+        let weight = AutomatonWeight::new(
+            field,
+            CountTransitions {
+                inner: tantivy_fst::Regex::new(".*").unwrap(),
+                transitions: transitions.clone(),
+            },
+        );
+        let mut expansions = MAX_ESTIMATED_TERMS;
+        assert_eq!(
+            weight.estimate_dictionary(
+                &dictionary,
+                1,
+                &mut expansions,
+                &mut EstimationBudget::default()
+            )?,
+            None
+        );
+        assert_eq!(transitions.load(Ordering::Relaxed), 0);
+        assert!(bytes.load(Ordering::Relaxed) < 1 << 20);
+        Ok(())
+    }
 
     fn create_index() -> crate::Result<Index> {
         let mut schema = Schema::builder();

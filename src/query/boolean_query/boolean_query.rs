@@ -1,6 +1,6 @@
 use super::boolean_weight::BooleanWeight;
 use crate::query::bm25::BatchedStatistics;
-use crate::query::{EnableScoring, Occur, Query, SumCombiner, TermQuery, Weight};
+use crate::query::{EnableScoring, Occur, Query, QueryEstimate, SumCombiner, TermQuery, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::SegmentReader;
 
@@ -152,6 +152,13 @@ impl Clone for BooleanQuery {
 impl From<Vec<(Occur, Box<dyn Query>)>> for BooleanQuery {
     fn from(subqueries: Vec<(Occur, Box<dyn Query>)>) -> BooleanQuery {
         BooleanQuery::new(subqueries)
+    }
+}
+
+impl QueryEstimate for BooleanQuery {
+    fn estimate_docs(&self, _reader: &crate::SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        // The caller combines estimates for the AND, OR, and NOT clauses.
+        Ok(None)
     }
 }
 
@@ -487,6 +494,16 @@ mod tests {
 
         #[derive(Clone, Debug, PartialEq, Eq)]
         struct VarQuery(usize);
+
+        impl crate::query::QueryEstimate for VarQuery {
+            fn estimate_docs(
+                &self,
+                _reader: &crate::SegmentReader,
+            ) -> crate::Result<Option<(u32, u64)>> {
+                // This test query has no index statistics.
+                Ok(None)
+            }
+        }
 
         impl Query for VarQuery {
             fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {

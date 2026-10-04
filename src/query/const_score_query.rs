@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{EnableScoring, Explanation, Query, QueryEstimate, Scorer, Weight};
 use crate::schema::Field;
 use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
 
@@ -44,6 +44,13 @@ impl<Q: Clone> Clone for ConstScoreQuery<Q> {
 impl<Q: fmt::Debug> fmt::Debug for ConstScoreQuery<Q> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Const(score={}, query={:?})", self.score, self.query)
+    }
+}
+
+impl<Q: QueryEstimate> QueryEstimate for ConstScoreQuery<Q> {
+    /// Use the inner query's estimate. Constant scores don't change which documents match.
+    fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        self.query.estimate_docs(reader)
     }
 }
 

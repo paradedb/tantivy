@@ -2,7 +2,7 @@ use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
 use crate::index::SegmentReader;
 use crate::query::boost_query::BoostScorer;
 use crate::query::explanation::does_not_match;
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{EnableScoring, Explanation, Query, QueryEstimate, Scorer, Weight};
 use crate::{DocId, Score};
 
 /// Query that matches all of the documents.
@@ -10,6 +10,13 @@ use crate::{DocId, Score};
 /// All of the documents get the score 1.0.
 #[derive(Clone, Debug)]
 pub struct AllQuery;
+
+impl QueryEstimate for AllQuery {
+    /// Use the segment's total document count for both matches and work, including deleted docs.
+    fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        Ok(Some((reader.max_doc(), u64::from(reader.max_doc()))))
+    }
+}
 
 impl Query for AllQuery {
     fn weight(&self, _: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {

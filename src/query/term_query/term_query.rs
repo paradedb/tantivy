@@ -5,8 +5,8 @@ use super::term_weight::TermWeight;
 use crate::index::Bm25Params;
 use crate::query::bm25::Bm25Weight;
 use crate::query::range_query::is_type_valid_for_fastfield_range_query;
-use crate::query::{EnableScoring, Explanation, Query, RangeQuery, Weight};
-use crate::schema::{Field, IndexRecordOption};
+use crate::query::{EnableScoring, Explanation, Query, QueryEstimate, RangeQuery, Weight};
+use crate::schema::{Field, IndexRecordOption, Type};
 use crate::{SegmentReader, Term};
 
 /// A Term query matches all of the documents
@@ -122,6 +122,30 @@ impl TermQuery {
             bm25_weight,
             scoring_enabled,
         ))
+    }
+}
+
+impl QueryEstimate for TermQuery {
+    /// Read the stored number of documents containing this text term. Use that count for both
+    /// matches and work, without visiting the documents. The count can include deleted documents.
+    fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        let value = self.term.value();
+        if value.typ() != Type::Str && value.json_path_type() != Some(Type::Str) {
+            // The caller uses column statistics to estimate matches for non-text values.
+            return Ok(None);
+        }
+        if !reader
+            .schema()
+            .get_field_entry(self.term.field())
+            .is_indexed()
+        {
+            // Unindexed fields have no term dictionary frequencies.
+            return Ok(None);
+        }
+        let count = reader
+            .inverted_index(self.term.field())?
+            .doc_freq(&self.term)?;
+        Ok(Some((count, u64::from(count))))
     }
 }
 

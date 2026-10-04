@@ -3,7 +3,7 @@ use std::fmt;
 use super::scorer::PruningScorer;
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
 use crate::fastfield::AliveBitSet;
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{EnableScoring, Explanation, Query, QueryEstimate, Scorer, Weight};
 use crate::schema::Field;
 use crate::{DocId, DocSet, Score, SegmentReader, Term};
 
@@ -46,6 +46,13 @@ impl<Q: Clone> Clone for BoostQuery<Q> {
 impl<Q: fmt::Debug> fmt::Debug for BoostQuery<Q> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Boost(query={:?}, boost={})", self.query, self.boost)
+    }
+}
+
+impl<Q: QueryEstimate> QueryEstimate for BoostQuery<Q> {
+    /// Use the inner query's estimate because boosting scores doesn't change which documents match.
+    fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        self.query.estimate_docs(reader)
     }
 }
 

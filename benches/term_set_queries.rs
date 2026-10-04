@@ -88,8 +88,8 @@ use rand::SeedableRng;
 use tantivy::collector::{Collector, Count, DocSetCollector, SegmentCollector};
 use tantivy::query::{
     BitSetDocSet, BooleanQuery, ConstScorer, EmptyScorer, EnableScoring, Explanation,
-    FastFieldTermSetQuery, Occur, Query, Scorer, StrategyTag, TermQuery, TermSetStrategyConfig,
-    Weight,
+    FastFieldTermSetQuery, Occur, Query, QueryEstimate, Scorer, StrategyTag, TermQuery,
+    TermSetStrategyConfig, Weight,
 };
 use tantivy::schema::{Field, IndexRecordOption, NumericOptions, SchemaBuilder};
 use tantivy::{
@@ -405,6 +405,16 @@ impl Clone for DirectBitsetQuery {
     }
 }
 
+impl QueryEstimate for DirectBitsetQuery {
+    fn estimate_docs(
+        &self,
+        _reader: &tantivy::SegmentReader,
+    ) -> tantivy::Result<Option<(u32, u64)>> {
+        // Benchmark-only query; planning estimates are not needed.
+        Ok(None)
+    }
+}
+
 impl Query for DirectBitsetQuery {
     fn weight(&self, _enable_scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
         Ok(Box::new(DirectBitsetWeight {
@@ -518,6 +528,17 @@ impl Clone for BatchedBitsetQuery {
             field: self.field,
             values: self.values.clone(),
         }
+    }
+}
+
+#[cfg(feature = "quickwit")]
+impl QueryEstimate for BatchedBitsetQuery {
+    fn estimate_docs(
+        &self,
+        _reader: &tantivy::SegmentReader,
+    ) -> tantivy::Result<Option<(u32, u64)>> {
+        // Benchmark-only query; planning estimates are not needed.
+        Ok(None)
     }
 }
 
