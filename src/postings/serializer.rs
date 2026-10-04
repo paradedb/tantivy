@@ -17,7 +17,9 @@ use crate::{DocId, Score};
 
 /// `InvertedIndexSerializer` is in charge of serializing
 /// postings on disk, in the
-/// * `.idx` (inverted index)
+/// * `.idx` (document IDs and skip data)
+/// * `.freqs` (term frequencies, when enabled)
+/// * `.pnorm` (posting norms, when enabled)
 /// * `.pos` (positions file)
 /// * `.term` (term dictionary)
 ///
@@ -52,6 +54,7 @@ pub struct InvertedIndexSerializer {
     positions_write: CompositeWrite<WritePtr>,
     schema: Schema,
     pnorms_write: Option<CompositeWrite<WritePtr>>,
+    freqs_write: Option<CompositeWrite<WritePtr>>,
 }
 
 impl InvertedIndexSerializer {
@@ -63,6 +66,18 @@ impl InvertedIndexSerializer {
             postings_write: CompositeWrite::wrap(segment.open_write(Postings)?),
             positions_write: CompositeWrite::wrap(segment.open_write(Positions)?),
             schema: segment.schema(),
+            freqs_write: if segment.schema().fields().any(|(_, entry)| {
+                entry
+                    .field_type()
+                    .index_record_option()
+                    .is_some_and(IndexRecordOption::has_freq)
+            }) {
+                Some(CompositeWrite::wrap(segment.open_write(
+                    crate::index::SegmentComponent::TermFrequencies,
+                )?))
+            } else {
+                None
+            },
             pnorms_write: if segment
                 .schema()
                 .fields()
@@ -106,6 +121,12 @@ impl InvertedIndexSerializer {
             fieldnorm_reader,
             bm25_params,
         )?;
+        if index_record_option.has_freq() {
+            let freqs_write = self.freqs_write.as_mut().unwrap().for_field(field);
+            serializer.freqs_start_offset = freqs_write.written_bytes();
+            serializer.freqs_write = Some(freqs_write);
+            serializer.postings_serializer.freqs = Some(Vec::new());
+        }
         if let Some(pnorms_write) = self.pnorms_write.as_mut() {
             if field_entry.has_pnorms() {
                 serializer.pnorms_writer = Some(super::term_norms::TermNormsWriter::new(
@@ -122,6 +143,9 @@ impl InvertedIndexSerializer {
         self.terms_write.close()?;
         self.postings_write.close()?;
         self.positions_write.close()?;
+        if let Some(freqs_write) = self.freqs_write {
+            freqs_write.close()?;
+        }
         if let Some(pnorms_write) = self.pnorms_write {
             pnorms_write.close()?;
         }
@@ -140,6 +164,8 @@ pub struct FieldSerializer<'a, W: Write = WritePtr> {
     postings_write: &'a mut CountingWriter<W>,
     postings_start_offset: u64,
     pnorms_writer: Option<super::term_norms::TermNormsWriter<'a, W>>,
+    freqs_write: Option<&'a mut CountingWriter<W>>,
+    freqs_start_offset: u64,
 }
 
 impl<'a, W: Write> FieldSerializer<'a, W> {
@@ -181,6 +207,8 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             postings_write,
             postings_start_offset,
             pnorms_writer: None,
+            freqs_write: None,
+            freqs_start_offset: 0,
         })
     }
 
@@ -201,6 +229,10 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             postings_range: addr..addr,
             positions_range: positions_start..positions_start,
             pnorms_offset: None,
+            freqs_range: self.freqs_write.as_ref().map(|writer| {
+                let start = (writer.written_bytes() - self.freqs_start_offset) as usize;
+                start..start
+            }),
         }
     }
 
@@ -265,6 +297,10 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
 
         self.postings_serializer
             .close_term(self.current_term_info.doc_freq, self.postings_write)?;
+        if let Some(freqs) = self.postings_serializer.freqs.as_ref() {
+            self.freqs_write.as_mut().unwrap().write_all(freqs)?;
+            self.current_term_info.freqs_range.as_mut().unwrap().end += freqs.len();
+        }
         if let Some(norms) = self.postings_serializer.pnorms.as_ref() {
             assert_eq!(norms.len(), self.current_term_info.doc_freq as usize);
             self.current_term_info.pnorms_offset =
@@ -360,6 +396,7 @@ pub struct PostingsSerializer {
     bm25_params: Bm25Params,
     term_has_freq: bool,
     pnorms: Option<Vec<u8>>,
+    freqs: Option<Vec<u8>>,
 }
 
 impl PostingsSerializer {
@@ -388,12 +425,16 @@ impl PostingsSerializer {
             bm25_params,
             term_has_freq: false,
             pnorms: None,
+            freqs: None,
         }
     }
 
     /// Starts the serialization for a new term.
     /// * term_doc_freq - the number of documents containing the term.
     pub fn new_term(&mut self, term_doc_freq: u32, record_term_freq: bool) {
+        if let Some(freqs) = self.freqs.as_mut() {
+            freqs.clear();
+        }
         if let Some(norms) = self.pnorms.as_mut() {
             norms.clear();
         }
@@ -440,7 +481,10 @@ impl PostingsSerializer {
             let (num_bits, block_encoded): (u8, &[u8]) = self
                 .block_encoder
                 .compress_block_unsorted(self.block.term_freqs(), true);
-            self.postings_write.extend(block_encoded);
+            self.freqs
+                .as_mut()
+                .unwrap_or(&mut self.postings_write)
+                .extend(block_encoded);
             self.skip_write.write_term_freq(num_bits);
             if self.mode.has_positions() {
                 // We serialize the sum of term freqs within the skip information
@@ -521,7 +565,10 @@ impl PostingsSerializer {
                 let block_encoded = self
                     .block_encoder
                     .compress_vint_unsorted(self.block.term_freqs());
-                self.postings_write.write_all(block_encoded)?;
+                self.freqs
+                    .as_mut()
+                    .unwrap_or(&mut self.postings_write)
+                    .write_all(block_encoded)?;
             }
             self.block.clear();
         }
@@ -540,5 +587,456 @@ impl PostingsSerializer {
     fn clear(&mut self) {
         self.block.clear();
         self.last_doc_id_encoded = 0;
+    }
+}
+
+#[cfg(all(test, feature = "unstable"))]
+mod benches {
+    use std::sync::Arc;
+
+    use common::HasLen;
+    use test::{black_box, Bencher};
+
+    use super::*;
+    use crate::directory::{FileHandle, FileSlice, OwnedBytes};
+    use crate::postings::BlockSegmentPostings;
+
+    #[derive(Debug)]
+    struct PagedFile(OwnedBytes);
+
+    impl HasLen for PagedFile {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    impl FileHandle for PagedFile {
+        fn read_bytes(&self, range: std::ops::Range<usize>) -> io::Result<OwnedBytes> {
+            if !range.is_empty() && range.start / 8192 != (range.end - 1) / 8192 {
+                Ok(OwnedBytes::new(self.0[range].to_vec()))
+            } else {
+                Ok(self.0.slice(range))
+            }
+        }
+
+        fn storage_block_len(&self) -> Option<usize> {
+            Some(8192)
+        }
+    }
+
+    fn scan(
+        b: &mut Bencher,
+        separated: bool,
+        paged: bool,
+        freq_every: usize,
+        count: u32,
+        per_doc: bool,
+    ) {
+        let mode = IndexRecordOption::WithFreqsAndPositions;
+        let mut serializer = PostingsSerializer::new(20.0, mode, None, Bm25Params::default());
+        serializer.freqs = separated.then(Vec::new);
+        serializer.new_term(count, true);
+        for doc in 0..count {
+            serializer.write_doc(doc * 3, doc % 17 + 1);
+        }
+        let mut bytes = Vec::new();
+        serializer.close_term(count, &mut bytes).unwrap();
+        let file = |bytes| {
+            if paged {
+                FileSlice::new(Arc::new(PagedFile(OwnedBytes::new(bytes))))
+            } else {
+                FileSlice::from(bytes)
+            }
+        };
+        let docs = file(bytes);
+        let freqs = serializer.freqs.map(file);
+        b.iter(|| {
+            let mut blocks = BlockSegmentPostings::open_file_slice(
+                count,
+                docs.clone(),
+                freqs.clone(),
+                mode,
+                mode,
+            )
+            .unwrap();
+            let mut total = 0u64;
+            let mut block = 0;
+            while !blocks.docs().is_empty() {
+                total += blocks.docs()[0] as u64;
+                if freq_every != 0 && block % freq_every == 0 {
+                    if per_doc {
+                        for idx in 0..blocks.docs().len() {
+                            total += u64::from(blocks.freq(black_box(idx)));
+                        }
+                    } else {
+                        total += blocks
+                            .freqs()
+                            .iter()
+                            .map(|&freq| u64::from(freq))
+                            .sum::<u64>();
+                    }
+                }
+                blocks.advance();
+                block += 1;
+            }
+            black_box(total)
+        });
+    }
+
+    macro_rules! scan_bench {
+        ($name:ident, $separated:expr, $paged:expr, $freq_every:expr) => {
+            #[bench]
+            fn $name(b: &mut Bencher) {
+                scan(b, $separated, $paged, $freq_every, 262_145, false);
+            }
+        };
+    }
+
+    scan_bench!(freq_scan_legacy_resident, false, false, 1);
+    scan_bench!(freq_scan_split_resident, true, false, 1);
+    scan_bench!(freq_scan_legacy_paged, false, true, 1);
+    scan_bench!(freq_scan_split_paged, true, true, 1);
+    scan_bench!(freq_scan_legacy_sparse, false, true, 16);
+    scan_bench!(freq_scan_split_sparse, true, true, 16);
+    scan_bench!(freq_scan_legacy_docs, false, true, 0);
+    scan_bench!(freq_scan_split_docs, true, true, 0);
+
+    #[bench]
+    fn freq_scan_legacy_short(b: &mut Bencher) {
+        scan(b, false, true, 1, 33, false);
+    }
+
+    #[bench]
+    fn freq_scan_split_short(b: &mut Bencher) {
+        scan(b, true, true, 1, 33, false);
+    }
+
+    #[bench]
+    fn freq_scan_legacy_per_doc(b: &mut Bencher) {
+        scan(b, false, true, 1, 262_145, true);
+    }
+
+    #[bench]
+    fn freq_scan_split_per_doc(b: &mut Bencher) {
+        scan(b, true, true, 1, 262_145, true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::directory::{CompositeFile, Directory, FileSlice, OwnedBytes, RamDirectory};
+    use crate::index::SegmentComponent;
+    use crate::indexer::NoMergePolicy;
+    use crate::postings::{BlockSegmentPostings, Postings};
+    use crate::schema::TEXT;
+    use crate::{DocSet, Index, Term, TERMINATED};
+
+    #[test]
+    fn separated_freqs_preserve_codecs_and_skip_data() -> crate::Result<()> {
+        for count in [1, 127, 128, 129, 255, 256, 257, 1024] {
+            for mode in [
+                IndexRecordOption::WithFreqs,
+                IndexRecordOption::WithFreqsAndPositions,
+            ] {
+                for max_freq in [1, 17, 257] {
+                    let norms = FieldNormReader::constant(count * 3, 400);
+                    let mut encoded = Vec::new();
+                    for separated in [false, true] {
+                        let mut serializer = PostingsSerializer::new(
+                            400.0,
+                            mode,
+                            Some(norms.clone()),
+                            Bm25Params::default(),
+                        );
+                        serializer.pnorms = Some(Vec::new());
+                        serializer.freqs = separated.then(Vec::new);
+                        serializer.new_term(count, true);
+                        for doc in 0..count {
+                            serializer.write_doc(doc * 3, doc % max_freq + 1);
+                        }
+                        let mut bytes = Vec::new();
+                        serializer.close_term(count, &mut bytes)?;
+                        assert_eq!(
+                            serializer.pnorms.unwrap(),
+                            vec![norms.fieldnorm_id(0); count as usize]
+                        );
+                        encoded.push((
+                            OwnedBytes::new(bytes),
+                            serializer.freqs.map(OwnedBytes::new),
+                        ));
+                    }
+                    let (legacy, _) = &encoded[0];
+                    let (docs, freqs) = &encoded[1];
+                    assert_eq!(legacy.len(), docs.len() + freqs.as_ref().unwrap().len());
+                    if count >= COMPRESSION_BLOCK_SIZE as u32 {
+                        let mut legacy = legacy.clone();
+                        let mut docs = docs.clone();
+                        let skip_len = VInt::deserialize_u64(&mut legacy)? as usize;
+                        assert_eq!(VInt::deserialize_u64(&mut docs)? as usize, skip_len);
+                        assert_eq!(&legacy[..skip_len], &docs[..skip_len]);
+                    }
+                    let mut old =
+                        BlockSegmentPostings::open(count, legacy.clone(), None, mode, mode)?;
+                    let mut split =
+                        BlockSegmentPostings::open(count, docs.clone(), freqs.clone(), mode, mode)?;
+                    loop {
+                        assert_eq!(old.docs(), split.docs());
+                        assert_eq!(old.freqs(), split.freqs());
+                        if old.docs().is_empty() {
+                            break;
+                        }
+                        old.advance();
+                        split.advance();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_segments_merge_into_separate_freqs() -> crate::Result<()> {
+        for pnorms in [false, true] {
+            let mut schema = Schema::builder();
+            let text = schema.add_text_field(
+                "text",
+                TEXT.set_indexing_options(
+                    TEXT.get_indexing_options()
+                        .unwrap()
+                        .clone()
+                        .set_pnorms(pnorms),
+                ),
+            );
+            let directory = RamDirectory::create();
+            let index = Index::create(directory.clone(), schema.build(), Default::default())?;
+            {
+                let mut writer = index.writer_for_tests()?;
+                for _ in 0..257 {
+                    writer.add_document(doc!(text => "x x y"))?;
+                }
+                writer.commit()?;
+            }
+            let segment = index.searchable_segments()?.pop().unwrap();
+            for component in [
+                SegmentComponent::Terms,
+                SegmentComponent::Postings,
+                SegmentComponent::Positions,
+            ] {
+                directory.delete(&segment.relative_path(component)).unwrap();
+            }
+            if pnorms {
+                directory
+                    .delete(&segment.relative_path(SegmentComponent::PostingNorms))
+                    .unwrap();
+            }
+            let norms = FieldNormReader::constant(257, 3);
+            let mut terms = CompositeWrite::wrap(segment.open_write(SegmentComponent::Terms)?);
+            let mut postings =
+                CompositeWrite::wrap(segment.open_write(SegmentComponent::Postings)?);
+            let mut positions =
+                CompositeWrite::wrap(segment.open_write(SegmentComponent::Positions)?);
+            let mut norm_file = if pnorms {
+                Some(CompositeWrite::wrap(
+                    segment.open_write(SegmentComponent::PostingNorms)?,
+                ))
+            } else {
+                None
+            };
+            let mut serializer = FieldSerializer::create(
+                IndexRecordOption::WithFreqsAndPositions,
+                257 * 3,
+                terms.for_field(text),
+                postings.for_field(text),
+                positions.for_field(text),
+                Some(norms),
+                Bm25Params::default(),
+            )?;
+            if let Some(norm_file) = &mut norm_file {
+                serializer.pnorms_writer = Some(super::super::term_norms::TermNormsWriter::new(
+                    norm_file.for_field(text),
+                ));
+                serializer.postings_serializer.pnorms = Some(Vec::new());
+            }
+            for (term, deltas) in [("x", &[0, 1][..]), ("y", &[2][..])] {
+                serializer.new_term(
+                    Term::from_field_text(text, term).serialized_value_bytes(),
+                    257,
+                    true,
+                )?;
+                for doc in 0..257 {
+                    serializer.write_doc(doc, deltas.len() as u32, deltas);
+                }
+                serializer.close_term()?;
+            }
+            serializer.close()?;
+            terms.close()?;
+            postings.close()?;
+            positions.close()?;
+            if let Some(norm_file) = norm_file {
+                norm_file.close()?;
+            }
+            directory
+                .delete(&segment.relative_path(SegmentComponent::TermFrequencies))
+                .unwrap();
+            let index = Index::open(directory.clone())?;
+            let mut writer = index.writer_for_tests()?;
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            for _ in 0..129 {
+                writer.add_document(doc!(text => "x x y"))?;
+            }
+            writer.commit()?;
+            let reader = index.reader()?;
+            for merged in [false, true] {
+                if merged {
+                    writer.merge(&index.searchable_segment_ids()?).wait()?;
+                    reader.reload()?;
+                }
+                let searcher = reader.searcher();
+                let mut total = 0;
+                for segment in searcher.segment_readers() {
+                    let inverted = segment.inverted_index(text)?;
+                    let term = Term::from_field_text(text, "x");
+                    let info = inverted.get_term_info(&term)?.unwrap();
+                    #[cfg(feature = "quickwit")]
+                    {
+                        futures::executor::block_on(inverted.warm_postings(&term, true))?;
+                        futures::executor::block_on(inverted.warm_postings_full(true))?;
+                    }
+                    if merged {
+                        assert!(info.freqs_range.is_some());
+                    }
+                    let mut postings = inverted
+                        .read_postings(&term, IndexRecordOption::WithFreqsAndPositions)?
+                        .unwrap();
+                    let mut positions = Vec::new();
+                    while postings.doc() != TERMINATED {
+                        assert_eq!(postings.term_freq(), 2);
+                        postings.positions(&mut positions);
+                        assert_eq!(positions, [0, 1]);
+                        total += 1;
+                        postings.advance();
+                    }
+                }
+                assert_eq!(total, 386);
+            }
+            writer.garbage_collect_files().wait()?;
+            assert!(index.validate_checksum()?.is_empty());
+            let segment = index.searchable_segments()?.pop().unwrap();
+            assert!(directory.exists(&segment.relative_path(SegmentComponent::TermFrequencies))?);
+            assert!(index.load_metas()?.persisted_custom_extensions.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn freqs_follow_field_options_and_are_not_opened_for_basic_reads() -> crate::Result<()> {
+        use crate::schema::{TextFieldIndexing, TextOptions};
+        for enabled in [false, true] {
+            let mut schema = Schema::builder();
+            let basic = schema.add_text_field(
+                "basic",
+                TEXT.set_indexing_options(
+                    TextFieldIndexing::default().set_index_option(IndexRecordOption::Basic),
+                ),
+            );
+            let freqs = enabled.then(|| {
+                schema.add_text_field(
+                    "freqs",
+                    TextOptions::default().set_indexing_options(
+                        TextFieldIndexing::default()
+                            .set_fieldnorms(false)
+                            .set_index_option(IndexRecordOption::WithFreqs),
+                    ),
+                )
+            });
+            let directory = RamDirectory::create();
+            let index = Index::create(directory.clone(), schema.build(), Default::default())?;
+            let mut writer = index.writer_for_tests()?;
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            for _ in 0..2 {
+                for _ in 0..129 {
+                    let mut doc = doc!(basic => "x x");
+                    if let Some(freqs) = freqs {
+                        doc.add_text(freqs, "x x");
+                    }
+                    writer.add_document(doc)?;
+                }
+                writer.commit()?;
+            }
+            writer.merge(&index.searchable_segment_ids()?).wait()?;
+            writer.garbage_collect_files().wait()?;
+            let index = Index::open(directory.clone())?;
+            let reader = index.reader()?;
+            let searcher = reader.searcher();
+            let segment = searcher.segment_reader(0);
+            assert_eq!(
+                segment.open_read(SegmentComponent::TermFrequencies).is_ok(),
+                enabled
+            );
+            if let Some(freqs) = freqs {
+                let component =
+                    CompositeFile::open(&segment.open_read(SegmentComponent::TermFrequencies)?)?;
+                assert!(component.open_read(basic).is_none());
+                assert!(component.open_read(freqs).is_some());
+                let mut inverted = crate::index::InvertedIndexReader::new(
+                    crate::termdict::TermDictionary::open(
+                        CompositeFile::open(&segment.open_read(SegmentComponent::Terms)?)?
+                            .open_read(freqs)
+                            .unwrap(),
+                    )?,
+                    CompositeFile::open(&segment.open_read(SegmentComponent::Postings)?)?
+                        .open_read(freqs)
+                        .unwrap(),
+                    common::file_slice::DeferredFileSlice::new(|| Ok(FileSlice::empty())),
+                    IndexRecordOption::WithFreqs,
+                )?;
+                let term = Term::from_field_text(freqs, "x");
+                let error_opener = || Err(io::Error::other("frequency component was opened"));
+                inverted.set_freqs_file(common::file_slice::DeferredFileSlice::new(error_opener));
+                let mut docs = inverted
+                    .read_postings(&term, IndexRecordOption::Basic)?
+                    .unwrap();
+                for doc in 0..258 {
+                    assert_eq!(docs.doc(), doc);
+                    docs.advance();
+                }
+                assert_eq!(docs.doc(), TERMINATED);
+                assert!(inverted
+                    .read_postings(&term, IndexRecordOption::WithFreqs)
+                    .is_err());
+                let inverted = segment.inverted_index(freqs)?;
+                let usage = searcher.space_usage()?;
+                assert!(
+                    usage.segments()[0]
+                        .component(SegmentComponent::TermFrequencies)
+                        .total()
+                        .get_bytes()
+                        > 0
+                );
+                directory
+                    .delete(
+                        &index
+                            .searchable_segments()?
+                            .pop()
+                            .unwrap()
+                            .relative_path(SegmentComponent::TermFrequencies),
+                    )
+                    .unwrap();
+                let postings = inverted
+                    .read_postings(&term, IndexRecordOption::WithFreqs)?
+                    .unwrap();
+                assert_eq!(postings.term_freq(), 2);
+                let reopened = Index::open(directory.clone())?.reader()?.searcher();
+                let inverted = reopened.segment_reader(0).inverted_index(freqs)?;
+                assert!(inverted
+                    .read_postings(&term, IndexRecordOption::Basic)?
+                    .is_some());
+                assert!(inverted
+                    .read_postings(&term, IndexRecordOption::WithFreqs)
+                    .is_err());
+            }
+        }
+        Ok(())
     }
 }
