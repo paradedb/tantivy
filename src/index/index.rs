@@ -3,7 +3,7 @@ use std::fmt;
 #[cfg(feature = "mmap")]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::available_parallelism;
 
 use super::segment::Segment;
@@ -17,7 +17,8 @@ use crate::directory::{Directory, ManagedDirectory, RamDirectory, INDEX_WRITER_L
 use crate::error::{DataCorruption, TantivyError};
 use crate::fastfield::FastFieldsPlugin;
 use crate::index::{
-    IndexMeta, InvertedIndexPlugin, SegmentComponent, SegmentId, SegmentMeta, SegmentMetaInventory,
+    CentroidIndexMeta, IndexMeta, InvertedIndexPlugin, SegmentComponent, SegmentId, SegmentMeta,
+    SegmentMetaInventory,
 };
 use crate::indexer::index_writer::{
     IndexWriterOptions, MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN,
@@ -30,7 +31,10 @@ use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::vector::{IvfClusterer, RouterKind, VectorPlugin};
+use crate::vector::ivf::centroid_index::{
+    open_centroid_index, write_centroid_index, CentroidIndex,
+};
+use crate::vector::{CentroidProducer, IvfClusterer, RouterKind, VectorPlugin};
 use crate::SegmentReader;
 
 fn load_metas(
@@ -126,8 +130,9 @@ fn save_new_metas(
     schema: Schema,
     index_settings: IndexSettings,
     plugins: &[Arc<dyn SegmentPlugin>],
+    centroid_index: Option<CentroidIndexMeta>,
     directory: &dyn Directory,
-) -> crate::Result<()> {
+) -> crate::Result<IndexMeta> {
     let persisted_custom_extensions: Vec<String> = plugins
         .iter()
         .flat_map(|plugin| plugin.extensions().iter().copied())
@@ -136,6 +141,7 @@ fn save_new_metas(
     let empty_metas = IndexMeta {
         index_settings,
         persisted_custom_extensions,
+        centroid_index,
         segments: Vec::new(),
         schema,
         opstamp: 0u64,
@@ -143,7 +149,7 @@ fn save_new_metas(
     };
     save_metas(&empty_metas, &empty_metas, directory)?;
     directory.sync_directory()?;
-    Ok(())
+    Ok(empty_metas)
 }
 
 fn configure_ivf_router(
@@ -197,6 +203,7 @@ pub struct IndexBuilder {
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
     ivf_clusterer: Option<Arc<dyn IvfClusterer>>,
     ivf_router: Option<RouterKind>,
+    centroid_producer: Option<Arc<dyn CentroidProducer>>,
 }
 impl Default for IndexBuilder {
     fn default() -> Self {
@@ -214,6 +221,7 @@ impl IndexBuilder {
             custom_plugins: Vec::new(),
             ivf_clusterer: None,
             ivf_router: None,
+            centroid_producer: None,
         }
     }
 
@@ -256,8 +264,17 @@ impl IndexBuilder {
         self
     }
 
-    /// Select the router used to build new IVF segments. Existing segments
-    /// open under the router persisted in their `.centroids` file.
+    /// Supplies immutable index-level centroids at creation. An existing index
+    /// keeps its stored centroids; the producer is not called when reopening.
+    /// Segment assignment and search still use the per-segment clusterer and router.
+    #[must_use]
+    pub fn centroid_producer(mut self, producer: Arc<dyn CentroidProducer>) -> Self {
+        self.centroid_producer = Some(producer);
+        self
+    }
+
+    /// Select the router used to build index-level centroids and new IVF segments. Existing
+    /// segments open under the router persisted in their `.centroids` file.
     pub fn ivf_router(mut self, router: RouterKind) -> crate::Result<Self> {
         configure_ivf_router(&mut self.ivf_router, router)?;
         Ok(self)
@@ -338,6 +355,11 @@ impl IndexBuilder {
         let mut index = Index::open(dir)?;
         index.set_tokenizers(self.tokenizer_manager.clone());
         if index.schema() == self.get_expect_schema()? {
+            if self.centroid_producer.is_some() && index.centroid_index_meta.is_none() {
+                return Err(TantivyError::InvalidArgument(
+                    "cannot install centroids into an existing index; recreate the index".into(),
+                ));
+            }
             index.custom_plugins.extend(self.custom_plugins);
             index.ivf_router = self.ivf_router;
             if let Some(clusterer) = self.ivf_clusterer {
@@ -352,12 +374,26 @@ impl IndexBuilder {
     }
 
     fn validate(&self) -> crate::Result<()> {
+        if self.centroid_producer.is_some() && self.ivf_router.is_none() {
+            return Err(TantivyError::InvalidArgument(
+                "a CentroidProducer requires an explicitly configured Router".into(),
+            ));
+        }
         if self.ivf_clusterer.is_some() && self.ivf_router.is_none() {
             return Err(TantivyError::InvalidArgument(
                 "an IvfClusterer requires an explicitly configured Router".to_string(),
             ));
         }
         if let Some(schema) = self.schema.as_ref() {
+            if self.centroid_producer.is_some()
+                && !schema
+                    .fields()
+                    .any(|(_, entry)| matches!(entry.field_type(), FieldType::Vector(_)))
+            {
+                return Err(TantivyError::InvalidArgument(
+                    "a CentroidProducer requires at least one vector field".into(),
+                ));
+            }
             for (_, entry) in schema.fields() {
                 if let FieldType::Str(options) = entry.field_type() {
                     if let Some(indexing) = options.get_indexing_options() {
@@ -421,19 +457,32 @@ impl IndexBuilder {
     /// Creates a new index given an implementation of the trait `Directory`.
     ///
     /// If a directory previously existed, it will be erased.
-    pub(crate) fn create<T: Into<Box<dyn Directory>>>(self, dir: T) -> crate::Result<Index> {
+    pub fn create<T: Into<Box<dyn Directory>>>(self, dir: T) -> crate::Result<Index> {
         self.validate()?;
         let dir = dir.into();
         let directory = ManagedDirectory::wrap(dir)?;
-        save_new_metas(
-            self.get_expect_schema()?,
-            self.index_settings.clone(),
+        let schema = self.get_expect_schema()?;
+        let centroid_index = self
+            .centroid_producer
+            .as_ref()
+            .map(|producer| {
+                write_centroid_index(
+                    &directory,
+                    &schema,
+                    producer.as_ref(),
+                    self.ivf_router.expect("validated router"),
+                )
+            })
+            .transpose()?;
+        let metas = save_new_metas(
+            schema,
+            self.index_settings,
             &self.custom_plugins,
+            centroid_index,
             &directory,
         )?;
-        let mut metas = IndexMeta::with_schema(self.get_expect_schema()?);
-        metas.index_settings = self.index_settings;
         let mut index = Index::open_from_metas(directory, &metas, SegmentMetaInventory::default());
+        index.cached_centroid_index()?;
         index.set_tokenizers(self.tokenizer_manager);
         index.set_fast_field_tokenizers(self.fast_field_tokenizer_manager);
         index.custom_plugins.extend(self.custom_plugins);
@@ -458,6 +507,8 @@ pub struct Index {
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
     ivf_clusterer: Option<Arc<dyn IvfClusterer>>,
     ivf_router: Option<RouterKind>,
+    centroid_index_meta: Option<CentroidIndexMeta>,
+    centroid_index_cache: Arc<OnceLock<crate::Result<Arc<CentroidIndex>>>>,
 }
 
 impl Index {
@@ -580,6 +631,8 @@ impl Index {
             custom_plugins: Vec::new(),
             ivf_clusterer: None,
             ivf_router: None,
+            centroid_index_meta: metas.centroid_index.clone(),
+            centroid_index_cache: Arc::new(OnceLock::new()),
         }
     }
 
@@ -717,7 +770,18 @@ impl Index {
         let inventory = SegmentMetaInventory::default();
         let metas = load_metas(&directory, &inventory)?;
         let index = Index::open_from_metas(directory, &metas, inventory);
+        index.cached_centroid_index()?;
         Ok(index)
+    }
+
+    pub(crate) fn cached_centroid_index(&self) -> crate::Result<Option<Arc<CentroidIndex>>> {
+        let Some(meta) = &self.centroid_index_meta else {
+            return Ok(None);
+        };
+        self.centroid_index_cache
+            .get_or_init(|| open_centroid_index(&self.directory, meta, &self.schema).map(Arc::new))
+            .clone()
+            .map(Some)
     }
 
     /// Reads the index meta file from the directory.
@@ -1005,8 +1069,11 @@ impl Index {
     pub fn validate_checksum(&self) -> crate::Result<HashSet<PathBuf>> {
         let managed_files = self.directory.list_managed_files()?;
         let metas = self.load_metas()?;
-        let active_segments_files =
+        let mut active_segments_files =
             list_segment_files(&metas.segments, &metas.persisted_custom_extensions);
+        if let Some(meta) = &metas.centroid_index {
+            active_segments_files.insert(meta.file_name.clone());
+        }
         let active_existing_files: HashSet<&PathBuf> =
             active_segments_files.intersection(&managed_files).collect();
 

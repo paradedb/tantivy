@@ -227,7 +227,7 @@ pub use self::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
 pub use crate::core::{json_utils, Executor, Searcher, SearcherGeneration};
 pub use crate::directory::Directory;
 pub use crate::index::{
-    Bm25Params, Index, IndexBuilder, IndexMeta, IndexSettings, IndexSortByField,
+    Bm25Params, CentroidIndexMeta, Index, IndexBuilder, IndexMeta, IndexSettings, IndexSortByField,
     InvertedIndexReader, Order, Segment, SegmentMeta, SegmentReader,
 };
 pub use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};

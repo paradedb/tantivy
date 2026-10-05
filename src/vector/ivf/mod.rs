@@ -2,6 +2,7 @@
 
 mod aps;
 pub(crate) mod bkt;
+pub(crate) mod centroid_index;
 pub(crate) mod graph;
 mod index;
 mod ivf;
@@ -16,6 +17,7 @@ pub(crate) const CENTROIDS_EXT: &str = "centroids";
 pub use aps::APS_MAX_DIM;
 pub(crate) use aps::{supports_metric as aps_supports_metric, CandidateRows, RecallEstimator};
 pub use bkt::{BKTree, BKTreeNode, BKTreeSearchIterator, NodeId as BktNodeId};
+pub use centroid_index::CentroidProducer;
 pub use graph::{
     Candidate, Graph, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,

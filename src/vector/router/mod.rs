@@ -43,11 +43,20 @@ impl RouterKind {
         options: &VectorOptions,
         centroids: &mut IvfCentroids,
     ) -> crate::Result<BuiltRouter> {
-        match self {
-            Self::Rng => Ok(Router::Rng(rng::build(options, centroids)?)),
-            Self::Stacked => Ok(Router::Stacked(stacked::build(options, centroids)?)),
-            Self::Exact => Ok(Router::Exact(exact::build(options, centroids))),
+        let IvfCentroids::F32(matrix) = &*centroids;
+        let shape = (matrix.rows, matrix.dims, matrix.values.len());
+        let router = match self {
+            Self::Rng => Router::Rng(rng::build(options, centroids)?),
+            Self::Stacked => Router::Stacked(stacked::build(options, centroids)?),
+            Self::Exact => Router::Exact(exact::build(options, centroids)),
+        };
+        let IvfCentroids::F32(matrix) = &*centroids;
+        if (matrix.rows, matrix.dims, matrix.values.len()) != shape {
+            return Err(crate::TantivyError::InvalidArgument(
+                "Router changed the centroid matrix shape while building".to_string(),
+            ));
         }
+        Ok(router)
     }
 
     /// Opens the router persisted in `slot`, whichever kind it was built
@@ -66,6 +75,14 @@ impl RouterKind {
             )
             .into());
         }
+        Self::open_tagged(slot, centroids, options)
+    }
+
+    pub(crate) fn open_tagged(
+        slot: FileSlice,
+        centroids: FileSlice,
+        options: &VectorOptions,
+    ) -> crate::Result<OpenedRouter> {
         if slot.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

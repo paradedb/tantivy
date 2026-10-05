@@ -128,23 +128,6 @@ fn write_empty_field_slots(
     Ok(())
 }
 
-fn build_router(
-    router: RouterKind,
-    opts: &VectorOptions,
-    centroids: &mut IvfCentroids,
-) -> crate::Result<BuiltRouter> {
-    let IvfCentroids::F32(matrix) = &*centroids;
-    let shape = (matrix.rows, matrix.dims, matrix.values.len());
-    let router = router.build(opts, centroids)?;
-    let IvfCentroids::F32(matrix) = &*centroids;
-    if (matrix.rows, matrix.dims, matrix.values.len()) != shape {
-        return Err(TantivyError::InvalidArgument(
-            "Router changed the centroid matrix shape while building".to_string(),
-        ));
-    }
-    Ok(router)
-}
-
 pub(crate) fn merge_ivf(
     ctx: &PluginMergeContext,
     clusterer: Option<&dyn IvfClusterer>,
@@ -227,7 +210,7 @@ pub(crate) fn merge_ivf(
                 rows: 0,
                 dims: opts.dim(),
             });
-            let router = build_router(router, opts, &mut centroids)?;
+            let router = router.build(opts, &mut centroids)?;
             id_maps.push((field, vec![DocLocation::ABSENT; num_target_docs as usize]));
             write_empty_field_slots(
                 &mut vec_write,
@@ -300,7 +283,7 @@ pub(crate) fn merge_ivf(
                         rows: 0,
                         dims: opts.dim(),
                     });
-                    let router = build_router(router, opts, &mut centroids)?;
+                    let router = router.build(opts, &mut centroids)?;
                     id_maps.push((field, vec![DocLocation::ABSENT; num_target_docs as usize]));
                     write_empty_field_slots(
                         &mut vec_write,
@@ -354,7 +337,7 @@ pub(crate) fn merge_ivf(
                 }
                 let num_centroids = centroid_matrix.rows;
 
-                let router = build_router(router, opts, &mut centroids)?;
+                let router = router.build(opts, &mut centroids)?;
                 let IvfCentroids::F32(centroid_matrix) = &centroids;
 
                 // Float working copy of the trained centroids — the

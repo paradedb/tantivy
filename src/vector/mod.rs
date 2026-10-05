@@ -71,8 +71,8 @@ pub use index_reader::{
     VectorStorageFormat,
 };
 pub use ivf::{
-    BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, Candidate, ClusterId, Graph,
-    InMemoryStackedIvf, InMemoryStore, IvfCentroids, IvfClusterer, IvfConfig, IvfIndex,
+    BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, Candidate, CentroidProducer, ClusterId,
+    Graph, InMemoryStackedIvf, InMemoryStore, IvfCentroids, IvfClusterer, IvfConfig, IvfIndex,
     IvfIndexBuilder, IvfLevelClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings,
     IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, LazyStackedIvf, LazyStore,
     MultiLevelIvf, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,

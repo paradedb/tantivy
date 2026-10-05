@@ -416,6 +416,13 @@ impl Order {
     }
 }
 
+/// Metadata for the immutable index-level centroid and router artifact.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CentroidIndexMeta {
+    /// Relative path of the artifact in the index directory.
+    pub file_name: PathBuf,
+}
+
 /// Meta information about the `Index`.
 ///
 /// This object is serialized on disk in the `meta.json` file.
@@ -438,6 +445,9 @@ pub struct IndexMeta {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub persisted_custom_extensions: Vec<String>,
+    /// Metadata for the immutable index-level centroid and router artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub centroid_index: Option<CentroidIndexMeta>,
     /// List of `SegmentMeta` information associated with each finalized segment of the index.
     pub segments: Vec<SegmentMeta>,
     /// Index `Schema`
@@ -460,6 +470,8 @@ struct UntrackedIndexMeta {
     pub index_settings: IndexSettings,
     #[serde(default)]
     pub persisted_custom_extensions: Vec<String>,
+    #[serde(default)]
+    pub centroid_index: Option<CentroidIndexMeta>,
     pub schema: Schema,
     pub opstamp: Opstamp,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -471,6 +483,7 @@ impl UntrackedIndexMeta {
         IndexMeta {
             index_settings: self.index_settings,
             persisted_custom_extensions: self.persisted_custom_extensions,
+            centroid_index: self.centroid_index,
             segments: self
                 .segments
                 .into_iter()
@@ -493,6 +506,7 @@ impl IndexMeta {
         IndexMeta {
             index_settings: IndexSettings::default(),
             persisted_custom_extensions: Vec::new(),
+            centroid_index: None,
             segments: vec![],
             schema,
             opstamp: 0u64,
@@ -548,6 +562,7 @@ mod tests {
                 ..Default::default()
             },
             persisted_custom_extensions: Vec::new(),
+            centroid_index: None,
             segments: Vec::new(),
             schema,
             opstamp: 0u64,
@@ -588,6 +603,7 @@ mod tests {
                 ..IndexSettings::default()
             },
             persisted_custom_extensions: Vec::new(),
+            centroid_index: None,
             segments: Vec::new(),
             schema,
             opstamp: 0u64,

@@ -1,5 +1,36 @@
 # Vector storage format
 
+## Index-level centroid artifact
+
+`IndexMeta.centroid_index`, when present, is a `CentroidIndexMeta` descriptor
+serialized as `{"file_name":"centroids-<uuid>"}` in `meta.json`. It identifies
+an immutable managed file. Its header is the four bytes `TVRI` followed by
+little-endian u32 version **1**, independently versioned from the segment formats below.
+The body is a `CompositeFile` with exactly these slots for every vector field:
+
+| Index | Contents |
+|---|---|
+| 0 | JSON metadata: `num_centroids` (u32) |
+| 1 | Row-major F32 centroid rows, in the router's final canonical order |
+| 2 | Router-kind byte followed by the existing tagged router payload |
+
+The consumer supplies a nonempty finite matrix for each vector field through
+`CentroidProducer`. Cosine rows are normalized before router construction;
+zero rows remain zero. The composite identifies fields by `Field`; field names
+and `VectorOptions` come from the index schema. Router construction may permute
+the centroids, and the rows in slot 1 use that order.
+Reopening uses the persisted router kind and requires no producer. The parsed
+routers are cached across clones of an `Index`; centroid rows remain lazy.
+
+The artifact is closed and synced before metadata publication. Its filename
+is preserved by commits and single-segment finalization, retained by garbage
+collection, and included in checksum validation. Existing metadata without
+`centroid_index` remains valid. A producer cannot install or replace centroids
+through `open_or_create` on an existing index.
+
+This artifact is currently independent of segment assignment and search. The
+per-segment V4/V3 formats and execution paths below are unchanged.
+
 ## File headers and entries
 
 `.vec` uses a little-endian u32 version header, with current and supported version

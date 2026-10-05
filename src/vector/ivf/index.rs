@@ -57,9 +57,9 @@ pub struct IvfIndex {
 }
 
 /// Centroid data and routing state, independent of segment postings.
-struct RouterIndex {
+pub(crate) struct RouterIndex {
     num_centroids: usize,
-    /// The centroid rows (slot `[0]` past the two count words).
+    /// Canonically ordered centroid rows, without metadata.
     centroids_slice: FileSlice,
     metric: Metric,
     router: OpenedRouter,
@@ -245,11 +245,11 @@ impl IvfIndex {
     }
 
     pub fn num_clusters(&self) -> usize {
-        self.routing.num_centroids
+        self.routing.num_clusters()
     }
 
     pub fn router(&self) -> RouterKind {
-        self.routing.router.kind()
+        self.routing.router()
     }
 
     /// Distinct docs with a vector.
@@ -325,11 +325,34 @@ impl IvfIndex {
 }
 
 impl RouterIndex {
-    fn centroid_bytes(&self) -> crate::Result<OwnedBytes> {
+    pub(crate) fn open(
+        options: &VectorOptions,
+        num_centroids: usize,
+        centroids_slice: FileSlice,
+        router_slice: FileSlice,
+    ) -> crate::Result<Self> {
+        let router = RouterKind::open_tagged(router_slice, centroids_slice.clone(), options)?;
+        Ok(Self {
+            num_centroids,
+            centroids_slice,
+            metric: options.metric(),
+            router,
+        })
+    }
+
+    pub(crate) fn num_clusters(&self) -> usize {
+        self.num_centroids
+    }
+
+    pub(crate) fn router(&self) -> RouterKind {
+        self.router.kind()
+    }
+
+    pub(crate) fn centroid_bytes(&self) -> crate::Result<OwnedBytes> {
         Ok(self.centroids_slice.read_bytes()?)
     }
 
-    fn rank_clusters<'router, 'workspace>(
+    pub(crate) fn rank_clusters<'router, 'workspace>(
         &'router self,
         workspace: &'workspace mut RouterWorkspace,
         query: &'router [f32],
@@ -342,7 +365,7 @@ impl RouterIndex {
         self.router.rank(workspace, query, self.metric, params)
     }
 
-    fn recall_estimator(
+    pub(crate) fn recall_estimator(
         &self,
         ranked: &RouterIter<'_, '_>,
         query: &[f32],
