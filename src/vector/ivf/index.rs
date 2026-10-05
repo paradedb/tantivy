@@ -44,20 +44,25 @@ use crate::vector::{BoundKind, BoundStore};
 /// at a time as routing visits them. Everything row-scale (the rows and
 /// id-map) lives on [`VectorIndexReader`](crate::vector::VectorIndexReader).
 pub struct IvfIndex {
-    num_centroids: usize,
+    routing: RouterIndex,
     /// Distinct documents with a vector in this field.
     num_docs: usize,
-    /// The centroid rows (slot `[0]` past the two count words).
-    centroids_slice: FileSlice,
     /// Slot `[1]`: the `u64[N+1]` prefix sum, pinned.
     cluster_offsets: OwnedBytes,
-    metric: Metric,
-    router: OpenedRouter,
     /// Slot `[3]`, pinned: the segment-level bound kind.
     bound_kind: BoundKind,
     /// Slot `[3]`, pinned: the per-cluster bound payload,
     /// `num_centroids * bound_kind.stride(dim)` f32s in cluster order.
     bounds: Vec<f32>,
+}
+
+/// Centroid data and routing state, independent of segment postings.
+struct RouterIndex {
+    num_centroids: usize,
+    /// The centroid rows (slot `[0]` past the two count words).
+    centroids_slice: FileSlice,
+    metric: Metric,
+    router: OpenedRouter,
 }
 
 impl IvfIndex {
@@ -216,12 +221,14 @@ impl IvfIndex {
         }
 
         let index = IvfIndex {
-            num_centroids,
+            routing: RouterIndex {
+                num_centroids,
+                centroids_slice,
+                metric: options.metric(),
+                router,
+            },
             num_docs,
-            centroids_slice,
             cluster_offsets,
-            metric: options.metric(),
-            router,
             bound_kind,
             bounds,
         };
@@ -238,11 +245,11 @@ impl IvfIndex {
     }
 
     pub fn num_clusters(&self) -> usize {
-        self.num_centroids
+        self.routing.num_centroids
     }
 
     pub fn router(&self) -> RouterKind {
-        self.router.kind()
+        self.routing.router.kind()
     }
 
     /// Distinct docs with a vector.
@@ -252,7 +259,7 @@ impl IvfIndex {
 
     /// Total posting rows across all clusters.
     pub fn num_rows(&self) -> usize {
-        self.cluster_offset(self.num_centroids) as usize
+        self.cluster_offset(self.num_clusters()) as usize
     }
 
     fn cluster_offset(&self, cluster: usize) -> u64 {
@@ -264,7 +271,7 @@ impl IvfIndex {
     /// The contiguous row range of `cluster` within the `.vec` rows.
     #[inline]
     pub fn cluster_range(&self, cluster: usize) -> Range<usize> {
-        debug_assert!(cluster < self.num_centroids, "cluster out of bounds");
+        debug_assert!(cluster < self.num_clusters(), "cluster out of bounds");
         self.cluster_offset(cluster) as usize..self.cluster_offset(cluster + 1) as usize
     }
 
@@ -281,7 +288,7 @@ impl IvfIndex {
     /// Per-cluster posting-list sizes, in cluster order — memberships, like
     /// [`Self::num_rows`].
     pub(crate) fn cluster_sizes(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.num_centroids).map(|cluster| {
+        (0..self.num_clusters()).map(|cluster| {
             (self.cluster_offset(cluster + 1) - self.cluster_offset(cluster)) as usize
         })
     }
@@ -289,13 +296,40 @@ impl IvfIndex {
     /// The centroid rows, materialized in one read — for introspection and
     /// tests only. Routing fetches per-node ranges through the lazy arena.
     pub fn centroid_bytes(&self) -> crate::Result<OwnedBytes> {
-        Ok(self.centroids_slice.read_bytes()?)
+        self.routing.centroid_bytes()
     }
 
     /// Rank this segment's clusters for `query`, nearest first. `params`
     /// steers the stacked router only (how many clusters the caller will
     /// probe and its recall target); other routers ignore it.
     pub(crate) fn rank_clusters<'router, 'workspace>(
+        &'router self,
+        workspace: &'workspace mut RouterWorkspace,
+        query: &'router [f32],
+        params: RoutingParams,
+    ) -> RouterIter<'router, 'workspace> {
+        self.routing.rank_clusters(workspace, query, params)
+    }
+
+    /// The APS estimator for scanning `ranked` (from
+    /// [`Self::rank_clusters`], not yet pulled) toward `recall`. `None`
+    /// unless the stacked router ranked it and APS is on.
+    pub(crate) fn recall_estimator(
+        &self,
+        ranked: &RouterIter<'_, '_>,
+        query: &[f32],
+        recall: f32,
+    ) -> Option<RecallEstimator<'_>> {
+        self.routing.recall_estimator(ranked, query, recall)
+    }
+}
+
+impl RouterIndex {
+    fn centroid_bytes(&self) -> crate::Result<OwnedBytes> {
+        Ok(self.centroids_slice.read_bytes()?)
+    }
+
+    fn rank_clusters<'router, 'workspace>(
         &'router self,
         workspace: &'workspace mut RouterWorkspace,
         query: &'router [f32],
@@ -308,10 +342,7 @@ impl IvfIndex {
         self.router.rank(workspace, query, self.metric, params)
     }
 
-    /// The APS estimator for scanning `ranked` (from
-    /// [`Self::rank_clusters`], not yet pulled) toward `recall`. `None`
-    /// unless the stacked router ranked it and APS is on.
-    pub(crate) fn recall_estimator(
+    fn recall_estimator(
         &self,
         ranked: &RouterIter<'_, '_>,
         query: &[f32],
