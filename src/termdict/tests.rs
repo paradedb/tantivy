@@ -14,6 +14,7 @@ fn make_term_info(term_ord: u64) -> TermInfo {
         postings_range: offset(term_ord)..offset(term_ord + 1),
         positions_range: offset(term_ord) * 2..offset(term_ord + 1) * 2,
         pnorms_offset: None,
+        bitmap_offset: None,
     }
 }
 
@@ -446,6 +447,7 @@ fn v1_dictionary_remains_readable_and_byte_identical() -> crate::Result<()> {
             postings_range: i * 13..(i + 1) * 13,
             positions_range: i * 3..(i + 1) * 3,
             pnorms_offset: None,
+            bitmap_offset: None,
         };
         assert_eq!(dictionary.get(&key)?, Some(info.clone()));
         writer.insert(key, &info)?;
@@ -509,10 +511,10 @@ fn dictionary_rejects_unknown_versions() -> crate::Result<()> {
     writer.insert("term", &info)?;
     let mut bytes = writer.finish()?;
     let version_offset = bytes.len() - 8;
-    bytes[version_offset..version_offset + 4].copy_from_slice(&3u32.to_le_bytes());
+    bytes[version_offset..version_offset + 4].copy_from_slice(&4u32.to_le_bytes());
     let error = TermDictionary::open(FileSlice::from(bytes)).err().unwrap();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    assert!(error.to_string().contains("version 3"));
+    assert!(error.to_string().contains("version 4"));
     Ok(())
 }
 
@@ -525,4 +527,34 @@ fn dictionary_rejects_truncated_footer() {
         let error = TermDictionary::open(FileSlice::from(bytes)).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
+}
+
+#[test]
+fn optional_bitmap_offsets_across_dictionary_blocks() -> crate::Result<()> {
+    use crate::directory::FileSlice;
+    use crate::postings::TermInfo;
+    use crate::termdict::{TermDictionary, TermDictionaryBuilder};
+    for norms in [false, true] {
+        let mut builder = TermDictionaryBuilder::create(Vec::new())?;
+        let mut expected = Vec::new();
+        for i in 0..1100usize {
+            let info = TermInfo {
+                doc_freq: 2,
+                postings_range: i * 17..(i + 1) * 17,
+                positions_range: i * 9..(i + 1) * 9,
+                pnorms_offset: norms.then_some(i as u64 * 2),
+                bitmap_offset: (i > 300 && i % 3 == 0).then_some((1u64 << 40) + i as u64 * 128),
+            };
+            builder.insert(format!("{i:06}"), &info)?;
+            expected.push(info);
+        }
+        let dictionary = TermDictionary::open(FileSlice::from(builder.finish()?))?;
+        for (i, info) in expected.iter().enumerate().rev() {
+            assert_eq!(
+                dictionary.get(format!("{i:06}").as_bytes())?.as_ref(),
+                Some(info)
+            );
+        }
+    }
+    Ok(())
 }

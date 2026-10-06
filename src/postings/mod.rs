@@ -19,6 +19,7 @@ mod segment_postings;
 /// Serializer module for the inverted index
 pub mod serializer;
 pub(crate) mod skip;
+pub(crate) mod term_bitmaps;
 mod term_info;
 pub(crate) mod term_norms;
 

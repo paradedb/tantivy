@@ -32,7 +32,7 @@ use crate::postings::{
 use crate::schema::document::{Document, Value};
 use crate::schema::{Field, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
 use crate::space_usage::{
-    ComponentSpaceUsage, FIELDNORMS, POSITIONS, POSTINGS, POSTING_NORMS, TERMDICT,
+    ComponentSpaceUsage, FIELDNORMS, POSITIONS, POSTINGS, POSTING_BITMAPS, POSTING_NORMS, TERMDICT,
 };
 use crate::termdict::{TermMerger, TermOrdinal};
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
@@ -63,7 +63,7 @@ fn compute_initial_table_size(per_thread_memory_budget: usize) -> crate::Result<
 
 impl SegmentPlugin for InvertedIndexPlugin {
     fn extensions(&self) -> &[&str] {
-        &["fieldnorm", "term", "idx", "pos", "pnorm"]
+        &["fieldnorm", "term", "idx", "pos", "pnorm", "bmap"]
     }
 
     fn create_writer(&self, _ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
@@ -76,6 +76,7 @@ impl SegmentPlugin for InvertedIndexPlugin {
         debug!("write-postings");
         let target_segment = ctx.target_segment;
         let mut serializer = InvertedIndexSerializer::open(target_segment)?;
+        serializer.set_max_doc(ctx.doc_id_mapping.new_doc_id_to_old_doc_addr.len() as DocId);
         let fieldnorm_readers =
             FieldNormReaders::open(target_segment.open_read(SegmentComponent::FieldNorms)?)?;
         write_postings_merge(
@@ -127,6 +128,12 @@ impl SegmentPlugin for InvertedIndexPlugin {
         if let Ok(file) = segment_reader.open_read(SegmentComponent::PostingNorms) {
             usage.insert(
                 POSTING_NORMS.to_string(),
+                ComponentSpaceUsage::PerField(CompositeFile::open(&file)?.space_usage(schema)),
+            );
+        }
+        if let Ok(file) = segment_reader.open_read(SegmentComponent::PostingBitmaps) {
+            usage.insert(
+                POSTING_BITMAPS.to_string(),
                 ComponentSpaceUsage::PerField(CompositeFile::open(&file)?.space_usage(schema)),
             );
         }
@@ -418,6 +425,8 @@ impl PluginWriter for InvertedIndexPluginWriter {
             FieldNormsSerializer::from_write(segment.open_write(SegmentComponent::FieldNorms)?)?,
             None,
         )?;
+        self.postings_serializer
+            .set_max_doc(doc_id_map.map_or(self.max_doc, |map| map.len() as DocId));
         serialize_postings(
             self.ctx,
             self.schema,

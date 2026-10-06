@@ -52,6 +52,10 @@ pub struct InvertedIndexSerializer {
     positions_write: CompositeWrite<WritePtr>,
     schema: Schema,
     pnorms_write: Option<CompositeWrite<WritePtr>>,
+    bitmaps_write: Option<CompositeWrite<WritePtr>>,
+    bitmap_config: crate::index::BitmapPostingsConfig,
+    bitmap_bytes_remaining: u64,
+    max_doc: DocId,
 }
 
 impl InvertedIndexSerializer {
@@ -63,6 +67,24 @@ impl InvertedIndexSerializer {
             postings_write: CompositeWrite::wrap(segment.open_write(Postings)?),
             positions_write: CompositeWrite::wrap(segment.open_write(Positions)?),
             schema: segment.schema(),
+            bitmaps_write: if segment
+                .schema()
+                .fields()
+                .any(|(_, entry)| entry.has_bitmap_postings())
+            {
+                Some(CompositeWrite::wrap(segment.open_write(
+                    crate::index::SegmentComponent::PostingBitmaps,
+                )?))
+            } else {
+                None
+            },
+            bitmap_config: segment.index().settings().bitmap_postings.clone(),
+            bitmap_bytes_remaining: segment
+                .index()
+                .settings()
+                .bitmap_postings
+                .max_bytes_per_segment,
+            max_doc: segment.meta().max_doc(),
             pnorms_write: if segment
                 .schema()
                 .fields()
@@ -76,6 +98,10 @@ impl InvertedIndexSerializer {
             },
         };
         Ok(inv_index_serializer)
+    }
+
+    pub(crate) fn set_max_doc(&mut self, max_doc: DocId) {
+        self.max_doc = max_doc;
     }
 
     /// Must be called before starting pushing terms of
@@ -114,11 +140,24 @@ impl InvertedIndexSerializer {
                 serializer.postings_serializer.pnorms = Some(Vec::new());
             }
         }
+        if let Some(bitmaps_write) = self.bitmaps_write.as_mut() {
+            if field_entry.has_bitmap_postings() {
+                serializer.bitmaps_writer = Some(super::term_bitmaps::TermBitmapWriter::new(
+                    bitmaps_write.for_field(field),
+                    self.max_doc,
+                    self.bitmap_config.clone(),
+                    &mut self.bitmap_bytes_remaining,
+                ));
+            }
+        }
         Ok(serializer)
     }
 
     /// Closes the serializer.
     pub fn close(self) -> io::Result<()> {
+        if let Some(bitmaps_write) = self.bitmaps_write {
+            bitmaps_write.close()?;
+        }
         self.terms_write.close()?;
         self.postings_write.close()?;
         self.positions_write.close()?;
@@ -140,6 +179,7 @@ pub struct FieldSerializer<'a, W: Write = WritePtr> {
     postings_write: &'a mut CountingWriter<W>,
     postings_start_offset: u64,
     pnorms_writer: Option<super::term_norms::TermNormsWriter<'a, W>>,
+    bitmaps_writer: Option<super::term_bitmaps::TermBitmapWriter<'a, W>>,
 }
 
 impl<'a, W: Write> FieldSerializer<'a, W> {
@@ -181,6 +221,7 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             postings_write,
             postings_start_offset,
             pnorms_writer: None,
+            bitmaps_writer: None,
         })
     }
 
@@ -201,6 +242,7 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             postings_range: addr..addr,
             positions_range: positions_start..positions_start,
             pnorms_offset: None,
+            bitmap_offset: None,
         }
     }
 
@@ -219,6 +261,9 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             "Called new_term, while the previous term was not closed."
         );
         self.term_open = true;
+        if let Some(writer) = self.bitmaps_writer.as_mut() {
+            writer.new_term(term_doc_freq);
+        }
         self.postings_serializer.clear();
         self.current_term_info = self.current_term_info();
         self.term_dictionary_builder.insert_key(term)?;
@@ -243,6 +288,9 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
     /// on the configuration of the field in the `Schema`.
     pub fn write_doc(&mut self, doc_id: DocId, term_freq: u32, position_deltas: &[u32]) {
         self.current_term_info.doc_freq += 1;
+        if let Some(writer) = self.bitmaps_writer.as_mut() {
+            writer.write_doc(doc_id);
+        }
         self.postings_serializer.write_doc(doc_id, term_freq);
         if let Some(ref mut positions_serializer) = self.positions_serializer_opt.as_mut() {
             assert_eq!(term_freq as usize, position_deltas.len());
@@ -269,6 +317,10 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             assert_eq!(norms.len(), self.current_term_info.doc_freq as usize);
             self.current_term_info.pnorms_offset =
                 Some(self.pnorms_writer.as_mut().unwrap().write(norms)?);
+        }
+        if let Some(writer) = self.bitmaps_writer.as_mut() {
+            self.current_term_info.bitmap_offset =
+                writer.close_term(self.current_term_info.doc_freq)?;
         }
         self.current_term_info.postings_range.end = self.postings_offset();
         if let Some(positions_serializer) = self.positions_serializer_opt.as_mut() {

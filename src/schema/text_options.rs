@@ -196,6 +196,8 @@ pub struct TextFieldIndexing {
     fieldnorms: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pnorms: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    bitmap_postings: bool,
     #[serde(default = "default_tokenizer")]
     tokenizer: Cow<'static, str>,
     #[serde(default)]
@@ -218,6 +220,7 @@ impl Default for TextFieldIndexing {
             record: IndexRecordOption::default(),
             fieldnorms: default_fieldnorms(),
             pnorms: false,
+            bitmap_postings: false,
             bm25_params: Bm25Params::default(),
         }
     }
@@ -261,6 +264,18 @@ impl TextFieldIndexing {
         self
     }
 
+    /// Returns whether dense terms may store an additional membership bitmap.
+    pub fn bitmap_postings(&self) -> bool {
+        self.bitmap_postings
+    }
+
+    /// Enables optional membership bitmaps for dense terms. Defaults to false.
+    #[must_use]
+    pub fn set_bitmap_postings(mut self, enabled: bool) -> Self {
+        self.bitmap_postings = enabled;
+        self
+    }
+
     /// Sets which information should be indexed with the tokens.
     ///
     /// See [`IndexRecordOption`] for more detail.
@@ -296,6 +311,7 @@ pub const STRING: TextOptions = TextOptions {
         tokenizer: Cow::Borrowed(RAW_TOKENIZER_NAME),
         fieldnorms: true,
         pnorms: false,
+        bitmap_postings: false,
         record: IndexRecordOption::Basic,
         bm25_params: Bm25Params::DEFAULT,
     }),
@@ -310,6 +326,7 @@ pub const TEXT: TextOptions = TextOptions {
         tokenizer: Cow::Borrowed(DEFAULT_TOKENIZER_NAME),
         fieldnorms: true,
         pnorms: false,
+        bitmap_postings: false,
         record: IndexRecordOption::WithFreqsAndPositions,
         bm25_params: Bm25Params::DEFAULT,
     }),
