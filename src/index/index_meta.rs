@@ -663,7 +663,7 @@ mod tests {
                 codec_types: columnar::DEFAULT_CODEC_TYPES.to_vec(),
                 vector_clustering_threshold: 10_000,
                 vector_quantization: Vec::new(),
-                bitmap_postings: BitmapPostingsConfig::default(),
+                bitmap_postings: super::BitmapPostingsConfig::default(),
             }
         );
         {
