@@ -36,8 +36,11 @@ impl FastFieldRangeQuery {
 }
 
 impl Query for FastFieldRangeQuery {
-    fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
-        Ok(Box::new(FastFieldRangeWeight::new(self.bounds.clone())))
+    fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+        Ok(Box::new(
+            FastFieldRangeWeight::new(self.bounds.clone())
+                .with_bitmap_enabled(!enable_scoring.is_scoring_enabled()),
+        ))
     }
 }
 
@@ -45,17 +48,29 @@ impl Query for FastFieldRangeQuery {
 #[derive(Clone, Debug)]
 pub struct FastFieldRangeWeight {
     bounds: BoundsRange<Term>,
+    bitmap_enabled: bool,
 }
 
 impl FastFieldRangeWeight {
     /// Create a new FastFieldRangeWeight
     pub fn new(bounds: BoundsRange<Term>) -> Self {
-        Self { bounds }
+        Self {
+            bounds,
+            bitmap_enabled: false,
+        }
+    }
+}
+
+impl FastFieldRangeWeight {
+    pub(crate) fn with_bitmap_enabled(mut self, enabled: bool) -> Self {
+        self.bitmap_enabled = enabled;
+        self
     }
 }
 
 impl Weight for FastFieldRangeWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
+        let bitmap_enabled = self.bitmap_enabled && reader.bitmap_postings_enabled;
         // Check if both bounds are Bound::Unbounded
         if self.bounds.is_unbounded() {
             return Ok(Box::new(AllScorer::new(reader.max_doc())));
@@ -124,11 +139,17 @@ impl Weight for FastFieldRangeWeight {
                         boost,
                         BoundsRange::new(lower_bound, upper_bound),
                         None,
+                        reader.bitmap_postings_enabled,
                     )
                 }
-                Type::U64 | Type::I64 | Type::F64 => {
-                    search_on_json_numerical_field(reader, &field_name, typ, bounds, boost)
-                }
+                Type::U64 | Type::I64 | Type::F64 => search_on_json_numerical_field(
+                    reader,
+                    &field_name,
+                    typ,
+                    bounds,
+                    boost,
+                    bitmap_enabled,
+                ),
                 Type::Date => {
                     let fast_field_reader = reader.fast_fields();
                     let Some((column, _col_type)) = fast_field_reader
@@ -143,6 +164,7 @@ impl Weight for FastFieldRangeWeight {
                         boost,
                         BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
                         None,
+                        reader.bitmap_postings_enabled,
                     )
                 }
                 Type::Bool
@@ -198,6 +220,7 @@ impl Weight for FastFieldRangeWeight {
                 boost,
                 BoundsRange::new(lower_bound, upper_bound),
                 sort_order,
+                reader.bitmap_postings_enabled,
             )
         } else if field_type.is_bytes() {
             let Some(bytes_column): Option<BytesColumn> =
@@ -221,6 +244,7 @@ impl Weight for FastFieldRangeWeight {
                 boost,
                 BoundsRange::new(lower_bound, upper_bound),
                 sort_order,
+                reader.bitmap_postings_enabled,
             )
         } else {
             assert!(
@@ -264,6 +288,7 @@ impl Weight for FastFieldRangeWeight {
                 boost,
                 BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
                 sort_order,
+                reader.bitmap_postings_enabled,
             )
         }
     }
@@ -290,6 +315,7 @@ fn search_on_json_numerical_field(
     typ: Type,
     bounds: BoundsRange<ValueBytes<Vec<u8>>>,
     boost: Score,
+    bitmap_enabled: bool,
 ) -> crate::Result<Box<dyn Scorer>> {
     // Since we don't know which type was interpolated for the internal column we
     // have to check for all numeric types (only one exists)
@@ -369,6 +395,7 @@ fn search_on_json_numerical_field(
         boost,
         BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
         None,
+        reader.bitmap_postings_enabled,
     )
 }
 
@@ -448,6 +475,7 @@ fn search_on_u64_ff(
     boost: Score,
     bounds: BoundsRange<u64>,
     sort_order: Option<Order>,
+    bitmap_enabled: bool,
 ) -> crate::Result<Box<dyn Scorer>> {
     let col_min_value = column.min_value();
     let col_max_value = column.max_value();
@@ -493,6 +521,10 @@ fn search_on_u64_ff(
         }
     }
 
+    if bitmap_enabled && column.index.get_cardinality() == Cardinality::Full {
+        let docset = super::fast_field_range_doc_set::BitmapRangeDocSet::new(value_range, column);
+        return Ok(Box::new(ConstScorer::new(docset, boost)));
+    }
     let docset = RangeDocSet::new(value_range, column);
     Ok(Box::new(ConstScorer::new(docset, boost)))
 }

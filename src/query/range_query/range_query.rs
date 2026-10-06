@@ -106,7 +106,10 @@ impl Query for RangeQuery {
         let field_type = schema.get_field_entry(self.field()).field_type();
 
         if field_type.is_fast() && is_type_valid_for_fastfield_range_query(self.value_type()) {
-            Ok(Box::new(FastFieldRangeWeight::new(self.bounds.clone())))
+            Ok(Box::new(
+                FastFieldRangeWeight::new(self.bounds.clone())
+                    .with_bitmap_enabled(!enable_scoring.is_scoring_enabled()),
+            ))
         } else {
             if field_type.is_json() {
                 return Err(crate::TantivyError::InvalidArgument(
@@ -266,9 +269,8 @@ mod tests {
     use super::RangeQuery;
     use crate::collector::{Count, TopDocs};
     use crate::indexer::NoMergePolicy;
-    use crate::query::range_query::fast_field_range_doc_set::RangeDocSet;
     use crate::query::range_query::range_query::InvertedIndexRangeQuery;
-    use crate::query::{AllScorer, ConstScorer, EmptyScorer, EnableScoring, Query, QueryParser};
+    use crate::query::{AllScorer, EmptyScorer, EnableScoring, Query, QueryParser};
     use crate::schema::{
         Field, IntoIpv6Addr, Schema, TantivyDocument, FAST, INDEXED, STORED, TEXT,
     };
@@ -693,11 +695,11 @@ mod tests {
         let range_scorer = make_scorer(Bound::Included(1), Bound::Included(4));
         assert!(range_scorer.is::<AllScorer>());
         let range_scorer = make_scorer(Bound::Included(0), Bound::Included(2));
-        assert!(range_scorer.is::<ConstScorer<RangeDocSet<u64>>>());
+        assert!(range_scorer.has_fast_bitset());
         let range_scorer = make_scorer(Bound::Included(3), Bound::Included(10));
-        assert!(range_scorer.is::<ConstScorer<RangeDocSet<u64>>>());
+        assert!(range_scorer.has_fast_bitset());
         let range_scorer = make_scorer(Bound::Included(10), Bound::Included(12));
-        assert!(range_scorer.is::<ConstScorer<RangeDocSet<u64>>>());
+        assert!(range_scorer.has_fast_bitset());
         let range_scorer = make_scorer(Bound::Included(0), Bound::Included(1));
         assert!(range_scorer.is::<EmptyScorer>());
         let range_scorer = make_scorer(Bound::Included(0), Bound::Excluded(2));
