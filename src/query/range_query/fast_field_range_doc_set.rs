@@ -458,6 +458,21 @@ mod tests {
         writer.commit()?;
         let searcher = index.reader()?.searcher();
         let parser = QueryParser::for_index(&index, vec![text]);
+        let range = parser.parse_query("a:[0 TO 4999]")?;
+        for scoring in [false, true] {
+            let enabled = if scoring {
+                EnableScoring::enabled_from_searcher(&searcher)
+            } else {
+                EnableScoring::disabled_from_searcher(&searcher)
+            };
+            let weight = range.weight(enabled)?;
+            for reader in searcher.segment_readers() {
+                assert_eq!(weight.scorer(reader, 1.0)?.has_fast_bitset(), !scoring);
+                let mut ordinary = reader.clone();
+                ordinary.bitmap_postings_enabled = false;
+                assert!(!weight.scorer(&ordinary, 1.0)?.has_fast_bitset());
+            }
+        }
         for upper in [9, 99, 999, 4999, 8999] {
             for op in ["AND", "OR"] {
                 for left in [
