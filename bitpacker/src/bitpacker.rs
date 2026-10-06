@@ -264,6 +264,43 @@ impl BitUnpacker {
         self.get_ids_for_value_range_from_subset(range, id_range, 0, data, positions)
     }
 
+    /// Writes matching value positions as bits relative to `rows.start`.
+    /// Clears the output, which must have room for every requested position.
+    pub fn get_bitmap_for_value_range_from_subset(
+        &self,
+        range: RangeInclusive<u64>,
+        rows: Range<u32>,
+        offset: usize,
+        data: &[u8],
+        bitmap: &mut [u64],
+    ) {
+        bitmap.fill(0);
+        assert!(rows.len() <= bitmap.len() * 64);
+        let end = rows.end;
+        let mut values = [0u32; 256];
+        for start in (rows.start..end).step_by(values.len()) {
+            let len = (end - start).min(values.len() as u32) as usize;
+            if self.bit_width() <= 32 {
+                self.get_batch_u32s(start, offset, data, &mut values[..len]);
+            }
+            for (chunk, word) in bitmap[((start - rows.start) / 64) as usize..]
+                .iter_mut()
+                .take(len.div_ceil(64))
+                .enumerate()
+            {
+                for bit in 0..(len - chunk * 64).min(64) {
+                    let i = chunk * 64 + bit;
+                    let value = if self.bit_width() <= 32 {
+                        u64::from(values[i])
+                    } else {
+                        self.get_from_subset(start + i as u32, offset, data)
+                    };
+                    *word |= u64::from(range.contains(&value)) << bit;
+                }
+            }
+        }
+    }
+
     pub fn get_ids_for_value_range_from_subset(
         &self,
         range: RangeInclusive<u64>,
@@ -395,6 +432,46 @@ mod test {
         #[test]
         fn test_bitpacker_proptest((num_bits, vals) in vals_strategy()) {
             test_bitpacker_aux(num_bits, &vals);
+        }
+    }
+
+    #[test]
+    fn bitmap_range_matches_scalar_for_all_bit_widths() {
+        for bits in (0..=56).chain(std::iter::once(64)) {
+            let maximum = u64::MAX.checked_shr(64 - bits).unwrap_or(0);
+            let values: Vec<_> = (0..2051u64)
+                .map(|i| i.wrapping_mul(6364136223846793005) & maximum)
+                .collect();
+            let mut data = Vec::new();
+            let mut packer = BitPacker::new();
+            for &value in &values {
+                packer.write(value, bits as u8, &mut data).unwrap();
+            }
+            packer.flush(&mut data).unwrap();
+            let unpacker = BitUnpacker::new(bits as u8);
+            for start in [0, 1, 7, 8, 63, 64, 1023, 2000] {
+                let end = (start + 1024).min(values.len() as u32);
+                let bytes = unpacker.block_oblivious_range(start..end, data.len());
+                for range in [0..=maximum, maximum / 4..=maximum / 2, 1..=0] {
+                    let mut actual = [u64::MAX; 16];
+                    unpacker.get_bitmap_for_value_range_from_subset(
+                        range.clone(),
+                        start..end,
+                        bytes.start,
+                        &data[bytes.clone()],
+                        &mut actual,
+                    );
+                    for offset in 0..1024 {
+                        let expected = start + offset < end
+                            && range.contains(&values[(start + offset) as usize]);
+                        assert_eq!(
+                            (actual[offset as usize / 64] >> (offset % 64)) & 1 != 0,
+                            expected,
+                            "bits {bits}, start {start}, offset {offset}"
+                        );
+                    }
+                }
+            }
         }
     }
 
