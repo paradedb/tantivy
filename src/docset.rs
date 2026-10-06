@@ -64,6 +64,28 @@ impl DocSetBatch<'_> {
     }
 }
 
+#[inline]
+pub(crate) fn union_bitset_blocks(mask: &mut DocIdBitmap, other: &DocIdBitmap) {
+    for (word, other) in mask.iter_mut().zip(other) {
+        *word = word.union(*other);
+    }
+}
+
+#[inline]
+pub(crate) fn retain_bitset_range(mask: &mut DocIdBitmap, base: DocId, start: DocId, end: DocId) {
+    let start = start.saturating_sub(base).min(BLOCK_WINDOW) as usize;
+    let end = end.saturating_sub(base).min(BLOCK_WINDOW) as usize;
+    mask[..start / 64].fill(TinySet::EMPTY);
+    if start / 64 < mask.len() {
+        mask[start / 64] =
+            mask[start / 64].intersect(TinySet::range_greater_or_equal(start as u32 % 64));
+    }
+    if end / 64 < mask.len() {
+        mask[end / 64] = mask[end / 64].intersect(TinySet::range_lower(end as u32 % 64));
+        mask[end / 64 + 1..].fill(TinySet::EMPTY);
+    }
+}
+
 pub(crate) fn count_bitset_blocks<T: DocSet + ?Sized>(
     docset: &mut T,
     alive: Option<&AliveBitSet>,

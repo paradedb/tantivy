@@ -95,14 +95,10 @@ impl BitmapCombination {
                 child.fill_bitset_block(self.base, &mut other);
                 match self.operation {
                     BitmapOperation::Union => {
-                        for (word, other) in self.mask.iter_mut().zip(other) {
-                            *word = word.union(other);
-                        }
+                        crate::docset::union_bitset_blocks(&mut self.mask, &other);
                     }
                     BitmapOperation::Intersection => {
-                        for (word, other) in self.mask.iter_mut().zip(other) {
-                            *word = word.intersect(other);
-                        }
+                        super::intersection::and_blocks_and_return_is_empty(&mut self.mask, &other);
                     }
                     BitmapOperation::Exclude => {
                         for (word, other) in self.mask.iter_mut().zip(other) {
@@ -153,6 +149,10 @@ impl DocSet for BitmapCombination {
         }
         let horizon = base.saturating_add(BLOCK_WINDOW).min(TERMINATED);
         while self.doc < horizon {
+            if base == self.base {
+                crate::docset::union_bitset_blocks(mask, &self.mask);
+                return self.seek(horizon);
+            }
             for (i, word) in self.mask.iter().enumerate() {
                 let word_base = self.base + i as u32 * 64;
                 if word_base >= horizon || word_base + 64 <= base {

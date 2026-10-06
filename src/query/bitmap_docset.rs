@@ -123,6 +123,16 @@ impl DocSet for BitmapDocSet {
             .get_bytes(offset..bitmap_num_bytes(horizon))
             .expect("failed to read posting bitmap");
         let shift = base % 64;
+        if shift == 0 {
+            let mut block = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
+            for (word, bytes) in block.iter_mut().zip(bytes.as_chunks::<8>().0) {
+                *word = TinySet::deserialize(*bytes);
+            }
+            crate::docset::retain_bitset_range(&mut block, base, start, horizon);
+            crate::docset::union_bitset_blocks(mask, &block);
+            self.doc = self.next_doc(horizon);
+            return self.doc;
+        }
         let word_at = |i: usize| {
             bytes
                 .get(i * 8..i * 8 + 8)
