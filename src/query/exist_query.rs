@@ -39,6 +39,15 @@ pub struct ExistsQuery {
 }
 
 impl ExistsQuery {
+    /// The requested field or JSON path.
+    pub fn field_name(&self) -> &str {
+        &self.field_name
+    }
+    /// Whether descendants of a JSON path also match.
+    pub fn json_subpaths(&self) -> bool {
+        self.json_subpaths
+    }
+
     /// Creates a new `ExistQuery` from the given field.
     ///
     /// This query matches all documents with at least one non-null value in the specified field.

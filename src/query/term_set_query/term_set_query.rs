@@ -19,6 +19,11 @@ pub struct TermSetQuery {
 }
 
 impl TermSetQuery {
+    /// Terms grouped by field.
+    pub fn terms(&self) -> impl Iterator<Item = &Term> {
+        self.terms_map.values().flatten()
+    }
+
     /// Create a Term Set Query
     pub fn new<T: IntoIterator<Item = Term>>(terms: T) -> Self {
         let mut terms_map: HashMap<_, Vec<_>> = HashMap::new();

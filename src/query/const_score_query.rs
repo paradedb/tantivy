@@ -48,6 +48,10 @@ impl<Q: fmt::Debug> fmt::Debug for ConstScoreQuery<Q> {
 }
 
 impl<Q: Query + Clone> Query for ConstScoreQuery<Q> {
+    fn matching_query(&self) -> Option<&dyn Query> {
+        Some(&self.query)
+    }
+
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let inner_weight = self.query.weight(enable_scoring)?;
         Ok(if enable_scoring.is_scoring_enabled() {

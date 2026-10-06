@@ -174,6 +174,11 @@ impl<'a> EnableScoring<'a> {
 /// [`Scorer`]: crate::query::Scorer
 /// [`SegmentReader`]: crate::SegmentReader
 pub trait Query: QueryClone + Send + Sync + downcast_rs::Downcast + fmt::Debug {
+    /// For a wrapper that changes only scores, the child with the same matching documents.
+    fn matching_query(&self) -> Option<&dyn Query> {
+        None
+    }
+
     /// Create the weight associated with a query.
     ///
     /// If scoring is not required, setting `scoring_enabled` to `false`
@@ -238,6 +243,10 @@ where T: 'static + Query + Clone
 }
 
 impl Query for Box<dyn Query> {
+    fn matching_query(&self) -> Option<&dyn Query> {
+        Some(self.as_ref())
+    }
+
     fn weight(&self, enabled_scoring: EnableScoring) -> crate::Result<Box<dyn Weight>> {
         self.as_ref().weight(enabled_scoring)
     }
@@ -305,6 +314,19 @@ mod tests {
             assert_eq!(overridden.disjunction_pruning(), DisjunctionPruning::Auto);
         }
         Ok(())
+    }
+
+    #[test]
+    fn matching_query_unwraps_boxes_and_scoring_wrappers() {
+        use crate::query::{AllQuery, BoostQuery, ConstScoreQuery};
+        let query: Box<dyn Query> = Box::new(Box::new(AllQuery) as Box<dyn Query>);
+        let query =
+            ConstScoreQuery::new(BoostQuery::new(ConstScoreQuery::new(query, 1.0), 2.0), 3.0);
+        let mut child: &dyn Query = &query;
+        while let Some(inner) = child.matching_query() {
+            child = inner;
+        }
+        assert!(child.is::<AllQuery>());
     }
 
     #[test]
