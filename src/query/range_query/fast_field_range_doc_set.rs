@@ -58,6 +58,7 @@ pub(crate) struct RangeDocSet<T> {
     /// Current batch of loaded docs.
     loaded_docs: VecCursor,
     last_seek_pos_opt: Option<u32>,
+    estimated_cardinality: Option<u32>,
 }
 
 const DEFAULT_FETCH_HORIZON: u32 = 128;
@@ -71,6 +72,7 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> RangeDocSet<T> {
                 next_fetch_start: TERMINATED,
                 fetch_horizon: DEFAULT_FETCH_HORIZON,
                 last_seek_pos_opt: None,
+                estimated_cardinality: None,
             };
         }
 
@@ -81,10 +83,16 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> RangeDocSet<T> {
             next_fetch_start: 0,
             fetch_horizon: DEFAULT_FETCH_HORIZON,
             last_seek_pos_opt: None,
+            estimated_cardinality: None,
         };
         range_docset.reset_fetch_range();
         range_docset.fetch_block();
         range_docset
+    }
+
+    pub(crate) fn with_estimated_cardinality(mut self, estimate: u32) -> Self {
+        self.estimated_cardinality = Some(estimate);
+        self
     }
 
     fn reset_fetch_range(&mut self) {
@@ -218,7 +226,8 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> DocSet for RangeDocSe
 
     fn size_hint(&self) -> u32 {
         // TODO: Implement a better size hint
-        self.column.num_docs() / 10
+        self.estimated_cardinality
+            .unwrap_or(self.column.num_docs() / 10)
     }
 
     /// Returns a best-effort hint of the
@@ -235,7 +244,10 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> DocSet for RangeDocSe
         // query has not.
         //
         // Ideally this would take the fast field codec into account
-        (self.column.num_docs() as f64 * 0.8) as u64
+        self.estimated_cardinality.map_or_else(
+            || (self.column.num_docs() as f64 * 0.8) as u64,
+            |estimate| u64::from(self.column.num_docs() / 10) + u64::from(estimate),
+        )
     }
 }
 

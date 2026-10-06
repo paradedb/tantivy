@@ -520,6 +520,18 @@ fn search_on_u64_ff(
     }
 
     if bitmap_enabled && column.index.get_cardinality() == Cardinality::Full {
+        let sample_len = column.num_docs().min(crate::BLOCK_WINDOW);
+        let mut sample = [0u64; crate::BLOCK_NUM_TINYBITSETS];
+        column
+            .values
+            .get_bitmap_for_value_range(value_range.clone(), 0..sample_len, &mut sample);
+        let matches: u64 = sample.iter().map(|word| u64::from(word.count_ones())).sum();
+        let estimate =
+            (matches * u64::from(column.num_docs()) / u64::from(sample_len.max(1))) as u32;
+        if estimate.saturating_mul(32) < column.num_docs() {
+            let sparse = RangeDocSet::new(value_range, column).with_estimated_cardinality(estimate);
+            return Ok(Box::new(ConstScorer::new(sparse, boost)));
+        }
         let docset = super::fast_field_range_doc_set::BitmapRangeDocSet::new(value_range, column);
         return Ok(Box::new(ConstScorer::new(docset, boost)));
     }

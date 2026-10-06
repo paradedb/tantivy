@@ -699,7 +699,7 @@ mod tests {
         let range_scorer = make_scorer(Bound::Included(3), Bound::Included(10));
         assert!(range_scorer.has_fast_bitset());
         let range_scorer = make_scorer(Bound::Included(10), Bound::Included(12));
-        assert!(range_scorer.has_fast_bitset());
+        assert_eq!(range_scorer.doc(), crate::TERMINATED);
         let range_scorer = make_scorer(Bound::Included(0), Bound::Included(1));
         assert!(range_scorer.is::<EmptyScorer>());
         let range_scorer = make_scorer(Bound::Included(0), Bound::Excluded(2));
