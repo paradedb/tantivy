@@ -67,6 +67,10 @@ impl SegmentCollector for Box<dyn BoxableSegmentCollector> {
         self.as_mut().collect_block(docs);
     }
 
+    fn supports_bitmap_collection(&self) -> bool {
+        self.as_ref().supports_bitmap_collection()
+    }
+
     fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
         self.as_mut().collect_bitmap(base, mask);
     }
@@ -83,6 +87,10 @@ pub trait BoxableSegmentCollector {
             self.collect(doc, 0.0);
         }
     }
+    fn supports_bitmap_collection(&self) -> bool {
+        false
+    }
+
     fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
         crate::DocSetBatch::Bitmap(base, mask).for_each_doc_block(|docs| self.collect_block(docs));
     }
@@ -102,6 +110,10 @@ impl<TSegmentCollector: SegmentCollector> BoxableSegmentCollector
     #[inline]
     fn collect_block(&mut self, docs: &[DocId]) {
         self.0.collect_block(docs);
+    }
+
+    fn supports_bitmap_collection(&self) -> bool {
+        self.0.supports_bitmap_collection()
     }
 
     fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
@@ -278,6 +290,12 @@ impl SegmentCollector for MultiCollectorChild {
         for child in &mut self.children {
             child.collect_block(docs);
         }
+    }
+
+    fn supports_bitmap_collection(&self) -> bool {
+        self.children
+            .iter()
+            .all(|child| child.supports_bitmap_collection())
     }
 
     fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {

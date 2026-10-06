@@ -695,10 +695,6 @@ impl<B: SubAggBuffer> SegmentAggregationCollector for SegmentFilterCollector<B> 
         Ok(())
     }
 
-    fn supports_bitmap_collection(&self) -> bool {
-        self.sub_aggregations.is_none()
-    }
-
     fn collect_bitmap(
         &mut self,
         parent_bucket_id: BucketId,

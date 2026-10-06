@@ -262,7 +262,7 @@ impl TermWeight {
             )));
         }
 
-        if !self.scoring_enabled {
+        if !self.scoring_enabled && reader.bitmap_postings_enabled {
             if let Some(bitmap) =
                 inverted_index.read_bitmap_from_terminfo(&term_info, reader.max_doc())?
             {

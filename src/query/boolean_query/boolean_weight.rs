@@ -24,8 +24,10 @@ fn intersect_scorers(
     scorers: Vec<Box<dyn Scorer>>,
     num_docs: u32,
     scoring_enabled: bool,
+    bitmap_enabled: bool,
 ) -> Box<dyn Scorer> {
-    if !scoring_enabled
+    if bitmap_enabled
+        && !scoring_enabled
         && scorers.len() > 1
         && scorers.iter().any(|scorer| scorer.has_fast_bitset())
         && scorers
@@ -81,6 +83,7 @@ fn scorer_union<TScoreCombiner>(
     scorers: Vec<Box<dyn Scorer>>,
     score_combiner_fn: impl Fn() -> TScoreCombiner,
     num_docs: u32,
+    bitmap_enabled: bool,
 ) -> SpecializedScorer
 where
     TScoreCombiner: ScoreCombiner,
@@ -89,7 +92,8 @@ where
     if scorers.len() == 1 && !scorers[0].is::<TermScorer>() {
         return SpecializedScorer::Other(scorers.into_iter().next().unwrap()); //< we checked the size beforehand
     }
-    if TScoreCombiner::constant_score() == Some(1.0)
+    if bitmap_enabled
+        && TScoreCombiner::constant_score() == Some(1.0)
         && scorers.iter().any(|scorer| scorer.has_fast_bitset())
     {
         return SpecializedScorer::Other(Box::new(BitmapCombination::new(
@@ -134,6 +138,7 @@ fn into_box_scorer<TScoreCombiner: ScoreCombiner>(
     scorer: SpecializedScorer,
     score_combiner_fn: impl Fn() -> TScoreCombiner,
     num_docs: u32,
+    bitmap_enabled: bool,
 ) -> Box<dyn Scorer> {
     match scorer {
         SpecializedScorer::TermUnion(mut term_scorers) => {
@@ -154,6 +159,7 @@ fn into_box_scorer<TScoreCombiner: ScoreCombiner>(
                 boxed_scorers,
                 num_docs,
                 TScoreCombiner::constant_score().is_none(),
+                bitmap_enabled,
             )
         }
         SpecializedScorer::FilteredTermUnion { mut terms, filter } => {
@@ -170,6 +176,7 @@ fn into_box_scorer<TScoreCombiner: ScoreCombiner>(
                 vec![term_scorer, filter],
                 num_docs,
                 TScoreCombiner::constant_score().is_none(),
+                bitmap_enabled,
             )
         }
         SpecializedScorer::FilteredTermIntersection { terms, filter } => {
@@ -182,6 +189,7 @@ fn into_box_scorer<TScoreCombiner: ScoreCombiner>(
                 boxed_scorers,
                 num_docs,
                 TScoreCombiner::constant_score().is_none(),
+                bitmap_enabled,
             )
         }
         SpecializedScorer::Other(scorer) => scorer,
@@ -198,6 +206,7 @@ fn effective_must_scorer(
     max_doc: DocId,
     num_docs: u32,
     scoring_enabled: bool,
+    bitmap_enabled: bool,
 ) -> Option<Box<dyn Scorer>> {
     if must_scorers.is_empty() {
         if removed_all_scorer_count > 0 {
@@ -208,7 +217,12 @@ fn effective_must_scorer(
             None
         }
     } else {
-        Some(intersect_scorers(must_scorers, num_docs, scoring_enabled))
+        Some(intersect_scorers(
+            must_scorers,
+            num_docs,
+            scoring_enabled,
+            bitmap_enabled,
+        ))
     }
 }
 
@@ -226,12 +240,13 @@ fn effective_should_scorer_for_union<TScoreCombiner: ScoreCombiner>(
     num_docs: u32,
     score_combiner_fn: impl Fn() -> TScoreCombiner,
     scoring_enabled: bool,
+    bitmap_enabled: bool,
 ) -> SpecializedScorer {
     if removed_all_scorer_count > 0 {
         if scoring_enabled {
             // Need to union to get score contributions from both
             let all_scorers: Vec<Box<dyn Scorer>> = vec![
-                into_box_scorer(should_scorer, &score_combiner_fn, num_docs),
+                into_box_scorer(should_scorer, &score_combiner_fn, num_docs, bitmap_enabled),
                 Box::new(AllScorer::new(max_doc)),
             ];
             SpecializedScorer::Other(Box::new(BufferedUnionScorer::build(
@@ -379,11 +394,13 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     should_scorers,
                     &score_combiner_fn,
                     num_docs,
+                    reader.bitmap_postings_enabled,
                 )),
                 1 => ShouldScorersCombinationMethod::Required(scorer_union(
                     should_scorers,
                     &score_combiner_fn,
                     num_docs,
+                    reader.bitmap_postings_enabled,
                 )),
                 n if num_of_should_scorers == n => {
                     // When num_of_should_scorers equals the number of should clauses,
@@ -436,7 +453,12 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     && !term_scorers.is_empty()
                     && !other_scorers.is_empty()
                 {
-                    let filter = intersect_scorers(other_scorers, num_docs, self.scoring_enabled);
+                    let filter = intersect_scorers(
+                        other_scorers,
+                        num_docs,
+                        self.scoring_enabled,
+                        reader.bitmap_postings_enabled,
+                    );
                     if term_scorers.len() >= 2 {
                         SpecializedScorer::FilteredTermIntersection {
                             terms: term_scorers,
@@ -468,6 +490,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                                 reader.max_doc(),
                                 num_docs,
                                 self.scoring_enabled,
+                                reader.bitmap_postings_enabled,
                             )
                             .unwrap_or_else(|| Box::new(EmptyScorer))
                         };
@@ -482,6 +505,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     reader.max_doc(),
                     num_docs,
                     self.scoring_enabled,
+                    reader.bitmap_postings_enabled,
                 ) {
                     None => {
                         // No MUST constraint: promote SHOULD to required.
@@ -493,6 +517,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                             num_docs,
                             &score_combiner_fn,
                             self.scoring_enabled,
+                            reader.bitmap_postings_enabled,
                         )
                     }
                     Some(must_scorer) => {
@@ -504,7 +529,12 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                                 TScoreCombiner,
                             >::new(
                                 must_scorer,
-                                into_box_scorer(should_scorer, &score_combiner_fn, num_docs),
+                                into_box_scorer(
+                                    should_scorer,
+                                    &score_combiner_fn,
+                                    num_docs,
+                                    reader.bitmap_postings_enabled,
+                                ),
                             )))
                         } else {
                             SpecializedScorer::Other(must_scorer)
@@ -521,6 +551,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     reader.max_doc(),
                     num_docs,
                     self.scoring_enabled,
+                    reader.bitmap_postings_enabled,
                 ) {
                     None => {
                         // No MUST constraint: SHOULD alone determines matching.
@@ -540,12 +571,17 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                             }
                         }
                         _ => {
-                            let should_boxed =
-                                into_box_scorer(should_scorer, &score_combiner_fn, num_docs);
+                            let should_boxed = into_box_scorer(
+                                should_scorer,
+                                &score_combiner_fn,
+                                num_docs,
+                                reader.bitmap_postings_enabled,
+                            );
                             SpecializedScorer::Other(intersect_scorers(
                                 vec![must_scorer, should_boxed],
                                 num_docs,
                                 self.scoring_enabled,
+                                reader.bitmap_postings_enabled,
                             ))
                         }
                     },
@@ -556,8 +592,16 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
             return Ok(include_scorer);
         }
 
-        let include_scorer_boxed = into_box_scorer(include_scorer, &score_combiner_fn, num_docs);
-        if !self.scoring_enabled && include_scorer_boxed.has_fast_bitset() {
+        let include_scorer_boxed = into_box_scorer(
+            include_scorer,
+            &score_combiner_fn,
+            num_docs,
+            reader.bitmap_postings_enabled,
+        );
+        if reader.bitmap_postings_enabled
+            && !self.scoring_enabled
+            && include_scorer_boxed.has_fast_bitset()
+        {
             let mut children = vec![include_scorer_boxed];
             children.extend(exclude_scorers);
             return Ok(SpecializedScorer::Other(Box::new(BitmapCombination::new(
@@ -620,12 +664,22 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         } else if self.scoring_enabled {
             self.complex_scorer(reader, boost, &self.score_combiner_fn)
                 .map(|specialized_scorer| {
-                    into_box_scorer(specialized_scorer, &self.score_combiner_fn, num_docs)
+                    into_box_scorer(
+                        specialized_scorer,
+                        &self.score_combiner_fn,
+                        num_docs,
+                        reader.bitmap_postings_enabled,
+                    )
                 })
         } else {
             self.complex_scorer(reader, boost, DoNothingCombiner::default)
                 .map(|specialized_scorer| {
-                    into_box_scorer(specialized_scorer, DoNothingCombiner::default, num_docs)
+                    into_box_scorer(
+                        specialized_scorer,
+                        DoNothingCombiner::default,
+                        num_docs,
+                        reader.bitmap_postings_enabled,
+                    )
                 })
         }
     }
@@ -674,6 +728,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                         SpecializedScorer::FilteredTermUnion { terms, filter },
                         &self.score_combiner_fn,
                         reader.num_docs(),
+                        reader.bitmap_postings_enabled,
                     );
                     return Ok(Box::new(BasicPruningScorer::new(
                         union_scorer,
@@ -705,6 +760,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                         SpecializedScorer::FilteredTermIntersection { terms, filter },
                         &self.score_combiner_fn,
                         reader.num_docs(),
+                        reader.bitmap_postings_enabled,
                     );
                     return Ok(Box::new(BasicPruningScorer::new(
                         intersection_scorer,
@@ -783,13 +839,22 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     .into_iter()
                     .map(|term_scorer| Box::new(term_scorer) as Box<dyn Scorer>)
                     .collect();
-                let mut intersection =
-                    intersect_scorers(boxed_scorers, num_docs, self.scoring_enabled);
+                let mut intersection = intersect_scorers(
+                    boxed_scorers,
+                    num_docs,
+                    self.scoring_enabled,
+                    reader.bitmap_postings_enabled,
+                );
                 for_each_scorer(intersection.as_mut(), callback);
             }
             SpecializedScorer::FilteredTermUnion { .. }
             | SpecializedScorer::FilteredTermIntersection { .. } => {
-                let mut scorer = into_box_scorer(scorer, &self.score_combiner_fn, num_docs);
+                let mut scorer = into_box_scorer(
+                    scorer,
+                    &self.score_combiner_fn,
+                    num_docs,
+                    reader.bitmap_postings_enabled,
+                );
                 for_each_scorer(scorer.as_mut(), callback);
             }
             SpecializedScorer::Other(mut scorer) => {
@@ -868,6 +933,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                         SpecializedScorer::FilteredTermUnion { terms, filter },
                         &self.score_combiner_fn,
                         reader.num_docs(),
+                        reader.bitmap_postings_enabled,
                     );
                     let mut scorer = BasicPruningScorer::new(union_scorer, threshold);
                     for_each_pruning_scorer(&mut scorer, callback);
@@ -914,6 +980,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                         SpecializedScorer::FilteredTermIntersection { terms, filter },
                         &self.score_combiner_fn,
                         reader.num_docs(),
+                        reader.bitmap_postings_enabled,
                     );
                     let mut scorer = BasicPruningScorer::new(intersection_scorer, threshold);
                     for_each_pruning_scorer(&mut scorer, callback);
@@ -979,13 +1046,22 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     .into_iter()
                     .map(|term_scorer| Box::new(term_scorer) as Box<dyn Scorer>)
                     .collect();
-                let mut intersection =
-                    intersect_scorers(boxed_scorers, num_docs, self.scoring_enabled);
+                let mut intersection = intersect_scorers(
+                    boxed_scorers,
+                    num_docs,
+                    self.scoring_enabled,
+                    reader.bitmap_postings_enabled,
+                );
                 for_each_docset_buffered(intersection.as_mut(), &mut buffer, callback);
             }
             SpecializedScorer::FilteredTermUnion { .. }
             | SpecializedScorer::FilteredTermIntersection { .. } => {
-                let mut scorer = into_box_scorer(scorer, DoNothingCombiner::default, num_docs);
+                let mut scorer = into_box_scorer(
+                    scorer,
+                    DoNothingCombiner::default,
+                    num_docs,
+                    reader.bitmap_postings_enabled,
+                );
                 for_each_docset_buffered(scorer.as_mut(), &mut buffer, callback);
             }
             SpecializedScorer::Other(mut scorer) => {
@@ -1019,13 +1095,22 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     .into_iter()
                     .map(|term_scorer| Box::new(term_scorer) as Box<dyn Scorer>)
                     .collect();
-                let mut intersection =
-                    intersect_scorers(boxed_scorers, num_docs, self.scoring_enabled);
+                let mut intersection = intersect_scorers(
+                    boxed_scorers,
+                    num_docs,
+                    self.scoring_enabled,
+                    reader.bitmap_postings_enabled,
+                );
                 crate::query::weight::for_each_docset_batch(intersection.as_mut(), callback);
             }
             SpecializedScorer::FilteredTermUnion { .. }
             | SpecializedScorer::FilteredTermIntersection { .. } => {
-                let mut scorer = into_box_scorer(scorer, DoNothingCombiner::default, num_docs);
+                let mut scorer = into_box_scorer(
+                    scorer,
+                    DoNothingCombiner::default,
+                    num_docs,
+                    reader.bitmap_postings_enabled,
+                );
                 crate::query::weight::for_each_docset_batch(scorer.as_mut(), callback);
             }
             SpecializedScorer::Other(mut scorer) => {

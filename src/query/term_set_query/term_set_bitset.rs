@@ -92,7 +92,12 @@ pub(crate) fn bitset_from_postings_scorer(
         let sorted = SortedTermSlice::new_assume_sorted(sorted_keys);
         for result in term_dict.batch_term_info_exact(sorted) {
             let (_idx, term_info) = result?;
-            or_term_info_into_bitset(&inverted_index, &term_info, &mut bitset)?;
+            or_term_info_into_bitset(
+                &inverted_index,
+                &term_info,
+                &mut bitset,
+                reader.bitmap_postings_enabled,
+            )?;
         }
     }
     #[cfg(not(feature = "quickwit"))]
@@ -103,7 +108,12 @@ pub(crate) fn bitset_from_postings_scorer(
             let Some(term_info) = term_dict.get(key.as_slice())? else {
                 continue;
             };
-            or_term_info_into_bitset(&inverted_index, &term_info, &mut bitset)?;
+            or_term_info_into_bitset(
+                &inverted_index,
+                &term_info,
+                &mut bitset,
+                reader.bitmap_postings_enabled,
+            )?;
         }
     }
 
@@ -120,10 +130,13 @@ fn or_term_info_into_bitset(
     inverted_index: &InvertedIndexReader,
     term_info: &TermInfo,
     bitset: &mut BitSet,
+    bitmap_enabled: bool,
 ) -> crate::Result<()> {
-    if let Some(mut bitmap) =
+    if let Some(mut bitmap) = if bitmap_enabled {
         inverted_index.read_bitmap_from_terminfo(term_info, bitset.max_value())?
-    {
+    } else {
+        None
+    } {
         use crate::DocSet;
         while bitmap.doc() != crate::TERMINATED {
             let base = bitmap.doc() / crate::BLOCK_WINDOW * crate::BLOCK_WINDOW;

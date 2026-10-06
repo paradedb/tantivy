@@ -104,7 +104,7 @@ where
         let mut scorers = vec![];
         let mut bitmaps: Vec<Box<dyn Scorer>> = Vec::new();
         while let Some((_term, term_info, state)) = term_stream.next() {
-            if !self.scoring_enabled {
+            if !self.scoring_enabled && reader.bitmap_postings_enabled {
                 if let Some(bitmap) =
                     inverted_index.read_bitmap_from_terminfo(term_info, reader.max_doc())?
                 {

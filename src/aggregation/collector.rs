@@ -138,6 +138,7 @@ pub struct AggregationSegmentCollector {
     aggs_with_accessor: AggregationsSegmentCtx,
     agg_collector: LowCardBufferedSubAggs,
     error: Option<TantivyError>,
+    supports_bitmap_collection: bool,
 }
 
 impl AggregationSegmentCollector {
@@ -149,6 +150,18 @@ impl AggregationSegmentCollector {
         segment_ordinal: SegmentOrdinal,
         context: &AggContextParams,
     ) -> crate::Result<Self> {
+        let supports_bitmap_collection = agg.values().all(|agg| {
+            matches!(agg.agg, super::agg_req::AggregationVariants::Filter(_))
+                && agg.sub_aggregation.is_empty()
+        });
+        let mut ordinary_reader;
+        let reader = if supports_bitmap_collection {
+            reader
+        } else {
+            ordinary_reader = reader.clone();
+            ordinary_reader.bitmap_postings_enabled = false;
+            &ordinary_reader
+        };
         let mut agg_data =
             build_aggregations_data_from_req(agg, reader, segment_ordinal, context.clone())?;
         let mut result =
@@ -161,6 +174,7 @@ impl AggregationSegmentCollector {
             aggs_with_accessor: agg_data,
             agg_collector: result,
             error: None,
+            supports_bitmap_collection,
         })
     }
 }
@@ -199,6 +213,10 @@ impl SegmentCollector for AggregationSegmentCollector {
                 self.error = Some(e);
             }
         }
+    }
+
+    fn supports_bitmap_collection(&self) -> bool {
+        self.supports_bitmap_collection
     }
 
     fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {

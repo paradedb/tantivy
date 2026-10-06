@@ -83,6 +83,10 @@ impl SegmentCollector for SegmentCountCollector {
         self.count += docs.len();
     }
 
+    fn supports_bitmap_collection(&self) -> bool {
+        true
+    }
+
     fn collect_bitmap(&mut self, _base: DocId, mask: &crate::DocIdBitmap) {
         self.count += mask.iter().map(|word| word.len() as usize).sum::<usize>();
     }
@@ -106,6 +110,10 @@ mod tests {
         fn collect_block(&mut self, _: &[crate::DocId]) {
             panic!("count enumerated a bitmap");
         }
+        fn supports_bitmap_collection(&self) -> bool {
+            true
+        }
+
         fn collect_bitmap(&mut self, _: crate::DocId, _: &crate::DocIdBitmap) {}
         fn harvest(self) {}
     }
@@ -153,6 +161,12 @@ mod tests {
             (expected, Some(expected))
         );
         let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let term_query = QueryParser::for_index(&index, vec![text]).parse_query("a")?;
+        let term_weight = term_query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let mut ordinary_reader = searcher.segment_reader(0).clone();
+        assert!(term_weight.scorer(&ordinary_reader, 1.0)?.has_fast_bitset());
+        ordinary_reader.bitmap_postings_enabled = false;
+        assert!(!term_weight.scorer(&ordinary_reader, 1.0)?.has_fast_bitset());
         let mut proof = BitmapOnlyCount;
         super::super::default_collect_segment_impl(
             &mut proof,
@@ -196,6 +210,80 @@ mod tests {
             (0..2303).filter(|doc| doc % 7 != 0 && doc % 5 == 0).count() as f64
         );
         assert_eq!(json["multiple"]["value"], (expected * 2) as f64);
+        Ok(())
+    }
+
+    #[test]
+    fn aggregation_bitmap_execution_is_count_only() -> crate::Result<()> {
+        use crate::aggregation::{AggContextParams, AggregationCollector};
+        use crate::query::{AllWeight, Explanation, Scorer, Weight};
+        use crate::schema::{Schema, FAST};
+        use crate::{DocId, Index, Score, SegmentReader};
+
+        struct CheckedWeight(bool);
+        impl Weight for CheckedWeight {
+            fn scorer(
+                &self,
+                reader: &SegmentReader,
+                boost: Score,
+            ) -> crate::Result<Box<dyn Scorer>> {
+                assert_eq!(reader.bitmap_postings_enabled, self.0);
+                AllWeight.scorer(reader, boost)
+            }
+            fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
+                AllWeight.explain(reader, doc)
+            }
+            fn for_each_no_score_batch(
+                &self,
+                reader: &SegmentReader,
+                callback: &mut dyn FnMut(crate::DocSetBatch<'_>),
+            ) -> crate::Result<()> {
+                assert!(self.0, "non-count request entered bitmap execution");
+                assert!(reader.bitmap_postings_enabled);
+                AllWeight.for_each_no_score_batch(reader, callback)
+            }
+        }
+        let mut schema = Schema::builder();
+        let value = schema.add_u64_field("value", FAST);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer = index.writer_for_tests()?;
+        writer.add_document(doc!(value => 7u64))?;
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let reader = searcher.segment_reader(0);
+        for (request, bitmap) in [
+            (serde_json::json!({"a":{"filter":"*"}}), true),
+            (
+                serde_json::json!({"a":{"filter":"*"}, "b":{"filter":"*"}}),
+                true,
+            ),
+            (serde_json::json!({"a":{"sum":{"field":"value"}}}), false),
+            (
+                serde_json::json!({"a":{"value_count":{"field":"value"}}}),
+                false,
+            ),
+            (
+                serde_json::json!({"a":{"filter":"*"}, "b":{"sum":{"field":"value"}}}),
+                false,
+            ),
+            (
+                serde_json::json!({"a":{"filter":"*", "aggs":{"b":{"sum":{"field":"value"}}}}}),
+                false,
+            ),
+            (serde_json::json!({"a":{"terms":{"field":"value"}}}), false),
+        ] {
+            let collector = AggregationCollector::from_aggs(
+                serde_json::from_value(request)?,
+                AggContextParams::default(),
+            );
+            collector.collect_segment(&CheckedWeight(bitmap), 0, reader)??;
+            let mut multi = crate::collector::MultiCollector::new();
+            multi.add_collector(Count);
+            multi.add_collector(collector);
+            multi.collect_segment(&CheckedWeight(bitmap), 0, reader)?;
+        }
+        (Count, Some(Count)).collect_segment(&CheckedWeight(true), 0, reader)?;
+        assert!(reader.bitmap_postings_enabled);
         Ok(())
     }
 

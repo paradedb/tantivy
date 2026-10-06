@@ -269,10 +269,7 @@ fn build_segment_agg_collectors_generic(
     if collectors.len() == 1 {
         return Ok(collectors.pop().unwrap());
     }
-    req.context
-        .limits
-        .add_memory_consumed((collectors.len() * std::mem::size_of::<usize>()) as u64)?;
-    let agg = GenericSegmentAggregationResultsCollector::new(collectors);
+    let agg = GenericSegmentAggregationResultsCollector { aggs: collectors };
     Ok(Box::new(agg))
 }
 

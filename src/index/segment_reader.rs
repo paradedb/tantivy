@@ -37,6 +37,7 @@ use crate::{DocId, Opstamp};
 #[derive(Clone)]
 pub struct SegmentReader {
     index: Index,
+    pub(crate) bitmap_postings_enabled: bool,
     segment_id: SegmentId,
     custom_alive_bitset: Option<AliveBitSet>,
 
@@ -233,6 +234,7 @@ impl SegmentReader {
         custom_bitset: Option<AliveBitSet>,
     ) -> crate::Result<SegmentReader> {
         Ok(SegmentReader {
+            bitmap_postings_enabled: true,
             index: segment.index().clone(),
             segment_id: segment.id(),
             custom_alive_bitset: custom_bitset,

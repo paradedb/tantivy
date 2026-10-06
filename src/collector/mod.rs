@@ -193,6 +193,28 @@ pub(crate) fn default_collect_segment_impl<TSegmentCollector: SegmentCollector>(
     reader: &SegmentReader,
     with_scoring: bool,
 ) -> crate::Result<()> {
+    if !with_scoring && !segment_collector.supports_bitmap_collection() {
+        let mut reader = reader.clone();
+        reader.bitmap_postings_enabled = false;
+        weight.for_each_no_score(&reader, &mut |docs| {
+            if let Some(alive) = reader.alive_bitset() {
+                let mut filtered = [0; crate::COLLECT_BLOCK_BUFFER_LEN];
+                for block in docs.chunks(filtered.len()) {
+                    let mut len = 0;
+                    for &doc in block {
+                        if alive.is_alive(doc) {
+                            filtered[len] = doc;
+                            len += 1;
+                        }
+                    }
+                    segment_collector.collect_block(&filtered[..len]);
+                }
+            } else {
+                segment_collector.collect_block(docs);
+            }
+        })?;
+        return Ok(());
+    }
     match (reader.alive_bitset(), with_scoring) {
         (Some(alive_bitset), true) => {
             weight.for_each(reader, &mut |doc, score| {
@@ -253,6 +275,11 @@ impl<TSegmentCollector: SegmentCollector> SegmentCollector for Option<TSegmentCo
         if let Some(segment_collector) = self {
             segment_collector.collect_block(docs);
         }
+    }
+
+    fn supports_bitmap_collection(&self) -> bool {
+        self.as_ref()
+            .is_none_or(|collector| collector.supports_bitmap_collection())
     }
 
     fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
@@ -338,6 +365,11 @@ pub trait SegmentCollector: 'static {
         }
     }
 
+    /// Opts into bitmap execution for unscored collection.
+    fn supports_bitmap_collection(&self) -> bool {
+        false
+    }
+
     /// Collects unscored membership bits. The default enumerates into `collect_block`.
     fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
         crate::DocSetBatch::Bitmap(base, mask).for_each_doc_block(|docs| self.collect_block(docs));
@@ -410,6 +442,10 @@ where
     fn collect_block(&mut self, docs: &[DocId]) {
         self.0.collect_block(docs);
         self.1.collect_block(docs);
+    }
+
+    fn supports_bitmap_collection(&self) -> bool {
+        self.0.supports_bitmap_collection() && self.1.supports_bitmap_collection()
     }
 
     fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
@@ -493,6 +529,12 @@ where
         self.0.collect_block(docs);
         self.1.collect_block(docs);
         self.2.collect_block(docs);
+    }
+
+    fn supports_bitmap_collection(&self) -> bool {
+        self.0.supports_bitmap_collection()
+            && self.1.supports_bitmap_collection()
+            && self.2.supports_bitmap_collection()
     }
 
     fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
@@ -589,6 +631,13 @@ where
         self.1.collect_block(docs);
         self.2.collect_block(docs);
         self.3.collect_block(docs);
+    }
+
+    fn supports_bitmap_collection(&self) -> bool {
+        self.0.supports_bitmap_collection()
+            && self.1.supports_bitmap_collection()
+            && self.2.supports_bitmap_collection()
+            && self.3.supports_bitmap_collection()
     }
 
     fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
