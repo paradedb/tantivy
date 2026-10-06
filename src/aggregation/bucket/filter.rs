@@ -666,6 +666,27 @@ impl<B: SubAggBuffer> SegmentAggregationCollector for SegmentFilterCollector<B> 
         Ok(())
     }
 
+    fn collect_bitmap(
+        &mut self,
+        parent_bucket_id: BucketId,
+        base: DocId,
+        mask: &crate::DocIdBitmap,
+        agg_data: &mut AggregationsSegmentCtx,
+    ) -> crate::Result<()> {
+        if self.sub_aggregations.is_none() && self.req_data.evaluator.bitset.is_none() {
+            self.parent_buckets[parent_bucket_id as usize].doc_count +=
+                mask.iter().map(|word| u64::from(word.len())).sum::<u64>();
+            return Ok(());
+        }
+        let mut result = Ok(());
+        crate::DocSetBatch::Bitmap(base, mask).for_each_doc_block(|docs| {
+            if result.is_ok() {
+                result = self.collect(parent_bucket_id, docs, agg_data);
+            }
+        });
+        result
+    }
+
     fn flush(&mut self, agg_data: &mut AggregationsSegmentCtx) -> crate::Result<()> {
         if let Some(ref mut sub_aggs) = self.sub_aggregations {
             sub_aggs.flush(agg_data)?;

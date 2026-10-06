@@ -184,6 +184,27 @@ impl Weight for TermWeight {
 
         Ok(())
     }
+
+    fn for_each_no_score_batch(
+        &self,
+        reader: &SegmentReader,
+        callback: &mut dyn FnMut(crate::DocSetBatch<'_>),
+    ) -> crate::Result<()> {
+        match self.specialized_scorer(reader, 1.0)? {
+            TermOrEmptyOrAllScorer::TermScorer(mut term_scorer) => {
+                crate::query::weight::for_each_docset_batch(&mut term_scorer, callback);
+            }
+            TermOrEmptyOrAllScorer::Bitmap(mut scorer) => {
+                crate::query::weight::for_each_docset_batch(&mut scorer, callback);
+            }
+            TermOrEmptyOrAllScorer::Empty => {}
+            TermOrEmptyOrAllScorer::AllMatch(mut all_scorer) => {
+                crate::query::weight::for_each_docset_batch(&mut all_scorer, callback);
+            }
+        };
+
+        Ok(())
+    }
 }
 
 impl TermWeight {

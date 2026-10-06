@@ -324,6 +324,29 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
         Ok(())
     }
 
+    fn collect_bitmap(
+        &mut self,
+        parent_bucket_id: BucketId,
+        base: crate::DocId,
+        mask: &crate::DocIdBitmap,
+        agg_data: &mut AggregationsSegmentCtx,
+    ) -> crate::Result<()> {
+        if matches!(self.collecting_for, StatsType::Count)
+            && matches!(self.accessor.index, columnar::ColumnIndex::Full)
+        {
+            self.buckets[parent_bucket_id as usize].count +=
+                mask.iter().map(|word| u64::from(word.len())).sum::<u64>();
+            return Ok(());
+        }
+        let mut result = Ok(());
+        crate::DocSetBatch::Bitmap(base, mask).for_each_doc_block(|docs| {
+            if result.is_ok() {
+                result = self.collect(parent_bucket_id, docs, agg_data);
+            }
+        });
+        result
+    }
+
     fn prepare_max_bucket(
         &mut self,
         max_bucket: BucketId,

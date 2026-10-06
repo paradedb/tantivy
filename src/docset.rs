@@ -22,6 +22,65 @@ pub const BLOCK_NUM_TINYBITSETS: usize = 16;
 /// Number of doc IDs covered by one block: `BLOCK_NUM_TINYBITSETS * 64 = 1024`.
 pub const BLOCK_WINDOW: u32 = BLOCK_NUM_TINYBITSETS as u32 * 64;
 
+/// Membership bits for a window of [`BLOCK_WINDOW`] consecutive document IDs.
+pub type DocIdBitmap = [TinySet; BLOCK_NUM_TINYBITSETS];
+
+/// Unscored matches, retained as a bitmap when the query can produce one directly.
+#[derive(Clone, Copy)]
+pub enum DocSetBatch<'a> {
+    /// Sorted document IDs.
+    Docs(&'a [DocId]),
+    /// A window's starting document ID and membership bits relative to that start.
+    Bitmap(DocId, &'a DocIdBitmap),
+}
+
+impl DocSetBatch<'_> {
+    /// Enumerates a batch in blocks no larger than [`COLLECT_BLOCK_BUFFER_LEN`].
+    pub fn for_each_doc_block(self, mut callback: impl FnMut(&[DocId])) {
+        match self {
+            Self::Docs(docs) => {
+                for block in docs.chunks(COLLECT_BLOCK_BUFFER_LEN) {
+                    callback(block);
+                }
+            }
+            Self::Bitmap(base, mask) => {
+                let mut buffer = [0; COLLECT_BLOCK_BUFFER_LEN];
+                let mut len = 0;
+                for (i, word) in mask.iter().enumerate() {
+                    for bit in *word {
+                        buffer[len] = base + i as u32 * 64 + bit;
+                        len += 1;
+                        if len == buffer.len() {
+                            callback(&buffer);
+                            len = 0;
+                        }
+                    }
+                }
+                if len > 0 {
+                    callback(&buffer[..len]);
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn count_bitset_blocks<T: DocSet + ?Sized>(
+    docset: &mut T,
+    alive: Option<&AliveBitSet>,
+) -> u32 {
+    let mut count = 0;
+    while docset.doc() < TERMINATED {
+        let base = docset.doc() / BLOCK_WINDOW * BLOCK_WINDOW;
+        let mut mask = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
+        docset.fill_bitset_block(base, &mut mask);
+        if let Some(alive) = alive {
+            alive.intersect_bitmap(base, &mut mask);
+        }
+        count += mask.iter().map(|word| word.len()).sum::<u32>();
+    }
+    count
+}
+
 /// Represents an iterable set of sorted doc ids.
 pub trait DocSet: Send {
     /// Goes to the next element.
@@ -217,6 +276,9 @@ pub trait DocSet: Send {
     /// Returns the number documents matching.
     /// Calling this method consumes the `DocSet`.
     fn count(&mut self, alive_bitset: &AliveBitSet) -> u32 {
+        if self.has_fast_bitset() {
+            return count_bitset_blocks(self, Some(alive_bitset));
+        }
         let mut count = 0u32;
         let mut doc = self.doc();
         while doc != TERMINATED {
@@ -234,6 +296,9 @@ pub trait DocSet: Send {
     /// Of course, the result is an upper bound of the result
     /// given by `count()`.
     fn count_including_deleted(&mut self) -> u32 {
+        if self.has_fast_bitset() {
+            return count_bitset_blocks(self, None);
+        }
         let mut count = 0u32;
         let mut doc = self.doc();
         while doc != TERMINATED {

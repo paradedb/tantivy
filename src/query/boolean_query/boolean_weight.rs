@@ -994,6 +994,46 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         }
         Ok(())
     }
+
+    fn for_each_no_score_batch(
+        &self,
+        reader: &SegmentReader,
+        callback: &mut dyn FnMut(crate::DocSetBatch<'_>),
+    ) -> crate::Result<()> {
+        let scorer = self.complex_scorer(reader, 1.0, DoNothingCombiner::default)?;
+        let num_docs = reader.num_docs();
+
+        match scorer {
+            SpecializedScorer::TermUnion(mut term_scorers) => {
+                if term_scorers.len() == 1 {
+                    let mut term_scorer = term_scorers.pop().unwrap();
+                    crate::query::weight::for_each_docset_batch(&mut term_scorer, callback);
+                } else {
+                    let mut union_scorer =
+                        BufferedUnionScorer::build(term_scorers, &self.score_combiner_fn, num_docs);
+                    crate::query::weight::for_each_docset_batch(&mut union_scorer, callback);
+                }
+            }
+            SpecializedScorer::TermIntersection(term_scorers) => {
+                let boxed_scorers: Vec<Box<dyn Scorer>> = term_scorers
+                    .into_iter()
+                    .map(|term_scorer| Box::new(term_scorer) as Box<dyn Scorer>)
+                    .collect();
+                let mut intersection =
+                    intersect_scorers(boxed_scorers, num_docs, self.scoring_enabled);
+                crate::query::weight::for_each_docset_batch(intersection.as_mut(), callback);
+            }
+            SpecializedScorer::FilteredTermUnion { .. }
+            | SpecializedScorer::FilteredTermIntersection { .. } => {
+                let mut scorer = into_box_scorer(scorer, DoNothingCombiner::default, num_docs);
+                crate::query::weight::for_each_docset_batch(scorer.as_mut(), callback);
+            }
+            SpecializedScorer::Other(mut scorer) => {
+                crate::query::weight::for_each_docset_batch(scorer.as_mut(), callback);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn is_include_occur(occur: Occur) -> bool {

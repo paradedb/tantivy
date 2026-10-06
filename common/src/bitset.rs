@@ -379,6 +379,16 @@ impl ReadOnlyBitSet {
         ReadOnlyBitSet { data, max_value }
     }
 
+    /// Reads one aligned word; words beyond the document space are empty.
+    #[inline]
+    pub fn tinyset(&self, bucket: u32) -> TinySet {
+        self.data
+            .get(bucket as usize * 8..bucket as usize * 8 + 8)
+            .map_or(TinySet::EMPTY, |bytes| {
+                TinySet::deserialize(bytes.try_into().unwrap())
+            })
+    }
+
     /// Number of elements in the bitset.
     #[inline]
     pub fn len(&self) -> usize {

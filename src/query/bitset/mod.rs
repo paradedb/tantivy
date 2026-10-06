@@ -162,7 +162,7 @@ mod tests {
     use common::BitSet;
 
     use super::BitSetDocSet;
-    use crate::docset::{DocSet, BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW, TERMINATED};
+    use crate::docset::{DocSet, TERMINATED};
     use crate::tests::generate_nonunique_unsorted;
     use crate::DocId;
 

@@ -202,11 +202,24 @@ pub(crate) fn default_collect_segment_impl<TSegmentCollector: SegmentCollector>(
             })?;
         }
         (Some(alive_bitset), false) => {
-            weight.for_each_no_score(reader, &mut |docs| {
-                for doc in docs.iter().cloned() {
-                    if alive_bitset.is_alive(doc) {
-                        segment_collector.collect(doc, 0.0);
+            weight.for_each_no_score_batch(reader, &mut |batch| match batch {
+                crate::DocSetBatch::Docs(docs) => {
+                    let mut filtered = [0; crate::COLLECT_BLOCK_BUFFER_LEN];
+                    for block in docs.chunks(filtered.len()) {
+                        let mut len = 0;
+                        for &doc in block {
+                            if alive_bitset.is_alive(doc) {
+                                filtered[len] = doc;
+                                len += 1;
+                            }
+                        }
+                        segment_collector.collect_block(&filtered[..len]);
                     }
+                }
+                crate::DocSetBatch::Bitmap(base, mask) => {
+                    let mut mask = *mask;
+                    alive_bitset.intersect_bitmap(base, &mut mask);
+                    segment_collector.collect_bitmap(base, &mask);
                 }
             })?;
         }
@@ -216,8 +229,11 @@ pub(crate) fn default_collect_segment_impl<TSegmentCollector: SegmentCollector>(
             })?;
         }
         (None, false) => {
-            weight.for_each_no_score(reader, &mut |docs| {
-                segment_collector.collect_block(docs);
+            weight.for_each_no_score_batch(reader, &mut |batch| match batch {
+                crate::DocSetBatch::Docs(docs) => segment_collector.collect_block(docs),
+                crate::DocSetBatch::Bitmap(base, mask) => {
+                    segment_collector.collect_bitmap(base, mask)
+                }
             })?;
         }
     }
@@ -236,6 +252,12 @@ impl<TSegmentCollector: SegmentCollector> SegmentCollector for Option<TSegmentCo
     fn collect_block(&mut self, docs: &[DocId]) {
         if let Some(segment_collector) = self {
             segment_collector.collect_block(docs);
+        }
+    }
+
+    fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
+        if let Some(collector) = self {
+            collector.collect_bitmap(base, mask);
         }
     }
 
@@ -316,6 +338,11 @@ pub trait SegmentCollector: 'static {
         }
     }
 
+    /// Collects unscored membership bits. The default enumerates into `collect_block`.
+    fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
+        crate::DocSetBatch::Bitmap(base, mask).for_each_doc_block(|docs| self.collect_block(docs));
+    }
+
     /// Extract the fruit of the collection from the `SegmentCollector`.
     fn harvest(self) -> Self::Fruit;
 }
@@ -383,6 +410,11 @@ where
     fn collect_block(&mut self, docs: &[DocId]) {
         self.0.collect_block(docs);
         self.1.collect_block(docs);
+    }
+
+    fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
+        self.0.collect_bitmap(base, mask);
+        self.1.collect_bitmap(base, mask);
     }
 
     fn harvest(self) -> <Self as SegmentCollector>::Fruit {
@@ -461,6 +493,12 @@ where
         self.0.collect_block(docs);
         self.1.collect_block(docs);
         self.2.collect_block(docs);
+    }
+
+    fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
+        self.0.collect_bitmap(base, mask);
+        self.1.collect_bitmap(base, mask);
+        self.2.collect_bitmap(base, mask);
     }
 
     fn harvest(self) -> <Self as SegmentCollector>::Fruit {
@@ -551,6 +589,13 @@ where
         self.1.collect_block(docs);
         self.2.collect_block(docs);
         self.3.collect_block(docs);
+    }
+
+    fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
+        self.0.collect_bitmap(base, mask);
+        self.1.collect_bitmap(base, mask);
+        self.2.collect_bitmap(base, mask);
+        self.3.collect_bitmap(base, mask);
     }
 
     fn harvest(self) -> <Self as SegmentCollector>::Fruit {

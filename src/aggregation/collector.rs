@@ -201,6 +201,20 @@ impl SegmentCollector for AggregationSegmentCollector {
         }
     }
 
+    fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
+        if self.error.is_some() {
+            return;
+        }
+        if let Err(error) = self.agg_collector.get_sub_agg_collector().collect_bitmap(
+            0,
+            base,
+            mask,
+            &mut self.aggs_with_accessor,
+        ) {
+            self.error = Some(error);
+        }
+    }
+
     fn harvest(mut self) -> Self::Fruit {
         if let Some(err) = self.error {
             return Err(err);
