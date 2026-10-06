@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::Arc;
 
 use common::{BinarySerializable, HasLen};
 
@@ -30,7 +31,7 @@ pub trait CentroidProducer: Send + Sync + 'static {
     fn centroids(&self, field: Field, options: &VectorOptions) -> crate::Result<IvfCentroids>;
 }
 
-pub(crate) type CentroidIndex = HashMap<Field, RouterIndex>;
+pub(crate) type CentroidIndex = HashMap<Field, Arc<RouterIndex>>;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct FieldMeta {
@@ -159,7 +160,7 @@ pub(crate) fn open_centroid_index(
         }
         routers.insert(
             field,
-            RouterIndex::open(options, count, rows, slot(ROUTER)?)?,
+            Arc::new(RouterIndex::open(options, count, rows, slot(ROUTER)?)?),
         );
     }
     Ok(routers)
@@ -336,7 +337,7 @@ mod tests {
     #[test]
     fn every_vector_field_has_its_own_centroids() -> crate::Result<()> {
         let mut schema = Schema::builder();
-        schema.add_text_field("text", crate::schema::TEXT);
+        let text = schema.add_text_field("text", crate::schema::TEXT);
         let first = schema.add_vector_field("first", VectorOptions::new(2, Metric::L2));
         let second = schema.add_vector_field("second", VectorOptions::new(3, Metric::Dot));
         let producer = Arc::new(TestProducer {
@@ -355,7 +356,252 @@ mod tests {
         assert_eq!(cache.len(), 2);
         assert_eq!(cache[&first].centroid_bytes()?.len(), 8);
         assert_eq!(cache[&second].centroid_bytes()?.len(), 12);
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        for field in [Some(first), Some(second), None] {
+            let mut doc = TantivyDocument::new();
+            if field == Some(first) {
+                doc.add_text(text, "drop");
+            }
+            if let Some(field) = field {
+                doc.add_vector(
+                    field,
+                    if field == first {
+                        &[1.0, 2.0][..]
+                    } else {
+                        &[3.0, 4.0, 5.0][..]
+                    },
+                );
+            }
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        for (present_doc, field) in [first, second].into_iter().enumerate() {
+            let vectors = searcher.segment_readers()[0].vector_index(field)?;
+            assert_eq!(vectors.num_vectors(), 1);
+            assert_eq!(vectors.index().unwrap().cluster_range(0), 0..1);
+            for doc in 0..3 {
+                assert_eq!(
+                    vectors.vector_bytes(doc)?.is_some(),
+                    doc == present_doc as u32
+                );
+            }
+        }
+        writer.delete_term(crate::Term::from_field_text(text, "drop"));
+        writer.commit()?;
+        writer.merge(&index.searchable_segment_ids()?).wait()?;
+        let merged = index.reader()?.searcher();
+        assert_eq!(merged.num_docs(), 2);
+        let empty = merged.segment_readers()[0].vector_index(first)?;
+        assert_eq!(empty.num_vectors(), 0);
+        assert_eq!(empty.index().unwrap().num_clusters(), 1);
+        assert_eq!(empty.index().unwrap().cluster_range(0), 0..0);
+        assert_eq!(
+            merged.segment_readers()[0]
+                .vector_index(second)?
+                .num_vectors(),
+            1
+        );
         assert_eq!(producer.calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn shared_segments_use_stored_centroids_for_assignment_and_encoding() -> crate::Result<()> {
+        use crate::index::SegmentComponent;
+        use crate::query::AllQuery;
+        use crate::vector::header::{read_centroid_header, VectorFileVersion};
+        use crate::vector::ivf::AdaptiveProbeParams;
+        use crate::vector::{
+            residual_norm, TopDocsByVectorSimilarity, VectorQuantizationConfig,
+            VectorQuantizationLayer,
+        };
+
+        const DIM: usize = 64;
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            for kind in [RouterKind::Exact, RouterKind::Rng, RouterKind::Stacked] {
+                for quantized in [false, true] {
+                    let mut fixture = Fixture::new(metric);
+                    let mut schema = Schema::builder();
+                    schema.add_vector_field("embedding", VectorOptions::new(DIM, metric));
+                    fixture.schema = schema.build();
+                    let mut supplied: Vec<_> = (0..256)
+                        .map(|i| {
+                            let mut row = [0.0; DIM];
+                            row[0] = (i % 2) as f32 * 8.0 - 4.0;
+                            row[1] = (i / 2) as f32 * 0.125 - 8.0;
+                            row
+                        })
+                        .collect();
+                    supplied.push([0.0; DIM]);
+                    fixture.replace_centroids(centroids(&supplied));
+                    let config = VectorQuantizationConfig::materialize(
+                        "embedding".into(),
+                        &VectorOptions::new(DIM, metric),
+                        vec![
+                            VectorQuantizationLayer { bits: 1, seed: 7 },
+                            VectorQuantizationLayer { bits: 4, seed: 11 },
+                        ],
+                    )?;
+                    let index = fixture
+                        .builder()
+                        .settings(crate::IndexSettings {
+                            vector_quantization: if quantized { vec![config] } else { Vec::new() },
+                            ..Default::default()
+                        })
+                        .ivf_router(kind)?
+                        .create(fixture.directory.clone())?;
+                    let original = artifact(&index)?;
+                    for batch in 0..3 {
+                        let reopened = Index::open(fixture.directory.clone())?;
+                        let mut writer: IndexWriter =
+                            reopened.writer_with_num_threads(1, 15_000_000)?;
+                        writer.set_merge_policy(Box::new(NoMergePolicy));
+                        for (doc, value) in [[0.0, 0.0], [3.0, 4.0], [-4.0, 3.0], [8.0, -2.0]]
+                            .iter()
+                            .enumerate()
+                        {
+                            let mut document = TantivyDocument::new();
+                            if batch != 2 && doc != 3 {
+                                let mut row = [0.0; DIM];
+                                row[..2].copy_from_slice(value);
+                                document.add_vector(fixture.field, &row);
+                                document.add_vector(fixture.field, &[999.0; DIM]);
+                            }
+                            writer.add_document(document)?;
+                        }
+                        writer.commit()?;
+                    }
+                    let cache = index.cached_centroid_index()?.unwrap();
+                    let shared = &cache[&fixture.field];
+                    let bytes = shared.centroid_bytes()?;
+                    let stored = decode_row::<f32>(&bytes, supplied.len() * DIM)?;
+                    if kind == RouterKind::Stacked {
+                        let mut original_rows = supplied
+                            .iter()
+                            .map(|row| encode_vector(row, DIM).unwrap())
+                            .collect::<Vec<_>>();
+                        for row in &mut original_rows {
+                            maybe_normalize_bytes(&VectorOptions::new(DIM, metric), row);
+                        }
+                        assert_ne!(bytes.as_slice(), original_rows.concat());
+                    }
+                    for merged in [false, true] {
+                        if merged {
+                            let mut writer: IndexWriter =
+                                index.writer_with_num_threads(1, 15_000_000)?;
+                            writer.merge(&index.searchable_segment_ids()?).wait()?;
+                        }
+                        let searcher = index.reader()?.searcher();
+                        assert_eq!(searcher.segment_readers().len(), if merged { 1 } else { 3 });
+                        let mut total = 0;
+                        for segment in searcher.segment_readers() {
+                            let vector = segment.vector_index(fixture.field)?;
+                            let ivf = vector.index().unwrap();
+                            assert_eq!(ivf.router(), kind);
+                            assert_eq!(ivf.num_clusters(), supplied.len());
+                            assert_eq!(ivf.centroid_bytes()?, bytes);
+                            assert_eq!(vector.quantization().is_some(), quantized);
+                            let sidecar =
+                                segment.open_read(SegmentComponent::Custom("centroids".into()))?;
+                            let (version, body) = read_centroid_header(&sidecar)?;
+                            assert_eq!(version, VectorFileVersion::V5);
+                            let composite = CompositeFile::open(&body)?;
+                            let mut slots = composite.field_indices().collect::<Vec<_>>();
+                            slots.sort();
+                            assert_eq!(slots, [0, 1, 3].map(|slot| (fixture.field, slot)));
+                            for cluster in 0..ivf.num_clusters() {
+                                let centroid = &stored[cluster * DIM..(cluster + 1) * DIM];
+                                let mut bound = if metric == Metric::Cosine
+                                    && centroid.iter().all(|&v| v == 0.0)
+                                {
+                                    f32::INFINITY
+                                } else {
+                                    0.0
+                                };
+                                for row in ivf.cluster_range(cluster) {
+                                    total += 1;
+                                    let doc = vector.doc_id_at(row)?;
+                                    let row_bytes = vector.vector_bytes_for_row(row)?;
+                                    assert_eq!(vector.vector_bytes(doc)?.unwrap(), row_bytes);
+                                    let values = decode_row::<f32>(&row_bytes, DIM)?;
+                                    assert!(values.iter().all(|v| v.abs() <= 4.0));
+                                    let score = metric.similarity(&values, centroid);
+                                    assert!(stored
+                                        .chunks_exact(DIM)
+                                        .all(|c| metric.similarity(&values, c) <= score));
+                                    if metric != Metric::L2 && values.iter().all(|&v| v == 0.0) {
+                                        assert_eq!(cluster, 0);
+                                    }
+                                    bound = bound.max(residual_norm::<f32>(&row_bytes, centroid));
+                                    if let Some(quant) = vector.quantization() {
+                                        let ctx = quant.index_ctx();
+                                        let prepared =
+                                            cascade::prepare_centroid(centroid, &ctx.specs);
+                                        let mut workspace = cascade::BatchEncodeWorkspace::new();
+                                        let mut input = values.clone();
+                                        let expected =
+                                            cascade::encode_batch_in_place_with_workspace(
+                                                &mut input,
+                                                1,
+                                                &prepared,
+                                                &ctx.specs,
+                                                &ctx.grids,
+                                                &mut workspace,
+                                                metric == Metric::L2,
+                                            );
+                                        assert_eq!(
+                                            quant.residual_norm(row)?,
+                                            expected.residual_norms_squared[0]
+                                        );
+                                        for (layer, encoded) in
+                                            quant.layers().iter().zip(&expected.layers)
+                                        {
+                                            assert_eq!(
+                                                layer.code_bytes(row)?.as_slice(),
+                                                encoded.codes
+                                            );
+                                            assert_eq!(layer.scale(row)?, encoded.scales[0]);
+                                        }
+                                    }
+                                }
+                                assert_eq!(ivf.bounds().ball_r(cluster), bound);
+                            }
+                            for doc in 0..segment.max_doc() {
+                                if doc % 4 == 3 || vector.num_vectors() == 0 {
+                                    assert!(vector.vector_bytes(doc)?.is_none());
+                                }
+                            }
+                        }
+                        assert_eq!(total, 6);
+                        assert!(Arc::strong_count(shared) > 1);
+                        if kind == RouterKind::Exact {
+                            let mut query = vec![0.0; DIM];
+                            query[..2].copy_from_slice(&[3.1, 4.2]);
+                            let expected = crate::vector::tests::ground_truth::top_k(
+                                &index,
+                                fixture.field,
+                                metric,
+                                &query,
+                                6,
+                            )?;
+                            let result = searcher.search(
+                                &AllQuery,
+                                &TopDocsByVectorSimilarity::new(fixture.field, query, 6)
+                                    .with_adaptive_params(AdaptiveProbeParams {
+                                        max_probe_fraction: 1.0,
+                                        min_probe_clusters: supplied.len(),
+                                        ..Default::default()
+                                    }),
+                            )?;
+                            assert_eq!(result.results, expected);
+                        }
+                    }
+                    assert_eq!(artifact(&index)?, original);
+                    assert_eq!(fixture.producer.calls.load(Ordering::SeqCst), 1);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -524,7 +770,7 @@ mod tests {
                 .info()
                 .unwrap()
                 .format,
-            VectorStorageFormat::Flat
+            VectorStorageFormat::Ivf
         );
         writer.delete_all_documents()?;
         writer.rollback()?;
@@ -575,6 +821,15 @@ mod tests {
             let reopened = Index::open(fixture.directory)?;
             assert_eq!(reopened.reader()?.searcher().num_docs(), 2);
             assert!(reopened.cached_centroid_index()?.is_some());
+            let vectors =
+                reopened.reader()?.searcher().segment_readers()[0].vector_index(fixture.field)?;
+            for doc in 0..2 {
+                let expected = if remap { 2 - doc } else { doc + 1 } as f32;
+                assert_eq!(
+                    decode_row::<f32>(&vectors.vector_bytes(doc)?.unwrap(), 2)?,
+                    [expected, 0.0]
+                );
+            }
             assert_eq!(fixture.producer.calls.load(Ordering::SeqCst), 1);
         }
         Ok(())
@@ -611,6 +866,88 @@ mod tests {
             index.validate_checksum()?,
             std::collections::HashSet::from([path.to_path_buf()])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn shared_segments_validate_artifact_identity_and_posting_slots() -> crate::Result<()> {
+        use crate::directory::FileSlice;
+        use crate::index::SegmentComponent;
+        use crate::vector::header::read_centroid_header;
+        use crate::vector::ivf::SharedSegmentMeta;
+
+        let fixture = Fixture::new(Metric::L2);
+        let index = fixture.create(RouterKind::Exact)?;
+        {
+            let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(fixture.field, &[1.0, 2.0]);
+            writer.add_document(doc)?;
+            writer.commit()?;
+        }
+        let path = index.searchable_segments()?[0]
+            .relative_path(SegmentComponent::Custom("centroids".into()));
+        let original = index.directory().open_read(&path)?.read_bytes()?;
+        let (_, body) = read_centroid_header(&FileSlice::from(original.to_vec()))?;
+        let composite = CompositeFile::open(&body)?;
+        let slots = [0, 1, 3].map(|slot| {
+            (
+                slot,
+                composite
+                    .open_read_with_idx(fixture.field, slot)
+                    .unwrap()
+                    .read_bytes()
+                    .unwrap(),
+            )
+        });
+        let foreign = Fixture::new(Metric::L2).create(RouterKind::Exact)?;
+        let foreign_meta = serde_json::to_vec(&SharedSegmentMeta {
+            centroid_index: foreign.centroid_index_meta().unwrap().clone(),
+            num_docs: 1,
+        })?;
+        for (name, changed, data) in [
+            (
+                "different artifact with the same centroid count",
+                0,
+                Some(foreign_meta),
+            ),
+            ("missing metadata", 0, None),
+            ("missing offsets", 1, None),
+            ("missing bounds", 3, None),
+            ("router must be shared", 2, Some(vec![2])),
+            ("short offsets", 1, Some(vec![0; 8])),
+            ("short bounds", 3, Some(vec![0])),
+        ] {
+            let mut bytes = original[..4].to_vec();
+            let mut writer = CompositeWrite::wrap(&mut bytes);
+            for slot in 0..4 {
+                let payload = if slot == changed {
+                    data.as_deref()
+                } else {
+                    slots
+                        .iter()
+                        .find(|(s, _)| *s == slot)
+                        .map(|(_, bytes)| bytes.as_slice())
+                };
+                if let Some(payload) = payload {
+                    writer
+                        .for_field_with_idx(fixture.field, slot)
+                        .write_all(payload)?;
+                }
+            }
+            writer.close()?;
+            fixture.directory.delete(&path).unwrap();
+            let mut writer = index.directory().open_write(&path)?;
+            writer.write_all(&bytes)?;
+            writer.terminate()?;
+            let reopened = Index::open(fixture.directory.clone())?;
+            assert!(
+                reopened.reader()?.searcher().segment_readers()[0]
+                    .vector_index(fixture.field)
+                    .is_err(),
+                "{name}"
+            );
+        }
         Ok(())
     }
 

@@ -313,13 +313,9 @@ pub struct IndexSettings {
     #[serde(default = "default_codec_types")]
     #[serde(skip_serializing_if = "is_default_codec_types")]
     pub codec_types: Vec<columnar::CodecType>,
-    /// Doc-count boundary for choosing the vector-storage format on merge.
-    ///
-    /// A merge whose target segment has strictly fewer than this many
-    /// docs writes `.flatvec`; at or above this many docs writes
-    /// `.ivfvec` (clustered). Exactly one format is written per merge —
-    /// `FlatVecPlugin` and `IvfVecPlugin` short-circuit symmetrically
-    /// off this threshold.
+    /// Doc-count boundary for choosing flat or clustered storage on merge
+    /// when the index has no shared centroids. Indexes with shared centroids
+    /// write clustered segments regardless of this threshold.
     #[serde(default = "default_vector_clustering_threshold")]
     #[serde(skip_serializing_if = "is_default_vector_clustering_threshold")]
     pub vector_clustering_threshold: usize,

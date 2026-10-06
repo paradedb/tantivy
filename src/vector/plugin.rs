@@ -1,22 +1,17 @@
 //! Unified vector storage plugin.
 //!
 //! [`VectorPlugin`] owns per-segment vector storage end-to-end:
-//! - During indexing, accumulates raw vector bytes per doc and writes a single `.vec` file at
-//!   segment finalize (always flat — clustering is a merge-time transform).
-//! - During merge, picks one of two output formats by target doc count: below
+//! - With shared centroids, flushes and merges assign vectors to the persisted centroid order and
+//!   write clustered `.vec` blocks plus segment-specific `.centroids` metadata.
+//! - Without shared centroids, indexing writes flat `.vec` files. Merges select by doc count: below
 //!   [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold)
 //!   it copies vectors forward into a flat `.vec`; at or above the threshold it writes an IVF
 //!   `.vec` (with `IdMap::DocLocations`) plus a `.centroids` file.
 //! - During reads, [`VectorIndexReader`](super::VectorIndexReader) opens the field's `.vec` slots
 //!   (and the `.centroids` sidecar when present) via
 //!   [`SegmentReader::vector_index`](crate::SegmentReader::vector_index).
-//!
-//! Owning both flat and IVF extensions on one plugin keeps the "exactly one
-//! format per segment" invariant right by construction: the dispatch is one
-//! `if` inside one `merge()` method, not a cross-plugin coordination problem.
-
 use super::flat::{merge_flat, FlatVecWriter};
-use super::ivf::{merge_ivf, CENTROIDS_EXT};
+use super::ivf::{merge_ivf, merge_shared, IvfVecWriter, CENTROIDS_EXT};
 use super::VEC_EXT;
 use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
 
@@ -28,12 +23,18 @@ impl SegmentPlugin for VectorPlugin {
     }
 
     fn create_writer(&self, ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
-        // Per-doc indexing only ever produces flatvec — clustering
-        // exists exclusively as a merge-time transformation.
-        Ok(Box::new(FlatVecWriter::for_schema(&ctx.segment.schema())))
+        let schema = ctx.segment.schema();
+        if ctx.segment.index().centroid_index_meta().is_some() {
+            Ok(Box::new(IvfVecWriter::for_schema(&schema)))
+        } else {
+            Ok(Box::new(FlatVecWriter::for_schema(&schema)))
+        }
     }
 
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {
+        if ctx.target_segment.index().centroid_index_meta().is_some() {
+            return merge_shared(&ctx);
+        }
         // Target cardinality selects uniform or clustered storage.
         let target_docs: u32 = ctx.readers.iter().map(|r| r.num_docs()).sum();
         let threshold = ctx.settings.vector_clustering_threshold();

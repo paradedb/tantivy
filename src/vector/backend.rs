@@ -2183,7 +2183,7 @@ impl<T: VectorElement> VectorBackend<T> {
         K: SegmentSortKeyComputer,
         CTail: Comparator<K::SegmentSortKey>,
     {
-        if top_n == 0 || segment_reader.max_doc() == 0 || index.num_clusters() == 0 {
+        if top_n == 0 || segment_reader.max_doc() == 0 || index.num_docs() == 0 {
             return Ok(Vec::new());
         }
         let init_start = Instant::now();
@@ -2784,7 +2784,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let alive = segment_reader.alive_bitset();
 
         let num_centroids = index.num_clusters();
-        if num_centroids == 0 {
+        if num_centroids == 0 || index.num_docs() == 0 {
             drop(init_stage);
             stats.scan_init_ns = stats.scan_init_ns.saturating_add(
                 (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),

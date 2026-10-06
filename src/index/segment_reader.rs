@@ -190,6 +190,10 @@ impl SegmentReader {
         self.vector_field(field)?.search_reader()
     }
 
+    pub(crate) fn index(&self) -> &Index {
+        &self.index
+    }
+
     /// Returns stored field metadata without reading IdMap, routing payloads or block geometry.
     /// A segment without vector data returns `None`.
     pub fn vector_metadata(&self, field: Field) -> crate::Result<Option<Arc<VectorColMetadata>>> {

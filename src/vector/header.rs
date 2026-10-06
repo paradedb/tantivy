@@ -20,6 +20,8 @@ pub enum VectorFileVersion {
     V3 = 3,
     /// Block-major vector columns with per-field metadata.
     V4 = 4,
+    /// `.centroids` references the shared index-level centroids and router.
+    V5 = 5,
 }
 
 impl BinarySerializable for VectorFileVersion {
@@ -33,6 +35,7 @@ impl BinarySerializable for VectorFileVersion {
             2 => Ok(Self::V2),
             3 => Ok(Self::V3),
             4 => Ok(Self::V4),
+            5 => Ok(Self::V5),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported vector file format version: {other}"),
@@ -45,7 +48,7 @@ impl BinarySerializable for VectorFileVersion {
 pub(crate) const VECTOR_FILE_FORMAT_VERSION: u32 = VectorFileVersion::V4 as u32;
 /// Version written to `.vec` files.
 pub(crate) const CURRENT_VECTOR: VectorFileVersion = VectorFileVersion::V4;
-/// Version written to `.centroids` files.
+/// Version written to segment-local `.centroids` files.
 pub(crate) const CURRENT_CENTROID: VectorFileVersion = VectorFileVersion::V3;
 
 /// `.centroids` composite slot indices.

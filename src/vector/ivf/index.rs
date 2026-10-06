@@ -20,11 +20,13 @@
 //!     the stored centroid (the merge documents the metric-uniform fold).
 //! ```
 //!
-//! Persisted IVF routers use the V3 layout. Earlier bare-router and
-//! router-less layouts are not supported.
+//! V5 segments instead store a centroid-artifact reference and document count in slot 0,
+//! omit slot 2, and use the index's shared router. See `vector/FORMAT.md`.
+//! Earlier bare-router and router-less layouts are not supported.
 use std::io::{self, Write};
 use std::mem;
 use std::ops::Range;
+use std::sync::Arc;
 
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
@@ -44,7 +46,7 @@ use crate::vector::{BoundKind, BoundStore};
 /// at a time as routing visits them. Everything row-scale (the rows and
 /// id-map) lives on [`VectorIndexReader`](crate::vector::VectorIndexReader).
 pub struct IvfIndex {
-    routing: RouterIndex,
+    routing: Arc<RouterIndex>,
     /// Distinct documents with a vector in this field.
     num_docs: usize,
     /// Slot `[1]`: the `u64[N+1]` prefix sum, pinned.
@@ -168,6 +170,24 @@ impl IvfIndex {
             .into());
         }
 
+        let router = RouterKind::open(version, router_slice, centroids_slice.clone(), options)?;
+        let routing = Arc::new(RouterIndex {
+            num_centroids,
+            centroids_slice,
+            metric: options.metric(),
+            router,
+        });
+        Self::open_postings(options, routing, num_docs, offsets_slice, bounds_slice)
+    }
+
+    pub(crate) fn open_postings(
+        options: &VectorOptions,
+        routing: Arc<RouterIndex>,
+        num_docs: usize,
+        offsets_slice: FileSlice,
+        bounds_slice: FileSlice,
+    ) -> crate::Result<Self> {
+        let num_centroids = routing.num_clusters();
         let cluster_offsets = offsets_slice.read_bytes()?;
         let expected_offsets = (num_centroids + 1)
             .checked_mul(mem::size_of::<u64>())
@@ -181,8 +201,6 @@ impl IvfIndex {
             )
             .into());
         }
-
-        let router = RouterKind::open(version, router_slice, centroids_slice.clone(), options)?;
 
         let bytes = bounds_slice.read_bytes()?;
         let Some((&kind_code, payload)) = bytes.as_slice().split_first() else {
@@ -221,12 +239,7 @@ impl IvfIndex {
         }
 
         let index = IvfIndex {
-            routing: RouterIndex {
-                num_centroids,
-                centroids_slice,
-                metric: options.metric(),
-                router,
-            },
+            routing,
             num_docs,
             cluster_offsets,
             bound_kind,

@@ -10,6 +10,7 @@ mod params;
 mod partition;
 mod plugin;
 mod training;
+mod writer;
 
 /// The IVF cluster-routing file. Written per field, only for IVF segments.
 pub(crate) const CENTROIDS_EXT: &str = "centroids";
@@ -24,6 +25,7 @@ pub use graph::{
     Workspace,
 };
 pub use index::IvfIndex;
+pub(crate) use index::RouterIndex;
 pub use ivf::{
     AddLevelError, ClusterId, InMemoryStackedIvf, InMemoryStore, IvfConfig,
     IvfIndex as MultiLevelIvf, IvfIndexBuilder, IvfLevelClusterer, LazyStackedIvf, LazyStore,
@@ -36,3 +38,4 @@ pub use training::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfTrainingBatch,
     IvfTrainingVectors, IvfVectorBatch, IvfVectors,
 };
+pub(crate) use writer::{merge_shared, IvfVecWriter, SharedSegmentMeta};

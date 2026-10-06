@@ -266,7 +266,7 @@ impl IndexBuilder {
 
     /// Supplies immutable index-level centroids at creation. An existing index
     /// keeps its stored centroids; the producer is not called when reopening.
-    /// Segment assignment and search still use the per-segment clusterer and router.
+    /// Segments assign against these centroids without per-segment training.
     #[must_use]
     pub fn centroid_producer(mut self, producer: Arc<dyn CentroidProducer>) -> Self {
         self.centroid_producer = Some(producer);
@@ -772,6 +772,10 @@ impl Index {
         let index = Index::open_from_metas(directory, &metas, inventory);
         index.cached_centroid_index()?;
         Ok(index)
+    }
+
+    pub(crate) fn centroid_index_meta(&self) -> Option<&CentroidIndexMeta> {
+        self.centroid_index_meta.as_ref()
     }
 
     pub(crate) fn cached_centroid_index(&self) -> crate::Result<Option<Arc<CentroidIndex>>> {

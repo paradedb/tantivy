@@ -28,14 +28,34 @@ collection, and included in checksum validation. Existing metadata without
 `centroid_index` remains valid. A producer cannot install or replace centroids
 through `open_or_create` on an existing index.
 
-This artifact is currently independent of segment assignment and search. The
-per-segment V4/V3 formats and execution paths below are unchanged.
+Indexes with this artifact assign every flushed or merged vector to its most
+similar stored centroid, breaking ties by the lowest centroid ID. Assignment
+uses an exact scan and does not call the per-segment clusterer. The clustering
+threshold applies only to indexes without shared centroids. Merges currently
+reassign surviving rows; preserving memberships is a subsequent step.
+
+These segments use the existing V4 `.vec` block format and a V5 `.centroids`
+sidecar with only the following slots per vector field:
+
+| Index | Contents |
+|---|---|
+| 0 | JSON: `centroid_index` (the artifact descriptor), `num_docs` (u32) |
+| 1 | Posting offsets: u64[N+1], including empty clusters |
+| 3 | Bound-kind byte followed by N cluster bounds |
+
+The descriptor must match the owning index's descriptor. The shared artifact
+supplies N, centroid rows, and the router; none of those rows or routing payloads
+are copied into the segment. Bounds and quantized residuals use those exact
+stored centroid coordinates. Queries still execute independently per segment,
+using shared router state with separate per-query workspaces.
+Indexes without an artifact keep the flat/V3 clustered paths below.
 
 ## File headers and entries
 
 `.vec` uses a little-endian u32 version header, with current and supported version
-**4**. Other versions fail with “rebuild required.” The `.centroids` grammar and
-its version **3** describe routing, posting offsets, and cluster bounds.
+**4**. Other versions fail with “rebuild required.” The `.centroids` version
+**3** stores segment-local routing, offsets, and bounds; version **5** uses the
+shared centroid artifact as described above.
 `VectorQuantizationConfig.format_version = 3` identifies the independent index
 settings grammar; settings specify the target for future builds.
 

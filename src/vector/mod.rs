@@ -6,7 +6,8 @@
 //! [`VectorArena`], and the distance kernels live here.
 //! The on-disk formats live in submodules: [`flat`] for the dense full-precision layout and
 //! [`ivf`] for the partitioned/clustered accelerator. Both are owned by a single
-//! [`VectorPlugin`] which picks between them per merge based on
+//! [`VectorPlugin`]. Indexes with shared centroids write clustered storage; other indexes
+//! select their merge layout using
 //! [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold).
 //! Top-N vector queries dispatch over them via [`VectorBackend`].
 
@@ -22,6 +23,7 @@ pub use element::MAX_ELEM_BYTES;
 pub const ENTRY_ALIGN: usize = 8;
 const _: () = assert!(MAX_ELEM_BYTES <= ENTRY_ALIGN);
 mod bounds;
+mod buffer;
 mod collector;
 mod distance;
 pub(crate) mod header;

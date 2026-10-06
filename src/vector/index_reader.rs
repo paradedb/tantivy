@@ -1475,13 +1475,17 @@ pub(crate) struct VectorFieldReader {
     search: OnceLock<crate::Result<Arc<VectorIndexReader>>>,
 }
 
-type CentroidSlices = (
-    super::header::VectorFileVersion,
-    FileSlice,
-    FileSlice,
-    FileSlice,
-    FileSlice,
-);
+#[derive(Clone)]
+enum CentroidSlices {
+    Local(
+        super::header::VectorFileVersion,
+        FileSlice,
+        FileSlice,
+        FileSlice,
+        FileSlice,
+    ),
+    Shared(Arc<super::ivf::RouterIndex>, usize, FileSlice, FileSlice),
+}
 
 struct VectorSource {
     metadata: BlockMetadata,
@@ -1574,11 +1578,54 @@ impl VectorFieldReader {
         };
         let (_, body) = read_vector_header(&vec_file)?;
 
-        let centroid_slots =
-            match segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string())) {
-                Ok(file) => {
-                    let (centroids_version, body) = read_centroid_header(&file)?;
-                    let composite = CompositeFile::open(&body)?;
+        let centroid_slots = match segment_reader
+            .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))
+        {
+            Ok(file) => {
+                let (centroids_version, body) = read_centroid_header(&file)?;
+                let composite = CompositeFile::open(&body)?;
+                if centroids_version == super::header::VectorFileVersion::V5 {
+                    if composite
+                        .field_indices()
+                        .any(|(_, slot)| ![0, 1, 3].contains(&slot))
+                    {
+                        return Err(
+                            DataCorruption::comment_only("invalid shared centroid slots").into(),
+                        );
+                    }
+                    let slot = |slot: CentroidSlot| {
+                        composite
+                            .open_read_with_idx(field, slot.index())
+                            .ok_or_else(|| {
+                                DataCorruption::comment_only("missing shared centroid slot")
+                            })
+                    };
+                    let meta: super::ivf::SharedSegmentMeta =
+                        serde_json::from_slice(&slot(CentroidSlot::Centroids)?.read_bytes()?)
+                            .map_err(|error| DataCorruption::comment_only(error.to_string()))?;
+                    if Some(&meta.centroid_index) != segment_reader.index().centroid_index_meta() {
+                        return Err(DataCorruption::comment_only(
+                            "segment centroid index does not match its index",
+                        )
+                        .into());
+                    }
+                    let routers =
+                        segment_reader
+                            .index()
+                            .cached_centroid_index()?
+                            .ok_or_else(|| {
+                                DataCorruption::comment_only("missing shared centroid index")
+                            })?;
+                    let router = routers.get(&field).ok_or_else(|| {
+                        DataCorruption::comment_only("missing shared centroid field")
+                    })?;
+                    Some(CentroidSlices::Shared(
+                        Arc::clone(router),
+                        meta.num_docs as usize,
+                        slot(CentroidSlot::Offsets)?,
+                        slot(CentroidSlot::Bounds)?,
+                    ))
+                } else {
                     match (
                         composite.open_read_with_idx(field, CentroidSlot::Centroids.index()),
                         composite.open_read_with_idx(field, CentroidSlot::Offsets.index()),
@@ -1586,7 +1633,13 @@ impl VectorFieldReader {
                         composite.open_read_with_idx(field, CentroidSlot::Bounds.index()),
                     ) {
                         (Some(centroids), Some(offsets), Some(router), Some(bounds)) => {
-                            Some((centroids_version, centroids, offsets, router, bounds))
+                            Some(CentroidSlices::Local(
+                                centroids_version,
+                                centroids,
+                                offsets,
+                                router,
+                                bounds,
+                            ))
                         }
                         (Some(_), Some(_), None, _) => {
                             return Err(TantivyError::InternalError(format!(
@@ -1603,9 +1656,10 @@ impl VectorFieldReader {
                         _ => None,
                     }
                 }
-                Err(OpenReadError::FileDoesNotExist(_)) => None,
-                Err(err) => return Err(err.into()),
-            };
+            }
+            Err(OpenReadError::FileDoesNotExist(_)) => None,
+            Err(err) => return Err(err.into()),
+        };
 
         let vec_composite = CompositeFile::open(&body)?;
         validate_vector_entries(&vec_composite, field)?;
@@ -1652,18 +1706,14 @@ impl VectorIndexReader {
             source: Some((source.composite.clone(), source.field, source.max_doc)),
             value: OnceLock::new(),
         };
-        let index = if let Some((version, centroids, offsets, router_slot, bounds)) = centroid_slots
-        {
-            Some(IvfIndex::open(
-                version,
-                &options,
-                centroids,
-                offsets,
-                router_slot,
-                bounds,
-            )?)
-        } else {
-            None
+        let index = match centroid_slots {
+            Some(CentroidSlices::Local(version, centroids, offsets, router, bounds)) => Some(
+                IvfIndex::open(version, &options, centroids, offsets, router, bounds)?,
+            ),
+            Some(CentroidSlices::Shared(router, num_docs, offsets, bounds)) => Some(
+                IvfIndex::open_postings(&options, router, num_docs, offsets, bounds)?,
+            ),
+            None => None,
         };
         let num_rows = match &index {
             Some(index) => index.num_rows(),
