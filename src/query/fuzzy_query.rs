@@ -89,6 +89,23 @@ pub struct FuzzyTermQuery {
 }
 
 impl FuzzyTermQuery {
+    /// The query term.
+    pub fn term(&self) -> &Term {
+        &self.term
+    }
+    /// Maximum edit distance.
+    pub fn distance(&self) -> u8 {
+        self.distance
+    }
+    /// Whether transpositions count as one edit.
+    pub fn transposition_cost_one(&self) -> bool {
+        self.transposition_cost_one
+    }
+    /// Whether the term is a prefix.
+    pub fn prefix(&self) -> bool {
+        self.prefix
+    }
+
     /// Creates a new Fuzzy Query
     pub fn new(term: Term, distance: u8, transposition_cost_one: bool) -> FuzzyTermQuery {
         FuzzyTermQuery {

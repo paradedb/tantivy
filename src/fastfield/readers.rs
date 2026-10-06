@@ -30,7 +30,8 @@ impl FastFieldReaders {
         Ok(FastFieldReaders { columnar, schema })
     }
 
-    fn resolve_field(&self, column_name: &str) -> crate::Result<Option<String>> {
+    /// Resolves a schema field or escaped JSON path to its columnar name.
+    pub fn resolve_field(&self, column_name: &str) -> crate::Result<Option<String>> {
         let default_field_opt: Option<Field> = if cfg!(feature = "quickwit") {
             self.schema.get_field("_dynamic").ok()
         } else {

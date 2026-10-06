@@ -50,6 +50,10 @@ impl<Q: fmt::Debug> fmt::Debug for BoostQuery<Q> {
 }
 
 impl<Q: Query + Clone> Query for BoostQuery<Q> {
+    fn matching_query(&self) -> Option<&dyn Query> {
+        Some(&self.query)
+    }
+
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let weight_without_boost = self.query.weight(enable_scoring)?;
         let boosted_weight = if enable_scoring.is_scoring_enabled() {

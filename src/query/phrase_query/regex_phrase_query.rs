@@ -37,6 +37,15 @@ pub fn wildcard_query_to_regex_str(term: &str) -> String {
 }
 
 impl RegexPhraseQuery {
+    /// Allowed positional distance.
+    pub fn slop(&self) -> u32 {
+        self.slop
+    }
+    /// Maximum number of regex expansions.
+    pub fn max_expansions(&self) -> u32 {
+        self.max_expansions
+    }
+
     /// Creates a new `RegexPhraseQuery` given a list of terms.
     ///
     /// There must be at least two terms, and all terms
