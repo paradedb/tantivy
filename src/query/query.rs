@@ -174,12 +174,6 @@ impl<'a> EnableScoring<'a> {
 /// [`Scorer`]: crate::query::Scorer
 /// [`SegmentReader`]: crate::SegmentReader
 pub trait Query: QueryClone + Send + Sync + downcast_rs::Downcast + fmt::Debug {
-    /// Estimates matching documents and traversal work from metadata, without running the query.
-    /// `None` lets the caller choose its fallback. Counts may include deleted documents.
-    fn estimate_docs(&self, _reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
-        Ok(None)
-    }
-
     /// For a wrapper that changes only scores, the child with the same matching documents.
     fn matching_query(&self) -> Option<&dyn Query> {
         None
@@ -253,10 +247,6 @@ impl Query for Box<dyn Query> {
         Some(self.as_ref())
     }
 
-    fn estimate_docs(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
-        self.as_ref().estimate_docs(reader)
-    }
-
     fn weight(&self, enabled_scoring: EnableScoring) -> crate::Result<Box<dyn Weight>> {
         self.as_ref().weight(enabled_scoring)
     }
@@ -327,41 +317,16 @@ mod tests {
     }
 
     #[test]
-    fn estimate_hook_defaults_to_none_and_delegates_through_boxes() -> crate::Result<()> {
-        use crate::query::Weight;
-        use crate::SegmentReader;
-        #[derive(Clone, Debug)]
-        struct Estimated;
-        impl Query for Estimated {
-            fn weight(&self, _: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
-                panic!("estimation must not build a weight")
-            }
-            fn estimate_docs(&self, _: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
-                Ok(Some((3, 7)))
-            }
-        }
-        let mut schema = crate::schema::Schema::builder();
-        let field = schema.add_u64_field("id", crate::schema::INDEXED);
-        let index = crate::Index::create_in_ram(schema.build());
-        let mut writer = index.writer_with_num_threads::<crate::TantivyDocument>(1, 15_000_000)?;
-        writer.add_document(crate::doc!(field => 1u64))?;
-        writer.commit()?;
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-        let segment = searcher.segment_reader(0);
-        assert_eq!(crate::query::AllQuery.estimate_docs(segment)?, None);
-        let query: Box<dyn Query> = Box::new(Box::new(Estimated) as Box<dyn Query>);
-        assert_eq!(query.estimate_docs(segment)?, Some((3, 7)));
-        let wrapped = crate::query::ConstScoreQuery::new(
-            crate::query::BoostQuery::new(crate::query::ConstScoreQuery::new(Estimated, 1.0), 2.0),
-            3.0,
-        );
-        let mut child: &dyn Query = &wrapped;
+    fn matching_query_unwraps_boxes_and_scoring_wrappers() {
+        use crate::query::{AllQuery, BoostQuery, ConstScoreQuery};
+        let query: Box<dyn Query> = Box::new(Box::new(AllQuery) as Box<dyn Query>);
+        let query =
+            ConstScoreQuery::new(BoostQuery::new(ConstScoreQuery::new(query, 1.0), 2.0), 3.0);
+        let mut child: &dyn Query = &query;
         while let Some(inner) = child.matching_query() {
             child = inner;
         }
-        assert_eq!(child.estimate_docs(segment)?, Some((3, 7)));
-        Ok(())
+        assert!(child.is::<AllQuery>());
     }
 
     #[test]
