@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use common::file_slice::FileSlice;
 use common::{BinarySerializable, HasLen, OwnedBytes};
 use fastdivide::DividerU64;
-use tantivy_bitpacker::{BitPacker, BitUnpacker, compute_num_bits};
+use tantivy_bitpacker::{compute_num_bits, BitPacker, BitUnpacker};
 
 use crate::column_values::u64_based::{ColumnCodec, ColumnCodecEstimator, ColumnStats};
 use crate::{ColumnValues, RowId};
@@ -56,7 +56,11 @@ const fn div_ceil(n: u64, q: NonZeroU64) -> u64 {
     // copied from unstable rust standard library.
     let d = n / q.get();
     let r = n % q.get();
-    if r > 0 { d + 1 } else { d }
+    if r > 0 {
+        d + 1
+    } else {
+        d
+    }
 }
 
 // The bitpacked codec applies a linear transformation `f` over data that are bitpacked.
@@ -98,6 +102,41 @@ impl ColumnValues for BitpackedReader {
     #[inline]
     fn num_vals(&self) -> RowId {
         self.stats.num_rows
+    }
+
+    fn get_bitmap_for_value_range(
+        &self,
+        range: RangeInclusive<u64>,
+        rows: Range<u32>,
+        bitmap: &mut [u64],
+    ) {
+        bitmap.fill(0);
+        let end = rows.end.min(self.num_vals());
+        if rows.start >= end
+            || range.is_empty()
+            || *range.end() < self.min_value()
+            || *range.start() > self.max_value()
+        {
+            return;
+        }
+        assert!((end - rows.start) as usize <= bitmap.len() * 64);
+        let range = transform_range_before_linear_transformation(&self.stats, range).unwrap();
+        let data_range = self
+            .bit_unpacker
+            .block_oblivious_range(rows.start..end, self.data.len());
+        let offset = data_range.start;
+        let data = self
+            .data
+            .slice(data_range)
+            .read_bytes()
+            .expect("Failed to read column values.");
+        self.bit_unpacker.get_bitmap_for_value_range_from_subset(
+            range,
+            rows.start..end,
+            offset,
+            &data,
+            bitmap,
+        );
     }
 
     fn get_row_ids_for_value_range(

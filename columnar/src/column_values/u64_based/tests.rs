@@ -498,3 +498,43 @@ pub fn test_fastfield2() {
     assert_eq!(test_fastfield.get_val(1), 200);
     assert_eq!(test_fastfield.get_val(2), 300);
 }
+
+#[test]
+fn bitmap_ranges_preserve_signed_mapping_gcd_and_tail() {
+    for values in [
+        vec![-7i64; 2051],
+        (0..2051).map(|i| (i * 7919 % 10000) * 10 - 50000).collect(),
+    ] {
+        for codec in [CodecType::Bitpacked, CodecType::BlockwiseLinear] {
+            let encoded: Vec<u64> = values
+                .iter()
+                .map(|&v| crate::MonotonicallyMappableToU64::to_u64(v))
+                .collect();
+            let column = serialize_and_load_u64_based_column_values::<i64>(&&encoded[..], &[codec]);
+            for range in [
+                -100000..=-90000,
+                -7..=-7,
+                -1000..=17000,
+                i64::MIN..=i64::MAX,
+            ] {
+                for start in [0u32, 1, 63, 1024, 2000, 2051] {
+                    let mut mask = [u64::MAX; 16];
+                    column.get_bitmap_for_value_range(
+                        range.clone(),
+                        start..start + 1024,
+                        &mut mask,
+                    );
+                    for offset in 0..1024 {
+                        let expected = values
+                            .get((start + offset) as usize)
+                            .is_some_and(|v| range.contains(v));
+                        assert_eq!(
+                            (mask[offset as usize / 64] >> (offset % 64)) & 1 != 0,
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
