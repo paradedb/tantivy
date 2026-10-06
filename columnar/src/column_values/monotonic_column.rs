@@ -2,8 +2,8 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::{Range, RangeInclusive};
 
-use crate::ColumnValues;
 use crate::column_values::monotonic_mapping::StrictlyMonotonicFn;
+use crate::ColumnValues;
 
 struct MonotonicMappingColumn<C, T, Input> {
     from_column: C,
@@ -78,6 +78,20 @@ where
         )
     }
 
+    fn get_bitmap_for_value_range(
+        &self,
+        range: RangeInclusive<Output>,
+        rows: Range<u32>,
+        bitmap: &mut [u64],
+    ) {
+        self.from_column.get_bitmap_for_value_range(
+            self.monotonic_mapping.inverse(range.start().clone())
+                ..=self.monotonic_mapping.inverse(range.end().clone()),
+            rows,
+            bitmap,
+        )
+    }
+
     fn get_row_ids_for_value_range(
         &self,
         range: RangeInclusive<Output>,
@@ -99,10 +113,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::column_values::VecColumn;
     use crate::column_values::monotonic_mapping::{
         StrictlyMonotonicMappingInverter, StrictlyMonotonicMappingToInternal,
     };
+    use crate::column_values::VecColumn;
 
     #[test]
     fn test_monotonic_mapping_iter() {

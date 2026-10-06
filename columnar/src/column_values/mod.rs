@@ -26,13 +26,13 @@ mod monotonic_column;
 
 pub(crate) use merge::MergedColumnValues;
 pub use stats::ColumnStats;
-pub use u64_based::{
-    ALL_U64_CODEC_TYPES, CodecType, load_u64_based_column_values,
-    serialize_and_load_u64_based_column_values, serialize_u64_based_column_values,
-};
 pub use u128_based::{
-    CompactHit, CompactSpaceU64Accessor, open_u128_as_compact_u64, open_u128_mapped,
-    serialize_column_values_u128,
+    open_u128_as_compact_u64, open_u128_mapped, serialize_column_values_u128, CompactHit,
+    CompactSpaceU64Accessor,
+};
+pub use u64_based::{
+    load_u64_based_column_values, serialize_and_load_u64_based_column_values,
+    serialize_u64_based_column_values, CodecType, ALL_U64_CODEC_TYPES,
 };
 pub use vec_column::VecColumn;
 
@@ -144,6 +144,26 @@ pub trait ColumnValues<T: PartialOrd = u64>: Send + Sync + DowncastSync {
         }
     }
 
+    /// Writes range matches as bits relative to `row_id_range.start`, clearing `bitmap` first.
+    /// The output must have room for the requested row range; rows past the column are zero.
+    fn get_bitmap_for_value_range(
+        &self,
+        value_range: RangeInclusive<T>,
+        row_id_range: Range<RowId>,
+        bitmap: &mut [u64],
+    ) {
+        bitmap.fill(0);
+        let start = row_id_range.start;
+        let end = row_id_range.end.min(self.num_vals());
+        assert!(end.saturating_sub(start) as usize <= bitmap.len() * 64);
+        for row in start..end {
+            if value_range.contains(&self.get_val(row)) {
+                let offset = (row - start) as usize;
+                bitmap[offset / 64] |= 1u64 << (offset % 64);
+            }
+        }
+    }
+
     /// Returns a lower bound for this column of values.
     ///
     /// All values are guaranteed to be higher than `.min_value()`
@@ -234,6 +254,16 @@ impl<T: Copy + PartialOrd + Debug + 'static> ColumnValues<T> for Arc<dyn ColumnV
     }
 
     #[inline(always)]
+    fn get_bitmap_for_value_range(
+        &self,
+        range: RangeInclusive<T>,
+        rows: Range<RowId>,
+        bitmap: &mut [u64],
+    ) {
+        self.as_ref()
+            .get_bitmap_for_value_range(range, rows, bitmap)
+    }
+
     fn get_row_ids_for_value_range(
         &self,
         range: RangeInclusive<T>,
