@@ -49,7 +49,7 @@ impl BufferedFileSlice {
     }
 
     /// Reads a byte without cloning the retained buffer on a cache hit.
-    #[inline]
+    #[inline(always)]
     pub fn read_byte(&self, offset: u64) -> io::Result<u8> {
         let range = self.buffer_range.borrow();
         if range.contains(&offset) {
