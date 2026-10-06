@@ -234,8 +234,7 @@ pub trait QueryClone {
 }
 
 impl<T> QueryClone for T
-where
-    T: 'static + Query + Clone,
+where T: 'static + Query + Clone
 {
     fn box_clone(&self) -> Box<dyn Query> {
         // If T is Box<dyn Query>, wrapping self.clone() in Box::new would double-box
@@ -329,7 +328,8 @@ mod tests {
 
     #[test]
     fn estimate_hook_defaults_to_none_and_delegates_through_boxes() -> crate::Result<()> {
-        use crate::{query::Weight, SegmentReader};
+        use crate::query::Weight;
+        use crate::SegmentReader;
         #[derive(Clone, Debug)]
         struct Estimated;
         impl Query for Estimated {
