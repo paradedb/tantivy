@@ -239,6 +239,143 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> DocSet for RangeDocSe
     }
 }
 
+pub(crate) struct BitmapRangeDocSet {
+    column: Column<u64>,
+    range: RangeInclusive<u64>,
+    mask: crate::DocIdBitmap,
+    base: DocId,
+    end: DocId,
+    doc: DocId,
+}
+
+impl BitmapRangeDocSet {
+    pub(crate) fn new(range: RangeInclusive<u64>, column: Column<u64>) -> Self {
+        let mut result = Self {
+            column,
+            range,
+            mask: [common::TinySet::EMPTY; crate::BLOCK_NUM_TINYBITSETS],
+            base: 0,
+            end: 0,
+            doc: TERMINATED,
+        };
+        if !result.range.is_empty()
+            && *result.range.start() <= result.column.max_value()
+            && *result.range.end() >= result.column.min_value()
+        {
+            result.refill(0, DEFAULT_FETCH_HORIZON);
+        }
+        result
+    }
+
+    fn position(&mut self, target: DocId) -> bool {
+        for (i, word) in self.mask.iter_mut().enumerate() {
+            let base = self.base.saturating_add(i as u32 * 64);
+            if target >= base.saturating_add(64) {
+                *word = common::TinySet::EMPTY;
+            } else if target > base {
+                *word = word.intersect(common::TinySet::range_greater_or_equal(target - base));
+            }
+            if let Some(bit) = word.into_iter().next() {
+                self.doc = base + bit;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn refill(&mut self, mut target: DocId, width: u32) -> DocId {
+        while target < self.column.num_docs() {
+            self.base = target;
+            self.end = target.saturating_add(width).min(self.column.num_docs());
+            let mut words = [0u64; crate::BLOCK_NUM_TINYBITSETS];
+            self.column.values.get_bitmap_for_value_range(
+                self.range.clone(),
+                self.base..self.end,
+                &mut words,
+            );
+            self.mask = words.map(|word| common::TinySet::deserialize(word.to_le_bytes()));
+            if self.position(target) {
+                return self.doc;
+            }
+            target = self.end;
+        }
+        self.doc = TERMINATED;
+        self.doc
+    }
+}
+
+impl DocSet for BitmapRangeDocSet {
+    fn advance(&mut self) -> DocId {
+        self.seek(self.doc.saturating_add(1))
+    }
+    fn doc(&self) -> DocId {
+        self.doc
+    }
+    fn seek(&mut self, target: DocId) -> DocId {
+        if target <= self.doc {
+            return self.doc;
+        }
+        if target < self.end && self.position(target) {
+            return self.doc;
+        }
+        self.refill(target.max(self.end), crate::BLOCK_WINDOW)
+    }
+    fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
+        if target >= self.column.num_docs() {
+            self.doc = TERMINATED;
+            return SeekDangerResult::SeekLowerBound(TERMINATED);
+        }
+        if target < self.doc {
+            return SeekDangerResult::SeekLowerBound(self.doc);
+        }
+        self.doc = target;
+        self.end = 0;
+        if self.range.contains(&self.column.values.get_val(target)) {
+            SeekDangerResult::Found
+        } else {
+            SeekDangerResult::SeekLowerBound(target + 1)
+        }
+    }
+    fn size_hint(&self) -> u32 {
+        self.column.num_docs() / 10
+    }
+    fn cost(&self) -> u64 {
+        (self.column.num_docs() as f64 * 0.8) as u64
+    }
+    fn has_fast_bitset(&self) -> bool {
+        true
+    }
+    fn fill_bitset_block(&mut self, base: DocId, mask: &mut crate::DocIdBitmap) -> DocId {
+        let horizon = base
+            .saturating_add(crate::BLOCK_WINDOW)
+            .min(self.column.num_docs());
+        let start = base.max(self.doc);
+        if start >= horizon {
+            return self.doc;
+        }
+        if self.base == base && self.end >= horizon {
+            crate::docset::union_bitset_blocks(mask, &self.mask);
+        } else {
+            let mut words = [0u64; crate::BLOCK_NUM_TINYBITSETS];
+            self.column.values.get_bitmap_for_value_range(
+                self.range.clone(),
+                base..horizon,
+                &mut words,
+            );
+            for (i, (out, bits)) in mask.iter_mut().zip(words).enumerate() {
+                let word_base = base + i as u32 * 64;
+                let keep = if start >= word_base.saturating_add(64) {
+                    common::TinySet::EMPTY
+                } else {
+                    common::TinySet::range_greater_or_equal(start.saturating_sub(word_base))
+                };
+                *out = out.union(common::TinySet::deserialize(bits.to_le_bytes()).intersect(keep));
+            }
+        }
+        self.seek(horizon)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::{Bound, RangeInclusive};
@@ -251,6 +388,99 @@ mod tests {
     use crate::docset::{SeekDangerResult, TERMINATED};
     use crate::query::RangeQuery;
     use crate::{schema, DocSet, Index, IndexBuilder, TantivyDocument, Term};
+
+    #[test]
+    fn bitmap_ranges_match_doc_ids_across_cursor_operations() {
+        let column = build_u64_column(4099, |i| vec![(i as u64 * 7919) % 10000]);
+        for range in [0..=9999, 100..=4900, 0..=0, 20000..=30000] {
+            for start in [0, 1, 63, 64, 65, 1000, 1023, 1024, 4098] {
+                let mut ordinary = RangeDocSet::new(range.clone(), column.clone());
+                let mut bitmap = super::BitmapRangeDocSet::new(range.clone(), column.clone());
+                if ordinary.doc() < start {
+                    ordinary.seek(start);
+                }
+                assert_eq!(ordinary.doc(), bitmap.seek(start));
+                for base in (start..4200).step_by(1024) {
+                    let mut expected = [common::TinySet::EMPTY; crate::BLOCK_NUM_TINYBITSETS];
+                    expected[0].insert_mut(7);
+                    let mut actual = expected;
+                    let next = ordinary.fill_bitset_block(base, &mut expected);
+                    assert_eq!(bitmap.fill_bitset_block(base, &mut actual), next);
+                    assert_eq!(
+                        actual, expected,
+                        "range {range:?}, start {start}, base {base}"
+                    );
+                    if next == TERMINATED {
+                        break;
+                    }
+                    assert_eq!(bitmap.advance(), ordinary.advance());
+                }
+            }
+            let mut bitmap = super::BitmapRangeDocSet::new(range.clone(), column.clone());
+            for target in [0, 17, 128, 1023, 1024, 2000, 4098] {
+                let hit = matches!(bitmap.seek_danger(target), SeekDangerResult::Found);
+                assert_eq!(hit, range.contains(&column.values.get_val(target)));
+                if hit {
+                    assert_eq!(bitmap.doc(), target);
+                }
+            }
+            assert_eq!(bitmap.seek(TERMINATED), TERMINATED);
+        }
+    }
+
+    #[test]
+    fn bitmap_ranges_combine_with_terms_and_deletions() -> crate::Result<()> {
+        use crate::query::{EnableScoring, QueryParser};
+        let mut schema = schema::Schema::builder();
+        let id = schema.add_u64_field("id", schema::INDEXED);
+        let a = schema.add_u64_field("a", schema::FAST);
+        let b = schema.add_u64_field("b", schema::FAST);
+        let text = schema.add_text_field(
+            "text",
+            schema::TEXT.set_indexing_options(
+                schema::TEXT
+                    .get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_bitmap_postings(true),
+            ),
+        );
+        let index = Index::create_in_ram(schema.build());
+        let mut writer = index.writer_for_tests()?;
+        for i in 0..4099u64 {
+            writer.add_document(crate::doc!(id => i, a => i * 7919 % 10000, b => i * 3571 % 10000,
+                text => if i % 997 == 0 { "dense rare" } else if i % 2 == 0 { "dense" } else { "other" }))?;
+        }
+        writer.commit()?;
+        for i in (0..4099).step_by(17) {
+            writer.delete_term(Term::from_field_u64(id, i));
+        }
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let parser = QueryParser::for_index(&index, vec![text]);
+        for upper in [9, 99, 999, 4999, 8999] {
+            for op in ["AND", "OR"] {
+                for left in [
+                    "dense".to_string(),
+                    "rare".to_string(),
+                    format!("b:[0 TO {upper}]"),
+                ] {
+                    let query = parser.parse_query(&format!("{left} {op} a:[0 TO {upper}]"))?;
+                    let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+                    for reader in searcher.segment_readers() {
+                        let mut ordinary = reader.clone();
+                        ordinary.bitmap_postings_enabled = false;
+                        assert_eq!(
+                            weight.count(reader)?,
+                            weight.count(&ordinary)?,
+                            "{left} {op} a:[0 TO {upper}]"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// Builds a single-segment index where doc `i` carries `values_for_doc(i)` in a u64 fast
     /// field, then returns its column so we can drive a `RangeDocSet` directly.
