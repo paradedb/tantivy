@@ -1,5 +1,6 @@
 mod all_query;
 mod automaton_weight;
+mod bitmap_combination;
 mod bitmap_docset;
 mod bitset;
 mod bm25;
