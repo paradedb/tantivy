@@ -8,7 +8,6 @@
 - [Index Sorting](./index_sorting.md)
 - [Innerworkings](./innerworkings.md)
   - [Inverted index](./inverted_index.md)
-  - [Optional posting bitmaps](./bitmap_postings.md)
 - [Best practise](./inverted_index.md)
 
 [Frequently Asked Questions](./faq.md)
