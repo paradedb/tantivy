@@ -366,6 +366,153 @@ impl Bm25Weight {
         self.weight * (term_freq / (term_freq + norm))
     }
 
+    /// Computes BM25 scores for a block of `(freqs, norms)` pairs, storing the results in `scores`,
+    /// and returns the maximum score across the evaluated elements.
+    #[inline]
+    pub fn compute_block_scores(
+        &self,
+        freqs: &[u32],
+        norms: &[u32],
+        scores: &mut [Score],
+    ) -> Score {
+        let len = freqs.len().min(norms.len()).min(scores.len());
+        if len == 0 {
+            return 0.0;
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            self.compute_block_scores_neon(&freqs[..len], &norms[..len], &mut scores[..len])
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            self.compute_block_scores_sse2(&freqs[..len], &norms[..len], &mut scores[..len])
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            self.compute_block_scores_scalar(&freqs[..len], &norms[..len], &mut scores[..len])
+        }
+    }
+
+    #[inline]
+    #[cfg_attr(any(target_arch = "aarch64", target_arch = "x86_64"), allow(dead_code))]
+    pub(crate) fn compute_block_scores_scalar(
+        &self,
+        freqs: &[u32],
+        norms: &[u32],
+        scores: &mut [Score],
+    ) -> Score {
+        let len = freqs.len().min(norms.len()).min(scores.len());
+        let mut max_score = 0.0f32;
+        for i in 0..len {
+            let s = self.score_fieldnorm(norms[i], freqs[i]);
+            scores[i] = s;
+            max_score = max_score.max(s);
+        }
+        max_score
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    unsafe fn compute_block_scores_neon(
+        &self,
+        freqs: &[u32],
+        norms: &[u32],
+        scores: &mut [Score],
+    ) -> Score {
+        use core::arch::aarch64::*;
+
+        let len = freqs.len().min(norms.len()).min(scores.len());
+        let v_norm_const = vdupq_n_f32(self.norm_const);
+        let v_norm_factor = vdupq_n_f32(self.norm_factor);
+        let v_weight = vdupq_n_f32(self.weight);
+        let mut v_max = vdupq_n_f32(0.0f32);
+
+        let chunks = len / 4;
+        let freqs_ptr = freqs.as_ptr();
+        let norms_ptr = norms.as_ptr();
+        let scores_ptr = scores.as_mut_ptr();
+
+        for c in 0..chunks {
+            let i = c * 4;
+            let tf_u32 = vld1q_u32(freqs_ptr.add(i));
+            let norm_u32 = vld1q_u32(norms_ptr.add(i));
+            let tf = vcvtq_f32_u32(tf_u32);
+            let norm_f = vcvtq_f32_u32(norm_u32);
+            let norm = vaddq_f32(v_norm_const, vmulq_f32(v_norm_factor, norm_f));
+            let denom = vaddq_f32(tf, norm);
+            let ratio = vdivq_f32(tf, denom);
+            let s = vmulq_f32(v_weight, ratio);
+            vst1q_f32(scores_ptr.add(i), s);
+            v_max = vmaxq_f32(v_max, s);
+        }
+
+        let mut max_score = if chunks > 0 {
+            vmaxvq_f32(v_max)
+        } else {
+            0.0f32
+        };
+
+        for i in (chunks * 4)..len {
+            let s = self.score_fieldnorm(norms[i], freqs[i]);
+            scores[i] = s;
+            max_score = max_score.max(s);
+        }
+
+        max_score
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    unsafe fn compute_block_scores_sse2(
+        &self,
+        freqs: &[u32],
+        norms: &[u32],
+        scores: &mut [Score],
+    ) -> Score {
+        use core::arch::x86_64::*;
+
+        let len = freqs.len().min(norms.len()).min(scores.len());
+        let v_norm_const = _mm_set1_ps(self.norm_const);
+        let v_norm_factor = _mm_set1_ps(self.norm_factor);
+        let v_weight = _mm_set1_ps(self.weight);
+        let mut v_max = _mm_set1_ps(0.0f32);
+
+        let chunks = len / 4;
+        let freqs_ptr = freqs.as_ptr();
+        let norms_ptr = norms.as_ptr();
+        let scores_ptr = scores.as_mut_ptr();
+
+        for c in 0..chunks {
+            let i = c * 4;
+            let tf_raw = _mm_loadu_si128(freqs_ptr.add(i) as *const __m128i);
+            let norm_raw = _mm_loadu_si128(norms_ptr.add(i) as *const __m128i);
+            let tf = _mm_cvtepi32_ps(tf_raw);
+            let norm_f = _mm_cvtepi32_ps(norm_raw);
+            let norm = _mm_add_ps(v_norm_const, _mm_mul_ps(v_norm_factor, norm_f));
+            let denom = _mm_add_ps(tf, norm);
+            let ratio = _mm_div_ps(tf, denom);
+            let s = _mm_mul_ps(v_weight, ratio);
+            _mm_storeu_ps(scores_ptr.add(i), s);
+            v_max = _mm_max_ps(v_max, s);
+        }
+
+        let mut max_score = if chunks > 0 {
+            let mut max_arr = [0.0f32; 4];
+            _mm_storeu_ps(max_arr.as_mut_ptr(), v_max);
+            max_arr[0].max(max_arr[1]).max(max_arr[2]).max(max_arr[3])
+        } else {
+            0.0f32
+        };
+
+        for i in (chunks * 4)..len {
+            let s = self.score_fieldnorm(norms[i], freqs[i]);
+            scores[i] = s;
+            max_score = max_score.max(s);
+        }
+
+        max_score
+    }
+
     pub fn max_score(&self) -> Score {
         self.score(255u8, 2_013_265_944)
     }
@@ -494,5 +641,40 @@ mod tests {
     fn test_bm25_params_rejects_b_out_of_range() {
         use crate::index::Bm25Params;
         Bm25Params::new(1.2, 1.5);
+    }
+
+    #[test]
+    fn test_compute_block_scores() {
+        use super::Bm25Weight;
+        use crate::index::Bm25Params;
+
+        let weight = Bm25Weight::for_one_term(10, 1000, 45.0, Bm25Params::default());
+
+        // Test lengths from 0 to 128
+        let freqs: Vec<u32> = (0..128).map(|i| (i % 7) + 1).collect();
+        let norms: Vec<u32> = (0..128).map(|i| ((i * 13) % 150) + 1).collect();
+
+        for len in [0, 1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 31, 32, 63, 64, 127, 128] {
+            let mut scores = vec![0.0f32; len];
+            let mut scalar_scores = vec![0.0f32; len];
+
+            let max_score = weight.compute_block_scores(&freqs[..len], &norms[..len], &mut scores);
+            let scalar_max = weight.compute_block_scores_scalar(
+                &freqs[..len],
+                &norms[..len],
+                &mut scalar_scores,
+            );
+
+            assert!((max_score - scalar_max).abs() < 1e-6);
+
+            let mut expected_max = 0.0f32;
+            for i in 0..len {
+                let expected = weight.score_fieldnorm(norms[i], freqs[i]);
+                assert!((scores[i] - expected).abs() < 1e-6);
+                assert!((scalar_scores[i] - expected).abs() < 1e-6);
+                expected_max = expected_max.max(expected);
+            }
+            assert!((max_score - expected_max).abs() < 1e-6);
+        }
     }
 }

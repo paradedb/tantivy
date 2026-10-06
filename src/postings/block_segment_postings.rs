@@ -17,6 +17,12 @@ pub(crate) fn max_score<I: Iterator<Item = Score>>(mut it: I) -> Option<Score> {
     it.next().map(|first| it.fold(first, Score::max))
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScoringLoadedFlags {
+    pub(crate) freq: bool,
+    pub(crate) fieldnorm: bool,
+}
+
 /// `BlockSegmentPostings` is a cursor iterating over blocks
 /// of documents.
 ///
@@ -30,7 +36,7 @@ pub struct BlockSegmentPostings {
     block_loaded: bool,
     freq_decoder: RefCell<BlockDecoder>,
     fieldnorm_decoder: RefCell<BlockDecoder>,
-    scoring_loaded: Cell<bool>,
+    scoring_loaded: Cell<ScoringLoadedFlags>,
     freq_reading_option: FreqReadingOption,
     block_max_score_cache: Option<Score>,
     doc_freq: u32,
@@ -243,7 +249,7 @@ impl BlockSegmentPostings {
             block_loaded: false,
             freq_decoder: RefCell::new(BlockDecoder::with_val(1)),
             fieldnorm_decoder: RefCell::new(BlockDecoder::with_val(0)),
-            scoring_loaded: Cell::new(false),
+            scoring_loaded: Cell::new(ScoringLoadedFlags::default()),
             freq_reading_option,
             block_max_score_cache: None,
             doc_freq,
@@ -312,12 +318,12 @@ impl BlockSegmentPostings {
         self.term_norms = source
             .zip(norm_offset)
             .map(|(source, offset)| super::term_norms::TermNormReader::new(source, offset));
-        self.scoring_loaded.set(false);
+        self.scoring_loaded.set(ScoringLoadedFlags::default());
     }
 
     pub(crate) fn disable_term_norms(&mut self) {
         self.term_norms = None;
-        self.scoring_loaded.set(false);
+        self.scoring_loaded.set(ScoringLoadedFlags::default());
     }
 
     #[inline]
@@ -331,15 +337,67 @@ impl BlockSegmentPostings {
     }
 
     #[inline]
-    pub(crate) fn load_scoring_block(&self) {
-        if !self.scoring_loaded.get() {
-            self.load_scoring_block_cold();
+    pub(crate) fn load_freq_block(&self) {
+        if !self.scoring_loaded.get().freq {
+            self.load_freq_block_cold();
         }
     }
 
     #[cold]
     #[inline(never)]
-    fn load_scoring_block_cold(&self) {
+    fn load_freq_block_cold(&self) {
+        if let Some(norms) = self.term_norms.as_ref() {
+            let offset = self.skip_reader.pnorm_byte_offset();
+            match self.skip_reader.block_info() {
+                BlockInfo::BitPacked { tf_num_bits, .. } => {
+                    norms
+                        .decode_freq_packed_block(
+                            offset,
+                            tf_num_bits,
+                            &mut self.freq_decoder.borrow_mut(),
+                        )
+                        .expect("failed to decode freq packed block");
+                }
+                BlockInfo::VInt { num_docs } => {
+                    norms
+                        .decode_freq_vint_block(
+                            offset,
+                            num_docs as usize,
+                            self.freq_reading_option != FreqReadingOption::NoFreq,
+                            &mut self.freq_decoder.borrow_mut(),
+                        )
+                        .expect("failed to decode freq vint block");
+                }
+            }
+        } else {
+            match self.skip_reader.block_info() {
+                BlockInfo::BitPacked { .. } => {
+                    self.freq_decoder
+                        .borrow_mut()
+                        .fill_val(1, COMPRESSION_BLOCK_SIZE);
+                }
+                BlockInfo::VInt { num_docs } => {
+                    self.freq_decoder
+                        .borrow_mut()
+                        .fill_val(1, num_docs as usize);
+                }
+            }
+        }
+        let mut flags = self.scoring_loaded.get();
+        flags.freq = true;
+        self.scoring_loaded.set(flags);
+    }
+
+    #[inline]
+    pub(crate) fn load_fieldnorm_block(&self) {
+        if !self.scoring_loaded.get().fieldnorm {
+            self.load_fieldnorm_block_cold();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn load_fieldnorm_block_cold(&self) {
         if let Some(norms) = self.term_norms.as_ref() {
             let offset = self.skip_reader.pnorm_byte_offset();
             match self.skip_reader.block_info() {
@@ -349,56 +407,138 @@ impl BlockSegmentPostings {
                     ..
                 } => {
                     norms
-                        .decode_scoring_packed_block(
+                        .decode_fieldnorm_packed_block(
                             offset,
                             super::term_norms::BlockBitwidths {
                                 tf: tf_num_bits,
                                 pnorm: pnorm_num_bits,
                             },
-                            &mut self.freq_decoder.borrow_mut(),
                             &mut self.fieldnorm_decoder.borrow_mut(),
                         )
-                        .expect("failed to decode scoring packed block");
+                        .expect("failed to decode fieldnorm packed block");
                 }
                 BlockInfo::VInt { num_docs } => {
                     norms
-                        .decode_scoring_vint_block(
+                        .decode_fieldnorm_vint_block(
                             offset,
                             num_docs as usize,
                             self.freq_reading_option != FreqReadingOption::NoFreq,
-                            &mut self.freq_decoder.borrow_mut(),
                             &mut self.fieldnorm_decoder.borrow_mut(),
                         )
-                        .expect("failed to decode scoring vint block");
+                        .expect("failed to decode fieldnorm vint block");
                 }
             }
         } else {
             match self.skip_reader.block_info() {
                 BlockInfo::BitPacked { .. } => {
-                    self.freq_decoder
-                        .borrow_mut()
-                        .fill_val(1, COMPRESSION_BLOCK_SIZE);
                     self.fieldnorm_decoder
                         .borrow_mut()
                         .fill_val(0, COMPRESSION_BLOCK_SIZE);
                 }
                 BlockInfo::VInt { num_docs } => {
-                    self.freq_decoder
-                        .borrow_mut()
-                        .fill_val(1, num_docs as usize);
                     self.fieldnorm_decoder
                         .borrow_mut()
                         .fill_val(0, num_docs as usize);
                 }
             }
         }
-        self.scoring_loaded.set(true);
+        let mut flags = self.scoring_loaded.get();
+        flags.fieldnorm = true;
+        self.scoring_loaded.set(flags);
+    }
+
+    #[inline]
+    pub(crate) fn load_scoring_block(&self) {
+        let flags = self.scoring_loaded.get();
+        if !flags.freq || !flags.fieldnorm {
+            self.load_scoring_block_cold(flags);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn load_scoring_block_cold(&self, flags: ScoringLoadedFlags) {
+        if !flags.freq && !flags.fieldnorm {
+            if let Some(norms) = self.term_norms.as_ref() {
+                let offset = self.skip_reader.pnorm_byte_offset();
+                match self.skip_reader.block_info() {
+                    BlockInfo::BitPacked {
+                        tf_num_bits,
+                        pnorm_num_bits,
+                        ..
+                    } => {
+                        norms
+                            .decode_scoring_packed_block(
+                                offset,
+                                super::term_norms::BlockBitwidths {
+                                    tf: tf_num_bits,
+                                    pnorm: pnorm_num_bits,
+                                },
+                                &mut self.freq_decoder.borrow_mut(),
+                                &mut self.fieldnorm_decoder.borrow_mut(),
+                            )
+                            .expect("failed to decode scoring packed block");
+                    }
+                    BlockInfo::VInt { num_docs } => {
+                        norms
+                            .decode_scoring_vint_block(
+                                offset,
+                                num_docs as usize,
+                                self.freq_reading_option != FreqReadingOption::NoFreq,
+                                &mut self.freq_decoder.borrow_mut(),
+                                &mut self.fieldnorm_decoder.borrow_mut(),
+                            )
+                            .expect("failed to decode scoring vint block");
+                    }
+                }
+            } else {
+                match self.skip_reader.block_info() {
+                    BlockInfo::BitPacked { .. } => {
+                        self.freq_decoder
+                            .borrow_mut()
+                            .fill_val(1, COMPRESSION_BLOCK_SIZE);
+                        self.fieldnorm_decoder
+                            .borrow_mut()
+                            .fill_val(0, COMPRESSION_BLOCK_SIZE);
+                    }
+                    BlockInfo::VInt { num_docs } => {
+                        self.freq_decoder
+                            .borrow_mut()
+                            .fill_val(1, num_docs as usize);
+                        self.fieldnorm_decoder
+                            .borrow_mut()
+                            .fill_val(0, num_docs as usize);
+                    }
+                }
+            }
+            self.scoring_loaded.set(ScoringLoadedFlags {
+                freq: true,
+                fieldnorm: true,
+            });
+        } else if !flags.freq {
+            self.load_freq_block_cold();
+        } else if !flags.fieldnorm {
+            self.load_fieldnorm_block_cold();
+        }
     }
 
     #[cfg(test)]
     #[inline]
     pub(crate) fn is_scoring_loaded(&self) -> bool {
-        self.scoring_loaded.get()
+        let flags = self.scoring_loaded.get();
+        flags.freq && flags.fieldnorm
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn is_freq_loaded(&self) -> bool {
+        self.scoring_loaded.get().freq
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn is_fieldnorm_loaded(&self) -> bool {
+        self.scoring_loaded.get().fieldnorm
     }
 
     #[inline]
@@ -423,7 +563,7 @@ impl BlockSegmentPostings {
     #[inline]
     pub(crate) fn freq_decoder(&self) -> Ref<'_, BlockDecoder> {
         if self.has_pnorms() {
-            self.load_scoring_block();
+            self.load_freq_block();
         }
         self.freq_decoder.borrow()
     }
@@ -431,7 +571,7 @@ impl BlockSegmentPostings {
     #[inline]
     pub(crate) fn fieldnorm_at(&self, offset: usize, fallback: &FieldNormReader) -> u32 {
         if self.term_norms.is_some() {
-            self.load_scoring_block();
+            self.load_fieldnorm_block();
             self.fieldnorm_decoder.borrow().output(offset)
         } else {
             fallback.fieldnorm(self.doc(offset))
@@ -441,7 +581,7 @@ impl BlockSegmentPostings {
     #[inline]
     pub(crate) fn fieldnorm_id_at(&self, offset: usize, fallback: &FieldNormReader) -> u8 {
         if self.term_norms.is_some() {
-            self.load_scoring_block();
+            self.load_fieldnorm_block();
             FieldNormReader::fieldnorm_to_id(self.fieldnorm_decoder.borrow().output(offset))
         } else {
             fallback.fieldnorm_id(self.doc(offset))
@@ -451,7 +591,7 @@ impl BlockSegmentPostings {
     #[inline]
     pub(crate) fn posting_fieldnorm_at(&self, offset: usize) -> Option<u32> {
         if self.term_norms.is_some() {
-            self.load_scoring_block();
+            self.load_fieldnorm_block();
             Some(self.fieldnorm_decoder.borrow().output(offset))
         } else {
             None
@@ -481,7 +621,7 @@ impl BlockSegmentPostings {
         self.data = PostingData::Eager(postings_data);
         self.block_max_score_cache = None;
         self.block_loaded = false;
-        self.scoring_loaded.set(false);
+        self.scoring_loaded.set(ScoringLoadedFlags::default());
         if let Some(skip_data) = skip_data_opt {
             self.skip_reader.reset(skip_data, doc_freq);
         } else {
@@ -522,7 +662,7 @@ impl BlockSegmentPostings {
     pub fn freqs(&self) -> Ref<'_, [u32]> {
         debug_assert!(self.block_is_loaded());
         if self.has_pnorms() {
-            self.load_scoring_block();
+            self.load_freq_block();
         }
         Ref::map(self.freq_decoder.borrow(), |d| d.output_array())
     }
@@ -532,7 +672,7 @@ impl BlockSegmentPostings {
     pub fn freq(&self, idx: usize) -> u32 {
         debug_assert!(self.block_is_loaded());
         if self.has_pnorms() {
-            self.load_scoring_block();
+            self.load_freq_block();
         }
         self.freq_decoder.borrow().output(idx)
     }
@@ -610,7 +750,7 @@ impl BlockSegmentPostings {
         if self.skip_reader.seek(target_doc) {
             self.block_max_score_cache = None;
             self.block_loaded = false;
-            self.scoring_loaded.set(false);
+            self.scoring_loaded.set(ScoringLoadedFlags::default());
         }
     }
 
@@ -738,7 +878,7 @@ impl BlockSegmentPostings {
                 })?;
             }
         }
-        self.scoring_loaded.set(false);
+        self.scoring_loaded.set(ScoringLoadedFlags::default());
         self.block_loaded = true;
         Ok(())
     }
@@ -747,7 +887,7 @@ impl BlockSegmentPostings {
     pub fn advance(&mut self) {
         self.skip_reader.advance();
         self.block_loaded = false;
-        self.scoring_loaded.set(false);
+        self.scoring_loaded.set(ScoringLoadedFlags::default());
         self.block_max_score_cache = None;
         self.load_block();
     }
@@ -759,7 +899,10 @@ impl BlockSegmentPostings {
             block_loaded: true,
             freq_decoder: RefCell::new(BlockDecoder::with_val(1)),
             fieldnorm_decoder: RefCell::new(BlockDecoder::with_val(0)),
-            scoring_loaded: Cell::new(true),
+            scoring_loaded: Cell::new(ScoringLoadedFlags {
+                freq: true,
+                fieldnorm: true,
+            }),
             freq_reading_option: FreqReadingOption::NoFreq,
             block_max_score_cache: None,
             doc_freq: 0,

@@ -453,22 +453,11 @@ impl DocSet for BlockWandIntersectionScorer {
                 let len = block_docs.len();
                 let mut scores = [0.0f32; COMPRESSION_BLOCK_SIZE];
 
-                let norm_const = self.bm25_weight.norm_const();
-                let norm_factor = self.bm25_weight.norm_factor();
-                let weight = self.bm25_weight.weight();
-
                 let freqs = &all_freqs[start_idx..end_idx];
                 let norms = &all_norms[start_idx..end_idx];
                 let sc = &mut scores[..len];
 
-                let mut max_score = 0.0f32;
-                for i in 0..len {
-                    let tf = freqs[i] as f32;
-                    let norm = norm_const + norm_factor * (norms[i] as f32);
-                    let s = weight * (tf / (tf + norm));
-                    sc[i] = s;
-                    max_score = max_score.max(s);
-                }
+                let max_score = self.bm25_weight.compute_block_scores(freqs, norms, sc);
 
                 if max_score <= score_threshold {
                     self.internal_doc = self.window_end + 1;

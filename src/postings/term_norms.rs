@@ -144,6 +144,74 @@ impl TermNormReader {
         Ok(())
     }
 
+    pub(crate) fn decode_freq_packed_block(
+        &self,
+        offset: usize,
+        tf_bitwidth: u8,
+        freq_decoder: &mut BlockDecoder,
+    ) -> io::Result<()> {
+        if tf_bitwidth == 0 {
+            freq_decoder.fill_val(1, crate::postings::compression::COMPRESSION_BLOCK_SIZE);
+            return Ok(());
+        }
+        let buffer = self
+            .buffer
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated posting norms"))?;
+        let tf_size = compressed_block_size(tf_bitwidth);
+        let end = offset.checked_add(tf_size).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "overflow in freq block size")
+        })?;
+        if end > self.slice_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "scoring slice shorter than compressed freq block",
+            ));
+        }
+        let bytes = buffer.get_bytes(offset as u64..end as u64)?;
+        freq_decoder.uncompress_block_unsorted(&bytes, tf_bitwidth, true);
+        Ok(())
+    }
+
+    pub(crate) fn decode_fieldnorm_packed_block(
+        &self,
+        offset: usize,
+        bitwidths: BlockBitwidths,
+        fieldnorm_decoder: &mut BlockDecoder,
+    ) -> io::Result<()> {
+        if bitwidths.pnorm == 0 {
+            fieldnorm_decoder.fill_val(0, crate::postings::compression::COMPRESSION_BLOCK_SIZE);
+            return Ok(());
+        }
+        let buffer = self
+            .buffer
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated posting norms"))?;
+        let tf_size = compressed_block_size(bitwidths.tf);
+        let norm_size = compressed_block_size(bitwidths.pnorm);
+        let norm_offset = offset.checked_add(tf_size).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "overflow in fieldnorm block offset",
+            )
+        })?;
+        let end = norm_offset.checked_add(norm_size).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "overflow in fieldnorm block size",
+            )
+        })?;
+        if end > self.slice_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "scoring slice shorter than compressed fieldnorm block",
+            ));
+        }
+        let bytes = buffer.get_bytes(norm_offset as u64..end as u64)?;
+        fieldnorm_decoder.uncompress_block_unsorted(&bytes, bitwidths.pnorm, false);
+        Ok(())
+    }
+
     pub(crate) fn decode_scoring_packed_block(
         &self,
         offset: usize,
@@ -187,6 +255,82 @@ impl TermNormReader {
         } else {
             fieldnorm_decoder.fill_val(0, crate::postings::compression::COMPRESSION_BLOCK_SIZE);
         }
+        Ok(())
+    }
+
+    pub(crate) fn decode_freq_vint_block(
+        &self,
+        offset: usize,
+        num_docs: usize,
+        has_freq: bool,
+        freq_decoder: &mut BlockDecoder,
+    ) -> io::Result<()> {
+        if num_docs == 0 {
+            return Ok(());
+        }
+        if !has_freq {
+            freq_decoder.fill_val(1, num_docs);
+            return Ok(());
+        }
+        let buffer = self
+            .buffer
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated posting norms"))?;
+        if offset >= self.slice_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "scoring slice offset out of bounds",
+            ));
+        }
+        let max_vint_len = (num_docs * 5).min(self.slice_len - offset);
+        let bytes = buffer.get_bytes(offset as u64..(offset + max_vint_len) as u64)?;
+        freq_decoder.uncompress_vint_unsorted(&bytes, num_docs, 1);
+        Ok(())
+    }
+
+    pub(crate) fn decode_fieldnorm_vint_block(
+        &self,
+        offset: usize,
+        num_docs: usize,
+        has_freq: bool,
+        fieldnorm_decoder: &mut BlockDecoder,
+    ) -> io::Result<()> {
+        if num_docs == 0 {
+            return Ok(());
+        }
+        let buffer = self
+            .buffer
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated posting norms"))?;
+        if offset >= self.slice_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "scoring slice offset out of bounds",
+            ));
+        }
+        let max_bytes_per_doc = if has_freq { 10 } else { 5 };
+        let max_vint_len = (num_docs * max_bytes_per_doc).min(self.slice_len - offset);
+        let bytes = buffer.get_bytes(offset as u64..(offset + max_vint_len) as u64)?;
+        let tf_consumed = if has_freq {
+            let mut consumed = 0;
+            for _ in 0..num_docs {
+                while consumed < bytes.len() && (bytes[consumed] & 128) == 0 {
+                    consumed += 1;
+                }
+                consumed += 1;
+            }
+            consumed
+        } else {
+            0
+        };
+        if tf_consumed > bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "scoring slice offset out of bounds for fieldnorm vint",
+            ));
+        }
+        let norm_bytes = &bytes[tf_consumed..];
+        fieldnorm_decoder.uncompress_vint_unsorted(norm_bytes, num_docs, 0);
         Ok(())
     }
 
@@ -924,15 +1068,26 @@ mod tests {
 
         // Freshly loaded block has not loaded scoring data yet
         assert!(!block.is_scoring_loaded());
+        assert!(!block.is_freq_loaded());
+        assert!(!block.is_fieldnorm_loaded());
 
         // Inspecting docs does not load scoring data
         assert_eq!(block.doc(0), 0);
         assert_eq!(block.doc(10), 10);
         assert!(!block.is_scoring_loaded());
+        assert!(!block.is_freq_loaded());
+        assert!(!block.is_fieldnorm_loaded());
 
-        // Accessing freq on doc 0 triggers lazy loading of scoring data
+        // Accessing freq on doc 0 triggers lazy loading of freqs only
         let freq_0 = block.freq(0);
         assert_eq!(freq_0, 1);
+        assert!(block.is_freq_loaded());
+        assert!(!block.is_fieldnorm_loaded());
+        assert!(!block.is_scoring_loaded());
+
+        // Accessing fieldnorm loads fieldnorms
+        let _ = block.posting_fieldnorm_at(0);
+        assert!(block.is_fieldnorm_loaded());
         assert!(block.is_scoring_loaded());
 
         // Verify freqs across the first block (128 docs)
@@ -945,14 +1100,20 @@ mod tests {
         block.advance();
         // In the new block, scoring data is again not loaded yet
         assert!(!block.is_scoring_loaded());
+        assert!(!block.is_freq_loaded());
+        assert!(!block.is_fieldnorm_loaded());
 
         // Checking doc ID in the tail block does not load scoring data
         assert_eq!(block.doc(0), 128);
         assert!(!block.is_scoring_loaded());
+        assert!(!block.is_freq_loaded());
+        assert!(!block.is_fieldnorm_loaded());
 
-        // Accessing freq loads scoring data for tail block
+        // Accessing freq loads freqs for tail block without requiring fieldnorm
         assert_eq!(block.freq(0), ((128 % 5) + 1) as u32);
-        assert!(block.is_scoring_loaded());
+        assert!(block.is_freq_loaded());
+        assert!(!block.is_fieldnorm_loaded());
+        assert!(!block.is_scoring_loaded());
 
         // Verify all docs in tail block
         for i in 0..block.block_len() {
