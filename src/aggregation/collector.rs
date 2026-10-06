@@ -150,8 +150,9 @@ impl AggregationSegmentCollector {
         segment_ordinal: SegmentOrdinal,
         context: &AggContextParams,
     ) -> crate::Result<Self> {
+        let count_filter = super::bucket::FilterAggregation::new("*".to_string());
         let supports_bitmap_collection = agg.values().all(|agg| {
-            matches!(agg.agg, super::agg_req::AggregationVariants::Filter(_))
+            matches!(&agg.agg, super::agg_req::AggregationVariants::Filter(filter) if filter == &count_filter)
                 && agg.sub_aggregation.is_empty()
         });
         let mut ordinary_reader;
