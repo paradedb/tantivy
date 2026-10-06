@@ -59,9 +59,7 @@ impl FastFieldRangeWeight {
             bitmap_enabled: false,
         }
     }
-}
 
-impl FastFieldRangeWeight {
     pub(crate) fn with_bitmap_enabled(mut self, enabled: bool) -> Self {
         self.bitmap_enabled = enabled;
         self
@@ -139,7 +137,7 @@ impl Weight for FastFieldRangeWeight {
                         boost,
                         BoundsRange::new(lower_bound, upper_bound),
                         None,
-                        reader.bitmap_postings_enabled,
+                        bitmap_enabled,
                     )
                 }
                 Type::U64 | Type::I64 | Type::F64 => search_on_json_numerical_field(
@@ -164,7 +162,7 @@ impl Weight for FastFieldRangeWeight {
                         boost,
                         BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
                         None,
-                        reader.bitmap_postings_enabled,
+                        bitmap_enabled,
                     )
                 }
                 Type::Bool
@@ -220,7 +218,7 @@ impl Weight for FastFieldRangeWeight {
                 boost,
                 BoundsRange::new(lower_bound, upper_bound),
                 sort_order,
-                reader.bitmap_postings_enabled,
+                bitmap_enabled,
             )
         } else if field_type.is_bytes() {
             let Some(bytes_column): Option<BytesColumn> =
@@ -244,7 +242,7 @@ impl Weight for FastFieldRangeWeight {
                 boost,
                 BoundsRange::new(lower_bound, upper_bound),
                 sort_order,
-                reader.bitmap_postings_enabled,
+                bitmap_enabled,
             )
         } else {
             assert!(
@@ -288,7 +286,7 @@ impl Weight for FastFieldRangeWeight {
                 boost,
                 BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
                 sort_order,
-                reader.bitmap_postings_enabled,
+                bitmap_enabled,
             )
         }
     }
@@ -395,7 +393,7 @@ fn search_on_json_numerical_field(
         boost,
         BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
         None,
-        reader.bitmap_postings_enabled,
+        bitmap_enabled,
     )
 }
 
