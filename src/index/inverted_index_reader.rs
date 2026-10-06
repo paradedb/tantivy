@@ -44,6 +44,7 @@ pub struct InvertedIndexReader {
     postings_file_slice: FileSlice,
     positions_file_slice: DeferredFileSlice,
     pnorms_file_slice: Option<FileSlice>,
+    bitmaps_file_slice: Option<DeferredFileSlice>,
     record_option: IndexRecordOption,
     total_num_tokens: u64,
 }
@@ -91,6 +92,7 @@ impl InvertedIndexReader {
             postings_file_slice: postings_body,
             positions_file_slice,
             pnorms_file_slice: None,
+            bitmaps_file_slice: None,
             record_option,
             total_num_tokens,
         })
@@ -98,6 +100,23 @@ impl InvertedIndexReader {
 
     pub(crate) fn set_pnorms_file(&mut self, source: FileSlice) {
         self.pnorms_file_slice = Some(source);
+    }
+
+    pub(crate) fn set_bitmaps_file(&mut self, source: DeferredFileSlice) {
+        self.bitmaps_file_slice = Some(source);
+    }
+
+    /// Opens an optional term membership bitmap. Ordinary postings remain available for scoring.
+    pub fn read_bitmap_from_terminfo(
+        &self,
+        info: &TermInfo,
+        max_doc: crate::DocId,
+    ) -> io::Result<Option<crate::query::BitmapDocSet>> {
+        let (Some(source), Some(offset)) = (&self.bitmaps_file_slice, info.bitmap_offset) else {
+            return Ok(None);
+        };
+        crate::query::BitmapDocSet::open(source.open()?.clone(), offset, max_doc, info.doc_freq)
+            .map(Some)
     }
 
     /// Creates an empty `InvertedIndexReader` object, which
@@ -110,6 +129,7 @@ impl InvertedIndexReader {
             postings_file_slice: FileSlice::empty(),
             positions_file_slice: DeferredFileSlice::new(|| Ok(FileSlice::empty())),
             pnorms_file_slice: None,
+            bitmaps_file_slice: None,
             record_option,
             total_num_tokens: 0u64,
         }

@@ -354,6 +354,18 @@ impl SegmentReader {
                 Err(error) => return Err(error.into()),
             }
         }
+        if self.index.settings().bitmap_postings.use_for_queries {
+            let path = self.relative_path(SegmentComponent::PostingBitmaps);
+            let directory = self.index.directory().clone();
+            inv_idx_reader.set_bitmaps_file(DeferredFileSlice::new(move || {
+                let source = directory.open_read(&path).map_err(io::Error::other)?;
+                CompositeFile::open(&source)?
+                    .open_read(field)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "missing field posting bitmaps")
+                    })
+            }));
+        }
         let inv_idx_reader = Arc::new(inv_idx_reader);
 
         // by releasing the lock in between, we may end up opening the inverting index

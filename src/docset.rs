@@ -168,6 +168,11 @@ pub trait DocSet: Send {
         self.size_hint() as u64
     }
 
+    /// Whether this docset can produce membership masks without enumerating each match.
+    fn has_fast_bitset(&self) -> bool {
+        false
+    }
+
     /// Fills a bitmask representing which documents in `[min_doc, min_doc + BLOCK_WINDOW)` are
     /// present in this docset.
     ///
@@ -178,8 +183,10 @@ pub trait DocSet: Send {
         min_doc: DocId,
         mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
     ) -> DocId {
-        self.seek(min_doc);
-        let horizon = min_doc + BLOCK_WINDOW;
+        if self.doc() < min_doc {
+            self.seek(min_doc);
+        }
+        let horizon = min_doc.saturating_add(BLOCK_WINDOW).min(TERMINATED);
         loop {
             let doc = self.doc();
             if doc >= horizon {
@@ -273,6 +280,10 @@ impl DocSet for &mut dyn DocSet {
         (**self).fill_bitset_block(min_doc, mask)
     }
 
+    fn has_fast_bitset(&self) -> bool {
+        (**self).has_fast_bitset()
+    }
+
     fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
         (**self).is_empty_in_range(start, end)
     }
@@ -326,6 +337,10 @@ impl<TDocSet: DocSet + ?Sized> DocSet for Box<TDocSet> {
     ) -> DocId {
         let unboxed: &mut TDocSet = self.borrow_mut();
         unboxed.fill_bitset_block(min_doc, mask)
+    }
+
+    fn has_fast_bitset(&self) -> bool {
+        (**self).has_fast_bitset()
     }
 
     fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {

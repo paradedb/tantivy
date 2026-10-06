@@ -8,7 +8,9 @@ use crate::query::boolean_query::BlockWandSingleScorer;
 use crate::query::explanation::does_not_match;
 use crate::query::scorer::BasicPruningScorer;
 use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
-use crate::query::{AllScorer, AllWeight, EmptyScorer, Explanation, Scorer, Weight};
+use crate::query::{
+    AllScorer, AllWeight, BitmapDocSet, ConstScorer, EmptyScorer, Explanation, Scorer, Weight,
+};
 use crate::schema::IndexRecordOption;
 use crate::{DocId, Score, TantivyError, Term};
 
@@ -21,6 +23,7 @@ pub struct TermWeight {
 
 enum TermOrEmptyOrAllScorer {
     TermScorer(Box<TermScorer>),
+    Bitmap(ConstScorer<BitmapDocSet>),
     Empty,
     AllMatch(AllScorer),
 }
@@ -29,6 +32,7 @@ impl TermOrEmptyOrAllScorer {
     pub fn into_boxed_scorer(self) -> Box<dyn Scorer> {
         match self {
             TermOrEmptyOrAllScorer::TermScorer(scorer) => scorer,
+            TermOrEmptyOrAllScorer::Bitmap(scorer) => Box::new(scorer),
             TermOrEmptyOrAllScorer::Empty => Box::new(EmptyScorer),
             TermOrEmptyOrAllScorer::AllMatch(scorer) => Box::new(scorer),
         }
@@ -51,6 +55,10 @@ impl Weight for TermWeight {
             TermOrEmptyOrAllScorer::TermScorer(term_scorer) => Ok(Box::new(
                 BlockWandSingleScorer::new(*term_scorer, init_threshold),
             )),
+            TermOrEmptyOrAllScorer::Bitmap(scorer) => Ok(Box::new(BasicPruningScorer::new(
+                Box::new(scorer),
+                init_threshold,
+            ))),
             TermOrEmptyOrAllScorer::Empty => Ok(Box::new(EmptyScorer)),
             TermOrEmptyOrAllScorer::AllMatch(all_scorer) => Ok(Box::new(BasicPruningScorer::new(
                 Box::new(all_scorer),
@@ -68,6 +76,12 @@ impl Weight for TermWeight {
                 let mut explanation = term_scorer.explain();
                 explanation.add_context(format!("Term={:?}", self.term,));
                 Ok(explanation)
+            }
+            TermOrEmptyOrAllScorer::Bitmap(mut scorer) => {
+                if scorer.doc() > doc || scorer.seek(doc) != doc {
+                    return Err(does_not_match(doc));
+                }
+                Ok(Explanation::new("Term membership", scorer.score()))
             }
             TermOrEmptyOrAllScorer::Empty => Err(does_not_match(doc)),
             TermOrEmptyOrAllScorer::AllMatch(_) => AllWeight.explain(reader, doc),
@@ -114,7 +128,7 @@ impl Weight for TermWeight {
                 for_each_pruning_scorer(&mut scorer, callback);
             }
             TermOrEmptyOrAllScorer::Empty => {}
-            TermOrEmptyOrAllScorer::AllMatch(_) => {
+            TermOrEmptyOrAllScorer::AllMatch(_) | TermOrEmptyOrAllScorer::Bitmap(_) => {
                 return Err(TantivyError::InvalidArgument(
                     "for each pruning should only be called if scoring is enabled".to_string(),
                 ));
@@ -133,6 +147,9 @@ impl Weight for TermWeight {
         match self.specialized_scorer(reader, 1.0)? {
             TermOrEmptyOrAllScorer::TermScorer(mut term_scorer) => {
                 for_each_scorer(&mut *term_scorer, callback);
+            }
+            TermOrEmptyOrAllScorer::Bitmap(mut scorer) => {
+                for_each_scorer(&mut scorer, callback);
             }
             TermOrEmptyOrAllScorer::Empty => {}
             TermOrEmptyOrAllScorer::AllMatch(mut all_scorer) => {
@@ -153,6 +170,10 @@ impl Weight for TermWeight {
             TermOrEmptyOrAllScorer::TermScorer(mut term_scorer) => {
                 let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
                 for_each_docset_buffered(&mut term_scorer, &mut buffer, callback);
+            }
+            TermOrEmptyOrAllScorer::Bitmap(mut scorer) => {
+                let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
+                for_each_docset_buffered(&mut scorer, &mut buffer, callback);
             }
             TermOrEmptyOrAllScorer::Empty => {}
             TermOrEmptyOrAllScorer::AllMatch(mut all_scorer) => {
@@ -218,6 +239,16 @@ impl TermWeight {
             return Ok(TermOrEmptyOrAllScorer::AllMatch(AllScorer::new(
                 reader.max_doc(),
             )));
+        }
+
+        if !self.scoring_enabled {
+            if let Some(bitmap) =
+                inverted_index.read_bitmap_from_terminfo(&term_info, reader.max_doc())?
+            {
+                return Ok(TermOrEmptyOrAllScorer::Bitmap(ConstScorer::new(
+                    bitmap, boost,
+                )));
+            }
         }
 
         let mut segment_postings: SegmentPostings =

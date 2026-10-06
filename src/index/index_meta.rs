@@ -757,6 +757,8 @@ mod tests {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BitmapPostingsConfig {
+    /// Use existing bitmap payloads for unscored queries. Disable for comparison or rollback.
+    pub use_for_queries: bool,
     /// Minimum percentage of segment document slots containing the term (1..=100).
     pub min_density_percent: u8,
     /// Minimum document frequency eligible for a bitmap.
@@ -768,6 +770,7 @@ pub struct BitmapPostingsConfig {
 impl Default for BitmapPostingsConfig {
     fn default() -> Self {
         Self {
+            use_for_queries: true,
             min_density_percent: 10,
             min_docs: 128,
             max_bytes_per_segment: 64 * 1024 * 1024,

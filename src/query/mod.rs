@@ -1,5 +1,6 @@
 mod all_query;
 mod automaton_weight;
+mod bitmap_docset;
 mod bitset;
 mod bm25;
 mod boolean_query;
@@ -36,6 +37,7 @@ pub use query_grammar::Occur;
 
 pub use self::all_query::{AllQuery, AllScorer, AllWeight};
 pub use self::automaton_weight::AutomatonWeight;
+pub use self::bitmap_docset::BitmapDocSet;
 pub use self::bitset::BitSetDocSet;
 pub use self::bm25::{Bm25StatisticsProvider, Bm25Weight};
 pub use self::boolean_query::{
