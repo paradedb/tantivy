@@ -695,25 +695,20 @@ impl<B: SubAggBuffer> SegmentAggregationCollector for SegmentFilterCollector<B> 
         Ok(())
     }
 
+    // ParadeDB represents COUNT(*) as `filter: "*"`; count its bitmap without enumerating doc IDs.
     fn collect_bitmap(
         &mut self,
         parent_bucket_id: BucketId,
         base: DocId,
         mask: &crate::DocIdBitmap,
-        agg_data: &mut AggregationsSegmentCtx,
+        _agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()> {
-        if self.sub_aggregations.is_none() {
-            self.parent_buckets[parent_bucket_id as usize].doc_count +=
-                self.req_data.evaluator.count_bitmap(base, mask);
-            return Ok(());
+        if self.sub_aggregations.is_some() {
+            unreachable!("bitmap collection requires a filter without sub-aggregations");
         }
-        let mut result = Ok(());
-        crate::DocSetBatch::Bitmap(base, mask).for_each_doc_block(|docs| {
-            if result.is_ok() {
-                result = self.collect(parent_bucket_id, docs, agg_data);
-            }
-        });
-        result
+        self.parent_buckets[parent_bucket_id as usize].doc_count +=
+            self.req_data.evaluator.count_bitmap(base, mask);
+        Ok(())
     }
 
     fn flush(&mut self, agg_data: &mut AggregationsSegmentCtx) -> crate::Result<()> {
