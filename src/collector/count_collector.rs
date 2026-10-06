@@ -162,6 +162,11 @@ mod tests {
         )?;
         let request = serde_json::from_value(serde_json::json!({
             "documents": {"filter": "*"},
+            "filtered": {"filter": "text:a"},
+            "nested": {"filter": "text:a", "aggs": {
+                "sum": {"sum": {"field": "id"}},
+                "max": {"max": {"field": "id"}}
+            }},
             "values": {"value_count": {"field": "id"}},
             "optional": {"value_count": {"field": "optional"}},
             "multiple": {"value_count": {"field": "multiple"}}
@@ -172,6 +177,19 @@ mod tests {
         )?;
         let json = serde_json::to_value(result)?;
         assert_eq!(json["documents"]["doc_count"], expected);
+        let filtered: Vec<u64> = (0..2303)
+            .filter(|doc| doc % 7 != 0 && doc % 2 == 0)
+            .collect();
+        assert_eq!(json["filtered"]["doc_count"], filtered.len());
+        assert_eq!(json["nested"]["doc_count"], filtered.len());
+        assert_eq!(
+            json["nested"]["sum"]["value"],
+            filtered.iter().sum::<u64>() as f64
+        );
+        assert_eq!(
+            json["nested"]["max"]["value"],
+            *filtered.last().unwrap() as f64
+        );
         assert_eq!(json["values"]["value"], expected as f64);
         assert_eq!(
             json["optional"]["value"],

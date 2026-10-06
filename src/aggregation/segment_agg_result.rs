@@ -39,6 +39,11 @@ pub trait SegmentAggregationCollector: Debug {
         agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()>;
 
+    /// Whether bitmap collection avoids enumerating document IDs. Fixed for this collector's lifetime.
+    fn supports_bitmap_collection(&self) -> bool {
+        false
+    }
+
     fn collect_bitmap(
         &mut self,
         parent_bucket_id: BucketId,
@@ -125,6 +130,20 @@ pub trait SegmentAggregationCollector: Debug {
 /// and can provide specialized versions instead, that remove some of its overhead.
 pub(crate) struct GenericSegmentAggregationResultsCollector {
     pub(crate) aggs: Vec<Box<dyn SegmentAggregationCollector>>,
+    bitmap_collectors: Box<[usize]>,
+    doc_collectors: Box<[usize]>,
+}
+
+impl GenericSegmentAggregationResultsCollector {
+    pub(crate) fn new(aggs: Vec<Box<dyn SegmentAggregationCollector>>) -> Self {
+        let (bitmap_collectors, doc_collectors): (Vec<_>, Vec<_>) =
+            (0..aggs.len()).partition(|&i| aggs[i].supports_bitmap_collection());
+        Self {
+            aggs,
+            bitmap_collectors: bitmap_collectors.into_boxed_slice(),
+            doc_collectors: doc_collectors.into_boxed_slice(),
+        }
+    }
 }
 
 impl Debug for GenericSegmentAggregationResultsCollector {
@@ -161,6 +180,10 @@ impl SegmentAggregationCollector for GenericSegmentAggregationResultsCollector {
         Ok(())
     }
 
+    fn supports_bitmap_collection(&self) -> bool {
+        !self.bitmap_collectors.is_empty()
+    }
+
     fn collect_bitmap(
         &mut self,
         parent_bucket_id: BucketId,
@@ -168,10 +191,24 @@ impl SegmentAggregationCollector for GenericSegmentAggregationResultsCollector {
         mask: &crate::DocIdBitmap,
         agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()> {
-        for collector in &mut self.aggs {
-            collector.collect_bitmap(parent_bucket_id, base, mask, agg_data)?;
+        for &i in &self.bitmap_collectors {
+            self.aggs[i].collect_bitmap(parent_bucket_id, base, mask, agg_data)?;
         }
-        Ok(())
+        if self.doc_collectors.is_empty() {
+            return Ok(());
+        }
+        let mut result = Ok(());
+        crate::DocSetBatch::Bitmap(base, mask).for_each_doc_block(|docs| {
+            if result.is_ok() {
+                for &i in &self.doc_collectors {
+                    if let Err(error) = self.aggs[i].collect(parent_bucket_id, docs, agg_data) {
+                        result = Err(error);
+                        break;
+                    }
+                }
+            }
+        });
+        result
     }
 
     fn flush(&mut self, agg_data: &mut AggregationsSegmentCtx) -> crate::Result<()> {

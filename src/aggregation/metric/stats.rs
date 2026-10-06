@@ -324,6 +324,11 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
         Ok(())
     }
 
+    fn supports_bitmap_collection(&self) -> bool {
+        matches!(self.collecting_for, StatsType::Count)
+            && matches!(self.accessor.index, columnar::ColumnIndex::Full)
+    }
+
     fn collect_bitmap(
         &mut self,
         parent_bucket_id: BucketId,
@@ -331,9 +336,7 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
         mask: &crate::DocIdBitmap,
         agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()> {
-        if matches!(self.collecting_for, StatsType::Count)
-            && matches!(self.accessor.index, columnar::ColumnIndex::Full)
-        {
+        if self.supports_bitmap_collection() {
             self.buckets[parent_bucket_id as usize].count +=
                 mask.iter().map(|word| u64::from(word.len())).sum::<u64>();
             return Ok(());
