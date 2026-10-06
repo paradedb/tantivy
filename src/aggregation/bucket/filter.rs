@@ -15,7 +15,6 @@ use crate::aggregation::intermediate_agg_result::{
 };
 use crate::aggregation::segment_agg_result::{BucketIdProvider, SegmentAggregationCollector};
 use crate::aggregation::BucketId;
-use crate::docset::DocSet;
 use crate::query::{AllQuery, EnableScoring, Query, QueryParser};
 use crate::schema::Schema;
 use crate::tokenizer::TokenizerManager;
@@ -457,13 +456,14 @@ impl DocumentQueryEvaluator {
         // Create a BitSet to hold all matching documents
         let mut bitset = BitSet::with_max_value(max_doc);
 
-        // Collect all matching documents into the BitSet
-        // This is the upfront cost, but then lookups are O(1)
-        let mut doc = scorer.doc();
-        while doc != crate::TERMINATED {
-            bitset.insert(doc);
-            doc = scorer.advance();
-        }
+        crate::query::for_each_docset_batch(scorer.as_mut(), &mut |batch| match batch {
+            crate::DocSetBatch::Docs(docs) => {
+                for &doc in docs {
+                    bitset.insert(doc);
+                }
+            }
+            crate::DocSetBatch::Bitmap(base, mask) => bitset.union_tinysets(base / 64, mask),
+        });
 
         Ok(Self {
             bitset: Some(bitset),

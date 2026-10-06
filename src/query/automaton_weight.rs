@@ -18,6 +18,7 @@ use crate::{DocId, Score, TantivyError};
 /// A weight struct for Fuzzy Term and Regex Queries
 pub struct AutomatonWeight<A> {
     field: Field,
+    scoring_enabled: bool,
     automaton: Arc<A>,
     // For JSON fields, the term dictionary include terms from all paths.
     // We apply additional filtering based on the given JSON path, when searching within the term
@@ -34,6 +35,7 @@ where
     pub fn new<IntoArcA: Into<Arc<A>>>(field: Field, automaton: IntoArcA) -> AutomatonWeight<A> {
         AutomatonWeight {
             field,
+            scoring_enabled: true,
             automaton: automaton.into(),
             json_path_bytes: None,
         }
@@ -47,9 +49,16 @@ where
     ) -> AutomatonWeight<A> {
         AutomatonWeight {
             field,
+            scoring_enabled: true,
             automaton: automaton.into(),
             json_path_bytes: Some(json_path_bytes.to_vec().into_boxed_slice()),
         }
+    }
+
+    /// Enables score computation; disabling it permits membership-only posting readers.
+    pub fn with_scoring_enabled(mut self, enabled: bool) -> Self {
+        self.scoring_enabled = enabled;
+        self
     }
 
     fn automaton_stream<'a>(
@@ -93,12 +102,34 @@ where
         let mut term_stream = self.automaton_stream(term_dict)?;
 
         let mut scorers = vec![];
+        let mut bitmaps: Vec<Box<dyn Scorer>> = Vec::new();
         while let Some((_term, term_info, state)) = term_stream.next() {
+            if !self.scoring_enabled {
+                if let Some(bitmap) =
+                    inverted_index.read_bitmap_from_terminfo(term_info, reader.max_doc())?
+                {
+                    bitmaps.push(Box::new(ConstScorer::new(bitmap, boost)));
+                    continue;
+                }
+            }
             let score = automaton_score(self.automaton.as_ref(), state);
             let segment_postings =
                 inverted_index.read_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
             let scorer = ConstScorer::new(segment_postings, boost * score);
             scorers.push(scorer);
+        }
+
+        if !bitmaps.is_empty() {
+            bitmaps.extend(
+                scorers
+                    .into_iter()
+                    .map(|scorer| Box::new(scorer) as Box<dyn Scorer>),
+            );
+            return Ok(Box::new(super::bitmap_combination::BitmapCombination::new(
+                bitmaps,
+                super::bitmap_combination::BitmapOperation::Union,
+                reader.max_doc(),
+            )));
         }
 
         let scorer = BufferedUnionScorer::build(scorers, SumCombiner::default, reader.max_doc());

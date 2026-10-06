@@ -39,7 +39,10 @@ impl BitmapCombination {
         };
         let cost = match operation {
             BitmapOperation::Union => children.iter().map(|child| child.cost()).sum(),
-            _ => children.iter().map(|child| child.cost()).min().unwrap(),
+            BitmapOperation::Intersection => {
+                children.iter().map(|child| child.cost()).min().unwrap()
+            }
+            BitmapOperation::Exclude => children[0].cost(),
         };
         let mut result = Self {
             children,
@@ -307,7 +310,7 @@ mod tests {
         }
         writer.commit()?;
         let parser = QueryParser::for_index(&index, vec![text]);
-        for query in [
+        let mut queries: Vec<Box<dyn crate::query::Query>> = [
             "a OR b",
             "a AND b",
             "rare AND a",
@@ -321,12 +324,49 @@ mod tests {
             "a OR number:[101 TO 4321]",
             "a AND \"b c\"",
             "a AND missing",
-        ] {
-            let query = parser.parse_query(query)?;
+        ]
+        .into_iter()
+        .map(|query| parser.parse_query(query))
+        .collect::<Result<Vec<_>, _>>()?;
+        use crate::query::{
+            BooleanQuery, FuzzyTermQuery, Occur, RegexQuery, TermQuery, TermSetQuery,
+        };
+        use crate::schema::IndexRecordOption;
+        use crate::Term;
+        let terms: Vec<_> = ["a", "b", "c"]
+            .into_iter()
+            .map(|word| Term::from_field_text(text, word))
+            .collect();
+        queries.push(Box::new(BooleanQuery::with_minimum_required_clauses(
+            terms
+                .iter()
+                .map(|term| {
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(term.clone(), IndexRecordOption::Basic))
+                            as Box<dyn crate::query::Query>,
+                    )
+                })
+                .collect(),
+            2,
+        )));
+        queries.push(Box::new(RegexQuery::from_pattern("[ab]", text)?));
+        queries.push(Box::new(FuzzyTermQuery::new(
+            Term::from_field_text(text, "a"),
+            1,
+            false,
+        )));
+        queries.push(Box::new(TermSetQuery::new(terms)));
+        for query in queries {
             let mut results = Vec::new();
+            let mut scored_results = Vec::new();
             for enabled in [false, true] {
                 index.settings_mut().bitmap_postings.use_for_queries = enabled;
                 let searcher = index.reader()?.searcher();
+                scored_results.push(searcher.search(
+                    query.as_ref(),
+                    &crate::collector::TopDocs::with_limit(10).order_by_score(),
+                )?);
                 let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
                 let mut scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
                 let mut docs = Vec::new();
@@ -348,6 +388,7 @@ mod tests {
                 results.push(docs);
             }
             assert_eq!(results[0], results[1], "{query:?}");
+            assert_eq!(scored_results[0], scored_results[1], "scored {query:?}");
         }
         Ok(())
     }

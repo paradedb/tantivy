@@ -258,6 +258,7 @@ pub trait DocSet: Send {
     /// present in this docset.
     ///
     /// The window is divided into `BLOCK_NUM_TINYBITSETS` buckets of 64 docs each.
+    /// Adds only unconsumed matches to the existing mask; it does not clear the mask.
     /// Returns the next doc `>= min_doc + BLOCK_WINDOW`, or `TERMINATED` if exhausted.
     fn fill_bitset_block(
         &mut self,

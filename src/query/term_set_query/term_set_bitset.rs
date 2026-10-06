@@ -121,6 +121,18 @@ fn or_term_info_into_bitset(
     term_info: &TermInfo,
     bitset: &mut BitSet,
 ) -> crate::Result<()> {
+    if let Some(mut bitmap) =
+        inverted_index.read_bitmap_from_terminfo(term_info, bitset.max_value())?
+    {
+        use crate::DocSet;
+        while bitmap.doc() != crate::TERMINATED {
+            let base = bitmap.doc() / crate::BLOCK_WINDOW * crate::BLOCK_WINDOW;
+            let mut mask = [common::TinySet::EMPTY; crate::BLOCK_NUM_TINYBITSETS];
+            bitmap.fill_bitset_block(base, &mut mask);
+            bitset.union_tinysets(base / 64, &mask);
+        }
+        return Ok(());
+    }
     let mut block_postings =
         inverted_index.read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
     loop {

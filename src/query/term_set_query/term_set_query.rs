@@ -144,7 +144,10 @@ impl Query for InvertedIndexTermSetQuery {
 
             sub_queries.push((
                 Occur::Should,
-                Box::new(AutomatonWeight::new(field, SetDfaWrapper(Arc::new(map)))),
+                Box::new(
+                    AutomatonWeight::new(field, SetDfaWrapper(Arc::new(map)))
+                        .with_scoring_enabled(enable_scoring.is_scoring_enabled()),
+                ),
             ));
         }
         Ok(Box::new(BooleanWeight::new(

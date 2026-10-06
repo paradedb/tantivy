@@ -83,6 +83,9 @@ impl DocSet for BitmapDocSet {
             self.doc = TERMINATED;
             return SeekDangerResult::SeekLowerBound(TERMINATED);
         }
+        if target < self.doc {
+            return SeekDangerResult::SeekLowerBound(self.doc);
+        }
         let byte = self
             .data
             .read_byte(u64::from(target / 8))
@@ -170,6 +173,38 @@ mod tests {
             data[doc as usize / 8] |= 1 << (doc % 8);
         }
         BitmapDocSet::open(FileSlice::from(data), 0, max_doc, docs.len() as u32).unwrap()
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn bitmap_cursor_operations_match_postings(
+            mut docs in proptest::collection::vec(0u32..5137, 0..900),
+            actions in proptest::collection::vec((0u8..3, 0u32..300), 0..100),
+        ) {
+            docs.sort_unstable(); docs.dedup();
+            let mut bitmap = bitmap(&docs, 5137);
+            let mut reference = crate::query::VecDocSet::from(docs);
+            for (action, gap) in actions {
+                assert_eq!(bitmap.doc(), reference.doc());
+                if reference.doc() == TERMINATED { break; }
+                match action {
+                    0 => { assert_eq!(bitmap.advance(), reference.advance()); }
+                    1 => {
+                        let target = reference.doc() + gap;
+                        assert_eq!(bitmap.seek(target), reference.seek(target));
+                    }
+                    _ => {
+                        let base = reference.doc().saturating_sub(gap);
+                        let mut actual = [TinySet::singleton(7); BLOCK_NUM_TINYBITSETS];
+                        let mut expected = actual;
+                        assert_eq!(bitmap.fill_bitset_block(base, &mut actual), reference.fill_bitset_block(base, &mut expected));
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
+            bitmap.seek(TERMINATED);
+            assert_eq!(bitmap.seek_danger(0), SeekDangerResult::SeekLowerBound(TERMINATED));
+        }
     }
 
     #[test]
