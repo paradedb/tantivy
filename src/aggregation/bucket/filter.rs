@@ -344,7 +344,9 @@ impl FilterAggregation {
 // Custom serialization implementation
 impl Serialize for FilterAggregation {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: Serializer {
+    where
+        S: Serializer,
+    {
         match &self.query {
             FilterQuery::QueryString(query_string) => {
                 // Serialize query strings as plain strings
@@ -360,7 +362,9 @@ impl Serialize for FilterAggregation {
 
 impl<'de> Deserialize<'de> for FilterAggregation {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         // We need to peek at the value to determine if it's a string or an object
         use serde::de::Error;
         use serde_json::Value;
@@ -492,6 +496,31 @@ impl DocumentQueryEvaluator {
         } else {
             output.extend_from_slice(docs);
         }
+    }
+
+    fn count_bitmap(&self, base: DocId, mask: &crate::DocIdBitmap) -> u64 {
+        let Some(bitset) = &self.bitset else {
+            return mask.iter().map(|word| u64::from(word.len())).sum();
+        };
+        let word_at = |bucket| {
+            if bucket < bitset.max_value().div_ceil(64) {
+                bitset.tinyset(bucket).into_u64()
+            } else {
+                0
+            }
+        };
+        let shift = base % 64;
+        mask.iter()
+            .enumerate()
+            .map(|(i, word)| {
+                let bucket = base / 64 + i as u32;
+                let mut filter = word_at(bucket) >> shift;
+                if shift != 0 {
+                    filter |= word_at(bucket + 1) << (64 - shift);
+                }
+                u64::from((word.into_u64() & filter).count_ones())
+            })
+            .sum()
     }
 }
 
@@ -673,9 +702,9 @@ impl<B: SubAggBuffer> SegmentAggregationCollector for SegmentFilterCollector<B> 
         mask: &crate::DocIdBitmap,
         agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()> {
-        if self.sub_aggregations.is_none() && self.req_data.evaluator.bitset.is_none() {
+        if self.sub_aggregations.is_none() {
             self.parent_buckets[parent_bucket_id as usize].doc_count +=
-                mask.iter().map(|word| u64::from(word.len())).sum::<u64>();
+                self.req_data.evaluator.count_bitmap(base, mask);
             return Ok(());
         }
         let mut result = Ok(());
@@ -859,6 +888,41 @@ mod tests {
             deserialized,
             AggContextParams::new(Default::default(), index.tokenizers().clone()),
         ))
+    }
+
+    #[test]
+    fn filter_bitmap_count_matches_document_filtering() {
+        use common::TinySet;
+
+        for max_doc in [0, 1, 63, 64, 65, 1023, 1024, 1025, 2051] {
+            let mut bitset = BitSet::with_max_value(max_doc);
+            for doc in 0..max_doc {
+                if doc % 5 < 3 {
+                    bitset.insert(doc);
+                }
+            }
+            let evaluator = DocumentQueryEvaluator {
+                bitset: Some(bitset),
+            };
+            for base in [0, 1, 63, 64, 65, 1023, 1024, 2030, 2051] {
+                for bits in [0, u64::MAX, 0x8181_8181_8181_8181] {
+                    let mask = [TinySet::deserialize(bits.to_le_bytes()); 16];
+                    let expected = (0..1024)
+                        .filter(|offset| {
+                            let doc = base + offset;
+                            bits & (1 << (offset % 64)) != 0
+                                && doc < max_doc
+                                && evaluator.matches_document(doc)
+                        })
+                        .count() as u64;
+                    assert_eq!(evaluator.count_bitmap(base, &mask), expected);
+                    assert_eq!(
+                        DocumentQueryEvaluator { bitset: None }.count_bitmap(base, &mask),
+                        u64::from(bits.count_ones()) * 16
+                    );
+                }
+            }
+        }
     }
 
     #[test]
