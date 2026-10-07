@@ -58,6 +58,10 @@ preparation uses the executor; the coordinated probe loop runs on the search
 thread. Cosine routing uses the same normalized query coordinates as quantized
 scoring. Collector reuse and concurrent searches have independent query state.
 
+Vector collectors must be used directly. Combining or wrapping them in tuples,
+`Option`, `MultiCollector`, `FilterCollector`, or `BytesFilterCollector` returns
+an error. Apply vector filters in the query.
+
 The work budget resolves once from the global cluster count and total native
 vector count. A cluster open is charged once; eligible rows are charged across
 all its segment fragments. `WorkModel::for_searcher` counts shared centroids once.

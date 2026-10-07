@@ -226,7 +226,7 @@ impl Searcher {
     ) -> crate::Result<C::Fruit> {
         let weight = query.weight(enabled_scoring)?;
         collector.check_schema(self.schema())?;
-        collector.collect_search(weight.as_ref(), self, executor)
+        collector.collect_global(weight.as_ref(), self, executor)
     }
 
     /// Summarize total space usage of this searcher.

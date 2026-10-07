@@ -173,13 +173,26 @@ pub trait Collector: Sync + Send {
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
     ) -> crate::Result<Self::Fruit>;
 
-    /// Collects one search, allowing query-wide state to be shared across segments.
-    fn collect_search(
+    /// Whether this collector or a wrapped child requires custom global collection.
+    /// Such collectors cannot use the default document collection path.
+    fn requires_global_collection(&self) -> bool {
+        false
+    }
+
+    /// Collects results across all segments, allowing query-wide state to be shared.
+    fn collect_global(
         &self,
         weight: &dyn Weight,
         searcher: &crate::Searcher,
         executor: &crate::Executor,
     ) -> crate::Result<Self::Fruit> {
+        if self.requires_global_collection() {
+            return Err(crate::TantivyError::InvalidArgument(
+                "collectors requiring global collection cannot be combined or wrapped; use the \
+                 collector directly"
+                    .into(),
+            ));
+        }
         let fruits = executor.map(
             |(ordinal, reader)| self.collect_segment(weight, ordinal as u32, reader),
             searcher.segment_readers().iter().enumerate(),
@@ -289,6 +302,11 @@ impl<TCollector: Collector> Collector for Option<TCollector> {
             .unwrap_or(false)
     }
 
+    fn requires_global_collection(&self) -> bool {
+        self.as_ref()
+            .is_some_and(Collector::requires_global_collection)
+    }
+
     fn merge_fruits(
         &self,
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
@@ -365,6 +383,10 @@ where
         self.0.requires_scoring() || self.1.requires_scoring()
     }
 
+    fn requires_global_collection(&self) -> bool {
+        self.0.requires_global_collection() || self.1.requires_global_collection()
+    }
+
     fn merge_fruits(
         &self,
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
@@ -435,6 +457,12 @@ where
 
     fn requires_scoring(&self) -> bool {
         self.0.requires_scoring() || self.1.requires_scoring() || self.2.requires_scoring()
+    }
+
+    fn requires_global_collection(&self) -> bool {
+        self.0.requires_global_collection()
+            || self.1.requires_global_collection()
+            || self.2.requires_global_collection()
     }
 
     fn merge_fruits(
@@ -519,6 +547,13 @@ where
             || self.1.requires_scoring()
             || self.2.requires_scoring()
             || self.3.requires_scoring()
+    }
+
+    fn requires_global_collection(&self) -> bool {
+        self.0.requires_global_collection()
+            || self.1.requires_global_collection()
+            || self.2.requires_global_collection()
+            || self.3.requires_global_collection()
     }
 
     fn merge_fruits(

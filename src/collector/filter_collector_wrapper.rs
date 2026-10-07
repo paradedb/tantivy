@@ -106,6 +106,13 @@ where
     type Child = FilterSegmentCollector<TCollector::Child, TPredicate, TPredicateValue>;
 
     fn check_schema(&self, schema: &Schema) -> crate::Result<()> {
+        if self.collector.requires_global_collection() {
+            return Err(crate::TantivyError::InvalidArgument(
+                "FilterCollector cannot wrap a collector requiring global collection; apply the \
+                 filter in the query instead"
+                    .into(),
+            ));
+        }
         self.collector.check_schema(schema)?;
         Ok(())
     }
@@ -281,6 +288,13 @@ where
     type Child = BytesFilterSegmentCollector<TCollector::Child, TPredicate>;
 
     fn check_schema(&self, schema: &Schema) -> crate::Result<()> {
+        if self.collector.requires_global_collection() {
+            return Err(crate::TantivyError::InvalidArgument(
+                "BytesFilterCollector cannot wrap a collector requiring global collection; apply \
+                 the filter in the query instead"
+                    .into(),
+            ));
+        }
         self.collector.check_schema(schema)
     }
 

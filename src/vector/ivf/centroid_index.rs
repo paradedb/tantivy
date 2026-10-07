@@ -783,6 +783,105 @@ mod tests {
     }
 
     #[test]
+    fn vector_collectors_reject_composition() -> crate::Result<()> {
+        use crate::collector::{
+            BytesFilterCollector, Count, FilterCollector, MultiCollector, TopDocs,
+        };
+        use crate::query::{AllQuery, EmptyQuery, Query};
+        use crate::schema::FAST;
+        use crate::vector::TopDocsByVectorSimilarity;
+
+        for shared_centroids in [false, true] {
+            let mut fixture = Fixture::new(Metric::L2);
+            let mut schema = Schema::builder();
+            schema.add_vector_field("embedding", VectorOptions::new(2, Metric::L2));
+            schema.add_u64_field("keep", FAST);
+            schema.add_bytes_field("bytes", FAST);
+            fixture.schema = schema.build();
+            let index = if shared_centroids {
+                fixture.create(RouterKind::Exact)?
+            } else {
+                Index::create_in_ram(fixture.schema.clone())
+            };
+            let vector = || TopDocsByVectorSimilarity::new(fixture.field, vec![0.1_f32, 0.2], 3);
+            for num_docs in [0, 2] {
+                if num_docs > 0 {
+                    let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+                    writer.set_merge_policy(Box::new(NoMergePolicy));
+                    for _ in 0..num_docs {
+                        let mut doc = TantivyDocument::new();
+                        doc.add_vector(fixture.field, &[0.0_f32, 0.0]);
+                        writer.add_document(doc)?;
+                        writer.commit()?;
+                    }
+                }
+                let searcher = index.reader()?.searcher();
+                assert_eq!(
+                    searcher.search(&AllQuery, &vector())?.results.len(),
+                    num_docs
+                );
+                assert_eq!(
+                    searcher.search(&AllQuery, &(Count, Some(Count)))?,
+                    (num_docs, Some(num_docs))
+                );
+                assert_eq!(
+                    searcher
+                        .search(&AllQuery, &(Count, None::<TopDocsByVectorSimilarity<f32>>))?
+                        .0,
+                    num_docs
+                );
+                for query in [&AllQuery as &dyn Query, &EmptyQuery] {
+                    let mut multi = MultiCollector::new();
+                    multi.add_collector(Count);
+                    multi.add_collector(Some(vector()));
+                    let mut nested = MultiCollector::new();
+                    nested.add_collector((Count, vector()));
+                    let filtered = FilterCollector::new("keep".into(), |_: u64| true, vector());
+                    let bytes_filtered =
+                        BytesFilterCollector::new("bytes".into(), |_: &[u8]| true, Some(vector()));
+                    for result in [
+                        searcher.search(query, &(vector(), Count)).map(|_| ()),
+                        searcher.search(query, &(Count, vector())).map(|_| ()),
+                        searcher
+                            .search(query, &(Count, Some(vector()), Count))
+                            .map(|_| ()),
+                        searcher
+                            .search(
+                                query,
+                                &(
+                                    Count,
+                                    Count,
+                                    TopDocs::with_limit(1).order_by_score(),
+                                    vector(),
+                                ),
+                            )
+                            .map(|_| ()),
+                        searcher
+                            .search(query, &(Count, (Count, vector())))
+                            .map(|_| ()),
+                        searcher.search(query, &Some(vector())).map(|_| ()),
+                        searcher.search(query, &Some((Count, vector()))).map(|_| ()),
+                        searcher.search(query, &multi).map(|_| ()),
+                        searcher.search(query, &(Count, Some(nested))).map(|_| ()),
+                        searcher.search(query, &filtered).map(|_| ()),
+                        searcher.search(query, &bytes_filtered).map(|_| ()),
+                    ] {
+                        assert!(
+                            matches!(
+                                result,
+                                Err(TantivyError::InvalidArgument(ref message))
+                                    if message.contains("global collection")
+                            ),
+                            "{result:?}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn global_probe_budget_is_independent_of_segment_partitioning() -> crate::Result<()> {
         use crate::collector::sort_key::SortByStaticFastValue;
         use crate::query::{AllQuery, Query, TermQuery};

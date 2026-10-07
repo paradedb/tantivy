@@ -34,6 +34,10 @@ impl<TCollector: Collector> Collector for CollectorWrapper<TCollector> {
         self.0.requires_scoring()
     }
 
+    fn requires_global_collection(&self) -> bool {
+        self.0.requires_global_collection()
+    }
+
     fn merge_fruits(
         &self,
         children: Vec<<Self::Child as SegmentCollector>::Fruit>,
@@ -224,6 +228,12 @@ impl Collector for MultiCollector<'_> {
             .iter()
             .map(Deref::deref)
             .any(Collector::requires_scoring)
+    }
+
+    fn requires_global_collection(&self) -> bool {
+        self.collector_wrappers
+            .iter()
+            .any(|collector| collector.requires_global_collection())
     }
 
     fn merge_fruits(&self, segments_multifruits: Vec<MultiFruit>) -> crate::Result<MultiFruit> {

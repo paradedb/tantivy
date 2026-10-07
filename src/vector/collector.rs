@@ -4,7 +4,7 @@
 //! not a [`SortKeyComputer`](crate::collector::sort_key::SortKeyComputer). IVF
 //! needs to drain the filter `DocSet` into a bitmap upfront and drive its own
 //! cluster iteration, which inverts the per-doc pull model that sort-key
-//! computers assume. [`Collector::collect_search`] coordinates global routing,
+//! computers assume. [`Collector::collect_global`] coordinates global routing,
 //! probe budgets, and candidate thresholds across segments. Segment scorers
 //! consume clusters using their stored row format. Legacy segment routers
 //! still rank independently.
@@ -366,9 +366,11 @@ where
         _segment_local_id: SegmentOrdinal,
         _reader: &SegmentReader,
     ) -> crate::Result<Self::Child> {
-        // Never called at runtime — we override `collect_segment`. The
-        // child type exists only to satisfy the trait bound.
-        Ok(NoOpSegmentCollector::default())
+        Err(TantivyError::InvalidArgument(
+            "vector similarity requires global collection and cannot be combined or wrapped; use \
+             the collector directly"
+                .into(),
+        ))
     }
 
     fn requires_scoring(&self) -> bool {
@@ -386,7 +388,11 @@ where
         self.collect_backend(weight, reader, self.segment_backend(segment_ord, reader)?)
     }
 
-    fn collect_search(
+    fn requires_global_collection(&self) -> bool {
+        true
+    }
+
+    fn collect_global(
         &self,
         weight: &dyn Weight,
         searcher: &crate::Searcher,
