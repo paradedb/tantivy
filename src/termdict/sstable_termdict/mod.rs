@@ -176,7 +176,7 @@ impl ValueReader for TermInfoValueReader {
         let mut positions_start = VInt::deserialize_u64(&mut data)? as usize;
         let mut pnorms_offset = match version {
             TermInfoVersion::V1 => None,
-            TermInfoVersion::V2 => Some(VInt::deserialize_u64(&mut data)?),
+            TermInfoVersion::V2 | TermInfoVersion::V3 => Some(VInt::deserialize_u64(&mut data)?),
         };
 
         self.term_infos.reserve_exact(num_els as usize);
@@ -186,21 +186,40 @@ impl ValueReader for TermInfoValueReader {
             let positions_num_bytes = VInt::deserialize_u64(&mut data)?;
             let postings_end = postings_start + postings_num_bytes as usize;
             let positions_end = positions_start + positions_num_bytes as usize;
-            if i > 0 {
+            if version == TermInfoVersion::V2 && i > 0 {
                 if let Some(offset) = &mut pnorms_offset {
                     let delta = VInt::deserialize_u64(&mut data)?;
                     *offset += delta;
                 }
             }
+            let pnorms_num_bytes = match version {
+                TermInfoVersion::V1 => 0,
+                TermInfoVersion::V2 => u32::MAX,
+                TermInfoVersion::V3 => {
+                    u32::try_from(VInt::deserialize_u64(&mut data)?).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "scoring length exceeds 4GB")
+                    })?
+                }
+            };
             let term_info = TermInfo {
                 doc_freq,
                 postings_range: postings_start..postings_end,
                 positions_range: positions_start..positions_end,
                 pnorms_offset,
+                pnorms_num_bytes,
             };
             self.term_infos.push(term_info);
             postings_start = postings_end;
             positions_start = positions_end;
+            if version == TermInfoVersion::V3 {
+                if let Some(offset) = &mut pnorms_offset {
+                    *offset = offset
+                        .checked_add(u64::from(pnorms_num_bytes))
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "scoring offset overflow")
+                        })?;
+                }
+            }
         }
         let consumed_len = len_before - data.len();
         Ok(consumed_len)
@@ -226,7 +245,7 @@ impl ValueWriter for TermInfoValueWriter {
             .any(|info| info.pnorms_offset.is_some());
         if has_pnorms {
             VInt(VERSIONED_BLOCK).serialize_into_vec(buffer);
-            TermInfoVersion::V2.serialize(buffer).unwrap();
+            TermInfoVersion::V3.serialize(buffer).unwrap();
         }
         VInt(self.term_infos.len() as u64).serialize_into_vec(buffer);
         if self.term_infos.is_empty() {
@@ -234,26 +253,22 @@ impl ValueWriter for TermInfoValueWriter {
         }
         VInt(self.term_infos[0].postings_range.start as u64).serialize_into_vec(buffer);
         VInt(self.term_infos[0].positions_range.start as u64).serialize_into_vec(buffer);
-        let mut prev_pnorms_offset = None;
+        let mut next_pnorms_offset = None;
         if has_pnorms {
             let start = self.term_infos[0]
                 .pnorms_offset
                 .expect("posting norms must be enabled for every term");
             VInt(start).serialize_into_vec(buffer);
-            prev_pnorms_offset = Some(start);
+            next_pnorms_offset = Some(start);
         }
-        for (i, term_info) in self.term_infos.iter().enumerate() {
+        for term_info in &self.term_infos {
             VInt(term_info.doc_freq as u64).serialize_into_vec(buffer);
             VInt(term_info.postings_range.len() as u64).serialize_into_vec(buffer);
             VInt(term_info.positions_range.len() as u64).serialize_into_vec(buffer);
-            if has_pnorms && i > 0 {
-                let current_offset = term_info
-                    .pnorms_offset
-                    .expect("posting norms must be enabled for every term");
-                debug_assert!(current_offset >= prev_pnorms_offset.unwrap());
-                let delta = current_offset - prev_pnorms_offset.unwrap();
-                VInt(delta).serialize_into_vec(buffer);
-                prev_pnorms_offset = Some(current_offset);
+            if let Some(offset) = &mut next_pnorms_offset {
+                assert_eq!(term_info.pnorms_offset, Some(*offset));
+                VInt(u64::from(term_info.pnorms_num_bytes)).serialize_into_vec(buffer);
+                *offset += u64::from(term_info.pnorms_num_bytes);
             }
         }
     }
@@ -272,6 +287,26 @@ mod tests {
 
     use crate::postings::TermInfo;
     use crate::termdict::sstable_termdict::TermInfoValueReader;
+
+    #[test]
+    fn legacy_scoring_offsets_remain_readable() {
+        let mut bytes = Vec::new();
+        VInt(super::VERSIONED_BLOCK).serialize_into_vec(&mut bytes);
+        crate::postings::TermInfoVersion::V2
+            .serialize(&mut bytes)
+            .unwrap();
+        for value in [2, 10, 20, 500, 3, 4, 5, 6, 7, 8, 9] {
+            VInt(value).serialize_into_vec(&mut bytes);
+        }
+        let mut reader = TermInfoValueReader::default();
+        assert_eq!(reader.load(&bytes).unwrap(), bytes.len());
+        assert_eq!(reader.term_infos[0].pnorms_offset, Some(500));
+        assert_eq!(reader.term_infos[1].pnorms_offset, Some(509));
+        assert!(reader
+            .term_infos
+            .iter()
+            .all(|info| info.pnorms_num_bytes == u32::MAX));
+    }
 
     #[test]
     fn empty_block_clears_previous_values() {
@@ -293,10 +328,10 @@ mod tests {
     fn rejects_unknown_block_version() {
         let mut bytes = Vec::new();
         VInt(super::VERSIONED_BLOCK).serialize_into_vec(&mut bytes);
-        3u32.serialize(&mut bytes).unwrap();
+        4u32.serialize(&mut bytes).unwrap();
         let error = TermInfoValueReader::default().load(&bytes).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("version 3"));
+        assert!(error.to_string().contains("version 4"));
     }
 
     #[test]
@@ -312,6 +347,7 @@ mod tests {
                     postings_range: (i * 4)..((i + 1) * 4),
                     positions_range: i..(i + 1),
                     pnorms_offset: Some(offset),
+                    pnorms_num_bytes: ((i % 7) + 2) as u32,
                 };
                 offset += ((i % 7) + 2) as u64;
                 writer.write(&info);
@@ -332,18 +368,21 @@ mod tests {
             postings_range: 17..45,
             positions_range: 10..122,
             pnorms_offset: None,
+            pnorms_num_bytes: 0,
         });
         term_info_writer.write(&TermInfo {
             doc_freq: 10u32,
             postings_range: 45..450,
             positions_range: 122..1100,
             pnorms_offset: None,
+            pnorms_num_bytes: 0,
         });
         term_info_writer.write(&TermInfo {
             doc_freq: 17u32,
             postings_range: 450..462,
             positions_range: 1100..1302,
             pnorms_offset: None,
+            pnorms_num_bytes: 0,
         });
         let mut buffer = Vec::new();
         term_info_writer.serialize_block(&mut buffer);
@@ -353,6 +392,7 @@ mod tests {
             term_info_reader.value(0),
             &TermInfo {
                 pnorms_offset: None,
+                pnorms_num_bytes: 0,
                 doc_freq: 120u32,
                 postings_range: 17..45,
                 positions_range: 10..122

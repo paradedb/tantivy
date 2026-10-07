@@ -14,6 +14,7 @@ fn make_term_info(term_ord: u64) -> TermInfo {
         postings_range: offset(term_ord)..offset(term_ord + 1),
         positions_range: offset(term_ord) * 2..offset(term_ord + 1) * 2,
         pnorms_offset: None,
+        pnorms_num_bytes: 0,
     }
 }
 
@@ -446,6 +447,7 @@ fn v1_dictionary_remains_readable_and_byte_identical() -> crate::Result<()> {
             postings_range: i * 13..(i + 1) * 13,
             positions_range: i * 3..(i + 1) * 3,
             pnorms_offset: None,
+            pnorms_num_bytes: 0,
         };
         assert_eq!(dictionary.get(&key)?, Some(info.clone()));
         writer.insert(key, &info)?;
@@ -463,6 +465,7 @@ fn dictionary_preserves_norm_offsets_in_lookups_and_streams() -> crate::Result<(
             .map(|i| {
                 let mut info = make_term_info(i);
                 info.pnorms_offset = Some(offset);
+                info.pnorms_num_bytes = info.doc_freq;
                 offset += u64::from(info.doc_freq);
                 info
             })
@@ -509,10 +512,10 @@ fn dictionary_rejects_unknown_versions() -> crate::Result<()> {
     writer.insert("term", &info)?;
     let mut bytes = writer.finish()?;
     let version_offset = bytes.len() - 8;
-    bytes[version_offset..version_offset + 4].copy_from_slice(&3u32.to_le_bytes());
+    bytes[version_offset..version_offset + 4].copy_from_slice(&4u32.to_le_bytes());
     let error = TermDictionary::open(FileSlice::from(bytes)).err().unwrap();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    assert!(error.to_string().contains("version 3"));
+    assert!(error.to_string().contains("version 4"));
     Ok(())
 }
 

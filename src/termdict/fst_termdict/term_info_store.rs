@@ -19,6 +19,7 @@ struct TermInfoBlockMeta {
     postings_offset_nbits: u8,
     positions_offset_nbits: u8,
     pnorms_offset_nbits: u8,
+    pnorms_num_bytes_nbits: u8,
 }
 
 impl TermInfoBlockMeta {
@@ -26,7 +27,8 @@ impl TermInfoBlockMeta {
         u64::SIZE_IN_BYTES
             + version.serialized_size()
             + 3
-            + usize::from(version == TermInfoVersion::V2)
+            + usize::from(version != TermInfoVersion::V1)
+            + usize::from(version == TermInfoVersion::V3)
     }
 
     fn serialize<W: Write + ?Sized>(
@@ -41,8 +43,11 @@ impl TermInfoBlockMeta {
             self.postings_offset_nbits,
             self.positions_offset_nbits,
         ])?;
-        if version == TermInfoVersion::V2 {
+        if version != TermInfoVersion::V1 {
             self.pnorms_offset_nbits.serialize(write)?;
+        }
+        if version == TermInfoVersion::V3 {
+            self.pnorms_num_bytes_nbits.serialize(write)?;
         }
         Ok(())
     }
@@ -60,7 +65,11 @@ impl TermInfoBlockMeta {
             positions_offset_nbits: buffer[2],
             pnorms_offset_nbits: match version {
                 TermInfoVersion::V1 => 0,
-                TermInfoVersion::V2 => u8::deserialize(reader)?,
+                TermInfoVersion::V2 | TermInfoVersion::V3 => u8::deserialize(reader)?,
+            },
+            pnorms_num_bytes_nbits: match version {
+                TermInfoVersion::V1 | TermInfoVersion::V2 => 0,
+                TermInfoVersion::V3 => u8::deserialize(reader)?,
             },
         })
     }
@@ -70,6 +79,7 @@ impl TermInfoBlockMeta {
             + usize::from(self.postings_offset_nbits)
             + usize::from(self.positions_offset_nbits)
             + usize::from(self.pnorms_offset_nbits)
+            + usize::from(self.pnorms_num_bytes_nbits)
     }
 
     // Here inner_offset is the offset within the block, WITHOUT the first term_info.
@@ -112,6 +122,17 @@ impl TermInfoBlockMeta {
                         self.pnorms_offset_nbits,
                     )
             }),
+            pnorms_num_bytes: if self.ref_term_info.pnorms_num_bytes == u32::MAX {
+                u32::MAX
+            } else {
+                extract_bits(
+                    data,
+                    doc_freq_addr
+                        + usize::from(self.doc_freq_nbits)
+                        + usize::from(self.pnorms_offset_nbits),
+                    self.pnorms_num_bytes_nbits,
+                ) as u32
+            },
         }
     }
 }
@@ -218,6 +239,13 @@ fn bitpack_serialize<W: Write>(
     )?;
     if let Some(offset) = term_info.pnorms_offset {
         bit_packer.write(offset, term_info_block_meta.pnorms_offset_nbits, write)?;
+        if term_info_block_meta.pnorms_num_bytes_nbits > 0 {
+            bit_packer.write(
+                u64::from(term_info.pnorms_num_bytes),
+                term_info_block_meta.pnorms_num_bytes_nbits,
+                write,
+            )?;
+        }
     }
     Ok(())
 }
@@ -246,13 +274,24 @@ impl TermInfoStoreWriter {
         };
         let ref_term_info = self.term_infos[0].clone();
         let version = if self.has_pnorms {
-            TermInfoVersion::V2
+            TermInfoVersion::V3
         } else {
             TermInfoVersion::V1
         };
         let pnorms_offset_nbits = ref_term_info.pnorms_offset.map_or(0, |base| {
             compute_num_bits(last_term_info.pnorms_offset.unwrap() - base)
         });
+        let pnorms_num_bytes_nbits = if self.has_pnorms {
+            compute_num_bits(
+                self.term_infos[1..]
+                    .iter()
+                    .map(|info| u64::from(info.pnorms_num_bytes))
+                    .max()
+                    .unwrap_or(0),
+            )
+        } else {
+            0
+        };
         let postings_end_offset =
             last_term_info.postings_range.end - ref_term_info.postings_range.start;
         let positions_end_offset =
@@ -282,6 +321,7 @@ impl TermInfoStoreWriter {
             postings_offset_nbits: max_postings_offset_nbits,
             positions_offset_nbits: max_positions_offset_nbits,
             pnorms_offset_nbits,
+            pnorms_num_bytes_nbits,
         };
 
         term_info_block_meta.serialize(&mut self.buffer_block_metas, version)?;
@@ -367,23 +407,33 @@ mod tests {
 
     #[test]
     fn test_term_info_block_meta_serialization() {
-        for version in [TermInfoVersion::V1, TermInfoVersion::V2] {
+        for version in [
+            TermInfoVersion::V1,
+            TermInfoVersion::V2,
+            TermInfoVersion::V3,
+        ] {
             let term_info_block_meta = TermInfoBlockMeta {
                 offset: 2009u64,
                 ref_term_info: TermInfo {
                     doc_freq: 512,
                     postings_range: 51..57,
                     positions_range: 110..134,
-                    pnorms_offset: (version == TermInfoVersion::V2).then_some(1 << 40),
+                    pnorms_offset: (version != TermInfoVersion::V1).then_some(1 << 40),
+                    pnorms_num_bytes: match version {
+                        TermInfoVersion::V1 => 0,
+                        TermInfoVersion::V2 => u32::MAX,
+                        TermInfoVersion::V3 => 13,
+                    },
                 },
                 doc_freq_nbits: 10,
                 postings_offset_nbits: 5,
                 positions_offset_nbits: 8,
-                pnorms_offset_nbits: if version == TermInfoVersion::V2 {
+                pnorms_offset_nbits: if version != TermInfoVersion::V1 {
                     11
                 } else {
                     0
                 },
+                pnorms_num_bytes_nbits: if version == TermInfoVersion::V3 { 4 } else { 0 },
             };
             let mut buffer = Vec::new();
             term_info_block_meta
@@ -397,6 +447,53 @@ mod tests {
             );
             assert!(cursor.is_empty());
         }
+    }
+
+    #[test]
+    fn legacy_scoring_offsets_remain_readable() -> crate::Result<()> {
+        use common::BinarySerializable;
+
+        let first = TermInfo {
+            doc_freq: 1,
+            postings_range: 0..10,
+            positions_range: 0..1,
+            pnorms_offset: Some(500),
+            pnorms_num_bytes: u32::MAX,
+        };
+        let mut second = TermInfo {
+            doc_freq: 2,
+            postings_range: 10..20,
+            positions_range: 1..2,
+            pnorms_offset: Some(9),
+            pnorms_num_bytes: u32::MAX,
+        };
+        let meta = TermInfoBlockMeta {
+            offset: 0,
+            ref_term_info: first.clone(),
+            doc_freq_nbits: 2,
+            postings_offset_nbits: 5,
+            positions_offset_nbits: 2,
+            pnorms_offset_nbits: 4,
+            pnorms_num_bytes_nbits: 0,
+        };
+        let mut metadata = Vec::new();
+        meta.serialize(&mut metadata, TermInfoVersion::V2)?;
+        let mut packed = Vec::new();
+        let mut packer = BitPacker::new();
+        super::bitpack_serialize(&mut packed, &mut packer, &meta, &second)?;
+        packer.write(20, 5, &mut packed)?;
+        packer.write(2, 2, &mut packed)?;
+        packer.close(&mut packed)?;
+        let mut bytes = Vec::new();
+        (metadata.len() as u64).serialize(&mut bytes)?;
+        2u64.serialize(&mut bytes)?;
+        bytes.extend(metadata);
+        bytes.extend(packed);
+        let store = TermInfoStore::open(FileSlice::from(bytes), TermInfoVersion::V2)?;
+        second.pnorms_offset = Some(509);
+        assert_eq!(store.get(0), first);
+        assert_eq!(store.get(1), second);
+        Ok(())
     }
 
     #[test]
@@ -414,6 +511,7 @@ mod tests {
                         postings_range: offset(i)..offset(i + 1),
                         positions_range: offset(i) * 3..offset(i + 1) * 3,
                         pnorms_offset: norm_offset,
+                        pnorms_num_bytes: if norm_offset.is_some() { i as u32 } else { 0 },
                     };
                     if let Some(offset) = &mut norm_offset {
                         *offset += u64::from(term_info.doc_freq);
@@ -424,14 +522,14 @@ mod tests {
                 let mut buffer = Vec::new();
                 store_writer.serialize(&mut buffer)?;
                 let version = if store_writer.has_pnorms() {
-                    TermInfoVersion::V2
+                    TermInfoVersion::V3
                 } else {
                     TermInfoVersion::V1
                 };
                 if initial_norm_offset.is_none() {
                     plain_len = buffer.len();
                 } else if count >= 256 {
-                    assert!(buffer.len() - plain_len < count * 3);
+                    assert!(buffer.len() - plain_len < count * 5);
                 }
                 let term_info_store = TermInfoStore::open(FileSlice::from(buffer), version)?;
                 assert_eq!(term_info_store.num_terms(), count);

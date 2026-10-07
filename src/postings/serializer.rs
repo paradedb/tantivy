@@ -202,6 +202,7 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             postings_range: addr..addr,
             positions_range: positions_start..positions_start,
             pnorms_offset: None,
+            pnorms_num_bytes: 0,
         }
     }
 
@@ -292,6 +293,10 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
                 .unwrap_or(&[]);
             self.current_term_info.pnorms_offset =
                 Some(pnorms_writer.write_term(packed_blocks, tail_vint)?);
+            self.current_term_info.pnorms_num_bytes =
+                u32::try_from(packed_blocks.len() + tail_vint.len())
+                    .expect("term scoring data exceeds 4GB");
+            assert_ne!(self.current_term_info.pnorms_num_bytes, u32::MAX);
             self.postings_serializer.clear_pnorms();
         }
         self.current_term_info.postings_range.end = self.postings_offset();

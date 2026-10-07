@@ -22,6 +22,7 @@ pub struct BufferedFileSlice {
     buffer: RefCell<OwnedBytes>,
     buffer_range: RefCell<Range<u64>>,
     buffer_max_size: usize,
+    buffer_by_storage_block: bool,
 }
 
 impl BufferedFileSlice {
@@ -35,7 +36,14 @@ impl BufferedFileSlice {
             buffer: RefCell::new(OwnedBytes::empty()),
             buffer_range: RefCell::new(0..0),
             buffer_max_size,
+            buffer_by_storage_block: false,
         }
+    }
+
+    /// Aligns retained buffers to storage pages when the backend exposes them.
+    pub fn with_storage_block_buffer(mut self) -> Self {
+        self.buffer_by_storage_block = self.file_slice.storage_block_len().is_some();
+        self
     }
 
     /// Creates a new `BufferedFileSlice` with a default buffer max size.
@@ -88,6 +96,10 @@ impl BufferedFileSlice {
                 ));
             }
 
+            if required_range.is_empty() {
+                return Ok(OwnedBytes::empty());
+            }
+
             if (required_range.end - required_range.start) as usize > self.buffer_max_size {
                 // This read is larger than our buffer max size.
                 // Read it directly and bypass the buffer to avoid churning.
@@ -96,12 +108,23 @@ impl BufferedFileSlice {
                     .read_bytes_slice(required_range.start as usize..required_range.end as usize);
             }
 
-            let new_buffer_start = required_range.start;
-            let new_buffer_end = min(
-                new_buffer_start + self.buffer_max_size as u64,
-                self.file_slice.len() as u64,
-            );
-            let read_range = new_buffer_start..new_buffer_end;
+            let read_range = if self.buffer_by_storage_block {
+                let block = self
+                    .file_slice
+                    .storage_block_range(required_range.start as usize)
+                    .unwrap();
+                if required_range.end <= block.end as u64 {
+                    block.start as u64..block.end as u64
+                } else {
+                    required_range.clone()
+                }
+            } else {
+                let end = min(
+                    required_range.start + self.buffer_max_size as u64,
+                    self.file_slice.len() as u64,
+                );
+                required_range.start..end
+            };
 
             let new_buffer = self
                 .file_slice
@@ -117,5 +140,55 @@ impl BufferedFileSlice {
         let local_start = (required_range.start - buffer_range.start) as usize;
         let local_end = (required_range.end - buffer_range.start) as usize;
         Ok(buffer.slice(local_start..local_end))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::file_slice::FileHandle;
+
+    #[derive(Debug)]
+    struct PagedFile {
+        reads: Arc<Mutex<Vec<Range<usize>>>>,
+        data: Vec<u8>,
+    }
+
+    impl HasLen for PagedFile {
+        fn len(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    impl FileHandle for PagedFile {
+        fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+            self.reads.lock().unwrap().push(range.clone());
+            Ok(OwnedBytes::new(self.data[range].to_vec()))
+        }
+
+        fn storage_block_len(&self) -> Option<usize> {
+            Some(8)
+        }
+    }
+
+    #[test]
+    fn storage_block_buffer_handles_slices_and_boundaries() {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let file = FileSlice::new(Arc::new(PagedFile {
+            reads: reads.clone(),
+            data: (0..32).collect(),
+        }));
+        let buffer = BufferedFileSlice::new(file.slice(2..25), 8).with_storage_block_buffer();
+        for range in [1..4, 0..1, 5..8, 8..9, 22..23, 23..23, 0..20] {
+            let expected: Vec<u8> = range.clone().map(|i| (i + 2) as u8).collect();
+            assert_eq!(buffer.get_bytes(range).unwrap().as_slice(), expected);
+        }
+        assert_eq!(
+            *reads.lock().unwrap(),
+            vec![2..8, 7..10, 8..16, 24..25, 2..22]
+        );
+        assert!(buffer.get_bytes(23..24).is_err());
     }
 }

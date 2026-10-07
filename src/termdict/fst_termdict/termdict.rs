@@ -82,7 +82,7 @@ where W: Write
             let footer_size = counting_writer.written_bytes();
             footer_size.serialize(&mut counting_writer)?;
             let version = if self.term_info_store_writer.has_pnorms() {
-                TermInfoVersion::V2
+                TermInfoVersion::V3
             } else {
                 TermInfoVersion::V1
             };

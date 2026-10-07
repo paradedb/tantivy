@@ -252,8 +252,11 @@ impl InvertedIndexReader {
             .slice(term_info.postings_range.clone());
         let postings_bytes = postings_slice.read_bytes()?;
         block_postings.reset(term_info.doc_freq, postings_bytes)?;
-        block_postings
-            .set_term_norm_source(self.pnorms_file_slice.clone(), term_info.pnorms_offset);
+        block_postings.set_term_norm_source(
+            self.pnorms_file_slice.clone(),
+            term_info.pnorms_offset,
+            term_info.pnorms_num_bytes,
+        );
         Ok(())
     }
 
@@ -290,7 +293,11 @@ impl InvertedIndexReader {
             requested_option,
             self.has_pnorms(),
         )?;
-        postings.set_term_norm_source(self.pnorms_file_slice.clone(), term_info.pnorms_offset);
+        postings.set_term_norm_source(
+            self.pnorms_file_slice.clone(),
+            term_info.pnorms_offset,
+            term_info.pnorms_num_bytes,
+        );
         Ok(postings)
     }
 

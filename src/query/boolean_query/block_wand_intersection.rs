@@ -1240,7 +1240,7 @@ mod tests {
         for secondary in &mut shared[1..] {
             secondary
                 .block_cursor()
-                .set_term_norm_source(Some(FileSlice::empty()), Some(0));
+                .set_term_norm_source(Some(FileSlice::empty()), Some(0), 0);
         }
         let actual = compute_checkpoints_block_wand_intersection(shared, 10, None);
         assert_eq!(actual, expected);

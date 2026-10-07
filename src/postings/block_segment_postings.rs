@@ -314,10 +314,11 @@ impl BlockSegmentPostings {
         &mut self,
         source: Option<FileSlice>,
         norm_offset: Option<u64>,
+        norm_len: u32,
     ) {
-        self.term_norms = source
-            .zip(norm_offset)
-            .map(|(source, offset)| super::term_norms::TermNormReader::new(source, offset));
+        self.term_norms = source.zip(norm_offset).map(|(source, offset)| {
+            super::term_norms::TermNormReader::new(source, offset, norm_len)
+        });
         self.scoring_loaded.set(ScoringLoadedFlags::default());
     }
 
@@ -1120,7 +1121,7 @@ mod tests {
             (None, None),
         ] {
             let present = file.is_some() && offset.is_some();
-            postings.set_term_norm_source(file, offset);
+            postings.set_term_norm_source(file, offset, 1);
             assert_eq!(postings.term_norms.is_some(), present);
         }
     }

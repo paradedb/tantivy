@@ -553,6 +553,7 @@ mod tests {
             term_info,
             TermInfo {
                 pnorms_offset: None,
+                pnorms_num_bytes: 0,
                 doc_freq: 1,
                 postings_range: 2..4,
                 positions_range: 2..5
@@ -593,6 +594,7 @@ mod tests {
             term_info,
             TermInfo {
                 pnorms_offset: None,
+                pnorms_num_bytes: 0,
                 doc_freq: 1,
                 postings_range: 0..1,
                 positions_range: 0..0

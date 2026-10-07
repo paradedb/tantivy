@@ -8,6 +8,7 @@ use common::{BinarySerializable, FixedSize};
 pub(crate) enum TermInfoVersion {
     V1 = 1,
     V2 = 2,
+    V3 = 3,
 }
 
 impl TermInfoVersion {
@@ -16,6 +17,7 @@ impl TermInfoVersion {
         match self {
             Self::V1 => base,
             Self::V2 => base + u64::SIZE_IN_BYTES,
+            Self::V3 => base + u64::SIZE_IN_BYTES + u32::SIZE_IN_BYTES,
         }
     }
 }
@@ -29,6 +31,7 @@ impl BinarySerializable for TermInfoVersion {
         match u32::deserialize(reader)? {
             1 => Ok(Self::V1),
             2 => Ok(Self::V2),
+            3 => Ok(Self::V3),
             version => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Unsupported term metadata version {version}"),
@@ -49,6 +52,8 @@ pub struct TermInfo {
     pub positions_range: Range<usize>,
     /// Byte offset of this term's norms in the field's `.pnorm` data, when enabled.
     pub pnorms_offset: Option<u64>,
+    /// Encoded scoring length; `u32::MAX` marks legacy metadata without a length.
+    pub pnorms_num_bytes: u32,
 }
 
 impl TermInfo {
@@ -70,7 +75,7 @@ impl FixedSize for TermInfo {
     /// This is large, but in practise, `TermInfo` are encoded in blocks and
     /// only the first `TermInfo` of a block is serialized uncompressed.
     /// The subsequent `TermInfo` are delta encoded and bitpacked.
-    const SIZE_IN_BYTES: usize = TermInfoVersion::V2.serialized_size();
+    const SIZE_IN_BYTES: usize = TermInfoVersion::V3.serialized_size();
 }
 
 impl TermInfo {
@@ -87,6 +92,10 @@ impl TermInfo {
         match version {
             TermInfoVersion::V1 => Ok(()),
             TermInfoVersion::V2 => self.pnorms_offset.unwrap_or(u64::MAX).serialize(writer),
+            TermInfoVersion::V3 => {
+                self.pnorms_offset.unwrap_or(u64::MAX).serialize(writer)?;
+                self.pnorms_num_bytes.serialize(writer)
+            }
         }
     }
 
@@ -103,27 +112,39 @@ impl TermInfo {
         let positions_end_offset = positions_start_offset + positions_num_bytes;
         let pnorms_offset = match version {
             TermInfoVersion::V1 => None,
-            TermInfoVersion::V2 => {
+            TermInfoVersion::V2 | TermInfoVersion::V3 => {
                 let offset = u64::deserialize(reader)?;
                 (offset != u64::MAX).then_some(offset)
             }
+        };
+        let pnorms_num_bytes = match version {
+            TermInfoVersion::V1 => 0,
+            TermInfoVersion::V2 => {
+                if pnorms_offset.is_some() {
+                    u32::MAX
+                } else {
+                    0
+                }
+            }
+            TermInfoVersion::V3 => u32::deserialize(reader)?,
         };
         Ok(TermInfo {
             doc_freq,
             postings_range: postings_start_offset..postings_end_offset,
             positions_range: positions_start_offset..positions_end_offset,
             pnorms_offset,
+            pnorms_num_bytes,
         })
     }
 }
 
 impl BinarySerializable for TermInfo {
     fn serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
-        self.serialize_versioned(writer, TermInfoVersion::V2)
+        self.serialize_versioned(writer, TermInfoVersion::V3)
     }
 
     fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        Self::deserialize_versioned(reader, TermInfoVersion::V2)
+        Self::deserialize_versioned(reader, TermInfoVersion::V3)
     }
 }
 
@@ -135,19 +156,27 @@ mod tests {
 
     #[test]
     fn versioned_roundtrip() -> std::io::Result<()> {
-        for version in [TermInfoVersion::V1, TermInfoVersion::V2] {
+        for version in [
+            TermInfoVersion::V1,
+            TermInfoVersion::V2,
+            TermInfoVersion::V3,
+        ] {
             for pnorms_offset in [None, Some(0), Some(1 << 40)] {
                 let mut expected = TermInfo {
                     doc_freq: 3,
                     postings_range: 10..20,
                     positions_range: 30..40,
                     pnorms_offset,
+                    pnorms_num_bytes: if pnorms_offset.is_some() { 123 } else { 0 },
                 };
                 let mut bytes = Vec::new();
                 expected.serialize_versioned(&mut bytes, version)?;
                 assert_eq!(bytes.len(), version.serialized_size());
                 if version == TermInfoVersion::V1 {
                     expected.pnorms_offset = None;
+                    expected.pnorms_num_bytes = 0;
+                } else if version == TermInfoVersion::V2 && pnorms_offset.is_some() {
+                    expected.pnorms_num_bytes = u32::MAX;
                 }
                 let mut bytes = bytes.as_slice();
                 assert_eq!(

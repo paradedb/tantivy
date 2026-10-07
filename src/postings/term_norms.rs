@@ -64,13 +64,20 @@ pub(crate) struct TermNormReader {
 }
 
 impl TermNormReader {
-    pub(crate) fn new(source: FileSlice, offset: u64) -> Self {
+    pub(crate) fn new(source: FileSlice, offset: u64, len: u32) -> Self {
         // Unscored queries must not fail on a norm stream they never read.
-        if offset <= source.len() as u64 {
-            let slice = source.slice_from(offset as usize);
+        let end = if len == u32::MAX {
+            Some(source.len() as u64)
+        } else {
+            offset.checked_add(u64::from(len))
+        };
+        if let Some(end) = end.filter(|&end| offset <= end && end <= source.len() as u64) {
+            let slice = source.slice(offset as usize..end as usize);
             let slice_len = slice.len();
             Self {
-                buffer: Some(BufferedFileSlice::new(slice, BUFFER_SIZE)),
+                buffer: Some(
+                    BufferedFileSlice::new(slice, BUFFER_SIZE).with_storage_block_buffer(),
+                ),
                 slice_len,
             }
         } else {
@@ -409,6 +416,73 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct PagedFile(TrackedFile);
+
+    impl HasLen for PagedFile {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    impl FileHandle for PagedFile {
+        fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+            self.0.read_bytes(range)
+        }
+
+        fn storage_block_len(&self) -> Option<usize> {
+            Some(8152)
+        }
+    }
+
+    #[test]
+    fn paged_scoring_reuses_storage_block() {
+        use crate::postings::compression::BlockEncoder;
+
+        let freqs: Vec<u32> = (0..128).map(|i| i % 7 + 1).collect();
+        let norms: Vec<u32> = (0..128).map(|i| i * 3 + 10).collect();
+        let mut encoder = BlockEncoder::new();
+        let (tf_bits, tf_bytes) = encoder.compress_block_unsorted(&freqs, true);
+        let tf_bytes = tf_bytes.to_vec();
+        let (norm_bits, norm_bytes) = encoder.compress_block_unsorted(&norms, false);
+        let norm_len = (tf_bytes.len() + norm_bytes.len()) as u32;
+        let mut data = vec![0; 500];
+        data.extend_from_slice(&tf_bytes);
+        data.extend_from_slice(norm_bytes);
+        data.resize(20_000, 0);
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let reader = TermNormReader::new(
+            FileSlice::new(Arc::new(PagedFile(TrackedFile {
+                reads: reads.clone(),
+                data,
+            }))),
+            500,
+            norm_len,
+        );
+        let mut freq_decoder = BlockDecoder::default();
+        let mut norm_decoder = BlockDecoder::default();
+        reader
+            .decode_fieldnorm_packed_block(
+                0,
+                BlockBitwidths {
+                    tf: tf_bits,
+                    pnorm: norm_bits,
+                },
+                &mut norm_decoder,
+            )
+            .unwrap();
+        reader
+            .decode_freq_packed_block(0, tf_bits, &mut freq_decoder)
+            .unwrap();
+        assert_eq!(freq_decoder.output_array(), freqs.as_slice());
+        assert_eq!(norm_decoder.output_array(), norms.as_slice());
+        assert_eq!(*reads.lock().unwrap(), vec![500..500 + norm_len as usize]);
+        assert!(reader
+            .decode_freq_packed_block(norm_len as usize, tf_bits, &mut freq_decoder)
+            .is_err());
+        assert_eq!(reads.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn lazy_reads_and_retained_bytes() {
         let reads = Arc::new(Mutex::new(Vec::new()));
@@ -419,12 +493,16 @@ mod tests {
         writer.write_slice(&data[..10]).unwrap();
         let ((block_specs, tail_offset), norm_offset) =
             writer.write_slice(&data[10..29010]).unwrap();
-        writer.write_slice(&data[29010..]).unwrap();
+        let (_, next_offset) = writer.write_slice(&data[29010..]).unwrap();
         let file = FileSlice::new(Arc::new(TrackedFile {
             reads: reads.clone(),
             data: bytes,
         }));
-        let reader = TermNormReader::new(file.clone(), norm_offset);
+        let reader = TermNormReader::new(
+            file.clone(),
+            norm_offset,
+            (next_offset - norm_offset) as u32,
+        );
         assert!(reads.lock().unwrap().is_empty());
         let mut decoder = BlockDecoder::default();
         // Block 0 (ordinals 0..128)
@@ -471,10 +549,10 @@ mod tests {
         assert!(reader
             .decode_packed_block(usize::MAX, 1, &mut decoder)
             .is_err());
-        assert!(TermNormReader::new(file.clone(), u64::MAX)
+        assert!(TermNormReader::new(file.clone(), u64::MAX, 1)
             .decode_packed_block(0, 1, &mut decoder)
             .is_err());
-        assert!(TermNormReader::new(file, 29999)
+        assert!(TermNormReader::new(file, 29999, 1)
             .decode_packed_block(usize::MAX, 1, &mut decoder)
             .is_err());
         let empty = TermNormReader::empty();
@@ -490,8 +568,9 @@ mod tests {
         let mut targets = Vec::new();
         for term in 0..1_000_000 {
             let (_, offset) = writer.write_slice(&[(term % 251) as u32]).unwrap();
+            let len = (writer.write.written_bytes() - offset) as u32;
             if term == 0 || term == 123_456 || term == 999_999 {
-                targets.push((term, offset));
+                targets.push((term, offset, len));
             }
         }
         let reads = Arc::new(Mutex::new(Vec::new()));
@@ -500,9 +579,9 @@ mod tests {
             data: bytes,
         }));
         let mut decoder = BlockDecoder::default();
-        for (term, offset) in targets {
+        for (term, offset, len) in targets {
             reads.lock().unwrap().clear();
-            let reader = TermNormReader::new(file.clone(), offset);
+            let reader = TermNormReader::new(file.clone(), offset, len);
             assert!(reads.lock().unwrap().is_empty());
             for _ in 0..100 {
                 reader.decode_vint_block(0, 1, &mut decoder).unwrap();
@@ -512,7 +591,7 @@ mod tests {
             assert_eq!(ranges.len(), 1);
             let range = &ranges[0];
             assert_eq!(range.start, offset as usize);
-            assert!(range.len() <= 8192);
+            assert_eq!(range.len(), len as usize);
         }
     }
 

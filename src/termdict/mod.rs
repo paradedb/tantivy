@@ -294,7 +294,7 @@ impl<W: io::Write> TermDictionaryBuilder<W> {
         let mut writer = self.inner.finish()?;
         (CURRENT_TYPE as u32).serialize(&mut writer)?;
         if self.has_pnorms {
-            TermInfoVersion::V2.serialize(&mut writer)?;
+            TermInfoVersion::V3.serialize(&mut writer)?;
             VERSIONED_FOOTER_MAGIC.serialize(&mut writer)?;
         }
         Ok(writer)
