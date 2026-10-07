@@ -31,12 +31,11 @@ impl WorkModel {
                 // deletes only ever cheapen a scan. As-written counts are stable and free;
                 // Merges purge deletions; shared cluster counts stay fixed.
                 n_native += ivf.num_docs() as u64;
-                if let Some(meta) = ivf.centroid_index_meta() {
-                    if shared.contains(meta) {
-                        continue;
-                    }
-                    shared.push(meta.clone());
+                let meta = ivf.centroid_index_meta();
+                if shared.contains(meta) {
+                    continue;
                 }
+                shared.push(meta.clone());
                 clusters += ivf.num_clusters() as u64;
             }
         }
@@ -63,9 +62,8 @@ impl WorkModel {
 /// All defaults are provisional pending real-data benchmarking.
 #[derive(Clone, Debug)]
 pub struct AdaptiveProbeParams {
-    /// Filter-effective work ceiling as a fraction of capacity. Shared-centroid
-    /// indexes resolve this once across the query; legacy indexes resolve it
-    /// per segment. A selective filter probes deeper within the same budget.
+    /// Filter-effective work ceiling as a fraction of capacity, resolved once
+    /// across the query. A selective filter probes deeper within the same budget.
     /// Default 0.01, PROVISIONAL.
     pub max_probe_fraction: f32,
     /// Lower bound on the resolved budget, in work units, applied before

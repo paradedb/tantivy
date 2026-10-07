@@ -1476,20 +1476,11 @@ pub(crate) struct VectorFieldReader {
 }
 
 #[derive(Clone)]
-enum CentroidSlices {
-    Local(
-        super::header::VectorFileVersion,
-        FileSlice,
-        FileSlice,
-        FileSlice,
-        FileSlice,
-    ),
-    Shared(
-        Arc<super::ivf::RouterIndex>,
-        super::ivf::SharedSegmentMeta,
-        FileSlice,
-        FileSlice,
-    ),
+struct CentroidSlices {
+    router: Arc<super::ivf::RouterIndex>,
+    meta: super::ivf::SharedSegmentMeta,
+    offsets: FileSlice,
+    bounds: FileSlice,
 }
 
 struct VectorSource {
@@ -1587,80 +1578,43 @@ impl VectorFieldReader {
             .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))
         {
             Ok(file) => {
-                let (centroids_version, body) = read_centroid_header(&file)?;
+                let (_, body) = read_centroid_header(&file)?;
                 let composite = CompositeFile::open(&body)?;
-                if centroids_version == super::header::VectorFileVersion::V5 {
-                    if composite
-                        .field_indices()
-                        .any(|(_, slot)| ![0, 1, 3].contains(&slot))
-                    {
-                        return Err(
-                            DataCorruption::comment_only("invalid shared centroid slots").into(),
-                        );
-                    }
-                    let slot = |slot: CentroidSlot| {
-                        composite
-                            .open_read_with_idx(field, slot.index())
-                            .ok_or_else(|| {
-                                DataCorruption::comment_only("missing shared centroid slot")
-                            })
-                    };
-                    let meta: super::ivf::SharedSegmentMeta =
-                        serde_json::from_slice(&slot(CentroidSlot::Centroids)?.read_bytes()?)
-                            .map_err(|error| DataCorruption::comment_only(error.to_string()))?;
-                    if Some(&meta.centroid_index) != segment_reader.index().centroid_index_meta() {
-                        return Err(DataCorruption::comment_only(
-                            "segment centroid index does not match its index",
-                        )
-                        .into());
-                    }
-                    let routers =
-                        segment_reader
-                            .index()
-                            .cached_centroid_index()?
-                            .ok_or_else(|| {
-                                DataCorruption::comment_only("missing shared centroid index")
-                            })?;
-                    let router = routers.get(&field).ok_or_else(|| {
-                        DataCorruption::comment_only("missing shared centroid field")
-                    })?;
-                    Some(CentroidSlices::Shared(
-                        Arc::clone(router),
-                        meta,
-                        slot(CentroidSlot::Offsets)?,
-                        slot(CentroidSlot::Bounds)?,
-                    ))
-                } else {
-                    match (
-                        composite.open_read_with_idx(field, CentroidSlot::Centroids.index()),
-                        composite.open_read_with_idx(field, CentroidSlot::Offsets.index()),
-                        composite.open_read_with_idx(field, CentroidSlot::Router.index()),
-                        composite.open_read_with_idx(field, CentroidSlot::Bounds.index()),
-                    ) {
-                        (Some(centroids), Some(offsets), Some(router), Some(bounds)) => {
-                            Some(CentroidSlices::Local(
-                                centroids_version,
-                                centroids,
-                                offsets,
-                                router,
-                                bounds,
-                            ))
-                        }
-                        (Some(_), Some(_), None, _) => {
-                            return Err(TantivyError::InternalError(format!(
-                                "vector field {:?} has no router slot",
-                                entry.name()
-                            )));
-                        }
-                        (Some(_), Some(_), Some(_), None) => {
-                            return Err(TantivyError::InternalError(format!(
-                                "vector field {:?} has no bounds slot",
-                                entry.name()
-                            )));
-                        }
-                        _ => None,
-                    }
+                if composite
+                    .field_indices()
+                    .any(|(_, slot)| ![0, 1, 3].contains(&slot))
+                {
+                    return Err(
+                        DataCorruption::comment_only("invalid shared centroid slots").into(),
+                    );
                 }
+                let slot = |slot: CentroidSlot| {
+                    composite
+                        .open_read_with_idx(field, slot.index())
+                        .ok_or_else(|| DataCorruption::comment_only("missing shared centroid slot"))
+                };
+                let meta: super::ivf::SharedSegmentMeta =
+                    serde_json::from_slice(&slot(CentroidSlot::Centroids)?.read_bytes()?)
+                        .map_err(|error| DataCorruption::comment_only(error.to_string()))?;
+                if Some(&meta.centroid_index) != segment_reader.index().centroid_index_meta() {
+                    return Err(DataCorruption::comment_only(
+                        "segment centroid index does not match its index",
+                    )
+                    .into());
+                }
+                let routers = segment_reader
+                    .index()
+                    .cached_centroid_index()?
+                    .ok_or_else(|| DataCorruption::comment_only("missing shared centroid index"))?;
+                let router = routers
+                    .get(&field)
+                    .ok_or_else(|| DataCorruption::comment_only("missing shared centroid field"))?;
+                Some(CentroidSlices {
+                    router: Arc::clone(router),
+                    meta,
+                    offsets: slot(CentroidSlot::Offsets)?,
+                    bounds: slot(CentroidSlot::Bounds)?,
+                })
             }
             Err(OpenReadError::FileDoesNotExist(_)) => None,
             Err(err) => return Err(err.into()),
@@ -1712,19 +1666,19 @@ impl VectorIndexReader {
             value: OnceLock::new(),
         };
         let index = match centroid_slots {
-            Some(CentroidSlices::Local(version, centroids, offsets, router, bounds)) => Some(
-                IvfIndex::open(version, &options, centroids, offsets, router, bounds)?,
-            ),
-            Some(CentroidSlices::Shared(router, meta, offsets, bounds)) => {
-                Some(IvfIndex::open_postings(
-                    &options,
-                    router,
-                    Some(meta.centroid_index),
-                    meta.num_docs as usize,
-                    offsets,
-                    bounds,
-                )?)
-            }
+            Some(CentroidSlices {
+                router,
+                meta,
+                offsets,
+                bounds,
+            }) => Some(IvfIndex::open_postings(
+                &options,
+                router,
+                meta.centroid_index,
+                meta.num_docs as usize,
+                offsets,
+                bounds,
+            )?),
             None => None,
         };
         let num_rows = match &index {

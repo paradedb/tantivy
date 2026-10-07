@@ -49,30 +49,16 @@ pub(crate) const VECTOR_FILE_FORMAT_VERSION: u32 = VectorFileVersion::V4 as u32;
 /// Version written to `.vec` files.
 pub(crate) const CURRENT_VECTOR: VectorFileVersion = VectorFileVersion::V4;
 
-/// `.centroids` composite slot indices.
-pub(crate) mod centroid_slot {
-    /// Centroid vectors.
-    pub(crate) const CENTROIDS: usize = 0;
-    /// Per-cluster posting offsets.
-    pub(crate) const OFFSETS: usize = 1;
-    /// Router kind and payload (V3).
-    pub(crate) const ROUTER: usize = 2;
-    /// Per-cluster centroid bounds.
-    pub(crate) const BOUNDS: usize = 3;
-}
-
 /// Slots in a centroid composite file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
 pub(crate) enum CentroidSlot {
-    /// Centroid vectors.
-    Centroids = centroid_slot::CENTROIDS,
+    /// Shared centroid reference and document count.
+    Centroids = 0,
     /// Posting offsets.
-    Offsets = centroid_slot::OFFSETS,
-    /// Routing payload.
-    Router = centroid_slot::ROUTER,
+    Offsets = 1,
     /// Cluster bounds.
-    Bounds = centroid_slot::BOUNDS,
+    Bounds = 3,
 }
 
 impl CentroidSlot {
@@ -155,15 +141,16 @@ pub(crate) fn check_vector_format(file: Result<FileSlice, OpenReadError>) -> cra
     }
 }
 
-/// Writes a legacy `.centroids` header for compatibility tests.
-#[cfg(test)]
-pub(crate) fn write_centroid_header<W: Write + ?Sized>(writer: &mut W) -> io::Result<()> {
-    write_header(writer, VectorFileVersion::V3)
-}
-
 /// Parses a `.centroids` header and returns its version and composite body.
 pub(crate) fn read_centroid_header(file: &FileSlice) -> io::Result<(VectorFileVersion, FileSlice)> {
-    parse_header(file, "centroid")
+    let (version, body) = parse_header(file, "centroid")?;
+    if version != VectorFileVersion::V5 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported centroid format {version:?}; rebuild required"),
+        ));
+    }
+    Ok((version, body))
 }
 
 #[cfg(test)]
@@ -206,6 +193,15 @@ mod tests {
             let mut buf = Vec::new();
             version.serialize(&mut buf).unwrap();
             let error = read_vector_header(&FileSlice::from(buf)).unwrap_err();
+            assert!(error.to_string().contains("rebuild required"));
+        }
+    }
+
+    #[test]
+    fn centroid_headers_before_v5_require_rebuild() {
+        for version in 1_u32..5 {
+            let file = FileSlice::from(version.to_le_bytes().to_vec());
+            let error = read_centroid_header(&file).unwrap_err();
             assert!(error.to_string().contains("rebuild required"));
         }
     }

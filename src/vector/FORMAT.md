@@ -24,15 +24,15 @@ routers are cached across clones of an `Index`; centroid rows remain lazy.
 
 The artifact is closed and synced before metadata publication. Its filename
 is preserved by commits and single-segment finalization, retained by garbage
-collection, and included in checksum validation. Existing metadata without
-`centroid_index` remains valid. A producer cannot install or replace centroids
+collection, and included in checksum validation. Indexes without shared centroids
+omit `centroid_index`. A producer cannot install or replace centroids
 through `open_or_create` on an existing index.
 
 Indexes with this artifact assign flushed vectors and flat merge inputs to their
 most similar stored centroid, breaking ties by the lowest centroid ID. Assignment
 uses an exact scan. Clustered merge inputs must reference the same centroid
-artifact as the target. Merges preserve their
-memberships and row bytes, remap document IDs, and discard deleted documents.
+artifact as the target. Merges preserve their memberships and row bytes, remap
+document IDs, and discard deleted documents.
 Bounds are the per-cluster maximum of source bounds and newly assigned flat-row
 residuals; deleted rows may leave conservative overestimates. Quantized columns
 are encoded using the target settings and the preserved cluster assignments.
@@ -68,21 +68,19 @@ Bounds use the global k-th lower endpoint, treating exact scores as zero-width
 intervals. Quantized layers retain candidates against that same global threshold;
 segments with fewer layers finish reranking while others continue refinement.
 APS advances once per global cluster, using the lowest point estimate among the
-lower-endpoint top-k, as in the legacy segment scan.
+lower-endpoint top-k.
 
 Routing, budget, termination, recall, and bound-arming statistics are recorded
 once in the first segment's stats. Row counts, bounds skips, layer statistics,
 and storage reads remain attributed to their segment.
 
-Indexes without an artifact write flat storage on both flush and merge. Existing
-V3 clustered segments remain readable and become flat when merged without an artifact.
+Indexes without an artifact write flat storage on both flush and merge.
 
 ## File headers and entries
 
 `.vec` uses a little-endian u32 version header, with current and supported version
-**4**. Other versions fail with “rebuild required.” The `.centroids` version
-**3** stores segment-local routing, offsets, and bounds; version **5** uses the
-shared centroid artifact as described above.
+**4**. The `.centroids` version is **5**, referencing the shared centroid artifact
+as described above. Other versions of either file require rebuilding the index.
 `VectorQuantizationConfig.format_version = 3` identifies the independent index
 settings grammar; settings specify the target for future builds.
 

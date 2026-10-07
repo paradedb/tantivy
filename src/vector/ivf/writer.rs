@@ -497,7 +497,8 @@ pub(crate) fn merge_shared(ctx: &PluginMergeContext) -> crate::Result<()> {
         let mut bounds = BoundsBuilder::new(writer.routers[&field].num_clusters());
         for reader in &readers {
             if let Some(source) = reader.index() {
-                if source.centroid_index_meta() != ctx.target_segment.index().centroid_index_meta()
+                if Some(source.centroid_index_meta())
+                    != ctx.target_segment.index().centroid_index_meta()
                 {
                     return Err(TantivyError::InvalidArgument(
                         "cannot preserve memberships from a different centroid index".into(),

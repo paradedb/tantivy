@@ -1364,13 +1364,13 @@ fn unsupported_vector_versions_remain_typed_on_open_and_merge() -> crate::Result
 }
 
 #[test]
-fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()> {
+fn vector_format_mismatch_precedes_centroid_format_mismatch() -> crate::Result<()> {
     use std::io::Write;
 
     use common::TerminatingWrite;
 
     use crate::directory::error::Incompatibility;
-    use crate::directory::{CompositeWrite, Directory, RamDirectory};
+    use crate::directory::{Directory, RamDirectory};
     use crate::index::SegmentComponent;
 
     let directory = RamDirectory::create();
@@ -1385,20 +1385,9 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
     let segment = index.searchable_segments()?.remove(0);
     let vec_path = segment.relative_path(SegmentComponent::Custom(super::VEC_EXT.into()));
     let mut bytes = directory.atomic_read(&vec_path)?;
-    let mut centroids = 2u32.to_le_bytes().to_vec();
-    let mut composite = CompositeWrite::wrap(&mut centroids);
-    for slot in [
-        super::header::CentroidSlot::Centroids,
-        super::header::CentroidSlot::Offsets,
-    ] {
-        composite
-            .for_field_with_idx(field, slot.index())
-            .write_all(&[0; 8])?;
-    }
-    composite.close()?;
     let mut centroid_file =
         segment.open_write(SegmentComponent::Custom(super::ivf::CENTROIDS_EXT.into()))?;
-    centroid_file.write_all(&centroids)?;
+    centroid_file.write_all(&2u32.to_le_bytes())?;
     centroid_file.terminate()?;
     for version in [2u32, 3, 4] {
         bytes[..4].copy_from_slice(&version.to_le_bytes());
@@ -1412,7 +1401,7 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
             segment.validate_vector_format()?;
             reader.validate_vector_format()?;
             assert!(
-                matches!(error, crate::TantivyError::InternalError(ref message) if message.contains("no router slot")),
+                matches!(error, crate::TantivyError::IoError(ref error) if error.to_string().contains("unsupported centroid format")),
                 "{error:?}"
             );
         } else {

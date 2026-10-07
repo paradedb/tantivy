@@ -1,39 +1,15 @@
-//! The `.centroids` file and its reader, [`IvfIndex`] — the per-field IVF
-//! routing index. This module owns the wire format end to end: the
-//! serializers the merge calls and the [`IvfIndex::open`] that parses them
-//! back sit side by side.
-//!
-//! The on-disk file is a 4-byte format-version stamp (see `vector::header`)
-//! followed by a [`CompositeFile`](crate::directory::CompositeFile). Written
-//! per field, only for IVF segments (⟺ the field's `.vec` `IdMap` is
-//! `DocLocations`). The composite has four slots per field:
-//!
-//! ```text
-//! [0] num_centroids (u32) + num_docs (u32) + centroid_bytes (N · stride),
-//!     rows in the router's canonical cluster-sorted order when a stacked
-//!     router was built
-//! [1] cluster_offsets (u64[N+1], prefix sum)
-//! [2] a router-kind byte followed by the selected router's payload, REQUIRED
-//! [3] centroid bounds, REQUIRED: a segment-level BoundKind byte,
-//!     then N · stride(kind) f32s in cluster order — for Ball, one f32 per
-//!     cluster: max ||x - c|| over the cluster's members' stored rows against
-//!     the stored centroid (the merge documents the metric-uniform fold).
-//! ```
-//!
-//! V5 segments instead store a centroid-artifact reference and document count in slot 0,
-//! omit slot 2, and use the index's shared router. See `vector/FORMAT.md`.
-//! Earlier bare-router and router-less layouts are not supported.
+//! Per-segment IVF postings and bounds, referencing the shared centroid router.
+//! The V5 `.centroids` layout is described in `vector/FORMAT.md`.
 use std::io::{self, Write};
 use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
 
-use common::{BinarySerializable, HasLen, OwnedBytes};
+use common::{BinarySerializable, OwnedBytes};
 
 use crate::directory::FileSlice;
 use crate::index::CentroidIndexMeta;
 use crate::schema::{Metric, VectorOptions};
-use crate::vector::header::VectorFileVersion;
 use crate::vector::ivf::RecallEstimator;
 use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RouterWorkspace, RoutingParams};
 use crate::vector::{BoundKind, BoundStore};
@@ -47,7 +23,7 @@ use crate::vector::{BoundKind, BoundStore};
 /// at a time as routing visits them. Everything row-scale (the rows and
 /// id-map) lives on [`VectorIndexReader`](crate::vector::VectorIndexReader).
 pub struct IvfIndex {
-    centroid_index: Option<CentroidIndexMeta>,
+    centroid_index: CentroidIndexMeta,
     routing: Arc<RouterIndex>,
     /// Distinct documents with a vector in this field.
     num_docs: usize,
@@ -70,36 +46,6 @@ pub(crate) struct RouterIndex {
 }
 
 impl IvfIndex {
-    /// Write slot `[0]` of the `.centroids` composite for a field. `num_docs`
-    /// is the number of distinct docs assigned, not the posting-row total.
-    #[cfg(test)]
-    pub(crate) fn serialize_centroids<W: Write + ?Sized>(
-        num_centroids: usize,
-        num_docs: usize,
-        centroid_bytes: &[u8],
-        options: &VectorOptions,
-        out: &mut W,
-    ) -> io::Result<()> {
-        let expected = num_centroids
-            .checked_mul(options.bytes_per_vector())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "centroid byte length overflow")
-            })?;
-        if centroid_bytes.len() != expected {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid IVF centroid byte length",
-            ));
-        }
-        u32::try_from(num_centroids)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "centroid count exceeds u32"))?
-            .serialize(out)?;
-        u32::try_from(num_docs)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "doc count exceeds u32"))?
-            .serialize(out)?;
-        out.write_all(centroid_bytes)
-    }
-
     /// Write slot `[1]` of the `.centroids` composite for a field.
     pub(crate) fn serialize_offsets<W: Write + ?Sized>(
         cluster_offsets: &[u64],
@@ -119,8 +65,7 @@ impl IvfIndex {
     ///   caller's [`BoundsBuilder`] output.
     /// * `out` (`&mut W`) — the slot writer.
     ///
-    /// Returns (`io::Result<()>`): write errors only — the payload length
-    /// is validated at open, against the count words of slot `[0]`.
+    /// The payload length is validated against the shared router at open.
     ///
     /// [`BoundsBuilder`]: crate::vector::BoundsBuilder
     pub(crate) fn serialize_bounds<W: Write + ?Sized>(
@@ -135,65 +80,10 @@ impl IvfIndex {
         Ok(())
     }
 
-    /// Parse a field's `.centroids` slots. Only the count words, the offsets,
-    /// the bounds, and the router topology are materialized; the centroid
-    /// rows stay behind a [`FileSlice`] for lazy per-node reads.
-    /// The router is opened as the kind persisted in `router_slice`.
-    pub(crate) fn open(
-        version: VectorFileVersion,
-        options: &VectorOptions,
-        centroids_slice: FileSlice,
-        offsets_slice: FileSlice,
-        router_slice: FileSlice,
-        bounds_slice: FileSlice,
-    ) -> crate::Result<Self> {
-        let count_words = 2 * mem::size_of::<u32>();
-        if centroids_slice.len() < count_words {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "IVF centroids slot is smaller than its count words",
-            )
-            .into());
-        }
-        let header = centroids_slice.slice_to(count_words).read_bytes()?;
-        let mut reader = header.as_slice();
-        let num_centroids = u32::deserialize(&mut reader)? as usize;
-        let num_docs = u32::deserialize(&mut reader)? as usize;
-        let centroid_len = num_centroids
-            .checked_mul(options.bytes_per_vector())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "centroid byte length overflow")
-            })?;
-        let centroids_slice = centroids_slice.slice_from(count_words);
-        if centroids_slice.len() != centroid_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "IVF centroid byte length mismatch",
-            )
-            .into());
-        }
-
-        let router = RouterKind::open(version, router_slice, centroids_slice.clone(), options)?;
-        let routing = Arc::new(RouterIndex {
-            num_centroids,
-            centroids_slice,
-            metric: options.metric(),
-            router,
-        });
-        Self::open_postings(
-            options,
-            routing,
-            None,
-            num_docs,
-            offsets_slice,
-            bounds_slice,
-        )
-    }
-
     pub(crate) fn open_postings(
         options: &VectorOptions,
         routing: Arc<RouterIndex>,
-        centroid_index: Option<CentroidIndexMeta>,
+        centroid_index: CentroidIndexMeta,
         num_docs: usize,
         offsets_slice: FileSlice,
         bounds_slice: FileSlice,
@@ -269,8 +159,8 @@ impl IvfIndex {
         Ok(index)
     }
 
-    pub(crate) fn centroid_index_meta(&self) -> Option<&CentroidIndexMeta> {
-        self.centroid_index.as_ref()
+    pub(crate) fn centroid_index_meta(&self) -> &CentroidIndexMeta {
+        &self.centroid_index
     }
 
     pub fn num_clusters(&self) -> usize {
@@ -360,7 +250,7 @@ impl RouterIndex {
         centroids_slice: FileSlice,
         router_slice: FileSlice,
     ) -> crate::Result<Self> {
-        let router = RouterKind::open_tagged(router_slice, centroids_slice.clone(), options)?;
+        let router = RouterKind::open(router_slice, centroids_slice.clone(), options)?;
         Ok(Self {
             num_centroids,
             centroids_slice,

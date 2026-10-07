@@ -664,14 +664,6 @@ mod tests {
             assert_eq!(index_settings_deser, index_settings);
         }
         {
-            let mut legacy = serde_json::to_value(&index_settings).unwrap();
-            legacy["vector_clustering_threshold"] = serde_json::json!(1);
-            assert_eq!(
-                serde_json::from_value::<IndexSettings>(legacy).unwrap(),
-                index_settings
-            );
-        }
-        {
             // manual_doc_id_mapping should not be persisted.
             index_settings.manual_doc_id_mapping = true;
             let index_settings_json = serde_json::to_value(&index_settings).unwrap();

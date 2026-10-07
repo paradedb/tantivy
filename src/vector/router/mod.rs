@@ -10,7 +10,6 @@ use super::ivf::graph::{
 use super::ivf::{InMemoryStore, IvfCentroids, LazyStore, MultiLevelIvf, RecallEstimator};
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
-use crate::vector::header::VectorFileVersion;
 
 mod exact;
 mod rng;
@@ -59,24 +58,7 @@ impl RouterKind {
         Ok(router)
     }
 
-    /// Opens the router persisted in a legacy segment, whichever kind it was built with.
     pub(crate) fn open(
-        file_version: VectorFileVersion,
-        slot: FileSlice,
-        centroids: FileSlice,
-        options: &VectorOptions,
-    ) -> crate::Result<OpenedRouter> {
-        if file_version != VectorFileVersion::V3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("routers require vector file version V3, found {file_version:?}"),
-            )
-            .into());
-        }
-        Self::open_tagged(slot, centroids, options)
-    }
-
-    pub(crate) fn open_tagged(
         slot: FileSlice,
         centroids: FileSlice,
         options: &VectorOptions,
@@ -320,12 +302,7 @@ mod tests {
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<_>>(),
         };
-        let opened = RouterKind::open(
-            VectorFileVersion::V3,
-            FileSlice::from(bytes),
-            FileSlice::from(rows),
-            &options,
-        )?;
+        let opened = RouterKind::open(FileSlice::from(bytes), FileSlice::from(rows), &options)?;
         let mut workspace = RouterWorkspace::default();
         let mut ranking = opened.rank(&mut workspace, &[1.1], Metric::L2, RoutingParams::default());
         assert_eq!(ranking.next().unwrap().node, 1);
@@ -351,12 +328,7 @@ mod tests {
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<_>>(),
         };
-        let opened = RouterKind::open(
-            VectorFileVersion::V3,
-            FileSlice::from(bytes),
-            FileSlice::from(rows),
-            &options,
-        )?;
+        let opened = RouterKind::open(FileSlice::from(bytes), FileSlice::from(rows), &options)?;
         let mut workspace = RouterWorkspace::default();
         for query in [[0.1], [1.9]] {
             let mut ranking =
@@ -408,12 +380,7 @@ mod tests {
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<_>>(),
         };
-        RouterKind::open(
-            VectorFileVersion::V3,
-            FileSlice::from(bytes),
-            FileSlice::from(rows),
-            &options,
-        )
+        RouterKind::open(FileSlice::from(bytes), FileSlice::from(rows), &options)
     }
 
     fn stacked_metrics(metrics: RouterMetrics) -> (usize, usize, usize, f32) {
@@ -511,42 +478,18 @@ mod tests {
                     .flat_map(f32::to_le_bytes)
                     .collect::<Vec<_>>(),
             };
-            let opened = RouterKind::open(
-                VectorFileVersion::V3,
-                FileSlice::from(bytes),
-                FileSlice::from(rows),
-                &options,
-            )?;
+            let opened = RouterKind::open(FileSlice::from(bytes), FileSlice::from(rows), &options)?;
             assert_eq!(opened.kind(), kind);
         }
         Ok(())
     }
 
     #[test]
-    fn pre_v3_router_format_is_rejected() {
-        let options = VectorOptions::new(1, Metric::L2);
-        let error = RouterKind::open(
-            VectorFileVersion::V2,
-            FileSlice::empty(),
-            FileSlice::empty(),
-            &options,
-        )
-        .err()
-        .expect("pre-V3 router formats must fail");
-        assert!(error.to_string().contains("require vector file version V3"));
-    }
-
-    #[test]
     fn unknown_router_kind_is_rejected() {
         let options = VectorOptions::new(1, Metric::L2);
-        let error = RouterKind::open(
-            VectorFileVersion::V3,
-            FileSlice::from(vec![u8::MAX]),
-            FileSlice::empty(),
-            &options,
-        )
-        .err()
-        .expect("unknown router kinds must fail");
+        let error = RouterKind::open(FileSlice::from(vec![u8::MAX]), FileSlice::empty(), &options)
+            .err()
+            .expect("unknown router kinds must fail");
         assert!(error.to_string().contains("unknown router kind: 255"));
     }
 }
