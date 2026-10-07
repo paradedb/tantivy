@@ -1,6 +1,7 @@
 /// Global work-unit statistics, computed once at query init across the
 /// index's IVF segments: `n_avg = N / C`, native docs over clusters.
-/// When absent, budgeting falls back to the segment's own ratio.
+/// Shared centroids count once across their segments.
+/// When absent, budgeting uses the probed index's own ratio.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkModel {
     /// Native docs per cluster (as written; see `for_searcher` on
@@ -22,13 +23,20 @@ impl WorkModel {
         field: crate::schema::Field,
     ) -> crate::Result<Option<WorkModel>> {
         let (mut n_native, mut clusters) = (0u64, 0u64);
+        let mut shared = Vec::new();
         for segment_reader in searcher.segment_readers() {
             let vec_reader = segment_reader.vector_index(field)?;
             if let Some(ivf) = vec_reader.index() {
                 // Native docs as WRITTEN: dead rows charge nothing (alive pre-pass), so
                 // deletes only ever cheapen a scan. As-written counts are stable and free;
-                // merges purge deletions and shrink N and C together.
+                // Merges purge deletions; shared cluster counts stay fixed.
                 n_native += ivf.num_docs() as u64;
+                if let Some(meta) = ivf.centroid_index_meta() {
+                    if shared.contains(meta) {
+                        continue;
+                    }
+                    shared.push(meta.clone());
+                }
                 clusters += ivf.num_clusters() as u64;
             }
         }
@@ -55,10 +63,9 @@ impl WorkModel {
 /// All defaults are provisional pending real-data benchmarking.
 #[derive(Clone, Debug)]
 pub struct AdaptiveProbeParams {
-    /// Filter-effective work ceiling, as a FRACTION of the segment's
-    /// capacity and resolved per segment - a fraction tracks each
-    /// segment's own cluster count where an absolute cap cannot; a
-    /// selective filter probes proportionally deeper within it.
+    /// Filter-effective work ceiling as a fraction of capacity. Shared-centroid
+    /// indexes resolve this once across the query; legacy indexes resolve it
+    /// per segment. A selective filter probes deeper within the same budget.
     /// Default 0.01, PROVISIONAL.
     pub max_probe_fraction: f32,
     /// Lower bound on the resolved budget, in work units, applied before
@@ -80,7 +87,8 @@ pub struct AdaptiveProbeParams {
     /// [`APS_MAX_DIM`](crate::vector::ivf::APS_MAX_DIM). Default
     /// [`DEFAULT_ROUTER_RECALL`], PROVISIONAL.
     pub router_recall_target: f32,
-    /// Recall target for the segment's own cluster scan, in `(0, 1]`.
+    /// Recall target for the cluster scan, in `(0, 1]`. Global probing covers
+    /// each shared cluster once after scanning all of its segment fragments.
     /// Below `1.0` the probe loop stops once the estimated recall of the
     /// clusters covered so far reaches it (APS); `1.0` leaves the work
     /// budget as the only bound. Stacked-router segments only, and forced

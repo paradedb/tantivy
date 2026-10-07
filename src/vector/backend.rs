@@ -14,6 +14,8 @@
 #[path = "quantized_boundary_tests.rs"]
 mod quantized_boundary_tests;
 
+pub(crate) mod global;
+mod scoring;
 use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
@@ -23,6 +25,7 @@ use std::time::Instant;
 
 use common::BitSet;
 use quant_model::f16::f16_to_f32;
+use scoring::QuantizedScorer;
 
 use super::bounds::{
     bounds_verdict, margin_ball_ball, margin_ball_halfspace, to_bound_space, HeapPeek, QueryBound,
@@ -40,7 +43,6 @@ use super::prepared::{
 };
 use super::quantization::QUANTIZED_BOUNDARY_KAPPA;
 use super::router::{RouterMetrics, RouterWorkspace, RoutingParams};
-use super::routing::{ClusterRouting, SharedRouting};
 use super::tie_break::NoTieBreak;
 use super::{enter_vector_stage, Similarity, Stage, VectorElement};
 use crate::collector::sort_key::{Comparator, NaturalComparator};
@@ -119,37 +121,17 @@ impl<T: VectorElement> VectorBackend<T> {
         Ok((Cow::Owned(filter), start.elapsed().as_nanos() as u64))
     }
 
-    pub(crate) fn routing_params(
+    pub(crate) fn prepare_filter(
         &mut self,
         weight: &dyn Weight,
         reader: &SegmentReader,
         top_n: usize,
-    ) -> crate::Result<Option<RoutingParams>> {
-        let Some(index) = self.reader.index() else {
-            return Ok(None);
-        };
-        if top_n == 0 || reader.max_doc() == 0 || index.num_docs() == 0 {
-            return Ok(None);
+    ) -> crate::Result<()> {
+        if top_n > 0 && self.reader.index().is_some() {
+            let (filter, elapsed) = self.segment_filter(weight, reader)?;
+            self.filter = Some((filter.into_owned(), elapsed));
         }
-        let (filter, elapsed) = self.segment_filter(weight, reader)?;
-        let params = if filter.is_empty() {
-            None
-        } else {
-            let (budget, _, open) = self
-                .adaptive
-                .resolved_work_budget(index.num_clusters(), index.num_docs())?;
-            Some(RoutingParams {
-                k: self.adaptive.router_k(
-                    budget,
-                    open,
-                    filter.match_fraction(reader.max_doc()),
-                    index.num_clusters(),
-                ),
-                recall: self.adaptive.router_recall_target,
-            })
-        };
-        self.filter = Some((filter.into_owned(), elapsed));
-        Ok(params)
+        Ok(())
     }
 
     pub(crate) fn add_scan_init_ns(&mut self, elapsed_ns: u64) {
@@ -222,30 +204,6 @@ impl<T: VectorElement> VectorBackend<T> {
         K: SegmentSortKeyComputer,
         CTail: Comparator<K::SegmentSortKey>,
     {
-        self.top_n_by_with_routing(
-            None,
-            weight,
-            segment_reader,
-            top_n,
-            tie_break,
-            tie_comparator,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn top_n_by_with_routing<K, CTail>(
-        &self,
-        shared: Option<&SharedRouting<'_>>,
-        weight: &dyn Weight,
-        segment_reader: &SegmentReader,
-        top_n: usize,
-        tie_break: &mut K,
-        tie_comparator: CTail,
-    ) -> crate::Result<(TieBreakHits<K>, ProbeStats)>
-    where
-        K: SegmentSortKeyComputer,
-        CTail: Comparator<K::SegmentSortKey>,
-    {
         #[cfg(test)]
         let trace_docs = super::storage_io::test_support::with_unarmed_log(|| {
             let mut mapping = Vec::new();
@@ -279,7 +237,6 @@ impl<T: VectorElement> VectorBackend<T> {
                 Some(quantized_query) => self.quantized_top_n(
                     index,
                     quantized_query,
-                    shared,
                     weight,
                     segment_reader,
                     top_n,
@@ -289,7 +246,6 @@ impl<T: VectorElement> VectorBackend<T> {
                 )?,
                 None => self.approximate_top_n(
                     index,
-                    shared,
                     weight,
                     segment_reader,
                     top_n,
@@ -661,25 +617,21 @@ pub struct ProbeStats {
     pub routing_graph_result_count: usize,
     /// Clusters rejected by the bounds gate.
     pub bounds_skips: u32,
-    /// Number of segment scans in which the query bound armed.
+    /// Number of probe loops in which the query bound armed.
     pub bound_armed_count: u32,
     /// Sum of the zero-based probe index where the bound armed.
     pub bound_armed_probe_sum: u64,
-    /// How the probe loop terminated. Per-segment; does not sum.
+    /// How probing terminated. Global probe decisions are recorded on the first segment.
     pub termination: ProbeTermination,
-    /// Work units this segment's probe loop charged against its resolved
-    /// budget: opens at `x`, scored rows at `(1 - x)/n_avg`. The
-    /// budget identity is per segment:
-    /// `budget <= work_charged <= budget + last cluster's charge` on
-    /// Ceiling terminations.
-    /// Work units charged by the probe loop.
+    /// Work charged for cluster opens and eligible rows. Global probing records
+    /// the query total on the first segment; subsequent segments report zero.
     pub work_charged: f32,
     /// The resolved work budget the probe loop ran against: the
     /// `max_probe_fraction` ceiling in work units, floored by
     /// `min_probe_clusters`. `0` when no IVF probe loop ran.
     pub work_budget: f32,
     /// The APS recall estimate when the probe loop stopped; absent when
-    /// APS was off or the heap never held `k` results. Per-segment.
+    /// APS was off or the heap never held `k` results. Global estimates are on the first segment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recall_estimate: Option<f32>,
     /// Vector rows in the segment.
@@ -926,14 +878,14 @@ impl std::ops::Mul<f64> for WorkUnits {
     }
 }
 
-/// The resolved per-segment prices the probe loop charges against its
+/// The resolved prices the probe loop charges against its
 /// budget: an open costs `open`, a scored row costs `row`. Built once
-/// per segment from [`AdaptiveProbeParams::resolved_work_budget`]'s
+/// from [`AdaptiveProbeParams::resolved_work_budget`]'s
 /// `(budget, n_avg, x)`.
-/// Per-segment probe budget and event prices.
+/// Probe budget and event prices.
 #[derive(Clone, Copy, Debug)]
 struct UnitPricing {
-    /// Work this segment may spend before the ceiling binds.
+    /// Work this probe loop may spend before the ceiling binds.
     budget: WorkUnits,
     /// The per-index open share `x`: what opening one cluster costs.
     open: WorkUnits,
@@ -948,7 +900,7 @@ struct ProbeController<'a> {
     pricing: UnitPricing,
     work_spent: WorkUnits,
     termination: ProbeTermination,
-    /// Clusters in the segment and clusters pulled from the ranking so far.
+    /// Total clusters and clusters pulled from the ranking so far.
     clusters: usize,
     pulled: usize,
     /// APS over the ranked clusters; `None` when APS is off.
@@ -2078,7 +2030,11 @@ impl QuantizedScanCtx {
     }
 
     fn band(&mut self, top_n: usize, kappa: f32) {
-        let pessimistic_kth = self.pessimistic_kth(top_n, kappa);
+        let threshold = self.pessimistic_kth(top_n, kappa);
+        self.band_at_threshold(threshold, kappa);
+    }
+
+    fn band_at_threshold(&mut self, pessimistic_kth: Option<Threshold>, kappa: f32) {
         self.boundary_scratch.clear();
         for index in 0..self.candidates.len() {
             if pessimistic_kth.is_none_or(|kth| {
@@ -2250,7 +2206,6 @@ impl<T: VectorElement> VectorBackend<T> {
         &self,
         index: &IvfIndex,
         query: &QuantizedQueryCtx,
-        shared: Option<&SharedRouting<'_>>,
         weight: &dyn Weight,
         segment_reader: &SegmentReader,
         top_n: usize,
@@ -2283,10 +2238,6 @@ impl<T: VectorElement> VectorBackend<T> {
         let row_gate = RowGate::new(&filter, alive);
         let mut cluster_docs = Vec::new();
         let scan_levels = query.active_layers();
-        let quantized = self
-            .reader
-            .quantization()
-            .expect("quantized query requires quantized slots");
         stats.segment_rows = Some(index.num_rows());
         stats.segment_clusters = Some(index.num_clusters());
         stats.start_layer(0);
@@ -2301,7 +2252,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut routing_ws = RouterWorkspace::default();
         let candidate_capacity =
             ((pricing.budget.get() / pricing.row.get()).ceil() as usize).min(index.num_rows());
-        let mut scan = QuantizedScanCtx::new(max_doc, candidate_capacity);
+        let mut scorer = QuantizedScorer::new(max_doc, candidate_capacity);
         let mut postings_row = 0usize;
         let mut postings_skipped = 0usize;
         let bounds = index.bounds();
@@ -2310,22 +2261,6 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut bounds_skips = 0u32;
         let mut armed_probe = None;
         let mut selection_offsets = Vec::new();
-        let mut kernel_scores = Vec::new();
-        let mut decoded_scales = Vec::new();
-        let mut decoded_gammas = Vec::new();
-        let mut decoded_error_ratios = Vec::new();
-        let mut decoded_constants = Vec::new();
-        let mut decoded_residual_norms = Vec::new();
-        let mut base_scores = Vec::new();
-        let mut estimate_scores = Vec::new();
-        let mut sigma_scores = Vec::new();
-        let mut residual_norm_squared_scores = Vec::new();
-        let mut sign_query_error_terms = Vec::new();
-        let mut arithmetic_variances = Vec::new();
-        let mut selected_rows = Vec::new();
-        let mut indexed_row_offsets = Vec::new();
-        let mut survivor_read_ranges = Vec::new();
-        let mut survivor_block_scratch = Vec::new();
         drop(init_stage);
         stats.scan_init_ns = stats.scan_init_ns.saturating_add(
             (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
@@ -2343,14 +2278,9 @@ impl<T: VectorElement> VectorBackend<T> {
         let routing_start = Instant::now();
         let (mut ranked, mut controller) = {
             let _routing_stage = enter_vector_stage(Stage::Routing);
-            let ClusterRouting { ranked, estimator } = ClusterRouting::new(
-                shared,
-                index,
-                &mut routing_ws,
-                query.query(),
-                routing,
-                self.adaptive.recall_target,
-            );
+            let ranked = index.rank_clusters(&mut routing_ws, query.query(), routing);
+            let estimator =
+                index.recall_estimator(&ranked, query.query(), self.adaptive.recall_target);
             let controller = ProbeController::new(
                 pricing,
                 index.num_clusters(),
@@ -2382,10 +2312,11 @@ impl<T: VectorElement> VectorBackend<T> {
             // drops a true top-k row; APS takes the point estimate, since
             // the pessimistic radius inflates the query ball and
             // underestimates recall.
-            let kth = scan
+            let kth = scorer
+                .scan
                 .running_pessimistic_kth(top_n, QUANTIZED_BOUNDARY_KAPPA)
                 .map(|score| score.0 .0);
-            let aps_kth = scan.running_estimate_kth(top_n);
+            let aps_kth = scorer.scan.running_estimate_kth(top_n);
             let query_bound = kth.map_or(QueryBound::Filling, |score| QueryBound::Armed {
                 t: to_bound_space(metric, score),
             });
@@ -2430,7 +2361,6 @@ impl<T: VectorElement> VectorBackend<T> {
                 controller.cover(aps_kth)?;
                 continue;
             }
-            let layer = &quantized.layers()[0];
             if !matches!(row_gate, RowGate::Open) {
                 self.reader.read_doc_ids(cluster, &mut cluster_docs)?;
             }
@@ -2456,87 +2386,35 @@ impl<T: VectorElement> VectorBackend<T> {
                 continue;
             }
 
-            let batch = layer.read_batch_in_block(cluster, rows.clone())?;
-            let score_query_norm = query.score_query_norm(sim.score());
-            score_layer(
+            scorer.scan.begin_cluster(top_n);
+            scorer.score_cluster(
+                &self.reader,
                 query,
-                0,
-                layer,
-                Some((&batch, &mut decoded_residual_norms)),
-                Some(cluster),
-                rows.clone(),
-                &selection,
-                &mut kernel_scores,
-                &mut decoded_scales,
-                &mut decoded_gammas,
-                &mut decoded_error_ratios,
-                &mut decoded_constants,
-                &mut survivor_read_ranges,
-                &mut selected_rows,
-                &mut indexed_row_offsets,
-            )?;
-            base_scores.resize(selected_count, 0.0);
-            estimate_scores.resize(selected_count, 0.0);
-            sigma_scores.resize(selected_count, 0.0);
-            residual_norm_squared_scores.resize(selected_count, 0.0);
-            sign_query_error_terms.resize(selected_count, 0.0);
-            arithmetic_variances.resize(selected_count, ArithmeticError::default());
-            let cluster_score = sim.score();
-            combine_initial_decoded(
-                metric,
-                query.index.meta.field().dim as usize,
-                &mut kernel_scores,
-                &mut base_scores,
-                &mut estimate_scores,
-                &mut sigma_scores,
-                &mut residual_norm_squared_scores,
-                &mut sign_query_error_terms,
-                &mut arithmetic_variances,
-                &decoded_scales,
-                &decoded_gammas,
-                &decoded_error_ratios,
-                &decoded_constants,
-                &decoded_residual_norms,
-                cluster_score,
-                score_query_norm * score_query_norm,
-                query.query_error_squared(0) as f32,
-            );
-
-            scan.set_cluster_query_norm(cluster, score_query_norm);
-            scan.begin_cluster(top_n);
-            scan.candidates.append_selected(
+                cluster,
+                sim,
                 rows.clone(),
                 &selection,
                 (!matches!(row_gate, RowGate::Open)).then_some(cluster_docs.as_slice()),
-                &base_scores[..selected_count],
-                &kernel_scores[..selected_count],
-                &estimate_scores[..selected_count],
-                &sigma_scores[..selected_count],
-                &residual_norm_squared_scores[..selected_count],
-                &decoded_gammas[..selected_count],
-                &sign_query_error_terms[..selected_count],
-                &arithmetic_variances[..selected_count],
-            );
-            scan.finish_cluster_bound();
+            )?;
+            scorer.scan.finish_cluster_bound();
             controller.charge_rows(selected_count);
             stats.layer0_eligible += selected_count;
             stats.eligible_charged += selected_count;
             postings_row += 1;
-            let kth = scan
+            let kth = scorer
+                .scan
                 .running_pessimistic_kth(top_n, QUANTIZED_BOUNDARY_KAPPA)
                 .map(|score| score.0 .0);
             if armed_probe.is_none() && kth.is_some() {
                 armed_probe = Some((postings_row + postings_skipped - 1) as u32);
             }
-            controller.cover(scan.running_estimate_kth(top_n))?;
+            controller.cover(scorer.scan.running_estimate_kth(top_n))?;
         }
-        if let Some(metrics) = ranked.metrics() {
-            stats.record_routing(metrics);
-        }
+        stats.record_routing(ranked.metrics());
         stats.postings_row += postings_row;
         stats.postings_skipped += postings_skipped;
-        stats.candidates_scored += scan.candidates.len();
-        let layer0_scored = scan.candidates.len();
+        stats.candidates_scored += scorer.scan.candidates.len();
+        let layer0_scored = scorer.scan.candidates.len();
         stats.bounds_skips += bounds_skips;
         stats.record_bound_armed(armed_probe);
         controller.finish(stats);
@@ -2551,258 +2429,52 @@ impl<T: VectorElement> VectorBackend<T> {
 
         #[cfg(test)]
         {
-            stats.quantized_trace.scored_rows = scan.candidates.rows.clone();
+            stats.quantized_trace.scored_rows = scorer.scan.candidates.rows.clone();
             stats
                 .quantized_trace
                 .estimate_rows
-                .push(scan.candidates.estimate_trace());
+                .push(scorer.scan.candidates.estimate_trace());
         }
 
         let boundary_start = Instant::now();
         let boundary_stage = enter_vector_stage(Stage::Boundary(0));
-        scan.band(top_n, QUANTIZED_BOUNDARY_KAPPA);
+        scorer.scan.band(top_n, QUANTIZED_BOUNDARY_KAPPA);
         #[cfg(test)]
         stats
             .quantized_trace
             .boundary_rows
-            .push(scan.candidates.rows.clone());
+            .push(scorer.scan.candidates.rows.clone());
         drop(boundary_stage);
         stats.record_boundary(
             0,
-            scan.candidates.len(),
+            scorer.scan.candidates.len(),
             boundary_start.elapsed().as_nanos() as u64,
         );
         for layer_idx in 1..scan_levels {
-            stats.start_layer(layer_idx);
-            let layer_start = Instant::now();
-            let layer_stage = enter_vector_stage(Stage::LayerScan(layer_idx as u8));
-            let layer = &quantized.layers()[layer_idx];
-            let layer_scored = scan.candidates.len();
-            if metric == Metric::Cosine {
-                let query_norm = query.score_query_norm(0.0);
-                for candidate_range in cosine_refinement_batches(scan.candidates.len()) {
-                    let candidate_start = candidate_range.start;
-                    let candidate_end = candidate_range.end;
-                    let first_row = scan.candidates.rows[candidate_start];
-                    let last_row = scan.candidates.rows[candidate_end - 1];
-                    let available_rows = first_row..last_row + 1;
-                    let selection = candidate_selection(
-                        &scan.candidates.rows[candidate_range.clone()],
-                        &available_rows,
-                        &mut selection_offsets,
-                    );
-                    let rows = score_layer(
-                        query,
-                        layer_idx,
-                        layer,
-                        None,
-                        None,
-                        available_rows,
-                        &selection,
-                        &mut kernel_scores,
-                        &mut decoded_scales,
-                        &mut decoded_gammas,
-                        &mut decoded_error_ratios,
-                        &mut decoded_constants,
-                        &mut survivor_read_ranges,
-                        &mut selected_rows,
-                        &mut indexed_row_offsets,
-                    )?;
-                    let decoded_constants = if metric == Metric::L2 {
-                        &decoded_constants[..rows]
-                    } else {
-                        &[]
-                    };
-                    let sign_query_error_squared =
-                        if matches!(query.index.specs[layer_idx].kind, cascade::LayerKind::Sign) {
-                            query.query_error_squared(layer_idx) as f32
-                        } else {
-                            0.0
-                        };
-                    combine_refinement_decoded(
-                        metric,
-                        query.index.meta.field().dim as usize,
-                        &mut scan.candidates,
-                        candidate_range,
-                        &kernel_scores[..rows],
-                        &decoded_scales[..rows],
-                        &decoded_gammas[..rows],
-                        &decoded_error_ratios[..rows],
-                        decoded_constants,
-                        query_norm * query_norm,
-                        sign_query_error_squared,
-                    );
-                }
-            } else {
-                let mut candidate_start = 0;
-                let mut cluster = 0;
-                while candidate_start < scan.candidates.len() {
-                    let first_row = scan.candidates.rows[candidate_start];
-                    while cluster < index.num_clusters()
-                        && index.cluster_range(cluster).end <= first_row
-                    {
-                        cluster += 1;
-                    }
-                    if cluster == index.num_clusters() {
-                        return Err(TantivyError::DataCorruption(DataCorruption::comment_only(
-                            format!(
-                                "quantized survivor row {first_row} is outside IVF cluster ranges"
-                            ),
-                        )));
-                    }
-                    let cluster_rows = index.cluster_range(cluster);
-                    if first_row < cluster_rows.start {
-                        return Err(TantivyError::DataCorruption(DataCorruption::comment_only(
-                            format!(
-                                "quantized survivor row {first_row} precedes cluster {cluster} \
-                                 range {cluster_rows:?}"
-                            ),
-                        )));
-                    }
-                    let mut candidate_end = candidate_start + 1;
-                    while candidate_end < scan.candidates.len()
-                        && scan.candidates.rows[candidate_end] < cluster_rows.end
-                    {
-                        candidate_end += 1;
-                    }
-                    let query_norm = scan.cluster_query_norm(cluster);
-                    let candidate_range = candidate_start..candidate_end;
-                    let selection = candidate_selection(
-                        &scan.candidates.rows[candidate_range.clone()],
-                        &cluster_rows,
-                        &mut selection_offsets,
-                    );
-                    let rows = score_layer(
-                        query,
-                        layer_idx,
-                        layer,
-                        None,
-                        Some(cluster),
-                        cluster_rows,
-                        &selection,
-                        &mut kernel_scores,
-                        &mut decoded_scales,
-                        &mut decoded_gammas,
-                        &mut decoded_error_ratios,
-                        &mut decoded_constants,
-                        &mut survivor_read_ranges,
-                        &mut selected_rows,
-                        &mut indexed_row_offsets,
-                    )?;
-                    let decoded_constants = if metric == Metric::L2 {
-                        &decoded_constants[..rows]
-                    } else {
-                        &[]
-                    };
-                    let sign_query_error_squared =
-                        if matches!(query.index.specs[layer_idx].kind, cascade::LayerKind::Sign) {
-                            query.query_error_squared(layer_idx) as f32
-                        } else {
-                            0.0
-                        };
-                    combine_refinement_decoded(
-                        metric,
-                        query.index.meta.field().dim as usize,
-                        &mut scan.candidates,
-                        candidate_range,
-                        &kernel_scores[..rows],
-                        &decoded_scales[..rows],
-                        &decoded_gammas[..rows],
-                        &decoded_error_ratios[..rows],
-                        decoded_constants,
-                        query_norm * query_norm,
-                        sign_query_error_squared,
-                    );
-                    candidate_start = candidate_end;
-                }
-            }
-            drop(layer_stage);
-            stats.record_layer_scan(
-                layer_idx,
-                layer_scored,
-                layer_start.elapsed().as_nanos() as u64,
-            );
-            #[cfg(test)]
-            stats
-                .quantized_trace
-                .estimate_rows
-                .push(scan.candidates.estimate_trace());
+            scorer.refine(&self.reader, query, layer_idx, stats)?;
             let boundary_start = Instant::now();
             let boundary_stage = enter_vector_stage(Stage::Boundary(layer_idx as u8));
-            scan.band(top_n, QUANTIZED_BOUNDARY_KAPPA);
+            scorer.scan.band(top_n, QUANTIZED_BOUNDARY_KAPPA);
             #[cfg(test)]
             stats
                 .quantized_trace
                 .boundary_rows
-                .push(scan.candidates.rows.clone());
+                .push(scorer.scan.candidates.rows.clone());
             drop(boundary_stage);
             stats.record_boundary(
                 layer_idx,
-                scan.candidates.len(),
+                scorer.scan.candidates.len(),
                 boundary_start.elapsed().as_nanos() as u64,
             );
         }
 
-        let rerank_fetch_start = Instant::now();
-        let rerank_fetch_stage = enter_vector_stage(Stage::RerankFetch);
-        debug_assert!(
-            scan.candidates
-                .rows
-                .windows(2)
-                .all(|pair| pair[0] < pair[1]),
-            "boundary survivors are row-sorted"
-        );
-        let mut first = 0;
-        let mut cluster = 0;
-        while first < scan.candidates.len() {
-            while index.cluster_range(cluster).end <= scan.candidates.rows[first] {
-                cluster += 1;
-            }
-            let cluster_rows = index.cluster_range(cluster);
-            let end = first
-                + scan.candidates.rows[first..].partition_point(|&row| row < cluster_rows.end);
-            if scan.candidates.docs[first..end].contains(&DocId::MAX) {
-                self.reader.read_doc_ids(cluster, &mut cluster_docs)?;
-                for candidate in first..end {
-                    if scan.candidates.docs[candidate] == DocId::MAX {
-                        scan.candidates.docs[candidate] =
-                            cluster_docs[scan.candidates.rows[candidate] - cluster_rows.start];
-                    }
-                }
-            }
-            first = end;
-        }
-        #[cfg(test)]
-        {
-            stats.quantized_trace.rerank_docs = scan.candidates.docs.clone();
-            stats.quantized_trace.rerank_docs.sort_unstable();
-        }
-        let rerank_batch = self.reader.read_vector_rows_planned(
-            &scan.candidates.rows,
-            &mut survivor_read_ranges,
-            &mut survivor_block_scratch,
-        )?;
-        drop(rerank_fetch_stage);
-        stats.rerank_fetch_ns += rerank_fetch_start.elapsed().as_nanos() as u64;
-        stats.rerank_rows += scan.candidates.len();
-
         let mut topn =
             TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator));
-        // Row-sorted survivors own their document ids; the batch ordinal addresses both.
-        for (candidate, (batch_row, bytes)) in rerank_batch.iter().enumerate() {
-            debug_assert_eq!(scan.candidates.rows[candidate], batch_row);
-            let doc = scan.candidates.docs[candidate];
-            let score_start = Instant::now();
-            {
-                let _rerank_score_stage = enter_vector_stage(Stage::RerankScore);
-                let score = self.query.score_doc_bytes(bytes);
-                if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
-                    topn.push_unordered(key, doc);
-                }
+        scorer.rerank(&self.reader, &self.query, stats, |doc, score| {
+            if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
+                topn.push_unordered(key, doc);
             }
-            stats.rerank_score_ns += score_start.elapsed().as_nanos() as u64;
-            stats.exact_rows_read += 1;
-        }
+        })?;
         let segment_ord = self.segment_ord;
         let assembly_start = Instant::now();
         let _assembly_stage = enter_vector_stage(Stage::ResultAssembly);
@@ -2827,7 +2499,6 @@ impl<T: VectorElement> VectorBackend<T> {
     fn approximate_top_n<K, CTail>(
         &self,
         index: &IvfIndex,
-        shared: Option<&SharedRouting<'_>>,
         weight: &dyn Weight,
         segment_reader: &SegmentReader,
         top_n: usize,
@@ -2892,10 +2563,7 @@ impl<T: VectorElement> VectorBackend<T> {
         // cheap.
         // Routing operates in `f32` (centroid rows are `f32` today), so the
         // query is widened losslessly per element.
-        let query_f32: Vec<f32> = match shared {
-            Some(shared) => shared.query.to_vec(),
-            None => self.query.query().iter().map(|e| e.to_f32()).collect(),
-        };
+        let query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
         let mut routing_ws = RouterWorkspace::default();
         stats.segment_rows = Some(index.num_rows());
         stats.segment_clusters = Some(index.num_clusters());
@@ -2918,14 +2586,9 @@ impl<T: VectorElement> VectorBackend<T> {
         let routing_start = Instant::now();
         let (mut ranked, controller) = {
             let _routing_stage = enter_vector_stage(Stage::Routing);
-            let ClusterRouting { ranked, estimator } = ClusterRouting::new(
-                shared,
-                index,
-                &mut routing_ws,
-                &query_f32,
-                routing,
-                self.adaptive.recall_target,
-            );
+            let ranked = index.rank_clusters(&mut routing_ws, &query_f32, routing);
+            let estimator =
+                index.recall_estimator(&ranked, &query_f32, self.adaptive.recall_target);
             let controller = ProbeController::new(
                 pricing,
                 num_centroids,
@@ -2961,9 +2624,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 as u64,
         );
 
-        if let Some(metrics) = ranked.metrics() {
-            stats.record_routing(metrics);
-        }
+        stats.record_routing(ranked.metrics());
 
         let segment_ord = self.segment_ord;
         let assembly_start = Instant::now();

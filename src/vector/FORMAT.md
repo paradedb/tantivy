@@ -50,16 +50,27 @@ sidecar with only the following slots per vector field:
 The descriptor must match the owning index's descriptor. The shared artifact
 supplies N, centroid rows, and the router; none of those rows or routing payloads
 are copied into the segment. Bounds and quantized residuals use those exact
-stored centroid coordinates. Each search ranks shared centroids once and lazily
-replays that order for both plain and quantized segment scans. Segment filters
-are prepared once; the largest active segment request determines the router's
-candidate count. Cosine routing uses the same normalized query coordinates as
-quantized scoring. Routing progress belongs to the search, so collector reuse
-and concurrent searches have independent cursors. Routing counters are recorded
-once, in the first segment's stats.
+stored centroid coordinates.
 
-Probe budgets, bounds gates, and candidate refinement still operate per segment;
-moving that state into a global probe loop is the next step.
+Each search ranks shared centroids once and visits each cluster across all active
+segments before deciding whether to probe the next cluster. Segment query/filter
+preparation uses the executor; the coordinated probe loop runs on the search
+thread. Cosine routing uses the same normalized query coordinates as quantized
+scoring. Collector reuse and concurrent searches have independent query state.
+
+The work budget resolves once from the global cluster count and total native
+vector count. A cluster open is charged once; eligible rows are charged across
+all its segment fragments. `WorkModel::for_searcher` counts shared centroids once.
+Bounds use the global k-th lower endpoint, treating exact scores as zero-width
+intervals. Quantized layers retain candidates against that same global threshold;
+segments with fewer layers finish reranking while others continue refinement.
+APS advances once per global cluster, using the lowest point estimate among the
+lower-endpoint top-k, as in the legacy segment scan.
+
+Routing, budget, termination, recall, and bound-arming statistics are recorded
+once in the first segment's stats. Row counts, bounds skips, layer statistics,
+and storage reads remain attributed to their segment.
+
 Indexes without an artifact keep the flat/V3 clustered paths below.
 
 ## File headers and entries

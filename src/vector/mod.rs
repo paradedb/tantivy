@@ -34,7 +34,6 @@ pub use storage_io::VectorIoStats;
 mod plugin;
 mod prepared;
 pub(crate) mod quantization;
-mod routing;
 mod tie_break;
 
 pub mod flat;

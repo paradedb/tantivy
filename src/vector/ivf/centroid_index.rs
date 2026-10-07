@@ -639,10 +639,12 @@ mod tests {
                         vec![VectorQuantizationConfig::materialize(
                             "embedding".into(),
                             &VectorOptions::new(DIM, metric),
-                            vec![VectorQuantizationLayer {
-                                bits: if batch == 1 { 1 } else { 4 },
-                                seed: batch,
-                            }],
+                            (0..batch)
+                                .map(|layer| VectorQuantizationLayer {
+                                    bits: if layer == 0 { 1 } else { 4 },
+                                    seed: batch + layer,
+                                })
+                                .collect(),
                         )?]
                     } else {
                         Vec::new()
@@ -655,7 +657,10 @@ mod tests {
                         doc.add_u64(ordinal, id);
                         doc.add_u64(keep, id % 2);
                         if batch != 3 && local != 8 {
-                            doc.add_vector(fixture.field, &rows[local as usize % rows.len()]);
+                            let mut row = rows[local as usize % rows.len()];
+                            row[0] += 0.01 * (local + 1) as f32;
+                            row[2 + batch as usize] = 0.02 * (local + 1) as f32;
+                            doc.add_vector(fixture.field, &row);
                         }
                         writer.add_document(doc)?;
                     }
@@ -778,47 +783,319 @@ mod tests {
     }
 
     #[test]
-    fn shared_routing_replays_lazily_and_restarts_recall_estimation() -> crate::Result<()> {
-        use crate::vector::router::RouterMetrics;
-        use crate::vector::routing::SharedRouting;
+    fn global_probe_budget_is_independent_of_segment_partitioning() -> crate::Result<()> {
+        use crate::collector::sort_key::SortByStaticFastValue;
+        use crate::query::{AllQuery, Query, TermQuery};
+        use crate::schema::{IndexRecordOption, FAST, INDEXED};
+        use crate::vector::ivf::{AdaptiveProbeParams, WorkModel};
+        use crate::vector::{
+            TopDocsByVectorSimilarity, VectorQuantizationConfig, VectorQuantizationLayer,
+        };
+        use crate::{Order, Term};
 
-        for kind in [RouterKind::Rng, RouterKind::Stacked] {
+        for kind in [RouterKind::Exact, RouterKind::Rng, RouterKind::Stacked] {
             let mut fixture = Fixture::new(Metric::L2);
-            let rows: Vec<_> = (0..256).map(|i| [i as f32, (i % 7) as f32]).collect();
+            let mut schema = Schema::builder();
+            schema.add_vector_field("embedding", VectorOptions::new(64, Metric::L2));
+            let ordinal = schema.add_u64_field("ordinal", FAST);
+            let keep = schema.add_u64_field("keep", INDEXED);
+            fixture.schema = schema.build();
+            let rows: Vec<_> = (0..256)
+                .map(|i| {
+                    let mut row = [0.0; 64];
+                    row[0] = i as f32 * 20.0;
+                    row
+                })
+                .collect();
             fixture.replace_centroids(centroids(&rows));
-            let index = fixture.create(kind)?;
-            let cache = index.cached_centroid_index()?.unwrap();
-            let mut workspace = RouterWorkspace::default();
-            let shared = SharedRouting::new(
-                &cache[&fixture.field],
-                &mut workspace,
-                &[0.1, 0.2],
-                RoutingParams {
-                    k: 16,
-                    recall: 0.99,
-                },
-            );
-            let mut first = shared.replay(0.9);
-            let prefix: Vec<_> = first.ranked.by_ref().take(2).collect();
-            let before = serde_json::to_value(shared.metrics())?;
-            if let RouterMetrics::Rng(metrics) = shared.metrics() {
-                assert_eq!(metrics.result_count, 2);
-                assert!(metrics.visited_count < 256);
-            }
-            let mut second = shared.replay(0.9);
-            assert_eq!(second.ranked.by_ref().take(2).collect::<Vec<_>>(), prefix);
-            assert_eq!(serde_json::to_value(shared.metrics())?, before);
-            if let (Some(a), Some(b)) = (&mut first.estimator, &mut second.estimator) {
-                for candidate in prefix {
-                    assert_eq!(
-                        a.cover_next(Some(candidate.sim))?,
-                        b.cover_next(Some(candidate.sim))?
-                    );
+            let mut index = fixture.create(kind)?;
+            for batch in 0..4 {
+                index.settings_mut().vector_quantization = if batch == 0 {
+                    Vec::new()
+                } else {
+                    vec![VectorQuantizationConfig::materialize(
+                        "embedding".into(),
+                        &VectorOptions::new(64, Metric::L2),
+                        vec![VectorQuantizationLayer {
+                            bits: if batch == 1 { 1 } else { 4 },
+                            seed: batch,
+                        }],
+                    )?]
+                };
+                let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+                writer.set_merge_policy(Box::new(NoMergePolicy));
+                for (cluster, row) in rows.iter().enumerate() {
+                    let mut doc = TantivyDocument::new();
+                    doc.add_vector(fixture.field, row);
+                    doc.add_u64(ordinal, cluster as u64 * 4 + batch);
+                    doc.add_u64(keep, batch % 2);
+                    writer.add_document(doc)?;
                 }
-            } else {
-                assert_eq!(kind, RouterKind::Rng);
+                writer.commit()?;
+                writer.wait_merging_threads()?;
+            }
+            let mut before = Vec::new();
+            let mut recall_before = None;
+            for merged in [false, true] {
+                if merged {
+                    let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+                    writer.merge(&index.searchable_segment_ids()?).wait()?;
+                }
+                let searcher = index.reader()?.searcher();
+                let model = WorkModel::for_searcher(&searcher, fixture.field)?.unwrap();
+                assert_eq!(model.n_avg, 4.0);
+                for selected in [false, true] {
+                    let filter: Box<dyn Query> = if selected {
+                        Box::new(TermQuery::new(
+                            Term::from_field_u64(keep, 1),
+                            IndexRecordOption::Basic,
+                        ))
+                    } else {
+                        Box::new(AllQuery)
+                    };
+                    for levels in [0, usize::MAX] {
+                        let collector =
+                            TopDocsByVectorSimilarity::new(fixture.field, rows[0].to_vec(), 2048)
+                                .with_tie_break((
+                                    SortByStaticFastValue::<u64>::for_field("ordinal"),
+                                    Order::Asc,
+                                ))
+                                .with_max_scan_levels(levels)
+                                .with_adaptive_params(AdaptiveProbeParams {
+                                    max_probe_fraction: 0.005,
+                                    min_probe_clusters: 1,
+                                    work_model: Some(model),
+                                    router_recall_target: 1.0,
+                                    ..Default::default()
+                                });
+                        let result = searcher.search(filter.as_ref(), &collector)?;
+                        let ids: Vec<_> = result
+                            .results
+                            .iter()
+                            .map(|(_, address)| {
+                                searcher
+                                    .segment_reader(address.segment_ord)
+                                    .fast_fields()
+                                    .u64("ordinal")
+                                    .unwrap()
+                                    .first(address.doc_id)
+                                    .unwrap()
+                            })
+                            .collect();
+                        let budget: f32 = result.stats.iter().map(|s| s.work_budget).sum();
+                        let work: f32 = result.stats.iter().map(|s| s.work_charged).sum();
+                        let scored: usize = result.stats.iter().map(|s| s.candidates_scored).sum();
+                        assert!((budget - 1.28).abs() < 1e-6, "{budget}");
+                        assert!(scored > 0 && scored < 32, "{scored}");
+                        assert_eq!(
+                            result.stats.iter().filter(|s| s.work_budget > 0.0).count(),
+                            1
+                        );
+                        if let Some(crate::vector::router::RouterMetrics::Rng(metrics)) =
+                            result.stats[0].routing
+                        {
+                            assert!(metrics.visited_count < rows.len());
+                            assert!(metrics.result_count < 8);
+                        }
+                        let snapshot = (
+                            ids,
+                            budget.to_bits(),
+                            work.to_bits(),
+                            scored,
+                            result.stats[0].termination,
+                        );
+                        if merged {
+                            assert_eq!(
+                                snapshot,
+                                before.remove(0),
+                                "{kind:?} filtered={selected} levels={levels}"
+                            );
+                        } else {
+                            before.push(snapshot);
+                        }
+                    }
+                }
+                if kind == RouterKind::Stacked {
+                    let mut query = rows[0].to_vec();
+                    query[0] = 0.1;
+                    let result = searcher.search(
+                        &AllQuery,
+                        &TopDocsByVectorSimilarity::new(fixture.field, query, 1)
+                            .with_max_scan_levels(0)
+                            .with_adaptive_params(AdaptiveProbeParams {
+                                max_probe_fraction: 1.0,
+                                min_probe_clusters: 1,
+                                recall_target: 0.5,
+                                work_model: Some(model),
+                                ..Default::default()
+                            }),
+                    )?;
+                    let stats = &result.stats[0];
+                    assert_eq!(
+                        stats.termination,
+                        crate::vector::backend::ProbeTermination::RecallTarget
+                    );
+                    assert!(stats.recall_estimate.is_some_and(|recall| recall >= 0.5));
+                    assert_eq!(
+                        result
+                            .stats
+                            .iter()
+                            .filter(|s| s.recall_estimate.is_some())
+                            .count(),
+                        1
+                    );
+                    let snapshot = (
+                        stats.work_charged.to_bits(),
+                        stats.recall_estimate.map(f32::to_bits),
+                        result
+                            .stats
+                            .iter()
+                            .map(|s| s.candidates_scored)
+                            .sum::<usize>(),
+                    );
+                    if let Some(before) = recall_before {
+                        assert_eq!(snapshot, before);
+                    } else {
+                        recall_before = Some(snapshot);
+                    }
+                }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn global_boundaries_prune_across_encodings_and_preserve_string_ties() -> crate::Result<()> {
+        use crate::collector::sort_key::SortByString;
+        use crate::query::AllQuery;
+        use crate::schema::{FAST, STRING};
+        use crate::vector::{
+            TopDocsByVectorSimilarity, VectorQuantizationConfig, VectorQuantizationLayer,
+        };
+        use crate::Order;
+
+        for exact_winner in [false, true] {
+            let mut fixture = Fixture::new(Metric::L2);
+            let mut schema = Schema::builder();
+            schema.add_vector_field("embedding", VectorOptions::new(64, Metric::L2));
+            let name = schema.add_text_field("name", FAST | STRING);
+            fixture.schema = schema.build();
+            fixture.replace_centroids(centroids(&[[0.0; 64]]));
+            let mut index = fixture.create(RouterKind::Exact)?;
+            for (batch, names) in [["z", "y"], ["b", "c"], ["a", "b"]].into_iter().enumerate() {
+                index.settings_mut().vector_quantization = if exact_winner && batch == 2 {
+                    Vec::new()
+                } else {
+                    vec![VectorQuantizationConfig::materialize(
+                        "embedding".into(),
+                        &VectorOptions::new(64, Metric::L2),
+                        (0..batch + 1)
+                            .map(|layer| VectorQuantizationLayer {
+                                bits: 1,
+                                seed: layer as u64 + 7,
+                            })
+                            .collect(),
+                    )?]
+                };
+                let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+                writer.set_merge_policy(Box::new(NoMergePolicy));
+                for name_value in names {
+                    let mut row = [0.0; 64];
+                    row[0] = if batch == 0 { 10.0 } else { 0.0 };
+                    let mut doc = TantivyDocument::new();
+                    doc.add_vector(fixture.field, &row);
+                    doc.add_text(name, name_value);
+                    writer.add_document(doc)?;
+                }
+                writer.commit()?;
+                writer.wait_merging_threads()?;
+            }
+            let searcher = index.reader()?.searcher();
+            let result = searcher.search(
+                &AllQuery,
+                &TopDocsByVectorSimilarity::new(fixture.field, vec![0.0; 64], 2)
+                    .with_tie_break((SortByString::for_field("name"), Order::Asc)),
+            )?;
+            let names: Vec<_> = result
+                .results
+                .iter()
+                .map(|(_, address)| {
+                    let column = searcher
+                        .segment_reader(address.segment_ord)
+                        .fast_fields()
+                        .str("name")
+                        .unwrap()
+                        .unwrap();
+                    let mut name = String::new();
+                    column
+                        .ord_to_str(column.term_ords(address.doc_id).next().unwrap(), &mut name)
+                        .unwrap();
+                    name
+                })
+                .collect();
+            assert_eq!(names, ["a", "b"]);
+            assert_eq!(
+                result
+                    .stats
+                    .iter()
+                    .map(|s| s.candidates_scored)
+                    .sum::<usize>(),
+                6
+            );
+            let loser = result
+                .stats
+                .iter()
+                .find(|s| {
+                    s.layers.get(0).is_some_and(|layer| layer.scored() == 2) && s.rerank_rows == 0
+                })
+                .unwrap();
+            assert_eq!(loser.quantized_trace.boundary_docs, [Vec::<u32>::new()]);
+            assert_eq!(loser.rerank_io.reads, 0);
+            assert_eq!(
+                result.stats.iter().map(|s| s.rerank_rows).sum::<usize>(),
+                if exact_winner { 2 } else { 4 }
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn global_bounds_use_hits_from_other_segments() -> crate::Result<()> {
+        use crate::query::AllQuery;
+        use crate::vector::TopDocsByVectorSimilarity;
+
+        let fixture = Fixture::new(Metric::L2);
+        let index = fixture.create(RouterKind::Exact)?;
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for row in [[0.0_f32, 0.0], [3.0, 4.0]] {
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(fixture.field, &row);
+            writer.add_document(doc)?;
+            writer.commit()?;
+        }
+        let result = index.reader()?.searcher().search(
+            &AllQuery,
+            &TopDocsByVectorSimilarity::new(fixture.field, vec![0.0_f32, 0.0], 1),
+        )?;
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].0, 0.0);
+        assert_eq!(
+            result
+                .stats
+                .iter()
+                .map(|s| s.candidates_scored)
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            result
+                .stats
+                .iter()
+                .filter(|s| s.candidates_scored == 0 && s.bounds_skips > 0)
+                .count(),
+            1
+        );
         Ok(())
     }
 

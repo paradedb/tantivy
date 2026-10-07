@@ -4,10 +4,10 @@
 //! not a [`SortKeyComputer`](crate::collector::sort_key::SortKeyComputer). IVF
 //! needs to drain the filter `DocSet` into a bitmap upfront and drive its own
 //! cluster iteration, which inverts the per-doc pull model that sort-key
-//! computers assume. [`Collector::collect_search`] shares one lazy centroid
-//! ranking across segments with a global router. Each
-//! [`VectorBackend`](super::backend::VectorBackend) consumes that ranking using
-//! its stored row format. Legacy segment routers still rank independently.
+//! computers assume. [`Collector::collect_search`] coordinates global routing,
+//! probe budgets, and candidate thresholds across segments. Segment scorers
+//! consume clusters using their stored row format. Legacy segment routers
+//! still rank independently.
 //!
 //! A secondary key *is* an ordinary `SortKeyComputer` — see
 //! [`TopDocsByVectorSimilarity::with_tie_break`]. The heap sorts on the
@@ -28,8 +28,6 @@ use super::index_reader::QuantizedFieldReader;
 use super::ivf::AdaptiveProbeParams;
 use super::metadata::VectorColMetadata;
 use super::prepared::{normalize_query, QuantizedQueryCtx, VectorQuery};
-use super::router::RouterWorkspace;
-use super::routing::SharedRouting;
 use super::tie_break::NoTieBreak;
 use super::{enter_vector_stage, Stage, VectorElement};
 use crate::collector::sort_key::NaturalComparator;
@@ -254,12 +252,10 @@ where
         weight: &dyn Weight,
         reader: &SegmentReader,
         backend: VectorBackend<T>,
-        shared: Option<&SharedRouting<'_>>,
     ) -> crate::Result<SegmentVectorFruit<S::SortKey>> {
         let collect_start = Instant::now();
         let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
-        let (hits, mut stats) = backend.top_n_by_with_routing(
-            shared,
+        let (hits, mut stats) = backend.top_n_by(
             weight,
             reader,
             self.segment_top_n(),
@@ -387,12 +383,7 @@ where
         segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
     ) -> crate::Result<SegmentVectorFruit<S::SortKey>> {
-        self.collect_backend(
-            weight,
-            reader,
-            self.segment_backend(segment_ord, reader)?,
-            None,
-        )
+        self.collect_backend(weight, reader, self.segment_backend(segment_ord, reader)?)
     }
 
     fn collect_search(
@@ -412,39 +403,39 @@ where
         let backends = executor.map(
             |(ordinal, reader)| {
                 let mut backend = self.segment_backend(ordinal as u32, reader)?;
-                let params = backend.routing_params(weight, reader, self.segment_top_n())?;
-                Ok((backend, params))
+                backend.prepare_filter(weight, reader, self.segment_top_n())?;
+                Ok(backend)
             },
             readers.iter().enumerate(),
         )?;
-        let params = backends
-            .iter()
-            .filter_map(|(_, params)| *params)
-            .max_by_key(|params| params.k);
         let FieldType::Vector(options) = searcher.schema().get_field_entry(self.field).field_type()
         else {
             unreachable!("collector schema has been checked")
         };
         let mut query: Vec<f32> = self.query.iter().map(|value| value.to_f32()).collect();
         normalize_query(options.metric(), &mut query);
-        let mut workspace = RouterWorkspace::default();
-        let routing_start = Instant::now();
-        let shared = {
-            let _stage = enter_vector_stage(Stage::Routing);
-            params.map(|params| {
-                SharedRouting::new(&centroids[&self.field], &mut workspace, &query, params)
-            })
-        };
-        let routing_ns = routing_start.elapsed().as_nanos() as u64;
-        let mut fruits = executor.map(
-            |(reader, (backend, _))| self.collect_backend(weight, reader, backend, shared.as_ref()),
-            readers.iter().zip(backends),
+        let (hits, mut stats) = super::backend::global::search(
+            &centroids[&self.field],
+            &query,
+            &backends,
+            readers,
+            weight,
+            &self.adaptive,
+            self.segment_top_n(),
+            &self.tie_break,
         )?;
-        if let (Some(shared), Some(first)) = (&shared, fruits.first_mut()) {
-            first.stats.record_routing(shared.metrics());
-            first.stats.routing_ns += routing_ns;
+        let start = Instant::now();
+        let _stage = enter_vector_stage(Stage::ResultAssembly);
+        let results = hits
+            .into_iter()
+            .skip(self.offset)
+            .take(self.limit)
+            .map(|((score, _), address)| (score, address))
+            .collect();
+        if let Some(first) = stats.first_mut() {
+            *first.result_assembly_ns.get_or_insert(0) += start.elapsed().as_nanos() as u64;
         }
-        self.merge_fruits(fruits)
+        Ok(VectorSimilarityFruit { results, stats })
     }
 
     fn merge_fruits(
