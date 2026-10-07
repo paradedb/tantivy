@@ -27,7 +27,7 @@ impl BitmapDocSet {
             ));
         }
         let mut docset = Self {
-            data: BufferedFileSlice::new(
+            data: BufferedFileSlice::new_block_aligned(
                 source.slice(offset as usize..end.unwrap() as usize),
                 8192,
             ),
@@ -47,20 +47,17 @@ impl BitmapDocSet {
         let end = bitmap_num_bytes(self.max_doc);
         let mut first_mask = u64::MAX << (target % 64);
         while offset < end {
-            let page = offset / 8192 * 8192;
             let bytes = self
                 .data
-                .get_bytes(page..(page + 8192).min(end))
+                .get_bytes(offset..offset + 8)
                 .expect("failed to read posting bitmap");
-            for word in bytes[(offset - page) as usize..].chunks_exact(8) {
-                let word = u64::from_le_bytes(word.try_into().unwrap()) & first_mask;
-                if word != 0 {
-                    let doc = offset as u32 * 8 + word.trailing_zeros();
-                    return if doc < self.max_doc { doc } else { TERMINATED };
-                }
-                first_mask = u64::MAX;
-                offset += 8;
+            let word = u64::from_le_bytes(bytes.as_ref().try_into().unwrap()) & first_mask;
+            if word != 0 {
+                let doc = offset as u32 * 8 + word.trailing_zeros();
+                return if doc < self.max_doc { doc } else { TERMINATED };
             }
+            first_mask = u64::MAX;
+            offset += 8;
         }
         TERMINATED
     }
@@ -173,6 +170,92 @@ mod tests {
             data[doc as usize / 8] |= 1 << (doc % 8);
         }
         BitmapDocSet::open(FileSlice::from(data), 0, max_doc, docs.len() as u32).unwrap()
+    }
+
+    #[derive(Debug)]
+    struct TrackedBitmapFile {
+        data: Vec<u8>,
+        reads: std::sync::Arc<std::sync::Mutex<Vec<std::ops::Range<usize>>>>,
+        block_len: Option<usize>,
+    }
+
+    impl HasLen for TrackedBitmapFile {
+        fn len(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    impl crate::directory::FileHandle for TrackedBitmapFile {
+        fn read_bytes(&self, range: std::ops::Range<usize>) -> io::Result<common::OwnedBytes> {
+            self.reads.lock().unwrap().push(range.clone());
+            Ok(common::OwnedBytes::new(self.data[range].to_vec()))
+        }
+
+        fn storage_block_len(&self) -> Option<usize> {
+            self.block_len
+        }
+    }
+
+    #[test]
+    fn bitmap_jump_does_not_reread_the_same_buffer() {
+        use std::sync::{Arc, Mutex};
+
+        for probe_first in [false, true] {
+            let reads = Arc::new(Mutex::new(Vec::new()));
+            let file = FileSlice::new(Arc::new(TrackedBitmapFile {
+                data: vec![255; 32768],
+                reads: reads.clone(),
+                block_len: None,
+            }));
+            let mut bitmap = BitmapDocSet::open(file, 0, 262144, 262144).unwrap();
+            if probe_first {
+                assert_eq!(bitmap.seek_danger(66560), SeekDangerResult::Found);
+            }
+            let mut mask = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
+            assert_eq!(bitmap.fill_bitset_block(66560, &mut mask), 67584);
+            assert!(mask.iter().all(|word| word.len() == 64));
+            assert_eq!(*reads.lock().unwrap(), vec![0..8192, 8192..16384]);
+        }
+    }
+
+    #[test]
+    fn bitmap_reads_respect_storage_blocks_and_nested_slice_offsets() {
+        use std::sync::{Arc, Mutex};
+
+        for prefix in [1, 151, 8155] {
+            let reads = Arc::new(Mutex::new(Vec::new()));
+            let max_doc = 300003;
+            let len = bitmap_num_bytes(max_doc) as usize;
+            let file = FileSlice::new(Arc::new(TrackedBitmapFile {
+                data: vec![255; prefix + 37 + len + 19],
+                reads: reads.clone(),
+                block_len: Some(8156),
+            }))
+            .slice(37..);
+            let mut bitmap = BitmapDocSet::open(file, prefix as u64, max_doc, max_doc).unwrap();
+            for base in (0..max_doc).step_by(BLOCK_WINDOW as usize) {
+                let mut mask = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
+                let next = bitmap.fill_bitset_block(base, &mut mask);
+                let expected = (max_doc - base).min(BLOCK_WINDOW);
+                assert_eq!(mask.iter().map(|word| word.len()).sum::<u32>(), expected);
+                assert_eq!(
+                    next,
+                    if base + expected == max_doc {
+                        TERMINATED
+                    } else {
+                        base + expected
+                    }
+                );
+            }
+            let reads = reads.lock().unwrap();
+            let mut end = prefix + 37;
+            for range in reads.iter() {
+                assert_eq!(range.start, end, "overlapping or skipped read: {reads:?}");
+                assert!(range.end % 8156 == 0 || range.end == prefix + 37 + len);
+                end = range.end;
+            }
+            assert_eq!(end, prefix + 37 + len);
+        }
     }
 
     proptest::proptest! {

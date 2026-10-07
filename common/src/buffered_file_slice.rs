@@ -22,6 +22,7 @@ pub struct BufferedFileSlice {
     buffer: RefCell<OwnedBytes>,
     buffer_range: RefCell<Range<u64>>,
     buffer_max_size: usize,
+    block_aligned: bool,
 }
 
 impl BufferedFileSlice {
@@ -35,6 +36,16 @@ impl BufferedFileSlice {
             buffer: RefCell::new(OwnedBytes::empty()),
             buffer_range: RefCell::new(0..0),
             buffer_max_size,
+            block_aligned: false,
+        }
+    }
+
+    /// Aligns reads to storage blocks, or fixed-size buffers when storage geometry is unavailable.
+    pub fn new_block_aligned(file_slice: FileSlice, buffer_max_size: usize) -> Self {
+        assert!(buffer_max_size > 0);
+        Self {
+            block_aligned: true,
+            ..Self::new(file_slice, buffer_max_size)
         }
     }
 
@@ -96,16 +107,57 @@ impl BufferedFileSlice {
                     .read_bytes_slice(required_range.start as usize..required_range.end as usize);
             }
 
-            let new_buffer_start = required_range.start;
-            let new_buffer_end = min(
-                new_buffer_start + self.buffer_max_size as u64,
-                self.file_slice.len() as u64,
-            );
-            let read_range = new_buffer_start..new_buffer_end;
-
-            let new_buffer = self
-                .file_slice
-                .read_bytes_slice(read_range.start as usize..read_range.end as usize)?;
+            let read_range = if self.block_aligned && !required_range.is_empty() {
+                let first = required_range.start as usize;
+                let last = required_range.end as usize - 1;
+                let start = self.file_slice.storage_block_range(first).map_or_else(
+                    || first / self.buffer_max_size * self.buffer_max_size,
+                    |block| block.start,
+                );
+                let end = self.file_slice.storage_block_range(last).map_or_else(
+                    || {
+                        ((last / self.buffer_max_size + 1) * self.buffer_max_size)
+                            .min(self.file_slice.len())
+                    },
+                    |block| block.end,
+                );
+                start as u64..end as u64
+            } else {
+                required_range.start
+                    ..min(
+                        required_range.start + self.buffer_max_size as u64,
+                        self.file_slice.len() as u64,
+                    )
+            };
+            let old_range = self.buffer_range.borrow();
+            let overlap_start = read_range.start.max(old_range.start);
+            let overlap_end = read_range.end.min(old_range.end);
+            let new_buffer = if self.block_aligned && overlap_start < overlap_end {
+                let mut bytes = Vec::with_capacity((read_range.end - read_range.start) as usize);
+                if read_range.start < overlap_start {
+                    bytes.extend_from_slice(
+                        &self
+                            .file_slice
+                            .read_bytes_slice(read_range.start as usize..overlap_start as usize)?,
+                    );
+                }
+                bytes.extend_from_slice(
+                    &self.buffer.borrow()[(overlap_start - old_range.start) as usize
+                        ..(overlap_end - old_range.start) as usize],
+                );
+                if overlap_end < read_range.end {
+                    bytes.extend_from_slice(
+                        &self
+                            .file_slice
+                            .read_bytes_slice(overlap_end as usize..read_range.end as usize)?,
+                    );
+                }
+                OwnedBytes::new(bytes)
+            } else {
+                self.file_slice
+                    .read_bytes_slice(read_range.start as usize..read_range.end as usize)?
+            };
+            drop(old_range);
 
             self.buffer.replace(new_buffer);
             self.buffer_range.replace(read_range);
