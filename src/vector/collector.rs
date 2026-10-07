@@ -527,7 +527,7 @@ mod ivf_e2e_tests {
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
     use crate::schema::{Field, Schema, FAST, STORED, STRING};
-    use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
+    use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DCentroids, TestVectorIndex};
     use crate::vector::{Metric, RouterKind, VectorDType, VectorOptions, VectorStorageFormat};
     use crate::{DocAddress, Index, Order, Score, TantivyDocument, TantivyError};
 
@@ -639,14 +639,11 @@ mod ivf_e2e_tests {
         let mut schema_builder = Schema::builder();
         let embedding_field = schema_builder.add_vector_field("embedding", vector_options);
         let id_field = schema_builder.add_u64_field("id", FAST);
-        let settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..IndexSettings::default()
-        };
+        let settings = IndexSettings::default();
         let index = Index::builder()
             .schema(schema_builder.build())
             .settings(settings)
-            .ivf_clusterer(Arc::new(Grid2DClusterer {
+            .centroid_producer(Arc::new(Grid2DCentroids {
                 centroids: vec![[0.0, 0.0], [10.0, 10.0]],
             }))
             .ivf_router(RouterKind::Stacked)?
@@ -689,11 +686,8 @@ mod ivf_e2e_tests {
                     .is_ok_and(|vectors| vectors.index().is_some())
             })
             .count();
-        assert!(ivf_segments >= 1, "expected at least one Ivf segment");
-        assert!(
-            ivf_segments < searcher.segment_readers().len(),
-            "expected at least one Flat segment"
-        );
+        assert_eq!(ivf_segments, 2);
+        assert_eq!(ivf_segments, searcher.segment_readers().len());
         Ok((index, embedding_field, id_field))
     }
 
@@ -797,14 +791,11 @@ mod ivf_e2e_tests {
         let vector_options = VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32);
         let mut schema_builder = Schema::builder();
         let embedding_field = schema_builder.add_vector_field("embedding", vector_options);
-        let settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..IndexSettings::default()
-        };
+        let settings = IndexSettings::default();
         let index = Index::builder()
             .schema(schema_builder.build())
             .settings(settings)
-            .ivf_clusterer(Arc::new(Grid2DClusterer {
+            .centroid_producer(Arc::new(Grid2DCentroids {
                 centroids: vec![[0.0, 10.0], [0.0, -10.0]],
             }))
             .ivf_router(RouterKind::Stacked)?
@@ -955,13 +946,7 @@ mod ivf_e2e_tests {
         Ok(())
     }
 
-    /// Single index containing both a Flat segment (un-merged commit) and
-    /// an Ivf segment (merged commit under `vector_clustering_threshold=1`)
-    /// so the collector has to dispatch `FlatBackend::top_n` on one and
-    /// `IvfBackend::top_n` on the other in a single `searcher.search`.
-    /// Hand-built — `TestVectorIndex` produces a single format index-wide
-    /// — but uses the shared `Grid2DClusterer` and `ground_truth::top_k`
-    /// so there's no parallel oracle / clusterer to drift.
+    /// Shared routing searches imported flat segments alongside clustered segments.
     #[test]
     fn e2e_mixed_flat_and_ivf_matches_global_oracle() -> crate::Result<()> {
         let centroids: Vec<[f32; 2]> = vec![[0.0, 0.0], [10.0, 10.0]];
@@ -971,14 +956,11 @@ mod ivf_e2e_tests {
         let embedding_field = schema_builder.add_vector_field("embedding", vector_options);
         let label_field = schema_builder.add_text_field("label", STRING | STORED);
         let schema = schema_builder.build();
-        let settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..IndexSettings::default()
-        };
+        let settings = IndexSettings::default();
         let index = Index::builder()
             .schema(schema)
             .settings(settings)
-            .ivf_clusterer(Arc::new(Grid2DClusterer {
+            .centroid_producer(Arc::new(Grid2DCentroids {
                 centroids: centroids.clone(),
             }))
             .ivf_router(RouterKind::Stacked)?
@@ -986,8 +968,7 @@ mod ivf_e2e_tests {
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
 
-        // Two commits → two flat segments; pairwise merge → one Ivf segment
-        // (threshold=1 trips the format flip).
+        // Merge two clustered segments before importing a flat one.
         let ivf_batches: [&[(&str, [f32; 2])]; 2] = [
             &[
                 ("ivf0", [0.1, 0.1]),
@@ -1014,7 +995,8 @@ mod ivf_e2e_tests {
         assert_eq!(ivf_targets.len(), 2, "expected two segments to merge");
         writer.merge(&ivf_targets).wait()?;
 
-        // One more un-merged commit → flat segment.
+        let flat = Index::create_in_ram(index.schema());
+        let mut flat_writer = flat.writer_with_num_threads(1, 15_000_000)?;
         let flat_batch: [(&str, [f32; 2]); 3] = [
             ("flat0", [0.4, 0.4]),
             ("flat1", [10.3, 10.3]),
@@ -1024,7 +1006,25 @@ mod ivf_e2e_tests {
             let mut doc = TantivyDocument::new();
             doc.add_vector(embedding_field, &v);
             doc.add_text(label_field, lbl);
-            writer.add_document(doc)?;
+            flat_writer.add_document(doc)?;
+        }
+        flat_writer.commit()?;
+        let meta = flat.load_metas()?;
+        use std::io::Write;
+
+        use crate::directory::{Directory, TerminatingWrite};
+        for path in
+            crate::index::list_segment_files(&meta.segments, &meta.persisted_custom_extensions)
+        {
+            if flat.directory().exists(&path)? {
+                let bytes = flat.directory().open_read(&path)?.read_bytes()?;
+                let mut write = index.directory().open_write(&path)?;
+                write.write_all(&bytes)?;
+                write.terminate()?;
+            }
+        }
+        for segment in meta.segments {
+            writer.add_segment(segment)?;
         }
         writer.commit()?;
         writer.wait_merging_threads()?;
@@ -1046,9 +1046,7 @@ mod ivf_e2e_tests {
             "expected mixed segments, got {flat_count} flat / {ivf_count} ivf"
         );
 
-        // Exhaustive probing on the Ivf side so the only thing being
-        // tested here is per-segment dispatch + merge_fruits — not the
-        // adaptive loop, which is covered separately.
+        // Exhaustive probing includes both storage formats in the global result.
         let params = exhaustive_params(9);
         for query in [[0.0_f32, 0.0], [10.0, 10.0], [5.0, 5.0]] {
             for k in [1usize, 3, 6] {

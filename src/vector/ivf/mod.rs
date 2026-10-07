@@ -8,6 +8,7 @@ mod index;
 mod ivf;
 mod params;
 mod partition;
+#[cfg(test)]
 mod plugin;
 mod training;
 mod writer;
@@ -32,10 +33,6 @@ pub use ivf::{
     StackedSearchStats, SuperKMeansLevelClusterer, PARENT_NPROBE_FRACTION,
 };
 pub use params::{AdaptiveProbeParams, WorkModel, DEFAULT_ROUTER_RECALL};
-pub(crate) use plugin::merge_ivf;
 pub(crate) use training::{decode_row, decode_row_append, encode_vector};
-pub use training::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfTrainingBatch,
-    IvfTrainingVectors, IvfVectorBatch, IvfVectors,
-};
+pub use training::{IvfCentroids, IvfMatrix};
 pub(crate) use writer::{merge_shared, IvfVecWriter, SharedSegmentMeta};

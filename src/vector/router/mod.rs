@@ -59,9 +59,7 @@ impl RouterKind {
         Ok(router)
     }
 
-    /// Opens the router persisted in `slot`, whichever kind it was built
-    /// with. The configured router only decides what new segments build, so
-    /// an index may hold segments routed by different kinds.
+    /// Opens the router persisted in a legacy segment, whichever kind it was built with.
     pub(crate) fn open(
         file_version: VectorFileVersion,
         slot: FileSlice,

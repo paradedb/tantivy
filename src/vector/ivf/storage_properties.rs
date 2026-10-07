@@ -1,5 +1,6 @@
 use super::*;
 use crate::schema::Value;
+use crate::vector::distance::maybe_normalize_bytes;
 use crate::vector::prepared::{corrected_quantized_estimate, ArithmeticError};
 use crate::vector::storage_io::test_support::{PagedDirectory, PAGE_BYTES};
 
@@ -7,11 +8,8 @@ const DIM: usize = 64;
 const DOCS: usize = 1200;
 
 struct FixedClusters;
-impl IvfClusterer for FixedClusters {
-    fn training_sample_ratio(&self) -> f32 {
-        1.0
-    }
-    fn train(&self, _: &VectorOptions, _: IvfTrainingVectors) -> crate::Result<IvfCentroids> {
+impl CentroidProducer for FixedClusters {
+    fn centroids(&self, _: Field, _: &VectorOptions) -> crate::Result<IvfCentroids> {
         let mut values = vec![0.0; 4 * DIM];
         for cluster in 0..4 {
             values[cluster * DIM + cluster] = 1.0;
@@ -21,20 +19,6 @@ impl IvfClusterer for FixedClusters {
             rows: 4,
             dims: DIM,
         }))
-    }
-    fn assign(
-        &self,
-        _: &VectorOptions,
-        vectors: IvfVectors<'_>,
-        _: &IvfCentroids,
-    ) -> crate::Result<Vec<u32>> {
-        let IvfVectors::F32(vectors) = vectors;
-        Ok(vectors
-            .matrix
-            .values
-            .chunks_exact(DIM)
-            .map(|row| (0..4).max_by(|&a, &b| row[a].total_cmp(&row[b])).unwrap() as u32)
-            .collect())
     }
 }
 fn present(doc: usize) -> bool {
@@ -78,7 +62,6 @@ fn fixture_with_seed(
     let index = Index::builder()
         .schema(schema.build())
         .settings(IndexSettings {
-            vector_clustering_threshold: 1,
             vector_quantization: if schedule.is_empty() {
                 Vec::new()
             } else {
@@ -92,7 +75,7 @@ fn fixture_with_seed(
             },
             ..Default::default()
         })
-        .ivf_clusterer(Arc::new(FixedClusters))
+        .centroid_producer(Arc::new(FixedClusters))
         .ivf_router(RouterKind::Exact)?
         .create(directory.clone())?;
     let mut writer = index.writer_with_num_threads(1, 30_000_000)?;

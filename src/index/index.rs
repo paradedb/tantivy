@@ -34,7 +34,7 @@ use crate::tokenizer::{TextAnalyzer, TokenizerManager};
 use crate::vector::ivf::centroid_index::{
     open_centroid_index, write_centroid_index, CentroidIndex,
 };
-use crate::vector::{CentroidProducer, IvfClusterer, RouterKind, VectorPlugin};
+use crate::vector::{CentroidProducer, RouterKind, VectorPlugin};
 use crate::SegmentReader;
 
 fn load_metas(
@@ -201,7 +201,6 @@ pub struct IndexBuilder {
     tokenizer_manager: TokenizerManager,
     fast_field_tokenizer_manager: TokenizerManager,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
-    ivf_clusterer: Option<Arc<dyn IvfClusterer>>,
     ivf_router: Option<RouterKind>,
     centroid_producer: Option<Arc<dyn CentroidProducer>>,
 }
@@ -219,7 +218,6 @@ impl IndexBuilder {
             tokenizer_manager: TokenizerManager::default(),
             fast_field_tokenizer_manager: TokenizerManager::default(),
             custom_plugins: Vec::new(),
-            ivf_clusterer: None,
             ivf_router: None,
             centroid_producer: None,
         }
@@ -257,13 +255,6 @@ impl IndexBuilder {
         self
     }
 
-    /// Configure the clusterer used when vector merges cross the IVF threshold.
-    #[must_use]
-    pub fn ivf_clusterer(mut self, clusterer: Arc<dyn IvfClusterer>) -> Self {
-        self.ivf_clusterer = Some(clusterer);
-        self
-    }
-
     /// Supplies immutable index-level centroids at creation. An existing index
     /// keeps its stored centroids; the producer is not called when reopening.
     /// Segments assign against these centroids without per-segment training.
@@ -273,8 +264,7 @@ impl IndexBuilder {
         self
     }
 
-    /// Select the router used to build index-level centroids and new IVF segments. Existing
-    /// segments open under the router persisted in their `.centroids` file.
+    /// Select the router built with the supplied centroids at index creation.
     pub fn ivf_router(mut self, router: RouterKind) -> crate::Result<Self> {
         configure_ivf_router(&mut self.ivf_router, router)?;
         Ok(self)
@@ -361,10 +351,6 @@ impl IndexBuilder {
                 ));
             }
             index.custom_plugins.extend(self.custom_plugins);
-            index.ivf_router = self.ivf_router;
-            if let Some(clusterer) = self.ivf_clusterer {
-                index.set_ivf_clusterer(clusterer);
-            }
             Ok(index)
         } else {
             Err(TantivyError::SchemaError(
@@ -377,11 +363,6 @@ impl IndexBuilder {
         if self.centroid_producer.is_some() && self.ivf_router.is_none() {
             return Err(TantivyError::InvalidArgument(
                 "a CentroidProducer requires an explicitly configured Router".into(),
-            ));
-        }
-        if self.ivf_clusterer.is_some() && self.ivf_router.is_none() {
-            return Err(TantivyError::InvalidArgument(
-                "an IvfClusterer requires an explicitly configured Router".to_string(),
             ));
         }
         if let Some(schema) = self.schema.as_ref() {
@@ -486,10 +467,6 @@ impl IndexBuilder {
         index.set_tokenizers(self.tokenizer_manager);
         index.set_fast_field_tokenizers(self.fast_field_tokenizer_manager);
         index.custom_plugins.extend(self.custom_plugins);
-        index.ivf_router = self.ivf_router;
-        if let Some(clusterer) = self.ivf_clusterer {
-            index.set_ivf_clusterer(clusterer);
-        }
         Ok(index)
     }
 }
@@ -505,8 +482,6 @@ pub struct Index {
     fast_field_tokenizers: TokenizerManager,
     inventory: SegmentMetaInventory,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
-    ivf_clusterer: Option<Arc<dyn IvfClusterer>>,
-    ivf_router: Option<RouterKind>,
     centroid_index_meta: Option<CentroidIndexMeta>,
     centroid_index_cache: Arc<OnceLock<crate::Result<Arc<CentroidIndex>>>>,
 }
@@ -629,8 +604,6 @@ impl Index {
             executor: Executor::single_thread(),
             inventory,
             custom_plugins: Vec::new(),
-            ivf_clusterer: None,
-            ivf_router: None,
             centroid_index_meta: metas.centroid_index.clone(),
             centroid_index_cache: Arc::new(OnceLock::new()),
         }
@@ -992,25 +965,6 @@ impl Index {
     /// Accessor to the index settings
     pub fn settings_mut(&mut self) -> &mut IndexSettings {
         &mut self.settings
-    }
-
-    /// Configure the clusterer used when vector merges cross the IVF threshold.
-    pub fn set_ivf_clusterer(&mut self, clusterer: Arc<dyn IvfClusterer>) {
-        self.ivf_clusterer = Some(clusterer);
-    }
-
-    /// Select the router used to build new IVF segments. Existing segments
-    /// open under the router persisted in their `.centroids` file.
-    pub fn set_ivf_router(&mut self, router: RouterKind) -> crate::Result<()> {
-        configure_ivf_router(&mut self.ivf_router, router)
-    }
-
-    pub(crate) fn ivf_router(&self) -> Option<RouterKind> {
-        self.ivf_router
-    }
-
-    pub(crate) fn ivf_clusterer(&self) -> Option<&dyn IvfClusterer> {
-        self.ivf_clusterer.as_deref()
     }
 
     /// Accessor to the index schema

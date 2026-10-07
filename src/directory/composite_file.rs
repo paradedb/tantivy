@@ -50,11 +50,6 @@ impl<W: TerminatingWrite + Write> CompositeWrite<W> {
         }
     }
 
-    /// Number of bytes written to entries, excluding the composite footer.
-    pub(crate) fn written_bytes(&self) -> u64 {
-        self.write.written_bytes()
-    }
-
     /// Start writing a new field.
     pub fn for_field(&mut self, field: Field) -> &mut CountingWriter<W> {
         self.for_field_with_idx(field, 0)

@@ -72,6 +72,7 @@ pub(crate) struct RouterIndex {
 impl IvfIndex {
     /// Write slot `[0]` of the `.centroids` composite for a field. `num_docs`
     /// is the number of distinct docs assigned, not the posting-row total.
+    #[cfg(test)]
     pub(crate) fn serialize_centroids<W: Write + ?Sized>(
         num_centroids: usize,
         num_docs: usize,

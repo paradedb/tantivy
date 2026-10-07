@@ -30,9 +30,8 @@ through `open_or_create` on an existing index.
 
 Indexes with this artifact assign flushed vectors and flat merge inputs to their
 most similar stored centroid, breaking ties by the lowest centroid ID. Assignment
-uses an exact scan and does not call the per-segment clusterer. The clustering
-threshold applies only to indexes without shared centroids. Clustered merge inputs
-must reference the same centroid artifact as the target. Merges preserve their
+uses an exact scan. Clustered merge inputs must reference the same centroid
+artifact as the target. Merges preserve their
 memberships and row bytes, remap document IDs, and discard deleted documents.
 Bounds are the per-cluster maximum of source bounds and newly assigned flat-row
 residuals; deleted rows may leave conservative overestimates. Quantized columns
@@ -75,7 +74,8 @@ Routing, budget, termination, recall, and bound-arming statistics are recorded
 once in the first segment's stats. Row counts, bounds skips, layer statistics,
 and storage reads remain attributed to their segment.
 
-Indexes without an artifact keep the flat/V3 clustered paths below.
+Indexes without an artifact write flat storage on both flush and merge. Existing
+V3 clustered segments remain readable and become flat when merged without an artifact.
 
 ## File headers and entries
 

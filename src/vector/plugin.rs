@@ -4,15 +4,12 @@
 //! - With shared centroids, flushes assign vectors to the persisted centroid order; merges preserve
 //!   clustered memberships and assign flat inputs. Both write clustered `.vec` blocks plus
 //!   segment-specific `.centroids` metadata.
-//! - Without shared centroids, indexing writes flat `.vec` files. Merges select by doc count: below
-//!   [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold)
-//!   it copies vectors forward into a flat `.vec`; at or above the threshold it writes an IVF
-//!   `.vec` (with `IdMap::DocLocations`) plus a `.centroids` file.
+//! - Without shared centroids, flushes and merges write flat `.vec` files.
 //! - During reads, [`VectorIndexReader`](super::VectorIndexReader) opens the field's `.vec` slots
 //!   (and the `.centroids` sidecar when present) via
 //!   [`SegmentReader::vector_index`](crate::SegmentReader::vector_index).
 use super::flat::{merge_flat, FlatVecWriter};
-use super::ivf::{merge_ivf, merge_shared, IvfVecWriter, CENTROIDS_EXT};
+use super::ivf::{merge_shared, IvfVecWriter, CENTROIDS_EXT};
 use super::VEC_EXT;
 use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
 
@@ -36,23 +33,12 @@ impl SegmentPlugin for VectorPlugin {
         if ctx.target_segment.index().centroid_index_meta().is_some() {
             return merge_shared(&ctx);
         }
-        // Target cardinality selects uniform or clustered storage.
-        let target_docs: u32 = ctx.readers.iter().map(|r| r.num_docs()).sum();
-        let threshold = ctx.settings.vector_clustering_threshold();
-        if (target_docs as usize) < threshold {
-            merge_flat(&ctx)
-        } else {
-            merge_ivf(
-                &ctx,
-                ctx.target_segment.index().ivf_clusterer(),
-                ctx.target_segment.index().ivf_router(),
-            )
-        }
+        merge_flat(&ctx)
     }
 }
 
 /// Resolves target-document order to source rows using document columns or flat maps.
-/// Target order fixes training samples and assignment batches independently of source clustering.
+/// Target order is independent of source clustering.
 pub(crate) fn merge_source_rows(
     ctx: &PluginMergeContext,
     readers: &[std::sync::Arc<super::VectorIndexReader>],

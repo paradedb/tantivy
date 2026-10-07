@@ -7,8 +7,7 @@
 //! The on-disk formats live in submodules: [`flat`] for the dense full-precision layout and
 //! [`ivf`] for the partitioned/clustered accelerator. Both are owned by a single
 //! [`VectorPlugin`]. Indexes with shared centroids write clustered storage; other indexes
-//! select their merge layout using
-//! [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold).
+//! write flat storage.
 //! Top-N vector queries dispatch over them via [`VectorBackend`].
 
 use std::borrow::Cow;
@@ -74,12 +73,11 @@ pub use index_reader::{
 };
 pub use ivf::{
     BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, Candidate, CentroidProducer, ClusterId,
-    Graph, InMemoryStackedIvf, InMemoryStore, IvfCentroids, IvfClusterer, IvfConfig, IvfIndex,
-    IvfIndexBuilder, IvfLevelClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings,
-    IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, LazyStackedIvf, LazyStore,
-    MultiLevelIvf, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
-    RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
-    StackedSearchStats, SuperKMeansLevelClusterer, Workspace, APS_MAX_DIM,
+    Graph, InMemoryStackedIvf, InMemoryStore, IvfCentroids, IvfConfig, IvfIndex, IvfIndexBuilder,
+    IvfLevelClusterer, IvfMatrix, LazyStackedIvf, LazyStore, MultiLevelIvf,
+    NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph,
+    ResumableSearchIterator, SearchIterator, SearchTerminationReason, StackedSearchStats,
+    SuperKMeansLevelClusterer, Workspace, APS_MAX_DIM,
 };
 pub use metadata::{
     F64Bits, Grid, Partition, QuantizationSchedule, Quantizer, QuantizerKind, Rotation,

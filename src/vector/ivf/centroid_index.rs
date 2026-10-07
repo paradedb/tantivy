@@ -1455,40 +1455,71 @@ mod tests {
 
     #[test]
     fn shared_merge_rejects_foreign_and_segment_local_centroids() -> crate::Result<()> {
+        use crate::index::SegmentComponent;
         use crate::indexer::merger::IndexMerger;
-        use crate::vector::tests::Grid2DClusterer;
+        use crate::vector::header::{read_centroid_header, write_centroid_header};
+        use crate::vector::ivf::{IvfIndex, CENTROIDS_EXT};
 
         let fixture = Fixture::new(Metric::L2);
         let target_index = fixture.create(RouterKind::Exact)?;
         for local in [false, true] {
-            let source = if local {
-                Index::builder()
-                    .schema(fixture.schema.clone())
-                    .settings(crate::IndexSettings {
-                        vector_clustering_threshold: 1,
-                        ..Default::default()
-                    })
-                    .ivf_clusterer(Arc::new(Grid2DClusterer {
-                        centroids: vec![[0.0, 0.0], [3.0, 4.0], [-4.0, 3.0]],
-                    }))
-                    .ivf_router(RouterKind::Exact)?
-                    .create_in_ram()?
-            } else {
-                fixture
-                    .builder()
-                    .ivf_router(RouterKind::Exact)?
-                    .create_in_ram()?
-            };
+            let directory = RamDirectory::create();
+            let source = fixture
+                .builder()
+                .ivf_router(RouterKind::Exact)?
+                .create(directory.clone())?;
             let mut writer: IndexWriter = source.writer_with_num_threads(1, 15_000_000)?;
             writer.set_merge_policy(Box::new(NoMergePolicy));
             let mut doc = TantivyDocument::new();
             doc.add_vector(fixture.field, &[3.0, 4.0]);
             writer.add_document(doc)?;
             writer.commit()?;
-            if local {
-                writer.merge(&source.searchable_segment_ids()?).wait()?;
-            }
+            drop(writer);
             let segments = source.searchable_segments()?;
+            if local {
+                let segment = &segments[0];
+                let reader = crate::SegmentReader::open(segment)?;
+                let vectors = reader.vector_index(fixture.field)?;
+                let ivf = vectors.index().unwrap();
+                let component = SegmentComponent::Custom(CENTROIDS_EXT.into());
+                let (_, body) = read_centroid_header(&segment.open_read(component.clone())?)?;
+                let old = CompositeFile::open(&body)?;
+                let artifact = source
+                    .directory()
+                    .open_read(&source.centroid_index_meta().unwrap().file_name)?;
+                let router = CompositeFile::open(&artifact.slice_from(HEADER_LEN))?
+                    .open_read_with_idx(fixture.field, ROUTER)
+                    .unwrap()
+                    .read_bytes()?;
+                source
+                    .directory()
+                    .delete(&segment.relative_path(component.clone()))
+                    .unwrap();
+                let mut write = segment.open_write(component)?;
+                write_centroid_header(&mut write)?;
+                let mut write = CompositeWrite::wrap(write);
+                IvfIndex::serialize_centroids(
+                    ivf.num_clusters(),
+                    ivf.num_docs(),
+                    &ivf.centroid_bytes()?,
+                    &VectorOptions::new(2, Metric::L2),
+                    write.for_field_with_idx(fixture.field, 0),
+                )?;
+                write.for_field_with_idx(fixture.field, 1).write_all(
+                    &old.open_read_with_idx(fixture.field, 1)
+                        .unwrap()
+                        .read_bytes()?,
+                )?;
+                write
+                    .for_field_with_idx(fixture.field, 2)
+                    .write_all(&router)?;
+                write.for_field_with_idx(fixture.field, 3).write_all(
+                    &old.open_read_with_idx(fixture.field, 3)
+                        .unwrap()
+                        .read_bytes()?,
+                )?;
+                write.close()?;
+            }
             assert_eq!(
                 crate::SegmentReader::open(&segments[0])?
                     .vector_index(fixture.field)?
@@ -1496,6 +1527,16 @@ mod tests {
                     .unwrap()
                     .num_clusters(),
                 3
+            );
+            let reader = crate::SegmentReader::open(&segments[0])?;
+            assert_eq!(
+                reader
+                    .vector_index(fixture.field)?
+                    .index()
+                    .unwrap()
+                    .centroid_index_meta()
+                    .is_none(),
+                local
             );
             let merger = IndexMerger::open(
                 fixture.schema.clone(),
@@ -1509,6 +1550,22 @@ mod tests {
                 error.to_string().contains("different centroid index"),
                 "{error}"
             );
+            if local {
+                let mut meta = source.load_metas()?;
+                meta.centroid_index = None;
+                directory.atomic_write(&META_FILEPATH, &serde_json::to_vec(&meta)?)?;
+                let reopened = Index::open(directory)?;
+                let mut writer: IndexWriter = reopened.writer_with_num_threads(1, 15_000_000)?;
+                writer.merge(&reopened.searchable_segment_ids()?).wait()?;
+                writer.wait_merging_threads()?;
+                let searcher = reopened.reader()?.searcher();
+                let vectors = searcher.segment_readers()[0].vector_index(fixture.field)?;
+                assert!(vectors.index().is_none());
+                assert_eq!(
+                    vectors.vector_bytes(0)?.unwrap().as_slice(),
+                    encode_vector(&[3.0_f32, 4.0], 2)?
+                );
+            }
         }
         Ok(())
     }

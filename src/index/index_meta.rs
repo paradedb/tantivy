@@ -313,12 +313,6 @@ pub struct IndexSettings {
     #[serde(default = "default_codec_types")]
     #[serde(skip_serializing_if = "is_default_codec_types")]
     pub codec_types: Vec<columnar::CodecType>,
-    /// Doc-count boundary for choosing flat or clustered storage on merge
-    /// when the index has no shared centroids. Indexes with shared centroids
-    /// write clustered segments regardless of this threshold.
-    #[serde(default = "default_vector_clustering_threshold")]
-    #[serde(skip_serializing_if = "is_default_vector_clustering_threshold")]
-    pub vector_clustering_threshold: usize,
     /// Per-vector-field quantization configuration. The empty default keeps
     /// existing and flat-only indexes on the exact path.
     #[serde(default)]
@@ -339,14 +333,6 @@ fn is_default_codec_types(types: &[columnar::CodecType]) -> bool {
     types == columnar::DEFAULT_CODEC_TYPES
 }
 
-fn default_vector_clustering_threshold() -> usize {
-    10_000
-}
-
-fn is_default_vector_clustering_threshold(threshold: &usize) -> bool {
-    *threshold == default_vector_clustering_threshold()
-}
-
 impl Default for IndexSettings {
     fn default() -> Self {
         Self {
@@ -356,7 +342,6 @@ impl Default for IndexSettings {
             docstore_blocksize: default_docstore_blocksize(),
             docstore_compress_dedicated_thread: true,
             codec_types: default_codec_types(),
-            vector_clustering_threshold: default_vector_clustering_threshold(),
             vector_quantization: Vec::new(),
         }
     }
@@ -366,12 +351,6 @@ impl IndexSettings {
     /// Returns the codec types to use for u64-based column serialization.
     pub fn columnar_codec_types(&self) -> &[columnar::CodecType] {
         &self.codec_types
-    }
-
-    /// Returns the doc-count boundary at which merges switch from flat
-    /// to IVF storage. See [`IndexSettings::vector_clustering_threshold`].
-    pub fn vector_clustering_threshold(&self) -> usize {
-        self.vector_clustering_threshold
     }
 
     /// Validate field-keyed quantization metadata before an index is built.
@@ -668,7 +647,6 @@ mod tests {
                 docstore_compress_dedicated_thread: true,
                 docstore_blocksize: 16_384,
                 codec_types: columnar::DEFAULT_CODEC_TYPES.to_vec(),
-                vector_clustering_threshold: 10_000,
                 vector_quantization: Vec::new(),
             }
         );
@@ -684,6 +662,14 @@ mod tests {
             let index_settings_deser: IndexSettings =
                 serde_json::from_value(index_settings_json).unwrap();
             assert_eq!(index_settings_deser, index_settings);
+        }
+        {
+            let mut legacy = serde_json::to_value(&index_settings).unwrap();
+            legacy["vector_clustering_threshold"] = serde_json::json!(1);
+            assert_eq!(
+                serde_json::from_value::<IndexSettings>(legacy).unwrap(),
+                index_settings
+            );
         }
         {
             // manual_doc_id_mapping should not be persisted.

@@ -48,8 +48,6 @@ impl BinarySerializable for VectorFileVersion {
 pub(crate) const VECTOR_FILE_FORMAT_VERSION: u32 = VectorFileVersion::V4 as u32;
 /// Version written to `.vec` files.
 pub(crate) const CURRENT_VECTOR: VectorFileVersion = VectorFileVersion::V4;
-/// Version written to segment-local `.centroids` files.
-pub(crate) const CURRENT_CENTROID: VectorFileVersion = VectorFileVersion::V3;
 
 /// `.centroids` composite slot indices.
 pub(crate) mod centroid_slot {
@@ -157,9 +155,10 @@ pub(crate) fn check_vector_format(file: Result<FileSlice, OpenReadError>) -> cra
     }
 }
 
-/// Writes a `.centroids` header.
+/// Writes a legacy `.centroids` header for compatibility tests.
+#[cfg(test)]
 pub(crate) fn write_centroid_header<W: Write + ?Sized>(writer: &mut W) -> io::Result<()> {
-    write_header(writer, CURRENT_CENTROID)
+    write_header(writer, VectorFileVersion::V3)
 }
 
 /// Parses a `.centroids` header and returns its version and composite body.

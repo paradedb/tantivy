@@ -2945,8 +2945,7 @@ mod tests {
     // overflow / zero-K. The handful of tests that need crafted point
     // geometry (the trap case + the result-level candidate-floor
     // demonstration) build a tiny IVF index inline via `build_inline_ivf`
-    // and an `InlineClusterer` that's compatible with the batched
-    // IvfClusterer trait.
+    // and the shared `Grid2DCentroids` producer.
     // ============================================================
     use std::cmp::Ordering;
 
@@ -2962,9 +2961,8 @@ mod tests {
     };
     use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
     use crate::vector::prepared::QuantizedIndexCtx;
-    use crate::vector::tests::{exhaustive_params, TestVectorIndex};
+    use crate::vector::tests::{exhaustive_params, Grid2DCentroids, TestVectorIndex};
     use crate::vector::{
-        IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors,
         NeighborhoodGraphSearchMetrics, RouterKind, SearchTerminationReason, VectorClusterStats,
         VectorDType, VectorInfo, VectorOptions, VectorQuantizationConfig, VectorQuantizationLayer,
         VectorStorageFormat,
@@ -3314,64 +3312,8 @@ mod tests {
     // override. The trap-case and result-level candidate-floor tests
     // need points at specific coordinates, so they build a small IVF
     // index inline via the helper below.
-    struct InlineClusterer {
-        centroids: Vec<[f32; 2]>,
-    }
-
-    impl IvfClusterer for InlineClusterer {
-        fn training_sample_ratio(&self) -> f32 {
-            1.0
-        }
-        fn train(
-            &self,
-            options: &VectorOptions,
-            _vectors: IvfTrainingVectors,
-        ) -> crate::Result<IvfCentroids> {
-            assert_eq!(options.dim(), 2);
-            let num_centroids = self.centroids.len();
-            Ok(IvfCentroids::F32(IvfMatrix {
-                values: self
-                    .centroids
-                    .iter()
-                    .flat_map(|c| c.iter().copied())
-                    .collect(),
-                rows: num_centroids,
-                dims: 2,
-            }))
-        }
-        fn assign(
-            &self,
-            options: &VectorOptions,
-            vectors: IvfVectors<'_>,
-            centroids: &IvfCentroids,
-        ) -> crate::Result<Vec<u32>> {
-            assert_eq!(options.dim(), 2);
-            let IvfVectors::F32(vectors) = vectors;
-            let IvfCentroids::F32(centroids) = centroids;
-            Ok(vectors
-                .matrix
-                .values
-                .chunks_exact(2)
-                .map(|v| {
-                    let mut best = 0u32;
-                    let mut best_d2 = f32::INFINITY;
-                    for (i, c) in centroids.values.chunks_exact(2).enumerate() {
-                        let dx = v[0] - c[0];
-                        let dy = v[1] - c[1];
-                        let d2 = dx * dx + dy * dy;
-                        if d2 < best_d2 {
-                            best = i as u32;
-                            best_d2 = d2;
-                        }
-                    }
-                    best
-                })
-                .collect())
-        }
-    }
-
     /// Build a single-IVF-segment index with the supplied centroids and
-    /// labelled docs. Splits docs across two commits so `merge_ivf`
+    /// labelled docs. Splits docs across two commits so the merge
     /// has ≥ 2 source segments to consume. Returns the index plus the
     /// `(embedding, label)` field handles.
     fn build_inline_ivf(
@@ -3388,14 +3330,11 @@ mod tests {
         let label_field = sb.add_text_field("label", STRING | STORED);
         let schema = sb.build();
 
-        let settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..IndexSettings::default()
-        };
+        let settings = IndexSettings::default();
         let index = Index::builder()
             .schema(schema)
             .settings(settings)
-            .ivf_clusterer(Arc::new(InlineClusterer {
+            .centroid_producer(Arc::new(Grid2DCentroids {
                 centroids: centroids.to_vec(),
             }))
             .ivf_router(RouterKind::Stacked)?
@@ -3417,31 +3356,6 @@ mod tests {
         writer.merge(&segment_ids).wait()?;
         writer.wait_merging_threads()?;
         Ok((index, embed_field, label_field))
-    }
-
-    /// Decode a stored little-endian `[f32; 2]` row.
-    fn decode_2d(bytes: &[u8]) -> [f32; 2] {
-        [
-            f32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            f32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-        ]
-    }
-
-    /// L2-nearest centroid with first-wins tie-break on strict `<` — the
-    /// same rule `InlineClusterer::assign` uses for the primary.
-    fn nearest_centroid(p: [f32; 2], centroids: &[[f32; 2]]) -> usize {
-        let mut best = 0;
-        let mut best_d2 = f32::INFINITY;
-        for (i, c) in centroids.iter().enumerate() {
-            let dx = p[0] - c[0];
-            let dy = p[1] - c[1];
-            let d2 = dx * dx + dy * dy;
-            if d2 < best_d2 {
-                best_d2 = d2;
-                best = i;
-            }
-        }
-        best
     }
 
     const DOCS_PER_CLUSTER: usize = 6;
@@ -3474,20 +3388,20 @@ mod tests {
             .collect()
     }
 
-    /// Merging flat segments with deletes past the clustering threshold: rows
+    /// Merging clustered segments with deletes: rows
     /// written for since-deleted docs still count toward the sources'
     /// `count()` (tombstones don't rewrite `.vec`), so the alive-doc merge
     /// iteration legitimately comes up short of `vector_count`. The merge
     /// must tolerate that, and the resulting IVF segment must hold — and
     /// count — the alive docs only.
     #[test]
-    fn merge_flat_segments_with_deletes_into_ivf() -> crate::Result<()> {
+    fn merge_clustered_segments_with_deletes() -> crate::Result<()> {
         let (centroids, labels) = multi_cluster_fixture();
         let docs = multi_cluster_docs(&centroids, &labels);
         let n = docs.len();
 
-        // Same shape as `build_inline_ivf`, but the two flat source segments
-        // stay unmerged so the deletes land BEFORE the clustering merge.
+        // Same shape as `build_inline_ivf`, but the two clustered source segments
+        // stay unmerged so the deletes land before the merge.
         let mut sb = Schema::builder();
         let embed_field = sb.add_vector_field(
             "embedding",
@@ -3495,14 +3409,11 @@ mod tests {
         );
         let label_field = sb.add_text_field("label", STRING | STORED);
         let schema = sb.build();
-        let settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..IndexSettings::default()
-        };
+        let settings = IndexSettings::default();
         let index = Index::builder()
             .schema(schema)
             .settings(settings)
-            .ivf_clusterer(Arc::new(InlineClusterer {
+            .centroid_producer(Arc::new(Grid2DCentroids {
                 centroids: centroids.clone(),
             }))
             .ivf_router(RouterKind::Stacked)?
@@ -3520,7 +3431,7 @@ mod tests {
             writer.commit()?;
         }
 
-        // Tombstone docs in BOTH flat sources (d0/d7 in the first commit,
+        // Tombstone docs in BOTH sources (d0/d7 in the first commit,
         // d35 in the second), then merge everything into one IVF segment.
         let deleted = ["d0", "d7", "d35"];
         for label in deleted {
@@ -3563,16 +3474,7 @@ mod tests {
         Ok(())
     }
 
-    /// Merging past the clustering threshold when every doc carrying a
-    /// vector for ONE field is deleted, while another field keeps live
-    /// vectors. The sources still report `vector_count > 0` for the emptied
-    /// field (tombstones don't rewrite `.vec`), so it takes the training
-    /// path, collects nothing — and used to `continue` without writing the
-    /// field's `.vec`/`.centroids` slots. The live field still wrote, so the
-    /// composites existed but the emptied field's slots were missing:
-    /// `count()`, `open_column()` and `vector_info()` all failed with
-    /// InternalError. The merge must instead write the same empty slots as
-    /// the no-vectors-at-all fast path.
+    /// Merging an emptied field preserves its global cluster slots and the live field's rows.
     #[test]
     fn merge_deleting_every_doc_of_one_field_writes_empty_ivf() -> crate::Result<()> {
         let (centroids, labels) = multi_cluster_fixture();
@@ -3590,14 +3492,11 @@ mod tests {
         );
         let label_field = sb.add_text_field("label", STRING | STORED);
         let schema = sb.build();
-        let settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..IndexSettings::default()
-        };
+        let settings = IndexSettings::default();
         let index = Index::builder()
             .schema(schema)
             .settings(settings)
-            .ivf_clusterer(Arc::new(InlineClusterer {
+            .centroid_producer(Arc::new(Grid2DCentroids {
                 centroids: centroids.clone(),
             }))
             .ivf_router(RouterKind::Stacked)?
@@ -3606,7 +3505,7 @@ mod tests {
         writer.set_merge_policy(Box::new(NoMergePolicy));
 
         // Even docs carry the doomed field, odd docs the kept one, split
-        // across two flat commits so BOTH sources hold doomed vectors.
+        // across two commits so BOTH sources hold doomed vectors.
         let mid = n / 2;
         for (i, (label, v)) in docs.iter().enumerate() {
             let mut doc = TantivyDocument::new();
@@ -3645,19 +3544,19 @@ mod tests {
             VectorInfo {
                 format: VectorStorageFormat::Ivf,
                 num_vectors: 0,
-                num_centroids: Some(0),
+                num_centroids: Some(centroids.len()),
                 cluster_stats: Some(VectorClusterStats {
                     min_cluster_size: 0,
                     max_cluster_size: 0,
                     avg_cluster_size: 0.0,
-                    empty_clusters: 0,
+                    empty_clusters: centroids.len(),
                 }),
             },
         );
         let ivf = vec_reader.index().expect("expected IVF storage");
         assert!(vec_reader.is_empty(), "no rows in the emptied field");
         assert_eq!(ivf.num_rows(), 0);
-        assert_eq!(ivf.num_clusters(), 0);
+        assert_eq!(ivf.num_clusters(), centroids.len());
 
         // The live field is untouched: every alive doc is counted and found.
         let kept_count = n / 2;
@@ -3674,67 +3573,6 @@ mod tests {
             exhaustive_params(centroids.len()),
         )?;
         assert_eq!(hits.len(), kept_count, "kept field returns alive docs");
-        Ok(())
-    }
-
-    /// Captures `paradedb::ivf_build` log records so a test can read back the
-    /// timings line the merge emits.
-    struct CaptureLogger;
-    static CAPTURED_IVF_BUILD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    impl log::Log for CaptureLogger {
-        fn enabled(&self, m: &log::Metadata) -> bool {
-            m.target() == "paradedb::ivf_build"
-        }
-        fn log(&self, r: &log::Record) {
-            if self.enabled(r.metadata()) {
-                CAPTURED_IVF_BUILD
-                    .lock()
-                    .unwrap()
-                    .push(format!("{}", r.args()));
-            }
-        }
-        fn flush(&self) {}
-    }
-    static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
-
-    /// The merge emits one parseable `ivf_build timings_ms ...` line per
-    /// field. Builds a larger index so the phase timings are measurable,
-    /// captures the line, and prints it (run with `--nocapture`) so we can
-    /// see where build time goes.
-    #[test]
-    fn ivf_build_emits_timings_log() -> crate::Result<()> {
-        let _ = log::set_logger(&CAPTURE_LOGGER);
-        log::set_max_level(log::LevelFilter::Info);
-
-        // 200 centroids on a 20×10 grid; ~5000 docs clustered around them.
-        let mut centroids: Vec<[f32; 2]> = Vec::new();
-        for x in 0..20 {
-            for y in 0..10 {
-                centroids.push([x as f32 * 10.0, y as f32 * 10.0]);
-            }
-        }
-        let n_per = 25usize;
-        let labels: Vec<String> = (0..centroids.len() * n_per)
-            .map(|i| format!("d{i}"))
-            .collect();
-        let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
-            .map(|i| {
-                let c = centroids[i / n_per];
-                let off = (i % n_per) as f32 * 0.05;
-                (labels[i].as_str(), [c[0] + off, c[1] + off])
-            })
-            .collect();
-
-        let before = CAPTURED_IVF_BUILD.lock().unwrap().len();
-        let _ = build_inline_ivf(Metric::L2, &centroids, &docs)?;
-        let lines: Vec<String> = CAPTURED_IVF_BUILD.lock().unwrap()[before..].to_vec();
-        let line = lines
-            .iter()
-            .find(|l| l.contains("ivf_build timings_ms") && l.contains("centroids=200"))
-            .expect("expected an ivf_build timings line for the 200-centroid build");
-        assert!(line.contains("train="));
-        assert!(line.contains("id_map_write="));
-        eprintln!("IVF_BUILD_SAMPLE {line}");
         Ok(())
     }
 
@@ -5337,8 +5175,7 @@ mod tests {
         );
     }
 
-    /// Build a single-segment FLAT index (one commit, never merged past
-    /// the clustering threshold): `docs` are `(label, Some(vector))`, or
+    /// Build a single-segment flat index without centroids: `docs` are `(label, Some(vector))`, or
     /// `(label, None)` for vectorless docs — mixing the two forces the
     /// `Bitmap` id-map.
     fn build_flat(
@@ -5786,14 +5623,11 @@ mod tests {
             );
             sb.add_text_field("label", STRING | STORED);
             let schema = sb.build();
-            let settings = IndexSettings {
-                vector_clustering_threshold: 1,
-                ..IndexSettings::default()
-            };
+            let settings = IndexSettings::default();
             let index = Index::builder()
                 .schema(schema)
                 .settings(settings)
-                .ivf_clusterer(Arc::new(InlineClusterer {
+                .centroid_producer(Arc::new(Grid2DCentroids {
                     centroids: centroids.to_vec(),
                 }))
                 .ivf_router(RouterKind::Stacked)?
@@ -5808,7 +5642,7 @@ mod tests {
             }
             writer.commit()?;
             let segment_ids = index.searchable_segment_ids()?;
-            assert_eq!(segment_ids.len(), 1, "single flat segment");
+            assert_eq!(segment_ids.len(), 1, "single clustered segment");
             writer.merge(&segment_ids).wait()?;
             writer.wait_merging_threads()?;
             Ok((index, embed_field))
@@ -5873,14 +5707,7 @@ mod tests {
                         "{metric:?} seed {seed}: gated top-k must equal brute force"
                     );
 
-                    // (b): the theorem, cluster by cluster. Homes are
-                    // recomputed with the clusterer's own rule: stored
-                    // (post-normalization) doc values against the RAW
-                    // trained centroids - the values `assign` saw. The
-                    // margin then runs against the STORED (normalized)
-                    // centroid, exactly as the gate does; the fold covers
-                    // members whatever rule assigned them, so the
-                    // triangle argument is assignment-rule-agnostic.
+                    // The final search radius must intersect every true member's stored cluster.
                     let searcher = index.reader()?.searcher();
                     let segment_reader = &searcher.segment_readers()[0];
                     let vec_reader = segment_reader.vector_index(field)?;
@@ -5892,12 +5719,8 @@ mod tests {
                     let t_final = to_bound_space(metric, kth_key);
                     let q_norm = (query[0] * query[0] + query[1] * query[1]).sqrt();
                     for &(_, addr) in &brute {
-                        let stored = decode_2d(
-                            &vec_reader
-                                .vector_bytes(addr.doc_id)?
-                                .expect("stored vector"),
-                        );
-                        let home = nearest_centroid(stored, &centroids);
+                        let row = vec_reader.row_id(addr.doc_id)?.unwrap();
+                        let home = vec_reader.row_cluster(row).unwrap();
                         let sim = Metric::similarity_bytes::<f32>(
                             metric,
                             &query,
