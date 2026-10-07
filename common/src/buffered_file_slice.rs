@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::cmp::min;
 use std::io;
 use std::ops::Range;
@@ -71,6 +71,28 @@ impl BufferedFileSlice {
             io::Error::new(io::ErrorKind::UnexpectedEof, "byte offset out of bounds")
         })?;
         Ok(self.get_bytes(offset..end)?[0])
+    }
+
+    /// Borrows the cached bytes from `offset`, loading at least `min_len` bytes if needed.
+    /// `min_len` must be nonzero and no larger than the buffer size. Drop the borrow
+    /// before making another read that could refill the buffer.
+    pub fn read_chunk(&self, offset: u64, min_len: usize) -> io::Result<Ref<'_, [u8]>> {
+        if min_len == 0 || min_len > self.buffer_max_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid chunk size",
+            ));
+        }
+        let end = offset.checked_add(min_len as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "chunk offset out of bounds")
+        })?;
+        let range = self.buffer_range.borrow();
+        if offset < range.start || end > range.end {
+            drop(range);
+            self.get_bytes(offset..end)?;
+        }
+        let start = (offset - self.buffer_range.borrow().start) as usize;
+        Ok(Ref::map(self.buffer.borrow(), |bytes| &bytes[start..]))
     }
 
     /// Returns an `OwnedBytes` corresponding to the given `required_range`.
@@ -169,5 +191,26 @@ impl BufferedFileSlice {
         let local_start = (required_range.start - buffer_range.start) as usize;
         let local_end = (required_range.end - buffer_range.start) as usize;
         Ok(buffer.slice(local_start..local_end))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_chunks_cover_requested_bytes_and_stop_at_cache_end() {
+        let data =
+            BufferedFileSlice::new_block_aligned(FileSlice::from((0u8..23).collect::<Vec<_>>()), 8);
+        assert_eq!(&*data.read_chunk(3, 2).unwrap(), &[3, 4, 5, 6, 7]);
+        assert_eq!(
+            &*data.read_chunk(7, 8).unwrap(),
+            &[7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+        assert_eq!(&*data.read_chunk(14, 2).unwrap(), &[14, 15]);
+        assert_eq!(&*data.read_chunk(20, 3).unwrap(), &[20, 21, 22]);
+        for (offset, len) in [(0, 0), (0, 9), (20, 4), (u64::MAX, 1)] {
+            assert!(data.read_chunk(offset, len).is_err());
+        }
     }
 }

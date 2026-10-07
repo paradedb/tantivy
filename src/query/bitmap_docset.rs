@@ -49,15 +49,17 @@ impl BitmapDocSet {
         while offset < end {
             let bytes = self
                 .data
-                .get_bytes(offset..offset + 8)
+                .read_chunk(offset, 8)
                 .expect("failed to read posting bitmap");
-            let word = u64::from_le_bytes(bytes.as_ref().try_into().unwrap()) & first_mask;
-            if word != 0 {
-                let doc = offset as u32 * 8 + word.trailing_zeros();
-                return if doc < self.max_doc { doc } else { TERMINATED };
+            for bytes in bytes.as_chunks::<8>().0 {
+                let word = u64::from_le_bytes(*bytes) & first_mask;
+                if word != 0 {
+                    let doc = offset as u32 * 8 + word.trailing_zeros();
+                    return if doc < self.max_doc { doc } else { TERMINATED };
+                }
+                first_mask = u64::MAX;
+                offset += 8;
             }
-            first_mask = u64::MAX;
-            offset += 8;
         }
         TERMINATED
     }
@@ -256,6 +258,45 @@ mod tests {
             }
             assert_eq!(end, prefix + 37 + len);
         }
+    }
+
+    #[test]
+    fn bitmap_empty_gaps_cross_storage_boundaries_without_rereads() {
+        use std::sync::{Arc, Mutex};
+
+        for block_len in [None, Some(8156)] {
+            for prefix in [0, 1, 151, 8155] {
+                let max_doc = 1_048_573;
+                let docs = [0, 131_071, 800_003, max_doc - 1];
+                let len = bitmap_num_bytes(max_doc) as usize;
+                let mut data = vec![0; prefix + len];
+                for doc in docs {
+                    data[prefix + doc as usize / 8] |= 1 << (doc % 8);
+                }
+                let reads = Arc::new(Mutex::new(Vec::new()));
+                let file = FileSlice::new(Arc::new(TrackedBitmapFile {
+                    data,
+                    reads: reads.clone(),
+                    block_len,
+                }));
+                let mut bitmap = BitmapDocSet::open(file, prefix as u64, max_doc, 4).unwrap();
+                for doc in docs {
+                    assert_eq!(bitmap.doc(), doc);
+                    bitmap.advance();
+                }
+                assert_eq!(bitmap.doc(), TERMINATED);
+                let reads = reads.lock().unwrap();
+                let mut end = prefix;
+                for range in reads.iter() {
+                    assert_eq!(range.start, end, "overlapping or skipped read: {reads:?}");
+                    end = range.end;
+                }
+                assert_eq!(end, prefix + len);
+                assert!(reads.len() <= 18, "{reads:?}");
+            }
+        }
+        let mut tail = bitmap(&[0, 131_071], 1_048_576);
+        assert_eq!(tail.seek(131_072), TERMINATED);
     }
 
     proptest::proptest! {
