@@ -26,11 +26,14 @@ pub(crate) struct BitmapCombination {
 
 impl BitmapCombination {
     pub(crate) fn new(
-        children: Vec<Box<dyn Scorer>>,
+        mut children: Vec<Box<dyn Scorer>>,
         operation: BitmapOperation,
         num_docs: u32,
     ) -> Self {
         assert!(!children.is_empty());
+        if matches!(operation, BitmapOperation::Intersection) {
+            children.sort_by_key(|child| (child.cost(), child.size_hint()));
+        }
         let sizes = children.iter().map(|child| child.size_hint());
         let size_hint = match operation {
             BitmapOperation::Union => estimate_union(sizes, num_docs),
@@ -93,7 +96,11 @@ impl BitmapCombination {
             self.base = next / BLOCK_WINDOW * BLOCK_WINDOW;
             self.mask.fill(TinySet::EMPTY);
             self.children[0].fill_bitset_block(self.base, &mut self.mask);
+            let mut empty = self.mask.iter().all(|word| word.is_empty());
             for child in &mut self.children[1..] {
+                if empty && !matches!(self.operation, BitmapOperation::Union) {
+                    break;
+                }
                 let mut other = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
                 child.fill_bitset_block(self.base, &mut other);
                 match self.operation {
@@ -101,12 +108,17 @@ impl BitmapCombination {
                         crate::docset::union_bitset_blocks(&mut self.mask, &other);
                     }
                     BitmapOperation::Intersection => {
-                        super::intersection::and_blocks_and_return_is_empty(&mut self.mask, &other);
+                        empty = super::intersection::and_blocks_and_return_is_empty(
+                            &mut self.mask,
+                            &other,
+                        );
                     }
                     BitmapOperation::Exclude => {
+                        empty = true;
                         for (word, other) in self.mask.iter_mut().zip(other) {
                             let bits = word.into_u64() & !other.into_u64();
                             *word = TinySet::deserialize(bits.to_le_bytes());
+                            empty &= bits == 0;
                         }
                     }
                 }
@@ -222,6 +234,124 @@ mod tests {
             operation,
             8007,
         )
+    }
+
+    struct TrackedScorer {
+        docs: VecDocSet,
+        cost: u64,
+        fills: std::sync::Arc<std::sync::Mutex<Vec<DocId>>>,
+    }
+
+    impl DocSet for TrackedScorer {
+        fn advance(&mut self) -> DocId {
+            self.docs.advance()
+        }
+        fn seek(&mut self, target: DocId) -> DocId {
+            self.docs.seek(target)
+        }
+        fn doc(&self) -> DocId {
+            self.docs.doc()
+        }
+        fn size_hint(&self) -> u32 {
+            self.docs.size_hint()
+        }
+        fn cost(&self) -> u64 {
+            self.cost
+        }
+        fn fill_bitset_block(&mut self, base: DocId, mask: &mut Block) -> DocId {
+            self.fills.lock().unwrap().push(base);
+            self.docs.fill_bitset_block(base, mask)
+        }
+    }
+
+    impl Scorer for TrackedScorer {
+        fn score(&mut self) -> Score {
+            1.0
+        }
+    }
+
+    #[test]
+    fn empty_windows_skip_children_and_preserve_progress() {
+        for operation in [BitmapOperation::Intersection, BitmapOperation::Exclude] {
+            let intersection = matches!(operation, BitmapOperation::Intersection);
+            let documents = [
+                vec![1, 1025, 2049, 4097],
+                if intersection {
+                    vec![2, 1026, 2049, 4097]
+                } else {
+                    vec![1, 1025, 4097]
+                },
+                if intersection {
+                    vec![3, 1027, 2049, 4097]
+                } else {
+                    vec![3, 1027, 4097]
+                },
+                if intersection {
+                    vec![4, 1028, 2049, 4097]
+                } else {
+                    vec![4, 1028, 4097]
+                },
+            ];
+            let fills: Vec<_> = (0..4)
+                .map(|_| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+                .collect();
+            let mut children: Vec<Box<dyn Scorer>> = documents
+                .into_iter()
+                .enumerate()
+                .map(|(i, docs)| {
+                    Box::new(TrackedScorer {
+                        docs: VecDocSet::from(docs),
+                        cost: i as u64,
+                        fills: fills[i].clone(),
+                    }) as Box<dyn Scorer>
+                })
+                .collect();
+            if intersection {
+                children.reverse();
+            }
+            let mut scorer = BitmapCombination::new(children, operation, 8007);
+            assert_eq!(scorer.doc(), 2049);
+            assert_eq!(*fills[2].lock().unwrap(), vec![2048]);
+            assert_eq!(*fills[3].lock().unwrap(), vec![2048]);
+            assert_eq!(
+                scorer.advance(),
+                if intersection { 4097 } else { TERMINATED }
+            );
+            assert_eq!(scorer.advance(), TERMINATED);
+            assert_eq!(*fills[0].lock().unwrap(), vec![0, 1024, 2048, 4096]);
+            assert_eq!(
+                *fills[3].lock().unwrap(),
+                if intersection {
+                    vec![2048, 4096]
+                } else {
+                    vec![2048]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn empty_first_child_skips_the_remaining_children() {
+        let fills = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut scorer = BitmapCombination::new(
+            vec![
+                Box::new(TrackedScorer {
+                    docs: VecDocSet::from(vec![1, 4097]),
+                    cost: 0,
+                    fills: Default::default(),
+                }),
+                Box::new(TrackedScorer {
+                    docs: VecDocSet::from(vec![2049, 4097]),
+                    cost: 1,
+                    fills: fills.clone(),
+                }),
+            ],
+            BitmapOperation::Intersection,
+            8007,
+        );
+        assert_eq!(scorer.doc(), 4097);
+        assert_eq!(*fills.lock().unwrap(), vec![4096]);
+        assert_eq!(scorer.advance(), TERMINATED);
     }
 
     #[test]
