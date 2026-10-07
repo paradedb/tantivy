@@ -229,7 +229,7 @@ impl OpenedRouter {
     }
 
     /// The APS estimator for the segment's own cluster scan over
-    /// `ranking`, which must not have been pulled yet. Only the stacked
+    /// the full `ranking`, including any previously yielded candidates. Only the stacked
     /// router supports APS; `None` otherwise, or when APS is off.
     pub(crate) fn recall_estimator(
         &self,

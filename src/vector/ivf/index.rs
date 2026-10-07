@@ -340,7 +340,7 @@ impl IvfIndex {
     }
 
     /// The APS estimator for scanning `ranked` (from
-    /// [`Self::rank_clusters`], not yet pulled) toward `recall`. `None`
+    /// [`Self::rank_clusters`]) toward `recall`. `None`
     /// unless the stacked router ranked it and APS is on.
     pub(crate) fn recall_estimator(
         &self,

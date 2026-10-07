@@ -173,6 +173,20 @@ pub trait Collector: Sync + Send {
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
     ) -> crate::Result<Self::Fruit>;
 
+    /// Collects one search, allowing query-wide state to be shared across segments.
+    fn collect_search(
+        &self,
+        weight: &dyn Weight,
+        searcher: &crate::Searcher,
+        executor: &crate::Executor,
+    ) -> crate::Result<Self::Fruit> {
+        let fruits = executor.map(
+            |(ordinal, reader)| self.collect_segment(weight, ordinal as u32, reader),
+            searcher.segment_readers().iter().enumerate(),
+        )?;
+        self.merge_fruits(fruits)
+    }
+
     /// Created a segment collector and
     fn collect_segment(
         &self,

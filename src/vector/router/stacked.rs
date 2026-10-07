@@ -106,7 +106,8 @@ pub(super) fn rank(
     let (ranked, stats) = index.search(query, k, recall, metric);
     let candidate_count = ranked.len();
     Ranking {
-        ranked: ranked.into_iter(),
+        ranked,
+        next: 0,
         candidate_count,
         stats,
         recall_target: recall,
@@ -114,8 +115,8 @@ pub(super) fn rank(
 }
 
 /// The APS estimator for the segment's own cluster scan over `ranking`,
-/// or `None` when APS is off for `recall` at this dimension. Call before
-/// the first pull: the estimator covers the whole candidate set. The
+/// or `None` when APS is off for `recall` at this dimension. The
+/// estimator covers the whole candidate set, including previously yielded candidates. The
 /// bottom router level's members are the segment centroids, row for row,
 /// so candidate rows come from its member store, fetched only as the
 /// estimator needs them.
@@ -126,7 +127,7 @@ pub(super) fn recall_estimator<'a>(
     metric: Metric,
     recall: f32,
 ) -> Option<RecallEstimator<'a>> {
-    let candidates = ranking.ranked.as_slice();
+    let candidates = &ranking.ranked;
     if effective_recall(query.len(), metric, recall) >= 1.0 || candidates.is_empty() {
         return None;
     }
@@ -154,7 +155,8 @@ impl CandidateRows for MemberRows<'_> {
 }
 
 pub(crate) struct Ranking {
-    ranked: std::vec::IntoIter<Candidate<ClusterId>>,
+    ranked: Vec<Candidate<ClusterId>>,
+    next: usize,
     candidate_count: usize,
     stats: StackedSearchStats,
     recall_target: f32,
@@ -175,7 +177,9 @@ impl Iterator for Ranking {
     type Item = Candidate;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.ranked.next().map(|candidate| Candidate {
+        let candidate = *self.ranked.get(self.next)?;
+        self.next += 1;
+        Some(Candidate {
             sim: candidate.sim,
             node: candidate.node.0,
         })

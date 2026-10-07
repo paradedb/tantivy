@@ -606,6 +606,223 @@ mod tests {
     }
 
     #[test]
+    fn shared_search_routes_once_across_encodings_and_executors() -> crate::Result<()> {
+        use crate::collector::sort_key::SortByStaticFastValue;
+        use crate::query::{AllQuery, EnableScoring, Query, TermQuery};
+        use crate::schema::{IndexRecordOption, FAST, INDEXED};
+        use crate::vector::ivf::AdaptiveProbeParams;
+        use crate::vector::tests::ground_truth;
+        use crate::vector::{
+            TopDocsByVectorSimilarity, VectorQuantizationConfig, VectorQuantizationLayer,
+        };
+        use crate::{Executor, Order, Term};
+
+        const DIM: usize = 64;
+        let parallel = Executor::multi_thread(3, "shared-vector-test")?;
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            for kind in [RouterKind::Exact, RouterKind::Rng, RouterKind::Stacked] {
+                let mut fixture = Fixture::new(metric);
+                let mut schema = Schema::builder();
+                schema.add_vector_field("embedding", VectorOptions::new(DIM, metric));
+                let ordinal = schema.add_u64_field("ordinal", FAST | INDEXED);
+                let keep = schema.add_u64_field("keep", FAST | INDEXED);
+                fixture.schema = schema.build();
+                let rows = [[0.0, 0.0], [3.0, 4.0], [-4.0, 3.0]].map(|value| {
+                    let mut row = [0.0; DIM];
+                    row[..2].copy_from_slice(&value);
+                    row
+                });
+                fixture.replace_centroids(centroids(&rows));
+                let mut index = fixture.create(kind)?;
+                for batch in 0..4 {
+                    index.settings_mut().vector_quantization = if batch == 1 || batch == 2 {
+                        vec![VectorQuantizationConfig::materialize(
+                            "embedding".into(),
+                            &VectorOptions::new(DIM, metric),
+                            vec![VectorQuantizationLayer {
+                                bits: if batch == 1 { 1 } else { 4 },
+                                seed: batch,
+                            }],
+                        )?]
+                    } else {
+                        Vec::new()
+                    };
+                    let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+                    writer.set_merge_policy(Box::new(NoMergePolicy));
+                    for local in 0..9 {
+                        let id = batch * 9 + local;
+                        let mut doc = TantivyDocument::new();
+                        doc.add_u64(ordinal, id);
+                        doc.add_u64(keep, id % 2);
+                        if batch != 3 && local != 8 {
+                            doc.add_vector(fixture.field, &rows[local as usize % rows.len()]);
+                        }
+                        writer.add_document(doc)?;
+                    }
+                    writer.commit()?;
+                    for id in [4, 13] {
+                        writer.delete_term(Term::from_field_u64(ordinal, id));
+                    }
+                    writer.commit()?;
+                    writer.wait_merging_threads()?;
+                }
+                let mut query = vec![0.0; DIM];
+                query[..2].copy_from_slice(&[3.1, 4.2]);
+                let collectors: Vec<_> = [0, usize::MAX]
+                    .into_iter()
+                    .map(|levels| {
+                        TopDocsByVectorSimilarity::new(fixture.field, query.clone(), 5)
+                            .and_offset(2)
+                            .with_max_scan_levels(levels)
+                            .with_adaptive_params(AdaptiveProbeParams {
+                                max_probe_fraction: 1.0,
+                                min_probe_clusters: 3,
+                                ..Default::default()
+                            })
+                            .with_tie_break((
+                                SortByStaticFastValue::<u64>::for_field("ordinal"),
+                                Order::Asc,
+                            ))
+                    })
+                    .collect();
+                for merged in [false, true] {
+                    if merged {
+                        let mut writer: IndexWriter =
+                            index.writer_with_num_threads(1, 15_000_000)?;
+                        writer.merge(&index.searchable_segment_ids()?).wait()?;
+                    }
+                    let searcher = index.reader()?.searcher();
+                    let mut oracle =
+                        ground_truth::top_k(&index, fixture.field, metric, &query, usize::MAX)?;
+                    let id = |address: crate::DocAddress| {
+                        searcher.segment_readers()[address.segment_ord as usize]
+                            .fast_fields()
+                            .u64("ordinal")
+                            .unwrap()
+                            .first(address.doc_id)
+                            .unwrap()
+                    };
+                    oracle.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| id(a.1).cmp(&id(b.1))));
+                    for selected in [None, Some(1), Some(9)] {
+                        let filter: Box<dyn Query> = match selected {
+                            None => Box::new(AllQuery),
+                            Some(value) => Box::new(TermQuery::new(
+                                Term::from_field_u64(keep, value),
+                                IndexRecordOption::Basic,
+                            )),
+                        };
+                        let expected: Vec<_> = oracle
+                            .iter()
+                            .copied()
+                            .filter(|(_, address)| {
+                                selected.is_none_or(|value| id(*address) % 2 == value)
+                            })
+                            .skip(2)
+                            .take(5)
+                            .collect();
+                        for collector in &collectors {
+                            for executor in [&Executor::SingleThread, &parallel] {
+                                let result = searcher.search_with_executor(
+                                    filter.as_ref(),
+                                    collector,
+                                    executor,
+                                    EnableScoring::disabled_from_searcher(&searcher),
+                                )?;
+                                assert_eq!(
+                                    result.results, expected,
+                                    "{metric:?} {kind:?} merged={merged}"
+                                );
+                                assert_eq!(
+                                    result
+                                        .stats
+                                        .iter()
+                                        .filter(|stats| stats.routing.is_some())
+                                        .count(),
+                                    usize::from(selected != Some(9))
+                                );
+                                if kind == RouterKind::Exact && selected != Some(9) {
+                                    assert_eq!(
+                                        result
+                                            .stats
+                                            .iter()
+                                            .map(|stats| stats.routing_visited_count)
+                                            .sum::<usize>(),
+                                        3
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let concurrent =
+                        parallel.map(|_| searcher.search(&AllQuery, &collectors[1]), 0..3)?;
+                    for result in concurrent {
+                        assert_eq!(result.results, oracle[2..7]);
+                        assert_eq!(
+                            result
+                                .stats
+                                .iter()
+                                .filter(|stats| stats.routing.is_some())
+                                .count(),
+                            1
+                        );
+                    }
+                    let zero = TopDocsByVectorSimilarity::new(fixture.field, query.clone(), 0);
+                    let result = searcher.search(&AllQuery, &zero)?;
+                    assert!(result.results.is_empty());
+                    assert!(result.stats.iter().all(|stats| stats.routing.is_none()));
+                }
+                assert_eq!(collectors[1].quantized_query_count(), 2);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_routing_replays_lazily_and_restarts_recall_estimation() -> crate::Result<()> {
+        use crate::vector::router::RouterMetrics;
+        use crate::vector::routing::SharedRouting;
+
+        for kind in [RouterKind::Rng, RouterKind::Stacked] {
+            let mut fixture = Fixture::new(Metric::L2);
+            let rows: Vec<_> = (0..256).map(|i| [i as f32, (i % 7) as f32]).collect();
+            fixture.replace_centroids(centroids(&rows));
+            let index = fixture.create(kind)?;
+            let cache = index.cached_centroid_index()?.unwrap();
+            let mut workspace = RouterWorkspace::default();
+            let shared = SharedRouting::new(
+                &cache[&fixture.field],
+                &mut workspace,
+                &[0.1, 0.2],
+                RoutingParams {
+                    k: 16,
+                    recall: 0.99,
+                },
+            );
+            let mut first = shared.replay(0.9);
+            let prefix: Vec<_> = first.ranked.by_ref().take(2).collect();
+            let before = serde_json::to_value(shared.metrics())?;
+            if let RouterMetrics::Rng(metrics) = shared.metrics() {
+                assert_eq!(metrics.result_count, 2);
+                assert!(metrics.visited_count < 256);
+            }
+            let mut second = shared.replay(0.9);
+            assert_eq!(second.ranked.by_ref().take(2).collect::<Vec<_>>(), prefix);
+            assert_eq!(serde_json::to_value(shared.metrics())?, before);
+            if let (Some(a), Some(b)) = (&mut first.estimator, &mut second.estimator) {
+                for candidate in prefix {
+                    assert_eq!(
+                        a.cover_next(Some(candidate.sim))?,
+                        b.cover_next(Some(candidate.sim))?
+                    );
+                }
+            } else {
+                assert_eq!(kind, RouterKind::Rng);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn shared_merges_preserve_memberships_rows_and_bounds() -> crate::Result<()> {
         use std::collections::BTreeMap;
 

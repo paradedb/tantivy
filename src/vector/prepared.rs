@@ -281,17 +281,7 @@ impl QuantizedQueryCtx {
         active_layers: usize,
     ) -> Self {
         assert!((1..=index.specs.len()).contains(&active_layers));
-        if index.meta.field().metric == Metric::Cosine {
-            let norm = norm_squared_wide(&query).sqrt();
-            if norm != 0.0 && norm.is_finite() {
-                let inv = (1.0 / norm) as f32;
-                for value in &mut query {
-                    *value *= inv;
-                }
-            } else {
-                query.fill(0.0);
-            }
-        }
+        normalize_query(index.meta.field().metric, &mut query);
         let query_norm_sq = norm_squared_wide(&query) as f32;
         let prepared = prepare_split_query_with_plan(
             &query,
@@ -401,6 +391,20 @@ impl QuantizedQueryCtx {
 
     pub(crate) fn query(&self) -> &[f32] {
         &self.query
+    }
+}
+
+pub(crate) fn normalize_query(metric: Metric, query: &mut [f32]) {
+    if metric == Metric::Cosine {
+        let norm = norm_squared_wide(query).sqrt();
+        if norm != 0.0 && norm.is_finite() {
+            let inv = (1.0 / norm) as f32;
+            for value in query {
+                *value *= inv;
+            }
+        } else {
+            query.fill(0.0);
+        }
     }
 }
 

@@ -50,8 +50,16 @@ sidecar with only the following slots per vector field:
 The descriptor must match the owning index's descriptor. The shared artifact
 supplies N, centroid rows, and the router; none of those rows or routing payloads
 are copied into the segment. Bounds and quantized residuals use those exact
-stored centroid coordinates. Queries still execute independently per segment,
-using shared router state with separate per-query workspaces.
+stored centroid coordinates. Each search ranks shared centroids once and lazily
+replays that order for both plain and quantized segment scans. Segment filters
+are prepared once; the largest active segment request determines the router's
+candidate count. Cosine routing uses the same normalized query coordinates as
+quantized scoring. Routing progress belongs to the search, so collector reuse
+and concurrent searches have independent cursors. Routing counters are recorded
+once, in the first segment's stats.
+
+Probe budgets, bounds gates, and candidate refinement still operate per segment;
+moving that state into a global probe loop is the next step.
 Indexes without an artifact keep the flat/V3 clustered paths below.
 
 ## File headers and entries

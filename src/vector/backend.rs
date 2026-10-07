@@ -14,6 +14,7 @@
 #[path = "quantized_boundary_tests.rs"]
 mod quantized_boundary_tests;
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
@@ -39,6 +40,7 @@ use super::prepared::{
 };
 use super::quantization::QUANTIZED_BOUNDARY_KAPPA;
 use super::router::{RouterMetrics, RouterWorkspace, RoutingParams};
+use super::routing::{ClusterRouting, SharedRouting};
 use super::tie_break::NoTieBreak;
 use super::{enter_vector_stage, Similarity, Stage, VectorElement};
 use crate::collector::sort_key::{Comparator, NaturalComparator};
@@ -74,6 +76,7 @@ pub struct VectorBackend<T: VectorElement> {
     query_prep_ns: u64,
     adaptive: AdaptiveProbeParams,
     segment_ord: SegmentOrdinal,
+    filter: Option<(SegmentFilter, u64)>,
 }
 
 impl<T: VectorElement> VectorBackend<T> {
@@ -98,7 +101,55 @@ impl<T: VectorElement> VectorBackend<T> {
             query_prep_ns: prep_start.elapsed().as_nanos() as u64,
             adaptive,
             segment_ord,
+            filter: None,
         })
+    }
+
+    fn segment_filter(
+        &self,
+        weight: &dyn Weight,
+        reader: &SegmentReader,
+    ) -> crate::Result<(Cow<'_, SegmentFilter>, u64)> {
+        if let Some((filter, _)) = &self.filter {
+            return Ok((Cow::Borrowed(filter), 0));
+        }
+        let start = Instant::now();
+        let _stage = enter_vector_stage(Stage::NonVectorSearch);
+        let filter = build_segment_filter(weight, reader, reader.max_doc())?;
+        Ok((Cow::Owned(filter), start.elapsed().as_nanos() as u64))
+    }
+
+    pub(crate) fn routing_params(
+        &mut self,
+        weight: &dyn Weight,
+        reader: &SegmentReader,
+        top_n: usize,
+    ) -> crate::Result<Option<RoutingParams>> {
+        let Some(index) = self.reader.index() else {
+            return Ok(None);
+        };
+        if top_n == 0 || reader.max_doc() == 0 || index.num_docs() == 0 {
+            return Ok(None);
+        }
+        let (filter, elapsed) = self.segment_filter(weight, reader)?;
+        let params = if filter.is_empty() {
+            None
+        } else {
+            let (budget, _, open) = self
+                .adaptive
+                .resolved_work_budget(index.num_clusters(), index.num_docs())?;
+            Some(RoutingParams {
+                k: self.adaptive.router_k(
+                    budget,
+                    open,
+                    filter.match_fraction(reader.max_doc()),
+                    index.num_clusters(),
+                ),
+                recall: self.adaptive.router_recall_target,
+            })
+        };
+        self.filter = Some((filter.into_owned(), elapsed));
+        Ok(params)
     }
 
     pub(crate) fn add_scan_init_ns(&mut self, elapsed_ns: u64) {
@@ -171,6 +222,30 @@ impl<T: VectorElement> VectorBackend<T> {
         K: SegmentSortKeyComputer,
         CTail: Comparator<K::SegmentSortKey>,
     {
+        self.top_n_by_with_routing(
+            None,
+            weight,
+            segment_reader,
+            top_n,
+            tie_break,
+            tie_comparator,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn top_n_by_with_routing<K, CTail>(
+        &self,
+        shared: Option<&SharedRouting<'_>>,
+        weight: &dyn Weight,
+        segment_reader: &SegmentReader,
+        top_n: usize,
+        tie_break: &mut K,
+        tie_comparator: CTail,
+    ) -> crate::Result<(TieBreakHits<K>, ProbeStats)>
+    where
+        K: SegmentSortKeyComputer,
+        CTail: Comparator<K::SegmentSortKey>,
+    {
         #[cfg(test)]
         let trace_docs = super::storage_io::test_support::with_unarmed_log(|| {
             let mut mapping = Vec::new();
@@ -188,6 +263,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut stats = ProbeStats {
             scan_init_ns: self.scan_init_ns,
             query_prep_ns: self.query_prep_ns,
+            non_vector_search_ns: self.filter.as_ref().map_or(0, |(_, elapsed)| *elapsed),
             ..Default::default()
         };
         let hits = match self.reader.index() {
@@ -203,6 +279,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 Some(quantized_query) => self.quantized_top_n(
                     index,
                     quantized_query,
+                    shared,
                     weight,
                     segment_reader,
                     top_n,
@@ -212,6 +289,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 )?,
                 None => self.approximate_top_n(
                     index,
+                    shared,
                     weight,
                     segment_reader,
                     top_n,
@@ -630,7 +708,7 @@ impl ProbeStats {
         })
     }
 
-    fn record_routing(&mut self, routing: RouterMetrics) {
+    pub(crate) fn record_routing(&mut self, routing: RouterMetrics) {
         self.routing = Some(routing);
         self.routing_visited_count += match routing {
             RouterMetrics::Rng(graph) => graph.visited_count,
@@ -2172,6 +2250,7 @@ impl<T: VectorElement> VectorBackend<T> {
         &self,
         index: &IvfIndex,
         query: &QuantizedQueryCtx,
+        shared: Option<&SharedRouting<'_>>,
         weight: &dyn Weight,
         segment_reader: &SegmentReader,
         top_n: usize,
@@ -2189,12 +2268,8 @@ impl<T: VectorElement> VectorBackend<T> {
         let init_start = Instant::now();
         let init_stage = enter_vector_stage(Stage::ScanInit);
         let max_doc = segment_reader.max_doc();
-        let non_vector_start = Instant::now();
-        let non_vector_stage = enter_vector_stage(Stage::NonVectorSearch);
-        let filter = build_segment_filter(weight, segment_reader, max_doc)?;
+        let (filter, non_vector_search_ns) = self.segment_filter(weight, segment_reader)?;
         let alive = segment_reader.alive_bitset();
-        drop(non_vector_stage);
-        let non_vector_search_ns = non_vector_start.elapsed().as_nanos() as u64;
         stats.non_vector_search_ns = stats
             .non_vector_search_ns
             .saturating_add(non_vector_search_ns);
@@ -2268,9 +2343,14 @@ impl<T: VectorElement> VectorBackend<T> {
         let routing_start = Instant::now();
         let (mut ranked, mut controller) = {
             let _routing_stage = enter_vector_stage(Stage::Routing);
-            let ranked = index.rank_clusters(&mut routing_ws, query.query(), routing);
-            let estimator =
-                index.recall_estimator(&ranked, query.query(), self.adaptive.recall_target);
+            let ClusterRouting { ranked, estimator } = ClusterRouting::new(
+                shared,
+                index,
+                &mut routing_ws,
+                query.query(),
+                routing,
+                self.adaptive.recall_target,
+            );
             let controller = ProbeController::new(
                 pricing,
                 index.num_clusters(),
@@ -2450,7 +2530,9 @@ impl<T: VectorElement> VectorBackend<T> {
             }
             controller.cover(scan.running_estimate_kth(top_n))?;
         }
-        stats.record_routing(ranked.metrics());
+        if let Some(metrics) = ranked.metrics() {
+            stats.record_routing(metrics);
+        }
         stats.postings_row += postings_row;
         stats.postings_skipped += postings_skipped;
         stats.candidates_scored += scan.candidates.len();
@@ -2745,6 +2827,7 @@ impl<T: VectorElement> VectorBackend<T> {
     fn approximate_top_n<K, CTail>(
         &self,
         index: &IvfIndex,
+        shared: Option<&SharedRouting<'_>>,
         weight: &dyn Weight,
         segment_reader: &SegmentReader,
         top_n: usize,
@@ -2766,11 +2849,7 @@ impl<T: VectorElement> VectorBackend<T> {
             return Ok(Vec::new());
         }
 
-        let non_vector_start = Instant::now();
-        let non_vector_stage = enter_vector_stage(Stage::NonVectorSearch);
-        let filter = build_segment_filter(weight, segment_reader, max_doc)?;
-        drop(non_vector_stage);
-        let non_vector_search_ns = non_vector_start.elapsed().as_nanos() as u64;
+        let (filter, non_vector_search_ns) = self.segment_filter(weight, segment_reader)?;
         stats.non_vector_search_ns = stats
             .non_vector_search_ns
             .saturating_add(non_vector_search_ns);
@@ -2813,7 +2892,10 @@ impl<T: VectorElement> VectorBackend<T> {
         // cheap.
         // Routing operates in `f32` (centroid rows are `f32` today), so the
         // query is widened losslessly per element.
-        let query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
+        let query_f32: Vec<f32> = match shared {
+            Some(shared) => shared.query.to_vec(),
+            None => self.query.query().iter().map(|e| e.to_f32()).collect(),
+        };
         let mut routing_ws = RouterWorkspace::default();
         stats.segment_rows = Some(index.num_rows());
         stats.segment_clusters = Some(index.num_clusters());
@@ -2836,9 +2918,14 @@ impl<T: VectorElement> VectorBackend<T> {
         let routing_start = Instant::now();
         let (mut ranked, controller) = {
             let _routing_stage = enter_vector_stage(Stage::Routing);
-            let ranked = index.rank_clusters(&mut routing_ws, &query_f32, routing);
-            let estimator =
-                index.recall_estimator(&ranked, &query_f32, self.adaptive.recall_target);
+            let ClusterRouting { ranked, estimator } = ClusterRouting::new(
+                shared,
+                index,
+                &mut routing_ws,
+                &query_f32,
+                routing,
+                self.adaptive.recall_target,
+            );
             let controller = ProbeController::new(
                 pricing,
                 num_centroids,
@@ -2874,7 +2961,9 @@ impl<T: VectorElement> VectorBackend<T> {
                 as u64,
         );
 
-        stats.record_routing(ranked.metrics());
+        if let Some(metrics) = ranked.metrics() {
+            stats.record_routing(metrics);
+        }
 
         let segment_ord = self.segment_ord;
         let assembly_start = Instant::now();
@@ -3122,6 +3211,7 @@ impl<T: VectorElement> VectorBackend<T> {
 }
 
 /// A segment's filter matches, as consumed by the IVF probes.
+#[derive(Clone)]
 enum SegmentFilter {
     /// Every doc id below `max_doc` matches (deleted docs included); no
     /// bitset is materialized.
