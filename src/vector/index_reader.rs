@@ -1484,7 +1484,12 @@ enum CentroidSlices {
         FileSlice,
         FileSlice,
     ),
-    Shared(Arc<super::ivf::RouterIndex>, usize, FileSlice, FileSlice),
+    Shared(
+        Arc<super::ivf::RouterIndex>,
+        super::ivf::SharedSegmentMeta,
+        FileSlice,
+        FileSlice,
+    ),
 }
 
 struct VectorSource {
@@ -1621,7 +1626,7 @@ impl VectorFieldReader {
                     })?;
                     Some(CentroidSlices::Shared(
                         Arc::clone(router),
-                        meta.num_docs as usize,
+                        meta,
                         slot(CentroidSlot::Offsets)?,
                         slot(CentroidSlot::Bounds)?,
                     ))
@@ -1710,9 +1715,16 @@ impl VectorIndexReader {
             Some(CentroidSlices::Local(version, centroids, offsets, router, bounds)) => Some(
                 IvfIndex::open(version, &options, centroids, offsets, router, bounds)?,
             ),
-            Some(CentroidSlices::Shared(router, num_docs, offsets, bounds)) => Some(
-                IvfIndex::open_postings(&options, router, num_docs, offsets, bounds)?,
-            ),
+            Some(CentroidSlices::Shared(router, meta, offsets, bounds)) => {
+                Some(IvfIndex::open_postings(
+                    &options,
+                    router,
+                    Some(meta.centroid_index),
+                    meta.num_docs as usize,
+                    offsets,
+                    bounds,
+                )?)
+            }
             None => None,
         };
         let num_rows = match &index {
@@ -2765,6 +2777,11 @@ impl VectorIndexReader {
         self.read_doc_ids(cluster, &mut docs)?;
         Ok(Some(docs))
     }
+
+    pub(crate) fn row_cluster(&self, row: usize) -> Option<usize> {
+        self.index.as_ref().map(|_| self.rows_slice.block_of(row))
+    }
+
     /// Resolves one document by direct location or flat bitmap rank, validating stored coordinates.
     pub(crate) fn row_id(&self, doc_id: DocId) -> crate::Result<Option<usize>> {
         let clustered = self.rows_slice.clustered();

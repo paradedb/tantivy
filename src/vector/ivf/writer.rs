@@ -19,7 +19,6 @@ use crate::schema::document::ErasedDocument;
 use crate::schema::{Field, FieldType, Schema, VectorDType, VectorOptions};
 use crate::vector::blocks::{block_len, column_range, pad, write_metadata, BlockDirectory};
 use crate::vector::buffer::VectorBuffer;
-use crate::vector::distance::maybe_normalize_bytes;
 use crate::vector::flat::id_map::DocLocation;
 use crate::vector::flat::IdMap;
 use crate::vector::header::{
@@ -65,14 +64,14 @@ impl PluginWriter for IvfVecWriter {
         let mut writer = SharedSegmentWriter::new(segment)?;
         for (field, buf) in fields {
             let stride = buf.opts.bytes_per_vector();
-            let rows: Box<dyn Iterator<Item = (DocId, usize, usize)> + '_> =
+            let rows: Box<dyn Iterator<Item = (DocId, usize, usize, Option<usize>)> + '_> =
                 if let Some(map) = doc_id_map {
                     Box::new(map.iter_source_doc_ids().enumerate().filter_map(
                         |(target_doc_id, source_doc_id)| {
                             buf.present_doc_ids
                                 .binary_search(&source_doc_id)
                                 .ok()
-                                .map(|row| (target_doc_id as DocId, 0, row))
+                                .map(|row| (target_doc_id as DocId, 0, row, None))
                         },
                     ))
                 } else {
@@ -80,13 +79,14 @@ impl PluginWriter for IvfVecWriter {
                         buf.present_doc_ids
                             .iter()
                             .enumerate()
-                            .map(|(row, &doc)| (doc, 0, row)),
+                            .map(|(row, &doc)| (doc, 0, row, None)),
                     )
                 };
             writer.write_field(
                 field,
                 num_docs,
                 rows,
+                BoundsBuilder::new(writer.routers[&field].num_clusters()),
                 |_, row| Ok(&buf.row_bytes[row * stride..(row + 1) * stride]),
                 &|| false,
             )?;
@@ -109,6 +109,7 @@ impl PluginWriter for IvfVecWriter {
 
 struct AssignedVector {
     cluster: usize,
+    new_assignment: bool,
     target_doc_id: DocId,
     source_segment_ord: usize,
     source_row: usize,
@@ -209,7 +210,6 @@ impl ClusteredField<'_> {
         let mut encode_workspace = quantization
             .map(|_| BatchEncodeWorkspace::with_capacity(opts.dim(), tile_rows, &specs));
         let mut bufs: Vec<Vec<u8>> = slots.iter().map(|_| Vec::new()).collect();
-        let mut normalized = Vec::with_capacity(row_bytes);
         let mut batch_values = Vec::with_capacity(tile_rows * opts.dim());
         let mut centroid = Vec::with_capacity(opts.dim());
         for (cluster, offsets) in cluster_offsets.windows(2).enumerate() {
@@ -246,18 +246,12 @@ impl ClusteredField<'_> {
                     };
                     local += 1;
                     let bytes = read_row(assigned)?;
-                    let bytes = bytes.as_ref();
-                    let row: &[u8] = if opts.needs_normalization() {
-                        normalized.clear();
-                        normalized.extend_from_slice(bytes);
-                        maybe_normalize_bytes(opts, &mut normalized);
-                        &normalized
-                    } else {
-                        bytes
-                    };
+                    let row = bytes.as_ref();
                     data.write_all(row)?;
                     pos += row.len();
-                    bounds_builder.add_native(cluster, residual(row, &centroid));
+                    if assigned.new_assignment {
+                        bounds_builder.add_native(cluster, residual(row, &centroid));
+                    }
                     if quantization.is_some() {
                         decode_row_append::<f32>(row, opts.dim(), &mut batch_values)?;
                     }
@@ -337,7 +331,7 @@ impl ClusteredField<'_> {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SharedSegmentMeta {
     pub centroid_index: CentroidIndexMeta,
     pub num_docs: u32,
@@ -373,7 +367,8 @@ impl<'a> SharedSegmentWriter<'a> {
         &mut self,
         field: Field,
         num_docs: DocId,
-        rows: impl IntoIterator<Item = (DocId, usize, usize)>,
+        rows: impl IntoIterator<Item = (DocId, usize, usize, Option<usize>)>,
+        mut bounds: BoundsBuilder,
         mut read_row: impl FnMut(usize, usize) -> crate::Result<R>,
         cancel: &dyn CancelSentinel,
     ) -> crate::Result<()> {
@@ -389,29 +384,33 @@ impl<'a> SharedSegmentWriter<'a> {
         let stride = opts.bytes_per_vector();
         let mut vector = Vec::with_capacity(opts.dim());
         let mut assigned = Vec::new();
-        for (target_doc_id, source_segment_ord, source_row) in rows {
+        for (target_doc_id, source_segment_ord, source_row, existing_cluster) in rows {
             if cancel.wants_cancel() {
                 return Err(TantivyError::Cancelled);
             }
-            let bytes = read_row(source_segment_ord, source_row)?;
-            vector.clear();
-            decode_row_append::<f32>(bytes.as_ref(), opts.dim(), &mut vector)?;
-            let cluster = centroid_bytes
-                .chunks_exact(stride)
-                .enumerate()
-                .map(|(id, centroid)| (id, opts.metric().similarity_bytes(&vector, centroid)))
-                .max_by(|(a, sa), (b, sb)| sa.cmp(sb).then_with(|| b.cmp(a)))
-                .expect("validated nonempty centroids")
-                .0;
+            let cluster = if let Some(cluster) = existing_cluster {
+                cluster
+            } else {
+                let bytes = read_row(source_segment_ord, source_row)?;
+                vector.clear();
+                decode_row_append::<f32>(bytes.as_ref(), opts.dim(), &mut vector)?;
+                centroid_bytes
+                    .chunks_exact(stride)
+                    .enumerate()
+                    .map(|(id, centroid)| (id, opts.metric().similarity_bytes(&vector, centroid)))
+                    .max_by(|(a, sa), (b, sb)| sa.cmp(sb).then_with(|| b.cmp(a)))
+                    .expect("validated nonempty centroids")
+                    .0
+            };
             assigned.push(AssignedVector {
                 cluster,
+                new_assignment: existing_cluster.is_none(),
                 target_doc_id,
                 source_segment_ord,
                 source_row,
             });
         }
         let num_present = assigned.len() as u32;
-        let mut bounds = BoundsBuilder::new(router.num_clusters());
         if opts.needs_normalization() {
             for (cluster, centroid) in centroid_bytes.chunks_exact(stride).enumerate() {
                 if centroid
@@ -495,10 +494,24 @@ pub(crate) fn merge_shared(ctx: &PluginMergeContext) -> crate::Result<()> {
             .iter()
             .map(|reader| reader.vector_index(field))
             .collect::<crate::Result<Vec<_>>>()?;
+        let mut bounds = BoundsBuilder::new(writer.routers[&field].num_clusters());
+        for reader in &readers {
+            if let Some(source) = reader.index() {
+                if source.centroid_index_meta() != ctx.target_segment.index().centroid_index_meta()
+                {
+                    return Err(TantivyError::InvalidArgument(
+                        "cannot preserve memberships from a different centroid index".into(),
+                    ));
+                }
+                for cluster in 0..source.num_clusters() {
+                    if ctx.cancel.wants_cancel() {
+                        return Err(TantivyError::Cancelled);
+                    }
+                    bounds.add_native(cluster, source.bounds().ball_r(cluster));
+                }
+            }
+        }
         let source_rows = crate::vector::plugin::merge_source_rows(ctx, &readers)?;
-        // TODO(global-router): preserve clustered memberships after validating that the source
-        // centroid artifact matches the target. Assign only flat rows and combine source bounds
-        // conservatively; this call currently reassigns all rows and rebuilds their bounds.
         writer.write_field(
             field,
             num_docs,
@@ -506,8 +519,16 @@ pub(crate) fn merge_shared(ctx: &PluginMergeContext) -> crate::Result<()> {
                 .into_iter()
                 .enumerate()
                 .filter_map(|(doc, source)| {
-                    source.map(|(segment, row)| (doc as DocId, segment, row))
+                    source.map(|(segment, row)| {
+                        (
+                            doc as DocId,
+                            segment,
+                            row,
+                            readers[segment].row_cluster(row),
+                        )
+                    })
                 }),
+            bounds,
             |segment, row| readers[segment].vector_bytes_for_row(row),
             ctx.cancel,
         )?;

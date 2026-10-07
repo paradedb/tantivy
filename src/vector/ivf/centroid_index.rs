@@ -606,6 +606,321 @@ mod tests {
     }
 
     #[test]
+    fn shared_merges_preserve_memberships_rows_and_bounds() -> crate::Result<()> {
+        use std::collections::BTreeMap;
+
+        use crate::indexer::merger::IndexMerger;
+        use crate::schema::{FAST, INDEXED};
+        use crate::vector::storage_io::test_support::PagedDirectory;
+        use crate::vector::{residual_norm, VectorQuantizationConfig, VectorQuantizationLayer};
+        use crate::{IndexSettings, IndexSortByField, Order, SegmentReader, Term};
+
+        const DIM: usize = 64;
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            for quantized in [false, true] {
+                for mixed in [false, true] {
+                    let mut fixture = Fixture::new(metric);
+                    let mut schema = Schema::builder();
+                    fixture.field =
+                        schema.add_vector_field("embedding", VectorOptions::new(DIM, metric));
+                    let ordinal = schema.add_u64_field("ordinal", FAST | INDEXED);
+                    fixture.schema = schema.build();
+                    fixture.replace_centroids(centroids(
+                        &[[0.0, 0.0], [3.0, 4.0], [-4.0, 3.0]].map(|value| {
+                            let mut row = [0.0; DIM];
+                            row[..2].copy_from_slice(&value);
+                            row
+                        }),
+                    ));
+                    let settings = IndexSettings {
+                        sort_by_field: Some(IndexSortByField {
+                            field: "ordinal".into(),
+                            order: Order::Asc,
+                        }),
+                        vector_quantization: if quantized {
+                            vec![VectorQuantizationConfig::materialize(
+                                "embedding".into(),
+                                &VectorOptions::new(DIM, metric),
+                                vec![VectorQuantizationLayer { bits: 1, seed: 7 }],
+                            )?]
+                        } else {
+                            Vec::new()
+                        },
+                        ..Default::default()
+                    };
+                    let directory = PagedDirectory::default();
+                    let shared = fixture
+                        .builder()
+                        .settings(settings.clone())
+                        .ivf_router(RouterKind::Exact)?
+                        .create(directory.clone())?;
+                    let flat = Index::builder()
+                        .schema(fixture.schema.clone())
+                        .settings(settings.clone())
+                        .create_in_ram()?;
+                    let mut segments = Vec::new();
+                    for (index, batches) in [
+                        (
+                            &shared,
+                            vec![
+                                vec![
+                                    (4, Some([3.0, 4.0])),
+                                    (0, Some([0.0, 0.0])),
+                                    (7, Some([30.0, 40.0])),
+                                    (1, None),
+                                ],
+                                vec![
+                                    (6, Some([-4.0, 3.0])),
+                                    (3, Some([0.1, 0.2])),
+                                    (8, Some([-20.0, 15.0])),
+                                ],
+                            ],
+                        ),
+                        (
+                            &flat,
+                            vec![vec![
+                                (5, Some([2.0, 2.0])),
+                                (2, Some([0.3, -0.7])),
+                                (9, None),
+                                (10, Some([4.0, 4.0])),
+                            ]],
+                        ),
+                    ] {
+                        if !mixed && std::ptr::eq(index, &flat) {
+                            continue;
+                        }
+                        let mut writer: IndexWriter =
+                            index.writer_with_num_threads(1, 15_000_000)?;
+                        writer.set_merge_policy(Box::new(NoMergePolicy));
+                        for batch in batches {
+                            for (id, row) in batch {
+                                let mut doc = TantivyDocument::new();
+                                doc.add_u64(ordinal, id);
+                                if let Some(value) = row {
+                                    let mut row = [0.0; DIM];
+                                    row[..2].copy_from_slice(&value);
+                                    doc.add_vector(fixture.field, &row);
+                                }
+                                writer.add_document(doc)?;
+                            }
+                            writer.commit()?;
+                        }
+                        for id in [7, 8, 10] {
+                            writer.delete_term(Term::from_field_u64(ordinal, id));
+                        }
+                        writer.commit()?;
+                        segments.extend(index.searchable_segments()?);
+                    }
+                    let target_index = Index::open(directory.clone())?;
+                    let merger = IndexMerger::open(
+                        fixture.schema.clone(),
+                        settings,
+                        &segments,
+                        Box::new(|| false),
+                        false,
+                    )?;
+                    let centroid_bytes = target_index.cached_centroid_index()?.unwrap()
+                        [&fixture.field]
+                        .centroid_bytes()?;
+                    let centroids = decode_row::<f32>(&centroid_bytes, 3 * DIM)?;
+                    let mut expected = BTreeMap::new();
+                    let mut bounds = crate::vector::BoundsBuilder::new(3);
+                    let mut expected_reads = Vec::new();
+                    for segment in &merger.readers {
+                        let vectors = segment.vector_index(fixture.field)?;
+                        let ordinals = segment.fast_fields().u64("ordinal")?;
+                        directory.reads.lock().unwrap().clear();
+                        if let Some(ivf) = vectors.index() {
+                            for cluster in 0..ivf.num_clusters() {
+                                bounds.add_native(cluster, ivf.bounds().ball_r(cluster));
+                                vectors.read_doc_ids(cluster, &mut Vec::new())?;
+                            }
+                        }
+                        expected_reads.extend(
+                            directory
+                                .reads
+                                .lock()
+                                .unwrap()
+                                .drain(..)
+                                .map(|(_, range)| range),
+                        );
+                        for doc in segment.doc_ids_alive() {
+                            let id = ordinals.first(doc).unwrap();
+                            let row = vectors.row_id(doc)?;
+                            let value = if let Some(row) = row {
+                                directory.reads.lock().unwrap().clear();
+                                let bytes = vectors.vector_bytes_for_row(row)?;
+                                expected_reads.extend(
+                                    directory
+                                        .reads
+                                        .lock()
+                                        .unwrap()
+                                        .drain(..)
+                                        .map(|(_, range)| range),
+                                );
+                                let values = decode_row::<f32>(&bytes, DIM)?;
+                                let cluster = vectors.row_cluster(row).unwrap_or_else(|| {
+                                    (0..3)
+                                        .max_by(|&a, &b| {
+                                            metric
+                                                .similarity(
+                                                    &values,
+                                                    &centroids[a * DIM..(a + 1) * DIM],
+                                                )
+                                                .cmp(&metric.similarity(
+                                                    &values,
+                                                    &centroids[b * DIM..(b + 1) * DIM],
+                                                ))
+                                                .then_with(|| b.cmp(&a))
+                                        })
+                                        .unwrap()
+                                });
+                                if vectors.index().is_none() {
+                                    bounds.add_native(
+                                        cluster,
+                                        residual_norm::<f32>(
+                                            &bytes,
+                                            &centroids[cluster * DIM..(cluster + 1) * DIM],
+                                        ),
+                                    );
+                                }
+                                Some((bytes, cluster))
+                            } else {
+                                None
+                            };
+                            expected.insert(id, value);
+                        }
+                    }
+                    directory.reads.lock().unwrap().clear();
+                    let target = target_index.new_segment();
+                    let num_docs = merger.write(&target)?;
+                    let mut actual_reads: Vec<_> = directory
+                        .reads
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(_, range)| range.clone())
+                        .collect();
+                    actual_reads.sort_by_key(|range| (range.start, range.end));
+                    expected_reads.sort_by_key(|range| (range.start, range.end));
+                    assert_eq!(
+                        actual_reads, expected_reads,
+                        "clustered rows must be read only for encoding"
+                    );
+                    let merged = SegmentReader::open(&target.with_max_doc(num_docs))?;
+                    let vectors = merged.vector_index(fixture.field)?;
+                    assert_eq!(vectors.index().unwrap().bounds().values(), bounds.finish());
+                    assert_eq!(num_docs as usize, expected.len());
+                    for (doc, (id, expected)) in expected.into_iter().enumerate() {
+                        let doc = doc as u32;
+                        assert_eq!(merged.fast_fields().u64("ordinal")?.first(doc), Some(id));
+                        match expected {
+                            None => assert!(vectors.vector_bytes(doc)?.is_none()),
+                            Some((bytes, cluster)) => {
+                                assert_eq!(vectors.vector_bytes(doc)?.unwrap(), bytes);
+                                let row = vectors.row_id(doc)?.unwrap();
+                                assert_eq!(vectors.row_cluster(row), Some(cluster));
+                                if let Some(quant) = vectors.quantization() {
+                                    let context = quant.index_ctx();
+                                    let prepared = cascade::prepare_centroid(
+                                        &centroids[cluster * DIM..(cluster + 1) * DIM],
+                                        &context.specs,
+                                    );
+                                    let mut values = decode_row::<f32>(&bytes, DIM)?;
+                                    let mut workspace = cascade::BatchEncodeWorkspace::new();
+                                    let encoded = cascade::encode_batch_in_place_with_workspace(
+                                        &mut values,
+                                        1,
+                                        &prepared,
+                                        &context.specs,
+                                        &context.grids,
+                                        &mut workspace,
+                                        metric == Metric::L2,
+                                    );
+                                    assert_eq!(
+                                        quant.residual_norm(row)?,
+                                        encoded.residual_norms_squared[0]
+                                    );
+                                    for (layer, encoded) in
+                                        quant.layers().iter().zip(&encoded.layers)
+                                    {
+                                        assert_eq!(
+                                            layer.code_bytes(row)?.as_slice(),
+                                            encoded.codes
+                                        );
+                                        assert_eq!(layer.scale(row)?, encoded.scales[0]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_merge_rejects_foreign_and_segment_local_centroids() -> crate::Result<()> {
+        use crate::indexer::merger::IndexMerger;
+        use crate::vector::tests::Grid2DClusterer;
+
+        let fixture = Fixture::new(Metric::L2);
+        let target_index = fixture.create(RouterKind::Exact)?;
+        for local in [false, true] {
+            let source = if local {
+                Index::builder()
+                    .schema(fixture.schema.clone())
+                    .settings(crate::IndexSettings {
+                        vector_clustering_threshold: 1,
+                        ..Default::default()
+                    })
+                    .ivf_clusterer(Arc::new(Grid2DClusterer {
+                        centroids: vec![[0.0, 0.0], [3.0, 4.0], [-4.0, 3.0]],
+                    }))
+                    .ivf_router(RouterKind::Exact)?
+                    .create_in_ram()?
+            } else {
+                fixture
+                    .builder()
+                    .ivf_router(RouterKind::Exact)?
+                    .create_in_ram()?
+            };
+            let mut writer: IndexWriter = source.writer_with_num_threads(1, 15_000_000)?;
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(fixture.field, &[3.0, 4.0]);
+            writer.add_document(doc)?;
+            writer.commit()?;
+            if local {
+                writer.merge(&source.searchable_segment_ids()?).wait()?;
+            }
+            let segments = source.searchable_segments()?;
+            assert_eq!(
+                crate::SegmentReader::open(&segments[0])?
+                    .vector_index(fixture.field)?
+                    .index()
+                    .unwrap()
+                    .num_clusters(),
+                3
+            );
+            let merger = IndexMerger::open(
+                fixture.schema.clone(),
+                target_index.settings().clone(),
+                &segments,
+                Box::new(|| false),
+                false,
+            )?;
+            let error = merger.write(&target_index.new_segment()).unwrap_err();
+            assert!(
+                error.to_string().contains("different centroid index"),
+                "{error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn invalid_producers_do_not_publish_metadata() -> crate::Result<()> {
         for (name, values, rows, dims) in [
             ("empty", vec![], 0, 2),

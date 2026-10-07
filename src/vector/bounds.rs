@@ -34,7 +34,7 @@ use crate::vector::VectorElement;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum BoundKind {
-    /// One `f32` per cluster: max `||x - c||` over members, in the
+    /// One `f32` per cluster: an upper bound on `||x - c||` over members, in the
     /// stored representation. Metric-uniform by the cosine
     /// write-normalization invariant (unit members + renormalized
     /// centroid make the residual norm the chord).
@@ -128,9 +128,7 @@ impl<'a> BoundStore<'a> {
 
 // ---- build ------------------------------------------------------------
 //
-// The ONLY producer of bounds. The merge path runs this same fold over its
-// re-assignment output against the NEW centroids; no bound-combining API
-// exists, by design -- folded input radii under merge are unsound.
+// Bounds can be combined only when centroid coordinates and stored rows stay unchanged.
 
 /// Accumulates one segment's per-cluster ball bounds during a merge.
 pub struct BoundsBuilder {
@@ -151,11 +149,11 @@ impl BoundsBuilder {
         }
     }
 
-    /// Folds one native member assigned to `cluster`.
+    /// Folds a native member residual or an existing bound against the same stored centroid.
     ///
-    /// * `cluster` (`usize`) — the member's HOME (primary) cluster.
-    /// * `residual_norm` (`f32`) — `||x - c||` of the member's STORED row against the STORED
-    ///   centroid (post-renormalization for cosine). A non-finite residual saturates the cluster.
+    /// * `cluster` (`usize`) — the member's or bound's cluster.
+    /// * `residual_norm` (`f32`) — `||x - c||` of a stored row against its stored centroid, or a
+    ///   source segment's bound with unchanged rows and centroid. Non-finite values saturate.
     pub fn add_native(&mut self, cluster: usize, residual_norm: f32) {
         let slot = &mut self.r[cluster];
         if !residual_norm.is_finite() {

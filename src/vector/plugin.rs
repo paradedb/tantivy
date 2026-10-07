@@ -1,8 +1,9 @@
 //! Unified vector storage plugin.
 //!
 //! [`VectorPlugin`] owns per-segment vector storage end-to-end:
-//! - With shared centroids, flushes and merges assign vectors to the persisted centroid order and
-//!   write clustered `.vec` blocks plus segment-specific `.centroids` metadata.
+//! - With shared centroids, flushes assign vectors to the persisted centroid order; merges preserve
+//!   clustered memberships and assign flat inputs. Both write clustered `.vec` blocks plus
+//!   segment-specific `.centroids` metadata.
 //! - Without shared centroids, indexing writes flat `.vec` files. Merges select by doc count: below
 //!   [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold)
 //!   it copies vectors forward into a flat `.vec`; at or above the threshold it writes an IVF

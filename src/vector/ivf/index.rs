@@ -31,6 +31,7 @@ use std::sync::Arc;
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
 use crate::directory::FileSlice;
+use crate::index::CentroidIndexMeta;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
 use crate::vector::ivf::RecallEstimator;
@@ -46,6 +47,7 @@ use crate::vector::{BoundKind, BoundStore};
 /// at a time as routing visits them. Everything row-scale (the rows and
 /// id-map) lives on [`VectorIndexReader`](crate::vector::VectorIndexReader).
 pub struct IvfIndex {
+    centroid_index: Option<CentroidIndexMeta>,
     routing: Arc<RouterIndex>,
     /// Distinct documents with a vector in this field.
     num_docs: usize,
@@ -177,12 +179,20 @@ impl IvfIndex {
             metric: options.metric(),
             router,
         });
-        Self::open_postings(options, routing, num_docs, offsets_slice, bounds_slice)
+        Self::open_postings(
+            options,
+            routing,
+            None,
+            num_docs,
+            offsets_slice,
+            bounds_slice,
+        )
     }
 
     pub(crate) fn open_postings(
         options: &VectorOptions,
         routing: Arc<RouterIndex>,
+        centroid_index: Option<CentroidIndexMeta>,
         num_docs: usize,
         offsets_slice: FileSlice,
         bounds_slice: FileSlice,
@@ -239,6 +249,7 @@ impl IvfIndex {
         }
 
         let index = IvfIndex {
+            centroid_index,
             routing,
             num_docs,
             cluster_offsets,
@@ -255,6 +266,10 @@ impl IvfIndex {
             .into());
         }
         Ok(index)
+    }
+
+    pub(crate) fn centroid_index_meta(&self) -> Option<&CentroidIndexMeta> {
+        self.centroid_index.as_ref()
     }
 
     pub fn num_clusters(&self) -> usize {
