@@ -2,13 +2,14 @@ use std::collections::HashMap;
 
 use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN};
 use crate::index::SegmentReader;
-use crate::postings::FreqReadingOption;
+use crate::postings::{FreqReadingOption, SegmentPostings};
 use crate::query::bitmap_combination::{BitmapCombination, BitmapOperation};
 use crate::query::boolean_query::{
     BlockWandIntersectionScorer, BlockWandSingleScorer, BlockWandUnionScorer,
 };
 use crate::query::disjunction::Disjunction;
 use crate::query::explanation::does_not_match;
+use crate::query::phrase_query::PhraseScorer;
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
 use crate::query::scorer::BasicPruningScorer;
 use crate::query::term_query::TermScorer;
@@ -33,6 +34,14 @@ fn intersect_scorers(
         && scorers
             .iter()
             .all(|scorer| scorer.size_hint().saturating_mul(32) >= num_docs)
+        && !scorers.iter().any(|phrase| {
+            phrase.is::<PhraseScorer<SegmentPostings>>()
+                && scorers.iter().any(|driver| {
+                    !driver.is::<PhraseScorer<SegmentPostings>>()
+                        && driver.cost() < phrase.cost()
+                        && u64::from(driver.size_hint()) * 2 <= u64::from(num_docs)
+                })
+        })
     {
         Box::new(BitmapCombination::new(
             scorers,
@@ -1133,6 +1142,83 @@ mod tests {
     use super::BooleanWeight;
     use crate::query::{Bm25Weight, DisjunctionPruning, SumCombiner, TermScorer};
     use crate::Bm25Params;
+
+    #[test]
+    fn bitmap_phrase_intersections_use_selective_candidates() -> crate::Result<()> {
+        use crate::query::bitmap_combination::BitmapCombination;
+        use crate::query::{EnableScoring, QueryParser};
+        use crate::schema::{Schema, FAST, TEXT};
+        use crate::{Index, TERMINATED};
+
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field(
+            "text",
+            TEXT.set_indexing_options(
+                TEXT.get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_bitmap_postings(true),
+            ),
+        );
+        let number = schema.add_u64_field("number", FAST);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer = index.writer_for_tests()?;
+        for doc in 0..4096u32 {
+            let mut terms = vec![if doc % 3 == 0 { "of the" } else { "of gap the" }];
+            for (term, frequency) in [
+                ("selective", 512),
+                ("half", 2048),
+                ("abovehalf", 2049),
+                ("dense", 3072),
+            ] {
+                if doc < frequency {
+                    terms.push(term);
+                }
+            }
+            writer.add_document(doc!(text => terms.join(" "), number => u64::from(doc)))?;
+        }
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let reader = searcher.segment_reader(0);
+        let mut ordinary_reader = reader.clone();
+        ordinary_reader.bitmap_postings_enabled = false;
+        let parser = QueryParser::for_index(&index, vec![text]);
+        for (expression, bitmap) in [
+            (r#"selective AND "of the""#, false),
+            (r#""of the" AND selective"#, false),
+            (r#"half AND "of the""#, false),
+            (r#"abovehalf AND "of the""#, true),
+            (r#"dense AND "of the""#, true),
+            (r#"dense AND "of the" AND selective"#, false),
+            (r#"selective AND (dense OR "of the")"#, true),
+            (r#"selective OR "of the""#, true),
+            ("selective AND dense", true),
+            ("dense AND number:[0 TO 511]", true),
+        ] {
+            let query = parser.parse_query(expression)?;
+            let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+            let mut scorer = weight.scorer(reader, 1.0)?;
+            assert_eq!(scorer.is::<BitmapCombination>(), bitmap, "{expression}");
+            let mut expected_scorer = weight.scorer(&ordinary_reader, 1.0)?;
+            let mut expected = Vec::new();
+            while expected_scorer.doc() != TERMINATED {
+                expected.push(expected_scorer.doc());
+                expected_scorer.advance();
+            }
+            let mut actual = Vec::new();
+            crate::query::for_each_docset_batch(scorer.as_mut(), &mut |batch| {
+                batch.for_each_doc_block(|docs| actual.extend_from_slice(docs));
+            });
+            assert_eq!(actual, expected, "{expression}");
+            assert!(!actual.is_empty(), "{expression}");
+            let scored = query
+                .weight(EnableScoring::enabled_from_searcher(&searcher))?
+                .scorer(reader, 1.0)?;
+            assert!(!scored.is::<BitmapCombination>(), "{expression}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_shared_conjunction_norms_match_exhaustive() -> crate::Result<()> {
