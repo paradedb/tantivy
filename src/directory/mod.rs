@@ -18,7 +18,6 @@ mod composite_file;
 use std::io::{BufWriter, Read, Seek, Write};
 use std::path::PathBuf;
 
-pub use common::buffered_file_slice::BufferedFileSlice;
 pub use common::file_slice::{FileHandle, FileSlice};
 pub use common::{AntiCallToken, OwnedBytes, TerminatingWrite};
 

@@ -41,7 +41,6 @@ const COMPRESSION_BLOCK_SIZE: usize = BitPacker4x::BLOCK_LEN;
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::collections::HashSet;
     use std::io;
     use std::ops::Range;
     use std::sync::{Arc, Mutex};
@@ -212,9 +211,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_position_storage_pages_are_reused() -> crate::Result<()> {
-        let mut repeated_pages = 0;
-        for (name, num_positions, step, block_len, term_offset, value) in [
+    fn test_lazy_position_reads() -> crate::Result<()> {
+        for (_name, num_positions, step, block_len, term_offset, value) in [
             ("tiny vint", 3, 1, 8192, 123, 255),
             ("tiny bitpacked", 256, 128, 8192, 123, 255),
             ("dense aligned", 262_161, 128, 8192, 0, 255),
@@ -254,39 +252,16 @@ pub(crate) mod tests {
                 assert_eq!(output, position_deltas[offset..offset + output.len()]);
             }
             let reads = reads.lock().unwrap();
-            let mut pages = HashSet::new();
-            let mut page_accesses = 0;
             for range in reads.iter().filter(|range| !range.is_empty()) {
                 assert!(range.start >= term_offset && range.end <= term_end);
-                assert!(range.start == term_offset || range.start % block_len == 0);
-                assert!(range.end == term_end || range.end % block_len == 0);
-                for page in range.start / block_len..=(range.end - 1) / block_len {
-                    page_accesses += 1;
-                    pages.insert(page);
-                }
-            }
-            eprintln!(
-                "{name}: {} reads, {page_accesses} page accesses, {} unique pages, {} bytes",
-                reads.len(),
-                pages.len(),
-                reads.iter().map(|range| range.len()).sum::<usize>()
-            );
-            repeated_pages += page_accesses - pages.len();
-            if step <= 128 {
-                assert_eq!(
-                    pages.len(),
-                    (term_end - 1) / block_len - term_offset / block_len + 1
-                );
-            } else {
-                assert!(pages.len() < (term_end - term_offset) / block_len);
+                assert!(range.len() <= positions_data.len());
             }
         }
-        assert_eq!(repeated_pages, 0);
         Ok(())
     }
 
     #[test]
-    fn test_position_page_cache_survives_clone_and_reset() -> crate::Result<()> {
+    fn test_lazy_position_clone_and_reset() -> crate::Result<()> {
         let position_deltas: Vec<u32> = (0..2_049).map(|position| position % 257).collect();
         let positions_data = create_positions_data(&position_deltas)?;
         let mut data = vec![0; 123];
@@ -307,7 +282,11 @@ pub(crate) mod tests {
                 assert_eq!(output, position_deltas[offset..offset + len]);
             }
         }
-        assert_eq!(reads.lock().unwrap().len(), 1);
+        assert!(reads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| r.len() < positions_data.len()));
         Ok(())
     }
 
