@@ -65,8 +65,9 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
                 if ctx.cancel.wants_cancel() {
                     return Err(crate::TantivyError::Cancelled);
                 }
-                if let Some((segment, row)) = source {
-                    let bytes = field_readers[segment].vector_bytes_for_row(row)?;
+                if let Some(source) = source {
+                    let bytes = field_readers[source.segment_ord as usize]
+                        .vector_bytes_for_row(source.row_id)?;
                     target_present.push(target_doc_id);
                     rows_w.write_all(&bytes)?;
                     block_bytes += bytes.len();
