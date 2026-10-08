@@ -62,7 +62,12 @@ impl BitmapCombination {
 
     fn next_base(&self) -> DocId {
         match self.operation {
-            BitmapOperation::Union => self.children.iter().map(|child| child.doc()).min().unwrap(),
+            BitmapOperation::Union => self
+                .children
+                .iter()
+                .map(|child| child.doc())
+                .min()
+                .unwrap_or(TERMINATED),
             BitmapOperation::Intersection => {
                 self.children.iter().map(|child| child.doc()).max().unwrap()
             }
@@ -95,18 +100,29 @@ impl BitmapCombination {
             }
             self.base = next / BLOCK_WINDOW * BLOCK_WINDOW;
             self.mask.fill(TinySet::EMPTY);
+            if matches!(self.operation, BitmapOperation::Union) {
+                let horizon = self.base.saturating_add(BLOCK_WINDOW).min(TERMINATED);
+                self.children.retain_mut(|child| {
+                    if child.doc() < horizon {
+                        child.fill_bitset_block(self.base, &mut self.mask);
+                    }
+                    child.doc() != TERMINATED
+                });
+                if self.position(target) {
+                    return self.doc;
+                }
+                continue;
+            }
             self.children[0].fill_bitset_block(self.base, &mut self.mask);
             let mut empty = self.mask.iter().all(|word| word.is_empty());
             for child in &mut self.children[1..] {
-                if empty && !matches!(self.operation, BitmapOperation::Union) {
+                if empty {
                     break;
                 }
                 let mut other = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
                 child.fill_bitset_block(self.base, &mut other);
                 match self.operation {
-                    BitmapOperation::Union => {
-                        crate::docset::union_bitset_blocks(&mut self.mask, &other);
-                    }
+                    BitmapOperation::Union => unreachable!(),
                     BitmapOperation::Intersection => {
                         empty = super::intersection::and_blocks_and_return_is_empty(
                             &mut self.mask,
@@ -268,6 +284,35 @@ mod tests {
         fn score(&mut self) -> Score {
             1.0
         }
+    }
+
+    #[test]
+    fn union_retires_children_after_their_last_mask_and_skips_future_windows() {
+        let fills: Vec<_> = (0..3)
+            .map(|_| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+            .collect();
+        let children = [vec![1], vec![2, 1025, 2049], vec![4097]]
+            .into_iter()
+            .enumerate()
+            .map(|(i, docs)| {
+                Box::new(TrackedScorer {
+                    docs: VecDocSet::from(docs),
+                    cost: 1,
+                    fills: fills[i].clone(),
+                }) as Box<dyn Scorer>
+            })
+            .collect();
+        let mut scorer = BitmapCombination::new(children, BitmapOperation::Union, 8007);
+        assert_eq!(scorer.children.len(), 2);
+        for doc in [1, 2, 1025, 2049, 4097] {
+            assert_eq!(scorer.doc(), doc);
+            scorer.advance();
+        }
+        assert!(scorer.children.is_empty());
+        assert_eq!(scorer.advance(), TERMINATED);
+        assert_eq!(*fills[0].lock().unwrap(), vec![0]);
+        assert_eq!(*fills[1].lock().unwrap(), vec![0, 1024, 2048]);
+        assert_eq!(*fills[2].lock().unwrap(), vec![4096]);
     }
 
     #[test]
