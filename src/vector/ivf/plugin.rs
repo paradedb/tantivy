@@ -12,6 +12,7 @@ use cascade::{
     encode_batch_in_place_with_workspace, BatchEncodeWorkspace, PreparedCentroidWorkspace,
     QueryRotationPlan,
 };
+use itertools::Itertools;
 #[cfg(test)]
 use quant_model::Grid;
 
@@ -53,7 +54,7 @@ struct AssignedVector {
 /// Per-field IVF build counters and timings, reported on `paradedb::ivf_build`.
 #[derive(Default)]
 struct IvfBuildTimings {
-    /// Source vector lookups, including lookups for documents without a vector.
+    /// Source vector reads across the training, assign, and encode passes.
     source_reads: usize,
     spill_bytes: usize,
     pad_bytes: usize,
@@ -253,32 +254,42 @@ pub(crate) fn merge_ivf(
 
         match opts.dtype() {
             VectorDType::F32 => {
-                let mut timings = IvfBuildTimings {
-                    source_reads: vector_count,
-                    ..Default::default()
-                };
-                let mut training_values = Vec::with_capacity(training_sample_size * opts.dim());
+                let mut timings = IvfBuildTimings::default();
+                let dim = opts.dim();
+
+                // Each sampled row paired with its position in target-doc order.
                 let mut training_doc_ids = Vec::with_capacity(training_sample_size);
-                let mut target_doc_id: DocId = 0;
+                let mut training_sources: Vec<(RowAddress, usize)> =
+                    Vec::with_capacity(training_sample_size);
                 let mut present_vector_ord = 0usize;
-                let mut sampled_count = 0usize;
-                for source in &source_rows {
-                    if let Some(source) = *source {
-                        timings.source_reads += 1;
-                        let bytes = field_readers[source.segment_ord as usize]
-                            .vector_bytes_for_row(source.row_id)?;
-                        let should_sample = sampled_count < training_sample_size
-                            && present_vector_ord % training_sample_interval == 0;
-                        if should_sample {
-                            training_doc_ids.push(target_doc_id);
-                            decode_row_append::<f32>(&bytes, opts.dim(), &mut training_values)?;
-                            sampled_count += 1;
-                        }
-                        present_vector_ord += 1;
+                for (target_doc_id, source) in source_rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(doc_id, row)| row.map(|row| (doc_id as DocId, row)))
+                {
+                    if training_sources.len() < training_sample_size
+                        && present_vector_ord % training_sample_interval == 0
+                    {
+                        training_sources.push((source, training_doc_ids.len()));
+                        training_doc_ids.push(target_doc_id);
                     }
-                    target_doc_id += 1;
+                    present_vector_ord += 1;
                 }
-                debug_assert_eq!(target_doc_id, num_target_docs);
+                debug_assert_eq!(source_rows.len(), num_target_docs as usize);
+
+                // Read in source storage order, but keep the training matrix in target-doc
+                // order so the trainer's input does not depend on source clustering.
+                training_sources.sort_unstable();
+                let mut training_values = vec![0.0f32; training_sources.len() * dim];
+                let mut decode_buffer = Vec::with_capacity(dim);
+                for (source, sample_idx) in training_sources {
+                    timings.source_reads += 1;
+                    let bytes = field_readers[source.segment_ord as usize]
+                        .vector_bytes_for_row(source.row_id)?;
+                    decode_buffer.clear();
+                    decode_row_append::<f32>(&bytes, dim, &mut decode_buffer)?;
+                    training_values[sample_idx * dim..][..dim].copy_from_slice(&decode_buffer);
+                }
                 debug_assert!(
                     if ctx.readers.iter().any(|reader| reader.has_deletes()) {
                         present_vector_ord <= vector_count
@@ -369,26 +380,32 @@ pub(crate) fn merge_ivf(
                     .collect();
 
                 let mut assigned_vectors = Vec::with_capacity(vector_count);
-                let mut target_doc_id: DocId = 0;
                 {
-                    let mut batch_values = Vec::with_capacity(
-                        settings.assign_batch_size.min(vector_count) * opts.dim(),
-                    );
-                    let mut batch_doc_ids =
-                        Vec::with_capacity(settings.assign_batch_size.min(vector_count));
-                    let mut batch_sources =
-                        Vec::with_capacity(settings.assign_batch_size.min(vector_count));
-                    let mut flush_assign_batch = |batch_values: &mut Vec<f32>,
-                                                  batch_doc_ids: &mut Vec<DocId>,
-                                                  batch_sources: &mut Vec<(DocId, RowAddress)>|
-                     -> crate::Result<()> {
-                        if batch_doc_ids.is_empty() {
-                            return Ok(());
-                        }
+                    // Assignment is per vector, so batches can follow source storage order;
+                    // `assigned_vectors` is re-sorted by (cluster, target doc) below.
+                    let mut assign_sources: Vec<(RowAddress, DocId)> = source_rows
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(doc_id, row)| row.map(|row| (row, doc_id as DocId)))
+                        .sorted()
+                        .collect();
+
+                    let batch_capacity = settings.assign_batch_size.min(assign_sources.len());
+                    let mut batch_values = Vec::with_capacity(batch_capacity * dim);
+                    let mut batch_doc_ids = Vec::with_capacity(batch_capacity);
+                    for batch in assign_sources.chunks(settings.assign_batch_size) {
                         if ctx.cancel.wants_cancel() {
                             return Err(TantivyError::Cancelled);
                         }
-                        let batch_len = batch_doc_ids.len();
+                        batch_values.clear();
+                        batch_doc_ids.clear();
+                        for &(source, target_doc_id) in batch {
+                            timings.source_reads += 1;
+                            let bytes = field_readers[source.segment_ord as usize]
+                                .vector_bytes_for_row(source.row_id)?;
+                            decode_row_append::<f32>(&bytes, dim, &mut batch_values)?;
+                            batch_doc_ids.push(target_doc_id);
+                        }
                         let assign_start = Instant::now();
                         let clusters = clusterer.assign(
                             opts,
@@ -396,23 +413,21 @@ pub(crate) fn merge_ivf(
                                 doc_ids: batch_doc_ids.as_slice(),
                                 matrix: IvfMatrixView {
                                     values: batch_values.as_slice(),
-                                    rows: batch_len,
-                                    dims: opts.dim(),
+                                    rows: batch.len(),
+                                    dims: dim,
                                 },
                             }),
                             &centroids,
                         )?;
                         timings.assign += assign_start.elapsed();
-                        if clusters.len() != batch_len {
+                        if clusters.len() != batch.len() {
                             return Err(TantivyError::InvalidArgument(format!(
                                 "IvfClusterer assigned {} clusters for {} vectors",
                                 clusters.len(),
-                                batch_len
+                                batch.len()
                             )));
                         }
-                        for (cluster, (target_doc_id, source)) in
-                            clusters.into_iter().zip(batch_sources.drain(..))
-                        {
+                        for (cluster, &(source, target_doc_id)) in clusters.into_iter().zip(batch) {
                             let cluster = cluster as usize;
                             if cluster >= num_centroids {
                                 return Err(TantivyError::InvalidArgument(format!(
@@ -426,31 +441,8 @@ pub(crate) fn merge_ivf(
                                 source,
                             });
                         }
-                        batch_values.clear();
-                        batch_doc_ids.clear();
-                        Ok(())
-                    };
-                    for source in &source_rows {
-                        if let Some(source) = *source {
-                            timings.source_reads += 1;
-                            let bytes = field_readers[source.segment_ord as usize]
-                                .vector_bytes_for_row(source.row_id)?;
-                            batch_doc_ids.push(target_doc_id);
-                            decode_row_append::<f32>(&bytes, opts.dim(), &mut batch_values)?;
-                            batch_sources.push((target_doc_id, source));
-                            if batch_doc_ids.len() == settings.assign_batch_size {
-                                flush_assign_batch(
-                                    &mut batch_values,
-                                    &mut batch_doc_ids,
-                                    &mut batch_sources,
-                                )?;
-                            }
-                        }
-                        target_doc_id += 1;
                     }
-                    flush_assign_batch(&mut batch_values, &mut batch_doc_ids, &mut batch_sources)?;
                 }
-                debug_assert_eq!(target_doc_id, num_target_docs);
                 debug_assert_eq!(assigned_vectors.len(), present_vector_ord);
                 // The `.centroids` doc count: one posting row per document.
                 let num_present_docs = assigned_vectors.len();
