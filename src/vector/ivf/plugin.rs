@@ -379,26 +379,32 @@ pub(crate) fn merge_ivf(
                     .collect();
 
                 let mut assigned_vectors = Vec::with_capacity(vector_count);
-                let mut target_doc_id: DocId = 0;
                 {
-                    let mut batch_values = Vec::with_capacity(
-                        settings.assign_batch_size.min(vector_count) * opts.dim(),
-                    );
-                    let mut batch_doc_ids =
-                        Vec::with_capacity(settings.assign_batch_size.min(vector_count));
-                    let mut batch_sources =
-                        Vec::with_capacity(settings.assign_batch_size.min(vector_count));
-                    let mut flush_assign_batch = |batch_values: &mut Vec<f32>,
-                                                  batch_doc_ids: &mut Vec<DocId>,
-                                                  batch_sources: &mut Vec<(DocId, RowAddress)>|
-                     -> crate::Result<()> {
-                        if batch_doc_ids.is_empty() {
-                            return Ok(());
-                        }
+                    // Assignment is per vector, so batches can follow source storage order;
+                    // `assigned_vectors` is re-sorted by (cluster, target doc) below.
+                    let mut assign_sources: Vec<(RowAddress, DocId)> = source_rows
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(doc_id, row)| row.map(|row| (row, doc_id as DocId)))
+                        .collect();
+                    assign_sources.sort_unstable();
+
+                    let batch_capacity = settings.assign_batch_size.min(assign_sources.len());
+                    let mut batch_values = Vec::with_capacity(batch_capacity * dim);
+                    let mut batch_doc_ids = Vec::with_capacity(batch_capacity);
+                    for batch in assign_sources.chunks(settings.assign_batch_size) {
                         if ctx.cancel.wants_cancel() {
                             return Err(TantivyError::Cancelled);
                         }
-                        let batch_len = batch_doc_ids.len();
+                        batch_values.clear();
+                        batch_doc_ids.clear();
+                        for &(source, target_doc_id) in batch {
+                            timings.source_reads += 1;
+                            let bytes = field_readers[source.segment_ord as usize]
+                                .vector_bytes_for_row(source.row_id)?;
+                            decode_row_append::<f32>(&bytes, dim, &mut batch_values)?;
+                            batch_doc_ids.push(target_doc_id);
+                        }
                         let assign_start = Instant::now();
                         let clusters = clusterer.assign(
                             opts,
@@ -406,22 +412,21 @@ pub(crate) fn merge_ivf(
                                 doc_ids: batch_doc_ids.as_slice(),
                                 matrix: IvfMatrixView {
                                     values: batch_values.as_slice(),
-                                    rows: batch_len,
-                                    dims: opts.dim(),
+                                    rows: batch.len(),
+                                    dims: dim,
                                 },
                             }),
                             &centroids,
                         )?;
                         timings.assign += assign_start.elapsed();
-                        if clusters.len() != batch_len {
+                        if clusters.len() != batch.len() {
                             return Err(TantivyError::InvalidArgument(format!(
                                 "IvfClusterer assigned {} clusters for {} vectors",
                                 clusters.len(),
-                                batch_len
+                                batch.len()
                             )));
                         }
-                        for (cluster, (target_doc_id, source)) in
-                            clusters.into_iter().zip(batch_sources.drain(..))
+                        for (cluster, &(source, target_doc_id)) in clusters.into_iter().zip(batch)
                         {
                             let cluster = cluster as usize;
                             if cluster >= num_centroids {
@@ -436,31 +441,8 @@ pub(crate) fn merge_ivf(
                                 source,
                             });
                         }
-                        batch_values.clear();
-                        batch_doc_ids.clear();
-                        Ok(())
-                    };
-                    for source in &source_rows {
-                        if let Some(source) = *source {
-                            timings.source_reads += 1;
-                            let bytes = field_readers[source.segment_ord as usize]
-                                .vector_bytes_for_row(source.row_id)?;
-                            batch_doc_ids.push(target_doc_id);
-                            decode_row_append::<f32>(&bytes, opts.dim(), &mut batch_values)?;
-                            batch_sources.push((target_doc_id, source));
-                            if batch_doc_ids.len() == settings.assign_batch_size {
-                                flush_assign_batch(
-                                    &mut batch_values,
-                                    &mut batch_doc_ids,
-                                    &mut batch_sources,
-                                )?;
-                            }
-                        }
-                        target_doc_id += 1;
                     }
-                    flush_assign_batch(&mut batch_values, &mut batch_doc_ids, &mut batch_sources)?;
                 }
-                debug_assert_eq!(target_doc_id, num_target_docs);
                 debug_assert_eq!(assigned_vectors.len(), present_vector_ord);
                 // The `.centroids` doc count: one posting row per document.
                 let num_present_docs = assigned_vectors.len();
