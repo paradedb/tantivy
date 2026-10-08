@@ -6,8 +6,7 @@
 //! cluster iteration, which inverts the per-doc pull model that sort-key
 //! computers assume. [`Collector::collect_global`] coordinates global routing,
 //! probe budgets, and candidate thresholds across segments. Segment scorers
-//! consume clusters using their stored row format. Legacy segment routers
-//! still rank independently.
+//! consume clusters using their stored row format.
 //!
 //! A secondary key *is* an ordinary `SortKeyComputer` — see
 //! [`TopDocsByVectorSimilarity::with_tie_break`]. The heap sorts on the
@@ -141,24 +140,17 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     /// Order documents that tie on similarity by `tie_break`, as
     /// `ORDER BY embedding <=> $1, id` does.
     ///
-    /// The tie-break takes part in each segment's top-N eviction, so it also
+    /// The tie-break takes part in top-N eviction, so it also
     /// decides *which* of a set of equally-distant documents survive, not only
     /// how the survivors are ordered. Similarity remains the primary key; the
     /// tie-break is only consulted between documents whose similarity is
     /// exactly equal.
     ///
-    /// This does not change which clusters an IVF segment probes: the probe
-    /// loop's stopping rule reads the routed centroids and the filter, never
-    /// the top-N heap.
+    /// Routing and probe stopping use similarity, independently of the tie-break.
     ///
-    /// Each segment is cut to its own top-N under the segment-local
-    /// `SegmentSortKey`, and only the survivors are lifted to `SortKey` for the
-    /// cross-segment merge. `convert_segment_sort_key` must therefore be
-    /// order-preserving within a segment, or a segment can discard a document
-    /// that would have placed globally. The bundled computers satisfy this:
-    /// term ordinals ascend with their terms, and `FastValue`'s `u64` encoding
-    /// is monotonic.
-    /// Sets a secondary ordering for equal similarities.
+    /// Global collection converts segment keys before comparing hits across segments.
+    /// Segment collection converts its survivors before merging; conversion must
+    /// preserve their order.
     pub fn with_tie_break<S2: SortKeyComputer>(
         self,
         tie_break: S2,
@@ -399,6 +391,9 @@ where
         executor: &crate::Executor,
     ) -> crate::Result<Self::Fruit> {
         let readers = searcher.segment_readers();
+        if let [reader] = readers {
+            return self.merge_fruits(vec![self.collect_segment(weight, 0, reader)?]);
+        }
         let Some(centroids) = searcher.index().cached_centroid_index()? else {
             let fruits = executor.map(
                 |(ordinal, reader)| self.collect_segment(weight, ordinal as u32, reader),

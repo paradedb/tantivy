@@ -163,30 +163,6 @@ impl<T: VectorElement, S: SortKeyComputer> SegmentScan<'_, T, S> {
         q_norm: f32,
         top: &mut GlobalTop<S>,
     ) -> crate::Result<usize> {
-        let start = Instant::now();
-        let quantized = self.quantized.is_some();
-        let _stage = enter_vector_stage(if quantized {
-            Stage::LayerScan(0)
-        } else {
-            Stage::ExactScan
-        });
-        let count = self.probe_rows(candidate, bound, q_norm, top)?;
-        let elapsed = start.elapsed().as_nanos() as u64;
-        if quantized {
-            self.stats.record_layer_scan(0, count, elapsed);
-        } else {
-            *self.stats.exact_scan_ns.get_or_insert(0) += elapsed;
-        }
-        Ok(count)
-    }
-
-    fn probe_rows(
-        &mut self,
-        candidate: Candidate,
-        bound: QueryBound,
-        q_norm: f32,
-        top: &mut GlobalTop<S>,
-    ) -> crate::Result<usize> {
         let reader = &self.backend.reader;
         let index = reader.index().expect("IVF segment");
         let metric = reader.options().metric();
@@ -207,6 +183,27 @@ impl<T: VectorElement, S: SortKeyComputer> SegmentScan<'_, T, S> {
             self.stats.bounds_skips += 1;
             return Ok(0);
         }
+        let start = Instant::now();
+        let quantized = self.quantized.is_some();
+        let _stage = enter_vector_stage(if quantized {
+            Stage::LayerScan(0)
+        } else {
+            Stage::ExactScan
+        });
+        let count = self.with_io(|segment| segment.probe_rows(candidate, top))?;
+        let elapsed = start.elapsed().as_nanos() as u64;
+        if quantized {
+            self.stats.record_layer_scan(0, count, elapsed);
+        } else {
+            *self.stats.exact_scan_ns.get_or_insert(0) += elapsed;
+        }
+        Ok(count)
+    }
+
+    fn probe_rows(&mut self, candidate: Candidate, top: &mut GlobalTop<S>) -> crate::Result<usize> {
+        let reader = &self.backend.reader;
+        let index = reader.index().expect("IVF segment");
+        let cluster = candidate.node as usize;
         let rows = index.cluster_range(cluster);
         let open = matches!(self.gate, RowGate::Open);
         if !open && !rows.is_empty() {
@@ -444,8 +441,7 @@ pub(crate) fn search<T: VectorElement, S: SortKeyComputer>(
             let mut scored = 0;
             for segment in &mut segments {
                 if active(segment.backend) {
-                    let count = segment
-                        .with_io(|segment| segment.probe(candidate, bound, q_norm, &mut top))?;
+                    let count = segment.probe(candidate, bound, q_norm, &mut top)?;
                     scored += count;
                 }
             }

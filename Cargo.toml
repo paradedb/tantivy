@@ -301,3 +301,7 @@ required-features = ["unstable"]
 [[bench]]
 name = "ivf_recall"
 harness = false
+
+[[bench]]
+name = "global_router"
+harness = false
