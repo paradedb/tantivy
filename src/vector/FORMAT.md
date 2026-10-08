@@ -30,9 +30,10 @@ through `open_or_create` on an existing index.
 
 Indexes with this artifact assign flushed vectors and flat merge inputs to their
 most similar stored centroid, breaking ties by the lowest centroid ID. Assignment
-uses an exact scan. Clustered merge inputs must reference the same centroid
-artifact as the target. Merges preserve their memberships and row bytes, remap
-document IDs, and discard deleted documents.
+uses batched matrix multiplication over all centroids, with bounded score tiles
+and direct L2 scoring near cancellation or overflow. Clustered merge inputs must
+reference the same centroid artifact as the target. Merges preserve their
+memberships and row bytes, remap document IDs, and discard deleted documents.
 Bounds are the per-cluster maximum of source bounds and newly assigned flat-row
 residuals; deleted rows may leave conservative overestimates. Quantized columns
 are encoded using the target settings and the preserved cluster assignments.

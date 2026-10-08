@@ -1461,18 +1461,23 @@ mod tests {
         let fixture = Fixture::new(Metric::L2);
         let shared = fixture.create(RouterKind::Exact)?;
         let flat = Index::create_in_ram(fixture.schema.clone());
+        let rows = [[0.0, 0.0], [3.0, 4.0], [-4.0, 3.0]];
+        let num_docs = 259;
         for index in [&shared, &flat] {
             let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
             writer.set_merge_policy(Box::new(NoMergePolicy));
-            for value in [1.0, 2.0] {
+            for doc_id in 0..num_docs {
                 let mut doc = TantivyDocument::new();
-                doc.add_vector(fixture.field, &[value, 0.0]);
+                doc.add_vector(fixture.field, &rows[doc_id as usize % rows.len()]);
                 writer.add_document(doc)?;
             }
             writer.commit()?;
         }
         let expected = artifact(&shared)?;
         for filtered in [false, true] {
+            let surviving: Vec<_> = (0..num_docs)
+                .filter(|doc| !filtered || doc % 2 == 0)
+                .collect();
             let directory = RamDirectory::create();
             let merged = if filtered {
                 let segments: Vec<_> = flat
@@ -1483,7 +1488,13 @@ mod tests {
                 merge_filtered_segments(
                     &segments,
                     shared.settings().clone(),
-                    vec![Some(AliveBitSet::for_test_from_deleted_docs(&[1], 2)); 2],
+                    vec![
+                        Some(AliveBitSet::for_test_from_deleted_docs(
+                            &(1..num_docs).step_by(2).collect::<Vec<_>>(),
+                            num_docs,
+                        ));
+                        2
+                    ],
                     directory.clone(),
                     Box::new(|| false),
                 )?
@@ -1500,14 +1511,18 @@ mod tests {
             drop(writer);
             let reopened = Index::open(directory)?;
             let searcher = reopened.reader()?.searcher();
-            assert_eq!(searcher.num_docs(), if filtered { 2 } else { 4 });
+            assert_eq!(searcher.num_docs() as usize, surviving.len() * 2);
             let vectors = searcher.segment_readers()[0].vector_index(fixture.field)?;
             assert_eq!(vectors.index().unwrap().centroid_index_meta(), &expected.0);
             for doc in 0..searcher.num_docs() as u32 {
-                let value = if filtered { 1.0 } else { (doc % 2 + 1) as f32 };
+                let cluster = surviving[doc as usize % surviving.len()] as usize % rows.len();
                 assert_eq!(
                     vectors.vector_bytes(doc)?.unwrap().as_slice(),
-                    encode_vector(&[value, 0.0], 2)?
+                    encode_vector(&rows[cluster], 2)?
+                );
+                assert_eq!(
+                    vectors.row_cluster(vectors.row_id(doc)?.unwrap()),
+                    Some(cluster)
                 );
             }
             assert_eq!(artifact(&reopened)?, expected);

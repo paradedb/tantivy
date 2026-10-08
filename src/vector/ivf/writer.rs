@@ -8,8 +8,9 @@ use cascade::{
 };
 use common::BinarySerializable;
 
+use super::assignments::{BatchAssigner, ASSIGN_BATCH_SIZE};
 use super::centroid_index::CentroidIndex;
-use super::{decode_row_append, IvfIndex, CENTROIDS_EXT};
+use super::{decode_row, decode_row_append, IvfIndex, CENTROIDS_EXT};
 use crate::directory::CompositeWrite;
 use crate::index::{CentroidIndexMeta, SegmentComponent};
 use crate::indexer::doc_id_mapping::DocIdMapping;
@@ -382,33 +383,42 @@ impl<'a> SharedSegmentWriter<'a> {
         let router = &self.routers[&field];
         let centroid_bytes = router.centroid_bytes()?;
         let stride = opts.bytes_per_vector();
-        let mut vector = Vec::with_capacity(opts.dim());
         let mut assigned = Vec::new();
         for (target_doc_id, source_segment_ord, source_row, existing_cluster) in rows {
             if cancel.wants_cancel() {
                 return Err(TantivyError::Cancelled);
             }
-            let cluster = if let Some(cluster) = existing_cluster {
-                cluster
-            } else {
-                let bytes = read_row(source_segment_ord, source_row)?;
-                vector.clear();
-                decode_row_append::<f32>(bytes.as_ref(), opts.dim(), &mut vector)?;
-                centroid_bytes
-                    .chunks_exact(stride)
-                    .enumerate()
-                    .map(|(id, centroid)| (id, opts.metric().similarity_bytes(&vector, centroid)))
-                    .max_by(|(a, sa), (b, sb)| sa.cmp(sb).then_with(|| b.cmp(a)))
-                    .expect("validated nonempty centroids")
-                    .0
-            };
             assigned.push(AssignedVector {
-                cluster,
+                cluster: existing_cluster.unwrap_or_default(),
                 new_assignment: existing_cluster.is_none(),
                 target_doc_id,
                 source_segment_ord,
                 source_row,
             });
+        }
+        if assigned.iter().any(|row| row.new_assignment) {
+            let mut assigner = BatchAssigner::new(
+                decode_row::<f32>(&centroid_bytes, router.num_clusters() * opts.dim())?,
+                opts,
+            );
+            let mut values = Vec::with_capacity(ASSIGN_BATCH_SIZE * opts.dim());
+            for batch in assigned.chunks_mut(ASSIGN_BATCH_SIZE) {
+                if cancel.wants_cancel() {
+                    return Err(TantivyError::Cancelled);
+                }
+                values.clear();
+                for row in batch.iter().filter(|row| row.new_assignment) {
+                    let bytes = read_row(row.source_segment_ord, row.source_row)?;
+                    decode_row_append::<f32>(bytes.as_ref(), opts.dim(), &mut values)?;
+                }
+                for (row, cluster) in batch
+                    .iter_mut()
+                    .filter(|row| row.new_assignment)
+                    .zip(assigner.assign(&values))
+                {
+                    row.cluster = cluster;
+                }
+            }
         }
         let num_present = assigned.len() as u32;
         if opts.needs_normalization() {

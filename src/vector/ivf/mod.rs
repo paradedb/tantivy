@@ -1,6 +1,7 @@
 //! Inverted-file vector storage and cluster routing.
 
 mod aps;
+mod assignments;
 pub(crate) mod bkt;
 pub(crate) mod centroid_index;
 pub(crate) mod graph;
