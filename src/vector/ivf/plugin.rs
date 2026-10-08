@@ -254,28 +254,41 @@ pub(crate) fn merge_ivf(
         match opts.dtype() {
             VectorDType::F32 => {
                 let mut timings = IvfBuildTimings::default();
-                let mut training_values = Vec::with_capacity(training_sample_size * opts.dim());
+                let dim = opts.dim();
+
+                // Each sampled row paired with its position in target-doc order.
                 let mut training_doc_ids = Vec::with_capacity(training_sample_size);
-                let mut target_doc_id: DocId = 0;
+                let mut training_sources: Vec<(RowAddress, usize)> =
+                    Vec::with_capacity(training_sample_size);
                 let mut present_vector_ord = 0usize;
-                let mut sampled_count = 0usize;
-                for source in &source_rows {
-                    if let Some(source) = *source {
-                        let should_sample = sampled_count < training_sample_size
-                            && present_vector_ord % training_sample_interval == 0;
-                        if should_sample {
-                            timings.source_reads += 1;
-                            let bytes = field_readers[source.segment_ord as usize]
-                                .vector_bytes_for_row(source.row_id)?;
-                            training_doc_ids.push(target_doc_id);
-                            decode_row_append::<f32>(&bytes, opts.dim(), &mut training_values)?;
-                            sampled_count += 1;
-                        }
-                        present_vector_ord += 1;
+                for (target_doc_id, source) in source_rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(doc_id, row)| row.map(|row| (doc_id as DocId, row)))
+                {
+                    if training_sources.len() < training_sample_size
+                        && present_vector_ord % training_sample_interval == 0
+                    {
+                        training_sources.push((source, training_doc_ids.len()));
+                        training_doc_ids.push(target_doc_id);
                     }
-                    target_doc_id += 1;
+                    present_vector_ord += 1;
                 }
-                debug_assert_eq!(target_doc_id, num_target_docs);
+                debug_assert_eq!(source_rows.len(), num_target_docs as usize);
+
+                // Read in source storage order, but keep the training matrix in target-doc
+                // order so the trainer's input does not depend on source clustering.
+                training_sources.sort_unstable();
+                let mut training_values = vec![0.0f32; training_sources.len() * dim];
+                let mut decode_buffer = Vec::with_capacity(dim);
+                for (source, sample_idx) in training_sources {
+                    timings.source_reads += 1;
+                    let bytes = field_readers[source.segment_ord as usize]
+                        .vector_bytes_for_row(source.row_id)?;
+                    decode_buffer.clear();
+                    decode_row_append::<f32>(&bytes, dim, &mut decode_buffer)?;
+                    training_values[sample_idx * dim..][..dim].copy_from_slice(&decode_buffer);
+                }
                 debug_assert!(
                     if ctx.readers.iter().any(|reader| reader.has_deletes()) {
                         present_vector_ord <= vector_count
