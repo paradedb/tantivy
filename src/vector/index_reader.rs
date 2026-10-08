@@ -1538,6 +1538,7 @@ pub struct VectorIndexReader {
     present: bool,
     /// Document addressing, deferred until a lookup requires the entry.
     id_map: DeferredIdMap,
+    cached_doc_ids: OnceLock<crate::Result<Box<[DocId]>>>,
     /// Deferred row-group columns and their validated geometry.
     rows_slice: Arc<Blocks>,
     index: Option<IvfIndex>,
@@ -1763,6 +1764,7 @@ impl VectorIndexReader {
             present: true,
             rows_slice,
             id_map,
+            cached_doc_ids: OnceLock::new(),
             index,
             quantization,
         })
@@ -1787,6 +1789,7 @@ impl VectorIndexReader {
             present: false,
             rows_slice,
             id_map: DeferredIdMap::ready(IdMap::Identity { num_docs: 0 }),
+            cached_doc_ids: OnceLock::new(),
             index: None,
             quantization: None,
         }
@@ -2750,7 +2753,20 @@ impl VectorIndexReader {
             Ok(map.rank_if_exists(doc_id).map(|row| row as usize))
         }
     }
-    /// Reads only a cluster's document column, validating bounds and ordering while decoding.
+    pub(crate) fn cache_doc_ids(&self) -> crate::Result<()> {
+        self.cached_doc_ids
+            .get_or_init(|| {
+                self.id_map
+                    .get(true)?
+                    .row_doc_ids(&self.rows_slice.block_rows)
+                    .map_err(|e| DataCorruption::comment_only(e.to_string()).into())
+            })
+            .as_ref()
+            .map(|_| ())
+            .map_err(Clone::clone)
+    }
+
+    /// Reads a cluster's cached document ids or validates its stored document column.
     pub(crate) fn read_doc_ids(&self, cluster: usize, out: &mut Vec<DocId>) -> crate::Result<()> {
         out.clear();
         let blocks = &self.rows_slice;
@@ -2758,6 +2774,13 @@ impl VectorIndexReader {
             return Err(DataCorruption::comment_only("invalid DocIds cluster").into());
         }
         if blocks.rows_in(cluster) == 0 {
+            return Ok(());
+        }
+        if let Some(docs) = self.cached_doc_ids.get() {
+            let docs = docs.as_ref().map_err(Clone::clone)?;
+            out.extend_from_slice(
+                &docs[blocks.block_rows[cluster]..blocks.block_rows[cluster + 1]],
+            );
             return Ok(());
         }
         let idx = blocks
@@ -3093,6 +3116,7 @@ mod tests {
                 present: true,
                 rows_slice: blocks,
                 id_map: DeferredIdMap::ready(IdMap::Identity { num_docs: 3 }),
+                cached_doc_ids: OnceLock::new(),
                 index: None,
                 quantization: None,
             };
@@ -3111,6 +3135,69 @@ mod tests {
                 Err(TantivyError::InvalidArgument(_))
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn filtered_doc_ids_read_one_table_and_reuse_it() -> crate::Result<()> {
+        use crate::vector::storage_io::test_support::PagedDirectory;
+        use crate::vector::tests::Grid2DCentroids;
+        use crate::{Index, TantivyDocument};
+
+        let directory = PagedDirectory::default();
+        let mut schema = crate::schema::Schema::builder();
+        let field = schema.add_vector_field("vec", VectorOptions::new(2, Metric::L2));
+        let index = Index::builder()
+            .schema(schema.build())
+            .centroid_producer(Arc::new(Grid2DCentroids {
+                centroids: vec![[0.0, 0.0], [10.0, 10.0], [100.0, 100.0]],
+            }))
+            .ivf_router(crate::vector::RouterKind::Rng)?
+            .create(directory.clone())?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        for vector in [
+            Some([9.0, 9.0]),
+            Some([1.0, 1.0]),
+            None,
+            Some([10.0, 10.0]),
+            Some([0.0, 0.0]),
+        ] {
+            let mut doc = TantivyDocument::new();
+            if let Some(vector) = vector {
+                doc.add_vector(field, &vector);
+            }
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let reader = searcher.segment_reader(0).vector_index(field)?;
+        let expected = (0..reader.index().unwrap().num_clusters())
+            .map(|cluster| reader.cluster_doc_ids(cluster).map(Option::unwrap))
+            .collect::<crate::Result<Vec<_>>>()?;
+        assert!(expected.iter().any(Vec::is_empty));
+        assert!(!reader.id_map_initialized());
+        directory.reads.lock().unwrap().clear();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| reader.cache_doc_ids().unwrap());
+            }
+        });
+        let reads = directory.reads.lock().unwrap();
+        assert_eq!(
+            reads
+                .iter()
+                .map(|(_, range)| range.len())
+                .collect::<Vec<_>>(),
+            [1, 5 * 8]
+        );
+        drop(reads);
+        directory.reads.lock().unwrap().clear();
+        reader.cache_doc_ids()?;
+        for (cluster, expected) in expected.iter().enumerate() {
+            assert_eq!(reader.cluster_doc_ids(cluster)?.as_ref(), Some(expected));
+        }
+        assert_eq!(reader.row_doc_ids(0..4)?, expected.concat());
+        assert!(directory.reads.lock().unwrap().is_empty());
         Ok(())
     }
 
@@ -3254,6 +3341,7 @@ mod tests {
             max_doc: ROWS as DocId,
             options: VectorOptions::new(DIM, Metric::Dot),
             num_vectors: ROWS,
+            cached_doc_ids: OnceLock::new(),
             present: true,
             id_map: DeferredIdMap::ready(IdMap::Identity {
                 num_docs: ROWS as u32,

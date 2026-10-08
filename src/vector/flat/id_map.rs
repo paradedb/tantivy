@@ -104,6 +104,10 @@ impl IdMap {
             return Ok(None);
         }
         let bytes = body.slice(start..start + 8).read_vector_bytes()?;
+        Self::decode_location(&bytes, rows)
+    }
+
+    fn decode_location(bytes: &[u8], rows: &[usize]) -> io::Result<Option<DocLocation>> {
         let cluster = u32::from_le_bytes(bytes[..4].try_into().unwrap());
         let local = u32::from_le_bytes(bytes[4..].try_into().unwrap());
         if cluster == u32::MAX {
@@ -126,6 +130,42 @@ impl IdMap {
             ));
         }
         Ok(Some(DocLocation { cluster, local }))
+    }
+
+    pub(crate) fn row_doc_ids(&self, rows: &[usize]) -> io::Result<Box<[DocId]>> {
+        let Self::DocLocations(body) = self else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "clustered lookup requires DocLocations",
+            ));
+        };
+        let bytes = body.read_vector_bytes()?;
+        let mut docs = vec![DocId::MAX; rows.last().copied().unwrap_or(0)];
+        for (doc, bytes) in bytes.chunks_exact(8).enumerate() {
+            if let Some(location) = Self::decode_location(bytes, rows)? {
+                let row = rows[location.cluster as usize] + location.local as usize;
+                if docs[row] != DocId::MAX {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "multiple documents have the same vector location",
+                    ));
+                }
+                docs[row] = doc as DocId;
+            }
+        }
+        if docs.contains(&DocId::MAX)
+            || rows.windows(2).any(|range| {
+                docs[range[0]..range[1]]
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "document locations must cover all rows in ascending cluster order",
+            ));
+        }
+        Ok(docs.into_boxed_slice())
     }
     /// Number of present flat rows; clustered row counts reside in cluster offsets.
     pub fn num_rows(&self) -> u32 {
@@ -270,6 +310,7 @@ mod tests {
         IdMap::serialize_locations(&expected, &mut bytes).unwrap();
         assert_eq!(bytes.len(), 1 + 8 * expected.len());
         let map = IdMap::open(FileSlice::from(bytes.clone()), 5).unwrap();
+        assert_eq!(&*map.row_doc_ids(&[0, 2, 4]).unwrap(), &[1, 4, 0, 3]);
         for (doc, &location) in expected.iter().enumerate() {
             assert_eq!(
                 map.locate(doc as u32, &[0, 2, 4]).unwrap(),
@@ -297,6 +338,25 @@ mod tests {
             let map = IdMap::open(FileSlice::from(corrupt), 5).unwrap();
             assert_eq!(
                 map.locate(0, &[0, 2, 4]).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                map.row_doc_ids(&[0, 2, 4]).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        let mut duplicate = expected;
+        duplicate[0] = expected[1];
+        let mut missing = expected;
+        missing[0] = DocLocation::ABSENT;
+        let mut descending = expected;
+        descending.swap(0, 3);
+        for locations in [duplicate, missing, descending] {
+            let mut corrupt = Vec::new();
+            IdMap::serialize_locations(&locations, &mut corrupt).unwrap();
+            let map = IdMap::open(FileSlice::from(corrupt), 5).unwrap();
+            assert_eq!(
+                map.row_doc_ids(&[0, 2, 4]).unwrap_err().kind(),
                 io::ErrorKind::InvalidData
             );
         }

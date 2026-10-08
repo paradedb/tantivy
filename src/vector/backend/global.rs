@@ -230,6 +230,7 @@ impl<T: VectorElement, S: SortKeyComputer> SegmentScan<'_, T, S> {
         let gate = self.gate.as_ref().expect("filter prepared before scanning");
         let open = matches!(gate, RowGate::Open);
         if !open {
+            reader.cache_doc_ids()?;
             reader.read_doc_ids(cluster, &mut self.docs)?;
         }
         let (selection, visited, pruned_filter, pruned_dead) =
