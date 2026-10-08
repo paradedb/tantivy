@@ -610,6 +610,10 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         if reader.bitmap_postings_enabled
             && !self.scoring_enabled
             && include_scorer_boxed.has_fast_bitset()
+            // Positional and other expensive exclusions should probe inclusion candidates.
+            && exclude_scorers
+                .iter()
+                .all(|scorer| scorer.has_fast_bitset() || scorer.is::<TermScorer>())
         {
             let mut children = vec![include_scorer_boxed];
             children.extend(exclude_scorers);
@@ -1195,6 +1199,10 @@ mod tests {
             (r#"selective OR "of the""#, true),
             ("selective AND dense", true),
             ("dense AND number:[0 TO 511]", true),
+            (r#"selective -"of the""#, false),
+            (r#"selective -("of the"^2)"#, false),
+            (r#"abovehalf -"of the" -selective"#, false),
+            ("dense -selective", true),
         ] {
             let query = parser.parse_query(expression)?;
             let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
