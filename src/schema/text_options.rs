@@ -96,6 +96,10 @@ pub(super) mod fast_field_text_options_serde {
     }
 }
 
+fn is_true(val: &bool) -> bool {
+    *val
+}
+
 fn is_false(val: &bool) -> bool {
     !val
 }
@@ -196,7 +200,7 @@ pub struct TextFieldIndexing {
     fieldnorms: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pnorms: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default = "default_bitmap_postings", skip_serializing_if = "is_true")]
     bitmap_postings: bool,
     #[serde(default = "default_tokenizer")]
     tokenizer: Cow<'static, str>,
@@ -213,6 +217,10 @@ pub(crate) fn default_fieldnorms() -> bool {
     true
 }
 
+const fn default_bitmap_postings() -> bool {
+    true
+}
+
 impl Default for TextFieldIndexing {
     fn default() -> TextFieldIndexing {
         TextFieldIndexing {
@@ -220,7 +228,7 @@ impl Default for TextFieldIndexing {
             record: IndexRecordOption::default(),
             fieldnorms: default_fieldnorms(),
             pnorms: false,
-            bitmap_postings: false,
+            bitmap_postings: default_bitmap_postings(),
             bm25_params: Bm25Params::default(),
         }
     }
@@ -269,7 +277,7 @@ impl TextFieldIndexing {
         self.bitmap_postings
     }
 
-    /// Enables optional membership bitmaps for dense terms. Defaults to false.
+    /// Enables optional membership bitmaps for dense terms. Defaults to true.
     #[must_use]
     pub fn set_bitmap_postings(mut self, enabled: bool) -> Self {
         self.bitmap_postings = enabled;
@@ -311,7 +319,7 @@ pub const STRING: TextOptions = TextOptions {
         tokenizer: Cow::Borrowed(RAW_TOKENIZER_NAME),
         fieldnorms: true,
         pnorms: false,
-        bitmap_postings: false,
+        bitmap_postings: default_bitmap_postings(),
         record: IndexRecordOption::Basic,
         bm25_params: Bm25Params::DEFAULT,
     }),
@@ -326,7 +334,7 @@ pub const TEXT: TextOptions = TextOptions {
         tokenizer: Cow::Borrowed(DEFAULT_TOKENIZER_NAME),
         fieldnorms: true,
         pnorms: false,
-        bitmap_postings: false,
+        bitmap_postings: default_bitmap_postings(),
         record: IndexRecordOption::WithFreqsAndPositions,
         bm25_params: Bm25Params::DEFAULT,
     }),
@@ -462,6 +470,25 @@ mod tests {
         let options: TextOptions = serde_json::from_str(json).unwrap();
         let options2: TextOptions = serde_json::from_str("{\"indexing\": {}}").unwrap();
         assert_eq!(options, options2);
+        assert!(options.get_indexing_options().unwrap().bitmap_postings());
+        for indexing in [
+            TextFieldIndexing::default(),
+            TEXT.get_indexing_options().unwrap().clone(),
+            STRING.get_indexing_options().unwrap().clone(),
+        ] {
+            assert!(indexing.bitmap_postings());
+            for enabled in [false, true] {
+                let indexing = indexing.clone().set_bitmap_postings(enabled);
+                let json = serde_json::to_value(&indexing).unwrap();
+                if !enabled {
+                    assert_eq!(json["bitmap_postings"], false);
+                }
+                assert_eq!(
+                    serde_json::from_value::<TextFieldIndexing>(json).unwrap(),
+                    indexing
+                );
+            }
+        }
         assert_eq!(options.indexing.unwrap().record, IndexRecordOption::Basic);
         let options3: TextOptions = serde_json::from_str("{}").unwrap();
         assert_eq!(options3.indexing, None);
