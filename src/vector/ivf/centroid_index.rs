@@ -1454,6 +1454,82 @@ mod tests {
     }
 
     #[test]
+    fn merge_into_new_index_preserves_centroids() -> crate::Result<()> {
+        use crate::fastfield::AliveBitSet;
+        use crate::indexer::{merge_filtered_segments, merge_indices};
+
+        let fixture = Fixture::new(Metric::L2);
+        let shared = fixture.create(RouterKind::Exact)?;
+        let flat = Index::create_in_ram(fixture.schema.clone());
+        for index in [&shared, &flat] {
+            let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            for value in [1.0, 2.0] {
+                let mut doc = TantivyDocument::new();
+                doc.add_vector(fixture.field, &[value, 0.0]);
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+        }
+        let expected = artifact(&shared)?;
+        for filtered in [false, true] {
+            let directory = RamDirectory::create();
+            let merged = if filtered {
+                let segments: Vec<_> = flat
+                    .searchable_segments()?
+                    .into_iter()
+                    .chain(shared.searchable_segments()?)
+                    .collect();
+                merge_filtered_segments(
+                    &segments,
+                    shared.settings().clone(),
+                    vec![Some(AliveBitSet::for_test_from_deleted_docs(&[1], 2)); 2],
+                    directory.clone(),
+                    Box::new(|| false),
+                )?
+            } else {
+                merge_indices(
+                    &[flat.clone(), shared.clone()],
+                    directory.clone(),
+                    Box::new(|| false),
+                )?
+            };
+            assert_eq!(artifact(&merged)?, expected);
+            let writer: IndexWriter = merged.writer_with_num_threads(1, 15_000_000)?;
+            writer.garbage_collect_files().wait()?;
+            drop(writer);
+            let reopened = Index::open(directory)?;
+            let searcher = reopened.reader()?.searcher();
+            assert_eq!(searcher.num_docs(), if filtered { 2 } else { 4 });
+            let vectors = searcher.segment_readers()[0].vector_index(fixture.field)?;
+            assert_eq!(vectors.index().unwrap().centroid_index_meta(), &expected.0);
+            for doc in 0..searcher.num_docs() as u32 {
+                let value = if filtered { 1.0 } else { (doc % 2 + 1) as f32 };
+                assert_eq!(
+                    vectors.vector_bytes(doc)?.unwrap().as_slice(),
+                    encode_vector(&[value, 0.0], 2)?
+                );
+            }
+            assert_eq!(artifact(&reopened)?, expected);
+        }
+        let foreign = Fixture::new(Metric::L2).create(RouterKind::Exact)?;
+        let mut writer: IndexWriter = foreign.writer_with_num_threads(1, 15_000_000)?;
+        let mut doc = TantivyDocument::new();
+        doc.add_vector(fixture.field, &[0.0, 1.0]);
+        writer.add_document(doc)?;
+        writer.commit()?;
+        drop(writer);
+        let error = merge_indices(
+            &[shared, foreign],
+            RamDirectory::create(),
+            Box::new(|| false),
+        )
+        .expect_err("foreign centroid index");
+        assert!(error.to_string().contains("different centroid indexes"));
+        Ok(())
+    }
+
+    #[test]
     fn shared_merge_rejects_foreign_centroids() -> crate::Result<()> {
         use crate::indexer::merger::IndexMerger;
 

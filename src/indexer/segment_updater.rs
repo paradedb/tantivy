@@ -11,7 +11,9 @@ use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use super::segment_manager::SegmentManager;
 use crate::core::META_FILEPATH;
-use crate::directory::{Directory, DirectoryClone, DirectoryPanicHandler, GarbageCollectionResult};
+use crate::directory::{
+    Directory, DirectoryClone, DirectoryPanicHandler, GarbageCollectionResult, TerminatingWrite,
+};
 use crate::fastfield::AliveBitSet;
 use crate::index::{
     list_segment_files, Index, IndexMeta, IndexSettings, Segment, SegmentId, SegmentMeta,
@@ -271,6 +273,22 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         ));
     }
 
+    let centroid_source = segments
+        .iter()
+        .find(|segment| segment.index().centroid_index_meta().is_some());
+    let centroid_index = centroid_source
+        .and_then(|segment| segment.index().centroid_index_meta())
+        .cloned();
+    if segments
+        .iter()
+        .filter_map(|segment| segment.index().centroid_index_meta())
+        .any(|meta| Some(meta) != centroid_index.as_ref())
+    {
+        return Err(TantivyError::InvalidArgument(
+            "cannot merge segments from different centroid indexes".into(),
+        ));
+    }
+
     // The source index's writer was already validated against its recorded plugin
     // set (else `MissingPlugin`); the merger reuses those registered plugins.
     let merger = IndexMerger::open_with_custom_alive_set(
@@ -282,11 +300,27 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         false,
     )?;
 
+    let output_directory: Box<dyn Directory> = output_directory.into();
     let mut merged_index = Index::create(
-        output_directory,
+        output_directory.box_clone(),
         target_schema.clone(),
         target_settings.clone(),
     )?;
+
+    if let Some(source) = centroid_source {
+        let path = &centroid_index.as_ref().unwrap().file_name;
+        let bytes = source.index().directory().open_read(path)?.read_bytes()?;
+        let mut write = merged_index.directory().open_write(path)?;
+        write.write_all(&bytes)?;
+        write.terminate()?;
+        let previous_meta = merged_index.load_metas()?;
+        let meta = IndexMeta {
+            centroid_index: centroid_index.clone(),
+            ..previous_meta.clone()
+        };
+        save_metas(&meta, &previous_meta, merged_index.directory())?;
+        merged_index = Index::open(output_directory)?;
+    }
 
     // Carry the merger's custom plugins onto the merged index (built-ins come for free) and
     // record their extensions as the merged index's required set; without this the first GC
@@ -318,7 +352,7 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         index_settings: target_settings.clone(), /* index_settings of all segments should be the
                                                   * same */
         persisted_custom_extensions: persisted_custom_extensions.clone(),
-        centroid_index: None,
+        centroid_index: centroid_index.clone(),
         segments: vec![segment_meta],
         schema: target_schema.clone(),
         opstamp: 0u64,
@@ -333,7 +367,7 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     let previous_meta = IndexMeta {
         index_settings: target_settings,
         persisted_custom_extensions,
-        centroid_index: None,
+        centroid_index,
         segments: segment_metas,
         schema: target_schema,
         opstamp: 0u64,
