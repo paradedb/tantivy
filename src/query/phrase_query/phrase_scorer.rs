@@ -49,6 +49,7 @@ impl<TPostings: Postings> DocSet for PostingsWithOffset<TPostings> {
 pub struct PhraseScorer<TPostings: Postings> {
     intersection_docset: Intersection<PostingsWithOffset<TPostings>, PostingsWithOffset<TPostings>>,
     num_terms: usize,
+    pub(super) stream_positions: bool,
     left_positions: Vec<u32>,
     right_positions: Vec<u32>,
     phrase_count: u32,
@@ -410,6 +411,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         PhraseScorer {
             intersection_docset,
             num_terms: num_docsets,
+            stream_positions: false,
             left_positions: Vec::with_capacity(100),
             right_positions: Vec::with_capacity(100),
             phrase_count: 0u32,
@@ -499,6 +501,33 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
     }
 
     fn phrase_exists(&mut self) -> bool {
+        if self.stream_positions {
+            self.intersection_docset
+                .docset_mut_specialized(0)
+                .positions(&mut self.left_positions);
+            for ord in 1..self.num_terms {
+                let term = self.intersection_docset.docset_mut_specialized(ord);
+                if let Some(count) = term.postings.intersect_positions_with_offset(
+                    term.offset,
+                    &mut self.left_positions,
+                    ord + 1 == self.num_terms,
+                ) {
+                    if count == 0 {
+                        return false;
+                    }
+                } else {
+                    term.positions(&mut self.right_positions);
+                    if ord + 1 == self.num_terms {
+                        return intersection_exists(&self.left_positions, &self.right_positions);
+                    }
+                    intersection(&mut self.left_positions, &self.right_positions);
+                    if self.left_positions.is_empty() {
+                        return false;
+                    }
+                }
+            }
+            return !self.left_positions.is_empty();
+        }
         self.compute_phrase_match();
         if self.has_slop() {
             intersection_exists_with_slop(

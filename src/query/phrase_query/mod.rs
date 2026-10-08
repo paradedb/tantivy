@@ -126,6 +126,65 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_streamed_phrase_counts_match_scored_positions() -> crate::Result<()> {
+        let mut state = 91u64;
+        let mut texts: Vec<String> = (0..128)
+            .map(|doc| {
+                (0..(260 + doc * 3))
+                    .map(|_| {
+                        state = state
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1);
+                        ["a", "b", "c", "x"][((state >> 32) % 4) as usize]
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        texts.extend(["a", "a a", "a b", "b a", "a b a", "a a a", ""].map(String::from));
+        texts.extend(std::iter::repeat_n("a".to_string(), 20));
+        let index = create_index(&texts)?;
+        let field = index.schema().get_field("text")?;
+        let searcher = index.reader()?.searcher();
+        for words in [vec!["a", "b"], vec!["a", "b", "c", "x", "a", "b"]] {
+            for gap in [1, 3] {
+                let query = PhraseQuery::new_with_offset(
+                    words
+                        .iter()
+                        .enumerate()
+                        .map(|(i, word)| (i * gap, Term::from_field_text(field, word)))
+                        .collect(),
+                );
+                let scored = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE)?;
+                let unscored = searcher.search(&query, &TEST_COLLECTOR_WITHOUT_SCORE)?;
+                assert_eq!(scored.docs(), unscored.docs());
+                let expected: Vec<DocId> = texts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(doc, text)| {
+                        let tokens: Vec<_> = text.split_whitespace().collect();
+                        (0..tokens.len())
+                            .any(|start| {
+                                words
+                                    .iter()
+                                    .enumerate()
+                                    .all(|(i, word)| tokens.get(start + i * gap) == Some(word))
+                            })
+                            .then_some(doc as DocId)
+                    })
+                    .collect();
+                let actual: Vec<_> = unscored
+                    .docs()
+                    .iter()
+                    .map(|address| address.doc_id)
+                    .collect();
+                assert_eq!(actual, expected);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     pub fn test_phrase_query_no_positions() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         use crate::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};

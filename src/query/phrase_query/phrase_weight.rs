@@ -72,13 +72,15 @@ impl PhraseWeight {
                 return Ok(None);
             }
         }
-        Ok(Some(PhraseScorer::new_unpositioned(
+        let mut scorer = PhraseScorer::new_unpositioned(
             term_postings_list,
             similarity_weight_opt,
             fieldnorm_reader,
             self.slop,
             0,
-        )))
+        );
+        scorer.stream_positions = self.slop == 0 && self.similarity_weight_opt.is_none();
+        Ok(Some(scorer))
     }
 
     pub fn slop(&mut self, slop: u32) {

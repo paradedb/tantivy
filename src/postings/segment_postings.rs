@@ -289,6 +289,26 @@ impl Postings for SegmentPostings {
         self.block_cursor.freq(self.cur)
     }
 
+    fn intersect_positions_with_offset(
+        &mut self,
+        offset: u32,
+        candidates: &mut Vec<u32>,
+        stop_at_first: bool,
+    ) -> Option<usize> {
+        let count = self.term_freq() as usize;
+        let reader = self.position_reader.as_mut()?;
+        let read_offset = self
+            .position_offset_cache
+            .position_offset(&self.block_cursor, self.cur);
+        Some(reader.intersect_positions_with_offset(
+            read_offset,
+            count,
+            offset,
+            candidates,
+            stop_at_first,
+        ))
+    }
+
     fn append_positions_with_offset(&mut self, offset: u32, output: &mut Vec<u32>) {
         let term_freq = self.term_freq();
         if let Some(position_reader) = self.position_reader.as_mut() {

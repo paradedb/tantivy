@@ -236,6 +236,7 @@ impl PositionReader {
                 previous = value;
                 cursor += 1;
             }
+            true
         });
     }
 
@@ -253,14 +254,66 @@ impl PositionReader {
             if let Some(&last) = block.last() {
                 position_offset = last.wrapping_add(base);
             }
+            true
         });
+    }
+
+    pub(crate) fn intersect_positions_with_offset(
+        &mut self,
+        offset: u64,
+        count: usize,
+        mut position: u32,
+        candidates: &mut Vec<u32>,
+        stop_at_first: bool,
+    ) -> usize {
+        if candidates.is_empty() {
+            return 0;
+        }
+        let mut cursor = 0;
+        let mut matches = 0;
+        self.read_blocks(offset, count, |mut block, previous| {
+            let base = position.wrapping_sub(previous);
+            if let Some(&last) = block.last() {
+                position = last.wrapping_add(base);
+            }
+            while !block.is_empty() {
+                if position < candidates[cursor] {
+                    break;
+                }
+                let skip =
+                    block.partition_point(|&value| value.wrapping_add(base) < candidates[cursor]);
+                block = &block[skip..];
+                if block.is_empty() {
+                    break;
+                }
+                let value = block[0].wrapping_add(base);
+                while candidates[cursor] < value {
+                    cursor += 1;
+                    if cursor == candidates.len() {
+                        return false;
+                    }
+                }
+                if candidates[cursor] == value {
+                    candidates[matches] = value;
+                    matches += 1;
+                    cursor += 1;
+                    if stop_at_first || cursor == candidates.len() {
+                        return false;
+                    }
+                    block = &block[1..];
+                }
+            }
+            true
+        });
+        candidates.truncate(matches);
+        matches
     }
 
     fn read_blocks(
         &mut self,
         mut offset: u64,
         mut count: usize,
-        mut consume: impl FnMut(&[u32], u32),
+        mut consume: impl FnMut(&[u32], u32) -> bool,
     ) {
         if offset < self.anchor_offset {
             self.reset();
@@ -291,7 +344,9 @@ impl PositionReader {
             let len = count.min(remaining_in_block);
             let positions = self.block_decoder.output_array();
             let previous = offset_in_block.checked_sub(1).map_or(0, |i| positions[i]);
-            consume(&positions[offset_in_block..][..len], previous);
+            if !consume(&positions[offset_in_block..][..len], previous) {
+                break;
+            }
             count -= len;
             if count == 0 {
                 break;

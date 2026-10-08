@@ -168,6 +168,81 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    proptest! {
+        #[test]
+        fn test_streamed_position_intersection(
+            deltas in proptest::collection::vec(0u32..32, 0..600),
+            mut candidates in proptest::collection::vec(0u32..10_000, 0..100),
+            start_hint in 0usize..1_000,
+            count_hint in 0usize..1_000,
+            position_offset in 0u32..100,
+        ) {
+            candidates.sort_unstable();
+            let offset = start_hint % (deltas.len() + 1);
+            let count = count_hint % (deltas.len() - offset + 1);
+            let mut available = std::collections::BTreeMap::<u32, usize>::new();
+            let mut position = position_offset;
+            for delta in &deltas[offset..offset + count] {
+                position += delta;
+                *available.entry(position).or_default() += 1;
+            }
+            let mut expected = Vec::new();
+            for &candidate in &candidates {
+                if let Some(count) = available.get_mut(&candidate) {
+                    if *count > 0 {
+                        expected.push(candidate);
+                        *count -= 1;
+                    }
+                }
+            }
+            let data = create_positions_data(&deltas).unwrap();
+            let mut reader = PositionReader::open(data).unwrap();
+            for stop_at_first in [false, true, false] {
+                let mut actual = candidates.clone();
+                let matches = reader.intersect_positions_with_offset(
+                    offset as u64, count, position_offset, &mut actual, stop_at_first,
+                );
+                let expected = if stop_at_first { &expected[..expected.len().min(1)] } else { &expected };
+                prop_assert_eq!(matches, expected.len());
+                prop_assert_eq!(actual.as_slice(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn test_streamed_positions_stop_reading() -> crate::Result<()> {
+        let data = create_positions_data(&vec![1; 4_097])?;
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let file = FileSlice::new(Arc::new(BlockBackedFile {
+            data: data.as_slice().to_vec(),
+            reads: reads.clone(),
+            block_len: 17,
+        }));
+        let mut reader = PositionReader::open_file_slice(file)?;
+        let mut candidates = vec![1, 4_096];
+        assert_eq!(
+            reader.intersect_positions_with_offset(0, 4_097, 0, &mut candidates, true),
+            1
+        );
+        assert_eq!(candidates, [1]);
+        let early_bytes: usize = reads.lock().unwrap().iter().map(Range::len).sum();
+        for (offset, count, target) in [
+            (2_000, 1_000, 257),
+            (127, 270, 129),
+            (4_096, 1, 1),
+            (0, 4_097, 4_097),
+        ] {
+            let mut candidates = vec![target];
+            assert_eq!(
+                reader.intersect_positions_with_offset(offset, count, 0, &mut candidates, false),
+                1
+            );
+            assert_eq!(candidates, [target]);
+        }
+        assert!(early_bytes < data.len());
+        Ok(())
+    }
+
     #[test]
     fn test_position_block_prefix_sums_wrap() -> crate::Result<()> {
         let deltas: Vec<_> = [u32::MAX - 7, 0, 4, 5, 7, 11]
@@ -190,6 +265,12 @@ pub(crate) mod tests {
             let mut actual = Vec::new();
             reader.append_positions_with_offset(offset as u64, 3, 2, &mut actual);
             assert_eq!(actual, expected);
+            let mut candidates = expected.clone();
+            assert_eq!(
+                reader.intersect_positions_with_offset(offset as u64, 3, 2, &mut candidates, false),
+                3
+            );
+            assert_eq!(candidates, expected);
         }
         Ok(())
     }

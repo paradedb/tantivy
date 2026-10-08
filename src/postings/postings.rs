@@ -31,6 +31,18 @@ pub trait Postings: DocSet + 'static {
     /// Data will be appended to the output.
     fn append_positions_with_offset(&mut self, offset: u32, output: &mut Vec<u32>);
 
+    /// Intersects sorted, offset-adjusted candidates with this document's positions.
+    /// Returns the number retained, optionally stopping at the first match.
+    /// `None` means unsupported and leaves candidates unchanged.
+    fn intersect_positions_with_offset(
+        &mut self,
+        _offset: u32,
+        _candidates: &mut Vec<u32>,
+        _stop_at_first: bool,
+    ) -> Option<usize> {
+        None
+    }
+
     /// Returns the positions of the term in the given document.
     /// The output vector will be resized to the `term_freq`.
     fn positions(&mut self, output: &mut Vec<u32>) {
