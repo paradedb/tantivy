@@ -53,7 +53,7 @@ struct AssignedVector {
 /// Per-field IVF build counters and timings, reported on `paradedb::ivf_build`.
 #[derive(Default)]
 struct IvfBuildTimings {
-    /// Source vector lookups, including lookups for documents without a vector.
+    /// Source vector reads across the training, assign, and encode passes.
     source_reads: usize,
     spill_bytes: usize,
     pad_bytes: usize,
@@ -253,10 +253,7 @@ pub(crate) fn merge_ivf(
 
         match opts.dtype() {
             VectorDType::F32 => {
-                let mut timings = IvfBuildTimings {
-                    source_reads: vector_count,
-                    ..Default::default()
-                };
+                let mut timings = IvfBuildTimings::default();
                 let mut training_values = Vec::with_capacity(training_sample_size * opts.dim());
                 let mut training_doc_ids = Vec::with_capacity(training_sample_size);
                 let mut target_doc_id: DocId = 0;
@@ -264,12 +261,12 @@ pub(crate) fn merge_ivf(
                 let mut sampled_count = 0usize;
                 for source in &source_rows {
                     if let Some(source) = *source {
-                        timings.source_reads += 1;
-                        let bytes = field_readers[source.segment_ord as usize]
-                            .vector_bytes_for_row(source.row_id)?;
                         let should_sample = sampled_count < training_sample_size
                             && present_vector_ord % training_sample_interval == 0;
                         if should_sample {
+                            timings.source_reads += 1;
+                            let bytes = field_readers[source.segment_ord as usize]
+                                .vector_bytes_for_row(source.row_id)?;
                             training_doc_ids.push(target_doc_id);
                             decode_row_append::<f32>(&bytes, opts.dim(), &mut training_values)?;
                             sampled_count += 1;
