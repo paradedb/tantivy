@@ -146,8 +146,13 @@ pub(crate) mod tests {
         let index = create_index(&texts)?;
         let field = index.schema().get_field("text")?;
         let searcher = index.reader()?.searcher();
-        for words in [vec!["a", "b"], vec!["a", "b", "c", "x", "a", "b"]] {
-            for gap in [1, 3] {
+        for words in [
+            vec!["a", "b"],
+            vec!["a", "a"],
+            vec!["a", "b", "a"],
+            vec!["a", "b", "c", "x", "a", "b"],
+        ] {
+            for gap in [0, 1, 3] {
                 let query = PhraseQuery::new_with_offset(
                     words
                         .iter()

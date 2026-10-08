@@ -13,6 +13,7 @@ use crate::{DocId, Score};
 struct PostingsWithOffset<TPostings> {
     offset: u32,
     postings: TPostings,
+    original_ord: usize,
 }
 
 impl<TPostings: Postings> PostingsWithOffset<TPostings> {
@@ -20,6 +21,7 @@ impl<TPostings: Postings> PostingsWithOffset<TPostings> {
         PostingsWithOffset {
             offset,
             postings: segment_postings,
+            original_ord: 0,
         }
     }
 
@@ -50,6 +52,7 @@ pub struct PhraseScorer<TPostings: Postings> {
     intersection_docset: Intersection<PostingsWithOffset<TPostings>, PostingsWithOffset<TPostings>>,
     num_terms: usize,
     pub(super) stream_positions: bool,
+    term_frequency_requirements: Vec<(usize, u32)>,
     left_positions: Vec<u32>,
     right_positions: Vec<u32>,
     phrase_count: u32,
@@ -403,8 +406,11 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         let num_docsets = term_postings_with_offset.len();
         let postings_with_offsets = term_postings_with_offset
             .into_iter()
-            .map(|(offset, postings)| {
-                PostingsWithOffset::new(postings, (max_offset - offset) as u32)
+            .enumerate()
+            .map(|(ord, (offset, postings))| {
+                let mut postings = PostingsWithOffset::new(postings, (max_offset - offset) as u32);
+                postings.original_ord = ord;
+                postings
             })
             .collect::<Vec<_>>();
         let intersection_docset = Intersection::new_unpositioned(postings_with_offsets, num_docs);
@@ -412,6 +418,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             intersection_docset,
             num_terms: num_docsets,
             stream_positions: false,
+            term_frequency_requirements: Vec::new(),
             left_positions: Vec::with_capacity(100),
             right_positions: Vec::with_capacity(100),
             phrase_count: 0u32,
@@ -424,6 +431,19 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             slops_buffer: Vec::with_capacity(100),
             positions_buffer: Vec::with_capacity(100),
         }
+    }
+
+    pub(super) fn set_term_frequency_requirements(&mut self, requirements: &[u32]) {
+        self.term_frequency_requirements = (0..self.num_terms)
+            .filter_map(|ord| {
+                let original_ord = self
+                    .intersection_docset
+                    .docset_specialized(ord)
+                    .original_ord;
+                let required = requirements[original_ord];
+                (required > 1).then_some((ord, required))
+            })
+            .collect();
     }
 
     pub fn fieldnorm_id(&self) -> u8 {
@@ -502,6 +522,19 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
 
     fn phrase_exists(&mut self) -> bool {
         if self.stream_positions {
+            if self
+                .term_frequency_requirements
+                .iter()
+                .any(|&(ord, required)| {
+                    self.intersection_docset
+                        .docset_specialized(ord)
+                        .postings
+                        .term_freq()
+                        < required
+                })
+            {
+                return false;
+            }
             self.intersection_docset
                 .docset_mut_specialized(0)
                 .positions(&mut self.left_positions);

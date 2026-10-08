@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use super::phrase_scorer::BlockPruningPhraseScorer;
 use super::PhraseScorer;
 use crate::fieldnorm::FieldNormReader;
@@ -80,6 +82,21 @@ impl PhraseWeight {
             0,
         );
         scorer.stream_positions = self.slop == 0 && self.similarity_weight_opt.is_none();
+        if scorer.stream_positions {
+            let mut occurrences: HashMap<&Term, (usize, HashSet<usize>)> = HashMap::new();
+            for (ord, (offset, term)) in self.phrase_terms.iter().enumerate() {
+                occurrences
+                    .entry(term)
+                    .or_insert_with(|| (ord, HashSet::new()))
+                    .1
+                    .insert(*offset);
+            }
+            let mut requirements = vec![1; self.phrase_terms.len()];
+            for (ord, offsets) in occurrences.values() {
+                requirements[*ord] = offsets.len() as u32;
+            }
+            scorer.set_term_frequency_requirements(&requirements);
+        }
         Ok(Some(scorer))
     }
 
