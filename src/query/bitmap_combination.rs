@@ -15,29 +15,6 @@
 //! - Sparse + sparse: both children could fill masks from their document IDs, but Boolean query
 //!   selection normally keeps these queries on ordinary postings scorers. This scorer is chosen
 //!   when at least one child can supply a bitmap.
-//!
-//! As a small example, write the set bits as document IDs: A = {1, 2, 4} and
-//! B = {2, 3}. A OR B produces {1, 2, 3, 4}; A AND B produces {2}; A NOT B
-//! produces {1, 4}. Exclusion starts with the first child's mask and clears bits
-//! found in any of the remaining children. Children can also be nested queries
-//! or filters; they use the same window interface.
-//!
-//! A union skips children whose next match is beyond this window and removes
-//! exhausted children after including their last bits. An intersection tries
-//! children with lower estimated cost first, breaking ties by estimated match
-//! count. Intersections and exclusions stop filling a window once no bits remain.
-//! The children's next document IDs tell us which window to visit next.
-//!
-//! Query selection can still choose ordinary, candidate-driven evaluation. For
-//! example, a very rare term AND a dense term can probe the dense bitmap only at
-//! the rare term's document IDs. Likewise, `selective -"of the"` keeps
-//! candidate-driven phrase evaluation to avoid scanning phrase matches throughout
-//! every window.
-//!
-//! The result supports both ordinary document iteration and passing a whole mask
-//! to another bitmap-aware scorer or collector. The optimized collection path is
-//! currently used for counts; these masks describe matches, with document
-//! visibility checks handled downstream.
 
 use common::TinySet;
 

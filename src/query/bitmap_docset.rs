@@ -1,36 +1,9 @@
-//! Reads the optional on-disk bitmap for one term. Dense terms can have this
-//! extra representation alongside their ordinary postings, which remain available
-//! for scoring and positions. Sparse terms normally use ordinary postings alone;
-//! the indexing code decides which terms get a bitmap.
+//! Reads the on-disk bitmap for one dense term. Each set bit identifies a document
+//! containing that term. It supports individual document probes and reading
+//! 1,024-document masks for bitmap combinations and count collection.
 //!
-//! A term's bitmap has one bit for each possible document ID in the segment,
-//! stored in little-endian 64-bit words. A set bit means that document contains
-//! the term. For example, document 65 is bit 1 of word 1. The caller supplies the
-//! bitmap offset from the term dictionary, and `open` uses it to select the term's
-//! bytes from `.bmap`. The bitmap is read through a buffer as needed.
-//!
-//! There are two useful ways to read it:
-//!
-//! - Window reads: `fill_bitset_block` adds the unconsumed matches in `[base, base + 1024)` to the
-//!   caller's mask. For an aligned window, that is sixteen bitmap words (128 bytes). At base 1024,
-//!   document 1027 becomes bit 3 of the first output word. We copy and combine words without
-//!   turning each set bit into a document ID, then move to the next match beyond the window.
-//!   `BitmapCombination` uses these masks for dense/dense and sparse/dense queries.
-//! - Individual probes: `seek_danger` checks the bit for a candidate document. For example, if a
-//!   sparse term matches documents 65 and 900, an intersection can test those two bits in a dense
-//!   term's bitmap. On an unset bit, it returns a lower bound of `candidate + 1` without searching
-//!   for the next set bit.
-//!
-//! Ordinary `seek` and `advance` do find the next matching document. They scan
-//! buffered words, stopping at the first set bit. After scanning 8 KiB without a
-//! match, they lazily open the term's ordinary postings and use their existing
-//! seek support to jump over the empty region. Opening the bitmap uses the same
-//! search, so a first match at document 90 million is reached with a bounded
-//! bitmap scan followed by a postings seek. This also handles internal gaps and
-//! empty tails. The postings reader is only opened if this fallback is needed.
-//!
-//! These bits describe index matches. Live-document and MVCC visibility checks
-//! are handled downstream.
+//! Ordinary postings remain available for scoring and positions, and are opened
+//! lazily here to seek across long empty regions of the bitmap.
 
 use std::io;
 
