@@ -1,7 +1,11 @@
 use crate::docset::DocSet;
+use crate::fastfield::AliveBitSet;
 use crate::fieldnorm::FieldNormReader;
 use crate::index::SegmentId;
-use crate::postings::{BlockSegmentPostings, FreqReadingOption, Postings, SegmentPostings};
+use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
+use crate::postings::{
+    BlockInfo, BlockSegmentPostings, FreqReadingOption, Postings, SegmentPostings,
+};
 use crate::query::bm25::Bm25Weight;
 use crate::query::{Explanation, Scorer};
 use crate::schema::Field;
@@ -137,6 +141,67 @@ impl TermScorer {
 
     pub fn last_doc_in_block(&self) -> DocId {
         self.postings.block_cursor.skip_reader().last_doc_in_block()
+    }
+
+    /// Number of postings in the term's list, deleted docs included.
+    pub(crate) fn doc_freq(&self) -> u32 {
+        self.postings.block_cursor.doc_freq()
+    }
+
+    /// Whether `count_alive` counts block by block over the skip list for a posting list of
+    /// `doc_freq` docs in a segment of `max_doc` docs.
+    ///
+    /// The block loop reads one skip entry per block and the alive-bitset words, i.e. at least
+    /// `blocks + max_doc / 64` items, and never decodes a block the drain would not decode. Above
+    /// that floor it is never slower than the drain; below it (rare terms, e.g. 100 docs in a
+    /// 1M-doc segment) reading the alive words costs more than draining the whole list.
+    pub(crate) fn count_alive_uses_block_loop(doc_freq: u32, max_doc: u32) -> bool {
+        let blocks = doc_freq.div_ceil(COMPRESSION_BLOCK_SIZE as u32);
+        let loop_floor = u64::from(blocks) + u64::from(max_doc / 64);
+        loop_floor < u64::from(doc_freq)
+    }
+
+    /// Number of postings whose doc is alive in `alive_bitset`.
+    ///
+    /// When `count_alive_uses_block_loop` holds, sums over the posting list's blocks:
+    /// `block_len` if the block's doc-id range `[last_doc_in_previous_block + 1,
+    /// last_doc_in_block]` (starting at 0 for the first block) holds no deleted doc, otherwise
+    /// `block_len` minus the docs of the decoded block that are not alive. Otherwise drains the
+    /// postings and tests each doc.
+    ///
+    /// Like `DocSet::count`, this consumes the scorer: its position is unspecified afterwards.
+    pub(crate) fn count_alive(&mut self, alive_bitset: &AliveBitSet) -> u32 {
+        let bitset = alive_bitset.bitset();
+        if !Self::count_alive_uses_block_loop(self.doc_freq(), bitset.max_value()) {
+            return DocSet::count(self, alive_bitset);
+        }
+        let block_cursor = &mut self.postings.block_cursor;
+        let mut skip_reader = block_cursor.skip_reader().clone();
+        let mut range_start: DocId = 0;
+        let mut live = 0u32;
+        while skip_reader.has_remaining_docs() {
+            let range_end = skip_reader.last_doc_in_block();
+            let block_len = match skip_reader.block_info() {
+                BlockInfo::BitPacked { .. } => COMPRESSION_BLOCK_SIZE as u32,
+                BlockInfo::VInt { num_docs } => num_docs,
+            };
+            if bitset.has_absent_in(range_start, range_end) {
+                block_cursor.seek_block(range_start);
+                block_cursor.load_block();
+                let docs = block_cursor.docs();
+                debug_assert_eq!(docs.len(), block_len as usize);
+                let mut deleted = 0u32;
+                for &doc in docs {
+                    deleted += u32::from(!alive_bitset.is_alive(doc));
+                }
+                live += block_len - deleted;
+            } else {
+                live += block_len;
+            }
+            skip_reader.advance();
+            range_start = skip_reader.last_doc_in_previous_block + 1;
+        }
+        live
     }
 
     /// Returns a mutable reference to the underlying block cursor.

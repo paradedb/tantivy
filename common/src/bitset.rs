@@ -419,6 +419,35 @@ impl ReadOnlyBitSet {
         b & (1u8 << shift) != 0
     }
 
+    /// Returns true iff some position in `[start, end_inclusive]` below `max_value` is not in the
+    /// set.
+    ///
+    /// Reads only the words covering the range; the partial words at both ends are masked, and
+    /// padding bits at or above `max_value` are never treated as absent.
+    pub fn has_absent_in(&self, start: u32, end_inclusive: u32) -> bool {
+        let Some(last_position) = self.max_value.checked_sub(1) else {
+            return false;
+        };
+        let end = end_inclusive.min(last_position);
+        if start > end {
+            return false;
+        }
+        let first_word = (start / 64) as usize;
+        let last_word = (end / 64) as usize;
+        let words = &self.data.as_chunks::<8>().0[first_word..=last_word];
+        let word = |chunk: &[u8; 8]| u64::from_le_bytes(*chunk);
+        let low_mask = u64::MAX << (start % 64);
+        let high_mask = u64::MAX >> (63 - end % 64);
+        if let [only] = words {
+            return !word(only) & low_mask & high_mask != 0;
+        }
+        let (first, rest) = words.split_first().expect("range covers at least one word");
+        let (last, middle) = rest.split_last().expect("range covers at least two words");
+        !word(first) & low_mask != 0
+            || middle.iter().any(|chunk| word(chunk) != u64::MAX)
+            || !word(last) & high_mask != 0
+    }
+
     /// Maximum value the bitset may contain.
     /// (Note this is not the maximum value contained in the set.)
     ///
@@ -723,6 +752,101 @@ mod tests {
 
     pub fn sample(n: u32, ratio: f64) -> Vec<u32> {
         sample_with_seed(n, ratio, 4)
+    }
+
+    fn has_absent_in_naive(bitset: &ReadOnlyBitSet, start: u32, end_inclusive: u32) -> bool {
+        (start..=end_inclusive)
+            .take_while(|&pos| pos < bitset.max_value())
+            .any(|pos| !bitset.contains(pos))
+    }
+
+    fn read_only_without(max_value: u32, absent: &[u32]) -> ReadOnlyBitSet {
+        let mut bitset = BitSet::with_max_value_and_full(max_value);
+        for &pos in absent {
+            bitset.remove(pos);
+        }
+        ReadOnlyBitSet::from(&bitset)
+    }
+
+    #[test]
+    fn test_has_absent_in_full_ignores_padding() {
+        for max_value in [1, 63, 64, 65, 127, 128, 130] {
+            let bitset = read_only_without(max_value, &[]);
+            assert!(!bitset.has_absent_in(0, max_value - 1));
+            assert!(!bitset.has_absent_in(0, u32::MAX));
+            assert!(!bitset.has_absent_in(max_value - 1, max_value + 200));
+            assert!(!bitset.has_absent_in(max_value, max_value + 200));
+        }
+    }
+
+    #[test]
+    fn test_has_absent_in_empty_capacity() {
+        let bitset = read_only_without(0, &[]);
+        assert!(!bitset.has_absent_in(0, 0));
+        assert!(!bitset.has_absent_in(0, u32::MAX));
+    }
+
+    #[test]
+    fn test_has_absent_in_single_word() {
+        let bitset = read_only_without(200, &[70]);
+        assert!(bitset.has_absent_in(70, 70));
+        assert!(bitset.has_absent_in(65, 75));
+        assert!(bitset.has_absent_in(64, 127));
+        assert!(!bitset.has_absent_in(65, 69));
+        assert!(!bitset.has_absent_in(71, 127));
+        assert!(!bitset.has_absent_in(64, 64));
+    }
+
+    #[test]
+    fn test_has_absent_in_mid_word_ends() {
+        let bitset = read_only_without(1_000, &[5, 130, 700]);
+        assert!(!bitset.has_absent_in(6, 129));
+        assert!(bitset.has_absent_in(6, 130));
+        assert!(bitset.has_absent_in(5, 129));
+        assert!(!bitset.has_absent_in(131, 699));
+        assert!(bitset.has_absent_in(131, 700));
+        assert!(!bitset.has_absent_in(701, 999));
+        assert!(bitset.has_absent_in(3, 400));
+    }
+
+    #[test]
+    fn test_has_absent_in_middle_word() {
+        let bitset = read_only_without(1_000, &[300]);
+        assert!(bitset.has_absent_in(10, 900));
+        assert!(!bitset.has_absent_in(10, 299));
+        assert!(!bitset.has_absent_in(301, 900));
+    }
+
+    #[test]
+    fn test_has_absent_in_touching_max_value() {
+        let bitset = read_only_without(130, &[129]);
+        assert!(bitset.has_absent_in(129, 129));
+        assert!(bitset.has_absent_in(128, 1_000));
+        assert!(bitset.has_absent_in(0, u32::MAX));
+        assert!(!bitset.has_absent_in(0, 128));
+        assert!(!bitset.has_absent_in(130, 1_000));
+    }
+
+    #[test]
+    fn test_has_absent_in_matches_naive() {
+        for (max_value, ratio, seed) in [
+            (1u32, 0.5, 1u8),
+            (64, 0.05, 2),
+            (190, 0.02, 3),
+            (513, 0.01, 4),
+        ] {
+            let absent = sample_with_seed(max_value, ratio, seed);
+            let bitset = read_only_without(max_value, &absent);
+            for start in 0..max_value + 3 {
+                for end_inclusive in start..max_value + 3 {
+                    assert_eq!(
+                        bitset.has_absent_in(start, end_inclusive),
+                        has_absent_in_naive(&bitset, start, end_inclusive),
+                        "max_value={max_value} start={start} end_inclusive={end_inclusive}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

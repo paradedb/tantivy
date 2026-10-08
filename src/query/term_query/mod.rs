@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod count_alive_tests;
 mod term_query;
 mod term_scorer;
 mod term_weight;

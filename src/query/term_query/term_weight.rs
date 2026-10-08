@@ -76,7 +76,13 @@ impl Weight for TermWeight {
 
     fn count(&self, reader: &SegmentReader) -> crate::Result<u32> {
         if let Some(alive_bitset) = reader.alive_bitset() {
-            Ok(self.scorer(reader, 1.0)?.count(alive_bitset))
+            Ok(match self.specialized_scorer(reader, 1.0)? {
+                TermOrEmptyOrAllScorer::TermScorer(mut term_scorer) => {
+                    term_scorer.count_alive(alive_bitset)
+                }
+                TermOrEmptyOrAllScorer::Empty => 0,
+                TermOrEmptyOrAllScorer::AllMatch(mut all_scorer) => all_scorer.count(alive_bitset),
+            })
         } else {
             let field = self.term.field();
             let inv_index = reader.inverted_index(field)?;
