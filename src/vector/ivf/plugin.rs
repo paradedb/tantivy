@@ -12,6 +12,7 @@ use cascade::{
     encode_batch_in_place_with_workspace, BatchEncodeWorkspace, PreparedCentroidWorkspace,
     QueryRotationPlan,
 };
+use itertools::Itertools;
 #[cfg(test)]
 use quant_model::Grid;
 
@@ -383,11 +384,11 @@ pub(crate) fn merge_ivf(
                     // Assignment is per vector, so batches can follow source storage order;
                     // `assigned_vectors` is re-sorted by (cluster, target doc) below.
                     let mut assign_sources: Vec<(RowAddress, DocId)> = source_rows
-                        .iter()
+                        .into_iter()
                         .enumerate()
                         .filter_map(|(doc_id, row)| row.map(|row| (row, doc_id as DocId)))
+                        .sorted()
                         .collect();
-                    assign_sources.sort_unstable();
 
                     let batch_capacity = settings.assign_batch_size.min(assign_sources.len());
                     let mut batch_values = Vec::with_capacity(batch_capacity * dim);
