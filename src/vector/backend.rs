@@ -134,6 +134,21 @@ impl<T: VectorElement> VectorBackend<T> {
         Ok(())
     }
 
+    fn prepare_row_gate<'a>(
+        &'a self,
+        weight: &dyn Weight,
+        reader: &'a SegmentReader,
+        gate: &mut Option<RowGate<'a>>,
+        stats: &mut ProbeStats,
+    ) -> crate::Result<()> {
+        if gate.is_none() {
+            let (filter, elapsed) = self.segment_filter(weight, reader)?;
+            stats.non_vector_search_ns += elapsed;
+            *gate = Some(RowGate::new(filter, reader.alive_bitset()));
+        }
+        Ok(())
+    }
+
     pub(crate) fn add_scan_init_ns(&mut self, elapsed_ns: u64) {
         self.scan_init_ns = self.scan_init_ns.saturating_add(elapsed_ns);
     }
@@ -2063,28 +2078,47 @@ impl QuantizedScanCtx {
 /// How a cluster row is tested before scoring: the filter's matches
 /// intersected with the alive docs.
 enum RowGate<'a> {
+    Empty,
     Open,
     AliveOnly(&'a AliveBitSet),
-    FilterOnly(&'a BitSet),
+    FilterOnly(Cow<'a, BitSet>),
     FilterAndAlive {
-        filter: &'a BitSet,
+        filter: Cow<'a, BitSet>,
         filter_and_alive: BitSet,
     },
 }
 
 impl<'a> RowGate<'a> {
-    fn new(filter: &'a SegmentFilter, alive: Option<&'a AliveBitSet>) -> Self {
-        match (filter.docs(), alive) {
+    fn new(filter: Cow<'a, SegmentFilter>, alive: Option<&'a AliveBitSet>) -> Self {
+        if filter.is_empty() {
+            return RowGate::Empty;
+        }
+        let docs = match filter {
+            Cow::Owned(SegmentFilter::All) | Cow::Borrowed(SegmentFilter::All) => None,
+            Cow::Owned(SegmentFilter::Docs(docs)) => Some(Cow::Owned(docs)),
+            Cow::Borrowed(SegmentFilter::Docs(docs)) => Some(Cow::Borrowed(docs)),
+        };
+        match (docs, alive) {
             (None, None) => RowGate::Open,
             (None, Some(alive)) => RowGate::AliveOnly(alive),
             (Some(filter), None) => RowGate::FilterOnly(filter),
             (Some(filter), Some(alive)) => {
-                let mut filter_and_alive = filter.clone();
+                let mut filter_and_alive = filter.as_ref().clone();
                 filter_and_alive.intersect_update(alive.bitset());
                 RowGate::FilterAndAlive {
                     filter,
                     filter_and_alive,
                 }
+            }
+        }
+    }
+
+    fn match_fraction(&self, max_doc: DocId) -> f64 {
+        match self {
+            Self::Empty => 0.0,
+            Self::Open | Self::AliveOnly(_) => 1.0,
+            Self::FilterOnly(filter) | Self::FilterAndAlive { filter, .. } => {
+                filter.len() as f64 / f64::from(max_doc.max(1))
             }
         }
     }
@@ -2105,6 +2139,7 @@ fn select_cluster_rows<'a>(
     offsets.clear();
     let visited = rows.len();
     let (pruned_filter, pruned_dead) = match gate {
+        RowGate::Empty => return (Selection::None, visited, visited, 0),
         RowGate::Open => {
             return (Selection::All, visited, 0, 0);
         }
@@ -2223,19 +2258,19 @@ impl<T: VectorElement> VectorBackend<T> {
         let init_start = Instant::now();
         let init_stage = enter_vector_stage(Stage::ScanInit);
         let max_doc = segment_reader.max_doc();
-        let (filter, non_vector_search_ns) = self.segment_filter(weight, segment_reader)?;
-        let alive = segment_reader.alive_bitset();
-        stats.non_vector_search_ns = stats
-            .non_vector_search_ns
-            .saturating_add(non_vector_search_ns);
-        if filter.is_empty() {
+        let mut row_gate = None;
+        let filter_before_init = stats.non_vector_search_ns;
+        if index.router() == super::RouterKind::Stacked {
+            self.prepare_row_gate(weight, segment_reader, &mut row_gate, stats)?;
+        }
+        let non_vector_search_ns = stats.non_vector_search_ns - filter_before_init;
+        if matches!(row_gate, Some(RowGate::Empty)) {
             drop(init_stage);
             stats.scan_init_ns = stats.scan_init_ns.saturating_add(
                 (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
             );
             return Ok(Vec::new());
         }
-        let row_gate = RowGate::new(&filter, alive);
         let mut cluster_docs = Vec::new();
         let scan_levels = query.active_layers();
         stats.segment_rows = Some(index.num_rows());
@@ -2270,7 +2305,9 @@ impl<T: VectorElement> VectorBackend<T> {
             k: self.adaptive.router_k(
                 work_budget,
                 x,
-                filter.match_fraction(max_doc),
+                row_gate
+                    .as_ref()
+                    .map_or(1.0, |gate| gate.match_fraction(max_doc)),
                 index.num_clusters(),
             ),
             recall: self.adaptive.router_recall_target,
@@ -2291,6 +2328,7 @@ impl<T: VectorElement> VectorBackend<T> {
         };
         let mut routing_ns = routing_start.elapsed().as_nanos() as u64;
         let routing_before_scan = routing_ns;
+        let filter_before_scan = stats.non_vector_search_ns;
         let scan_start = Instant::now();
         let layer0_stage = enter_vector_stage(Stage::LayerScan(0));
 
@@ -2317,6 +2355,14 @@ impl<T: VectorElement> VectorBackend<T> {
                 .running_pessimistic_kth(top_n, QUANTIZED_BOUNDARY_KAPPA)
                 .map(|score| score.0 .0);
             let aps_kth = scorer.scan.running_estimate_kth(top_n);
+            let rows = index.cluster_range(cluster);
+            if rows.is_empty() {
+                controller.charge_open();
+                postings_skipped += 1;
+                stats.clusters_skipped_empty += 1;
+                controller.cover(aps_kth)?;
+                continue;
+            }
             let query_bound = kth.map_or(QueryBound::Filling, |score| QueryBound::Armed {
                 t: to_bound_space(metric, score),
             });
@@ -2353,13 +2399,10 @@ impl<T: VectorElement> VectorBackend<T> {
                 continue;
             }
             controller.charge_open();
-            let rows = index.cluster_range(cluster);
-            // Empty clusters have no band to read and use the probe's empty-cluster counter.
-            if rows.is_empty() {
-                postings_skipped += 1;
-                stats.clusters_skipped_empty += 1;
-                controller.cover(aps_kth)?;
-                continue;
+            self.prepare_row_gate(weight, segment_reader, &mut row_gate, stats)?;
+            let row_gate = row_gate.as_ref().unwrap();
+            if matches!(row_gate, RowGate::Empty) {
+                break;
             }
             if !matches!(row_gate, RowGate::Open) {
                 self.reader.read_doc_ids(cluster, &mut cluster_docs)?;
@@ -2370,7 +2413,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 select_cluster_rows(
                     &cluster_docs,
                     rows.clone(),
-                    &row_gate,
+                    row_gate,
                     &mut selection_offsets,
                 )
             };
@@ -2424,7 +2467,9 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.record_layer_scan(
             0,
             layer0_scored,
-            scan_ns.saturating_sub(routing_ns.saturating_sub(routing_before_scan)),
+            scan_ns
+                .saturating_sub(routing_ns.saturating_sub(routing_before_scan))
+                .saturating_sub(stats.non_vector_search_ns - filter_before_scan),
         );
 
         #[cfg(test)]
@@ -2520,19 +2565,19 @@ impl<T: VectorElement> VectorBackend<T> {
             return Ok(Vec::new());
         }
 
-        let (filter, non_vector_search_ns) = self.segment_filter(weight, segment_reader)?;
-        stats.non_vector_search_ns = stats
-            .non_vector_search_ns
-            .saturating_add(non_vector_search_ns);
-        if filter.is_empty() {
+        let mut row_gate = None;
+        let filter_before_init = stats.non_vector_search_ns;
+        if index.router() == super::RouterKind::Stacked {
+            self.prepare_row_gate(weight, segment_reader, &mut row_gate, stats)?;
+        }
+        let non_vector_search_ns = stats.non_vector_search_ns - filter_before_init;
+        if matches!(row_gate, Some(RowGate::Empty)) {
             drop(init_stage);
             stats.scan_init_ns = stats.scan_init_ns.saturating_add(
                 (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
             );
             return Ok(Vec::new());
         }
-        let alive = segment_reader.alive_bitset();
-
         let num_centroids = index.num_clusters();
         if num_centroids == 0 || index.num_docs() == 0 {
             drop(init_stage);
@@ -2578,7 +2623,9 @@ impl<T: VectorElement> VectorBackend<T> {
             k: self.adaptive.router_k(
                 work_budget,
                 x,
-                filter.match_fraction(max_doc),
+                row_gate
+                    .as_ref()
+                    .map_or(1.0, |gate| gate.match_fraction(max_doc)),
                 num_centroids,
             ),
             recall: self.adaptive.router_recall_target,
@@ -2599,6 +2646,7 @@ impl<T: VectorElement> VectorBackend<T> {
         };
         let mut routing_ns = routing_start.elapsed().as_nanos() as u64;
         let routing_before_scan = routing_ns;
+        let filter_before_scan = stats.non_vector_search_ns;
 
         let scan_start = Instant::now();
         let exact_scan_stage = enter_vector_stage(Stage::ExactScan);
@@ -2606,7 +2654,9 @@ impl<T: VectorElement> VectorBackend<T> {
             index,
             &mut ranked,
             controller,
-            &RowGate::new(&filter, alive),
+            row_gate,
+            weight,
+            segment_reader,
             top_n,
             tie_break,
             tie_comparator,
@@ -2621,6 +2671,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 .elapsed()
                 .as_nanos()
                 .saturating_sub(u128::from(routing_ns.saturating_sub(routing_before_scan)))
+                .saturating_sub(u128::from(stats.non_vector_search_ns - filter_before_scan))
                 as u64,
         );
 
@@ -2641,12 +2692,14 @@ impl<T: VectorElement> VectorBackend<T> {
     /// Probes ranked clusters under bounds and work-budget gates, filtering before payload reads.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
-    fn scan_clusters<K, CTail>(
-        &self,
+    fn scan_clusters<'a, K, CTail>(
+        &'a self,
         index: &IvfIndex,
         ranked: &mut impl Iterator<Item = Candidate>,
         mut controller: ProbeController<'_>,
-        row_gate: &RowGate<'_>,
+        mut row_gate: Option<RowGate<'a>>,
+        weight: &dyn Weight,
+        segment_reader: &'a SegmentReader,
         top_n: usize,
         tie_break: &mut K,
         tie_comparator: CTail,
@@ -2703,6 +2756,14 @@ impl<T: VectorElement> VectorBackend<T> {
                 break;
             }
             let cluster = cluster as usize;
+            let rows = index.cluster_range(cluster);
+            if rows.is_empty() {
+                controller.charge_open();
+                postings_skipped += 1;
+                stats.clusters_skipped_empty += 1;
+                controller.cover(kth)?;
+                continue;
+            }
 
             // P5: the bounds verdict. The bound is consumed only through
             // `Armed` (the heap holds k results) — enforced by the enum;
@@ -2758,12 +2819,10 @@ impl<T: VectorElement> VectorBackend<T> {
             // Event-wise charging, part 1: the open.
             controller.charge_open();
 
-            let rows = index.cluster_range(cluster);
-
-            if rows.is_empty() {
-                postings_skipped += 1;
-                controller.cover(kth)?;
-                continue;
+            self.prepare_row_gate(weight, segment_reader, &mut row_gate, stats)?;
+            let row_gate = row_gate.as_ref().unwrap();
+            if matches!(row_gate, RowGate::Empty) {
+                break;
             }
             let open = matches!(row_gate, RowGate::Open);
             if !open {
@@ -2885,21 +2944,6 @@ impl SegmentFilter {
     fn is_empty(&self) -> bool {
         matches!(self, SegmentFilter::Docs(filter) if filter.len() == 0)
     }
-
-    fn docs(&self) -> Option<&BitSet> {
-        match self {
-            SegmentFilter::All => None,
-            SegmentFilter::Docs(filter) => Some(filter),
-        }
-    }
-
-    /// The share of doc ids below `max_doc` that match.
-    fn match_fraction(&self, max_doc: DocId) -> f64 {
-        match self {
-            SegmentFilter::All => 1.0,
-            SegmentFilter::Docs(filter) => filter.len() as f64 / f64::from(max_doc.max(1)),
-        }
-    }
 }
 
 /// Drain the filter `DocSet` into a dense BitSet for O(1) random membership
@@ -2987,7 +3031,7 @@ mod tests {
             (
                 100..104,
                 vec![4u32, 9, 12, 22],
-                RowGate::FilterOnly(&filter),
+                RowGate::FilterOnly(Cow::Borrowed(&filter)),
             ),
             (200..202, vec![11u32, 13], RowGate::Open),
         ] {

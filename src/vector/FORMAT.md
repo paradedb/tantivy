@@ -53,10 +53,15 @@ are copied into the segment. Bounds and quantized residuals use those exact
 stored centroid coordinates.
 
 Each search ranks shared centroids once and visits each cluster across all active
-segments before deciding whether to probe the next cluster. Segment query/filter
+segments before deciding whether to probe the next cluster. Segment query
 preparation uses the executor; the coordinated probe loop runs on the search
-thread. Cosine routing uses the same normalized query coordinates as quantized
-scoring. Collector reuse and concurrent searches have independent query state.
+thread. Empty segment fragments are skipped before bounds checks. Exact and RNG
+searches build each segment's filter only when a nonempty fragment survives the
+bounds check, then reuse it. Stacked searches prepare filters eagerly through the
+executor because filter selectivity determines the ranking size. Single-segment
+searches use the same filter policy. Cosine routing uses the same normalized query
+coordinates as quantized scoring. Collector reuse and concurrent searches have
+independent query state.
 
 Vector collectors must be used directly. Combining or wrapping them in tuples,
 `Option`, `MultiCollector`, `FilterCollector`, or `BytesFilterCollector` returns

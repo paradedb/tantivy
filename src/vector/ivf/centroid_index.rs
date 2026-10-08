@@ -743,7 +743,7 @@ mod tests {
                                         .iter()
                                         .filter(|stats| stats.routing.is_some())
                                         .count(),
-                                    usize::from(selected != Some(9))
+                                    usize::from(selected != Some(9) || kind != RouterKind::Stacked)
                                 );
                                 if kind == RouterKind::Exact && selected != Some(9) {
                                     assert_eq!(
@@ -1154,6 +1154,175 @@ mod tests {
                 result.stats.iter().map(|s| s.rerank_rows).sum::<usize>(),
                 if exact_winner { 2 } else { 4 }
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn filters_follow_cluster_presence_and_bounds() -> crate::Result<()> {
+        use std::sync::Mutex;
+
+        use crate::collector::Collector;
+        use crate::index::SegmentId;
+        use crate::query::{
+            AllQuery, EnableScoring, Explanation, Query, Scorer, TermQuery, Weight,
+        };
+        use crate::schema::{IndexRecordOption, INDEXED};
+        use crate::vector::ivf::AdaptiveProbeParams;
+        use crate::vector::{
+            TopDocsByVectorSimilarity, VectorQuantizationConfig, VectorQuantizationLayer,
+        };
+        use crate::{DocId, Executor, Score, SegmentReader, Term};
+
+        struct CountingWeight {
+            inner: Box<dyn Weight>,
+            calls: Mutex<HashMap<SegmentId, usize>>,
+            fail: bool,
+        }
+
+        impl Weight for CountingWeight {
+            fn scorer(
+                &self,
+                reader: &SegmentReader,
+                boost: Score,
+            ) -> crate::Result<Box<dyn Scorer>> {
+                *self
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .entry(reader.segment_id())
+                    .or_default() += 1;
+                if self.fail {
+                    return Err(TantivyError::InvalidArgument("filter failed".into()));
+                }
+                self.inner.scorer(reader, boost)
+            }
+
+            fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
+                self.inner.explain(reader, doc)
+            }
+        }
+
+        let parallel = Executor::multi_thread(3, "lazy-filter-test")?;
+        for kind in [RouterKind::Exact, RouterKind::Rng, RouterKind::Stacked] {
+            let mut fixture = Fixture::new(Metric::L2);
+            let options = VectorOptions::new(64, Metric::L2);
+            let mut schema = Schema::builder();
+            schema.add_vector_field("embedding", options.clone());
+            let keep = schema.add_u64_field("keep", INDEXED);
+            fixture.schema = schema.build();
+            let rows = [0.0, 10.0, 100.0, 200.0, 400.0].map(|x| {
+                let mut row = [0.0; 64];
+                row[0] = x;
+                row
+            });
+            fixture.replace_centroids(centroids(&rows));
+            let mut index = fixture.create(kind)?;
+            index.settings_mut().vector_quantization = vec![VectorQuantizationConfig::materialize(
+                "embedding".into(),
+                &options,
+                vec![VectorQuantizationLayer { bits: 1, seed: 17 }],
+            )?];
+            let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            for batch in [&rows[..2], &rows[2..3], &rows[3..4]] {
+                for row in batch {
+                    let mut doc = TantivyDocument::new();
+                    doc.add_vector(fixture.field, row);
+                    doc.add_u64(keep, u64::from(row[0] != 10.0));
+                    writer.add_document(doc)?;
+                }
+                writer.commit()?;
+            }
+            for merged in [false, true] {
+                if merged {
+                    writer.merge(&index.searchable_segment_ids()?).wait()?;
+                }
+                let searcher = index.reader()?.searcher();
+                let segments = searcher.segment_readers().len();
+                for levels in [0, usize::MAX] {
+                    for executor in [&Executor::SingleThread, &parallel] {
+                        for mode in ["bounds", "reuse", "empty_filter", "empty_cluster", "error"] {
+                            let query: Box<dyn Query> = match mode {
+                                "reuse" | "empty_filter" => Box::new(TermQuery::new(
+                                    Term::from_field_u64(keep, if mode == "reuse" { 1 } else { 9 }),
+                                    IndexRecordOption::Basic,
+                                )),
+                                _ => Box::new(AllQuery),
+                            };
+                            let weight = CountingWeight {
+                                inner: query
+                                    .weight(EnableScoring::disabled_from_searcher(&searcher))?,
+                                calls: Mutex::default(),
+                                fail: mode == "error",
+                            };
+                            let empty_cluster = mode == "empty_cluster";
+                            let collector = TopDocsByVectorSimilarity::new(
+                                fixture.field,
+                                rows[if empty_cluster { 4 } else { 0 }].to_vec(),
+                                if mode == "bounds" { 1 } else { 10 },
+                            )
+                            .with_max_scan_levels(levels)
+                            .with_adaptive_params(
+                                AdaptiveProbeParams {
+                                    max_probe_fraction: if empty_cluster { 0.001 } else { 1.0 },
+                                    min_probe_clusters: 0,
+                                    router_recall_target: 1.0,
+                                    ..Default::default()
+                                },
+                            );
+                            let result = collector.collect_global(&weight, &searcher, executor);
+                            if mode == "error" {
+                                assert!(result.unwrap_err().to_string().contains("filter failed"));
+                                continue;
+                            }
+                            let result = result?;
+                            let calls = weight.calls.lock().unwrap();
+                            let expected_calls = if kind == RouterKind::Stacked {
+                                segments
+                            } else {
+                                match mode {
+                                    "bounds" => 1,
+                                    "empty_cluster" => 0,
+                                    _ => segments,
+                                }
+                            };
+                            assert_eq!(
+                                calls.len(),
+                                expected_calls,
+                                "{kind:?} {mode} merged={merged} levels={levels}"
+                            );
+                            assert!(calls.values().all(|&count| count == 1));
+                            assert_eq!(
+                                result.results.len(),
+                                match mode {
+                                    "bounds" => 1,
+                                    "reuse" => 3,
+                                    _ => 0,
+                                }
+                            );
+                            assert_eq!(
+                                result.stats.iter().map(|s| s.bounds_skips).sum::<u32>(),
+                                if mode == "bounds" { 3 } else { 0 }
+                            );
+                            if mode != "empty_filter" {
+                                assert_eq!(
+                                    result
+                                        .stats
+                                        .iter()
+                                        .map(|s| s.postings_skipped)
+                                        .sum::<usize>(),
+                                    if empty_cluster {
+                                        segments
+                                    } else {
+                                        segments * rows.len() - 4 + usize::from(mode == "reuse")
+                                    }
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }

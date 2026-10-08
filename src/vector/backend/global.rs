@@ -121,7 +121,8 @@ impl<S: SortKeyComputer> GlobalTop<S> {
 
 struct SegmentScan<'a, T: VectorElement, S: SortKeyComputer> {
     backend: &'a VectorBackend<T>,
-    gate: RowGate<'a>,
+    reader: &'a SegmentReader,
+    gate: Option<RowGate<'a>>,
     sort: S::Child,
     quantized: Option<QuantizedScorer>,
     stats: ProbeStats,
@@ -161,12 +162,19 @@ impl<T: VectorElement, S: SortKeyComputer> SegmentScan<'_, T, S> {
         candidate: Candidate,
         bound: QueryBound,
         q_norm: f32,
+        weight: &dyn Weight,
         top: &mut GlobalTop<S>,
     ) -> crate::Result<usize> {
         let reader = &self.backend.reader;
         let index = reader.index().expect("IVF segment");
         let metric = reader.options().metric();
         let cluster = candidate.node as usize;
+        let rows = index.cluster_range(cluster);
+        if rows.is_empty() {
+            self.stats.postings_skipped += 1;
+            self.stats.clusters_skipped_empty += 1;
+            return Ok(0);
+        }
         let verdict = bounds_verdict(bound, || {
             let QueryBound::Armed { t } = bound else {
                 return f32::INFINITY;
@@ -183,6 +191,17 @@ impl<T: VectorElement, S: SortKeyComputer> SegmentScan<'_, T, S> {
             self.stats.bounds_skips += 1;
             return Ok(0);
         }
+        self.backend
+            .prepare_row_gate(weight, self.reader, &mut self.gate, &mut self.stats)?;
+        if matches!(self.gate, Some(RowGate::Empty)) {
+            return Ok(0);
+        }
+        if self.quantized.is_none() && self.backend.quantized_query.is_some() {
+            let start = Instant::now();
+            self.quantized = Some(QuantizedScorer::new(self.reader.max_doc(), 0));
+            self.stats.start_layer(0);
+            self.stats.scan_init_ns += start.elapsed().as_nanos() as u64;
+        }
         let start = Instant::now();
         let quantized = self.quantized.is_some();
         let _stage = enter_vector_stage(if quantized {
@@ -190,7 +209,7 @@ impl<T: VectorElement, S: SortKeyComputer> SegmentScan<'_, T, S> {
         } else {
             Stage::ExactScan
         });
-        let count = self.with_io(|segment| segment.probe_rows(candidate, top))?;
+        let count = self.with_io(|segment| segment.probe_rows(candidate, rows, top))?;
         let elapsed = start.elapsed().as_nanos() as u64;
         if quantized {
             self.stats.record_layer_scan(0, count, elapsed);
@@ -200,17 +219,21 @@ impl<T: VectorElement, S: SortKeyComputer> SegmentScan<'_, T, S> {
         Ok(count)
     }
 
-    fn probe_rows(&mut self, candidate: Candidate, top: &mut GlobalTop<S>) -> crate::Result<usize> {
+    fn probe_rows(
+        &mut self,
+        candidate: Candidate,
+        rows: Range<usize>,
+        top: &mut GlobalTop<S>,
+    ) -> crate::Result<usize> {
         let reader = &self.backend.reader;
-        let index = reader.index().expect("IVF segment");
         let cluster = candidate.node as usize;
-        let rows = index.cluster_range(cluster);
-        let open = matches!(self.gate, RowGate::Open);
-        if !open && !rows.is_empty() {
+        let gate = self.gate.as_ref().expect("filter prepared before scanning");
+        let open = matches!(gate, RowGate::Open);
+        if !open {
             reader.read_doc_ids(cluster, &mut self.docs)?;
         }
         let (selection, visited, pruned_filter, pruned_dead) =
-            select_cluster_rows(&self.docs, rows.clone(), &self.gate, &mut self.offsets);
+            select_cluster_rows(&self.docs, rows.clone(), gate, &mut self.offsets);
         self.stats.vectors_visited += visited;
         self.stats.pruned_filter += pruned_filter;
         self.stats.pruned_dead += pruned_dead;
@@ -326,15 +349,9 @@ pub(crate) fn search<T: VectorElement, S: SortKeyComputer>(
             ..Default::default()
         };
         let mut child = sort.segment_sort_key_computer(reader)?;
-        let mut quantized = None;
         if let Some(index) = backend.reader.index() {
             stats.segment_rows = Some(index.num_rows());
             stats.segment_clusters = Some(index.num_clusters());
-            if backend.quantized_query.is_some() && filter.is_some_and(|filter| !filter.is_empty())
-            {
-                quantized = Some(QuantizedScorer::new(reader.max_doc(), 0));
-                stats.start_layer(0);
-            }
             stats.scan_init_ns += start.elapsed().as_nanos() as u64;
         } else {
             let (hits, flat_stats) =
@@ -355,9 +372,10 @@ pub(crate) fn search<T: VectorElement, S: SortKeyComputer>(
         }
         segments.push(SegmentScan {
             backend,
-            gate: RowGate::new(filter.unwrap_or(&SegmentFilter::All), reader.alive_bitset()),
+            reader,
+            gate: filter.map(|filter| RowGate::new(Cow::Borrowed(filter), reader.alive_bitset())),
             sort: child,
-            quantized,
+            quantized: None,
             stats,
             docs: Vec::new(),
             offsets: Vec::new(),
@@ -366,17 +384,15 @@ pub(crate) fn search<T: VectorElement, S: SortKeyComputer>(
             blocks: Vec::new(),
         });
     }
-    let active = |backend: &VectorBackend<T>| {
-        backend
+    let active = |segment: &SegmentScan<'_, T, S>| {
+        segment
+            .backend
             .reader
             .index()
             .is_some_and(|index| index.num_docs() > 0)
-            && backend
-                .filter
-                .as_ref()
-                .is_some_and(|(filter, _)| !filter.is_empty())
+            && !matches!(segment.gate, Some(RowGate::Empty))
     };
-    if backends.iter().any(active) {
+    if segments.iter().any(active) {
         let num_docs: usize = backends
             .iter()
             .filter_map(|backend| backend.reader.index())
@@ -389,18 +405,18 @@ pub(crate) fn search<T: VectorElement, S: SortKeyComputer>(
             open: WorkUnits::new(open),
             row: WorkUnits::new((1.0 - open) / n_avg),
         };
-        let (matched, docs) = backends
+        let (matched, docs) = segments
             .iter()
-            .zip(readers)
-            .filter(|(backend, _)| backend.reader.index().is_some())
-            .fold((0.0, 0u64), |(matched, docs), (backend, reader)| {
-                let fraction = backend
-                    .filter
+            .filter(|segment| segment.backend.reader.index().is_some())
+            .fold((0.0, 0u64), |(matched, docs), segment| {
+                let max_doc = segment.reader.max_doc();
+                let fraction = segment
+                    .gate
                     .as_ref()
-                    .map_or(0.0, |(filter, _)| filter.match_fraction(reader.max_doc()));
+                    .map_or(1.0, |gate| gate.match_fraction(max_doc));
                 (
-                    matched + fraction * f64::from(reader.max_doc()),
-                    docs + u64::from(reader.max_doc()),
+                    matched + fraction * f64::from(max_doc),
+                    docs + u64::from(max_doc),
                 )
             });
         let params = RoutingParams {
@@ -440,8 +456,8 @@ pub(crate) fn search<T: VectorElement, S: SortKeyComputer>(
             controller.charge_open();
             let mut scored = 0;
             for segment in &mut segments {
-                if active(segment.backend) {
-                    let count = segment.probe(candidate, bound, q_norm, &mut top)?;
+                if active(segment) {
+                    let count = segment.probe(candidate, bound, q_norm, weight, &mut top)?;
                     scored += count;
                 }
             }
@@ -453,6 +469,9 @@ pub(crate) fn search<T: VectorElement, S: SortKeyComputer>(
                 controller.cover(top.estimate_kth())?;
             }
             probe += 1;
+            if !segments.iter().any(active) {
+                break;
+            }
         }
         let stats = &mut segments[0].stats;
         controller.finish(stats);

@@ -108,13 +108,19 @@ fn main() -> tantivy::Result<()> {
     let clusters = read_size("VECTOR_BENCH_CLUSTERS", 128);
     let num_queries = read_size("VECTOR_BENCH_QUERIES", 16);
     let rounds = read_size("VECTOR_BENCH_ROUNDS", 8);
+    let sparse = std::env::var_os("VECTOR_BENCH_SPARSE").is_some();
     assert!(dim >= 64 && clusters > 0);
     assert!(docs >= 32 && docs % 32 == 0 && num_queries > 0 && rounds > 0);
     let mut rng = fastrand::Rng::with_seed(0x51_a7_09);
     let centroids: Vec<f32> = (0..clusters * dim).map(|_| rng.f32() * 8.0 - 4.0).collect();
     let vectors: Vec<Vec<f32>> = (0..docs)
         .map(|doc| {
-            centroids[(doc % clusters) * dim..][..dim]
+            let cluster = if sparse {
+                doc * clusters / docs
+            } else {
+                doc % clusters
+            };
+            centroids[cluster * dim..][..dim]
                 .iter()
                 .map(|center| center + (rng.f32() - 0.5) * 0.5)
                 .collect()
@@ -139,7 +145,7 @@ fn main() -> tantivy::Result<()> {
                 VectorQuantizationLayer { bits: 4, seed: 31 },
             ],
         )?;
-        for router in [RouterKind::Exact, RouterKind::Stacked] {
+        for router in [RouterKind::Exact, RouterKind::Rng, RouterKind::Stacked] {
             for quantized in [false, true] {
                 for segments in [1, 8, 32] {
                     let mut schema = Schema::builder();
@@ -238,7 +244,7 @@ fn main() -> tantivy::Result<()> {
                                 serde_json::json!({
                                     "metric": format!("{metric:?}"), "router": router.to_string(),
                                     "quantized": quantized, "segments": segments, "docs": docs, "dim": dim, "clusters": clusters,
-                                    "filtered": filtered, "driver": if driver == 0 { "global" } else { "per_segment" },
+                                    "filtered": filtered, "sparse": sparse, "driver": if driver == 0 { "global" } else { "per_segment" },
                                     "samples": samples[driver].len(),
                                     "median_us": samples[driver][samples[driver].len() / 2],
                                     "p95_us": samples[driver][samples[driver].len() * 95 / 100],

@@ -2,7 +2,7 @@
 //!
 //! Unlike the other `TopDocs::order_by_*` paths, the *primary* sort key here is
 //! not a [`SortKeyComputer`](crate::collector::sort_key::SortKeyComputer). IVF
-//! needs to drain the filter `DocSet` into a bitmap upfront and drive its own
+//! needs to drain the filter `DocSet` into a bitmap and drive its own
 //! cluster iteration, which inverts the per-doc pull model that sort-key
 //! computers assume. [`Collector::collect_global`] coordinates global routing,
 //! probe budgets, and candidate thresholds across segments. Segment scorers
@@ -404,7 +404,9 @@ where
         let backends = executor.map(
             |(ordinal, reader)| {
                 let mut backend = self.segment_backend(ordinal as u32, reader)?;
-                backend.prepare_filter(weight, reader, self.segment_top_n())?;
+                if centroids[&self.field].router() == super::RouterKind::Stacked {
+                    backend.prepare_filter(weight, reader, self.segment_top_n())?;
+                }
                 Ok(backend)
             },
             readers.iter().enumerate(),
