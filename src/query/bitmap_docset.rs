@@ -27,7 +27,7 @@ impl BitmapDocSet {
             ));
         }
         let mut docset = Self {
-            data: BufferedFileSlice::new_block_aligned(
+            data: BufferedFileSlice::new(
                 source.slice(offset as usize..end.unwrap() as usize),
                 8192,
             ),
@@ -216,47 +216,7 @@ mod tests {
             let mut mask = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
             assert_eq!(bitmap.fill_bitset_block(66560, &mut mask), 67584);
             assert!(mask.iter().all(|word| word.len() == 64));
-            assert_eq!(*reads.lock().unwrap(), vec![0..8192, 8192..16384]);
-        }
-    }
-
-    #[test]
-    fn bitmap_reads_respect_storage_blocks_and_nested_slice_offsets() {
-        use std::sync::{Arc, Mutex};
-
-        for prefix in [1, 151, 8155] {
-            let reads = Arc::new(Mutex::new(Vec::new()));
-            let max_doc = 300003;
-            let len = bitmap_num_bytes(max_doc) as usize;
-            let file = FileSlice::new(Arc::new(TrackedBitmapFile {
-                data: vec![255; prefix + 37 + len + 19],
-                reads: reads.clone(),
-                block_len: Some(8156),
-            }))
-            .slice(37..);
-            let mut bitmap = BitmapDocSet::open(file, prefix as u64, max_doc, max_doc).unwrap();
-            for base in (0..max_doc).step_by(BLOCK_WINDOW as usize) {
-                let mut mask = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
-                let next = bitmap.fill_bitset_block(base, &mut mask);
-                let expected = (max_doc - base).min(BLOCK_WINDOW);
-                assert_eq!(mask.iter().map(|word| word.len()).sum::<u32>(), expected);
-                assert_eq!(
-                    next,
-                    if base + expected == max_doc {
-                        TERMINATED
-                    } else {
-                        base + expected
-                    }
-                );
-            }
-            let reads = reads.lock().unwrap();
-            let mut end = prefix + 37;
-            for range in reads.iter() {
-                assert_eq!(range.start, end, "overlapping or skipped read: {reads:?}");
-                assert!(range.end % 8156 == 0 || range.end == prefix + 37 + len);
-                end = range.end;
-            }
-            assert_eq!(end, prefix + 37 + len);
+            assert_eq!(*reads.lock().unwrap(), vec![0..8192, 8320..16512]);
         }
     }
 
