@@ -6,6 +6,7 @@ use common::{HasLen, TinySet};
 use crate::directory::FileSlice;
 use crate::docset::{SeekDangerResult, BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW};
 use crate::postings::term_bitmaps::bitmap_num_bytes;
+use crate::postings::SegmentPostings;
 use crate::{DocId, DocSet, TERMINATED};
 
 /// A buffered, on-disk membership bitmap over segment-local document IDs.
@@ -14,11 +15,20 @@ pub struct BitmapDocSet {
     max_doc: DocId,
     doc_freq: u32,
     doc: DocId,
+    postings: Option<Box<SegmentPostings>>,
+    open_postings: Option<Box<dyn FnOnce() -> io::Result<SegmentPostings> + Send>>,
 }
 
 impl BitmapDocSet {
     /// Opens a term's bitmap, validating the payload bounds.
-    pub fn open(source: FileSlice, offset: u64, max_doc: DocId, doc_freq: u32) -> io::Result<Self> {
+    /// Ordinary postings are opened lazily to navigate long empty regions.
+    pub fn open(
+        source: FileSlice,
+        offset: u64,
+        max_doc: DocId,
+        doc_freq: u32,
+        open_postings: impl FnOnce() -> io::Result<SegmentPostings> + Send + 'static,
+    ) -> io::Result<Self> {
         let end = offset.checked_add(bitmap_num_bytes(max_doc));
         if max_doc > TERMINATED || end.is_none_or(|end| end > source.len() as u64) {
             return Err(io::Error::new(
@@ -34,19 +44,23 @@ impl BitmapDocSet {
             max_doc,
             doc_freq,
             doc: TERMINATED,
+            postings: None,
+            open_postings: Some(Box::new(open_postings)),
         };
         docset.doc = docset.next_doc(0);
         Ok(docset)
     }
 
-    fn next_doc(&self, target: DocId) -> DocId {
+    #[inline]
+    fn next_doc(&mut self, target: DocId) -> DocId {
         if target >= self.max_doc {
             return TERMINATED;
         }
         let mut offset = u64::from(target / 64) * 8;
+        let start_offset = offset;
         let end = bitmap_num_bytes(self.max_doc);
         let mut first_mask = u64::MAX << (target % 64);
-        while offset < end {
+        'scan: while offset < end {
             let bytes = self
                 .data
                 .read_chunk(offset, 8)
@@ -59,9 +73,31 @@ impl BitmapDocSet {
                 }
                 first_mask = u64::MAX;
                 offset += 8;
+                if offset - start_offset >= 8192 {
+                    break 'scan;
+                }
             }
         }
-        TERMINATED
+        if offset == end {
+            return TERMINATED;
+        }
+        // Keep local scans cheap; use the existing postings skips across long empty regions.
+        self.seek_postings((offset * 8) as DocId)
+    }
+
+    #[cold]
+    fn seek_postings(&mut self, target: DocId) -> DocId {
+        let postings = self.postings.get_or_insert_with(|| {
+            Box::new(
+                self.open_postings.take().unwrap()()
+                    .expect("failed to open bitmap navigation postings"),
+            )
+        });
+        if postings.doc() < target {
+            postings.seek(target)
+        } else {
+            postings.doc()
+        }
     }
 }
 
@@ -171,7 +207,15 @@ mod tests {
         for &doc in docs {
             data[doc as usize / 8] |= 1 << (doc % 8);
         }
-        BitmapDocSet::open(FileSlice::from(data), 0, max_doc, docs.len() as u32).unwrap()
+        let docs = docs.to_vec();
+        BitmapDocSet::open(
+            FileSlice::from(data),
+            0,
+            max_doc,
+            docs.len() as u32,
+            move || Ok(SegmentPostings::create_from_docs(&docs)),
+        )
+        .unwrap()
     }
 
     #[derive(Debug)]
@@ -209,7 +253,10 @@ mod tests {
                 reads: reads.clone(),
                 block_len: None,
             }));
-            let mut bitmap = BitmapDocSet::open(file, 0, 262144, 262144).unwrap();
+            let mut bitmap = BitmapDocSet::open(file, 0, 262144, 262144, || {
+                panic!("dense bitmap should not open postings")
+            })
+            .unwrap();
             if probe_first {
                 assert_eq!(bitmap.seek_danger(66560), SeekDangerResult::Found);
             }
@@ -234,7 +281,10 @@ mod tests {
                 block_len: Some(8156),
             }))
             .slice(37..);
-            let mut bitmap = BitmapDocSet::open(file, prefix as u64, max_doc, max_doc).unwrap();
+            let mut bitmap = BitmapDocSet::open(file, prefix as u64, max_doc, max_doc, || {
+                panic!("dense bitmap should not open postings")
+            })
+            .unwrap();
             for base in (0..max_doc).step_by(BLOCK_WINDOW as usize) {
                 let mut mask = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
                 let next = bitmap.fill_bitset_block(base, &mut mask);
@@ -261,6 +311,34 @@ mod tests {
     }
 
     #[test]
+    fn bitmap_navigation_skips_large_empty_prefix_gaps_and_tail() {
+        use std::sync::{Arc, Mutex};
+
+        let max_doc = 100_000_000;
+        let docs = [90_000_000, 90_000_002, 99_000_000];
+        let mut data = vec![0; bitmap_num_bytes(max_doc) as usize];
+        for doc in docs {
+            data[doc as usize / 8] |= 1 << (doc % 8);
+        }
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let file = FileSlice::new(Arc::new(TrackedBitmapFile {
+            data,
+            reads: reads.clone(),
+            block_len: Some(8156),
+        }));
+        let mut bitmap = BitmapDocSet::open(file, 0, max_doc, 3, move || {
+            Ok(SegmentPostings::create_from_docs(&docs))
+        })
+        .unwrap();
+        assert_eq!(bitmap.doc(), docs[0]);
+        assert!(reads.lock().unwrap().iter().map(|r| r.len()).sum::<usize>() <= 16312);
+        assert_eq!(bitmap.advance(), docs[1]);
+        assert_eq!(bitmap.seek(95_000_000), docs[2]);
+        assert_eq!(bitmap.advance(), TERMINATED);
+        assert!(reads.lock().unwrap().iter().map(|r| r.len()).sum::<usize>() < 65536);
+    }
+
+    #[test]
     fn bitmap_empty_gaps_cross_storage_boundaries_without_rereads() {
         use std::sync::{Arc, Mutex};
 
@@ -279,7 +357,10 @@ mod tests {
                     reads: reads.clone(),
                     block_len,
                 }));
-                let mut bitmap = BitmapDocSet::open(file, prefix as u64, max_doc, 4).unwrap();
+                let mut bitmap = BitmapDocSet::open(file, prefix as u64, max_doc, 4, move || {
+                    Ok(SegmentPostings::create_from_docs(&docs))
+                })
+                .unwrap();
                 for doc in docs {
                     assert_eq!(bitmap.doc(), doc);
                     bitmap.advance();
@@ -288,11 +369,11 @@ mod tests {
                 let reads = reads.lock().unwrap();
                 let mut end = prefix;
                 for range in reads.iter() {
-                    assert_eq!(range.start, end, "overlapping or skipped read: {reads:?}");
+                    assert!(range.start >= end, "overlapping read: {reads:?}");
                     end = range.end;
                 }
-                assert_eq!(end, prefix + len);
-                assert!(reads.len() <= 18, "{reads:?}");
+                assert!(end <= prefix + len);
+                assert!(reads.len() <= 8, "{reads:?}");
             }
         }
         let mut tail = bitmap(&[0, 131_071], 1_048_576);
@@ -304,9 +385,11 @@ mod tests {
         fn bitmap_cursor_operations_match_postings(
             mut docs in proptest::collection::vec(0u32..5137, 0..900),
             actions in proptest::collection::vec((0u8..3, 0u32..300), 0..100),
+            scale in proptest::sample::select(vec![1u32, 4096]),
         ) {
+            for doc in &mut docs { *doc *= scale; }
             docs.sort_unstable(); docs.dedup();
-            let mut bitmap = bitmap(&docs, 5137);
+            let mut bitmap = bitmap(&docs, 5137 * scale);
             let mut reference = crate::query::VecDocSet::from(docs);
             for (action, gap) in actions {
                 assert_eq!(bitmap.doc(), reference.doc());
@@ -314,7 +397,7 @@ mod tests {
                 match action {
                     0 => { assert_eq!(bitmap.advance(), reference.advance()); }
                     1 => {
-                        let target = reference.doc() + gap;
+                        let target = reference.doc() + gap * scale;
                         assert_eq!(bitmap.seek(target), reference.seek(target));
                     }
                     _ => {
@@ -426,7 +509,14 @@ mod tests {
                 );
             }
         }
-        assert!(BitmapDocSet::open(FileSlice::empty(), 0, 65, 0).is_err());
+        assert!(BitmapDocSet::open(
+            FileSlice::empty(),
+            0,
+            65,
+            0,
+            || Ok(SegmentPostings::empty())
+        )
+        .is_err());
         assert_eq!(bitmap(&[], 0).doc(), TERMINATED);
     }
 }

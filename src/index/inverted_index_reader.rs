@@ -115,8 +115,25 @@ impl InvertedIndexReader {
         let (Some(source), Some(offset)) = (&self.bitmaps_file_slice, info.bitmap_offset) else {
             return Ok(None);
         };
-        crate::query::BitmapDocSet::open(source.open()?.clone(), offset, max_doc, info.doc_freq)
-            .map(Some)
+        let postings_source = self.postings_file_slice.slice(info.postings_range.clone());
+        let doc_freq = info.doc_freq;
+        let record_option = self.record_option;
+        crate::query::BitmapDocSet::open(
+            source.open()?.clone(),
+            offset,
+            max_doc,
+            doc_freq,
+            move || {
+                let postings = BlockSegmentPostings::open_file_slice(
+                    doc_freq,
+                    postings_source,
+                    record_option,
+                    IndexRecordOption::Basic,
+                )?;
+                Ok(SegmentPostings::from_block_postings(postings, None))
+            },
+        )
+        .map(Some)
     }
 
     /// Creates an empty `InvertedIndexReader` object, which
