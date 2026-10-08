@@ -6,15 +6,15 @@
 //! Every child supplies its matches for the current window through
 //! `fill_bitset_block`. How much work that takes depends on the child:
 //!
-//! - Dense + dense: both children supply bitmap words directly. We combine those
-//!   words with bitwise OR for a union, or AND for an intersection.
-//! - Sparse + dense: the sparse child reads its ordinary postings and sets bits
-//!   for the matching document IDs in this window. The dense child supplies its
-//!   bitmap words directly. We then use the same OR or AND operations. Only the
-//!   current window is converted; we do not build a bitmap for the whole sparse list.
-//! - Sparse + sparse: both children could fill masks from their document IDs, but
-//!   Boolean query selection normally keeps these queries on ordinary postings
-//!   scorers. This scorer is chosen when at least one child can supply a bitmap.
+//! - Dense + dense: both children supply bitmap words directly. We combine those words with bitwise
+//!   OR for a union, or AND for an intersection.
+//! - Sparse + dense: the sparse child reads its ordinary postings and sets bits for the matching
+//!   document IDs in this window. The dense child supplies its bitmap words directly. We then use
+//!   the same OR or AND operations. Only the current window is converted; we do not build a bitmap
+//!   for the whole sparse list.
+//! - Sparse + sparse: both children could fill masks from their document IDs, but Boolean query
+//!   selection normally keeps these queries on ordinary postings scorers. This scorer is chosen
+//!   when at least one child can supply a bitmap.
 //!
 //! As a small example, write the set bits as document IDs: A = {1, 2, 4} and
 //! B = {2, 3}. A OR B produces {1, 2, 3, 4}; A AND B produces {2}; A NOT B

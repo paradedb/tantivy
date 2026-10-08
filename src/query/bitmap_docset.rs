@@ -11,16 +11,15 @@
 //!
 //! There are two useful ways to read it:
 //!
-//! - Window reads: `fill_bitset_block` adds the unconsumed matches in
-//!   `[base, base + 1024)` to the caller's mask. For an aligned window, that is
-//!   sixteen bitmap words (128 bytes). At base 1024, document 1027 becomes bit 3
-//!   of the first output word. We copy and combine words without turning each set
-//!   bit into a document ID, then move to the next match beyond the window.
+//! - Window reads: `fill_bitset_block` adds the unconsumed matches in `[base, base + 1024)` to the
+//!   caller's mask. For an aligned window, that is sixteen bitmap words (128 bytes). At base 1024,
+//!   document 1027 becomes bit 3 of the first output word. We copy and combine words without
+//!   turning each set bit into a document ID, then move to the next match beyond the window.
 //!   `BitmapCombination` uses these masks for dense/dense and sparse/dense queries.
-//! - Individual probes: `seek_danger` checks the bit for a candidate document.
-//!   For example, if a sparse term matches documents 65 and 900, an intersection
-//!   can test those two bits in a dense term's bitmap. On an unset bit, it returns
-//!   a lower bound of `candidate + 1` without searching for the next set bit.
+//! - Individual probes: `seek_danger` checks the bit for a candidate document. For example, if a
+//!   sparse term matches documents 65 and 900, an intersection can test those two bits in a dense
+//!   term's bitmap. On an unset bit, it returns a lower bound of `candidate + 1` without searching
+//!   for the next set bit.
 //!
 //! Ordinary `seek` and `advance` do find the next matching document. They scan
 //! buffered words, stopping at the first set bit. After scanning 8 KiB without a
