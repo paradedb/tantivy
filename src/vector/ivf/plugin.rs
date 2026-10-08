@@ -426,8 +426,7 @@ pub(crate) fn merge_ivf(
                                 batch.len()
                             )));
                         }
-                        for (cluster, &(source, target_doc_id)) in clusters.into_iter().zip(batch)
-                        {
+                        for (cluster, &(source, target_doc_id)) in clusters.into_iter().zip(batch) {
                             let cluster = cluster as usize;
                             if cluster >= num_centroids {
                                 return Err(TantivyError::InvalidArgument(format!(
