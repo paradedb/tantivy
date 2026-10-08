@@ -614,16 +614,16 @@ mod tests {
     #[test]
     fn term_info_cache_preserves_hits_misses_and_eviction() -> crate::Result<()> {
         let mut schema = Schema::builder();
-        let first = schema.add_text_field(
-            "first",
+        let first = schema.add_text_field("first", TEXT);
+        let second = schema.add_text_field(
+            "second",
             TEXT.set_indexing_options(
                 TEXT.get_indexing_options()
                     .unwrap()
                     .clone()
-                    .set_bitmap_postings(true),
+                    .set_bitmap_postings(false),
             ),
         );
-        let second = schema.add_text_field("second", TEXT);
         let index = Index::create_in_ram(schema.build());
         let mut writer: IndexWriter = index.writer_for_tests()?;
         writer.set_merge_policy(Box::new(NoMergePolicy));

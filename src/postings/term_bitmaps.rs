@@ -125,11 +125,7 @@ mod tests {
             let mut schema = Schema::builder();
             let field = schema.add_text_field(
                 "text",
-                TEXT.set_indexing_options(
-                    TextFieldIndexing::default()
-                        .set_index_option(record)
-                        .set_bitmap_postings(true),
-                ),
+                TEXT.set_indexing_options(TextFieldIndexing::default().set_index_option(record)),
             );
             let index = Index::create_in_ram(schema.build());
             let mut writer = index.writer_for_tests::<TantivyDocument>()?;

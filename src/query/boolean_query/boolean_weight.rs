@@ -1260,9 +1260,11 @@ mod tests {
             let scored = term_query
                 .weight(EnableScoring::enabled_from_searcher(&searcher))?
                 .scorer(reader, 1.0)?;
+            let mut ordinary_reader = reader.clone();
+            ordinary_reader.bitmap_postings_enabled = false;
             let unscored = term_query
                 .weight(EnableScoring::disabled_from_searcher(&searcher))?
-                .scorer(reader, 1.0)?;
+                .scorer(&ordinary_reader, 1.0)?;
             let other_field = parser
                 .parse_query("other:a")?
                 .weight(EnableScoring::enabled_from_searcher(&searcher))?
