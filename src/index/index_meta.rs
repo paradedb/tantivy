@@ -763,8 +763,6 @@ pub struct BitmapPostingsConfig {
     pub min_density_percent: u8,
     /// Minimum document frequency eligible for a bitmap.
     pub min_docs: u32,
-    /// Maximum bitmap payload bytes across all fields in a segment.
-    pub max_bytes_per_segment: u64,
 }
 
 impl Default for BitmapPostingsConfig {
@@ -773,7 +771,6 @@ impl Default for BitmapPostingsConfig {
             use_for_queries: true,
             min_density_percent: 10,
             min_docs: 128,
-            max_bytes_per_segment: 64 * 1024 * 1024,
         }
     }
 }
