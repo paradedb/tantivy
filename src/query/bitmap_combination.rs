@@ -1,3 +1,44 @@
+//! Combines query matches one 1,024-document window at a time, keeping the result
+//! as bits so count collectors can count set bits without visiting every document.
+//! Each window has sixteen 64-bit words (`TinySet`s). For example, in the window
+//! `[1024, 2048)`, bit 3 of the first word represents document 1027 in this segment.
+//!
+//! Every child supplies its matches for the current window through
+//! `fill_bitset_block`. How much work that takes depends on the child:
+//!
+//! - Dense + dense: both children supply bitmap words directly. We combine those
+//!   words with bitwise OR for a union, or AND for an intersection.
+//! - Sparse + dense: the sparse child reads its ordinary postings and sets bits
+//!   for the matching document IDs in this window. The dense child supplies its
+//!   bitmap words directly. We then use the same OR or AND operations. Only the
+//!   current window is converted; we do not build a bitmap for the whole sparse list.
+//! - Sparse + sparse: both children could fill masks from their document IDs, but
+//!   Boolean query selection normally keeps these queries on ordinary postings
+//!   scorers. This scorer is chosen when at least one child can supply a bitmap.
+//!
+//! As a small example, write the set bits as document IDs: A = {1, 2, 4} and
+//! B = {2, 3}. A OR B produces {1, 2, 3, 4}; A AND B produces {2}; A NOT B
+//! produces {1, 4}. Exclusion starts with the first child's mask and clears bits
+//! found in any of the remaining children. Children can also be nested queries
+//! or filters; they use the same window interface.
+//!
+//! A union skips children whose next match is beyond this window and removes
+//! exhausted children after including their last bits. An intersection tries
+//! children with lower estimated cost first, breaking ties by estimated match
+//! count. Intersections and exclusions stop filling a window once no bits remain.
+//! The children's next document IDs tell us which window to visit next.
+//!
+//! Query selection can still choose ordinary, candidate-driven evaluation. For
+//! example, a very rare term AND a dense term can probe the dense bitmap only at
+//! the rare term's document IDs. Likewise, `selective -"of the"` keeps
+//! candidate-driven phrase evaluation to avoid scanning phrase matches throughout
+//! every window.
+//!
+//! The result supports both ordinary document iteration and passing a whole mask
+//! to another bitmap-aware scorer or collector. The optimized collection path is
+//! currently used for counts; these masks describe matches, with document
+//! visibility checks handled downstream.
+
 use common::TinySet;
 
 use crate::docset::{BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW};
