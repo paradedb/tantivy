@@ -18,21 +18,18 @@ mod tests {
     use crate::{Index, TantivyDocument, Term};
 
     #[test]
-    fn density_budget_and_unknown_frequency() -> io::Result<()> {
+    fn density_and_unknown_frequency() -> io::Result<()> {
         let mut bytes = Vec::new();
         let mut write = CountingWriter::wrap(&mut bytes);
-        let mut budget = 256;
-        let mut writer = TermBitmapWriter::new(
-            &mut write,
-            1024,
-            BitmapPostingsConfig::default(),
-            &mut budget,
-        );
+        let mut writer = TermBitmapWriter::new(&mut write, 1024, BitmapPostingsConfig::default());
         for (hint, len, offset) in [
             (127, 127, None),
             (128, 128, Some(0)),
             (0, 200, Some(128)),
-            (400, 400, None),
+            (400, 400, Some(256)),
+            (0, 127, None),
+            (1024, 1024, None),
+            (800, 800, Some(384)),
         ] {
             writer.new_term(hint);
             for doc in 0..len {
@@ -41,8 +38,7 @@ mod tests {
             assert_eq!(writer.close_term(len)?, offset);
         }
         drop(writer);
-        assert_eq!(budget, 0);
-        assert_eq!(bytes.len(), 256);
+        assert_eq!(bytes.len(), 512);
         assert!(bytes[..16].iter().all(|byte| *byte == 255));
         assert!(bytes[16..128].iter().all(|byte| *byte == 0));
         Ok(())
@@ -193,7 +189,6 @@ pub(crate) struct TermBitmapWriter<'a, W: Write> {
     start_offset: u64,
     max_doc: DocId,
     config: BitmapPostingsConfig,
-    remaining: &'a mut u64,
     sparse: Vec<DocId>,
     words: Vec<u64>,
     collecting: bool,
@@ -204,14 +199,12 @@ impl<'a, W: Write> TermBitmapWriter<'a, W> {
         write: &'a mut CountingWriter<W>,
         max_doc: DocId,
         config: BitmapPostingsConfig,
-        remaining: &'a mut u64,
     ) -> Self {
         Self {
             start_offset: write.written_bytes(),
             write,
             max_doc,
             config,
-            remaining,
             sparse: Vec::new(),
             words: Vec::new(),
             collecting: false,
@@ -221,9 +214,8 @@ impl<'a, W: Write> TermBitmapWriter<'a, W> {
     pub(crate) fn new_term(&mut self, doc_freq: u32) {
         self.sparse.clear();
         self.words.clear();
-        self.collecting = self.max_doc > 0
-            && bitmap_num_bytes(self.max_doc) <= *self.remaining
-            && (doc_freq == 0 || self.config.eligible(doc_freq, self.max_doc));
+        self.collecting =
+            self.max_doc > 0 && (doc_freq == 0 || self.config.eligible(doc_freq, self.max_doc));
     }
 
     pub(crate) fn write_doc(&mut self, doc: DocId) {
@@ -259,7 +251,6 @@ impl<'a, W: Write> TermBitmapWriter<'a, W> {
         for word in &self.words {
             self.write.write_all(&word.to_le_bytes())?;
         }
-        *self.remaining -= bitmap_num_bytes(self.max_doc);
         Ok(Some(offset))
     }
 }

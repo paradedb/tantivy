@@ -54,7 +54,6 @@ pub struct InvertedIndexSerializer {
     pnorms_write: Option<CompositeWrite<WritePtr>>,
     bitmaps_write: Option<CompositeWrite<WritePtr>>,
     bitmap_config: crate::index::BitmapPostingsConfig,
-    bitmap_bytes_remaining: u64,
     max_doc: DocId,
 }
 
@@ -79,11 +78,6 @@ impl InvertedIndexSerializer {
                 None
             },
             bitmap_config: segment.index().settings().bitmap_postings.clone(),
-            bitmap_bytes_remaining: segment
-                .index()
-                .settings()
-                .bitmap_postings
-                .max_bytes_per_segment,
             max_doc: segment.meta().max_doc(),
             pnorms_write: if segment
                 .schema()
@@ -146,7 +140,6 @@ impl InvertedIndexSerializer {
                     bitmaps_write.for_field(field),
                     self.max_doc,
                     self.bitmap_config.clone(),
-                    &mut self.bitmap_bytes_remaining,
                 ));
             }
         }
