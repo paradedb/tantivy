@@ -111,6 +111,89 @@ pub(crate) mod tests {
         }
     }
 
+    proptest! {
+        #[test]
+        fn test_append_positions(delta_positions in gen_delta_positions(), position_offset in 0u32..100) {
+            let data = create_positions_data(&delta_positions).unwrap();
+            let mut reader = PositionReader::open(data).unwrap();
+            let mut actual = vec![19, 41];
+            reader.append_positions_with_offset(0, delta_positions.len(), position_offset, &mut actual);
+            let mut expected = vec![19, 41];
+            let mut position = position_offset;
+            for delta in delta_positions {
+                position += delta;
+                expected.push(position);
+            }
+            prop_assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn test_append_positions_with_offsets() -> crate::Result<()> {
+        let deltas: Vec<u32> = (0..2_049).map(|position| position % 257).collect();
+        let data = create_positions_data(&deltas)?;
+        let file = FileSlice::new(Arc::new(BlockBackedFile {
+            data: data.as_slice().to_vec(),
+            reads: Arc::new(Mutex::new(Vec::new())),
+            block_len: 17,
+        }));
+        for mut reader in [
+            PositionReader::open(data)?,
+            PositionReader::open_file_slice(file)?,
+        ] {
+            let mut actual = vec![19, 41];
+            for (offset, count) in [
+                (0, 0),
+                (0, 257),
+                (127, 130),
+                (1_900, 149),
+                (512, 400),
+                (129, 0),
+                (31, 129),
+                (2_048, 1),
+                (2_048, 1),
+                (0, 2_049),
+            ] {
+                actual.truncate(2);
+                reader.append_positions_with_offset(offset as u64, count, 17, &mut actual);
+                let mut expected = vec![19, 41];
+                let mut position = 17;
+                for delta in &deltas[offset..offset + count] {
+                    position += delta;
+                    expected.push(position);
+                }
+                assert_eq!(actual, expected, "offset={offset}, count={count}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_position_block_prefix_sums_wrap() -> crate::Result<()> {
+        let deltas: Vec<_> = [u32::MAX - 7, 0, 4, 5, 7, 11]
+            .into_iter()
+            .cycle()
+            .take(600)
+            .collect();
+        let data = create_positions_data(&deltas)?;
+        let mut reader = PositionReader::open(data)?;
+        let mut raw = vec![0; deltas.len()];
+        reader.read(0, &mut raw);
+        assert_eq!(raw, deltas);
+        for offset in (0..deltas.len()).step_by(3) {
+            let mut expected = Vec::new();
+            let mut position = 2;
+            for &delta in &deltas[offset..offset + 3] {
+                position += delta;
+                expected.push(position);
+            }
+            let mut actual = Vec::new();
+            reader.append_positions_with_offset(offset as u64, 3, 2, &mut actual);
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_position_read() -> crate::Result<()> {
         let position_deltas: Vec<u32> = (0..1000).collect();

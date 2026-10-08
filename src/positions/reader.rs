@@ -5,7 +5,7 @@ use common::{BinarySerializable, HasLen, VInt};
 
 use crate::directory::{FileSlice, OwnedBytes};
 use crate::positions::COMPRESSION_BLOCK_SIZE;
-use crate::postings::compression::{BlockDecoder, VIntDecoder};
+use crate::postings::compression::BlockDecoder;
 
 /// When accessing the positions of a term, we get a positions_idx from the `Terminfo`.
 /// This means we need to skip to the `nth` position efficiently.
@@ -23,6 +23,8 @@ pub struct PositionReader {
     positions: PositionData,
     positions_byte_offset: usize,
 
+    // Wrapping prefix sums let documents borrow positions from a decoded block.
+    // Subtracting the preceding value recovers each document's starting point.
     block_decoder: BlockDecoder,
 
     // offset, expressed in positions, for the first position of the block currently loaded
@@ -209,13 +211,14 @@ impl PositionReader {
         self.positions
             .with_bytes(start..end, |compressed_data| {
                 if is_bitpacked {
-                    block_decoder.uncompress_block_unsorted(
+                    block_decoder.uncompress_block_sorted(
                         compressed_data,
+                        0,
                         bit_widths[block_rel_id],
                         false,
                     );
                 } else {
-                    block_decoder.uncompress_vint_unsorted_until_end(compressed_data);
+                    block_decoder.uncompress_vint_sorted_until_end(compressed_data);
                 }
             })
             .expect("position data became unreadable after the reader was opened");
@@ -225,7 +228,40 @@ impl PositionReader {
     /// Fills a buffer with the positions `[offset..offset+output.len())` integers.
     ///
     /// This function is optimized to be called with increasing values of `offset`.
-    pub fn read(&mut self, mut offset: u64, mut output: &mut [u32]) {
+    pub fn read(&mut self, offset: u64, output: &mut [u32]) {
+        let mut cursor = 0;
+        self.read_blocks(offset, output.len(), |block, mut previous| {
+            for &value in block {
+                output[cursor] = value.wrapping_sub(previous);
+                previous = value;
+                cursor += 1;
+            }
+        });
+    }
+
+    pub(crate) fn append_positions_with_offset(
+        &mut self,
+        offset: u64,
+        count: usize,
+        mut position_offset: u32,
+        output: &mut Vec<u32>,
+    ) {
+        output.reserve(count);
+        self.read_blocks(offset, count, |block, previous| {
+            let base = position_offset.wrapping_sub(previous);
+            output.extend(block.iter().map(|&value| value.wrapping_add(base)));
+            if let Some(&last) = block.last() {
+                position_offset = last.wrapping_add(base);
+            }
+        });
+    }
+
+    fn read_blocks(
+        &mut self,
+        mut offset: u64,
+        mut count: usize,
+        mut consume: impl FnMut(&[u32], u32),
+    ) {
         if offset < self.anchor_offset {
             self.reset();
         }
@@ -250,18 +286,16 @@ impl PositionReader {
         // At this point, the block containing offset is loaded, and anchor has
         // been updated to point to it as well.
         for i in 1.. {
-            // we copy the part from block i - 1 that is relevant.
             let offset_in_block = (offset as usize) % COMPRESSION_BLOCK_SIZE;
             let remaining_in_block = COMPRESSION_BLOCK_SIZE - offset_in_block;
-            if remaining_in_block >= output.len() {
-                output.copy_from_slice(
-                    &self.block_decoder.output_array()[offset_in_block..][..output.len()],
-                );
+            let len = count.min(remaining_in_block);
+            let positions = self.block_decoder.output_array();
+            let previous = offset_in_block.checked_sub(1).map_or(0, |i| positions[i]);
+            consume(&positions[offset_in_block..][..len], previous);
+            count -= len;
+            if count == 0 {
                 break;
             }
-            output[..remaining_in_block]
-                .copy_from_slice(&self.block_decoder.output_array()[offset_in_block..]);
-            output = &mut output[remaining_in_block..];
             // we load block #i if necessary.
             offset += remaining_in_block as u64;
             self.load_block(i);

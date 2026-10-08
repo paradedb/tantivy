@@ -149,6 +149,15 @@ impl BlockDecoder {
         res
     }
 
+    pub(crate) fn uncompress_vint_sorted_until_end(&mut self, compressed_data: &[u8]) {
+        self.uncompress_vint_unsorted_until_end(compressed_data);
+        let mut position = 0u32;
+        for value in &mut self.output[..self.output_len] {
+            position = position.wrapping_add(*value);
+            *value = position;
+        }
+    }
+
     #[inline]
     pub fn output_array(&self) -> &[u32] {
         &self.output[..self.output_len]
