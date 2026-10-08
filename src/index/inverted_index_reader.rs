@@ -614,14 +614,28 @@ mod tests {
     #[test]
     fn term_info_cache_preserves_hits_misses_and_eviction() -> crate::Result<()> {
         let mut schema = Schema::builder();
-        let first = schema.add_text_field("first", TEXT);
+        let first = schema.add_text_field(
+            "first",
+            TEXT.set_indexing_options(
+                TEXT.get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_bitmap_postings(true),
+            ),
+        );
         let second = schema.add_text_field("second", TEXT);
         let index = Index::create_in_ram(schema.build());
         let mut writer: IndexWriter = index.writer_for_tests()?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
-        writer.add_document(doc!(first => "rust", second => "memory"))?;
+        for _ in 0..128 {
+            writer.add_document(doc!(first => "rust", second => "memory"))?;
+            writer.add_document(doc!(first => "padding", second => "padding"))?;
+        }
         writer.commit()?;
-        writer.add_document(doc!(first => "memory", second => "rust"))?;
+        for _ in 0..128 {
+            writer.add_document(doc!(first => "memory", second => "rust"))?;
+            writer.add_document(doc!(first => "padding", second => "padding"))?;
+        }
         writer.commit()?;
         let searcher = index.reader()?.searcher();
         for segment in searcher.segment_readers() {
@@ -636,6 +650,9 @@ mod tests {
                     let infos = reader.get_term_infos(SortedTermSlice::new(&keys).unwrap())?;
                     for (key, info) in keys.iter().zip(infos) {
                         assert_eq!(info, reader.terms().get(key)?);
+                        if let Some(info) = &info {
+                            assert_eq!(info.bitmap_offset.is_some(), field == first);
+                        }
                         assert_eq!(
                             reader.term_info_cache.get().unwrap().lock().peek(*key),
                             Some(&info)
