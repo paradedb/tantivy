@@ -2,13 +2,11 @@
 //!
 //! Built once per segment by
 //! [`TopDocsByVectorSimilarity`](super::collector::TopDocsByVectorSimilarity)
-//! around the segment's cached [`VectorIndexReader`]. The search strategy
-//! branches once, on whether the reader carries an [`IvfIndex`]: with it, the
-//! filter is drained into a bitmap and the routed clusters are probed
-//! adaptively; without it, the filter `Scorer` is iterated doc-by-doc and
-//! every vector is scored exactly. Cluster scans read document ids together with
-//! exact rows or layer-zero columns. Reranking reads selected full-precision rows.
-//! Supports flat scans and routed quantized scans.
+//! around the segment's cached [`VectorIndexReader`]. A segment without an [`IvfIndex`] iterates
+//! the filter `Scorer` doc by doc and scores every vector exactly. An IVF segment runs one scan
+//! driver, [`SegmentScan`], whatever its representation: a cluster source supplies layer-0
+//! clusters, quantized segments refine their candidates layer by layer under one pruning bound,
+//! [`KthBound`], and every row reaches the result heap through exact scoring.
 
 #[cfg(test)]
 #[path = "quantized_boundary_tests.rs"]
@@ -20,18 +18,21 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::time::Instant;
 
-use common::BitSet;
+use common::{BitSet, OwnedBytes};
 use quant_model::f16::f16_to_f32;
 
-use super::bounds::{
-    bounds_verdict, margin_ball_ball, margin_ball_halfspace, to_bound_space, HeapPeek, QueryBound,
-    QueryBoundTracker, Verdict,
+use super::cluster_plan::{
+    CentroidScore, ClusterBatch, SelectedDocs, Selection, Stage as PlanStage,
+};
+use super::cluster_source::{
+    admit_all, ClusterSource, RoutedAccounting, RoutedClusters, RoutedQuery, RowGate,
 };
 use super::distance::norm_squared_wide;
 use super::index_reader::{
-    validate_decoded_sidecar, QuantizedLayerBatch, QuantizedLayerReader, VectorIndexReader,
+    validate_decoded_sidecar, QuantizedFieldReader, QuantizedLayerBatch, QuantizedLayerReader,
+    VectorIndexReader, VectorRowBatch,
 };
-use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, RecallEstimator};
+use super::ivf::{AdaptiveProbeParams, IvfIndex, RecallEstimator};
 use super::prepared::{
     corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix,
     quantized_model_sigma, refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError,
@@ -39,13 +40,13 @@ use super::prepared::{
 };
 use super::quantization::QUANTIZED_BOUNDARY_KAPPA;
 use super::router::{RouterMetrics, RouterWorkspace, RoutingParams};
+use super::storage_io::{EXACT_SLOT, RERANK_SLOT};
 use super::tie_break::NoTieBreak;
 use super::{enter_vector_stage, Similarity, Stage, VectorElement};
 use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::{SegmentSortKeyComputer, TopNComputer};
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::error::DataCorruption;
-use crate::fastfield::AliveBitSet;
 use crate::query::{for_each_docset_buffered, AllScorer, Weight};
 use crate::schema::{Field, Metric};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
@@ -199,27 +200,15 @@ impl<T: VectorElement> VectorBackend<T> {
                 tie_comparator,
                 &mut stats,
             )?,
-            Some(index) => match &self.quantized_query {
-                Some(quantized_query) => self.quantized_top_n(
-                    index,
-                    quantized_query,
-                    weight,
-                    segment_reader,
-                    top_n,
-                    tie_break,
-                    tie_comparator,
-                    &mut stats,
-                )?,
-                None => self.approximate_top_n(
-                    index,
-                    weight,
-                    segment_reader,
-                    top_n,
-                    tie_break,
-                    tie_comparator,
-                    &mut stats,
-                )?,
-            },
+            Some(index) => self.ivf_top_n(
+                index,
+                weight,
+                segment_reader,
+                top_n,
+                tie_break,
+                tie_comparator,
+                &mut stats,
+            )?,
         };
         let io_after = super::storage_io::snapshot();
         let fallbacks_after = cascade::sign_word_fallback_counts();
@@ -227,7 +216,8 @@ impl<T: VectorElement> VectorBackend<T> {
             stats.io = io_after[layer].since(io_before[layer]);
             stats.sign_word_fallbacks = fallbacks_after[layer] - fallbacks_before[layer];
         }
-        stats.rerank_io = io_after[3].since(io_before[3]);
+        stats.rerank_io = io_after[RERANK_SLOT].since(io_before[RERANK_SLOT]);
+        stats.exact_io = io_after[EXACT_SLOT].since(io_before[EXACT_SLOT]);
         #[cfg(test)]
         stats.quantized_trace.translate(&trace_docs);
         Ok((hits, stats))
@@ -495,6 +485,15 @@ where S: serde::Serializer {
     map.end()
 }
 
+fn serialize_exact_io<S>(io: &super::VectorIoStats, serializer: S) -> Result<S::Ok, S::Error>
+where S: serde::Serializer {
+    use serde::ser::SerializeMap;
+
+    let mut map = serializer.serialize_map(Some(3))?;
+    serialize_prefixed(io, "exact", &mut map)?;
+    map.end()
+}
+
 /// Per-segment probe-loop instrumentation: a prune breakdown of every
 /// doc the inner loop touched, plus posting-fetch counters. Returned by
 /// [`VectorBackend::top_n`] alongside the hits. The flat/exact path fills
@@ -514,6 +513,12 @@ pub struct ProbeStats {
     pub clusters_skipped_empty: usize,
     /// Eligible rows charged against the probe budget.
     pub eligible_charged: usize,
+    /// Time scoring rows exactly before the final stage: every admitted row of a
+    /// full-precision segment.
+    pub exact_ns: u64,
+    /// Read requests for rows scored exactly before the final stage.
+    #[serde(flatten, serialize_with = "serialize_exact_io")]
+    pub exact_io: super::VectorIoStats,
     /// Sparse layer-indexed timing and funnel counters, flattened on the wire.
     #[serde(flatten)]
     pub layers: LayerProbeStatsSet,
@@ -530,7 +535,8 @@ pub struct ProbeStats {
     pub query_prep_ns: u64,
     /// Lazy cluster-routing time, including every ranked-stream pull.
     pub routing_ns: u64,
-    /// Exact scan time for an unquantized or explicitly exact path.
+    /// Full-precision scan time: the flat path's whole scan; on a full-precision IVF segment,
+    /// admission outside routing and exact scoring (`exact_ns`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exact_scan_ns: Option<u64>,
     /// Result assembly time.
@@ -622,7 +628,8 @@ impl ProbeStats {
             .saturating_add(self.exact_scan_ns.unwrap_or_default())
             .saturating_add(self.result_assembly_ns.unwrap_or_default())
             .saturating_add(self.rerank_fetch_ns)
-            .saturating_add(self.rerank_score_ns);
+            .saturating_add(self.rerank_score_ns)
+            .saturating_add(self.exact_ns);
         self.layers.0.iter().fold(fixed, |total, layer| {
             total
                 .saturating_add(layer.scan_ns)
@@ -630,7 +637,7 @@ impl ProbeStats {
         })
     }
 
-    fn record_routing(&mut self, routing: RouterMetrics) {
+    pub(super) fn record_routing(&mut self, routing: RouterMetrics) {
         self.routing = Some(routing);
         self.routing_visited_count += match routing {
             RouterMetrics::Rng(graph) => graph.visited_count,
@@ -649,7 +656,7 @@ impl ProbeStats {
         }
     }
 
-    fn record_bound_armed(&mut self, at_probe: Option<u32>) {
+    pub(super) fn record_bound_armed(&mut self, at_probe: Option<u32>) {
         if let Some(probe) = at_probe {
             self.bound_armed_count += 1;
             self.bound_armed_probe_sum += u64::from(probe);
@@ -682,6 +689,7 @@ impl ProbeStats {
         self.result_assembly_ns = self.result_assembly_ns.map(|_| 0);
         self.rerank_fetch_ns = 0;
         self.rerank_score_ns = 0;
+        self.exact_ns = 0;
     }
 
     /// Clusters the probe loop visited.
@@ -854,19 +862,19 @@ impl std::ops::Mul<f64> for WorkUnits {
 /// `(budget, n_avg, x)`.
 /// Per-segment probe budget and event prices.
 #[derive(Clone, Copy, Debug)]
-struct UnitPricing {
+pub(super) struct UnitPricing {
     /// Work this segment may spend before the ceiling binds.
-    budget: WorkUnits,
+    pub(super) budget: WorkUnits,
     /// The per-index open share `x`: what opening one cluster costs.
-    open: WorkUnits,
+    pub(super) open: WorkUnits,
     /// `(1 - x)/n_avg`: what one scored row costs.
-    row: WorkUnits,
+    pub(super) row: WorkUnits,
 }
 
 /// Cost accounting and termination for the probe loop: charges each
 /// cluster's work against the budget, tracks the APS recall estimate, and
 /// decides whether the next ranked cluster is opened.
-struct ProbeController<'a> {
+pub(super) struct ProbeController<'a> {
     pricing: UnitPricing,
     work_spent: WorkUnits,
     termination: ProbeTermination,
@@ -880,7 +888,7 @@ struct ProbeController<'a> {
 }
 
 impl<'a> ProbeController<'a> {
-    fn new(
+    pub(super) fn new(
         pricing: UnitPricing,
         clusters: usize,
         estimator: Option<RecallEstimator<'a>>,
@@ -902,7 +910,7 @@ impl<'a> ProbeController<'a> {
     /// Checked after the pull: a stop proves another ranked cluster
     /// existed, keeping `Ceiling` and `RecallTarget` distinct from
     /// `Exhausted`.
-    fn admit(&mut self) -> bool {
+    pub(super) fn admit(&mut self) -> bool {
         self.pulled += 1;
         if self
             .recall_estimate
@@ -919,12 +927,12 @@ impl<'a> ProbeController<'a> {
     }
 
     /// Charges one cluster open, probed or skipped by the bounds gate.
-    fn charge_open(&mut self) {
+    pub(super) fn charge_open(&mut self) {
         self.work_spent += self.pricing.open;
     }
 
     /// Charges `rows` scored rows.
-    fn charge_rows(&mut self, rows: usize) {
+    pub(super) fn charge_rows(&mut self, rows: usize) {
         self.work_spent += self.pricing.row * rows as f64;
     }
 
@@ -932,7 +940,7 @@ impl<'a> ProbeController<'a> {
     /// gate, or without survivors. Either way no result inside the query
     /// ball remains there. `kth` is the k-th result score after it,
     /// `None` while the heap is filling.
-    fn cover(&mut self, kth: Option<Score>) -> crate::Result<()> {
+    pub(super) fn cover(&mut self, kth: Option<Score>) -> crate::Result<()> {
         if let Some(estimator) = self.estimator.as_mut() {
             if let Some(estimate) = estimator.cover_next(kth.map(Similarity::new))? {
                 self.recall_estimate = Some(estimate);
@@ -941,7 +949,7 @@ impl<'a> ProbeController<'a> {
         Ok(())
     }
 
-    fn finish(&self, stats: &mut ProbeStats) {
+    pub(super) fn finish(&self, stats: &mut ProbeStats) {
         // A stacked ranking is sized to the budget, so it can run out just
         // as the budget is spent, short of the segment's clusters; that stop
         // is the ceiling's, not exhaustion.
@@ -1006,25 +1014,7 @@ struct QuantizedCandidate {
     arithmetic_variance: ArithmeticError,
 }
 
-/// Storage-row selection resolved before a quantized layer is read.
-enum Selection<'a> {
-    All,
-    Rows(&'a [usize]),
-    None,
-}
-
-impl Selection<'_> {
-    #[inline]
-    fn len(&self, rows: &Range<usize>) -> usize {
-        match self {
-            Self::All => rows.len(),
-            Self::Rows(offsets) => offsets.len(),
-            Self::None => 0,
-        }
-    }
-}
-
-/// Row-parallel quantized scan columns.
+/// Row-parallel quantized scan columns, with the admission and boundary selection over them.
 struct QuantizedCandidates {
     rows: Vec<usize>,
     docs: Vec<DocId>,
@@ -1036,6 +1026,11 @@ struct QuantizedCandidates {
     gammas: Vec<f32>,
     sign_query_error_terms: Vec<f32>,
     arithmetic_variances: Vec<ArithmeticError>,
+    /// Confidence multiplier of every interval endpoint.
+    kappa: f32,
+    boundary_scratch: Vec<QuantizedCandidate>,
+    cluster_top: Vec<(f32, usize, f32)>,
+    lowers: Vec<f32>,
 }
 
 impl QuantizedCandidates {
@@ -1058,6 +1053,10 @@ impl QuantizedCandidates {
             gammas: Vec::with_capacity(capacity),
             sign_query_error_terms: Vec::with_capacity(capacity),
             arithmetic_variances: Vec::with_capacity(capacity),
+            kappa: QUANTIZED_BOUNDARY_KAPPA,
+            boundary_scratch: Vec::with_capacity(capacity),
+            cluster_top: Vec::new(),
+            lowers: Vec::new(),
         }
     }
 
@@ -1098,7 +1097,7 @@ impl QuantizedCandidates {
         &mut self,
         rows: Range<usize>,
         selection: &Selection<'_>,
-        doc_ids: Option<&[DocId]>,
+        doc_ids: SelectedDocs<'_>,
         bases: &[f32],
         raw_prefixes: &[f32],
         estimates: &[f32],
@@ -1109,7 +1108,11 @@ impl QuantizedCandidates {
         arithmetic_variances: &[ArithmeticError],
     ) {
         let len = selection.len(&rows);
-        debug_assert!(doc_ids.is_none_or(|docs| docs.len() == rows.len()));
+        debug_assert!(match doc_ids {
+            SelectedDocs::ByClusterOffset(docs) => docs.len() == rows.len(),
+            SelectedDocs::BySelection(docs) => docs.len() == len,
+            SelectedDocs::Deferred => true,
+        });
         debug_assert_eq!(bases.len(), len);
         debug_assert_eq!(raw_prefixes.len(), len);
         debug_assert_eq!(estimates.len(), len);
@@ -1124,15 +1127,16 @@ impl QuantizedCandidates {
                 debug_assert!(offset < rows.len());
                 rows.start + offset
             })),
-            Selection::None => unreachable!("empty selections are skipped before scoring"),
         }
         match (selection, doc_ids) {
-            (Selection::All, Some(docs)) => self.docs.extend_from_slice(docs),
-            (Selection::Rows(offsets), Some(docs)) => {
+            (Selection::All, SelectedDocs::ByClusterOffset(docs)) => {
+                self.docs.extend_from_slice(docs)
+            }
+            (Selection::Rows(offsets), SelectedDocs::ByClusterOffset(docs)) => {
                 self.docs.extend(offsets.iter().map(|&row| docs[row]))
             }
-            (_, None) => self.docs.resize(self.docs.len() + len, DocId::MAX),
-            (Selection::None, _) => unreachable!("empty selections are skipped before scoring"),
+            (_, SelectedDocs::BySelection(docs)) => self.docs.extend_from_slice(docs),
+            (_, SelectedDocs::Deferred) => self.docs.resize(self.docs.len() + len, DocId::MAX),
         }
         self.bases.extend_from_slice(bases);
         self.raw_prefixes.extend_from_slice(raw_prefixes);
@@ -1165,6 +1169,64 @@ impl QuantizedCandidates {
             sign_query_error_term: self.sign_query_error_terms[index],
             arithmetic_variance: self.arithmetic_variances[index],
         }
+    }
+
+    #[inline]
+    fn lower(&self, index: usize) -> f32 {
+        self.estimate(index).lower(self.sigmas[index], self.kappa).0
+    }
+
+    /// Merges the candidates appended since `cluster_start` into the bound's running top-k,
+    /// through the cluster's own top-k so the merge stays O(k).
+    fn finish_cluster(&mut self, cluster_start: usize, bound: &mut KthBound) {
+        let k = bound.k;
+        if k == 0 || cluster_start >= self.len() {
+            return;
+        }
+        let mut cluster_top = std::mem::take(&mut self.cluster_top);
+        cluster_top.clear();
+        cluster_top.extend(
+            (cluster_start..self.len())
+                .map(|index| (self.lower(index), self.rows[index], self.estimates[index])),
+        );
+        if cluster_top.len() > k {
+            cluster_top.select_nth_unstable_by(k - 1, lower_endpoint_order);
+            cluster_top.truncate(k);
+        }
+        bound.merge_running(&cluster_top);
+        self.cluster_top = cluster_top;
+    }
+
+    /// Keeps the candidates whose upper endpoint reaches the boundary threshold, row-ordered.
+    /// Selecting by lower endpoint itself matters: ordering by estimate can prune a true top-k
+    /// row even when every confidence interval encloses its exact score.
+    fn band(&mut self, bound: &mut KthBound) {
+        debug_assert!(
+            self.estimates
+                .iter()
+                .zip(&self.sigmas)
+                .all(|(&estimate, &sigma)| estimate.is_finite() && sigma.is_finite()),
+            "quantized boundary inputs must be finite"
+        );
+        let mut lowers = std::mem::take(&mut self.lowers);
+        lowers.clear();
+        lowers.extend((0..self.len()).map(|index| self.lower(index)));
+        let threshold = bound
+            .boundary_lower(&mut lowers)
+            .map(|kth| Threshold(LowerEndpoint(kth)));
+        self.lowers = lowers;
+        let mut survivors = std::mem::take(&mut self.boundary_scratch);
+        survivors.clear();
+        for index in 0..self.len() {
+            if threshold.is_none_or(|kth| {
+                kth.admits(self.estimate(index).upper(self.sigmas[index], self.kappa))
+            }) {
+                survivors.push(self.materialize(index));
+            }
+        }
+        survivors.sort_unstable_by_key(|candidate| candidate.row);
+        self.replace_with_boundary_survivors(&survivors);
+        self.boundary_scratch = survivors;
     }
 
     fn replace_with_boundary_survivors(&mut self, survivors: &[QuantizedCandidate]) {
@@ -1810,56 +1872,194 @@ fn score_layer(
     Ok(selected_count)
 }
 
-struct QuantizedScanCtx {
-    candidates: QuantizedCandidates,
-    boundary_scratch: Vec<QuantizedCandidate>,
-    /// Query-residual norms by cluster.
-    cluster_query_norms: Vec<f32>,
-    /// Running top lower endpoints, all evaluated with `bound_kappa`.
-    bound_top: Vec<usize>,
-    bound_kappa: f32,
-    boundary_passed: bool,
-    /// Cluster-local selection scratch.
-    cluster_top: Vec<usize>,
-    cluster_top_n: usize,
-    cluster_start: Option<usize>,
-    /// Top-k merge scratch.
-    bound_merge: Vec<usize>,
-    kth_scratch: Vec<usize>,
+/// The `k`-th largest of two descending sequences, `a` given by length and accessor; `None`
+/// while they hold fewer than `k` values together.
+#[inline]
+fn merged_kth(a_len: usize, a: impl Fn(usize) -> f32, b: &[f32], k: usize) -> Option<f32> {
+    if k == 0 || a_len + b.len() < k {
+        return None;
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut kth = f32::NAN;
+    for _ in 0..k {
+        if j == b.len() || (i < a_len && a(i) >= b[j]) {
+            kth = a(i);
+            i += 1;
+        } else {
+            kth = b[j];
+            j += 1;
+        }
+    }
+    Some(kth)
 }
 
-impl QuantizedScanCtx {
-    fn new(max_doc: DocId, candidate_capacity: usize) -> Self {
-        let distinct_capacity = candidate_capacity.min(max_doc as usize);
+/// Orders `(lower, row, estimate)` entries by lower endpoint descending, then row ascending.
+#[inline]
+fn lower_endpoint_order(a: &(f32, usize, f32), b: &(f32, usize, f32)) -> std::cmp::Ordering {
+    b.0.total_cmp(&a.0).then(a.1.cmp(&b.1))
+}
+
+/// The scan's one pruning bound: the k-th largest lower endpoint over every live candidate,
+/// quantized intervals and exactly scored rows (zero-width intervals) alike. Only the top `k` of
+/// each side can affect it, so each side keeps at most `k` entries.
+#[derive(Clone)]
+pub(super) struct KthBound {
+    k: usize,
+    /// Top-k exact scores, descending. Exact rows never move.
+    exact: Vec<f32>,
+    /// Top-k quantized entries admitted since the last boundary, as `(lower, row, estimate)`,
+    /// ordered by [`lower_endpoint_order`].
+    running: Vec<(f32, usize, f32)>,
+    /// The estimates of `running`, descending.
+    running_estimates: Vec<f32>,
+    merge: Vec<(f32, usize, f32)>,
+}
+
+impl KthBound {
+    fn new(k: usize) -> Self {
         Self {
-            candidates: QuantizedCandidates::with_capacity(candidate_capacity),
-            boundary_scratch: Vec::with_capacity(candidate_capacity),
-            cluster_query_norms: Vec::new(),
-            bound_top: Vec::new(),
-            bound_kappa: QUANTIZED_BOUNDARY_KAPPA,
-            boundary_passed: false,
-            cluster_top: Vec::new(),
-            cluster_top_n: 0,
-            cluster_start: None,
-            bound_merge: Vec::new(),
-            kth_scratch: Vec::with_capacity(distinct_capacity),
+            k,
+            exact: Vec::with_capacity(k),
+            running: Vec::with_capacity(k),
+            running_estimates: Vec::with_capacity(k),
+            merge: Vec::with_capacity(k.saturating_mul(2)),
         }
     }
 
-    fn begin_cluster(&mut self, top_n: usize) {
-        debug_assert!(self.cluster_start.is_none());
-        debug_assert!(self.cluster_top.is_empty());
-        self.cluster_top.reserve(top_n);
-        self.bound_top.reserve(top_n);
-        self.bound_merge.reserve(top_n.saturating_mul(2));
-        self.cluster_top_n = top_n;
+    /// Records an exactly scored row.
+    fn push_exact(&mut self, score: f32) {
+        if self.k == 0
+            || (self.exact.len() == self.k
+                && score.total_cmp(self.exact.last().unwrap()) != std::cmp::Ordering::Greater)
+        {
+            return;
+        }
+        let at = self
+            .exact
+            .partition_point(|kept| kept.total_cmp(&score) != std::cmp::Ordering::Less);
+        self.exact.insert(at, score);
+        self.exact.truncate(self.k);
+    }
+
+    /// The k-th exact score: no row scoring below it can enter the top k.
+    #[inline]
+    fn exact_kth(&self) -> Option<f32> {
+        (self.k > 0 && self.exact.len() == self.k).then(|| self.exact[self.k - 1])
+    }
+
+    /// Merges one cluster's top-k entries into the running top-k.
+    fn merge_running(&mut self, cluster_top: &[(f32, usize, f32)]) {
+        self.merge.clear();
+        self.merge.extend_from_slice(&self.running);
+        self.merge.extend_from_slice(cluster_top);
+        self.merge.sort_unstable_by(lower_endpoint_order);
+        self.merge.truncate(self.k);
+        std::mem::swap(&mut self.running, &mut self.merge);
+        self.running_estimates.clear();
+        self.running_estimates
+            .extend(self.running.iter().map(|&(_, _, estimate)| estimate));
+        self.running_estimates
+            .sort_unstable_by(|a, b| b.total_cmp(a));
+    }
+
+    /// The bounds gate's threshold: the k-th of the running lower endpoints and the exact
+    /// scores, `None` until `k` are in.
+    pub(super) fn running_lower(&self) -> Option<f32> {
+        if self.exact.is_empty() {
+            return (self.k > 0 && self.running.len() >= self.k)
+                .then(|| self.running[self.k - 1].0);
+        }
+        merged_kth(
+            self.running.len(),
+            |i| self.running[i].0,
+            &self.exact,
+            self.k,
+        )
+    }
+
+    /// APS cover's threshold: the k-th of the running point estimates and the exact scores,
+    /// `None` until `k` are in. `k` rows score at least this, so it never exceeds the k-th best
+    /// estimate; it carries no confidence margin, so it must not drive pruning.
+    pub(super) fn running_estimate(&self) -> Option<f32> {
+        if self.k == 0 {
+            return None;
+        }
+        if self.exact.is_empty() {
+            if self.running.len() < self.k {
+                return None;
+            }
+            return self
+                .running
+                .iter()
+                .map(|&(_, _, estimate)| estimate)
+                .min_by(f32::total_cmp);
+        }
+        let estimates = &self.running_estimates;
+        merged_kth(estimates.len(), |i| estimates[i], &self.exact, self.k)
+    }
+
+    /// The boundary threshold: the k-th largest of `candidate_lowers` (one per live quantized
+    /// candidate, reordered in place) and the exact scores. Clears the running top-k, which
+    /// describes the candidates before the boundary.
+    fn boundary_lower(&mut self, candidate_lowers: &mut [f32]) -> Option<f32> {
+        self.running.clear();
+        self.running_estimates.clear();
+        let k = self.k;
+        if k == 0 {
+            return None;
+        }
+        if self.exact.is_empty() {
+            if candidate_lowers.len() < k {
+                return None;
+            }
+            let (_, kth, _) = candidate_lowers.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
+            return Some(*kth);
+        }
+        if candidate_lowers.len() + self.exact.len() < k {
+            return None;
+        }
+        let quantized = k.min(candidate_lowers.len());
+        if quantized > 0 && quantized < candidate_lowers.len() {
+            candidate_lowers.select_nth_unstable_by(quantized - 1, |a, b| b.total_cmp(a));
+        }
+        let top = &mut candidate_lowers[..quantized];
+        top.sort_unstable_by(|a, b| b.total_cmp(a));
+        merged_kth(top.len(), |i| top[i], &self.exact, k)
+    }
+}
+
+/// Drives candidate admission, the bound and boundaries without a segment, for unit tests.
+#[cfg(test)]
+struct BoundaryHarness {
+    candidates: QuantizedCandidates,
+    bound: Option<KthBound>,
+    cluster_start: Option<usize>,
+}
+
+#[cfg(test)]
+impl BoundaryHarness {
+    fn new(capacity: usize) -> Self {
+        Self {
+            candidates: QuantizedCandidates::with_capacity(capacity),
+            bound: None,
+            cluster_start: None,
+        }
+    }
+
+    fn bound(&mut self, k: usize) -> &mut KthBound {
+        let bound = self.bound.get_or_insert_with(|| KthBound::new(k));
+        assert_eq!(bound.k, k, "one k per harness");
+        bound
+    }
+
+    fn begin_cluster(&mut self, k: usize) {
+        assert!(self.cluster_start.is_none());
+        self.bound(k);
         self.cluster_start = Some(self.candidates.len());
     }
 
-    /// Appends an eligible row to scan columns.
-    #[cfg(test)]
+    /// Appends a row to the current cluster.
     #[allow(clippy::too_many_arguments)]
-    #[inline]
     fn push(
         &mut self,
         row: usize,
@@ -1886,254 +2086,272 @@ impl QuantizedScanCtx {
         );
     }
 
-    fn set_cluster_query_norm(&mut self, cluster: usize, query_norm: f32) {
-        if self.cluster_query_norms.len() <= cluster {
-            self.cluster_query_norms.resize(cluster + 1, f32::NAN);
-        }
-        self.cluster_query_norms[cluster] = query_norm;
-    }
-
-    fn cluster_query_norm(&self, cluster: usize) -> f32 {
-        let query_norm = self.cluster_query_norms[cluster];
-        debug_assert!(query_norm.is_finite());
-        query_norm
-    }
-
-    /// Merges one cluster into the running admission top-k.
     fn finish_cluster_bound(&mut self) {
         self.finish_cluster_bound_with_kappa(QUANTIZED_BOUNDARY_KAPPA);
     }
 
     fn finish_cluster_bound_with_kappa(&mut self, kappa: f32) {
-        debug_assert!(self.bound_top.is_empty() || self.bound_kappa == kappa);
-        self.bound_kappa = kappa;
-        let cluster_start = self
-            .cluster_start
-            .take()
-            .expect("finish_cluster_bound requires begin_cluster");
-        let top_n = std::mem::take(&mut self.cluster_top_n);
-        if top_n == 0 || cluster_start >= self.candidates.len() {
-            self.cluster_top.clear();
-            return;
-        }
-
-        self.cluster_top.clear();
-        self.cluster_top
-            .extend(cluster_start..self.candidates.len());
-        if self.cluster_top.len() > top_n {
-            self.cluster_top
-                .select_nth_unstable_by(top_n - 1, |&a, &b| {
-                    lower_endpoint_order(&self.candidates, a, b, kappa)
-                });
-            self.cluster_top.truncate(top_n);
-        }
-
-        self.bound_merge.clear();
-        self.bound_merge.extend_from_slice(&self.bound_top);
-        for &index in &self.cluster_top {
-            self.bound_merge.push(index);
-        }
-        self.cluster_top.clear();
-        self.bound_merge
-            .sort_unstable_by(|&a, &b| lower_endpoint_order(&self.candidates, a, b, kappa));
-        self.bound_merge.truncate(top_n);
-        std::mem::swap(&mut self.bound_top, &mut self.bound_merge);
+        let start = self.cluster_start.take().expect("begin_cluster first");
+        self.candidates.kappa = kappa;
+        let bound = self
+            .bound
+            .as_mut()
+            .expect("begin_cluster creates the bound");
+        self.candidates.finish_cluster(start, bound);
     }
 
-    fn running_pessimistic_kth(&self, top_n: usize, kappa: f32) -> Option<Threshold> {
-        debug_assert!(!self.boundary_passed);
-        if top_n == 0 || self.bound_top.len() < top_n {
+    fn running_pessimistic_kth(&mut self, k: usize, kappa: f32) -> Option<Threshold> {
+        assert_eq!(self.candidates.kappa, kappa);
+        self.bound(k)
+            .running_lower()
+            .map(|kth| Threshold(LowerEndpoint(kth)))
+    }
+
+    /// `None` for a `k` above the harness's: the running top-k holds fewer than `k` entries.
+    fn running_estimate_kth(&mut self, k: usize) -> Option<f32> {
+        let bound = self.bound.as_ref()?;
+        if k > bound.k {
             return None;
         }
-        debug_assert_eq!(self.bound_kappa, kappa);
-        let index = *self.bound_top.last().unwrap();
-        Some(Threshold(
-            self.candidates
-                .estimate(index)
-                .lower(self.candidates.sigmas[index], kappa),
-        ))
+        self.bound(k).running_estimate()
     }
 
-    /// The lowest point estimate among the running top-k rows, `None`
-    /// until `top_n` rows are in. `top_n` rows score at least this, so it
-    /// never exceeds the k-th best estimate; unlike
-    /// [`Self::running_pessimistic_kth`] it carries no confidence margin,
-    /// so it must not drive pruning.
-    fn running_estimate_kth(&self, top_n: usize) -> Option<Score> {
-        debug_assert!(!self.boundary_passed);
-        if top_n == 0 || self.bound_top.len() < top_n {
-            return None;
-        }
-        self.bound_top
-            .iter()
-            .map(|&index| self.candidates.estimates[index])
-            .min_by(f32::total_cmp)
+    /// The boundary threshold the next band would apply, leaving the running top-k intact.
+    fn pessimistic_kth(&mut self, k: usize, kappa: f32) -> Option<Threshold> {
+        let mut bound = self.bound(k).clone();
+        self.candidates.kappa = kappa;
+        let mut lowers: Vec<f32> = (0..self.candidates.len())
+            .map(|index| self.candidates.lower(index))
+            .collect();
+        bound
+            .boundary_lower(&mut lowers)
+            .map(|kth| Threshold(LowerEndpoint(kth)))
     }
 
-    /// Select by lower endpoint itself; ordering by estimate can prune a true top-k row
-    /// even when every confidence interval encloses its exact score.
-    fn pessimistic_kth(&mut self, top_n: usize, kappa: f32) -> Option<Threshold> {
-        debug_assert!(
-            self.candidates
-                .estimates
-                .iter()
-                .zip(&self.candidates.sigmas)
-                .all(|(&estimate, &sigma)| estimate.is_finite() && sigma.is_finite()),
-            "quantized boundary inputs must be finite"
-        );
-        if top_n == 0 || self.candidates.len() < top_n {
-            return None;
-        }
-        self.kth_scratch.clear();
-        self.kth_scratch.extend(0..self.candidates.len());
-        let (_, selected, _) = self
-            .kth_scratch
-            .select_nth_unstable_by(top_n - 1, |&a, &b| {
-                lower_endpoint_order(&self.candidates, a, b, kappa)
-            });
-        let index = *selected;
-        Some(Threshold(
-            self.candidates
-                .estimate(index)
-                .lower(self.candidates.sigmas[index], kappa),
-        ))
+    fn band(&mut self, k: usize, kappa: f32) {
+        self.candidates.kappa = kappa;
+        let bound = self.bound.get_or_insert_with(|| KthBound::new(k));
+        self.candidates.band(bound);
     }
 
-    fn band(&mut self, top_n: usize, kappa: f32) {
-        let pessimistic_kth = self.pessimistic_kth(top_n, kappa);
-        self.boundary_scratch.clear();
-        for index in 0..self.candidates.len() {
-            if pessimistic_kth.is_none_or(|kth| {
-                kth.admits(
-                    self.candidates
-                        .estimate(index)
-                        .upper(self.candidates.sigmas[index], kappa),
-                )
-            }) {
-                self.boundary_scratch
-                    .push(self.candidates.materialize(index));
-            }
-        }
-        self.boundary_scratch
-            .sort_unstable_by_key(|candidate| candidate.row);
-        self.candidates
-            .replace_with_boundary_survivors(&self.boundary_scratch);
-        // `bound_top` indexes the pre-boundary column layout; nothing may read the
-        // running admission threshold after a boundary.
-        self.bound_top.clear();
-        self.boundary_passed = true;
-        debug_assert!(self.cluster_start.is_none());
+    /// Rows of the running top-k, in bound order.
+    fn running_rows(&self) -> Vec<usize> {
+        self.bound.as_ref().map_or_else(Vec::new, |bound| {
+            bound.running.iter().map(|e| e.1).collect()
+        })
     }
 }
 
-/// How a cluster row is tested before scoring: the filter's matches
-/// intersected with the alive docs.
-enum RowGate<'a> {
-    Open,
-    AliveOnly(&'a AliveBitSet),
-    FilterOnly(&'a BitSet),
-    FilterAndAlive {
-        filter: &'a BitSet,
-        filter_and_alive: BitSet,
-    },
+/// Per-segment buffers reused across clusters, layers and the final stage.
+#[derive(Default)]
+struct ScanScratch {
+    kernel_scores: Vec<f32>,
+    decoded_scales: Vec<f32>,
+    decoded_gammas: Vec<f32>,
+    decoded_error_ratios: Vec<f32>,
+    decoded_constants: Vec<f32>,
+    decoded_residual_norms: Vec<f32>,
+    base_scores: Vec<f32>,
+    estimate_scores: Vec<f32>,
+    sigma_scores: Vec<f32>,
+    residual_norm_squared_scores: Vec<f32>,
+    sign_query_error_terms: Vec<f32>,
+    arithmetic_variances: Vec<ArithmeticError>,
+    selection_offsets: Vec<usize>,
+    selected_rows: Vec<usize>,
+    row_offsets: Vec<usize>,
+    read_ranges: Vec<Range<usize>>,
+    block_scratch: Vec<(usize, usize)>,
+    /// A cluster's DocIds column, read for deferred documents.
+    cluster_docs: Vec<DocId>,
+    /// Global rows of an exactly scored batch.
+    exact_rows: Vec<usize>,
+    /// A survivor group's offsets and documents.
+    group_offsets: Vec<usize>,
+    group_docs: Vec<DocId>,
 }
 
-impl<'a> RowGate<'a> {
-    fn new(filter: &'a SegmentFilter, alive: Option<&'a AliveBitSet>) -> Self {
-        match (filter.docs(), alive) {
-            (None, None) => RowGate::Open,
-            (None, Some(alive)) => RowGate::AliveOnly(alive),
-            (Some(filter), None) => RowGate::FilterOnly(filter),
-            (Some(filter), Some(alive)) => {
-                let mut filter_and_alive = filter.clone();
-                filter_and_alive.intersect_update(alive.bitset());
-                RowGate::FilterAndAlive {
-                    filter,
-                    filter_and_alive,
-                }
-            }
+/// The quantized cascade's state: candidate columns plus what later layers need per cluster.
+struct QuantizedState<'a> {
+    query: &'a QuantizedQueryCtx,
+    field: &'a QuantizedFieldReader,
+    metric: Metric,
+    dimension: usize,
+    candidates: QuantizedCandidates,
+    /// Query-centroid similarity of each admitted cluster; NaN for clusters never admitted.
+    centroid_scores: Vec<f32>,
+}
+
+impl<'a> QuantizedState<'a> {
+    fn new(
+        query: &'a QuantizedQueryCtx,
+        field: &'a QuantizedFieldReader,
+        candidate_capacity: usize,
+    ) -> Self {
+        let meta = query.index.meta.field();
+        Self {
+            query,
+            field,
+            metric: meta.metric,
+            dimension: meta.dim as usize,
+            candidates: QuantizedCandidates::with_capacity(candidate_capacity),
+            centroid_scores: Vec::new(),
         }
     }
-}
 
-enum RowVerdict {
-    Keep,
-    Filtered,
-    Dead,
-}
-
-fn select_cluster_rows<'a>(
-    doc_ids: &[DocId],
-    rows: Range<usize>,
-    gate: &RowGate,
-    offsets: &'a mut Vec<usize>,
-) -> (Selection<'a>, usize, usize, usize) {
-    offsets.clear();
-    let visited = rows.len();
-    let (pruned_filter, pruned_dead) = match gate {
-        RowGate::Open => {
-            return (Selection::All, visited, 0, 0);
+    fn set_centroid(&mut self, cluster: usize, score: f32) {
+        if self.centroid_scores.len() <= cluster {
+            self.centroid_scores.resize(cluster + 1, f32::NAN);
         }
-        RowGate::AliveOnly(alive) => select_rows(doc_ids, rows, offsets, |doc| {
-            if alive.is_alive(doc) {
-                RowVerdict::Keep
+        self.centroid_scores[cluster] = score;
+    }
+
+    /// The admitted cluster's query-centroid similarity.
+    fn centroid(&self, cluster: usize) -> CentroidScore {
+        let score = self.centroid_scores[cluster];
+        debug_assert!(!score.is_nan(), "cluster {cluster} was never admitted");
+        CentroidScore::Known(Similarity::new(score))
+    }
+
+    /// The query-residual norm the error model uses for `cluster`.
+    fn cluster_query_norm(&self, cluster: usize) -> f32 {
+        let CentroidScore::Known(score) = self.centroid(cluster);
+        self.query.score_query_norm(score.score())
+    }
+
+    /// Refines every live candidate with `layer`, which must follow at least one boundary.
+    fn refine_layer(
+        &mut self,
+        layer_idx: usize,
+        index: &IvfIndex,
+        scratch: &mut ScanScratch,
+    ) -> crate::Result<()> {
+        let query = self.query;
+        let metric = self.metric;
+        let layer = &self.field.layers()[layer_idx];
+        let sign_query_error_squared =
+            if matches!(query.index.specs[layer_idx].kind, cascade::LayerKind::Sign) {
+                query.query_error_squared(layer_idx) as f32
             } else {
-                RowVerdict::Dead
+                0.0
+            };
+        if metric == Metric::Cosine {
+            let query_norm = query.score_query_norm(0.0);
+            for candidate_range in cosine_refinement_batches(self.candidates.len()) {
+                let first_row = self.candidates.rows[candidate_range.start];
+                let last_row = self.candidates.rows[candidate_range.end - 1];
+                let available_rows = first_row..last_row + 1;
+                let selection = candidate_selection(
+                    &self.candidates.rows[candidate_range.clone()],
+                    &available_rows,
+                    &mut scratch.selection_offsets,
+                );
+                let rows = score_layer(
+                    query,
+                    layer_idx,
+                    layer,
+                    None,
+                    None,
+                    available_rows,
+                    &selection,
+                    &mut scratch.kernel_scores,
+                    &mut scratch.decoded_scales,
+                    &mut scratch.decoded_gammas,
+                    &mut scratch.decoded_error_ratios,
+                    &mut scratch.decoded_constants,
+                    &mut scratch.read_ranges,
+                    &mut scratch.selected_rows,
+                    &mut scratch.row_offsets,
+                )?;
+                combine_refinement_decoded(
+                    metric,
+                    self.dimension,
+                    &mut self.candidates,
+                    candidate_range,
+                    &scratch.kernel_scores[..rows],
+                    &scratch.decoded_scales[..rows],
+                    &scratch.decoded_gammas[..rows],
+                    &scratch.decoded_error_ratios[..rows],
+                    &[],
+                    query_norm * query_norm,
+                    sign_query_error_squared,
+                );
             }
-        }),
-        RowGate::FilterOnly(filter) => select_rows(doc_ids, rows, offsets, |doc| {
-            if filter.contains(doc) {
-                RowVerdict::Keep
-            } else {
-                RowVerdict::Filtered
-            }
-        }),
-        RowGate::FilterAndAlive {
-            filter,
-            filter_and_alive,
-        } => select_rows(doc_ids, rows, offsets, |doc| {
-            if filter_and_alive.contains(doc) {
-                RowVerdict::Keep
-            } else if !filter.contains(doc) {
-                RowVerdict::Filtered
-            } else {
-                RowVerdict::Dead
-            }
-        }),
-    };
-    if offsets.is_empty() {
-        (Selection::None, visited, pruned_filter, pruned_dead)
-    } else {
-        (
-            Selection::Rows(offsets),
-            visited,
-            pruned_filter,
-            pruned_dead,
-        )
-    }
-}
-
-/// Returns `(pruned_filter, pruned_dead)`.
-#[inline(always)]
-fn select_rows(
-    doc_ids: &[DocId],
-    rows: Range<usize>,
-    offsets: &mut Vec<usize>,
-    verdict: impl Fn(DocId) -> RowVerdict,
-) -> (usize, usize) {
-    let mut pruned_filter = 0usize;
-    let mut pruned_dead = 0usize;
-    for (offset, _row) in rows.enumerate() {
-        let doc = doc_ids[offset];
-        match verdict(doc) {
-            RowVerdict::Keep => {
-                offsets.push(offset);
-            }
-            RowVerdict::Filtered => pruned_filter += 1,
-            RowVerdict::Dead => pruned_dead += 1,
+            return Ok(());
         }
+        let mut candidate_start = 0;
+        let mut cluster = 0;
+        while candidate_start < self.candidates.len() {
+            let first_row = self.candidates.rows[candidate_start];
+            while cluster < index.num_clusters() && index.cluster_range(cluster).end <= first_row {
+                cluster += 1;
+            }
+            if cluster == index.num_clusters() {
+                return Err(TantivyError::DataCorruption(DataCorruption::comment_only(
+                    format!("quantized survivor row {first_row} is outside IVF cluster ranges"),
+                )));
+            }
+            let cluster_rows = index.cluster_range(cluster);
+            if first_row < cluster_rows.start {
+                return Err(TantivyError::DataCorruption(DataCorruption::comment_only(
+                    format!(
+                        "quantized survivor row {first_row} precedes cluster {cluster} range \
+                         {cluster_rows:?}"
+                    ),
+                )));
+            }
+            let mut candidate_end = candidate_start + 1;
+            while candidate_end < self.candidates.len()
+                && self.candidates.rows[candidate_end] < cluster_rows.end
+            {
+                candidate_end += 1;
+            }
+            let query_norm = self.cluster_query_norm(cluster);
+            let candidate_range = candidate_start..candidate_end;
+            let selection = candidate_selection(
+                &self.candidates.rows[candidate_range.clone()],
+                &cluster_rows,
+                &mut scratch.selection_offsets,
+            );
+            let rows = score_layer(
+                query,
+                layer_idx,
+                layer,
+                None,
+                Some(cluster),
+                cluster_rows,
+                &selection,
+                &mut scratch.kernel_scores,
+                &mut scratch.decoded_scales,
+                &mut scratch.decoded_gammas,
+                &mut scratch.decoded_error_ratios,
+                &mut scratch.decoded_constants,
+                &mut scratch.read_ranges,
+                &mut scratch.selected_rows,
+                &mut scratch.row_offsets,
+            )?;
+            let decoded_constants = if metric == Metric::L2 {
+                &scratch.decoded_constants[..rows]
+            } else {
+                &[]
+            };
+            combine_refinement_decoded(
+                metric,
+                self.dimension,
+                &mut self.candidates,
+                candidate_range,
+                &scratch.kernel_scores[..rows],
+                &scratch.decoded_scales[..rows],
+                &scratch.decoded_gammas[..rows],
+                &scratch.decoded_error_ratios[..rows],
+                decoded_constants,
+                query_norm * query_norm,
+                sign_query_error_squared,
+            );
+            candidate_start = candidate_end;
+        }
+        Ok(())
     }
-    (pruned_filter, pruned_dead)
 }
 
 fn candidate_selection<'a>(
@@ -2151,580 +2369,435 @@ fn candidate_selection<'a>(
     Selection::Rows(offsets)
 }
 
-#[inline]
-fn lower_endpoint_order(
-    candidates: &QuantizedCandidates,
-    a: usize,
-    b: usize,
-    kappa: f32,
-) -> std::cmp::Ordering {
-    candidates
-        .estimate(b)
-        .lower(candidates.sigmas[b], kappa)
-        .0
-        .total_cmp(&candidates.estimate(a).lower(candidates.sigmas[a], kappa).0)
-        .then(candidates.rows[a].cmp(&candidates.rows[b]))
+/// Full-precision rows of one exactly scored batch.
+enum ExactRows {
+    /// The cluster's whole full-precision span, in one request.
+    Span(OwnedBytes),
+    /// The selected rows, through a storage-aware read plan.
+    Planned(VectorRowBatch),
 }
 
-impl<T: VectorElement> VectorBackend<T> {
-    #[allow(clippy::too_many_arguments)]
-    fn quantized_top_n<K, CTail>(
-        &self,
-        index: &IvfIndex,
-        query: &QuantizedQueryCtx,
-        weight: &dyn Weight,
-        segment_reader: &SegmentReader,
+/// One segment's IVF scan. Cluster sources feed it layer-0 batches; it scores each with the
+/// segment's representation (quantized layers or full precision), keeps the pruning bound, and
+/// runs the remaining stages. Every row enters the result heap through exact scoring.
+pub(super) struct SegmentScan<'a, T, K, CTail>
+where
+    T: VectorElement,
+    K: SegmentSortKeyComputer,
+    CTail: Comparator<K::SegmentSortKey>,
+{
+    reader: &'a VectorIndexReader,
+    index: &'a IvfIndex,
+    /// Scores every exact row, in the space the quantized estimates share.
+    exact_query: &'a PreparedQuery<T>,
+    /// The result heap; rows enter only through [`Self::score_exact`].
+    topn: TieBreakHeap<K, CTail>,
+    bound: KthBound,
+    /// `None` on full-precision segments.
+    quantized: Option<QuantizedState<'a>>,
+    scratch: ScanScratch,
+}
+
+impl<'a, T, K, CTail> SegmentScan<'a, T, K, CTail>
+where
+    T: VectorElement,
+    K: SegmentSortKeyComputer,
+    CTail: Comparator<K::SegmentSortKey>,
+{
+    /// A scan of a full-precision segment: every admitted row is scored exactly.
+    fn exact(
+        reader: &'a VectorIndexReader,
+        index: &'a IvfIndex,
+        exact_query: &'a PreparedQuery<T>,
         top_n: usize,
-        tie_break: &mut K,
         tie_comparator: CTail,
+    ) -> Self {
+        Self {
+            reader,
+            index,
+            exact_query,
+            topn: TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator)),
+            bound: KthBound::new(top_n),
+            quantized: None,
+            scratch: ScanScratch::default(),
+        }
+    }
+
+    /// A scan of a quantized segment: rows enter at layer 0, refine through the remaining
+    /// layers, and reach the heap at the final stage.
+    #[allow(clippy::too_many_arguments)]
+    fn quantized(
+        reader: &'a VectorIndexReader,
+        index: &'a IvfIndex,
+        exact_query: &'a PreparedQuery<T>,
+        query: &'a QuantizedQueryCtx,
+        field: &'a QuantizedFieldReader,
+        top_n: usize,
+        tie_comparator: CTail,
+        candidate_capacity: usize,
+    ) -> Self {
+        Self {
+            quantized: Some(QuantizedState::new(query, field, candidate_capacity)),
+            ..Self::exact(reader, index, exact_query, top_n, tie_comparator)
+        }
+    }
+
+    pub(super) fn bound(&self) -> &KthBound {
+        &self.bound
+    }
+
+    /// Admits one layer-0 batch from a cluster source; returns the rows scored.
+    pub(super) fn admit(
+        &mut self,
+        batch: &ClusterBatch<'_>,
+        tie_break: &mut K,
         stats: &mut ProbeStats,
-    ) -> crate::Result<TieBreakHits<K>>
-    where
-        K: SegmentSortKeyComputer,
-        CTail: Comparator<K::SegmentSortKey>,
-    {
-        if top_n == 0 || segment_reader.max_doc() == 0 || index.num_clusters() == 0 {
-            return Ok(Vec::new());
+    ) -> crate::Result<usize> {
+        debug_assert_eq!(batch.stage, PlanStage::Layer(0));
+        let rows = batch.len();
+        debug_assert!(rows > 0, "empty batches never reach the scan");
+        if self.quantized.is_some() {
+            self.admit_quantized(batch)?;
+        } else {
+            self.score_exact(batch, tie_break, stats)?;
         }
-        let init_start = Instant::now();
-        let init_stage = enter_vector_stage(Stage::ScanInit);
-        let max_doc = segment_reader.max_doc();
-        let non_vector_start = Instant::now();
-        let non_vector_stage = enter_vector_stage(Stage::NonVectorSearch);
-        let filter = build_segment_filter(weight, segment_reader, max_doc)?;
-        let alive = segment_reader.alive_bitset();
-        drop(non_vector_stage);
-        let non_vector_search_ns = non_vector_start.elapsed().as_nanos() as u64;
-        stats.non_vector_search_ns = stats
-            .non_vector_search_ns
-            .saturating_add(non_vector_search_ns);
-        if filter.is_empty() {
-            drop(init_stage);
-            stats.scan_init_ns = stats.scan_init_ns.saturating_add(
-                (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
-            );
-            return Ok(Vec::new());
-        }
-        let row_gate = RowGate::new(&filter, alive);
-        let mut cluster_docs = Vec::new();
-        let scan_levels = query.active_layers();
-        let quantized = self
-            .reader
-            .quantization()
-            .expect("quantized query requires quantized slots");
-        stats.segment_rows = Some(index.num_rows());
-        stats.segment_clusters = Some(index.num_clusters());
-        stats.start_layer(0);
-        let (work_budget, n_avg, x) = self
-            .adaptive
-            .resolved_work_budget(index.num_clusters(), index.num_docs())?;
-        let pricing = UnitPricing {
-            budget: WorkUnits::new(work_budget),
-            open: WorkUnits::new(x),
-            row: WorkUnits::new((1.0 - x) / n_avg),
-        };
-        let mut routing_ws = RouterWorkspace::default();
-        let candidate_capacity =
-            ((pricing.budget.get() / pricing.row.get()).ceil() as usize).min(index.num_rows());
-        let mut scan = QuantizedScanCtx::new(max_doc, candidate_capacity);
-        let mut postings_row = 0usize;
-        let mut postings_skipped = 0usize;
-        let bounds = index.bounds();
-        let metric = query.index.meta.field().metric;
-        let q_norm = norm_squared_wide(query.query()).sqrt() as f32;
-        let mut bounds_skips = 0u32;
-        let mut armed_probe = None;
-        let mut selection_offsets = Vec::new();
-        let mut kernel_scores = Vec::new();
-        let mut decoded_scales = Vec::new();
-        let mut decoded_gammas = Vec::new();
-        let mut decoded_error_ratios = Vec::new();
-        let mut decoded_constants = Vec::new();
-        let mut decoded_residual_norms = Vec::new();
-        let mut base_scores = Vec::new();
-        let mut estimate_scores = Vec::new();
-        let mut sigma_scores = Vec::new();
-        let mut residual_norm_squared_scores = Vec::new();
-        let mut sign_query_error_terms = Vec::new();
-        let mut arithmetic_variances = Vec::new();
-        let mut selected_rows = Vec::new();
-        let mut indexed_row_offsets = Vec::new();
-        let mut survivor_read_ranges = Vec::new();
-        let mut survivor_block_scratch = Vec::new();
-        drop(init_stage);
-        stats.scan_init_ns = stats.scan_init_ns.saturating_add(
-            (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
-        );
+        stats.candidates_scored += rows;
+        Ok(rows)
+    }
 
-        let routing = RoutingParams {
-            k: self.adaptive.router_k(
-                work_budget,
-                x,
-                filter.match_fraction(max_doc),
-                index.num_clusters(),
-            ),
-            recall: self.adaptive.router_recall_target,
-        };
-        let routing_start = Instant::now();
-        let (mut ranked, mut controller) = {
-            let _routing_stage = enter_vector_stage(Stage::Routing);
-            let ranked = index.rank_clusters(&mut routing_ws, query.query(), routing);
-            let estimator =
-                index.recall_estimator(&ranked, query.query(), self.adaptive.recall_target);
-            let controller = ProbeController::new(
-                pricing,
-                index.num_clusters(),
-                estimator,
-                self.adaptive.recall_target,
-            );
-            (ranked, controller)
-        };
-        let mut routing_ns = routing_start.elapsed().as_nanos() as u64;
-        let routing_before_scan = routing_ns;
-        let scan_start = Instant::now();
-        let layer0_stage = enter_vector_stage(Stage::LayerScan(0));
-
-        loop {
-            let routing_start = Instant::now();
-            let next = {
-                let _routing_stage = enter_vector_stage(Stage::Routing);
-                ranked.next()
-            };
-            routing_ns += routing_start.elapsed().as_nanos() as u64;
-            let Some(Candidate { sim, node }) = next else {
-                break;
-            };
-            if !controller.admit() {
-                break;
-            }
-            let cluster = node as usize;
-            // The bounds gate needs the pessimistic kth so a skip never
-            // drops a true top-k row; APS takes the point estimate, since
-            // the pessimistic radius inflates the query ball and
-            // underestimates recall.
-            let kth = scan
-                .running_pessimistic_kth(top_n, QUANTIZED_BOUNDARY_KAPPA)
-                .map(|score| score.0 .0);
-            let aps_kth = scan.running_estimate_kth(top_n);
-            let query_bound = kth.map_or(QueryBound::Filling, |score| QueryBound::Armed {
-                t: to_bound_space(metric, score),
-            });
-            let verdict = bounds_verdict(query_bound, || {
-                let QueryBound::Armed { t } = query_bound else {
-                    return f32::INFINITY;
-                };
-                #[cfg(debug_assertions)]
-                {
-                    let stride = self.reader.options().bytes_per_vector();
-                    let centroid_bytes = index.centroid_bytes().expect("readable centroid rows");
-                    let exact = metric.similarity_bytes::<f32>(
-                        query.query(),
-                        &centroid_bytes[cluster * stride..(cluster + 1) * stride],
-                    );
-                    debug_assert_eq!(
-                        sim, exact,
-                        "routing stream key must be the exact centroid similarity; the quantized \
-                         L2 base and query-residual norm are derived from it"
-                    );
-                }
-                let r = bounds.ball_r(cluster);
-                match metric {
-                    Metric::L2 | Metric::Cosine => {
-                        margin_ball_ball(t, r, to_bound_space(metric, sim.score()))
-                    }
-                    Metric::Dot => margin_ball_halfspace(sim.score(), q_norm, r, t),
-                }
-            });
-            if verdict == Verdict::Skip {
-                controller.charge_open();
-                controller.cover(aps_kth)?;
-                bounds_skips += 1;
-                continue;
-            }
-            controller.charge_open();
-            let rows = index.cluster_range(cluster);
-            // Empty clusters have no band to read and use the probe's empty-cluster counter.
-            if rows.is_empty() {
-                postings_skipped += 1;
-                stats.clusters_skipped_empty += 1;
-                controller.cover(aps_kth)?;
-                continue;
-            }
-            let layer = &quantized.layers()[0];
-            if !matches!(row_gate, RowGate::Open) {
-                self.reader.read_doc_ids(cluster, &mut cluster_docs)?;
-            }
-            let selection_start = Instant::now();
-            let (selection, visited, pruned_filter, pruned_dead) = {
-                let _routing_stage = enter_vector_stage(Stage::Routing);
-                select_cluster_rows(
-                    &cluster_docs,
-                    rows.clone(),
-                    &row_gate,
-                    &mut selection_offsets,
-                )
-            };
-            routing_ns += selection_start.elapsed().as_nanos() as u64;
-            stats.vectors_visited += visited;
-            stats.pruned_filter += pruned_filter;
-            stats.pruned_dead += pruned_dead;
-            let selected_count = selection.len(&rows);
-            if selected_count == 0 {
-                postings_skipped += 1;
-                stats.clusters_skipped_empty += 1;
-                controller.cover(aps_kth)?;
-                continue;
-            }
-
-            let batch = layer.read_batch_in_block(cluster, rows.clone())?;
-            let score_query_norm = query.score_query_norm(sim.score());
-            score_layer(
-                query,
-                0,
-                layer,
-                Some((&batch, &mut decoded_residual_norms)),
-                Some(cluster),
-                rows.clone(),
-                &selection,
-                &mut kernel_scores,
-                &mut decoded_scales,
-                &mut decoded_gammas,
-                &mut decoded_error_ratios,
-                &mut decoded_constants,
-                &mut survivor_read_ranges,
-                &mut selected_rows,
-                &mut indexed_row_offsets,
-            )?;
-            base_scores.resize(selected_count, 0.0);
-            estimate_scores.resize(selected_count, 0.0);
-            sigma_scores.resize(selected_count, 0.0);
-            residual_norm_squared_scores.resize(selected_count, 0.0);
-            sign_query_error_terms.resize(selected_count, 0.0);
-            arithmetic_variances.resize(selected_count, ArithmeticError::default());
-            let cluster_score = sim.score();
-            combine_initial_decoded(
-                metric,
-                query.index.meta.field().dim as usize,
-                &mut kernel_scores,
-                &mut base_scores,
-                &mut estimate_scores,
-                &mut sigma_scores,
-                &mut residual_norm_squared_scores,
-                &mut sign_query_error_terms,
-                &mut arithmetic_variances,
-                &decoded_scales,
-                &decoded_gammas,
-                &decoded_error_ratios,
-                &decoded_constants,
-                &decoded_residual_norms,
-                cluster_score,
-                score_query_norm * score_query_norm,
-                query.query_error_squared(0) as f32,
-            );
-
-            scan.set_cluster_query_norm(cluster, score_query_norm);
-            scan.begin_cluster(top_n);
-            scan.candidates.append_selected(
-                rows.clone(),
-                &selection,
-                (!matches!(row_gate, RowGate::Open)).then_some(cluster_docs.as_slice()),
-                &base_scores[..selected_count],
-                &kernel_scores[..selected_count],
-                &estimate_scores[..selected_count],
-                &sigma_scores[..selected_count],
-                &residual_norm_squared_scores[..selected_count],
-                &decoded_gammas[..selected_count],
-                &sign_query_error_terms[..selected_count],
-                &arithmetic_variances[..selected_count],
-            );
-            scan.finish_cluster_bound();
-            controller.charge_rows(selected_count);
-            stats.layer0_eligible += selected_count;
-            stats.eligible_charged += selected_count;
-            postings_row += 1;
-            let kth = scan
-                .running_pessimistic_kth(top_n, QUANTIZED_BOUNDARY_KAPPA)
-                .map(|score| score.0 .0);
-            if armed_probe.is_none() && kth.is_some() {
-                armed_probe = Some((postings_row + postings_skipped - 1) as u32);
-            }
-            controller.cover(scan.running_estimate_kth(top_n))?;
-        }
-        stats.record_routing(ranked.metrics());
-        stats.postings_row += postings_row;
-        stats.postings_skipped += postings_skipped;
-        stats.candidates_scored += scan.candidates.len();
-        let layer0_scored = scan.candidates.len();
-        stats.bounds_skips += bounds_skips;
-        stats.record_bound_armed(armed_probe);
-        controller.finish(stats);
-        drop(layer0_stage);
-        let scan_ns = scan_start.elapsed().as_nanos() as u64;
-        stats.routing_ns += routing_ns;
-        stats.record_layer_scan(
+    /// Scores a batch's rows on layer 0 from the cluster's whole band and appends them as
+    /// quantized candidates.
+    fn admit_quantized(&mut self, batch: &ClusterBatch<'_>) -> crate::Result<()> {
+        let state = self.quantized.as_mut().expect("quantized scan");
+        let scratch = &mut self.scratch;
+        let query = state.query;
+        let selected_count = batch.len();
+        let layer = &state.field.layers()[0];
+        let CentroidScore::Known(sim) = batch.centroid;
+        let cluster_score = sim.score();
+        let band = layer.read_batch_in_block(batch.cluster, batch.rows.clone())?;
+        let score_query_norm = query.score_query_norm(cluster_score);
+        score_layer(
+            query,
             0,
-            layer0_scored,
-            scan_ns.saturating_sub(routing_ns.saturating_sub(routing_before_scan)),
+            layer,
+            Some((&band, &mut scratch.decoded_residual_norms)),
+            Some(batch.cluster),
+            batch.rows.clone(),
+            &batch.selection,
+            &mut scratch.kernel_scores,
+            &mut scratch.decoded_scales,
+            &mut scratch.decoded_gammas,
+            &mut scratch.decoded_error_ratios,
+            &mut scratch.decoded_constants,
+            &mut scratch.read_ranges,
+            &mut scratch.selected_rows,
+            &mut scratch.row_offsets,
+        )?;
+        scratch.base_scores.resize(selected_count, 0.0);
+        scratch.estimate_scores.resize(selected_count, 0.0);
+        scratch.sigma_scores.resize(selected_count, 0.0);
+        scratch
+            .residual_norm_squared_scores
+            .resize(selected_count, 0.0);
+        scratch.sign_query_error_terms.resize(selected_count, 0.0);
+        scratch
+            .arithmetic_variances
+            .resize(selected_count, ArithmeticError::default());
+        combine_initial_decoded(
+            state.metric,
+            state.dimension,
+            &mut scratch.kernel_scores,
+            &mut scratch.base_scores,
+            &mut scratch.estimate_scores,
+            &mut scratch.sigma_scores,
+            &mut scratch.residual_norm_squared_scores,
+            &mut scratch.sign_query_error_terms,
+            &mut scratch.arithmetic_variances,
+            &scratch.decoded_scales,
+            &scratch.decoded_gammas,
+            &scratch.decoded_error_ratios,
+            &scratch.decoded_constants,
+            &scratch.decoded_residual_norms,
+            cluster_score,
+            score_query_norm * score_query_norm,
+            query.query_error_squared(0) as f32,
         );
+        state.set_centroid(batch.cluster, cluster_score);
+        let cluster_start = state.candidates.len();
+        state.candidates.append_selected(
+            batch.rows.clone(),
+            &batch.selection,
+            batch.docs,
+            &scratch.base_scores[..selected_count],
+            &scratch.kernel_scores[..selected_count],
+            &scratch.estimate_scores[..selected_count],
+            &scratch.sigma_scores[..selected_count],
+            &scratch.residual_norm_squared_scores[..selected_count],
+            &scratch.decoded_gammas[..selected_count],
+            &scratch.sign_query_error_terms[..selected_count],
+            &scratch.arithmetic_variances[..selected_count],
+        );
+        state
+            .candidates
+            .finish_cluster(cluster_start, &mut self.bound);
+        Ok(())
+    }
 
-        #[cfg(test)]
-        {
-            stats.quantized_trace.scored_rows = scan.candidates.rows.clone();
-            stats
-                .quantized_trace
-                .estimate_rows
-                .push(scan.candidates.estimate_trace());
+    /// Scores a batch's rows at full precision into the bound and the result heap. Rows that
+    /// cannot enter the top k skip the tie-break, and deferred documents are read only once a
+    /// row could enter the heap. Before the final stage the reads land in the `exact` IO slot;
+    /// at the final stage, in the rerank slot.
+    fn score_exact(
+        &mut self,
+        batch: &ClusterBatch<'_>,
+        tie_break: &mut K,
+        stats: &mut ProbeStats,
+    ) -> crate::Result<()> {
+        let final_stage = batch.stage == PlanStage::Final;
+        let fetch_start = Instant::now();
+        // Before the final stage, reads and scoring (lazy DocIds included) stay in `Exact`.
+        let mut fetch_stage = Some(enter_vector_stage(if final_stage {
+            Stage::RerankFetch
+        } else {
+            Stage::Exact
+        }));
+        let rows = match batch.selection {
+            Selection::All => ExactRows::Span(self.reader.read_cluster_rows(batch.cluster)?),
+            Selection::Rows(offsets) => {
+                self.scratch.exact_rows.clear();
+                self.scratch
+                    .exact_rows
+                    .extend(offsets.iter().map(|&offset| batch.rows.start + offset));
+                ExactRows::Planned(self.reader.read_vector_rows_planned(
+                    &self.scratch.exact_rows,
+                    &mut self.scratch.read_ranges,
+                    &mut self.scratch.block_scratch,
+                )?)
+            }
+        };
+        let score_stage = if final_stage {
+            drop(fetch_stage.take());
+            stats.rerank_fetch_ns += fetch_start.elapsed().as_nanos() as u64;
+            Some(enter_vector_stage(Stage::RerankScore))
+        } else {
+            None
+        };
+        let score_start = Instant::now();
+
+        let reader = self.reader;
+        let exact_query = self.exact_query;
+        let topn = &mut self.topn;
+        let bound = &mut self.bound;
+        let cluster_docs = &mut self.scratch.cluster_docs;
+        let mut docs_resolved = false;
+        let mut doc_at = |position: usize, offset: usize| -> crate::Result<DocId> {
+            match batch.docs {
+                SelectedDocs::ByClusterOffset(docs) => Ok(docs[offset]),
+                SelectedDocs::BySelection(docs) => Ok(docs[position]),
+                SelectedDocs::Deferred => {
+                    if !docs_resolved {
+                        reader.read_doc_ids(batch.cluster, cluster_docs)?;
+                        docs_resolved = true;
+                    }
+                    Ok(cluster_docs[offset])
+                }
+            }
+        };
+        let mut offer = |position: usize, offset: usize, bytes: &[u8]| -> crate::Result<()> {
+            let score = exact_query.score_doc_bytes(bytes);
+            bound.push_exact(score);
+            if bound.exact_kth().is_some_and(|kth| score < kth)
+                || topn
+                    .threshold
+                    .as_ref()
+                    .is_some_and(|((threshold, _), _)| score < *threshold)
+            {
+                return Ok(());
+            }
+            let doc = doc_at(position, offset)?;
+            if let Some(key) = tie_break_key(topn, tie_break, score, doc) {
+                topn.push_unordered(key, doc);
+            }
+            Ok(())
+        };
+        let scored = match &rows {
+            ExactRows::Span(bytes) => {
+                let stride = self.reader.options().bytes_per_vector();
+                for (local, vbytes) in bytes.chunks_exact(stride).enumerate() {
+                    #[cfg(test)]
+                    if !final_stage {
+                        stats
+                            .quantized_trace
+                            .scored_rows
+                            .push(batch.rows.start + local);
+                    }
+                    offer(local, local, vbytes)?;
+                }
+                bytes.len() / stride
+            }
+            ExactRows::Planned(planned) => {
+                let mut scored = 0;
+                for (position, (row, bytes)) in planned.iter().enumerate() {
+                    #[cfg(test)]
+                    if !final_stage {
+                        stats.quantized_trace.scored_rows.push(row);
+                    }
+                    offer(position, row - batch.rows.start, bytes)?;
+                    scored += 1;
+                }
+                scored
+            }
+        };
+        debug_assert_eq!(scored, batch.len());
+        drop(score_stage);
+        drop(fetch_stage);
+        if final_stage {
+            stats.rerank_score_ns += score_start.elapsed().as_nanos() as u64;
+            stats.rerank_rows += scored;
+            stats.exact_rows_read += scored;
+        } else {
+            stats.exact_ns += fetch_start.elapsed().as_nanos() as u64;
         }
+        Ok(())
+    }
 
+    /// Runs boundary `layer` over the quantized candidates.
+    fn boundary(&mut self, layer: usize, stats: &mut ProbeStats) {
+        let state = self.quantized.as_mut().expect("quantized scan");
         let boundary_start = Instant::now();
-        let boundary_stage = enter_vector_stage(Stage::Boundary(0));
-        scan.band(top_n, QUANTIZED_BOUNDARY_KAPPA);
+        let boundary_stage = enter_vector_stage(Stage::Boundary(layer as u8));
+        state.candidates.band(&mut self.bound);
         #[cfg(test)]
         stats
             .quantized_trace
             .boundary_rows
-            .push(scan.candidates.rows.clone());
+            .push(state.candidates.rows.clone());
         drop(boundary_stage);
         stats.record_boundary(
-            0,
-            scan.candidates.len(),
+            layer,
+            state.candidates.len(),
             boundary_start.elapsed().as_nanos() as u64,
         );
-        for layer_idx in 1..scan_levels {
-            stats.start_layer(layer_idx);
-            let layer_start = Instant::now();
-            let layer_stage = enter_vector_stage(Stage::LayerScan(layer_idx as u8));
-            let layer = &quantized.layers()[layer_idx];
-            let layer_scored = scan.candidates.len();
-            if metric == Metric::Cosine {
-                let query_norm = query.score_query_norm(0.0);
-                for candidate_range in cosine_refinement_batches(scan.candidates.len()) {
-                    let candidate_start = candidate_range.start;
-                    let candidate_end = candidate_range.end;
-                    let first_row = scan.candidates.rows[candidate_start];
-                    let last_row = scan.candidates.rows[candidate_end - 1];
-                    let available_rows = first_row..last_row + 1;
-                    let selection = candidate_selection(
-                        &scan.candidates.rows[candidate_range.clone()],
-                        &available_rows,
-                        &mut selection_offsets,
-                    );
-                    let rows = score_layer(
-                        query,
-                        layer_idx,
-                        layer,
-                        None,
-                        None,
-                        available_rows,
-                        &selection,
-                        &mut kernel_scores,
-                        &mut decoded_scales,
-                        &mut decoded_gammas,
-                        &mut decoded_error_ratios,
-                        &mut decoded_constants,
-                        &mut survivor_read_ranges,
-                        &mut selected_rows,
-                        &mut indexed_row_offsets,
-                    )?;
-                    let decoded_constants = if metric == Metric::L2 {
-                        &decoded_constants[..rows]
-                    } else {
-                        &[]
-                    };
-                    let sign_query_error_squared =
-                        if matches!(query.index.specs[layer_idx].kind, cascade::LayerKind::Sign) {
-                            query.query_error_squared(layer_idx) as f32
-                        } else {
-                            0.0
-                        };
-                    combine_refinement_decoded(
-                        metric,
-                        query.index.meta.field().dim as usize,
-                        &mut scan.candidates,
-                        candidate_range,
-                        &kernel_scores[..rows],
-                        &decoded_scales[..rows],
-                        &decoded_gammas[..rows],
-                        &decoded_error_ratios[..rows],
-                        decoded_constants,
-                        query_norm * query_norm,
-                        sign_query_error_squared,
-                    );
-                }
-            } else {
-                let mut candidate_start = 0;
-                let mut cluster = 0;
-                while candidate_start < scan.candidates.len() {
-                    let first_row = scan.candidates.rows[candidate_start];
-                    while cluster < index.num_clusters()
-                        && index.cluster_range(cluster).end <= first_row
-                    {
-                        cluster += 1;
-                    }
-                    if cluster == index.num_clusters() {
-                        return Err(TantivyError::DataCorruption(DataCorruption::comment_only(
-                            format!(
-                                "quantized survivor row {first_row} is outside IVF cluster ranges"
-                            ),
-                        )));
-                    }
-                    let cluster_rows = index.cluster_range(cluster);
-                    if first_row < cluster_rows.start {
-                        return Err(TantivyError::DataCorruption(DataCorruption::comment_only(
-                            format!(
-                                "quantized survivor row {first_row} precedes cluster {cluster} \
-                                 range {cluster_rows:?}"
-                            ),
-                        )));
-                    }
-                    let mut candidate_end = candidate_start + 1;
-                    while candidate_end < scan.candidates.len()
-                        && scan.candidates.rows[candidate_end] < cluster_rows.end
-                    {
-                        candidate_end += 1;
-                    }
-                    let query_norm = scan.cluster_query_norm(cluster);
-                    let candidate_range = candidate_start..candidate_end;
-                    let selection = candidate_selection(
-                        &scan.candidates.rows[candidate_range.clone()],
-                        &cluster_rows,
-                        &mut selection_offsets,
-                    );
-                    let rows = score_layer(
-                        query,
-                        layer_idx,
-                        layer,
-                        None,
-                        Some(cluster),
-                        cluster_rows,
-                        &selection,
-                        &mut kernel_scores,
-                        &mut decoded_scales,
-                        &mut decoded_gammas,
-                        &mut decoded_error_ratios,
-                        &mut decoded_constants,
-                        &mut survivor_read_ranges,
-                        &mut selected_rows,
-                        &mut indexed_row_offsets,
-                    )?;
-                    let decoded_constants = if metric == Metric::L2 {
-                        &decoded_constants[..rows]
-                    } else {
-                        &[]
-                    };
-                    let sign_query_error_squared =
-                        if matches!(query.index.specs[layer_idx].kind, cascade::LayerKind::Sign) {
-                            query.query_error_squared(layer_idx) as f32
-                        } else {
-                            0.0
-                        };
-                    combine_refinement_decoded(
-                        metric,
-                        query.index.meta.field().dim as usize,
-                        &mut scan.candidates,
-                        candidate_range,
-                        &kernel_scores[..rows],
-                        &decoded_scales[..rows],
-                        &decoded_gammas[..rows],
-                        &decoded_error_ratios[..rows],
-                        decoded_constants,
-                        query_norm * query_norm,
-                        sign_query_error_squared,
-                    );
-                    candidate_start = candidate_end;
-                }
-            }
-            drop(layer_stage);
-            stats.record_layer_scan(
-                layer_idx,
-                layer_scored,
-                layer_start.elapsed().as_nanos() as u64,
-            );
-            #[cfg(test)]
-            stats
-                .quantized_trace
-                .estimate_rows
-                .push(scan.candidates.estimate_trace());
-            let boundary_start = Instant::now();
-            let boundary_stage = enter_vector_stage(Stage::Boundary(layer_idx as u8));
-            scan.band(top_n, QUANTIZED_BOUNDARY_KAPPA);
-            #[cfg(test)]
-            stats
-                .quantized_trace
-                .boundary_rows
-                .push(scan.candidates.rows.clone());
-            drop(boundary_stage);
-            stats.record_boundary(
-                layer_idx,
-                scan.candidates.len(),
-                boundary_start.elapsed().as_nanos() as u64,
-            );
-        }
+    }
 
-        let rerank_fetch_start = Instant::now();
-        let rerank_fetch_stage = enter_vector_stage(Stage::RerankFetch);
+    /// Refines the boundary survivors with `layer`, then runs its boundary.
+    fn refine(&mut self, layer: usize, stats: &mut ProbeStats) -> crate::Result<()> {
+        stats.start_layer(layer);
+        let layer_start = Instant::now();
+        let layer_stage = enter_vector_stage(Stage::LayerScan(layer as u8));
+        let state = self.quantized.as_mut().expect("quantized scan");
+        let scored = state.candidates.len();
+        state.refine_layer(layer, self.index, &mut self.scratch)?;
+        drop(layer_stage);
+        stats.record_layer_scan(layer, scored, layer_start.elapsed().as_nanos() as u64);
+        #[cfg(test)]
+        stats
+            .quantized_trace
+            .estimate_rows
+            .push(state.candidates.estimate_trace());
+        self.boundary(layer, stats);
+        Ok(())
+    }
+
+    /// Scores the last boundary's survivors exactly, one cluster group at a time. Deferred
+    /// documents are resolved for each group before scoring.
+    fn score_final(&mut self, tie_break: &mut K, stats: &mut ProbeStats) -> crate::Result<()> {
+        let state = self.quantized.as_mut().expect("quantized scan");
+        let survivors =
+            std::mem::replace(&mut state.candidates, QuantizedCandidates::with_capacity(0));
         debug_assert!(
-            scan.candidates
-                .rows
-                .windows(2)
-                .all(|pair| pair[0] < pair[1]),
+            survivors.rows.windows(2).all(|pair| pair[0] < pair[1]),
             "boundary survivors are row-sorted"
         );
+        let mut offsets = std::mem::take(&mut self.scratch.group_offsets);
+        let mut docs = std::mem::take(&mut self.scratch.group_docs);
+        #[cfg(test)]
+        let mut rerank_docs = Vec::with_capacity(survivors.len());
         let mut first = 0;
         let mut cluster = 0;
-        while first < scan.candidates.len() {
-            while index.cluster_range(cluster).end <= scan.candidates.rows[first] {
+        while first < survivors.len() {
+            while self.index.cluster_range(cluster).end <= survivors.rows[first] {
                 cluster += 1;
             }
-            let cluster_rows = index.cluster_range(cluster);
-            let end = first
-                + scan.candidates.rows[first..].partition_point(|&row| row < cluster_rows.end);
-            if scan.candidates.docs[first..end].contains(&DocId::MAX) {
-                self.reader.read_doc_ids(cluster, &mut cluster_docs)?;
-                for candidate in first..end {
-                    if scan.candidates.docs[candidate] == DocId::MAX {
-                        scan.candidates.docs[candidate] =
-                            cluster_docs[scan.candidates.rows[candidate] - cluster_rows.start];
+            let cluster_rows = self.index.cluster_range(cluster);
+            let end =
+                first + survivors.rows[first..].partition_point(|&row| row < cluster_rows.end);
+            offsets.clear();
+            offsets.extend(
+                survivors.rows[first..end]
+                    .iter()
+                    .map(|&row| row - cluster_rows.start),
+            );
+            docs.clear();
+            docs.extend_from_slice(&survivors.docs[first..end]);
+            if docs.contains(&DocId::MAX) {
+                let fetch_start = Instant::now();
+                let _fetch_stage = enter_vector_stage(Stage::RerankFetch);
+                self.reader
+                    .read_doc_ids(cluster, &mut self.scratch.cluster_docs)?;
+                for (doc, &offset) in docs.iter_mut().zip(&offsets) {
+                    if *doc == DocId::MAX {
+                        *doc = self.scratch.cluster_docs[offset];
                     }
                 }
+                stats.rerank_fetch_ns += fetch_start.elapsed().as_nanos() as u64;
             }
+            #[cfg(test)]
+            rerank_docs.extend_from_slice(&docs);
+            let centroid = self
+                .quantized
+                .as_ref()
+                .expect("quantized scan")
+                .centroid(cluster);
+            let batch = ClusterBatch {
+                stage: PlanStage::Final,
+                cluster,
+                rows: cluster_rows,
+                selection: Selection::Rows(&offsets),
+                docs: SelectedDocs::BySelection(&docs),
+                centroid,
+            };
+            self.score_exact(&batch, tie_break, stats)?;
             first = end;
         }
         #[cfg(test)]
         {
-            stats.quantized_trace.rerank_docs = scan.candidates.docs.clone();
-            stats.quantized_trace.rerank_docs.sort_unstable();
+            rerank_docs.sort_unstable();
+            stats.quantized_trace.rerank_docs = rerank_docs;
         }
-        let rerank_batch = self.reader.read_vector_rows_planned(
-            &scan.candidates.rows,
-            &mut survivor_read_ranges,
-            &mut survivor_block_scratch,
-        )?;
-        drop(rerank_fetch_stage);
-        stats.rerank_fetch_ns += rerank_fetch_start.elapsed().as_nanos() as u64;
-        stats.rerank_rows += scan.candidates.len();
+        self.scratch.group_offsets = offsets;
+        self.scratch.group_docs = docs;
+        Ok(())
+    }
 
-        let mut topn =
-            TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator));
-        // Row-sorted survivors own their document ids; the batch ordinal addresses both.
-        for (candidate, (batch_row, bytes)) in rerank_batch.iter().enumerate() {
-            debug_assert_eq!(scan.candidates.rows[candidate], batch_row);
-            let doc = scan.candidates.docs[candidate];
-            let score_start = Instant::now();
+    /// Runs every stage after admission, then assembles the segment's hits.
+    fn finish(
+        mut self,
+        tie_break: &mut K,
+        stats: &mut ProbeStats,
+        segment_ord: SegmentOrdinal,
+    ) -> crate::Result<TieBreakHits<K>> {
+        if let Some(state) = &self.quantized {
+            let layers = state.query.active_layers();
+            #[cfg(test)]
             {
-                let _rerank_score_stage = enter_vector_stage(Stage::RerankScore);
-                let score = self.query.score_doc_bytes(bytes);
-                if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
-                    topn.push_unordered(key, doc);
-                }
+                stats.quantized_trace.scored_rows = state.candidates.rows.clone();
+                stats
+                    .quantized_trace
+                    .estimate_rows
+                    .push(state.candidates.estimate_trace());
             }
-            stats.rerank_score_ns += score_start.elapsed().as_nanos() as u64;
-            stats.exact_rows_read += 1;
+            self.boundary(0, stats);
+            for layer in 1..layers {
+                self.refine(layer, stats)?;
+            }
+            self.score_final(tie_break, stats)?;
         }
-        let segment_ord = self.segment_ord;
         let assembly_start = Instant::now();
         let _assembly_stage = enter_vector_stage(Stage::ResultAssembly);
-        let hits = topn
+        let hits = self
+            .topn
             .into_sorted_vec()
             .into_iter()
             .map(|candidate| {
@@ -2738,11 +2811,19 @@ impl<T: VectorElement> VectorBackend<T> {
         Ok(hits)
     }
 
-    /// Top-N by IVF probe. Fills `stats` with this segment's probe-loop
-    /// counters.
-    /// Returns the top matches from an IVF probe.
+    /// Quantized candidates currently live.
+    fn quantized_len(&self) -> usize {
+        self.quantized
+            .as_ref()
+            .map_or(0, |state| state.candidates.len())
+    }
+}
+
+impl<T: VectorElement> VectorBackend<T> {
+    /// Top-N within an IVF segment: one scan driver for quantized and full-precision segments.
+    /// The routed source supplies clusters; the scan scores them and runs the cascade.
     #[allow(clippy::too_many_arguments)]
-    fn approximate_top_n<K, CTail>(
+    fn ivf_top_n<K, CTail>(
         &self,
         index: &IvfIndex,
         weight: &dyn Weight,
@@ -2756,48 +2837,39 @@ impl<T: VectorElement> VectorBackend<T> {
         K: SegmentSortKeyComputer,
         CTail: Comparator<K::SegmentSortKey>,
     {
-        if top_n == 0 {
+        let max_doc = segment_reader.max_doc();
+        if top_n == 0 || max_doc == 0 || index.num_clusters() == 0 {
             return Ok(Vec::new());
         }
         let init_start = Instant::now();
         let init_stage = enter_vector_stage(Stage::ScanInit);
-        let max_doc = segment_reader.max_doc();
-        if max_doc == 0 {
-            return Ok(Vec::new());
-        }
-
         let non_vector_start = Instant::now();
         let non_vector_stage = enter_vector_stage(Stage::NonVectorSearch);
-        let filter = build_segment_filter(weight, segment_reader, max_doc)?;
+        let filter = collect_segment_filter(weight, segment_reader, max_doc)?;
         drop(non_vector_stage);
         let non_vector_search_ns = non_vector_start.elapsed().as_nanos() as u64;
         stats.non_vector_search_ns = stats
             .non_vector_search_ns
             .saturating_add(non_vector_search_ns);
-        if filter.is_empty() {
-            drop(init_stage);
+        let finish_init = |stats: &mut ProbeStats| {
             stats.scan_init_ns = stats.scan_init_ns.saturating_add(
                 (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
             );
+        };
+        if filter.is_empty() {
+            drop(init_stage);
+            finish_init(stats);
             return Ok(Vec::new());
         }
         let alive = segment_reader.alive_bitset();
+        stats.segment_rows = Some(index.num_rows());
+        stats.segment_clusters = Some(index.num_clusters());
 
-        let num_centroids = index.num_clusters();
-        if num_centroids == 0 {
-            drop(init_stage);
-            stats.scan_init_ns = stats.scan_init_ns.saturating_add(
-                (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
-            );
-            return Ok(Vec::new());
-        }
-        // Capacity counts native docs as WRITTEN (deleted rows still
-        // charge on first touch - see `WorkModel::for_searcher`), and the
-        // open share x is derived from the index's own n_avg at query
-        // init - see `open_share`.
+        // Capacity counts native docs as WRITTEN (deleted rows still charge on first touch; see
+        // `WorkModel::for_searcher`), and the open share x comes from the index's own n_avg.
         let (work_budget, n_avg, x) = self
             .adaptive
-            .resolved_work_budget(num_centroids, index.num_docs())?;
+            .resolved_work_budget(index.num_clusters(), index.num_docs())?;
         debug_assert!(n_avg > 0.0);
         let pricing = UnitPricing {
             budget: WorkUnits::new(work_budget),
@@ -2805,319 +2877,97 @@ impl<T: VectorElement> VectorBackend<T> {
             row: WorkUnits::new((1.0 - x) / n_avg),
         };
 
-        // Phase 1: rank the clusters to probe, lazily — the scan below pulls
-        // ranked clusters on demand, so routing cost is paid only as far as
-        // probing actually reaches. The filter-effective budget can pull far
-        // past its nominal cluster count on a selective filter (each passed-
-        // over cluster streams few unseen rows), and lazy routing keeps that
-        // cheap.
-        // Routing operates in `f32` (centroid rows are `f32` today), so the
-        // query is widened losslessly per element.
-        let query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
-        let mut routing_ws = RouterWorkspace::default();
-        stats.segment_rows = Some(index.num_rows());
-        stats.segment_clusters = Some(index.num_clusters());
-        drop(init_stage);
-        stats.scan_init_ns = stats.scan_init_ns.saturating_add(
-            (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
-        );
-        // The stacked router is told how many clusters this budget buys
-        // under the filter and the recall target; it drops to the fixed
-        // nprobe path itself when the dimension is past `APS_MAX_DIM`.
+        // Routing runs in `f32`: a quantized query in its prepared form, otherwise the raw query
+        // widened losslessly per element.
+        let (mut scan, routing_query, accounting, admission_stage) = match &self.quantized_query {
+            Some(query) => {
+                let field = self
+                    .reader
+                    .quantization()
+                    .expect("quantized query requires quantized slots");
+                stats.start_layer(0);
+                let candidate_capacity = ((pricing.budget.get() / pricing.row.get()).ceil()
+                    as usize)
+                    .min(index.num_rows());
+                (
+                    SegmentScan::quantized(
+                        &self.reader,
+                        index,
+                        &self.query,
+                        query,
+                        field,
+                        top_n,
+                        tie_comparator,
+                        candidate_capacity,
+                    ),
+                    query.query().to_vec(),
+                    RoutedAccounting::Quantized,
+                    Stage::LayerScan(0),
+                )
+            }
+            None => (
+                SegmentScan::exact(&self.reader, index, &self.query, top_n, tie_comparator),
+                self.query.query().iter().map(|e| e.to_f32()).collect(),
+                RoutedAccounting::FullPrecision,
+                Stage::ExactScan,
+            ),
+        };
+        let metric = self.query.metric();
+        let query_norm = match &self.quantized_query {
+            Some(query) => norm_squared_wide(query.query()).sqrt() as f32,
+            None => norm_squared_wide(self.query.query()).sqrt() as f32,
+        };
+        let gate = RowGate::new(filter.docs(), alive);
+        // The stacked router is told how many clusters this budget buys under the filter and
+        // the recall target; it drops to the fixed nprobe path itself past `APS_MAX_DIM`.
         let routing = RoutingParams {
             k: self.adaptive.router_k(
                 work_budget,
                 x,
                 filter.match_fraction(max_doc),
-                num_centroids,
+                index.num_clusters(),
             ),
             recall: self.adaptive.router_recall_target,
         };
-        let routing_start = Instant::now();
-        let (mut ranked, controller) = {
-            let _routing_stage = enter_vector_stage(Stage::Routing);
-            let ranked = index.rank_clusters(&mut routing_ws, &query_f32, routing);
-            let estimator =
-                index.recall_estimator(&ranked, &query_f32, self.adaptive.recall_target);
-            let controller = ProbeController::new(
-                pricing,
-                num_centroids,
-                estimator,
-                self.adaptive.recall_target,
-            );
-            (ranked, controller)
-        };
-        let mut routing_ns = routing_start.elapsed().as_nanos() as u64;
-        let routing_before_scan = routing_ns;
+        let mut workspace = RouterWorkspace::default();
+        drop(init_stage);
+        finish_init(stats);
 
-        let scan_start = Instant::now();
-        let exact_scan_stage = enter_vector_stage(Stage::ExactScan);
-        let topn = self.scan_clusters(
+        let mut source = RoutedClusters::new(
             index,
-            &mut ranked,
-            controller,
-            &RowGate::new(&filter, alive),
-            top_n,
-            tie_break,
-            tie_comparator,
-            &query_f32,
+            &self.reader,
+            RoutedQuery {
+                vector: &routing_query,
+                norm: query_norm,
+                metric,
+            },
+            &mut workspace,
+            routing,
+            pricing,
+            self.adaptive.recall_target,
+            &gate,
+            accounting,
             stats,
-            &mut routing_ns,
-        )?;
-        drop(exact_scan_stage);
-        stats.routing_ns += routing_ns;
-        stats.exact_scan_ns = Some(
-            scan_start
-                .elapsed()
-                .as_nanos()
-                .saturating_sub(u128::from(routing_ns.saturating_sub(routing_before_scan)))
-                as u64,
         );
-
-        stats.record_routing(ranked.metrics());
-
-        let segment_ord = self.segment_ord;
-        let assembly_start = Instant::now();
-        let _assembly_stage = enter_vector_stage(Stage::ResultAssembly);
-        let hits = topn
-            .into_sorted_vec()
-            .into_iter()
-            .map(|cd| (cd.sort_key, DocAddress::new(segment_ord, cd.doc)))
-            .collect();
-        stats.result_assembly_ns = Some(assembly_start.elapsed().as_nanos() as u64);
-        Ok(hits)
-    }
-
-    /// Probes ranked clusters under bounds and work-budget gates, filtering before payload reads.
-    #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
-    fn scan_clusters<K, CTail>(
-        &self,
-        index: &IvfIndex,
-        ranked: &mut impl Iterator<Item = Candidate>,
-        mut controller: ProbeController<'_>,
-        row_gate: &RowGate<'_>,
-        top_n: usize,
-        tie_break: &mut K,
-        tie_comparator: CTail,
-        routing_query: &[f32],
-        stats: &mut ProbeStats,
-        routing_ns: &mut u64,
-    ) -> crate::Result<TieBreakHeap<K, CTail>>
-    where
-        K: SegmentSortKeyComputer,
-        CTail: Comparator<K::SegmentSortKey>,
-    {
-        let mut topn =
-            TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator));
-        // `candidates` is the cumulative scored count that drives the gate; the
-        // prune counters accumulate into locals and fold into `ProbeStats` once
-        // after the loop, keeping the hot per-doc path free of indirection.
-        let mut candidates = 0usize;
-        let mut visited = 0usize;
-        let mut pruned_filter = 0usize;
-        let mut pruned_dead = 0usize;
-        let mut postings_row = 0usize;
-        let mut postings_skipped = 0usize;
-        let mut bounds_skips = 0u32;
-        // P2: the query bound, maintained at cluster boundaries. The
-        // bound-space conversion runs on kth improvement only, inside the
-        // tracker.
-        let metric = self.query.metric();
-        let mut bound_tracker = QueryBoundTracker::new();
-        // P4: `||q||` for the dot margin's Cauchy-Schwarz term; once per
-        // segment-query.
-        let q_norm = norm_squared_wide(self.query.query()).sqrt() as f32;
-        let bounds = index.bounds();
-        // The probed cluster's gate survivors; allocated once, reused
-        // across clusters.
-        let mut cluster_docs = Vec::new();
-        let mut selection_offsets = Vec::new();
-        let mut selected_rows = Vec::new();
-        let mut read_ranges = Vec::new();
-        let mut block_scratch = Vec::new();
-        // The heap's kth after the last covered cluster.
-        let mut kth: Option<Score> = None;
-
-        loop {
-            let routing_start = Instant::now();
-            let next = {
-                let _routing_stage = enter_vector_stage(Stage::Routing);
-                ranked.next()
-            };
-            *routing_ns += routing_start.elapsed().as_nanos() as u64;
-            let Some(Candidate { sim, node: cluster }) = next else {
-                break;
-            };
-            if !controller.admit() {
-                break;
-            }
-            let cluster = cluster as usize;
-
-            // P5: the bounds verdict. The bound is consumed only through
-            // `Armed` (the heap holds k results) — enforced by the enum;
-            // Filling probes, and SATURATED probes arithmetically (+inf
-            // margin). The margin closure runs on armed clusters only.
-            let qb = bound_tracker.bound();
-            let verdict = bounds_verdict(qb, || {
-                let QueryBound::Armed { t } = qb else {
-                    // `bounds_verdict` never calls the margin while
-                    // Filling; +inf keeps even that impossibility
-                    // fail-open.
-                    return f32::INFINITY;
-                };
-                // The separation IS the routing key the ranked stream
-                // already computed: `to_bound_space` maps the similarity
-                // key into the metric's distance space for L2/cosine
-                // (the heap-key and routing-key spaces coincide), and
-                // dot consumes the raw `q . c` key directly.
-                #[cfg(debug_assertions)]
-                {
-                    // Precondition of every margin: the stream key is the
-                    // EXACT centroid similarity — an approximate key
-                    // makes a skip unsound.
-                    let stride = self.reader.options().bytes_per_vector();
-                    let centroid_bytes = index.centroid_bytes().expect("readable centroid rows");
-                    let exact = metric.similarity_bytes::<f32>(
-                        routing_query,
-                        &centroid_bytes[cluster * stride..(cluster + 1) * stride],
-                    );
-                    debug_assert_eq!(
-                        sim, exact,
-                        "routing stream key must be the exact centroid similarity"
-                    );
-                }
-                let r = bounds.ball_r(cluster);
-                match metric {
-                    Metric::L2 | Metric::Cosine => {
-                        margin_ball_ball(t, r, to_bound_space(metric, sim.score()))
-                    }
-                    Metric::Dot => margin_ball_halfspace(sim.score(), q_norm, r, t),
-                }
-            });
-            if let Verdict::Skip = verdict {
-                // A skip charges the open share: skips are search work,
-                // and free skips break the work identity (validated to
-                // +-0.03% in benchmarks). No row work is spent.
-                controller.charge_open();
-                controller.cover(kth)?;
-                bounds_skips += 1;
-                continue;
-            }
-
-            // Event-wise charging, part 1: the open.
-            controller.charge_open();
-
-            let rows = index.cluster_range(cluster);
-
-            if rows.is_empty() {
-                postings_skipped += 1;
-                controller.cover(kth)?;
-                continue;
-            }
-            let open = matches!(row_gate, RowGate::Open);
-            if !open {
-                self.reader.read_doc_ids(cluster, &mut cluster_docs)?;
-            }
-            let (selection, v, pf, pd) = select_cluster_rows(
-                &cluster_docs,
-                rows.clone(),
-                row_gate,
-                &mut selection_offsets,
-            );
-            visited += v;
-            pruned_filter += pf;
-            pruned_dead += pd;
-            let scored_rows = selection.len(&rows);
-            controller.charge_rows(scored_rows);
-            candidates += scored_rows;
-            if scored_rows == 0 {
-                postings_skipped += 1;
-            } else {
-                postings_row += 1;
-                if open {
-                    let bytes = self.reader.read_cluster_rows(cluster)?;
-                    let mut docs_resolved = false;
-                    for (local, vbytes) in bytes
-                        .chunks_exact(self.reader.options().bytes_per_vector())
-                        .enumerate()
-                    {
-                        #[cfg(test)]
-                        stats.quantized_trace.scored_rows.push(rows.start + local);
-                        let score = self.query.score_doc_bytes(vbytes);
-                        if topn
-                            .threshold
-                            .as_ref()
-                            .is_some_and(|((threshold, _), _)| score < *threshold)
-                        {
-                            continue;
-                        }
-                        if !docs_resolved {
-                            self.reader.read_doc_ids(cluster, &mut cluster_docs)?;
-                            docs_resolved = true;
-                        }
-                        let doc = cluster_docs[local];
-                        if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
-                            topn.push_unordered(key, doc);
-                        }
-                    }
-                } else {
-                    selected_rows.clear();
-                    match selection {
-                        Selection::All => selected_rows.extend(rows.clone()),
-                        Selection::Rows(offsets) => {
-                            selected_rows.extend(offsets.iter().map(|&offset| rows.start + offset))
-                        }
-                        Selection::None => unreachable!("nonempty selection"),
-                    }
-                    let batch = self.reader.read_vector_rows_planned(
-                        &selected_rows,
-                        &mut read_ranges,
-                        &mut block_scratch,
-                    )?;
-                    for (row, bytes) in batch.iter() {
-                        #[cfg(test)]
-                        stats.quantized_trace.scored_rows.push(row);
-                        let doc = cluster_docs[row - rows.start];
-                        let score = self.query.score_doc_bytes(bytes);
-                        if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
-                            topn.push_unordered(key, doc);
-                        }
-                    }
-                }
-            }
-
-            // P2: fold the exact kth into the bound at the cluster
-            // boundary. `kth_best` is O(buffer) and force-truncates —
-            // results and every counter above are unaffected (truncation
-            // only drops already-lost entries and tightens the push
-            // threshold, which prunes pushes, not scoring).
-            let probe_idx = (postings_row + postings_skipped - 1) as u32;
-            kth = topn.kth_best().map(|(score, _tie)| score);
-            bound_tracker.observe(metric, HeapPeek::from_kth(kth), probe_idx);
-            controller.cover(kth)?;
-        }
-        // The armed index exists exactly when the bound armed.
-        debug_assert!(
-            bound_tracker.armed_at_probe().is_some()
-                == matches!(bound_tracker.bound(), QueryBound::Armed { .. })
-        );
-
-        stats.vectors_visited += visited;
-        stats.pruned_filter += pruned_filter;
-        stats.pruned_dead += pruned_dead;
-        stats.postings_row += postings_row;
-        stats.postings_skipped += postings_skipped;
-        stats.candidates_scored += candidates;
-        stats.bounds_skips += bounds_skips;
-        stats.record_bound_armed(bound_tracker.armed_at_probe());
-        controller.finish(stats);
-        #[cfg(test)]
+        let admission_start = Instant::now();
+        let exact_before = stats.exact_ns;
         {
-            stats.quantized_trace.scored_docs.sort_unstable();
+            let _admission_stage = enter_vector_stage(admission_stage);
+            admit_all(&mut scan, &mut source, tie_break, stats)?;
         }
-
-        Ok(topn)
+        let admission_ns = admission_start.elapsed().as_nanos() as u64;
+        let routing_before = stats.routing_ns;
+        source.finish(stats);
+        let scan_ns = admission_ns
+            .saturating_sub(stats.routing_ns - routing_before)
+            .saturating_sub(stats.exact_ns - exact_before);
+        match accounting {
+            RoutedAccounting::Quantized => {
+                stats.record_layer_scan(0, scan.quantized_len(), scan_ns)
+            }
+            RoutedAccounting::FullPrecision => stats.exact_scan_ns = Some(scan_ns),
+        }
+        scan.finish(tie_break, stats, self.segment_ord)
     }
 }
 
@@ -3161,7 +3011,7 @@ impl SegmentFilter {
 /// this drain is real cost otherwise hidden in the search entry.
 /// Materializes a filter doc set as a dense bitset unless it matches all docs.
 #[inline(never)]
-fn build_segment_filter(
+fn collect_segment_filter(
     weight: &dyn Weight,
     segment_reader: &SegmentReader,
     max_doc: DocId,
@@ -3210,6 +3060,7 @@ mod tests {
         Query, Scorer, TermQuery,
     };
     use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
+    use crate::vector::cluster_source::select_cluster_rows;
     use crate::vector::prepared::QuantizedIndexCtx;
     use crate::vector::tests::{exhaustive_params, TestVectorIndex};
     use crate::vector::{
@@ -3242,8 +3093,13 @@ mod tests {
             ),
             (200..202, vec![11u32, 13], RowGate::Open),
         ] {
-            let (selection, visited, filtered, dead) =
+            let (all, visited, filtered, dead) =
                 select_cluster_rows(&docs, rows.clone(), &gate, &mut offsets);
+            let selection = if all {
+                Selection::All
+            } else {
+                Selection::Rows(&offsets)
+            };
             assert_eq!(visited, docs.len());
             assert_eq!(filtered, docs.len() - 2);
             assert_eq!(dead, 0);
@@ -3251,7 +3107,11 @@ mod tests {
             candidates.append_selected(
                 rows,
                 &selection,
-                (!matches!(gate, RowGate::Open)).then_some(docs.as_slice()),
+                if matches!(gate, RowGate::Open) {
+                    SelectedDocs::Deferred
+                } else {
+                    SelectedDocs::ByClusterOffset(&docs)
+                },
                 &scores,
                 &scores,
                 &scores,
@@ -3496,7 +3356,7 @@ mod tests {
     }
 
     fn push_test_candidate(
-        scan: &mut QuantizedScanCtx,
+        scan: &mut BoundaryHarness,
         row: usize,
         doc: DocId,
         estimate: f32,
@@ -4270,7 +4130,7 @@ mod tests {
             let weight_for =
                 |query: &dyn Query| query.weight(EnableScoring::disabled_from_searcher(&searcher));
             let filter_for = |query: &dyn Query| -> crate::Result<SegmentFilter> {
-                build_segment_filter(weight_for(query)?.as_ref(), segment_reader, max_doc)
+                collect_segment_filter(weight_for(query)?.as_ref(), segment_reader, max_doc)
             };
 
             assert!(matches!(filter_for(&AllQuery)?, SegmentFilter::All));
@@ -5066,6 +4926,12 @@ mod tests {
             work_budget: 1.5,
             segment_rows: Some(100),
             segment_clusters: Some(5),
+            exact_ns: 30,
+            exact_io: super::super::VectorIoStats {
+                reads: 1,
+                bytes_read: 512,
+                storage_blocks: 1,
+            },
             ..Default::default()
         };
         stats.start_layer(0);
@@ -5102,6 +4968,10 @@ mod tests {
         assert_eq!(object.remove("rerank_bytes_read").unwrap(), 256);
         assert_eq!(object.remove("rerank_storage_blocks").unwrap(), 3);
         assert!(!object.contains_key("rerank_io"));
+        assert_eq!(object.remove("exact_reads").unwrap(), 1);
+        assert_eq!(object.remove("exact_bytes_read").unwrap(), 512);
+        assert_eq!(object.remove("exact_storage_blocks").unwrap(), 1);
+        assert!(!object.contains_key("exact_io"));
         assert_eq!(
             value,
             serde_json::json!({
@@ -5109,6 +4979,7 @@ mod tests {
                 "layer0_eligible": 10,
                 "clusters_skipped_empty": 2,
                 "eligible_charged": 10,
+                "exact_ns": 30,
                 "layer0_scan_ns": 250,
                 "layer0_scored": 10,
                 "layer0_survivors": 8,
@@ -5161,7 +5032,7 @@ mod tests {
 
     #[test]
     fn quantized_boundary_kth_uses_the_row_tie_for_sigma() {
-        let mut scan = QuantizedScanCtx::new(3, 3);
+        let mut scan = BoundaryHarness::new(3);
         scan.begin_cluster(2);
         for (row, score, sigma) in [(0, 10.0, 0.0), (1, 9.0, 1.0), (2, 9.0, 100.0)] {
             push_test_candidate(&mut scan, row, row as DocId, score, sigma);
@@ -5183,7 +5054,7 @@ mod tests {
     /// best estimate.
     #[test]
     fn running_estimate_kth_bounds_the_kth_estimate() {
-        let mut scan = QuantizedScanCtx::new(3, 3);
+        let mut scan = BoundaryHarness::new(3);
         assert_eq!(scan.running_estimate_kth(2), None);
         scan.begin_cluster(2);
         // Lower endpoints at kappa 2: 10, 7, 4. The top-2 by lower endpoint
@@ -5204,7 +5075,7 @@ mod tests {
     #[test]
     fn cluster_local_admission_kth_matches_full_partition() {
         const TOP_N: usize = 4;
-        let mut scan = QuantizedScanCtx::new(12, 24);
+        let mut scan = BoundaryHarness::new(24);
         for cluster in 0..6 {
             scan.begin_cluster(TOP_N);
             for row in cluster * 4..cluster * 4 + 4 {
@@ -5225,7 +5096,7 @@ mod tests {
         }
     }
 
-    fn independent_admission_top(scan: &QuantizedScanCtx, top_n: usize) -> Vec<usize> {
+    fn independent_admission_top(scan: &BoundaryHarness, top_n: usize) -> Vec<usize> {
         let mut indices = (0..scan.candidates.len()).collect::<Vec<_>>();
         indices.sort_unstable_by(|&left, &right| {
             let left_estimate =
@@ -5261,7 +5132,7 @@ mod tests {
         ];
 
         for top_n in [1, 3] {
-            let mut scan = QuantizedScanCtx::new(16, 16);
+            let mut scan = BoundaryHarness::new(16);
             for (cluster, rows) in clusters.iter().enumerate() {
                 scan.begin_cluster(top_n);
                 for &(row, doc, estimate, sigma) in *rows {
@@ -5270,11 +5141,7 @@ mod tests {
                 scan.finish_cluster_bound_with_kappa(2.0);
 
                 let expected = independent_admission_top(&scan, top_n);
-                let actual_rows = scan
-                    .bound_top
-                    .iter()
-                    .map(|&index| scan.candidates.rows[index])
-                    .collect::<Vec<_>>();
+                let actual_rows = scan.running_rows();
                 let expected_rows = expected
                     .iter()
                     .map(|&index| scan.candidates.rows[index])
@@ -5445,7 +5312,7 @@ mod tests {
         let (_, first_kth) = cascade::kth(&lower, TOP_N);
         let harness_first = cascade::band_filter(&layer0_scores, &layer0_sigmas, KAPPA, first_kth);
 
-        let mut scan = QuantizedScanCtx::new(CANDIDATES as DocId, CANDIDATES);
+        let mut scan = BoundaryHarness::new(CANDIDATES);
         for row in 0..CANDIDATES {
             push_test_candidate(
                 &mut scan,
@@ -5512,7 +5379,7 @@ mod tests {
 
     #[test]
     fn quantized_boundary_filters_with_finite_sigmas() {
-        let mut scan = QuantizedScanCtx::new(3, 3);
+        let mut scan = BoundaryHarness::new(3);
         for (row, score) in [(0, 100.0), (1, 99.0), (2, -100.0)] {
             push_test_candidate(&mut scan, row, row as DocId, score, 0.1);
         }

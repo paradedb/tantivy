@@ -29,10 +29,15 @@ impl VectorIoStats {
         }
     }
 }
+/// Counter slots: layer scans 0..3, the final stage (serialized as `rerank_*`), and exact reads
+/// before the final stage.
+pub(crate) const IO_SLOTS: usize = 5;
+pub(crate) const RERANK_SLOT: usize = 3;
+pub(crate) const EXACT_SLOT: usize = 4;
 thread_local! {
-    static COUNTERS: Cell<[VectorIoStats; 4]> = const { Cell::new([VectorIoStats { reads: 0, bytes_read: 0, storage_blocks: 0 }; 4]) };
+    static COUNTERS: Cell<[VectorIoStats; IO_SLOTS]> = const { Cell::new([VectorIoStats { reads: 0, bytes_read: 0, storage_blocks: 0 }; IO_SLOTS]) };
 }
-pub(crate) fn snapshot() -> [VectorIoStats; 4] {
+pub(crate) fn snapshot() -> [VectorIoStats; IO_SLOTS] {
     COUNTERS.get()
 }
 
@@ -45,7 +50,8 @@ impl VectorRead for FileSlice {
         let bytes = self.read_bytes()?;
         let slot = match current_vector_stage() {
             Stage::LayerScan(l) if l < 3 => Some(l as usize),
-            Stage::RerankFetch => Some(3),
+            Stage::RerankFetch => Some(RERANK_SLOT),
+            Stage::Exact => Some(EXACT_SLOT),
             _ => None,
         };
         if let Some(slot) = slot {

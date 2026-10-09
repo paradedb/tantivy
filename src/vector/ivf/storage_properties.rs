@@ -683,6 +683,97 @@ fn zero_row_cluster_skips_band_reads() -> crate::Result<()> {
     Ok(())
 }
 
+/// A routed cluster whose rows all fail the filter is skipped once its DocIds are read: no band
+/// or row read, one skipped posting, and only the open charged. Quantized segments also count the
+/// skip in `clusters_skipped_empty`; full-precision segments count it in `postings_skipped`
+/// alone.
+#[test]
+fn filtered_empty_cluster_skips_band_reads() -> crate::Result<()> {
+    use crate::vector::Stage;
+    for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+        for schedule in [&[][..], &[1][..]] {
+            let (index, directory) = fixture_with_deletes(metric, schedule, false)?;
+            let reader = index.reader()?;
+            let searcher = reader.searcher();
+            let field = index.schema().get_field("embedding")?;
+            let label = index.schema().get_field("label")?;
+            let vectors = searcher.segment_readers()[0].vector_index(field)?;
+            let ivf = vectors.index().unwrap();
+            let doc_ranges = doc_column_ranges(&vectors, &directory)?;
+            // Cluster 2 holds even docs; the filter matches doc 0 alone, which is in cluster 1.
+            let cluster = 2;
+            let rows = ivf.cluster_range(cluster).len();
+            let context = format!("metric={metric:?} schedule={schedule:?} cluster={cluster}");
+            assert!(rows > 0, "{context} row=all column=Rows");
+            let query = input_vector(42);
+            let prepared =
+                crate::vector::prepared::PreparedQuery::new(metric, Arc::new(query.clone()));
+            let centroids = ivf.centroid_bytes()?;
+            let candidate = crate::vector::ivf::Candidate {
+                node: cluster as u32,
+                sim: metric.similarity_bytes::<f32>(
+                    prepared.query(),
+                    &centroids[cluster * DIM * 4..(cluster + 1) * DIM * 4],
+                ),
+            };
+            let params = AdaptiveProbeParams {
+                max_probe_fraction: 1.0,
+                min_probe_clusters: 4,
+                ..Default::default()
+            };
+            let (_, _, open) = params.resolved_work_budget(ivf.num_clusters(), ivf.num_docs())?;
+            let collector =
+                TopDocsByVectorSimilarity::new(field, query, 10).with_adaptive_params(params);
+            let filter =
+                TermQuery::new(Term::from_field_text(label, "d0"), IndexRecordOption::Basic);
+            directory.reads.lock().unwrap().clear();
+            let fruit = crate::vector::router::with_test_clusters(vec![candidate], || {
+                searcher.search(&filter, &collector)
+            })?;
+            let stats = &fruit.stats[0];
+            assert!(fruit.results.is_empty(), "{context} results");
+            assert_eq!(stats.postings_row, 0, "{context} probed postings");
+            assert_eq!(stats.postings_skipped, 1, "{context} skipped postings");
+            assert_eq!(
+                stats.clusters_skipped_empty,
+                usize::from(!schedule.is_empty()),
+                "{context} empty counter"
+            );
+            assert_eq!(stats.vectors_visited, rows, "{context} visits");
+            assert_eq!(stats.pruned_filter, rows, "{context} filtered rows");
+            assert_eq!(stats.candidates_scored, 0, "{context} scored rows");
+            assert_eq!(stats.eligible_charged, 0, "{context} charged rows");
+            assert_eq!(stats.work_charged, open as f32, "{context} work charges the open alone");
+            let reads = directory.reads.lock().unwrap();
+            // Admission reads the cluster's DocIds and nothing else; no rows are scored.
+            let admission: Vec<_> = reads
+                .iter()
+                .filter(|(stage, _)| {
+                    if schedule.is_empty() {
+                        matches!(stage, Stage::ExactScan)
+                    } else {
+                        matches!(stage, Stage::LayerScan(0))
+                    }
+                })
+                .map(|(_, range)| range.clone())
+                .collect();
+            assert_eq!(
+                admission,
+                vec![doc_ranges[cluster].clone().unwrap()],
+                "{context} column=DocIds only"
+            );
+            assert!(
+                !reads.iter().any(|(stage, _)| matches!(
+                    stage,
+                    Stage::Exact | Stage::RerankFetch | Stage::LayerScan(1..)
+                )),
+                "{context} column=Rows unread"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Captures one column request per nonempty cluster before the measured probe.
 fn doc_column_ranges(
     vectors: &crate::vector::VectorIndexReader,
@@ -846,7 +937,8 @@ fn filtered_clusters_read_doc_ids_before_payload() -> crate::Result<()> {
             .iter()
             .filter(|(stage, _)| {
                 if schedule.is_empty() {
-                    matches!(stage, Stage::ExactScan)
+                    // DocIds are read during admission, rows when scored exactly.
+                    matches!(stage, Stage::ExactScan | Stage::Exact)
                 } else {
                     matches!(stage, Stage::LayerScan(0))
                 }
@@ -948,23 +1040,30 @@ fn exact_filter_reads_only_survivor_pages() -> crate::Result<()> {
     let result = searcher.search(&filter, &collector)?;
     assert_eq!(result.results, expected);
     let reads = directory.reads.lock().unwrap();
-    let scans: Vec<_> = reads
-        .iter()
-        .filter(|(stage, _)| matches!(stage, Stage::ExactScan))
-        .map(|(_, range)| range)
-        .collect();
+    let stage_reads = |wanted: Stage| -> Vec<_> {
+        reads
+            .iter()
+            .filter(|(stage, _)| *stage == wanted)
+            .map(|(_, range)| range)
+            .collect()
+    };
+    let admission = stage_reads(Stage::ExactScan);
     for docs in doc_ranges.iter().flatten() {
         assert_eq!(
-            scans.iter().filter(|range| **range == docs).count(),
+            admission.iter().filter(|range| **range == docs).count(),
             1,
             "DocIds read once"
         );
     }
+    assert!(
+        admission
+            .iter()
+            .all(|range| doc_ranges.iter().flatten().any(|docs| docs == *range)),
+        "admission reads only DocIds"
+    );
     let mut payload_pages = std::collections::BTreeSet::new();
-    for range in scans {
-        if !doc_ranges.iter().flatten().any(|docs| docs == range) {
-            payload_pages.extend(range.start / PAGE_BYTES..=(range.end - 1) / PAGE_BYTES);
-        }
+    for range in stage_reads(Stage::Exact) {
+        payload_pages.extend(range.start / PAGE_BYTES..=(range.end - 1) / PAGE_BYTES);
     }
     assert_eq!(
         payload_pages, pages,
