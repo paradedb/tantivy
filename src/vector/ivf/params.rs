@@ -91,11 +91,26 @@ pub struct AdaptiveProbeParams {
     /// block geometry) than the cheaper quantized read of the same rows. Exact rows join the
     /// pruning bound as zero-width intervals. Default `false`.
     pub exact_plan: bool,
-    /// Per segment, a filter matching at most `floor(direct_max_selectivity * max_doc)`
-    /// documents, deleted ones included, skips routing: each match is located through the
-    /// document location map and its clusters are scored in ascending order. `0.0` always
-    /// routes; unfiltered queries always route. Default `0.0`.
-    pub direct_max_selectivity: f32,
+    /// Which segments locate their filter's matches through the document location map instead
+    /// of routing; see [`DirectRead`]. Unfiltered queries always route. Default
+    /// [`DirectRead::Off`].
+    pub direct_read: DirectRead,
+}
+
+/// Which segments take the located path: per segment, a filter matching at most a cap of
+/// documents, deleted ones included, skips routing, and each match is located through the
+/// document location map and scored.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum DirectRead {
+    /// Every segment routes.
+    #[default]
+    Off,
+    /// The cap is the rows the segment's routed work budget buys with no cluster opened,
+    /// `floor(budget * n_avg / (1 - x))`: a filter matching fewer documents than routing may
+    /// score is located instead.
+    Auto,
+    /// The cap is `floor(fraction * max_doc)`; a fraction of `0.0` or less always routes.
+    MaxSelectivity(f32),
 }
 
 impl Default for AdaptiveProbeParams {
@@ -107,7 +122,7 @@ impl Default for AdaptiveProbeParams {
             router_recall_target: DEFAULT_ROUTER_RECALL,
             recall_target: 1.0,
             exact_plan: false,
-            direct_max_selectivity: 0.0,
+            direct_read: DirectRead::Off,
         }
     }
 }

@@ -27,7 +27,7 @@ pub use ivf::{
     IvfIndex as MultiLevelIvf, IvfIndexBuilder, IvfLevelClusterer, LazyStackedIvf, LazyStore,
     StackedSearchStats, SuperKMeansLevelClusterer, PARENT_NPROBE_FRACTION,
 };
-pub use params::{AdaptiveProbeParams, WorkModel, DEFAULT_ROUTER_RECALL};
+pub use params::{AdaptiveProbeParams, DirectRead, WorkModel, DEFAULT_ROUTER_RECALL};
 pub(crate) use plugin::merge_ivf;
 pub(crate) use training::{decode_row, decode_row_append, encode_vector};
 pub use training::{

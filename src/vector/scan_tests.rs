@@ -13,7 +13,7 @@ use crate::query::{
 };
 use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
 use crate::vector::cluster_plan::{BatchCosts, LayerCosts, ReadCost};
-use crate::vector::ivf::Candidate;
+use crate::vector::ivf::{Candidate, DirectRead, WorkModel};
 use crate::vector::storage_io::test_support::{doc_ids_reads, PagedDirectory};
 use crate::vector::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors, RouterKind, Stage,
@@ -787,7 +787,7 @@ const SCHEDULES: [&[u8]; 2] = [&[], &[1, 4]];
 /// [`exhaustive`] with a located-path threshold and the exact plan on or off.
 fn located(direct_max_selectivity: f32, exact_plan: bool) -> AdaptiveProbeParams {
     AdaptiveProbeParams {
-        direct_max_selectivity,
+        direct_read: DirectRead::MaxSelectivity(direct_max_selectivity),
         exact_plan,
         ..exhaustive()
     }
@@ -1136,4 +1136,74 @@ fn admitted(fx: &Fixture, filter: &dyn Query) -> crate::Result<HashSet<DocAddres
         })?;
     }
     Ok(admitted)
+}
+
+// ============================================================
+// Auto located-path cap: the routed budget's row equivalent.
+// ============================================================
+
+/// A run under `direct_read` with a realistic probe budget.
+fn budgeted(direct_read: DirectRead, work_model: Option<WorkModel>) -> AdaptiveProbeParams {
+    AdaptiveProbeParams {
+        max_probe_fraction: 0.05,
+        min_probe_clusters: 1,
+        work_model,
+        direct_read,
+        ..Default::default()
+    }
+}
+
+/// The Auto cap is `floor(budget * n_avg / (1 - x))` of the work budget the routed path runs
+/// against, primed or not; at the cap a filter is located, one match past it routes.
+#[test]
+fn auto_cap_is_the_budget_in_rows() -> crate::Result<()> {
+    let fx = fixture(Shape::new(Metric::L2, &[1, 4]))?;
+    let searcher = fx.index.reader()?.searcher();
+    let segment_reader = &searcher.segment_readers()[0];
+    let max_doc = segment_reader.max_doc();
+    let vectors = segment_reader.vector_index(fx.field)?;
+    let index = vectors.index().expect("ivf");
+    for work_model in [None, Some(WorkModel { n_avg: 61.5 })] {
+        let params = budgeted(DirectRead::Auto, work_model);
+        let (budget, n_avg, x) =
+            params.resolved_work_budget(index.num_clusters(), index.num_docs())?;
+        let cap = (budget * n_avg / (1.0 - x)).floor() as usize;
+        assert!(cap > 0 && cap < max_doc as usize, "cap {cap}");
+        let at_cap = spread(max_doc, cap as u32);
+        let (hits, stats) = run(&fx, &at_cap, 10, params.clone())?;
+        assert_eq!(stats.direct_cap, cap, "{work_model:?}");
+        assert_eq!(stats.access_path, AccessPath::Located, "{work_model:?}");
+        assert_eq!(hits, oracle(&fx, Some(&addresses(&at_cap)), 10)?);
+        let past_cap = spread(max_doc, cap as u32 + 1);
+        let (_, stats) = run(&fx, &past_cap, 10, params)?;
+        assert_eq!(stats.direct_cap, cap, "{work_model:?}");
+        assert_eq!(stats.access_path, AccessPath::Routed, "{work_model:?}");
+    }
+    Ok(())
+}
+
+/// Every mode reports its cap: zero when off, the selectivity cap otherwise; unfiltered queries
+/// route whatever the cap.
+#[test]
+fn direct_cap_is_reported_in_every_mode() -> crate::Result<()> {
+    let fx = fixture(Shape::new(Metric::L2, &[1, 4]))?;
+    let max_doc = fx.index.reader()?.searcher().segment_readers()[0].max_doc();
+    let docs = spread(max_doc, 10);
+    let (_, off) = run(&fx, &docs, 10, budgeted(DirectRead::Off, None))?;
+    assert_eq!((off.direct_cap, off.access_path), (0, AccessPath::Routed));
+    let (_, fixed) = run(
+        &fx,
+        &docs,
+        10,
+        budgeted(DirectRead::MaxSelectivity(0.01), None),
+    )?;
+    assert_eq!(
+        fixed.direct_cap,
+        (f64::from(0.01f32) * f64::from(max_doc)).floor() as usize
+    );
+    assert_eq!(fixed.access_path, AccessPath::Located);
+    let (_, unfiltered) = run_all(&fx, 10, budgeted(DirectRead::Auto, None))?;
+    assert!(unfiltered.direct_cap > 0);
+    assert_eq!(unfiltered.access_path, AccessPath::Routed);
+    Ok(())
 }
