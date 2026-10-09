@@ -86,6 +86,11 @@ pub struct AdaptiveProbeParams {
     /// budget as the only bound. Stacked-router segments only, and forced
     /// to `1.0` above [`APS_MAX_DIM`](crate::vector::ivf::APS_MAX_DIM).
     pub recall_target: f32,
+    /// Lets a quantized segment score a cluster's rows at full precision at any quantized
+    /// stage when reading them exactly touches strictly fewer storage blocks (bytes without
+    /// block geometry) than the cheaper quantized read of the same rows. Exact rows join the
+    /// pruning bound as zero-width intervals. Default `false`.
+    pub exact_plan: bool,
 }
 
 impl Default for AdaptiveProbeParams {
@@ -96,6 +101,7 @@ impl Default for AdaptiveProbeParams {
             work_model: None,
             router_recall_target: DEFAULT_ROUTER_RECALL,
             recall_target: 1.0,
+            exact_plan: false,
         }
     }
 }

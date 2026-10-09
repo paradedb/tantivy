@@ -10,12 +10,12 @@ use crate::indexer::NoMergePolicy;
 use crate::query::{
     AllQuery, BitSetDocSet, ConstScorer, EnableScoring, Explanation, Query, Scorer,
 };
-use crate::schema::{Schema, STORED, STRING};
-use crate::vector::cluster_plan::{LayerCosts, ReadCost};
+use crate::schema::{Schema, Term, STORED, STRING};
+use crate::vector::cluster_plan::{BatchCosts, LayerCosts, ReadCost};
 use crate::vector::storage_io::test_support::PagedDirectory;
 use crate::vector::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors, RouterKind, VectorDType,
-    VectorOptions, VectorQuantizationConfig, VectorQuantizationLayer,
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors, RouterKind, Stage,
+    VectorDType, VectorOptions, VectorQuantizationConfig, VectorQuantizationLayer,
 };
 use crate::{DocAddress, Index, IndexWriter, TantivyDocument};
 
@@ -104,9 +104,12 @@ impl IvfClusterer for StrideClusterer {
 pub(super) struct Fixture {
     pub(super) index: Index,
     pub(super) field: Field,
+    pub(super) label: Field,
     pub(super) metric: Metric,
     pub(super) quantized: bool,
     pub(super) dim: usize,
+    /// The read log of paged storage.
+    pub(super) directory: Option<PagedDirectory>,
 }
 
 /// The shape of a fixture index.
@@ -177,10 +180,10 @@ pub(super) fn fixture_with(shape: Shape, picks: &[fn(u32) -> bool]) -> crate::Re
             clusters: shape.clusters,
         }))
         .ivf_router(RouterKind::Rng)?;
-    let index = if shape.paged {
-        builder.create(PagedDirectory::default())?
-    } else {
-        builder.create(crate::directory::RamDirectory::create())?
+    let directory = shape.paged.then(PagedDirectory::default);
+    let index = match &directory {
+        Some(directory) => builder.create(directory.clone())?,
+        None => builder.create(crate::directory::RamDirectory::create())?,
     };
     let mut writer: IndexWriter = index.writer_with_num_threads(1, 50_000_000)?;
     writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -209,9 +212,11 @@ pub(super) fn fixture_with(shape: Shape, picks: &[fn(u32) -> bool]) -> crate::Re
     Ok(Fixture {
         index,
         field,
+        label,
         metric: shape.metric,
         quantized: !shape.schedule.is_empty(),
         dim: shape.dim,
+        directory,
     })
 }
 
@@ -229,6 +234,25 @@ pub(super) fn exhaustive() -> AdaptiveProbeParams {
         max_probe_fraction: 1.0,
         min_probe_clusters: usize::MAX / 2,
         ..Default::default()
+    }
+}
+
+/// Deletes documents of the first segment by their unique label.
+pub(super) fn delete(fx: &Fixture, docs: &[DocId]) -> crate::Result<()> {
+    let mut writer: IndexWriter = fx.index.writer_with_num_threads(1, 15_000_000)?;
+    writer.set_merge_policy(Box::new(NoMergePolicy));
+    for doc in docs {
+        writer.delete_term(Term::from_field_text(fx.label, &format!("s0d{doc}")));
+    }
+    writer.commit()?;
+    Ok(())
+}
+
+/// [`exhaustive`] with the exact plan on or off.
+pub(super) fn with_exact(exact_plan: bool) -> AdaptiveProbeParams {
+    AdaptiveProbeParams {
+        exact_plan,
+        ..exhaustive()
     }
 }
 
@@ -526,5 +550,226 @@ fn layout_picks_sparse_for_selective_filters() -> crate::Result<()> {
         "{stats:?}"
     );
     assert_eq!(hits, oracle(&fx, Some(&addresses(&dense_docs)), 10)?);
+    Ok(())
+}
+
+// ============================================================
+// The exact plan: clusters finished at full precision before `Final`.
+// ============================================================
+
+/// Exact only when strictly cheaper than the cheaper quantized read; ties stay quantized, and
+/// `Final` is always exact.
+#[test]
+fn batch_plan_takes_exact_only_when_strictly_cheaper() {
+    let batch = |exact: usize, layer: Option<LayerCosts>| BatchCosts {
+        exact: ReadCost(exact),
+        layer,
+    };
+    let layer = Some(costs(10, Some(4)));
+    assert_eq!(batch(3, layer).plan(true), ReadPlan::Exact);
+    assert_eq!(
+        batch(4, layer).plan(true),
+        ReadPlan::Sparse,
+        "a tie stays quantized"
+    );
+    assert_eq!(
+        batch(3, layer).plan(false),
+        ReadPlan::Sparse,
+        "exact plan off"
+    );
+    assert_eq!(batch(9, Some(costs(10, None))).plan(true), ReadPlan::Exact);
+    assert_eq!(batch(10, Some(costs(10, None))).plan(true), ReadPlan::Full);
+    assert_eq!(batch(5, Some(costs(4, Some(6)))).plan(true), ReadPlan::Full);
+    assert_eq!(
+        batch(usize::MAX, None).plan(false),
+        ReadPlan::Exact,
+        "Final"
+    );
+}
+
+fn layer_sum(stats: &ProbeStats, read: fn(&LayerProbeStats) -> usize) -> usize {
+    (0..stats.layers.0.len())
+        .map(|layer| stats.layers.get(layer).map_or(0, read))
+        .sum()
+}
+
+/// Scoring every cluster exactly at admission returns the exhaustive top-k for every metric,
+/// filtered or not, with and without deletes, and never keeps a quantized candidate.
+#[test]
+fn forced_exact_matches_the_oracle() -> crate::Result<()> {
+    let _forced = force_exact(|_, _| true);
+    for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+        let fx = fixture(Shape::new(metric, &[1, 4]))?;
+        let max_doc = fx.index.reader()?.searcher().segment_readers()[0].max_doc();
+        let docs = spread(max_doc, 200);
+        for deletes in [false, true] {
+            if deletes {
+                delete(&fx, &[docs[0], docs[1], 5, 6, 7])?;
+            }
+            for filtered in [false, true] {
+                for k in [1, 3, 8] {
+                    let context = format!("{metric:?} deletes={deletes} filtered={filtered} k={k}");
+                    let (hits, stats) = if filtered {
+                        run(&fx, &docs, k, exhaustive())?
+                    } else {
+                        run_all(&fx, k, exhaustive())?
+                    };
+                    let filter = filtered.then(|| addresses(&docs));
+                    assert_eq!(hits, oracle(&fx, filter.as_ref(), k)?, "{context}");
+                    let layer0 = stats.layers.get(0).expect("layer 0");
+                    assert_eq!(layer0.exact_clusters(), stats.postings_row, "{context}");
+                    assert_eq!(layer0.exact_rows(), stats.candidates_scored, "{context}");
+                    assert_eq!(layer0.scored(), 0, "{context}");
+                    assert_eq!(stats.rerank_rows, 0, "{context}");
+                    assert_eq!(
+                        stats.vectors_visited,
+                        stats.pruned_filter + stats.pruned_dead + stats.candidates_scored,
+                        "{context}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Exact and quantized clusters in one scan, at layer 0 or a later layer, rank together: the
+/// top-k equals the all-exact top-k.
+#[test]
+fn mixed_exact_and_quantized_match_all_exact() -> crate::Result<()> {
+    let rules: [ExactRule; 3] = [
+        |cluster, _| cluster % 2 == 0,
+        |_, layer| layer == 1,
+        |cluster, layer| layer == 1 && cluster % 3 == 0,
+    ];
+    for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+        let fx = fixture(Shape::new(metric, &[1, 4]))?;
+        let max_doc = fx.index.reader()?.searcher().segment_readers()[0].max_doc();
+        let docs = spread(max_doc, 300);
+        for k in [1, 3, 8] {
+            let (all_exact, _) = {
+                let _forced = force_exact(|_, _| true);
+                run(&fx, &docs, k, exhaustive())?
+            };
+            assert_eq!(all_exact, oracle(&fx, Some(&addresses(&docs)), k)?);
+            for (index, rule) in rules.iter().enumerate() {
+                let _forced = force_exact(*rule);
+                let (hits, stats) = run(&fx, &docs, k, exhaustive())?;
+                let context = format!("{metric:?} rule={index} k={k}");
+                assert_eq!(hits, all_exact, "{context}");
+                assert!(
+                    layer_sum(&stats, LayerProbeStats::exact_clusters) > 0,
+                    "{context}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A cluster finished exactly never reads its band; its rows land in the `exact` IO slot.
+#[test]
+fn exact_clusters_never_read_their_band() -> crate::Result<()> {
+    let rules: [(ExactRule, bool); 3] = [
+        (|_, _| true, true),
+        (|cluster, _| cluster % 2 == 0, false),
+        (|_, _| false, false),
+    ];
+    let shape = Shape {
+        paged: true,
+        ..Shape::new(Metric::L2, &[1])
+    };
+    let fx = fixture(shape)?;
+    for (rule, all) in rules {
+        let _forced = force_exact(rule);
+        let _full = force_read_plan(ReadPlan::Full);
+        let directory = fx.directory.as_ref().expect("paged");
+        directory.reads.lock().unwrap().clear();
+        let (hits, stats) = run_all(&fx, 10, exhaustive())?;
+        assert_eq!(hits, oracle(&fx, None, 10)?);
+        let reads = directory.reads.lock().unwrap();
+        let count = |stage: Stage| reads.iter().filter(|(read, _)| *read == stage).count();
+        let layer0 = stats.layers.get(0).expect("layer 0");
+        // Unfiltered admission reads no DocIds: layer 0 reads are bands alone.
+        assert_eq!(
+            count(Stage::LayerScan(0)),
+            layer0.full_clusters(),
+            "{stats:?}"
+        );
+        assert_eq!(
+            layer0.full_clusters() + layer0.exact_clusters(),
+            stats.postings_row
+        );
+        assert_eq!(
+            stats.exact_io.reads,
+            count(Stage::Exact) as u64,
+            "{stats:?}"
+        );
+        assert_eq!(stats.exact_io.reads > 0, layer0.exact_clusters() > 0);
+        if all {
+            assert_eq!(layer0.full_clusters(), 0);
+        }
+    }
+    Ok(())
+}
+
+/// A group finished exactly at a later layer leaves the candidates before that layer's band:
+/// none of its rows reaches a later boundary, and the top-k is unchanged.
+#[test]
+fn retired_rows_never_reach_a_later_band() -> crate::Result<()> {
+    let fx = fixture(Shape::new(Metric::L2, &[1, 4]))?;
+    let searcher = fx.index.reader()?.searcher();
+    let vectors = searcher.segment_readers()[0].vector_index(fx.field)?;
+    let index = vectors.index().expect("ivf");
+    let max_doc = searcher.segment_readers()[0].max_doc();
+    let docs = spread(max_doc, 400);
+    let _forced = force_exact(|cluster, layer| layer == 1 && cluster % 2 == 0);
+    let (hits, stats) = run(&fx, &docs, 10, exhaustive())?;
+    assert_eq!(hits, oracle(&fx, Some(&addresses(&docs)), 10)?);
+    let layer1 = stats.layers.get(1).expect("layer 1");
+    assert!(layer1.exact_clusters() > 0, "{stats:?}");
+    let even_cluster = |row: &usize| {
+        (0..index.num_clusters())
+            .find(|&cluster| index.cluster_range(cluster).contains(row))
+            .is_some_and(|cluster| cluster % 2 == 0)
+    };
+    let trace = &stats.quantized_trace;
+    assert!(trace.boundary_rows[0].iter().any(even_cluster));
+    assert!(!trace.boundary_rows[1].iter().any(even_cluster));
+    assert!(!trace.layer_columns[1]
+        .iter()
+        .any(|(row, _)| even_cluster(row)));
+    assert_eq!(
+        layer1.scored() + layer1.exact_rows(),
+        trace.boundary_rows[0].len()
+    );
+    Ok(())
+}
+
+/// Left to the layout on paged d=1024 storage, a selective filter finishes clusters exactly
+/// (one row is half a page, less than any layer-0 read), an unfiltered query never does, and
+/// both return the exhaustive top-k.
+#[test]
+fn layout_takes_exact_for_selective_filters_only() -> crate::Result<()> {
+    for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+        let fx = fixture(Shape::paged_1024(metric, &[1, 4]))?;
+        let max_doc = fx.index.reader()?.searcher().segment_readers()[0].max_doc();
+        let docs = spread(max_doc, 4);
+        let (hits, stats) = run(&fx, &docs, 10, with_exact(true))?;
+        assert_eq!(
+            hits,
+            oracle(&fx, Some(&addresses(&docs)), 10)?,
+            "{metric:?}"
+        );
+        let layer0 = stats.layers.get(0).expect("layer 0");
+        assert_eq!(layer0.exact_clusters(), stats.postings_row, "{stats:?}");
+        let (hits, stats) = run_all(&fx, 10, with_exact(true))?;
+        assert_eq!(hits, run_all(&fx, 10, with_exact(false))?.0, "{metric:?}");
+        assert_eq!(
+            layer_sum(&stats, LayerProbeStats::exact_clusters),
+            0,
+            "{stats:?}"
+        );
+    }
     Ok(())
 }
