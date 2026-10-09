@@ -91,41 +91,63 @@ impl IdMap {
     }
     /// Reads one document location and validates both coordinates before exposing it.
     pub(crate) fn locate(&self, doc: DocId, rows: &[usize]) -> io::Result<Option<DocLocation>> {
-        let Self::DocLocations(body) = self else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "clustered lookup requires DocLocations",
-            ));
-        };
+        let body = self.location_body()?;
         let Some(start) = (doc as usize).checked_mul(8) else {
             return Ok(None);
         };
         if start >= body.len() {
             return Ok(None);
         }
-        let bytes = body.slice(start..start + 8).read_vector_bytes()?;
-        let cluster = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-        let local = u32::from_le_bytes(bytes[4..].try_into().unwrap());
-        if cluster == u32::MAX {
-            return if local == 0 {
-                Ok(None)
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "absent document location has nonzero local row",
-                ))
-            };
-        }
-        let cluster_idx = cluster as usize;
-        if cluster_idx >= rows.len().saturating_sub(1)
-            || local as usize >= rows[cluster_idx + 1] - rows[cluster_idx]
-        {
+        decode_location(&body.slice(start..start + 8).read_vector_bytes()?, rows)
+    }
+    /// Locates strictly ascending `docs`, appending `(doc, location)` for each present one to
+    /// `out`. Entries are read in runs: a run extends while the next entry starts within one
+    /// storage block (4096 bytes when the geometry is unknown) of the run's end, so each run
+    /// costs one read. Validation matches [`Self::locate`].
+    pub(crate) fn locate_many(
+        &self,
+        docs: &[DocId],
+        rows: &[usize],
+        out: &mut Vec<(DocId, DocLocation)>,
+    ) -> io::Result<()> {
+        let body = self.location_body()?;
+        if docs.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "document location is outside its cluster",
+                io::ErrorKind::InvalidInput,
+                "located documents must be strictly ascending",
             ));
         }
-        Ok(Some(DocLocation { cluster, local }))
+        let gap = body.storage_block_len().unwrap_or(4096);
+        let in_body = docs.partition_point(|&doc| (doc as usize) * 8 < body.len());
+        let docs = &docs[..in_body];
+        let mut first = 0;
+        while first < docs.len() {
+            let start = docs[first] as usize * 8;
+            let mut end = start + 8;
+            let mut last = first + 1;
+            while last < docs.len() && docs[last] as usize * 8 - end < gap {
+                end = docs[last] as usize * 8 + 8;
+                last += 1;
+            }
+            let bytes = body.slice(start..end).read_vector_bytes()?;
+            for &doc in &docs[first..last] {
+                let offset = doc as usize * 8 - start;
+                if let Some(location) = decode_location(&bytes[offset..offset + 8], rows)? {
+                    out.push((doc, location));
+                }
+            }
+            first = last;
+        }
+        Ok(())
+    }
+    fn location_body(&self) -> io::Result<&FileSlice> {
+        match self {
+            Self::DocLocations(body) => Ok(body),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "clustered lookup requires DocLocations",
+            )),
+        }
     }
     /// Number of present flat rows; clustered row counts reside in cluster offsets.
     pub fn num_rows(&self) -> u32 {
@@ -155,6 +177,32 @@ impl IdMap {
             Self::DocLocations(_) => unreachable!("clustered rows contain DocIds"),
         }
     }
+}
+
+/// Decodes one 8-byte location entry; the absent sentinel decodes to `None`.
+fn decode_location(bytes: &[u8], rows: &[usize]) -> io::Result<Option<DocLocation>> {
+    let cluster = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+    let local = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    if cluster == u32::MAX {
+        return if local == 0 {
+            Ok(None)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "absent document location has nonzero local row",
+            ))
+        };
+    }
+    let cluster_idx = cluster as usize;
+    if cluster_idx >= rows.len().saturating_sub(1)
+        || local as usize >= rows[cluster_idx + 1] - rows[cluster_idx]
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "document location is outside its cluster",
+        ));
+    }
+    Ok(Some(DocLocation { cluster, local }))
 }
 
 #[cfg(test)]
@@ -303,5 +351,179 @@ mod tests {
         assert!(IdMap::open(FileSlice::from(bytes.clone()), 4).is_err());
         bytes[0] = 2;
         assert!(IdMap::open(FileSlice::from(bytes), 5).is_err());
+    }
+
+    /// Records read ranges against a fixed block geometry.
+    #[derive(Debug)]
+    struct BlockLog {
+        bytes: Vec<u8>,
+        block_len: Option<usize>,
+        reads: std::sync::Arc<std::sync::Mutex<Vec<std::ops::Range<usize>>>>,
+    }
+    impl HasLen for BlockLog {
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+    }
+    impl crate::directory::FileHandle for BlockLog {
+        fn read_bytes(&self, range: std::ops::Range<usize>) -> io::Result<common::OwnedBytes> {
+            self.reads.lock().unwrap().push(range.clone());
+            Ok(common::OwnedBytes::new(self.bytes[range].to_vec()))
+        }
+        fn storage_block_len(&self) -> Option<usize> {
+            self.block_len
+        }
+    }
+
+    type ReadLog = std::sync::Arc<std::sync::Mutex<Vec<std::ops::Range<usize>>>>;
+
+    /// A location map over `clusters` of `rows_per` rows; every 7th document is absent.
+    fn locations_map(
+        num_docs: u32,
+        clusters: u32,
+        rows_per: u32,
+        block_len: Option<usize>,
+    ) -> (IdMap, Vec<usize>, ReadLog) {
+        let locations: Vec<DocLocation> = (0..num_docs)
+            .map(|doc| {
+                if doc % 7 == 3 {
+                    DocLocation::ABSENT
+                } else {
+                    DocLocation {
+                        cluster: doc % clusters,
+                        local: (doc / clusters) % rows_per,
+                    }
+                }
+            })
+            .collect();
+        let mut bytes = Vec::new();
+        IdMap::serialize_locations(&locations, &mut bytes).unwrap();
+        let reads = ReadLog::default();
+        let file = FileSlice::new(std::sync::Arc::new(BlockLog {
+            bytes,
+            block_len,
+            reads: reads.clone(),
+        }));
+        let rows: Vec<usize> = (0..=clusters as usize)
+            .map(|cluster| cluster * rows_per as usize)
+            .collect();
+        (IdMap::open(file, num_docs).unwrap(), rows, reads)
+    }
+
+    #[test]
+    fn locate_many_agrees_with_locate_on_random_sets() {
+        for block_len in [Some(64), Some(4096), None] {
+            let (map, rows, _) = locations_map(5000, 13, 1000, block_len);
+            for seed in 0..64 {
+                let mut rng = fastrand::Rng::with_seed(seed);
+                let density = 1 + rng.usize(0..200);
+                let docs: Vec<DocId> = (0..5000).filter(|_| rng.usize(0..1000) < density).collect();
+                let mut located = Vec::new();
+                map.locate_many(&docs, &rows, &mut located).unwrap();
+                let expected: Vec<(DocId, DocLocation)> = docs
+                    .iter()
+                    .filter_map(|&doc| map.locate(doc, &rows).unwrap().map(|loc| (doc, loc)))
+                    .collect();
+                assert_eq!(located, expected, "block_len={block_len:?} seed={seed}");
+            }
+        }
+    }
+
+    /// Entries straddle block edges (the body starts one byte past the tag); a run never
+    /// costs more reads than the distinct blocks its entries touch.
+    #[test]
+    fn locate_many_reads_at_most_the_touched_blocks() {
+        const BLOCK: usize = 64;
+        let (map, rows, reads) = locations_map(5000, 13, 1000, Some(BLOCK));
+        for seed in 0..64 {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            let density = 1 + rng.usize(0..300);
+            let docs: Vec<DocId> = (0..5000).filter(|_| rng.usize(0..1000) < density).collect();
+            reads.lock().unwrap().clear();
+            let mut located = Vec::new();
+            map.locate_many(&docs, &rows, &mut located).unwrap();
+            let touched: std::collections::BTreeSet<usize> = docs
+                .iter()
+                .flat_map(|&doc| {
+                    let start = 1 + doc as usize * 8;
+                    [start / BLOCK, (start + 7) / BLOCK]
+                })
+                .collect();
+            let reads = reads.lock().unwrap();
+            assert!(
+                reads.len() <= touched.len(),
+                "seed {seed}: {} > {}",
+                reads.len(),
+                touched.len()
+            );
+            assert!(docs.iter().all(|&doc| {
+                let start = 1 + doc as usize * 8;
+                reads.iter().any(|r| r.start <= start && start + 8 <= r.end)
+            }));
+        }
+    }
+
+    #[test]
+    fn locate_many_skips_absent_and_rejects_corruption() {
+        let (map, rows, _) = locations_map(70, 2, 40, None);
+        let mut located = Vec::new();
+        map.locate_many(&[3, 4, 10, 17], &rows, &mut located)
+            .unwrap();
+        assert_eq!(
+            located.iter().map(|&(doc, _)| doc).collect::<Vec<_>>(),
+            [4],
+            "documents 3, 10 and 17 are absent"
+        );
+        assert_eq!(
+            map.locate_many(&[4, 4], &rows, &mut Vec::new())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            map.locate_many(&[5, 4], &rows, &mut Vec::new())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let mut beyond = Vec::new();
+        map.locate_many(&[4, 70, 900], &rows, &mut beyond).unwrap();
+        assert_eq!(beyond.len(), 1, "documents past the map are not located");
+
+        for location in [
+            DocLocation {
+                cluster: 2,
+                local: 0,
+            },
+            DocLocation {
+                cluster: 0,
+                local: 40,
+            },
+            DocLocation {
+                cluster: u32::MAX,
+                local: 1,
+            },
+        ] {
+            let mut bytes = Vec::new();
+            let mut locations = vec![
+                DocLocation {
+                    cluster: 0,
+                    local: 0
+                };
+                8
+            ];
+            locations[5] = location;
+            IdMap::serialize_locations(&locations, &mut bytes).unwrap();
+            let map = IdMap::open(FileSlice::from(bytes), 8).unwrap();
+            assert_eq!(
+                map.locate_many(&[1, 5, 6], &rows, &mut Vec::new())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData,
+                "{location:?}"
+            );
+        }
+        let flat = round_trip(&[0, 1], 2);
+        assert!(flat.locate_many(&[0], &rows, &mut Vec::new()).is_err());
     }
 }

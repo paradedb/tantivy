@@ -91,6 +91,11 @@ pub struct AdaptiveProbeParams {
     /// block geometry) than the cheaper quantized read of the same rows. Exact rows join the
     /// pruning bound as zero-width intervals. Default `false`.
     pub exact_plan: bool,
+    /// Per segment, a filter matching at most `floor(direct_max_selectivity * max_doc)`
+    /// documents, deleted ones included, skips routing: each match is located through the
+    /// document location map and its clusters are scored in ascending order. `0.0` always
+    /// routes; unfiltered queries always route. Default `0.0`.
+    pub direct_max_selectivity: f32,
 }
 
 impl Default for AdaptiveProbeParams {
@@ -102,6 +107,7 @@ impl Default for AdaptiveProbeParams {
             router_recall_target: DEFAULT_ROUTER_RECALL,
             recall_target: 1.0,
             exact_plan: false,
+            direct_max_selectivity: 0.0,
         }
     }
 }

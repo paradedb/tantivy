@@ -33,6 +33,7 @@ use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
 use crate::vector::ivf::RecallEstimator;
 use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RouterWorkspace, RoutingParams};
+use crate::vector::storage_io::VectorRead;
 use crate::vector::{BoundKind, BoundStore};
 
 /// The IVF routing index over one field's clusters: says which clusters —
@@ -49,6 +50,8 @@ pub struct IvfIndex {
     num_docs: usize,
     /// The centroid rows (slot `[0]` past the two count words).
     centroids_slice: FileSlice,
+    /// Bytes per centroid row: the field's vector stride.
+    centroid_stride: usize,
     /// Slot `[1]`: the `u64[N+1]` prefix sum, pinned.
     cluster_offsets: OwnedBytes,
     metric: Metric,
@@ -219,6 +222,7 @@ impl IvfIndex {
             num_centroids,
             num_docs,
             centroids_slice,
+            centroid_stride: options.bytes_per_vector(),
             cluster_offsets,
             metric: options.metric(),
             router,
@@ -284,6 +288,26 @@ impl IvfIndex {
         (0..self.num_centroids).map(|cluster| {
             (self.cluster_offset(cluster + 1) - self.cluster_offset(cluster)) as usize
         })
+    }
+
+    /// One centroid row as a file slice preserving storage geometry.
+    pub(crate) fn centroid_row_slice(&self, cluster: usize) -> crate::Result<FileSlice> {
+        if cluster >= self.num_centroids {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("centroid {cluster} is out of range"),
+            )
+            .into());
+        }
+        let start = cluster * self.centroid_stride;
+        Ok(self
+            .centroids_slice
+            .slice(start..start + self.centroid_stride))
+    }
+
+    /// One centroid row, read alone and attributed to the active vector stage.
+    pub(crate) fn centroid_row(&self, cluster: usize) -> crate::Result<OwnedBytes> {
+        Ok(self.centroid_row_slice(cluster)?.read_vector_bytes()?)
     }
 
     /// The centroid rows, materialized in one read — for introspection and
