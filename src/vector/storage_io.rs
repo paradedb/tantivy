@@ -39,31 +39,42 @@ pub(crate) fn snapshot() -> [VectorIoStats; 4] {
 /// Reads vector bytes while attributing the actual range to the active scan stage.
 pub(crate) trait VectorRead {
     fn read_vector_bytes(&self) -> std::io::Result<OwnedBytes>;
+    fn read_vector_chunks(&self, visitor: &mut dyn FnMut(&[u8])) -> std::io::Result<()>;
 }
 impl VectorRead for FileSlice {
     fn read_vector_bytes(&self) -> std::io::Result<OwnedBytes> {
         let bytes = self.read_bytes()?;
-        let slot = match current_vector_stage() {
-            Stage::LayerScan(l) if l < 3 => Some(l as usize),
-            Stage::RerankFetch => Some(3),
-            _ => None,
-        };
-        if let Some(slot) = slot {
-            let mut counters = COUNTERS.get();
-            let counter = &mut counters[slot];
-            counter.reads += 1;
-            counter.bytes_read += self.len() as u64;
-            if self.len() != 0 {
-                if let (Some(first), Some(last)) = (
-                    self.storage_block_ord(0),
-                    self.storage_block_ord(self.len() - 1),
-                ) {
-                    counter.storage_blocks += (last - first + 1) as u64;
-                }
-            }
-            COUNTERS.set(counters);
-        }
+        record_read(self);
         Ok(bytes)
+    }
+
+    fn read_vector_chunks(&self, visitor: &mut dyn FnMut(&[u8])) -> std::io::Result<()> {
+        self.read_bytes_chunks(0..self.len(), visitor)?;
+        record_read(self);
+        Ok(())
+    }
+}
+
+fn record_read(slice: &FileSlice) {
+    let slot = match current_vector_stage() {
+        Stage::LayerScan(l) if l < 3 => Some(l as usize),
+        Stage::RerankFetch => Some(3),
+        _ => None,
+    };
+    if let Some(slot) = slot {
+        let mut counters = COUNTERS.get();
+        let counter = &mut counters[slot];
+        counter.reads += 1;
+        counter.bytes_read += slice.len() as u64;
+        if slice.len() != 0 {
+            if let (Some(first), Some(last)) = (
+                slice.storage_block_ord(0),
+                slice.storage_block_ord(slice.len() - 1),
+            ) {
+                counter.storage_blocks += (last - first + 1) as u64;
+            }
+        }
+        COUNTERS.set(counters);
     }
 }
 
@@ -128,6 +139,21 @@ pub(crate) mod test_support {
                     .push((current_vector_stage(), range));
             }
             Ok(bytes)
+        }
+        fn read_bytes_chunks(
+            &self,
+            range: Range<usize>,
+            visitor: &mut dyn FnMut(&[u8]),
+        ) -> io::Result<()> {
+            let bytes = self.read_bytes(range.clone())?;
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let len =
+                    (PAGE_BYTES - (range.start + offset) % PAGE_BYTES).min(bytes.len() - offset);
+                visitor(&bytes[offset..offset + len]);
+                offset += len;
+            }
+            Ok(())
         }
         fn storage_block_len(&self) -> Option<usize> {
             Some(PAGE_BYTES)

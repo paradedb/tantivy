@@ -139,27 +139,92 @@ impl IdMap {
                 "clustered lookup requires DocLocations",
             ));
         };
-        let bytes = body.read_vector_bytes()?;
+        self.row_doc_ids_for(rows, 0..(body.len() / 8) as DocId, true)
+    }
+
+    pub(crate) fn filtered_row_doc_ids(
+        &self,
+        rows: &[usize],
+        filter: &common::BitSet,
+    ) -> io::Result<Box<[DocId]>> {
+        let selected = (0..filter.max_value().div_ceil(64)).flat_map(|bucket| {
+            filter
+                .tinyset(bucket)
+                .into_iter()
+                .map(move |bit| bucket * 64 + bit)
+        });
+        self.row_doc_ids_for(rows, selected, false)
+    }
+
+    fn row_doc_ids_for(
+        &self,
+        rows: &[usize],
+        mut selected: impl Iterator<Item = DocId>,
+        complete: bool,
+    ) -> io::Result<Box<[DocId]>> {
+        let Self::DocLocations(body) = self else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "clustered lookup requires DocLocations",
+            ));
+        };
         let mut docs = vec![DocId::MAX; rows.last().copied().unwrap_or(0)];
-        for (doc, bytes) in bytes.chunks_exact(8).enumerate() {
-            if let Some(location) = Self::decode_location(bytes, rows)? {
-                let row = rows[location.cluster as usize] + location.local as usize;
-                if docs[row] != DocId::MAX {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "multiple documents have the same vector location",
-                    ));
+        let mut last_local = vec![u32::MAX; rows.len().saturating_sub(1)];
+        let mut next = selected.next();
+        let mut offset = 0;
+        let mut entry = [0; 8];
+        let mut error = None;
+        body.read_vector_chunks(&mut |bytes| {
+            let end = offset + bytes.len();
+            while error.is_none() {
+                let Some(doc) = next else {
+                    break;
+                };
+                let start = doc as usize * 8;
+                if start >= end {
+                    break;
                 }
-                docs[row] = doc as DocId;
+                let first = start.max(offset);
+                let last = (start + 8).min(end);
+                entry[first - start..last - start]
+                    .copy_from_slice(&bytes[first - offset..last - offset]);
+                if last < start + 8 {
+                    break;
+                }
+                match Self::decode_location(&entry, rows) {
+                    Ok(Some(location)) => {
+                        let cluster = location.cluster as usize;
+                        let previous = &mut last_local[cluster];
+                        if *previous != u32::MAX && *previous >= location.local {
+                            error = Some(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "document locations must ascend within each cluster",
+                            ));
+                            break;
+                        }
+                        *previous = location.local;
+                        docs[rows[cluster] + location.local as usize] = doc;
+                    }
+                    Ok(None) => (),
+                    Err(err) => {
+                        error = Some(err);
+                        break;
+                    }
+                }
+                next = selected.next();
             }
+            offset = end;
+        })?;
+        if let Some(err) = error {
+            return Err(err);
         }
-        if docs.contains(&DocId::MAX)
-            || rows.windows(2).any(|range| {
-                docs[range[0]..range[1]]
-                    .windows(2)
-                    .any(|pair| pair[0] >= pair[1])
-            })
-        {
+        if next.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "document id is outside the location table",
+            ));
+        }
+        if complete && docs.contains(&DocId::MAX) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "document locations must cover all rows in ascending cluster order",
@@ -284,6 +349,75 @@ mod tests {
         assert!(!p.contains(100));
         assert_eq!(p.rank_if_exists(10), None);
     }
+    #[test]
+    fn cached_locations_handle_split_records() {
+        use std::ops::Range;
+        use std::sync::Arc;
+
+        use common::OwnedBytes;
+
+        use crate::directory::FileHandle;
+
+        #[derive(Debug)]
+        struct Fragments(Vec<u8>, usize);
+        impl HasLen for Fragments {
+            fn len(&self) -> usize {
+                self.0.len()
+            }
+        }
+        impl FileHandle for Fragments {
+            fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+                Ok(OwnedBytes::new(self.0[range].to_vec()))
+            }
+            fn read_bytes_chunks(
+                &self,
+                range: Range<usize>,
+                visitor: &mut dyn FnMut(&[u8]),
+            ) -> io::Result<()> {
+                for chunk in self.0[range].chunks(self.1) {
+                    visitor(chunk);
+                }
+                Ok(())
+            }
+        }
+        let locations = [
+            DocLocation {
+                cluster: 2,
+                local: 0,
+            },
+            DocLocation::ABSENT,
+            DocLocation {
+                cluster: 0,
+                local: 0,
+            },
+            DocLocation {
+                cluster: 2,
+                local: 1,
+            },
+        ];
+        let mut bytes = Vec::new();
+        IdMap::serialize_locations(&locations, &mut bytes).unwrap();
+        for chunk in [1, 3, 7, 8, 9, 17] {
+            let map =
+                IdMap::open(FileSlice::new(Arc::new(Fragments(bytes.clone(), chunk))), 4).unwrap();
+            assert_eq!(&*map.row_doc_ids(&[0, 1, 1, 3]).unwrap(), &[2, 0, 3]);
+            for (selected, expected) in [
+                (vec![1, 3], vec![DocId::MAX, DocId::MAX, 3]),
+                (vec![2], vec![2, DocId::MAX, DocId::MAX]),
+                (vec![], vec![DocId::MAX; 3]),
+            ] {
+                let mut filter = common::BitSet::with_max_value(4);
+                for doc in selected {
+                    filter.insert(doc);
+                }
+                assert_eq!(
+                    &*map.filtered_row_doc_ids(&[0, 1, 1, 3], &filter).unwrap(),
+                    &expected
+                );
+            }
+        }
+    }
+
     // Every present document resolves to a checked pair; sentinels and invalid pairs are distinct.
     #[test]
     fn locations_round_trip_absence_and_corruption() {

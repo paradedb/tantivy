@@ -2151,7 +2151,7 @@ fn select_cluster_rows<'a>(
             }
         }),
         RowGate::FilterOnly(filter) => select_rows(doc_ids, rows, offsets, |doc| {
-            if filter.contains(doc) {
+            if doc != DocId::MAX && filter.contains(doc) {
                 RowVerdict::Keep
             } else {
                 RowVerdict::Filtered
@@ -2161,9 +2161,9 @@ fn select_cluster_rows<'a>(
             filter,
             filter_and_alive,
         } => select_rows(doc_ids, rows, offsets, |doc| {
-            if filter_and_alive.contains(doc) {
+            if doc != DocId::MAX && filter_and_alive.contains(doc) {
                 RowVerdict::Keep
-            } else if !filter.contains(doc) {
+            } else if doc == DocId::MAX || !filter.contains(doc) {
                 RowVerdict::Filtered
             } else {
                 RowVerdict::Dead

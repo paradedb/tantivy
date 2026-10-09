@@ -1159,6 +1159,72 @@ mod tests {
     }
 
     #[test]
+    fn filtered_doc_id_cache_follows_probe_budget() -> crate::Result<()> {
+        use crate::query::TermQuery;
+        use crate::schema::{IndexRecordOption, INDEXED};
+        use crate::vector::ivf::AdaptiveProbeParams;
+        use crate::vector::TopDocsByVectorSimilarity;
+        use crate::Term;
+
+        let mut fixture = Fixture::new(Metric::L2);
+        let rows: Vec<_> = (0..128).map(|i| [i as f32, 0.0]).collect();
+        fixture.replace_centroids(centroids(&rows));
+        let mut schema = Schema::builder();
+        schema.add_vector_field("embedding", VectorOptions::new(2, Metric::L2));
+        let keep = schema.add_u64_field("keep", INDEXED);
+        fixture.schema = schema.build();
+        let index = fixture.create(RouterKind::Exact)?;
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(crate::merge_policy::NoMergePolicy));
+        for (i, row) in rows.iter().enumerate() {
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(fixture.field, row);
+            doc.add_u64(keep, (i % 2) as u64);
+            writer.add_document(doc)?;
+            if i == 63 {
+                writer.commit()?;
+            }
+        }
+        writer.commit()?;
+        let filter = TermQuery::new(Term::from_field_u64(keep, 0), IndexRecordOption::Basic);
+        for (probe, cached) in [(0.001, false), (0.5, true)] {
+            let searcher = index.reader()?.searcher();
+            let vectors = searcher
+                .segment_readers()
+                .iter()
+                .map(|reader| reader.vector_index(fixture.field))
+                .collect::<crate::Result<Vec<_>>>()?;
+            assert!(vectors.iter().all(|reader| !reader.id_map_initialized()));
+            let hits = searcher.search(
+                &filter,
+                &TopDocsByVectorSimilarity::new(fixture.field, vec![0.0f32, 0.0], 1)
+                    .with_adaptive_params(AdaptiveProbeParams {
+                        max_probe_fraction: probe,
+                        min_probe_clusters: 1,
+                        ..Default::default()
+                    }),
+            )?;
+            assert_eq!(hits.results[0].1.doc_id, 0);
+            assert_eq!(
+                vectors[hits.results[0].1.segment_ord as usize].id_map_initialized(),
+                cached
+            );
+            let opposite = TermQuery::new(Term::from_field_u64(keep, 1), IndexRecordOption::Basic);
+            let hits = searcher.search(
+                &opposite,
+                &TopDocsByVectorSimilarity::new(fixture.field, vec![1.0f32, 0.0], 1)
+                    .with_adaptive_params(AdaptiveProbeParams {
+                        max_probe_fraction: probe,
+                        min_probe_clusters: 1,
+                        ..Default::default()
+                    }),
+            )?;
+            assert_eq!(hits.results[0].1.doc_id, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn filters_follow_cluster_presence_and_bounds() -> crate::Result<()> {
         use std::sync::Mutex;
 

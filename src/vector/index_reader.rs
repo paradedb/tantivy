@@ -1333,7 +1333,6 @@ impl QuantizedClusterReader<'_> {
 }
 
 /// Splits increasing rows by block before consulting storage geometry.
-#[cfg(test)]
 fn plan_block_column(
     blocks: &Blocks,
     idx: usize,
@@ -1653,6 +1652,52 @@ impl VectorFieldReader {
             .get_or_init(|| VectorIndexReader::open(self).map(Arc::new))
             .clone()
     }
+}
+
+pub(crate) fn visit_row_fragments(
+    slice: &FileSlice,
+    stride: usize,
+    rows: std::ops::Range<usize>,
+    mut visitor: impl FnMut(usize, usize, &[u8]),
+) -> crate::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    if stride == 0 {
+        return Err(TantivyError::InvalidArgument(
+            "vector stride is zero".into(),
+        ));
+    }
+    let expected = rows.len() * stride;
+    let (mut received, mut offset, mut row) = (0, 0, rows.start);
+    let mut invalid = false;
+    slice
+        .slice(rows.start * stride..rows.end * stride)
+        .read_vector_chunks(&mut |mut bytes| {
+            if invalid || bytes.len() > expected - received {
+                invalid = true;
+                return;
+            }
+            received += bytes.len();
+            while !bytes.is_empty() {
+                let len = (stride - offset).min(bytes.len());
+                visitor(row, offset, &bytes[..len]);
+                bytes = &bytes[len..];
+                offset += len;
+                if offset == stride {
+                    row += 1;
+                    offset = 0;
+                }
+            }
+        })?;
+    if invalid || received != expected || row != rows.end || offset != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "vector row fragments do not cover the requested range",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 impl VectorIndexReader {
@@ -2753,6 +2798,16 @@ impl VectorIndexReader {
             Ok(map.rank_if_exists(doc_id).map(|row| row as usize))
         }
     }
+    pub(crate) fn filtered_row_doc_ids(
+        &self,
+        filter: &common::BitSet,
+    ) -> crate::Result<Box<[DocId]>> {
+        self.id_map
+            .get(true)?
+            .filtered_row_doc_ids(&self.rows_slice.block_rows, filter)
+            .map_err(|e| DataCorruption::comment_only(e.to_string()).into())
+    }
+
     pub(crate) fn cache_doc_ids(&self) -> crate::Result<()> {
         self.cached_doc_ids
             .get_or_init(|| {
@@ -2806,6 +2861,44 @@ impl VectorIndexReader {
         Ok(())
     }
 
+    pub(crate) fn plan_vector_reads(
+        &self,
+        rows: &[usize],
+        ranges: &mut Vec<Range<usize>>,
+        scratch: &mut Vec<(usize, usize)>,
+    ) -> crate::Result<()> {
+        plan_block_column(
+            &self.rows_slice,
+            0,
+            0..self.num_vectors(),
+            rows,
+            ranges,
+            scratch,
+        )
+    }
+
+    pub(crate) fn visit_vector_row_fragments(
+        &self,
+        cluster: usize,
+        rows: Range<usize>,
+        mut visitor: impl FnMut(usize, usize, &[u8]),
+    ) -> crate::Result<()> {
+        let blocks = &self.rows_slice;
+        let first = blocks.block_rows[cluster];
+        if rows.start < first || rows.start > rows.end || rows.end > blocks.block_rows[cluster + 1]
+        {
+            return Err(TantivyError::InvalidArgument(format!(
+                "vector rows {rows:?} are outside cluster {cluster}"
+            )));
+        }
+        visit_row_fragments(
+            &blocks.column(cluster, 0)?,
+            self.options.bytes_per_vector(),
+            rows.start - first..rows.end - first,
+            |row, offset, bytes| visitor(first + row, offset, bytes),
+        )
+    }
+
     /// Reads a cluster's full-precision rows without document ids or quantized columns.
     pub(crate) fn read_cluster_rows(&self, cluster: usize) -> crate::Result<OwnedBytes> {
         let rows = self.rows_slice.block_rows[cluster]..self.rows_slice.block_rows[cluster + 1];
@@ -2847,9 +2940,57 @@ mod tests {
             Ok(OwnedBytes::new(self.bytes[range].to_vec()))
         }
 
+        fn read_bytes_chunks(
+            &self,
+            range: Range<usize>,
+            visitor: &mut dyn FnMut(&[u8]),
+        ) -> std::io::Result<()> {
+            self.reads.lock().unwrap().push(range.clone());
+            let mut offset = range.start;
+            while offset < range.end {
+                let end = (offset / self.block_len + 1) * self.block_len;
+                let end = end.min(range.end);
+                visitor(&self.bytes[offset..end]);
+                offset = end;
+            }
+            Ok(())
+        }
+
         fn storage_block_len(&self) -> Option<usize> {
             Some(self.block_len)
         }
+    }
+
+    #[test]
+    fn row_fragments_borrow_across_storage_boundaries() -> crate::Result<()> {
+        for stride in [4, 12, 4096] {
+            for block_len in [1, 7, 64, 8192] {
+                let bytes: Vec<_> = (0..5 + 5 * stride).map(|i| (i % 251) as u8).collect();
+                let file = Arc::new(BlockTrackedBytes {
+                    bytes,
+                    reads: Default::default(),
+                    block_len,
+                });
+                let slice = FileSlice::new(file.clone()).slice_from(5);
+                for rows in [0..5, 1..4, 4..5, 2..2] {
+                    let mut actual = Vec::new();
+                    visit_row_fragments(&slice, stride, rows.clone(), |row, offset, bytes| {
+                        assert_eq!(row, rows.start + actual.len() / stride);
+                        assert_eq!(offset, actual.len() % stride);
+                        assert_eq!(
+                            bytes.as_ptr(),
+                            file.bytes[5 + row * stride + offset..].as_ptr()
+                        );
+                        actual.extend_from_slice(bytes);
+                    })?;
+                    assert_eq!(
+                        actual,
+                        file.bytes[5 + rows.start * stride..5 + rows.end * stride]
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     fn test_layer(

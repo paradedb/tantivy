@@ -131,6 +131,9 @@ struct SegmentScan<'a, T: VectorElement, S: SortKeyComputer> {
     rows: Vec<usize>,
     ranges: Vec<Range<usize>>,
     blocks: Vec<(usize, usize)>,
+    scratch: Vec<u8>,
+    cache_pricing: (f64, f64),
+    filtered_doc_ids: Option<Box<[DocId]>>,
 }
 
 impl<T: VectorElement, S: SortKeyComputer> SegmentScan<'_, T, S> {
@@ -230,8 +233,30 @@ impl<T: VectorElement, S: SortKeyComputer> SegmentScan<'_, T, S> {
         let gate = self.gate.as_ref().expect("filter prepared before scanning");
         let open = matches!(gate, RowGate::Open);
         if !open {
-            reader.cache_doc_ids()?;
-            reader.read_doc_ids(cluster, &mut self.docs)?;
+            let (probe_fraction, open_share) = self.cache_pricing;
+            let expected_fraction = probe_fraction
+                / (open_share + (1.0 - open_share) * gate.match_fraction(self.reader.max_doc()));
+            let filter = match gate {
+                RowGate::FilterOnly(filter) | RowGate::FilterAndAlive { filter, .. } => {
+                    Some(filter)
+                }
+                _ => None,
+            };
+            if expected_fraction >= 1.0 / 32.0 {
+                if let Some(filter) = filter {
+                    if self.filtered_doc_ids.is_none() {
+                        self.filtered_doc_ids = Some(reader.filtered_row_doc_ids(filter)?);
+                    }
+                } else {
+                    reader.cache_doc_ids()?;
+                }
+            }
+            if let Some(docs) = &self.filtered_doc_ids {
+                self.docs.clear();
+                self.docs.extend_from_slice(&docs[rows.clone()]);
+            } else {
+                reader.read_doc_ids(cluster, &mut self.docs)?;
+            }
         }
         let (selection, visited, pruned_filter, pruned_dead) =
             select_cluster_rows(&self.docs, rows.clone(), gate, &mut self.offsets);
@@ -261,37 +286,9 @@ impl<T: VectorElement, S: SortKeyComputer> SegmentScan<'_, T, S> {
             top.push_quantized(self.backend.segment_ord, &scorer.scan.candidates, first);
             self.stats.layer0_eligible += count;
         } else {
+            self.ranges.clear();
             if open {
-                let bytes = reader.read_cluster_rows(cluster)?;
-                let mut resolved = false;
-                for (offset, bytes) in bytes
-                    .chunks_exact(reader.options().bytes_per_vector())
-                    .enumerate()
-                {
-                    #[cfg(test)]
-                    self.stats
-                        .quantized_trace
-                        .scored_rows
-                        .push(rows.start + offset);
-                    let score = self.backend.query.score_doc_bytes(bytes);
-                    if top
-                        .hits
-                        .threshold
-                        .as_ref()
-                        .is_some_and(|((threshold, _), _)| score < *threshold)
-                    {
-                        continue;
-                    }
-                    if !resolved {
-                        reader.read_doc_ids(cluster, &mut self.docs)?;
-                        resolved = true;
-                    }
-                    top.push_exact(
-                        &mut self.sort,
-                        DocAddress::new(self.backend.segment_ord, self.docs[offset]),
-                        score,
-                    );
-                }
+                self.ranges.push(rows.clone());
             } else {
                 self.rows.clear();
                 match selection {
@@ -301,20 +298,65 @@ impl<T: VectorElement, S: SortKeyComputer> SegmentScan<'_, T, S> {
                         .extend(offsets.iter().map(|offset| rows.start + offset)),
                     Selection::None => unreachable!("nonempty selection"),
                 }
-                let batch = reader.read_vector_rows_planned(
-                    &self.rows,
-                    &mut self.ranges,
-                    &mut self.blocks,
-                )?;
-                for (row, bytes) in batch.iter() {
+                reader.plan_vector_reads(&self.rows, &mut self.ranges, &mut self.blocks)?;
+            }
+            let query = &self.backend.query;
+            let stride = reader.options().bytes_per_vector();
+            let mut accumulator = query.dot_accumulator();
+            let mut selected = 0;
+            let mut resolved = !open;
+            let mut error = None;
+            for range in self.ranges.iter().cloned() {
+                reader.visit_vector_row_fragments(cluster, range, |row, offset, bytes| {
+                    if error.is_some() || (!open && self.rows.get(selected) != Some(&row)) {
+                        return;
+                    }
+                    let complete = offset + bytes.len() == stride;
+                    let score = if offset == 0 && complete {
+                        query.score_doc_bytes(bytes)
+                    } else if let Some(accumulator) = &mut accumulator {
+                        let Some(score) = query.score_doc_fragment(accumulator, bytes, complete)
+                        else {
+                            return;
+                        };
+                        score
+                    } else {
+                        if offset == 0 {
+                            self.scratch.clear();
+                        }
+                        self.scratch.extend_from_slice(bytes);
+                        if !complete {
+                            return;
+                        }
+                        query.score_doc_bytes(&self.scratch)
+                    };
+                    selected += usize::from(!open);
                     #[cfg(test)]
                     self.stats.quantized_trace.scored_rows.push(row);
+                    if top
+                        .hits
+                        .threshold
+                        .as_ref()
+                        .is_some_and(|((threshold, _), _)| score < *threshold)
+                    {
+                        return;
+                    }
+                    if !resolved {
+                        if let Err(err) = reader.read_doc_ids(cluster, &mut self.docs) {
+                            error = Some(err);
+                            return;
+                        }
+                        resolved = true;
+                    }
                     top.push_exact(
                         &mut self.sort,
                         DocAddress::new(self.backend.segment_ord, self.docs[row - rows.start]),
-                        self.backend.query.score_doc_bytes(bytes),
+                        score,
                     );
-                }
+                })?;
+            }
+            if let Some(err) = error {
+                return Err(err);
             }
         }
         Ok(count)
@@ -383,6 +425,9 @@ pub(crate) fn search<T: VectorElement, S: SortKeyComputer>(
             rows: Vec::new(),
             ranges: Vec::new(),
             blocks: Vec::new(),
+            scratch: Vec::new(),
+            cache_pricing: (0.0, 1.0),
+            filtered_doc_ids: None,
         });
     }
     let active = |segment: &SegmentScan<'_, T, S>| {
@@ -401,6 +446,9 @@ pub(crate) fn search<T: VectorElement, S: SortKeyComputer>(
             .sum();
         let clusters = router.num_clusters();
         let (budget, n_avg, open) = adaptive.resolved_work_budget(clusters, num_docs)?;
+        for segment in &mut segments {
+            segment.cache_pricing = (budget / clusters.max(1) as f64, open);
+        }
         let pricing = UnitPricing {
             budget: WorkUnits::new(budget),
             open: WorkUnits::new(open),
