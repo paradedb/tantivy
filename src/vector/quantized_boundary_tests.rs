@@ -22,7 +22,7 @@ fn enclosing_intervals_preserve_topk_and_running_threshold_many_seeds() {
         let n = 97;
         let k = 1 + rng.usize(0..20);
         let mut truth = Vec::new();
-        let mut scan = QuantizedScanCtx::new(n as u32, n);
+        let mut scan = BoundaryHarness::new(n);
         for cluster in (0..n).step_by(11) {
             scan.begin_cluster(k);
             for row in cluster..(cluster + 11).min(n) {
@@ -59,7 +59,7 @@ fn enclosing_intervals_preserve_topk_and_running_threshold_many_seeds() {
 }
 
 fn survivors(estimates: &[f32], sigmas: &[f32], k: usize, kappa: f32) -> Vec<usize> {
-    let mut scan = QuantizedScanCtx::new(estimates.len() as u32, estimates.len());
+    let mut scan = BoundaryHarness::new(estimates.len());
     for (row, (&estimate, &sigma)) in estimates.iter().zip(sigmas).enumerate() {
         scan.push(
             row, row as u32, 0.0, estimate, estimate, sigma, 1.0, 1.0, 0.0,
@@ -134,7 +134,7 @@ fn l2_cluster(
     let truth: Vec<f32> = encoded.residual_norms_squared.iter().map(|r| -r).collect();
     let mut exact: Vec<usize> = (0..n).collect();
     exact.sort_by(|&a, &b| truth[b].total_cmp(&truth[a]).then(a.cmp(&b)));
-    let mut scan = QuantizedScanCtx::new(n as u32, n);
+    let mut scan = BoundaryHarness::new(n);
     let mut boundaries = Vec::new();
     let mut initial_sigmas = Vec::new();
     for (level, layer) in encoded.layers.iter().enumerate() {
@@ -184,7 +184,7 @@ fn l2_cluster(
             scan.candidates.append_selected(
                 0..n,
                 &Selection::All,
-                Some(&docs),
+                SelectedDocs::ByClusterOffset(&docs),
                 &bases,
                 &scores,
                 &estimates,
@@ -291,7 +291,7 @@ fn l2_translation_preserves_ranking_and_conservatively_widens_survivors() {
 
 #[test]
 fn boundary_preserves_topk_when_all_intervals_cover_truth() {
-    let mut scan = QuantizedScanCtx::new(3, 3);
+    let mut scan = BoundaryHarness::new(3);
     let examples: [(f32, f32, f32); 3] = [
         (0.10, 0.015, 0.065),
         (0.09, 0.001, 0.090),

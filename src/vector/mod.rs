@@ -22,6 +22,8 @@ pub use element::MAX_ELEM_BYTES;
 pub const ENTRY_ALIGN: usize = 8;
 const _: () = assert!(MAX_ELEM_BYTES <= ENTRY_ALIGN);
 mod bounds;
+mod cluster_plan;
+mod cluster_source;
 mod collector;
 mod distance;
 pub(crate) mod header;
@@ -119,6 +121,8 @@ pub enum Stage {
     Boundary(u8),
     /// Full-precision scanning.
     ExactScan,
+    /// Exact scoring of rows before the final stage.
+    Exact,
     /// Result assembly.
     ResultAssembly,
     /// Rerank row fetching.
@@ -139,6 +143,7 @@ impl Stage {
             Self::LayerScan(layer) => Some(Cow::Owned(format!("layer{layer}_scan"))),
             Self::Boundary(layer) => Some(Cow::Owned(format!("boundary{layer}"))),
             Self::ExactScan => Some(Cow::Borrowed("exact_scan")),
+            Self::Exact => Some(Cow::Borrowed("exact")),
             Self::ResultAssembly => Some(Cow::Borrowed("result_assembly")),
             Self::RerankFetch => Some(Cow::Borrowed("rerank_fetch")),
             Self::RerankScore => Some(Cow::Borrowed("rerank_score")),
@@ -184,6 +189,7 @@ mod stage_tests {
         assert_eq!(Stage::LayerScan(2).name().as_deref(), Some("layer2_scan"));
         assert_eq!(Stage::Boundary(2).name().as_deref(), Some("boundary2"));
         assert_eq!(Stage::ExactScan.name().as_deref(), Some("exact_scan"));
+        assert_eq!(Stage::Exact.name().as_deref(), Some("exact"));
         assert_eq!(
             Stage::ResultAssembly.name().as_deref(),
             Some("result_assembly")
