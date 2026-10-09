@@ -251,8 +251,7 @@ pub trait QueryClone {
 }
 
 impl<T> QueryClone for T
-where
-    T: 'static + Query + Clone,
+where T: 'static + Query + Clone
 {
     fn box_clone(&self) -> Box<dyn Query> {
         // If T is Box<dyn Query>, wrapping self.clone() in Box::new would double-box

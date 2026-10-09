@@ -1220,7 +1220,8 @@ mod tests {
                     assert_eq!(
                         scorer.is::<BitmapCombination>(),
                         enabled && opt_in,
-                        "stored_bitmaps={stored_bitmaps}, enabled={enabled}, opt_in={opt_in}, occur={occur:?}"
+                        "stored_bitmaps={stored_bitmaps}, enabled={enabled}, opt_in={opt_in}, \
+                         occur={occur:?}"
                     );
                     let mut actual = Vec::new();
                     crate::query::for_each_docset_batch(scorer.as_mut(), &mut |batch| {
