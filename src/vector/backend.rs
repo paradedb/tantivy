@@ -36,7 +36,7 @@ use super::index_reader::{
     validate_decoded_sidecar, QuantizedFieldReader, QuantizedLayerBatch, QuantizedLayerReader,
     VectorIndexReader, VectorRowBatch,
 };
-use super::ivf::{AdaptiveProbeParams, IvfIndex, RecallEstimator};
+use super::ivf::{AdaptiveProbeParams, DirectRead, IvfIndex, RecallEstimator};
 use super::prepared::{
     corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix,
     quantized_model_sigma, refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError,
@@ -581,6 +581,8 @@ pub struct ProbeStats {
     /// Read requests for rows scored exactly before the final stage.
     #[serde(flatten, serialize_with = "serialize_exact_io")]
     pub exact_io: super::VectorIoStats,
+    /// The segment's resolved located-path cap in matches; `0` when the located path is off.
+    pub direct_cap: usize,
     /// Where this segment's layer-0 clusters came from.
     pub access_path: AccessPath,
     /// Live filter matches with a vector, on the located path.
@@ -3129,8 +3131,9 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut init_stage = Some(enter_vector_stage(Stage::ScanInit));
         let non_vector_start = Instant::now();
         let non_vector_stage = enter_vector_stage(Stage::NonVectorSearch);
-        let mut filter =
-            collect_segment_filter(weight, segment_reader, max_doc, self.direct_cap(max_doc))?;
+        let direct_cap = self.direct_cap(index, max_doc)?;
+        stats.direct_cap = direct_cap;
+        let mut filter = collect_segment_filter(weight, segment_reader, max_doc, direct_cap)?;
         drop(non_vector_stage);
         let non_vector_search_ns = non_vector_start.elapsed().as_nanos() as u64;
         stats.non_vector_search_ns = stats
@@ -3267,13 +3270,26 @@ impl<T: VectorElement> VectorBackend<T> {
         scan.finish(tie_break, stats, self.segment_ord)
     }
 
-    /// The per-segment located-path cap: `floor(direct_max_selectivity * max_doc)` matches.
-    fn direct_cap(&self, max_doc: DocId) -> usize {
-        let fraction = f64::from(self.adaptive.direct_max_selectivity);
-        if fraction.is_nan() || fraction <= 0.0 {
-            return 0;
-        }
-        (fraction.min(1.0) * f64::from(max_doc)).floor() as usize
+    /// The segment's located-path cap in matches, deleted documents included: see
+    /// [`DirectRead`]. `Auto` resolves the same work budget the routed path runs against.
+    fn direct_cap(&self, index: &IvfIndex, max_doc: DocId) -> crate::Result<usize> {
+        Ok(match self.adaptive.direct_read {
+            DirectRead::Off => 0,
+            DirectRead::MaxSelectivity(fraction) => {
+                let fraction = f64::from(fraction);
+                if fraction.is_nan() || fraction <= 0.0 {
+                    0
+                } else {
+                    (fraction.min(1.0) * f64::from(max_doc)).floor() as usize
+                }
+            }
+            DirectRead::Auto => {
+                let (budget, n_avg, x) = self
+                    .adaptive
+                    .resolved_work_budget(index.num_clusters(), index.num_docs())?;
+                (budget * n_avg / (1.0 - x)).floor() as usize
+            }
+        })
     }
 
     /// Resolves a sparse filter's matches to located rows grouped by cluster. Dead matches are
@@ -5329,6 +5345,7 @@ mod tests {
                 bytes_read: 512,
                 storage_blocks: 1,
             },
+            direct_cap: 7,
             access_path: AccessPath::Located,
             located_matches: 6,
             located_absent: 1,
@@ -5388,6 +5405,7 @@ mod tests {
         assert_eq!(object.remove("exact_bytes_read").unwrap(), 512);
         assert_eq!(object.remove("exact_storage_blocks").unwrap(), 1);
         assert!(!object.contains_key("exact_io"));
+        assert_eq!(object.remove("direct_cap").unwrap(), 7);
         assert_eq!(object.remove("access_path").unwrap(), "Located");
         assert_eq!(object.remove("located_matches").unwrap(), 6);
         assert_eq!(object.remove("located_absent").unwrap(), 1);
