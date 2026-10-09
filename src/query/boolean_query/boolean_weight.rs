@@ -373,7 +373,14 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         // Indicate how should clauses are combined with must clauses.
         let mut must_scorers: Vec<Box<dyn Scorer>> =
             per_occur_scorers.remove(&Occur::Must).unwrap_or_default();
-        let must_special_scorer_counts = remove_and_count_all_and_empty_scorers(&mut must_scorers);
+        // An `AllScorer` still adds its constant score to every document. When scores are
+        // needed, keep it: removing it drops that score, and the shape checks below only use
+        // Block-WAND when no `AllScorer` was removed.
+        let must_special_scorer_counts = if self.scoring_enabled {
+            remove_and_count_empty_scorers(&mut must_scorers)
+        } else {
+            remove_and_count_all_and_empty_scorers(&mut must_scorers)
+        };
 
         if must_special_scorer_counts.num_empty_scorers > 0 {
             return Ok(SpecializedScorer::Other(Box::new(EmptyScorer)));
@@ -650,6 +657,19 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
 struct AllAndEmptyScorerCounts {
     num_all_scorers: usize,
     num_empty_scorers: usize,
+}
+
+fn remove_and_count_empty_scorers(scorers: &mut Vec<Box<dyn Scorer>>) -> AllAndEmptyScorerCounts {
+    let mut counts = AllAndEmptyScorerCounts::default();
+    scorers.retain(|scorer| {
+        if scorer.is::<EmptyScorer>() {
+            counts.num_empty_scorers += 1;
+            false
+        } else {
+            true
+        }
+    });
+    counts
 }
 
 fn remove_and_count_all_and_empty_scorers(

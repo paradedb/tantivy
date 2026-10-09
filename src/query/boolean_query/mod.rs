@@ -730,6 +730,92 @@ mod tests {
         Ok(())
     }
 
+    /// A MUST range returns an `AllScorer` on a segment it fully covers. With scoring enabled it
+    /// must still add its score and keep Block-WAND, so equal matches score the same on fully and
+    /// partly covered segments.
+    #[test]
+    pub fn test_must_all_scorer_kept_when_scoring() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let num_field =
+            schema_builder.add_i64_field("num", NumericOptions::default().set_fast().set_indexed());
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            index_writer.set_merge_policy(Box::new(crate::indexer::NoMergePolicy));
+            // Two segments with disjoint `num` values: 0..300 and 300..600.
+            for segment in 0..2 {
+                for i in segment * 300..(segment + 1) * 300 {
+                    let text = if i % 3 == 0 { "target" } else { "other" };
+                    index_writer.add_document(doc!(text_field => text, num_field => i as i64))?;
+                }
+                index_writer.commit()?;
+            }
+        }
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 2);
+        let (partly_covered, fully_covered) = {
+            let readers = searcher.segment_readers();
+            let holds_zero = |reader: &crate::SegmentReader| {
+                reader
+                    .fast_fields()
+                    .i64("num")
+                    .map(|column| column.min_value() == 0)
+                    .unwrap_or(false)
+            };
+            if holds_zero(&readers[0]) {
+                (&readers[0], &readers[1])
+            } else {
+                (&readers[1], &readers[0])
+            }
+        };
+
+        // `num >= 200` cuts through the first segment and covers all of the second.
+        let range_query = RangeQuery::new(
+            Bound::Included(Term::from_field_i64(num_field, 200)),
+            Bound::Unbounded,
+        );
+        let term_query = TermQuery::new(
+            Term::from_field_text(text_field, "target"),
+            IndexRecordOption::WithFreqs,
+        );
+        let range_weight = range_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        assert!(range_weight.scorer(fully_covered, 1.0)?.is::<AllScorer>());
+        assert!(!range_weight.scorer(partly_covered, 1.0)?.is::<AllScorer>());
+
+        let query = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(term_query)),
+            (Occur::Must, Box::new(range_query)),
+        ]);
+        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+
+        for reader in [partly_covered, fully_covered] {
+            let pruning_scorer = weight.pruning_scorer(reader, 1.0, 0.0)?;
+            assert!(pruning_scorer.is::<BlockWandSingleScorer>());
+        }
+
+        // Every match has the same text, so all scores must be equal.
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(1_000).order_by_score())?;
+        let all_docs = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE)?;
+        assert_eq!(top_docs.len(), all_docs.scores().len());
+        let expected = top_docs[0].0;
+        for (score, _) in &top_docs {
+            assert_nearly_equals!(*score, expected);
+        }
+        for score in all_docs.scores() {
+            assert_nearly_equals!(*score, expected);
+        }
+        let segments_hit: std::collections::HashSet<u32> =
+            top_docs.iter().map(|(_, addr)| addr.segment_ord).collect();
+        assert_eq!(segments_hit.len(), 2);
+
+        // Scoring disabled: the match count is unchanged.
+        assert_eq!(searcher.search(&query, &Count)?, top_docs.len());
+
+        Ok(())
+    }
+
     #[test]
     pub fn test_filtered_pruning_initial_threshold() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
