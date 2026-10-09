@@ -294,7 +294,12 @@ mod tests {
                         let start = candidate.node as usize * 8;
                         assert_eq!(
                             candidate.sim,
-                            metric.similarity_bytes(&query, &bytes[start..start + 8])
+                            if metric == Metric::Cosine && kind == RouterKind::Rng {
+                                Metric::Dot
+                            } else {
+                                metric
+                            }
+                            .similarity_bytes(&query, &bytes[start..start + 8])
                         );
                     }
                 }

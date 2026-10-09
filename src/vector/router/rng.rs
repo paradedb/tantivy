@@ -1,5 +1,5 @@
 use crate::directory::FileSlice;
-use crate::schema::{VectorDType, VectorOptions};
+use crate::schema::{Metric, VectorDType, VectorOptions};
 use crate::vector::ivf::{
     InMemoryStore, LazyStore, NeighborhoodGraphConfig, RelativeNeighborhoodGraph,
     ResumableSearchIterator, Workspace,
@@ -52,7 +52,10 @@ pub(super) fn open(
         payload,
         vectors,
         options.dim(),
-        options.metric(),
+        match options.metric() {
+            Metric::Cosine => Metric::Dot,
+            metric => metric,
+        },
         NeighborhoodGraphConfig::default(),
     )?)
 }

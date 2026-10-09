@@ -2608,7 +2608,10 @@ impl<T: VectorElement> VectorBackend<T> {
         // cheap.
         // Routing operates in `f32` (centroid rows are `f32` today), so the
         // query is widened losslessly per element.
-        let query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
+        let mut query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
+        if index.router() == super::RouterKind::Rng {
+            super::prepared::normalize_query(self.query.metric(), &mut query_f32);
+        }
         let mut routing_ws = RouterWorkspace::default();
         stats.segment_rows = Some(index.num_rows());
         stats.segment_clusters = Some(index.num_clusters());
@@ -3658,7 +3661,7 @@ mod tests {
             .vector_storage_format(VectorStorageFormat::Ivf)
             .build()?;
         let params = exhaustive_params(DEFAULT_NUM_CENTROIDS);
-        for query in [[1.0_f32, 0.0], [0.0, 1.0], [0.7, 0.3]] {
+        for query in [[1.0_f32, 0.0], [0.0, 1.0], [0.7, 0.3], [7.0, 3.0]] {
             for k in [1usize, 3, 6] {
                 let expected = index.ground_truth(query, k)?;
                 let actual = search(
