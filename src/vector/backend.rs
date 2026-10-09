@@ -28,7 +28,8 @@ use super::cluster_plan::{
     CentroidScore, ClusterBatch, ReadPlan, SelectedDocs, Selection, Stage as PlanStage,
 };
 use super::cluster_source::{
-    admit_all, ClusterSource, RoutedAccounting, RoutedClusters, RoutedQuery, RowGate,
+    admit_all, ClusterSource, LocatedClusters, LocatedMatches, RoutedAccounting, RoutedClusters,
+    RoutedQuery, RowGate,
 };
 use super::distance::norm_squared_wide;
 use super::index_reader::{
@@ -43,13 +44,14 @@ use super::prepared::{
 };
 use super::quantization::QUANTIZED_BOUNDARY_KAPPA;
 use super::router::{RouterMetrics, RouterWorkspace, RoutingParams};
-use super::storage_io::{EXACT_SLOT, RERANK_SLOT};
+use super::storage_io::{EXACT_SLOT, LOCATE_SLOT, RERANK_SLOT};
 use super::tie_break::NoTieBreak;
 use super::{enter_vector_stage, Similarity, Stage, VectorElement};
 use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::{SegmentSortKeyComputer, TopNComputer};
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::error::DataCorruption;
+use crate::fastfield::AliveBitSet;
 use crate::query::{for_each_docset_buffered, AllScorer, Weight};
 use crate::schema::{Field, Metric};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
@@ -221,6 +223,7 @@ impl<T: VectorElement> VectorBackend<T> {
         }
         stats.rerank_io = io_after[RERANK_SLOT].since(io_before[RERANK_SLOT]);
         stats.exact_io = io_after[EXACT_SLOT].since(io_before[EXACT_SLOT]);
+        stats.locate_io = io_after[LOCATE_SLOT].since(io_before[LOCATE_SLOT]);
         #[cfg(test)]
         stats.quantized_trace.translate(&trace_docs);
         Ok((hits, stats))
@@ -534,6 +537,25 @@ where S: serde::Serializer {
     map.end()
 }
 
+fn serialize_locate_io<S>(io: &super::VectorIoStats, serializer: S) -> Result<S::Ok, S::Error>
+where S: serde::Serializer {
+    use serde::ser::SerializeMap;
+
+    let mut map = serializer.serialize_map(Some(3))?;
+    serialize_prefixed(io, "locate", &mut map)?;
+    map.end()
+}
+
+/// Where a segment's layer-0 clusters came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, serde::Serialize)]
+pub enum AccessPath {
+    /// The router's ranking, gated by the filter bitset.
+    #[default]
+    Routed,
+    /// The filter's own matches, located through the document location map.
+    Located,
+}
+
 /// Per-segment probe-loop instrumentation: a prune breakdown of every
 /// doc the inner loop touched, plus posting-fetch counters. Returned by
 /// [`VectorBackend::top_n`] alongside the hits. The flat/exact path fills
@@ -559,6 +581,21 @@ pub struct ProbeStats {
     /// Read requests for rows scored exactly before the final stage.
     #[serde(flatten, serialize_with = "serialize_exact_io")]
     pub exact_io: super::VectorIoStats,
+    /// Where this segment's layer-0 clusters came from.
+    pub access_path: AccessPath,
+    /// Live filter matches with a vector, on the located path.
+    pub located_matches: usize,
+    /// Live filter matches without a vector, on the located path.
+    pub located_absent: usize,
+    /// Clusters holding a located match.
+    pub located_clusters: usize,
+    /// Centroid rows read for layer-0 clusters with an unknown centroid score.
+    pub centroid_reads: usize,
+    /// Time locating filter matches and reading centroid rows.
+    pub locate_ns: u64,
+    /// Read requests locating filter matches and reading centroid rows.
+    #[serde(flatten, serialize_with = "serialize_locate_io")]
+    pub locate_io: super::VectorIoStats,
     /// Sparse layer-indexed timing and funnel counters, flattened on the wire.
     #[serde(flatten)]
     pub layers: LayerProbeStatsSet,
@@ -669,7 +706,8 @@ impl ProbeStats {
             .saturating_add(self.result_assembly_ns.unwrap_or_default())
             .saturating_add(self.rerank_fetch_ns)
             .saturating_add(self.rerank_score_ns)
-            .saturating_add(self.exact_ns);
+            .saturating_add(self.exact_ns)
+            .saturating_add(self.locate_ns);
         self.layers.0.iter().fold(fixed, |total, layer| {
             total
                 .saturating_add(layer.scan_ns)
@@ -742,6 +780,7 @@ impl ProbeStats {
         self.rerank_fetch_ns = 0;
         self.rerank_score_ns = 0;
         self.exact_ns = 0;
+        self.locate_ns = 0;
     }
 
     /// Clusters the probe loop visited.
@@ -2698,12 +2737,15 @@ where
             self.score_exact(batch, tie_break, stats)?;
             return Ok(plan);
         }
+        let sim = match batch.centroid {
+            CentroidScore::Known(sim) => sim,
+            CentroidScore::Unknown => self.read_centroid(batch.cluster, stats)?,
+        };
         let state = self.quantized.as_mut().expect("quantized scan");
         let spec = state.layers[layer];
         let rows = &mut self.scratch.layer_rows;
         let reader = &state.field.layers()[layer];
         read_layer(reader, state.query, &spec, batch, plan, rows)?;
-        let CentroidScore::Known(sim) = batch.centroid;
         let query_norm = state.query.score_query_norm(sim.score());
         if layer == 0 {
             state.set_centroid(batch.cluster, sim.score());
@@ -2736,6 +2778,23 @@ where
             );
         }
         Ok(plan)
+    }
+
+    /// The query's similarity to `cluster`'s centroid, from its stored row: the same value, bit
+    /// for bit, as the router's key.
+    fn read_centroid(&self, cluster: usize, stats: &mut ProbeStats) -> crate::Result<Similarity> {
+        let state = self.quantized.as_ref().expect("quantized scan");
+        let start = Instant::now();
+        let similarity = {
+            let _locate_stage = enter_vector_stage(Stage::Locate);
+            let row = self.index.centroid_row(cluster)?;
+            state
+                .metric
+                .similarity_bytes::<f32>(state.query.query(), &row)
+        };
+        stats.centroid_reads += 1;
+        stats.locate_ns += start.elapsed().as_nanos() as u64;
+        Ok(similarity)
     }
 
     /// Scores a batch's rows at full precision into the bound and the result heap. Rows that
@@ -3067,10 +3126,11 @@ impl<T: VectorElement> VectorBackend<T> {
             return Ok(Vec::new());
         }
         let init_start = Instant::now();
-        let init_stage = enter_vector_stage(Stage::ScanInit);
+        let mut init_stage = Some(enter_vector_stage(Stage::ScanInit));
         let non_vector_start = Instant::now();
         let non_vector_stage = enter_vector_stage(Stage::NonVectorSearch);
-        let filter = collect_segment_filter(weight, segment_reader, max_doc)?;
+        let mut filter =
+            collect_segment_filter(weight, segment_reader, max_doc, self.direct_cap(max_doc))?;
         drop(non_vector_stage);
         let non_vector_search_ns = non_vector_start.elapsed().as_nanos() as u64;
         stats.non_vector_search_ns = stats
@@ -3102,6 +3162,16 @@ impl<T: VectorElement> VectorBackend<T> {
             row: WorkUnits::new((1.0 - x) / n_avg),
         };
 
+        // A sparse filter's matches are located now; its clusters come from them, not the router.
+        let located = match &mut filter {
+            SegmentFilter::Sparse(docs) => {
+                drop(init_stage.take());
+                finish_init(stats);
+                Some(self.locate_matches(index, std::mem::take(docs), alive, stats)?)
+            }
+            _ => None,
+        };
+
         // Routing runs in `f32`: a quantized query in its prepared form, otherwise the raw query
         // widened losslessly per element.
         let (mut scan, routing_query, accounting, admission_stage) = match &self.quantized_query {
@@ -3111,9 +3181,13 @@ impl<T: VectorElement> VectorBackend<T> {
                     .quantization()
                     .expect("quantized query requires quantized slots");
                 stats.start_layer(0);
-                let candidate_capacity = ((pricing.budget.get() / pricing.row.get()).ceil()
-                    as usize)
-                    .min(index.num_rows());
+                let candidate_capacity = located.as_ref().map_or_else(
+                    || {
+                        ((pricing.budget.get() / pricing.row.get()).ceil() as usize)
+                            .min(index.num_rows())
+                    },
+                    LocatedMatches::len,
+                );
                 (
                     SegmentScan::quantized(
                         &self.reader,
@@ -3138,55 +3212,52 @@ impl<T: VectorElement> VectorBackend<T> {
                 Stage::ExactScan,
             ),
         };
-        let metric = self.query.metric();
-        let query_norm = match &self.quantized_query {
-            Some(query) => norm_squared_wide(query.query()).sqrt() as f32,
-            None => norm_squared_wide(self.query.query()).sqrt() as f32,
+        let scan_ns = match &located {
+            Some(matches) => {
+                let source = LocatedClusters::new(index, matches);
+                admit_from(&mut scan, source, admission_stage, tie_break, stats)?
+            }
+            None => {
+                let metric = self.query.metric();
+                let query_norm = match &self.quantized_query {
+                    Some(query) => norm_squared_wide(query.query()).sqrt() as f32,
+                    None => norm_squared_wide(self.query.query()).sqrt() as f32,
+                };
+                let gate = RowGate::new(filter.docs(), alive);
+                // The stacked router is told how many clusters this budget buys under the filter
+                // and the recall target; it drops to the fixed nprobe path itself past
+                // `APS_MAX_DIM`.
+                let routing = RoutingParams {
+                    k: self.adaptive.router_k(
+                        work_budget,
+                        x,
+                        filter.match_fraction(max_doc),
+                        index.num_clusters(),
+                    ),
+                    recall: self.adaptive.router_recall_target,
+                };
+                let mut workspace = RouterWorkspace::default();
+                drop(init_stage.take());
+                finish_init(stats);
+                let source = RoutedClusters::new(
+                    index,
+                    &self.reader,
+                    RoutedQuery {
+                        vector: &routing_query,
+                        norm: query_norm,
+                        metric,
+                    },
+                    &mut workspace,
+                    routing,
+                    pricing,
+                    self.adaptive.recall_target,
+                    &gate,
+                    accounting,
+                    stats,
+                );
+                admit_from(&mut scan, source, admission_stage, tie_break, stats)?
+            }
         };
-        let gate = RowGate::new(filter.docs(), alive);
-        // The stacked router is told how many clusters this budget buys under the filter and
-        // the recall target; it drops to the fixed nprobe path itself past `APS_MAX_DIM`.
-        let routing = RoutingParams {
-            k: self.adaptive.router_k(
-                work_budget,
-                x,
-                filter.match_fraction(max_doc),
-                index.num_clusters(),
-            ),
-            recall: self.adaptive.router_recall_target,
-        };
-        let mut workspace = RouterWorkspace::default();
-        drop(init_stage);
-        finish_init(stats);
-
-        let mut source = RoutedClusters::new(
-            index,
-            &self.reader,
-            RoutedQuery {
-                vector: &routing_query,
-                norm: query_norm,
-                metric,
-            },
-            &mut workspace,
-            routing,
-            pricing,
-            self.adaptive.recall_target,
-            &gate,
-            accounting,
-            stats,
-        );
-        let admission_start = Instant::now();
-        let exact_before = stats.exact_ns;
-        {
-            let _admission_stage = enter_vector_stage(admission_stage);
-            admit_all(&mut scan, &mut source, tie_break, stats)?;
-        }
-        let admission_ns = admission_start.elapsed().as_nanos() as u64;
-        let routing_before = stats.routing_ns;
-        source.finish(stats);
-        let scan_ns = admission_ns
-            .saturating_sub(stats.routing_ns - routing_before)
-            .saturating_sub(stats.exact_ns - exact_before);
         match accounting {
             RoutedAccounting::Quantized => {
                 stats.record_layer_scan(0, scan.quantized_len(), scan_ns)
@@ -3195,68 +3266,167 @@ impl<T: VectorElement> VectorBackend<T> {
         }
         scan.finish(tie_break, stats, self.segment_ord)
     }
+
+    /// The per-segment located-path cap: `floor(direct_max_selectivity * max_doc)` matches.
+    fn direct_cap(&self, max_doc: DocId) -> usize {
+        let fraction = f64::from(self.adaptive.direct_max_selectivity);
+        if fraction.is_nan() || fraction <= 0.0 {
+            return 0;
+        }
+        (fraction.min(1.0) * f64::from(max_doc)).floor() as usize
+    }
+
+    /// Resolves a sparse filter's matches to located rows grouped by cluster. Dead matches are
+    /// pruned; matches without a vector are absent.
+    fn locate_matches(
+        &self,
+        index: &IvfIndex,
+        mut docs: Vec<DocId>,
+        alive: Option<&AliveBitSet>,
+        stats: &mut ProbeStats,
+    ) -> crate::Result<LocatedMatches> {
+        let locate_start = Instant::now();
+        let _locate_stage = enter_vector_stage(Stage::Locate);
+        let matched = docs.len();
+        if let Some(alive) = alive {
+            docs.retain(|&doc| alive.is_alive(doc));
+        }
+        let dead = matched - docs.len();
+        let mut located = Vec::with_capacity(docs.len());
+        self.reader.locate_docs(&docs, &mut located)?;
+        let matches = LocatedMatches::new(index, &located);
+        stats.access_path = AccessPath::Located;
+        stats.pruned_dead += dead;
+        stats.vectors_visited += matches.len() + dead;
+        stats.located_absent += docs.len() - matches.len();
+        stats.located_matches += matches.len();
+        stats.located_clusters += matches.num_clusters();
+        stats.locate_ns += locate_start.elapsed().as_nanos() as u64;
+        Ok(matches)
+    }
 }
 
-/// A segment's filter matches, as consumed by the IVF probes.
+/// Admits every batch of `source` into `scan` under `admission_stage`, folds the source's
+/// counters into `stats`, and returns the admission time outside routing, exact scoring and
+/// locating.
+fn admit_from<S, T, K, CTail>(
+    scan: &mut SegmentScan<'_, T, K, CTail>,
+    mut source: S,
+    admission_stage: Stage,
+    tie_break: &mut K,
+    stats: &mut ProbeStats,
+) -> crate::Result<u64>
+where
+    S: ClusterSource,
+    T: VectorElement,
+    K: SegmentSortKeyComputer,
+    CTail: Comparator<K::SegmentSortKey>,
+{
+    let admission_start = Instant::now();
+    let exact_before = stats.exact_ns;
+    let locate_before = stats.locate_ns;
+    {
+        let _admission_stage = enter_vector_stage(admission_stage);
+        admit_all(scan, &mut source, tie_break, stats)?;
+    }
+    let admission_ns = admission_start.elapsed().as_nanos() as u64;
+    let routing_before = stats.routing_ns;
+    source.finish(stats);
+    Ok(admission_ns
+        .saturating_sub(stats.routing_ns - routing_before)
+        .saturating_sub(stats.exact_ns - exact_before)
+        .saturating_sub(stats.locate_ns - locate_before))
+}
+
+/// A segment's filter matches, as consumed by the IVF scan.
 enum SegmentFilter {
     /// Every doc id below `max_doc` matches (deleted docs included); no
     /// bitset is materialized.
     All,
     /// The matching doc ids.
     Docs(BitSet),
+    /// At most the located-path cap of matching doc ids, ascending, deleted docs included.
+    Sparse(Vec<DocId>),
 }
 
 impl SegmentFilter {
     fn is_empty(&self) -> bool {
-        matches!(self, SegmentFilter::Docs(filter) if filter.len() == 0)
+        match self {
+            SegmentFilter::All => false,
+            SegmentFilter::Docs(filter) => filter.len() == 0,
+            SegmentFilter::Sparse(docs) => docs.is_empty(),
+        }
     }
 
+    /// The bitset the routed path gates rows with; `None` matches every doc.
     fn docs(&self) -> Option<&BitSet> {
         match self {
             SegmentFilter::All => None,
             SegmentFilter::Docs(filter) => Some(filter),
+            SegmentFilter::Sparse(_) => unreachable!("sparse filters take the located path"),
         }
     }
 
     /// The share of doc ids below `max_doc` that match.
     fn match_fraction(&self, max_doc: DocId) -> f64 {
-        match self {
-            SegmentFilter::All => 1.0,
-            SegmentFilter::Docs(filter) => filter.len() as f64 / f64::from(max_doc.max(1)),
-        }
+        let matched = match self {
+            SegmentFilter::All => return 1.0,
+            SegmentFilter::Docs(filter) => filter.len(),
+            SegmentFilter::Sparse(docs) => docs.len(),
+        };
+        matched as f64 / f64::from(max_doc.max(1))
     }
 }
 
-/// Drain the filter `DocSet` into a dense BitSet for O(1) random membership
-/// testing per cluster doc. The BitSet allocates `max_doc / 8` bytes regardless
-/// of filter selectivity — inherent to IVF needing membership tests on
-/// out-of-order doc ids. A filter whose scorer is an [`AllScorer`] (match-all,
-/// including boolean queries that collapse to one) skips the drain entirely,
-/// as does a drained bitset that turns out full. `#[inline(never)]` so it
-/// forms its own flamegraph frame; at low selectivity over a large segment
-/// this drain is real cost otherwise hidden in the search entry.
-/// Materializes a filter doc set as a dense bitset unless it matches all docs.
+/// Drains the filter `DocSet` once, in ascending doc order. Up to `cap` matches are kept as a
+/// sparse list for the located path; the first match past `cap` moves them into a dense BitSet
+/// and the drain continues there, so a filter is never drained twice. Dead docs count toward the
+/// cap, which keeps the decision free of alive lookups. A match-all scorer, or a drain that
+/// matches every doc, is [`SegmentFilter::All`]; `cap == 0` always builds the bitset. The BitSet
+/// allocates `max_doc / 8` bytes regardless of selectivity, inherent to random membership tests
+/// on out-of-order cluster doc ids. `#[inline(never)]` keeps the drain in its own flamegraph
+/// frame.
 #[inline(never)]
 fn collect_segment_filter(
     weight: &dyn Weight,
     segment_reader: &SegmentReader,
     max_doc: DocId,
+    cap: usize,
 ) -> crate::Result<SegmentFilter> {
     let mut scorer = weight.scorer(segment_reader, 1.0)?;
     if scorer.is::<AllScorer>() {
         return Ok(SegmentFilter::All);
     }
-    let mut filter = BitSet::with_max_value(max_doc);
+    let mut sparse = Vec::new();
+    let mut dense = (cap == 0).then(|| BitSet::with_max_value(max_doc));
     let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
     for_each_docset_buffered(scorer.as_mut(), &mut buffer, |docs| {
         for &doc in docs {
-            filter.insert(doc);
+            match &mut dense {
+                Some(filter) => {
+                    filter.insert(doc);
+                }
+                None if sparse.len() < cap => sparse.push(doc),
+                None => {
+                    let mut filter = BitSet::with_max_value(max_doc);
+                    for &doc in &sparse {
+                        filter.insert(doc);
+                    }
+                    filter.insert(doc);
+                    sparse = Vec::new();
+                    dense = Some(filter);
+                }
+            }
         }
     });
-    if filter.len() == max_doc as usize {
+    let matched = dense.as_ref().map_or(sparse.len(), BitSet::len);
+    if matched == max_doc as usize {
         return Ok(SegmentFilter::All);
     }
-    Ok(SegmentFilter::Docs(filter))
+    Ok(match dense {
+        Some(filter) => SegmentFilter::Docs(filter),
+        None => SegmentFilter::Sparse(sparse),
+    })
 }
 
 #[cfg(test)]
@@ -4356,7 +4526,7 @@ mod tests {
             let weight_for =
                 |query: &dyn Query| query.weight(EnableScoring::disabled_from_searcher(&searcher));
             let filter_for = |query: &dyn Query| -> crate::Result<SegmentFilter> {
-                collect_segment_filter(weight_for(query)?.as_ref(), segment_reader, max_doc)
+                collect_segment_filter(weight_for(query)?.as_ref(), segment_reader, max_doc, 0)
             };
 
             assert!(matches!(filter_for(&AllQuery)?, SegmentFilter::All));
@@ -4371,6 +4541,7 @@ mod tests {
                     assert_eq!(docs.len(), matching);
                     saw_partial |= matching > 0;
                 }
+                SegmentFilter::Sparse(_) => unreachable!("a zero cap never builds a sparse filter"),
             }
         }
         assert!(saw_partial, "fixture must exercise a partial filter");
@@ -5158,6 +5329,17 @@ mod tests {
                 bytes_read: 512,
                 storage_blocks: 1,
             },
+            access_path: AccessPath::Located,
+            located_matches: 6,
+            located_absent: 1,
+            located_clusters: 3,
+            centroid_reads: 2,
+            locate_ns: 15,
+            locate_io: super::super::VectorIoStats {
+                reads: 4,
+                bytes_read: 64,
+                storage_blocks: 2,
+            },
             ..Default::default()
         };
         stats.start_layer(0);
@@ -5206,6 +5388,16 @@ mod tests {
         assert_eq!(object.remove("exact_bytes_read").unwrap(), 512);
         assert_eq!(object.remove("exact_storage_blocks").unwrap(), 1);
         assert!(!object.contains_key("exact_io"));
+        assert_eq!(object.remove("access_path").unwrap(), "Located");
+        assert_eq!(object.remove("located_matches").unwrap(), 6);
+        assert_eq!(object.remove("located_absent").unwrap(), 1);
+        assert_eq!(object.remove("located_clusters").unwrap(), 3);
+        assert_eq!(object.remove("centroid_reads").unwrap(), 2);
+        assert_eq!(object.remove("locate_ns").unwrap(), 15);
+        assert_eq!(object.remove("locate_reads").unwrap(), 4);
+        assert_eq!(object.remove("locate_bytes_read").unwrap(), 64);
+        assert_eq!(object.remove("locate_storage_blocks").unwrap(), 2);
+        assert!(!object.contains_key("locate_io"));
         assert_eq!(
             value,
             serde_json::json!({

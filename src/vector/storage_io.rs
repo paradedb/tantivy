@@ -29,11 +29,12 @@ impl VectorIoStats {
         }
     }
 }
-/// Counter slots: layer scans 0..3, the final stage (serialized as `rerank_*`), and exact reads
-/// before the final stage.
-pub(crate) const IO_SLOTS: usize = 5;
+/// Counter slots: layer scans 0..3, the final stage (serialized as `rerank_*`), exact reads
+/// before the final stage, and location-map and centroid-row reads.
+pub(crate) const IO_SLOTS: usize = 6;
 pub(crate) const RERANK_SLOT: usize = 3;
 pub(crate) const EXACT_SLOT: usize = 4;
+pub(crate) const LOCATE_SLOT: usize = 5;
 thread_local! {
     static COUNTERS: Cell<[VectorIoStats; IO_SLOTS]> = const { Cell::new([VectorIoStats { reads: 0, bytes_read: 0, storage_blocks: 0 }; IO_SLOTS]) };
 }
@@ -52,6 +53,7 @@ impl VectorRead for FileSlice {
             Stage::LayerScan(l) if l < 3 => Some(l as usize),
             Stage::RerankFetch => Some(RERANK_SLOT),
             Stage::Exact => Some(EXACT_SLOT),
+            Stage::Locate => Some(LOCATE_SLOT),
             _ => None,
         };
         if let Some(slot) = slot {
@@ -94,6 +96,19 @@ pub(crate) mod test_support {
 
     thread_local! {
         static LOG_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+        static DOC_IDS_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Counts a cluster DocIds column read made while the probe's read log is armed.
+    pub(crate) fn record_doc_ids_read() {
+        if LOG_ARMED.get() {
+            DOC_IDS_READS.set(DOC_IDS_READS.get() + 1);
+        }
+    }
+
+    /// DocIds column reads recorded on this thread so far.
+    pub(crate) fn doc_ids_reads() -> usize {
+        DOC_IDS_READS.get()
     }
 
     /// Builds trace fixtures before the probe's read log is armed, restoring nested state on exit.

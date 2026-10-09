@@ -29,6 +29,8 @@ pub(crate) enum Stage {
 pub(crate) enum CentroidScore {
     /// The exact similarity the router keys on.
     Known(Similarity),
+    /// Not computed: a quantized layer-0 read must first read the centroid row.
+    Unknown,
 }
 
 /// The rows of one cluster a batch selects.
@@ -128,6 +130,9 @@ pub(crate) struct LayerCosts {
     pub(crate) sparse: Option<ReadCost>,
     /// The whole band.
     pub(crate) full: ReadCost,
+    /// The centroid row either quantized read needs first: non-zero only at layer 0 with an
+    /// unknown centroid score.
+    pub(crate) centroid: ReadCost,
 }
 
 impl LayerCosts {
@@ -164,7 +169,7 @@ impl BatchCosts {
         let Some(layer) = self.layer else {
             return ReadPlan::Exact;
         };
-        if exact_enabled && self.exact < layer.cheapest() {
+        if exact_enabled && self.exact < layer.cheapest() + layer.centroid {
             return ReadPlan::Exact;
         }
         layer.plan()

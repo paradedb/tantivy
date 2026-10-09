@@ -15,7 +15,8 @@ use quant_model::f16::f16_to_f32;
 
 use super::backend::{Estimate, Threshold};
 use super::blocks::{BlockMetadata, Blocks};
-use super::cluster_plan::{BatchCosts, ClusterBatch, LayerCosts, ReadCost};
+use super::cluster_plan::{BatchCosts, CentroidScore, ClusterBatch, LayerCosts, ReadCost};
+use super::flat::id_map::DocLocation;
 use super::flat::IdMap;
 use super::header::{read_centroid_header, read_vector_header, CentroidSlot, VectorEntry};
 use super::ivf::{decode_row, IvfIndex, CENTROIDS_EXT};
@@ -1265,7 +1266,11 @@ impl QuantizedLayerReader {
         let in_blocks = band.storage_block_len().is_some();
         let full = range_cost(&band, 0..band.len(), in_blocks);
         let Some(offsets) = offsets else {
-            return Ok(LayerCosts { sparse: None, full });
+            return Ok(LayerCosts {
+                sparse: None,
+                full,
+                centroid: ReadCost(0),
+            });
         };
         let cluster = self.cluster_in_block(b)?;
         rows.clear();
@@ -1290,6 +1295,7 @@ impl QuantizedLayerReader {
         Ok(LayerCosts {
             sparse: Some(sparse),
             full,
+            centroid: ReadCost(0),
         })
     }
     #[cfg(test)]
@@ -1429,6 +1435,19 @@ fn exact_read_cost(
         }
     }
     ReadCost(blocks)
+}
+
+/// The cost of reading one centroid row, in the unit of the rows' storage: blocks when
+/// `block_len` is known (a row on storage without geometry counts the blocks its bytes fill),
+/// bytes otherwise.
+fn centroid_read_cost(row: &FileSlice, block_len: Option<usize>) -> ReadCost {
+    match block_len {
+        None => ReadCost(row.len()),
+        Some(block_len) => match storage_block_span(row, 0..row.len()) {
+            Some((first, last)) => ReadCost(last - first + 1),
+            None => ReadCost(row.len().div_ceil(block_len)),
+        },
+    }
 }
 
 /// Storage blocks a byte range of `slice` spans, or its bytes without block geometry.
@@ -2729,9 +2748,10 @@ impl VectorIndexReader {
         rows: &mut Vec<usize>,
         ranges: &mut Vec<Range<usize>>,
     ) -> crate::Result<BatchCosts> {
+        let column = self.rows_slice.column(batch.cluster, 0)?;
         let exact = if with_exact {
             exact_read_cost(
-                &self.rows_slice.column(batch.cluster, 0)?,
+                &column,
                 self.options.bytes_per_vector(),
                 batch.selection.offsets(),
                 batch.rows.len(),
@@ -2744,16 +2764,39 @@ impl VectorIndexReader {
                 let field = self.quantization.as_ref().ok_or_else(|| {
                     DataCorruption::comment_only("quantized read costs need quantized storage")
                 })?;
-                Some(field.layers()[layer].read_costs(
+                let mut costs = field.layers()[layer].read_costs(
                     batch.cluster,
                     batch.selection.offsets(),
                     rows,
                     ranges,
-                )?)
+                )?;
+                if layer == 0 && batch.centroid == CentroidScore::Unknown {
+                    let index = self.index.as_ref().ok_or_else(|| {
+                        DataCorruption::comment_only("centroid rows need an IVF index")
+                    })?;
+                    costs.centroid = centroid_read_cost(
+                        &index.centroid_row_slice(batch.cluster)?,
+                        column.storage_block_len(),
+                    );
+                }
+                Some(costs)
             }
             None => None,
         };
         Ok(BatchCosts { exact, layer })
+    }
+
+    /// Locates strictly ascending documents through the clustered location map, appending
+    /// `(doc, location)` for each document that has a vector.
+    pub(crate) fn locate_docs(
+        &self,
+        docs: &[DocId],
+        out: &mut Vec<(DocId, DocLocation)>,
+    ) -> crate::Result<()> {
+        self.id_map
+            .get(true)?
+            .locate_many(docs, &self.rows_slice.block_rows, out)
+            .map_err(|e| DataCorruption::comment_only(e.to_string()).into())
     }
 
     /// Fetches increasing vector rows through a storage-aware range plan.
@@ -2893,6 +2936,8 @@ impl VectorIndexReader {
             .iter()
             .position(|slot| matches!(slot.slot_type, SlotType::DocIds))
             .ok_or_else(|| DataCorruption::comment_only("missing DocIds column"))?;
+        #[cfg(test)]
+        super::storage_io::test_support::record_doc_ids_read();
         let bytes = blocks.column(cluster, idx)?.read_vector_bytes()?;
         out.reserve(blocks.rows_in(cluster));
         let mut previous = None;

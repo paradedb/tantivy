@@ -123,6 +123,8 @@ pub enum Stage {
     ExactScan,
     /// Exact scoring of rows before the final stage.
     Exact,
+    /// Locating filter matches through the document location map, and reading centroid rows.
+    Locate,
     /// Result assembly.
     ResultAssembly,
     /// Rerank row fetching.
@@ -144,6 +146,7 @@ impl Stage {
             Self::Boundary(layer) => Some(Cow::Owned(format!("boundary{layer}"))),
             Self::ExactScan => Some(Cow::Borrowed("exact_scan")),
             Self::Exact => Some(Cow::Borrowed("exact")),
+            Self::Locate => Some(Cow::Borrowed("locate")),
             Self::ResultAssembly => Some(Cow::Borrowed("result_assembly")),
             Self::RerankFetch => Some(Cow::Borrowed("rerank_fetch")),
             Self::RerankScore => Some(Cow::Borrowed("rerank_score")),
@@ -190,6 +193,7 @@ mod stage_tests {
         assert_eq!(Stage::Boundary(2).name().as_deref(), Some("boundary2"));
         assert_eq!(Stage::ExactScan.name().as_deref(), Some("exact_scan"));
         assert_eq!(Stage::Exact.name().as_deref(), Some("exact"));
+        assert_eq!(Stage::Locate.name().as_deref(), Some("locate"));
         assert_eq!(
             Stage::ResultAssembly.name().as_deref(),
             Some("result_assembly")

@@ -3,7 +3,8 @@
 //! A [`ClusterSource`] supplies a segment scan's layer-0 [`ClusterBatch`]es in its own order and
 //! decides when to stop. It never scores: the scan admits each batch and reports back how many
 //! rows it scored. [`RoutedClusters`] walks the router's ranking under the probe budget, the
-//! bounds gate and the filter.
+//! bounds gate and the filter. [`LocatedClusters`] serves a sparse filter's own matches, found
+//! through the document location map, cluster by cluster in ascending id.
 
 use std::ops::Range;
 use std::time::Instant;
@@ -16,6 +17,7 @@ use super::bounds::{
     QueryBound, QueryBoundTracker, Verdict,
 };
 use super::cluster_plan::{CentroidScore, ClusterBatch, SelectedDocs, Selection, Stage};
+use super::flat::id_map::DocLocation;
 use super::index_reader::VectorIndexReader;
 use super::ivf::{Candidate, IvfIndex};
 use super::router::{RouterIter, RouterWorkspace, RoutingParams};
@@ -407,5 +409,109 @@ impl ClusterSource for RoutedClusters<'_, '_> {
         stats.eligible_charged += self.eligible;
         stats.record_bound_armed(self.tracker.armed_at_probe());
         self.controller.finish(stats);
+    }
+}
+
+/// A sparse filter's live matches with a vector, located: ascending global rows, their
+/// documents, and each cluster's run of positions.
+pub(super) struct LocatedMatches {
+    rows: Vec<usize>,
+    docs: Vec<DocId>,
+    /// `(cluster, positions in rows and docs)`, ascending by cluster.
+    clusters: Vec<(usize, Range<usize>)>,
+}
+
+impl LocatedMatches {
+    /// Groups located documents into per-cluster runs of ascending rows.
+    pub(super) fn new(index: &IvfIndex, located: &[(DocId, DocLocation)]) -> Self {
+        let mut entries: Vec<(usize, DocId, usize)> = located
+            .iter()
+            .map(|&(doc, location)| {
+                let cluster = location.cluster as usize;
+                (
+                    index.cluster_range(cluster).start + location.local as usize,
+                    doc,
+                    cluster,
+                )
+            })
+            .collect();
+        entries.sort_unstable_by_key(|&(row, _, _)| row);
+        let mut matches = LocatedMatches {
+            rows: Vec::with_capacity(entries.len()),
+            docs: Vec::with_capacity(entries.len()),
+            clusters: Vec::new(),
+        };
+        for (position, &(row, doc, cluster)) in entries.iter().enumerate() {
+            matches.rows.push(row);
+            matches.docs.push(doc);
+            match matches.clusters.last_mut() {
+                Some((last, positions)) if *last == cluster => positions.end = position + 1,
+                _ => matches.clusters.push((cluster, position..position + 1)),
+            }
+        }
+        matches
+    }
+
+    /// Located rows.
+    pub(super) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Clusters holding a located row.
+    pub(super) fn num_clusters(&self) -> usize {
+        self.clusters.len()
+    }
+}
+
+/// The clusters holding a sparse filter's located matches, in ascending cluster id: one batch
+/// per cluster, its matches as the selection, the centroid score left for the scan to read.
+/// No routing, no DocIds read, no bounds gate and no probe budget: every match is scored.
+pub(super) struct LocatedClusters<'a> {
+    index: &'a IvfIndex,
+    matches: &'a LocatedMatches,
+    next: usize,
+    offsets: Vec<usize>,
+}
+
+impl<'a> LocatedClusters<'a> {
+    pub(super) fn new(index: &'a IvfIndex, matches: &'a LocatedMatches) -> Self {
+        Self {
+            index,
+            matches,
+            next: 0,
+            offsets: Vec::new(),
+        }
+    }
+}
+
+impl ClusterSource for LocatedClusters<'_> {
+    fn next(&mut self, _bound: &KthBound) -> crate::Result<Option<ClusterBatch<'_>>> {
+        let Some((cluster, positions)) = self.matches.clusters.get(self.next).cloned() else {
+            return Ok(None);
+        };
+        self.next += 1;
+        let rows = self.index.cluster_range(cluster);
+        self.offsets.clear();
+        self.offsets.extend(
+            self.matches.rows[positions.clone()]
+                .iter()
+                .map(|&row| row - rows.start),
+        );
+        Ok(Some(ClusterBatch {
+            stage: Stage::Layer(0),
+            cluster,
+            rows,
+            selection: Selection::Rows(&self.offsets),
+            docs: SelectedDocs::BySelection(&self.matches.docs[positions]),
+            centroid: CentroidScore::Unknown,
+        }))
+    }
+
+    fn admitted(&mut self, _rows_scored: usize, _bound: &KthBound) -> crate::Result<()> {
+        Ok(())
+    }
+
+    fn finish(self, stats: &mut ProbeStats) {
+        stats.postings_row += self.next;
     }
 }

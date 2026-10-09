@@ -5,14 +5,16 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::*;
+use crate::collector::TopDocs;
 use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
 use crate::query::{
-    AllQuery, BitSetDocSet, ConstScorer, EnableScoring, Explanation, Query, Scorer,
+    AllQuery, BitSetDocSet, ConstScorer, EnableScoring, Explanation, Query, Scorer, TermQuery,
 };
-use crate::schema::{Schema, Term, STORED, STRING};
+use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
 use crate::vector::cluster_plan::{BatchCosts, LayerCosts, ReadCost};
-use crate::vector::storage_io::test_support::PagedDirectory;
+use crate::vector::ivf::Candidate;
+use crate::vector::storage_io::test_support::{doc_ids_reads, PagedDirectory};
 use crate::vector::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors, RouterKind, Stage,
     VectorDType, VectorOptions, VectorQuantizationConfig, VectorQuantizationLayer,
@@ -385,6 +387,7 @@ fn costs(full: usize, sparse: Option<usize>) -> LayerCosts {
     LayerCosts {
         sparse: sparse.map(ReadCost),
         full: ReadCost(full),
+        centroid: ReadCost(0),
     }
 }
 
@@ -772,4 +775,365 @@ fn layout_takes_exact_for_selective_filters_only() -> crate::Result<()> {
         );
     }
     Ok(())
+}
+
+// ============================================================
+// The located source: sparse filters through the location map.
+// ============================================================
+
+/// Full precision, and two quantized layers.
+const SCHEDULES: [&[u8]; 2] = [&[], &[1, 4]];
+
+/// [`exhaustive`] with a located-path threshold and the exact plan on or off.
+fn located(direct_max_selectivity: f32, exact_plan: bool) -> AdaptiveProbeParams {
+    AdaptiveProbeParams {
+        direct_max_selectivity,
+        exact_plan,
+        ..exhaustive()
+    }
+}
+
+/// A threshold whose cap is exactly `cap` on a segment of `max_doc` documents.
+fn selectivity_for_cap(cap: u32, max_doc: u32) -> f32 {
+    (cap as f32 + 0.5) / max_doc as f32
+}
+
+/// The located path's identities: every match is admitted, nothing is filtered or routed.
+fn assert_located(stats: &ProbeStats) {
+    assert_eq!(stats.access_path, AccessPath::Located, "{stats:?}");
+    assert_eq!(
+        stats.vectors_visited,
+        stats.located_matches + stats.pruned_dead,
+        "{stats:?}"
+    );
+    assert_eq!(
+        stats.vectors_visited,
+        stats.pruned_filter + stats.pruned_dead + stats.candidates_scored,
+        "{stats:?}"
+    );
+    assert_eq!(stats.pruned_filter, 0, "{stats:?}");
+    assert!(stats.routing.is_none(), "{stats:?}");
+    assert_eq!(stats.postings_skipped, 0, "{stats:?}");
+    assert_eq!(stats.bounds_skips, 0, "{stats:?}");
+    assert_eq!(stats.postings_row, stats.located_clusters, "{stats:?}");
+}
+
+fn present(fx: &Fixture, docs: &[DocId]) -> crate::Result<usize> {
+    let searcher = fx.index.reader()?.searcher();
+    let reader = searcher.segment_readers()[0].vector_index(fx.field)?;
+    let mut count = 0;
+    for &doc in docs {
+        count += usize::from(reader.contains(doc)?);
+    }
+    Ok(count)
+}
+
+/// The located path returns the exhaustive top-k on full-precision and quantized segments, with
+/// the exact plan on and off, for every metric and selectivity, and reads no DocIds column.
+#[test]
+fn located_path_matches_the_oracle() -> crate::Result<()> {
+    for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+        for schedule in SCHEDULES {
+            let fx = fixture(Shape::new(metric, schedule))?;
+            let max_doc = fx.index.reader()?.searcher().segment_readers()[0].max_doc();
+            for exact_plan in [false, true] {
+                for count in [1, 2, 20, 200] {
+                    let docs = spread(max_doc, count);
+                    let context = format!(
+                        "{metric:?} schedule={schedule:?} exact={exact_plan} matches={count}"
+                    );
+                    let before = doc_ids_reads();
+                    let (hits, stats) = run(&fx, &docs, 10, located(1.0, exact_plan))?;
+                    assert_eq!(doc_ids_reads(), before, "{context}: DocIds read");
+                    assert_eq!(hits, oracle(&fx, Some(&addresses(&docs)), 10)?, "{context}");
+                    assert_located(&stats);
+                    assert_eq!(stats.located_matches, present(&fx, &docs)?, "{context}");
+                    assert_eq!(
+                        stats.located_absent,
+                        docs.len() - stats.located_matches,
+                        "{context}"
+                    );
+                    assert_eq!(stats.candidates_scored, stats.located_matches, "{context}");
+                    if fx.quantized {
+                        let layer0 = stats.layers.get(0).expect("layer 0");
+                        // Every cluster not finished exactly reads its centroid row first.
+                        assert_eq!(
+                            stats.centroid_reads + layer0.exact_clusters(),
+                            stats.located_clusters,
+                            "{context}"
+                        );
+                        if !exact_plan {
+                            assert_eq!(layer0.scored(), stats.located_matches, "{context}");
+                        }
+                    } else {
+                        assert_eq!(stats.centroid_reads, 0, "{context}");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The drain keeps exactly `cap` matches sparse; one more spills into the bitset a zero cap
+/// builds, and a zero cap never builds a sparse filter.
+#[test]
+fn cap_boundary_spills_to_the_routed_bitset() -> crate::Result<()> {
+    let fx = fixture(Shape::new(Metric::L2, &[1, 4]))?;
+    let searcher = fx.index.reader()?.searcher();
+    let segment_reader = &searcher.segment_readers()[0];
+    let max_doc = segment_reader.max_doc();
+    let docs = spread(max_doc, 20);
+    let weight = FixedDocsWeight {
+        max_doc,
+        docs: docs.clone(),
+    };
+    match collect_segment_filter(&weight, segment_reader, max_doc, 20)? {
+        SegmentFilter::Sparse(sparse) => assert_eq!(sparse, docs),
+        _ => panic!("matches == cap stay sparse"),
+    }
+    let SegmentFilter::Docs(routed) = collect_segment_filter(&weight, segment_reader, max_doc, 0)?
+    else {
+        panic!("a zero cap builds the bitset");
+    };
+    let SegmentFilter::Docs(spilled) =
+        collect_segment_filter(&weight, segment_reader, max_doc, 19)?
+    else {
+        panic!("matches == cap + 1 spill");
+    };
+    assert_eq!(spilled.len(), routed.len());
+    assert!((0..max_doc).all(|doc| spilled.contains(doc) == routed.contains(doc)));
+    assert!(docs.iter().all(|&doc| routed.contains(doc)));
+
+    // The same boundary through the threshold: floor(selectivity * max_doc).
+    let (_, at_cap) = run(
+        &fx,
+        &docs,
+        10,
+        located(selectivity_for_cap(20, max_doc), false),
+    )?;
+    assert_eq!(at_cap.access_path, AccessPath::Located, "{at_cap:?}");
+    let (_, over) = run(
+        &fx,
+        &docs,
+        10,
+        located(selectivity_for_cap(19, max_doc), false),
+    )?;
+    assert_eq!(over.access_path, AccessPath::Routed, "{over:?}");
+    let (_, never) = run(&fx, &docs[..1], 10, located(0.0, false))?;
+    assert_eq!(never.access_path, AccessPath::Routed, "{never:?}");
+    let (_, unfiltered) = run_all(&fx, 10, located(1.0, true))?;
+    assert_eq!(
+        unfiltered.access_path,
+        AccessPath::Routed,
+        "unfiltered queries route"
+    );
+    Ok(())
+}
+
+/// Dead matches count toward the cap but are never scored; matches without a vector are
+/// absent; an empty filter, `k > m` and `top_n == 0` behave as on the routed path.
+#[test]
+fn located_deletes_absent_and_edge_cases() -> crate::Result<()> {
+    for schedule in SCHEDULES {
+        let fx = fixture(Shape::new(Metric::L2, schedule))?;
+        let max_doc = fx.index.reader()?.searcher().segment_readers()[0].max_doc();
+        let docs: Vec<DocId> = (0..20).map(|i| i * 97 + 5).collect();
+        delete(&fx, &docs[..5])?;
+        let searcher = fx.index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let alive = segment_reader.alive_bitset().expect("deletes landed");
+        let live: Vec<DocId> = docs
+            .iter()
+            .copied()
+            .filter(|&d| alive.is_alive(d))
+            .collect();
+        assert_eq!(live.len(), 15);
+
+        // Twenty matches, five dead: a cap of twenty goes located.
+        let at_cap = located(selectivity_for_cap(20, max_doc), false);
+        let (hits, stats) = run(&fx, &docs, 50, at_cap)?;
+        assert_located(&stats);
+        assert_eq!(stats.pruned_dead, 5, "{stats:?}");
+        assert_eq!(
+            stats.located_matches + stats.located_absent,
+            15,
+            "{stats:?}"
+        );
+        assert_eq!(hits, oracle(&fx, Some(&addresses(&live)), 50)?);
+        assert_eq!(
+            hits.len(),
+            stats.located_matches,
+            "k > m returns every match"
+        );
+
+        // Dead matches count toward the cap: fifteen live matches over a cap of fifteen route.
+        let (_, routed) = run(
+            &fx,
+            &docs,
+            10,
+            located(selectivity_for_cap(15, max_doc), false),
+        )?;
+        assert_eq!(routed.access_path, AccessPath::Routed, "{routed:?}");
+
+        // Absent matches: live documents without a vector.
+        let vectors = segment_reader.vector_index(fx.field)?;
+        let mut absent = Vec::new();
+        for doc in 0..max_doc {
+            if alive.is_alive(doc) && !vectors.contains(doc)? {
+                absent.push(doc);
+            }
+            if absent.len() == 3 {
+                break;
+            }
+        }
+        let mut mixed = absent.clone();
+        mixed.extend(&live[..2]);
+        mixed.sort_unstable();
+        let (hits, stats) = run(&fx, &mixed, 10, located(1.0, false))?;
+        assert_located(&stats);
+        assert_eq!(stats.located_absent, 3, "{stats:?}");
+        assert_eq!(hits, oracle(&fx, Some(&addresses(&mixed)), 10)?);
+
+        let (hits, _) = run(&fx, &[], 10, located(1.0, false))?;
+        assert!(hits.is_empty());
+        let (hits, _) = run(&fx, &live, 0, located(1.0, false))?;
+        assert!(hits.is_empty());
+    }
+    Ok(())
+}
+
+/// One threshold, two segments: the sparse segment goes located, the dense one routes, and
+/// the merged result is the exhaustive top-k.
+#[test]
+fn mixed_index_merges_located_and_routed_segments() -> crate::Result<()> {
+    for schedule in SCHEDULES {
+        let fx = fixture_with(
+            Shape::new(Metric::L2, schedule),
+            &[|doc| doc % 100 == 3, |doc| doc % 2 == 0],
+        )?;
+        let searcher = fx.index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 2);
+        let filter = TermQuery::new(
+            Term::from_field_text(fx.label, "pick"),
+            IndexRecordOption::Basic,
+        );
+        let collector = TopDocs::with_limit(10)
+            .order_by_similarity(fx.field, query(fx.dim))
+            .with_adaptive_params(located(0.05, true));
+        let fruit = searcher.search(&filter, &collector)?;
+        let admitted = admitted(&fx, &filter)?;
+        assert_eq!(
+            fruit.results,
+            oracle(&fx, Some(&admitted), 10)?,
+            "schedule={schedule:?}"
+        );
+        let paths: HashSet<_> = fruit.stats.iter().map(|s| s.access_path).collect();
+        assert_eq!(
+            paths,
+            HashSet::from([AccessPath::Located, AccessPath::Routed]),
+            "{:?}",
+            fruit.stats
+        );
+    }
+    Ok(())
+}
+
+/// The located path reads no DocIds column; its location-map reads land in the locate slot.
+#[test]
+fn located_path_reads_no_doc_ids() -> crate::Result<()> {
+    for schedule in SCHEDULES {
+        let shape = Shape {
+            paged: true,
+            ..Shape::new(Metric::L2, schedule)
+        };
+        let fx = fixture(shape)?;
+        let max_doc = fx.index.reader()?.searcher().segment_readers()[0].max_doc();
+        let docs = spread(max_doc, 40);
+        let before = doc_ids_reads();
+        let (_, routed) = run(&fx, &docs, 10, located(0.0, false))?;
+        assert!(doc_ids_reads() > before, "the routed path reads DocIds");
+        assert_eq!(routed.access_path, AccessPath::Routed);
+
+        let searcher = fx.index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let weight = FixedDocsWeight {
+            max_doc,
+            docs: docs.clone(),
+        };
+        let backend = backend(&fx, segment_reader, located(1.0, false))?;
+        // The first run opens this reader's location map; measure the second.
+        backend.top_n(&weight, segment_reader, 10)?;
+        let directory = fx.directory.as_ref().expect("paged");
+        directory.reads.lock().unwrap().clear();
+        let before = doc_ids_reads();
+        let (_, direct) = backend.top_n(&weight, segment_reader, 10)?;
+        assert_eq!(doc_ids_reads(), before, "schedule={schedule:?}");
+        assert_located(&direct);
+        let reads = directory.reads.lock().unwrap();
+        let locate_reads = reads
+            .iter()
+            .filter(|(stage, _)| *stage == Stage::Locate)
+            .count();
+        assert!(locate_reads > 0);
+        // Centroid rows live in the `.centroids` file, which the paged directory does not log;
+        // the locate slot counts them too.
+        assert_eq!(
+            direct.locate_io.reads,
+            (locate_reads + direct.centroid_reads) as u64,
+            "{direct:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The located path's centroid score is the router's key, bit for bit.
+#[test]
+fn centroid_score_equals_the_router_key() -> crate::Result<()> {
+    for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+        let fx = fixture(Shape::new(metric, &[1, 4]))?;
+        let searcher = fx.index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let backend = backend(&fx, segment_reader, exhaustive())?;
+        let quantized = backend.quantized_query.as_ref().expect("quantized segment");
+        let index = backend.reader.index().expect("IVF segment");
+        let mut workspace = RouterWorkspace::default();
+        let ranked: Vec<Candidate> = index
+            .rank_clusters(
+                &mut workspace,
+                quantized.query(),
+                RoutingParams {
+                    k: index.num_clusters(),
+                    recall: 1.0,
+                },
+            )
+            .collect();
+        assert_eq!(ranked.len(), index.num_clusters());
+        for Candidate { sim, node } in ranked {
+            let row = index.centroid_row(node as usize)?;
+            let located = metric.similarity_bytes::<f32>(quantized.query(), &row);
+            assert_eq!(
+                sim.score().to_bits(),
+                located.score().to_bits(),
+                "{metric:?} cluster {node}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Documents a query admits, across segments.
+fn admitted(fx: &Fixture, filter: &dyn Query) -> crate::Result<HashSet<DocAddress>> {
+    let searcher = fx.index.reader()?.searcher();
+    let weight = filter.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+    let mut admitted = HashSet::new();
+    for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {
+        weight.for_each_no_score(segment, &mut |docs| {
+            admitted.extend(
+                docs.iter()
+                    .map(|&doc| DocAddress::new(segment_ord as u32, doc)),
+            );
+        })?;
+    }
+    Ok(admitted)
 }
