@@ -11,6 +11,9 @@
 #[cfg(test)]
 #[path = "quantized_boundary_tests.rs"]
 mod quantized_boundary_tests;
+#[cfg(test)]
+#[path = "scan_tests.rs"]
+mod scan_tests;
 
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
@@ -22,7 +25,7 @@ use common::{BitSet, OwnedBytes};
 use quant_model::f16::f16_to_f32;
 
 use super::cluster_plan::{
-    CentroidScore, ClusterBatch, SelectedDocs, Selection, Stage as PlanStage,
+    CentroidScore, ClusterBatch, ReadPlan, SelectedDocs, Selection, Stage as PlanStage,
 };
 use super::cluster_source::{
     admit_all, ClusterSource, RoutedAccounting, RoutedClusters, RoutedQuery, RowGate,
@@ -357,6 +360,8 @@ pub struct LayerProbeStats {
     boundary_ns: u64,
     scored: usize,
     survivors: usize,
+    sparse_clusters: usize,
+    full_clusters: usize,
 }
 
 /// Candidate identities at quantized stage boundaries.
@@ -367,6 +372,9 @@ pub(crate) struct QuantizedStageTrace {
     pub(crate) estimates: Vec<Vec<(usize, DocId, u32)>>,
     pub(crate) boundary_docs: Vec<Vec<DocId>>,
     pub(crate) rerank_docs: Vec<DocId>,
+    /// Candidate columns after each layer, before its boundary: row, then raw prefix, base,
+    /// estimate and sigma bits.
+    pub(crate) layer_columns: Vec<Vec<(usize, [u32; 4])>>,
     scored_rows: Vec<usize>,
     boundary_rows: Vec<Vec<usize>>,
     estimate_rows: Vec<Vec<(usize, u32)>>,
@@ -439,6 +447,11 @@ impl serde::Serialize for LayerProbeStatsSet {
             map.serialize_entry(&format!("layer{index}_scan_ns"), &layer.scan_ns)?;
             map.serialize_entry(&format!("layer{index}_scored"), &layer.scored)?;
             map.serialize_entry(&format!("layer{index}_survivors"), &layer.survivors)?;
+            map.serialize_entry(
+                &format!("layer{index}_sparse_clusters"),
+                &layer.sparse_clusters,
+            )?;
+            map.serialize_entry(&format!("layer{index}_full_clusters"), &layer.full_clusters)?;
             map.serialize_entry(&format!("boundary{index}_ns"), &layer.boundary_ns)?;
         }
         map.end()
@@ -460,6 +473,16 @@ impl LayerProbeStats {
 
     pub fn survivors(&self) -> usize {
         self.survivors
+    }
+
+    /// Clusters read with only their selected rows at this layer.
+    pub fn sparse_clusters(&self) -> usize {
+        self.sparse_clusters
+    }
+
+    /// Clusters read as a whole band at this layer.
+    pub fn full_clusters(&self) -> usize {
+        self.full_clusters
     }
 }
 
@@ -671,6 +694,14 @@ impl ProbeStats {
         let stats = self.layers.layer_mut(layer);
         stats.scored += scored;
         stats.scan_ns += elapsed_ns;
+    }
+
+    fn record_layer_read(&mut self, layer: usize, plan: ReadPlan) {
+        let stats = self.layers.layer_mut(layer);
+        match plan {
+            ReadPlan::Sparse => stats.sparse_clusters += 1,
+            ReadPlan::Full => stats.full_clusters += 1,
+        }
     }
 
     fn record_boundary(&mut self, layer: usize, survivors: usize, elapsed_ns: u64) {
@@ -1038,6 +1069,23 @@ impl QuantizedCandidates {
     fn estimate_trace(&self) -> Vec<(usize, u32)> {
         (0..self.len())
             .map(|i| (self.rows[i], self.estimates[i].to_bits()))
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn column_trace(&self) -> Vec<(usize, [u32; 4])> {
+        (0..self.len())
+            .map(|i| {
+                (
+                    self.rows[i],
+                    [
+                        self.raw_prefixes[i].to_bits(),
+                        self.bases[i].to_bits(),
+                        self.estimates[i].to_bits(),
+                        self.sigmas[i].to_bits(),
+                    ],
+                )
+            })
             .collect()
     }
 
@@ -1770,7 +1818,8 @@ fn score_layer(
     query: &QuantizedQueryCtx,
     layer_idx: usize,
     layer: &QuantizedLayerReader,
-    first_layer: Option<(&QuantizedLayerBatch, &mut Vec<f32>)>,
+    pinned: Option<&QuantizedLayerBatch>,
+    mut residual_norms: Option<&mut Vec<f32>>,
     known_block: Option<usize>,
     rows: Range<usize>,
     selection: &Selection<'_>,
@@ -1783,8 +1832,6 @@ fn score_layer(
     selected_rows: &mut Vec<usize>,
     row_offsets: &mut Vec<usize>,
 ) -> crate::Result<usize> {
-    let (pinned, residual_norms) =
-        first_layer.map_or((None, None), |(batch, norms)| (Some(batch), Some(norms)));
     let metric = query.index.meta.field().metric();
     let selected_count = selection.len(&rows);
     if selected_count == 0 {
@@ -1889,6 +1936,9 @@ fn score_layer(
     debug_assert!(offsets.iter().all(|&offset| offset < rows.len()));
     selected_rows.clear();
     selected_rows.extend(offsets.iter().map(|&offset| rows.start + offset));
+    if let Some(out) = residual_norms.as_deref_mut() {
+        out.resize(selected_count, 0.0);
+    }
 
     // Selected rows and their code ranges are ordered, so each cluster can be consumed
     // directly without allocating request/view lists or sorting them.
@@ -1936,6 +1986,17 @@ fn score_layer(
                 &mut []
             },
         )?;
+        // Layer 0 also needs the selected rows' residual norms, read once per cluster.
+        if let Some(out) = residual_norms.as_deref_mut() {
+            let norms = cluster.read_residual_norms()?;
+            for (out, &row) in out[cluster_start..cluster_end]
+                .iter_mut()
+                .zip(&selected_rows[cluster_start..cluster_end])
+            {
+                let at = (row - cluster.rows.start) * 4;
+                *out = f32::from_le_bytes(norms[at..at + 4].try_into().unwrap());
+            }
+        }
         cluster_start = cluster_end;
     }
     // For sparse selections, the reported error row is approximate after the first selected row.
@@ -2260,25 +2321,27 @@ enum Combine {
     },
 }
 
-/// Reads and decodes `spec` for one batch's selected rows: the whole band at layer 0, the
-/// selected rows' code runs and the sidecar span at later layers. One function for every layer.
+/// Reads and decodes `spec` for one batch's selected rows, the way `plan` says: the whole band
+/// in one request, or the selected rows' code runs plus the sidecar span (and at layer 0 the
+/// residual norms). Both decode to the same values bit for bit. One function for every layer.
 fn read_layer(
     reader: &QuantizedLayerReader,
     query: &QuantizedQueryCtx,
     spec: &LayerSpec,
     batch: &ClusterBatch<'_>,
+    plan: ReadPlan,
     out: &mut LayerRows,
 ) -> crate::Result<()> {
-    let band = if spec.has_norms {
-        Some(reader.read_batch_in_block(batch.cluster, batch.rows.clone())?)
-    } else {
-        None
+    let band = match plan {
+        ReadPlan::Full => Some(reader.read_batch_in_block(batch.cluster, batch.rows.clone())?),
+        ReadPlan::Sparse => None,
     };
     score_layer(
         query,
         spec.index,
         reader,
-        band.as_ref().map(|band| (band, &mut out.norms)),
+        band.as_ref(),
+        spec.has_norms.then_some(&mut out.norms),
         Some(batch.cluster),
         batch.rows.clone(),
         &batch.selection,
@@ -2311,6 +2374,46 @@ fn survivor_cluster(index: &IvfIndex, row: usize, mut cluster: usize) -> crate::
         )));
     }
     Ok(cluster)
+}
+
+/// The cheaper read of `batch` at `reader`'s layer, from slice geometry alone.
+fn plan_read(
+    reader: &QuantizedLayerReader,
+    batch: &ClusterBatch<'_>,
+    rows: &mut LayerRows,
+) -> crate::Result<ReadPlan> {
+    let costs = reader.read_costs(
+        batch.cluster,
+        batch.selection.offsets(),
+        &mut rows.selected_rows,
+        &mut rows.read_ranges,
+    )?;
+    #[cfg(test)]
+    if let Some(plan) = FORCED_READ_PLAN.get() {
+        // A whole-cluster selection has no sparse read.
+        if plan == ReadPlan::Full || costs.sparse.is_some() {
+            return Ok(plan);
+        }
+    }
+    Ok(costs.plan())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCED_READ_PLAN: std::cell::Cell<Option<ReadPlan>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Overrides the quantized read plan on this thread until the guard drops.
+#[cfg(test)]
+pub(crate) fn force_read_plan(plan: ReadPlan) -> impl Drop {
+    struct Restore(Option<ReadPlan>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCED_READ_PLAN.set(self.0);
+        }
+    }
+    Restore(FORCED_READ_PLAN.replace(Some(plan)))
 }
 
 /// Per-segment buffers reused across clusters, layers and the final stage.
@@ -2488,13 +2591,10 @@ where
         };
         let spec = state.layers[layer];
         let rows = &mut self.scratch.layer_rows;
-        read_layer(
-            &state.field.layers()[layer],
-            state.query,
-            &spec,
-            batch,
-            rows,
-        )?;
+        let reader = &state.field.layers()[layer];
+        let plan = plan_read(reader, batch, rows)?;
+        stats.record_layer_read(layer, plan);
+        read_layer(reader, state.query, &spec, batch, plan, rows)?;
         let CentroidScore::Known(sim) = batch.centroid;
         let query_norm = state.query.score_query_norm(sim.score());
         if layer == 0 {
@@ -2748,13 +2848,17 @@ where
             drop(layer_stage);
             stats.record_layer_scan(layer, survivors, layer_start.elapsed().as_nanos() as u64);
             #[cfg(test)]
-            stats.quantized_trace.estimate_rows.push(
-                self.quantized
-                    .as_ref()
-                    .expect("quantized scan")
-                    .candidates
-                    .estimate_trace(),
-            );
+            {
+                let candidates = &self.quantized.as_ref().expect("quantized scan").candidates;
+                stats
+                    .quantized_trace
+                    .estimate_rows
+                    .push(candidates.estimate_trace());
+                stats
+                    .quantized_trace
+                    .layer_columns
+                    .push(candidates.column_trace());
+            }
             self.boundary(layer, stats);
         }
         Ok(())
@@ -2776,6 +2880,10 @@ where
                     .quantized_trace
                     .estimate_rows
                     .push(state.candidates.estimate_trace());
+                stats
+                    .quantized_trace
+                    .layer_columns
+                    .push(state.candidates.column_trace());
             }
             self.boundary(0, stats);
             for layer in 1..layers {
@@ -4950,6 +5058,10 @@ mod tests {
             "layer1_reads",
             "layer1_bytes_read",
             "layer1_storage_blocks",
+            "layer0_sparse_clusters",
+            "layer0_full_clusters",
+            "layer1_sparse_clusters",
+            "layer1_full_clusters",
         ] {
             assert_eq!(object.remove(key).unwrap(), 0);
         }

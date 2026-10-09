@@ -4,6 +4,10 @@
 //! the documents they belong to (or how to find them), and what is known about the query's
 //! similarity to the cluster's centroid. Cluster sources produce layer-0 batches; the segment
 //! scan regroups the survivors of each later stage into batches of its own.
+//!
+//! Each batch is read the cheapest way its storage layout allows ([`ReadPlan`]), judged by the
+//! storage blocks each read would touch ([`ReadCost`]). The decision covers a whole cluster at a
+//! stage boundary and changes only reads, never scores.
 
 use std::ops::Range;
 
@@ -45,6 +49,15 @@ impl Selection<'_> {
             Self::Rows(offsets) => offsets.len(),
         }
     }
+
+    /// Selected cluster-local offsets; `None` selects every row.
+    #[inline]
+    pub(crate) fn offsets(&self) -> Option<&[usize]> {
+        match self {
+            Self::All => None,
+            Self::Rows(offsets) => Some(offsets),
+        }
+    }
 }
 
 /// Document ids for a batch's rows. Within one cluster they are all resolved or all deferred.
@@ -74,5 +87,54 @@ impl ClusterBatch<'_> {
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.selection.len(&self.rows)
+    }
+}
+
+/// How a batch's rows are read at a quantized layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadPlan {
+    /// The selected rows' code runs, the layer's sidecar span, and at layer 0 the residual
+    /// norms.
+    Sparse,
+    /// The layer's whole band in one request.
+    Full,
+}
+
+/// A read's cost in the segment's one unit: storage blocks when the storage has block geometry,
+/// bytes otherwise.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ReadCost(pub(crate) usize);
+
+impl std::ops::Add for ReadCost {
+    type Output = ReadCost;
+
+    fn add(self, rhs: ReadCost) -> ReadCost {
+        ReadCost(self.0 + rhs.0)
+    }
+}
+
+impl std::ops::AddAssign for ReadCost {
+    fn add_assign(&mut self, rhs: ReadCost) {
+        self.0 += rhs.0;
+    }
+}
+
+/// The two ways to read one batch at a quantized layer, priced from slice geometry alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LayerCosts {
+    /// The sparse read; `None` when every row is selected.
+    pub(crate) sparse: Option<ReadCost>,
+    /// The whole band.
+    pub(crate) full: ReadCost,
+}
+
+impl LayerCosts {
+    /// Sparse only when strictly cheaper than the whole band; a tie reads the band in one
+    /// request.
+    pub(crate) fn plan(&self) -> ReadPlan {
+        match self.sparse {
+            Some(sparse) if sparse < self.full => ReadPlan::Sparse,
+            _ => ReadPlan::Full,
+        }
     }
 }
