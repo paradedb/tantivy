@@ -47,7 +47,11 @@ impl TermSetQuery {
     /// strategies (Gallop / Linear / Bitset on the fast column) when
     /// available, `BitsetFromPostings` / `Automaton` on the inverted
     /// index otherwise.
-    fn build_weight(&self, schema: &Schema) -> crate::Result<BooleanWeight<DoNothingCombiner>> {
+    fn build_weight(
+        &self,
+        schema: &Schema,
+        bitmap_enabled: bool,
+    ) -> crate::Result<BooleanWeight<DoNothingCombiner>> {
         let mut sub_queries: Vec<(_, Box<dyn Weight>)> = Vec::with_capacity(self.terms_map.len());
 
         for (&field, terms) in self.terms_map.iter() {
@@ -66,26 +70,26 @@ impl TermSetQuery {
 
             sub_queries.push((
                 Occur::Should,
-                Box::new(TermSetWeight::new(
-                    field,
-                    terms,
-                    field_type,
-                    self.strategy_config.clone(),
-                )?),
+                Box::new(
+                    TermSetWeight::new(field, terms, field_type, self.strategy_config.clone())?
+                        .with_bitmap_postings(bitmap_enabled),
+                ),
             ));
         }
 
-        Ok(BooleanWeight::new(
-            sub_queries,
-            false,
-            Box::new(DoNothingCombiner::default),
-        ))
+        Ok(
+            BooleanWeight::new(sub_queries, false, Box::new(DoNothingCombiner::default))
+                .with_bitmap_postings(bitmap_enabled),
+        )
     }
 }
 
 impl Query for TermSetQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
-        Ok(Box::new(self.build_weight(enable_scoring.schema())?))
+        Ok(Box::new(self.build_weight(
+            enable_scoring.schema(),
+            enable_scoring.bitmap_postings_enabled(),
+        )?))
     }
 
     fn query_terms(
@@ -144,14 +148,17 @@ impl Query for InvertedIndexTermSetQuery {
 
             sub_queries.push((
                 Occur::Should,
-                Box::new(AutomatonWeight::new(field, SetDfaWrapper(Arc::new(map)))),
+                Box::new(
+                    AutomatonWeight::new(field, SetDfaWrapper(Arc::new(map)))
+                        .with_scoring_enabled(enable_scoring.is_scoring_enabled())
+                        .with_bitmap_postings(enable_scoring.bitmap_postings_enabled()),
+                ),
             ));
         }
-        Ok(Box::new(BooleanWeight::new(
-            sub_queries,
-            false,
-            Box::new(DoNothingCombiner::default),
-        )))
+        Ok(Box::new(
+            BooleanWeight::new(sub_queries, false, Box::new(DoNothingCombiner::default))
+                .with_bitmap_postings(enable_scoring.bitmap_postings_enabled()),
+        ))
     }
 }
 

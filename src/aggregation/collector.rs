@@ -58,6 +58,14 @@ impl DistributedAggregationCollector {
     }
 }
 
+fn supports_bitmap_collection(agg: &Aggregations) -> bool {
+    let count_filter = super::bucket::FilterAggregation::new("*".to_string());
+    agg.values().all(|agg| {
+        matches!(&agg.agg, super::agg_req::AggregationVariants::Filter(filter) if filter == &count_filter)
+            && agg.sub_aggregation.is_empty()
+    })
+}
+
 impl Collector for DistributedAggregationCollector {
     type Fruit = IntermediateAggregationResults;
 
@@ -78,6 +86,10 @@ impl Collector for DistributedAggregationCollector {
 
     fn requires_scoring(&self) -> bool {
         false
+    }
+
+    fn supports_bitmap_collection(&self) -> bool {
+        supports_bitmap_collection(&self.agg)
     }
 
     fn merge_fruits(
@@ -110,6 +122,10 @@ impl Collector for AggregationCollector {
         false
     }
 
+    fn supports_bitmap_collection(&self) -> bool {
+        supports_bitmap_collection(&self.agg)
+    }
+
     fn merge_fruits(
         &self,
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
@@ -138,6 +154,7 @@ pub struct AggregationSegmentCollector {
     aggs_with_accessor: AggregationsSegmentCtx,
     agg_collector: LowCardBufferedSubAggs,
     error: Option<TantivyError>,
+    supports_bitmap_collection: bool,
 }
 
 impl AggregationSegmentCollector {
@@ -149,6 +166,15 @@ impl AggregationSegmentCollector {
         segment_ordinal: SegmentOrdinal,
         context: &AggContextParams,
     ) -> crate::Result<Self> {
+        let supports_bitmap_collection = supports_bitmap_collection(agg);
+        let mut ordinary_reader;
+        let reader = if supports_bitmap_collection {
+            reader
+        } else {
+            ordinary_reader = reader.clone();
+            ordinary_reader.bitmap_postings_enabled = false;
+            &ordinary_reader
+        };
         let mut agg_data =
             build_aggregations_data_from_req(agg, reader, segment_ordinal, context.clone())?;
         let mut result =
@@ -161,6 +187,7 @@ impl AggregationSegmentCollector {
             aggs_with_accessor: agg_data,
             agg_collector: result,
             error: None,
+            supports_bitmap_collection,
         })
     }
 }
@@ -198,6 +225,24 @@ impl SegmentCollector for AggregationSegmentCollector {
             Err(e) => {
                 self.error = Some(e);
             }
+        }
+    }
+
+    fn supports_bitmap_collection(&self) -> bool {
+        self.supports_bitmap_collection
+    }
+
+    fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
+        if self.error.is_some() {
+            return;
+        }
+        if let Err(error) = self.agg_collector.get_sub_agg_collector().collect_bitmap(
+            0,
+            base,
+            mask,
+            &mut self.aggs_with_accessor,
+        ) {
+            self.error = Some(error);
         }
     }
 

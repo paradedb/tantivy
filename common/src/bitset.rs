@@ -293,6 +293,23 @@ impl BitSet {
         self.len as usize
     }
 
+    /// Unions aligned words into the set, clipping padding beyond `max_value`.
+    pub fn union_tinysets(&mut self, start_bucket: u32, words: &[TinySet]) {
+        for (i, &word) in words.iter().enumerate() {
+            let bucket = start_bucket as usize + i;
+            let Some(destination) = self.tinysets.get_mut(bucket) else {
+                break;
+            };
+            let mut word = word;
+            if self.max_value % 64 != 0 && bucket == (self.max_value / 64) as usize {
+                word = word.intersect(TinySet::range_lower(self.max_value % 64));
+            }
+            let combined = destination.union(word);
+            self.len += u64::from(combined.len() - destination.len());
+            *destination = combined;
+        }
+    }
+
     /// Inserts an element in the `BitSet`
     ///
     /// Returns true if the set changed.
@@ -379,6 +396,16 @@ impl ReadOnlyBitSet {
         ReadOnlyBitSet { data, max_value }
     }
 
+    /// Reads one aligned word; words beyond the document space are empty.
+    #[inline]
+    pub fn tinyset(&self, bucket: u32) -> TinySet {
+        self.data
+            .get(bucket as usize * 8..bucket as usize * 8 + 8)
+            .map_or(TinySet::EMPTY, |bytes| {
+                TinySet::deserialize(bytes.try_into().unwrap())
+            })
+    }
+
     /// Number of elements in the bitset.
     #[inline]
     pub fn len(&self) -> usize {
@@ -456,6 +483,18 @@ mod tests {
     use rand::{Rng, SeedableRng};
 
     use super::{BitSet, ReadOnlyBitSet, TinySet};
+
+    #[test]
+    fn union_words_preserves_cardinality_and_padding() {
+        let mut bits = super::BitSet::with_max_value(70);
+        bits.insert(1);
+        bits.union_tinysets(0, &[super::TinySet::full(); 3]);
+        assert_eq!(bits.len(), 70);
+        assert_eq!(bits.tinyset(1).len(), 6);
+        bits.union_tinysets(0, &[super::TinySet::full(); 3]);
+        bits.union_tinysets(99, &[super::TinySet::full()]);
+        assert_eq!(bits.len(), 70);
+    }
 
     #[test]
     fn test_read_serialized_bitset_full_multi() {

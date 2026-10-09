@@ -27,6 +27,7 @@ pub(crate) const POSITIONS: &str = "positions";
 pub(crate) const FAST_FIELDS: &str = "fast_fields";
 pub(crate) const FIELDNORMS: &str = "fieldnorms";
 pub(crate) const POSTING_NORMS: &str = "pnorm";
+pub(crate) const POSTING_BITMAPS: &str = "bmap";
 pub(crate) const STORE: &str = "store";
 pub(crate) const DELETES: &str = "deletes";
 
@@ -133,6 +134,7 @@ impl SegmentSpaceUsage {
             FastFields => FAST_FIELDS,
             FieldNorms => FIELDNORMS,
             PostingNorms => POSTING_NORMS,
+            PostingBitmaps => POSTING_BITMAPS,
             Terms => TERMDICT,
             Store | TempStore => STORE,
             Delete => DELETES,

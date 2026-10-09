@@ -280,7 +280,7 @@ const EMPTY_BLOCK: [TinySet; BLOCK_NUM_TINYBITSETS] = [TinySet::EMPTY; BLOCK_NUM
 
 /// ANDs `other` into `mask` in-place. Returns `true` if the result is all zeros.
 #[inline]
-fn and_blocks_and_return_is_empty(
+pub(crate) fn and_blocks_and_return_is_empty(
     mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
     update: &[TinySet; BLOCK_NUM_TINYBITSETS],
 ) -> bool {

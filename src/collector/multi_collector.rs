@@ -34,6 +34,10 @@ impl<TCollector: Collector> Collector for CollectorWrapper<TCollector> {
         self.0.requires_scoring()
     }
 
+    fn supports_bitmap_collection(&self) -> bool {
+        self.0.supports_bitmap_collection()
+    }
+
     fn merge_fruits(
         &self,
         children: Vec<<Self::Child as SegmentCollector>::Fruit>,
@@ -67,6 +71,14 @@ impl SegmentCollector for Box<dyn BoxableSegmentCollector> {
         self.as_mut().collect_block(docs);
     }
 
+    fn supports_bitmap_collection(&self) -> bool {
+        self.as_ref().supports_bitmap_collection()
+    }
+
+    fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
+        self.as_mut().collect_bitmap(base, mask);
+    }
+
     fn harvest(self) -> Box<dyn Fruit> {
         BoxableSegmentCollector::harvest_from_box(self)
     }
@@ -79,6 +91,14 @@ pub trait BoxableSegmentCollector {
             self.collect(doc, 0.0);
         }
     }
+    fn supports_bitmap_collection(&self) -> bool {
+        false
+    }
+
+    fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
+        crate::DocSetBatch::Bitmap(base, mask).for_each_doc_block(|docs| self.collect_block(docs));
+    }
+
     fn harvest_from_box(self: Box<Self>) -> Box<dyn Fruit>;
 }
 
@@ -94,6 +114,14 @@ impl<TSegmentCollector: SegmentCollector> BoxableSegmentCollector
     #[inline]
     fn collect_block(&mut self, docs: &[DocId]) {
         self.0.collect_block(docs);
+    }
+
+    fn supports_bitmap_collection(&self) -> bool {
+        self.0.supports_bitmap_collection()
+    }
+
+    fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
+        self.0.collect_bitmap(base, mask);
     }
 
     fn harvest_from_box(self: Box<Self>) -> Box<dyn Fruit> {
@@ -226,6 +254,12 @@ impl Collector for MultiCollector<'_> {
             .any(Collector::requires_scoring)
     }
 
+    fn supports_bitmap_collection(&self) -> bool {
+        self.collector_wrappers
+            .iter()
+            .all(|collector| collector.supports_bitmap_collection())
+    }
+
     fn merge_fruits(&self, segments_multifruits: Vec<MultiFruit>) -> crate::Result<MultiFruit> {
         let mut segment_fruits_list: Vec<Vec<Box<dyn Fruit>>> = (0..self.collector_wrappers.len())
             .map(|_| Vec::with_capacity(segments_multifruits.len()))
@@ -265,6 +299,18 @@ impl SegmentCollector for MultiCollectorChild {
     fn collect_block(&mut self, docs: &[DocId]) {
         for child in &mut self.children {
             child.collect_block(docs);
+        }
+    }
+
+    fn supports_bitmap_collection(&self) -> bool {
+        self.children
+            .iter()
+            .all(|child| child.supports_bitmap_collection())
+    }
+
+    fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
+        for child in &mut self.children {
+            child.collect_bitmap(base, mask);
         }
     }
 

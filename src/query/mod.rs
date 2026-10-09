@@ -1,5 +1,7 @@
 mod all_query;
 mod automaton_weight;
+mod bitmap_combination;
+mod bitmap_docset;
 mod bitset;
 mod bm25;
 mod boolean_query;
@@ -36,6 +38,7 @@ pub use query_grammar::Occur;
 
 pub use self::all_query::{AllQuery, AllScorer, AllWeight};
 pub use self::automaton_weight::AutomatonWeight;
+pub use self::bitmap_docset::BitmapDocSet;
 pub use self::bitset::BitSetDocSet;
 pub use self::bm25::{Bm25StatisticsProvider, Bm25Weight};
 pub use self::boolean_query::{
@@ -70,8 +73,8 @@ pub use self::term_set_query::*;
 pub use self::union::{BufferedUnionScorer, SimpleUnion};
 #[cfg(test)]
 pub use self::vec_docset::VecDocSet;
-pub(crate) use self::weight::for_each_docset_buffered;
 pub use self::weight::Weight;
+pub(crate) use self::weight::{for_each_docset_batch, for_each_docset_buffered};
 
 #[cfg(test)]
 mod tests {

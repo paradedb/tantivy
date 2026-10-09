@@ -72,6 +72,19 @@ impl AliveBitSet {
         self.bitset.iter()
     }
 
+    /// Removes deleted documents from a membership window without enumerating its set bits.
+    pub fn intersect_bitmap(&self, base: DocId, mask: &mut crate::DocIdBitmap) {
+        let shift = base % 64;
+        for (i, word) in mask.iter_mut().enumerate() {
+            let bucket = base / 64 + i as u32;
+            let mut alive = self.bitset.tinyset(bucket).into_u64() >> shift;
+            if shift != 0 {
+                alive |= self.bitset.tinyset(bucket + 1).into_u64() << (64 - shift);
+            }
+            *word = word.intersect(common::TinySet::deserialize(alive.to_le_bytes()));
+        }
+    }
+
     /// Get underlying bitset.
     #[inline]
     pub fn bitset(&self) -> &ReadOnlyBitSet {

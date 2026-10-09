@@ -371,6 +371,11 @@ impl IndexBuilder {
                 }
             }
             self.index_settings.validate_vector_quantization(schema)?;
+            if !(1..=100).contains(&self.index_settings.bitmap_postings.min_density_percent) {
+                return Err(crate::TantivyError::InvalidArgument(
+                    "bitmap posting density must be between 1 and 100 percent".into(),
+                ));
+            }
             if self.index_settings.manual_doc_id_mapping
                 && self.index_settings.sort_by_field.is_some()
             {
