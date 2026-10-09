@@ -211,11 +211,12 @@ impl IvfLevelClusterer for SuperKMeansLevelClusterer {
             data_already_rotated: true,
             ..Default::default()
         };
+        let iters = self.iters_per_split.max(1);
         let cfg = HierarchicalSuperKMeansConfig {
             base,
             max_leaf_size,
-            iters_per_split: self.iters_per_split.max(1),
-            ..Default::default()
+            iters_meso: iters,
+            iters_fine: iters,
         };
         let mut kmeans = HierarchicalSuperKMeans::with_config(dim, cfg);
         let centroids = kmeans.train(data, n);
