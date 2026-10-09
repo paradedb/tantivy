@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
-use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN};
+use crate::docset::{DocSet, SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
 use crate::index::SegmentReader;
 use crate::postings::{FreqReadingOption, SegmentPostings};
 use crate::query::bitmap_combination::{BitmapCombination, BitmapOperation};
+use crate::query::bitmap_docset::BitmapDocSet;
 use crate::query::boolean_query::{
     BlockWandIntersectionScorer, BlockWandSingleScorer, BlockWandUnionScorer,
 };
@@ -15,11 +16,77 @@ use crate::query::scorer::BasicPruningScorer;
 use crate::query::term_query::TermScorer;
 use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
 use crate::query::{
-    intersect_scorers as intersect_scored_scorers, AllScorer, BufferedUnionScorer,
+    intersect_scorers as intersect_scored_scorers, AllScorer, BufferedUnionScorer, ConstScorer,
     DisjunctionPruning, EmptyScorer, Exclude, Explanation, Occur, RequiredOptionalScorer, Scorer,
     Weight,
 };
 use crate::{DocId, Score, TERMINATED};
+
+fn sparse_count_union(scorers: Vec<Box<dyn Scorer>>, num_docs: u32) -> Box<dyn Scorer> {
+    match scorers.len() {
+        0 => Box::new(EmptyScorer),
+        1 => scorers.into_iter().next().unwrap(),
+        _ => Box::new(BufferedUnionScorer::build(
+            scorers,
+            DoNothingCombiner::default,
+            num_docs,
+        )),
+    }
+}
+
+fn count_sparse_candidates(
+    mut anchor: Box<dyn Scorer>,
+    mut count: u32,
+    mut additions: Box<dyn Scorer>,
+    mut exclusions: Box<dyn Scorer>,
+) -> u32 {
+    loop {
+        let doc = additions.doc().min(exclusions.doc());
+        if doc == TERMINATED {
+            return count;
+        }
+        let in_anchor = matches!(anchor.seek_danger(doc), SeekDangerResult::Found);
+        if exclusions.doc() == doc {
+            count -= u32::from(in_anchor);
+            exclusions.advance();
+        } else {
+            count += u32::from(!in_anchor);
+        }
+        if additions.doc() == doc {
+            additions.advance();
+        }
+    }
+}
+
+fn try_count_sparse_union(
+    included: &mut Vec<Box<dyn Scorer>>,
+    excluded: &mut Vec<Box<dyn Scorer>>,
+    num_docs: u32,
+) -> Option<u32> {
+    let (anchor_idx, count) = included
+        .iter()
+        .enumerate()
+        .filter(|(_, scorer)| scorer.is::<ConstScorer<BitmapDocSet>>() || scorer.is::<AllScorer>())
+        // These concrete scorers report the exact, unfiltered document frequency.
+        .map(|(i, scorer)| (i, scorer.size_hint()))
+        .max_by_key(|&(_, count)| count)?;
+    let candidate_cost = included
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != anchor_idx)
+        .map(|(_, scorer)| scorer.cost())
+        .chain(excluded.iter().map(|scorer| scorer.cost()))
+        .fold(0u64, u64::saturating_add);
+    if candidate_cost.saturating_mul(512) > u64::from(num_docs) {
+        return None;
+    }
+    let anchor = included.swap_remove(anchor_idx);
+    let additions = sparse_count_union(std::mem::take(included), num_docs);
+    let exclusions = sparse_count_union(std::mem::take(excluded), num_docs);
+    Some(count_sparse_candidates(
+        anchor, count, additions, exclusions,
+    ))
+}
 
 fn intersect_scorers(
     scorers: Vec<Box<dyn Scorer>>,
@@ -367,8 +434,20 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         boost: Score,
         score_combiner_fn: impl Fn() -> TComplexScoreCombiner,
     ) -> crate::Result<SpecializedScorer> {
+        self.complex_scorer_from_scorers(
+            reader,
+            score_combiner_fn,
+            self.per_occur_scorers(reader, boost)?,
+        )
+    }
+
+    fn complex_scorer_from_scorers<TComplexScoreCombiner: ScoreCombiner>(
+        &self,
+        reader: &SegmentReader,
+        score_combiner_fn: impl Fn() -> TComplexScoreCombiner,
+        mut per_occur_scorers: HashMap<Occur, Vec<Box<dyn Scorer>>>,
+    ) -> crate::Result<SpecializedScorer> {
         let num_docs = reader.num_docs();
-        let mut per_occur_scorers = self.per_occur_scorers(reader, boost)?;
 
         // Indicate how should clauses are combined with must clauses.
         let mut must_scorers: Vec<Box<dyn Scorer>> =
@@ -671,6 +750,61 @@ fn remove_and_count_all_and_empty_scorers(
 }
 
 impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombiner> {
+    fn count(&self, reader: &SegmentReader) -> crate::Result<u32> {
+        if let [(occur, weight)] = self.weights.as_slice() {
+            return if *occur == Occur::MustNot {
+                Ok(0)
+            } else {
+                weight.count(reader)
+            };
+        }
+        let must_count = self
+            .weights
+            .iter()
+            .filter(|(occur, _)| *occur == Occur::Must)
+            .count();
+        let count_union = must_count == 0 && self.minimum_number_should_match <= 1;
+        let count_required = must_count == 1 && self.minimum_number_should_match == 0;
+        if !self.scoring_enabled
+            && self.bitmap_enabled
+            && reader.bitmap_postings_enabled
+            && reader.alive_bitset().is_none()
+            && (count_union || count_required)
+            && !self.weights.is_empty()
+        {
+            let mut scorers = self.per_occur_scorers(reader, 1.0)?;
+            let included_occur = if count_union {
+                Occur::Should
+            } else {
+                Occur::Must
+            };
+            let mut included = scorers.remove(&included_occur).unwrap_or_default();
+            let mut excluded = scorers.remove(&Occur::MustNot).unwrap_or_default();
+            if let Some(count) =
+                try_count_sparse_union(&mut included, &mut excluded, reader.max_doc())
+            {
+                return Ok(count);
+            }
+            scorers.insert(included_occur, included);
+            scorers.insert(Occur::MustNot, excluded);
+            let scorer =
+                self.complex_scorer_from_scorers(reader, DoNothingCombiner::default, scorers)?;
+            return Ok(into_box_scorer(
+                scorer,
+                DoNothingCombiner::default,
+                reader.num_docs(),
+                self.bitmap_enabled && reader.bitmap_postings_enabled,
+            )
+            .count_including_deleted());
+        }
+        let mut scorer = self.scorer(reader, 1.0)?;
+        Ok(if let Some(alive) = reader.alive_bitset() {
+            scorer.count(alive)
+        } else {
+            scorer.count_including_deleted()
+        })
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let num_docs = reader.num_docs();
         if self.weights.is_empty() {
@@ -1244,6 +1378,104 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn sparse_union_count_only_reads_candidate_pages() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        use common::{HasLen, OwnedBytes};
+
+        use super::{try_count_sparse_union, ConstScorer};
+        use crate::directory::{FileHandle, FileSlice};
+        use crate::postings::SegmentPostings;
+        use crate::query::bitmap_docset::BitmapDocSet;
+        use crate::query::Scorer;
+        use crate::TERMINATED;
+
+        #[derive(Debug)]
+        struct TrackedBitmap {
+            data: Vec<u8>,
+            bytes_read: Arc<AtomicUsize>,
+        }
+        impl HasLen for TrackedBitmap {
+            fn len(&self) -> usize {
+                self.data.len()
+            }
+        }
+        impl FileHandle for TrackedBitmap {
+            fn read_bytes(&self, range: std::ops::Range<usize>) -> std::io::Result<OwnedBytes> {
+                self.bytes_read.fetch_add(range.len(), Ordering::Relaxed);
+                Ok(OwnedBytes::new(self.data[range].to_vec()))
+            }
+        }
+
+        let max_doc = 262_147u32;
+        for rare_count in [1, 3, 15, 63] {
+            let dense: Vec<_> = (0..max_doc).filter(|doc| doc % 5 != 0).collect();
+            let mut data = vec![0u8; (max_doc as usize).div_ceil(64) * 8];
+            for &doc in &dense {
+                data[doc as usize / 8] |= 1 << (doc % 8);
+            }
+            let bytes_read = Arc::new(AtomicUsize::new(0));
+            let bitmap = BitmapDocSet::open(
+                FileSlice::new(Arc::new(TrackedBitmap {
+                    data,
+                    bytes_read: bytes_read.clone(),
+                })),
+                0,
+                max_doc,
+                dense.len() as u32,
+                || panic!("sparse counting must not open the dense postings"),
+            )
+            .unwrap();
+            let mut included: Vec<Box<dyn Scorer>> = vec![Box::new(ConstScorer::new(bitmap, 1.0))];
+            let mut expected: std::collections::BTreeSet<_> = dense.into_iter().collect();
+            for i in 0..rare_count {
+                let docs = [0, i + 1, 1023, 1024];
+                expected.extend(docs);
+                included.push(Box::new(ConstScorer::new(
+                    SegmentPostings::create_from_docs(&docs),
+                    1.0,
+                )));
+            }
+            let mut excluded: Vec<Box<dyn Scorer>> = Vec::new();
+            for docs in [&[0, 1, 63, 1023][..], &[0, 2, 64, 1024][..]] {
+                for doc in docs {
+                    expected.remove(doc);
+                }
+                excluded.push(Box::new(ConstScorer::new(
+                    SegmentPostings::create_from_docs(docs),
+                    1.0,
+                )));
+            }
+            assert_eq!(
+                try_count_sparse_union(&mut included, &mut excluded, max_doc),
+                Some(expected.len() as u32)
+            );
+            assert_eq!(bytes_read.load(Ordering::Relaxed), 8192);
+        }
+
+        let mut included: Vec<Box<dyn Scorer>> =
+            vec![Box::new(crate::query::AllScorer::new(max_doc))];
+        included.push(Box::new(ConstScorer::new(
+            SegmentPostings::create_from_docs(&(0..1000).collect::<Vec<_>>()),
+            1.0,
+        )));
+        let initial: Vec<_> = included.iter().map(|scorer| scorer.doc()).collect();
+        assert_eq!(
+            try_count_sparse_union(&mut included, &mut Vec::new(), max_doc),
+            None
+        );
+        assert_eq!(
+            included
+                .iter()
+                .map(|scorer| scorer.doc())
+                .collect::<Vec<_>>(),
+            initial
+        );
+        assert_ne!(included[0].doc(), TERMINATED);
     }
 
     #[test]

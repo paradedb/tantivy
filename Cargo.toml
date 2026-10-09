@@ -225,6 +225,10 @@ name = "failpoints"
 path = "tests/failpoints/mod.rs"
 required-features = ["failpoints"]
 
+[[example]]
+name = "sparse_disjunction_count"
+required-features = ["mmap"]
+
 [[bench]]
 name = "analyzer"
 harness = false
