@@ -1148,6 +1148,93 @@ mod tests {
     use crate::Bm25Params;
 
     #[test]
+    fn bitmap_combinations_respect_query_setting() -> crate::Result<()> {
+        use crate::query::bitmap_combination::BitmapCombination;
+        use crate::query::{BooleanQuery, EnableScoring, Occur, Query, TermQuery, TermSetQuery};
+        use crate::schema::{IndexRecordOption, Schema, TEXT};
+        use crate::{Index, Term, TERMINATED};
+
+        for stored_bitmaps in [false, true] {
+            let mut schema = Schema::builder();
+            let text = schema.add_text_field(
+                "text",
+                TEXT.set_indexing_options(
+                    TEXT.get_indexing_options()
+                        .unwrap()
+                        .clone()
+                        .set_bitmap_postings(stored_bitmaps),
+                ),
+            );
+            let mut index = Index::create_in_ram(schema.build());
+            let mut writer = index.writer_for_tests()?;
+            for doc in 0..1024 {
+                let mut terms = Vec::new();
+                for (term, divisor) in [("alpha", 2), ("beta", 3), ("gamma", 5)] {
+                    if doc % divisor == 0 {
+                        terms.push(term);
+                    }
+                }
+                writer.add_document(doc!(text => terms.join(" ")))?;
+            }
+            writer.commit()?;
+
+            for enabled in [false, true] {
+                index.settings_mut().bitmap_postings.use_for_queries = enabled;
+                let searcher = index.reader()?.searcher();
+                let reader = searcher.segment_reader(0);
+                for occur in [Occur::Should, Occur::Must, Occur::MustNot] {
+                    let set = TermSetQuery::new([
+                        Term::from_field_text(text, "alpha"),
+                        Term::from_field_text(text, "gamma"),
+                    ]);
+                    let query = BooleanQuery::new(vec![
+                        (
+                            if occur == Occur::Should {
+                                occur
+                            } else {
+                                Occur::Must
+                            },
+                            Box::new(set),
+                        ),
+                        (
+                            occur,
+                            Box::new(TermQuery::new(
+                                Term::from_field_text(text, "beta"),
+                                IndexRecordOption::Basic,
+                            )),
+                        ),
+                    ]);
+                    let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+                    let mut scorer = weight.scorer(reader, 1.0)?;
+                    assert_eq!(
+                        scorer.is::<BitmapCombination>(),
+                        enabled,
+                        "stored_bitmaps={stored_bitmaps}, enabled={enabled}, occur={occur:?}"
+                    );
+                    let mut actual = Vec::new();
+                    crate::query::for_each_docset_batch(scorer.as_mut(), &mut |batch| {
+                        batch.for_each_doc_block(|docs| actual.extend_from_slice(docs));
+                    });
+                    let expected: Vec<_> = (0..1024)
+                        .filter(|doc| {
+                            let set = doc % 2 == 0 || doc % 5 == 0;
+                            let term = doc % 3 == 0;
+                            match occur {
+                                Occur::Should => set || term,
+                                Occur::Must => set && term,
+                                Occur::MustNot => set && !term,
+                            }
+                        })
+                        .collect();
+                    assert_eq!(actual, expected);
+                    assert_eq!(scorer.doc(), TERMINATED);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn bitmap_phrase_intersections_use_selective_candidates() -> crate::Result<()> {
         use crate::query::bitmap_combination::BitmapCombination;
         use crate::query::{EnableScoring, QueryParser};

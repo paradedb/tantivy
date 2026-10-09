@@ -234,7 +234,7 @@ impl SegmentReader {
         custom_bitset: Option<AliveBitSet>,
     ) -> crate::Result<SegmentReader> {
         Ok(SegmentReader {
-            bitmap_postings_enabled: true,
+            bitmap_postings_enabled: segment.index().settings().bitmap_postings.use_for_queries,
             index: segment.index().clone(),
             segment_id: segment.id(),
             custom_alive_bitset: custom_bitset,
