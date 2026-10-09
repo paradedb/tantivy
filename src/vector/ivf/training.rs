@@ -10,7 +10,7 @@ pub trait IvfClusterer: Send + Sync + 'static {
     fn train(
         &self,
         options: &VectorOptions,
-        vectors: IvfTrainingVectors,
+        source: &mut dyn TrainingSource,
     ) -> crate::Result<IvfCentroids>;
 
     /// Assigns vectors to centroids.
@@ -44,6 +44,29 @@ pub trait IvfClusterer: Send + Sync + 'static {
             assign_batch_size,
         })
     }
+}
+
+/// Replayable, read-only view of the rows a clusterer trains on.
+///
+/// Rows are identified by their 0-based position in scan order. Every call to
+/// [`TrainingSource::for_each_batch`] yields the same rows in the same
+/// order, and [`TrainingSource::read_rows`] positions refer to that order.
+pub trait TrainingSource {
+    /// Number of rows each scan yields.
+    fn num_rows(&self) -> usize;
+
+    /// Scans every row in order, in batches of at most `batch_size` rows.
+    ///
+    /// Fails with [`TantivyError::Cancelled`] if the merge is cancelled
+    /// mid-scan.
+    fn for_each_batch(
+        &mut self,
+        batch_size: usize,
+        f: &mut dyn FnMut(IvfVectors<'_>),
+    ) -> crate::Result<()>;
+
+    /// Loads the rows at the given scan positions, in the given order.
+    fn read_rows(&mut self, rows: &[u32]) -> crate::Result<IvfTrainingVectors>;
 }
 
 #[derive(Clone, Copy, Debug)]

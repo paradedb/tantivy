@@ -77,7 +77,7 @@ pub use ivf::{
     IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, LazyStackedIvf, LazyStore,
     MultiLevelIvf, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
-    StackedSearchStats, SuperKMeansLevelClusterer, Workspace, APS_MAX_DIM,
+    StackedSearchStats, SuperKMeansLevelClusterer, TrainingSource, Workspace, APS_MAX_DIM,
 };
 pub use metadata::{
     F64Bits, Grid, Partition, QuantizationSchedule, Quantizer, QuantizerKind, Rotation,

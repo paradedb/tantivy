@@ -9,8 +9,8 @@ use crate::query::{AllQuery, TermQuery};
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, STRING};
 use crate::vector::ivf::AdaptiveProbeParams;
 use crate::vector::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
-    Metric, RouterKind, VectorDType, VectorOptions,
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, Metric, RouterKind,
+    TrainingSource, VectorDType, VectorOptions,
 };
 use crate::{DocAddress, Index, Score, TantivyDocument};
 
@@ -198,7 +198,7 @@ impl IvfClusterer for Grid2DClusterer {
     fn train(
         &self,
         options: &VectorOptions,
-        _vectors: IvfTrainingVectors,
+        _source: &mut dyn TrainingSource,
     ) -> crate::Result<IvfCentroids> {
         assert_eq!(options.dim(), grid2d::DIM);
         let num_centroids = self.centroids.len();
@@ -860,7 +860,7 @@ mod bounds_storage_tests {
     use crate::vector::{
         residual_norm, BoundKind, InMemoryStackedIvf, IvfCentroids, IvfClusterer, IvfConfig,
         IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors, Metric, RouterKind,
-        RoutingParams, VectorDType, VectorOptions, VectorStorageFormat,
+        RoutingParams, TrainingSource, VectorDType, VectorOptions, VectorStorageFormat,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -963,7 +963,7 @@ mod bounds_storage_tests {
         fn train(
             &self,
             options: &VectorOptions,
-            vectors: IvfTrainingVectors,
+            source: &mut dyn TrainingSource,
         ) -> crate::Result<IvfCentroids> {
             assert_eq!(options.dim(), 2);
             let num_centroids = self.num_centroids;
@@ -974,8 +974,9 @@ mod bounds_storage_tests {
                     .flat_map(|centroid| centroid.iter().copied())
                     .collect(),
                 None => {
-                    let IvfTrainingVectors::F32(batch) = vectors;
-                    batch.matrix.values[..num_centroids * 2].to_vec()
+                    let rows: Vec<u32> = (0..num_centroids as u32).collect();
+                    let IvfTrainingVectors::F32(batch) = source.read_rows(&rows)?;
+                    batch.matrix.values
                 }
             };
             Ok(IvfCentroids::F32(IvfMatrix {

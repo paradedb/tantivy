@@ -3213,9 +3213,9 @@ mod tests {
     use crate::vector::prepared::QuantizedIndexCtx;
     use crate::vector::tests::{exhaustive_params, TestVectorIndex};
     use crate::vector::{
-        IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors,
-        NeighborhoodGraphSearchMetrics, RouterKind, SearchTerminationReason, VectorClusterStats,
-        VectorDType, VectorInfo, VectorOptions, VectorQuantizationConfig, VectorQuantizationLayer,
+        IvfCentroids, IvfClusterer, IvfMatrix, IvfVectors, NeighborhoodGraphSearchMetrics,
+        RouterKind, SearchTerminationReason, TrainingSource, VectorClusterStats, VectorDType,
+        VectorInfo, VectorOptions, VectorQuantizationConfig, VectorQuantizationLayer,
         VectorStorageFormat,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
@@ -3574,7 +3574,7 @@ mod tests {
         fn train(
             &self,
             options: &VectorOptions,
-            _vectors: IvfTrainingVectors,
+            _source: &mut dyn TrainingSource,
         ) -> crate::Result<IvfCentroids> {
             assert_eq!(options.dim(), 2);
             let num_centroids = self.centroids.len();
