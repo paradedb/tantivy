@@ -15,11 +15,36 @@ use crate::query::scorer::BasicPruningScorer;
 use crate::query::term_query::TermScorer;
 use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
 use crate::query::{
-    intersect_scorers as intersect_scored_scorers, AllScorer, BufferedUnionScorer,
-    DisjunctionPruning, EmptyScorer, Exclude, Explanation, Occur, RequiredOptionalScorer, Scorer,
-    Weight,
+    intersect_scorers as intersect_scored_scorers, AllScorer, BitmapDocSet, BufferedUnionScorer,
+    ConstScorer, DisjunctionPruning, EmptyScorer, Exclude, Explanation, Occur,
+    RequiredOptionalScorer, Scorer, Weight,
 };
 use crate::{DocId, Score, TERMINATED};
+
+fn try_count_two_term_union(scorers: &mut Vec<Box<dyn Scorer>>, num_docs: u32) -> Option<u32> {
+    if scorers.len() != 2
+        || !scorers.iter().all(|scorer| {
+            scorer.is::<TermScorer>()
+                || scorer.is::<ConstScorer<BitmapDocSet>>()
+                || scorer.is::<AllScorer>()
+                || scorer.is::<EmptyScorer>()
+        })
+    {
+        return None;
+    }
+    // These concrete scorers report exact document frequencies, including deleted documents.
+    let left = scorers[0].size_hint();
+    let right = scorers[1].size_hint();
+    if left == num_docs || right == num_docs {
+        return Some(num_docs);
+    }
+    if left == 0 || right == 0 {
+        return Some(left.max(right));
+    }
+    let intersection =
+        intersect_scorers(std::mem::take(scorers), num_docs, false, true).count_including_deleted();
+    Some((u64::from(left) + u64::from(right) - u64::from(intersection)) as u32)
+}
 
 fn intersect_scorers(
     scorers: Vec<Box<dyn Scorer>>,
@@ -671,6 +696,43 @@ fn remove_and_count_all_and_empty_scorers(
 }
 
 impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombiner> {
+    fn count(&self, reader: &SegmentReader) -> crate::Result<u32> {
+        if !self.scoring_enabled
+            && self.bitmap_enabled
+            && reader.bitmap_postings_enabled
+            && reader.alive_bitset().is_none()
+            && self.minimum_number_should_match <= 1
+            && self.weights.len() == 2
+            && self
+                .weights
+                .iter()
+                .all(|(occur, _)| *occur == Occur::Should)
+        {
+            let mut scorers = self
+                .weights
+                .iter()
+                .map(|(_, weight)| weight.scorer(reader, 1.0))
+                .collect::<crate::Result<Vec<_>>>()?;
+            if let Some(count) = try_count_two_term_union(&mut scorers, reader.max_doc()) {
+                return Ok(count);
+            }
+            let scorer = scorer_union(scorers, DoNothingCombiner::default, reader.num_docs(), true);
+            return Ok(into_box_scorer(
+                scorer,
+                DoNothingCombiner::default,
+                reader.num_docs(),
+                true,
+            )
+            .count_including_deleted());
+        }
+        let mut scorer = self.scorer(reader, 1.0)?;
+        Ok(if let Some(alive) = reader.alive_bitset() {
+            scorer.count(alive)
+        } else {
+            scorer.count_including_deleted()
+        })
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let num_docs = reader.num_docs();
         if self.weights.is_empty() {
@@ -1154,6 +1216,95 @@ mod tests {
     use super::BooleanWeight;
     use crate::query::{Bm25Weight, DisjunctionPruning, SumCombiner, TermScorer};
     use crate::Bm25Params;
+
+    #[test]
+    fn two_term_union_counts_only_the_intersection() -> crate::Result<()> {
+        use super::try_count_two_term_union;
+        use crate::query::{EnableScoring, Query, QueryParser};
+        use crate::schema::{Schema, TEXT};
+        use crate::Index;
+
+        for stored_bitmaps in [false, true] {
+            let mut schema = Schema::builder();
+            let text = schema.add_text_field(
+                "text",
+                TEXT.set_indexing_options(
+                    TEXT.get_indexing_options()
+                        .unwrap()
+                        .clone()
+                        .set_bitmap_postings(stored_bitmaps),
+                ),
+            );
+            let index = Index::create_in_ram(schema.build());
+            let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+            for doc in 0..4097 {
+                let mut terms = vec!["all"];
+                if doc % 2 == 0 {
+                    terms.push("dense");
+                }
+                if doc % 3 == 0 {
+                    terms.push("second");
+                }
+                if doc % 101 == 0 {
+                    terms.push("sparse");
+                }
+                if doc % 101 == 1 {
+                    terms.push("disjoint");
+                }
+                writer.add_document(crate::doc!(text => terms.join(" ")))?;
+            }
+            writer.commit()?;
+            let searcher = index.reader()?.searcher();
+            let reader = &searcher.segment_readers()[0];
+            let parser = QueryParser::for_index(&index, vec![text]);
+            let scoring =
+                EnableScoring::disabled_from_searcher(&searcher).with_bitmap_postings(true);
+            for (left, right) in [
+                ("dense", "sparse"),
+                ("dense", "second"),
+                ("sparse", "disjoint"),
+                ("sparse", "sparse"),
+                ("all", "sparse"),
+                ("missing", "sparse"),
+                ("missing", "absent"),
+            ] {
+                let mut scorers = [left, right]
+                    .into_iter()
+                    .map(|term| {
+                        parser
+                            .parse_query(term)?
+                            .weight(scoring)?
+                            .scorer(reader, 1.0)
+                    })
+                    .collect::<crate::Result<Vec<_>>>()?;
+                let expected = parser
+                    .parse_query(&format!("{left} OR {right}"))?
+                    .weight(scoring)?
+                    .scorer(reader, 1.0)?
+                    .count_including_deleted();
+                assert_eq!(
+                    try_count_two_term_union(&mut scorers, reader.max_doc()),
+                    Some(expected),
+                    "{left} OR {right}, stored_bitmaps={stored_bitmaps}"
+                );
+            }
+            let mut scorers = ["dense", "\"all sparse\""]
+                .into_iter()
+                .map(|query| {
+                    parser
+                        .parse_query(query)?
+                        .weight(scoring)?
+                        .scorer(reader, 1.0)
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            assert_eq!(
+                try_count_two_term_union(&mut scorers, reader.max_doc()),
+                None
+            );
+            assert_eq!(scorers.len(), 2);
+        }
+        Ok(())
+    }
 
     #[test]
     fn bitmap_combinations_respect_query_setting() -> crate::Result<()> {
