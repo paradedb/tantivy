@@ -10,13 +10,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
-#[cfg(test)]
-use common::HasLen;
-use common::OwnedBytes;
+use common::{HasLen, OwnedBytes};
 use quant_model::f16::f16_to_f32;
 
 use super::backend::{Estimate, Threshold};
 use super::blocks::{BlockMetadata, Blocks};
+use super::cluster_plan::{LayerCosts, ReadCost};
 use super::flat::IdMap;
 use super::header::{read_centroid_header, read_vector_header, CentroidSlot, VectorEntry};
 use super::ivf::{decode_row, IvfIndex, CENTROIDS_EXT};
@@ -1251,6 +1250,48 @@ impl QuantizedLayerReader {
             codes: self.blocks.column(block, self.codes)?,
         })
     }
+    /// The two ways to read block `b` at this layer for cluster-local `offsets` (`None` selects
+    /// every row), from slice geometry alone: the whole band, or the selected rows' planned code
+    /// runs plus the sidecar span and, at layer 0, the residual norms. Each request costs the
+    /// blocks it spans, or its bytes without block geometry. `rows` and `ranges` are scratch.
+    pub(crate) fn read_costs(
+        &self,
+        b: usize,
+        offsets: Option<&[usize]>,
+        rows: &mut Vec<usize>,
+        ranges: &mut Vec<Range<usize>>,
+    ) -> crate::Result<LayerCosts> {
+        let band = self.blocks.band_slice(b, self.layer)?;
+        let in_blocks = band.storage_block_len().is_some();
+        let full = range_cost(&band, 0..band.len(), in_blocks);
+        let Some(offsets) = offsets else {
+            return Ok(LayerCosts { sparse: None, full });
+        };
+        let cluster = self.cluster_in_block(b)?;
+        rows.clear();
+        rows.extend(offsets.iter().map(|&offset| cluster.rows.start + offset));
+        cluster.plan_codes(rows, ranges);
+        let stride = self.code_stride;
+        let origin = cluster.rows.start;
+        let mut sparse = ReadCost(0);
+        for range in ranges.iter() {
+            sparse += range_cost(
+                &cluster.codes,
+                (range.start - origin) * stride..(range.end - origin) * stride,
+                in_blocks,
+            );
+        }
+        let sidecar = cluster.sidecar_slice()?;
+        sparse += range_cost(&sidecar, 0..sidecar.len(), in_blocks);
+        if self.layer == 0 {
+            let norms = cluster.residual_norms_slice()?;
+            sparse += range_cost(&norms, 0..norms.len(), in_blocks);
+        }
+        Ok(LayerCosts {
+            sparse: Some(sparse),
+            full,
+        })
+    }
     #[cfg(test)]
     pub(crate) fn read_column(&self, idx: usize, rows: Range<usize>) -> crate::Result<OwnedBytes> {
         self.blocks.read_column(idx, rows)
@@ -1314,10 +1355,7 @@ impl QuantizedClusterReader<'_> {
         let blocks = &layer.blocks;
         let n = blocks.rows_in(self.block);
         let first = column_range(&blocks.slots, n, layer.scales).start;
-        let last = column_range(&blocks.slots, n, layer.constants.unwrap_or(layer.errors)).end;
-        let bytes = blocks
-            .block_slice(self.block, first..last)?
-            .read_vector_bytes()?;
+        let bytes = self.sidecar_slice()?.read_vector_bytes()?;
         let view = |idx| {
             let column = column_range(&blocks.slots, n, idx);
             bytes.slice(column.start - first..column.end - first)
@@ -1330,6 +1368,44 @@ impl QuantizedClusterReader<'_> {
             rows: self.rows.clone(),
         })
     }
+
+    /// The sidecar span: scales through error ratios, or through L2 constants.
+    fn sidecar_slice(&self) -> crate::Result<FileSlice> {
+        use super::blocks::column_range;
+        let layer = self.layer;
+        let blocks = &layer.blocks;
+        let n = blocks.rows_in(self.block);
+        let first = column_range(&blocks.slots, n, layer.scales).start;
+        let last = column_range(&blocks.slots, n, layer.constants.unwrap_or(layer.errors)).end;
+        blocks.block_slice(self.block, first..last)
+    }
+
+    /// The cluster's residual-norms column, stored in layer 0's band.
+    fn residual_norms_slice(&self) -> crate::Result<FileSlice> {
+        let blocks = &self.layer.blocks;
+        let idx = blocks
+            .slots
+            .iter()
+            .position(|slot| matches!(slot.slot_type, SlotType::ResidualNorms))
+            .ok_or_else(|| DataCorruption::comment_only("missing residual norms column"))?;
+        blocks.column(self.block, idx)
+    }
+
+    /// Reads the cluster's residual norms in one request.
+    pub(crate) fn read_residual_norms(&self) -> crate::Result<OwnedBytes> {
+        Ok(self.residual_norms_slice()?.read_vector_bytes()?)
+    }
+}
+
+/// Storage blocks a byte range of `slice` spans, or its bytes without block geometry.
+fn range_cost(slice: &FileSlice, range: Range<usize>, in_blocks: bool) -> ReadCost {
+    if range.is_empty() {
+        return ReadCost(0);
+    }
+    if !in_blocks {
+        return ReadCost(range.len());
+    }
+    ReadCost(storage_block_span(slice, range).map_or(0, |(first, last)| last - first + 1))
 }
 
 /// Splits increasing rows by block before consulting storage geometry.

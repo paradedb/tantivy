@@ -455,6 +455,12 @@ impl Blocks {
         let end = column_range(&self.slots, n, band.end - 1).end;
         self.block_start(b) + start..self.block_start(b) + end
     }
+    /// Resolves one scan band as a file slice preserving storage geometry.
+    pub(crate) fn band_slice(&self, b: usize, layer: usize) -> crate::Result<FileSlice> {
+        let range = self.layer_span(b, layer);
+        let start = self.block_start(b);
+        self.block_slice(b, range.start - start..range.end - start)
+    }
     /// Pins a band with exactly one read. Column views borrow this span without a heap list.
     pub(crate) fn read_band(
         &self,
@@ -462,10 +468,7 @@ impl Blocks {
         layer: usize,
     ) -> crate::Result<(Range<usize>, OwnedBytes)> {
         let range = self.layer_span(b, layer);
-        let start = self.block_start(b);
-        let bytes = self
-            .block_slice(b, range.start - start..range.end - start)?
-            .read_vector_bytes()?;
+        let bytes = self.band_slice(b, layer)?.read_vector_bytes()?;
         Ok((range, bytes))
     }
 }
