@@ -19,6 +19,7 @@ struct TermInfoBlockMeta {
     postings_offset_nbits: u8,
     positions_offset_nbits: u8,
     pnorms_offset_nbits: u8,
+    bitmap_offset_nbits: u8,
 }
 
 impl TermInfoBlockMeta {
@@ -26,7 +27,8 @@ impl TermInfoBlockMeta {
         u64::SIZE_IN_BYTES
             + version.serialized_size()
             + 3
-            + usize::from(version == TermInfoVersion::V2)
+            + usize::from(version != TermInfoVersion::V1)
+            + usize::from(version == TermInfoVersion::V3)
     }
 
     fn serialize<W: Write + ?Sized>(
@@ -41,8 +43,11 @@ impl TermInfoBlockMeta {
             self.postings_offset_nbits,
             self.positions_offset_nbits,
         ])?;
-        if version == TermInfoVersion::V2 {
+        if version != TermInfoVersion::V1 {
             self.pnorms_offset_nbits.serialize(write)?;
+        }
+        if version == TermInfoVersion::V3 {
+            self.bitmap_offset_nbits.serialize(write)?;
         }
         Ok(())
     }
@@ -60,7 +65,12 @@ impl TermInfoBlockMeta {
             positions_offset_nbits: buffer[2],
             pnorms_offset_nbits: match version {
                 TermInfoVersion::V1 => 0,
-                TermInfoVersion::V2 => u8::deserialize(reader)?,
+                TermInfoVersion::V2 | TermInfoVersion::V3 => u8::deserialize(reader)?,
+            },
+            bitmap_offset_nbits: if version == TermInfoVersion::V3 {
+                u8::deserialize(reader)?
+            } else {
+                0
             },
         })
     }
@@ -70,6 +80,7 @@ impl TermInfoBlockMeta {
             + usize::from(self.postings_offset_nbits)
             + usize::from(self.positions_offset_nbits)
             + usize::from(self.pnorms_offset_nbits)
+            + usize::from(self.bitmap_offset_nbits)
     }
 
     // Here inner_offset is the offset within the block, WITHOUT the first term_info.
@@ -112,6 +123,16 @@ impl TermInfoBlockMeta {
                         self.pnorms_offset_nbits,
                     )
             }),
+            bitmap_offset: {
+                let encoded = extract_bits(
+                    data,
+                    doc_freq_addr
+                        + usize::from(self.doc_freq_nbits)
+                        + usize::from(self.pnorms_offset_nbits),
+                    self.bitmap_offset_nbits,
+                );
+                encoded.checked_sub(1)
+            },
         }
     }
 }
@@ -188,11 +209,12 @@ impl TermInfoStore {
 }
 
 pub struct TermInfoStoreWriter {
-    buffer_block_metas: Vec<u8>,
+    buffer_block_metas: Vec<TermInfoBlockMeta>,
     buffer_term_infos: Vec<u8>,
     term_infos: Vec<TermInfo>,
     num_terms: u64,
     has_pnorms: bool,
+    has_bitmaps: bool,
 }
 
 fn bitpack_serialize<W: Write>(
@@ -219,6 +241,11 @@ fn bitpack_serialize<W: Write>(
     if let Some(offset) = term_info.pnorms_offset {
         bit_packer.write(offset, term_info_block_meta.pnorms_offset_nbits, write)?;
     }
+    bit_packer.write(
+        term_info.bitmap_offset.map_or(0, |offset| offset + 1),
+        term_info_block_meta.bitmap_offset_nbits,
+        write,
+    )?;
     Ok(())
 }
 
@@ -230,11 +257,22 @@ impl TermInfoStoreWriter {
             term_infos: Vec::with_capacity(BLOCK_LEN),
             num_terms: 0u64,
             has_pnorms: false,
+            has_bitmaps: false,
         }
     }
 
     pub fn has_pnorms(&self) -> bool {
         self.has_pnorms
+    }
+
+    pub(crate) fn version(&self) -> TermInfoVersion {
+        if self.has_bitmaps {
+            TermInfoVersion::V3
+        } else if self.has_pnorms {
+            TermInfoVersion::V2
+        } else {
+            TermInfoVersion::V1
+        }
     }
 
     fn flush_block(&mut self) -> io::Result<()> {
@@ -245,11 +283,19 @@ impl TermInfoStoreWriter {
             return Ok(());
         };
         let ref_term_info = self.term_infos[0].clone();
-        let version = if self.has_pnorms {
-            TermInfoVersion::V2
-        } else {
-            TermInfoVersion::V1
-        };
+        let bitmap_offset_nbits = compute_num_bits(
+            self.term_infos
+                .iter()
+                .filter_map(|info| info.bitmap_offset)
+                .max()
+                .map_or(0, |offset| offset + 1),
+        );
+        if bitmap_offset_nbits > 56 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bitmap offset exceeds the term dictionary limit",
+            ));
+        }
         let pnorms_offset_nbits = ref_term_info.pnorms_offset.map_or(0, |base| {
             compute_num_bits(last_term_info.pnorms_offset.unwrap() - base)
         });
@@ -282,9 +328,9 @@ impl TermInfoStoreWriter {
             postings_offset_nbits: max_postings_offset_nbits,
             positions_offset_nbits: max_positions_offset_nbits,
             pnorms_offset_nbits,
+            bitmap_offset_nbits,
         };
 
-        term_info_block_meta.serialize(&mut self.buffer_block_metas, version)?;
         for term_info in &self.term_infos[1..] {
             bitpack_serialize(
                 &mut self.buffer_term_infos,
@@ -308,6 +354,7 @@ impl TermInfoStoreWriter {
 
         // Block need end up at the end of a byte.
         bit_packer.flush(&mut self.buffer_term_infos)?;
+        self.buffer_block_metas.push(term_info_block_meta);
         self.term_infos.clear();
 
         Ok(())
@@ -318,6 +365,7 @@ impl TermInfoStoreWriter {
             self.has_pnorms = term_info.pnorms_offset.is_some();
         }
         assert_eq!(term_info.pnorms_offset.is_some(), self.has_pnorms);
+        self.has_bitmaps |= term_info.bitmap_offset.is_some();
         self.num_terms += 1u64;
         self.term_infos.push(term_info.clone());
         if self.term_infos.len() >= BLOCK_LEN {
@@ -330,10 +378,14 @@ impl TermInfoStoreWriter {
         if !self.term_infos.is_empty() {
             self.flush_block()?;
         }
-        let len = self.buffer_block_metas.len() as u64;
+        let version = self.version();
+        let len =
+            (self.buffer_block_metas.len() * TermInfoBlockMeta::serialized_size(version)) as u64;
         len.serialize(write)?;
         self.num_terms.serialize(write)?;
-        write.write_all(&self.buffer_block_metas)?;
+        for meta in &self.buffer_block_metas {
+            meta.serialize(write, version)?;
+        }
         write.write_all(&self.buffer_term_infos)?;
         Ok(())
     }
@@ -375,7 +427,9 @@ mod tests {
                     postings_range: 51..57,
                     positions_range: 110..134,
                     pnorms_offset: (version == TermInfoVersion::V2).then_some(1 << 40),
+                    bitmap_offset: None,
                 },
+                bitmap_offset_nbits: 0,
                 doc_freq_nbits: 10,
                 postings_offset_nbits: 5,
                 positions_offset_nbits: 8,
@@ -414,6 +468,7 @@ mod tests {
                         postings_range: offset(i)..offset(i + 1),
                         positions_range: offset(i) * 3..offset(i + 1) * 3,
                         pnorms_offset: norm_offset,
+                        bitmap_offset: None,
                     };
                     if let Some(offset) = &mut norm_offset {
                         *offset += u64::from(term_info.doc_freq);

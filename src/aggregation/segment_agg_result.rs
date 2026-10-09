@@ -39,6 +39,22 @@ pub trait SegmentAggregationCollector: Debug {
         agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()>;
 
+    fn collect_bitmap(
+        &mut self,
+        parent_bucket_id: BucketId,
+        base: crate::DocId,
+        mask: &crate::DocIdBitmap,
+        agg_data: &mut AggregationsSegmentCtx,
+    ) -> crate::Result<()> {
+        let mut result = Ok(());
+        crate::DocSetBatch::Bitmap(base, mask).for_each_doc_block(|docs| {
+            if result.is_ok() {
+                result = self.collect(parent_bucket_id, docs, agg_data);
+            }
+        });
+        result
+    }
+
     /// Collect docs for multiple buckets in one call.
     /// Minimizes dynamic dispatch overhead when collecting many buckets.
     ///
@@ -141,6 +157,19 @@ impl SegmentAggregationCollector for GenericSegmentAggregationResultsCollector {
     ) -> crate::Result<()> {
         for collector in &mut self.aggs {
             collector.collect(parent_bucket_id, docs, agg_data)?;
+        }
+        Ok(())
+    }
+
+    fn collect_bitmap(
+        &mut self,
+        parent_bucket_id: BucketId,
+        base: crate::DocId,
+        mask: &crate::DocIdBitmap,
+        agg_data: &mut AggregationsSegmentCtx,
+    ) -> crate::Result<()> {
+        for collector in &mut self.aggs {
+            collector.collect_bitmap(parent_bucket_id, base, mask, agg_data)?;
         }
         Ok(())
     }

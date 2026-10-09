@@ -2,7 +2,7 @@ use std::fmt;
 
 use common::TinySet;
 
-use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
+use crate::docset::{SeekDangerResult, BLOCK_NUM_TINYBITSETS, COLLECT_BLOCK_BUFFER_LEN};
 use crate::query::{
     CandidateHint, EnableScoring, Explanation, Query, Scorer, UnpositionedScorer, Weight,
 };
@@ -165,6 +165,18 @@ impl<TDocSet: DocSet> DocSet for ConstScorer<TDocSet> {
 
     fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
         self.docset.is_empty_in_range(start, end)
+    }
+
+    fn has_fast_bitset(&self) -> bool {
+        self.docset.has_fast_bitset()
+    }
+
+    fn fill_bitset_block(
+        &mut self,
+        base: DocId,
+        mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
+    ) -> DocId {
+        self.docset.fill_bitset_block(base, mask)
     }
 
     fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {

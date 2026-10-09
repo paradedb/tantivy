@@ -1,4 +1,8 @@
-use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
+use common::TinySet;
+
+use crate::docset::{
+    DocSet, BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW, COLLECT_BLOCK_BUFFER_LEN, TERMINATED,
+};
 use crate::index::SegmentReader;
 use crate::query::boost_query::BoostScorer;
 use crate::query::explanation::does_not_match;
@@ -47,7 +51,10 @@ pub struct AllScorer {
 impl AllScorer {
     /// Creates a new AllScorer with `max_doc` docs.
     pub fn new(max_doc: DocId) -> AllScorer {
-        AllScorer { doc: 0u32, max_doc }
+        AllScorer {
+            doc: if max_doc == 0 { TERMINATED } else { 0 },
+            max_doc,
+        }
     }
 }
 
@@ -67,6 +74,34 @@ impl DocSet for AllScorer {
         self.doc = target;
         if self.doc >= self.max_doc {
             self.doc = TERMINATED;
+        }
+        self.doc
+    }
+
+    fn has_fast_bitset(&self) -> bool {
+        true
+    }
+
+    fn fill_bitset_block(
+        &mut self,
+        base: DocId,
+        mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
+    ) -> DocId {
+        let start = base.max(self.doc);
+        let end = base.saturating_add(BLOCK_WINDOW).min(self.max_doc);
+        for (i, word) in mask.iter_mut().enumerate() {
+            let word_base = base + i as u32 * 64;
+            if word_base >= end || word_base + 64 <= start {
+                continue;
+            }
+            let mut bits = u64::MAX << start.saturating_sub(word_base);
+            if end - word_base < 64 {
+                bits &= (1u64 << (end - word_base)) - 1;
+            }
+            *word = word.union(TinySet::deserialize(bits.to_le_bytes()));
+        }
+        if end > self.doc {
+            self.seek(end);
         }
         self.doc
     }

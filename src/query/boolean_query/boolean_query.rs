@@ -200,7 +200,8 @@ impl Query for BooleanQuery {
                 enable_scoring.is_scoring_enabled(),
                 Box::new(SumCombiner::default),
             )
-            .with_disjunction_pruning(enable_scoring.disjunction_pruning()),
+            .with_disjunction_pruning(enable_scoring.disjunction_pruning())
+            .with_bitmap_postings(enable_scoring.bitmap_postings_enabled()),
         ))
     }
 

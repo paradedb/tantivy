@@ -15,7 +15,6 @@ use crate::aggregation::intermediate_agg_result::{
 };
 use crate::aggregation::segment_agg_result::{BucketIdProvider, SegmentAggregationCollector};
 use crate::aggregation::BucketId;
-use crate::docset::DocSet;
 use crate::query::{AllQuery, EnableScoring, Query, QueryParser};
 use crate::schema::Schema;
 use crate::tokenizer::TokenizerManager;
@@ -666,6 +665,22 @@ impl<B: SubAggBuffer> SegmentAggregationCollector for SegmentFilterCollector<B> 
         Ok(())
     }
 
+    // ParadeDB represents COUNT(*) as `filter: "*"`; count its bitmap without enumerating doc IDs.
+    fn collect_bitmap(
+        &mut self,
+        parent_bucket_id: BucketId,
+        _base: DocId,
+        mask: &crate::DocIdBitmap,
+        _agg_data: &mut AggregationsSegmentCtx,
+    ) -> crate::Result<()> {
+        if self.sub_aggregations.is_some() || self.req_data.evaluator.bitset.is_some() {
+            unreachable!("bitmap collection requires a match-all filter without sub-aggregations");
+        }
+        self.parent_buckets[parent_bucket_id as usize].doc_count +=
+            mask.iter().map(|word| u64::from(word.len())).sum::<u64>();
+        Ok(())
+    }
+
     fn flush(&mut self, agg_data: &mut AggregationsSegmentCtx) -> crate::Result<()> {
         if let Some(ref mut sub_aggs) = self.sub_aggregations {
             sub_aggs.flush(agg_data)?;
@@ -838,6 +853,33 @@ mod tests {
             deserialized,
             AggContextParams::new(Default::default(), index.tokenizers().clone()),
         ))
+    }
+
+    #[test]
+    fn bitmap_collection_requires_match_all_without_sub_aggregations() -> crate::Result<()> {
+        use crate::collector::{Collector, SegmentCollector};
+
+        let index = create_standard_test_index()?;
+        let searcher = index.reader()?.searcher();
+        for (request, expected) in [
+            (json!({"count": {"filter": "*"}}), true),
+            (json!({"count": {"filter": "category:electronics"}}), false),
+            (
+                json!({"count": {"filter": "*", "aggs": {"nested": {"filter": "*"}}}}),
+                false,
+            ),
+            (
+                json!({"count": {"filter": "*"}, "filtered": {"filter": "category:electronics"}}),
+                false,
+            ),
+        ] {
+            let collector = create_collector(&index, serde_json::from_value(request)?)?;
+            for (ordinal, segment) in searcher.segment_readers().iter().enumerate() {
+                let child = collector.for_segment(ordinal as u32, segment)?;
+                assert_eq!(child.supports_bitmap_collection(), expected);
+            }
+        }
+        Ok(())
     }
 
     #[test]

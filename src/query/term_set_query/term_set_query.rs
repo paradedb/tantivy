@@ -31,6 +31,7 @@ fn build_multi_field_weight(
     strategy_config: &TermSetStrategyConfig,
     exact_fast_field: ExactFastField,
     schema: &Schema,
+    bitmap_enabled: bool,
     index_requirement: IndexRequirement,
 ) -> crate::Result<BooleanWeight<DoNothingCombiner>> {
     let mut sub_queries: Vec<(_, Box<dyn Weight>)> = Vec::with_capacity(terms_map.len());
@@ -45,20 +46,22 @@ fn build_multi_field_weight(
         }
         sub_queries.push((
             Occur::Should,
-            Box::new(TermSetWeight::from_terms(
-                field,
-                terms,
-                field_type,
-                exact_fast_field,
-                strategy_config.clone(),
-            )?),
+            Box::new(
+                TermSetWeight::from_terms(
+                    field,
+                    terms,
+                    field_type,
+                    exact_fast_field,
+                    strategy_config.clone(),
+                )?
+                .with_bitmap_postings(bitmap_enabled),
+            ),
         ));
     }
-    Ok(BooleanWeight::new(
-        sub_queries,
-        false,
-        Box::new(DoNothingCombiner::default),
-    ))
+    Ok(
+        BooleanWeight::new(sub_queries, false, Box::new(DoNothingCombiner::default))
+            .with_bitmap_postings(bitmap_enabled),
+    )
 }
 
 /// A `TermSetQuery` matches all documents containing any of the provided `Term`s.
@@ -105,6 +108,7 @@ impl Query for TermSetQuery {
             &self.strategy_config,
             self.exact_fast_field,
             enable_scoring.schema(),
+            enable_scoring.bitmap_postings_enabled(),
             IndexRequirement::Required,
         )?))
     }
@@ -163,6 +167,7 @@ impl Query for FastFieldTermSetQuery {
             &self.strategy_config,
             self.exact_fast_field,
             enable_scoring.schema(),
+            enable_scoring.bitmap_postings_enabled(),
             IndexRequirement::Optional,
         )?))
     }
@@ -207,14 +212,16 @@ impl Query for InvertedIndexTermSetQuery {
 
             sub_queries.push((
                 Occur::Should,
-                Box::new(AutomatonWeight::new(field, SetDfaWrapper(Arc::new(map)))),
+                Box::new(
+                    AutomatonWeight::new(field, SetDfaWrapper(Arc::new(map)))
+                        .with_bitmap_postings(enable_scoring.bitmap_postings_enabled()),
+                ),
             ));
         }
-        Ok(Box::new(BooleanWeight::new(
-            sub_queries,
-            false,
-            Box::new(DoNothingCombiner::default),
-        )))
+        Ok(Box::new(
+            BooleanWeight::new(sub_queries, false, Box::new(DoNothingCombiner::default))
+                .with_bitmap_postings(enable_scoring.bitmap_postings_enabled()),
+        ))
     }
 }
 

@@ -11,16 +11,13 @@ use crate::DocId;
 pub struct DriveCost(pub u64);
 
 impl DriveCost {
-    /// Zero drive cost.
     pub const ZERO: Self = Self(0);
 
-    /// Saturating addition of drive costs.
     #[inline]
     pub const fn saturating_add(self, rhs: Self) -> Self {
         Self(self.0.saturating_add(rhs.0))
     }
 
-    /// Saturating multiplication of drive cost by `factor`.
     #[inline]
     pub const fn saturating_mul(self, factor: u64) -> Self {
         Self(self.0.saturating_mul(factor))
@@ -31,15 +28,14 @@ impl DriveCost {
 /// in units of one `TermScorer::advance()`.
 ///
 /// Zero for in-memory docsets (`TermScorer`, `BitSetDocSet`, `RangeDocSet`, `PhraseScorer`);
-/// non-zero for lazy SSTable dictionary block decoding or cross-boundary vectorized predicates.
+/// non-zero for lazy SSTable dictionary block decoding (`CachedDictPredicateDocSet`) or
+/// cross-boundary vectorized predicates (`PredicateColumnDocSet`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProbeSetupCost(pub u64);
 
 impl ProbeSetupCost {
-    /// Zero setup cost.
     pub const ZERO: Self = Self(0);
 
-    /// Saturating addition of setup costs.
     #[inline]
     pub const fn saturating_add(self, rhs: Self) -> Self {
         Self(self.0.saturating_add(rhs.0))
@@ -52,16 +48,13 @@ impl ProbeSetupCost {
 pub struct ProbePerDocCost(pub u64);
 
 impl ProbePerDocCost {
-    /// Zero per-document probe cost.
     pub const ZERO: Self = Self(0);
 
-    /// Saturating addition of per-document probe costs.
     #[inline]
     pub const fn saturating_add(self, rhs: Self) -> Self {
         Self(self.0.saturating_add(rhs.0))
     }
 
-    /// Saturating multiplication of per-document probe cost by `factor`.
     #[inline]
     pub const fn saturating_mul(self, factor: u64) -> Self {
         Self(self.0.saturating_mul(factor))
@@ -81,7 +74,6 @@ pub struct ProbeCost {
 }
 
 impl ProbeCost {
-    /// Zero probe cost.
     pub const ZERO: Self = Self {
         setup: ProbeSetupCost::ZERO,
         per_doc: ProbePerDocCost::ZERO,
@@ -96,13 +88,14 @@ impl ProbeCost {
     /// In-memory fast-field value decode + comparison (`RangeDocSet`).
     pub const FAST_FIELD: Self = Self::per_doc(5);
 
-    /// Binary search / gallop on a sorted fast-field column.
+    /// Binary search / gallop on a sorted fast-field column (`TermSetGallopDocSet`).
     pub const GALLOP: Self = Self::per_doc(8);
 
-    /// In-memory fast-field decode + hash/ordinal set lookup.
+    /// In-memory fast-field decode + hash/ordinal set lookup (`TermSetDocSet`,
+    /// populated `CachedDictPredicateDocSet`).
     pub const FAST_FIELD_LOOKUP: Self = Self::per_doc(10);
 
-    /// Lazy SSTable dictionary block decode + lookup:
+    /// Lazy SSTable dictionary block decode + lookup (unpopulated `CachedDictPredicateDocSet`):
     /// fixed block read/decompression setup plus ordinal lookup per probed document.
     pub const DICT_BLOCK: Self = Self {
         setup: ProbeSetupCost(64),
@@ -187,13 +180,11 @@ pub struct DocSetCost {
 }
 
 impl DocSetCost {
-    /// Zero drive and probe cost.
     pub const ZERO: Self = Self {
         drive: DriveCost::ZERO,
         probe: ProbeCost::ZERO,
     };
 
-    /// Creates a new `DocSetCost` from drive and probe components.
     #[inline]
     pub const fn new(drive: DriveCost, probe: ProbeCost) -> Self {
         Self { drive, probe }
@@ -217,6 +208,48 @@ pub const BLOCK_NUM_TINYBITSETS: usize = 16;
 /// Number of doc IDs covered by one block: `BLOCK_NUM_TINYBITSETS * 64 = 1024`.
 pub const BLOCK_WINDOW: u32 = BLOCK_NUM_TINYBITSETS as u32 * 64;
 
+/// Membership bits for a window of [`BLOCK_WINDOW`] consecutive document IDs.
+pub type DocIdBitmap = [TinySet; BLOCK_NUM_TINYBITSETS];
+
+/// Unscored matches, retained as a bitmap when the query can produce one directly.
+#[derive(Clone, Copy)]
+pub enum DocSetBatch<'a> {
+    /// Sorted document IDs.
+    Docs(&'a [DocId]),
+    /// A window's starting document ID and membership bits relative to that start.
+    Bitmap(DocId, &'a DocIdBitmap),
+}
+
+impl DocSetBatch<'_> {
+    /// Enumerates a batch in blocks no larger than [`COLLECT_BLOCK_BUFFER_LEN`].
+    pub fn for_each_doc_block(self, mut callback: impl FnMut(&[DocId])) {
+        match self {
+            Self::Docs(docs) => {
+                for block in docs.chunks(COLLECT_BLOCK_BUFFER_LEN) {
+                    callback(block);
+                }
+            }
+            Self::Bitmap(base, mask) => {
+                let mut buffer = [0; COLLECT_BLOCK_BUFFER_LEN];
+                let mut len = 0;
+                for (i, word) in mask.iter().enumerate() {
+                    for bit in *word {
+                        buffer[len] = base + i as u32 * 64 + bit;
+                        len += 1;
+                        if len == buffer.len() {
+                            callback(&buffer);
+                            len = 0;
+                        }
+                    }
+                }
+                if len > 0 {
+                    callback(&buffer[..len]);
+                }
+            }
+        }
+    }
+}
+
 /// Initializes `mask[..len.div_ceil(64)]` with bits `0..len` set (all candidates active).
 #[inline]
 pub fn fill_all_candidates_mask(len: usize, mask: &mut [TinySet]) {
@@ -228,6 +261,45 @@ pub fn fill_all_candidates_mask(len: usize, mask: &mut [TinySet]) {
     if rem > 0 {
         mask[full_words] = TinySet::range_lower(rem as u32);
     }
+}
+
+#[inline]
+pub(crate) fn union_bitset_blocks(mask: &mut DocIdBitmap, other: &DocIdBitmap) {
+    for (word, other) in mask.iter_mut().zip(other) {
+        *word = word.union(*other);
+    }
+}
+
+#[inline]
+pub(crate) fn retain_bitset_range(mask: &mut DocIdBitmap, base: DocId, start: DocId, end: DocId) {
+    let start = start.saturating_sub(base).min(BLOCK_WINDOW) as usize;
+    let end = end.saturating_sub(base).min(BLOCK_WINDOW) as usize;
+    mask[..start / 64].fill(TinySet::EMPTY);
+    if start / 64 < mask.len() {
+        mask[start / 64] =
+            mask[start / 64].intersect(TinySet::range_greater_or_equal(start as u32 % 64));
+    }
+    if end / 64 < mask.len() {
+        mask[end / 64] = mask[end / 64].intersect(TinySet::range_lower(end as u32 % 64));
+        mask[end / 64 + 1..].fill(TinySet::EMPTY);
+    }
+}
+
+pub(crate) fn count_bitset_blocks<T: DocSet + ?Sized>(
+    docset: &mut T,
+    alive: Option<&AliveBitSet>,
+) -> u32 {
+    let mut count = 0;
+    while docset.doc() < TERMINATED {
+        let base = docset.doc() / BLOCK_WINDOW * BLOCK_WINDOW;
+        let mut mask = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
+        docset.fill_bitset_block(base, &mut mask);
+        if let Some(alive) = alive {
+            alive.intersect_bitmap(base, &mut mask);
+        }
+        count += mask.iter().map(|word| word.len()).sum::<u32>();
+    }
+    count
 }
 
 /// Represents an iterable set of sorted doc ids.
@@ -434,18 +506,26 @@ pub trait DocSet: Send {
         DocSetCost::new(DriveCost(self.size_hint() as u64), ProbeCost::TERM)
     }
 
+    /// Whether this docset can produce membership masks without enumerating each match.
+    fn has_fast_bitset(&self) -> bool {
+        false
+    }
+
     /// Fills a bitmask representing which documents in `[min_doc, min_doc + BLOCK_WINDOW)` are
     /// present in this docset.
     ///
     /// The window is divided into `BLOCK_NUM_TINYBITSETS` buckets of 64 docs each.
+    /// Adds only unconsumed matches to the existing mask; it does not clear the mask.
     /// Returns the next doc `>= min_doc + BLOCK_WINDOW`, or `TERMINATED` if exhausted.
     fn fill_bitset_block(
         &mut self,
         min_doc: DocId,
         mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
     ) -> DocId {
-        self.seek(min_doc);
-        let horizon = min_doc + BLOCK_WINDOW;
+        if self.doc() < min_doc {
+            self.seek(min_doc);
+        }
+        let horizon = min_doc.saturating_add(BLOCK_WINDOW).min(TERMINATED);
         loop {
             let doc = self.doc();
             if doc >= horizon {
@@ -459,12 +539,10 @@ pub trait DocSet: Send {
         }
     }
 
-    /// Returns `true` if this `DocSet` is guaranteed to contain no documents in the inclusive
-    /// range `[start, end]`.
+    /// Returns true if the docset is known to have NO matching documents in the inclusive
+    /// range `[start, end]` (`start <= doc <= end`).
     ///
-    /// Returning `false` is always conservative and safe (callers will still test individual
-    /// candidates). Like [`Self::seek_danger`], this may leave the `DocSet` in the danger zone
-    /// and expects non-decreasing `start` values across consecutive calls.
+    /// Useful for block-level skipping prior to decoding postings blocks.
     fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
         if start > end {
             return true;
@@ -478,6 +556,9 @@ pub trait DocSet: Send {
     /// Returns the number documents matching.
     /// Calling this method consumes the `DocSet`.
     fn count(&mut self, alive_bitset: &AliveBitSet) -> u32 {
+        if self.has_fast_bitset() {
+            return count_bitset_blocks(self, Some(alive_bitset));
+        }
         let mut count = 0u32;
         let mut doc = self.doc();
         while doc != TERMINATED {
@@ -495,6 +576,9 @@ pub trait DocSet: Send {
     /// Of course, the result is an upper bound of the result
     /// given by `count()`.
     fn count_including_deleted(&mut self) -> u32 {
+        if self.has_fast_bitset() {
+            return count_bitset_blocks(self, None);
+        }
         let mut count = 0u32;
         let mut doc = self.doc();
         while doc != TERMINATED {
@@ -543,6 +627,10 @@ impl DocSet for &mut dyn DocSet {
         mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
     ) -> DocId {
         (**self).fill_bitset_block(min_doc, mask)
+    }
+
+    fn has_fast_bitset(&self) -> bool {
+        (**self).has_fast_bitset()
     }
 
     fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
@@ -603,6 +691,10 @@ impl<TDocSet: DocSet + ?Sized> DocSet for Box<TDocSet> {
     ) -> DocId {
         let unboxed: &mut TDocSet = self.borrow_mut();
         unboxed.fill_bitset_block(min_doc, mask)
+    }
+
+    fn has_fast_bitset(&self) -> bool {
+        (**self).has_fast_bitset()
     }
 
     fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {

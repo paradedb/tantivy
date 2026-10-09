@@ -155,7 +155,8 @@ impl Query for TermPredicateQuery {
             self.exact_postings,
             self.exact_fast_field,
             self.strategy_config.clone(),
-        )?;
+        )?
+        .with_bitmap_postings(enable_scoring.bitmap_postings_enabled());
         Ok(Box::new(weight))
     }
 }

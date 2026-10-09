@@ -148,6 +148,11 @@ impl UnpositionedScorer {
     }
 
     #[inline]
+    pub fn has_fast_bitset(&self) -> bool {
+        self.scorer.has_fast_bitset()
+    }
+
+    #[inline]
     pub fn is<T: Scorer>(&self) -> bool {
         self.scorer.is::<T>()
     }

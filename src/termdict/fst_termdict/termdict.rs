@@ -81,11 +81,7 @@ where W: Write
                 .serialize(&mut counting_writer)?;
             let footer_size = counting_writer.written_bytes();
             footer_size.serialize(&mut counting_writer)?;
-            let version = if self.term_info_store_writer.has_pnorms() {
-                TermInfoVersion::V2
-            } else {
-                TermInfoVersion::V1
-            };
+            let version = self.term_info_store_writer.version();
             version.serialize(&mut counting_writer)?;
         }
         Ok(file)

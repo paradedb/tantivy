@@ -3,7 +3,7 @@ use std::fmt;
 use common::TinySet;
 
 use super::scorer::PruningScorer;
-use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
+use crate::docset::{SeekDangerResult, BLOCK_NUM_TINYBITSETS, COLLECT_BLOCK_BUFFER_LEN};
 use crate::fastfield::AliveBitSet;
 use crate::query::{
     CandidateHint, EnableScoring, Explanation, Query, Scorer, UnpositionedScorer, Weight,
@@ -155,6 +155,18 @@ impl<S: Scorer> DocSet for BoostScorer<S> {
 
     fn seek_danger_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) -> DocId {
         self.underlying.seek_danger_batch(docs, mask)
+    }
+
+    fn has_fast_bitset(&self) -> bool {
+        self.underlying.has_fast_bitset()
+    }
+
+    fn fill_bitset_block(
+        &mut self,
+        base: DocId,
+        mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
+    ) -> DocId {
+        self.underlying.fill_bitset_block(base, mask)
     }
 
     fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {

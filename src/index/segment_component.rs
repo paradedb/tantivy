@@ -18,6 +18,8 @@ pub enum SegmentComponent {
     FieldNorms,
     /// Optional field norms stored in posting order for scoring.
     PostingNorms,
+    /// Optional membership bitmaps for dense terms.
+    PostingBitmaps,
     /// Dictionary associating `Term`s to `TermInfo`s which is
     /// simply an address into the `postings` file and the `positions` file.
     Terms,
@@ -48,6 +50,7 @@ impl TryFrom<&str> for SegmentComponent {
             "fast" => Ok(SegmentComponent::FastFields),
             "fieldnorm" => Ok(SegmentComponent::FieldNorms),
             "pnorm" => Ok(SegmentComponent::PostingNorms),
+            "bmap" => Ok(SegmentComponent::PostingBitmaps),
             "del" => Ok(SegmentComponent::Delete),
             other => Ok(SegmentComponent::Custom(other.to_string())),
         }
@@ -62,6 +65,7 @@ impl Display for SegmentComponent {
             SegmentComponent::FastFields => write!(f, "fast"),
             SegmentComponent::FieldNorms => write!(f, "fieldnorm"),
             SegmentComponent::PostingNorms => write!(f, "pnorm"),
+            SegmentComponent::PostingBitmaps => write!(f, "bmap"),
             SegmentComponent::Terms => write!(f, "term"),
             SegmentComponent::Store => write!(f, "store"),
             SegmentComponent::TempStore => write!(f, "temp"),

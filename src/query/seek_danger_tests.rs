@@ -87,8 +87,11 @@ implementations! {
     ("disjunction.rs", ScorerWrapper, query_seek_danger_scorer_wrapper),
 }
 
-// Overrides not yet covered by the expression generator above.
-const FORK_INVENTORY: &[(&str, usize)] = &[("query/term_set_query/term_set_weight.rs", 1)];
+// ParadeDB-only overrides not yet covered by the expression generator above.
+const FORK_INVENTORY: &[(&str, usize)] = &[
+    ("query/bitmap_docset.rs", 1),
+    ("query/term_set_query/term_set_weight.rs", 1),
+];
 
 #[derive(Clone, Debug)]
 enum Expr {

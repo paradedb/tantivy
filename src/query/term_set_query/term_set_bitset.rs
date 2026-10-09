@@ -72,6 +72,7 @@ pub(crate) fn bitset_from_postings_scorer(
     field: Field,
     sorted_keys: &[Vec<u8>],
     boost: Score,
+    bitmap_enabled: bool,
 ) -> crate::Result<Box<dyn Scorer>> {
     if sorted_keys.is_empty() || reader.max_doc() == 0 {
         return Ok(Box::new(EmptyScorer));
@@ -94,7 +95,12 @@ pub(crate) fn bitset_from_postings_scorer(
         let sorted = SortedTermSlice::new_assume_sorted(sorted_keys);
         for result in term_dict.batch_term_info_exact(sorted) {
             let (_idx, term_info) = result?;
-            or_term_info_into_bitset(&inverted_index, &term_info, &mut bitset)?;
+            or_term_info_into_bitset(
+                &inverted_index,
+                &term_info,
+                &mut bitset,
+                bitmap_enabled && reader.bitmap_postings_enabled,
+            )?;
         }
     }
     #[cfg(not(feature = "quickwit"))]
@@ -107,7 +113,12 @@ pub(crate) fn bitset_from_postings_scorer(
             let Some(term_info) = term_dict.get(key.as_slice())? else {
                 continue;
             };
-            or_term_info_into_bitset(&inverted_index, &term_info, &mut bitset)?;
+            or_term_info_into_bitset(
+                &inverted_index,
+                &term_info,
+                &mut bitset,
+                bitmap_enabled && reader.bitmap_postings_enabled,
+            )?;
         }
     }
 

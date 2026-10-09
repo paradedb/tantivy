@@ -250,6 +250,7 @@ impl TermDictionary {
 pub struct TermDictionaryBuilder<W: io::Write> {
     inner: InnerTermDictBuilder<W>,
     has_pnorms: bool,
+    has_bitmaps: bool,
 }
 
 impl<W: io::Write> TermDictionaryBuilder<W> {
@@ -258,6 +259,7 @@ impl<W: io::Write> TermDictionaryBuilder<W> {
         InnerTermDictBuilder::create(w).map(|inner| Self {
             inner,
             has_pnorms: false,
+            has_bitmaps: false,
         })
     }
 
@@ -266,6 +268,7 @@ impl<W: io::Write> TermDictionaryBuilder<W> {
     /// *Keys have to be inserted in order.*
     pub fn insert<K: AsRef<[u8]>>(&mut self, key_ref: K, value: &TermInfo) -> io::Result<()> {
         self.has_pnorms |= value.pnorms_offset.is_some();
+        self.has_bitmaps |= value.bitmap_offset.is_some();
         self.inner.insert(key_ref, value)
     }
 
@@ -285,6 +288,7 @@ impl<W: io::Write> TermDictionaryBuilder<W> {
     /// Horribly dangerous internal API. See `.insert_key(...)`.
     pub fn insert_value(&mut self, term_info: &TermInfo) -> io::Result<()> {
         self.has_pnorms |= term_info.pnorms_offset.is_some();
+        self.has_bitmaps |= term_info.bitmap_offset.is_some();
         self.inner.insert_value(term_info)
     }
 
@@ -293,8 +297,13 @@ impl<W: io::Write> TermDictionaryBuilder<W> {
     pub fn finish(self) -> io::Result<W> {
         let mut writer = self.inner.finish()?;
         (CURRENT_TYPE as u32).serialize(&mut writer)?;
-        if self.has_pnorms {
-            TermInfoVersion::V2.serialize(&mut writer)?;
+        if self.has_pnorms || self.has_bitmaps {
+            (if self.has_bitmaps {
+                TermInfoVersion::V3
+            } else {
+                TermInfoVersion::V2
+            })
+            .serialize(&mut writer)?;
             VERSIONED_FOOTER_MAGIC.serialize(&mut writer)?;
         }
         Ok(writer)

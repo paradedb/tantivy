@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::cmp::min;
 use std::io;
 use std::ops::Range;
@@ -22,6 +22,7 @@ pub struct BufferedFileSlice {
     buffer: RefCell<OwnedBytes>,
     buffer_range: RefCell<Range<u64>>,
     buffer_max_size: usize,
+    block_aligned: bool,
 }
 
 impl BufferedFileSlice {
@@ -35,6 +36,16 @@ impl BufferedFileSlice {
             buffer: RefCell::new(OwnedBytes::empty()),
             buffer_range: RefCell::new(0..0),
             buffer_max_size,
+            block_aligned: false,
+        }
+    }
+
+    /// Aligns reads to storage blocks, or fixed-size buffers when storage geometry is unavailable.
+    pub fn new_block_aligned(file_slice: FileSlice, buffer_max_size: usize) -> Self {
+        assert!(buffer_max_size > 0);
+        Self {
+            block_aligned: true,
+            ..Self::new(file_slice, buffer_max_size)
         }
     }
 
@@ -49,7 +60,7 @@ impl BufferedFileSlice {
     }
 
     /// Reads a byte without cloning the retained buffer on a cache hit.
-    #[inline]
+    #[inline(always)]
     pub fn read_byte(&self, offset: u64) -> io::Result<u8> {
         let range = self.buffer_range.borrow();
         if range.contains(&offset) {
@@ -60,6 +71,28 @@ impl BufferedFileSlice {
             io::Error::new(io::ErrorKind::UnexpectedEof, "byte offset out of bounds")
         })?;
         Ok(self.get_bytes(offset..end)?[0])
+    }
+
+    /// Borrows the cached bytes from `offset`, loading at least `min_len` bytes if needed.
+    /// `min_len` must be nonzero and no larger than the buffer size. Drop the borrow
+    /// before making another read that could refill the buffer.
+    pub fn read_chunk(&self, offset: u64, min_len: usize) -> io::Result<Ref<'_, [u8]>> {
+        if min_len == 0 || min_len > self.buffer_max_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid chunk size",
+            ));
+        }
+        let end = offset.checked_add(min_len as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "chunk offset out of bounds")
+        })?;
+        let range = self.buffer_range.borrow();
+        if offset < range.start || end > range.end {
+            drop(range);
+            self.get_bytes(offset..end)?;
+        }
+        let start = (offset - self.buffer_range.borrow().start) as usize;
+        Ok(Ref::map(self.buffer.borrow(), |bytes| &bytes[start..]))
     }
 
     /// Returns an `OwnedBytes` corresponding to the given `required_range`.
@@ -96,16 +129,57 @@ impl BufferedFileSlice {
                     .read_bytes_slice(required_range.start as usize..required_range.end as usize);
             }
 
-            let new_buffer_start = required_range.start;
-            let new_buffer_end = min(
-                new_buffer_start + self.buffer_max_size as u64,
-                self.file_slice.len() as u64,
-            );
-            let read_range = new_buffer_start..new_buffer_end;
-
-            let new_buffer = self
-                .file_slice
-                .read_bytes_slice(read_range.start as usize..read_range.end as usize)?;
+            let read_range = if self.block_aligned && !required_range.is_empty() {
+                let first = required_range.start as usize;
+                let last = required_range.end as usize - 1;
+                let start = self.file_slice.storage_block_range(first).map_or_else(
+                    || first / self.buffer_max_size * self.buffer_max_size,
+                    |block| block.start,
+                );
+                let end = self.file_slice.storage_block_range(last).map_or_else(
+                    || {
+                        ((last / self.buffer_max_size + 1) * self.buffer_max_size)
+                            .min(self.file_slice.len())
+                    },
+                    |block| block.end,
+                );
+                start as u64..end as u64
+            } else {
+                required_range.start
+                    ..min(
+                        required_range.start + self.buffer_max_size as u64,
+                        self.file_slice.len() as u64,
+                    )
+            };
+            let old_range = self.buffer_range.borrow();
+            let overlap_start = read_range.start.max(old_range.start);
+            let overlap_end = read_range.end.min(old_range.end);
+            let new_buffer = if self.block_aligned && overlap_start < overlap_end {
+                let mut bytes = Vec::with_capacity((read_range.end - read_range.start) as usize);
+                if read_range.start < overlap_start {
+                    bytes.extend_from_slice(
+                        &self
+                            .file_slice
+                            .read_bytes_slice(read_range.start as usize..overlap_start as usize)?,
+                    );
+                }
+                bytes.extend_from_slice(
+                    &self.buffer.borrow()[(overlap_start - old_range.start) as usize
+                        ..(overlap_end - old_range.start) as usize],
+                );
+                if overlap_end < read_range.end {
+                    bytes.extend_from_slice(
+                        &self
+                            .file_slice
+                            .read_bytes_slice(overlap_end as usize..read_range.end as usize)?,
+                    );
+                }
+                OwnedBytes::new(bytes)
+            } else {
+                self.file_slice
+                    .read_bytes_slice(read_range.start as usize..read_range.end as usize)?
+            };
+            drop(old_range);
 
             self.buffer.replace(new_buffer);
             self.buffer_range.replace(read_range);
@@ -117,5 +191,26 @@ impl BufferedFileSlice {
         let local_start = (required_range.start - buffer_range.start) as usize;
         let local_end = (required_range.end - buffer_range.start) as usize;
         Ok(buffer.slice(local_start..local_end))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_chunks_cover_requested_bytes_and_stop_at_cache_end() {
+        let data =
+            BufferedFileSlice::new_block_aligned(FileSlice::from((0u8..23).collect::<Vec<_>>()), 8);
+        assert_eq!(&*data.read_chunk(3, 2).unwrap(), &[3, 4, 5, 6, 7]);
+        assert_eq!(
+            &*data.read_chunk(7, 8).unwrap(),
+            &[7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+        assert_eq!(&*data.read_chunk(14, 2).unwrap(), &[14, 15]);
+        assert_eq!(&*data.read_chunk(20, 3).unwrap(), &[20, 21, 22]);
+        for (offset, len) in [(0, 0), (0, 9), (20, 4), (u64::MAX, 1)] {
+            assert!(data.read_chunk(offset, len).is_err());
+        }
     }
 }

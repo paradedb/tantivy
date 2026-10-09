@@ -1,6 +1,7 @@
-use crate::docset::{DocSet, DriveCost, COLLECT_BLOCK_BUFFER_LEN};
+use crate::docset::{DocSet, DriveCost, ProbeCost, COLLECT_BLOCK_BUFFER_LEN};
 use crate::index::SegmentReader;
 use crate::postings::FreqReadingOption;
+use crate::query::bitmap_combination::{BitmapCombination, BitmapOperation};
 use crate::query::boolean_query::{
     BlockWandIntersectionScorer, BlockWandSingleScorer, BlockWandUnionScorer,
 };
@@ -18,6 +19,49 @@ use crate::query::{
     UnpositionedScorer, Weight,
 };
 use crate::{DocId, Score, TERMINATED};
+
+fn intersect_scorers(
+    scorers: Vec<UnpositionedScorer>,
+    num_docs: u32,
+    scoring_enabled: bool,
+    bitmap_enabled: bool,
+) -> Box<dyn Scorer> {
+    if bitmap_enabled
+        && !scoring_enabled
+        && scorers.len() > 1
+        && scorers.iter().any(|scorer| scorer.has_fast_bitset())
+        && scorers
+            .iter()
+            .all(|scorer| scorer.size_hint().saturating_mul(32) >= num_docs)
+        // Avoid materializing full-segment bitmaps for expensive-to-probe non-bitset scorers
+        // (e.g. `PhraseScorer`, `PredicateColumnDocSet`) when a cheaper selective driver can
+        // intersect with them directly.
+        && !scorers.iter().any(|expensive| {
+            !expensive.has_fast_bitset()
+                && expensive.cost().probe.scalar() > ProbeCost::FAST_FIELD.scalar()
+                && scorers.iter().any(|driver| {
+                    driver.cost().drive < expensive.cost().drive
+                        && u64::from(driver.size_hint()) * 2 <= u64::from(num_docs)
+                })
+        })
+    {
+        let mut positioned_scorers = Vec::with_capacity(scorers.len());
+        for scorer in scorers {
+            let scorer = scorer.into_positioned();
+            if scorer.doc() == TERMINATED {
+                return Box::new(EmptyScorer);
+            }
+            positioned_scorers.push(scorer);
+        }
+        Box::new(BitmapCombination::new(
+            positioned_scorers,
+            BitmapOperation::Intersection,
+            num_docs,
+        ))
+    } else {
+        intersect_candidate_scorers(scorers, num_docs)
+    }
+}
 
 pub(crate) enum SpecializedScorer {
     TermUnion(Vec<TermScorer>),
@@ -58,6 +102,7 @@ fn scorer_union<TScoreCombiner>(
     scorers: Vec<Box<dyn Scorer>>,
     score_combiner_fn: impl Fn() -> TScoreCombiner,
     num_docs: u32,
+    bitmap_enabled: bool,
 ) -> SpecializedScorer
 where
     TScoreCombiner: ScoreCombiner,
@@ -65,6 +110,16 @@ where
     assert!(!scorers.is_empty());
     if scorers.len() == 1 && !scorers[0].is::<TermScorer>() {
         return SpecializedScorer::Other(scorers.into_iter().next().unwrap()); //< we checked the size beforehand
+    }
+    if bitmap_enabled
+        && TScoreCombiner::constant_score() == Some(1.0)
+        && scorers.iter().any(|scorer| scorer.has_fast_bitset())
+    {
+        return SpecializedScorer::Other(Box::new(BitmapCombination::new(
+            scorers,
+            BitmapOperation::Union,
+            num_docs,
+        )));
     }
     {
         let is_all_term_queries = scorers.iter().all(|scorer| scorer.is::<TermScorer>());
@@ -114,6 +169,7 @@ fn into_box_scorer<TScoreCombiner: ScoreCombiner>(
     scorer: SpecializedScorer,
     score_combiner_fn: impl Fn() -> TScoreCombiner,
     num_docs: u32,
+    bitmap_enabled: bool,
 ) -> Box<dyn Scorer> {
     match scorer {
         SpecializedScorer::TermUnion(mut term_scorers) => {
@@ -130,7 +186,12 @@ fn into_box_scorer<TScoreCombiner: ScoreCombiner>(
                 .into_iter()
                 .map(|s| UnpositionedScorer::from_positioned(Box::new(s) as Box<dyn Scorer>))
                 .collect();
-            intersect_candidate_scorers(boxed_scorers, num_docs)
+            intersect_scorers(
+                boxed_scorers,
+                num_docs,
+                TScoreCombiner::constant_score().is_none(),
+                bitmap_enabled,
+            )
         }
         SpecializedScorer::FilteredTermUnion { mut terms, filter } => {
             let term_scorer: Box<dyn Scorer> = if terms.len() == 1 {
@@ -142,9 +203,11 @@ fn into_box_scorer<TScoreCombiner: ScoreCombiner>(
                     num_docs,
                 ))
             };
-            intersect_candidate_scorers(
+            intersect_scorers(
                 vec![UnpositionedScorer::from_positioned(term_scorer), filter],
                 num_docs,
+                TScoreCombiner::constant_score().is_none(),
+                bitmap_enabled,
             )
         }
         SpecializedScorer::FilteredTermIntersection { terms, filter } => {
@@ -153,7 +216,12 @@ fn into_box_scorer<TScoreCombiner: ScoreCombiner>(
                 .map(|s| UnpositionedScorer::from_positioned(Box::new(s) as Box<dyn Scorer>))
                 .collect();
             boxed_scorers.push(filter);
-            intersect_candidate_scorers(boxed_scorers, num_docs)
+            intersect_scorers(
+                boxed_scorers,
+                num_docs,
+                TScoreCombiner::constant_score().is_none(),
+                bitmap_enabled,
+            )
         }
         SpecializedScorer::Other(scorer) => scorer,
     }
@@ -168,6 +236,8 @@ fn effective_must_scorer(
     removed_all_scorer_count: usize,
     max_doc: DocId,
     num_docs: u32,
+    scoring_enabled: bool,
+    bitmap_enabled: bool,
 ) -> Option<Box<dyn Scorer>> {
     if must_scorers.is_empty() {
         if removed_all_scorer_count > 0 {
@@ -178,7 +248,12 @@ fn effective_must_scorer(
             None
         }
     } else {
-        Some(intersect_candidate_scorers(must_scorers, num_docs))
+        Some(intersect_scorers(
+            must_scorers,
+            num_docs,
+            scoring_enabled,
+            bitmap_enabled,
+        ))
     }
 }
 
@@ -215,12 +290,13 @@ fn effective_should_scorer_for_union<TScoreCombiner: ScoreCombiner>(
     num_docs: u32,
     score_combiner_fn: impl Fn() -> TScoreCombiner,
     scoring_enabled: bool,
+    bitmap_enabled: bool,
 ) -> SpecializedScorer {
     if removed_all_scorer_count > 0 {
         if scoring_enabled {
             // Need to union to get score contributions from both
             let all_scorers: Vec<Box<dyn Scorer>> = vec![
-                into_box_scorer(should_scorer, &score_combiner_fn, num_docs),
+                into_box_scorer(should_scorer, &score_combiner_fn, num_docs, bitmap_enabled),
                 Box::new(AllScorer::new(max_doc)),
             ];
             SpecializedScorer::Other(Box::new(BufferedUnionScorer::build(
@@ -264,6 +340,7 @@ pub struct BooleanWeight<TScoreCombiner: ScoreCombiner> {
     weights: Vec<(Occur, Box<dyn Weight>)>,
     minimum_number_should_match: usize,
     scoring_enabled: bool,
+    bitmap_enabled: bool,
     disjunction_pruning: DisjunctionPruning,
     score_combiner_fn: Box<dyn Fn() -> TScoreCombiner + Sync + Send>,
 }
@@ -278,6 +355,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         BooleanWeight {
             weights,
             scoring_enabled,
+            bitmap_enabled: false,
             score_combiner_fn,
             minimum_number_should_match: 1,
             disjunction_pruning: DisjunctionPruning::Auto,
@@ -295,9 +373,15 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
             weights,
             minimum_number_should_match,
             scoring_enabled,
+            bitmap_enabled: false,
             score_combiner_fn,
             disjunction_pruning: DisjunctionPruning::Auto,
         }
+    }
+
+    pub(crate) fn with_bitmap_postings(mut self, enabled: bool) -> Self {
+        self.bitmap_enabled = enabled;
+        self
     }
 
     pub(crate) fn with_disjunction_pruning(mut self, pruning: DisjunctionPruning) -> Self {
@@ -316,9 +400,9 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
     }
 
     /// Returns true when the non-deferred clauses will enter a filtered Block-WAND /
-    /// Block-MaxScore scorer (`FilteredTermUnion` or `FilteredTermIntersection`) under
-    /// `ExecutionMode::Pruning`, so deferred fast-field `Occur::Must` clauses should be
-    /// constructed lazily with `CandidateHint::Pruned`.
+    /// Block-MaxScore scorer (`FilteredTermUnion`, `FilteredBlockMaxUnion`, or
+    /// `FilteredTermIntersection`) under `ExecutionMode::Pruning`, so deferred fast-field
+    /// `Occur::Must` clauses should be constructed lazily with `CandidateHint::Pruned`.
     ///
     /// Queries without frequency-bearing WAND drivers (for example `AllQuery AND
     /// TermPredicateQuery`), with active `Occur::MustNot` exclusions, or with non-constant-score
@@ -581,11 +665,13 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     should_scorers,
                     &score_combiner_fn,
                     num_docs,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
                 )),
                 1 => ShouldScorersCombinationMethod::Required(scorer_union(
                     should_scorers,
                     &score_combiner_fn,
                     num_docs,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
                 )),
                 n if num_of_should_scorers == n => {
                     // When num_of_should_scorers equals the number of should clauses,
@@ -682,6 +768,8 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                             combined_all_scorer_count,
                             reader.max_doc(),
                             num_docs,
+                            self.scoring_enabled,
+                            self.bitmap_enabled && reader.bitmap_postings_enabled,
                         )
                         .unwrap_or_else(|| Box::new(EmptyScorer))
                     };
@@ -695,6 +783,8 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     must_special_scorer_counts.num_all_scorers,
                     reader.max_doc(),
                     num_docs,
+                    self.scoring_enabled,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
                 ) {
                     None => {
                         // No MUST constraint: promote SHOULD to required.
@@ -706,6 +796,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                             num_docs,
                             &score_combiner_fn,
                             self.scoring_enabled,
+                            self.bitmap_enabled && reader.bitmap_postings_enabled,
                         )
                     }
                     Some(must_scorer) => {
@@ -717,7 +808,12 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                                 TScoreCombiner,
                             >::new(
                                 must_scorer,
-                                into_box_scorer(should_scorer, &score_combiner_fn, num_docs),
+                                into_box_scorer(
+                                    should_scorer,
+                                    &score_combiner_fn,
+                                    num_docs,
+                                    self.bitmap_enabled && reader.bitmap_postings_enabled,
+                                ),
                             )))
                         } else {
                             SpecializedScorer::Other(must_scorer)
@@ -753,17 +849,25 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                         must_special_scorer_counts.num_all_scorers,
                         reader.max_doc(),
                         num_docs,
+                        self.scoring_enabled,
+                        self.bitmap_enabled && reader.bitmap_postings_enabled,
                     ) {
                         None => should_scorer,
                         Some(must_scorer) => {
-                            let should_boxed =
-                                into_box_scorer(should_scorer, &score_combiner_fn, num_docs);
-                            SpecializedScorer::Other(intersect_candidate_scorers(
+                            let should_boxed = into_box_scorer(
+                                should_scorer,
+                                &score_combiner_fn,
+                                num_docs,
+                                self.bitmap_enabled && reader.bitmap_postings_enabled,
+                            );
+                            SpecializedScorer::Other(intersect_scorers(
                                 vec![
                                     UnpositionedScorer::from_positioned(must_scorer),
                                     UnpositionedScorer::from_positioned(should_boxed),
                                 ],
                                 num_docs,
+                                self.scoring_enabled,
+                                self.bitmap_enabled && reader.bitmap_postings_enabled,
                             ))
                         }
                     },
@@ -774,7 +878,32 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
             return Ok(include_scorer);
         }
 
-        let include_scorer_boxed = into_box_scorer(include_scorer, &score_combiner_fn, num_docs);
+        let include_scorer_boxed = into_box_scorer(
+            include_scorer,
+            &score_combiner_fn,
+            num_docs,
+            self.bitmap_enabled && reader.bitmap_postings_enabled,
+        );
+        if self.bitmap_enabled && reader.bitmap_postings_enabled
+            && !self.scoring_enabled
+            && include_scorer_boxed.has_fast_bitset()
+            // Positional and other expensive exclusions should probe inclusion candidates.
+            && exclude_scorers
+                .iter()
+                .all(|scorer| scorer.has_fast_bitset() || scorer.is::<TermScorer>())
+        {
+            let mut children = vec![include_scorer_boxed];
+            children.extend(
+                exclude_scorers
+                    .into_iter()
+                    .map(UnpositionedScorer::into_positioned),
+            );
+            return Ok(SpecializedScorer::Other(Box::new(BitmapCombination::new(
+                children,
+                BitmapOperation::Exclude,
+                num_docs,
+            ))));
+        }
         let scorer: Box<dyn Scorer> = if exclude_scorers.len() == 1 {
             let exclude_scorer = exclude_scorers.pop().unwrap();
             if exclude_scorer.is::<TermScorer>() {
@@ -869,7 +998,12 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                 ExecutionMode::Exhaustive,
             )
             .map(|specialized_scorer| {
-                into_box_scorer(specialized_scorer, &self.score_combiner_fn, num_docs)
+                into_box_scorer(
+                    specialized_scorer,
+                    &self.score_combiner_fn,
+                    num_docs,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
+                )
             })
         } else {
             self.complex_scorer(
@@ -879,7 +1013,12 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                 ExecutionMode::Exhaustive,
             )
             .map(|specialized_scorer| {
-                into_box_scorer(specialized_scorer, DoNothingCombiner::default, num_docs)
+                into_box_scorer(
+                    specialized_scorer,
+                    DoNothingCombiner::default,
+                    num_docs,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
+                )
             })
         }
     }
@@ -974,6 +1113,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                         SpecializedScorer::FilteredTermUnion { terms, filter },
                         &self.score_combiner_fn,
                         reader.num_docs(),
+                        self.bitmap_enabled && reader.bitmap_postings_enabled,
                     );
                     return Ok(Box::new(BasicPruningScorer::new(
                         union_scorer,
@@ -1005,6 +1145,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                         SpecializedScorer::FilteredTermIntersection { terms, filter },
                         &self.score_combiner_fn,
                         reader.num_docs(),
+                        self.bitmap_enabled && reader.bitmap_postings_enabled,
                     );
                     return Ok(Box::new(BasicPruningScorer::new(
                         intersection_scorer,
@@ -1093,12 +1234,22 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                             )
                         })
                         .collect();
-                let mut intersection = intersect_candidate_scorers(boxed_scorers, num_docs);
+                let mut intersection = intersect_scorers(
+                    boxed_scorers,
+                    num_docs,
+                    self.scoring_enabled,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
+                );
                 for_each_scorer(intersection.as_mut(), callback);
             }
             SpecializedScorer::FilteredTermUnion { .. }
             | SpecializedScorer::FilteredTermIntersection { .. } => {
-                let mut scorer = into_box_scorer(scorer, &self.score_combiner_fn, num_docs);
+                let mut scorer = into_box_scorer(
+                    scorer,
+                    &self.score_combiner_fn,
+                    num_docs,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
+                );
                 for_each_scorer(scorer.as_mut(), callback);
             }
             SpecializedScorer::Other(mut scorer) => {
@@ -1178,6 +1329,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                         SpecializedScorer::FilteredTermUnion { terms, filter },
                         &self.score_combiner_fn,
                         reader.num_docs(),
+                        self.bitmap_enabled && reader.bitmap_postings_enabled,
                     );
                     let mut scorer = BasicPruningScorer::new(union_scorer, threshold);
                     for_each_pruning_scorer(&mut scorer, callback);
@@ -1225,6 +1377,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                         SpecializedScorer::FilteredTermIntersection { terms, filter },
                         &self.score_combiner_fn,
                         reader.num_docs(),
+                        self.bitmap_enabled && reader.bitmap_postings_enabled,
                     );
                     let mut scorer = BasicPruningScorer::new(intersection_scorer, threshold);
                     for_each_pruning_scorer(&mut scorer, callback);
@@ -1300,16 +1453,85 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                             )
                         })
                         .collect();
-                let mut intersection = intersect_candidate_scorers(boxed_scorers, num_docs);
+                let mut intersection = intersect_scorers(
+                    boxed_scorers,
+                    num_docs,
+                    self.scoring_enabled,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
+                );
                 for_each_docset_buffered(intersection.as_mut(), &mut buffer, callback);
             }
             SpecializedScorer::FilteredTermUnion { .. }
             | SpecializedScorer::FilteredTermIntersection { .. } => {
-                let mut scorer = into_box_scorer(scorer, DoNothingCombiner::default, num_docs);
+                let mut scorer = into_box_scorer(
+                    scorer,
+                    DoNothingCombiner::default,
+                    num_docs,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
+                );
                 for_each_docset_buffered(scorer.as_mut(), &mut buffer, callback);
             }
             SpecializedScorer::Other(mut scorer) => {
                 for_each_docset_buffered(scorer.as_mut(), &mut buffer, callback);
+            }
+        }
+        Ok(())
+    }
+
+    fn for_each_no_score_batch(
+        &self,
+        reader: &SegmentReader,
+        callback: &mut dyn FnMut(crate::DocSetBatch<'_>),
+    ) -> crate::Result<()> {
+        let scorer = self.complex_scorer(
+            reader,
+            1.0,
+            DoNothingCombiner::default,
+            ExecutionMode::Exhaustive,
+        )?;
+        let num_docs = reader.num_docs();
+
+        match scorer {
+            SpecializedScorer::TermUnion(mut term_scorers) => {
+                if term_scorers.len() == 1 {
+                    let mut term_scorer = term_scorers.pop().unwrap();
+                    crate::query::weight::for_each_docset_batch(&mut term_scorer, callback);
+                } else {
+                    let mut union_scorer =
+                        BufferedUnionScorer::build(term_scorers, &self.score_combiner_fn, num_docs);
+                    crate::query::weight::for_each_docset_batch(&mut union_scorer, callback);
+                }
+            }
+            SpecializedScorer::TermIntersection(term_scorers) => {
+                let boxed_scorers: Vec<UnpositionedScorer> =
+                    term_scorers
+                        .into_iter()
+                        .map(|term_scorer| {
+                            UnpositionedScorer::from_positioned(
+                                Box::new(term_scorer) as Box<dyn Scorer>
+                            )
+                        })
+                        .collect();
+                let mut intersection = intersect_scorers(
+                    boxed_scorers,
+                    num_docs,
+                    self.scoring_enabled,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
+                );
+                crate::query::weight::for_each_docset_batch(intersection.as_mut(), callback);
+            }
+            SpecializedScorer::FilteredTermUnion { .. }
+            | SpecializedScorer::FilteredTermIntersection { .. } => {
+                let mut scorer = into_box_scorer(
+                    scorer,
+                    DoNothingCombiner::default,
+                    num_docs,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
+                );
+                crate::query::weight::for_each_docset_batch(scorer.as_mut(), callback);
+            }
+            SpecializedScorer::Other(mut scorer) => {
+                crate::query::weight::for_each_docset_batch(scorer.as_mut(), callback);
             }
         }
         Ok(())
@@ -1326,6 +1548,7 @@ fn is_include_occur(occur: Occur) -> bool {
 #[cfg(test)]
 mod tests {
     use std::ops::Bound;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     use columnar::ColumnType;
@@ -1333,6 +1556,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{BooleanWeight, ExecutionMode};
+    use crate::query::bitmap_combination::BitmapCombination;
     use crate::query::{
         AllQuery, Bm25Weight, BooleanQuery, CandidateHint, DisjunctionPruning, EnableScoring,
         ExactPostings, ExcludedDocSet, ExclusionSet, FastFieldTermSetQuery, Occur, Query,
@@ -1564,7 +1788,15 @@ mod tests {
         let mut schema = Schema::builder();
         let value = schema.add_u64_field("value", FAST);
         let tag = schema.add_text_field("tag", TextOptions::default().set_fast("raw"));
-        let text = schema.add_text_field("text", TEXT);
+        let text = schema.add_text_field(
+            "text",
+            TEXT.set_indexing_options(
+                TEXT.get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_bitmap_postings(true),
+            ),
+        );
         let index = Index::create_in_ram(schema.build());
         let mut writer = index.writer_for_tests()?;
         for doc in 0..DOCUMENTS {
@@ -1590,6 +1822,7 @@ mod tests {
         writer.commit()?;
         let searcher = index.reader()?.searcher();
         let reader = searcher.segment_reader(0);
+        let hit_bitmap_with_deferred_fast_must = AtomicBool::new(false);
 
         proptest!(ProptestConfig::with_cases(128), |(
             clauses in prop::collection::vec(arb_clause(DOCUMENTS), 2..=5),
@@ -1603,13 +1836,24 @@ mod tests {
                 min_should,
             );
             let expected_docs = expected_boolean_matches(&clauses, min_should, DOCUMENTS);
+            let has_fast_must = clauses
+                .iter()
+                .any(|(o, leaf)| *o == Occur::Must && leaf.is_fast_field());
 
             for scoring in [
                 EnableScoring::disabled_from_searcher(&searcher),
+                EnableScoring::disabled_from_searcher(&searcher).with_bitmap_postings(true),
                 EnableScoring::enabled_from_searcher(&searcher),
             ] {
                 let weight = query.weight(scoring).unwrap();
                 let mut ordinary = weight.scorer(reader, 1.0).unwrap();
+                if !scoring.is_scoring_enabled()
+                    && scoring.bitmap_postings_enabled()
+                    && has_fast_must
+                    && ordinary.is::<BitmapCombination>()
+                {
+                    hit_bitmap_with_deferred_fast_must.store(true, Ordering::Relaxed);
+                }
                 let mut ordinary_results = Vec::new();
                 while ordinary.doc() != TERMINATED {
                     ordinary_results.push((ordinary.doc(), ordinary.score()));
@@ -1618,7 +1862,15 @@ mod tests {
                 let ordinary_docs: Vec<_> = ordinary_results.iter().map(|&(doc, _)| doc).collect();
                 prop_assert_eq!(&ordinary_docs, &expected_docs);
 
-                if scoring.is_scoring_enabled() {
+                if !scoring.is_scoring_enabled() {
+                    let mut batch_docs = Vec::new();
+                    weight
+                        .for_each_no_score_batch(reader, &mut |batch| {
+                            batch.for_each_doc_block(|docs| batch_docs.extend_from_slice(docs));
+                        })
+                        .unwrap();
+                    prop_assert_eq!(&batch_docs, &expected_docs);
+                } else {
                     let mut pruned_results = Vec::new();
                     weight
                         .for_each_pruning(Score::MIN, reader, &mut |doc, score| {
@@ -1667,6 +1919,184 @@ mod tests {
             }
         });
 
+        assert!(
+            hit_bitmap_with_deferred_fast_must.load(Ordering::Relaxed),
+            "proptest should cover BitmapCombination with deferred fast-field Must clauses"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bitmap_combinations_respect_query_setting() -> crate::Result<()> {
+        use crate::query::bitmap_combination::BitmapCombination;
+        use crate::query::{BooleanQuery, EnableScoring, Occur, Query, TermQuery, TermSetQuery};
+        use crate::schema::{IndexRecordOption, Schema, TEXT};
+        use crate::{Index, Term, TERMINATED};
+
+        for stored_bitmaps in [false, true] {
+            let mut schema = Schema::builder();
+            let text = schema.add_text_field(
+                "text",
+                TEXT.set_indexing_options(
+                    TEXT.get_indexing_options()
+                        .unwrap()
+                        .clone()
+                        .set_bitmap_postings(stored_bitmaps),
+                ),
+            );
+            let mut index = Index::create_in_ram(schema.build());
+            let mut writer = index.writer_for_tests()?;
+            for doc in 0..1024 {
+                let mut terms = Vec::new();
+                for (term, divisor) in [("alpha", 2), ("beta", 3), ("gamma", 5)] {
+                    if doc % divisor == 0 {
+                        terms.push(term);
+                    }
+                }
+                writer.add_document(doc!(text => terms.join(" ")))?;
+            }
+            writer.commit()?;
+
+            for (enabled, opt_in) in [(false, false), (false, true), (true, false), (true, true)] {
+                index.settings_mut().bitmap_postings.use_for_queries = enabled;
+                let searcher = index.reader()?.searcher();
+                let reader = searcher.segment_reader(0);
+                for occur in [Occur::Should, Occur::Must, Occur::MustNot] {
+                    let set = TermSetQuery::new([
+                        Term::from_field_text(text, "alpha"),
+                        Term::from_field_text(text, "gamma"),
+                    ]);
+                    let query = BooleanQuery::new(vec![
+                        (
+                            if occur == Occur::Should {
+                                occur
+                            } else {
+                                Occur::Must
+                            },
+                            Box::new(set),
+                        ),
+                        (
+                            occur,
+                            Box::new(TermQuery::new(
+                                Term::from_field_text(text, "beta"),
+                                IndexRecordOption::Basic,
+                            )),
+                        ),
+                    ]);
+                    let weight = query.weight(
+                        EnableScoring::disabled_from_searcher(&searcher)
+                            .with_bitmap_postings(opt_in),
+                    )?;
+                    let mut scorer = weight.scorer(reader, 1.0)?;
+                    assert_eq!(
+                        scorer.is::<BitmapCombination>(),
+                        enabled && opt_in,
+                        "stored_bitmaps={stored_bitmaps}, enabled={enabled}, opt_in={opt_in}, \
+                         occur={occur:?}"
+                    );
+                    let mut actual = Vec::new();
+                    crate::query::for_each_docset_batch(scorer.as_mut(), &mut |batch| {
+                        batch.for_each_doc_block(|docs| actual.extend_from_slice(docs));
+                    });
+                    let expected: Vec<_> = (0..1024)
+                        .filter(|doc| {
+                            let set = doc % 2 == 0 || doc % 5 == 0;
+                            let term = doc % 3 == 0;
+                            match occur {
+                                Occur::Should => set || term,
+                                Occur::Must => set && term,
+                                Occur::MustNot => set && !term,
+                            }
+                        })
+                        .collect();
+                    assert_eq!(actual, expected);
+                    assert_eq!(scorer.doc(), TERMINATED);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bitmap_phrase_intersections_use_selective_candidates() -> crate::Result<()> {
+        use crate::query::bitmap_combination::BitmapCombination;
+        use crate::query::{EnableScoring, QueryParser};
+        use crate::schema::{Schema, FAST, TEXT};
+        use crate::{Index, TERMINATED};
+
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field(
+            "text",
+            TEXT.set_indexing_options(
+                TEXT.get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_bitmap_postings(true),
+            ),
+        );
+        let number = schema.add_u64_field("number", FAST);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer = index.writer_for_tests()?;
+        for doc in 0..4096u32 {
+            let mut terms = vec![if doc % 3 == 0 { "of the" } else { "of gap the" }];
+            for (term, frequency) in [
+                ("selective", 512),
+                ("half", 2048),
+                ("abovehalf", 2049),
+                ("dense", 3072),
+            ] {
+                if doc < frequency {
+                    terms.push(term);
+                }
+            }
+            writer.add_document(doc!(text => terms.join(" "), number => u64::from(doc)))?;
+        }
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let reader = searcher.segment_reader(0);
+        let mut ordinary_reader = reader.clone();
+        ordinary_reader.bitmap_postings_enabled = false;
+        let parser = QueryParser::for_index(&index, vec![text]);
+        for (expression, bitmap) in [
+            (r#"selective AND "of the""#, false),
+            (r#""of the" AND selective"#, false),
+            (r#"half AND "of the""#, false),
+            (r#"abovehalf AND "of the""#, true),
+            (r#"dense AND "of the""#, true),
+            (r#"dense AND "of the" AND selective"#, false),
+            (r#"selective AND (dense OR "of the")"#, true),
+            (r#"selective OR "of the""#, true),
+            ("selective AND dense", true),
+            ("dense AND number:[0 TO 511]", true),
+            (r#"selective -"of the""#, false),
+            (r#"selective -("of the"^2)"#, false),
+            (r#"abovehalf -"of the" -selective"#, false),
+            ("dense -selective", true),
+        ] {
+            let query = parser.parse_query(expression)?;
+            let weight = query.weight(
+                EnableScoring::disabled_from_searcher(&searcher).with_bitmap_postings(true),
+            )?;
+            let mut scorer = weight.scorer(reader, 1.0)?;
+            assert_eq!(scorer.is::<BitmapCombination>(), bitmap, "{expression}");
+            let mut expected_scorer = weight.scorer(&ordinary_reader, 1.0)?;
+            let mut expected = Vec::new();
+            while expected_scorer.doc() != TERMINATED {
+                expected.push(expected_scorer.doc());
+                expected_scorer.advance();
+            }
+            let mut actual = Vec::new();
+            crate::query::for_each_docset_batch(scorer.as_mut(), &mut |batch| {
+                batch.for_each_doc_block(|docs| actual.extend_from_slice(docs));
+            });
+            assert_eq!(actual, expected, "{expression}");
+            assert!(!actual.is_empty(), "{expression}");
+            let scored = query
+                .weight(EnableScoring::enabled_from_searcher(&searcher))?
+                .scorer(reader, 1.0)?;
+            assert!(!scored.is::<BitmapCombination>(), "{expression}");
+        }
         Ok(())
     }
 
@@ -1710,9 +2140,13 @@ mod tests {
             let scored = term_query
                 .weight(EnableScoring::enabled_from_searcher(&searcher))?
                 .scorer(reader, 1.0)?;
+            let mut ordinary_reader = reader.clone();
+            ordinary_reader.bitmap_postings_enabled = false;
             let unscored = term_query
-                .weight(EnableScoring::disabled_from_searcher(&searcher))?
-                .scorer(reader, 1.0)?;
+                .weight(
+                    EnableScoring::disabled_from_searcher(&searcher).with_bitmap_postings(true),
+                )?
+                .scorer(&ordinary_reader, 1.0)?;
             let other_field = parser
                 .parse_query("other:a")?
                 .weight(EnableScoring::enabled_from_searcher(&searcher))?
@@ -1753,8 +2187,10 @@ mod tests {
                                 baseline.advance();
                             }
                             if boost == 1.0 && mode == DisjunctionPruning::Auto {
-                                let disabled = query
-                                    .weight(EnableScoring::disabled_from_searcher(&searcher))?;
+                                let disabled = query.weight(
+                                    EnableScoring::disabled_from_searcher(&searcher)
+                                        .with_bitmap_postings(true),
+                                )?;
                                 let mut docs = Vec::new();
                                 disabled.for_each_no_score(reader, &mut |block| {
                                     docs.extend_from_slice(block);

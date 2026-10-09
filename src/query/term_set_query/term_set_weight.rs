@@ -199,6 +199,7 @@ pub struct TermSetWeight {
     fast_substrate: FastSubstrate,
     exact_postings: ExactPostings,
     strategy_config: TermSetStrategyConfig,
+    bitmap_enabled: bool,
     dict_cache: SegmentDictCache,
 }
 
@@ -281,6 +282,7 @@ impl TermSetWeight {
             fast_substrate,
             exact_postings,
             strategy_config,
+            bitmap_enabled: false,
             dict_cache: SegmentDictCache::default(),
         })
     }
@@ -323,8 +325,14 @@ impl TermSetWeight {
             fast_substrate,
             exact_postings,
             strategy_config,
+            bitmap_enabled: false,
             dict_cache: SegmentDictCache::default(),
         })
+    }
+
+    pub(crate) fn with_bitmap_postings(mut self, enabled: bool) -> Self {
+        self.bitmap_enabled = enabled;
+        self
     }
 
     fn record_strategy_tag(&self, tag: StrategyTag) {
@@ -342,7 +350,8 @@ impl TermSetWeight {
         if explicit.terms_bytes.is_empty() {
             return Ok(Box::new(EmptyScorer));
         }
-        let weight = AutomatonWeight::new(self.field, SetDfaWrapper(explicit.fst()?));
+        let weight = AutomatonWeight::new(self.field, SetDfaWrapper(explicit.fst()?))
+            .with_bitmap_postings(self.bitmap_enabled);
         weight.scorer(reader, boost)
     }
 
@@ -690,8 +699,9 @@ impl TermSetWeight {
         let k_prime = ords_arc.len() as u32;
         let sorted_ords = Arc::clone(&ords_arc);
         let postings_cb = retained_keys.map(|keys| {
-            Box::new(move || bitset_from_postings_scorer(reader, self.field, &keys, boost))
-                as Box<dyn FnOnce() -> crate::Result<Box<dyn Scorer>> + '_>
+            Box::new(move || {
+                bitset_from_postings_scorer(reader, self.field, &keys, boost, self.bitmap_enabled)
+            }) as Box<dyn FnOnce() -> crate::Result<Box<dyn Scorer>> + '_>
         });
 
         dispatch_u64_column(
@@ -781,7 +791,13 @@ impl TermSetWeight {
                 };
                 let postings_cb = (self.exact_postings == ExactPostings::Available).then(|| {
                     Box::new(move || {
-                        bitset_from_postings_scorer(reader, self.field, pruned_bytes, boost)
+                        bitset_from_postings_scorer(
+                            reader,
+                            self.field,
+                            pruned_bytes,
+                            boost,
+                            self.bitmap_enabled,
+                        )
                     })
                         as Box<dyn FnOnce() -> crate::Result<Box<dyn Scorer>> + '_>
                 });
@@ -863,7 +879,13 @@ impl TermSetWeight {
                 }
                 if (k as f64) / (max_doc as f64) <= self.strategy_config.bitset_max_density_multi {
                     self.record_strategy_tag(StrategyTag::Bitset);
-                    bitset_from_postings_scorer(reader, self.field, &explicit.terms_bytes, boost)
+                    bitset_from_postings_scorer(
+                        reader,
+                        self.field,
+                        &explicit.terms_bytes,
+                        boost,
+                        self.bitmap_enabled,
+                    )
                 } else {
                     self.record_strategy_tag(StrategyTag::Automaton);
                     self.automaton_scorer(reader, explicit, boost)
@@ -883,6 +905,7 @@ impl TermSetWeight {
                     Bound::Unbounded => {}
                 }
                 let mut stream: TermStreamer<'_> = builder.into_stream()?;
+                let use_bmap = self.bitmap_enabled && reader.bitmap_postings_enabled;
                 let mut doc_bitset = BitSet::with_max_value(max_doc);
                 let mut matched_terms: u64 = 0;
 
@@ -890,7 +913,7 @@ impl TermSetWeight {
                     let mut batcher = U64Batcher::new();
                     let mut on_match = |info: &TermInfo, _val: u64| -> crate::Result<()> {
                         matched_terms += 1;
-                        or_term_info_into_bitset(&inverted_index, info, &mut doc_bitset)
+                        or_term_info_into_bitset(&inverted_index, info, &mut doc_bitset, use_bmap)
                     };
                     while stream.advance() {
                         if let Ok(bytes) = <[u8; 8]>::try_from(stream.key()) {
@@ -908,7 +931,7 @@ impl TermSetWeight {
                     let mut batcher = BytesBatcher::new();
                     let mut on_match = |info: &TermInfo, _key: &[u8]| -> crate::Result<()> {
                         matched_terms += 1;
-                        or_term_info_into_bitset(&inverted_index, info, &mut doc_bitset)
+                        or_term_info_into_bitset(&inverted_index, info, &mut doc_bitset, use_bmap)
                     };
                     while stream.advance() {
                         batcher.push(

@@ -121,7 +121,8 @@ impl TermQuery {
             index_record_option,
             bm25_weight,
             scoring_enabled,
-        ))
+        )
+        .with_bitmap_postings(enable_scoring.bitmap_postings_enabled()))
     }
 }
 
