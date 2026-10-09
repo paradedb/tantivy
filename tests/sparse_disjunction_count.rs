@@ -17,12 +17,16 @@ fn assert_count(query: &dyn Query, ordinary: &Searcher, bitmap: &Searcher) -> ta
             scorer.count_including_deleted()
         } as usize;
     }
-    let bitmap_weight = query.weight(
-        EnableScoring::disabled_from_searcher(bitmap).with_bitmap_postings(true),
-    )?;
-    let optimized = bitmap.segment_readers().iter().try_fold(0usize, |total, reader| {
-        bitmap_weight.count(reader).map(|count| total + count as usize)
-    })?;
+    let bitmap_weight =
+        query.weight(EnableScoring::disabled_from_searcher(bitmap).with_bitmap_postings(true))?;
+    let optimized = bitmap
+        .segment_readers()
+        .iter()
+        .try_fold(0usize, |total, reader| {
+            bitmap_weight
+                .count(reader)
+                .map(|count| total + count as usize)
+        })?;
     assert_eq!(optimized, expected, "{query:?}");
     assert_eq!(bitmap.search(query, &Count)?, expected, "{query:?}");
     assert_eq!(
