@@ -58,6 +58,69 @@ fn enclosing_intervals_preserve_topk_and_running_threshold_many_seeds() {
     }
 }
 
+/// Clusters scored exactly join the threshold as zero-width intervals. With every quantized
+/// interval enclosing its exact score, the running and boundary thresholds never exceed the true
+/// k-th score, no true top-k quantized row is pruned, and no exact row stays a candidate.
+#[test]
+fn exact_rows_never_prune_an_enclosed_top_k_row_many_seeds() {
+    for seed in 0..512 {
+        let mut rng = fastrand::Rng::with_seed(seed);
+        let n = 97;
+        let k = 1 + rng.usize(0..20);
+        let mut truth = Vec::new();
+        let mut exact_rows = Vec::new();
+        let mut scan = BoundaryHarness::new(n);
+        for cluster in (0..n).step_by(11) {
+            let exact = rng.bool();
+            if !exact {
+                scan.begin_cluster(k);
+            }
+            for row in cluster..(cluster + 11).min(n) {
+                let score = rng.f32() * 20.0 - 10.0;
+                truth.push(score);
+                if exact {
+                    exact_rows.push(row);
+                    scan.push_exact(score, k);
+                    continue;
+                }
+                let sigma = 0.001 + rng.f32().powi(3) * 10.0;
+                let estimate = score + (rng.f32() * 2.0 - 1.0) * QUANTIZED_BOUNDARY_KAPPA * sigma;
+                scan.push(
+                    row, row as u32, 0.0, estimate, estimate, sigma, 1.0, 1.0, 0.0,
+                );
+            }
+            if !exact {
+                scan.finish_cluster_bound();
+            }
+            let running = scan.running_pessimistic_kth(k, QUANTIZED_BOUNDARY_KAPPA);
+            assert_eq!(
+                running,
+                scan.pessimistic_kth(k, QUANTIZED_BOUNDARY_KAPPA),
+                "seed {seed}, cluster {cluster}"
+            );
+            if let Some(threshold) = running {
+                let mut sorted = truth.clone();
+                sorted.sort_by(|a, b| b.total_cmp(a));
+                assert!(threshold.0 .0 <= sorted[k - 1] + 1e-5, "seed {seed}");
+            }
+        }
+        let mut order = (0..n).collect::<Vec<_>>();
+        order.sort_by(|&a, &b| truth[b].total_cmp(&truth[a]));
+        scan.band(k, QUANTIZED_BOUNDARY_KAPPA);
+        for row in &order[..k] {
+            assert!(
+                exact_rows.contains(row) || scan.candidates.rows.contains(row),
+                "seed {seed}, true row {row}"
+            );
+        }
+        assert!(scan
+            .candidates
+            .rows
+            .iter()
+            .all(|row| !exact_rows.contains(row)));
+    }
+}
+
 fn survivors(estimates: &[f32], sigmas: &[f32], k: usize, kappa: f32) -> Vec<usize> {
     let mut scan = BoundaryHarness::new(estimates.len());
     for (row, (&estimate, &sigma)) in estimates.iter().zip(sigmas).enumerate() {

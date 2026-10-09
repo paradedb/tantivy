@@ -15,7 +15,7 @@ use quant_model::f16::f16_to_f32;
 
 use super::backend::{Estimate, Threshold};
 use super::blocks::{BlockMetadata, Blocks};
-use super::cluster_plan::{LayerCosts, ReadCost};
+use super::cluster_plan::{BatchCosts, ClusterBatch, LayerCosts, ReadCost};
 use super::flat::IdMap;
 use super::header::{read_centroid_header, read_vector_header, CentroidSlot, VectorEntry};
 use super::ivf::{decode_row, IvfIndex, CENTROIDS_EXT};
@@ -1397,6 +1397,40 @@ impl QuantizedClusterReader<'_> {
     }
 }
 
+/// The cost of reading full-precision rows of one cluster's `column` (rows of `stride` bytes):
+/// the distinct storage blocks the selected rows touch, or their bytes without block geometry.
+/// `None` selects all `rows` rows, read as one span.
+fn exact_read_cost(
+    column: &FileSlice,
+    stride: usize,
+    offsets: Option<&[usize]>,
+    rows: usize,
+) -> ReadCost {
+    let in_blocks = column.storage_block_len().is_some();
+    let Some(offsets) = offsets else {
+        return range_cost(column, 0..rows * stride, in_blocks);
+    };
+    if !in_blocks {
+        return ReadCost(offsets.len() * stride);
+    }
+    // Ascending rows: a block is new iff it lies past the last block counted.
+    let mut blocks = 0usize;
+    let mut next = 0usize;
+    for &offset in offsets {
+        let Some((first, last)) =
+            storage_block_span(column, offset * stride..(offset + 1) * stride)
+        else {
+            continue;
+        };
+        let first = first.max(next);
+        if first <= last {
+            blocks += last - first + 1;
+            next = last + 1;
+        }
+    }
+    ReadCost(blocks)
+}
+
 /// Storage blocks a byte range of `slice` spans, or its bytes without block geometry.
 fn range_cost(slice: &FileSlice, range: Range<usize>, in_blocks: bool) -> ReadCost {
     if range.is_empty() {
@@ -2681,6 +2715,45 @@ impl VectorIndexReader {
             )));
         }
         self.rows_slice.read_column(0, row..row + 1)
+    }
+
+    /// Every way to read `batch` at its stage, from slice geometry alone: exactly at full
+    /// precision, and at quantized `layer` (`None` at `Final`) sparsely or as a whole band. With
+    /// `with_exact` off the exact read is left unpriced, never cheaper than another. `rows` and
+    /// `ranges` are scratch.
+    pub(crate) fn batch_costs(
+        &self,
+        layer: Option<usize>,
+        batch: &ClusterBatch<'_>,
+        with_exact: bool,
+        rows: &mut Vec<usize>,
+        ranges: &mut Vec<Range<usize>>,
+    ) -> crate::Result<BatchCosts> {
+        let exact = if with_exact {
+            exact_read_cost(
+                &self.rows_slice.column(batch.cluster, 0)?,
+                self.options.bytes_per_vector(),
+                batch.selection.offsets(),
+                batch.rows.len(),
+            )
+        } else {
+            ReadCost(usize::MAX)
+        };
+        let layer = match layer {
+            Some(layer) => {
+                let field = self.quantization.as_ref().ok_or_else(|| {
+                    DataCorruption::comment_only("quantized read costs need quantized storage")
+                })?;
+                Some(field.layers()[layer].read_costs(
+                    batch.cluster,
+                    batch.selection.offsets(),
+                    rows,
+                    ranges,
+                )?)
+            }
+            None => None,
+        };
+        Ok(BatchCosts { exact, layer })
     }
 
     /// Fetches increasing vector rows through a storage-aware range plan.
@@ -3992,5 +4065,36 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// Exact reads cost the distinct storage blocks the selected rows touch, a whole cluster its
+    /// span; without block geometry, bytes.
+    #[test]
+    fn exact_read_cost_counts_distinct_blocks_then_bytes() {
+        // 100-byte blocks, 40-byte rows from offset 0: rows 0-1 lie in block 0, row 2 straddles
+        // blocks 0-1, rows 3-4 lie in block 1, row 5 in block 2, row 7 straddles blocks 2-3.
+        let file = FileSlice::new(Arc::new(BlockTrackedBytes {
+            bytes: vec![0; 1000],
+            reads: Default::default(),
+            block_len: 100,
+        }));
+        let column = file.slice(0..400);
+        let cost = |offsets: Option<&[usize]>| exact_read_cost(&column, 40, offsets, 10).0;
+        assert_eq!(cost(Some(&[0, 1])), 1);
+        assert_eq!(cost(Some(&[0, 3])), 2);
+        assert_eq!(cost(Some(&[2])), 2, "a straddling row counts both blocks");
+        assert_eq!(
+            cost(Some(&[1, 2, 3])),
+            2,
+            "blocks shared by rows count once"
+        );
+        assert_eq!(cost(Some(&[0, 3, 5, 7])), 4);
+        assert_eq!(cost(None), 4, "all rows span blocks 0-3");
+
+        let plain = FileSlice::from(vec![0u8; 1000]);
+        let column = plain.slice(0..400);
+        let cost = |offsets: Option<&[usize]>| exact_read_cost(&column, 40, offsets, 10).0;
+        assert_eq!(cost(Some(&[0, 9])), 80);
+        assert_eq!(cost(None), 400);
     }
 }

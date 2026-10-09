@@ -90,9 +90,11 @@ impl ClusterBatch<'_> {
     }
 }
 
-/// How a batch's rows are read at a quantized layer.
+/// How a batch's rows are read at its stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadPlan {
+    /// The selected rows at full precision, scored exactly: the rows finish here.
+    Exact,
     /// The selected rows' code runs, the layer's sidecar span, and at layer 0 the residual
     /// norms.
     Sparse,
@@ -136,5 +138,35 @@ impl LayerCosts {
             Some(sparse) if sparse < self.full => ReadPlan::Sparse,
             _ => ReadPlan::Full,
         }
+    }
+
+    /// The cheaper of the two quantized reads.
+    pub(crate) fn cheapest(&self) -> ReadCost {
+        self.sparse
+            .map_or(self.full, |sparse| sparse.min(self.full))
+    }
+}
+
+/// Every way to read one batch at its stage, priced from slice geometry alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BatchCosts {
+    /// The selected rows' full-precision reads: the distinct storage blocks they touch.
+    pub(crate) exact: ReadCost,
+    /// The quantized reads; `None` at `Final`, where only exact scoring remains.
+    pub(crate) layer: Option<LayerCosts>,
+}
+
+impl BatchCosts {
+    /// Exact only when strictly cheaper than the cheaper quantized read, so ties stay
+    /// quantized; otherwise the layer's own plan. The rerank of quantized rows is not priced,
+    /// which keeps the rule conservative toward quantized reads.
+    pub(crate) fn plan(&self, exact_enabled: bool) -> ReadPlan {
+        let Some(layer) = self.layer else {
+            return ReadPlan::Exact;
+        };
+        if exact_enabled && self.exact < layer.cheapest() {
+            return ReadPlan::Exact;
+        }
+        layer.plan()
     }
 }

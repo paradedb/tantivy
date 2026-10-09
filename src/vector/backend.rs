@@ -362,6 +362,8 @@ pub struct LayerProbeStats {
     survivors: usize,
     sparse_clusters: usize,
     full_clusters: usize,
+    exact_clusters: usize,
+    exact_rows: usize,
 }
 
 /// Candidate identities at quantized stage boundaries.
@@ -452,6 +454,11 @@ impl serde::Serialize for LayerProbeStatsSet {
                 &layer.sparse_clusters,
             )?;
             map.serialize_entry(&format!("layer{index}_full_clusters"), &layer.full_clusters)?;
+            map.serialize_entry(
+                &format!("layer{index}_exact_clusters"),
+                &layer.exact_clusters,
+            )?;
+            map.serialize_entry(&format!("layer{index}_exact_rows"), &layer.exact_rows)?;
             map.serialize_entry(&format!("boundary{index}_ns"), &layer.boundary_ns)?;
         }
         map.end()
@@ -483,6 +490,16 @@ impl LayerProbeStats {
     /// Clusters read as a whole band at this layer.
     pub fn full_clusters(&self) -> usize {
         self.full_clusters
+    }
+
+    /// Clusters whose rows were scored exactly, and finished, at this layer.
+    pub fn exact_clusters(&self) -> usize {
+        self.exact_clusters
+    }
+
+    /// Rows scored exactly, and finished, at this layer.
+    pub fn exact_rows(&self) -> usize {
+        self.exact_rows
     }
 }
 
@@ -696,9 +713,13 @@ impl ProbeStats {
         stats.scan_ns += elapsed_ns;
     }
 
-    fn record_layer_read(&mut self, layer: usize, plan: ReadPlan) {
+    fn record_layer_read(&mut self, layer: usize, plan: ReadPlan, rows: usize) {
         let stats = self.layers.layer_mut(layer);
         match plan {
+            ReadPlan::Exact => {
+                stats.exact_clusters += 1;
+                stats.exact_rows += rows;
+            }
             ReadPlan::Sparse => stats.sparse_clusters += 1,
             ReadPlan::Full => stats.full_clusters += 1,
         }
@@ -1359,6 +1380,33 @@ impl QuantizedCandidates {
                 );
             }
         }
+    }
+
+    /// Removes the candidates at `ranges`, which ascend and do not overlap.
+    fn remove_ranges(&mut self, ranges: &[Range<usize>]) {
+        fn compact<T: Copy>(column: &mut Vec<T>, ranges: &[Range<usize>]) {
+            let mut write = 0;
+            let mut read = 0;
+            for range in ranges {
+                column.copy_within(read..range.start, write);
+                write += range.start - read;
+                read = range.end;
+            }
+            let len = column.len();
+            column.copy_within(read..len, write);
+            column.truncate(write + len - read);
+        }
+        debug_assert!(ranges.windows(2).all(|pair| pair[0].end <= pair[1].start));
+        compact(&mut self.rows, ranges);
+        compact(&mut self.docs, ranges);
+        compact(&mut self.bases, ranges);
+        compact(&mut self.raw_prefixes, ranges);
+        compact(&mut self.estimates, ranges);
+        compact(&mut self.sigmas, ranges);
+        compact(&mut self.residual_norm_squared, ranges);
+        compact(&mut self.gammas, ranges);
+        compact(&mut self.sign_query_error_terms, ranges);
+        compact(&mut self.arithmetic_variances, ranges);
     }
 
     fn replace_with_boundary_survivors(&mut self, survivors: &[QuantizedCandidate]) {
@@ -2237,6 +2285,10 @@ impl BoundaryHarness {
         self.candidates.finish_cluster(start, bound);
     }
 
+    fn push_exact(&mut self, score: f32, k: usize) {
+        self.bound(k).push_exact(score);
+    }
+
     fn running_pessimistic_kth(&mut self, k: usize, kappa: f32) -> Option<Threshold> {
         assert_eq!(self.candidates.kappa, kappa);
         self.bound(k)
@@ -2335,6 +2387,7 @@ fn read_layer(
     let band = match plan {
         ReadPlan::Full => Some(reader.read_batch_in_block(batch.cluster, batch.rows.clone())?),
         ReadPlan::Sparse => None,
+        ReadPlan::Exact => unreachable!("exact batches are scored at full precision"),
     };
     score_layer(
         query,
@@ -2376,32 +2429,62 @@ fn survivor_cluster(index: &IvfIndex, row: usize, mut cluster: usize) -> crate::
     Ok(cluster)
 }
 
-/// The cheaper read of `batch` at `reader`'s layer, from slice geometry alone.
-fn plan_read(
-    reader: &QuantizedLayerReader,
+/// The cheapest way to read `batch` at quantized `layer`, from slice geometry alone: exactly
+/// (when `exact_enabled`), sparsely, or as a whole band.
+fn plan_batch(
+    reader: &VectorIndexReader,
+    layer: usize,
     batch: &ClusterBatch<'_>,
+    exact_enabled: bool,
     rows: &mut LayerRows,
 ) -> crate::Result<ReadPlan> {
-    let costs = reader.read_costs(
-        batch.cluster,
-        batch.selection.offsets(),
+    #[cfg(test)]
+    if FORCED_EXACT_RULE
+        .get()
+        .is_some_and(|rule| rule(batch.cluster, layer))
+    {
+        return Ok(ReadPlan::Exact);
+    }
+    let costs = reader.batch_costs(
+        Some(layer),
+        batch,
+        exact_enabled,
         &mut rows.selected_rows,
         &mut rows.read_ranges,
     )?;
     #[cfg(test)]
-    if let Some(plan) = FORCED_READ_PLAN.get() {
+    if let Some(forced) = FORCED_READ_PLAN.get() {
         // A whole-cluster selection has no sparse read.
-        if plan == ReadPlan::Full || costs.sparse.is_some() {
-            return Ok(plan);
+        if forced != ReadPlan::Sparse || costs.layer.is_some_and(|layer| layer.sparse.is_some()) {
+            return Ok(forced);
         }
     }
-    Ok(costs.plan())
+    Ok(costs.plan(exact_enabled))
 }
 
 #[cfg(test)]
 thread_local! {
     static FORCED_READ_PLAN: std::cell::Cell<Option<ReadPlan>> =
         const { std::cell::Cell::new(None) };
+    static FORCED_EXACT_RULE: std::cell::Cell<Option<ExactRule>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test override of the exact plan: whether `(cluster, layer)` is scored exactly.
+#[cfg(test)]
+pub(crate) type ExactRule = fn(usize, usize) -> bool;
+
+/// Scores the `(cluster, layer)` batches `rule` selects exactly on this thread until the guard
+/// drops; the layout decides the rest.
+#[cfg(test)]
+pub(crate) fn force_exact(rule: ExactRule) -> impl Drop {
+    struct Restore(Option<ExactRule>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCED_EXACT_RULE.set(self.0);
+        }
+    }
+    Restore(FORCED_EXACT_RULE.replace(Some(rule)))
 }
 
 /// Overrides the quantized read plan on this thread until the guard drops.
@@ -2429,6 +2512,8 @@ struct ScanScratch {
     /// A survivor group's offsets and documents.
     group_offsets: Vec<usize>,
     group_docs: Vec<DocId>,
+    /// Candidate ranges finished exactly at the current stage.
+    retired: Vec<Range<usize>>,
 }
 
 /// The quantized cascade's state: candidate columns plus what later layers need per cluster.
@@ -2439,6 +2524,8 @@ struct QuantizedState<'a> {
     dimension: usize,
     /// The active layers, in scan order.
     layers: Vec<LayerSpec>,
+    /// Whether a batch may be planned `Exact` before `Final`.
+    exact_enabled: bool,
     candidates: QuantizedCandidates,
     /// Query-centroid similarity of each admitted cluster; NaN for clusters never admitted.
     centroid_scores: Vec<f32>,
@@ -2449,6 +2536,7 @@ impl<'a> QuantizedState<'a> {
         query: &'a QuantizedQueryCtx,
         field: &'a QuantizedFieldReader,
         candidate_capacity: usize,
+        exact_enabled: bool,
     ) -> Self {
         let meta = query.index.meta.field();
         Self {
@@ -2463,6 +2551,7 @@ impl<'a> QuantizedState<'a> {
                     query_error_squared: query.query_error_squared(index) as f32,
                 })
                 .collect(),
+            exact_enabled,
             candidates: QuantizedCandidates::with_capacity(candidate_capacity),
             centroid_scores: Vec::new(),
         }
@@ -2549,9 +2638,15 @@ where
         top_n: usize,
         tie_comparator: CTail,
         candidate_capacity: usize,
+        exact_enabled: bool,
     ) -> Self {
         Self {
-            quantized: Some(QuantizedState::new(query, field, candidate_capacity)),
+            quantized: Some(QuantizedState::new(
+                query,
+                field,
+                candidate_capacity,
+                exact_enabled,
+            )),
             ..Self::exact(reader, index, exact_query, top_n, tie_comparator)
         }
     }
@@ -2576,24 +2671,37 @@ where
         Ok(rows)
     }
 
-    /// Scores one batch at its stage: exactly, or by reading its quantized layer and combining
-    /// it into the candidate columns. `survivors` locates a refined batch's rows in the columns;
-    /// a layer-0 batch's rows are appended after them.
+    /// Scores one batch at its stage, the way its plan says: exactly, finishing its rows, or by
+    /// reading its quantized layer and combining it into the candidate columns. `survivors`
+    /// locates a refined batch's rows in the columns; a layer-0 batch's rows are appended after
+    /// them. Returns the plan.
     fn step(
         &mut self,
         batch: &ClusterBatch<'_>,
         survivors: Range<usize>,
         tie_break: &mut K,
         stats: &mut ProbeStats,
-    ) -> crate::Result<()> {
-        let (PlanStage::Layer(layer), Some(state)) = (batch.stage, self.quantized.as_mut()) else {
-            return self.score_exact(batch, tie_break, stats);
+    ) -> crate::Result<ReadPlan> {
+        let (PlanStage::Layer(layer), Some(state)) = (batch.stage, self.quantized.as_ref()) else {
+            self.score_exact(batch, tie_break, stats)?;
+            return Ok(ReadPlan::Exact);
         };
+        let plan = plan_batch(
+            self.reader,
+            layer,
+            batch,
+            state.exact_enabled,
+            &mut self.scratch.layer_rows,
+        )?;
+        stats.record_layer_read(layer, plan, batch.len());
+        if plan == ReadPlan::Exact {
+            self.score_exact(batch, tie_break, stats)?;
+            return Ok(plan);
+        }
+        let state = self.quantized.as_mut().expect("quantized scan");
         let spec = state.layers[layer];
         let rows = &mut self.scratch.layer_rows;
         let reader = &state.field.layers()[layer];
-        let plan = plan_read(reader, batch, rows)?;
-        stats.record_layer_read(layer, plan);
         read_layer(reader, state.query, &spec, batch, plan, rows)?;
         let CentroidScore::Known(sim) = batch.centroid;
         let query_norm = state.query.score_query_norm(sim.score());
@@ -2627,7 +2735,7 @@ where
                 },
             );
         }
-        Ok(())
+        Ok(plan)
     }
 
     /// Scores a batch's rows at full precision into the bound and the result heap. Rows that
@@ -2786,6 +2894,9 @@ where
             enter_vector_stage(Stage::LayerScan(layer as u8))
         });
         let survivors = self.quantized_len();
+        let exact_before = stats.exact_ns;
+        let mut retired = std::mem::take(&mut self.scratch.retired);
+        retired.clear();
         let mut offsets = std::mem::take(&mut self.scratch.group_offsets);
         let mut docs = std::mem::take(&mut self.scratch.group_docs);
         #[cfg(test)]
@@ -2834,11 +2945,26 @@ where
                 },
                 centroid,
             };
-            self.step(&batch, first..end, tie_break, stats)?;
+            // A group finished exactly before `Final` leaves the candidates before the band, so
+            // no row counts both as an interval and as an exact score.
+            if self.step(&batch, first..end, tie_break, stats)? == ReadPlan::Exact
+                && layer.is_some()
+            {
+                retired.push(first..end);
+            }
             first = end;
         }
         self.scratch.group_offsets = offsets;
         self.scratch.group_docs = docs;
+        let retired_rows: usize = retired.iter().map(|range| range.len()).sum();
+        if !retired.is_empty() {
+            self.quantized
+                .as_mut()
+                .expect("quantized scan")
+                .candidates
+                .remove_ranges(&retired);
+        }
+        self.scratch.retired = retired;
         #[cfg(test)]
         if layer.is_none() {
             final_docs.sort_unstable();
@@ -2846,7 +2972,9 @@ where
         }
         if let Some(layer) = layer {
             drop(layer_stage);
-            stats.record_layer_scan(layer, survivors, layer_start.elapsed().as_nanos() as u64);
+            let layer_ns = (layer_start.elapsed().as_nanos() as u64)
+                .saturating_sub(stats.exact_ns - exact_before);
+            stats.record_layer_scan(layer, survivors - retired_rows, layer_ns);
             #[cfg(test)]
             {
                 let candidates = &self.quantized.as_ref().expect("quantized scan").candidates;
@@ -2996,6 +3124,7 @@ impl<T: VectorElement> VectorBackend<T> {
                         top_n,
                         tie_comparator,
                         candidate_capacity,
+                        self.adaptive.exact_plan,
                     ),
                     query.query().to_vec(),
                     RoutedAccounting::Quantized,
@@ -5062,6 +5191,10 @@ mod tests {
             "layer0_full_clusters",
             "layer1_sparse_clusters",
             "layer1_full_clusters",
+            "layer0_exact_clusters",
+            "layer0_exact_rows",
+            "layer1_exact_clusters",
+            "layer1_exact_rows",
         ] {
             assert_eq!(object.remove(key).unwrap(), 0);
         }
@@ -5171,6 +5304,92 @@ mod tests {
         );
         assert_eq!(scan.running_estimate_kth(2), Some(9.0));
         assert_eq!(scan.running_estimate_kth(4), None);
+    }
+
+    #[test]
+    fn merged_kth_walks_two_descending_sequences() {
+        let a = [9.0, 4.0, 1.0];
+        let at = |position: usize| a[position];
+        assert_eq!(merged_kth(3, at, &[8.0, 5.0], 1), Some(9.0));
+        assert_eq!(merged_kth(3, at, &[8.0, 5.0], 3), Some(5.0));
+        assert_eq!(merged_kth(3, at, &[8.0, 5.0], 5), Some(1.0));
+        assert_eq!(merged_kth(3, at, &[8.0, 5.0], 6), None);
+        assert_eq!(merged_kth(0, at, &[8.0, 5.0], 2), Some(5.0));
+        assert_eq!(merged_kth(3, at, &[], 0), None);
+    }
+
+    /// Exact rows are zero-width intervals: alone they set every threshold to the k-th exact
+    /// score.
+    #[test]
+    fn exact_rows_alone_set_the_kth_threshold() {
+        let mut scan = BoundaryHarness::new(8);
+        for score in [3.0, 9.0, 5.0, 1.0, 9.0] {
+            scan.push_exact(score, 3);
+        }
+        let kth = Some(Threshold(LowerEndpoint(5.0)));
+        assert_eq!(
+            scan.running_pessimistic_kth(3, QUANTIZED_BOUNDARY_KAPPA),
+            kth
+        );
+        assert_eq!(scan.running_estimate_kth(3), Some(5.0));
+        assert_eq!(scan.pessimistic_kth(3, QUANTIZED_BOUNDARY_KAPPA), kth);
+        let mut short = BoundaryHarness::new(8);
+        for score in [3.0, 9.0, 5.0] {
+            short.push_exact(score, 4);
+        }
+        assert_eq!(
+            short.running_pessimistic_kth(4, QUANTIZED_BOUNDARY_KAPPA),
+            None
+        );
+        assert_eq!(short.running_estimate_kth(4), None);
+        assert_eq!(short.pessimistic_kth(4, QUANTIZED_BOUNDARY_KAPPA), None);
+    }
+
+    /// With both kinds of rows, each threshold is the k-th of the union, and a quantized row is
+    /// pruned only when the exact rows push the threshold past its upper endpoint.
+    #[test]
+    fn mixed_threshold_is_the_kth_of_the_union() {
+        let candidates = [(0, 12.0, 1.0), (1, 8.0, 1.0), (2, 2.0, 2.0)];
+        let mut scan = BoundaryHarness::new(8);
+        scan.begin_cluster(3);
+        // Kappa 2: lower endpoints 10, 6, -2; upper endpoints 14, 10, 6.
+        for (row, estimate, sigma) in candidates {
+            push_test_candidate(&mut scan, row, row as DocId, estimate, sigma);
+        }
+        scan.finish_cluster_bound_with_kappa(2.0);
+        assert_eq!(
+            scan.running_pessimistic_kth(3, 2.0),
+            Some(Threshold(LowerEndpoint(-2.0)))
+        );
+        scan.push_exact(7.0, 3);
+        scan.push_exact(11.0, 3);
+        // Lower endpoints {10, 6, -2} with exact {11, 7}: 11, 10, 7.
+        assert_eq!(
+            scan.running_pessimistic_kth(3, 2.0),
+            Some(Threshold(LowerEndpoint(7.0)))
+        );
+        // Estimates {12, 8, 2} with exact {11, 7}: 12, 11, 8.
+        assert_eq!(scan.running_estimate_kth(3), Some(8.0));
+        assert_eq!(
+            scan.pessimistic_kth(3, 2.0),
+            Some(Threshold(LowerEndpoint(7.0)))
+        );
+        scan.band(3, 2.0);
+        assert_eq!(scan.candidates.rows, [0, 1]);
+
+        // Fewer quantized rows than k still yield a threshold through the exact rows.
+        let mut wide = BoundaryHarness::new(8);
+        wide.begin_cluster(4);
+        for (row, estimate, sigma) in candidates {
+            push_test_candidate(&mut wide, row, row as DocId, estimate, sigma);
+        }
+        wide.finish_cluster_bound_with_kappa(2.0);
+        wide.push_exact(7.0, 4);
+        wide.push_exact(11.0, 4);
+        assert_eq!(
+            wide.pessimistic_kth(4, 2.0),
+            Some(Threshold(LowerEndpoint(6.0)))
+        );
     }
 
     #[test]
