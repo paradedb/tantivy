@@ -154,7 +154,7 @@ mod tests {
                 ),
             )?;
             assert_eq!(hits.results.len(), count.min(3));
-            assert!(!vector.id_map_initialized(), "scan must not open IdMap");
+            assert_eq!(vector.id_map_initialized(), count > 0);
             let ivf = vector.index().unwrap();
             for b in 0..ivf.num_clusters() {
                 let range = ivf.cluster_range(b);
@@ -188,7 +188,7 @@ mod tests {
             let id_map = composite
                 .open_read_with_idx(field, VectorEntry::IdMap.index())
                 .unwrap();
-            assert_eq!(id_map.len(), 1 + segment.max_doc() as usize * 8);
+            assert_eq!(id_map.len(), 1 + count * 4);
             let start = data.storage_block_ord(0).unwrap();
             assert_eq!(start % ENTRY_ALIGN, 0);
             assert_eq!(data.len() % ENTRY_ALIGN, 0);
@@ -212,7 +212,7 @@ mod tests {
         Ok(())
     }
 
-    // Empty quantized IVF fields still carry exact metadata-only Data and DocLocations IdMap
+    // Empty quantized IVF fields still carry exact metadata-only Data and Explicit IdMap
     // entries.
     #[test]
     fn two_field_ivf_includes_empty_field() -> crate::Result<()> {
@@ -292,7 +292,7 @@ mod tests {
                             .to_owned();
                         out.insert(name, rows_by_doc.remove(&doc));
                     }
-                    assert!(!vectors.id_map_initialized());
+                    assert!(vectors.id_map_initialized());
                 }
                 Ok(out)
             };
@@ -940,7 +940,7 @@ mod tests {
         let config = &index.settings().vector_quantization[0];
         assert_eq!(config.format_version, 3);
         config.validate(&VectorOptions::new(QUANT_FIXTURE_DIM, Metric::L2))?;
-        assert_eq!(&quantized_vec_file(&index)?[..4], &[4, 0, 0, 0]);
+        assert_eq!(&quantized_vec_file(&index)?[..4], &[6, 0, 0, 0]);
         index.settings_mut().vector_quantization.clear();
         let searcher = index.reader()?.searcher();
         let vector = searcher.segment_readers()[0].vector_index(field)?;

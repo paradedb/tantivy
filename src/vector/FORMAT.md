@@ -38,7 +38,7 @@ Bounds are the per-cluster maximum of source bounds and newly assigned flat-row
 residuals; deleted rows may leave conservative overestimates. Quantized columns
 are encoded using the target settings and the preserved cluster assignments.
 
-These segments use the existing V4 `.vec` block format and a V5 `.centroids`
+These segments use the V6 `.vec` block format and a V5 `.centroids`
 sidecar with only the following slots per vector field:
 
 | Index | Contents |
@@ -85,7 +85,7 @@ Indexes without an artifact write flat storage on both flush and merge.
 ## File headers and entries
 
 `.vec` uses a little-endian u32 version header, with current and supported version
-**4**. The `.centroids` version is **5**, referencing the shared centroid artifact
+**6**. The `.centroids` version is **5**, referencing the shared centroid artifact
 as described above. Other versions of either file require rebuilding the index.
 `VectorQuantizationConfig.format_version = 3` identifies the independent index
 settings grammar; settings specify the target for future builds.
@@ -94,7 +94,7 @@ Each vector field declares exactly these composite entries:
 
 | Index | Entry | Contents |
 |---|---|---|
-| 0 | IdMap | Identity, Bitmap, or DocLocations document addressing |
+| 0 | IdMap | Identity, Bitmap, or Explicit row-to-document addressing |
 | 1 | Data | Field metadata, aligned blocks, and a stored block directory |
 
 Missing entries or any additional entry index are corruption. All Data entries
@@ -105,17 +105,15 @@ entry-end padding belongs to Data, so no gap is added to an IdMap. The first
 Data entry may be preceded by padding outside any entry.
 
 An IdMap begins with a u8 tag: 0 for Identity (document count supplied by the
-segment), 1 for the columnar OptionalIndex Bitmap encoding, or 3 for
-DocLocations. All other tags, including 2, are rejected. Identity and Bitmap
-have document-ordered rows.
+segment), 1 for the columnar OptionalIndex Bitmap encoding, or 2 for Explicit.
+All other tags are rejected. Identity and Bitmap have document-ordered rows.
 
-DocLocations contains exactly `max_doc` records of `cluster:u32, local:u32`,
-both little-endian, with no padding. Record `doc` starts at body offset `8*doc`.
-Absent documents store `(u32::MAX, 0)`; the cluster count must be less than
-`u32::MAX`. Opening the entry checks its body length is exactly `8*max_doc`.
-Each lookup reads one record and checks `cluster < K` and `local < rows_in(cluster)`.
-The entry opens lazily for document lookups. Scans, reranking and result assembly
-use Data columns and do not open it.
+Explicit contains one little-endian u32 document ID per vector row, in cluster
+order. IDs must be below `max_doc` and strictly ascending within each cluster.
+The packed table loads once per vector reader, on its first document-ID
+access. IDs are validated when a cluster is read. The table is shared by scans,
+reranking, result assembly, and merges.
+Document-to-row lookups binary-search each cluster's range in this table.
 
 ## Data entry and blocks
 
@@ -165,7 +163,7 @@ Column reads cannot exceed their stored block boundary. The writer asserts that
 every Data entry length is a multiple of `ENTRY_ALIGN`. All padding is zero.
 
 `Clusters` requires `row_starts` to equal the posting offsets in `.centroids`,
-a DocLocations IdMap, and centroid data. `Uniform { rows_per_block }` requires
+an Explicit IdMap, and centroid data. `Uniform { rows_per_block }` requires
 an Identity or Bitmap IdMap, no centroid data, and a nonzero block size. Its
 stored boundaries must describe `[b*r, min((b+1)*r, num_rows))`. Zero flat rows
 means zero blocks; both directory arrays still contain one sentinel.
@@ -177,7 +175,6 @@ Column order and widths are part of the contract:
 | Column | Decoder element | Row stride | Band |
 |---|---|---:|---|
 | Rows | F32 | dim * dtype width | none |
-| DocIds, clustered only | U32 | 4 | none |
 | ResidualNorms | F32 | 4 | 0 |
 | QuantLayerCodes(l) | U64 for SignPlane, U8 for GridPlane | quantizer code stride | l |
 | QuantLayerScales(l) | F32 | 4 | l |
@@ -185,9 +182,7 @@ Column order and widths are part of the contract:
 | QuantLayerErrors(l) | F16 | 2 | l |
 | QuantLayerConstants(l), L2 only | F32 | 4 | l |
 
-Flat Plain has only Rows; clustered Plain has Rows followed by DocIds.
-DocIds ascend within each block. Quantized adds ResidualNorms after DocIds
-when clustered, then each layer's columns in
+Plain has only Rows. Quantized adds ResidualNorms, then each layer's columns in
 ascending layer order. Norms, scales and constants are binary32; gammas and
 errors are binary16. SignPlane code stride is `ceil(dim/64)*8`; GridPlane stride
 is `ceil(dim*bits/64)*8` as defined by `grid_plane::packed_len`. Code tail bits
@@ -198,12 +193,10 @@ Band 0 includes ResidualNorms through the last layer-0 column. Higher bands run
 from that layer's codes through its final column. `layer_span(b, l)` is band l;
 each band uses one read with columns exposed as views.
 
-DocIds are read separately and validated as strictly ascending and below the
-segment's `max_doc`. Filters and deleted-document visibility select rows before
-any payload read; a cluster with no survivors reads only DocIds. With no filter
-or deletions, quantized scans read no DocIds until rerank resolves the final
-candidates, once per candidate-bearing cluster. Exact scans without a row gate
-read Rows alone and resolve DocIds only when a score reaches heap admission.
+Document IDs come from the shared Explicit IdMap. Filter and deletion checks
+run before payload reads; rejected clusters read no payload columns. Quantized
+scans resolve document IDs from that map during reranking. Exact scans resolve
+them when a score reaches heap admission.
 Filtered exact scans plan reads over survivor rows in the Rows column.
 
 Sparse code reads group

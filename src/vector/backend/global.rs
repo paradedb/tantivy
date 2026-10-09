@@ -132,8 +132,6 @@ struct SegmentScan<'a, T: VectorElement, S: SortKeyComputer> {
     ranges: Vec<Range<usize>>,
     blocks: Vec<(usize, usize)>,
     scratch: Vec<u8>,
-    cache_pricing: (f64, f64),
-    filtered_doc_ids: Option<Box<[DocId]>>,
 }
 
 impl<T: VectorElement, S: SortKeyComputer> SegmentScan<'_, T, S> {
@@ -233,30 +231,7 @@ impl<T: VectorElement, S: SortKeyComputer> SegmentScan<'_, T, S> {
         let gate = self.gate.as_ref().expect("filter prepared before scanning");
         let open = matches!(gate, RowGate::Open);
         if !open {
-            let (probe_fraction, open_share) = self.cache_pricing;
-            let expected_fraction = probe_fraction
-                / (open_share + (1.0 - open_share) * gate.match_fraction(self.reader.max_doc()));
-            let filter = match gate {
-                RowGate::FilterOnly(filter) | RowGate::FilterAndAlive { filter, .. } => {
-                    Some(filter)
-                }
-                _ => None,
-            };
-            if expected_fraction >= 1.0 / 32.0 {
-                if let Some(filter) = filter {
-                    if self.filtered_doc_ids.is_none() {
-                        self.filtered_doc_ids = Some(reader.filtered_row_doc_ids(filter)?);
-                    }
-                } else {
-                    reader.cache_doc_ids()?;
-                }
-            }
-            if let Some(docs) = &self.filtered_doc_ids {
-                self.docs.clear();
-                self.docs.extend_from_slice(&docs[rows.clone()]);
-            } else {
-                reader.read_doc_ids(cluster, &mut self.docs)?;
-            }
+            reader.read_doc_ids(cluster, &mut self.docs)?;
         }
         let (selection, visited, pruned_filter, pruned_dead) =
             select_cluster_rows(&self.docs, rows.clone(), gate, &mut self.offsets);
@@ -426,8 +401,6 @@ pub(crate) fn search<T: VectorElement, S: SortKeyComputer>(
             ranges: Vec::new(),
             blocks: Vec::new(),
             scratch: Vec::new(),
-            cache_pricing: (0.0, 1.0),
-            filtered_doc_ids: None,
         });
     }
     let active = |segment: &SegmentScan<'_, T, S>| {
@@ -446,9 +419,6 @@ pub(crate) fn search<T: VectorElement, S: SortKeyComputer>(
             .sum();
         let clusters = router.num_clusters();
         let (budget, n_avg, open) = adaptive.resolved_work_budget(clusters, num_docs)?;
-        for segment in &mut segments {
-            segment.cache_pricing = (budget / clusters.max(1) as f64, open);
-        }
         let pricing = UnitPricing {
             budget: WorkUnits::new(budget),
             open: WorkUnits::new(open),

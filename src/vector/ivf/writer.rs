@@ -20,7 +20,6 @@ use crate::schema::document::ErasedDocument;
 use crate::schema::{Field, FieldType, Schema, VectorDType, VectorOptions};
 use crate::vector::blocks::{block_len, column_range, pad, write_metadata, BlockDirectory};
 use crate::vector::buffer::VectorBuffer;
-use crate::vector::flat::id_map::DocLocation;
 use crate::vector::flat::IdMap;
 use crate::vector::header::{
     write_vector_header, CentroidSlot, VectorEntry, VectorFileVersion, HEADER_LEN,
@@ -132,7 +131,7 @@ fn write_f32_run(writer: &mut impl Write, values: &[f32]) -> std::io::Result<()>
 
 struct WrittenField {
     offsets: Vec<u64>,
-    locations: Vec<DocLocation>,
+    doc_ids: Vec<DocId>,
     bounds: Vec<f32>,
 }
 
@@ -167,6 +166,11 @@ impl ClusteredField<'_> {
         };
         let mut cluster_counts = vec![0usize; num_centroids];
         for assigned_vector in &assigned_vectors {
+            if assigned_vector.target_doc_id >= num_target_docs {
+                return Err(TantivyError::InvalidArgument(
+                    "vector document id exceeds max_doc".into(),
+                ));
+            }
             cluster_counts[assigned_vector.cluster] += 1;
         }
 
@@ -180,13 +184,10 @@ impl ClusteredField<'_> {
             cluster_offsets.push(next_offset);
         }
 
-        // IdMaps are emitted after Data so inter-entry padding never enters an id map.
-        if num_centroids >= u32::MAX as usize {
-            return Err(TantivyError::InvalidArgument(
-                "too many clusters for document locations".into(),
-            ));
-        }
-        let mut locations = vec![DocLocation::ABSENT; num_target_docs as usize];
+        let doc_ids = assigned_vectors
+            .iter()
+            .map(|vector| vector.target_doc_id)
+            .collect();
 
         // Data entry: metadata followed by aligned cluster blocks.
         let meta = VectorColMetadata::build_ivf(opts, quantization)?;
@@ -233,19 +234,12 @@ impl ClusteredField<'_> {
                 .as_mut()
                 .map(|workspace| workspace.prepare(&centroid));
             // Rows stream directly to disk; only encoded columns need cluster buffers.
-            let mut local = 0u32;
             for tile in assigned_vectors[start..end].chunks(tile_rows) {
                 if cancel.wants_cancel() {
                     return Err(TantivyError::Cancelled);
                 }
                 batch_values.clear();
                 for assigned in tile {
-                    bufs[1].extend_from_slice(&assigned.target_doc_id.to_le_bytes());
-                    locations[assigned.target_doc_id as usize] = DocLocation {
-                        cluster: cluster as u32,
-                        local,
-                    };
-                    local += 1;
                     let bytes = read_row(assigned)?;
                     let row = bytes.as_ref();
                     data.write_all(row)?;
@@ -291,7 +285,6 @@ impl ClusteredField<'_> {
                                 &mut bufs[idx],
                                 &batch.layers[*layer as usize].constants,
                             )?,
-                            SlotType::DocIds => (),
                             SlotType::Rows { .. } => unreachable!(),
                         }
                     }
@@ -326,7 +319,7 @@ impl ClusteredField<'_> {
         data.flush()?;
         Ok(WrittenField {
             offsets: cluster_offsets,
-            locations,
+            doc_ids,
             bounds: bounds_builder.finish(),
         })
     }
@@ -343,7 +336,7 @@ struct SharedSegmentWriter<'a> {
     routers: Arc<CentroidIndex>,
     vectors: CompositeWrite,
     centroids: CompositeWrite,
-    id_maps: Vec<(Field, Vec<DocLocation>)>,
+    id_maps: Vec<(Field, Vec<DocId>)>,
 }
 
 impl<'a> SharedSegmentWriter<'a> {
@@ -471,14 +464,14 @@ impl<'a> SharedSegmentWriter<'a> {
             self.centroids
                 .for_field_with_idx(field, CentroidSlot::Bounds.index()),
         )?;
-        self.id_maps.push((field, written.locations));
+        self.id_maps.push((field, written.doc_ids));
         Ok(())
     }
 
     fn finish(mut self) -> crate::Result<()> {
-        for (field, locations) in self.id_maps {
-            IdMap::serialize_locations(
-                &locations,
+        for (field, doc_ids) in self.id_maps {
+            IdMap::serialize_explicit(
+                &doc_ids,
                 self.vectors
                     .for_field_with_idx(field, VectorEntry::IdMap.index()),
             )?;

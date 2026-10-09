@@ -1164,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn filtered_doc_id_cache_follows_probe_budget() -> crate::Result<()> {
+    fn filtered_search_reuses_the_row_map_for_different_predicates() -> crate::Result<()> {
         use crate::query::TermQuery;
         use crate::schema::{IndexRecordOption, INDEXED};
         use crate::vector::ivf::AdaptiveProbeParams;
@@ -1192,7 +1192,7 @@ mod tests {
         }
         writer.commit()?;
         let filter = TermQuery::new(Term::from_field_u64(keep, 0), IndexRecordOption::Basic);
-        for (probe, cached) in [(0.001, false), (0.5, true)] {
+        for probe in [0.001, 0.5] {
             let searcher = index.reader()?.searcher();
             let vectors = searcher
                 .segment_readers()
@@ -1212,7 +1212,7 @@ mod tests {
             assert_eq!(hits.results[0].1.doc_id, 0);
             assert_eq!(
                 vectors[hits.results[0].1.segment_ord as usize].id_map_initialized(),
-                cached
+                true
             );
             let opposite = TermQuery::new(Term::from_field_u64(keep, 1), IndexRecordOption::Basic);
             let hits = searcher.search(
@@ -1569,14 +1569,7 @@ mod tests {
                                 vectors.read_doc_ids(cluster, &mut Vec::new())?;
                             }
                         }
-                        expected_reads.extend(
-                            directory
-                                .reads
-                                .lock()
-                                .unwrap()
-                                .drain(..)
-                                .map(|(_, range)| range),
-                        );
+                        directory.reads.lock().unwrap().clear();
                         for doc in segment.doc_ids_alive() {
                             let id = ordinals.first(doc).unwrap();
                             let row = vectors.row_id(doc)?;
