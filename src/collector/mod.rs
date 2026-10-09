@@ -166,6 +166,11 @@ pub trait Collector: Sync + Send {
     /// Returns true iff the collector requires to compute scores for documents.
     fn requires_scoring(&self) -> bool;
 
+    /// Requests posting bitmaps when compiling an unscored collection query.
+    fn supports_bitmap_collection(&self) -> bool {
+        false
+    }
+
     /// Combines the fruit associated with the collection of each segments
     /// into one fruit.
     fn merge_fruits(
@@ -324,6 +329,11 @@ impl<TCollector: Collector> Collector for Option<TCollector> {
             .unwrap_or(false)
     }
 
+    fn supports_bitmap_collection(&self) -> bool {
+        self.as_ref()
+            .is_none_or(|collector| collector.supports_bitmap_collection())
+    }
+
     fn merge_fruits(
         &self,
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
@@ -410,6 +420,10 @@ where
         self.0.requires_scoring() || self.1.requires_scoring()
     }
 
+    fn supports_bitmap_collection(&self) -> bool {
+        self.0.supports_bitmap_collection() && self.1.supports_bitmap_collection()
+    }
+
     fn merge_fruits(
         &self,
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
@@ -489,6 +503,12 @@ where
 
     fn requires_scoring(&self) -> bool {
         self.0.requires_scoring() || self.1.requires_scoring() || self.2.requires_scoring()
+    }
+
+    fn supports_bitmap_collection(&self) -> bool {
+        self.0.supports_bitmap_collection()
+            && self.1.supports_bitmap_collection()
+            && self.2.supports_bitmap_collection()
     }
 
     fn merge_fruits(
@@ -585,6 +605,13 @@ where
             || self.1.requires_scoring()
             || self.2.requires_scoring()
             || self.3.requires_scoring()
+    }
+
+    fn supports_bitmap_collection(&self) -> bool {
+        self.0.supports_bitmap_collection()
+            && self.1.supports_bitmap_collection()
+            && self.2.supports_bitmap_collection()
+            && self.3.supports_bitmap_collection()
     }
 
     fn merge_fruits(

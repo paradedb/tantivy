@@ -560,7 +560,9 @@ mod tests {
                     query.as_ref(),
                     &crate::collector::TopDocs::with_limit(10).order_by_score(),
                 )?);
-                let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+                let weight = query.weight(
+                    EnableScoring::disabled_from_searcher(&searcher).with_bitmap_postings(true),
+                )?;
                 let mut scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
                 let mut docs = Vec::new();
                 while scorer.doc() != TERMINATED {

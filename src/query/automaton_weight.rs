@@ -19,6 +19,7 @@ use crate::{DocId, Score, TantivyError};
 pub struct AutomatonWeight<A> {
     field: Field,
     scoring_enabled: bool,
+    bitmap_enabled: bool,
     automaton: Arc<A>,
     // For JSON fields, the term dictionary include terms from all paths.
     // We apply additional filtering based on the given JSON path, when searching within the term
@@ -36,6 +37,7 @@ where
         AutomatonWeight {
             field,
             scoring_enabled: true,
+            bitmap_enabled: false,
             automaton: automaton.into(),
             json_path_bytes: None,
         }
@@ -50,9 +52,15 @@ where
         AutomatonWeight {
             field,
             scoring_enabled: true,
+            bitmap_enabled: false,
             automaton: automaton.into(),
             json_path_bytes: Some(json_path_bytes.to_vec().into_boxed_slice()),
         }
+    }
+
+    pub(crate) fn with_bitmap_postings(mut self, enabled: bool) -> Self {
+        self.bitmap_enabled = enabled;
+        self
     }
 
     /// Enables score computation; disabling it permits membership-only posting readers.
@@ -104,7 +112,7 @@ where
         let mut scorers = vec![];
         let mut bitmaps: Vec<Box<dyn Scorer>> = Vec::new();
         while let Some((_term, term_info, state)) = term_stream.next() {
-            if !self.scoring_enabled && reader.bitmap_postings_enabled {
+            if self.bitmap_enabled && !self.scoring_enabled && reader.bitmap_postings_enabled {
                 if let Some(bitmap) =
                     inverted_index.read_bitmap_from_terminfo(term_info, reader.max_doc())?
                 {

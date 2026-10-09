@@ -286,6 +286,7 @@ pub struct BooleanWeight<TScoreCombiner: ScoreCombiner> {
     weights: Vec<(Occur, Box<dyn Weight>)>,
     minimum_number_should_match: usize,
     scoring_enabled: bool,
+    bitmap_enabled: bool,
     disjunction_pruning: DisjunctionPruning,
     score_combiner_fn: Box<dyn Fn() -> TScoreCombiner + Sync + Send>,
 }
@@ -300,6 +301,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         BooleanWeight {
             weights,
             scoring_enabled,
+            bitmap_enabled: false,
             score_combiner_fn,
             minimum_number_should_match: 1,
             disjunction_pruning: DisjunctionPruning::Auto,
@@ -317,9 +319,15 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
             weights,
             minimum_number_should_match,
             scoring_enabled,
+            bitmap_enabled: false,
             score_combiner_fn,
             disjunction_pruning: DisjunctionPruning::Auto,
         }
+    }
+
+    pub(crate) fn with_bitmap_postings(mut self, enabled: bool) -> Self {
+        self.bitmap_enabled = enabled;
+        self
     }
 
     pub(crate) fn with_disjunction_pruning(mut self, pruning: DisjunctionPruning) -> Self {
@@ -403,13 +411,13 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     should_scorers,
                     &score_combiner_fn,
                     num_docs,
-                    reader.bitmap_postings_enabled,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
                 )),
                 1 => ShouldScorersCombinationMethod::Required(scorer_union(
                     should_scorers,
                     &score_combiner_fn,
                     num_docs,
-                    reader.bitmap_postings_enabled,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
                 )),
                 n if num_of_should_scorers == n => {
                     // When num_of_should_scorers equals the number of should clauses,
@@ -466,7 +474,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                         other_scorers,
                         num_docs,
                         self.scoring_enabled,
-                        reader.bitmap_postings_enabled,
+                        self.bitmap_enabled && reader.bitmap_postings_enabled,
                     );
                     if term_scorers.len() >= 2 {
                         SpecializedScorer::FilteredTermIntersection {
@@ -499,7 +507,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                                 reader.max_doc(),
                                 num_docs,
                                 self.scoring_enabled,
-                                reader.bitmap_postings_enabled,
+                                self.bitmap_enabled && reader.bitmap_postings_enabled,
                             )
                             .unwrap_or_else(|| Box::new(EmptyScorer))
                         };
@@ -514,7 +522,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     reader.max_doc(),
                     num_docs,
                     self.scoring_enabled,
-                    reader.bitmap_postings_enabled,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
                 ) {
                     None => {
                         // No MUST constraint: promote SHOULD to required.
@@ -526,7 +534,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                             num_docs,
                             &score_combiner_fn,
                             self.scoring_enabled,
-                            reader.bitmap_postings_enabled,
+                            self.bitmap_enabled && reader.bitmap_postings_enabled,
                         )
                     }
                     Some(must_scorer) => {
@@ -542,7 +550,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                                     should_scorer,
                                     &score_combiner_fn,
                                     num_docs,
-                                    reader.bitmap_postings_enabled,
+                                    self.bitmap_enabled && reader.bitmap_postings_enabled,
                                 ),
                             )))
                         } else {
@@ -560,7 +568,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     reader.max_doc(),
                     num_docs,
                     self.scoring_enabled,
-                    reader.bitmap_postings_enabled,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
                 ) {
                     None => {
                         // No MUST constraint: SHOULD alone determines matching.
@@ -584,13 +592,13 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                                 should_scorer,
                                 &score_combiner_fn,
                                 num_docs,
-                                reader.bitmap_postings_enabled,
+                                self.bitmap_enabled && reader.bitmap_postings_enabled,
                             );
                             SpecializedScorer::Other(intersect_scorers(
                                 vec![must_scorer, should_boxed],
                                 num_docs,
                                 self.scoring_enabled,
-                                reader.bitmap_postings_enabled,
+                                self.bitmap_enabled && reader.bitmap_postings_enabled,
                             ))
                         }
                     },
@@ -605,9 +613,9 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
             include_scorer,
             &score_combiner_fn,
             num_docs,
-            reader.bitmap_postings_enabled,
+            self.bitmap_enabled && reader.bitmap_postings_enabled,
         );
-        if reader.bitmap_postings_enabled
+        if self.bitmap_enabled && reader.bitmap_postings_enabled
             && !self.scoring_enabled
             && include_scorer_boxed.has_fast_bitset()
             // Positional and other expensive exclusions should probe inclusion candidates.
@@ -681,7 +689,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                         specialized_scorer,
                         &self.score_combiner_fn,
                         num_docs,
-                        reader.bitmap_postings_enabled,
+                        self.bitmap_enabled && reader.bitmap_postings_enabled,
                     )
                 })
         } else {
@@ -691,7 +699,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                         specialized_scorer,
                         DoNothingCombiner::default,
                         num_docs,
-                        reader.bitmap_postings_enabled,
+                        self.bitmap_enabled && reader.bitmap_postings_enabled,
                     )
                 })
         }
@@ -741,7 +749,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                         SpecializedScorer::FilteredTermUnion { terms, filter },
                         &self.score_combiner_fn,
                         reader.num_docs(),
-                        reader.bitmap_postings_enabled,
+                        self.bitmap_enabled && reader.bitmap_postings_enabled,
                     );
                     return Ok(Box::new(BasicPruningScorer::new(
                         union_scorer,
@@ -773,7 +781,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                         SpecializedScorer::FilteredTermIntersection { terms, filter },
                         &self.score_combiner_fn,
                         reader.num_docs(),
-                        reader.bitmap_postings_enabled,
+                        self.bitmap_enabled && reader.bitmap_postings_enabled,
                     );
                     return Ok(Box::new(BasicPruningScorer::new(
                         intersection_scorer,
@@ -856,7 +864,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     boxed_scorers,
                     num_docs,
                     self.scoring_enabled,
-                    reader.bitmap_postings_enabled,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
                 );
                 for_each_scorer(intersection.as_mut(), callback);
             }
@@ -866,7 +874,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     scorer,
                     &self.score_combiner_fn,
                     num_docs,
-                    reader.bitmap_postings_enabled,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
                 );
                 for_each_scorer(scorer.as_mut(), callback);
             }
@@ -946,7 +954,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                         SpecializedScorer::FilteredTermUnion { terms, filter },
                         &self.score_combiner_fn,
                         reader.num_docs(),
-                        reader.bitmap_postings_enabled,
+                        self.bitmap_enabled && reader.bitmap_postings_enabled,
                     );
                     let mut scorer = BasicPruningScorer::new(union_scorer, threshold);
                     for_each_pruning_scorer(&mut scorer, callback);
@@ -993,7 +1001,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                         SpecializedScorer::FilteredTermIntersection { terms, filter },
                         &self.score_combiner_fn,
                         reader.num_docs(),
-                        reader.bitmap_postings_enabled,
+                        self.bitmap_enabled && reader.bitmap_postings_enabled,
                     );
                     let mut scorer = BasicPruningScorer::new(intersection_scorer, threshold);
                     for_each_pruning_scorer(&mut scorer, callback);
@@ -1063,7 +1071,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     boxed_scorers,
                     num_docs,
                     self.scoring_enabled,
-                    reader.bitmap_postings_enabled,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
                 );
                 for_each_docset_buffered(intersection.as_mut(), &mut buffer, callback);
             }
@@ -1073,7 +1081,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     scorer,
                     DoNothingCombiner::default,
                     num_docs,
-                    reader.bitmap_postings_enabled,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
                 );
                 for_each_docset_buffered(scorer.as_mut(), &mut buffer, callback);
             }
@@ -1112,7 +1120,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     boxed_scorers,
                     num_docs,
                     self.scoring_enabled,
-                    reader.bitmap_postings_enabled,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
                 );
                 crate::query::weight::for_each_docset_batch(intersection.as_mut(), callback);
             }
@@ -1122,7 +1130,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     scorer,
                     DoNothingCombiner::default,
                     num_docs,
-                    reader.bitmap_postings_enabled,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
                 );
                 crate::query::weight::for_each_docset_batch(scorer.as_mut(), callback);
             }
@@ -1178,7 +1186,7 @@ mod tests {
             }
             writer.commit()?;
 
-            for enabled in [false, true] {
+            for (enabled, opt_in) in [(false, false), (false, true), (true, false), (true, true)] {
                 index.settings_mut().bitmap_postings.use_for_queries = enabled;
                 let searcher = index.reader()?.searcher();
                 let reader = searcher.segment_reader(0);
@@ -1204,12 +1212,15 @@ mod tests {
                             )),
                         ),
                     ]);
-                    let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+                    let weight = query.weight(
+                        EnableScoring::disabled_from_searcher(&searcher)
+                            .with_bitmap_postings(opt_in),
+                    )?;
                     let mut scorer = weight.scorer(reader, 1.0)?;
                     assert_eq!(
                         scorer.is::<BitmapCombination>(),
-                        enabled,
-                        "stored_bitmaps={stored_bitmaps}, enabled={enabled}, occur={occur:?}"
+                        enabled && opt_in,
+                        "stored_bitmaps={stored_bitmaps}, enabled={enabled}, opt_in={opt_in}, occur={occur:?}"
                     );
                     let mut actual = Vec::new();
                     crate::query::for_each_docset_batch(scorer.as_mut(), &mut |batch| {
@@ -1292,7 +1303,9 @@ mod tests {
             ("dense -selective", true),
         ] {
             let query = parser.parse_query(expression)?;
-            let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+            let weight = query.weight(
+                EnableScoring::disabled_from_searcher(&searcher).with_bitmap_postings(true),
+            )?;
             let mut scorer = weight.scorer(reader, 1.0)?;
             assert_eq!(scorer.is::<BitmapCombination>(), bitmap, "{expression}");
             let mut expected_scorer = weight.scorer(&ordinary_reader, 1.0)?;
@@ -1358,7 +1371,9 @@ mod tests {
             let mut ordinary_reader = reader.clone();
             ordinary_reader.bitmap_postings_enabled = false;
             let unscored = term_query
-                .weight(EnableScoring::disabled_from_searcher(&searcher))?
+                .weight(
+                    EnableScoring::disabled_from_searcher(&searcher).with_bitmap_postings(true),
+                )?
                 .scorer(&ordinary_reader, 1.0)?;
             let other_field = parser
                 .parse_query("other:a")?
@@ -1400,8 +1415,10 @@ mod tests {
                                 baseline.advance();
                             }
                             if boost == 1.0 && mode == DisjunctionPruning::Auto {
-                                let disabled = query
-                                    .weight(EnableScoring::disabled_from_searcher(&searcher))?;
+                                let disabled = query.weight(
+                                    EnableScoring::disabled_from_searcher(&searcher)
+                                        .with_bitmap_postings(true),
+                                )?;
                                 let mut docs = Vec::new();
                                 disabled.for_each_no_score(reader, &mut |block| {
                                     docs.extend_from_slice(block);

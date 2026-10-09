@@ -53,6 +53,10 @@ impl Collector for Count {
         false
     }
 
+    fn supports_bitmap_collection(&self) -> bool {
+        true
+    }
+
     fn merge_fruits(&self, segment_counts: Vec<usize>) -> crate::Result<usize> {
         Ok(segment_counts.into_iter().sum())
     }
@@ -160,9 +164,11 @@ mod tests {
             searcher.search(&query, &(Count, Some(Count)))?,
             (expected, Some(expected))
         );
-        let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let weight = query
+            .weight(EnableScoring::disabled_from_searcher(&searcher).with_bitmap_postings(true))?;
         let term_query = QueryParser::for_index(&index, vec![text]).parse_query("a")?;
-        let term_weight = term_query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let term_weight = term_query
+            .weight(EnableScoring::disabled_from_searcher(&searcher).with_bitmap_postings(true))?;
         let mut ordinary_reader = searcher.segment_reader(0).clone();
         assert!(term_weight.scorer(&ordinary_reader, 1.0)?.has_fast_bitset());
         ordinary_reader.bitmap_postings_enabled = false;
@@ -216,7 +222,7 @@ mod tests {
     #[test]
     fn aggregation_bitmap_execution_is_count_only() -> crate::Result<()> {
         use crate::aggregation::{AggContextParams, AggregationCollector};
-        use crate::query::{AllWeight, Explanation, Scorer, Weight};
+        use crate::query::{AllWeight, EnableScoring, Explanation, Query, Scorer, Weight};
         use crate::schema::{Schema, FAST};
         use crate::{DocId, Index, Score, SegmentReader};
 
@@ -241,6 +247,14 @@ mod tests {
                 assert!(self.0, "non-count request entered bitmap execution");
                 assert!(reader.bitmap_postings_enabled);
                 AllWeight.for_each_no_score_batch(reader, callback)
+            }
+        }
+        #[derive(Debug, Clone)]
+        struct CheckedQuery(bool);
+        impl Query for CheckedQuery {
+            fn weight(&self, scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+                assert_eq!(scoring.bitmap_postings_enabled(), self.0);
+                Ok(Box::new(CheckedWeight(self.0)))
             }
         }
         let mut schema = Schema::builder();
@@ -276,12 +290,19 @@ mod tests {
                 serde_json::from_value(request)?,
                 AggContextParams::default(),
             );
+            searcher.search(&CheckedQuery(bitmap), &collector)?;
             collector.collect_segment(&CheckedWeight(bitmap), 0, reader)??;
             let mut multi = crate::collector::MultiCollector::new();
             multi.add_collector(Count);
             multi.add_collector(collector);
             multi.collect_segment(&CheckedWeight(bitmap), 0, reader)?;
         }
+        searcher.search(&CheckedQuery(true), &Count)?;
+        searcher.search(&CheckedQuery(true), &(Count, Some(Count)))?;
+        let mut counts = crate::collector::MultiCollector::new();
+        counts.add_collector(Count);
+        counts.add_collector(Count);
+        searcher.search(&CheckedQuery(true), &counts)?;
         (Count, Some(Count)).collect_segment(&CheckedWeight(true), 0, reader)?;
         assert!(reader.bitmap_postings_enabled);
         Ok(())

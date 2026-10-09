@@ -423,7 +423,10 @@ mod tests {
 
     #[test]
     fn bitmap_selection_preserves_scored_postings_and_read_fallback() -> crate::Result<()> {
-        use crate::query::{EnableScoring, Query, TermQuery, TermScorer};
+        use crate::query::{
+            BoostQuery, ConstScoreQuery, EnableScoring, FuzzyTermQuery, Query, RegexQuery,
+            TermQuery, TermScorer,
+        };
         use crate::schema::{IndexRecordOption, Schema, TEXT};
         use crate::{Index, Term};
         let mut schema = Schema::builder();
@@ -445,24 +448,38 @@ mod tests {
         for enabled in [true, false] {
             index.settings_mut().bitmap_postings.use_for_queries = enabled;
             let searcher = index.reader()?.searcher();
-            let query = TermQuery::new(
-                Term::from_field_text(field, "common"),
-                IndexRecordOption::WithFreqs,
-            );
-            for scoring in [false, true] {
-                let weight = query.weight(if scoring {
-                    EnableScoring::enabled_from_searcher(&searcher)
-                } else {
-                    EnableScoring::disabled_from_searcher(&searcher)
-                })?;
-                let mut scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
-                assert_eq!(scorer.has_fast_bitset(), enabled && !scoring);
-                assert_eq!(scorer.is::<TermScorer>(), !enabled || scoring);
-                for doc in (0..1024).step_by(2) {
-                    assert_eq!(scorer.doc(), doc);
-                    scorer.advance();
+            let term = Term::from_field_text(field, "common");
+            let query = TermQuery::new(term.clone(), IndexRecordOption::WithFreqs);
+            let queries: Vec<Box<dyn Query>> = vec![
+                Box::new(query.clone()),
+                Box::new(RegexQuery::from_pattern("common", field)?),
+                Box::new(FuzzyTermQuery::new(term, 0, false)),
+                Box::new(BoostQuery::new(query.clone(), 2.0)),
+                Box::new(ConstScoreQuery::new(query, 2.0)),
+            ];
+            for query in queries {
+                for (scoring, opt_in) in
+                    [(false, false), (false, true), (true, false), (true, true)]
+                {
+                    let weight = query.weight(
+                        (if scoring {
+                            EnableScoring::enabled_from_searcher(&searcher)
+                        } else {
+                            EnableScoring::disabled_from_searcher(&searcher)
+                        })
+                        .with_bitmap_postings(opt_in),
+                    )?;
+                    let mut scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
+                    assert_eq!(scorer.has_fast_bitset(), enabled && opt_in && !scoring);
+                    if query.is::<TermQuery>() {
+                        assert_eq!(scorer.is::<TermScorer>(), !enabled || !opt_in || scoring);
+                    }
+                    for doc in (0..1024).step_by(2) {
+                        assert_eq!(scorer.doc(), doc);
+                        scorer.advance();
+                    }
+                    assert_eq!(scorer.doc(), TERMINATED);
                 }
-                assert_eq!(scorer.doc(), TERMINATED);
             }
         }
         Ok(())

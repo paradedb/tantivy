@@ -19,6 +19,7 @@ pub struct TermWeight {
     index_record_option: IndexRecordOption,
     similarity_weight: Bm25Weight,
     scoring_enabled: bool,
+    bitmap_enabled: bool,
 }
 
 enum TermOrEmptyOrAllScorer {
@@ -219,7 +220,13 @@ impl TermWeight {
             index_record_option,
             similarity_weight,
             scoring_enabled,
+            bitmap_enabled: false,
         }
+    }
+
+    pub(crate) fn with_bitmap_postings(mut self, enabled: bool) -> Self {
+        self.bitmap_enabled = enabled;
+        self
     }
 
     pub fn term(&self) -> &Term {
@@ -262,7 +269,7 @@ impl TermWeight {
             )));
         }
 
-        if !self.scoring_enabled && reader.bitmap_postings_enabled {
+        if self.bitmap_enabled && !self.scoring_enabled && reader.bitmap_postings_enabled {
             if let Some(bitmap) =
                 inverted_index.read_bitmap_from_terminfo(&term_info, reader.max_doc())?
             {

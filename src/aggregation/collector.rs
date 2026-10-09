@@ -58,6 +58,14 @@ impl DistributedAggregationCollector {
     }
 }
 
+fn supports_bitmap_collection(agg: &Aggregations) -> bool {
+    let count_filter = super::bucket::FilterAggregation::new("*".to_string());
+    agg.values().all(|agg| {
+        matches!(&agg.agg, super::agg_req::AggregationVariants::Filter(filter) if filter == &count_filter)
+            && agg.sub_aggregation.is_empty()
+    })
+}
+
 impl Collector for DistributedAggregationCollector {
     type Fruit = IntermediateAggregationResults;
 
@@ -78,6 +86,10 @@ impl Collector for DistributedAggregationCollector {
 
     fn requires_scoring(&self) -> bool {
         false
+    }
+
+    fn supports_bitmap_collection(&self) -> bool {
+        supports_bitmap_collection(&self.agg)
     }
 
     fn merge_fruits(
@@ -108,6 +120,10 @@ impl Collector for AggregationCollector {
 
     fn requires_scoring(&self) -> bool {
         false
+    }
+
+    fn supports_bitmap_collection(&self) -> bool {
+        supports_bitmap_collection(&self.agg)
     }
 
     fn merge_fruits(
@@ -150,11 +166,7 @@ impl AggregationSegmentCollector {
         segment_ordinal: SegmentOrdinal,
         context: &AggContextParams,
     ) -> crate::Result<Self> {
-        let count_filter = super::bucket::FilterAggregation::new("*".to_string());
-        let supports_bitmap_collection = agg.values().all(|agg| {
-            matches!(&agg.agg, super::agg_req::AggregationVariants::Filter(filter) if filter == &count_filter)
-                && agg.sub_aggregation.is_empty()
-        });
+        let supports_bitmap_collection = supports_bitmap_collection(agg);
         let mut ordinary_reader;
         let reader = if supports_bitmap_collection {
             reader

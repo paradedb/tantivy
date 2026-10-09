@@ -50,6 +50,8 @@ pub enum EnableScoring<'a> {
         schema: &'a Schema,
         /// Searcher should be provided if available.
         searcher_opt: Option<&'a Searcher>,
+        /// Whether unscored execution may use posting bitmaps. Defaults to false.
+        bitmap_postings: bool,
     },
 }
 
@@ -106,6 +108,7 @@ impl<'a> EnableScoring<'a> {
         EnableScoring::Disabled {
             schema: searcher.schema(),
             searcher_opt: Some(searcher),
+            bitmap_postings: false,
         }
     }
 
@@ -114,7 +117,31 @@ impl<'a> EnableScoring<'a> {
         Self::Disabled {
             schema,
             searcher_opt: None,
+            bitmap_postings: false,
         }
+    }
+
+    /// Opts unscored execution into posting bitmaps, subject to the index setting.
+    #[must_use]
+    pub fn with_bitmap_postings(mut self, enabled: bool) -> Self {
+        if let Self::Disabled {
+            bitmap_postings, ..
+        } = &mut self
+        {
+            *bitmap_postings = enabled;
+        }
+        self
+    }
+
+    /// Returns whether the caller requested posting bitmaps for unscored execution.
+    pub fn bitmap_postings_enabled(&self) -> bool {
+        matches!(
+            self,
+            Self::Disabled {
+                bitmap_postings: true,
+                ..
+            }
+        )
     }
 
     /// Returns the searcher if available.
@@ -191,7 +218,8 @@ pub trait Query: QueryClone + Send + Sync + downcast_rs::Downcast + fmt::Debug {
 
     /// Returns the number of documents matching the query.
     fn count(&self, searcher: &Searcher) -> crate::Result<usize> {
-        let weight = self.weight(EnableScoring::disabled_from_searcher(searcher))?;
+        let weight = self
+            .weight(EnableScoring::disabled_from_searcher(searcher).with_bitmap_postings(true))?;
         let mut result = 0;
         for reader in searcher.segment_readers() {
             result += weight.count(reader)? as usize;
@@ -223,7 +251,8 @@ pub trait QueryClone {
 }
 
 impl<T> QueryClone for T
-where T: 'static + Query + Clone
+where
+    T: 'static + Query + Clone,
 {
     fn box_clone(&self) -> Box<dyn Query> {
         // If T is Box<dyn Query>, wrapping self.clone() in Box::new would double-box

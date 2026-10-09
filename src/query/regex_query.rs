@@ -84,7 +84,8 @@ impl Query for RegexQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         Ok(Box::new(
             self.specialized_weight()
-                .with_scoring_enabled(enable_scoring.is_scoring_enabled()),
+                .with_scoring_enabled(enable_scoring.is_scoring_enabled())
+                .with_bitmap_postings(enable_scoring.bitmap_postings_enabled()),
         ))
     }
 }

@@ -71,6 +71,7 @@ pub(crate) fn bitset_from_postings_scorer(
     field: Field,
     sorted_keys: &[Vec<u8>],
     boost: Score,
+    bitmap_enabled: bool,
 ) -> crate::Result<Box<dyn Scorer>> {
     if sorted_keys.is_empty() || reader.max_doc() == 0 {
         return Ok(Box::new(EmptyScorer));
@@ -96,7 +97,7 @@ pub(crate) fn bitset_from_postings_scorer(
                 &inverted_index,
                 &term_info,
                 &mut bitset,
-                reader.bitmap_postings_enabled,
+                bitmap_enabled && reader.bitmap_postings_enabled,
             )?;
         }
     }
@@ -112,7 +113,7 @@ pub(crate) fn bitset_from_postings_scorer(
                 &inverted_index,
                 &term_info,
                 &mut bitset,
-                reader.bitmap_postings_enabled,
+                bitmap_enabled && reader.bitmap_postings_enabled,
             )?;
         }
     }
