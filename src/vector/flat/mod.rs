@@ -1,9 +1,5 @@
-//! Flat vector storage and row mapping.
-
-pub(crate) mod id_map;
-mod plugin;
+mod id_map;
 mod writer;
 
 pub(crate) use id_map::IdMap;
-pub(crate) use plugin::merge_flat;
-pub use writer::FlatVecWriter;
+pub use writer::VecWriter;

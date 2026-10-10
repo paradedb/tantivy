@@ -1,4 +1,9 @@
-//! Header and entry assignments for per-segment vector files.
+//! Format version for the vector files: the per-segment `.vec` and the
+//! index-level `centroids.<version>` set file.
+//!
+//! A fixed 4-byte header (a `u32` version) is prepended to every file, ahead of
+//! the [`CompositeFile`](crate::directory::CompositeFile) body. The version is
+//! the wire-layout *generation* — bump it when the framing changes incompatibly.
 
 use std::io::{self, Read, Write};
 
@@ -7,20 +12,55 @@ use common::{BinarySerializable, HasLen};
 use crate::directory::error::OpenReadError;
 use crate::directory::FileSlice;
 
-/// Length of the version header in bytes.
+/// Length of the version header in bytes (a single `u32`).
 pub(crate) const HEADER_LEN: usize = 4;
 
-/// On-disk vector file version.
+/// On-disk format version of a vector file (`.vec` or `centroids.<version>`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VectorFileVersion {
     V1 = 1,
-    /// `.centroids` includes required per-cluster bounds.
+    /// The retired `.centroids` sidecar carried per-cluster centroid bounds
+    /// (slot `[3]`) as a REQUIRED slot.
     V2 = 2,
-    /// `.centroids` includes a tagged router and `.vec` includes quantized slots.
+    /// Centroids are an index-level artifact: the `centroids` file holds the
+    /// centroid rows and the routing structure once per
+    /// index, and every segment assigns against it. `.vec` becomes the
+    /// single per-segment file — cluster-sorted rows plus the per-segment
+    /// remainder (offsets, bounds, IVF meta) — and the per-segment
+    /// `.centroids` sidecar and the flat (doc-ordered) layout are gone.
+    /// A pre-V3 `.vec` is rejected at open with a REINDEX message.
     V3 = 3,
-    /// Block-major vector columns with per-field metadata.
-    V4 = 4,
 }
+
+/// `.vec` composite slot indices. Slots `[2..=4]` exist exactly when the
+/// field has vector rows in the segment (there is no flat layout from
+/// [`VectorFileVersion::V3`] on); a field with no vectors owns no slots at
+/// all, and a partial slot set is corrupt.
+pub(crate) mod vec_slot {
+    /// Row→doc-id permutation (`IdMap::Explicit`), cluster-sorted, parallel
+    /// to [`ROWS`].
+    pub(crate) const ID_MAP: usize = 0;
+    /// The stored vector rows, cluster-sorted.
+    pub(crate) const ROWS: usize = 1;
+    /// Per-cluster posting offsets: `u64[C+1]` prefix sum over the rows.
+    pub(crate) const OFFSETS: usize = 2;
+    /// Per-cluster centroid bounds: a segment-level kind byte, then the
+    /// per-cluster payload folded over this segment's NATIVE rows.
+    pub(crate) const BOUNDS: usize = 3;
+    /// Per-segment IVF metadata: distinct doc count and centroid count.
+    pub(crate) const IVF_META: usize = 4;
+}
+
+/// `centroids` composite slot indices (the index-level centroid-index file).
+pub(crate) mod centroid_index_slot {
+    /// `num_centroids: u32` + the centroid rows (normalized at creation).
+    pub(crate) const CENTROIDS: usize = 0;
+    /// The required router-kind discriminant and payload over the centroids.
+    pub(crate) const ROUTER: usize = 1;
+}
+
+/// Version stamped into newly written vector files.
+pub(crate) const CURRENT: VectorFileVersion = VectorFileVersion::V3;
 
 impl BinarySerializable for VectorFileVersion {
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
@@ -29,10 +69,9 @@ impl BinarySerializable for VectorFileVersion {
 
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
         match u32::deserialize(reader)? {
-            1 => Ok(Self::V1),
-            2 => Ok(Self::V2),
-            3 => Ok(Self::V3),
-            4 => Ok(Self::V4),
+            1 => Ok(VectorFileVersion::V1),
+            2 => Ok(VectorFileVersion::V2),
+            3 => Ok(VectorFileVersion::V3),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported vector file format version: {other}"),
@@ -41,71 +80,21 @@ impl BinarySerializable for VectorFileVersion {
     }
 }
 
-/// Format identifier written to `.vec` files.
-pub(crate) const VECTOR_FILE_FORMAT_VERSION: u32 = VectorFileVersion::V4 as u32;
-/// Version written to `.vec` files.
-pub(crate) const CURRENT_VECTOR: VectorFileVersion = VectorFileVersion::V4;
-/// Version written to `.centroids` files.
-pub(crate) const CURRENT_CENTROID: VectorFileVersion = VectorFileVersion::V3;
-
-/// `.centroids` composite slot indices.
-pub(crate) mod centroid_slot {
-    /// Centroid vectors.
-    pub(crate) const CENTROIDS: usize = 0;
-    /// Per-cluster posting offsets.
-    pub(crate) const OFFSETS: usize = 1;
-    /// Router kind and payload (V3).
-    pub(crate) const ROUTER: usize = 2;
-    /// Per-cluster centroid bounds.
-    pub(crate) const BOUNDS: usize = 3;
+/// Write the current version header. Call before wrapping the writer in a
+/// [`CompositeWrite`](crate::directory::CompositeWrite); the composite's
+/// offsets are self-relative, so the header does not perturb them.
+pub(crate) fn write_header<W: Write + ?Sized>(writer: &mut W) -> io::Result<()> {
+    CURRENT.serialize(writer)
 }
 
-/// Slots in a centroid composite file.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(usize)]
-pub(crate) enum CentroidSlot {
-    /// Centroid vectors.
-    Centroids = centroid_slot::CENTROIDS,
-    /// Posting offsets.
-    Offsets = centroid_slot::OFFSETS,
-    /// Routing payload.
-    Router = centroid_slot::ROUTER,
-    /// Cluster bounds.
-    Bounds = centroid_slot::BOUNDS,
-}
-
-impl CentroidSlot {
-    pub(crate) const fn index(self) -> usize {
-        self as usize
-    }
-}
-
-/// Composite entries of every vector field. Column slots live inside Data blocks.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(usize)]
-pub(crate) enum VectorEntry {
-    /// Lazy doc-to-location map for clustered fields; identity or bitmap for flat fields.
-    IdMap = 0,
-    /// Stored metadata and block columns.
-    Data = 1,
-}
-impl VectorEntry {
-    pub(crate) const fn index(self) -> usize {
-        self as usize
-    }
-}
-/// Accepted vector grammars; all other versions require rebuilding.
-pub(crate) const SUPPORTED_VECTOR: &[VectorFileVersion] = &[VectorFileVersion::V4];
-
-fn write_header<W: Write + ?Sized>(writer: &mut W, version: VectorFileVersion) -> io::Result<()> {
-    version.serialize(writer)
-}
-
-fn parse_header(file: &FileSlice, file_kind: &str) -> io::Result<(VectorFileVersion, FileSlice)> {
+/// Parse the version header and return it alongside the composite body (the
+/// file slice past the header). Errors if the version is unknown or newer than
+/// [`CURRENT`].
+pub(crate) fn read_header(file: &FileSlice) -> io::Result<(VectorFileVersion, FileSlice)> {
     if file.len() < HEADER_LEN {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
-            format!("{file_kind} file is smaller than its header"),
+            "vector file is smaller than its header",
         ));
     }
     let header_bytes = file.slice_to(HEADER_LEN).read_bytes()?;
@@ -113,106 +102,64 @@ fn parse_header(file: &FileSlice, file_kind: &str) -> io::Result<(VectorFileVers
     Ok((version, file.slice_from(HEADER_LEN)))
 }
 
-/// Writes a `.vec` header.
-pub(crate) fn write_vector_header<W: Write + ?Sized>(writer: &mut W) -> io::Result<()> {
-    debug_assert_eq!(CURRENT_VECTOR as u32, VECTOR_FILE_FORMAT_VERSION);
-    write_header(writer, CURRENT_VECTOR)
-}
-
-/// Validates a `.vec` header and returns its version and composite body.
-pub(crate) fn read_vector_header(
-    file: &FileSlice,
-) -> crate::Result<(VectorFileVersion, FileSlice)> {
-    if file.len() < HEADER_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "vector file is smaller than its header",
-        )
-        .into());
-    }
-    let bytes = file.slice_to(HEADER_LEN).read_bytes()?;
-    let index_version = u32::deserialize(&mut bytes.as_slice())?;
-    let version = SUPPORTED_VECTOR
-        .iter()
-        .copied()
-        .find(|version| *version as u32 == index_version)
-        .ok_or(crate::TantivyError::IncompatibleIndex(
-            crate::directory::error::Incompatibility::VectorFormatMismatch {
-                index_version,
-                supported_version: VECTOR_FILE_FORMAT_VERSION,
-            },
-        ))?;
-    Ok((version, file.slice_from(HEADER_LEN)))
-}
-
-/// Checks only the vector header. A missing component means the segment has no vector data.
-pub(crate) fn check_vector_format(file: Result<FileSlice, OpenReadError>) -> crate::Result<()> {
-    match file {
-        Ok(file) => read_vector_header(&file).map(|_| ()),
-        Err(OpenReadError::FileDoesNotExist(_)) => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// Writes a `.centroids` header.
-pub(crate) fn write_centroid_header<W: Write + ?Sized>(writer: &mut W) -> io::Result<()> {
-    write_header(writer, CURRENT_CENTROID)
-}
-
-/// Parses a `.centroids` header and returns its version and composite body.
-pub(crate) fn read_centroid_header(file: &FileSlice) -> io::Result<(VectorFileVersion, FileSlice)> {
-    parse_header(file, "centroid")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn vector_header_round_trip() {
+    fn test_header_round_trip() {
         let mut buf = Vec::new();
-        write_vector_header(&mut buf).unwrap();
-        assert_eq!(buf, [4, 0, 0, 0]);
+        write_header(&mut buf).unwrap();
+        assert_eq!(buf.len(), HEADER_LEN);
+        assert_eq!(buf, vec![3, 0, 0, 0]);
 
-        let (version, body) = read_vector_header(&FileSlice::from(buf)).unwrap();
-        assert_eq!(version, VectorFileVersion::V4);
+        let (version, body) = read_header(&FileSlice::from(buf)).unwrap();
+        assert_eq!(version, VectorFileVersion::V3);
         assert_eq!(body.len(), 0);
     }
 
     #[test]
-    fn format_check_accepts_a_missing_vector_component() {
-        check_vector_format(Err(OpenReadError::FileDoesNotExist("segment.vec".into()))).unwrap();
-    }
-
-    #[test]
-    fn vector_header_preserves_body() {
+    fn test_header_preserves_body() {
         let mut buf = Vec::new();
-        write_vector_header(&mut buf).unwrap();
+        write_header(&mut buf).unwrap();
         buf.extend_from_slice(b"composite-bytes");
 
-        let (_, body) = read_vector_header(&FileSlice::from(buf)).unwrap();
+        let (version, body) = read_header(&FileSlice::from(buf)).unwrap();
+        assert_eq!(version, VectorFileVersion::V3);
         assert_eq!(body.read_bytes().unwrap().as_slice(), b"composite-bytes");
     }
 
+    /// A prior generation still PARSES here — the header module knows
+    /// versions, not policy. Rejecting a pre-V3 `.vec` is the vector
+    /// reader's job, where the REINDEX hint can be phrased.
     #[test]
-    fn vector_headers_before_v4_require_rebuild() {
-        for version in [
-            VectorFileVersion::V1,
-            VectorFileVersion::V2,
-            VectorFileVersion::V3,
-        ] {
-            let mut buf = Vec::new();
-            version.serialize(&mut buf).unwrap();
-            let error = read_vector_header(&FileSlice::from(buf)).unwrap_err();
-            assert!(error.to_string().contains("rebuild required"));
+    fn test_prior_version_parses() {
+        for (raw, expected) in [(1u32, VectorFileVersion::V1), (2, VectorFileVersion::V2)] {
+            let buf = raw.to_le_bytes().to_vec();
+            let (version, _) = read_header(&FileSlice::from(buf)).unwrap();
+            assert_eq!(version, expected);
         }
     }
 
     #[test]
-    fn truncated_vector_header_is_rejected() {
-        let error = read_vector_header(&FileSlice::from(vec![2u8, 0])).unwrap_err();
-        assert!(
-            matches!(error, crate::TantivyError::IoError(ref error) if error.kind() == io::ErrorKind::UnexpectedEof)
-        );
+    fn test_future_version_rejected() {
+        let buf = 4u32.to_le_bytes().to_vec();
+        let err = read_header(&FileSlice::from(buf)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_truncated_header_rejected() {
+        let buf = vec![3u8, 0];
+        let err = read_header(&FileSlice::from(buf)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+}
+
+pub(crate) fn check_vector_format(file: Result<FileSlice, OpenReadError>) -> crate::Result<()> {
+    match file {
+        Ok(file) => Ok(read_header(&file).map(|_| ())?),
+        Err(OpenReadError::FileDoesNotExist(_)) => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }

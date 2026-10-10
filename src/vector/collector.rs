@@ -1,83 +1,36 @@
-//! Top-N vector-similarity collector.
+//! Top-N vector-similarity search.
 //!
-//! Unlike the other `TopDocs::order_by_*` paths, the *primary* sort key here is
-//! not a [`SortKeyComputer`](crate::collector::sort_key::SortKeyComputer). IVF
-//! needs to drain the filter `DocSet` into a bitmap upfront and drive its own
-//! cluster iteration, which inverts the per-doc pull model that sort-key
-//! computers assume. So this is its own [`Collector`] with an overridden
-//! [`Collector::collect_segment`] that hands the filter `Weight` down to the
-//! per-segment [`VectorBackend`](super::backend::VectorBackend), which owns the
-//! loop. Flat fits the pull model trivially; IVF gets to drive.
+//! Unlike the other `TopDocs::order_by_*` paths, collection here is not
+//! per-segment at all: centroids are index-level and every segment shares
+//! their cluster ids, so the search ranks the set's centroids once and
+//! gathers each ranked cluster across ALL segments into one heap (see
+//! [`search`](super::search)). Call
+//! [`TopDocsByVectorSimilarity::search`] directly instead of passing this
+//! type to [`Searcher::search`](crate::Searcher::search), whose collector
+//! contract is intentionally per-segment.
 //!
 //! A secondary key *is* an ordinary `SortKeyComputer` — see
-//! [`TopDocsByVectorSimilarity::with_tie_break`]. The heap sorts on the
-//! composite `(similarity, tie_break)`, so `SortByStaticFastValue`,
-//! `SortByString` and their `(key, Order)` tuples all compose here, and
-//! [`TopNComputer`](crate::collector::TopNComputer) and `compare_for_top_k` are
-//! shared verbatim with the pull-model path. Only the iteration driver differs,
-//! never the ordering rule.
-//! Top-N vector-similarity collection.
+//! [`TopDocsByVectorSimilarity::with_tie_break`]. The global heap sorts on
+//! the composite `(similarity, tie_break)`; segment-local sort keys are
+//! lifted to their global form at push time, for competitive candidates
+//! only.
 
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::Arc;
 
-use super::backend::{ProbeStats, VectorBackend};
-use super::index_reader::QuantizedFieldReader;
-use super::ivf::AdaptiveProbeParams;
-use super::metadata::VectorColMetadata;
-use super::prepared::{QuantizedQueryCtx, VectorQuery};
+use super::backend::ProbeStats;
+use super::search::global_top_n_by;
 use super::tie_break::NoTieBreak;
-use super::{enter_vector_stage, Stage, VectorElement};
-use crate::collector::sort_key::NaturalComparator;
-use crate::collector::{
-    compare_for_top_k, Collector, ComparableDoc, SegmentCollector, SegmentSortKeyComputer,
-    SortKeyComputer,
-};
-use crate::index::SegmentReader;
-use crate::query::Weight;
+use super::VectorElement;
+use crate::collector::SortKeyComputer;
+use crate::query::{EnableScoring, Query, Weight};
 use crate::schema::{Field, FieldType, Schema};
-use crate::{DocAddress, DocId, Score, SegmentOrdinal, TantivyError};
-
-/// Query identity consists of dimension, metric tag and structural layer metadata.
-#[derive(Clone, Debug)]
-struct PreparedKey(Arc<VectorColMetadata>);
-impl PreparedKey {
-    fn query_fields(&self) -> Option<(u32, u8, &[super::metadata::Quantizer])> {
-        match self.0.as_ref() {
-            VectorColMetadata::Plain(_) => None,
-            VectorColMetadata::Quantized { field, layers } => {
-                let metric = match field.metric {
-                    crate::schema::Metric::L2 => 0,
-                    crate::schema::Metric::Dot => 1,
-                    crate::schema::Metric::Cosine => 2,
-                };
-                Some((field.dim, metric, layers))
-            }
-        }
-    }
-}
-impl PartialEq for PreparedKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.query_fields() == other.query_fields()
-    }
-}
-impl Eq for PreparedKey {}
-impl Hash for PreparedKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.query_fields().hash(state);
-    }
-}
-
-/// Shared initialization cell so each metadata key prepares its query exactly once.
-type PreparedCell = Arc<OnceLock<Arc<QuantizedQueryCtx>>>;
+use crate::vector::ivf::AdaptiveProbeParams;
+use crate::{DocAddress, Score, Searcher, TantivyError};
 
 /// Top-N by vector similarity. Returns documents in descending
 /// similarity order. Only docs that actually have a vector are
 /// returned — docs that match the filter but lack a vector for `field`
-/// are dropped (this is required for IVF compatibility, which can't
-/// see vectorless docs at all).
+/// are dropped (IVF storage can't see vectorless docs at all).
 ///
 /// Generic over `T: VectorElement` — `T` must match the schema's
 /// declared dtype, checked at [`Collector::check_schema`] time.
@@ -85,21 +38,16 @@ type PreparedCell = Arc<OnceLock<Arc<QuantizedQueryCtx>>>;
 /// `S` orders documents that tie on similarity; it defaults to
 /// [`NoTieBreak`], which leaves ties to ascending `DocAddress`. See
 /// [`with_tie_break`](Self::with_tie_break).
-/// Collects documents by descending vector similarity.
 pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     field: Field,
     query: Arc<Vec<T>>,
     limit: usize,
     offset: usize,
     adaptive: AdaptiveProbeParams,
-    max_scan_levels: usize,
-    /// Exactly one prepared query for each distinct segment encoding.
-    quantized_queries: Mutex<HashMap<PreparedKey, PreparedCell>>,
     tie_break: S,
 }
 
 impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
-    /// Creates a top-vector-similarity collector.
     pub fn new(field: Field, query: Vec<T>, limit: usize) -> Self {
         Self {
             field,
@@ -107,8 +55,6 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
             limit,
             offset: 0,
             adaptive: AdaptiveProbeParams::default(),
-            max_scan_levels: usize::MAX,
-            quantized_queries: Mutex::new(HashMap::new()),
             tie_break: NoTieBreak,
         }
     }
@@ -116,49 +62,38 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
 
 impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     /// Drop the first `offset` results in the global ranking — used to
-    /// paginate. Each segment still produces its top `limit + offset`
-    /// to ensure the global window has enough candidates.
-    /// Sets the global result offset.
+    /// paginate. The global heap keeps `limit + offset` candidates so the
+    /// window is exact.
     pub fn and_offset(mut self, offset: usize) -> Self {
         self.offset = offset;
         self
     }
 
-    /// Override the adaptive probing parameters (ignored by flat-only
-    /// segments).
-    /// Sets adaptive probing parameters.
+    /// Override the adaptive probing parameters.
     pub fn with_adaptive_params(mut self, params: AdaptiveProbeParams) -> Self {
         self.adaptive = params;
-        self
-    }
-
-    /// Limits the quantized residual prefix.
-    pub fn with_max_scan_levels(mut self, max_scan_levels: usize) -> Self {
-        self.max_scan_levels = max_scan_levels;
         self
     }
 
     /// Order documents that tie on similarity by `tie_break`, as
     /// `ORDER BY embedding <=> $1, id` does.
     ///
-    /// The tie-break takes part in each segment's top-N eviction, so it also
-    /// decides *which* of a set of equally-distant documents survive, not only
-    /// how the survivors are ordered. Similarity remains the primary key; the
-    /// tie-break is only consulted between documents whose similarity is
-    /// exactly equal.
+    /// The tie-break takes part in the global heap's eviction, so it also
+    /// decides *which* of a set of equally-distant documents survive, not
+    /// only how the survivors are ordered. Similarity remains the primary
+    /// key; the tie-break is only consulted between documents whose
+    /// similarity is exactly equal.
     ///
-    /// This does not change which clusters an IVF segment probes: the probe
-    /// loop's stopping rule reads the routed centroids and the filter, never
-    /// the top-N heap.
+    /// This does not change which clusters are probed: the probe loop's
+    /// stopping rule reads the routed centroids and the work budget,
+    /// never the tie-break.
     ///
-    /// Each segment is cut to its own top-N under the segment-local
-    /// `SegmentSortKey`, and only the survivors are lifted to `SortKey` for the
-    /// cross-segment merge. `convert_segment_sort_key` must therefore be
-    /// order-preserving within a segment, or a segment can discard a document
-    /// that would have placed globally. The bundled computers satisfy this:
-    /// term ordinals ascend with their terms, and `FastValue`'s `u64` encoding
-    /// is monotonic.
-    /// Sets a secondary ordering for equal similarities.
+    /// Candidates are keyed by the GLOBAL `SortKey` at push time — a
+    /// segment-local `SegmentSortKey` (e.g. a term ordinal) means nothing
+    /// beside another segment's, and the heap holds candidates from every
+    /// segment at once. `convert_segment_sort_key` must therefore be
+    /// order-preserving within a segment; the bundled computers satisfy
+    /// this.
     pub fn with_tie_break<S2: SortKeyComputer>(
         self,
         tie_break: S2,
@@ -169,8 +104,6 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
             limit: self.limit,
             offset: self.offset,
             adaptive: self.adaptive,
-            max_scan_levels: self.max_scan_levels,
-            quantized_queries: self.quantized_queries,
             tie_break,
         }
     }
@@ -178,79 +111,35 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     fn segment_top_n(&self) -> usize {
         self.limit.saturating_add(self.offset)
     }
-
-    fn segment_query(&self, reader: &SegmentReader) -> crate::Result<VectorQuery<T>> {
-        let quantized = match reader.vector_index(self.field)?.quantization() {
-            Some(field) if self.max_scan_levels > 0 => Some(self.quantized_query(field)),
-            _ => None,
-        };
-        Ok(VectorQuery::new(Arc::clone(&self.query), quantized))
-    }
-
-    /// Prepares once per metadata key, releasing the map lock before expensive preparation.
-    fn quantized_query(&self, field: &QuantizedFieldReader) -> Arc<QuantizedQueryCtx> {
-        let index_ctx = field.index_ctx();
-        let prepare = || {
-            let active_layers = self.max_scan_levels.min(index_ctx.specs.len());
-            let query = self.query.iter().map(|value| value.to_f32()).collect();
-            Arc::new(QuantizedQueryCtx::with_depth(
-                Arc::clone(index_ctx),
-                query,
-                active_layers,
-            ))
-        };
-        let cell = Arc::clone(
-            self.quantized_queries
-                .lock()
-                .unwrap()
-                .entry(PreparedKey(Arc::clone(&index_ctx.meta)))
-                .or_default(),
-        );
-        Arc::clone(cell.get_or_init(prepare))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn quantized_query_count(&self) -> usize {
-        self.quantized_queries.lock().unwrap().len()
-    }
 }
 
 /// What a [`TopDocsByVectorSimilarity`] search returns: the global top-N
-/// plus each searched segment's [`ProbeStats`], so callers can inspect or
-/// aggregate probe metrics without a side channel.
-/// Contains vector results and per-segment probe statistics.
+/// plus the query's probe instrumentation.
 #[derive(Debug, Default)]
 pub struct VectorSimilarityFruit {
     /// Global top-N `(score, address)` pairs in descending-similarity order.
-    /// Global results in descending-similarity order.
     pub results: Vec<(Score, DocAddress)>,
-    /// One [`ProbeStats`] per collected segment, in segment-ordinal order
-    /// after [`Collector::merge_fruits`]. The counter fields are summable
-    /// across segments; `termination` only carries per-segment meaning.
-    /// Probe statistics in segment order.
-    pub stats: Vec<ProbeStats>,
+    /// The query's [`ProbeStats`] — one per query: the probe loop is
+    /// global, so its counters are too.
+    pub stats: ProbeStats,
 }
 
-/// One segment's contribution, before [`Collector::merge_fruits`] cuts the
-/// global window.
-///
-/// Carries the tie-break value alongside each score because the cross-segment
-/// merge has to order by the same composite key the per-segment heaps used.
-/// The value is dropped at merge time — callers order by similarity and read
-/// their own columns back themselves, so it never reaches [`VectorSimilarityFruit`].
-/// One segment's vector results with secondary sort keys.
-pub struct SegmentVectorFruit<K> {
-    results: Vec<((Score, K), DocAddress)>,
-    stats: ProbeStats,
-}
-
-impl<T, S> Collector for TopDocsByVectorSimilarity<T, S>
+impl<T, S> TopDocsByVectorSimilarity<T, S>
 where
     T: VectorElement,
-    S: SortKeyComputer + Send + Sync + 'static,
+    S: SortKeyComputer,
 {
-    type Fruit = VectorSimilarityFruit;
-    type Child = NoOpSegmentCollector<S::SortKey>;
+    /// Run one vector search across every segment in `searcher`, using
+    /// `filter` to select candidate documents.
+    pub fn search(
+        &self,
+        searcher: &Searcher,
+        filter: &dyn Query,
+    ) -> crate::Result<VectorSimilarityFruit> {
+        self.check_schema(searcher.schema())?;
+        let weight = filter.weight(EnableScoring::disabled_from_searcher(searcher))?;
+        self.collect_global(searcher, weight.as_ref())
+    }
 
     fn check_schema(&self, schema: &Schema) -> crate::Result<()> {
         let entry = schema.get_field_entry(self.field);
@@ -283,7 +172,6 @@ where
             // `requires_scoring` is false below, so the filter's BM25 score is
             // never computed and every doc would tie-break on the same
             // placeholder. Fail loudly rather than silently ordering by nothing.
-            // Relevance scores are unavailable on vector-ordered scans.
             return Err(TantivyError::InvalidArgument(
                 "vector similarity cannot be tie-broken by the relevance score: no score is \
                  computed when ordering by a vector field"
@@ -293,171 +181,54 @@ where
         self.tie_break.check_schema(schema)
     }
 
-    fn for_segment(
+    fn collect_global(
         &self,
-        _segment_local_id: SegmentOrdinal,
-        _reader: &SegmentReader,
-    ) -> crate::Result<Self::Child> {
-        // Never called at runtime — we override `collect_segment`. The
-        // child type exists only to satisfy the trait bound.
-        Ok(NoOpSegmentCollector::default())
-    }
-
-    fn requires_scoring(&self) -> bool {
-        // Similarity is computed from the stored vectors, not from the
-        // filter's BM25 score — let tantivy take the no-score fast path.
-        false
-    }
-
-    fn collect_segment(
-        &self,
+        searcher: &Searcher,
         weight: &dyn Weight,
-        segment_ord: SegmentOrdinal,
-        reader: &SegmentReader,
-    ) -> crate::Result<SegmentVectorFruit<S::SortKey>> {
-        let collect_start = Instant::now();
-        let init_start = Instant::now();
-        let init_stage = enter_vector_stage(Stage::ScanInit);
-        let prep_start = Instant::now();
-        let query_prep_stage = enter_vector_stage(Stage::QueryPrep);
-        let query = self.segment_query(reader)?;
-        drop(query_prep_stage);
-        let query_prep_ns = prep_start.elapsed().as_nanos() as u64;
-        let mut backend = VectorBackend::for_segment(
-            reader,
-            segment_ord,
-            self.field,
-            query,
-            self.adaptive.clone(),
-        )?;
-        backend.add_query_prep_ns(query_prep_ns);
-        let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
-        drop(init_stage);
-        backend.add_scan_init_ns(
-            (init_start.elapsed().as_nanos() as u64).saturating_sub(backend.query_prep_ns()),
-        );
-        let (hits, mut stats) = backend.top_n_by(
+    ) -> crate::Result<VectorSimilarityFruit> {
+        let (hits, stats) = global_top_n_by(
+            searcher,
             weight,
-            reader,
+            self.field,
+            &self.query,
             self.segment_top_n(),
-            &mut tie_break,
-            self.tie_break.comparator(),
+            &self.adaptive,
+            &self.tie_break,
         )?;
-        // Lift the segment-local tie-break key to its global form, but only
-        // now: a `SegmentSortKey` can be a term ordinal, which means nothing
-        // outside this segment and must never reach the cross-segment merge.
         let results = hits
-            .into_iter()
-            .map(|((score, segment_key), address)| {
-                (
-                    (score, tie_break.convert_segment_sort_key(segment_key)),
-                    address,
-                )
-            })
-            .collect();
-        let residual_ns =
-            (collect_start.elapsed().as_nanos() as u64).saturating_sub(stats.stage_elapsed_ns());
-        let assembly_ns = stats.result_assembly_ns.unwrap_or_default();
-        stats.result_assembly_ns = Some(assembly_ns.saturating_add(residual_ns));
-        Ok(SegmentVectorFruit { results, stats })
-    }
-
-    fn merge_fruits(
-        &self,
-        segment_fruits: Vec<SegmentVectorFruit<S::SortKey>>,
-    ) -> crate::Result<Self::Fruit> {
-        let assembly_start = Instant::now();
-        let _assembly_stage = enter_vector_stage(Stage::ResultAssembly);
-        // Per-segment fruits are each already top-(limit+offset) under this
-        // same composite order, so the global window is a plain sort of their
-        // union. Stats concatenate untouched — one entry per segment, kept
-        // even when the offset swallows every result.
-        let comparator = (NaturalComparator, self.tie_break.comparator());
-        let mut stats = Vec::with_capacity(segment_fruits.len());
-        let mut all: Vec<ComparableDoc<(Score, S::SortKey), DocAddress>> = Vec::new();
-        for fruit in segment_fruits {
-            stats.push(fruit.stats);
-            all.extend(
-                fruit
-                    .results
-                    .into_iter()
-                    .map(|(sort_key, doc)| ComparableDoc { sort_key, doc }),
-            );
-        }
-        // `compare_for_top_k` is the same rule the per-segment heaps used,
-        // down to the trailing ascending-`DocAddress` tie-break, so it is a
-        // total order and the unstable sort is deterministic.
-        all.sort_unstable_by(|lhs, rhs| compare_for_top_k(&comparator, lhs, rhs));
-        let results = all
             .into_iter()
             .skip(self.offset)
             .take(self.limit)
-            .map(|cd| (cd.sort_key.0, cd.doc))
+            .map(|((score, _tie), address)| (score, address))
             .collect();
-        if let Some(first) = stats.first_mut() {
-            let merge_ns = assembly_start.elapsed().as_nanos() as u64;
-            let segment_ns = first.result_assembly_ns.unwrap_or_default();
-            first.result_assembly_ns = Some(segment_ns.saturating_add(merge_ns));
-        }
         Ok(VectorSimilarityFruit { results, stats })
     }
 }
 
-/// Trait-bound shim: the collector overrides [`Collector::collect_segment`]
-/// so the per-doc path never fires, but the `Child: SegmentCollector`
-/// bound on `Collector` still has to be satisfied.
-/// Satisfies the collector's segment-child type requirement.
-pub struct NoOpSegmentCollector<K>(std::marker::PhantomData<K>);
-
-impl<K> Default for NoOpSegmentCollector<K> {
-    fn default() -> Self {
-        NoOpSegmentCollector(std::marker::PhantomData)
-    }
-}
-
-impl<K: 'static + Send> SegmentCollector for NoOpSegmentCollector<K> {
-    type Fruit = SegmentVectorFruit<K>;
-    fn collect(&mut self, _doc: DocId, _score: Score) {}
-    fn harvest(self) -> Self::Fruit {
-        SegmentVectorFruit {
-            results: Vec::new(),
-            stats: ProbeStats::default(),
-        }
-    }
-}
-
 #[cfg(test)]
-mod ivf_e2e_tests {
-    //! End-to-end coverage: drives the full
-    //! `searcher.search → TopDocsByVectorSimilarity → collect_segment
-    //! → IvfBackend::top_n → merge_fruits` path against the shared
-    //! `TestVectorIndex` fixture and asserts the resulting global
-    //! top-K matches `index.ground_truth(...)`. Built on the shared
-    //! fixture so the manual flat/ivf scene construction the
-    //! pre-consolidation tests carried is gone — `vector_storage_format`
-    //! is the only knob.
+mod e2e_tests {
+    //! End-to-end coverage of the production path:
+    //! `TopDocsByVectorSimilarity::search → search::global_top_n_by`, asserted
+    //! against `index.ground_truth(...)`.
+
     use std::sync::Arc;
 
     use super::VectorSimilarityFruit;
     use crate::collector::sort_key::{SortBySimilarityScore, SortByStaticFastValue};
     use crate::collector::TopDocs;
-    use crate::index::IndexSettings;
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
-    use crate::schema::{Field, Schema, FAST, STORED, STRING};
-    use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
-    use crate::vector::{Metric, RouterKind, VectorDType, VectorOptions, VectorStorageFormat};
+    use crate::schema::{Field, Schema, FAST};
+    use crate::vector::tests::{exhaustive_params, Grid2DCentroidProducer, TestVectorIndex};
+    use crate::vector::{Metric, RouterKind, VectorDType, VectorOptions};
     use crate::{DocAddress, Index, Order, Score, TantivyDocument, TantivyError};
 
-    /// IVF + exhaustive probing matches the global oracle. The shared
-    /// fixture produces multiple IVF segments (it merges raw segments
-    /// pairwise), so this single test already exercises cross-segment
-    /// merge_fruits.
+    /// Exhaustive probing matches the global oracle across the fixture's
+    /// several segments — one routing pass, one heap.
     #[test]
-    fn e2e_ivf_matches_global_oracle() -> crate::Result<()> {
+    fn e2e_matches_global_oracle() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
             .metric(Metric::L2)
-            .vector_storage_format(VectorStorageFormat::Ivf)
             .build()?;
         let searcher = index.index.reader()?.searcher();
         let params = exhaustive_params(9);
@@ -467,22 +238,19 @@ mod ivf_e2e_tests {
                 let collector = TopDocs::with_limit(k)
                     .order_by_similarity(index.embedding_field(), query.to_vec())
                     .with_adaptive_params(params.clone());
-                let actual = searcher.search(&AllQuery, &collector)?;
-                assert_eq!(actual.results, expected, "IVF query={query:?} k={k}");
+                let actual = collector.search(&searcher, &AllQuery)?;
+                assert_eq!(actual.results, expected, "query={query:?} k={k}");
             }
         }
         Ok(())
     }
 
-    /// The production path: the fruit of a normal `searcher.search` carries
-    /// one `ProbeStats` per IVF segment, each satisfying the counter
-    /// invariant, so callers can aggregate probe metrics straight off the
-    /// search result.
+    /// The fruit carries ONE global `ProbeStats` satisfying the counter
+    /// invariant — the probe loop is global, so its counters are too.
     #[test]
-    fn e2e_ivf_fruit_carries_per_segment_probe_stats() -> crate::Result<()> {
+    fn e2e_fruit_carries_global_probe_stats() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
             .metric(Metric::L2)
-            .vector_storage_format(VectorStorageFormat::Ivf)
             .build()?;
         let searcher = index.index.reader()?.searcher();
         let num_segments = searcher.segment_readers().len();
@@ -490,20 +258,16 @@ mod ivf_e2e_tests {
         let collector = TopDocs::with_limit(4)
             .order_by_similarity(index.embedding_field(), vec![0.5_f32, 0.5])
             .with_adaptive_params(exhaustive_params(9));
-        let fruit = searcher.search(&AllQuery, &collector)?;
+        let fruit = collector.search(&searcher, &AllQuery)?;
 
-        // One ProbeStats per searched segment.
-        assert_eq!(fruit.stats.len(), num_segments);
-        let mut total_visited = 0usize;
-        for s in &fruit.stats {
-            assert_eq!(
-                s.vectors_visited,
-                s.pruned_filter + s.pruned_dead + s.candidates_scored,
-                "invariant per segment: {s:?}"
-            );
-            total_visited += s.vectors_visited;
-        }
-        assert!(total_visited > 0, "exhaustive probe should visit docs");
+        let s = &fruit.stats;
+        assert_eq!(
+            s.vectors_visited,
+            s.pruned_filter + s.pruned_dead + s.pruned_seen + s.candidates_scored,
+            "invariant: {s:?}"
+        );
+        assert_eq!(s.segments_searched as usize, num_segments);
+        assert!(s.vectors_visited > 0);
         Ok(())
     }
 
@@ -512,7 +276,6 @@ mod ivf_e2e_tests {
     fn e2e_offset_window_matches_oracle_slice() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
             .metric(Metric::L2)
-            .vector_storage_format(VectorStorageFormat::Ivf)
             .build()?;
         let searcher = index.index.reader()?.searcher();
         let query = [0.5_f32, 0.5];
@@ -524,31 +287,8 @@ mod ivf_e2e_tests {
             .and_offset(offset)
             .order_by_similarity(index.embedding_field(), query.to_vec())
             .with_adaptive_params(exhaustive_params(9));
-        let actual = searcher.search(&AllQuery, &collector)?;
+        let actual = collector.search(&searcher, &AllQuery)?;
         assert_eq!(actual.results, expected);
-        Ok(())
-    }
-
-    /// Flat-format build also matches the oracle. Pairs with
-    /// `e2e_ivf_matches_global_oracle` to exercise the per-segment
-    /// dispatch on both backend variants — `vector_storage_format`
-    /// is the only thing that changes between them.
-    #[test]
-    fn e2e_flat_matches_global_oracle() -> crate::Result<()> {
-        let index = TestVectorIndex::builder(VectorDType::F32)
-            .metric(Metric::L2)
-            .vector_storage_format(VectorStorageFormat::Flat)
-            .build()?;
-        let searcher = index.index.reader()?.searcher();
-        for query in [[0.5_f32, 0.5], [9.7, 10.3]] {
-            for k in [1usize, 4, 8] {
-                let expected = index.ground_truth(query, k)?;
-                let collector = TopDocs::with_limit(k)
-                    .order_by_similarity(index.embedding_field(), query.to_vec());
-                let actual = searcher.search(&AllQuery, &collector)?;
-                assert_eq!(actual.results, expected, "Flat query={query:?} k={k}");
-            }
-        }
         Ok(())
     }
 
@@ -557,17 +297,12 @@ mod ivf_e2e_tests {
         let mut schema_builder = Schema::builder();
         let embedding_field = schema_builder.add_vector_field("embedding", vector_options);
         let id_field = schema_builder.add_u64_field("id", FAST);
-        let settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..IndexSettings::default()
-        };
         let index = Index::builder()
             .schema(schema_builder.build())
-            .settings(settings)
-            .ivf_clusterer(Arc::new(Grid2DClusterer {
+            .centroid_producer(Arc::new(Grid2DCentroidProducer {
                 centroids: vec![[0.0, 0.0], [10.0, 10.0]],
             }))
-            .ivf_router(RouterKind::Stacked)?
+            .ivf_router(RouterKind::Rng)?
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -595,26 +330,17 @@ mod ivf_e2e_tests {
         writer.commit()?;
         writer.wait_merging_threads()?;
 
-        // A fixture that ended up all-Flat would quietly stop testing the
-        // probe loop at all.
+        // The tie-break must cross a segment boundary to prove anything.
         let searcher = index.reader()?.searcher();
-        let ivf_segments = searcher
-            .segment_readers()
-            .iter()
-            .filter(|reader| {
-                reader
-                    .vector_index(embedding_field)
-                    .is_ok_and(|vectors| vectors.index().is_some())
-            })
-            .count();
-        assert!(ivf_segments >= 1, "expected at least one Ivf segment");
         assert!(
-            ivf_segments < searcher.segment_readers().len(),
-            "expected at least one Flat segment"
+            searcher.segment_readers().len() >= 2,
+            "fixture needs >= 2 segments"
         );
         Ok((index, embedding_field, id_field))
     }
 
+    /// Tie-breaks match a brute-force total order, and leave the probe
+    /// loop untouched: the same clusters are probed with or without one.
     #[test]
     fn e2e_tie_break_matches_oracle_and_leaves_probing_untouched() -> crate::Result<()> {
         let ids: Vec<u64> = (0..30).map(|i| (i * 11) % 30).collect();
@@ -631,7 +357,7 @@ mod ivf_e2e_tests {
                 let id_column = reader.fast_fields().u64("id")?;
                 let vector_reader = reader.vector_index(embedding_field)?;
                 for doc_id in 0..reader.max_doc() {
-                    let row = vector_reader.row_id(doc_id)?.unwrap();
+                    let row = vector_reader.row_id(doc_id).unwrap();
                     let bytes = vector_reader.vector_bytes_for_row(row)?;
                     expected.push((
                         -crate::vector::l2_squared_bytes(&query, &bytes),
@@ -659,15 +385,13 @@ mod ivf_e2e_tests {
             );
 
             for k in [1usize, 3, 7, 12] {
-                // Ordering: exhaustive probing so the IVF side is exact and
-                // only the composite ordering + cross-segment merge is tested.
-                let fruit = searcher.search(
-                    &AllQuery,
-                    &TopDocs::with_limit(k)
-                        .order_by_similarity(embedding_field, query.to_vec())
-                        .with_adaptive_params(exhaustive_params(9))
-                        .with_tie_break(tie_break()),
-                )?;
+                // Ordering: exhaustive probing so the ranking is exact and
+                // only the composite ordering is tested.
+                let fruit = TopDocs::with_limit(k)
+                    .order_by_similarity(embedding_field, query.to_vec())
+                    .with_adaptive_params(exhaustive_params(2))
+                    .with_tie_break(tie_break())
+                    .search(&searcher, &AllQuery)?;
                 let actual: Vec<DocAddress> =
                     fruit.results.iter().map(|(_, address)| *address).collect();
                 let want: Vec<DocAddress> = expected.iter().take(k).map(|entry| entry.2).collect();
@@ -677,16 +401,14 @@ mod ivf_e2e_tests {
                 // gate/ceiling logic actually runs.
                 let collector =
                     || TopDocs::with_limit(k).order_by_similarity(embedding_field, query.to_vec());
-                let mut untied = searcher.search(&AllQuery, &collector())?;
-                let mut tied =
-                    searcher.search(&AllQuery, &collector().with_tie_break(tie_break()))?;
+                let untied = collector().search(&searcher, &AllQuery)?;
+                let tied = collector()
+                    .with_tie_break(tie_break())
+                    .search(&searcher, &AllQuery)?;
                 assert!(
-                    untied.stats.iter().any(|s| s.candidates_scored > 0),
+                    untied.stats.candidates_scored > 0,
                     "no probe activity to compare for query={query:?} k={k}"
                 );
-                for stats in untied.stats.iter_mut().chain(&mut tied.stats) {
-                    stats.clear_stage_timings();
-                }
                 assert_eq!(
                     format!("{:?}", untied.stats),
                     format!("{:?}", tied.stats),
@@ -695,13 +417,10 @@ mod ivf_e2e_tests {
             }
         }
 
-        let err = searcher
-            .search(
-                &AllQuery,
-                &TopDocs::with_limit(2)
-                    .order_by_similarity(embedding_field, vec![0.0_f32, 0.0])
-                    .with_tie_break(SortBySimilarityScore::new()),
-            )
+        let err = TopDocs::with_limit(2)
+            .order_by_similarity(embedding_field, vec![0.0_f32, 0.0])
+            .with_tie_break(SortBySimilarityScore::new())
+            .search(&searcher, &AllQuery)
             .unwrap_err();
         assert!(
             matches!(err, TantivyError::InvalidArgument(ref msg) if msg.contains("relevance score")),
@@ -710,22 +429,20 @@ mod ivf_e2e_tests {
         Ok(())
     }
 
+    /// All four docs tie on distance; the lowest `DocAddress` must win
+    /// even though its cluster is probed LAST — cluster-order arrival must
+    /// not decide ties.
     #[test]
-    fn e2e_ivf_cluster_order_keeps_the_lowest_doc_of_a_tie() -> crate::Result<()> {
+    fn e2e_cluster_order_keeps_the_lowest_doc_of_a_tie() -> crate::Result<()> {
         let vector_options = VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32);
         let mut schema_builder = Schema::builder();
         let embedding_field = schema_builder.add_vector_field("embedding", vector_options);
-        let settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..IndexSettings::default()
-        };
         let index = Index::builder()
             .schema(schema_builder.build())
-            .settings(settings)
-            .ivf_clusterer(Arc::new(Grid2DClusterer {
+            .centroid_producer(Arc::new(Grid2DCentroidProducer {
                 centroids: vec![[0.0, 10.0], [0.0, -10.0]],
             }))
-            .ivf_router(RouterKind::Stacked)?
+            .ivf_router(RouterKind::Rng)?
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -757,16 +474,11 @@ mod ivf_e2e_tests {
 
         let searcher = index.reader()?.searcher();
         assert_eq!(searcher.segment_readers().len(), 1);
-        let reader = searcher.segment_reader(0);
-        let ivf = reader.vector_index(embedding_field)?;
-        assert!(ivf.index().is_some(), "expected an Ivf segment");
 
-        let fruit = searcher.search(
-            &AllQuery,
-            &TopDocs::with_limit(1)
-                .order_by_similarity(embedding_field, query.to_vec())
-                .with_adaptive_params(exhaustive_params(2)),
-        )?;
+        let fruit = TopDocs::with_limit(1)
+            .order_by_similarity(embedding_field, query.to_vec())
+            .with_adaptive_params(exhaustive_params(2))
+            .search(&searcher, &AllQuery)?;
         // All four docs tie at distance 1, so the lowest DocAddress wins.
         let scores: Vec<Score> = fruit.results.iter().map(|(score, _)| *score).collect();
         assert_eq!(scores, vec![-1.0], "expected the shared distance");
@@ -778,6 +490,10 @@ mod ivf_e2e_tests {
         Ok(())
     }
 
+    /// Segment-local term ordinals as tie-breaks: the global heap holds
+    /// candidates from EVERY segment at once, so keys must be lifted to
+    /// their global (string) form at push time — comparing raw ordinals
+    /// across segments would order b, a, c, b.
     #[test]
     fn e2e_tie_break_on_segment_local_term_ordinals() -> crate::Result<()> {
         use crate::collector::sort_key::SortByString;
@@ -788,6 +504,10 @@ mod ivf_e2e_tests {
         let city_field = schema_builder.add_text_field("city", crate::schema::STRING | FAST);
         let index = Index::builder()
             .schema(schema_builder.build())
+            .centroid_producer(Arc::new(Grid2DCentroidProducer {
+                centroids: vec![[0.0, 0.0]],
+            }))
+            .ivf_router(RouterKind::Rng)?
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -862,218 +582,39 @@ mod ivf_e2e_tests {
             (2, vec!["a", "b"]),
             (1, vec!["a"]),
         ] {
-            let fruit = searcher.search(
-                &AllQuery,
-                &TopDocs::with_limit(k)
-                    .order_by_similarity(embedding_field, vec![0.0_f32, 0.0])
-                    .with_tie_break((SortByString::for_field("city"), Order::Asc)),
-            )?;
+            let fruit = TopDocs::with_limit(k)
+                .order_by_similarity(embedding_field, vec![0.0_f32, 0.0])
+                .with_tie_break((SortByString::for_field("city"), Order::Asc))
+                .search(&searcher, &AllQuery)?;
             assert_eq!(cities(&fruit), want, "k={k}");
         }
         Ok(())
     }
 
-    /// Single index containing both a Flat segment (un-merged commit) and
-    /// an Ivf segment (merged commit under `vector_clustering_threshold=1`)
-    /// so the collector has to dispatch `FlatBackend::top_n` on one and
-    /// `IvfBackend::top_n` on the other in a single `searcher.search`.
-    /// Hand-built — `TestVectorIndex` produces a single format index-wide
-    /// — but uses the shared `Grid2DClusterer` and `ground_truth::top_k`
-    /// so there's no parallel oracle / clusterer to drift.
+    /// `check_schema` failures surface with their own messages: a
+    /// mismatched query dim and a non-vector field.
     #[test]
-    fn e2e_mixed_flat_and_ivf_matches_global_oracle() -> crate::Result<()> {
-        let centroids: Vec<[f32; 2]> = vec![[0.0, 0.0], [10.0, 10.0]];
-        let metric = Metric::L2;
-        let vector_options = VectorOptions::new(2, metric).with_dtype(VectorDType::F32);
-        let mut schema_builder = Schema::builder();
-        let embedding_field = schema_builder.add_vector_field("embedding", vector_options);
-        let label_field = schema_builder.add_text_field("label", STRING | STORED);
-        let schema = schema_builder.build();
-        let settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..IndexSettings::default()
-        };
-        let index = Index::builder()
-            .schema(schema)
-            .settings(settings)
-            .ivf_clusterer(Arc::new(Grid2DClusterer {
-                centroids: centroids.clone(),
-            }))
-            .ivf_router(RouterKind::Stacked)?
-            .create_in_ram()?;
-        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
-        writer.set_merge_policy(Box::new(NoMergePolicy));
+    fn e2e_check_schema_errors() -> crate::Result<()> {
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .metric(Metric::L2)
+            .build()?;
+        let searcher = index.index.reader()?.searcher();
 
-        // Two commits → two flat segments; pairwise merge → one Ivf segment
-        // (threshold=1 trips the format flip).
-        let ivf_batches: [&[(&str, [f32; 2])]; 2] = [
-            &[
-                ("ivf0", [0.1, 0.1]),
-                ("ivf1", [0.3, -0.2]),
-                ("ivf2", [10.1, 9.9]),
-            ],
-            &[
-                ("ivf3", [9.9, 10.1]),
-                ("ivf4", [-0.2, 0.3]),
-                ("ivf5", [10.4, 9.8]),
-            ],
-        ];
-        for batch in ivf_batches {
-            for (lbl, v) in batch {
-                let mut doc = TantivyDocument::new();
-                doc.add_vector(embedding_field, v);
-                doc.add_text(label_field, *lbl);
-                writer.add_document(doc)?;
-            }
-            writer.commit()?;
-        }
-        let mut ivf_targets = index.searchable_segment_ids()?;
-        ivf_targets.sort();
-        assert_eq!(ivf_targets.len(), 2, "expected two segments to merge");
-        writer.merge(&ivf_targets).wait()?;
-
-        // One more un-merged commit → flat segment.
-        let flat_batch: [(&str, [f32; 2]); 3] = [
-            ("flat0", [0.4, 0.4]),
-            ("flat1", [10.3, 10.3]),
-            ("flat2", [-0.1, 0.2]),
-        ];
-        for (lbl, v) in flat_batch {
-            let mut doc = TantivyDocument::new();
-            doc.add_vector(embedding_field, &v);
-            doc.add_text(label_field, lbl);
-            writer.add_document(doc)?;
-        }
-        writer.commit()?;
-        writer.wait_merging_threads()?;
-
-        // Confirm both formats are actually represented — the whole point
-        // of this test is mixed dispatch, so a vacuous all-Flat or all-Ivf
-        // index should fail loudly here.
-        let searcher = index.reader()?.searcher();
-        let mut flat_count = 0usize;
-        let mut ivf_count = 0usize;
-        for reader in searcher.segment_readers() {
-            match reader.vector_index(embedding_field)?.index() {
-                None => flat_count += 1,
-                Some(_) => ivf_count += 1,
-            }
-        }
+        let wrong_dim =
+            TopDocs::with_limit(2).order_by_similarity(index.embedding_field(), vec![0.0_f32; 3]);
+        let err = wrong_dim.search(&searcher, &AllQuery).unwrap_err();
         assert!(
-            flat_count >= 1 && ivf_count >= 1,
-            "expected mixed segments, got {flat_count} flat / {ivf_count} ivf"
+            matches!(err, TantivyError::SchemaError(ref msg) if msg.contains("does not match")),
+            "unexpected error: {err:?}"
         );
 
-        // Exhaustive probing on the Ivf side so the only thing being
-        // tested here is per-segment dispatch + merge_fruits — not the
-        // adaptive loop, which is covered separately.
-        let params = exhaustive_params(9);
-        for query in [[0.0_f32, 0.0], [10.0, 10.0], [5.0, 5.0]] {
-            for k in [1usize, 3, 6] {
-                let expected = ground_truth::top_k(&index, embedding_field, metric, &query, k)?;
-                let collector = TopDocs::with_limit(k)
-                    .order_by_similarity(embedding_field, query.to_vec())
-                    .with_adaptive_params(params.clone());
-                let actual = searcher.search(&AllQuery, &collector)?;
-                assert_eq!(actual.results, expected, "mixed query={query:?} k={k}");
-            }
-        }
+        let not_a_vector =
+            TopDocs::with_limit(2).order_by_similarity(index.label_field(), vec![0.0_f32, 0.0]);
+        let err = not_a_vector.search(&searcher, &AllQuery).unwrap_err();
+        assert!(
+            matches!(err, TantivyError::SchemaError(ref msg) if msg.contains("not a vector field")),
+            "unexpected error: {err:?}"
+        );
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod prepared_key_tests {
-    use super::*;
-    use crate::schema::{Metric, VectorOptions};
-    use crate::vector::metadata::{Grid, Partition, Quantizer, Rotation};
-    use crate::vector::quantization::{
-        VectorNormPolicy, VectorQuantizationConfig, VectorQuantizationLayer,
-    };
-    fn metadata(metric: Metric, schedule: &[u8]) -> VectorColMetadata {
-        let opts = VectorOptions::new(100, metric);
-        let config = VectorQuantizationConfig::materialize(
-            "v".into(),
-            &opts,
-            schedule
-                .iter()
-                .map(|&bits| VectorQuantizationLayer { bits, seed: 17 })
-                .collect(),
-        )
-        .unwrap();
-        VectorColMetadata::build_ivf(&opts, Some(&config)).unwrap()
-    }
-    fn key(meta: &VectorColMetadata) -> PreparedKey {
-        PreparedKey(Arc::new(meta.clone()))
-    }
-    fn hash(meta: &VectorColMetadata) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        key(meta).hash(&mut h);
-        h.finish()
-    }
-    // Storage geometry does not split prepared-query cache keys.
-    #[test]
-    fn query_identity_uses_only_semantic_bits() {
-        let original = metadata(Metric::L2, &[1, 4]);
-        let mut changed = original.clone();
-        if let VectorColMetadata::Quantized { field, .. } = &mut changed {
-            field.norm_policy = VectorNormPolicy::UnitL2;
-            field.partition = Partition::Uniform { rows_per_block: 7 };
-        }
-        assert_eq!(key(&original), key(&changed));
-        assert_eq!(hash(&original), hash(&changed));
-        assert_ne!(original.to_bytes(), changed.to_bytes());
-        for change in 0..8 {
-            let mut changed = original.clone();
-            if let VectorColMetadata::Quantized { field, layers } = &mut changed {
-                match change {
-                    0 => field.dim += 1,
-                    1 => field.metric = Metric::Dot,
-                    2 => {
-                        if let Quantizer::SignPlane { rotation, .. } = &mut layers[0] {
-                            *rotation = Rotation::None;
-                        }
-                    }
-                    3 => {
-                        if let Quantizer::SignPlane { rho_model, .. } = &mut layers[0] {
-                            rho_model.0 += 1;
-                        }
-                    }
-                    4 => {
-                        if let Quantizer::GridPlane { bits, .. } = &mut layers[1] {
-                            *bits = 3;
-                        }
-                    }
-                    5 => {
-                        if let Quantizer::GridPlane { grid, .. } = &mut layers[1] {
-                            grid.points[0] = f32::from_bits(grid.points[0].to_bits() ^ 1);
-                        }
-                    }
-                    6 => {
-                        if let Quantizer::SignPlane { rotation, .. } = &mut layers[0] {
-                            *rotation = Rotation::SeededFhtChaCha8 { seed: 18 };
-                        }
-                    }
-                    _ => {
-                        if let Quantizer::GridPlane { grid, .. } = &mut layers[1] {
-                            grid.rho_model = f64::from_bits(grid.rho_model.to_bits() + 1);
-                        }
-                    }
-                }
-            }
-            assert_ne!(key(&original), key(&changed));
-        }
-        let g = Grid {
-            points: vec![0.0],
-            rho_model: 1.0,
-        };
-        let mut other = g.clone();
-        other.points[0] = -0.0;
-        let quant = |grid| super::super::metadata::Quantizer::GridPlane {
-            bits: 2,
-            rotation: Rotation::None,
-            grid,
-        };
-        assert_ne!(quant(g), quant(other));
     }
 }

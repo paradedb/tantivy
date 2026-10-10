@@ -1,34 +1,22 @@
 //! Per-query precomputation hoisted out of the per-doc scoring loop.
 //!
-//! Built once per [`VectorBackend::for_segment`] and held by the backend.
-//! Hides the metric match and any metric-specific precomputed scalars
-//! (currently only `1/||q||` for cosine) behind
-//! [`PreparedQuery::score_doc_bytes`].
+//! Built once per query by the cross-segment search driver
+//! ([`search`](super::search)). Hides the metric match and any
+//! metric-specific precomputed scalars (currently only `1/||q||` for
+//! cosine) behind [`PreparedQuery::score_doc_bytes`].
 //!
 //! Stored vectors — including IVF centroids — are unit-normalized at
 //! write time for `Cosine + F32` (see
 //! [`maybe_normalize_bytes`](super::distance::maybe_normalize_bytes)),
 //! so a single scoring entry point covers both per-doc and centroid
 //! scans.
-//!
-//! [`VectorBackend::for_segment`]: super::backend::VectorBackend::for_segment
-//! Prepared exact and quantized query state.
 
 use std::sync::Arc;
 
-use cascade::{prepare_split_query_with_plan, LayerSpec, PreparedSplitQuery, QueryRotationPlan};
-use quant_model::Grid;
-
-use super::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide};
-use super::metadata::VectorColMetadata;
-#[cfg(test)]
-use super::quantization::VectorQuantizationConfig;
-use super::quantization::{GAMMA_ANALYTICAL_SAFETY, SIGN_QUERY_BITS};
 use super::VectorElement;
-use crate::schema::Metric;
-use crate::TantivyError;
+use crate::schema::{Metric, VectorDType};
+use crate::vector::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide, DotAccumulator};
 
-/// Metric-specific prepared vector query.
 pub struct PreparedQuery<T: VectorElement> {
     query: Arc<Vec<T>>,
     kind: QueryKind,
@@ -36,376 +24,17 @@ pub struct PreparedQuery<T: VectorElement> {
 
 /// Metric-specific per-query state. Each variant carries only what
 /// that metric actually needs — no dead fields for L2 / Dot.
-/// Metric-specific per-query state.
 enum QueryKind {
     L2,
     Dot,
     Cosine {
         /// `1.0 / ||q||`. `0.0` for a zero / non-finite query norm so a
         /// degenerate query scores `0.0` against every doc.
-        /// Reciprocal query norm, or zero for a degenerate query.
         inv_norm_q: f32,
     },
 }
 
-/// Immutable quantization state for one segment's field, built when the
-/// segment's vector reader opens.
-pub(crate) struct QuantizedIndexCtx {
-    pub(crate) meta: Arc<VectorColMetadata>,
-    pub(crate) specs: Vec<LayerSpec>,
-    pub(crate) grids: Vec<Grid>,
-    rotation_plan: QueryRotationPlan,
-}
-
-/// Applies the metric-specific correction to a cumulative quantized estimate.
-#[inline(always)]
-pub(crate) fn corrected_quantized_estimate(
-    metric: Metric,
-    gamma: f32,
-    raw_prefix: f32,
-    base: f32,
-) -> f32 {
-    let metric_factor = if metric == Metric::L2 { 2.0 } else { 1.0 };
-    (metric_factor * gamma).mul_add(raw_prefix, base)
-}
-
-/// Combines the first L2 layer's unscaled kernel output.
-#[inline(always)]
-pub(crate) fn initial_l2_raw_prefix(kernel_score: f32, scale: f32, constant: f32) -> f32 {
-    scale.mul_add(kernel_score, -constant)
-}
-
-/// Combines the first dot-like layer's unscaled kernel output.
-#[inline(always)]
-pub(crate) fn initial_dot_raw_prefix(kernel_score: f32, scale: f32) -> f32 {
-    kernel_score * scale
-}
-
-/// Adds an L2 refinement to the cumulative raw prefix.
-#[inline(always)]
-pub(crate) fn refine_l2_raw_prefix(
-    raw_prefix: f32,
-    kernel_score: f32,
-    scale: f32,
-    constant: f32,
-) -> f32 {
-    scale.mul_add(kernel_score, raw_prefix - constant)
-}
-
-/// Analytical f32 subtraction error, in raw-prefix units. The two split-form
-/// operands were rounded independently; cancellation does not remove their error.
-/// This is machine epsilon times the sum of operand magnitudes, not a fitted
-/// constant. Refinements additionally account for `raw_prefix - constant`.
-#[inline(always)]
-pub(crate) fn l2_arithmetic_variance(
-    kernel_score: f32,
-    scale: f32,
-    constant: f32,
-    previous_prefix: Option<f32>,
-) -> f32 {
-    // c = 2: independently rounded split operands, then the fused subtraction.
-    let subtraction = rounding_error(scale * kernel_score, constant, 2.0);
-    // c = 1: the separate `previous_prefix - constant` subtraction.
-    let refinement = previous_prefix.map_or(0.0, |prefix| rounding_error(prefix, constant, 1.0));
-    subtraction * subtraction + refinement * refinement
-}
-
-/// Propagate raw-prefix arithmetic error through the L2 `2 * gamma` correction
-/// and combine it in quadrature with the statistical model width.
-#[inline(always)]
-pub(crate) fn rounding_error(a: f32, b: f32, rounding_count: f32) -> f32 {
-    rounding_count * f32::EPSILON * (a.abs() + b.abs())
-}
-
-/// Arithmetic uncertainty is kept separately so a refinement can change gamma
-/// without losing or double-scaling the error accumulated in the raw prefix.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct ArithmeticError {
-    pub(crate) raw_variance: f32,
-    pub(crate) base_variance: f32,
-}
-
-impl ArithmeticError {
-    pub(crate) fn initial(
-        metric: Metric,
-        kernel: f32,
-        scale: f32,
-        constant: f32,
-        cluster_score: f32,
-        residual_norm_sq: f32,
-    ) -> Self {
-        let raw_variance = if metric == Metric::L2 {
-            l2_arithmetic_variance(kernel, scale, constant, None)
-        } else {
-            // c = 1: the initial scale * kernel multiplication.
-            rounding_error(scale * kernel, 0.0, 1.0).powi(2)
-        };
-        let base_variance = if metric == Metric::L2 {
-            // c = 1: cluster_score - residual_norm_sq.
-            rounding_error(cluster_score, residual_norm_sq, 1.0).powi(2)
-        } else {
-            0.0
-        };
-        Self {
-            raw_variance,
-            base_variance,
-        }
-    }
-
-    pub(crate) fn refine(
-        &mut self,
-        metric: Metric,
-        prefix: f32,
-        kernel: f32,
-        scale: f32,
-        constant: f32,
-    ) {
-        self.raw_variance += if metric == Metric::L2 {
-            l2_arithmetic_variance(kernel, scale, constant, Some(prefix))
-        } else {
-            // c = 2: rounded layer contribution plus the refinement addition.
-            rounding_error(scale * kernel, prefix, 2.0).powi(2)
-        };
-    }
-
-    pub(crate) fn sigma(
-        self,
-        metric: Metric,
-        model_sigma: f32,
-        gamma: f32,
-        prefix: f32,
-        base: f32,
-    ) -> f32 {
-        let factor = if metric == Metric::L2 {
-            2.0 * gamma
-        } else {
-            gamma
-        };
-        // c = 1: the final fused base-plus-corrected-residual expression. This
-        // includes cosine's base-plus-residual sum even if its model width is zero.
-        let final_error = rounding_error(factor * prefix, base, 1.0);
-        model_sigma.hypot(
-            (factor * factor * self.raw_variance + self.base_variance + final_error * final_error)
-                .sqrt(),
-        )
-    }
-}
-
-/// Adds a dot-like refinement to the cumulative raw prefix.
-#[inline(always)]
-pub(crate) fn refine_dot_raw_prefix(raw_prefix: f32, kernel_score: f32, scale: f32) -> f32 {
-    scale.mul_add(kernel_score, raw_prefix)
-}
-
-/// Computes the production uncertainty width for a corrected estimate.
-#[inline(always)]
-pub(crate) fn quantized_model_sigma(
-    metric: Metric,
-    dimension: usize,
-    residual_norm_squared: f32,
-    corrected_error_ratio: f32,
-    gamma: f32,
-    score_query_norm_squared: f32,
-    sign_query_error_term: f32,
-) -> f32 {
-    debug_assert_ne!(dimension, 0);
-    let data_variance = residual_norm_squared
-        * (1.0 / dimension as f32)
-        * corrected_error_ratio
-        * score_query_norm_squared;
-    let query_variance = gamma * gamma * sign_query_error_term;
-    let metric_factor = if metric == Metric::L2 { 2.0 } else { 1.0 };
-    metric_factor * GAMMA_ANALYTICAL_SAFETY * (data_variance + query_variance).sqrt()
-}
-
-impl QuantizedIndexCtx {
-    /// Builds query inputs only from the immutable segment metadata.
-    pub(crate) fn new(meta: Arc<VectorColMetadata>) -> crate::Result<Self> {
-        if !matches!(meta.as_ref(), VectorColMetadata::Quantized { .. }) {
-            return Err(TantivyError::InvalidArgument(
-                "prepared queries require quantized metadata".into(),
-            ));
-        }
-        let (specs, grids) = meta.runtime();
-        let rotation_plan = QueryRotationPlan::new(meta.field().dim as usize, &specs);
-        Ok(Self {
-            meta,
-            specs,
-            grids,
-            rotation_plan,
-        })
-    }
-    #[cfg(test)]
-    pub(crate) fn from_config(config: VectorQuantizationConfig) -> crate::Result<Self> {
-        let opts = crate::schema::VectorOptions::new(config.dim, config.metric);
-        Self::new(Arc::new(VectorColMetadata::build_ivf(
-            &opts,
-            Some(&config),
-        )?))
-    }
-}
-
-/// A vector query as seen by one segment.
-pub(crate) struct VectorQuery<T: VectorElement> {
-    /// Full-precision coordinates, always kept for exact scoring and rerank.
-    pub(crate) raw: Arc<Vec<T>>,
-    /// Quantized scan state; `None` when the segment is not quantized or
-    /// quantized scanning is disabled.
-    pub(crate) quantized: Option<Arc<QuantizedQueryCtx>>,
-}
-
-impl<T: VectorElement> VectorQuery<T> {
-    pub(crate) fn new(raw: Arc<Vec<T>>, quantized: Option<Arc<QuantizedQueryCtx>>) -> Self {
-        Self { raw, quantized }
-    }
-}
-
-/// Immutable query rotations, sign bitplanes, and LUTs shared across segments.
-pub(crate) struct QuantizedQueryCtx {
-    pub(crate) index: Arc<QuantizedIndexCtx>,
-    prepared: PreparedSplitQuery,
-    query: Vec<f32>,
-    query_norm_sq: f32,
-    active_layers: usize,
-}
-
-impl QuantizedQueryCtx {
-    pub(crate) fn new(index: Arc<QuantizedIndexCtx>, query: Vec<f32>) -> Self {
-        let active_layers = index.specs.len();
-        Self::with_depth(index, query, active_layers)
-    }
-
-    pub(crate) fn with_depth(
-        index: Arc<QuantizedIndexCtx>,
-        mut query: Vec<f32>,
-        active_layers: usize,
-    ) -> Self {
-        assert!((1..=index.specs.len()).contains(&active_layers));
-        if index.meta.field().metric == Metric::Cosine {
-            let norm = norm_squared_wide(&query).sqrt();
-            if norm != 0.0 && norm.is_finite() {
-                let inv = (1.0 / norm) as f32;
-                for value in &mut query {
-                    *value *= inv;
-                }
-            } else {
-                query.fill(0.0);
-            }
-        }
-        let query_norm_sq = norm_squared_wide(&query) as f32;
-        let prepared = prepare_split_query_with_plan(
-            &query,
-            &index.rotation_plan,
-            &index.grids[..active_layers],
-            SIGN_QUERY_BITS,
-        );
-        Self {
-            index,
-            prepared,
-            query,
-            query_norm_sq,
-            active_layers,
-        }
-    }
-
-    pub(crate) fn active_layers(&self) -> usize {
-        self.active_layers
-    }
-
-    /// Squared query-quantization error contributed by this layer alone: the
-    /// sign-plane error for a 1-bit layer, zero for a grid layer. Callers that
-    /// need the cumulative term sum it themselves (see `combine_refinement_decoded`).
-    pub(crate) fn query_error_squared(&self, layer: usize) -> f64 {
-        self.prepared.query_error_squared(layer)
-    }
-
-    pub(crate) fn score_layer(
-        &self,
-        layer: usize,
-        codes: &[u8],
-        scale: f32,
-        constant: Option<f32>,
-    ) -> crate::Result<f32> {
-        match (self.index.meta.field().metric, constant) {
-            (Metric::L2, Some(constant)) => Ok(self.prepared.score_layer(
-                layer,
-                codes,
-                scale,
-                constant,
-                self.index.specs[layer],
-            )),
-            (Metric::L2, None) => Err(TantivyError::DataCorruption(
-                crate::error::DataCorruption::comment_only(
-                    "quantized L2 scoring requires a split constant",
-                ),
-            )),
-            (Metric::Dot | Metric::Cosine, None) => Ok(self.prepared.score_layer_without_constant(
-                layer,
-                codes,
-                scale,
-                self.index.specs[layer],
-            )),
-            (Metric::Dot | Metric::Cosine, Some(_)) => Err(TantivyError::DataCorruption(
-                crate::error::DataCorruption::comment_only(
-                    "quantized dot and cosine scoring omit split constants",
-                ),
-            )),
-        }
-    }
-
-    /// Scores a fixed-stride code batch with the resolved layer kernel.
-    #[inline(always)]
-    pub(crate) fn score_layer_batch_unscaled(
-        &self,
-        layer: usize,
-        codes: &[u8],
-        code_stride: usize,
-        out: &mut [f32],
-    ) {
-        self.prepared.score_layer_batch_unscaled(
-            layer,
-            codes,
-            code_stride,
-            self.index.specs[layer],
-            out,
-        );
-    }
-
-    #[inline(always)]
-    pub(crate) fn score_layer_batch_unscaled_indexed(
-        &self,
-        layer: usize,
-        codes: &[u8],
-        code_stride: usize,
-        row_offsets: &[usize],
-        out: &mut [f32],
-    ) {
-        self.prepared.score_layer_batch_unscaled_indexed(
-            layer,
-            codes,
-            code_stride,
-            row_offsets,
-            self.index.specs[layer],
-            out,
-        );
-    }
-
-    /// Returns the query-vector norm used by the layer error model.
-    pub(crate) fn score_query_norm(&self, routing_score: f32) -> f32 {
-        if self.index.meta.field().metric == Metric::L2 {
-            (-routing_score).max(0.0).sqrt()
-        } else {
-            self.query_norm_sq.sqrt()
-        }
-    }
-
-    pub(crate) fn query(&self) -> &[f32] {
-        &self.query
-    }
-}
-
 impl<T: VectorElement> PreparedQuery<T> {
-    /// Prepares a query for one metric.
     pub fn new(metric: Metric, query: Arc<Vec<T>>) -> Self {
         let kind = match metric {
             Metric::L2 => QueryKind::L2,
@@ -426,7 +55,6 @@ impl<T: VectorElement> PreparedQuery<T> {
         Self { query, kind }
     }
 
-    /// Returns the query metric.
     pub fn metric(&self) -> Metric {
         match self.kind {
             QueryKind::L2 => Metric::L2,
@@ -435,7 +63,6 @@ impl<T: VectorElement> PreparedQuery<T> {
         }
     }
 
-    /// Returns the query coordinates.
     pub fn query(&self) -> &[T] {
         &self.query
     }
@@ -443,7 +70,6 @@ impl<T: VectorElement> PreparedQuery<T> {
     /// Score a stored vector — either a document or an IVF centroid.
     /// Both are unit-normalized at write time for `Cosine + F32`, so
     /// the cosine branch collapses to `dot * inv_norm_q`.
-    /// Scores a stored vector row.
     #[inline]
     pub fn score_doc_bytes(&self, doc_bytes: &[u8]) -> f32 {
         match self.kind {
@@ -452,87 +78,118 @@ impl<T: VectorElement> PreparedQuery<T> {
             QueryKind::Cosine { inv_norm_q } => dot_bytes::<T>(&self.query, doc_bytes) * inv_norm_q,
         }
     }
+
+    pub(crate) fn dot_accumulator(&self) -> Option<DotAccumulator> {
+        (T::DTYPE == VectorDType::F32 && T::SIZE_BYTES == 4 && !matches!(self.kind, QueryKind::L2))
+            .then(DotAccumulator::new)
+    }
+
+    #[inline]
+    pub(crate) fn score_doc_fragment(
+        &self,
+        accumulator: &mut DotAccumulator,
+        bytes: &[u8],
+        complete: bool,
+    ) -> Option<f32> {
+        accumulator.push::<T>(&self.query, bytes);
+        complete.then(|| {
+            let dot = accumulator.finish::<T>(&self.query);
+            match self.kind {
+                QueryKind::Dot => dot,
+                QueryKind::Cosine { inv_norm_q } => dot * inv_norm_q,
+                QueryKind::L2 => unreachable!("L2 uses the contiguous row scorer"),
+            }
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use super::*;
 
-    use super::{QuantizedIndexCtx, QuantizedQueryCtx};
-    use crate::schema::{Metric, VectorOptions};
-    use crate::vector::{VectorQuantizationConfig, VectorQuantizationLayer};
-
-    #[test]
-    fn quantized_query_is_prepared_only_for_matching_index_configs() {
-        let mut config = VectorQuantizationConfig::materialize(
-            "prepared_for_embedding".to_string(),
-            &VectorOptions::new(100, Metric::Dot),
-            vec![VectorQuantizationLayer {
-                bits: 1,
-                seed: 0xfeed_2001,
-            }],
-        )
-        .unwrap();
-        let first_index = Arc::new(QuantizedIndexCtx::from_config(config.clone()).unwrap());
-        let query = QuantizedQueryCtx::new(Arc::clone(&first_index), vec![0.5_f32; 100]);
-        assert!(Arc::ptr_eq(&query.index.meta, &first_index.meta));
-
-        let other_segment = Arc::new(QuantizedIndexCtx::from_config(config.clone()).unwrap());
-        assert_eq!(query.index.meta.to_bytes(), other_segment.meta.to_bytes());
-
-        config.layers[0].seed = 0xfeed_2002;
-        let reseeded_index = Arc::new(QuantizedIndexCtx::from_config(config).unwrap());
-        assert_ne!(query.index.meta.to_bytes(), reseeded_index.meta.to_bytes());
+    fn bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
     }
 
     #[test]
-    fn quantized_index_context_requires_persisted_grid_and_rho() {
-        let config = VectorQuantizationConfig::materialize(
-            "strict_persisted_model".to_string(),
-            &VectorOptions::new(100, Metric::Dot),
-            vec![VectorQuantizationLayer {
-                bits: 1,
-                seed: 0xfeed_4001,
-            }],
-        )
-        .unwrap();
-
-        let mut missing_grid = config.clone();
-        missing_grid.grids.clear();
-        let error = QuantizedIndexCtx::from_config(missing_grid)
-            .err()
-            .expect("missing grid must be rejected");
-        assert!(error.to_string().contains("grid"));
+    fn fragmented_dot_scores_match_contiguous_bits() {
+        for dim in [1, 15, 16, 17, 31, 33, 1024] {
+            for profile in 0..3 {
+                let query: Vec<f32> = (0..dim)
+                    .map(|i| match profile {
+                        0 => ((i * 17 % 31) as f32 - 15.0) * 0.03137,
+                        1 => [1.0e20, -1.0e20, 1.0e-20, -1.0e-20][i % 4],
+                        _ => {
+                            if i % 2 == 0 {
+                                0.0
+                            } else {
+                                -0.0
+                            }
+                        }
+                    })
+                    .collect();
+                let doc: Vec<f32> = (0..dim)
+                    .map(|i| ((i * 13 % 43) as f32 - 21.0) * 0.06257)
+                    .collect();
+                let doc = bytes(&doc);
+                for metric in [Metric::Dot, Metric::Cosine] {
+                    let prepared = PreparedQuery::new(metric, Arc::new(query.clone()));
+                    let expected = prepared.score_doc_bytes(&doc).to_bits();
+                    let mut accumulator = prepared.dot_accumulator().unwrap();
+                    for split in 0..=doc.len() {
+                        assert!(prepared
+                            .score_doc_fragment(&mut accumulator, &doc[..split], false)
+                            .is_none());
+                        let score = prepared
+                            .score_doc_fragment(&mut accumulator, &doc[split..], true)
+                            .unwrap();
+                        assert_eq!(
+                            score.to_bits(),
+                            expected,
+                            "{metric:?}, dim={dim}, split={split}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
-    fn query_error_is_exact_for_sign_layers_and_zero_for_grid_luts() {
-        let config = VectorQuantizationConfig::materialize(
-            "query_error_by_kernel".to_string(),
-            &VectorOptions::new(100, Metric::Dot),
-            vec![
-                VectorQuantizationLayer { bits: 1, seed: 1 },
-                VectorQuantizationLayer { bits: 4, seed: 2 },
-            ],
-        )
-        .unwrap();
-        let query_values = (0..100)
-            .map(|coordinate| ((coordinate as f32 + 0.25) * 0.173).sin())
-            .collect::<Vec<_>>();
-        let index = Arc::new(QuantizedIndexCtx::from_config(config).unwrap());
-        let expected = cascade::audit_split_query_layer_error_squared_with_plan(
-            &query_values,
-            &index.rotation_plan,
-            &index.grids,
-            4,
-        );
-        let query = QuantizedQueryCtx::new(index, query_values);
-
-        assert_eq!(
-            query.query_error_squared(0).to_bits(),
-            expected[0].to_bits()
-        );
-        assert!(query.query_error_squared(0) > 0.0);
-        assert_eq!(query.query_error_squared(1), 0.0);
+    fn fragmented_dot_scores_handle_many_chunks_and_row_reuse() {
+        for dim in [3, 17, 1024, 4099] {
+            for chunk_size in [1, 3, 7, 63, 64, 65, 8160] {
+                for metric in [Metric::Dot, Metric::Cosine] {
+                    let query = (0..dim).map(|i| i as f32 * 0.003 - 0.2).collect();
+                    let prepared = PreparedQuery::new(metric, Arc::new(query));
+                    let mut accumulator = prepared.dot_accumulator().unwrap();
+                    for row in 0..3 {
+                        let doc = bytes(
+                            &(0..dim)
+                                .map(|i| ((i + row * 7) % 23) as f32 * 0.125 - 1.0)
+                                .collect::<Vec<_>>(),
+                        );
+                        let mut actual = None;
+                        for (i, fragment) in doc.chunks(chunk_size).enumerate() {
+                            assert!(actual.is_none());
+                            actual = prepared.score_doc_fragment(
+                                &mut accumulator,
+                                fragment,
+                                (i + 1) * chunk_size >= doc.len(),
+                            );
+                        }
+                        assert_eq!(
+                            actual.unwrap().to_bits(),
+                            prepared.score_doc_bytes(&doc).to_bits(),
+                            "{metric:?}, dim={dim}, chunks={chunk_size}",
+                        );
+                    }
+                }
+            }
+        }
+        let prepared = PreparedQuery::new(Metric::L2, Arc::new(vec![1.0f32; 17]));
+        assert!(prepared.dot_accumulator().is_none());
     }
 }

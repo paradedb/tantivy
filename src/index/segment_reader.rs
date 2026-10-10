@@ -20,8 +20,7 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
-use crate::vector::index_reader::VectorFieldReader;
-use crate::vector::{VectorColMetadata, VectorIndexReader};
+use crate::vector::VectorIndexReader;
 use crate::{DocId, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
@@ -42,7 +41,7 @@ pub struct SegmentReader {
     custom_alive_bitset: Option<AliveBitSet>,
 
     inv_idx_reader_cache: Arc<RwLock<HashMap<Field, Arc<InvertedIndexReader>>>>,
-    vector_reader_cache: Arc<RwLock<HashMap<Field, Arc<VectorFieldReader>>>>,
+    vector_reader_cache: Arc<RwLock<HashMap<Field, Arc<VectorIndexReader>>>>,
     delete_opstamp: Option<Opstamp>,
 
     max_doc: DocId,
@@ -188,30 +187,19 @@ impl SegmentReader {
     /// (zero vectors, no index) rather than an error, so callers never branch
     /// on presence. Requesting a non-vector field is an error.
     pub fn vector_index(&self, field: Field) -> crate::Result<Arc<VectorIndexReader>> {
-        self.vector_field(field)?.search_reader()
-    }
-
-    /// Returns stored field metadata without reading IdMap, routing payloads or block geometry.
-    /// A segment without vector data returns `None`.
-    pub fn vector_metadata(&self, field: Field) -> crate::Result<Option<Arc<VectorColMetadata>>> {
-        Ok(self.vector_field(field)?.metadata())
-    }
-
-    fn vector_field(&self, field: Field) -> crate::Result<Arc<VectorFieldReader>> {
         if let Some(reader) = self
             .vector_reader_cache
             .read()
-            .expect("Lock poisoned")
+            .expect("Lock poisoned. This should never happen")
             .get(&field)
         {
             return Ok(Arc::clone(reader));
         }
-        let mut cache = self.vector_reader_cache.write().expect("Lock poisoned");
-        if let Some(reader) = cache.get(&field) {
-            return Ok(Arc::clone(reader));
-        }
-        let reader = Arc::new(VectorFieldReader::open(self, field)?);
-        cache.insert(field, Arc::clone(&reader));
+        let reader = Arc::new(VectorIndexReader::open(self, field)?);
+        self.vector_reader_cache
+            .write()
+            .expect("Lock poisoned. This should never happen")
+            .insert(field, Arc::clone(&reader));
         Ok(reader)
     }
 

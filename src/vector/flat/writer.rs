@@ -1,3 +1,9 @@
+//! Per-commit vector writer: buffers raw vector bytes per doc and, at
+//! segment finalize, writes the segment's `.vec` in the layout the index
+//! dictates — clustered (assigned against the index-level centroid index)
+//! when the index has one, flat (doc-ordered, searched exhaustively) when
+//! it does not. The mutable/staging tier is exactly the no-set case.
+
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -9,16 +15,28 @@ use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::plugin::PluginWriter;
 use crate::schema::document::{ErasedDocument, ErasedValue, ReferenceValueLeaf};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
-use crate::vector::blocks::{align_up, block_align, pad, write_metadata, BlockDirectory};
 use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
-use crate::vector::header::{write_vector_header, VectorEntry, HEADER_LEN};
-use crate::vector::metadata::{VectorColMetadata, FLAT_ROWS_PER_BLOCK};
-use crate::vector::{ENTRY_ALIGN, VEC_EXT};
+use crate::vector::header::{vec_slot, write_header};
+use crate::vector::ivf::centroid_index::CentroidIndexReader;
+use crate::vector::ivf::{write_ivf_field, IvfFieldWriteParams};
+use crate::vector::VEC_EXT;
 use crate::{DocId, TantivyError};
 
-/// Buffers one vector field before serialization.
+/// Per-field in-memory state: the doc ids that have a value (ascending),
+/// plus a dense byte array — analogous to fast-fields' `Optional`
+/// cardinality. Docs without a vector occupy zero bytes of storage.
+///
+/// Rows are kept as raw little-endian bytes rather than decoded `T`
+/// values. The bytes go in via `add_document` and come back out at
+/// serialize time unchanged — no decode/re-encode round-trip, no
+/// dependency on `T: VectorElement` in the writer.
 struct FieldBuffer {
+    /// Doc ids that have a value for this field, in insertion order
+    /// (which equals ascending old-doc-id order since `add_document<D>`
+    /// is called sequentially).
     present_doc_ids: Vec<DocId>,
+    /// Dense byte blob: `row_bytes[i*stride..(i+1)*stride]` is the
+    /// vector for `present_doc_ids[i]`.
     row_bytes: Vec<u8>,
     opts: VectorOptions,
 }
@@ -40,15 +58,14 @@ impl FieldBuffer {
     }
 }
 
-/// Writes full-precision vector rows.
-pub struct FlatVecWriter {
+pub struct VecWriter {
     fields: BTreeMap<Field, FieldBuffer>,
-    /// Number of documents represented by the presence map.
+    /// Set by [`SegmentWriter::finalize`] before [`serialize`]. Used for
+    /// the ascending-doc-order invariant checks.
     num_docs: DocId,
 }
 
-impl FlatVecWriter {
-    /// Creates a writer for all vector fields in a schema.
+impl VecWriter {
     pub fn for_schema(schema: &Schema) -> Self {
         let mut fields = BTreeMap::new();
         for (field, entry) in schema.fields() {
@@ -70,7 +87,7 @@ impl FlatVecWriter {
     }
 }
 
-impl PluginWriter for FlatVecWriter {
+impl PluginWriter for VecWriter {
     fn add_document(
         &mut self,
         doc_id: DocId,
@@ -85,6 +102,7 @@ impl PluginWriter for FlatVecWriter {
             let Some(buf) = self.fields.get_mut(&field) else {
                 continue;
             };
+            // Only the first value per field counts, matching `get_first` semantics.
             if buf.present_doc_ids.last() == Some(&doc_id) {
                 continue;
             }
@@ -103,6 +121,10 @@ impl PluginWriter for FlatVecWriter {
                     bytes.len(),
                 )));
             }
+            // NonFinite is a hard ingest error: bad data is rejected at the
+            // boundary so merge and query never have to re-classify it. The
+            // offending row is still in the buffer, but an add_document error
+            // aborts the segment build — it is never serialized.
             if buf.push_bytes(doc_id, bytes) == NormalizeOutcome::NonFinite {
                 return Err(TantivyError::InvalidArgument(format!(
                     "non-finite element in vector field '{}' (doc {doc_id}): vectors must contain \
@@ -122,11 +144,36 @@ impl PluginWriter for FlatVecWriter {
         if self.fields.is_empty() {
             return Ok(());
         }
-        let mut write = segment.open_write(SegmentComponent::Custom(VEC_EXT.to_string()))?;
-        write_vector_header(&mut write)?;
-        let mut composite = CompositeWrite::wrap(write);
+        if self
+            .fields
+            .values()
+            .all(|buf| buf.present_doc_ids.is_empty())
+        {
+            // No rows anywhere: no `.vec` at all — the reader treats a
+            // missing file as "no vector data".
+            return Ok(());
+        }
 
-        let mut id_maps = Vec::new();
+        let index = segment.index();
+        let meta = index.load_metas()?;
+        let set = match meta.centroid_index.as_ref() {
+            Some(centroid_index) => {
+                index.cached_centroid_index()?;
+                let set_reader = CentroidIndexReader::open(
+                    index.directory(),
+                    std::path::Path::new(centroid_index),
+                )?;
+                Some(set_reader)
+            }
+            None => None,
+        };
+
+        let mut write = segment.open_write(SegmentComponent::Custom(VEC_EXT.to_string()))?;
+        write_header(&mut write)?;
+        let mut composite = CompositeWrite::wrap(write);
+        let cancel = || false;
+        let schema = segment.schema();
+
         for (field, buf) in self.fields {
             // Compute (present, row_bytes) in target doc-id order. For
             // the no-remap case the writer already accumulates in
@@ -135,9 +182,9 @@ impl PluginWriter for FlatVecWriter {
             let (present, row_bytes): (Vec<DocId>, Vec<u8>) = if let Some(map) = doc_id_map {
                 let mut p = Vec::new();
                 let mut r = Vec::new();
-                for (target_doc_id, source_doc_id) in map.iter_source_doc_ids().enumerate() {
-                    if let Ok(row_idx) = buf.present_doc_ids.binary_search(&source_doc_id) {
-                        p.push(target_doc_id as DocId);
+                for (new_doc_id, old_doc_id) in map.iter_old_doc_ids().enumerate() {
+                    if let Ok(row_idx) = buf.present_doc_ids.binary_search(&old_doc_id) {
+                        p.push(new_doc_id as DocId);
                         let start = row_idx * stride;
                         r.extend_from_slice(&buf.row_bytes[start..start + stride]);
                     }
@@ -146,33 +193,51 @@ impl PluginWriter for FlatVecWriter {
             } else {
                 (buf.present_doc_ids, buf.row_bytes)
             };
-
-            // Data entries precede IdMaps so their exact lengths exclude alignment padding.
-            id_maps.push((field, present));
-            let meta = VectorColMetadata::build_flat(&buf.opts);
-            let align = block_align(&meta.slots());
-            composite.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
-            let data = composite.for_field_with_idx(field, VectorEntry::Data.index());
-            let start = data.written_bytes();
-            write_metadata(data, &meta)?;
-            let mut directory = BlockDirectory::new(data.written_bytes() - start);
-            let mut rows = 0u32;
-            // A full row group or the final partial group forms one aligned Rows column.
-            for block in row_bytes.chunks(FLAT_ROWS_PER_BLOCK as usize * stride) {
-                data.write_all(block)?;
-                pad(data, align_up(block.len(), align) - block.len())?;
-                rows += (block.len() / stride) as u32;
-                directory.push(data.written_bytes() - start, rows);
+            if present.is_empty() {
+                continue;
             }
-            directory.finish(data)?;
-            assert_eq!((data.written_bytes() - start) as usize % ENTRY_ALIGN, 0);
-            data.flush()?;
-        }
-        for (field, present) in id_maps {
-            IdMap::serialize(
-                &present,
-                self.num_docs,
-                composite.for_field_with_idx(field, VectorEntry::IdMap.index()),
+
+            let Some(set_reader) = &set else {
+                // Flat layout (no centroid index — the mutable/staging
+                // tier): the `Identity`/`Bitmap` id-map and the
+                // doc-ordered rows, nothing else. Searched exhaustively;
+                // clustered at its first merge into a real index.
+                let id_map_w = composite.for_field_with_idx(field, vec_slot::ID_MAP);
+                IdMap::serialize(&present, self.num_docs, id_map_w)?;
+                id_map_w.flush()?;
+                let rows_w = composite.for_field_with_idx(field, vec_slot::ROWS);
+                rows_w.write_all(&row_bytes)?;
+                rows_w.flush()?;
+                continue;
+            };
+
+            let field_centroids = set_reader.field_centroids(field, &buf.opts)?;
+            let params = IvfFieldWriteParams {
+                field,
+                opts: &buf.opts,
+                set: &field_centroids,
+                replicas: index.settings().vector_replicas,
+                bounds_scope: index.settings().vector_bounds_scope,
+                cancel: &cancel,
+                field_name: schema.get_field_entry(field).name(),
+            };
+            write_ivf_field(
+                &mut composite,
+                &params,
+                &mut |sink| {
+                    for (row_idx, &doc_id) in present.iter().enumerate() {
+                        sink(
+                            doc_id,
+                            row_idx as u64,
+                            &row_bytes[row_idx * stride..(row_idx + 1) * stride],
+                        )?;
+                    }
+                    Ok(())
+                },
+                &mut |handle, sink| {
+                    let row_idx = handle as usize;
+                    sink(&row_bytes[row_idx * stride..(row_idx + 1) * stride])
+                },
             )?;
         }
         composite.close()?;

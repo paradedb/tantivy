@@ -1,37 +1,25 @@
-//! Distance kernels, the vector element trait, and the per-segment storage plugin.
+//! Vector storage and search.
+//!
+//! The index-level centroid index owns the shared centroid matrix and router.
+//! Segment writers assign vectors to those centroids and store their rows,
+//! offsets, and bounds. The cross-segment driver in [`search`] ranks centroids
+//! once and probes every segment with one result heap and work budget.
 //!
 //! The schema-level field configuration ([`VectorOptions`](crate::schema::VectorOptions),
-//! [`Metric`](crate::schema::Metric), [`VectorDType`]) lives in the schema module and is
-//! re-exported here; the element trait [`VectorElement`], the vector storage abstraction
-//! [`VectorArena`], and the distance kernels live here.
-//! The on-disk formats live in submodules: [`flat`] for the dense full-precision layout and
-//! [`ivf`] for the partitioned/clustered accelerator. Both are owned by a single
-//! [`VectorPlugin`] which picks between them per merge based on
-//! [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold).
-//! Top-N vector queries dispatch over them via [`VectorBackend`].
+//! [`Metric`](crate::schema::Metric), [`VectorDType`]) lives in the schema
+//! module and is re-exported here.
 
-use std::borrow::Cow;
-use std::cell::Cell;
 use std::io;
 
 mod backend;
-mod blocks;
-mod element;
-pub use element::MAX_ELEM_BYTES;
-/// Fixed alignment of Data entries and their block directories.
-pub const ENTRY_ALIGN: usize = 8;
-const _: () = assert!(MAX_ELEM_BYTES <= ENTRY_ALIGN);
 mod bounds;
 mod collector;
 mod distance;
 pub(crate) mod header;
-pub(crate) mod index_reader;
-mod metadata;
-mod storage_io;
-pub use storage_io::VectorIoStats;
+mod index_reader;
 mod plugin;
 mod prepared;
-pub(crate) mod quantization;
+mod search;
 mod tie_break;
 
 pub mod flat;
@@ -43,155 +31,38 @@ pub(crate) mod tests;
 
 pub(crate) const VEC_EXT: &str = "vec";
 
-#[cfg(feature = "unstable")]
-#[doc(hidden)]
-pub use backend::quantization_bench_layer0_cosine_cluster;
 pub use backend::{
-    set_fixed_probe_cost_rows, ProbeStats, ProbeTermination, VectorBackend,
-    DEFAULT_FIXED_PROBE_COST_ROWS,
+    set_fixed_probe_cost_rows, ProbeStats, ProbeTermination, DEFAULT_FIXED_PROBE_COST_ROWS,
 };
 pub use bounds::{
     bounds_verdict, margin_ball_ball, margin_ball_halfspace, residual_norm, to_bound_space,
-    BoundKind, BoundStore, BoundsBuilder, HeapPeek, QueryBound, Verdict,
+    BoundKind, BoundStore, BoundsBuilder, BoundsScope, HeapPeek, QueryBound, Verdict,
 };
-pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
-#[cfg(feature = "unstable")]
-#[doc(hidden)]
-pub use distance::quantization_bench_dot_bytes_f32;
+pub use collector::{TopDocsByVectorSimilarity, VectorSimilarityFruit};
 pub use distance::{
     cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
 };
-pub use flat::FlatVecWriter;
+pub use flat::VecWriter;
 pub use header::VectorFileVersion;
-pub use index_reader::{
-    VectorAuditMoments, VectorClusterStats, VectorErrorAuditMeasurements,
-    VectorErrorConeAuditMeasurements, VectorErrorConeDepthMeasurements,
-    VectorErrorDepthMeasurements, VectorEstimatorMeasurements, VectorEstimatorMoments,
-    VectorEstimatorQuery, VectorEstimatorSource, VectorIndexReader, VectorInfo,
-    VectorStorageFormat,
-};
+pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo};
+pub(crate) use ivf::centroid_index::CachedCentroidIndex;
+pub use ivf::centroid_index::CentroidProducer;
 pub use ivf::{
     BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, Candidate, ClusterId, Graph,
-    InMemoryStackedIvf, InMemoryStore, IvfCentroids, IvfClusterer, IvfConfig, IvfIndex,
-    IvfIndexBuilder, IvfLevelClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings,
-    IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, LazyStackedIvf, LazyStore,
-    MultiLevelIvf, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
-    RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
-    StackedSearchStats, SuperKMeansLevelClusterer, Workspace, APS_MAX_DIM,
-};
-pub use metadata::{
-    F64Bits, Grid, Partition, QuantizationSchedule, Quantizer, QuantizerKind, Rotation,
-    VectorColMetadata, VectorFieldMeta,
+    InMemoryStackedIvf, InMemoryStore, IvfCentroids, IvfConfig, IvfIndexBuilder, IvfLevelClusterer,
+    IvfMatrix, LazyStackedIvf, LazyStore, MultiLevelIvf, NeighborhoodGraphConfig,
+    NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph, ResumableSearchIterator,
+    SearchIterator, SearchTerminationReason, SegmentClusters, SuperKMeansLevelClusterer, Workspace,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
-pub use quantization::{
-    quantized_code_stride, VectorNormPolicy, VectorQuantizationConfig, VectorQuantizationGrid,
-    VectorQuantizationLayer, MAX_QUANTIZATION_LAYERS, QUANTIZED_CODE_ALIGNMENT,
-    QUANTIZED_CONSTANT_STRIDE, QUANTIZED_ERROR_RATIO_STRIDE, QUANTIZED_GAMMA_STRIDE,
-    QUANTIZED_RESIDUAL_NORM_STRIDE, QUANTIZED_SCALE_STRIDE, QUANTIZED_SIDECAR_STRIDE,
-    VECTOR_QUANTIZATION_FORMAT_VERSION,
-};
-pub use router::{RouterKind, RouterMetrics, RoutingParams};
+pub use router::{RouterKind, RouterMetrics};
 pub use tie_break::NoTieBreak;
 
+pub use crate::core::CENTROIDS_FILEPATH;
 // The schema-level vector types are re-exported here so `crate::vector::{...}`
 // resolves for callers and tests that work entirely within the vector module.
 pub use crate::schema::{Metric, VectorDType, VectorOptions};
-
-/// Logical stage of a vector search.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Stage {
-    /// Unclassified work.
-    #[default]
-    Other,
-    /// Reader initialization.
-    ScanInit,
-    /// Predicate evaluation and filter-bitset construction.
-    NonVectorSearch,
-    /// Query preparation.
-    QueryPrep,
-    /// Cluster routing.
-    Routing,
-    /// Quantized layer scanning.
-    LayerScan(u8),
-    /// Quantized layer boundary selection.
-    Boundary(u8),
-    /// Full-precision scanning.
-    ExactScan,
-    /// Result assembly.
-    ResultAssembly,
-    /// Rerank row fetching.
-    RerankFetch,
-    /// Exact rerank scoring.
-    RerankScore,
-}
-
-impl Stage {
-    /// Returns the flat telemetry field prefix for this stage.
-    pub fn name(self) -> Option<Cow<'static, str>> {
-        match self {
-            Self::Other => None,
-            Self::ScanInit => Some(Cow::Borrowed("scan_init")),
-            Self::NonVectorSearch => Some(Cow::Borrowed("non_vector_search")),
-            Self::QueryPrep => Some(Cow::Borrowed("query_prep")),
-            Self::Routing => Some(Cow::Borrowed("routing")),
-            Self::LayerScan(layer) => Some(Cow::Owned(format!("layer{layer}_scan"))),
-            Self::Boundary(layer) => Some(Cow::Owned(format!("boundary{layer}"))),
-            Self::ExactScan => Some(Cow::Borrowed("exact_scan")),
-            Self::ResultAssembly => Some(Cow::Borrowed("result_assembly")),
-            Self::RerankFetch => Some(Cow::Borrowed("rerank_fetch")),
-            Self::RerankScore => Some(Cow::Borrowed("rerank_score")),
-        }
-    }
-}
-
-thread_local! {
-    static VECTOR_STAGE: Cell<Stage> = const { Cell::new(Stage::Other) };
-}
-
-/// The logical stage responsible for a vector component read on this thread.
-pub fn current_vector_stage() -> Stage {
-    VECTOR_STAGE.get()
-}
-
-pub(crate) struct VectorStageGuard(Stage);
-
-pub(crate) fn enter_vector_stage(stage: Stage) -> VectorStageGuard {
-    VectorStageGuard(VECTOR_STAGE.replace(stage))
-}
-
-impl Drop for VectorStageGuard {
-    fn drop(&mut self) {
-        VECTOR_STAGE.set(self.0);
-    }
-}
-
-#[cfg(test)]
-mod stage_tests {
-    use super::Stage;
-
-    #[test]
-    fn stage_names_are_flat_telemetry_prefixes() {
-        assert_eq!(Stage::Other.name(), None);
-        assert_eq!(Stage::ScanInit.name().as_deref(), Some("scan_init"));
-        assert_eq!(
-            Stage::NonVectorSearch.name().as_deref(),
-            Some("non_vector_search")
-        );
-        assert_eq!(Stage::QueryPrep.name().as_deref(), Some("query_prep"));
-        assert_eq!(Stage::Routing.name().as_deref(), Some("routing"));
-        assert_eq!(Stage::LayerScan(2).name().as_deref(), Some("layer2_scan"));
-        assert_eq!(Stage::Boundary(2).name().as_deref(), Some("boundary2"));
-        assert_eq!(Stage::ExactScan.name().as_deref(), Some("exact_scan"));
-        assert_eq!(
-            Stage::ResultAssembly.name().as_deref(),
-            Some("result_assembly")
-        );
-        assert_eq!(Stage::RerankFetch.name().as_deref(), Some("rerank_fetch"));
-        assert_eq!(Stage::RerankScore.name().as_deref(), Some("rerank_score"));
-    }
-}
 
 /// Wide accumulator used by the reduction kernels (norms). Element
 /// types choose their accumulator via [`VectorElement::Acc`]; this
@@ -386,16 +257,6 @@ impl<T> FileSliceArena<T> {
     }
 }
 
-impl<T: VectorElement> FileSliceArena<T> {
-    /// Row `index`'s little-endian bytes, one stride-sized ranged read.
-    pub(crate) fn row_bytes(&self, dim: usize, index: u32) -> std::io::Result<common::OwnedBytes> {
-        let stride = dim * T::SIZE_BYTES;
-        self.slice
-            .slice(index as usize * stride..(index as usize + 1) * stride)
-            .read_bytes()
-    }
-}
-
 impl<T: VectorElement> VectorArena for FileSliceArena<T> {
     type Elem = T;
 
@@ -414,8 +275,11 @@ impl<T: VectorElement> VectorArena for FileSliceArena<T> {
     /// `Directory` could not produce bytes it already promised via the slice.
     #[inline]
     fn similarity(&self, metric: Metric, dim: usize, index: u32, query: &[T]) -> Similarity {
+        let stride = dim * T::SIZE_BYTES;
         let bytes = self
-            .row_bytes(dim, index)
+            .slice
+            .slice(index as usize * stride..(index as usize + 1) * stride)
+            .read_bytes()
             .expect("failed to read vector arena row");
         metric.similarity_bytes(query, &bytes)
     }
