@@ -1333,7 +1333,6 @@ impl QuantizedClusterReader<'_> {
 }
 
 /// Splits increasing rows by block before consulting storage geometry.
-#[cfg(test)]
 fn plan_block_column(
     blocks: &Blocks,
     idx: usize,
@@ -1475,13 +1474,13 @@ pub(crate) struct VectorFieldReader {
     search: OnceLock<crate::Result<Arc<VectorIndexReader>>>,
 }
 
-type CentroidSlices = (
-    super::header::VectorFileVersion,
-    FileSlice,
-    FileSlice,
-    FileSlice,
-    FileSlice,
-);
+#[derive(Clone)]
+struct CentroidSlices {
+    router: Arc<super::ivf::RouterIndex>,
+    meta: super::ivf::SharedSegmentMeta,
+    offsets: FileSlice,
+    bounds: FileSlice,
+}
 
 struct VectorSource {
     metadata: BlockMetadata,
@@ -1505,7 +1504,7 @@ impl DeferredIdMap {
         }
     }
     /// Initializes the entry once and checks its variant against the stored partition.
-    fn get(&self, clustered: bool) -> crate::Result<&IdMap> {
+    fn get(&self, clustered: bool, rows: &[usize]) -> crate::Result<&IdMap> {
         self.value
             .get_or_init(|| {
                 let (composite, field, max_doc) =
@@ -1515,8 +1514,12 @@ impl DeferredIdMap {
                     .unwrap();
                 let map = IdMap::open(entry, *max_doc)
                     .map_err(|e| DataCorruption::comment_only(e.to_string()))?;
-                if matches!(map, IdMap::DocLocations(_)) != clustered {
+                if matches!(map, IdMap::Explicit(_)) != clustered {
                     return Err(DataCorruption::comment_only("partition/id-map mismatch").into());
+                }
+                if clustered {
+                    map.validate_rows(rows)
+                        .map_err(|e| DataCorruption::comment_only(e.to_string()))?;
                 }
                 Ok(map)
             })
@@ -1574,38 +1577,51 @@ impl VectorFieldReader {
         };
         let (_, body) = read_vector_header(&vec_file)?;
 
-        let centroid_slots =
-            match segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string())) {
-                Ok(file) => {
-                    let (centroids_version, body) = read_centroid_header(&file)?;
-                    let composite = CompositeFile::open(&body)?;
-                    match (
-                        composite.open_read_with_idx(field, CentroidSlot::Centroids.index()),
-                        composite.open_read_with_idx(field, CentroidSlot::Offsets.index()),
-                        composite.open_read_with_idx(field, CentroidSlot::Router.index()),
-                        composite.open_read_with_idx(field, CentroidSlot::Bounds.index()),
-                    ) {
-                        (Some(centroids), Some(offsets), Some(router), Some(bounds)) => {
-                            Some((centroids_version, centroids, offsets, router, bounds))
-                        }
-                        (Some(_), Some(_), None, _) => {
-                            return Err(TantivyError::InternalError(format!(
-                                "vector field {:?} has no router slot",
-                                entry.name()
-                            )));
-                        }
-                        (Some(_), Some(_), Some(_), None) => {
-                            return Err(TantivyError::InternalError(format!(
-                                "vector field {:?} has no bounds slot",
-                                entry.name()
-                            )));
-                        }
-                        _ => None,
-                    }
+        let centroid_slots = match segment_reader
+            .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))
+        {
+            Ok(file) => {
+                let (_, body) = read_centroid_header(&file)?;
+                let composite = CompositeFile::open(&body)?;
+                if composite
+                    .field_indices()
+                    .any(|(_, slot)| ![0, 1, 3].contains(&slot))
+                {
+                    return Err(
+                        DataCorruption::comment_only("invalid shared centroid slots").into(),
+                    );
                 }
-                Err(OpenReadError::FileDoesNotExist(_)) => None,
-                Err(err) => return Err(err.into()),
-            };
+                let slot = |slot: CentroidSlot| {
+                    composite
+                        .open_read_with_idx(field, slot.index())
+                        .ok_or_else(|| DataCorruption::comment_only("missing shared centroid slot"))
+                };
+                let meta: super::ivf::SharedSegmentMeta =
+                    serde_json::from_slice(&slot(CentroidSlot::Centroids)?.read_bytes()?)
+                        .map_err(|error| DataCorruption::comment_only(error.to_string()))?;
+                if Some(&meta.centroid_index) != segment_reader.index().centroid_index_meta() {
+                    return Err(DataCorruption::comment_only(
+                        "segment centroid index does not match its index",
+                    )
+                    .into());
+                }
+                let routers = segment_reader
+                    .index()
+                    .cached_centroid_index()?
+                    .ok_or_else(|| DataCorruption::comment_only("missing shared centroid index"))?;
+                let router = routers
+                    .get(&field)
+                    .ok_or_else(|| DataCorruption::comment_only("missing shared centroid field"))?;
+                Some(CentroidSlices {
+                    router: Arc::clone(router),
+                    meta,
+                    offsets: slot(CentroidSlot::Offsets)?,
+                    bounds: slot(CentroidSlot::Bounds)?,
+                })
+            }
+            Err(OpenReadError::FileDoesNotExist(_)) => None,
+            Err(err) => return Err(err.into()),
+        };
 
         let vec_composite = CompositeFile::open(&body)?;
         validate_vector_entries(&vec_composite, field)?;
@@ -1641,6 +1657,52 @@ impl VectorFieldReader {
     }
 }
 
+pub(crate) fn visit_row_fragments(
+    slice: &FileSlice,
+    stride: usize,
+    rows: std::ops::Range<usize>,
+    mut visitor: impl FnMut(usize, usize, &[u8]),
+) -> crate::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    if stride == 0 {
+        return Err(TantivyError::InvalidArgument(
+            "vector stride is zero".into(),
+        ));
+    }
+    let expected = rows.len() * stride;
+    let (mut received, mut offset, mut row) = (0, 0, rows.start);
+    let mut invalid = false;
+    slice
+        .slice(rows.start * stride..rows.end * stride)
+        .read_vector_chunks(&mut |mut bytes| {
+            if invalid || bytes.len() > expected - received {
+                invalid = true;
+                return;
+            }
+            received += bytes.len();
+            while !bytes.is_empty() {
+                let len = (stride - offset).min(bytes.len());
+                visitor(row, offset, &bytes[..len]);
+                bytes = &bytes[len..];
+                offset += len;
+                if offset == stride {
+                    row += 1;
+                    offset = 0;
+                }
+            }
+        })?;
+    if invalid || received != expected || row != rows.end || offset != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "vector row fragments do not cover the requested range",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 impl VectorIndexReader {
     fn open(field: &VectorFieldReader) -> crate::Result<Self> {
         let options = field.options.clone();
@@ -1652,22 +1714,25 @@ impl VectorIndexReader {
             source: Some((source.composite.clone(), source.field, source.max_doc)),
             value: OnceLock::new(),
         };
-        let index = if let Some((version, centroids, offsets, router_slot, bounds)) = centroid_slots
-        {
-            Some(IvfIndex::open(
-                version,
-                &options,
-                centroids,
+        let index = match centroid_slots {
+            Some(CentroidSlices {
+                router,
+                meta,
                 offsets,
-                router_slot,
                 bounds,
-            )?)
-        } else {
-            None
+            }) => Some(IvfIndex::open_postings(
+                &options,
+                router,
+                meta.centroid_index,
+                meta.num_docs as usize,
+                offsets,
+                bounds,
+            )?),
+            None => None,
         };
         let num_rows = match &index {
             Some(index) => index.num_rows(),
-            None => id_map.get(false)?.num_rows() as usize,
+            None => id_map.get(false, &[])?.num_rows() as usize,
         };
         let cluster_rows = index.as_ref().map(|ivf| {
             (0..ivf.num_clusters())
@@ -2569,24 +2634,6 @@ impl VectorIndexReader {
     ///
     /// Returns an error when the vector row cannot be read.
     pub fn vector_bytes(&self, doc_id: DocId) -> crate::Result<Option<OwnedBytes>> {
-        if self.rows_slice.clustered() {
-            let Some(location) = self
-                .id_map
-                .get(true)?
-                .locate(doc_id, &self.rows_slice.block_rows)
-                .map_err(|e| DataCorruption::comment_only(e.to_string()))?
-            else {
-                return Ok(None);
-            };
-            let stride = self.options.bytes_per_vector();
-            let start = location.local as usize * stride;
-            return Ok(Some(
-                self.rows_slice
-                    .column(location.cluster as usize, 0)?
-                    .slice(start..start + stride)
-                    .read_vector_bytes()?,
-            ));
-        }
         let Some(row) = self.row_id(doc_id)? else {
             return Ok(None);
         };
@@ -2675,19 +2722,30 @@ impl VectorIndexReader {
         })
     }
 
-    /// Reads a clustered document id from its Data column, or selects a flat bitmap row.
     pub fn doc_id_at(&self, row: usize) -> crate::Result<DocId> {
         if row >= self.num_vectors() {
             return Err(TantivyError::InvalidArgument(format!(
                 "vector row {row} is out of bounds"
             )));
         }
-        Ok(self.row_doc_ids(row..row + 1)?[0])
+        let map = self
+            .id_map
+            .get(self.rows_slice.clustered(), &self.rows_slice.block_rows)?;
+        let doc = map.doc_at(row as u32);
+        if doc >= self.max_doc {
+            return Err(DataCorruption::comment_only("row document id exceeds max_doc").into());
+        }
+        Ok(doc)
     }
-    /// Reads and validates ascending document ids without opening the clustered IdMap.
+
     pub(crate) fn row_doc_ids(&self, rows: Range<usize>) -> crate::Result<Vec<DocId>> {
+        if rows.start > rows.end || rows.end > self.num_vectors() {
+            return Err(TantivyError::InvalidArgument(format!(
+                "vector rows {rows:?} are out of bounds"
+            )));
+        }
         if !self.rows_slice.clustered() {
-            let map = self.id_map.get(false)?;
+            let map = self.id_map.get(false, &[])?;
             return Ok(rows.map(|row| map.doc_at(row as u32)).collect());
         }
         let mut result = Vec::with_capacity(rows.len());
@@ -2703,7 +2761,7 @@ impl VectorIndexReader {
         }
         Ok(result)
     }
-    /// Returns sorted document ids assigned to a cluster, or None for an invalid cluster.
+
     pub fn cluster_doc_ids(&self, cluster: usize) -> crate::Result<Option<Vec<DocId>>> {
         let Some(index) = &self.index else {
             return Ok(None);
@@ -2715,43 +2773,59 @@ impl VectorIndexReader {
         self.read_doc_ids(cluster, &mut docs)?;
         Ok(Some(docs))
     }
-    /// Resolves one document by direct location or flat bitmap rank, validating stored coordinates.
-    pub(crate) fn row_id(&self, doc_id: DocId) -> crate::Result<Option<usize>> {
-        let clustered = self.rows_slice.clustered();
-        let map = self.id_map.get(clustered)?;
-        if clustered {
-            let location = map
-                .locate(doc_id, &self.rows_slice.block_rows)
-                .map_err(|e| DataCorruption::comment_only(e.to_string()))?;
-            Ok(location
-                .map(|loc| self.rows_slice.block_rows[loc.cluster as usize] + loc.local as usize))
-        } else {
-            Ok(map.rank_if_exists(doc_id).map(|row| row as usize))
-        }
+
+    pub(crate) fn row_cluster(&self, row: usize) -> Option<usize> {
+        self.index.as_ref().map(|_| self.rows_slice.block_of(row))
     }
-    /// Reads only a cluster's document column, validating bounds and ordering while decoding.
+
+    pub(crate) fn row_id(&self, doc_id: DocId) -> crate::Result<Option<usize>> {
+        if doc_id >= self.max_doc {
+            return Ok(None);
+        }
+        let map = self
+            .id_map
+            .get(self.rows_slice.clustered(), &self.rows_slice.block_rows)?;
+        if !matches!(map, IdMap::Explicit(_)) {
+            return Ok(map.rank_if_exists(doc_id).map(|row| row as usize));
+        }
+        for (cluster, range) in self.rows_slice.block_rows.windows(2).enumerate() {
+            let mut lo = range[0];
+            let mut hi = range[1];
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                match map.doc_at(mid as u32).cmp(&doc_id) {
+                    std::cmp::Ordering::Less => lo = mid + 1,
+                    std::cmp::Ordering::Greater => hi = mid,
+                    std::cmp::Ordering::Equal => {
+                        self.read_doc_ids(cluster, &mut Vec::new())?;
+                        return Ok(Some(mid));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
     pub(crate) fn read_doc_ids(&self, cluster: usize, out: &mut Vec<DocId>) -> crate::Result<()> {
         out.clear();
         let blocks = &self.rows_slice;
         if !blocks.clustered() || cluster >= blocks.block_rows.len() - 1 {
-            return Err(DataCorruption::comment_only("invalid DocIds cluster").into());
+            return Err(DataCorruption::comment_only("invalid document map cluster").into());
         }
         if blocks.rows_in(cluster) == 0 {
             return Ok(());
         }
-        let idx = blocks
-            .slots
-            .iter()
-            .position(|slot| matches!(slot.slot_type, SlotType::DocIds))
-            .ok_or_else(|| DataCorruption::comment_only("missing DocIds column"))?;
-        let bytes = blocks.column(cluster, idx)?.read_vector_bytes()?;
+        let IdMap::Explicit(docs) = self.id_map.get(true, &blocks.block_rows)? else {
+            unreachable!()
+        };
+        let bytes = &docs[blocks.block_rows[cluster] * 4..blocks.block_rows[cluster + 1] * 4];
         out.reserve(blocks.rows_in(cluster));
         let mut previous = None;
-        for bytes in bytes.chunks_exact(std::mem::size_of::<DocId>()) {
+        for bytes in bytes.chunks_exact(4) {
             let doc = DocId::from_le_bytes(bytes.try_into().unwrap());
             if doc >= self.max_doc || previous.is_some_and(|prev| prev >= doc) {
                 return Err(DataCorruption::comment_only(format!(
-                    "cluster {cluster} DocIds must ascend and be below max_doc {}",
+                    "cluster {cluster} document ids must ascend and be below max_doc {}",
                     self.max_doc
                 ))
                 .into());
@@ -2760,6 +2834,44 @@ impl VectorIndexReader {
             previous = Some(doc);
         }
         Ok(())
+    }
+
+    pub(crate) fn plan_vector_reads(
+        &self,
+        rows: &[usize],
+        ranges: &mut Vec<Range<usize>>,
+        scratch: &mut Vec<(usize, usize)>,
+    ) -> crate::Result<()> {
+        plan_block_column(
+            &self.rows_slice,
+            0,
+            0..self.num_vectors(),
+            rows,
+            ranges,
+            scratch,
+        )
+    }
+
+    pub(crate) fn visit_vector_row_fragments(
+        &self,
+        cluster: usize,
+        rows: Range<usize>,
+        mut visitor: impl FnMut(usize, usize, &[u8]),
+    ) -> crate::Result<()> {
+        let blocks = &self.rows_slice;
+        let first = blocks.block_rows[cluster];
+        if rows.start < first || rows.start > rows.end || rows.end > blocks.block_rows[cluster + 1]
+        {
+            return Err(TantivyError::InvalidArgument(format!(
+                "vector rows {rows:?} are outside cluster {cluster}"
+            )));
+        }
+        visit_row_fragments(
+            &blocks.column(cluster, 0)?,
+            self.options.bytes_per_vector(),
+            rows.start - first..rows.end - first,
+            |row, offset, bytes| visitor(first + row, offset, bytes),
+        )
     }
 
     /// Reads a cluster's full-precision rows without document ids or quantized columns.
@@ -2803,9 +2915,57 @@ mod tests {
             Ok(OwnedBytes::new(self.bytes[range].to_vec()))
         }
 
+        fn read_bytes_chunks(
+            &self,
+            range: Range<usize>,
+            visitor: &mut dyn FnMut(&[u8]),
+        ) -> std::io::Result<()> {
+            self.reads.lock().unwrap().push(range.clone());
+            let mut offset = range.start;
+            while offset < range.end {
+                let end = (offset / self.block_len + 1) * self.block_len;
+                let end = end.min(range.end);
+                visitor(&self.bytes[offset..end]);
+                offset = end;
+            }
+            Ok(())
+        }
+
         fn storage_block_len(&self) -> Option<usize> {
             Some(self.block_len)
         }
+    }
+
+    #[test]
+    fn row_fragments_borrow_across_storage_boundaries() -> crate::Result<()> {
+        for stride in [4, 12, 4096] {
+            for block_len in [1, 7, 64, 8192] {
+                let bytes: Vec<_> = (0..5 + 5 * stride).map(|i| (i % 251) as u8).collect();
+                let file = Arc::new(BlockTrackedBytes {
+                    bytes,
+                    reads: Default::default(),
+                    block_len,
+                });
+                let slice = FileSlice::new(file.clone()).slice_from(5);
+                for rows in [0..5, 1..4, 4..5, 2..2] {
+                    let mut actual = Vec::new();
+                    visit_row_fragments(&slice, stride, rows.clone(), |row, offset, bytes| {
+                        assert_eq!(row, rows.start + actual.len() / stride);
+                        assert_eq!(offset, actual.len() % stride);
+                        assert_eq!(
+                            bytes.as_ptr(),
+                            file.bytes[5 + row * stride + offset..].as_ptr()
+                        );
+                        actual.extend_from_slice(bytes);
+                    })?;
+                    assert_eq!(
+                        actual,
+                        file.bytes[5 + rows.start * stride..5 + rows.end * stride]
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     fn test_layer(
@@ -2874,11 +3034,7 @@ mod tests {
                     }
                     _ => &[],
                 };
-                if matches!(slot.slot_type, SlotType::DocIds) {
-                    for row in rows[0]..rows[1] {
-                        out.extend_from_slice(&(row as u32).to_le_bytes());
-                    }
-                } else if bytes.is_empty() {
+                if bytes.is_empty() {
                     pad(&mut out, range.len()).unwrap();
                 } else {
                     out.extend_from_slice(bytes);
@@ -2910,11 +3066,11 @@ mod tests {
         QuantizedLayerReader {
             blocks,
             layer: 0,
-            codes: 3,
-            scales: 4,
-            gammas: 5,
-            errors: 6,
-            constants: constants.map(|_| 7),
+            codes: 2,
+            scales: 3,
+            gammas: 4,
+            errors: 5,
+            constants: constants.map(|_| 6),
             code_stride: stride,
             dim,
             bits,
@@ -2966,46 +3122,66 @@ mod tests {
         composite
     }
 
-    // Opening reads only the tag; a lookup reads exactly its eight-byte record.
     #[test]
-    fn location_lookup_reads_one_record_and_defers_entry() -> crate::Result<()> {
-        use super::super::flat::id_map::DocLocation;
-        let reads = Arc::new(Mutex::new(Vec::new()));
-        let mut bytes = Vec::new();
-        IdMap::serialize_locations(
-            &[
-                DocLocation::ABSENT,
-                DocLocation {
-                    cluster: 0,
-                    local: 0,
-                },
-                DocLocation {
-                    cluster: 0,
-                    local: 1,
-                },
-            ],
-            &mut bytes,
-        )?;
-        let map = DeferredIdMap {
-            source: Some((
-                tracked_id_composite(bytes, &reads),
-                Field::from_field_id(0),
-                3,
-            )),
-            value: OnceLock::new(),
-        };
-        assert!(reads.lock().unwrap().is_empty());
-        let opened = map.get(true)?;
-        assert_eq!(&*reads.lock().unwrap(), &[0..1]);
-        reads.lock().unwrap().clear();
-        assert_eq!(
-            opened.locate(2, &[0, 2])?,
-            Some(DocLocation {
-                cluster: 0,
-                local: 1
-            })
-        );
-        assert_eq!(&*reads.lock().unwrap(), &[17..25]);
+    fn row_map_is_loaded_once_and_validated() -> crate::Result<()> {
+        for (rows, valid) in [(&[0, 2][..], true), (&[0, 3][..], false)] {
+            let docs = [1u32, 2];
+            let reads = Arc::new(Mutex::new(Vec::new()));
+            let mut bytes = Vec::new();
+            IdMap::serialize_explicit(&docs, &mut bytes)?;
+            let map = DeferredIdMap {
+                source: Some((
+                    tracked_id_composite(bytes, &reads),
+                    Field::from_field_id(0),
+                    3,
+                )),
+                value: OnceLock::new(),
+            };
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    let map = &map;
+                    scope.spawn(move || {
+                        let result = map.get(true, rows);
+                        if valid {
+                            assert_eq!(result.unwrap().doc_at(1), 2);
+                        } else {
+                            assert!(matches!(result, Err(TantivyError::DataCorruption(_))));
+                        }
+                    });
+                }
+            });
+            assert_eq!(&*reads.lock().unwrap(), &[0..1, 1..9]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn row_map_rejects_corrupt_cluster_ids() -> crate::Result<()> {
+        for docs in [[0u32, 0], [1, 0], [0, 3]] {
+            let mut bytes = Vec::new();
+            IdMap::serialize_explicit(&docs, &mut bytes)?;
+            let mut reader = VectorIndexReader::empty(VectorOptions::new(64, Metric::Dot));
+            reader.max_doc = 3;
+            reader.num_vectors = 2;
+            reader.rows_slice = test_layer(
+                FileSlice::from(Vec::new()),
+                FileSlice::from(Vec::new()),
+                None,
+                &[0, 2],
+                64,
+                1,
+            )
+            .blocks;
+            reader.id_map = DeferredIdMap::ready(IdMap::open(FileSlice::from(bytes), 3)?);
+            assert!(matches!(
+                reader.read_doc_ids(0, &mut Vec::new()),
+                Err(TantivyError::DataCorruption(_))
+            ));
+            assert!(matches!(
+                reader.row_doc_ids(0..2),
+                Err(TantivyError::DataCorruption(_))
+            ));
+        }
         Ok(())
     }
 
@@ -3034,62 +3210,49 @@ mod tests {
     }
 
     #[test]
-    fn doc_ids_reject_out_of_bounds_and_nonascending_values() -> crate::Result<()> {
-        use super::super::blocks::{block_len, column_range, pad, write_metadata, BlockDirectory};
-        for docs in [[0u32, 1, 3], [0, 0, 2], [1, 0, 2]] {
-            let options = VectorOptions::new(2, Metric::L2);
-            let meta = VectorColMetadata::build_ivf(&options, None)?;
-            let slots = meta.slots();
-            let mut data = Vec::new();
-            let first = write_metadata(&mut data, &meta)?;
-            for (idx, slot) in slots.iter().enumerate() {
-                let range = column_range(&slots, docs.len(), idx);
-                let padding = first + range.start - data.len();
-                pad(&mut data, padding)?;
-                if matches!(slot.slot_type, SlotType::DocIds) {
-                    for doc in docs {
-                        data.extend_from_slice(&doc.to_le_bytes());
-                    }
-                } else {
-                    pad(&mut data, range.len())?;
-                }
+    fn cluster_doc_ids_reuse_the_reader_row_map() -> crate::Result<()> {
+        use crate::vector::storage_io::test_support::PagedDirectory;
+        use crate::vector::tests::Grid2DCentroids;
+        use crate::{Index, TantivyDocument};
+
+        let directory = PagedDirectory::default();
+        let mut schema = crate::schema::Schema::builder();
+        let field = schema.add_vector_field("vec", VectorOptions::new(2, Metric::L2));
+        let index = Index::builder()
+            .schema(schema.build())
+            .centroid_producer(Arc::new(Grid2DCentroids {
+                centroids: vec![[0.0, 0.0], [10.0, 10.0], [100.0, 100.0]],
+            }))
+            .ivf_router(crate::vector::RouterKind::Rng)?
+            .create(directory.clone())?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        for vector in [
+            Some([9.0, 9.0]),
+            Some([1.0, 1.0]),
+            None,
+            Some([10.0, 10.0]),
+            Some([0.0, 0.0]),
+        ] {
+            let mut doc = TantivyDocument::new();
+            if let Some(vector) = vector {
+                doc.add_vector(field, &vector);
             }
-            let padding = first + block_len(&slots, docs.len()) - data.len();
-            pad(&mut data, padding)?;
-            let mut directory = BlockDirectory::new(first as u64);
-            directory.push(data.len() as u64, docs.len() as u32);
-            directory.finish(&mut data)?;
-            let blocks = Arc::new(Blocks::open(
-                FileSlice::from(data),
-                &options,
-                3,
-                Some(vec![0, 3]),
-            )?);
-            let reader = VectorIndexReader {
-                max_doc: 3,
-                options,
-                num_vectors: 3,
-                present: true,
-                rows_slice: blocks,
-                id_map: DeferredIdMap::ready(IdMap::Identity { num_docs: 3 }),
-                index: None,
-                quantization: None,
-            };
-            let mut decoded = Vec::new();
-            let error = reader.read_doc_ids(0, &mut decoded).unwrap_err();
-            assert!(
-                matches!(error, TantivyError::DataCorruption(_)),
-                "column=DocIds values={docs:?}: {error}"
-            );
-            assert!(matches!(
-                reader.doc_id_at(0),
-                Err(TantivyError::DataCorruption(_))
-            ));
-            assert!(matches!(
-                reader.doc_id_at(3),
-                Err(TantivyError::InvalidArgument(_))
-            ));
+            writer.add_document(doc)?;
         }
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let reader = searcher.segment_reader(0).vector_index(field)?;
+        let expected = (0..reader.index().unwrap().num_clusters())
+            .map(|cluster| reader.cluster_doc_ids(cluster).map(Option::unwrap))
+            .collect::<crate::Result<Vec<_>>>()?;
+        assert!(expected.iter().any(Vec::is_empty));
+        assert!(reader.id_map_initialized());
+        directory.reads.lock().unwrap().clear();
+        for (cluster, expected) in expected.iter().enumerate() {
+            assert_eq!(reader.cluster_doc_ids(cluster)?.as_ref(), Some(expected));
+        }
+        assert_eq!(reader.row_doc_ids(0..4)?, expected.concat());
+        assert!(directory.reads.lock().unwrap().is_empty());
         Ok(())
     }
 

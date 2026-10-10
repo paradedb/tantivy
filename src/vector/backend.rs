@@ -14,6 +14,9 @@
 #[path = "quantized_boundary_tests.rs"]
 mod quantized_boundary_tests;
 
+pub(crate) mod global;
+mod scoring;
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
@@ -22,6 +25,7 @@ use std::time::Instant;
 
 use common::BitSet;
 use quant_model::f16::f16_to_f32;
+use scoring::QuantizedScorer;
 
 use super::bounds::{
     bounds_verdict, margin_ball_ball, margin_ball_halfspace, to_bound_space, HeapPeek, QueryBound,
@@ -74,6 +78,7 @@ pub struct VectorBackend<T: VectorElement> {
     query_prep_ns: u64,
     adaptive: AdaptiveProbeParams,
     segment_ord: SegmentOrdinal,
+    filter: Option<(SegmentFilter, u64)>,
 }
 
 impl<T: VectorElement> VectorBackend<T> {
@@ -98,7 +103,50 @@ impl<T: VectorElement> VectorBackend<T> {
             query_prep_ns: prep_start.elapsed().as_nanos() as u64,
             adaptive,
             segment_ord,
+            filter: None,
         })
+    }
+
+    fn segment_filter(
+        &self,
+        weight: &dyn Weight,
+        reader: &SegmentReader,
+    ) -> crate::Result<(Cow<'_, SegmentFilter>, u64)> {
+        if let Some((filter, _)) = &self.filter {
+            return Ok((Cow::Borrowed(filter), 0));
+        }
+        let start = Instant::now();
+        let _stage = enter_vector_stage(Stage::NonVectorSearch);
+        let filter = build_segment_filter(weight, reader, reader.max_doc())?;
+        Ok((Cow::Owned(filter), start.elapsed().as_nanos() as u64))
+    }
+
+    pub(crate) fn prepare_filter(
+        &mut self,
+        weight: &dyn Weight,
+        reader: &SegmentReader,
+        top_n: usize,
+    ) -> crate::Result<()> {
+        if top_n > 0 && self.reader.index().is_some() {
+            let (filter, elapsed) = self.segment_filter(weight, reader)?;
+            self.filter = Some((filter.into_owned(), elapsed));
+        }
+        Ok(())
+    }
+
+    fn prepare_row_gate<'a>(
+        &'a self,
+        weight: &dyn Weight,
+        reader: &'a SegmentReader,
+        gate: &mut Option<RowGate<'a>>,
+        stats: &mut ProbeStats,
+    ) -> crate::Result<()> {
+        if gate.is_none() {
+            let (filter, elapsed) = self.segment_filter(weight, reader)?;
+            stats.non_vector_search_ns += elapsed;
+            *gate = Some(RowGate::new(filter, reader.alive_bitset()));
+        }
+        Ok(())
     }
 
     pub(crate) fn add_scan_init_ns(&mut self, elapsed_ns: u64) {
@@ -188,6 +236,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut stats = ProbeStats {
             scan_init_ns: self.scan_init_ns,
             query_prep_ns: self.query_prep_ns,
+            non_vector_search_ns: self.filter.as_ref().map_or(0, |(_, elapsed)| *elapsed),
             ..Default::default()
         };
         let hits = match self.reader.index() {
@@ -583,25 +632,21 @@ pub struct ProbeStats {
     pub routing_graph_result_count: usize,
     /// Clusters rejected by the bounds gate.
     pub bounds_skips: u32,
-    /// Number of segment scans in which the query bound armed.
+    /// Number of probe loops in which the query bound armed.
     pub bound_armed_count: u32,
     /// Sum of the zero-based probe index where the bound armed.
     pub bound_armed_probe_sum: u64,
-    /// How the probe loop terminated. Per-segment; does not sum.
+    /// How probing terminated. Global probe decisions are recorded on the first segment.
     pub termination: ProbeTermination,
-    /// Work units this segment's probe loop charged against its resolved
-    /// budget: opens at `x`, scored rows at `(1 - x)/n_avg`. The
-    /// budget identity is per segment:
-    /// `budget <= work_charged <= budget + last cluster's charge` on
-    /// Ceiling terminations.
-    /// Work units charged by the probe loop.
+    /// Work charged for cluster opens and eligible rows. Global probing records
+    /// the query total on the first segment; subsequent segments report zero.
     pub work_charged: f32,
     /// The resolved work budget the probe loop ran against: the
     /// `max_probe_fraction` ceiling in work units, floored by
     /// `min_probe_clusters`. `0` when no IVF probe loop ran.
     pub work_budget: f32,
     /// The APS recall estimate when the probe loop stopped; absent when
-    /// APS was off or the heap never held `k` results. Per-segment.
+    /// APS was off or the heap never held `k` results. Global estimates are on the first segment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recall_estimate: Option<f32>,
     /// Vector rows in the segment.
@@ -630,7 +675,7 @@ impl ProbeStats {
         })
     }
 
-    fn record_routing(&mut self, routing: RouterMetrics) {
+    pub(crate) fn record_routing(&mut self, routing: RouterMetrics) {
         self.routing = Some(routing);
         self.routing_visited_count += match routing {
             RouterMetrics::Rng(graph) => graph.visited_count,
@@ -848,14 +893,14 @@ impl std::ops::Mul<f64> for WorkUnits {
     }
 }
 
-/// The resolved per-segment prices the probe loop charges against its
+/// The resolved prices the probe loop charges against its
 /// budget: an open costs `open`, a scored row costs `row`. Built once
-/// per segment from [`AdaptiveProbeParams::resolved_work_budget`]'s
+/// from [`AdaptiveProbeParams::resolved_work_budget`]'s
 /// `(budget, n_avg, x)`.
-/// Per-segment probe budget and event prices.
+/// Probe budget and event prices.
 #[derive(Clone, Copy, Debug)]
 struct UnitPricing {
-    /// Work this segment may spend before the ceiling binds.
+    /// Work this probe loop may spend before the ceiling binds.
     budget: WorkUnits,
     /// The per-index open share `x`: what opening one cluster costs.
     open: WorkUnits,
@@ -870,7 +915,7 @@ struct ProbeController<'a> {
     pricing: UnitPricing,
     work_spent: WorkUnits,
     termination: ProbeTermination,
-    /// Clusters in the segment and clusters pulled from the ranking so far.
+    /// Total clusters and clusters pulled from the ranking so far.
     clusters: usize,
     pulled: usize,
     /// APS over the ranked clusters; `None` when APS is off.
@@ -2000,7 +2045,11 @@ impl QuantizedScanCtx {
     }
 
     fn band(&mut self, top_n: usize, kappa: f32) {
-        let pessimistic_kth = self.pessimistic_kth(top_n, kappa);
+        let threshold = self.pessimistic_kth(top_n, kappa);
+        self.band_at_threshold(threshold, kappa);
+    }
+
+    fn band_at_threshold(&mut self, pessimistic_kth: Option<Threshold>, kappa: f32) {
         self.boundary_scratch.clear();
         for index in 0..self.candidates.len() {
             if pessimistic_kth.is_none_or(|kth| {
@@ -2029,28 +2078,47 @@ impl QuantizedScanCtx {
 /// How a cluster row is tested before scoring: the filter's matches
 /// intersected with the alive docs.
 enum RowGate<'a> {
+    Empty,
     Open,
     AliveOnly(&'a AliveBitSet),
-    FilterOnly(&'a BitSet),
+    FilterOnly(Cow<'a, BitSet>),
     FilterAndAlive {
-        filter: &'a BitSet,
+        filter: Cow<'a, BitSet>,
         filter_and_alive: BitSet,
     },
 }
 
 impl<'a> RowGate<'a> {
-    fn new(filter: &'a SegmentFilter, alive: Option<&'a AliveBitSet>) -> Self {
-        match (filter.docs(), alive) {
+    fn new(filter: Cow<'a, SegmentFilter>, alive: Option<&'a AliveBitSet>) -> Self {
+        if filter.is_empty() {
+            return RowGate::Empty;
+        }
+        let docs = match filter {
+            Cow::Owned(SegmentFilter::All) | Cow::Borrowed(SegmentFilter::All) => None,
+            Cow::Owned(SegmentFilter::Docs(docs)) => Some(Cow::Owned(docs)),
+            Cow::Borrowed(SegmentFilter::Docs(docs)) => Some(Cow::Borrowed(docs)),
+        };
+        match (docs, alive) {
             (None, None) => RowGate::Open,
             (None, Some(alive)) => RowGate::AliveOnly(alive),
             (Some(filter), None) => RowGate::FilterOnly(filter),
             (Some(filter), Some(alive)) => {
-                let mut filter_and_alive = filter.clone();
+                let mut filter_and_alive = filter.as_ref().clone();
                 filter_and_alive.intersect_update(alive.bitset());
                 RowGate::FilterAndAlive {
                     filter,
                     filter_and_alive,
                 }
+            }
+        }
+    }
+
+    fn match_fraction(&self, max_doc: DocId) -> f64 {
+        match self {
+            Self::Empty => 0.0,
+            Self::Open | Self::AliveOnly(_) => 1.0,
+            Self::FilterOnly(filter) | Self::FilterAndAlive { filter, .. } => {
+                filter.len() as f64 / f64::from(max_doc.max(1))
             }
         }
     }
@@ -2071,6 +2139,7 @@ fn select_cluster_rows<'a>(
     offsets.clear();
     let visited = rows.len();
     let (pruned_filter, pruned_dead) = match gate {
+        RowGate::Empty => return (Selection::None, visited, visited, 0),
         RowGate::Open => {
             return (Selection::All, visited, 0, 0);
         }
@@ -2082,7 +2151,7 @@ fn select_cluster_rows<'a>(
             }
         }),
         RowGate::FilterOnly(filter) => select_rows(doc_ids, rows, offsets, |doc| {
-            if filter.contains(doc) {
+            if doc != DocId::MAX && filter.contains(doc) {
                 RowVerdict::Keep
             } else {
                 RowVerdict::Filtered
@@ -2092,9 +2161,9 @@ fn select_cluster_rows<'a>(
             filter,
             filter_and_alive,
         } => select_rows(doc_ids, rows, offsets, |doc| {
-            if filter_and_alive.contains(doc) {
+            if doc != DocId::MAX && filter_and_alive.contains(doc) {
                 RowVerdict::Keep
-            } else if !filter.contains(doc) {
+            } else if doc == DocId::MAX || !filter.contains(doc) {
                 RowVerdict::Filtered
             } else {
                 RowVerdict::Dead
@@ -2183,35 +2252,27 @@ impl<T: VectorElement> VectorBackend<T> {
         K: SegmentSortKeyComputer,
         CTail: Comparator<K::SegmentSortKey>,
     {
-        if top_n == 0 || segment_reader.max_doc() == 0 || index.num_clusters() == 0 {
+        if top_n == 0 || segment_reader.max_doc() == 0 || index.num_docs() == 0 {
             return Ok(Vec::new());
         }
         let init_start = Instant::now();
         let init_stage = enter_vector_stage(Stage::ScanInit);
         let max_doc = segment_reader.max_doc();
-        let non_vector_start = Instant::now();
-        let non_vector_stage = enter_vector_stage(Stage::NonVectorSearch);
-        let filter = build_segment_filter(weight, segment_reader, max_doc)?;
-        let alive = segment_reader.alive_bitset();
-        drop(non_vector_stage);
-        let non_vector_search_ns = non_vector_start.elapsed().as_nanos() as u64;
-        stats.non_vector_search_ns = stats
-            .non_vector_search_ns
-            .saturating_add(non_vector_search_ns);
-        if filter.is_empty() {
+        let mut row_gate = None;
+        let filter_before_init = stats.non_vector_search_ns;
+        if index.router() == super::RouterKind::Stacked {
+            self.prepare_row_gate(weight, segment_reader, &mut row_gate, stats)?;
+        }
+        let non_vector_search_ns = stats.non_vector_search_ns - filter_before_init;
+        if matches!(row_gate, Some(RowGate::Empty)) {
             drop(init_stage);
             stats.scan_init_ns = stats.scan_init_ns.saturating_add(
                 (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
             );
             return Ok(Vec::new());
         }
-        let row_gate = RowGate::new(&filter, alive);
         let mut cluster_docs = Vec::new();
         let scan_levels = query.active_layers();
-        let quantized = self
-            .reader
-            .quantization()
-            .expect("quantized query requires quantized slots");
         stats.segment_rows = Some(index.num_rows());
         stats.segment_clusters = Some(index.num_clusters());
         stats.start_layer(0);
@@ -2226,7 +2287,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut routing_ws = RouterWorkspace::default();
         let candidate_capacity =
             ((pricing.budget.get() / pricing.row.get()).ceil() as usize).min(index.num_rows());
-        let mut scan = QuantizedScanCtx::new(max_doc, candidate_capacity);
+        let mut scorer = QuantizedScorer::new(max_doc, candidate_capacity);
         let mut postings_row = 0usize;
         let mut postings_skipped = 0usize;
         let bounds = index.bounds();
@@ -2235,22 +2296,6 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut bounds_skips = 0u32;
         let mut armed_probe = None;
         let mut selection_offsets = Vec::new();
-        let mut kernel_scores = Vec::new();
-        let mut decoded_scales = Vec::new();
-        let mut decoded_gammas = Vec::new();
-        let mut decoded_error_ratios = Vec::new();
-        let mut decoded_constants = Vec::new();
-        let mut decoded_residual_norms = Vec::new();
-        let mut base_scores = Vec::new();
-        let mut estimate_scores = Vec::new();
-        let mut sigma_scores = Vec::new();
-        let mut residual_norm_squared_scores = Vec::new();
-        let mut sign_query_error_terms = Vec::new();
-        let mut arithmetic_variances = Vec::new();
-        let mut selected_rows = Vec::new();
-        let mut indexed_row_offsets = Vec::new();
-        let mut survivor_read_ranges = Vec::new();
-        let mut survivor_block_scratch = Vec::new();
         drop(init_stage);
         stats.scan_init_ns = stats.scan_init_ns.saturating_add(
             (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
@@ -2260,7 +2305,9 @@ impl<T: VectorElement> VectorBackend<T> {
             k: self.adaptive.router_k(
                 work_budget,
                 x,
-                filter.match_fraction(max_doc),
+                row_gate
+                    .as_ref()
+                    .map_or(1.0, |gate| gate.match_fraction(max_doc)),
                 index.num_clusters(),
             ),
             recall: self.adaptive.router_recall_target,
@@ -2281,6 +2328,7 @@ impl<T: VectorElement> VectorBackend<T> {
         };
         let mut routing_ns = routing_start.elapsed().as_nanos() as u64;
         let routing_before_scan = routing_ns;
+        let filter_before_scan = stats.non_vector_search_ns;
         let scan_start = Instant::now();
         let layer0_stage = enter_vector_stage(Stage::LayerScan(0));
 
@@ -2302,10 +2350,19 @@ impl<T: VectorElement> VectorBackend<T> {
             // drops a true top-k row; APS takes the point estimate, since
             // the pessimistic radius inflates the query ball and
             // underestimates recall.
-            let kth = scan
+            let kth = scorer
+                .scan
                 .running_pessimistic_kth(top_n, QUANTIZED_BOUNDARY_KAPPA)
                 .map(|score| score.0 .0);
-            let aps_kth = scan.running_estimate_kth(top_n);
+            let aps_kth = scorer.scan.running_estimate_kth(top_n);
+            let rows = index.cluster_range(cluster);
+            if rows.is_empty() {
+                controller.charge_open();
+                postings_skipped += 1;
+                stats.clusters_skipped_empty += 1;
+                controller.cover(aps_kth)?;
+                continue;
+            }
             let query_bound = kth.map_or(QueryBound::Filling, |score| QueryBound::Armed {
                 t: to_bound_space(metric, score),
             });
@@ -2342,15 +2399,11 @@ impl<T: VectorElement> VectorBackend<T> {
                 continue;
             }
             controller.charge_open();
-            let rows = index.cluster_range(cluster);
-            // Empty clusters have no band to read and use the probe's empty-cluster counter.
-            if rows.is_empty() {
-                postings_skipped += 1;
-                stats.clusters_skipped_empty += 1;
-                controller.cover(aps_kth)?;
-                continue;
+            self.prepare_row_gate(weight, segment_reader, &mut row_gate, stats)?;
+            let row_gate = row_gate.as_ref().unwrap();
+            if matches!(row_gate, RowGate::Empty) {
+                break;
             }
-            let layer = &quantized.layers()[0];
             if !matches!(row_gate, RowGate::Open) {
                 self.reader.read_doc_ids(cluster, &mut cluster_docs)?;
             }
@@ -2360,7 +2413,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 select_cluster_rows(
                     &cluster_docs,
                     rows.clone(),
-                    &row_gate,
+                    row_gate,
                     &mut selection_offsets,
                 )
             };
@@ -2376,85 +2429,35 @@ impl<T: VectorElement> VectorBackend<T> {
                 continue;
             }
 
-            let batch = layer.read_batch_in_block(cluster, rows.clone())?;
-            let score_query_norm = query.score_query_norm(sim.score());
-            score_layer(
+            scorer.scan.begin_cluster(top_n);
+            scorer.score_cluster(
+                &self.reader,
                 query,
-                0,
-                layer,
-                Some((&batch, &mut decoded_residual_norms)),
-                Some(cluster),
-                rows.clone(),
-                &selection,
-                &mut kernel_scores,
-                &mut decoded_scales,
-                &mut decoded_gammas,
-                &mut decoded_error_ratios,
-                &mut decoded_constants,
-                &mut survivor_read_ranges,
-                &mut selected_rows,
-                &mut indexed_row_offsets,
-            )?;
-            base_scores.resize(selected_count, 0.0);
-            estimate_scores.resize(selected_count, 0.0);
-            sigma_scores.resize(selected_count, 0.0);
-            residual_norm_squared_scores.resize(selected_count, 0.0);
-            sign_query_error_terms.resize(selected_count, 0.0);
-            arithmetic_variances.resize(selected_count, ArithmeticError::default());
-            let cluster_score = sim.score();
-            combine_initial_decoded(
-                metric,
-                query.index.meta.field().dim as usize,
-                &mut kernel_scores,
-                &mut base_scores,
-                &mut estimate_scores,
-                &mut sigma_scores,
-                &mut residual_norm_squared_scores,
-                &mut sign_query_error_terms,
-                &mut arithmetic_variances,
-                &decoded_scales,
-                &decoded_gammas,
-                &decoded_error_ratios,
-                &decoded_constants,
-                &decoded_residual_norms,
-                cluster_score,
-                score_query_norm * score_query_norm,
-                query.query_error_squared(0) as f32,
-            );
-
-            scan.set_cluster_query_norm(cluster, score_query_norm);
-            scan.begin_cluster(top_n);
-            scan.candidates.append_selected(
+                cluster,
+                sim,
                 rows.clone(),
                 &selection,
                 (!matches!(row_gate, RowGate::Open)).then_some(cluster_docs.as_slice()),
-                &base_scores[..selected_count],
-                &kernel_scores[..selected_count],
-                &estimate_scores[..selected_count],
-                &sigma_scores[..selected_count],
-                &residual_norm_squared_scores[..selected_count],
-                &decoded_gammas[..selected_count],
-                &sign_query_error_terms[..selected_count],
-                &arithmetic_variances[..selected_count],
-            );
-            scan.finish_cluster_bound();
+            )?;
+            scorer.scan.finish_cluster_bound();
             controller.charge_rows(selected_count);
             stats.layer0_eligible += selected_count;
             stats.eligible_charged += selected_count;
             postings_row += 1;
-            let kth = scan
+            let kth = scorer
+                .scan
                 .running_pessimistic_kth(top_n, QUANTIZED_BOUNDARY_KAPPA)
                 .map(|score| score.0 .0);
             if armed_probe.is_none() && kth.is_some() {
                 armed_probe = Some((postings_row + postings_skipped - 1) as u32);
             }
-            controller.cover(scan.running_estimate_kth(top_n))?;
+            controller.cover(scorer.scan.running_estimate_kth(top_n))?;
         }
         stats.record_routing(ranked.metrics());
         stats.postings_row += postings_row;
         stats.postings_skipped += postings_skipped;
-        stats.candidates_scored += scan.candidates.len();
-        let layer0_scored = scan.candidates.len();
+        stats.candidates_scored += scorer.scan.candidates.len();
+        let layer0_scored = scorer.scan.candidates.len();
         stats.bounds_skips += bounds_skips;
         stats.record_bound_armed(armed_probe);
         controller.finish(stats);
@@ -2464,263 +2467,59 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.record_layer_scan(
             0,
             layer0_scored,
-            scan_ns.saturating_sub(routing_ns.saturating_sub(routing_before_scan)),
+            scan_ns
+                .saturating_sub(routing_ns.saturating_sub(routing_before_scan))
+                .saturating_sub(stats.non_vector_search_ns - filter_before_scan),
         );
 
         #[cfg(test)]
         {
-            stats.quantized_trace.scored_rows = scan.candidates.rows.clone();
+            stats.quantized_trace.scored_rows = scorer.scan.candidates.rows.clone();
             stats
                 .quantized_trace
                 .estimate_rows
-                .push(scan.candidates.estimate_trace());
+                .push(scorer.scan.candidates.estimate_trace());
         }
 
         let boundary_start = Instant::now();
         let boundary_stage = enter_vector_stage(Stage::Boundary(0));
-        scan.band(top_n, QUANTIZED_BOUNDARY_KAPPA);
+        scorer.scan.band(top_n, QUANTIZED_BOUNDARY_KAPPA);
         #[cfg(test)]
         stats
             .quantized_trace
             .boundary_rows
-            .push(scan.candidates.rows.clone());
+            .push(scorer.scan.candidates.rows.clone());
         drop(boundary_stage);
         stats.record_boundary(
             0,
-            scan.candidates.len(),
+            scorer.scan.candidates.len(),
             boundary_start.elapsed().as_nanos() as u64,
         );
         for layer_idx in 1..scan_levels {
-            stats.start_layer(layer_idx);
-            let layer_start = Instant::now();
-            let layer_stage = enter_vector_stage(Stage::LayerScan(layer_idx as u8));
-            let layer = &quantized.layers()[layer_idx];
-            let layer_scored = scan.candidates.len();
-            if metric == Metric::Cosine {
-                let query_norm = query.score_query_norm(0.0);
-                for candidate_range in cosine_refinement_batches(scan.candidates.len()) {
-                    let candidate_start = candidate_range.start;
-                    let candidate_end = candidate_range.end;
-                    let first_row = scan.candidates.rows[candidate_start];
-                    let last_row = scan.candidates.rows[candidate_end - 1];
-                    let available_rows = first_row..last_row + 1;
-                    let selection = candidate_selection(
-                        &scan.candidates.rows[candidate_range.clone()],
-                        &available_rows,
-                        &mut selection_offsets,
-                    );
-                    let rows = score_layer(
-                        query,
-                        layer_idx,
-                        layer,
-                        None,
-                        None,
-                        available_rows,
-                        &selection,
-                        &mut kernel_scores,
-                        &mut decoded_scales,
-                        &mut decoded_gammas,
-                        &mut decoded_error_ratios,
-                        &mut decoded_constants,
-                        &mut survivor_read_ranges,
-                        &mut selected_rows,
-                        &mut indexed_row_offsets,
-                    )?;
-                    let decoded_constants = if metric == Metric::L2 {
-                        &decoded_constants[..rows]
-                    } else {
-                        &[]
-                    };
-                    let sign_query_error_squared =
-                        if matches!(query.index.specs[layer_idx].kind, cascade::LayerKind::Sign) {
-                            query.query_error_squared(layer_idx) as f32
-                        } else {
-                            0.0
-                        };
-                    combine_refinement_decoded(
-                        metric,
-                        query.index.meta.field().dim as usize,
-                        &mut scan.candidates,
-                        candidate_range,
-                        &kernel_scores[..rows],
-                        &decoded_scales[..rows],
-                        &decoded_gammas[..rows],
-                        &decoded_error_ratios[..rows],
-                        decoded_constants,
-                        query_norm * query_norm,
-                        sign_query_error_squared,
-                    );
-                }
-            } else {
-                let mut candidate_start = 0;
-                let mut cluster = 0;
-                while candidate_start < scan.candidates.len() {
-                    let first_row = scan.candidates.rows[candidate_start];
-                    while cluster < index.num_clusters()
-                        && index.cluster_range(cluster).end <= first_row
-                    {
-                        cluster += 1;
-                    }
-                    if cluster == index.num_clusters() {
-                        return Err(TantivyError::DataCorruption(DataCorruption::comment_only(
-                            format!(
-                                "quantized survivor row {first_row} is outside IVF cluster ranges"
-                            ),
-                        )));
-                    }
-                    let cluster_rows = index.cluster_range(cluster);
-                    if first_row < cluster_rows.start {
-                        return Err(TantivyError::DataCorruption(DataCorruption::comment_only(
-                            format!(
-                                "quantized survivor row {first_row} precedes cluster {cluster} \
-                                 range {cluster_rows:?}"
-                            ),
-                        )));
-                    }
-                    let mut candidate_end = candidate_start + 1;
-                    while candidate_end < scan.candidates.len()
-                        && scan.candidates.rows[candidate_end] < cluster_rows.end
-                    {
-                        candidate_end += 1;
-                    }
-                    let query_norm = scan.cluster_query_norm(cluster);
-                    let candidate_range = candidate_start..candidate_end;
-                    let selection = candidate_selection(
-                        &scan.candidates.rows[candidate_range.clone()],
-                        &cluster_rows,
-                        &mut selection_offsets,
-                    );
-                    let rows = score_layer(
-                        query,
-                        layer_idx,
-                        layer,
-                        None,
-                        Some(cluster),
-                        cluster_rows,
-                        &selection,
-                        &mut kernel_scores,
-                        &mut decoded_scales,
-                        &mut decoded_gammas,
-                        &mut decoded_error_ratios,
-                        &mut decoded_constants,
-                        &mut survivor_read_ranges,
-                        &mut selected_rows,
-                        &mut indexed_row_offsets,
-                    )?;
-                    let decoded_constants = if metric == Metric::L2 {
-                        &decoded_constants[..rows]
-                    } else {
-                        &[]
-                    };
-                    let sign_query_error_squared =
-                        if matches!(query.index.specs[layer_idx].kind, cascade::LayerKind::Sign) {
-                            query.query_error_squared(layer_idx) as f32
-                        } else {
-                            0.0
-                        };
-                    combine_refinement_decoded(
-                        metric,
-                        query.index.meta.field().dim as usize,
-                        &mut scan.candidates,
-                        candidate_range,
-                        &kernel_scores[..rows],
-                        &decoded_scales[..rows],
-                        &decoded_gammas[..rows],
-                        &decoded_error_ratios[..rows],
-                        decoded_constants,
-                        query_norm * query_norm,
-                        sign_query_error_squared,
-                    );
-                    candidate_start = candidate_end;
-                }
-            }
-            drop(layer_stage);
-            stats.record_layer_scan(
-                layer_idx,
-                layer_scored,
-                layer_start.elapsed().as_nanos() as u64,
-            );
-            #[cfg(test)]
-            stats
-                .quantized_trace
-                .estimate_rows
-                .push(scan.candidates.estimate_trace());
+            scorer.refine(&self.reader, query, layer_idx, stats)?;
             let boundary_start = Instant::now();
             let boundary_stage = enter_vector_stage(Stage::Boundary(layer_idx as u8));
-            scan.band(top_n, QUANTIZED_BOUNDARY_KAPPA);
+            scorer.scan.band(top_n, QUANTIZED_BOUNDARY_KAPPA);
             #[cfg(test)]
             stats
                 .quantized_trace
                 .boundary_rows
-                .push(scan.candidates.rows.clone());
+                .push(scorer.scan.candidates.rows.clone());
             drop(boundary_stage);
             stats.record_boundary(
                 layer_idx,
-                scan.candidates.len(),
+                scorer.scan.candidates.len(),
                 boundary_start.elapsed().as_nanos() as u64,
             );
         }
 
-        let rerank_fetch_start = Instant::now();
-        let rerank_fetch_stage = enter_vector_stage(Stage::RerankFetch);
-        debug_assert!(
-            scan.candidates
-                .rows
-                .windows(2)
-                .all(|pair| pair[0] < pair[1]),
-            "boundary survivors are row-sorted"
-        );
-        let mut first = 0;
-        let mut cluster = 0;
-        while first < scan.candidates.len() {
-            while index.cluster_range(cluster).end <= scan.candidates.rows[first] {
-                cluster += 1;
-            }
-            let cluster_rows = index.cluster_range(cluster);
-            let end = first
-                + scan.candidates.rows[first..].partition_point(|&row| row < cluster_rows.end);
-            if scan.candidates.docs[first..end].contains(&DocId::MAX) {
-                self.reader.read_doc_ids(cluster, &mut cluster_docs)?;
-                for candidate in first..end {
-                    if scan.candidates.docs[candidate] == DocId::MAX {
-                        scan.candidates.docs[candidate] =
-                            cluster_docs[scan.candidates.rows[candidate] - cluster_rows.start];
-                    }
-                }
-            }
-            first = end;
-        }
-        #[cfg(test)]
-        {
-            stats.quantized_trace.rerank_docs = scan.candidates.docs.clone();
-            stats.quantized_trace.rerank_docs.sort_unstable();
-        }
-        let rerank_batch = self.reader.read_vector_rows_planned(
-            &scan.candidates.rows,
-            &mut survivor_read_ranges,
-            &mut survivor_block_scratch,
-        )?;
-        drop(rerank_fetch_stage);
-        stats.rerank_fetch_ns += rerank_fetch_start.elapsed().as_nanos() as u64;
-        stats.rerank_rows += scan.candidates.len();
-
         let mut topn =
             TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator));
-        // Row-sorted survivors own their document ids; the batch ordinal addresses both.
-        for (candidate, (batch_row, bytes)) in rerank_batch.iter().enumerate() {
-            debug_assert_eq!(scan.candidates.rows[candidate], batch_row);
-            let doc = scan.candidates.docs[candidate];
-            let score_start = Instant::now();
-            {
-                let _rerank_score_stage = enter_vector_stage(Stage::RerankScore);
-                let score = self.query.score_doc_bytes(bytes);
-                if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
-                    topn.push_unordered(key, doc);
-                }
+        scorer.rerank(&self.reader, &self.query, stats, |doc, score| {
+            if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
+                topn.push_unordered(key, doc);
             }
-            stats.rerank_score_ns += score_start.elapsed().as_nanos() as u64;
-            stats.exact_rows_read += 1;
-        }
+        })?;
         let segment_ord = self.segment_ord;
         let assembly_start = Instant::now();
         let _assembly_stage = enter_vector_stage(Stage::ResultAssembly);
@@ -2766,25 +2565,21 @@ impl<T: VectorElement> VectorBackend<T> {
             return Ok(Vec::new());
         }
 
-        let non_vector_start = Instant::now();
-        let non_vector_stage = enter_vector_stage(Stage::NonVectorSearch);
-        let filter = build_segment_filter(weight, segment_reader, max_doc)?;
-        drop(non_vector_stage);
-        let non_vector_search_ns = non_vector_start.elapsed().as_nanos() as u64;
-        stats.non_vector_search_ns = stats
-            .non_vector_search_ns
-            .saturating_add(non_vector_search_ns);
-        if filter.is_empty() {
+        let mut row_gate = None;
+        let filter_before_init = stats.non_vector_search_ns;
+        if index.router() == super::RouterKind::Stacked {
+            self.prepare_row_gate(weight, segment_reader, &mut row_gate, stats)?;
+        }
+        let non_vector_search_ns = stats.non_vector_search_ns - filter_before_init;
+        if matches!(row_gate, Some(RowGate::Empty)) {
             drop(init_stage);
             stats.scan_init_ns = stats.scan_init_ns.saturating_add(
                 (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
             );
             return Ok(Vec::new());
         }
-        let alive = segment_reader.alive_bitset();
-
         let num_centroids = index.num_clusters();
-        if num_centroids == 0 {
+        if num_centroids == 0 || index.num_docs() == 0 {
             drop(init_stage);
             stats.scan_init_ns = stats.scan_init_ns.saturating_add(
                 (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
@@ -2813,7 +2608,10 @@ impl<T: VectorElement> VectorBackend<T> {
         // cheap.
         // Routing operates in `f32` (centroid rows are `f32` today), so the
         // query is widened losslessly per element.
-        let query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
+        let mut query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
+        if index.router() == super::RouterKind::Rng {
+            super::prepared::normalize_query(self.query.metric(), &mut query_f32);
+        }
         let mut routing_ws = RouterWorkspace::default();
         stats.segment_rows = Some(index.num_rows());
         stats.segment_clusters = Some(index.num_clusters());
@@ -2828,7 +2626,9 @@ impl<T: VectorElement> VectorBackend<T> {
             k: self.adaptive.router_k(
                 work_budget,
                 x,
-                filter.match_fraction(max_doc),
+                row_gate
+                    .as_ref()
+                    .map_or(1.0, |gate| gate.match_fraction(max_doc)),
                 num_centroids,
             ),
             recall: self.adaptive.router_recall_target,
@@ -2849,6 +2649,7 @@ impl<T: VectorElement> VectorBackend<T> {
         };
         let mut routing_ns = routing_start.elapsed().as_nanos() as u64;
         let routing_before_scan = routing_ns;
+        let filter_before_scan = stats.non_vector_search_ns;
 
         let scan_start = Instant::now();
         let exact_scan_stage = enter_vector_stage(Stage::ExactScan);
@@ -2856,7 +2657,9 @@ impl<T: VectorElement> VectorBackend<T> {
             index,
             &mut ranked,
             controller,
-            &RowGate::new(&filter, alive),
+            row_gate,
+            weight,
+            segment_reader,
             top_n,
             tie_break,
             tie_comparator,
@@ -2871,6 +2674,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 .elapsed()
                 .as_nanos()
                 .saturating_sub(u128::from(routing_ns.saturating_sub(routing_before_scan)))
+                .saturating_sub(u128::from(stats.non_vector_search_ns - filter_before_scan))
                 as u64,
         );
 
@@ -2891,12 +2695,14 @@ impl<T: VectorElement> VectorBackend<T> {
     /// Probes ranked clusters under bounds and work-budget gates, filtering before payload reads.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
-    fn scan_clusters<K, CTail>(
-        &self,
+    fn scan_clusters<'a, K, CTail>(
+        &'a self,
         index: &IvfIndex,
         ranked: &mut impl Iterator<Item = Candidate>,
         mut controller: ProbeController<'_>,
-        row_gate: &RowGate<'_>,
+        mut row_gate: Option<RowGate<'a>>,
+        weight: &dyn Weight,
+        segment_reader: &'a SegmentReader,
         top_n: usize,
         tie_break: &mut K,
         tie_comparator: CTail,
@@ -2953,6 +2759,14 @@ impl<T: VectorElement> VectorBackend<T> {
                 break;
             }
             let cluster = cluster as usize;
+            let rows = index.cluster_range(cluster);
+            if rows.is_empty() {
+                controller.charge_open();
+                postings_skipped += 1;
+                stats.clusters_skipped_empty += 1;
+                controller.cover(kth)?;
+                continue;
+            }
 
             // P5: the bounds verdict. The bound is consumed only through
             // `Armed` (the heap holds k results) — enforced by the enum;
@@ -3008,12 +2822,10 @@ impl<T: VectorElement> VectorBackend<T> {
             // Event-wise charging, part 1: the open.
             controller.charge_open();
 
-            let rows = index.cluster_range(cluster);
-
-            if rows.is_empty() {
-                postings_skipped += 1;
-                controller.cover(kth)?;
-                continue;
+            self.prepare_row_gate(weight, segment_reader, &mut row_gate, stats)?;
+            let row_gate = row_gate.as_ref().unwrap();
+            if matches!(row_gate, RowGate::Empty) {
+                break;
             }
             let open = matches!(row_gate, RowGate::Open);
             if !open {
@@ -3122,6 +2934,7 @@ impl<T: VectorElement> VectorBackend<T> {
 }
 
 /// A segment's filter matches, as consumed by the IVF probes.
+#[derive(Clone)]
 enum SegmentFilter {
     /// Every doc id below `max_doc` matches (deleted docs included); no
     /// bitset is materialized.
@@ -3133,21 +2946,6 @@ enum SegmentFilter {
 impl SegmentFilter {
     fn is_empty(&self) -> bool {
         matches!(self, SegmentFilter::Docs(filter) if filter.len() == 0)
-    }
-
-    fn docs(&self) -> Option<&BitSet> {
-        match self {
-            SegmentFilter::All => None,
-            SegmentFilter::Docs(filter) => Some(filter),
-        }
-    }
-
-    /// The share of doc ids below `max_doc` that match.
-    fn match_fraction(&self, max_doc: DocId) -> f64 {
-        match self {
-            SegmentFilter::All => 1.0,
-            SegmentFilter::Docs(filter) => filter.len() as f64 / f64::from(max_doc.max(1)),
-        }
     }
 }
 
@@ -3194,8 +2992,7 @@ mod tests {
     // overflow / zero-K. The handful of tests that need crafted point
     // geometry (the trap case + the result-level candidate-floor
     // demonstration) build a tiny IVF index inline via `build_inline_ivf`
-    // and an `InlineClusterer` that's compatible with the batched
-    // IvfClusterer trait.
+    // and the shared `Grid2DCentroids` producer.
     // ============================================================
     use std::cmp::Ordering;
 
@@ -3211,9 +3008,8 @@ mod tests {
     };
     use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
     use crate::vector::prepared::QuantizedIndexCtx;
-    use crate::vector::tests::{exhaustive_params, TestVectorIndex};
+    use crate::vector::tests::{exhaustive_params, Grid2DCentroids, TestVectorIndex};
     use crate::vector::{
-        IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors,
         NeighborhoodGraphSearchMetrics, RouterKind, SearchTerminationReason, VectorClusterStats,
         VectorDType, VectorInfo, VectorOptions, VectorQuantizationConfig, VectorQuantizationLayer,
         VectorStorageFormat,
@@ -3238,7 +3034,7 @@ mod tests {
             (
                 100..104,
                 vec![4u32, 9, 12, 22],
-                RowGate::FilterOnly(&filter),
+                RowGate::FilterOnly(Cow::Borrowed(&filter)),
             ),
             (200..202, vec![11u32, 13], RowGate::Open),
         ] {
@@ -3563,64 +3359,8 @@ mod tests {
     // override. The trap-case and result-level candidate-floor tests
     // need points at specific coordinates, so they build a small IVF
     // index inline via the helper below.
-    struct InlineClusterer {
-        centroids: Vec<[f32; 2]>,
-    }
-
-    impl IvfClusterer for InlineClusterer {
-        fn training_sample_ratio(&self) -> f32 {
-            1.0
-        }
-        fn train(
-            &self,
-            options: &VectorOptions,
-            _vectors: IvfTrainingVectors,
-        ) -> crate::Result<IvfCentroids> {
-            assert_eq!(options.dim(), 2);
-            let num_centroids = self.centroids.len();
-            Ok(IvfCentroids::F32(IvfMatrix {
-                values: self
-                    .centroids
-                    .iter()
-                    .flat_map(|c| c.iter().copied())
-                    .collect(),
-                rows: num_centroids,
-                dims: 2,
-            }))
-        }
-        fn assign(
-            &self,
-            options: &VectorOptions,
-            vectors: IvfVectors<'_>,
-            centroids: &IvfCentroids,
-        ) -> crate::Result<Vec<u32>> {
-            assert_eq!(options.dim(), 2);
-            let IvfVectors::F32(vectors) = vectors;
-            let IvfCentroids::F32(centroids) = centroids;
-            Ok(vectors
-                .matrix
-                .values
-                .chunks_exact(2)
-                .map(|v| {
-                    let mut best = 0u32;
-                    let mut best_d2 = f32::INFINITY;
-                    for (i, c) in centroids.values.chunks_exact(2).enumerate() {
-                        let dx = v[0] - c[0];
-                        let dy = v[1] - c[1];
-                        let d2 = dx * dx + dy * dy;
-                        if d2 < best_d2 {
-                            best = i as u32;
-                            best_d2 = d2;
-                        }
-                    }
-                    best
-                })
-                .collect())
-        }
-    }
-
     /// Build a single-IVF-segment index with the supplied centroids and
-    /// labelled docs. Splits docs across two commits so `merge_ivf`
+    /// labelled docs. Splits docs across two commits so the merge
     /// has ≥ 2 source segments to consume. Returns the index plus the
     /// `(embedding, label)` field handles.
     fn build_inline_ivf(
@@ -3637,14 +3377,11 @@ mod tests {
         let label_field = sb.add_text_field("label", STRING | STORED);
         let schema = sb.build();
 
-        let settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..IndexSettings::default()
-        };
+        let settings = IndexSettings::default();
         let index = Index::builder()
             .schema(schema)
             .settings(settings)
-            .ivf_clusterer(Arc::new(InlineClusterer {
+            .centroid_producer(Arc::new(Grid2DCentroids {
                 centroids: centroids.to_vec(),
             }))
             .ivf_router(RouterKind::Stacked)?
@@ -3666,31 +3403,6 @@ mod tests {
         writer.merge(&segment_ids).wait()?;
         writer.wait_merging_threads()?;
         Ok((index, embed_field, label_field))
-    }
-
-    /// Decode a stored little-endian `[f32; 2]` row.
-    fn decode_2d(bytes: &[u8]) -> [f32; 2] {
-        [
-            f32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            f32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-        ]
-    }
-
-    /// L2-nearest centroid with first-wins tie-break on strict `<` — the
-    /// same rule `InlineClusterer::assign` uses for the primary.
-    fn nearest_centroid(p: [f32; 2], centroids: &[[f32; 2]]) -> usize {
-        let mut best = 0;
-        let mut best_d2 = f32::INFINITY;
-        for (i, c) in centroids.iter().enumerate() {
-            let dx = p[0] - c[0];
-            let dy = p[1] - c[1];
-            let d2 = dx * dx + dy * dy;
-            if d2 < best_d2 {
-                best_d2 = d2;
-                best = i;
-            }
-        }
-        best
     }
 
     const DOCS_PER_CLUSTER: usize = 6;
@@ -3723,20 +3435,20 @@ mod tests {
             .collect()
     }
 
-    /// Merging flat segments with deletes past the clustering threshold: rows
+    /// Merging clustered segments with deletes: rows
     /// written for since-deleted docs still count toward the sources'
     /// `count()` (tombstones don't rewrite `.vec`), so the alive-doc merge
     /// iteration legitimately comes up short of `vector_count`. The merge
     /// must tolerate that, and the resulting IVF segment must hold — and
     /// count — the alive docs only.
     #[test]
-    fn merge_flat_segments_with_deletes_into_ivf() -> crate::Result<()> {
+    fn merge_clustered_segments_with_deletes() -> crate::Result<()> {
         let (centroids, labels) = multi_cluster_fixture();
         let docs = multi_cluster_docs(&centroids, &labels);
         let n = docs.len();
 
-        // Same shape as `build_inline_ivf`, but the two flat source segments
-        // stay unmerged so the deletes land BEFORE the clustering merge.
+        // Same shape as `build_inline_ivf`, but the two clustered source segments
+        // stay unmerged so the deletes land before the merge.
         let mut sb = Schema::builder();
         let embed_field = sb.add_vector_field(
             "embedding",
@@ -3744,14 +3456,11 @@ mod tests {
         );
         let label_field = sb.add_text_field("label", STRING | STORED);
         let schema = sb.build();
-        let settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..IndexSettings::default()
-        };
+        let settings = IndexSettings::default();
         let index = Index::builder()
             .schema(schema)
             .settings(settings)
-            .ivf_clusterer(Arc::new(InlineClusterer {
+            .centroid_producer(Arc::new(Grid2DCentroids {
                 centroids: centroids.clone(),
             }))
             .ivf_router(RouterKind::Stacked)?
@@ -3769,7 +3478,7 @@ mod tests {
             writer.commit()?;
         }
 
-        // Tombstone docs in BOTH flat sources (d0/d7 in the first commit,
+        // Tombstone docs in BOTH sources (d0/d7 in the first commit,
         // d35 in the second), then merge everything into one IVF segment.
         let deleted = ["d0", "d7", "d35"];
         for label in deleted {
@@ -3812,16 +3521,7 @@ mod tests {
         Ok(())
     }
 
-    /// Merging past the clustering threshold when every doc carrying a
-    /// vector for ONE field is deleted, while another field keeps live
-    /// vectors. The sources still report `vector_count > 0` for the emptied
-    /// field (tombstones don't rewrite `.vec`), so it takes the training
-    /// path, collects nothing — and used to `continue` without writing the
-    /// field's `.vec`/`.centroids` slots. The live field still wrote, so the
-    /// composites existed but the emptied field's slots were missing:
-    /// `count()`, `open_column()` and `vector_info()` all failed with
-    /// InternalError. The merge must instead write the same empty slots as
-    /// the no-vectors-at-all fast path.
+    /// Merging an emptied field preserves its global cluster slots and the live field's rows.
     #[test]
     fn merge_deleting_every_doc_of_one_field_writes_empty_ivf() -> crate::Result<()> {
         let (centroids, labels) = multi_cluster_fixture();
@@ -3839,14 +3539,11 @@ mod tests {
         );
         let label_field = sb.add_text_field("label", STRING | STORED);
         let schema = sb.build();
-        let settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..IndexSettings::default()
-        };
+        let settings = IndexSettings::default();
         let index = Index::builder()
             .schema(schema)
             .settings(settings)
-            .ivf_clusterer(Arc::new(InlineClusterer {
+            .centroid_producer(Arc::new(Grid2DCentroids {
                 centroids: centroids.clone(),
             }))
             .ivf_router(RouterKind::Stacked)?
@@ -3855,7 +3552,7 @@ mod tests {
         writer.set_merge_policy(Box::new(NoMergePolicy));
 
         // Even docs carry the doomed field, odd docs the kept one, split
-        // across two flat commits so BOTH sources hold doomed vectors.
+        // across two commits so BOTH sources hold doomed vectors.
         let mid = n / 2;
         for (i, (label, v)) in docs.iter().enumerate() {
             let mut doc = TantivyDocument::new();
@@ -3894,19 +3591,19 @@ mod tests {
             VectorInfo {
                 format: VectorStorageFormat::Ivf,
                 num_vectors: 0,
-                num_centroids: Some(0),
+                num_centroids: Some(centroids.len()),
                 cluster_stats: Some(VectorClusterStats {
                     min_cluster_size: 0,
                     max_cluster_size: 0,
                     avg_cluster_size: 0.0,
-                    empty_clusters: 0,
+                    empty_clusters: centroids.len(),
                 }),
             },
         );
         let ivf = vec_reader.index().expect("expected IVF storage");
         assert!(vec_reader.is_empty(), "no rows in the emptied field");
         assert_eq!(ivf.num_rows(), 0);
-        assert_eq!(ivf.num_clusters(), 0);
+        assert_eq!(ivf.num_clusters(), centroids.len());
 
         // The live field is untouched: every alive doc is counted and found.
         let kept_count = n / 2;
@@ -3923,67 +3620,6 @@ mod tests {
             exhaustive_params(centroids.len()),
         )?;
         assert_eq!(hits.len(), kept_count, "kept field returns alive docs");
-        Ok(())
-    }
-
-    /// Captures `paradedb::ivf_build` log records so a test can read back the
-    /// timings line the merge emits.
-    struct CaptureLogger;
-    static CAPTURED_IVF_BUILD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    impl log::Log for CaptureLogger {
-        fn enabled(&self, m: &log::Metadata) -> bool {
-            m.target() == "paradedb::ivf_build"
-        }
-        fn log(&self, r: &log::Record) {
-            if self.enabled(r.metadata()) {
-                CAPTURED_IVF_BUILD
-                    .lock()
-                    .unwrap()
-                    .push(format!("{}", r.args()));
-            }
-        }
-        fn flush(&self) {}
-    }
-    static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
-
-    /// The merge emits one parseable `ivf_build timings_ms ...` line per
-    /// field. Builds a larger index so the phase timings are measurable,
-    /// captures the line, and prints it (run with `--nocapture`) so we can
-    /// see where build time goes.
-    #[test]
-    fn ivf_build_emits_timings_log() -> crate::Result<()> {
-        let _ = log::set_logger(&CAPTURE_LOGGER);
-        log::set_max_level(log::LevelFilter::Info);
-
-        // 200 centroids on a 20×10 grid; ~5000 docs clustered around them.
-        let mut centroids: Vec<[f32; 2]> = Vec::new();
-        for x in 0..20 {
-            for y in 0..10 {
-                centroids.push([x as f32 * 10.0, y as f32 * 10.0]);
-            }
-        }
-        let n_per = 25usize;
-        let labels: Vec<String> = (0..centroids.len() * n_per)
-            .map(|i| format!("d{i}"))
-            .collect();
-        let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
-            .map(|i| {
-                let c = centroids[i / n_per];
-                let off = (i % n_per) as f32 * 0.05;
-                (labels[i].as_str(), [c[0] + off, c[1] + off])
-            })
-            .collect();
-
-        let before = CAPTURED_IVF_BUILD.lock().unwrap().len();
-        let _ = build_inline_ivf(Metric::L2, &centroids, &docs)?;
-        let lines: Vec<String> = CAPTURED_IVF_BUILD.lock().unwrap()[before..].to_vec();
-        let line = lines
-            .iter()
-            .find(|l| l.contains("ivf_build timings_ms") && l.contains("centroids=200"))
-            .expect("expected an ivf_build timings line for the 200-centroid build");
-        assert!(line.contains("train="));
-        assert!(line.contains("id_map_write="));
-        eprintln!("IVF_BUILD_SAMPLE {line}");
         Ok(())
     }
 
@@ -4025,7 +3661,7 @@ mod tests {
             .vector_storage_format(VectorStorageFormat::Ivf)
             .build()?;
         let params = exhaustive_params(DEFAULT_NUM_CENTROIDS);
-        for query in [[1.0_f32, 0.0], [0.0, 1.0], [0.7, 0.3]] {
+        for query in [[1.0_f32, 0.0], [0.0, 1.0], [0.7, 0.3], [7.0, 3.0]] {
             for k in [1usize, 3, 6] {
                 let expected = index.ground_truth(query, k)?;
                 let actual = search(
@@ -5586,8 +5222,7 @@ mod tests {
         );
     }
 
-    /// Build a single-segment FLAT index (one commit, never merged past
-    /// the clustering threshold): `docs` are `(label, Some(vector))`, or
+    /// Build a single-segment flat index without centroids: `docs` are `(label, Some(vector))`, or
     /// `(label, None)` for vectorless docs — mixing the two forces the
     /// `Bitmap` id-map.
     fn build_flat(
@@ -6035,14 +5670,11 @@ mod tests {
             );
             sb.add_text_field("label", STRING | STORED);
             let schema = sb.build();
-            let settings = IndexSettings {
-                vector_clustering_threshold: 1,
-                ..IndexSettings::default()
-            };
+            let settings = IndexSettings::default();
             let index = Index::builder()
                 .schema(schema)
                 .settings(settings)
-                .ivf_clusterer(Arc::new(InlineClusterer {
+                .centroid_producer(Arc::new(Grid2DCentroids {
                     centroids: centroids.to_vec(),
                 }))
                 .ivf_router(RouterKind::Stacked)?
@@ -6057,7 +5689,7 @@ mod tests {
             }
             writer.commit()?;
             let segment_ids = index.searchable_segment_ids()?;
-            assert_eq!(segment_ids.len(), 1, "single flat segment");
+            assert_eq!(segment_ids.len(), 1, "single clustered segment");
             writer.merge(&segment_ids).wait()?;
             writer.wait_merging_threads()?;
             Ok((index, embed_field))
@@ -6122,14 +5754,7 @@ mod tests {
                         "{metric:?} seed {seed}: gated top-k must equal brute force"
                     );
 
-                    // (b): the theorem, cluster by cluster. Homes are
-                    // recomputed with the clusterer's own rule: stored
-                    // (post-normalization) doc values against the RAW
-                    // trained centroids - the values `assign` saw. The
-                    // margin then runs against the STORED (normalized)
-                    // centroid, exactly as the gate does; the fold covers
-                    // members whatever rule assigned them, so the
-                    // triangle argument is assignment-rule-agnostic.
+                    // The final search radius must intersect every true member's stored cluster.
                     let searcher = index.reader()?.searcher();
                     let segment_reader = &searcher.segment_readers()[0];
                     let vec_reader = segment_reader.vector_index(field)?;
@@ -6141,12 +5766,8 @@ mod tests {
                     let t_final = to_bound_space(metric, kth_key);
                     let q_norm = (query[0] * query[0] + query[1] * query[1]).sqrt();
                     for &(_, addr) in &brute {
-                        let stored = decode_2d(
-                            &vec_reader
-                                .vector_bytes(addr.doc_id)?
-                                .expect("stored vector"),
-                        );
-                        let home = nearest_centroid(stored, &centroids);
+                        let row = vec_reader.row_id(addr.doc_id)?.unwrap();
+                        let home = vec_reader.row_cluster(row).unwrap();
                         let sim = Metric::similarity_bytes::<f32>(
                             metric,
                             &query,

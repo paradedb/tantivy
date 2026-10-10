@@ -1,766 +1,32 @@
-//! IVF merge-time clustering and vector encoding.
-
-use std::io::Write;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-#[cfg(test)]
-use cascade::prepare_centroid;
-#[cfg(test)]
-use cascade::LayerSpec;
-use cascade::{
-    encode_batch_in_place_with_workspace, BatchEncodeWorkspace, PreparedCentroidWorkspace,
-    QueryRotationPlan,
-};
-use itertools::Itertools;
-#[cfg(test)]
-use quant_model::Grid;
-
-#[cfg(test)]
-use super::decode_row;
-use super::{
-    decode_row_append, encode_vector, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix,
-    IvfMatrixView, IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, CENTROIDS_EXT,
-};
-use crate::directory::{CompositeWrite, Directory};
-use crate::index::SegmentComponent;
-use crate::plugin::PluginMergeContext;
-#[cfg(test)]
-use crate::schema::Metric;
-use crate::schema::{Field, FieldType, VectorDType, VectorOptions};
-use crate::vector::blocks::{block_len, column_range, pad, write_metadata, BlockDirectory};
-#[cfg(test)]
-use crate::vector::distance::l2_squared;
-use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
-use crate::vector::flat::id_map::DocLocation;
-use crate::vector::flat::IdMap;
-use crate::vector::header::{
-    write_centroid_header, write_vector_header, CentroidSlot, VectorEntry, HEADER_LEN,
-};
-use crate::vector::metadata::{SlotType, VectorColMetadata};
-use crate::vector::plugin::{merge_source_rows, RowAddress};
-use crate::vector::router::{BuiltRouter, RouterKind};
-use crate::vector::{
-    residual_norm, BoundKind, BoundsBuilder, VectorQuantizationConfig, ENTRY_ALIGN, VEC_EXT,
-};
-use crate::{DocId, TantivyError};
-
-struct AssignedVector {
-    cluster: usize,
-    target_doc_id: DocId,
-    source: RowAddress,
-}
-
-/// Per-field IVF build counters and timings, reported on `paradedb::ivf_build`.
-#[derive(Default)]
-struct IvfBuildTimings {
-    /// Source vector reads across the training, assign, and encode passes.
-    source_reads: usize,
-    spill_bytes: usize,
-    pad_bytes: usize,
-    /// Bytes written to this field's vector entries, including entry padding.
-    /// File headers and the composite footer are excluded.
-    vec_bytes: u64,
-    train: Duration,
-    assign: Duration,
-    id_map_write: Duration,
-    encode: Duration,
-}
-
-fn write_u16_run(writer: &mut impl Write, values: &[u16]) -> std::io::Result<()> {
-    for &value in values {
-        writer.write_all(&value.to_le_bytes())?;
-    }
-    Ok(())
-}
-
-fn write_f32_run(writer: &mut impl Write, values: &[f32]) -> std::io::Result<()> {
-    for &value in values {
-        writer.write_all(&value.to_le_bytes())?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn quantization_runtime(
-    config: &VectorQuantizationConfig,
-    opts: &VectorOptions,
-) -> crate::Result<(Vec<LayerSpec>, Vec<Grid>)> {
-    Ok(VectorColMetadata::build_ivf(opts, Some(config))?.runtime())
-}
-
-/// Writes an empty IVF field to both vector composites.
-fn write_empty_field_slots(
-    vec_write: &mut CompositeWrite,
-    centroids_write: &mut CompositeWrite,
-    field: Field,
-    opts: &VectorOptions,
-    router: &BuiltRouter,
-    quantization: Option<&VectorQuantizationConfig>,
-) -> crate::Result<()> {
-    let meta = VectorColMetadata::build_ivf(opts, quantization)?;
-    vec_write.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
-    let data = vec_write.for_field_with_idx(field, VectorEntry::Data.index());
-    let start = data.written_bytes();
-    write_metadata(data, &meta)?;
-    BlockDirectory::new(data.written_bytes() - start).finish(data)?;
-    assert_eq!((data.written_bytes() - start) as usize % ENTRY_ALIGN, 0);
-    {
-        let centroids_w =
-            centroids_write.for_field_with_idx(field, CentroidSlot::Centroids.index());
-        IvfIndex::serialize_centroids(0, 0, &[], opts, centroids_w)?;
-        centroids_w.flush()?;
-    }
-    {
-        let offsets_w = centroids_write.for_field_with_idx(field, CentroidSlot::Offsets.index());
-        IvfIndex::serialize_offsets(&[0u64], offsets_w)?;
-        offsets_w.flush()?;
-    }
-    {
-        let bounds_w = centroids_write.for_field_with_idx(field, CentroidSlot::Bounds.index());
-        IvfIndex::serialize_bounds(BoundKind::Ball, &[], bounds_w)?;
-        bounds_w.flush()?;
-    }
-    {
-        let router_w = centroids_write.for_field_with_idx(field, CentroidSlot::Router.index());
-        router.serialize(router_w)?;
-        router_w.flush()?;
-    }
-    Ok(())
-}
-
-fn build_router(
-    router: RouterKind,
-    opts: &VectorOptions,
-    centroids: &mut IvfCentroids,
-) -> crate::Result<BuiltRouter> {
-    let IvfCentroids::F32(matrix) = &*centroids;
-    let shape = (matrix.rows, matrix.dims, matrix.values.len());
-    let router = router.build(opts, centroids)?;
-    let IvfCentroids::F32(matrix) = &*centroids;
-    if (matrix.rows, matrix.dims, matrix.values.len()) != shape {
-        return Err(TantivyError::InvalidArgument(
-            "Router changed the centroid matrix shape while building".to_string(),
-        ));
-    }
-    Ok(router)
-}
-
-pub(crate) fn merge_ivf(
-    ctx: &PluginMergeContext,
-    clusterer: Option<&dyn IvfClusterer>,
-    router: Option<RouterKind>,
-) -> crate::Result<()> {
-    if ctx.cancel.wants_cancel() {
-        return Err(TantivyError::Cancelled);
-    }
-
-    let has_vector_field = ctx
-        .schema
-        .fields()
-        .any(|(_, entry)| matches!(entry.field_type(), FieldType::Vector(_)));
-    if !has_vector_field {
-        return Ok(());
-    }
-
-    let clusterer = clusterer.ok_or_else(|| {
-        TantivyError::InvalidArgument(
-            "vector_clustering_threshold selected IVF merge, but no IvfClusterer is configured"
-                .to_string(),
-        )
-    })?;
-    let router = router.ok_or_else(|| {
-        TantivyError::InvalidArgument(
-            "vector_clustering_threshold selected IVF merge, but no Router is configured"
-                .to_string(),
-        )
-    })?;
-
-    let num_target_docs: u32 = ctx.readers.iter().map(|r| r.num_docs()).sum();
-    if num_target_docs == 0 {
-        return Ok(());
-    }
-
-    let settings = clusterer.merge_settings(num_target_docs as usize)?;
-    let directory = ctx.target_segment.index().directory();
-    let vec_path = ctx
-        .target_segment
-        .relative_path(SegmentComponent::Custom(VEC_EXT.to_string()));
-    let centroids_path = ctx
-        .target_segment
-        .relative_path(SegmentComponent::Custom(CENTROIDS_EXT.to_string()));
-    let mut vec_file = directory.open_write(&vec_path)?;
-    write_vector_header(&mut vec_file)?;
-    let mut vec_write = CompositeWrite::wrap(vec_file);
-    let mut centroids_file = directory.open_write(&centroids_path)?;
-    write_centroid_header(&mut centroids_file)?;
-    let mut centroids_write = CompositeWrite::wrap(centroids_file);
-
-    let mut id_maps = Vec::new();
-    let mut build_reports = Vec::new();
-    for (field, entry) in ctx.schema.fields() {
-        let opts = match entry.field_type() {
-            FieldType::Vector(opts) => opts,
-            _ => continue,
-        };
-        let quantization = ctx
-            .settings
-            .vector_quantization
-            .iter()
-            .find(|config| config.field == entry.name());
-        if let Some(config) = quantization {
-            config.validate(opts)?;
-        }
-        let field_readers: Vec<_> = ctx
-            .readers
-            .iter()
-            .map(|reader| reader.vector_index(field))
-            .collect::<crate::Result<Vec<_>>>()?;
-        let field_build_start = Instant::now();
-        let source_rows = merge_source_rows(ctx, &field_readers)?;
-        let vector_count = field_readers
-            .iter()
-            .map(|reader| reader.num_vectors())
-            .sum::<usize>();
-        if vector_count == 0 {
-            let mut centroids = IvfCentroids::F32(IvfMatrix {
-                values: Vec::new(),
-                rows: 0,
-                dims: opts.dim(),
-            });
-            let router = build_router(router, opts, &mut centroids)?;
-            id_maps.push((field, vec![DocLocation::ABSENT; num_target_docs as usize]));
-            write_empty_field_slots(
-                &mut vec_write,
-                &mut centroids_write,
-                field,
-                opts,
-                &router,
-                quantization,
-            )?;
-            continue;
-        }
-        let training_sample_size = {
-            let ratio = f64::from(settings.training_sample_ratio).clamp(f64::MIN_POSITIVE, 1.0);
-            let target = ((vector_count as f64) * ratio).ceil() as usize;
-            target.clamp(1, vector_count)
-        };
-        let training_sample_interval = (vector_count / training_sample_size).max(1);
-
-        let residual: fn(&[u8], &[f32]) -> f32 = match opts.dtype() {
-            VectorDType::F32 => residual_norm::<f32>,
-        };
-        let centroid_stride = opts.bytes_per_vector();
-
-        match opts.dtype() {
-            VectorDType::F32 => {
-                let mut timings = IvfBuildTimings::default();
-                let dim = opts.dim();
-
-                // Each sampled row paired with its position in target-doc order.
-                let mut training_doc_ids = Vec::with_capacity(training_sample_size);
-                let mut training_sources: Vec<(RowAddress, usize)> =
-                    Vec::with_capacity(training_sample_size);
-                let mut present_vector_ord = 0usize;
-                for (target_doc_id, source) in source_rows
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(doc_id, row)| row.map(|row| (doc_id as DocId, row)))
-                {
-                    if training_sources.len() < training_sample_size
-                        && present_vector_ord % training_sample_interval == 0
-                    {
-                        training_sources.push((source, training_doc_ids.len()));
-                        training_doc_ids.push(target_doc_id);
-                    }
-                    present_vector_ord += 1;
-                }
-                debug_assert_eq!(source_rows.len(), num_target_docs as usize);
-
-                // Read in source storage order, but keep the training matrix in target-doc
-                // order so the trainer's input does not depend on source clustering.
-                training_sources.sort_unstable();
-                let mut training_values = vec![0.0f32; training_sources.len() * dim];
-                let mut decode_buffer = Vec::with_capacity(dim);
-                for (source, sample_idx) in training_sources {
-                    timings.source_reads += 1;
-                    let bytes = field_readers[source.segment_ord as usize]
-                        .vector_bytes_for_row(source.row_id)?;
-                    decode_buffer.clear();
-                    decode_row_append::<f32>(&bytes, dim, &mut decode_buffer)?;
-                    training_values[sample_idx * dim..][..dim].copy_from_slice(&decode_buffer);
-                }
-                debug_assert!(
-                    if ctx.readers.iter().any(|reader| reader.has_deletes()) {
-                        present_vector_ord <= vector_count
-                    } else {
-                        present_vector_ord == vector_count
-                    },
-                    "{present_vector_ord} alive docs with vectors vs {vector_count} reported by \
-                     source count()"
-                );
-                if training_doc_ids.is_empty() {
-                    // `vector_count > 0`, yet the alive-doc walk found
-                    // nothing to sample: every vector-bearing doc was
-                    // deleted. Write the same empty slots as the
-                    // no-vectors fast path — skipping the field would
-                    // leave its slots missing from composites the other
-                    // fields still write, and the reader errors on
-                    // missing slots.
-                    let mut centroids = IvfCentroids::F32(IvfMatrix {
-                        values: Vec::new(),
-                        rows: 0,
-                        dims: opts.dim(),
-                    });
-                    let router = build_router(router, opts, &mut centroids)?;
-                    id_maps.push((field, vec![DocLocation::ABSENT; num_target_docs as usize]));
-                    write_empty_field_slots(
-                        &mut vec_write,
-                        &mut centroids_write,
-                        field,
-                        opts,
-                        &router,
-                        quantization,
-                    )?;
-                    continue;
-                }
-
-                let training_rows = training_doc_ids.len();
-                let training_vectors = IvfTrainingVectors::F32(IvfTrainingBatch {
-                    doc_ids: training_doc_ids,
-                    matrix: IvfMatrix {
-                        values: training_values,
-                        rows: training_rows,
-                        dims: opts.dim(),
-                    },
-                });
-                let train_start = Instant::now();
-                let mut centroids = clusterer.train(opts, training_vectors)?;
-
-                timings.train = train_start.elapsed();
-
-                if ctx.cancel.wants_cancel() {
-                    return Err(TantivyError::Cancelled);
-                }
-
-                let IvfCentroids::F32(centroid_matrix) = &centroids;
-                if centroid_matrix.dims != opts.dim() {
-                    return Err(TantivyError::InvalidArgument(format!(
-                        "IvfClusterer produced centroids with {} dimensions, expected {}",
-                        centroid_matrix.dims,
-                        opts.dim()
-                    )));
-                }
-                if centroid_matrix.values.len() != centroid_matrix.rows * centroid_matrix.dims {
-                    return Err(TantivyError::InvalidArgument(format!(
-                        "IvfClusterer produced {} centroid values for {} rows x {} dimensions",
-                        centroid_matrix.values.len(),
-                        centroid_matrix.rows,
-                        centroid_matrix.dims
-                    )));
-                }
-                if centroid_matrix.rows == 0 {
-                    return Err(TantivyError::InvalidArgument(
-                        "IvfClusterer produced zero centroids".to_string(),
-                    ));
-                }
-                let num_centroids = centroid_matrix.rows;
-
-                let router = build_router(router, opts, &mut centroids)?;
-                let IvfCentroids::F32(centroid_matrix) = &centroids;
-
-                // Float working copy of the trained centroids — the
-                // `.centroids` encode below reads per-row slices. Encoding +
-                // Cosine normalization happen at the `.centroids` write
-                // below.
-                let centroid_rows: Vec<Vec<f32>> = centroid_matrix
-                    .values
-                    .chunks_exact(opts.dim())
-                    .map(|centroid| centroid.to_vec())
-                    .collect();
-
-                let mut assigned_vectors = Vec::with_capacity(vector_count);
-                {
-                    // Assignment is per vector, so batches can follow source storage order;
-                    // `assigned_vectors` is re-sorted by (cluster, target doc) below.
-                    let mut assign_sources: Vec<(RowAddress, DocId)> = source_rows
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(doc_id, row)| row.map(|row| (row, doc_id as DocId)))
-                        .sorted()
-                        .collect();
-
-                    let batch_capacity = settings.assign_batch_size.min(assign_sources.len());
-                    let mut batch_values = Vec::with_capacity(batch_capacity * dim);
-                    let mut batch_doc_ids = Vec::with_capacity(batch_capacity);
-                    for batch in assign_sources.chunks(settings.assign_batch_size) {
-                        if ctx.cancel.wants_cancel() {
-                            return Err(TantivyError::Cancelled);
-                        }
-                        batch_values.clear();
-                        batch_doc_ids.clear();
-                        for &(source, target_doc_id) in batch {
-                            timings.source_reads += 1;
-                            let bytes = field_readers[source.segment_ord as usize]
-                                .vector_bytes_for_row(source.row_id)?;
-                            decode_row_append::<f32>(&bytes, dim, &mut batch_values)?;
-                            batch_doc_ids.push(target_doc_id);
-                        }
-                        let assign_start = Instant::now();
-                        let clusters = clusterer.assign(
-                            opts,
-                            IvfVectors::F32(IvfVectorBatch {
-                                doc_ids: batch_doc_ids.as_slice(),
-                                matrix: IvfMatrixView {
-                                    values: batch_values.as_slice(),
-                                    rows: batch.len(),
-                                    dims: dim,
-                                },
-                            }),
-                            &centroids,
-                        )?;
-                        timings.assign += assign_start.elapsed();
-                        if clusters.len() != batch.len() {
-                            return Err(TantivyError::InvalidArgument(format!(
-                                "IvfClusterer assigned {} clusters for {} vectors",
-                                clusters.len(),
-                                batch.len()
-                            )));
-                        }
-                        for (cluster, &(source, target_doc_id)) in clusters.into_iter().zip(batch) {
-                            let cluster = cluster as usize;
-                            if cluster >= num_centroids {
-                                return Err(TantivyError::InvalidArgument(format!(
-                                    "IvfClusterer assigned vector to cluster {cluster}, but only \
-                                     {num_centroids} centroids were trained"
-                                )));
-                            }
-                            assigned_vectors.push(AssignedVector {
-                                cluster,
-                                target_doc_id,
-                                source,
-                            });
-                        }
-                    }
-                }
-                debug_assert_eq!(assigned_vectors.len(), present_vector_ord);
-                // The `.centroids` doc count: one posting row per document.
-                let num_present_docs = assigned_vectors.len();
-
-                let mut cluster_counts = vec![0usize; num_centroids];
-                for assigned_vector in &assigned_vectors {
-                    cluster_counts[assigned_vector.cluster] += 1;
-                }
-
-                assigned_vectors
-                    .sort_unstable_by_key(|vector| (vector.cluster, vector.target_doc_id));
-
-                let mut cluster_offsets: Vec<u64> = Vec::with_capacity(num_centroids + 1);
-                let mut next_offset = 0u64;
-                cluster_offsets.push(next_offset);
-                for cluster_count in cluster_counts {
-                    next_offset += cluster_count as u64;
-                    cluster_offsets.push(next_offset);
-                }
-
-                let mut centroid_bytes =
-                    Vec::with_capacity(num_centroids * opts.bytes_per_vector());
-                let mut bounds_builder = BoundsBuilder::new(num_centroids);
-                let mut stored_centroid = Vec::with_capacity(opts.dim());
-                for (centroid_ord, centroid) in centroid_rows.iter().enumerate() {
-                    let mut bytes = encode_vector(centroid, opts.dim())?;
-                    let outcome = maybe_normalize_bytes(opts, &mut bytes);
-                    if outcome == NormalizeOutcome::NonFinite {
-                        log::warn!(
-                            "non-finite centroid {centroid_ord} in field '{}' written \
-                             un-normalized during merge",
-                            entry.name(),
-                        );
-                    }
-                    stored_centroid.clear();
-                    decode_row_append::<f32>(&bytes, opts.dim(), &mut stored_centroid)?;
-                    if outcome != NormalizeOutcome::Normalized
-                        || stored_centroid.iter().any(|value| !value.is_finite())
-                    {
-                        bounds_builder.saturate(centroid_ord);
-                    }
-                    centroid_bytes.extend_from_slice(&bytes);
-                }
-
-                // IdMaps are emitted after Data so inter-entry padding never enters an id map.
-                let id_map_start = Instant::now();
-                if num_centroids >= u32::MAX as usize {
-                    return Err(TantivyError::InvalidArgument(
-                        "too many clusters for document locations".into(),
-                    ));
-                }
-                let mut locations = vec![DocLocation::ABSENT; num_target_docs as usize];
-                timings.id_map_write = id_map_start.elapsed();
-
-                // Data entry: metadata followed by aligned cluster blocks.
-                let encode_start = Instant::now();
-                let meta = VectorColMetadata::build_ivf(opts, quantization)?;
-                let slots = meta.slots();
-                timings.pad_bytes += vec_write.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
-                let data_start = vec_write.written_bytes();
-                let data = vec_write.for_field_with_idx(field, VectorEntry::Data.index());
-                let entry_start = data.written_bytes();
-                let mut pos = write_metadata(data, &meta)?;
-                let mut directory = BlockDirectory::new(data.written_bytes() - entry_start);
-                timings.pad_bytes += pos - 4 - meta.to_bytes().len();
-                let (specs, grids) = meta.runtime();
-                let row_bytes = opts.bytes_per_vector();
-                let fixed_scratch = row_bytes + opts.dim() + opts.dim().div_ceil(64) * 8;
-                let per_row_scratch =
-                    2 * row_bytes + quantization.map_or(0, |c| c.bytes_per_row()) + 16;
-                let tile_rows = (1usize << 20)
-                    .saturating_sub(fixed_scratch)
-                    .checked_div(per_row_scratch)
-                    .unwrap_or(0)
-                    .max(1);
-                let mut centroid_workspace = quantization.map(|_| {
-                    PreparedCentroidWorkspace::new(Arc::new(QueryRotationPlan::new(
-                        opts.dim(),
-                        &specs,
-                    )))
-                });
-                let mut encode_workspace = quantization
-                    .map(|_| BatchEncodeWorkspace::with_capacity(opts.dim(), tile_rows, &specs));
-                let mut bufs: Vec<Vec<u8>> = slots.iter().map(|_| Vec::new()).collect();
-                let mut normalized = Vec::with_capacity(row_bytes);
-                let mut batch_values = Vec::with_capacity(tile_rows * opts.dim());
-                let mut centroid = Vec::with_capacity(opts.dim());
-                for (cluster, offsets) in cluster_offsets.windows(2).enumerate() {
-                    let start = offsets[0] as usize;
-                    let end = offsets[1] as usize;
-                    let n = end - start;
-                    if n == 0 {
-                        directory.push(data.written_bytes() - entry_start, offsets[1] as u32);
-                        continue;
-                    }
-                    let block_start = pos;
-                    assert_eq!(data.written_bytes() - entry_start, block_start as u64);
-                    centroid.clear();
-                    decode_row_append::<f32>(
-                        &centroid_bytes[cluster * centroid_stride..][..centroid_stride],
-                        opts.dim(),
-                        &mut centroid,
-                    )?;
-                    let prepared = centroid_workspace
-                        .as_mut()
-                        .map(|workspace| workspace.prepare(&centroid));
-                    // Rows stream directly to disk; only encoded columns need cluster buffers.
-                    let mut local = 0u32;
-                    for tile in assigned_vectors[start..end].chunks(tile_rows) {
-                        if ctx.cancel.wants_cancel() {
-                            return Err(TantivyError::Cancelled);
-                        }
-                        batch_values.clear();
-                        for assigned in tile {
-                            timings.source_reads += 1;
-                            bufs[1].extend_from_slice(&assigned.target_doc_id.to_le_bytes());
-                            locations[assigned.target_doc_id as usize] = DocLocation {
-                                cluster: cluster as u32,
-                                local,
-                            };
-                            local += 1;
-                            let bytes = field_readers[assigned.source.segment_ord as usize]
-                                .vector_bytes_for_row(assigned.source.row_id)?;
-                            let row: &[u8] = if opts.needs_normalization() {
-                                normalized.clear();
-                                normalized.extend_from_slice(&bytes);
-                                maybe_normalize_bytes(opts, &mut normalized);
-                                &normalized
-                            } else {
-                                &bytes
-                            };
-                            data.write_all(row)?;
-                            pos += row.len();
-                            bounds_builder.add_native(cluster, residual(row, &centroid));
-                            if quantization.is_some() {
-                                decode_row_append::<f32>(row, opts.dim(), &mut batch_values)?;
-                            }
-                        }
-                        if let Some(prepared) = prepared.as_ref() {
-                            let batch = encode_batch_in_place_with_workspace(
-                                &mut batch_values,
-                                tile.len(),
-                                prepared,
-                                &specs,
-                                &grids,
-                                encode_workspace.as_mut().unwrap(),
-                                opts.metric() == crate::schema::Metric::L2,
-                            );
-                            for (idx, slot) in slots.iter().enumerate().skip(1) {
-                                match &slot.slot_type {
-                                    SlotType::ResidualNorms => write_f32_run(
-                                        &mut bufs[idx],
-                                        &batch.residual_norms_squared,
-                                    )?,
-                                    SlotType::QuantLayerCodes { layer, .. } => bufs[idx]
-                                        .extend_from_slice(&batch.layers[*layer as usize].codes),
-                                    SlotType::QuantLayerScales { layer } => write_f32_run(
-                                        &mut bufs[idx],
-                                        &batch.layers[*layer as usize].scales,
-                                    )?,
-                                    SlotType::QuantLayerGammas { layer } => write_u16_run(
-                                        &mut bufs[idx],
-                                        &batch.layers[*layer as usize].gammas,
-                                    )?,
-                                    SlotType::QuantLayerErrors { layer } => write_u16_run(
-                                        &mut bufs[idx],
-                                        &batch.layers[*layer as usize].corrected_error_ratios,
-                                    )?,
-                                    SlotType::QuantLayerConstants { layer } => write_f32_run(
-                                        &mut bufs[idx],
-                                        &batch.layers[*layer as usize].constants,
-                                    )?,
-                                    SlotType::DocIds => (),
-                                    SlotType::Rows { .. } => unreachable!(),
-                                }
-                            }
-                        }
-                    }
-                    // Column flushes poll cancellation and retain capacity for the next cluster.
-                    for idx in 1..slots.len() {
-                        let col = column_range(&slots, n, idx);
-                        let padding = block_start + col.start - pos;
-                        pad(data, padding)?;
-                        timings.pad_bytes += padding;
-                        assert_eq!(bufs[idx].len(), col.len());
-                        for chunk in bufs[idx].chunks(1 << 20) {
-                            if ctx.cancel.wants_cancel() {
-                                return Err(TantivyError::Cancelled);
-                            }
-                            data.write_all(chunk)?;
-                        }
-                        bufs[idx].clear();
-                        pos = block_start + col.end;
-                    }
-                    let padding = block_start + block_len(&slots, n) - pos;
-                    pad(data, padding)?;
-                    timings.pad_bytes += padding;
-                    pos += padding;
-                    assert_eq!(data.written_bytes() - entry_start, pos as u64);
-                    directory.push(data.written_bytes() - entry_start, offsets[1] as u32);
-                }
-                id_maps.push((field, locations));
-                let entry_len = directory.finish(data)?;
-                timings.pad_bytes += entry_len - pos - (num_centroids + 1) * 12 - 8;
-                assert_eq!(
-                    (data.written_bytes() - entry_start) as usize % ENTRY_ALIGN,
-                    0
-                );
-                data.flush()?;
-                timings.vec_bytes += vec_write.written_bytes() - data_start;
-                timings.encode = encode_start.elapsed();
-
-                {
-                    let centroids_w =
-                        centroids_write.for_field_with_idx(field, CentroidSlot::Centroids.index());
-                    IvfIndex::serialize_centroids(
-                        num_centroids,
-                        num_present_docs,
-                        &centroid_bytes,
-                        opts,
-                        centroids_w,
-                    )?;
-                    centroids_w.flush()?;
-                }
-                {
-                    let offsets_w =
-                        centroids_write.for_field_with_idx(field, CentroidSlot::Offsets.index());
-                    IvfIndex::serialize_offsets(&cluster_offsets, offsets_w)?;
-                    offsets_w.flush()?;
-                }
-                {
-                    let bounds_w =
-                        centroids_write.for_field_with_idx(field, CentroidSlot::Bounds.index());
-                    IvfIndex::serialize_bounds(
-                        BoundKind::Ball,
-                        &bounds_builder.finish(),
-                        bounds_w,
-                    )?;
-                    bounds_w.flush()?;
-                }
-
-                if ctx.cancel.wants_cancel() {
-                    return Err(TantivyError::Cancelled);
-                }
-                let router_w =
-                    centroids_write.for_field_with_idx(field, CentroidSlot::Router.index());
-                router.serialize(router_w)?;
-                router_w.flush()?;
-
-                build_reports.push((
-                    field,
-                    timings,
-                    field_build_start.elapsed(),
-                    num_centroids,
-                    vector_count,
-                ));
-            }
-        }
-    }
-
-    for (field, docs) in id_maps {
-        let started = Instant::now();
-        let id_map_start = vec_write.written_bytes();
-        let id_map = vec_write.for_field_with_idx(field, VectorEntry::IdMap.index());
-        IdMap::serialize_locations(&docs, id_map)?;
-        id_map.flush()?;
-        if let Some((_, timings, total, num_centroids, vector_count)) =
-            build_reports.iter_mut().find(|(f, ..)| *f == field)
-        {
-            timings.vec_bytes += vec_write.written_bytes() - id_map_start;
-            let elapsed = started.elapsed();
-            timings.id_map_write += elapsed;
-            *total += elapsed;
-            log::info!(
-                target: "paradedb::ivf_build",
-                "ivf_build timings_ms train={} assign={} id_map_write={} encode={} total={} \
-                 centroids={} vectors={} source_reads={} spill_bytes={} vec_bytes={} pad_bytes={} encode_ms={}",
-                timings.train.as_millis(),
-                timings.assign.as_millis(),
-                timings.id_map_write.as_millis(),
-                timings.encode.as_millis(),
-                total.as_millis(),
-                num_centroids,
-                vector_count,
-                timings.source_reads, timings.spill_bytes, timings.vec_bytes, timings.pad_bytes,
-                timings.encode.as_millis(),
-            );
-        }
-    }
-    vec_write.close()?;
-    centroids_write.close()?;
-    Ok(())
-}
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use super::*;
-    use crate::index::IndexSettings;
+    use cascade::prepare_centroid;
+
+    use crate::index::{IndexSettings, SegmentComponent};
     use crate::indexer::NoMergePolicy;
     use crate::query::{AllQuery, EnableScoring, Query, TermQuery};
-    use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
-    use crate::vector::ivf::AdaptiveProbeParams;
+    use crate::schema::{
+        Field, IndexRecordOption, Metric, Schema, Term, VectorOptions, STORED, STRING,
+    };
+    use crate::vector::blocks::block_len;
+    use crate::vector::distance::l2_squared;
+    use crate::vector::header::VectorEntry;
+    use crate::vector::ivf::{decode_row, AdaptiveProbeParams};
+    use crate::vector::metadata::{SlotType, VectorColMetadata};
     use crate::vector::prepared::QuantizedQueryCtx;
     use crate::vector::tests::ground_truth;
     use crate::vector::{
-        TopDocsByVectorSimilarity, VectorEstimatorMeasurements, VectorEstimatorQuery,
-        VectorEstimatorSource, VectorQuantizationLayer,
+        CentroidProducer, IvfCentroids, IvfMatrix, RouterKind, TopDocsByVectorSimilarity,
+        VectorEstimatorMeasurements, VectorEstimatorQuery, VectorEstimatorSource,
+        VectorQuantizationConfig, VectorQuantizationLayer, ENTRY_ALIGN, VEC_EXT,
     };
-    use crate::{Index, TantivyDocument};
+    use crate::{Index, TantivyDocument, TantivyError};
 
     #[test]
     fn quantization_merge_source_has_no_estimator_analysis_entrypoint() {
-        let source = include_str!("plugin.rs");
-        let test_module_start = source
-            .rfind("\n#[cfg(test)]\nmod tests {")
-            .expect("plugin source must retain one terminal test module");
-        let production_source = &source[..test_module_start];
+        let production_source = include_str!("writer.rs");
         for forbidden in [
             "build_grid(",
             "audit_prefix_error_model(",
@@ -781,7 +47,9 @@ mod tests {
     fn merge_runtime_uses_persisted_grid_and_rho() {
         let config = quant_fixture_config_for(100, Metric::Dot, &[1, 4]);
         let (_, resolved) =
-            quantization_runtime(&config, &VectorOptions::new(100, Metric::Dot)).unwrap();
+            VectorColMetadata::build_ivf(&VectorOptions::new(100, Metric::Dot), Some(&config))
+                .unwrap()
+                .runtime();
         assert_eq!(resolved.len(), 2);
         for (layer, grid) in resolved.iter().enumerate() {
             let persisted = config
@@ -834,11 +102,10 @@ mod tests {
         let index = Index::builder()
             .schema(schema.build())
             .settings(IndexSettings {
-                vector_clustering_threshold: 1,
                 vector_quantization: vec![config],
                 ..Default::default()
             })
-            .ivf_clusterer(Arc::new(QuantFixtureClusterer {
+            .centroid_producer(Arc::new(QuantFixtureCentroids {
                 dim: 65,
                 metric: Metric::L2,
             }))
@@ -887,7 +154,7 @@ mod tests {
                 ),
             )?;
             assert_eq!(hits.results.len(), count.min(3));
-            assert!(!vector.id_map_initialized(), "scan must not open IdMap");
+            assert_eq!(vector.id_map_initialized(), count > 0);
             let ivf = vector.index().unwrap();
             for b in 0..ivf.num_clusters() {
                 let range = ivf.cluster_range(b);
@@ -921,7 +188,7 @@ mod tests {
             let id_map = composite
                 .open_read_with_idx(field, VectorEntry::IdMap.index())
                 .unwrap();
-            assert_eq!(id_map.len(), 1 + segment.max_doc() as usize * 8);
+            assert_eq!(id_map.len(), 1 + count * 4);
             let start = data.storage_block_ord(0).unwrap();
             assert_eq!(start % ENTRY_ALIGN, 0);
             assert_eq!(data.len() % ENTRY_ALIGN, 0);
@@ -945,7 +212,7 @@ mod tests {
         Ok(())
     }
 
-    // Empty quantized IVF fields still carry exact metadata-only Data and DocLocations IdMap
+    // Empty quantized IVF fields still carry exact metadata-only Data and Explicit IdMap
     // entries.
     #[test]
     fn two_field_ivf_includes_empty_field() -> crate::Result<()> {
@@ -1025,7 +292,7 @@ mod tests {
                             .to_owned();
                         out.insert(name, rows_by_doc.remove(&doc));
                     }
-                    assert!(!vectors.id_map_initialized());
+                    assert!(vectors.id_map_initialized());
                 }
                 Ok(out)
             };
@@ -1040,21 +307,13 @@ mod tests {
 
     const QUANT_FIXTURE_DIM: usize = 64;
 
-    struct QuantFixtureClusterer {
+    struct QuantFixtureCentroids {
         dim: usize,
         metric: Metric,
     }
 
-    impl IvfClusterer for QuantFixtureClusterer {
-        fn training_sample_ratio(&self) -> f32 {
-            0.5
-        }
-
-        fn train(
-            &self,
-            options: &VectorOptions,
-            _vectors: IvfTrainingVectors,
-        ) -> crate::Result<IvfCentroids> {
+    impl CentroidProducer for QuantFixtureCentroids {
+        fn centroids(&self, _field: Field, options: &VectorOptions) -> crate::Result<IvfCentroids> {
             assert_eq!(options.dim(), self.dim);
             let values = match self.metric {
                 Metric::L2 => [0.0_f32, 1.0]
@@ -1073,24 +332,6 @@ mod tests {
                 rows: 2,
                 dims: self.dim,
             }))
-        }
-
-        fn assign(
-            &self,
-            _options: &VectorOptions,
-            vectors: IvfVectors<'_>,
-            _centroids: &IvfCentroids,
-        ) -> crate::Result<Vec<u32>> {
-            let IvfVectors::F32(vectors) = vectors;
-            Ok(vectors
-                .matrix
-                .values
-                .chunks_exact(self.dim)
-                .map(|row| match self.metric {
-                    Metric::L2 => u32::from(row[0] >= 0.5),
-                    Metric::Cosine | Metric::Dot => u32::from(row[1] > row[0]),
-                })
-                .collect())
         }
     }
 
@@ -1251,17 +492,14 @@ mod tests {
         let field = schema_builder.add_vector_field("embedding", VectorOptions::new(dim, metric));
         let label_field = schema_builder.add_text_field("label", STRING | STORED);
         let schema = schema_builder.build();
-        let mut settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..Default::default()
-        };
+        let mut settings = IndexSettings::default();
         if quantized {
             settings.vector_quantization = vec![quant_fixture_config_for(dim, metric, schedule)];
         }
         let index = Index::builder()
             .schema(schema)
             .settings(settings)
-            .ivf_clusterer(Arc::new(QuantFixtureClusterer { dim, metric }))
+            .centroid_producer(Arc::new(QuantFixtureCentroids { dim, metric }))
             .ivf_router(router)?
             .create(directory)?;
         let mut writer = index.writer_with_num_threads(1, 30_000_000)?;
@@ -1300,7 +538,6 @@ mod tests {
             schema_builder.add_vector_field("embedding", VectorOptions::new(dim, Metric::L2));
         let schema = schema_builder.build();
         let settings = IndexSettings {
-            vector_clustering_threshold: usize::MAX,
             vector_quantization: vec![quant_fixture_config(dim)],
             ..Default::default()
         };
@@ -1703,7 +940,7 @@ mod tests {
         let config = &index.settings().vector_quantization[0];
         assert_eq!(config.format_version, 3);
         config.validate(&VectorOptions::new(QUANT_FIXTURE_DIM, Metric::L2))?;
-        assert_eq!(&quantized_vec_file(&index)?[..4], &[4, 0, 0, 0]);
+        assert_eq!(&quantized_vec_file(&index)?[..4], &[6, 0, 0, 0]);
         index.settings_mut().vector_quantization.clear();
         let searcher = index.reader()?.searcher();
         let vector = searcher.segment_readers()[0].vector_index(field)?;

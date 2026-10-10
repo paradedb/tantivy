@@ -227,14 +227,7 @@ impl Searcher {
     ) -> crate::Result<C::Fruit> {
         let weight = query.weight(enabled_scoring)?;
         collector.check_schema(self.schema())?;
-        let segment_readers = self.segment_readers();
-        let fruits = executor.map(
-            |(segment_ord, segment_reader)| {
-                collector.collect_segment(weight.as_ref(), segment_ord as u32, segment_reader)
-            },
-            segment_readers.iter().enumerate(),
-        )?;
-        collector.merge_fruits(fruits)
+        collector.collect_global(weight.as_ref(), self, executor)
     }
 
     /// Summarize total space usage of this searcher.

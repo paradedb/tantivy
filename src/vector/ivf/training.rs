@@ -1,87 +1,11 @@
-use crate::schema::VectorOptions;
 use crate::vector::VectorElement;
-use crate::{DocId, TantivyError};
-
-pub trait IvfClusterer: Send + Sync + 'static {
-    /// Fraction of vectors sampled for training, in `(0, 1]`.
-    fn training_sample_ratio(&self) -> f32;
-
-    /// Trains centroids.
-    fn train(
-        &self,
-        options: &VectorOptions,
-        vectors: IvfTrainingVectors,
-    ) -> crate::Result<IvfCentroids>;
-
-    /// Assigns vectors to centroids.
-    fn assign(
-        &self,
-        options: &VectorOptions,
-        vectors: IvfVectors<'_>,
-        centroids: &IvfCentroids,
-    ) -> crate::Result<Vec<u32>>;
-
-    fn assign_batch_size(&self) -> usize {
-        2048
-    }
-
-    fn merge_settings(&self, _total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
-        let training_sample_ratio = self.training_sample_ratio();
-        let assign_batch_size = self.assign_batch_size();
-
-        assert!(
-            training_sample_ratio > 0.0 && training_sample_ratio <= 1.0,
-            "IvfClusterer training_sample_ratio must be greater than 0 and less than or equal to \
-             1, got {training_sample_ratio}"
-        );
-        assert!(
-            assign_batch_size > 0,
-            "IvfClusterer assign_batch_size must be greater than 0, got {assign_batch_size}"
-        );
-
-        Ok(IvfMergeSettings {
-            training_sample_ratio,
-            assign_batch_size,
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-/// Merge-time IVF sizes.
-pub struct IvfMergeSettings {
-    /// Fraction of vectors sampled for training, in `(0, 1]`.
-    pub training_sample_ratio: f32,
-    pub assign_batch_size: usize,
-}
+use crate::TantivyError;
 
 #[derive(Clone, Debug)]
 /// Trained centroid matrix.
 pub enum IvfCentroids {
     /// Binary32 centroids.
     F32(IvfMatrix<f32>),
-}
-
-#[derive(Clone, Copy, Debug)]
-/// Borrowed vector batch.
-pub enum IvfVectors<'a> {
-    /// Binary32 vector batch.
-    F32(IvfVectorBatch<'a, f32>),
-}
-
-/// Owned vector training input.
-#[derive(Clone, Debug)]
-pub enum IvfTrainingVectors {
-    /// Binary32 training batch.
-    F32(IvfTrainingBatch<f32>),
-}
-
-#[derive(Clone, Debug)]
-/// Owned training rows and document identifiers.
-pub struct IvfTrainingBatch<T> {
-    /// Document identifiers.
-    pub doc_ids: Vec<DocId>,
-    /// Training matrix.
-    pub matrix: IvfMatrix<T>,
 }
 
 #[derive(Clone, Debug)]
@@ -93,26 +17,6 @@ pub struct IvfMatrix<T> {
     pub rows: usize,
     /// Column count.
     pub dims: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-/// Borrowed row-major matrix.
-pub struct IvfMatrixView<'a, T> {
-    /// Row-major values.
-    pub values: &'a [T],
-    /// Row count.
-    pub rows: usize,
-    /// Column count.
-    pub dims: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-/// Borrowed vectors and document identifiers.
-pub struct IvfVectorBatch<'a, T> {
-    /// Document identifiers.
-    pub doc_ids: &'a [DocId],
-    /// Vector matrix.
-    pub matrix: IvfMatrixView<'a, T>,
 }
 
 pub(crate) fn decode_row<T: VectorElement>(bytes: &[u8], dim: usize) -> crate::Result<Vec<T>> {

@@ -34,6 +34,10 @@ impl<TCollector: Collector> Collector for CollectorWrapper<TCollector> {
         self.0.requires_scoring()
     }
 
+    fn requires_global_collection(&self) -> bool {
+        self.0.requires_global_collection()
+    }
+
     fn supports_bitmap_collection(&self) -> bool {
         self.0.supports_bitmap_collection()
     }
@@ -252,6 +256,12 @@ impl Collector for MultiCollector<'_> {
             .iter()
             .map(Deref::deref)
             .any(Collector::requires_scoring)
+    }
+
+    fn requires_global_collection(&self) -> bool {
+        self.collector_wrappers
+            .iter()
+            .any(|collector| collector.requires_global_collection())
     }
 
     fn supports_bitmap_collection(&self) -> bool {

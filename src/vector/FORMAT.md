@@ -1,10 +1,92 @@
 # Vector storage format
 
+## Index-level centroid artifact
+
+`IndexMeta.centroid_index`, when present, is a `CentroidIndexMeta` descriptor
+serialized as `{"file_name":"centroids-<uuid>"}` in `meta.json`. It identifies
+an immutable managed file. Its header is the four bytes `TVRI` followed by
+little-endian u32 version **1**, independently versioned from the segment formats below.
+The body is a `CompositeFile` with exactly these slots for every vector field:
+
+| Index | Contents |
+|---|---|
+| 0 | JSON metadata: `num_centroids` (u32) |
+| 1 | Row-major F32 centroid rows, in the router's final canonical order |
+| 2 | Router-kind byte followed by the existing tagged router payload |
+
+The consumer supplies a nonempty finite matrix for each vector field through
+`CentroidProducer`. Cosine rows are normalized before router construction;
+zero rows remain zero. The composite identifies fields by `Field`; field names
+and `VectorOptions` come from the index schema. Router construction may permute
+the centroids, and the rows in slot 1 use that order.
+Reopening uses the persisted router kind and requires no producer. The parsed
+routers are cached across clones of an `Index`; centroid rows remain lazy.
+
+The artifact is closed and synced before metadata publication. Its filename
+is preserved by commits and single-segment finalization, retained by garbage
+collection, and included in checksum validation. Indexes without shared centroids
+omit `centroid_index`. A producer cannot install or replace centroids
+through `open_or_create` on an existing index.
+
+Indexes with this artifact assign flushed vectors and flat merge inputs to their
+most similar stored centroid, breaking ties by the lowest centroid ID. Assignment
+uses batched matrix multiplication over all centroids, with bounded score tiles
+and direct L2 scoring near cancellation or overflow. Clustered merge inputs must
+reference the same centroid artifact as the target. Merges preserve their
+memberships and row bytes, remap document IDs, and discard deleted documents.
+Bounds are the per-cluster maximum of source bounds and newly assigned flat-row
+residuals; deleted rows may leave conservative overestimates. Quantized columns
+are encoded using the target settings and the preserved cluster assignments.
+
+These segments use the V6 `.vec` block format and a V5 `.centroids`
+sidecar with only the following slots per vector field:
+
+| Index | Contents |
+|---|---|
+| 0 | JSON: `centroid_index` (the artifact descriptor), `num_docs` (u32) |
+| 1 | Posting offsets: u64[N+1], including empty clusters |
+| 3 | Bound-kind byte followed by N cluster bounds |
+
+The descriptor must match the owning index's descriptor. The shared artifact
+supplies N, centroid rows, and the router; none of those rows or routing payloads
+are copied into the segment. Bounds and quantized residuals use those exact
+stored centroid coordinates.
+
+Each search ranks shared centroids once and visits each cluster across all active
+segments before deciding whether to probe the next cluster. Segment query
+preparation uses the executor; the coordinated probe loop runs on the search
+thread. Empty segment fragments are skipped before bounds checks. Exact and RNG
+searches build each segment's filter only when a nonempty fragment survives the
+bounds check, then reuse it. Stacked searches prepare filters eagerly through the
+executor because filter selectivity determines the ranking size. Single-segment
+searches use the same filter policy. Cosine routing uses the same normalized query
+coordinates as quantized scoring. Collector reuse and concurrent searches have
+independent query state.
+
+Vector collectors must be used directly. Combining or wrapping them in tuples,
+`Option`, `MultiCollector`, `FilterCollector`, or `BytesFilterCollector` returns
+an error. Apply vector filters in the query.
+
+The work budget resolves once from the global cluster count and total native
+vector count. A cluster open is charged once; eligible rows are charged across
+all its segment fragments. `WorkModel::for_searcher` counts shared centroids once.
+Bounds use the global k-th lower endpoint, treating exact scores as zero-width
+intervals. Quantized layers retain candidates against that same global threshold;
+segments with fewer layers finish reranking while others continue refinement.
+APS advances once per global cluster, using the lowest point estimate among the
+lower-endpoint top-k.
+
+Routing, budget, termination, recall, and bound-arming statistics are recorded
+once in the first segment's stats. Row counts, bounds skips, layer statistics,
+and storage reads remain attributed to their segment.
+
+Indexes without an artifact write flat storage on both flush and merge.
+
 ## File headers and entries
 
 `.vec` uses a little-endian u32 version header, with current and supported version
-**4**. Other versions fail with “rebuild required.” The `.centroids` grammar and
-its version **3** describe routing, posting offsets, and cluster bounds.
+**6**. The `.centroids` version is **5**, referencing the shared centroid artifact
+as described above. Other versions of either file require rebuilding the index.
 `VectorQuantizationConfig.format_version = 3` identifies the independent index
 settings grammar; settings specify the target for future builds.
 
@@ -12,7 +94,7 @@ Each vector field declares exactly these composite entries:
 
 | Index | Entry | Contents |
 |---|---|---|
-| 0 | IdMap | Identity, Bitmap, or DocLocations document addressing |
+| 0 | IdMap | Identity, Bitmap, or Explicit row-to-document addressing |
 | 1 | Data | Field metadata, aligned blocks, and a stored block directory |
 
 Missing entries or any additional entry index are corruption. All Data entries
@@ -23,17 +105,15 @@ entry-end padding belongs to Data, so no gap is added to an IdMap. The first
 Data entry may be preceded by padding outside any entry.
 
 An IdMap begins with a u8 tag: 0 for Identity (document count supplied by the
-segment), 1 for the columnar OptionalIndex Bitmap encoding, or 3 for
-DocLocations. All other tags, including 2, are rejected. Identity and Bitmap
-have document-ordered rows.
+segment), 1 for the columnar OptionalIndex Bitmap encoding, or 2 for Explicit.
+All other tags are rejected. Identity and Bitmap have document-ordered rows.
 
-DocLocations contains exactly `max_doc` records of `cluster:u32, local:u32`,
-both little-endian, with no padding. Record `doc` starts at body offset `8*doc`.
-Absent documents store `(u32::MAX, 0)`; the cluster count must be less than
-`u32::MAX`. Opening the entry checks its body length is exactly `8*max_doc`.
-Each lookup reads one record and checks `cluster < K` and `local < rows_in(cluster)`.
-The entry opens lazily for document lookups. Scans, reranking and result assembly
-use Data columns and do not open it.
+Explicit contains one little-endian u32 document ID per vector row, in cluster
+order. IDs must be below `max_doc` and strictly ascending within each cluster.
+The packed table loads once per vector reader, on its first document-ID
+access. IDs are validated when a cluster is read. The table is shared by scans,
+reranking, result assembly, and merges.
+Document-to-row lookups binary-search each cluster's range in this table.
 
 ## Data entry and blocks
 
@@ -83,7 +163,7 @@ Column reads cannot exceed their stored block boundary. The writer asserts that
 every Data entry length is a multiple of `ENTRY_ALIGN`. All padding is zero.
 
 `Clusters` requires `row_starts` to equal the posting offsets in `.centroids`,
-a DocLocations IdMap, and centroid data. `Uniform { rows_per_block }` requires
+an Explicit IdMap, and centroid data. `Uniform { rows_per_block }` requires
 an Identity or Bitmap IdMap, no centroid data, and a nonzero block size. Its
 stored boundaries must describe `[b*r, min((b+1)*r, num_rows))`. Zero flat rows
 means zero blocks; both directory arrays still contain one sentinel.
@@ -95,7 +175,6 @@ Column order and widths are part of the contract:
 | Column | Decoder element | Row stride | Band |
 |---|---|---:|---|
 | Rows | F32 | dim * dtype width | none |
-| DocIds, clustered only | U32 | 4 | none |
 | ResidualNorms | F32 | 4 | 0 |
 | QuantLayerCodes(l) | U64 for SignPlane, U8 for GridPlane | quantizer code stride | l |
 | QuantLayerScales(l) | F32 | 4 | l |
@@ -103,9 +182,7 @@ Column order and widths are part of the contract:
 | QuantLayerErrors(l) | F16 | 2 | l |
 | QuantLayerConstants(l), L2 only | F32 | 4 | l |
 
-Flat Plain has only Rows; clustered Plain has Rows followed by DocIds.
-DocIds ascend within each block. Quantized adds ResidualNorms after DocIds
-when clustered, then each layer's columns in
+Plain has only Rows. Quantized adds ResidualNorms, then each layer's columns in
 ascending layer order. Norms, scales and constants are binary32; gammas and
 errors are binary16. SignPlane code stride is `ceil(dim/64)*8`; GridPlane stride
 is `ceil(dim*bits/64)*8` as defined by `grid_plane::packed_len`. Code tail bits
@@ -116,12 +193,10 @@ Band 0 includes ResidualNorms through the last layer-0 column. Higher bands run
 from that layer's codes through its final column. `layer_span(b, l)` is band l;
 each band uses one read with columns exposed as views.
 
-DocIds are read separately and validated as strictly ascending and below the
-segment's `max_doc`. Filters and deleted-document visibility select rows before
-any payload read; a cluster with no survivors reads only DocIds. With no filter
-or deletions, quantized scans read no DocIds until rerank resolves the final
-candidates, once per candidate-bearing cluster. Exact scans without a row gate
-read Rows alone and resolve DocIds only when a score reaches heap admission.
+Document IDs come from the shared Explicit IdMap. Filter and deletion checks
+run before payload reads; rejected clusters read no payload columns. Quantized
+scans resolve document IDs from that map during reranking. Exact scans resolve
+them when a score reaches heap admission.
 Filtered exact scans plan reads over survivor rows in the Rows column.
 
 Sparse code reads group

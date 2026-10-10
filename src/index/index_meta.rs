@@ -314,16 +314,6 @@ pub struct IndexSettings {
     #[serde(default = "default_codec_types")]
     #[serde(skip_serializing_if = "is_default_codec_types")]
     pub codec_types: Vec<columnar::CodecType>,
-    /// Doc-count boundary for choosing the vector-storage format on merge.
-    ///
-    /// A merge whose target segment has strictly fewer than this many
-    /// docs writes `.flatvec`; at or above this many docs writes
-    /// `.ivfvec` (clustered). Exactly one format is written per merge —
-    /// `FlatVecPlugin` and `IvfVecPlugin` short-circuit symmetrically
-    /// off this threshold.
-    #[serde(default = "default_vector_clustering_threshold")]
-    #[serde(skip_serializing_if = "is_default_vector_clustering_threshold")]
-    pub vector_clustering_threshold: usize,
     /// Per-vector-field quantization configuration. The empty default keeps
     /// existing and flat-only indexes on the exact path.
     #[serde(default)]
@@ -347,14 +337,6 @@ fn is_default_codec_types(types: &[columnar::CodecType]) -> bool {
     types == columnar::DEFAULT_CODEC_TYPES
 }
 
-fn default_vector_clustering_threshold() -> usize {
-    10_000
-}
-
-fn is_default_vector_clustering_threshold(threshold: &usize) -> bool {
-    *threshold == default_vector_clustering_threshold()
-}
-
 impl Default for IndexSettings {
     fn default() -> Self {
         Self {
@@ -364,7 +346,6 @@ impl Default for IndexSettings {
             docstore_blocksize: default_docstore_blocksize(),
             docstore_compress_dedicated_thread: true,
             codec_types: default_codec_types(),
-            vector_clustering_threshold: default_vector_clustering_threshold(),
             vector_quantization: Vec::new(),
             bitmap_postings: BitmapPostingsConfig::default(),
         }
@@ -375,12 +356,6 @@ impl IndexSettings {
     /// Returns the codec types to use for u64-based column serialization.
     pub fn columnar_codec_types(&self) -> &[columnar::CodecType] {
         &self.codec_types
-    }
-
-    /// Returns the doc-count boundary at which merges switch from flat
-    /// to IVF storage. See [`IndexSettings::vector_clustering_threshold`].
-    pub fn vector_clustering_threshold(&self) -> usize {
-        self.vector_clustering_threshold
     }
 
     /// Validate field-keyed quantization metadata before an index is built.
@@ -421,6 +396,13 @@ impl Order {
     }
 }
 
+/// Metadata for the immutable index-level centroid and router artifact.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CentroidIndexMeta {
+    /// Relative path of the artifact in the index directory.
+    pub file_name: PathBuf,
+}
+
 /// Meta information about the `Index`.
 ///
 /// This object is serialized on disk in the `meta.json` file.
@@ -443,6 +425,9 @@ pub struct IndexMeta {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub persisted_custom_extensions: Vec<String>,
+    /// Metadata for the immutable index-level centroid and router artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub centroid_index: Option<CentroidIndexMeta>,
     /// List of `SegmentMeta` information associated with each finalized segment of the index.
     pub segments: Vec<SegmentMeta>,
     /// Index `Schema`
@@ -465,6 +450,8 @@ struct UntrackedIndexMeta {
     pub index_settings: IndexSettings,
     #[serde(default)]
     pub persisted_custom_extensions: Vec<String>,
+    #[serde(default)]
+    pub centroid_index: Option<CentroidIndexMeta>,
     pub schema: Schema,
     pub opstamp: Opstamp,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -476,6 +463,7 @@ impl UntrackedIndexMeta {
         IndexMeta {
             index_settings: self.index_settings,
             persisted_custom_extensions: self.persisted_custom_extensions,
+            centroid_index: self.centroid_index,
             segments: self
                 .segments
                 .into_iter()
@@ -498,6 +486,7 @@ impl IndexMeta {
         IndexMeta {
             index_settings: IndexSettings::default(),
             persisted_custom_extensions: Vec::new(),
+            centroid_index: None,
             segments: vec![],
             schema,
             opstamp: 0u64,
@@ -553,6 +542,7 @@ mod tests {
                 ..Default::default()
             },
             persisted_custom_extensions: Vec::new(),
+            centroid_index: None,
             segments: Vec::new(),
             schema,
             opstamp: 0u64,
@@ -593,6 +583,7 @@ mod tests {
                 ..IndexSettings::default()
             },
             persisted_custom_extensions: Vec::new(),
+            centroid_index: None,
             segments: Vec::new(),
             schema,
             opstamp: 0u64,
@@ -661,7 +652,6 @@ mod tests {
                 docstore_compress_dedicated_thread: true,
                 docstore_blocksize: 16_384,
                 codec_types: columnar::DEFAULT_CODEC_TYPES.to_vec(),
-                vector_clustering_threshold: 10_000,
                 vector_quantization: Vec::new(),
                 bitmap_postings: super::BitmapPostingsConfig::default(),
             }

@@ -232,7 +232,6 @@ impl Slot {
 #[derive(Clone, Debug)]
 pub(crate) enum SlotType {
     Rows { dtype: VectorDType },
-    DocIds,
     ResidualNorms,
     QuantLayerCodes { layer: u8, quant: Quantizer },
     QuantLayerScales { layer: u8 },
@@ -247,7 +246,6 @@ impl SlotType {
             Self::Rows {
                 dtype: VectorDType::F32,
             } => ElemType::F32,
-            Self::DocIds => ElemType::U32,
             Self::QuantLayerCodes { quant, .. } => quant.codes_elem(),
             Self::QuantLayerGammas { .. } | Self::QuantLayerErrors { .. } => ElemType::F16,
             Self::ResidualNorms
@@ -259,7 +257,7 @@ impl SlotType {
     /// Norms share band zero so a first-layer scan needs one contiguous read.
     pub(crate) fn band(&self) -> Option<u8> {
         match self {
-            Self::Rows { .. } | Self::DocIds => None,
+            Self::Rows { .. } => None,
             Self::ResidualNorms => Some(0),
             Self::QuantLayerCodes { layer, .. }
             | Self::QuantLayerScales { layer }
@@ -378,7 +376,7 @@ impl VectorColMetadata {
             ),
         }
     }
-    /// Rows and clustered document ids precede residual norms and ordered layer bands.
+    /// Rows precede residual norms and ordered layer bands.
     pub(crate) fn slots(&self) -> Vec<Slot> {
         let field = self.field();
         let mut slots = vec![Slot {
@@ -386,13 +384,6 @@ impl VectorColMetadata {
             elem: ElemType::F32,
             stride: field.dim * ElemType::F32.size() as u32,
         }];
-        if matches!(field.partition, Partition::Clusters) {
-            slots.push(Slot {
-                slot_type: SlotType::DocIds,
-                elem: ElemType::U32,
-                stride: ElemType::U32.size() as u32,
-            });
-        }
         if let Self::Quantized { layers, .. } = self {
             slots.push(Slot {
                 slot_type: SlotType::ResidualNorms,
@@ -576,7 +567,7 @@ impl VectorColMetadata {
             })
             .unzip()
     }
-    /// Serializes the V4 grammar using explicit tag maps, never Rust discriminants.
+    /// Serializes the metadata grammar using explicit tag maps, never Rust discriminants.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.push(u8::from(matches!(self, Self::Quantized { .. })));
@@ -817,7 +808,7 @@ mod tests {
                             };
                         }
                     }
-                    let norms = if clustered { 2 } else { 1 };
+                    let norms = 1;
                     let slots = meta.slots();
                     assert!(matches!(
                         slots[0].slot_type,
@@ -829,13 +820,6 @@ mod tests {
                         (slots[0].elem, slots[0].stride, slots[0].slot_type.band()),
                         (ElemType::F32, 400, None)
                     );
-                    if clustered {
-                        assert!(matches!(slots[1].slot_type, SlotType::DocIds));
-                        assert_eq!(
-                            (slots[1].elem, slots[1].stride, slots[1].slot_type.band()),
-                            (ElemType::U32, 4, None)
-                        );
-                    }
                     assert!(matches!(slots[norms].slot_type, SlotType::ResidualNorms));
                     assert_eq!(
                         (
@@ -907,15 +891,7 @@ mod tests {
                 } else {
                     VectorColMetadata::build_flat(&opts)
                 };
-                assert_eq!(plain.slots().len(), if clustered { 2 } else { 1 });
-                if clustered {
-                    let slot = &plain.slots()[1];
-                    assert!(matches!(slot.slot_type, SlotType::DocIds));
-                    assert_eq!(
-                        (slot.elem, slot.stride, slot.slot_type.band()),
-                        (ElemType::U32, 4, None)
-                    );
-                }
+                assert_eq!(plain.slots().len(), 1);
                 assert!(matches!(
                     plain.slots()[0].slot_type,
                     SlotType::Rows {

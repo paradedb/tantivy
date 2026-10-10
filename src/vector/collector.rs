@@ -2,12 +2,11 @@
 //!
 //! Unlike the other `TopDocs::order_by_*` paths, the *primary* sort key here is
 //! not a [`SortKeyComputer`](crate::collector::sort_key::SortKeyComputer). IVF
-//! needs to drain the filter `DocSet` into a bitmap upfront and drive its own
+//! needs to drain the filter `DocSet` into a bitmap and drive its own
 //! cluster iteration, which inverts the per-doc pull model that sort-key
-//! computers assume. So this is its own [`Collector`] with an overridden
-//! [`Collector::collect_segment`] that hands the filter `Weight` down to the
-//! per-segment [`VectorBackend`](super::backend::VectorBackend), which owns the
-//! loop. Flat fits the pull model trivially; IVF gets to drive.
+//! computers assume. [`Collector::collect_global`] coordinates global routing,
+//! probe budgets, and candidate thresholds across segments. Segment scorers
+//! consume clusters using their stored row format.
 //!
 //! A secondary key *is* an ordinary `SortKeyComputer` — see
 //! [`TopDocsByVectorSimilarity::with_tie_break`]. The heap sorts on the
@@ -27,7 +26,7 @@ use super::backend::{ProbeStats, VectorBackend};
 use super::index_reader::QuantizedFieldReader;
 use super::ivf::AdaptiveProbeParams;
 use super::metadata::VectorColMetadata;
-use super::prepared::{QuantizedQueryCtx, VectorQuery};
+use super::prepared::{normalize_query, QuantizedQueryCtx, VectorQuery};
 use super::tie_break::NoTieBreak;
 use super::{enter_vector_stage, Stage, VectorElement};
 use crate::collector::sort_key::NaturalComparator;
@@ -141,24 +140,17 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     /// Order documents that tie on similarity by `tie_break`, as
     /// `ORDER BY embedding <=> $1, id` does.
     ///
-    /// The tie-break takes part in each segment's top-N eviction, so it also
+    /// The tie-break takes part in top-N eviction, so it also
     /// decides *which* of a set of equally-distant documents survive, not only
     /// how the survivors are ordered. Similarity remains the primary key; the
     /// tie-break is only consulted between documents whose similarity is
     /// exactly equal.
     ///
-    /// This does not change which clusters an IVF segment probes: the probe
-    /// loop's stopping rule reads the routed centroids and the filter, never
-    /// the top-N heap.
+    /// Routing and probe stopping use similarity, independently of the tie-break.
     ///
-    /// Each segment is cut to its own top-N under the segment-local
-    /// `SegmentSortKey`, and only the survivors are lifted to `SortKey` for the
-    /// cross-segment merge. `convert_segment_sort_key` must therefore be
-    /// order-preserving within a segment, or a segment can discard a document
-    /// that would have placed globally. The bundled computers satisfy this:
-    /// term ordinals ascend with their terms, and `FastValue`'s `u64` encoding
-    /// is monotonic.
-    /// Sets a secondary ordering for equal similarities.
+    /// Global collection converts segment keys before comparing hits across segments.
+    /// Segment collection converts its survivors before merging; conversion must
+    /// preserve their order.
     pub fn with_tie_break<S2: SortKeyComputer>(
         self,
         tie_break: S2,
@@ -215,6 +207,73 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     }
 }
 
+impl<T, S> TopDocsByVectorSimilarity<T, S>
+where
+    T: VectorElement,
+    S: SortKeyComputer + Send + Sync + 'static,
+{
+    fn segment_backend(
+        &self,
+        segment_ord: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> crate::Result<VectorBackend<T>> {
+        let init_start = Instant::now();
+        let init_stage = enter_vector_stage(Stage::ScanInit);
+        let prep_start = Instant::now();
+        let query_prep_stage = enter_vector_stage(Stage::QueryPrep);
+        let query = self.segment_query(reader)?;
+        drop(query_prep_stage);
+        let query_prep_ns = prep_start.elapsed().as_nanos() as u64;
+        let mut backend = VectorBackend::for_segment(
+            reader,
+            segment_ord,
+            self.field,
+            query,
+            self.adaptive.clone(),
+        )?;
+        backend.add_query_prep_ns(query_prep_ns);
+        drop(init_stage);
+        backend.add_scan_init_ns(
+            (init_start.elapsed().as_nanos() as u64).saturating_sub(backend.query_prep_ns()),
+        );
+        Ok(backend)
+    }
+
+    fn collect_backend(
+        &self,
+        weight: &dyn Weight,
+        reader: &SegmentReader,
+        backend: VectorBackend<T>,
+    ) -> crate::Result<SegmentVectorFruit<S::SortKey>> {
+        let collect_start = Instant::now();
+        let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
+        let (hits, mut stats) = backend.top_n_by(
+            weight,
+            reader,
+            self.segment_top_n(),
+            &mut tie_break,
+            self.tie_break.comparator(),
+        )?;
+        // Lift the segment-local tie-break key to its global form, but only
+        // now: a `SegmentSortKey` can be a term ordinal, which means nothing
+        // outside this segment and must never reach the cross-segment merge.
+        let results = hits
+            .into_iter()
+            .map(|((score, segment_key), address)| {
+                (
+                    (score, tie_break.convert_segment_sort_key(segment_key)),
+                    address,
+                )
+            })
+            .collect();
+        let residual_ns =
+            (collect_start.elapsed().as_nanos() as u64).saturating_sub(stats.stage_elapsed_ns());
+        let assembly_ns = stats.result_assembly_ns.unwrap_or_default();
+        stats.result_assembly_ns = Some(assembly_ns.saturating_add(residual_ns));
+        Ok(SegmentVectorFruit { results, stats })
+    }
+}
+
 /// What a [`TopDocsByVectorSimilarity`] search returns: the global top-N
 /// plus each searched segment's [`ProbeStats`], so callers can inspect or
 /// aggregate probe metrics without a side channel.
@@ -227,6 +286,7 @@ pub struct VectorSimilarityFruit {
     /// One [`ProbeStats`] per collected segment, in segment-ordinal order
     /// after [`Collector::merge_fruits`]. The counter fields are summable
     /// across segments; `termination` only carries per-segment meaning.
+    /// Shared routing counters are recorded once, in the first segment's stats.
     /// Probe statistics in segment order.
     pub stats: Vec<ProbeStats>,
 }
@@ -298,9 +358,11 @@ where
         _segment_local_id: SegmentOrdinal,
         _reader: &SegmentReader,
     ) -> crate::Result<Self::Child> {
-        // Never called at runtime — we override `collect_segment`. The
-        // child type exists only to satisfy the trait bound.
-        Ok(NoOpSegmentCollector::default())
+        Err(TantivyError::InvalidArgument(
+            "vector similarity requires global collection and cannot be combined or wrapped; use \
+             the collector directly"
+                .into(),
+        ))
     }
 
     fn requires_scoring(&self) -> bool {
@@ -315,51 +377,68 @@ where
         segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
     ) -> crate::Result<SegmentVectorFruit<S::SortKey>> {
-        let collect_start = Instant::now();
-        let init_start = Instant::now();
-        let init_stage = enter_vector_stage(Stage::ScanInit);
-        let prep_start = Instant::now();
-        let query_prep_stage = enter_vector_stage(Stage::QueryPrep);
-        let query = self.segment_query(reader)?;
-        drop(query_prep_stage);
-        let query_prep_ns = prep_start.elapsed().as_nanos() as u64;
-        let mut backend = VectorBackend::for_segment(
-            reader,
-            segment_ord,
-            self.field,
-            query,
-            self.adaptive.clone(),
+        self.collect_backend(weight, reader, self.segment_backend(segment_ord, reader)?)
+    }
+
+    fn requires_global_collection(&self) -> bool {
+        true
+    }
+
+    fn collect_global(
+        &self,
+        weight: &dyn Weight,
+        searcher: &crate::Searcher,
+        executor: &crate::Executor,
+    ) -> crate::Result<Self::Fruit> {
+        let readers = searcher.segment_readers();
+        if let [reader] = readers {
+            return self.merge_fruits(vec![self.collect_segment(weight, 0, reader)?]);
+        }
+        let Some(centroids) = searcher.index().cached_centroid_index()? else {
+            let fruits = executor.map(
+                |(ordinal, reader)| self.collect_segment(weight, ordinal as u32, reader),
+                readers.iter().enumerate(),
+            )?;
+            return self.merge_fruits(fruits);
+        };
+        let backends = executor.map(
+            |(ordinal, reader)| {
+                let mut backend = self.segment_backend(ordinal as u32, reader)?;
+                if centroids[&self.field].router() == super::RouterKind::Stacked {
+                    backend.prepare_filter(weight, reader, self.segment_top_n())?;
+                }
+                Ok(backend)
+            },
+            readers.iter().enumerate(),
         )?;
-        backend.add_query_prep_ns(query_prep_ns);
-        let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
-        drop(init_stage);
-        backend.add_scan_init_ns(
-            (init_start.elapsed().as_nanos() as u64).saturating_sub(backend.query_prep_ns()),
-        );
-        let (hits, mut stats) = backend.top_n_by(
+        let FieldType::Vector(options) = searcher.schema().get_field_entry(self.field).field_type()
+        else {
+            unreachable!("collector schema has been checked")
+        };
+        let mut query: Vec<f32> = self.query.iter().map(|value| value.to_f32()).collect();
+        normalize_query(options.metric(), &mut query);
+        let (hits, mut stats) = super::backend::global::search(
+            &centroids[&self.field],
+            &query,
+            &backends,
+            readers,
             weight,
-            reader,
+            &self.adaptive,
             self.segment_top_n(),
-            &mut tie_break,
-            self.tie_break.comparator(),
+            &self.tie_break,
         )?;
-        // Lift the segment-local tie-break key to its global form, but only
-        // now: a `SegmentSortKey` can be a term ordinal, which means nothing
-        // outside this segment and must never reach the cross-segment merge.
+        let start = Instant::now();
+        let _stage = enter_vector_stage(Stage::ResultAssembly);
         let results = hits
             .into_iter()
-            .map(|((score, segment_key), address)| {
-                (
-                    (score, tie_break.convert_segment_sort_key(segment_key)),
-                    address,
-                )
-            })
+            .skip(self.offset)
+            .take(self.limit)
+            .map(|((score, _), address)| (score, address))
             .collect();
-        let residual_ns =
-            (collect_start.elapsed().as_nanos() as u64).saturating_sub(stats.stage_elapsed_ns());
-        let assembly_ns = stats.result_assembly_ns.unwrap_or_default();
-        stats.result_assembly_ns = Some(assembly_ns.saturating_add(residual_ns));
-        Ok(SegmentVectorFruit { results, stats })
+        if let Some(first) = stats.first_mut() {
+            *first.result_assembly_ns.get_or_insert(0) += start.elapsed().as_nanos() as u64;
+        }
+        Ok(VectorSimilarityFruit { results, stats })
     }
 
     fn merge_fruits(
@@ -445,7 +524,7 @@ mod ivf_e2e_tests {
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
     use crate::schema::{Field, Schema, FAST, STORED, STRING};
-    use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
+    use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DCentroids, TestVectorIndex};
     use crate::vector::{Metric, RouterKind, VectorDType, VectorOptions, VectorStorageFormat};
     use crate::{DocAddress, Index, Order, Score, TantivyDocument, TantivyError};
 
@@ -557,14 +636,11 @@ mod ivf_e2e_tests {
         let mut schema_builder = Schema::builder();
         let embedding_field = schema_builder.add_vector_field("embedding", vector_options);
         let id_field = schema_builder.add_u64_field("id", FAST);
-        let settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..IndexSettings::default()
-        };
+        let settings = IndexSettings::default();
         let index = Index::builder()
             .schema(schema_builder.build())
             .settings(settings)
-            .ivf_clusterer(Arc::new(Grid2DClusterer {
+            .centroid_producer(Arc::new(Grid2DCentroids {
                 centroids: vec![[0.0, 0.0], [10.0, 10.0]],
             }))
             .ivf_router(RouterKind::Stacked)?
@@ -607,11 +683,8 @@ mod ivf_e2e_tests {
                     .is_ok_and(|vectors| vectors.index().is_some())
             })
             .count();
-        assert!(ivf_segments >= 1, "expected at least one Ivf segment");
-        assert!(
-            ivf_segments < searcher.segment_readers().len(),
-            "expected at least one Flat segment"
-        );
+        assert_eq!(ivf_segments, 2);
+        assert_eq!(ivf_segments, searcher.segment_readers().len());
         Ok((index, embedding_field, id_field))
     }
 
@@ -715,14 +788,11 @@ mod ivf_e2e_tests {
         let vector_options = VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32);
         let mut schema_builder = Schema::builder();
         let embedding_field = schema_builder.add_vector_field("embedding", vector_options);
-        let settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..IndexSettings::default()
-        };
+        let settings = IndexSettings::default();
         let index = Index::builder()
             .schema(schema_builder.build())
             .settings(settings)
-            .ivf_clusterer(Arc::new(Grid2DClusterer {
+            .centroid_producer(Arc::new(Grid2DCentroids {
                 centroids: vec![[0.0, 10.0], [0.0, -10.0]],
             }))
             .ivf_router(RouterKind::Stacked)?
@@ -873,13 +943,7 @@ mod ivf_e2e_tests {
         Ok(())
     }
 
-    /// Single index containing both a Flat segment (un-merged commit) and
-    /// an Ivf segment (merged commit under `vector_clustering_threshold=1`)
-    /// so the collector has to dispatch `FlatBackend::top_n` on one and
-    /// `IvfBackend::top_n` on the other in a single `searcher.search`.
-    /// Hand-built — `TestVectorIndex` produces a single format index-wide
-    /// — but uses the shared `Grid2DClusterer` and `ground_truth::top_k`
-    /// so there's no parallel oracle / clusterer to drift.
+    /// Shared routing searches imported flat segments alongside clustered segments.
     #[test]
     fn e2e_mixed_flat_and_ivf_matches_global_oracle() -> crate::Result<()> {
         let centroids: Vec<[f32; 2]> = vec![[0.0, 0.0], [10.0, 10.0]];
@@ -889,14 +953,11 @@ mod ivf_e2e_tests {
         let embedding_field = schema_builder.add_vector_field("embedding", vector_options);
         let label_field = schema_builder.add_text_field("label", STRING | STORED);
         let schema = schema_builder.build();
-        let settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..IndexSettings::default()
-        };
+        let settings = IndexSettings::default();
         let index = Index::builder()
             .schema(schema)
             .settings(settings)
-            .ivf_clusterer(Arc::new(Grid2DClusterer {
+            .centroid_producer(Arc::new(Grid2DCentroids {
                 centroids: centroids.clone(),
             }))
             .ivf_router(RouterKind::Stacked)?
@@ -904,8 +965,7 @@ mod ivf_e2e_tests {
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
 
-        // Two commits → two flat segments; pairwise merge → one Ivf segment
-        // (threshold=1 trips the format flip).
+        // Merge two clustered segments before importing a flat one.
         let ivf_batches: [&[(&str, [f32; 2])]; 2] = [
             &[
                 ("ivf0", [0.1, 0.1]),
@@ -932,7 +992,8 @@ mod ivf_e2e_tests {
         assert_eq!(ivf_targets.len(), 2, "expected two segments to merge");
         writer.merge(&ivf_targets).wait()?;
 
-        // One more un-merged commit → flat segment.
+        let flat = Index::create_in_ram(index.schema());
+        let mut flat_writer = flat.writer_with_num_threads(1, 15_000_000)?;
         let flat_batch: [(&str, [f32; 2]); 3] = [
             ("flat0", [0.4, 0.4]),
             ("flat1", [10.3, 10.3]),
@@ -942,7 +1003,25 @@ mod ivf_e2e_tests {
             let mut doc = TantivyDocument::new();
             doc.add_vector(embedding_field, &v);
             doc.add_text(label_field, lbl);
-            writer.add_document(doc)?;
+            flat_writer.add_document(doc)?;
+        }
+        flat_writer.commit()?;
+        let meta = flat.load_metas()?;
+        use std::io::Write;
+
+        use crate::directory::{Directory, TerminatingWrite};
+        for path in
+            crate::index::list_segment_files(&meta.segments, &meta.persisted_custom_extensions)
+        {
+            if flat.directory().exists(&path)? {
+                let bytes = flat.directory().open_read(&path)?.read_bytes()?;
+                let mut write = index.directory().open_write(&path)?;
+                write.write_all(&bytes)?;
+                write.terminate()?;
+            }
+        }
+        for segment in meta.segments {
+            writer.add_segment(segment)?;
         }
         writer.commit()?;
         writer.wait_merging_threads()?;
@@ -964,9 +1043,7 @@ mod ivf_e2e_tests {
             "expected mixed segments, got {flat_count} flat / {ivf_count} ivf"
         );
 
-        // Exhaustive probing on the Ivf side so the only thing being
-        // tested here is per-segment dispatch + merge_fruits — not the
-        // adaptive loop, which is covered separately.
+        // Exhaustive probing includes both storage formats in the global result.
         let params = exhaustive_params(9);
         for query in [[0.0_f32, 0.0], [10.0, 10.0], [5.0, 5.0]] {
             for k in [1usize, 3, 6] {
