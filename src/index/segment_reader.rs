@@ -37,6 +37,7 @@ use crate::{DocId, Opstamp};
 #[derive(Clone)]
 pub struct SegmentReader {
     index: Index,
+    pub(crate) bitmap_postings_enabled: bool,
     segment_id: SegmentId,
     custom_alive_bitset: Option<AliveBitSet>,
 
@@ -237,6 +238,7 @@ impl SegmentReader {
         custom_bitset: Option<AliveBitSet>,
     ) -> crate::Result<SegmentReader> {
         Ok(SegmentReader {
+            bitmap_postings_enabled: segment.index().settings().bitmap_postings.use_for_queries,
             index: segment.index().clone(),
             segment_id: segment.id(),
             custom_alive_bitset: custom_bitset,
@@ -357,6 +359,18 @@ impl SegmentReader {
                 Err(OpenReadError::FileDoesNotExist(_)) => {}
                 Err(error) => return Err(error.into()),
             }
+        }
+        if self.index.settings().bitmap_postings.use_for_queries {
+            let path = self.relative_path(SegmentComponent::PostingBitmaps);
+            let directory = self.index.directory().clone();
+            inv_idx_reader.set_bitmaps_file(DeferredFileSlice::new(move || {
+                let source = directory.open_read(&path).map_err(io::Error::other)?;
+                CompositeFile::open(&source)?
+                    .open_read(field)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "missing field posting bitmaps")
+                    })
+            }));
         }
         let inv_idx_reader = Arc::new(inv_idx_reader);
 
@@ -649,6 +663,7 @@ impl SegmentReader {
             SegmentComponent::FastFields => ".fast".to_string(),
             SegmentComponent::FieldNorms => ".fieldnorm".to_string(),
             SegmentComponent::PostingNorms => ".pnorm".to_string(),
+            SegmentComponent::PostingBitmaps => ".bmap".to_string(),
             SegmentComponent::Delete => format!(".{}.del", self.delete_opstamp().unwrap_or(0)),
             SegmentComponent::Custom(ext) => format!(".{ext}"),
         });

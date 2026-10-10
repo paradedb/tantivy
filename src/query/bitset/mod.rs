@@ -1,6 +1,6 @@
 use common::{BitSet, TinySet};
 
-use crate::docset::{DocSet, TERMINATED};
+use crate::docset::{DocSet, BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW, TERMINATED};
 use crate::DocId;
 
 /// A `BitSetDocSet` makes it possible to iterate through a bitset as if it was a `DocSet`.
@@ -101,6 +101,47 @@ impl DocSet for BitSetDocSet {
         // zero words via first_non_empty_bucket, and terminates
         // cleanly when nothing remains.
         self.advance()
+    }
+
+    fn has_fast_bitset(&self) -> bool {
+        true
+    }
+
+    fn fill_bitset_block(
+        &mut self,
+        base: DocId,
+        mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
+    ) -> DocId {
+        let start = base.max(self.doc);
+        let end = base.saturating_add(BLOCK_WINDOW).min(self.docs.max_value());
+        let shift = base % 64;
+        let word_at = |bucket: u32| {
+            if bucket * 64 < self.docs.max_value() {
+                self.docs.tinyset(bucket).into_u64()
+            } else {
+                0
+            }
+        };
+        for (i, word) in mask.iter_mut().enumerate() {
+            let word_base = base + i as u32 * 64;
+            if word_base >= end || word_base + 64 <= start {
+                continue;
+            }
+            let bucket = base / 64 + i as u32;
+            let mut bits = word_at(bucket) >> shift;
+            if shift != 0 {
+                bits |= word_at(bucket + 1) << (64 - shift);
+            }
+            bits &= u64::MAX << start.saturating_sub(word_base);
+            if end - word_base < 64 {
+                bits &= (1u64 << (end - word_base)) - 1;
+            }
+            *word = word.union(TinySet::deserialize(bits.to_le_bytes()));
+        }
+        if end > self.doc {
+            self.seek(end);
+        }
+        self.doc
     }
 
     /// Returns the current document

@@ -94,19 +94,16 @@ impl Query for FastFieldTermSetQuery {
             let field_type = field_entry.field_type();
             sub_queries.push((
                 Occur::Should,
-                Box::new(TermSetWeight::new(
-                    field,
-                    terms,
-                    field_type,
-                    self.strategy_config.clone(),
-                )?),
+                Box::new(
+                    TermSetWeight::new(field, terms, field_type, self.strategy_config.clone())?
+                        .with_bitmap_postings(enable_scoring.bitmap_postings_enabled()),
+                ),
             ));
         }
-        Ok(Box::new(BooleanWeight::new(
-            sub_queries,
-            false,
-            Box::new(DoNothingCombiner::default),
-        )))
+        Ok(Box::new(
+            BooleanWeight::new(sub_queries, false, Box::new(DoNothingCombiner::default))
+                .with_bitmap_postings(enable_scoring.bitmap_postings_enabled()),
+        ))
     }
 }
 
@@ -168,6 +165,7 @@ pub struct TermSetWeight {
     /// indexed.
     is_indexed: bool,
     strategy_config: TermSetStrategyConfig,
+    bitmap_enabled: bool,
 }
 
 /// Returns whether `field_type.value_type()` has a fast-field column
@@ -278,7 +276,13 @@ impl TermSetWeight {
             fast_strategies_available,
             is_indexed,
             strategy_config,
+            bitmap_enabled: false,
         })
+    }
+
+    pub(crate) fn with_bitmap_postings(mut self, enabled: bool) -> Self {
+        self.bitmap_enabled = enabled;
+        self
     }
 
     /// Common epilogue: write the chosen tag to `strategy_sink` if one
@@ -303,7 +307,9 @@ impl TermSetWeight {
         let Some(map_arc) = self.terms_fst.clone() else {
             return Ok(Box::new(EmptyScorer));
         };
-        let weight = AutomatonWeight::new(self.field, SetDfaWrapper(map_arc));
+        let weight = AutomatonWeight::new(self.field, SetDfaWrapper(map_arc))
+            .with_scoring_enabled(!self.bitmap_enabled)
+            .with_bitmap_postings(self.bitmap_enabled);
         weight.scorer(reader, boost)
     }
 }
@@ -446,7 +452,13 @@ impl TermSetWeight {
             }
             TermSetStrategy::BitsetFromPostings if self.is_indexed => {
                 // `terms_bytes` was pre-sorted+deduped at construction.
-                bitset_from_postings_scorer(reader, self.field, &self.terms_bytes, boost)
+                bitset_from_postings_scorer(
+                    reader,
+                    self.field,
+                    &self.terms_bytes,
+                    boost,
+                    self.bitmap_enabled,
+                )
             }
             TermSetStrategy::LinearScan | TermSetStrategy::BitsetFromPostings => {
                 let term_set: FxHashSet<u64> = values.iter().copied().collect();
@@ -504,7 +516,13 @@ impl TermSetWeight {
         // (unusual) lands on the same threshold by default.
         if density <= self.strategy_config.bitset_max_density_multi {
             self.record_strategy_tag(StrategyTag::Bitset);
-            bitset_from_postings_scorer(reader, self.field, &self.terms_bytes, boost)
+            bitset_from_postings_scorer(
+                reader,
+                self.field,
+                &self.terms_bytes,
+                boost,
+                self.bitmap_enabled,
+            )
         } else {
             self.record_strategy_tag(StrategyTag::Automaton);
             self.automaton_scorer(reader, boost)

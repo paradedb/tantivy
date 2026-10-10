@@ -959,7 +959,10 @@ fn diagnostics_skip_empty_clusters() -> crate::Result<()> {
         .unwrap();
     assert_eq!(
         audit.schedule().layers(),
-        &[(crate::vector::QuantizerKind::Sign, 1), (crate::vector::QuantizerKind::Grid, 4)]
+        &[
+            (crate::vector::QuantizerKind::Sign, 1),
+            (crate::vector::QuantizerKind::Grid, 4)
+        ]
     );
     assert_eq!(audit.estimator.sample_rows(), 30);
     let estimates = vectors
@@ -1023,12 +1026,13 @@ fn merge_source_addresses_read_only_document_columns() -> crate::Result<()> {
     assert_eq!(rows.len(), docs.len());
     for (source, target) in rows.into_iter().zip(docs) {
         match source {
-            Some((segment, row)) => {
-                assert_eq!(segment, 0);
+            Some(source) => {
+                assert_eq!(source.segment_ord, 0);
                 assert_eq!(
-                    vectors.doc_id_at(row)?,
+                    vectors.doc_id_at(source.row_id)?,
                     target.doc_id,
-                    "row={row} column=DocIds"
+                    "row={} column=DocIds",
+                    source.row_id
                 );
             }
             None => assert!(!vectors.contains(target.doc_id)?),

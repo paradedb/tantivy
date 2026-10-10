@@ -372,6 +372,19 @@ impl FieldType {
         }
     }
 
+    /// Returns whether dense posting bitmaps are enabled for this field.
+    pub fn has_bitmap_postings(&self) -> bool {
+        match self {
+            FieldType::Str(options) => options
+                .get_indexing_options()
+                .is_some_and(|indexing| indexing.bitmap_postings()),
+            FieldType::JsonObject(options) => options
+                .get_text_indexing_options()
+                .is_some_and(|indexing| indexing.bitmap_postings()),
+            _ => false,
+        }
+    }
+
     /// Given a field configuration, return the maximal possible
     /// `IndexRecordOption` available.
     ///

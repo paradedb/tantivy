@@ -118,6 +118,11 @@ impl FieldEntry {
         self.field_type.has_pnorms()
     }
 
+    /// Returns whether dense posting bitmaps are enabled for this field.
+    pub fn has_bitmap_postings(&self) -> bool {
+        self.field_type.has_bitmap_postings()
+    }
+
     /// Returns true if the field is a fast field
     pub fn is_fast(&self) -> bool {
         self.field_type.is_fast()

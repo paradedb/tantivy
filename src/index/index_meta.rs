@@ -134,6 +134,7 @@ impl SegmentMeta {
             SegmentComponent::FastFields => ".fast".to_string(),
             SegmentComponent::FieldNorms => ".fieldnorm".to_string(),
             SegmentComponent::PostingNorms => ".pnorm".to_string(),
+            SegmentComponent::PostingBitmaps => ".bmap".to_string(),
             SegmentComponent::Delete => format!(".{}.del", self.delete_opstamp().unwrap_or(0)),
             SegmentComponent::Custom(ext) => format!(".{ext}"),
         });
@@ -318,6 +319,9 @@ pub struct IndexSettings {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub vector_quantization: Vec<VectorQuantizationConfig>,
+    /// Eligibility and storage limits for fields with bitmap postings enabled.
+    #[serde(default, skip_serializing_if = "BitmapPostingsConfig::is_default")]
+    pub bitmap_postings: BitmapPostingsConfig,
 }
 
 /// Must be a function to be compatible with serde defaults
@@ -343,6 +347,7 @@ impl Default for IndexSettings {
             docstore_compress_dedicated_thread: true,
             codec_types: default_codec_types(),
             vector_quantization: Vec::new(),
+            bitmap_postings: BitmapPostingsConfig::default(),
         }
     }
 }
@@ -648,6 +653,7 @@ mod tests {
                 docstore_blocksize: 16_384,
                 codec_types: columnar::DEFAULT_CODEC_TYPES.to_vec(),
                 vector_quantization: Vec::new(),
+                bitmap_postings: super::BitmapPostingsConfig::default(),
             }
         );
         {
@@ -734,5 +740,39 @@ mod tests {
             deser.columnar_codec_types(),
             &[CodecType::Bitpacked, CodecType::BlockwiseLinear]
         );
+    }
+}
+
+/// Storage policy for optional dense-term membership bitmaps.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BitmapPostingsConfig {
+    /// Use existing bitmap payloads for unscored queries. Disable for comparison or rollback.
+    pub use_for_queries: bool,
+    /// Minimum percentage of segment document slots containing the term (1..=100).
+    pub min_density_percent: u8,
+    /// Minimum document frequency eligible for a bitmap.
+    pub min_docs: u32,
+}
+
+impl Default for BitmapPostingsConfig {
+    fn default() -> Self {
+        Self {
+            use_for_queries: true,
+            min_density_percent: 10,
+            min_docs: 128,
+        }
+    }
+}
+
+impl BitmapPostingsConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub(crate) fn eligible(&self, doc_freq: u32, max_doc: u32) -> bool {
+        doc_freq >= self.min_docs
+            && doc_freq < max_doc
+            && u64::from(doc_freq) * 100 >= u64::from(max_doc) * u64::from(self.min_density_percent)
     }
 }

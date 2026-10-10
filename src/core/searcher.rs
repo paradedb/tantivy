@@ -200,6 +200,7 @@ impl Searcher {
             EnableScoring::enabled_from_statistics_provider(statistics_provider, self)
         } else {
             EnableScoring::disabled_from_searcher(self)
+                .with_bitmap_postings(collector.supports_bitmap_collection())
         };
         let executor = self.inner.index.search_executor();
         self.search_with_executor(query, collector, executor, enabled_scoring)

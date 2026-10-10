@@ -44,6 +44,7 @@ pub struct InvertedIndexReader {
     postings_file_slice: FileSlice,
     positions_file_slice: DeferredFileSlice,
     pnorms_file_slice: Option<FileSlice>,
+    bitmaps_file_slice: Option<DeferredFileSlice>,
     record_option: IndexRecordOption,
     total_num_tokens: u64,
 }
@@ -91,6 +92,7 @@ impl InvertedIndexReader {
             postings_file_slice: postings_body,
             positions_file_slice,
             pnorms_file_slice: None,
+            bitmaps_file_slice: None,
             record_option,
             total_num_tokens,
         })
@@ -98,6 +100,40 @@ impl InvertedIndexReader {
 
     pub(crate) fn set_pnorms_file(&mut self, source: FileSlice) {
         self.pnorms_file_slice = Some(source);
+    }
+
+    pub(crate) fn set_bitmaps_file(&mut self, source: DeferredFileSlice) {
+        self.bitmaps_file_slice = Some(source);
+    }
+
+    /// Opens an optional term membership bitmap. Ordinary postings remain available for scoring.
+    pub fn read_bitmap_from_terminfo(
+        &self,
+        info: &TermInfo,
+        max_doc: crate::DocId,
+    ) -> io::Result<Option<crate::query::BitmapDocSet>> {
+        let (Some(source), Some(offset)) = (&self.bitmaps_file_slice, info.bitmap_offset) else {
+            return Ok(None);
+        };
+        let postings_source = self.postings_file_slice.slice(info.postings_range.clone());
+        let doc_freq = info.doc_freq;
+        let record_option = self.record_option;
+        crate::query::BitmapDocSet::open(
+            source.open()?.clone(),
+            offset,
+            max_doc,
+            doc_freq,
+            move || {
+                let postings = BlockSegmentPostings::open_file_slice(
+                    doc_freq,
+                    postings_source,
+                    record_option,
+                    IndexRecordOption::Basic,
+                )?;
+                Ok(SegmentPostings::from_block_postings(postings, None))
+            },
+        )
+        .map(Some)
     }
 
     /// Creates an empty `InvertedIndexReader` object, which
@@ -110,6 +146,7 @@ impl InvertedIndexReader {
             postings_file_slice: FileSlice::empty(),
             positions_file_slice: DeferredFileSlice::new(|| Ok(FileSlice::empty())),
             pnorms_file_slice: None,
+            bitmaps_file_slice: None,
             record_option,
             total_num_tokens: 0u64,
         }
@@ -595,13 +632,27 @@ mod tests {
     fn term_info_cache_preserves_hits_misses_and_eviction() -> crate::Result<()> {
         let mut schema = Schema::builder();
         let first = schema.add_text_field("first", TEXT);
-        let second = schema.add_text_field("second", TEXT);
+        let second = schema.add_text_field(
+            "second",
+            TEXT.set_indexing_options(
+                TEXT.get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_bitmap_postings(false),
+            ),
+        );
         let index = Index::create_in_ram(schema.build());
         let mut writer: IndexWriter = index.writer_for_tests()?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
-        writer.add_document(doc!(first => "rust", second => "memory"))?;
+        for _ in 0..128 {
+            writer.add_document(doc!(first => "rust", second => "memory"))?;
+            writer.add_document(doc!(first => "padding", second => "padding"))?;
+        }
         writer.commit()?;
-        writer.add_document(doc!(first => "memory", second => "rust"))?;
+        for _ in 0..128 {
+            writer.add_document(doc!(first => "memory", second => "rust"))?;
+            writer.add_document(doc!(first => "padding", second => "padding"))?;
+        }
         writer.commit()?;
         let searcher = index.reader()?.searcher();
         for segment in searcher.segment_readers() {
@@ -616,6 +667,9 @@ mod tests {
                     let infos = reader.get_term_infos(SortedTermSlice::new(&keys).unwrap())?;
                     for (key, info) in keys.iter().zip(infos) {
                         assert_eq!(info, reader.terms().get(key)?);
+                        if let Some(info) = &info {
+                            assert_eq!(info.bitmap_offset.is_some(), field == first);
+                        }
                         assert_eq!(
                             reader.term_info_cache.get().unwrap().lock().peek(*key),
                             Some(&info)

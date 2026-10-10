@@ -523,7 +523,9 @@ pub(crate) fn merge_shared(ctx: &PluginMergeContext) -> crate::Result<()> {
                 .into_iter()
                 .enumerate()
                 .filter_map(|(doc, source)| {
-                    source.map(|(segment, row)| {
+                    source.map(|source| {
+                        let segment = source.segment_ord as usize;
+                        let row = source.row_id;
                         (
                             doc as DocId,
                             segment,
