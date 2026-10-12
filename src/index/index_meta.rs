@@ -527,6 +527,12 @@ impl fmt::Debug for IndexMeta {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_bitmap_postings_start_above_sparse_block_density() {
+        let config = super::BitmapPostingsConfig::default();
+        assert!(!config.eligible(699, 10_000));
+        assert!(config.eligible(700, 10_000));
+    }
 
     use super::IndexMeta;
     use crate::index::index_meta::UntrackedIndexMeta;
@@ -769,7 +775,9 @@ impl Default for BitmapPostingsConfig {
     fn default() -> Self {
         Self {
             use_for_queries: true,
-            min_density_percent: 10,
+            // Hierarchical bitmap blocks switch from sparse offsets to dense words above 6.25%.
+            // Starting at 7% keeps the default on the dense side of that crossover.
+            min_density_percent: 7,
             min_docs: 128,
         }
     }
