@@ -79,6 +79,15 @@ impl SegmentCollector for Box<dyn BoxableSegmentCollector> {
         self.as_mut().collect_bitmap(base, mask);
     }
 
+    fn collect_bitmap_filtered(
+        &mut self,
+        base: DocId,
+        mask: &crate::DocIdBitmap,
+        filter: &crate::DocIdBitmap,
+    ) {
+        self.as_mut().collect_bitmap_filtered(base, mask, filter);
+    }
+
     fn harvest(self) -> Box<dyn Fruit> {
         BoxableSegmentCollector::harvest_from_box(self)
     }
@@ -97,6 +106,17 @@ pub trait BoxableSegmentCollector {
 
     fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
         crate::DocSetBatch::Bitmap(base, mask).for_each_doc_block(|docs| self.collect_block(docs));
+    }
+
+    fn collect_bitmap_filtered(
+        &mut self,
+        base: DocId,
+        mask: &crate::DocIdBitmap,
+        filter: &crate::DocIdBitmap,
+    ) {
+        let mut filtered = *mask;
+        crate::bitmap_ops::intersect_in_place(&mut filtered, filter);
+        self.collect_bitmap(base, &filtered);
     }
 
     fn harvest_from_box(self: Box<Self>) -> Box<dyn Fruit>;
@@ -122,6 +142,15 @@ impl<TSegmentCollector: SegmentCollector> BoxableSegmentCollector
 
     fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
         self.0.collect_bitmap(base, mask);
+    }
+
+    fn collect_bitmap_filtered(
+        &mut self,
+        base: DocId,
+        mask: &crate::DocIdBitmap,
+        filter: &crate::DocIdBitmap,
+    ) {
+        self.0.collect_bitmap_filtered(base, mask, filter);
     }
 
     fn harvest_from_box(self: Box<Self>) -> Box<dyn Fruit> {
@@ -311,6 +340,17 @@ impl SegmentCollector for MultiCollectorChild {
     fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
         for child in &mut self.children {
             child.collect_bitmap(base, mask);
+        }
+    }
+
+    fn collect_bitmap_filtered(
+        &mut self,
+        base: DocId,
+        mask: &crate::DocIdBitmap,
+        filter: &crate::DocIdBitmap,
+    ) {
+        for child in &mut self.children {
+            child.collect_bitmap_filtered(base, mask, filter);
         }
     }
 

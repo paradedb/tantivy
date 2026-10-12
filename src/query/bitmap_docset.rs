@@ -1,9 +1,9 @@
 //! Reads the on-disk bitmap for one dense term. Each set bit identifies a document
 //! containing that term. It supports individual document probes and reading
-//! 1,024-document masks for bitmap combinations and count collection.
+//! 8,192-document masks for bitmap combinations and count collection.
 //!
-//! Ordinary postings remain available for scoring and positions, and are opened
-//! lazily here to seek across long empty regions of the bitmap.
+//! Ordinary postings remain available for scoring and positions. For legacy flat
+//! bitmaps, they are opened lazily to seek across long empty regions.
 
 use std::io;
 
@@ -12,13 +12,36 @@ use common::{HasLen, TinySet};
 
 use crate::directory::FileSlice;
 use crate::docset::{SeekDangerResult, BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW};
-use crate::postings::term_bitmaps::bitmap_num_bytes;
+use crate::postings::term_bitmaps::{
+    bitmap_block_count, bitmap_summary_num_bytes, flat_bitmap_num_bytes,
+    HIERARCHICAL_BITMAP_ENTRY_LEN, HIERARCHICAL_BITMAP_HEADER_LEN, HIERARCHICAL_BITMAP_MAGIC,
+    SPARSE_BLOCK_MAX_DOCS,
+};
 use crate::postings::SegmentPostings;
 use crate::{DocId, DocSet, TERMINATED};
+
+#[derive(Clone, Copy)]
+struct HierarchicalEntry {
+    count: u16,
+    payload_offset: u32,
+}
+
+struct HierarchicalIndex {
+    summary: Vec<u64>,
+    summary_prefix: Vec<u32>,
+    entries: Vec<HierarchicalEntry>,
+    payload_base: u64,
+}
+
+enum BitmapStorage {
+    Flat,
+    Hierarchical(HierarchicalIndex),
+}
 
 /// A buffered, on-disk membership bitmap over segment-local document IDs.
 pub struct BitmapDocSet {
     data: BufferedFileSlice,
+    storage: BitmapStorage,
     max_doc: DocId,
     doc_freq: u32,
     doc: DocId,
@@ -28,7 +51,7 @@ pub struct BitmapDocSet {
 
 impl BitmapDocSet {
     /// Opens a term's bitmap, validating the payload bounds.
-    /// Ordinary postings are opened lazily to navigate long empty regions.
+    /// Ordinary postings are opened lazily to navigate long empty regions in legacy flat bitmaps.
     pub fn open(
         source: FileSlice,
         offset: u64,
@@ -36,18 +59,107 @@ impl BitmapDocSet {
         doc_freq: u32,
         open_postings: impl FnOnce() -> io::Result<SegmentPostings> + Send + 'static,
     ) -> io::Result<Self> {
-        let end = offset.checked_add(bitmap_num_bytes(max_doc));
-        if max_doc > TERMINATED || end.is_none_or(|end| end > source.len() as u64) {
+        if max_doc > TERMINATED || offset > source.len() as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid posting bitmap bounds",
             ));
         }
+        let offset = offset as usize;
+        let available = source.len() - offset;
+        let data = BufferedFileSlice::new_block_aligned(source.slice(offset..), 8192);
+        let probe_len = HIERARCHICAL_BITMAP_HEADER_LEN.min(available);
+        let probe = data.get_bytes(0..probe_len as u64)?;
+        let storage = if probe.starts_with(&HIERARCHICAL_BITMAP_MAGIC) {
+            if probe.len() < HIERARCHICAL_BITMAP_HEADER_LEN {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated hierarchical posting bitmap header",
+                ));
+            }
+            let present_count = u32::from_le_bytes(probe[8..12].try_into().unwrap()) as usize;
+            let payload_len = u32::from_le_bytes(probe[12..16].try_into().unwrap()) as usize;
+            let summary_len = bitmap_summary_num_bytes(max_doc);
+            let directory_len = present_count
+                .checked_mul(HIERARCHICAL_BITMAP_ENTRY_LEN)
+                .ok_or_else(|| invalid_bitmap("hierarchical posting bitmap directory overflow"))?;
+            let metadata_len = HIERARCHICAL_BITMAP_HEADER_LEN
+                .checked_add(summary_len)
+                .and_then(|len| len.checked_add(directory_len))
+                .ok_or_else(|| invalid_bitmap("hierarchical posting bitmap metadata overflow"))?;
+            let total_len = metadata_len
+                .checked_add(payload_len)
+                .ok_or_else(|| invalid_bitmap("hierarchical posting bitmap payload overflow"))?;
+            if total_len > available {
+                return Err(invalid_bitmap("truncated hierarchical posting bitmap"));
+            }
+            let metadata = data.get_bytes(0..metadata_len as u64)?;
+            let mut summary = Vec::with_capacity(summary_len / 8);
+            for bytes in metadata
+                [HIERARCHICAL_BITMAP_HEADER_LEN..HIERARCHICAL_BITMAP_HEADER_LEN + summary_len]
+                .chunks_exact(8)
+            {
+                summary.push(u64::from_le_bytes(bytes.try_into().unwrap()));
+            }
+            if summary.last().is_some_and(|last| {
+                let valid = bitmap_block_count(max_doc) % 64;
+                valid != 0 && *last & (u64::MAX << valid) != 0
+            }) {
+                return Err(invalid_bitmap(
+                    "posting bitmap summary contains out-of-range blocks",
+                ));
+            }
+            let summary_count: usize = summary.iter().map(|word| word.count_ones() as usize).sum();
+            if summary_count != present_count {
+                return Err(invalid_bitmap(
+                    "posting bitmap summary and directory disagree",
+                ));
+            }
+            let mut summary_prefix = Vec::with_capacity(summary.len() + 1);
+            summary_prefix.push(0);
+            for word in &summary {
+                summary_prefix.push(summary_prefix.last().unwrap() + word.count_ones());
+            }
+            let directory = &metadata[HIERARCHICAL_BITMAP_HEADER_LEN + summary_len..metadata_len];
+            let mut entries = Vec::with_capacity(present_count);
+            let mut expected_offset = 0usize;
+            for bytes in directory.chunks_exact(HIERARCHICAL_BITMAP_ENTRY_LEN) {
+                let count = u16::from_le_bytes(bytes[0..2].try_into().unwrap());
+                let payload_offset = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                if payload_offset as usize != expected_offset || count == 0 {
+                    return Err(invalid_bitmap("invalid hierarchical posting bitmap entry"));
+                }
+                expected_offset = expected_offset
+                    .checked_add(if count as usize <= SPARSE_BLOCK_MAX_DOCS {
+                        count as usize * 2
+                    } else {
+                        BLOCK_NUM_TINYBITSETS * 8
+                    })
+                    .ok_or_else(|| invalid_bitmap("posting bitmap entry overflow"))?;
+                entries.push(HierarchicalEntry {
+                    count,
+                    payload_offset,
+                });
+            }
+            if expected_offset != payload_len {
+                return Err(invalid_bitmap("posting bitmap payload length mismatch"));
+            }
+            BitmapStorage::Hierarchical(HierarchicalIndex {
+                summary,
+                summary_prefix,
+                entries,
+                payload_base: metadata_len as u64,
+            })
+        } else {
+            let flat_len = flat_bitmap_num_bytes(max_doc) as usize;
+            if flat_len > available {
+                return Err(invalid_bitmap("invalid posting bitmap bounds"));
+            }
+            BitmapStorage::Flat
+        };
         let mut docset = Self {
-            data: BufferedFileSlice::new_block_aligned(
-                source.slice(offset as usize..end.unwrap() as usize),
-                8192,
-            ),
+            data,
+            storage,
             max_doc,
             doc_freq,
             doc: TERMINATED,
@@ -60,12 +172,19 @@ impl BitmapDocSet {
 
     #[inline]
     fn next_doc(&mut self, target: DocId) -> DocId {
+        match &self.storage {
+            BitmapStorage::Flat => self.next_flat_doc(target),
+            BitmapStorage::Hierarchical(index) => self.next_hierarchical_doc(index, target),
+        }
+    }
+
+    fn next_flat_doc(&mut self, target: DocId) -> DocId {
         if target >= self.max_doc {
             return TERMINATED;
         }
         let mut offset = u64::from(target / 64) * 8;
         let start_offset = offset;
-        let end = bitmap_num_bytes(self.max_doc);
+        let end = flat_bitmap_num_bytes(self.max_doc);
         let mut first_mask = u64::MAX << (target % 64);
         'scan: while offset < end {
             let bytes = self
@@ -106,6 +225,142 @@ impl BitmapDocSet {
             postings.doc()
         }
     }
+
+    fn next_hierarchical_doc(&self, index: &HierarchicalIndex, target: DocId) -> DocId {
+        if target >= self.max_doc {
+            return TERMINATED;
+        }
+        let mut block = (target / BLOCK_WINDOW) as usize;
+        while let Some((next_block, entry_ord)) = index.next_present_block(block) {
+            let entry = index.entries[entry_ord];
+            let block_base = next_block as u32 * BLOCK_WINDOW;
+            let relative_target = target.saturating_sub(block_base);
+            let payload_start = index.payload_base + u64::from(entry.payload_offset);
+            if entry.count as usize <= SPARSE_BLOCK_MAX_DOCS {
+                let payload_len = u64::from(entry.count) * 2;
+                let bytes = self
+                    .data
+                    .get_bytes(payload_start..payload_start + payload_len)
+                    .expect("failed to read sparse posting bitmap block");
+                for raw in bytes.chunks_exact(2) {
+                    let relative = u16::from_le_bytes(raw.try_into().unwrap()) as u32;
+                    if relative >= relative_target {
+                        return block_base + relative;
+                    }
+                }
+            } else {
+                let word_start = (relative_target / 64) as usize;
+                let payload_len = (BLOCK_NUM_TINYBITSETS * 8) as u64;
+                let bytes = self
+                    .data
+                    .get_bytes(payload_start..payload_start + payload_len)
+                    .expect("failed to read dense posting bitmap block");
+                let mut first_mask = u64::MAX << (relative_target % 64);
+                for (word_ord, raw) in bytes.chunks_exact(8).enumerate().skip(word_start) {
+                    let word = u64::from_le_bytes(raw.try_into().unwrap()) & first_mask;
+                    if word != 0 {
+                        let doc = block_base + word_ord as u32 * 64 + word.trailing_zeros();
+                        return if doc < self.max_doc { doc } else { TERMINATED };
+                    }
+                    first_mask = u64::MAX;
+                }
+            }
+            block = next_block + 1;
+        }
+        TERMINATED
+    }
+
+    fn fill_hierarchical_block(
+        &self,
+        index: &HierarchicalIndex,
+        base: DocId,
+        start: DocId,
+        horizon: DocId,
+        mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
+    ) {
+        let first_block = (start / BLOCK_WINDOW) as usize;
+        let last_block = ((horizon - 1) / BLOCK_WINDOW) as usize;
+        let mut block = first_block;
+        let mut result = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
+        while let Some((present_block, entry_ord)) = index.next_present_block(block) {
+            if present_block > last_block {
+                break;
+            }
+            let entry = index.entries[entry_ord];
+            let block_base = present_block as u32 * BLOCK_WINDOW;
+            let payload_start = index.payload_base + u64::from(entry.payload_offset);
+            if entry.count as usize <= SPARSE_BLOCK_MAX_DOCS {
+                let payload_len = u64::from(entry.count) * 2;
+                let bytes = self
+                    .data
+                    .get_bytes(payload_start..payload_start + payload_len)
+                    .expect("failed to read sparse posting bitmap block");
+                for raw in bytes.chunks_exact(2) {
+                    let doc = block_base + u16::from_le_bytes(raw.try_into().unwrap()) as u32;
+                    if doc >= start && doc < horizon {
+                        let relative = doc - base;
+                        result[(relative / 64) as usize].insert_mut(relative % 64);
+                    }
+                }
+            } else {
+                let payload_len = (BLOCK_NUM_TINYBITSETS * 8) as u64;
+                let bytes = self
+                    .data
+                    .get_bytes(payload_start..payload_start + payload_len)
+                    .expect("failed to read dense posting bitmap block");
+                if block_base == base {
+                    for (word, raw) in result.iter_mut().zip(bytes.chunks_exact(8)) {
+                        *word = TinySet::deserialize(raw.try_into().unwrap());
+                    }
+                } else {
+                    for (word_ord, raw) in bytes.chunks_exact(8).enumerate() {
+                        let word_base = block_base + word_ord as u32 * 64;
+                        if word_base >= horizon || word_base + 64 <= base {
+                            continue;
+                        }
+                        let mut bits = u64::from_le_bytes(raw.try_into().unwrap());
+                        if word_base < base {
+                            bits >>= base - word_base;
+                            result[0] = result[0].union(TinySet::deserialize(bits.to_le_bytes()));
+                        } else {
+                            let delta = word_base - base;
+                            let bucket = delta as usize / 64;
+                            let shift = delta % 64;
+                            result[bucket] = result[bucket]
+                                .union(TinySet::deserialize((bits << shift).to_le_bytes()));
+                            if shift != 0 && bucket + 1 < result.len() {
+                                result[bucket + 1] = result[bucket + 1].union(
+                                    TinySet::deserialize((bits >> (64 - shift)).to_le_bytes()),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            block = present_block + 1;
+        }
+        crate::docset::retain_bitset_range(&mut result, base, start, horizon);
+        crate::docset::union_bitset_blocks(mask, &result);
+    }
+}
+
+impl HierarchicalIndex {
+    fn next_present_block(&self, block: usize) -> Option<(usize, usize)> {
+        let mut word_ord = block / 64;
+        let mut word = *self.summary.get(word_ord)? & (u64::MAX << (block % 64));
+        while word == 0 {
+            word_ord += 1;
+            word = *self.summary.get(word_ord)?;
+        }
+        let block = word_ord * 64 + word.trailing_zeros() as usize;
+        let lower = self.summary[word_ord] & ((1u64 << (block % 64)).wrapping_sub(1));
+        let entry_ord = self.summary_prefix[word_ord] as usize + lower.count_ones() as usize;
+        Some((block, entry_ord))
+    }
+}
+
+fn invalid_bitmap(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 impl DocSet for BitmapDocSet {
@@ -128,15 +383,11 @@ impl DocSet for BitmapDocSet {
         if target < self.doc {
             return SeekDangerResult::SeekLowerBound(self.doc);
         }
-        let byte = self
-            .data
-            .read_byte(u64::from(target / 8))
-            .expect("failed to read posting bitmap");
-        self.doc = target;
-        if byte & (1 << (target % 8)) != 0 {
+        self.doc = self.next_doc(target);
+        if self.doc == target {
             SeekDangerResult::Found
         } else {
-            SeekDangerResult::SeekLowerBound(target + 1)
+            SeekDangerResult::SeekLowerBound(self.doc)
         }
     }
 
@@ -162,10 +413,15 @@ impl DocSet for BitmapDocSet {
         if start >= horizon {
             return self.doc;
         }
+        if let BitmapStorage::Hierarchical(index) = &self.storage {
+            self.fill_hierarchical_block(index, base, start, horizon, mask);
+            self.doc = self.next_doc(horizon);
+            return self.doc;
+        }
         let offset = u64::from(base / 64) * 8;
         let bytes = self
             .data
-            .get_bytes(offset..bitmap_num_bytes(horizon))
+            .get_bytes(offset..flat_bitmap_num_bytes(horizon))
             .expect("failed to read posting bitmap");
         let shift = base % 64;
         if shift == 0 {
@@ -209,8 +465,16 @@ impl DocSet for BitmapDocSet {
 mod tests {
     use super::*;
 
+    fn hierarchical_bitmap(docs: &[DocId], max_doc: DocId) -> BitmapDocSet {
+        let data = crate::postings::term_bitmaps::encode_hierarchical_bitmap(max_doc, docs, &[]);
+        BitmapDocSet::open(FileSlice::from(data), 0, max_doc, docs.len() as u32, || {
+            panic!("hierarchical bitmap navigation should not open postings")
+        })
+        .unwrap()
+    }
+
     fn bitmap(docs: &[DocId], max_doc: DocId) -> BitmapDocSet {
-        let mut data = vec![0u8; bitmap_num_bytes(max_doc) as usize];
+        let mut data = vec![0u8; flat_bitmap_num_bytes(max_doc) as usize];
         for &doc in docs {
             data[doc as usize / 8] |= 1 << (doc % 8);
         }
@@ -268,7 +532,7 @@ mod tests {
                 assert_eq!(bitmap.seek_danger(66560), SeekDangerResult::Found);
             }
             let mut mask = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
-            assert_eq!(bitmap.fill_bitset_block(66560, &mut mask), 67584);
+            assert_eq!(bitmap.fill_bitset_block(66560, &mut mask), 74752);
             assert!(mask.iter().all(|word| word.len() == 64));
             assert_eq!(*reads.lock().unwrap(), vec![0..8192, 8192..16384]);
         }
@@ -281,7 +545,7 @@ mod tests {
         for prefix in [1, 151, 8155] {
             let reads = Arc::new(Mutex::new(Vec::new()));
             let max_doc = 300003;
-            let len = bitmap_num_bytes(max_doc) as usize;
+            let len = flat_bitmap_num_bytes(max_doc) as usize;
             let file = FileSlice::new(Arc::new(TrackedBitmapFile {
                 data: vec![255; prefix + 37 + len + 19],
                 reads: reads.clone(),
@@ -308,12 +572,14 @@ mod tests {
             }
             let reads = reads.lock().unwrap();
             let mut end = prefix + 37;
+            let source_end = prefix + 37 + len + 19;
             for range in reads.iter() {
                 assert_eq!(range.start, end, "overlapping or skipped read: {reads:?}");
-                assert!(range.end % 8156 == 0 || range.end == prefix + 37 + len);
+                assert!(range.end % 8156 == 0 || range.end == source_end);
                 end = range.end;
             }
-            assert_eq!(end, prefix + 37 + len);
+            assert!(end >= prefix + 37 + len);
+            assert!(end <= source_end);
         }
     }
 
@@ -323,7 +589,7 @@ mod tests {
 
         let max_doc = 100_000_000;
         let docs = [90_000_000, 90_000_002, 99_000_000];
-        let mut data = vec![0; bitmap_num_bytes(max_doc) as usize];
+        let mut data = vec![0; flat_bitmap_num_bytes(max_doc) as usize];
         for doc in docs {
             data[doc as usize / 8] |= 1 << (doc % 8);
         }
@@ -353,7 +619,7 @@ mod tests {
             for prefix in [0, 1, 151, 8155] {
                 let max_doc = 1_048_573;
                 let docs = [0, 131_071, 800_003, max_doc - 1];
-                let len = bitmap_num_bytes(max_doc) as usize;
+                let len = flat_bitmap_num_bytes(max_doc) as usize;
                 let mut data = vec![0; prefix + len];
                 for doc in docs {
                     data[prefix + doc as usize / 8] |= 1 << (doc % 8);
@@ -542,5 +808,42 @@ mod tests {
         )
         .is_err());
         assert_eq!(bitmap(&[], 0).doc(), TERMINATED);
+    }
+
+    #[test]
+    fn hierarchical_bitmap_skips_empty_blocks_and_decodes_sparse_and_dense_blocks() {
+        let max_doc = BLOCK_WINDOW * 4 + 123;
+        let mut docs = vec![3, 70, 500];
+        docs.extend((BLOCK_WINDOW * 2..BLOCK_WINDOW * 3).step_by(2));
+        docs.extend([BLOCK_WINDOW * 3 + 1, BLOCK_WINDOW * 4 - 1]);
+
+        let mut iter = hierarchical_bitmap(&docs, max_doc);
+        for &doc in &docs {
+            assert_eq!(iter.doc(), doc);
+            iter.advance();
+        }
+        assert_eq!(iter.doc(), TERMINATED);
+
+        for base in [
+            0,
+            1,
+            BLOCK_WINDOW - 63,
+            BLOCK_WINDOW,
+            BLOCK_WINDOW + 17,
+            BLOCK_WINDOW * 2,
+            BLOCK_WINDOW * 2 + 11,
+            BLOCK_WINDOW * 3 - 31,
+        ] {
+            let mut actual = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
+            let mut expected = actual;
+            let mut hierarchical = hierarchical_bitmap(&docs, max_doc);
+            let mut reference = crate::query::VecDocSet::from(docs.clone());
+            assert_eq!(
+                hierarchical.fill_bitset_block(base, &mut actual),
+                reference.fill_bitset_block(base, &mut expected),
+                "base {base}",
+            );
+            assert_eq!(actual, expected, "base {base}");
+        }
     }
 }

@@ -148,12 +148,7 @@ impl BitmapCombination {
                         );
                     }
                     BitmapOperation::Exclude => {
-                        empty = true;
-                        for (word, other) in self.mask.iter_mut().zip(other) {
-                            let bits = word.into_u64() & !other.into_u64();
-                            *word = TinySet::deserialize(bits.to_le_bytes());
-                            empty &= bits == 0;
-                        }
+                        empty = crate::bitmap_ops::exclude_in_place(&mut self.mask, &other);
                     }
                 }
             }
@@ -306,10 +301,11 @@ mod tests {
 
     #[test]
     fn union_retires_children_after_their_last_mask_and_skips_future_windows() {
+        let w = BLOCK_WINDOW;
         let fills: Vec<_> = (0..3)
             .map(|_| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
             .collect();
-        let children = [vec![1], vec![2, 1025, 2049], vec![4097]]
+        let children = [vec![1], vec![2, w + 1, 2 * w + 1], vec![4 * w + 1]]
             .into_iter()
             .enumerate()
             .map(|(i, docs)| {
@@ -320,39 +316,40 @@ mod tests {
                 }) as Box<dyn Scorer>
             })
             .collect();
-        let mut scorer = BitmapCombination::new(children, BitmapOperation::Union, 8007);
+        let mut scorer = BitmapCombination::new(children, BitmapOperation::Union, 8 * w);
         assert_eq!(scorer.children.len(), 2);
-        for doc in [1, 2, 1025, 2049, 4097] {
+        for doc in [1, 2, w + 1, 2 * w + 1, 4 * w + 1] {
             assert_eq!(scorer.doc(), doc);
             scorer.advance();
         }
         assert!(scorer.children.is_empty());
         assert_eq!(scorer.advance(), TERMINATED);
         assert_eq!(*fills[0].lock().unwrap(), vec![0]);
-        assert_eq!(*fills[1].lock().unwrap(), vec![0, 1024, 2048]);
-        assert_eq!(*fills[2].lock().unwrap(), vec![4096]);
+        assert_eq!(*fills[1].lock().unwrap(), vec![0, w, 2 * w]);
+        assert_eq!(*fills[2].lock().unwrap(), vec![4 * w]);
     }
 
     #[test]
     fn empty_windows_skip_children_and_preserve_progress() {
+        let w = BLOCK_WINDOW;
         for operation in [BitmapOperation::Intersection, BitmapOperation::Exclude] {
             let intersection = matches!(operation, BitmapOperation::Intersection);
             let documents = [
-                vec![1, 1025, 2049, 4097],
+                vec![1, w + 1, 2 * w + 1, 4 * w + 1],
                 if intersection {
-                    vec![2, 1026, 2049, 4097]
+                    vec![2, w + 2, 2 * w + 1, 4 * w + 1]
                 } else {
-                    vec![1, 1025, 4097]
+                    vec![1, w + 1, 4 * w + 1]
                 },
                 if intersection {
-                    vec![3, 1027, 2049, 4097]
+                    vec![3, w + 3, 2 * w + 1, 4 * w + 1]
                 } else {
-                    vec![3, 1027, 4097]
+                    vec![3, w + 3, 4 * w + 1]
                 },
                 if intersection {
-                    vec![4, 1028, 2049, 4097]
+                    vec![4, w + 4, 2 * w + 1, 4 * w + 1]
                 } else {
-                    vec![4, 1028, 4097]
+                    vec![4, w + 4, 4 * w + 1]
                 },
             ];
             let fills: Vec<_> = (0..4)
@@ -372,22 +369,22 @@ mod tests {
             if intersection {
                 children.reverse();
             }
-            let mut scorer = BitmapCombination::new(children, operation, 8007);
-            assert_eq!(scorer.doc(), 2049);
-            assert_eq!(*fills[2].lock().unwrap(), vec![2048]);
-            assert_eq!(*fills[3].lock().unwrap(), vec![2048]);
+            let mut scorer = BitmapCombination::new(children, operation, 5 * w);
+            assert_eq!(scorer.doc(), 2 * w + 1);
+            assert_eq!(*fills[2].lock().unwrap(), vec![2 * w]);
+            assert_eq!(*fills[3].lock().unwrap(), vec![2 * w]);
             assert_eq!(
                 scorer.advance(),
-                if intersection { 4097 } else { TERMINATED }
+                if intersection { 4 * w + 1 } else { TERMINATED }
             );
             assert_eq!(scorer.advance(), TERMINATED);
-            assert_eq!(*fills[0].lock().unwrap(), vec![0, 1024, 2048, 4096]);
+            assert_eq!(*fills[0].lock().unwrap(), vec![0, w, 2 * w, 4 * w]);
             assert_eq!(
                 *fills[3].lock().unwrap(),
                 if intersection {
-                    vec![2048, 4096]
+                    vec![2 * w, 4 * w]
                 } else {
-                    vec![2048]
+                    vec![2 * w]
                 }
             );
         }
@@ -395,25 +392,26 @@ mod tests {
 
     #[test]
     fn empty_first_child_skips_the_remaining_children() {
+        let w = BLOCK_WINDOW;
         let fills = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut scorer = BitmapCombination::new(
             vec![
                 Box::new(TrackedScorer {
-                    docs: VecDocSet::from(vec![1, 4097]),
+                    docs: VecDocSet::from(vec![1, 4 * w + 1]),
                     cost: 0,
                     fills: Default::default(),
                 }),
                 Box::new(TrackedScorer {
-                    docs: VecDocSet::from(vec![2049, 4097]),
+                    docs: VecDocSet::from(vec![2 * w + 1, 4 * w + 1]),
                     cost: 1,
                     fills: fills.clone(),
                 }),
             ],
             BitmapOperation::Intersection,
-            8007,
+            5 * w,
         );
-        assert_eq!(scorer.doc(), 4097);
-        assert_eq!(*fills.lock().unwrap(), vec![4096]);
+        assert_eq!(scorer.doc(), 4 * w + 1);
+        assert_eq!(*fills.lock().unwrap(), vec![4 * w]);
         assert_eq!(scorer.advance(), TERMINATED);
     }
 
@@ -632,7 +630,7 @@ mod tests {
             let base = exclude.doc() / BLOCK_WINDOW * BLOCK_WINDOW;
             let mut mask = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
             exclude.fill_bitset_block(base, &mut mask);
-            count += mask.iter().map(|word| word.len()).sum::<u32>();
+            count += crate::bitmap_ops::count(&mask);
         }
         assert_eq!(
             count,

@@ -284,12 +284,7 @@ pub(crate) fn and_blocks_and_return_is_empty(
     mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
     update: &[TinySet; BLOCK_NUM_TINYBITSETS],
 ) -> bool {
-    let mut all_empty = true;
-    for (mask_tinyset, update_tinyset) in mask.iter_mut().zip(update.iter()) {
-        *mask_tinyset = mask_tinyset.intersect(*update_tinyset);
-        all_empty &= mask_tinyset.is_empty();
-    }
-    all_empty
+    crate::bitmap_ops::intersect_in_place(mask, update)
 }
 
 impl<TDocSet: DocSet, TOtherDocSet: DocSet> Intersection<TDocSet, TOtherDocSet> {
@@ -305,7 +300,7 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> Intersection<TDocSet, TOtherDocSet> 
 
     /// Dense block-wise bitmask intersection count.
     ///
-    /// Fills a 1024-doc window from each iterator, ANDs the bitmasks together,
+    /// Fills an 8192-doc window from each iterator, ANDs the bitmasks together,
     /// and popcounts the result. `fill_bitset_block` handles seeking tails forward
     /// when they lag behind the current block.
     fn count_including_deleted_dense(&mut self) -> u32 {
@@ -610,16 +605,16 @@ mod tests {
         assert_eq!(intersection.count_including_deleted(), expected);
     }
 
-    /// Test that spans multiple blocks (>1024 docs).
+    /// Test that spans multiple 8192-document bitmap windows.
     #[test]
     fn test_count_including_deleted_multi_block() {
-        let docs_a: Vec<u32> = (0..5000).collect();
-        let docs_b: Vec<u32> = (0..5000).step_by(7).collect();
+        let docs_a: Vec<u32> = (0..20_000).collect();
+        let docs_b: Vec<u32> = (0..20_000).step_by(7).collect();
         let expected = docs_b.len() as u32; // all of b is in a
 
         let a = VecDocSet::from(docs_a);
         let b = VecDocSet::from(docs_b);
-        let mut intersection = Intersection::new(vec![a, b], 5000);
+        let mut intersection = Intersection::new(vec![a, b], 20_000);
         assert_eq!(intersection.count_including_deleted(), expected);
     }
 

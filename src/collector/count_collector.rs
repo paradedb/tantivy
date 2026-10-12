@@ -92,7 +92,16 @@ impl SegmentCollector for SegmentCountCollector {
     }
 
     fn collect_bitmap(&mut self, _base: DocId, mask: &crate::DocIdBitmap) {
-        self.count += mask.iter().map(|word| word.len() as usize).sum::<usize>();
+        self.count += crate::bitmap_ops::count(mask) as usize;
+    }
+
+    fn collect_bitmap_filtered(
+        &mut self,
+        _base: DocId,
+        mask: &crate::DocIdBitmap,
+        filter: &crate::DocIdBitmap,
+    ) {
+        self.count += crate::bitmap_ops::count_intersection(mask, filter) as usize;
     }
 
     fn harvest(self) -> usize {
@@ -104,6 +113,21 @@ impl SegmentCollector for SegmentCountCollector {
 mod tests {
     use super::{Count, SegmentCountCollector};
     use crate::collector::{Collector, SegmentCollector};
+
+    #[test]
+    fn filtered_bitmap_count_intersects_without_enumerating() {
+        let mut mask = [common::TinySet::EMPTY; crate::BLOCK_NUM_TINYBITSETS];
+        let mut filter = mask;
+        for doc in [1u32, 65, 1024, 8191] {
+            mask[doc as usize / 64].insert_mut(doc % 64);
+        }
+        for doc in [0u32, 65, 1024, 4096] {
+            filter[doc as usize / 64].insert_mut(doc % 64);
+        }
+        let mut collector = SegmentCountCollector::default();
+        collector.collect_bitmap_filtered(0, &mask, &filter);
+        assert_eq!(collector.harvest(), 2);
+    }
 
     struct BitmapOnlyCount;
     impl SegmentCollector for BitmapOnlyCount {

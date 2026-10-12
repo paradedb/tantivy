@@ -677,7 +677,23 @@ impl<B: SubAggBuffer> SegmentAggregationCollector for SegmentFilterCollector<B> 
             unreachable!("bitmap collection requires a match-all filter without sub-aggregations");
         }
         self.parent_buckets[parent_bucket_id as usize].doc_count +=
-            mask.iter().map(|word| u64::from(word.len())).sum::<u64>();
+            u64::from(crate::bitmap_ops::count(mask));
+        Ok(())
+    }
+
+    fn collect_bitmap_filtered(
+        &mut self,
+        parent_bucket_id: BucketId,
+        _base: DocId,
+        mask: &crate::DocIdBitmap,
+        filter: &crate::DocIdBitmap,
+        _agg_data: &mut AggregationsSegmentCtx,
+    ) -> crate::Result<()> {
+        if self.sub_aggregations.is_some() || self.req_data.evaluator.bitset.is_some() {
+            unreachable!("bitmap collection requires a match-all filter without sub-aggregations");
+        }
+        self.parent_buckets[parent_bucket_id as usize].doc_count +=
+            u64::from(crate::bitmap_ops::count_intersection(mask, filter));
         Ok(())
     }
 

@@ -182,6 +182,7 @@ pub use crate::future_result::FutureResult;
 /// and instead, refer to this as `crate::Result<T>`.
 pub type Result<T> = std::result::Result<T, TantivyError>;
 
+mod bitmap_ops;
 mod core;
 pub mod indexer;
 

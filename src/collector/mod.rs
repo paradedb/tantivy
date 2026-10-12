@@ -244,9 +244,8 @@ pub(crate) fn default_collect_segment_impl<TSegmentCollector: SegmentCollector>(
                     }
                 }
                 crate::DocSetBatch::Bitmap(base, mask) => {
-                    let mut mask = *mask;
-                    alive_bitset.intersect_bitmap(base, &mut mask);
-                    segment_collector.collect_bitmap(base, &mask);
+                    let alive_filter = alive_bitset.bitmap_filter(base);
+                    segment_collector.collect_bitmap_filtered(base, mask, &alive_filter);
                 }
             })?;
         }
@@ -290,6 +289,17 @@ impl<TSegmentCollector: SegmentCollector> SegmentCollector for Option<TSegmentCo
     fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
         if let Some(collector) = self {
             collector.collect_bitmap(base, mask);
+        }
+    }
+
+    fn collect_bitmap_filtered(
+        &mut self,
+        base: DocId,
+        mask: &crate::DocIdBitmap,
+        filter: &crate::DocIdBitmap,
+    ) {
+        if let Some(collector) = self {
+            collector.collect_bitmap_filtered(base, mask, filter);
         }
     }
 
@@ -385,6 +395,21 @@ pub trait SegmentCollector: 'static {
         crate::DocSetBatch::Bitmap(base, mask).for_each_doc_block(|docs| self.collect_block(docs));
     }
 
+    /// Collects the intersection of an unscored membership bitmap and a filter bitmap.
+    ///
+    /// Count-like collectors can override this to combine masking and popcount without
+    /// materializing an intermediate bitmap. The default keeps existing collectors correct.
+    fn collect_bitmap_filtered(
+        &mut self,
+        base: DocId,
+        mask: &crate::DocIdBitmap,
+        filter: &crate::DocIdBitmap,
+    ) {
+        let mut filtered = *mask;
+        crate::bitmap_ops::intersect_in_place(&mut filtered, filter);
+        self.collect_bitmap(base, &filtered);
+    }
+
     /// Extract the fruit of the collection from the `SegmentCollector`.
     fn harvest(self) -> Self::Fruit;
 }
@@ -465,6 +490,16 @@ where
     fn collect_bitmap(&mut self, base: DocId, mask: &crate::DocIdBitmap) {
         self.0.collect_bitmap(base, mask);
         self.1.collect_bitmap(base, mask);
+    }
+
+    fn collect_bitmap_filtered(
+        &mut self,
+        base: DocId,
+        mask: &crate::DocIdBitmap,
+        filter: &crate::DocIdBitmap,
+    ) {
+        self.0.collect_bitmap_filtered(base, mask, filter);
+        self.1.collect_bitmap_filtered(base, mask, filter);
     }
 
     fn harvest(self) -> <Self as SegmentCollector>::Fruit {
@@ -561,6 +596,17 @@ where
         self.0.collect_bitmap(base, mask);
         self.1.collect_bitmap(base, mask);
         self.2.collect_bitmap(base, mask);
+    }
+
+    fn collect_bitmap_filtered(
+        &mut self,
+        base: DocId,
+        mask: &crate::DocIdBitmap,
+        filter: &crate::DocIdBitmap,
+    ) {
+        self.0.collect_bitmap_filtered(base, mask, filter);
+        self.1.collect_bitmap_filtered(base, mask, filter);
+        self.2.collect_bitmap_filtered(base, mask, filter);
     }
 
     fn harvest(self) -> <Self as SegmentCollector>::Fruit {
@@ -672,6 +718,18 @@ where
         self.1.collect_bitmap(base, mask);
         self.2.collect_bitmap(base, mask);
         self.3.collect_bitmap(base, mask);
+    }
+
+    fn collect_bitmap_filtered(
+        &mut self,
+        base: DocId,
+        mask: &crate::DocIdBitmap,
+        filter: &crate::DocIdBitmap,
+    ) {
+        self.0.collect_bitmap_filtered(base, mask, filter);
+        self.1.collect_bitmap_filtered(base, mask, filter);
+        self.2.collect_bitmap_filtered(base, mask, filter);
+        self.3.collect_bitmap_filtered(base, mask, filter);
     }
 
     fn harvest(self) -> <Self as SegmentCollector>::Fruit {

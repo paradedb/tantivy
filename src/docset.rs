@@ -17,9 +17,13 @@ pub const TERMINATED: DocId = i32::MAX as u32;
 pub const COLLECT_BLOCK_BUFFER_LEN: usize = 64;
 
 /// Number of `TinySet` (64-bit) buckets in a block used by [`DocSet::fill_bitset_block`].
-pub const BLOCK_NUM_TINYBITSETS: usize = 16;
+///
+/// Bitmap-backed queries deliberately use a larger window than ordinary posting-list
+/// collection. This amortizes query composition, collector callbacks, and any visibility
+/// filtering layered on top of Tantivy over 8K documents at a time.
+pub const BLOCK_NUM_TINYBITSETS: usize = 128;
 
-/// Number of doc IDs covered by one block: `BLOCK_NUM_TINYBITSETS * 64 = 1024`.
+/// Number of doc IDs covered by one block: `BLOCK_NUM_TINYBITSETS * 64 = 8192`.
 pub const BLOCK_WINDOW: u32 = BLOCK_NUM_TINYBITSETS as u32 * 64;
 
 /// Membership bits for a window of [`BLOCK_WINDOW`] consecutive document IDs.
@@ -66,9 +70,7 @@ impl DocSetBatch<'_> {
 
 #[inline]
 pub(crate) fn union_bitset_blocks(mask: &mut DocIdBitmap, other: &DocIdBitmap) {
-    for (word, other) in mask.iter_mut().zip(other) {
-        *word = word.union(*other);
-    }
+    crate::bitmap_ops::union_in_place(mask, other);
 }
 
 #[inline]
@@ -96,9 +98,11 @@ pub(crate) fn count_bitset_blocks<T: DocSet + ?Sized>(
         let mut mask = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
         docset.fill_bitset_block(base, &mut mask);
         if let Some(alive) = alive {
-            alive.intersect_bitmap(base, &mut mask);
+            let alive_filter = alive.bitmap_filter(base);
+            count += crate::bitmap_ops::count_intersection(&mask, &alive_filter);
+        } else {
+            count += crate::bitmap_ops::count(&mask);
         }
-        count += mask.iter().map(|word| word.len()).sum::<u32>();
     }
     count
 }

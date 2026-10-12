@@ -6,6 +6,7 @@ use ownedbytes::OwnedBytes;
 use crate::ByteCount;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
+#[repr(transparent)]
 pub struct TinySet(u64);
 
 impl fmt::Debug for TinySet {
@@ -33,6 +34,20 @@ impl IntoIterator for TinySet {
 }
 
 impl TinySet {
+    /// Views a contiguous collection of tiny sets as their underlying words.
+    #[inline]
+    pub fn as_u64_slice(sets: &[Self]) -> &[u64] {
+        // SAFETY: TinySet is repr(transparent) over u64.
+        unsafe { std::slice::from_raw_parts(sets.as_ptr().cast(), sets.len()) }
+    }
+
+    /// Views a contiguous mutable collection of tiny sets as their underlying words.
+    #[inline]
+    pub fn as_u64_slice_mut(sets: &mut [Self]) -> &mut [u64] {
+        // SAFETY: TinySet is repr(transparent) over u64.
+        unsafe { std::slice::from_raw_parts_mut(sets.as_mut_ptr().cast(), sets.len()) }
+    }
+
     pub fn serialize<T: Write>(&self, writer: &mut T) -> io::Result<()> {
         writer.write_all(self.0.to_le_bytes().as_ref())
     }
