@@ -1,7 +1,7 @@
-//! Combines query matches one 8,192-document window at a time, keeping the result
+//! Combines query matches one 1,024-document window at a time, keeping the result
 //! as bits so count collectors can count set bits without visiting every document.
-//! Each window has 128 64-bit words (`TinySet`s). For example, in the window
-//! `[8192, 16384)`, bit 3 of the first word represents document 8195 in this segment.
+//! Each window has sixteen 64-bit words (`TinySet`s). For example, in the window
+//! `[1024, 2048)`, bit 3 of the first word represents document 1027 in this segment.
 //!
 //! Every child supplies its matches for the current window through
 //! `fill_bitset_block`. How much work that takes depends on the child:
@@ -187,14 +187,6 @@ impl DocSet for BitmapCombination {
         true
     }
 
-    fn for_each_no_score_batch(&mut self, callback: &mut dyn FnMut(crate::DocSetBatch<'_>)) {
-        while self.doc < TERMINATED {
-            let base = self.base;
-            callback(crate::DocSetBatch::Bitmap(base, &self.mask));
-            self.seek(base.saturating_add(BLOCK_WINDOW));
-        }
-    }
-
     fn fill_bitset_block(&mut self, base: DocId, mask: &mut Block) -> DocId {
         if self.doc < base {
             self.seek(base);
@@ -230,25 +222,6 @@ impl DocSet for BitmapCombination {
         }
         self.doc
     }
-
-    fn count_including_deleted(&mut self) -> u32 {
-        let mut count = 0;
-        while self.doc < TERMINATED {
-            count += crate::bitmap_ops::count(&self.mask);
-            self.seek(self.base.saturating_add(BLOCK_WINDOW));
-        }
-        count
-    }
-
-    fn count(&mut self, alive_bitset: &crate::fastfield::AliveBitSet) -> u32 {
-        let mut count = 0;
-        while self.doc < TERMINATED {
-            let alive_filter = alive_bitset.bitmap_filter(self.base);
-            count += crate::bitmap_ops::count_intersection(&self.mask, &alive_filter);
-            self.seek(self.base.saturating_add(BLOCK_WINDOW));
-        }
-        count
-    }
 }
 
 impl Scorer for BitmapCombination {
@@ -269,13 +242,7 @@ mod tests {
 
     fn leaf(docs: Vec<u32>, dense: bool) -> Box<dyn Scorer> {
         if dense {
-            let max_value = docs
-                .last()
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(1)
-                .max(8007);
-            let mut bits = BitSet::with_max_value(max_value);
+            let mut bits = BitSet::with_max_value(8007);
             for doc in docs {
                 bits.insert(doc);
             }
@@ -496,55 +463,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn bitmap_combinations_batch_and_count_from_current_position() {
-        let a: Vec<_> = (0..20_003).filter(|doc| doc % 7 < 3).collect();
-        let b: Vec<_> = (0..20_003).filter(|doc| doc % 11 < 2).collect();
-        let expected: Vec<_> = (0..20_003)
-            .filter(|doc| (doc % 7 < 3 || doc % 11 < 2) && *doc >= 8_237)
-            .collect();
-
-        let mut batched = BitmapCombination::new(
-            vec![leaf(a.clone(), true), leaf(b.clone(), true)],
-            BitmapOperation::Union,
-            20_003,
-        );
-        batched.seek(8_237);
-        let mut actual = Vec::new();
-        batched.for_each_no_score_batch(&mut |batch| {
-            batch.for_each_doc_block(|docs| actual.extend_from_slice(docs));
-        });
-        assert_eq!(actual.len(), expected.len());
-        assert_eq!(
-            actual
-                .iter()
-                .zip(&expected)
-                .find(|(actual, expected)| actual != expected),
-            None
-        );
-
-        let mut counted = BitmapCombination::new(
-            vec![leaf(a.clone(), true), leaf(b.clone(), true)],
-            BitmapOperation::Union,
-            20_003,
-        );
-        counted.seek(8_237);
-        assert_eq!(counted.count_including_deleted(), expected.len() as u32);
-
-        let deleted = [8_239, 8_240, 9_001, 16_385, 19_999];
-        let alive = crate::fastfield::AliveBitSet::for_test_from_deleted_docs(&deleted, 20_003);
-        let mut filtered = BitmapCombination::new(
-            vec![leaf(a, true), leaf(b, true)],
-            BitmapOperation::Union,
-            20_003,
-        );
-        filtered.seek(8_237);
-        assert_eq!(
-            filtered.count(&alive),
-            expected.iter().filter(|doc| !deleted.contains(doc)).count() as u32
-        );
     }
 
     #[test]
