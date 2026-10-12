@@ -13,7 +13,14 @@
 //! translation invariance across many seeds; the two named tests are the
 //! minimal reproductions.
 
-use super::*;
+use quant_model::f16::f16_to_f32;
+
+use crate::schema::Metric;
+use crate::vector::prepared::ArithmeticError;
+use crate::vector::quantization::QUANTIZED_BOUNDARY_KAPPA;
+use crate::vector::scan::estimate::{combine_initial_decoded, combine_refinement_decoded};
+use crate::vector::scan::layer_read::Selection;
+use crate::vector::scan::QuantizedScanCtx;
 
 #[test]
 fn enclosing_intervals_preserve_topk_and_running_threshold_many_seeds() {

@@ -170,9 +170,9 @@ impl AdaptiveProbeParams {
         };
         // The open share is PER INDEX, derived from the measured
         // rows-per-open hardware ratio and this index's own granularity -
-        // see `backend::open_share`. The unit identity (1 unit = x +
+        // see `source::controller::open_share`. The unit identity (1 unit = x +
         // (1 - x); exhaustive scan = C units) holds for any x.
-        let x = crate::vector::backend::open_share(n_avg);
+        let x = crate::vector::source::controller::open_share(n_avg);
         let segment_units = clusters_in_segment as f64 * x
             + (1.0 - x) * native_docs_in_segment as f64 / n_avg.max(f64::MIN_POSITIVE);
         let budget = (self.max_probe_fraction as f64 * segment_units)

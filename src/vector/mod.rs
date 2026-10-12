@@ -26,7 +26,12 @@ mod collector;
 mod distance;
 pub(crate) mod header;
 pub(crate) mod index_reader;
+mod interval;
 mod metadata;
+mod scan;
+mod segment;
+mod source;
+mod stats;
 mod storage_io;
 pub use storage_io::VectorIoStats;
 mod plugin;
@@ -43,13 +48,7 @@ pub(crate) mod tests;
 
 pub(crate) const VEC_EXT: &str = "vec";
 
-#[cfg(feature = "unstable")]
-#[doc(hidden)]
-pub use backend::quantization_bench_layer0_cosine_cluster;
-pub use backend::{
-    set_fixed_probe_cost_rows, ProbeStats, ProbeTermination, VectorBackend,
-    DEFAULT_FIXED_PROBE_COST_ROWS,
-};
+pub use backend::VectorBackend;
 pub use bounds::{
     bounds_verdict, margin_ball_ball, margin_ball_halfspace, residual_norm, to_bound_space,
     BoundKind, BoundStore, BoundsBuilder, HeapPeek, QueryBound, Verdict,
@@ -93,6 +92,13 @@ pub use quantization::{
     VECTOR_QUANTIZATION_FORMAT_VERSION,
 };
 pub use router::{RouterKind, RouterMetrics, RoutingParams};
+#[cfg(feature = "unstable")]
+#[doc(hidden)]
+pub use scan::estimate::quantization_bench_layer0_cosine_cluster;
+pub use source::controller::{
+    set_fixed_probe_cost_rows, ProbeTermination, DEFAULT_FIXED_PROBE_COST_ROWS,
+};
+pub use stats::ProbeStats;
 pub use tie_break::NoTieBreak;
 
 // The schema-level vector types are re-exported here so `crate::vector::{...}`

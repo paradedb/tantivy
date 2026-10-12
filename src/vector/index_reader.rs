@@ -15,10 +15,10 @@ use common::HasLen;
 use common::OwnedBytes;
 use quant_model::f16::f16_to_f32;
 
-use super::backend::{Estimate, Threshold};
 use super::blocks::{BlockMetadata, Blocks};
 use super::flat::IdMap;
 use super::header::{read_centroid_header, read_vector_header, CentroidSlot, VectorEntry};
+use super::interval::{Estimate, Threshold};
 use super::ivf::{decode_row, IvfIndex, CENTROIDS_EXT};
 use super::metadata::{QuantizationSchedule, SlotType, VectorColMetadata};
 use super::prepared::{
