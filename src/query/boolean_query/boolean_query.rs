@@ -157,7 +157,8 @@ impl From<Vec<(Occur, Box<dyn Query>)>> for BooleanQuery {
 
 impl Query for BooleanQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
-        let (subqueries, minimum_number_should_match) = self.flattened_clauses();
+        let (subqueries, minimum_number_should_match) =
+            self.flattened_clauses(enable_scoring.bitmap_postings_enabled());
         let statistics;
         let term_scoring = if let EnableScoring::Enabled {
             searcher,
@@ -259,7 +260,64 @@ impl BooleanQuery {
 
     /// Flattens nested conjunctions and disjunctions where possible, surfacing constituent
     /// term clauses so they can be combined for block-max optimization.
-    pub(crate) fn flattened_clauses(&self) -> (Vec<(Occur, Box<dyn Query>)>, usize) {
+    fn flattened_clauses(
+        &self,
+        flatten_unscored_union: bool,
+    ) -> (Vec<(Occur, Box<dyn Query>)>, usize) {
+        if flatten_unscored_union
+            && self.minimum_number_should_match == 0
+            && self
+                .subqueries
+                .iter()
+                .any(|(occur, _)| *occur == Occur::MustNot)
+        {
+            let mut required = self
+                .subqueries
+                .iter()
+                .filter(|(occur, _)| *occur == Occur::Must);
+            if let Some((_, query)) = required.next() {
+                if required.next().is_none() {
+                    if let Some(child) = query.downcast_ref::<BooleanQuery>() {
+                        let (mut clauses, minimum) = child.flattened_clauses(true);
+                        if minimum <= 1
+                            && !clauses.is_empty()
+                            && clauses.iter().all(|(occur, _)| *occur == Occur::Should)
+                        {
+                            clauses.extend(
+                                self.subqueries
+                                    .iter()
+                                    .filter(|(occur, _)| *occur == Occur::MustNot)
+                                    .map(|(occur, query)| (*occur, query.box_clone())),
+                            );
+                            return (clauses, 1);
+                        }
+                    }
+                }
+            }
+        }
+        if flatten_unscored_union
+            && self.minimum_number_should_match <= 1
+            && self
+                .subqueries
+                .iter()
+                .all(|(occur, _)| *occur == Occur::Should)
+        {
+            let mut clauses = Vec::new();
+            for (occur, query) in &self.subqueries {
+                if let Some(child) = query.downcast_ref::<BooleanQuery>() {
+                    let (children, minimum) = child.flattened_clauses(true);
+                    if minimum <= 1
+                        && !children.is_empty()
+                        && children.iter().all(|(occur, _)| *occur == Occur::Should)
+                    {
+                        clauses.extend(children);
+                        continue;
+                    }
+                }
+                clauses.push((*occur, query.box_clone()));
+            }
+            return (clauses, self.minimum_number_should_match);
+        }
         if self.minimum_number_should_match != 0
             || self
                 .subqueries
@@ -286,7 +344,8 @@ impl BooleanQuery {
         for (occur, subquery) in &self.subqueries {
             if *occur == Occur::Must {
                 if let Some(child_bq) = subquery.downcast_ref::<BooleanQuery>() {
-                    let (child_flat, child_min_should) = child_bq.flattened_clauses();
+                    let (child_flat, child_min_should) =
+                        child_bq.flattened_clauses(flatten_unscored_union);
                     let all_must = !child_flat.is_empty()
                         && child_flat.iter().all(|(o, _)| *o == Occur::Must)
                         && child_min_should == 0;
@@ -637,10 +696,11 @@ mod tests {
             #[test]
             fn proptest_flattened_clauses_semantic_equivalence_and_idempotence(
                 ast in arb_root_boolean_ast(4),
+                unscored in any::<bool>(),
             ) {
                 let query = ast_to_query(&ast);
                 let bq = query.downcast_ref::<BooleanQuery>().unwrap();
-                let (flat_clauses, flat_min_should) = bq.flattened_clauses();
+                let (flat_clauses, flat_min_should) = bq.flattened_clauses(unscored);
 
                 let flat_ast = QueryAST::Boolean {
                     clauses: flat_clauses
@@ -666,7 +726,7 @@ mod tests {
 
                 // Property 2: Idempotence (flattening an already flattened query is a no-op)
                 let flat_bq = BooleanQuery::with_minimum_required_clauses(flat_clauses, flat_min_should);
-                let (flat_clauses_2, flat_min_should_2) = flat_bq.flattened_clauses();
+                let (flat_clauses_2, flat_min_should_2) = flat_bq.flattened_clauses(unscored);
                 let flat_ast_2 = QueryAST::Boolean {
                     clauses: flat_clauses_2
                         .iter()

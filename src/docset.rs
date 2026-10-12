@@ -258,6 +258,30 @@ pub trait DocSet: Send {
         false
     }
 
+    /// Visits the remaining documents in their most efficient unscored representation.
+    ///
+    /// Bitmap-native docsets may override this method to lend their current bitmap window
+    /// directly to the collector instead of copying it through [`Self::fill_bitset_block`].
+    fn for_each_no_score_batch(&mut self, callback: &mut dyn FnMut(DocSetBatch<'_>)) {
+        if self.has_fast_bitset() {
+            while self.doc() < TERMINATED {
+                let base = self.doc() / BLOCK_WINDOW * BLOCK_WINDOW;
+                let mut mask = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
+                self.fill_bitset_block(base, &mut mask);
+                callback(DocSetBatch::Bitmap(base, &mask));
+            }
+        } else {
+            let mut buffer = [0; COLLECT_BLOCK_BUFFER_LEN];
+            loop {
+                let num_items = self.fill_buffer(&mut buffer);
+                callback(DocSetBatch::Docs(&buffer[..num_items]));
+                if num_items != buffer.len() {
+                    break;
+                }
+            }
+        }
+    }
+
     /// Fills a bitmask representing which documents in `[min_doc, min_doc + BLOCK_WINDOW)` are
     /// present in this docset.
     ///

@@ -39,19 +39,7 @@ pub(crate) fn for_each_docset_batch<T: DocSet + ?Sized>(
     docset: &mut T,
     callback: &mut dyn FnMut(crate::DocSetBatch<'_>),
 ) {
-    if docset.has_fast_bitset() {
-        while docset.doc() < TERMINATED {
-            let base = docset.doc() / crate::BLOCK_WINDOW * crate::BLOCK_WINDOW;
-            let mut mask = [common::TinySet::EMPTY; crate::BLOCK_NUM_TINYBITSETS];
-            docset.fill_bitset_block(base, &mut mask);
-            callback(crate::DocSetBatch::Bitmap(base, &mask));
-        }
-    } else {
-        let mut buffer = [0; COLLECT_BLOCK_BUFFER_LEN];
-        for_each_docset_buffered(docset, &mut buffer, |docs| {
-            callback(crate::DocSetBatch::Docs(docs))
-        });
-    }
+    docset.for_each_no_score_batch(callback);
 }
 
 /// Iterates through all of the `(doc, score)` produced by a pruning scorer.
