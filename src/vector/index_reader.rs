@@ -30,7 +30,7 @@ use super::quantization::{
     quantized_code_tail_is_zero, QUANTIZED_BOUNDARY_KAPPA, QUANTIZED_CONSTANT_STRIDE,
     QUANTIZED_ERROR_RATIO_STRIDE, QUANTIZED_GAMMA_STRIDE, QUANTIZED_SCALE_STRIDE,
 };
-use super::storage_io::VectorRead;
+use super::storage_io::{VectorRead, VectorReadKind};
 use super::VEC_EXT;
 use crate::directory::error::OpenReadError;
 use crate::directory::{CompositeFile, FileSlice};
@@ -1300,7 +1300,7 @@ impl QuantizedClusterReader<'_> {
         let bytes = self
             .codes
             .slice((rows.start - self.rows.start) * stride..(rows.end - self.rows.start) * stride)
-            .read_vector_bytes()?;
+            .read_vector_bytes(VectorReadKind::QuantizedLayer(self.layer.layer as u8))?;
         self.layer.validate_codes(&bytes, &rows)?;
         Ok(bytes)
     }
@@ -1317,7 +1317,7 @@ impl QuantizedClusterReader<'_> {
         let last = column_range(&blocks.slots, n, layer.constants.unwrap_or(layer.errors)).end;
         let bytes = blocks
             .block_slice(self.block, first..last)?
-            .read_vector_bytes()?;
+            .read_vector_bytes(VectorReadKind::QuantizedLayer(layer.layer as u8))?;
         let view = |idx| {
             let column = column_range(&blocks.slots, n, idx);
             bytes.slice(column.start - first..column.end - first)
@@ -2584,7 +2584,7 @@ impl VectorIndexReader {
                 self.rows_slice
                     .column(location.cluster as usize, 0)?
                     .slice(start..start + stride)
-                    .read_vector_bytes()?,
+                    .read_vector_bytes(VectorReadKind::FullPrecision)?,
             ));
         }
         let Some(row) = self.row_id(doc_id)? else {
@@ -2660,7 +2660,7 @@ impl VectorIndexReader {
             for row_range in read_ranges[range_start..].iter().cloned() {
                 let bytes = column
                     .slice((row_range.start - first) * stride..(row_range.end - first) * stride)
-                    .read_vector_bytes()?;
+                    .read_vector_bytes(VectorReadKind::FullPrecision)?;
                 chunks.push(VectorRowChunk {
                     rows: row_range,
                     bytes,
@@ -2744,7 +2744,9 @@ impl VectorIndexReader {
             .iter()
             .position(|slot| matches!(slot.slot_type, SlotType::DocIds))
             .ok_or_else(|| DataCorruption::comment_only("missing DocIds column"))?;
-        let bytes = blocks.column(cluster, idx)?.read_vector_bytes()?;
+        let bytes = blocks
+            .column(cluster, idx)?
+            .read_vector_bytes(VectorReadKind::Other)?;
         out.reserve(blocks.rows_in(cluster));
         let mut previous = None;
         for bytes in bytes.chunks_exact(std::mem::size_of::<DocId>()) {

@@ -28,7 +28,7 @@ pub(crate) mod header;
 pub(crate) mod index_reader;
 mod metadata;
 mod storage_io;
-pub use storage_io::VectorIoStats;
+pub use storage_io::{current_vector_read_kind, VectorIoStats, VectorReadKind};
 mod plugin;
 mod prepared;
 pub(crate) mod quantization;

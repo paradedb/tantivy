@@ -6,7 +6,7 @@ use columnar::column_index::{open_optional_index, serialize_optional_index, Opti
 use common::HasLen;
 
 use crate::directory::FileSlice;
-use crate::vector::storage_io::VectorRead;
+use crate::vector::storage_io::{VectorRead, VectorReadKind};
 use crate::DocId;
 
 const VARIANT_IDENTITY: u8 = 0;
@@ -103,7 +103,9 @@ impl IdMap {
         if start >= body.len() {
             return Ok(None);
         }
-        let bytes = body.slice(start..start + 8).read_vector_bytes()?;
+        let bytes = body
+            .slice(start..start + 8)
+            .read_vector_bytes(VectorReadKind::Other)?;
         let cluster = u32::from_le_bytes(bytes[..4].try_into().unwrap());
         let local = u32::from_le_bytes(bytes[4..].try_into().unwrap());
         if cluster == u32::MAX {

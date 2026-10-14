@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use common::{HasLen, OwnedBytes};
 
-use super::metadata::{Partition, Slot, VectorColMetadata};
-use super::storage_io::VectorRead;
+use super::metadata::{Partition, Slot, SlotType, VectorColMetadata};
+use super::storage_io::{VectorRead, VectorReadKind};
 use super::ENTRY_ALIGN;
 use crate::directory::FileSlice;
 use crate::error::DataCorruption;
@@ -434,10 +434,17 @@ impl Blocks {
         let b = self.block_for_range(&rows)?;
         let stride = self.slots[idx].stride as usize;
         let first = self.block_rows[b];
+        let kind = match self.slots[idx].slot_type {
+            SlotType::Rows { .. } => VectorReadKind::FullPrecision,
+            ref slot => slot
+                .band()
+                .map(VectorReadKind::QuantizedLayer)
+                .unwrap_or_default(),
+        };
         Ok(self
             .column(b, idx)?
             .slice((rows.start - first) * stride..(rows.end - first) * stride)
-            .read_vector_bytes()?)
+            .read_vector_bytes(kind)?)
     }
     /// Whether blocks carry a document-id column and use centroid row boundaries.
     pub(crate) fn clustered(&self) -> bool {
@@ -465,7 +472,7 @@ impl Blocks {
         let start = self.block_start(b);
         let bytes = self
             .block_slice(b, range.start - start..range.end - start)?
-            .read_vector_bytes()?;
+            .read_vector_bytes(VectorReadKind::QuantizedLayer(layer as u8))?;
         Ok((range, bytes))
     }
 }

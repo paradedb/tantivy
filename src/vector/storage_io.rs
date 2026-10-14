@@ -10,6 +10,35 @@ use common::{HasLen, OwnedBytes};
 use super::{current_vector_stage, Stage};
 use crate::directory::FileSlice;
 
+/// The vector data requested by the current storage read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VectorReadKind {
+    /// Document addressing, metadata, or unclassified reads.
+    #[default]
+    Other,
+    /// Original vector rows, including exact scans and reranking.
+    FullPrecision,
+    /// Quantized codes and their associated norms and sidecars.
+    QuantizedLayer(u8),
+}
+
+thread_local! {
+    static READ_KIND: Cell<VectorReadKind> = const { Cell::new(VectorReadKind::Other) };
+}
+
+/// The requested data kind, independent of the current search stage.
+pub fn current_vector_read_kind() -> VectorReadKind {
+    READ_KIND.get()
+}
+
+struct ReadKindGuard(VectorReadKind);
+
+impl Drop for ReadKindGuard {
+    fn drop(&mut self) {
+        READ_KIND.set(self.0);
+    }
+}
+
 /// Summable physical read requests; storage blocks count repetitions across requests.
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct VectorIoStats {
@@ -38,10 +67,11 @@ pub(crate) fn snapshot() -> [VectorIoStats; 4] {
 
 /// Reads vector bytes while attributing the actual range to the active scan stage.
 pub(crate) trait VectorRead {
-    fn read_vector_bytes(&self) -> std::io::Result<OwnedBytes>;
+    fn read_vector_bytes(&self, kind: VectorReadKind) -> std::io::Result<OwnedBytes>;
 }
 impl VectorRead for FileSlice {
-    fn read_vector_bytes(&self) -> std::io::Result<OwnedBytes> {
+    fn read_vector_bytes(&self, kind: VectorReadKind) -> std::io::Result<OwnedBytes> {
+        let _kind = ReadKindGuard(READ_KIND.replace(kind));
         let bytes = self.read_bytes()?;
         let slot = match current_vector_stage() {
             Stage::LayerScan(l) if l < 3 => Some(l as usize),
@@ -80,7 +110,7 @@ pub(crate) mod test_support {
     use crate::directory::{
         Directory, FileHandle, InnerWritePtr, RamDirectory, TempFilePtr, WatchCallback, WatchHandle,
     };
-    use crate::vector::{current_vector_stage, Stage};
+    use crate::vector::{current_vector_read_kind, current_vector_stage, Stage, VectorReadKind};
 
     pub(crate) const PAGE_BYTES: usize = 8192;
 
@@ -107,11 +137,13 @@ pub(crate) mod test_support {
     pub(crate) struct PagedDirectory {
         inner: RamDirectory,
         pub(crate) reads: ReadLog,
+        pub(crate) read_kinds: Arc<Mutex<Vec<VectorReadKind>>>,
     }
     #[derive(Debug)]
     struct PagedFile {
         inner: Arc<dyn FileHandle>,
         reads: ReadLog,
+        read_kinds: Arc<Mutex<Vec<VectorReadKind>>>,
     }
     impl HasLen for PagedFile {
         fn len(&self) -> usize {
@@ -126,6 +158,10 @@ pub(crate) mod test_support {
                     .lock()
                     .unwrap()
                     .push((current_vector_stage(), range));
+                self.read_kinds
+                    .lock()
+                    .unwrap()
+                    .push(current_vector_read_kind());
             }
             Ok(bytes)
         }
@@ -140,6 +176,7 @@ pub(crate) mod test_support {
                 Ok(Arc::new(PagedFile {
                     inner,
                     reads: self.reads.clone(),
+                    read_kinds: self.read_kinds.clone(),
                 }))
             } else {
                 Ok(inner)
