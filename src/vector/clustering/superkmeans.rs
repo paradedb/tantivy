@@ -7,7 +7,7 @@ use superkmeans::{Dataset, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfi
 
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::clustering::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors, TrainingSource,
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors, VectorSource,
 };
 use crate::TantivyError;
 
@@ -19,8 +19,8 @@ pub const DEFAULT_TRAINING_SAMPLE_RATIO: f64 = 0.32;
 const TRAINING_BATCH_SIZE: usize = 4_096;
 const ASSIGN_BATCH_SIZE: usize = 40_960;
 
-/// Replays a [`TrainingSource`] as a SuperKMeans [`Dataset`].
-struct SourceDataset<'a>(&'a mut dyn TrainingSource);
+/// Replays a [`VectorSource`] as a SuperKMeans [`Dataset`].
+struct SourceDataset<'a>(&'a mut dyn VectorSource);
 
 impl Dataset for SourceDataset<'_> {
     type Error = TantivyError;
@@ -125,14 +125,10 @@ impl IvfClusterer for SuperKMeansClusterer {
         self.training_sample_ratio
     }
 
-    fn assign_batch_size(&self) -> usize {
-        ASSIGN_BATCH_SIZE
-    }
-
     fn train(
         &self,
         options: &VectorOptions,
-        source: &mut dyn TrainingSource,
+        source: &mut dyn VectorSource,
     ) -> crate::Result<IvfCentroids> {
         let dim = options.dim();
         let num_rows = source.num_rows();
@@ -179,20 +175,21 @@ impl IvfClusterer for SuperKMeansClusterer {
     fn assign(
         &self,
         options: &VectorOptions,
-        vectors: IvfVectors<'_>,
+        source: &mut dyn VectorSource,
         centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>> {
-        let IvfVectors::F32(vectors) = vectors;
-        let IvfCentroids::F32(centroids) = centroids;
-        if vectors.matrix.rows == 0 {
-            return Ok(Vec::new());
-        }
+        let mut assignments = Vec::with_capacity(source.num_rows());
         let kmeans = self.assigner(options.dim(), is_angular(options.metric()));
-        Ok(kmeans.assign(
-            vectors.matrix.values,
-            centroids.values.as_slice(),
-            vectors.matrix.rows,
-        ))
+        let IvfCentroids::F32(centroids) = centroids;
+        source.for_each_batch(ASSIGN_BATCH_SIZE, &mut |vectors| {
+            let IvfVectors::F32(batch) = vectors;
+            assignments.extend(kmeans.assign(
+                batch.matrix.values,
+                centroids.values.as_slice(),
+                batch.matrix.rows,
+            ));
+        })?;
+        Ok(assignments)
     }
 }
 
@@ -201,14 +198,14 @@ mod tests {
     use super::*;
     use crate::vector::clustering::{IvfMatrixView, IvfTrainingBatch, IvfVectorBatch};
 
-    /// In-memory [`TrainingSource`] that counts full scans.
+    /// In-memory [`VectorSource`] that counts full scans.
     struct VecSource {
         values: Vec<f32>,
         dim: usize,
         scans: usize,
     }
 
-    impl TrainingSource for VecSource {
+    impl VectorSource for VecSource {
         fn num_rows(&self) -> usize {
             self.values.len() / self.dim
         }
@@ -273,19 +270,9 @@ mod tests {
         assert!(source.scans > 1, "meso step should replay the source");
 
         let assignments = clusterer
-            .assign(
-                &options,
-                IvfVectors::F32(IvfVectorBatch {
-                    doc_ids: &(0..n as u32).collect::<Vec<_>>(),
-                    matrix: IvfMatrixView {
-                        values: &source.values,
-                        rows: n,
-                        dims: dim,
-                    },
-                }),
-                &IvfCentroids::F32(centroids.clone()),
-            )
+            .assign(&options, &mut source, &IvfCentroids::F32(centroids.clone()))
             .unwrap();
+        assert_eq!(assignments.len(), n);
         assert!(assignments.iter().all(|&c| (c as usize) < centroids.rows));
     }
 
@@ -308,7 +295,6 @@ mod tests {
     fn settings_default_and_set_independently() {
         let clusterer = SuperKMeansClusterer::default();
         assert_eq!(clusterer.training_sample_ratio(), 0.32);
-        assert_eq!(clusterer.assign_batch_size(), ASSIGN_BATCH_SIZE);
         assert_eq!(clusterer.config.max_leaf_size, DEFAULT_MAX_LEAF_SIZE);
 
         let clusterer = clusterer

@@ -17,29 +17,27 @@ pub trait IvfClusterer: Send + Sync + 'static {
     fn train(
         &self,
         options: &VectorOptions,
-        source: &mut dyn TrainingSource,
+        source: &mut dyn VectorSource,
     ) -> crate::Result<IvfCentroids>;
 
     /// Assigns vectors to centroids.
     fn assign(
         &self,
         options: &VectorOptions,
-        vectors: IvfVectors<'_>,
+        source: &mut dyn VectorSource,
         centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>>;
-
-    /// Rows per assign batch during merge.
-    fn assign_batch_size(&self) -> usize {
-        2048
-    }
 }
 
-/// Replayable, read-only view of the rows a clusterer trains on.
+/// Replayable, read-only view of vectors for IVF [`IvfClusterer::train`] or
+/// [`IvfClusterer::assign`].
 ///
 /// Rows are identified by their 0-based position in scan order. Every call to
-/// [`TrainingSource::for_each_batch`] yields the same rows in the same
-/// order, and [`TrainingSource::read_rows`] positions refer to that order.
-pub trait TrainingSource {
+/// [`VectorSource::for_each_batch`] yields the same rows in the same order, and
+/// [`VectorSource::read_rows`] positions refer to that order.
+///
+/// Merge builds a sample for training and the full set for assignment.
+pub trait VectorSource {
     /// Number of rows each scan yields.
     fn num_rows(&self) -> usize;
 
@@ -54,6 +52,10 @@ pub trait TrainingSource {
     ) -> crate::Result<()>;
 
     /// Loads the rows at the given scan positions, in the given order.
+    ///
+    /// Used by streaming trainers that revisit a subset after a full scan
+    /// (for example SuperKMeans meso clusters). Assign typically only needs
+    /// [`Self::for_each_batch`].
     fn read_rows(&mut self, rows: &[u32]) -> crate::Result<IvfTrainingVectors>;
 }
 

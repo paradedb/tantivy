@@ -7,7 +7,7 @@ use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
 use crate::query::{AllQuery, EnableScoring, Query, TermQuery};
 use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
-use crate::vector::clustering::{IvfVectors, TrainingSource};
+use crate::vector::clustering::{IvfVectors, VectorSource};
 use crate::vector::diagnostics::{
     VectorEstimatorMeasurements, VectorEstimatorQuery, VectorEstimatorSource,
 };
@@ -26,6 +26,7 @@ use crate::{Index, TantivyDocument};
 fn quantization_merge_source_has_no_estimator_analysis_entrypoint() {
     let production_source = [
         include_str!("mod.rs"),
+        include_str!("source.rs"),
         include_str!("train.rs"),
         include_str!("assign.rs"),
         include_str!("encode.rs"),
@@ -321,7 +322,7 @@ impl IvfClusterer for QuantFixtureClusterer {
     fn train(
         &self,
         options: &VectorOptions,
-        _source: &mut dyn TrainingSource,
+        _source: &mut dyn VectorSource,
     ) -> crate::Result<IvfCentroids> {
         assert_eq!(options.dim(), self.dim);
         let values = match self.metric {
@@ -346,19 +347,20 @@ impl IvfClusterer for QuantFixtureClusterer {
     fn assign(
         &self,
         _options: &VectorOptions,
-        vectors: IvfVectors<'_>,
+        source: &mut dyn VectorSource,
         _centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>> {
-        let IvfVectors::F32(vectors) = vectors;
-        Ok(vectors
-            .matrix
-            .values
-            .chunks_exact(self.dim)
-            .map(|row| match self.metric {
-                Metric::L2 => u32::from(row[0] >= 0.5),
-                Metric::Cosine | Metric::Dot => u32::from(row[1] > row[0]),
-            })
-            .collect())
+        let mut assignments = Vec::with_capacity(source.num_rows());
+        source.for_each_batch(source.num_rows().max(1), &mut |vectors| {
+            let IvfVectors::F32(batch) = vectors;
+            for row in batch.matrix.values.chunks_exact(self.dim) {
+                assignments.push(match self.metric {
+                    Metric::L2 => u32::from(row[0] >= 0.5),
+                    Metric::Cosine | Metric::Dot => u32::from(row[1] > row[0]),
+                });
+            }
+        })?;
+        Ok(assignments)
     }
 }
 

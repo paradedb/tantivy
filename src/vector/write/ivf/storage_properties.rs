@@ -1,5 +1,6 @@
-use crate::vector::write::ivf::tests::*;
+use super::*;
 use crate::schema::Value;
+use crate::vector::clustering::VectorSource;
 use crate::vector::quantization::{corrected_quantized_estimate, ArithmeticError};
 use crate::vector::storage::io::test_support::{PagedDirectory, PAGE_BYTES};
 
@@ -11,7 +12,7 @@ impl IvfClusterer for FixedClusters {
     fn training_sample_ratio(&self) -> f32 {
         1.0
     }
-    fn train(&self, _: &VectorOptions, _: &mut dyn TrainingSource) -> crate::Result<IvfCentroids> {
+    fn train(&self, _: &VectorOptions, _: &mut dyn VectorSource) -> crate::Result<IvfCentroids> {
         let mut values = vec![0.0; 4 * DIM];
         for cluster in 0..4 {
             values[cluster * DIM + cluster] = 1.0;
@@ -25,16 +26,18 @@ impl IvfClusterer for FixedClusters {
     fn assign(
         &self,
         _: &VectorOptions,
-        vectors: IvfVectors<'_>,
+        source: &mut dyn VectorSource,
         _: &IvfCentroids,
     ) -> crate::Result<Vec<u32>> {
-        let IvfVectors::F32(vectors) = vectors;
-        Ok(vectors
-            .matrix
-            .values
-            .chunks_exact(DIM)
-            .map(|row| (0..4).max_by(|&a, &b| row[a].total_cmp(&row[b])).unwrap() as u32)
-            .collect())
+        let mut assignments = Vec::with_capacity(source.num_rows());
+        source.for_each_batch(source.num_rows().max(1), &mut |vectors| {
+            let IvfVectors::F32(batch) = vectors;
+            for row in batch.matrix.values.chunks_exact(DIM) {
+                assignments
+                    .push((0..4).max_by(|&a, &b| row[a].total_cmp(&row[b])).unwrap() as u32);
+            }
+        })?;
+        Ok(assignments)
     }
 }
 fn present(doc: usize) -> bool {

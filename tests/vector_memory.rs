@@ -16,7 +16,7 @@ use tantivy::schema::{
     Field, IndexRecordOption, Metric, Schema, VectorDType, VectorOptions, STRING,
 };
 use tantivy::vector::clustering::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors, TrainingSource,
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors, VectorSource,
 };
 use tantivy::vector::{
     LocatedPath, ProbeParams, ProbeStats, Selectivity, VectorQuantizationConfig,
@@ -139,7 +139,7 @@ impl IvfClusterer for RoundRobinClusterer {
     fn train(
         &self,
         options: &VectorOptions,
-        source: &mut dyn TrainingSource,
+        source: &mut dyn VectorSource,
     ) -> tantivy::Result<IvfCentroids> {
         let rows: Vec<u32> = (0..self.clusters as u32).collect();
         let IvfTrainingVectors::F32(batch) = source.read_rows(&rows)?;
@@ -154,13 +154,19 @@ impl IvfClusterer for RoundRobinClusterer {
     fn assign(
         &self,
         _options: &VectorOptions,
-        vectors: IvfVectors<'_>,
+        source: &mut dyn VectorSource,
         _centroids: &IvfCentroids,
     ) -> tantivy::Result<Vec<u32>> {
-        let IvfVectors::F32(vectors) = vectors;
-        Ok((0..vectors.matrix.rows)
-            .map(|row| (row % self.clusters) as u32)
-            .collect())
+        let mut assignments = Vec::with_capacity(source.num_rows());
+        let mut offset = 0usize;
+        source.for_each_batch(source.num_rows().max(1), &mut |vectors| {
+            let IvfVectors::F32(batch) = vectors;
+            for row in 0..batch.matrix.rows {
+                assignments.push(((offset + row) % self.clusters) as u32);
+            }
+            offset += batch.matrix.rows;
+        })?;
+        Ok(assignments)
     }
 }
 

@@ -38,6 +38,7 @@ mod assign;
 #[cfg(test)]
 mod build_tests;
 mod encode;
+mod source;
 #[cfg(test)]
 mod tests;
 mod train;

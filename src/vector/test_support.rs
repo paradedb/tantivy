@@ -19,7 +19,7 @@ use crate::schema::{
     STRING,
 };
 use crate::vector::clustering::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfVectors, TrainingSource,
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfVectors, VectorSource,
 };
 use crate::vector::params::ProbeParams;
 use crate::vector::router::candidate::Candidate;
@@ -78,7 +78,7 @@ impl IvfClusterer for NearestClusterer {
     fn train(
         &self,
         options: &VectorOptions,
-        _: &mut dyn TrainingSource,
+        _: &mut dyn VectorSource,
     ) -> crate::Result<IvfCentroids> {
         Ok(IvfCentroids::F32(IvfMatrix {
             values: self.centroids.iter().flatten().copied().collect(),
@@ -90,16 +90,18 @@ impl IvfClusterer for NearestClusterer {
     fn assign(
         &self,
         options: &VectorOptions,
-        vectors: IvfVectors<'_>,
+        source: &mut dyn VectorSource,
         _: &IvfCentroids,
     ) -> crate::Result<Vec<u32>> {
-        let IvfVectors::F32(vectors) = vectors;
-        Ok(vectors
-            .matrix
-            .values
-            .chunks_exact(options.dim())
-            .map(|vector| nearest(vector, &self.centroids) as u32)
-            .collect())
+        let dim = options.dim();
+        let mut assignments = Vec::with_capacity(source.num_rows());
+        source.for_each_batch(source.num_rows().max(1), &mut |vectors| {
+            let IvfVectors::F32(batch) = vectors;
+            for vector in batch.matrix.values.chunks_exact(dim) {
+                assignments.push(nearest(vector, &self.centroids) as u32);
+            }
+        })?;
+        Ok(assignments)
     }
 }
 
