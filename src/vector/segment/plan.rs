@@ -35,19 +35,23 @@ impl Source {
 pub(crate) struct PlanReport {
     pub(crate) segment_rows: usize,
     pub(crate) segment_clusters: usize,
+    /// The located-path cap in matches; 0 with the located path off.
+    pub(crate) located_cap: usize,
 }
 
 /// One segment's search plan.
 pub(crate) struct SegmentPlan {
+    /// Zero when nothing can match before the budget resolves.
     pub(crate) budget: WorkBudget,
-    pub(crate) source: Source,
+    /// `None` when nothing can match.
+    pub(crate) source: Option<Source>,
     pub(crate) report: PlanReport,
 }
 
 impl SegmentPlan {
     /// Resolves the budget once, drains the filter under the located cap, and picks the source.
     ///
-    /// Returns `None` when nothing can match: `top_n` is zero, the segment holds no clusters or
+    /// Plans no source when nothing can match: `top_n` is zero, the segment holds no clusters or
     /// docs, or the filter matches nothing.
     pub(crate) fn build(
         params: &AdaptiveProbeParams,
@@ -55,56 +59,62 @@ impl SegmentPlan {
         weight: &dyn Weight,
         segment: &SegmentReader,
         top_n: usize,
-    ) -> crate::Result<Option<Self>> {
+    ) -> crate::Result<Self> {
         let max_doc = segment.max_doc();
-        if top_n == 0 || max_doc == 0 || index.num_clusters() == 0 {
-            return Ok(None);
-        }
         let clusters = index.num_clusters();
+        let report = |located_cap| PlanReport {
+            segment_rows: index.num_rows(),
+            segment_clusters: clusters,
+            located_cap,
+        };
+        if top_n == 0 || max_doc == 0 || clusters == 0 {
+            return Ok(Self {
+                budget: WorkBudget::default(),
+                source: None,
+                report: report(0),
+            });
+        }
         // Capacity counts native docs as written: deleted rows still charge on first touch.
         let (budget, n_avg, x) = params.resolved_work_budget(clusters, index.num_docs())?;
         debug_assert!(n_avg > 0.0);
-        let cap = located_cap(params.located, max_doc);
+        let cap = located_cap(params.located, max_doc, budget, n_avg, x);
         let source = {
             let _filter = enter_vector_stage(Stage::NonVectorSearch);
             collect_segment_filter(weight, segment, max_doc, cap)?
         };
-        if source.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(Self {
+        Ok(Self {
             budget: WorkBudget {
                 total: WorkUnits::new(budget),
                 per_cluster: WorkUnits::new(x),
                 per_row: WorkUnits::new((1.0 - x) / n_avg),
             },
-            source,
-            report: PlanReport {
-                segment_rows: index.num_rows(),
-                segment_clusters: clusters,
-            },
-        }))
+            source: (!source.is_empty()).then_some(source),
+            report: report(cap),
+        })
     }
 
     /// Upper bound on rows the scan will admit, for sizing its columns.
     pub(crate) fn capacity_hint(&self) -> usize {
         let rows = match &self.source {
-            Source::Router(_) => {
+            Some(Source::Router(_)) => {
                 (self.budget.total.get() / self.budget.per_row.get()).ceil() as usize
             }
-            Source::FilterMatches(docs) => docs.len(),
+            Some(Source::FilterMatches(docs)) => docs.len(),
+            None => 0,
         };
         rows.min(self.report.segment_rows)
     }
 }
 
-/// The most matches, deleted ones included, a filter may have and take the located path.
-fn located_cap(located: LocatedPath, max_doc: DocId) -> usize {
+/// The most matches, deleted ones included, a filter may have and take the located path; `Auto`
+/// prices the work budget `(budget, n_avg, x)` the routed path runs against.
+fn located_cap(located: LocatedPath, max_doc: DocId, budget: f64, n_avg: f64, x: f64) -> usize {
     match located {
         LocatedPath::Off => 0,
         LocatedPath::MaxSelectivity(selectivity) => {
             (f64::from(selectivity.get()) * f64::from(max_doc)).floor() as usize
         }
+        LocatedPath::Auto => (budget * n_avg / (1.0 - x)).floor() as usize,
     }
 }
 
@@ -163,14 +173,15 @@ mod tests {
     use super::*;
     use crate::query::{AllQuery, BooleanQuery, Occur, Query};
     use crate::schema::Metric;
-    use crate::vector::ivf::{AdaptiveProbeParams, Selectivity};
+    use crate::vector::ivf::{AdaptiveProbeParams, Selectivity, WorkModel};
+    use crate::vector::stats::AccessPath;
     use crate::vector::test_support::{DocsWeight, FixtureSpec};
     use crate::vector::tests::exhaustive_params;
 
     /// The plan resolves the budget once, builds no bitset for match-all filters, sees an empty
     /// filter or `top_n == 0` as nothing to search, and sizes the scan from the budget. A filter
     /// with at most the located cap of matches, deleted ones included, is located; one more
-    /// spills into the routed bitset, and match-all always routes.
+    /// spills into the routed bitset, match-all always routes, and every mode reports its cap.
     #[test]
     fn segment_plan() -> crate::Result<()> {
         let fixture = FixtureSpec::ivf(
@@ -209,8 +220,9 @@ mod tests {
         // The source as `(located, matches)`; `None` matches for a match-all routed filter.
         let plan_with = |filter: &dyn Query, top_n: usize, params: &AdaptiveProbeParams| {
             fixture.with_segment(filter, &[0.0, 0.0], top_n, params, |seg| {
-                Ok(seg.plan()?.map(|plan| {
-                    let source = match &plan.source {
+                let plan = seg.plan()?;
+                Ok(plan.source.as_ref().map(|source| {
+                    let source = match source {
                         Source::Router(filter) => match filter {
                             DocFilter::All => (false, None),
                             DocFilter::Docs(docs) => (false, Some(docs.len())),
@@ -308,6 +320,52 @@ mod tests {
         assert_eq!(Selectivity::new(0.0), None);
         assert_eq!(Selectivity::new(1.5), None);
         assert_eq!(Selectivity::new(f32::NAN), None);
+
+        // `Auto` caps at the rows the routed budget buys: matches at the cap are located, one more
+        // routes, and a filter matching nothing still reports the cap.
+        let ivf_docs = ivf.num_docs();
+        for work_model in [None, Some(WorkModel { n_avg: 61.5 })] {
+            let auto = AdaptiveProbeParams {
+                max_probe_fraction: 0.2,
+                min_probe_clusters: 1,
+                work_model,
+                located: LocatedPath::Auto,
+                ..AdaptiveProbeParams::default()
+            };
+            let (budget, n_avg, x) = auto.resolved_work_budget(ivf.num_clusters(), ivf_docs)?;
+            let cap = (budget * n_avg / (1.0 - x)).floor() as usize;
+            assert!(cap > 0 && cap + 1 < segment.max_doc() as usize, "cap {cap}");
+            for (matches, path) in [
+                (cap, AccessPath::Located),
+                (cap + 1, AccessPath::Routed),
+                (0, AccessPath::Routed),
+            ] {
+                let weight = DocsWeight {
+                    max_doc: segment.max_doc(),
+                    docs: (0..matches as DocId).collect(),
+                };
+                let (_, stats) = fixture.run_segment(0, &weight, &[0.0, 0.0], 10, auto.clone())?;
+                let case = format!("{work_model:?} matches={matches}");
+                assert_eq!(
+                    (stats.located_cap, stats.access_path),
+                    (cap, path),
+                    "{case}"
+                );
+            }
+        }
+        // Every mode reports its cap, and an unfiltered query routes.
+        for (located, cap) in [(LocatedPath::Off, 0), (capped(9).located, 9)] {
+            let params = AdaptiveProbeParams {
+                located,
+                ..params.clone()
+            };
+            let (_, stats) =
+                fixture.run_segment(0, fixture.all()?.as_ref(), &[0.0, 0.0], 10, params)?;
+            assert_eq!(
+                (stats.located_cap, stats.access_path),
+                (cap, AccessPath::Routed)
+            );
+        }
 
         let (hits, stats) =
             fixture.run_segment(0, fixture.all()?.as_ref(), &[0.0, 0.0], 0, params)?;

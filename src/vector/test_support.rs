@@ -44,7 +44,7 @@ pub(crate) struct SegmentRun<'a> {
 
 impl SegmentRun<'_> {
     /// The segment's search plan.
-    pub(crate) fn plan(&self) -> crate::Result<Option<SegmentPlan>> {
+    pub(crate) fn plan(&self) -> crate::Result<SegmentPlan> {
         SegmentPlan::build(
             self.searcher.params(),
             self.index,
