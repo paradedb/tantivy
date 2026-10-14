@@ -20,7 +20,7 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
-use crate::vector::index_reader::VectorFieldReader;
+use crate::vector::storage::reader::VectorFieldReader;
 use crate::vector::{VectorColMetadata, VectorIndexReader};
 use crate::{DocId, Opstamp};
 
@@ -218,7 +218,7 @@ impl SegmentReader {
     /// Checks the vector format header and each vector field's IVF router kind, without opening
     /// vector readers. Segments without vector files are accepted.
     pub fn validate_vector_format(&self) -> crate::Result<()> {
-        crate::vector::header::check_vector_format(
+        crate::vector::storage::header::check_vector_format(
             |component| self.open_read(component),
             self.schema(),
         )

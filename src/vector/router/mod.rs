@@ -3,17 +3,19 @@ use std::io::{self, Write};
 
 use common::{BinarySerializable, HasLen};
 
-use super::ivf::{
-    Candidate, InMemoryStore, IvfCentroids, LazyStore, MultiLevelIvf, RecallEstimator,
-};
 use crate::directory::error::Incompatibility;
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
-use crate::vector::header::VectorFileVersion;
+use crate::vector::clustering::IvfCentroids;
+use crate::vector::router::candidate::Candidate;
+use crate::vector::router::stacked::aps::RecallEstimator;
+use crate::vector::router::stacked::levels::{InMemoryStore, IvfIndex as MultiLevelIvf, LazyStore};
 use crate::TantivyError;
 
+pub(crate) mod arena;
+pub(crate) mod candidate;
 mod exact;
-mod stacked;
+pub(crate) mod stacked;
 
 /// The routing structure new IVF segments build. Codes are persisted; 0 belonged to the removed
 /// graph router and is never reused.
@@ -55,18 +57,10 @@ impl RouterKind {
     /// with. The configured router only decides what new segments build, so
     /// an index may hold segments routed by different kinds.
     pub(crate) fn open(
-        file_version: VectorFileVersion,
         slot: FileSlice,
         centroids: FileSlice,
         options: &VectorOptions,
     ) -> crate::Result<OpenedRouter> {
-        if file_version != VectorFileVersion::V3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("routers require vector file version V3, found {file_version:?}"),
-            )
-            .into());
-        }
         if slot.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -92,7 +86,7 @@ impl fmt::Display for RouterKind {
     }
 }
 
-pub(crate) enum Router<S: super::VectorArena<Elem = f32>> {
+pub(crate) enum Router<S: crate::vector::VectorArena<Elem = f32>> {
     Stacked(MultiLevelIvf<S, S>),
     Exact(exact::ExactRouter<S>),
 }
@@ -127,7 +121,7 @@ pub struct RoutingParams {
     pub k: usize,
     /// Stacked-router recall target in `(0, 1]`. `1.0` disables APS and
     /// routes with the fixed nprobe fractions. APS is also disabled above
-    /// [`APS_MAX_DIM`](crate::vector::ivf::APS_MAX_DIM) regardless of this
+    /// [`APS_MAX_DIM`](crate::vector::router::stacked::aps::APS_MAX_DIM) regardless of this
     /// value.
     pub recall: f32,
 }
@@ -287,12 +281,7 @@ mod tests {
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<_>>(),
         };
-        let opened = RouterKind::open(
-            VectorFileVersion::V3,
-            FileSlice::from(bytes),
-            FileSlice::from(rows),
-            &options,
-        )?;
+        let opened = RouterKind::open(FileSlice::from(bytes), FileSlice::from(rows), &options)?;
         let mut ranking = opened.rank(&[1.1], Metric::L2, RoutingParams::default());
         assert_eq!(ranking.next().unwrap().node, 1);
         assert!(matches!(
@@ -333,12 +322,7 @@ mod tests {
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<_>>(),
         };
-        RouterKind::open(
-            VectorFileVersion::V3,
-            FileSlice::from(bytes),
-            FileSlice::from(rows),
-            &options,
-        )
+        RouterKind::open(FileSlice::from(bytes), FileSlice::from(rows), &options)
     }
 
     fn stacked_metrics(metrics: RouterMetrics) -> (usize, usize, usize, f32) {
@@ -382,7 +366,7 @@ mod tests {
     /// so the caller's probe budget limits `candidate_count`.
     #[test]
     fn stacked_ranking_falls_back_to_nprobe_above_dim_cap() -> crate::Result<()> {
-        let dim = crate::vector::ivf::APS_MAX_DIM + 1;
+        let dim = crate::vector::router::stacked::aps::APS_MAX_DIM + 1;
         let opened = open_stacked(dim, 32)?;
         let query = vec![0.0f32; dim];
         let params = RoutingParams { k: 2, recall: 0.5 };
@@ -410,11 +394,19 @@ mod tests {
         assert_eq!(stacked::effective_recall(2, Metric::L2, 1.5), 1.0);
         assert_eq!(stacked::effective_recall(2, Metric::L2, f32::NAN), 1.0);
         assert_eq!(
-            stacked::effective_recall(crate::vector::ivf::APS_MAX_DIM, Metric::L2, 0.9),
+            stacked::effective_recall(
+                crate::vector::router::stacked::aps::APS_MAX_DIM,
+                Metric::L2,
+                0.9
+            ),
             0.9
         );
         assert_eq!(
-            stacked::effective_recall(crate::vector::ivf::APS_MAX_DIM + 1, Metric::L2, 0.9),
+            stacked::effective_recall(
+                crate::vector::router::stacked::aps::APS_MAX_DIM + 1,
+                Metric::L2,
+                0.9
+            ),
             1.0
         );
     }
@@ -431,12 +423,7 @@ mod tests {
                 .into_iter()
                 .flat_map(f32::to_le_bytes)
                 .collect();
-            RouterKind::open(
-                VectorFileVersion::V3,
-                FileSlice::from(slot),
-                FileSlice::from(rows),
-                &options,
-            )
+            RouterKind::open(FileSlice::from(slot), FileSlice::from(rows), &options)
         };
         for kind in [RouterKind::Stacked, RouterKind::Exact] {
             let mut centroids = centroids();
@@ -459,19 +446,5 @@ mod tests {
             );
         }
         Ok(())
-    }
-
-    #[test]
-    fn pre_v3_router_format_is_rejected() {
-        let options = VectorOptions::new(1, Metric::L2);
-        let error = RouterKind::open(
-            VectorFileVersion::V2,
-            FileSlice::empty(),
-            FileSlice::empty(),
-            &options,
-        )
-        .err()
-        .expect("pre-V3 router formats must fail");
-        assert!(error.to_string().contains("require vector file version V3"));
     }
 }

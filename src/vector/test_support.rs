@@ -15,13 +15,15 @@ use crate::query::{
     Weight,
 };
 use crate::schema::{Field, IndexRecordOption, Schema, Term, Value, STORED, STRING};
-use crate::vector::ivf::{AdaptiveProbeParams, Candidate, IvfIndex};
-use crate::vector::prepared::{QuantizedQueryCtx, VectorQuery};
+use crate::vector::params::AdaptiveProbeParams;
+use crate::vector::router::candidate::Candidate;
 use crate::vector::router::with_test_clusters;
-use crate::vector::scan::plan::PlanOverride;
-use crate::vector::scan::ScanTrace;
-use crate::vector::segment::plan::SegmentPlan;
-use crate::vector::storage_io::test_support::{with_unarmed_log, PagedDirectory};
+use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
+use crate::vector::search::scan::plan::PlanOverride;
+use crate::vector::search::scan::ScanTrace;
+use crate::vector::search::segment::plan::SegmentPlan;
+use crate::vector::storage::centroids::IvfIndex;
+use crate::vector::storage::io::test_support::{with_unarmed_log, PagedDirectory};
 use crate::vector::tests::TestVectorIndex;
 use crate::vector::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors, Metric, ProbeStats,

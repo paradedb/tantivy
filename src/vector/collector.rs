@@ -1,23 +1,14 @@
 //! Top-N vector-similarity collection.
 //!
 //! IVF drives its own cluster iteration, so [`Collector::collect_segment`] hands the filter
-//! `Weight` to the segment's [`VectorBackend`](super::backend::VectorBackend) instead of pulling
-//! docs. A secondary key is an ordinary `SortKeyComputer` composed into the heap's
+//! `Weight` to the segment's [`VectorBackend`](crate::vector::search::VectorBackend) instead of
+//! pulling docs. A secondary key is an ordinary `SortKeyComputer` composed into the heap's
 //! `(similarity, tie_break)` order, the same rule as the pull-model path.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::backend::VectorBackend;
-use super::index_reader::QuantizedFieldReader;
-use super::ivf::AdaptiveProbeParams;
-use super::metadata::VectorColMetadata;
-use super::prepared::{QuantizedQueryCtx, VectorQuery};
-use super::stats::ProbeStats;
-use super::telemetry::take_stage_totals;
-use super::tie_break::NoTieBreak;
-use super::{enter_vector_stage, Stage, VectorElement};
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{
     compare_for_top_k, Collector, ComparableDoc, SegmentCollector, SegmentSortKeyComputer,
@@ -26,6 +17,15 @@ use crate::collector::{
 use crate::index::SegmentReader;
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Metric, Schema};
+use crate::vector::params::AdaptiveProbeParams;
+use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
+use crate::vector::search::VectorBackend;
+use crate::vector::stats::ProbeStats;
+use crate::vector::storage::metadata::VectorColMetadata;
+use crate::vector::storage::quantized::QuantizedFieldReader;
+use crate::vector::telemetry::take_stage_totals;
+use crate::vector::tie_break::NoTieBreak;
+use crate::vector::{enter_vector_stage, Stage, VectorElement};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal, TantivyError};
 
 // --- Query preparation ---
@@ -34,7 +34,7 @@ use crate::{DocAddress, DocId, Score, SegmentOrdinal, TantivyError};
 #[derive(Clone, Debug)]
 struct PreparedKey(Arc<VectorColMetadata>);
 impl PreparedKey {
-    fn query_fields(&self) -> Option<(u32, u8, &[super::metadata::Quantizer])> {
+    fn query_fields(&self) -> Option<(u32, u8, &[crate::vector::storage::metadata::Quantizer])> {
         match self.0.as_ref() {
             VectorColMetadata::Plain(_) => None,
             VectorColMetadata::Quantized { field, layers } => {
@@ -936,10 +936,10 @@ mod ivf_e2e_tests {
 mod prepared_key_tests {
     use super::*;
     use crate::schema::{Metric, VectorOptions};
-    use crate::vector::metadata::{Grid, Partition, Quantizer, Rotation};
     use crate::vector::quantization::{
         VectorNormPolicy, VectorQuantizationConfig, VectorQuantizationLayer,
     };
+    use crate::vector::storage::metadata::{Grid, Partition, Quantizer, Rotation};
     fn metadata(metric: Metric, schedule: &[u8]) -> VectorColMetadata {
         let opts = VectorOptions::new(100, metric);
         let config = VectorQuantizationConfig::materialize(
@@ -1019,7 +1019,7 @@ mod prepared_key_tests {
         };
         let mut other = g.clone();
         other.points[0] = -0.0;
-        let quant = |grid| super::super::metadata::Quantizer::GridPlane {
+        let quant = |grid| crate::vector::storage::metadata::Quantizer::GridPlane {
             bits: 2,
             rotation: Rotation::None,
             grid,

@@ -2,14 +2,14 @@
 //! serialized flat for EXPLAIN.
 
 use crate::vector::router::RouterMetrics;
-use crate::vector::scan::ScanReport;
+use crate::vector::search::scan::ScanReport;
 #[cfg(test)]
-use crate::vector::scan::ScanTrace;
-use crate::vector::segment::plan::PlanReport;
-use crate::vector::source::controller::ProbeTermination;
-use crate::vector::source::matches::MatchReport;
-use crate::vector::source::router::RouterReport;
-use crate::vector::source::SourceReport;
+use crate::vector::search::scan::ScanTrace;
+use crate::vector::search::segment::plan::PlanReport;
+use crate::vector::search::source::controller::ProbeTermination;
+use crate::vector::search::source::matches::MatchReport;
+use crate::vector::search::source::router::RouterReport;
+use crate::vector::search::source::SourceReport;
 use crate::vector::telemetry::StageTotals;
 use crate::vector::{Stage, VectorIoStats};
 
@@ -433,9 +433,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::vector::scan::LayerReport;
-    use crate::vector::source::controller::ProbeOutcome;
-    use crate::vector::source::router::RouterCounters;
+    use crate::vector::search::scan::LayerReport;
+    use crate::vector::search::source::controller::ProbeOutcome;
+    use crate::vector::search::source::router::RouterCounters;
 
     fn keys(stats: &ProbeStats) -> BTreeSet<String> {
         serde_json::to_value(stats)

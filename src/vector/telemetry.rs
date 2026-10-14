@@ -5,8 +5,8 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::time::Instant;
 
-use super::quantization::MAX_QUANTIZATION_LAYERS;
-use super::storage_io::VectorIoStats;
+use crate::vector::quantization::MAX_QUANTIZATION_LAYERS;
+use crate::vector::storage::io::VectorIoStats;
 
 /// Logical stage of a vector search.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

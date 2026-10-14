@@ -301,7 +301,8 @@ pub(crate) fn normalize_bytes_inplace<T: VectorElement>(row: &mut [u8]) -> Norma
 /// L2-normalizes `row` in place when `opts` requires write-time unit normalization (see
 /// [`VectorOptions::needs_normalization`]).
 ///
-/// Cosine scoring ([`VectorQuery::score_row`](crate::vector::prepared::VectorQuery::score_row))
+/// Cosine scoring
+/// ([`VectorQuery::score_row`](crate::vector::search::prepared::VectorQuery::score_row))
 /// is then `dot * inv_norm_q`, with no per-row norm pass.
 pub(crate) fn maybe_normalize_bytes(opts: &VectorOptions, row: &mut [u8]) -> NormalizeOutcome {
     debug_assert_eq!(row.len(), opts.bytes_per_vector());
