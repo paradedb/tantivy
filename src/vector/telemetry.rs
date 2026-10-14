@@ -136,7 +136,6 @@ struct Meter {
     running: VectorStage,
     since: Instant,
     totals: StageTotals,
-    fallbacks_at_start: [u64; FALLBACK_LAYERS],
 }
 
 impl Meter {
@@ -145,7 +144,6 @@ impl Meter {
             running: VectorStage::Other,
             since: Instant::now(),
             totals: StageTotals::default(),
-            fallbacks_at_start: quant::cascade::sign_word_fallback_counts(),
         }
     }
 
@@ -165,10 +163,6 @@ impl Meter {
     /// Charges the final time and returns the totals.
     fn finish(mut self) -> StageTotals {
         self.charge_time();
-        let fallbacks = quant::cascade::sign_word_fallback_counts();
-        for (layer, count) in self.totals.sign_word_fallbacks.iter_mut().enumerate() {
-            *count = fallbacks[layer] - self.fallbacks_at_start[layer];
-        }
         self.totals
     }
 }
@@ -236,6 +230,22 @@ pub(crate) fn charge_read(bytes: u64, storage_blocks: u64) {
             io.reads += 1;
             io.bytes_read += bytes;
             io.storage_blocks += storage_blocks;
+        }
+    });
+}
+
+/// Charges `count` sign-word fallbacks in `layer`; does nothing outside a [`measure`].
+pub(crate) fn charge_fallbacks(layer: usize, count: u64) {
+    // Aligned codes, the usual case, leave the thread-local untouched.
+    if count == 0 {
+        return;
+    }
+    SCOPE.with_borrow_mut(|scope| {
+        if let Some(fallbacks) = scope
+            .as_mut()
+            .and_then(|meter| meter.totals.sign_word_fallbacks.get_mut(layer))
+        {
+            *fallbacks += count;
         }
     });
 }
@@ -359,6 +369,20 @@ mod tests {
         assert_eq!(totals.io(VectorStage::Other).reads, 0);
         assert_eq!(totals.io(VectorStage::Routing).reads, 0);
         assert_eq!(totals.time_ns(VectorStage::Routing), 0);
+    }
+
+    /// Fallbacks charge the meter in scope by layer, and nothing outside one.
+    #[test]
+    fn fallbacks_charge_the_meter_in_scope() {
+        charge_fallbacks(1, 5);
+        let ((), totals) = measure(|| {
+            charge_fallbacks(1, 2);
+            charge_fallbacks(2, 1);
+        });
+        let fallbacks: Vec<u64> = (0..FALLBACK_LAYERS)
+            .map(|layer| totals.sign_word_fallbacks(layer))
+            .collect();
+        assert_eq!(fallbacks, [0, 2, 1]);
     }
 
     /// A thread without its own measure charges nothing to the parent's meter.
