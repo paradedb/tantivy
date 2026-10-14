@@ -9,7 +9,7 @@ use crate::query::{AllQuery, EnableScoring, Query, TermQuery};
 use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
 use crate::vector::clustering::{IvfTrainingVectors, IvfVectors};
 use crate::vector::distance::maybe_normalize_bytes;
-use crate::vector::params::{AdaptiveProbeParams, LocatedPath};
+use crate::vector::params::{LocatedPath, ProbeParams};
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
 use crate::vector::storage::blocks::block_len;
 use crate::vector::storage::header::VectorEntry;
@@ -148,8 +148,8 @@ fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
         assert!(!vector.id_map_initialized());
         let hits = searcher.search(
             &AllQuery,
-            &TopDocsByVectorSimilarity::new(field, vec![0.25; 65], 3).with_adaptive_params(
-                AdaptiveProbeParams {
+            &TopDocsByVectorSimilarity::new(field, vec![0.25; 65], 3).with_probe_params(
+                ProbeParams {
                     max_probe_fraction: 1.0,
                     min_probe_clusters: 2,
                     ..Default::default()
@@ -776,7 +776,7 @@ fn run_quantized_matrix_query(
     };
     let expected = fixture_exact_hits(index, metric, &query, Some(filter), TOP_N)?;
     let collector = TopDocsByVectorSimilarity::new(field, query.clone(), TOP_N)
-        .with_adaptive_params(AdaptiveProbeParams {
+        .with_probe_params(ProbeParams {
             max_probe_fraction: 1.0,
             min_probe_clusters: 2,
             exact_plan: false,
@@ -844,7 +844,7 @@ fn run_quantized_matrix_query(
     );
     for max_probe_fraction in [0.25, 1.0] {
         const ELIGIBILITY_TOP_N: usize = 8;
-        let params = AdaptiveProbeParams {
+        let params = ProbeParams {
             max_probe_fraction,
             min_probe_clusters: 2,
             exact_plan: false,
@@ -854,13 +854,13 @@ fn run_quantized_matrix_query(
         let quantized = searcher.search(
             filter,
             &TopDocsByVectorSimilarity::new(field, query.clone(), ELIGIBILITY_TOP_N)
-                .with_adaptive_params(params.clone())
+                .with_probe_params(params.clone())
                 .with_max_scan_levels(depth),
         )?;
         let level0 = searcher.search(
             filter,
             &TopDocsByVectorSimilarity::new(field, query.clone(), ELIGIBILITY_TOP_N)
-                .with_adaptive_params(params)
+                .with_probe_params(params)
                 .with_max_scan_levels(0),
         )?;
         assert_eq!(
@@ -983,7 +983,7 @@ fn settings_v3_builds_v4_and_readers_ignore_global_changes() -> crate::Result<()
 fn level_zero_matches_unquantized_ivf() -> crate::Result<()> {
     const DIM: usize = 64;
     let query = vec![0.05_f32; DIM];
-    let params = AdaptiveProbeParams {
+    let params = ProbeParams {
         max_probe_fraction: 0.5,
         min_probe_clusters: 1,
         exact_plan: false,
@@ -995,11 +995,10 @@ fn level_zero_matches_unquantized_ivf() -> crate::Result<()> {
     let field = unquantized.schema().get_field("embedding")?;
     let unquantized_fruit = unquantized.reader()?.searcher().search(
         &AllQuery,
-        &TopDocsByVectorSimilarity::new(field, query.clone(), 3)
-            .with_adaptive_params(params.clone()),
+        &TopDocsByVectorSimilarity::new(field, query.clone(), 3).with_probe_params(params.clone()),
     )?;
     let level_zero_collector = TopDocsByVectorSimilarity::new(field, query, 3)
-        .with_adaptive_params(params)
+        .with_probe_params(params)
         .with_max_scan_levels(0);
     let quantized_reader = quantized.reader()?;
     let quantized_searcher = quantized_reader.searcher();
@@ -1137,7 +1136,7 @@ fn mixed_segments_share_preparation_by_stored_metadata() -> crate::Result<()> {
         assert_eq!(searcher.segment_readers().len(), 3);
         let make_collector = || {
             TopDocsByVectorSimilarity::new(field, fixture_search_query(Metric::L2, 64), 5)
-                .with_adaptive_params(AdaptiveProbeParams {
+                .with_probe_params(ProbeParams {
                     max_probe_fraction: 1.0,
                     min_probe_clusters: 2,
                     ..Default::default()
@@ -1166,14 +1165,14 @@ fn reused_collector_prepares_query_per_quantization_config() -> crate::Result<()
     let field_of = |index: &Index| index.schema().get_field("embedding");
     let first = build_quantized_fixture_case(DIM, Metric::L2, &[1, 4], true)?;
     let second = build_quantized_fixture_case(DIM, Metric::L2, &[4], true)?;
-    let params = AdaptiveProbeParams {
+    let params = ProbeParams {
         max_probe_fraction: 1.0,
         min_probe_clusters: 2,
         ..Default::default()
     };
     let query = vec![0.05_f32; DIM];
     let collector = |field| {
-        TopDocsByVectorSimilarity::new(field, query.clone(), 3).with_adaptive_params(params.clone())
+        TopDocsByVectorSimilarity::new(field, query.clone(), 3).with_probe_params(params.clone())
     };
 
     let reused = collector(field_of(&first)?);
@@ -1309,15 +1308,14 @@ fn merge_quantization_matches_kernel_harness_and_is_reproducible() -> crate::Res
     }
 
     let query = vec![0.05_f32; QUANT_FIXTURE_DIM];
-    let collector = TopDocsByVectorSimilarity::new(field, query.clone(), 3).with_adaptive_params(
-        AdaptiveProbeParams {
+    let collector =
+        TopDocsByVectorSimilarity::new(field, query.clone(), 3).with_probe_params(ProbeParams {
             max_probe_fraction: 1.0,
             min_probe_clusters: 2,
             exact_plan: false,
             located: LocatedPath::Off,
             ..Default::default()
-        },
-    );
+        });
     let quantized_fruit = searcher.search(&AllQuery, &collector)?;
     assert!(collector.quantized_query_count() > 0);
     assert_eq!(quantized_fruit.stats.len(), 1);
@@ -1377,7 +1375,7 @@ fn quantized_bounds_gate_skips_provably_useless_cluster() -> crate::Result<()> {
     let query = fixture_search_query(Metric::L2, 100);
     let searcher = index.reader()?.searcher();
     let collector = TopDocsByVectorSimilarity::new(field, query.clone(), 3)
-        .with_adaptive_params(AdaptiveProbeParams {
+        .with_probe_params(ProbeParams {
             max_probe_fraction: 1.0,
             min_probe_clusters: 1,
             exact_plan: false,
@@ -1407,7 +1405,7 @@ fn quantized_probe_terminates_at_ceiling() -> crate::Result<()> {
     let query = fixture_search_query(Metric::L2, 100);
     let searcher = index.reader()?.searcher();
     let collector = TopDocsByVectorSimilarity::new(field, query.clone(), 3)
-        .with_adaptive_params(AdaptiveProbeParams {
+        .with_probe_params(ProbeParams {
             max_probe_fraction: 0.1,
             min_probe_clusters: 1,
             exact_plan: false,
@@ -1447,7 +1445,7 @@ fn quantized_probe_terminates_at_recall_target() -> crate::Result<()> {
     let query = fixture_search_query(Metric::L2, 100);
     let searcher = index.reader()?.searcher();
     let collector = TopDocsByVectorSimilarity::new(field, query.clone(), 3)
-        .with_adaptive_params(AdaptiveProbeParams {
+        .with_probe_params(ProbeParams {
             max_probe_fraction: 1.0,
             min_probe_clusters: 1,
             recall_target: 0.5,
@@ -1488,7 +1486,7 @@ fn quantized_filtered_rows_are_not_charged() -> crate::Result<()> {
         Term::from_field_text(label, "keep"),
         IndexRecordOption::Basic,
     );
-    let params = AdaptiveProbeParams {
+    let params = ProbeParams {
         max_probe_fraction: 1.0,
         min_probe_clusters: 2,
         exact_plan: false,
@@ -1501,7 +1499,7 @@ fn quantized_filtered_rows_are_not_charged() -> crate::Result<()> {
     let row = (1.0 - open_share) / n_avg;
     // Request all fixture rows so both scans open every cluster.
     let collector = TopDocsByVectorSimilarity::new(field, query.clone(), 8)
-        .with_adaptive_params(params)
+        .with_probe_params(params)
         .with_max_scan_levels(1);
     let unfiltered = searcher.search(&AllQuery, &collector)?;
     let filtered = searcher.search(&keep, &collector)?;
@@ -1631,8 +1629,8 @@ fn general_dimension_quantized_bridge_at_d100() -> crate::Result<()> {
     let quantized_hits = searcher
         .search(
             &AllQuery,
-            &TopDocsByVectorSimilarity::new(field, query.clone(), 3).with_adaptive_params(
-                AdaptiveProbeParams {
+            &TopDocsByVectorSimilarity::new(field, query.clone(), 3).with_probe_params(
+                ProbeParams {
                     max_probe_fraction: 1.0,
                     min_probe_clusters: 2,
                     ..Default::default()
@@ -1735,8 +1733,8 @@ fn estimator_measurement_uses_production_path_and_is_centered() -> crate::Result
 
     let fruit = searcher.search(
         &AllQuery,
-        &TopDocsByVectorSimilarity::new(field, queries[0].clone(), 3).with_adaptive_params(
-            AdaptiveProbeParams {
+        &TopDocsByVectorSimilarity::new(field, queries[0].clone(), 3).with_probe_params(
+            ProbeParams {
                 max_probe_fraction: 1.0,
                 min_probe_clusters: 2,
                 exact_plan: false,
@@ -1820,7 +1818,7 @@ fn held_out_estimator_excludes_the_source_row() -> crate::Result<()> {
 #[test]
 fn layer_zero_io_matches_requested_page_spans() -> crate::Result<()> {
     use crate::vector::storage::io::test_support::{PagedDirectory, PAGE_BYTES};
-    use crate::vector::Stage;
+    use crate::vector::VectorStage;
     let directory = PagedDirectory::default();
     let index =
         build_quantized_fixture_in_directory(64, Metric::L2, &[1], true, directory.clone())?;
@@ -1830,7 +1828,7 @@ fn layer_zero_io_matches_requested_page_spans() -> crate::Result<()> {
     let result = searcher.search(
         &AllQuery,
         &TopDocsByVectorSimilarity::new(field, fixture_search_query(Metric::L2, 64), 16)
-            .with_adaptive_params(AdaptiveProbeParams {
+            .with_probe_params(ProbeParams {
                 max_probe_fraction: 1.0,
                 min_probe_clusters: 2,
                 exact_plan: false,
@@ -1841,7 +1839,7 @@ fn layer_zero_io_matches_requested_page_spans() -> crate::Result<()> {
     let reads = directory.reads.lock().unwrap();
     let ranges: Vec<_> = reads
         .iter()
-        .filter_map(|(stage, range)| matches!(stage, Stage::LayerScan(0)).then_some(range))
+        .filter_map(|(stage, range)| matches!(stage, VectorStage::LayerScan(0)).then_some(range))
         .collect();
     let io = result.stats[0].layers.get(0).unwrap().io;
     assert!(io.reads > 0);

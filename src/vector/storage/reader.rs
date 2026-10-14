@@ -17,7 +17,7 @@ use crate::fastfield::AliveBitSet;
 use crate::index::SegmentComponent;
 use crate::schema::{Field, FieldType, VectorOptions};
 use crate::vector::storage::blocks::{BlockMetadata, Blocks};
-use crate::vector::storage::centroids::IvfIndex;
+use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::header::{
     read_centroid_header, read_vector_header, CentroidSlot, VectorEntry, CENTROIDS_EXT, VEC_EXT,
 };
@@ -170,7 +170,7 @@ pub struct VectorIndexReader {
     id_map: DeferredIdMap,
     /// Deferred row-group columns and their validated geometry.
     rows_slice: Arc<Blocks>,
-    pub(crate) index: Option<IvfIndex>,
+    pub(crate) index: Option<ClusterIndex>,
     pub(crate) quantization: Option<QuantizedFieldReader>,
 }
 
@@ -284,7 +284,7 @@ impl VectorIndexReader {
         };
         let index = if let Some((version, centroids, offsets, router_slot, bounds)) = centroid_slots
         {
-            Some(IvfIndex::open(
+            Some(ClusterIndex::open(
                 version,
                 &options,
                 centroids,
@@ -441,7 +441,7 @@ impl VectorIndexReader {
 
     /// The routing index, present iff the segment's rows are IVF-clustered; `None` means search
     /// scans the rows exactly.
-    pub fn index(&self) -> Option<&IvfIndex> {
+    pub fn index(&self) -> Option<&ClusterIndex> {
         self.index.as_ref()
     }
 

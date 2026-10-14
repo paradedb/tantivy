@@ -17,19 +17,19 @@ pub enum ProbeTermination {
     #[default]
     Exhausted,
     /// The APS recall estimate of the covered clusters reached
-    /// [`AdaptiveProbeParams::recall_target`](crate::vector::params::AdaptiveProbeParams::recall_target).
+    /// [`ProbeParams::recall_target`](crate::vector::params::ProbeParams::recall_target).
     RecallTarget,
 }
 
 // --- Work units ---
 
-/// Default [`AdaptiveProbeParams::fixed_probe_cost_rows`]: the cost of opening a cluster, in rows
+/// Default [`ProbeParams::fixed_probe_cost_rows`]: the cost of opening a cluster, in rows
 /// of full work, fitted on the reference fixture.
 ///
 /// Policy constant: the open share `x = cost / (cost + n_avg)` follows the index's granularity.
 /// It covers the open only; routing cost is not modeled.
 ///
-/// [`AdaptiveProbeParams::fixed_probe_cost_rows`]: crate::vector::params::AdaptiveProbeParams::fixed_probe_cost_rows
+/// [`ProbeParams::fixed_probe_cost_rows`]: crate::vector::params::ProbeParams::fixed_probe_cost_rows
 pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 
 /// The open share `x = cost / (cost + n_avg)` for a cluster-open cost of `fixed_cost_rows` rows
@@ -93,7 +93,7 @@ impl std::ops::Mul<f64> for WorkUnits {
 }
 
 /// A segment's work budget and what a cluster open and a scored row cost against it, from
-/// [`AdaptiveProbeParams::resolved_work_budget`](crate::vector::params::AdaptiveProbeParams::resolved_work_budget).
+/// [`ProbeParams::resolved_work_budget`](crate::vector::params::ProbeParams::resolved_work_budget).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct WorkBudget {
     /// Work the segment may spend before the ceiling binds.

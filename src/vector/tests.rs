@@ -7,7 +7,7 @@ use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
 use crate::query::{AllQuery, TermQuery};
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, STRING};
-use crate::vector::params::{AdaptiveProbeParams, LocatedPath};
+use crate::vector::params::{LocatedPath, ProbeParams};
 use crate::vector::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
     Metric, RouterKind, VectorDType, VectorOptions,
@@ -538,7 +538,7 @@ fn default_setup_clusters_past_the_threshold() -> crate::Result<()> {
             &AllQuery,
             &TopDocs::with_limit(10)
                 .order_by_similarity(field, query.to_vec())
-                .with_adaptive_params(exhaustive_params(0)),
+                .with_probe_params(exhaustive_params(0)),
         )?;
         assert_eq!(actual.results, expected);
         Ok(())
@@ -717,8 +717,8 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
 /// oracle-equality tests, where every cluster the bounds gate cannot
 /// PROVE useless must be probed - provable skips never change the
 /// top-K, so oracle equality still holds under them.
-pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
-    AdaptiveProbeParams {
+pub(crate) fn exhaustive_params(_num_centroids: usize) -> ProbeParams {
+    ProbeParams {
         max_probe_fraction: 1.0,
         min_probe_clusters: 1,
         ..Default::default()
@@ -726,8 +726,8 @@ pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
 }
 
 /// [`exhaustive_params`] on the routed path, with no cluster scored exactly before the exact phase.
-pub(crate) fn routed_exhaustive_params(num_centroids: usize) -> AdaptiveProbeParams {
-    AdaptiveProbeParams {
+pub(crate) fn routed_exhaustive_params(num_centroids: usize) -> ProbeParams {
+    ProbeParams {
         exact_plan: false,
         located: LocatedPath::Off,
         ..exhaustive_params(num_centroids)
@@ -976,12 +976,12 @@ mod bounds_storage_tests {
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
     use crate::schema::{Schema, STORED, STRING};
-    use crate::vector::storage::centroids::IvfIndex;
+    use crate::vector::storage::centroids::ClusterIndex;
     use crate::vector::storage::header::CENTROIDS_EXT;
     use crate::vector::{
-        residual_norm, BoundKind, InMemoryStackedIvf, IvfCentroids, IvfClusterer, IvfConfig,
-        IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors, Metric, RouterKind,
-        RoutingParams, VectorDType, VectorOptions, VectorStorageFormat,
+        residual_norm, BoundKind, InMemoryStore, IvfCentroids, IvfClusterer, IvfMatrix,
+        IvfMergeSettings, IvfTrainingVectors, IvfVectors, Metric, RouterKind, RoutingParams,
+        StackedIvf, StackedIvfConfig, VectorDType, VectorOptions, VectorStorageFormat,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -990,7 +990,7 @@ mod bounds_storage_tests {
     /// the stored centroid.
     fn fresh_fold(
         vec_reader: &crate::vector::VectorIndexReader,
-        ivf: &IvfIndex,
+        ivf: &ClusterIndex,
         dim: usize,
         metric: Metric,
     ) -> crate::Result<Vec<f32>> {
@@ -1437,11 +1437,11 @@ mod bounds_storage_tests {
             .collect();
         assert_eq!(stacked_bytes[0], RouterKind::Stacked as u8);
         let payload_offset = 1;
-        let stacked = InMemoryStackedIvf::deserialize_owned(
+        let stacked = StackedIvf::<InMemoryStore>::deserialize_owned(
             &stacked_bytes[payload_offset..],
             stored_rows.clone(),
             2,
-            IvfConfig::default(),
+            StackedIvfConfig::default(),
         )
         .expect("slot [2] must parse as a stacked router");
         assert_eq!(stacked.vectors.len(), centroids.len());

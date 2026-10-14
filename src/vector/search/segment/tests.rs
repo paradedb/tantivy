@@ -7,13 +7,13 @@ use std::ops::Range;
 use crate::collector::TopDocs;
 use crate::query::{AllQuery, BooleanQuery, EnableScoring, Query};
 use crate::schema::Metric;
-use crate::vector::params::{AdaptiveProbeParams, LocatedPath, Selectivity};
+use crate::vector::params::{LocatedPath, ProbeParams, Selectivity};
 use crate::vector::search::scan::layer_read::LayerRead;
 use crate::vector::search::scan::plan::{ExactRule, PlanOverride};
 use crate::vector::stats::{AccessPath, LayerProbeStats};
 use crate::vector::test_support::{ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg, ReadLog};
 use crate::vector::tests::{exhaustive_params, routed_exhaustive_params};
-use crate::vector::{ProbeStats, RouterKind, Stage};
+use crate::vector::{ProbeStats, RouterKind, VectorStage};
 use crate::{DocAddress, DocId, Score};
 
 // --- Oracle matrix ---
@@ -120,7 +120,7 @@ fn forced_top_k(
     filter: &dyn Query,
     query: &[f32],
     k: usize,
-    params: &AdaptiveProbeParams,
+    params: &ProbeParams,
     forced: PlanOverride,
 ) -> crate::Result<(Hits, Vec<ProbeStats>)> {
     let weight = fixture.weight(filter)?;
@@ -161,12 +161,12 @@ fn forced_plans() -> [(&'static str, PlanOverride); 4] {
 
 /// The probe parameters of each path: routed, and on IVF segments located under a cap of a
 /// tenth of a segment with the exact plan on, as pg_search runs it.
-fn paths(representation: Representation) -> Vec<(&'static str, AdaptiveProbeParams)> {
+fn paths(representation: Representation) -> Vec<(&'static str, ProbeParams)> {
     let routed = routed_exhaustive_params(MATRIX_CLUSTERS);
     if matches!(representation, Representation::Flat) {
         return vec![("routed", routed)];
     }
-    let located = AdaptiveProbeParams {
+    let located = ProbeParams {
         located: LocatedPath::MaxSelectivity(Selectivity::new(0.1).unwrap()),
         exact_plan: true,
         ..routed.clone()
@@ -182,7 +182,7 @@ fn assert_case(
     filter: &dyn Query,
     query: &[f32],
     k: usize,
-    params: &AdaptiveProbeParams,
+    params: &ProbeParams,
     case: &str,
 ) -> crate::Result<Vec<ProbeStats>> {
     let fruit = fixture.search(filter, query, k, params.clone())?;
@@ -295,7 +295,7 @@ fn adaptive_probe_finds_nn_outside_nearest_cluster() -> crate::Result<()> {
         2,
         "the trap doc is the true nearest"
     );
-    let one_cluster = AdaptiveProbeParams {
+    let one_cluster = ProbeParams {
         max_probe_fraction: 0.5,
         min_probe_clusters: 1,
         ..Default::default()
@@ -326,7 +326,7 @@ fn routes_home_below_ceiling() -> crate::Result<()> {
         })
         .collect();
     let fixture = FixtureSpec::ivf(Metric::L2, centroids.clone(), vectors).build()?;
-    let params = AdaptiveProbeParams {
+    let params = ProbeParams {
         max_probe_fraction: 0.1,
         min_probe_clusters: 1,
         ..Default::default()
@@ -358,7 +358,7 @@ fn single_centroid_segment_routes() -> crate::Result<()> {
     )
     .build()?;
     let query = [0.0, 0.0];
-    let fruit = fixture.search(&AllQuery, &query, 3, AdaptiveProbeParams::default())?;
+    let fruit = fixture.search(&AllQuery, &query, 3, ProbeParams::default())?;
     assert_eq!(fruit.results, fixture.oracle(&AllQuery, &query, 3)?);
     assert_eq!(fruit.stats[0].clusters_probed(), 1);
     Ok(())
@@ -488,8 +488,8 @@ fn reads_fixture(metric: Metric, schedule: &[u8], deletes: &[usize]) -> crate::R
 
 /// Probe parameters that open every cluster the router hands over, on the routed path with no
 /// cluster scored exactly before the exact phase.
-fn every_cluster() -> AdaptiveProbeParams {
-    AdaptiveProbeParams {
+fn every_cluster() -> ProbeParams {
+    ProbeParams {
         max_probe_fraction: 1.0,
         min_probe_clusters: 4,
         exact_plan: false,
@@ -499,7 +499,10 @@ fn every_cluster() -> AdaptiveProbeParams {
 }
 
 /// The ranges `log` requested while `stage` ran.
-fn stage_reads<'a>(log: &'a ReadLog, stage: impl Fn(Stage) -> bool + 'a) -> Vec<&'a Range<usize>> {
+fn stage_reads<'a>(
+    log: &'a ReadLog,
+    stage: impl Fn(VectorStage) -> bool + 'a,
+) -> Vec<&'a Range<usize>> {
     log.iter()
         .filter(|(running, _)| stage(*running))
         .map(|(_, range)| range)
@@ -511,13 +514,13 @@ fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
 }
 
 /// The admission stage of a schedule: the layer-0 scan, or the full-precision scan.
-fn admission(schedule: &[u8]) -> impl Fn(Stage) -> bool {
+fn admission(schedule: &[u8]) -> impl Fn(VectorStage) -> bool {
     let quantized = !schedule.is_empty();
     move |stage| {
         if quantized {
-            stage == Stage::LayerScan(0)
+            stage == VectorStage::LayerScan(0)
         } else {
-            stage == Stage::ExactScan
+            stage == VectorStage::ExactScan
         }
     }
 }
@@ -542,7 +545,7 @@ fn empty_cluster_skips_its_band() -> crate::Result<()> {
     assert_eq!(stats.clusters_probed(), 1);
     assert_eq!(stats.vectors_visited, 0);
     assert_eq!(stats.layers.get(0).unwrap().io.reads, 0);
-    assert!(stage_reads(&fixture.reads(), |stage| stage == Stage::LayerScan(0)).is_empty());
+    assert!(stage_reads(&fixture.reads(), |stage| stage == VectorStage::LayerScan(0)).is_empty());
     Ok(())
 }
 
@@ -591,7 +594,7 @@ fn filtered_cluster_reads_only_doc_ids() -> crate::Result<()> {
             assert!(
                 stage_reads(&log, |stage| matches!(
                     stage,
-                    Stage::ExactFetch | Stage::ExactScore | Stage::LayerScan(1..)
+                    VectorStage::ExactFetch | VectorStage::ExactScore | VectorStage::LayerScan(1..)
                 ))
                 .is_empty(),
                 "{case}: no row is read"
@@ -619,7 +622,8 @@ fn filtered_clusters_read_doc_ids_before_payload() -> crate::Result<()> {
         let log = fixture.reads();
         let scans = stage_reads(&log, |stage| {
             admission(schedule)(stage)
-                || (schedule.is_empty() && matches!(stage, Stage::ExactFetch | Stage::ExactScore))
+                || (schedule.is_empty()
+                    && matches!(stage, VectorStage::ExactFetch | VectorStage::ExactScore))
         });
         for cluster in [2, 3] {
             let docs = ranges.docs[cluster].as_ref().unwrap();
@@ -655,7 +659,7 @@ fn open_gate_reads_doc_ids_only_in_the_exact_phase() -> crate::Result<()> {
     fixture.clear_reads();
     let open = fixture.search(&AllQuery, &query, 3, every_cluster())?;
     let log = fixture.reads();
-    for range in stage_reads(&log, |stage| matches!(stage, Stage::LayerScan(_))) {
+    for range in stage_reads(&log, |stage| matches!(stage, VectorStage::LayerScan(_))) {
         assert!(
             !ranges
                 .docs
@@ -673,7 +677,7 @@ fn open_gate_reads_doc_ids_only_in_the_exact_phase() -> crate::Result<()> {
         let expected = usize::from(docs.iter().any(|doc| trace.exact_phase_docs.contains(doc)));
         let fetched = log
             .iter()
-            .filter(|(stage, read)| *stage == Stage::ExactFetch && read == range)
+            .filter(|(stage, read)| *stage == VectorStage::ExactFetch && read == range)
             .count();
         assert_eq!(
             fetched, expected,
@@ -686,7 +690,7 @@ fn open_gate_reads_doc_ids_only_in_the_exact_phase() -> crate::Result<()> {
         );
     }
     for layer in 0..2 {
-        let requested = stage_reads(&log, |stage| stage == Stage::LayerScan(layer as u8));
+        let requested = stage_reads(&log, |stage| stage == VectorStage::LayerScan(layer as u8));
         let io = open.stats[0].layers.get(layer).unwrap().io;
         assert_eq!(io.reads, requested.len() as u64, "layer {layer}");
         assert_eq!(
@@ -770,7 +774,7 @@ fn flat_path_reads_one_row_per_survivor() -> crate::Result<()> {
         assert_eq!(stats.candidates_scored, 0, "{percent}%");
         assert_eq!(stats.clusters_probed(), 0, "{percent}%");
         assert_eq!(
-            stage_reads(&fixture.reads(), |stage| stage == Stage::ExactScan).len(),
+            stage_reads(&fixture.reads(), |stage| stage == VectorStage::ExactScan).len(),
             admitted,
             "{percent}%: one row request per survivor"
         );
@@ -809,7 +813,7 @@ fn exact_reads_touch_only_survivor_pages() -> crate::Result<()> {
         fixture.oracle(&filter, &query, READS_DOCS + 1)?
     );
     let log = fixture.reads();
-    let admission_reads = stage_reads(&log, |stage| stage == Stage::ExactScan);
+    let admission_reads = stage_reads(&log, |stage| stage == VectorStage::ExactScan);
     for docs in ranges.docs.iter().flatten() {
         assert_eq!(
             admission_reads
@@ -828,7 +832,7 @@ fn exact_reads_touch_only_survivor_pages() -> crate::Result<()> {
     );
     let mut payload = BTreeSet::new();
     for range in stage_reads(&log, |stage| {
-        matches!(stage, Stage::ExactFetch | Stage::ExactScore)
+        matches!(stage, VectorStage::ExactFetch | VectorStage::ExactScore)
     }) {
         payload.extend(range.start / 8192..=(range.end - 1) / 8192);
     }
@@ -868,7 +872,7 @@ fn layout_plans_selective_filters() -> crate::Result<()> {
             .label("dense", |ordinal| ordinal % 10 != 0)
             .build()?;
         let query = Lcg(5).vector(1024, 0.5);
-        let exact_on = AdaptiveProbeParams {
+        let exact_on = ProbeParams {
             exact_plan: true,
             ..routed_exhaustive_params(2)
         };
@@ -942,7 +946,7 @@ fn exact_clusters_never_read_their_band() -> crate::Result<()> {
         let layer0 = stats.layers.get(0).unwrap();
         // Unfiltered admission reads no DocIds: its reads are bands alone.
         assert_eq!(
-            stage_reads(&log, |stage| stage == Stage::LayerScan(0)).len(),
+            stage_reads(&log, |stage| stage == VectorStage::LayerScan(0)).len(),
             layer0.full_clusters(),
             "{stats:?}"
         );
@@ -951,7 +955,7 @@ fn exact_clusters_never_read_their_band() -> crate::Result<()> {
             stats.postings_row
         );
         let exact_reads = stage_reads(&log, |stage| {
-            matches!(stage, Stage::ExactFetch | Stage::ExactScore)
+            matches!(stage, VectorStage::ExactFetch | VectorStage::ExactScore)
         })
         .len();
         assert_eq!(stats.exact_io.reads, exact_reads as u64, "{stats:?}");
@@ -1021,13 +1025,13 @@ fn located_path_reads_no_doc_ids() -> crate::Result<()> {
             Box::new(fixture.filter("d1101")),
         ]);
         let query = reads_vector(42);
-        let params = AdaptiveProbeParams {
+        let params = ProbeParams {
             located: LocatedPath::MaxSelectivity(Selectivity::new(1.0).unwrap()),
             ..every_cluster()
         };
         let collector = TopDocs::with_limit(10)
             .order_by_similarity(fixture.field, query.clone())
-            .with_adaptive_params(params);
+            .with_probe_params(params);
         let searcher = fixture.index.reader()?.searcher();
         // The first search opens the location map; measure the second.
         searcher.search(&filter, &collector)?;
@@ -1051,7 +1055,7 @@ fn located_path_reads_no_doc_ids() -> crate::Result<()> {
                 .all(|docs| !overlaps(read, docs))),
             "{case}: a DocIds column was read"
         );
-        let locate_reads = stage_reads(&log, |stage| stage == Stage::Locate).len();
+        let locate_reads = stage_reads(&log, |stage| stage == VectorStage::Locate).len();
         assert!(locate_reads > 0, "{case}");
         assert_eq!(stats.locate_io.reads, locate_reads as u64, "{case}");
         // Centroid rows live in the centroid file, which the read log does not record.
@@ -1075,7 +1079,7 @@ fn located_path_charges_the_work_meter() -> crate::Result<()> {
         Box::new(fixture.filter("d1101")),
     ]);
     // Far below one cluster's work: the routed path would stop after its first cluster.
-    let params = AdaptiveProbeParams {
+    let params = ProbeParams {
         located: LocatedPath::MaxSelectivity(Selectivity::new(1.0).unwrap()),
         max_probe_fraction: 1e-6,
         min_probe_clusters: 0,

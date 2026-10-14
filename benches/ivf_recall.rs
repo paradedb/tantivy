@@ -23,7 +23,10 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 use tantivy::schema::Metric;
-use tantivy::vector::{l2_squared, IvfConfig, IvfIndexBuilder, SuperKMeansLevelClusterer};
+use tantivy::vector::{
+    l2_squared, InMemoryStore, StackedIvf, StackedIvfBuilder, StackedIvfConfig,
+    SuperKMeansLevelClusterer,
+};
 
 const COHERE_N: usize = 1_000_000;
 const COHERE_D: usize = 1024;
@@ -239,7 +242,7 @@ fn invert_perm(perm: &[u32]) -> Vec<u32> {
 /// all queries. Counts cover every level of the stack, so `%_sims` is total
 /// query cost relative to brute force, not just L0 rows touched.
 fn evaluate(
-    index: &tantivy::vector::InMemoryStackedIvf,
+    index: &StackedIvf<InMemoryStore>,
     queries: &[f32],
     n_queries: usize,
     d: usize,
@@ -309,13 +312,13 @@ fn main() {
     println!("{:.1}s", t0.elapsed().as_secs_f64());
 
     let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
-    let config = IvfConfig {
+    let config = StackedIvfConfig {
         branching_factor: BRANCHING_FACTOR,
         ..Default::default()
     };
     println!("building stacked IVF...");
     let t0 = Instant::now();
-    let (mut index, perm) = IvfIndexBuilder::new(base.to_vec(), n, d, &clusterer, config).build();
+    let (mut index, perm) = StackedIvfBuilder::new(base.to_vec(), n, d, &clusterer, config).build();
     let build_secs = t0.elapsed().as_secs_f64();
     let inv = invert_perm(&perm);
     println!(

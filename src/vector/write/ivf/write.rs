@@ -9,7 +9,7 @@ use crate::directory::CompositeWrite;
 use crate::schema::Field;
 use crate::vector::router::{BuiltRouter, RouterKind};
 use crate::vector::storage::blocks::{write_metadata, BlockDirectory};
-use crate::vector::storage::centroids::IvfIndex;
+use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::header::{CentroidSlot, VectorEntry, HEADER_LEN};
 use crate::vector::storage::id_map::{DocLocation, IdMap};
 use crate::vector::storage::metadata::VectorColMetadata;
@@ -31,7 +31,7 @@ pub(super) fn centroid_slots(
     {
         let centroids_w =
             centroids_write.for_field_with_idx(field, CentroidSlot::Centroids.index());
-        IvfIndex::serialize_centroids(
+        ClusterIndex::serialize_centroids(
             num_centroids,
             num_present_docs,
             centroid_bytes,
@@ -42,12 +42,12 @@ pub(super) fn centroid_slots(
     }
     {
         let offsets_w = centroids_write.for_field_with_idx(field, CentroidSlot::Offsets.index());
-        IvfIndex::serialize_offsets(cluster_offsets, offsets_w)?;
+        ClusterIndex::serialize_offsets(cluster_offsets, offsets_w)?;
         offsets_w.flush()?;
     }
     {
         let bounds_w = centroids_write.for_field_with_idx(field, CentroidSlot::Bounds.index());
-        IvfIndex::serialize_bounds(BoundKind::Ball, bounds, bounds_w)?;
+        ClusterIndex::serialize_bounds(BoundKind::Ball, bounds, bounds_w)?;
         bounds_w.flush()?;
     }
 
@@ -79,17 +79,17 @@ pub(super) fn empty_field(
     {
         let centroids_w =
             centroids_write.for_field_with_idx(field, CentroidSlot::Centroids.index());
-        IvfIndex::serialize_centroids(0, 0, &[], opts, centroids_w)?;
+        ClusterIndex::serialize_centroids(0, 0, &[], opts, centroids_w)?;
         centroids_w.flush()?;
     }
     {
         let offsets_w = centroids_write.for_field_with_idx(field, CentroidSlot::Offsets.index());
-        IvfIndex::serialize_offsets(&[0u64], offsets_w)?;
+        ClusterIndex::serialize_offsets(&[0u64], offsets_w)?;
         offsets_w.flush()?;
     }
     {
         let bounds_w = centroids_write.for_field_with_idx(field, CentroidSlot::Bounds.index());
-        IvfIndex::serialize_bounds(BoundKind::Ball, &[], bounds_w)?;
+        ClusterIndex::serialize_bounds(BoundKind::Ball, &[], bounds_w)?;
         bounds_w.flush()?;
     }
     {

@@ -86,7 +86,7 @@ pub use distance::{
     cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
 };
 pub use element::{Accumulator, VectorElement, ENTRY_ALIGN, MAX_ELEM_BYTES};
-pub use params::{AdaptiveProbeParams, LocatedPath, Selectivity, WorkModel, DEFAULT_ROUTER_RECALL};
+pub use params::{LocatedPath, ProbeParams, Selectivity, WorkModel, DEFAULT_ROUTER_RECALL};
 pub use quantization::{
     quantized_code_stride, VectorNormPolicy, VectorQuantizationConfig, VectorQuantizationGrid,
     VectorQuantizationLayer, MAX_QUANTIZATION_LAYERS, QUANTIZED_CODE_ALIGNMENT,
@@ -98,9 +98,9 @@ pub use router::arena::{FileSliceArena, VectorArena};
 pub use router::candidate::Candidate;
 pub use router::stacked::aps::APS_MAX_DIM;
 pub use router::stacked::levels::{
-    AddLevelError, ClusterId, InMemoryStackedIvf, InMemoryStore, IvfConfig,
-    IvfIndex as MultiLevelIvf, IvfIndexBuilder, IvfLevelClusterer, LazyStackedIvf, LazyStore,
-    StackedSearchStats, SuperKMeansLevelClusterer, PARENT_NPROBE_FRACTION,
+    AddLevelError, ClusterId, InMemoryStore, LazyStore, LevelClusterer, StackedIvf,
+    StackedIvfBuilder, StackedIvfConfig, StackedSearchStats, SuperKMeansLevelClusterer,
+    PARENT_NPROBE_FRACTION,
 };
 pub use router::{RouterKind, RouterMetrics, RoutingParams};
 #[cfg(feature = "unstable")]
@@ -110,13 +110,13 @@ pub use search::scan::estimate::quantization_bench_layer0_cosine_cluster;
 #[doc(hidden)]
 pub use search::scan::{columns::Columns, layer_read::Decoded};
 pub use search::source::controller::{ProbeTermination, DEFAULT_FIXED_PROBE_COST_ROWS};
-pub use search::VectorBackend;
+pub use search::SegmentSearcher;
 pub use stats::ProbeStats;
 pub use storage::bounds::{
     bounds_verdict, margin_ball_ball, margin_ball_halfspace, residual_norm, to_bound_space,
     BoundKind, BoundStore, BoundsBuilder, HeapPeek, QueryBound, Verdict,
 };
-pub use storage::centroids::IvfIndex;
+pub use storage::centroids::ClusterIndex;
 pub use storage::header::VectorFileVersion;
 pub use storage::io::VectorIoStats;
 pub use storage::metadata::{
@@ -125,7 +125,7 @@ pub use storage::metadata::{
 };
 pub use storage::reader::VectorIndexReader;
 pub(crate) use telemetry::enter_vector_stage;
-pub use telemetry::{current_vector_stage, Stage};
+pub use telemetry::{current_vector_stage, VectorStage};
 pub use tie_break::NoTieBreak;
 pub use write::flat::FlatVecWriter;
 pub use write::VectorPlugin;

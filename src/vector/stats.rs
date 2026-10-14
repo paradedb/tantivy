@@ -11,7 +11,7 @@ use crate::vector::search::source::matches::MatchReport;
 use crate::vector::search::source::router::RouterReport;
 use crate::vector::search::source::SourceReport;
 use crate::vector::telemetry::StageTotals;
-use crate::vector::{Stage, VectorIoStats};
+use crate::vector::{VectorIoStats, VectorStage};
 
 // --- Layers ---
 
@@ -276,7 +276,7 @@ impl ProbeStats {
                     .enumerate()
                     .map(|(layer, report)| LayerProbeStats {
                         sign_word_fallbacks: totals.sign_word_fallbacks(layer),
-                        io: totals.io(Stage::LayerScan(layer as u8)),
+                        io: totals.io(VectorStage::LayerScan(layer as u8)),
                         scored: report.scored,
                         survivors: report.survivors,
                         sparse_clusters: report.sparse_clusters,
@@ -376,42 +376,46 @@ impl ProbeStats {
     }
 
     fn record_io(&mut self, totals: &StageTotals) {
-        let (fetch, score) = (totals.io(Stage::ExactFetch), totals.io(Stage::ExactScore));
+        let (fetch, score) = (
+            totals.io(VectorStage::ExactFetch),
+            totals.io(VectorStage::ExactScore),
+        );
         self.exact_io = VectorIoStats {
             reads: fetch.reads + score.reads,
             bytes_read: fetch.bytes_read + score.bytes_read,
             storage_blocks: fetch.storage_blocks + score.storage_blocks,
         };
-        self.locate_io = totals.io(Stage::Locate);
-        self.centroid_io = totals.io(Stage::Centroid);
+        self.locate_io = totals.io(VectorStage::Locate);
+        self.centroid_io = totals.io(VectorStage::Centroid);
     }
 
     /// Sets every timing field from `totals`; optional timings stay absent when unset.
     fn apply_timings(&mut self, totals: &StageTotals) {
-        self.scan_init_ns = totals.time_ns(Stage::ScanInit);
-        self.non_vector_search_ns = totals.time_ns(Stage::NonVectorSearch);
-        self.query_prep_ns = totals.time_ns(Stage::QueryPrep);
-        self.routing_ns = totals.time_ns(Stage::Routing);
-        self.locate_ns = totals.time_ns(Stage::Locate);
-        self.centroid_ns = totals.time_ns(Stage::Centroid);
-        self.exact_fetch_ns = totals.time_ns(Stage::ExactFetch);
-        self.exact_score_ns = totals.time_ns(Stage::ExactScore);
+        self.scan_init_ns = totals.time_ns(VectorStage::ScanInit);
+        self.non_vector_search_ns = totals.time_ns(VectorStage::NonVectorSearch);
+        self.query_prep_ns = totals.time_ns(VectorStage::QueryPrep);
+        self.routing_ns = totals.time_ns(VectorStage::Routing);
+        self.locate_ns = totals.time_ns(VectorStage::Locate);
+        self.centroid_ns = totals.time_ns(VectorStage::Centroid);
+        self.exact_fetch_ns = totals.time_ns(VectorStage::ExactFetch);
+        self.exact_score_ns = totals.time_ns(VectorStage::ExactScore);
         if let Some(exact_scan_ns) = self.exact_scan_ns.as_mut() {
-            *exact_scan_ns = totals.time_ns(Stage::ExactScan);
+            *exact_scan_ns = totals.time_ns(VectorStage::ExactScan);
         }
         if let Some(result_assembly_ns) = self.result_assembly_ns.as_mut() {
             *result_assembly_ns =
-                totals.time_ns(Stage::ResultAssembly) + totals.time_ns(Stage::Other);
+                totals.time_ns(VectorStage::ResultAssembly) + totals.time_ns(VectorStage::Other);
         }
         for (layer, stats) in self.layers.0.iter_mut().enumerate() {
-            stats.scan_ns = totals.time_ns(Stage::LayerScan(layer as u8));
-            stats.boundary_ns = totals.time_ns(Stage::Boundary(layer as u8));
+            stats.scan_ns = totals.time_ns(VectorStage::LayerScan(layer as u8));
+            stats.boundary_ns = totals.time_ns(VectorStage::Boundary(layer as u8));
         }
     }
 
     /// Adds result-assembly time accrued after the segment's statistics were assembled.
     pub(crate) fn add_assembly(&mut self, totals: &StageTotals) {
-        let extra = totals.time_ns(Stage::ResultAssembly) + totals.time_ns(Stage::Other);
+        let extra =
+            totals.time_ns(VectorStage::ResultAssembly) + totals.time_ns(VectorStage::Other);
         self.result_assembly_ns = Some(self.result_assembly_ns.unwrap_or(0) + extra);
     }
 

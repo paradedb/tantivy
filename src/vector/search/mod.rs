@@ -1,6 +1,6 @@
 //! Per-segment vector search.
 //!
-//! A segment without an [`IvfIndex`] iterates the filter doc by doc and scores every vector
+//! A segment without a [`ClusterIndex`] iterates the filter doc by doc and scores every vector
 //! exactly. An IVF segment is planned, then scanned over its cluster source.
 
 pub(crate) mod cluster_source;
@@ -16,7 +16,7 @@ use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::{SegmentSortKeyComputer, TopNComputer};
 use crate::query::Weight;
 use crate::schema::Field;
-use crate::vector::params::AdaptiveProbeParams;
+use crate::vector::params::ProbeParams;
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery, VectorQuery};
 use crate::vector::search::scan::heap::{tie_break_key, TieBreakHits};
 #[cfg(test)]
@@ -27,27 +27,27 @@ use crate::vector::search::source::matches::MatchClusters;
 use crate::vector::search::source::router::RouterClusters;
 use crate::vector::search::source::SourceReport;
 use crate::vector::stats::ProbeStats;
-use crate::vector::storage::centroids::IvfIndex;
+use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::take_stage_totals;
 use crate::vector::tie_break::NoTieBreak;
-use crate::vector::{enter_vector_stage, Stage, VectorElement};
+use crate::vector::{enter_vector_stage, VectorElement, VectorStage};
 use crate::{DocAddress, Score, SegmentOrdinal, SegmentReader, TantivyError};
 
 /// Per-segment vector search state: the segment's [`VectorIndexReader`] and the prepared query.
-/// Build via [`VectorBackend::for_segment`].
-pub struct VectorBackend<T: VectorElement> {
+/// Build via [`SegmentSearcher::for_segment`].
+pub struct SegmentSearcher<T: VectorElement> {
     reader: Arc<VectorIndexReader>,
     query: Arc<VectorQuery<T>>,
     /// `None` when the segment is not quantized or quantized scanning is off.
     quantized: Option<Arc<QuantizedQueryCtx>>,
-    adaptive: AdaptiveProbeParams,
+    probe_params: ProbeParams,
     segment_ord: SegmentOrdinal,
     #[cfg(test)]
     pub(crate) plan_override: Option<PlanOverride>,
 }
 
-impl<T: VectorElement> VectorBackend<T> {
+impl<T: VectorElement> SegmentSearcher<T> {
     // --- Construction ---
 
     /// Opens `field`'s vector reader for one segment.
@@ -57,13 +57,13 @@ impl<T: VectorElement> VectorBackend<T> {
         field: Field,
         query: Arc<VectorQuery<T>>,
         quantized: Option<Arc<QuantizedQueryCtx>>,
-        adaptive: AdaptiveProbeParams,
+        probe_params: ProbeParams,
     ) -> crate::Result<Self> {
         Ok(Self {
             reader: segment_reader.vector_index(field)?,
             query,
             quantized,
-            adaptive,
+            probe_params,
             segment_ord,
             #[cfg(test)]
             plan_override: None,
@@ -79,8 +79,8 @@ impl<T: VectorElement> VectorBackend<T> {
     }
 
     #[cfg(test)]
-    pub(crate) fn params(&self) -> &AdaptiveProbeParams {
-        &self.adaptive
+    pub(crate) fn params(&self) -> &ProbeParams {
+        &self.probe_params
     }
 
     #[cfg(test)]
@@ -159,7 +159,7 @@ impl<T: VectorElement> VectorBackend<T> {
     /// the statistics from every stage's report and the stage clock.
     fn search_ivf<K, C>(
         &self,
-        index: &IvfIndex,
+        index: &ClusterIndex,
         weight: &dyn Weight,
         segment: &SegmentReader,
         top_n: usize,
@@ -170,8 +170,8 @@ impl<T: VectorElement> VectorBackend<T> {
         K: SegmentSortKeyComputer,
         C: Comparator<K::SegmentSortKey>,
     {
-        let init = enter_vector_stage(Stage::ScanInit);
-        let plan = SegmentPlan::build(&self.adaptive, index, weight, segment, top_n)?;
+        let init = enter_vector_stage(VectorStage::ScanInit);
+        let plan = SegmentPlan::build(&self.probe_params, index, weight, segment, top_n)?;
         let capacity = plan.capacity_hint();
         let SegmentPlan {
             budget,
@@ -188,7 +188,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let config = ScanConfig {
             top_n,
             capacity,
-            exact_plan: self.adaptive.exact_plan,
+            exact_plan: self.probe_params.exact_plan,
             #[cfg(test)]
             plan_override: self.plan_override,
         };
@@ -209,7 +209,7 @@ impl<T: VectorElement> VectorBackend<T> {
                     budget,
                     filter,
                     segment,
-                    &self.adaptive,
+                    &self.probe_params,
                 );
                 scan.run(&mut clusters)?;
                 SourceReport::Router(clusters.finish())
@@ -243,7 +243,7 @@ impl<T: VectorElement> VectorBackend<T> {
         K: SegmentSortKeyComputer,
         CTail: Comparator<K::SegmentSortKey>,
     {
-        let init = enter_vector_stage(Stage::ScanInit);
+        let init = enter_vector_stage(VectorStage::ScanInit);
         let mut topn =
             TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator));
         let alive = segment_reader.alive_bitset();
@@ -251,7 +251,7 @@ impl<T: VectorElement> VectorBackend<T> {
         // The `for_each` closure can't return an error; the first one is re-raised after the walk.
         let mut read_err: Option<TantivyError> = None;
         drop(init);
-        let scan = enter_vector_stage(Stage::ExactScan);
+        let scan = enter_vector_stage(VectorStage::ExactScan);
         weight.for_each_no_score(segment_reader, &mut |docs| {
             if read_err.is_some() {
                 return;
@@ -283,7 +283,7 @@ impl<T: VectorElement> VectorBackend<T> {
         }
         drop(scan);
         let segment_ord = self.segment_ord;
-        let _assembly = enter_vector_stage(Stage::ResultAssembly);
+        let _assembly = enter_vector_stage(VectorStage::ResultAssembly);
         let hits = topn
             .into_sorted_vec()
             .into_iter()

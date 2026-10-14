@@ -26,10 +26,10 @@ use crate::error::DataCorruption;
 use crate::schema::Metric;
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource, Feedback};
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery};
-use crate::vector::storage::centroids::IvfIndex;
+use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::quantized::{QuantizedFieldReader, ReadScratch};
 use crate::vector::storage::reader::VectorIndexReader;
-use crate::vector::{enter_vector_stage, Similarity, Stage, VectorElement};
+use crate::vector::{enter_vector_stage, Similarity, VectorElement, VectorStage};
 use crate::SegmentOrdinal;
 
 // --- Contracts ---
@@ -133,7 +133,7 @@ struct QuantizedState<'a> {
     cluster_columns: Columns,
     /// The reader exact reads are priced through; `None` with the exact plan off.
     exact: Option<&'a VectorIndexReader>,
-    index: &'a IvfIndex,
+    index: &'a ClusterIndex,
     /// Centroid rows read for clusters without a centroid score.
     centroid_reads: usize,
     #[cfg(test)]
@@ -146,7 +146,7 @@ impl<'a> QuantizedState<'a> {
         widened: &'a [f32],
         field: &'a QuantizedFieldReader,
         reader: &'a VectorIndexReader,
-        index: &'a IvfIndex,
+        index: &'a ClusterIndex,
         config: &ScanConfig,
     ) -> Self {
         let meta = query.index.meta.field();
@@ -288,7 +288,7 @@ impl<'a> QuantizedState<'a> {
     /// The query's similarity to `cluster`'s centroid, from its stored row, scored as the router
     /// scores it.
     fn read_centroid(&mut self, cluster: usize) -> crate::Result<Similarity> {
-        let _centroid = enter_vector_stage(Stage::Centroid);
+        let _centroid = enter_vector_stage(VectorStage::Centroid);
         let row = self.index.centroid_row(cluster)?;
         self.centroid_reads += 1;
         Ok(self.metric.similarity_bytes::<f32>(self.widened, &row))
@@ -308,7 +308,7 @@ impl<'a> QuantizedState<'a> {
                 .layer_columns
                 .push(self.candidates.column_trace());
         }
-        let _boundary = enter_vector_stage(Stage::Boundary(layer as u8));
+        let _boundary = enter_vector_stage(VectorStage::Boundary(layer as u8));
         self.candidates.band(bound);
         report.layers[layer].survivors = self.candidates.len();
         #[cfg(test)]
@@ -322,7 +322,7 @@ impl<'a> QuantizedState<'a> {
 fn survivor_groups(
     rows: &[usize],
     admitted: impl Iterator<Item = (usize, AdmittedCluster)>,
-    index: &IvfIndex,
+    index: &ClusterIndex,
 ) -> Vec<(usize, AdmittedCluster, Range<usize>)> {
     debug_assert!(
         rows.windows(2).all(|pair| pair[0] < pair[1]),
@@ -360,7 +360,7 @@ where
     K: SegmentSortKeyComputer,
     C: Comparator<K::SegmentSortKey>,
 {
-    index: &'a IvfIndex,
+    index: &'a ClusterIndex,
     exact: ExactScorer<'a, T, K, C>,
     /// The quantized cascade; `None` scores every shortlisted row exactly.
     quantized: Option<QuantizedState<'a>>,
@@ -381,7 +381,7 @@ where
     /// Fails with `DataCorruption` when a quantized query meets a segment without quantized slots.
     pub(crate) fn new(
         reader: &'a VectorIndexReader,
-        index: &'a IvfIndex,
+        index: &'a ClusterIndex,
         query: ScoringQuery<'a, T>,
         config: ScanConfig,
         tie_break: &'a mut K,
@@ -436,10 +436,10 @@ where
     }
 
     /// The stage the shortlist is built in: layer 0, or the exact scan at full precision.
-    fn shortlist_stage(&self) -> Stage {
+    fn shortlist_stage(&self) -> VectorStage {
         match self.quantized {
-            Some(_) => Stage::LayerScan(0),
-            None => Stage::ExactScan,
+            Some(_) => VectorStage::LayerScan(0),
+            None => VectorStage::ExactScan,
         }
     }
 
@@ -512,7 +512,7 @@ where
             state.admitted_clusters(),
             self.index,
         );
-        let layer_scan = enter_vector_stage(Stage::LayerScan(layer as u8));
+        let layer_scan = enter_vector_stage(VectorStage::LayerScan(layer as u8));
         self.retired.clear();
         for (cluster, admitted, at) in groups {
             let rows = self.index.cluster_range(cluster);
@@ -585,7 +585,7 @@ where
         self,
         segment_ord: SegmentOrdinal,
     ) -> crate::Result<(TieBreakHits<K>, ScanReport)> {
-        let _assembly = enter_vector_stage(Stage::ResultAssembly);
+        let _assembly = enter_vector_stage(VectorStage::ResultAssembly);
         let Self {
             exact,
             quantized,

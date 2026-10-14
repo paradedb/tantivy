@@ -463,7 +463,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
             );
             let filter: &dyn Query = if filtered { &keep } else { &AllQuery };
             let collector = TopDocsByVectorSimilarity::new(field, query.clone(), DOCS + 1)
-                .with_adaptive_params(AdaptiveProbeParams {
+                .with_probe_params(ProbeParams {
                     max_probe_fraction: 1.0,
                     min_probe_clusters: 4,
                     exact_plan: false,

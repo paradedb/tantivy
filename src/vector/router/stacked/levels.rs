@@ -2,18 +2,18 @@
 //!
 //! L0 members are the items being routed. L1 is an IVF over L0's
 //! centroids, L2 over L1's, and so on. Each list is a contiguous row
-//! range in [`IvfIndex::offsets`].
+//! range in [`StackedIvf::offsets`].
 //!
-//! [`InMemoryStackedIvf::build`] creates one level. [`InMemoryStackedIvf::add_level`]
+//! [`StackedIvf::build`] creates one level. [`StackedIvf::add_level`]
 //! hangs a parent on this level and reorders this level's centroids and
 //! offset ranges so parent member `i` is list `i`. Member rows stay put;
-//! a later parent only shuffles this level's metadata. [`IvfIndexBuilder`]
+//! a later parent only shuffles this level's metadata. [`StackedIvfBuilder`]
 //! walks up, calling `add_level` until the top has at most
 //! `branching_factor` lists. L0 granularity is `max_leaf_size`
 //! (`nlist ≈ n / max_leaf_size`); `branching_factor` is the tree fan-out.
 //!
 //! Search works on any [`VectorArena`]. Build and payload serialization require
-//! owned [`InMemoryStore`]s. [`LazyStackedIvf::open`] is search-only.
+//! owned [`InMemoryStore`]s. [`StackedIvf::open`] is search-only.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -73,7 +73,7 @@ pub const DEFAULT_BRANCHING_FACTOR: usize = 100;
 
 /// Search and clustering knobs for this level. Not persisted.
 #[derive(Clone, Debug)]
-pub struct IvfConfig {
+pub struct StackedIvfConfig {
     /// Initial candidate fraction `f_M`: `|S| = nprobe_fraction * nlist`.
     pub nprobe_fraction: f32,
     /// IVF tree fan-out. Parent lists hold about this many children, and
@@ -85,7 +85,7 @@ pub struct IvfConfig {
     pub parent_recall_target: f32,
 }
 
-impl Default for IvfConfig {
+impl Default for StackedIvfConfig {
     fn default() -> Self {
         Self {
             nprobe_fraction: 0.02,
@@ -95,7 +95,7 @@ impl Default for IvfConfig {
     }
 }
 
-impl IvfConfig {
+impl StackedIvfConfig {
     pub fn new(branching_factor: usize) -> Self {
         Self {
             branching_factor,
@@ -121,7 +121,7 @@ impl IvfConfig {
     }
 }
 
-/// No centroids at the level [`InMemoryStackedIvf::add_level`] would extend.
+/// No centroids at the level [`StackedIvf::add_level`] would extend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddLevelError {
     Empty,
@@ -180,7 +180,7 @@ impl Deref for InMemoryStore {
 }
 
 /// Cluster `n` vectors into about `nlist` balanced lists.
-pub trait IvfLevelClusterer {
+pub trait LevelClusterer {
     type Elem: VectorElement;
 
     /// Returns `(centroids row-major nlist'×dim, assignment[i] → list id)`.
@@ -199,7 +199,7 @@ pub struct SuperKMeansLevelClusterer {
     pub iters_per_split: u32,
 }
 
-impl IvfLevelClusterer for SuperKMeansLevelClusterer {
+impl LevelClusterer for SuperKMeansLevelClusterer {
     type Elem = f32;
 
     fn cluster(&self, data: &[f32], n: usize, dim: usize, nlist: usize) -> (Vec<f32>, Vec<u32>) {
@@ -228,23 +228,17 @@ impl IvfLevelClusterer for SuperKMeansLevelClusterer {
 /// One IVF level. `parent` is the next level up (L0's parent is L1).
 ///
 /// List `j` is `vectors` rows `offsets[j].0..offsets[j].1`. Search is
-/// available for any [`VectorArena`]; [`build`](IvfIndex::build) and
-/// [`add_level`](IvfIndex::add_level) require [`InMemoryStore`].
-pub struct IvfIndex<C, M> {
-    pub config: IvfConfig,
-    pub parent: Option<Box<IvfIndex<C, C>>>,
+/// available for any [`VectorArena`]; [`build`](StackedIvf::build) and
+/// [`add_level`](StackedIvf::add_level) require [`InMemoryStore`].
+pub struct StackedIvf<S> {
+    pub config: StackedIvfConfig,
+    pub parent: Option<Box<StackedIvf<S>>>,
     /// Per-list `(start, end)` into [`Self::vectors`]. Not necessarily
     /// packed in list-id order after a parent is added above this level.
     pub offsets: Vec<(u64, u64)>,
-    pub centroids: C,
-    pub vectors: M,
+    pub centroids: S,
+    pub vectors: S,
 }
-
-/// Owned stacked IVF (`build` / `add_level` / `serialize`).
-pub type InMemoryStackedIvf = IvfIndex<InMemoryStore, InMemoryStore>;
-
-/// File-backed stacked IVF (`open` / search only).
-pub type LazyStackedIvf = IvfIndex<LazyStore, LazyStore>;
 
 /// File-backed row-major `f32` matrix.
 ///
@@ -371,9 +365,9 @@ impl SerializableStore for LazyStore {
     }
 }
 
-fn serialize_stacked_index<C, M, W>(index: &IvfIndex<C, M>, out: &mut W) -> io::Result<()>
+fn serialize_stacked_index<S, W>(index: &StackedIvf<S>, out: &mut W) -> io::Result<()>
 where
-    C: SerializableStore,
+    S: SerializableStore,
     W: Write + ?Sized,
 {
     let mut num_levels = 1usize;
@@ -388,8 +382,8 @@ where
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "level count exceeds u32"))?
         .serialize(&mut topology)?;
 
-    fn serialize_level<C, M>(index: &IvfIndex<C, M>, out: &mut Vec<u8>) -> io::Result<()>
-    where C: SerializableStore {
+    fn serialize_level<S>(index: &StackedIvf<S>, out: &mut Vec<u8>) -> io::Result<()>
+    where S: SerializableStore {
         let nlist = index.centroids.len();
         if index.offsets.len() != nlist {
             return Err(io::Error::new(
@@ -447,7 +441,7 @@ impl CentroidMatrix for LazyStore {
     }
 }
 
-/// Work done by one [`IvfIndex::search`], summed over this level and
+/// Work done by one [`StackedIvf::search`], summed over this level and
 /// every parent above it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StackedSearchStats {
@@ -493,21 +487,27 @@ fn permute_rows(data: &[f32], dim: usize, perm: &[u32]) -> Vec<f32> {
 }
 
 /// Builds a stacked IVF, hanging parents until the top has at most
-/// [`IvfConfig::branching_factor`] lists.
+/// [`StackedIvfConfig::branching_factor`] lists.
 ///
-/// [`InMemoryStackedIvf::build`] is one level. The builder walks up, calling
-/// [`InMemoryStackedIvf::add_level`] on each current top. Only L0's member
+/// [`StackedIvf::build`] is one level. The builder walks up, calling
+/// [`StackedIvf::add_level`] on each current top. Only L0's member
 /// permutation is returned — later levels shuffle metadata, not L0 rows.
-pub struct IvfIndexBuilder<'a, Cl> {
+pub struct StackedIvfBuilder<'a, Cl> {
     data: Vec<f32>,
     n: usize,
     dim: usize,
     clusterer: &'a Cl,
-    config: IvfConfig,
+    config: StackedIvfConfig,
 }
 
-impl<'a, Cl: IvfLevelClusterer<Elem = f32>> IvfIndexBuilder<'a, Cl> {
-    pub fn new(data: Vec<f32>, n: usize, dim: usize, clusterer: &'a Cl, config: IvfConfig) -> Self {
+impl<'a, Cl: LevelClusterer<Elem = f32>> StackedIvfBuilder<'a, Cl> {
+    pub fn new(
+        data: Vec<f32>,
+        n: usize,
+        dim: usize,
+        clusterer: &'a Cl,
+        config: StackedIvfConfig,
+    ) -> Self {
         Self {
             data,
             n,
@@ -517,14 +517,19 @@ impl<'a, Cl: IvfLevelClusterer<Elem = f32>> IvfIndexBuilder<'a, Cl> {
         }
     }
 
-    /// Clusters L0, then walks up calling [`InMemoryStackedIvf::add_level`]
+    /// Clusters L0, then walks up calling [`StackedIvf::add_level`]
     /// while the current top's `nlist` is greater than `branching_factor`.
     ///
     /// Returns the stacked index and L0's member permutation
     /// (`perm[old] = new`).
-    pub fn build(self) -> (InMemoryStackedIvf, Vec<u32>) {
-        let (mut index, perm) =
-            InMemoryStackedIvf::build(self.data, self.n, self.dim, self.clusterer, self.config);
+    pub fn build(self) -> (StackedIvf<InMemoryStore>, Vec<u32>) {
+        let (mut index, perm) = StackedIvf::<InMemoryStore>::build(
+            self.data,
+            self.n,
+            self.dim,
+            self.clusterer,
+            self.config,
+        );
         let parent_cfg = index.config.for_parent();
         let branching_factor = index.config.branching_factor;
         let mut cur = &mut index;
@@ -537,8 +542,8 @@ impl<'a, Cl: IvfLevelClusterer<Elem = f32>> IvfIndexBuilder<'a, Cl> {
     }
 }
 
-impl IvfIndex<InMemoryStore, InMemoryStore> {
-    fn empty(config: IvfConfig, dim: usize) -> Self {
+impl StackedIvf<InMemoryStore> {
+    fn empty(config: StackedIvfConfig, dim: usize) -> Self {
         Self {
             config,
             parent: None,
@@ -591,10 +596,10 @@ impl IvfIndex<InMemoryStore, InMemoryStore> {
     /// parent already present is extended upward without touching this
     /// level. Returns the list permutation applied at the level that
     /// gained the parent. Fails if the top has no centroids.
-    pub fn add_level<Cl: IvfLevelClusterer<Elem = f32>>(
+    pub fn add_level<Cl: LevelClusterer<Elem = f32>>(
         &mut self,
         clusterer: &Cl,
-        config: IvfConfig,
+        config: StackedIvfConfig,
     ) -> Result<Vec<u32>, AddLevelError> {
         if let Some(parent) = &mut self.parent {
             return parent.add_level(clusterer, config);
@@ -615,12 +620,12 @@ impl IvfIndex<InMemoryStore, InMemoryStore> {
     ///
     /// Returns the index and the permutation of input rows into cluster
     /// order (`perm[old] = new`). [`add_level`] does not permute members.
-    pub fn build<Cl: IvfLevelClusterer<Elem = f32>>(
+    pub fn build<Cl: LevelClusterer<Elem = f32>>(
         data: Vec<f32>,
         n: usize,
         dim: usize,
         clusterer: &Cl,
-        config: IvfConfig,
+        config: StackedIvfConfig,
     ) -> (Self, Vec<u32>) {
         assert!(dim > 0, "dim must be positive");
         assert_eq!(data.len(), n * dim);
@@ -635,7 +640,7 @@ impl IvfIndex<InMemoryStore, InMemoryStore> {
     }
 
     /// Writes offsets and centroid rows for every level (L0, L1, …).
-    /// L0 member vectors and [`IvfConfig`] are not written.
+    /// L0 member vectors and [`StackedIvfConfig`] are not written.
     pub(crate) fn serialize_router_payload<W: Write + ?Sized>(
         &self,
         out: &mut W,
@@ -651,7 +656,7 @@ impl IvfIndex<InMemoryStore, InMemoryStore> {
         bytes: &[u8],
         members: Vec<f32>,
         dim: usize,
-        config: IvfConfig,
+        config: StackedIvfConfig,
     ) -> io::Result<Self> {
         if dim == 0 || members.len() % dim != 0 {
             return Err(io::Error::new(
@@ -693,7 +698,7 @@ impl IvfIndex<InMemoryStore, InMemoryStore> {
             level_centroids.push(values);
         }
 
-        let mut index: Option<Box<InMemoryStackedIvf>> = None;
+        let mut index: Option<Box<StackedIvf<InMemoryStore>>> = None;
         for level in (0..level_topology.len()).rev() {
             let (nlist, offsets) = &level_topology[level];
             let level_members = if level == 0 {
@@ -708,7 +713,7 @@ impl IvfIndex<InMemoryStore, InMemoryStore> {
                 ));
             }
             let _ = nlist;
-            index = Some(Box::new(IvfIndex {
+            index = Some(Box::new(StackedIvf {
                 config: if level == 0 {
                     config.clone()
                 } else {
@@ -776,7 +781,7 @@ fn ranges_cover_members(ranges: &[(u64, u64)], n: usize) -> bool {
     packed.windows(2).all(|pair| pair[0].1 == pair[1].0)
 }
 
-impl LazyStackedIvf {
+impl StackedIvf<LazyStore> {
     /// Opens a serialized index for search.
     ///
     /// `member_rows` are the L0 vectors in serialized order. `config` is
@@ -785,7 +790,7 @@ impl LazyStackedIvf {
         slot: FileSlice,
         member_rows: FileSlice,
         dim: usize,
-        config: IvfConfig,
+        config: StackedIvfConfig,
     ) -> io::Result<Self> {
         if dim == 0 {
             return Err(io::Error::new(
@@ -841,7 +846,7 @@ impl LazyStackedIvf {
         // Every level's centroids are pinned: they are what APS reads, and
         // they are small. L0 members (the caller's rows) stay file-backed;
         // a parent's members are the level below's centroids, pinned too.
-        let mut index: Option<Box<LazyStackedIvf>> = None;
+        let mut index: Option<Box<StackedIvf<LazyStore>>> = None;
         for level in (0..level_topology.len()).rev() {
             let (_, offsets) = &level_topology[level];
             let (level_members, level_member_count) = if level == 0 {
@@ -858,7 +863,7 @@ impl LazyStackedIvf {
                     format!("level {level} offsets do not cover its members"),
                 ));
             }
-            index = Some(Box::new(IvfIndex {
+            index = Some(Box::new(StackedIvf {
                 config: if level == 0 {
                     config.clone()
                 } else {
@@ -874,10 +879,8 @@ impl LazyStackedIvf {
     }
 }
 
-impl<C, M> IvfIndex<C, M>
-where
-    C: VectorArena<Elem = f32> + CentroidMatrix,
-    M: VectorArena<Elem = f32>,
+impl<S> StackedIvf<S>
+where S: VectorArena<Elem = f32> + CentroidMatrix
 {
     pub fn nlist(&self) -> usize {
         self.offsets.len()
@@ -904,7 +907,7 @@ where
     /// far reaches `recall` (Quake APS).
     pub fn search(
         &self,
-        query: &[C::Elem],
+        query: &[S::Elem],
         k: usize,
         recall: f32,
         metric: Metric,
@@ -987,7 +990,7 @@ where
 
     fn scan_cluster(
         &self,
-        query: &[C::Elem],
+        query: &[S::Elem],
         metric: Metric,
         list: ClusterId,
         result: &mut BinaryHeap<Reverse<Candidate<ClusterId>>>,
@@ -1030,8 +1033,8 @@ mod tests {
 
     /// Small-fixture config: leaf size matches fan-out so n=16..64 still
     /// produces multiple L0 lists.
-    fn test_config(branching_factor: usize) -> IvfConfig {
-        IvfConfig {
+    fn test_config(branching_factor: usize) -> StackedIvfConfig {
+        StackedIvfConfig {
             branching_factor,
             ..Default::default()
         }
@@ -1043,8 +1046,8 @@ mod tests {
         dim: usize,
         clusterer: &SuperKMeansLevelClusterer,
         branching_factor: usize,
-    ) -> (InMemoryStackedIvf, Vec<u32>) {
-        let (mut index, perm) = InMemoryStackedIvf::build(
+    ) -> (StackedIvf<InMemoryStore>, Vec<u32>) {
+        let (mut index, perm) = StackedIvf::<InMemoryStore>::build(
             data.to_vec(),
             n,
             dim,
@@ -1065,7 +1068,7 @@ mod tests {
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
         let (index, member_perm) =
-            InMemoryStackedIvf::build(data, n, dim, &clusterer, test_config(4));
+            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config(4));
         assert!(index.nlist() > 1);
         assert_eq!(index.vectors.len(), n);
         assert_eq!(member_perm.len(), n);
@@ -1123,7 +1126,7 @@ mod tests {
 
         let mut bytes = Vec::new();
         index.serialize_router_payload(&mut bytes).unwrap();
-        let decoded = InMemoryStackedIvf::deserialize_owned(
+        let decoded = StackedIvf::<InMemoryStore>::deserialize_owned(
             &bytes,
             index.vectors.as_slice().to_vec(),
             dim,
@@ -1165,7 +1168,8 @@ mod tests {
         let n = 64;
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
-        let (mut index, _) = InMemoryStackedIvf::build(data, n, dim, &clusterer, test_config(2));
+        let (mut index, _) =
+            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config(2));
         assert_eq!(index.depth(), 1);
 
         let parent_cfg = index.config.for_parent();
@@ -1189,7 +1193,8 @@ mod tests {
         let n = 64;
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
-        let (mut index, _) = InMemoryStackedIvf::build(data, n, dim, &clusterer, test_config(2));
+        let (mut index, _) =
+            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config(2));
         let parent_cfg = index.config.for_parent();
         index.add_level(&clusterer, parent_cfg.clone()).expect("L1");
         let members = index.vectors.as_slice().to_vec();
@@ -1203,7 +1208,7 @@ mod tests {
 
     #[test]
     fn test_nlist() {
-        let config = IvfConfig {
+        let config = StackedIvfConfig {
             branching_factor: 100,
             ..Default::default()
         };
@@ -1220,7 +1225,8 @@ mod tests {
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
         let config = test_config(2);
-        let (index, perm) = IvfIndexBuilder::new(data, n, dim, &clusterer, config.clone()).build();
+        let (index, perm) =
+            StackedIvfBuilder::new(data, n, dim, &clusterer, config.clone()).build();
         assert!(index.depth() > 1, "builder must hang at least one parent");
         let mut top = &index;
         while let Some(p) = top.parent.as_deref() {
@@ -1243,10 +1249,10 @@ mod tests {
     #[test]
     fn test_add_level_errors_when_empty() {
         let dim = 2;
-        let mut index = InMemoryStackedIvf::empty(IvfConfig::default(), dim);
+        let mut index = StackedIvf::<InMemoryStore>::empty(StackedIvfConfig::default(), dim);
         let clusterer = SuperKMeansLevelClusterer::default();
         assert_eq!(
-            index.add_level(&clusterer, IvfConfig::default()),
+            index.add_level(&clusterer, StackedIvfConfig::default()),
             Err(AddLevelError::Empty)
         );
     }
@@ -1267,7 +1273,7 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
-        let opened = LazyStackedIvf::open(
+        let opened = StackedIvf::<LazyStore>::open(
             FileSlice::from(slot),
             FileSlice::from(member_bytes),
             dim,
@@ -1306,12 +1312,13 @@ mod tests {
             *v = ((i * 2654435761usize) % 1000) as f32 / 1000.0;
         }
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 1 };
-        let config = IvfConfig {
+        let config = StackedIvfConfig {
             nprobe_fraction: PARENT_NPROBE_FRACTION,
             branching_factor: 64,
-            ..IvfConfig::default()
+            ..StackedIvfConfig::default()
         };
-        let (index, _perm) = IvfIndexBuilder::new(data, n, dim, &clusterer, config.clone()).build();
+        let (index, _perm) =
+            StackedIvfBuilder::new(data, n, dim, &clusterer, config.clone()).build();
         assert!(
             index.depth() >= 2,
             "need a parent so permute_lists scrambles L0 list order"
@@ -1328,7 +1335,7 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
-        LazyStackedIvf::open(
+        StackedIvf::<LazyStore>::open(
             FileSlice::from(slot),
             FileSlice::from(member_bytes),
             dim,
@@ -1343,7 +1350,8 @@ mod tests {
         let n = 32;
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
-        let (index, _perm) = InMemoryStackedIvf::build(data, n, dim, &clusterer, test_config(2));
+        let (index, _perm) =
+            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config(2));
         let mut slot = Vec::new();
         index.serialize_router_payload(&mut slot).unwrap();
         let member_bytes: Vec<u8> = index
@@ -1354,21 +1362,21 @@ mod tests {
             .collect();
 
         let truncated = slot[..slot.len() - 4].to_vec();
-        assert!(LazyStackedIvf::open(
+        assert!(StackedIvf::<LazyStore>::open(
             FileSlice::from(truncated),
             FileSlice::from(member_bytes.clone()),
             dim,
-            IvfConfig::default(),
+            StackedIvfConfig::default(),
         )
         .is_err());
 
         // Wrong member count: offsets no longer cover the members.
         let short_members = member_bytes[..member_bytes.len() - dim * 4].to_vec();
-        assert!(LazyStackedIvf::open(
+        assert!(StackedIvf::<LazyStore>::open(
             FileSlice::from(slot),
             FileSlice::from(short_members),
             dim,
-            IvfConfig::default(),
+            StackedIvfConfig::default(),
         )
         .is_err());
     }
@@ -1391,7 +1399,8 @@ mod tests {
         let n_per = 16;
         let data = two_blobs(n_per);
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
-        let (index, _) = InMemoryStackedIvf::build(data, n_per * 2, 2, &clusterer, test_config(2));
+        let (index, _) =
+            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config(2));
         let (hits, stats) = index.search(&[0.0f32, 0.0], 4, 0.0, Metric::L2);
         assert!(
             stats.lists_scanned >= 1,
@@ -1407,7 +1416,7 @@ mod tests {
         let data = two_blobs(n_per);
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
         let (mut index, _) =
-            InMemoryStackedIvf::build(data, n_per * 2, 2, &clusterer, test_config(2));
+            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config(2));
         index.config.nprobe_fraction = 1.0;
         let query = [0.0f32, 0.0];
         let (full_hits, full) = index.search(&query, 4, 1.0, Metric::L2);
@@ -1435,7 +1444,7 @@ mod tests {
         let data = two_blobs(n_per);
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
         let (mut index, _) =
-            InMemoryStackedIvf::build(data, n_per * 2, 2, &clusterer, test_config(2));
+            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config(2));
         index.config.nprobe_fraction = 1.0;
 
         let mut slot = Vec::new();
@@ -1446,7 +1455,7 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
-        let opened = LazyStackedIvf::open(
+        let opened = StackedIvf::<LazyStore>::open(
             FileSlice::from(slot),
             FileSlice::from(member_bytes),
             2,
@@ -1497,7 +1506,8 @@ mod tests {
             })
             .collect();
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
-        let (mut index, _) = InMemoryStackedIvf::build(data, n, 2, &clusterer, test_config(2));
+        let (mut index, _) =
+            StackedIvf::<InMemoryStore>::build(data, n, 2, &clusterer, test_config(2));
         index.config.nprobe_fraction = 1.0;
         let query = [0.3f32.cos(), 0.3f32.sin()];
         let scaled = [query[0] * 10.0, query[1] * 10.0];
@@ -1518,7 +1528,7 @@ mod tests {
         let data = two_blobs(n_per);
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
         let (mut index, _) =
-            InMemoryStackedIvf::build(data, n_per * 2, 2, &clusterer, test_config(2));
+            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config(2));
         index.config.nprobe_fraction = 1.0;
         let query = [1.0f32, 0.0];
         let (full_hits, full) = index.search(&query, 4, 1.0, Metric::Dot);

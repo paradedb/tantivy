@@ -47,7 +47,7 @@ impl WorkModel {
 /// scan stops when its budget is spent or its ranking runs out. The numeric defaults are
 /// provisional pending real-data benchmarking.
 #[derive(Clone, Debug)]
-pub struct AdaptiveProbeParams {
+pub struct ProbeParams {
     /// Work ceiling as a fraction of each segment's capacity. Default 0.01.
     pub max_probe_fraction: f32,
     /// Floor on the resolved budget, in work units, applied before the capacity cap. Default
@@ -108,7 +108,7 @@ impl Selectivity {
     }
 }
 
-impl Default for AdaptiveProbeParams {
+impl Default for ProbeParams {
     fn default() -> Self {
         Self {
             max_probe_fraction: 0.01,
@@ -125,10 +125,10 @@ impl Default for AdaptiveProbeParams {
 
 pub(crate) const MIN_PROBE_CLUSTERS: usize = 16;
 
-/// Default [`AdaptiveProbeParams::router_recall_target`].
+/// Default [`ProbeParams::router_recall_target`].
 pub const DEFAULT_ROUTER_RECALL: f32 = 0.99;
 
-impl AdaptiveProbeParams {
+impl ProbeParams {
     /// The number of clusters the stacked router is asked to rank for a
     /// segment whose resolved work budget is `budget` units.
     ///
@@ -162,7 +162,7 @@ impl AdaptiveProbeParams {
     }
 }
 
-impl AdaptiveProbeParams {
+impl ProbeParams {
     /// The segment's work budget with the pricing it was resolved under, `(budget, n_avg, x)`.
     ///
     /// The budget is `max_probe_fraction` of the segment's capacity in work units, floored at
@@ -202,7 +202,7 @@ impl AdaptiveProbeParams {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdaptiveProbeParams, WorkModel};
+    use super::{ProbeParams, WorkModel};
 
     /// Capacity is the cluster count, exactly, whatever the granularity:
     /// `units_seg = C*x + (1 - x)*N/n_avg == C` for every x the open
@@ -210,7 +210,7 @@ mod tests {
     /// "this fraction of the index's work" at any granularity.
     #[test]
     fn unprimed_capacity_is_the_cluster_count() -> crate::Result<()> {
-        let all = AdaptiveProbeParams {
+        let all = ProbeParams {
             max_probe_fraction: 1.0,
             min_probe_clusters: 1,
             ..Default::default()
@@ -229,7 +229,7 @@ mod tests {
     /// and the capacity caps both.
     #[test]
     fn budget_resolves_against_capacity() -> crate::Result<()> {
-        let params = AdaptiveProbeParams {
+        let params = ProbeParams {
             max_probe_fraction: 0.25,
             ..Default::default()
         };
@@ -247,7 +247,7 @@ mod tests {
         assert!((budget - 2.0).abs() < 1e-6, "{budget}");
         // A fraction above 1.0 clamps to the capacity - small segments
         // scan exhaustively.
-        let all = AdaptiveProbeParams {
+        let all = ProbeParams {
             max_probe_fraction: 2.0,
             ..Default::default()
         };
@@ -263,7 +263,7 @@ mod tests {
     fn primed_model_allocates_by_work() -> crate::Result<()> {
         // 8 clusters each; one holds 800 docs, the other 200. Index-wide
         // n_avg = 1000/16 = 62.5.
-        let params = AdaptiveProbeParams {
+        let params = ProbeParams {
             max_probe_fraction: 0.5,
             min_probe_clusters: 1,
             work_model: Some(WorkModel { n_avg: 62.5 }),
@@ -287,7 +287,7 @@ mod tests {
     /// lifted to the probe floor and capped at the segment's clusters.
     #[test]
     fn router_k_tracks_budget_and_filter_selectivity() {
-        let params = AdaptiveProbeParams::default();
+        let params = ProbeParams::default();
         let x = 0.2;
         assert_eq!(params.router_k(20.0, x, 1.0, 1000), 20);
         assert_eq!(params.router_k(20.4, x, 1.0, 1000), 21);
@@ -308,14 +308,14 @@ mod tests {
     #[test]
     fn invalid_budget_params_error() {
         for fraction in [0.0, -1.0] {
-            let params = AdaptiveProbeParams {
+            let params = ProbeParams {
                 max_probe_fraction: fraction,
                 ..Default::default()
             };
             assert!(params.resolved_work_budget(9, 180).is_err());
         }
         for cost in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            let params = AdaptiveProbeParams {
+            let params = ProbeParams {
                 fixed_probe_cost_rows: cost,
                 ..Default::default()
             };

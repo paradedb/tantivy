@@ -4,7 +4,7 @@ use common::BitSet;
 
 use crate::query::{AllQuery, Query};
 use crate::schema::Metric;
-use crate::vector::params::{AdaptiveProbeParams, LocatedPath};
+use crate::vector::params::{LocatedPath, ProbeParams};
 use crate::vector::router::stacked::aps::RecallEstimator;
 use crate::vector::search::cluster_source::{ClusterSource, Feedback};
 use crate::vector::search::segment::plan::Source;
@@ -84,7 +84,7 @@ fn walk_fixture(
     filter: &dyn Query,
     query: &[f32],
     k: usize,
-    params: AdaptiveProbeParams,
+    params: ProbeParams,
     feedback: impl Fn(usize) -> Feedback,
 ) -> crate::Result<Walk> {
     fixture.with_segment(filter, query, k, &params, |seg| walk(seg, feedback))
@@ -136,8 +136,8 @@ fn kth_score(fixture: &Fixture, query: &[f32], k: usize) -> crate::Result<f32> {
 }
 
 /// A budget of `max_probe_fraction` on the routed path.
-fn budget_params(max_probe_fraction: f32) -> AdaptiveProbeParams {
-    AdaptiveProbeParams {
+fn budget_params(max_probe_fraction: f32) -> ProbeParams {
+    ProbeParams {
         max_probe_fraction,
         min_probe_clusters: 1,
         exact_plan: false,
@@ -316,7 +316,7 @@ fn probe_termination() -> crate::Result<()> {
     assert_eq!(exhausted.rows, docs);
 
     // Recall target: a loose target stops on the estimate before the budget; 1.0 leaves APS off.
-    let recall = |target| AdaptiveProbeParams {
+    let recall = |target| ProbeParams {
         recall_target: target,
         ..budget_params(1.0)
     };

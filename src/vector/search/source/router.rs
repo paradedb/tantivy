@@ -5,7 +5,7 @@ use common::BitSet;
 
 use crate::fastfield::AliveBitSet;
 use crate::schema::Metric;
-use crate::vector::params::AdaptiveProbeParams;
+use crate::vector::params::ProbeParams;
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::{RouterIter, RouterMetrics, RoutingParams};
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource, Feedback};
@@ -17,9 +17,9 @@ use crate::vector::storage::bounds::{
     bounds_verdict, margin_ball_ball, margin_ball_halfspace, to_bound_space, BoundStore, HeapPeek,
     QueryBound, QueryBoundTracker, Verdict,
 };
-use crate::vector::storage::centroids::IvfIndex;
+use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::reader::VectorIndexReader;
-use crate::vector::{enter_vector_stage, Stage, VectorElement};
+use crate::vector::{enter_vector_stage, VectorElement, VectorStage};
 use crate::{DocId, SegmentReader};
 
 // --- Filter and gate ---
@@ -195,7 +195,7 @@ pub(crate) struct RouterReport {
 /// filter. Owns the ranked stream, the work meter, the probe controller, the query bound and the
 /// buffers each cluster's rows borrow.
 pub(crate) struct RouterClusters<'a, T: VectorElement> {
-    index: &'a IvfIndex,
+    index: &'a ClusterIndex,
     reader: &'a VectorIndexReader,
     query: &'a VectorQuery<T>,
     ranked: RouterIter,
@@ -220,7 +220,7 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
         budget: WorkBudget,
         filter: DocFilter,
         segment: &'a SegmentReader,
-        params: &'a AdaptiveProbeParams,
+        params: &'a ProbeParams,
     ) -> Self {
         let index = reader
             .index()
@@ -235,7 +235,7 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
             ),
             recall: params.router_recall_target,
         };
-        let _routing = enter_vector_stage(Stage::Routing);
+        let _routing = enter_vector_stage(VectorStage::Routing);
         let ranked = index.rank_clusters(query.widened(), routing);
         let estimator = index.recall_estimator(&ranked, query.widened(), params.recall_target);
         Self {
@@ -300,7 +300,7 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
             debug_assert_eq!(self.docs.len(), rows);
         }
         let gated = {
-            let _routing = enter_vector_stage(Stage::Routing);
+            let _routing = enter_vector_stage(VectorStage::Routing);
             self.gate.select(&self.docs, &mut self.offsets)
         };
         self.counters.vectors_visited += rows;
@@ -335,7 +335,7 @@ impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
     fn next(&mut self, feedback: Feedback) -> crate::Result<Option<ClusterRows<'_>>> {
         loop {
             let next = {
-                let _routing = enter_vector_stage(Stage::Routing);
+                let _routing = enter_vector_stage(VectorStage::Routing);
                 self.ranked.next()
             };
             let Some(Candidate { sim, node }) = next else {

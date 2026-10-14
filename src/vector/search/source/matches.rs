@@ -6,9 +6,9 @@ use std::ops::Range;
 
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource, Feedback};
 use crate::vector::search::source::controller::{WorkBudget, WorkMeter};
-use crate::vector::storage::centroids::IvfIndex;
+use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::reader::VectorIndexReader;
-use crate::vector::{enter_vector_stage, Stage};
+use crate::vector::{enter_vector_stage, VectorStage};
 use crate::{DocId, SegmentReader};
 
 /// What the filter-match source counted.
@@ -30,7 +30,7 @@ pub(crate) struct MatchReport {
 
 /// A filter's live matches with a vector, grouped by cluster in ascending id.
 pub(crate) struct MatchClusters<'a> {
-    index: &'a IvfIndex,
+    index: &'a ClusterIndex,
     /// Cluster-local row offsets, ascending within each cluster.
     offsets: Vec<usize>,
     /// The doc id of each offset.
@@ -55,7 +55,7 @@ impl<'a> MatchClusters<'a> {
         let index = reader
             .index()
             .expect("the filter source runs on an IVF segment");
-        let _locate = enter_vector_stage(Stage::Locate);
+        let _locate = enter_vector_stage(VectorStage::Locate);
         let matched = docs.len();
         if let Some(alive) = segment.alive_bitset() {
             docs.retain(|&doc| alive.is_alive(doc));

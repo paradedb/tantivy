@@ -9,7 +9,7 @@ use crate::schema::{Metric, VectorOptions};
 use crate::vector::clustering::IvfCentroids;
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::aps::RecallEstimator;
-use crate::vector::router::stacked::levels::{InMemoryStore, IvfIndex as MultiLevelIvf, LazyStore};
+use crate::vector::router::stacked::levels::{InMemoryStore, LazyStore, StackedIvf};
 use crate::TantivyError;
 
 pub(crate) mod arena;
@@ -87,7 +87,7 @@ impl fmt::Display for RouterKind {
 }
 
 pub(crate) enum Router<S: crate::vector::VectorArena<Elem = f32>> {
-    Stacked(MultiLevelIvf<S, S>),
+    Stacked(StackedIvf<S>),
     Exact(exact::ExactRouter<S>),
 }
 

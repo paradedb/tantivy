@@ -8,34 +8,34 @@ use crate::vector::router::stacked::aps::{
     supports_metric as aps_supports_metric, CandidateRows, RecallEstimator, APS_MAX_DIM,
 };
 use crate::vector::router::stacked::levels::{
-    ClusterId, InMemoryStackedIvf, IvfConfig, IvfIndexBuilder, LazyStackedIvf, LazyStore,
+    ClusterId, InMemoryStore, LazyStore, StackedIvf, StackedIvfBuilder, StackedIvfConfig,
     StackedSearchStats, SuperKMeansLevelClusterer, PARENT_NPROBE_FRACTION,
 };
 use crate::vector::router::{RouterMetrics, RoutingParams};
 use crate::vector::{IvfCentroids, Similarity};
 use crate::TantivyError;
 
-/// The router's [`IvfConfig`]. The segment's own IVF (`.vec` rows under
+/// The router's [`StackedIvfConfig`]. The segment's own IVF (`.vec` rows under
 /// `.centroids`) is L0 and is probed by the caller's work budget; every
 /// level of this router sits above it and is a parent, so the bottom router
 /// level uses [`PARENT_NPROBE_FRACTION`] too rather than the standalone
 /// L0 default. Build-only knobs (`branching_factor`, `max_leaf_size`) keep
 /// their defaults; the config is not persisted, so open must agree with
 /// build only on what search reads.
-fn router_config() -> IvfConfig {
-    IvfConfig {
+fn router_config() -> StackedIvfConfig {
+    StackedIvfConfig {
         nprobe_fraction: PARENT_NPROBE_FRACTION,
-        ..IvfConfig::default()
+        ..StackedIvfConfig::default()
     }
 }
 
 pub(super) fn build(
     options: &VectorOptions,
     centroids: &mut IvfCentroids,
-) -> crate::Result<InMemoryStackedIvf> {
+) -> crate::Result<StackedIvf<InMemoryStore>> {
     let IvfCentroids::F32(matrix) = &*centroids;
     let clusterer = SuperKMeansLevelClusterer::default();
-    let (index, permutation) = IvfIndexBuilder::new(
+    let (index, permutation) = StackedIvfBuilder::new(
         matrix.values.clone(),
         matrix.rows,
         options.dim(),
@@ -72,8 +72,8 @@ pub(super) fn open(
     payload: FileSlice,
     centroids: FileSlice,
     options: &VectorOptions,
-) -> crate::Result<LazyStackedIvf> {
-    Ok(LazyStackedIvf::open(
+) -> crate::Result<StackedIvf<LazyStore>> {
+    Ok(StackedIvf::<LazyStore>::open(
         payload,
         centroids,
         options.dim(),
@@ -94,7 +94,7 @@ pub(crate) fn effective_recall(dim: usize, metric: Metric, recall: f32) -> f32 {
 }
 
 pub(super) fn rank(
-    index: &LazyStackedIvf,
+    index: &StackedIvf<LazyStore>,
     query: &[f32],
     metric: Metric,
     params: RoutingParams,
@@ -126,7 +126,7 @@ pub(super) fn rank(
 /// so candidate rows come from its member store, fetched only as the
 /// estimator needs them.
 pub(super) fn recall_estimator<'a>(
-    index: &'a LazyStackedIvf,
+    index: &'a StackedIvf<LazyStore>,
     ranking: &Ranking,
     query: &[f32],
     metric: Metric,

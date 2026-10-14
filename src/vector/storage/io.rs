@@ -49,7 +49,7 @@ pub(crate) mod test_support {
     use crate::directory::{
         Directory, FileHandle, InnerWritePtr, RamDirectory, TempFilePtr, WatchCallback, WatchHandle,
     };
-    use crate::vector::{current_vector_stage, Stage};
+    use crate::vector::{current_vector_stage, VectorStage};
 
     /// Ranges read, in order.
     pub(crate) type TrackedReads = Arc<Mutex<Vec<Range<usize>>>>;
@@ -81,7 +81,7 @@ pub(crate) mod test_support {
 
     pub(crate) const PAGE_BYTES: usize = 8192;
 
-    type ReadLog = Arc<Mutex<Vec<(Stage, Range<usize>)>>>;
+    type ReadLog = Arc<Mutex<Vec<(VectorStage, Range<usize>)>>>;
 
     thread_local! {
         static LOG_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };

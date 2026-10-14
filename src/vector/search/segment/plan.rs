@@ -4,11 +4,11 @@ use common::BitSet;
 
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::query::{for_each_docset_buffered, AllScorer, Weight};
-use crate::vector::params::{AdaptiveProbeParams, LocatedPath};
+use crate::vector::params::{LocatedPath, ProbeParams};
 use crate::vector::search::source::controller::{WorkBudget, WorkUnits};
 use crate::vector::search::source::router::DocFilter;
-use crate::vector::storage::centroids::IvfIndex;
-use crate::vector::{enter_vector_stage, Stage};
+use crate::vector::storage::centroids::ClusterIndex;
+use crate::vector::{enter_vector_stage, VectorStage};
 use crate::{DocId, SegmentReader};
 
 // --- Plan ---
@@ -55,8 +55,8 @@ impl SegmentPlan {
     /// Plans no source when nothing can match: `top_n` is zero, the segment holds no clusters or
     /// docs, or the filter matches nothing.
     pub(crate) fn build(
-        params: &AdaptiveProbeParams,
-        index: &IvfIndex,
+        params: &ProbeParams,
+        index: &ClusterIndex,
         weight: &dyn Weight,
         segment: &SegmentReader,
         top_n: usize,
@@ -80,7 +80,7 @@ impl SegmentPlan {
         debug_assert!(n_avg > 0.0);
         let cap = located_cap(params.located, max_doc, budget, n_avg, x);
         let source = {
-            let _filter = enter_vector_stage(Stage::NonVectorSearch);
+            let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
             collect_segment_filter(weight, segment, max_doc, cap)?
         };
         Ok(Self {
@@ -174,7 +174,7 @@ mod tests {
     use super::*;
     use crate::query::{AllQuery, BooleanQuery, Occur, Query};
     use crate::schema::Metric;
-    use crate::vector::params::{AdaptiveProbeParams, Selectivity, WorkModel};
+    use crate::vector::params::{ProbeParams, Selectivity, WorkModel};
     use crate::vector::stats::AccessPath;
     use crate::vector::test_support::{DocsWeight, FixtureSpec};
     use crate::vector::tests::exhaustive_params;
@@ -217,13 +217,13 @@ mod tests {
             (Occur::Should, label("tenth")),
             (Occur::Should, label("rest")),
         ]);
-        let params = AdaptiveProbeParams {
+        let params = ProbeParams {
             exact_plan: false,
             located: LocatedPath::Off,
             ..exhaustive_params(9)
         };
         // The source as `(located, matches)`; `None` matches for a match-all routed filter.
-        let plan_with = |filter: &dyn Query, top_n: usize, params: &AdaptiveProbeParams| {
+        let plan_with = |filter: &dyn Query, top_n: usize, params: &ProbeParams| {
             fixture.with_segment(filter, &[0.0, 0.0], top_n, params, |seg| {
                 let plan = seg.plan()?;
                 Ok(plan.source.as_ref().map(|source| {
@@ -278,7 +278,7 @@ mod tests {
 
         // The located cap is `floor(selectivity * max_doc)`.
         let max_doc = segment.max_doc() as f32;
-        let capped = |cap: usize| AdaptiveProbeParams {
+        let capped = |cap: usize| ProbeParams {
             located: LocatedPath::MaxSelectivity(
                 Selectivity::new(((cap as f32 + 0.5) / max_doc).min(1.0)).unwrap(),
             ),
@@ -330,12 +330,12 @@ mod tests {
         // routes, and a filter matching nothing still reports the cap.
         let ivf_docs = ivf.num_docs();
         for work_model in [None, Some(WorkModel { n_avg: 61.5 })] {
-            let auto = AdaptiveProbeParams {
+            let auto = ProbeParams {
                 max_probe_fraction: 0.2,
                 min_probe_clusters: 1,
                 work_model,
                 located: LocatedPath::Auto,
-                ..AdaptiveProbeParams::default()
+                ..ProbeParams::default()
             };
             let (budget, n_avg, x) = auto.resolved_work_budget(ivf.num_clusters(), ivf_docs)?;
             let cap = (budget * n_avg / (1.0 - x)).floor() as usize;
@@ -360,7 +360,7 @@ mod tests {
         }
         // Every mode reports its cap, and an unfiltered query routes.
         for (located, cap) in [(LocatedPath::Off, 0), (capped(9).located, 9)] {
-            let params = AdaptiveProbeParams {
+            let params = ProbeParams {
                 located,
                 ..params.clone()
             };

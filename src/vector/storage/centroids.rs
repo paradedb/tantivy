@@ -1,6 +1,6 @@
-//! The `.centroids` file and its reader, [`IvfIndex`] — the per-field IVF
+//! The `.centroids` file and its reader, [`ClusterIndex`] — the per-field IVF
 //! routing index. This module owns the wire format end to end: the
-//! serializers the merge calls and the [`IvfIndex::open`] that parses them
+//! serializers the merge calls and the [`ClusterIndex::open`] that parses them
 //! back sit side by side.
 //!
 //! The on-disk file is a 4-byte format-version stamp (see `vector::storage::header`)
@@ -43,7 +43,7 @@ use crate::vector::{BoundKind, BoundStore};
 /// router's lists. The centroid vectors stay behind a [`FileSlice`] and are read one row at a
 /// time as routing visits them. Everything row-scale (the rows and id-map) lives on
 /// [`VectorIndexReader`](crate::vector::VectorIndexReader).
-pub struct IvfIndex {
+pub struct ClusterIndex {
     num_centroids: usize,
     /// Distinct documents with a vector in this field.
     num_docs: usize,
@@ -62,7 +62,7 @@ pub struct IvfIndex {
     bounds: Vec<f32>,
 }
 
-impl IvfIndex {
+impl ClusterIndex {
     /// Write slot `[0]` of the `.centroids` composite for a field. `num_docs`
     /// is the number of distinct docs assigned, not the posting-row total.
     pub(crate) fn serialize_centroids<W: Write + ?Sized>(
@@ -224,7 +224,7 @@ impl IvfIndex {
             .into());
         }
 
-        let index = IvfIndex {
+        let index = ClusterIndex {
             num_centroids,
             num_docs,
             centroids_slice,
@@ -356,10 +356,10 @@ mod tests {
     fn pre_v3_router_format_is_rejected() -> io::Result<()> {
         let options = VectorOptions::new(1, Metric::L2);
         let mut centroids = Vec::new();
-        IvfIndex::serialize_centroids(0, 0, &[], &options, &mut centroids)?;
+        ClusterIndex::serialize_centroids(0, 0, &[], &options, &mut centroids)?;
         let mut offsets = Vec::new();
-        IvfIndex::serialize_offsets(&[0], &mut offsets)?;
-        let error = IvfIndex::open(
+        ClusterIndex::serialize_offsets(&[0], &mut offsets)?;
+        let error = ClusterIndex::open(
             VectorFileVersion::V2,
             &options,
             FileSlice::from(centroids),

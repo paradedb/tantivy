@@ -11,7 +11,7 @@ use crate::vector::search::scan::bound::KthBound;
 use crate::vector::search::scan::heap::{tie_break_key, TieBreakHeap, TieBreakHits};
 use crate::vector::storage::quantized::ReadScratch;
 use crate::vector::storage::reader::{VectorIndexReader, VectorRowBatch};
-use crate::vector::{enter_vector_stage, Stage, VectorElement};
+use crate::vector::{enter_vector_stage, VectorElement, VectorStage};
 use crate::{DocAddress, DocId, SegmentOrdinal};
 
 /// Full-precision rows of one cluster's selection.
@@ -89,7 +89,7 @@ where
     fn score_rows(&mut self, selected: &ClusterRows<'_>, docs_first: bool) -> crate::Result<usize> {
         let mut column_read = false;
         let rows = {
-            let _fetch = enter_vector_stage(Stage::ExactFetch);
+            let _fetch = enter_vector_stage(VectorStage::ExactFetch);
             if docs_first {
                 self.reader
                     .read_doc_ids(selected.cluster, &mut self.cluster_docs)?;
@@ -97,7 +97,7 @@ where
             }
             self.read(selected)?
         };
-        let _score = enter_vector_stage(Stage::ExactScore);
+        let _score = enter_vector_stage(VectorStage::ExactScore);
 
         let scored = match &rows {
             ExactRows::Span(bytes) => {
