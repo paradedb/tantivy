@@ -14,6 +14,7 @@ use common::{HasLen, OwnedBytes};
 use quant_model::f16::f16_to_f32;
 
 use super::blocks::{BlockMetadata, Blocks};
+use super::flat::id_map::DocLocation;
 use super::flat::IdMap;
 use super::header::{read_centroid_header, read_vector_header, CentroidSlot, VectorEntry};
 use super::interval::{Estimate, Threshold};
@@ -2922,6 +2923,35 @@ impl VectorIndexReader {
             offsets,
             self.rows_slice.rows_in(cluster),
         ))
+    }
+
+    /// The cost of reading `cluster`'s centroid row.
+    pub(crate) fn centroid_cost(&self, cluster: usize) -> crate::Result<ReadCost> {
+        let index = self
+            .index()
+            .ok_or_else(|| DataCorruption::comment_only("centroid rows need an IVF index"))?;
+        let row = index.centroid_row_slice(cluster)?;
+        // Priced in the unit of the cluster's rows, whatever storage the centroids sit on.
+        let unit = self.rows_slice.column(cluster, 0)?.storage_block_len();
+        Ok(range_cost(&row, 0..row.len(), unit))
+    }
+
+    /// Locates ascending `docs` through the location map, appending `(doc, location)` for each
+    /// one with a vector; an invalid map entry is `DataCorruption`.
+    pub(crate) fn locate_docs(
+        &self,
+        docs: &[DocId],
+        out: &mut Vec<(DocId, DocLocation)>,
+    ) -> crate::Result<()> {
+        self.id_map
+            .get(true)?
+            .locate_many(docs, &self.rows_slice.block_rows, out)
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::InvalidData => {
+                    DataCorruption::comment_only(error.to_string()).into()
+                }
+                _ => error.into(),
+            })
     }
 
     /// Reads a cluster's full-precision rows without document ids or quantized columns.

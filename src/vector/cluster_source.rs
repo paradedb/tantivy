@@ -17,8 +17,10 @@ pub(crate) struct ClusterRows<'a> {
     /// Doc ids aligned with `offsets`, when already in hand; otherwise the scan reads the DocIds
     /// column for the rows that need one.
     pub(crate) docs: Option<&'a [DocId]>,
-    /// The query's similarity to the cluster's centroid under the field metric.
-    pub(crate) centroid: Similarity,
+    /// The query's similarity to the cluster's centroid under the field metric, when already
+    /// computed; otherwise the scan computes it if a quantized read needs it, and the plan prices
+    /// that read.
+    pub(crate) centroid: Option<Similarity>,
 }
 
 impl ClusterRows<'_> {

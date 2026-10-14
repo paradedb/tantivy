@@ -261,15 +261,19 @@ impl<'a, 'w, T: VectorElement> RouterClusters<'a, 'w, T> {
                 // Never called while filling; +inf keeps the impossible case fail-open.
                 return f32::INFINITY;
             };
-            // Every margin assumes the stream key is the exact centroid similarity.
+            // Every margin assumes the stream key is the exact centroid similarity. The row is
+            // read unmetered, so debug builds report the same IO.
             #[cfg(debug_assertions)]
             {
-                let stride = self.reader.options().bytes_per_vector();
-                let centroid_bytes = self.index.centroid_bytes().expect("readable centroid rows");
-                let exact = self.query.metric().similarity_bytes::<f32>(
-                    self.query.widened(),
-                    &centroid_bytes[cluster * stride..(cluster + 1) * stride],
-                );
+                let row = self
+                    .index
+                    .centroid_row_slice(cluster)
+                    .and_then(|row| Ok(row.read_bytes()?))
+                    .expect("readable centroid row");
+                let exact = self
+                    .query
+                    .metric()
+                    .similarity_bytes::<f32>(self.query.widened(), &row);
                 debug_assert_eq!(
                     sim,
                     exact.score(),
@@ -373,7 +377,7 @@ impl<T: VectorElement> ClusterSource for RouterClusters<'_, '_, T> {
                 rows,
                 offsets,
                 docs,
-                centroid: sim,
+                centroid: Some(sim),
             }));
         }
     }

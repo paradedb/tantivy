@@ -18,6 +18,7 @@ use crate::vector::scan::heap::{tie_break_key, TieBreakHits};
 use crate::vector::scan::plan::PlanOverride;
 use crate::vector::scan::{ScanConfig, SegmentScan};
 use crate::vector::segment::plan::{SegmentPlan, Source};
+use crate::vector::source::matches::MatchClusters;
 use crate::vector::source::router::RouterClusters;
 use crate::vector::source::SourceReport;
 use crate::vector::stats::ProbeStats;
@@ -197,6 +198,11 @@ impl<T: VectorElement> VectorBackend<T> {
                 );
                 scan.run(&mut clusters)?;
                 SourceReport::Router(clusters.finish())
+            }
+            Source::FilterMatches(docs) => {
+                let mut clusters = MatchClusters::locate(&self.reader, docs, segment, plan.budget)?;
+                scan.run(&mut clusters)?;
+                SourceReport::Matches(clusters.finish())
             }
         };
         let (hits, scan_report) = scan.finish(self.segment_ord)?;

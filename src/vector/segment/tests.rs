@@ -4,12 +4,13 @@
 use std::collections::BTreeSet;
 use std::ops::Range;
 
+use crate::collector::TopDocs;
 use crate::query::{AllQuery, BooleanQuery, EnableScoring, Query};
 use crate::schema::Metric;
-use crate::vector::ivf::AdaptiveProbeParams;
+use crate::vector::ivf::{AdaptiveProbeParams, LocatedPath, Selectivity};
 use crate::vector::scan::layer_read::LayerRead;
 use crate::vector::scan::plan::{ExactRule, PlanOverride};
-use crate::vector::stats::LayerProbeStats;
+use crate::vector::stats::{AccessPath, LayerProbeStats};
 use crate::vector::test_support::{ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg, ReadLog};
 use crate::vector::tests::exhaustive_params;
 use crate::vector::{ProbeStats, RouterKind, Stage};
@@ -88,7 +89,12 @@ fn matrix_fixture(
         .without_vectors(|ordinal| ordinal % 37 == 5)
         .label("half", |ordinal| ordinal % 2 == 0)
         .label("rare", |ordinal| ordinal % 97 == 7)
-        .label("doomed", |ordinal| (60..63).contains(&ordinal));
+        .label("doomed", |ordinal| (60..63).contains(&ordinal))
+        // 5, 5, 5 and 40 matches in the four commits of 60 docs: whichever two commits merge,
+        // one segment holds at most 10 matches and the other at least 45.
+        .label("lopsided", |ordinal| {
+            ordinal % 60 < if ordinal >= 180 { 40 } else { 5 }
+        });
     if deletes {
         spec = spec.deletes(&[3, 60, 61, 62, 130, 131]);
     }
@@ -153,8 +159,64 @@ fn forced_plans() -> [(&'static str, PlanOverride); 4] {
     ]
 }
 
-/// Under an exhaustive probe every representation, filter, delete pattern, k and forced read
-/// plan returns exactly the oracle's top k, across segments.
+/// The probe parameters of each path: routed, and on IVF segments located under a cap of a
+/// tenth of a segment with the exact plan on, as pg_search runs it.
+fn paths(representation: Representation) -> Vec<(&'static str, AdaptiveProbeParams)> {
+    let routed = exhaustive_params(MATRIX_CLUSTERS);
+    if matches!(representation, Representation::Flat) {
+        return vec![("routed", routed)];
+    }
+    let located = AdaptiveProbeParams {
+        located: LocatedPath::MaxSelectivity(Selectivity::new(0.1).unwrap()),
+        exact_plan: true,
+        ..routed.clone()
+    };
+    vec![("routed", routed), ("located", located)]
+}
+
+/// One oracle-matrix case: the collector's top k, and on quantized segments every forced plan's,
+/// equal the oracle's.
+fn assert_case(
+    fixture: &Fixture,
+    representation: Representation,
+    filter: &dyn Query,
+    query: &[f32],
+    k: usize,
+    params: &AdaptiveProbeParams,
+    case: &str,
+) -> crate::Result<Vec<ProbeStats>> {
+    let fruit = fixture.search(filter, query, k, params.clone())?;
+    let oracle = fixture.oracle(filter, query, k)?;
+    assert_eq!(fruit.results, oracle, "{case}");
+    for stats in &fruit.stats {
+        assert_identities(stats, case);
+    }
+    if !matches!(representation, Representation::Quantized(_)) {
+        return Ok(fruit.stats);
+    }
+    for (name, forced) in forced_plans() {
+        let (hits, stats) = forced_top_k(fixture, filter, query, k, params, forced)?;
+        assert_eq!(hits, oracle, "{case} forced={name}");
+        if name != "all exact" {
+            continue;
+        }
+        for stats in &stats {
+            // A segment where nothing matches reports no layers.
+            let Some(layer0) = stats.layers.get(0) else {
+                continue;
+            };
+            assert_eq!(layer0.exact_clusters(), stats.postings_row, "{case}");
+            assert_eq!(layer0.exact_rows(), stats.candidates_scored, "{case}");
+            assert_eq!(layer0.scored(), 0, "{case}");
+            assert_eq!(stats.exact_rows, stats.candidates_scored, "{case}");
+        }
+    }
+    Ok(fruit.stats)
+}
+
+/// Under an exhaustive probe every representation, path, filter, delete pattern, k and forced
+/// read plan returns exactly the oracle's top k, across segments; a filter matching few docs in
+/// one segment and many in the other takes both paths.
 #[test]
 fn scan_matches_oracle() -> crate::Result<()> {
     let representations = [
@@ -173,50 +235,30 @@ fn scan_matches_oracle() -> crate::Result<()> {
                     ("rare", Box::new(fixture.filter("rare"))),
                     ("empty", Box::new(fixture.filter("absent"))),
                     ("doomed", Box::new(fixture.filter("doomed"))),
+                    ("lopsided", Box::new(fixture.filter("lopsided"))),
                 ];
-                for (query_ord, query) in matrix_queries().iter().enumerate() {
-                    for (filter_name, filter) in &filters {
-                        for k in [10, 1000] {
-                            let case = format!(
-                                "{metric:?} {representation:?} deletes={deletes} \
-                                 query={query_ord} filter={filter_name} k={k}"
-                            );
-                            let fruit = fixture.search(
-                                filter.as_ref(),
-                                query,
-                                k,
-                                exhaustive_params(MATRIX_CLUSTERS),
-                            )?;
-                            let oracle = fixture.oracle(filter.as_ref(), query, k)?;
-                            assert_eq!(fruit.results, oracle, "{case}");
-                            for stats in &fruit.stats {
-                                assert_identities(stats, &case);
-                            }
-                            if !matches!(representation, Representation::Quantized(_)) {
-                                continue;
-                            }
-                            for (name, forced) in forced_plans() {
-                                let (hits, stats) = forced_top_k(
+                for (path, params) in paths(representation) {
+                    for (query_ord, query) in matrix_queries().iter().enumerate() {
+                        for (filter_name, filter) in &filters {
+                            for k in [10, 1000] {
+                                let case = format!(
+                                    "{metric:?} {representation:?} {path} deletes={deletes} \
+                                     query={query_ord} filter={filter_name} k={k}"
+                                );
+                                let stats = assert_case(
                                     &fixture,
+                                    representation,
                                     filter.as_ref(),
                                     query,
                                     k,
-                                    &exhaustive_params(MATRIX_CLUSTERS),
-                                    forced,
+                                    &params,
+                                    &case,
                                 )?;
-                                assert_eq!(hits, oracle, "{case} forced={name}");
-                                if name != "all exact" {
-                                    continue;
-                                }
-                                for stats in &stats {
-                                    // A segment where nothing matches reports no layers.
-                                    let Some(layer0) = stats.layers.get(0) else {
-                                        continue;
-                                    };
-                                    assert_eq!(layer0.exact_clusters(), stats.postings_row);
-                                    assert_eq!(layer0.exact_rows(), stats.candidates_scored);
-                                    assert_eq!(layer0.scored(), 0);
-                                    assert_eq!(stats.exact_rows, stats.candidates_scored);
+                                if path == "located" && *filter_name == "lopsided" {
+                                    let paths: Vec<_> =
+                                        stats.iter().map(|stats| stats.access_path).collect();
+                                    assert!(paths.contains(&AccessPath::Located), "{case}");
+                                    assert!(paths.contains(&AccessPath::Routed), "{case}");
                                 }
                             }
                         }
@@ -965,13 +1007,105 @@ fn retired_groups_never_reach_a_later_band() -> crate::Result<()> {
     Ok(())
 }
 
+/// The located path reads no DocIds column: its location-map reads run in `locate`, and each
+/// quantized layer-0 cluster reads its centroid row in `centroid`.
+fn located_path_reads_no_doc_ids() -> crate::Result<()> {
+    for schedule in [&[][..], &[1][..], &[1, 4][..]] {
+        let fixture = reads_fixture(Metric::L2, schedule, &[])?;
+        let ranges = fixture.column_ranges()?;
+        let filter = BooleanQuery::union(vec![
+            Box::new(fixture.filter("d42")) as Box<dyn Query>,
+            Box::new(fixture.filter("d242")),
+            Box::new(fixture.filter("d1101")),
+        ]);
+        let query = reads_vector(42);
+        let params = AdaptiveProbeParams {
+            located: LocatedPath::MaxSelectivity(Selectivity::new(1.0).unwrap()),
+            ..every_cluster()
+        };
+        let collector = TopDocs::with_limit(10)
+            .order_by_similarity(fixture.field, query.clone())
+            .with_adaptive_params(params);
+        let searcher = fixture.index.reader()?.searcher();
+        // The first search opens the location map; measure the second.
+        searcher.search(&filter, &collector)?;
+        fixture.clear_reads();
+        let fruit = searcher.search(&filter, &collector)?;
+        let case = format!("{schedule:?}");
+        assert_eq!(
+            fruit.results,
+            fixture.oracle(&filter, &query, 10)?,
+            "{case}"
+        );
+        let stats = &fruit.stats[0];
+        assert_eq!(stats.access_path, AccessPath::Located, "{case}");
+        assert_eq!(stats.located_matches, 3, "{case}");
+        let log = fixture.reads();
+        assert!(
+            log.iter().all(|(_, read)| ranges
+                .docs
+                .iter()
+                .flatten()
+                .all(|docs| !overlaps(read, docs))),
+            "{case}: a DocIds column was read"
+        );
+        let locate_reads = stage_reads(&log, |stage| stage == Stage::Locate).len();
+        assert!(locate_reads > 0, "{case}");
+        assert_eq!(stats.locate_io.reads, locate_reads as u64, "{case}");
+        // Centroid rows live in the centroid file, which the read log does not record.
+        let quantized_clusters = stats.layers.get(0).map_or(0, |layer0| {
+            layer0.sparse_clusters() + layer0.full_clusters()
+        });
+        assert_eq!(stats.centroid_io.reads, quantized_clusters as u64, "{case}");
+        assert_eq!(quantized_clusters > 0, !schedule.is_empty(), "{case}");
+    }
+    Ok(())
+}
+
+/// The located path charges every cluster's open and every scored row against the work budget,
+/// and scores every match even past the budget.
+#[test]
+fn located_path_charges_the_work_meter() -> crate::Result<()> {
+    let fixture = reads_fixture(Metric::L2, &[1], &[])?;
+    let filter = BooleanQuery::union(vec![
+        Box::new(fixture.filter("d42")) as Box<dyn Query>,
+        Box::new(fixture.filter("d242")),
+        Box::new(fixture.filter("d1101")),
+    ]);
+    // Far below one cluster's work: the routed path would stop after its first cluster.
+    let params = AdaptiveProbeParams {
+        located: LocatedPath::MaxSelectivity(Selectivity::new(1.0).unwrap()),
+        max_probe_fraction: 1e-6,
+        min_probe_clusters: 0,
+        ..Default::default()
+    };
+    let weight = fixture.weight(&filter)?;
+    let (hits, stats) =
+        fixture.run_segment(0, weight.as_ref(), &reads_vector(42), 10, params.clone())?;
+    let searcher = fixture.index.reader()?.searcher();
+    let vectors = searcher.segment_readers()[0].vector_index(fixture.field)?;
+    let ivf = vectors.index().unwrap();
+    let (budget, n_avg, x) = params.resolved_work_budget(ivf.num_clusters(), ivf.num_docs())?;
+    assert_eq!(stats.access_path, AccessPath::Located);
+    assert_eq!(hits.len(), 3, "every match is scored");
+    assert_eq!(stats.candidates_scored, 3);
+    let charged = stats.located_clusters as f64 * x + 3.0 * (1.0 - x) / n_avg;
+    assert!(
+        (f64::from(stats.work_charged) - charged).abs() <= 1e-6,
+        "{stats:?}"
+    );
+    assert_eq!(stats.work_budget, budget as f32);
+    assert!(f64::from(stats.work_charged) > budget);
+    Ok(())
+}
+
 /// One named row of the reads table.
 type ReadCase = (&'static str, fn() -> crate::Result<()>);
 
 /// Every plan reads only what it needs, in the documented order.
 #[test]
 fn reads_follow_the_plan() -> crate::Result<()> {
-    let cases: [ReadCase; 11] = [
+    let cases: [ReadCase; 12] = [
         (
             "an empty cluster skips its band",
             empty_cluster_skips_its_band,
@@ -1015,6 +1149,10 @@ fn reads_follow_the_plan() -> crate::Result<()> {
         (
             "a retired group never reaches a later band",
             retired_groups_never_reach_a_later_band,
+        ),
+        (
+            "the located path reads no DocIds",
+            located_path_reads_no_doc_ids,
         ),
     ];
     for (name, case) in cases {
