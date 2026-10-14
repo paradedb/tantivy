@@ -7,6 +7,7 @@ pub(crate) mod estimate;
 mod exact;
 pub(crate) mod heap;
 pub(crate) mod layer_read;
+pub(crate) mod plan;
 
 use std::ops::Range;
 
@@ -15,7 +16,10 @@ use self::columns::{Columns, QuantizedCandidates};
 use self::estimate::{combine_initial, combine_refine, CombineCtx};
 use self::exact::ExactScorer;
 use self::heap::TieBreakHits;
-use self::layer_read::{decode_layer, plan_runs, Decoded, LayerRead, LayerSpec};
+use self::layer_read::{decode_layer, Decoded, LayerRead, LayerSpec};
+#[cfg(test)]
+use self::plan::{forced_plan, PlanOverride};
+use self::plan::{price, Read, ReadCosts};
 use crate::collector::sort_key::Comparator;
 use crate::collector::SegmentSortKeyComputer;
 use crate::error::DataCorruption;
@@ -35,6 +39,8 @@ pub(crate) struct ScanConfig {
     pub(crate) top_n: usize,
     /// Upper bound on rows admitted, for sizing the candidate columns.
     pub(crate) capacity: usize,
+    #[cfg(test)]
+    pub(crate) plan_override: Option<PlanOverride>,
 }
 
 /// Per-layer counts of a quantized scan.
@@ -44,6 +50,19 @@ pub(crate) struct LayerReport {
     pub(crate) scored: usize,
     /// Candidates left after the layer's boundary.
     pub(crate) survivors: usize,
+    /// Clusters read sparsely at this layer.
+    pub(crate) sparse_clusters: usize,
+    /// Clusters read as a whole band at this layer.
+    pub(crate) full_clusters: usize,
+}
+
+impl LayerReport {
+    fn count(&mut self, read: LayerRead) {
+        match read {
+            LayerRead::Sparse => self.sparse_clusters += 1,
+            LayerRead::Band => self.full_clusters += 1,
+        }
+    }
 }
 
 /// What a finished scan reports.
@@ -68,6 +87,8 @@ pub(crate) struct ScanTrace {
     pub(crate) boundary_rows: Vec<Vec<usize>>,
     /// `(row, estimate bits)` after the shortlist and after each refining layer.
     pub(crate) estimate_rows: Vec<Vec<(usize, u32)>>,
+    /// `(row, [raw prefix, base, estimate, sigma] bits)` at the same points.
+    pub(crate) layer_columns: Vec<Vec<(usize, [u32; 4])>>,
     /// Rows scored in the exact phase.
     pub(crate) exact_phase_rows: Vec<usize>,
 }
@@ -94,10 +115,16 @@ struct QuantizedState<'a> {
     decoded: Decoded,
     /// A shortlisted cluster's layer-0 columns, before they join the candidates.
     cluster_columns: Columns,
+    #[cfg(test)]
+    plan_override: Option<PlanOverride>,
 }
 
 impl<'a> QuantizedState<'a> {
-    fn new(query: &'a QuantizedQueryCtx, field: &'a QuantizedFieldReader, capacity: usize) -> Self {
+    fn new(
+        query: &'a QuantizedQueryCtx,
+        field: &'a QuantizedFieldReader,
+        config: &ScanConfig,
+    ) -> Self {
         let meta = query.index.meta.field();
         Self {
             layers: (0..query.active_layers())
@@ -105,17 +132,38 @@ impl<'a> QuantizedState<'a> {
                     query,
                     reader: &field.layers()[index],
                     index,
-                    has_norms: index == 0,
                     query_error_squared: query.query_error_squared(index) as f32,
                 })
                 .collect(),
             metric: meta.metric,
             dimension: meta.dim as usize,
-            candidates: QuantizedCandidates::with_capacity(capacity),
+            candidates: QuantizedCandidates::with_capacity(config.capacity),
             admitted: Vec::new(),
             decoded: Decoded::default(),
             cluster_columns: Columns::default(),
+            #[cfg(test)]
+            plan_override: config.plan_override,
         }
+    }
+
+    /// The plan for `costs`, or a test's override.
+    fn choose(&self, costs: &ReadCosts) -> Read {
+        #[cfg(test)]
+        return forced_plan(costs, self.plan_override);
+        #[cfg(not(test))]
+        plan::plan(costs)
+    }
+
+    /// Prices the rows of `selected` at `layer` and plans their read. A sparse plan leaves its rows
+    /// and code runs in `scratch` for the read.
+    fn read_plan(
+        &self,
+        selected: &ClusterRows<'_>,
+        layer: usize,
+        scratch: &mut ReadScratch,
+    ) -> crate::Result<Read> {
+        let costs = price(&self.layers[layer], selected, scratch)?;
+        Ok(self.choose(&costs))
     }
 
     fn record(&mut self, cluster: usize, admitted: AdmittedCluster) {
@@ -133,8 +181,8 @@ impl<'a> QuantizedState<'a> {
             .filter_map(|(cluster, admitted)| admitted.map(|admitted| (cluster, admitted)))
     }
 
-    /// Reads `layer` for the rows of `selected` as `read` and decodes them; returns how to combine
-    /// the decoded columns into estimates.
+    /// Reads `layer` for the rows of `selected` as `read` plans and decodes them; returns how to
+    /// combine the decoded columns into estimates.
     fn decode(
         &mut self,
         layer: usize,
@@ -143,9 +191,6 @@ impl<'a> QuantizedState<'a> {
         scratch: &mut ReadScratch,
     ) -> crate::Result<CombineCtx> {
         let spec = self.layers[layer];
-        if read == LayerRead::Sparse {
-            plan_runs(&spec, selected, scratch)?;
-        }
         decode_layer(&spec, selected, read, &mut self.decoded, scratch)?;
         let cluster_score = selected.centroid.score();
         let query_norm = spec.query.score_query_norm(cluster_score);
@@ -158,14 +203,15 @@ impl<'a> QuantizedState<'a> {
         })
     }
 
-    /// Scores a cluster's rows on layer 0 and appends them as candidates.
+    /// Scores a cluster's rows on layer 0, read as `read`, and appends them as candidates.
     fn admit(
         &mut self,
         rows: &ClusterRows<'_>,
+        read: LayerRead,
         bound: &mut KthBound,
         scratch: &mut ReadScratch,
     ) -> crate::Result<()> {
-        let ctx = self.decode(0, rows, LayerRead::Band, scratch)?;
+        let ctx = self.decode(0, rows, read, scratch)?;
         combine_initial(&ctx, &self.decoded, &mut self.cluster_columns);
         self.record(
             rows.cluster,
@@ -185,15 +231,17 @@ impl<'a> QuantizedState<'a> {
         Ok(())
     }
 
-    /// Refines the candidates at `at`, the survivors `group` of one cluster, with `layer`.
+    /// Refines the candidates at `at`, the survivors `group` of one cluster, with `layer` read as
+    /// `read`.
     fn refine(
         &mut self,
         layer: usize,
         group: &ClusterRows<'_>,
+        read: LayerRead,
         at: Range<usize>,
         scratch: &mut ReadScratch,
     ) -> crate::Result<()> {
-        let ctx = self.decode(layer, group, LayerRead::Sparse, scratch)?;
+        let ctx = self.decode(layer, group, read, scratch)?;
         combine_refine(&ctx, &self.decoded, &mut self.candidates.columns, at);
         Ok(())
     }
@@ -202,10 +250,16 @@ impl<'a> QuantizedState<'a> {
     fn prune(&mut self, layer: usize, bound: &mut KthBound, report: &mut ScanReport) {
         report.layers[layer].scored = self.candidates.len();
         #[cfg(test)]
-        report
-            .trace
-            .estimate_rows
-            .push(self.candidates.estimate_trace());
+        {
+            report
+                .trace
+                .estimate_rows
+                .push(self.candidates.estimate_trace());
+            report
+                .trace
+                .layer_columns
+                .push(self.candidates.column_trace());
+        }
         let _boundary = enter_vector_stage(Stage::Boundary(layer as u8));
         self.candidates.band(bound);
         report.layers[layer].survivors = self.candidates.len();
@@ -284,9 +338,7 @@ where
         tie_comparator: C,
     ) -> crate::Result<Self> {
         let quantized = match (query.quantized, reader.quantization()) {
-            (Some(quantized), Some(field)) => {
-                Some(QuantizedState::new(quantized, field, config.capacity))
-            }
+            (Some(quantized), Some(field)) => Some(QuantizedState::new(quantized, field, &config)),
             (Some(_), None) => {
                 return Err(DataCorruption::comment_only(
                     "quantized query requires quantized slots",
@@ -364,7 +416,11 @@ where
         #[cfg(test)]
         self.report.trace.scored_rows.extend(rows.global_rows());
         match &mut self.quantized {
-            Some(state) => state.admit(rows, &mut self.exact.bound, &mut self.scratch)?,
+            Some(state) => {
+                let Read::Layer(read) = state.read_plan(rows, 0, &mut self.scratch)?;
+                self.report.layers[0].count(read);
+                state.admit(rows, read, &mut self.exact.bound, &mut self.scratch)?;
+            }
             None => {
                 self.report.exact_rows += self.exact.score(rows)?;
             }
@@ -399,7 +455,9 @@ where
                 docs: None,
                 centroid: admitted.centroid,
             };
-            state.refine(layer, &group, at, &mut self.scratch)?;
+            let Read::Layer(read) = state.read_plan(&group, layer, &mut self.scratch)?;
+            self.report.layers[layer].count(read);
+            state.refine(layer, &group, read, at, &mut self.scratch)?;
         }
         drop(layer_scan);
         state.prune(layer, &mut self.exact.bound, &mut self.report);

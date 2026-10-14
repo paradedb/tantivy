@@ -7,10 +7,13 @@ use std::ops::Range;
 use crate::query::{AllQuery, BooleanQuery, EnableScoring, Query};
 use crate::schema::Metric;
 use crate::vector::ivf::AdaptiveProbeParams;
+use crate::vector::scan::layer_read::LayerRead;
+use crate::vector::scan::plan::PlanOverride;
+use crate::vector::stats::LayerProbeStats;
 use crate::vector::test_support::{ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg, ReadLog};
 use crate::vector::tests::exhaustive_params;
 use crate::vector::{ProbeStats, RouterKind, Stage};
-use crate::DocId;
+use crate::{DocAddress, DocId, Score};
 
 // --- Oracle matrix ---
 
@@ -101,8 +104,37 @@ fn assert_identities(stats: &ProbeStats, case: &str) {
     );
 }
 
-/// Under an exhaustive probe every representation, filter, delete pattern and k returns exactly
-/// the oracle's top k, across segments.
+/// The global top `k` with every segment searched directly under `forced`.
+fn forced_top_k(
+    fixture: &Fixture,
+    filter: &dyn Query,
+    query: &[f32],
+    k: usize,
+    params: &AdaptiveProbeParams,
+    forced: PlanOverride,
+) -> crate::Result<Vec<(Score, DocAddress)>> {
+    let weight = fixture.weight(filter)?;
+    let segments = fixture.index.reader()?.searcher().segment_readers().len();
+    let mut hits = Vec::new();
+    for segment in 0..segments {
+        let (segment_hits, stats) = fixture.run_planned(
+            segment,
+            weight.as_ref(),
+            query,
+            k,
+            params.clone(),
+            Some(forced),
+        )?;
+        assert_identities(&stats, "forced plan");
+        hits.extend(segment_hits);
+    }
+    hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    hits.truncate(k);
+    Ok(hits)
+}
+
+/// Under an exhaustive probe every representation, filter, delete pattern, k and forced read
+/// plan returns exactly the oracle's top k, across segments.
 #[test]
 fn scan_matches_oracle() -> crate::Result<()> {
     let representations = [
@@ -139,6 +171,20 @@ fn scan_matches_oracle() -> crate::Result<()> {
                             assert_eq!(fruit.results, oracle, "{case}");
                             for stats in &fruit.stats {
                                 assert_identities(stats, &case);
+                            }
+                            if !matches!(representation, Representation::Quantized(_)) {
+                                continue;
+                            }
+                            for forced in [LayerRead::Band, LayerRead::Sparse] {
+                                let hits = forced_top_k(
+                                    &fixture,
+                                    filter.as_ref(),
+                                    query,
+                                    k,
+                                    &exhaustive_params(MATRIX_CLUSTERS),
+                                    PlanOverride::read(forced),
+                                )?;
+                                assert_eq!(hits, oracle, "{case} forced={forced:?}");
                             }
                         }
                     }
@@ -241,6 +287,78 @@ fn single_centroid_segment_routes() -> crate::Result<()> {
     let fruit = fixture.search(&AllQuery, &query, 3, AdaptiveProbeParams::default())?;
     assert_eq!(fruit.results, fixture.oracle(&AllQuery, &query, 3)?);
     assert_eq!(fruit.stats[0].clusters_probed(), 1);
+    Ok(())
+}
+
+// --- Read equivalence ---
+
+/// Sparse layer reads summed over every layer.
+fn sparse_clusters(stats: &ProbeStats) -> usize {
+    (0..)
+        .map_while(|layer| stats.layers.get(layer))
+        .map(LayerProbeStats::sparse_clusters)
+        .sum()
+}
+
+/// Band and sparse reads give bit-identical candidate columns, estimates, boundaries and results
+/// at every layer, for every metric, in RAM and on pages.
+#[test]
+fn read_plans_are_bit_identical() -> crate::Result<()> {
+    let shapes: [(&[u8], usize, usize, usize, bool); 5] = [
+        (&[1], 64, 8, 800, false),
+        (&[1, 1], 64, 8, 800, false),
+        (&[1, 4], 64, 8, 800, false),
+        (&[2, 4], 64, 8, 800, false),
+        (&[1, 4], 1024, 2, 1200, true),
+    ];
+    for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+        for (schedule, dim, clusters, docs, paged) in shapes {
+            let mut spec = FixtureSpec::clustered(metric, dim, clusters, docs)
+                .schedule(schedule)
+                .without_vectors(|ordinal| ordinal % 101 == 7)
+                .label("few", |ordinal| ordinal % 40 == 3)
+                .label("some", |ordinal| ordinal % 4 == 1);
+            if paged {
+                spec = spec.paged();
+            }
+            let fixture = spec.build()?;
+            let query = Lcg(5).vector(dim, 0.5);
+            let filters: [(&str, Box<dyn Query>, bool); 3] = [
+                ("few", Box::new(fixture.filter("few")), true),
+                ("some", Box::new(fixture.filter("some")), true),
+                ("none", Box::new(AllQuery), schedule.len() > 1),
+            ];
+            for (name, filter, expect_sparse) in filters {
+                let case = format!("{metric:?} {schedule:?} dim={dim} filter={name}");
+                let weight = fixture.weight(filter.as_ref())?;
+                let run = |forced| {
+                    fixture.run_planned(
+                        0,
+                        weight.as_ref(),
+                        &query,
+                        10,
+                        exhaustive_params(clusters),
+                        Some(forced),
+                    )
+                };
+                let (band_hits, band) = run(PlanOverride::read(LayerRead::Band))?;
+                let (sparse_hits, sparse) = run(PlanOverride::read(LayerRead::Sparse))?;
+                assert_eq!(sparse_clusters(&band), 0, "{case}");
+                assert_eq!(sparse_clusters(&sparse) > 0, expect_sparse, "{case}");
+                let (band, sparse) = (&band.quantized_trace, &sparse.quantized_trace);
+                assert!(!band.layer_columns.is_empty(), "{case}");
+                assert_eq!(sparse.layer_columns, band.layer_columns, "{case}");
+                assert_eq!(sparse.estimate_rows, band.estimate_rows, "{case}");
+                assert_eq!(sparse.boundary_rows, band.boundary_rows, "{case}");
+                assert_eq!(sparse_hits, band_hits, "{case}");
+                assert_eq!(
+                    band_hits,
+                    fixture.oracle(filter.as_ref(), &query, 10)?,
+                    "{case}"
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -635,13 +753,56 @@ fn exact_reads_touch_only_survivor_pages() -> crate::Result<()> {
     Ok(())
 }
 
+/// A whole-cluster selection reads the band, even with sparse reads forced.
+fn whole_cluster_selections_read_the_band() -> crate::Result<()> {
+    let fixture = reads_fixture(Metric::L2, &[1, 4], &[])?;
+    let (_, stats) = fixture.run_planned(
+        0,
+        fixture.all()?.as_ref(),
+        &reads_vector(42),
+        10,
+        every_cluster(),
+        Some(PlanOverride::read(LayerRead::Sparse)),
+    )?;
+    let layer0 = stats.layers.get(0).unwrap();
+    assert_eq!(layer0.sparse_clusters(), 0, "{stats:?}");
+    assert_eq!(layer0.full_clusters(), stats.postings_row, "{stats:?}");
+    Ok(())
+}
+
+/// Left to the layout on paged d=1024 storage, a selective filter reads layer 0 sparsely and a
+/// dense one reads whole bands; both return the oracle's top k.
+fn layout_reads_selective_filters_sparsely() -> crate::Result<()> {
+    let fixture = FixtureSpec::clustered(Metric::L2, 1024, 2, 1200)
+        .schedule(&[1, 4])
+        .paged()
+        .label("few", |ordinal| ordinal % 300 == 7)
+        .label("dense", |ordinal| ordinal % 10 != 0)
+        .build()?;
+    let query = Lcg(5).vector(1024, 0.5);
+    for (name, selective) in [("few", true), ("dense", false)] {
+        let filter = fixture.filter(name);
+        let fruit = fixture.search(&filter, &query, 10, exhaustive_params(2))?;
+        let stats = &fruit.stats[0];
+        let layer0 = stats.layers.get(0).unwrap();
+        let expected = if selective { stats.postings_row } else { 0 };
+        assert_eq!(layer0.sparse_clusters(), expected, "{name}: {stats:?}");
+        assert_eq!(
+            fruit.results,
+            fixture.oracle(&filter, &query, 10)?,
+            "{name}"
+        );
+    }
+    Ok(())
+}
+
 /// One named row of the reads table.
 type ReadCase = (&'static str, fn() -> crate::Result<()>);
 
 /// Every plan reads only what it needs, in the documented order.
 #[test]
 fn reads_follow_the_plan() -> crate::Result<()> {
-    let cases: [ReadCase; 7] = [
+    let cases: [ReadCase; 9] = [
         (
             "an empty cluster skips its band",
             empty_cluster_skips_its_band,
@@ -669,6 +830,14 @@ fn reads_follow_the_plan() -> crate::Result<()> {
         (
             "exact scoring reads only the survivors' pages",
             exact_reads_touch_only_survivor_pages,
+        ),
+        (
+            "a whole-cluster selection reads the band",
+            whole_cluster_selections_read_the_band,
+        ),
+        (
+            "the layout reads selective filters sparsely",
+            layout_reads_selective_filters_sparsely,
         ),
     ];
     for (name, case) in cases {

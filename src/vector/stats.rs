@@ -25,6 +25,8 @@ pub struct LayerProbeStats {
     boundary_ns: u64,
     scored: usize,
     survivors: usize,
+    sparse_clusters: usize,
+    full_clusters: usize,
 }
 
 impl LayerProbeStats {
@@ -46,6 +48,16 @@ impl LayerProbeStats {
     /// Candidates left after the layer's boundary.
     pub fn survivors(&self) -> usize {
         self.survivors
+    }
+
+    /// Clusters read sparsely at this layer.
+    pub fn sparse_clusters(&self) -> usize {
+        self.sparse_clusters
+    }
+
+    /// Clusters read as a whole band at this layer.
+    pub fn full_clusters(&self) -> usize {
+        self.full_clusters
     }
 }
 
@@ -75,6 +87,11 @@ impl serde::Serialize for LayerProbeStatsSet {
             map.serialize_entry(&format!("layer{index}_scan_ns"), &layer.scan_ns)?;
             map.serialize_entry(&format!("layer{index}_scored"), &layer.scored)?;
             map.serialize_entry(&format!("layer{index}_survivors"), &layer.survivors)?;
+            map.serialize_entry(
+                &format!("layer{index}_sparse_clusters"),
+                &layer.sparse_clusters,
+            )?;
+            map.serialize_entry(&format!("layer{index}_full_clusters"), &layer.full_clusters)?;
             map.serialize_entry(&format!("boundary{index}_ns"), &layer.boundary_ns)?;
         }
         map.end()
@@ -216,6 +233,8 @@ impl ProbeStats {
                         io: totals.io(Stage::LayerScan(layer as u8)),
                         scored: report.scored,
                         survivors: report.survivors,
+                        sparse_clusters: report.sparse_clusters,
+                        full_clusters: report.full_clusters,
                         ..LayerProbeStats::default()
                     })
                     .collect(),
@@ -433,6 +452,8 @@ mod tests {
                 "scan_ns",
                 "scored",
                 "survivors",
+                "sparse_clusters",
+                "full_clusters",
             ] {
                 keys.insert(format!("layer{layer}_{suffix}"));
             }

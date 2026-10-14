@@ -17,8 +17,6 @@ pub(crate) struct LayerSpec<'a> {
     pub(crate) query: &'a QuantizedQueryCtx,
     pub(crate) reader: &'a QuantizedLayerReader,
     pub(crate) index: usize,
-    /// Whether the layer's band carries the rows' residual norms: layer 0 only.
-    pub(crate) has_norms: bool,
     /// The layer's own squared query-quantization error: zero for a grid layer.
     pub(crate) query_error_squared: f32,
 }
@@ -34,7 +32,7 @@ impl LayerSpec<'_> {
 pub(crate) enum LayerRead {
     /// The cluster's whole band, in one request.
     Band,
-    /// The planned code runs in scratch and the sidecar span.
+    /// The code runs planned in scratch, the sidecar span and, at layer 0, the norms column.
     Sparse,
 }
 
@@ -66,32 +64,11 @@ impl Decoded {
     }
 }
 
-// --- Planning ---
-
-/// Plans the code runs a sparse read of `selected` requests, into `scratch`.
-pub(crate) fn plan_runs(
-    spec: &LayerSpec<'_>,
-    selected: &ClusterRows<'_>,
-    scratch: &mut ReadScratch,
-) -> crate::Result<()> {
-    scratch.rows.clear();
-    match selected.offsets {
-        None => scratch.rows.extend(selected.rows.clone()),
-        Some(offsets) => scratch
-            .rows
-            .extend(offsets.iter().map(|&offset| selected.rows.start + offset)),
-    }
-    spec.reader
-        .cluster_in_block(selected.cluster)?
-        .plan_codes(&scratch.rows, &mut scratch.runs);
-    Ok(())
-}
-
 // --- Decoding ---
 
 /// Decodes `spec` for the rows of `selected` into `out`, reading as `read` says.
 ///
-/// A sparse read uses the runs [`plan_runs`] left in `scratch`; a whole-cluster selection always
+/// A sparse read uses the rows and runs pricing left in `scratch`; a whole-cluster selection always
 /// reads the band.
 pub(crate) fn decode_layer(
     spec: &LayerSpec<'_>,
@@ -121,7 +98,7 @@ fn decode_band(
     let count = selected.len();
     match selected.offsets {
         None => {
-            if spec.has_norms {
+            if spec.reader.has_norms() {
                 out.norms.resize(count, 0.0);
                 decode_f32s(band_norms(&band)?, &mut out.norms);
             }
@@ -172,7 +149,7 @@ fn decode_band_rows(
             out.constants[i] = f32_at(band_constants(band)?, row);
         }
     }
-    if spec.has_norms {
+    if spec.reader.has_norms() {
         let norms = band_norms(band)?;
         out.norms.clear();
         out.norms
@@ -181,7 +158,8 @@ fn decode_band_rows(
     validate_decoded_sidecar(&out.gammas, &out.errors, start)
 }
 
-/// Reads the planned code runs and the sidecar span, and decodes the selected rows.
+/// Reads the planned code runs, the sidecar span and, at layer 0, the norms column, and decodes
+/// the selected rows.
 fn decode_runs(
     spec: &LayerSpec<'_>,
     selected: &ClusterRows<'_>,
@@ -221,6 +199,14 @@ fn decode_runs(
         &mut out.errors,
         if l2 { &mut out.constants } else { &mut [] },
     )?;
+    if spec.reader.has_norms() {
+        let norms = cluster.read_norms()?;
+        out.norms.clear();
+        out.norms.extend(
+            rows.iter()
+                .map(|&row| f32_at(&norms, row - cluster.rows.start)),
+        );
+    }
     // The reported error row is the first selected row.
     validate_decoded_sidecar(&out.gammas, &out.errors, rows[0])
 }
