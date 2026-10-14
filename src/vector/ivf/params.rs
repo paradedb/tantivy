@@ -105,6 +105,10 @@ pub enum LocatedPath {
     Off,
     /// The cap is `floor(selectivity * max_doc)`.
     MaxSelectivity(Selectivity),
+    /// The cap is the rows the segment's routed work budget buys with no cluster opened,
+    /// `floor(budget * n_avg / (1 - x))`: a filter matching no more documents than routing may
+    /// score is located instead.
+    Auto,
 }
 
 /// A fraction in `(0, 1]`.

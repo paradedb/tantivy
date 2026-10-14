@@ -164,13 +164,23 @@ impl<T: VectorElement> VectorBackend<T> {
         C: Comparator<K::SegmentSortKey>,
     {
         let init = enter_vector_stage(Stage::ScanInit);
-        let Some(plan) = SegmentPlan::build(&self.adaptive, index, weight, segment, top_n)? else {
+        let plan = SegmentPlan::build(&self.adaptive, index, weight, segment, top_n)?;
+        let capacity = plan.capacity_hint();
+        let SegmentPlan {
+            budget,
+            source,
+            report,
+        } = plan;
+        let Some(source) = source else {
             drop(init);
-            return Ok((Vec::new(), ProbeStats::empty(take_stage_totals())));
+            return Ok((
+                Vec::new(),
+                ProbeStats::empty(report.located_cap, take_stage_totals()),
+            ));
         };
         let config = ScanConfig {
             top_n,
-            capacity: plan.capacity_hint(),
+            capacity,
             exact_plan: self.adaptive.exact_plan,
             #[cfg(test)]
             plan_override: self.plan_override,
@@ -184,14 +194,14 @@ impl<T: VectorElement> VectorBackend<T> {
             tie_comparator,
         )?;
         drop(init);
-        let source = match plan.source {
+        let source = match source {
             Source::Router(filter) => {
                 let mut workspace = RouterWorkspace::default();
                 let mut clusters = RouterClusters::new(
                     &self.reader,
                     &self.query,
                     &mut workspace,
-                    plan.budget,
+                    budget,
                     filter,
                     segment,
                     &self.adaptive,
@@ -200,7 +210,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 SourceReport::Router(clusters.finish())
             }
             Source::FilterMatches(docs) => {
-                let mut clusters = MatchClusters::locate(&self.reader, docs, segment, plan.budget)?;
+                let mut clusters = MatchClusters::locate(&self.reader, docs, segment, budget)?;
                 scan.run(&mut clusters)?;
                 SourceReport::Matches(clusters.finish())
             }
@@ -208,7 +218,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let (hits, scan_report) = scan.finish(self.segment_ord)?;
         Ok((
             hits,
-            ProbeStats::assemble(plan.report, source, scan_report, take_stage_totals()),
+            ProbeStats::assemble(report, source, scan_report, take_stage_totals()),
         ))
     }
 

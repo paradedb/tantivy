@@ -174,6 +174,8 @@ pub struct ProbeStats {
     /// Reads for exact scoring: full-precision rows and the DocIds they need.
     #[serde(flatten, serialize_with = "serialize_exact_io")]
     pub exact_io: VectorIoStats,
+    /// The segment's located-path cap in matches; 0 with the located path off.
+    pub located_cap: usize,
     /// Where this segment's layer-0 clusters came from.
     pub access_path: AccessPath,
     /// Live filter matches with a vector, on the located path.
@@ -303,6 +305,7 @@ impl ProbeStats {
             result_assembly_ns: Some(0),
             segment_rows: Some(plan.segment_rows),
             segment_clusters: Some(plan.segment_clusters),
+            located_cap: plan.located_cap,
             ..Self::default()
         };
         match source {
@@ -318,9 +321,12 @@ impl ProbeStats {
         stats
     }
 
-    /// Statistics of a segment search that matched nothing.
-    pub(crate) fn empty(totals: StageTotals) -> Self {
-        let mut stats = Self::default();
+    /// Statistics of a segment search that matched nothing, under `located_cap`.
+    pub(crate) fn empty(located_cap: usize, totals: StageTotals) -> Self {
+        let mut stats = Self {
+            located_cap,
+            ..Self::default()
+        };
         stats.apply_timings(&totals);
         stats
     }
@@ -488,6 +494,7 @@ mod tests {
         "exact_reads",
         "exact_bytes_read",
         "exact_storage_blocks",
+        "located_cap",
         "access_path",
         "located_matches",
         "located_absent",
@@ -562,6 +569,7 @@ mod tests {
         let plan = PlanReport {
             segment_rows: 100,
             segment_clusters: 5,
+            located_cap: 0,
         };
         let quantized = ScanReport {
             layers: vec![LayerReport::default(); 2],
@@ -589,6 +597,6 @@ mod tests {
             .filter(|key| **key != "result_assembly_ns")
             .map(|key| key.to_string())
             .collect();
-        assert_eq!(keys(&ProbeStats::empty(StageTotals::default())), empty);
+        assert_eq!(keys(&ProbeStats::empty(0, StageTotals::default())), empty);
     }
 }

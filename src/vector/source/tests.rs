@@ -31,8 +31,8 @@ struct Walk {
 /// Walks segment 0's router source as a scan would, admitting every row of every cluster;
 /// `feedback(rows)` is what the scan reports after `rows` admitted rows.
 fn walk(seg: &SegmentRun<'_>, feedback: impl Fn(usize) -> Feedback) -> crate::Result<Walk> {
-    let plan = seg.plan()?.expect("a plan");
-    let Source::Router(filter) = plan.source else {
+    let plan = seg.plan()?;
+    let Some(Source::Router(filter)) = plan.source else {
         panic!("the router source walks router plans");
     };
     let mut workspace = RouterWorkspace::default();
@@ -606,8 +606,8 @@ fn gate_bookkeeping() -> crate::Result<()> {
             ..*seg
         };
         for (run, open) in [(seg, true), (&gated, false)] {
-            let plan = run.plan()?.expect("a plan");
-            let Source::Router(filter) = plan.source else {
+            let plan = run.plan()?;
+            let Some(Source::Router(filter)) = plan.source else {
                 panic!("the router source walks router plans");
             };
             let mut workspace = RouterWorkspace::default();
