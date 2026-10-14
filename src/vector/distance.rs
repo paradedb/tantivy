@@ -308,6 +308,7 @@ pub(crate) fn maybe_normalize_bytes(opts: &VectorOptions, row: &mut [u8]) -> Nor
     }
     match opts.dtype() {
         VectorDType::F32 => normalize_bytes_inplace::<f32>(row),
+        VectorDType::F16 => NormalizeOutcome::Normalized,
     } // exhaustive: a new dtype variant must decide its policy here
 }
 

@@ -1,15 +1,13 @@
 //! The query, prepared once per search, and the quantized query context built from it for each
 //! segment encoding.
 //!
-//! Stored vectors, IVF centroids included, are unit-normalized at write time for `Cosine + F32`
-//! (see [`maybe_normalize_bytes`](crate::vector::distance::maybe_normalize_bytes)), so one exact
-//! scoring entry point covers documents and centroids.
+//! Exact scoring uses the stored row dtype; routers score f32 centroids separately.
 
 use std::sync::Arc;
 
 use quant::cascade::{prepare_split_query_with_plan, PreparedSplitQuery};
 
-use crate::schema::Metric;
+use crate::schema::{Metric, VectorDType, VectorOptions};
 use crate::vector::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide, Similarity};
 use crate::vector::quantization::SIGN_QUERY_BITS;
 use crate::vector::storage::quantized::QuantizedIndexCtx;
@@ -20,7 +18,7 @@ use crate::TantivyError;
 // --- Query ---
 
 /// The query, prepared once per search: its values, widened to `f32`, and its norm.
-pub(crate) struct VectorQuery<T: VectorElement> {
+pub struct VectorQuery<T: VectorElement> {
     metric: Metric,
     raw: Arc<Vec<T>>,
     /// The values widened losslessly to `f32`: what routers rank with.
@@ -28,6 +26,14 @@ pub(crate) struct VectorQuery<T: VectorElement> {
     /// `||q||`, for the dot margin's Cauchy-Schwarz term.
     norm: f32,
     kind: QueryKind,
+    dtype: VectorDType,
+    half: Option<HalfQuery>,
+}
+
+struct HalfQuery {
+    values: Vec<f32>,
+    kernel: crate::vector::half::Kernel,
+    packed_dot: Option<(Vec<u16>, crate::vector::half::PackedKernel)>,
 }
 
 /// Metric-specific per-query state.
@@ -49,7 +55,7 @@ pub(crate) struct ScoringQuery<'q, T: VectorElement> {
 
 impl<T: VectorElement> VectorQuery<T> {
     /// Prepares `raw` under `metric`.
-    pub(crate) fn new(metric: Metric, raw: Arc<Vec<T>>) -> Self {
+    pub fn new(metric: Metric, raw: Arc<Vec<T>>) -> Self {
         // Wide accumulation keeps a huge but finite norm finite. Queries are user input, so the
         // degenerate guard stays.
         let norm = norm_squared_wide::<T>(&raw).sqrt();
@@ -69,13 +75,92 @@ impl<T: VectorElement> VectorQuery<T> {
             widened: raw.iter().map(|element| element.to_f32()).collect(),
             norm: norm as f32,
             kind,
+            dtype: VectorDType::F32,
+            half: None,
             raw,
         }
     }
 
+    /// Prepares a query for the stored dtype, rounding F16 queries once.
+    pub fn for_options(options: &VectorOptions, query: Arc<Vec<T>>) -> crate::Result<Self> {
+        if options.dtype() == VectorDType::F32 {
+            return Ok(Self::new(options.metric(), query));
+        }
+        let norm = if options.needs_normalization() {
+            norm_squared_wide(&query).sqrt()
+        } else {
+            1.0
+        };
+        let inverse = if norm == 0.0 { 0.0 } else { norm.recip() };
+        let mut values = Vec::with_capacity(query.len());
+        for value in query.iter() {
+            if !value.to_f32().is_finite() {
+                return Err(TantivyError::InvalidArgument(
+                    "F16 queries must contain finite values".into(),
+                ));
+            }
+            let value = (f64::from(value.to_f32()) * inverse) as f32;
+            let value = quant::model::f16::f16_to_f32(quant::model::f16::f32_to_f16(value));
+            if !value.is_finite() {
+                return Err(TantivyError::InvalidArgument(
+                    "query value overflows F16 storage range".into(),
+                ));
+            }
+            values.push(value);
+        }
+        let rounded = Arc::new(values.iter().copied().map(T::from_f32).collect());
+        let mut prepared = Self::new(options.metric(), rounded);
+        let kernels = crate::vector::half::kernels();
+        let packed_dot = if options.metric() == Metric::L2 {
+            None
+        } else {
+            crate::vector::half::packed_dot_kernel().map(|kernel| {
+                (
+                    values
+                        .iter()
+                        .copied()
+                        .map(quant::model::f16::f32_to_f16)
+                        .collect(),
+                    kernel,
+                )
+            })
+        };
+        prepared.dtype = VectorDType::F16;
+        prepared.half = Some(HalfQuery {
+            values,
+            kernel: if options.metric() == Metric::L2 {
+                kernels.1
+            } else {
+                kernels.0
+            },
+            packed_dot,
+        });
+        Ok(prepared)
+    }
+
+    pub(crate) fn dtype(&self) -> VectorDType {
+        self.dtype
+    }
+
     /// Similarity to one stored row under the metric.
     #[inline]
-    pub(crate) fn score_row(&self, row: &[u8]) -> Similarity {
+    pub fn score_row(&self, row: &[u8]) -> Similarity {
+        if let Some(half) = &self.half {
+            let coords = half.values.len() * 2;
+            let score = match &half.packed_dot {
+                Some((query, kernel)) => kernel(query, &row[..coords]),
+                None => (half.kernel)(&half.values, &row[..coords]),
+            };
+            return Similarity::new(match self.kind {
+                QueryKind::L2 => -score,
+                QueryKind::Dot => score,
+                QueryKind::Cosine { inv_norm_q } => {
+                    let inv_norm_doc = f32::from_le_bytes(row[coords..].try_into().unwrap());
+                    score * inv_norm_q * inv_norm_doc
+                }
+            });
+        }
+
         Similarity::new(match self.kind {
             QueryKind::L2 => -l2_squared_bytes::<T>(&self.raw, row),
             QueryKind::Dot => dot_bytes::<T>(&self.raw, row),

@@ -67,7 +67,7 @@ pub(super) fn open(
     }
     let num_centroids = centroids
         .len()
-        .checked_div(options.bytes_per_vector())
+        .checked_div(options.dim() * std::mem::size_of::<f32>())
         .unwrap_or(0);
     Ok(ExactRouter {
         centroids: LazyStore::new(centroids, options.dim()),

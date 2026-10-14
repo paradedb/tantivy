@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use quant::model::build_grid;
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{FieldType, Metric, Schema, VectorDType, VectorOptions};
+use crate::schema::{FieldType, Metric, Schema, VectorOptions};
 use crate::TantivyError;
 
 // --- Validation ---
@@ -244,12 +244,6 @@ impl VectorQuantizationConfig {
                 "dimension {} does not match schema dimension {}",
                 self.dim,
                 options.dim()
-            )));
-        }
-        if options.dtype() != VectorDType::F32 {
-            return Err(invalid(format!(
-                "dtype {:?} is unsupported; expected f32",
-                options.dtype()
             )));
         }
         if self.metric != options.metric() {

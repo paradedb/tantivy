@@ -1,15 +1,17 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VectorDType {
     F32,
+    F16,
 }
 
 impl VectorDType {
     pub fn size_bytes(self) -> usize {
         match self {
             VectorDType::F32 => 4,
+            VectorDType::F16 => 2,
         }
     }
 }
@@ -17,7 +19,7 @@ impl VectorDType {
 /// Distance / similarity metric used when ranking vector field values.
 ///
 /// All metrics are presented to callers in a "higher is better" orientation.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Metric {
     L2,
@@ -60,16 +62,18 @@ impl VectorOptions {
 
     pub fn bytes_per_vector(&self) -> usize {
         self.dim * self.dtype.size_bytes()
+            + if self.dtype == VectorDType::F16 && self.metric == Metric::Cosine {
+                4
+            } else {
+                0
+            }
     }
 
     /// Whether this field's `(metric, dtype)` requires write-time
     /// unit-normalization (see `vector::distance::maybe_normalize_bytes`).
-    /// Currently only `Cosine + F32`.
+    /// Cosine rows carry unit-normalization in both storage formats.
     pub fn needs_normalization(&self) -> bool {
-        matches!(
-            (self.metric, self.dtype),
-            (Metric::Cosine, VectorDType::F32)
-        )
+        self.metric == Metric::Cosine
     }
 }
 

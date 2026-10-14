@@ -9,7 +9,7 @@ use crate::index::{Segment, SegmentComponent};
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::plugin::{PluginMergeContext, PluginWriter};
 use crate::schema::document::{ErasedDocument, ErasedValue, ReferenceValueLeaf};
-use crate::schema::{Field, FieldType, Schema, VectorOptions};
+use crate::schema::{Field, FieldType, Schema, VectorDType, VectorOptions};
 use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::storage::blocks::{align_up, block_align, pad, write_metadata, BlockDirectory};
 use crate::vector::storage::header::{write_vector_header, VectorEntry, HEADER_LEN, VEC_EXT};
@@ -29,6 +29,37 @@ struct FieldBuffer {
 
 impl FieldBuffer {
     fn push_bytes(&mut self, doc_id: DocId, bytes: &[u8]) -> NormalizeOutcome {
+        if self.opts.dtype() == VectorDType::F16 {
+            let mut normalized = bytes.to_vec();
+            let opts = self.opts.clone().with_dtype(VectorDType::F32);
+            let outcome = maybe_normalize_bytes(&opts, &mut normalized);
+            if outcome == NormalizeOutcome::NonFinite {
+                return outcome;
+            }
+            let start = self.row_bytes.len();
+            let mut norm_squared = 0.0f64;
+            for value in normalized.chunks_exact(4) {
+                let value = f32::from_le_bytes(value.try_into().unwrap());
+                let bits = quant::model::f16::f32_to_f16(value);
+                let rounded = quant::model::f16::f16_to_f32(bits);
+                if !rounded.is_finite() {
+                    self.row_bytes.truncate(start);
+                    return NormalizeOutcome::NonFinite;
+                }
+                norm_squared += f64::from(rounded).powi(2);
+                self.row_bytes.extend_from_slice(&bits.to_le_bytes());
+            }
+            if self.opts.needs_normalization() {
+                let inverse = if norm_squared == 0.0 {
+                    0.0
+                } else {
+                    norm_squared.sqrt().recip() as f32
+                };
+                self.row_bytes.extend_from_slice(&inverse.to_le_bytes());
+            }
+            self.present_doc_ids.push(doc_id);
+            return outcome;
+        }
         let stride = self.opts.bytes_per_vector();
         debug_assert_eq!(bytes.len(), stride);
         self.present_doc_ids.push(doc_id);
@@ -98,7 +129,7 @@ impl PluginWriter for FlatVecWriter {
                     schema.get_field_entry(field).name()
                 )));
             };
-            let stride = buf.opts.bytes_per_vector();
+            let stride = buf.opts.dim() * std::mem::size_of::<f32>();
             if bytes.len() != stride {
                 return Err(TantivyError::SchemaError(format!(
                     "vector byte length mismatch for field {:?}: expected {} bytes, got {}",
@@ -110,7 +141,7 @@ impl PluginWriter for FlatVecWriter {
             if buf.push_bytes(doc_id, bytes) == NormalizeOutcome::NonFinite {
                 return Err(TantivyError::InvalidArgument(format!(
                     "non-finite element in vector field '{}' (doc {doc_id}): vectors must contain \
-                     only finite values",
+                     only finite values representable in the configured storage dtype",
                     schema.get_field_entry(field).name(),
                 )));
             }

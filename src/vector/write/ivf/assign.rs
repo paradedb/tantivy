@@ -6,8 +6,8 @@ use itertools::Itertools;
 
 use super::{AssignedVector, FieldMerge, IvfBuildTimings};
 use crate::vector::clustering::{
-    decode_row_append, IvfCentroids, IvfClusterer, IvfMatrixView, IvfMergeSettings, IvfVectorBatch,
-    IvfVectors,
+    decode_stored_row_append, IvfCentroids, IvfClusterer, IvfMatrixView, IvfMergeSettings,
+    IvfVectorBatch, IvfVectors,
 };
 use crate::vector::write::RowAddress;
 use crate::{DocId, TantivyError};
@@ -50,7 +50,7 @@ pub(super) fn assign(
             timings.source_reads += 1;
             let bytes =
                 merge.readers[source.segment_ord as usize].vector_bytes_for_row(source.row_id)?;
-            decode_row_append::<f32>(&bytes, dim, &mut batch_values)?;
+            decode_stored_row_append(&bytes, opts, &mut batch_values)?;
             batch_doc_ids.push(target_doc_id);
         }
         let assign_start = Instant::now();

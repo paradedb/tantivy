@@ -16,7 +16,7 @@ use crate::collector::{
 };
 use crate::index::SegmentReader;
 use crate::query::Weight;
-use crate::schema::{Field, FieldType, Metric, Schema};
+use crate::schema::{Field, FieldType, Schema, VectorDType, VectorOptions};
 use crate::vector::params::ProbeParams;
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
 use crate::vector::search::SegmentSearcher;
@@ -34,7 +34,14 @@ use crate::{DocAddress, DocId, Score, SegmentOrdinal, TantivyError};
 #[derive(Clone, Debug)]
 struct PreparedKey(Arc<VectorColMetadata>);
 impl PreparedKey {
-    fn query_fields(&self) -> Option<(u32, u8, &[crate::vector::storage::metadata::Quantizer])> {
+    fn query_fields(
+        &self,
+    ) -> Option<(
+        u32,
+        u8,
+        VectorDType,
+        &[crate::vector::storage::metadata::Quantizer],
+    )> {
         match self.0.as_ref() {
             VectorColMetadata::Plain(_) => None,
             VectorColMetadata::Quantized { field, layers } => {
@@ -43,7 +50,7 @@ impl PreparedKey {
                     crate::schema::Metric::Dot => 1,
                     crate::schema::Metric::Cosine => 2,
                 };
-                Some((field.dim, metric, layers))
+                Some((field.dim, metric, field.dtype, layers))
             }
         }
     }
@@ -67,7 +74,7 @@ type PreparedCell = Arc<OnceLock<Arc<QuantizedQueryCtx>>>;
 
 /// Collects documents by descending vector similarity; docs without a vector are never returned.
 ///
-/// `T` must match the field's dtype ([`Collector::check_schema`]). `S` orders equal similarities
+/// Queries use `f32` for either storage dtype. `S` orders equal similarities
 /// and defaults to [`NoTieBreak`]: ascending `DocAddress`.
 pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     field: Field,
@@ -146,13 +153,20 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     }
 
     /// The query prepared for `metric`, on first use.
-    fn vector_query(&self, metric: Metric) -> Arc<VectorQuery<T>> {
+    fn vector_query(&self, options: &VectorOptions) -> crate::Result<Arc<VectorQuery<T>>> {
         let mut prepared = self.prepared.lock().unwrap();
         let query = match prepared.as_ref() {
-            Some(query) if query.metric() == metric => query,
-            _ => prepared.insert(Arc::new(VectorQuery::new(metric, Arc::clone(&self.query)))),
+            Some(query)
+                if query.metric() == options.metric() && query.dtype() == options.dtype() =>
+            {
+                query
+            }
+            _ => prepared.insert(Arc::new(VectorQuery::for_options(
+                options,
+                Arc::clone(&self.query),
+            )?)),
         };
-        Arc::clone(query)
+        Ok(Arc::clone(query))
     }
 
     /// Prepares `query` once per metadata key, releasing the map lock before expensive
@@ -239,7 +253,7 @@ where
                 opts.dim(),
             )));
         }
-        if opts.dtype() != T::DTYPE {
+        if T::DTYPE != VectorDType::F32 {
             return Err(TantivyError::SchemaError(format!(
                 "query dtype {:?} does not match field {:?} dtype {:?}",
                 T::DTYPE,
@@ -340,7 +354,7 @@ where
         let (query, quantized) = {
             let _prep = enter_vector_stage(VectorStage::QueryPrep);
             let vectors = reader.vector_index(self.field)?;
-            let query = self.vector_query(vectors.options().metric());
+            let query = self.vector_query(vectors.options())?;
             let quantized = match vectors.quantization() {
                 Some(field) if self.max_scan_levels > 0 => {
                     Some(self.quantized_query(field, &query))
@@ -998,12 +1012,13 @@ mod prepared_key_tests {
         assert_eq!(key(&original), key(&changed));
         assert_eq!(hash(&original), hash(&changed));
         assert_ne!(original.to_bytes(), changed.to_bytes());
-        for change in 0..8 {
+        for change in 0..9 {
             let mut changed = original.clone();
             if let VectorColMetadata::Quantized { field, layers } = &mut changed {
                 match change {
                     0 => field.dim += 1,
                     1 => field.metric = Metric::Dot,
+                    8 => field.dtype = crate::schema::VectorDType::F16,
                     2 => {
                         if let Quantizer::SignPlane { rotation, .. } = &mut layers[0] {
                             *rotation = Rotation::None;

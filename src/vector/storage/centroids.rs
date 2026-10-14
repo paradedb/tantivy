@@ -49,7 +49,7 @@ pub(crate) struct ClusterIndex {
     num_docs: usize,
     /// The centroid rows (slot `[0]` past the two count words).
     centroids_slice: FileSlice,
-    /// Bytes per centroid row: the field's vector stride.
+    /// Bytes per f32 centroid row.
     centroid_stride: usize,
     /// Slot `[1]`: the `u64[N+1]` prefix sum, pinned.
     cluster_offsets: OwnedBytes,
@@ -73,7 +73,7 @@ impl ClusterIndex {
         out: &mut W,
     ) -> io::Result<()> {
         let expected = num_centroids
-            .checked_mul(options.bytes_per_vector())
+            .checked_mul(options.dim() * mem::size_of::<f32>())
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "centroid byte length overflow")
             })?;
@@ -152,7 +152,7 @@ impl ClusterIndex {
         let num_centroids = u32::deserialize(&mut reader)? as usize;
         let num_docs = u32::deserialize(&mut reader)? as usize;
         let centroid_len = num_centroids
-            .checked_mul(options.bytes_per_vector())
+            .checked_mul(options.dim() * mem::size_of::<f32>())
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "centroid byte length overflow")
             })?;
@@ -228,7 +228,7 @@ impl ClusterIndex {
             num_centroids,
             num_docs,
             centroids_slice,
-            centroid_stride: options.bytes_per_vector(),
+            centroid_stride: options.dim() * std::mem::size_of::<f32>(),
             cluster_offsets,
             metric: options.metric(),
             router,

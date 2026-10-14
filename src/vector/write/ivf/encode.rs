@@ -13,7 +13,9 @@ use quant::cascade::{
 use super::{AssignedVector, FieldMerge, IvfBuildTimings};
 use crate::directory::CompositeWrite;
 use crate::schema::VectorDType;
-use crate::vector::clustering::{decode_row_append, encode_vector, IvfCentroids};
+use crate::vector::clustering::{
+    decode_row_append, decode_stored_row_append, encode_vector, IvfCentroids,
+};
 use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::storage::blocks::{
     block_len, column_range, pad, write_metadata, BlockDirectory,
@@ -39,12 +41,14 @@ pub(super) fn encode_centroids(
         .chunks_exact(opts.dim())
         .map(|centroid| centroid.to_vec())
         .collect();
-    let mut centroid_bytes = Vec::with_capacity(num_centroids * opts.bytes_per_vector());
+    let centroid_options = opts.clone().with_dtype(VectorDType::F32);
+    let mut centroid_bytes =
+        Vec::with_capacity(num_centroids * centroid_options.bytes_per_vector());
     let mut bounds_builder = BoundsBuilder::new(num_centroids);
     let mut stored_centroid = Vec::with_capacity(opts.dim());
     for (centroid_ord, centroid) in centroid_rows.iter().enumerate() {
         let mut bytes = encode_vector(centroid, opts.dim())?;
-        let outcome = maybe_normalize_bytes(opts, &mut bytes);
+        let outcome = maybe_normalize_bytes(&centroid_options, &mut bytes);
         if outcome == NormalizeOutcome::NonFinite {
             log::warn!(
                 "non-finite centroid {centroid_ord} in field '{}' written un-normalized during \
@@ -77,10 +81,7 @@ pub(super) fn write_data_entry(
 ) -> crate::Result<Vec<DocLocation>> {
     let (ctx, opts, quantization) = (merge.ctx, merge.opts, merge.quantization);
     let num_centroids = cluster_offsets.len() - 1;
-    let residual: fn(&[u8], &[f32]) -> f32 = match opts.dtype() {
-        VectorDType::F32 => residual_norm::<f32>,
-    };
-    let centroid_stride = opts.bytes_per_vector();
+    let centroid_stride = opts.dim() * std::mem::size_of::<f32>();
 
     // IdMaps are emitted after Data so inter-entry padding never enters an id map.
     let id_map_start = Instant::now();
@@ -105,8 +106,10 @@ pub(super) fn write_data_entry(
     timings.pad_bytes += pos - 4 - meta.to_bytes().len();
     let (specs, grids) = meta.runtime();
     let row_bytes = opts.bytes_per_vector();
-    let fixed_scratch = row_bytes + opts.dim() + opts.dim().div_ceil(64) * 8;
-    let per_row_scratch = 2 * row_bytes + quantization.map_or(0, |c| c.bytes_per_row()) + 16;
+    let decoded_row_bytes = opts.dim() * std::mem::size_of::<f32>();
+    let fixed_scratch = decoded_row_bytes + opts.dim() + opts.dim().div_ceil(64) * 8;
+    let per_row_scratch =
+        2 * decoded_row_bytes + quantization.map_or(0, |c| c.bytes_per_row()) + 16;
     let tile_rows = (1usize << 20)
         .saturating_sub(fixed_scratch)
         .checked_div(per_row_scratch)
@@ -119,6 +122,7 @@ pub(super) fn write_data_entry(
         quantization.map(|_| BatchEncodeWorkspace::with_capacity(opts.dim(), tile_rows, &specs));
     let mut bufs: Vec<Vec<u8>> = slots.iter().map(|_| Vec::new()).collect();
     let mut normalized = Vec::with_capacity(row_bytes);
+    let mut decode_buffer = Vec::with_capacity(opts.dim());
     let mut batch_values = Vec::with_capacity(tile_rows * opts.dim());
     let mut centroid = Vec::with_capacity(opts.dim());
     for (cluster, offsets) in cluster_offsets.windows(2).enumerate() {
@@ -157,7 +161,7 @@ pub(super) fn write_data_entry(
                 local += 1;
                 let bytes = merge.readers[assigned.source.segment_ord as usize]
                     .vector_bytes_for_row(assigned.source.row_id)?;
-                let row: &[u8] = if opts.needs_normalization() {
+                let row: &[u8] = if opts.needs_normalization() && opts.dtype() == VectorDType::F32 {
                     normalized.clear();
                     normalized.extend_from_slice(&bytes);
                     maybe_normalize_bytes(opts, &mut normalized);
@@ -167,9 +171,24 @@ pub(super) fn write_data_entry(
                 };
                 data.write_all(row)?;
                 pos += row.len();
-                bounds_builder.add_native(cluster, residual(row, &centroid));
-                if quantization.is_some() {
-                    decode_row_append::<f32>(row, opts.dim(), &mut batch_values)?;
+                if opts.dtype() == VectorDType::F16 {
+                    decode_buffer.clear();
+                    decode_stored_row_append(row, opts, &mut decode_buffer)?;
+                    let residual = decode_buffer
+                        .iter()
+                        .zip(&centroid)
+                        .map(|(&x, &c)| (f64::from(x) - f64::from(c)).powi(2))
+                        .sum::<f64>()
+                        .sqrt() as f32;
+                    bounds_builder.add_native(cluster, residual);
+                    if quantization.is_some() {
+                        batch_values.extend_from_slice(&decode_buffer);
+                    }
+                } else {
+                    bounds_builder.add_native(cluster, residual_norm::<f32>(row, &centroid));
+                    if quantization.is_some() {
+                        decode_row_append::<f32>(row, opts.dim(), &mut batch_values)?;
+                    }
                 }
             }
             if let Some(prepared) = prepared.as_ref() {

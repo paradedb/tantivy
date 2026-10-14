@@ -1,7 +1,7 @@
 //! Custom clustering: the [`IvfClusterer`] a merge trains and assigns with, its inputs and
 //! outputs, and the built-in [`SuperKMeansClusterer`].
 
-use crate::schema::VectorOptions;
+use crate::schema::{VectorDType, VectorOptions};
 use crate::vector::VectorElement;
 use crate::{DocId, TantivyError};
 
@@ -126,6 +126,39 @@ pub(crate) fn decode_row<T: VectorElement>(bytes: &[u8], dim: usize) -> crate::R
     let mut decoded = Vec::with_capacity(dim);
     decode_row_append(bytes, dim, &mut decoded)?;
     Ok(decoded)
+}
+
+pub(crate) fn decode_stored_row(bytes: &[u8], options: &VectorOptions) -> crate::Result<Vec<f32>> {
+    let mut decoded = Vec::with_capacity(options.dim());
+    decode_stored_row_append(bytes, options, &mut decoded)?;
+    Ok(decoded)
+}
+
+pub(crate) fn decode_stored_row_append(
+    bytes: &[u8],
+    options: &VectorOptions,
+    decoded: &mut Vec<f32>,
+) -> crate::Result<()> {
+    if bytes.len() != options.bytes_per_vector() {
+        return Err(TantivyError::InvalidArgument(
+            "stored vector byte length mismatch".into(),
+        ));
+    }
+    match options.dtype() {
+        VectorDType::F32 => decode_row_append(bytes, options.dim(), decoded),
+        VectorDType::F16 => {
+            let coords = options.dim() * 2;
+            let inverse = if options.needs_normalization() {
+                f32::from_le_bytes(bytes[coords..].try_into().unwrap())
+            } else {
+                1.0
+            };
+            decoded.extend(bytes[..coords].chunks_exact(2).map(|v| {
+                quant::model::f16::f16_to_f32(u16::from_le_bytes([v[0], v[1]])) * inverse
+            }));
+            Ok(())
+        }
+    }
 }
 
 /// Decodes a row into caller-owned storage.

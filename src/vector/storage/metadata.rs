@@ -240,6 +240,9 @@ impl SlotType {
             Self::Rows {
                 dtype: VectorDType::F32,
             } => ElemType::F32,
+            Self::Rows {
+                dtype: VectorDType::F16,
+            } => ElemType::F16,
             Self::DocIds => ElemType::U32,
             Self::QuantLayerCodes { quant, .. } => quant.codes_elem(),
             Self::QuantLayerGammas { .. } | Self::QuantLayerErrors { .. } => ElemType::F16,
@@ -376,8 +379,13 @@ impl VectorColMetadata {
         let field = self.field();
         let mut slots = vec![Slot {
             slot_type: SlotType::Rows { dtype: field.dtype },
-            elem: ElemType::F32,
-            stride: field.dim * ElemType::F32.size() as u32,
+            elem: match field.dtype {
+                VectorDType::F32 => ElemType::F32,
+                VectorDType::F16 => ElemType::F16,
+            },
+            stride: VectorOptions::new(field.dim as usize, field.metric)
+                .with_dtype(field.dtype)
+                .bytes_per_vector() as u32,
         }];
         if matches!(field.partition, Partition::Clusters) {
             slots.push(Slot {
@@ -577,6 +585,7 @@ impl VectorColMetadata {
         out.extend(f.dim.to_le_bytes());
         out.push(match f.dtype {
             VectorDType::F32 => 0,
+            VectorDType::F16 => 1,
         });
         out.push(metric_tag(f.metric));
         out.push(match f.norm_policy {
@@ -627,6 +636,7 @@ impl VectorColMetadata {
             let dim = u32::deserialize(input)?;
             let dtype = match u8::deserialize(input)? {
                 0 => VectorDType::F32,
+                1 => VectorDType::F16,
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
