@@ -8,8 +8,8 @@ use common::{HasLen, OwnedBytes};
 use crate::directory::FileSlice;
 use crate::error::DataCorruption;
 use crate::schema::VectorOptions;
-use crate::vector::storage::io::VectorRead;
-use crate::vector::storage::metadata::{Partition, Slot, VectorColMetadata};
+use crate::vector::storage::io::{VectorRead, VectorReadKind};
+use crate::vector::storage::metadata::{Partition, Slot, SlotType, VectorColMetadata};
 use crate::vector::ENTRY_ALIGN;
 
 /// Rounds a validated file offset up to a power-of-two alignment.
@@ -434,10 +434,17 @@ impl Blocks {
         let b = self.block_for_range(&rows)?;
         let stride = self.slots[idx].stride as usize;
         let first = self.block_rows[b];
+        let kind = match self.slots[idx].slot_type {
+            SlotType::Rows { .. } => VectorReadKind::FullPrecision,
+            ref slot => slot
+                .band()
+                .map(VectorReadKind::QuantizedLayer)
+                .unwrap_or_default(),
+        };
         Ok(self
             .column(b, idx)?
             .slice((rows.start - first) * stride..(rows.end - first) * stride)
-            .read_vector_bytes()?)
+            .read_vector_bytes(kind)?)
     }
     /// Whether blocks carry a document-id column and use centroid row boundaries.
     pub(crate) fn clustered(&self) -> bool {
@@ -468,7 +475,9 @@ impl Blocks {
         layer: usize,
     ) -> crate::Result<(Range<usize>, OwnedBytes)> {
         let range = self.layer_span(b, layer);
-        let bytes = self.band_slice(b, layer)?.read_vector_bytes()?;
+        let bytes = self
+            .band_slice(b, layer)?
+            .read_vector_bytes(VectorReadKind::QuantizedLayer(layer as u8))?;
         Ok((range, bytes))
     }
 }

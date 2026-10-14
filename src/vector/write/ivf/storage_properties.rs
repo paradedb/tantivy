@@ -141,6 +141,50 @@ fn floats(bytes: &[u8]) -> Vec<f32> {
 }
 
 #[test]
+fn vector_read_kinds_follow_data_for_dense_and_sparse_access() -> crate::Result<()> {
+    use crate::vector::{current_vector_read_kind, VectorReadKind};
+
+    let (index, directory) = fixture_with_deletes(Metric::Cosine, &[1, 1], false)?;
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let vectors =
+        searcher.segment_readers()[0].vector_index(index.schema().get_field("embedding")?)?;
+    let rows = vectors.index().unwrap().cluster_range(2);
+    let layers = vectors.quantization().unwrap().layers();
+    directory.read_kinds.lock().unwrap().clear();
+
+    vectors.read_cluster_rows(2)?;
+    vectors.read_doc_ids(2, &mut Vec::new())?;
+    layers[0].read_batch(rows.clone())?;
+    layers[1].read_batch(rows.clone())?;
+    let sparse = layers[1].cluster_in_block(2)?;
+    sparse.read_codes(rows.start..rows.start + 1)?;
+    sparse.read_sidecar()?;
+    vectors
+        .quantization()
+        .unwrap()
+        .read_residual_norms(rows.start..rows.start + 1)?;
+    let mut scratch = crate::vector::storage::quantized::ReadScratch::default();
+    scratch.rows.push(rows.start);
+    vectors.read_vector_rows_planned(&mut scratch)?;
+    assert_eq!(
+        *directory.read_kinds.lock().unwrap(),
+        [
+            VectorReadKind::FullPrecision,
+            VectorReadKind::Other,
+            VectorReadKind::QuantizedLayer(0),
+            VectorReadKind::QuantizedLayer(1),
+            VectorReadKind::QuantizedLayer(1),
+            VectorReadKind::QuantizedLayer(1),
+            VectorReadKind::QuantizedLayer(0),
+            VectorReadKind::FullPrecision,
+        ]
+    );
+    assert_eq!(current_vector_read_kind(), VectorReadKind::Other);
+    Ok(())
+}
+
+#[test]
 fn encoder_columns_and_read_paths() -> crate::Result<()> {
     for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
         for schedule in [&[1][..], &[1, 4][..], &[1, 2, 4][..]] {

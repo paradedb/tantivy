@@ -79,6 +79,7 @@ pub use quantization::{VectorQuantizationConfig, VectorQuantizationLayer};
 pub use router::{RouterKind, RouterMetrics};
 pub use search::source::controller::ProbeTermination;
 pub use stats::ProbeStats;
+pub use storage::io::{current_vector_read_kind, VectorReadKind};
 pub use storage::{VectorIndexReader, VectorIoStats};
 pub use telemetry::{current_vector_stage, VectorStage};
 pub use tie_break::NoTieBreak;

@@ -6,7 +6,7 @@ use columnar::column_index::{open_optional_index, serialize_optional_index, Opti
 use common::HasLen;
 
 use crate::directory::FileSlice;
-use crate::vector::storage::io::VectorRead;
+use crate::vector::storage::io::{VectorRead, VectorReadKind};
 use crate::DocId;
 
 const VARIANT_IDENTITY: u8 = 0;
@@ -101,7 +101,12 @@ impl IdMap {
         if start >= body.len() {
             return Ok(None);
         }
-        decode_location(&body.slice(start..start + 8).read_vector_bytes()?, rows)
+        decode_location(
+            &body
+                .slice(start..start + 8)
+                .read_vector_bytes(VectorReadKind::Other)?,
+            rows,
+        )
     }
     /// Locates ascending `docs`, appending `(doc, location)` for each one with a vector to `out`.
     ///
@@ -128,7 +133,9 @@ impl IdMap {
                 end = docs[last] as usize * 8 + 8;
                 last += 1;
             }
-            let bytes = body.slice(start..end).read_vector_bytes()?;
+            let bytes = body
+                .slice(start..end)
+                .read_vector_bytes(VectorReadKind::Other)?;
             for &doc in &docs[first..last] {
                 let at = doc as usize * 8 - start;
                 if let Some(location) = decode_location(&bytes[at..at + 8], rows)? {

@@ -22,7 +22,7 @@ use crate::vector::storage::header::{
     read_centroid_header, read_vector_header, CentroidSlot, VectorEntry, CENTROIDS_EXT, VEC_EXT,
 };
 use crate::vector::storage::id_map::{DocLocation, IdMap};
-use crate::vector::storage::io::VectorRead;
+use crate::vector::storage::io::{VectorRead, VectorReadKind};
 use crate::vector::storage::metadata::{SlotType, VectorColMetadata};
 use crate::vector::storage::quantized::{
     exact_read_cost, range_cost, QuantizedFieldReader, QuantizedIndexCtx, QuantizedLayerReader,
@@ -523,7 +523,7 @@ impl VectorIndexReader {
                 self.rows_slice
                     .column(location.cluster as usize, 0)?
                     .slice(start..start + stride)
-                    .read_vector_bytes()?,
+                    .read_vector_bytes(VectorReadKind::FullPrecision)?,
             ));
         }
         let Some(row) = self.row_id(doc_id)? else {
@@ -605,7 +605,7 @@ impl VectorIndexReader {
             for row_range in read_ranges[range_start..].iter().cloned() {
                 let bytes = column
                     .slice((row_range.start - first) * stride..(row_range.end - first) * stride)
-                    .read_vector_bytes()?;
+                    .read_vector_bytes(VectorReadKind::FullPrecision)?;
                 chunks.push(VectorRowChunk {
                     rows: row_range,
                     bytes,
@@ -689,7 +689,9 @@ impl VectorIndexReader {
             .iter()
             .position(|slot| matches!(slot.slot_type, SlotType::DocIds))
             .ok_or_else(|| DataCorruption::comment_only("missing DocIds column"))?;
-        let bytes = blocks.column(cluster, idx)?.read_vector_bytes()?;
+        let bytes = blocks
+            .column(cluster, idx)?
+            .read_vector_bytes(VectorReadKind::Other)?;
         out.reserve(blocks.rows_in(cluster));
         let mut previous = None;
         for bytes in bytes.chunks_exact(std::mem::size_of::<DocId>()) {
