@@ -1,4 +1,5 @@
-//! Field-keyed vector quantization settings and row-layout constants.
+//! Field-keyed vector quantization settings, row-layout constants, and the arithmetic of quantized
+//! estimates.
 
 use std::collections::BTreeSet;
 
@@ -7,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::schema::{FieldType, Metric, Schema, VectorDType, VectorOptions};
 use crate::TantivyError;
+
+// --- Validation ---
 
 /// Validates model values shared by settings and stored segment metadata.
 pub(crate) fn validate_quantization_values<'a>(
@@ -33,6 +36,8 @@ pub(crate) fn validate_quantization_values<'a>(
     Ok(())
 }
 
+// --- Constants ---
+
 /// Settings identifier for the vector quantization format.
 pub const VECTOR_QUANTIZATION_FORMAT_VERSION: u32 = 3;
 /// Maximum number of residual layers stored by the vector format.
@@ -58,6 +63,9 @@ pub(crate) const GAMMA_ANALYTICAL_SAFETY: f32 = 1.15;
 pub(crate) const QUANTIZED_BOUNDARY_KAPPA: f32 = 2.5;
 /// Query-side bits used by every sign-layer estimator.
 pub(crate) const SIGN_QUERY_BITS: u8 = 4;
+
+// --- Configuration ---
+
 /// Normalization applied to fp32 rows before residual encoding and exact scoring.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -373,6 +381,174 @@ pub(crate) fn quantized_code_tail_is_zero(codes: &[u8], dim: usize, bits: u8) ->
         let used_mask = (1_u8 << tail_bits) - 1;
         codes[full_bytes] & !used_mask == 0 && codes[full_bytes + 1..].iter().all(|&byte| byte == 0)
     }
+}
+
+// --- Estimates ---
+
+/// Applies the metric-specific correction to a cumulative quantized estimate.
+#[inline(always)]
+pub(crate) fn corrected_quantized_estimate(
+    metric: Metric,
+    gamma: f32,
+    raw_prefix: f32,
+    base: f32,
+) -> f32 {
+    let metric_factor = if metric == Metric::L2 { 2.0 } else { 1.0 };
+    (metric_factor * gamma).mul_add(raw_prefix, base)
+}
+
+/// Combines the first L2 layer's unscaled kernel output.
+#[inline(always)]
+pub(crate) fn initial_l2_raw_prefix(kernel_score: f32, scale: f32, constant: f32) -> f32 {
+    scale.mul_add(kernel_score, -constant)
+}
+
+/// Combines the first dot-like layer's unscaled kernel output.
+#[inline(always)]
+pub(crate) fn initial_dot_raw_prefix(kernel_score: f32, scale: f32) -> f32 {
+    kernel_score * scale
+}
+
+/// Adds an L2 refinement to the cumulative raw prefix.
+#[inline(always)]
+pub(crate) fn refine_l2_raw_prefix(
+    raw_prefix: f32,
+    kernel_score: f32,
+    scale: f32,
+    constant: f32,
+) -> f32 {
+    scale.mul_add(kernel_score, raw_prefix - constant)
+}
+
+/// Squared rounding error of an L2 raw prefix, in raw-prefix units.
+///
+/// The split operands were rounded independently, so cancellation does not remove their error; a
+/// refinement adds the `previous_prefix - constant` subtraction.
+#[inline(always)]
+pub(crate) fn l2_arithmetic_variance(
+    kernel_score: f32,
+    scale: f32,
+    constant: f32,
+    previous_prefix: Option<f32>,
+) -> f32 {
+    // c = 2: independently rounded split operands, then the fused subtraction.
+    let subtraction = rounding_error(scale * kernel_score, constant, 2.0);
+    // c = 1: the separate `previous_prefix - constant` subtraction.
+    let refinement = previous_prefix.map_or(0.0, |prefix| rounding_error(prefix, constant, 1.0));
+    subtraction * subtraction + refinement * refinement
+}
+
+/// The f32 error of `rounding_count` roundings over operands `a` and `b`: machine epsilon times
+/// the sum of their magnitudes.
+#[inline(always)]
+pub(crate) fn rounding_error(a: f32, b: f32, rounding_count: f32) -> f32 {
+    rounding_count * f32::EPSILON * (a.abs() + b.abs())
+}
+
+/// An estimate's arithmetic rounding error, kept apart from gamma so a refinement can change gamma
+/// without losing or double-scaling the error already in the raw prefix.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ArithmeticError {
+    pub(crate) raw_variance: f32,
+    pub(crate) base_variance: f32,
+}
+
+impl ArithmeticError {
+    /// The error of a cluster's first layer.
+    pub(crate) fn initial(
+        metric: Metric,
+        kernel: f32,
+        scale: f32,
+        constant: f32,
+        cluster_score: f32,
+        residual_norm_sq: f32,
+    ) -> Self {
+        let raw_variance = if metric == Metric::L2 {
+            l2_arithmetic_variance(kernel, scale, constant, None)
+        } else {
+            // c = 1: the initial scale * kernel multiplication.
+            rounding_error(scale * kernel, 0.0, 1.0).powi(2)
+        };
+        let base_variance = if metric == Metric::L2 {
+            // c = 1: cluster_score - residual_norm_sq.
+            rounding_error(cluster_score, residual_norm_sq, 1.0).powi(2)
+        } else {
+            0.0
+        };
+        Self {
+            raw_variance,
+            base_variance,
+        }
+    }
+
+    /// Adds one refining layer's error.
+    pub(crate) fn refine(
+        &mut self,
+        metric: Metric,
+        prefix: f32,
+        kernel: f32,
+        scale: f32,
+        constant: f32,
+    ) {
+        self.raw_variance += if metric == Metric::L2 {
+            l2_arithmetic_variance(kernel, scale, constant, Some(prefix))
+        } else {
+            // c = 2: rounded layer contribution plus the refinement addition.
+            rounding_error(scale * kernel, prefix, 2.0).powi(2)
+        };
+    }
+
+    /// The estimate's width: `model_sigma` combined in quadrature with the arithmetic error under
+    /// the metric's correction.
+    pub(crate) fn sigma(
+        self,
+        metric: Metric,
+        model_sigma: f32,
+        gamma: f32,
+        prefix: f32,
+        base: f32,
+    ) -> f32 {
+        let factor = if metric == Metric::L2 {
+            2.0 * gamma
+        } else {
+            gamma
+        };
+        // c = 1: the final fused base-plus-corrected-residual expression. This
+        // includes cosine's base-plus-residual sum even if its model width is zero.
+        let final_error = rounding_error(factor * prefix, base, 1.0);
+        model_sigma.hypot(
+            (factor * factor * self.raw_variance + self.base_variance + final_error * final_error)
+                .sqrt(),
+        )
+    }
+}
+
+/// Adds a dot-like refinement to the cumulative raw prefix.
+#[inline(always)]
+pub(crate) fn refine_dot_raw_prefix(raw_prefix: f32, kernel_score: f32, scale: f32) -> f32 {
+    scale.mul_add(kernel_score, raw_prefix)
+}
+
+/// The statistical width of a corrected estimate: its data and query quantization variance,
+/// scaled by the policy's safety factor.
+#[inline(always)]
+pub(crate) fn quantized_model_sigma(
+    metric: Metric,
+    dimension: usize,
+    residual_norm_squared: f32,
+    corrected_error_ratio: f32,
+    gamma: f32,
+    score_query_norm_squared: f32,
+    sign_query_error_term: f32,
+) -> f32 {
+    debug_assert_ne!(dimension, 0);
+    let data_variance = residual_norm_squared
+        * (1.0 / dimension as f32)
+        * corrected_error_ratio
+        * score_query_norm_squared;
+    let query_variance = gamma * gamma * sign_query_error_term;
+    let metric_factor = if metric == Metric::L2 { 2.0 } else { 1.0 };
+    metric_factor * GAMMA_ANALYTICAL_SAFETY * (data_variance + query_variance).sqrt()
 }
 
 #[cfg(test)]

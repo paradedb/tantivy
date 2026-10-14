@@ -1,6 +1,6 @@
 use super::*;
 use crate::schema::Value;
-use crate::vector::prepared::{corrected_quantized_estimate, ArithmeticError};
+use crate::vector::quantization::{corrected_quantized_estimate, ArithmeticError};
 use crate::vector::storage_io::test_support::{PagedDirectory, PAGE_BYTES};
 
 const DIM: usize = 64;

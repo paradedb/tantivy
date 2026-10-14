@@ -98,6 +98,9 @@ pub use router::{RouterKind, RouterMetrics, RoutingParams};
 #[cfg(feature = "unstable")]
 #[doc(hidden)]
 pub use scan::estimate::quantization_bench_layer0_cosine_cluster;
+#[cfg(feature = "unstable")]
+#[doc(hidden)]
+pub use scan::{columns::Columns, layer_read::Decoded};
 pub use source::controller::{
     set_fixed_probe_cost_rows, ProbeTermination, DEFAULT_FIXED_PROBE_COST_ROWS,
 };

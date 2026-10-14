@@ -21,13 +21,11 @@ use super::header::{read_centroid_header, read_vector_header, CentroidSlot, Vect
 use super::interval::{Estimate, Threshold};
 use super::ivf::{decode_row, IvfIndex, CENTROIDS_EXT};
 use super::metadata::{QuantizationSchedule, SlotType, VectorColMetadata};
-use super::prepared::{
-    corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix,
-    quantized_model_sigma, refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError,
-    QuantizedIndexCtx, QuantizedQueryCtx, VectorQuery,
-};
+use super::prepared::{QuantizedIndexCtx, QuantizedQueryCtx, VectorQuery};
 use super::quantization::{
-    quantized_code_tail_is_zero, QUANTIZED_BOUNDARY_KAPPA, QUANTIZED_CONSTANT_STRIDE,
+    corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix,
+    quantized_code_tail_is_zero, quantized_model_sigma, refine_dot_raw_prefix,
+    refine_l2_raw_prefix, ArithmeticError, QUANTIZED_BOUNDARY_KAPPA, QUANTIZED_CONSTANT_STRIDE,
     QUANTIZED_ERROR_RATIO_STRIDE, QUANTIZED_GAMMA_STRIDE, QUANTIZED_SCALE_STRIDE,
 };
 use super::storage_io::VectorRead;
@@ -40,9 +38,7 @@ use crate::index::SegmentComponent;
 use crate::schema::{Field, FieldType, Metric, VectorOptions};
 use crate::{DocId, SegmentReader, TantivyError};
 
-/// Which on-disk layout a segment's vector data uses, surfaced through
-/// [`VectorInfo`] for tooling.
-/// Vector row-storage layout.
+/// The on-disk layout of a segment's vector rows, reported in [`VectorInfo`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VectorStorageFormat {
     /// Full-precision rows without cluster routing.
@@ -57,7 +53,6 @@ pub struct VectorInfo {
     /// Row-storage layout.
     pub format: VectorStorageFormat,
     /// Distinct documents with a vector in this field.
-    /// Distinct documents with vectors.
     pub num_vectors: usize,
     /// Number of IVF centroids.
     pub num_centroids: Option<usize>,
@@ -724,6 +719,20 @@ pub(crate) struct QuantizedLayerReader {
     bits: u8,
 }
 
+/// Reusable buffers for planning and reading one batch's rows.
+#[derive(Default)]
+pub(crate) struct ReadScratch {
+    /// Global rows of the batch's selection, ascending.
+    pub(crate) rows: Vec<usize>,
+    /// Planned row runs, in row order: code runs of a sparse layer read, row runs of an exact
+    /// read.
+    pub(crate) runs: Vec<Range<usize>>,
+    /// Offsets of the selected rows within one run.
+    pub(crate) offsets: Vec<usize>,
+    /// Storage-block runs of an exact read.
+    pub(crate) blocks: Vec<(usize, usize)>,
+}
+
 /// Pinned SoA ranges for one contiguous cluster posting.
 pub(crate) struct QuantizedLayerBatch {
     pub(crate) residual_norms: Option<OwnedBytes>,
@@ -1057,6 +1066,7 @@ impl QuantizedLayerReader {
             .transpose()
     }
     /// Pins one band's columns in a single request, then restricts views to the requested rows.
+    #[cfg(test)]
     pub(crate) fn read_batch(&self, rows: Range<usize>) -> crate::Result<QuantizedLayerBatch> {
         let b = self.blocks.block_for_range(&rows)?;
         self.read_batch_in_block(b, rows)
@@ -1241,6 +1251,7 @@ impl QuantizedLayerReader {
         self.plan_column_reads(self.codes, available, rows, ranges, scratch);
     }
     /// Resolves a cluster once so ordered code reads need no repeated block lookup.
+    #[cfg(test)]
     pub(crate) fn cluster(&self, row: usize) -> crate::Result<QuantizedClusterReader<'_>> {
         self.cluster_in_block(self.blocks.block_of(row))
     }
@@ -1757,9 +1768,7 @@ impl VectorIndexReader {
         })
     }
 
-    /// The no-data placeholder: zero vectors, no index. Every accessor
-    /// behaves as an empty column, so callers never branch on presence.
-    /// Returns a vector reader with no rows or routing index.
+    /// A reader with no rows and no routing index; every accessor behaves as an empty column.
     pub(crate) fn empty(options: VectorOptions) -> Self {
         let mut bytes = Vec::new();
         super::blocks::write_metadata(&mut bytes, &VectorColMetadata::build_flat(&options))
@@ -1813,9 +1822,8 @@ impl VectorIndexReader {
         self.num_vectors == 0
     }
 
-    /// The routing index, present iff the segment's rows are IVF-clustered.
-    /// `None` means search must scan the rows exactly.
-    /// Returns the optional IVF routing index.
+    /// The routing index, present iff the segment's rows are IVF-clustered; `None` means search
+    /// scans the rows exactly.
     pub fn index(&self) -> Option<&IvfIndex> {
         self.index.as_ref()
     }
@@ -1830,9 +1838,7 @@ impl VectorIndexReader {
         self.quantization.is_some()
     }
 
-    /// Storage info for tooling; `None` if the segment has no vector data for
-    /// the field.
-    /// Returns vector storage information when the field is present.
+    /// Storage information for tooling; `None` when the segment has no vector data for the field.
     pub fn info(&self) -> Option<VectorInfo> {
         if !self.present {
             return None;
@@ -2537,10 +2543,8 @@ impl VectorIndexReader {
         Ok(Some(measurements))
     }
 
-    /// Per-cluster posting-list sizes in cluster order — the distribution
-    /// behind [`Self::info`]'s aggregate cluster stats. `None` when the
-    /// field's storage is not IVF.
-    /// Returns posting sizes in cluster order for IVF storage.
+    /// Per-cluster posting-list sizes in cluster order, behind [`Self::info`]'s cluster stats;
+    /// `None` when the field's storage is not IVF.
     pub fn cluster_sizes(&self) -> Option<Vec<u32>> {
         self.index
             .as_ref()
