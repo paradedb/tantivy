@@ -1,27 +1,13 @@
-//! Top-N vector-similarity collector.
-//!
-//! Unlike the other `TopDocs::order_by_*` paths, the *primary* sort key here is
-//! not a [`SortKeyComputer`](crate::collector::sort_key::SortKeyComputer). IVF
-//! needs to drain the filter `DocSet` into a bitmap upfront and drive its own
-//! cluster iteration, which inverts the per-doc pull model that sort-key
-//! computers assume. So this is its own [`Collector`] with an overridden
-//! [`Collector::collect_segment`] that hands the filter `Weight` down to the
-//! per-segment [`VectorBackend`](super::backend::VectorBackend), which owns the
-//! loop. Flat fits the pull model trivially; IVF gets to drive.
-//!
-//! A secondary key *is* an ordinary `SortKeyComputer` — see
-//! [`TopDocsByVectorSimilarity::with_tie_break`]. The heap sorts on the
-//! composite `(similarity, tie_break)`, so `SortByStaticFastValue`,
-//! `SortByString` and their `(key, Order)` tuples all compose here, and
-//! [`TopNComputer`](crate::collector::TopNComputer) and `compare_for_top_k` are
-//! shared verbatim with the pull-model path. Only the iteration driver differs,
-//! never the ordering rule.
 //! Top-N vector-similarity collection.
+//!
+//! IVF drives its own cluster iteration, so [`Collector::collect_segment`] hands the filter
+//! `Weight` to the segment's [`VectorBackend`](super::backend::VectorBackend) instead of pulling
+//! docs. A secondary key is an ordinary `SortKeyComputer` composed into the heap's
+//! `(similarity, tie_break)` order, the same rule as the pull-model path.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
 
 use super::backend::VectorBackend;
 use super::index_reader::QuantizedFieldReader;
@@ -29,6 +15,7 @@ use super::ivf::AdaptiveProbeParams;
 use super::metadata::VectorColMetadata;
 use super::prepared::{QuantizedQueryCtx, VectorQuery};
 use super::stats::ProbeStats;
+use super::telemetry::take_stage_totals;
 use super::tie_break::NoTieBreak;
 use super::{enter_vector_stage, Stage, VectorElement};
 use crate::collector::sort_key::NaturalComparator;
@@ -38,8 +25,10 @@ use crate::collector::{
 };
 use crate::index::SegmentReader;
 use crate::query::Weight;
-use crate::schema::{Field, FieldType, Schema};
+use crate::schema::{Field, FieldType, Metric, Schema};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal, TantivyError};
+
+// --- Query preparation ---
 
 /// Query identity consists of dimension, metric tag and structural layer metadata.
 #[derive(Clone, Debug)]
@@ -74,19 +63,12 @@ impl Hash for PreparedKey {
 /// Shared initialization cell so each metadata key prepares its query exactly once.
 type PreparedCell = Arc<OnceLock<Arc<QuantizedQueryCtx>>>;
 
-/// Top-N by vector similarity. Returns documents in descending
-/// similarity order. Only docs that actually have a vector are
-/// returned — docs that match the filter but lack a vector for `field`
-/// are dropped (this is required for IVF compatibility, which can't
-/// see vectorless docs at all).
+// --- Collector ---
+
+/// Collects documents by descending vector similarity; docs without a vector are never returned.
 ///
-/// Generic over `T: VectorElement` — `T` must match the schema's
-/// declared dtype, checked at [`Collector::check_schema`] time.
-///
-/// `S` orders documents that tie on similarity; it defaults to
-/// [`NoTieBreak`], which leaves ties to ascending `DocAddress`. See
-/// [`with_tie_break`](Self::with_tie_break).
-/// Collects documents by descending vector similarity.
+/// `T` must match the field's dtype ([`Collector::check_schema`]). `S` orders equal similarities
+/// and defaults to [`NoTieBreak`]: ascending `DocAddress`.
 pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     field: Field,
     query: Arc<Vec<T>>,
@@ -96,6 +78,8 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     max_scan_levels: usize,
     /// Exactly one prepared query for each distinct segment encoding.
     quantized_queries: Mutex<HashMap<PreparedKey, PreparedCell>>,
+    /// The query prepared for the field's metric on first use.
+    prepared: Mutex<Option<Arc<VectorQuery<T>>>>,
     tie_break: S,
 }
 
@@ -110,24 +94,21 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
             adaptive: AdaptiveProbeParams::default(),
             max_scan_levels: usize::MAX,
             quantized_queries: Mutex::new(HashMap::new()),
+            prepared: Mutex::new(None),
             tie_break: NoTieBreak,
         }
     }
 }
 
 impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
-    /// Drop the first `offset` results in the global ranking — used to
-    /// paginate. Each segment still produces its top `limit + offset`
-    /// to ensure the global window has enough candidates.
-    /// Sets the global result offset.
+    /// Skips the first `offset` results of the global ranking; each segment keeps
+    /// `limit + offset`.
     pub fn and_offset(mut self, offset: usize) -> Self {
         self.offset = offset;
         self
     }
 
-    /// Override the adaptive probing parameters (ignored by flat-only
-    /// segments).
-    /// Sets adaptive probing parameters.
+    /// Sets the adaptive probing parameters; flat segments ignore them.
     pub fn with_adaptive_params(mut self, params: AdaptiveProbeParams) -> Self {
         self.adaptive = params;
         self
@@ -139,27 +120,10 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
         self
     }
 
-    /// Order documents that tie on similarity by `tie_break`, as
-    /// `ORDER BY embedding <=> $1, id` does.
+    /// Orders equal similarities by `tie_break`, as `ORDER BY embedding <=> $1, id` does.
     ///
-    /// The tie-break takes part in each segment's top-N eviction, so it also
-    /// decides *which* of a set of equally-distant documents survive, not only
-    /// how the survivors are ordered. Similarity remains the primary key; the
-    /// tie-break is only consulted between documents whose similarity is
-    /// exactly equal.
-    ///
-    /// This does not change which clusters an IVF segment probes: the probe
-    /// loop's stopping rule reads the routed centroids and the filter, never
-    /// the top-N heap.
-    ///
-    /// Each segment is cut to its own top-N under the segment-local
-    /// `SegmentSortKey`, and only the survivors are lifted to `SortKey` for the
-    /// cross-segment merge. `convert_segment_sort_key` must therefore be
-    /// order-preserving within a segment, or a segment can discard a document
-    /// that would have placed globally. The bundled computers satisfy this:
-    /// term ordinals ascend with their terms, and `FastValue`'s `u64` encoding
-    /// is monotonic.
-    /// Sets a secondary ordering for equal similarities.
+    /// The tie-break takes part in each segment's eviction but never in routing. Segments cut on
+    /// the segment-local key, so `convert_segment_sort_key` must preserve order within a segment.
     pub fn with_tie_break<S2: SortKeyComputer>(
         self,
         tie_break: S2,
@@ -172,6 +136,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
             adaptive: self.adaptive,
             max_scan_levels: self.max_scan_levels,
             quantized_queries: self.quantized_queries,
+            prepared: self.prepared,
             tie_break,
         }
     }
@@ -180,20 +145,26 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
         self.limit.saturating_add(self.offset)
     }
 
-    fn segment_query(&self, reader: &SegmentReader) -> crate::Result<VectorQuery<T>> {
-        let quantized = match reader.vector_index(self.field)?.quantization() {
-            Some(field) if self.max_scan_levels > 0 => Some(self.quantized_query(field)),
-            _ => None,
+    /// The query prepared for `metric`, on first use.
+    fn vector_query(&self, metric: Metric) -> Arc<VectorQuery<T>> {
+        let mut prepared = self.prepared.lock().unwrap();
+        let query = match prepared.as_ref() {
+            Some(query) if query.metric() == metric => query,
+            _ => prepared.insert(Arc::new(VectorQuery::new(metric, Arc::clone(&self.query)))),
         };
-        Ok(VectorQuery::new(Arc::clone(&self.query), quantized))
+        Arc::clone(query)
     }
 
-    /// Prepares once per metadata key, releasing the map lock before expensive preparation.
-    fn quantized_query(&self, field: &QuantizedFieldReader) -> Arc<QuantizedQueryCtx> {
+    /// Prepares `query` once per metadata key, releasing the map lock before expensive
+    /// preparation.
+    fn quantized_query(
+        &self,
+        field: &QuantizedFieldReader,
+        query: &VectorQuery<T>,
+    ) -> Arc<QuantizedQueryCtx> {
         let index_ctx = field.index_ctx();
         let prepare = || {
             let active_layers = self.max_scan_levels.min(index_ctx.specs.len());
-            let query = self.query.iter().map(|value| value.to_f32()).collect();
             Arc::new(QuantizedQueryCtx::with_depth(
                 Arc::clone(index_ctx),
                 query,
@@ -216,34 +187,27 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     }
 }
 
-/// What a [`TopDocsByVectorSimilarity`] search returns: the global top-N
-/// plus each searched segment's [`ProbeStats`], so callers can inspect or
-/// aggregate probe metrics without a side channel.
-/// Contains vector results and per-segment probe statistics.
+// --- Fruits ---
+
+/// The global top-N and each searched segment's [`ProbeStats`].
 #[derive(Debug, Default)]
 pub struct VectorSimilarityFruit {
-    /// Global top-N `(score, address)` pairs in descending-similarity order.
     /// Global results in descending-similarity order.
     pub results: Vec<(Score, DocAddress)>,
-    /// One [`ProbeStats`] per collected segment, in segment-ordinal order
-    /// after [`Collector::merge_fruits`]. The counter fields are summable
-    /// across segments; `termination` only carries per-segment meaning.
-    /// Probe statistics in segment order.
+    /// One entry per collected segment, in segment order. Counters sum across segments;
+    /// `termination` is per segment.
     pub stats: Vec<ProbeStats>,
 }
 
-/// One segment's contribution, before [`Collector::merge_fruits`] cuts the
-/// global window.
+/// One segment's results with their tie-break keys, before [`Collector::merge_fruits`].
 ///
-/// Carries the tie-break value alongside each score because the cross-segment
-/// merge has to order by the same composite key the per-segment heaps used.
-/// The value is dropped at merge time — callers order by similarity and read
-/// their own columns back themselves, so it never reaches [`VectorSimilarityFruit`].
-/// One segment's vector results with secondary sort keys.
+/// The merge orders by the same composite key as the segment heaps, then drops the tie-break.
 pub struct SegmentVectorFruit<K> {
     results: Vec<((Score, K), DocAddress)>,
     stats: ProbeStats,
 }
+
+// --- Collection ---
 
 impl<T, S> Collector for TopDocsByVectorSimilarity<T, S>
 where
@@ -281,10 +245,7 @@ where
             )));
         }
         if self.tie_break.requires_scoring() {
-            // `requires_scoring` is false below, so the filter's BM25 score is
-            // never computed and every doc would tie-break on the same
-            // placeholder. Fail loudly rather than silently ordering by nothing.
-            // Relevance scores are unavailable on vector-ordered scans.
+            // No score is computed (`requires_scoring` is false), so every doc would tie.
             return Err(TantivyError::InvalidArgument(
                 "vector similarity cannot be tie-broken by the relevance score: no score is \
                  computed when ordering by a vector field"
@@ -299,14 +260,12 @@ where
         _segment_local_id: SegmentOrdinal,
         _reader: &SegmentReader,
     ) -> crate::Result<Self::Child> {
-        // Never called at runtime — we override `collect_segment`. The
-        // child type exists only to satisfy the trait bound.
+        // Unreachable: `collect_segment` is overridden; the child only satisfies the bound.
         Ok(NoOpSegmentCollector::default())
     }
 
     fn requires_scoring(&self) -> bool {
-        // Similarity is computed from the stored vectors, not from the
-        // filter's BM25 score — let tantivy take the no-score fast path.
+        // Similarity comes from the stored vectors, never from the filter's score.
         false
     }
 
@@ -316,27 +275,31 @@ where
         segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
     ) -> crate::Result<SegmentVectorFruit<S::SortKey>> {
-        let collect_start = Instant::now();
-        let init_start = Instant::now();
-        let init_stage = enter_vector_stage(Stage::ScanInit);
-        let prep_start = Instant::now();
-        let query_prep_stage = enter_vector_stage(Stage::QueryPrep);
-        let query = self.segment_query(reader)?;
-        drop(query_prep_stage);
-        let query_prep_ns = prep_start.elapsed().as_nanos() as u64;
-        let mut backend = VectorBackend::for_segment(
+        // Time before this segment belongs to no stage of it.
+        take_stage_totals();
+        let init = enter_vector_stage(Stage::ScanInit);
+        let (query, quantized) = {
+            let _prep = enter_vector_stage(Stage::QueryPrep);
+            let vectors = reader.vector_index(self.field)?;
+            let query = self.vector_query(vectors.options().metric());
+            let quantized = match vectors.quantization() {
+                Some(field) if self.max_scan_levels > 0 => {
+                    Some(self.quantized_query(field, &query))
+                }
+                _ => None,
+            };
+            (query, quantized)
+        };
+        let backend = VectorBackend::for_segment(
             reader,
             segment_ord,
             self.field,
             query,
+            quantized,
             self.adaptive.clone(),
         )?;
-        backend.add_query_prep_ns(query_prep_ns);
         let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
-        drop(init_stage);
-        backend.add_scan_init_ns(
-            (init_start.elapsed().as_nanos() as u64).saturating_sub(backend.query_prep_ns()),
-        );
+        drop(init);
         let (hits, mut stats) = backend.top_n_by(
             weight,
             reader,
@@ -344,9 +307,7 @@ where
             &mut tie_break,
             self.tie_break.comparator(),
         )?;
-        // Lift the segment-local tie-break key to its global form, but only
-        // now: a `SegmentSortKey` can be a term ordinal, which means nothing
-        // outside this segment and must never reach the cross-segment merge.
+        // A segment key can be a term ordinal: lift it before it leaves the segment.
         let results = hits
             .into_iter()
             .map(|((score, segment_key), address)| {
@@ -356,10 +317,7 @@ where
                 )
             })
             .collect();
-        let residual_ns =
-            (collect_start.elapsed().as_nanos() as u64).saturating_sub(stats.stage_elapsed_ns());
-        let assembly_ns = stats.result_assembly_ns.unwrap_or_default();
-        stats.result_assembly_ns = Some(assembly_ns.saturating_add(residual_ns));
+        stats.add_assembly(&take_stage_totals());
         Ok(SegmentVectorFruit { results, stats })
     }
 
@@ -367,12 +325,10 @@ where
         &self,
         segment_fruits: Vec<SegmentVectorFruit<S::SortKey>>,
     ) -> crate::Result<Self::Fruit> {
-        let assembly_start = Instant::now();
-        let _assembly_stage = enter_vector_stage(Stage::ResultAssembly);
-        // Per-segment fruits are each already top-(limit+offset) under this
-        // same composite order, so the global window is a plain sort of their
-        // union. Stats concatenate untouched — one entry per segment, kept
-        // even when the offset swallows every result.
+        take_stage_totals();
+        let _assembly = enter_vector_stage(Stage::ResultAssembly);
+        // Each fruit is already its segment's top `limit + offset` under this order, so the
+        // global window is a sort of their union. Stats keep one entry per segment.
         let comparator = (NaturalComparator, self.tie_break.comparator());
         let mut stats = Vec::with_capacity(segment_fruits.len());
         let mut all: Vec<ComparableDoc<(Score, S::SortKey), DocAddress>> = Vec::new();
@@ -385,9 +341,7 @@ where
                     .map(|(sort_key, doc)| ComparableDoc { sort_key, doc }),
             );
         }
-        // `compare_for_top_k` is the same rule the per-segment heaps used,
-        // down to the trailing ascending-`DocAddress` tie-break, so it is a
-        // total order and the unstable sort is deterministic.
+        // A total order (ascending `DocAddress` last), so the unstable sort is deterministic.
         all.sort_unstable_by(|lhs, rhs| compare_for_top_k(&comparator, lhs, rhs));
         let results = all
             .into_iter()
@@ -396,18 +350,13 @@ where
             .map(|cd| (cd.sort_key.0, cd.doc))
             .collect();
         if let Some(first) = stats.first_mut() {
-            let merge_ns = assembly_start.elapsed().as_nanos() as u64;
-            let segment_ns = first.result_assembly_ns.unwrap_or_default();
-            first.result_assembly_ns = Some(segment_ns.saturating_add(merge_ns));
+            first.add_assembly(&take_stage_totals());
         }
         Ok(VectorSimilarityFruit { results, stats })
     }
 }
 
-/// Trait-bound shim: the collector overrides [`Collector::collect_segment`]
-/// so the per-doc path never fires, but the `Child: SegmentCollector`
-/// bound on `Collector` still has to be satisfied.
-/// Satisfies the collector's segment-child type requirement.
+/// Satisfies `Collector::Child`; [`Collector::collect_segment`] is overridden, so it never runs.
 pub struct NoOpSegmentCollector<K>(std::marker::PhantomData<K>);
 
 impl<K> Default for NoOpSegmentCollector<K> {

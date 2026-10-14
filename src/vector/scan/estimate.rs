@@ -1,15 +1,15 @@
-//! Combining decoded layers into estimates and sigmas.
+//! Combining decoded layers into per-row estimates and sigmas.
 
 use std::ops::Range;
 
+use super::columns::QuantizedCandidates;
+#[cfg(feature = "unstable")]
+use super::layer_read::{decode_f16s, decode_f32s};
 use crate::schema::Metric;
 use crate::vector::prepared::{
     corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix,
     quantized_model_sigma, refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError,
 };
-use crate::vector::scan::columns::QuantizedCandidates;
-#[cfg(feature = "unstable")]
-use crate::vector::scan::layer_read::{decode_f16s, decode_f32s};
 
 /// Computes corrected-reconstruction uncertainty.
 #[inline(always)]
@@ -49,7 +49,7 @@ fn fill_gamma_sigmas(
 
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-pub(in crate::vector) fn combine_initial_decoded(
+pub(super) fn combine_initial_decoded(
     metric: Metric,
     dimension: usize,
     kernel_scores: &mut [f32],
@@ -289,16 +289,14 @@ fn finish_quantization_bench_layer0_cosine_cluster(
 
 const COSINE_REFINEMENT_BATCH_ROWS: usize = 2_048;
 
-pub(in crate::vector) fn cosine_refinement_batches(
-    row_count: usize,
-) -> impl Iterator<Item = Range<usize>> {
+pub(super) fn cosine_refinement_batches(row_count: usize) -> impl Iterator<Item = Range<usize>> {
     (0..row_count)
         .step_by(COSINE_REFINEMENT_BATCH_ROWS)
         .map(move |start| start..(start + COSINE_REFINEMENT_BATCH_ROWS).min(row_count))
 }
 
 #[inline(always)]
-pub(in crate::vector) fn combine_refinement_decoded(
+pub(super) fn combine_refinement_decoded(
     metric: Metric,
     dimension: usize,
     candidates: &mut QuantizedCandidates,

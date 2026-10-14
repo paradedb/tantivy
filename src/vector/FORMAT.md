@@ -32,7 +32,7 @@ both little-endian, with no padding. Record `doc` starts at body offset `8*doc`.
 Absent documents store `(u32::MAX, 0)`; the cluster count must be less than
 `u32::MAX`. Opening the entry checks its body length is exactly `8*max_doc`.
 Each lookup reads one record and checks `cluster < K` and `local < rows_in(cluster)`.
-The entry opens lazily for document lookups. Scans, reranking and result assembly
+The entry opens lazily for document lookups. Scans, exact scoring and result assembly
 use Data columns and do not open it.
 
 ## Data entry and blocks
@@ -119,7 +119,7 @@ each band uses one read with columns exposed as views.
 DocIds are read separately and validated as strictly ascending and below the
 segment's `max_doc`. Filters and deleted-document visibility select rows before
 any payload read; a cluster with no survivors reads only DocIds. With no filter
-or deletions, quantized scans read no DocIds until rerank resolves the final
+or deletions, quantized scans read no DocIds until the exact phase resolves the final
 candidates, once per candidate-bearing cluster. Exact scans without a row gate
 read Rows alone and resolve DocIds only when a score reaches heap admission.
 Filtered exact scans plan reads over survivor rows in the Rows column.
@@ -207,8 +207,8 @@ clusters, the threshold is the **k-th largest lower endpoint**
 estimate. A candidate survives when its upper endpoint reaches the threshold.
 Consequently, enclosing intervals preserve the true top-k; widening any interval
 or increasing kappa cannot remove an existing survivor. Statistical intervals
-are not guaranteed to enclose every true score, so exact reranking alone does
-not guarantee recall parity.
+are not guaranteed to enclose every true score, so exact scoring of the survivors alone
+does not guarantee recall parity.
 
 The policy constants are uniform `kappa = 2.5`, statistical-width multiplier
 `1.15`, and serialized gamma clamp `[1, 4]`. None is fitted per dataset, layer,

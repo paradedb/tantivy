@@ -499,7 +499,7 @@ mod bounds_peek_tests {
     use crate::collector::sort_key::NaturalComparator;
     use crate::collector::TopNComputer;
     use crate::schema::Metric;
-    use crate::vector::PreparedQuery;
+    use crate::vector::prepared::VectorQuery;
 
     /// The vector heap: f32 similarity keys, "higher is better",
     /// out-of-order pushes — the `scan_clusters` shape.
@@ -536,7 +536,7 @@ mod bounds_peek_tests {
 
     /// The kth key is in NATIVE heap space per metric: `-d^2` for L2,
     /// cosine similarity for cosine, the raw dot score for dot — the
-    /// values `PreparedQuery::score_doc_bytes` produces over known
+    /// values `VectorQuery::score_row` produces over known
     /// vectors.
     #[test]
     fn kth_key_per_metric() {
@@ -554,10 +554,10 @@ mod bounds_peek_tests {
             (Metric::Dot, 0.0),    // 2nd best of {1, 0, -1}
         ];
         for (metric, expected) in expected_kth {
-            let prepared = PreparedQuery::<f32>::new(metric, Arc::new(query.clone()));
+            let prepared = VectorQuery::<f32>::new(metric, Arc::new(query.clone()));
             let mut topn = heap(2);
             for (values, doc) in docs {
-                topn.push_unordered(prepared.score_doc_bytes(&row(values)), doc);
+                topn.push_unordered(prepared.score_row(&row(values)).score(), doc);
             }
             let peek = HeapPeek::from_kth(topn.kth_best());
             assert_eq!(

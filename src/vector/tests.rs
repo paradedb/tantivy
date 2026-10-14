@@ -620,7 +620,8 @@ pub(crate) mod ground_truth {
     use std::sync::Arc;
 
     use crate::schema::Field;
-    use crate::vector::{Metric, PreparedQuery};
+    use crate::vector::prepared::VectorQuery;
+    use crate::vector::Metric;
     use crate::{DocAddress, Index, Score};
 
     pub(crate) fn top_k(
@@ -630,7 +631,7 @@ pub(crate) mod ground_truth {
         query: &[f32],
         top_k: usize,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
-        let query = PreparedQuery::<f32>::new(metric, Arc::new(query.to_vec()));
+        let query = VectorQuery::<f32>::new(metric, Arc::new(query.to_vec()));
         let searcher = index.reader()?.searcher();
         let mut scored = Vec::new();
         for (seg_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
@@ -644,7 +645,7 @@ pub(crate) mod ground_truth {
                 }
                 if let Some(bytes) = vec_reader.vector_bytes(doc)? {
                     scored.push((
-                        query.score_doc_bytes(&bytes),
+                        query.score_row(&bytes).score(),
                         DocAddress::new(seg_ord as u32, doc),
                     ));
                 }

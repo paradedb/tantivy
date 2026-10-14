@@ -1,235 +1,577 @@
-//! The IVF segment scan: quantized candidates, boundaries and exact scoring.
+//! The IVF segment scan: shortlists each cluster a source supplies, narrows the quantized
+//! shortlist layer by layer under one pruning bound, and scores what is left exactly.
 
-pub(in crate::vector) mod bound;
-pub(in crate::vector) mod columns;
-pub(in crate::vector) mod estimate;
-pub(in crate::vector) mod heap;
-pub(in crate::vector) mod layer_read;
+pub(crate) mod bound;
+pub(crate) mod columns;
+pub(crate) mod estimate;
+mod exact;
+pub(crate) mod heap;
+pub(crate) mod layer_read;
 #[cfg(test)]
 mod quantized_boundary_tests;
 #[cfg(test)]
-pub(in crate::vector) mod tests;
+mod tests;
 
-use crate::vector::interval::Threshold;
-#[cfg(test)]
-use crate::vector::prepared::ArithmeticError;
-use crate::vector::quantization::QUANTIZED_BOUNDARY_KAPPA;
-use crate::vector::scan::bound::lower_endpoint_order;
-use crate::vector::scan::columns::{QuantizedCandidate, QuantizedCandidates};
-use crate::{DocId, Score};
+use std::ops::Range;
 
-pub(super) struct QuantizedScanCtx {
-    pub(super) candidates: QuantizedCandidates,
-    boundary_scratch: Vec<QuantizedCandidate>,
-    /// Query-residual norms by cluster.
-    cluster_query_norms: Vec<f32>,
-    /// Running top lower endpoints, all evaluated with `bound_kappa`.
-    bound_top: Vec<usize>,
-    bound_kappa: f32,
-    boundary_passed: bool,
-    /// Cluster-local selection scratch.
-    cluster_top: Vec<usize>,
-    cluster_top_n: usize,
-    cluster_start: Option<usize>,
-    /// Top-k merge scratch.
-    bound_merge: Vec<usize>,
-    kth_scratch: Vec<usize>,
+use self::bound::KthBound;
+use self::columns::QuantizedCandidates;
+use self::estimate::{
+    combine_initial_decoded, combine_refinement_decoded, cosine_refinement_batches,
+};
+use self::exact::ExactScorer;
+use self::heap::TieBreakHits;
+use self::layer_read::{candidate_offsets, score_layer};
+use crate::collector::sort_key::Comparator;
+use crate::collector::SegmentSortKeyComputer;
+use crate::error::DataCorruption;
+use crate::schema::Metric;
+use crate::vector::cluster_source::{ClusterRows, ClusterSource, Feedback};
+use crate::vector::index_reader::{QuantizedFieldReader, VectorIndexReader};
+use crate::vector::ivf::IvfIndex;
+use crate::vector::prepared::{ArithmeticError, QuantizedQueryCtx, ScoringQuery};
+use crate::vector::{enter_vector_stage, Similarity, Stage, VectorElement};
+use crate::SegmentOrdinal;
+
+// --- Contracts ---
+
+/// Sizes for one segment scan.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScanConfig {
+    pub(crate) top_n: usize,
+    /// Upper bound on rows admitted, for sizing the candidate columns.
+    pub(crate) capacity: usize,
 }
 
-impl QuantizedScanCtx {
-    pub(super) fn new(max_doc: DocId, candidate_capacity: usize) -> Self {
-        let distinct_capacity = candidate_capacity.min(max_doc as usize);
-        Self {
-            candidates: QuantizedCandidates::with_capacity(candidate_capacity),
-            boundary_scratch: Vec::with_capacity(candidate_capacity),
-            cluster_query_norms: Vec::new(),
-            bound_top: Vec::new(),
-            bound_kappa: QUANTIZED_BOUNDARY_KAPPA,
-            boundary_passed: false,
-            cluster_top: Vec::new(),
-            cluster_top_n: 0,
-            cluster_start: None,
-            bound_merge: Vec::new(),
-            kth_scratch: Vec::with_capacity(distinct_capacity),
-        }
-    }
+/// Per-layer counts of a quantized scan.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LayerReport {
+    /// Candidates the layer scored.
+    pub(crate) scored: usize,
+    /// Candidates left after the layer's boundary.
+    pub(crate) survivors: usize,
+}
 
-    pub(super) fn begin_cluster(&mut self, top_n: usize) {
-        debug_assert!(self.cluster_start.is_none());
-        debug_assert!(self.cluster_top.is_empty());
-        self.cluster_top.reserve(top_n);
-        self.bound_top.reserve(top_n);
-        self.bound_merge.reserve(top_n.saturating_mul(2));
-        self.cluster_top_n = top_n;
-        self.cluster_start = Some(self.candidates.len());
-    }
-
-    /// Appends an eligible row to scan columns.
+/// What a finished scan reports.
+#[derive(Debug, Default)]
+pub(crate) struct ScanReport {
+    /// Rows shortlisted from the source.
+    pub(crate) candidates_scored: usize,
+    /// One per active layer on a quantized segment; empty at full precision.
+    pub(crate) layers: Vec<LayerReport>,
+    /// Rows scored at full precision.
+    pub(crate) exact_rows: usize,
     #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    #[inline]
-    fn push(
-        &mut self,
-        row: usize,
-        doc: DocId,
-        base: f32,
-        raw_prefix: f32,
-        estimate: f32,
-        sigma: f32,
-        residual_norm_squared: f32,
-        gamma: f32,
-        sign_query_error_term: f32,
-    ) {
-        self.candidates.push(
-            row,
-            doc,
-            base,
-            raw_prefix,
-            estimate,
-            sigma,
-            residual_norm_squared,
-            gamma,
-            sign_query_error_term,
-            ArithmeticError::default(),
-        );
+    pub(crate) trace: ScanTrace,
+}
+
+/// Rows each stage of a scan scored and kept, by global row.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ScanTrace {
+    /// Rows shortlisted at layer 0.
+    pub(crate) scored_rows: Vec<usize>,
+    pub(crate) boundary_rows: Vec<Vec<usize>>,
+    /// `(row, estimate bits)` after the shortlist and after each refining layer.
+    pub(crate) estimate_rows: Vec<Vec<(usize, u32)>>,
+    /// Rows scored in the exact phase.
+    pub(crate) exact_phase_rows: Vec<usize>,
+}
+
+/// What the scan remembers about a cluster it admitted.
+#[derive(Clone, Copy, Debug)]
+struct AdmittedCluster {
+    centroid: Similarity,
+    /// Whether the candidates carry this cluster's doc ids.
+    docs_in_candidates: bool,
+}
+
+// --- Quantized state ---
+
+/// Per-segment buffers reused across clusters and layers.
+#[derive(Default)]
+struct ScanScratch {
+    kernel_scores: Vec<f32>,
+    decoded_scales: Vec<f32>,
+    decoded_gammas: Vec<f32>,
+    decoded_error_ratios: Vec<f32>,
+    decoded_constants: Vec<f32>,
+    decoded_residual_norms: Vec<f32>,
+    base_scores: Vec<f32>,
+    estimate_scores: Vec<f32>,
+    sigma_scores: Vec<f32>,
+    residual_norm_squared_scores: Vec<f32>,
+    sign_query_error_terms: Vec<f32>,
+    arithmetic_variances: Vec<ArithmeticError>,
+    selection_offsets: Vec<usize>,
+    selected_rows: Vec<usize>,
+    row_offsets: Vec<usize>,
+    read_ranges: Vec<Range<usize>>,
+    /// A survivor group's cluster-local offsets.
+    group_offsets: Vec<usize>,
+}
+
+/// The quantized cascade's state: candidate columns plus each admitted cluster's record.
+struct QuantizedState<'a> {
+    query: &'a QuantizedQueryCtx,
+    field: &'a QuantizedFieldReader,
+    metric: Metric,
+    dimension: usize,
+    candidates: QuantizedCandidates,
+    /// By cluster id; `None` for clusters never admitted.
+    admitted: Vec<Option<AdmittedCluster>>,
+}
+
+impl<'a> QuantizedState<'a> {
+    fn new(query: &'a QuantizedQueryCtx, field: &'a QuantizedFieldReader, capacity: usize) -> Self {
+        let meta = query.index.meta.field();
+        Self {
+            query,
+            field,
+            metric: meta.metric,
+            dimension: meta.dim as usize,
+            candidates: QuantizedCandidates::with_capacity(capacity),
+            admitted: Vec::new(),
+        }
     }
 
-    pub(super) fn set_cluster_query_norm(&mut self, cluster: usize, query_norm: f32) {
-        if self.cluster_query_norms.len() <= cluster {
-            self.cluster_query_norms.resize(cluster + 1, f32::NAN);
+    fn record(&mut self, cluster: usize, admitted: AdmittedCluster) {
+        if self.admitted.len() <= cluster {
+            self.admitted.resize(cluster + 1, None);
         }
-        self.cluster_query_norms[cluster] = query_norm;
+        self.admitted[cluster] = Some(admitted);
     }
 
-    pub(super) fn cluster_query_norm(&self, cluster: usize) -> f32 {
-        let query_norm = self.cluster_query_norms[cluster];
-        debug_assert!(query_norm.is_finite());
-        query_norm
-    }
-
-    /// Merges one cluster into the running admission top-k.
-    pub(super) fn finish_cluster_bound(&mut self) {
-        self.finish_cluster_bound_with_kappa(QUANTIZED_BOUNDARY_KAPPA);
-    }
-
-    fn finish_cluster_bound_with_kappa(&mut self, kappa: f32) {
-        debug_assert!(self.bound_top.is_empty() || self.bound_kappa == kappa);
-        self.bound_kappa = kappa;
-        let cluster_start = self
-            .cluster_start
-            .take()
-            .expect("finish_cluster_bound requires begin_cluster");
-        let top_n = std::mem::take(&mut self.cluster_top_n);
-        if top_n == 0 || cluster_start >= self.candidates.len() {
-            self.cluster_top.clear();
-            return;
-        }
-
-        self.cluster_top.clear();
-        self.cluster_top
-            .extend(cluster_start..self.candidates.len());
-        if self.cluster_top.len() > top_n {
-            self.cluster_top
-                .select_nth_unstable_by(top_n - 1, |&a, &b| {
-                    lower_endpoint_order(&self.candidates, a, b, kappa)
-                });
-            self.cluster_top.truncate(top_n);
-        }
-
-        self.bound_merge.clear();
-        self.bound_merge.extend_from_slice(&self.bound_top);
-        for &index in &self.cluster_top {
-            self.bound_merge.push(index);
-        }
-        self.cluster_top.clear();
-        self.bound_merge
-            .sort_unstable_by(|&a, &b| lower_endpoint_order(&self.candidates, a, b, kappa));
-        self.bound_merge.truncate(top_n);
-        std::mem::swap(&mut self.bound_top, &mut self.bound_merge);
-    }
-
-    pub(super) fn running_pessimistic_kth(&self, top_n: usize, kappa: f32) -> Option<Threshold> {
-        debug_assert!(!self.boundary_passed);
-        if top_n == 0 || self.bound_top.len() < top_n {
-            return None;
-        }
-        debug_assert_eq!(self.bound_kappa, kappa);
-        let index = *self.bound_top.last().unwrap();
-        Some(Threshold(
-            self.candidates
-                .estimate(index)
-                .lower(self.candidates.sigmas[index], kappa),
-        ))
-    }
-
-    /// The lowest point estimate among the running top-k rows, `None`
-    /// until `top_n` rows are in. `top_n` rows score at least this, so it
-    /// never exceeds the k-th best estimate; unlike
-    /// [`Self::running_pessimistic_kth`] it carries no confidence margin,
-    /// so it must not drive pruning.
-    pub(super) fn running_estimate_kth(&self, top_n: usize) -> Option<Score> {
-        debug_assert!(!self.boundary_passed);
-        if top_n == 0 || self.bound_top.len() < top_n {
-            return None;
-        }
-        self.bound_top
+    /// The admitted clusters in ascending id, which is ascending row order.
+    fn admitted_clusters(&self) -> impl Iterator<Item = (usize, AdmittedCluster)> + '_ {
+        self.admitted
             .iter()
-            .map(|&index| self.candidates.estimates[index])
-            .min_by(f32::total_cmp)
+            .enumerate()
+            .filter_map(|(cluster, admitted)| admitted.map(|admitted| (cluster, admitted)))
     }
 
-    /// Select by lower endpoint itself; ordering by estimate can prune a true top-k row
-    /// even when every confidence interval encloses its exact score.
-    fn pessimistic_kth(&mut self, top_n: usize, kappa: f32) -> Option<Threshold> {
-        debug_assert!(
-            self.candidates
-                .estimates
-                .iter()
-                .zip(&self.candidates.sigmas)
-                .all(|(&estimate, &sigma)| estimate.is_finite() && sigma.is_finite()),
-            "quantized boundary inputs must be finite"
+    /// Scores a cluster's rows on layer 0 from its whole band and appends them as quantized
+    /// candidates.
+    fn admit(
+        &mut self,
+        rows: &ClusterRows<'_>,
+        bound: &mut KthBound,
+        scratch: &mut ScanScratch,
+    ) -> crate::Result<()> {
+        let query = self.query;
+        let selected_count = rows.len();
+        let layer = &self.field.layers()[0];
+        let cluster_score = rows.centroid.score();
+        let band = layer.read_batch_in_block(rows.cluster, rows.rows.clone())?;
+        let score_query_norm = query.score_query_norm(cluster_score);
+        score_layer(
+            query,
+            0,
+            layer,
+            Some((&band, &mut scratch.decoded_residual_norms)),
+            Some(rows.cluster),
+            rows.rows.clone(),
+            rows.offsets,
+            &mut scratch.kernel_scores,
+            &mut scratch.decoded_scales,
+            &mut scratch.decoded_gammas,
+            &mut scratch.decoded_error_ratios,
+            &mut scratch.decoded_constants,
+            &mut scratch.read_ranges,
+            &mut scratch.selected_rows,
+            &mut scratch.row_offsets,
+        )?;
+        scratch.base_scores.resize(selected_count, 0.0);
+        scratch.estimate_scores.resize(selected_count, 0.0);
+        scratch.sigma_scores.resize(selected_count, 0.0);
+        scratch
+            .residual_norm_squared_scores
+            .resize(selected_count, 0.0);
+        scratch.sign_query_error_terms.resize(selected_count, 0.0);
+        scratch
+            .arithmetic_variances
+            .resize(selected_count, ArithmeticError::default());
+        combine_initial_decoded(
+            self.metric,
+            self.dimension,
+            &mut scratch.kernel_scores,
+            &mut scratch.base_scores,
+            &mut scratch.estimate_scores,
+            &mut scratch.sigma_scores,
+            &mut scratch.residual_norm_squared_scores,
+            &mut scratch.sign_query_error_terms,
+            &mut scratch.arithmetic_variances,
+            &scratch.decoded_scales,
+            &scratch.decoded_gammas,
+            &scratch.decoded_error_ratios,
+            &scratch.decoded_constants,
+            &scratch.decoded_residual_norms,
+            cluster_score,
+            score_query_norm * score_query_norm,
+            query.query_error_squared(0) as f32,
         );
-        if top_n == 0 || self.candidates.len() < top_n {
-            return None;
-        }
-        self.kth_scratch.clear();
-        self.kth_scratch.extend(0..self.candidates.len());
-        let (_, selected, _) = self
-            .kth_scratch
-            .select_nth_unstable_by(top_n - 1, |&a, &b| {
-                lower_endpoint_order(&self.candidates, a, b, kappa)
-            });
-        let index = *selected;
-        Some(Threshold(
-            self.candidates
-                .estimate(index)
-                .lower(self.candidates.sigmas[index], kappa),
-        ))
+        self.record(
+            rows.cluster,
+            AdmittedCluster {
+                centroid: rows.centroid,
+                docs_in_candidates: rows.docs.is_some(),
+            },
+        );
+        let cluster_start = self.candidates.len();
+        self.candidates.append_selected(
+            rows.rows.clone(),
+            rows.offsets,
+            rows.docs,
+            &scratch.base_scores[..selected_count],
+            &scratch.kernel_scores[..selected_count],
+            &scratch.estimate_scores[..selected_count],
+            &scratch.sigma_scores[..selected_count],
+            &scratch.residual_norm_squared_scores[..selected_count],
+            &scratch.decoded_gammas[..selected_count],
+            &scratch.sign_query_error_terms[..selected_count],
+            &scratch.arithmetic_variances[..selected_count],
+        );
+        self.candidates.finish_cluster(cluster_start, bound);
+        Ok(())
     }
 
-    pub(super) fn band(&mut self, top_n: usize, kappa: f32) {
-        let pessimistic_kth = self.pessimistic_kth(top_n, kappa);
-        self.boundary_scratch.clear();
-        for index in 0..self.candidates.len() {
-            if pessimistic_kth.is_none_or(|kth| {
-                kth.admits(
-                    self.candidates
-                        .estimate(index)
-                        .upper(self.candidates.sigmas[index], kappa),
+    /// Records the candidates `layer` scored and prunes them at its boundary.
+    fn prune(&mut self, layer: usize, bound: &mut KthBound, report: &mut ScanReport) {
+        report.layers[layer].scored = self.candidates.len();
+        #[cfg(test)]
+        report
+            .trace
+            .estimate_rows
+            .push(self.candidates.estimate_trace());
+        let _boundary = enter_vector_stage(Stage::Boundary(layer as u8));
+        self.candidates.band(bound);
+        report.layers[layer].survivors = self.candidates.len();
+        #[cfg(test)]
+        report
+            .trace
+            .boundary_rows
+            .push(self.candidates.rows.clone());
+    }
+
+    /// Refines every live candidate with `layer`, which follows at least one boundary.
+    fn refine_layer(
+        &mut self,
+        layer_idx: usize,
+        index: &IvfIndex,
+        scratch: &mut ScanScratch,
+    ) -> crate::Result<()> {
+        let query = self.query;
+        let metric = self.metric;
+        let layer = &self.field.layers()[layer_idx];
+        let sign_query_error_squared =
+            if matches!(query.index.specs[layer_idx].kind, cascade::LayerKind::Sign) {
+                query.query_error_squared(layer_idx) as f32
+            } else {
+                0.0
+            };
+        if metric == Metric::Cosine {
+            let query_norm = query.score_query_norm(0.0);
+            for candidate_range in cosine_refinement_batches(self.candidates.len()) {
+                let first_row = self.candidates.rows[candidate_range.start];
+                let last_row = self.candidates.rows[candidate_range.end - 1];
+                let available_rows = first_row..last_row + 1;
+                let offsets = candidate_offsets(
+                    &self.candidates.rows[candidate_range.clone()],
+                    &available_rows,
+                    &mut scratch.selection_offsets,
+                );
+                let rows = score_layer(
+                    query,
+                    layer_idx,
+                    layer,
+                    None,
+                    None,
+                    available_rows,
+                    Some(offsets),
+                    &mut scratch.kernel_scores,
+                    &mut scratch.decoded_scales,
+                    &mut scratch.decoded_gammas,
+                    &mut scratch.decoded_error_ratios,
+                    &mut scratch.decoded_constants,
+                    &mut scratch.read_ranges,
+                    &mut scratch.selected_rows,
+                    &mut scratch.row_offsets,
+                )?;
+                combine_refinement_decoded(
+                    metric,
+                    self.dimension,
+                    &mut self.candidates,
+                    candidate_range,
+                    &scratch.kernel_scores[..rows],
+                    &scratch.decoded_scales[..rows],
+                    &scratch.decoded_gammas[..rows],
+                    &scratch.decoded_error_ratios[..rows],
+                    &[],
+                    query_norm * query_norm,
+                    sign_query_error_squared,
+                );
+            }
+            return Ok(());
+        }
+        let groups = survivor_groups(&self.candidates.rows, self.admitted_clusters(), index);
+        for (cluster, admitted, candidate_range) in groups {
+            let cluster_rows = index.cluster_range(cluster);
+            let query_norm = query.score_query_norm(admitted.centroid.score());
+            let offsets = candidate_offsets(
+                &self.candidates.rows[candidate_range.clone()],
+                &cluster_rows,
+                &mut scratch.selection_offsets,
+            );
+            let rows = score_layer(
+                query,
+                layer_idx,
+                layer,
+                None,
+                Some(cluster),
+                cluster_rows,
+                Some(offsets),
+                &mut scratch.kernel_scores,
+                &mut scratch.decoded_scales,
+                &mut scratch.decoded_gammas,
+                &mut scratch.decoded_error_ratios,
+                &mut scratch.decoded_constants,
+                &mut scratch.read_ranges,
+                &mut scratch.selected_rows,
+                &mut scratch.row_offsets,
+            )?;
+            let decoded_constants = if metric == Metric::L2 {
+                &scratch.decoded_constants[..rows]
+            } else {
+                &[]
+            };
+            combine_refinement_decoded(
+                metric,
+                self.dimension,
+                &mut self.candidates,
+                candidate_range,
+                &scratch.kernel_scores[..rows],
+                &scratch.decoded_scales[..rows],
+                &scratch.decoded_gammas[..rows],
+                &scratch.decoded_error_ratios[..rows],
+                decoded_constants,
+                query_norm * query_norm,
+                sign_query_error_squared,
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Splits row-sorted survivors into one candidate range per admitted cluster.
+fn survivor_groups(
+    rows: &[usize],
+    admitted: impl Iterator<Item = (usize, AdmittedCluster)>,
+    index: &IvfIndex,
+) -> Vec<(usize, AdmittedCluster, Range<usize>)> {
+    debug_assert!(
+        rows.windows(2).all(|pair| pair[0] < pair[1]),
+        "survivors are row-sorted"
+    );
+    let mut groups = Vec::new();
+    let mut first = 0;
+    for (cluster, record) in admitted {
+        if first == rows.len() {
+            break;
+        }
+        let cluster_rows = index.cluster_range(cluster);
+        let end = first + rows[first..].partition_point(|&row| row < cluster_rows.end);
+        if end > first {
+            debug_assert!(rows[first] >= cluster_rows.start);
+            groups.push((cluster, record, first..end));
+        }
+        first = end;
+    }
+    debug_assert_eq!(
+        first,
+        rows.len(),
+        "every survivor belongs to an admitted cluster"
+    );
+    groups
+}
+
+// --- Segment scan ---
+
+/// One segment's IVF scan. A cluster source supplies each cluster's rows; the scan shortlists them
+/// under the segment's quantization, keeps the pruning bound, and scores what is left exactly.
+pub(crate) struct SegmentScan<'a, T, K, C>
+where
+    T: VectorElement,
+    K: SegmentSortKeyComputer,
+    C: Comparator<K::SegmentSortKey>,
+{
+    index: &'a IvfIndex,
+    exact: ExactScorer<'a, T, K, C>,
+    /// The quantized cascade; `None` scores every shortlisted row exactly.
+    quantized: Option<QuantizedState<'a>>,
+    scratch: ScanScratch,
+    report: ScanReport,
+}
+
+impl<'a, T, K, C> SegmentScan<'a, T, K, C>
+where
+    T: VectorElement,
+    K: SegmentSortKeyComputer,
+    C: Comparator<K::SegmentSortKey>,
+{
+    /// Fails with `DataCorruption` when a quantized query meets a segment without quantized slots.
+    pub(crate) fn new(
+        reader: &'a VectorIndexReader,
+        index: &'a IvfIndex,
+        query: ScoringQuery<'a, T>,
+        config: ScanConfig,
+        tie_break: &'a mut K,
+        tie_comparator: C,
+    ) -> crate::Result<Self> {
+        let quantized = match (query.quantized, reader.quantization()) {
+            (Some(quantized), Some(field)) => {
+                Some(QuantizedState::new(quantized, field, config.capacity))
+            }
+            (Some(_), None) => {
+                return Err(DataCorruption::comment_only(
+                    "quantized query requires quantized slots",
                 )
-            }) {
-                self.boundary_scratch
-                    .push(self.candidates.materialize(index));
+                .into())
+            }
+            (None, _) => None,
+        };
+        let layers = quantized
+            .as_ref()
+            .map_or(0, |state| state.query.active_layers());
+        Ok(Self {
+            index,
+            exact: ExactScorer::new(reader, query.query, config.top_n, tie_break, tie_comparator),
+            quantized,
+            scratch: ScanScratch::default(),
+            report: ScanReport {
+                layers: vec![LayerReport::default(); layers],
+                ..ScanReport::default()
+            },
+        })
+    }
+
+    /// Scores one segment: shortlists each cluster `source` supplies, narrows the shortlist one
+    /// quantized layer at a time, then scores what is left exactly.
+    pub(crate) fn run(&mut self, source: &mut impl ClusterSource) -> crate::Result<()> {
+        let stage = enter_vector_stage(self.shortlist_stage());
+        while let Some(rows) = source.next(self.feedback())? {
+            let scored = self.shortlist(&rows)?;
+            source.admitted(scored, self.feedback())?;
+        }
+        drop(stage);
+        self.close_shortlist();
+        for layer in self.refining_layers() {
+            self.narrow(layer)?;
+        }
+        self.score_shortlist()
+    }
+
+    /// The stage the shortlist is built in: layer 0, or the exact scan at full precision.
+    fn shortlist_stage(&self) -> Stage {
+        match self.quantized {
+            Some(_) => Stage::LayerScan(0),
+            None => Stage::ExactScan,
+        }
+    }
+
+    /// The pruning thresholds as of the last shortlisted cluster.
+    fn feedback(&self) -> Feedback {
+        Feedback {
+            kth_lower: self.exact.bound.running_lower(),
+            kth_estimate: self.exact.bound.running_estimate(),
+        }
+    }
+
+    /// Adds a cluster's rows to the shortlist: scored exactly at full precision, otherwise as
+    /// quantized candidates. Returns the rows scored.
+    fn shortlist(&mut self, rows: &ClusterRows<'_>) -> crate::Result<usize> {
+        let len = rows.len();
+        debug_assert!(len > 0, "empty clusters never reach the scan");
+        #[cfg(test)]
+        self.report.trace.scored_rows.extend(rows.global_rows());
+        match &mut self.quantized {
+            Some(state) => state.admit(rows, &mut self.exact.bound, &mut self.scratch)?,
+            None => {
+                self.report.exact_rows += self.exact.score(rows)?;
             }
         }
-        self.boundary_scratch
-            .sort_unstable_by_key(|candidate| candidate.row);
-        self.candidates
-            .replace_with_boundary_survivors(&self.boundary_scratch);
-        // `bound_top` indexes the pre-boundary column layout; nothing may read the
-        // running admission threshold after a boundary.
-        self.bound_top.clear();
-        self.boundary_passed = true;
-        debug_assert!(self.cluster_start.is_none());
+        self.report.candidates_scored += len;
+        Ok(len)
+    }
+
+    /// Prunes the shortlist at layer 0's boundary.
+    fn close_shortlist(&mut self) {
+        if let Some(state) = &mut self.quantized {
+            state.prune(0, &mut self.exact.bound, &mut self.report);
+        }
+    }
+
+    /// The quantized layers after layer 0; none at full precision.
+    fn refining_layers(&self) -> Range<usize> {
+        1..self
+            .quantized
+            .as_ref()
+            .map_or(1, |state| state.query.active_layers())
+    }
+
+    /// Refines the shortlist with `layer` and prunes it at that layer's boundary.
+    fn narrow(&mut self, layer: usize) -> crate::Result<()> {
+        let Some(state) = &mut self.quantized else {
+            return Ok(());
+        };
+        {
+            let _layer = enter_vector_stage(Stage::LayerScan(layer as u8));
+            state.refine_layer(layer, self.index, &mut self.scratch)?;
+        }
+        state.prune(layer, &mut self.exact.bound, &mut self.report);
+        Ok(())
+    }
+
+    /// Scores the last boundary's survivors exactly, one cluster group at a time.
+    fn score_shortlist(&mut self) -> crate::Result<()> {
+        let Some(state) = &self.quantized else {
+            return Ok(());
+        };
+        let survivors = &state.candidates;
+        for (cluster, admitted, group) in
+            survivor_groups(&survivors.rows, state.admitted_clusters(), self.index)
+        {
+            let cluster_rows = self.index.cluster_range(cluster);
+            self.scratch.group_offsets.clear();
+            self.scratch.group_offsets.extend(
+                survivors.rows[group.clone()]
+                    .iter()
+                    .map(|&row| row - cluster_rows.start),
+            );
+            let rows = ClusterRows {
+                cluster,
+                rows: cluster_rows,
+                offsets: Some(&self.scratch.group_offsets),
+                docs: admitted.docs_in_candidates.then(|| &survivors.docs[group]),
+                centroid: admitted.centroid,
+            };
+            self.report.exact_rows += self.exact.score_survivors(&rows)?;
+        }
+        Ok(())
+    }
+
+    /// Returns the hits and the scan's report.
+    pub(crate) fn finish(
+        self,
+        segment_ord: SegmentOrdinal,
+    ) -> crate::Result<(TieBreakHits<K>, ScanReport)> {
+        let _assembly = enter_vector_stage(Stage::ResultAssembly);
+        let Self { exact, report, .. } = self;
+        #[cfg(test)]
+        let report = {
+            let mut report = report;
+            report.trace.exact_phase_rows = exact.exact_phase_rows.clone();
+            report
+        };
+        Ok((exact.into_hits(segment_ord), report))
     }
 }
