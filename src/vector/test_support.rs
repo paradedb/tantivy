@@ -16,8 +16,9 @@ use crate::query::{
 };
 use crate::schema::{Field, IndexRecordOption, Schema, Term, Value, STORED, STRING};
 use crate::vector::ivf::{AdaptiveProbeParams, Candidate, IvfIndex};
-use crate::vector::prepared::VectorQuery;
+use crate::vector::prepared::{QuantizedQueryCtx, VectorQuery};
 use crate::vector::router::with_test_clusters;
+use crate::vector::scan::plan::PlanOverride;
 use crate::vector::scan::ScanTrace;
 use crate::vector::segment::plan::SegmentPlan;
 use crate::vector::storage_io::test_support::{with_unarmed_log, PagedDirectory};
@@ -176,6 +177,32 @@ impl FixtureSpec {
             segments: 1,
             deletes: Vec::new(),
         }
+    }
+
+    /// One IVF segment of `docs` docs around `clusters` one-hot centroids in `dim` dimensions;
+    /// Dot vectors also vary in norm.
+    pub(crate) fn clustered(metric: Metric, dim: usize, clusters: usize, docs: usize) -> Self {
+        let centroid = |cluster: usize| {
+            let mut centroid = vec![0.0; dim];
+            centroid[cluster] = 1.0;
+            centroid
+        };
+        let vectors = (0..docs)
+            .map(|ordinal| {
+                let mut rng = Lcg(ordinal as u64 * 7919 + 13);
+                let scale = if metric == Metric::Dot {
+                    0.5 + (ordinal % 7) as f32 * 0.15
+                } else {
+                    1.0
+                };
+                centroid(ordinal % clusters)
+                    .iter()
+                    .zip(rng.vector(dim, 0.3))
+                    .map(|(center, noise)| (center + noise) * scale)
+                    .collect()
+            })
+            .collect();
+        Self::ivf(metric, (0..clusters).map(centroid).collect(), vectors)
     }
 
     /// One flat segment over `vectors`.
@@ -447,6 +474,43 @@ impl Fixture {
         backend.top_n(weight, segment_reader, top_n)
     }
 
+    /// Searches segment `segment` directly with the quantized query a collector prepares, every
+    /// cluster read as `plan` forces where it can.
+    pub(crate) fn run_planned(
+        &self,
+        segment: usize,
+        weight: &dyn Weight,
+        query: &[f32],
+        top_n: usize,
+        params: AdaptiveProbeParams,
+        plan: Option<PlanOverride>,
+    ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
+        let searcher = self.index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[segment];
+        let query = Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec())));
+        let quantized = segment_reader
+            .vector_index(self.field)?
+            .quantization()
+            .map(|field| {
+                let index = field.index_ctx();
+                Arc::new(QuantizedQueryCtx::with_depth(
+                    Arc::clone(index),
+                    &query,
+                    index.specs.len(),
+                ))
+            });
+        let mut backend = VectorBackend::<f32>::for_segment(
+            segment_reader,
+            segment as u32,
+            self.field,
+            query,
+            quantized,
+            params,
+        )?;
+        backend.plan_override = plan;
+        backend.top_n(weight, segment_reader, top_n)
+    }
+
     /// Runs `run` over segment 0's full-precision searcher for `query` and `params`, with the
     /// search arguments `filter` and `top_n`.
     pub(crate) fn with_segment<R>(
@@ -477,6 +541,12 @@ impl Fixture {
             segment,
             top_n,
         })
+    }
+
+    /// `query`'s weight over the fixture's searcher.
+    pub(crate) fn weight(&self, query: &dyn Query) -> crate::Result<Box<dyn Weight>> {
+        let searcher = self.index.reader()?.searcher();
+        query.weight(EnableScoring::disabled_from_searcher(&searcher))
     }
 
     /// The match-all weight.

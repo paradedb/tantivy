@@ -120,6 +120,23 @@ impl QuantizedCandidates {
             .collect()
     }
 
+    /// `(row, [raw prefix, base, estimate, sigma] bits)` of every candidate, for traces.
+    #[cfg(test)]
+    pub(crate) fn column_trace(&self) -> Vec<(usize, [u32; 4])> {
+        let columns = &self.columns;
+        (0..self.len())
+            .map(|i| {
+                let bits = [
+                    columns.raw_prefixes[i],
+                    columns.bases[i],
+                    columns.estimates[i],
+                    columns.sigmas[i],
+                ];
+                (self.rows[i], bits.map(f32::to_bits))
+            })
+            .collect()
+    }
+
     #[inline(always)]
     fn estimate(&self, index: usize) -> Estimate {
         Estimate(self.columns.estimates[index])

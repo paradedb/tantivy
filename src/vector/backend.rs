@@ -14,6 +14,8 @@ use crate::vector::ivf::{AdaptiveProbeParams, IvfIndex};
 use crate::vector::prepared::{QuantizedQueryCtx, ScoringQuery, VectorQuery};
 use crate::vector::router::RouterWorkspace;
 use crate::vector::scan::heap::{tie_break_key, TieBreakHits};
+#[cfg(test)]
+use crate::vector::scan::plan::PlanOverride;
 use crate::vector::scan::{ScanConfig, SegmentScan};
 use crate::vector::segment::plan::{SegmentPlan, Source};
 use crate::vector::source::router::RouterClusters;
@@ -33,6 +35,8 @@ pub struct VectorBackend<T: VectorElement> {
     quantized: Option<Arc<QuantizedQueryCtx>>,
     adaptive: AdaptiveProbeParams,
     segment_ord: SegmentOrdinal,
+    #[cfg(test)]
+    pub(crate) plan_override: Option<PlanOverride>,
 }
 
 impl<T: VectorElement> VectorBackend<T> {
@@ -53,6 +57,8 @@ impl<T: VectorElement> VectorBackend<T> {
             quantized,
             adaptive,
             segment_ord,
+            #[cfg(test)]
+            plan_override: None,
         })
     }
 
@@ -164,6 +170,8 @@ impl<T: VectorElement> VectorBackend<T> {
         let config = ScanConfig {
             top_n,
             capacity: plan.capacity_hint(),
+            #[cfg(test)]
+            plan_override: self.plan_override,
         };
         let mut scan = SegmentScan::new(
             &self.reader,

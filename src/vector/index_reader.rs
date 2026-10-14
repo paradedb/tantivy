@@ -10,9 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
-#[cfg(test)]
-use common::HasLen;
-use common::OwnedBytes;
+use common::{HasLen, OwnedBytes};
 use quant_model::f16::f16_to_f32;
 
 use super::blocks::{BlockMetadata, Blocks};
@@ -719,6 +717,46 @@ pub(crate) struct QuantizedLayerReader {
     bits: u8,
 }
 
+// --- Read costs ---
+
+/// A read's cost: the storage blocks it spans with block geometry, its bytes without.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ReadCost(pub(crate) usize);
+
+impl std::ops::Add for ReadCost {
+    type Output = ReadCost;
+
+    fn add(self, rhs: ReadCost) -> ReadCost {
+        ReadCost(self.0 + rhs.0)
+    }
+}
+
+impl std::ops::AddAssign for ReadCost {
+    fn add_assign(&mut self, rhs: ReadCost) {
+        self.0 += rhs.0;
+    }
+}
+
+/// The cost of reading `range` of `slice` in the unit of storage with `block_len`-byte blocks:
+/// the blocks from its first to its last byte, by the slice's own geometry or, without one, as if
+/// the range started on a block boundary. Bytes when `block_len` is `None`.
+pub(crate) fn range_cost(
+    slice: &FileSlice,
+    range: Range<usize>,
+    block_len: Option<usize>,
+) -> ReadCost {
+    if range.is_empty() {
+        return ReadCost(0);
+    }
+    let Some(block_len) = block_len else {
+        return ReadCost(range.len());
+    };
+    match storage_block_span(slice, range.clone()) {
+        Some((first, last)) => ReadCost(last - first + 1),
+        None => ReadCost(range.len().div_ceil(block_len)),
+    }
+}
+
 /// Reusable buffers for planning and reading one batch's rows.
 #[derive(Default)]
 pub(crate) struct ReadScratch {
@@ -1032,6 +1070,48 @@ impl QuantizedLayerReader {
     pub(crate) fn code_stride(&self) -> usize {
         self.code_stride
     }
+    /// Whether this layer's band carries the rows' residual norms: layer 0 only.
+    pub(crate) fn has_norms(&self) -> bool {
+        self.layer == 0
+    }
+    /// The cost of reading `cluster`'s whole band in one request.
+    pub(crate) fn band_cost(&self, cluster: usize) -> crate::Result<ReadCost> {
+        let band = self.blocks.band_slice(cluster, self.layer)?;
+        Ok(range_cost(&band, 0..band.len(), band.storage_block_len()))
+    }
+    /// The cost of reading `cluster`'s rows at `offsets` sparsely: their planned code runs, the
+    /// sidecar span and, with norms, the norms column. Leaves the rows and runs in `scratch`.
+    pub(crate) fn sparse_cost(
+        &self,
+        cluster: usize,
+        offsets: &[usize],
+        scratch: &mut ReadScratch,
+    ) -> crate::Result<ReadCost> {
+        let reader = self.cluster_in_block(cluster)?;
+        let origin = reader.rows.start;
+        scratch.rows.clear();
+        scratch
+            .rows
+            .extend(offsets.iter().map(|&offset| origin + offset));
+        reader.plan_codes(&scratch.rows, &mut scratch.runs);
+        let stride = self.code_stride;
+        let unit = reader.codes.storage_block_len();
+        let mut cost = ReadCost(0);
+        for run in &scratch.runs {
+            cost += range_cost(
+                &reader.codes,
+                (run.start - origin) * stride..(run.end - origin) * stride,
+                unit,
+            );
+        }
+        let sidecar = reader.sidecar_slice()?;
+        cost += range_cost(&sidecar, 0..sidecar.len(), unit);
+        if self.has_norms() {
+            let norms = reader.norms_slice()?;
+            cost += range_cost(&norms, 0..norms.len(), unit);
+        }
+        Ok(cost)
+    }
     fn validate_codes(&self, bytes: &OwnedBytes, rows: &Range<usize>) -> crate::Result<()> {
         for (local, code) in bytes.chunks_exact(self.code_stride).enumerate() {
             if !quantized_code_tail_is_zero(code, self.dim, self.bits) {
@@ -1095,7 +1175,7 @@ impl QuantizedLayerReader {
             gammas: view(self.gammas),
             error_ratios: view(self.errors),
             constants: self.constants.map(view),
-            residual_norms: (self.layer == 0).then(|| {
+            residual_norms: self.has_norms().then(|| {
                 view(
                     self.blocks
                         .slots
@@ -1330,10 +1410,7 @@ impl QuantizedClusterReader<'_> {
         let blocks = &layer.blocks;
         let n = blocks.rows_in(self.block);
         let first = column_range(&blocks.slots, n, layer.scales).start;
-        let last = column_range(&blocks.slots, n, layer.constants.unwrap_or(layer.errors)).end;
-        let bytes = blocks
-            .block_slice(self.block, first..last)?
-            .read_vector_bytes()?;
+        let bytes = self.sidecar_slice()?.read_vector_bytes()?;
         let view = |idx| {
             let column = column_range(&blocks.slots, n, idx);
             bytes.slice(column.start - first..column.end - first)
@@ -1345,6 +1422,33 @@ impl QuantizedClusterReader<'_> {
             constants: layer.constants.map(view),
             rows: self.rows.clone(),
         })
+    }
+
+    /// The sidecar span: scales through error ratios, or through L2 constants.
+    fn sidecar_slice(&self) -> crate::Result<FileSlice> {
+        use super::blocks::column_range;
+        let layer = self.layer;
+        let blocks = &layer.blocks;
+        let n = blocks.rows_in(self.block);
+        let first = column_range(&blocks.slots, n, layer.scales).start;
+        let last = column_range(&blocks.slots, n, layer.constants.unwrap_or(layer.errors)).end;
+        blocks.block_slice(self.block, first..last)
+    }
+
+    /// The cluster's residual-norms column, stored in layer 0's band.
+    fn norms_slice(&self) -> crate::Result<FileSlice> {
+        let blocks = &self.layer.blocks;
+        let idx = blocks
+            .slots
+            .iter()
+            .position(|slot| matches!(slot.slot_type, SlotType::ResidualNorms))
+            .ok_or_else(|| DataCorruption::comment_only("missing residual norms column"))?;
+        blocks.column(self.block, idx)
+    }
+
+    /// Reads the cluster's residual norms in one request.
+    pub(crate) fn read_norms(&self) -> crate::Result<OwnedBytes> {
+        Ok(self.norms_slice()?.read_vector_bytes()?)
     }
 }
 
