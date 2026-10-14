@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
-use cascade::prepare_centroid;
+use quant::cascade::prepare_centroid;
 #[cfg(test)]
-use cascade::LayerSpec;
+use quant::cascade::LayerSpec;
 #[cfg(test)]
-use quant_model::Grid;
+use quant::model::Grid;
 
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;

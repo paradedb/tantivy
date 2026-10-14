@@ -476,7 +476,7 @@ impl VectorIndexReader {
                     ));
                 }
 
-                let regenerated = cascade::audit_prefix_error_model(
+                let regenerated = quant::cascade::audit_prefix_error_model(
                     &residual,
                     &measurement_ctx.specs,
                     &measurement_ctx.grids,
@@ -560,7 +560,10 @@ impl VectorIndexReader {
                             residual_norm_squared,
                             &mut arithmetic,
                         )?;
-                        if matches!(measurement_ctx.specs[depth].kind, cascade::LayerKind::Sign) {
+                        if matches!(
+                            measurement_ctx.specs[depth].kind,
+                            quant::cascade::LayerKind::Sign
+                        ) {
                             sign_query_error_term +=
                                 *scale * *scale * query.query_error_squared(depth) as f32;
                         }
@@ -789,12 +792,14 @@ impl VectorIndexReader {
                         cluster_scores[cluster]
                     };
                     let estimate = corrected_quantized_estimate(metric, gamma, raw_prefix, base);
-                    let sign_query_error_term =
-                        if matches!(measurement_ctx.specs[0].kind, cascade::LayerKind::Sign) {
-                            scale * scale * query.query_error_squared(0) as f32
-                        } else {
-                            0.0
-                        };
+                    let sign_query_error_term = if matches!(
+                        measurement_ctx.specs[0].kind,
+                        quant::cascade::LayerKind::Sign
+                    ) {
+                        scale * scale * query.query_error_squared(0) as f32
+                    } else {
+                        0.0
+                    };
                     let query_norm = cluster_query_norms[cluster];
                     let sigma = quantized_model_sigma(
                         metric,
@@ -864,7 +869,10 @@ impl VectorIndexReader {
                             residual_norms_squared[row],
                             &mut candidates.arithmetic_errors[candidate],
                         )?;
-                        if matches!(measurement_ctx.specs[depth].kind, cascade::LayerKind::Sign) {
+                        if matches!(
+                            measurement_ctx.specs[depth].kind,
+                            quant::cascade::LayerKind::Sign
+                        ) {
                             candidates.sign_query_error_terms[candidate] +=
                                 scale * scale * query.query_error_squared(depth) as f32;
                         }

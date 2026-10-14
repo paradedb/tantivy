@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use quant_model::build_grid;
+use quant::model::build_grid;
 use serde::{Deserialize, Serialize};
 
 use crate::schema::{FieldType, Metric, Schema, VectorDType, VectorOptions};

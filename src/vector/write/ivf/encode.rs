@@ -5,7 +5,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 
-use cascade::{
+use quant::cascade::{
     encode_batch_in_place_with_workspace, BatchEncodeWorkspace, EncodedBatch,
     PreparedCentroidWorkspace, QueryRotationPlan,
 };

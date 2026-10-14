@@ -482,8 +482,9 @@ mod tests {
             .zip(&layer0_sigmas)
             .map(|(&estimate, &sigma)| estimate - KAPPA * sigma)
             .collect();
-        let (_, first_kth) = cascade::kth(&lower, TOP_N);
-        let harness_first = cascade::band_filter(&layer0_scores, &layer0_sigmas, KAPPA, first_kth);
+        let (_, first_kth) = quant::cascade::kth(&lower, TOP_N);
+        let harness_first =
+            quant::cascade::band_filter(&layer0_scores, &layer0_sigmas, KAPPA, first_kth);
 
         let mut scan = BoundaryHarness::new(CANDIDATES);
         for row in 0..CANDIDATES {
@@ -510,9 +511,9 @@ mod tests {
             .zip(&second_sigmas)
             .map(|(&estimate, &sigma)| estimate - KAPPA * sigma)
             .collect();
-        let (_, second_kth) = cascade::kth(&lower, TOP_N);
+        let (_, second_kth) = quant::cascade::kth(&lower, TOP_N);
         let harness_second: Vec<u32> =
-            cascade::band_filter(&second_scores, &second_sigmas, KAPPA, second_kth)
+            quant::cascade::band_filter(&second_scores, &second_sigmas, KAPPA, second_kth)
                 .iter()
                 .map(|&local| harness_first[local as usize])
                 .collect();

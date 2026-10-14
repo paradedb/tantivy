@@ -218,8 +218,8 @@ fn fill_sigmas(ctx: &CombineCtx, error_ratios: &[f32], columns: &mut Columns, at
 #[inline(never)]
 pub fn quantization_bench_layer0_cosine_cluster(
     dimension: usize,
-    prepared: &cascade::PreparedSplitQuery,
-    spec: cascade::LayerSpec,
+    prepared: &quant::cascade::PreparedSplitQuery,
+    spec: quant::cascade::LayerSpec,
     codes: &[u8],
     code_stride: usize,
     scales: &[u8],
@@ -261,8 +261,8 @@ pub fn quantization_bench_layer0_cosine_cluster(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use cascade::{encode_batch_in_place, prepare_centroid};
-    use quant_model::f16::f16_to_f32;
+    use quant::cascade::{encode_batch_in_place, prepare_centroid};
+    use quant::model::f16::f16_to_f32;
 
     use super::*;
     use crate::schema::VectorOptions;
@@ -562,8 +562,8 @@ mod tests {
     }
 
     /// The Lloyd-Max grid for `(dimension, bits)`, built once per test binary.
-    fn grid(dimension: usize, bits: u8) -> quant_model::Grid {
-        static GRIDS: Mutex<Vec<(usize, u8, quant_model::Grid)>> = Mutex::new(Vec::new());
+    fn grid(dimension: usize, bits: u8) -> quant::model::Grid {
+        static GRIDS: Mutex<Vec<(usize, u8, quant::model::Grid)>> = Mutex::new(Vec::new());
         let mut grids = GRIDS.lock().unwrap();
         if let Some((_, _, grid)) = grids
             .iter()
@@ -571,7 +571,7 @@ mod tests {
         {
             return grid.clone();
         }
-        let grid = quant_model::build_grid(dimension, bits);
+        let grid = quant::model::build_grid(dimension, bits);
         grids.push((dimension, bits, grid.clone()));
         grid
     }
@@ -585,7 +585,7 @@ mod tests {
         seed: u64,
         k: usize,
     ) -> (Vec<usize>, Vec<Vec<usize>>, Vec<f32>) {
-        use cascade::{prepare_split_query, LayerSpec};
+        use quant::cascade::{prepare_split_query, LayerSpec};
         let dim = centroid.len();
         let n = vectors.len() / dim;
         let specs: Vec<_> = bits
@@ -593,12 +593,12 @@ mod tests {
             .enumerate()
             .map(|(layer, &bits)| LayerSpec {
                 kind: if bits == 1 {
-                    cascade::LayerKind::Sign
+                    quant::cascade::LayerKind::Sign
                 } else {
-                    cascade::LayerKind::Grid
+                    quant::cascade::LayerKind::Grid
                 },
                 bits,
-                rotation: cascade::Rotation::SeededFhtChaCha8 {
+                rotation: quant::cascade::Rotation::SeededFhtChaCha8 {
                     seed: seed + layer as u64,
                 },
             })

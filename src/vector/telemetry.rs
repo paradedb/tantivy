@@ -137,7 +137,7 @@ impl Clock {
         Self {
             since: Instant::now(),
             totals: StageTotals::default(),
-            fallbacks_at_take: cascade::sign_word_fallback_counts(),
+            fallbacks_at_take: quant::cascade::sign_word_fallback_counts(),
         }
     }
 
@@ -191,7 +191,7 @@ pub(crate) fn take_stage_totals() -> StageTotals {
     let running = CURRENT.get();
     CLOCK.with_borrow_mut(|clock| {
         clock.charge_time(running);
-        let fallbacks = cascade::sign_word_fallback_counts();
+        let fallbacks = quant::cascade::sign_word_fallback_counts();
         let mut totals = std::mem::take(&mut clock.totals);
         for (layer, count) in totals.sign_word_fallbacks.iter_mut().enumerate() {
             *count = fallbacks[layer] - clock.fallbacks_at_take[layer];
