@@ -12,7 +12,7 @@ pub(crate) mod plan;
 use std::ops::Range;
 
 use self::bound::KthBound;
-use self::columns::{Columns, QuantizedCandidates};
+use self::columns::QuantizedCandidates;
 use self::estimate::{combine_initial, combine_refine, CombineCtx};
 use self::exact::ExactScorer;
 use self::heap::TieBreakHits;
@@ -109,17 +109,9 @@ pub(crate) struct ScanTrace {
     pub(crate) exact_phase_rows: Vec<usize>,
 }
 
-/// What the scan remembers about a cluster it admitted.
-#[derive(Clone, Copy, Debug)]
-struct AdmittedCluster {
-    centroid: Similarity,
-    /// Whether the candidates carry this cluster's doc ids.
-    docs_in_candidates: bool,
-}
-
 // --- Quantized state ---
 
-/// The quantized cascade's state: candidate columns plus each admitted cluster's record.
+/// The quantized cascade's state: the candidate blocks and what reading and combining them needs.
 struct QuantizedState<'a> {
     /// The active layers, in scan order.
     layers: Vec<LayerSpec<'a>>,
@@ -128,11 +120,7 @@ struct QuantizedState<'a> {
     metric: Metric,
     dimension: usize,
     candidates: QuantizedCandidates,
-    /// By cluster id; `None` for clusters never admitted.
-    admitted: Vec<Option<AdmittedCluster>>,
     decoded: Decoded,
-    /// A shortlisted cluster's layer-0 columns, before they join the candidates.
-    cluster_columns: Columns,
     /// The reader exact reads are priced through; `None` with the exact plan off.
     exact: Option<&'a VectorIndexReader>,
     index: &'a ClusterIndex,
@@ -165,9 +153,7 @@ impl<'a> QuantizedState<'a> {
             metric: meta.metric,
             dimension: meta.dim as usize,
             candidates: QuantizedCandidates::with_capacity(config.capacity),
-            admitted: Vec::new(),
             decoded: Decoded::default(),
-            cluster_columns: Columns::default(),
             exact: config.exact_plan.then_some(reader),
             index,
             centroid_reads: 0,
@@ -199,45 +185,22 @@ impl<'a> QuantizedState<'a> {
         Ok(self.choose(&costs, selected, layer))
     }
 
-    fn record(&mut self, cluster: usize, admitted: AdmittedCluster) {
-        if self.admitted.len() <= cluster {
-            self.admitted.resize(cluster + 1, None);
-        }
-        self.admitted[cluster] = Some(admitted);
-    }
-
-    /// The admitted clusters in ascending id, which is ascending row order.
-    fn admitted_clusters(&self) -> impl Iterator<Item = (usize, AdmittedCluster)> + '_ {
-        self.admitted
-            .iter()
-            .enumerate()
-            .filter_map(|(cluster, admitted)| admitted.map(|admitted| (cluster, admitted)))
-    }
-
-    /// Reads `layer` for the rows of `selected` as `read` plans and decodes them; returns how to
-    /// combine the decoded columns into estimates around `centroid`, the query's centroid score.
-    fn decode(
-        &mut self,
-        layer: usize,
-        selected: &ClusterRows<'_>,
-        centroid: Similarity,
-        read: LayerRead,
-        scratch: &mut ReadScratch,
-    ) -> crate::Result<CombineCtx> {
-        let spec = self.layers[layer];
-        decode_layer(&spec, selected, read, &mut self.decoded, scratch)?;
+    /// How `layer`'s decoded rows combine into estimates around `centroid`, the query's centroid
+    /// score.
+    fn combine_ctx(&self, layer: usize, centroid: Similarity) -> CombineCtx {
+        let spec = &self.layers[layer];
         let cluster_score = centroid.score();
         let query_norm = spec.query.score_query_norm(cluster_score);
-        Ok(CombineCtx {
+        CombineCtx {
             metric: self.metric,
             dimension: self.dimension,
             query_norm_squared: query_norm * query_norm,
             query_error_squared: spec.query_error_squared,
             cluster_score,
-        })
+        }
     }
 
-    /// Scores a cluster's rows on layer 0, read as `read`, and appends them as candidates.
+    /// Scores a cluster's rows on layer 0, read as `read`, and appends them as a candidate block.
     fn admit(
         &mut self,
         rows: &ClusterRows<'_>,
@@ -249,40 +212,39 @@ impl<'a> QuantizedState<'a> {
             Some(centroid) => centroid,
             None => self.read_centroid(rows.cluster)?,
         };
-        let ctx = self.decode(0, rows, centroid, read, scratch)?;
-        combine_initial(&ctx, &self.decoded, &mut self.cluster_columns);
-        self.record(
-            rows.cluster,
-            AdmittedCluster {
-                centroid,
-                docs_in_candidates: rows.docs.is_some(),
-            },
+        let spec = self.layers[0];
+        decode_layer(&spec, rows, read, &mut self.decoded, scratch)?;
+        let ctx = self.combine_ctx(0, centroid);
+        let at = self.candidates.push_block(rows, centroid);
+        combine_initial(
+            &ctx,
+            &self.decoded,
+            &mut self.candidates.columns,
+            at.clone(),
         );
-        let cluster_start = self.candidates.len();
-        self.candidates.append(
-            rows.rows.clone(),
-            rows.offsets,
-            rows.docs,
-            &self.cluster_columns,
-        );
-        self.candidates.finish_cluster(cluster_start, bound);
+        self.candidates.finish_cluster(at, bound);
         Ok(())
     }
 
-    /// Refines the candidates at `at`, the survivors `group` of one cluster, with `layer` read as
-    /// `read`.
+    /// Refines block `b`'s candidates with `layer`, read as `read`.
     fn refine(
         &mut self,
         layer: usize,
-        group: &ClusterRows<'_>,
+        b: usize,
         read: LayerRead,
-        at: Range<usize>,
         scratch: &mut ReadScratch,
     ) -> crate::Result<()> {
-        let centroid = group
-            .centroid
-            .expect("a survivor group carries its cluster's centroid score");
-        let ctx = self.decode(layer, group, centroid, read, scratch)?;
+        let spec = self.layers[layer];
+        decode_layer(
+            &spec,
+            &self.candidates.rows(b),
+            read,
+            &mut self.decoded,
+            scratch,
+        )?;
+        let block = self.candidates.block(b);
+        let (centroid, at) = (block.centroid, block.at.clone());
+        let ctx = self.combine_ctx(layer, centroid);
         combine_refine(&ctx, &self.decoded, &mut self.candidates.columns, at);
         Ok(())
     }
@@ -301,14 +263,16 @@ impl<'a> QuantizedState<'a> {
         report.layers[layer].scored = self.candidates.len();
         #[cfg(test)]
         {
+            // Layer 0's candidates are listed in admission order, later layers' in row order.
+            let row_order = layer > 0;
             report
                 .trace
                 .estimate_rows
-                .push(self.candidates.estimate_trace());
+                .push(self.candidates.estimate_trace(row_order));
             report
                 .trace
                 .layer_columns
-                .push(self.candidates.column_trace());
+                .push(self.candidates.column_trace(row_order));
         }
         let _boundary = enter_vector_stage(VectorStage::Boundary(layer as u8));
         self.candidates.band(bound);
@@ -317,39 +281,8 @@ impl<'a> QuantizedState<'a> {
         report
             .trace
             .boundary_rows
-            .push(self.candidates.rows.clone());
+            .push(self.candidates.global_rows());
     }
-}
-/// Splits row-sorted survivors into one candidate range per admitted cluster.
-fn survivor_groups(
-    rows: &[usize],
-    admitted: impl Iterator<Item = (usize, AdmittedCluster)>,
-    index: &ClusterIndex,
-) -> Vec<(usize, AdmittedCluster, Range<usize>)> {
-    debug_assert!(
-        rows.windows(2).all(|pair| pair[0] < pair[1]),
-        "survivors are row-sorted"
-    );
-    let mut groups = Vec::new();
-    let mut first = 0;
-    for (cluster, record) in admitted {
-        if first == rows.len() {
-            break;
-        }
-        let cluster_rows = index.cluster_range(cluster);
-        let end = first + rows[first..].partition_point(|&row| row < cluster_rows.end);
-        if end > first {
-            debug_assert!(rows[first] >= cluster_rows.start);
-            groups.push((cluster, record, first..end));
-        }
-        first = end;
-    }
-    debug_assert_eq!(
-        first,
-        rows.len(),
-        "every survivor belongs to an admitted cluster"
-    );
-    groups
 }
 
 // --- Segment scan ---
@@ -362,15 +295,12 @@ where
     K: SegmentSortKeyComputer,
     C: Comparator<K::SegmentSortKey>,
 {
-    index: &'a ClusterIndex,
     exact: ExactScorer<'a, T, K, C>,
     /// The quantized cascade; `None` scores every shortlisted row exactly.
     quantized: Option<QuantizedState<'a>>,
     scratch: ReadScratch,
-    /// A survivor group's cluster-local offsets.
-    group_offsets: Vec<u32>,
-    /// Candidate ranges a layer finished exactly.
-    retired: Vec<Range<usize>>,
+    /// The candidate blocks by cluster id, which is row order; set when the shortlist closes.
+    by_cluster: Vec<usize>,
     report: ScanReport,
 }
 
@@ -408,12 +338,10 @@ where
         };
         let layers = quantized.as_ref().map_or(0, |state| state.layers.len());
         Ok(Self {
-            index,
             exact: ExactScorer::new(reader, query.query, config.top_n, tie_break, tie_comparator),
             quantized,
             scratch: ReadScratch::default(),
-            group_offsets: Vec::new(),
-            retired: Vec::new(),
+            by_cluster: Vec::new(),
             report: ScanReport {
                 layers: vec![LayerReport::default(); layers],
                 ..ScanReport::default()
@@ -453,11 +381,13 @@ where
         }
     }
 
-    /// Prunes the shortlist at layer 0's boundary.
+    /// Orders the candidate blocks by cluster and prunes the shortlist at layer 0's boundary.
     fn close_shortlist(&mut self) {
-        if let Some(state) = &mut self.quantized {
-            state.prune(0, &mut self.exact.bound, &mut self.report);
-        }
+        let Some(state) = &mut self.quantized else {
+            return;
+        };
+        state.candidates.order_by_cluster(&mut self.by_cluster);
+        state.prune(0, &mut self.exact.bound, &mut self.report);
     }
 
     /// The quantized layers after layer 0; none at full precision.
@@ -501,85 +431,45 @@ where
         Ok(read)
     }
 
-    /// Refines each cluster's surviving candidates with `layer`, then prunes them at the layer's
-    /// boundary. A cluster whose survivors are cheaper to read exactly is scored immediately and
-    /// leaves the shortlist before the boundary, so no row counts both as an interval and as an
-    /// exact score.
+    /// Refines each block's surviving candidates with `layer`, cluster by cluster, then prunes them
+    /// at the layer's boundary. A block whose survivors are cheaper to read exactly is scored
+    /// immediately and retired before the boundary, so no row counts both as an interval and as
+    /// an exact score.
     fn narrow(&mut self, layer: usize) -> crate::Result<()> {
         let Some(state) = &mut self.quantized else {
             return Ok(());
         };
-        let groups = survivor_groups(
-            &state.candidates.rows,
-            state.admitted_clusters(),
-            self.index,
-        );
-        let layer_scan = enter_vector_stage(VectorStage::LayerScan(layer as u8));
-        self.retired.clear();
-        for (cluster, admitted, at) in groups {
-            let rows = self.index.cluster_range(cluster);
-            local_offsets(
-                &mut self.group_offsets,
-                &state.candidates.rows[at.clone()],
-                rows.start,
-            );
-            let group = ClusterRows {
-                cluster,
-                rows,
-                offsets: Some(&self.group_offsets),
-                docs: None,
-                centroid: Some(admitted.centroid),
-            };
+        let stage = enter_vector_stage(VectorStage::LayerScan(layer as u8));
+        for &b in &self.by_cluster {
+            let group = state.candidates.rows(b);
+            if group.len() == 0 {
+                continue;
+            }
             let read = state.read_plan(&group, layer, &mut self.scratch)?;
-            self.report.layers[layer].count(read, at.len());
+            self.report.layers[layer].count(read, group.len());
             match read {
                 Read::Exact => {
-                    let docs = admitted
-                        .docs_in_candidates
-                        .then(|| &state.candidates.docs[at.clone()]);
-                    self.report.exact_rows += self
-                        .exact
-                        .score(&ClusterRows { docs, ..group }, &mut self.scratch)?;
-                    self.retired.push(at);
+                    self.report.exact_rows += self.exact.score(&group, &mut self.scratch)?;
+                    state.candidates.retire(b);
                 }
-                Read::Layer(read) => state.refine(layer, &group, read, at, &mut self.scratch)?,
+                Read::Layer(read) => state.refine(layer, b, read, &mut self.scratch)?,
             }
         }
-        drop(layer_scan);
-        if !self.retired.is_empty() {
-            state.candidates.retire(&self.retired);
-        }
+        drop(stage);
         state.prune(layer, &mut self.exact.bound, &mut self.report);
         Ok(())
     }
 
-    /// Scores the last boundary's survivors exactly, one cluster group at a time.
+    /// Scores the last boundary's survivors exactly, one block at a time in cluster order.
     fn score_shortlist(&mut self) -> crate::Result<()> {
         let Some(state) = &self.quantized else {
             return Ok(());
         };
-        let groups = survivor_groups(
-            &state.candidates.rows,
-            state.admitted_clusters(),
-            self.index,
-        );
-        for (cluster, admitted, at) in groups {
-            let rows = self.index.cluster_range(cluster);
-            local_offsets(
-                &mut self.group_offsets,
-                &state.candidates.rows[at.clone()],
-                rows.start,
-            );
-            let group = ClusterRows {
-                cluster,
-                rows,
-                offsets: Some(&self.group_offsets),
-                docs: admitted
-                    .docs_in_candidates
-                    .then(|| &state.candidates.docs[at]),
-                centroid: Some(admitted.centroid),
-            };
-            self.report.exact_rows += self.exact.score_survivors(&group, &mut self.scratch)?;
+        for &b in &self.by_cluster {
+            let group = state.candidates.rows(b);
+            if group.len() > 0 {
+                self.report.exact_rows += self.exact.score_survivors(&group, &mut self.scratch)?;
+            }
         }
         Ok(())
     }
@@ -605,10 +495,4 @@ where
         }
         Ok((exact.into_hits(segment_ord), report))
     }
-}
-
-/// Writes the cluster-local offsets of `rows`, in a cluster starting at `start`, into `offsets`.
-fn local_offsets(offsets: &mut Vec<u32>, rows: &[usize], start: usize) {
-    offsets.clear();
-    offsets.extend(rows.iter().map(|&row| (row - start) as u32));
 }

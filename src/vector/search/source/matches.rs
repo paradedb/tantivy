@@ -65,25 +65,28 @@ impl<'a> MatchClusters<'a> {
         reader.locate_docs(&docs, &mut located)?;
         // Cluster ids ascend with their row ranges, so this is ascending row order.
         located.sort_unstable_by_key(|&(_, location)| (location.cluster, location.local));
+        let report = MatchReport {
+            matches: located.len(),
+            absent: docs.len() - located.len(),
+            clusters: 0,
+            dead: matched - docs.len(),
+            work_charged: 0.0,
+            work_budget: budget.total.to_f32(),
+        };
+        // The located doc ids, in location order, overwrite the handed ones: never more of them.
+        docs.truncate(located.len());
         let mut source = Self {
             index,
             offsets: Vec::with_capacity(located.len()),
-            docs: Vec::with_capacity(located.len()),
+            docs,
             clusters: Vec::new(),
             next: 0,
             meter: WorkMeter::new(budget),
-            report: MatchReport {
-                matches: located.len(),
-                absent: docs.len() - located.len(),
-                clusters: 0,
-                dead: matched - docs.len(),
-                work_charged: 0.0,
-                work_budget: budget.total.to_f32(),
-            },
+            report,
         };
         for (position, &(doc, location)) in located.iter().enumerate() {
             source.offsets.push(location.local);
-            source.docs.push(doc);
+            source.docs[position] = doc;
             let cluster = location.cluster as usize;
             match source.clusters.last_mut() {
                 Some((last, positions)) if *last == cluster => positions.end = position + 1,

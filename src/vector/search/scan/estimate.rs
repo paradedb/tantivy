@@ -28,12 +28,19 @@ pub(crate) struct CombineCtx {
 
 // --- Combine ---
 
-/// Turns a shortlisted cluster's decoded layer-0 rows into candidate columns, written to `out`.
+/// Turns a shortlisted cluster's decoded layer-0 rows into the candidates at `at`, growing `out` to
+/// `at.end`.
 #[inline(always)]
-pub(crate) fn combine_initial(ctx: &CombineCtx, decoded: &Decoded, out: &mut Columns) {
+pub(crate) fn combine_initial(
+    ctx: &CombineCtx,
+    decoded: &Decoded,
+    out: &mut Columns,
+    at: Range<usize>,
+) {
     let rows = decoded.kernel.len();
     debug_assert_eq!(decoded.norms.len(), rows);
-    seed_initial(ctx, decoded, out);
+    debug_assert_eq!(at.len(), rows);
+    seed_initial(ctx, decoded, out, at.clone());
     let Columns {
         bases,
         raw_prefixes,
@@ -43,6 +50,12 @@ pub(crate) fn combine_initial(ctx: &CombineCtx, decoded: &Decoded, out: &mut Col
         sign_query_error_terms,
         ..
     } = out;
+    let bases = &mut bases[at.clone()];
+    let raw_prefixes = &mut raw_prefixes[at.clone()];
+    let estimates = &mut estimates[at.clone()];
+    let residual_norm_squared = &mut residual_norm_squared[at.clone()];
+    let gammas = &gammas[at.clone()];
+    let sign_query_error_terms = &mut sign_query_error_terms[at.clone()];
     let query_error_squared = ctx.query_error_squared;
     match ctx.metric {
         Metric::L2 => {
@@ -78,14 +91,13 @@ pub(crate) fn combine_initial(ctx: &CombineCtx, decoded: &Decoded, out: &mut Col
             }
         }
     }
-    fill_sigmas(ctx, &decoded.errors, out, 0..rows);
+    fill_sigmas(ctx, &decoded.errors, out, at);
 }
 
-/// Sizes `out` for a cluster's layer-0 rows and seeds their raw prefixes, gammas and arithmetic
-/// errors.
+/// Grows `out` to `at.end` and seeds the raw prefixes, gammas and arithmetic errors of a
+/// cluster's layer-0 rows at `at`.
 #[inline(always)]
-fn seed_initial(ctx: &CombineCtx, decoded: &Decoded, out: &mut Columns) {
-    let rows = decoded.kernel.len();
+fn seed_initial(ctx: &CombineCtx, decoded: &Decoded, out: &mut Columns, at: Range<usize>) {
     for column in [
         &mut out.bases,
         &mut out.estimates,
@@ -93,23 +105,24 @@ fn seed_initial(ctx: &CombineCtx, decoded: &Decoded, out: &mut Columns) {
         &mut out.residual_norm_squared,
         &mut out.sign_query_error_terms,
     ] {
-        column.resize(rows, 0.0);
+        column.resize(at.end, 0.0);
     }
-    out.arithmetic_variances.clear();
-    out.arithmetic_variances.extend((0..rows).map(|index| {
-        ArithmeticError::initial(
+    out.arithmetic_variances
+        .resize(at.end, ArithmeticError::default());
+    for (index, error) in out.arithmetic_variances[at.clone()].iter_mut().enumerate() {
+        *error = ArithmeticError::initial(
             ctx.metric,
             decoded.kernel[index],
             decoded.scales[index],
             decoded.constants.get(index).copied().unwrap_or(0.0),
             ctx.cluster_score,
             decoded.norms[index],
-        )
-    }));
-    out.raw_prefixes.clear();
-    out.raw_prefixes.extend_from_slice(&decoded.kernel);
-    out.gammas.clear();
-    out.gammas.extend_from_slice(&decoded.gammas);
+        );
+    }
+    out.raw_prefixes.resize(at.end, 0.0);
+    out.raw_prefixes[at.clone()].copy_from_slice(&decoded.kernel);
+    out.gammas.resize(at.end, 0.0);
+    out.gammas[at].copy_from_slice(&decoded.gammas);
 }
 
 /// Refines the candidates at `at` in place with a later layer's decoded rows.
@@ -253,7 +266,7 @@ pub fn quantization_bench_layer0_cosine_cluster(
         query_error_squared,
         cluster_score,
     };
-    combine_initial(&ctx, decoded, columns);
+    combine_initial(&ctx, decoded, columns, 0..rows);
     columns.raw_prefixes[rows - 1] + columns.estimates[rows - 1] + columns.sigmas[rows - 1]
 }
 
@@ -267,7 +280,9 @@ mod tests {
     use super::*;
     use crate::schema::VectorOptions;
     use crate::vector::diagnostics::audit::diagnostic_advance_raw_prefix;
+    use crate::vector::distance::Similarity;
     use crate::vector::quantization::QUANTIZED_BOUNDARY_KAPPA;
+    use crate::vector::search::cluster_source::ClusterRows;
     use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
     use crate::vector::search::scan::columns::BoundaryHarness;
     use crate::vector::storage::quantized::QuantizedIndexCtx;
@@ -316,6 +331,7 @@ mod tests {
             &ctx(Metric::L2, 1, 11.0, 13.0, 10.0),
             &decoded(&[2.0], &[3.0], &[2.0], &[0.5], &[5.0], &[7.0]),
             &mut columns,
+            0..1,
         );
         assert_eq!(columns.bases, [3.0]);
         assert_eq!(columns.raw_prefixes, [1.0]);
@@ -466,6 +482,7 @@ mod tests {
                 &[residual_norm_squared],
             ),
             &mut columns,
+            0..1,
         );
         assert_eq!(
             diagnostic_first_raw.to_bits(),
@@ -636,7 +653,15 @@ mod tests {
                 .map(f16_to_f32)
                 .collect();
             if level == 0 {
-                let mut columns = Columns::default();
+                let docs: Vec<_> = (0..n as u32).collect();
+                let rows = ClusterRows {
+                    cluster: 0,
+                    rows: 0..n,
+                    offsets: None,
+                    docs: Some(&docs),
+                    centroid: None,
+                };
+                let at = scan.candidates.push_block(&rows, Similarity::new(0.0));
                 combine_initial(
                     &combine,
                     &decoded(
@@ -647,19 +672,14 @@ mod tests {
                         &layer.constants,
                         &encoded.residual_norms_squared,
                     ),
-                    &mut columns,
+                    &mut scan.candidates.columns,
+                    at.clone(),
                 );
-                initial_sigmas = columns.sigmas.clone();
-                let docs: Vec<_> = (0..n as u32).collect();
-                scan.candidates.append(0..n, None, Some(&docs), &columns);
+                initial_sigmas = scan.candidates.columns.sigmas[at].to_vec();
             } else {
-                let select = |values: &[f32]| -> Vec<f32> {
-                    scan.candidates
-                        .rows
-                        .iter()
-                        .map(|&row| values[row])
-                        .collect()
-                };
+                let rows = scan.candidates.global_rows();
+                let select =
+                    |values: &[f32]| -> Vec<f32> { rows.iter().map(|&row| values[row]).collect() };
                 let refined = decoded(
                     &select(&scores),
                     &select(&layer.scales),
@@ -672,15 +692,14 @@ mod tests {
                 combine_refine(&combine, &refined, &mut scan.candidates.columns, 0..count);
             }
             scan.band(k, QUANTIZED_BOUNDARY_KAPPA);
+            let survivors = scan.candidates.global_rows();
             assert!(
-                exact[..k]
-                    .iter()
-                    .all(|row| scan.candidates.rows.contains(row)),
+                exact[..k].iter().all(|row| survivors.contains(row)),
                 "true top-k lost at layer {level}"
             );
-            boundaries.push(scan.candidates.rows.clone());
+            boundaries.push(survivors);
         }
-        let mut result = scan.candidates.rows;
+        let mut result = scan.candidates.global_rows();
         result.sort_by(|&a, &b| truth[b].total_cmp(&truth[a]).then(a.cmp(&b)));
         result.truncate(k);
         assert_eq!(result, exact[..k]);

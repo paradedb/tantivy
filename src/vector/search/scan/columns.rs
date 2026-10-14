@@ -1,10 +1,12 @@
-//! Quantized candidates: their rows, doc ids and value columns, their admission into the pruning
-//! bound, and boundary selection.
+//! Quantized candidates: one block per admitted cluster, their value columns, their admission
+//! into the pruning bound, and boundary selection in place.
 
 use std::ops::Range;
 
+use crate::vector::distance::Similarity;
 use crate::vector::quantization::{ArithmeticError, QUANTIZED_BOUNDARY_KAPPA};
-use crate::vector::search::interval::{Estimate, LowerEndpoint, Threshold};
+use crate::vector::search::cluster_source::ClusterRows;
+use crate::vector::search::interval::{Estimate, LowerEndpoint, Threshold, UpperEndpoint};
 use crate::vector::search::scan::bound::{lower_endpoint_order, KthBound};
 use crate::DocId;
 
@@ -24,117 +26,160 @@ pub struct Columns {
 }
 
 impl Columns {
-    pub(crate) fn len(&self) -> usize {
-        self.estimates.len()
-    }
-
-    /// Appends every entry of `other`.
-    pub(crate) fn extend_from(&mut self, other: &Columns) {
-        self.bases.extend_from_slice(&other.bases);
-        self.raw_prefixes.extend_from_slice(&other.raw_prefixes);
-        self.estimates.extend_from_slice(&other.estimates);
-        self.sigmas.extend_from_slice(&other.sigmas);
-        self.residual_norm_squared
-            .extend_from_slice(&other.residual_norm_squared);
-        self.gammas.extend_from_slice(&other.gammas);
-        self.sign_query_error_terms
-            .extend_from_slice(&other.sign_query_error_terms);
-        self.arithmetic_variances
-            .extend_from_slice(&other.arithmetic_variances);
-    }
-
-    /// Overwrites `into` with the entries at `order`, in that order.
-    pub(crate) fn gather(&self, order: &[usize], into: &mut Columns) {
-        fn pick<T: Copy>(from: &[T], order: &[usize], into: &mut Vec<T>) {
-            into.clear();
-            into.extend(order.iter().map(|&index| from[index]));
+    /// Columns with room for `capacity` entries each.
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            bases: Vec::with_capacity(capacity),
+            raw_prefixes: Vec::with_capacity(capacity),
+            estimates: Vec::with_capacity(capacity),
+            sigmas: Vec::with_capacity(capacity),
+            residual_norm_squared: Vec::with_capacity(capacity),
+            gammas: Vec::with_capacity(capacity),
+            sign_query_error_terms: Vec::with_capacity(capacity),
+            arithmetic_variances: Vec::with_capacity(capacity),
         }
-        pick(&self.bases, order, &mut into.bases);
-        pick(&self.raw_prefixes, order, &mut into.raw_prefixes);
-        pick(&self.estimates, order, &mut into.estimates);
-        pick(&self.sigmas, order, &mut into.sigmas);
-        pick(
-            &self.residual_norm_squared,
-            order,
-            &mut into.residual_norm_squared,
-        );
-        pick(&self.gammas, order, &mut into.gammas);
-        pick(
-            &self.sign_query_error_terms,
-            order,
-            &mut into.sign_query_error_terms,
-        );
-        pick(
-            &self.arithmetic_variances,
-            order,
-            &mut into.arithmetic_variances,
-        );
+    }
+
+    /// Copies every value of entry `from` over entry `to`.
+    fn move_entry(&mut self, from: usize, to: usize) {
+        self.bases[to] = self.bases[from];
+        self.raw_prefixes[to] = self.raw_prefixes[from];
+        self.estimates[to] = self.estimates[from];
+        self.sigmas[to] = self.sigmas[from];
+        self.residual_norm_squared[to] = self.residual_norm_squared[from];
+        self.gammas[to] = self.gammas[from];
+        self.sign_query_error_terms[to] = self.sign_query_error_terms[from];
+        self.arithmetic_variances[to] = self.arithmetic_variances[from];
+    }
+
+    /// Keeps the first `len` entries.
+    fn truncate(&mut self, len: usize) {
+        self.bases.truncate(len);
+        self.raw_prefixes.truncate(len);
+        self.estimates.truncate(len);
+        self.sigmas.truncate(len);
+        self.residual_norm_squared.truncate(len);
+        self.gammas.truncate(len);
+        self.sign_query_error_terms.truncate(len);
+        self.arithmetic_variances.truncate(len);
     }
 }
 
 // --- Candidates ---
 
-/// The live quantized candidates: global rows, doc ids and value columns, row-aligned.
+/// One admitted cluster's candidates: a contiguous block, in row order.
+#[derive(Clone, Debug)]
+pub(crate) struct AdmittedCluster {
+    pub(crate) cluster: usize,
+    /// The cluster's global row range.
+    pub(crate) rows: Range<usize>,
+    pub(crate) centroid: Similarity,
+    /// The block's candidates; empty once retired or pruned away.
+    pub(crate) at: Range<usize>,
+    /// Where the block's doc ids start in `docs`, when the source supplied them.
+    pub(crate) docs: Option<usize>,
+}
+
+/// The quantized candidates: one block per admitted cluster, compacted in place at each
+/// boundary.
 pub(crate) struct QuantizedCandidates {
-    pub(crate) rows: Vec<usize>,
-    /// Valid for clusters admitted with given doc ids; filler otherwise.
-    pub(crate) docs: Vec<DocId>,
+    /// Cluster-local offsets, ascending within each block.
+    offsets: Vec<u32>,
+    /// Doc ids of the blocks admitted with them.
+    docs: Vec<DocId>,
+    /// Estimator state, aligned with `offsets`.
     pub(crate) columns: Columns,
+    /// In admission order, which is storage order; compaction walks this.
+    blocks: Vec<AdmittedCluster>,
     /// Confidence multiplier of every interval endpoint.
     kappa: f32,
-    /// Gather targets, swapped in after a boundary.
-    spare_rows: Vec<usize>,
-    spare_docs: Vec<DocId>,
-    spare: Columns,
-    order: Vec<usize>,
-    cluster_top: Vec<(f32, usize, f32)>,
     lowers: Vec<f32>,
+    cluster_top: Vec<(f32, usize, f32)>,
 }
 
 impl QuantizedCandidates {
+    /// Room for `capacity` candidates in the offsets, every column and the boundary's lower
+    /// endpoints; doc ids are reserved when a block first brings them.
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
-            rows: Vec::with_capacity(capacity),
-            docs: Vec::with_capacity(capacity),
-            columns: Columns::default(),
+            offsets: Vec::with_capacity(capacity),
+            docs: Vec::new(),
+            columns: Columns::with_capacity(capacity),
+            blocks: Vec::new(),
             kappa: QUANTIZED_BOUNDARY_KAPPA,
-            spare_rows: Vec::new(),
-            spare_docs: Vec::new(),
-            spare: Columns::default(),
-            order: Vec::new(),
+            lowers: Vec::with_capacity(capacity),
             cluster_top: Vec::new(),
-            lowers: Vec::new(),
         }
     }
 
-    #[inline]
+    /// The live candidates: every block's range, summed.
     pub(crate) fn len(&self) -> usize {
-        self.rows.len()
+        self.blocks.iter().map(|block| block.at.len()).sum()
     }
 
-    /// `(row, estimate bits)` of every candidate, for traces.
-    #[cfg(test)]
-    pub(crate) fn estimate_trace(&self) -> Vec<(usize, u32)> {
-        (0..self.len())
-            .map(|i| (self.rows[i], self.columns.estimates[i].to_bits()))
-            .collect()
+    /// Appends `rows` as a block around `centroid`, with its doc ids when the source supplied
+    /// them; returns the block's range, whose columns the caller writes.
+    pub(crate) fn push_block(
+        &mut self,
+        rows: &ClusterRows<'_>,
+        centroid: Similarity,
+    ) -> Range<usize> {
+        let start = self.offsets.len();
+        match rows.offsets {
+            Some(offsets) => self.offsets.extend_from_slice(offsets),
+            None => self.offsets.extend((0..).take(rows.rows.len())),
+        }
+        let at = start..self.offsets.len();
+        let docs = rows.docs.map(|docs| {
+            debug_assert_eq!(docs.len(), at.len());
+            if self.docs.capacity() == 0 {
+                self.docs.reserve(self.offsets.capacity());
+            }
+            let start = self.docs.len();
+            self.docs.extend_from_slice(docs);
+            start
+        });
+        self.blocks.push(AdmittedCluster {
+            cluster: rows.cluster,
+            rows: rows.rows.clone(),
+            centroid,
+            at: at.clone(),
+            docs,
+        });
+        at
     }
 
-    /// `(row, [raw prefix, base, estimate, sigma] bits)` of every candidate, for traces.
-    #[cfg(test)]
-    pub(crate) fn column_trace(&self) -> Vec<(usize, [u32; 4])> {
-        let columns = &self.columns;
-        (0..self.len())
-            .map(|i| {
-                let bits = [
-                    columns.raw_prefixes[i],
-                    columns.bases[i],
-                    columns.estimates[i],
-                    columns.sigmas[i],
-                ];
-                (self.rows[i], bits.map(f32::to_bits))
-            })
-            .collect()
+    /// Block `b`.
+    pub(crate) fn block(&self, b: usize) -> &AdmittedCluster {
+        &self.blocks[b]
+    }
+
+    /// A view of block `b`: its offsets and doc ids borrowed, with its centroid score.
+    pub(crate) fn rows(&self, b: usize) -> ClusterRows<'_> {
+        let block = &self.blocks[b];
+        ClusterRows {
+            cluster: block.cluster,
+            rows: block.rows.clone(),
+            offsets: Some(&self.offsets[block.at.clone()]),
+            docs: block
+                .docs
+                .map(|start| &self.docs[start..start + block.at.len()]),
+            centroid: Some(block.centroid),
+        }
+    }
+
+    /// Empties block `b`'s range; its candidates go at the next boundary.
+    pub(crate) fn retire(&mut self, b: usize) {
+        let at = &mut self.blocks[b].at;
+        at.end = at.start;
+    }
+
+    /// Writes the block indices, sorted by cluster id, to `out`. Blocks are never removed, only
+    /// emptied, so the indices stay valid.
+    pub(crate) fn order_by_cluster(&self, out: &mut Vec<usize>) {
+        out.clear();
+        out.extend(0..self.blocks.len());
+        out.sort_unstable_by_key(|&b| self.blocks[b].cluster);
     }
 
     #[inline(always)]
@@ -149,46 +194,30 @@ impl QuantizedCandidates {
             .0
     }
 
-    /// Appends one cluster's selected rows, spanning `rows`, with their doc ids and `columns`.
-    pub(crate) fn append(
-        &mut self,
-        rows: Range<usize>,
-        offsets: Option<&[u32]>,
-        docs: Option<&[DocId]>,
-        columns: &Columns,
-    ) {
-        let len = offsets.map_or(rows.len(), <[u32]>::len);
-        debug_assert_eq!(columns.len(), len);
-        match offsets {
-            None => self.rows.extend(rows),
-            Some(offsets) => self
-                .rows
-                .extend(offsets.iter().map(|&offset| rows.start + offset as usize)),
-        }
-        match docs {
-            Some(docs) => {
-                debug_assert_eq!(docs.len(), len);
-                self.docs.extend_from_slice(docs);
-            }
-            // Filler: the cluster's admitted record says its doc ids come from the column.
-            None => self.docs.resize(self.docs.len() + len, 0),
-        }
-        self.columns.extend_from(columns);
+    #[inline]
+    fn upper(&self, index: usize) -> UpperEndpoint {
+        self.estimate(index)
+            .upper(self.columns.sigmas[index], self.kappa)
     }
 
-    /// Merges the candidates appended since `cluster_start` into the bound's running top-k,
-    /// through the cluster's own top-k so the merge stays O(k).
-    pub(crate) fn finish_cluster(&mut self, cluster_start: usize, bound: &mut KthBound) {
+    /// Merges the last block's candidates, at `at`, into the bound's running top-k, through the
+    /// block's own top-k so the merge stays O(k).
+    pub(crate) fn finish_cluster(&mut self, at: Range<usize>, bound: &mut KthBound) {
         let k = bound.k;
-        if k == 0 || cluster_start >= self.len() {
+        let Some(block) = self.blocks.last() else {
+            return;
+        };
+        debug_assert_eq!(block.at, at, "the block just pushed");
+        if k == 0 || at.is_empty() {
             return;
         }
+        let start = block.rows.start;
         let mut cluster_top = std::mem::take(&mut self.cluster_top);
         cluster_top.clear();
-        cluster_top.extend((cluster_start..self.len()).map(|index| {
+        cluster_top.extend(at.map(|index| {
             (
                 self.lower(index),
-                self.rows[index],
+                start + self.offsets[index] as usize,
                 self.columns.estimates[index],
             )
         }));
@@ -200,68 +229,161 @@ impl QuantizedCandidates {
         self.cluster_top = cluster_top;
     }
 
-    /// Keeps the candidates whose upper endpoint reaches the k-th lower endpoint, in row order.
-    ///
-    /// Selecting by lower endpoint matters: ordering by estimate can prune a true top-k row even
-    /// when every interval encloses its exact score.
+    /// Keeps, in place, each block's candidates whose upper endpoint reaches the k-th lower
+    /// endpoint; selecting by lower endpoint, not estimate, keeps every true top-k row whose
+    /// interval encloses its score. Blocks keep their row order and a retired block keeps nothing.
+    /// Blocks are walked in admission order, which is storage order, so writes never pass reads.
     pub(crate) fn band(&mut self, bound: &mut KthBound) {
-        debug_assert!(
-            self.columns
-                .estimates
-                .iter()
-                .zip(&self.columns.sigmas)
-                .all(|(estimate, sigma)| estimate.is_finite() && sigma.is_finite()),
-            "quantized boundary inputs must be finite"
-        );
+        let threshold = self.boundary(bound);
+        let (mut write, mut docs_write) = (0, 0);
+        for b in 0..self.blocks.len() {
+            let (at, docs) = (self.blocks[b].at.clone(), self.blocks[b].docs);
+            let (start, docs_start) = (write, docs_write);
+            for read in at.clone() {
+                if threshold.is_none_or(|kth| kth.admits(self.upper(read))) {
+                    self.offsets[write] = self.offsets[read];
+                    self.columns.move_entry(read, write);
+                    if let Some(docs) = docs {
+                        self.docs[docs_write] = self.docs[docs + (read - at.start)];
+                        docs_write += 1;
+                    }
+                    write += 1;
+                }
+            }
+            self.blocks[b].at = start..write;
+            self.blocks[b].docs = docs.map(|_| docs_start);
+        }
+        self.offsets.truncate(write);
+        self.columns.truncate(write);
+        self.docs.truncate(docs_write);
+    }
+
+    /// The boundary threshold: the k-th largest lower endpoint over the live candidates and the
+    /// bound's exact scores.
+    fn boundary(&mut self, bound: &mut KthBound) -> Option<Threshold> {
         let mut lowers = std::mem::take(&mut self.lowers);
         lowers.clear();
-        lowers.extend((0..self.len()).map(|index| self.lower(index)));
+        for block in &self.blocks {
+            debug_assert!(
+                block
+                    .at
+                    .clone()
+                    .all(|index| self.columns.estimates[index].is_finite()
+                        && self.columns.sigmas[index].is_finite()),
+                "quantized boundary inputs must be finite"
+            );
+            lowers.extend(block.at.clone().map(|index| self.lower(index)));
+        }
         let threshold = bound
             .boundary_lower(&mut lowers)
             .map(|kth| Threshold(LowerEndpoint(kth)));
         self.lowers = lowers;
-        let mut order = std::mem::take(&mut self.order);
-        order.clear();
-        order.extend((0..self.len()).filter(|&index| {
-            threshold.is_none_or(|kth| {
-                kth.admits(
-                    self.estimate(index)
-                        .upper(self.columns.sigmas[index], self.kappa),
-                )
-            })
-        }));
-        order.sort_unstable_by_key(|&index| self.rows[index]);
-        self.keep(&order);
-        self.order = order;
+        threshold
     }
+}
 
-    /// Removes the candidates at `ranges`, which ascend and do not overlap, keeping row order.
-    pub(crate) fn retire(&mut self, ranges: &[Range<usize>]) {
-        debug_assert!(ranges.windows(2).all(|pair| pair[0].end <= pair[1].start));
-        let mut order = std::mem::take(&mut self.order);
-        order.clear();
-        let mut next = 0;
-        for range in ranges {
-            order.extend(next..range.start);
-            next = range.end;
+// --- Traces ---
+
+#[cfg(test)]
+impl QuantizedCandidates {
+    /// `(global row, position)` of every live candidate, block by block: in admission order, or
+    /// by cluster id, which is row order.
+    fn live(&self, row_order: bool) -> Vec<(usize, usize)> {
+        let mut order: Vec<usize> = (0..self.blocks.len()).collect();
+        if row_order {
+            self.order_by_cluster(&mut order);
         }
-        order.extend(next..self.len());
-        self.keep(&order);
-        self.order = order;
+        order
+            .iter()
+            .flat_map(|&b| {
+                let block = &self.blocks[b];
+                block
+                    .at
+                    .clone()
+                    .map(move |index| (block.rows.start + self.offsets[index] as usize, index))
+            })
+            .collect()
     }
 
-    /// Keeps the candidates at `order`, in that order.
-    fn keep(&mut self, order: &[usize]) {
-        self.spare_rows.clear();
-        self.spare_rows
-            .extend(order.iter().map(|&index| self.rows[index]));
-        self.spare_docs.clear();
-        self.spare_docs
-            .extend(order.iter().map(|&index| self.docs[index]));
-        self.columns.gather(order, &mut self.spare);
-        std::mem::swap(&mut self.rows, &mut self.spare_rows);
-        std::mem::swap(&mut self.docs, &mut self.spare_docs);
-        std::mem::swap(&mut self.columns, &mut self.spare);
+    /// The live candidates' global rows, in row order.
+    pub(crate) fn global_rows(&self) -> Vec<usize> {
+        self.live(true).into_iter().map(|(row, _)| row).collect()
+    }
+
+    /// The live candidates' doc ids, in row order, for the blocks admitted with them.
+    pub(crate) fn doc_ids(&self) -> Vec<DocId> {
+        let mut order = Vec::new();
+        self.order_by_cluster(&mut order);
+        order
+            .iter()
+            .filter_map(|&b| {
+                let block = &self.blocks[b];
+                block
+                    .docs
+                    .map(|start| &self.docs[start..start + block.at.len()])
+            })
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    /// `(row, estimate bits)` of every live candidate, in admission or row order.
+    pub(crate) fn estimate_trace(&self, row_order: bool) -> Vec<(usize, u32)> {
+        self.live(row_order)
+            .into_iter()
+            .map(|(row, index)| (row, self.columns.estimates[index].to_bits()))
+            .collect()
+    }
+
+    /// `(row, [raw prefix, base, estimate, sigma] bits)` of every live candidate, in admission or
+    /// row order.
+    pub(crate) fn column_trace(&self, row_order: bool) -> Vec<(usize, [u32; 4])> {
+        let columns = &self.columns;
+        self.live(row_order)
+            .into_iter()
+            .map(|(row, index)| {
+                let bits = [
+                    columns.raw_prefixes[index],
+                    columns.bases[index],
+                    columns.estimates[index],
+                    columns.sigmas[index],
+                ];
+                (row, bits.map(f32::to_bits))
+            })
+            .collect()
+    }
+
+    /// Opens an empty test block whose offsets are global rows. Its cluster id is its index, so
+    /// cluster order is admission order.
+    fn open_test_block(&mut self) {
+        let start = self.offsets.len();
+        self.blocks.push(AdmittedCluster {
+            cluster: self.blocks.len(),
+            rows: 0..0,
+            centroid: Similarity::new(0.0),
+            at: start..start,
+            docs: Some(self.docs.len()),
+        });
+    }
+
+    /// Appends `row` with `doc`, `estimate` and `sigma` to the last test block.
+    fn push_test_row(&mut self, row: usize, doc: DocId, estimate: f32, sigma: f32) {
+        self.offsets.push(row as u32);
+        self.docs.push(doc);
+        let columns = &mut self.columns;
+        columns.bases.push(0.0);
+        columns.raw_prefixes.push(estimate);
+        columns.estimates.push(estimate);
+        columns.sigmas.push(sigma);
+        columns.residual_norm_squared.push(1.0);
+        columns.gammas.push(1.0);
+        columns.sign_query_error_terms.push(0.0);
+        columns
+            .arithmetic_variances
+            .push(ArithmeticError::default());
+        if let Some(block) = self.blocks.last_mut() {
+            block.at.end += 1;
+        }
     }
 }
 
@@ -272,7 +394,11 @@ impl QuantizedCandidates {
 pub(crate) struct BoundaryHarness {
     pub(crate) candidates: QuantizedCandidates,
     bound: Option<KthBound>,
-    cluster_start: Option<usize>,
+    /// Whether the last block is a cluster `begin_cluster` opened and `finish_cluster` has not
+    /// closed yet.
+    cluster_open: bool,
+    /// Whether the last block takes more rows: an open cluster, or rows pushed outside one.
+    block_open: bool,
 }
 
 #[cfg(test)]
@@ -281,7 +407,8 @@ impl BoundaryHarness {
         Self {
             candidates: QuantizedCandidates::with_capacity(capacity),
             bound: None,
-            cluster_start: None,
+            cluster_open: false,
+            block_open: false,
         }
     }
 
@@ -292,26 +419,20 @@ impl BoundaryHarness {
     }
 
     pub(crate) fn begin_cluster(&mut self, k: usize) {
-        assert!(self.cluster_start.is_none());
+        assert!(!self.cluster_open);
         self.bound(k);
-        self.cluster_start = Some(self.candidates.len());
+        self.candidates.open_test_block();
+        self.cluster_open = true;
+        self.block_open = true;
     }
 
     /// Appends a row with `estimate` and `sigma` to the current cluster.
     pub(crate) fn push(&mut self, row: usize, doc: DocId, estimate: f32, sigma: f32) {
-        let one = Columns {
-            bases: vec![0.0],
-            raw_prefixes: vec![estimate],
-            estimates: vec![estimate],
-            sigmas: vec![sigma],
-            residual_norm_squared: vec![1.0],
-            gammas: vec![1.0],
-            sign_query_error_terms: vec![0.0],
-            arithmetic_variances: vec![ArithmeticError::default()],
-        };
-        self.candidates.rows.push(row);
-        self.candidates.docs.push(doc);
-        self.candidates.columns.extend_from(&one);
+        if !self.block_open {
+            self.candidates.open_test_block();
+            self.block_open = true;
+        }
+        self.candidates.push_test_row(row, doc, estimate, sigma);
     }
 
     /// Records an exactly scored row in the bound.
@@ -320,13 +441,20 @@ impl BoundaryHarness {
     }
 
     pub(crate) fn finish_cluster(&mut self, kappa: f32) {
-        let start = self.cluster_start.take().expect("begin_cluster first");
+        assert!(self.cluster_open, "begin_cluster first");
+        self.cluster_open = false;
+        self.block_open = false;
         self.candidates.kappa = kappa;
+        let at = self
+            .candidates
+            .blocks
+            .last()
+            .map_or(0..0, |block| block.at.clone());
         let bound = self
             .bound
             .as_mut()
             .expect("begin_cluster creates the bound");
-        self.candidates.finish_cluster(start, bound);
+        self.candidates.finish_cluster(at, bound);
     }
 
     pub(crate) fn running_lower(&mut self, k: usize) -> Option<Threshold> {
@@ -348,16 +476,12 @@ impl BoundaryHarness {
     pub(crate) fn boundary_lower(&mut self, k: usize, kappa: f32) -> Option<Threshold> {
         let mut bound = self.bound(k).clone();
         self.candidates.kappa = kappa;
-        let mut lowers: Vec<f32> = (0..self.candidates.len())
-            .map(|index| self.candidates.lower(index))
-            .collect();
-        bound
-            .boundary_lower(&mut lowers)
-            .map(|kth| Threshold(LowerEndpoint(kth)))
+        self.candidates.boundary(&mut bound)
     }
 
     pub(crate) fn band(&mut self, k: usize, kappa: f32) {
         self.candidates.kappa = kappa;
+        self.block_open = false;
         let bound = self.bound.get_or_insert_with(|| KthBound::new(k));
         self.candidates.band(bound);
     }
