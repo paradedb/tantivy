@@ -28,7 +28,7 @@ pub(crate) struct CombineCtx {
 
 // --- Combine ---
 
-/// Turns a layer-0 batch's decoded rows into candidate columns, written to `out`.
+/// Turns a shortlisted cluster's decoded layer-0 rows into candidate columns, written to `out`.
 #[inline(always)]
 pub(crate) fn combine_initial(ctx: &CombineCtx, decoded: &Decoded, out: &mut Columns) {
     let rows = decoded.kernel.len();
@@ -81,7 +81,8 @@ pub(crate) fn combine_initial(ctx: &CombineCtx, decoded: &Decoded, out: &mut Col
     fill_sigmas(ctx, &decoded.errors, out, 0..rows);
 }
 
-/// Sizes `out` for a layer-0 batch and seeds its raw prefixes, gammas and arithmetic errors.
+/// Sizes `out` for a cluster's layer-0 rows and seeds their raw prefixes, gammas and arithmetic
+/// errors.
 #[inline(always)]
 fn seed_initial(ctx: &CombineCtx, decoded: &Decoded, out: &mut Columns) {
     let rows = decoded.kernel.len();

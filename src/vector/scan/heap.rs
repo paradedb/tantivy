@@ -17,17 +17,10 @@ pub(in crate::vector) type TieBreakHeap<K, CTail> = TopNComputer<
     (NaturalComparator, CTail),
 >;
 
-/// A candidate's composite heap key, or `None` when its similarity alone
-/// cannot beat the heap threshold, so the tie-break column is read only for
-/// competitive candidates. The caller pushes the key itself, with whichever of
-/// [`TopNComputer::push`]/`push_unordered` its doc arrival order permits.
+/// A candidate's composite heap key, or `None` when its similarity alone loses to the threshold.
 ///
-/// The skip is exact rather than approximate: `(s, t) < (ts, tt)` requires
-/// either `s < ts`, or `s == ts` with `t < tt`. So a candidate rejected here on
-/// similarity alone could never have survived the full composite comparison,
-/// and the tie-break lookup it would have cost is pure waste. Once the heap has
-/// filled this is the common case.
-/// Builds a competitive candidate's composite heap key.
+/// The skip is exact: `(s, t) < (ts, tt)` needs `s < ts` or `s == ts`, so a rejected candidate
+/// could never survive the full comparison. The caller pushes the key.
 #[inline(always)]
 pub(in crate::vector) fn tie_break_key<K, CTail>(
     topn: &TieBreakHeap<K, CTail>,

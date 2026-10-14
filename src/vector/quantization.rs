@@ -1,4 +1,5 @@
-//! Field-keyed vector quantization settings and row-layout constants.
+//! Field-keyed vector quantization settings, row-layout constants, and the arithmetic of quantized
+//! estimates.
 
 use std::collections::BTreeSet;
 
@@ -7,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::schema::{FieldType, Metric, Schema, VectorDType, VectorOptions};
 use crate::TantivyError;
+
+// --- Validation ---
 
 /// Validates model values shared by settings and stored segment metadata.
 pub(crate) fn validate_quantization_values<'a>(
@@ -33,6 +36,8 @@ pub(crate) fn validate_quantization_values<'a>(
     Ok(())
 }
 
+// --- Constants ---
+
 /// Settings identifier for the vector quantization format.
 pub const VECTOR_QUANTIZATION_FORMAT_VERSION: u32 = 3;
 /// Maximum number of residual layers stored by the vector format.
@@ -58,6 +63,9 @@ pub(crate) const GAMMA_ANALYTICAL_SAFETY: f32 = 1.15;
 pub(crate) const QUANTIZED_BOUNDARY_KAPPA: f32 = 2.5;
 /// Query-side bits used by every sign-layer estimator.
 pub(crate) const SIGN_QUERY_BITS: u8 = 4;
+
+// --- Configuration ---
+
 /// Normalization applied to fp32 rows before residual encoding and exact scoring.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -412,10 +420,10 @@ pub(crate) fn refine_l2_raw_prefix(
     scale.mul_add(kernel_score, raw_prefix - constant)
 }
 
-/// Analytical f32 subtraction error, in raw-prefix units. The two split-form
-/// operands were rounded independently; cancellation does not remove their error.
-/// This is machine epsilon times the sum of operand magnitudes, not a fitted
-/// constant. Refinements additionally account for `raw_prefix - constant`.
+/// Squared rounding error of an L2 raw prefix, in raw-prefix units.
+///
+/// The split operands were rounded independently, so cancellation does not remove their error; a
+/// refinement adds the `previous_prefix - constant` subtraction.
 #[inline(always)]
 pub(crate) fn l2_arithmetic_variance(
     kernel_score: f32,
@@ -430,15 +438,15 @@ pub(crate) fn l2_arithmetic_variance(
     subtraction * subtraction + refinement * refinement
 }
 
-/// Propagate raw-prefix arithmetic error through the L2 `2 * gamma` correction
-/// and combine it in quadrature with the statistical model width.
+/// The f32 error of `rounding_count` roundings over operands `a` and `b`: machine epsilon times
+/// the sum of their magnitudes.
 #[inline(always)]
 pub(crate) fn rounding_error(a: f32, b: f32, rounding_count: f32) -> f32 {
     rounding_count * f32::EPSILON * (a.abs() + b.abs())
 }
 
-/// Arithmetic uncertainty is kept separately so a refinement can change gamma
-/// without losing or double-scaling the error accumulated in the raw prefix.
+/// An estimate's arithmetic rounding error, kept apart from gamma so a refinement can change gamma
+/// without losing or double-scaling the error already in the raw prefix.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ArithmeticError {
     pub(crate) raw_variance: f32,
@@ -446,6 +454,7 @@ pub(crate) struct ArithmeticError {
 }
 
 impl ArithmeticError {
+    /// The error of a cluster's first layer.
     pub(crate) fn initial(
         metric: Metric,
         kernel: f32,
@@ -472,6 +481,7 @@ impl ArithmeticError {
         }
     }
 
+    /// Adds one refining layer's error.
     pub(crate) fn refine(
         &mut self,
         metric: Metric,
@@ -488,6 +498,8 @@ impl ArithmeticError {
         };
     }
 
+    /// The estimate's width: `model_sigma` combined in quadrature with the arithmetic error under
+    /// the metric's correction.
     pub(crate) fn sigma(
         self,
         metric: Metric,
@@ -517,7 +529,8 @@ pub(crate) fn refine_dot_raw_prefix(raw_prefix: f32, kernel_score: f32, scale: f
     scale.mul_add(kernel_score, raw_prefix)
 }
 
-/// Computes the production uncertainty width for a corrected estimate.
+/// The statistical width of a corrected estimate: its data and query quantization variance,
+/// scaled by the policy's safety factor.
 #[inline(always)]
 pub(crate) fn quantized_model_sigma(
     metric: Metric,

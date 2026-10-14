@@ -15,6 +15,8 @@ use crate::{Index, IndexWriter, TantivyDocument};
 
 const DOCS_PER_CLUSTER: usize = 6;
 
+// --- Fixtures ---
+
 /// Six centroids on a 3x2 grid, with six docs labelled `d{i}` packed around each.
 fn multi_cluster_fixture() -> (Vec<Vec<f32>>, Vec<String>) {
     let centroids = vec![
@@ -55,12 +57,10 @@ fn handle(index: &Index, field: Field, label: Field) -> Fixture {
     }
 }
 
-/// Merging flat segments with deletes past the clustering threshold: rows
-/// written for since-deleted docs still count toward the sources'
-/// `count()` (tombstones don't rewrite `.vec`), so the alive-doc merge
-/// iteration legitimately comes up short of `vector_count`. The merge
-/// must tolerate that, and the resulting IVF segment must hold — and
-/// count — the alive docs only.
+// --- Merge ---
+
+/// Merging flat segments with deletes, whose `.vec` still counts deleted rows, yields an IVF
+/// segment that holds and counts only the alive docs.
 #[test]
 fn merge_flat_segments_with_deletes_into_ivf() -> crate::Result<()> {
     let (centroids, labels) = multi_cluster_fixture();
@@ -145,16 +145,8 @@ fn merge_flat_segments_with_deletes_into_ivf() -> crate::Result<()> {
     Ok(())
 }
 
-/// Merging past the clustering threshold when every doc carrying a
-/// vector for ONE field is deleted, while another field keeps live
-/// vectors. The sources still report `vector_count > 0` for the emptied
-/// field (tombstones don't rewrite `.vec`), so it takes the training
-/// path, collects nothing — and used to `continue` without writing the
-/// field's `.vec`/`.centroids` slots. The live field still wrote, so the
-/// composites existed but the emptied field's slots were missing:
-/// `count()`, `open_column()` and `vector_info()` all failed with
-/// InternalError. The merge must instead write the same empty slots as
-/// the no-vectors-at-all fast path.
+/// A merge that deletes every vector of one field, while another keeps live vectors, writes the
+/// emptied field's `.vec`/`.centroids` slots as empty, the same as a field with no vectors.
 #[test]
 fn merge_deleting_every_doc_of_one_field_writes_empty_ivf() -> crate::Result<()> {
     let (centroids, labels) = multi_cluster_fixture();
@@ -218,7 +210,7 @@ fn merge_deleting_every_doc_of_one_field_writes_empty_ivf() -> crate::Result<()>
     assert_eq!(searcher.segment_readers().len(), 1, "one merged segment");
     let segment_reader = &searcher.segment_readers()[0];
 
-    // The emptied field reads back as a zeroed IVF field — not an error.
+    // The emptied field reads back as a zeroed IVF field, not an error.
     let vec_reader = segment_reader.vector_index(doomed_field)?;
     assert_eq!(vec_reader.num_vectors(), 0);
     let info = vec_reader.info().expect("vector info");
@@ -259,6 +251,8 @@ fn merge_deleting_every_doc_of_one_field_writes_empty_ivf() -> crate::Result<()>
     Ok(())
 }
 
+// --- Build log ---
+
 /// Captures `paradedb::ivf_build` log records so a test can read back the
 /// timings line the merge emits.
 struct CaptureLogger;
@@ -282,16 +276,14 @@ impl log::Log for CaptureLogger {
 
 static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
 
-/// The merge emits one parseable `ivf_build timings_ms ...` line per
-/// field. Builds a larger index so the phase timings are measurable,
-/// captures the line, and prints it (run with `--nocapture`) so we can
-/// see where build time goes.
+/// The merge emits one parseable `ivf_build timings_ms ...` line per field, printed under
+/// `--nocapture`.
 #[test]
 fn ivf_build_emits_timings_log() -> crate::Result<()> {
     let _ = log::set_logger(&CAPTURE_LOGGER);
     log::set_max_level(log::LevelFilter::Info);
 
-    // 200 centroids on a 20×10 grid; ~5000 docs clustered around them.
+    // 200 centroids on a 20x10 grid; ~5000 docs clustered around them.
     let mut centroids: Vec<Vec<f32>> = Vec::new();
     for x in 0..20 {
         for y in 0..10 {
@@ -320,10 +312,10 @@ fn ivf_build_emits_timings_log() -> crate::Result<()> {
     Ok(())
 }
 
-/// The raw per-cluster sizes from the reader's `cluster_sizes` must be
-/// exactly the un-collapsed array behind `info`'s aggregate cluster stats
-/// — the invariant `paradedb.ivf_cluster_sizes` relies on to reconcile
-/// with `paradedb.index_info`. Flat segments expose no sizes.
+// --- Cluster sizes ---
+
+/// The reader's raw `cluster_sizes` are exactly the array behind `vector_info`'s cluster stats;
+/// flat segments expose none.
 #[test]
 fn ivf_cluster_sizes_match_vector_info() -> crate::Result<()> {
     let index = TestVectorIndex::builder(VectorDType::F32)
@@ -373,7 +365,7 @@ fn ivf_cluster_sizes_match_vector_info() -> crate::Result<()> {
         "fixture must produce >= 1 IVF segment"
     );
 
-    // Flat segments (no IVF data) yield None — the SRF emits no rows for them.
+    // Flat segments yield `None`, so the SRF emits no rows for them.
     let flat = TestVectorIndex::builder(VectorDType::F32)
         .metric(Metric::L2)
         .vector_storage_format(VectorStorageFormat::Flat)
