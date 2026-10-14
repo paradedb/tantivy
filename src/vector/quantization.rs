@@ -58,7 +58,7 @@ pub(crate) const GAMMA_ANALYTICAL_SAFETY: f32 = 1.15;
 pub(crate) const QUANTIZED_BOUNDARY_KAPPA: f32 = 2.5;
 /// Query-side bits used by every sign-layer estimator.
 pub(crate) const SIGN_QUERY_BITS: u8 = 4;
-/// Normalization applied to fp32 rows before residual encoding and rerank.
+/// Normalization applied to fp32 rows before residual encoding and exact scoring.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum VectorNormPolicy {

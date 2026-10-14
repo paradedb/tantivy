@@ -746,7 +746,7 @@ mod tests {
     use crate::query::{AllQuery, EnableScoring, Query, TermQuery};
     use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
     use crate::vector::ivf::AdaptiveProbeParams;
-    use crate::vector::prepared::QuantizedQueryCtx;
+    use crate::vector::prepared::{QuantizedQueryCtx, VectorQuery};
     use crate::vector::tests::ground_truth;
     use crate::vector::{
         TopDocsByVectorSimilarity, VectorEstimatorMeasurements, VectorEstimatorQuery,
@@ -1408,7 +1408,7 @@ mod tests {
         context: &str,
         actual: &[(crate::Score, crate::DocAddress)],
         expected: &[(crate::Score, crate::DocAddress)],
-        stats: &crate::vector::stats::ProbeStats,
+        trace: &crate::vector::test_support::DocTrace,
     ) {
         if actual == expected {
             return;
@@ -1421,27 +1421,23 @@ mod tests {
             .map(|(_, address)| address.doc_id)
             .find(|doc| !actual_docs.contains(doc));
         let attribution = if let Some(doc) = missing {
-            if !stats.quantized_trace.scored_docs.contains(&doc) {
+            if !trace.scored_docs.contains(&doc) {
                 "routing/admission miss"
-            } else if stats
-                .quantized_trace
+            } else if trace
                 .boundary_docs
                 .iter()
                 .any(|survivors| !survivors.contains(&doc))
             {
                 "band drop"
-            } else if !stats.quantized_trace.rerank_docs.contains(&doc) {
-                "rerank fetch bug"
+            } else if !trace.exact_phase_docs.contains(&doc) {
+                "exact-phase fetch bug"
             } else {
-                "rerank scoring/order bug"
+                "exact scoring/order bug"
             }
         } else {
-            "rerank scoring/order bug"
+            "exact scoring/order bug"
         };
-        panic!(
-            "{context}: {attribution}; actual={actual:?} expected={expected:?} trace={:?}",
-            stats.quantized_trace
-        );
+        panic!("{context}: {attribution}; actual={actual:?} expected={expected:?} trace={trace:?}");
     }
 
     fn assert_quantized_matrix_storage(
@@ -1522,18 +1518,14 @@ mod tests {
         let stats = &fruit.stats[0];
         let context =
             format!("metric={metric:?} schedule={schedule:?} scenario={scenario:?} depth={depth}");
-        assert_matrix_results(&context, &fruit.results, &expected, stats);
+        let trace = crate::vector::test_support::doc_trace(index, field, &stats.quantized_trace)?;
+        assert_matrix_results(&context, &fruit.results, &expected, &trace);
 
         let layer0 = stats.layers.get(0).expect("layer 0 must execute");
         assert_eq!(
             stats.layer0_eligible,
             layer0.scored(),
             "{context}: layer 0 must score exactly the admitted eligible rows"
-        );
-        assert_eq!(
-            stats.eligible_charged,
-            layer0.scored(),
-            "{context}: the probe budget must charge exactly the selected rows"
         );
         assert!(layer0.scored() > 0, "{context}: {stats:?}");
         assert!(
@@ -1562,25 +1554,22 @@ mod tests {
             );
         }
         assert_eq!(
-            stats.quantized_trace.boundary_docs.len(),
+            trace.boundary_docs.len(),
             depth,
             "{context}: one identity snapshot per executed boundary"
         );
-        for boundary in &stats.quantized_trace.boundary_docs {
+        for boundary in &trace.boundary_docs {
             assert!(
-                boundary
-                    .iter()
-                    .all(|doc| stats.quantized_trace.scored_docs.contains(doc)),
+                boundary.iter().all(|doc| trace.scored_docs.contains(doc)),
                 "{context}: a later layer retained a row absent from layer-0 selection"
             );
         }
         assert!(
-            stats.quantized_trace.rerank_docs.iter().all(|doc| stats
-                .quantized_trace
+            trace.exact_phase_docs.iter().all(|doc| trace
                 .boundary_docs
                 .last()
                 .is_some_and(|boundary| boundary.contains(doc))),
-            "{context}: rerank read a row absent from the final selection"
+            "{context}: the exact phase read a row absent from the final selection"
         );
         for max_probe_fraction in [0.25, 1.0] {
             const ELIGIBILITY_TOP_N: usize = 8;
@@ -1602,8 +1591,18 @@ mod tests {
                     .with_max_scan_levels(0),
             )?;
             assert_eq!(
-                quantized.stats[0].quantized_trace.scored_docs,
-                level0.stats[0].quantized_trace.scored_docs,
+                crate::vector::test_support::doc_trace(
+                    index,
+                    field,
+                    &quantized.stats[0].quantized_trace
+                )?
+                .scored_docs,
+                crate::vector::test_support::doc_trace(
+                    index,
+                    field,
+                    &level0.stats[0].quantized_trace
+                )?
+                .scored_docs,
                 "{context}: selected candidate set at probe fraction {max_probe_fraction}"
             );
         }
@@ -1658,7 +1657,10 @@ mod tests {
             .map(|coordinate| ((coordinate as f32 + 0.5) * 0.031).cos())
             .collect();
         let harness = cascade::prepare_split_query(&query, &specs, &grids, 4);
-        let scan = QuantizedQueryCtx::new(Arc::clone(quantized.index_ctx()), query);
+        let scan = QuantizedQueryCtx::new(
+            Arc::clone(quantized.index_ctx()),
+            &VectorQuery::new(quantized.index_ctx().meta.field().metric, Arc::new(query)),
+        );
 
         for row in 0..ivf.num_rows() {
             let mut scan_sum = 0.0;
@@ -1752,7 +1754,7 @@ mod tests {
         assert!(level_zero.candidates_scored > 0, "{level_zero:?}");
         assert!(level_zero.exact_scan_ns.is_some(), "{level_zero:?}");
         assert_eq!(level_zero.candidates_scored, baseline.candidates_scored);
-        assert_eq!(level_zero.exact_rows_read, baseline.exact_rows_read);
+        assert_eq!(level_zero.exact_rows, baseline.exact_rows);
         assert_eq!(level_zero.postings_row, baseline.postings_row);
         assert_eq!(level_zero.postings_skipped, baseline.postings_skipped);
         assert_eq!(
@@ -1955,7 +1957,7 @@ mod tests {
             expected
         );
         let stats = &fruit.stats[0];
-        assert_eq!(stats.exact_rows_read, 8, "{stats:?}");
+        assert_eq!(stats.exact_rows, 8, "{stats:?}");
         assert_eq!(stats.routing_visited_count, 0, "{stats:?}");
         assert_eq!(stats.clusters_probed(), 0, "{stats:?}");
         assert!(stats.layers.get(0).is_none(), "{stats:?}");
@@ -2065,8 +2067,7 @@ mod tests {
             "the two-layer fixture refines every first-boundary survivor: {stats:?}"
         );
         assert!(layer1.survivors() <= layer0.survivors(), "{stats:?}");
-        assert!(stats.rerank_rows <= layer1.survivors(), "{stats:?}");
-        assert_eq!(stats.exact_rows_read, stats.rerank_rows, "{stats:?}");
+        assert!(stats.exact_rows <= layer1.survivors(), "{stats:?}");
         let hits = quantized_fruit.results;
         let mut expected: Vec<(f32, u32)> = (0..8)
             .map(|doc| {

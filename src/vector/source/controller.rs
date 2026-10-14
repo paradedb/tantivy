@@ -4,7 +4,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 
 use crate::vector::ivf::RecallEstimator;
-use crate::vector::stats::ProbeStats;
 use crate::vector::Similarity;
 use crate::Score;
 
@@ -177,28 +176,60 @@ impl std::ops::Mul<f64> for WorkUnits {
     }
 }
 
-/// The resolved per-segment prices the probe loop charges against its
-/// budget: an open costs `open`, a scored row costs `row`. Built once
-/// per segment from
-/// [`AdaptiveProbeParams::resolved_work_budget`](crate::vector::ivf::AdaptiveProbeParams::resolved_work_budget)'
-/// s `(budget, n_avg, x)`.
-/// Per-segment probe budget and event prices.
-#[derive(Clone, Copy, Debug)]
-pub(in crate::vector) struct UnitPricing {
-    /// Work this segment may spend before the ceiling binds.
-    pub(in crate::vector) budget: WorkUnits,
-    /// The per-index open share `x`: what opening one cluster costs.
-    pub(in crate::vector) open: WorkUnits,
-    /// `(1 - x)/n_avg`: what one scored row costs.
-    pub(in crate::vector) row: WorkUnits,
+/// A segment's work budget and what a cluster open and a scored row cost against it, from
+/// [`AdaptiveProbeParams::resolved_work_budget`](crate::vector::ivf::AdaptiveProbeParams::resolved_work_budget).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WorkBudget {
+    /// Work the segment may spend before the ceiling binds.
+    pub(crate) total: WorkUnits,
+    /// The per-index open share `x`.
+    pub(crate) per_cluster: WorkUnits,
+    /// `(1 - x) / n_avg`.
+    pub(crate) per_row: WorkUnits,
 }
 
-/// Cost accounting and termination for the probe loop: charges each
-/// cluster's work against the budget, tracks the APS recall estimate, and
-/// decides whether the next ranked cluster is opened.
+/// Charges cluster opens and scored rows against a budget.
+pub(crate) struct WorkMeter {
+    budget: WorkBudget,
+    charged: WorkUnits,
+}
+
+impl WorkMeter {
+    pub(crate) fn new(budget: WorkBudget) -> Self {
+        Self {
+            budget,
+            charged: WorkUnits::ZERO,
+        }
+    }
+
+    /// Charges one cluster open.
+    pub(crate) fn open(&mut self) {
+        self.charged += self.budget.per_cluster;
+    }
+
+    /// Charges `rows` scored rows.
+    pub(crate) fn rows(&mut self, rows: usize) {
+        self.charged += self.budget.per_row * rows as f64;
+    }
+
+    /// Whether the charges have reached the budget.
+    pub(crate) fn exhausted(&self) -> bool {
+        self.charged >= self.budget.total
+    }
+
+    /// The work charged so far.
+    pub(crate) fn charged(&self) -> WorkUnits {
+        self.charged
+    }
+
+    pub(crate) fn budget(&self) -> WorkBudget {
+        self.budget
+    }
+}
+
+/// Termination for the probe loop: tracks the APS recall estimate and decides, from the work
+/// meter, whether the next ranked cluster is opened.
 pub(in crate::vector) struct ProbeController<'a> {
-    pricing: UnitPricing,
-    work_spent: WorkUnits,
     termination: ProbeTermination,
     /// Clusters in the segment and clusters pulled from the ranking so far.
     clusters: usize,
@@ -211,14 +242,11 @@ pub(in crate::vector) struct ProbeController<'a> {
 
 impl<'a> ProbeController<'a> {
     pub(in crate::vector) fn new(
-        pricing: UnitPricing,
         clusters: usize,
         estimator: Option<RecallEstimator<'a>>,
         recall_target: f32,
     ) -> Self {
         Self {
-            pricing,
-            work_spent: WorkUnits::ZERO,
             termination: ProbeTermination::Exhausted,
             clusters,
             pulled: 0,
@@ -232,7 +260,7 @@ impl<'a> ProbeController<'a> {
     /// Checked after the pull: a stop proves another ranked cluster
     /// existed, keeping `Ceiling` and `RecallTarget` distinct from
     /// `Exhausted`.
-    pub(in crate::vector) fn admit(&mut self) -> bool {
+    pub(in crate::vector) fn admit(&mut self, meter: &WorkMeter) -> bool {
         self.pulled += 1;
         if self
             .recall_estimate
@@ -241,21 +269,11 @@ impl<'a> ProbeController<'a> {
             self.termination = ProbeTermination::RecallTarget;
             return false;
         }
-        if self.work_spent >= self.pricing.budget {
+        if meter.exhausted() {
             self.termination = ProbeTermination::Ceiling;
             return false;
         }
         true
-    }
-
-    /// Charges one cluster open, probed or skipped by the bounds gate.
-    pub(in crate::vector) fn charge_open(&mut self) {
-        self.work_spent += self.pricing.open;
-    }
-
-    /// Charges `rows` scored rows.
-    pub(in crate::vector) fn charge_rows(&mut self, rows: usize) {
-        self.work_spent += self.pricing.row * rows as f64;
     }
 
     /// Marks the admitted cluster covered: probed, skipped by the bounds
@@ -271,20 +289,33 @@ impl<'a> ProbeController<'a> {
         Ok(())
     }
 
-    pub(in crate::vector) fn finish(&self, stats: &mut ProbeStats) {
-        // A stacked ranking is sized to the budget, so it can run out just
-        // as the budget is spent, short of the segment's clusters; that stop
-        // is the ceiling's, not exhaustion.
-        stats.termination = match self.termination {
-            ProbeTermination::Exhausted
-                if self.pulled < self.clusters && self.work_spent >= self.pricing.budget =>
-            {
+    /// How the probe loop ended and what `meter` charged.
+    pub(crate) fn finish(&self, meter: &WorkMeter) -> ProbeOutcome {
+        // A stacked ranking sized to the budget can run out as the budget is spent, short of the
+        // segment's clusters; that stop is the ceiling's.
+        let termination = match self.termination {
+            ProbeTermination::Exhausted if self.pulled < self.clusters && meter.exhausted() => {
                 ProbeTermination::Ceiling
             }
             termination => termination,
         };
-        stats.work_charged += self.work_spent.to_f32();
-        stats.work_budget += self.pricing.budget.to_f32();
-        stats.recall_estimate = self.recall_estimate;
+        ProbeOutcome {
+            termination,
+            work_charged: meter.charged().to_f32(),
+            work_budget: meter.budget().total.to_f32(),
+            recall_estimate: self.recall_estimate,
+        }
     }
+}
+
+/// How a routed probe loop ended.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ProbeOutcome {
+    pub(crate) termination: ProbeTermination,
+    /// Work units charged: opens at `x`, scored rows at `(1 - x)/n_avg`.
+    pub(crate) work_charged: f32,
+    /// The resolved budget the loop ran against, in work units.
+    pub(crate) work_budget: f32,
+    /// The APS recall estimate at the stop; `None` when APS was off or never armed.
+    pub(crate) recall_estimate: Option<f32>,
 }

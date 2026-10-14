@@ -1,32 +1,59 @@
 //! IVF build and merge tests.
 
-// ============================================================
-// IVF `top_n` test gate.
-//
-// Built on top of `crate::vector::tests::TestVectorIndex` (the
-// shared fixture) where the geometry fits — the 100-doc grid +
-// selectivity-based labels covers oracle / filter / delete /
-// overflow / zero-K. The handful of tests that need crafted point
-// geometry (the trap case + the result-level candidate-floor
-// demonstration) build a tiny IVF index inline via `build_inline_ivf`
-// and an `InlineClusterer` that's compatible with the batched
-// IvfClusterer trait.
-// ============================================================
 use std::sync::Arc;
 
 use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
 use crate::query::AllQuery;
-use crate::schema::{Metric, Schema, Term, STORED, STRING};
-use crate::vector::scan::tests::{
-    build_inline_ivf, multi_cluster_docs, multi_cluster_fixture, search, stored_label_at,
-    InlineClusterer,
-};
+use crate::schema::{Field, Metric, Schema, Term, STORED, STRING};
+use crate::vector::test_support::{Fixture, FixtureSpec, NearestClusterer};
 use crate::vector::tests::{exhaustive_params, TestVectorIndex};
 use crate::vector::{
     RouterKind, VectorClusterStats, VectorDType, VectorInfo, VectorOptions, VectorStorageFormat,
 };
 use crate::{Index, IndexWriter, TantivyDocument};
+
+const DOCS_PER_CLUSTER: usize = 6;
+
+/// Six centroids on a 3x2 grid, with six docs labelled `d{i}` packed around each.
+fn multi_cluster_fixture() -> (Vec<Vec<f32>>, Vec<String>) {
+    let centroids = vec![
+        vec![0.0f32, 0.0],
+        vec![10.0, 0.0],
+        vec![20.0, 0.0],
+        vec![0.0, 10.0],
+        vec![10.0, 10.0],
+        vec![20.0, 10.0],
+    ];
+    let labels = (0..centroids.len() * DOCS_PER_CLUSTER)
+        .map(|i| format!("d{i}"))
+        .collect();
+    (centroids, labels)
+}
+
+fn multi_cluster_docs<'a>(
+    centroids: &[Vec<f32>],
+    labels: &'a [String],
+) -> Vec<(&'a str, [f32; 2])> {
+    (0..labels.len())
+        .map(|i| {
+            let c = &centroids[i / DOCS_PER_CLUSTER];
+            let off = (i % DOCS_PER_CLUSTER) as f32 * 0.01;
+            (labels[i].as_str(), [c[0] + off, c[1] + off])
+        })
+        .collect()
+}
+
+/// A fixture handle over an index built by hand.
+fn handle(index: &Index, field: Field, label: Field) -> Fixture {
+    Fixture {
+        index: index.clone(),
+        field,
+        label,
+        metric: Metric::L2,
+        directory: None,
+    }
+}
 
 /// Merging flat segments with deletes past the clustering threshold: rows
 /// written for since-deleted docs still count toward the sources'
@@ -56,7 +83,7 @@ fn merge_flat_segments_with_deletes_into_ivf() -> crate::Result<()> {
     let index = Index::builder()
         .schema(schema)
         .settings(settings)
-        .ivf_clusterer(Arc::new(InlineClusterer {
+        .ivf_clusterer(Arc::new(NearestClusterer {
             centroids: centroids.clone(),
         }))
         .ivf_router(RouterKind::Stacked)?
@@ -96,18 +123,19 @@ fn merge_flat_segments_with_deletes_into_ivf() -> crate::Result<()> {
     assert_eq!(vec_reader.num_vectors(), alive);
 
     // Every alive doc comes back exactly once; no deleted label survives.
-    let hits = search(
-        &index,
-        embed_field,
-        &AllQuery,
-        vec![10.0, 10.0],
-        n,
-        exhaustive_params(centroids.len()),
-    )?;
+    let fixture = handle(&index, embed_field, label_field);
+    let hits = fixture
+        .search(
+            &AllQuery,
+            &[10.0, 10.0],
+            n,
+            exhaustive_params(centroids.len()),
+        )?
+        .results;
     assert_eq!(hits.len(), alive, "exhaustive top-N must return alive docs");
     let mut seen_labels = std::collections::HashSet::new();
     for (_, addr) in &hits {
-        let label = stored_label_at(&index, label_field, *addr)?;
+        let label = format!("d{}", fixture.ordinal(*addr)?);
         assert!(
             !deleted.contains(&label.as_str()),
             "deleted doc {label} surfaced in results"
@@ -151,7 +179,7 @@ fn merge_deleting_every_doc_of_one_field_writes_empty_ivf() -> crate::Result<()>
     let index = Index::builder()
         .schema(schema)
         .settings(settings)
-        .ivf_clusterer(Arc::new(InlineClusterer {
+        .ivf_clusterer(Arc::new(NearestClusterer {
             centroids: centroids.clone(),
         }))
         .ivf_router(RouterKind::Stacked)?
@@ -219,14 +247,14 @@ fn merge_deleting_every_doc_of_one_field_writes_empty_ivf() -> crate::Result<()>
         segment_reader.vector_index(kept_field)?.num_vectors(),
         kept_count
     );
-    let hits = search(
-        &index,
-        kept_field,
-        &AllQuery,
-        vec![10.0, 10.0],
-        n,
-        exhaustive_params(centroids.len()),
-    )?;
+    let hits = handle(&index, kept_field, label_field)
+        .search(
+            &AllQuery,
+            &[10.0, 10.0],
+            n,
+            exhaustive_params(centroids.len()),
+        )?
+        .results;
     assert_eq!(hits.len(), kept_count, "kept field returns alive docs");
     Ok(())
 }
@@ -264,26 +292,23 @@ fn ivf_build_emits_timings_log() -> crate::Result<()> {
     log::set_max_level(log::LevelFilter::Info);
 
     // 200 centroids on a 20×10 grid; ~5000 docs clustered around them.
-    let mut centroids: Vec<[f32; 2]> = Vec::new();
+    let mut centroids: Vec<Vec<f32>> = Vec::new();
     for x in 0..20 {
         for y in 0..10 {
-            centroids.push([x as f32 * 10.0, y as f32 * 10.0]);
+            centroids.push(vec![x as f32 * 10.0, y as f32 * 10.0]);
         }
     }
     let n_per = 25usize;
-    let labels: Vec<String> = (0..centroids.len() * n_per)
-        .map(|i| format!("d{i}"))
-        .collect();
-    let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
+    let docs: Vec<Vec<f32>> = (0..centroids.len() * n_per)
         .map(|i| {
-            let c = centroids[i / n_per];
+            let c = &centroids[i / n_per];
             let off = (i % n_per) as f32 * 0.05;
-            (labels[i].as_str(), [c[0] + off, c[1] + off])
+            vec![c[0] + off, c[1] + off]
         })
         .collect();
 
     let before = CAPTURED_IVF_BUILD.lock().unwrap().len();
-    let _ = build_inline_ivf(Metric::L2, &centroids, &docs)?;
+    FixtureSpec::ivf(Metric::L2, centroids, docs).build()?;
     let lines: Vec<String> = CAPTURED_IVF_BUILD.lock().unwrap()[before..].to_vec();
     let line = lines
         .iter()

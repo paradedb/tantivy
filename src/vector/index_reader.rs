@@ -24,7 +24,7 @@ use super::metadata::{QuantizationSchedule, SlotType, VectorColMetadata};
 use super::prepared::{
     corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix,
     quantized_model_sigma, refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError,
-    PreparedQuery, QuantizedIndexCtx, QuantizedQueryCtx,
+    QuantizedIndexCtx, QuantizedQueryCtx, VectorQuery,
 };
 use super::quantization::{
     quantized_code_tail_is_zero, QUANTIZED_BOUNDARY_KAPPA, QUANTIZED_CONSTANT_STRIDE,
@@ -390,11 +390,16 @@ impl VectorErrorAuditMeasurements {
 }
 
 #[inline]
-fn diagnostic_query_norm(query: &QuantizedQueryCtx, metric: Metric, centroid_bytes: &[u8]) -> f32 {
-    let routing_score = metric
-        .similarity_bytes::<f32>(query.query(), centroid_bytes)
+fn diagnostic_query_norm(
+    quantized: &QuantizedQueryCtx,
+    query: &VectorQuery<f32>,
+    metric: Metric,
+    centroid_bytes: &[u8],
+) -> f32 {
+    let centroid_score = metric
+        .similarity_bytes::<f32>(quantized.estimate_vector(query), centroid_bytes)
         .score();
-    query.score_query_norm(routing_score)
+    quantized.score_query_norm(centroid_score)
 }
 
 #[inline]
@@ -2009,13 +2014,13 @@ impl VectorIndexReader {
         }
 
         let measurement_ctx = Arc::clone(quantization.index_ctx());
-        let prepared_queries: Vec<QuantizedQueryCtx> = queries
+        let exact_queries: Vec<VectorQuery<f32>> = queries
             .iter()
-            .map(|query| QuantizedQueryCtx::new(Arc::clone(&measurement_ctx), query.values.clone()))
+            .map(|query| VectorQuery::new(self.options.metric(), Arc::new(query.values.clone())))
             .collect();
-        let exact_queries: Vec<PreparedQuery<f32>> = queries
+        let prepared_queries: Vec<QuantizedQueryCtx> = exact_queries
             .iter()
-            .map(|query| PreparedQuery::new(self.options.metric(), Arc::new(query.values.clone())))
+            .map(|query| QuantizedQueryCtx::new(Arc::clone(&measurement_ctx), query))
             .collect();
         let live_row_count = self.live_posting_row_count(alive)?;
         let target_rows = sample_rows.min(live_row_count);
@@ -2139,7 +2144,10 @@ impl VectorIndexReader {
                     let cluster_score = self
                         .options
                         .metric()
-                        .similarity_bytes::<f32>(query.query(), centroid_row)
+                        .similarity_bytes::<f32>(
+                            query.estimate_vector(&exact_queries[query_idx]),
+                            centroid_row,
+                        )
                         .score();
                     let query_norm = query.score_query_norm(cluster_score);
                     let query_norm_squared = query_norm * query_norm;
@@ -2148,7 +2156,7 @@ impl VectorIndexReader {
                     } else {
                         cluster_score
                     };
-                    let exact_score = exact_queries[query_idx].score_doc_bytes(&vector_bytes);
+                    let exact_score = exact_queries[query_idx].score_row(&vector_bytes).score();
                     let mut raw_prefix_estimate = 0.0_f32;
                     let mut sign_query_error_term = 0.0_f32;
                     let mut arithmetic = ArithmeticError::default();
@@ -2325,16 +2333,14 @@ impl VectorIndexReader {
                 .collect(),
         };
         for query_input in queries {
-            let query =
-                QuantizedQueryCtx::new(Arc::clone(&measurement_ctx), query_input.values.clone());
-            let exact_query =
-                PreparedQuery::<f32>::new(metric, Arc::new(query_input.values.clone()));
+            let exact_query = VectorQuery::<f32>::new(metric, Arc::new(query_input.values.clone()));
+            let query = QuantizedQueryCtx::new(Arc::clone(&measurement_ctx), &exact_query);
             let mut cluster_scores = Vec::with_capacity(index.num_clusters());
             let mut cluster_query_norms = Vec::with_capacity(index.num_clusters());
             for cluster in 0..index.num_clusters() {
                 let centroid_row = &centroid_bytes[cluster * centroid_stride..][..centroid_stride];
                 let score = metric
-                    .similarity_bytes::<f32>(query.query(), centroid_row)
+                    .similarity_bytes::<f32>(query.estimate_vector(&exact_query), centroid_row)
                     .score();
                 cluster_scores.push(score);
                 cluster_query_norms.push(query.score_query_norm(score));
@@ -2360,7 +2366,7 @@ impl VectorIndexReader {
                         continue;
                     }
                     let bytes = self.vector_bytes_for_row(row)?;
-                    let exact_score = exact_query.score_doc_bytes(&bytes);
+                    let exact_score = exact_query.score_row(&bytes).score();
                     match exact_by_doc.entry(doc) {
                         std::collections::btree_map::Entry::Vacant(entry) => {
                             entry.insert(exact_score);
@@ -3254,17 +3260,17 @@ mod tests {
         );
         assert!(batch.read_count() < selected.len());
 
-        let query = PreparedQuery::<f32>::new(Metric::Dot, Arc::new(vec![2.0, -0.5]));
+        let query = VectorQuery::<f32>::new(Metric::Dot, Arc::new(vec![2.0, -0.5]));
         let actual = batch
             .iter()
-            .map(|(row, bytes)| (row, query.score_doc_bytes(bytes).to_bits()))
+            .map(|(row, bytes)| (row, query.score_row(bytes).score().to_bits()))
             .collect::<Vec<_>>();
         let stride = DIM * std::mem::size_of::<f32>();
         let expected = selected
             .iter()
             .map(|&row| {
                 let bytes = &expected_bytes[row * stride..(row + 1) * stride];
-                (row, query.score_doc_bytes(bytes).to_bits())
+                (row, query.score_row(bytes).score().to_bits())
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
@@ -3293,19 +3299,20 @@ mod tests {
                 vec![super::super::quantization::VectorQuantizationLayer { bits: 1, seed: 7 }],
             )
             .unwrap();
+            let vector_query = VectorQuery::new(metric, Arc::new(source_query.clone()));
             let query = QuantizedQueryCtx::new(
                 Arc::new(QuantizedIndexCtx::from_config(config).unwrap()),
-                source_query.clone(),
+                &vector_query,
             );
-            let routing_score = metric
-                .similarity_bytes::<f32>(query.query(), &centroid_bytes)
+            let centroid_score = metric
+                .similarity_bytes::<f32>(query.estimate_vector(&vector_query), &centroid_bytes)
                 .score();
-            let expected = query.score_query_norm(routing_score);
-            let actual = diagnostic_query_norm(&query, metric, &centroid_bytes);
+            let expected = query.score_query_norm(centroid_score);
+            let actual = diagnostic_query_norm(&query, &vector_query, metric, &centroid_bytes);
             assert_eq!(actual.to_bits(), expected.to_bits(), "metric={metric:?}");
 
             let f64_reference = query
-                .query()
+                .estimate_vector(&vector_query)
                 .iter()
                 .zip(&centroid)
                 .map(|(&query, &centroid)| {
@@ -3668,12 +3675,13 @@ mod tests {
             Some((Arc::clone(&reads), 16)),
         );
         reads.lock().unwrap().clear();
-        let before = super::super::storage_io::snapshot();
+        crate::vector::telemetry::take_stage_totals();
         let stage = super::super::enter_vector_stage(super::super::Stage::LayerScan(0));
         let batch = reader.read_batch(0..8)?;
         drop(stage);
         assert_eq!(reads.lock().unwrap().len(), 1);
-        let io = super::super::storage_io::snapshot()[0].since(before[0]);
+        let io =
+            crate::vector::telemetry::take_stage_totals().io(super::super::Stage::LayerScan(0));
         let range = reads.lock().unwrap()[0].clone();
         assert_eq!(io.reads, 1);
         assert_eq!(io.bytes_read, range.len() as u64);
@@ -3726,7 +3734,8 @@ mod tests {
     #[test]
     fn sparse_cluster_reads_pin_one_sidecar_span() -> crate::Result<()> {
         use super::super::blocks::{block_len, column_range, write_metadata, BlockDirectory};
-        use super::super::{enter_vector_stage, storage_io, Stage, VectorQuantizationLayer};
+        use super::super::telemetry::take_stage_totals;
+        use super::super::{enter_vector_stage, Stage, VectorQuantizationLayer};
         for metric in [Metric::Cosine, Metric::Dot, Metric::L2] {
             let opts = VectorOptions::new(1024, metric);
             let config = VectorQuantizationConfig::materialize(
@@ -3830,14 +3839,13 @@ mod tests {
                             );
                             assert_eq!(ranges, expected);
                             let stage = enter_vector_stage(Stage::LayerScan(1));
-                            let before = storage_io::snapshot()[1];
+                            take_stage_totals();
                             for rows in ranges.iter().cloned() {
                                 cluster.read_codes(rows)?;
                             }
-                            let code_io = storage_io::snapshot()[1].since(before);
-                            let before = storage_io::snapshot()[1];
+                            let code_io = take_stage_totals().io(Stage::LayerScan(1));
                             let sidecar = cluster.read_sidecar()?;
-                            let sidecar_io = storage_io::snapshot()[1].since(before);
+                            let sidecar_io = take_stage_totals().io(Stage::LayerScan(1));
                             drop(stage);
                             assert_eq!(sidecar_io.reads, 1);
                             let first =

@@ -1,4 +1,4 @@
-//! Reading and decoding one quantized layer for a batch.
+//! Reading and decoding one quantized layer for a batch's selected rows.
 
 use std::ops::Range;
 
@@ -11,24 +11,6 @@ use crate::vector::index_reader::{
 };
 use crate::vector::prepared::QuantizedQueryCtx;
 use crate::TantivyError;
-
-/// Storage-row selection resolved before a quantized layer is read.
-pub(in crate::vector) enum Selection<'a> {
-    All,
-    Rows(&'a [usize]),
-    None,
-}
-
-impl Selection<'_> {
-    #[inline]
-    pub(in crate::vector) fn len(&self, rows: &Range<usize>) -> usize {
-        match self {
-            Self::All => rows.len(),
-            Self::Rows(offsets) => offsets.len(),
-            Self::None => 0,
-        }
-    }
-}
 
 /// Decodes a binary16 run into binary32 scratch storage.
 #[inline(always)]
@@ -57,14 +39,14 @@ pub(super) fn decode_f32s(bytes: &[u8], decoded: &mut Vec<f32>) {
 
 /// Reads and scores one selected layer range.
 #[inline(always)]
-pub(in crate::vector) fn score_layer(
+pub(super) fn score_layer(
     query: &QuantizedQueryCtx,
     layer_idx: usize,
     layer: &QuantizedLayerReader,
     first_layer: Option<(&QuantizedLayerBatch, &mut Vec<f32>)>,
     known_block: Option<usize>,
     rows: Range<usize>,
-    selection: &Selection<'_>,
+    offsets: Option<&[usize]>,
     kernel_scores: &mut Vec<f32>,
     decoded_scales: &mut Vec<f32>,
     decoded_gammas: &mut Vec<f32>,
@@ -77,7 +59,7 @@ pub(in crate::vector) fn score_layer(
     let (pinned, residual_norms) =
         first_layer.map_or((None, None), |(batch, norms)| (Some(batch), Some(norms)));
     let metric = query.index.meta.field().metric();
-    let selected_count = selection.len(&rows);
+    let selected_count = offsets.map_or(rows.len(), <[usize]>::len);
     if selected_count == 0 {
         unreachable!("empty selections are skipped before scoring");
     }
@@ -89,7 +71,7 @@ pub(in crate::vector) fn score_layer(
         decoded_constants.resize(selected_count, 0.0);
     }
 
-    if matches!(selection, Selection::All) {
+    if offsets.is_none() {
         let first_row = rows.start;
         let owned_batch;
         let batch = match pinned {
@@ -137,7 +119,7 @@ pub(in crate::vector) fn score_layer(
         return Ok(selected_count);
     }
 
-    let Selection::Rows(offsets) = selection else {
+    let Some(offsets) = offsets else {
         unreachable!("empty selections are skipped before scoring");
     };
     if let Some(batch) = pinned {
@@ -239,11 +221,12 @@ pub(in crate::vector) fn score_layer(
     Ok(selected_count)
 }
 
-pub(in crate::vector) fn candidate_selection<'a>(
+/// Writes `candidate_rows` as offsets into `available_rows` and returns them.
+pub(super) fn candidate_offsets<'a>(
     candidate_rows: &[usize],
     available_rows: &Range<usize>,
     offsets: &'a mut Vec<usize>,
-) -> Selection<'a> {
+) -> &'a [usize] {
     debug_assert!(!candidate_rows.is_empty());
     debug_assert!(candidate_rows.windows(2).all(|pair| pair[0] < pair[1]));
     debug_assert!(candidate_rows
@@ -251,5 +234,5 @@ pub(in crate::vector) fn candidate_selection<'a>(
         .all(|row| available_rows.contains(row)));
     offsets.clear();
     offsets.extend(candidate_rows.iter().map(|&row| row - available_rows.start));
-    Selection::Rows(offsets)
+    offsets
 }

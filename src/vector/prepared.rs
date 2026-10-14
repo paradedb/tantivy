@@ -1,25 +1,16 @@
-//! Per-query precomputation hoisted out of the per-doc scoring loop.
+//! The query, prepared once per search, and the quantized query context built from it for each
+//! segment encoding.
 //!
-//! Built once per [`VectorBackend::for_segment`] and held by the backend.
-//! Hides the metric match and any metric-specific precomputed scalars
-//! (currently only `1/||q||` for cosine) behind
-//! [`PreparedQuery::score_doc_bytes`].
-//!
-//! Stored vectors — including IVF centroids — are unit-normalized at
-//! write time for `Cosine + F32` (see
-//! [`maybe_normalize_bytes`](super::distance::maybe_normalize_bytes)),
-//! so a single scoring entry point covers both per-doc and centroid
-//! scans.
-//!
-//! [`VectorBackend::for_segment`]: super::backend::VectorBackend::for_segment
-//! Prepared exact and quantized query state.
+//! Stored vectors, IVF centroids included, are unit-normalized at write time for `Cosine + F32`
+//! (see [`maybe_normalize_bytes`](super::distance::maybe_normalize_bytes)), so one exact scoring
+//! entry point covers documents and centroids.
 
 use std::sync::Arc;
 
 use cascade::{prepare_split_query_with_plan, LayerSpec, PreparedSplitQuery, QueryRotationPlan};
 use quant_model::Grid;
 
-use super::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide};
+use super::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide, Similarity};
 use super::metadata::VectorColMetadata;
 #[cfg(test)]
 use super::quantization::VectorQuantizationConfig;
@@ -28,25 +19,88 @@ use super::VectorElement;
 use crate::schema::Metric;
 use crate::TantivyError;
 
-/// Metric-specific prepared vector query.
-pub struct PreparedQuery<T: VectorElement> {
-    query: Arc<Vec<T>>,
+// --- Query ---
+
+/// The query, prepared once per search: its values, widened to `f32`, and its norm.
+pub(crate) struct VectorQuery<T: VectorElement> {
+    metric: Metric,
+    raw: Arc<Vec<T>>,
+    /// The values widened losslessly to `f32`: what routers rank with.
+    widened: Arc<[f32]>,
+    /// `||q||`, for the dot margin's Cauchy-Schwarz term.
+    norm: f32,
     kind: QueryKind,
 }
 
-/// Metric-specific per-query state. Each variant carries only what
-/// that metric actually needs — no dead fields for L2 / Dot.
 /// Metric-specific per-query state.
 enum QueryKind {
     L2,
     Dot,
     Cosine {
-        /// `1.0 / ||q||`. `0.0` for a zero / non-finite query norm so a
-        /// degenerate query scores `0.0` against every doc.
-        /// Reciprocal query norm, or zero for a degenerate query.
+        /// Reciprocal query norm, or zero for a degenerate query, which then scores zero.
         inv_norm_q: f32,
     },
 }
+
+/// The query as one vector set scores it: the query plus that set's quantization, if any.
+#[derive(Clone, Copy)]
+pub(crate) struct ScoringQuery<'q, T: VectorElement> {
+    pub(crate) query: &'q VectorQuery<T>,
+    pub(crate) quantized: Option<&'q QuantizedQueryCtx>,
+}
+
+impl<T: VectorElement> VectorQuery<T> {
+    /// Prepares `raw` under `metric`.
+    pub(crate) fn new(metric: Metric, raw: Arc<Vec<T>>) -> Self {
+        // Wide accumulation keeps a huge but finite norm finite. Queries are user input, so the
+        // degenerate guard stays.
+        let norm = norm_squared_wide::<T>(&raw).sqrt();
+        let kind = match metric {
+            Metric::L2 => QueryKind::L2,
+            Metric::Dot => QueryKind::Dot,
+            Metric::Cosine => QueryKind::Cosine {
+                inv_norm_q: if norm == 0.0 || !norm.is_finite() {
+                    0.0
+                } else {
+                    (1.0 / norm) as f32
+                },
+            },
+        };
+        Self {
+            metric,
+            widened: raw.iter().map(|element| element.to_f32()).collect(),
+            norm: norm as f32,
+            kind,
+            raw,
+        }
+    }
+
+    /// Similarity to one stored row under the metric.
+    #[inline]
+    pub(crate) fn score_row(&self, row: &[u8]) -> Similarity {
+        Similarity::new(match self.kind {
+            QueryKind::L2 => -l2_squared_bytes::<T>(&self.raw, row),
+            QueryKind::Dot => dot_bytes::<T>(&self.raw, row),
+            QueryKind::Cosine { inv_norm_q } => dot_bytes::<T>(&self.raw, row) * inv_norm_q,
+        })
+    }
+
+    /// The values widened to `f32`: what routers rank with.
+    pub(crate) fn widened(&self) -> &[f32] {
+        &self.widened
+    }
+
+    /// `||q||`, for the dot margin's Cauchy-Schwarz term.
+    pub(crate) fn norm(&self) -> f32 {
+        self.norm
+    }
+
+    pub(crate) fn metric(&self) -> Metric {
+        self.metric
+    }
+}
+
+// --- Quantized estimates ---
 
 /// Immutable quantization state for one segment's field, built when the
 /// segment's vector reader opens.
@@ -245,56 +299,49 @@ impl QuantizedIndexCtx {
     }
 }
 
-/// A vector query as seen by one segment.
-pub(crate) struct VectorQuery<T: VectorElement> {
-    /// Full-precision coordinates, always kept for exact scoring and rerank.
-    pub(crate) raw: Arc<Vec<T>>,
-    /// Quantized scan state; `None` when the segment is not quantized or
-    /// quantized scanning is disabled.
-    pub(crate) quantized: Option<Arc<QuantizedQueryCtx>>,
-}
-
-impl<T: VectorElement> VectorQuery<T> {
-    pub(crate) fn new(raw: Arc<Vec<T>>, quantized: Option<Arc<QuantizedQueryCtx>>) -> Self {
-        Self { raw, quantized }
-    }
-}
+// --- Quantized query ---
 
 /// Immutable query rotations, sign bitplanes, and LUTs shared across segments.
 pub(crate) struct QuantizedQueryCtx {
     pub(crate) index: Arc<QuantizedIndexCtx>,
     prepared: PreparedSplitQuery,
-    query: Vec<f32>,
+    /// The query scaled to unit norm, under cosine only: what cosine estimates score with.
+    normalized: Option<Vec<f32>>,
     query_norm_sq: f32,
     active_layers: usize,
 }
 
 impl QuantizedQueryCtx {
-    pub(crate) fn new(index: Arc<QuantizedIndexCtx>, query: Vec<f32>) -> Self {
+    /// Prepares `query` for every layer of `index`'s encoding.
+    pub(crate) fn new<T: VectorElement>(
+        index: Arc<QuantizedIndexCtx>,
+        query: &VectorQuery<T>,
+    ) -> Self {
         let active_layers = index.specs.len();
         Self::with_depth(index, query, active_layers)
     }
 
-    pub(crate) fn with_depth(
+    /// Prepares `query` for the first `active_layers` layers of `index`'s encoding.
+    pub(crate) fn with_depth<T: VectorElement>(
         index: Arc<QuantizedIndexCtx>,
-        mut query: Vec<f32>,
+        query: &VectorQuery<T>,
         active_layers: usize,
     ) -> Self {
         assert!((1..=index.specs.len()).contains(&active_layers));
-        if index.meta.field().metric == Metric::Cosine {
-            let norm = norm_squared_wide(&query).sqrt();
+        let normalized = (index.meta.field().metric == Metric::Cosine).then(|| {
+            let widened = query.widened();
+            let norm = norm_squared_wide(widened).sqrt();
             if norm != 0.0 && norm.is_finite() {
                 let inv = (1.0 / norm) as f32;
-                for value in &mut query {
-                    *value *= inv;
-                }
+                widened.iter().map(|value| value * inv).collect()
             } else {
-                query.fill(0.0);
+                vec![0.0; widened.len()]
             }
-        }
-        let query_norm_sq = norm_squared_wide(&query) as f32;
+        });
+        let vector = normalized.as_deref().unwrap_or(query.widened());
+        let query_norm_sq = norm_squared_wide(vector) as f32;
         let prepared = prepare_split_query_with_plan(
-            &query,
+            vector,
             &index.rotation_plan,
             &index.grids[..active_layers],
             SIGN_QUERY_BITS,
@@ -302,7 +349,7 @@ impl QuantizedQueryCtx {
         Self {
             index,
             prepared,
-            query,
+            normalized,
             query_norm_sq,
             active_layers,
         }
@@ -390,67 +437,23 @@ impl QuantizedQueryCtx {
         );
     }
 
-    /// Returns the query-vector norm used by the layer error model.
-    pub(crate) fn score_query_norm(&self, routing_score: f32) -> f32 {
+    /// The norm the layer error model scales by: the query-to-centroid distance under L2, otherwise
+    /// the norm of the vector the estimates score with.
+    pub(crate) fn score_query_norm(&self, centroid_score: f32) -> f32 {
         if self.index.meta.field().metric == Metric::L2 {
-            (-routing_score).max(0.0).sqrt()
+            (-centroid_score).max(0.0).sqrt()
         } else {
             self.query_norm_sq.sqrt()
         }
     }
 
-    pub(crate) fn query(&self) -> &[f32] {
-        &self.query
-    }
-}
-
-impl<T: VectorElement> PreparedQuery<T> {
-    /// Prepares a query for one metric.
-    pub fn new(metric: Metric, query: Arc<Vec<T>>) -> Self {
-        let kind = match metric {
-            Metric::L2 => QueryKind::L2,
-            Metric::Dot => QueryKind::Dot,
-            Metric::Cosine => {
-                // Wide accumulation, so a huge-but-finite query norm stays
-                // finite. The degenerate guard remains load-bearing: queries
-                // are user input at search time, not ingest-validated.
-                let nq = norm_squared_wide::<T>(&query).sqrt();
-                let inv_norm_q = if nq == 0.0 || !nq.is_finite() {
-                    0.0
-                } else {
-                    (1.0 / nq) as f32
-                };
-                QueryKind::Cosine { inv_norm_q }
-            }
-        };
-        Self { query, kind }
-    }
-
-    /// Returns the query metric.
-    pub fn metric(&self) -> Metric {
-        match self.kind {
-            QueryKind::L2 => Metric::L2,
-            QueryKind::Dot => Metric::Dot,
-            QueryKind::Cosine { .. } => Metric::Cosine,
-        }
-    }
-
-    /// Returns the query coordinates.
-    pub fn query(&self) -> &[T] {
-        &self.query
-    }
-
-    /// Score a stored vector — either a document or an IVF centroid.
-    /// Both are unit-normalized at write time for `Cosine + F32`, so
-    /// the cosine branch collapses to `dot * inv_norm_q`.
-    /// Scores a stored vector row.
-    #[inline]
-    pub fn score_doc_bytes(&self, doc_bytes: &[u8]) -> f32 {
-        match self.kind {
-            QueryKind::L2 => -l2_squared_bytes::<T>(&self.query, doc_bytes),
-            QueryKind::Dot => dot_bytes::<T>(&self.query, doc_bytes),
-            QueryKind::Cosine { inv_norm_q } => dot_bytes::<T>(&self.query, doc_bytes) * inv_norm_q,
-        }
+    /// The vector the estimates score with: the normalized query under cosine, otherwise
+    /// `query`'s widened values. `query` is the query this context was prepared from.
+    pub(crate) fn estimate_vector<'q, T: VectorElement>(
+        &'q self,
+        query: &'q VectorQuery<T>,
+    ) -> &'q [f32] {
+        self.normalized.as_deref().unwrap_or(query.widened())
     }
 }
 
@@ -458,7 +461,7 @@ impl<T: VectorElement> PreparedQuery<T> {
 mod tests {
     use std::sync::Arc;
 
-    use super::{QuantizedIndexCtx, QuantizedQueryCtx};
+    use super::{QuantizedIndexCtx, QuantizedQueryCtx, VectorQuery};
     use crate::schema::{Metric, VectorOptions};
     use crate::vector::{VectorQuantizationConfig, VectorQuantizationLayer};
 
@@ -474,7 +477,10 @@ mod tests {
         )
         .unwrap();
         let first_index = Arc::new(QuantizedIndexCtx::from_config(config.clone()).unwrap());
-        let query = QuantizedQueryCtx::new(Arc::clone(&first_index), vec![0.5_f32; 100]);
+        let query = QuantizedQueryCtx::new(
+            Arc::clone(&first_index),
+            &VectorQuery::new(Metric::Dot, Arc::new(vec![0.5_f32; 100])),
+        );
         assert!(Arc::ptr_eq(&query.index.meta, &first_index.meta));
 
         let other_segment = Arc::new(QuantizedIndexCtx::from_config(config.clone()).unwrap());
@@ -526,7 +532,10 @@ mod tests {
             &index.grids,
             4,
         );
-        let query = QuantizedQueryCtx::new(index, query_values);
+        let query = QuantizedQueryCtx::new(
+            index,
+            &VectorQuery::new(Metric::Dot, Arc::new(query_values)),
+        );
 
         assert_eq!(
             query.query_error_squared(0).to_bits(),
