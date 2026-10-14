@@ -15,9 +15,9 @@ use crate::TantivyError;
 pub const DEFAULT_MAX_LEAF_SIZE: usize = 200;
 /// Default [`SuperKMeansClusterer::with_training_sample_ratio`].
 pub const DEFAULT_TRAINING_SAMPLE_RATIO: f64 = 0.32;
-const ASSIGN_BATCH_SIZE: usize = 40_960;
-/// Rows per training scan batch; SuperKMeans packs batches into GEMM-sized work.
+
 const TRAINING_BATCH_SIZE: usize = 4_096;
+const ASSIGN_BATCH_SIZE: usize = 40_960;
 
 /// Replays a [`TrainingSource`] as a SuperKMeans [`Dataset`].
 struct SourceDataset<'a>(&'a mut dyn TrainingSource);
@@ -307,9 +307,8 @@ mod tests {
     #[test]
     fn settings_default_and_set_independently() {
         let clusterer = SuperKMeansClusterer::default();
-        let settings = clusterer.merge_settings(10_000).unwrap();
-        assert_eq!(settings.training_sample_ratio, 0.32);
-        assert_eq!(settings.assign_batch_size, ASSIGN_BATCH_SIZE);
+        assert_eq!(clusterer.training_sample_ratio(), 0.32);
+        assert_eq!(clusterer.assign_batch_size(), ASSIGN_BATCH_SIZE);
         assert_eq!(clusterer.config.max_leaf_size, DEFAULT_MAX_LEAF_SIZE);
 
         let clusterer = clusterer
@@ -318,10 +317,7 @@ mod tests {
         assert_eq!(clusterer.training_sample_ratio(), 0.25);
         assert_eq!(clusterer.config.max_leaf_size, 20);
         let clusterer = clusterer.with_training_sample_ratio(1.0);
-        assert_eq!(
-            clusterer.merge_settings(100).unwrap().training_sample_ratio,
-            1.0
-        );
+        assert_eq!(clusterer.training_sample_ratio(), 1.0);
         assert_eq!(clusterer.config.max_leaf_size, 20);
     }
 }

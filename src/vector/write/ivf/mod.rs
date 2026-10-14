@@ -109,7 +109,6 @@ pub(crate) fn merge_ivf(
         return Ok(());
     }
 
-    let settings = clusterer.merge_settings(num_target_docs as usize)?;
     let directory = ctx.target_segment.index().directory();
     let vec_path = ctx
         .target_segment
@@ -168,14 +167,8 @@ pub(crate) fn merge_ivf(
         match opts.dtype() {
             VectorDType::F32 => {
                 let mut timings = IvfBuildTimings::default();
-                let Some(trained) = train::train(
-                    &merge,
-                    clusterer,
-                    &settings,
-                    &source_rows,
-                    vector_count,
-                    &mut timings,
-                )?
+                let Some(trained) =
+                    train::train(&merge, clusterer, &source_rows, vector_count, &mut timings)?
                 else {
                     // Every vector-bearing doc was deleted. Write the same empty slots as the
                     // no-vectors path: the reader errors on slots missing from composites the
@@ -191,7 +184,6 @@ pub(crate) fn merge_ivf(
                 let mut assigned_vectors = assign::assign(
                     &merge,
                     clusterer,
-                    &settings,
                     source_rows,
                     &centroids,
                     vector_count,

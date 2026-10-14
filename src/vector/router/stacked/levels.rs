@@ -210,6 +210,7 @@ impl LevelClusterer for SuperKMeansLevelClusterer {
             max_leaf_size,
             iters_meso: iters,
             iters_fine: iters,
+            memory_limit: None,
         };
         let mut kmeans = HierarchicalSuperKMeans::with_config(dim, cfg);
         let centroids = kmeans.train(data, n);

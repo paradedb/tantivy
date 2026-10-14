@@ -11,7 +11,7 @@ use crate::schema::{
     STRING,
 };
 use crate::vector::clustering::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, TrainingSource,
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfVectors, TrainingSource,
 };
 use crate::vector::params::{LocatedPath, ProbeParams};
 use crate::vector::RouterKind;
@@ -189,13 +189,6 @@ pub(crate) struct Grid2DClusterer {
 impl IvfClusterer for Grid2DClusterer {
     fn training_sample_ratio(&self) -> f32 {
         1.0
-    }
-
-    fn merge_settings(&self, _total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
-        Ok(IvfMergeSettings {
-            training_sample_ratio: self.training_sample_ratio(),
-            assign_batch_size: self.assign_batch_size(),
-        })
     }
 
     fn train(
@@ -979,8 +972,7 @@ mod bounds_storage_tests {
     use crate::query::AllQuery;
     use crate::schema::{Metric, Schema, VectorDType, VectorOptions, STORED, STRING};
     use crate::vector::clustering::{
-        IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
-        TrainingSource,
+        IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors, TrainingSource,
     };
     use crate::vector::diagnostics::VectorStorageFormat;
     use crate::vector::router::stacked::levels::{InMemoryStore, StackedIvf, StackedIvfConfig};
@@ -1080,12 +1072,6 @@ mod bounds_storage_tests {
     impl IvfClusterer for TestClusterer {
         fn training_sample_ratio(&self) -> f32 {
             1.0
-        }
-        fn merge_settings(&self, _total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
-            Ok(IvfMergeSettings {
-                training_sample_ratio: self.training_sample_ratio(),
-                assign_batch_size: self.assign_batch_size(),
-            })
         }
         fn train(
             &self,

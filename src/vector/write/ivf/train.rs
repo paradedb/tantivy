@@ -8,8 +8,8 @@ use super::{FieldMerge, IvfBuildTimings};
 use crate::indexer::segment_updater::CancelSentinel;
 use crate::schema::VectorOptions;
 use crate::vector::clustering::{
-    decode_row_append, IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings,
-    IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, TrainingSource,
+    decode_row_append, IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfTrainingBatch,
+    IvfTrainingVectors, IvfVectorBatch, IvfVectors, TrainingSource,
 };
 use crate::vector::router::{BuiltRouter, RouterKind};
 use crate::vector::storage::reader::VectorIndexReader;
@@ -29,14 +29,13 @@ pub(super) struct Trained {
 pub(super) fn train(
     merge: &FieldMerge,
     clusterer: &dyn IvfClusterer,
-    settings: &IvfMergeSettings,
     source_rows: &[Option<RowAddress>],
     vector_count: usize,
     timings: &mut IvfBuildTimings,
 ) -> crate::Result<Option<Trained>> {
     let opts = merge.opts;
     let training_sample_size = {
-        let ratio = f64::from(settings.training_sample_ratio).clamp(f64::MIN_POSITIVE, 1.0);
+        let ratio = f64::from(clusterer.training_sample_ratio()).clamp(f64::MIN_POSITIVE, 1.0);
         let target = ((vector_count as f64) * ratio).ceil() as usize;
         target.clamp(1, vector_count)
     };

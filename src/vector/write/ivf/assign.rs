@@ -6,8 +6,7 @@ use itertools::Itertools;
 
 use super::{AssignedVector, FieldMerge, IvfBuildTimings};
 use crate::vector::clustering::{
-    decode_row_append, IvfCentroids, IvfClusterer, IvfMatrixView, IvfMergeSettings, IvfVectorBatch,
-    IvfVectors,
+    decode_row_append, IvfCentroids, IvfClusterer, IvfMatrixView, IvfVectorBatch, IvfVectors,
 };
 use crate::vector::write::RowAddress;
 use crate::{DocId, TantivyError};
@@ -17,7 +16,6 @@ use crate::{DocId, TantivyError};
 pub(super) fn assign(
     merge: &FieldMerge,
     clusterer: &dyn IvfClusterer,
-    settings: &IvfMergeSettings,
     source_rows: Vec<Option<RowAddress>>,
     centroids: &IvfCentroids,
     vector_count: usize,
@@ -37,10 +35,11 @@ pub(super) fn assign(
         .sorted()
         .collect();
 
-    let batch_capacity = settings.assign_batch_size.min(assign_sources.len());
+    let assign_batch_size = clusterer.assign_batch_size().max(1);
+    let batch_capacity = assign_batch_size.min(assign_sources.len());
     let mut batch_values = Vec::with_capacity(batch_capacity * dim);
     let mut batch_doc_ids = Vec::with_capacity(batch_capacity);
-    for batch in assign_sources.chunks(settings.assign_batch_size) {
+    for batch in assign_sources.chunks(assign_batch_size) {
         if merge.ctx.cancel.wants_cancel() {
             return Err(TantivyError::Cancelled);
         }

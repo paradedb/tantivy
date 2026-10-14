@@ -28,28 +28,9 @@ pub trait IvfClusterer: Send + Sync + 'static {
         centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>>;
 
+    /// Rows per assign batch during merge.
     fn assign_batch_size(&self) -> usize {
         2048
-    }
-
-    fn merge_settings(&self, _total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
-        let training_sample_ratio = self.training_sample_ratio();
-        let assign_batch_size = self.assign_batch_size();
-
-        assert!(
-            training_sample_ratio > 0.0 && training_sample_ratio <= 1.0,
-            "IvfClusterer training_sample_ratio must be greater than 0 and less than or equal to \
-             1, got {training_sample_ratio}"
-        );
-        assert!(
-            assign_batch_size > 0,
-            "IvfClusterer assign_batch_size must be greater than 0, got {assign_batch_size}"
-        );
-
-        Ok(IvfMergeSettings {
-            training_sample_ratio,
-            assign_batch_size,
-        })
     }
 }
 
@@ -74,14 +55,6 @@ pub trait TrainingSource {
 
     /// Loads the rows at the given scan positions, in the given order.
     fn read_rows(&mut self, rows: &[u32]) -> crate::Result<IvfTrainingVectors>;
-}
-
-#[derive(Clone, Copy, Debug)]
-/// Merge-time IVF sizes.
-pub struct IvfMergeSettings {
-    /// Fraction of vectors sampled for training, in `(0, 1]`.
-    pub training_sample_ratio: f32,
-    pub assign_batch_size: usize,
 }
 
 #[derive(Clone, Debug)]
