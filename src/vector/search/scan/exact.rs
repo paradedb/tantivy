@@ -76,12 +76,11 @@ where
         selected: &ClusterRows<'_>,
         scratch: &mut ReadScratch,
     ) -> crate::Result<usize> {
-        self.score_rows(selected, scratch, false)
+        self.score_rows(selected, scratch)
     }
 
     /// Scores the exact phase's survivors in `selected`, reading through `scratch`; returns the
-    /// rows scored. Without doc ids in hand, the cluster's DocIds column is read up front with the
-    /// rows.
+    /// rows scored.
     pub(super) fn score_survivors(
         &mut self,
         selected: &ClusterRows<'_>,
@@ -89,25 +88,18 @@ where
     ) -> crate::Result<usize> {
         #[cfg(test)]
         self.exact_phase_rows.extend(selected.global_rows());
-        self.score_rows(selected, scratch, selected.docs.is_none())
+        self.score(selected, scratch)
     }
 
-    /// Reads `selected`'s rows in `ExactFetch`, with the DocIds column first when `docs_first`, and
-    /// scores them in `ExactScore`.
+    /// Reads `selected`'s rows in `ExactFetch` and scores them in `ExactScore`.
     fn score_rows(
         &mut self,
         selected: &ClusterRows<'_>,
         scratch: &mut ReadScratch,
-        docs_first: bool,
     ) -> crate::Result<usize> {
         let mut column_read = false;
         let rows = {
             let _fetch = enter_vector_stage(VectorStage::ExactFetch);
-            if docs_first {
-                self.reader
-                    .read_doc_ids(selected.cluster, &mut self.cluster_docs)?;
-                column_read = true;
-            }
             self.read(selected, scratch)?
         };
         let _score = enter_vector_stage(VectorStage::ExactScore);
@@ -168,6 +160,7 @@ where
             Some(docs) => docs[position],
             None => {
                 if !*column_read {
+                    let _fetch = enter_vector_stage(VectorStage::ExactFetch);
                     self.reader
                         .read_doc_ids(selected.cluster, &mut self.cluster_docs)?;
                     *column_read = true;
