@@ -6,12 +6,15 @@ use crate::collector::{Count, TopDocs};
 use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
 use crate::query::{AllQuery, TermQuery};
-use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, STRING};
-use crate::vector::params::{LocatedPath, ProbeParams};
-use crate::vector::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
-    Metric, RouterKind, VectorDType, VectorOptions,
+use crate::schema::{
+    Field, FieldType, IndexRecordOption, Metric, Schema, Term, VectorDType, VectorOptions, STORED,
+    STRING,
 };
+use crate::vector::clustering::{
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
+};
+use crate::vector::params::{LocatedPath, ProbeParams};
+use crate::vector::RouterKind;
 use crate::{DocAddress, Index, Score, TantivyDocument};
 
 const EMBEDDING_FIELD_NAME: &str = "embedding";
@@ -23,7 +26,7 @@ const DOCS_PER_SEGMENT: usize = 10;
 // descriptor enum. Selected via the index settings (clustering threshold +
 // clusterer); the resulting segment is self-describing through its `.vec`
 // `IdMap`, so this is purely a build knob here.
-pub(crate) use crate::vector::VectorStorageFormat;
+pub(crate) use crate::vector::diagnostics::VectorStorageFormat;
 
 pub(crate) struct TestVectorIndex {
     pub(crate) index: Index,
@@ -738,9 +741,8 @@ pub(crate) mod ground_truth {
     use std::cmp::Ordering;
     use std::sync::Arc;
 
-    use crate::schema::Field;
+    use crate::schema::{Field, Metric};
     use crate::vector::search::prepared::VectorQuery;
-    use crate::vector::Metric;
     use crate::{DocAddress, Index, Score};
 
     pub(crate) fn top_k(
@@ -975,14 +977,17 @@ mod bounds_storage_tests {
     use crate::index::{IndexSettings, SegmentComponent};
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
-    use crate::schema::{Schema, STORED, STRING};
+    use crate::schema::{Metric, Schema, VectorDType, VectorOptions, STORED, STRING};
+    use crate::vector::clustering::{
+        IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
+    };
+    use crate::vector::diagnostics::VectorStorageFormat;
+    use crate::vector::router::stacked::levels::{InMemoryStore, StackedIvf, StackedIvfConfig};
+    use crate::vector::router::RoutingParams;
+    use crate::vector::storage::bounds::{residual_norm, BoundKind};
     use crate::vector::storage::centroids::ClusterIndex;
     use crate::vector::storage::header::CENTROIDS_EXT;
-    use crate::vector::{
-        residual_norm, BoundKind, InMemoryStore, IvfCentroids, IvfClusterer, IvfMatrix,
-        IvfMergeSettings, IvfTrainingVectors, IvfVectors, Metric, RouterKind, RoutingParams,
-        StackedIvf, StackedIvfConfig, VectorDType, VectorOptions, VectorStorageFormat,
-    };
+    use crate::vector::RouterKind;
     use crate::{Index, IndexWriter, TantivyDocument};
 
     /// Recompute one segment's expected fold from its stored artifacts:

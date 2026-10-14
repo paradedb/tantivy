@@ -11,7 +11,8 @@ use crate::vector::search::scan::bound::KthBound;
 use crate::vector::search::scan::heap::{tie_break_key, TieBreakHeap, TieBreakHits};
 use crate::vector::storage::quantized::ReadScratch;
 use crate::vector::storage::reader::{VectorIndexReader, VectorRowBatch};
-use crate::vector::{enter_vector_stage, VectorElement, VectorStage};
+use crate::vector::telemetry::enter_vector_stage;
+use crate::vector::{VectorElement, VectorStage};
 use crate::{DocAddress, DocId, SegmentOrdinal};
 
 /// Full-precision rows of one cluster's selection.

@@ -17,11 +17,11 @@ use crate::vector::{VectorIoStats, VectorStage};
 
 /// One quantized layer's instrumentation.
 #[derive(Debug, Default)]
-pub struct LayerProbeStats {
+pub(crate) struct LayerProbeStats {
     /// Owned-word decoding fallbacks in sign-plane scoring.
-    pub sign_word_fallbacks: u64,
+    pub(crate) sign_word_fallbacks: u64,
     /// Reads charged to the layer's scan.
-    pub io: VectorIoStats,
+    pub(crate) io: VectorIoStats,
     scan_ns: u64,
     boundary_ns: u64,
     scored: usize,
@@ -32,55 +32,57 @@ pub struct LayerProbeStats {
     exact_rows: usize,
 }
 
+#[cfg(test)]
 impl LayerProbeStats {
     /// Nanoseconds scanning the layer.
-    pub fn scan_ns(&self) -> u64 {
+    pub(crate) fn scan_ns(&self) -> u64 {
         self.scan_ns
     }
 
     /// Nanoseconds in the layer's boundary.
-    pub fn boundary_ns(&self) -> u64 {
+    pub(crate) fn boundary_ns(&self) -> u64 {
         self.boundary_ns
     }
 
     /// Candidates the layer scored.
-    pub fn scored(&self) -> usize {
+    pub(crate) fn scored(&self) -> usize {
         self.scored
     }
 
     /// Candidates left after the layer's boundary.
-    pub fn survivors(&self) -> usize {
+    pub(crate) fn survivors(&self) -> usize {
         self.survivors
     }
 
     /// Clusters read sparsely at this layer.
-    pub fn sparse_clusters(&self) -> usize {
+    pub(crate) fn sparse_clusters(&self) -> usize {
         self.sparse_clusters
     }
 
     /// Clusters read as a whole band at this layer.
-    pub fn full_clusters(&self) -> usize {
+    pub(crate) fn full_clusters(&self) -> usize {
         self.full_clusters
     }
 
     /// Clusters scored exactly, and finished, at this layer.
-    pub fn exact_clusters(&self) -> usize {
+    pub(crate) fn exact_clusters(&self) -> usize {
         self.exact_clusters
     }
 
     /// Rows scored exactly, and finished, at this layer.
-    pub fn exact_rows(&self) -> usize {
+    pub(crate) fn exact_rows(&self) -> usize {
         self.exact_rows
     }
 }
 
 /// Per-layer instrumentation, flattened on the wire as `layer{i}_*` and `boundary{i}_ns`.
 #[derive(Debug, Default)]
-pub struct LayerProbeStatsSet(Vec<LayerProbeStats>);
+pub(crate) struct LayerProbeStatsSet(Vec<LayerProbeStats>);
 
+#[cfg(test)]
 impl LayerProbeStatsSet {
     /// Layer `layer`'s stats, when the scan reached it.
-    pub fn get(&self, layer: usize) -> Option<&LayerProbeStats> {
+    pub(crate) fn get(&self, layer: usize) -> Option<&LayerProbeStats> {
         self.0.get(layer)
     }
 }
@@ -151,7 +153,7 @@ where S: serde::Serializer {
 
 /// Where a segment's layer-0 clusters came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, serde::Serialize)]
-pub enum AccessPath {
+pub(crate) enum AccessPath {
     /// The router's ranking, gated by the filter bitset.
     #[default]
     Routed,
@@ -177,7 +179,7 @@ pub struct ProbeStats {
     /// The segment's located-path cap in matches; 0 with the located path off.
     pub located_cap: usize,
     /// Where this segment's layer-0 clusters came from.
-    pub access_path: AccessPath,
+    pub(crate) access_path: AccessPath,
     /// Live filter matches with a vector, on the located path.
     pub located_matches: usize,
     /// Live filter matches without a vector, on the located path.
@@ -196,7 +198,7 @@ pub struct ProbeStats {
     pub centroid_io: VectorIoStats,
     /// Per-layer counters of a quantized scan.
     #[serde(flatten)]
-    pub layers: LayerProbeStatsSet,
+    pub(crate) layers: LayerProbeStatsSet,
     #[cfg(test)]
     #[serde(skip)]
     pub(crate) quantized_trace: ScanTrace,

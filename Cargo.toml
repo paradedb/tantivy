@@ -284,6 +284,7 @@ harness = false
 [[bench]]
 name = "distance"
 harness = false
+required-features = ["unstable"]
 
 [[bench]]
 name = "vector_quantization_writer"
@@ -297,3 +298,4 @@ required-features = ["unstable"]
 [[bench]]
 name = "ivf_recall"
 harness = false
+required-features = ["unstable"]

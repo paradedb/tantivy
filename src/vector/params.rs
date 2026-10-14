@@ -1,44 +1,13 @@
-use crate::vector::search::source::controller::{open_share, DEFAULT_FIXED_PROBE_COST_ROWS};
+//! Query-time probe parameters: the work budget, the located path and the recall targets.
 
-/// Global work-unit statistics, computed once at query init across the
-/// index's IVF segments: `n_avg = N / C`, native docs over clusters.
-/// When absent, budgeting falls back to the segment's own ratio.
-#[derive(Clone, Copy, Debug)]
-pub struct WorkModel {
-    /// Native docs per cluster (as written; see `for_searcher` on
-    /// deletions), index-wide over IVF segments.
-    pub n_avg: f64,
-}
+use crate::vector::search::source::controller::open_share;
 
-impl WorkModel {
-    /// Compute `n_avg` for `field` across `searcher`'s IVF segments.
-    ///
-    /// * `searcher` (`&Searcher`) — the searcher whose segments are scanned.
-    /// * `field` (`Field`) — the vector field to meter.
-    ///
-    /// Returns (`crate::Result<Option<WorkModel>>`): the primed model, or
-    /// `None` when the index holds no IVF segment (an all-flat index has no
-    /// clusters to meter).
-    pub fn for_searcher(
-        searcher: &crate::Searcher,
-        field: crate::schema::Field,
-    ) -> crate::Result<Option<WorkModel>> {
-        let (mut n_native, mut clusters) = (0u64, 0u64);
-        for segment_reader in searcher.segment_readers() {
-            let vec_reader = segment_reader.vector_index(field)?;
-            if let Some(ivf) = vec_reader.index() {
-                // Native docs as WRITTEN: dead rows charge nothing (alive pre-pass), so
-                // deletes only ever cheapen a scan. As-written counts are stable and free;
-                // merges purge deletions and shrink N and C together.
-                n_native += ivf.num_docs() as u64;
-                clusters += ivf.num_clusters() as u64;
-            }
-        }
-        Ok((clusters > 0).then(|| WorkModel {
-            n_avg: n_native as f64 / clusters as f64,
-        }))
-    }
-}
+/// Default [`ProbeParams::fixed_probe_cost_rows`]: the cost of opening a cluster, in rows of full
+/// work, fitted on the reference fixture.
+///
+/// Policy constant: the open share `x = cost / (cost + n_avg)` follows the index's granularity.
+/// It covers the open only; routing cost is not modeled.
+pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 
 /// Query-time probe budget for IVF vector search.
 ///
@@ -50,19 +19,14 @@ impl WorkModel {
 pub struct ProbeParams {
     /// Work ceiling as a fraction of each segment's capacity. Default 0.01.
     pub max_probe_fraction: f32,
-    /// Floor on the resolved budget, in work units, applied before the capacity cap. Default
-    /// [`MIN_PROBE_CLUSTERS`].
+    /// Floor on the resolved budget, in work units, applied before the capacity cap. Default 16.
     pub min_probe_clusters: usize,
-    /// Index-wide docs per cluster; `None` budgets each segment by its own ratio.
-    pub work_model: Option<WorkModel>,
     /// Recall target for the stacked router's ranking, in `(0, 1]`; `1.0` routes with the fixed
-    /// nprobe fractions. Forced to `1.0` above
-    /// [`APS_MAX_DIM`](crate::vector::router::stacked::aps::APS_MAX_DIM).
-    /// Default [`DEFAULT_ROUTER_RECALL`].
+    /// nprobe fractions. Forced to `1.0` above 128 dimensions. Default [`DEFAULT_ROUTER_RECALL`].
     pub router_recall_target: f32,
     /// Recall target for each segment's cluster scan, in `(0, 1]`, estimated by the Quake APS;
     /// `1.0` leaves the budget as the only bound. Stacked-router segments only; forced to `1.0`
-    /// above [`APS_MAX_DIM`](crate::vector::router::stacked::aps::APS_MAX_DIM). Default `1.0`.
+    /// above 128 dimensions. Default `1.0`.
     pub recall_target: f32,
     /// Lets a quantized segment score a cluster's rows exactly before the exact phase when that
     /// reads strictly fewer storage blocks (bytes without block geometry) than the cheaper
@@ -113,7 +77,6 @@ impl Default for ProbeParams {
         Self {
             max_probe_fraction: 0.01,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
-            work_model: None,
             router_recall_target: DEFAULT_ROUTER_RECALL,
             recall_target: 1.0,
             exact_plan: true,
@@ -185,10 +148,7 @@ impl ProbeParams {
                 "fixed_probe_cost_rows must be finite and greater than 0".to_string(),
             ));
         }
-        let n_avg = match self.work_model {
-            Some(model) => model.n_avg,
-            None => native_docs_in_segment as f64 / clusters_in_segment.max(1) as f64,
-        };
+        let n_avg = native_docs_in_segment as f64 / clusters_in_segment.max(1) as f64;
         // The unit identity (1 unit = x + (1 - x); exhaustive scan = C units) holds for any x.
         let x = open_share(self.fixed_probe_cost_rows, n_avg);
         let segment_units = clusters_in_segment as f64 * x
@@ -202,14 +162,14 @@ impl ProbeParams {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProbeParams, WorkModel};
+    use super::ProbeParams;
 
     /// Capacity is the cluster count, exactly, whatever the granularity:
     /// `units_seg = C*x + (1 - x)*N/n_avg == C` for every x the open
     /// share can resolve to. That identity is what lets `f` keep meaning
     /// "this fraction of the index's work" at any granularity.
     #[test]
-    fn unprimed_capacity_is_the_cluster_count() -> crate::Result<()> {
+    fn capacity_is_the_cluster_count() -> crate::Result<()> {
         let all = ProbeParams {
             max_probe_fraction: 1.0,
             min_probe_clusters: 1,
@@ -253,32 +213,6 @@ mod tests {
         };
         let (budget, _, _) = all.resolved_work_budget(10, 200)?;
         assert!((budget - 10.0).abs() < 1e-6, "{budget}");
-        Ok(())
-    }
-
-    /// A primed model allocates across segments by where the WORK is: two
-    /// segments of equal cluster count but unequal size get budgets in
-    /// proportion to their rows, and the two together sum to `f*C`.
-    #[test]
-    fn primed_model_allocates_by_work() -> crate::Result<()> {
-        // 8 clusters each; one holds 800 docs, the other 200. Index-wide
-        // n_avg = 1000/16 = 62.5.
-        let params = ProbeParams {
-            max_probe_fraction: 0.5,
-            min_probe_clusters: 1,
-            work_model: Some(WorkModel { n_avg: 62.5 }),
-            ..Default::default()
-        };
-        let (big, _, _) = params.resolved_work_budget(8, 800)?;
-        let (small, _, _) = params.resolved_work_budget(8, 200)?;
-        assert!(
-            big > small,
-            "the fuller segment gets more: {big} vs {small}"
-        );
-        assert!(
-            (big + small - 0.5 * 16.0).abs() < 1e-6,
-            "allocation sums to f*C index-wide: {big} + {small}"
-        );
         Ok(())
     }
 

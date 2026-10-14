@@ -28,7 +28,7 @@ use crate::vector::write::ivf::merge_ivf;
 use crate::vector::VectorIndexReader;
 use crate::{DocAddress, DocId, SegmentOrdinal, TantivyError};
 
-pub struct VectorPlugin;
+pub(crate) struct VectorPlugin;
 
 /// Physical position of a vector in a segment's vector storage.
 ///
@@ -39,8 +39,8 @@ pub(crate) type RowId = usize;
 /// A vector row within a set of segments, the row counterpart of [`DocAddress`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RowAddress {
-    pub segment_ord: SegmentOrdinal,
-    pub row_id: RowId,
+    pub(crate) segment_ord: SegmentOrdinal,
+    pub(crate) row_id: RowId,
 }
 
 impl SegmentPlugin for VectorPlugin {

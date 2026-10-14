@@ -5,12 +5,11 @@ use std::sync::Arc;
 use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
 use crate::query::AllQuery;
-use crate::schema::{Field, Metric, Schema, Term, STORED, STRING};
+use crate::schema::{Field, Metric, Schema, Term, VectorDType, VectorOptions, STORED, STRING};
+use crate::vector::diagnostics::{VectorClusterStats, VectorInfo, VectorStorageFormat};
 use crate::vector::test_support::{Fixture, FixtureSpec, NearestClusterer};
 use crate::vector::tests::{exhaustive_params, TestVectorIndex};
-use crate::vector::{
-    RouterKind, VectorClusterStats, VectorDType, VectorInfo, VectorOptions, VectorStorageFormat,
-};
+use crate::vector::RouterKind;
 use crate::{Index, IndexWriter, TantivyDocument};
 
 const DOCS_PER_CLUSTER: usize = 6;
@@ -226,6 +225,8 @@ fn merge_deleting_every_doc_of_one_field_writes_empty_ivf() -> crate::Result<()>
                 avg_cluster_size: 0.0,
                 empty_clusters: 0,
             }),
+            quantized_layers: None,
+            quantized_bytes_per_row: None,
         },
     );
     let ivf = vec_reader.index().expect("expected IVF storage");

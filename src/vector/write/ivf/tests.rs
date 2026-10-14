@@ -8,6 +8,9 @@ use crate::indexer::NoMergePolicy;
 use crate::query::{AllQuery, EnableScoring, Query, TermQuery};
 use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
 use crate::vector::clustering::{IvfTrainingVectors, IvfVectors};
+use crate::vector::diagnostics::{
+    VectorEstimatorMeasurements, VectorEstimatorQuery, VectorEstimatorSource,
+};
 use crate::vector::distance::maybe_normalize_bytes;
 use crate::vector::params::{LocatedPath, ProbeParams};
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
@@ -15,10 +18,7 @@ use crate::vector::storage::blocks::block_len;
 use crate::vector::storage::header::VectorEntry;
 use crate::vector::storage::metadata::SlotType;
 use crate::vector::tests::ground_truth;
-use crate::vector::{
-    TopDocsByVectorSimilarity, VectorEstimatorMeasurements, VectorEstimatorQuery,
-    VectorEstimatorSource, VectorQuantizationLayer, ENTRY_ALIGN,
-};
+use crate::vector::{TopDocsByVectorSimilarity, VectorQuantizationLayer, ENTRY_ALIGN};
 use crate::{Index, TantivyDocument};
 
 /// The merge's production sources carry no estimator or audit entry point.
@@ -1037,7 +1037,7 @@ fn level_zero_matches_unquantized_ivf() -> crate::Result<()> {
 // Metadata reports the stored contract for each backend, independently of the build target.
 #[test]
 fn public_metadata_reports_stored_contract_after_settings_change() -> crate::Result<()> {
-    use crate::vector::{Partition, Quantizer, VectorColMetadata};
+    use crate::vector::storage::metadata::{Partition, Quantizer, VectorColMetadata};
     for mode in 0..3 {
         let mut index = match mode {
             0 => build_quantized_fixture(64, false)?,
@@ -1055,7 +1055,7 @@ fn public_metadata_reports_stored_contract_after_settings_change() -> crate::Res
             assert_eq!(meta.field().metric(), Metric::L2);
             assert_eq!(
                 meta.field().norm_policy(),
-                crate::vector::VectorNormPolicy::None
+                crate::vector::quantization::VectorNormPolicy::None
             );
             if mode == 2 {
                 assert!(matches!(

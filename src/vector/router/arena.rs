@@ -1,7 +1,8 @@
 //! Centroid arenas: dense `dim`-strided vector storage the routers score against.
 
 use crate::schema::Metric;
-use crate::vector::{Similarity, VectorElement};
+use crate::vector::distance::Similarity;
+use crate::vector::VectorElement;
 
 /// A flat, `dim`-strided arena of vectors addressed by dense row index.
 ///
@@ -47,14 +48,14 @@ impl<T: VectorElement, S: std::ops::Deref<Target = [T]>> VectorArena for S {
 /// stride-sized ranged read scored with the byte kernels ([`Metric::similarity_bytes`]).
 ///
 /// [`similarity`]: VectorArena::similarity
-pub struct FileSliceArena<T> {
+pub(crate) struct FileSliceArena<T> {
     pub(crate) slice: crate::directory::FileSlice,
     _elem: std::marker::PhantomData<T>,
 }
 
 impl<T> FileSliceArena<T> {
     /// Wraps a slice of contiguous `dim`-strided little-endian `T` rows.
-    pub fn new(slice: crate::directory::FileSlice) -> Self {
+    pub(crate) fn new(slice: crate::directory::FileSlice) -> Self {
         FileSliceArena {
             slice,
             _elem: std::marker::PhantomData,

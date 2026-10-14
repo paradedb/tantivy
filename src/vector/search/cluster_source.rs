@@ -3,7 +3,7 @@
 
 use std::ops::Range;
 
-use crate::vector::Similarity;
+use crate::vector::distance::Similarity;
 use crate::DocId;
 
 /// One cluster's selected rows, with what is already known about them.

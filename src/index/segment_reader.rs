@@ -20,8 +20,10 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
+#[cfg(test)]
+use crate::vector::storage::metadata::VectorColMetadata;
 use crate::vector::storage::reader::VectorFieldReader;
-use crate::vector::{VectorColMetadata, VectorIndexReader};
+use crate::vector::VectorIndexReader;
 use crate::{DocId, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
@@ -193,7 +195,11 @@ impl SegmentReader {
 
     /// Returns stored field metadata without reading IdMap, routing payloads or block geometry.
     /// A segment without vector data returns `None`.
-    pub fn vector_metadata(&self, field: Field) -> crate::Result<Option<Arc<VectorColMetadata>>> {
+    #[cfg(test)]
+    pub(crate) fn vector_metadata(
+        &self,
+        field: Field,
+    ) -> crate::Result<Option<Arc<VectorColMetadata>>> {
         Ok(self.vector_field(field)?.metadata())
     }
 

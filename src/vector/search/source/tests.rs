@@ -3,14 +3,14 @@
 use common::BitSet;
 
 use crate::query::{AllQuery, Query};
-use crate::schema::Metric;
-use crate::vector::params::{LocatedPath, ProbeParams};
+use crate::schema::{Metric, VectorDType};
+use crate::vector::diagnostics::VectorStorageFormat;
+use crate::vector::params::{LocatedPath, ProbeParams, DEFAULT_FIXED_PROBE_COST_ROWS};
 use crate::vector::router::stacked::aps::RecallEstimator;
 use crate::vector::search::cluster_source::{ClusterSource, Feedback};
 use crate::vector::search::segment::plan::Source;
 use crate::vector::search::source::controller::{
     open_share, ProbeController, ProbeTermination, WorkBudget, WorkMeter, WorkUnits,
-    DEFAULT_FIXED_PROBE_COST_ROWS,
 };
 use crate::vector::search::source::router::{
     DocFilter, GatedRows, RouterClusters, RouterReport, RowGate,
@@ -18,7 +18,7 @@ use crate::vector::search::source::router::{
 use crate::vector::storage::bounds::{HeapPeek, QueryBound, QueryBoundTracker};
 use crate::vector::test_support::{DocsWeight, Fixture, FixtureSpec, Lcg, SegmentRun};
 use crate::vector::tests::{exhaustive_params, routed_exhaustive_params, TestVectorIndex};
-use crate::vector::{RouterKind, VectorDType, VectorStorageFormat};
+use crate::vector::RouterKind;
 use crate::DocId;
 
 // --- Driver ---

@@ -7,14 +7,14 @@ use std::io;
 use std::sync::{Mutex, OnceLock};
 
 use crate::schema::Metric;
-use crate::vector::Similarity;
+use crate::vector::distance::Similarity;
 
 /// The largest dimension that routes with APS. Dimensions above this route
 /// with the fixed nprobe fractions even when a recall target is requested.
 /// The recall profile rests on `I_x((d+1)/2, 1/2)`; at high dimensions the
 /// continued fraction and cap volumes degenerate, and the estimate has not
 /// been validated above this dimension.
-pub const APS_MAX_DIM: usize = 128;
+pub(crate) const APS_MAX_DIM: usize = 128;
 
 const BETA_TABLE_LEN: usize = 1024;
 const BETA_STOP: f64 = 1.0e-8;
@@ -304,7 +304,7 @@ pub(crate) fn is_euclidean(metric: Metric) -> bool {
 }
 
 /// Relative change in `ρ` that triggers a recall profile recompute.
-pub const APS_RECOMPUTE_THRESHOLD: f32 = 0.10;
+pub(crate) const APS_RECOMPUTE_THRESHOLD: f32 = 0.10;
 
 /// Centroid rows of a ranked candidate set, fetched on demand.
 pub(crate) trait CandidateRows {

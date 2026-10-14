@@ -32,9 +32,9 @@ use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::router::stacked::aps::RecallEstimator;
 use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RoutingParams};
+use crate::vector::storage::bounds::{BoundKind, BoundStore};
 use crate::vector::storage::header::VectorFileVersion;
 use crate::vector::storage::io::VectorRead;
-use crate::vector::{BoundKind, BoundStore};
 
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
@@ -43,7 +43,7 @@ use crate::vector::{BoundKind, BoundStore};
 /// router's lists. The centroid vectors stay behind a [`FileSlice`] and are read one row at a
 /// time as routing visits them. Everything row-scale (the rows and id-map) lives on
 /// [`VectorIndexReader`](crate::vector::VectorIndexReader).
-pub struct ClusterIndex {
+pub(crate) struct ClusterIndex {
     num_centroids: usize,
     /// Distinct documents with a vector in this field.
     num_docs: usize,
@@ -114,7 +114,7 @@ impl ClusterIndex {
     /// Returns (`io::Result<()>`): write errors only — the payload length
     /// is validated at open, against the count words of slot `[0]`.
     ///
-    /// [`BoundsBuilder`]: crate::vector::BoundsBuilder
+    /// [`BoundsBuilder`]: crate::vector::storage::bounds::BoundsBuilder
     pub(crate) fn serialize_bounds<W: Write + ?Sized>(
         kind: BoundKind,
         values: &[f32],
@@ -247,11 +247,12 @@ impl ClusterIndex {
         Ok(index)
     }
 
-    pub fn num_clusters(&self) -> usize {
+    pub(crate) fn num_clusters(&self) -> usize {
         self.num_centroids
     }
 
-    pub fn router(&self) -> RouterKind {
+    #[cfg(test)]
+    pub(crate) fn router(&self) -> RouterKind {
         self.router.kind()
     }
 
@@ -261,7 +262,7 @@ impl ClusterIndex {
     }
 
     /// Total posting rows across all clusters.
-    pub fn num_rows(&self) -> usize {
+    pub(crate) fn num_rows(&self) -> usize {
         self.cluster_offset(self.num_centroids) as usize
     }
 
@@ -273,7 +274,7 @@ impl ClusterIndex {
 
     /// The contiguous row range of `cluster` within the `.vec` rows.
     #[inline]
-    pub fn cluster_range(&self, cluster: usize) -> Range<usize> {
+    pub(crate) fn cluster_range(&self, cluster: usize) -> Range<usize> {
         debug_assert!(cluster < self.num_centroids, "cluster out of bounds");
         self.cluster_offset(cluster) as usize..self.cluster_offset(cluster + 1) as usize
     }
@@ -284,7 +285,7 @@ impl ClusterIndex {
     /// segment-level kind plus per-cluster values; `f32::INFINITY` =
     /// SATURATED (always probes).
     #[inline]
-    pub fn bounds(&self) -> BoundStore<'_> {
+    pub(crate) fn bounds(&self) -> BoundStore<'_> {
         BoundStore::new(self.bound_kind, &self.bounds)
     }
 
@@ -318,7 +319,7 @@ impl ClusterIndex {
 
     /// The centroid rows, materialized in one read — for introspection and
     /// tests only. Routing fetches per-node ranges through the lazy arena.
-    pub fn centroid_bytes(&self) -> crate::Result<OwnedBytes> {
+    pub(crate) fn centroid_bytes(&self) -> crate::Result<OwnedBytes> {
         Ok(self.centroids_slice.read_bytes()?)
     }
 

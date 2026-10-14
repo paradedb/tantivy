@@ -629,7 +629,8 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
 
 #[test]
 fn diagnostic_schedules_ignore_rotation_seeds() -> crate::Result<()> {
-    use crate::vector::{QuantizerKind, VectorEstimatorQuery, VectorEstimatorSource};
+    use crate::vector::diagnostics::{VectorEstimatorQuery, VectorEstimatorSource};
+    use crate::vector::storage::metadata::QuantizerKind;
 
     let measure = |seed| -> crate::Result<_> {
         let (index, _) = fixture_with_seed(Metric::Cosine, &[1, 4], false, Some(seed))?;
@@ -689,8 +690,8 @@ fn diagnostics_skip_empty_clusters() -> crate::Result<()> {
     assert_eq!(
         audit.schedule().layers(),
         &[
-            (crate::vector::QuantizerKind::Sign, 1),
-            (crate::vector::QuantizerKind::Grid, 4)
+            (crate::vector::storage::metadata::QuantizerKind::Sign, 1),
+            (crate::vector::storage::metadata::QuantizerKind::Grid, 4)
         ]
     );
     assert_eq!(audit.estimator.sample_rows(), 30);

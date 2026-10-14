@@ -29,14 +29,17 @@ use crate::vector::search::source::SourceReport;
 use crate::vector::stats::ProbeStats;
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::reader::VectorIndexReader;
-use crate::vector::telemetry::take_stage_totals;
+use crate::vector::telemetry::{enter_vector_stage, take_stage_totals};
+#[cfg(test)]
 use crate::vector::tie_break::NoTieBreak;
-use crate::vector::{enter_vector_stage, VectorElement, VectorStage};
-use crate::{DocAddress, Score, SegmentOrdinal, SegmentReader, TantivyError};
+use crate::vector::{VectorElement, VectorStage};
+#[cfg(test)]
+use crate::Score;
+use crate::{DocAddress, SegmentOrdinal, SegmentReader, TantivyError};
 
 /// Per-segment vector search state: the segment's [`VectorIndexReader`] and the prepared query.
 /// Build via [`SegmentSearcher::for_segment`].
-pub struct SegmentSearcher<T: VectorElement> {
+pub(crate) struct SegmentSearcher<T: VectorElement> {
     reader: Arc<VectorIndexReader>,
     query: Arc<VectorQuery<T>>,
     /// `None` when the segment is not quantized or quantized scanning is off.
@@ -100,7 +103,8 @@ impl<T: VectorElement> SegmentSearcher<T> {
     /// # Errors
     ///
     /// Returns an error when segment vector data cannot be opened or scored.
-    pub fn top_n(
+    #[cfg(test)]
+    pub(crate) fn top_n(
         &self,
         weight: &dyn Weight,
         segment_reader: &SegmentReader,
@@ -126,7 +130,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
     ///
     /// # Errors
     /// Returns an error when segment vector data cannot be opened or scored.
-    pub fn top_n_by<K, CTail>(
+    pub(crate) fn top_n_by<K, CTail>(
         &self,
         weight: &dyn Weight,
         segment_reader: &SegmentReader,

@@ -18,10 +18,11 @@ use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::storage::blocks::{
     block_len, column_range, pad, write_metadata, BlockDirectory,
 };
+use crate::vector::storage::bounds::{residual_norm, BoundsBuilder};
 use crate::vector::storage::header::{VectorEntry, HEADER_LEN};
 use crate::vector::storage::id_map::DocLocation;
 use crate::vector::storage::metadata::{Slot, SlotType, VectorColMetadata};
-use crate::vector::{residual_norm, BoundsBuilder, ENTRY_ALIGN};
+use crate::vector::ENTRY_ALIGN;
 use crate::TantivyError;
 
 /// The stored centroid rows, normalized as the field's vectors are, and a bounds builder that

@@ -47,30 +47,27 @@ const fn max_elem_bytes() -> usize {
 
 /// Maximum decoder element size, bounding column and block alignment.
 /// Storage providers can use this to check page-data starts and usable page lengths.
-pub const MAX_ELEM_BYTES: usize = max_elem_bytes();
+pub(crate) const MAX_ELEM_BYTES: usize = max_elem_bytes();
 
 /// Fixed alignment of Data entries and their block directories.
 pub const ENTRY_ALIGN: usize = 8;
 const _: () = assert!(MAX_ELEM_BYTES <= ENTRY_ALIGN);
 
-/// Wide accumulator used by the reduction kernels (norms). Element
-/// types choose their accumulator via [`VectorElement::Acc`]; this
-/// trait is the vocabulary a kernel needs to *use* that choice:
-/// make a zero, add, read out as f64 at the fold.
+// --- Element traits ---
+
+/// Seals [`Accumulator`] and [`VectorElement`]: the element types are the ones [`VectorDType`]
+/// lists.
+mod sealed {
+    pub trait Sealed {}
+
+    impl Sealed for f32 {}
+    impl Sealed for f64 {}
+}
+
+/// The wide accumulator a reduction kernel sums an element type's squares in; sealed.
 ///
-/// Deliberately a custom trait rather than std bounds: the natural
-/// accumulator for a future quantized element is an integer (e.g.
-/// `u64` for `u8` elements — exact, matches integer-SIMD hardware),
-/// and `Into<f64>` does not exist for `u64` because std reserves
-/// `From`/`Into` for lossless conversions. `to_f64` is explicitly
-/// the lossy read-out at the end of a reduction.
-///
-/// Kept separate from `VectorElement` because these operations never
-/// mention the element type — how to sum two `f64`s is a fact about
-/// `f64` — and because accumulator impls are shared: `f32` and a
-/// future `f16` would both declare `type Acc = f64` and reuse this
-/// one impl.
-pub trait Accumulator: Copy + Send + Sync + 'static {
+/// `to_f64` is the lossy read-out at the end of a reduction.
+pub trait Accumulator: sealed::Sealed + Copy + Send + Sync + 'static {
     const ZERO: Self;
     fn add(self, rhs: Self) -> Self;
     fn to_f64(self) -> f64;
@@ -90,17 +87,12 @@ impl Accumulator for f64 {
     }
 }
 
-/// A vector element type with the primitives needed by the storage
-/// layer and the distance kernels.
+/// A vector element type with the primitives the storage layer and the distance kernels need;
+/// sealed, one per [`VectorDType`].
 ///
-/// Implemented for the element types supported by [`VectorDType`]. The
-/// `DTYPE` associated constant lets callers reject mismatches between
-/// the declared schema dtype and the type passed at runtime. The
-/// arithmetic methods (`squared_diff`, `product`) return `f32` so that
-/// kernels can use a uniform accumulator type across dtypes; the
-/// reduction kernels (norms) instead accumulate in [`Self::Acc`] via
-/// [`Self::mul_wide`].
-pub trait VectorElement: Copy + Send + Sync + 'static {
+/// `squared_diff` and `product` return `f32` so kernels share one accumulator across element
+/// types; the norm kernels accumulate in [`Self::Acc`] through [`Self::mul_wide`].
+pub trait VectorElement: sealed::Sealed + Copy + Send + Sync + 'static {
     const DTYPE: VectorDType;
     const SIZE_BYTES: usize;
 

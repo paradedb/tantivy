@@ -31,7 +31,7 @@ impl DocLocation {
 }
 
 /// Document addressing with deferred, fixed-width clustered lookups.
-pub enum IdMap {
+pub(crate) enum IdMap {
     /// Every document has a vector at the same row ordinal.
     Identity { num_docs: u32 },
     /// Present documents address dense rows by bitmap rank.
@@ -41,7 +41,7 @@ pub enum IdMap {
 }
 impl IdMap {
     /// Serializes sorted flat document ids, eliding a fully populated bitmap.
-    pub fn serialize<W: Write>(
+    pub(crate) fn serialize<W: Write>(
         present_doc_ids: &[DocId],
         num_docs: u32,
         out: &mut W,
@@ -67,7 +67,7 @@ impl IdMap {
         Ok(())
     }
     /// Validates the tag and table length without reading clustered table contents.
-    pub fn open(file_slice: FileSlice, num_docs: u32) -> io::Result<Self> {
+    pub(crate) fn open(file_slice: FileSlice, num_docs: u32) -> io::Result<Self> {
         if file_slice.len() == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -149,7 +149,7 @@ impl IdMap {
         }
     }
     /// Number of present flat rows; clustered row counts reside in cluster offsets.
-    pub fn num_rows(&self) -> u32 {
+    pub(crate) fn num_rows(&self) -> u32 {
         match self {
             Self::Identity { num_docs } => *num_docs,
             Self::Bitmap(idx) => idx.num_non_nulls(),
@@ -157,11 +157,11 @@ impl IdMap {
         }
     }
     #[cfg(test)]
-    pub fn contains(&self, doc: DocId) -> bool {
+    pub(crate) fn contains(&self, doc: DocId) -> bool {
         self.rank_if_exists(doc).is_some()
     }
     /// Resolves a flat document by rank without searching rows.
-    pub fn rank_if_exists(&self, doc: DocId) -> Option<u32> {
+    pub(crate) fn rank_if_exists(&self, doc: DocId) -> Option<u32> {
         match self {
             Self::Identity { num_docs } => (doc < *num_docs).then_some(doc),
             Self::Bitmap(idx) => Set::rank_if_exists(idx, doc),

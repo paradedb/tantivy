@@ -14,7 +14,13 @@ use crate::query::{
     AllQuery, BitSetDocSet, ConstScorer, EnableScoring, Explanation, Query, Scorer, TermQuery,
     Weight,
 };
-use crate::schema::{Field, IndexRecordOption, Schema, Term, Value, STORED, STRING};
+use crate::schema::{
+    Field, IndexRecordOption, Metric, Schema, Term, Value, VectorDType, VectorOptions, STORED,
+    STRING,
+};
+use crate::vector::clustering::{
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors,
+};
 use crate::vector::params::ProbeParams;
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::with_test_clusters;
@@ -22,13 +28,13 @@ use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
 use crate::vector::search::scan::plan::PlanOverride;
 use crate::vector::search::scan::ScanTrace;
 use crate::vector::search::segment::plan::SegmentPlan;
+use crate::vector::search::SegmentSearcher;
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::io::test_support::{with_unarmed_log, PagedDirectory};
 use crate::vector::tests::TestVectorIndex;
 use crate::vector::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors, Metric, ProbeStats,
-    RouterKind, SegmentSearcher, VectorDType, VectorOptions, VectorQuantizationConfig,
-    VectorQuantizationLayer, VectorSimilarityFruit, VectorStage,
+    ProbeStats, RouterKind, VectorQuantizationConfig, VectorQuantizationLayer,
+    VectorSimilarityFruit, VectorStage,
 };
 use crate::{DocAddress, DocId, Index, IndexWriter, Score, SegmentReader, TantivyDocument};
 

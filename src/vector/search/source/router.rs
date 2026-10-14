@@ -19,7 +19,8 @@ use crate::vector::storage::bounds::{
 };
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::reader::VectorIndexReader;
-use crate::vector::{enter_vector_stage, VectorElement, VectorStage};
+use crate::vector::telemetry::enter_vector_stage;
+use crate::vector::{VectorElement, VectorStage};
 use crate::{DocId, SegmentReader};
 
 // --- Filter and gate ---

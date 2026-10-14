@@ -256,6 +256,7 @@ impl VectorFieldReader {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn metadata(&self) -> Option<Arc<VectorColMetadata>> {
         self.source
             .as_ref()
@@ -415,7 +416,7 @@ impl VectorIndexReader {
     /// Returns this segment's stored field metadata, independent of index build settings.
     /// `None` means the segment has no stored vector data; an empty stored field still
     /// returns its metadata.
-    pub fn metadata(&self) -> Option<&VectorColMetadata> {
+    pub(crate) fn metadata(&self) -> Option<&VectorColMetadata> {
         self.present.then_some(self.rows_slice.meta.as_ref())
     }
 
@@ -441,7 +442,7 @@ impl VectorIndexReader {
 
     /// The routing index, present iff the segment's rows are IVF-clustered; `None` means search
     /// scans the rows exactly.
-    pub fn index(&self) -> Option<&ClusterIndex> {
+    pub(crate) fn index(&self) -> Option<&ClusterIndex> {
         self.index.as_ref()
     }
 
@@ -455,12 +456,22 @@ impl VectorIndexReader {
         self.quantization.is_some()
     }
 
-    /// Per-cluster posting-list sizes in cluster order, behind [`Self::info`]'s cluster stats;
-    /// `None` when the field's storage is not IVF.
+    /// Each cluster's posting-list size, in cluster order; `None` when the storage is not IVF.
     pub fn cluster_sizes(&self) -> Option<Vec<u32>> {
         self.index
             .as_ref()
             .map(|index| index.cluster_sizes().map(|size| size as u32).collect())
+    }
+
+    /// Each cluster's ball radius around its stored centroid, in cluster order, with
+    /// `f32::INFINITY` for a saturated cluster; `None` when the storage is not IVF.
+    pub fn cluster_radii(&self) -> Option<Vec<f32>> {
+        self.index.as_ref().map(|index| {
+            let bounds = index.bounds();
+            (0..index.num_clusters())
+                .map(|cluster| bounds.ball_r(cluster))
+                .collect()
+        })
     }
 
     /// Returns the number of live IVF posting rows.

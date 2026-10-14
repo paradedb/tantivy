@@ -23,9 +23,9 @@ use crate::vector::search::SegmentSearcher;
 use crate::vector::stats::ProbeStats;
 use crate::vector::storage::metadata::VectorColMetadata;
 use crate::vector::storage::quantized::QuantizedFieldReader;
-use crate::vector::telemetry::take_stage_totals;
+use crate::vector::telemetry::{enter_vector_stage, take_stage_totals};
 use crate::vector::tie_break::NoTieBreak;
-use crate::vector::{enter_vector_stage, VectorElement, VectorStage};
+use crate::vector::{VectorElement, VectorStage};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal, TantivyError};
 
 // --- Query preparation ---
@@ -394,9 +394,10 @@ mod ivf_e2e_tests {
     use crate::index::IndexSettings;
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
-    use crate::schema::{Field, Schema, FAST, STORED, STRING};
+    use crate::schema::{Field, Metric, Schema, VectorDType, VectorOptions, FAST, STORED, STRING};
+    use crate::vector::diagnostics::VectorStorageFormat;
     use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
-    use crate::vector::{Metric, RouterKind, VectorDType, VectorOptions, VectorStorageFormat};
+    use crate::vector::RouterKind;
     use crate::{DocAddress, Index, Order, Score, TantivyDocument, TantivyError};
 
     /// IVF + exhaustive probing matches the global oracle. The shared
@@ -584,7 +585,7 @@ mod ivf_e2e_tests {
                     let row = vector_reader.row_id(doc_id)?.unwrap();
                     let bytes = vector_reader.vector_bytes_for_row(row)?;
                     expected.push((
-                        -crate::vector::l2_squared_bytes(&query, &bytes),
+                        -crate::vector::distance::l2_squared_bytes(&query, &bytes),
                         id_column.first(doc_id).unwrap(),
                         DocAddress::new(segment_ord as u32, doc_id),
                     ));

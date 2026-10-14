@@ -45,7 +45,7 @@ impl FieldBuffer {
 }
 
 /// Writes full-precision vector rows.
-pub struct FlatVecWriter {
+pub(crate) struct FlatVecWriter {
     fields: BTreeMap<Field, FieldBuffer>,
     /// Number of documents represented by the presence map.
     num_docs: DocId,
@@ -53,7 +53,7 @@ pub struct FlatVecWriter {
 
 impl FlatVecWriter {
     /// Creates a writer for all vector fields in a schema.
-    pub fn for_schema(schema: &Schema) -> Self {
+    pub(crate) fn for_schema(schema: &Schema) -> Self {
         let mut fields = BTreeMap::new();
         for (field, entry) in schema.fields() {
             if let FieldType::Vector(opts) = entry.field_type() {

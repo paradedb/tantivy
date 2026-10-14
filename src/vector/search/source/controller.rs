@@ -4,8 +4,8 @@
 //! open charges `x` and a scored row `(1 - x) / n_avg`, so an exhaustive, unfiltered, delete-free
 //! scan charges exactly `C`. The budget is checked only between clusters.
 
+use crate::vector::distance::Similarity;
 use crate::vector::router::stacked::aps::RecallEstimator;
-use crate::vector::Similarity;
 use crate::Score;
 
 /// How the probe loop stopped.
@@ -17,20 +17,11 @@ pub enum ProbeTermination {
     #[default]
     Exhausted,
     /// The APS recall estimate of the covered clusters reached
-    /// [`ProbeParams::recall_target`](crate::vector::params::ProbeParams::recall_target).
+    /// [`ProbeParams::recall_target`](crate::vector::ProbeParams::recall_target).
     RecallTarget,
 }
 
 // --- Work units ---
-
-/// Default [`ProbeParams::fixed_probe_cost_rows`]: the cost of opening a cluster, in rows
-/// of full work, fitted on the reference fixture.
-///
-/// Policy constant: the open share `x = cost / (cost + n_avg)` follows the index's granularity.
-/// It covers the open only; routing cost is not modeled.
-///
-/// [`ProbeParams::fixed_probe_cost_rows`]: crate::vector::params::ProbeParams::fixed_probe_cost_rows
-pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 
 /// The open share `x = cost / (cost + n_avg)` for a cluster-open cost of `fixed_cost_rows` rows
 /// and `n_avg` native docs per cluster.
@@ -43,27 +34,27 @@ pub(crate) fn open_share(fixed_cost_rows: f64, n_avg: f64) -> f64 {
 
 /// Probe work in average-cluster units; budgets, prices and spends compose only with each other.
 #[derive(Clone, Copy, PartialEq, PartialOrd, Debug, Default)]
-pub struct WorkUnits(f64);
+pub(crate) struct WorkUnits(f64);
 
 impl WorkUnits {
     /// No work.
-    pub const ZERO: WorkUnits = WorkUnits(0.0);
+    pub(crate) const ZERO: WorkUnits = WorkUnits(0.0);
 
     /// Wraps an amount in work units.
     #[inline]
-    pub fn new(units: f64) -> WorkUnits {
+    pub(crate) fn new(units: f64) -> WorkUnits {
         WorkUnits(units)
     }
 
     /// Returns the binary64 amount.
     #[inline]
-    pub fn get(self) -> f64 {
+    pub(crate) fn get(self) -> f64 {
         self.0
     }
 
     /// Returns the amount narrowed to binary32, for the probe statistics.
     #[inline]
-    pub fn to_f32(self) -> f32 {
+    pub(crate) fn to_f32(self) -> f32 {
         self.0 as f32
     }
 }

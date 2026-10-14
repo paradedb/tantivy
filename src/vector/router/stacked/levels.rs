@@ -26,9 +26,12 @@ use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperK
 
 use crate::directory::FileSlice;
 use crate::schema::Metric;
+use crate::vector::distance::Similarity;
+use crate::vector::router::arena::{FileSliceArena, VectorArena};
+use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::aps;
 use crate::vector::router::stacked::aps::RecallEstimator;
-use crate::vector::{Candidate, FileSliceArena, Similarity, VectorArena, VectorElement};
+use crate::vector::VectorElement;
 
 /// Row index into a level's centroid or member arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -63,13 +66,13 @@ impl From<usize> for ClusterId {
 }
 
 /// Default `nprobe_fraction` for parent levels (L1, L2, …).
-pub const PARENT_NPROBE_FRACTION: f32 = 0.25;
+pub(crate) const PARENT_NPROBE_FRACTION: f32 = 0.25;
 
 /// Recall target used when this level searches its parent.
-pub const PARENT_RECALL_TARGET: f32 = 0.99;
+pub(crate) const PARENT_RECALL_TARGET: f32 = 0.99;
 
 /// Default fan-out of the Multi-level IVF index
-pub const DEFAULT_BRANCHING_FACTOR: usize = 100;
+pub(crate) const DEFAULT_BRANCHING_FACTOR: usize = 100;
 
 /// Search and clustering knobs for this level. Not persisted.
 #[derive(Clone, Debug)]
@@ -96,13 +99,6 @@ impl Default for StackedIvfConfig {
 }
 
 impl StackedIvfConfig {
-    pub fn new(branching_factor: usize) -> Self {
-        Self {
-            branching_factor,
-            ..Default::default()
-        }
-    }
-
     fn for_parent(&self) -> Self {
         Self {
             nprobe_fraction: PARENT_NPROBE_FRACTION,
@@ -164,10 +160,6 @@ impl InMemoryStore {
 
     pub fn len(&self) -> usize {
         self.data.len() / self.dim
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
     }
 }
 
@@ -247,7 +239,7 @@ pub struct StackedIvf<S> {
 /// held in memory. Router-level centroids are pinned at open: they are
 /// `nlist × dim` (tiny next to the member rows) and APS needs the full
 /// matrix to compute query-to-bisector distances.
-pub struct LazyStore {
+pub(crate) struct LazyStore {
     arena: FileSliceArena<f32>,
     dim: usize,
     pinned: Option<Vec<f32>>,
@@ -255,7 +247,7 @@ pub struct LazyStore {
 
 impl LazyStore {
     /// Wraps `rows` (row-major `n × dim` little-endian `f32`s).
-    pub fn new(rows: FileSlice, dim: usize) -> Self {
+    pub(crate) fn new(rows: FileSlice, dim: usize) -> Self {
         LazyStore {
             arena: FileSliceArena::new(rows),
             dim,
@@ -265,7 +257,7 @@ impl LazyStore {
 
     /// Wraps `rows` and decodes them into memory once, so
     /// [`CentroidMatrix`] is available and scoring skips the file.
-    pub fn pinned(rows: FileSlice, dim: usize) -> io::Result<Self> {
+    pub(crate) fn pinned(rows: FileSlice, dim: usize) -> io::Result<Self> {
         let bytes = rows.read_bytes()?;
         if bytes.len() % (dim * mem::size_of::<f32>()) != 0 {
             return Err(io::Error::new(
@@ -285,11 +277,7 @@ impl LazyStore {
         })
     }
 
-    pub fn dim(&self) -> usize {
-        self.dim
-    }
-
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.arena.num_vectors(self.dim)
     }
 
@@ -652,6 +640,7 @@ impl StackedIvf<InMemoryStore> {
     ///
     /// `members` are the L0 rows in serialized order. `config` applies to
     /// L0; parents use [`PARENT_NPROBE_FRACTION`].
+    #[cfg(test)]
     pub fn deserialize_owned(
         bytes: &[u8],
         members: Vec<f32>,
@@ -887,6 +876,7 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
     }
 
     /// Levels from this one up (L0 alone is 1; L0+L1 is 2).
+    #[cfg(any(test, feature = "unstable"))]
     pub fn depth(&self) -> usize {
         1 + self.parent.as_ref().map(|p| p.depth()).unwrap_or(0)
     }

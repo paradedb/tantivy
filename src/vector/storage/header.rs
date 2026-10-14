@@ -20,7 +20,7 @@ pub(crate) const HEADER_LEN: usize = 4;
 
 /// On-disk vector file version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum VectorFileVersion {
+pub(crate) enum VectorFileVersion {
     V1 = 1,
     /// `.centroids` includes required per-cluster bounds.
     V2 = 2,

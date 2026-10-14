@@ -1260,7 +1260,8 @@ mod tests {
         );
         reads.lock().unwrap().clear();
         crate::vector::telemetry::take_stage_totals();
-        let stage = crate::vector::enter_vector_stage(crate::vector::VectorStage::LayerScan(0));
+        let stage =
+            crate::vector::telemetry::enter_vector_stage(crate::vector::VectorStage::LayerScan(0));
         let batch = reader.read_batch(0..8)?;
         drop(stage);
         assert_eq!(reads.lock().unwrap().len(), 1);
@@ -1320,8 +1321,8 @@ mod tests {
         use crate::vector::storage::blocks::{
             block_len, column_range, write_metadata, BlockDirectory,
         };
-        use crate::vector::telemetry::take_stage_totals;
-        use crate::vector::{enter_vector_stage, VectorQuantizationLayer, VectorStage};
+        use crate::vector::telemetry::{enter_vector_stage, take_stage_totals};
+        use crate::vector::{VectorQuantizationLayer, VectorStage};
         for metric in [Metric::Cosine, Metric::Dot, Metric::L2] {
             let opts = VectorOptions::new(1024, metric);
             let config = VectorQuantizationConfig::materialize(

@@ -8,7 +8,8 @@ use crate::vector::params::{LocatedPath, ProbeParams};
 use crate::vector::search::source::controller::{WorkBudget, WorkUnits};
 use crate::vector::search::source::router::DocFilter;
 use crate::vector::storage::centroids::ClusterIndex;
-use crate::vector::{enter_vector_stage, VectorStage};
+use crate::vector::telemetry::enter_vector_stage;
+use crate::vector::VectorStage;
 use crate::{DocId, SegmentReader};
 
 // --- Plan ---
@@ -174,7 +175,7 @@ mod tests {
     use super::*;
     use crate::query::{AllQuery, BooleanQuery, Occur, Query};
     use crate::schema::Metric;
-    use crate::vector::params::{ProbeParams, Selectivity, WorkModel};
+    use crate::vector::params::{ProbeParams, Selectivity};
     use crate::vector::stats::AccessPath;
     use crate::vector::test_support::{DocsWeight, FixtureSpec};
     use crate::vector::tests::exhaustive_params;
@@ -329,34 +330,30 @@ mod tests {
         // `Auto` caps at the rows the routed budget buys: matches at the cap are located, one more
         // routes, and a filter matching nothing still reports the cap.
         let ivf_docs = ivf.num_docs();
-        for work_model in [None, Some(WorkModel { n_avg: 61.5 })] {
-            let auto = ProbeParams {
-                max_probe_fraction: 0.2,
-                min_probe_clusters: 1,
-                work_model,
-                located: LocatedPath::Auto,
-                ..ProbeParams::default()
+        let auto = ProbeParams {
+            max_probe_fraction: 0.2,
+            min_probe_clusters: 1,
+            located: LocatedPath::Auto,
+            ..ProbeParams::default()
+        };
+        let (budget, n_avg, x) = auto.resolved_work_budget(ivf.num_clusters(), ivf_docs)?;
+        let cap = (budget * n_avg / (1.0 - x)).floor() as usize;
+        assert!(cap > 0 && cap + 1 < segment.max_doc() as usize, "cap {cap}");
+        for (matches, path) in [
+            (cap, AccessPath::Located),
+            (cap + 1, AccessPath::Routed),
+            (0, AccessPath::Routed),
+        ] {
+            let weight = DocsWeight {
+                max_doc: segment.max_doc(),
+                docs: (0..matches as DocId).collect(),
             };
-            let (budget, n_avg, x) = auto.resolved_work_budget(ivf.num_clusters(), ivf_docs)?;
-            let cap = (budget * n_avg / (1.0 - x)).floor() as usize;
-            assert!(cap > 0 && cap + 1 < segment.max_doc() as usize, "cap {cap}");
-            for (matches, path) in [
-                (cap, AccessPath::Located),
-                (cap + 1, AccessPath::Routed),
-                (0, AccessPath::Routed),
-            ] {
-                let weight = DocsWeight {
-                    max_doc: segment.max_doc(),
-                    docs: (0..matches as DocId).collect(),
-                };
-                let (_, stats) = fixture.run_segment(0, &weight, &[0.0, 0.0], 10, auto.clone())?;
-                let case = format!("{work_model:?} matches={matches}");
-                assert_eq!(
-                    (stats.located_cap, stats.access_path),
-                    (cap, path),
-                    "{case}"
-                );
-            }
+            let (_, stats) = fixture.run_segment(0, &weight, &[0.0, 0.0], 10, auto.clone())?;
+            assert_eq!(
+                (stats.located_cap, stats.access_path),
+                (cap, path),
+                "matches={matches}"
+            );
         }
         // Every mode reports its cap, and an unfiltered query routes.
         for (located, cap) in [(LocatedPath::Off, 0), (capped(9).located, 9)] {

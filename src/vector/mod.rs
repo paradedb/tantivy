@@ -55,81 +55,30 @@ mod stats;
 mod telemetry;
 mod tie_break;
 
+#[cfg(feature = "unstable")]
+#[doc(hidden)]
+pub mod bench;
 pub mod clustering;
 pub mod diagnostics;
-pub mod router;
+mod router;
 mod search;
 pub(crate) mod storage;
-mod write;
+pub(crate) mod write;
 
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub use clustering::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfTrainingBatch,
-    IvfTrainingVectors, IvfVectorBatch, IvfVectors, SuperKMeansClusterer, DEFAULT_MAX_LEAF_SIZE,
-    DEFAULT_TRAINING_SAMPLE_RATIO,
-};
 pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
-pub use diagnostics::{
-    VectorAuditMoments, VectorClusterStats, VectorErrorAuditMeasurements,
-    VectorErrorConeAuditMeasurements, VectorErrorConeDepthMeasurements,
-    VectorErrorDepthMeasurements, VectorEstimatorMeasurements, VectorEstimatorMoments,
-    VectorEstimatorQuery, VectorEstimatorSource, VectorInfo, VectorStorageFormat,
+pub use element::{Accumulator, VectorElement, ENTRY_ALIGN};
+pub use params::{
+    LocatedPath, ProbeParams, Selectivity, DEFAULT_FIXED_PROBE_COST_ROWS, DEFAULT_ROUTER_RECALL,
 };
-#[cfg(feature = "unstable")]
-#[doc(hidden)]
-pub use distance::quantization_bench_dot_bytes_f32;
-pub use distance::{
-    cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
-};
-pub use element::{Accumulator, VectorElement, ENTRY_ALIGN, MAX_ELEM_BYTES};
-pub use params::{LocatedPath, ProbeParams, Selectivity, WorkModel, DEFAULT_ROUTER_RECALL};
-pub use quantization::{
-    quantized_code_stride, VectorNormPolicy, VectorQuantizationConfig, VectorQuantizationGrid,
-    VectorQuantizationLayer, MAX_QUANTIZATION_LAYERS, QUANTIZED_CODE_ALIGNMENT,
-    QUANTIZED_CONSTANT_STRIDE, QUANTIZED_ERROR_RATIO_STRIDE, QUANTIZED_GAMMA_STRIDE,
-    QUANTIZED_RESIDUAL_NORM_STRIDE, QUANTIZED_SCALE_STRIDE, QUANTIZED_SIDECAR_STRIDE,
-    VECTOR_QUANTIZATION_FORMAT_VERSION,
-};
-pub use router::arena::{FileSliceArena, VectorArena};
-pub use router::candidate::Candidate;
-pub use router::stacked::aps::APS_MAX_DIM;
-pub use router::stacked::levels::{
-    AddLevelError, ClusterId, InMemoryStore, LazyStore, LevelClusterer, StackedIvf,
-    StackedIvfBuilder, StackedIvfConfig, StackedSearchStats, SuperKMeansLevelClusterer,
-    PARENT_NPROBE_FRACTION,
-};
-pub use router::{RouterKind, RouterMetrics, RoutingParams};
-#[cfg(feature = "unstable")]
-#[doc(hidden)]
-pub use search::scan::estimate::quantization_bench_layer0_cosine_cluster;
-#[cfg(feature = "unstable")]
-#[doc(hidden)]
-pub use search::scan::{columns::Columns, layer_read::Decoded};
-pub use search::source::controller::{ProbeTermination, DEFAULT_FIXED_PROBE_COST_ROWS};
-pub use search::SegmentSearcher;
+pub use quantization::{VectorQuantizationConfig, VectorQuantizationLayer};
+pub use router::{RouterKind, RouterMetrics};
+pub use search::source::controller::ProbeTermination;
 pub use stats::ProbeStats;
-pub use storage::bounds::{
-    bounds_verdict, margin_ball_ball, margin_ball_halfspace, residual_norm, to_bound_space,
-    BoundKind, BoundStore, BoundsBuilder, HeapPeek, QueryBound, Verdict,
-};
-pub use storage::centroids::ClusterIndex;
-pub use storage::header::VectorFileVersion;
-pub use storage::io::VectorIoStats;
-pub use storage::metadata::{
-    F64Bits, Grid, Partition, QuantizationSchedule, Quantizer, QuantizerKind, Rotation,
-    VectorColMetadata, VectorFieldMeta,
-};
-pub use storage::reader::VectorIndexReader;
-pub(crate) use telemetry::enter_vector_stage;
+pub use storage::{VectorIndexReader, VectorIoStats};
 pub use telemetry::{current_vector_stage, VectorStage};
 pub use tie_break::NoTieBreak;
-pub use write::flat::FlatVecWriter;
-pub use write::VectorPlugin;
-
-// The schema-level vector types are re-exported here so `crate::vector::{...}`
-// resolves for callers and tests that work entirely within the vector module.
-pub use crate::schema::{Metric, VectorDType, VectorOptions};

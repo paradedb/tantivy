@@ -265,12 +265,13 @@ mod tests {
     use quant_model::f16::f16_to_f32;
 
     use super::*;
+    use crate::schema::VectorOptions;
     use crate::vector::diagnostics::audit::diagnostic_advance_raw_prefix;
     use crate::vector::quantization::QUANTIZED_BOUNDARY_KAPPA;
     use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
     use crate::vector::search::scan::columns::BoundaryHarness;
     use crate::vector::storage::quantized::QuantizedIndexCtx;
-    use crate::vector::{VectorOptions, VectorQuantizationConfig, VectorQuantizationLayer};
+    use crate::vector::{VectorQuantizationConfig, VectorQuantizationLayer};
 
     fn ctx(
         metric: Metric,

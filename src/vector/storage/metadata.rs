@@ -17,7 +17,7 @@ pub(crate) const FLAT_ROWS_PER_BLOCK: u32 = 16_384;
 /// Per-field storage and decoding contract.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
-pub enum VectorColMetadata {
+pub(crate) enum VectorColMetadata {
     /// Full-precision rows without quantized columns.
     Plain(VectorFieldMeta),
     /// Full-precision rows plus ordered residual quantization layers.
@@ -30,7 +30,7 @@ pub enum VectorColMetadata {
 }
 /// Schema and block geometry stored in every Data entry.
 #[derive(Clone, Debug)]
-pub struct VectorFieldMeta {
+pub(crate) struct VectorFieldMeta {
     pub(crate) dim: u32,
     pub(crate) dtype: VectorDType,
     pub(crate) metric: Metric,
@@ -40,7 +40,7 @@ pub struct VectorFieldMeta {
 /// Source of block row boundaries; cluster offsets reside in the centroid file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum Partition {
+pub(crate) enum Partition {
     /// One block per IVF cluster, with offsets stored in the centroid file.
     Clusters,
     /// Fixed-size row groups, with a possibly shorter final block.
@@ -53,7 +53,7 @@ pub enum Partition {
 /// The stable public name of a quantizer family; adding a quantizer adds a variant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
-pub enum QuantizerKind {
+pub(crate) enum QuantizerKind {
     /// One-bit signs scored as popcounted words.
     Sign,
     /// Packed scalar codes scored against reconstruction points.
@@ -62,7 +62,7 @@ pub enum QuantizerKind {
 
 impl QuantizerKind {
     /// Returns the stable public name of this quantizer family.
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Sign => "sign",
             Self::Grid => "grid",
@@ -78,16 +78,16 @@ impl fmt::Display for QuantizerKind {
 
 /// Ordered quantizer families and code widths, independent of rotation seeds.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct QuantizationSchedule(Vec<(QuantizerKind, u8)>);
+pub(crate) struct QuantizationSchedule(Vec<(QuantizerKind, u8)>);
 
 impl QuantizationSchedule {
     /// Constructs a schedule from its ordered layers.
-    pub fn new(layers: Vec<(QuantizerKind, u8)>) -> Self {
+    pub(crate) fn new(layers: Vec<(QuantizerKind, u8)>) -> Self {
         Self(layers)
     }
 
     /// Returns the quantizer family and code width of each layer in order.
-    pub fn layers(&self) -> &[(QuantizerKind, u8)] {
+    pub(crate) fn layers(&self) -> &[(QuantizerKind, u8)] {
         &self.0
     }
 }
@@ -107,7 +107,7 @@ impl fmt::Display for QuantizationSchedule {
 /// Tagged encode/decode contract; a semantic change requires a new variant.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
-pub enum Quantizer {
+pub(crate) enum Quantizer {
     /// One-bit signs scored as popcounted words.
     SignPlane {
         /// Transform applied before encoding and query preparation.
@@ -128,7 +128,7 @@ pub enum Quantizer {
 /// Pins the transform, random generator and seed expansion semantics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
-pub enum Rotation {
+pub(crate) enum Rotation {
     /// Coordinates are used directly.
     None,
     /// Seeded FHT with ChaCha8 and the pinned seed expansion contract.
@@ -139,55 +139,46 @@ pub enum Rotation {
 }
 /// Exact binary64 identity for persisted model parameters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct F64Bits(pub(crate) u64);
+pub(crate) struct F64Bits(pub(crate) u64);
 impl F64Bits {
-    /// Exact stored bits, preserving signed zero and NaN payloads.
-    pub fn to_bits(self) -> u64 {
-        self.0
-    }
     /// Stored model parameter interpreted as binary64.
-    pub fn value(self) -> f64 {
+    pub(crate) fn value(self) -> f64 {
         f64::from_bits(self.0)
     }
 }
 /// Persisted reconstruction points and error-model parameter.
 #[derive(Clone, Debug)]
-pub struct Grid {
+pub(crate) struct Grid {
     pub(crate) points: Vec<f32>,
     pub(crate) rho_model: f64,
 }
 impl VectorFieldMeta {
     /// Number of coordinates per vector.
-    pub fn dim(&self) -> u32 {
+    #[cfg(test)]
+    pub(crate) fn dim(&self) -> u32 {
         self.dim
     }
     /// Stored full-precision element representation.
-    pub fn dtype(&self) -> VectorDType {
+    #[cfg(test)]
+    pub(crate) fn dtype(&self) -> VectorDType {
         self.dtype
     }
     /// Similarity metric used when the segment was built.
-    pub fn metric(&self) -> Metric {
+    pub(crate) fn metric(&self) -> Metric {
         self.metric
     }
     /// Normalization applied to stored rows.
-    pub fn norm_policy(&self) -> VectorNormPolicy {
+    #[cfg(test)]
+    pub(crate) fn norm_policy(&self) -> VectorNormPolicy {
         self.norm_policy
     }
     /// Source of the segment's block row boundaries.
-    pub fn partition(&self) -> &Partition {
+    #[cfg(test)]
+    pub(crate) fn partition(&self) -> &Partition {
         &self.partition
     }
 }
-impl Grid {
-    /// Persisted reconstruction points in code order.
-    pub fn points(&self) -> &[f32] {
-        &self.points
-    }
-    /// Persisted error-model parameter.
-    pub fn rho_model(&self) -> f64 {
-        self.rho_model
-    }
-}
+impl Grid {}
 /// Compares every reconstruction point and model parameter by its exact stored bits.
 impl PartialEq for Grid {
     fn eq(&self, other: &Self) -> bool {
@@ -219,9 +210,9 @@ impl Hash for Grid {
 /// Derived block column; neither this record nor its stride is stored.
 #[derive(Clone, Debug)]
 pub(crate) struct Slot {
-    pub slot_type: SlotType,
-    pub elem: ElemType,
-    pub stride: u32,
+    pub(crate) slot_type: SlotType,
+    pub(crate) elem: ElemType,
+    pub(crate) stride: u32,
 }
 impl Slot {
     /// Width of the element consumed by the decoder, also the column alignment.
@@ -273,7 +264,7 @@ impl SlotType {
 }
 impl Quantizer {
     /// Returns the quantizer family independently of its width and rotation.
-    pub const fn kind(&self) -> QuantizerKind {
+    pub(crate) const fn kind(&self) -> QuantizerKind {
         match self {
             Self::SignPlane { .. } => QuantizerKind::Sign,
             Self::GridPlane { .. } => QuantizerKind::Grid,
@@ -289,14 +280,14 @@ impl Quantizer {
     }
 
     /// Returns the numeric width without using it to infer the quantizer kind.
-    pub fn bits(&self) -> u8 {
+    pub(crate) fn bits(&self) -> u8 {
         match self {
             Self::SignPlane { .. } => 1,
             Self::GridPlane { bits, .. } => *bits,
         }
     }
     /// Returns the tagged transform for this encoding contract.
-    pub fn rotation(&self) -> Rotation {
+    pub(crate) fn rotation(&self) -> Rotation {
         match self {
             Self::SignPlane { rotation, .. } | Self::GridPlane { rotation, .. } => *rotation,
         }
@@ -354,13 +345,13 @@ fn metric_tag(metric: Metric) -> u8 {
 }
 impl VectorColMetadata {
     /// Resolves the field contract without consulting mutable index settings.
-    pub fn field(&self) -> &VectorFieldMeta {
+    pub(crate) fn field(&self) -> &VectorFieldMeta {
         match self {
             Self::Plain(field) | Self::Quantized { field, .. } => field,
         }
     }
     /// Returns the ordered quantizers, or no layers for plain row storage.
-    pub fn layers(&self) -> &[Quantizer] {
+    pub(crate) fn layers(&self) -> &[Quantizer] {
         match self {
             Self::Plain(_) => &[],
             Self::Quantized { layers, .. } => layers,
@@ -368,7 +359,7 @@ impl VectorColMetadata {
     }
     /// Logical quantized bytes per row, including residual norms and layer columns.
     /// Excludes full-precision rows and alignment padding; plain storage returns `None`.
-    pub fn quantized_bytes_per_row(&self) -> Option<usize> {
+    pub(crate) fn quantized_bytes_per_row(&self) -> Option<usize> {
         match self {
             Self::Plain(_) => None,
             Self::Quantized { .. } => Some(

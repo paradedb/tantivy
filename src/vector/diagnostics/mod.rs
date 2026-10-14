@@ -1,6 +1,6 @@
 //! Vector storage diagnostics: segment storage info and estimator and audit measurements.
 
-use crate::vector::storage::metadata::QuantizationSchedule;
+use crate::vector::storage::metadata::{QuantizationSchedule, VectorColMetadata};
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::{DocId, TantivyError};
 
@@ -28,6 +28,10 @@ pub struct VectorInfo {
     pub num_centroids: Option<usize>,
     /// IVF posting-size statistics.
     pub cluster_stats: Option<VectorClusterStats>,
+    /// Bits per stored quantized layer, in scoring order; `None` when the rows are stored plain.
+    pub quantized_layers: Option<Vec<u8>>,
+    /// Quantized bytes stored per row, every layer's columns together; `None` when plain.
+    pub quantized_bytes_per_row: Option<usize>,
 }
 
 /// IVF posting-size statistics.
@@ -326,7 +330,8 @@ pub struct VectorErrorConeAuditMeasurements {
 
 impl VectorErrorAuditMeasurements {
     /// Ordered quantizer kinds and widths, independent of rotation seeds.
-    pub fn schedule(&self) -> &QuantizationSchedule {
+    #[cfg(test)]
+    pub(crate) fn schedule(&self) -> &QuantizationSchedule {
         self.estimator.schedule()
     }
 
@@ -353,7 +358,8 @@ impl VectorErrorAuditMeasurements {
 
 impl VectorEstimatorMeasurements {
     /// Ordered quantizer kinds and widths, independent of rotation seeds.
-    pub fn schedule(&self) -> &QuantizationSchedule {
+    #[cfg(test)]
+    pub(crate) fn schedule(&self) -> &QuantizationSchedule {
         &self.schedule
     }
 
@@ -439,15 +445,22 @@ impl VectorEstimatorMeasurements {
 impl VectorIndexReader {
     /// Storage information for tooling; `None` when the segment has no vector data for the field.
     pub fn info(&self) -> Option<VectorInfo> {
-        if !self.present {
-            return None;
-        }
+        let meta = self.metadata()?;
+        let (quantized_layers, quantized_bytes_per_row) = match meta {
+            VectorColMetadata::Quantized { .. } => (
+                Some(meta.layers().iter().map(|layer| layer.bits()).collect()),
+                meta.quantized_bytes_per_row(),
+            ),
+            VectorColMetadata::Plain(_) => (None, None),
+        };
         let Some(index) = &self.index else {
             return Some(VectorInfo {
                 format: VectorStorageFormat::Flat,
                 num_vectors: self.num_vectors,
                 num_centroids: None,
                 cluster_stats: None,
+                quantized_layers,
+                quantized_bytes_per_row,
             });
         };
         let mut empty_clusters = 0;
@@ -481,6 +494,8 @@ impl VectorIndexReader {
                 avg_cluster_size,
                 empty_clusters,
             }),
+            quantized_layers,
+            quantized_bytes_per_row,
         })
     }
 }

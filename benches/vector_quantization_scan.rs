@@ -11,7 +11,7 @@ use cascade::{audit_split_query_layer_error_squared, prepare_split_query, LayerS
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use quant_model::build_grid;
 use quant_model::f16::f32_to_f16;
-use tantivy::vector::{quantization_bench_layer0_cosine_cluster, Columns, Decoded};
+use tantivy::vector::bench::{quantization_bench_layer0_cosine_cluster, Columns, Decoded};
 
 const DIM: usize = 1_024;
 const ROWS_PER_CLUSTER: usize = 100;

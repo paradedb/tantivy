@@ -30,9 +30,9 @@ use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::vector::{
-    IvfClusterer, RouterKind, SuperKMeansClusterer, VectorPlugin, VectorQuantizationConfig,
-};
+use crate::vector::clustering::{IvfClusterer, SuperKMeansClusterer};
+use crate::vector::write::VectorPlugin;
+use crate::vector::{RouterKind, VectorQuantizationConfig};
 use crate::SegmentReader;
 
 fn load_metas(

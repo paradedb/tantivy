@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 use tantivy::schema::Metric;
-use tantivy::vector::{
+use tantivy::vector::bench::{
     l2_squared, InMemoryStore, StackedIvf, StackedIvfBuilder, StackedIvfConfig,
     SuperKMeansLevelClusterer,
 };

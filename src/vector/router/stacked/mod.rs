@@ -1,8 +1,13 @@
+//! The stacked router: a stacked IVF over a segment's centroids, ranked with fixed nprobe
+//! fractions or the Quake APS.
+
 pub(crate) mod aps;
 pub(crate) mod levels;
 
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
+use crate::vector::clustering::IvfCentroids;
+use crate::vector::distance::Similarity;
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::aps::{
     supports_metric as aps_supports_metric, CandidateRows, RecallEstimator, APS_MAX_DIM,
@@ -12,7 +17,6 @@ use crate::vector::router::stacked::levels::{
     StackedSearchStats, SuperKMeansLevelClusterer, PARENT_NPROBE_FRACTION,
 };
 use crate::vector::router::{RouterMetrics, RoutingParams};
-use crate::vector::{IvfCentroids, Similarity};
 use crate::TantivyError;
 
 /// The router's [`StackedIvfConfig`]. The segment's own IVF (`.vec` rows under

@@ -1,3 +1,6 @@
+//! Cluster routing: the router kinds an IVF segment persists, built at merge and opened per
+//! segment to rank its clusters for a query.
+
 use std::fmt;
 use std::io::{self, Write};
 
@@ -86,7 +89,7 @@ impl fmt::Display for RouterKind {
     }
 }
 
-pub(crate) enum Router<S: crate::vector::VectorArena<Elem = f32>> {
+pub(crate) enum Router<S: crate::vector::router::arena::VectorArena<Elem = f32>> {
     Stacked(StackedIvf<S>),
     Exact(exact::ExactRouter<S>),
 }
@@ -114,16 +117,16 @@ impl BuiltRouter {
 /// Per-query routing knobs. Only the stacked router reads them; the exact router ranks the same
 /// way regardless.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RoutingParams {
+pub(crate) struct RoutingParams {
     /// Clusters the caller expects to probe. The stacked router ranks at
     /// least this many members when APS is on; with APS off it ranks every
     /// member of the lists its nprobe fraction selects.
-    pub k: usize,
+    pub(crate) k: usize,
     /// Stacked-router recall target in `(0, 1]`. `1.0` disables APS and
     /// routes with the fixed nprobe fractions. APS is also disabled above
     /// [`APS_MAX_DIM`](crate::vector::router::stacked::aps::APS_MAX_DIM) regardless of this
     /// value.
-    pub recall: f32,
+    pub(crate) recall: f32,
 }
 
 impl Default for RoutingParams {
@@ -169,6 +172,7 @@ impl Iterator for RouterIter {
 }
 
 impl OpenedRouter {
+    #[cfg(test)]
     pub(crate) fn kind(&self) -> RouterKind {
         match self {
             Self::Stacked(_) => RouterKind::Stacked,
@@ -257,7 +261,7 @@ pub(crate) fn test_clusters() -> Option<RouterIter> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vector::IvfMatrix;
+    use crate::vector::clustering::IvfMatrix;
 
     fn centroids() -> IvfCentroids {
         IvfCentroids::F32(IvfMatrix {

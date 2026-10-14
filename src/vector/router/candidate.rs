@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 
-use crate::vector::Similarity;
+use crate::vector::distance::Similarity;
 
 /// A `(similarity, node)` pair ordered by similarity, ties broken by node id, so a max-heap yields
 /// the most similar first.

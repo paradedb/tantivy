@@ -8,6 +8,11 @@ use crate::error::DataCorruption;
 use crate::fastfield::AliveBitSet;
 use crate::schema::Metric;
 use crate::vector::clustering::decode_row;
+use crate::vector::diagnostics::{
+    VectorErrorAuditMeasurements, VectorErrorConeAuditMeasurements,
+    VectorErrorConeDepthMeasurements, VectorErrorDepthMeasurements, VectorEstimatorMeasurements,
+    VectorEstimatorMoments, VectorEstimatorQuery, VectorEstimatorSource,
+};
 use crate::vector::quantization::{
     corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix,
     quantized_model_sigma, refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError,
@@ -17,11 +22,6 @@ use crate::vector::search::interval::{Estimate, Threshold};
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
 use crate::vector::storage::metadata::QuantizationSchedule;
 use crate::vector::storage::reader::VectorIndexReader;
-use crate::vector::{
-    VectorErrorAuditMeasurements, VectorErrorConeAuditMeasurements,
-    VectorErrorConeDepthMeasurements, VectorErrorDepthMeasurements, VectorEstimatorMeasurements,
-    VectorEstimatorMoments, VectorEstimatorQuery, VectorEstimatorSource,
-};
 use crate::{DocId, TantivyError};
 
 const ERROR_CONE_QUERY_COUNT: usize = 100;

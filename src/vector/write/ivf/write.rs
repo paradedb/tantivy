@@ -9,11 +9,12 @@ use crate::directory::CompositeWrite;
 use crate::schema::Field;
 use crate::vector::router::{BuiltRouter, RouterKind};
 use crate::vector::storage::blocks::{write_metadata, BlockDirectory};
+use crate::vector::storage::bounds::BoundKind;
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::header::{CentroidSlot, VectorEntry, HEADER_LEN};
 use crate::vector::storage::id_map::{DocLocation, IdMap};
 use crate::vector::storage::metadata::VectorColMetadata;
-use crate::vector::{BoundKind, ENTRY_ALIGN};
+use crate::vector::ENTRY_ALIGN;
 use crate::TantivyError;
 
 /// Writes a field's `.centroids` slots: centroids, offsets, bounds, then the router.

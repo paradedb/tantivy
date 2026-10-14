@@ -24,12 +24,14 @@ use crate::collector::sort_key::Comparator;
 use crate::collector::SegmentSortKeyComputer;
 use crate::error::DataCorruption;
 use crate::schema::Metric;
+use crate::vector::distance::Similarity;
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource, Feedback};
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery};
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::quantized::{QuantizedFieldReader, ReadScratch};
 use crate::vector::storage::reader::VectorIndexReader;
-use crate::vector::{enter_vector_stage, Similarity, VectorElement, VectorStage};
+use crate::vector::telemetry::enter_vector_stage;
+use crate::vector::{VectorElement, VectorStage};
 use crate::SegmentOrdinal;
 
 // --- Contracts ---

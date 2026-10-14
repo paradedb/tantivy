@@ -8,7 +8,8 @@ use crate::vector::search::cluster_source::{ClusterRows, ClusterSource, Feedback
 use crate::vector::search::source::controller::{WorkBudget, WorkMeter};
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::reader::VectorIndexReader;
-use crate::vector::{enter_vector_stage, VectorStage};
+use crate::vector::telemetry::enter_vector_stage;
+use crate::vector::VectorStage;
 use crate::{DocId, SegmentReader};
 
 /// What the filter-match source counted.

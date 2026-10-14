@@ -33,7 +33,7 @@ use crate::vector::VectorElement;
 /// at build time — one kind for every cluster of a field's segment.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
-pub enum BoundKind {
+pub(crate) enum BoundKind {
     /// One `f32` per cluster: max `||x - c||` over members, in the
     /// stored representation. Metric-uniform by the cosine
     /// write-normalization invariant (unit members + renormalized
@@ -55,7 +55,7 @@ impl BoundKind {
     ///
     /// Returns (`io::Result<BoundKind>`): the kind, or `InvalidData` for a
     /// byte no known kind uses — a corrupt or future-format slot.
-    pub fn from_code(code: u8) -> io::Result<BoundKind> {
+    pub(crate) fn from_code(code: u8) -> io::Result<BoundKind> {
         match code {
             0 => Ok(BoundKind::Ball),
             other => Err(io::Error::new(
@@ -71,7 +71,7 @@ impl BoundKind {
     ///   future per-dimension kinds.
     ///
     /// Returns (`usize`): how many `f32`s one cluster's bound occupies.
-    pub fn stride(self, _dim: usize) -> usize {
+    pub(crate) fn stride(self, _dim: usize) -> usize {
         match self {
             BoundKind::Ball => 1,
             // BoundKind::Aabb => dim,
@@ -81,7 +81,7 @@ impl BoundKind {
 
 /// Read view over the bounds payload of one segment's `.centroids` field
 /// slot.
-pub struct BoundStore<'a> {
+pub(crate) struct BoundStore<'a> {
     kind: BoundKind,
     data: &'a [f32],
 }
@@ -95,14 +95,15 @@ impl<'a> BoundStore<'a> {
     ///
     /// Returns (`BoundStore`): the view; per-kind accessors validate the
     /// kind on read.
-    pub fn new(kind: BoundKind, data: &'a [f32]) -> Self {
+    pub(crate) fn new(kind: BoundKind, data: &'a [f32]) -> Self {
         Self { kind, data }
     }
 
     /// The segment-level bound kind of this store.
     ///
     /// Returns (`BoundKind`): the kind every cluster in the store uses.
-    pub fn kind(&self) -> BoundKind {
+    #[cfg(test)]
+    pub(crate) fn kind(&self) -> BoundKind {
         self.kind
     }
 
@@ -113,7 +114,7 @@ impl<'a> BoundStore<'a> {
     /// Returns (`f32`): max native-member residual norm against the stored
     /// centroid; `f32::INFINITY` = SATURATED (always probes).
     #[inline]
-    pub fn ball_r(&self, cluster: usize) -> f32 {
+    pub(crate) fn ball_r(&self, cluster: usize) -> f32 {
         debug_assert_eq!(self.kind, BoundKind::Ball);
         self.data[cluster]
     }
@@ -121,7 +122,8 @@ impl<'a> BoundStore<'a> {
     /// The raw payload, for serialization and tests.
     ///
     /// Returns (`&[f32]`): the values [`Self::new`] was built over.
-    pub fn values(&self) -> &'a [f32] {
+    #[cfg(test)]
+    pub(crate) fn values(&self) -> &'a [f32] {
         self.data
     }
 }
@@ -133,7 +135,7 @@ impl<'a> BoundStore<'a> {
 // exists, by design -- folded input radii under merge are unsound.
 
 /// Accumulates one segment's per-cluster ball bounds during a merge.
-pub struct BoundsBuilder {
+pub(crate) struct BoundsBuilder {
     r: Vec<f32>,
 }
 
@@ -145,7 +147,7 @@ impl BoundsBuilder {
     /// * `num_clusters` (`usize`) — cluster count of the segment being written.
     ///
     /// Returns (`BoundsBuilder`): the zeroed fold state.
-    pub fn new(num_clusters: usize) -> Self {
+    pub(crate) fn new(num_clusters: usize) -> Self {
         Self {
             r: vec![0.0; num_clusters],
         }
@@ -156,7 +158,7 @@ impl BoundsBuilder {
     /// * `cluster` (`usize`) — the member's HOME (primary) cluster.
     /// * `residual_norm` (`f32`) — `||x - c||` of the member's STORED row against the STORED
     ///   centroid (post-renormalization for cosine). A non-finite residual saturates the cluster.
-    pub fn add_native(&mut self, cluster: usize, residual_norm: f32) {
+    pub(crate) fn add_native(&mut self, cluster: usize, residual_norm: f32) {
         let slot = &mut self.r[cluster];
         if !residual_norm.is_finite() {
             *slot = f32::INFINITY; // SATURATED
@@ -170,7 +172,7 @@ impl BoundsBuilder {
     /// it can certify a skip.
     ///
     /// * `cluster` (`usize`) — the cluster to saturate.
-    pub fn saturate(&mut self, cluster: usize) {
+    pub(crate) fn saturate(&mut self, cluster: usize) {
         self.r[cluster] = f32::INFINITY;
     }
 
@@ -178,7 +180,7 @@ impl BoundsBuilder {
     ///
     /// Returns (`Vec<f32>`): the per-cluster ball bounds in cluster order —
     /// the [`BoundKind::Ball`] slot payload.
-    pub fn finish(self) -> Vec<f32> {
+    pub(crate) fn finish(self) -> Vec<f32> {
         self.r
     }
 }
@@ -194,7 +196,7 @@ impl BoundsBuilder {
 /// Returns (`f32`): the L2 residual norm, accumulated in `f64` so no
 /// finite input overflows; non-finite inputs propagate to a non-finite
 /// result (which saturates at the builder).
-pub fn residual_norm<T: VectorElement>(row_bytes: &[u8], c: &[f32]) -> f32 {
+pub(crate) fn residual_norm<T: VectorElement>(row_bytes: &[u8], c: &[f32]) -> f32 {
     debug_assert_eq!(row_bytes.len(), c.len() * T::SIZE_BYTES);
     let mut acc = 0.0f64;
     for (chunk, &ci) in row_bytes.chunks_exact(T::SIZE_BYTES).zip(c) {
@@ -215,7 +217,7 @@ pub fn residual_norm<T: VectorElement>(row_bytes: &[u8], c: &[f32]) -> f32 {
 /// ranks by (`-d^2` for L2, cosine for cosine, the raw score for dot).
 /// Conversion into bound space is the query bound's job, downstream.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum HeapPeek {
+pub(crate) enum HeapPeek {
     /// Fewer than k results collected; no kth key exists.
     Filling,
     /// Exactly k results held; `kth_key` (`f32`) is the exact kth-best
@@ -233,7 +235,7 @@ impl HeapPeek {
     /// Returns (`HeapPeek`): `Full` iff the heap holds k results.
     ///
     /// [`TopNComputer::kth_best`]: crate::collector::TopNComputer::kth_best
-    pub fn from_kth(kth: Option<f32>) -> HeapPeek {
+    pub(crate) fn from_kth(kth: Option<f32>) -> HeapPeek {
         match kth {
             Some(kth_key) => HeapPeek::Full { kth_key },
             None => HeapPeek::Filling,
@@ -246,7 +248,7 @@ impl HeapPeek {
 /// cosine sqrt is paid per heap update, not per cluster. `Filling` makes
 /// armed-only structural: no threshold exists before k results.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum QueryBound {
+pub(crate) enum QueryBound {
     /// Fewer than k results; no threshold exists.
     Filling,
     /// The heap holds k results; `t` (`f32`) is the kth threshold in
@@ -266,7 +268,7 @@ pub enum QueryBound {
 /// halfspace offset `s_k`). Float-noise excursions past the metric's key
 /// range clamp to `0.0`; a NaN key propagates and fails open downstream.
 #[inline]
-pub fn to_bound_space(metric: Metric, heap_key: f32) -> f32 {
+pub(crate) fn to_bound_space(metric: Metric, heap_key: f32) -> f32 {
     match metric {
         Metric::L2 => (-heap_key).max(0.0).sqrt(),
         Metric::Cosine => (2.0 * (1.0 - heap_key).max(0.0)).sqrt(),
@@ -355,7 +357,7 @@ impl QueryBoundTracker {
 /// Returns (`f32`): the signed margin — `>= 0` probe, `< 0` skip-safe
 /// (strict). Magnitude = overlap quality; never an ordering key.
 #[inline]
-pub fn margin_ball_ball(t: f32, r: f32, separation: f32) -> f32 {
+pub(crate) fn margin_ball_ball(t: f32, r: f32, separation: f32) -> f32 {
     (t + r) - separation
 }
 
@@ -371,7 +373,7 @@ pub fn margin_ball_ball(t: f32, r: f32, separation: f32) -> f32 {
 /// Returns (`f32`): the signed margin — `>= 0` probe, `< 0` skip-safe
 /// (strict). Magnitude = overlap quality; never an ordering key.
 #[inline]
-pub fn margin_ball_halfspace(q_dot_c: f32, q_norm: f32, r: f32, s_k: f32) -> f32 {
+pub(crate) fn margin_ball_halfspace(q_dot_c: f32, q_norm: f32, r: f32, s_k: f32) -> f32 {
     (q_dot_c + q_norm * r) - s_k
 }
 
@@ -393,7 +395,7 @@ pub fn margin_ball_halfspace(q_dot_c: f32, q_norm: f32, r: f32, s_k: f32) -> f32
 
 /// The gate's decision for one ranked cluster.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verdict {
+pub(crate) enum Verdict {
     /// Open and scan the cluster.
     Probe,
     /// Pass the cluster over — its bound proves it cannot improve the
@@ -413,7 +415,7 @@ pub enum Verdict {
 /// compares false and probes: fail-open is arithmetic. Margin magnitude
 /// is the overlap-quality number and is NEVER an ordering key.
 #[inline]
-pub fn bounds_verdict(qb: QueryBound, margin: impl FnOnce() -> f32) -> Verdict {
+pub(crate) fn bounds_verdict(qb: QueryBound, margin: impl FnOnce() -> f32) -> Verdict {
     match qb {
         QueryBound::Filling => Verdict::Probe,
         QueryBound::Armed { .. } => {
