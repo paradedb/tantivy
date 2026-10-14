@@ -948,6 +948,82 @@ mod tests {
             assert_eq!(term_scorer.seek(addr.doc_id), addr.doc_id);
             assert_nearly_equals!(*score, term_scorer.score());
         }
+
+        Ok(())
+    }
+
+    // Each excluded query sits on its first match, doc 150, while the MUST term starts at doc 0.
+    // `Exclude` must not call `seek_danger` below doc 150: two ranges form an `Intersection`
+    // whose `RangeDocSet`s were seeked to doc 150, and a phrase asserts `target >= doc`.
+    #[test]
+    pub fn test_must_not_starts_after_must() -> crate::Result<()> {
+        use crate::query::PhraseQuery;
+
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let tag_field = schema_builder.add_text_field("tag", TEXT);
+        let num_a =
+            schema_builder.add_i64_field("a", NumericOptions::default().set_fast().set_indexed());
+        let num_b =
+            schema_builder.add_i64_field("b", NumericOptions::default().set_fast().set_indexed());
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            for i in 0..300i64 {
+                let tag = if i >= 150 && i % 10 == 0 {
+                    "red apple"
+                } else {
+                    "apple red"
+                };
+                index_writer.add_document(doc!(
+                    text_field => "target",
+                    tag_field => tag,
+                    num_a => i,
+                    num_b => i,
+                ))?;
+            }
+            index_writer.commit()?;
+        }
+        let searcher = index.reader()?.searcher();
+
+        let must_not = |excluded: Box<dyn Query>| {
+            BooleanQuery::new(vec![
+                (
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(text_field, "target"),
+                        IndexRecordOption::WithFreqs,
+                    )) as Box<dyn Query>,
+                ),
+                (Occur::MustNot, excluded),
+            ])
+        };
+        let range = |field: Field, lower: i64| -> Box<dyn Query> {
+            Box::new(RangeQuery::new(
+                Bound::Included(Term::from_field_i64(field, lower)),
+                Bound::Unbounded,
+            ))
+        };
+        let phrase: Box<dyn Query> = Box::new(PhraseQuery::new(vec![
+            Term::from_field_text(tag_field, "red"),
+            Term::from_field_text(tag_field, "apple"),
+        ]));
+        let ranges: Box<dyn Query> = Box::new(BooleanQuery::new(vec![
+            (Occur::Must, range(num_a, 100)),
+            (Occur::Must, range(num_b, 150)),
+        ]));
+
+        for (excluded, expected_count) in [(phrase, 285), (ranges, 150)] {
+            let query = must_not(excluded);
+            assert_eq!(
+                searcher.search(&query, &Count)?,
+                expected_count,
+                "{query:?}"
+            );
+            let top_docs = searcher.search(&query, &TopDocs::with_limit(10).order_by_score())?;
+            assert_eq!(top_docs.len(), 10, "{query:?}");
+        }
+
         Ok(())
     }
 

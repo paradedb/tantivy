@@ -11,22 +11,47 @@ pub trait ExclusionSet: Send {
     fn contains(&mut self, doc: DocId) -> bool;
 }
 
-impl<TDocSet: DocSet> ExclusionSet for TDocSet {
-    #[inline]
-    fn contains(&mut self, doc: DocId) -> bool {
-        self.seek_danger(doc) == SeekDangerResult::Found
+/// A `DocSet` used as an exclusion set.
+///
+/// It remembers the lowest doc the `DocSet` can still contain, starting from the doc the `DocSet`
+/// is on, and answers lower docs without calling `seek_danger`. `seek_danger` targets then never
+/// go below the `DocSet`'s position, which `PhraseScorer` asserts and `RangeDocSet` relies on.
+pub struct ExcludedDocSet<TDocSet> {
+    docset: TDocSet,
+    lower_bound: DocId,
+}
+
+impl<TDocSet: DocSet> ExcludedDocSet<TDocSet> {
+    /// Wraps a `DocSet` that has not been probed with `seek_danger` yet.
+    pub fn new(docset: TDocSet) -> Self {
+        let lower_bound = docset.doc();
+        ExcludedDocSet {
+            docset,
+            lower_bound,
+        }
     }
 }
 
-impl<TDocSet: DocSet> ExclusionSet for Vec<TDocSet> {
+impl<TDocSet: DocSet> ExclusionSet for ExcludedDocSet<TDocSet> {
     #[inline]
     fn contains(&mut self, doc: DocId) -> bool {
-        for docset in self.iter_mut() {
-            if docset.seek_danger(doc) == SeekDangerResult::Found {
-                return true;
+        if doc < self.lower_bound {
+            return false;
+        }
+        match self.docset.seek_danger(doc) {
+            SeekDangerResult::Found => true,
+            SeekDangerResult::SeekLowerBound(lower_bound) => {
+                self.lower_bound = lower_bound;
+                false
             }
         }
-        false
+    }
+}
+
+impl<TDocSet: DocSet> ExclusionSet for Vec<ExcludedDocSet<TDocSet>> {
+    #[inline]
+    fn contains(&mut self, doc: DocId) -> bool {
+        self.iter_mut().any(|docset| docset.contains(doc))
     }
 }
 
@@ -154,7 +179,7 @@ mod tests {
     fn test_exclude() {
         let mut exclude_scorer = Exclude::new(
             VecDocSet::from(vec![1, 2, 5, 8, 10, 15, 24]),
-            VecDocSet::from(vec![1, 2, 3, 10, 16, 24]),
+            ExcludedDocSet::new(VecDocSet::from(vec![1, 2, 3, 10, 16, 24])),
         );
         let mut els = vec![];
         while exclude_scorer.doc() != TERMINATED {
@@ -170,7 +195,7 @@ mod tests {
             || {
                 Box::new(Exclude::new(
                     VecDocSet::from(vec![1, 2, 5, 8, 10, 15, 24]),
-                    VecDocSet::from(vec![1, 2, 3, 10, 16, 24]),
+                    ExcludedDocSet::new(VecDocSet::from(vec![1, 2, 3, 10, 16, 24])),
                 ))
             },
             vec![5, 8, 10, 15, 24],
@@ -186,7 +211,7 @@ mod tests {
             || {
                 Box::new(Exclude::new(
                     VecDocSet::from(sample_include.clone()),
-                    VecDocSet::from(sample_exclude.clone()),
+                    ExcludedDocSet::new(VecDocSet::from(sample_exclude.clone())),
                 ))
             },
             sample_skip,
@@ -221,13 +246,13 @@ mod tests {
     fn exclude_with_counts(
         include: Vec<DocId>,
         exclude: Vec<DocId>,
-    ) -> Exclude<CountingDocSet, VecDocSet> {
+    ) -> Exclude<CountingDocSet, ExcludedDocSet<VecDocSet>> {
         Exclude::new(
             CountingDocSet {
                 inner: VecDocSet::from(include),
                 advances: 0,
             },
-            VecDocSet::from(exclude),
+            ExcludedDocSet::new(VecDocSet::from(exclude)),
         )
     }
 
@@ -283,7 +308,7 @@ mod tests {
         for target in 0..30 {
             let mut fresh = Exclude::new(
                 VecDocSet::from(include.clone()),
-                VecDocSet::from(exclude.clone()),
+                ExcludedDocSet::new(VecDocSet::from(exclude.clone())),
             );
             // `seek` must not move backwards, and the leading excluded docs are already skipped.
             if target < fresh.doc() {
@@ -292,7 +317,7 @@ mod tests {
             let next = fresh.seek(target);
             let mut probed = Exclude::new(
                 VecDocSet::from(include.clone()),
-                VecDocSet::from(exclude.clone()),
+                ExcludedDocSet::new(VecDocSet::from(exclude.clone())),
             );
             match probed.seek_danger(target) {
                 SeekDangerResult::Found => assert_eq!(next, target, "target {target}"),
