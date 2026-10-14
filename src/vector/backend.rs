@@ -377,6 +377,7 @@ pub(crate) struct QuantizedStageTrace {
     pub(crate) estimates: Vec<Vec<(usize, DocId, u32)>>,
     pub(crate) boundary_docs: Vec<Vec<DocId>>,
     pub(crate) rerank_docs: Vec<DocId>,
+    rerank_rows: Vec<usize>,
     scored_rows: Vec<usize>,
     boundary_rows: Vec<Vec<usize>>,
     estimate_rows: Vec<Vec<(usize, u32)>>,
@@ -392,6 +393,7 @@ impl QuantizedStageTrace {
             result
         };
         self.scored_docs = translate(&self.scored_rows);
+        self.rerank_docs = translate(&self.rerank_rows);
         self.boundary_docs = self
             .boundary_rows
             .iter()
@@ -2670,30 +2672,9 @@ impl<T: VectorElement> VectorBackend<T> {
                 .all(|pair| pair[0] < pair[1]),
             "boundary survivors are row-sorted"
         );
-        let mut first = 0;
-        let mut cluster = 0;
-        while first < scan.candidates.len() {
-            while index.cluster_range(cluster).end <= scan.candidates.rows[first] {
-                cluster += 1;
-            }
-            let cluster_rows = index.cluster_range(cluster);
-            let end = first
-                + scan.candidates.rows[first..].partition_point(|&row| row < cluster_rows.end);
-            if scan.candidates.docs[first..end].contains(&DocId::MAX) {
-                self.reader.read_doc_ids(cluster, &mut cluster_docs)?;
-                for candidate in first..end {
-                    if scan.candidates.docs[candidate] == DocId::MAX {
-                        scan.candidates.docs[candidate] =
-                            cluster_docs[scan.candidates.rows[candidate] - cluster_rows.start];
-                    }
-                }
-            }
-            first = end;
-        }
         #[cfg(test)]
         {
-            stats.quantized_trace.rerank_docs = scan.candidates.docs.clone();
-            stats.quantized_trace.rerank_docs.sort_unstable();
+            stats.quantized_trace.rerank_rows = scan.candidates.rows.clone();
         }
         let rerank_batch = self.reader.read_vector_rows_planned(
             &scan.candidates.rows,
@@ -2706,20 +2687,43 @@ impl<T: VectorElement> VectorBackend<T> {
 
         let mut topn =
             TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator));
-        // Row-sorted survivors own their document ids; the batch ordinal addresses both.
+        let mut cluster = 0;
+        let mut loaded_doc_cluster = None;
         for (candidate, (batch_row, bytes)) in rerank_batch.iter().enumerate() {
             debug_assert_eq!(scan.candidates.rows[candidate], batch_row);
-            let doc = scan.candidates.docs[candidate];
             let score_start = Instant::now();
-            {
-                let _rerank_score_stage = enter_vector_stage(Stage::RerankScore);
-                let score = self.query.score_doc_bytes(bytes);
-                if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
-                    topn.push_unordered(key, doc);
-                }
-            }
-            stats.rerank_score_ns += score_start.elapsed().as_nanos() as u64;
+            let _rerank_score_stage = enter_vector_stage(Stage::RerankScore);
+            let score = self.query.score_doc_bytes(bytes);
             stats.exact_rows_read += 1;
+            if topn
+                .threshold
+                .as_ref()
+                .is_some_and(|((threshold, _), _)| score < *threshold)
+            {
+                stats.rerank_score_ns += score_start.elapsed().as_nanos() as u64;
+                continue;
+            }
+            let mut fetch_ns = 0;
+            let mut doc = scan.candidates.docs[candidate];
+            if doc == DocId::MAX {
+                while index.cluster_range(cluster).end <= batch_row {
+                    cluster += 1;
+                }
+                if loaded_doc_cluster != Some(cluster) {
+                    let fetch_start = Instant::now();
+                    let _fetch_stage = enter_vector_stage(Stage::RerankFetch);
+                    self.reader.read_doc_ids(cluster, &mut cluster_docs)?;
+                    fetch_ns = fetch_start.elapsed().as_nanos() as u64;
+                    stats.rerank_fetch_ns += fetch_ns;
+                    loaded_doc_cluster = Some(cluster);
+                }
+                doc = cluster_docs[batch_row - index.cluster_range(cluster).start];
+            }
+            if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
+                topn.push_unordered(key, doc);
+            }
+            stats.rerank_score_ns +=
+                (score_start.elapsed().as_nanos() as u64).saturating_sub(fetch_ns);
         }
         let segment_ord = self.segment_ord;
         let assembly_start = Instant::now();

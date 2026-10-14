@@ -1,5 +1,5 @@
 use super::*;
-use crate::schema::Value;
+use crate::schema::{Value, FAST};
 use crate::vector::prepared::{corrected_quantized_estimate, ArithmeticError};
 use crate::vector::storage_io::test_support::{PagedDirectory, PAGE_BYTES};
 
@@ -73,7 +73,7 @@ fn fixture_with_seed(
     let mut schema = Schema::builder();
     let vector = schema.add_vector_field("embedding", VectorOptions::new(DIM, metric));
     let label = schema.add_text_field("label", STRING | STORED);
-    let ordinal = schema.add_u64_field("ordinal", STORED);
+    let ordinal = schema.add_u64_field("ordinal", STORED | FAST);
     let directory = PagedDirectory::default();
     let index = Index::builder()
         .schema(schema.build())
@@ -147,8 +147,8 @@ fn vector_read_kinds_follow_data_for_dense_and_sparse_access() -> crate::Result<
     let (index, directory) = fixture_with_deletes(Metric::Cosine, &[1, 1], false)?;
     let reader = index.reader()?;
     let searcher = reader.searcher();
-    let vectors = searcher.segment_readers()[0]
-        .vector_index(index.schema().get_field("embedding")?)?;
+    let vectors =
+        searcher.segment_readers()[0].vector_index(index.schema().get_field("embedding")?)?;
     let rows = vectors.index().unwrap().cluster_range(2);
     let layers = vectors.quantization().unwrap().layers();
     directory.read_kinds.lock().unwrap().clear();
@@ -160,7 +160,10 @@ fn vector_read_kinds_follow_data_for_dense_and_sparse_access() -> crate::Result<
     let sparse = layers[1].cluster_in_block(2)?;
     sparse.read_codes(rows.start..rows.start + 1)?;
     sparse.read_sidecar()?;
-    vectors.quantization().unwrap().read_residual_norms(rows.start..rows.start + 1)?;
+    vectors
+        .quantization()
+        .unwrap()
+        .read_residual_norms(rows.start..rows.start + 1)?;
     vectors.read_vector_rows_planned(&[rows.start], &mut Vec::new(), &mut Vec::new())?;
     assert_eq!(
         *directory.read_kinds.lock().unwrap(),
@@ -745,7 +748,7 @@ fn doc_column_ranges(
 }
 
 #[test]
-fn open_gate_reads_doc_ids_only_for_rerank() -> crate::Result<()> {
+fn open_gate_reads_doc_ids_only_for_competitive_rerank() -> crate::Result<()> {
     use crate::vector::Stage;
     let (index, directory) = fixture_with_deletes(Metric::L2, &[1, 4], false)?;
     let reader = index.reader()?;
@@ -762,8 +765,11 @@ fn open_gate_reads_doc_ids_only_for_rerank() -> crate::Result<()> {
             min_probe_clusters: 4,
             ..Default::default()
         });
+    directory.read_kinds.lock().unwrap().clear();
     let open = searcher.search(&AllQuery, &collector)?;
     let reads = directory.reads.lock().unwrap().clone();
+    let kinds = directory.read_kinds.lock().unwrap().clone();
+    assert_eq!(reads.len(), kinds.len());
     let overlaps =
         |a: &std::ops::Range<usize>, b: &std::ops::Range<usize>| a.start < b.end && b.start < a.end;
     for (stage, range) in &reads {
@@ -786,15 +792,32 @@ fn open_gate_reads_doc_ids_only_for_rerank() -> crate::Result<()> {
             .iter()
             .filter(|(stage, read)| matches!(stage, Stage::RerankFetch) && read == range)
             .count();
-        assert_eq!(
-            actual, expected,
-            "cluster={cluster} column=DocIds rerank requests"
+        assert!(
+            actual <= expected,
+            "cluster={cluster} column=DocIds rerank requests={actual} expected<={expected}"
         );
+        if docs.iter().any(|doc| {
+            open.results
+                .iter()
+                .any(|(_, address)| address.doc_id == *doc)
+        }) {
+            assert_eq!(actual, 1, "cluster={cluster} winner doc IDs must be loaded");
+        }
         assert_eq!(
             reads.iter().filter(|(_, read)| read == range).count(),
-            expected,
+            actual,
             "cluster={cluster} column=DocIds extra trace requests"
         );
+        for (read_idx, _) in reads
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, read))| read == range)
+        {
+            assert!(
+                kinds[..read_idx].contains(&crate::vector::VectorReadKind::FullPrecision),
+                "cluster={cluster} doc IDs read before exact scoring was possible"
+            );
+        }
     }
     for layer in 0..2 {
         let requested: Vec<_> = reads
@@ -827,6 +850,45 @@ fn open_gate_reads_doc_ids_only_for_rerank() -> crate::Result<()> {
         open.stats[0].quantized_trace.boundary_docs,
         filtered.stats[0].quantized_trace.boundary_docs
     );
+    Ok(())
+}
+
+#[test]
+fn deferred_rerank_doc_ids_preserve_score_and_secondary_ties() -> crate::Result<()> {
+    use crate::collector::sort_key::SortByStaticFastValue;
+    use crate::Order;
+
+    let (index, _) = fixture_with_deletes(Metric::Dot, &[1, 1], false)?;
+    let searcher = index.reader()?.searcher();
+    let field = index.schema().get_field("embedding")?;
+    let params = AdaptiveProbeParams {
+        max_probe_fraction: 1.0,
+        min_probe_clusters: 4,
+        ..Default::default()
+    };
+    for k in [1, 3, 7] {
+        let collector = TopDocsByVectorSimilarity::new(field, vec![0.0; DIM], k)
+            .with_adaptive_params(params.clone());
+        let exact = TopDocsByVectorSimilarity::new(field, vec![0.0; DIM], k)
+            .with_adaptive_params(params.clone())
+            .with_max_scan_levels(0);
+        let actual = searcher.search(&AllQuery, &collector)?;
+        assert!(actual.stats[0].layers.get(1).is_some());
+        assert_eq!(actual.results, searcher.search(&AllQuery, &exact)?.results);
+        for order in [Order::Asc, Order::Desc] {
+            let collector = TopDocsByVectorSimilarity::new(field, vec![0.0; DIM], k)
+                .with_adaptive_params(params.clone())
+                .with_tie_break((SortByStaticFastValue::<u64>::for_field("ordinal"), order));
+            let exact = TopDocsByVectorSimilarity::new(field, vec![0.0; DIM], k)
+                .with_adaptive_params(params.clone())
+                .with_max_scan_levels(0)
+                .with_tie_break((SortByStaticFastValue::<u64>::for_field("ordinal"), order));
+            assert_eq!(
+                searcher.search(&AllQuery, &collector)?.results,
+                searcher.search(&AllQuery, &exact)?.results,
+            );
+        }
+    }
     Ok(())
 }
 
