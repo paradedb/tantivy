@@ -1,6 +1,6 @@
-# grid-plane
+# grid
 
-2–4-bit scalar quantization against a `quant-model` grid, with packed code
+2–4-bit scalar quantization against a `model` grid, with packed code
 rows and lookup-table scoring.
 
 ## Row layout
@@ -17,7 +17,7 @@ marginal the grid was built for. Codes are the nearest grid point of
 input encodes to zero bytes and scale `0.0`.
 
 ```rust
-let grid = quant_model::build_grid(d, bits);      // bits in 2..=4 here
+let grid = model::build_grid(d, bits);      // bits in 2..=4 here
 let mut codes = vec![0u8; packed_len(d, bits)];
 let scale_f16 = encode(&y, &grid.points, bits, &mut codes);
 let scale_f32 = encode_f32(&y, &grid.points, bits, &mut codes);
@@ -64,5 +64,5 @@ zero rows, and a golden for the packed 4-bit pipeline (`build_packed_lut_4`
 → `score_batch_packed_4`) so a change to the fold or the byte order fails
 before it reaches a stored file.
 
-`cargo bench -p grid-plane --bench kernels` times encode, scalar score, and
+`cargo bench -p tantivy-quant --bench grid_kernels` times encode, scalar score, and
 the batch kernels at `d = 768` for 2, 3, and 4 bits.

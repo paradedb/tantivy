@@ -925,7 +925,7 @@ fn assert_quantized_bridge_exactness(dim: usize) -> crate::Result<()> {
     let query: Vec<f32> = (0..dim)
         .map(|coordinate| ((coordinate as f32 + 0.5) * 0.031).cos())
         .collect();
-    let harness = cascade::prepare_split_query(&query, &specs, &grids, 4);
+    let harness = quant::cascade::prepare_split_query(&query, &specs, &grids, 4);
     let scan = QuantizedQueryCtx::new(
         Arc::clone(quantized.index_ctx()),
         &VectorQuery::new(quantized.index_ctx().meta.field().metric, Arc::new(query)),
@@ -1261,8 +1261,8 @@ fn merge_quantization_matches_kernel_harness_and_is_reproducible() -> crate::Res
             let vector =
                 decode_row::<f32>(&vector_reader.vector_bytes_for_row(row)?, QUANT_FIXTURE_DIM)?;
             let mut expected_input = vector.clone();
-            let mut workspace = cascade::BatchEncodeWorkspace::new();
-            let expected = cascade::encode_batch_in_place_with_workspace(
+            let mut workspace = quant::cascade::BatchEncodeWorkspace::new();
+            let expected = quant::cascade::encode_batch_in_place_with_workspace(
                 &mut expected_input,
                 1,
                 &prepared,
@@ -1289,11 +1289,11 @@ fn merge_quantization_matches_kernel_harness_and_is_reproducible() -> crate::Res
                 assert_eq!(stored.scale(row)?, expected.layers[layer].scales[0]);
                 assert_eq!(
                     stored.gamma(row)?.to_bits(),
-                    quant_model::f16::f16_to_f32(expected.layers[layer].gammas[0]).to_bits()
+                    quant::model::f16::f16_to_f32(expected.layers[layer].gammas[0]).to_bits()
                 );
                 assert_eq!(
                     stored.error_ratio(row)?.to_bits(),
-                    quant_model::f16::f16_to_f32(expected.layers[layer].corrected_error_ratios[0])
+                    quant::model::f16::f16_to_f32(expected.layers[layer].corrected_error_ratios[0])
                         .to_bits()
                 );
                 assert_eq!(
@@ -1610,7 +1610,8 @@ fn general_dimension_quantized_bridge_at_d100() -> crate::Result<()> {
                 .zip(&centroid)
                 .map(|(&value, &center)| value - center)
                 .collect();
-            let expected = cascade::encode_layers(&residual, Some(&prepared), &specs, &grids);
+            let expected =
+                quant::cascade::encode_layers(&residual, Some(&prepared), &specs, &grids);
             for (layer, stored) in quantized.layers().iter().enumerate() {
                 assert_eq!(stored.code_bytes(row)?.as_slice(), expected.codes[layer]);
                 assert_eq!(stored.scale(row)?, expected.scales[layer]);

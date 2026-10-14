@@ -3,7 +3,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-packages="-p fht -p sign-plane -p grid-plane -p quant-model -p cascade"
+packages="-p tantivy-quant"
 
 # shellcheck disable=SC2086 # the package list is intentionally word-split.
 cargo +nightly fmt --check $packages

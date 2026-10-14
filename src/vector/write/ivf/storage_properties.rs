@@ -200,9 +200,9 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
         let mut docs = Vec::new();
         vectors.read_doc_ids(cluster, &mut docs)?;
         let centroid = floats(&centroids[cluster * DIM * 4..(cluster + 1) * DIM * 4]);
-        let prepared = cascade::prepare_centroid(&centroid, &ctx.specs);
+        let prepared = quant::cascade::prepare_centroid(&centroid, &ctx.specs);
         let mut values = floats(&row_bytes);
-        let encoded = cascade::encode_batch_in_place(
+        let encoded = quant::cascade::encode_batch_in_place(
             &mut values,
             rows.len(),
             &prepared,
@@ -572,7 +572,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                     }
                     let estimate = corrected_quantized_estimate(
                         metric,
-                        quant_model::f16::f16_to_f32(encoded.layers[layer].gammas[local]),
+                        quant::model::f16::f16_to_f32(encoded.layers[layer].gammas[local]),
                         raw,
                         base,
                     );

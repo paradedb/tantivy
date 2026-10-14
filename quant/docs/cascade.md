@@ -1,6 +1,6 @@
 # cascade
 
-Layered residual quantization. Composes `fht`, `sign-plane`, and `grid-plane`
+Layered residual quantization. Composes `rotation`, `sign`, and `grid`
 into a schedule of 1–3 layers, produces the per-row metadata the `.vec`
 format stores, and provides the query side (rotation plan, split-form
 scoring) and the layer-boundary selection operators.
@@ -12,9 +12,9 @@ pub struct LayerSpec { pub bits: u8, pub seed: u64, pub rotate: bool }
 ```
 
 - 1–3 layers, `bits ∈ 1..=4`, any order. `specs[0].rotate` must be `true`.
-- Each layer takes a matching `quant_model::Grid` with `grid.bits == spec.bits`.
-  1-bit layers use `sign-plane` and ignore the grid's points.
-- A layer with `rotate = true` applies `fht::Rotation::new(d, seed)` to the
+- Each layer takes a matching `model::Grid` with `grid.bits == spec.bits`.
+  1-bit layers use `sign` and ignore the grid's points.
+- A layer with `rotate = true` applies `rotation::Rotation::new(d, seed)` to the
   residual before quantizing. Later layers therefore live in a different
   coordinate space from earlier ones; the query is rotated the same way.
 
@@ -25,7 +25,7 @@ if the spec says so, encode it, subtract the reconstruction, continue.
 
 Per row and per layer the encoder also records:
 
-- `scale`: the exact `f32` row scale from the kernel crate.
+- `scale`: the exact `f32` row scale from the kernel module.
 - `γ` (binary16): `‖r‖² / ⟨r, r̂⟩`, where `r` is the original residual and
   `r̂` the cumulative prefix reconstruction. It is the scalar that makes the
   prefix carry the row's energy, clamped to `[GAMMA_MIN, GAMMA_MAX] = [1, 4]`.
@@ -63,12 +63,12 @@ pub struct EncodedLayerBatch {
 ```
 
 Code stride is `ceil(d/64)·8` bytes for sign layers and
-`grid_plane::packed_len(d, bits)` for grid layers.
+`grid::packed_len(d, bits)` for grid layers.
 
 Centroids are prepared once per cluster with `prepare_centroid_with_plan` or
 `PreparedCentroidWorkspace`, which rotates the centroid into every layer's
 space; the rotation is applied once per cluster, not once per row (a debug
-counter in `fht` enforces this in tests).
+counter in `rotation` enforces this in tests).
 
 ## Query side
 
@@ -79,7 +79,7 @@ preparation.
 Two forms:
 
 - **Full-precision** (`prepare_fp_query*`, `estimate_prepared_fp*`): the
-  query rotated into each layer's space, scored with `sign_plane::estimate_fp`
+  query rotated into each layer's space, scored with `sign::estimate_fp`
   or a fresh grid LUT. Reference path.
 - **Split** (`prepare_split_query_with_plan(query, plan, grids, sign_query_bits)`
   → `PreparedSplitQuery`): sign layers become `bq`-bit bitplanes, grid layers
@@ -89,7 +89,7 @@ Two forms:
     `scale · ⟨q_layer, codes⟩ − constant`, i.e. `⟨q − c, r̂⟩` without a
     per-cluster query.
   - `score_layer_batch_unscaled(..)` and `score_layer_batch_unscaled_indexed(..)`
-    dispatch to the dense or indexed kernel of the layer's crate.
+    dispatch to the dense or indexed kernel of the layer's module.
   - `query_error_squared(layer)` exposes the query-side quantization error
     (nonzero only for sign layers).
 
@@ -127,5 +127,5 @@ little-endian, and otherwise decodes a copy. Both branches are tested.
   scoring equal single-row calls for every width.
 - `kth` against sort; `band_filter` retains the true top-k.
 
-`cargo bench -p cascade --bench baselines` gives fp-dot and decode-then-dot
+`cargo bench -p tantivy-quant --bench baselines` gives fp-dot and decode-then-dot
 references; `--bench cascade` times `kth` + `band_filter` at 50k and 500k.

@@ -1,6 +1,6 @@
 //! Packed exact-density grid encoding and LUT scoring kernels.
 
-use quant_model::f16::{f16_to_f32, f32_to_f16};
+use crate::model::f16::{f16_to_f32, f32_to_f16};
 
 /// Returns the packed byte length for a grid-code row.
 ///
@@ -717,11 +717,11 @@ fn code_at(packed: &[u8], i: usize, bits: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use quant_model::build_grid;
     use rand_chacha::ChaCha8Rng;
     use rand_core::{RngCore, SeedableRng};
 
     use super::*;
+    use crate::model::build_grid;
 
     #[test]
     fn packing_round_trips_and_orders_bits() {

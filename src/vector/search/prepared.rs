@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use cascade::{prepare_split_query_with_plan, PreparedSplitQuery};
+use quant::cascade::{prepare_split_query_with_plan, PreparedSplitQuery};
 
 use crate::schema::Metric;
 use crate::vector::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide, Similarity};
@@ -324,7 +324,7 @@ mod tests {
             .map(|coordinate| ((coordinate as f32 + 0.25) * 0.173).sin())
             .collect::<Vec<_>>();
         let index = Arc::new(QuantizedIndexCtx::from_config(config).unwrap());
-        let expected = cascade::audit_split_query_layer_error_squared_with_plan(
+        let expected = quant::cascade::audit_split_query_layer_error_squared_with_plan(
             &query_values,
             &index.rotation_plan,
             &index.grids,

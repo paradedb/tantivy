@@ -1,4 +1,4 @@
-# fht
+# rotation
 
 Seeded, format-stable, block-diagonal randomized Hadamard rotation. Applied
 to residuals before quantization so coordinates look isotropic to a scalar
@@ -57,6 +57,6 @@ Tests cover the block decomposition, the Hadamard against a naive matrix,
 norm/dot preservation, inverse round trip, scratch-vs-allocating equality,
 sampler uniformity, and the two snapshots.
 
-`cargo bench -p fht --bench rotation` times `apply` at the common dimensions.
+`cargo bench -p tantivy-quant --bench rotation` times `apply` at the common dimensions.
 `check_asm_x86.sh` asserts the release build emits packed `addps`/`subps`
 for the butterfly.

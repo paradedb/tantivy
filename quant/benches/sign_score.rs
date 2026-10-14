@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use sign_plane::{prepare_query, score_asym, score_sym};
+use tantivy_quant::sign::{prepare_query, score_asym, score_sym};
 
 fn bench_scores(c: &mut Criterion) {
     let d = 768;

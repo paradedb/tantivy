@@ -1,4 +1,4 @@
-# sign-plane
+# sign
 
 1-bit encoding and popcount scoring. A row is the sign of each coordinate
 plus one scale; a query is a small number of bitplanes so scoring is
@@ -60,8 +60,8 @@ Tests cover packing round trips at even and odd `d` with zero tails, the
 Hamming score, formula exactness against decode-then-dot, canonical zero
 rows, the f16 scale against a reference reconstruction, indexed-vs-dense
 batch equality on sparse selections, and statistical σ against
-`quant_model::isotropic_sigma`.
+`model::isotropic_sigma`.
 
-`cargo bench -p sign-plane --bench score` times the single-row and batch
+`cargo bench -p tantivy-quant --bench sign_score` times the single-row and batch
 kernels. `check_asm_x86.sh` and the ARM CI job assert the release build uses
 hardware `popcnt` / `cnt`.

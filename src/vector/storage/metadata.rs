@@ -296,7 +296,7 @@ impl Quantizer {
     pub(crate) fn code_stride(&self, dim: usize) -> usize {
         match self {
             Self::SignPlane { .. } => dim.div_ceil(u64::BITS as usize) * ElemType::U64.size(),
-            Self::GridPlane { bits, .. } => cascade::grid_code_stride(dim, *bits),
+            Self::GridPlane { bits, .. } => quant::cascade::grid_code_stride(dim, *bits),
         }
     }
     /// Ordered owned columns, frozen by the quantizer tag; see FORMAT.md.
@@ -530,36 +530,36 @@ impl VectorColMetadata {
         Ok(())
     }
     /// Resolves tagged kernel contracts and persisted models for encoding or query preparation.
-    pub(crate) fn runtime(&self) -> (Vec<cascade::LayerSpec>, Vec<quant_model::Grid>) {
+    pub(crate) fn runtime(&self) -> (Vec<quant::cascade::LayerSpec>, Vec<quant::model::Grid>) {
         self.layers()
             .iter()
             .map(|q| {
                 let rotation = match q.rotation() {
-                    Rotation::None => cascade::Rotation::None,
+                    Rotation::None => quant::cascade::Rotation::None,
                     Rotation::SeededFhtChaCha8 { seed } => {
-                        cascade::Rotation::SeededFhtChaCha8 { seed }
+                        quant::cascade::Rotation::SeededFhtChaCha8 { seed }
                     }
                 };
                 match q {
                     Quantizer::SignPlane { rho_model, .. } => (
-                        cascade::LayerSpec {
-                            kind: cascade::LayerKind::Sign,
+                        quant::cascade::LayerSpec {
+                            kind: quant::cascade::LayerKind::Sign,
                             bits: 1,
                             rotation,
                         },
-                        quant_model::Grid {
+                        quant::model::Grid {
                             bits: 1,
                             points: Vec::new(),
                             rho_model: f64::from_bits(rho_model.0),
                         },
                     ),
                     Quantizer::GridPlane { bits, grid, .. } => (
-                        cascade::LayerSpec {
-                            kind: cascade::LayerKind::Grid,
+                        quant::cascade::LayerSpec {
+                            kind: quant::cascade::LayerKind::Grid,
                             bits: *bits,
                             rotation,
                         },
-                        quant_model::Grid {
+                        quant::model::Grid {
                             bits: *bits,
                             points: grid.points.clone(),
                             rho_model: grid.rho_model,

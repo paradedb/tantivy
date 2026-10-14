@@ -246,19 +246,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
-name = "cascade"
-version = "0.1.0"
-dependencies = [
- "criterion 0.5.1",
- "fht",
- "grid-plane",
- "quant-model",
- "rand_chacha 0.3.1",
- "rand_core 0.6.4",
- "sign-plane",
-]
-
-[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -670,15 +657,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
-name = "fht"
-version = "0.1.0"
-dependencies = [
- "criterion 0.5.1",
- "rand_chacha 0.3.1",
- "rand_core 0.6.4",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -846,16 +824,6 @@ dependencies = [
  "r-efi 6.0.0",
  "wasip2",
  "wasip3",
-]
-
-[[package]]
-name = "grid-plane"
-version = "0.1.0"
-dependencies = [
- "criterion 0.5.1",
- "quant-model",
- "rand_chacha 0.3.1",
- "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -1546,15 +1514,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quant-model"
-version = "0.1.0"
-dependencies = [
- "half",
- "rand_chacha 0.3.1",
- "rand_core 0.6.4",
-]
-
-[[package]]
 name = "quanta"
 version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1886,16 +1845,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
-name = "sign-plane"
-version = "0.1.0"
-dependencies = [
- "criterion 0.5.1",
- "quant-model",
- "rand_chacha 0.3.1",
- "rand_core 0.6.4",
-]
-
-[[package]]
 name = "sketches-ddsketch"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1980,7 +1929,6 @@ dependencies = [
  "bitpacking",
  "bon",
  "byteorder",
- "cascade",
  "census",
  "crc32fast",
  "criterion 0.8.2",
@@ -2016,7 +1964,6 @@ dependencies = [
  "postcard",
  "pretty_assertions",
  "proptest",
- "quant-model",
  "rand 0.9.4",
  "rand_distr 0.5.1",
  "rayon",
@@ -2031,6 +1978,7 @@ dependencies = [
  "tantivy-columnar",
  "tantivy-common",
  "tantivy-fst",
+ "tantivy-quant",
  "tantivy-query-grammar 0.26.0",
  "tantivy-sstable",
  "tantivy-stacker",
@@ -2097,6 +2045,16 @@ dependencies = [
  "byteorder",
  "regex-syntax",
  "utf8-ranges",
+]
+
+[[package]]
+name = "tantivy-quant"
+version = "0.1.0"
+dependencies = [
+ "criterion 0.5.1",
+ "half",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
-# quant-model
+# model
 
-Numerical oracle for the scalar quantizers used by the sibling kernel crates.
+Numerical oracle for the scalar quantizers used by the sibling kernel modules.
 Grids, the closed-form error model, and binary16 conversion. No dependencies
 on the other kernels.
 
@@ -24,7 +24,7 @@ Requires `d ≥ 64` and `bits ∈ 1..=8`. `rho_model_for_points(d, points)`
 recomputes ρ for persisted points (power-of-two count, ≥ 2) so a reader can
 check a stored grid against the model without rebuilding it.
 
-Codes are assigned by nearest reconstruction point; the sibling crates
+Codes are assigned by nearest reconstruction point; the sibling modules
 compute boundaries as midpoints between adjacent points.
 
 ## Error model

@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use fht::Rotation;
+use tantivy_quant::rotation::Rotation;
 
 fn bench_rotation(c: &mut Criterion) {
     let mut group = c.benchmark_group("fht_apply");

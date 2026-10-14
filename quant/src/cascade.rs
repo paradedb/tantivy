@@ -4,19 +4,19 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::sync::Arc;
 
-use fht::Rotation as FhtRotation;
 /// Packed GridPlane row width, including its tail word.
-pub use grid_plane::packed_len as grid_code_stride;
-use grid_plane::{
+pub use crate::grid::packed_len as grid_code_stride;
+use crate::grid::{
     build_lut, build_packed_lut_4, encode_f32 as encode_grid,
     encode_f32_with_scratch as encode_grid_with_scratch, score as score_grid,
     score_batch as score_grid_batch, score_batch_indexed as score_grid_batch_indexed,
     score_batch_packed_4 as score_grid_batch_packed_4,
     score_batch_packed_4_indexed as score_grid_batch_packed_4_indexed, unpack as unpack_grid,
 };
-use quant_model::f16::{f16_to_f32, f32_to_f16};
-use quant_model::Grid;
-use sign_plane::{
+use crate::model::f16::{f16_to_f32, f32_to_f16};
+use crate::model::Grid;
+use crate::rotation::Rotation as FhtRotation;
+use crate::sign::{
     encode_f32 as encode_sign, estimate_asym_batch_unscaled as estimate_sign_batch,
     estimate_asym_batch_unscaled_indexed as estimate_sign_batch_indexed,
     estimate_asym_unscaled as estimate_sign_asym, estimate_fp_unscaled as estimate_sign_fp,
@@ -153,7 +153,7 @@ impl BatchEncodeWorkspace {
         for (spec, layer) in specs.iter().zip(&mut self.encoded.layers) {
             let code_stride = match spec.kind {
                 LayerKind::Sign => d.div_ceil(64) * 8,
-                LayerKind::Grid => grid_plane::packed_len(d, spec.bits),
+                LayerKind::Grid => crate::grid::packed_len(d, spec.bits),
             };
             layer.codes.reserve(rows * code_stride);
             layer.scales.reserve(rows);
@@ -758,7 +758,7 @@ fn encode_batch_in_place_reusing<F>(
 
         let code_stride = match spec.kind {
             LayerKind::Sign => d.div_ceil(64) * 8,
-            LayerKind::Grid => grid_plane::packed_len(d, spec.bits),
+            LayerKind::Grid => crate::grid::packed_len(d, spec.bits),
         };
         let EncodedLayerBatch {
             codes,
@@ -937,7 +937,7 @@ pub fn encode_layers(
                 constants.push(constant);
             }
             LayerKind::Grid => {
-                let mut codes = vec![0_u8; grid_plane::packed_len(r.len(), spec.bits)];
+                let mut codes = vec![0_u8; crate::grid::packed_len(r.len(), spec.bits)];
                 let scale = encode_grid(&residual, &grid.points, spec.bits, &mut codes);
                 let reconstructed = unpack_grid(&codes, r.len(), spec.bits)
                     .into_iter()
@@ -1045,7 +1045,7 @@ pub fn audit_prefix_error_model(
                 (words_to_bytes(&words), scale, reconstruction)
             }
             LayerKind::Grid => {
-                let mut codes = vec![0_u8; grid_plane::packed_len(d, spec.bits)];
+                let mut codes = vec![0_u8; crate::grid::packed_len(d, spec.bits)];
                 let scale = encode_grid(&residual, &grid.points, spec.bits, &mut codes);
                 let unpacked = unpack_grid(&codes, d, spec.bits);
                 let reconstruction: Vec<f32> = unpacked
@@ -1352,11 +1352,11 @@ fn decode_le_words(bytes: &[u8]) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
-    use quant_model::{build_grid, empirical_sigma, isotropic_sigma};
     use rand_chacha::ChaCha8Rng;
     use rand_core::{RngCore, SeedableRng};
 
     use super::*;
+    use crate::model::{build_grid, empirical_sigma, isotropic_sigma};
 
     #[cfg(target_endian = "little")]
     #[test]
@@ -1471,14 +1471,14 @@ mod tests {
         let plan = QueryRotationPlan::new(d, &specs);
 
         #[cfg(debug_assertions)]
-        fht::debug_reset_apply_count();
+        crate::rotation::debug_reset_apply_count();
         let fp = prepare_fp_query_with_plan(&query, &plan, 1);
         let split = prepare_split_query_with_plan(&query, &plan, &grids[..1], 4);
 
         assert_eq!(fp.layers.len(), 1);
         assert_eq!(split.layers.len(), 1);
         #[cfg(debug_assertions)]
-        assert_eq!(fht::debug_apply_count(), 2);
+        assert_eq!(crate::rotation::debug_apply_count(), 2);
         let mut expected = query;
         specs[0].rotation.build(d).unwrap().apply(&mut expected);
         assert_eq!(fp.layers[0], expected);
@@ -1535,7 +1535,7 @@ mod tests {
         let allocated = storage_signature(&workspace);
         assert!(allocated.iter().all(|(_, capacity)| *capacity > 0));
 
-        fht::debug_reset_apply_count();
+        crate::rotation::debug_reset_apply_count();
         let first_layers = {
             let first = workspace.prepare(&first_values);
             assert!(Arc::ptr_eq(&first.rotation_plan, &plan));
@@ -1549,7 +1549,7 @@ mod tests {
         assert_eq!(storage_signature(&workspace), allocated);
         let second = workspace.prepare(&second_values);
         assert!(Arc::ptr_eq(&second.rotation_plan, &plan));
-        assert_eq!(fht::debug_apply_count(), 2 * specs.len());
+        assert_eq!(crate::rotation::debug_apply_count(), 2 * specs.len());
         assert_eq!(storage_signature(&workspace), allocated);
 
         let direct = prepare_centroid(&first_values, &specs);
@@ -2057,7 +2057,7 @@ mod tests {
 
                     let stride = match spec.kind {
                         LayerKind::Sign => D.div_ceil(64) * std::mem::size_of::<u64>(),
-                        LayerKind::Grid => grid_plane::packed_len(D, spec.bits),
+                        LayerKind::Grid => crate::grid::packed_len(D, spec.bits),
                     };
                     let codes =
                         &batch.layers[layer].codes[row_index * stride..(row_index + 1) * stride];
@@ -2270,7 +2270,7 @@ mod tests {
             assert_eq!(&prefix.codes, codes);
             let expected_stride = match spec.kind {
                 LayerKind::Sign => d.div_ceil(64) * std::mem::size_of::<u64>(),
-                LayerKind::Grid => grid_plane::packed_len(d, spec.bits),
+                LayerKind::Grid => crate::grid::packed_len(d, spec.bits),
             };
             assert_eq!(prefix.codes.len(), expected_stride);
             assert_eq!(prefix.gamma.f16, f32_to_f16(prefix.gamma.clamped));
@@ -2486,7 +2486,7 @@ mod tests {
                 let code_stride = if bits == 1 {
                     d.div_ceil(64) * std::mem::size_of::<u64>()
                 } else {
-                    grid_plane::packed_len(d, bits)
+                    crate::grid::packed_len(d, bits)
                 };
                 let mut codes = Vec::with_capacity(ROWS * code_stride);
                 for row in 0..ROWS {
@@ -2759,10 +2759,10 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
-        fht::debug_reset_apply_count();
+        crate::rotation::debug_reset_apply_count();
         let context = prepare_centroid(&centroid, &specs);
         encode_batch_in_place(&mut vectors, rows, &context, &specs, &grids);
-        let count = fht::debug_apply_count();
+        let count = crate::rotation::debug_apply_count();
         assert_eq!(count, 2 * 2 * rows + 2, "Rotation::apply count={count}");
     }
 

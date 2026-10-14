@@ -1,9 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use grid_plane::{
+use tantivy_quant::grid::{
     build_lut, build_packed_lut_4, encode, packed_len, score, score_batch, score_batch_packed_4,
     score_batch_packed_4_indexed,
 };
-use quant_model::build_grid;
+use tantivy_quant::model::build_grid;
 
 fn bench_kernels(c: &mut Criterion) {
     let d = 768;

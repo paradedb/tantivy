@@ -7,10 +7,10 @@
 
 use std::hint::black_box;
 
-use cascade::{audit_split_query_layer_error_squared, prepare_split_query, LayerSpec};
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use quant_model::build_grid;
-use quant_model::f16::f32_to_f16;
+use quant::cascade::{audit_split_query_layer_error_squared, prepare_split_query, LayerSpec};
+use quant::model::build_grid;
+use quant::model::f16::f32_to_f16;
 use tantivy::vector::bench::{quantization_bench_layer0_cosine_cluster, Columns, Decoded};
 
 const DIM: usize = 1_024;
@@ -26,9 +26,9 @@ fn lcg_next(state: &mut u64) -> u64 {
 
 fn layer0_integrated_shape(c: &mut Criterion) {
     let spec = LayerSpec {
-        kind: cascade::LayerKind::Sign,
+        kind: quant::cascade::LayerKind::Sign,
         bits: 1,
-        rotation: cascade::Rotation::SeededFhtChaCha8 { seed: 0x51_91_14 },
+        rotation: quant::cascade::Rotation::SeededFhtChaCha8 { seed: 0x51_91_14 },
     };
     let grid = build_grid(DIM, 1);
     let query: Vec<f32> = (0..DIM)

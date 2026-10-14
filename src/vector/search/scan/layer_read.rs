@@ -1,6 +1,6 @@
 //! Reading and decoding one quantized layer for a cluster's selected rows.
 
-use quant_model::f16::f16_to_f32;
+use quant::model::f16::f16_to_f32;
 
 use crate::error::DataCorruption;
 use crate::schema::Metric;

@@ -1,6 +1,6 @@
 //! Sign-plane encoding and popcount scoring kernels.
 
-use quant_model::f16::{f16_to_f32, f32_to_f16};
+use crate::model::f16::{f16_to_f32, f32_to_f16};
 
 #[derive(Clone, Debug)]
 /// Quantized query bitplanes and affine reconstruction parameters.

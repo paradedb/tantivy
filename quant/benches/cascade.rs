@@ -1,5 +1,5 @@
-use cascade::{band_filter, kth};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use tantivy_quant::cascade::{band_filter, kth};
 
 fn bench_boundaries(c: &mut Criterion) {
     let mut group = c.benchmark_group("boundary_ops");

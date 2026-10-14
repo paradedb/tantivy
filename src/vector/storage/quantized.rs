@@ -3,10 +3,10 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use cascade::{LayerSpec, QueryRotationPlan};
 use common::{HasLen, OwnedBytes};
-use quant_model::f16::f16_to_f32;
-use quant_model::Grid;
+use quant::cascade::{LayerSpec, QueryRotationPlan};
+use quant::model::f16::f16_to_f32;
+use quant::model::Grid;
 
 use crate::directory::FileSlice;
 use crate::error::DataCorruption;
@@ -916,7 +916,7 @@ impl QuantizedIndexCtx {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use quant_model::f16::f32_to_f16;
+    use quant::model::f16::f32_to_f16;
 
     use super::*;
     use crate::schema::{Metric, VectorOptions};

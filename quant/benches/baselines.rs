@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use quant_model::f16::f16_to_f32;
-use sign_plane::{encode, unpack};
+use tantivy_quant::model::f16::f16_to_f32;
+use tantivy_quant::sign::{encode, unpack};
 
 fn fp_dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(&x, &y)| x * y).sum()
