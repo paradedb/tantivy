@@ -26,32 +26,38 @@ use crate::vector::storage::io::VectorRead;
 use crate::vector::storage::metadata::{SlotType, VectorColMetadata};
 use crate::vector::storage::quantized::{
     exact_read_cost, range_cost, QuantizedFieldReader, QuantizedIndexCtx, QuantizedLayerReader,
-    ReadCost,
+    ReadCost, ReadScratch,
 };
 use crate::{DocId, SegmentReader, TantivyError};
 
-/// Storage-planned borrowed views of selected fp32 rows.
-pub(crate) struct VectorRowBatch {
-    selected_rows: Vec<usize>,
-    chunks: Vec<VectorRowChunk>,
+/// Storage-planned views of selected fp32 rows, borrowing their rows and chunks from the read's
+/// scratch.
+pub(crate) struct VectorRowBatch<'s> {
+    rows: &'s [usize],
+    chunks: &'s [VectorRowChunk],
     stride: usize,
 }
 
-struct VectorRowChunk {
+/// One planned read: a run of rows and their bytes.
+pub(crate) struct VectorRowChunk {
     rows: Range<usize>,
     bytes: OwnedBytes,
 }
 
-pub(crate) struct VectorRowBatchIter<'a> {
-    batch: &'a VectorRowBatch,
+pub(crate) struct VectorRowBatchIter<'s> {
+    rows: &'s [usize],
+    chunks: &'s [VectorRowChunk],
+    stride: usize,
     selected: usize,
     chunk: usize,
 }
 
-impl VectorRowBatch {
-    pub(crate) fn iter(&self) -> VectorRowBatchIter<'_> {
+impl<'s> VectorRowBatch<'s> {
+    pub(crate) fn iter(&self) -> VectorRowBatchIter<'s> {
         VectorRowBatchIter {
-            batch: self,
+            rows: self.rows,
+            chunks: self.chunks,
+            stride: self.stride,
             selected: 0,
             chunk: 0,
         }
@@ -63,20 +69,20 @@ impl VectorRowBatch {
     }
 }
 
-impl<'a> Iterator for VectorRowBatchIter<'a> {
-    type Item = (usize, &'a [u8]);
+impl<'s> Iterator for VectorRowBatchIter<'s> {
+    type Item = (usize, &'s [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let &row = self.batch.selected_rows.get(self.selected)?;
-        while self.batch.chunks[self.chunk].rows.end <= row {
+        let &row = self.rows.get(self.selected)?;
+        while self.chunks[self.chunk].rows.end <= row {
             self.chunk += 1;
         }
-        let chunk = &self.batch.chunks[self.chunk];
+        let chunk = &self.chunks[self.chunk];
         debug_assert!(chunk.rows.contains(&row));
         let local = row - chunk.rows.start;
-        let start = local * self.batch.stride;
+        let start = local * self.stride;
         self.selected += 1;
-        Some((row, &chunk.bytes[start..start + self.batch.stride]))
+        Some((row, &chunk.bytes[start..start + self.stride]))
     }
 }
 
@@ -540,19 +546,29 @@ impl VectorIndexReader {
         self.rows_slice.read_column(0, row..row + 1)
     }
 
-    /// Fetches increasing vector rows through a storage-aware range plan.
-    pub(crate) fn read_vector_rows_planned(
+    /// Fetches the increasing vector rows in `scratch.rows` through a storage-aware range plan. The
+    /// batch borrows its rows and the read chunks from `scratch`.
+    pub(crate) fn read_vector_rows_planned<'s>(
         &self,
-        rows: &[usize],
-        read_ranges: &mut Vec<Range<usize>>,
-        block_scratch: &mut Vec<(usize, usize)>,
-    ) -> crate::Result<VectorRowBatch> {
+        scratch: &'s mut ReadScratch,
+    ) -> crate::Result<VectorRowBatch<'s>> {
+        let ReadScratch {
+            rows,
+            runs: read_ranges,
+            blocks: block_scratch,
+            chunks,
+            ..
+        } = scratch;
+        let rows: &'s [usize] = rows;
         let num_rows = *self.rows_slice.block_rows.last().unwrap();
         if rows.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(TantivyError::InvalidArgument(
                 "planned vector rows must be strictly increasing".to_string(),
             ));
         }
+        let stride = self.options.bytes_per_vector();
+        read_ranges.clear();
+        chunks.clear();
         if let Some(&row) = rows.last() {
             if row >= num_rows {
                 return Err(TantivyError::InvalidArgument(format!(
@@ -560,18 +576,14 @@ impl VectorIndexReader {
                 )));
             }
         } else {
-            read_ranges.clear();
             block_scratch.clear();
             return Ok(VectorRowBatch {
-                selected_rows: Vec::new(),
-                chunks: Vec::new(),
-                stride: self.options.bytes_per_vector(),
+                rows,
+                chunks,
+                stride,
             });
         }
 
-        let stride = self.options.bytes_per_vector();
-        read_ranges.clear();
-        let mut chunks = Vec::with_capacity(read_ranges.capacity().min(rows.len()));
         let mut selected = rows;
         while let Some(&row) = selected.first() {
             let block = self.rows_slice.block_of(row);
@@ -602,7 +614,7 @@ impl VectorIndexReader {
             selected = &selected[count..];
         }
         Ok(VectorRowBatch {
-            selected_rows: rows.to_vec(),
+            rows,
             chunks,
             stride,
         })
@@ -700,7 +712,7 @@ impl VectorIndexReader {
     pub(crate) fn exact_cost(
         &self,
         cluster: usize,
-        offsets: Option<&[usize]>,
+        offsets: Option<&[u32]>,
     ) -> crate::Result<ReadCost> {
         Ok(exact_read_cost(
             &self.rows_slice.column(cluster, 0)?,
@@ -1035,16 +1047,11 @@ mod tests {
             quantization: None,
         };
         let selected = [1, 2, 10, 11];
-        let mut ranges = Vec::new();
-        let mut block_scratch = Vec::new();
-        let batch = reader.read_vector_rows_planned(&selected, &mut ranges, &mut block_scratch)?;
+        let mut scratch = ReadScratch::default();
+        scratch.rows.extend(selected);
+        let batch = reader.read_vector_rows_planned(&mut scratch)?;
 
         assert_eq!(batch.read_count(), 2);
-        assert_eq!(ranges, [1..3, 10..12]);
-        assert_eq!(
-            &*reads.lock().unwrap(),
-            &[prefix + 8..prefix + 24, prefix + 80..prefix + 96]
-        );
         assert!(batch.read_count() < selected.len());
 
         let query = VectorQuery::<f32>::new(Metric::Dot, Arc::new(vec![2.0, -0.5]));
@@ -1052,6 +1059,11 @@ mod tests {
             .iter()
             .map(|(row, bytes)| (row, query.score_row(bytes).score().to_bits()))
             .collect::<Vec<_>>();
+        assert_eq!(scratch.runs, [1..3, 10..12]);
+        assert_eq!(
+            &*reads.lock().unwrap(),
+            &[prefix + 8..prefix + 24, prefix + 80..prefix + 96]
+        );
         let stride = DIM * std::mem::size_of::<f32>();
         let expected = selected
             .iter()

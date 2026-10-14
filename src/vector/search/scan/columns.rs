@@ -153,17 +153,17 @@ impl QuantizedCandidates {
     pub(crate) fn append(
         &mut self,
         rows: Range<usize>,
-        offsets: Option<&[usize]>,
+        offsets: Option<&[u32]>,
         docs: Option<&[DocId]>,
         columns: &Columns,
     ) {
-        let len = offsets.map_or(rows.len(), <[usize]>::len);
+        let len = offsets.map_or(rows.len(), <[u32]>::len);
         debug_assert_eq!(columns.len(), len);
         match offsets {
             None => self.rows.extend(rows),
             Some(offsets) => self
                 .rows
-                .extend(offsets.iter().map(|&offset| rows.start + offset)),
+                .extend(offsets.iter().map(|&offset| rows.start + offset as usize)),
         }
         match docs {
             Some(docs) => {

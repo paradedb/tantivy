@@ -368,7 +368,7 @@ where
     quantized: Option<QuantizedState<'a>>,
     scratch: ReadScratch,
     /// A survivor group's cluster-local offsets.
-    group_offsets: Vec<usize>,
+    group_offsets: Vec<u32>,
     /// Candidate ranges a layer finished exactly.
     retired: Vec<Range<usize>>,
     report: ScanReport,
@@ -478,7 +478,7 @@ where
         self.report.trace.scored_rows.extend(rows.global_rows());
         match self.read_plan(rows, 0)? {
             Read::Exact => {
-                self.report.exact_rows += self.exact.score(rows)?;
+                self.report.exact_rows += self.exact.score(rows, &mut self.scratch)?;
             }
             Read::Layer(read) => {
                 if let Some(state) = &mut self.quantized {
@@ -537,7 +537,9 @@ where
                     let docs = admitted
                         .docs_in_candidates
                         .then(|| &state.candidates.docs[at.clone()]);
-                    self.report.exact_rows += self.exact.score(&ClusterRows { docs, ..group })?;
+                    self.report.exact_rows += self
+                        .exact
+                        .score(&ClusterRows { docs, ..group }, &mut self.scratch)?;
                     self.retired.push(at);
                 }
                 Read::Layer(read) => state.refine(layer, &group, read, at, &mut self.scratch)?,
@@ -577,7 +579,7 @@ where
                     .then(|| &state.candidates.docs[at]),
                 centroid: Some(admitted.centroid),
             };
-            self.report.exact_rows += self.exact.score_survivors(&group)?;
+            self.report.exact_rows += self.exact.score_survivors(&group, &mut self.scratch)?;
         }
         Ok(())
     }
@@ -606,7 +608,7 @@ where
 }
 
 /// Writes the cluster-local offsets of `rows`, in a cluster starting at `start`, into `offsets`.
-fn local_offsets(offsets: &mut Vec<usize>, rows: &[usize], start: usize) {
+fn local_offsets(offsets: &mut Vec<u32>, rows: &[usize], start: usize) {
     offsets.clear();
-    offsets.extend(rows.iter().map(|&row| row - start));
+    offsets.extend(rows.iter().map(|&row| (row - start) as u32));
 }

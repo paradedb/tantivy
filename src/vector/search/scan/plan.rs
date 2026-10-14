@@ -272,12 +272,12 @@ mod tests {
             let reader = searcher.segment_readers()[0].vector_index(fixture.field)?;
             let rows = reader.index().expect("IVF segment").cluster_range(0).len();
             let one = vec![0];
-            let dense: Vec<usize> = (0..rows).filter(|row| row % 10 != 0).collect();
-            let every: Vec<usize> = (0..rows).collect();
+            let dense: Vec<u32> = (0..rows as u32).filter(|row| row % 10 != 0).collect();
+            let every: Vec<u32> = (0..rows as u32).collect();
             for (layer, layer_reader) in reader.quantization().unwrap().layers().iter().enumerate()
             {
                 let band_cost = layer_reader.band_cost(0)?;
-                let cost = |offsets: Option<&[usize]>| -> crate::Result<ReadCosts> {
+                let cost = |offsets: Option<&[u32]>| -> crate::Result<ReadCosts> {
                     let sparse = offsets
                         .map(|offsets| {
                             layer_reader.sparse_cost(0, offsets, &mut ReadScratch::default())
@@ -294,7 +294,7 @@ mod tests {
                 };
                 let sparse = Read::Layer(LayerRead::Sparse);
                 let band = Read::Layer(LayerRead::Band);
-                let cases: [(&str, Option<&[usize]>, Read); 4] = [
+                let cases: [(&str, Option<&[u32]>, Read); 4] = [
                     ("whole cluster", None, band),
                     ("one row", Some(&one), sparse),
                     (

@@ -33,7 +33,7 @@ pub(crate) struct MatchReport {
 pub(crate) struct MatchClusters<'a> {
     index: &'a ClusterIndex,
     /// Cluster-local row offsets, ascending within each cluster.
-    offsets: Vec<usize>,
+    offsets: Vec<u32>,
     /// The doc id of each offset.
     docs: Vec<DocId>,
     /// `(cluster, positions in offsets and docs)`, ascending by cluster.
@@ -82,7 +82,7 @@ impl<'a> MatchClusters<'a> {
             },
         };
         for (position, &(doc, location)) in located.iter().enumerate() {
-            source.offsets.push(location.local as usize);
+            source.offsets.push(location.local);
             source.docs.push(doc);
             let cluster = location.cluster as usize;
             match source.clusters.last_mut() {
