@@ -3,6 +3,32 @@
 
 // --- Ordering ---
 
+/// The `k`-th largest of two descending sequences, `a` given by length and accessor; `None`
+/// while they hold fewer than `k` values together.
+#[inline]
+pub(crate) fn merged_kth(
+    a_len: usize,
+    a: impl Fn(usize) -> f32,
+    b: &[f32],
+    k: usize,
+) -> Option<f32> {
+    if k == 0 || a_len + b.len() < k {
+        return None;
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut kth = f32::NAN;
+    for _ in 0..k {
+        if j == b.len() || (i < a_len && a(i) >= b[j]) {
+            kth = a(i);
+            i += 1;
+        } else {
+            kth = b[j];
+            j += 1;
+        }
+    }
+    Some(kth)
+}
+
 /// Orders `(lower, row, estimate)` entries by lower endpoint descending, then row ascending.
 #[inline]
 pub(crate) fn lower_endpoint_order(
@@ -14,10 +40,9 @@ pub(crate) fn lower_endpoint_order(
 
 // --- Bound ---
 
-/// The scan's one pruning bound: the k-th largest lower endpoint over the live candidates. A
-/// full-precision segment scores every row exactly, so its bound is the k-th exact score; a
-/// quantized segment bounds its quantized intervals until the exact phase scores the survivors.
-/// Only the top `k` can affect it, so each side keeps at most `k` entries.
+/// The scan's one pruning bound: the k-th largest lower endpoint over every live candidate,
+/// quantized intervals and exactly scored rows (zero-width intervals) alike. Only the top `k` of
+/// each side can affect it, so each side keeps at most `k` entries.
 #[derive(Clone)]
 pub(crate) struct KthBound {
     pub(super) k: usize,
@@ -26,6 +51,8 @@ pub(crate) struct KthBound {
     /// Top-k quantized entries admitted since the last boundary, as `(lower, row, estimate)`,
     /// ordered by [`lower_endpoint_order`].
     pub(super) running: Vec<(f32, usize, f32)>,
+    /// The estimates of `running`, descending.
+    running_estimates: Vec<f32>,
     merge: Vec<(f32, usize, f32)>,
 }
 
@@ -35,6 +62,7 @@ impl KthBound {
             k,
             exact: Vec::with_capacity(k),
             running: Vec::with_capacity(k),
+            running_estimates: Vec::with_capacity(k),
             merge: Vec::with_capacity(k.saturating_mul(2)),
         }
     }
@@ -68,55 +96,83 @@ impl KthBound {
         self.merge.sort_unstable_by(lower_endpoint_order);
         self.merge.truncate(self.k);
         std::mem::swap(&mut self.running, &mut self.merge);
+        self.running_estimates.clear();
+        self.running_estimates
+            .extend(self.running.iter().map(|&(_, _, estimate)| estimate));
+        self.running_estimates
+            .sort_unstable_by(|a, b| b.total_cmp(a));
     }
 
-    /// The bounds gate's threshold: the k-th exact score once rows are scored exactly, otherwise
-    /// the k-th running lower endpoint; `None` until `k` are in.
+    /// The bounds gate's threshold: the k-th of the running lower endpoints and the exact scores;
+    /// `None` until `k` are in.
     pub(crate) fn running_lower(&self) -> Option<f32> {
-        if !self.exact.is_empty() {
-            return self.exact_kth();
+        if self.exact.is_empty() {
+            return (self.k > 0 && self.running.len() >= self.k)
+                .then(|| self.running[self.k - 1].0);
         }
-        (self.k > 0 && self.running.len() >= self.k).then(|| self.running[self.k - 1].0)
+        merged_kth(
+            self.running.len(),
+            |i| self.running[i].0,
+            &self.exact,
+            self.k,
+        )
     }
 
-    /// APS cover's threshold: the k-th exact score once rows are scored exactly, otherwise the
-    /// smallest running point estimate; `None` until `k` are in. `k` rows score at least this, so
-    /// it never exceeds the k-th best estimate; it carries no confidence margin, so it must not
-    /// drive pruning.
+    /// APS cover's threshold: the k-th of the running point estimates and the exact scores;
+    /// `None` until `k` are in. It never exceeds the k-th best estimate and carries no confidence
+    /// margin, so it must not drive pruning.
     pub(crate) fn running_estimate(&self) -> Option<f32> {
         if self.k == 0 {
             return None;
         }
-        if !self.exact.is_empty() {
-            return self.exact_kth();
+        if self.exact.is_empty() {
+            if self.running.len() < self.k {
+                return None;
+            }
+            return self
+                .running
+                .iter()
+                .map(|&(_, _, estimate)| estimate)
+                .min_by(f32::total_cmp);
         }
-        if self.running.len() < self.k {
-            return None;
-        }
-        self.running
-            .iter()
-            .map(|&(_, _, estimate)| estimate)
-            .min_by(f32::total_cmp)
+        let estimates = &self.running_estimates;
+        merged_kth(estimates.len(), |i| estimates[i], &self.exact, self.k)
     }
 
-    /// The boundary threshold: the k-th largest of `candidate_lowers`, one per live quantized
-    /// candidate, reordered in place. Clears the running top-k, which describes the candidates
-    /// before the boundary. Boundaries precede every exact score.
+    /// The boundary threshold: the k-th largest of `candidate_lowers` (one per live quantized
+    /// candidate, reordered in place) and the exact scores. Clears the running top-k, which
+    /// describes the candidates before the boundary.
     pub(super) fn boundary_lower(&mut self, candidate_lowers: &mut [f32]) -> Option<f32> {
-        debug_assert!(self.exact.is_empty(), "boundaries precede exact scoring");
         self.running.clear();
+        self.running_estimates.clear();
         let k = self.k;
-        if k == 0 || candidate_lowers.len() < k {
+        if k == 0 {
             return None;
         }
-        let (_, kth, _) = candidate_lowers.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
-        Some(*kth)
+        if self.exact.is_empty() {
+            if candidate_lowers.len() < k {
+                return None;
+            }
+            let (_, kth, _) = candidate_lowers.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
+            return Some(*kth);
+        }
+        if candidate_lowers.len() + self.exact.len() < k {
+            return None;
+        }
+        let quantized = k.min(candidate_lowers.len());
+        if quantized > 0 && quantized < candidate_lowers.len() {
+            candidate_lowers.select_nth_unstable_by(quantized - 1, |a, b| b.total_cmp(a));
+        }
+        let top = &mut candidate_lowers[..quantized];
+        top.sort_unstable_by(|a, b| b.total_cmp(a));
+        merged_kth(top.len(), |i| top[i], &self.exact, k)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::columns::BoundaryHarness;
+    use super::merged_kth;
     use crate::vector::interval::{LowerEndpoint, Threshold};
     use crate::vector::quantization::QUANTIZED_BOUNDARY_KAPPA;
     use crate::DocId;
@@ -136,9 +192,9 @@ mod tests {
         harness
     }
 
-    /// The running thresholds and the boundary threshold: the k-th largest lower endpoint with
-    /// each row's own sigma, the lowest estimate among the lower-endpoint top k, and the same
-    /// values whether the candidates arrive in clusters or all at once.
+    /// The running and boundary thresholds: the k-th largest lower endpoint with each row's own
+    /// sigma, the lowest estimate among the lower-endpoint top k, the same values whether rows
+    /// arrive in clusters or all at once, and exact rows joining as zero-width intervals.
     #[test]
     fn kth_bound_thresholds() {
         // Ties on estimate break by the row's own sigma: lower endpoints 10, 7, -191.
@@ -218,6 +274,54 @@ mod tests {
             }
         }
 
+        // Two descending sequences merge to their k-th largest.
+        let a = [9.0, 4.0, 1.0];
+        let at = |position: usize| a[position];
+        for (a_len, b, k, expected) in [
+            (3, &[8.0, 5.0][..], 1, Some(9.0)),
+            (3, &[8.0, 5.0], 3, Some(5.0)),
+            (3, &[8.0, 5.0], 5, Some(1.0)),
+            (3, &[8.0, 5.0], 6, None),
+            (0, &[8.0, 5.0], 2, Some(5.0)),
+            (3, &[], 0, None),
+        ] {
+            assert_eq!(merged_kth(a_len, at, b, k), expected, "k={k}");
+        }
+
+        // Exact rows are zero-width intervals: alone they set every threshold to the k-th score.
+        let mut exact = BoundaryHarness::new(8);
+        for score in [3.0, 9.0, 5.0, 1.0, 9.0] {
+            exact.push_exact(score, 3);
+        }
+        assert_eq!(exact.running_lower(3), threshold(5.0));
+        assert_eq!(exact.running_estimate(3), Some(5.0));
+        assert_eq!(exact.boundary_lower(3, 2.0), threshold(5.0));
+        let mut short = BoundaryHarness::new(8);
+        for score in [3.0, 9.0, 5.0] {
+            short.push_exact(score, 4);
+        }
+        assert_eq!(short.running_lower(4), None);
+        assert_eq!(short.running_estimate(4), None);
+        assert_eq!(short.boundary_lower(4, 2.0), None);
+
+        // With both kinds, each threshold is the k-th of the union. Lower endpoints 10, 6, -2 and
+        // exact 11, 7 give 7; estimates 12, 8, 2 and exact 11, 7 give 8.
+        let quantized = [(0, 12.0, 1.0), (1, 8.0, 1.0), (2, 2.0, 2.0)];
+        let mut mixed = admitted(3, 2.0, &quantized);
+        assert_eq!(mixed.running_lower(3), threshold(-2.0));
+        mixed.push_exact(7.0, 3);
+        mixed.push_exact(11.0, 3);
+        assert_eq!(mixed.running_lower(3), threshold(7.0));
+        assert_eq!(mixed.running_estimate(3), Some(8.0));
+        assert_eq!(mixed.boundary_lower(3, 2.0), threshold(7.0));
+        mixed.band(3, 2.0);
+        assert_eq!(mixed.candidates.rows, [0, 1], "exact rows push row 2 out");
+        // Fewer quantized rows than k still reach a threshold through the exact rows.
+        let mut wide = admitted(4, 2.0, &quantized);
+        wide.push_exact(7.0, 4);
+        wide.push_exact(11.0, 4);
+        assert_eq!(wide.boundary_lower(4, 2.0), threshold(6.0));
+
         // A boundary keeps only rows whose upper endpoint reaches the threshold.
         let mut far = BoundaryHarness::new(3);
         for (row, estimate) in [(0, 100.0), (1, 99.0), (2, -100.0)] {
@@ -227,8 +331,9 @@ mod tests {
         assert_eq!(far.candidates.rows, [0]);
     }
 
-    /// When every interval encloses its row's exact score, the running threshold never exceeds
-    /// the true k-th score and a boundary keeps every true top-k row.
+    /// When every interval encloses its row's exact score, with or without exactly scored rows,
+    /// the running threshold never exceeds the true k-th score, a boundary keeps every true top-k
+    /// row, and no exact row stays a candidate.
     #[test]
     fn boundary_keeps_enclosed_top_k() {
         // Minimal case: the runner-up's interval is narrow but encloses its exact score.
@@ -252,41 +357,65 @@ mod tests {
             "the true runner-up survives"
         );
 
-        for seed in 0..512 {
-            let mut rng = fastrand::Rng::with_seed(seed);
-            let n = 97;
-            let k = 1 + rng.usize(0..20);
-            let mut truth = Vec::new();
-            let mut harness = BoundaryHarness::new(n);
-            for cluster in (0..n).step_by(11) {
-                harness.begin_cluster(k);
-                for row in cluster..(cluster + 11).min(n) {
-                    let score = rng.f32() * 20.0 - 10.0;
-                    let sigma = 0.001 + rng.f32().powi(3) * 10.0;
-                    let estimate =
-                        score + (rng.f32() * 2.0 - 1.0) * QUANTIZED_BOUNDARY_KAPPA * sigma;
-                    truth.push(score);
-                    harness.push(row, row as DocId, estimate, sigma);
+        // Each cluster is quantized, or with exact rows on, exact at random.
+        for with_exact in [false, true] {
+            for seed in 0..512 {
+                let mut rng = fastrand::Rng::with_seed(seed);
+                let n = 97;
+                let k = 1 + rng.usize(0..20);
+                let mut truth = Vec::new();
+                let mut exact_rows = Vec::new();
+                let mut harness = BoundaryHarness::new(n);
+                for cluster in (0..n).step_by(11) {
+                    let exact = with_exact && rng.bool();
+                    if !exact {
+                        harness.begin_cluster(k);
+                    }
+                    for row in cluster..(cluster + 11).min(n) {
+                        let score = rng.f32() * 20.0 - 10.0;
+                        truth.push(score);
+                        if exact {
+                            exact_rows.push(row);
+                            harness.push_exact(score, k);
+                            continue;
+                        }
+                        let sigma = 0.001 + rng.f32().powi(3) * 10.0;
+                        let estimate =
+                            score + (rng.f32() * 2.0 - 1.0) * QUANTIZED_BOUNDARY_KAPPA * sigma;
+                        harness.push(row, row as DocId, estimate, sigma);
+                    }
+                    if !exact {
+                        harness.finish_cluster(QUANTIZED_BOUNDARY_KAPPA);
+                    }
+                    let case = format!("exact={with_exact} seed {seed}, cluster {cluster}");
+                    let running = harness.running_lower(k);
+                    assert_eq!(
+                        running,
+                        harness.boundary_lower(k, QUANTIZED_BOUNDARY_KAPPA),
+                        "{case}"
+                    );
+                    if let Some(threshold) = running {
+                        let mut sorted = truth.clone();
+                        sorted.sort_by(|a, b| b.total_cmp(a));
+                        assert!(threshold.0 .0 <= sorted[k - 1] + 1e-5, "{case}");
+                    }
                 }
-                harness.finish_cluster(QUANTIZED_BOUNDARY_KAPPA);
-                assert_eq!(
-                    harness.running_lower(k),
-                    harness.boundary_lower(k, QUANTIZED_BOUNDARY_KAPPA),
-                    "seed {seed}, cluster {cluster}"
-                );
-                if let Some(threshold) = harness.running_lower(k) {
-                    let mut exact = truth.clone();
-                    exact.sort_by(|a, b| b.total_cmp(a));
-                    assert!(threshold.0 .0 <= exact[k - 1] + 1e-5, "seed {seed}");
+                let mut order = (0..n).collect::<Vec<_>>();
+                order.sort_by(|&a, &b| truth[b].total_cmp(&truth[a]));
+                harness.band(k, QUANTIZED_BOUNDARY_KAPPA);
+                for row in &order[..k] {
+                    assert!(
+                        exact_rows.contains(row) || harness.candidates.rows.contains(row),
+                        "exact={with_exact} seed {seed}, true row {row}"
+                    );
                 }
-            }
-            let mut order = (0..n).collect::<Vec<_>>();
-            order.sort_by(|&a, &b| truth[b].total_cmp(&truth[a]));
-            harness.band(k, QUANTIZED_BOUNDARY_KAPPA);
-            for row in &order[..k] {
                 assert!(
-                    harness.candidates.rows.contains(row),
-                    "seed {seed}, true row {row}"
+                    harness
+                        .candidates
+                        .rows
+                        .iter()
+                        .all(|row| !exact_rows.contains(row)),
+                    "exact={with_exact} seed {seed}: an exact row stayed a candidate"
                 );
             }
         }

@@ -235,6 +235,21 @@ impl QuantizedCandidates {
         self.order = order;
     }
 
+    /// Removes the candidates at `ranges`, which ascend and do not overlap, keeping row order.
+    pub(crate) fn retire(&mut self, ranges: &[Range<usize>]) {
+        debug_assert!(ranges.windows(2).all(|pair| pair[0].end <= pair[1].start));
+        let mut order = std::mem::take(&mut self.order);
+        order.clear();
+        let mut next = 0;
+        for range in ranges {
+            order.extend(next..range.start);
+            next = range.end;
+        }
+        order.extend(next..self.len());
+        self.keep(&order);
+        self.order = order;
+    }
+
     /// Keeps the candidates at `order`, in that order.
     fn keep(&mut self, order: &[usize]) {
         self.spare_rows.clear();
@@ -297,6 +312,11 @@ impl BoundaryHarness {
         self.candidates.rows.push(row);
         self.candidates.docs.push(doc);
         self.candidates.columns.extend_from(&one);
+    }
+
+    /// Records an exactly scored row in the bound.
+    pub(crate) fn push_exact(&mut self, score: f32, k: usize) {
+        self.bound(k).push_exact(score);
     }
 
     pub(crate) fn finish_cluster(&mut self, kappa: f32) {

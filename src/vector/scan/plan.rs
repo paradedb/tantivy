@@ -3,7 +3,7 @@
 
 use super::layer_read::{LayerRead, LayerSpec};
 use crate::vector::cluster_source::ClusterRows;
-use crate::vector::index_reader::{ReadCost, ReadScratch};
+use crate::vector::index_reader::{ReadCost, ReadScratch, VectorIndexReader};
 
 // --- Costs ---
 
@@ -16,9 +16,19 @@ pub(crate) struct LayerCosts {
     pub(crate) band: ReadCost,
 }
 
+impl LayerCosts {
+    /// The cheaper of the two quantized reads.
+    fn cheapest(&self) -> ReadCost {
+        self.sparse
+            .map_or(self.band, |sparse| sparse.min(self.band))
+    }
+}
+
 /// Every way to read a cluster's selected rows, priced from storage geometry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ReadCosts {
+    /// The exact read of the selected rows; `None` with the exact plan off.
+    pub(crate) exact: Option<ReadCost>,
     pub(crate) layer: LayerCosts,
 }
 
@@ -27,8 +37,14 @@ pub(crate) struct ReadCosts {
 /// How a cluster's selected rows are read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Read {
+    /// The selected rows read and scored at full precision; they finish here.
+    Exact,
     Layer(LayerRead),
 }
+
+/// Whether a test scores the rows of `(cluster, layer)` exactly.
+#[cfg(test)]
+pub(crate) type ExactRule = fn(usize, usize) -> bool;
 
 /// Reads forced by a test; each applies only where the rows have that read.
 #[cfg(test)]
@@ -36,47 +52,83 @@ pub(crate) enum Read {
 pub(crate) struct PlanOverride {
     /// The quantized read of every cluster.
     pub(crate) read: Option<LayerRead>,
+    /// The clusters scored exactly; overrides `read`.
+    pub(crate) exact: Option<ExactRule>,
 }
 
 #[cfg(test)]
 impl PlanOverride {
     /// Every cluster read as `read`.
     pub(crate) fn read(read: LayerRead) -> Self {
-        Self { read: Some(read) }
+        Self {
+            read: Some(read),
+            exact: None,
+        }
+    }
+
+    /// The clusters `rule` selects scored exactly; the layout plans the rest.
+    pub(crate) fn exact(rule: ExactRule) -> Self {
+        Self {
+            read: None,
+            exact: Some(rule),
+        }
     }
 }
 
-/// Sparse only when strictly cheaper than the band; a tie reads the band in one request.
+/// Exact only when strictly cheaper than the cheaper quantized read, so ties stay quantized; then
+/// sparse only when strictly cheaper than the band, so a tie reads the band in one request.
 pub(crate) fn plan(costs: &ReadCosts) -> Read {
+    if costs
+        .exact
+        .is_some_and(|exact| exact < costs.layer.cheapest())
+    {
+        return Read::Exact;
+    }
     match costs.layer.sparse {
         Some(sparse) if sparse < costs.layer.band => Read::Layer(LayerRead::Sparse),
         _ => Read::Layer(LayerRead::Band),
     }
 }
 
-/// [`plan`], unless `forced` names a read the rows have.
+/// [`plan`], unless `forced` names a read the rows of `(cluster, layer)` have.
 #[cfg(test)]
-pub(crate) fn forced_plan(costs: &ReadCosts, forced: Option<PlanOverride>) -> Read {
-    match forced.and_then(|forced| forced.read) {
+pub(crate) fn forced_plan(
+    costs: &ReadCosts,
+    forced: Option<PlanOverride>,
+    cluster: usize,
+    layer: usize,
+) -> Read {
+    let Some(forced) = forced else {
+        return plan(costs);
+    };
+    if forced.exact.is_some_and(|rule| rule(cluster, layer)) {
+        return Read::Exact;
+    }
+    match forced.read {
         Some(LayerRead::Band) => Read::Layer(LayerRead::Band),
         Some(LayerRead::Sparse) if costs.layer.sparse.is_some() => Read::Layer(LayerRead::Sparse),
         _ => plan(costs),
     }
 }
 
-/// Prices the rows of `selected` at `spec`'s layer. A sparse price leaves its rows and code runs in
-/// `scratch` for the read.
+/// Prices the rows of `selected` at `spec`'s layer, and exactly through `exact` when the exact plan
+/// is on. A sparse price leaves its rows and code runs in `scratch` for the read.
 pub(crate) fn price(
     spec: &LayerSpec<'_>,
+    exact: Option<&VectorIndexReader>,
     selected: &ClusterRows<'_>,
     scratch: &mut ReadScratch,
 ) -> crate::Result<ReadCosts> {
+    let exact = exact
+        .map(|reader| reader.exact_cost(selected.cluster, selected.offsets))
+        .transpose()?;
     let band = spec.reader.band_cost(selected.cluster)?;
     let sparse = selected
         .offsets
         .map(|offsets| spec.reader.sparse_cost(selected.cluster, offsets, scratch))
         .transpose()?;
     Ok(ReadCosts {
+        exact,
         layer: LayerCosts { sparse, band },
     })
 }
@@ -89,6 +141,7 @@ mod tests {
 
     fn costs(band: usize, sparse: Option<usize>) -> ReadCosts {
         ReadCosts {
+            exact: None,
             layer: LayerCosts {
                 sparse: sparse.map(ReadCost),
                 band: ReadCost(band),
@@ -96,12 +149,22 @@ mod tests {
         }
     }
 
-    /// Sparse only when strictly cheaper than the band, and never for a whole-cluster selection;
-    /// an override applies only where its read exists.
+    fn with_exact(exact: usize, costs: ReadCosts) -> ReadCosts {
+        ReadCosts {
+            exact: Some(ReadCost(exact)),
+            ..costs
+        }
+    }
+
+    /// Exact only when strictly cheaper than the cheaper quantized read, then sparse only when
+    /// strictly cheaper than the band; an override applies only where its read exists.
     #[test]
     fn plan_from_costs() {
         let band = Read::Layer(LayerRead::Band);
         let sparse = Read::Layer(LayerRead::Sparse);
+        let exact = Read::Exact;
+        let read = |read| Some(PlanOverride::read(read));
+        let odd_exact = Some(PlanOverride::exact(|cluster, _| cluster % 2 == 1));
         let cases = [
             ("cheaper sparse", costs(5, Some(4)), None, sparse),
             ("a tie reads the band", costs(5, Some(5)), None, band),
@@ -109,30 +172,72 @@ mod tests {
             ("every row selected", costs(5, None), None, band),
             ("large counts", costs(1000, Some(999)), None, sparse),
             (
+                "cheaper exact",
+                with_exact(3, costs(5, Some(4))),
+                None,
+                exact,
+            ),
+            (
+                "exact ties the cheaper read",
+                with_exact(4, costs(5, Some(4))),
+                None,
+                sparse,
+            ),
+            (
+                "dearer exact",
+                with_exact(5, costs(5, Some(4))),
+                None,
+                sparse,
+            ),
+            (
+                "exact under a lone band",
+                with_exact(9, costs(10, None)),
+                None,
+                exact,
+            ),
+            (
+                "exact ties a lone band",
+                with_exact(10, costs(10, None)),
+                None,
+                band,
+            ),
+            (
+                "the band is the cheaper read",
+                with_exact(5, costs(4, Some(6))),
+                None,
+                band,
+            ),
+            (
                 "forced band",
                 costs(5, Some(1)),
-                Some(PlanOverride::read(LayerRead::Band)),
+                read(LayerRead::Band),
                 band,
             ),
             (
                 "forced sparse",
                 costs(5, Some(9)),
-                Some(PlanOverride::read(LayerRead::Sparse)),
+                read(LayerRead::Sparse),
                 sparse,
             ),
             (
                 "no sparse read to force",
                 costs(5, None),
-                Some(PlanOverride::read(LayerRead::Sparse)),
+                read(LayerRead::Sparse),
                 band,
             ),
+            ("forced exact", costs(5, Some(4)), odd_exact, exact),
         ];
         for (name, costs, forced, expected) in cases {
-            assert_eq!(forced_plan(&costs, forced), expected, "{name}");
+            assert_eq!(forced_plan(&costs, forced, 1, 0), expected, "{name}");
             if forced.is_none() {
                 assert_eq!(plan(&costs), expected, "{name}");
             }
         }
+        let layout = forced_plan(&costs(5, Some(4)), odd_exact, 2, 0);
+        assert_eq!(
+            layout, sparse,
+            "the rule leaves other clusters to the layout"
+        );
     }
 
     /// Costs follow storage geometry, priced by the reader alone: in bytes in RAM and in blocks on
@@ -164,6 +269,7 @@ mod tests {
                         })
                         .transpose()?;
                     Ok(ReadCosts {
+                        exact: None,
                         layer: LayerCosts {
                             sparse,
                             band: band_cost,

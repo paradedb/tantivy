@@ -8,7 +8,7 @@ use crate::query::{AllQuery, BooleanQuery, EnableScoring, Query};
 use crate::schema::Metric;
 use crate::vector::ivf::AdaptiveProbeParams;
 use crate::vector::scan::layer_read::LayerRead;
-use crate::vector::scan::plan::PlanOverride;
+use crate::vector::scan::plan::{ExactRule, PlanOverride};
 use crate::vector::stats::LayerProbeStats;
 use crate::vector::test_support::{ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg, ReadLog};
 use crate::vector::tests::exhaustive_params;
@@ -104,7 +104,11 @@ fn assert_identities(stats: &ProbeStats, case: &str) {
     );
 }
 
-/// The global top `k` with every segment searched directly under `forced`.
+/// Hits as `(score, address)`, best first.
+type Hits = Vec<(Score, DocAddress)>;
+
+/// The global top `k` with every segment searched directly under `forced`, and each segment's
+/// stats.
 fn forced_top_k(
     fixture: &Fixture,
     filter: &dyn Query,
@@ -112,12 +116,13 @@ fn forced_top_k(
     k: usize,
     params: &AdaptiveProbeParams,
     forced: PlanOverride,
-) -> crate::Result<Vec<(Score, DocAddress)>> {
+) -> crate::Result<(Hits, Vec<ProbeStats>)> {
     let weight = fixture.weight(filter)?;
     let segments = fixture.index.reader()?.searcher().segment_readers().len();
     let mut hits = Vec::new();
+    let mut stats = Vec::new();
     for segment in 0..segments {
-        let (segment_hits, stats) = fixture.run_planned(
+        let (segment_hits, segment_stats) = fixture.run_planned(
             segment,
             weight.as_ref(),
             query,
@@ -125,12 +130,27 @@ fn forced_top_k(
             params.clone(),
             Some(forced),
         )?;
-        assert_identities(&stats, "forced plan");
+        assert_identities(&segment_stats, "forced plan");
         hits.extend(segment_hits);
+        stats.push(segment_stats);
     }
     hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     hits.truncate(k);
-    Ok(hits)
+    Ok((hits, stats))
+}
+
+/// Every forced plan of the oracle matrix: each read, every cluster exact at admission, and
+/// mixed exact clusters at admission and at layer 1.
+fn forced_plans() -> [(&'static str, PlanOverride); 4] {
+    [
+        ("band", PlanOverride::read(LayerRead::Band)),
+        ("sparse", PlanOverride::read(LayerRead::Sparse)),
+        ("all exact", PlanOverride::exact(|_, _| true)),
+        (
+            "mixed exact",
+            PlanOverride::exact(|cluster, layer| (cluster + layer) % 2 == 0),
+        ),
+    ]
 }
 
 /// Under an exhaustive probe every representation, filter, delete pattern, k and forced read
@@ -175,16 +195,29 @@ fn scan_matches_oracle() -> crate::Result<()> {
                             if !matches!(representation, Representation::Quantized(_)) {
                                 continue;
                             }
-                            for forced in [LayerRead::Band, LayerRead::Sparse] {
-                                let hits = forced_top_k(
+                            for (name, forced) in forced_plans() {
+                                let (hits, stats) = forced_top_k(
                                     &fixture,
                                     filter.as_ref(),
                                     query,
                                     k,
                                     &exhaustive_params(MATRIX_CLUSTERS),
-                                    PlanOverride::read(forced),
+                                    forced,
                                 )?;
-                                assert_eq!(hits, oracle, "{case} forced={forced:?}");
+                                assert_eq!(hits, oracle, "{case} forced={name}");
+                                if name != "all exact" {
+                                    continue;
+                                }
+                                for stats in &stats {
+                                    // A segment where nothing matches reports no layers.
+                                    let Some(layer0) = stats.layers.get(0) else {
+                                        continue;
+                                    };
+                                    assert_eq!(layer0.exact_clusters(), stats.postings_row);
+                                    assert_eq!(layer0.exact_rows(), stats.candidates_scored);
+                                    assert_eq!(layer0.scored(), 0);
+                                    assert_eq!(stats.exact_rows, stats.candidates_scored);
+                                }
                             }
                         }
                     }
@@ -301,7 +334,8 @@ fn sparse_clusters(stats: &ProbeStats) -> usize {
 }
 
 /// Band and sparse reads give bit-identical candidate columns, estimates, boundaries and results
-/// at every layer, for every metric, in RAM and on pages.
+/// at every layer, for every metric, in RAM and on pages, with and without exact clusters; every
+/// plan returns the oracle's top k.
 #[test]
 fn read_plans_are_bit_identical() -> crate::Result<()> {
     let shapes: [(&[u8], usize, usize, usize, bool); 5] = [
@@ -341,21 +375,29 @@ fn read_plans_are_bit_identical() -> crate::Result<()> {
                         Some(forced),
                     )
                 };
-                let (band_hits, band) = run(PlanOverride::read(LayerRead::Band))?;
-                let (sparse_hits, sparse) = run(PlanOverride::read(LayerRead::Sparse))?;
-                assert_eq!(sparse_clusters(&band), 0, "{case}");
-                assert_eq!(sparse_clusters(&sparse) > 0, expect_sparse, "{case}");
-                let (band, sparse) = (&band.quantized_trace, &sparse.quantized_trace);
-                assert!(!band.layer_columns.is_empty(), "{case}");
-                assert_eq!(sparse.layer_columns, band.layer_columns, "{case}");
-                assert_eq!(sparse.estimate_rows, band.estimate_rows, "{case}");
-                assert_eq!(sparse.boundary_rows, band.boundary_rows, "{case}");
-                assert_eq!(sparse_hits, band_hits, "{case}");
-                assert_eq!(
-                    band_hits,
-                    fixture.oracle(filter.as_ref(), &query, 10)?,
-                    "{case}"
-                );
+                let oracle = fixture.oracle(filter.as_ref(), &query, 10)?;
+                // Each read alone, then with mixed exact clusters at admission and at layer 1.
+                let mixed: ExactRule = |cluster, layer| (cluster + layer) % 2 == 0;
+                for exact in [None, Some(mixed)] {
+                    let case = format!("{case} exact={}", exact.is_some());
+                    let forced = |read| PlanOverride {
+                        read: Some(read),
+                        exact,
+                    };
+                    let (band_hits, band) = run(forced(LayerRead::Band))?;
+                    let (sparse_hits, sparse) = run(forced(LayerRead::Sparse))?;
+                    assert_eq!(sparse_clusters(&band), 0, "{case}");
+                    if exact.is_none() {
+                        assert_eq!(sparse_clusters(&sparse) > 0, expect_sparse, "{case}");
+                    }
+                    let (band, sparse) = (&band.quantized_trace, &sparse.quantized_trace);
+                    assert!(!band.layer_columns.is_empty(), "{case}");
+                    assert_eq!(sparse.layer_columns, band.layer_columns, "{case}");
+                    assert_eq!(sparse.estimate_rows, band.estimate_rows, "{case}");
+                    assert_eq!(sparse.boundary_rows, band.boundary_rows, "{case}");
+                    assert_eq!(sparse_hits, band_hits, "{case}");
+                    assert_eq!(band_hits, oracle, "{case}");
+                }
             }
         }
     }
@@ -770,29 +812,156 @@ fn whole_cluster_selections_read_the_band() -> crate::Result<()> {
     Ok(())
 }
 
-/// Left to the layout on paged d=1024 storage, a selective filter reads layer 0 sparsely and a
-/// dense one reads whole bands; both return the oracle's top k.
-fn layout_reads_selective_filters_sparsely() -> crate::Result<()> {
-    let fixture = FixtureSpec::clustered(Metric::L2, 1024, 2, 1200)
-        .schedule(&[1, 4])
-        .paged()
-        .label("few", |ordinal| ordinal % 300 == 7)
-        .label("dense", |ordinal| ordinal % 10 != 0)
-        .build()?;
-    let query = Lcg(5).vector(1024, 0.5);
-    for (name, selective) in [("few", true), ("dense", false)] {
-        let filter = fixture.filter(name);
-        let fruit = fixture.search(&filter, &query, 10, exhaustive_params(2))?;
-        let stats = &fruit.stats[0];
-        let layer0 = stats.layers.get(0).unwrap();
-        let expected = if selective { stats.postings_row } else { 0 };
-        assert_eq!(layer0.sparse_clusters(), expected, "{name}: {stats:?}");
+/// Left to the layout on paged d=1024 storage, a selective filter reads layer 0 sparsely, or
+/// with the exact plan on scores it exactly; a dense filter reads whole bands and an unfiltered
+/// query never scores exactly. Every plan returns the oracle's top k.
+fn layout_plans_selective_filters() -> crate::Result<()> {
+    for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+        let fixture = FixtureSpec::clustered(metric, 1024, 2, 1200)
+            .schedule(&[1, 4])
+            .paged()
+            .label("few", |ordinal| ordinal == 7 || ordinal == 8)
+            .label("dense", |ordinal| ordinal % 10 != 0)
+            .build()?;
+        let query = Lcg(5).vector(1024, 0.5);
+        let exact_on = AdaptiveProbeParams {
+            exact_plan: true,
+            ..exhaustive_params(2)
+        };
+        for (name, selective) in [("few", true), ("dense", false)] {
+            let case = format!("{metric:?} {name}");
+            let filter = fixture.filter(name);
+            let oracle = fixture.oracle(&filter, &query, 10)?;
+            let fruit = fixture.search(&filter, &query, 10, exhaustive_params(2))?;
+            let stats = &fruit.stats[0];
+            let expected = if selective { stats.postings_row } else { 0 };
+            let layer0 = stats.layers.get(0).unwrap();
+            assert_eq!(layer0.sparse_clusters(), expected, "{case}: {stats:?}");
+            assert_eq!(fruit.results, oracle, "{case}");
+            let fruit = fixture.search(&filter, &query, 10, exact_on.clone())?;
+            let stats = &fruit.stats[0];
+            if selective {
+                let layer0 = stats.layers.get(0).unwrap();
+                assert_eq!(
+                    layer0.exact_clusters(),
+                    stats.postings_row,
+                    "{case}: {stats:?}"
+                );
+            }
+            assert_eq!(fruit.results, oracle, "{case}");
+        }
+        let unfiltered = fixture.search(&AllQuery, &query, 10, exact_on)?;
+        let exact_clusters: usize = (0..2)
+            .map(|layer| {
+                unfiltered.stats[0]
+                    .layers
+                    .get(layer)
+                    .unwrap()
+                    .exact_clusters()
+            })
+            .sum();
+        assert_eq!(exact_clusters, 0, "{metric:?}: {:?}", unfiltered.stats[0]);
         assert_eq!(
-            fruit.results,
-            fixture.oracle(&filter, &query, 10)?,
-            "{name}"
+            unfiltered.results,
+            fixture.oracle(&AllQuery, &query, 10)?,
+            "{metric:?}"
         );
     }
+    Ok(())
+}
+
+/// A cluster scored exactly never reads its band; its rows are read in the exact stages.
+fn exact_clusters_never_read_their_band() -> crate::Result<()> {
+    let fixture = reads_fixture(Metric::L2, &[1], &[])?;
+    let query = reads_vector(42);
+    let rules: [(ExactRule, bool); 3] = [
+        (|_, _| true, true),
+        (|cluster, _| cluster % 2 == 0, false),
+        (|_, _| false, false),
+    ];
+    for (rule, all) in rules {
+        fixture.clear_reads();
+        let forced = PlanOverride {
+            read: Some(LayerRead::Band),
+            exact: Some(rule),
+        };
+        let (hits, stats) = fixture.run_planned(
+            0,
+            fixture.all()?.as_ref(),
+            &query,
+            10,
+            every_cluster(),
+            Some(forced),
+        )?;
+        assert_eq!(hits, fixture.oracle(&AllQuery, &query, 10)?);
+        let log = fixture.reads();
+        let layer0 = stats.layers.get(0).unwrap();
+        // Unfiltered admission reads no DocIds: its reads are bands alone.
+        assert_eq!(
+            stage_reads(&log, |stage| stage == Stage::LayerScan(0)).len(),
+            layer0.full_clusters(),
+            "{stats:?}"
+        );
+        assert_eq!(
+            layer0.full_clusters() + layer0.exact_clusters(),
+            stats.postings_row
+        );
+        let exact_reads = stage_reads(&log, |stage| {
+            matches!(stage, Stage::ExactFetch | Stage::ExactScore)
+        })
+        .len();
+        assert_eq!(stats.exact_io.reads, exact_reads as u64, "{stats:?}");
+        assert_eq!(exact_reads > 0, stats.exact_rows > 0, "{stats:?}");
+        assert_eq!(
+            stats.exact_rows,
+            layer0.exact_rows() + layer0.survivors(),
+            "{stats:?}"
+        );
+        if all {
+            assert_eq!(layer0.full_clusters(), 0);
+        }
+    }
+    Ok(())
+}
+
+/// A group scored exactly at a later layer leaves the candidates before that layer's boundary:
+/// none of its rows reaches it, and the top k is unchanged.
+fn retired_groups_never_reach_a_later_band() -> crate::Result<()> {
+    let fixture = FixtureSpec::clustered(Metric::L2, 64, 8, 800)
+        .schedule(&[1, 4])
+        .label("some", |ordinal| ordinal % 3 == 1)
+        .build()?;
+    let filter = fixture.filter("some");
+    let query = Lcg(5).vector(64, 0.5);
+    let (hits, stats) = fixture.run_planned(
+        0,
+        fixture.weight(&filter)?.as_ref(),
+        &query,
+        10,
+        exhaustive_params(8),
+        Some(PlanOverride::exact(|cluster, layer| {
+            layer == 1 && cluster % 2 == 0
+        })),
+    )?;
+    assert_eq!(hits, fixture.oracle(&filter, &query, 10)?);
+    let layer1 = stats.layers.get(1).unwrap();
+    assert!(layer1.exact_clusters() > 0, "{stats:?}");
+    let searcher = fixture.index.reader()?.searcher();
+    let vectors = searcher.segment_readers()[0].vector_index(fixture.field)?;
+    let index = vectors.index().unwrap();
+    let even = |row: &usize| {
+        (0..index.num_clusters())
+            .find(|&cluster| index.cluster_range(cluster).contains(row))
+            .is_some_and(|cluster| cluster % 2 == 0)
+    };
+    let trace = &stats.quantized_trace;
+    assert!(trace.boundary_rows[0].iter().any(even));
+    assert!(!trace.boundary_rows[1].iter().any(even));
+    assert!(!trace.layer_columns[1].iter().any(|(row, _)| even(row)));
+    assert_eq!(
+        layer1.scored() + layer1.exact_rows(),
+        trace.boundary_rows[0].len()
+    );
     Ok(())
 }
 
@@ -802,7 +971,7 @@ type ReadCase = (&'static str, fn() -> crate::Result<()>);
 /// Every plan reads only what it needs, in the documented order.
 #[test]
 fn reads_follow_the_plan() -> crate::Result<()> {
-    let cases: [ReadCase; 9] = [
+    let cases: [ReadCase; 11] = [
         (
             "an empty cluster skips its band",
             empty_cluster_skips_its_band,
@@ -836,8 +1005,16 @@ fn reads_follow_the_plan() -> crate::Result<()> {
             whole_cluster_selections_read_the_band,
         ),
         (
-            "the layout reads selective filters sparsely",
-            layout_reads_selective_filters_sparsely,
+            "the layout reads selective filters sparsely or exactly",
+            layout_plans_selective_filters,
+        ),
+        (
+            "an exact cluster never reads its band",
+            exact_clusters_never_read_their_band,
+        ),
+        (
+            "a retired group never reaches a later band",
+            retired_groups_never_reach_a_later_band,
         ),
     ];
     for (name, case) in cases {
