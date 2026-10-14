@@ -1,10 +1,10 @@
 //! Query preparation and scoring: the rotation plan, full-precision and split-form queries, and
 //! the per-layer kernels they dispatch to.
 
+use std::borrow::Cow;
+
 use super::encode::Encoded;
-use super::{
-    aligned_le_words, scoring_le_words, validate, validate_specs, LayerKind, LayerSpec, Rotation,
-};
+use super::{aligned_le_words, validate, validate_specs, LayerKind, LayerSpec, Rotation};
 use crate::grid::{
     build_lut, build_packed_lut_4, score as score_grid, score_batch as score_grid_batch,
     score_batch_indexed as score_grid_batch_indexed,
@@ -194,7 +194,7 @@ impl PreparedSplitQuery {
         match &self.layers[layer] {
             PreparedSplitLayer::Sign(query) => {
                 assert_eq!(spec.bits, 1);
-                let words = scoring_le_words(codes, layer);
+                let words = aligned_le_words(codes);
                 scale * estimate_sign_asym(words.as_ref(), query)
             }
             PreparedSplitLayer::Grid { lut, .. } => {
@@ -204,7 +204,8 @@ impl PreparedSplitQuery {
         }
     }
 
-    /// Scores a contiguous batch without scales or constants.
+    /// Scores a contiguous batch without scales or constants. Returns its sign-word fallbacks: 1
+    /// when sign codes aren't `u64`-aligned and are decoded into owned words, else 0.
     ///
     /// # Panics
     ///
@@ -217,19 +218,20 @@ impl PreparedSplitQuery {
         code_stride: usize,
         spec: LayerSpec,
         out: &mut [f32],
-    ) {
+    ) -> u64 {
         assert_eq!(codes.len(), out.len() * code_stride);
         match &self.layers[layer] {
             PreparedSplitLayer::Sign(query) => {
                 assert_eq!(spec.bits, 1);
                 assert_eq!(code_stride % std::mem::size_of::<u64>(), 0);
-                let words = scoring_le_words(codes, layer);
+                let words = aligned_le_words(codes);
                 estimate_sign_batch(
                     words.as_ref(),
                     code_stride / std::mem::size_of::<u64>(),
                     query,
                     out,
                 );
+                u64::from(matches!(words, Cow::Owned(_)))
             }
             PreparedSplitLayer::Grid { lut, packed_lut_4 } => {
                 assert!(spec.bits > 1);
@@ -238,11 +240,13 @@ impl PreparedSplitQuery {
                 } else {
                     score_grid_batch(codes, code_stride, lut, self.d, spec.bits, out);
                 }
+                0
             }
         }
     }
 
-    /// Scores selected rows without scales or constants.
+    /// Scores selected rows without scales or constants. Returns its sign-word fallbacks, as
+    /// [`Self::score_layer_batch_unscaled`] does.
     ///
     /// # Panics
     ///
@@ -256,13 +260,13 @@ impl PreparedSplitQuery {
         row_offsets: &[usize],
         spec: LayerSpec,
         out: &mut [f32],
-    ) {
+    ) -> u64 {
         assert_eq!(row_offsets.len(), out.len());
         match &self.layers[layer] {
             PreparedSplitLayer::Sign(query) => {
                 assert_eq!(spec.bits, 1);
                 assert_eq!(code_stride % std::mem::size_of::<u64>(), 0);
-                let words = scoring_le_words(codes, layer);
+                let words = aligned_le_words(codes);
                 estimate_sign_batch_indexed(
                     words.as_ref(),
                     code_stride / std::mem::size_of::<u64>(),
@@ -270,6 +274,7 @@ impl PreparedSplitQuery {
                     query,
                     out,
                 );
+                u64::from(matches!(words, Cow::Owned(_)))
             }
             PreparedSplitLayer::Grid {
                 packed_lut_4: Some(packed_lut_4),
@@ -284,6 +289,7 @@ impl PreparedSplitQuery {
                     self.d,
                     out,
                 );
+                0
             }
             PreparedSplitLayer::Grid {
                 lut,
@@ -299,6 +305,7 @@ impl PreparedSplitQuery {
                     spec.bits,
                     out,
                 );
+                0
             }
         }
     }
@@ -636,6 +643,51 @@ mod tests {
             .collect();
         let direct = dot(&u1, &combined);
         assert!((layered - direct).abs() < 2e-4, "{layered} != {direct}");
+    }
+
+    /// Unaligned sign codes are decoded into owned words and counted; aligned ones are borrowed.
+    #[test]
+    fn batch_scoring_returns_sign_word_fallbacks() {
+        let d = 128;
+        let spec = LayerSpec {
+            kind: LayerKind::Sign,
+            bits: 1,
+            rotation: Rotation::SeededFhtChaCha8 { seed: 11 },
+        };
+        let prepared = prepare_split_query(
+            &(0..d).map(|i| (i as f32 * 0.019).cos()).collect::<Vec<_>>(),
+            &[spec],
+            &[build_grid(d, 1)],
+            4,
+        );
+        let (rows, stride) = (3, d / 8);
+        let codes: Vec<u8> = (0..rows * stride).map(|i| (i * 37 % 251) as u8).collect();
+        let mut storage = vec![0_u8; codes.len() + 8];
+        let mut scores = Vec::new();
+        for aligned in [true, false] {
+            let offset = (0..8)
+                .find(|offset| ((storage.as_ptr() as usize + offset) % 8 == 0) == aligned)
+                .expect("eight consecutive offsets hold both aligned and unaligned starts");
+            storage[offset..offset + codes.len()].copy_from_slice(&codes);
+            let placed = &storage[offset..offset + codes.len()];
+            let mut dense = vec![0.0; rows];
+            let fallbacks =
+                prepared.score_layer_batch_unscaled(0, placed, stride, spec, &mut dense);
+            assert_eq!(fallbacks, u64::from(!aligned));
+            let mut indexed = vec![0.0; 2];
+            let fallbacks = prepared.score_layer_batch_unscaled_indexed(
+                0,
+                placed,
+                stride,
+                &[0, 2],
+                spec,
+                &mut indexed,
+            );
+            assert_eq!(fallbacks, u64::from(!aligned));
+            assert_eq!(indexed, [dense[0], dense[2]]);
+            scores.push(dense);
+        }
+        assert_eq!(scores[0], scores[1]);
     }
 
     #[test]

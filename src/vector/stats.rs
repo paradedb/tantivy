@@ -260,14 +260,49 @@ pub struct ProbeStats {
     pub segment_clusters: Option<usize>,
 }
 
-impl ProbeStats {
-    /// Statistics of an IVF segment search from each stage's report and the stage clock.
-    pub(crate) fn assemble(
+// --- Segment report ---
+
+/// What one segment search reports; its statistics are built from it once its measure ends.
+pub(crate) enum SegmentReport {
+    /// A segment without an IVF index: rows scored by the flat scan.
+    Flat { rows_read: usize },
+    /// Nothing could match; the located cap still reports.
+    Empty { located_cap: usize },
+    /// An IVF segment search: its plan, cluster source and scan.
+    Ivf {
         plan: PlanReport,
         source: SourceReport,
         scan: ScanReport,
-        totals: StageTotals,
-    ) -> Self {
+    },
+}
+
+impl ProbeStats {
+    /// Statistics of one segment search from its report and the totals of its measure.
+    pub(crate) fn new(report: SegmentReport, totals: StageTotals) -> Self {
+        let mut stats = match report {
+            SegmentReport::Flat { rows_read } => {
+                let mut stats = Self {
+                    exact_rows: rows_read,
+                    exact_scan_ns: Some(0),
+                    ..Self::default()
+                };
+                stats.record_io(&totals);
+                stats
+            }
+            SegmentReport::Empty { located_cap } => Self {
+                located_cap,
+                ..Self::default()
+            },
+            SegmentReport::Ivf { plan, source, scan } => Self::ivf(plan, source, scan, &totals),
+        };
+        // Every segment search reports its result assembly, an empty one included.
+        stats.result_assembly_ns = Some(0);
+        stats.apply_timings(&totals);
+        stats
+    }
+
+    /// Statistics of an IVF segment search from each stage's report, timings aside.
+    fn ivf(plan: PlanReport, source: SourceReport, scan: ScanReport, totals: &StageTotals) -> Self {
         let full_precision = scan.layers.is_empty();
         let mut stats = Self {
             candidates_scored: scan.candidates_scored,
@@ -290,9 +325,8 @@ impl ProbeStats {
                     .collect(),
             ),
             #[cfg(test)]
-            quantized_trace: scan.trace,
+            quantized_trace: *scan.trace,
             exact_scan_ns: full_precision.then_some(0),
-            result_assembly_ns: Some(0),
             segment_rows: Some(plan.segment_rows),
             segment_clusters: Some(plan.segment_clusters),
             located_cap: plan.located_cap,
@@ -302,35 +336,11 @@ impl ProbeStats {
             SourceReport::Router(routed) => stats.record_routed(routed),
             SourceReport::Matches(matches) => stats.record_matches(matches),
         }
-        stats.record_io(&totals);
+        stats.record_io(totals);
         debug_assert_eq!(
             stats.centroid_io.reads, scan.centroid_reads as u64,
             "one read per centroid row"
         );
-        stats.apply_timings(&totals);
-        stats
-    }
-
-    /// Statistics of a segment search that matched nothing, under `located_cap`.
-    pub(crate) fn empty(located_cap: usize, totals: StageTotals) -> Self {
-        let mut stats = Self {
-            located_cap,
-            ..Self::default()
-        };
-        stats.apply_timings(&totals);
-        stats
-    }
-
-    /// Statistics of a flat segment scan that scored `rows` rows.
-    pub(crate) fn flat(rows: usize, totals: StageTotals) -> Self {
-        let mut stats = Self {
-            exact_rows: rows,
-            exact_scan_ns: Some(0),
-            result_assembly_ns: Some(0),
-            ..Self::default()
-        };
-        stats.record_io(&totals);
-        stats.apply_timings(&totals);
         stats
     }
 
@@ -414,7 +424,8 @@ impl ProbeStats {
         }
     }
 
-    /// Adds result-assembly time accrued after the segment's statistics were assembled.
+    /// Adds the result-assembly time of the merge, measured after the segment's statistics were
+    /// built.
     pub(crate) fn add_assembly(&mut self, totals: &StageTotals) {
         let extra =
             totals.time_ns(VectorStage::ResultAssembly) + totals.time_ns(VectorStage::Other);
@@ -547,27 +558,29 @@ mod tests {
             ..ScanReport::default()
         };
         let segment = ["recall_estimate", "segment_rows", "segment_clusters"];
-        let stats = ProbeStats::assemble(plan, routed(), quantized, StageTotals::default());
+        let ivf = |scan| SegmentReport::Ivf {
+            plan,
+            source: routed(),
+            scan,
+        };
+        let stats = ProbeStats::new(ivf(quantized), StageTotals::default());
         assert_eq!(keys(&stats), expected(&segment, 2));
         let layer = stats.layers.get(1).unwrap();
         assert_eq!((layer.scan_ns(), layer.boundary_ns()), (0, 0));
         let full_precision = [&segment[..], &["exact_scan_ns"]].concat();
         assert_eq!(
-            keys(&ProbeStats::assemble(
-                plan,
-                routed(),
-                ScanReport::default(),
+            keys(&ProbeStats::new(
+                ivf(ScanReport::default()),
                 StageTotals::default()
             )),
             expected(&full_precision, 0)
         );
-        let flat = ProbeStats::flat(3, StageTotals::default());
+        let flat = ProbeStats::new(SegmentReport::Flat { rows_read: 3 }, StageTotals::default());
         assert_eq!(keys(&flat), expected(&["exact_scan_ns"], 0));
-        let empty: BTreeSet<String> = COMMON
-            .iter()
-            .filter(|key| **key != "result_assembly_ns")
-            .map(|key| key.to_string())
-            .collect();
-        assert_eq!(keys(&ProbeStats::empty(0, StageTotals::default())), empty);
+        let empty = ProbeStats::new(
+            SegmentReport::Empty { located_cap: 0 },
+            StageTotals::default(),
+        );
+        assert_eq!(keys(&empty), expected(&[], 0));
     }
 }

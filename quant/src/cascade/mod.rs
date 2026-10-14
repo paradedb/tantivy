@@ -2,7 +2,6 @@
 //! encoding, query preparation and the error-model audits.
 
 use std::borrow::Cow;
-use std::cell::Cell;
 
 use crate::model::Grid;
 use crate::rotation::Rotation as FhtRotation;
@@ -129,27 +128,6 @@ fn words_to_bytes(words: &[u64]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
-thread_local! {
-    static SIGN_WORD_FALLBACKS: Cell<[u64; 3]> = const { Cell::new([0; 3]) };
-}
-
-/// Cumulative per-layer owned-word fallbacks in sign scoring on the current thread.
-/// Snapshot differences attribute allocations without synchronizing the scoring loop.
-pub fn sign_word_fallback_counts() -> [u64; 3] {
-    SIGN_WORD_FALLBACKS.get()
-}
-
-#[inline]
-fn scoring_le_words(bytes: &[u8], layer: usize) -> Cow<'_, [u64]> {
-    let words = aligned_le_words(bytes);
-    if matches!(words, Cow::Owned(_)) {
-        let mut counts = SIGN_WORD_FALLBACKS.get();
-        counts[layer] += 1;
-        SIGN_WORD_FALLBACKS.set(counts);
-    }
-    words
-}
-
 #[inline]
 fn aligned_le_words(bytes: &[u8]) -> Cow<'_, [u64]> {
     assert_eq!(bytes.len() % std::mem::size_of::<u64>(), 0);
@@ -196,9 +174,7 @@ mod tests {
         let (prefix, bytes, suffix) = unsafe { expected.as_slice().align_to::<u8>() };
         assert!(prefix.is_empty() && suffix.is_empty());
 
-        let before = sign_word_fallback_counts();
-        let words = scoring_le_words(bytes, 1);
-        assert_eq!(sign_word_fallback_counts(), before);
+        let words = aligned_le_words(bytes);
         assert_eq!(words.as_ref(), expected);
         assert!(matches!(words, Cow::Borrowed(_)));
     }
@@ -213,11 +189,7 @@ mod tests {
             .expect("at least seven of eight consecutive byte offsets are unaligned");
         storage[offset..offset + encoded.len()].copy_from_slice(&encoded);
 
-        let before = sign_word_fallback_counts();
-        let words = scoring_le_words(&storage[offset..offset + encoded.len()], 2);
-        let mut expected_counts = before;
-        expected_counts[2] += 1;
-        assert_eq!(sign_word_fallback_counts(), expected_counts);
+        let words = aligned_le_words(&storage[offset..offset + encoded.len()]);
         assert_eq!(words.as_ref(), expected);
         assert!(matches!(words, Cow::Owned(_)));
     }
