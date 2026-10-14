@@ -16,8 +16,8 @@ use crate::query::term_query::TermScorer;
 use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
 use crate::query::{
     intersect_scorers as intersect_scored_scorers, AllScorer, BufferedUnionScorer,
-    DisjunctionPruning, EmptyScorer, Exclude, Explanation, Occur, RequiredOptionalScorer, Scorer,
-    Weight,
+    DisjunctionPruning, EmptyScorer, Exclude, ExcludedDocSet, Explanation, Occur,
+    RequiredOptionalScorer, Scorer, Weight,
 };
 use crate::{DocId, Score, TERMINATED};
 
@@ -635,11 +635,21 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
             let exclude_scorer = exclude_scorers.pop().unwrap();
             match exclude_scorer.downcast::<TermScorer>() {
                 // Cast to TermScorer succeeded
-                Ok(exclude_scorer) => Box::new(Exclude::new(include_scorer_boxed, *exclude_scorer)),
+                Ok(exclude_scorer) => Box::new(Exclude::new(
+                    include_scorer_boxed,
+                    ExcludedDocSet::new(*exclude_scorer),
+                )),
                 // We get back the original Box<dyn Scorer>
-                Err(exclude_scorer) => Box::new(Exclude::new(include_scorer_boxed, exclude_scorer)),
+                Err(exclude_scorer) => Box::new(Exclude::new(
+                    include_scorer_boxed,
+                    ExcludedDocSet::new(exclude_scorer),
+                )),
             }
         } else {
+            let exclude_scorers: Vec<_> = exclude_scorers
+                .into_iter()
+                .map(ExcludedDocSet::new)
+                .collect();
             Box::new(Exclude::new(include_scorer_boxed, exclude_scorers))
         };
         Ok(SpecializedScorer::Other(scorer))
