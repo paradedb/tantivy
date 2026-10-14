@@ -1,8 +1,6 @@
 //! Exact scoring: full-precision reads of a cluster's selected rows, scored into the pruning bound
 //! and the result heap.
 
-use std::ops::Range;
-
 use common::OwnedBytes;
 
 use super::bound::KthBound;
@@ -10,7 +8,7 @@ use super::heap::{tie_break_key, TieBreakHeap, TieBreakHits};
 use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::{SegmentSortKeyComputer, TopNComputer};
 use crate::vector::cluster_source::ClusterRows;
-use crate::vector::index_reader::{VectorIndexReader, VectorRowBatch};
+use crate::vector::index_reader::{ReadScratch, VectorIndexReader, VectorRowBatch};
 use crate::vector::prepared::VectorQuery;
 use crate::vector::{enter_vector_stage, Stage, VectorElement};
 use crate::{DocAddress, DocId, SegmentOrdinal};
@@ -35,9 +33,7 @@ where
     topn: TieBreakHeap<K, C>,
     tie_break: &'a mut K,
     pub(super) bound: KthBound,
-    rows: Vec<usize>,
-    read_ranges: Vec<Range<usize>>,
-    block_scratch: Vec<(usize, usize)>,
+    scratch: ReadScratch,
     /// A cluster's DocIds column, read when its selected rows carry no doc ids.
     cluster_docs: Vec<DocId>,
     /// Global rows scored in the exact phase, in order; the scan copies them into its trace.
@@ -64,9 +60,7 @@ where
             topn: TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator)),
             tie_break,
             bound: KthBound::new(top_n),
-            rows: Vec::new(),
-            read_ranges: Vec::new(),
-            block_scratch: Vec::new(),
+            scratch: ReadScratch::default(),
             cluster_docs: Vec::new(),
             #[cfg(test)]
             exact_phase_rows: Vec::new(),
@@ -180,13 +174,12 @@ where
         Ok(match selected.offsets {
             None => ExactRows::Span(self.reader.read_cluster_rows(selected.cluster)?),
             Some(_) => {
-                self.rows.clear();
-                self.rows.extend(selected.global_rows());
-                ExactRows::Planned(self.reader.read_vector_rows_planned(
-                    &self.rows,
-                    &mut self.read_ranges,
-                    &mut self.block_scratch,
-                )?)
+                let ReadScratch {
+                    rows, runs, blocks, ..
+                } = &mut self.scratch;
+                rows.clear();
+                rows.extend(selected.global_rows());
+                ExactRows::Planned(self.reader.read_vector_rows_planned(rows, runs, blocks)?)
             }
         })
     }

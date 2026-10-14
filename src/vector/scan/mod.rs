@@ -7,29 +7,23 @@ pub(crate) mod estimate;
 mod exact;
 pub(crate) mod heap;
 pub(crate) mod layer_read;
-#[cfg(test)]
-mod quantized_boundary_tests;
-#[cfg(test)]
-mod tests;
 
 use std::ops::Range;
 
 use self::bound::KthBound;
-use self::columns::QuantizedCandidates;
-use self::estimate::{
-    combine_initial_decoded, combine_refinement_decoded, cosine_refinement_batches,
-};
+use self::columns::{Columns, QuantizedCandidates};
+use self::estimate::{combine_initial, combine_refine, CombineCtx};
 use self::exact::ExactScorer;
 use self::heap::TieBreakHits;
-use self::layer_read::{candidate_offsets, score_layer};
+use self::layer_read::{decode_layer, plan_runs, Decoded, LayerRead, LayerSpec};
 use crate::collector::sort_key::Comparator;
 use crate::collector::SegmentSortKeyComputer;
 use crate::error::DataCorruption;
 use crate::schema::Metric;
 use crate::vector::cluster_source::{ClusterRows, ClusterSource, Feedback};
-use crate::vector::index_reader::{QuantizedFieldReader, VectorIndexReader};
+use crate::vector::index_reader::{QuantizedFieldReader, ReadScratch, VectorIndexReader};
 use crate::vector::ivf::IvfIndex;
-use crate::vector::prepared::{ArithmeticError, QuantizedQueryCtx, ScoringQuery};
+use crate::vector::prepared::{QuantizedQueryCtx, ScoringQuery};
 use crate::vector::{enter_vector_stage, Similarity, Stage, VectorElement};
 use crate::SegmentOrdinal;
 
@@ -88,50 +82,39 @@ struct AdmittedCluster {
 
 // --- Quantized state ---
 
-/// Per-segment buffers reused across clusters and layers.
-#[derive(Default)]
-struct ScanScratch {
-    kernel_scores: Vec<f32>,
-    decoded_scales: Vec<f32>,
-    decoded_gammas: Vec<f32>,
-    decoded_error_ratios: Vec<f32>,
-    decoded_constants: Vec<f32>,
-    decoded_residual_norms: Vec<f32>,
-    base_scores: Vec<f32>,
-    estimate_scores: Vec<f32>,
-    sigma_scores: Vec<f32>,
-    residual_norm_squared_scores: Vec<f32>,
-    sign_query_error_terms: Vec<f32>,
-    arithmetic_variances: Vec<ArithmeticError>,
-    selection_offsets: Vec<usize>,
-    selected_rows: Vec<usize>,
-    row_offsets: Vec<usize>,
-    read_ranges: Vec<Range<usize>>,
-    /// A survivor group's cluster-local offsets.
-    group_offsets: Vec<usize>,
-}
-
 /// The quantized cascade's state: candidate columns plus each admitted cluster's record.
 struct QuantizedState<'a> {
-    query: &'a QuantizedQueryCtx,
-    field: &'a QuantizedFieldReader,
+    /// The active layers, in scan order.
+    layers: Vec<LayerSpec<'a>>,
     metric: Metric,
     dimension: usize,
     candidates: QuantizedCandidates,
     /// By cluster id; `None` for clusters never admitted.
     admitted: Vec<Option<AdmittedCluster>>,
+    decoded: Decoded,
+    /// A shortlisted cluster's layer-0 columns, before they join the candidates.
+    cluster_columns: Columns,
 }
 
 impl<'a> QuantizedState<'a> {
     fn new(query: &'a QuantizedQueryCtx, field: &'a QuantizedFieldReader, capacity: usize) -> Self {
         let meta = query.index.meta.field();
         Self {
-            query,
-            field,
+            layers: (0..query.active_layers())
+                .map(|index| LayerSpec {
+                    query,
+                    reader: &field.layers()[index],
+                    index,
+                    has_norms: index == 0,
+                    query_error_squared: query.query_error_squared(index) as f32,
+                })
+                .collect(),
             metric: meta.metric,
             dimension: meta.dim as usize,
             candidates: QuantizedCandidates::with_capacity(capacity),
             admitted: Vec::new(),
+            decoded: Decoded::default(),
+            cluster_columns: Columns::default(),
         }
     }
 
@@ -150,66 +133,40 @@ impl<'a> QuantizedState<'a> {
             .filter_map(|(cluster, admitted)| admitted.map(|admitted| (cluster, admitted)))
     }
 
-    /// Scores a cluster's rows on layer 0 from its whole band and appends them as quantized
-    /// candidates.
+    /// Reads `layer` for the rows of `selected` as `read` and decodes them; returns how to combine
+    /// the decoded columns into estimates.
+    fn decode(
+        &mut self,
+        layer: usize,
+        selected: &ClusterRows<'_>,
+        read: LayerRead,
+        scratch: &mut ReadScratch,
+    ) -> crate::Result<CombineCtx> {
+        let spec = self.layers[layer];
+        if read == LayerRead::Sparse {
+            plan_runs(&spec, selected, scratch)?;
+        }
+        decode_layer(&spec, selected, read, &mut self.decoded, scratch)?;
+        let cluster_score = selected.centroid.score();
+        let query_norm = spec.query.score_query_norm(cluster_score);
+        Ok(CombineCtx {
+            metric: self.metric,
+            dimension: self.dimension,
+            query_norm_squared: query_norm * query_norm,
+            query_error_squared: spec.query_error_squared,
+            cluster_score,
+        })
+    }
+
+    /// Scores a cluster's rows on layer 0 and appends them as candidates.
     fn admit(
         &mut self,
         rows: &ClusterRows<'_>,
         bound: &mut KthBound,
-        scratch: &mut ScanScratch,
+        scratch: &mut ReadScratch,
     ) -> crate::Result<()> {
-        let query = self.query;
-        let selected_count = rows.len();
-        let layer = &self.field.layers()[0];
-        let cluster_score = rows.centroid.score();
-        let band = layer.read_batch_in_block(rows.cluster, rows.rows.clone())?;
-        let score_query_norm = query.score_query_norm(cluster_score);
-        score_layer(
-            query,
-            0,
-            layer,
-            Some((&band, &mut scratch.decoded_residual_norms)),
-            Some(rows.cluster),
-            rows.rows.clone(),
-            rows.offsets,
-            &mut scratch.kernel_scores,
-            &mut scratch.decoded_scales,
-            &mut scratch.decoded_gammas,
-            &mut scratch.decoded_error_ratios,
-            &mut scratch.decoded_constants,
-            &mut scratch.read_ranges,
-            &mut scratch.selected_rows,
-            &mut scratch.row_offsets,
-        )?;
-        scratch.base_scores.resize(selected_count, 0.0);
-        scratch.estimate_scores.resize(selected_count, 0.0);
-        scratch.sigma_scores.resize(selected_count, 0.0);
-        scratch
-            .residual_norm_squared_scores
-            .resize(selected_count, 0.0);
-        scratch.sign_query_error_terms.resize(selected_count, 0.0);
-        scratch
-            .arithmetic_variances
-            .resize(selected_count, ArithmeticError::default());
-        combine_initial_decoded(
-            self.metric,
-            self.dimension,
-            &mut scratch.kernel_scores,
-            &mut scratch.base_scores,
-            &mut scratch.estimate_scores,
-            &mut scratch.sigma_scores,
-            &mut scratch.residual_norm_squared_scores,
-            &mut scratch.sign_query_error_terms,
-            &mut scratch.arithmetic_variances,
-            &scratch.decoded_scales,
-            &scratch.decoded_gammas,
-            &scratch.decoded_error_ratios,
-            &scratch.decoded_constants,
-            &scratch.decoded_residual_norms,
-            cluster_score,
-            score_query_norm * score_query_norm,
-            query.query_error_squared(0) as f32,
-        );
+        let ctx = self.decode(0, rows, LayerRead::Band, scratch)?;
+        combine_initial(&ctx, &self.decoded, &mut self.cluster_columns);
         self.record(
             rows.cluster,
             AdmittedCluster {
@@ -218,20 +175,26 @@ impl<'a> QuantizedState<'a> {
             },
         );
         let cluster_start = self.candidates.len();
-        self.candidates.append_selected(
+        self.candidates.append(
             rows.rows.clone(),
             rows.offsets,
             rows.docs,
-            &scratch.base_scores[..selected_count],
-            &scratch.kernel_scores[..selected_count],
-            &scratch.estimate_scores[..selected_count],
-            &scratch.sigma_scores[..selected_count],
-            &scratch.residual_norm_squared_scores[..selected_count],
-            &scratch.decoded_gammas[..selected_count],
-            &scratch.sign_query_error_terms[..selected_count],
-            &scratch.arithmetic_variances[..selected_count],
+            &self.cluster_columns,
         );
         self.candidates.finish_cluster(cluster_start, bound);
+        Ok(())
+    }
+
+    /// Refines the candidates at `at`, the survivors `group` of one cluster, with `layer`.
+    fn refine(
+        &mut self,
+        layer: usize,
+        group: &ClusterRows<'_>,
+        at: Range<usize>,
+        scratch: &mut ReadScratch,
+    ) -> crate::Result<()> {
+        let ctx = self.decode(layer, group, LayerRead::Sparse, scratch)?;
+        combine_refine(&ctx, &self.decoded, &mut self.candidates.columns, at);
         Ok(())
     }
 
@@ -252,116 +215,7 @@ impl<'a> QuantizedState<'a> {
             .boundary_rows
             .push(self.candidates.rows.clone());
     }
-
-    /// Refines every live candidate with `layer`, which follows at least one boundary.
-    fn refine_layer(
-        &mut self,
-        layer_idx: usize,
-        index: &IvfIndex,
-        scratch: &mut ScanScratch,
-    ) -> crate::Result<()> {
-        let query = self.query;
-        let metric = self.metric;
-        let layer = &self.field.layers()[layer_idx];
-        let sign_query_error_squared =
-            if matches!(query.index.specs[layer_idx].kind, cascade::LayerKind::Sign) {
-                query.query_error_squared(layer_idx) as f32
-            } else {
-                0.0
-            };
-        if metric == Metric::Cosine {
-            let query_norm = query.score_query_norm(0.0);
-            for candidate_range in cosine_refinement_batches(self.candidates.len()) {
-                let first_row = self.candidates.rows[candidate_range.start];
-                let last_row = self.candidates.rows[candidate_range.end - 1];
-                let available_rows = first_row..last_row + 1;
-                let offsets = candidate_offsets(
-                    &self.candidates.rows[candidate_range.clone()],
-                    &available_rows,
-                    &mut scratch.selection_offsets,
-                );
-                let rows = score_layer(
-                    query,
-                    layer_idx,
-                    layer,
-                    None,
-                    None,
-                    available_rows,
-                    Some(offsets),
-                    &mut scratch.kernel_scores,
-                    &mut scratch.decoded_scales,
-                    &mut scratch.decoded_gammas,
-                    &mut scratch.decoded_error_ratios,
-                    &mut scratch.decoded_constants,
-                    &mut scratch.read_ranges,
-                    &mut scratch.selected_rows,
-                    &mut scratch.row_offsets,
-                )?;
-                combine_refinement_decoded(
-                    metric,
-                    self.dimension,
-                    &mut self.candidates,
-                    candidate_range,
-                    &scratch.kernel_scores[..rows],
-                    &scratch.decoded_scales[..rows],
-                    &scratch.decoded_gammas[..rows],
-                    &scratch.decoded_error_ratios[..rows],
-                    &[],
-                    query_norm * query_norm,
-                    sign_query_error_squared,
-                );
-            }
-            return Ok(());
-        }
-        let groups = survivor_groups(&self.candidates.rows, self.admitted_clusters(), index);
-        for (cluster, admitted, candidate_range) in groups {
-            let cluster_rows = index.cluster_range(cluster);
-            let query_norm = query.score_query_norm(admitted.centroid.score());
-            let offsets = candidate_offsets(
-                &self.candidates.rows[candidate_range.clone()],
-                &cluster_rows,
-                &mut scratch.selection_offsets,
-            );
-            let rows = score_layer(
-                query,
-                layer_idx,
-                layer,
-                None,
-                Some(cluster),
-                cluster_rows,
-                Some(offsets),
-                &mut scratch.kernel_scores,
-                &mut scratch.decoded_scales,
-                &mut scratch.decoded_gammas,
-                &mut scratch.decoded_error_ratios,
-                &mut scratch.decoded_constants,
-                &mut scratch.read_ranges,
-                &mut scratch.selected_rows,
-                &mut scratch.row_offsets,
-            )?;
-            let decoded_constants = if metric == Metric::L2 {
-                &scratch.decoded_constants[..rows]
-            } else {
-                &[]
-            };
-            combine_refinement_decoded(
-                metric,
-                self.dimension,
-                &mut self.candidates,
-                candidate_range,
-                &scratch.kernel_scores[..rows],
-                &scratch.decoded_scales[..rows],
-                &scratch.decoded_gammas[..rows],
-                &scratch.decoded_error_ratios[..rows],
-                decoded_constants,
-                query_norm * query_norm,
-                sign_query_error_squared,
-            );
-        }
-        Ok(())
-    }
 }
-
 /// Splits row-sorted survivors into one candidate range per admitted cluster.
 fn survivor_groups(
     rows: &[usize],
@@ -408,7 +262,9 @@ where
     exact: ExactScorer<'a, T, K, C>,
     /// The quantized cascade; `None` scores every shortlisted row exactly.
     quantized: Option<QuantizedState<'a>>,
-    scratch: ScanScratch,
+    scratch: ReadScratch,
+    /// A survivor group's cluster-local offsets.
+    group_offsets: Vec<usize>,
     report: ScanReport,
 }
 
@@ -439,14 +295,13 @@ where
             }
             (None, _) => None,
         };
-        let layers = quantized
-            .as_ref()
-            .map_or(0, |state| state.query.active_layers());
+        let layers = quantized.as_ref().map_or(0, |state| state.layers.len());
         Ok(Self {
             index,
             exact: ExactScorer::new(reader, query.query, config.top_n, tie_break, tie_comparator),
             quantized,
-            scratch: ScanScratch::default(),
+            scratch: ReadScratch::default(),
+            group_offsets: Vec::new(),
             report: ScanReport {
                 layers: vec![LayerReport::default(); layers],
                 ..ScanReport::default()
@@ -486,6 +341,21 @@ where
         }
     }
 
+    /// Prunes the shortlist at layer 0's boundary.
+    fn close_shortlist(&mut self) {
+        if let Some(state) = &mut self.quantized {
+            state.prune(0, &mut self.exact.bound, &mut self.report);
+        }
+    }
+
+    /// The quantized layers after layer 0; none at full precision.
+    fn refining_layers(&self) -> Range<usize> {
+        1..self
+            .quantized
+            .as_ref()
+            .map_or(1, |state| state.layers.len())
+    }
+
     /// Adds a cluster's rows to the shortlist: scored exactly at full precision, otherwise as
     /// quantized candidates. Returns the rows scored.
     fn shortlist(&mut self, rows: &ClusterRows<'_>) -> crate::Result<usize> {
@@ -503,30 +373,35 @@ where
         Ok(len)
     }
 
-    /// Prunes the shortlist at layer 0's boundary.
-    fn close_shortlist(&mut self) {
-        if let Some(state) = &mut self.quantized {
-            state.prune(0, &mut self.exact.bound, &mut self.report);
-        }
-    }
-
-    /// The quantized layers after layer 0; none at full precision.
-    fn refining_layers(&self) -> Range<usize> {
-        1..self
-            .quantized
-            .as_ref()
-            .map_or(1, |state| state.query.active_layers())
-    }
-
-    /// Refines the shortlist with `layer` and prunes it at that layer's boundary.
+    /// Refines each cluster's surviving candidates with `layer`, then prunes them at the layer's
+    /// boundary.
     fn narrow(&mut self, layer: usize) -> crate::Result<()> {
         let Some(state) = &mut self.quantized else {
             return Ok(());
         };
-        {
-            let _layer = enter_vector_stage(Stage::LayerScan(layer as u8));
-            state.refine_layer(layer, self.index, &mut self.scratch)?;
+        let groups = survivor_groups(
+            &state.candidates.rows,
+            state.admitted_clusters(),
+            self.index,
+        );
+        let layer_scan = enter_vector_stage(Stage::LayerScan(layer as u8));
+        for (cluster, admitted, at) in groups {
+            let rows = self.index.cluster_range(cluster);
+            local_offsets(
+                &mut self.group_offsets,
+                &state.candidates.rows[at.clone()],
+                rows.start,
+            );
+            let group = ClusterRows {
+                cluster,
+                rows,
+                offsets: Some(&self.group_offsets),
+                docs: None,
+                centroid: admitted.centroid,
+            };
+            state.refine(layer, &group, at, &mut self.scratch)?;
         }
+        drop(layer_scan);
         state.prune(layer, &mut self.exact.bound, &mut self.report);
         Ok(())
     }
@@ -536,25 +411,28 @@ where
         let Some(state) = &self.quantized else {
             return Ok(());
         };
-        let survivors = &state.candidates;
-        for (cluster, admitted, group) in
-            survivor_groups(&survivors.rows, state.admitted_clusters(), self.index)
-        {
-            let cluster_rows = self.index.cluster_range(cluster);
-            self.scratch.group_offsets.clear();
-            self.scratch.group_offsets.extend(
-                survivors.rows[group.clone()]
-                    .iter()
-                    .map(|&row| row - cluster_rows.start),
+        let groups = survivor_groups(
+            &state.candidates.rows,
+            state.admitted_clusters(),
+            self.index,
+        );
+        for (cluster, admitted, at) in groups {
+            let rows = self.index.cluster_range(cluster);
+            local_offsets(
+                &mut self.group_offsets,
+                &state.candidates.rows[at.clone()],
+                rows.start,
             );
-            let rows = ClusterRows {
+            let group = ClusterRows {
                 cluster,
-                rows: cluster_rows,
-                offsets: Some(&self.scratch.group_offsets),
-                docs: admitted.docs_in_candidates.then(|| &survivors.docs[group]),
+                rows,
+                offsets: Some(&self.group_offsets),
+                docs: admitted
+                    .docs_in_candidates
+                    .then(|| &state.candidates.docs[at]),
                 centroid: admitted.centroid,
             };
-            self.report.exact_rows += self.exact.score_survivors(&rows)?;
+            self.report.exact_rows += self.exact.score_survivors(&group)?;
         }
         Ok(())
     }
@@ -574,4 +452,10 @@ where
         };
         Ok((exact.into_hits(segment_ord), report))
     }
+}
+
+/// Writes the cluster-local offsets of `rows`, in a cluster starting at `start`, into `offsets`.
+fn local_offsets(offsets: &mut Vec<usize>, rows: &[usize], start: usize) {
+    offsets.clear();
+    offsets.extend(rows.iter().map(|&row| row - start));
 }

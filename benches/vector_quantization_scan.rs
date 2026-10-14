@@ -11,7 +11,7 @@ use cascade::{audit_split_query_layer_error_squared, prepare_split_query, LayerS
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use quant_model::build_grid;
 use quant_model::f16::f32_to_f16;
-use tantivy::vector::quantization_bench_layer0_cosine_cluster;
+use tantivy::vector::{quantization_bench_layer0_cosine_cluster, Columns, Decoded};
 
 const DIM: usize = 1_024;
 const ROWS_PER_CLUSTER: usize = 100;
@@ -72,16 +72,8 @@ fn layer0_integrated_shape(c: &mut Criterion) {
         .map(|cluster| (cluster as f32 * 0.071).cos())
         .collect();
 
-    let mut kernel_scores = Vec::with_capacity(ROWS_PER_CLUSTER);
-    let mut decoded_scales = Vec::with_capacity(ROWS_PER_CLUSTER);
-    let mut decoded_gammas = Vec::with_capacity(ROWS_PER_CLUSTER);
-    let mut decoded_error_ratios = Vec::with_capacity(ROWS_PER_CLUSTER);
-    let mut decoded_residual_norms = Vec::with_capacity(ROWS_PER_CLUSTER);
-    let mut bases = Vec::with_capacity(ROWS_PER_CLUSTER);
-    let mut estimates = Vec::with_capacity(ROWS_PER_CLUSTER);
-    let mut sigmas = Vec::with_capacity(ROWS_PER_CLUSTER);
-    let mut residual_norms_squared = Vec::with_capacity(ROWS_PER_CLUSTER);
-    let mut sign_query_error_terms = Vec::with_capacity(ROWS_PER_CLUSTER);
+    let mut decoded = Decoded::default();
+    let mut columns = Columns::default();
     let mut next_cluster = 0_usize;
 
     // Allocate and size every scratch stream before Criterion starts timing.
@@ -98,16 +90,8 @@ fn layer0_integrated_shape(c: &mut Criterion) {
         cluster_scores[0],
         query_norm_squared,
         query_error_squared,
-        &mut kernel_scores,
-        &mut decoded_scales,
-        &mut decoded_gammas,
-        &mut decoded_error_ratios,
-        &mut decoded_residual_norms,
-        &mut bases,
-        &mut estimates,
-        &mut sigmas,
-        &mut residual_norms_squared,
-        &mut sign_query_error_terms,
+        &mut decoded,
+        &mut columns,
     );
 
     let mut group = c.benchmark_group("vector_quantization_scan");
@@ -136,16 +120,8 @@ fn layer0_integrated_shape(c: &mut Criterion) {
                 cluster_scores[cluster],
                 query_norm_squared,
                 query_error_squared,
-                &mut kernel_scores,
-                &mut decoded_scales,
-                &mut decoded_gammas,
-                &mut decoded_error_ratios,
-                &mut decoded_residual_norms,
-                &mut bases,
-                &mut estimates,
-                &mut sigmas,
-                &mut residual_norms_squared,
-                &mut sign_query_error_terms,
+                &mut decoded,
+                &mut columns,
             ))
         })
     });
