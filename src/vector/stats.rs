@@ -235,18 +235,6 @@ pub struct ProbeStats {
     pub routing: Option<RouterMetrics>,
     /// Centroids scored while ranking.
     pub routing_visited_count: usize,
-    /// Segments ranked through the centroid graph: 0 or 1.
-    pub routing_graph_count: usize,
-    /// Graph nodes visited and scored.
-    pub routing_graph_visited_count: usize,
-    /// Graph frontier candidates expanded.
-    pub routing_graph_expanded_count: usize,
-    /// Graph adjacency entries scanned.
-    pub routing_graph_edges_scanned: usize,
-    /// Graph result-set evictions.
-    pub routing_graph_evictions: usize,
-    /// Graph candidates returned before probing stopped.
-    pub routing_graph_result_count: usize,
     /// Clusters the bounds gate passed over.
     pub bounds_skips: u32,
     /// Segment scans in which the query bound armed: 0 or 1.
@@ -364,20 +352,11 @@ impl ProbeStats {
         }
         self.routing = Some(routing);
         self.routing_visited_count = match routing {
-            RouterMetrics::Rng(graph) => graph.visited_count,
             RouterMetrics::Stacked {
                 candidate_count, ..
             } => candidate_count,
             RouterMetrics::Exact { visited_count } => visited_count,
         };
-        if let RouterMetrics::Rng(graph) = routing {
-            self.routing_graph_count = 1;
-            self.routing_graph_visited_count = graph.visited_count;
-            self.routing_graph_expanded_count = graph.expanded_count;
-            self.routing_graph_edges_scanned = graph.edges_scanned;
-            self.routing_graph_evictions = graph.evictions;
-            self.routing_graph_result_count = graph.result_count;
-        }
         self.termination = probe.termination;
         self.work_charged = probe.work_charged;
         self.work_budget = probe.work_budget;
@@ -454,7 +433,6 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::vector::ivf::{NeighborhoodGraphSearchMetrics, SearchTerminationReason};
     use crate::vector::scan::LayerReport;
     use crate::vector::source::controller::ProbeOutcome;
     use crate::vector::source::router::RouterCounters;
@@ -472,14 +450,7 @@ mod tests {
     fn routed() -> SourceReport {
         SourceReport::Router(RouterReport {
             counters: RouterCounters::default(),
-            routing: RouterMetrics::Rng(NeighborhoodGraphSearchMetrics {
-                visited_count: 7,
-                expanded_count: 4,
-                edges_scanned: 12,
-                evictions: 1,
-                result_count: 3,
-                termination_reason: SearchTerminationReason::SearchConverged,
-            }),
+            routing: RouterMetrics::Exact { visited_count: 7 },
             probe: ProbeOutcome {
                 recall_estimate: Some(0.9),
                 ..ProbeOutcome::default()
@@ -521,12 +492,6 @@ mod tests {
         "postings_row",
         "postings_skipped",
         "routing_visited_count",
-        "routing_graph_count",
-        "routing_graph_visited_count",
-        "routing_graph_expanded_count",
-        "routing_graph_edges_scanned",
-        "routing_graph_evictions",
-        "routing_graph_result_count",
         "bounds_skips",
         "bound_armed_count",
         "bound_armed_probe_sum",

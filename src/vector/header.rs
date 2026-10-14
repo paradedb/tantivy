@@ -5,7 +5,12 @@ use std::io::{self, Read, Write};
 use common::{BinarySerializable, HasLen};
 
 use crate::directory::error::OpenReadError;
-use crate::directory::FileSlice;
+use crate::directory::{CompositeFile, FileSlice};
+use crate::index::SegmentComponent;
+use crate::schema::{FieldType, Schema};
+use crate::vector::ivf::CENTROIDS_EXT;
+use crate::vector::router::RouterKind;
+use crate::vector::VEC_EXT;
 
 /// Length of the version header in bytes.
 pub(crate) const HEADER_LEN: usize = 4;
@@ -145,11 +150,40 @@ pub(crate) fn read_vector_header(
     Ok((version, file.slice_from(HEADER_LEN)))
 }
 
-/// Checks only the vector header. A missing component means the segment has no vector data.
-pub(crate) fn check_vector_format(file: Result<FileSlice, OpenReadError>) -> crate::Result<()> {
+/// Checks a segment's `.vec` header, then the router kind of each vector field in its
+/// `.centroids`, through `open`. A missing component means the segment has no vector data or no
+/// IVF field.
+pub(crate) fn check_vector_format(
+    open: impl Fn(SegmentComponent) -> Result<FileSlice, OpenReadError>,
+    schema: &Schema,
+) -> crate::Result<()> {
+    let Some(vectors) = existing(open(SegmentComponent::Custom(VEC_EXT.to_string())))? else {
+        return Ok(());
+    };
+    read_vector_header(&vectors)?;
+    let Some(centroids) = existing(open(SegmentComponent::Custom(CENTROIDS_EXT.to_string())))?
+    else {
+        return Ok(());
+    };
+    let (_, body) = read_centroid_header(&centroids)?;
+    let composite = CompositeFile::open(&body)?;
+    for (field, entry) in schema.fields() {
+        if !matches!(entry.field_type(), FieldType::Vector(_)) {
+            continue;
+        }
+        let router = composite.open_read_with_idx(field, CentroidSlot::Router.index());
+        if let Some(router) = router.filter(|slot| !slot.is_empty()) {
+            RouterKind::from_code(router.read_byte(0)?)?;
+        }
+    }
+    Ok(())
+}
+
+/// `file`, or `None` when it doesn't exist.
+fn existing(file: Result<FileSlice, OpenReadError>) -> crate::Result<Option<FileSlice>> {
     match file {
-        Ok(file) => read_vector_header(&file).map(|_| ()),
-        Err(OpenReadError::FileDoesNotExist(_)) => Ok(()),
+        Ok(file) => Ok(Some(file)),
+        Err(OpenReadError::FileDoesNotExist(_)) => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
@@ -181,7 +215,8 @@ mod tests {
 
     #[test]
     fn format_check_accepts_a_missing_vector_component() {
-        check_vector_format(Err(OpenReadError::FileDoesNotExist("segment.vec".into()))).unwrap();
+        let missing = |_| Err(OpenReadError::FileDoesNotExist("segment.vec".into()));
+        check_vector_format(missing, &Schema::builder().build()).unwrap();
     }
 
     #[test]

@@ -32,18 +32,17 @@ use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
 use crate::vector::ivf::RecallEstimator;
-use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RouterWorkspace, RoutingParams};
+use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RoutingParams};
 use crate::vector::storage_io::VectorRead;
 use crate::vector::{BoundKind, BoundStore};
 
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
 ///
-/// Pinned state is small and touched by every query: the cluster offsets and
-/// the RNG adjacency (edges only, `num_centroids × max_edges × 4` bytes). The
-/// centroid vectors stay behind a [`FileSliceArena`] and are fetched one node
-/// at a time as routing visits them. Everything row-scale (the rows and
-/// id-map) lives on [`VectorIndexReader`](crate::vector::VectorIndexReader).
+/// Pinned state is small and touched by every query: the cluster offsets, the bounds and the
+/// router's lists. The centroid vectors stay behind a [`FileSlice`] and are read one row at a
+/// time as routing visits them. Everything row-scale (the rows and id-map) lives on
+/// [`VectorIndexReader`](crate::vector::VectorIndexReader).
 pub struct IvfIndex {
     num_centroids: usize,
     /// Distinct documents with a vector in this field.
@@ -319,17 +318,12 @@ impl IvfIndex {
     /// Rank this segment's clusters for `query`, nearest first. `params`
     /// steers the stacked router only (how many clusters the caller will
     /// probe and its recall target); other routers ignore it.
-    pub(crate) fn rank_clusters<'router, 'workspace>(
-        &'router self,
-        workspace: &'workspace mut RouterWorkspace,
-        query: &'router [f32],
-        params: RoutingParams,
-    ) -> RouterIter<'router, 'workspace> {
+    pub(crate) fn rank_clusters(&self, query: &[f32], params: RoutingParams) -> RouterIter {
         #[cfg(test)]
         if let Some(clusters) = crate::vector::router::test_clusters() {
             return clusters;
         }
-        self.router.rank(workspace, query, self.metric, params)
+        self.router.rank(query, self.metric, params)
     }
 
     /// The APS estimator for scanning `ranked` (from
@@ -337,7 +331,7 @@ impl IvfIndex {
     /// unless the stacked router ranked it and APS is on.
     pub(crate) fn recall_estimator(
         &self,
-        ranked: &RouterIter<'_, '_>,
+        ranked: &RouterIter,
         query: &[f32],
         recall: f32,
     ) -> Option<RecallEstimator<'_>> {

@@ -1323,9 +1323,8 @@ mod bounds_storage_tests {
         Ok(())
     }
 
-    /// Segments open under the router persisted in their `.centroids` file:
-    /// no configured router is needed to read them, and a different
-    /// configured router only applies to segments merged afterwards.
+    /// Segments open under the router persisted in their `.centroids` file; a different router
+    /// set on the index applies only to segments merged afterwards.
     #[test]
     fn opening_ivf_uses_the_persisted_router() -> crate::Result<()> {
         let clusterer = || TestClusterer {
@@ -1353,7 +1352,7 @@ mod bounds_storage_tests {
         drop(reopened);
 
         let mut reopened = Index::open(directory)?;
-        reopened.set_ivf_router(RouterKind::Rng);
+        reopened.set_ivf_router(RouterKind::Exact);
         reopened.set_ivf_clusterer(Arc::new(clusterer()));
         let routers = |index: &Index| -> crate::Result<Vec<RouterKind>> {
             let searcher = index.reader()?.searcher();
@@ -1379,7 +1378,7 @@ mod bounds_storage_tests {
         drop(writer);
         merge_all(&reopened)?;
 
-        assert_eq!(routers(&reopened)?, vec![RouterKind::Rng]);
+        assert_eq!(routers(&reopened)?, vec![RouterKind::Exact]);
         let searcher = reopened.reader()?.searcher();
         assert_eq!(searcher.num_docs(), 6);
         Ok(())
@@ -1457,7 +1456,6 @@ mod bounds_storage_tests {
 
         // The reader's lazy router and the owned parse agree, query by
         // query — the FileSlice path scores the same rows.
-        let mut workspace = crate::vector::router::RouterWorkspace::default();
         for c in &centroids {
             let query = [c[0] + 0.3, 0.2];
             let owned: Vec<_> = stacked
@@ -1467,7 +1465,7 @@ mod bounds_storage_tests {
                 .take(2)
                 .collect();
             let lazy: Vec<_> = ivf
-                .rank_clusters(&mut workspace, &query, RoutingParams::default())
+                .rank_clusters(&query, RoutingParams::default())
                 .take(2)
                 .collect();
             assert_eq!(owned.len(), lazy.len());
@@ -1691,6 +1689,61 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
                 "{error:?}"
             );
         }
+    }
+    Ok(())
+}
+
+/// A `.centroids` router slot holding the graph router's code 0 fails format validation as an
+/// incompatible index.
+#[test]
+fn graph_router_segments_fail_format_validation() -> crate::Result<()> {
+    use std::io::Write;
+
+    use common::TerminatingWrite;
+
+    use crate::directory::error::Incompatibility;
+    use crate::directory::{CompositeWrite, RamDirectory};
+    use crate::index::SegmentComponent;
+
+    let mut schema = Schema::builder();
+    let field = schema.add_vector_field("v", VectorOptions::new(2, Metric::L2));
+    let index = Index::create(
+        RamDirectory::create(),
+        schema.build(),
+        IndexSettings::default(),
+    )?;
+    let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+    let mut doc = TantivyDocument::new();
+    doc.add_vector(field, &[1.0, 0.0]);
+    writer.add_document(doc)?;
+    writer.commit()?;
+    let segment = index.searchable_segments()?.remove(0);
+    let mut centroids = 3u32.to_le_bytes().to_vec();
+    let mut composite = CompositeWrite::wrap(&mut centroids);
+    composite
+        .for_field_with_idx(field, super::header::CentroidSlot::Router.index())
+        .write_all(&[0, 1, 2])?;
+    composite.close()?;
+    let mut file =
+        segment.open_write(SegmentComponent::Custom(super::ivf::CENTROIDS_EXT.into()))?;
+    file.write_all(&centroids)?;
+    file.terminate()?;
+
+    let reader = crate::SegmentReader::open(&segment)?;
+    for error in [
+        segment.validate_vector_format().unwrap_err(),
+        reader.validate_vector_format().unwrap_err(),
+    ] {
+        assert!(
+            matches!(
+                error,
+                crate::TantivyError::IncompatibleIndex(Incompatibility::VectorRouterMismatch {
+                    kind: 0
+                })
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("rebuild required"), "{error}");
     }
     Ok(())
 }

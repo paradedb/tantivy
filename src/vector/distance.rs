@@ -25,7 +25,7 @@ use crate::vector::{Accumulator, VectorElement};
 /// The raw kernels below ([`l2_squared`], [`dot`], …) return bare `f32`s in
 /// whatever space the math lives in; [`Metric::similarity`] is the boundary
 /// that folds them all into similarity space (negating L2) and wraps the
-/// result. Downstream code — edge ordering, beam search, RNG occlusion —
+/// result. Downstream code — routing, the bounds gate, the result heap —
 /// compares `Similarity` values directly and never re-negates, so a distance
 /// can't be confused for a similarity without an explicit
 /// [`Similarity::new`].

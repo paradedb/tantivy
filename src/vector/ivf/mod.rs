@@ -1,15 +1,13 @@
 //! Inverted-file vector storage and cluster routing.
 
 mod aps;
-pub(crate) mod bkt;
 #[cfg(test)]
 mod build_tests;
+mod candidate;
 mod clusterer;
-pub(crate) mod graph;
 mod index;
 mod ivf;
 mod params;
-mod partition;
 mod plugin;
 mod training;
 
@@ -18,13 +16,8 @@ pub(crate) const CENTROIDS_EXT: &str = "centroids";
 
 pub use aps::APS_MAX_DIM;
 pub(crate) use aps::{supports_metric as aps_supports_metric, CandidateRows, RecallEstimator};
-pub use bkt::{BKTree, BKTreeNode, BKTreeSearchIterator, NodeId as BktNodeId};
+pub use candidate::Candidate;
 pub use clusterer::{SuperKMeansClusterer, DEFAULT_MAX_LEAF_SIZE, DEFAULT_TRAINING_SAMPLE_RATIO};
-pub use graph::{
-    Candidate, Graph, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
-    RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
-    Workspace,
-};
 pub use index::IvfIndex;
 pub use ivf::{
     AddLevelError, ClusterId, InMemoryStackedIvf, InMemoryStore, IvfConfig,
