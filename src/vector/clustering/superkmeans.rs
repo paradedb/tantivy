@@ -16,18 +16,20 @@ pub const DEFAULT_MAX_LEAF_SIZE: usize = 200;
 /// Default [`SuperKMeansClusterer::with_training_sample_ratio`].
 pub const DEFAULT_TRAINING_SAMPLE_RATIO: f64 = 0.32;
 
-const TRAINING_BATCH_SIZE: usize = 4_096;
-const ASSIGN_BATCH_SIZE: usize = 40_960;
+const DEFAULT_BATCH_SIZE: usize = 40_960;
 
 /// Replays a [`VectorSource`] as a SuperKMeans [`Dataset`].
-struct SourceDataset<'a>(&'a mut dyn VectorSource);
+struct SourceDataset<'a> {
+    source: &'a mut dyn VectorSource,
+    batch_size: usize,
+}
 
 impl Dataset for SourceDataset<'_> {
     type Error = TantivyError;
 
     fn for_each_batch(&mut self, f: &mut dyn FnMut(Matrix<'_>)) -> crate::Result<()> {
-        self.0
-            .for_each_batch(TRAINING_BATCH_SIZE, &mut |IvfVectors::F32(batch)| {
+        self.source
+            .for_each_batch(self.batch_size, &mut |IvfVectors::F32(batch)| {
                 f(Matrix::new(
                     batch.matrix.values,
                     batch.matrix.rows,
@@ -43,6 +45,7 @@ impl Dataset for SourceDataset<'_> {
 pub struct SuperKMeansClusterer {
     config: HierarchicalSuperKMeansConfig,
     training_sample_ratio: f32,
+    memory_limit: Option<usize>,
     /// The assigner for the last `(dim, angular)`, reused across a merge's batches.
     assigner: Arc<Mutex<Option<Assigner>>>,
 }
@@ -55,14 +58,7 @@ struct Assigner {
 
 impl Default for SuperKMeansClusterer {
     fn default() -> Self {
-        let mut config = HierarchicalSuperKMeansConfig::default();
-        config.base.suppress_warnings = true;
-        config.max_leaf_size = DEFAULT_MAX_LEAF_SIZE;
-        Self {
-            config,
-            training_sample_ratio: DEFAULT_TRAINING_SAMPLE_RATIO as f32,
-            assigner: Arc::new(Mutex::new(None)),
-        }
+        Self::new()
     }
 }
 
@@ -76,18 +72,43 @@ impl fmt::Debug for SuperKMeansClusterer {
 }
 
 impl SuperKMeansClusterer {
+    /// Defaults: [`DEFAULT_MAX_LEAF_SIZE`], [`DEFAULT_TRAINING_SAMPLE_RATIO`], no memory limit.
+    pub fn new() -> Self {
+        let mut config = HierarchicalSuperKMeansConfig::default();
+        config.base.suppress_warnings = true;
+        config.max_leaf_size = DEFAULT_MAX_LEAF_SIZE;
+        Self {
+            config,
+            training_sample_ratio: DEFAULT_TRAINING_SAMPLE_RATIO as f32,
+            memory_limit: None,
+            assigner: Arc::new(Mutex::new(None)),
+        }
+    }
+
     /// At most `max_leaf_size` training vectors per clustering leaf.
-    #[must_use]
     pub fn with_max_leaf_size(mut self, max_leaf_size: usize) -> Self {
         self.config.max_leaf_size = max_leaf_size;
         self
     }
 
+    /// Caps decode/assign working buffers at about `memory_limit` bytes.
+    pub fn with_memory_limit(mut self, memory_limit: usize) -> Self {
+        self.memory_limit = Some(memory_limit);
+        self
+    }
+
     /// Trains on `ratio` of the vectors, in `(0, 1]`.
-    #[must_use]
     pub fn with_training_sample_ratio(mut self, ratio: f32) -> Self {
         self.training_sample_ratio = ratio;
         self
+    }
+
+    fn batch_size(&self, vector_options: &VectorOptions) -> usize {
+        let batch_size = match self.memory_limit {
+            Some(byte_limit) => byte_limit.saturating_div(vector_options.bytes_per_vector()),
+            None => DEFAULT_BATCH_SIZE,
+        };
+        batch_size.max(1)
     }
 
     /// The assigner for `(dim, angular)`, built on first use and kept for the next batch.
@@ -145,7 +166,13 @@ impl IvfClusterer for SuperKMeansClusterer {
 
         // Only the meso step scans every row; each meso cluster is then loaded and split on its
         // own, so peak memory is one meso cluster.
-        let meso = kmeans.train_meso(&mut SourceDataset(&mut *source), num_rows)?;
+        let meso = kmeans.train_meso(
+            &mut SourceDataset {
+                source: &mut *source,
+                batch_size: self.batch_size(options),
+            },
+            num_rows,
+        )?;
         let mut centroids = Vec::new();
         for m in 0..meso.n_meso() {
             let IvfTrainingVectors::F32(vectors) = source.read_rows(meso.meso_rows(m))?;
@@ -181,7 +208,7 @@ impl IvfClusterer for SuperKMeansClusterer {
         let mut assignments = Vec::with_capacity(source.num_rows());
         let kmeans = self.assigner(options.dim(), is_angular(options.metric()));
         let IvfCentroids::F32(centroids) = centroids;
-        source.for_each_batch(ASSIGN_BATCH_SIZE, &mut |vectors| {
+        source.for_each_batch(self.batch_size(options), &mut |vectors| {
             let IvfVectors::F32(batch) = vectors;
             assignments.extend(kmeans.assign(
                 batch.matrix.values,
@@ -260,7 +287,7 @@ mod tests {
             dim,
             scans: 0,
         };
-        let clusterer = SuperKMeansClusterer::default().with_max_leaf_size(100);
+        let clusterer = SuperKMeansClusterer::new().with_max_leaf_size(100);
         let options = VectorOptions::new(dim, Metric::L2);
 
         let IvfCentroids::F32(centroids) = clusterer.train(&options, &mut source).unwrap();
@@ -284,7 +311,7 @@ mod tests {
             scans: 0,
         };
         let options = VectorOptions::new(4, Metric::L2);
-        assert!(SuperKMeansClusterer::default()
+        assert!(SuperKMeansClusterer::new()
             .train(&options, &mut source)
             .is_err());
         assert_eq!(source.scans, 0);
@@ -293,11 +320,11 @@ mod tests {
     /// The defaults are the documented constants, and the two setters are independent.
     #[test]
     fn settings_default_and_set_independently() {
-        let clusterer = SuperKMeansClusterer::default();
+        let clusterer = SuperKMeansClusterer::new();
         assert_eq!(clusterer.training_sample_ratio(), 0.32);
         assert_eq!(clusterer.config.max_leaf_size, DEFAULT_MAX_LEAF_SIZE);
 
-        let clusterer = clusterer
+        let clusterer = SuperKMeansClusterer::new()
             .with_max_leaf_size(20)
             .with_training_sample_ratio(0.25);
         assert_eq!(clusterer.training_sample_ratio(), 0.25);
