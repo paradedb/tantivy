@@ -23,7 +23,10 @@ mod tests {
         RequiredOptionalScorer, Scorer, SumCombiner, TermQuery,
     };
     use crate::schema::*;
-    use crate::{assert_nearly_equals, DocAddress, DocId, Index, IndexWriter, Score, TERMINATED};
+    use crate::{
+        assert_nearly_equals, DocAddress, DocId, Index, IndexWriter, Score, Searcher,
+        SegmentReader, TERMINATED,
+    };
 
     fn aux_test_helper() -> crate::Result<(Index, Field)> {
         let mut schema_builder = Schema::builder();
@@ -726,6 +729,225 @@ mod tests {
         let doc_ids: Vec<DocId> = top_docs.iter().map(|(_, addr)| addr.doc_id).collect();
         assert!(doc_ids.contains(&150));
         assert!(doc_ids.contains(&260));
+
+        Ok(())
+    }
+
+    /// Two segments with disjoint `num` values, 0..300 and 300..600, so that `num >= 200` cuts
+    /// through the first and covers all of the second.
+    fn two_segment_index(
+        text_for: impl Fn(usize) -> &'static str,
+    ) -> crate::Result<(Index, Field, Field)> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let num_field =
+            schema_builder.add_i64_field("num", NumericOptions::default().set_fast().set_indexed());
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        index_writer.set_merge_policy(Box::new(crate::indexer::NoMergePolicy));
+        for segment in 0..2 {
+            for i in segment * 300..(segment + 1) * 300 {
+                index_writer
+                    .add_document(doc!(text_field => text_for(i), num_field => i as i64))?;
+            }
+            index_writer.commit()?;
+        }
+        Ok((index, text_field, num_field))
+    }
+
+    /// Returns the segment `num >= 200` partly covers, then the one it fully covers.
+    fn partly_and_fully_covered(searcher: &Searcher) -> (&SegmentReader, &SegmentReader) {
+        let readers = searcher.segment_readers();
+        assert_eq!(readers.len(), 2);
+        let holds_zero = |reader: &SegmentReader| {
+            reader
+                .fast_fields()
+                .i64("num")
+                .expect("num is a fast field")
+                .min_value()
+                == 0
+        };
+        if holds_zero(&readers[0]) {
+            (&readers[0], &readers[1])
+        } else {
+            (&readers[1], &readers[0])
+        }
+    }
+
+    fn num_from_200(num_field: Field) -> RangeQuery {
+        RangeQuery::new(
+            Bound::Included(Term::from_field_i64(num_field, 200)),
+            Bound::Unbounded,
+        )
+    }
+
+    fn text_term(text_field: Field, text: &str) -> TermQuery {
+        TermQuery::new(
+            Term::from_field_text(text_field, text),
+            IndexRecordOption::WithFreqs,
+        )
+    }
+
+    /// A MUST range returns an `AllScorer` on a segment it fully covers. With scoring enabled it
+    /// must still add its score and keep Block-WAND, so equal matches score the same on fully and
+    /// partly covered segments.
+    #[test]
+    pub fn test_must_all_scorer_kept_when_scoring() -> crate::Result<()> {
+        let (index, text_field, num_field) =
+            two_segment_index(|i| if i % 3 == 0 { "target" } else { "other" })?;
+        let searcher = index.reader()?.searcher();
+        let (partly_covered, fully_covered) = partly_and_fully_covered(&searcher);
+
+        let range_query = num_from_200(num_field);
+        let range_weight = range_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        assert!(range_weight.scorer(fully_covered, 1.0)?.is::<AllScorer>());
+        assert!(!range_weight.scorer(partly_covered, 1.0)?.is::<AllScorer>());
+
+        let query = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(text_term(text_field, "target"))),
+            (Occur::Must, Box::new(range_query)),
+        ]);
+        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+
+        for reader in [partly_covered, fully_covered] {
+            let pruning_scorer = weight.pruning_scorer(reader, 1.0, 0.0)?;
+            assert!(pruning_scorer.is::<BlockWandSingleScorer>());
+        }
+
+        // Every match has the same text, so all scores must be equal.
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(1_000).order_by_score())?;
+        let all_docs = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE)?;
+        assert_eq!(top_docs.len(), all_docs.scores().len());
+        let expected = top_docs[0].0;
+        for (score, _) in &top_docs {
+            assert_nearly_equals!(*score, expected);
+        }
+        for score in all_docs.scores() {
+            assert_nearly_equals!(*score, expected);
+        }
+        let segments_hit: std::collections::HashSet<u32> =
+            top_docs.iter().map(|(_, addr)| addr.segment_ord).collect();
+        assert_eq!(segments_hit.len(), 2);
+
+        // Scoring disabled: the match count is unchanged.
+        assert_eq!(searcher.search(&query, &Count)?, top_docs.len());
+
+        Ok(())
+    }
+
+    /// `target AND (extra OR num >= 200)` is flattened to MUST `target` with SHOULD `extra` and
+    /// SHOULD range. On the segment the range fully covers, its `AllScorer` sits in the SHOULD
+    /// list and must keep adding its score there too.
+    #[test]
+    pub fn test_should_all_scorer_kept_when_scoring() -> crate::Result<()> {
+        use std::collections::{HashMap, HashSet};
+
+        let (index, text_field, num_field) =
+            two_segment_index(|i| match (i % 3 == 0, i % 7 == 0) {
+                (true, true) => "target extra",
+                (true, false) => "target",
+                (false, true) => "other extra",
+                (false, false) => "other",
+            })?;
+        let searcher = index.reader()?.searcher();
+
+        let query = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(text_term(text_field, "target"))),
+            (
+                Occur::Must,
+                Box::new(BooleanQuery::new(vec![
+                    (Occur::Should, Box::new(text_term(text_field, "extra"))),
+                    (Occur::Should, Box::new(num_from_200(num_field))),
+                ])),
+            ),
+        ]);
+        let (clauses, minimum_number_should_match) = query.flattened_clauses();
+        assert_eq!(minimum_number_should_match, 1);
+        let should_count = clauses
+            .iter()
+            .filter(|(occur, _)| *occur == Occur::Should)
+            .count();
+        assert_eq!(should_count, 2);
+
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(1_000).order_by_score())?;
+        let all_docs = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE)?;
+        let mut top_scores: Vec<Score> = top_docs.iter().map(|(score, _)| *score).collect();
+        let mut all_scores: Vec<Score> = all_docs.scores().to_vec();
+        top_scores.sort_by(|a, b| a.total_cmp(b));
+        all_scores.sort_by(|a, b| a.total_cmp(b));
+        assert_eq!(top_scores.len(), all_scores.len());
+        for (top, all) in top_scores.iter().zip(&all_scores) {
+            assert_nearly_equals!(*top, *all);
+        }
+
+        // Same text and same matching clauses must score the same on either segment.
+        let mut score_by_group: HashMap<(bool, bool), Score> = HashMap::new();
+        let mut segments_by_group: HashMap<(bool, bool), HashSet<u32>> = HashMap::new();
+        for (score, addr) in &top_docs {
+            let num = searcher
+                .segment_reader(addr.segment_ord)
+                .fast_fields()
+                .i64("num")?
+                .first(addr.doc_id)
+                .unwrap();
+            let group = (num >= 200, num % 7 == 0);
+            let expected = *score_by_group.entry(group).or_insert(*score);
+            assert_nearly_equals!(*score, expected);
+            segments_by_group
+                .entry(group)
+                .or_default()
+                .insert(addr.segment_ord);
+        }
+        // Docs in range appear on both segments. Docs below 200 only match through `extra`.
+        assert_eq!(segments_by_group[&(true, false)].len(), 2);
+        assert_eq!(segments_by_group[&(true, true)].len(), 2);
+        assert_eq!(segments_by_group[&(false, true)].len(), 1);
+        assert!(!segments_by_group.contains_key(&(false, false)));
+
+        // Scoring disabled: the match count is unchanged.
+        assert_eq!(searcher.search(&query, &Count)?, top_docs.len());
+
+        Ok(())
+    }
+
+    /// A MUST_NOT range that fully covers a segment excludes every document on it, with or
+    /// without scoring. On the other segment it only filters, and contributes nothing to the score.
+    #[test]
+    pub fn test_must_not_all_scorer_excludes_segment_when_scoring() -> crate::Result<()> {
+        let (index, text_field, num_field) =
+            two_segment_index(|i| if i % 3 == 0 { "target" } else { "other" })?;
+        let searcher = index.reader()?.searcher();
+        let (partly_covered, fully_covered) = partly_and_fully_covered(&searcher);
+
+        let query = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(text_term(text_field, "target"))),
+            (Occur::MustNot, Box::new(num_from_200(num_field))),
+        ]);
+        for enable_scoring in [
+            EnableScoring::enabled_from_searcher(&searcher),
+            EnableScoring::disabled_from_searcher(&searcher),
+        ] {
+            let weight = query.weight(enable_scoring)?;
+            assert!(weight.scorer(fully_covered, 1.0)?.is::<EmptyScorer>());
+            assert!(!weight.scorer(partly_covered, 1.0)?.is::<EmptyScorer>());
+        }
+
+        // `target` docs with num < 200.
+        let expected_count = (0..200).filter(|i| i % 3 == 0).count();
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(1_000).order_by_score())?;
+        assert_eq!(top_docs.len(), expected_count);
+        assert_eq!(searcher.search(&query, &Count)?, expected_count);
+
+        // The excluded clause adds nothing: scores equal the term query's own.
+        let term_weight = text_term(text_field, "target")
+            .weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        for (score, addr) in &top_docs {
+            let reader = searcher.segment_reader(addr.segment_ord);
+            let mut term_scorer = term_weight.scorer(reader, 1.0)?;
+            assert_eq!(term_scorer.seek(addr.doc_id), addr.doc_id);
+            assert_nearly_equals!(*score, term_scorer.score());
+        }
 
         Ok(())
     }
