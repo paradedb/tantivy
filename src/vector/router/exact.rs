@@ -1,11 +1,15 @@
+//! The exact router: scores every centroid against the query and ranks them all.
+
 use std::io::{self, Write};
 
 use common::HasLen;
 
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
-use crate::vector::ivf::{Candidate, InMemoryStore, LazyStore};
-use crate::vector::{IvfCentroids, VectorArena};
+use crate::vector::clustering::IvfCentroids;
+use crate::vector::router::arena::VectorArena;
+use crate::vector::router::candidate::Candidate;
+use crate::vector::router::stacked::levels::{InMemoryStore, LazyStore};
 
 pub(crate) struct ExactRouter<S> {
     centroids: S,

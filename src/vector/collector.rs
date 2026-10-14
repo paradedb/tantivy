@@ -1,23 +1,14 @@
 //! Top-N vector-similarity collection.
 //!
 //! IVF drives its own cluster iteration, so [`Collector::collect_segment`] hands the filter
-//! `Weight` to the segment's [`VectorBackend`](super::backend::VectorBackend) instead of pulling
-//! docs. A secondary key is an ordinary `SortKeyComputer` composed into the heap's
+//! `Weight` to the segment's [`SegmentSearcher`](crate::vector::search::SegmentSearcher) instead of
+//! pulling docs. A secondary key is an ordinary `SortKeyComputer` composed into the heap's
 //! `(similarity, tie_break)` order, the same rule as the pull-model path.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::backend::VectorBackend;
-use super::index_reader::QuantizedFieldReader;
-use super::ivf::AdaptiveProbeParams;
-use super::metadata::VectorColMetadata;
-use super::prepared::{QuantizedQueryCtx, VectorQuery};
-use super::stats::ProbeStats;
-use super::telemetry::take_stage_totals;
-use super::tie_break::NoTieBreak;
-use super::{enter_vector_stage, Stage, VectorElement};
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{
     compare_for_top_k, Collector, ComparableDoc, SegmentCollector, SegmentSortKeyComputer,
@@ -26,6 +17,15 @@ use crate::collector::{
 use crate::index::SegmentReader;
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Metric, Schema};
+use crate::vector::params::ProbeParams;
+use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
+use crate::vector::search::SegmentSearcher;
+use crate::vector::stats::ProbeStats;
+use crate::vector::storage::metadata::VectorColMetadata;
+use crate::vector::storage::quantized::QuantizedFieldReader;
+use crate::vector::telemetry::{enter_vector_stage, take_stage_totals};
+use crate::vector::tie_break::NoTieBreak;
+use crate::vector::{VectorElement, VectorStage};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal, TantivyError};
 
 // --- Query preparation ---
@@ -34,7 +34,7 @@ use crate::{DocAddress, DocId, Score, SegmentOrdinal, TantivyError};
 #[derive(Clone, Debug)]
 struct PreparedKey(Arc<VectorColMetadata>);
 impl PreparedKey {
-    fn query_fields(&self) -> Option<(u32, u8, &[super::metadata::Quantizer])> {
+    fn query_fields(&self) -> Option<(u32, u8, &[crate::vector::storage::metadata::Quantizer])> {
         match self.0.as_ref() {
             VectorColMetadata::Plain(_) => None,
             VectorColMetadata::Quantized { field, layers } => {
@@ -74,7 +74,7 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     query: Arc<Vec<T>>,
     limit: usize,
     offset: usize,
-    adaptive: AdaptiveProbeParams,
+    probe_params: ProbeParams,
     max_scan_levels: usize,
     /// Exactly one prepared query for each distinct segment encoding.
     quantized_queries: Mutex<HashMap<PreparedKey, PreparedCell>>,
@@ -91,7 +91,7 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
             query: Arc::new(query),
             limit,
             offset: 0,
-            adaptive: AdaptiveProbeParams::default(),
+            probe_params: ProbeParams::default(),
             max_scan_levels: usize::MAX,
             quantized_queries: Mutex::new(HashMap::new()),
             prepared: Mutex::new(None),
@@ -108,9 +108,9 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
         self
     }
 
-    /// Sets the adaptive probing parameters; flat segments ignore them.
-    pub fn with_adaptive_params(mut self, params: AdaptiveProbeParams) -> Self {
-        self.adaptive = params;
+    /// Sets the probe parameters; flat segments ignore them.
+    pub fn with_probe_params(mut self, params: ProbeParams) -> Self {
+        self.probe_params = params;
         self
     }
 
@@ -133,7 +133,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
             query: self.query,
             limit: self.limit,
             offset: self.offset,
-            adaptive: self.adaptive,
+            probe_params: self.probe_params,
             max_scan_levels: self.max_scan_levels,
             quantized_queries: self.quantized_queries,
             prepared: self.prepared,
@@ -277,9 +277,9 @@ where
     ) -> crate::Result<SegmentVectorFruit<S::SortKey>> {
         // Time before this segment belongs to no stage of it.
         take_stage_totals();
-        let init = enter_vector_stage(Stage::ScanInit);
+        let init = enter_vector_stage(VectorStage::ScanInit);
         let (query, quantized) = {
-            let _prep = enter_vector_stage(Stage::QueryPrep);
+            let _prep = enter_vector_stage(VectorStage::QueryPrep);
             let vectors = reader.vector_index(self.field)?;
             let query = self.vector_query(vectors.options().metric());
             let quantized = match vectors.quantization() {
@@ -290,13 +290,13 @@ where
             };
             (query, quantized)
         };
-        let backend = VectorBackend::for_segment(
+        let backend = SegmentSearcher::for_segment(
             reader,
             segment_ord,
             self.field,
             query,
             quantized,
-            self.adaptive.clone(),
+            self.probe_params.clone(),
         )?;
         let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
         drop(init);
@@ -326,7 +326,7 @@ where
         segment_fruits: Vec<SegmentVectorFruit<S::SortKey>>,
     ) -> crate::Result<Self::Fruit> {
         take_stage_totals();
-        let _assembly = enter_vector_stage(Stage::ResultAssembly);
+        let _assembly = enter_vector_stage(VectorStage::ResultAssembly);
         // Each fruit is already its segment's top `limit + offset` under this order, so the
         // global window is a sort of their union. Stats keep one entry per segment.
         let comparator = (NaturalComparator, self.tie_break.comparator());
@@ -394,9 +394,10 @@ mod ivf_e2e_tests {
     use crate::index::IndexSettings;
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
-    use crate::schema::{Field, Schema, FAST, STORED, STRING};
+    use crate::schema::{Field, Metric, Schema, VectorDType, VectorOptions, FAST, STORED, STRING};
+    use crate::vector::diagnostics::VectorStorageFormat;
     use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
-    use crate::vector::{Metric, RouterKind, VectorDType, VectorOptions, VectorStorageFormat};
+    use crate::vector::RouterKind;
     use crate::{DocAddress, Index, Order, Score, TantivyDocument, TantivyError};
 
     /// IVF + exhaustive probing matches the global oracle. The shared
@@ -416,7 +417,7 @@ mod ivf_e2e_tests {
                 let expected = index.ground_truth(query, k)?;
                 let collector = TopDocs::with_limit(k)
                     .order_by_similarity(index.embedding_field(), query.to_vec())
-                    .with_adaptive_params(params.clone());
+                    .with_probe_params(params.clone());
                 let actual = searcher.search(&AllQuery, &collector)?;
                 assert_eq!(actual.results, expected, "IVF query={query:?} k={k}");
             }
@@ -439,7 +440,7 @@ mod ivf_e2e_tests {
 
         let collector = TopDocs::with_limit(4)
             .order_by_similarity(index.embedding_field(), vec![0.5_f32, 0.5])
-            .with_adaptive_params(exhaustive_params(9));
+            .with_probe_params(exhaustive_params(9));
         let fruit = searcher.search(&AllQuery, &collector)?;
 
         // One ProbeStats per searched segment.
@@ -473,7 +474,7 @@ mod ivf_e2e_tests {
         let collector = TopDocs::with_limit(k)
             .and_offset(offset)
             .order_by_similarity(index.embedding_field(), query.to_vec())
-            .with_adaptive_params(exhaustive_params(9));
+            .with_probe_params(exhaustive_params(9));
         let actual = searcher.search(&AllQuery, &collector)?;
         assert_eq!(actual.results, expected);
         Ok(())
@@ -584,7 +585,7 @@ mod ivf_e2e_tests {
                     let row = vector_reader.row_id(doc_id)?.unwrap();
                     let bytes = vector_reader.vector_bytes_for_row(row)?;
                     expected.push((
-                        -crate::vector::l2_squared_bytes(&query, &bytes),
+                        -crate::vector::distance::l2_squared_bytes(&query, &bytes),
                         id_column.first(doc_id).unwrap(),
                         DocAddress::new(segment_ord as u32, doc_id),
                     ));
@@ -615,7 +616,7 @@ mod ivf_e2e_tests {
                     &AllQuery,
                     &TopDocs::with_limit(k)
                         .order_by_similarity(embedding_field, query.to_vec())
-                        .with_adaptive_params(exhaustive_params(9))
+                        .with_probe_params(exhaustive_params(9))
                         .with_tie_break(tie_break()),
                 )?;
                 let actual: Vec<DocAddress> =
@@ -623,7 +624,7 @@ mod ivf_e2e_tests {
                 let want: Vec<DocAddress> = expected.iter().take(k).map(|entry| entry.2).collect();
                 assert_eq!(actual, want, "query={query:?} k={k}");
 
-                // Probe invariance, under the default adaptive params so the
+                // Probe invariance, under the default probe params so the
                 // gate/ceiling logic actually runs.
                 let collector =
                     || TopDocs::with_limit(k).order_by_similarity(embedding_field, query.to_vec());
@@ -715,7 +716,7 @@ mod ivf_e2e_tests {
             &AllQuery,
             &TopDocs::with_limit(1)
                 .order_by_similarity(embedding_field, query.to_vec())
-                .with_adaptive_params(exhaustive_params(2)),
+                .with_probe_params(exhaustive_params(2)),
         )?;
         // All four docs tie at distance 1, so the lowest DocAddress wins.
         let scores: Vec<Score> = fruit.results.iter().map(|(score, _)| *score).collect();
@@ -923,7 +924,7 @@ mod ivf_e2e_tests {
                 let expected = ground_truth::top_k(&index, embedding_field, metric, &query, k)?;
                 let collector = TopDocs::with_limit(k)
                     .order_by_similarity(embedding_field, query.to_vec())
-                    .with_adaptive_params(params.clone());
+                    .with_probe_params(params.clone());
                 let actual = searcher.search(&AllQuery, &collector)?;
                 assert_eq!(actual.results, expected, "mixed query={query:?} k={k}");
             }
@@ -936,10 +937,10 @@ mod ivf_e2e_tests {
 mod prepared_key_tests {
     use super::*;
     use crate::schema::{Metric, VectorOptions};
-    use crate::vector::metadata::{Grid, Partition, Quantizer, Rotation};
     use crate::vector::quantization::{
         VectorNormPolicy, VectorQuantizationConfig, VectorQuantizationLayer,
     };
+    use crate::vector::storage::metadata::{Grid, Partition, Quantizer, Rotation};
     fn metadata(metric: Metric, schedule: &[u8]) -> VectorColMetadata {
         let opts = VectorOptions::new(100, metric);
         let config = VectorQuantizationConfig::materialize(
@@ -1019,7 +1020,7 @@ mod prepared_key_tests {
         };
         let mut other = g.clone();
         other.points[0] = -0.0;
-        let quant = |grid| super::super::metadata::Quantizer::GridPlane {
+        let quant = |grid| crate::vector::storage::metadata::Quantizer::GridPlane {
             bits: 2,
             rotation: Rotation::None,
             grid,

@@ -6,12 +6,15 @@ use crate::collector::{Count, TopDocs};
 use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
 use crate::query::{AllQuery, TermQuery};
-use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, STRING};
-use crate::vector::ivf::{AdaptiveProbeParams, LocatedPath};
-use crate::vector::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
-    Metric, RouterKind, VectorDType, VectorOptions,
+use crate::schema::{
+    Field, FieldType, IndexRecordOption, Metric, Schema, Term, VectorDType, VectorOptions, STORED,
+    STRING,
 };
+use crate::vector::clustering::{
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
+};
+use crate::vector::params::{LocatedPath, ProbeParams};
+use crate::vector::RouterKind;
 use crate::{DocAddress, Index, Score, TantivyDocument};
 
 const EMBEDDING_FIELD_NAME: &str = "embedding";
@@ -23,7 +26,7 @@ const DOCS_PER_SEGMENT: usize = 10;
 // descriptor enum. Selected via the index settings (clustering threshold +
 // clusterer); the resulting segment is self-describing through its `.vec`
 // `IdMap`, so this is purely a build knob here.
-pub(crate) use crate::vector::VectorStorageFormat;
+pub(crate) use crate::vector::diagnostics::VectorStorageFormat;
 
 pub(crate) struct TestVectorIndex {
     pub(crate) index: Index,
@@ -290,9 +293,9 @@ fn fixture_uses_selected_storage_format() -> crate::Result<()> {
 fn vector_files_stamp_format_version_header() -> crate::Result<()> {
     use crate::directory::CompositeFile;
     use crate::index::SegmentComponent;
-    use crate::vector::header::{read_centroid_header, read_vector_header, VectorFileVersion};
-    use crate::vector::ivf::CENTROIDS_EXT;
-    use crate::vector::VEC_EXT;
+    use crate::vector::storage::header::{
+        read_centroid_header, read_vector_header, VectorFileVersion, CENTROIDS_EXT, VEC_EXT,
+    };
 
     for format in [VectorStorageFormat::Flat, VectorStorageFormat::Ivf] {
         let index = TestVectorIndex::builder(VectorDType::F32)
@@ -468,7 +471,7 @@ fn flat_top_n_returns_nearest_when_more_than_k_docs_per_segment() -> crate::Resu
 fn ivf_merge_writes_the_selected_stacked_router() -> crate::Result<()> {
     use crate::directory::CompositeFile;
     use crate::index::SegmentComponent;
-    use crate::vector::ivf::CENTROIDS_EXT;
+    use crate::vector::storage::header::CENTROIDS_EXT;
 
     let centroids = vec![[0.0, 0.0], [6.0, 6.0]];
     let index = TestVectorIndex::builder(VectorDType::F32)
@@ -481,7 +484,8 @@ fn ivf_merge_writes_the_selected_stacked_router() -> crate::Result<()> {
     for segment_reader in searcher.segment_readers() {
         let centroids_file =
             segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
-        let (_version, body) = super::header::read_centroid_header(&centroids_file)?;
+        let (_version, body) =
+            crate::vector::storage::header::read_centroid_header(&centroids_file)?;
         let composite = CompositeFile::open(&body)?;
         let router_bytes = composite
             .open_read_with_idx(index.embedding_field(), 2)
@@ -537,7 +541,7 @@ fn default_setup_clusters_past_the_threshold() -> crate::Result<()> {
             &AllQuery,
             &TopDocs::with_limit(10)
                 .order_by_similarity(field, query.to_vec())
-                .with_adaptive_params(exhaustive_params(0)),
+                .with_probe_params(exhaustive_params(0)),
         )?;
         assert_eq!(actual.results, expected);
         Ok(())
@@ -716,8 +720,8 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
 /// oracle-equality tests, where every cluster the bounds gate cannot
 /// PROVE useless must be probed - provable skips never change the
 /// top-K, so oracle equality still holds under them.
-pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
-    AdaptiveProbeParams {
+pub(crate) fn exhaustive_params(_num_centroids: usize) -> ProbeParams {
+    ProbeParams {
         max_probe_fraction: 1.0,
         min_probe_clusters: 1,
         ..Default::default()
@@ -725,8 +729,8 @@ pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
 }
 
 /// [`exhaustive_params`] on the routed path, with no cluster scored exactly before the exact phase.
-pub(crate) fn routed_exhaustive_params(num_centroids: usize) -> AdaptiveProbeParams {
-    AdaptiveProbeParams {
+pub(crate) fn routed_exhaustive_params(num_centroids: usize) -> ProbeParams {
+    ProbeParams {
         exact_plan: false,
         located: LocatedPath::Off,
         ..exhaustive_params(num_centroids)
@@ -737,9 +741,8 @@ pub(crate) mod ground_truth {
     use std::cmp::Ordering;
     use std::sync::Arc;
 
-    use crate::schema::Field;
-    use crate::vector::prepared::VectorQuery;
-    use crate::vector::Metric;
+    use crate::schema::{Field, Metric};
+    use crate::vector::search::prepared::VectorQuery;
     use crate::{DocAddress, Index, Score};
 
     pub(crate) fn top_k(
@@ -974,13 +977,17 @@ mod bounds_storage_tests {
     use crate::index::{IndexSettings, SegmentComponent};
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
-    use crate::schema::{Schema, STORED, STRING};
-    use crate::vector::ivf::{IvfIndex, CENTROIDS_EXT};
-    use crate::vector::{
-        residual_norm, BoundKind, InMemoryStackedIvf, IvfCentroids, IvfClusterer, IvfConfig,
-        IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors, Metric, RouterKind,
-        RoutingParams, VectorDType, VectorOptions, VectorStorageFormat,
+    use crate::schema::{Metric, Schema, VectorDType, VectorOptions, STORED, STRING};
+    use crate::vector::clustering::{
+        IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
     };
+    use crate::vector::diagnostics::VectorStorageFormat;
+    use crate::vector::router::stacked::levels::{InMemoryStore, StackedIvf, StackedIvfConfig};
+    use crate::vector::router::RoutingParams;
+    use crate::vector::storage::bounds::{residual_norm, BoundKind};
+    use crate::vector::storage::centroids::ClusterIndex;
+    use crate::vector::storage::header::CENTROIDS_EXT;
+    use crate::vector::RouterKind;
     use crate::{Index, IndexWriter, TantivyDocument};
 
     /// Recompute one segment's expected fold from its stored artifacts:
@@ -988,7 +995,7 @@ mod bounds_storage_tests {
     /// the stored centroid.
     fn fresh_fold(
         vec_reader: &crate::vector::VectorIndexReader,
-        ivf: &IvfIndex,
+        ivf: &ClusterIndex,
         dim: usize,
         metric: Metric,
     ) -> crate::Result<Vec<f32>> {
@@ -1391,7 +1398,7 @@ mod bounds_storage_tests {
     /// staying exact.
     #[test]
     fn ivf_merge_writes_stacked_slot_at_v3() -> crate::Result<()> {
-        use crate::vector::header::{read_centroid_header, VectorFileVersion};
+        use crate::vector::storage::header::{read_centroid_header, VectorFileVersion};
 
         // 8 fixed centroids on a line; two tight docs per centroid split
         // across two commits.
@@ -1435,11 +1442,11 @@ mod bounds_storage_tests {
             .collect();
         assert_eq!(stacked_bytes[0], RouterKind::Stacked as u8);
         let payload_offset = 1;
-        let stacked = InMemoryStackedIvf::deserialize_owned(
+        let stacked = StackedIvf::<InMemoryStore>::deserialize_owned(
             &stacked_bytes[payload_offset..],
             stored_rows.clone(),
             2,
-            IvfConfig::default(),
+            StackedIvfConfig::default(),
         )
         .expect("slot [2] must parse as a stacked router");
         assert_eq!(stacked.vectors.len(), centroids.len());
@@ -1510,7 +1517,7 @@ mod bounds_storage_tests {
 // Both flat write paths preserve rows across the stored uniform-group boundary.
 #[test]
 fn flat_uniform_boundary_survives_merge_and_sparse_presence() -> crate::Result<()> {
-    let r = super::metadata::FLAT_ROWS_PER_BLOCK as usize;
+    let r = crate::vector::storage::metadata::FLAT_ROWS_PER_BLOCK as usize;
     let mut schema = Schema::builder();
     let dense = schema.add_vector_field("dense", VectorOptions::new(1, Metric::L2));
     let sparse = schema.add_vector_field("sparse", VectorOptions::new(1, Metric::L2));
@@ -1590,7 +1597,9 @@ fn unsupported_vector_versions_remain_typed_on_open_and_merge() -> crate::Result
             writer.commit()?;
         }
         let segment = index.searchable_segments()?.remove(0);
-        let path = segment.relative_path(SegmentComponent::Custom(super::VEC_EXT.into()));
+        let path = segment.relative_path(SegmentComponent::Custom(
+            crate::vector::storage::header::VEC_EXT.into(),
+        ));
         let mut bytes = directory.atomic_read(&path)?;
         bytes[..4].copy_from_slice(&version.to_le_bytes());
         directory.atomic_write(&path, &bytes)?;
@@ -1642,21 +1651,24 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
     writer.add_document(doc)?;
     writer.commit()?;
     let segment = index.searchable_segments()?.remove(0);
-    let vec_path = segment.relative_path(SegmentComponent::Custom(super::VEC_EXT.into()));
+    let vec_path = segment.relative_path(SegmentComponent::Custom(
+        crate::vector::storage::header::VEC_EXT.into(),
+    ));
     let mut bytes = directory.atomic_read(&vec_path)?;
     let mut centroids = 2u32.to_le_bytes().to_vec();
     let mut composite = CompositeWrite::wrap(&mut centroids);
     for slot in [
-        super::header::CentroidSlot::Centroids,
-        super::header::CentroidSlot::Offsets,
+        crate::vector::storage::header::CentroidSlot::Centroids,
+        crate::vector::storage::header::CentroidSlot::Offsets,
     ] {
         composite
             .for_field_with_idx(field, slot.index())
             .write_all(&[0; 8])?;
     }
     composite.close()?;
-    let mut centroid_file =
-        segment.open_write(SegmentComponent::Custom(super::ivf::CENTROIDS_EXT.into()))?;
+    let mut centroid_file = segment.open_write(SegmentComponent::Custom(
+        crate::vector::storage::header::CENTROIDS_EXT.into(),
+    ))?;
     centroid_file.write_all(&centroids)?;
     centroid_file.terminate()?;
     for version in [2u32, 3, 4] {
@@ -1721,11 +1733,15 @@ fn graph_router_segments_fail_format_validation() -> crate::Result<()> {
     let mut centroids = 3u32.to_le_bytes().to_vec();
     let mut composite = CompositeWrite::wrap(&mut centroids);
     composite
-        .for_field_with_idx(field, super::header::CentroidSlot::Router.index())
+        .for_field_with_idx(
+            field,
+            crate::vector::storage::header::CentroidSlot::Router.index(),
+        )
         .write_all(&[0, 1, 2])?;
     composite.close()?;
-    let mut file =
-        segment.open_write(SegmentComponent::Custom(super::ivf::CENTROIDS_EXT.into()))?;
+    let mut file = segment.open_write(SegmentComponent::Custom(
+        crate::vector::storage::header::CENTROIDS_EXT.into(),
+    ))?;
     file.write_all(&centroids)?;
     file.terminate()?;
 

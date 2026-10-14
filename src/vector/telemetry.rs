@@ -5,12 +5,12 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::time::Instant;
 
-use super::quantization::MAX_QUANTIZATION_LAYERS;
-use super::storage_io::VectorIoStats;
+use crate::vector::quantization::MAX_QUANTIZATION_LAYERS;
+use crate::vector::storage::io::VectorIoStats;
 
 /// Logical stage of a vector search.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Stage {
+pub enum VectorStage {
     /// Unclassified work.
     #[default]
     Other,
@@ -40,7 +40,7 @@ pub enum Stage {
     ResultAssembly,
 }
 
-impl Stage {
+impl VectorStage {
     /// Returns the flat telemetry field prefix for this stage.
     pub fn name(self) -> Option<Cow<'static, str>> {
         match self {
@@ -68,7 +68,7 @@ const STAGE_SLOTS: usize = FIXED_SLOTS + 2 * MAX_QUANTIZATION_LAYERS;
 const FALLBACK_LAYERS: usize = 3;
 
 /// Accounting slot of `stage`; layers past the schedule limit fold into `Other`.
-fn slot(stage: Stage) -> usize {
+fn slot(stage: VectorStage) -> usize {
     let layer = |base: usize, layer: u8| {
         let layer = usize::from(layer);
         if layer < MAX_QUANTIZATION_LAYERS {
@@ -78,19 +78,19 @@ fn slot(stage: Stage) -> usize {
         }
     };
     match stage {
-        Stage::Other => 0,
-        Stage::ScanInit => 1,
-        Stage::NonVectorSearch => 2,
-        Stage::QueryPrep => 3,
-        Stage::Routing => 4,
-        Stage::ExactScan => 5,
-        Stage::ExactFetch => 6,
-        Stage::ExactScore => 7,
-        Stage::ResultAssembly => 8,
-        Stage::Locate => 9,
-        Stage::Centroid => 10,
-        Stage::LayerScan(l) => layer(FIXED_SLOTS, l),
-        Stage::Boundary(l) => layer(FIXED_SLOTS + MAX_QUANTIZATION_LAYERS, l),
+        VectorStage::Other => 0,
+        VectorStage::ScanInit => 1,
+        VectorStage::NonVectorSearch => 2,
+        VectorStage::QueryPrep => 3,
+        VectorStage::Routing => 4,
+        VectorStage::ExactScan => 5,
+        VectorStage::ExactFetch => 6,
+        VectorStage::ExactScore => 7,
+        VectorStage::ResultAssembly => 8,
+        VectorStage::Locate => 9,
+        VectorStage::Centroid => 10,
+        VectorStage::LayerScan(l) => layer(FIXED_SLOTS, l),
+        VectorStage::Boundary(l) => layer(FIXED_SLOTS + MAX_QUANTIZATION_LAYERS, l),
     }
 }
 
@@ -104,12 +104,12 @@ pub(crate) struct StageTotals {
 
 impl StageTotals {
     /// Nanoseconds spent in `stage` with no inner stage running.
-    pub(crate) fn time_ns(&self, stage: Stage) -> u64 {
+    pub(crate) fn time_ns(&self, stage: VectorStage) -> u64 {
         self.time_ns[slot(stage)]
     }
 
     /// Reads charged while `stage` was running.
-    pub(crate) fn io(&self, stage: Stage) -> VectorIoStats {
+    pub(crate) fn io(&self, stage: VectorStage) -> VectorIoStats {
         self.io[slot(stage)]
     }
 
@@ -122,7 +122,7 @@ impl StageTotals {
 // --- Clock ---
 
 thread_local! {
-    static CURRENT: Cell<Stage> = const { Cell::new(Stage::Other) };
+    static CURRENT: Cell<VectorStage> = const { Cell::new(VectorStage::Other) };
     static CLOCK: RefCell<Clock> = RefCell::new(Clock::new());
 }
 
@@ -142,7 +142,7 @@ impl Clock {
     }
 
     /// Charges the time since the last transition to `running`.
-    fn charge_time(&mut self, running: Stage) {
+    fn charge_time(&mut self, running: VectorStage) {
         let now = Instant::now();
         self.totals.time_ns[slot(running)] += now.duration_since(self.since).as_nanos() as u64;
         self.since = now;
@@ -150,22 +150,22 @@ impl Clock {
 }
 
 /// Moves the clock to `next` and returns the stage that was running.
-fn switch(next: Stage) -> Stage {
+fn switch(next: VectorStage) -> VectorStage {
     let running = CURRENT.replace(next);
     CLOCK.with_borrow_mut(|clock| clock.charge_time(running));
     running
 }
 
 /// The logical stage responsible for a vector component read on this thread.
-pub fn current_vector_stage() -> Stage {
+pub fn current_vector_stage() -> VectorStage {
     CURRENT.get()
 }
 
 /// Restores the enclosing stage when dropped.
-pub(crate) struct StageGuard(Stage);
+pub(crate) struct StageGuard(VectorStage);
 
 /// Enters `stage` until the guard drops. Time accrues only to the innermost stage.
-pub(crate) fn enter_vector_stage(stage: Stage) -> StageGuard {
+pub(crate) fn enter_vector_stage(stage: VectorStage) -> StageGuard {
     StageGuard(switch(stage))
 }
 
@@ -207,23 +207,35 @@ mod tests {
 
     #[test]
     fn stage_names_are_flat_telemetry_prefixes() {
-        assert_eq!(Stage::Other.name(), None);
-        assert_eq!(Stage::ScanInit.name().as_deref(), Some("scan_init"));
+        assert_eq!(VectorStage::Other.name(), None);
+        assert_eq!(VectorStage::ScanInit.name().as_deref(), Some("scan_init"));
         assert_eq!(
-            Stage::NonVectorSearch.name().as_deref(),
+            VectorStage::NonVectorSearch.name().as_deref(),
             Some("non_vector_search")
         );
-        assert_eq!(Stage::QueryPrep.name().as_deref(), Some("query_prep"));
-        assert_eq!(Stage::Routing.name().as_deref(), Some("routing"));
-        assert_eq!(Stage::LayerScan(2).name().as_deref(), Some("layer2_scan"));
-        assert_eq!(Stage::Boundary(2).name().as_deref(), Some("boundary2"));
-        assert_eq!(Stage::ExactScan.name().as_deref(), Some("exact_scan"));
-        assert_eq!(Stage::ExactFetch.name().as_deref(), Some("exact_fetch"));
-        assert_eq!(Stage::ExactScore.name().as_deref(), Some("exact_score"));
-        assert_eq!(Stage::Locate.name().as_deref(), Some("locate"));
-        assert_eq!(Stage::Centroid.name().as_deref(), Some("centroid"));
+        assert_eq!(VectorStage::QueryPrep.name().as_deref(), Some("query_prep"));
+        assert_eq!(VectorStage::Routing.name().as_deref(), Some("routing"));
         assert_eq!(
-            Stage::ResultAssembly.name().as_deref(),
+            VectorStage::LayerScan(2).name().as_deref(),
+            Some("layer2_scan")
+        );
+        assert_eq!(
+            VectorStage::Boundary(2).name().as_deref(),
+            Some("boundary2")
+        );
+        assert_eq!(VectorStage::ExactScan.name().as_deref(), Some("exact_scan"));
+        assert_eq!(
+            VectorStage::ExactFetch.name().as_deref(),
+            Some("exact_fetch")
+        );
+        assert_eq!(
+            VectorStage::ExactScore.name().as_deref(),
+            Some("exact_score")
+        );
+        assert_eq!(VectorStage::Locate.name().as_deref(), Some("locate"));
+        assert_eq!(VectorStage::Centroid.name().as_deref(), Some("centroid"));
+        assert_eq!(
+            VectorStage::ResultAssembly.name().as_deref(),
             Some("result_assembly")
         );
     }
@@ -233,21 +245,21 @@ mod tests {
     fn clock_charges_the_innermost_stage() {
         take_stage_totals();
         {
-            let _outer = enter_vector_stage(Stage::ScanInit);
+            let _outer = enter_vector_stage(VectorStage::ScanInit);
             charge_read(10, 1);
             {
-                let _inner = enter_vector_stage(Stage::NonVectorSearch);
-                assert_eq!(current_vector_stage(), Stage::NonVectorSearch);
+                let _inner = enter_vector_stage(VectorStage::NonVectorSearch);
+                assert_eq!(current_vector_stage(), VectorStage::NonVectorSearch);
                 charge_read(20, 2);
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
-            assert_eq!(current_vector_stage(), Stage::ScanInit);
+            assert_eq!(current_vector_stage(), VectorStage::ScanInit);
         }
-        assert_eq!(current_vector_stage(), Stage::Other);
+        assert_eq!(current_vector_stage(), VectorStage::Other);
         let totals = take_stage_totals();
-        assert_eq!(totals.io(Stage::ScanInit).bytes_read, 10);
-        assert_eq!(totals.io(Stage::NonVectorSearch).storage_blocks, 2);
-        assert!(totals.time_ns(Stage::NonVectorSearch) >= 2_000_000);
-        assert_eq!(take_stage_totals().io(Stage::ScanInit).reads, 0);
+        assert_eq!(totals.io(VectorStage::ScanInit).bytes_read, 10);
+        assert_eq!(totals.io(VectorStage::NonVectorSearch).storage_blocks, 2);
+        assert!(totals.time_ns(VectorStage::NonVectorSearch) >= 2_000_000);
+        assert_eq!(take_stage_totals().io(VectorStage::ScanInit).reads, 0);
     }
 }

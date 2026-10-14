@@ -14,19 +14,27 @@ use crate::query::{
     AllQuery, BitSetDocSet, ConstScorer, EnableScoring, Explanation, Query, Scorer, TermQuery,
     Weight,
 };
-use crate::schema::{Field, IndexRecordOption, Schema, Term, Value, STORED, STRING};
-use crate::vector::ivf::{AdaptiveProbeParams, Candidate, IvfIndex};
-use crate::vector::prepared::{QuantizedQueryCtx, VectorQuery};
+use crate::schema::{
+    Field, IndexRecordOption, Metric, Schema, Term, Value, VectorDType, VectorOptions, STORED,
+    STRING,
+};
+use crate::vector::clustering::{
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors,
+};
+use crate::vector::params::ProbeParams;
+use crate::vector::router::candidate::Candidate;
 use crate::vector::router::with_test_clusters;
-use crate::vector::scan::plan::PlanOverride;
-use crate::vector::scan::ScanTrace;
-use crate::vector::segment::plan::SegmentPlan;
-use crate::vector::storage_io::test_support::{with_unarmed_log, PagedDirectory};
+use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
+use crate::vector::search::scan::plan::PlanOverride;
+use crate::vector::search::scan::ScanTrace;
+use crate::vector::search::segment::plan::SegmentPlan;
+use crate::vector::search::SegmentSearcher;
+use crate::vector::storage::centroids::ClusterIndex;
+use crate::vector::storage::io::test_support::{with_unarmed_log, PagedDirectory};
 use crate::vector::tests::TestVectorIndex;
 use crate::vector::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors, Metric, ProbeStats,
-    RouterKind, Stage, VectorBackend, VectorDType, VectorOptions, VectorQuantizationConfig,
-    VectorQuantizationLayer, VectorSimilarityFruit,
+    ProbeStats, RouterKind, VectorQuantizationConfig, VectorQuantizationLayer,
+    VectorSimilarityFruit, VectorStage,
 };
 use crate::{DocAddress, DocId, Index, IndexWriter, Score, SegmentReader, TantivyDocument};
 
@@ -35,8 +43,8 @@ use crate::{DocAddress, DocId, Index, IndexWriter, Score, SegmentReader, Tantivy
 /// One segment's searcher and the arguments a search passes it.
 #[derive(Clone, Copy)]
 pub(crate) struct SegmentRun<'a> {
-    pub(crate) searcher: &'a VectorBackend<f32>,
-    pub(crate) index: &'a IvfIndex,
+    pub(crate) searcher: &'a SegmentSearcher<f32>,
+    pub(crate) index: &'a ClusterIndex,
     pub(crate) weight: &'a dyn Weight,
     pub(crate) segment: &'a SegmentReader,
     pub(crate) top_n: usize,
@@ -408,11 +416,11 @@ impl Fixture {
         filter: &dyn Query,
         query: &[f32],
         k: usize,
-        params: AdaptiveProbeParams,
+        params: ProbeParams,
     ) -> crate::Result<VectorSimilarityFruit> {
         let collector = TopDocs::with_limit(k)
             .order_by_similarity(self.field, query.to_vec())
-            .with_adaptive_params(params);
+            .with_probe_params(params);
         self.index.reader()?.searcher().search(filter, &collector)
     }
 
@@ -423,7 +431,7 @@ impl Fixture {
         filter: &dyn Query,
         query: &[f32],
         k: usize,
-        params: AdaptiveProbeParams,
+        params: ProbeParams,
     ) -> crate::Result<VectorSimilarityFruit> {
         let candidates = self.candidates(clusters, query)?;
         with_test_clusters(candidates, || self.search(filter, query, k, params))
@@ -459,11 +467,11 @@ impl Fixture {
         weight: &dyn Weight,
         query: &[f32],
         top_n: usize,
-        params: AdaptiveProbeParams,
+        params: ProbeParams,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = self.index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[segment];
-        let backend = VectorBackend::<f32>::for_segment(
+        let backend = SegmentSearcher::<f32>::for_segment(
             segment_reader,
             segment as u32,
             self.field,
@@ -482,7 +490,7 @@ impl Fixture {
         weight: &dyn Weight,
         query: &[f32],
         top_n: usize,
-        params: AdaptiveProbeParams,
+        params: ProbeParams,
         plan: Option<PlanOverride>,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = self.index.reader()?.searcher();
@@ -499,7 +507,7 @@ impl Fixture {
                     index.specs.len(),
                 ))
             });
-        let mut backend = VectorBackend::<f32>::for_segment(
+        let mut backend = SegmentSearcher::<f32>::for_segment(
             segment_reader,
             segment as u32,
             self.field,
@@ -518,7 +526,7 @@ impl Fixture {
         filter: &dyn Query,
         query: &[f32],
         top_n: usize,
-        params: &AdaptiveProbeParams,
+        params: &ProbeParams,
         run: impl FnOnce(&SegmentRun<'_>) -> crate::Result<R>,
     ) -> crate::Result<R> {
         let searcher = self.index.reader()?.searcher();
@@ -526,7 +534,7 @@ impl Fixture {
         let reader = segment.vector_index(self.field)?;
         let index = reader.index().expect("IVF segment");
         let weight = filter.weight(EnableScoring::disabled_from_searcher(&searcher))?;
-        let backend = VectorBackend::<f32>::for_segment(
+        let backend = SegmentSearcher::<f32>::for_segment(
             segment,
             0,
             self.field,
@@ -617,7 +625,7 @@ impl Fixture {
 // --- Read log ---
 
 /// The requests a paged fixture's searches made, by stage.
-pub(crate) type ReadLog = Vec<(Stage, Range<usize>)>;
+pub(crate) type ReadLog = Vec<(VectorStage, Range<usize>)>;
 
 impl Fixture {
     fn log(&self) -> &PagedDirectory {

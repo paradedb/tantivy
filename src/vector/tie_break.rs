@@ -1,13 +1,9 @@
 //! The default, empty tie-break for the vector top-N heap.
 //!
-//! [`TopDocsByVectorSimilarity`](super::TopDocsByVectorSimilarity) sorts by a
-//! composite `(similarity, tie_break)` key so a secondary `ORDER BY` column can
-//! participate in heap eviction rather than being applied after the losing
-//! candidates are already gone. When no secondary column was requested, the tail
-//! is this ZST: the key becomes `(Score, ())`, which has the same layout as
-//! `Score`, and the comparator pair degenerates to comparing the similarity
-//! alone. The no-tie-break path is therefore identical to the pre-composite one
-//! by construction rather than by measurement.
+//! [`TopDocsByVectorSimilarity`](crate::vector::TopDocsByVectorSimilarity) sorts by a composite
+//! `(similarity, tie_break)` key so a secondary `ORDER BY` column takes part in heap eviction.
+//! Without one, the tail is this zero-sized key: `(Score, ())` has the layout of `Score` and
+//! compares by similarity alone.
 
 use std::cmp::Ordering;
 
@@ -15,10 +11,8 @@ use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
 use crate::{DocId, Score, SegmentOrdinal, SegmentReader};
 
-/// A [`SortKeyComputer`] that contributes nothing to the ordering.
-///
-/// See the [module docs](self) for why this exists rather than a separate
-/// non-composite code path.
+/// A [`SortKeyComputer`] that contributes nothing to the ordering: a vector search without a
+/// tie-break runs the same composite path with this key.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoTieBreak;
 

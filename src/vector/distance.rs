@@ -37,20 +37,17 @@ use crate::vector::{Accumulator, VectorElement};
 pub struct Similarity(f32);
 
 impl Similarity {
-    /// Less similar than any real score (`-∞`); the empty-slot sentinel.
-    pub const WORST: Similarity = Similarity(f32::NEG_INFINITY);
-
     /// Wraps a raw score that is *already* in similarity space (higher is
     /// better). Callers converting from a distance must negate first — that
     /// negation is exactly what this type exists to make explicit.
     #[inline]
-    pub fn new(score: f32) -> Self {
+    pub(crate) fn new(score: f32) -> Self {
         Similarity(score)
     }
 
     /// The raw score, e.g. to hand off as a document [`Score`](crate::Score).
     #[inline]
-    pub fn score(self) -> f32 {
+    pub(crate) fn score(self) -> f32 {
         self.0
     }
 }
@@ -120,7 +117,7 @@ pub fn dot<T: VectorElement>(a: &[T], b: &[T]) -> f32 {
 
 /// Sum of squares (squared L2 norm).
 #[inline]
-pub fn norm_squared<T: VectorElement>(a: &[T]) -> f32 {
+pub(crate) fn norm_squared<T: VectorElement>(a: &[T]) -> f32 {
     norm_squared_wide(a) as f32
 }
 
@@ -230,7 +227,7 @@ pub fn quantization_bench_dot_bytes_f32(query: &[f32], doc_bytes: &[u8]) -> f32 
 
 /// `norm_squared` over little-endian bytes encoding `T`.
 #[inline]
-pub fn norm_squared_bytes<T: VectorElement>(doc_bytes: &[u8]) -> f32 {
+pub(crate) fn norm_squared_bytes<T: VectorElement>(doc_bytes: &[u8]) -> f32 {
     norm_squared_bytes_wide::<T>(doc_bytes) as f32
 }
 
@@ -301,7 +298,8 @@ pub(crate) fn normalize_bytes_inplace<T: VectorElement>(row: &mut [u8]) -> Norma
 /// L2-normalizes `row` in place when `opts` requires write-time unit normalization (see
 /// [`VectorOptions::needs_normalization`]).
 ///
-/// Cosine scoring ([`VectorQuery::score_row`](crate::vector::prepared::VectorQuery::score_row))
+/// Cosine scoring
+/// ([`VectorQuery::score_row`](crate::vector::search::prepared::VectorQuery::score_row))
 /// is then `dot * inv_norm_q`, with no per-row norm pass.
 pub(crate) fn maybe_normalize_bytes(opts: &VectorOptions, row: &mut [u8]) -> NormalizeOutcome {
     debug_assert_eq!(row.len(), opts.bytes_per_vector());
@@ -331,7 +329,7 @@ impl Metric {
     /// here, so all metrics share the same "higher is better" convention.
     /// Magnitude differences across metrics are the caller's problem.
     #[inline]
-    pub fn similarity<T: VectorElement>(self, query: &[T], doc: &[T]) -> Similarity {
+    pub(crate) fn similarity<T: VectorElement>(self, query: &[T], doc: &[T]) -> Similarity {
         Similarity(match self {
             Metric::L2 => -l2_squared(query, doc),
             Metric::Cosine => cosine(query, doc),
@@ -343,7 +341,11 @@ impl Metric {
     /// little-endian bytes — typically a borrowed slice straight out
     /// of the segment's file.
     #[inline]
-    pub fn similarity_bytes<T: VectorElement>(self, query: &[T], doc_bytes: &[u8]) -> Similarity {
+    pub(crate) fn similarity_bytes<T: VectorElement>(
+        self,
+        query: &[T],
+        doc_bytes: &[u8],
+    ) -> Similarity {
         Similarity(match self {
             Metric::L2 => -l2_squared_bytes(query, doc_bytes),
             Metric::Cosine => cosine_bytes(query, doc_bytes),

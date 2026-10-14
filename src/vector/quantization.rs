@@ -39,24 +39,22 @@ pub(crate) fn validate_quantization_values<'a>(
 // --- Constants ---
 
 /// Settings identifier for the vector quantization format.
-pub const VECTOR_QUANTIZATION_FORMAT_VERSION: u32 = 3;
+pub(crate) const VECTOR_QUANTIZATION_FORMAT_VERSION: u32 = 3;
 /// Maximum number of residual layers stored by the vector format.
-pub const MAX_QUANTIZATION_LAYERS: usize = 3;
-/// Code sections begin at a 64-byte-aligned file offset.
-pub const QUANTIZED_CODE_ALIGNMENT: usize = 64;
+pub(crate) const MAX_QUANTIZATION_LAYERS: usize = 3;
 /// One little-endian binary32 scale per vector row and layer.
-pub const QUANTIZED_SCALE_STRIDE: usize = 4;
+pub(crate) const QUANTIZED_SCALE_STRIDE: usize = 4;
 /// One binary16 cumulative-prefix gamma per vector row and layer.
-pub const QUANTIZED_GAMMA_STRIDE: usize = 2;
+pub(crate) const QUANTIZED_GAMMA_STRIDE: usize = 2;
 /// One binary16 corrected-error ratio per vector row and layer.
-pub const QUANTIZED_ERROR_RATIO_STRIDE: usize = 2;
+pub(crate) const QUANTIZED_ERROR_RATIO_STRIDE: usize = 2;
 /// Combined per-layer sidecar bytes per vector row.
-pub const QUANTIZED_SIDECAR_STRIDE: usize =
+pub(crate) const QUANTIZED_SIDECAR_STRIDE: usize =
     QUANTIZED_SCALE_STRIDE + QUANTIZED_GAMMA_STRIDE + QUANTIZED_ERROR_RATIO_STRIDE;
 /// One binary32 split-form constant per vector row and layer.
-pub const QUANTIZED_CONSTANT_STRIDE: usize = 4;
+pub(crate) const QUANTIZED_CONSTANT_STRIDE: usize = 4;
 /// One binary32 residual squared norm per vector row.
-pub const QUANTIZED_RESIDUAL_NORM_STRIDE: usize = 4;
+pub(crate) const QUANTIZED_RESIDUAL_NORM_STRIDE: usize = 4;
 /// Closed-form uncertainty safety multiplier declared by the scoring policy.
 pub(crate) const GAMMA_ANALYTICAL_SAFETY: f32 = 1.15;
 /// Uniform confidence width at every quantized layer boundary.
@@ -69,7 +67,7 @@ pub(crate) const SIGN_QUERY_BITS: u8 = 4;
 /// Normalization applied to fp32 rows before residual encoding and exact scoring.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum VectorNormPolicy {
+pub(crate) enum VectorNormPolicy {
     /// Preserve input values.
     None,
     /// Normalize vectors to unit L2 norm.
@@ -78,7 +76,7 @@ pub enum VectorNormPolicy {
 
 impl VectorNormPolicy {
     /// Resolves the normalization policy for vector options.
-    pub fn for_options(options: &VectorOptions) -> Self {
+    pub(crate) fn for_options(options: &VectorOptions) -> Self {
         if options.needs_normalization() {
             Self::UnitL2
         } else {
@@ -98,13 +96,13 @@ pub struct VectorQuantizationLayer {
 
 /// Exact-density grid persisted as part of the index configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct VectorQuantizationGrid {
+pub(crate) struct VectorQuantizationGrid {
     /// Code width.
-    pub bits: u8,
+    pub(crate) bits: u8,
     /// Reconstruction points.
-    pub points: Vec<f32>,
+    pub(crate) points: Vec<f32>,
     /// Exact-density normalized RMSE resolved when the grid is materialized.
-    pub rho_model: f64,
+    pub(crate) rho_model: f64,
 }
 
 impl PartialEq for VectorQuantizationGrid {
@@ -134,11 +132,11 @@ pub struct VectorQuantizationConfig {
     /// Distance metric.
     pub metric: Metric,
     /// Vector normalization policy.
-    pub norm_policy: VectorNormPolicy,
+    pub(crate) norm_policy: VectorNormPolicy,
     /// Residual layers in scoring order.
     pub layers: Vec<VectorQuantizationLayer>,
     /// Persisted grids by code width.
-    pub grids: Vec<VectorQuantizationGrid>,
+    pub(crate) grids: Vec<VectorQuantizationGrid>,
 }
 
 impl VectorQuantizationConfig {
@@ -379,7 +377,7 @@ pub(crate) fn validate_quantization_configs(
 /// # Panics
 ///
 /// Panics when `dim` is zero, `bits` is outside `1..=4`, or multiplication overflows.
-pub fn quantized_code_stride(dim: usize, bits: u8) -> usize {
+pub(crate) fn quantized_code_stride(dim: usize, bits: u8) -> usize {
     assert!(dim > 0);
     assert!((1..=4).contains(&bits));
     dim.checked_mul(usize::from(bits))
