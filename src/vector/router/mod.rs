@@ -16,10 +16,11 @@ mod exact;
 mod rng;
 mod stacked;
 
-/// The routing structure used for every IVF segment in an index.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The routing structure new IVF segments build. Codes are persisted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RouterKind {
+    #[default]
     Rng = 0,
     Stacked = 1,
     Exact = 2,

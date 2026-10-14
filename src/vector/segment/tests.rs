@@ -12,7 +12,7 @@ use crate::vector::scan::layer_read::LayerRead;
 use crate::vector::scan::plan::{ExactRule, PlanOverride};
 use crate::vector::stats::{AccessPath, LayerProbeStats};
 use crate::vector::test_support::{ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg, ReadLog};
-use crate::vector::tests::exhaustive_params;
+use crate::vector::tests::{exhaustive_params, routed_exhaustive_params};
 use crate::vector::{ProbeStats, RouterKind, Stage};
 use crate::{DocAddress, DocId, Score};
 
@@ -162,7 +162,7 @@ fn forced_plans() -> [(&'static str, PlanOverride); 4] {
 /// The probe parameters of each path: routed, and on IVF segments located under a cap of a
 /// tenth of a segment with the exact plan on, as pg_search runs it.
 fn paths(representation: Representation) -> Vec<(&'static str, AdaptiveProbeParams)> {
-    let routed = exhaustive_params(MATRIX_CLUSTERS);
+    let routed = routed_exhaustive_params(MATRIX_CLUSTERS);
     if matches!(representation, Representation::Flat) {
         return vec![("routed", routed)];
     }
@@ -413,7 +413,7 @@ fn read_plans_are_bit_identical() -> crate::Result<()> {
                         weight.as_ref(),
                         &query,
                         10,
-                        exhaustive_params(clusters),
+                        routed_exhaustive_params(clusters),
                         Some(forced),
                     )
                 };
@@ -487,11 +487,14 @@ fn reads_fixture(metric: Metric, schedule: &[u8], deletes: &[usize]) -> crate::R
     .build()
 }
 
-/// Probe parameters that open every cluster the router hands over.
+/// Probe parameters that open every cluster the router hands over, on the routed path with no
+/// cluster scored exactly before the exact phase.
 fn every_cluster() -> AdaptiveProbeParams {
     AdaptiveProbeParams {
         max_probe_fraction: 1.0,
         min_probe_clusters: 4,
+        exact_plan: false,
+        located: LocatedPath::Off,
         ..Default::default()
     }
 }
@@ -868,13 +871,13 @@ fn layout_plans_selective_filters() -> crate::Result<()> {
         let query = Lcg(5).vector(1024, 0.5);
         let exact_on = AdaptiveProbeParams {
             exact_plan: true,
-            ..exhaustive_params(2)
+            ..routed_exhaustive_params(2)
         };
         for (name, selective) in [("few", true), ("dense", false)] {
             let case = format!("{metric:?} {name}");
             let filter = fixture.filter(name);
             let oracle = fixture.oracle(&filter, &query, 10)?;
-            let fruit = fixture.search(&filter, &query, 10, exhaustive_params(2))?;
+            let fruit = fixture.search(&filter, &query, 10, routed_exhaustive_params(2))?;
             let stats = &fruit.stats[0];
             let expected = if selective { stats.postings_row } else { 0 };
             let layer0 = stats.layers.get(0).unwrap();
@@ -980,7 +983,7 @@ fn retired_groups_never_reach_a_later_band() -> crate::Result<()> {
         fixture.weight(&filter)?.as_ref(),
         &query,
         10,
-        exhaustive_params(8),
+        routed_exhaustive_params(8),
         Some(PlanOverride::exact(|cluster, layer| {
             layer == 1 && cluster % 2 == 0
         })),

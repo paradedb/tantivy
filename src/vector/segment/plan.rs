@@ -216,7 +216,11 @@ mod tests {
             (Occur::Should, label("tenth")),
             (Occur::Should, label("rest")),
         ]);
-        let params = exhaustive_params(9);
+        let params = AdaptiveProbeParams {
+            exact_plan: false,
+            located: LocatedPath::Off,
+            ..exhaustive_params(9)
+        };
         // The source as `(located, matches)`; `None` matches for a match-all routed filter.
         let plan_with = |filter: &dyn Query, top_n: usize, params: &AdaptiveProbeParams| {
             fixture.with_segment(filter, &[0.0, 0.0], top_n, params, |seg| {

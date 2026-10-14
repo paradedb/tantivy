@@ -93,7 +93,7 @@ fn fixture_with_seed(
             ..Default::default()
         })
         .ivf_clusterer(Arc::new(FixedClusters))
-        .ivf_router(RouterKind::Exact)?
+        .ivf_router(RouterKind::Exact)
         .create(directory.clone())?;
     let mut writer = index.writer_with_num_threads(1, 30_000_000)?;
     writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -466,6 +466,8 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                 .with_adaptive_params(AdaptiveProbeParams {
                     max_probe_fraction: 1.0,
                     min_probe_clusters: 4,
+                    exact_plan: false,
+                    located: LocatedPath::Off,
                     ..Default::default()
                 });
             let fruit = crate::vector::router::with_test_clusters(candidates, || {

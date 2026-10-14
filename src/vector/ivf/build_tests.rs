@@ -86,7 +86,7 @@ fn merge_flat_segments_with_deletes_into_ivf() -> crate::Result<()> {
         .ivf_clusterer(Arc::new(NearestClusterer {
             centroids: centroids.clone(),
         }))
-        .ivf_router(RouterKind::Stacked)?
+        .ivf_router(RouterKind::Stacked)
         .create_in_ram()?;
     let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
     writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -174,7 +174,7 @@ fn merge_deleting_every_doc_of_one_field_writes_empty_ivf() -> crate::Result<()>
         .ivf_clusterer(Arc::new(NearestClusterer {
             centroids: centroids.clone(),
         }))
-        .ivf_router(RouterKind::Stacked)?
+        .ivf_router(RouterKind::Stacked)
         .create_in_ram()?;
     let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
     writer.set_merge_policy(Box::new(NoMergePolicy));

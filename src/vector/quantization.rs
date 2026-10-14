@@ -200,6 +200,27 @@ impl VectorQuantizationConfig {
         Ok(config)
     }
 
+    /// Materializes one field's configuration with one layer per entry of `bits`, in scoring
+    /// order, each with a fresh random rotation seed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the dimension, schedule, or generated grids are invalid.
+    pub fn with_random_seeds(
+        field: String,
+        options: &VectorOptions,
+        bits: &[u8],
+    ) -> crate::Result<Self> {
+        let layers = bits
+            .iter()
+            .map(|&bits| VectorQuantizationLayer {
+                bits,
+                seed: fastrand::u64(..),
+            })
+            .collect();
+        Self::materialize(field, options, layers)
+    }
+
     /// Validate the persisted configuration against its schema field.
     ///
     /// # Errors

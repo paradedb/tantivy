@@ -1,3 +1,5 @@
+use crate::vector::source::controller::{open_share, DEFAULT_FIXED_PROBE_COST_ROWS};
+
 /// Global work-unit statistics, computed once at query init across the
 /// index's IVF segments: `n_avg = N / C`, native docs over clusters.
 /// When absent, budgeting falls back to the segment's own ratio.
@@ -40,59 +42,37 @@ impl WorkModel {
 
 /// Query-time probe budget for IVF vector search.
 ///
-/// Stop condition: the probe-budget ceiling, or stream exhaustion. There
-/// is no distance-ratio knob and no second stop — the bounds gate skips
-/// clusters it can prove are useless, which spends LESS than the ceiling
-/// but never ends the scan.
-///
-/// The ceiling is measured in WORK UNITS, not raw clusters: 1 unit is
-/// one average cluster of work, charged event-wise as probing proceeds
-/// (an opening share per probed cluster, a per-row share per row actually
-/// read and scored - see the work-unit model in `backend`). A selective
-/// filter therefore probes deeper into the ranked list before the ceiling
-/// binds, since the rows it rejects are never scored and never charged.
-///
-/// All defaults are provisional pending real-data benchmarking.
+/// The budget is in work units: one unit is one average cluster of work, charged per opened
+/// cluster and per scored row, so a selective filter probes further down the ranking. A segment
+/// scan stops when its budget is spent or its ranking runs out. The numeric defaults are
+/// provisional pending real-data benchmarking.
 #[derive(Clone, Debug)]
 pub struct AdaptiveProbeParams {
-    /// Filter-effective work ceiling, as a FRACTION of the segment's
-    /// capacity and resolved per segment - a fraction tracks each
-    /// segment's own cluster count where an absolute cap cannot; a
-    /// selective filter probes proportionally deeper within it.
-    /// Default 0.01, PROVISIONAL.
+    /// Work ceiling as a fraction of each segment's capacity. Default 0.01.
     pub max_probe_fraction: f32,
-    /// Lower bound on the resolved budget, in work units, applied before
-    /// the capacity clamp - see [`Self::resolved_work_budget`]. Keeps
-    /// small segments, where `max_probe_fraction` rounds down to a single
-    /// cluster, probing more than that one cluster. Defaults to
-    /// [`MIN_PROBE_CLUSTERS`]. Denominated in work units (~ that many
-    /// average clusters), NOT a probed-cluster count.
+    /// Floor on the resolved budget, in work units, applied before the capacity cap. Default
+    /// [`MIN_PROBE_CLUSTERS`].
     pub min_probe_clusters: usize,
-    /// The global work-unit statistics, primed at query init by callers
-    /// holding a [`Searcher`](crate::Searcher) - see [`WorkModel`]. `None`
-    /// falls back to per-segment normalization.
+    /// Index-wide docs per cluster; `None` budgets each segment by its own ratio.
     pub work_model: Option<WorkModel>,
-    /// Recall target for the stacked router's cluster ranking, in
-    /// `(0, 1]`. Below `1.0` the router stops scanning its lists once the
-    /// estimated recall of the top clusters reaches it (APS); `1.0` routes
-    /// with the fixed nprobe fractions. Ignored by other routers, and
-    /// forced to `1.0` above
-    /// [`APS_MAX_DIM`](crate::vector::ivf::APS_MAX_DIM). Default
-    /// [`DEFAULT_ROUTER_RECALL`], PROVISIONAL.
+    /// Recall target for the stacked router's ranking, in `(0, 1]`; `1.0` routes with the fixed
+    /// nprobe fractions. Forced to `1.0` above [`APS_MAX_DIM`](crate::vector::ivf::APS_MAX_DIM).
+    /// Default [`DEFAULT_ROUTER_RECALL`].
     pub router_recall_target: f32,
-    /// Recall target for the segment's own cluster scan, in `(0, 1]`.
-    /// Below `1.0` the probe loop stops once the estimated recall of the
-    /// clusters covered so far reaches it (APS); `1.0` leaves the work
-    /// budget as the only bound. Stacked-router segments only, and forced
-    /// to `1.0` above [`APS_MAX_DIM`](crate::vector::ivf::APS_MAX_DIM).
+    /// Recall target for each segment's cluster scan, in `(0, 1]`, estimated by the Quake APS;
+    /// `1.0` leaves the budget as the only bound. Stacked-router segments only; forced to `1.0`
+    /// above [`APS_MAX_DIM`](crate::vector::ivf::APS_MAX_DIM). Default `1.0`.
     pub recall_target: f32,
     /// Lets a quantized segment score a cluster's rows exactly before the exact phase when that
     /// reads strictly fewer storage blocks (bytes without block geometry) than the cheaper
-    /// quantized read. Exact rows join the pruning bound as zero-width intervals. Default `false`.
+    /// quantized read. Exact rows join the pruning bound as zero-width intervals. Default `true`.
     pub exact_plan: bool,
     /// Which segments locate their filter's matches through the document location map instead
-    /// of routing; unfiltered queries always route. Default [`LocatedPath::Off`].
+    /// of routing; unfiltered queries always route. Default [`LocatedPath::Auto`].
     pub located: LocatedPath,
+    /// Cost of opening a cluster, in rows of full work; finite and positive. Default
+    /// [`DEFAULT_FIXED_PROBE_COST_ROWS`].
+    pub fixed_probe_cost_rows: f64,
 }
 
 /// Which segments take the located path: a segment whose filter matches at most a cap of
@@ -135,8 +115,9 @@ impl Default for AdaptiveProbeParams {
             work_model: None,
             router_recall_target: DEFAULT_ROUTER_RECALL,
             recall_target: 1.0,
-            exact_plan: false,
-            located: LocatedPath::Off,
+            exact_plan: true,
+            located: LocatedPath::Auto,
+            fixed_probe_cost_rows: DEFAULT_FIXED_PROBE_COST_ROWS,
         }
     }
 }
@@ -181,20 +162,13 @@ impl AdaptiveProbeParams {
 }
 
 impl AdaptiveProbeParams {
-    /// The segment's work-unit budget: `max_probe_fraction *
-    /// segment_units`, floored at `min_probe_clusters` units and capped
-    /// at `segment_units` (`n_avg` global when primed - see
-    /// [`WorkModel`]).
+    /// The segment's work budget with the pricing it was resolved under, `(budget, n_avg, x)`.
     ///
-    /// * `clusters_in_segment` (`usize`) — IVF cluster count in this segment.
-    /// * `native_docs_in_segment` (`usize`) — distinct docs with a vector in this segment, as
-    ///   written (replication does not inflate this).
-    ///
-    /// Returns (`crate::Result<(f64, f64, f64)>`): `(budget, n_avg, x)` —
-    /// the segment's work-unit budget, the docs-per-cluster average, and
-    /// the open share; the loop's pricing is built from all three. A
-    /// non-positive `max_probe_fraction` is a configuration error, not
-    /// "no probing".
+    /// The budget is `max_probe_fraction` of the segment's capacity in work units, floored at
+    /// `min_probe_clusters` and capped at the capacity; `n_avg` is the docs per cluster and `x` the
+    /// open share. `native_docs_in_segment` counts distinct docs with a vector, as written. A
+    /// non-positive `max_probe_fraction` or a non-finite or non-positive `fixed_probe_cost_rows` is
+    /// an error.
     pub(crate) fn resolved_work_budget(
         &self,
         clusters_in_segment: usize,
@@ -205,15 +179,17 @@ impl AdaptiveProbeParams {
                 "max_probe_fraction must be greater than 0".to_string(),
             ));
         }
+        if !(self.fixed_probe_cost_rows.is_finite() && self.fixed_probe_cost_rows > 0.0) {
+            return Err(crate::TantivyError::InvalidArgument(
+                "fixed_probe_cost_rows must be finite and greater than 0".to_string(),
+            ));
+        }
         let n_avg = match self.work_model {
             Some(model) => model.n_avg,
             None => native_docs_in_segment as f64 / clusters_in_segment.max(1) as f64,
         };
-        // The open share is PER INDEX, derived from the measured
-        // rows-per-open hardware ratio and this index's own granularity -
-        // see `source::controller::open_share`. The unit identity (1 unit = x +
-        // (1 - x); exhaustive scan = C units) holds for any x.
-        let x = crate::vector::source::controller::open_share(n_avg);
+        // The unit identity (1 unit = x + (1 - x); exhaustive scan = C units) holds for any x.
+        let x = open_share(self.fixed_probe_cost_rows, n_avg);
         let segment_units = clusters_in_segment as f64 * x
             + (1.0 - x) * native_docs_in_segment as f64 / n_avg.max(f64::MIN_POSITIVE);
         let budget = (self.max_probe_fraction as f64 * segment_units)
@@ -327,14 +303,22 @@ mod tests {
         assert_eq!(params.router_k(0.0, x, 1.0, 0), 1);
     }
 
+    /// A non-positive probe fraction or a non-finite or non-positive open cost is an error.
     #[test]
-    fn non_positive_probe_fraction_errors() {
+    fn invalid_budget_params_error() {
         for fraction in [0.0, -1.0] {
             let params = AdaptiveProbeParams {
                 max_probe_fraction: fraction,
                 ..Default::default()
             };
             assert!(params.resolved_work_budget(9, 180).is_err());
+        }
+        for cost in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let params = AdaptiveProbeParams {
+                fixed_probe_cost_rows: cost,
+                ..Default::default()
+            };
+            assert!(params.resolved_work_budget(9, 180).is_err(), "{cost}");
         }
     }
 }
