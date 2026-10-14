@@ -22,6 +22,155 @@ const LABEL_FIELD_NAME: &str = "label";
 const NUM_DOCS: usize = 100;
 const DOCS_PER_SEGMENT: usize = 10;
 
+#[test]
+fn f16_rows_survive_flat_merge_and_reopen_without_rounding_again() -> crate::Result<()> {
+    for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+        let directory = crate::directory::RamDirectory::create();
+        let mut schema = Schema::builder();
+        let field = schema.add_vector_field(
+            EMBEDDING_FIELD_NAME,
+            VectorOptions::new(grid2d::DIM, metric).with_dtype(VectorDType::F16),
+        );
+        let index = TestVectorIndex {
+            index: Index::create(directory.clone(), schema.build(), IndexSettings::default())?,
+        };
+        let mut writer = index.index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for (i, vector) in grid2d::vectors(NUM_DOCS).iter().enumerate() {
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(field, vector);
+            writer.add_document(doc)?;
+            if (i + 1) % DOCS_PER_SEGMENT == 0 {
+                writer.commit()?;
+            }
+        }
+        writer.wait_merging_threads()?;
+        let before = index.index.reader()?.searcher();
+        let mut expected = Vec::new();
+        for segment in before.segment_readers() {
+            let vectors = segment.vector_index(index.embedding_field())?;
+            for doc in 0..segment.max_doc() {
+                expected.push(vectors.vector_bytes(doc)?.unwrap().to_vec());
+            }
+        }
+        expected.sort();
+        let mut writer = index
+            .index
+            .writer_with_num_threads::<TantivyDocument>(1, 15_000_000)?;
+        writer
+            .merge(&index.index.searchable_segment_ids()?)
+            .wait()?;
+        writer.wait_merging_threads()?;
+        let reopened = Index::open(directory)?;
+        let after = reopened.reader()?.searcher();
+        let mut actual = Vec::new();
+        for segment in after.segment_readers() {
+            let vectors = segment.vector_index(index.embedding_field())?;
+            for doc in 0..segment.max_doc() {
+                actual.push(vectors.vector_bytes(doc)?.unwrap().to_vec());
+            }
+        }
+        actual.sort();
+        assert_eq!(actual, expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn f16_rejects_overflow_and_normalizes_large_cosine_inputs_before_narrowing() -> crate::Result<()> {
+    for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+        let mut builder = Schema::builder();
+        let options = VectorOptions::new(3, metric).with_dtype(VectorDType::F16);
+        let field = builder.add_vector_field("embedding", options.clone());
+        let index = Index::create_in_ram(builder.build());
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        let mut document = TantivyDocument::new();
+        document.add_vector(field, &[1e20_f32, 0.0, 0.0]);
+        writer.add_document(document)?;
+        let result = writer.commit();
+        if metric == Metric::Cosine {
+            result?;
+            let query = vec![1e20_f32, 0.0, 0.0];
+            let found = index.reader()?.searcher().search(
+                &AllQuery,
+                &TopDocs::with_limit(1).order_by_similarity(field, query),
+            )?;
+            assert_eq!(found.results[0].0, 1.0);
+        } else {
+            assert!(result.is_err());
+            assert!(crate::vector::search::prepared::VectorQuery::for_options(
+                &options,
+                Arc::new(vec![1e20_f32, 0.0, 0.0])
+            )
+            .is_err());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn f16_flat_and_ivf_scores_match_widened_cosine_dot_and_l2() -> crate::Result<()> {
+    for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+        for format in [VectorStorageFormat::Flat, VectorStorageFormat::Ivf] {
+            let index = TestVectorIndex::builder(VectorDType::F16)
+                .metric(metric)
+                .vector_storage_format(format)
+                .build()?;
+            let searcher = index.index.reader()?.searcher();
+            let query = vec![0.2513_f32, -0.7389];
+            let prepared = crate::vector::search::prepared::VectorQuery::for_options(
+                &index.vector_options(),
+                Arc::new(query.clone()),
+            )?;
+            let collector = TopDocs::with_limit(NUM_DOCS)
+                .order_by_similarity(index.embedding_field(), query)
+                .with_probe_params(ProbeParams {
+                    max_probe_fraction: 1.0,
+                    min_probe_clusters: 1000,
+                    ..Default::default()
+                });
+            let results = searcher.search(&AllQuery, &collector)?;
+            assert_eq!(results.results.len(), NUM_DOCS);
+            for (score, address) in results.results {
+                let vectors = searcher
+                    .segment_reader(address.segment_ord)
+                    .vector_index(index.embedding_field())?;
+                let bytes = vectors.vector_bytes(address.doc_id)?.unwrap();
+                assert_eq!(bytes.len(), if metric == Metric::Cosine { 8 } else { 4 });
+                let values =
+                    crate::vector::clustering::decode_stored_row(&bytes, &index.vector_options())?;
+                let q = prepared.widened();
+                let dot: f64 = q
+                    .iter()
+                    .zip(&values)
+                    .map(|(&q, &v)| f64::from(q) * f64::from(v))
+                    .sum();
+                let expected = match metric {
+                    Metric::Dot => dot,
+                    Metric::L2 => -q
+                        .iter()
+                        .zip(&values)
+                        .map(|(&q, &v)| (f64::from(q) - f64::from(v)).powi(2))
+                        .sum::<f64>(),
+                    Metric::Cosine => {
+                        dot / q.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt()
+                            / values
+                                .iter()
+                                .map(|&x| f64::from(x).powi(2))
+                                .sum::<f64>()
+                                .sqrt()
+                    }
+                };
+                assert!(
+                    (f64::from(score) - expected).abs() <= 2e-6 * expected.abs().max(1.0),
+                    "{metric:?} {format:?}: {score} != {expected}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 // Which on-disk layout the fixture should produce, reusing the public
 // descriptor enum. Selected via the index settings (clustering threshold +
 // clusterer); the resulting segment is self-describing through its `.vec`

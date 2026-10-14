@@ -88,13 +88,13 @@ an Identity or Bitmap IdMap, no centroid data, and a nonzero block size. Its
 stored boundaries must describe `[b*r, min((b+1)*r, num_rows))`. Zero flat rows
 means zero blocks; both directory arrays still contain one sentinel.
 The flat writer stores `Plain` with `rows_per_block = 16384`. Plain blocks align
-to F32; blocks containing SignPlane codes align to U64.
+to their row dtype; blocks containing SignPlane codes align to U64.
 
 Column order and widths are part of the contract:
 
 | Column | Decoder element | Row stride | Band |
 |---|---|---:|---|
-| Rows | F32 | dim * dtype width | none |
+| Rows | F32 or F16 | dim * dtype width, plus 4 for F16 cosine | none |
 | DocIds, clustered only | U32 | 4 | none |
 | ResidualNorms | F32 | 4 | 0 |
 | QuantLayerCodes(l) | U64 for SignPlane, U8 for GridPlane | quantizer code stride | l |
@@ -104,6 +104,19 @@ Column order and widths are part of the contract:
 | QuantLayerConstants(l), L2 only | F32 | 4 | l |
 
 Flat Plain has only Rows; clustered Plain has Rows followed by DocIds.
+F16 rows contain little-endian binary16 coordinates. Cosine rows additionally
+carry a little-endian f32 reciprocal norm immediately after the coordinates;
+this corrects the norm after rounding without another read or norm reduction.
+The row decoder accepts an unaligned reciprocal norm, including odd dimensions.
+Input and query coordinates remain f32 at the API boundary. Writers normalize
+cosine inputs before narrowing; other metrics reject values that overflow F16.
+Queries are rounded once and their prepared kernels are shared across segments.
+Distance arithmetic and accumulation use f32. Centroids remain f32 regardless
+of the document dtype. Merges copy F16 rows without rounding them again, and
+decode their corrected coordinates for clustering, bounds, and quantization.
+Existing F32 metadata and rows retain their encoding; changing a field's storage
+dtype requires rebuilding its index.
+
 DocIds ascend within each block. Quantized adds ResidualNorms after DocIds
 when clustered, then each layer's columns in
 ascending layer order. Norms, scales and constants are binary32; gammas and
@@ -154,7 +167,7 @@ rotation   := kind:u8 [seed:u64 if kind=1]
 | Tag domain | Frozen values |
 |---|---|
 | repr | 0 Plain, 1 Quantized |
-| dtype | 0 F32 |
+| dtype | 0 F32, 1 F16 |
 | metric | 0 L2, 1 Dot, 2 Cosine |
 | norm_policy | 0 None, 1 UnitL2 |
 | partition | 0 Clusters, 1 Uniform |

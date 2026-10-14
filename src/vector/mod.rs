@@ -48,6 +48,8 @@
 
 mod collector;
 mod distance;
+mod half;
+pub use half::{dot_f16_bytes, l2_squared_f16_bytes};
 mod element;
 mod params;
 pub(crate) mod quantization;

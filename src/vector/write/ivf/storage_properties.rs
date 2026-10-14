@@ -1,10 +1,118 @@
-use crate::vector::write::ivf::tests::*;
 use crate::schema::Value;
 use crate::vector::quantization::{corrected_quantized_estimate, ArithmeticError};
 use crate::vector::storage::io::test_support::{PagedDirectory, PAGE_BYTES};
+use crate::vector::write::ivf::tests::*;
 
 const DIM: usize = 64;
 const DOCS: usize = 1200;
+
+#[test]
+fn f16_rerank_matches_exact_with_filters_deletes_and_float_centroids() -> crate::Result<()> {
+    for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+        let (index, _) = fixture_with_seed(metric, &[1, 1], true, None, VectorDType::F16)?;
+        let searcher = index.reader()?.searcher();
+        let field = index.schema().get_field("embedding")?;
+        let label = index.schema().get_field("label")?;
+        let vector_reader = searcher.segment_readers()[0].vector_index(field)?;
+        assert_eq!(
+            vector_reader.index().unwrap().centroid_bytes()?.len(),
+            4 * DIM * 4
+        );
+        let params = ProbeParams {
+            max_probe_fraction: 1.0,
+            min_probe_clusters: 4,
+            ..Default::default()
+        };
+        let filtered = TermQuery::new(
+            Term::from_field_text(label, "keep"),
+            IndexRecordOption::Basic,
+        );
+        for located in [
+            LocatedPath::Off,
+            LocatedPath::MaxSelectivity(crate::vector::params::Selectivity::new(1.0).unwrap()),
+        ] {
+            let params = ProbeParams {
+                located,
+                ..params.clone()
+            };
+            for filter in [&AllQuery as &dyn crate::query::Query, &filtered] {
+                for doc in [42, 133, 779] {
+                    let query = input_vector(doc);
+                    let exact = TopDocsByVectorSimilarity::new(field, query.clone(), 10)
+                        .with_probe_params(params.clone())
+                        .with_max_scan_levels(0);
+                    let quantized = TopDocsByVectorSimilarity::new(field, query, 10)
+                        .with_probe_params(params.clone());
+                    let expected = searcher.search(filter, &exact)?;
+                    let actual = searcher.search(filter, &quantized)?;
+                    let matching = actual
+                        .results
+                        .iter()
+                        .filter(|(_, address)| {
+                            expected.results.iter().any(|(_, other)| address == other)
+                        })
+                        .count();
+                    assert!(matching >= 9, "{metric:?} query={doc} recall={matching}/10");
+                    for &(score, address) in &actual.results {
+                        if let Some(&(expected_score, _)) =
+                            expected.results.iter().find(|(_, other)| *other == address)
+                        {
+                            assert_eq!(score, expected_score);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn f16_dense_rows_halve_payload_and_reduce_page_reads() -> crate::Result<()> {
+    for metric in [Metric::L2, Metric::Cosine] {
+        let mut counts = Vec::new();
+        for dtype in [VectorDType::F32, VectorDType::F16] {
+            let (index, directory) = fixture_with_seed(metric, &[], false, None, dtype)?;
+            let searcher = index.reader()?.searcher();
+            let field = index.schema().get_field("embedding")?;
+            let vectors = searcher.segment_readers()[0].vector_index(field)?;
+            directory.reads.lock().unwrap().clear();
+            let mut bytes = 0;
+            for cluster in 0..4 {
+                bytes += vectors.read_cluster_rows(cluster)?.len();
+            }
+            let pages: usize = directory
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, range)| {
+                    if range.is_empty() {
+                        0
+                    } else {
+                        (range.end - 1) / PAGE_BYTES - range.start / PAGE_BYTES + 1
+                    }
+                })
+                .sum();
+            counts.push((bytes, pages, vectors.num_vectors()));
+        }
+        let correction = if metric == Metric::Cosine {
+            counts[1].2 * 4
+        } else {
+            0
+        };
+        assert_eq!((counts[1].0 - correction) * 2, counts[0].0);
+        assert!(
+            counts[1].1 * 10 <= counts[0].1 * 6,
+            "{metric:?}: {counts:?}"
+        );
+        eprintln!(
+            "{metric:?} dense rows: f32={} bytes/{} pages; f16={} bytes/{} pages",
+            counts[0].0, counts[0].1, counts[1].0, counts[1].1
+        );
+    }
+    Ok(())
+}
 
 struct FixedClusters;
 impl IvfClusterer for FixedClusters {
@@ -62,16 +170,20 @@ fn fixture_with_deletes(
     schedule: &[u8],
     deletes: bool,
 ) -> crate::Result<(Index, PagedDirectory)> {
-    fixture_with_seed(metric, schedule, deletes, None)
+    fixture_with_seed(metric, schedule, deletes, None, VectorDType::F32)
 }
 fn fixture_with_seed(
     metric: Metric,
     schedule: &[u8],
     deletes: bool,
     seed: Option<u64>,
+    dtype: VectorDType,
 ) -> crate::Result<(Index, PagedDirectory)> {
     let mut schema = Schema::builder();
-    let vector = schema.add_vector_field("embedding", VectorOptions::new(DIM, metric));
+    let vector = schema.add_vector_field(
+        "embedding",
+        VectorOptions::new(DIM, metric).with_dtype(dtype),
+    );
     let label = schema.add_text_field("label", STRING | STORED);
     let ordinal = schema.add_u64_field("ordinal", STORED);
     let directory = PagedDirectory::default();
@@ -487,7 +599,8 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
         return Ok(());
     }
     let query = input_vector(42);
-    let exact_query = crate::vector::search::prepared::VectorQuery::new(metric, Arc::new(query.clone()));
+    let exact_query =
+        crate::vector::search::prepared::VectorQuery::new(metric, Arc::new(query.clone()));
     let prepared = QuantizedQueryCtx::new(Arc::clone(ctx), &exact_query);
     for clusters in [vec![0, 1, 2, 3], vec![0, 1, 3]] {
         for filtered in [false, true] {
@@ -666,18 +779,14 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
     Ok(())
 }
 
-
-
-
-
-
 #[test]
 fn diagnostic_schedules_ignore_rotation_seeds() -> crate::Result<()> {
     use crate::vector::diagnostics::{VectorEstimatorQuery, VectorEstimatorSource};
     use crate::vector::storage::metadata::QuantizerKind;
 
     let measure = |seed| -> crate::Result<_> {
-        let (index, _) = fixture_with_seed(Metric::Cosine, &[1, 4], false, Some(seed))?;
+        let (index, _) =
+            fixture_with_seed(Metric::Cosine, &[1, 4], false, Some(seed), VectorDType::F32)?;
         let reader = index.reader()?;
         let searcher = reader.searcher();
         let segment = &searcher.segment_readers()[0];
@@ -713,52 +822,54 @@ fn diagnostic_schedules_ignore_rotation_seeds() -> crate::Result<()> {
 #[test]
 fn diagnostics_skip_empty_clusters() -> crate::Result<()> {
     use crate::vector::diagnostics::{VectorEstimatorQuery, VectorEstimatorSource};
-    let (index, _) = fixture(Metric::Cosine, &[1, 4])?;
-    let reader = index.reader()?;
-    let searcher = reader.searcher();
-    let segment = &searcher.segment_readers()[0];
-    let vectors = segment.vector_index(index.schema().get_field("embedding")?)?;
-    assert!(vectors.index().unwrap().cluster_range(0).is_empty());
-    let queries = vectors
-        .sample_estimator_pseudo_queries(3, segment.alive_bitset())?
-        .unwrap();
-    assert_eq!(queries.len(), 3);
-    let audit = vectors
-        .audit_error_queries(
-            VectorEstimatorSource::HeldOut,
-            &queries,
-            30,
-            segment.alive_bitset(),
-        )?
-        .unwrap();
-    assert_eq!(
-        audit.schedule().layers(),
-        &[
-            (crate::vector::storage::metadata::QuantizerKind::Sign, 1),
-            (crate::vector::storage::metadata::QuantizerKind::Grid, 4)
-        ]
-    );
-    assert_eq!(audit.estimator.sample_rows(), 30);
-    let estimates = vectors
-        .measure_estimator_queries(
-            VectorEstimatorSource::HeldOut,
-            &queries,
-            30,
-            segment.alive_bitset(),
-        )?
-        .unwrap();
-    assert_eq!(estimates, audit.estimator);
-    let external: Vec<_> = (0..100)
-        .map(|doc| VectorEstimatorQuery {
-            values: input_vector(doc + DOCS),
-            excluded_doc_id: None,
-        })
-        .collect();
-    let cone = vectors
-        .audit_error_cone(&external, segment.alive_bitset())?
-        .unwrap();
-    assert_eq!(cone.query_count, 100);
-    assert_eq!(cone.depths.len(), 2);
+    for dtype in [VectorDType::F32, VectorDType::F16] {
+        let (index, _) = fixture_with_seed(Metric::Cosine, &[1, 4], true, None, dtype)?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let segment = &searcher.segment_readers()[0];
+        let vectors = segment.vector_index(index.schema().get_field("embedding")?)?;
+        assert!(vectors.index().unwrap().cluster_range(0).is_empty());
+        let queries = vectors
+            .sample_estimator_pseudo_queries(3, segment.alive_bitset())?
+            .unwrap();
+        assert_eq!(queries.len(), 3);
+        let audit = vectors
+            .audit_error_queries(
+                VectorEstimatorSource::HeldOut,
+                &queries,
+                30,
+                segment.alive_bitset(),
+            )?
+            .unwrap();
+        assert_eq!(
+            audit.schedule().layers(),
+            &[
+                (crate::vector::storage::metadata::QuantizerKind::Sign, 1),
+                (crate::vector::storage::metadata::QuantizerKind::Grid, 4)
+            ]
+        );
+        assert_eq!(audit.estimator.sample_rows(), 30);
+        let estimates = vectors
+            .measure_estimator_queries(
+                VectorEstimatorSource::HeldOut,
+                &queries,
+                30,
+                segment.alive_bitset(),
+            )?
+            .unwrap();
+        assert_eq!(estimates, audit.estimator);
+        let external: Vec<_> = (0..100)
+            .map(|doc| VectorEstimatorQuery {
+                values: input_vector(doc + DOCS),
+                excluded_doc_id: None,
+            })
+            .collect();
+        let cone = vectors
+            .audit_error_cone(&external, segment.alive_bitset())?
+            .unwrap();
+        assert_eq!(cone.query_count, 100);
+        assert_eq!(cone.depths.len(), 2);
+    }
     Ok(())
 }
 

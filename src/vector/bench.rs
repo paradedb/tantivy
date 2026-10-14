@@ -9,6 +9,7 @@ pub use crate::vector::router::stacked::levels::{
     ClusterId, InMemoryStore, LevelClusterer, StackedIvf, StackedIvfBuilder, StackedIvfConfig,
     StackedSearchStats, SuperKMeansLevelClusterer,
 };
+pub use crate::vector::search::prepared::VectorQuery as PreparedQuery;
 pub use crate::vector::search::scan::columns::Columns;
 pub use crate::vector::search::scan::estimate::quantization_bench_layer0_cosine_cluster;
 pub use crate::vector::search::scan::layer_read::Decoded;

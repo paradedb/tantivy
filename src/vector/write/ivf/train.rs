@@ -6,8 +6,8 @@ use std::time::Instant;
 use super::{FieldMerge, IvfBuildTimings};
 use crate::schema::VectorOptions;
 use crate::vector::clustering::{
-    decode_row_append, IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingBatch,
-    IvfTrainingVectors,
+    decode_stored_row_append, IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings,
+    IvfTrainingBatch, IvfTrainingVectors,
 };
 use crate::vector::router::{BuiltRouter, RouterKind};
 use crate::vector::write::RowAddress;
@@ -69,7 +69,7 @@ pub(super) fn train(
         let bytes =
             merge.readers[source.segment_ord as usize].vector_bytes_for_row(source.row_id)?;
         decode_buffer.clear();
-        decode_row_append::<f32>(&bytes, dim, &mut decode_buffer)?;
+        decode_stored_row_append(&bytes, opts, &mut decode_buffer)?;
         training_values[sample_idx * dim..][..dim].copy_from_slice(&decode_buffer);
     }
     debug_assert!(

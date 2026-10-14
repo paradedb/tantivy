@@ -3,6 +3,7 @@
 // What's measured:
 // - Pairwise f32:    l2_squared / dot / cosine on two f32 slices
 // - Pairwise bytes:  query is f32, doc side is LE bytes (segment shape)
+// - Stored/streamed rows: production prepared scoring, throughput counts document bytes
 //
 // Dimension sweep covers common embedding widths:
 //   128 (word2vec) / 384 (MiniLM) / 768 (BERT-base) / 1024 (e5-large)
@@ -17,11 +18,15 @@
 // Run with:  cargo bench --bench distance
 
 use std::hint::black_box;
+use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use tantivy::vector::bench::{cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes};
+use tantivy::schema::{Metric, VectorDType, VectorOptions};
+use tantivy::vector::bench::{
+    cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, PreparedQuery,
+};
 
-const DIMS: &[usize] = &[1024, 2048];
+const DIMS: &[usize] = &[384, 768, 1024, 1536, 2048];
 
 /// Guaranteed-scalar dot product. Serves as the "no SIMD at all"
 /// baseline so we can see how much the autovectorizer is buying us.
@@ -121,9 +126,70 @@ fn bench_pairwise_bytes(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_stored_rows(c: &mut Criterion) {
+    for (name, rows, dimensions) in [
+        ("stored_rows", 1, DIMS),
+        ("streamed_rows", 32768, &[1024][..]),
+    ] {
+        let mut group = c.benchmark_group(name);
+        for &dim in dimensions {
+            let input = make_f32(dim * rows, 3);
+            let query = Arc::new(make_f32(dim, 1));
+            for metric in [Metric::Dot, Metric::L2, Metric::Cosine] {
+                for dtype in [VectorDType::F32, VectorDType::F16] {
+                    let options = VectorOptions::new(dim, metric).with_dtype(dtype);
+                    let prepared =
+                        PreparedQuery::for_options(&options, Arc::clone(&query)).unwrap();
+                    let mut bytes = Vec::with_capacity(rows * options.bytes_per_vector());
+                    for row in input.chunks_exact(dim) {
+                        let inverse = if metric == Metric::Cosine {
+                            row.iter()
+                                .map(|&v| f64::from(v).powi(2))
+                                .sum::<f64>()
+                                .sqrt()
+                                .recip()
+                        } else {
+                            1.0
+                        };
+                        let mut norm = 0.0f64;
+                        for &v in row {
+                            let v = (f64::from(v) * inverse) as f32;
+                            if dtype == VectorDType::F32 {
+                                bytes.extend_from_slice(&v.to_le_bytes());
+                            } else {
+                                let bits = quant::model::f16::f32_to_f16(v);
+                                norm += f64::from(quant::model::f16::f16_to_f32(bits)).powi(2);
+                                bytes.extend_from_slice(&bits.to_le_bytes());
+                            }
+                        }
+                        if metric == Metric::Cosine && dtype == VectorDType::F16 {
+                            bytes.extend_from_slice(&(norm.sqrt().recip() as f32).to_le_bytes());
+                        }
+                    }
+                    group.throughput(Throughput::Bytes(bytes.len() as u64));
+                    group.bench_with_input(
+                        BenchmarkId::new(format!("{metric:?}_{dtype:?}"), dim),
+                        &dim,
+                        |b, _| {
+                            b.iter(|| {
+                                for row in
+                                    black_box(&bytes).chunks_exact(options.bytes_per_vector())
+                                {
+                                    black_box(prepared.score_row(row));
+                                }
+                            })
+                        },
+                    );
+                }
+            }
+        }
+        group.finish();
+    }
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(100);
-    targets = bench_pairwise_f32, bench_pairwise_bytes
+    targets = bench_pairwise_f32, bench_pairwise_bytes, bench_stored_rows
 }
 criterion_main!(benches);

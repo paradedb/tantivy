@@ -166,7 +166,7 @@ pub(crate) fn merge_ivf(
         }
 
         match opts.dtype() {
-            VectorDType::F32 => {
+            VectorDType::F32 | VectorDType::F16 => {
                 let mut timings = IvfBuildTimings::default();
                 let Some(trained) = train::train(
                     &merge,

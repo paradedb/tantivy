@@ -132,8 +132,8 @@ impl CompactDoc {
     /// Each element is encoded as little-endian bytes and stored as a
     /// bytes value on the document. The field must be declared as a
     /// [`FieldType::Vector`](crate::schema::FieldType::Vector); callers
-    /// must ensure the vector's length matches the declared `dim` and that
-    /// `T::DTYPE` matches the schema's dtype (not yet validated here).
+    /// must ensure the vector's length matches the declared `dim`.
+    /// Binary32 inputs are narrowed by the writer for F16 storage.
     pub fn add_vector<T: VectorElement>(&mut self, field: Field, value: &[T]) {
         let mut bytes = Vec::with_capacity(value.len() * T::SIZE_BYTES);
         for v in value {

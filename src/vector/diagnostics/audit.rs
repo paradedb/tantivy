@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::error::DataCorruption;
 use crate::fastfield::AliveBitSet;
 use crate::schema::Metric;
-use crate::vector::clustering::decode_row;
+use crate::vector::clustering::{decode_row, decode_stored_row};
 use crate::vector::diagnostics::{
     VectorErrorAuditMeasurements, VectorErrorConeAuditMeasurements,
     VectorErrorConeDepthMeasurements, VectorErrorDepthMeasurements, VectorEstimatorMeasurements,
@@ -305,7 +305,7 @@ impl VectorIndexReader {
         for sample in 0..target {
             let candidate = sample * candidates.len() / target;
             let (doc_id, row) = candidates[candidate];
-            let values = decode_row::<f32>(&self.vector_bytes_for_row(row)?, self.options.dim())?;
+            let values = decode_stored_row(&self.vector_bytes_for_row(row)?, &self.options)?;
             queries.push(VectorEstimatorQuery {
                 values,
                 excluded_doc_id: Some(doc_id),
@@ -401,8 +401,8 @@ impl VectorIndexReader {
         let measurement_ctx = Arc::clone(quantization.index_ctx());
         let exact_queries: Vec<VectorQuery<f32>> = queries
             .iter()
-            .map(|query| VectorQuery::new(self.options.metric(), Arc::new(query.values.clone())))
-            .collect();
+            .map(|query| VectorQuery::for_options(&self.options, Arc::new(query.values.clone())))
+            .collect::<crate::Result<_>>()?;
         let prepared_queries: Vec<QuantizedQueryCtx> = exact_queries
             .iter()
             .map(|query| QuantizedQueryCtx::new(Arc::clone(&measurement_ctx), query))
@@ -417,7 +417,7 @@ impl VectorIndexReader {
         if target_rows == 0 {
             return Ok(Some(measurements));
         }
-        let centroid_stride = self.options.bytes_per_vector();
+        let centroid_stride = self.options.dim() * std::mem::size_of::<f32>();
         let centroid_bytes = index.centroid_bytes()?;
         let mut sampled = 0usize;
         let mut live_rows_seen = 0usize;
@@ -445,7 +445,7 @@ impl VectorIndexReader {
                 next_sample_ordinal = sampled * live_row_count / target_rows;
 
                 let vector_bytes = self.vector_bytes_for_row(row)?;
-                let values = decode_row::<f32>(&vector_bytes, self.options.dim())?;
+                let values = decode_stored_row(&vector_bytes, &self.options)?;
                 let residual: Vec<f32> = values
                     .iter()
                     .zip(&centroid)
@@ -678,7 +678,7 @@ impl VectorIndexReader {
         let mut stored_scales = vec![vec![f32::NAN; row_count]; layer_count];
         let mut corrected_error_ratios = vec![vec![f32::NAN; row_count]; layer_count];
         let mut residual_norms_squared = vec![f32::NAN; row_count];
-        let centroid_stride = self.options.bytes_per_vector();
+        let centroid_stride = self.options.dim() * std::mem::size_of::<f32>();
         let centroid_bytes = index.centroid_bytes()?;
 
         let mut docs = Vec::new();
@@ -721,7 +721,10 @@ impl VectorIndexReader {
                 .collect(),
         };
         for query_input in queries {
-            let exact_query = VectorQuery::<f32>::new(metric, Arc::new(query_input.values.clone()));
+            let exact_query = VectorQuery::<f32>::for_options(
+                &self.options,
+                Arc::new(query_input.values.clone()),
+            )?;
             let query = QuantizedQueryCtx::new(Arc::clone(&measurement_ctx), &exact_query);
             let mut cluster_scores = Vec::with_capacity(index.num_clusters());
             let mut cluster_query_norms = Vec::with_capacity(index.num_clusters());
