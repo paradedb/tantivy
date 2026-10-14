@@ -27,6 +27,8 @@ pub struct LayerProbeStats {
     survivors: usize,
     sparse_clusters: usize,
     full_clusters: usize,
+    exact_clusters: usize,
+    exact_rows: usize,
 }
 
 impl LayerProbeStats {
@@ -58,6 +60,16 @@ impl LayerProbeStats {
     /// Clusters read as a whole band at this layer.
     pub fn full_clusters(&self) -> usize {
         self.full_clusters
+    }
+
+    /// Clusters scored exactly, and finished, at this layer.
+    pub fn exact_clusters(&self) -> usize {
+        self.exact_clusters
+    }
+
+    /// Rows scored exactly, and finished, at this layer.
+    pub fn exact_rows(&self) -> usize {
+        self.exact_rows
     }
 }
 
@@ -92,6 +104,11 @@ impl serde::Serialize for LayerProbeStatsSet {
                 &layer.sparse_clusters,
             )?;
             map.serialize_entry(&format!("layer{index}_full_clusters"), &layer.full_clusters)?;
+            map.serialize_entry(
+                &format!("layer{index}_exact_clusters"),
+                &layer.exact_clusters,
+            )?;
+            map.serialize_entry(&format!("layer{index}_exact_rows"), &layer.exact_rows)?;
             map.serialize_entry(&format!("boundary{index}_ns"), &layer.boundary_ns)?;
         }
         map.end()
@@ -235,6 +252,8 @@ impl ProbeStats {
                         survivors: report.survivors,
                         sparse_clusters: report.sparse_clusters,
                         full_clusters: report.full_clusters,
+                        exact_clusters: report.exact_clusters,
+                        exact_rows: report.exact_rows,
                         ..LayerProbeStats::default()
                     })
                     .collect(),
@@ -454,6 +473,8 @@ mod tests {
                 "survivors",
                 "sparse_clusters",
                 "full_clusters",
+                "exact_clusters",
+                "exact_rows",
             ] {
                 keys.insert(format!("layer{layer}_{suffix}"));
             }

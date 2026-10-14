@@ -170,6 +170,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let config = ScanConfig {
             top_n,
             capacity: plan.capacity_hint(),
+            exact_plan: self.adaptive.exact_plan,
             #[cfg(test)]
             plan_override: self.plan_override,
         };
