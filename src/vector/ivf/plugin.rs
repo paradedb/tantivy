@@ -1408,7 +1408,7 @@ mod tests {
         context: &str,
         actual: &[(crate::Score, crate::DocAddress)],
         expected: &[(crate::Score, crate::DocAddress)],
-        stats: &crate::vector::backend::ProbeStats,
+        stats: &crate::vector::stats::ProbeStats,
     ) {
         if actual == expected {
             return;

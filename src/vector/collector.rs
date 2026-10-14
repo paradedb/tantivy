@@ -23,11 +23,12 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use super::backend::{ProbeStats, VectorBackend};
+use super::backend::VectorBackend;
 use super::index_reader::QuantizedFieldReader;
 use super::ivf::AdaptiveProbeParams;
 use super::metadata::VectorColMetadata;
 use super::prepared::{QuantizedQueryCtx, VectorQuery};
+use super::stats::ProbeStats;
 use super::tie_break::NoTieBreak;
 use super::{enter_vector_stage, Stage, VectorElement};
 use crate::collector::sort_key::NaturalComparator;

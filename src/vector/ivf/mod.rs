@@ -2,6 +2,8 @@
 
 mod aps;
 pub(crate) mod bkt;
+#[cfg(test)]
+mod build_tests;
 pub(crate) mod graph;
 mod index;
 mod ivf;
