@@ -14,6 +14,9 @@ pub(crate) struct LayerCosts {
     pub(crate) sparse: Option<ReadCost>,
     /// The whole band.
     pub(crate) band: ReadCost,
+    /// The centroid row either quantized read needs first: non-zero only for rows without a
+    /// centroid score, with the exact plan on.
+    pub(crate) centroid: ReadCost,
 }
 
 impl LayerCosts {
@@ -75,12 +78,14 @@ impl PlanOverride {
     }
 }
 
-/// Exact only when strictly cheaper than the cheaper quantized read, so ties stay quantized; then
-/// sparse only when strictly cheaper than the band, so a tie reads the band in one request.
+/// Exact only when strictly cheaper than the cheaper quantized read with its centroid row, so
+/// ties stay quantized; then sparse only when strictly cheaper than the band, so a tie reads the
+/// band in one request.
 pub(crate) fn plan(costs: &ReadCosts) -> Read {
+    let layer = &costs.layer;
     if costs
         .exact
-        .is_some_and(|exact| exact < costs.layer.cheapest())
+        .is_some_and(|exact| exact < layer.cheapest() + layer.centroid)
     {
         return Read::Exact;
     }
@@ -119,6 +124,10 @@ pub(crate) fn price(
     selected: &ClusterRows<'_>,
     scratch: &mut ReadScratch,
 ) -> crate::Result<ReadCosts> {
+    let centroid = match (exact, selected.centroid) {
+        (Some(reader), None) => reader.centroid_cost(selected.cluster)?,
+        _ => ReadCost(0),
+    };
     let exact = exact
         .map(|reader| reader.exact_cost(selected.cluster, selected.offsets))
         .transpose()?;
@@ -129,7 +138,11 @@ pub(crate) fn price(
         .transpose()?;
     Ok(ReadCosts {
         exact,
-        layer: LayerCosts { sparse, band },
+        layer: LayerCosts {
+            sparse,
+            band,
+            centroid,
+        },
     })
 }
 
@@ -145,6 +158,7 @@ mod tests {
             layer: LayerCosts {
                 sparse: sparse.map(ReadCost),
                 band: ReadCost(band),
+                centroid: ReadCost(0),
             },
         }
     }
@@ -273,6 +287,7 @@ mod tests {
                         layer: LayerCosts {
                             sparse,
                             band: band_cost,
+                            centroid: ReadCost(0),
                         },
                     })
                 };

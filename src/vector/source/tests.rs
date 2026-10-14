@@ -32,7 +32,9 @@ struct Walk {
 /// `feedback(rows)` is what the scan reports after `rows` admitted rows.
 fn walk(seg: &SegmentRun<'_>, feedback: impl Fn(usize) -> Feedback) -> crate::Result<Walk> {
     let plan = seg.plan()?.expect("a plan");
-    let Source::Router(filter) = plan.source;
+    let Source::Router(filter) = plan.source else {
+        panic!("the router source walks router plans");
+    };
     let mut workspace = RouterWorkspace::default();
     let mut source = RouterClusters::new(
         seg.searcher.reader(),
@@ -605,7 +607,9 @@ fn gate_bookkeeping() -> crate::Result<()> {
         };
         for (run, open) in [(seg, true), (&gated, false)] {
             let plan = run.plan()?.expect("a plan");
-            let Source::Router(filter) = plan.source;
+            let Source::Router(filter) = plan.source else {
+                panic!("the router source walks router plans");
+            };
             let mut workspace = RouterWorkspace::default();
             let mut source = RouterClusters::new(
                 run.searcher.reader(),

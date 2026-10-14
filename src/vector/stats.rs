@@ -7,6 +7,7 @@ use crate::vector::scan::ScanReport;
 use crate::vector::scan::ScanTrace;
 use crate::vector::segment::plan::PlanReport;
 use crate::vector::source::controller::ProbeTermination;
+use crate::vector::source::matches::MatchReport;
 use crate::vector::source::router::RouterReport;
 use crate::vector::source::SourceReport;
 use crate::vector::telemetry::StageTotals;
@@ -138,6 +139,26 @@ where S: serde::Serializer {
     serialize_io(io, "exact", serializer)
 }
 
+fn serialize_locate_io<S>(io: &VectorIoStats, serializer: S) -> Result<S::Ok, S::Error>
+where S: serde::Serializer {
+    serialize_io(io, "locate", serializer)
+}
+
+fn serialize_centroid_io<S>(io: &VectorIoStats, serializer: S) -> Result<S::Ok, S::Error>
+where S: serde::Serializer {
+    serialize_io(io, "centroid", serializer)
+}
+
+/// Where a segment's layer-0 clusters came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, serde::Serialize)]
+pub enum AccessPath {
+    /// The router's ranking, gated by the filter bitset.
+    #[default]
+    Routed,
+    /// The filter's own matches, located through the document location map.
+    Located,
+}
+
 // --- Probe stats ---
 
 /// One segment's vector search statistics. Counters sum across segments; `termination` and the
@@ -153,6 +174,24 @@ pub struct ProbeStats {
     /// Reads for exact scoring: full-precision rows and the DocIds they need.
     #[serde(flatten, serialize_with = "serialize_exact_io")]
     pub exact_io: VectorIoStats,
+    /// Where this segment's layer-0 clusters came from.
+    pub access_path: AccessPath,
+    /// Live filter matches with a vector, on the located path.
+    pub located_matches: usize,
+    /// Live filter matches without a vector, on the located path.
+    pub located_absent: usize,
+    /// Clusters holding a located match.
+    pub located_clusters: usize,
+    /// Nanoseconds locating filter matches through the location map.
+    pub locate_ns: u64,
+    /// Reads of the location map.
+    #[serde(flatten, serialize_with = "serialize_locate_io")]
+    pub locate_io: VectorIoStats,
+    /// Nanoseconds reading centroid rows for clusters with an unknown centroid score.
+    pub centroid_ns: u64,
+    /// Reads of centroid rows, one per row.
+    #[serde(flatten, serialize_with = "serialize_centroid_io")]
+    pub centroid_io: VectorIoStats,
     /// Per-layer counters of a quantized scan.
     #[serde(flatten)]
     pub layers: LayerProbeStatsSet,
@@ -268,8 +307,13 @@ impl ProbeStats {
         };
         match source {
             SourceReport::Router(routed) => stats.record_routed(routed),
+            SourceReport::Matches(matches) => stats.record_matches(matches),
         }
         stats.record_io(&totals);
+        debug_assert_eq!(
+            stats.centroid_io.reads, scan.centroid_reads as u64,
+            "one read per centroid row"
+        );
         stats.apply_timings(&totals);
         stats
     }
@@ -334,6 +378,18 @@ impl ProbeStats {
         self.recall_estimate = probe.recall_estimate;
     }
 
+    fn record_matches(&mut self, report: MatchReport) {
+        self.access_path = AccessPath::Located;
+        self.located_matches = report.matches;
+        self.located_absent = report.absent;
+        self.located_clusters = report.clusters;
+        self.vectors_visited = report.matches + report.dead;
+        self.pruned_dead = report.dead;
+        self.postings_row = report.clusters;
+        self.work_charged = report.work_charged;
+        self.work_budget = report.work_budget;
+    }
+
     fn record_io(&mut self, totals: &StageTotals) {
         let (fetch, score) = (totals.io(Stage::ExactFetch), totals.io(Stage::ExactScore));
         self.exact_io = VectorIoStats {
@@ -341,6 +397,8 @@ impl ProbeStats {
             bytes_read: fetch.bytes_read + score.bytes_read,
             storage_blocks: fetch.storage_blocks + score.storage_blocks,
         };
+        self.locate_io = totals.io(Stage::Locate);
+        self.centroid_io = totals.io(Stage::Centroid);
     }
 
     /// Sets every timing field from `totals`; optional timings stay absent when unset.
@@ -349,6 +407,8 @@ impl ProbeStats {
         self.non_vector_search_ns = totals.time_ns(Stage::NonVectorSearch);
         self.query_prep_ns = totals.time_ns(Stage::QueryPrep);
         self.routing_ns = totals.time_ns(Stage::Routing);
+        self.locate_ns = totals.time_ns(Stage::Locate);
+        self.centroid_ns = totals.time_ns(Stage::Centroid);
         self.exact_fetch_ns = totals.time_ns(Stage::ExactFetch);
         self.exact_score_ns = totals.time_ns(Stage::ExactScore);
         if let Some(exact_scan_ns) = self.exact_scan_ns.as_mut() {
@@ -428,6 +488,18 @@ mod tests {
         "exact_reads",
         "exact_bytes_read",
         "exact_storage_blocks",
+        "access_path",
+        "located_matches",
+        "located_absent",
+        "located_clusters",
+        "locate_ns",
+        "locate_reads",
+        "locate_bytes_read",
+        "locate_storage_blocks",
+        "centroid_ns",
+        "centroid_reads",
+        "centroid_bytes_read",
+        "centroid_storage_blocks",
         "exact_rows",
         "scan_init_ns",
         "non_vector_search_ns",

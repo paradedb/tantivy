@@ -32,6 +32,10 @@ pub enum Stage {
     ExactFetch,
     /// Exact scoring into the bound and the result heap.
     ExactScore,
+    /// Locating filter matches through the document location map.
+    Locate,
+    /// Reading centroid rows for clusters whose centroid score is unknown.
+    Centroid,
     /// Result assembly.
     ResultAssembly,
 }
@@ -50,6 +54,8 @@ impl Stage {
             Self::ExactScan => Some(Cow::Borrowed("exact_scan")),
             Self::ExactFetch => Some(Cow::Borrowed("exact_fetch")),
             Self::ExactScore => Some(Cow::Borrowed("exact_score")),
+            Self::Locate => Some(Cow::Borrowed("locate")),
+            Self::Centroid => Some(Cow::Borrowed("centroid")),
             Self::ResultAssembly => Some(Cow::Borrowed("result_assembly")),
         }
     }
@@ -57,7 +63,7 @@ impl Stage {
 
 // --- Totals ---
 
-const FIXED_SLOTS: usize = 9;
+const FIXED_SLOTS: usize = 11;
 const STAGE_SLOTS: usize = FIXED_SLOTS + 2 * MAX_QUANTIZATION_LAYERS;
 const FALLBACK_LAYERS: usize = 3;
 
@@ -81,6 +87,8 @@ fn slot(stage: Stage) -> usize {
         Stage::ExactFetch => 6,
         Stage::ExactScore => 7,
         Stage::ResultAssembly => 8,
+        Stage::Locate => 9,
+        Stage::Centroid => 10,
         Stage::LayerScan(l) => layer(FIXED_SLOTS, l),
         Stage::Boundary(l) => layer(FIXED_SLOTS + MAX_QUANTIZATION_LAYERS, l),
     }
@@ -212,6 +220,8 @@ mod tests {
         assert_eq!(Stage::ExactScan.name().as_deref(), Some("exact_scan"));
         assert_eq!(Stage::ExactFetch.name().as_deref(), Some("exact_fetch"));
         assert_eq!(Stage::ExactScore.name().as_deref(), Some("exact_score"));
+        assert_eq!(Stage::Locate.name().as_deref(), Some("locate"));
+        assert_eq!(Stage::Centroid.name().as_deref(), Some("centroid"));
         assert_eq!(
             Stage::ResultAssembly.name().as_deref(),
             Some("result_assembly")

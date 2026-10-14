@@ -90,6 +90,37 @@ pub struct AdaptiveProbeParams {
     /// reads strictly fewer storage blocks (bytes without block geometry) than the cheaper
     /// quantized read. Exact rows join the pruning bound as zero-width intervals. Default `false`.
     pub exact_plan: bool,
+    /// Which segments locate their filter's matches through the document location map instead
+    /// of routing; unfiltered queries always route. Default [`LocatedPath::Off`].
+    pub located: LocatedPath,
+}
+
+/// Which segments take the located path: a segment whose filter matches at most a cap of
+/// documents, deleted ones included, skips routing and scores every match, located through the
+/// document location map.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum LocatedPath {
+    /// Every segment routes.
+    #[default]
+    Off,
+    /// The cap is `floor(selectivity * max_doc)`.
+    MaxSelectivity(Selectivity),
+}
+
+/// A fraction in `(0, 1]`.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct Selectivity(f32);
+
+impl Selectivity {
+    /// `value` as a selectivity, or `None` outside `(0, 1]`.
+    pub fn new(value: f32) -> Option<Self> {
+        (value > 0.0 && value <= 1.0).then_some(Self(value))
+    }
+
+    /// The fraction.
+    pub fn get(self) -> f32 {
+        self.0
+    }
 }
 
 impl Default for AdaptiveProbeParams {
@@ -101,6 +132,7 @@ impl Default for AdaptiveProbeParams {
             router_recall_target: DEFAULT_ROUTER_RECALL,
             recall_target: 1.0,
             exact_plan: false,
+            located: LocatedPath::Off,
         }
     }
 }

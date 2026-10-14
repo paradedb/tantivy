@@ -85,6 +85,8 @@ pub(crate) struct ScanReport {
     pub(crate) layers: Vec<LayerReport>,
     /// Rows scored at full precision.
     pub(crate) exact_rows: usize,
+    /// Centroid rows read for shortlisted clusters without a centroid score.
+    pub(crate) centroid_reads: usize,
     #[cfg(test)]
     pub(crate) trace: ScanTrace,
 }
@@ -118,6 +120,8 @@ struct AdmittedCluster {
 struct QuantizedState<'a> {
     /// The active layers, in scan order.
     layers: Vec<LayerSpec<'a>>,
+    /// The widened query: what the router scores centroids with.
+    widened: &'a [f32],
     metric: Metric,
     dimension: usize,
     candidates: QuantizedCandidates,
@@ -128,6 +132,9 @@ struct QuantizedState<'a> {
     cluster_columns: Columns,
     /// The reader exact reads are priced through; `None` with the exact plan off.
     exact: Option<&'a VectorIndexReader>,
+    index: &'a IvfIndex,
+    /// Centroid rows read for clusters without a centroid score.
+    centroid_reads: usize,
     #[cfg(test)]
     plan_override: Option<PlanOverride>,
 }
@@ -135,8 +142,10 @@ struct QuantizedState<'a> {
 impl<'a> QuantizedState<'a> {
     fn new(
         query: &'a QuantizedQueryCtx,
+        widened: &'a [f32],
         field: &'a QuantizedFieldReader,
         reader: &'a VectorIndexReader,
+        index: &'a IvfIndex,
         config: &ScanConfig,
     ) -> Self {
         let meta = query.index.meta.field();
@@ -149,6 +158,7 @@ impl<'a> QuantizedState<'a> {
                     query_error_squared: query.query_error_squared(index) as f32,
                 })
                 .collect(),
+            widened,
             metric: meta.metric,
             dimension: meta.dim as usize,
             candidates: QuantizedCandidates::with_capacity(config.capacity),
@@ -156,6 +166,8 @@ impl<'a> QuantizedState<'a> {
             decoded: Decoded::default(),
             cluster_columns: Columns::default(),
             exact: config.exact_plan.then_some(reader),
+            index,
+            centroid_reads: 0,
             #[cfg(test)]
             plan_override: config.plan_override,
         }
@@ -200,17 +212,18 @@ impl<'a> QuantizedState<'a> {
     }
 
     /// Reads `layer` for the rows of `selected` as `read` plans and decodes them; returns how to
-    /// combine the decoded columns into estimates.
+    /// combine the decoded columns into estimates around `centroid`, the query's centroid score.
     fn decode(
         &mut self,
         layer: usize,
         selected: &ClusterRows<'_>,
+        centroid: Similarity,
         read: LayerRead,
         scratch: &mut ReadScratch,
     ) -> crate::Result<CombineCtx> {
         let spec = self.layers[layer];
         decode_layer(&spec, selected, read, &mut self.decoded, scratch)?;
-        let cluster_score = selected.centroid.score();
+        let cluster_score = centroid.score();
         let query_norm = spec.query.score_query_norm(cluster_score);
         Ok(CombineCtx {
             metric: self.metric,
@@ -229,12 +242,16 @@ impl<'a> QuantizedState<'a> {
         bound: &mut KthBound,
         scratch: &mut ReadScratch,
     ) -> crate::Result<()> {
-        let ctx = self.decode(0, rows, read, scratch)?;
+        let centroid = match rows.centroid {
+            Some(centroid) => centroid,
+            None => self.read_centroid(rows.cluster)?,
+        };
+        let ctx = self.decode(0, rows, centroid, read, scratch)?;
         combine_initial(&ctx, &self.decoded, &mut self.cluster_columns);
         self.record(
             rows.cluster,
             AdmittedCluster {
-                centroid: rows.centroid,
+                centroid,
                 docs_in_candidates: rows.docs.is_some(),
             },
         );
@@ -259,9 +276,21 @@ impl<'a> QuantizedState<'a> {
         at: Range<usize>,
         scratch: &mut ReadScratch,
     ) -> crate::Result<()> {
-        let ctx = self.decode(layer, group, read, scratch)?;
+        let centroid = group
+            .centroid
+            .expect("a survivor group carries its cluster's centroid score");
+        let ctx = self.decode(layer, group, centroid, read, scratch)?;
         combine_refine(&ctx, &self.decoded, &mut self.candidates.columns, at);
         Ok(())
+    }
+
+    /// The query's similarity to `cluster`'s centroid, from its stored row, scored as the router
+    /// scores it.
+    fn read_centroid(&mut self, cluster: usize) -> crate::Result<Similarity> {
+        let _centroid = enter_vector_stage(Stage::Centroid);
+        let row = self.index.centroid_row(cluster)?;
+        self.centroid_reads += 1;
+        Ok(self.metric.similarity_bytes::<f32>(self.widened, &row))
     }
 
     /// Records the candidates `layer` scored and prunes them at its boundary.
@@ -358,9 +387,14 @@ where
         tie_comparator: C,
     ) -> crate::Result<Self> {
         let quantized = match (query.quantized, reader.quantization()) {
-            (Some(quantized), Some(field)) => {
-                Some(QuantizedState::new(quantized, field, reader, &config))
-            }
+            (Some(quantized), Some(field)) => Some(QuantizedState::new(
+                quantized,
+                query.query.widened(),
+                field,
+                reader,
+                index,
+                &config,
+            )),
             (Some(_), None) => {
                 return Err(DataCorruption::comment_only(
                     "quantized query requires quantized slots",
@@ -491,7 +525,7 @@ where
                 rows,
                 offsets: Some(&self.group_offsets),
                 docs: None,
-                centroid: admitted.centroid,
+                centroid: Some(admitted.centroid),
             };
             let read = state.read_plan(&group, layer, &mut self.scratch)?;
             self.report.layers[layer].count(read, at.len());
@@ -538,7 +572,7 @@ where
                 docs: admitted
                     .docs_in_candidates
                     .then(|| &state.candidates.docs[at]),
-                centroid: admitted.centroid,
+                centroid: Some(admitted.centroid),
             };
             self.report.exact_rows += self.exact.score_survivors(&group)?;
         }
@@ -551,13 +585,19 @@ where
         segment_ord: SegmentOrdinal,
     ) -> crate::Result<(TieBreakHits<K>, ScanReport)> {
         let _assembly = enter_vector_stage(Stage::ResultAssembly);
-        let Self { exact, report, .. } = self;
+        let Self {
+            exact,
+            quantized,
+            mut report,
+            ..
+        } = self;
+        if let Some(state) = &quantized {
+            report.centroid_reads = state.centroid_reads;
+        }
         #[cfg(test)]
-        let report = {
-            let mut report = report;
+        {
             report.trace.exact_phase_rows = exact.exact_phase_rows.clone();
-            report
-        };
+        }
         Ok((exact.into_hits(segment_ord), report))
     }
 }
