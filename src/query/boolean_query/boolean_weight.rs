@@ -16,8 +16,8 @@ use crate::query::term_query::TermScorer;
 use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
 use crate::query::{
     intersect_scorers as intersect_scored_scorers, AllScorer, BufferedUnionScorer,
-    DisjunctionPruning, EmptyScorer, Exclude, Explanation, Occur, RequiredOptionalScorer, Scorer,
-    Weight,
+    DisjunctionPruning, EmptyScorer, Exclude, ExcludedDocSet, Explanation, Occur,
+    RequiredOptionalScorer, Scorer, Weight,
 };
 use crate::{DocId, Score, TERMINATED};
 
@@ -373,7 +373,8 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         // Indicate how should clauses are combined with must clauses.
         let mut must_scorers: Vec<Box<dyn Scorer>> =
             per_occur_scorers.remove(&Occur::Must).unwrap_or_default();
-        let must_special_scorer_counts = remove_and_count_all_and_empty_scorers(&mut must_scorers);
+        let must_special_scorer_counts =
+            remove_and_count_all_and_empty_scorers(&mut must_scorers, self.scoring_enabled);
 
         if must_special_scorer_counts.num_empty_scorers > 0 {
             return Ok(SpecializedScorer::Other(Box::new(EmptyScorer)));
@@ -381,13 +382,15 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
 
         let mut should_scorers = per_occur_scorers.remove(&Occur::Should).unwrap_or_default();
         let should_special_scorer_counts =
-            remove_and_count_all_and_empty_scorers(&mut should_scorers);
+            remove_and_count_all_and_empty_scorers(&mut should_scorers, self.scoring_enabled);
 
         let mut exclude_scorers: Vec<Box<dyn Scorer>> = per_occur_scorers
             .remove(&Occur::MustNot)
             .unwrap_or_default();
+        // A MUST_NOT clause never contributes to the score, so its `AllScorer` is
+        // always dropped and counted; the check below then empties the result.
         let exclude_special_scorer_counts =
-            remove_and_count_all_and_empty_scorers(&mut exclude_scorers);
+            remove_and_count_all_and_empty_scorers(&mut exclude_scorers, false);
 
         if exclude_special_scorer_counts.num_all_scorers > 0 {
             // We exclude all documents at one point.
@@ -635,11 +638,21 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
             let exclude_scorer = exclude_scorers.pop().unwrap();
             match exclude_scorer.downcast::<TermScorer>() {
                 // Cast to TermScorer succeeded
-                Ok(exclude_scorer) => Box::new(Exclude::new(include_scorer_boxed, *exclude_scorer)),
+                Ok(exclude_scorer) => Box::new(Exclude::new(
+                    include_scorer_boxed,
+                    ExcludedDocSet::new(*exclude_scorer),
+                )),
                 // We get back the original Box<dyn Scorer>
-                Err(exclude_scorer) => Box::new(Exclude::new(include_scorer_boxed, exclude_scorer)),
+                Err(exclude_scorer) => Box::new(Exclude::new(
+                    include_scorer_boxed,
+                    ExcludedDocSet::new(exclude_scorer),
+                )),
             }
         } else {
+            let exclude_scorers: Vec<_> = exclude_scorers
+                .into_iter()
+                .map(ExcludedDocSet::new)
+                .collect();
             Box::new(Exclude::new(include_scorer_boxed, exclude_scorers))
         };
         Ok(SpecializedScorer::Other(scorer))
@@ -652,12 +665,16 @@ struct AllAndEmptyScorerCounts {
     num_empty_scorers: usize,
 }
 
+/// Removes `EmptyScorer`s, and `AllScorer`s unless `scoring_enabled`: an
+/// `AllScorer` scores 1.0 per document, so it only drops out when scores are
+/// not needed.
 fn remove_and_count_all_and_empty_scorers(
     scorers: &mut Vec<Box<dyn Scorer>>,
+    scoring_enabled: bool,
 ) -> AllAndEmptyScorerCounts {
     let mut counts = AllAndEmptyScorerCounts::default();
     scorers.retain(|scorer| {
-        if scorer.is::<AllScorer>() {
+        if !scoring_enabled && scorer.is::<AllScorer>() {
             counts.num_all_scorers += 1;
             false
         } else if scorer.is::<EmptyScorer>() {
