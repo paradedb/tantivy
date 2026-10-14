@@ -649,10 +649,8 @@ fn filtered_clusters_read_doc_ids_before_payload() -> crate::Result<()> {
     Ok(())
 }
 
-/// With no filter and no deletes, layer scans never touch a DocIds column; the exact phase reads
-/// it once for each cluster with a survivor, and each layer's IO counts its own requests. The
-/// scan is the same as under a filter that matches every vector.
-fn open_gate_reads_doc_ids_only_in_the_exact_phase() -> crate::Result<()> {
+/// With no filter and no deletes, DocIds are read only for competitive exact scores.
+fn open_gate_reads_doc_ids_only_for_competitive_survivors() -> crate::Result<()> {
     let fixture = reads_fixture(Metric::L2, &[1, 4], &[])?;
     let ranges = fixture.column_ranges()?;
     let query = reads_vector(42);
@@ -679,15 +677,31 @@ fn open_gate_reads_doc_ids_only_in_the_exact_phase() -> crate::Result<()> {
             .iter()
             .filter(|(stage, read)| *stage == VectorStage::ExactFetch && read == range)
             .count();
-        assert_eq!(
-            fetched, expected,
+        assert!(
+            fetched <= expected,
             "cluster={cluster} DocIds exact-phase reads"
         );
+        if open
+            .results
+            .iter()
+            .any(|(_, address)| docs.contains(&address.doc_id))
+        {
+            assert_eq!(fetched, 1, "cluster={cluster} winner DocIds");
+        }
         assert_eq!(
             log.iter().filter(|(_, read)| read == range).count(),
-            expected,
+            fetched,
             "cluster={cluster} DocIds reads outside the exact phase"
         );
+        if let Some(position) = log.iter().position(|(_, read)| read == range) {
+            let rows = ranges.rows[cluster].as_ref().unwrap();
+            assert!(
+                log[..position].iter().any(|(stage, read)| {
+                    *stage == VectorStage::ExactFetch && overlaps(read, rows)
+                }),
+                "cluster={cluster} DocIds read before its vectors"
+            );
+        }
     }
     for layer in 0..2 {
         let requested = stage_reads(&log, |stage| stage == VectorStage::LayerScan(layer as u8));
@@ -1125,8 +1139,8 @@ fn reads_follow_the_plan() -> crate::Result<()> {
             filtered_clusters_read_doc_ids_before_payload,
         ),
         (
-            "an open gate reads DocIds only in the exact phase",
-            open_gate_reads_doc_ids_only_in_the_exact_phase,
+            "an open gate reads DocIds only for competitive survivors",
+            open_gate_reads_doc_ids_only_for_competitive_survivors,
         ),
         (
             "an all-dead cluster reads nothing past DocIds",

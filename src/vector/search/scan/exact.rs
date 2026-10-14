@@ -76,12 +76,11 @@ where
         selected: &ClusterRows<'_>,
         scratch: &mut ReadScratch,
     ) -> crate::Result<usize> {
-        self.score_rows(selected, scratch, false)
+        self.score_rows(selected, scratch)
     }
 
     /// Scores the exact phase's survivors in `selected`, reading through `scratch`; returns the
-    /// rows scored. Without doc ids in hand, the cluster's DocIds column is read up front with the
-    /// rows.
+    /// rows scored.
     pub(super) fn score_survivors(
         &mut self,
         selected: &ClusterRows<'_>,
@@ -89,25 +88,18 @@ where
     ) -> crate::Result<usize> {
         #[cfg(test)]
         self.exact_phase_rows.extend(selected.global_rows());
-        self.score_rows(selected, scratch, selected.docs.is_none())
+        self.score(selected, scratch)
     }
 
-    /// Reads `selected`'s rows in `ExactFetch`, with the DocIds column first when `docs_first`, and
-    /// scores them in `ExactScore`.
+    /// Reads `selected`'s rows in `ExactFetch` and scores them in `ExactScore`.
     fn score_rows(
         &mut self,
         selected: &ClusterRows<'_>,
         scratch: &mut ReadScratch,
-        docs_first: bool,
     ) -> crate::Result<usize> {
         let mut column_read = false;
         let rows = {
             let _fetch = enter_vector_stage(VectorStage::ExactFetch);
-            if docs_first {
-                self.reader
-                    .read_doc_ids(selected.cluster, &mut self.cluster_docs)?;
-                column_read = true;
-            }
             self.read(selected, scratch)?
         };
         let _score = enter_vector_stage(VectorStage::ExactScore);
@@ -168,6 +160,7 @@ where
             Some(docs) => docs[position],
             None => {
                 if !*column_read {
+                    let _fetch = enter_vector_stage(VectorStage::ExactFetch);
                     self.reader
                         .read_doc_ids(selected.cluster, &mut self.cluster_docs)?;
                     *column_read = true;
@@ -212,5 +205,76 @@ where
                 )
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::query::AllQuery;
+    use crate::schema::Metric;
+    use crate::vector::telemetry::measure;
+    use crate::vector::test_support::FixtureSpec;
+    use crate::vector::tie_break::NoTieBreak;
+
+    #[test]
+    fn survivors_skip_doc_ids_for_losing_clusters_and_keep_ties() -> crate::Result<()> {
+        let centroids = vec![vec![-1.0, 0.0], vec![0.0, 10.0], vec![1.0, 0.0]];
+        let fixture = FixtureSpec::ivf(
+            Metric::L2,
+            centroids.clone(),
+            centroids.into_iter().cycle().take(6).collect(),
+        )
+        .paged()
+        .build()?;
+        let ranges = fixture.column_ranges()?;
+        let docs = fixture.cluster_docs(0)?;
+        let searcher = fixture.index.reader()?.searcher();
+        let reader = searcher.segment_readers()[0].vector_index(fixture.field)?;
+        let index = reader.index().unwrap();
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.0_f32, 0.0]));
+        let expected = fixture.oracle(&AllQuery, &[0.0, 0.0], 1)?;
+        for known_docs in [false, true] {
+            let mut tie_break = NoTieBreak;
+            let mut scorer =
+                ExactScorer::new(&reader, &query, 1, &mut tie_break, NaturalComparator);
+            let mut scratch = ReadScratch::default();
+            for cluster in [2, 1, 0] {
+                let rows = index.cluster_range(cluster);
+                let offsets: Vec<u32> = (0..rows.len() as u32).collect();
+                let selected = ClusterRows {
+                    cluster,
+                    rows,
+                    offsets: Some(&offsets),
+                    docs: known_docs.then_some(docs[cluster].as_slice()),
+                    centroid: None,
+                };
+                fixture.clear_reads();
+                let (scored, totals) = measure(|| scorer.score_survivors(&selected, &mut scratch));
+                assert_eq!(scored?, 2);
+                let log = fixture.reads();
+                let doc_range = ranges.docs[cluster].as_ref().unwrap();
+                assert_eq!(
+                    log.iter().filter(|(_, range)| range == doc_range).count(),
+                    usize::from(!known_docs && cluster != 1),
+                    "cluster={cluster} known_docs={known_docs}"
+                );
+                assert!(log
+                    .iter()
+                    .all(|(stage, _)| *stage == VectorStage::ExactFetch));
+                assert_ne!(&log[0].1, doc_range, "read vectors before doc IDs");
+                assert_eq!(totals.io(VectorStage::ExactFetch).reads, log.len() as u64);
+                assert_eq!(totals.io(VectorStage::ExactScore).reads, 0);
+            }
+            let hits: Vec<_> = scorer
+                .into_hits(0)
+                .into_iter()
+                .map(|((score, ()), address)| (score, address))
+                .collect();
+            assert_eq!(hits, expected);
+        }
+        Ok(())
     }
 }
