@@ -1263,14 +1263,15 @@ mod tests {
             Some((Arc::clone(&reads), 16)),
         );
         reads.lock().unwrap().clear();
-        crate::vector::telemetry::take_stage_totals();
-        let stage =
-            crate::vector::telemetry::enter_vector_stage(crate::vector::VectorStage::LayerScan(0));
-        let batch = reader.read_batch(0..8)?;
-        drop(stage);
+        let (batch, totals) = crate::vector::telemetry::measure(|| {
+            let _stage = crate::vector::telemetry::enter_vector_stage(
+                crate::vector::VectorStage::LayerScan(0),
+            );
+            reader.read_batch(0..8)
+        });
+        let batch = batch?;
         assert_eq!(reads.lock().unwrap().len(), 1);
-        let io = crate::vector::telemetry::take_stage_totals()
-            .io(crate::vector::VectorStage::LayerScan(0));
+        let io = totals.io(crate::vector::VectorStage::LayerScan(0));
         let range = reads.lock().unwrap()[0].clone();
         assert_eq!(io.reads, 1);
         assert_eq!(io.bytes_read, range.len() as u64);
@@ -1325,7 +1326,7 @@ mod tests {
         use crate::vector::storage::blocks::{
             block_len, column_range, write_metadata, BlockDirectory,
         };
-        use crate::vector::telemetry::{enter_vector_stage, take_stage_totals};
+        use crate::vector::telemetry::{enter_vector_stage, measure};
         use crate::vector::{VectorQuantizationLayer, VectorStage};
         for metric in [Metric::Cosine, Metric::Dot, Metric::L2] {
             let opts = VectorOptions::new(1024, metric);
@@ -1429,15 +1430,20 @@ mod tests {
                                 &mut Vec::new(),
                             );
                             assert_eq!(ranges, expected);
-                            let stage = enter_vector_stage(VectorStage::LayerScan(1));
-                            take_stage_totals();
-                            for rows in ranges.iter().cloned() {
-                                cluster.read_codes(rows)?;
-                            }
-                            let code_io = take_stage_totals().io(VectorStage::LayerScan(1));
-                            let sidecar = cluster.read_sidecar()?;
-                            let sidecar_io = take_stage_totals().io(VectorStage::LayerScan(1));
-                            drop(stage);
+                            let (codes, code_totals) = measure(|| {
+                                let _stage = enter_vector_stage(VectorStage::LayerScan(1));
+                                ranges
+                                    .iter()
+                                    .try_for_each(|rows| cluster.read_codes(rows.clone()).map(drop))
+                            });
+                            codes?;
+                            let code_io = code_totals.io(VectorStage::LayerScan(1));
+                            let (sidecar, sidecar_totals) = measure(|| {
+                                let _stage = enter_vector_stage(VectorStage::LayerScan(1));
+                                cluster.read_sidecar()
+                            });
+                            let sidecar = sidecar?;
+                            let sidecar_io = sidecar_totals.io(VectorStage::LayerScan(1));
                             assert_eq!(sidecar_io.reads, 1);
                             let first =
                                 column_range(&slots, cluster.rows.len(), reader.scales).start;

@@ -1,8 +1,12 @@
-//! The vector-search stage clock: which stage is running on this thread, and the exclusive time,
-//! storage reads and sign-word fallbacks each stage accrues until the next take.
+//! Vector-search stage telemetry, owned by the operation it measures: [`measure`] puts a meter in
+//! scope on this thread, and stage switches and reads charge it and nothing outside one. The scope
+//! is per thread because storage reads charge it without a parameter, and embedders read
+//! [`current_vector_stage`] beneath the `Directory` API, which carries no context. Another thread
+//! charges nothing here: a worker runs its own `measure` and the parent adds the returned totals.
+//! Reads outside a `measure` aren't counted; to count an operation, wrap it in `measure`.
 
 use std::borrow::Cow;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::time::Instant;
 
 use crate::vector::quantization::MAX_QUANTIZATION_LAYERS;
@@ -94,7 +98,8 @@ fn slot(stage: VectorStage) -> usize {
     }
 }
 
-/// Exclusive time, storage reads and sign-word fallbacks per stage since the last take.
+/// Exclusive time and storage reads per stage, and sign-word fallbacks per layer, of one measured
+/// operation.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StageTotals {
     time_ns: [u64; STAGE_SLOTS],
@@ -119,86 +124,120 @@ impl StageTotals {
     }
 }
 
-// --- Clock ---
+// --- Meter ---
 
 thread_local! {
-    static CURRENT: Cell<VectorStage> = const { Cell::new(VectorStage::Other) };
-    static CLOCK: RefCell<Clock> = RefCell::new(Clock::new());
+    static SCOPE: RefCell<Option<Meter>> = const { RefCell::new(None) };
 }
 
-struct Clock {
+/// One operation's telemetry: the running stage, time and reads per stage, and sign-word fallbacks
+/// per layer. It exists only inside [`measure`], which owns it, so there is nothing to reset.
+struct Meter {
+    running: VectorStage,
     since: Instant,
     totals: StageTotals,
-    fallbacks_at_take: [u64; FALLBACK_LAYERS],
+    fallbacks_at_start: [u64; FALLBACK_LAYERS],
 }
 
-impl Clock {
+impl Meter {
     fn new() -> Self {
         Self {
+            running: VectorStage::Other,
             since: Instant::now(),
             totals: StageTotals::default(),
-            fallbacks_at_take: quant::cascade::sign_word_fallback_counts(),
+            fallbacks_at_start: quant::cascade::sign_word_fallback_counts(),
         }
     }
 
-    /// Charges the time since the last transition to `running`.
-    fn charge_time(&mut self, running: VectorStage) {
+    /// Charges the time since the last transition to the running stage.
+    fn charge_time(&mut self) {
         let now = Instant::now();
-        self.totals.time_ns[slot(running)] += now.duration_since(self.since).as_nanos() as u64;
+        self.totals.time_ns[slot(self.running)] += now.duration_since(self.since).as_nanos() as u64;
         self.since = now;
+    }
+
+    /// Moves the meter to `next` and returns the stage that was running.
+    fn switch(&mut self, next: VectorStage) -> VectorStage {
+        self.charge_time();
+        std::mem::replace(&mut self.running, next)
+    }
+
+    /// Charges the final time and returns the totals.
+    fn finish(mut self) -> StageTotals {
+        self.charge_time();
+        let fallbacks = quant::cascade::sign_word_fallback_counts();
+        for (layer, count) in self.totals.sign_word_fallbacks.iter_mut().enumerate() {
+            *count = fallbacks[layer] - self.fallbacks_at_start[layer];
+        }
+        self.totals
     }
 }
 
-/// Moves the clock to `next` and returns the stage that was running.
-fn switch(next: VectorStage) -> VectorStage {
-    let running = CURRENT.replace(next);
-    CLOCK.with_borrow_mut(|clock| clock.charge_time(running));
-    running
+/// The meter a [`measure`] shadows, put back in scope when dropped, unwinding included.
+struct Enclosing(Option<Meter>);
+
+impl Drop for Enclosing {
+    fn drop(&mut self) {
+        SCOPE.set(self.0.take());
+    }
 }
 
-/// The logical stage responsible for a vector component read on this thread.
+/// Runs `op` with a fresh meter in scope on this thread; returns its result and the meter's
+/// totals. Stage switches and reads inside `op` charge this meter only. A nested `measure`
+/// shadows this one until it returns.
+pub(crate) fn measure<R>(op: impl FnOnce() -> R) -> (R, StageTotals) {
+    let enclosing = Enclosing(SCOPE.replace(Some(Meter::new())));
+    let result = op();
+    let totals = SCOPE.take().map(Meter::finish).unwrap_or_default();
+    drop(enclosing);
+    (result, totals)
+}
+
+/// The stage running on this thread, for embedders attributing their own IO: `Other` outside a
+/// `measure`.
 pub fn current_vector_stage() -> VectorStage {
-    CURRENT.get()
+    SCOPE
+        .try_with(|scope| {
+            scope
+                .borrow()
+                .as_ref()
+                .map_or(VectorStage::Other, |meter| meter.running)
+        })
+        .unwrap_or_default()
 }
 
-/// Restores the enclosing stage when dropped.
-pub(crate) struct StageGuard(VectorStage);
+/// Restores the enclosing stage when dropped; holds nothing outside a [`measure`].
+pub(crate) struct StageGuard(Option<VectorStage>);
 
-/// Enters `stage` until the guard drops. Time accrues only to the innermost stage.
+/// Enters `stage` until the guard drops; does nothing outside a [`measure`]. Time accrues only to
+/// the innermost stage.
 pub(crate) fn enter_vector_stage(stage: VectorStage) -> StageGuard {
-    StageGuard(switch(stage))
+    StageGuard(SCOPE.with_borrow_mut(|scope| scope.as_mut().map(|meter| meter.switch(stage))))
 }
 
 impl Drop for StageGuard {
     fn drop(&mut self) {
-        switch(self.0);
+        if let Some(enclosing) = self.0 {
+            SCOPE.with_borrow_mut(|scope| {
+                if let Some(meter) = scope {
+                    meter.switch(enclosing);
+                }
+            });
+        }
     }
 }
 
-/// Charges one storage read of `bytes` touching `storage_blocks` blocks to the running stage.
+/// Charges one storage read of `bytes` touching `storage_blocks` blocks to the running stage; does
+/// nothing outside a [`measure`].
 pub(crate) fn charge_read(bytes: u64, storage_blocks: u64) {
-    let stage = CURRENT.get();
-    CLOCK.with_borrow_mut(|clock| {
-        let io = &mut clock.totals.io[slot(stage)];
-        io.reads += 1;
-        io.bytes_read += bytes;
-        io.storage_blocks += storage_blocks;
-    });
-}
-
-/// Returns the totals accrued since the last take and resets them.
-pub(crate) fn take_stage_totals() -> StageTotals {
-    let running = CURRENT.get();
-    CLOCK.with_borrow_mut(|clock| {
-        clock.charge_time(running);
-        let fallbacks = quant::cascade::sign_word_fallback_counts();
-        let mut totals = std::mem::take(&mut clock.totals);
-        for (layer, count) in totals.sign_word_fallbacks.iter_mut().enumerate() {
-            *count = fallbacks[layer] - clock.fallbacks_at_take[layer];
+    SCOPE.with_borrow_mut(|scope| {
+        if let Some(meter) = scope {
+            let io = &mut meter.totals.io[slot(meter.running)];
+            io.reads += 1;
+            io.bytes_read += bytes;
+            io.storage_blocks += storage_blocks;
         }
-        clock.fallbacks_at_take = fallbacks;
-        totals
-    })
+    });
 }
 
 #[cfg(test)]
@@ -242,9 +281,8 @@ mod tests {
 
     /// Time and reads go to the innermost stage; leaving a stage resumes the enclosing one.
     #[test]
-    fn clock_charges_the_innermost_stage() {
-        take_stage_totals();
-        {
+    fn meter_charges_the_innermost_stage() {
+        let ((), totals) = measure(|| {
             let _outer = enter_vector_stage(VectorStage::ScanInit);
             charge_read(10, 1);
             {
@@ -254,12 +292,89 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
             assert_eq!(current_vector_stage(), VectorStage::ScanInit);
-        }
+        });
         assert_eq!(current_vector_stage(), VectorStage::Other);
-        let totals = take_stage_totals();
         assert_eq!(totals.io(VectorStage::ScanInit).bytes_read, 10);
         assert_eq!(totals.io(VectorStage::NonVectorSearch).storage_blocks, 2);
         assert!(totals.time_ns(VectorStage::NonVectorSearch) >= 2_000_000);
-        assert_eq!(take_stage_totals().io(VectorStage::ScanInit).reads, 0);
+        assert_eq!(measure(|| ()).1.io(VectorStage::ScanInit).reads, 0);
+    }
+
+    /// A nested measure starts at `Other`, returns only its own totals, and hands the enclosing
+    /// meter back at the stage it left.
+    #[test]
+    fn nested_measure_returns_only_its_own_totals() {
+        let ((inner, resumed), outer) = measure(|| {
+            let _routing = enter_vector_stage(VectorStage::Routing);
+            charge_read(10, 1);
+            let ((), inner) = measure(|| {
+                assert_eq!(current_vector_stage(), VectorStage::Other);
+                let _locate = enter_vector_stage(VectorStage::Locate);
+                charge_read(20, 2);
+            });
+            let resumed = current_vector_stage();
+            charge_read(30, 3);
+            (inner, resumed)
+        });
+        assert_eq!(resumed, VectorStage::Routing);
+        assert_eq!(inner.io(VectorStage::Locate).bytes_read, 20);
+        assert_eq!(inner.io(VectorStage::Routing).reads, 0);
+        assert_eq!(outer.io(VectorStage::Routing).bytes_read, 40);
+        assert_eq!(outer.io(VectorStage::Locate).reads, 0);
+    }
+
+    /// A panic inside a measure puts the enclosing meter back in scope at the stage it left.
+    #[test]
+    fn panic_inside_measure_restores_the_enclosing_meter() {
+        let ((), totals) = measure(|| {
+            let _routing = enter_vector_stage(VectorStage::Routing);
+            let unwound = std::panic::catch_unwind(|| {
+                measure(|| {
+                    let _locate = enter_vector_stage(VectorStage::Locate);
+                    charge_read(20, 2);
+                    panic!("operation failed inside its measure");
+                })
+            });
+            assert!(unwound.is_err());
+            assert_eq!(current_vector_stage(), VectorStage::Routing);
+            charge_read(10, 1);
+        });
+        assert_eq!(current_vector_stage(), VectorStage::Other);
+        assert_eq!(totals.io(VectorStage::Routing).bytes_read, 10);
+        assert_eq!(totals.io(VectorStage::Locate).reads, 0);
+    }
+
+    /// Outside a measure the stage stays `Other`, and neither stage switches nor reads carry into
+    /// the next measure.
+    #[test]
+    fn outside_a_measure_nothing_is_charged() {
+        let routing = enter_vector_stage(VectorStage::Routing);
+        assert_eq!(current_vector_stage(), VectorStage::Other);
+        charge_read(10, 1);
+        let ((), totals) = measure(|| {
+            assert_eq!(current_vector_stage(), VectorStage::Other);
+        });
+        drop(routing);
+        assert_eq!(current_vector_stage(), VectorStage::Other);
+        assert_eq!(totals.io(VectorStage::Other).reads, 0);
+        assert_eq!(totals.io(VectorStage::Routing).reads, 0);
+        assert_eq!(totals.time_ns(VectorStage::Routing), 0);
+    }
+
+    /// A thread without its own measure charges nothing to the parent's meter.
+    #[test]
+    fn spawned_thread_charges_nothing_to_the_parent() {
+        let ((), totals) = measure(|| {
+            let _routing = enter_vector_stage(VectorStage::Routing);
+            std::thread::spawn(|| {
+                assert_eq!(current_vector_stage(), VectorStage::Other);
+                let _locate = enter_vector_stage(VectorStage::Locate);
+                charge_read(10, 1);
+            })
+            .join()
+            .unwrap();
+        });
+        assert_eq!(totals.io(VectorStage::Routing).reads, 0);
+        assert_eq!(totals.io(VectorStage::Locate).reads, 0);
     }
 }

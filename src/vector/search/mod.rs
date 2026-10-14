@@ -26,10 +26,14 @@ use crate::vector::search::segment::plan::{SegmentPlan, Source};
 use crate::vector::search::source::matches::MatchClusters;
 use crate::vector::search::source::router::RouterClusters;
 use crate::vector::search::source::SourceReport;
+#[cfg(test)]
 use crate::vector::stats::ProbeStats;
+use crate::vector::stats::SegmentReport;
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::reader::VectorIndexReader;
-use crate::vector::telemetry::{enter_vector_stage, take_stage_totals};
+use crate::vector::telemetry::enter_vector_stage;
+#[cfg(test)]
+use crate::vector::telemetry::measure;
 #[cfg(test)]
 use crate::vector::tie_break::NoTieBreak;
 use crate::vector::{VectorElement, VectorStage};
@@ -98,7 +102,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
 
     // --- Search ---
 
-    /// Returns the segment's top vector matches and probe statistics.
+    /// Returns the segment's top vector matches and the probe statistics of a measured search.
     ///
     /// # Errors
     ///
@@ -110,23 +114,26 @@ impl<T: VectorElement> SegmentSearcher<T> {
         segment_reader: &SegmentReader,
         top_n: usize,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
-        let (hits, stats) = self.top_n_by(
-            weight,
-            segment_reader,
-            top_n,
-            &mut NoTieBreak,
-            NaturalComparator,
-        )?;
+        let (searched, totals) = measure(|| {
+            self.top_n_by(
+                weight,
+                segment_reader,
+                top_n,
+                &mut NoTieBreak,
+                NaturalComparator,
+            )
+        });
+        let (hits, report) = searched?;
         Ok((
             hits.into_iter()
                 .map(|((score, ()), address)| (score, address))
                 .collect(),
-            stats,
+            ProbeStats::new(report, totals),
         ))
     }
 
-    /// [`Self::top_n`] ordered by `(similarity, tie_break)`; the tie-break takes part in the heap's
-    /// eviction, so it decides which documents tied at the k-th place survive.
+    /// The top matches by `(similarity, tie_break)` and the segment's report; the tie-break takes
+    /// part in the heap's eviction, so it decides which documents tied at the k-th place survive.
     ///
     /// # Errors
     /// Returns an error when segment vector data cannot be opened or scored.
@@ -137,7 +144,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
         top_n: usize,
         tie_break: &mut K,
         tie_comparator: CTail,
-    ) -> crate::Result<(TieBreakHits<K>, ProbeStats)>
+    ) -> crate::Result<(TieBreakHits<K>, SegmentReport)>
     where
         K: SegmentSortKeyComputer,
         CTail: Comparator<K::SegmentSortKey>,
@@ -146,7 +153,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
             None => {
                 let (hits, rows_read) =
                     self.flat_top_n(weight, segment_reader, top_n, tie_break, tie_comparator)?;
-                Ok((hits, ProbeStats::flat(rows_read, take_stage_totals())))
+                Ok((hits, SegmentReport::Flat { rows_read }))
             }
             Some(index) => self.search_ivf(
                 index,
@@ -159,8 +166,8 @@ impl<T: VectorElement> SegmentSearcher<T> {
         }
     }
 
-    /// Searches one IVF segment: plans it, runs the scan over its cluster source, and assembles
-    /// the statistics from every stage's report and the stage clock.
+    /// Searches one IVF segment: plans it, runs the scan over its cluster source, and returns the
+    /// hits with every stage's report.
     fn search_ivf<K, C>(
         &self,
         index: &ClusterIndex,
@@ -169,7 +176,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
         top_n: usize,
         tie_break: &mut K,
         tie_comparator: C,
-    ) -> crate::Result<(TieBreakHits<K>, ProbeStats)>
+    ) -> crate::Result<(TieBreakHits<K>, SegmentReport)>
     where
         K: SegmentSortKeyComputer,
         C: Comparator<K::SegmentSortKey>,
@@ -186,7 +193,9 @@ impl<T: VectorElement> SegmentSearcher<T> {
             drop(init);
             return Ok((
                 Vec::new(),
-                ProbeStats::empty(report.located_cap, take_stage_totals()),
+                SegmentReport::Empty {
+                    located_cap: report.located_cap,
+                },
             ));
         };
         let config = ScanConfig {
@@ -224,10 +233,14 @@ impl<T: VectorElement> SegmentSearcher<T> {
                 SourceReport::Matches(clusters.finish())
             }
         };
-        let (hits, scan_report) = scan.finish(self.segment_ord)?;
+        let (hits, scan) = scan.finish(self.segment_ord)?;
         Ok((
             hits,
-            ProbeStats::assemble(report, source, scan_report, take_stage_totals()),
+            SegmentReport::Ivf {
+                plan: report,
+                source,
+                scan,
+            },
         ))
     }
 

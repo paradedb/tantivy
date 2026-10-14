@@ -20,10 +20,10 @@ use crate::schema::{Field, FieldType, Metric, Schema};
 use crate::vector::params::ProbeParams;
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
 use crate::vector::search::SegmentSearcher;
-use crate::vector::stats::ProbeStats;
+use crate::vector::stats::{ProbeStats, SegmentReport};
 use crate::vector::storage::metadata::VectorColMetadata;
 use crate::vector::storage::quantized::QuantizedFieldReader;
-use crate::vector::telemetry::{enter_vector_stage, take_stage_totals};
+use crate::vector::telemetry::{enter_vector_stage, measure};
 use crate::vector::tie_break::NoTieBreak;
 use crate::vector::{VectorElement, VectorStage};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal, TantivyError};
@@ -203,9 +203,12 @@ pub struct VectorSimilarityFruit {
 ///
 /// The merge orders by the same composite key as the segment heaps, then drops the tie-break.
 pub struct SegmentVectorFruit<K> {
-    results: Vec<((Score, K), DocAddress)>,
+    results: KeyedHits<K>,
     stats: ProbeStats,
 }
+
+/// One segment's hits with their tie-break keys lifted out of the segment.
+type KeyedHits<K> = Vec<((Score, K), DocAddress)>;
 
 // --- Collection ---
 
@@ -275,8 +278,64 @@ where
         segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
     ) -> crate::Result<SegmentVectorFruit<S::SortKey>> {
-        // Time before this segment belongs to no stage of it.
-        take_stage_totals();
+        let (searched, totals) = measure(|| self.search_segment(weight, segment_ord, reader));
+        let (results, report) = searched?;
+        Ok(SegmentVectorFruit {
+            results,
+            stats: ProbeStats::new(report, totals),
+        })
+    }
+
+    fn merge_fruits(
+        &self,
+        segment_fruits: Vec<SegmentVectorFruit<S::SortKey>>,
+    ) -> crate::Result<Self::Fruit> {
+        let (mut merged, totals) = measure(|| {
+            let _assembly = enter_vector_stage(VectorStage::ResultAssembly);
+            // Each fruit is already its segment's top `limit + offset` under this order, so the
+            // global window is a sort of their union. Stats keep one entry per segment.
+            let comparator = (NaturalComparator, self.tie_break.comparator());
+            let mut stats = Vec::with_capacity(segment_fruits.len());
+            let mut all: Vec<ComparableDoc<(Score, S::SortKey), DocAddress>> = Vec::new();
+            for fruit in segment_fruits {
+                stats.push(fruit.stats);
+                all.extend(
+                    fruit
+                        .results
+                        .into_iter()
+                        .map(|(sort_key, doc)| ComparableDoc { sort_key, doc }),
+                );
+            }
+            // A total order (ascending `DocAddress` last), so the unstable sort is deterministic.
+            all.sort_unstable_by(|lhs, rhs| compare_for_top_k(&comparator, lhs, rhs));
+            let results = all
+                .into_iter()
+                .skip(self.offset)
+                .take(self.limit)
+                .map(|cd| (cd.sort_key.0, cd.doc))
+                .collect();
+            VectorSimilarityFruit { results, stats }
+        });
+        if let Some(first) = merged.stats.first_mut() {
+            first.add_assembly(&totals);
+        }
+        Ok(merged)
+    }
+}
+
+impl<T, S> TopDocsByVectorSimilarity<T, S>
+where
+    T: VectorElement,
+    S: SortKeyComputer + Send + Sync + 'static,
+{
+    /// Searches one segment: prepares the query, runs the segment searcher, and lifts each hit's
+    /// tie-break key out of the segment.
+    fn search_segment(
+        &self,
+        weight: &dyn Weight,
+        segment_ord: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> crate::Result<(KeyedHits<S::SortKey>, SegmentReport)> {
         let init = enter_vector_stage(VectorStage::ScanInit);
         let (query, quantized) = {
             let _prep = enter_vector_stage(VectorStage::QueryPrep);
@@ -300,7 +359,7 @@ where
         )?;
         let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
         drop(init);
-        let (hits, mut stats) = backend.top_n_by(
+        let (hits, report) = backend.top_n_by(
             weight,
             reader,
             self.segment_top_n(),
@@ -317,42 +376,7 @@ where
                 )
             })
             .collect();
-        stats.add_assembly(&take_stage_totals());
-        Ok(SegmentVectorFruit { results, stats })
-    }
-
-    fn merge_fruits(
-        &self,
-        segment_fruits: Vec<SegmentVectorFruit<S::SortKey>>,
-    ) -> crate::Result<Self::Fruit> {
-        take_stage_totals();
-        let _assembly = enter_vector_stage(VectorStage::ResultAssembly);
-        // Each fruit is already its segment's top `limit + offset` under this order, so the
-        // global window is a sort of their union. Stats keep one entry per segment.
-        let comparator = (NaturalComparator, self.tie_break.comparator());
-        let mut stats = Vec::with_capacity(segment_fruits.len());
-        let mut all: Vec<ComparableDoc<(Score, S::SortKey), DocAddress>> = Vec::new();
-        for fruit in segment_fruits {
-            stats.push(fruit.stats);
-            all.extend(
-                fruit
-                    .results
-                    .into_iter()
-                    .map(|(sort_key, doc)| ComparableDoc { sort_key, doc }),
-            );
-        }
-        // A total order (ascending `DocAddress` last), so the unstable sort is deterministic.
-        all.sort_unstable_by(|lhs, rhs| compare_for_top_k(&comparator, lhs, rhs));
-        let results = all
-            .into_iter()
-            .skip(self.offset)
-            .take(self.limit)
-            .map(|cd| (cd.sort_key.0, cd.doc))
-            .collect();
-        if let Some(first) = stats.first_mut() {
-            first.add_assembly(&take_stage_totals());
-        }
-        Ok(VectorSimilarityFruit { results, stats })
+        Ok((results, report))
     }
 }
 

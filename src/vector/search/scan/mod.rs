@@ -91,7 +91,7 @@ pub(crate) struct ScanReport {
     /// Centroid rows read for shortlisted clusters without a centroid score.
     pub(crate) centroid_reads: usize,
     #[cfg(test)]
-    pub(crate) trace: ScanTrace,
+    pub(crate) trace: Box<ScanTrace>,
 }
 
 /// Rows each stage of a scan scored and kept, by global row.
