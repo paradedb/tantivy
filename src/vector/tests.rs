@@ -11,7 +11,7 @@ use crate::schema::{
     STRING,
 };
 use crate::vector::clustering::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, TrainingSource,
 };
 use crate::vector::params::{LocatedPath, ProbeParams};
 use crate::vector::RouterKind;
@@ -201,7 +201,7 @@ impl IvfClusterer for Grid2DClusterer {
     fn train(
         &self,
         options: &VectorOptions,
-        _vectors: IvfTrainingVectors,
+        _source: &mut dyn TrainingSource,
     ) -> crate::Result<IvfCentroids> {
         assert_eq!(options.dim(), grid2d::DIM);
         let num_centroids = self.centroids.len();
@@ -980,6 +980,7 @@ mod bounds_storage_tests {
     use crate::schema::{Metric, Schema, VectorDType, VectorOptions, STORED, STRING};
     use crate::vector::clustering::{
         IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
+        TrainingSource,
     };
     use crate::vector::diagnostics::VectorStorageFormat;
     use crate::vector::router::stacked::levels::{InMemoryStore, StackedIvf, StackedIvfConfig};
@@ -1089,7 +1090,7 @@ mod bounds_storage_tests {
         fn train(
             &self,
             options: &VectorOptions,
-            vectors: IvfTrainingVectors,
+            source: &mut dyn TrainingSource,
         ) -> crate::Result<IvfCentroids> {
             assert_eq!(options.dim(), 2);
             let num_centroids = self.num_centroids;
@@ -1100,8 +1101,9 @@ mod bounds_storage_tests {
                     .flat_map(|centroid| centroid.iter().copied())
                     .collect(),
                 None => {
-                    let IvfTrainingVectors::F32(batch) = vectors;
-                    batch.matrix.values[..num_centroids * 2].to_vec()
+                    let rows: Vec<u32> = (0..num_centroids as u32).collect();
+                    let IvfTrainingVectors::F32(batch) = source.read_rows(&rows)?;
+                    batch.matrix.values
                 }
             };
             Ok(IvfCentroids::F32(IvfMatrix {

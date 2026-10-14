@@ -16,7 +16,7 @@ use tantivy::schema::{
     Field, IndexRecordOption, Metric, Schema, VectorDType, VectorOptions, STRING,
 };
 use tantivy::vector::clustering::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors,
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors, TrainingSource,
 };
 use tantivy::vector::{
     LocatedPath, ProbeParams, ProbeStats, Selectivity, VectorQuantizationConfig,
@@ -139,12 +139,13 @@ impl IvfClusterer for RoundRobinClusterer {
     fn train(
         &self,
         options: &VectorOptions,
-        vectors: IvfTrainingVectors,
+        source: &mut dyn TrainingSource,
     ) -> tantivy::Result<IvfCentroids> {
-        let IvfTrainingVectors::F32(batch) = vectors;
+        let rows: Vec<u32> = (0..self.clusters as u32).collect();
+        let IvfTrainingVectors::F32(batch) = source.read_rows(&rows)?;
         let dims = options.dim();
         Ok(IvfCentroids::F32(IvfMatrix {
-            values: batch.matrix.values[..self.clusters * dims].to_vec(),
+            values: batch.matrix.values,
             rows: self.clusters,
             dims,
         }))

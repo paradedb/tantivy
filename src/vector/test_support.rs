@@ -19,7 +19,7 @@ use crate::schema::{
     STRING,
 };
 use crate::vector::clustering::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors,
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfVectors, TrainingSource,
 };
 use crate::vector::params::ProbeParams;
 use crate::vector::router::candidate::Candidate;
@@ -75,7 +75,11 @@ impl IvfClusterer for NearestClusterer {
         1.0
     }
 
-    fn train(&self, options: &VectorOptions, _: IvfTrainingVectors) -> crate::Result<IvfCentroids> {
+    fn train(
+        &self,
+        options: &VectorOptions,
+        _: &mut dyn TrainingSource,
+    ) -> crate::Result<IvfCentroids> {
         Ok(IvfCentroids::F32(IvfMatrix {
             values: self.centroids.iter().flatten().copied().collect(),
             rows: self.centroids.len(),

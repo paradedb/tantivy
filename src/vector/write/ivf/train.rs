@@ -1,15 +1,18 @@
-//! The train step: a target-ordered sample of a field's vectors, the clusterer's centroids, and
-//! the router over them.
+//! The train step: a sample of a field's vectors streamed to the clusterer in source storage
+//! order, the clusterer's centroids, and the router over them.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use super::{FieldMerge, IvfBuildTimings};
+use crate::indexer::segment_updater::CancelSentinel;
 use crate::schema::VectorOptions;
 use crate::vector::clustering::{
-    decode_row_append, IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingBatch,
-    IvfTrainingVectors,
+    decode_row_append, IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings,
+    IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, TrainingSource,
 };
 use crate::vector::router::{BuiltRouter, RouterKind};
+use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::write::RowAddress;
 use crate::{DocId, TantivyError};
 
@@ -21,8 +24,8 @@ pub(super) struct Trained {
     pub(super) present_vectors: usize,
 }
 
-/// Samples the field's vectors in target-doc order and trains centroids on the sample; `None`
-/// when every vector-bearing document was deleted.
+/// Samples the field's vectors in target-doc order and trains centroids on the sample, streamed
+/// in source storage order; `None` when every vector-bearing document was deleted.
 pub(super) fn train(
     merge: &FieldMerge,
     clusterer: &dyn IvfClusterer,
@@ -38,40 +41,25 @@ pub(super) fn train(
         target.clamp(1, vector_count)
     };
     let training_sample_interval = (vector_count / training_sample_size).max(1);
-    let dim = opts.dim();
 
-    // Each sampled row paired with its position in target-doc order.
-    let mut training_doc_ids = Vec::with_capacity(training_sample_size);
-    let mut training_sources: Vec<(RowAddress, usize)> = Vec::with_capacity(training_sample_size);
+    // The sample is picked in target-doc order, then scanned in source storage order so every
+    // training pass reads sequentially.
+    let mut training_rows: Vec<(RowAddress, DocId)> = Vec::with_capacity(training_sample_size);
     let mut present_vector_ord = 0usize;
     for (target_doc_id, source) in source_rows
         .iter()
         .enumerate()
         .filter_map(|(doc_id, row)| row.map(|row| (doc_id as DocId, row)))
     {
-        if training_sources.len() < training_sample_size
+        if training_rows.len() < training_sample_size
             && present_vector_ord % training_sample_interval == 0
         {
-            training_sources.push((source, training_doc_ids.len()));
-            training_doc_ids.push(target_doc_id);
+            training_rows.push((source, target_doc_id));
         }
         present_vector_ord += 1;
     }
     debug_assert_eq!(source_rows.len(), merge.num_target_docs as usize);
-
-    // Read in source storage order, but keep the training matrix in target-doc
-    // order so the trainer's input does not depend on source clustering.
-    training_sources.sort_unstable();
-    let mut training_values = vec![0.0f32; training_sources.len() * dim];
-    let mut decode_buffer = Vec::with_capacity(dim);
-    for (source, sample_idx) in training_sources {
-        timings.source_reads += 1;
-        let bytes =
-            merge.readers[source.segment_ord as usize].vector_bytes_for_row(source.row_id)?;
-        decode_buffer.clear();
-        decode_row_append::<f32>(&bytes, dim, &mut decode_buffer)?;
-        training_values[sample_idx * dim..][..dim].copy_from_slice(&decode_buffer);
-    }
+    training_rows.sort_unstable();
     debug_assert!(
         if merge.ctx.readers.iter().any(|reader| reader.has_deletes()) {
             present_vector_ord <= vector_count
@@ -80,23 +68,16 @@ pub(super) fn train(
         },
         "{present_vector_ord} alive docs with vectors vs {vector_count} reported by source count()"
     );
-    if training_doc_ids.is_empty() {
+    if training_rows.is_empty() {
         return Ok(None);
     }
 
-    let training_rows = training_doc_ids.len();
-    let training_vectors = IvfTrainingVectors::F32(IvfTrainingBatch {
-        doc_ids: training_doc_ids,
-        matrix: IvfMatrix {
-            values: training_values,
-            rows: training_rows,
-            dims: opts.dim(),
-        },
-    });
+    let mut training_source =
+        MergeTrainingSource::new(&merge.readers, training_rows, opts.dim(), merge.ctx.cancel);
     let train_start = Instant::now();
-    let centroids = clusterer.train(opts, training_vectors)?;
-
+    let centroids = clusterer.train(opts, &mut training_source)?;
     timings.train = train_start.elapsed();
+    timings.source_reads += training_source.reads;
 
     if merge.ctx.cancel.wants_cancel() {
         return Err(TantivyError::Cancelled);
@@ -108,6 +89,118 @@ pub(super) fn train(
         num_centroids,
         present_vectors: present_vector_ord,
     }))
+}
+
+/// Sampled merge rows, scanned in source storage order.
+struct MergeTrainingSource<'a> {
+    readers: &'a [Arc<VectorIndexReader>],
+    rows: Vec<(RowAddress, DocId)>,
+    dim: usize,
+    cancel: &'a dyn CancelSentinel,
+    reads: usize,
+    batch_values: Vec<f32>,
+    batch_doc_ids: Vec<DocId>,
+}
+
+impl<'a> MergeTrainingSource<'a> {
+    fn new(
+        readers: &'a [Arc<VectorIndexReader>],
+        rows: Vec<(RowAddress, DocId)>,
+        dim: usize,
+        cancel: &'a dyn CancelSentinel,
+    ) -> Self {
+        MergeTrainingSource {
+            readers,
+            rows,
+            dim,
+            cancel,
+            reads: 0,
+            batch_values: Vec::new(),
+            batch_doc_ids: Vec::new(),
+        }
+    }
+}
+
+fn decode_training_rows(
+    readers: &[Arc<VectorIndexReader>],
+    dim: usize,
+    rows: impl Iterator<Item = (RowAddress, DocId)>,
+    values: &mut Vec<f32>,
+    doc_ids: &mut Vec<DocId>,
+) -> crate::Result<()> {
+    for (source, target_doc_id) in rows {
+        let bytes = readers[source.segment_ord as usize].vector_bytes_for_row(source.row_id)?;
+        decode_row_append::<f32>(&bytes, dim, values)?;
+        doc_ids.push(target_doc_id);
+    }
+    Ok(())
+}
+
+impl TrainingSource for MergeTrainingSource<'_> {
+    fn num_rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn for_each_batch(
+        &mut self,
+        batch_size: usize,
+        f: &mut dyn FnMut(IvfVectors<'_>),
+    ) -> crate::Result<()> {
+        for batch in self.rows.chunks(batch_size.max(1)) {
+            if self.cancel.wants_cancel() {
+                return Err(TantivyError::Cancelled);
+            }
+            self.batch_values.clear();
+            self.batch_doc_ids.clear();
+            decode_training_rows(
+                self.readers,
+                self.dim,
+                batch.iter().copied(),
+                &mut self.batch_values,
+                &mut self.batch_doc_ids,
+            )?;
+            self.reads += batch.len();
+            f(IvfVectors::F32(IvfVectorBatch {
+                doc_ids: &self.batch_doc_ids,
+                matrix: IvfMatrixView {
+                    values: &self.batch_values,
+                    rows: batch.len(),
+                    dims: self.dim,
+                },
+            }));
+        }
+        Ok(())
+    }
+
+    fn read_rows(&mut self, rows: &[u32]) -> crate::Result<IvfTrainingVectors> {
+        if self.cancel.wants_cancel() {
+            return Err(TantivyError::Cancelled);
+        }
+        if let Some(&row) = rows.iter().find(|&&row| row as usize >= self.rows.len()) {
+            return Err(TantivyError::InvalidArgument(format!(
+                "training row {row} is out of bounds for {} rows",
+                self.rows.len()
+            )));
+        }
+        let mut values = Vec::with_capacity(rows.len() * self.dim);
+        let mut doc_ids = Vec::with_capacity(rows.len());
+        decode_training_rows(
+            self.readers,
+            self.dim,
+            rows.iter().map(|&row| self.rows[row as usize]),
+            &mut values,
+            &mut doc_ids,
+        )?;
+        self.reads += rows.len();
+        Ok(IvfTrainingVectors::F32(IvfTrainingBatch {
+            doc_ids,
+            matrix: IvfMatrix {
+                values,
+                rows: rows.len(),
+                dims: self.dim,
+            },
+        }))
+    }
 }
 
 /// The number of centroids a clusterer produced, checked against `opts`'s dimension.

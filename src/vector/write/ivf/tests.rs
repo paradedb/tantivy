@@ -7,7 +7,7 @@ use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
 use crate::query::{AllQuery, EnableScoring, Query, TermQuery};
 use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
-use crate::vector::clustering::{IvfTrainingVectors, IvfVectors};
+use crate::vector::clustering::{IvfVectors, TrainingSource};
 use crate::vector::diagnostics::{
     VectorEstimatorMeasurements, VectorEstimatorQuery, VectorEstimatorSource,
 };
@@ -321,7 +321,7 @@ impl IvfClusterer for QuantFixtureClusterer {
     fn train(
         &self,
         options: &VectorOptions,
-        _vectors: IvfTrainingVectors,
+        _source: &mut dyn TrainingSource,
     ) -> crate::Result<IvfCentroids> {
         assert_eq!(options.dim(), self.dim);
         let values = match self.metric {
