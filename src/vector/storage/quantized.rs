@@ -17,7 +17,7 @@ use crate::vector::quantization::{
     QUANTIZED_GAMMA_STRIDE, QUANTIZED_SCALE_STRIDE,
 };
 use crate::vector::storage::blocks::Blocks;
-use crate::vector::storage::io::VectorRead;
+use crate::vector::storage::io::{VectorRead, VectorReadKind};
 use crate::vector::storage::metadata::{SlotType, VectorColMetadata};
 use crate::vector::storage::reader::VectorRowChunk;
 use crate::TantivyError;
@@ -754,7 +754,7 @@ impl QuantizedClusterReader<'_> {
         let bytes = self
             .codes
             .slice((rows.start - self.rows.start) * stride..(rows.end - self.rows.start) * stride)
-            .read_vector_bytes()?;
+            .read_vector_bytes(VectorReadKind::QuantizedLayer(self.layer.layer as u8))?;
         self.layer.validate_codes(&bytes, &rows)?;
         Ok(bytes)
     }
@@ -768,7 +768,9 @@ impl QuantizedClusterReader<'_> {
         let blocks = &layer.blocks;
         let n = blocks.rows_in(self.block);
         let first = column_range(&blocks.slots, n, layer.scales).start;
-        let bytes = self.sidecar_slice()?.read_vector_bytes()?;
+        let bytes = self
+            .sidecar_slice()?
+            .read_vector_bytes(VectorReadKind::QuantizedLayer(self.layer.layer as u8))?;
         let view = |idx| {
             let column = column_range(&blocks.slots, n, idx);
             bytes.slice(column.start - first..column.end - first)
@@ -806,7 +808,9 @@ impl QuantizedClusterReader<'_> {
 
     /// Reads the cluster's residual norms in one request.
     pub(crate) fn read_norms(&self) -> crate::Result<OwnedBytes> {
-        Ok(self.norms_slice()?.read_vector_bytes()?)
+        Ok(self
+            .norms_slice()?
+            .read_vector_bytes(VectorReadKind::QuantizedLayer(0))?)
     }
 }
 

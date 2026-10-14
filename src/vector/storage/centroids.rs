@@ -34,7 +34,7 @@ use crate::vector::router::stacked::aps::RecallEstimator;
 use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RoutingParams};
 use crate::vector::storage::bounds::{BoundKind, BoundStore};
 use crate::vector::storage::header::VectorFileVersion;
-use crate::vector::storage::io::VectorRead;
+use crate::vector::storage::io::{VectorRead, VectorReadKind};
 
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
@@ -314,7 +314,9 @@ impl ClusterIndex {
 
     /// One centroid row, read alone and charged to the running vector stage.
     pub(crate) fn centroid_row(&self, cluster: usize) -> crate::Result<OwnedBytes> {
-        Ok(self.centroid_row_slice(cluster)?.read_vector_bytes()?)
+        Ok(self
+            .centroid_row_slice(cluster)?
+            .read_vector_bytes(VectorReadKind::Other)?)
     }
 
     /// The centroid rows, materialized in one read — for introspection and
