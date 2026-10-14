@@ -286,10 +286,6 @@ name = "distance"
 harness = false
 
 [[bench]]
-name = "graph"
-harness = false
-
-[[bench]]
 name = "vector_quantization_writer"
 harness = false
 

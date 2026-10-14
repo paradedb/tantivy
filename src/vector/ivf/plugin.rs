@@ -831,7 +831,6 @@ mod tests {
                 dim: 65,
                 metric: Metric::L2,
             }))
-            .ivf_router(RouterKind::Rng)
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 30_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -1191,7 +1190,13 @@ mod tests {
         schedule: &[u8],
         quantized: bool,
     ) -> crate::Result<Index> {
-        build_quantized_fixture_case_with_router(dim, metric, schedule, quantized, RouterKind::Rng)
+        build_quantized_fixture_case_with_router(
+            dim,
+            metric,
+            schedule,
+            quantized,
+            RouterKind::default(),
+        )
     }
 
     fn build_quantized_fixture_case_with_router(
@@ -1224,7 +1229,7 @@ mod tests {
             schedule,
             quantized,
             directory,
-            RouterKind::Rng,
+            RouterKind::default(),
         )
     }
 

@@ -29,7 +29,7 @@ use crate::schema::Metric;
 use crate::vector::ivf::aps::{self, RecallEstimator};
 use crate::vector::{Candidate, FileSliceArena, Similarity, VectorArena, VectorElement};
 
-/// Row index into a level's centroid or member arena. Not a graph [`super::NodeId`].
+/// Row index into a level's centroid or member arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClusterId(pub u32);
 

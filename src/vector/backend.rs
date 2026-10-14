@@ -12,7 +12,6 @@ use crate::schema::Field;
 use crate::vector::index_reader::VectorIndexReader;
 use crate::vector::ivf::{AdaptiveProbeParams, IvfIndex};
 use crate::vector::prepared::{QuantizedQueryCtx, ScoringQuery, VectorQuery};
-use crate::vector::router::RouterWorkspace;
 use crate::vector::scan::heap::{tie_break_key, TieBreakHits};
 #[cfg(test)]
 use crate::vector::scan::plan::PlanOverride;
@@ -196,11 +195,9 @@ impl<T: VectorElement> VectorBackend<T> {
         drop(init);
         let source = match source {
             Source::Router(filter) => {
-                let mut workspace = RouterWorkspace::default();
                 let mut clusters = RouterClusters::new(
                     &self.reader,
                     &self.query,
-                    &mut workspace,
                     budget,
                     filter,
                     segment,

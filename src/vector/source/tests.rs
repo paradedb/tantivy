@@ -12,7 +12,6 @@ use crate::schema::Metric;
 use crate::vector::bounds::{HeapPeek, QueryBound, QueryBoundTracker};
 use crate::vector::cluster_source::{ClusterSource, Feedback};
 use crate::vector::ivf::{AdaptiveProbeParams, LocatedPath, RecallEstimator};
-use crate::vector::router::RouterWorkspace;
 use crate::vector::segment::plan::Source;
 use crate::vector::test_support::{DocsWeight, Fixture, FixtureSpec, Lcg, SegmentRun};
 use crate::vector::tests::{exhaustive_params, routed_exhaustive_params, TestVectorIndex};
@@ -35,11 +34,9 @@ fn walk(seg: &SegmentRun<'_>, feedback: impl Fn(usize) -> Feedback) -> crate::Re
     let Some(Source::Router(filter)) = plan.source else {
         panic!("the router source walks router plans");
     };
-    let mut workspace = RouterWorkspace::default();
     let mut source = RouterClusters::new(
         seg.searcher.reader(),
         seg.searcher.query(),
-        &mut workspace,
         plan.budget,
         filter,
         seg.segment,
@@ -618,11 +615,9 @@ fn gate_bookkeeping() -> crate::Result<()> {
                 let Some(Source::Router(filter)) = plan.source else {
                     panic!("the router source walks router plans");
                 };
-                let mut workspace = RouterWorkspace::default();
                 let mut source = RouterClusters::new(
                     run.searcher.reader(),
                     run.searcher.query(),
-                    &mut workspace,
                     plan.budget,
                     filter,
                     run.segment,

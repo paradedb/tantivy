@@ -110,14 +110,11 @@ pub use index_reader::{
     VectorStorageFormat,
 };
 pub use ivf::{
-    BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, Candidate, ClusterId, Graph,
-    InMemoryStackedIvf, InMemoryStore, IvfCentroids, IvfClusterer, IvfConfig, IvfIndex,
-    IvfIndexBuilder, IvfLevelClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings,
+    Candidate, ClusterId, InMemoryStackedIvf, InMemoryStore, IvfCentroids, IvfClusterer, IvfConfig,
+    IvfIndex, IvfIndexBuilder, IvfLevelClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings,
     IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, LazyStackedIvf, LazyStore,
-    MultiLevelIvf, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
-    RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
-    StackedSearchStats, SuperKMeansClusterer, SuperKMeansLevelClusterer, Workspace, APS_MAX_DIM,
-    DEFAULT_MAX_LEAF_SIZE, DEFAULT_TRAINING_SAMPLE_RATIO,
+    MultiLevelIvf, StackedSearchStats, SuperKMeansClusterer, SuperKMeansLevelClusterer,
+    APS_MAX_DIM, DEFAULT_MAX_LEAF_SIZE, DEFAULT_TRAINING_SAMPLE_RATIO,
 };
 pub use metadata::{
     F64Bits, Grid, Partition, QuantizationSchedule, Quantizer, QuantizerKind, Rotation,
@@ -313,15 +310,8 @@ impl<T: VectorElement, S: std::ops::Deref<Target = [T]>> VectorArena for S {
 }
 
 /// A [`VectorArena`] over raw little-endian `T` rows behind a
-/// [`FileSlice`](crate::directory::FileSlice): each [`similarity`] call
-/// fetches only that row with one stride-sized ranged read, scored with the
-/// byte kernels ([`Metric::similarity_bytes`]). The arena is never
-/// materialized whole — under `MmapDirectory` a read is a zero-copy view,
-/// and under a copying `Directory` only the visited rows' bytes are fetched.
-///
-/// This is the search-time counterpart of the typed blanket impl: a
-/// [`Graph`] reloaded from disk wraps its file-resident vectors in one of
-/// these and is search-only (refinement needs typed storage).
+/// [`FileSlice`](crate::directory::FileSlice): each [`similarity`] call reads only that row, one
+/// stride-sized ranged read scored with the byte kernels ([`Metric::similarity_bytes`]).
 ///
 /// [`similarity`]: VectorArena::similarity
 pub struct FileSliceArena<T> {

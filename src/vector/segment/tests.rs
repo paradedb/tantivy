@@ -314,7 +314,7 @@ fn adaptive_probe_finds_nn_outside_nearest_cluster() -> crate::Result<()> {
 /// Below the ceiling the router still reaches each query's home cluster among 16 separated
 /// clusters: the routed top k equals the oracle within two probes.
 #[test]
-fn routes_through_graph_below_ceiling() -> crate::Result<()> {
+fn routes_home_below_ceiling() -> crate::Result<()> {
     let centroids: Vec<Vec<f32>> = (0..16)
         .map(|i| vec![(i % 4) as f32 * 10.0, (i / 4) as f32 * 10.0])
         .collect();
@@ -348,8 +348,7 @@ fn routes_through_graph_below_ceiling() -> crate::Result<()> {
     Ok(())
 }
 
-/// A single-centroid segment has no routing graph; it ranks its one cluster and returns the
-/// oracle's top k.
+/// A single-centroid segment ranks its one cluster and returns the oracle's top k.
 #[test]
 fn single_centroid_segment_routes() -> crate::Result<()> {
     let fixture = FixtureSpec::ivf(
