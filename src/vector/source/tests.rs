@@ -3,19 +3,19 @@
 use common::BitSet;
 
 use super::controller::{
-    fixed_probe_cost_rows, open_share, ProbeController, ProbeTermination, WorkBudget, WorkMeter,
-    WorkUnits,
+    open_share, ProbeController, ProbeTermination, WorkBudget, WorkMeter, WorkUnits,
+    DEFAULT_FIXED_PROBE_COST_ROWS,
 };
 use super::router::{DocFilter, GatedRows, RouterClusters, RouterReport, RowGate};
 use crate::query::{AllQuery, Query};
 use crate::schema::Metric;
 use crate::vector::bounds::{HeapPeek, QueryBound, QueryBoundTracker};
 use crate::vector::cluster_source::{ClusterSource, Feedback};
-use crate::vector::ivf::{AdaptiveProbeParams, RecallEstimator};
+use crate::vector::ivf::{AdaptiveProbeParams, LocatedPath, RecallEstimator};
 use crate::vector::router::RouterWorkspace;
 use crate::vector::segment::plan::Source;
 use crate::vector::test_support::{DocsWeight, Fixture, FixtureSpec, Lcg, SegmentRun};
-use crate::vector::tests::{exhaustive_params, TestVectorIndex};
+use crate::vector::tests::{exhaustive_params, routed_exhaustive_params, TestVectorIndex};
 use crate::vector::{RouterKind, VectorDType, VectorStorageFormat};
 use crate::DocId;
 
@@ -135,10 +135,13 @@ fn kth_score(fixture: &Fixture, query: &[f32], k: usize) -> crate::Result<f32> {
     Ok(fixture.oracle(&AllQuery, query, k)?[k - 1].0)
 }
 
+/// A budget of `max_probe_fraction` on the routed path.
 fn budget_params(max_probe_fraction: f32) -> AdaptiveProbeParams {
     AdaptiveProbeParams {
         max_probe_fraction,
         min_probe_clusters: 1,
+        exact_plan: false,
+        located: LocatedPath::Off,
         ..Default::default()
     }
 }
@@ -191,7 +194,7 @@ fn controller_charges_opens_and_scored_rows() -> crate::Result<()> {
     // Sizes [20, 2]: three of cluster 0's docs pass the filter; the rest are walked, not charged.
     let fixture = sized_fixture(&[20, 2], 0.001)?;
     let n_avg = 11.0;
-    let x = fixed_probe_cost_rows() / (fixed_probe_cost_rows() + n_avg);
+    let x = DEFAULT_FIXED_PROBE_COST_ROWS / (DEFAULT_FIXED_PROBE_COST_ROWS + n_avg);
     let row = (1.0 - x) / n_avg;
     let docs = fixture.cluster_docs(0)?[0][..3].to_vec();
     let max_doc = fixture.index.reader()?.searcher().segment_readers()[0].max_doc();
@@ -230,7 +233,7 @@ fn controller_charges_opens_and_scored_rows() -> crate::Result<()> {
     )?;
     assert_eq!(gated.clusters.len(), 1);
     assert_eq!(gated.report.counters.bounds_skips, 5);
-    let x = open_share(6.0);
+    let x = open_share(DEFAULT_FIXED_PROBE_COST_ROWS, 6.0);
     let expected = 6.0 * x + 6.0 * (1.0 - x) / 6.0;
     assert!(
         (gated.report.probe.work_charged as f64 - expected).abs() < 1e-5,
@@ -564,7 +567,7 @@ fn gate_bookkeeping() -> crate::Result<()> {
     assert_eq!(walk.rows, 18);
     assert_eq!(walk.report.counters.bounds_skips, 0);
     assert_eq!(walk.report.counters.bound_armed_at, None);
-    let x = open_share(6.0);
+    let x = open_share(DEFAULT_FIXED_PROBE_COST_ROWS, 6.0);
     let expected = 3.0 * x + 18.0 * (1.0 - x) / 6.0;
     assert!((walk.report.probe.work_charged as f64 - expected).abs() < 1e-5);
 
@@ -596,44 +599,50 @@ fn gate_bookkeeping() -> crate::Result<()> {
         .iter()
         .flat_map(|docs| docs.iter().step_by(2).copied())
         .collect();
-    fixture.with_segment(&AllQuery, &[1.0, 1.0], 100, &exhaustive_params(2), |seg| {
-        let weight = DocsWeight {
-            max_doc,
-            docs: keep.clone(),
-        };
-        let gated = SegmentRun {
-            weight: &weight,
-            ..*seg
-        };
-        for (run, open) in [(seg, true), (&gated, false)] {
-            let plan = run.plan()?;
-            let Some(Source::Router(filter)) = plan.source else {
-                panic!("the router source walks router plans");
+    fixture.with_segment(
+        &AllQuery,
+        &[1.0, 1.0],
+        100,
+        &routed_exhaustive_params(2),
+        |seg| {
+            let weight = DocsWeight {
+                max_doc,
+                docs: keep.clone(),
             };
-            let mut workspace = RouterWorkspace::default();
-            let mut source = RouterClusters::new(
-                run.searcher.reader(),
-                run.searcher.query(),
-                &mut workspace,
-                plan.budget,
-                filter,
-                run.segment,
-                run.searcher.params(),
-            );
-            while let Some(rows) = source.next(Feedback::default())? {
-                match rows.docs {
-                    None => assert!(open),
-                    Some(given) => {
-                        assert!(!open);
-                        assert_eq!(given.len(), rows.len());
-                        assert!(given.iter().all(|doc| keep.contains(doc)));
+            let gated = SegmentRun {
+                weight: &weight,
+                ..*seg
+            };
+            for (run, open) in [(seg, true), (&gated, false)] {
+                let plan = run.plan()?;
+                let Some(Source::Router(filter)) = plan.source else {
+                    panic!("the router source walks router plans");
+                };
+                let mut workspace = RouterWorkspace::default();
+                let mut source = RouterClusters::new(
+                    run.searcher.reader(),
+                    run.searcher.query(),
+                    &mut workspace,
+                    plan.budget,
+                    filter,
+                    run.segment,
+                    run.searcher.params(),
+                );
+                while let Some(rows) = source.next(Feedback::default())? {
+                    match rows.docs {
+                        None => assert!(open),
+                        Some(given) => {
+                            assert!(!open);
+                            assert_eq!(given.len(), rows.len());
+                            assert!(given.iter().all(|doc| keep.contains(doc)));
+                        }
                     }
+                    let len = rows.len();
+                    source.admitted(len, Feedback::default())?;
                 }
-                let len = rows.len();
-                source.admitted(len, Feedback::default())?;
             }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
     Ok(())
 }

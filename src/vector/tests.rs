@@ -7,7 +7,7 @@ use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
 use crate::query::{AllQuery, TermQuery};
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, STRING};
-use crate::vector::ivf::AdaptiveProbeParams;
+use crate::vector::ivf::{AdaptiveProbeParams, LocatedPath};
 use crate::vector::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
     Metric, RouterKind, VectorDType, VectorOptions,
@@ -114,7 +114,7 @@ impl TestVectorIndexBuilder {
             builder = builder.ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: self.centroids.clone(),
             }));
-            builder = builder.ivf_router(self.router)?;
+            builder = builder.ivf_router(self.router);
         }
         builder.create_in_ram()
     }
@@ -465,26 +465,6 @@ fn flat_top_n_returns_nearest_when_more_than_k_docs_per_segment() -> crate::Resu
 }
 
 #[test]
-fn ivf_clusterer_requires_an_explicit_router() {
-    let mut schema_builder = Schema::builder();
-    schema_builder.add_vector_field(
-        EMBEDDING_FIELD_NAME,
-        VectorOptions::new(grid2d::DIM, Metric::L2),
-    );
-    let error = Index::builder()
-        .schema(schema_builder.build())
-        .ivf_clusterer(Arc::new(Grid2DClusterer {
-            centroids: grid2d::centroids(),
-        }))
-        .create_in_ram()
-        .err()
-        .expect("an IVF clusterer without a router must be rejected");
-    assert!(error
-        .to_string()
-        .contains("requires an explicitly configured Router"));
-}
-
-#[test]
 fn ivf_merge_writes_the_selected_stacked_router() -> crate::Result<()> {
     use crate::directory::CompositeFile;
     use crate::index::SegmentComponent;
@@ -509,6 +489,135 @@ fn ivf_merge_writes_the_selected_stacked_router() -> crate::Result<()> {
             .read_bytes()?;
         assert_eq!(router_bytes[0], RouterKind::Stacked as u8);
         assert!(router_bytes.len() > 1);
+    }
+    Ok(())
+}
+
+/// With no clusterer or router configured, merges past the threshold write IVF with the default
+/// router, on the created index and after a reopen; an exhaustive search matches the oracle.
+#[test]
+fn default_setup_clusters_past_the_threshold() -> crate::Result<()> {
+    use crate::directory::RamDirectory;
+    use crate::IndexWriter;
+
+    let mut schema_builder = Schema::builder();
+    let field = schema_builder.add_vector_field(
+        EMBEDDING_FIELD_NAME,
+        VectorOptions::new(grid2d::DIM, Metric::L2),
+    );
+    let settings = IndexSettings {
+        vector_clustering_threshold: 64,
+        ..IndexSettings::default()
+    };
+    let directory = RamDirectory::create();
+    let vectors = grid2d::vectors(150);
+    let commit_and_merge = |index: &Index, commits: &[&[[f32; 2]]]| -> crate::Result<()> {
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for commit in commits {
+            for vector in *commit {
+                let mut doc = TantivyDocument::new();
+                doc.add_vector(field, vector);
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+        }
+        writer.merge(&index.searchable_segment_ids()?).wait()?;
+        writer.wait_merging_threads()
+    };
+    let assert_default_ivf = |index: &Index| -> crate::Result<()> {
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let vectors = searcher.segment_reader(0).vector_index(field)?;
+        let ivf = vectors.index().expect("the merge must write IVF");
+        assert_eq!(ivf.router(), RouterKind::default());
+        let query = [4.0_f32, 4.0];
+        let expected = ground_truth::top_k(index, field, Metric::L2, &query, 10)?;
+        let actual = searcher.search(
+            &AllQuery,
+            &TopDocs::with_limit(10)
+                .order_by_similarity(field, query.to_vec())
+                .with_adaptive_params(exhaustive_params(0)),
+        )?;
+        assert_eq!(actual.results, expected);
+        Ok(())
+    };
+
+    let index = Index::create(directory.clone(), schema_builder.build(), settings)?;
+    commit_and_merge(&index, &[&vectors[..48], &vectors[48..96]])?;
+    assert_default_ivf(&index)?;
+    drop(index);
+
+    let reopened = Index::open(directory)?;
+    commit_and_merge(&reopened, &[&vectors[96..]])?;
+    assert_default_ivf(&reopened)?;
+    assert_eq!(reopened.reader()?.searcher().num_docs(), 150);
+    Ok(())
+}
+
+/// `IndexBuilder::quantize` stores a fresh-seeded configuration at create that a reopen keeps; a
+/// field the settings already quantize, a text field and a vector below 64 dims are errors.
+#[test]
+fn quantize_on_the_builder() -> crate::Result<()> {
+    use crate::directory::RamDirectory;
+    use crate::vector::VectorQuantizationConfig;
+
+    let mut schema_builder = Schema::builder();
+    let options = VectorOptions::new(64, Metric::Cosine);
+    let embedding = schema_builder.add_vector_field(EMBEDDING_FIELD_NAME, options.clone());
+    let small = schema_builder.add_vector_field("small", VectorOptions::new(8, Metric::L2));
+    let label = schema_builder.add_text_field(LABEL_FIELD_NAME, STRING);
+    let schema = schema_builder.build();
+    let builder = |settings: IndexSettings, field: Field| {
+        Index::builder()
+            .schema(schema.clone())
+            .settings(settings)
+            .quantize(field, [1, 1])
+    };
+    let layers = |index: &Index| index.settings().vector_quantization[0].layers.clone();
+
+    let directory = RamDirectory::create();
+    let created = builder(IndexSettings::default(), embedding).create(directory.clone())?;
+    assert_eq!(created.settings().vector_quantization.len(), 1);
+    assert_eq!(
+        layers(&created)
+            .iter()
+            .map(|layer| layer.bits)
+            .collect::<Vec<_>>(),
+        [1, 1]
+    );
+    assert_eq!(layers(&Index::open(directory)?), layers(&created));
+    let other = builder(IndexSettings::default(), embedding).create_in_ram()?;
+    assert_ne!(layers(&other), layers(&created));
+
+    let explicit = IndexSettings {
+        vector_quantization: vec![VectorQuantizationConfig::with_random_seeds(
+            EMBEDDING_FIELD_NAME.to_string(),
+            &options,
+            &[1],
+        )?],
+        ..IndexSettings::default()
+    };
+    for (case, settings, field, message) in [
+        ("already quantized", explicit, embedding, "duplicated"),
+        (
+            "text field",
+            IndexSettings::default(),
+            label,
+            "not a vector field",
+        ),
+        (
+            "below 64 dims",
+            IndexSettings::default(),
+            small,
+            "dimension",
+        ),
+    ] {
+        let error = builder(settings, field)
+            .create_in_ram()
+            .expect_err(case)
+            .to_string();
+        assert!(error.contains(message), "{case}: {error}");
     }
     Ok(())
 }
@@ -612,6 +721,15 @@ pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
         max_probe_fraction: 1.0,
         min_probe_clusters: 1,
         ..Default::default()
+    }
+}
+
+/// [`exhaustive_params`] on the routed path, with no cluster scored exactly before the exact phase.
+pub(crate) fn routed_exhaustive_params(num_centroids: usize) -> AdaptiveProbeParams {
+    AdaptiveProbeParams {
+        exact_plan: false,
+        located: LocatedPath::Off,
+        ..exhaustive_params(num_centroids)
     }
 }
 
@@ -1040,7 +1158,7 @@ mod bounds_storage_tests {
             .schema(schema)
             .settings(settings)
             .ivf_clusterer(Arc::new(clusterer))
-            .ivf_router(RouterKind::Stacked)?;
+            .ivf_router(RouterKind::Stacked);
         let index = match directory {
             Some(directory) => builder.open_or_create(directory)?,
             None => builder.create_in_ram()?,
@@ -1235,7 +1353,7 @@ mod bounds_storage_tests {
         drop(reopened);
 
         let mut reopened = Index::open(directory)?;
-        reopened.set_ivf_router(RouterKind::Rng)?;
+        reopened.set_ivf_router(RouterKind::Rng);
         reopened.set_ivf_clusterer(Arc::new(clusterer()));
         let routers = |index: &Index| -> crate::Result<Vec<RouterKind>> {
             let searcher = index.reader()?.searcher();
@@ -1264,30 +1382,6 @@ mod bounds_storage_tests {
         assert_eq!(routers(&reopened)?, vec![RouterKind::Rng]);
         let searcher = reopened.reader()?.searcher();
         assert_eq!(searcher.num_docs(), 6);
-        Ok(())
-    }
-
-    #[test]
-    fn configured_router_cannot_be_changed() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        schema_builder.add_vector_field(EMBEDDING_FIELD_NAME, VectorOptions::new(2, Metric::L2));
-        let settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..IndexSettings::default()
-        };
-        let mut index = Index::builder()
-            .schema(schema_builder.build())
-            .settings(settings)
-            .ivf_clusterer(Arc::new(TestClusterer {
-                fixed_centroids: Some(vec![[0.0, 0.0], [10.0, 10.0]]),
-                num_centroids: 2,
-            }))
-            .ivf_router(RouterKind::Rng)?
-            .create_in_ram()?;
-        let error = index
-            .set_ivf_router(RouterKind::Stacked)
-            .expect_err("an Index must use one router");
-        assert!(error.to_string().contains("already configured as rng"));
         Ok(())
     }
 

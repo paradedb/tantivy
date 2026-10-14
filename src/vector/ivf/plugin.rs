@@ -146,10 +146,12 @@ fn build_router(
     Ok(router)
 }
 
+/// Writes `ctx`'s target segment as IVF: centroids trained by `clusterer`, every vector assigned,
+/// and a new `router` over the centroids.
 pub(crate) fn merge_ivf(
     ctx: &PluginMergeContext,
-    clusterer: Option<&dyn IvfClusterer>,
-    router: Option<RouterKind>,
+    clusterer: &dyn IvfClusterer,
+    router: RouterKind,
 ) -> crate::Result<()> {
     if ctx.cancel.wants_cancel() {
         return Err(TantivyError::Cancelled);
@@ -162,19 +164,6 @@ pub(crate) fn merge_ivf(
     if !has_vector_field {
         return Ok(());
     }
-
-    let clusterer = clusterer.ok_or_else(|| {
-        TantivyError::InvalidArgument(
-            "vector_clustering_threshold selected IVF merge, but no IvfClusterer is configured"
-                .to_string(),
-        )
-    })?;
-    let router = router.ok_or_else(|| {
-        TantivyError::InvalidArgument(
-            "vector_clustering_threshold selected IVF merge, but no Router is configured"
-                .to_string(),
-        )
-    })?;
 
     let num_target_docs: u32 = ctx.readers.iter().map(|r| r.num_docs()).sum();
     if num_target_docs == 0 {
@@ -745,7 +734,7 @@ mod tests {
     use crate::indexer::NoMergePolicy;
     use crate::query::{AllQuery, EnableScoring, Query, TermQuery};
     use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
-    use crate::vector::ivf::AdaptiveProbeParams;
+    use crate::vector::ivf::{AdaptiveProbeParams, LocatedPath};
     use crate::vector::prepared::{QuantizedQueryCtx, VectorQuery};
     use crate::vector::tests::ground_truth;
     use crate::vector::{
@@ -842,7 +831,7 @@ mod tests {
                 dim: 65,
                 metric: Metric::L2,
             }))
-            .ivf_router(RouterKind::Rng)?
+            .ivf_router(RouterKind::Rng)
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 30_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -1262,7 +1251,7 @@ mod tests {
             .schema(schema)
             .settings(settings)
             .ivf_clusterer(Arc::new(QuantFixtureClusterer { dim, metric }))
-            .ivf_router(router)?
+            .ivf_router(router)
             .create(directory)?;
         let mut writer = index.writer_with_num_threads(1, 30_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -1510,6 +1499,8 @@ mod tests {
             .with_adaptive_params(AdaptiveProbeParams {
                 max_probe_fraction: 1.0,
                 min_probe_clusters: 2,
+                exact_plan: false,
+                located: LocatedPath::Off,
                 ..Default::default()
             })
             .with_max_scan_levels(depth);
@@ -1576,6 +1567,8 @@ mod tests {
             let params = AdaptiveProbeParams {
                 max_probe_fraction,
                 min_probe_clusters: 2,
+                exact_plan: false,
+                located: LocatedPath::Off,
                 ..Default::default()
             };
             let quantized = searcher.search(
@@ -1721,6 +1714,8 @@ mod tests {
         let params = AdaptiveProbeParams {
             max_probe_fraction: 0.5,
             min_probe_clusters: 1,
+            exact_plan: false,
+            located: LocatedPath::Off,
             ..Default::default()
         };
         let unquantized = build_quantized_fixture(DIM, false)?;
@@ -2051,6 +2046,8 @@ mod tests {
             .with_adaptive_params(AdaptiveProbeParams {
                 max_probe_fraction: 1.0,
                 min_probe_clusters: 2,
+                exact_plan: false,
+                located: LocatedPath::Off,
                 ..Default::default()
             });
         let quantized_fruit = searcher.search(&AllQuery, &collector)?;
@@ -2115,6 +2112,8 @@ mod tests {
             .with_adaptive_params(AdaptiveProbeParams {
                 max_probe_fraction: 1.0,
                 min_probe_clusters: 1,
+                exact_plan: false,
+                located: LocatedPath::Off,
                 ..Default::default()
             })
             .with_max_scan_levels(1);
@@ -2143,6 +2142,8 @@ mod tests {
             .with_adaptive_params(AdaptiveProbeParams {
                 max_probe_fraction: 0.1,
                 min_probe_clusters: 1,
+                exact_plan: false,
+                located: LocatedPath::Off,
                 ..Default::default()
             })
             .with_max_scan_levels(1);
@@ -2187,6 +2188,8 @@ mod tests {
                 max_probe_fraction: 1.0,
                 min_probe_clusters: 1,
                 recall_target: 0.5,
+                exact_plan: false,
+                located: LocatedPath::Off,
                 ..Default::default()
             })
             .with_max_scan_levels(1);
@@ -2225,6 +2228,8 @@ mod tests {
         let params = AdaptiveProbeParams {
             max_probe_fraction: 1.0,
             min_probe_clusters: 2,
+            exact_plan: false,
+            located: LocatedPath::Off,
             ..Default::default()
         };
         let vector_reader = searcher.segment_readers()[0].vector_index(field)?;
@@ -2472,6 +2477,8 @@ mod tests {
                 AdaptiveProbeParams {
                     max_probe_fraction: 1.0,
                     min_probe_clusters: 2,
+                    exact_plan: false,
+                    located: LocatedPath::Off,
                     ..Default::default()
                 },
             ),
@@ -2564,6 +2571,8 @@ mod tests {
                 .with_adaptive_params(AdaptiveProbeParams {
                     max_probe_fraction: 1.0,
                     min_probe_clusters: 2,
+                    exact_plan: false,
+                    located: LocatedPath::Off,
                     ..Default::default()
                 }),
         )?;

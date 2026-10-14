@@ -4,9 +4,6 @@
 //! open charges `x` and a scored row `(1 - x) / n_avg`, so an exhaustive, unfiltered, delete-free
 //! scan charges exactly `C`. The budget is checked only between clusters.
 
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::Relaxed;
-
 use crate::vector::ivf::RecallEstimator;
 use crate::vector::Similarity;
 use crate::Score;
@@ -26,40 +23,22 @@ pub enum ProbeTermination {
 
 // --- Work units ---
 
-/// Cost of opening a cluster, in rows of full work, fitted on the reference fixture.
+/// Default [`AdaptiveProbeParams::fixed_probe_cost_rows`]: the cost of opening a cluster, in rows
+/// of full work, fitted on the reference fixture.
 ///
 /// Policy constant: the open share `x = cost / (cost + n_avg)` follows the index's granularity.
 /// It covers the open only; routing cost is not modeled.
+///
+/// [`AdaptiveProbeParams::fixed_probe_cost_rows`]: crate::vector::ivf::AdaptiveProbeParams::fixed_probe_cost_rows
 pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 
-/// The current fixed cluster-open cost, as binary64 bits.
-static FIXED_PROBE_COST_ROWS_BITS: AtomicU64 =
-    AtomicU64::new(DEFAULT_FIXED_PROBE_COST_ROWS.to_bits());
-
-/// Sets the fixed cluster-open cost in row-work units, for testing and calibration.
-///
-/// A non-finite or non-positive value restores [`DEFAULT_FIXED_PROBE_COST_ROWS`].
-pub fn set_fixed_probe_cost_rows(v: f64) {
-    let v = if v.is_finite() && v > 0.0 {
-        v
-    } else {
-        DEFAULT_FIXED_PROBE_COST_ROWS
-    };
-    FIXED_PROBE_COST_ROWS_BITS.store(v.to_bits(), Relaxed);
-}
-
-/// Returns the fixed cluster-open cost in row-work units.
-pub(crate) fn fixed_probe_cost_rows() -> f64 {
-    f64::from_bits(FIXED_PROBE_COST_ROWS_BITS.load(Relaxed))
-}
-
-/// The open share `x = cost / (cost + n_avg)` for `n_avg` native docs per cluster.
+/// The open share `x = cost / (cost + n_avg)` for a cluster-open cost of `fixed_cost_rows` rows
+/// and `n_avg` native docs per cluster.
 ///
 /// Clamped to at most one half: a larger share means opens outweigh rows, which only clusters of
 /// under two rows produce.
-pub(crate) fn open_share(n_avg: f64) -> f64 {
-    let fixed = fixed_probe_cost_rows();
-    (fixed / (fixed + n_avg.max(0.0))).min(0.5)
+pub(crate) fn open_share(fixed_cost_rows: f64, n_avg: f64) -> f64 {
+    (fixed_cost_rows / (fixed_cost_rows + n_avg.max(0.0))).min(0.5)
 }
 
 /// Probe work in average-cluster units; budgets, prices and spends compose only with each other.

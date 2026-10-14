@@ -320,7 +320,7 @@ impl FixtureSpec {
                 .ivf_clusterer(Arc::new(NearestClusterer {
                     centroids: centroids.clone(),
                 }))
-                .ivf_router(self.router)?;
+                .ivf_router(self.router);
         }
         let index = match &directory {
             Some(directory) => builder.create(directory.clone())?,
