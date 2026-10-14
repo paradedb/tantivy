@@ -47,15 +47,14 @@ impl DocFilter {
     }
 }
 
-/// How a cluster row is tested before scoring: the filter's matches intersected with the alive
-/// docs.
+/// How a cluster row is tested before scoring: against the filter's matches and the alive docs.
 pub(crate) enum RowGate<'a> {
     Open,
     AliveOnly(&'a AliveBitSet),
     FilterOnly(BitSet),
     FilterAndAlive {
         filter: BitSet,
-        filter_and_alive: BitSet,
+        alive: &'a AliveBitSet,
     },
 }
 
@@ -74,14 +73,7 @@ impl<'a> RowGate<'a> {
             (DocFilter::All, None) => RowGate::Open,
             (DocFilter::All, Some(alive)) => RowGate::AliveOnly(alive),
             (DocFilter::Docs(filter), None) => RowGate::FilterOnly(filter),
-            (DocFilter::Docs(filter), Some(alive)) => {
-                let mut filter_and_alive = filter.clone();
-                filter_and_alive.intersect_update(alive.bitset());
-                RowGate::FilterAndAlive {
-                    filter,
-                    filter_and_alive,
-                }
-            }
+            (DocFilter::Docs(filter), Some(alive)) => RowGate::FilterAndAlive { filter, alive },
         }
     }
 
@@ -91,7 +83,7 @@ impl<'a> RowGate<'a> {
     }
 
     /// Gates a cluster whose DocIds column is `doc_ids`, writing the kept cluster-local offsets.
-    pub(crate) fn select(&self, doc_ids: &[DocId], offsets: &mut Vec<usize>) -> GatedRows {
+    pub(crate) fn select(&self, doc_ids: &[DocId], offsets: &mut Vec<u32>) -> GatedRows {
         offsets.clear();
         let (pruned_filter, pruned_dead) = match self {
             RowGate::Open => {
@@ -115,14 +107,11 @@ impl<'a> RowGate<'a> {
                     RowVerdict::Filtered
                 }
             }),
-            RowGate::FilterAndAlive {
-                filter,
-                filter_and_alive,
-            } => gate(doc_ids, offsets, |doc| {
-                if filter_and_alive.contains(doc) {
-                    RowVerdict::Keep
-                } else if !filter.contains(doc) {
+            RowGate::FilterAndAlive { filter, alive } => gate(doc_ids, offsets, |doc| {
+                if !filter.contains(doc) {
                     RowVerdict::Filtered
+                } else if alive.is_alive(doc) {
+                    RowVerdict::Keep
                 } else {
                     RowVerdict::Dead
                 }
@@ -146,12 +135,12 @@ enum RowVerdict {
 #[inline(always)]
 fn gate(
     doc_ids: &[DocId],
-    offsets: &mut Vec<usize>,
+    offsets: &mut Vec<u32>,
     verdict: impl Fn(DocId) -> RowVerdict,
 ) -> (usize, usize) {
     let mut pruned_filter = 0usize;
     let mut pruned_dead = 0usize;
-    for (offset, &doc) in doc_ids.iter().enumerate() {
+    for (offset, &doc) in (0u32..).zip(doc_ids) {
         match verdict(doc) {
             RowVerdict::Keep => offsets.push(offset),
             RowVerdict::Filtered => pruned_filter += 1,
@@ -207,7 +196,7 @@ pub(crate) struct RouterClusters<'a, T: VectorElement> {
     gate: RowGate<'a>,
     /// The current cluster's DocIds column; read only when the gate is closed.
     docs: Vec<DocId>,
-    offsets: Vec<usize>,
+    offsets: Vec<u32>,
     selected_docs: Vec<DocId>,
     counters: RouterCounters,
 }
@@ -371,8 +360,11 @@ impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
                 (None, None)
             } else {
                 self.selected_docs.clear();
-                self.selected_docs
-                    .extend(self.offsets.iter().map(|&offset| self.docs[offset]));
+                self.selected_docs.extend(
+                    self.offsets
+                        .iter()
+                        .map(|&offset| self.docs[offset as usize]),
+                );
                 (Some(&self.offsets[..]), Some(&self.selected_docs[..]))
             };
             return Ok(Some(ClusterRows {

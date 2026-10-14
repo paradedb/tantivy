@@ -13,7 +13,7 @@ pub(crate) struct ClusterRows<'a> {
     pub(crate) rows: Range<usize>,
     /// Strictly ascending cluster-local offsets of the selected rows, at least one; `None`
     /// selects every row.
-    pub(crate) offsets: Option<&'a [usize]>,
+    pub(crate) offsets: Option<&'a [u32]>,
     /// Doc ids aligned with `offsets`, when already in hand; otherwise the scan reads the DocIds
     /// column for the rows that need one.
     pub(crate) docs: Option<&'a [DocId]>,
@@ -27,7 +27,7 @@ impl ClusterRows<'_> {
     /// Number of selected rows.
     #[inline]
     pub(crate) fn len(&self) -> usize {
-        self.offsets.map_or(self.rows.len(), <[usize]>::len)
+        self.offsets.map_or(self.rows.len(), <[u32]>::len)
     }
 
     /// The selected rows' global row numbers, ascending.
@@ -36,7 +36,11 @@ impl ClusterRows<'_> {
             None => (self.rows.clone(), &[][..]),
             Some(offsets) => (0..0, offsets),
         };
-        span.chain(offsets.iter().map(|&offset| self.rows.start + offset))
+        span.chain(
+            offsets
+                .iter()
+                .map(|&offset| self.rows.start + offset as usize),
+        )
     }
 }
 

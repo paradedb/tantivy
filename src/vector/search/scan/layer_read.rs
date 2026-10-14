@@ -81,15 +81,17 @@ pub(crate) fn decode_layer(
     out.resize(selected.len(), spec.metric());
     match (read, selected.offsets) {
         (LayerRead::Sparse, Some(_)) => decode_runs(spec, selected, out, scratch),
-        _ => decode_band(spec, selected, out),
+        _ => decode_band(spec, selected, out, &mut scratch.offsets),
     }
 }
 
-/// Reads the cluster's band and decodes the selected rows from it.
+/// Reads the cluster's band and decodes the selected rows from it; `kernel_offsets` holds the
+/// selected rows' offsets as the scoring kernel indexes them.
 fn decode_band(
     spec: &LayerSpec<'_>,
     selected: &ClusterRows<'_>,
     out: &mut Decoded,
+    kernel_offsets: &mut Vec<usize>,
 ) -> crate::Result<()> {
     let band = spec
         .reader
@@ -120,7 +122,11 @@ fn decode_band(
                 decode_f32s(band_constants(&band)?, &mut out.constants);
             }
         }
-        Some(offsets) => decode_band_rows(spec, &band, offsets, out, selected.rows.start)?,
+        Some(offsets) => {
+            kernel_offsets.clear();
+            kernel_offsets.extend(offsets.iter().map(|&offset| offset as usize));
+            decode_band_rows(spec, &band, kernel_offsets, out, selected.rows.start)?
+        }
     }
     Ok(())
 }

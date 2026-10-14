@@ -95,7 +95,8 @@ impl SegmentPlan {
         })
     }
 
-    /// Upper bound on rows the scan will admit, for sizing its columns.
+    /// The rows the scan admits under the budget, for reserving its columns once. The last
+    /// cluster can overshoot the budget, growing the columns once more.
     pub(crate) fn capacity_hint(&self) -> usize {
         let rows = match &self.source {
             Some(Source::Router(_)) => {

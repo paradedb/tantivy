@@ -315,7 +315,11 @@ mod tests {
         assert_eq!(mixed.running_estimate(3), Some(8.0));
         assert_eq!(mixed.boundary_lower(3, 2.0), threshold(7.0));
         mixed.band(3, 2.0);
-        assert_eq!(mixed.candidates.rows, [0, 1], "exact rows push row 2 out");
+        assert_eq!(
+            mixed.candidates.global_rows(),
+            [0, 1],
+            "exact rows push row 2 out"
+        );
         // Fewer quantized rows than k still reach a threshold through the exact rows.
         let mut wide = admitted(4, 2.0, &quantized);
         wide.push_exact(7.0, 4);
@@ -328,7 +332,7 @@ mod tests {
             far.push(row, row as DocId, estimate, 0.1);
         }
         far.band(1, 2.0);
-        assert_eq!(far.candidates.rows, [0]);
+        assert_eq!(far.candidates.global_rows(), [0]);
     }
 
     /// When every interval encloses its row's exact score, with or without exactly scored rows,
@@ -353,7 +357,7 @@ mod tests {
         let mut harness = admitted(2, QUANTIZED_BOUNDARY_KAPPA, &rows);
         harness.band(2, QUANTIZED_BOUNDARY_KAPPA);
         assert!(
-            harness.candidates.docs.contains(&2),
+            harness.candidates.doc_ids().contains(&2),
             "the true runner-up survives"
         );
 
@@ -403,18 +407,15 @@ mod tests {
                 let mut order = (0..n).collect::<Vec<_>>();
                 order.sort_by(|&a, &b| truth[b].total_cmp(&truth[a]));
                 harness.band(k, QUANTIZED_BOUNDARY_KAPPA);
+                let survivors = harness.candidates.global_rows();
                 for row in &order[..k] {
                     assert!(
-                        exact_rows.contains(row) || harness.candidates.rows.contains(row),
+                        exact_rows.contains(row) || survivors.contains(row),
                         "exact={with_exact} seed {seed}, true row {row}"
                     );
                 }
                 assert!(
-                    harness
-                        .candidates
-                        .rows
-                        .iter()
-                        .all(|row| !exact_rows.contains(row)),
+                    survivors.iter().all(|row| !exact_rows.contains(row)),
                     "exact={with_exact} seed {seed}: an exact row stayed a candidate"
                 );
             }
@@ -427,7 +428,7 @@ mod tests {
             harness.push(row, row as DocId, estimate, sigma);
         }
         harness.band(k, kappa);
-        harness.candidates.rows
+        harness.candidates.global_rows()
     }
 
     /// Widening kappa, or any one row's sigma, never removes a survivor.
@@ -491,7 +492,12 @@ mod tests {
             scan.push(row, row as DocId, layer0_scores[row], layer0_sigmas[row]);
         }
         scan.band(TOP_N, KAPPA);
-        let scan_first: Vec<u32> = scan.candidates.rows.iter().map(|&row| row as u32).collect();
+        let scan_first: Vec<u32> = scan
+            .candidates
+            .global_rows()
+            .iter()
+            .map(|&row| row as u32)
+            .collect();
         assert!(
             harness_first.len() < CANDIDATES,
             "the first boundary filters"
@@ -518,13 +524,17 @@ mod tests {
                 .map(|&local| harness_first[local as usize])
                 .collect();
 
-        for index in 0..scan.candidates.len() {
-            let row = scan.candidates.rows[index];
+        for (index, row) in scan.candidates.global_rows().into_iter().enumerate() {
             scan.candidates.columns.estimates[index] += refinements[row];
             scan.candidates.columns.sigmas[index] = layer1_sigmas[row];
         }
         scan.band(TOP_N, KAPPA);
-        let scan_second: Vec<u32> = scan.candidates.rows.iter().map(|&row| row as u32).collect();
+        let scan_second: Vec<u32> = scan
+            .candidates
+            .global_rows()
+            .iter()
+            .map(|&row| row as u32)
+            .collect();
         assert!(
             harness_second.len() < harness_first.len(),
             "the second boundary filters"

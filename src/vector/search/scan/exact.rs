@@ -16,11 +16,11 @@ use crate::vector::{VectorElement, VectorStage};
 use crate::{DocAddress, DocId, SegmentOrdinal};
 
 /// Full-precision rows of one cluster's selection.
-enum ExactRows {
+enum ExactRows<'s> {
     /// The cluster's whole full-precision span, in one request.
     Span(OwnedBytes),
-    /// The selected rows, through a storage-aware read plan.
-    Planned(VectorRowBatch),
+    /// The selected rows, through a storage-aware read plan into the scan's scratch.
+    Planned(VectorRowBatch<'s>),
 }
 
 /// Scores rows exactly into the bound and the result heap; the only way rows reach the heap.
@@ -35,7 +35,6 @@ where
     topn: TieBreakHeap<K, C>,
     tie_break: &'a mut K,
     pub(super) bound: KthBound,
-    scratch: ReadScratch,
     /// A cluster's DocIds column, read when its selected rows carry no doc ids.
     cluster_docs: Vec<DocId>,
     /// Global rows scored in the exact phase, in order; the scan copies them into its trace.
@@ -62,7 +61,6 @@ where
             topn: TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator)),
             tie_break,
             bound: KthBound::new(top_n),
-            scratch: ReadScratch::default(),
             cluster_docs: Vec::new(),
             #[cfg(test)]
             exact_phase_rows: Vec::new(),
@@ -71,23 +69,37 @@ where
 
     // --- Scoring ---
 
-    /// Scores every row `selected` selects; returns the rows scored. A row without a doc id reads
-    /// the cluster's DocIds column when it first needs one.
-    pub(super) fn score(&mut self, selected: &ClusterRows<'_>) -> crate::Result<usize> {
-        self.score_rows(selected, false)
+    /// Scores every row `selected` selects, reading through `scratch`; returns the rows scored. A
+    /// row without a doc id reads the cluster's DocIds column when it first needs one.
+    pub(super) fn score(
+        &mut self,
+        selected: &ClusterRows<'_>,
+        scratch: &mut ReadScratch,
+    ) -> crate::Result<usize> {
+        self.score_rows(selected, scratch, false)
     }
 
-    /// Scores the exact phase's survivors in `selected`; returns the rows scored. Without doc ids
-    /// in hand, the cluster's DocIds column is read up front with the rows.
-    pub(super) fn score_survivors(&mut self, selected: &ClusterRows<'_>) -> crate::Result<usize> {
+    /// Scores the exact phase's survivors in `selected`, reading through `scratch`; returns the
+    /// rows scored. Without doc ids in hand, the cluster's DocIds column is read up front with the
+    /// rows.
+    pub(super) fn score_survivors(
+        &mut self,
+        selected: &ClusterRows<'_>,
+        scratch: &mut ReadScratch,
+    ) -> crate::Result<usize> {
         #[cfg(test)]
         self.exact_phase_rows.extend(selected.global_rows());
-        self.score_rows(selected, selected.docs.is_none())
+        self.score_rows(selected, scratch, selected.docs.is_none())
     }
 
     /// Reads `selected`'s rows in `ExactFetch`, with the DocIds column first when `docs_first`, and
     /// scores them in `ExactScore`.
-    fn score_rows(&mut self, selected: &ClusterRows<'_>, docs_first: bool) -> crate::Result<usize> {
+    fn score_rows(
+        &mut self,
+        selected: &ClusterRows<'_>,
+        scratch: &mut ReadScratch,
+        docs_first: bool,
+    ) -> crate::Result<usize> {
         let mut column_read = false;
         let rows = {
             let _fetch = enter_vector_stage(VectorStage::ExactFetch);
@@ -96,7 +108,7 @@ where
                     .read_doc_ids(selected.cluster, &mut self.cluster_docs)?;
                 column_read = true;
             }
-            self.read(selected)?
+            self.read(selected, scratch)?
         };
         let _score = enter_vector_stage(VectorStage::ExactScore);
 
@@ -171,17 +183,19 @@ where
 
     // --- Reads ---
 
-    /// Reads the selected full-precision rows: the cluster's span, or the rows planned.
-    fn read(&mut self, selected: &ClusterRows<'_>) -> crate::Result<ExactRows> {
+    /// Reads the selected full-precision rows: the cluster's span, or the rows planned into
+    /// `scratch`.
+    fn read<'s>(
+        &self,
+        selected: &ClusterRows<'_>,
+        scratch: &'s mut ReadScratch,
+    ) -> crate::Result<ExactRows<'s>> {
         Ok(match selected.offsets {
             None => ExactRows::Span(self.reader.read_cluster_rows(selected.cluster)?),
             Some(_) => {
-                let ReadScratch {
-                    rows, runs, blocks, ..
-                } = &mut self.scratch;
-                rows.clear();
-                rows.extend(selected.global_rows());
-                ExactRows::Planned(self.reader.read_vector_rows_planned(rows, runs, blocks)?)
+                scratch.rows.clear();
+                scratch.rows.extend(selected.global_rows());
+                ExactRows::Planned(self.reader.read_vector_rows_planned(scratch)?)
             }
         })
     }

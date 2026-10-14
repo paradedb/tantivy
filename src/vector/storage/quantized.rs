@@ -19,6 +19,7 @@ use crate::vector::quantization::{
 use crate::vector::storage::blocks::Blocks;
 use crate::vector::storage::io::VectorRead;
 use crate::vector::storage::metadata::{SlotType, VectorColMetadata};
+use crate::vector::storage::reader::VectorRowChunk;
 use crate::TantivyError;
 
 /// Deferred code, sidecar, and optional L2-constant slices for one residual layer.
@@ -81,7 +82,7 @@ pub(crate) fn range_cost(
 pub(crate) fn exact_read_cost(
     column: &FileSlice,
     stride: usize,
-    offsets: Option<&[usize]>,
+    offsets: Option<&[u32]>,
     rows: usize,
 ) -> ReadCost {
     let Some(offsets) = offsets else {
@@ -94,6 +95,7 @@ pub(crate) fn exact_read_cost(
     let mut blocks = 0usize;
     let mut next = 0usize;
     for &offset in offsets {
+        let offset = offset as usize;
         let Some((first, last)) =
             storage_block_span(column, offset * stride..(offset + 1) * stride)
         else {
@@ -116,10 +118,12 @@ pub(crate) struct ReadScratch {
     /// Planned row runs, in row order: code runs of a sparse layer read, row runs of an exact
     /// read.
     pub(crate) runs: Vec<Range<usize>>,
-    /// Offsets of the selected rows within one run.
+    /// Offsets of the selected rows within one run or band, as the scoring kernels index them.
     pub(crate) offsets: Vec<usize>,
     /// Storage-block runs of an exact read.
     pub(crate) blocks: Vec<(usize, usize)>,
+    /// The row chunks of an exact read, borrowed by its batch.
+    pub(crate) chunks: Vec<VectorRowChunk>,
 }
 
 /// Pinned SoA ranges for one contiguous cluster posting.
@@ -435,7 +439,7 @@ impl QuantizedLayerReader {
     pub(crate) fn sparse_cost(
         &self,
         cluster: usize,
-        offsets: &[usize],
+        offsets: &[u32],
         scratch: &mut ReadScratch,
     ) -> crate::Result<ReadCost> {
         let reader = self.cluster_in_block(cluster)?;
@@ -443,7 +447,7 @@ impl QuantizedLayerReader {
         scratch.rows.clear();
         scratch
             .rows
-            .extend(offsets.iter().map(|&offset| origin + offset));
+            .extend(offsets.iter().map(|&offset| origin + offset as usize));
         reader.plan_codes(&scratch.rows, &mut scratch.runs);
         let stride = self.code_stride;
         let unit = reader.codes.storage_block_len();
@@ -1505,7 +1509,7 @@ mod tests {
             block_len: 100,
         }));
         let column = file.slice(0..400);
-        let cost = |offsets: Option<&[usize]>| exact_read_cost(&column, 40, offsets, 10).0;
+        let cost = |offsets: Option<&[u32]>| exact_read_cost(&column, 40, offsets, 10).0;
         assert_eq!(cost(Some(&[0, 1])), 1);
         assert_eq!(cost(Some(&[0, 3])), 2);
         assert_eq!(cost(Some(&[2])), 2, "a straddling row counts both blocks");
@@ -1519,7 +1523,7 @@ mod tests {
 
         let plain = FileSlice::from(vec![0u8; 1000]);
         let column = plain.slice(0..400);
-        let cost = |offsets: Option<&[usize]>| exact_read_cost(&column, 40, offsets, 10).0;
+        let cost = |offsets: Option<&[u32]>| exact_read_cost(&column, 40, offsets, 10).0;
         assert_eq!(cost(Some(&[0, 9])), 80);
         assert_eq!(cost(None), 400);
     }
