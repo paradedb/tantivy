@@ -135,8 +135,42 @@ fn forced_top_k(
             k,
             params.clone(),
             Some(forced),
+            true,
         )?;
         assert_identities(&segment_stats, "forced plan");
+        hits.extend(segment_hits);
+        stats.push(segment_stats);
+    }
+    hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    hits.truncate(k);
+    Ok((hits, stats))
+}
+
+/// The global top `k` with every segment searched directly under the planner, with admission
+/// pruning on or off, and each segment's stats.
+fn planned_top_k(
+    fixture: &Fixture,
+    filter: &dyn Query,
+    query: &[f32],
+    k: usize,
+    params: &ProbeParams,
+    admission_pruning: bool,
+) -> crate::Result<(Hits, Vec<ProbeStats>)> {
+    let weight = fixture.weight(filter)?;
+    let segments = fixture.index.reader()?.searcher().segment_readers().len();
+    let mut hits = Vec::new();
+    let mut stats = Vec::new();
+    for segment in 0..segments {
+        let (segment_hits, segment_stats) = fixture.run_planned(
+            segment,
+            weight.as_ref(),
+            query,
+            k,
+            params.clone(),
+            None,
+            admission_pruning,
+        )?;
+        assert_identities(&segment_stats, "admission pruning");
         hits.extend(segment_hits);
         stats.push(segment_stats);
     }
@@ -210,6 +244,29 @@ fn assert_case(
             assert_eq!(layer0.scored(), 0, "{case}");
             assert_eq!(stats.exact_rows, stats.candidates_scored, "{case}");
         }
+    }
+    // Admission pruning drops only rows every boundary would drop: results, survivors and their
+    // column bits must match a run without it.
+    let (pruned, pruned_stats) = planned_top_k(fixture, filter, query, k, params, true)?;
+    let (unpruned, unpruned_stats) = planned_top_k(fixture, filter, query, k, params, false)?;
+    assert_eq!(pruned, oracle, "{case} pruned");
+    assert_eq!(pruned, unpruned, "{case} admission pruning changed hits");
+    for (p, u) in pruned_stats.iter().zip(&unpruned_stats) {
+        let (pt, ut) = (&p.quantized_trace, &u.quantized_trace);
+        assert_eq!(pt.boundary_rows, ut.boundary_rows, "{case}");
+        assert_eq!(pt.exact_phase_rows, ut.exact_phase_rows, "{case}");
+        // Layer 0's pre-boundary candidate list shrinks under pruning; later layers see
+        // identical survivors with identical column bits.
+        assert_eq!(
+            pt.estimate_rows.get(1..),
+            ut.estimate_rows.get(1..),
+            "{case}"
+        );
+        assert_eq!(
+            pt.layer_columns.get(1..),
+            ut.layer_columns.get(1..),
+            "{case}"
+        );
     }
     Ok(fruit.stats)
 }
@@ -414,6 +471,7 @@ fn read_plans_are_bit_identical() -> crate::Result<()> {
                         10,
                         routed_exhaustive_params(clusters),
                         Some(forced),
+                        true,
                     )
                 };
                 let oracle = fixture.oracle(filter.as_ref(), &query, 10)?;
@@ -867,6 +925,7 @@ fn whole_cluster_selections_read_the_band() -> crate::Result<()> {
         10,
         every_cluster(),
         Some(PlanOverride::read(LayerRead::Sparse)),
+        true,
     )?;
     let layer0 = stats.layers.get(0).unwrap();
     assert_eq!(layer0.sparse_clusters(), 0, "{stats:?}");
@@ -954,6 +1013,7 @@ fn exact_clusters_never_read_their_band() -> crate::Result<()> {
             10,
             every_cluster(),
             Some(forced),
+            true,
         )?;
         assert_eq!(hits, fixture.oracle(&AllQuery, &query, 10)?);
         let log = fixture.reads();
@@ -1004,6 +1064,7 @@ fn retired_groups_never_reach_a_later_band() -> crate::Result<()> {
         Some(PlanOverride::exact(|cluster, layer| {
             layer == 1 && cluster % 2 == 0
         })),
+        true,
     )?;
     assert_eq!(hits, fixture.oracle(&filter, &query, 10)?);
     let layer1 = stats.layers.get(1).unwrap();

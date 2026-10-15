@@ -52,6 +52,8 @@ pub(crate) struct SegmentSearcher<T: VectorElement> {
     segment_ord: SegmentOrdinal,
     #[cfg(test)]
     pub(crate) plan_override: Option<PlanOverride>,
+    #[cfg(test)]
+    pub(crate) admission_pruning_disabled: bool,
 }
 
 impl<T: VectorElement> SegmentSearcher<T> {
@@ -74,6 +76,8 @@ impl<T: VectorElement> SegmentSearcher<T> {
             segment_ord,
             #[cfg(test)]
             plan_override: None,
+            #[cfg(test)]
+            admission_pruning_disabled: false,
         })
     }
 
@@ -204,6 +208,8 @@ impl<T: VectorElement> SegmentSearcher<T> {
             exact_plan: self.probe_params.exact_plan,
             #[cfg(test)]
             plan_override: self.plan_override,
+            #[cfg(test)]
+            admission_pruning_disabled: self.admission_pruning_disabled,
         };
         let mut scan = SegmentScan::new(
             &self.reader,

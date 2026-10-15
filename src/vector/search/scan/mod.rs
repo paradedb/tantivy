@@ -12,7 +12,7 @@ pub(crate) mod plan;
 use std::ops::Range;
 
 use self::bound::KthBound;
-use self::columns::QuantizedCandidates;
+use self::columns::{Columns, QuantizedCandidates};
 use self::estimate::{combine_initial, combine_refine, CombineCtx};
 use self::exact::ExactScorer;
 use self::heap::TieBreakHits;
@@ -26,6 +26,7 @@ use crate::error::DataCorruption;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource, Feedback};
+use crate::vector::search::interval::{LowerEndpoint, Threshold};
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery};
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::quantized::{QuantizedFieldReader, ReadScratch};
@@ -46,6 +47,9 @@ pub(crate) struct ScanConfig {
     pub(crate) exact_plan: bool,
     #[cfg(test)]
     pub(crate) plan_override: Option<PlanOverride>,
+    /// Disables layer-0 admission pruning, which never changes results; equivalence tests flip it.
+    #[cfg(test)]
+    pub(crate) admission_pruning_disabled: bool,
 }
 
 /// Per-layer counts of a quantized scan.
@@ -53,6 +57,9 @@ pub(crate) struct ScanConfig {
 pub(crate) struct LayerReport {
     /// Candidates the layer scored.
     pub(crate) scored: usize,
+    /// Rows dropped at admission because their interval could no longer reach the running top-k;
+    /// layer 0 only.
+    pub(crate) admission_pruned: usize,
     /// Candidates left after the layer's boundary.
     pub(crate) survivors: usize,
     /// Clusters read sparsely at this layer.
@@ -121,6 +128,14 @@ struct QuantizedState<'a> {
     dimension: usize,
     candidates: QuantizedCandidates,
     decoded: Decoded,
+    /// Scratch for one cluster's combined columns while admission filters them.
+    admission_columns: Columns,
+    /// Scratch for the admitted row indices of one cluster.
+    admission_keep: Vec<u32>,
+    /// Rows the layer-0 kernel scored, before admission pruning.
+    layer0_scored: usize,
+    /// Rows admission pruning dropped.
+    layer0_admission_pruned: usize,
     /// The reader exact reads are priced through; `None` with the exact plan off.
     exact: Option<&'a VectorIndexReader>,
     index: &'a ClusterIndex,
@@ -128,6 +143,8 @@ struct QuantizedState<'a> {
     centroid_reads: usize,
     #[cfg(test)]
     plan_override: Option<PlanOverride>,
+    #[cfg(test)]
+    admission_pruning_disabled: bool,
 }
 
 impl<'a> QuantizedState<'a> {
@@ -154,11 +171,17 @@ impl<'a> QuantizedState<'a> {
             dimension: meta.dim as usize,
             candidates: QuantizedCandidates::with_capacity(config.capacity),
             decoded: Decoded::default(),
+            admission_columns: Columns::default(),
+            admission_keep: Vec::new(),
+            layer0_scored: 0,
+            layer0_admission_pruned: 0,
             exact: config.exact_plan.then_some(reader),
             index,
             centroid_reads: 0,
             #[cfg(test)]
             plan_override: config.plan_override,
+            #[cfg(test)]
+            admission_pruning_disabled: config.admission_pruning_disabled,
         }
     }
 
@@ -200,7 +223,9 @@ impl<'a> QuantizedState<'a> {
         }
     }
 
-    /// Scores a cluster's rows on layer 0, read as `read`, and appends them as a candidate block.
+    /// Scores a cluster's rows on layer 0, read as `read`, and appends the rows whose interval
+    /// can still reach the running top-k as a candidate block. The bound's k-th lower endpoint
+    /// only rises, so the rows dropped here are exactly rows every later boundary would drop.
     fn admit(
         &mut self,
         rows: &ClusterRows<'_>,
@@ -212,18 +237,55 @@ impl<'a> QuantizedState<'a> {
             Some(centroid) => centroid,
             None => self.read_centroid(rows.cluster)?,
         };
+        // The threshold as of the clusters admitted so far, before this cluster's rows enter.
+        let prior = self.admission_threshold(bound);
         let spec = self.layers[0];
         decode_layer(&spec, rows, read, &mut self.decoded, scratch)?;
+        self.layer0_scored += rows.len();
         let ctx = self.combine_ctx(0, centroid);
-        let at = self.candidates.push_block(rows, centroid);
-        combine_initial(
-            &ctx,
-            &self.decoded,
-            &mut self.candidates.columns,
-            at.clone(),
-        );
+        let at = match prior {
+            Some(threshold) => {
+                combine_initial(
+                    &ctx,
+                    &self.decoded,
+                    &mut self.admission_columns,
+                    0..rows.len(),
+                );
+                let at = self.candidates.push_block_pruned(
+                    rows,
+                    centroid,
+                    &self.admission_columns,
+                    &mut self.admission_keep,
+                    threshold,
+                );
+                self.layer0_admission_pruned += rows.len() - at.len();
+                at
+            }
+            None => {
+                let at = self.candidates.push_block(rows, centroid);
+                combine_initial(
+                    &ctx,
+                    &self.decoded,
+                    &mut self.candidates.columns,
+                    at.clone(),
+                );
+                at
+            }
+        };
         self.candidates.finish_cluster(at, bound);
         Ok(())
+    }
+
+    /// The admission-pruning threshold: the bound's running k-th lower endpoint, `None` until the
+    /// running top-k fills or when a test disables pruning.
+    fn admission_threshold(&self, bound: &KthBound) -> Option<Threshold> {
+        #[cfg(test)]
+        if self.admission_pruning_disabled {
+            return None;
+        }
+        bound
+            .running_lower()
+            .map(|kth| Threshold(LowerEndpoint(kth)))
     }
 
     /// Refines block `b`'s candidates with `layer`, read as `read`.
@@ -260,7 +322,14 @@ impl<'a> QuantizedState<'a> {
 
     /// Records the candidates `layer` scored and prunes them at its boundary.
     fn prune(&mut self, layer: usize, bound: &mut KthBound, report: &mut ScanReport) {
-        report.layers[layer].scored = self.candidates.len();
+        // Layer 0's kernel scores every admitted row; admission pruning drops rows before they
+        // become candidates, so the scored count keeps its own counter.
+        report.layers[layer].scored = if layer == 0 {
+            report.layers[0].admission_pruned = self.layer0_admission_pruned;
+            self.layer0_scored
+        } else {
+            self.candidates.len()
+        };
         #[cfg(test)]
         {
             // Layer 0's candidates are listed in admission order, later layers' in row order.

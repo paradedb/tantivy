@@ -25,6 +25,7 @@ pub(crate) struct LayerProbeStats {
     scan_ns: u64,
     boundary_ns: u64,
     scored: usize,
+    admission_pruned: usize,
     survivors: usize,
     sparse_clusters: usize,
     full_clusters: usize,
@@ -47,6 +48,11 @@ impl LayerProbeStats {
     /// Candidates the layer scored.
     pub(crate) fn scored(&self) -> usize {
         self.scored
+    }
+
+    /// Rows admission pruning dropped before they became candidates.
+    pub(crate) fn admission_pruned(&self) -> usize {
+        self.admission_pruned
     }
 
     /// Candidates left after the layer's boundary.
@@ -101,6 +107,9 @@ impl serde::Serialize for LayerProbeStatsSet {
             serialize_prefixed(&layer.io, &format!("layer{index}"), &mut map)?;
             map.serialize_entry(&format!("layer{index}_scan_ns"), &layer.scan_ns)?;
             map.serialize_entry(&format!("layer{index}_scored"), &layer.scored)?;
+            if index == 0 {
+                map.serialize_entry("layer0_admission_pruned", &layer.admission_pruned)?;
+            }
             map.serialize_entry(&format!("layer{index}_survivors"), &layer.survivors)?;
             map.serialize_entry(
                 &format!("layer{index}_sparse_clusters"),
@@ -315,6 +324,7 @@ impl ProbeStats {
                         sign_word_fallbacks: totals.sign_word_fallbacks(layer),
                         io: totals.io(VectorStage::LayerScan(layer as u8)),
                         scored: report.scored,
+                        admission_pruned: report.admission_pruned,
                         survivors: report.survivors,
                         sparse_clusters: report.sparse_clusters,
                         full_clusters: report.full_clusters,
@@ -540,6 +550,9 @@ mod tests {
                 keys.insert(format!("layer{layer}_{suffix}"));
             }
             keys.insert(format!("boundary{layer}_ns"));
+        }
+        if layers > 0 {
+            keys.insert("layer0_admission_pruned".to_string());
         }
         keys
     }
