@@ -167,6 +167,16 @@ pub fn score_asym(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
     assert!(q.planes.iter().all(|plane| plane.len() == x.len()));
     debug_assert!(tail_is_zero(x, q.d));
     debug_assert!(q.planes.iter().all(|plane| tail_is_zero(plane, q.d)));
+    #[cfg(target_arch = "x86_64")]
+    let totals = x86::single(x, q);
+    #[cfg(not(target_arch = "x86_64"))]
+    let totals = score_asym_body(x, q);
+    totals
+}
+
+/// Portable body of [`score_asym`].
+#[inline(always)]
+fn score_asym_body(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
     let positives = x.iter().map(|word| word.count_ones()).sum();
     let weighted_sum = q
         .planes
@@ -361,7 +371,10 @@ pub fn estimate_asym_batch_unscaled(
         }
         _ => {}
     }
-    batch_body(rows, words_per_row, q, out)
+    #[cfg(target_arch = "x86_64")]
+    x86::batch(rows, words_per_row, q, out);
+    #[cfg(not(target_arch = "x86_64"))]
+    batch_body(rows, words_per_row, q, out);
 }
 
 /// Scores selected sign rows from a fixed-stride posting range.
@@ -414,7 +427,10 @@ pub fn estimate_asym_batch_unscaled_indexed(
         }
         _ => {}
     }
-    indexed_body(rows, words_per_row, row_offsets, q, out)
+    #[cfg(target_arch = "x86_64")]
+    x86::indexed(rows, words_per_row, row_offsets, q, out);
+    #[cfg(not(target_arch = "x86_64"))]
+    indexed_body(rows, words_per_row, row_offsets, q, out);
 }
 
 /// NEON popcount kernels for the three- and four-plane batch scorers.
@@ -801,6 +817,114 @@ mod neon {
             options(pure, nomem, nostack),
         );
         out
+    }
+}
+
+/// Runtime-dispatched x86 compilations of the portable scorer bodies.
+///
+/// Shipped x86-64 packages carry no target-cpu, so the baseline bodies lower popcounts in
+/// software. Each tier recompiles the same bodies under `target_feature`, and the tier is probed
+/// once per process; the integer totals and the epilogue are shared, so every tier scores
+/// bit-identically.
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use super::{batch_body, indexed_body, score_asym_body, QueryPlanes};
+    use crate::cpu::{tier, Tier};
+
+    pub(super) fn batch(rows: &[u64], words_per_row: usize, q: &QueryPlanes, out: &mut [f32]) {
+        match tier() {
+            // SAFETY: the tier is only reported when the CPU has avx2, popcnt and f16c.
+            Tier::Avx2 => unsafe { batch_avx2(rows, words_per_row, q, out) },
+            // SAFETY: the tier is only reported when the CPU has popcnt.
+            Tier::Popcnt => unsafe { batch_popcnt(rows, words_per_row, q, out) },
+            Tier::Baseline => batch_body(rows, words_per_row, q, out),
+        }
+    }
+
+    pub(super) fn indexed(
+        rows: &[u64],
+        words_per_row: usize,
+        row_offsets: &[usize],
+        q: &QueryPlanes,
+        out: &mut [f32],
+    ) {
+        match tier() {
+            // SAFETY: the tier is only reported when the CPU has avx2, popcnt and f16c.
+            Tier::Avx2 => unsafe { indexed_avx2(rows, words_per_row, row_offsets, q, out) },
+            // SAFETY: the tier is only reported when the CPU has popcnt.
+            Tier::Popcnt => unsafe { indexed_popcnt(rows, words_per_row, row_offsets, q, out) },
+            Tier::Baseline => indexed_body(rows, words_per_row, row_offsets, q, out),
+        }
+    }
+
+    pub(super) fn single(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
+        match tier() {
+            // SAFETY: the tier is only reported when the CPU has avx2, popcnt and f16c.
+            Tier::Avx2 => unsafe { single_avx2(x, q) },
+            // SAFETY: the tier is only reported when the CPU has popcnt.
+            Tier::Popcnt => unsafe { single_popcnt(x, q) },
+            Tier::Baseline => score_asym_body(x, q),
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must have POPCNT.
+    #[target_feature(enable = "popcnt")]
+    unsafe fn batch_popcnt(rows: &[u64], words_per_row: usize, q: &QueryPlanes, out: &mut [f32]) {
+        batch_body(rows, words_per_row, q, out)
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must have AVX2, POPCNT and F16C.
+    #[target_feature(enable = "avx2,popcnt,f16c")]
+    unsafe fn batch_avx2(rows: &[u64], words_per_row: usize, q: &QueryPlanes, out: &mut [f32]) {
+        batch_body(rows, words_per_row, q, out)
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must have POPCNT.
+    #[target_feature(enable = "popcnt")]
+    unsafe fn indexed_popcnt(
+        rows: &[u64],
+        words_per_row: usize,
+        row_offsets: &[usize],
+        q: &QueryPlanes,
+        out: &mut [f32],
+    ) {
+        indexed_body(rows, words_per_row, row_offsets, q, out)
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must have AVX2, POPCNT and F16C.
+    #[target_feature(enable = "avx2,popcnt,f16c")]
+    unsafe fn indexed_avx2(
+        rows: &[u64],
+        words_per_row: usize,
+        row_offsets: &[usize],
+        q: &QueryPlanes,
+        out: &mut [f32],
+    ) {
+        indexed_body(rows, words_per_row, row_offsets, q, out)
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must have POPCNT.
+    #[target_feature(enable = "popcnt")]
+    unsafe fn single_popcnt(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
+        score_asym_body(x, q)
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must have AVX2, POPCNT and F16C.
+    #[target_feature(enable = "avx2,popcnt,f16c")]
+    unsafe fn single_avx2(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
+        score_asym_body(x, q)
     }
 }
 
