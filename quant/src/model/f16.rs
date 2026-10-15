@@ -61,6 +61,120 @@ pub fn f32_to_f16(value: f32) -> u16 {
     result
 }
 
+/// Decodes a run of little-endian binary16 values into binary32.
+///
+/// binary16 to binary32 widening is exact, and the hardware converters (NEON FCVTL, F16C behind
+/// the x86 dispatch) agree with the portable bit manipulation on every finite and infinite
+/// input, so swapping them never changes results; NaNs stay NaNs either way and sidecar decoding
+/// validates finiteness.
+///
+/// # Panics
+///
+/// Panics when the byte length is odd or the output length disagrees.
+pub fn decode_f16s_to_f32s(bytes: &[u8], out: &mut [f32]) {
+    assert_eq!(bytes.len() % 2, 0);
+    assert_eq!(out.len() * 2, bytes.len());
+    #[cfg(target_arch = "aarch64")]
+    neon::decode(bytes, out);
+    #[cfg(target_arch = "x86_64")]
+    x86::decode(bytes, out);
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    decode_scalar(bytes, out);
+}
+
+/// Portable body of [`decode_f16s_to_f32s`].
+#[inline(always)]
+fn decode_scalar(bytes: &[u8], out: &mut [f32]) {
+    for (out, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+        *out = f16_to_f32(u16::from_le_bytes([pair[0], pair[1]]));
+    }
+}
+
+/// NEON decode: FCVTL widens eight values per iteration. The conversion intrinsics are
+/// unstable, so the instruction pair is inline asm.
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use std::arch::aarch64::{float32x4_t, uint16x8_t, vld1q_u16, vst1q_f32};
+
+    pub(super) fn decode(bytes: &[u8], out: &mut [f32]) {
+        let blocks = out.len() / 8;
+        // SAFETY: the caller asserts `bytes` holds `2 * out.len()` bytes, so each block of
+        // eight u16 loads and eight f32 stores is in bounds; the load and store allow
+        // unaligned addresses.
+        unsafe {
+            for block in 0..blocks {
+                let half = vld1q_u16(bytes.as_ptr().add(block * 16).cast());
+                vst1q_f32(out.as_mut_ptr().add(block * 8), fcvtl(half));
+                vst1q_f32(out.as_mut_ptr().add(block * 8 + 4), fcvtl2(half));
+            }
+        }
+        super::decode_scalar(&bytes[blocks * 16..], &mut out[blocks * 8..]);
+    }
+
+    /// Widens the low four binary16 lanes.
+    #[inline(always)]
+    fn fcvtl(half: uint16x8_t) -> float32x4_t {
+        let wide;
+        // SAFETY: FCVTL touches only its register operands.
+        unsafe {
+            core::arch::asm!(
+                "fcvtl {wide:v}.4s, {half:v}.4h",
+                wide = out(vreg) wide,
+                half = in(vreg) half,
+                options(pure, nomem, nostack),
+            );
+        }
+        wide
+    }
+
+    /// Widens the high four binary16 lanes.
+    #[inline(always)]
+    fn fcvtl2(half: uint16x8_t) -> float32x4_t {
+        let wide;
+        // SAFETY: FCVTL2 touches only its register operands.
+        unsafe {
+            core::arch::asm!(
+                "fcvtl2 {wide:v}.4s, {half:v}.8h",
+                wide = out(vreg) wide,
+                half = in(vreg) half,
+                options(pure, nomem, nostack),
+            );
+        }
+        wide
+    }
+}
+
+/// x86 decode: VCVTPH2PS widens eight values per iteration behind the AVX2 tier; other tiers
+/// keep the portable bit manipulation.
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use crate::cpu::{tier, Tier};
+
+    pub(super) fn decode(bytes: &[u8], out: &mut [f32]) {
+        match tier() {
+            // SAFETY: the tier is only reported when the CPU has avx2, popcnt and f16c.
+            Tier::Avx2 => unsafe { decode_f16c(bytes, out) },
+            _ => super::decode_scalar(bytes, out),
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must have AVX and F16C.
+    #[target_feature(enable = "avx,f16c")]
+    unsafe fn decode_f16c(bytes: &[u8], out: &mut [f32]) {
+        use std::arch::x86_64::{_mm256_cvtph_ps, _mm256_storeu_ps, _mm_loadu_si128};
+        let blocks = out.len() / 8;
+        for block in 0..blocks {
+            // SAFETY: the public caller asserts `bytes` holds `2 * out.len()` bytes, so each
+            // block of eight loads and stores is in bounds; both allow unaligned addresses.
+            let half = _mm_loadu_si128(bytes.as_ptr().add(block * 16).cast());
+            _mm256_storeu_ps(out.as_mut_ptr().add(block * 8), _mm256_cvtph_ps(half));
+        }
+        super::decode_scalar(&bytes[blocks * 16..], &mut out[blocks * 8..]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +196,36 @@ mod tests {
                 assert_ne!(ours_back & 0x03ff, 0);
             } else {
                 assert_eq!(ours_back, oracle_back, "{bits:#06x}");
+            }
+        }
+    }
+
+    #[test]
+    fn batch_decode_matches_scalar_for_every_pattern() {
+        let bytes: Vec<u8> = (0_u32..65_536)
+            .flat_map(|bits| (bits as u16).to_le_bytes())
+            .collect();
+        let mut decoded = vec![0.0_f32; 65_536];
+        decode_f16s_to_f32s(&bytes, &mut decoded);
+        for bits in 0_u16..=u16::MAX {
+            let want = f16_to_f32(bits);
+            let got = decoded[bits as usize];
+            if want.is_nan() {
+                assert!(got.is_nan(), "{bits:#06x}");
+            } else {
+                assert_eq!(got.to_bits(), want.to_bits(), "{bits:#06x}");
+            }
+        }
+        // Lengths around the eight-lane block size exercise the scalar remainder.
+        for len in [0_usize, 1, 7, 8, 9, 15, 16, 17] {
+            let mut tail = vec![0.0_f32; len];
+            decode_f16s_to_f32s(&bytes[..len * 2], &mut tail);
+            for (i, value) in tail.iter().enumerate() {
+                assert_eq!(
+                    value.to_bits(),
+                    f16_to_f32(i as u16).to_bits(),
+                    "len={len}, i={i}"
+                );
             }
         }
     }
