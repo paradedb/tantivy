@@ -51,11 +51,13 @@ pub trait VectorSource {
         f: &mut dyn FnMut(IvfVectors<'_>),
     ) -> crate::Result<()>;
 
-    /// Loads the rows at the given scan positions, in the given order.
+    /// Loads the rows at the given scan positions, returned in the given order.
     ///
-    /// Used by streaming trainers that revisit a subset after a full scan
-    /// (for example SuperKMeans meso clusters). Assign typically only needs
-    /// [`Self::for_each_batch`].
+    /// Positions may be scattered and unsorted; implementations should fetch
+    /// them in scan order, so one large request is cheaper than many small
+    /// ones. Used by streaming trainers that revisit a subset after a full scan
+    /// (for example groups of SuperKMeans meso clusters). Assign typically only
+    /// needs [`Self::for_each_batch`].
     fn read_rows(&mut self, rows: &[u32]) -> crate::Result<IvfTrainingVectors>;
 }
 
@@ -140,6 +142,24 @@ pub(crate) fn decode_row_append<T: VectorElement>(
         )));
     }
     decoded.extend(bytes.chunks_exact(T::SIZE_BYTES).map(T::decode_le));
+    Ok(())
+}
+
+/// Decodes a row into a caller-owned slot of exactly one row.
+pub(crate) fn decode_row_into<T: VectorElement>(
+    bytes: &[u8],
+    decoded: &mut [T],
+) -> crate::Result<()> {
+    let expected = decoded.len() * T::SIZE_BYTES;
+    if bytes.len() != expected {
+        return Err(TantivyError::InvalidArgument(format!(
+            "vector byte length mismatch: expected {expected} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    for (value, chunk) in decoded.iter_mut().zip(bytes.chunks_exact(T::SIZE_BYTES)) {
+        *value = T::decode_le(chunk);
+    }
     Ok(())
 }
 
