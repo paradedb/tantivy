@@ -1,6 +1,6 @@
 use super::*;
 use crate::schema::Value;
-use crate::vector::clustering::VectorSource;
+use crate::vector::clustering::{for_each_batch, IvfTrainingVectors, VectorSource};
 use crate::vector::quantization::{corrected_quantized_estimate, ArithmeticError};
 use crate::vector::storage::io::test_support::{PagedDirectory, PAGE_BYTES};
 
@@ -29,9 +29,9 @@ impl IvfClusterer for FixedClusters {
         source: &mut dyn VectorSource,
         _: &IvfCentroids,
     ) -> crate::Result<Vec<u32>> {
-        let mut assignments = Vec::with_capacity(source.num_rows());
-        source.for_each_batch(source.num_rows().max(1), &mut |vectors| {
-            let IvfVectors::F32(batch) = vectors;
+        let num_rows = source.num_rows();
+        let mut assignments = Vec::with_capacity(num_rows);
+        for_each_batch(source, num_rows, |IvfTrainingVectors::F32(batch)| {
             for row in batch.matrix.values.chunks_exact(DIM) {
                 assignments
                     .push((0..4).max_by(|&a, &b| row[a].total_cmp(&row[b])).unwrap() as u32);

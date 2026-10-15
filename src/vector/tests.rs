@@ -11,7 +11,7 @@ use crate::schema::{
     STRING,
 };
 use crate::vector::clustering::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfVectors, VectorSource,
+    for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
 };
 use crate::vector::params::{LocatedPath, ProbeParams};
 use crate::vector::RouterKind;
@@ -217,9 +217,9 @@ impl IvfClusterer for Grid2DClusterer {
     ) -> crate::Result<Vec<u32>> {
         assert_eq!(options.dim(), grid2d::DIM);
         let IvfCentroids::F32(centroids) = centroids;
-        let mut assignments = Vec::with_capacity(source.num_rows());
-        source.for_each_batch(source.num_rows().max(1), &mut |vectors| {
-            let IvfVectors::F32(batch) = vectors;
+        let num_rows = source.num_rows();
+        let mut assignments = Vec::with_capacity(num_rows);
+        for_each_batch(source, num_rows, |IvfTrainingVectors::F32(batch)| {
             for vector in batch.matrix.values.chunks_exact(batch.matrix.dims) {
                 assignments
                     .push(grid2d::nearest_centroid(vector, centroids.values.as_slice()) as u32);
@@ -974,7 +974,7 @@ mod bounds_storage_tests {
     use crate::query::AllQuery;
     use crate::schema::{Metric, Schema, VectorDType, VectorOptions, STORED, STRING};
     use crate::vector::clustering::{
-        IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors, VectorSource,
+        for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
     };
     use crate::vector::diagnostics::VectorStorageFormat;
     use crate::vector::router::stacked::levels::{InMemoryStore, StackedIvf, StackedIvfConfig};
@@ -1108,9 +1108,9 @@ mod bounds_storage_tests {
         ) -> crate::Result<Vec<u32>> {
             assert_eq!(options.dim(), 2);
             let IvfCentroids::F32(centroids) = centroids;
-            let mut assignments = Vec::with_capacity(source.num_rows());
-            source.for_each_batch(source.num_rows().max(1), &mut |vectors| {
-                let IvfVectors::F32(batch) = vectors;
+            let num_rows = source.num_rows();
+            let mut assignments = Vec::with_capacity(num_rows);
+            for_each_batch(source, num_rows, |IvfTrainingVectors::F32(batch)| {
                 for vector in batch.matrix.values.chunks_exact(2) {
                     let mut best = 0u32;
                     let mut best_d2 = f32::INFINITY;

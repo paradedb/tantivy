@@ -1,11 +1,11 @@
 //! Merge-time [`VectorSource`]: sampled rows for train, every row for assign.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::indexer::segment_updater::CancelSentinel;
 use crate::vector::clustering::{
-    decode_row_into, IvfMatrix, IvfMatrixView, IvfTrainingBatch, IvfTrainingVectors,
-    IvfVectorBatch, IvfVectors, VectorSource,
+    decode_row_into, IvfMatrix, IvfTrainingBatch, IvfTrainingVectors, VectorSource,
 };
 use crate::vector::storage::quantized::ReadScratch;
 use crate::vector::storage::reader::VectorIndexReader;
@@ -17,14 +17,9 @@ const PLANNED_READ_ROWS: usize = 4_096;
 
 /// Merge rows scanned in source storage order.
 pub(super) struct MergeVectorSource<'a> {
-    readers: &'a [Arc<VectorIndexReader>],
     rows: Vec<(RowAddress, DocId)>,
-    dim: usize,
-    cancel: &'a dyn CancelSentinel,
+    reader: RowReader<'a>,
     pub(super) reads: usize,
-    batch_values: Vec<f32>,
-    batch_doc_ids: Vec<DocId>,
-    reader: RowReader,
 }
 
 impl<'a> MergeVectorSource<'a> {
@@ -35,14 +30,15 @@ impl<'a> MergeVectorSource<'a> {
         cancel: &'a dyn CancelSentinel,
     ) -> Self {
         MergeVectorSource {
-            readers,
             rows,
-            dim,
-            cancel,
+            reader: RowReader {
+                readers,
+                dim,
+                cancel,
+                scratch: ReadScratch::default(),
+                order: Vec::new(),
+            },
             reads: 0,
-            batch_values: Vec::new(),
-            batch_doc_ids: Vec::new(),
-            reader: RowReader::default(),
         }
     }
 
@@ -52,26 +48,44 @@ impl<'a> MergeVectorSource<'a> {
 }
 
 /// Reads requested rows in storage order and decodes each into its request slot.
-#[derive(Default)]
-struct RowReader {
+struct RowReader<'a> {
+    readers: &'a [Arc<VectorIndexReader>],
+    dim: usize,
+    cancel: &'a dyn CancelSentinel,
     scratch: ReadScratch,
     /// Request slots sorted by source address.
     order: Vec<u32>,
 }
 
-impl RowReader {
+impl RowReader<'_> {
+    /// Decodes `requested` into a new batch in request order.
+    fn load(&mut self, requested: &[(RowAddress, DocId)]) -> crate::Result<IvfTrainingVectors> {
+        if self.cancel.wants_cancel() {
+            return Err(TantivyError::Cancelled);
+        }
+        let mut values = vec![0.0; requested.len() * self.dim];
+        let mut doc_ids = vec![0; requested.len()];
+        self.decode(requested, &mut values, &mut doc_ids)?;
+        Ok(IvfTrainingVectors::F32(IvfTrainingBatch {
+            doc_ids,
+            matrix: IvfMatrix {
+                values,
+                rows: requested.len(),
+                dims: self.dim,
+            },
+        }))
+    }
+
     /// Fills `values` (`requested.len() * dim`) and `doc_ids` (`requested.len()`) in request
     /// order. Each segment's rows are fetched ascending through planned reads, so a request of
     /// scattered positions costs one forward pass per segment.
     fn decode(
         &mut self,
-        readers: &[Arc<VectorIndexReader>],
-        cancel: &dyn CancelSentinel,
-        dim: usize,
         requested: &[(RowAddress, DocId)],
         values: &mut [f32],
         doc_ids: &mut [DocId],
     ) -> crate::Result<()> {
+        let dim = self.dim;
         debug_assert_eq!(values.len(), requested.len() * dim);
         debug_assert_eq!(doc_ids.len(), requested.len());
         let address = |slot: u32| requested[slot as usize].0;
@@ -86,9 +100,9 @@ impl RowReader {
                 remaining.partition_point(|&slot| address(slot).segment_ord == segment_ord);
             let (run, rest) = remaining.split_at(run_len);
             remaining = rest;
-            let reader = &readers[segment_ord as usize];
+            let reader = &self.readers[segment_ord as usize];
             for chunk in run.chunks(PLANNED_READ_ROWS) {
-                if cancel.wants_cancel() {
+                if self.cancel.wants_cancel() {
                     return Err(TantivyError::Cancelled);
                 }
                 self.scratch.rows.clear();
@@ -116,42 +130,19 @@ impl VectorSource for MergeVectorSource<'_> {
         self.rows.len()
     }
 
-    fn for_each_batch(
-        &mut self,
-        batch_size: usize,
-        f: &mut dyn FnMut(IvfVectors<'_>),
-    ) -> crate::Result<()> {
-        for batch in self.rows.chunks(batch_size.max(1)) {
-            if self.cancel.wants_cancel() {
-                return Err(TantivyError::Cancelled);
-            }
-            self.batch_values.resize(batch.len() * self.dim, 0.0);
-            self.batch_doc_ids.resize(batch.len(), 0);
-            self.reader.decode(
-                self.readers,
-                self.cancel,
-                self.dim,
-                batch,
-                &mut self.batch_values,
-                &mut self.batch_doc_ids,
-            )?;
-            self.reads += batch.len();
-            f(IvfVectors::F32(IvfVectorBatch {
-                doc_ids: &self.batch_doc_ids,
-                matrix: IvfMatrixView {
-                    values: &self.batch_values,
-                    rows: batch.len(),
-                    dims: self.dim,
-                },
-            }));
-        }
-        Ok(())
+    fn read_range(&mut self, range: Range<usize>) -> crate::Result<IvfTrainingVectors> {
+        let Some(requested) = self.rows.get(range.clone()) else {
+            return Err(TantivyError::InvalidArgument(format!(
+                "vector source range {range:?} is out of bounds for {} rows",
+                self.rows.len()
+            )));
+        };
+        let batch = self.reader.load(requested)?;
+        self.reads += requested.len();
+        Ok(batch)
     }
 
     fn read_rows(&mut self, rows: &[u32]) -> crate::Result<IvfTrainingVectors> {
-        if self.cancel.wants_cancel() {
-            return Err(TantivyError::Cancelled);
-        }
         if let Some(&row) = rows.iter().find(|&&row| row as usize >= self.rows.len()) {
             return Err(TantivyError::InvalidArgument(format!(
                 "vector source row {row} is out of bounds for {} rows",
@@ -160,24 +151,8 @@ impl VectorSource for MergeVectorSource<'_> {
         }
         let requested: Vec<(RowAddress, DocId)> =
             rows.iter().map(|&row| self.rows[row as usize]).collect();
-        let mut values = vec![0.0; rows.len() * self.dim];
-        let mut doc_ids = vec![0; rows.len()];
-        self.reader.decode(
-            self.readers,
-            self.cancel,
-            self.dim,
-            &requested,
-            &mut values,
-            &mut doc_ids,
-        )?;
+        let batch = self.reader.load(&requested)?;
         self.reads += rows.len();
-        Ok(IvfTrainingVectors::F32(IvfTrainingBatch {
-            doc_ids,
-            matrix: IvfMatrix {
-                values,
-                rows: rows.len(),
-                dims: self.dim,
-            },
-        }))
+        Ok(batch)
     }
 }

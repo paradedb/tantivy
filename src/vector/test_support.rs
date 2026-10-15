@@ -19,7 +19,7 @@ use crate::schema::{
     STRING,
 };
 use crate::vector::clustering::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfVectors, VectorSource,
+    for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
 };
 use crate::vector::params::ProbeParams;
 use crate::vector::router::candidate::Candidate;
@@ -94,9 +94,9 @@ impl IvfClusterer for NearestClusterer {
         _: &IvfCentroids,
     ) -> crate::Result<Vec<u32>> {
         let dim = options.dim();
-        let mut assignments = Vec::with_capacity(source.num_rows());
-        source.for_each_batch(source.num_rows().max(1), &mut |vectors| {
-            let IvfVectors::F32(batch) = vectors;
+        let num_rows = source.num_rows();
+        let mut assignments = Vec::with_capacity(num_rows);
+        for_each_batch(source, num_rows, |IvfTrainingVectors::F32(batch)| {
             for vector in batch.matrix.values.chunks_exact(dim) {
                 assignments.push(nearest(vector, &self.centroids) as u32);
             }

@@ -1,6 +1,8 @@
 //! Custom clustering: the [`IvfClusterer`] a merge trains and assigns with, its inputs and
 //! outputs, and the built-in [`SuperKMeansClusterer`].
 
+use std::ops::Range;
+
 use crate::schema::VectorOptions;
 use crate::vector::VectorElement;
 use crate::{DocId, TantivyError};
@@ -32,33 +34,41 @@ pub trait IvfClusterer: Send + Sync + 'static {
 /// Replayable, read-only view of vectors for IVF [`IvfClusterer::train`] or
 /// [`IvfClusterer::assign`].
 ///
-/// Rows are identified by their 0-based position in scan order. Every call to
-/// [`VectorSource::for_each_batch`] yields the same rows in the same order, and
-/// [`VectorSource::read_rows`] positions refer to that order.
+/// Rows are identified by their 0-based position in a fixed scan order, and
+/// every read returns the same vectors for the same positions. Reads hand the
+/// decoded rows to the caller and keep none, so what the caller holds is all
+/// the vector memory a train or assign uses.
 ///
-/// Merge builds a sample for training and the full set for assignment.
+/// Merge builds a sample for training and the full set for assignment. Reads
+/// fail with [`TantivyError::Cancelled`] if the merge is cancelled.
 pub trait VectorSource {
-    /// Number of rows each scan yields.
+    /// Number of rows in scan order.
     fn num_rows(&self) -> usize;
 
-    /// Scans every row in order, in batches of at most `batch_size` rows.
-    ///
-    /// Fails with [`TantivyError::Cancelled`] if the merge is cancelled
-    /// mid-scan.
-    fn for_each_batch(
-        &mut self,
-        batch_size: usize,
-        f: &mut dyn FnMut(IvfVectors<'_>),
-    ) -> crate::Result<()>;
+    /// Loads the rows in `range` of scan order.
+    fn read_range(&mut self, range: Range<usize>) -> crate::Result<IvfTrainingVectors>;
 
     /// Loads the rows at the given scan positions, returned in the given order.
     ///
     /// Positions may be scattered and unsorted; implementations should fetch
     /// them in scan order, so one large request is cheaper than many small
-    /// ones. Used by streaming trainers that revisit a subset after a full scan
-    /// (for example groups of SuperKMeans meso clusters). Assign typically only
-    /// needs [`Self::for_each_batch`].
+    /// ones.
     fn read_rows(&mut self, rows: &[u32]) -> crate::Result<IvfTrainingVectors>;
+}
+
+/// Reads every row of `source` in scan order, at most `batch_rows` at a time, and calls `f`
+/// with each batch. A batch is dropped once `f` returns unless `f` keeps it.
+pub fn for_each_batch(
+    source: &mut dyn VectorSource,
+    batch_rows: usize,
+    mut f: impl FnMut(IvfTrainingVectors),
+) -> crate::Result<()> {
+    let num_rows = source.num_rows();
+    for start in (0..num_rows).step_by(batch_rows.max(1)) {
+        let end = start.saturating_add(batch_rows.max(1)).min(num_rows);
+        f(source.read_range(start..end)?);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]

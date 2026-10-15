@@ -7,7 +7,7 @@ use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
 use crate::query::{AllQuery, EnableScoring, Query, TermQuery};
 use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
-use crate::vector::clustering::{IvfVectors, VectorSource};
+use crate::vector::clustering::{for_each_batch, IvfTrainingVectors, VectorSource};
 use crate::vector::diagnostics::{
     VectorEstimatorMeasurements, VectorEstimatorQuery, VectorEstimatorSource,
 };
@@ -350,9 +350,9 @@ impl IvfClusterer for QuantFixtureClusterer {
         source: &mut dyn VectorSource,
         _centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>> {
-        let mut assignments = Vec::with_capacity(source.num_rows());
-        source.for_each_batch(source.num_rows().max(1), &mut |vectors| {
-            let IvfVectors::F32(batch) = vectors;
+        let num_rows = source.num_rows();
+        let mut assignments = Vec::with_capacity(num_rows);
+        for_each_batch(source, num_rows, |IvfTrainingVectors::F32(batch)| {
             for row in batch.matrix.values.chunks_exact(self.dim) {
                 assignments.push(match self.metric {
                     Metric::L2 => u32::from(row[0] >= 0.5),
