@@ -162,7 +162,7 @@ mod x86 {
     ///
     /// The CPU must have AVX and F16C.
     #[target_feature(enable = "avx,f16c")]
-    unsafe fn decode_f16c(bytes: &[u8], out: &mut [f32]) {
+    pub(super) unsafe fn decode_f16c(bytes: &[u8], out: &mut [f32]) {
         use std::arch::x86_64::{_mm256_cvtph_ps, _mm256_storeu_ps, _mm_loadu_si128};
         let blocks = out.len() / 8;
         for block in 0..blocks {
@@ -214,6 +214,22 @@ mod tests {
                 assert!(got.is_nan(), "{bits:#06x}");
             } else {
                 assert_eq!(got.to_bits(), want.to_bits(), "{bits:#06x}");
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx") && std::arch::is_x86_feature_detected!("f16c")
+        {
+            let mut forced = vec![0.0_f32; 65_536];
+            // SAFETY: avx and f16c were just detected.
+            unsafe { x86::decode_f16c(&bytes, &mut forced) };
+            for bits in 0_u16..=u16::MAX {
+                let want = f16_to_f32(bits);
+                let got = forced[bits as usize];
+                if want.is_nan() {
+                    assert!(got.is_nan(), "f16c {bits:#06x}");
+                } else {
+                    assert_eq!(got.to_bits(), want.to_bits(), "f16c {bits:#06x}");
+                }
             }
         }
         // Lengths around the eight-lane block size exercise the scalar remainder.

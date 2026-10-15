@@ -871,7 +871,12 @@ mod x86 {
     ///
     /// The CPU must have POPCNT.
     #[target_feature(enable = "popcnt")]
-    unsafe fn batch_popcnt(rows: &[u64], words_per_row: usize, q: &QueryPlanes, out: &mut [f32]) {
+    pub(super) unsafe fn batch_popcnt(
+        rows: &[u64],
+        words_per_row: usize,
+        q: &QueryPlanes,
+        out: &mut [f32],
+    ) {
         batch_body(rows, words_per_row, q, out)
     }
 
@@ -879,7 +884,12 @@ mod x86 {
     ///
     /// The CPU must have AVX2, POPCNT and F16C.
     #[target_feature(enable = "avx2,popcnt,f16c")]
-    unsafe fn batch_avx2(rows: &[u64], words_per_row: usize, q: &QueryPlanes, out: &mut [f32]) {
+    pub(super) unsafe fn batch_avx2(
+        rows: &[u64],
+        words_per_row: usize,
+        q: &QueryPlanes,
+        out: &mut [f32],
+    ) {
         batch_body(rows, words_per_row, q, out)
     }
 
@@ -887,7 +897,7 @@ mod x86 {
     ///
     /// The CPU must have POPCNT.
     #[target_feature(enable = "popcnt")]
-    unsafe fn indexed_popcnt(
+    pub(super) unsafe fn indexed_popcnt(
         rows: &[u64],
         words_per_row: usize,
         row_offsets: &[usize],
@@ -901,7 +911,7 @@ mod x86 {
     ///
     /// The CPU must have AVX2, POPCNT and F16C.
     #[target_feature(enable = "avx2,popcnt,f16c")]
-    unsafe fn indexed_avx2(
+    pub(super) unsafe fn indexed_avx2(
         rows: &[u64],
         words_per_row: usize,
         row_offsets: &[usize],
@@ -915,7 +925,7 @@ mod x86 {
     ///
     /// The CPU must have POPCNT.
     #[target_feature(enable = "popcnt")]
-    unsafe fn single_popcnt(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
+    pub(super) unsafe fn single_popcnt(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
         score_asym_body(x, q)
     }
 
@@ -923,7 +933,7 @@ mod x86 {
     ///
     /// The CPU must have AVX2, POPCNT and F16C.
     #[target_feature(enable = "avx2,popcnt,f16c")]
-    unsafe fn single_avx2(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
+    pub(super) unsafe fn single_avx2(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
         score_asym_body(x, q)
     }
 }
@@ -1221,6 +1231,61 @@ mod tests {
                             expected[offset].to_bits(),
                             "indexed d={d}, bq={bq}, rows={rows}, i={i}"
                         );
+                    }
+
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        let context = format!("d={d}, bq={bq}, rows={rows}");
+                        let expected_indexed: Vec<f32> =
+                            row_offsets.iter().map(|&offset| expected[offset]).collect();
+                        let check = |name: &str, got: &[f32], want: &[f32]| {
+                            for (i, (got, want)) in got.iter().zip(want).enumerate() {
+                                assert_eq!(
+                                    got.to_bits(),
+                                    want.to_bits(),
+                                    "x86 {name} {context}, i={i}"
+                                );
+                            }
+                        };
+                        let mut got = vec![0.0_f32; rows];
+                        let mut got_indexed = vec![0.0_f32; row_offsets.len()];
+                        batch_body(&packed, words, &q, &mut got);
+                        indexed_body(&packed, words, &row_offsets, &q, &mut got_indexed);
+                        check("baseline batch", &got, &expected);
+                        check("baseline indexed", &got_indexed, &expected_indexed);
+                        if std::arch::is_x86_feature_detected!("popcnt") {
+                            // SAFETY: popcnt was just detected.
+                            unsafe {
+                                x86::batch_popcnt(&packed, words, &q, &mut got);
+                                x86::indexed_popcnt(
+                                    &packed,
+                                    words,
+                                    &row_offsets,
+                                    &q,
+                                    &mut got_indexed,
+                                );
+                            }
+                            check("popcnt batch", &got, &expected);
+                            check("popcnt indexed", &got_indexed, &expected_indexed);
+                        }
+                        if std::arch::is_x86_feature_detected!("avx2")
+                            && std::arch::is_x86_feature_detected!("popcnt")
+                            && std::arch::is_x86_feature_detected!("f16c")
+                        {
+                            // SAFETY: avx2, popcnt and f16c were just detected.
+                            unsafe {
+                                x86::batch_avx2(&packed, words, &q, &mut got);
+                                x86::indexed_avx2(
+                                    &packed,
+                                    words,
+                                    &row_offsets,
+                                    &q,
+                                    &mut got_indexed,
+                                );
+                            }
+                            check("avx2 batch", &got, &expected);
+                            check("avx2 indexed", &got_indexed, &expected_indexed);
+                        }
                     }
 
                     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
