@@ -516,30 +516,6 @@ impl ArithmeticError {
             rounding_error(scale * kernel, prefix, 2.0).powi(2)
         };
     }
-
-    /// The estimate's width: `model_sigma` combined in quadrature with the arithmetic error under
-    /// the metric's correction.
-    pub(crate) fn sigma(
-        self,
-        metric: Metric,
-        model_sigma: f32,
-        gamma: f32,
-        prefix: f32,
-        base: f32,
-    ) -> f32 {
-        let factor = if metric == Metric::L2 {
-            2.0 * gamma
-        } else {
-            gamma
-        };
-        // c = 1: the final fused base-plus-corrected-residual expression. This
-        // includes cosine's base-plus-residual sum even if its model width is zero.
-        let final_error = rounding_error(factor * prefix, base, 1.0);
-        model_sigma.hypot(
-            (factor * factor * self.raw_variance + self.base_variance + final_error * final_error)
-                .sqrt(),
-        )
-    }
 }
 
 /// Adds a dot-like refinement to the cumulative raw prefix.
@@ -548,10 +524,19 @@ pub(crate) fn refine_dot_raw_prefix(raw_prefix: f32, kernel_score: f32, scale: f
     scale.mul_add(kernel_score, raw_prefix)
 }
 
+/// Rounding margin on the fused sigma, in units of `f32::EPSILON`: the smallest integer that
+/// keeps the fused form at least the composed `hypot(model, sqrt(arithmetic))` on every input.
+/// A float-rounding margin, not a fitted constant.
+pub(crate) const SIGMA_FUSED_ROUNDING_K: f32 = 2.0;
+
 /// The statistical width of a corrected estimate: its data and query quantization variance,
-/// scaled by the policy's safety factor.
+/// scaled by the policy's safety factor, combined in quadrature with its arithmetic rounding
+/// variance, under one square root. The `(1 + kε)` pad covers the rounding difference against
+/// composing the terms through `hypot`, so the width never shrinks and lower endpoints only
+/// widen.
 #[inline(always)]
-pub(crate) fn quantized_model_sigma(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quantized_sigma(
     metric: Metric,
     dimension: usize,
     residual_norm_squared: f32,
@@ -559,6 +544,9 @@ pub(crate) fn quantized_model_sigma(
     gamma: f32,
     score_query_norm_squared: f32,
     sign_query_error_term: f32,
+    arithmetic: ArithmeticError,
+    prefix: f32,
+    base: f32,
 ) -> f32 {
     debug_assert_ne!(dimension, 0);
     let data_variance = residual_norm_squared
@@ -566,13 +554,127 @@ pub(crate) fn quantized_model_sigma(
         * corrected_error_ratio
         * score_query_norm_squared;
     let query_variance = gamma * gamma * sign_query_error_term;
-    let metric_factor = if metric == Metric::L2 { 2.0 } else { 1.0 };
-    metric_factor * GAMMA_ANALYTICAL_SAFETY * (data_variance + query_variance).sqrt()
+    let (metric_factor, factor) = if metric == Metric::L2 {
+        (2.0, 2.0 * gamma)
+    } else {
+        (1.0, gamma)
+    };
+    let model_scale = metric_factor * GAMMA_ANALYTICAL_SAFETY;
+    // c = 1: the final fused base-plus-corrected-residual expression. This includes cosine's
+    // base-plus-residual sum even if its model width is zero.
+    let final_error = rounding_error(factor * prefix, base, 1.0);
+    let variance = model_scale * model_scale * (data_variance + query_variance)
+        + factor * factor * arithmetic.raw_variance
+        + arithmetic.base_variance
+        + final_error * final_error;
+    (1.0 + SIGMA_FUSED_ROUNDING_K * f32::EPSILON) * variance.sqrt()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Splitmix64 for deterministic sweeps without an RNG dependency.
+    fn splitmix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A positive value `mantissa * 2^e` with `e` uniform in `[lo, hi]`.
+    fn magnitude(state: &mut u64, lo: i32, hi: i32) -> f32 {
+        let e = lo + (splitmix(state) % (hi - lo + 1) as u64) as i32;
+        let mantissa = 1.0 + (splitmix(state) >> 40) as f32 / (1u64 << 24) as f32;
+        mantissa * (e as f32).exp2()
+    }
+
+    /// The fused sigma stays within rounding of the composed `hypot(model, sqrt(arith))` form:
+    /// never below it, and at most `(1 + 2k eps)` above it, over magnitudes whose squared terms
+    /// stay finite. Inputs whose squares overflow f32 cannot reach the boundary: estimates and
+    /// sigmas are validated finite.
+    #[test]
+    fn fused_sigma_bounds_the_composed_form() {
+        let mut state = 0x5349_474d_4121_u64;
+        let upper = 1.0 + 2.0 * SIGMA_FUSED_ROUNDING_K * f32::EPSILON;
+        for sample in 0..2_000_000_u64 {
+            let bits = splitmix(&mut state);
+            let metric = if bits & 1 == 0 {
+                Metric::Dot
+            } else {
+                Metric::L2
+            };
+            let dimension = [64, 768, 1024, 4096][(bits >> 1) as usize % 4];
+            let residual_norm_squared = magnitude(&mut state, -30, 30);
+            let corrected_error_ratio = magnitude(&mut state, -20, 4);
+            let gamma = magnitude(&mut state, -8, 4);
+            let query_norm_squared = magnitude(&mut state, -30, 30);
+            let sign_query_error_term = if bits & 4 == 0 {
+                0.0
+            } else {
+                magnitude(&mut state, -30, 20)
+            };
+            let arithmetic = ArithmeticError {
+                raw_variance: if bits & 8 == 0 {
+                    0.0
+                } else {
+                    magnitude(&mut state, -60, 10)
+                },
+                base_variance: if bits & 16 == 0 {
+                    0.0
+                } else {
+                    magnitude(&mut state, -60, 10)
+                },
+            };
+            let sign = if bits & 32 == 0 { 1.0 } else { -1.0 };
+            let prefix = sign * magnitude(&mut state, -20, 25);
+            let base = -sign * magnitude(&mut state, -20, 25);
+
+            let data_variance = residual_norm_squared
+                * (1.0 / dimension as f32)
+                * corrected_error_ratio
+                * query_norm_squared;
+            let query_variance = gamma * gamma * sign_query_error_term;
+            let (metric_factor, factor) = if metric == Metric::L2 {
+                (2.0, 2.0 * gamma)
+            } else {
+                (1.0, gamma)
+            };
+            let model =
+                metric_factor * GAMMA_ANALYTICAL_SAFETY * (data_variance + query_variance).sqrt();
+            let final_error = rounding_error(factor * prefix, base, 1.0);
+            let composed = model.hypot(
+                (factor * factor * arithmetic.raw_variance
+                    + arithmetic.base_variance
+                    + final_error * final_error)
+                    .sqrt(),
+            );
+            let fused = quantized_sigma(
+                metric,
+                dimension,
+                residual_norm_squared,
+                corrected_error_ratio,
+                gamma,
+                query_norm_squared,
+                sign_query_error_term,
+                arithmetic,
+                prefix,
+                base,
+            );
+            if !composed.is_finite() || !fused.is_finite() {
+                continue;
+            }
+            assert!(
+                fused >= composed,
+                "sample {sample}: fused {fused} below composed {composed}"
+            );
+            assert!(
+                fused <= composed * upper,
+                "sample {sample}: fused {fused} above composed {composed} * (1 + 2k eps)"
+            );
+        }
+    }
 
     fn grid(bits: u8) -> VectorQuantizationGrid {
         let count = 1usize << bits;
