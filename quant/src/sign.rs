@@ -214,11 +214,13 @@ pub fn estimate_asym_unscaled(x: &[u64], q: &QueryPlanes) -> f32 {
 }
 
 /// Affine epilogue shared by every asymmetric scorer; a single body keeps the integer-to-f32
-/// rounding identical across the scalar and NEON kernels.
+/// rounding identical across the scalar and NEON kernels. `2·weighted_sum` and `sum_codes` are
+/// bounded by `2·255·d`, so the code sum fits `i64` exactly for any supported dimension and the
+/// conversion needs no software `i128` lowering.
 #[inline(always)]
 fn finish_asym(positives: u32, weighted_sum: u64, q: &QueryPlanes) -> f32 {
     let sign_sum = i64::from(positives) * 2 - q.d as i64;
-    let code_sum = i128::from(weighted_sum) * 2 - i128::from(q.sum_codes);
+    let code_sum = weighted_sum as i64 * 2 - q.sum_codes as i64;
     q.lo * sign_sum as f32 + q.delta * code_sum as f32
 }
 
@@ -927,6 +929,34 @@ mod tests {
                     assert_eq!(actual, contiguous[row], "d={d}, bq={bq}, row={row}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn i64_code_sum_matches_i128() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0x4936_344d_4154_4348);
+        for _ in 0..20_000 {
+            let d = (rng.next_u64() % 65_536 + 1) as usize;
+            let bound = 15 * d as u64;
+            let positives = (rng.next_u64() % (d as u64 + 1)) as u32;
+            let weighted_sum = rng.next_u64() % (bound + 1);
+            let sum_codes = rng.next_u64() % (bound + 1);
+            let q = QueryPlanes {
+                planes: Vec::new(),
+                lo: (rng.next_u32() as f32 / u32::MAX as f32) * 2.0 - 1.0,
+                delta: rng.next_u32() as f32 / u32::MAX as f32,
+                sum_codes,
+                error_squared: 0.0,
+                d,
+            };
+            let sign_sum = i64::from(positives) * 2 - d as i64;
+            let code_sum = i128::from(weighted_sum) * 2 - i128::from(sum_codes);
+            let reference = q.lo * sign_sum as f32 + q.delta * code_sum as f32;
+            assert_eq!(
+                finish_asym(positives, weighted_sum, &q).to_bits(),
+                reference.to_bits(),
+                "d={d}, positives={positives}, weighted_sum={weighted_sum}, sum_codes={sum_codes}"
+            );
         }
     }
 
