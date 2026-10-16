@@ -74,11 +74,14 @@ pub fn f32_to_f16(value: f32) -> u16 {
 pub fn decode_f16s_to_f32s(bytes: &[u8], out: &mut [f32]) {
     assert_eq!(bytes.len() % 2, 0);
     assert_eq!(out.len() * 2, bytes.len());
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     neon::decode(bytes, out);
     #[cfg(target_arch = "x86_64")]
     x86::decode(bytes, out);
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_endian = "little"),
+        target_arch = "x86_64"
+    )))]
     decode_scalar(bytes, out);
 }
 
@@ -91,8 +94,10 @@ fn decode_scalar(bytes: &[u8], out: &mut [f32]) {
 }
 
 /// NEON decode: FCVTL widens eight values per iteration. The conversion intrinsics are
-/// unstable, so the instruction pair is inline asm.
-#[cfg(target_arch = "aarch64")]
+/// unstable, so the instruction pair is inline asm. The vector load reads the u16 lanes
+/// straight from little-endian bytes, so the path exists only on little-endian targets;
+/// big-endian aarch64 falls back to the portable conversion.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 mod neon {
     use std::arch::aarch64::{float32x4_t, uint16x8_t, vld1q_u16, vst1q_f32};
 
