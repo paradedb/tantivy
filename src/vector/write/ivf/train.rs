@@ -71,7 +71,7 @@ pub(super) fn train(
     let train_start = Instant::now();
     let centroids = clusterer.train(opts, &mut training_source)?;
     timings.train = train_start.elapsed();
-    timings.source_reads += training_source.reads;
+    timings.train_reads += training_source.reads;
 
     if merge.ctx.cancel.wants_cancel() {
         return Err(TantivyError::Cancelled);

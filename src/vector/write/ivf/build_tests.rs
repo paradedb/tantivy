@@ -309,6 +309,17 @@ fn ivf_build_emits_timings_log() -> crate::Result<()> {
         .expect("expected an ivf_build timings line for the 200-centroid build");
     assert!(line.contains("train="));
     assert!(line.contains("id_map_write="));
+    let field = |key: &str| -> usize {
+        line.split_whitespace()
+            .find_map(|part| part.strip_prefix(key)?.strip_prefix('='))
+            .unwrap_or_else(|| panic!("no {key} in {line}"))
+            .parse()
+            .unwrap()
+    };
+    let vectors = field("vectors");
+    assert!(line.contains("train_reads="));
+    assert_eq!(field("assign_reads"), vectors);
+    assert_eq!(field("encode_reads"), vectors);
     eprintln!("IVF_BUILD_SAMPLE {line}");
     Ok(())
 }

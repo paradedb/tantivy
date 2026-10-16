@@ -38,7 +38,7 @@ pub(super) fn assign(
     let assign_start = Instant::now();
     let clusters = clusterer.assign(opts, &mut source, centroids)?;
     timings.assign += assign_start.elapsed();
-    timings.source_reads += source.reads;
+    timings.assign_reads += source.reads;
 
     if clusters.len() != source.num_rows() {
         return Err(TantivyError::InvalidArgument(format!(

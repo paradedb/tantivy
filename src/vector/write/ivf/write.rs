@@ -127,7 +127,8 @@ pub(super) fn id_maps(
             log::info!(
                 target: "paradedb::ivf_build",
                 "ivf_build timings_ms train={} assign={} id_map_write={} encode={} total={} \
-                 centroids={} vectors={} source_reads={} spill_bytes={} vec_bytes={} pad_bytes={} encode_ms={}",
+                 centroids={} vectors={} train_reads={} assign_reads={} encode_reads={} spill_bytes={} \
+                 vec_bytes={} pad_bytes={} encode_ms={}",
                 timings.train.as_millis(),
                 timings.assign.as_millis(),
                 timings.id_map_write.as_millis(),
@@ -135,7 +136,12 @@ pub(super) fn id_maps(
                 total.as_millis(),
                 num_centroids,
                 vector_count,
-                timings.source_reads, timings.spill_bytes, timings.vec_bytes, timings.pad_bytes,
+                timings.train_reads,
+                timings.assign_reads,
+                timings.encode_reads,
+                timings.spill_bytes,
+                timings.vec_bytes,
+                timings.pad_bytes,
                 timings.encode.as_millis(),
             );
         }

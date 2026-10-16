@@ -53,8 +53,12 @@ struct AssignedVector {
 /// Per-field IVF build counters and timings, reported on `paradedb::ivf_build`.
 #[derive(Default)]
 struct IvfBuildTimings {
-    /// Source vector reads across the training, assign, and encode passes.
-    source_reads: usize,
+    /// Source vectors decoded for training, counting a vector again each time it is re-read.
+    train_reads: usize,
+    /// Source vectors decoded for assignment.
+    assign_reads: usize,
+    /// Source vectors read while encoding the clustered rows.
+    encode_reads: usize,
     spill_bytes: usize,
     pad_bytes: usize,
     /// Bytes written to this field's vector entries, including entry padding.

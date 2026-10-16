@@ -148,7 +148,7 @@ pub(super) fn write_data_entry(
             }
             batch_values.clear();
             for assigned in tile {
-                timings.source_reads += 1;
+                timings.encode_reads += 1;
                 bufs[1].extend_from_slice(&assigned.target_doc_id.to_le_bytes());
                 locations[assigned.target_doc_id as usize] = DocLocation {
                     cluster: cluster as u32,
