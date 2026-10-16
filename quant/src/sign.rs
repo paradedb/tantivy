@@ -363,11 +363,17 @@ pub fn estimate_asym_batch_unscaled(
     match q.planes.as_slice() {
         [p0, p1, p2, p3] => {
             let planes = [p0.as_slice(), p1.as_slice(), p2.as_slice(), p3.as_slice()];
-            return neon::batch(neon::accumulator(), rows, words_per_row, planes, q, out);
+            // SAFETY: the assertions above checked the batch shape.
+            return unsafe {
+                neon::batch(neon::accumulator(), rows, words_per_row, planes, q, out)
+            };
         }
         [p0, p1, p2] => {
             let planes = [p0.as_slice(), p1.as_slice(), p2.as_slice()];
-            return neon::batch(neon::accumulator(), rows, words_per_row, planes, q, out);
+            // SAFETY: the assertions above checked the batch shape.
+            return unsafe {
+                neon::batch(neon::accumulator(), rows, words_per_row, planes, q, out)
+            };
         }
         _ => {}
     }
@@ -403,27 +409,33 @@ pub fn estimate_asym_batch_unscaled_indexed(
     match q.planes.as_slice() {
         [p0, p1, p2, p3] => {
             let planes = [p0.as_slice(), p1.as_slice(), p2.as_slice(), p3.as_slice()];
-            return neon::indexed(
-                neon::accumulator(),
-                rows,
-                words_per_row,
-                row_offsets,
-                planes,
-                q,
-                out,
-            );
+            // SAFETY: the assertions above checked the batch shape and every offset's bound.
+            return unsafe {
+                neon::indexed(
+                    neon::accumulator(),
+                    rows,
+                    words_per_row,
+                    row_offsets,
+                    planes,
+                    q,
+                    out,
+                )
+            };
         }
         [p0, p1, p2] => {
             let planes = [p0.as_slice(), p1.as_slice(), p2.as_slice()];
-            return neon::indexed(
-                neon::accumulator(),
-                rows,
-                words_per_row,
-                row_offsets,
-                planes,
-                q,
-                out,
-            );
+            // SAFETY: the assertions above checked the batch shape and every offset's bound.
+            return unsafe {
+                neon::indexed(
+                    neon::accumulator(),
+                    rows,
+                    words_per_row,
+                    row_offsets,
+                    planes,
+                    q,
+                    out,
+                )
+            };
         }
         _ => {}
     }
@@ -473,7 +485,12 @@ mod neon {
     }
 
     /// Scores a contiguous fixed-stride batch.
-    pub(super) fn batch<const P: usize>(
+    ///
+    /// # Safety
+    ///
+    /// The caller must have checked the batch shape: `words_per_row > 0`, every plane holds
+    /// `words_per_row` words, and `rows.len() == out.len() * words_per_row`.
+    pub(super) unsafe fn batch<const P: usize>(
         acc: Accumulator,
         rows: &[u64],
         words_per_row: usize,
@@ -481,11 +498,9 @@ mod neon {
         q: &QueryPlanes,
         out: &mut [f32],
     ) {
-        assert_eq!(rows.len(), out.len() * words_per_row);
-        assert_shapes(words_per_row, planes);
         match acc {
-            // SAFETY: the assertions above keep every row index below `out.len()` in bounds, and
-            // `Dot` is only constructed behind FEAT_DotProd detection.
+            // SAFETY: the caller's shape checks keep every row index below `out.len()` in
+            // bounds, and `Dot` is only constructed behind FEAT_DotProd detection.
             Accumulator::Dot => unsafe { drive_dot(rows, words_per_row, |i| i, planes, q, out) },
             // SAFETY: bounds as above.
             Accumulator::Widen => unsafe {
@@ -495,7 +510,13 @@ mod neon {
     }
 
     /// Scores selected rows of a fixed-stride posting range.
-    pub(super) fn indexed<const P: usize>(
+    ///
+    /// # Safety
+    ///
+    /// The caller must have checked the batch shape: `words_per_row > 0`, every plane holds
+    /// `words_per_row` words, `row_offsets.len() == out.len()`, and every offset is below
+    /// `rows.len() / words_per_row`.
+    pub(super) unsafe fn indexed<const P: usize>(
         acc: Accumulator,
         rows: &[u64],
         words_per_row: usize,
@@ -504,15 +525,9 @@ mod neon {
         q: &QueryPlanes,
         out: &mut [f32],
     ) {
-        assert_eq!(rows.len() % words_per_row, 0);
-        assert_eq!(row_offsets.len(), out.len());
-        assert!(row_offsets
-            .iter()
-            .all(|&row| row < rows.len() / words_per_row));
-        assert_shapes(words_per_row, planes);
         match acc {
-            // SAFETY: the assertions above keep every selected row in bounds, and `Dot` is only
-            // constructed behind FEAT_DotProd detection.
+            // SAFETY: the caller's offset bounds keep every selected row in bounds, and `Dot`
+            // is only constructed behind FEAT_DotProd detection.
             Accumulator::Dot => unsafe {
                 drive_dot(rows, words_per_row, |i| row_offsets[i], planes, q, out)
             },
@@ -521,11 +536,6 @@ mod neon {
                 drive_widen(rows, words_per_row, |i| row_offsets[i], planes, q, out)
             },
         }
-    }
-
-    fn assert_shapes<const P: usize>(words_per_row: usize, planes: [&[u64]; P]) {
-        assert!(words_per_row > 0);
-        assert!(planes.iter().all(|plane| plane.len() == words_per_row));
     }
 
     /// Pairs rows so [`block2_dot`] shares each plane load, with a single-row cleanup call.
@@ -1305,7 +1315,9 @@ mod tests {
                             }
                             for acc in accumulators {
                                 let mut got = vec![0.0_f32; expected.len()];
-                                neon::batch(acc, packed, words, planes, q, &mut got);
+                                // SAFETY: the fixture packs `expected.len()` whole rows of
+                                // `words` words and planes of `words` words.
+                                unsafe { neon::batch(acc, packed, words, planes, q, &mut got) };
                                 for (row, (got, want)) in got.iter().zip(expected).enumerate() {
                                     assert_eq!(
                                         got.to_bits(),
@@ -1314,15 +1326,19 @@ mod tests {
                                     );
                                 }
                                 let mut got_indexed = vec![0.0_f32; row_offsets.len()];
-                                neon::indexed(
-                                    acc,
-                                    packed,
-                                    words,
-                                    row_offsets,
-                                    planes,
-                                    q,
-                                    &mut got_indexed,
-                                );
+                                // SAFETY: every fixture offset addresses one of the packed rows
+                                // and the output matches the offsets' length.
+                                unsafe {
+                                    neon::indexed(
+                                        acc,
+                                        packed,
+                                        words,
+                                        row_offsets,
+                                        planes,
+                                        q,
+                                        &mut got_indexed,
+                                    )
+                                };
                                 for (i, &offset) in row_offsets.iter().enumerate() {
                                     assert_eq!(
                                         got_indexed[i].to_bits(),
