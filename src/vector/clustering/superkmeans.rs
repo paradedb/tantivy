@@ -1,7 +1,6 @@
 //! The built-in [`IvfClusterer`]: hierarchical SuperKMeans.
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
 
 use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig};
 
@@ -23,14 +22,6 @@ const ASSIGN_BATCH_SIZE: usize = 40_960;
 pub struct SuperKMeansClusterer {
     config: HierarchicalSuperKMeansConfig,
     training_sample_ratio: f32,
-    /// The assigner for the last `(dim, angular)`, reused across a merge's batches.
-    assigner: Arc<Mutex<Option<Assigner>>>,
-}
-
-struct Assigner {
-    dim: usize,
-    angular: bool,
-    kmeans: Arc<HierarchicalSuperKMeans>,
 }
 
 impl Default for SuperKMeansClusterer {
@@ -41,7 +32,6 @@ impl Default for SuperKMeansClusterer {
         Self {
             config,
             training_sample_ratio: DEFAULT_TRAINING_SAMPLE_RATIO as f32,
-            assigner: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -68,30 +58,6 @@ impl SuperKMeansClusterer {
     pub fn with_training_sample_ratio(mut self, ratio: f32) -> Self {
         self.training_sample_ratio = ratio;
         self
-    }
-
-    /// The assigner for `(dim, angular)`, built on first use and kept for the next batch.
-    fn assigner(&self, dim: usize, angular: bool) -> Arc<HierarchicalSuperKMeans> {
-        let mut cached = self
-            .assigner
-            .lock()
-            .expect("SuperKMeans assigner mutex poisoned");
-        match cached.as_ref() {
-            Some(assigner) if assigner.dim == dim && assigner.angular == angular => {
-                Arc::clone(&assigner.kmeans)
-            }
-            _ => {
-                let mut config = self.config.clone();
-                config.base.angular = angular;
-                let kmeans = Arc::new(HierarchicalSuperKMeans::with_config(dim, config));
-                *cached = Some(Assigner {
-                    dim,
-                    angular,
-                    kmeans: Arc::clone(&kmeans),
-                });
-                kmeans
-            }
-        }
     }
 }
 
@@ -148,11 +114,11 @@ impl IvfClusterer for SuperKMeansClusterer {
         if vectors.matrix.rows == 0 {
             return Ok(Vec::new());
         }
-        let kmeans = self.assigner(options.dim(), is_angular(options.metric()));
-        Ok(kmeans.assign(
+        Ok(superkmeans::assign(
             vectors.matrix.values,
-            centroids.values.as_slice(),
+            &centroids.values,
             vectors.matrix.rows,
+            options.dim(),
         ))
     }
 }
@@ -160,6 +126,7 @@ impl IvfClusterer for SuperKMeansClusterer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vector::clustering::{IvfMatrixView, IvfVectorBatch};
 
     /// The defaults are the documented constants, and the two setters are independent.
     #[test]
@@ -181,5 +148,55 @@ mod tests {
             1.0
         );
         assert_eq!(clusterer.config.max_leaf_size, 20);
+    }
+
+    #[test]
+    fn assignment_matches_brute_force() -> crate::Result<()> {
+        let clusterer = SuperKMeansClusterer::default();
+        for dim in [3, 64, 1024] {
+            let mut values = superkmeans::generate_random_vectors(1031, dim, -1.0, 1.0, 42);
+            let mut centers = superkmeans::generate_random_vectors(19, dim, -1.0, 1.0, 17);
+            centers.extend_from_within(..dim);
+            values[..dim].copy_from_slice(&centers[..dim]);
+            let centroids = IvfCentroids::F32(IvfMatrix {
+                values: centers.clone(),
+                rows: 20,
+                dims: dim,
+            });
+            for rows in [0, 1, 1031] {
+                let doc_ids = (0..rows as u32).collect::<Vec<_>>();
+                let values = &values[..rows * dim];
+                let mut expected = vec![0; rows];
+                let mut distances = vec![0.0; rows];
+                superkmeans::find_nearest_neighbor_brute_force(
+                    values,
+                    &centers,
+                    rows,
+                    20,
+                    dim,
+                    &mut expected,
+                    &mut distances,
+                );
+                for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+                    let actual = clusterer.assign(
+                        &VectorOptions::new(dim, metric),
+                        IvfVectors::F32(IvfVectorBatch {
+                            doc_ids: &doc_ids,
+                            matrix: IvfMatrixView {
+                                values,
+                                rows,
+                                dims: dim,
+                            },
+                        }),
+                        &centroids,
+                    )?;
+                    assert_eq!(
+                        actual, expected,
+                        "dim={dim}, rows={rows}, metric={metric:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
