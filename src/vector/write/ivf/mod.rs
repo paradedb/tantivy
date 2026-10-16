@@ -38,6 +38,7 @@ mod assign;
 #[cfg(test)]
 mod build_tests;
 mod encode;
+mod source;
 #[cfg(test)]
 mod tests;
 mod train;
@@ -52,8 +53,12 @@ struct AssignedVector {
 /// Per-field IVF build counters and timings, reported on `paradedb::ivf_build`.
 #[derive(Default)]
 struct IvfBuildTimings {
-    /// Source vector reads across the training, assign, and encode passes.
-    source_reads: usize,
+    /// Source vectors decoded for training, counting a vector again each time it is re-read.
+    train_reads: usize,
+    /// Source vectors decoded for assignment.
+    assign_reads: usize,
+    /// Source vectors read while encoding the clustered rows.
+    encode_reads: usize,
     spill_bytes: usize,
     pad_bytes: usize,
     /// Bytes written to this field's vector entries, including entry padding.
@@ -109,7 +114,6 @@ pub(crate) fn merge_ivf(
         return Ok(());
     }
 
-    let settings = clusterer.merge_settings(num_target_docs as usize)?;
     let directory = ctx.target_segment.index().directory();
     let vec_path = ctx
         .target_segment
@@ -168,14 +172,8 @@ pub(crate) fn merge_ivf(
         match opts.dtype() {
             VectorDType::F32 => {
                 let mut timings = IvfBuildTimings::default();
-                let Some(trained) = train::train(
-                    &merge,
-                    clusterer,
-                    &settings,
-                    &source_rows,
-                    vector_count,
-                    &mut timings,
-                )?
+                let Some(trained) =
+                    train::train(&merge, clusterer, &source_rows, vector_count, &mut timings)?
                 else {
                     // Every vector-bearing doc was deleted. Write the same empty slots as the
                     // no-vectors path: the reader errors on slots missing from composites the
@@ -191,7 +189,6 @@ pub(crate) fn merge_ivf(
                 let mut assigned_vectors = assign::assign(
                     &merge,
                     clusterer,
-                    &settings,
                     source_rows,
                     &centroids,
                     vector_count,

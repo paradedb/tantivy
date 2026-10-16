@@ -607,7 +607,7 @@ impl Index {
             executor: Executor::single_thread(),
             inventory,
             custom_plugins: Vec::new(),
-            ivf_clusterer: Arc::new(SuperKMeansClusterer::default()),
+            ivf_clusterer: Arc::new(SuperKMeansClusterer::new()),
             ivf_router: RouterKind::default(),
         }
     }

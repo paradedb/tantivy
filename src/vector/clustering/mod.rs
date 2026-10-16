@@ -1,6 +1,8 @@
 //! Custom clustering: the [`IvfClusterer`] a merge trains and assigns with, its inputs and
 //! outputs, and the built-in [`SuperKMeansClusterer`].
 
+use std::ops::Range;
+
 use crate::schema::VectorOptions;
 use crate::vector::VectorElement;
 use crate::{DocId, TantivyError};
@@ -17,48 +19,56 @@ pub trait IvfClusterer: Send + Sync + 'static {
     fn train(
         &self,
         options: &VectorOptions,
-        vectors: IvfTrainingVectors,
+        source: &mut dyn VectorSource,
     ) -> crate::Result<IvfCentroids>;
 
     /// Assigns vectors to centroids.
     fn assign(
         &self,
         options: &VectorOptions,
-        vectors: IvfVectors<'_>,
+        source: &mut dyn VectorSource,
         centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>>;
-
-    fn assign_batch_size(&self) -> usize {
-        2048
-    }
-
-    fn merge_settings(&self, _total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
-        let training_sample_ratio = self.training_sample_ratio();
-        let assign_batch_size = self.assign_batch_size();
-
-        assert!(
-            training_sample_ratio > 0.0 && training_sample_ratio <= 1.0,
-            "IvfClusterer training_sample_ratio must be greater than 0 and less than or equal to \
-             1, got {training_sample_ratio}"
-        );
-        assert!(
-            assign_batch_size > 0,
-            "IvfClusterer assign_batch_size must be greater than 0, got {assign_batch_size}"
-        );
-
-        Ok(IvfMergeSettings {
-            training_sample_ratio,
-            assign_batch_size,
-        })
-    }
 }
 
-#[derive(Clone, Copy, Debug)]
-/// Merge-time IVF sizes.
-pub struct IvfMergeSettings {
-    /// Fraction of vectors sampled for training, in `(0, 1]`.
-    pub training_sample_ratio: f32,
-    pub assign_batch_size: usize,
+/// Replayable, read-only view of vectors for IVF [`IvfClusterer::train`] or
+/// [`IvfClusterer::assign`].
+///
+/// Rows are identified by their 0-based position in a fixed scan order, and
+/// every read returns the same vectors for the same positions. Reads hand the
+/// decoded rows to the caller and keep none, so what the caller holds is all
+/// the vector memory a train or assign uses.
+///
+/// Merge builds a sample for training and the full set for assignment. Reads
+/// fail with [`TantivyError::Cancelled`] if the merge is cancelled.
+pub trait VectorSource {
+    /// Number of rows in scan order.
+    fn num_rows(&self) -> usize;
+
+    /// Loads the rows in `range` of scan order.
+    fn read_range(&mut self, range: Range<usize>) -> crate::Result<IvfTrainingVectors>;
+
+    /// Loads the rows at the given scan positions, returned in the given order.
+    ///
+    /// Positions may be scattered and unsorted; implementations should fetch
+    /// them in scan order, so one large request is cheaper than many small
+    /// ones.
+    fn read_rows(&mut self, rows: &[u32]) -> crate::Result<IvfTrainingVectors>;
+}
+
+/// Reads every row of `source` in scan order, at most `batch_rows` at a time, and calls `f`
+/// with each batch. A batch is dropped once `f` returns unless `f` keeps it.
+pub fn for_each_batch(
+    source: &mut dyn VectorSource,
+    batch_rows: usize,
+    mut f: impl FnMut(IvfTrainingVectors),
+) -> crate::Result<()> {
+    let num_rows = source.num_rows();
+    for start in (0..num_rows).step_by(batch_rows.max(1)) {
+        let end = start.saturating_add(batch_rows.max(1)).min(num_rows);
+        f(source.read_range(start..end)?);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +152,24 @@ pub(crate) fn decode_row_append<T: VectorElement>(
         )));
     }
     decoded.extend(bytes.chunks_exact(T::SIZE_BYTES).map(T::decode_le));
+    Ok(())
+}
+
+/// Decodes a row into a caller-owned slot of exactly one row.
+pub(crate) fn decode_row_into<T: VectorElement>(
+    bytes: &[u8],
+    decoded: &mut [T],
+) -> crate::Result<()> {
+    let expected = decoded.len() * T::SIZE_BYTES;
+    if bytes.len() != expected {
+        return Err(TantivyError::InvalidArgument(format!(
+            "vector byte length mismatch: expected {expected} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    for (value, chunk) in decoded.iter_mut().zip(bytes.chunks_exact(T::SIZE_BYTES)) {
+        *value = T::decode_le(chunk);
+    }
     Ok(())
 }
 

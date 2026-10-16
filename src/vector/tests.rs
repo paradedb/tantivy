@@ -11,7 +11,7 @@ use crate::schema::{
     STRING,
 };
 use crate::vector::clustering::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
+    for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
 };
 use crate::vector::params::{LocatedPath, ProbeParams};
 use crate::vector::RouterKind;
@@ -191,17 +191,10 @@ impl IvfClusterer for Grid2DClusterer {
         1.0
     }
 
-    fn merge_settings(&self, _total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
-        Ok(IvfMergeSettings {
-            training_sample_ratio: self.training_sample_ratio(),
-            assign_batch_size: self.assign_batch_size(),
-        })
-    }
-
     fn train(
         &self,
         options: &VectorOptions,
-        _vectors: IvfTrainingVectors,
+        _source: &mut dyn VectorSource,
     ) -> crate::Result<IvfCentroids> {
         assert_eq!(options.dim(), grid2d::DIM);
         let num_centroids = self.centroids.len();
@@ -219,18 +212,20 @@ impl IvfClusterer for Grid2DClusterer {
     fn assign(
         &self,
         options: &VectorOptions,
-        vectors: IvfVectors<'_>,
+        source: &mut dyn VectorSource,
         centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>> {
         assert_eq!(options.dim(), grid2d::DIM);
-        let IvfVectors::F32(vectors) = vectors;
         let IvfCentroids::F32(centroids) = centroids;
-        Ok(vectors
-            .matrix
-            .values
-            .chunks_exact(vectors.matrix.dims)
-            .map(|vector| grid2d::nearest_centroid(vector, centroids.values.as_slice()) as u32)
-            .collect())
+        let num_rows = source.num_rows();
+        let mut assignments = Vec::with_capacity(num_rows);
+        for_each_batch(source, num_rows, |IvfTrainingVectors::F32(batch)| {
+            for vector in batch.matrix.values.chunks_exact(batch.matrix.dims) {
+                assignments
+                    .push(grid2d::nearest_centroid(vector, centroids.values.as_slice()) as u32);
+            }
+        })?;
+        Ok(assignments)
     }
 }
 
@@ -979,7 +974,7 @@ mod bounds_storage_tests {
     use crate::query::AllQuery;
     use crate::schema::{Metric, Schema, VectorDType, VectorOptions, STORED, STRING};
     use crate::vector::clustering::{
-        IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
+        for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
     };
     use crate::vector::diagnostics::VectorStorageFormat;
     use crate::vector::router::stacked::levels::{InMemoryStore, StackedIvf, StackedIvfConfig};
@@ -1080,16 +1075,10 @@ mod bounds_storage_tests {
         fn training_sample_ratio(&self) -> f32 {
             1.0
         }
-        fn merge_settings(&self, _total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
-            Ok(IvfMergeSettings {
-                training_sample_ratio: self.training_sample_ratio(),
-                assign_batch_size: self.assign_batch_size(),
-            })
-        }
         fn train(
             &self,
             options: &VectorOptions,
-            vectors: IvfTrainingVectors,
+            source: &mut dyn VectorSource,
         ) -> crate::Result<IvfCentroids> {
             assert_eq!(options.dim(), 2);
             let num_centroids = self.num_centroids;
@@ -1100,8 +1089,9 @@ mod bounds_storage_tests {
                     .flat_map(|centroid| centroid.iter().copied())
                     .collect(),
                 None => {
-                    let IvfTrainingVectors::F32(batch) = vectors;
-                    batch.matrix.values[..num_centroids * 2].to_vec()
+                    let rows: Vec<u32> = (0..num_centroids as u32).collect();
+                    let IvfTrainingVectors::F32(batch) = source.read_rows(&rows)?;
+                    batch.matrix.values
                 }
             };
             Ok(IvfCentroids::F32(IvfMatrix {
@@ -1113,17 +1103,15 @@ mod bounds_storage_tests {
         fn assign(
             &self,
             options: &VectorOptions,
-            vectors: IvfVectors<'_>,
+            source: &mut dyn VectorSource,
             centroids: &IvfCentroids,
         ) -> crate::Result<Vec<u32>> {
             assert_eq!(options.dim(), 2);
-            let IvfVectors::F32(vectors) = vectors;
             let IvfCentroids::F32(centroids) = centroids;
-            Ok(vectors
-                .matrix
-                .values
-                .chunks_exact(2)
-                .map(|vector| {
+            let num_rows = source.num_rows();
+            let mut assignments = Vec::with_capacity(num_rows);
+            for_each_batch(source, num_rows, |IvfTrainingVectors::F32(batch)| {
+                for vector in batch.matrix.values.chunks_exact(2) {
                     let mut best = 0u32;
                     let mut best_d2 = f32::INFINITY;
                     for (i, centroid) in centroids.values.chunks_exact(2).enumerate() {
@@ -1135,9 +1123,10 @@ mod bounds_storage_tests {
                             best_d2 = d2;
                         }
                     }
-                    best
-                })
-                .collect())
+                    assignments.push(best);
+                }
+            })?;
+            Ok(assignments)
         }
     }
 

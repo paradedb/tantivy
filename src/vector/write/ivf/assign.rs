@@ -4,31 +4,26 @@ use std::time::Instant;
 
 use itertools::Itertools;
 
+use super::source::MergeVectorSource;
 use super::{AssignedVector, FieldMerge, IvfBuildTimings};
-use crate::vector::clustering::{
-    decode_row_append, IvfCentroids, IvfClusterer, IvfMatrixView, IvfMergeSettings, IvfVectorBatch,
-    IvfVectors,
-};
+use crate::vector::clustering::{IvfCentroids, IvfClusterer, VectorSource};
 use crate::vector::write::RowAddress;
 use crate::{DocId, TantivyError};
 
 /// Assigns each of the field's vectors to one of `centroids`, reading the sources in storage
-/// order and batching by the clusterer's batch size.
+/// order through a [`MergeVectorSource`].
 pub(super) fn assign(
     merge: &FieldMerge,
     clusterer: &dyn IvfClusterer,
-    settings: &IvfMergeSettings,
     source_rows: Vec<Option<RowAddress>>,
     centroids: &IvfCentroids,
     vector_count: usize,
     timings: &mut IvfBuildTimings,
 ) -> crate::Result<Vec<AssignedVector>> {
     let opts = merge.opts;
-    let dim = opts.dim();
     let IvfCentroids::F32(centroid_matrix) = centroids;
     let num_centroids = centroid_matrix.rows;
-    let mut assigned_vectors = Vec::with_capacity(vector_count);
-    // Assignment is per vector, so batches can follow source storage order;
+    // Assignment is per vector, so the source follows storage order;
     // `assigned_vectors` is re-sorted by (cluster, target doc) afterwards.
     let assign_sources: Vec<(RowAddress, DocId)> = source_rows
         .into_iter()
@@ -36,58 +31,37 @@ pub(super) fn assign(
         .filter_map(|(doc_id, row)| row.map(|row| (row, doc_id as DocId)))
         .sorted()
         .collect();
+    debug_assert!(assign_sources.len() <= vector_count);
 
-    let batch_capacity = settings.assign_batch_size.min(assign_sources.len());
-    let mut batch_values = Vec::with_capacity(batch_capacity * dim);
-    let mut batch_doc_ids = Vec::with_capacity(batch_capacity);
-    for batch in assign_sources.chunks(settings.assign_batch_size) {
-        if merge.ctx.cancel.wants_cancel() {
-            return Err(TantivyError::Cancelled);
-        }
-        batch_values.clear();
-        batch_doc_ids.clear();
-        for &(source, target_doc_id) in batch {
-            timings.source_reads += 1;
-            let bytes =
-                merge.readers[source.segment_ord as usize].vector_bytes_for_row(source.row_id)?;
-            decode_row_append::<f32>(&bytes, dim, &mut batch_values)?;
-            batch_doc_ids.push(target_doc_id);
-        }
-        let assign_start = Instant::now();
-        let clusters = clusterer.assign(
-            opts,
-            IvfVectors::F32(IvfVectorBatch {
-                doc_ids: batch_doc_ids.as_slice(),
-                matrix: IvfMatrixView {
-                    values: batch_values.as_slice(),
-                    rows: batch.len(),
-                    dims: dim,
-                },
-            }),
-            centroids,
-        )?;
-        timings.assign += assign_start.elapsed();
-        if clusters.len() != batch.len() {
+    let mut source =
+        MergeVectorSource::new(&merge.readers, assign_sources, opts.dim(), merge.ctx.cancel);
+    let assign_start = Instant::now();
+    let clusters = clusterer.assign(opts, &mut source, centroids)?;
+    timings.assign += assign_start.elapsed();
+    timings.assign_reads += source.reads;
+
+    if clusters.len() != source.num_rows() {
+        return Err(TantivyError::InvalidArgument(format!(
+            "IvfClusterer assigned {} clusters for {} vectors",
+            clusters.len(),
+            source.num_rows()
+        )));
+    }
+
+    let mut assigned_vectors = Vec::with_capacity(clusters.len());
+    for (cluster, &(row, target_doc_id)) in clusters.into_iter().zip(source.rows()) {
+        let cluster = cluster as usize;
+        if cluster >= num_centroids {
             return Err(TantivyError::InvalidArgument(format!(
-                "IvfClusterer assigned {} clusters for {} vectors",
-                clusters.len(),
-                batch.len()
+                "IvfClusterer assigned vector to cluster {cluster}, but only {num_centroids} \
+                 centroids were trained"
             )));
         }
-        for (cluster, &(source, target_doc_id)) in clusters.into_iter().zip(batch) {
-            let cluster = cluster as usize;
-            if cluster >= num_centroids {
-                return Err(TantivyError::InvalidArgument(format!(
-                    "IvfClusterer assigned vector to cluster {cluster}, but only {num_centroids} \
-                     centroids were trained"
-                )));
-            }
-            assigned_vectors.push(AssignedVector {
-                cluster,
-                target_doc_id,
-                source,
-            });
-        }
+        assigned_vectors.push(AssignedVector {
+            cluster,
+            target_doc_id,
+            source: row,
+        });
     }
     Ok(assigned_vectors)
 }
