@@ -524,10 +524,11 @@ pub(crate) fn refine_dot_raw_prefix(raw_prefix: f32, kernel_score: f32, scale: f
     scale.mul_add(kernel_score, raw_prefix)
 }
 
-/// Rounding margin on the fused sigma, in units of `f32::EPSILON`: the smallest integer that
-/// keeps the fused form at least the composed `hypot(model, sqrt(arithmetic))` on every input.
-/// A float-rounding margin, not a fitted constant.
-pub(crate) const SIGMA_FUSED_ROUNDING_K: f32 = 2.0;
+/// Rounding margin on the fused sigma, in units of `f32::EPSILON`. The pad keeps the
+/// single-sqrt sigma at or above the hypot composition of its model and arithmetic parts on
+/// every input, with 2x headroom over the largest measured rounding gap between the two forms
+/// (1.998 eps). A float-rounding margin, not a fitted constant.
+pub(crate) const SIGMA_FUSED_ROUNDING_K: f32 = 4.0;
 
 /// The statistical width of a corrected estimate: its data and query quantization variance,
 /// scaled by the policy's safety factor, combined in quadrature with its arithmetic rounding
