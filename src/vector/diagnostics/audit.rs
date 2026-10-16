@@ -14,9 +14,8 @@ use crate::vector::diagnostics::{
     VectorEstimatorMoments, VectorEstimatorQuery, VectorEstimatorSource,
 };
 use crate::vector::quantization::{
-    corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix,
-    quantized_model_sigma, refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError,
-    QUANTIZED_BOUNDARY_KAPPA,
+    corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix, quantized_sigma,
+    refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError, QUANTIZED_BOUNDARY_KAPPA,
 };
 use crate::vector::search::interval::{Estimate, Threshold};
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
@@ -568,7 +567,7 @@ impl VectorIndexReader {
                                 *scale * *scale * query.query_error_squared(depth) as f32;
                         }
                         let gamma = *stored_gamma;
-                        let model_sigma = quantized_model_sigma(
+                        let model_sigma = quantized_sigma(
                             self.options.metric(),
                             self.options.dim(),
                             residual_norm_squared,
@@ -576,11 +575,7 @@ impl VectorIndexReader {
                             gamma,
                             query_norm_squared,
                             sign_query_error_term,
-                        );
-                        let model_sigma = arithmetic.sigma(
-                            self.options.metric(),
-                            model_sigma,
-                            gamma,
+                            arithmetic,
                             raw_prefix_estimate,
                             base,
                         );
@@ -801,7 +796,7 @@ impl VectorIndexReader {
                         0.0
                     };
                     let query_norm = cluster_query_norms[cluster];
-                    let sigma = quantized_model_sigma(
+                    let sigma = quantized_sigma(
                         metric,
                         self.options.dim(),
                         residual_norm_squared,
@@ -809,8 +804,10 @@ impl VectorIndexReader {
                         gamma,
                         query_norm * query_norm,
                         sign_query_error_term,
+                        arithmetic,
+                        raw_prefix,
+                        base,
                     );
-                    let sigma = arithmetic.sigma(metric, sigma, gamma, raw_prefix, base);
                     if !estimate.is_finite() || !sigma.is_finite() {
                         return Err(DataCorruption::comment_only(format!(
                             "exact-E cone row {row} produced a non-finite depth-1 estimate or \
@@ -890,7 +887,7 @@ impl VectorIndexReader {
                             base,
                         );
                         let query_norm = cluster_query_norms[cluster];
-                        let sigma = quantized_model_sigma(
+                        let sigma = quantized_sigma(
                             metric,
                             self.options.dim(),
                             residual_norm_squared,
@@ -898,11 +895,7 @@ impl VectorIndexReader {
                             gamma,
                             query_norm * query_norm,
                             candidates.sign_query_error_terms[candidate],
-                        );
-                        let sigma = candidates.arithmetic_errors[candidate].sigma(
-                            metric,
-                            sigma,
-                            gamma,
+                            candidates.arithmetic_errors[candidate],
                             candidates.raw_prefixes[candidate],
                             base,
                         );
@@ -1005,7 +998,7 @@ mod tests {
         let variance =
             residual_norm_squared / dimension as f32 * corrected_error_ratio * query_norm_squared
                 + gamma * gamma * sign_query_error_term;
-        let dot = quantized_model_sigma(
+        let dot = quantized_sigma(
             Metric::Dot,
             dimension,
             residual_norm_squared,
@@ -1013,8 +1006,11 @@ mod tests {
             gamma,
             query_norm_squared,
             sign_query_error_term,
+            ArithmeticError::default(),
+            0.0,
+            0.0,
         );
-        let l2 = quantized_model_sigma(
+        let l2 = quantized_sigma(
             Metric::L2,
             dimension,
             residual_norm_squared,
@@ -1022,17 +1018,36 @@ mod tests {
             gamma,
             query_norm_squared,
             sign_query_error_term,
+            ArithmeticError::default(),
+            0.0,
+            0.0,
         );
-        let expected = crate::vector::quantization::GAMMA_ANALYTICAL_SAFETY * variance.sqrt();
-        assert_eq!(dot.to_bits(), expected.to_bits());
-        assert_eq!(l2.to_bits(), (2.0 * expected).to_bits());
+        let safety = crate::vector::quantization::GAMMA_ANALYTICAL_SAFETY;
+        let pad = 1.0 + crate::vector::quantization::SIGMA_FUSED_ROUNDING_K * f32::EPSILON;
+        let expected_dot = pad * (safety * safety * variance).sqrt();
+        let l2_scale = 2.0 * safety;
+        let expected_l2 = pad * (l2_scale * l2_scale * variance).sqrt();
+        assert_eq!(dot.to_bits(), expected_dot.to_bits());
+        assert_eq!(l2.to_bits(), expected_l2.to_bits());
     }
 
     #[test]
     fn exact_e_sigma_supports_a_grid_first_prefix() {
-        let sigma = quantized_model_sigma(Metric::Cosine, 64, 4.0, 0.5, 1.25, 2.0, 0.0);
-        let expected = crate::vector::quantization::GAMMA_ANALYTICAL_SAFETY
-            * (4.0_f32 / 64.0 * 0.5 * 2.0).sqrt();
+        let sigma = quantized_sigma(
+            Metric::Cosine,
+            64,
+            4.0,
+            0.5,
+            1.25,
+            2.0,
+            0.0,
+            ArithmeticError::default(),
+            0.0,
+            0.0,
+        );
+        let safety = crate::vector::quantization::GAMMA_ANALYTICAL_SAFETY;
+        let pad = 1.0 + crate::vector::quantization::SIGMA_FUSED_ROUNDING_K * f32::EPSILON;
+        let expected = pad * (safety * safety * (4.0_f32 / 64.0 * 0.5 * 2.0)).sqrt();
         assert_eq!(sigma.to_bits(), expected.to_bits());
     }
 

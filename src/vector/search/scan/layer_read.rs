@@ -1,6 +1,6 @@
 //! Reading and decoding one quantized layer for a cluster's selected rows.
 
-use quant::model::f16::f16_to_f32;
+use quant::model::f16::{decode_f16s_to_f32s, f16_to_f32};
 
 use crate::error::DataCorruption;
 use crate::schema::Metric;
@@ -248,10 +248,7 @@ fn f16_at(bytes: &[u8], row: usize) -> f32 {
 pub(super) fn decode_f16s(values: &[u8], decoded: &mut Vec<f32>) {
     assert_eq!(values.len() % std::mem::size_of::<u16>(), 0);
     decoded.resize(values.len() / std::mem::size_of::<u16>(), 0.0);
-    for (out, bytes) in decoded.iter_mut().zip(values.chunks_exact(2)) {
-        let bits = bytes[0] as u16 | (bytes[1] as u16) << 8;
-        *out = f16_to_f32(bits);
-    }
+    decode_f16s_to_f32s(values, decoded);
 }
 
 /// Decodes a little-endian binary32 run.

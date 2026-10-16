@@ -63,6 +63,28 @@ impl Columns {
         self.sign_query_error_terms.truncate(len);
         self.arithmetic_variances.truncate(len);
     }
+
+    /// Appends the entries of `from` that `keep` selects, column by column.
+    fn extend_selected(&mut self, from: &Columns, keep: &[u32]) {
+        self.bases
+            .extend(keep.iter().map(|&i| from.bases[i as usize]));
+        self.raw_prefixes
+            .extend(keep.iter().map(|&i| from.raw_prefixes[i as usize]));
+        self.estimates
+            .extend(keep.iter().map(|&i| from.estimates[i as usize]));
+        self.sigmas
+            .extend(keep.iter().map(|&i| from.sigmas[i as usize]));
+        self.residual_norm_squared
+            .extend(keep.iter().map(|&i| from.residual_norm_squared[i as usize]));
+        self.gammas
+            .extend(keep.iter().map(|&i| from.gammas[i as usize]));
+        self.sign_query_error_terms.extend(
+            keep.iter()
+                .map(|&i| from.sign_query_error_terms[i as usize]),
+        );
+        self.arithmetic_variances
+            .extend(keep.iter().map(|&i| from.arithmetic_variances[i as usize]));
+    }
 }
 
 // --- Candidates ---
@@ -139,6 +161,56 @@ impl QuantizedCandidates {
             self.docs.extend_from_slice(docs);
             start
         });
+        self.blocks.push(AdmittedCluster {
+            cluster: rows.cluster,
+            rows: rows.rows.clone(),
+            centroid,
+            at: at.clone(),
+            docs,
+        });
+        at
+    }
+
+    /// Appends the rows of `rows` whose interval can still reach the running top-k as a block
+    /// around `centroid`, taking their combined columns from `scratch`. The running k-th lower
+    /// endpoint only rises, so a dropped row's upper endpoint stays below every later boundary
+    /// threshold and its lower endpoint can never enter the running top-k: survivors, thresholds
+    /// and results are exactly those of appending every row. `keep` is reused scratch for the
+    /// selected row indices. Returns the block's range.
+    pub(crate) fn push_block_pruned(
+        &mut self,
+        rows: &ClusterRows<'_>,
+        centroid: Similarity,
+        scratch: &Columns,
+        keep: &mut Vec<u32>,
+        threshold: Threshold,
+    ) -> Range<usize> {
+        debug_assert_eq!(scratch.estimates.len(), rows.len());
+        keep.clear();
+        keep.extend((0..rows.len() as u32).filter(|&i| {
+            let index = i as usize;
+            let upper = Estimate(scratch.estimates[index]).upper(scratch.sigmas[index], self.kappa);
+            threshold.admits(upper)
+        }));
+        let start = self.offsets.len();
+        match rows.offsets {
+            Some(offsets) => self
+                .offsets
+                .extend(keep.iter().map(|&i| offsets[i as usize])),
+            // A whole-cluster selection's offsets are the row indices themselves.
+            None => self.offsets.extend_from_slice(keep),
+        }
+        let at = start..self.offsets.len();
+        let docs = rows.docs.map(|docs| {
+            debug_assert_eq!(docs.len(), rows.len());
+            if self.docs.capacity() == 0 {
+                self.docs.reserve(self.offsets.capacity());
+            }
+            let start = self.docs.len();
+            self.docs.extend(keep.iter().map(|&i| docs[i as usize]));
+            start
+        });
+        self.columns.extend_selected(scratch, keep);
         self.blocks.push(AdmittedCluster {
             cluster: rows.cluster,
             rows: rows.rows.clone(),

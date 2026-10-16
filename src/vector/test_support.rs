@@ -492,6 +492,7 @@ impl Fixture {
         top_n: usize,
         params: ProbeParams,
         plan: Option<PlanOverride>,
+        admission_pruning: bool,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = self.index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[segment];
@@ -516,6 +517,7 @@ impl Fixture {
             params,
         )?;
         backend.plan_override = plan;
+        backend.admission_pruning_disabled = !admission_pruning;
         backend.top_n(weight, segment_reader, top_n)
     }
 

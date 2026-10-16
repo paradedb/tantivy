@@ -63,8 +63,12 @@ posting range, so a later layer never touches rows an earlier one ruled out.
   bytes. Bits past `d` are always zero, so byte comparison is code equality.
 - **Zero residuals serialize canonically:** zero codes, zero scale, γ = 1,
   E = 0.
-- **No `unsafe`** except one aligned `align_to::<u64>` cast in `cascade`
-  with a decoding fallback when the input is unaligned or big-endian.
+- **`unsafe` is confined to dispatched kernels.** `sign`'s NEON kernels and
+  its x86 `target_feature` variants run only behind CPU-feature checks (NEON
+  is baseline on aarch64, UDOT behind FEAT_DotProd detection), and every
+  variant is bit-identical to the portable body it wraps. The one other use
+  is an aligned `align_to::<u64>` cast in `cascade` with a decoding fallback
+  when the input is unaligned or big-endian.
 
 ## Checks and benchmarks
 
