@@ -524,17 +524,22 @@ pub(crate) fn refine_dot_raw_prefix(raw_prefix: f32, kernel_score: f32, scale: f
     scale.mul_add(kernel_score, raw_prefix)
 }
 
-/// Rounding margin on the fused sigma, in units of `f32::EPSILON`. The pad keeps the
-/// single-sqrt sigma at or above the hypot composition of its model and arithmetic parts on
-/// every input, with 2x headroom over the largest measured rounding gap between the two forms
-/// (1.998 eps). A float-rounding margin, not a fitted constant.
+/// Rounding margin on the fused sigma, in units of `f32::EPSILON`. Every variance term is
+/// non-negative, so relative rounding errors accumulate along each term's path with no
+/// cancellation; the longest path is the model term's ten roundings (four in the data
+/// variance, the query-variance addition, the squared model scale, their product, and three
+/// sum additions). The square root halves that relative error and adds one rounding, the pad
+/// multiply adds one more, so the computed sigma sits at most (10/2 + 2) half-ulps below the
+/// exact-arithmetic value of the same expression, and the smallest sufficient integer pad is
+/// k = 4. With it, sigma is at or above that exact value wherever no term underflows f32. A
+/// float-rounding margin, not a fitted constant.
 pub(crate) const SIGMA_FUSED_ROUNDING_K: f32 = 4.0;
 
 /// The statistical width of a corrected estimate: its data and query quantization variance,
 /// scaled by the policy's safety factor, combined in quadrature with its arithmetic rounding
-/// variance, under one square root. The `(1 + kε)` pad covers the rounding difference against
-/// composing the terms through `hypot`, so the width never shrinks and lower endpoints only
-/// widen.
+/// variance, under one square root. The `(1 + kε)` pad keeps the result at or above the
+/// exact-arithmetic value of the expression ([`SIGMA_FUSED_ROUNDING_K`]), so the width never
+/// shrinks and lower endpoints only widen.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn quantized_sigma(
@@ -591,14 +596,14 @@ mod tests {
         mantissa * (e as f32).exp2()
     }
 
-    /// The fused sigma stays within rounding of the composed `hypot(model, sqrt(arith))` form:
-    /// never below it, and at most `(1 + 2k eps)` above it, over magnitudes whose squared terms
-    /// stay finite. Inputs whose squares overflow f32 cannot reach the boundary: estimates and
-    /// sigmas are validated finite.
+    /// The fused sigma brackets the exact-arithmetic value of its own expression: at or above
+    /// an f64 evaluation from the same f32 inputs, and within `(1 + 2k eps)` of it. Samples
+    /// where a nonzero term sits below `f32::MIN_POSITIVE` are skipped: the bound holds away
+    /// from f32 underflow.
     #[test]
-    fn fused_sigma_bounds_the_composed_form() {
+    fn fused_sigma_bounds_the_exact_value() {
         let mut state = 0x5349_474d_4121_u64;
-        let upper = 1.0 + 2.0 * SIGMA_FUSED_ROUNDING_K * f32::EPSILON;
+        let upper = 1.0 + 2.0 * f64::from(SIGMA_FUSED_ROUNDING_K) * f64::from(f32::EPSILON);
         for sample in 0..2_000_000_u64 {
             let bits = splitmix(&mut state);
             let metric = if bits & 1 == 0 {
@@ -632,26 +637,35 @@ mod tests {
             let prefix = sign * magnitude(&mut state, -20, 25);
             let base = -sign * magnitude(&mut state, -20, 25);
 
-            let data_variance = residual_norm_squared
-                * (1.0 / dimension as f32)
-                * corrected_error_ratio
-                * query_norm_squared;
-            let query_variance = gamma * gamma * sign_query_error_term;
+            // The same expression in f64, from the f32 inputs and constants.
+            let data_variance = f64::from(residual_norm_squared)
+                * (1.0 / dimension as f64)
+                * f64::from(corrected_error_ratio)
+                * f64::from(query_norm_squared);
+            let query_variance =
+                f64::from(gamma) * f64::from(gamma) * f64::from(sign_query_error_term);
             let (metric_factor, factor) = if metric == Metric::L2 {
-                (2.0, 2.0 * gamma)
+                (2.0, 2.0 * f64::from(gamma))
             } else {
-                (1.0, gamma)
+                (1.0, f64::from(gamma))
             };
-            let model =
-                metric_factor * GAMMA_ANALYTICAL_SAFETY * (data_variance + query_variance).sqrt();
-            let final_error = rounding_error(factor * prefix, base, 1.0);
-            let composed = model.hypot(
-                (factor * factor * arithmetic.raw_variance
-                    + arithmetic.base_variance
-                    + final_error * final_error)
-                    .sqrt(),
-            );
-            let fused = quantized_sigma(
+            let model_scale = metric_factor * f64::from(GAMMA_ANALYTICAL_SAFETY);
+            let final_error = f64::from(f32::EPSILON)
+                * ((factor * f64::from(prefix)).abs() + f64::from(base).abs());
+            let terms = [
+                model_scale * model_scale * (data_variance + query_variance),
+                factor * factor * f64::from(arithmetic.raw_variance),
+                f64::from(arithmetic.base_variance),
+                final_error * final_error,
+            ];
+            if terms
+                .iter()
+                .any(|&term| term != 0.0 && term < f64::from(f32::MIN_POSITIVE))
+            {
+                continue;
+            }
+            let exact = terms.iter().sum::<f64>().sqrt();
+            let fused = f64::from(quantized_sigma(
                 metric,
                 dimension,
                 residual_norm_squared,
@@ -662,17 +676,17 @@ mod tests {
                 arithmetic,
                 prefix,
                 base,
-            );
-            if !composed.is_finite() || !fused.is_finite() {
+            ));
+            if !exact.is_finite() || !fused.is_finite() {
                 continue;
             }
             assert!(
-                fused >= composed,
-                "sample {sample}: fused {fused} below composed {composed}"
+                fused >= exact,
+                "sample {sample}: fused {fused} below exact {exact}"
             );
             assert!(
-                fused <= composed * upper,
-                "sample {sample}: fused {fused} above composed {composed} * (1 + 2k eps)"
+                fused <= exact * upper,
+                "sample {sample}: fused {fused} above exact {exact} * (1 + 2k eps)"
             );
         }
     }

@@ -334,8 +334,26 @@ mod tests {
         assert_eq!(columns.residual_norm_squared, [7.0]);
         assert_eq!(columns.sign_query_error_terms, [117.0]);
         let variance: f32 = 7.0 * 0.5 * 11.0 + 4.0 * 117.0;
-        // The fused sigma adds its rounding pad and the arithmetic terms, all far below 1e-3.
-        assert!((columns.sigmas[0] - 2.0 * 1.15 * variance.sqrt()).abs() < 1e-3);
+        // The model variance is one non-negative summand under the width's square root and the
+        // pad multiplies by at least one, so it bounds sigma from below; the stored columns and
+        // the combine context re-evaluate the width exactly.
+        assert!(columns.sigmas[0] >= 2.0 * 1.15 * variance.sqrt());
+        assert_eq!(
+            columns.sigmas[0].to_bits(),
+            quantized_sigma(
+                Metric::L2,
+                1,
+                columns.residual_norm_squared[0],
+                0.5,
+                columns.gammas[0],
+                11.0,
+                columns.sign_query_error_terms[0],
+                columns.arithmetic_variances[0],
+                columns.raw_prefixes[0],
+                columns.bases[0],
+            )
+            .to_bits()
+        );
     }
 
     /// A refining L2 gamma corrects only the raw prefix, and refining one candidate leaves the
@@ -369,9 +387,31 @@ mod tests {
         assert_eq!(columns.estimates, [22.0, 44.0]);
         assert_eq!(columns.residual_norm_squared, [9.0, 4.0]);
         assert_eq!(columns.sign_query_error_terms, [99.0, 53.0]);
-        // The fused sigma adds its rounding pad and the arithmetic terms, all far below 1e-3.
-        assert!((columns.sigmas[0] - 2.0 * 1.15 * 427.5_f32.sqrt()).abs() < 1e-3);
-        assert!((columns.sigmas[1] - 2.0 * 1.15 * 136.25_f32.sqrt()).abs() < 1e-3);
+        // The model variances are non-negative summands under each width's square root and the
+        // pad multiplies by at least one, so they bound the sigmas from below; the stored
+        // columns and each refinement's own context re-evaluate the widths exactly.
+        assert!(columns.sigmas[0] >= 2.0 * 1.15 * 427.5_f32.sqrt());
+        assert!(columns.sigmas[1] >= 2.0 * 1.15 * 136.25_f32.sqrt());
+        for (index, (error_ratio, query_norm_squared)) in
+            [(0.5, 7.0), (0.25, 17.0)].into_iter().enumerate()
+        {
+            assert_eq!(
+                columns.sigmas[index].to_bits(),
+                quantized_sigma(
+                    Metric::L2,
+                    1,
+                    columns.residual_norm_squared[index],
+                    error_ratio,
+                    columns.gammas[index],
+                    query_norm_squared,
+                    columns.sign_query_error_terms[index],
+                    columns.arithmetic_variances[index],
+                    columns.raw_prefixes[index],
+                    columns.bases[index],
+                )
+                .to_bits()
+            );
+        }
     }
 
     fn assert_diagnostic_prefix_matches_integrated(metric: Metric) {
