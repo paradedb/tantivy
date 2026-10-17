@@ -120,6 +120,15 @@ pub(crate) struct QuantizedCandidates {
 }
 
 impl QuantizedCandidates {
+    pub(crate) fn clear(&mut self) {
+        self.offsets.clear();
+        self.docs.clear();
+        self.columns.truncate(0);
+        self.blocks.clear();
+        self.lowers.clear();
+        self.cluster_top.clear();
+    }
+
     /// Room for `capacity` candidates in the offsets, every column and the boundary's lower
     /// endpoints; doc ids are reserved when a block first brings them.
     pub(crate) fn with_capacity(capacity: usize) -> Self {
@@ -132,6 +141,10 @@ impl QuantizedCandidates {
             lowers: Vec::with_capacity(capacity),
             cluster_top: Vec::new(),
         }
+    }
+
+    pub(crate) fn block_count(&self) -> usize {
+        self.blocks.len()
     }
 
     /// The live candidates: every block's range, summed.
@@ -267,7 +280,7 @@ impl QuantizedCandidates {
     }
 
     #[inline]
-    fn upper(&self, index: usize) -> UpperEndpoint {
+    pub(super) fn upper(&self, index: usize) -> UpperEndpoint {
         self.estimate(index)
             .upper(self.columns.sigmas[index], self.kappa)
     }
@@ -299,6 +312,34 @@ impl QuantizedCandidates {
         }
         bound.merge_running(&cluster_top);
         self.cluster_top = cluster_top;
+    }
+
+    pub(crate) fn band_last(&mut self, bound: &KthBound) {
+        let threshold = bound
+            .running_lower()
+            .map(|kth| Threshold(LowerEndpoint(kth)));
+        let block = self.blocks.len() - 1;
+        let at = self.blocks[block].at.clone();
+        let docs = self.blocks[block].docs;
+        let mut write = at.start;
+        for read in at.clone() {
+            if threshold.is_none_or(|kth| kth.admits(self.upper(read))) {
+                if write != read {
+                    self.offsets[write] = self.offsets[read];
+                    self.columns.move_entry(read, write);
+                    if let Some(docs) = docs {
+                        self.docs[docs + write - at.start] = self.docs[docs + read - at.start];
+                    }
+                }
+                write += 1;
+            }
+        }
+        self.blocks[block].at.end = write;
+        self.offsets.truncate(write);
+        self.columns.truncate(write);
+        if let Some(docs) = docs {
+            self.docs.truncate(docs + write - at.start);
+        }
     }
 
     /// Keeps, in place, each block's candidates whose upper endpoint reaches the k-th lower
@@ -563,5 +604,93 @@ impl BoundaryHarness {
         self.bound.as_ref().map_or_else(Vec::new, |bound| {
             bound.running.iter().map(|entry| entry.1).collect()
         })
+    }
+}
+
+#[cfg(test)]
+mod incremental_tests {
+    use super::*;
+
+    #[test]
+    fn refinement_replaces_temporary_bounds_and_preserves_older_candidates() {
+        let mut candidates = QuantizedCandidates::with_capacity(6);
+        candidates.kappa = 1.0;
+        let mut bound = KthBound::new(2);
+        let mut completed = KthBound::new(2);
+        candidates.open_test_block();
+        candidates.push_test_row(10, 110, 5.0, 0.0);
+        candidates.push_test_row(20, 120, 4.0, 0.0);
+        candidates.push_test_row(30, 130, 3.0, 2.0);
+        candidates.finish_cluster(0..3, &mut bound);
+        candidates.band_last(&bound);
+        completed.copy_running_from(&bound);
+        let before = candidates.column_trace(false);
+
+        candidates.open_test_block();
+        candidates.push_test_row(40, 140, 100.0, 0.0);
+        candidates.push_test_row(50, 150, 99.0, 0.0);
+        candidates.push_test_row(60, 160, 98.0, 0.0);
+        candidates.finish_cluster(3..6, &mut bound);
+        candidates.band_last(&bound);
+        assert_eq!(candidates.blocks[1].at, 3..5);
+        assert_eq!(&candidates.column_trace(false)[..3], before.as_slice());
+        assert_eq!(candidates.doc_ids(), vec![110, 120, 130, 140, 150]);
+
+        candidates.columns.estimates[3] = 1.0;
+        candidates.columns.estimates[4] = 2.0;
+        bound.copy_running_from(&completed);
+        candidates.finish_cluster(3..5, &mut bound);
+        candidates.band_last(&bound);
+        assert_eq!(bound.running_lower(), Some(4.0));
+        assert_eq!(bound.running_estimate(), Some(4.0));
+        assert_eq!(candidates.column_trace(false), before);
+        assert_eq!(candidates.blocks[1].at, 3..3);
+        candidates.band(&mut bound);
+        assert_eq!(candidates.doc_ids(), vec![110, 120, 130]);
+    }
+
+    #[test]
+    fn incremental_summary_matches_full_candidate_selection_after_each_layer() {
+        for k in [1, 3, 10, 100] {
+            let mut candidates = QuantizedCandidates::with_capacity(100);
+            let mut bound = KthBound::new(k);
+            let mut completed = KthBound::new(k);
+            for cluster in 0..12 {
+                candidates.open_test_block();
+                for row in 0..7 {
+                    let id = cluster * 7 + row;
+                    candidates.push_test_row(id, id as DocId, ((id * 17) % 31) as f32, 2.0);
+                }
+                let block = candidates.blocks.len() - 1;
+                candidates.finish_cluster(candidates.blocks[block].at.clone(), &mut bound);
+                for layer in 0..3 {
+                    if layer > 0 {
+                        for i in candidates.blocks[block].at.clone() {
+                            candidates.columns.estimates[i] += if i % 2 == 0 { -1.0 } else { 1.0 };
+                            candidates.columns.sigmas[i] *= 0.5;
+                        }
+                        bound.copy_running_from(&completed);
+                        candidates.finish_cluster(candidates.blocks[block].at.clone(), &mut bound);
+                    }
+                    let mut expected: Vec<_> = candidates
+                        .live(false)
+                        .into_iter()
+                        .map(|(row, i)| (candidates.lower(i), row, candidates.columns.estimates[i]))
+                        .collect();
+                    expected.sort_unstable_by(lower_endpoint_order);
+                    expected.truncate(k);
+                    assert_eq!(bound.running, expected);
+                    candidates.band_last(&bound);
+                }
+                completed.copy_running_from(&bound);
+            }
+            let threshold = bound.running_lower();
+            candidates.band(&mut bound);
+            assert!(candidates
+                .live(false)
+                .iter()
+                .all(|&(_, i)| threshold.is_none_or(|t| candidates.upper(i).0 >= t)));
+            assert_eq!(candidates.global_rows().len(), candidates.doc_ids().len());
+        }
     }
 }

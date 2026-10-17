@@ -929,7 +929,12 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
             } else {
                 recall.max(1.0)
             };
-            parent.search(query, self.n_probe(), parent_recall, metric)
+            let probes = if k >= self.vectors.num_vectors(dim) {
+                self.nlist()
+            } else {
+                self.n_probe()
+            };
+            parent.search(query, probes, parent_recall, metric)
         } else {
             let mut all: Vec<Candidate<ClusterId>> = (0..self.nlist())
                 .map(|i| Candidate {
@@ -1300,6 +1305,12 @@ mod tests {
         );
 
         for query in [[0.0f32, 0.0], [7.5, 0.0], [15.2, 0.0], [31.0, 0.0]] {
+            let (all, _) = opened.search(&query, n, 1.0, Metric::L2);
+            assert_eq!(
+                all.len(),
+                n,
+                "full ranking must include every centroid through parent levels"
+            );
             let (expected, _) = index.search(&query, 4, 1.0, Metric::L2);
             let (got, _) = opened.search(&query, 4, 1.0, Metric::L2);
             assert_eq!(got.len(), expected.len());
