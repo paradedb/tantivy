@@ -164,7 +164,7 @@ impl CandidateRows for MemberRows<'_> {
 }
 
 pub(crate) struct Ranking {
-    ranked: std::vec::IntoIter<Candidate<ClusterId>>,
+    pub(super) ranked: std::vec::IntoIter<Candidate<ClusterId>>,
     candidate_count: usize,
     stats: StackedSearchStats,
     recall_target: f32,

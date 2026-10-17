@@ -198,10 +198,33 @@ impl<T: VectorElement> SegmentSearcher<T> {
                 },
             ));
         };
+        let deferred_rerank =
+            self.probe_params.deferred_rerank || self.probe_params.quantized_recall.is_some();
+        let quantized_recall = matches!(&source, Source::Router(_))
+            .then_some(self.probe_params.quantized_recall)
+            .flatten();
         let config = ScanConfig {
+            cluster_cascade: self.probe_params.cluster_cascade
+                || self.probe_params.rerank_stop.is_some(),
+            cluster_stats: self.probe_params.cluster_stats,
+            deferred_rerank,
+            quantized_recall,
+            min_probe_clusters: if quantized_recall.is_some() {
+                1
+            } else {
+                self.probe_params.min_probe_clusters
+            },
+            cluster_limit: self.probe_params.cluster_limit,
             top_n,
-            capacity,
-            exact_plan: self.probe_params.exact_plan,
+            capacity: if self.probe_params.cluster_cascade
+                || deferred_rerank
+                || self.probe_params.rerank_stop.is_some()
+            {
+                capacity.min(4096)
+            } else {
+                capacity
+            },
+            exact_plan: self.probe_params.exact_plan && !deferred_rerank,
             #[cfg(test)]
             plan_override: self.plan_override,
         };

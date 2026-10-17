@@ -788,6 +788,15 @@ where
     }
 
     /// Returns the top n elements in sorted order.
+    pub(crate) fn sorted_docs(&self) -> Vec<D>
+    where D: Clone {
+        let mut entries: Vec<_> = self.buffer.iter().collect();
+        entries.sort_unstable_by(|lhs, rhs| compare_for_top_k(&self.comparator, lhs, rhs));
+        entries.truncate(self.top_n);
+        entries.into_iter().map(|entry| entry.doc.clone()).collect()
+    }
+
+    /// Returns the top n elements in sorted order.
     pub fn into_sorted_vec(mut self) -> Vec<ComparableDoc<TSortKey, D>> {
         if self.buffer.len() > self.top_n {
             self.truncate_top_n();

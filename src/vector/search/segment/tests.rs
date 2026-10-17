@@ -22,6 +22,405 @@ const MATRIX_DIM: usize = 64;
 const MATRIX_DOCS: usize = 240;
 const MATRIX_CLUSTERS: usize = 6;
 
+#[test]
+fn cluster_cascade_matches_oracle_and_trace_accounts_for_work() -> crate::Result<()> {
+    for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+        for schedule in [&[1, 1][..], &[1, 4][..], &[1, 1, 4][..]] {
+            let fixture = matrix_fixture(metric, Representation::Quantized(schedule), true)?;
+            for filter in [&AllQuery as &dyn Query, &fixture.filter("half")] {
+                for query in matrix_queries() {
+                    for exact_plan in [false, true] {
+                        let params = ProbeParams {
+                            cluster_cascade: true,
+                            cluster_stats: true,
+                            exact_plan,
+                            ..routed_exhaustive_params(MATRIX_CLUSTERS)
+                        };
+                        let fruit = fixture.search(filter, &query, 10, params.clone())?;
+                        assert_eq!(fruit.results, fixture.oracle(filter, &query, 10)?);
+                        let (hits, stats) = forced_top_k(
+                            &fixture,
+                            filter,
+                            &query,
+                            10,
+                            &params,
+                            PlanOverride::default(),
+                        )?;
+                        assert_eq!(hits, fruit.results);
+                        for stats in stats {
+                            assert_eq!(
+                                stats.clusters.iter().map(|c| c.eligible).sum::<usize>(),
+                                stats.candidates_scored
+                            );
+                            assert_eq!(
+                                stats.clusters.iter().map(|c| c.exact).sum::<usize>(),
+                                stats.exact_rows
+                            );
+                            let mut previous = None;
+                            for (i, cluster) in stats.clusters.iter().enumerate() {
+                                assert_eq!(cluster.ordinal, i + 1);
+                                assert!(
+                                    cluster.planned_exact <= cluster.exact
+                                        && cluster.exact <= cluster.eligible
+                                );
+                                assert!(cluster.top_docs.len() <= 10);
+                                if let (Some(before), Some(after)) = (previous, cluster.kth) {
+                                    assert!(after >= before);
+                                }
+                                previous = cluster.kth;
+                            }
+                        }
+                        let untraced = fixture.search(
+                            filter,
+                            &query,
+                            10,
+                            ProbeParams {
+                                cluster_stats: false,
+                                ..params
+                            },
+                        )?;
+                        assert_eq!(fruit.results, untraced.results);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cluster_cascade_active_results_match_shadow_prefix() -> crate::Result<()> {
+    let fixture = matrix_fixture(Metric::Cosine, Representation::Quantized(&[1, 1]), false)?;
+    let query = &matrix_queries()[0];
+    let stop = crate::vector::RerankStopParams {
+        threshold: 1.0,
+        patience: 1,
+        min_clusters: 1,
+        min_rows: 1,
+        shadow: true,
+    };
+    let params = ProbeParams {
+        cluster_stats: true,
+        rerank_stop: Some(stop),
+        ..routed_exhaustive_params(MATRIX_CLUSTERS)
+    };
+    let weight = fixture.weight(&AllQuery)?;
+    let (_, shadow) = fixture.run_planned(0, weight.as_ref(), query, 3, params.clone(), None)?;
+    assert_eq!(shadow.rerank_stop_at, Some(1));
+    let (active_hits, active) = fixture.run_planned(
+        0,
+        weight.as_ref(),
+        query,
+        3,
+        ProbeParams {
+            rerank_stop: Some(crate::vector::RerankStopParams {
+                shadow: false,
+                ..stop
+            }),
+            ..params
+        },
+        None,
+    )?;
+    assert_eq!(
+        active.termination,
+        crate::vector::ProbeTermination::RerankRate
+    );
+    assert_eq!(active.clusters.len(), 1);
+    assert_eq!(
+        active_hits.iter().map(|h| h.1.doc_id).collect::<Vec<_>>(),
+        shadow.clusters[0].top_docs
+    );
+    Ok(())
+}
+
+#[test]
+fn quantized_recall_matches_deferred_prefix_replay() -> crate::Result<()> {
+    use crate::vector::{ProbeTermination, QuantizedRecallParams};
+    let mut triggers = 0;
+    for metric in [Metric::Cosine, Metric::L2, Metric::Dot] {
+        let fixture = matrix_fixture(metric, Representation::Quantized(&[1, 1]), true)?;
+        for filter in [&AllQuery as &dyn Query, &fixture.filter("half")] {
+            let weight = fixture.weight(filter)?;
+            for query in matrix_queries() {
+                let params = ProbeParams {
+                    deferred_rerank: true,
+                    cluster_stats: true,
+                    ..routed_exhaustive_params(MATRIX_CLUSTERS)
+                };
+                let (_, full) =
+                    fixture.run_planned(0, weight.as_ref(), &query, 10, params.clone(), None)?;
+                let candidates =
+                    fixture.candidates(&(0..MATRIX_CLUSTERS).collect::<Vec<_>>(), &query)?;
+                let searcher = fixture.index.reader()?.searcher();
+                let vectors = searcher.segment_readers()[0].vector_index(fixture.field)?;
+                let index = vectors.index().unwrap();
+                let mean = candidates
+                    .iter()
+                    .map(|c| f64::from(c.sim.score()))
+                    .sum::<f64>()
+                    / MATRIX_CLUSTERS as f64;
+                let sigma = (candidates
+                    .iter()
+                    .map(|c| (f64::from(c.sim.score()) - mean).powi(2))
+                    .sum::<f64>()
+                    / MATRIX_CLUSTERS as f64)
+                    .sqrt();
+                let best = candidates
+                    .iter()
+                    .map(|c| f64::from(c.sim.score()))
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let weights: Vec<_> = candidates
+                    .iter()
+                    .map(|c| {
+                        index.cluster_range(c.node as usize).len() as f64
+                            * ((f64::from(c.sim.score()) - best) / sigma).exp()
+                    })
+                    .collect();
+                let total: f64 = weights.iter().sum();
+                let mut prefixes_by_target = std::collections::BTreeMap::new();
+                for target in [0.5, 0.95, 1.0] {
+                    let mut prefixes_by_gamma = std::collections::BTreeMap::new();
+                    for recall_exponent in [1.0_f64, 1.5, 2.0] {
+                        for floor in [1, 2, 16] {
+                            let mut remaining = total;
+                            let expected = full.clusters.iter().position(|c| {
+                                remaining = (remaining - weights[c.cluster]).max(0.0);
+                                target < 1.0
+                                    && sigma.is_finite()
+                                    && sigma > 0.0
+                                    && c.kth_estimate.zip(c.centroid).is_some_and(
+                                        |(cutoff, centroid)| {
+                                            let proxy = remaining / total / c.ordinal as f64
+                                                * (-(f64::from(cutoff) - f64::from(centroid))
+                                                    / sigma)
+                                                    .exp();
+                                            proxy <= (1.0_f64 - target).powf(recall_exponent)
+                                        },
+                                    )
+                            });
+                            let prefix = expected.map_or(full.clusters.len(), |p| p + 1);
+                            let (actual, stats) = fixture.run_planned(
+                                0,
+                                weight.as_ref(),
+                                &query,
+                                10,
+                                ProbeParams {
+                                    deferred_rerank: false,
+                                    quantized_recall: Some(QuantizedRecallParams {
+                                        target,
+                                        recall_exponent,
+                                    }),
+                                    min_probe_clusters: floor,
+                                    max_probe_fraction: 0.000001,
+                                    located: LocatedPath::Auto,
+                                    router_recall_target: 0.1,
+                                    recall_target: 0.1,
+                                    ..params.clone()
+                                },
+                                None,
+                            )?;
+                            let (replay, _) = fixture.run_planned(
+                                0,
+                                weight.as_ref(),
+                                &query,
+                                10,
+                                ProbeParams {
+                                    cluster_limit: prefix,
+                                    ..params.clone()
+                                },
+                                None,
+                            )?;
+                            assert_eq!(actual, replay);
+                            assert_eq!(stats.clusters.len(), prefix);
+                            if let Some(previous) = prefixes_by_gamma.insert(floor, prefix) {
+                                assert!(prefix >= previous);
+                            }
+                            if let Some(previous) = prefixes_by_target
+                                .insert((recall_exponent.to_bits(), floor), prefix)
+                            {
+                                assert!(prefix >= previous);
+                            }
+                            assert_eq!(stats.quantized_recall_stop_at, expected.map(|p| p + 1));
+                            assert!(stats
+                                .clusters
+                                .iter()
+                                .all(|c| c.exact == 0 && c.planned_exact == 0));
+                            if expected.is_some() {
+                                triggers += 1;
+                                assert_eq!(stats.termination, ProbeTermination::QuantizedRecall);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let filter = fixture.filter("half");
+        let query = &matrix_queries()[0];
+        let result = fixture.search(
+            &filter,
+            query,
+            10,
+            ProbeParams {
+                quantized_recall: Some(QuantizedRecallParams {
+                    target: 0.5,
+                    recall_exponent: 1.5,
+                }),
+                min_probe_clusters: 1,
+                located: LocatedPath::MaxSelectivity(Selectivity::new(1.0).unwrap()),
+                ..routed_exhaustive_params(MATRIX_CLUSTERS)
+            },
+        )?;
+        assert_eq!(result.results, fixture.oracle(&filter, query, 10)?);
+    }
+    assert!(triggers > 0);
+    Ok(())
+}
+
+#[test]
+fn quantized_recall_rejects_invalid_parameters() {
+    use crate::vector::QuantizedRecallParams;
+    let stop = QuantizedRecallParams {
+        target: 0.95,
+        recall_exponent: 1.5,
+    };
+    for target in [0.0, -1.0, 1.1, f64::NAN, f64::INFINITY] {
+        assert!(ProbeParams {
+            quantized_recall: Some(QuantizedRecallParams { target, ..stop }),
+            ..Default::default()
+        }
+        .resolved_work_budget(MATRIX_CLUSTERS, MATRIX_DOCS)
+        .is_err());
+    }
+    assert_eq!(stop.gap_threshold(0), None);
+    assert!(stop.gap_threshold(10).unwrap() > 0.0);
+    assert_eq!(
+        QuantizedRecallParams {
+            target: 1.0,
+            ..stop
+        }
+        .gap_threshold(10),
+        None
+    );
+    for recall_exponent in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(ProbeParams {
+            quantized_recall: Some(QuantizedRecallParams {
+                recall_exponent,
+                ..stop
+            }),
+            ..Default::default()
+        }
+        .resolved_work_budget(MATRIX_CLUSTERS, MATRIX_DOCS)
+        .is_err());
+    }
+    for target in [0.9, 0.95, 0.99] {
+        let calibrated = QuantizedRecallParams { target, ..stop };
+        let raw = QuantizedRecallParams {
+            target: 1.0 - (1.0 - target).powf(stop.recall_exponent),
+            recall_exponent: 1.0,
+        };
+        assert!(
+            (calibrated.gap_threshold(10).unwrap() - raw.gap_threshold(10).unwrap()).abs() < 1e-10
+        );
+    }
+    assert!(QuantizedRecallParams {
+        target: 1.0 - f64::EPSILON,
+        recall_exponent: 100.0
+    }
+    .gap_threshold(10)
+    .unwrap()
+    .is_finite());
+}
+
+#[test]
+fn deferred_cascade_matches_oracle_and_prefix_candidates() -> crate::Result<()> {
+    assert!(ProbeParams {
+        deferred_rerank: true,
+        rerank_stop: Some(crate::vector::RerankStopParams {
+            threshold: 0.0,
+            patience: 5,
+            min_clusters: 16,
+            min_rows: 2000,
+            shadow: false,
+        }),
+        ..Default::default()
+    }
+    .resolved_work_budget(MATRIX_CLUSTERS, MATRIX_DOCS)
+    .is_err());
+    for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+        for schedule in [&[1, 1][..], &[1, 4][..], &[1, 1, 4][..]] {
+            let fixture = matrix_fixture(metric, Representation::Quantized(schedule), true)?;
+            for filter in [&AllQuery as &dyn Query, &fixture.filter("half")] {
+                for query in matrix_queries() {
+                    let params = ProbeParams {
+                        deferred_rerank: true,
+                        cluster_stats: true,
+                        ..routed_exhaustive_params(MATRIX_CLUSTERS)
+                    };
+                    let weight = fixture.weight(filter)?;
+                    let (_hits, stats) = fixture.run_planned(
+                        0,
+                        weight.as_ref(),
+                        &query,
+                        10,
+                        params.clone(),
+                        None,
+                    )?;
+                    let fruit = fixture.search(filter, &query, 10, params.clone())?;
+                    assert_eq!(fruit.results, fixture.oracle(filter, &query, 10)?);
+                    assert!(stats
+                        .clusters
+                        .iter()
+                        .all(|c| c.exact == 0 && c.planned_exact == 0));
+                    assert!(stats
+                        .clusters
+                        .iter()
+                        .all(|c| c.layer_survivors.len() == schedule.len()));
+                    for prefix in 1..=stats.clusters.len() {
+                        let (partial, report) = fixture.run_planned(
+                            0,
+                            weight.as_ref(),
+                            &query,
+                            10,
+                            ProbeParams {
+                                cluster_limit: prefix,
+                                ..params.clone()
+                            },
+                            None,
+                        )?;
+                        assert_eq!(report.clusters.len(), prefix);
+                        let pending: BTreeSet<_> = stats.clusters[prefix - 1]
+                            .pending_docs
+                            .iter()
+                            .copied()
+                            .collect();
+                        assert_eq!(
+                            pending,
+                            report.clusters[prefix - 1]
+                                .pending_docs
+                                .iter()
+                                .copied()
+                                .collect()
+                        );
+                        assert!(partial.iter().all(|h| pending.contains(&h.1.doc_id)));
+                        assert_eq!(report.exact_rows, pending.len());
+                    }
+                    let untraced = fixture.search(
+                        filter,
+                        &query,
+                        10,
+                        ProbeParams {
+                            cluster_stats: false,
+                            ..params
+                        },
+                    )?;
+                    assert_eq!(fruit.results, untraced.results);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Representation {
     Flat,

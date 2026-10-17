@@ -67,6 +67,12 @@ impl KthBound {
         }
     }
 
+    pub(super) fn copy_running_from(&mut self, other: &Self) {
+        debug_assert_eq!(self.k, other.k);
+        self.running.clone_from(&other.running);
+        self.running_estimates.clone_from(&other.running_estimates);
+    }
+
     /// Records an exactly scored row.
     pub(super) fn push_exact(&mut self, score: f32) {
         if self.k == 0

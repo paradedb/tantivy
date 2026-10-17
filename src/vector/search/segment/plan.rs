@@ -79,7 +79,12 @@ impl SegmentPlan {
         // Capacity counts native docs as written: deleted rows still charge on first touch.
         let (budget, n_avg, x) = params.resolved_work_budget(clusters, index.num_docs())?;
         debug_assert!(n_avg > 0.0);
-        let cap = located_cap(params.located, max_doc, budget, n_avg, x);
+        let located = if params.quantized_recall.is_some() && params.located == LocatedPath::Auto {
+            LocatedPath::Off
+        } else {
+            params.located
+        };
+        let cap = located_cap(located, max_doc, budget, n_avg, x);
         let source = {
             let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
             collect_segment_filter(weight, segment, max_doc, cap)?
