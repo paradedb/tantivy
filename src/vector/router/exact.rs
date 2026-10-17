@@ -78,7 +78,7 @@ pub(super) fn open(
 }
 
 pub(crate) struct Ranking {
-    ranked: std::vec::IntoIter<Candidate>,
+    pub(super) ranked: std::vec::IntoIter<Candidate>,
     visited_count: usize,
 }
 

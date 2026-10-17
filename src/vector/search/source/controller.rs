@@ -5,12 +5,17 @@
 //! scan charges exactly `C`. The budget is checked only between clusters.
 
 use crate::vector::distance::Similarity;
+use crate::vector::params::RerankStopParams;
 use crate::vector::router::stacked::aps::RecallEstimator;
 use crate::Score;
 
 /// How the probe loop stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize)]
 pub enum ProbeTermination {
+    /// The quantized-gap estimate reached the requested recall.
+    QuantizedRecall,
+    /// The observed exact-scoring rate stayed below the configured threshold.
+    RerankRate,
     /// The work budget was spent.
     Ceiling,
     /// The router ran out of clusters before the budget was spent.
@@ -142,6 +147,8 @@ impl WorkMeter {
 /// Tracks the APS recall estimate and decides, from the work meter, whether the next ranked
 /// cluster opens.
 pub(in crate::vector) struct ProbeController<'a> {
+    rerank: Option<RerankStopState>,
+    enforce_budget: bool,
     termination: ProbeTermination,
     /// Clusters in the segment and clusters pulled from the ranking so far.
     clusters: usize,
@@ -157,8 +164,11 @@ impl<'a> ProbeController<'a> {
         clusters: usize,
         estimator: Option<RecallEstimator<'a>>,
         recall_target: f32,
+        enforce_budget: bool,
     ) -> Self {
         Self {
+            rerank: None,
+            enforce_budget,
             termination: ProbeTermination::Exhausted,
             clusters,
             pulled: 0,
@@ -174,13 +184,21 @@ impl<'a> ProbeController<'a> {
     pub(in crate::vector) fn admit(&mut self, meter: &WorkMeter) -> bool {
         self.pulled += 1;
         if self
+            .rerank
+            .as_ref()
+            .is_some_and(|state| state.first_trigger.is_some() && !state.params.shadow)
+        {
+            self.termination = ProbeTermination::RerankRate;
+            return false;
+        }
+        if self
             .recall_estimate
             .is_some_and(|estimate| estimate >= self.recall_target)
         {
             self.termination = ProbeTermination::RecallTarget;
             return false;
         }
-        if meter.exhausted() {
+        if self.enforce_budget && meter.exhausted() {
             self.termination = ProbeTermination::Ceiling;
             return false;
         }
@@ -199,17 +217,31 @@ impl<'a> ProbeController<'a> {
         Ok(())
     }
 
+    pub(crate) fn with_rerank_stop(mut self, params: Option<RerankStopParams>) -> Self {
+        self.rerank = params.map(RerankStopState::new);
+        self
+    }
+
+    pub(crate) fn completed(&mut self, eligible: usize, exact: usize, filled: bool) {
+        if let Some(state) = &mut self.rerank {
+            state.observe(eligible, exact, filled);
+        }
+    }
+
     /// How the probe loop ended and what `meter` charged.
     pub(crate) fn finish(&self, meter: &WorkMeter) -> ProbeOutcome {
         // A stacked ranking sized to the budget can run out as the budget is spent, short of the
         // segment's clusters; that stop is the ceiling's.
         let termination = match self.termination {
-            ProbeTermination::Exhausted if self.pulled < self.clusters && meter.exhausted() => {
+            ProbeTermination::Exhausted
+                if self.enforce_budget && self.pulled < self.clusters && meter.exhausted() =>
+            {
                 ProbeTermination::Ceiling
             }
             termination => termination,
         };
         ProbeOutcome {
+            rerank_stop_at: self.rerank.as_ref().and_then(|state| state.first_trigger),
             termination,
             work_charged: meter.charged().to_f32(),
             work_budget: meter.budget().total.to_f32(),
@@ -221,6 +253,7 @@ impl<'a> ProbeController<'a> {
 /// How a routed probe loop ended.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ProbeOutcome {
+    pub(crate) rerank_stop_at: Option<usize>,
     pub(crate) termination: ProbeTermination,
     /// Work units charged: opens at `x`, scored rows at `(1 - x)/n_avg`.
     pub(crate) work_charged: f32,
@@ -228,4 +261,120 @@ pub(crate) struct ProbeOutcome {
     pub(crate) work_budget: f32,
     /// The APS recall estimate at the stop; `None` when APS was off or never armed.
     pub(crate) recall_estimate: Option<f32>,
+}
+
+struct RerankStopState {
+    params: RerankStopParams,
+    completed: usize,
+    quiet_clusters: usize,
+    quiet_rows: usize,
+    first_trigger: Option<usize>,
+}
+
+impl RerankStopState {
+    fn new(params: RerankStopParams) -> Self {
+        Self {
+            params,
+            completed: 0,
+            quiet_clusters: 0,
+            quiet_rows: 0,
+            first_trigger: None,
+        }
+    }
+
+    fn observe(&mut self, eligible: usize, exact: usize, filled: bool) {
+        if eligible == 0 {
+            return;
+        }
+        self.completed += 1;
+        if exact as f64 / eligible as f64 <= self.params.threshold {
+            self.quiet_clusters += 1;
+            self.quiet_rows += eligible;
+        } else {
+            self.quiet_clusters = 0;
+            self.quiet_rows = 0;
+        }
+        if filled
+            && self.completed >= self.params.min_clusters
+            && self.quiet_clusters >= self.params.patience
+            && self.quiet_rows >= self.params.min_rows
+            && self.first_trigger.is_none()
+        {
+            self.first_trigger = Some(self.completed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod rerank_tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_probing_ignores_exhausted_work_meter() {
+        let meter = WorkMeter::new(WorkBudget::default());
+        assert!(meter.exhausted());
+        let mut fixed = ProbeController::new(10, None, 1.0, true);
+        assert!(!fixed.admit(&meter));
+        assert_eq!(fixed.finish(&meter).termination, ProbeTermination::Ceiling);
+        let mut adaptive = ProbeController::new(10, None, 1.0, false);
+        assert!(adaptive.admit(&meter));
+        assert_eq!(
+            adaptive.finish(&meter).termination,
+            ProbeTermination::Exhausted
+        );
+    }
+
+    #[test]
+    fn rerank_rate_requires_filled_heap_floor_patience_and_rows() {
+        let mut state = RerankStopState::new(RerankStopParams {
+            threshold: 0.01,
+            patience: 3,
+            min_clusters: 5,
+            min_rows: 250,
+            shadow: true,
+        });
+        state.observe(0, 0, true);
+        assert_eq!(state.completed, 0);
+        for _ in 0..4 {
+            state.observe(10, 0, true);
+        }
+        assert_eq!(state.first_trigger, None);
+        state.observe(100, 2, true);
+        assert_eq!(state.quiet_clusters, 0);
+        state.observe(100, 1, true);
+        state.observe(100, 0, true);
+        state.observe(100, 0, false);
+        assert_eq!(state.first_trigger, None);
+        state.observe(100, 0, true);
+        assert_eq!(state.first_trigger, Some(9));
+        state.observe(100, 50, true);
+        assert_eq!(state.first_trigger, Some(9));
+    }
+
+    #[test]
+    fn rerank_shadow_records_but_only_active_mode_stops() {
+        for shadow in [false, true] {
+            let params = RerankStopParams {
+                threshold: 0.0,
+                patience: 1,
+                min_clusters: 1,
+                min_rows: 1,
+                shadow,
+            };
+            let mut controller =
+                ProbeController::new(10, None, 1.0, true).with_rerank_stop(Some(params));
+            let meter = WorkMeter::new(WorkBudget {
+                total: WorkUnits::new(10.0),
+                ..Default::default()
+            });
+            assert!(controller.admit(&meter));
+            controller.completed(100, 0, true);
+            assert_eq!(controller.admit(&meter), shadow);
+            let outcome = controller.finish(&meter);
+            assert_eq!(outcome.rerank_stop_at, Some(1));
+            if !shadow {
+                assert_eq!(outcome.termination, ProbeTermination::RerankRate);
+            }
+        }
+    }
 }

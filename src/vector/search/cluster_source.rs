@@ -47,6 +47,8 @@ impl ClusterRows<'_> {
 /// What the scan reports to a source after each cluster.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Feedback {
+    /// Exact rows in the just-completed cascade; absent for deferred or exact scans.
+    pub(crate) exact_rows: Option<usize>,
     /// The pruning threshold: the k-th largest lower endpoint, once `k` rows are in.
     pub(crate) kth_lower: Option<f32>,
     /// The APS cover threshold: never above the k-th best estimate, so it never prunes.
@@ -55,6 +57,10 @@ pub(crate) struct Feedback {
 
 /// Supplies a segment scan's clusters in its own order and decides when to stop.
 pub(crate) trait ClusterSource {
+    fn quantized_recall_score(&self, _cutoff: f32, _completed: usize) -> Option<f64> {
+        None
+    }
+
     /// The next cluster's rows, or `None` when the source stops.
     fn next(&mut self, feedback: Feedback) -> crate::Result<Option<ClusterRows<'_>>>;
     /// Records that the last cluster was shortlisted with `rows` scored; `feedback` includes them.

@@ -181,6 +181,137 @@ pub(crate) struct RouterReport {
     pub(crate) probe: ProbeOutcome,
 }
 
+struct AdaptiveProgress {
+    weights: Box<[f64]>,
+    sigma: f64,
+    total: f64,
+    remaining: f64,
+    centroid: f64,
+}
+
+impl AdaptiveProgress {
+    fn new(ranked: &RouterIter, clusters: usize, size: impl Fn(usize) -> usize) -> Option<Self> {
+        let (mut count, mut mean, mut m2) = (0, 0.0, 0.0);
+        let mut best = f64::NEG_INFINITY;
+        ranked.for_each_candidate(|candidate| {
+            let score = f64::from(candidate.sim.score());
+            count += 1;
+            let delta = score - mean;
+            mean += delta / count as f64;
+            m2 += delta * (score - mean);
+            best = best.max(score);
+        });
+        let sigma = (m2 / count as f64).sqrt();
+        if count != clusters || !sigma.is_finite() || sigma <= 0.0 {
+            return None;
+        }
+        let mut weights = vec![0.0; clusters];
+        ranked.for_each_candidate(|candidate| {
+            let cluster = candidate.node as usize;
+            weights[cluster] =
+                size(cluster) as f64 * ((f64::from(candidate.sim.score()) - best) / sigma).exp();
+        });
+        let total: f64 = weights.iter().sum();
+        (total.is_finite() && total > 0.0).then(|| Self {
+            weights: weights.into_boxed_slice(),
+            sigma,
+            total,
+            remaining: total,
+            centroid: best,
+        })
+    }
+
+    fn complete(&mut self, candidate: Candidate) {
+        self.remaining = (self.remaining - self.weights[candidate.node as usize]).max(0.0);
+        self.centroid = f64::from(candidate.sim.score());
+    }
+
+    fn score(&self, cutoff: f32, completed: usize) -> Option<f64> {
+        (cutoff.is_finite() && completed > 0).then(|| {
+            (completed as f64).ln() - (self.remaining / self.total).ln()
+                + (f64::from(cutoff) - self.centroid) / self.sigma
+        })
+    }
+}
+
+#[cfg(test)]
+mod adaptive_tests {
+    use super::*;
+    use crate::vector::distance::Similarity;
+
+    #[test]
+    fn remaining_weight_is_affine_invariant_and_keeps_unvisited_clusters() {
+        let sizes = [100, 200, 50, 400];
+        let mut reference: Option<f64> = None;
+        for scale in [0.125_f32, 1.0, 1024.0] {
+            for shift in [-16.0, 0.0, 32.0] {
+                let candidates: Vec<_> = [4.0, 2.0, 0.0, -2.0]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(node, score)| Candidate {
+                        node: node as u32,
+                        sim: Similarity::new(scale * score + shift),
+                    })
+                    .collect();
+                let ranked = RouterIter::Explicit(candidates.clone().into_iter());
+                let mut progress = AdaptiveProgress::new(&ranked, 4, |i| sizes[i]).unwrap();
+                progress.complete(candidates[0]);
+                progress.complete(candidates[2]);
+                assert!(
+                    (progress.remaining - progress.weights[1] - progress.weights[3]).abs() < 1e-10
+                );
+                let score = progress.score(scale * 1.5 + shift, 2).unwrap();
+                if let Some(previous) = reference {
+                    assert!((score - previous).abs() < 1e-10);
+                }
+                reference = Some(score);
+                assert!(progress.score(f32::NAN, 2).is_none());
+                assert!(progress.score(0.0, 0).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_spread_or_incomplete_routing_disables_adaptive_progress() {
+        for scores in [
+            vec![],
+            vec![1.0],
+            vec![1.0, 1.0],
+            vec![1.0, f32::NAN],
+            vec![1.0, f32::INFINITY],
+        ] {
+            let count = scores.len();
+            let ranked = RouterIter::Explicit(
+                scores
+                    .into_iter()
+                    .enumerate()
+                    .map(|(node, score)| Candidate {
+                        node: node as u32,
+                        sim: Similarity::new(score),
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            );
+            assert!(AdaptiveProgress::new(&ranked, count, |_| 100).is_none());
+        }
+        let ranked = RouterIter::Explicit(
+            vec![
+                Candidate {
+                    node: 0,
+                    sim: Similarity::new(2.0),
+                },
+                Candidate {
+                    node: 1,
+                    sim: Similarity::new(1.0),
+                },
+            ]
+            .into_iter(),
+        );
+        assert!(AdaptiveProgress::new(&ranked, 3, |_| 100).is_none());
+        assert!(AdaptiveProgress::new(&ranked, 2, |_| 0).is_none());
+    }
+}
+
 /// Clusters in the router's order, admitted under the work budget, the bounds gate and the
 /// filter. Owns the ranked stream, the work meter, the probe controller, the query bound and the
 /// buffers each cluster's rows borrow.
@@ -189,6 +320,8 @@ pub(crate) struct RouterClusters<'a, T: VectorElement> {
     reader: &'a VectorIndexReader,
     query: &'a VectorQuery<T>,
     ranked: RouterIter,
+    adaptive: Option<AdaptiveProgress>,
+    pending: Option<Candidate>,
     meter: WorkMeter,
     controller: ProbeController<'a>,
     bounds: BoundStore<'a>,
@@ -223,18 +356,43 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
                 filter.match_fraction(segment.max_doc()),
                 clusters,
             ),
-            recall: params.router_recall_target,
+            recall: if params.quantized_recall.is_some() {
+                1.0
+            } else {
+                params.router_recall_target
+            },
         };
         let _routing = enter_vector_stage(VectorStage::Routing);
         let ranked = index.rank_clusters(query.widened(), routing);
-        let estimator = index.recall_estimator(&ranked, query.widened(), params.recall_target);
+        let adaptive = params
+            .quantized_recall
+            .filter(|p| p.target < 1.0)
+            .and_then(|_| {
+                AdaptiveProgress::new(&ranked, clusters, |cluster| {
+                    index.cluster_range(cluster).len()
+                })
+            });
+        let recall_target = if params.quantized_recall.is_some() {
+            1.0
+        } else {
+            params.recall_target
+        };
+        let estimator = index.recall_estimator(&ranked, query.widened(), recall_target);
         Self {
             index,
             reader,
             query,
             ranked,
+            adaptive,
+            pending: None,
             meter: WorkMeter::new(budget),
-            controller: ProbeController::new(clusters, estimator, params.recall_target),
+            controller: ProbeController::new(
+                clusters,
+                estimator,
+                recall_target,
+                params.quantized_recall.is_none(),
+            )
+            .with_rerank_stop(params.rerank_stop),
             bounds: index.bounds(),
             tracker: QueryBoundTracker::new(),
             gate: RowGate::new(filter, segment.alive_bitset()),
@@ -322,6 +480,10 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
 }
 
 impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
+    fn quantized_recall_score(&self, cutoff: f32, completed: usize) -> Option<f64> {
+        self.adaptive.as_ref()?.score(cutoff, completed)
+    }
+
     fn next(&mut self, feedback: Feedback) -> crate::Result<Option<ClusterRows<'_>>> {
         loop {
             let next = {
@@ -367,6 +529,7 @@ impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
                 );
                 (Some(&self.offsets[..]), Some(&self.selected_docs[..]))
             };
+            self.pending = Some(Candidate { sim, node });
             return Ok(Some(ClusterRows {
                 cluster,
                 rows,
@@ -378,6 +541,13 @@ impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
     }
 
     fn admitted(&mut self, rows: usize, feedback: Feedback) -> crate::Result<()> {
+        if let (Some(adaptive), Some(candidate)) = (&mut self.adaptive, self.pending.take()) {
+            adaptive.complete(candidate);
+        }
+        if let Some(exact) = feedback.exact_rows {
+            self.controller
+                .completed(rows, exact, feedback.kth_lower.is_some());
+        }
         self.meter.rows(rows);
         self.counters.eligible += rows;
         self.counters.postings_row += 1;

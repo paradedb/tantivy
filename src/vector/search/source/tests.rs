@@ -72,6 +72,7 @@ fn armed(k: usize, kth: f32) -> impl Fn(usize) -> Feedback {
     move |rows| {
         let kth = (rows >= k).then_some(kth);
         Feedback {
+            exact_rows: None,
             kth_lower: kth,
             kth_estimate: kth,
         }
@@ -270,7 +271,7 @@ fn probe_termination() -> crate::Result<()> {
         centroids.iter().map(|row| &row[..]).collect(),
         Metric::L2,
     );
-    let mut controller = ProbeController::new(3, Some(estimator), 0.5);
+    let mut controller = ProbeController::new(3, Some(estimator), 0.5, true);
     assert!(controller.admit(&meter));
     controller.cover(None)?;
     assert!(controller.admit(&meter), "no estimate while the heap fills");
@@ -461,6 +462,7 @@ fn gate_never_skips_a_true_member() -> crate::Result<()> {
         let kth = oracle[k - 1].0;
         let walk = walk_fixture(&fixture, &AllQuery, &query, k, exhaustive_params(5), |_| {
             Feedback {
+                exact_rows: None,
                 kth_lower: Some(kth),
                 kth_estimate: Some(kth),
             }
