@@ -7,7 +7,7 @@ use crate::vector::distance::Similarity;
 use crate::vector::quantization::{ArithmeticError, QUANTIZED_BOUNDARY_KAPPA};
 use crate::vector::search::cluster_source::ClusterRows;
 use crate::vector::search::interval::{Estimate, LowerEndpoint, Threshold, UpperEndpoint};
-use crate::vector::search::scan::bound::{lower_endpoint_order, KthBound};
+use crate::vector::search::scan::bound::{lower_endpoint_order, tighter, KthBound};
 use crate::DocId;
 
 // --- Columns ---
@@ -302,11 +302,12 @@ impl QuantizedCandidates {
     }
 
     /// Keeps, in place, each block's candidates whose upper endpoint reaches the k-th lower
-    /// endpoint; selecting by lower endpoint, not estimate, keeps every true top-k row whose
-    /// interval encloses its score. Blocks keep their row order and a retired block keeps nothing.
-    /// Blocks are walked in admission order, which is storage order, so writes never pass reads.
-    pub(crate) fn band(&mut self, bound: &mut KthBound) {
-        let threshold = self.boundary(bound);
+    /// endpoint, or `shared`, the shared bound's k-th, when that is tighter; selecting by lower
+    /// endpoint, not estimate, keeps every true top-k row whose interval encloses its score.
+    /// Blocks keep their row order and a retired block keeps nothing. Blocks are walked in
+    /// admission order, which is storage order, so writes never pass reads.
+    pub(crate) fn band(&mut self, bound: &mut KthBound, shared: Option<f32>) {
+        let threshold = self.boundary(bound, shared);
         let (mut write, mut docs_write) = (0, 0);
         for b in 0..self.blocks.len() {
             let (at, docs) = (self.blocks[b].at.clone(), self.blocks[b].docs);
@@ -331,8 +332,8 @@ impl QuantizedCandidates {
     }
 
     /// The boundary threshold: the k-th largest lower endpoint over the live candidates and the
-    /// bound's exact scores.
-    fn boundary(&mut self, bound: &mut KthBound) -> Option<Threshold> {
+    /// bound's exact scores, or `shared` when that is tighter.
+    fn boundary(&mut self, bound: &mut KthBound, shared: Option<f32>) -> Option<Threshold> {
         let mut lowers = std::mem::take(&mut self.lowers);
         lowers.clear();
         for block in &self.blocks {
@@ -346,8 +347,7 @@ impl QuantizedCandidates {
             );
             lowers.extend(block.at.clone().map(|index| self.lower(index)));
         }
-        let threshold = bound
-            .boundary_lower(&mut lowers)
+        let threshold = tighter(bound.boundary_lower(&mut lowers), shared)
             .map(|kth| Threshold(LowerEndpoint(kth)));
         self.lowers = lowers;
         threshold
@@ -548,14 +548,14 @@ impl BoundaryHarness {
     pub(crate) fn boundary_lower(&mut self, k: usize, kappa: f32) -> Option<Threshold> {
         let mut bound = self.bound(k).clone();
         self.candidates.kappa = kappa;
-        self.candidates.boundary(&mut bound)
+        self.candidates.boundary(&mut bound, None)
     }
 
     pub(crate) fn band(&mut self, k: usize, kappa: f32) {
         self.candidates.kappa = kappa;
         self.block_open = false;
         let bound = self.bound.get_or_insert_with(|| KthBound::new(k));
-        self.candidates.band(bound);
+        self.candidates.band(bound, None);
     }
 
     /// Rows of the running top-k, in bound order.

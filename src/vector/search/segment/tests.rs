@@ -3,11 +3,16 @@
 
 use std::collections::BTreeSet;
 use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crate::collector::TopDocs;
 use crate::query::{AllQuery, BooleanQuery, EnableScoring, Query};
 use crate::schema::Metric;
 use crate::vector::params::{LocatedPath, ProbeParams, Selectivity};
+use crate::vector::quantization::QUANTIZED_BOUNDARY_KAPPA;
+use crate::vector::search::interval::Estimate;
+use crate::vector::search::scan::bound::SharedBound;
 use crate::vector::search::scan::layer_read::LayerRead;
 use crate::vector::search::scan::plan::{ExactRule, PlanOverride};
 use crate::vector::stats::{AccessPath, LayerProbeStats};
@@ -156,12 +161,25 @@ fn planned_top_k(
     params: &ProbeParams,
     admission_pruning: bool,
 ) -> crate::Result<(Hits, Vec<ProbeStats>)> {
+    planned_top_k_with(fixture, filter, query, k, params, admission_pruning, None)
+}
+
+/// [`planned_top_k`] with every segment pruning against `shared` too.
+fn planned_top_k_with(
+    fixture: &Fixture,
+    filter: &dyn Query,
+    query: &[f32],
+    k: usize,
+    params: &ProbeParams,
+    admission_pruning: bool,
+    shared: Option<Arc<SharedBound>>,
+) -> crate::Result<(Hits, Vec<ProbeStats>)> {
     let weight = fixture.weight(filter)?;
     let segments = fixture.index.reader()?.searcher().segment_readers().len();
     let mut hits = Vec::new();
     let mut stats = Vec::new();
     for segment in 0..segments {
-        let (segment_hits, segment_stats) = fixture.run_planned(
+        let (segment_hits, segment_stats) = fixture.run_planned_with(
             segment,
             weight.as_ref(),
             query,
@@ -169,6 +187,7 @@ fn planned_top_k(
             params.clone(),
             None,
             admission_pruning,
+            shared.clone(),
         )?;
         assert_identities(&segment_stats, "admission pruning");
         hits.extend(segment_hits);
@@ -178,6 +197,49 @@ fn planned_top_k(
     hits.truncate(k);
     Ok((hits, stats))
 }
+
+/// The rows of `expected` missing from `seeded`, a run seeded with the k-th exact score `seed`:
+/// each with its upper endpoint at the first layer of `stats`' traces where it fell below the
+/// seed (`None` if none did), and its exact score.
+fn seeded_drops(
+    fixture: &Fixture,
+    expected: &Hits,
+    seeded: &Hits,
+    stats: &[ProbeStats],
+    seed: f32,
+) -> crate::Result<Vec<(DocAddress, Option<f32>, Score)>> {
+    let searcher = fixture.index.reader()?.searcher();
+    let mut drops = Vec::new();
+    for &(score, address) in expected {
+        if seeded.iter().any(|&(_, kept)| kept == address) {
+            continue;
+        }
+        let row = searcher
+            .segment_reader(address.segment_ord)
+            .vector_index(fixture.field)?
+            .row_id(address.doc_id)?
+            .expect("a result has a vector");
+        let trace = &stats[address.segment_ord as usize].quantized_trace;
+        let upper = trace.layer_columns.iter().find_map(|layer| {
+            layer
+                .iter()
+                .find(|&&(traced, _)| traced == row)
+                .map(|&(_, bits)| {
+                    Estimate(f32::from_bits(bits[2]))
+                        .upper(f32::from_bits(bits[3]), QUANTIZED_BOUNDARY_KAPPA)
+                        .0
+                })
+                .filter(|&upper| upper < seed)
+        });
+        drops.push((address, upper, score));
+    }
+    Ok(drops)
+}
+
+/// Oracle-matrix cases compared against a seeded shared bound, and those where the seed pruned
+/// more rows at admission than the scan's own bound.
+static SEEDED_CASES: AtomicUsize = AtomicUsize::new(0);
+static SEEDED_CASES_PRUNING_MORE: AtomicUsize = AtomicUsize::new(0);
 
 /// Every forced plan of the oracle matrix: each read, every cluster exact at admission, and
 /// mixed exact clusters at admission and at layer 1.
@@ -268,6 +330,37 @@ fn assert_case(
             "{case}"
         );
     }
+    // A shared bound seeded with the result's k-th exact score prunes only rows that cannot enter
+    // the top k: the seeded run returns the same hits, unless a dropped row's interval missed its
+    // exact score.
+    if let Some(&(seed, _)) = pruned.get(k - 1) {
+        let shared = Arc::new(SharedBound::seeded(k, seed));
+        let (seeded, seeded_stats) =
+            planned_top_k_with(fixture, filter, query, k, params, true, Some(shared))?;
+        SEEDED_CASES.fetch_add(1, Ordering::Relaxed);
+        let admission_pruned = |stats: &[ProbeStats]| -> usize {
+            stats
+                .iter()
+                .filter_map(|stats| stats.layers.get(0))
+                .map(LayerProbeStats::admission_pruned)
+                .sum()
+        };
+        if admission_pruned(&seeded_stats) > admission_pruned(&pruned_stats) {
+            SEEDED_CASES_PRUNING_MORE.fetch_add(1, Ordering::Relaxed);
+        }
+        if seeded != pruned {
+            let drops = seeded_drops(fixture, &pruned, &seeded, &pruned_stats, seed)?;
+            assert!(!drops.is_empty(), "{case} seeded bound reordered hits");
+            for (address, upper, score) in &drops {
+                eprintln!("{case}: seeded drop {address:?} upper {upper:?} exact {score}");
+                assert!(
+                    upper.is_some_and(|upper| upper < *score),
+                    "{case} seeded bound {seed} dropped {address:?}: upper {upper:?}, exact \
+                     {score}"
+                );
+            }
+        }
+    }
     Ok(fruit.stats)
 }
 
@@ -324,6 +417,15 @@ fn scan_matches_oracle() -> crate::Result<()> {
             }
         }
     }
+    let (seeded, pruning_more) = (
+        SEEDED_CASES.load(Ordering::Relaxed),
+        SEEDED_CASES_PRUNING_MORE.load(Ordering::Relaxed),
+    );
+    eprintln!("seeded shared-bound cases: {seeded}, pruning more at admission: {pruning_more}");
+    assert!(
+        pruning_more > 0,
+        "no seeded case pruned beyond the scan's own bound"
+    );
     Ok(())
 }
 

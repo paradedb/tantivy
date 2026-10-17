@@ -25,6 +25,7 @@ use crate::vector::params::ProbeParams;
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::with_test_clusters;
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
+use crate::vector::search::scan::bound::SharedBound;
 use crate::vector::search::scan::plan::PlanOverride;
 use crate::vector::search::scan::ScanTrace;
 use crate::vector::search::segment::plan::SegmentPlan;
@@ -503,6 +504,31 @@ impl Fixture {
         plan: Option<PlanOverride>,
         admission_pruning: bool,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
+        self.run_planned_with(
+            segment,
+            weight,
+            query,
+            top_n,
+            params,
+            plan,
+            admission_pruning,
+            None,
+        )
+    }
+
+    /// [`Fixture::run_planned`], pruning against `shared` too when given.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_planned_with(
+        &self,
+        segment: usize,
+        weight: &dyn Weight,
+        query: &[f32],
+        top_n: usize,
+        params: ProbeParams,
+        plan: Option<PlanOverride>,
+        admission_pruning: bool,
+        shared: Option<Arc<SharedBound>>,
+    ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = self.index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[segment];
         let query = Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec())));
@@ -527,6 +553,7 @@ impl Fixture {
         )?;
         backend.plan_override = plan;
         backend.admission_pruning_disabled = !admission_pruning;
+        backend.shared_bound = shared;
         backend.top_n(weight, segment_reader, top_n)
     }
 
