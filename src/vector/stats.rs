@@ -2,6 +2,7 @@
 //! serialized flat for EXPLAIN.
 
 use crate::vector::router::RouterMetrics;
+use crate::vector::search::scan::bound::SharedOffer;
 use crate::vector::search::scan::ScanReport;
 #[cfg(test)]
 use crate::vector::search::scan::ScanTrace;
@@ -261,6 +262,10 @@ pub struct ProbeStats {
     /// The APS recall estimate at the stop; absent when APS was off or never armed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recall_estimate: Option<f32>,
+    /// Exact scores of this segment's results offered to the query's shared bound.
+    pub shared_bound_offers: usize,
+    /// Offers that moved the shared bound's k-th.
+    pub shared_bound_tightenings: usize,
     /// Vector rows in the segment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segment_rows: Option<usize>,
@@ -436,6 +441,12 @@ impl ProbeStats {
 
     /// Adds the result-assembly time of the merge, measured after the segment's statistics were
     /// built.
+    /// Records what the segment's offer did to the query's shared bound.
+    pub(crate) fn record_shared_offer(&mut self, offer: SharedOffer) {
+        self.shared_bound_offers = offer.offers;
+        self.shared_bound_tightenings = offer.tightenings;
+    }
+
     pub(crate) fn add_assembly(&mut self, totals: &StageTotals) {
         let extra =
             totals.time_ns(VectorStage::ResultAssembly) + totals.time_ns(VectorStage::Other);
@@ -525,6 +536,8 @@ mod tests {
         "termination",
         "work_charged",
         "work_budget",
+        "shared_bound_offers",
+        "shared_bound_tightenings",
     ];
 
     fn expected(extra: &[&str], layers: usize) -> BTreeSet<String> {

@@ -19,6 +19,7 @@ use crate::query::Weight;
 use crate::schema::{Field, FieldType, Metric, Schema};
 use crate::vector::params::ProbeParams;
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
+use crate::vector::search::scan::bound::{SharedBound, SharedOffer};
 use crate::vector::search::SegmentSearcher;
 use crate::vector::stats::{ProbeStats, SegmentReport};
 use crate::vector::storage::metadata::VectorColMetadata;
@@ -80,6 +81,9 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     quantized_queries: Mutex<HashMap<PreparedKey, PreparedCell>>,
     /// The query prepared for the field's metric on first use.
     prepared: Mutex<Option<Arc<VectorQuery<T>>>>,
+    /// The best `limit + offset` exact scores the finished segments returned; every later
+    /// segment prunes against their k-th.
+    shared_bound: Arc<SharedBound>,
     tie_break: S,
 }
 
@@ -95,6 +99,7 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
             max_scan_levels: usize::MAX,
             quantized_queries: Mutex::new(HashMap::new()),
             prepared: Mutex::new(None),
+            shared_bound: Arc::new(SharedBound::new(limit)),
             tie_break: NoTieBreak,
         }
     }
@@ -105,6 +110,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     /// `limit + offset`.
     pub fn and_offset(mut self, offset: usize) -> Self {
         self.offset = offset;
+        self.shared_bound = Arc::new(SharedBound::new(self.segment_top_n()));
         self
     }
 
@@ -137,6 +143,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
             max_scan_levels: self.max_scan_levels,
             quantized_queries: self.quantized_queries,
             prepared: self.prepared,
+            shared_bound: self.shared_bound,
             tie_break,
         }
     }
@@ -279,11 +286,10 @@ where
         reader: &SegmentReader,
     ) -> crate::Result<SegmentVectorFruit<S::SortKey>> {
         let (searched, totals) = measure(|| self.search_segment(weight, segment_ord, reader));
-        let (results, report) = searched?;
-        Ok(SegmentVectorFruit {
-            results,
-            stats: ProbeStats::new(report, totals),
-        })
+        let (results, report, offer) = searched?;
+        let mut stats = ProbeStats::new(report, totals);
+        stats.record_shared_offer(offer);
+        Ok(SegmentVectorFruit { results, stats })
     }
 
     fn merge_fruits(
@@ -319,6 +325,8 @@ where
         if let Some(first) = merged.stats.first_mut() {
             first.add_assembly(&totals);
         }
+        // The bound describes this search's results only.
+        self.shared_bound.clear();
         Ok(merged)
     }
 }
@@ -328,14 +336,14 @@ where
     T: VectorElement,
     S: SortKeyComputer + Send + Sync + 'static,
 {
-    /// Searches one segment: prepares the query, runs the segment searcher, and lifts each hit's
-    /// tie-break key out of the segment.
+    /// Searches one segment: prepares the query, runs the segment searcher against the shared
+    /// bound, offers the hits' scores to it, and lifts each hit's tie-break key out of the segment.
     fn search_segment(
         &self,
         weight: &dyn Weight,
         segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
-    ) -> crate::Result<(KeyedHits<S::SortKey>, SegmentReport)> {
+    ) -> crate::Result<(KeyedHits<S::SortKey>, SegmentReport, SharedOffer)> {
         let init = enter_vector_stage(VectorStage::ScanInit);
         let (query, quantized) = {
             let _prep = enter_vector_stage(VectorStage::QueryPrep);
@@ -356,7 +364,8 @@ where
             query,
             quantized,
             self.probe_params.clone(),
-        )?;
+        )?
+        .with_shared_bound(Arc::clone(&self.shared_bound));
         let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
         drop(init);
         let (hits, report) = backend.top_n_by(
@@ -366,6 +375,11 @@ where
             &mut tie_break,
             self.tie_break.comparator(),
         )?;
+        let offer = {
+            let _assembly = enter_vector_stage(VectorStage::ResultAssembly);
+            self.shared_bound
+                .offer(hits.iter().map(|((score, _), _)| *score))
+        };
         // A segment key can be a term ordinal: lift it before it leaves the segment.
         let results = hits
             .into_iter()
@@ -376,7 +390,7 @@ where
                 )
             })
             .collect();
-        Ok((results, report))
+        Ok((results, report, offer))
     }
 }
 
