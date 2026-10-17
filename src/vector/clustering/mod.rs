@@ -54,6 +54,12 @@ pub trait VectorSource {
     /// them in scan order, so one large request is cheaper than many small
     /// ones.
     fn read_rows(&mut self, rows: &[u32]) -> crate::Result<IvfTrainingVectors>;
+
+    /// Polled between compute steps. Once the training sample fits in memory the clusterer
+    /// stops reading, so the reads' own cancel checks never run again.
+    fn wants_cancel(&self) -> bool {
+        false
+    }
 }
 
 /// Reads every row of `source` in scan order, at most `batch_rows` at a time, and calls `f`

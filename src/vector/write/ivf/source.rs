@@ -155,4 +155,8 @@ impl VectorSource for MergeVectorSource<'_> {
         self.reads += rows.len();
         Ok(batch)
     }
+
+    fn wants_cancel(&self) -> bool {
+        self.reader.cancel.wants_cancel()
+    }
 }
