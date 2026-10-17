@@ -225,6 +225,8 @@ fn merge_deleting_every_doc_of_one_field_writes_empty_ivf() -> crate::Result<()>
                 avg_cluster_size: 0.0,
                 empty_clusters: 0,
             }),
+            router: Some(RouterKind::Stacked),
+            router_levels: Some(vec![0]),
             quantized_layers: None,
             quantized_bytes_per_row: None,
         },
@@ -392,6 +394,58 @@ fn ivf_cluster_sizes_match_vector_info() -> crate::Result<()> {
                 .is_none(),
             "flat segments expose no cluster sizes"
         );
+    }
+    Ok(())
+}
+
+/// `vector_info` reports the router kind and its per-level centroid counts: the stacked router's
+/// levels shrink from the bottom up and sit under the segment's centroids, the exact router has
+/// none, and flat segments have no router.
+#[test]
+fn vector_info_reports_router_levels() -> crate::Result<()> {
+    for router in [RouterKind::Stacked, RouterKind::Exact] {
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .metric(Metric::L2)
+            .vector_storage_format(VectorStorageFormat::Ivf)
+            .router(router)
+            .build()?;
+        let field = index.embedding_field();
+        let searcher = index.index.reader()?.searcher();
+        for segment_reader in searcher.segment_readers() {
+            let info = segment_reader
+                .vector_index(field)?
+                .info()
+                .expect("vector info");
+            assert_eq!(info.router, Some(router));
+            let levels = info.router_levels.expect("ivf router levels");
+            match router {
+                RouterKind::Stacked => {
+                    let num_centroids = info.num_centroids.expect("ivf centroids");
+                    assert!(!levels.is_empty(), "stacked router has a level");
+                    assert!(
+                        levels[0] <= num_centroids,
+                        "{levels:?} over {num_centroids}"
+                    );
+                    assert!(
+                        levels.windows(2).all(|pair| pair[1] <= pair[0]),
+                        "levels shrink upward: {levels:?}"
+                    );
+                }
+                RouterKind::Exact => assert!(levels.is_empty(), "{levels:?}"),
+            }
+        }
+    }
+
+    let flat = TestVectorIndex::builder(VectorDType::F32)
+        .metric(Metric::L2)
+        .vector_storage_format(VectorStorageFormat::Flat)
+        .build()?;
+    for segment_reader in flat.index.reader()?.searcher().segment_readers() {
+        let info = segment_reader
+            .vector_index(flat.embedding_field())?
+            .info()
+            .expect("vector info");
+        assert_eq!((info.router, info.router_levels), (None, None));
     }
     Ok(())
 }
