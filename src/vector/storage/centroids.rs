@@ -251,9 +251,12 @@ impl ClusterIndex {
         self.num_centroids
     }
 
-    #[cfg(test)]
     pub(crate) fn router(&self) -> RouterKind {
         self.router.kind()
+    }
+
+    pub(crate) fn router_levels(&self) -> Vec<usize> {
+        self.router.level_sizes()
     }
 
     /// Distinct docs with a vector.

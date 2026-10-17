@@ -1,5 +1,6 @@
 //! Vector storage diagnostics: segment storage info and estimator and audit measurements.
 
+use crate::vector::router::RouterKind;
 use crate::vector::storage::metadata::{QuantizationSchedule, VectorColMetadata};
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::{DocId, TantivyError};
@@ -28,6 +29,10 @@ pub struct VectorInfo {
     pub num_centroids: Option<usize>,
     /// IVF posting-size statistics.
     pub cluster_stats: Option<VectorClusterStats>,
+    /// Router that ranks the IVF centroids.
+    pub router: Option<RouterKind>,
+    /// Centroids at each router level, bottom to top; empty for the exact router.
+    pub router_levels: Option<Vec<usize>>,
     /// Bits per stored quantized layer, in scoring order; `None` when the rows are stored plain.
     pub quantized_layers: Option<Vec<u8>>,
     /// Quantized bytes stored per row, every layer's columns together; `None` when plain.
@@ -459,6 +464,8 @@ impl VectorIndexReader {
                 num_vectors: self.num_vectors,
                 num_centroids: None,
                 cluster_stats: None,
+                router: None,
+                router_levels: None,
                 quantized_layers,
                 quantized_bytes_per_row,
             });
@@ -494,6 +501,8 @@ impl VectorIndexReader {
                 avg_cluster_size,
                 empty_clusters,
             }),
+            router: Some(index.router()),
+            router_levels: Some(index.router_levels()),
             quantized_layers,
             quantized_bytes_per_row,
         })
