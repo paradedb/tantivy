@@ -1,5 +1,9 @@
 //! The scan's pruning bound: the k-th largest lower endpoint over quantized intervals and exact
-//! scores.
+//! scores; and the bound one query's segment scans share: the k-th best exact score its finished
+//! segments returned.
+
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Mutex;
 
 // --- Ordering ---
 
@@ -169,9 +173,113 @@ impl KthBound {
     }
 }
 
+/// The tighter of a scan's own threshold and the shared bound's k-th; an unset side is the
+/// loosest value.
+#[inline]
+pub(crate) fn tighter(local: Option<f32>, shared: Option<f32>) -> Option<f32> {
+    match (local, shared) {
+        (Some(local), Some(shared)) => Some(if shared > local { shared } else { local }),
+        (local, None) => local,
+        (None, shared) => shared,
+    }
+}
+
+// --- Shared bound ---
+
+/// The k-th cached as `f32` bits; no score has these bits, since the high half is never set.
+const UNSET: u64 = u64::MAX;
+
+/// What one segment's offer did to a [`SharedBound`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SharedOffer {
+    /// Scores offered.
+    pub(crate) offers: usize,
+    /// Offers that moved the k-th: set it, or raised it.
+    pub(crate) tightenings: usize,
+}
+
+/// The bound one query's segment scans share within a process: the `k` best exact scores of the
+/// rows its finished segments returned. Those rows are real results, so no row scoring below
+/// their k-th can enter the query's top `k`, and that k-th prunes like a scan's own bound. It is
+/// unset until `k` scores are in and only ever tightens.
+///
+/// Keeping the `k` scores, not one segment's k-th, lets a segment that returns fewer than `k`
+/// rows still raise it.
+pub(crate) struct SharedBound {
+    k: usize,
+    /// The best `k` scores offered, descending.
+    scores: Mutex<Vec<f32>>,
+    /// The k-th of `scores` as bits, or [`UNSET`]; read without the lock.
+    kth: AtomicU64,
+}
+
+impl SharedBound {
+    pub(crate) fn new(k: usize) -> Self {
+        Self {
+            k,
+            scores: Mutex::new(Vec::with_capacity(k)),
+            kth: AtomicU64::new(UNSET),
+        }
+    }
+
+    /// The k-th best score offered; `None` until `k` are in. Offers only raise it, so a read that
+    /// misses a concurrent offer sees an older, looser value and prunes less, never wrongly.
+    #[inline]
+    pub(crate) fn kth(&self) -> Option<f32> {
+        let bits = self.kth.load(AtomicOrdering::Relaxed);
+        (bits != UNSET).then(|| f32::from_bits(bits as u32))
+    }
+
+    /// Takes the exact scores of the rows a segment returns. A non-finite score is skipped: it is
+    /// no result, and a NaN k-th would admit nothing.
+    pub(crate) fn offer(&self, scores: impl IntoIterator<Item = f32>) -> SharedOffer {
+        let mut offer = SharedOffer::default();
+        if self.k == 0 {
+            return offer;
+        }
+        let mut kept = self.scores.lock().unwrap();
+        for score in scores {
+            if !score.is_finite() {
+                continue;
+            }
+            offer.offers += 1;
+            if kept.len() == self.k && score <= kept[self.k - 1] {
+                continue;
+            }
+            let before = (kept.len() == self.k).then(|| kept[self.k - 1]);
+            let at = kept.partition_point(|&held| held >= score);
+            kept.insert(at, score);
+            kept.truncate(self.k);
+            if kept.len() == self.k && before.is_none_or(|before| kept[self.k - 1] > before) {
+                offer.tightenings += 1;
+                self.kth.store(
+                    u64::from(kept[self.k - 1].to_bits()),
+                    AtomicOrdering::Relaxed,
+                );
+            }
+        }
+        offer
+    }
+
+    /// Forgets every offer, for the next search of a reused collector.
+    pub(crate) fn clear(&self) {
+        let mut kept = self.scores.lock().unwrap();
+        kept.clear();
+        self.kth.store(UNSET, AtomicOrdering::Relaxed);
+    }
+
+    /// A bound already holding `k` copies of `score`.
+    #[cfg(test)]
+    pub(crate) fn seeded(k: usize, score: f32) -> Self {
+        let bound = Self::new(k);
+        bound.offer(std::iter::repeat_n(score, k));
+        bound
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::merged_kth;
+    use super::{merged_kth, SharedBound, SharedOffer};
     use crate::vector::quantization::QUANTIZED_BOUNDARY_KAPPA;
     use crate::vector::search::interval::{LowerEndpoint, Threshold};
     use crate::vector::search::scan::columns::BoundaryHarness;
@@ -420,6 +528,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The shared bound is unset until `k` scores are in, then holds the k-th best score offered
+    /// whatever the order and grouping of the offers, and never loosens; an offer counts as a
+    /// tightening exactly when it moves the k-th.
+    #[test]
+    fn shared_bound_holds_the_kth_best_offer() {
+        let bound = SharedBound::new(3);
+        assert_eq!(bound.kth(), None);
+        let offer = bound.offer([5.0, 1.0]);
+        assert_eq!(
+            offer,
+            SharedOffer {
+                offers: 2,
+                tightenings: 0
+            }
+        );
+        assert_eq!(bound.kth(), None, "unset below k");
+        assert_eq!(bound.offer([3.0]).tightenings, 1, "the k-th offer sets it");
+        assert_eq!(bound.kth(), Some(1.0));
+        assert_eq!(
+            bound.offer([1.0, 0.5]).tightenings,
+            0,
+            "ties and worse keep it"
+        );
+        assert_eq!(bound.kth(), Some(1.0));
+        assert_eq!(bound.offer([4.0]).tightenings, 1);
+        assert_eq!(bound.kth(), Some(3.0));
+        let skipped = bound.offer([f32::NAN, f32::INFINITY, f32::NEG_INFINITY]);
+        assert_eq!(
+            skipped,
+            SharedOffer::default(),
+            "non-finite scores are no results"
+        );
+        assert_eq!(bound.kth(), Some(3.0));
+        bound.clear();
+        assert_eq!(bound.kth(), None);
+        assert_eq!(SharedBound::new(0).offer([1.0]), SharedOffer::default());
+        assert_eq!(SharedBound::seeded(4, 2.5).kth(), Some(2.5));
+
+        for seed in 0..256 {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            let k = 1 + rng.usize(0..12);
+            let scores: Vec<f32> = (0..rng.usize(0..40))
+                .map(|_| (rng.f32() * 20.0 - 10.0).round() / 2.0)
+                .collect();
+            let bound = SharedBound::new(k);
+            let mut offered: Vec<f32> = Vec::new();
+            let mut previous = None;
+            let mut rest = &scores[..];
+            while !rest.is_empty() {
+                let (offer, tail) = rest.split_at(1 + rng.usize(0..rest.len()));
+                rest = tail;
+                let mut tightenings = 0;
+                for &score in offer {
+                    let before = kth_best(&offered, k);
+                    offered.push(score);
+                    let after = kth_best(&offered, k);
+                    if after.is_some_and(|after| before.is_none_or(|before| after > before)) {
+                        tightenings += 1;
+                    }
+                }
+                let report = bound.offer(offer.iter().copied());
+                let case = format!("seed {seed} k={k}");
+                assert_eq!(report.offers, offer.len(), "{case}");
+                assert_eq!(report.tightenings, tightenings, "{case}");
+                assert_eq!(bound.kth(), kth_best(&offered, k), "{case}");
+                if let Some(previous) = previous {
+                    assert!(bound.kth().is_some_and(|now| now >= previous), "{case}");
+                }
+                previous = bound.kth();
+            }
+        }
+    }
+
+    /// The k-th largest of `scores`; `None` with fewer than `k`.
+    fn kth_best(scores: &[f32], k: usize) -> Option<f32> {
+        let mut sorted = scores.to_vec();
+        sorted.sort_by(|a, b| b.total_cmp(a));
+        sorted.get(k - 1).copied()
     }
 
     fn survivors(estimates: &[f32], sigmas: &[f32], k: usize, kappa: f32) -> Vec<usize> {

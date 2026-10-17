@@ -11,7 +11,7 @@ pub(crate) mod plan;
 
 use std::ops::Range;
 
-use self::bound::KthBound;
+use self::bound::{tighter, KthBound, SharedBound};
 use self::columns::{Columns, QuantizedCandidates};
 use self::estimate::{combine_initial, combine_refine, CombineCtx};
 use self::exact::ExactScorer;
@@ -141,6 +141,10 @@ struct QuantizedState<'a> {
     index: &'a ClusterIndex,
     /// Centroid rows read for clusters without a centroid score.
     centroid_reads: usize,
+    /// The bound the query's segment scans share, when the collector supplies one.
+    shared: Option<&'a SharedBound>,
+    /// Its k-th as of segment start; later reads never fall below it.
+    shared_at_start: Option<f32>,
     #[cfg(test)]
     plan_override: Option<PlanOverride>,
     #[cfg(test)]
@@ -155,6 +159,7 @@ impl<'a> QuantizedState<'a> {
         reader: &'a VectorIndexReader,
         index: &'a ClusterIndex,
         config: &ScanConfig,
+        shared: Option<&'a SharedBound>,
     ) -> Self {
         let meta = query.index.meta.field();
         Self {
@@ -178,6 +183,8 @@ impl<'a> QuantizedState<'a> {
             exact: config.exact_plan.then_some(reader),
             index,
             centroid_reads: 0,
+            shared,
+            shared_at_start: shared.and_then(SharedBound::kth),
             #[cfg(test)]
             plan_override: config.plan_override,
             #[cfg(test)]
@@ -276,16 +283,25 @@ impl<'a> QuantizedState<'a> {
         Ok(())
     }
 
-    /// The admission-pruning threshold: the bound's running k-th lower endpoint, `None` until the
-    /// running top-k fills or when a test disables pruning.
+    /// The admission-pruning threshold: the tighter of the bound's running k-th lower endpoint and
+    /// the shared bound's k-th; `None` while both are unset or when a test disables pruning.
     fn admission_threshold(&self, bound: &KthBound) -> Option<Threshold> {
         #[cfg(test)]
         if self.admission_pruning_disabled {
             return None;
         }
-        bound
-            .running_lower()
-            .map(|kth| Threshold(LowerEndpoint(kth)))
+        tighter(bound.running_lower(), self.shared_kth()).map(|kth| Threshold(LowerEndpoint(kth)))
+    }
+
+    /// The shared bound's current k-th; `None` without one or until it is set.
+    fn shared_kth(&self) -> Option<f32> {
+        let kth = self.shared.and_then(SharedBound::kth);
+        debug_assert!(
+            self.shared_at_start
+                .is_none_or(|start| kth.is_some_and(|now| now >= start)),
+            "the shared bound only tightens"
+        );
+        kth
     }
 
     /// Refines block `b`'s candidates with `layer`, read as `read`.
@@ -344,7 +360,8 @@ impl<'a> QuantizedState<'a> {
                 .push(self.candidates.column_trace(row_order));
         }
         let _boundary = enter_vector_stage(VectorStage::Boundary(layer as u8));
-        self.candidates.band(bound);
+        let shared = self.shared_kth();
+        self.candidates.band(bound, shared);
         report.layers[layer].survivors = self.candidates.len();
         #[cfg(test)]
         report
@@ -385,6 +402,7 @@ where
         index: &'a ClusterIndex,
         query: ScoringQuery<'a, T>,
         config: ScanConfig,
+        shared: Option<&'a SharedBound>,
         tie_break: &'a mut K,
         tie_comparator: C,
     ) -> crate::Result<Self> {
@@ -396,6 +414,7 @@ where
                 reader,
                 index,
                 &config,
+                shared,
             )),
             (Some(_), None) => {
                 return Err(DataCorruption::comment_only(
