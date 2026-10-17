@@ -10,6 +10,7 @@ pub mod buffered_file_slice;
 mod byte_count;
 mod datetime;
 pub mod file_slice;
+pub mod interrupt;
 mod group_by;
 pub mod json_path_writer;
 mod serialize;
