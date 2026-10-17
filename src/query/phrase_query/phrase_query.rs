@@ -28,6 +28,11 @@ pub struct PhraseQuery {
 }
 
 impl PhraseQuery {
+    /// Allowed positional distance.
+    pub fn slop(&self) -> u32 {
+        self.slop
+    }
+
     /// Creates a new `PhraseQuery` given a list of terms.
     ///
     /// There must be at least two terms, and all terms

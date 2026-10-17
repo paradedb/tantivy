@@ -31,6 +31,15 @@ pub struct PhrasePrefixQuery {
 }
 
 impl PhrasePrefixQuery {
+    /// The final prefix term.
+    pub fn prefix(&self) -> &Term {
+        &self.prefix.1
+    }
+    /// Maximum number of prefix expansions.
+    pub fn max_expansions(&self) -> u32 {
+        self.max_expansions
+    }
+
     /// Creates a new `PhrasePrefixQuery` given a list of terms.
     ///
     /// There must be at least two terms, and all terms

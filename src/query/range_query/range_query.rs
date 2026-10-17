@@ -73,6 +73,11 @@ pub struct RangeQuery {
 }
 
 impl RangeQuery {
+    /// The lower and upper query bounds.
+    pub fn bounds(&self) -> (&Bound<Term>, &Bound<Term>) {
+        (&self.bounds.lower_bound, &self.bounds.upper_bound)
+    }
+
     /// Creates a new `RangeQuery` from bounded start and end terms.
     ///
     /// If the value type is not correct, something may go terribly wrong when
@@ -130,6 +135,11 @@ pub struct InvertedIndexRangeQuery {
     limit: Option<u64>,
 }
 impl InvertedIndexRangeQuery {
+    /// The lower and upper query bounds.
+    pub fn bounds(&self) -> (&Bound<Term>, &Bound<Term>) {
+        (&self.bounds.lower_bound, &self.bounds.upper_bound)
+    }
+
     /// Create new `InvertedIndexRangeQuery`
     pub fn new(lower_bound: Bound<Term>, upper_bound: Bound<Term>) -> InvertedIndexRangeQuery {
         InvertedIndexRangeQuery {

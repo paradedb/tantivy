@@ -443,7 +443,7 @@ where B: AsRef<[u8]>
     /// and the encoded ValueBytes after the json path.
     ///
     /// Returns `None` if the value is not JSON.
-    pub(crate) fn as_json(&self) -> Option<(&[u8], ValueBytes<&[u8]>)> {
+    pub fn as_json(&self) -> Option<(&[u8], ValueBytes<&[u8]>)> {
         if self.typ() != Type::Json {
             return None;
         }
@@ -458,7 +458,7 @@ where B: AsRef<[u8]>
     /// Returns the encoded ValueBytes after the json path.
     ///
     /// Returns `None` if the value is not JSON.
-    pub(crate) fn as_json_value_bytes(&self) -> Option<ValueBytes<&[u8]>> {
+    pub fn as_json_value_bytes(&self) -> Option<ValueBytes<&[u8]>> {
         if self.typ() != Type::Json {
             return None;
         }

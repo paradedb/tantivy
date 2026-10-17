@@ -27,6 +27,11 @@ pub struct FastFieldRangeQuery {
     bounds: BoundsRange<Term>,
 }
 impl FastFieldRangeQuery {
+    /// The lower and upper query bounds.
+    pub fn bounds(&self) -> (&Bound<Term>, &Bound<Term>) {
+        (&self.bounds.lower_bound, &self.bounds.upper_bound)
+    }
+
     /// Create new `FastFieldRangeQuery`
     pub fn new(lower_bound: Bound<Term>, upper_bound: Bound<Term>) -> FastFieldRangeQuery {
         Self {

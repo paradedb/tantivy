@@ -60,6 +60,15 @@ pub struct RegexQuery {
 }
 
 impl RegexQuery {
+    /// The field and compiled term matcher.
+    pub fn field(&self) -> Field {
+        self.field
+    }
+    /// The compiled term matcher.
+    pub fn regex(&self) -> &Regex {
+        &self.regex
+    }
+
     /// Creates a new RegexQuery from a given pattern
     pub fn from_pattern(regex_pattern: &str, field: Field) -> crate::Result<Self> {
         let regex = Regex::new(regex_pattern)
