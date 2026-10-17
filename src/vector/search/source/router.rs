@@ -386,8 +386,13 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
             adaptive,
             pending: None,
             meter: WorkMeter::new(budget),
-            controller: ProbeController::new(clusters, estimator, recall_target)
-                .with_rerank_stop(params.rerank_stop),
+            controller: ProbeController::new(
+                clusters,
+                estimator,
+                recall_target,
+                params.quantized_recall.is_none(),
+            )
+            .with_rerank_stop(params.rerank_stop),
             bounds: index.bounds(),
             tracker: QueryBoundTracker::new(),
             gate: RowGate::new(filter, segment.alive_bitset()),

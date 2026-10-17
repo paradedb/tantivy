@@ -271,7 +271,7 @@ fn probe_termination() -> crate::Result<()> {
         centroids.iter().map(|row| &row[..]).collect(),
         Metric::L2,
     );
-    let mut controller = ProbeController::new(3, Some(estimator), 0.5);
+    let mut controller = ProbeController::new(3, Some(estimator), 0.5, true);
     assert!(controller.admit(&meter));
     controller.cover(None)?;
     assert!(controller.admit(&meter), "no estimate while the heap fills");

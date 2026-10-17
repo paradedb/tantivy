@@ -148,6 +148,7 @@ impl WorkMeter {
 /// cluster opens.
 pub(in crate::vector) struct ProbeController<'a> {
     rerank: Option<RerankStopState>,
+    enforce_budget: bool,
     termination: ProbeTermination,
     /// Clusters in the segment and clusters pulled from the ranking so far.
     clusters: usize,
@@ -163,9 +164,11 @@ impl<'a> ProbeController<'a> {
         clusters: usize,
         estimator: Option<RecallEstimator<'a>>,
         recall_target: f32,
+        enforce_budget: bool,
     ) -> Self {
         Self {
             rerank: None,
+            enforce_budget,
             termination: ProbeTermination::Exhausted,
             clusters,
             pulled: 0,
@@ -195,7 +198,7 @@ impl<'a> ProbeController<'a> {
             self.termination = ProbeTermination::RecallTarget;
             return false;
         }
-        if meter.exhausted() {
+        if self.enforce_budget && meter.exhausted() {
             self.termination = ProbeTermination::Ceiling;
             return false;
         }
@@ -230,7 +233,9 @@ impl<'a> ProbeController<'a> {
         // A stacked ranking sized to the budget can run out as the budget is spent, short of the
         // segment's clusters; that stop is the ceiling's.
         let termination = match self.termination {
-            ProbeTermination::Exhausted if self.pulled < self.clusters && meter.exhausted() => {
+            ProbeTermination::Exhausted
+                if self.enforce_budget && self.pulled < self.clusters && meter.exhausted() =>
+            {
                 ProbeTermination::Ceiling
             }
             termination => termination,
@@ -305,6 +310,21 @@ mod rerank_tests {
     use super::*;
 
     #[test]
+    fn adaptive_probing_ignores_exhausted_work_meter() {
+        let meter = WorkMeter::new(WorkBudget::default());
+        assert!(meter.exhausted());
+        let mut fixed = ProbeController::new(10, None, 1.0, true);
+        assert!(!fixed.admit(&meter));
+        assert_eq!(fixed.finish(&meter).termination, ProbeTermination::Ceiling);
+        let mut adaptive = ProbeController::new(10, None, 1.0, false);
+        assert!(adaptive.admit(&meter));
+        assert_eq!(
+            adaptive.finish(&meter).termination,
+            ProbeTermination::Exhausted
+        );
+    }
+
+    #[test]
     fn rerank_rate_requires_filled_heap_floor_patience_and_rows() {
         let mut state = RerankStopState::new(RerankStopParams {
             threshold: 0.01,
@@ -341,7 +361,8 @@ mod rerank_tests {
                 min_rows: 1,
                 shadow,
             };
-            let mut controller = ProbeController::new(10, None, 1.0).with_rerank_stop(Some(params));
+            let mut controller =
+                ProbeController::new(10, None, 1.0, true).with_rerank_stop(Some(params));
             let meter = WorkMeter::new(WorkBudget {
                 total: WorkUnits::new(10.0),
                 ..Default::default()
