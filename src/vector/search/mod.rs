@@ -228,7 +228,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
             } else {
                 capacity
             },
-            exact_plan: self.probe_params.exact_plan && !deferred_rerank,
+            exact_plan: self.probe_params.exact_plan,
             #[cfg(test)]
             plan_override: self.plan_override,
             #[cfg(test)]

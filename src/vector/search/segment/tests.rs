@@ -332,6 +332,131 @@ fn quantized_recall_rejects_invalid_parameters() {
 }
 
 #[test]
+fn deferred_bypass_matches_oracle_and_adaptive_prefix() -> crate::Result<()> {
+    let plans = [
+        PlanOverride::exact(|_, _| true),
+        PlanOverride::exact(|_, layer| layer == 1),
+        PlanOverride::exact(|cluster, layer| cluster % 3 == layer),
+    ];
+    let mut stops = 0;
+    let mut exact_layers = [0; 3];
+    for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+        for schedule in [&[1][..], &[1, 1][..], &[1, 1, 4][..]] {
+            let fixture = matrix_fixture(metric, Representation::Quantized(schedule), true)?;
+            for filter in [
+                &AllQuery as &dyn Query,
+                &fixture.filter("half"),
+                &fixture.filter("rare"),
+            ] {
+                let weight = fixture.weight(filter)?;
+                for query in matrix_queries() {
+                    for k in [1, 10, MATRIX_DOCS] {
+                        let params = ProbeParams {
+                            deferred_rerank: true,
+                            cluster_stats: true,
+                            exact_plan: true,
+                            ..routed_exhaustive_params(MATRIX_CLUSTERS)
+                        };
+                        for plan in plans {
+                            let (hits, reports) =
+                                forced_top_k(&fixture, filter, &query, k, &params, plan)?;
+                            assert_eq!(hits, fixture.oracle(filter, &query, k)?);
+                            for report in &reports {
+                                let planned: usize = (0..schedule.len())
+                                    .filter_map(|layer| report.layers.get(layer))
+                                    .map(|l| l.exact_rows())
+                                    .sum();
+                                assert_eq!(
+                                    planned,
+                                    report
+                                        .clusters
+                                        .iter()
+                                        .map(|c| c.planned_exact)
+                                        .sum::<usize>()
+                                );
+                                assert_eq!(
+                                    planned,
+                                    report.clusters.iter().map(|c| c.exact).sum::<usize>()
+                                );
+                                assert!(planned <= report.exact_rows);
+                                assert!(report.exact_rows <= report.candidates_scored);
+                                if k == MATRIX_DOCS {
+                                    assert_eq!(report.exact_rows, report.candidates_scored);
+                                }
+                                for (layer, total) in exact_layers.iter_mut().enumerate() {
+                                    *total += report
+                                        .layers
+                                        .get(layer)
+                                        .map_or(0, |counts| counts.exact_rows());
+                                }
+                                for cluster in &report.clusters {
+                                    assert!(cluster
+                                        .top_docs
+                                        .iter()
+                                        .all(|doc| !cluster.pending_docs.contains(doc)));
+                                }
+                            }
+                            for target in [0.5, 0.95] {
+                                let (active, report) = fixture.run_planned(
+                                    0,
+                                    weight.as_ref(),
+                                    &query,
+                                    k,
+                                    ProbeParams {
+                                        quantized_recall: Some(
+                                            crate::vector::QuantizedRecallParams {
+                                                target,
+                                                recall_exponent: 1.5,
+                                            },
+                                        ),
+                                        ..params.clone()
+                                    },
+                                    Some(plan),
+                                )?;
+                                let Some(prefix) = report.quantized_recall_stop_at else {
+                                    continue;
+                                };
+                                stops += 1;
+                                let (replay, _) = fixture.run_planned(
+                                    0,
+                                    weight.as_ref(),
+                                    &query,
+                                    k,
+                                    ProbeParams {
+                                        cluster_limit: prefix,
+                                        ..params.clone()
+                                    },
+                                    Some(plan),
+                                )?;
+                                assert_eq!(active, replay);
+                                let cluster = &report.clusters[prefix - 1];
+                                assert_eq!(
+                                    cluster.kth_estimate,
+                                    reports[0].clusters[prefix - 1].kth_estimate
+                                );
+                                assert!(active
+                                    .iter()
+                                    .all(|h| cluster.pending_docs.contains(&h.1.doc_id)
+                                        || cluster.top_docs.contains(&h.1.doc_id)));
+                                if report.candidates_scored
+                                    == report.layers.get(0).unwrap().exact_rows()
+                                {
+                                    assert_eq!(cluster.kth, cluster.kth_estimate);
+                                    assert_eq!(cluster.kth, active.get(k - 1).map(|h| h.0));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(stops > 0);
+    assert!(exact_layers.iter().all(|&rows| rows > 0));
+    Ok(())
+}
+
+#[test]
 fn deferred_cascade_matches_oracle_and_prefix_candidates() -> crate::Result<()> {
     assert!(ProbeParams {
         deferred_rerank: true,

@@ -19,9 +19,9 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 pub struct ProbeParams {
     /// Finish the quantized cascade after each cluster. Experimental; default false.
     pub cluster_cascade: bool,
-    /// Defer exact scoring until probing finishes. Experimental; default false.
+    /// Defer reranking quantized survivors until probing finishes. Experimental; default false.
     pub deferred_rerank: bool,
-    /// Experimental quantized-gap recall estimate; enables deferred reranking.
+    /// Experimental score-gap recall estimate; enables deferred reranking.
     pub quantized_recall: Option<QuantizedRecallParams>,
     /// Stop after this many completed clusters; zero disables the diagnostic limit.
     pub cluster_limit: usize,

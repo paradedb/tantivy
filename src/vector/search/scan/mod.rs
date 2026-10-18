@@ -109,7 +109,7 @@ pub(crate) struct ScanReport {
     pub(crate) trace: Box<ScanTrace>,
 }
 
-/// An online observation after finishing one nonempty quantized cluster.
+/// An online observation after finishing one nonempty cluster.
 #[derive(Debug, serde::Serialize)]
 pub struct CompletedCluster {
     /// One-based ordinal among completed nonempty clusters.
@@ -488,36 +488,49 @@ where
         let mut completed_bound = KthBound::new(self.exact.bound.k);
         let mut survivors = Vec::new();
         while let Some(rows) = source.next(self.feedback())? {
+            let block = self.quantized.as_ref().unwrap().candidates.block_count();
+            let exact_before = self.report.exact_rows;
             let scored = {
                 let _stage = enter_vector_stage(self.shortlist_stage());
                 self.shortlist(&rows)?
             };
             let state = self.quantized.as_mut().unwrap();
-            let block = state.candidates.block_count() - 1;
             survivors.clear();
-            for layer in 0..state.layers.len() {
-                let _stage = enter_vector_stage(VectorStage::LayerScan(layer as u8));
-                let count = state.candidates.rows(block).len();
-                if layer > 0 && count > 0 {
-                    let read =
-                        state.read_plan(&state.candidates.rows(block), layer, &mut self.scratch)?;
-                    self.report.layers[layer].count(read, count);
-                    let Read::Layer(read) = read else {
-                        unreachable!("deferred reranking disables direct exact reads");
-                    };
-                    state.refine(layer, block, read, &mut self.scratch)?;
-                }
-                if layer > 0 {
-                    self.exact.bound.copy_running_from(&completed_bound);
-                    let at = state.candidates.block(block).at.clone();
-                    state.candidates.finish_cluster(at, &mut self.exact.bound);
-                }
-                self.report.layers[layer].scored += count;
-                state.candidates.band_last(&self.exact.bound);
-                let count = state.candidates.rows(block).len();
-                self.report.layers[layer].survivors += count;
-                if self.cluster_stats {
-                    survivors.push(count);
+            if self.cluster_stats {
+                survivors.resize(state.layers.len(), 0);
+            }
+            if state.candidates.block_count() > block {
+                for layer in 0..state.layers.len() {
+                    let _stage = enter_vector_stage(VectorStage::LayerScan(layer as u8));
+                    let count = state.candidates.rows(block).len();
+                    if layer > 0 {
+                        self.exact.bound.copy_running_from(&completed_bound);
+                        if count > 0 {
+                            let selected = state.candidates.rows(block);
+                            let read = state.read_plan(&selected, layer, &mut self.scratch)?;
+                            self.report.layers[layer].count(read, count);
+                            match read {
+                                Read::Exact => {
+                                    self.report.exact_rows +=
+                                        self.exact.score(&selected, &mut self.scratch)?;
+                                    state.candidates.retire(block);
+                                    break;
+                                }
+                                Read::Layer(read) => {
+                                    state.refine(layer, block, read, &mut self.scratch)?
+                                }
+                            }
+                        }
+                        let at = state.candidates.block(block).at.clone();
+                        state.candidates.finish_cluster(at, &mut self.exact.bound);
+                    }
+                    self.report.layers[layer].scored += count;
+                    state.candidates.band_last(&self.exact.bound);
+                    let count = state.candidates.rows(block).len();
+                    self.report.layers[layer].survivors += count;
+                    if self.cluster_stats {
+                        survivors[layer] = count;
+                    }
                 }
             }
             completed_bound.copy_running_from(&self.exact.bound);
@@ -548,11 +561,11 @@ where
                     ordinal: completed,
                     cluster: rows.cluster,
                     eligible: scored,
-                    exact: 0,
-                    planned_exact: 0,
+                    exact: self.report.exact_rows - exact_before,
+                    planned_exact: self.report.exact_rows - exact_before,
                     kth: self.exact.bound.running_lower(),
                     kth_estimate: self.exact.bound.running_estimate(),
-                    top_docs: Vec::new(),
+                    top_docs: self.exact.top_docs(),
                     pending_docs,
                     layer_survivors: survivors.clone(),
                     centroid: rows.centroid.map(|c| c.score()),
