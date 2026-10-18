@@ -217,7 +217,7 @@ impl InvertedIndexReader {
     /// Notice: This requires a full scan and therefore **very expensive**.
     /// TODO: Move to sstable to use the index.
     pub(crate) fn list_encoded_json_fields(&self) -> io::Result<Vec<InvertedIndexFieldSpace>> {
-        let mut stream = self.termdict.stream()?;
+        let mut stream = self.termdict.range().interruptible().into_stream()?;
         let mut fields: Vec<InvertedIndexFieldSpace> = Vec::new();
 
         let mut current_field_opt: Option<InvertedIndexFieldSpace> = None;

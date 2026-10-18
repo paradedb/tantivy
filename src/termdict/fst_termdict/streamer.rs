@@ -51,6 +51,12 @@ where A: Automaton
         self
     }
 
+    /// No interrupt check on the fst dictionary. This keeps the query code the same for both
+    /// dictionaries.
+    pub fn interruptible(self) -> Self {
+        self
+    }
+
     /// Iterate over the range backwards.
     pub fn backward(mut self) -> Self {
         self.stream_builder = self.stream_builder.backward();
@@ -190,6 +196,12 @@ where
     /// Limit the range to terms lesser or equal to the bound
     pub fn lt<T: AsRef<[u8]>>(mut self, bound: T) -> Self {
         self.stream_builder = self.stream_builder.lt(bound);
+        self
+    }
+
+    /// No interrupt check on the fst dictionary. This keeps the query code the same for both
+    /// dictionaries.
+    pub fn interruptible(self) -> Self {
         self
     }
 
