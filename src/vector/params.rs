@@ -43,7 +43,7 @@ pub struct ProbeParams {
     pub fixed_probe_cost_rows: f64,
 }
 
-/// Normalized centroid-gap and remaining-weight recall estimate.
+/// Normalized centroid-gap recall estimate, including unexplored router groups.
 #[derive(Clone, Copy, Debug)]
 pub struct QuantizedRecallParams {
     pub target: f64,

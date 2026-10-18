@@ -242,9 +242,9 @@ pub struct ProbeStats {
     /// Clusters opened that contributed no row.
     pub postings_skipped: usize,
     /// The router's counters.
-    #[serde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub routing: Option<RouterMetrics>,
-    /// Centroids scored while ranking.
+    /// Candidates returned by routing, including repeated expansion passes.
     pub routing_visited_count: usize,
     /// Clusters the bounds gate passed over.
     pub bounds_skips: u32,
@@ -573,7 +573,12 @@ mod tests {
             layers: vec![LayerReport::default(); 2],
             ..ScanReport::default()
         };
-        let segment = ["recall_estimate", "segment_rows", "segment_clusters"];
+        let segment = [
+            "recall_estimate",
+            "segment_rows",
+            "segment_clusters",
+            "routing",
+        ];
         let ivf = |scan| SegmentReport::Ivf {
             plan,
             source: routed(),

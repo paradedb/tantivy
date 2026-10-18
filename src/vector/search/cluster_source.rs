@@ -55,7 +55,7 @@ pub(crate) struct Feedback {
 
 /// Supplies a segment scan's clusters in its own order and decides when to stop.
 pub(crate) trait ClusterSource {
-    fn quantized_recall_score(&self, _cutoff: f32, _completed: usize) -> Option<f64> {
+    fn quantized_recall_score(&mut self, _cutoff: f32, _completed: usize) -> Option<f64> {
         None
     }
 

@@ -450,6 +450,9 @@ pub struct StackedSearchStats {
     /// the top level's brute-force centroid ranking. A parent's members
     /// are this level's centroids, so this is the total query cost.
     pub members_scored: usize,
+    /// Estimated member score at the best excluded parent; not a bound.
+    pub(crate) unsearched_score: Option<f32>,
+    pub(crate) excluded_score: Option<f32>,
 }
 
 /// Counting sort into list order. `perm[old] = new_row`.
@@ -913,6 +916,17 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         recall: f32,
         metric: Metric,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
+        self.search_expanded(query, k, recall, metric, 1)
+    }
+
+    pub(crate) fn search_expanded(
+        &self,
+        query: &[S::Elem],
+        k: usize,
+        recall: f32,
+        metric: Metric,
+        expansion: usize,
+    ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
         if k == 0 {
             return (Vec::new(), StackedSearchStats::default());
         }
@@ -929,12 +943,13 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
             } else {
                 recall.max(1.0)
             };
-            let probes = if k >= self.vectors.num_vectors(dim) {
-                self.nlist()
-            } else {
-                self.n_probe()
-            };
-            parent.search(query, probes, parent_recall, metric)
+            parent.search_expanded(
+                query,
+                self.n_probe().saturating_mul(expansion).min(self.nlist()),
+                if expansion > 1 { 1.0 } else { parent_recall },
+                metric,
+                expansion,
+            )
         } else {
             let mut all: Vec<Candidate<ClusterId>> = (0..self.nlist())
                 .map(|i| Candidate {
@@ -946,6 +961,7 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
             let stats = StackedSearchStats {
                 lists_scanned: 0,
                 members_scored: all.len(),
+                ..Default::default()
             };
             (all, stats)
         };
@@ -953,6 +969,12 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         if candidates.is_empty() {
             return (Vec::new(), stats);
         }
+
+        stats.unsearched_score = stats
+            .unsearched_score
+            .into_iter()
+            .chain(stats.excluded_score.take())
+            .reduce(f32::max);
 
         let mut estimator = can_aps.then(|| {
             let (matrix, _) = self.centroids.centroid_matrix().expect("can_aps");
@@ -968,8 +990,20 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         });
 
         let mut result = BinaryHeap::with_capacity(k);
-        for c in &candidates {
-            stats.members_scored += self.scan_cluster(query, metric, c.node, &mut result, k);
+        let (mut member_score_sum, mut parent_score_sum, mut members) = (0.0, 0.0, 0);
+        for (position, c) in candidates.iter().enumerate() {
+            let (scanned, score_sum) = self.scan_cluster(
+                query,
+                metric,
+                c.node,
+                &mut result,
+                k,
+                &mut stats.excluded_score,
+            );
+            stats.members_scored += scanned;
+            members += scanned;
+            member_score_sum += score_sum;
+            parent_score_sum += f64::from(c.sim.score()) * scanned as f64;
             stats.lists_scanned += 1;
             let Some(estimator) = estimator.as_mut() else {
                 continue;
@@ -982,8 +1016,20 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
                 .cover_next(kth)
                 .expect("in-memory centroid rows cannot fail to load");
             if estimate.is_some_and(|est| est >= recall) {
+                if let Some(next) = candidates.get(position + 1) {
+                    stats.unsearched_score = Some(
+                        stats
+                            .unsearched_score
+                            .map_or(next.sim.score(), |score| score.max(next.sim.score())),
+                    );
+                }
                 break;
             }
+        }
+
+        if members > 0 {
+            let shift = ((member_score_sum - parent_score_sum) / members as f64) as f32;
+            stats.unsearched_score = stats.unsearched_score.map(|score| score + shift);
         }
 
         let hits = result
@@ -1001,26 +1047,35 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         list: ClusterId,
         result: &mut BinaryHeap<Reverse<Candidate<ClusterId>>>,
         k: usize,
-    ) -> usize {
+        excluded: &mut Option<f32>,
+    ) -> (usize, f64) {
         let dim = query.len();
         let (start, end) = self.offsets[usize::from(list)];
         let start = start as usize;
         let end = end as usize;
+        let mut score_sum = 0.0;
         for row in start..end {
             let id = ClusterId::from(row);
             let cand = Candidate {
                 sim: self.vectors.similarity(metric, dim, id.0, query),
                 node: id,
             };
+            score_sum += f64::from(cand.sim.score());
             if result.len() < k {
                 result.push(Reverse(cand));
             } else if let Some(mut worst) = result.peek_mut() {
+                let dropped = if cand > worst.0 {
+                    worst.0.sim.score()
+                } else {
+                    cand.sim.score()
+                };
+                *excluded = Some(excluded.map_or(dropped, |score| score.max(dropped)));
                 if cand > worst.0 {
                     *worst = Reverse(cand);
                 }
             }
         }
-        end.saturating_sub(start)
+        (end.saturating_sub(start), score_sum)
     }
 }
 
@@ -1305,11 +1360,26 @@ mod tests {
         );
 
         for query in [[0.0f32, 0.0], [7.5, 0.0], [15.2, 0.0], [31.0, 0.0]] {
-            let (all, _) = opened.search(&query, n, 1.0, Metric::L2);
+            let (candidates, stats) = opened.search(&query, n, 1.0, Metric::L2);
+            let (parent, parent_stats) =
+                opened
+                    .parent
+                    .as_ref()
+                    .unwrap()
+                    .search(&query, opened.n_probe(), 1.0, Metric::L2);
+            let mut expected = Vec::new();
+            for candidate in parent {
+                let (start, end) = opened.offsets[usize::from(candidate.node)];
+                expected.extend(start..end);
+            }
+            let mut actual: Vec<_> = candidates.iter().map(|c| u64::from(c.node.0)).collect();
+            expected.sort_unstable();
+            actual.sort_unstable();
+            assert_eq!(actual, expected);
+            assert!(candidates.len() < n);
             assert_eq!(
-                all.len(),
-                n,
-                "full ranking must include every centroid through parent levels"
+                stats.members_scored,
+                parent_stats.members_scored + candidates.len()
             );
             let (expected, _) = index.search(&query, 4, 1.0, Metric::L2);
             let (got, _) = opened.search(&query, 4, 1.0, Metric::L2);
@@ -1318,6 +1388,61 @@ mod tests {
                 assert_eq!(g.node, e.node);
                 assert_eq!(g.sim, e.sim);
             }
+        }
+    }
+
+    #[test]
+    fn expansion_preserves_normal_routing_and_eventually_covers_every_member() {
+        let n = 256;
+        let data = line_data(n);
+        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let (index, _) = StackedIvfBuilder::new(data, n, 2, &clusterer, test_config(4)).build();
+        let query = [7.5, 0.0];
+        let (normal, stats) = index.search(&query, n, 1.0, Metric::L2);
+        let (initial, initial_stats) = index.search_expanded(&query, n, 1.0, Metric::L2, 1);
+        assert_eq!(normal, initial);
+        assert_eq!(stats.members_scored, initial_stats.members_scored);
+        assert!(stats.unsearched_score.is_some());
+        let mut previous: std::collections::BTreeSet<_> = normal.iter().map(|c| c.node).collect();
+        for expansion in [2, 4, 16, 256] {
+            let (hits, stats) = index.search_expanded(&query, n, 1.0, Metric::L2, expansion);
+            let current: std::collections::BTreeSet<_> = hits.iter().map(|c| c.node).collect();
+            assert!(previous.is_subset(&current));
+            assert!(hits.windows(2).all(|pair| pair[0] >= pair[1]));
+            if hits.len() == n {
+                assert!(stats.unsearched_score.is_none());
+            }
+            previous = current;
+        }
+        assert_eq!(previous.len(), n);
+    }
+
+    #[test]
+    fn unsearched_parent_score_uses_observed_child_offset() {
+        for scale in [0.5, 1.0, 4.0] {
+            let store =
+                |values: &[f32]| InMemoryStore::new(values.iter().map(|v| v * scale).collect(), 1);
+            let parent = StackedIvf {
+                config: test_config(2),
+                parent: None,
+                offsets: vec![(0, 2)],
+                centroids: store(&[5.0]),
+                vectors: store(&[0.0, 10.0]),
+            };
+            let index = StackedIvf {
+                config: test_config(2),
+                parent: Some(Box::new(parent)),
+                offsets: vec![(0, 2), (2, 4)],
+                centroids: store(&[0.0, 10.0]),
+                vectors: store(&[-1.0, 1.0, 9.0, 11.0]),
+            };
+            let (hits, stats) = index.search(&[0.0], 4, 1.0, Metric::L2);
+            assert_eq!(hits.len(), 2);
+            assert_eq!(stats.members_scored, 5);
+            assert_eq!(stats.unsearched_score, Some(-101.0 * scale * scale));
+            let (hits, stats) = index.search_expanded(&[0.0], 4, 1.0, Metric::L2, 2);
+            assert_eq!(hits.len(), 4);
+            assert_eq!(stats.unsearched_score, None);
         }
     }
 
