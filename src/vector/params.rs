@@ -17,18 +17,8 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 /// provisional pending real-data benchmarking.
 #[derive(Clone, Debug)]
 pub struct ProbeParams {
-    /// Finish the quantized cascade after each cluster. Experimental; default false.
-    pub cluster_cascade: bool,
-    /// Defer reranking quantized survivors until probing finishes. Experimental; default false.
-    pub deferred_rerank: bool,
-    /// Experimental score-gap recall estimate; enables deferred reranking.
+    /// Adaptive score-gap recall estimate; enables deferred reranking.
     pub quantized_recall: Option<QuantizedRecallParams>,
-    /// Stop after this many completed clusters; zero disables the diagnostic limit.
-    pub cluster_limit: usize,
-    /// Record completed clusters and their exact top-k. Default false.
-    pub cluster_stats: bool,
-    /// Experimental stopping rule for completed quantized clusters.
-    pub rerank_stop: Option<RerankStopParams>,
     /// Work ceiling as a fraction of segment capacity. Ignored with quantized recall. Default
     /// 0.01.
     pub max_probe_fraction: f32,
@@ -66,21 +56,6 @@ impl QuantizedRecallParams {
     }
 }
 
-/// A low exact-scoring rate sustained across enough clusters and eligible rows.
-#[derive(Clone, Copy, Debug)]
-pub struct RerankStopParams {
-    /// Maximum fraction of eligible rows scored exactly in each quiet cluster.
-    pub threshold: f64,
-    /// Consecutive quiet, nonempty clusters required.
-    pub patience: usize,
-    /// Completed nonempty clusters required before stopping.
-    pub min_clusters: usize,
-    /// Eligible rows required across the quiet streak.
-    pub min_rows: usize,
-    /// Record the first trigger but continue searching.
-    pub shadow: bool,
-}
-
 /// Which segments take the located path: a segment whose filter matches at most a cap of
 /// documents, deleted ones included, skips routing and scores every match, located through the
 /// document location map.
@@ -93,7 +68,8 @@ pub enum LocatedPath {
     MaxSelectivity(Selectivity),
     /// The cap is the rows the segment's routed work budget buys with no cluster opened,
     /// `floor(budget * n_avg / (1 - x))`: a filter matching no more documents than routing may
-    /// score is located instead.
+    /// score is located instead. With quantized recall, the cap is half the segment's cluster
+    /// count, independent of the work budget.
     Auto,
 }
 
@@ -116,12 +92,7 @@ impl Selectivity {
 impl Default for ProbeParams {
     fn default() -> Self {
         Self {
-            cluster_cascade: false,
-            deferred_rerank: false,
             quantized_recall: None,
-            cluster_limit: 0,
-            cluster_stats: false,
-            rerank_stop: None,
             max_probe_fraction: 0.01,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
             router_recall_target: DEFAULT_ROUTER_RECALL,
@@ -198,22 +169,6 @@ impl ProbeParams {
                 "quantized recall requires a target in (0, 1] and a finite positive recall \
                  exponent"
                     .into(),
-            ));
-        }
-        if (self.deferred_rerank || self.quantized_recall.is_some()) && self.rerank_stop.is_some() {
-            return Err(crate::TantivyError::InvalidArgument(
-                "deferred reranking cannot use the eager rerank-rate stopping rule".into(),
-            ));
-        }
-        if self.rerank_stop.is_some_and(|stop| {
-            !stop.threshold.is_finite()
-                || !(0.0..=1.0).contains(&stop.threshold)
-                || stop.patience == 0
-                || stop.min_clusters == 0
-                || stop.min_rows == 0
-        }) {
-            return Err(crate::TantivyError::InvalidArgument(
-                "rerank stopping requires a finite rate in [0, 1] and positive floors".into(),
             ));
         }
         if self.quantized_recall.is_none() && !(self.max_probe_fraction > 0.0) {

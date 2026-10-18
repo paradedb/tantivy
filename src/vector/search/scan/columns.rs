@@ -120,15 +120,6 @@ pub(crate) struct QuantizedCandidates {
 }
 
 impl QuantizedCandidates {
-    pub(crate) fn clear(&mut self) {
-        self.offsets.clear();
-        self.docs.clear();
-        self.columns.truncate(0);
-        self.blocks.clear();
-        self.lowers.clear();
-        self.cluster_top.clear();
-    }
-
     /// Room for `capacity` candidates in the offsets, every column and the boundary's lower
     /// endpoints; doc ids are reserved when a block first brings them.
     pub(crate) fn with_capacity(capacity: usize) -> Self {
@@ -280,7 +271,7 @@ impl QuantizedCandidates {
     }
 
     #[inline]
-    pub(super) fn upper(&self, index: usize) -> UpperEndpoint {
+    fn upper(&self, index: usize) -> UpperEndpoint {
         self.estimate(index)
             .upper(self.columns.sigmas[index], self.kappa)
     }

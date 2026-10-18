@@ -26,7 +26,6 @@ use crate::error::DataCorruption;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource, Feedback};
-use crate::vector::search::interval::{LowerEndpoint, Threshold};
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery};
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::quantized::{QuantizedFieldReader, ReadScratch};
@@ -40,12 +39,8 @@ use crate::SegmentOrdinal;
 /// Sizes for one segment scan.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ScanConfig {
-    pub(crate) cluster_cascade: bool,
-    pub(crate) cluster_stats: bool,
     pub(crate) deferred_rerank: bool,
     pub(crate) quantized_recall: Option<crate::vector::QuantizedRecallParams>,
-    pub(crate) min_probe_clusters: usize,
-    pub(crate) cluster_limit: usize,
     pub(crate) top_n: usize,
     /// Upper bound on rows admitted, for sizing the candidate columns.
     pub(crate) capacity: usize,
@@ -95,8 +90,7 @@ impl LayerReport {
 /// What a finished scan reports.
 #[derive(Debug, Default)]
 pub(crate) struct ScanReport {
-    pub(crate) clusters: Vec<CompletedCluster>,
-    pub(crate) quantized_recall_stop_at: Option<usize>,
+    pub(crate) recall_reached: bool,
     /// Rows shortlisted from the source.
     pub(crate) candidates_scored: usize,
     /// One per active layer on a quantized segment; empty at full precision.
@@ -107,29 +101,6 @@ pub(crate) struct ScanReport {
     pub(crate) centroid_reads: usize,
     #[cfg(test)]
     pub(crate) trace: Box<ScanTrace>,
-}
-
-/// An online observation after finishing one nonempty cluster.
-#[derive(Debug, serde::Serialize)]
-pub struct CompletedCluster {
-    /// One-based ordinal among completed nonempty clusters.
-    pub ordinal: usize,
-    /// Segment-local storage cluster.
-    pub cluster: usize,
-    /// Rows admitted after filters and deletions.
-    pub eligible: usize,
-    /// Rows scored exactly, including cost-based direct reads.
-    pub exact: usize,
-    /// Rows scored exactly by the read planner before the final stage.
-    pub planned_exact: usize,
-    /// Running pruning cutoff after this cluster, absent while filling.
-    pub kth: Option<f32>,
-    /// Exact top-k document ids in result order.
-    pub top_docs: Vec<crate::DocId>,
-    pub layer_survivors: Vec<usize>,
-    pub pending_docs: Vec<crate::DocId>,
-    pub centroid: Option<f32>,
-    pub kth_estimate: Option<f32>,
 }
 
 /// Rows each stage of a scan scored and kept, by global row.
@@ -353,12 +324,12 @@ impl<'a> QuantizedState<'a> {
 
     /// Records the candidates `layer` scored and prunes them at its boundary.
     fn prune(&mut self, layer: usize, bound: &mut KthBound, report: &mut ScanReport) {
-        if layer == 0 {
+        report.layers[layer].scored = if layer == 0 {
             report.layers[0].admission_pruned = self.layer0_admission_pruned;
-            report.layers[0].scored = self.layer0_scored;
+            self.layer0_scored
         } else {
-            report.layers[layer].scored += self.candidates.len();
-        }
+            self.candidates.len()
+        };
         #[cfg(test)]
         {
             // Layer 0's candidates are listed in admission order, later layers' in row order.
@@ -374,7 +345,7 @@ impl<'a> QuantizedState<'a> {
         }
         let _boundary = enter_vector_stage(VectorStage::Boundary(layer as u8));
         self.candidates.band(bound);
-        report.layers[layer].survivors += self.candidates.len();
+        report.layers[layer].survivors = self.candidates.len();
         #[cfg(test)]
         report
             .trace
@@ -400,12 +371,8 @@ where
     /// The candidate blocks by cluster id, which is row order; set when the shortlist closes.
     by_cluster: Vec<usize>,
     report: ScanReport,
-    cluster_cascade: bool,
-    cluster_stats: bool,
     deferred_rerank: bool,
     quantized_recall_gap: Option<f64>,
-    min_probe_clusters: usize,
-    cluster_limit: usize,
 }
 
 impl<'a, T, K, C> SegmentScan<'a, T, K, C>
@@ -442,14 +409,10 @@ where
         };
         let layers = quantized.as_ref().map_or(0, |state| state.layers.len());
         Ok(Self {
-            cluster_cascade: config.cluster_cascade,
-            cluster_stats: config.cluster_stats,
             deferred_rerank: config.deferred_rerank,
             quantized_recall_gap: config
                 .quantized_recall
                 .and_then(|p| p.gap_threshold(config.top_n)),
-            min_probe_clusters: config.min_probe_clusters,
-            cluster_limit: config.cluster_limit,
             exact: ExactScorer::new(reader, query.query, config.top_n, tie_break, tie_comparator),
             quantized,
             scratch: ReadScratch::default(),
@@ -467,9 +430,6 @@ where
         if self.deferred_rerank && self.quantized.is_some() {
             return self.run_deferred(source);
         }
-        if self.cluster_cascade && self.quantized.is_some() {
-            return self.run_clusters(source);
-        }
         let stage = enter_vector_stage(self.shortlist_stage());
         while let Some(rows) = source.next(self.feedback())? {
             let scored = self.shortlist(&rows)?;
@@ -486,19 +446,13 @@ where
     fn run_deferred(&mut self, source: &mut impl ClusterSource) -> crate::Result<()> {
         let mut completed = 0;
         let mut completed_bound = KthBound::new(self.exact.bound.k);
-        let mut survivors = Vec::new();
         while let Some(rows) = source.next(self.feedback())? {
             let block = self.quantized.as_ref().unwrap().candidates.block_count();
-            let exact_before = self.report.exact_rows;
             let scored = {
                 let _stage = enter_vector_stage(self.shortlist_stage());
                 self.shortlist(&rows)?
             };
             let state = self.quantized.as_mut().unwrap();
-            survivors.clear();
-            if self.cluster_stats {
-                survivors.resize(state.layers.len(), 0);
-            }
             if state.candidates.block_count() > block {
                 for layer in 0..state.layers.len() {
                     let _stage = enter_vector_stage(VectorStage::LayerScan(layer as u8));
@@ -528,63 +482,20 @@ where
                     state.candidates.band_last(&self.exact.bound);
                     let count = state.candidates.rows(block).len();
                     self.report.layers[layer].survivors += count;
-                    if self.cluster_stats {
-                        survivors[layer] = count;
-                    }
                 }
             }
             completed_bound.copy_running_from(&self.exact.bound);
             completed += 1;
-            if self.cluster_stats {
-                let mut pending_docs = Vec::new();
-                let threshold = self
-                    .exact
-                    .bound
-                    .running_lower()
-                    .map(|kth| Threshold(LowerEndpoint(kth)));
-                for b in 0..state.candidates.block_count() {
-                    let selected = state.candidates.rows(b);
-                    if selected.len() > 0 {
-                        let docs = self.exact.selected_docs(&selected)?;
-                        pending_docs.extend(
-                            docs.into_iter()
-                                .zip(state.candidates.block(b).at.clone())
-                                .filter(|&(_, index)| {
-                                    threshold
-                                        .is_none_or(|kth| kth.admits(state.candidates.upper(index)))
-                                })
-                                .map(|(doc, _)| doc),
-                        );
-                    }
-                }
-                self.report.clusters.push(CompletedCluster {
-                    ordinal: completed,
-                    cluster: rows.cluster,
-                    eligible: scored,
-                    exact: self.report.exact_rows - exact_before,
-                    planned_exact: self.report.exact_rows - exact_before,
-                    kth: self.exact.bound.running_lower(),
-                    kth_estimate: self.exact.bound.running_estimate(),
-                    top_docs: self.exact.top_docs(),
-                    pending_docs,
-                    layer_survivors: survivors.clone(),
-                    centroid: rows.centroid.map(|c| c.score()),
-                });
-            }
             source.admitted(scored, self.feedback())?;
-            let recall_reached = completed >= self.min_probe_clusters
-                && self.quantized_recall_gap.is_some_and(|threshold| {
-                    self.exact
-                        .bound
-                        .running_estimate()
-                        .and_then(|cutoff| source.quantized_recall_score(cutoff, completed))
-                        .is_some_and(|score| score >= threshold)
-                });
+            let recall_reached = self.quantized_recall_gap.is_some_and(|threshold| {
+                self.exact
+                    .bound
+                    .running_estimate()
+                    .and_then(|cutoff| source.quantized_recall_score(cutoff, completed))
+                    .is_some_and(|score| score >= threshold)
+            });
             if recall_reached {
-                self.report.quantized_recall_stop_at = Some(completed);
-                break;
-            }
-            if self.cluster_limit > 0 && completed >= self.cluster_limit {
+                self.report.recall_reached = true;
                 break;
             }
         }
@@ -592,52 +503,6 @@ where
         state.candidates.band(&mut self.exact.bound);
         state.candidates.order_by_cluster(&mut self.by_cluster);
         self.score_shortlist()
-    }
-
-    fn run_clusters(&mut self, source: &mut impl ClusterSource) -> crate::Result<()> {
-        while let Some(rows) = source.next(self.feedback())? {
-            let cluster = rows.cluster;
-            let exact_before = self.report.exact_rows;
-            let planned_before: usize = self.report.layers.iter().map(|l| l.exact_rows).sum();
-            let scored = {
-                let _stage = enter_vector_stage(self.shortlist_stage());
-                self.shortlist(&rows)?
-            };
-            self.close_shortlist();
-            for layer in self.refining_layers() {
-                self.narrow(layer)?;
-            }
-            self.score_shortlist()?;
-            let exact = self.report.exact_rows - exact_before;
-            let state = self.quantized.as_mut().unwrap();
-            state.candidates.clear();
-            self.exact.bound.boundary_lower(&mut []);
-            let mut feedback = self.feedback();
-            feedback.exact_rows = Some(exact);
-            if self.cluster_stats {
-                self.report.clusters.push(CompletedCluster {
-                    ordinal: self.report.clusters.len() + 1,
-                    cluster,
-                    eligible: scored,
-                    exact,
-                    planned_exact: self
-                        .report
-                        .layers
-                        .iter()
-                        .map(|l| l.exact_rows)
-                        .sum::<usize>()
-                        - planned_before,
-                    kth: feedback.kth_lower,
-                    top_docs: self.exact.top_docs(),
-                    layer_survivors: Vec::new(),
-                    pending_docs: Vec::new(),
-                    centroid: rows.centroid.map(|c| c.score()),
-                    kth_estimate: feedback.kth_estimate,
-                });
-            }
-            source.admitted(scored, feedback)?;
-        }
-        Ok(())
     }
 
     /// The stage the shortlist is built in: layer 0, or the exact scan at full precision.
@@ -651,7 +516,6 @@ where
     /// The pruning thresholds as of the last shortlisted cluster.
     fn feedback(&self) -> Feedback {
         Feedback {
-            exact_rows: None,
             kth_lower: self.exact.bound.running_lower(),
             kth_estimate: self.exact.bound.running_estimate(),
         }

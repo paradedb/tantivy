@@ -69,28 +69,6 @@ where
 
     // --- Scoring ---
 
-    pub(super) fn selected_docs(
-        &mut self,
-        selected: &ClusterRows<'_>,
-    ) -> crate::Result<Vec<DocId>> {
-        if let Some(docs) = selected.docs {
-            return Ok(docs.to_vec());
-        }
-        self.reader
-            .read_doc_ids(selected.cluster, &mut self.cluster_docs)?;
-        Ok(match selected.offsets {
-            Some(offsets) => offsets
-                .iter()
-                .map(|&i| self.cluster_docs[i as usize])
-                .collect(),
-            None => self.cluster_docs.clone(),
-        })
-    }
-
-    pub(super) fn top_docs(&self) -> Vec<DocId> {
-        self.topn.sorted_docs()
-    }
-
     /// Scores every row `selected` selects, reading through `scratch`; returns the rows scored. A
     /// row without a doc id reads the cluster's DocIds column when it first needs one.
     pub(super) fn score(

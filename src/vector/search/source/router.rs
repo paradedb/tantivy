@@ -261,6 +261,11 @@ mod adaptive_tests {
                     (progress.remaining - progress.weights[1] - progress.weights[3]).abs() < 1e-10
                 );
                 let score = progress.score(scale * 1.5 + shift, 2).unwrap();
+                let sigma = 5.0_f64.sqrt();
+                let remaining = 200.0 * (-2.0 / sigma).exp() + 400.0 * (-6.0 / sigma).exp();
+                let total = 100.0 + remaining + 50.0 * (-4.0 / sigma).exp();
+                let miss_fraction = remaining / total / 2.0 * (-1.5 / sigma).exp();
+                assert!((score + miss_fraction.ln()).abs() < 1e-10);
                 if let Some(previous) = reference {
                     assert!((score - previous).abs() < 1e-10);
                 }
@@ -391,8 +396,7 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
                 estimator,
                 recall_target,
                 params.quantized_recall.is_none(),
-            )
-            .with_rerank_stop(params.rerank_stop),
+            ),
             bounds: index.bounds(),
             tracker: QueryBoundTracker::new(),
             gate: RowGate::new(filter, segment.alive_bitset()),
@@ -543,10 +547,6 @@ impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
     fn admitted(&mut self, rows: usize, feedback: Feedback) -> crate::Result<()> {
         if let (Some(adaptive), Some(candidate)) = (&mut self.adaptive, self.pending.take()) {
             adaptive.complete(candidate);
-        }
-        if let Some(exact) = feedback.exact_rows {
-            self.controller
-                .completed(rows, exact, feedback.kth_lower.is_some());
         }
         self.meter.rows(rows);
         self.counters.eligible += rows;

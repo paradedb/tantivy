@@ -176,14 +176,6 @@ pub(crate) enum AccessPath {
 /// `segment_*` fields are per segment.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct ProbeStats {
-    /// Completed quantized clusters, in probe order, when tracing is enabled.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub clusters: Vec<crate::vector::search::scan::CompletedCluster>,
-    /// First completed-cluster ordinal at which the rerank stopping rule fired.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rerank_stop_at: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quantized_recall_stop_at: Option<usize>,
     /// Rows admitted and scored at layer 0 or exactly.
     pub candidates_scored: usize,
     /// Rows the routed source admitted and charged.
@@ -322,8 +314,6 @@ impl ProbeStats {
     fn ivf(plan: PlanReport, source: SourceReport, scan: ScanReport, totals: &StageTotals) -> Self {
         let full_precision = scan.layers.is_empty();
         let mut stats = Self {
-            clusters: scan.clusters,
-            quantized_recall_stop_at: scan.quantized_recall_stop_at,
             candidates_scored: scan.candidates_scored,
             exact_rows: scan.exact_rows,
             layers: LayerProbeStatsSet(
@@ -356,7 +346,7 @@ impl ProbeStats {
             SourceReport::Router(routed) => stats.record_routed(routed),
             SourceReport::Matches(matches) => stats.record_matches(matches),
         }
-        if stats.quantized_recall_stop_at.is_some() {
+        if scan.recall_reached {
             stats.termination = ProbeTermination::QuantizedRecall;
         }
         stats.record_io(totals);
@@ -393,7 +383,6 @@ impl ProbeStats {
             RouterMetrics::Exact { visited_count } => visited_count,
         };
         self.termination = probe.termination;
-        self.rerank_stop_at = probe.rerank_stop_at;
         self.work_charged = probe.work_charged;
         self.work_budget = probe.work_budget;
         self.recall_estimate = probe.recall_estimate;

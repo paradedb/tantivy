@@ -47,8 +47,6 @@ impl ClusterRows<'_> {
 /// What the scan reports to a source after each cluster.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Feedback {
-    /// Exact rows in the just-completed cascade; absent for deferred or exact scans.
-    pub(crate) exact_rows: Option<usize>,
     /// The pruning threshold: the k-th largest lower endpoint, once `k` rows are in.
     pub(crate) kth_lower: Option<f32>,
     /// The APS cover threshold: never above the k-th best estimate, so it never prunes.

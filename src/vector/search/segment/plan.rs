@@ -79,12 +79,11 @@ impl SegmentPlan {
         // Capacity counts native docs as written: deleted rows still charge on first touch.
         let (budget, n_avg, x) = params.resolved_work_budget(clusters, index.num_docs())?;
         debug_assert!(n_avg > 0.0);
-        let located = if params.quantized_recall.is_some() && params.located == LocatedPath::Auto {
-            LocatedPath::Off
+        let cap = if params.quantized_recall.is_some() && params.located == LocatedPath::Auto {
+            clusters / 2
         } else {
-            params.located
+            located_cap(params.located, max_doc, budget, n_avg, x)
         };
-        let cap = located_cap(located, max_doc, budget, n_avg, x);
         let source = {
             let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
             collect_segment_filter(weight, segment, max_doc, cap)?
@@ -360,6 +359,61 @@ mod tests {
                 (cap, path),
                 "matches={matches}"
             );
+        }
+        let adaptive_cap = ivf.num_clusters() / 2;
+        for (max_probe_fraction, min_probe_clusters) in [(0.000001, 0), (1.0, usize::MAX)] {
+            let adaptive = ProbeParams {
+                quantized_recall: Some(crate::vector::QuantizedRecallParams {
+                    target: 0.95,
+                    recall_exponent: 1.5,
+                }),
+                max_probe_fraction,
+                min_probe_clusters,
+                ..auto.clone()
+            };
+            for (located, matches, cap, path) in [
+                (
+                    LocatedPath::Auto,
+                    adaptive_cap,
+                    adaptive_cap,
+                    AccessPath::Located,
+                ),
+                (
+                    LocatedPath::Auto,
+                    adaptive_cap + 1,
+                    adaptive_cap,
+                    AccessPath::Routed,
+                ),
+                (LocatedPath::Auto, 0, adaptive_cap, AccessPath::Routed),
+                (
+                    LocatedPath::Auto,
+                    segment.max_doc() as usize,
+                    adaptive_cap,
+                    AccessPath::Routed,
+                ),
+                (LocatedPath::Off, adaptive_cap, 0, AccessPath::Routed),
+                (capped(9).located, 9, 9, AccessPath::Located),
+            ] {
+                let weight = DocsWeight {
+                    max_doc: segment.max_doc(),
+                    docs: (0..matches as DocId).collect(),
+                };
+                let (_, stats) = fixture.run_segment(
+                    0,
+                    &weight,
+                    &[0.0, 0.0],
+                    10,
+                    ProbeParams {
+                        located,
+                        ..adaptive.clone()
+                    },
+                )?;
+                assert_eq!(
+                    (stats.located_cap, stats.access_path),
+                    (cap, path),
+                    "matches={matches}"
+                );
+            }
         }
         // Every mode reports its cap, and an unfiltered query routes.
         for (located, cap) in [(LocatedPath::Off, 0), (capped(9).located, 9)] {

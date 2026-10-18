@@ -72,7 +72,6 @@ fn armed(k: usize, kth: f32) -> impl Fn(usize) -> Feedback {
     move |rows| {
         let kth = (rows >= k).then_some(kth);
         Feedback {
-            exact_rows: None,
             kth_lower: kth,
             kth_estimate: kth,
         }
@@ -462,7 +461,6 @@ fn gate_never_skips_a_true_member() -> crate::Result<()> {
         let kth = oracle[k - 1].0;
         let walk = walk_fixture(&fixture, &AllQuery, &query, k, exhaustive_params(5), |_| {
             Feedback {
-                exact_rows: None,
                 kth_lower: Some(kth),
                 kth_estimate: Some(kth),
             }
