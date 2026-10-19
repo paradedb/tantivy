@@ -1395,7 +1395,7 @@ mod tests {
     fn expansion_preserves_normal_routing_and_eventually_covers_every_member() {
         let n = 256;
         let data = line_data(n);
-        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let clusterer = SuperKMeansLevelClusterer::default();
         let (index, _) = StackedIvfBuilder::new(data, n, 2, &clusterer, test_config(4)).build();
         let query = [7.5, 0.0];
         let (normal, stats) = index.search(&query, n, 1.0, Metric::L2);

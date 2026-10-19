@@ -26,6 +26,7 @@ use crate::error::DataCorruption;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource, Feedback};
+use crate::vector::search::interval::{LowerEndpoint, Threshold};
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery};
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::quantized::{QuantizedFieldReader, ReadScratch};
@@ -500,6 +501,8 @@ where
             }
         }
         let state = self.quantized.as_mut().unwrap();
+        self.report.layers[0].scored = state.layer0_scored;
+        self.report.layers[0].admission_pruned = state.layer0_admission_pruned;
         state.candidates.band(&mut self.exact.bound);
         state.candidates.order_by_cluster(&mut self.by_cluster);
         self.score_shortlist()

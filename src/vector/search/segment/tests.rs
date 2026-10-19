@@ -113,6 +113,7 @@ fn adaptive_cascade_matches_oracle_and_prefix_replay() -> crate::Result<()> {
                                             ..params.clone()
                                         },
                                         Some(plan),
+                                        true,
                                     )
                                 })?;
                                 let prefix =
@@ -132,6 +133,7 @@ fn adaptive_cascade_matches_oracle_and_prefix_replay() -> crate::Result<()> {
                                             k,
                                             params.clone(),
                                             Some(plan),
+                                            true,
                                         )
                                     })?;
                                 assert_eq!(active, replay);
