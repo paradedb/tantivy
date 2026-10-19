@@ -68,6 +68,26 @@ impl From<usize> for ClusterId {
 /// Default `nprobe_fraction` for parent levels (L1, L2, …).
 pub(crate) const PARENT_NPROBE_FRACTION: f32 = 0.25;
 
+/// Floor of [`member_budget`], as a fraction of the bottom router level's members.
+pub(crate) const MEMBER_BUDGET_FLOOR_FRACTION: f64 = 0.10;
+
+/// Members the bottom router level scores before it stops opening lists: `multiplier × k`,
+/// clamped to [`MEMBER_BUDGET_FLOOR_FRACTION`] and [`PARENT_NPROBE_FRACTION`] of its `members`
+/// and never below `k`. Lists are scanned whole, so the scan ends at the first list boundary at
+/// or past the budget.
+pub(crate) fn member_budget(members: usize, k: usize, multiplier: f32) -> usize {
+    let fraction = |f: f64| (members as f64 * f).ceil() as usize;
+    let wanted = (k as f64 * f64::from(multiplier))
+        .ceil()
+        .min(usize::MAX as f64) as usize;
+    wanted
+        .clamp(
+            fraction(MEMBER_BUDGET_FLOOR_FRACTION),
+            fraction(f64::from(PARENT_NPROBE_FRACTION)),
+        )
+        .max(k)
+}
+
 /// Recall target used when this level searches its parent.
 pub(crate) const PARENT_RECALL_TARGET: f32 = 0.99;
 
@@ -911,6 +931,19 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         recall: f32,
         metric: Metric,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
+        self.search_within(query, k, recall, metric, None)
+    }
+
+    /// [`search`](Self::search) that stops opening this level's lists once it has scored
+    /// `member_budget` members here (see [`member_budget`]). Parents always search without one.
+    pub(crate) fn search_within(
+        &self,
+        query: &[S::Elem],
+        k: usize,
+        recall: f32,
+        metric: Metric,
+        member_budget: Option<usize>,
+    ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
         if k == 0 {
             return (Vec::new(), StackedSearchStats::default());
         }
@@ -967,9 +1000,15 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         });
 
         let mut result = BinaryHeap::with_capacity(k);
+        let mut scored_here = 0;
         for c in &candidates {
-            stats.members_scored += self.scan_cluster(query, metric, c.node, &mut result, k);
+            let scanned = self.scan_cluster(query, metric, c.node, &mut result, k);
+            stats.members_scored += scanned;
             stats.lists_scanned += 1;
+            scored_here += scanned;
+            if member_budget.is_some_and(|budget| scored_here >= budget) {
+                break;
+            }
             let Some(estimator) = estimator.as_mut() else {
                 continue;
             };
@@ -1217,6 +1256,64 @@ mod tests {
         assert_eq!(StackedIvfConfig::nlist_for(65_536), 256);
         assert_eq!(StackedIvfConfig::nlist_for(1_000_000), 1_000);
         assert_eq!(StackedIvfConfig::nlist_for(400_000), 633);
+    }
+
+    /// `c × k` is clamped to 10%..25% of the members and never drops below `k`.
+    #[test]
+    fn test_member_budget_clamps() {
+        assert_eq!(member_budget(24_000, 1000, 3.0), 3000);
+        assert_eq!(member_budget(24_000, 1000, 2.0), 2400);
+        assert_eq!(member_budget(24_000, 20, 3.0), 2400);
+        assert_eq!(member_budget(24_000, 1000, 8.0), 6000);
+        assert_eq!(member_budget(24_000, 1000, f32::MAX), 6000);
+        assert_eq!(member_budget(24_000, 10_000, 3.0), 10_000);
+        assert_eq!(member_budget(10, 1, 1.0), 1);
+    }
+
+    /// The budget stops the bottom level at the first list boundary past it, while its parent
+    /// still scans everything; the nearest members are the same as the full scan's.
+    #[test]
+    fn test_member_budget_stops_bottom_level_only() {
+        let dim = 2;
+        let n = 2048;
+        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let config = StackedIvfConfig {
+            nprobe_fraction: PARENT_NPROBE_FRACTION,
+            ..test_config(16)
+        };
+        let (mut index, _) =
+            StackedIvf::<InMemoryStore>::build(line_data(n), n, dim, &clusterer, config);
+        let parent_cfg = index.config.for_parent();
+        index.add_level(&clusterer, parent_cfg).expect("L1");
+        let parent = index.parent.as_deref().expect("L1");
+        assert!(parent.parent.is_none());
+        let parent_cost = parent.nlist() + parent.vectors.len();
+
+        let query = [0.0f32, 0.0];
+        let k = 16;
+        let budget = member_budget(n, k, 2.0);
+        let (full_hits, full) = index.search(&query, k, 1.0, Metric::L2);
+        let (hits, stats) = index.search_within(&query, k, 1.0, Metric::L2, Some(budget));
+
+        let scored_here = stats.members_scored - parent_cost;
+        let largest_list = index
+            .offsets
+            .iter()
+            .map(|&(start, end)| (end - start) as usize)
+            .max()
+            .unwrap();
+        assert!(
+            full.members_scored - parent_cost > budget,
+            "fixture must exceed the budget"
+        );
+        assert!(scored_here >= budget, "{scored_here} < {budget}");
+        assert!(
+            scored_here < budget + largest_list,
+            "{scored_here} vs {budget}"
+        );
+        assert!(stats.lists_scanned < full.lists_scanned);
+        let nodes = |hits: &[Candidate<ClusterId>]| hits.iter().map(|h| h.node).collect::<Vec<_>>();
+        assert_eq!(nodes(&hits), nodes(&full_hits));
     }
 
     #[test]

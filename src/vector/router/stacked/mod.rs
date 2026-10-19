@@ -13,8 +13,8 @@ use crate::vector::router::stacked::aps::{
     supports_metric as aps_supports_metric, CandidateRows, RecallEstimator, APS_MAX_DIM,
 };
 use crate::vector::router::stacked::levels::{
-    ClusterId, InMemoryStore, LazyStore, StackedIvf, StackedIvfBuilder, StackedIvfConfig,
-    StackedSearchStats, SuperKMeansLevelClusterer, PARENT_NPROBE_FRACTION,
+    member_budget, ClusterId, InMemoryStore, LazyStore, StackedIvf, StackedIvfBuilder,
+    StackedIvfConfig, StackedSearchStats, SuperKMeansLevelClusterer, PARENT_NPROBE_FRACTION,
 };
 use crate::vector::router::{RouterMetrics, RoutingParams};
 use crate::TantivyError;
@@ -113,7 +113,13 @@ pub(super) fn rank(
     // lists avoids the classic IVF boundary miss; capping the heap (and
     // thus `candidate_count`) is what ties the returned set to probe.
     let k = params.k.clamp(1, index.vectors.len().max(1));
-    let (ranked, stats) = index.search(query, k, recall, metric);
+    // APS already sizes the scan to its recall target; the budget only replaces the fixed
+    // fraction's full scan of the parent's lists.
+    let budget = params
+        .member_budget_multiplier
+        .filter(|_| recall >= 1.0)
+        .map(|multiplier| member_budget(index.vectors.len(), k, multiplier));
+    let (ranked, stats) = index.search_within(query, k, recall, metric, budget);
     let candidate_count = ranked.len();
     Ranking {
         ranked: ranked.into_iter(),
