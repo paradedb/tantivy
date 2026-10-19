@@ -311,7 +311,7 @@ fn main() {
     let truth = ground_truth(base, n, queries, n_queries, d, TOP_K);
     println!("{:.1}s", t0.elapsed().as_secs_f64());
 
-    let clusterer = SuperKMeansLevelClusterer;
+    let clusterer = SuperKMeansLevelClusterer::default();
     let config = StackedIvfConfig {
         branching_factor: BRANCHING_FACTOR,
         ..Default::default()
