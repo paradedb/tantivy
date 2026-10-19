@@ -7,8 +7,8 @@ use std::ops::Range;
 
 use crate::schema::Metric;
 use crate::vector::quantization::{
-    corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix,
-    quantized_model_sigma, refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError,
+    corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix, quantized_sigma,
+    refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError,
 };
 use crate::vector::search::scan::columns::Columns;
 use crate::vector::search::scan::layer_read::Decoded;
@@ -186,16 +186,20 @@ pub(crate) fn combine_refine(
 
 // --- Sigma ---
 
-/// Sets the sigmas at `at`: each row's data-model sigma, widened by its arithmetic error.
+/// Sets the sigmas at `at`: each row's data-model and arithmetic variance under one square root.
+/// The loop stays free of calls so it vectorizes.
 #[inline(always)]
 fn fill_sigmas(ctx: &CombineCtx, error_ratios: &[f32], columns: &mut Columns, at: Range<usize>) {
     let sigmas = &mut columns.sigmas[at.clone()];
     let residual_norms_squared = &columns.residual_norm_squared[at.clone()];
     let gammas = &columns.gammas[at.clone()];
     let sign_query_error_terms = &columns.sign_query_error_terms[at.clone()];
+    let arithmetic_variances = &columns.arithmetic_variances[at.clone()];
+    let raw_prefixes = &columns.raw_prefixes[at.clone()];
+    let bases = &columns.bases[at.clone()];
     debug_assert_eq!(sigmas.len(), error_ratios.len());
     for (index, sigma) in sigmas.iter_mut().enumerate() {
-        *sigma = quantized_model_sigma(
+        *sigma = quantized_sigma(
             ctx.metric,
             ctx.dimension,
             residual_norms_squared[index],
@@ -203,16 +207,7 @@ fn fill_sigmas(ctx: &CombineCtx, error_ratios: &[f32], columns: &mut Columns, at
             gammas[index],
             ctx.query_norm_squared,
             sign_query_error_terms[index],
-        );
-    }
-    let arithmetic_variances = &columns.arithmetic_variances[at.clone()];
-    let raw_prefixes = &columns.raw_prefixes[at.clone()];
-    let bases = &columns.bases[at.clone()];
-    for (index, sigma) in sigmas.iter_mut().enumerate() {
-        *sigma = arithmetic_variances[index].sigma(
-            ctx.metric,
-            *sigma,
-            gammas[index],
+            arithmetic_variances[index],
             raw_prefixes[index],
             bases[index],
         );
@@ -339,7 +334,26 @@ mod tests {
         assert_eq!(columns.residual_norm_squared, [7.0]);
         assert_eq!(columns.sign_query_error_terms, [117.0]);
         let variance: f32 = 7.0 * 0.5 * 11.0 + 4.0 * 117.0;
-        assert!((columns.sigmas[0] - 2.0 * 1.15 * variance.sqrt()).abs() < 1e-5);
+        // The model variance is one non-negative summand under the width's square root and the
+        // pad multiplies by at least one, so it bounds sigma from below; the stored columns and
+        // the combine context re-evaluate the width exactly.
+        assert!(columns.sigmas[0] >= 2.0 * 1.15 * variance.sqrt());
+        assert_eq!(
+            columns.sigmas[0].to_bits(),
+            quantized_sigma(
+                Metric::L2,
+                1,
+                columns.residual_norm_squared[0],
+                0.5,
+                columns.gammas[0],
+                11.0,
+                columns.sign_query_error_terms[0],
+                columns.arithmetic_variances[0],
+                columns.raw_prefixes[0],
+                columns.bases[0],
+            )
+            .to_bits()
+        );
     }
 
     /// A refining L2 gamma corrects only the raw prefix, and refining one candidate leaves the
@@ -373,8 +387,31 @@ mod tests {
         assert_eq!(columns.estimates, [22.0, 44.0]);
         assert_eq!(columns.residual_norm_squared, [9.0, 4.0]);
         assert_eq!(columns.sign_query_error_terms, [99.0, 53.0]);
-        assert!((columns.sigmas[0] - 2.0 * 1.15 * 427.5_f32.sqrt()).abs() < 1e-5);
-        assert!((columns.sigmas[1] - 2.0 * 1.15 * 136.25_f32.sqrt()).abs() < 1e-5);
+        // The model variances are non-negative summands under each width's square root and the
+        // pad multiplies by at least one, so they bound the sigmas from below; the stored
+        // columns and each refinement's own context re-evaluate the widths exactly.
+        assert!(columns.sigmas[0] >= 2.0 * 1.15 * 427.5_f32.sqrt());
+        assert!(columns.sigmas[1] >= 2.0 * 1.15 * 136.25_f32.sqrt());
+        for (index, (error_ratio, query_norm_squared)) in
+            [(0.5, 7.0), (0.25, 17.0)].into_iter().enumerate()
+        {
+            assert_eq!(
+                columns.sigmas[index].to_bits(),
+                quantized_sigma(
+                    Metric::L2,
+                    1,
+                    columns.residual_norm_squared[index],
+                    error_ratio,
+                    columns.gammas[index],
+                    query_norm_squared,
+                    columns.sign_query_error_terms[index],
+                    columns.arithmetic_variances[index],
+                    columns.raw_prefixes[index],
+                    columns.bases[index],
+                )
+                .to_bits()
+            );
+        }
     }
 
     fn assert_diagnostic_prefix_matches_integrated(metric: Metric) {
@@ -446,18 +483,15 @@ mod tests {
         .unwrap();
         let diagnostic_sign_query_error_term =
             first.scales[0] * first.scales[0] * query.query_error_squared(0) as f32;
-        let diagnostic_first_sigma = diagnostic_arithmetic.sigma(
+        let diagnostic_first_sigma = quantized_sigma(
             metric,
-            quantized_model_sigma(
-                metric,
-                DIM,
-                residual_norm_squared,
-                first_error_ratio,
-                first_gamma,
-                score_query_norm_squared,
-                diagnostic_sign_query_error_term,
-            ),
+            DIM,
+            residual_norm_squared,
+            first_error_ratio,
             first_gamma,
+            score_query_norm_squared,
+            diagnostic_sign_query_error_term,
+            diagnostic_arithmetic,
             diagnostic_first_raw,
             base,
         );
@@ -514,18 +548,15 @@ mod tests {
             &mut diagnostic_arithmetic,
         )
         .unwrap();
-        let diagnostic_refined_sigma = diagnostic_arithmetic.sigma(
+        let diagnostic_refined_sigma = quantized_sigma(
             metric,
-            quantized_model_sigma(
-                metric,
-                DIM,
-                residual_norm_squared,
-                refinement_error_ratio,
-                refinement_gamma,
-                score_query_norm_squared,
-                diagnostic_sign_query_error_term,
-            ),
+            DIM,
+            residual_norm_squared,
+            refinement_error_ratio,
             refinement_gamma,
+            score_query_norm_squared,
+            diagnostic_sign_query_error_term,
+            diagnostic_arithmetic,
             diagnostic_refined_raw,
             base,
         );
