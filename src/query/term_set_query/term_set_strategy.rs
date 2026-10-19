@@ -105,6 +105,13 @@ pub struct TermSetStrategyConfig {
     /// the D=1 case where every key maps to a distinct block.
     pub bitset_max_density_multi: f64,
     /// Subsequent-column `BitsetFromPostings` threshold: `K' · D / C` cutoff.
+    /// Default `1/2000 = 0.0005` — in the subsequent-column branch (`C < N`),
+    /// `BitsetFromPostings` still pays the full SSTable `dict.get` zstd block
+    /// decompression and postings decode across `K'` keys regardless of how small
+    /// `C` is, whereas `TermSetDocSet::new_unpositioned` only performs `C`
+    /// in-memory fast-field point probes (`column.values_for_doc` + `FxHashSet`
+    /// lookup). Matching `bitset_max_density_unique` (`1/2000`) ensures bitset is
+    /// only chosen when `K' · D` is at least ~2000× smaller than `C`.
     pub subsequent_bitset_max_density: f64,
     /// Optional sink for the per-segment strategy choice. When `Some`,
     /// `select_strategy` writes the chosen `StrategyTag` (as `u8`) on its way
@@ -118,13 +125,11 @@ impl Default for TermSetStrategyConfig {
     fn default() -> Self {
         Self {
             gallop_enabled: true,
-            // Defaults are bench-derived. See per-field doc-comments for the
-            // calibration story. `subsequent_bitset_max_density` is an
-            // unverified starting estimate — no bench data for the
-            // subsequent-column branch yet.
+            // Defaults are bench- and profile-derived. See per-field doc-comments
+            // for the calibration story.
             bitset_max_density_unique: 1.0 / 2000.0,
             bitset_max_density_multi: 1.0 / 200.0,
-            subsequent_bitset_max_density: 1.0 / 4.0,
+            subsequent_bitset_max_density: 1.0 / 2000.0,
             strategy_sink: None,
         }
     }
@@ -157,7 +162,6 @@ pub enum TermSetStrategy {
     ///   - `n == 0` (empty segment)
     ///   - `term_set.is_empty()` (no query terms)
     ///   - `k_prime == 0` (all query terms pruned outside `[min, max]`)
-    ///   - `candidate_size == 0` (subsequent-column branch with empty upstream)
     ///
     /// The dispatch site emits an `EmptyScorer` for this variant —
     /// returning `LinearScan` here instead would have the dispatch
@@ -214,12 +218,12 @@ pub struct PlannerInputs<'a> {
 /// 2. Gallop  (sorted-segment fast path)
 ///      inputs.fast_available                       AND
 ///      cfg.gallop_enabled                          AND
-///      inputs.candidate_size is None or == n       AND
+///      inputs.candidate_size is None               AND
 ///      cardinality in {Full, Optional}             AND
 ///      reader.sort_by_field matches field_name     →  Gallop
 ///
-/// 3. Subsequent-column branch  (candidate_size < n)
-///      candidate_size == 0                         →  Empty
+/// 3. Subsequent-column branch  (candidate_size is Some(c))
+///      C = c.clamp(1, n)
 ///      K' · D / C <=                                  BitsetFromPostings
 ///        cfg.subsequent_bitset_max_density         →
 ///      otherwise                                   →  terminal_fallback()
@@ -278,7 +282,7 @@ pub struct PlannerInputs<'a> {
 ///   - `cfg.gallop_enabled`                    default true
 ///   - `cfg.bitset_max_density_unique`         default 1/2000 = 0.0005
 ///   - `cfg.bitset_max_density_multi`          default 1/200  = 0.005
-///   - `cfg.subsequent_bitset_max_density`     default 1/4    = 0.25
+///   - `cfg.subsequent_bitset_max_density`     default 1/2000 = 0.0005
 ///
 /// # Strategy sink for EXPLAIN
 ///
@@ -288,6 +292,8 @@ pub struct PlannerInputs<'a> {
 /// planner keeps the per-segment hot path uncluttered when no sink
 /// is configured. `StrategyTag::Automaton` is included alongside the
 /// fast-field-bound tags so a single sink covers both dispatch paths.
+///
+/// `term_set` must be sorted ascending with no duplicates.
 pub fn select_strategy(
     reader: &SegmentReader,
     column: &Column<u64>,
@@ -316,33 +322,35 @@ fn select_strategy_inner(
     term_set: &[u64],
     cfg: &TermSetStrategyConfig,
 ) -> TermSetStrategy {
+    debug_assert!(term_set.windows(2).all(|w| w[0] < w[1]));
+
     // --- Edge cases: nothing to do.
     let n = column.num_docs();
     if n == 0 || term_set.is_empty() {
         return TermSetStrategy::Empty;
     }
-    let k_prime = k_prime_in_range(term_set, column);
-    if k_prime == 0 {
+    let range = sorted_range_in_column(term_set, column);
+    if range.is_empty() {
         // All query terms outside [min, max]. Returning `LinearScan` would
         // walk every doc in the segment doing hashset probes guaranteed to
         // miss; `Empty` lets the dispatch site emit `EmptyScorer` instead.
         return TermSetStrategy::Empty;
     }
+    let pruned_terms = &term_set[range];
+    let k_prime = pruned_terms.len() as u32;
 
     // Gallop: sorted-segment fast path. Dominates whenever the segment
     // is sorted by the queried field. Skipped when `!fast_available`
     // because Gallop walks a `Column<u64>`.
     if inputs.fast_available {
-        if let Some(strategy) = try_gallop(reader, column, &inputs, term_set, cfg) {
+        if let Some(strategy) = try_gallop(reader, column, &inputs, pruned_terms, cfg) {
             return strategy;
         }
     }
 
-    // --- Subsequent-column branch (upstream filter narrowed work to c < n).
-    if let Some(c) = inputs.candidate_size.filter(|&c| c < n) {
-        if c == 0 {
-            return TermSetStrategy::Empty;
-        }
+    // --- Subsequent-column branch (upstream candidate probing).
+    if let Some(c) = inputs.candidate_size {
+        let c = c.clamp(1, n);
         let d = inputs.avg_docs_per_term.unwrap_or(1) as u64;
         let kd = (k_prime as u64).saturating_mul(d) as f64;
         if kd / (c as f64) <= cfg.subsequent_bitset_max_density {
@@ -385,40 +393,35 @@ fn terminal_fallback(inputs: &PlannerInputs<'_>) -> TermSetStrategy {
     }
 }
 
-/// Count the query terms that survive the `[column.min, column.max]`
-/// range prune — `K'` in the dispatcher's gate formulas. Public-in-crate
-/// so the dispatch site (`FastFieldTermSetWeight::scorer`) can pre-compute
-/// the density gate's left-hand-side without re-running the filter or
-/// having to call the full planner first. Keeping a single definition
-/// here ensures dispatch and planner stay consistent by construction.
-///
-/// Duplicates are *not* removed: counts occurrences. Production input
-/// flows through HashSet-derived sources so duplicates are rare; the
-/// Gallop branch dedups defensively when it commits to that strategy.
-pub(crate) fn k_prime_in_range(term_set: &[u64], column: &Column<u64>) -> u32 {
+/// Return the index range `lo_idx..hi_idx` of `sorted_terms` (assumed sorted
+/// ascending) whose elements fall within `[column.min_value(), column.max_value()]`.
+pub(crate) fn sorted_range_in_column(
+    sorted_terms: &[u64],
+    column: &Column<u64>,
+) -> std::ops::Range<usize> {
     let lo = column.min_value();
     let hi = column.max_value();
-    term_set.iter().filter(|&&v| v >= lo && v <= hi).count() as u32
+    if lo > hi || sorted_terms.is_empty() {
+        return 0..0;
+    }
+    let lo_idx = sorted_terms.partition_point(|&v| v < lo);
+    let hi_idx = lo_idx + sorted_terms[lo_idx..].partition_point(|&v| v <= hi);
+    lo_idx..hi_idx
 }
 
 /// Gallop admissibility: returns `Some(Gallop { .. })` when the segment is
 /// sorted by `field_name`, the column shape supports gallop, and no upstream
-/// filter has narrowed the work. Builds the pruned+sorted+deduped
-/// `sorted_terms` Vec only on commit. `cfg.gallop_enabled` is the only
-/// configurable gate.
+/// filter has narrowed the work. Copies the already-pruned+sorted+deduped
+/// `pruned_terms` slice into `sorted_terms` only on commit. `cfg.gallop_enabled`
+/// is the only configurable gate.
 fn try_gallop(
     reader: &SegmentReader,
     column: &Column<u64>,
     inputs: &PlannerInputs<'_>,
-    term_set: &[u64],
+    pruned_terms: &[u64],
     cfg: &TermSetStrategyConfig,
 ) -> Option<TermSetStrategy> {
-    if !cfg.gallop_enabled {
-        return None;
-    }
-    let n = column.num_docs();
-    let candidate_eq_n = inputs.candidate_size.is_none_or(|c| c == n);
-    if !candidate_eq_n {
+    if !cfg.gallop_enabled || inputs.candidate_size.is_some() {
         return None;
     }
     if !matches!(
@@ -431,23 +434,9 @@ fn try_gallop(
         .sort_by_field()
         .filter(|sbf| sbf.field == inputs.field_name)
         .map(|sbf| sbf.order)?;
-    // Gallop tolerates duplicate input terms (the second occurrence finds
-    // an empty range and skips), but each duplicate still pays two
-    // `gallop_search_sorted` probes. Production input is HashSet-derived
-    // so dedup is usually a no-op; `TermSetQuery::new` doesn't enforce
-    // uniqueness on its input, so we dedup defensively here.
-    let lo = column.min_value();
-    let hi = column.max_value();
-    let mut sorted_terms: Vec<u64> = term_set
-        .iter()
-        .copied()
-        .filter(|&v| v >= lo && v <= hi)
-        .collect();
-    sorted_terms.sort_unstable();
-    sorted_terms.dedup();
     Some(TermSetStrategy::Gallop {
         sort_order: order,
-        sorted_terms,
+        sorted_terms: pruned_terms.to_vec(),
     })
 }
 
@@ -619,7 +608,7 @@ mod tests {
 
     #[test]
     fn select_returns_linear_scan_for_subsequent_column_when_kd_exceeds_threshold() {
-        // Subsequent column with c=100, K·D/c = 50/100 = 0.5 > 0.25 →
+        // Subsequent column with c=100, K·D/c = 50/100 = 0.5 > 1/2000 →
         // bitset rejected, falls through to LinearScan.
         let n: u64 = 4096;
         let (index, _field, name) = build_index(n, None, |i| i);
@@ -641,8 +630,8 @@ mod tests {
 
     #[test]
     fn select_returns_bitset_from_postings_when_subsequent_column_kd_below_threshold() {
-        // Subsequent column: K·D / C < subsequent_bitset_max_density.
-        // K·D / C = 50 / 1024 ≈ 0.0488 < 1/4 = 0.25 → BitsetFromPostings.
+        // Subsequent column: K·D / C <= subsequent_bitset_max_density (1/2000).
+        // K·D / C = 1 / 2048 ≈ 0.000488 <= 0.0005 → BitsetFromPostings.
         let n: u64 = 4096;
         let (index, _field, name) = build_index(n, None, |i| i);
         let (reader, column) = open_column(&index, &name);
@@ -651,11 +640,11 @@ mod tests {
             &column,
             PlannerInputs {
                 field_name: &name,
-                candidate_size: Some(1024),
+                candidate_size: Some(2048),
                 avg_docs_per_term: None,
                 fast_available: true,
             },
-            &term_set(0..50),
+            &term_set(0..1),
             &TermSetStrategyConfig::default(),
         );
         assert_eq!(strat, TermSetStrategy::BitsetFromPostings);
