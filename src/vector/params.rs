@@ -28,7 +28,7 @@ pub struct ProbeParams {
     /// path: it stops opening lists once it has scored `c × k` segment centroids, `k` being the
     /// clusters the budget buys, clamped to 10%..25% of the segment's centroids. Higher router
     /// levels keep their fixed fractions. `None` scans every list the parent level returns; a
-    /// value must be finite and positive. Default `None`.
+    /// value must be finite and positive. Default [`DEFAULT_ROUTER_MEMBER_BUDGET_MULTIPLIER`].
     pub router_member_budget_multiplier: Option<f32>,
     /// Recall target for each segment's cluster scan, in `(0, 1]`, estimated by the Quake APS;
     /// `1.0` leaves the budget as the only bound. Stacked-router segments only; forced to `1.0`
@@ -84,7 +84,7 @@ impl Default for ProbeParams {
             max_probe_fraction: 0.01,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
             router_recall_target: DEFAULT_ROUTER_RECALL,
-            router_member_budget_multiplier: None,
+            router_member_budget_multiplier: Some(DEFAULT_ROUTER_MEMBER_BUDGET_MULTIPLIER),
             recall_target: 1.0,
             exact_plan: true,
             located: LocatedPath::Auto,
@@ -97,6 +97,9 @@ pub(crate) const MIN_PROBE_CLUSTERS: usize = 16;
 
 /// Default [`ProbeParams::router_recall_target`].
 pub const DEFAULT_ROUTER_RECALL: f32 = 0.99;
+
+/// Default [`ProbeParams::router_member_budget_multiplier`]; provisional pending a sweep.
+pub const DEFAULT_ROUTER_MEMBER_BUDGET_MULTIPLIER: f32 = 3.0;
 
 impl ProbeParams {
     /// The number of clusters the stacked router is asked to rank for a
