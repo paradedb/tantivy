@@ -2,6 +2,7 @@
 //! fractions or the Quake APS.
 
 pub(crate) mod aps;
+pub(crate) mod last_level;
 pub(crate) mod levels;
 
 use crate::directory::FileSlice;
@@ -113,7 +114,17 @@ pub(super) fn rank(
     // lists avoids the classic IVF boundary miss; capping the heap (and
     // thus `candidate_count`) is what ties the returned set to probe.
     let k = params.k.clamp(1, index.vectors.len().max(1));
-    let (ranked, stats) = index.search(query, k, recall, metric);
+    // `recall` is what geometric APS sees (1 above 128 dims). The bottom-level
+    // `auto` target keeps the caller's r90/r95/r99.
+    dump_router(index);
+    // Equal targets take the public `search` entry (benches and direct callers).
+    // They differ when geometric APS forced recall to 1; `auto` still needs the
+    // caller's r90/r95/r99.
+    let (ranked, stats) = if params.recall == recall {
+        index.search(query, k, recall, metric)
+    } else {
+        index.search_with_requested_recall(query, k, recall, metric, params.recall)
+    };
     let candidate_count = ranked.len();
     Ranking {
         ranked: ranked.into_iter(),
@@ -179,6 +190,49 @@ impl Ranking {
             recall_target: self.recall_target,
         }
     }
+}
+
+/// When `/tmp/tv_router_dump` contains a directory path, the first search
+/// writes every router level's offsets and f32 rows there.
+fn dump_router(index: &StackedIvf<LazyStore>) {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    let Ok(dir) = std::fs::read_to_string("/tmp/tv_router_dump") else {
+        return;
+    };
+    let dir = dir.trim().to_string();
+    if dir.is_empty() || DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let mut level = Some(index);
+    let mut depth = 0usize;
+    while let Some(current) = level {
+        let mut offsets = String::new();
+        for (start, end) in &current.offsets {
+            offsets.push_str(&format!("{start} {end}\n"));
+        }
+        let _ = std::fs::write(format!("{dir}/level{depth}_offsets.txt"), offsets);
+        for (name, store) in [
+            ("vectors", &current.vectors),
+            ("centroids", &current.centroids),
+        ] {
+            let mut rows = Vec::new();
+            for row in 0..store.len() {
+                if store.extend_with_row(row as u32, &mut rows).is_err() {
+                    break;
+                }
+            }
+            if let Ok(mut file) = std::fs::File::create(format!("{dir}/level{depth}_{name}.f32")) {
+                let bytes: Vec<u8> = rows.iter().flat_map(|value| value.to_le_bytes()).collect();
+                let _ = file.write_all(&bytes);
+            }
+        }
+        level = current.parent.as_deref();
+        depth += 1;
+    }
+    let _ = std::fs::write(format!("{dir}/levels.txt"), format!("{depth}\n"));
 }
 
 impl Iterator for Ranking {

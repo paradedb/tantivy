@@ -31,6 +31,9 @@ use crate::vector::router::arena::{FileSliceArena, VectorArena};
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::aps;
 use crate::vector::router::stacked::aps::RecallEstimator;
+use crate::vector::router::stacked::last_level::{
+    self, LastLevelRule, LastLevelStop, ParentProbe, StopReason, Stopper,
+};
 use crate::vector::VectorElement;
 
 /// Row index into a level's centroid or member arena.
@@ -86,6 +89,9 @@ pub struct StackedIvfConfig {
     /// `1.0` makes the parent scan its full candidate set (exact routing
     /// when the parent is the top level).
     pub parent_recall_target: f32,
+    /// Early stop for the bottom level (the one whose children are leaf
+    /// clusters). Default is stock. A rule file overrides this per query.
+    pub last_level: LastLevelStop,
 }
 
 impl Default for StackedIvfConfig {
@@ -94,6 +100,7 @@ impl Default for StackedIvfConfig {
             nprobe_fraction: 0.02,
             branching_factor: DEFAULT_BRANCHING_FACTOR,
             parent_recall_target: PARENT_RECALL_TARGET,
+            last_level: LastLevelStop::default(),
         }
     }
 }
@@ -104,6 +111,8 @@ impl StackedIvfConfig {
             nprobe_fraction: PARENT_NPROBE_FRACTION,
             branching_factor: self.branching_factor,
             parent_recall_target: self.parent_recall_target,
+            // Only the bottom level reads this. Parents keep stock routing.
+            last_level: LastLevelStop::default(),
         }
     }
 
@@ -450,6 +459,19 @@ pub struct StackedSearchStats {
     /// the top level's brute-force centroid ranking. A parent's members
     /// are this level's centroids, so this is the total query cost.
     pub members_scored: usize,
+    /// Parents expanded at the bottom router level. Levels above it are not
+    /// included. `0` when this search never recorded a bottom-level pass.
+    pub parents_expanded: usize,
+    /// Leaf centroids scored while expanding the bottom router level: the
+    /// children of the parents opened there, and only those. Upper-level
+    /// centroid scoring stays in [`Self::members_scored`] and is not included.
+    pub leaf_centroids_scored: usize,
+    /// Why the bottom level stopped. `None` on the stock path.
+    pub stop_reason: Option<StopReason>,
+    /// Centered mass of leaf centroids scored at the stop. `0` on the stock path.
+    pub opened_mass: f64,
+    /// Centered mass estimated for parents left in the beam. `0` on the stock path.
+    pub unopened_mass_est: f64,
 }
 
 /// Counting sort into list order. `perm[old] = new_row`.
@@ -913,10 +935,57 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         recall: f32,
         metric: Metric,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
+        // Direct callers have no separate harness target: `auto` uses `recall`.
+        self.search_with_requested_recall(query, k, recall, metric, recall)
+    }
+
+    /// `recall` is the geometric-APS target (already forced to `1` above 128
+    /// dims). `requested_recall` is the caller's target, which `TARGET=auto`
+    /// reads so a high-dimensional search still sees r90/r95/r99.
+    pub(crate) fn search_with_requested_recall(
+        &self,
+        query: &[S::Elem],
+        k: usize,
+        recall: f32,
+        metric: Metric,
+        requested_recall: f32,
+    ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
+        self.search_level(query, k, recall, metric, requested_recall, true)
+    }
+
+    fn search_level(
+        &self,
+        query: &[S::Elem],
+        k: usize,
+        recall: f32,
+        metric: Metric,
+        requested_recall: f32,
+        bottom: bool,
+    ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
         if k == 0 {
             return (Vec::new(), StackedSearchStats::default());
         }
+        // The rule applies only where children are leaf clusters and a parent
+        // beam exists. Every level above keeps the stock scan.
+        if bottom && self.parent.is_some() {
+            let (rule, label) = last_level::effective_rule(&self.config.last_level);
+            if !rule.is_stock() {
+                return self.search_ruled(query, k, recall, metric, requested_recall, rule, label);
+            }
+        }
+        self.search_stock(query, k, recall, metric, bottom)
+    }
 
+    /// Stock scan. `bottom` only records counters and the optional log; it
+    /// does not change which lists are opened.
+    fn search_stock(
+        &self,
+        query: &[S::Elem],
+        k: usize,
+        recall: f32,
+        metric: Metric,
+        bottom: bool,
+    ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
         let dim = query.len();
         let can_aps = recall < 1.0
             && aps::supports_metric(metric)
@@ -929,7 +998,7 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
             } else {
                 recall.max(1.0)
             };
-            parent.search(query, self.n_probe(), parent_recall, metric)
+            parent.search_level(query, self.n_probe(), parent_recall, metric, recall, false)
         } else {
             let mut all: Vec<Candidate<ClusterId>> = (0..self.nlist())
                 .map(|i| Candidate {
@@ -941,14 +1010,20 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
             let stats = StackedSearchStats {
                 lists_scanned: 0,
                 members_scored: all.len(),
+                ..Default::default()
             };
             (all, stats)
         };
 
         if candidates.is_empty() {
+            if bottom {
+                self.log_stock(k, &stats);
+            }
             return (Vec::new(), stats);
         }
 
+        let lists_before = stats.lists_scanned;
+        let scored_before = stats.members_scored;
         let mut estimator = can_aps.then(|| {
             let (matrix, _) = self.centroids.centroid_matrix().expect("can_aps");
             let rows: Vec<&[f32]> = candidates
@@ -964,7 +1039,7 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
 
         let mut result = BinaryHeap::with_capacity(k);
         for c in &candidates {
-            stats.members_scored += self.scan_cluster(query, metric, c.node, &mut result, k);
+            stats.members_scored += self.scan_cluster(query, metric, c.node, &mut result, k, None);
             stats.lists_scanned += 1;
             let Some(estimator) = estimator.as_mut() else {
                 continue;
@@ -981,6 +1056,171 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
             }
         }
 
+        if bottom {
+            stats.parents_expanded = stats.lists_scanned.saturating_sub(lists_before);
+            // Difference of member scores at this level only: the parent's
+            // centroid work is already in `scored_before`.
+            stats.leaf_centroids_scored = stats.members_scored.saturating_sub(scored_before);
+            self.log_stock(k, &stats);
+        }
+
+        let hits = result
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse(c)| c)
+            .collect();
+        (hits, stats)
+    }
+
+    fn log_stock(&self, k: usize, stats: &StackedSearchStats) {
+        let requested = if self.parent.is_some() {
+            self.n_probe().min(self.nlist().max(1))
+        } else {
+            self.nlist()
+        };
+        last_level::log_bottom(&last_level::ParentLog {
+            rule: "stock",
+            k_req: k,
+            parents_requested: requested,
+            parents_expanded: stats.parents_expanded,
+            leaf_centroids_scored: stats.leaf_centroids_scored,
+            stop_reason: "stock",
+            opened_mass: 0.0,
+            unopened_mass_est: 0.0,
+        });
+    }
+
+    /// Bottom level, non-stock rule. One parent probe, then expand that beam
+    /// in its existing score order. `frac` / `kscale` expand the whole probe;
+    /// `aps` / `gap` may stop inside the 25% beam. Geometric APS is not run
+    /// at this level when a rule is active; levels above are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn search_ruled(
+        &self,
+        query: &[S::Elem],
+        k: usize,
+        recall: f32,
+        metric: Metric,
+        requested_recall: f32,
+        rule: LastLevelRule,
+        rule_label: String,
+    ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
+        let parent = self
+            .parent
+            .as_ref()
+            .expect("the bottom-level rule runs only when a parent beam exists");
+        let nlist = self.nlist().max(1);
+        let cpp = last_level::children_per_parent(nlist, &self.offsets);
+        let (parent_k, parent_recall) = match rule.parent_probe(k, nlist, cpp) {
+            ParentProbe::Stock => {
+                let can_aps = recall < 1.0
+                    && aps::supports_metric(metric)
+                    && self.centroids.centroid_matrix().is_some();
+                let parent_recall = if can_aps {
+                    self.config.parent_recall_target
+                } else {
+                    recall.max(1.0)
+                };
+                (self.n_probe().min(nlist), parent_recall)
+            }
+            ParentProbe::Count(n) => (n, 1.0),
+        };
+        let requested = parent_k;
+        let (candidates, mut stats) = parent.search_level(
+            query,
+            parent_k,
+            parent_recall,
+            metric,
+            requested_recall,
+            false,
+        );
+        if candidates.is_empty() {
+            last_level::log_bottom(&last_level::ParentLog {
+                rule: &rule_label,
+                k_req: k,
+                parents_requested: requested,
+                parents_expanded: 0,
+                leaf_centroids_scored: 0,
+                stop_reason: "exhausted",
+                opened_mass: 0.0,
+                unopened_mass_est: 0.0,
+            });
+            stats.stop_reason = Some(StopReason::Exhausted);
+            return (Vec::new(), stats);
+        }
+
+        let beam: Vec<last_level::ParentBeam> = candidates
+            .iter()
+            .map(|candidate| {
+                let (start, end) = self.offsets[usize::from(candidate.node)];
+                last_level::ParentBeam {
+                    score: f64::from(candidate.sim.score()),
+                    rows: end.saturating_sub(start) as usize,
+                }
+            })
+            .collect();
+        let mut stopper = Stopper::new(&rule, beam, requested_recall);
+        let lists_before = stats.lists_scanned;
+        let scored_before = stats.members_scored;
+        let mut result = BinaryHeap::with_capacity(k);
+        let mut stop = None;
+        for candidate in &candidates {
+            let mut child_scores = Vec::new();
+            let scanned = self.scan_cluster(
+                query,
+                metric,
+                candidate.node,
+                &mut result,
+                k,
+                Some(&mut child_scores),
+            );
+            stats.members_scored += scanned;
+            stats.lists_scanned += 1;
+            let cutoff = (result.len() >= k)
+                .then(|| {
+                    result
+                        .peek()
+                        .map(|Reverse(worst)| f64::from(worst.sim.score()))
+                })
+                .flatten();
+            if let Some(stopper) = stopper.as_mut() {
+                if let Some(reason) = stopper.observe(&child_scores, cutoff) {
+                    stop = Some(reason);
+                    break;
+                }
+            }
+        }
+
+        let reason = stop.unwrap_or_else(|| {
+            stopper
+                .as_ref()
+                .map(|stopper| stopper.finish(requested))
+                .unwrap_or(if candidates.len() < requested {
+                    StopReason::Exhausted
+                } else {
+                    StopReason::Cap
+                })
+        });
+        let (opened_mass, unopened_mass_est) = stopper
+            .as_ref()
+            .map(|stopper| stopper.masses())
+            .unwrap_or((0.0, 0.0));
+        stats.parents_expanded = stats.lists_scanned.saturating_sub(lists_before);
+        stats.leaf_centroids_scored = stats.members_scored.saturating_sub(scored_before);
+        stats.stop_reason = Some(reason);
+        stats.opened_mass = opened_mass;
+        stats.unopened_mass_est = unopened_mass_est;
+        last_level::log_bottom(&last_level::ParentLog {
+            rule: &rule_label,
+            k_req: k,
+            parents_requested: requested,
+            parents_expanded: stats.parents_expanded,
+            leaf_centroids_scored: stats.leaf_centroids_scored,
+            stop_reason: &reason.to_string(),
+            opened_mass,
+            unopened_mass_est,
+        });
+
         let hits = result
             .into_sorted_vec()
             .into_iter()
@@ -996,6 +1236,7 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         list: ClusterId,
         result: &mut BinaryHeap<Reverse<Candidate<ClusterId>>>,
         k: usize,
+        mut child_scores: Option<&mut Vec<f64>>,
     ) -> usize {
         let dim = query.len();
         let (start, end) = self.offsets[usize::from(list)];
@@ -1007,6 +1248,9 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
                 sim: self.vectors.similarity(metric, dim, id.0, query),
                 node: id,
             };
+            if let Some(scores) = child_scores.as_deref_mut() {
+                scores.push(f64::from(cand.sim.score()));
+            }
             if result.len() < k {
                 result.push(Reverse(cand));
             } else if let Some(mut worst) = result.peek_mut() {
@@ -1546,5 +1790,70 @@ mod tests {
         assert!(full.lists_scanned > 1);
         assert_eq!(low.lists_scanned, full.lists_scanned);
         assert_eq!(low_hits, full_hits);
+    }
+
+    /// A missing rule file leaves the stock scan: same hits and the same
+    /// pre-existing work counters. This tip has no `unsearched_score`.
+    #[test]
+    fn missing_rule_file_matches_stock() {
+        let _guard = crate::vector::router::stacked::last_level::force_absent();
+        let missing = std::env::temp_dir().join("tv_parent_rule_absent_e2cc");
+        let _ = std::fs::remove_file(&missing);
+        let (rule, _) = crate::vector::router::stacked::last_level::rule_from_path(
+            &missing,
+            &crate::vector::router::stacked::last_level::LastLevelStop::default(),
+        );
+        assert!(rule.is_stock());
+
+        let n = 64;
+        let data = line_data(n);
+        let clusterer = SuperKMeansLevelClusterer::default();
+        let (index, _) = build_with_parent(&data, n, 2, &clusterer, 2);
+        for recall in [1.0f32, 0.9] {
+            for query in [[0.0f32, 0.0], [15.0, 0.0], [63.0, 0.0]] {
+                let (hits, stats) = index.search(&query, 4, recall, Metric::L2);
+                let (stock_hits, stock_stats) =
+                    index.search_stock(&query, 4, recall, Metric::L2, true);
+                assert_eq!(hits, stock_hits, "recall {recall} query {query:?}");
+                assert_eq!(stats.lists_scanned, stock_stats.lists_scanned);
+                assert_eq!(stats.members_scored, stock_stats.members_scored);
+                assert!(stats.stop_reason.is_none());
+            }
+        }
+    }
+
+    /// `frac:1.0` expands every bottom-level parent. Leaf-centroid scoring
+    /// counts those children and not the parent's centroids.
+    #[test]
+    fn frac_one_expands_every_parent() {
+        let _guard = crate::vector::router::stacked::last_level::force_text("frac:1.0");
+        let n = 64;
+        let dim = 2;
+        let data = line_data(n);
+        let clusterer = SuperKMeansLevelClusterer::default();
+        let (index, _) = build_with_parent(&data, n, dim, &clusterer, 2);
+        let query = [3.0f32, 0.0];
+        let (hits, stats) = index.search(&query, 4, 1.0, Metric::L2);
+        assert_eq!(stats.parents_expanded, index.nlist());
+        assert_eq!(stats.leaf_centroids_scored, index.vectors.len());
+        assert!(
+            stats.members_scored > stats.leaf_centroids_scored,
+            "upper-level centroids are in members_scored ({}) but not leaf_centroids_scored ({})",
+            stats.members_scored,
+            stats.leaf_centroids_scored
+        );
+        assert_eq!(stats.stop_reason, Some(StopReason::Cap));
+        let rows = index.vectors.as_slice();
+        let mut best_node = ClusterId(0);
+        let mut best = Metric::L2.similarity(&query, &rows[..dim]);
+        for row in 1..index.vectors.len() {
+            let sim = Metric::L2.similarity(&query, &rows[row * dim..(row + 1) * dim]);
+            if sim > best {
+                best = sim;
+                best_node = ClusterId(row as u32);
+            }
+        }
+        assert_eq!(hits[0].node, best_node);
+        assert_eq!(hits[0].sim, best);
     }
 }
