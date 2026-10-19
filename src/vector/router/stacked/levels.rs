@@ -185,10 +185,21 @@ pub trait LevelClusterer {
     ) -> (Vec<Self::Elem>, Vec<u32>);
 }
 
-/// [`HierarchicalSuperKMeans`] with `max_leaf_size ≈ n / nlist`.
-#[derive(Clone, Debug, Default)]
+/// [`HierarchicalSuperKMeans`] with `max_leaf_size ≈ n / nlist`. Meso and fine
+/// iterations keep the library defaults. [`Self::for_metric`] clusters Cosine
+/// and Dot by angle, the same rule as the segment's IVF.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SuperKMeansLevelClusterer {
-    pub iters_per_split: u32,
+    angular: bool,
+}
+
+impl SuperKMeansLevelClusterer {
+    /// Angular clustering for Cosine and Dot; Euclidean for L2.
+    pub fn for_metric(metric: Metric) -> Self {
+        Self {
+            angular: matches!(metric, Metric::Cosine | Metric::Dot),
+        }
+    }
 }
 
 impl LevelClusterer for SuperKMeansLevelClusterer {
@@ -202,14 +213,12 @@ impl LevelClusterer for SuperKMeansLevelClusterer {
 
         let base = SuperKMeansConfig {
             data_already_rotated: true,
+            angular: self.angular,
             ..Default::default()
         };
-        let iters = self.iters_per_split.max(1);
         let cfg = HierarchicalSuperKMeansConfig {
             base,
             max_leaf_size,
-            iters_meso: iters,
-            iters_fine: iters,
             ..Default::default()
         };
         let mut kmeans = HierarchicalSuperKMeans::with_config(dim, cfg);
@@ -1058,7 +1067,7 @@ mod tests {
         let dim = 2;
         let n = 16;
         let data = line_data(n);
-        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let clusterer = SuperKMeansLevelClusterer::default();
         let (index, member_perm) =
             StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config(4));
         assert!(index.nlist() > 1);
@@ -1081,7 +1090,7 @@ mod tests {
         let dim = 2;
         let n = 32;
         let data = line_data(n);
-        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let clusterer = SuperKMeansLevelClusterer::default();
         let (index, member_perm) = build_with_parent(&data, n, dim, &clusterer, 2);
 
         let mut seen = vec![false; n];
@@ -1113,7 +1122,7 @@ mod tests {
         let dim = 2;
         let n = 32;
         let data = line_data(n);
-        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let clusterer = SuperKMeansLevelClusterer::default();
         let (index, _perm) = build_with_parent(&data, n, dim, &clusterer, 2);
 
         let mut bytes = Vec::new();
@@ -1159,7 +1168,7 @@ mod tests {
         let dim = 2;
         let n = 64;
         let data = line_data(n);
-        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let clusterer = SuperKMeansLevelClusterer::default();
         let (mut index, _) =
             StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config(2));
         assert_eq!(index.depth(), 1);
@@ -1184,7 +1193,7 @@ mod tests {
         let dim = 2;
         let n = 64;
         let data = line_data(n);
-        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let clusterer = SuperKMeansLevelClusterer::default();
         let (mut index, _) =
             StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config(2));
         let parent_cfg = index.config.for_parent();
@@ -1196,6 +1205,15 @@ mod tests {
         assert_eq!(index.vectors.as_slice(), members.as_slice());
         assert_eq!(index.offsets, offsets);
         assert_eq!(index.centroids.as_slice(), centroids.as_slice());
+    }
+
+    /// Cosine and Dot cluster by angle; L2 does not. Same rule as the segment IVF.
+    #[test]
+    fn level_clusterer_follows_metric() {
+        assert!(!SuperKMeansLevelClusterer::for_metric(Metric::L2).angular);
+        assert!(SuperKMeansLevelClusterer::for_metric(Metric::Cosine).angular);
+        assert!(SuperKMeansLevelClusterer::for_metric(Metric::Dot).angular);
+        assert!(!SuperKMeansLevelClusterer::default().angular);
     }
 
     #[test]
@@ -1215,7 +1233,7 @@ mod tests {
         let dim = 2;
         let n = 64;
         let data = line_data(n);
-        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let clusterer = SuperKMeansLevelClusterer::default();
         let config = test_config(2);
         let (index, perm) =
             StackedIvfBuilder::new(data, n, dim, &clusterer, config.clone()).build();
@@ -1254,7 +1272,7 @@ mod tests {
         let dim = 2;
         let n = 32;
         let data = line_data(n);
-        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let clusterer = SuperKMeansLevelClusterer::default();
         let (index, _perm) = build_with_parent(&data, n, dim, &clusterer, 2);
 
         let mut slot = Vec::new();
@@ -1303,7 +1321,7 @@ mod tests {
         for (i, v) in data.iter_mut().enumerate() {
             *v = ((i * 2654435761usize) % 1000) as f32 / 1000.0;
         }
-        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 1 };
+        let clusterer = SuperKMeansLevelClusterer::default();
         let config = StackedIvfConfig {
             nprobe_fraction: PARENT_NPROBE_FRACTION,
             branching_factor: 64,
@@ -1341,7 +1359,7 @@ mod tests {
         let dim = 2;
         let n = 32;
         let data = line_data(n);
-        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let clusterer = SuperKMeansLevelClusterer::default();
         let (index, _perm) =
             StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config(2));
         let mut slot = Vec::new();
@@ -1390,7 +1408,7 @@ mod tests {
     fn test_aps_recall_zero_still_scans_p0() {
         let n_per = 16;
         let data = two_blobs(n_per);
-        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let clusterer = SuperKMeansLevelClusterer::default();
         let (index, _) =
             StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config(2));
         let (hits, stats) = index.search(&[0.0f32, 0.0], 4, 0.0, Metric::L2);
@@ -1406,7 +1424,7 @@ mod tests {
     fn test_aps_low_recall_scans_fewer_lists_than_full() {
         let n_per = 32;
         let data = two_blobs(n_per);
-        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let clusterer = SuperKMeansLevelClusterer::default();
         let (mut index, _) =
             StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config(2));
         index.config.nprobe_fraction = 1.0;
@@ -1434,7 +1452,7 @@ mod tests {
     fn test_opened_index_runs_aps() {
         let n_per = 32;
         let data = two_blobs(n_per);
-        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let clusterer = SuperKMeansLevelClusterer::default();
         let (mut index, _) =
             StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config(2));
         index.config.nprobe_fraction = 1.0;
@@ -1475,7 +1493,7 @@ mod tests {
     fn test_aps_parent_keeps_high_recall() {
         let n_per = 32;
         let data = two_blobs(n_per);
-        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let clusterer = SuperKMeansLevelClusterer::default();
         let (index, _) = build_with_parent(&data, n_per * 2, 2, &clusterer, 2);
         let query = [0.0f32, 0.0];
         let (leaf, _) = index.search(&query, 4, 0.9, Metric::L2);
@@ -1497,7 +1515,7 @@ mod tests {
                 [norm * angle(i).cos(), norm * angle(i).sin()]
             })
             .collect();
-        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let clusterer = SuperKMeansLevelClusterer::default();
         let (mut index, _) =
             StackedIvf::<InMemoryStore>::build(data, n, 2, &clusterer, test_config(2));
         index.config.nprobe_fraction = 1.0;
@@ -1518,7 +1536,7 @@ mod tests {
     fn test_aps_is_off_for_dot() {
         let n_per = 32;
         let data = two_blobs(n_per);
-        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let clusterer = SuperKMeansLevelClusterer::default();
         let (mut index, _) =
             StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config(2));
         index.config.nprobe_fraction = 1.0;

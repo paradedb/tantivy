@@ -38,7 +38,7 @@ pub(super) fn build(
     centroids: &mut IvfCentroids,
 ) -> crate::Result<StackedIvf<InMemoryStore>> {
     let IvfCentroids::F32(matrix) = &*centroids;
-    let clusterer = SuperKMeansLevelClusterer::default();
+    let clusterer = SuperKMeansLevelClusterer::for_metric(options.metric());
     let (index, permutation) = StackedIvfBuilder::new(
         matrix.values.clone(),
         matrix.rows,

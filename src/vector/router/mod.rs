@@ -172,11 +172,27 @@ impl Iterator for RouterIter {
 }
 
 impl OpenedRouter {
-    #[cfg(test)]
     pub(crate) fn kind(&self) -> RouterKind {
         match self {
             Self::Stacked(_) => RouterKind::Stacked,
             Self::Exact(_) => RouterKind::Exact,
+        }
+    }
+
+    /// Centroids at each router level, bottom (the level whose members are the segment's
+    /// centroids) to top. The exact router has no levels.
+    pub(crate) fn level_sizes(&self) -> Vec<usize> {
+        match self {
+            Self::Stacked(router) => {
+                let mut sizes = Vec::new();
+                let mut level = Some(router);
+                while let Some(current) = level {
+                    sizes.push(current.nlist());
+                    level = current.parent.as_deref();
+                }
+                sizes
+            }
+            Self::Exact(_) => Vec::new(),
         }
     }
 
