@@ -1271,15 +1271,15 @@ mod tests {
     }
 
     /// The budget stops the bottom level at the first list boundary past it, while its parent
-    /// still scans everything; the nearest members are the same as the full scan's.
+    /// still runs without a member budget; the nearest members are the same as the full scan's.
     #[test]
     fn test_member_budget_stops_bottom_level_only() {
         let dim = 2;
         let n = 2048;
-        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let clusterer = SuperKMeansLevelClusterer::default();
         let config = StackedIvfConfig {
             nprobe_fraction: PARENT_NPROBE_FRACTION,
-            ..test_config(16)
+            ..test_config()
         };
         let (mut index, _) =
             StackedIvf::<InMemoryStore>::build(line_data(n), n, dim, &clusterer, config);
@@ -1287,10 +1287,11 @@ mod tests {
         index.add_level(&clusterer, parent_cfg).expect("L1");
         let parent = index.parent.as_deref().expect("L1");
         assert!(parent.parent.is_none());
-        let parent_cost = parent.nlist() + parent.vectors.len();
 
         let query = [0.0f32, 0.0];
         let k = 16;
+        let (_, parent_stats) = parent.search(&query, index.n_probe(), 1.0, Metric::L2);
+        let parent_cost = parent_stats.members_scored;
         let budget = member_budget(n, k, 2.0);
         let (full_hits, full) = index.search(&query, k, 1.0, Metric::L2);
         let (hits, stats) = index.search_within(&query, k, 1.0, Metric::L2, Some(budget));
