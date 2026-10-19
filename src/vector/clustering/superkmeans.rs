@@ -40,6 +40,9 @@ impl Dataset for SourceDataset<'_> {
             self.kept = Some(checked_matrix(batch.matrix, self.kept_rows, self.dim)?);
         }
         if let Some(kept) = &self.kept {
+            if self.source.wants_cancel() {
+                return Err(TantivyError::Cancelled);
+            }
             f(Matrix::new(&kept.values, kept.rows, kept.dims));
         }
         for start in (self.kept_rows..num_rows).step_by(self.batch_rows) {
@@ -265,6 +268,9 @@ impl IvfClusterer for SuperKMeansClusterer {
             Some(mut kept) if kept.rows == num_rows && num_rows + largest_meso <= budget_rows => {
                 permute_rows(&mut kept.values, dim, &meso.rows);
                 for m in 0..meso.n_meso() {
+                    if source.wants_cancel() {
+                        return Err(TantivyError::Cancelled);
+                    }
                     let rows = meso.offsets[m]..meso.offsets[m + 1];
                     let fine = kmeans.train_meso_cluster(
                         &kept.values[rows.start * dim..rows.end * dim],
@@ -285,6 +291,9 @@ impl IvfClusterer for SuperKMeansClusterer {
                     let IvfTrainingVectors::F32(group) = source.read_rows(group_rows)?;
                     let group = checked_matrix(group.matrix, group_rows.len(), dim)?;
                     for m in start..end {
+                        if source.wants_cancel() {
+                            return Err(TantivyError::Cancelled);
+                        }
                         let rows = meso.offsets[m] - group_start..meso.offsets[m + 1] - group_start;
                         let fine = kmeans.train_meso_cluster(
                             &group.values[rows.start * dim..rows.end * dim],
@@ -336,6 +345,7 @@ impl IvfClusterer for SuperKMeansClusterer {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::ops::Range;
 
     use super::*;
@@ -392,6 +402,33 @@ mod tests {
         }
     }
 
+    /// Reports a cancel once it has been polled `polls_before_cancel` times, like a backend
+    /// that receives the request part way through training.
+    struct CancellingSource {
+        inner: VecSource,
+        polls_before_cancel: usize,
+        polls: Cell<usize>,
+    }
+
+    impl VectorSource for CancellingSource {
+        fn num_rows(&self) -> usize {
+            self.inner.num_rows()
+        }
+
+        fn read_range(&mut self, range: Range<usize>) -> crate::Result<IvfTrainingVectors> {
+            self.inner.read_range(range)
+        }
+
+        fn read_rows(&mut self, rows: &[u32]) -> crate::Result<IvfTrainingVectors> {
+            self.inner.read_rows(rows)
+        }
+
+        fn wants_cancel(&self) -> bool {
+            self.polls.set(self.polls.get() + 1);
+            self.polls.get() > self.polls_before_cancel
+        }
+    }
+
     fn blobs(n: usize, dim: usize) -> Vec<f32> {
         superkmeans::make_blobs(n, dim, 25, false, 1.0, 10.0, 42)
     }
@@ -419,6 +456,36 @@ mod tests {
             .unwrap();
         assert_eq!(assignments.len(), n);
         assert!(assignments.iter().all(|&c| (c as usize) < centroids.rows));
+    }
+
+    /// The sample fits in memory, so without the polls nothing after the single read could
+    /// notice a cancel. One poll per meso pass and one per fine cluster both stop training.
+    #[test]
+    fn a_cancel_stops_training_in_the_meso_and_fine_steps() {
+        let (n, dim) = (5_000, 16);
+        let clusterer = SuperKMeansClusterer::new().with_max_leaf_size(100);
+        let options = VectorOptions::new(dim, Metric::L2);
+
+        let mut source = CancellingSource {
+            inner: VecSource::new(blobs(n, dim), dim),
+            polls_before_cancel: usize::MAX,
+            polls: Cell::new(0),
+        };
+        clusterer.train(&options, &mut source).unwrap();
+        let polls_in_full_run = source.polls.get();
+        assert!(polls_in_full_run > 2, "{polls_in_full_run} polls");
+
+        for polls_before_cancel in [1, polls_in_full_run - 1] {
+            let mut source = CancellingSource {
+                inner: VecSource::new(blobs(n, dim), dim),
+                polls_before_cancel,
+                polls: Cell::new(0),
+            };
+            let err = clusterer.train(&options, &mut source).unwrap_err();
+            assert!(matches!(err, TantivyError::Cancelled), "{err:?}");
+            assert_eq!(source.polls.get(), polls_before_cancel + 1);
+            assert_eq!(source.inner.ranges, vec![0..n]);
+        }
     }
 
     #[test]

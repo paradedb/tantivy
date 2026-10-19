@@ -220,3 +220,25 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod interrupt_counter {
+    use std::cell::Cell;
+
+    // Per thread, since the hook is process-wide and tests run in parallel.
+    thread_local! { static CALLS: Cell<usize> = const { Cell::new(0) }; }
+
+    fn count() {
+        CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
+
+    /// Installs the counting hook and returns this thread's count so far.
+    pub(crate) fn install() -> usize {
+        common::interrupt::set_interrupt_check(count);
+        calls()
+    }
+
+    pub(crate) fn calls() -> usize {
+        CALLS.with(Cell::get)
+    }
+}
