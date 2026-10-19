@@ -127,6 +127,10 @@ pub(crate) struct RoutingParams {
     /// [`APS_MAX_DIM`](crate::vector::router::stacked::aps::APS_MAX_DIM) regardless of this
     /// value.
     pub(crate) recall: f32,
+    /// Stacked-router member budget multiplier `c`: on the fixed nprobe path the bottom router
+    /// level stops opening lists once it has scored `c × k` members, clamped to 10%..25% of its
+    /// members. `None` scans every list the parent returns. Finite and positive.
+    pub(crate) member_budget_multiplier: Option<f32>,
 }
 
 impl Default for RoutingParams {
@@ -134,6 +138,7 @@ impl Default for RoutingParams {
         Self {
             k: usize::MAX,
             recall: 1.0,
+            member_budget_multiplier: None,
         }
     }
 }
@@ -368,7 +373,11 @@ mod tests {
     fn stacked_ranking_uses_requested_recall_within_dim_cap() -> crate::Result<()> {
         let opened = open_stacked(2, 64)?;
         let query = vec![0.0f32; 2];
-        let params = RoutingParams { k: 8, recall: 0.5 };
+        let params = RoutingParams {
+            k: 8,
+            recall: 0.5,
+            ..Default::default()
+        };
         let ranking = opened.rank(&query, Metric::L2, params);
         let (candidates, lists, scored, recall) = stacked_metrics(ranking.metrics());
         assert_eq!(recall, 0.5);
@@ -389,7 +398,11 @@ mod tests {
         let dim = crate::vector::router::stacked::aps::APS_MAX_DIM + 1;
         let opened = open_stacked(dim, 32)?;
         let query = vec![0.0f32; dim];
-        let params = RoutingParams { k: 2, recall: 0.5 };
+        let params = RoutingParams {
+            k: 2,
+            recall: 0.5,
+            ..Default::default()
+        };
         let ranking = opened.rank(&query, Metric::L2, params);
         let (candidates, lists, scored, recall) = stacked_metrics(ranking.metrics());
         assert_eq!(recall, 1.0, "dimension cap must force the nprobe path");

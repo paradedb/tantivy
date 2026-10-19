@@ -24,6 +24,12 @@ pub struct ProbeParams {
     /// Recall target for the stacked router's ranking, in `(0, 1]`; `1.0` routes with the fixed
     /// nprobe fractions. Forced to `1.0` above 128 dimensions. Default [`DEFAULT_ROUTER_RECALL`].
     pub router_recall_target: f32,
+    /// Member budget multiplier `c` for the stacked router's bottom level on the fixed nprobe
+    /// path: it stops opening lists once it has scored `c × k` segment centroids, `k` being the
+    /// clusters the budget buys, clamped to 10%..25% of the segment's centroids. Higher router
+    /// levels keep their fixed fractions. `None` scans every list the parent level returns; a
+    /// value must be finite and positive. Default `None`.
+    pub router_member_budget_multiplier: Option<f32>,
     /// Recall target for each segment's cluster scan, in `(0, 1]`, estimated by the Quake APS;
     /// `1.0` leaves the budget as the only bound. Stacked-router segments only; forced to `1.0`
     /// above 128 dimensions. Default `1.0`.
@@ -78,6 +84,7 @@ impl Default for ProbeParams {
             max_probe_fraction: 0.01,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
             router_recall_target: DEFAULT_ROUTER_RECALL,
+            router_member_budget_multiplier: None,
             recall_target: 1.0,
             exact_plan: true,
             located: LocatedPath::Auto,
@@ -146,6 +153,14 @@ impl ProbeParams {
         if !(self.fixed_probe_cost_rows.is_finite() && self.fixed_probe_cost_rows > 0.0) {
             return Err(crate::TantivyError::InvalidArgument(
                 "fixed_probe_cost_rows must be finite and greater than 0".to_string(),
+            ));
+        }
+        if self
+            .router_member_budget_multiplier
+            .is_some_and(|multiplier| !(multiplier.is_finite() && multiplier > 0.0))
+        {
+            return Err(crate::TantivyError::InvalidArgument(
+                "router_member_budget_multiplier must be finite and greater than 0".to_string(),
             ));
         }
         let n_avg = native_docs_in_segment as f64 / clusters_in_segment.max(1) as f64;
@@ -254,6 +269,13 @@ mod tests {
                 ..Default::default()
             };
             assert!(params.resolved_work_budget(9, 180).is_err(), "{cost}");
+        }
+        for multiplier in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let params = ProbeParams {
+                router_member_budget_multiplier: Some(multiplier),
+                ..Default::default()
+            };
+            assert!(params.resolved_work_budget(9, 180).is_err(), "{multiplier}");
         }
     }
 }

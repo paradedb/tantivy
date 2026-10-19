@@ -224,6 +224,7 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
                 clusters,
             ),
             recall: params.router_recall_target,
+            member_budget_multiplier: params.router_member_budget_multiplier,
         };
         let _routing = enter_vector_stage(VectorStage::Routing);
         let ranked = index.rank_clusters(query.widened(), routing);
