@@ -69,6 +69,11 @@ where
         self
     }
 
+    pub fn interruptible(mut self) -> Self {
+        self.streamer_builder = self.streamer_builder.interruptible();
+        self
+    }
+
     pub fn backward(mut self) -> Self {
         self.streamer_builder = self.streamer_builder.backward();
         self

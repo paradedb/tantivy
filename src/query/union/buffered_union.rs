@@ -115,6 +115,9 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> BufferedUnionScorer<TScorer
     }
 
     fn refill(&mut self) -> bool {
+        // A union over many terms keeps going long after the term walk that built it ended,
+        // with nothing above it that checks.
+        common::interrupt::check_for_interrupt();
         if let Some(min_doc) = self.docsets.iter().map(DocSet::doc).min() {
             // Reset the sliding window to start at the smallest doc
             // across all scorers and prebuffer within the horizon.

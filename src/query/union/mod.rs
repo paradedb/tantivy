@@ -41,6 +41,21 @@ mod tests {
         ))
     }
 
+    /// The term walk that builds a wide union ends before the first doc is scored, so the
+    /// union runs the host's check itself, once per window.
+    #[test]
+    fn test_union_runs_the_interrupt_check() {
+        let calls_before = crate::query::interrupt_counter::install();
+        let docs_list = [
+            (0..100_000).step_by(3).collect::<Vec<DocId>>(),
+            (0..100_000).step_by(7).collect::<Vec<DocId>>(),
+        ];
+        let mut union = union_from_docs_list(&docs_list);
+        while union.advance() != TERMINATED {}
+        let checks = crate::query::interrupt_counter::calls() - calls_before;
+        assert!(checks >= 100_000 / 4096, "{checks} checks");
+    }
+
     fn posting_list_union_from_docs_list(docs_list: &[Vec<DocId>]) -> Box<dyn DocSet> {
         Box::new(BitSetPostingUnion::build(
             vec_doc_set_from_docs_list(docs_list).collect::<Vec<VecDocSet>>(),

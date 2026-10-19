@@ -81,7 +81,7 @@ impl PhrasePrefixWeight {
             stream = stream.limit(self.max_expansions as u64);
         }
 
-        let mut stream = stream.into_stream()?;
+        let mut stream = stream.interruptible().into_stream()?;
 
         let mut suffixes = Vec::with_capacity(self.max_expansions as usize);
         let mut new_term = self.prefix.1.clone();

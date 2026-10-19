@@ -893,7 +893,7 @@ impl TermSetWeight {
             }
             KeyFilter::Predicate { predicate, bounds } => {
                 let inverted_index = reader.inverted_index(self.field)?;
-                let mut builder = inverted_index.terms().range();
+                let mut builder = inverted_index.terms().range().interruptible();
                 match &bounds.lower_bound {
                     Bound::Included(t) => builder = builder.ge(t.serialized_value_bytes()),
                     Bound::Excluded(t) => builder = builder.gt(t.serialized_value_bytes()),

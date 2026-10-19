@@ -349,7 +349,7 @@ fn compute_collapse_mapping(
     if facets.is_empty() {
         return Ok(collapsed);
     }
-    let mut facet_terms: columnar::Streamer = facet_dict.range().into_stream()?;
+    let mut facet_terms: columnar::Streamer = facet_dict.range().interruptible().into_stream()?;
     if !facet_terms.advance() {
         return Ok(collapsed);
     }

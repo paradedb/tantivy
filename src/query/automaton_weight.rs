@@ -83,7 +83,7 @@ where
             }
         }
 
-        term_stream_builder.into_stream()
+        term_stream_builder.interruptible().into_stream()
     }
 
     /// Returns the term infos that match the automaton
