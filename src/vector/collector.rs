@@ -424,15 +424,17 @@ mod ivf_e2e_tests {
     use crate::vector::RouterKind;
     use crate::{DocAddress, Index, Order, Score, TantivyDocument, TantivyError};
 
-    /// IVF + exhaustive probing matches the global oracle. The shared
-    /// fixture produces multiple IVF segments (it merges raw segments
-    /// pairwise), so this single test already exercises cross-segment
-    /// merge_fruits.
+    /// IVF + exhaustive probing matches the global oracle. Exact ranks
+    /// every centroid; Stacked's flat-top 25% prune is approximate and is
+    /// not expected to match. The shared fixture produces multiple IVF
+    /// segments (it merges raw segments pairwise), so this single test
+    /// already exercises cross-segment merge_fruits.
     #[test]
     fn e2e_ivf_matches_global_oracle() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
             .metric(Metric::L2)
             .vector_storage_format(VectorStorageFormat::Ivf)
+            .router(RouterKind::Exact)
             .build()?;
         let searcher = index.index.reader()?.searcher();
         let params = exhaustive_params(9);
@@ -488,6 +490,7 @@ mod ivf_e2e_tests {
         let index = TestVectorIndex::builder(VectorDType::F32)
             .metric(Metric::L2)
             .vector_storage_format(VectorStorageFormat::Ivf)
+            .router(RouterKind::Exact)
             .build()?;
         let searcher = index.index.reader()?.searcher();
         let query = [0.5_f32, 0.5];
@@ -542,7 +545,8 @@ mod ivf_e2e_tests {
             .ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: vec![[0.0, 0.0], [10.0, 10.0]],
             }))
-            .ivf_router(RouterKind::Stacked)
+            // Exact: this fixture's oracle assumes every cluster is probed.
+            .ivf_router(RouterKind::Exact)
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -877,7 +881,9 @@ mod ivf_e2e_tests {
             .ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: centroids.clone(),
             }))
-            .ivf_router(RouterKind::Stacked)
+            // Exact so the IVF side can match the oracle; Stacked's flat-top
+            // prune is approximate.
+            .ivf_router(RouterKind::Exact)
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
