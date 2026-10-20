@@ -1,6 +1,8 @@
 //! The scan's pruning bound: the k-th largest lower endpoint over quantized intervals and exact
 //! scores.
 
+use itertools::Itertools;
+
 // --- Ordering ---
 
 /// The `k`-th largest of two descending sequences, `a` given by length and accessor; `None`
@@ -40,6 +42,37 @@ pub(crate) fn lower_endpoint_order(
 
 // --- Bound ---
 
+#[derive(Clone, Default)]
+struct QuantizedSummary {
+    entries: Vec<(f32, usize, f32)>,
+    /// Indices into lower-endpoint-sorted entries, ordered by estimate descending.
+    estimates: Vec<usize>,
+}
+
+impl QuantizedSummary {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.estimates.clear();
+    }
+
+    fn sort(&mut self, k: usize) {
+        self.entries.sort_unstable_by(lower_endpoint_order);
+        self.entries.truncate(k);
+        self.estimates.clear();
+        self.estimates.extend(0..self.entries.len());
+        self.estimates
+            .sort_unstable_by(|&a, &b| self.entries[b].2.total_cmp(&self.entries[a].2));
+    }
+
+    fn estimates(&self, prefix: usize) -> impl Iterator<Item = f32> + '_ {
+        self.estimates
+            .iter()
+            .copied()
+            .filter(move |&i| i < prefix)
+            .map(|i| self.entries[i].2)
+    }
+}
+
 /// The scan's one pruning bound: the k-th largest lower endpoint over every live candidate,
 /// quantized intervals and exactly scored rows (zero-width intervals) alike. Only the top `k` of
 /// each side can affect it, so each side keeps at most `k` entries.
@@ -48,11 +81,10 @@ pub(crate) struct KthBound {
     pub(super) k: usize,
     /// Top-k exact scores, descending. Exact rows never move.
     exact: Vec<f32>,
-    /// Top-k quantized entries admitted since the last boundary, as `(lower, row, estimate)`,
-    /// ordered by [`lower_endpoint_order`].
-    pub(super) running: Vec<(f32, usize, f32)>,
-    /// The estimates of `running`, descending.
-    running_estimates: Vec<f32>,
+    /// Completed clusters; unchanged while the current cluster is refined.
+    running: QuantizedSummary,
+    current: QuantizedSummary,
+    refining_cluster: bool,
     merge: Vec<(f32, usize, f32)>,
 }
 
@@ -61,10 +93,42 @@ impl KthBound {
         Self {
             k,
             exact: Vec::with_capacity(k),
-            running: Vec::with_capacity(k),
-            running_estimates: Vec::with_capacity(k),
+            running: QuantizedSummary::default(),
+            current: QuantizedSummary::default(),
+            refining_cluster: false,
             merge: Vec::with_capacity(k.saturating_mul(2)),
         }
+    }
+
+    pub(super) fn begin_cluster(&mut self) {
+        debug_assert!(!self.refining_cluster);
+        self.refining_cluster = true;
+        self.current.clear();
+    }
+
+    pub(super) fn clear_current(&mut self) {
+        self.current.clear();
+    }
+
+    pub(super) fn commit_cluster(&mut self) {
+        self.refining_cluster = false;
+        if self.current.entries.is_empty() {
+            return;
+        }
+        let entries = std::mem::take(&mut self.current.entries);
+        self.merge_running(&entries);
+        self.current.entries = entries;
+        self.current.clear();
+    }
+
+    pub(super) fn running_entries(&self) -> impl Iterator<Item = &(f32, usize, f32)> {
+        self.running
+            .entries
+            .iter()
+            .merge_by(self.current.entries.iter(), |a, b| {
+                lower_endpoint_order(a, b).is_le()
+            })
+            .take(self.k)
     }
 
     /// Records an exactly scored row.
@@ -88,55 +152,83 @@ impl KthBound {
         (self.k > 0 && self.exact.len() == self.k).then(|| self.exact[self.k - 1])
     }
 
-    /// Merges one cluster's top-k entries into the running top-k.
+    /// Replaces the current refinement, or merges a cluster directly when not refining.
     pub(super) fn merge_running(&mut self, cluster_top: &[(f32, usize, f32)]) {
+        if self.refining_cluster {
+            self.current.entries.clear();
+            self.current.entries.extend_from_slice(cluster_top);
+            self.current.sort(self.k);
+            return;
+        }
         self.merge.clear();
-        self.merge.extend_from_slice(&self.running);
+        self.merge.extend_from_slice(&self.running.entries);
         self.merge.extend_from_slice(cluster_top);
-        self.merge.sort_unstable_by(lower_endpoint_order);
-        self.merge.truncate(self.k);
-        std::mem::swap(&mut self.running, &mut self.merge);
-        self.running_estimates.clear();
-        self.running_estimates
-            .extend(self.running.iter().map(|&(_, _, estimate)| estimate));
-        self.running_estimates
-            .sort_unstable_by(|a, b| b.total_cmp(a));
+        std::mem::swap(&mut self.running.entries, &mut self.merge);
+        self.running.sort(self.k);
     }
 
-    /// The bounds gate's threshold: the k-th of the running lower endpoints and the exact scores;
-    /// `None` until `k` are in.
+    /// The k-th lower endpoint across completed clusters, the current cluster, and exact rows.
     pub(crate) fn running_lower(&self) -> Option<f32> {
-        if self.exact.is_empty() {
-            return (self.k > 0 && self.running.len() >= self.k)
-                .then(|| self.running[self.k - 1].0);
+        let rank = self.k.checked_sub(1)?;
+        if self.current.entries.is_empty() {
+            if self.exact.is_empty() {
+                return self.running.entries.get(rank).map(|entry| entry.0);
+            }
+            return merged_kth(
+                self.running.entries.len(),
+                |i| self.running.entries[i].0,
+                &self.exact,
+                self.k,
+            );
         }
-        merged_kth(
-            self.running.len(),
-            |i| self.running[i].0,
-            &self.exact,
-            self.k,
-        )
+        self.running_entries()
+            .map(|entry| entry.0)
+            .merge_by(self.exact.iter().copied(), |a, b| a >= b)
+            .nth(rank)
     }
 
-    /// APS cover's threshold: the k-th of the running point estimates and the exact scores;
-    /// `None` until `k` are in. It never exceeds the k-th best estimate and carries no confidence
-    /// margin, so it must not drive pruning.
+    /// The k-th estimate among the lower-endpoint top-k and exact rows; not a pruning bound.
     pub(crate) fn running_estimate(&self) -> Option<f32> {
-        if self.k == 0 {
-            return None;
-        }
-        if self.exact.is_empty() {
-            if self.running.len() < self.k {
-                return None;
+        let rank = self.k.checked_sub(1)?;
+        if self.current.entries.is_empty() {
+            if self.exact.is_empty() {
+                return self
+                    .running
+                    .estimates
+                    .get(rank)
+                    .map(|&i| self.running.entries[i].2);
             }
-            return self
-                .running
-                .iter()
-                .map(|&(_, _, estimate)| estimate)
-                .min_by(f32::total_cmp);
+            return merged_kth(
+                self.running.estimates.len(),
+                |i| self.running.entries[self.running.estimates[i]].2,
+                &self.exact,
+                self.k,
+            );
         }
-        let estimates = &self.running_estimates;
-        merged_kth(estimates.len(), |i| estimates[i], &self.exact, self.k)
+        let mut completed = 0;
+        let mut current = 0;
+        for (is_current, _) in self
+            .running
+            .entries
+            .iter()
+            .map(|entry| (false, entry))
+            .merge_by(
+                self.current.entries.iter().map(|entry| (true, entry)),
+                |a, b| lower_endpoint_order(a.1, b.1).is_le(),
+            )
+            .take(self.k)
+        {
+            if is_current {
+                current += 1;
+            } else {
+                completed += 1;
+            }
+        }
+        self.running
+            .estimates(completed)
+            .merge_by(self.current.estimates(current), |a, b| a >= b)
+            .merge_by(self.exact.iter().copied(), |a, b| a >= b)
+            .nth(rank)
     }
 
     /// The boundary threshold: the k-th largest of `candidate_lowers` (one per live quantized
@@ -144,7 +236,8 @@ impl KthBound {
     /// describes the candidates before the boundary.
     pub(super) fn boundary_lower(&mut self, candidate_lowers: &mut [f32]) -> Option<f32> {
         self.running.clear();
-        self.running_estimates.clear();
+        self.current.clear();
+        self.refining_cluster = false;
         let k = self.k;
         if k == 0 {
             return None;
@@ -176,6 +269,79 @@ mod tests {
     use crate::vector::search::interval::{LowerEndpoint, Threshold};
     use crate::vector::search::scan::columns::BoundaryHarness;
     use crate::DocId;
+
+    #[test]
+    fn separate_summaries_match_full_selection_with_exact_scores() {
+        use super::{lower_endpoint_order, KthBound};
+        for seed in 0..32 {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            for k in [0, 1, 2, 10, 100] {
+                let mut bound = KthBound::new(k);
+                let mut completed = Vec::new();
+                let mut exact = Vec::new();
+                for cluster in 0..8 {
+                    bound.begin_cluster();
+                    let saved = bound.running.entries.clone();
+                    let saved_estimates = bound.running.estimates.clone();
+                    let mut current = Vec::new();
+                    for layer in 0..3 {
+                        bound.clear_current();
+                        current.clear();
+                        for row in 0..7 {
+                            let estimate = rng.i32(-10..11) as f32;
+                            current.push((estimate - rng.f32() * 4.0, cluster * 7 + row, estimate));
+                        }
+                        if rng.bool() {
+                            let score = rng.i32(-10..11) as f32;
+                            exact.push(score);
+                            bound.push_exact(score);
+                        }
+                        // Some clusters switch from quantization to exact scoring on refinement.
+                        if cluster % 3 == 0 && layer == 2 {
+                            for &(_, _, score) in &current {
+                                exact.push(score);
+                                bound.push_exact(score);
+                            }
+                            current.clear();
+                        } else {
+                            bound.merge_running(&current);
+                        }
+                        let mut selected = completed.clone();
+                        selected.extend_from_slice(&current);
+                        selected.sort_unstable_by(lower_endpoint_order);
+                        selected.truncate(k);
+                        let mut lowers: Vec<_> = selected
+                            .iter()
+                            .map(|entry| entry.0)
+                            .chain(exact.iter().copied())
+                            .collect();
+                        let mut estimates: Vec<_> = selected
+                            .iter()
+                            .map(|entry| entry.2)
+                            .chain(exact.iter().copied())
+                            .collect();
+                        lowers.sort_unstable_by(|a, b| b.total_cmp(a));
+                        estimates.sort_unstable_by(|a, b| b.total_cmp(a));
+                        let at = k.checked_sub(1);
+                        assert_eq!(
+                            bound.running_lower(),
+                            at.and_then(|i| lowers.get(i).copied())
+                        );
+                        assert_eq!(
+                            bound.running_estimate(),
+                            at.and_then(|i| estimates.get(i).copied())
+                        );
+                        assert_eq!(bound.running.entries, saved);
+                        assert_eq!(bound.running.estimates, saved_estimates);
+                    }
+                    let before = (bound.running_lower(), bound.running_estimate());
+                    bound.commit_cluster();
+                    assert_eq!((bound.running_lower(), bound.running_estimate()), before);
+                    completed.extend(current);
+                }
+            }
+        }
+    }
 
     fn threshold(value: f32) -> Option<Threshold> {
         Some(Threshold(LowerEndpoint(value)))

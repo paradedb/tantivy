@@ -11,6 +11,8 @@ use crate::Score;
 /// How the probe loop stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize)]
 pub enum ProbeTermination {
+    /// The quantized-gap estimate reached the requested recall.
+    QuantizedRecall,
     /// The work budget was spent.
     Ceiling,
     /// The router ran out of clusters before the budget was spent.
@@ -142,6 +144,7 @@ impl WorkMeter {
 /// Tracks the APS recall estimate and decides, from the work meter, whether the next ranked
 /// cluster opens.
 pub(in crate::vector) struct ProbeController<'a> {
+    enforce_budget: bool,
     termination: ProbeTermination,
     /// Clusters in the segment and clusters pulled from the ranking so far.
     clusters: usize,
@@ -157,8 +160,10 @@ impl<'a> ProbeController<'a> {
         clusters: usize,
         estimator: Option<RecallEstimator<'a>>,
         recall_target: f32,
+        enforce_budget: bool,
     ) -> Self {
         Self {
+            enforce_budget,
             termination: ProbeTermination::Exhausted,
             clusters,
             pulled: 0,
@@ -180,7 +185,7 @@ impl<'a> ProbeController<'a> {
             self.termination = ProbeTermination::RecallTarget;
             return false;
         }
-        if meter.exhausted() {
+        if self.enforce_budget && meter.exhausted() {
             self.termination = ProbeTermination::Ceiling;
             return false;
         }
@@ -204,7 +209,9 @@ impl<'a> ProbeController<'a> {
         // A stacked ranking sized to the budget can run out as the budget is spent, short of the
         // segment's clusters; that stop is the ceiling's.
         let termination = match self.termination {
-            ProbeTermination::Exhausted if self.pulled < self.clusters && meter.exhausted() => {
+            ProbeTermination::Exhausted
+                if self.enforce_budget && self.pulled < self.clusters && meter.exhausted() =>
+            {
                 ProbeTermination::Ceiling
             }
             termination => termination,
@@ -228,4 +235,24 @@ pub(crate) struct ProbeOutcome {
     pub(crate) work_budget: f32,
     /// The APS recall estimate at the stop; `None` when APS was off or never armed.
     pub(crate) recall_estimate: Option<f32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_probing_ignores_exhausted_work_meter() {
+        let meter = WorkMeter::new(WorkBudget::default());
+        assert!(meter.exhausted());
+        let mut fixed = ProbeController::new(10, None, 1.0, true);
+        assert!(!fixed.admit(&meter));
+        assert_eq!(fixed.finish(&meter).termination, ProbeTermination::Ceiling);
+        let mut adaptive = ProbeController::new(10, None, 1.0, false);
+        assert!(adaptive.admit(&meter));
+        assert_eq!(
+            adaptive.finish(&meter).termination,
+            ProbeTermination::Exhausted
+        );
+    }
 }

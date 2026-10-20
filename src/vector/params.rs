@@ -17,9 +17,12 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 /// provisional pending real-data benchmarking.
 #[derive(Clone, Debug)]
 pub struct ProbeParams {
-    /// Work ceiling as a fraction of each segment's capacity. Default 0.01.
+    /// Adaptive score-gap recall estimate; enables deferred reranking.
+    pub quantized_recall: Option<QuantizedRecallParams>,
+    /// Work ceiling as a fraction of segment capacity. Ignored with quantized recall. Default
+    /// 0.01.
     pub max_probe_fraction: f32,
-    /// Floor on the resolved budget, in work units, applied before the capacity cap. Default 16.
+    /// Work-budget floor. Ignored with quantized recall. Default 16.
     pub min_probe_clusters: usize,
     /// Recall target for the stacked router's ranking, in `(0, 1]`; `1.0` routes with the fixed
     /// nprobe fractions. Forced to `1.0` above 128 dimensions. Default [`DEFAULT_ROUTER_RECALL`].
@@ -40,6 +43,19 @@ pub struct ProbeParams {
     pub fixed_probe_cost_rows: f64,
 }
 
+/// Normalized centroid-gap recall estimate, including unexplored router groups.
+#[derive(Clone, Copy, Debug)]
+pub struct QuantizedRecallParams {
+    pub target: f64,
+    pub recall_exponent: f64,
+}
+
+impl QuantizedRecallParams {
+    pub(crate) fn gap_threshold(self, k: usize) -> Option<f64> {
+        (k > 0 && self.target < 1.0).then(|| -self.recall_exponent * (-self.target).ln_1p())
+    }
+}
+
 /// Which segments take the located path: a segment whose filter matches at most a cap of
 /// documents, deleted ones included, skips routing and scores every match, located through the
 /// document location map.
@@ -52,7 +68,11 @@ pub enum LocatedPath {
     MaxSelectivity(Selectivity),
     /// The cap is the rows the segment's routed work budget buys with no cluster opened,
     /// `floor(budget * n_avg / (1 - x))`: a filter matching no more documents than routing may
-    /// score is located instead.
+    /// score is located instead. With adaptive recall, half the segment's cluster count is
+    /// capped by the centroid bytes in storage pages, then scaled by the log error budget
+    /// relative to target 0.95 and exponent 1.5. Stricter recall or a larger exponent permits
+    /// more matches to bypass routing, independently of the work budget. Target 1 permits every
+    /// filtered match; unfiltered queries always route.
     Auto,
 }
 
@@ -75,6 +95,7 @@ impl Selectivity {
 impl Default for ProbeParams {
     fn default() -> Self {
         Self {
+            quantized_recall: None,
             max_probe_fraction: 0.01,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
             router_recall_target: DEFAULT_ROUTER_RECALL,
@@ -114,6 +135,9 @@ impl ProbeParams {
         match_fraction: f64,
         clusters_in_segment: usize,
     ) -> usize {
+        if self.quantized_recall.is_some() {
+            return clusters_in_segment;
+        }
         let match_fraction = match_fraction.clamp(0.0, 1.0);
         let cluster_cost =
             (open_share + (1.0 - open_share) * match_fraction).max(f64::MIN_POSITIVE);
@@ -138,7 +162,19 @@ impl ProbeParams {
         clusters_in_segment: usize,
         native_docs_in_segment: usize,
     ) -> crate::Result<(f64, f64, f64)> {
-        if !(self.max_probe_fraction > 0.0) {
+        if self.quantized_recall.is_some_and(|stop| {
+            !stop.target.is_finite()
+                || !(0.0 < stop.target && stop.target <= 1.0)
+                || !stop.recall_exponent.is_finite()
+                || stop.recall_exponent <= 0.0
+        }) {
+            return Err(crate::TantivyError::InvalidArgument(
+                "quantized recall requires a target in (0, 1] and a finite positive recall \
+                 exponent"
+                    .into(),
+            ));
+        }
+        if self.quantized_recall.is_none() && !(self.max_probe_fraction > 0.0) {
             return Err(crate::TantivyError::InvalidArgument(
                 "max_probe_fraction must be greater than 0".to_string(),
             ));
@@ -153,9 +189,13 @@ impl ProbeParams {
         let x = open_share(self.fixed_probe_cost_rows, n_avg);
         let segment_units = clusters_in_segment as f64 * x
             + (1.0 - x) * native_docs_in_segment as f64 / n_avg.max(f64::MIN_POSITIVE);
-        let budget = (self.max_probe_fraction as f64 * segment_units)
-            .max(self.min_probe_clusters as f64)
-            .min(segment_units);
+        let budget = if self.quantized_recall.is_some() {
+            segment_units
+        } else {
+            (self.max_probe_fraction as f64 * segment_units)
+                .max(self.min_probe_clusters as f64)
+                .min(segment_units)
+        };
         Ok((budget, n_avg, x))
     }
 }
@@ -163,6 +203,29 @@ impl ProbeParams {
 #[cfg(test)]
 mod tests {
     use super::ProbeParams;
+
+    #[test]
+    fn adaptive_budget_ignores_probe_limits() -> crate::Result<()> {
+        for target in [0.95, 1.0] {
+            for max_probe_fraction in [f32::NAN, 0.0, 0.000001, 1.0] {
+                for min_probe_clusters in [0, 16, usize::MAX] {
+                    let params = ProbeParams {
+                        quantized_recall: Some(super::QuantizedRecallParams {
+                            target,
+                            recall_exponent: 1.5,
+                        }),
+                        max_probe_fraction,
+                        min_probe_clusters,
+                        ..Default::default()
+                    };
+                    let (budget, _, x) = params.resolved_work_budget(1000, 20_000)?;
+                    assert!((budget - 1000.0).abs() < 1e-6);
+                    assert_eq!(params.router_k(budget, x, 0.1, 1000), 1000);
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// Capacity is the cluster count, exactly, whatever the granularity:
     /// `units_seg = C*x + (1 - x)*N/n_avg == C` for every x the open

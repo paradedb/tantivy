@@ -40,6 +40,8 @@ use crate::SegmentOrdinal;
 /// Sizes for one segment scan.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ScanConfig {
+    pub(crate) deferred_rerank: bool,
+    pub(crate) quantized_recall: Option<crate::vector::QuantizedRecallParams>,
     pub(crate) top_n: usize,
     /// Upper bound on rows admitted, for sizing the candidate columns.
     pub(crate) capacity: usize,
@@ -89,6 +91,7 @@ impl LayerReport {
 /// What a finished scan reports.
 #[derive(Debug, Default)]
 pub(crate) struct ScanReport {
+    pub(crate) recall_reached: bool,
     /// Rows shortlisted from the source.
     pub(crate) candidates_scored: usize,
     /// One per active layer on a quantized segment; empty at full precision.
@@ -322,8 +325,6 @@ impl<'a> QuantizedState<'a> {
 
     /// Records the candidates `layer` scored and prunes them at its boundary.
     fn prune(&mut self, layer: usize, bound: &mut KthBound, report: &mut ScanReport) {
-        // Layer 0's kernel scores every admitted row; admission pruning drops rows before they
-        // become candidates, so the scored count keeps its own counter.
         report.layers[layer].scored = if layer == 0 {
             report.layers[0].admission_pruned = self.layer0_admission_pruned;
             self.layer0_scored
@@ -371,6 +372,8 @@ where
     /// The candidate blocks by cluster id, which is row order; set when the shortlist closes.
     by_cluster: Vec<usize>,
     report: ScanReport,
+    deferred_rerank: bool,
+    quantized_recall_gap: Option<f64>,
 }
 
 impl<'a, T, K, C> SegmentScan<'a, T, K, C>
@@ -407,6 +410,10 @@ where
         };
         let layers = quantized.as_ref().map_or(0, |state| state.layers.len());
         Ok(Self {
+            deferred_rerank: config.deferred_rerank,
+            quantized_recall_gap: config
+                .quantized_recall
+                .and_then(|p| p.gap_threshold(config.top_n)),
             exact: ExactScorer::new(reader, query.query, config.top_n, tie_break, tie_comparator),
             quantized,
             scratch: ReadScratch::default(),
@@ -421,10 +428,18 @@ where
     /// Scores one segment: shortlists each cluster `source` supplies, narrows the shortlist one
     /// quantized layer at a time, then scores what is left exactly.
     pub(crate) fn run(&mut self, source: &mut impl ClusterSource) -> crate::Result<()> {
+        if self.deferred_rerank && self.quantized.is_some() {
+            return self.run_deferred(source);
+        }
         let stage = enter_vector_stage(self.shortlist_stage());
+        let mut completed = 0;
         while let Some(rows) = source.next(self.feedback())? {
             let scored = self.shortlist(&rows)?;
             source.admitted(scored, self.feedback())?;
+            completed += 1;
+            if self.recall_reached(source, completed) {
+                break;
+            }
         }
         drop(stage);
         self.close_shortlist();
@@ -432,6 +447,74 @@ where
             self.narrow(layer)?;
         }
         self.score_shortlist()
+    }
+
+    fn run_deferred(&mut self, source: &mut impl ClusterSource) -> crate::Result<()> {
+        let mut completed = 0;
+        while let Some(rows) = source.next(self.feedback())? {
+            self.exact.bound.begin_cluster();
+            let block = self.quantized.as_ref().unwrap().candidates.block_count();
+            let scored = {
+                let _stage = enter_vector_stage(self.shortlist_stage());
+                self.shortlist(&rows)?
+            };
+            let state = self.quantized.as_mut().unwrap();
+            if state.candidates.block_count() > block {
+                for layer in 0..state.layers.len() {
+                    let _stage = enter_vector_stage(VectorStage::LayerScan(layer as u8));
+                    let count = state.candidates.rows(block).len();
+                    if layer > 0 {
+                        self.exact.bound.clear_current();
+                        if count > 0 {
+                            let selected = state.candidates.rows(block);
+                            let read = state.read_plan(&selected, layer, &mut self.scratch)?;
+                            self.report.layers[layer].count(read, count);
+                            match read {
+                                Read::Exact => {
+                                    self.report.exact_rows +=
+                                        self.exact.score(&selected, &mut self.scratch)?;
+                                    state.candidates.retire(block);
+                                    break;
+                                }
+                                Read::Layer(read) => {
+                                    state.refine(layer, block, read, &mut self.scratch)?
+                                }
+                            }
+                        }
+                        let at = state.candidates.block(block).at.clone();
+                        state.candidates.finish_cluster(at, &mut self.exact.bound);
+                    }
+                    self.report.layers[layer].scored += count;
+                    state.candidates.band_last(&self.exact.bound);
+                    let count = state.candidates.rows(block).len();
+                    self.report.layers[layer].survivors += count;
+                }
+            }
+            self.exact.bound.commit_cluster();
+            completed += 1;
+            source.admitted(scored, self.feedback())?;
+            if self.recall_reached(source, completed) {
+                break;
+            }
+        }
+        let state = self.quantized.as_mut().unwrap();
+        self.report.layers[0].scored = state.layer0_scored;
+        self.report.layers[0].admission_pruned = state.layer0_admission_pruned;
+        state.candidates.band(&mut self.exact.bound);
+        state.candidates.order_by_cluster(&mut self.by_cluster);
+        self.score_shortlist()
+    }
+
+    fn recall_reached(&mut self, source: &mut impl ClusterSource, completed: usize) -> bool {
+        let reached = self.quantized_recall_gap.is_some_and(|threshold| {
+            self.exact
+                .bound
+                .running_estimate()
+                .and_then(|cutoff| source.quantized_recall_score(cutoff, completed))
+                .is_some_and(|score| score >= threshold)
+        });
+        self.report.recall_reached |= reached;
+        reached
     }
 
     /// The stage the shortlist is built in: layer 0, or the exact scan at full precision.

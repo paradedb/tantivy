@@ -114,10 +114,38 @@ impl BuiltRouter {
     }
 }
 
+/// Controls the probe window when searching parent router levels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RoutingWindow {
+    #[default]
+    Initial,
+    Doubled,
+    Full,
+}
+
+impl RoutingWindow {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Initial => Self::Doubled,
+            Self::Doubled | Self::Full => Self::Full,
+        }
+    }
+
+    pub(crate) fn probes(self, initial: usize, total: usize) -> usize {
+        match self {
+            Self::Initial => initial.min(total),
+            Self::Doubled => initial.saturating_mul(2).min(total),
+            Self::Full => total,
+        }
+    }
+}
+
 /// Per-query routing knobs. Only the stacked router reads them; the exact router ranks the same
 /// way regardless.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RoutingParams {
+    /// Widening stage of the normal parent probe window.
+    pub(crate) window: RoutingWindow,
     /// Clusters the caller expects to probe. The stacked router ranks at
     /// least this many members when APS is on; with APS off it ranks every
     /// member of the lists its nprobe fraction selects.
@@ -132,6 +160,7 @@ pub(crate) struct RoutingParams {
 impl Default for RoutingParams {
     fn default() -> Self {
         Self {
+            window: RoutingWindow::Initial,
             k: usize::MAX,
             recall: 1.0,
         }
@@ -146,6 +175,28 @@ pub(crate) enum RouterIter {
 }
 
 impl RouterIter {
+    pub(crate) fn unsearched_score(&self) -> Option<f32> {
+        match self {
+            Self::Stacked(ranking) => ranking.unsearched_score(),
+            _ => None,
+        }
+    }
+    pub(crate) fn for_each_candidate(&self, mut visit: impl FnMut(Candidate)) {
+        match self {
+            #[cfg(test)]
+            Self::Explicit(ranking) => ranking.as_slice().iter().copied().for_each(visit),
+            Self::Exact(ranking) => ranking.ranked.as_slice().iter().copied().for_each(visit),
+            Self::Stacked(ranking) => {
+                for candidate in ranking.ranked.as_slice() {
+                    visit(Candidate {
+                        sim: candidate.sim,
+                        node: candidate.node.0,
+                    });
+                }
+            }
+        }
+    }
+
     pub(crate) fn metrics(&self) -> RouterMetrics {
         match self {
             #[cfg(test)]
@@ -230,7 +281,9 @@ impl OpenedRouter {
 pub enum RouterMetrics {
     /// The stacked router's work.
     Stacked {
-        /// Ranked centroids handed to the probe loop.
+        /// Routing passes, including expansions.
+        passes: usize,
+        /// Ranked centroids returned across passes, including repeated candidates.
         candidate_count: usize,
         /// Router lists opened, summed over every router level.
         lists_scanned: usize,
@@ -245,6 +298,42 @@ pub enum RouterMetrics {
         /// Centroids scored.
         visited_count: usize,
     },
+}
+
+impl RouterMetrics {
+    /// Accumulates diagnostic counters across routing passes, including repeated work.
+    pub(crate) fn accumulate(&mut self, next: Self) {
+        match (self, next) {
+            (
+                Self::Stacked {
+                    passes,
+                    candidate_count,
+                    lists_scanned,
+                    members_scored,
+                    ..
+                },
+                Self::Stacked {
+                    passes: next_passes,
+                    candidate_count: candidates,
+                    lists_scanned: lists,
+                    members_scored: members,
+                    ..
+                },
+            ) => {
+                *passes += next_passes;
+                *candidate_count += candidates;
+                *lists_scanned += lists;
+                *members_scored += members;
+            }
+            (
+                Self::Exact { visited_count },
+                Self::Exact {
+                    visited_count: count,
+                },
+            ) => *visited_count += count,
+            _ => unreachable!("router kind cannot change during expansion"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +441,7 @@ mod tests {
                 lists_scanned,
                 members_scored,
                 recall_target,
+                ..
             } => (
                 candidate_count,
                 lists_scanned,
@@ -368,7 +458,11 @@ mod tests {
     fn stacked_ranking_uses_requested_recall_within_dim_cap() -> crate::Result<()> {
         let opened = open_stacked(2, 64)?;
         let query = vec![0.0f32; 2];
-        let params = RoutingParams { k: 8, recall: 0.5 };
+        let params = RoutingParams {
+            k: 8,
+            recall: 0.5,
+            ..Default::default()
+        };
         let ranking = opened.rank(&query, Metric::L2, params);
         let (candidates, lists, scored, recall) = stacked_metrics(ranking.metrics());
         assert_eq!(recall, 0.5);
@@ -389,7 +483,11 @@ mod tests {
         let dim = crate::vector::router::stacked::aps::APS_MAX_DIM + 1;
         let opened = open_stacked(dim, 32)?;
         let query = vec![0.0f32; dim];
-        let params = RoutingParams { k: 2, recall: 0.5 };
+        let params = RoutingParams {
+            k: 2,
+            recall: 0.5,
+            ..Default::default()
+        };
         let ranking = opened.rank(&query, Metric::L2, params);
         let (candidates, lists, scored, recall) = stacked_metrics(ranking.metrics());
         assert_eq!(recall, 1.0, "dimension cap must force the nprobe path");
