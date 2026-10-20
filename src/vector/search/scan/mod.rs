@@ -432,9 +432,14 @@ where
             return self.run_deferred(source);
         }
         let stage = enter_vector_stage(self.shortlist_stage());
+        let mut completed = 0;
         while let Some(rows) = source.next(self.feedback())? {
             let scored = self.shortlist(&rows)?;
             source.admitted(scored, self.feedback())?;
+            completed += 1;
+            if self.recall_reached(source, completed) {
+                break;
+            }
         }
         drop(stage);
         self.close_shortlist();
@@ -488,15 +493,7 @@ where
             completed_bound.copy_running_from(&self.exact.bound);
             completed += 1;
             source.admitted(scored, self.feedback())?;
-            let recall_reached = self.quantized_recall_gap.is_some_and(|threshold| {
-                self.exact
-                    .bound
-                    .running_estimate()
-                    .and_then(|cutoff| source.quantized_recall_score(cutoff, completed))
-                    .is_some_and(|score| score >= threshold)
-            });
-            if recall_reached {
-                self.report.recall_reached = true;
+            if self.recall_reached(source, completed) {
                 break;
             }
         }
@@ -506,6 +503,18 @@ where
         state.candidates.band(&mut self.exact.bound);
         state.candidates.order_by_cluster(&mut self.by_cluster);
         self.score_shortlist()
+    }
+
+    fn recall_reached(&mut self, source: &mut impl ClusterSource, completed: usize) -> bool {
+        let reached = self.quantized_recall_gap.is_some_and(|threshold| {
+            self.exact
+                .bound
+                .running_estimate()
+                .and_then(|cutoff| source.quantized_recall_score(cutoff, completed))
+                .is_some_and(|score| score >= threshold)
+        });
+        self.report.recall_reached |= reached;
+        reached
     }
 
     /// The stage the shortlist is built in: layer 0, or the exact scan at full precision.

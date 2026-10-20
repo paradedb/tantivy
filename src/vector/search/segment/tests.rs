@@ -34,10 +34,16 @@ fn adaptive_cascade_matches_oracle_and_prefix_replay() -> crate::Result<()> {
         PlanOverride::exact(|cluster, layer| cluster % 3 == layer),
     ];
     let mut stops = 0;
+    let mut plain_stops = 0;
     let mut exact_layers = [0; 3];
     for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
-        for schedule in [&[1][..], &[1, 1][..], &[1, 1, 4][..]] {
-            let fixture = matrix_fixture(metric, Representation::Quantized(schedule), true)?;
+        for schedule in [&[][..], &[1][..], &[1, 1][..], &[1, 1, 4][..]] {
+            let representation = if schedule.is_empty() {
+                Representation::FullPrecision
+            } else {
+                Representation::Quantized(schedule)
+            };
+            let fixture = matrix_fixture(metric, representation, true)?;
             for filter in [
                 &AllQuery as &dyn Query,
                 &fixture.filter("half"),
@@ -122,6 +128,7 @@ fn adaptive_cascade_matches_oracle_and_prefix_replay() -> crate::Result<()> {
                                 previous_prefix = prefix;
                                 if report.termination == ProbeTermination::QuantizedRecall {
                                     stops += 1;
+                                    plain_stops += usize::from(schedule.is_empty());
                                     assert!(target < 1.0);
                                 }
                                 let (replay, replay_report) =
@@ -150,6 +157,10 @@ fn adaptive_cascade_matches_oracle_and_prefix_replay() -> crate::Result<()> {
         }
     }
     assert!(stops > 0);
+    assert!(
+        plain_stops > 0,
+        "unquantized IVF must honor adaptive stopping"
+    );
     assert!(exact_layers.iter().all(|&rows| rows > 0));
     Ok(())
 }

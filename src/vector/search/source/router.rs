@@ -231,11 +231,21 @@ impl AdaptiveProgress {
         self.centroid = f64::from(candidate.sim.score());
     }
 
-    fn score(&self, cutoff: f32, completed: usize) -> Option<f64> {
+    fn local_score(&self, cutoff: f32, completed: usize) -> Option<f64> {
         (cutoff.is_finite() && completed > 0).then(|| {
             (completed as f64).ln() - (self.remaining / self.total).ln()
                 + (f64::from(cutoff) - self.centroid) / self.sigma
         })
+    }
+
+    fn score(&self, cutoff: f32, completed: usize, threshold: f64) -> Option<(f64, bool)> {
+        let local_miss = (-self.local_score(cutoff, completed)?).exp();
+        let routing_miss = self.routing_miss(cutoff);
+        let budget = (-threshold).exp();
+        Some((
+            -(local_miss + routing_miss).ln(),
+            local_miss <= budget && routing_miss >= budget,
+        ))
     }
 
     fn routing_miss(&self, cutoff: f32) -> f64 {
@@ -274,7 +284,7 @@ mod adaptive_tests {
                 assert!(
                     (progress.remaining - progress.weights[1] - progress.weights[3]).abs() < 1e-10
                 );
-                let score = progress.score(scale * 1.5 + shift, 2).unwrap();
+                let score = progress.local_score(scale * 1.5 + shift, 2).unwrap();
                 let sigma = 5.0_f64.sqrt();
                 let remaining = 200.0 * (-2.0 / sigma).exp() + 400.0 * (-6.0 / sigma).exp();
                 let total = 100.0 + remaining + 50.0 * (-4.0 / sigma).exp();
@@ -284,10 +294,48 @@ mod adaptive_tests {
                     assert!((score - previous).abs() < 1e-10);
                 }
                 reference = Some(score);
-                assert!(progress.score(f32::NAN, 2).is_none());
-                assert!(progress.score(0.0, 0).is_none());
+                assert!(progress.local_score(f32::NAN, 2).is_none());
+                assert!(progress.local_score(0.0, 0).is_none());
             }
         }
+    }
+
+    #[test]
+    fn competitive_unexplored_frontier_does_not_decay_with_completed_clusters() {
+        let candidates: Vec<_> = (0..100)
+            .map(|node| Candidate {
+                node,
+                sim: Similarity::new(1.0 - node as f32 / 100.0),
+            })
+            .collect();
+        let ranked = RouterIter::Explicit(candidates.clone().into_iter());
+        let mut progress = AdaptiveProgress::new(&ranked, 10_000, |_| 100).unwrap();
+        progress.frontier = Some(2.0);
+        let threshold = crate::vector::QuantizedRecallParams {
+            target: 0.95,
+            recall_exponent: 1.5,
+        }
+        .gap_threshold(10)
+        .unwrap();
+        for (i, candidate) in candidates.into_iter().enumerate() {
+            progress.complete(candidate);
+            assert_eq!(progress.routing_miss(1.0), 1.0);
+            let (score, expand) = progress.score(1.0, i + 1, threshold).unwrap();
+            assert!(score < threshold, "stopped after {} clusters", i + 1);
+            if (-progress.local_score(1.0, i + 1).unwrap()).exp() <= (-threshold).exp() {
+                assert!(expand, "must explore the competitive frontier");
+            }
+        }
+        for completed in [100, 1_000, 10_000] {
+            let (score, expand) = progress.score(1.0, completed, threshold).unwrap();
+            assert!(score < threshold);
+            assert!(expand);
+        }
+        progress.frontier = Some(-10.0);
+        assert!(progress.score(1.0, 100, threshold).unwrap().0 >= threshold);
+        progress.frontier = Some(2.0);
+        progress.outside = 0.0;
+        assert!(progress.score(1.0, 100, threshold).unwrap().0 >= threshold);
     }
 
     #[test]
@@ -338,7 +386,7 @@ mod adaptive_tests {
         let remaining = 100.0 * (-2.0_f64).exp();
         assert!((progress.remaining - remaining).abs() < 1e-10);
         let expected = -(remaining / (100.0 + remaining)).ln() + 2.0;
-        assert!((progress.score(3.0, 1).unwrap() - expected).abs() < 1e-10);
+        assert!((progress.local_score(3.0, 1).unwrap() - expected).abs() < 1e-10);
         progress.complete(candidates[1]);
         assert!(progress.remaining.abs() < 1e-10);
         assert_eq!(progress.routing_miss(3.0), 1.0);
@@ -564,16 +612,12 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
 
 impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
     fn quantized_recall_score(&mut self, cutoff: f32, completed: usize) -> Option<f64> {
-        let progress = self.adaptive.as_ref()?;
-        let score = progress.score(cutoff, completed)?;
-        let local_miss = (-score).exp();
-        let routing_miss = progress.routing_miss(cutoff) / completed as f64;
-        let combined = -(local_miss + routing_miss).ln();
-        self.expand_next = self.more_routing
-            && self.threshold.is_some_and(|threshold| {
-                local_miss <= (-threshold).exp() && routing_miss >= (-threshold).exp()
-            });
-        Some(combined)
+        let (score, expand) = self
+            .adaptive
+            .as_ref()?
+            .score(cutoff, completed, self.threshold?)?;
+        self.expand_next = self.more_routing && expand;
+        Some(score)
     }
 
     fn next(&mut self, feedback: Feedback) -> crate::Result<Option<ClusterRows<'_>>> {
