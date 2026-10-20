@@ -114,12 +114,37 @@ impl BuiltRouter {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RoutingExpansion {
+    #[default]
+    Initial,
+    Doubled,
+    Full,
+}
+
+impl RoutingExpansion {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Initial => Self::Doubled,
+            Self::Doubled | Self::Full => Self::Full,
+        }
+    }
+
+    pub(crate) fn probes(self, initial: usize, total: usize) -> usize {
+        match self {
+            Self::Initial => initial.min(total),
+            Self::Doubled => initial.saturating_mul(2).min(total),
+            Self::Full => total,
+        }
+    }
+}
+
 /// Per-query routing knobs. Only the stacked router reads them; the exact router ranks the same
 /// way regardless.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RoutingParams {
-    /// Multiplier of the normal parent probe window.
-    pub(crate) expansion: usize,
+    /// Widening stage of the normal parent probe window.
+    pub(crate) expansion: RoutingExpansion,
     /// Clusters the caller expects to probe. The stacked router ranks at
     /// least this many members when APS is on; with APS off it ranks every
     /// member of the lists its nprobe fraction selects.
@@ -134,7 +159,7 @@ pub(crate) struct RoutingParams {
 impl Default for RoutingParams {
     fn default() -> Self {
         Self {
-            expansion: 1,
+            expansion: RoutingExpansion::Initial,
             k: usize::MAX,
             recall: 1.0,
         }

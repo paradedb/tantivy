@@ -31,6 +31,7 @@ use crate::vector::router::arena::{FileSliceArena, VectorArena};
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::aps;
 use crate::vector::router::stacked::aps::RecallEstimator;
+use crate::vector::router::RoutingExpansion;
 use crate::vector::VectorElement;
 
 /// Row index into a level's centroid or member arena.
@@ -916,7 +917,7 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         recall: f32,
         metric: Metric,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-        self.search_expanded(query, k, recall, metric, 1)
+        self.search_expanded(query, k, recall, metric, RoutingExpansion::Initial)
     }
 
     pub(crate) fn search_expanded(
@@ -925,7 +926,7 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         k: usize,
         recall: f32,
         metric: Metric,
-        expansion: usize,
+        expansion: RoutingExpansion,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
         if k == 0 {
             return (Vec::new(), StackedSearchStats::default());
@@ -945,8 +946,12 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
             };
             parent.search_expanded(
                 query,
-                self.n_probe().saturating_mul(expansion).min(self.nlist()),
-                if expansion > 1 { 1.0 } else { parent_recall },
+                expansion.probes(self.n_probe(), self.nlist()),
+                if expansion == RoutingExpansion::Initial {
+                    parent_recall
+                } else {
+                    1.0
+                },
                 metric,
                 expansion,
             )
@@ -1399,12 +1404,15 @@ mod tests {
         let (index, _) = StackedIvfBuilder::new(data, n, 2, &clusterer, test_config(4)).build();
         let query = [7.5, 0.0];
         let (normal, stats) = index.search(&query, n, 1.0, Metric::L2);
-        let (initial, initial_stats) = index.search_expanded(&query, n, 1.0, Metric::L2, 1);
+        let (initial, initial_stats) =
+            index.search_expanded(&query, n, 1.0, Metric::L2, RoutingExpansion::Initial);
         assert_eq!(normal, initial);
         assert_eq!(stats.members_scored, initial_stats.members_scored);
         assert!(stats.unsearched_score.is_some());
         let mut previous: std::collections::BTreeSet<_> = normal.iter().map(|c| c.node).collect();
-        for expansion in [2, 4, 16, 256] {
+        let mut expansion = RoutingExpansion::Initial;
+        for _ in 0..3 {
+            expansion = expansion.next();
             let (hits, stats) = index.search_expanded(&query, n, 1.0, Metric::L2, expansion);
             let current: std::collections::BTreeSet<_> = hits.iter().map(|c| c.node).collect();
             assert!(previous.is_subset(&current));
@@ -1440,7 +1448,8 @@ mod tests {
             assert_eq!(hits.len(), 2);
             assert_eq!(stats.members_scored, 5);
             assert_eq!(stats.unsearched_score, Some(-101.0 * scale * scale));
-            let (hits, stats) = index.search_expanded(&[0.0], 4, 1.0, Metric::L2, 2);
+            let (hits, stats) =
+                index.search_expanded(&[0.0], 4, 1.0, Metric::L2, RoutingExpansion::Doubled);
             assert_eq!(hits.len(), 4);
             assert_eq!(stats.unsearched_score, None);
         }

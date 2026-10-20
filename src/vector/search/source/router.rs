@@ -7,7 +7,7 @@ use crate::fastfield::AliveBitSet;
 use crate::schema::Metric;
 use crate::vector::params::ProbeParams;
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::{RouterIter, RouterMetrics, RoutingParams};
+use crate::vector::router::{RouterIter, RouterMetrics, RoutingExpansion, RoutingParams};
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource, Feedback};
 use crate::vector::search::prepared::VectorQuery;
 use crate::vector::search::source::controller::{
@@ -485,7 +485,7 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
             .expect("the router source runs on an IVF segment");
         let clusters = index.num_clusters();
         let routing = RoutingParams {
-            expansion: 1,
+            expansion: RoutingExpansion::Initial,
             k: params.router_k(
                 budget.total.get(),
                 budget.per_cluster.get(),
@@ -555,7 +555,7 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
             return false;
         }
         let _routing = enter_vector_stage(VectorStage::Routing);
-        self.routing.expansion = self.routing.expansion.saturating_mul(2);
+        self.routing.expansion = self.routing.expansion.next();
         self.ranked = self.index.rank_clusters(self.query.widened(), self.routing);
         self.routing_metrics.accumulate(self.ranked.metrics());
         let mut count = 0;
