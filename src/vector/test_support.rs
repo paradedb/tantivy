@@ -187,7 +187,9 @@ impl FixtureSpec {
             layout: Layout::Ivf(centroids),
             schedule: Vec::new(),
             paged: false,
-            router: RouterKind::Stacked,
+            // Exact: small fixtures have few lists; Stacked's hard 25% top prune
+            // cannot open them all, so oracle/exhaustive tests would be invalid.
+            router: RouterKind::Exact,
             segments: 1,
             deletes: Vec::new(),
         }
@@ -229,7 +231,7 @@ impl FixtureSpec {
             layout: Layout::Flat,
             schedule: Vec::new(),
             paged: false,
-            router: RouterKind::Stacked,
+            router: RouterKind::Exact,
             segments: 1,
             deletes: Vec::new(),
         }
