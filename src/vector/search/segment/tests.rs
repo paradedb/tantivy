@@ -344,6 +344,8 @@ fn adaptive_probe_finds_nn_outside_nearest_cluster() -> crate::Result<()> {
             vec![10.0, 10.0],
         ],
     )
+    // Exact: Stacked's hard 25% top prune keeps only one of two lists even under Exhaustive.
+    .router(RouterKind::Exact)
     .build()?;
     let query = [1.0, 1.0];
     let oracle = fixture.oracle(&AllQuery, &query, 1)?;
