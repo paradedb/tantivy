@@ -68,8 +68,11 @@ pub enum LocatedPath {
     MaxSelectivity(Selectivity),
     /// The cap is the rows the segment's routed work budget buys with no cluster opened,
     /// `floor(budget * n_avg / (1 - x))`: a filter matching no more documents than routing may
-    /// score is located instead. With quantized recall, the cap is half the segment's cluster
-    /// count, independent of the work budget.
+    /// score is located instead. With adaptive recall, half the segment's cluster count is
+    /// capped by the centroid bytes in storage pages, then scaled by the log error budget
+    /// relative to target 0.95 and exponent 1.5. Stricter recall or a larger exponent permits
+    /// more matches to bypass routing, independently of the work budget. Target 1 permits every
+    /// filtered match; unfiltered queries always route.
     Auto,
 }
 
