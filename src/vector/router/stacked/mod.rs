@@ -23,9 +23,9 @@ use crate::TantivyError;
 /// `.centroids`) is L0 and is probed by the caller's work budget; every
 /// level of this router sits above it and is a parent, so the bottom router
 /// level uses [`PARENT_NPROBE_FRACTION`] too rather than the standalone
-/// L0 default. Build-only knobs (`branching_factor`, `max_leaf_size`) keep
-/// their defaults; the config is not persisted, so open must agree with
-/// build only on what search reads.
+/// L0 default. Each level uses `nlist = ceil(√n)`; parents are added
+/// while the top has at least 256 lists. The config is not persisted, so
+/// open must agree with build only on what search reads.
 fn router_config() -> StackedIvfConfig {
     StackedIvfConfig {
         nprobe_fraction: PARENT_NPROBE_FRACTION,
