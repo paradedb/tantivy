@@ -253,7 +253,8 @@ impl AdaptiveProgress {
             return 0.0;
         }
         self.frontier.map_or(1.0, |frontier| {
-            (self.outside * ((frontier - f64::from(cutoff)) / self.sigma).exp()).min(1.0)
+            let gap = (f64::from(cutoff) - frontier) / self.sigma;
+            self.outside * 0.5 * libm::erfc(gap / std::f64::consts::SQRT_2)
         })
     }
 }
@@ -317,9 +318,11 @@ mod adaptive_tests {
         }
         .gap_threshold(10)
         .unwrap();
+        let routing_miss = progress.routing_miss(1.0);
+        assert!(routing_miss >= progress.outside / 2.0);
         for (i, candidate) in candidates.into_iter().enumerate() {
             progress.complete(candidate);
-            assert_eq!(progress.routing_miss(1.0), 1.0);
+            assert_eq!(progress.routing_miss(1.0), routing_miss);
             let (score, expand) = progress.score(1.0, i + 1, threshold).unwrap();
             assert!(score < threshold, "stopped after {} clusters", i + 1);
             if (-progress.local_score(1.0, i + 1).unwrap()).exp() <= (-threshold).exp() {
@@ -336,6 +339,46 @@ mod adaptive_tests {
         progress.frontier = Some(2.0);
         progress.outside = 0.0;
         assert!(progress.score(1.0, 100, threshold).unwrap().0 >= threshold);
+    }
+
+    #[test]
+    fn routing_tail_is_scale_invariant_and_monotone() {
+        for scale in [0.125_f32, 1.0, 1024.0] {
+            for shift in [-16.0_f32, 0.0, 32.0] {
+                let ranked = RouterIter::Explicit(
+                    [1.0, -1.0]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(node, score)| Candidate {
+                            node: node as u32,
+                            sim: Similarity::new(scale * score + shift),
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter(),
+                );
+                let mut progress = AdaptiveProgress::new(&ranked, 4, |_| 100).unwrap();
+                progress.frontier = Some(f64::from(shift));
+                let mut previous = 1.0;
+                for (gap, expected) in [
+                    (-1.0, 0.42067237303427146),
+                    (0.0, 0.25),
+                    (1.0, 0.07932762696572854),
+                    (2.0, 0.01137506597408961),
+                    (3.0, 0.0006749490158150479),
+                ] {
+                    let miss = progress.routing_miss(scale * gap + shift);
+                    assert!((miss - expected).abs() < 1e-12);
+                    assert!(miss < previous);
+                    previous = miss;
+                }
+                assert_eq!(progress.routing_miss(f32::MAX), 0.0);
+                assert_eq!(progress.routing_miss(f32::MIN), progress.outside);
+                progress.frontier = None;
+                assert_eq!(progress.routing_miss(shift), 1.0);
+                progress.outside = 0.0;
+                assert_eq!(progress.routing_miss(shift), 0.0);
+            }
+        }
     }
 
     #[test]
