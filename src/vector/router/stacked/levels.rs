@@ -31,7 +31,7 @@ use crate::vector::router::arena::{FileSliceArena, VectorArena};
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::aps;
 use crate::vector::router::stacked::aps::RecallEstimator;
-use crate::vector::router::RoutingExpansion;
+use crate::vector::router::RoutingWindow;
 use crate::vector::VectorElement;
 
 /// Row index into a level's centroid or member arena.
@@ -917,16 +917,21 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         recall: f32,
         metric: Metric,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-        self.search_expanded(query, k, recall, metric, RoutingExpansion::Initial)
+        self.search_windowed(query, k, recall, metric, RoutingWindow::Initial)
     }
 
-    pub(crate) fn search_expanded(
+    /// The window limits how many candidate lists a parent returns at each recursive level:
+    /// Initial uses that level's configured probe fraction (25% for router parent levels),
+    /// Doubled doubles its probe count, and Full includes every list. Levels without a parent
+    /// rank all their centroids; a shallow router therefore has no parent window to widen.
+    /// Wider windows disable APS in parent searches. This does not limit document-cluster probing.
+    pub(crate) fn search_windowed(
         &self,
         query: &[S::Elem],
         k: usize,
         recall: f32,
         metric: Metric,
-        expansion: RoutingExpansion,
+        window: RoutingWindow,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
         if k == 0 {
             return (Vec::new(), StackedSearchStats::default());
@@ -944,16 +949,16 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
             } else {
                 recall.max(1.0)
             };
-            parent.search_expanded(
+            parent.search_windowed(
                 query,
-                expansion.probes(self.n_probe(), self.nlist()),
-                if expansion == RoutingExpansion::Initial {
+                window.probes(self.n_probe(), self.nlist()),
+                if window == RoutingWindow::Initial {
                     parent_recall
                 } else {
                     1.0
                 },
                 metric,
-                expansion,
+                window,
             )
         } else {
             let mut all: Vec<Candidate<ClusterId>> = (0..self.nlist())
@@ -1397,7 +1402,7 @@ mod tests {
     }
 
     #[test]
-    fn expansion_preserves_normal_routing_and_eventually_covers_every_member() {
+    fn window_preserves_normal_routing_and_eventually_covers_every_member() {
         let n = 256;
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer::default();
@@ -1405,15 +1410,15 @@ mod tests {
         let query = [7.5, 0.0];
         let (normal, stats) = index.search(&query, n, 1.0, Metric::L2);
         let (initial, initial_stats) =
-            index.search_expanded(&query, n, 1.0, Metric::L2, RoutingExpansion::Initial);
+            index.search_windowed(&query, n, 1.0, Metric::L2, RoutingWindow::Initial);
         assert_eq!(normal, initial);
         assert_eq!(stats.members_scored, initial_stats.members_scored);
         assert!(stats.unsearched_score.is_some());
         let mut previous: std::collections::BTreeSet<_> = normal.iter().map(|c| c.node).collect();
-        let mut expansion = RoutingExpansion::Initial;
+        let mut window = RoutingWindow::Initial;
         for _ in 0..3 {
-            expansion = expansion.next();
-            let (hits, stats) = index.search_expanded(&query, n, 1.0, Metric::L2, expansion);
+            window = window.next();
+            let (hits, stats) = index.search_windowed(&query, n, 1.0, Metric::L2, window);
             let current: std::collections::BTreeSet<_> = hits.iter().map(|c| c.node).collect();
             assert!(previous.is_subset(&current));
             assert!(hits.windows(2).all(|pair| pair[0] >= pair[1]));
@@ -1449,7 +1454,7 @@ mod tests {
             assert_eq!(stats.members_scored, 5);
             assert_eq!(stats.unsearched_score, Some(-101.0 * scale * scale));
             let (hits, stats) =
-                index.search_expanded(&[0.0], 4, 1.0, Metric::L2, RoutingExpansion::Doubled);
+                index.search_windowed(&[0.0], 4, 1.0, Metric::L2, RoutingWindow::Doubled);
             assert_eq!(hits.len(), 4);
             assert_eq!(stats.unsearched_score, None);
         }

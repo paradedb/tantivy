@@ -113,7 +113,7 @@ pub(super) fn rank(
     // lists avoids the classic IVF boundary miss; capping the heap (and
     // thus `candidate_count`) is what ties the returned set to probe.
     let k = params.k.clamp(1, index.vectors.len().max(1));
-    let (ranked, stats) = index.search_expanded(query, k, recall, metric, params.expansion);
+    let (ranked, stats) = index.search_windowed(query, k, recall, metric, params.window);
     let candidate_count = ranked.len();
     Ranking {
         ranked: ranked.into_iter(),

@@ -115,14 +115,14 @@ impl BuiltRouter {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum RoutingExpansion {
+pub(crate) enum RoutingWindow {
     #[default]
     Initial,
     Doubled,
     Full,
 }
 
-impl RoutingExpansion {
+impl RoutingWindow {
     pub(crate) fn next(self) -> Self {
         match self {
             Self::Initial => Self::Doubled,
@@ -144,7 +144,7 @@ impl RoutingExpansion {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RoutingParams {
     /// Widening stage of the normal parent probe window.
-    pub(crate) expansion: RoutingExpansion,
+    pub(crate) window: RoutingWindow,
     /// Clusters the caller expects to probe. The stacked router ranks at
     /// least this many members when APS is on; with APS off it ranks every
     /// member of the lists its nprobe fraction selects.
@@ -159,7 +159,7 @@ pub(crate) struct RoutingParams {
 impl Default for RoutingParams {
     fn default() -> Self {
         Self {
-            expansion: RoutingExpansion::Initial,
+            window: RoutingWindow::Initial,
             k: usize::MAX,
             recall: 1.0,
         }
