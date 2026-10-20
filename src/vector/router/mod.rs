@@ -114,6 +114,7 @@ impl BuiltRouter {
     }
 }
 
+/// Controls the probe window when searching parent router levels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum RoutingWindow {
     #[default]
@@ -300,6 +301,7 @@ pub enum RouterMetrics {
 }
 
 impl RouterMetrics {
+    /// Accumulates diagnostic counters across routing passes, including repeated work.
     pub(crate) fn accumulate(&mut self, next: Self) {
         match (self, next) {
             (

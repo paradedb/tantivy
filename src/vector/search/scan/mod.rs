@@ -451,8 +451,8 @@ where
 
     fn run_deferred(&mut self, source: &mut impl ClusterSource) -> crate::Result<()> {
         let mut completed = 0;
-        let mut completed_bound = KthBound::new(self.exact.bound.k);
         while let Some(rows) = source.next(self.feedback())? {
+            self.exact.bound.begin_cluster();
             let block = self.quantized.as_ref().unwrap().candidates.block_count();
             let scored = {
                 let _stage = enter_vector_stage(self.shortlist_stage());
@@ -464,7 +464,7 @@ where
                     let _stage = enter_vector_stage(VectorStage::LayerScan(layer as u8));
                     let count = state.candidates.rows(block).len();
                     if layer > 0 {
-                        self.exact.bound.copy_running_from(&completed_bound);
+                        self.exact.bound.clear_current();
                         if count > 0 {
                             let selected = state.candidates.rows(block);
                             let read = state.read_plan(&selected, layer, &mut self.scratch)?;
@@ -490,7 +490,7 @@ where
                     self.report.layers[layer].survivors += count;
                 }
             }
-            completed_bound.copy_running_from(&self.exact.bound);
+            self.exact.bound.commit_cluster();
             completed += 1;
             source.admitted(scored, self.feedback())?;
             if self.recall_reached(source, completed) {

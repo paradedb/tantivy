@@ -593,7 +593,7 @@ impl BoundaryHarness {
     /// Rows of the running top-k, in bound order.
     pub(crate) fn running_rows(&self) -> Vec<usize> {
         self.bound.as_ref().map_or_else(Vec::new, |bound| {
-            bound.running.iter().map(|entry| entry.1).collect()
+            bound.running_entries().map(|entry| entry.1).collect()
         })
     }
 }
@@ -607,16 +607,17 @@ mod incremental_tests {
         let mut candidates = QuantizedCandidates::with_capacity(6);
         candidates.kappa = 1.0;
         let mut bound = KthBound::new(2);
-        let mut completed = KthBound::new(2);
+        bound.begin_cluster();
         candidates.open_test_block();
         candidates.push_test_row(10, 110, 5.0, 0.0);
         candidates.push_test_row(20, 120, 4.0, 0.0);
         candidates.push_test_row(30, 130, 3.0, 2.0);
         candidates.finish_cluster(0..3, &mut bound);
         candidates.band_last(&bound);
-        completed.copy_running_from(&bound);
+        bound.commit_cluster();
         let before = candidates.column_trace(false);
 
+        bound.begin_cluster();
         candidates.open_test_block();
         candidates.push_test_row(40, 140, 100.0, 0.0);
         candidates.push_test_row(50, 150, 99.0, 0.0);
@@ -629,7 +630,7 @@ mod incremental_tests {
 
         candidates.columns.estimates[3] = 1.0;
         candidates.columns.estimates[4] = 2.0;
-        bound.copy_running_from(&completed);
+        bound.clear_current();
         candidates.finish_cluster(3..5, &mut bound);
         candidates.band_last(&bound);
         assert_eq!(bound.running_lower(), Some(4.0));
@@ -645,8 +646,8 @@ mod incremental_tests {
         for k in [1, 3, 10, 100] {
             let mut candidates = QuantizedCandidates::with_capacity(100);
             let mut bound = KthBound::new(k);
-            let mut completed = KthBound::new(k);
             for cluster in 0..12 {
+                bound.begin_cluster();
                 candidates.open_test_block();
                 for row in 0..7 {
                     let id = cluster * 7 + row;
@@ -660,7 +661,7 @@ mod incremental_tests {
                             candidates.columns.estimates[i] += if i % 2 == 0 { -1.0 } else { 1.0 };
                             candidates.columns.sigmas[i] *= 0.5;
                         }
-                        bound.copy_running_from(&completed);
+                        bound.clear_current();
                         candidates.finish_cluster(candidates.blocks[block].at.clone(), &mut bound);
                     }
                     let mut expected: Vec<_> = candidates
@@ -670,10 +671,13 @@ mod incremental_tests {
                         .collect();
                     expected.sort_unstable_by(lower_endpoint_order);
                     expected.truncate(k);
-                    assert_eq!(bound.running, expected);
+                    assert_eq!(
+                        bound.running_entries().copied().collect::<Vec<_>>(),
+                        expected
+                    );
                     candidates.band_last(&bound);
                 }
-                completed.copy_running_from(&bound);
+                bound.commit_cluster();
             }
             let threshold = bound.running_lower();
             candidates.band(&mut bound);
