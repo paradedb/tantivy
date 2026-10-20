@@ -694,13 +694,16 @@ mod ivf_e2e_tests {
             vector_clustering_threshold: 1,
             ..IndexSettings::default()
         };
+        // Exact ranks every centroid so both clusters are probed in distance
+        // order. A Stacked flat top over two lists would keep only
+        // ceil(0.25 × 2) = 1 list and never open the southern cluster.
         let index = Index::builder()
             .schema(schema_builder.build())
             .settings(settings)
             .ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: vec![[0.0, 10.0], [0.0, -10.0]],
             }))
-            .ivf_router(RouterKind::Stacked)
+            .ivf_router(RouterKind::Exact)
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
