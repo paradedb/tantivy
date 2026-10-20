@@ -380,9 +380,7 @@ where
         .serialize(&mut topology)?;
 
     fn serialize_level<S>(index: &StackedIvf<S>, out: &mut Vec<u8>) -> io::Result<()>
-    where
-        S: SerializableStore,
-    {
+    where S: SerializableStore {
         let nlist = index.centroids.len();
         if index.offsets.len() != nlist {
             return Err(io::Error::new(
@@ -879,8 +877,7 @@ impl StackedIvf<LazyStore> {
 }
 
 impl<S> StackedIvf<S>
-where
-    S: VectorArena<Elem = f32> + CentroidMatrix,
+where S: VectorArena<Elem = f32> + CentroidMatrix
 {
     pub fn nlist(&self) -> usize {
         self.offsets.len()
