@@ -181,6 +181,35 @@ pub(crate) struct RouterReport {
     pub(crate) probe: ProbeOutcome,
 }
 
+#[derive(Default)]
+struct ClusterEvidence {
+    rows: f64,
+    rows_squared: f64,
+    matches: f64,
+    matches_squared: f64,
+}
+
+impl ClusterEvidence {
+    fn observe(&mut self, rows: usize, matches: usize) {
+        let rows = rows as f64;
+        let matches = matches as f64;
+        self.rows += rows;
+        self.rows_squared += rows * rows;
+        self.matches += matches;
+        self.matches_squared += matches * matches;
+    }
+
+    fn risk_scale(&self) -> f64 {
+        if self.matches == 0.0 {
+            return 1.0;
+        }
+        // Effective cluster count is sum(counts)^2 / sum(counts^2).
+        let all = self.rows * self.rows / self.rows_squared.max(1.0);
+        let matching = self.matches * self.matches / self.matches_squared.max(1.0);
+        (all / matching.max(1.0)).sqrt()
+    }
+}
+
 struct AdaptiveProgress {
     weights: Box<[f64]>,
     sigma: f64,
@@ -238,8 +267,14 @@ impl AdaptiveProgress {
         })
     }
 
-    fn score(&self, cutoff: f32, completed: usize, threshold: f64) -> Option<(f64, bool)> {
-        let local_miss = (-self.local_score(cutoff, completed)?).exp();
+    fn score(
+        &self,
+        cutoff: f32,
+        completed: usize,
+        threshold: f64,
+        local_scale: f64,
+    ) -> Option<(f64, bool)> {
+        let local_miss = (-self.local_score(cutoff, completed)?).exp() * local_scale;
         let routing_miss = self.routing_miss(cutoff);
         let budget = (-threshold).exp();
         Some((
@@ -263,6 +298,65 @@ impl AdaptiveProgress {
 mod adaptive_tests {
     use super::*;
     use crate::vector::distance::Similarity;
+
+    #[test]
+    fn proportional_filters_preserve_cluster_evidence() {
+        for divisor in [1, 2, 10] {
+            let mut evidence = ClusterEvidence::default();
+            assert_eq!(evidence.risk_scale(), 1.0);
+            for rows in [100, 200, 50, 400] {
+                evidence.observe(rows, rows / divisor);
+                assert!((evidence.risk_scale() - 1.0).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn concentrated_matches_delay_local_stopping_without_discounting_routing_risk() {
+        let mut uniform = ClusterEvidence::default();
+        let mut concentrated = ClusterEvidence::default();
+        for matches in [100, 0, 0, 0] {
+            uniform.observe(100, 25);
+            concentrated.observe(100, matches);
+        }
+        assert_eq!(uniform.matches, concentrated.matches);
+        assert_eq!(uniform.risk_scale(), 1.0);
+        assert_eq!(concentrated.risk_scale(), 2.0);
+
+        let mut progress = AdaptiveProgress {
+            weights: Box::default(),
+            sigma: 1.0,
+            total: 1.0,
+            remaining: 0.1,
+            centroid: 0.0,
+            outside: 0.0,
+            frontier: Some(0.0),
+        };
+        let threshold = -0.03_f64.ln();
+        assert!(
+            progress
+                .score(0.0, 4, threshold, uniform.risk_scale())
+                .unwrap()
+                .0
+                >= threshold
+        );
+        assert!(
+            progress
+                .score(0.0, 4, threshold, concentrated.risk_scale())
+                .unwrap()
+                .0
+                < threshold
+        );
+
+        progress.remaining = 0.0;
+        progress.outside = 0.5;
+        for scale in [0.1, uniform.risk_scale(), concentrated.risk_scale(), 100.0] {
+            let (score, expand) = progress.score(0.0, 4, threshold, scale).unwrap();
+            assert_eq!((-score).exp(), progress.routing_miss(0.0));
+            assert!(score < threshold);
+            assert!(expand);
+        }
+    }
 
     #[test]
     fn remaining_weight_is_affine_invariant_and_keeps_unvisited_clusters() {
@@ -323,22 +417,22 @@ mod adaptive_tests {
         for (i, candidate) in candidates.into_iter().enumerate() {
             progress.complete(candidate);
             assert_eq!(progress.routing_miss(1.0), routing_miss);
-            let (score, expand) = progress.score(1.0, i + 1, threshold).unwrap();
+            let (score, expand) = progress.score(1.0, i + 1, threshold, 1.0).unwrap();
             assert!(score < threshold, "stopped after {} clusters", i + 1);
             if (-progress.local_score(1.0, i + 1).unwrap()).exp() <= (-threshold).exp() {
                 assert!(expand, "must explore the competitive frontier");
             }
         }
         for completed in [100, 1_000, 10_000] {
-            let (score, expand) = progress.score(1.0, completed, threshold).unwrap();
+            let (score, expand) = progress.score(1.0, completed, threshold, 1.0).unwrap();
             assert!(score < threshold);
             assert!(expand);
         }
         progress.frontier = Some(-10.0);
-        assert!(progress.score(1.0, 100, threshold).unwrap().0 >= threshold);
+        assert!(progress.score(1.0, 100, threshold, 1.0).unwrap().0 >= threshold);
         progress.frontier = Some(2.0);
         progress.outside = 0.0;
-        assert!(progress.score(1.0, 100, threshold).unwrap().0 >= threshold);
+        assert!(progress.score(1.0, 100, threshold, 1.0).unwrap().0 >= threshold);
     }
 
     #[test]
@@ -457,6 +551,7 @@ pub(crate) struct RouterClusters<'a, T: VectorElement> {
     expand_next: bool,
     threshold: Option<f64>,
     adaptive: Option<AdaptiveProgress>,
+    evidence: ClusterEvidence,
     pending: Option<Candidate>,
     meter: WorkMeter,
     controller: ProbeController<'a>,
@@ -532,6 +627,7 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
             expand_next: false,
             threshold: params.quantized_recall.and_then(|p| p.gap_threshold(1)),
             adaptive,
+            evidence: ClusterEvidence::default(),
             pending: None,
             meter: WorkMeter::new(budget),
             controller: ProbeController::new(
@@ -625,6 +721,10 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
             let _routing = enter_vector_stage(VectorStage::Routing);
             self.gate.select(&self.docs, &mut self.offsets)
         };
+        if self.threshold.is_some() {
+            self.evidence
+                .observe(rows, rows - gated.pruned_filter - gated.pruned_dead);
+        }
         self.counters.vectors_visited += rows;
         self.counters.pruned_filter += gated.pruned_filter;
         self.counters.pruned_dead += gated.pruned_dead;
@@ -655,10 +755,12 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
 
 impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
     fn quantized_recall_score(&mut self, cutoff: f32, completed: usize) -> Option<f64> {
-        let (score, expand) = self
-            .adaptive
-            .as_ref()?
-            .score(cutoff, completed, self.threshold?)?;
+        let (score, expand) = self.adaptive.as_ref()?.score(
+            cutoff,
+            completed,
+            self.threshold?,
+            self.evidence.risk_scale(),
+        )?;
         self.expand_next = self.more_routing && expand;
         Some(score)
     }
