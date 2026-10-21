@@ -297,7 +297,8 @@ fn probe_termination() -> crate::Result<()> {
     assert_eq!(ceiling.clusters.len(), 1);
 
     // Exhausted: an exhaustive, unarmed walk opens every cluster and admits every row.
-    let fixture = grid(Metric::L2, RouterKind::Stacked)?;
+    // Exact: Stacked's hard 25% top prune cannot hand the probe every list on a 3×3 grid.
+    let fixture = grid(Metric::L2, RouterKind::Exact)?;
     let exhausted = walk_fixture(
         &fixture,
         &AllQuery,
@@ -316,13 +317,14 @@ fn probe_termination() -> crate::Result<()> {
     assert_eq!(exhausted.rows, docs);
 
     // Recall target: a loose target stops on the estimate before the budget; 1.0 leaves APS off.
+    let stacked = grid(Metric::L2, RouterKind::Stacked)?;
     let recall = |target| ProbeParams {
         recall_target: target,
         ..budget_params(1.0)
     };
-    let kth = kth_score(&fixture, &[0.0, 0.0], 3)?;
+    let kth = kth_score(&stacked, &[0.0, 0.0], 3)?;
     let aps = walk_fixture(
-        &fixture,
+        &stacked,
         &AllQuery,
         &[0.0, 0.0],
         3,
@@ -334,7 +336,7 @@ fn probe_termination() -> crate::Result<()> {
     assert_eq!(aps.termination, ProbeTermination::RecallTarget, "{aps:?}");
     assert!(aps.recall_estimate.is_some_and(|estimate| estimate >= 0.5));
     let off = walk_fixture(
-        &fixture,
+        &stacked,
         &AllQuery,
         &[0.0, 0.0],
         3,

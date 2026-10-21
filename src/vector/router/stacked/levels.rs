@@ -7,10 +7,9 @@
 //! [`StackedIvf::build`] creates one level. [`StackedIvf::add_level`]
 //! hangs a parent on this level and reorders this level's centroids and
 //! offset ranges so parent member `i` is list `i`. Member rows stay put;
-//! a later parent only shuffles this level's metadata. [`StackedIvfBuilder`]
-//! walks up, calling `add_level` until the top has at most
-//! `branching_factor` lists. L0 granularity is `max_leaf_size`
-//! (`nlist ≈ n / max_leaf_size`); `branching_factor` is the tree fan-out.
+//! a later parent only shuffles this level's metadata. Each level's `nlist`
+//! is `ceil(√n)`; [`StackedIvfBuilder`] hangs a parent while the current
+//! top has at least [`MIN_NLIST_FOR_PARENT`] lists.
 //!
 //! Search works on any [`VectorArena`]. Build and payload serialization require
 //! owned [`InMemoryStore`]s. [`StackedIvf::open`] is search-only.
@@ -22,6 +21,7 @@ use std::ops::Deref;
 use std::{fmt, mem};
 
 use common::{BinarySerializable, HasLen};
+use itertools::Itertools;
 use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperKMeansConfig};
 
 use crate::directory::FileSlice;
@@ -71,17 +71,18 @@ pub(crate) const PARENT_NPROBE_FRACTION: f32 = 0.25;
 /// Recall target used when this level searches its parent.
 pub(crate) const PARENT_RECALL_TARGET: f32 = 0.99;
 
-/// Default fan-out of the Multi-level IVF index
-pub(crate) const DEFAULT_BRANCHING_FACTOR: usize = 100;
+/// [`StackedIvfBuilder`] hangs a parent only while the current top has at
+/// least this many lists. Below that, the top is scored in full and pruned
+/// to [`PARENT_NPROBE_FRACTION`].
+pub(crate) const MIN_NLIST_FOR_PARENT: usize = 256;
 
 /// Search and clustering knobs for this level. Not persisted.
 #[derive(Clone, Debug)]
 pub struct StackedIvfConfig {
     /// Initial candidate fraction `f_M`: `|S| = nprobe_fraction * nlist`.
+    /// At the top level (no parent), lists are pruned to
+    /// [`PARENT_NPROBE_FRACTION`] after scoring every centroid.
     pub nprobe_fraction: f32,
-    /// IVF tree fan-out. Parent lists hold about this many children, and
-    /// stacking stops when the top has at most this many lists.
-    pub branching_factor: usize,
     /// Recall target this level passes to its parent when APS is on.
     /// `1.0` makes the parent scan its full candidate set (exact routing
     /// when the parent is the top level).
@@ -92,7 +93,6 @@ impl Default for StackedIvfConfig {
     fn default() -> Self {
         Self {
             nprobe_fraction: 0.02,
-            branching_factor: DEFAULT_BRANCHING_FACTOR,
             parent_recall_target: PARENT_RECALL_TARGET,
         }
     }
@@ -102,18 +102,16 @@ impl StackedIvfConfig {
     fn for_parent(&self) -> Self {
         Self {
             nprobe_fraction: PARENT_NPROBE_FRACTION,
-            branching_factor: self.branching_factor,
             parent_recall_target: self.parent_recall_target,
         }
     }
 
-    fn nlist_for(&self, n: usize) -> usize {
-        assert!(
-            self.branching_factor >= 2,
-            "branching_factor must be >= 2, got {}",
-            self.branching_factor
-        );
-        (n / self.branching_factor).max(1).min(n)
+    /// k-means target for a level over `n` members: `ceil(√n)`.
+    fn nlist_for(n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        ((n as f64).sqrt().ceil() as usize).max(1).min(n)
     }
 }
 
@@ -485,12 +483,11 @@ fn permute_rows(data: &[f32], dim: usize, perm: &[u32]) -> Vec<f32> {
     out
 }
 
-/// Builds a stacked IVF, hanging parents until the top has at most
-/// [`StackedIvfConfig::branching_factor`] lists.
+/// Builds a stacked IVF: L0 via [`StackedIvf::build`], then parents while
+/// the current top has at least [`MIN_NLIST_FOR_PARENT`] lists.
 ///
-/// [`StackedIvf::build`] is one level. The builder walks up, calling
-/// [`StackedIvf::add_level`] on each current top. Only L0's member
-/// permutation is returned — later levels shuffle metadata, not L0 rows.
+/// Only L0's member permutation is returned — later levels shuffle
+/// metadata, not L0 rows.
 pub struct StackedIvfBuilder<'a, Cl> {
     data: Vec<f32>,
     n: usize,
@@ -516,8 +513,8 @@ impl<'a, Cl: LevelClusterer<Elem = f32>> StackedIvfBuilder<'a, Cl> {
         }
     }
 
-    /// Clusters L0, then walks up calling [`StackedIvf::add_level`]
-    /// while the current top's `nlist` is greater than `branching_factor`.
+    /// Clusters L0 (`nlist = ceil(√n)`), then hangs parents while the
+    /// current top's `nlist` is at least [`MIN_NLIST_FOR_PARENT`].
     ///
     /// Returns the stacked index and L0's member permutation
     /// (`perm[old] = new`).
@@ -530,9 +527,8 @@ impl<'a, Cl: LevelClusterer<Elem = f32>> StackedIvfBuilder<'a, Cl> {
             self.config,
         );
         let parent_cfg = index.config.for_parent();
-        let branching_factor = index.config.branching_factor;
         let mut cur = &mut index;
-        while cur.nlist() > branching_factor {
+        while cur.nlist() >= MIN_NLIST_FOR_PARENT {
             cur.add_level(self.clusterer, parent_cfg.clone())
                 .expect("L0 build produced centroids");
             cur = cur.parent.as_mut().expect("add_level hung a parent");
@@ -615,7 +611,8 @@ impl StackedIvf<InMemoryStore> {
         Ok(perm)
     }
 
-    /// Clusters `data` into a single level (no parent).
+    /// Clusters `data` into a single level (no parent) with
+    /// `nlist = ceil(√n)`.
     ///
     /// Returns the index and the permutation of input rows into cluster
     /// order (`perm[old] = new`). [`add_level`] does not permute members.
@@ -631,7 +628,7 @@ impl StackedIvf<InMemoryStore> {
         if n == 0 {
             return (Self::empty(config, dim), Vec::new());
         }
-        let nlist = config.nlist_for(n);
+        let nlist = StackedIvfConfig::nlist_for(n);
         let (centroids, assignments) = clusterer.cluster(&data, n, dim, nlist);
         let mut index = Self::empty(config, dim);
         let perm = index.populate(data, centroids, assignments);
@@ -901,11 +898,12 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
     /// Nearest members from the lists selected at this level, plus the
     /// work done across the whole stack to find them.
     ///
-    /// If a parent is present it ranks which lists to probe; otherwise
-    /// all centroids at this level are scored. Lists are scanned nearest
-    /// centroid first. When `recall < 1.0` and centroids are in-memory,
-    /// scanning stops once the estimated recall of the lists scanned so
-    /// far reaches `recall` (Quake APS).
+    /// If a parent is present it ranks which lists to probe (`n_probe`,
+    /// typically 25% of this level's lists). Otherwise every centroid is
+    /// scored and only the best [`PARENT_NPROBE_FRACTION`] are expanded.
+    /// Lists are scanned nearest centroid first. When `recall < 1.0` and
+    /// centroids are in-memory, scanning stops once the estimated recall
+    /// of the lists scanned so far reaches `recall` (Quake APS).
     pub fn search(
         &self,
         query: &[S::Elem],
@@ -931,16 +929,22 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
             };
             parent.search(query, self.n_probe(), parent_recall, metric)
         } else {
-            let mut all: Vec<Candidate<ClusterId>> = (0..self.nlist())
+            let nlist = self.nlist();
+            let keep = ((nlist as f32 * PARENT_NPROBE_FRACTION).ceil() as usize)
+                .max(1)
+                .min(nlist);
+            let all: Vec<Candidate<ClusterId>> = (0..nlist)
                 .map(|i| Candidate {
                     sim: self.centroids.similarity(metric, dim, i as u32, query),
                     node: ClusterId(i as u32),
                 })
+                .sorted()
+                .rev()
+                .take(keep)
                 .collect();
-            all.sort_unstable_by(|a, b| b.cmp(a));
             let stats = StackedSearchStats {
                 lists_scanned: 0,
-                members_scored: all.len(),
+                members_scored: nlist,
             };
             (all, stats)
         };
@@ -1032,13 +1036,8 @@ mod tests {
         data
     }
 
-    /// Small-fixture config: leaf size matches fan-out so n=16..64 still
-    /// produces multiple L0 lists.
-    fn test_config(branching_factor: usize) -> StackedIvfConfig {
-        StackedIvfConfig {
-            branching_factor,
-            ..Default::default()
-        }
+    fn test_config() -> StackedIvfConfig {
+        StackedIvfConfig::default()
     }
 
     fn build_with_parent(
@@ -1046,15 +1045,9 @@ mod tests {
         n: usize,
         dim: usize,
         clusterer: &SuperKMeansLevelClusterer,
-        branching_factor: usize,
     ) -> (StackedIvf<InMemoryStore>, Vec<u32>) {
-        let (mut index, perm) = StackedIvf::<InMemoryStore>::build(
-            data.to_vec(),
-            n,
-            dim,
-            clusterer,
-            test_config(branching_factor),
-        );
+        let (mut index, perm) =
+            StackedIvf::<InMemoryStore>::build(data.to_vec(), n, dim, clusterer, test_config());
         let parent_cfg = index.config.for_parent();
         index
             .add_level(clusterer, parent_cfg)
@@ -1069,7 +1062,7 @@ mod tests {
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer::default();
         let (index, member_perm) =
-            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config(4));
+            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config());
         assert!(index.nlist() > 1);
         assert_eq!(index.vectors.len(), n);
         assert_eq!(member_perm.len(), n);
@@ -1091,7 +1084,7 @@ mod tests {
         let n = 32;
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer::default();
-        let (index, member_perm) = build_with_parent(&data, n, dim, &clusterer, 2);
+        let (index, member_perm) = build_with_parent(&data, n, dim, &clusterer);
 
         let mut seen = vec![false; n];
         for &new in &member_perm {
@@ -1123,7 +1116,7 @@ mod tests {
         let n = 32;
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer::default();
-        let (index, _perm) = build_with_parent(&data, n, dim, &clusterer, 2);
+        let (index, _perm) = build_with_parent(&data, n, dim, &clusterer);
 
         let mut bytes = Vec::new();
         index.serialize_router_payload(&mut bytes).unwrap();
@@ -1170,7 +1163,7 @@ mod tests {
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer::default();
         let (mut index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config(2));
+            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config());
         assert_eq!(index.depth(), 1);
 
         let parent_cfg = index.config.for_parent();
@@ -1195,7 +1188,7 @@ mod tests {
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer::default();
         let (mut index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config(2));
+            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config());
         let parent_cfg = index.config.for_parent();
         index.add_level(&clusterer, parent_cfg.clone()).expect("L1");
         let members = index.vectors.as_slice().to_vec();
@@ -1217,37 +1210,51 @@ mod tests {
     }
 
     #[test]
-    fn test_nlist() {
-        let config = StackedIvfConfig {
-            branching_factor: 100,
-            ..Default::default()
-        };
-        assert_eq!(config.nlist_for(200_000), 2_000);
-        assert_eq!(config.nlist_for(20_000), 200);
-        assert_eq!(config.nlist_for(200), 2);
-        assert_eq!(config.nlist_for(2), 1);
+    fn test_nlist_for_sqrt() {
+        assert_eq!(StackedIvfConfig::nlist_for(0), 0);
+        assert_eq!(StackedIvfConfig::nlist_for(1), 1);
+        assert_eq!(StackedIvfConfig::nlist_for(2_000), 45);
+        assert_eq!(StackedIvfConfig::nlist_for(65_536), 256);
+        assert_eq!(StackedIvfConfig::nlist_for(1_000_000), 1_000);
+        assert_eq!(StackedIvfConfig::nlist_for(400_000), 633);
     }
 
     #[test]
-    fn test_builder_stacks_until_top_level_fits_branching_factor() {
+    fn test_top_level_prunes_to_parent_nprobe_fraction() {
         let dim = 2;
         let n = 64;
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer::default();
-        let config = test_config(2);
-        let (index, perm) =
-            StackedIvfBuilder::new(data, n, dim, &clusterer, config.clone()).build();
-        assert!(index.depth() > 1, "builder must hang at least one parent");
-        let mut top = &index;
-        while let Some(p) = top.parent.as_deref() {
-            top = p;
-        }
-        assert!(
-            top.nlist() <= config.branching_factor,
-            "top nlist {} should be <= branching_factor {}",
-            top.nlist(),
-            config.branching_factor
+        let (index, _) =
+            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config());
+        assert!(index.parent.is_none());
+        let nlist = index.nlist();
+        assert!(nlist > 1);
+        let keep = ((nlist as f32 * PARENT_NPROBE_FRACTION).ceil() as usize).max(1);
+
+        let query = [0.0f32, 0.0];
+        let (hits, stats) = index.search(&query, n, 1.0, Metric::L2);
+        assert!(!hits.is_empty());
+        assert_eq!(
+            stats.lists_scanned, keep,
+            "top level must expand only ceil(0.25 × nlist) lists"
         );
+        assert!(
+            stats.members_scored >= nlist,
+            "every top centroid is scored before the prune"
+        );
+    }
+
+    #[test]
+    fn test_builder_skips_parent_when_below_threshold() {
+        let dim = 2;
+        let n = 64;
+        let data = line_data(n);
+        let clusterer = SuperKMeansLevelClusterer::default();
+        assert!(StackedIvfConfig::nlist_for(n) < MIN_NLIST_FOR_PARENT);
+        let (index, perm) = StackedIvfBuilder::new(data, n, dim, &clusterer, test_config()).build();
+        assert!(index.parent.is_none());
+        assert!(index.nlist() < MIN_NLIST_FOR_PARENT);
         assert_eq!(perm.len(), n);
         let mut seen = vec![false; n];
         for &new in &perm {
@@ -1273,7 +1280,7 @@ mod tests {
         let n = 32;
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer::default();
-        let (index, _perm) = build_with_parent(&data, n, dim, &clusterer, 2);
+        let (index, _perm) = build_with_parent(&data, n, dim, &clusterer);
 
         let mut slot = Vec::new();
         index.serialize_router_payload(&mut slot).unwrap();
@@ -1324,15 +1331,15 @@ mod tests {
         let clusterer = SuperKMeansLevelClusterer::default();
         let config = StackedIvfConfig {
             nprobe_fraction: PARENT_NPROBE_FRACTION,
-            branching_factor: 64,
             ..StackedIvfConfig::default()
         };
-        let (index, _perm) =
-            StackedIvfBuilder::new(data, n, dim, &clusterer, config.clone()).build();
-        assert!(
-            index.depth() >= 2,
-            "need a parent so permute_lists scrambles L0 list order"
-        );
+        // √20k ≈ 142 < 256, so the builder would stay flat; hang a parent
+        // so permute_lists scrambles L0 list order (and can leave empties).
+        let (mut index, _perm) =
+            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, config.clone());
+        let parent_cfg = index.config.for_parent();
+        index.add_level(&clusterer, parent_cfg).expect("L1");
+        assert_eq!(index.depth(), 2);
         assert!(
             index.offsets.iter().any(|&(start, end)| start == end),
             "need at least one empty list to exercise the tie-break"
@@ -1361,7 +1368,7 @@ mod tests {
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer::default();
         let (index, _perm) =
-            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config(2));
+            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config());
         let mut slot = Vec::new();
         index.serialize_router_payload(&mut slot).unwrap();
         let member_bytes: Vec<u8> = index
@@ -1410,7 +1417,7 @@ mod tests {
         let data = two_blobs(n_per);
         let clusterer = SuperKMeansLevelClusterer::default();
         let (index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config(2));
+            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config());
         let (hits, stats) = index.search(&[0.0f32, 0.0], 4, 0.0, Metric::L2);
         assert!(
             stats.lists_scanned >= 1,
@@ -1426,7 +1433,7 @@ mod tests {
         let data = two_blobs(n_per);
         let clusterer = SuperKMeansLevelClusterer::default();
         let (mut index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config(2));
+            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config());
         index.config.nprobe_fraction = 1.0;
         let query = [0.0f32, 0.0];
         let (full_hits, full) = index.search(&query, 4, 1.0, Metric::L2);
@@ -1454,7 +1461,7 @@ mod tests {
         let data = two_blobs(n_per);
         let clusterer = SuperKMeansLevelClusterer::default();
         let (mut index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config(2));
+            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config());
         index.config.nprobe_fraction = 1.0;
 
         let mut slot = Vec::new();
@@ -1494,7 +1501,7 @@ mod tests {
         let n_per = 32;
         let data = two_blobs(n_per);
         let clusterer = SuperKMeansLevelClusterer::default();
-        let (index, _) = build_with_parent(&data, n_per * 2, 2, &clusterer, 2);
+        let (index, _) = build_with_parent(&data, n_per * 2, 2, &clusterer);
         let query = [0.0f32, 0.0];
         let (leaf, _) = index.search(&query, 4, 0.9, Metric::L2);
         let (full, _) = index.search(&query, 4, 1.0, Metric::L2);
@@ -1517,7 +1524,7 @@ mod tests {
             .collect();
         let clusterer = SuperKMeansLevelClusterer::default();
         let (mut index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n, 2, &clusterer, test_config(2));
+            StackedIvf::<InMemoryStore>::build(data, n, 2, &clusterer, test_config());
         index.config.nprobe_fraction = 1.0;
         let query = [0.3f32.cos(), 0.3f32.sin()];
         let scaled = [query[0] * 10.0, query[1] * 10.0];
@@ -1538,7 +1545,7 @@ mod tests {
         let data = two_blobs(n_per);
         let clusterer = SuperKMeansLevelClusterer::default();
         let (mut index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config(2));
+            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config());
         index.config.nprobe_fraction = 1.0;
         let query = [1.0f32, 0.0];
         let (full_hits, full) = index.search(&query, 4, 1.0, Metric::Dot);

@@ -19,7 +19,7 @@ use tantivy::vector::clustering::{
     for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
 };
 use tantivy::vector::{
-    LocatedPath, ProbeParams, ProbeStats, Selectivity, VectorQuantizationConfig,
+    LocatedPath, ProbeParams, ProbeStats, RouterKind, Selectivity, VectorQuantizationConfig,
     VectorQuantizationLayer,
 };
 use tantivy::{Index, IndexWriter, Searcher, TantivyDocument, Term};
@@ -234,6 +234,9 @@ impl Fixture {
             .ivf_clusterer(Arc::new(RoundRobinClusterer {
                 clusters: shape.clusters,
             }))
+            // Exact: Stacked's hard 25% top prune caps candidates below the
+            // probe ladder this scenario needs for strictly increasing opens.
+            .ivf_router(RouterKind::Exact)
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 1_000_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));

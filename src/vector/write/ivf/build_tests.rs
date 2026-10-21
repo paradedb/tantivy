@@ -85,7 +85,8 @@ fn merge_flat_segments_with_deletes_into_ivf() -> crate::Result<()> {
         .ivf_clusterer(Arc::new(NearestClusterer {
             centroids: centroids.clone(),
         }))
-        .ivf_router(RouterKind::Stacked)
+        // Exact: exhaustive top-N below assumes every alive cluster is probed.
+        .ivf_router(RouterKind::Exact)
         .create_in_ram()?;
     let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
     writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -173,7 +174,8 @@ fn merge_deleting_every_doc_of_one_field_writes_empty_ivf() -> crate::Result<()>
         .ivf_clusterer(Arc::new(NearestClusterer {
             centroids: centroids.clone(),
         }))
-        .ivf_router(RouterKind::Stacked)
+        // Exact: exhaustive search below assumes every alive cluster is probed.
+        .ivf_router(RouterKind::Exact)
         .create_in_ram()?;
     let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
     writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -225,8 +227,8 @@ fn merge_deleting_every_doc_of_one_field_writes_empty_ivf() -> crate::Result<()>
                 avg_cluster_size: 0.0,
                 empty_clusters: 0,
             }),
-            router: Some(RouterKind::Stacked),
-            router_levels: Some(vec![0]),
+            router: Some(RouterKind::Exact),
+            router_levels: Some(vec![]),
             quantized_layers: None,
             quantized_bytes_per_row: None,
         },
