@@ -175,8 +175,14 @@ fn fixture() -> &'static Fixture {
                 11010 => ("purchase order", ""),
                 _ => ("service team meeting", ""),
             };
-            let mixed = ["service order", "order service", "service ordering", "service", "order", "nothing"]
-                [(id % 6) as usize];
+            let mixed = [
+                "service order",
+                "order service",
+                "service ordering",
+                "service",
+                "order",
+                "nothing",
+            ][(id % 6) as usize];
             writer
                 .add_document(doc!(
                     fields[0] => content,
