@@ -1,5 +1,8 @@
-//! Adaptive Partition Scanning geometry: query-ball ∩ Voronoi half-space
-//! recall estimates (Quake §5 / `geometry.h`).
+//! When a ranked list walk should stop opening further lists.
+//!
+//! [`Aps`] is that decision. The walk only calls [`Aps::observe`]. Which
+//! estimate produces the decision — the geometry profile, a patience window,
+//! or a later replacement — stays in this module.
 
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -9,12 +12,138 @@ use std::sync::{Mutex, OnceLock};
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
 
-/// The largest dimension that routes with APS. Dimensions above this route
-/// with the fixed nprobe fractions even when a recall target is requested.
-/// The recall profile rests on `I_x((d+1)/2, 1/2)`; at high dimensions the
-/// continued fraction and cap volumes degenerate, and the estimate has not
-/// been validated above this dimension.
+/// The largest dimension whose stop uses the geometry estimate. Above this the
+/// cap-volume profile degenerates. The profile rests on `I_x((d+1)/2, 1/2)`
+/// and has not been validated above this dimension.
 pub(crate) const APS_MAX_DIM: usize = 128;
+
+/// Consecutive lists that leave a full size-`k` heap unchanged before the
+/// current fallback stops. The shortlist is still the hard cap.
+const MEMBER_SCAN_PATIENCE: usize = 5;
+
+/// Decides whether the list just scanned is the last one to open.
+pub(crate) trait Aps {
+    /// `kth` is the worst similarity in a full size-`k` heap, `None` until the heap fills.
+    /// `Ok(true)` stops the walk.
+    fn observe(&mut self, kth: Option<Similarity>) -> io::Result<bool>;
+}
+
+/// Recall a parent search should use so this level's stop sees a usable shortlist.
+///
+/// When the geometry estimate will run, the parent keeps `configured` (a near-full
+/// ranking). Otherwise the parent asks for the whole shortlist and this level's
+/// own stop decides how far to walk it.
+pub(crate) fn parent_recall(
+    dim: usize,
+    metric: Metric,
+    recall: f32,
+    has_matrix: bool,
+    configured: f32,
+) -> f32 {
+    if has_matrix && geometry_applies(dim, metric, recall) {
+        configured
+    } else {
+        recall.max(1.0)
+    }
+}
+
+/// Builds the stop for one level. The geometry estimate runs when it is reliable;
+/// every other case uses the current fallback. Callers do not choose.
+pub(crate) fn open<'a>(
+    query: &'a [f32],
+    recall: f32,
+    metric: Metric,
+    sims: &'a [Similarity],
+    matrix: Option<(&'a [f32], usize)>,
+    centroid_ids: &[u32],
+) -> Box<dyn Aps + 'a> {
+    if geometry_applies(query.len(), metric, recall) {
+        if let Some((values, dim)) = matrix {
+            let rows = SliceRows {
+                matrix: values,
+                dim,
+                ids: centroid_ids.to_vec(),
+            };
+            return Box::new(Geometry {
+                estimator: RecallEstimator::new(query, sims, Box::new(rows), metric),
+                recall,
+            });
+        }
+    }
+    Box::new(Patience::new(MEMBER_SCAN_PATIENCE))
+}
+
+fn geometry_applies(dim: usize, metric: Metric, recall: f32) -> bool {
+    dim > 0 && dim <= APS_MAX_DIM && recall < 1.0 && supports_metric(metric)
+}
+
+/// Geometry estimate: stop once covered recall reaches the target.
+struct Geometry<'a> {
+    estimator: RecallEstimator<'a>,
+    recall: f32,
+}
+
+impl Aps for Geometry<'_> {
+    fn observe(&mut self, kth: Option<Similarity>) -> io::Result<bool> {
+        Ok(self
+            .estimator
+            .cover_next(kth)?
+            .is_some_and(|estimate| estimate >= self.recall))
+    }
+}
+
+/// Stops after `window` lists in a row leave the full heap's worst similarity unchanged.
+struct Patience {
+    window: usize,
+    misses: usize,
+    last: Option<Similarity>,
+}
+
+impl Patience {
+    fn new(window: usize) -> Self {
+        Self {
+            window: window.max(1),
+            misses: 0,
+            last: None,
+        }
+    }
+}
+
+impl Aps for Patience {
+    fn observe(&mut self, kth: Option<Similarity>) -> io::Result<bool> {
+        let Some(kth) = kth else {
+            return Ok(false);
+        };
+        match self.last {
+            None => self.last = Some(kth),
+            Some(previous) if previous == kth => {
+                self.misses += 1;
+                if self.misses >= self.window {
+                    return Ok(true);
+                }
+            }
+            Some(_) => {
+                self.misses = 0;
+                self.last = Some(kth);
+            }
+        }
+        Ok(false)
+    }
+}
+
+struct SliceRows<'a> {
+    matrix: &'a [f32],
+    dim: usize,
+    ids: Vec<u32>,
+}
+
+impl CandidateRows for SliceRows<'_> {
+    fn append_row(&self, rank: usize, out: &mut Vec<f32>) -> io::Result<()> {
+        let start = self.ids[rank] as usize * self.dim;
+        out.extend_from_slice(&self.matrix[start..start + self.dim]);
+        Ok(())
+    }
+}
 
 const BETA_TABLE_LEN: usize = 1024;
 const BETA_STOP: f64 = 1.0e-8;

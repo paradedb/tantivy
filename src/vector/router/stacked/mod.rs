@@ -85,10 +85,9 @@ pub(super) fn open(
     )?)
 }
 
-/// The recall target the bottom router level runs with: the caller's,
-/// unless APS is off (`recall >= 1.0`), the metric has no query ball
-/// (Dot), or the dimension is past [`APS_MAX_DIM`], where the cap-volume
-/// estimate is unreliable. The fixed nprobe path is used instead.
+/// The recall target reported for this query. A target the geometry estimate
+/// cannot serve (no query ball, `recall >= 1.0`, or past [`APS_MAX_DIM`])
+/// is reported as a full scan. The list walk's stop is chosen inside [`aps`].
 pub(crate) fn effective_recall(dim: usize, metric: Metric, recall: f32) -> f32 {
     if dim > APS_MAX_DIM || !aps_supports_metric(metric) || !(recall < 1.0) {
         1.0
@@ -108,10 +107,9 @@ pub(super) fn rank(
     // clusters the caller's probe budget buys under its filter
     // (`router_k` ← `max_probe` and filter selectivity).
     //
-    // The search still opens the parent nprobe lists and scores every
-    // member into a size-`k` heap: scanning all members of the selected
-    // lists avoids the classic IVF boundary miss; capping the heap (and
-    // thus `candidate_count`) is what ties the returned set to probe.
+    // Parents still select lists with their fixed fraction. This level scores those lists'
+    // members into a size-`k` heap and may stop before the shortlist is exhausted. Capping
+    // the heap is what ties the returned set to the probe budget.
     let k = params.k.clamp(1, index.vectors.len().max(1));
     let (ranked, stats) = index.search(query, k, recall, metric);
     let candidate_count = ranked.len();

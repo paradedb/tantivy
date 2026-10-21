@@ -30,7 +30,6 @@ use crate::vector::distance::Similarity;
 use crate::vector::router::arena::{FileSliceArena, VectorArena};
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::aps;
-use crate::vector::router::stacked::aps::RecallEstimator;
 use crate::vector::VectorElement;
 
 /// Row index into a level's centroid or member arena.
@@ -901,9 +900,8 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
     /// If a parent is present it ranks which lists to probe (`n_probe`,
     /// typically 25% of this level's lists). Otherwise every centroid is
     /// scored and only the best [`PARENT_NPROBE_FRACTION`] are expanded.
-    /// Lists are scanned nearest centroid first. When `recall < 1.0` and
-    /// centroids are in-memory, scanning stops once the estimated recall
-    /// of the lists scanned so far reaches `recall` (Quake APS).
+    /// Lists are scanned nearest centroid first. [`aps::Aps`] decides when to
+    /// stop. Parents are searched the same way.
     pub fn search(
         &self,
         query: &[S::Elem],
@@ -916,17 +914,16 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         }
 
         let dim = query.len();
-        let can_aps = recall < 1.0
-            && aps::supports_metric(metric)
-            && self.centroids.centroid_matrix().is_some();
 
         // Candidate lists, nearest centroid first; `candidates[0]` is P0.
         let (candidates, mut stats) = if let Some(parent) = &self.parent {
-            let parent_recall = if can_aps {
-                self.config.parent_recall_target
-            } else {
-                recall.max(1.0)
-            };
+            let parent_recall = aps::parent_recall(
+                dim,
+                metric,
+                recall,
+                self.centroids.centroid_matrix().is_some(),
+                self.config.parent_recall_target,
+            );
             parent.search(query, self.n_probe(), parent_recall, metric)
         } else {
             let nlist = self.nlist();
@@ -953,34 +950,33 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
             return (Vec::new(), stats);
         }
 
-        let mut estimator = can_aps.then(|| {
-            let (matrix, _) = self.centroids.centroid_matrix().expect("can_aps");
-            let rows: Vec<&[f32]> = candidates
-                .iter()
-                .map(|c| {
-                    let j = usize::from(c.node);
-                    &matrix[j * dim..(j + 1) * dim]
-                })
-                .collect();
-            let sims: Vec<Similarity> = candidates.iter().map(|c| c.sim).collect();
-            RecallEstimator::new(query, &sims, Box::new(rows), metric)
-        });
+        let sims: Vec<Similarity> = candidates.iter().map(|c| c.sim).collect();
+        let ids: Vec<u32> = candidates.iter().map(|c| c.node.0).collect();
+        let mut probe = aps::open(
+            query,
+            recall,
+            metric,
+            &sims,
+            self.centroids.centroid_matrix(),
+            &ids,
+        );
 
         let mut result = BinaryHeap::with_capacity(k);
         for c in &candidates {
-            stats.members_scored += self.scan_cluster(query, metric, c.node, &mut result, k);
+            let scanned = self.scan_cluster(query, metric, c.node, &mut result, k);
+            stats.members_scored += scanned;
             stats.lists_scanned += 1;
-            let Some(estimator) = estimator.as_mut() else {
-                continue;
+            let kth = if result.len() >= k {
+                result
+                    .peek()
+                    .map(|worst: &Reverse<Candidate<ClusterId>>| worst.0.sim)
+            } else {
+                None
             };
-            let kth = result
-                .peek()
-                .filter(|_| result.len() >= k)
-                .map(|Reverse(kth)| kth.sim);
-            let estimate = estimator
-                .cover_next(kth)
-                .expect("in-memory centroid rows cannot fail to load");
-            if estimate.is_some_and(|est| est >= recall) {
+            if probe
+                .observe(kth)
+                .expect("in-memory centroid rows cannot fail to load")
+            {
                 break;
             }
         }
@@ -1217,6 +1213,33 @@ mod tests {
         assert_eq!(StackedIvfConfig::nlist_for(65_536), 256);
         assert_eq!(StackedIvfConfig::nlist_for(1_000_000), 1_000);
         assert_eq!(StackedIvfConfig::nlist_for(400_000), 633);
+    }
+
+    /// A run of lists that miss the full heap stops the walk short of the 25% shortlist.
+    #[test]
+    fn test_patience_stops_before_the_shortlist_is_exhausted() {
+        let dim = 2;
+        let n = 2048;
+        let clusterer = SuperKMeansLevelClusterer::default();
+        let (index, _) =
+            StackedIvf::<InMemoryStore>::build(line_data(n), n, dim, &clusterer, test_config());
+        assert!(index.parent.is_none());
+
+        let query = [0.0f32, 0.0];
+        let k = 16;
+        let nlist = index.nlist();
+        let shortlist = ((nlist as f32 * PARENT_NPROBE_FRACTION).ceil() as usize)
+            .max(1)
+            .min(nlist);
+        let (hits, stats) = index.search(&query, k, 1.0, Metric::L2);
+
+        assert_eq!(hits.len(), k);
+        assert!(
+            stats.lists_scanned < shortlist,
+            "stop scanned {} lists, shortlist {}",
+            stats.lists_scanned,
+            shortlist
+        );
     }
 
     #[test]
@@ -1537,8 +1560,8 @@ mod tests {
         assert_eq!(nodes(&unit_hits), nodes(&scaled_hits));
     }
 
-    /// Dot scores past 1 would clamp the query radius to zero and stop
-    /// APS after the first full heap; Dot scans its full nprobe instead.
+    /// Dot has no query ball, so the geometry estimate does not run. Both
+    /// targets share the same stop and therefore the same lists.
     #[test]
     fn test_aps_is_off_for_dot() {
         let n_per = 32;

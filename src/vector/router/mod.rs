@@ -118,14 +118,12 @@ impl BuiltRouter {
 /// way regardless.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RoutingParams {
-    /// Clusters the caller expects to probe. The stacked router ranks at
-    /// least this many members when APS is on; with APS off it ranks every
-    /// member of the lists its nprobe fraction selects.
+    /// Clusters the caller expects to probe. The stacked router returns at most this many
+    /// members. The stop that produces them is geometry or patience; the shortlist is the cap.
     pub(crate) k: usize,
-    /// Stacked-router recall target in `(0, 1]`. `1.0` disables APS and
-    /// routes with the fixed nprobe fractions. APS is also disabled above
-    /// [`APS_MAX_DIM`](crate::vector::router::stacked::aps::APS_MAX_DIM) regardless of this
-    /// value.
+    /// Stacked-router recall target in `(0, 1]`. `1.0` and dimensions above
+    /// [`APS_MAX_DIM`](crate::vector::router::stacked::aps::APS_MAX_DIM) use patience instead of
+    /// the geometry estimate.
     pub(crate) recall: f32,
 }
 
@@ -368,7 +366,11 @@ mod tests {
     fn stacked_ranking_uses_requested_recall_within_dim_cap() -> crate::Result<()> {
         let opened = open_stacked(2, 64)?;
         let query = vec![0.0f32; 2];
-        let params = RoutingParams { k: 8, recall: 0.5 };
+        let params = RoutingParams {
+            k: 8,
+            recall: 0.5,
+            ..Default::default()
+        };
         let ranking = opened.rank(&query, Metric::L2, params);
         let (candidates, lists, scored, recall) = stacked_metrics(ranking.metrics());
         assert_eq!(recall, 0.5);
@@ -381,15 +383,18 @@ mod tests {
         Ok(())
     }
 
-    /// Above `APS_MAX_DIM` the recall target is forced to `1.0` (fixed
-    /// nprobe list selection), but the returned set is still capped at `k`
-    /// so the caller's probe budget limits `candidate_count`.
+    /// Above `APS_MAX_DIM` the recall target is forced to `1.0` and the walk stops with
+    /// patience. The returned set is still capped at `k`.
     #[test]
     fn stacked_ranking_falls_back_to_nprobe_above_dim_cap() -> crate::Result<()> {
         let dim = crate::vector::router::stacked::aps::APS_MAX_DIM + 1;
         let opened = open_stacked(dim, 32)?;
         let query = vec![0.0f32; dim];
-        let params = RoutingParams { k: 2, recall: 0.5 };
+        let params = RoutingParams {
+            k: 2,
+            recall: 0.5,
+            ..Default::default()
+        };
         let ranking = opened.rank(&query, Metric::L2, params);
         let (candidates, lists, scored, recall) = stacked_metrics(ranking.metrics());
         assert_eq!(recall, 1.0, "dimension cap must force the nprobe path");

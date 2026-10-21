@@ -21,8 +21,8 @@ pub struct ProbeParams {
     pub max_probe_fraction: f32,
     /// Floor on the resolved budget, in work units, applied before the capacity cap. Default 16.
     pub min_probe_clusters: usize,
-    /// Recall target for the stacked router's ranking, in `(0, 1]`; `1.0` routes with the fixed
-    /// nprobe fractions. Forced to `1.0` above 128 dimensions. Default [`DEFAULT_ROUTER_RECALL`].
+    /// Recall target for the stacked router's ranking, in `(0, 1]`. `1.0`, Dot, and dimensions
+    /// above 128 use patience instead of the geometry estimate. Default [`DEFAULT_ROUTER_RECALL`].
     pub router_recall_target: f32,
     /// Recall target for each segment's cluster scan, in `(0, 1]`, estimated by the Quake APS;
     /// `1.0` leaves the budget as the only bound. Stacked-router segments only; forced to `1.0`
