@@ -79,6 +79,10 @@ pub(super) fn block_maxscore_filtered<F: DocSet + ?Sized>(
         .map(|t| t.scorer.doc())
         .min()
         .unwrap_or(TERMINATED);
+    // See `seek_to_filter_start`.
+    if let Some(ref f) = filter {
+        start = start.max(f.doc());
+    }
     while start < TERMINATED {
         terms.retain(|term| term.scorer.doc() < TERMINATED);
         if terms.is_empty() {
