@@ -26,9 +26,9 @@ pub struct ProbeParams {
     pub router_recall_target: f32,
     /// Member budget multiplier `c` for the stacked router's bottom level on the fixed nprobe
     /// path: it stops opening lists once it has scored `c × k` segment centroids, `k` being the
-    /// clusters the budget buys. The 10% floor and 25% cap are fractions of the segment's
-    /// centroids and both rise with `k`: the floor is at least `k`, and the cap is at least
-    /// `c × k` (never more centroids than the segment has). Higher router levels keep their fixed
+    /// clusters the budget buys. The floor is `k`. The 25% cap is a fraction of the segment's
+    /// centroids and rises with `k`: it is at least `c × k` (never more centroids than the
+    /// segment has). Higher router levels keep their fixed
     /// fractions. `None` scans every list the parent level returns; a value must be finite and
     /// positive. Default [`DEFAULT_ROUTER_MEMBER_BUDGET_MULTIPLIER`].
     pub router_member_budget_multiplier: Option<f32>,

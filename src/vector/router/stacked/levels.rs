@@ -68,16 +68,11 @@ impl From<usize> for ClusterId {
 /// Default `nprobe_fraction` for parent levels (L1, L2, …).
 pub(crate) const PARENT_NPROBE_FRACTION: f32 = 0.25;
 
-/// Floor of [`member_budget`], as a fraction of the bottom router level's members.
-pub(crate) const MEMBER_BUDGET_FLOOR_FRACTION: f64 = 0.10;
-
-/// Members the bottom router level scores before it stops opening lists: `multiplier × k`,
-/// clamped between a floor and a cap that both scale with `k`.
+/// Members the bottom router level scores before it stops opening lists: `multiplier × k`.
 ///
-/// The floor is [`MEMBER_BUDGET_FLOOR_FRACTION`] of `members`, or `k` when `k` is larger.
-/// The cap is [`PARENT_NPROBE_FRACTION`] of `members`, or `multiplier × k` when that is larger,
-/// and never exceeds `members`. Lists are scanned whole, so the scan ends at the first list
-/// boundary at or past the budget.
+/// The floor is `k`. The cap is [`PARENT_NPROBE_FRACTION`] of `members`, or `multiplier × k`
+/// when that is larger, and never exceeds `members`. Lists are scanned whole, so the scan ends
+/// at the first list boundary at or past the budget.
 pub(crate) fn member_budget(members: usize, k: usize, multiplier: f32) -> usize {
     if members == 0 || k == 0 {
         return 0;
@@ -86,7 +81,7 @@ pub(crate) fn member_budget(members: usize, k: usize, multiplier: f32) -> usize 
     let wanted = (k as f64 * f64::from(multiplier))
         .ceil()
         .min(usize::MAX as f64) as usize;
-    let floor = fraction(MEMBER_BUDGET_FLOOR_FRACTION).max(k).min(members);
+    let floor = k.min(members);
     let cap = fraction(f64::from(PARENT_NPROBE_FRACTION))
         .max(wanted)
         .max(floor)
@@ -1264,21 +1259,22 @@ mod tests {
         assert_eq!(StackedIvfConfig::nlist_for(400_000), 633);
     }
 
-    /// `c × k` sits between 10% and 25% of the members when `k` is small. Once `k` exceeds
-    /// either fraction, that bound scales with `k`: the floor is at least `k`, and the cap is
-    /// at least `c × k`, never more members than exist.
+    /// The floor is `k` and the cap is at least 25% of the members, or `c × k` when that is
+    /// larger. Never more members than exist.
     #[test]
     fn test_member_budget_clamps() {
         assert_eq!(member_budget(24_000, 1000, 3.0), 3000);
-        assert_eq!(member_budget(24_000, 1000, 2.0), 2400);
-        assert_eq!(member_budget(24_000, 20, 3.0), 2400);
+        // c × k = 2000 is under 25% (6000) and above k, so the 10% floor no longer lifts it.
+        assert_eq!(member_budget(24_000, 1000, 2.0), 2000);
+        // Small k: budget is c × k, not 10% of the members.
+        assert_eq!(member_budget(24_000, 20, 3.0), 60);
         // c × k = 8000 > 25% (6000): cap scales up to c × k.
         assert_eq!(member_budget(24_000, 1000, 8.0), 8000);
         // c × k above the member count: scan every member, not the old 25% cap.
         assert_eq!(member_budget(24_000, 1000, f32::MAX), 24_000);
         // k itself is above 25%; c × k is above the member count.
         assert_eq!(member_budget(24_000, 10_000, 3.0), 24_000);
-        // k is between 10% and 25%, and c × k exceeds 25%.
+        // k is above 25%, and c × k exceeds 25%.
         assert_eq!(member_budget(24_000, 3_000, 3.0), 9_000);
         assert_eq!(member_budget(10, 1, 1.0), 1);
         assert_eq!(member_budget(0, 1, 3.0), 0);

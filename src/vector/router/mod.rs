@@ -128,8 +128,9 @@ pub(crate) struct RoutingParams {
     /// value.
     pub(crate) recall: f32,
     /// Stacked-router member budget multiplier `c`: on the fixed nprobe path the bottom router
-    /// level stops opening lists once it has scored `c × k` members, clamped to 10%..25% of its
-    /// members. `None` scans every list the parent returns. Finite and positive.
+    /// level stops opening lists once it has scored `c × k` members, floored at `k` and capped
+    /// at 25% of its members or `c × k`, whichever is larger. `None` scans every list the parent
+    /// returns. Finite and positive.
     pub(crate) member_budget_multiplier: Option<f32>,
 }
 
