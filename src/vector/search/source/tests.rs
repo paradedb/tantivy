@@ -254,6 +254,24 @@ fn grid(metric: Metric, router: RouterKind) -> crate::Result<Fixture> {
         .into())
 }
 
+/// 64 separated centroids so Stacked's √n lists + 25% top prune still ranks
+/// enough members for probe-level APS to stop mid-stream.
+fn stacked_aps_fixture() -> crate::Result<Fixture> {
+    let centroids: Vec<Vec<f32>> = (0..64)
+        .map(|i| vec![(i % 8) as f32 * 10.0, (i / 8) as f32 * 10.0])
+        .collect();
+    let vectors = (0..256)
+        .map(|i| {
+            let centroid = &centroids[i / 4];
+            let offset = (i % 4) as f32 * 0.01;
+            vec![centroid[0] + offset, centroid[1] + offset]
+        })
+        .collect();
+    FixtureSpec::ivf(Metric::L2, centroids, vectors)
+        .router(RouterKind::Stacked)
+        .build()
+}
+
 /// The loop stops on the ceiling, on exhaustion, or at the recall target, which only the stacked
 /// router estimates and only for metrics with a query ball.
 #[test]
@@ -317,7 +335,10 @@ fn probe_termination() -> crate::Result<()> {
     assert_eq!(exhausted.rows, docs);
 
     // Recall target: a loose target stops on the estimate before the budget; 1.0 leaves APS off.
-    let stacked = grid(Metric::L2, RouterKind::Stacked)?;
+    // A 3×3 Stacked grid only keeps one √n list under the 25% top prune, so SuperKMeans
+    // can hand the probe a single candidate and the walk exhausts before a mid-stream stop.
+    // An 8×8 grid keeps two lists and ranks enough members for APS to fire reliably.
+    let stacked = stacked_aps_fixture()?;
     let recall = |target| ProbeParams {
         recall_target: target,
         ..budget_params(1.0)
