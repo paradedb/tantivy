@@ -118,18 +118,13 @@ impl BuiltRouter {
 /// way regardless.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RoutingParams {
-    /// Clusters the caller expects to probe. The stacked router ranks at
-    /// least this many members when APS is on; with APS off it ranks every
-    /// member of the lists its nprobe fraction selects.
+    /// Clusters the caller expects to probe. The stacked router returns at most this many
+    /// members. The stop that produces them is geometry or patience; the shortlist is the cap.
     pub(crate) k: usize,
-    /// Stacked-router recall target in `(0, 1]`. `1.0` disables APS and
-    /// routes with the fixed nprobe fractions. APS is also disabled above
-    /// [`APS_MAX_DIM`](crate::vector::router::stacked::aps::APS_MAX_DIM) regardless of this
-    /// value.
+    /// Stacked-router recall target in `(0, 1]`. `1.0` and dimensions above
+    /// [`APS_MAX_DIM`](crate::vector::router::stacked::aps::APS_MAX_DIM) use patience instead of
+    /// the geometry estimate.
     pub(crate) recall: f32,
-    /// Retained member-budget multiplier. Ignored on the fixed-nprobe path, which stops with
-    /// patience instead. Finite and positive when set.
-    pub(crate) member_budget_multiplier: Option<f32>,
 }
 
 impl Default for RoutingParams {
@@ -137,7 +132,6 @@ impl Default for RoutingParams {
         Self {
             k: usize::MAX,
             recall: 1.0,
-            member_budget_multiplier: None,
         }
     }
 }
@@ -389,9 +383,8 @@ mod tests {
         Ok(())
     }
 
-    /// Above `APS_MAX_DIM` the recall target is forced to `1.0` (fixed
-    /// nprobe list selection), but the returned set is still capped at `k`
-    /// so the caller's probe budget limits `candidate_count`.
+    /// Above `APS_MAX_DIM` the recall target is forced to `1.0` and the walk stops with
+    /// patience. The returned set is still capped at `k`.
     #[test]
     fn stacked_ranking_falls_back_to_nprobe_above_dim_cap() -> crate::Result<()> {
         let dim = crate::vector::router::stacked::aps::APS_MAX_DIM + 1;

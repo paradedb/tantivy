@@ -12,9 +12,10 @@ use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::aps::{
     supports_metric as aps_supports_metric, CandidateRows, RecallEstimator, APS_MAX_DIM,
 };
+use crate::vector::router::stacked::aps::{StopPolicy, MEMBER_SCAN_PATIENCE};
 use crate::vector::router::stacked::levels::{
     ClusterId, InMemoryStore, LazyStore, StackedIvf, StackedIvfBuilder, StackedIvfConfig,
-    StackedSearchStats, SuperKMeansLevelClusterer, MEMBER_SCAN_PATIENCE, PARENT_NPROBE_FRACTION,
+    StackedSearchStats, SuperKMeansLevelClusterer, PARENT_NPROBE_FRACTION,
 };
 use crate::vector::router::{RouterMetrics, RoutingParams};
 use crate::TantivyError;
@@ -86,9 +87,9 @@ pub(super) fn open(
 }
 
 /// The recall target the bottom router level runs with: the caller's,
-/// unless APS is off (`recall >= 1.0`), the metric has no query ball
-/// (Dot), or the dimension is past [`APS_MAX_DIM`], where the cap-volume
-/// estimate is unreliable. The fixed nprobe path is used instead.
+/// unless the metric has no query ball (Dot), the caller asked for a full
+/// scan (`recall >= 1.0`), or the dimension is past [`APS_MAX_DIM`], where
+/// the cap-volume estimate is unreliable. Those cases use the patience stop.
 pub(crate) fn effective_recall(dim: usize, metric: Metric, recall: f32) -> f32 {
     if dim > APS_MAX_DIM || !aps_supports_metric(metric) || !(recall < 1.0) {
         1.0
@@ -112,12 +113,13 @@ pub(super) fn rank(
     // members into a size-`k` heap and may stop before the shortlist is exhausted. Capping
     // the heap is what ties the returned set to the probe budget.
     let k = params.k.clamp(1, index.vectors.len().max(1));
-    // Geometric APS sizes the scan when it is reliable. Above that, stop after a run of lists
-    // that miss the size-`k` heap. The shortlist is still the hard cap. `member_budget` is not
-    // applied: a fixed `c × k` did not hold recall across probe targets.
-    let _ = params.member_budget_multiplier;
-    let patience = (recall >= 1.0).then_some(MEMBER_SCAN_PATIENCE);
-    let (ranked, stats) = index.search_within(query, k, recall, metric, None, patience);
+    // Geometry when it applies. Otherwise patience: the shortlist stays the hard cap.
+    let policy = if recall >= 1.0 {
+        StopPolicy::Patience(MEMBER_SCAN_PATIENCE)
+    } else {
+        StopPolicy::Full
+    };
+    let (ranked, stats) = index.search_within(query, k, recall, metric, policy);
     let candidate_count = ranked.len();
     Ranking {
         ranked: ranked.into_iter(),

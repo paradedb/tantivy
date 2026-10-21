@@ -21,14 +21,9 @@ pub struct ProbeParams {
     pub max_probe_fraction: f32,
     /// Floor on the resolved budget, in work units, applied before the capacity cap. Default 16.
     pub min_probe_clusters: usize,
-    /// Recall target for the stacked router's ranking, in `(0, 1]`; `1.0` routes with the fixed
-    /// nprobe fractions. Forced to `1.0` above 128 dimensions. Default [`DEFAULT_ROUTER_RECALL`].
+    /// Recall target for the stacked router's ranking, in `(0, 1]`. `1.0`, Dot, and dimensions
+    /// above 128 use patience instead of the geometry estimate. Default [`DEFAULT_ROUTER_RECALL`].
     pub router_recall_target: f32,
-    /// Retained member-budget multiplier. The fixed-nprobe path no longer stops at `c × k`; it
-    /// stops after a run of lists miss the size-`k` heap, capped by the shortlist already
-    /// selected. `None` and the default are accepted and ignored by that path. A value must be
-    /// finite and positive. Default [`DEFAULT_ROUTER_MEMBER_BUDGET_MULTIPLIER`].
-    pub router_member_budget_multiplier: Option<f32>,
     /// Recall target for each segment's cluster scan, in `(0, 1]`, estimated by the Quake APS;
     /// `1.0` leaves the budget as the only bound. Stacked-router segments only; forced to `1.0`
     /// above 128 dimensions. Default `1.0`.
@@ -83,7 +78,6 @@ impl Default for ProbeParams {
             max_probe_fraction: 0.01,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
             router_recall_target: DEFAULT_ROUTER_RECALL,
-            router_member_budget_multiplier: Some(DEFAULT_ROUTER_MEMBER_BUDGET_MULTIPLIER),
             recall_target: 1.0,
             exact_plan: true,
             located: LocatedPath::Auto,
@@ -96,9 +90,6 @@ pub(crate) const MIN_PROBE_CLUSTERS: usize = 16;
 
 /// Default [`ProbeParams::router_recall_target`].
 pub const DEFAULT_ROUTER_RECALL: f32 = 0.99;
-
-/// Default [`ProbeParams::router_member_budget_multiplier`]; provisional pending a sweep.
-pub const DEFAULT_ROUTER_MEMBER_BUDGET_MULTIPLIER: f32 = 3.0;
 
 impl ProbeParams {
     /// The number of clusters the stacked router is asked to rank for a
@@ -155,14 +146,6 @@ impl ProbeParams {
         if !(self.fixed_probe_cost_rows.is_finite() && self.fixed_probe_cost_rows > 0.0) {
             return Err(crate::TantivyError::InvalidArgument(
                 "fixed_probe_cost_rows must be finite and greater than 0".to_string(),
-            ));
-        }
-        if self
-            .router_member_budget_multiplier
-            .is_some_and(|multiplier| !(multiplier.is_finite() && multiplier > 0.0))
-        {
-            return Err(crate::TantivyError::InvalidArgument(
-                "router_member_budget_multiplier must be finite and greater than 0".to_string(),
             ));
         }
         let n_avg = native_docs_in_segment as f64 / clusters_in_segment.max(1) as f64;
@@ -271,13 +254,6 @@ mod tests {
                 ..Default::default()
             };
             assert!(params.resolved_work_budget(9, 180).is_err(), "{cost}");
-        }
-        for multiplier in [0.0, -1.0, f32::NAN, f32::INFINITY] {
-            let params = ProbeParams {
-                router_member_budget_multiplier: Some(multiplier),
-                ..Default::default()
-            };
-            assert!(params.resolved_work_budget(9, 180).is_err(), "{multiplier}");
         }
     }
 }

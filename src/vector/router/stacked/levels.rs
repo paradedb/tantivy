@@ -30,7 +30,6 @@ use crate::vector::distance::Similarity;
 use crate::vector::router::arena::{FileSliceArena, VectorArena};
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::aps;
-use crate::vector::router::stacked::aps::RecallEstimator;
 use crate::vector::VectorElement;
 
 /// Row index into a level's centroid or member arena.
@@ -67,36 +66,6 @@ impl From<usize> for ClusterId {
 
 /// Default `nprobe_fraction` for parent levels (L1, L2, …).
 pub(crate) const PARENT_NPROBE_FRACTION: f32 = 0.25;
-
-/// Consecutive lists that miss the size-`k` heap before this level stops opening lists.
-///
-/// Used when geometric APS is off. The shortlist already in hand is the hard cap, so a query
-/// whose heap keeps moving scans every selected list.
-pub(crate) const MEMBER_SCAN_PATIENCE: usize = 5;
-
-/// Members a caller-supplied budget scores before it stops opening lists: `multiplier × k`.
-///
-/// The fixed-nprobe search path does not use this. It stops with [`MEMBER_SCAN_PATIENCE`].
-///
-/// The floor is `k`. The cap is [`PARENT_NPROBE_FRACTION`] of `members`, or `multiplier × k`
-/// when that is larger, and never exceeds `members`. Lists are scanned whole, so the scan ends
-/// at the first list boundary at or past the budget.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn member_budget(members: usize, k: usize, multiplier: f32) -> usize {
-    if members == 0 || k == 0 {
-        return 0;
-    }
-    let fraction = |f: f64| (members as f64 * f).ceil() as usize;
-    let wanted = (k as f64 * f64::from(multiplier))
-        .ceil()
-        .min(usize::MAX as f64) as usize;
-    let floor = k.min(members);
-    let cap = fraction(f64::from(PARENT_NPROBE_FRACTION))
-        .max(wanted)
-        .max(floor)
-        .min(members);
-    wanted.min(members).clamp(floor, cap)
-}
 
 /// Recall target used when this level searches its parent.
 pub(crate) const PARENT_RECALL_TARGET: f32 = 0.99;
@@ -931,9 +900,9 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
     /// If a parent is present it ranks which lists to probe (`n_probe`,
     /// typically 25% of this level's lists). Otherwise every centroid is
     /// scored and only the best [`PARENT_NPROBE_FRACTION`] are expanded.
-    /// Lists are scanned nearest centroid first. When `recall < 1.0` and
-    /// centroids are in-memory, scanning stops once the estimated recall
-    /// of the lists scanned so far reaches `recall` (Quake APS).
+    /// Lists are scanned nearest centroid first. The stop comes from
+    /// [`aps::StopPolicy`]: geometry when it applies, otherwise every selected list.
+    /// Parents are searched the same way.
     pub fn search(
         &self,
         query: &[S::Elem],
@@ -941,35 +910,32 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         recall: f32,
         metric: Metric,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-        self.search_within(query, k, recall, metric, None, None)
+        self.search_within(query, k, recall, metric, aps::StopPolicy::Full)
     }
 
-    /// [`search`](Self::search) with optional early stops on this level's lists.
+    /// [`search`](Self::search) with `policy` choosing the stop when geometry does not apply.
     ///
-    /// `member_budget` stops once that many members have been scored here (see [`member_budget`]).
-    /// `patience` stops after that many consecutive lists leave the full size-`k` heap's worst
-    /// similarity unchanged. Parents always search without either.
+    /// Parents always search with [`aps::StopPolicy::Full`].
     pub(crate) fn search_within(
         &self,
         query: &[S::Elem],
         k: usize,
         recall: f32,
         metric: Metric,
-        member_budget: Option<usize>,
-        patience: Option<usize>,
+        policy: aps::StopPolicy,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
         if k == 0 {
             return (Vec::new(), StackedSearchStats::default());
         }
 
         let dim = query.len();
-        let can_aps = recall < 1.0
+        let geometry = recall < 1.0
             && aps::supports_metric(metric)
             && self.centroids.centroid_matrix().is_some();
 
         // Candidate lists, nearest centroid first; `candidates[0]` is P0.
         let (candidates, mut stats) = if let Some(parent) = &self.parent {
-            let parent_recall = if can_aps {
+            let parent_recall = if geometry {
                 self.config.parent_recall_target
             } else {
                 recall.max(1.0)
@@ -1000,62 +966,34 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
             return (Vec::new(), stats);
         }
 
-        let mut estimator = can_aps.then(|| {
-            let (matrix, _) = self.centroids.centroid_matrix().expect("can_aps");
-            let rows: Vec<&[f32]> = candidates
-                .iter()
-                .map(|c| {
-                    let j = usize::from(c.node);
-                    &matrix[j * dim..(j + 1) * dim]
-                })
-                .collect();
-            let sims: Vec<Similarity> = candidates.iter().map(|c| c.sim).collect();
-            RecallEstimator::new(query, &sims, Box::new(rows), metric)
-        });
+        let sims: Vec<Similarity> = candidates.iter().map(|c| c.sim).collect();
+        let ids: Vec<u32> = candidates.iter().map(|c| c.node.0).collect();
+        let mut probe = aps::open(
+            policy,
+            query,
+            recall,
+            metric,
+            &sims,
+            self.centroids.centroid_matrix(),
+            &ids,
+        );
 
         let mut result = BinaryHeap::with_capacity(k);
-        let mut scored_here = 0;
-        let mut misses = 0usize;
-        let patience = patience.filter(|window| *window > 0);
         for c in &candidates {
-            let kth_before = if result.len() >= k {
+            let scanned = self.scan_cluster(query, metric, c.node, &mut result, k);
+            stats.members_scored += scanned;
+            stats.lists_scanned += 1;
+            let kth = if result.len() >= k {
                 result
                     .peek()
                     .map(|worst: &Reverse<Candidate<ClusterId>>| worst.0.sim)
             } else {
                 None
             };
-            let scanned = self.scan_cluster(query, metric, c.node, &mut result, k);
-            stats.members_scored += scanned;
-            stats.lists_scanned += 1;
-            scored_here += scanned;
-            if member_budget.is_some_and(|budget| scored_here >= budget) {
-                break;
-            }
-            if let Some(window) = patience {
-                if let Some(before) = kth_before {
-                    let unchanged = result.peek().is_some_and(|worst| worst.0.sim == before);
-                    if unchanged {
-                        misses += 1;
-                        if misses >= window {
-                            break;
-                        }
-                    } else {
-                        misses = 0;
-                    }
-                }
-            }
-            let Some(estimator) = estimator.as_mut() else {
-                continue;
-            };
-            let kth = result
-                .peek()
-                .filter(|_| result.len() >= k)
-                .map(|Reverse(kth)| kth.sim);
-            let estimate = estimator
-                .cover_next(kth)
-                .expect("in-memory centroid rows cannot fail to load");
-            if estimate.is_some_and(|est| est >= recall) {
+            if probe
+                .observe(kth)
+                .expect("in-memory centroid rows cannot fail to load")
+            {
                 break;
             }
         }
@@ -1294,28 +1232,6 @@ mod tests {
         assert_eq!(StackedIvfConfig::nlist_for(400_000), 633);
     }
 
-    /// The floor is `k` and the cap is at least 25% of the members, or `c × k` when that is
-    /// larger. Never more members than exist.
-    #[test]
-    fn test_member_budget_clamps() {
-        assert_eq!(member_budget(24_000, 1000, 3.0), 3000);
-        // c × k = 2000 is under 25% (6000) and above k, so the 10% floor no longer lifts it.
-        assert_eq!(member_budget(24_000, 1000, 2.0), 2000);
-        // Small k: budget is c × k, not 10% of the members.
-        assert_eq!(member_budget(24_000, 20, 3.0), 60);
-        // c × k = 8000 > 25% (6000): cap scales up to c × k.
-        assert_eq!(member_budget(24_000, 1000, 8.0), 8000);
-        // c × k above the member count: scan every member, not the old 25% cap.
-        assert_eq!(member_budget(24_000, 1000, f32::MAX), 24_000);
-        // k itself is above 25%; c × k is above the member count.
-        assert_eq!(member_budget(24_000, 10_000, 3.0), 24_000);
-        // k is above 25%, and c × k exceeds 25%.
-        assert_eq!(member_budget(24_000, 3_000, 3.0), 9_000);
-        assert_eq!(member_budget(10, 1, 1.0), 1);
-        assert_eq!(member_budget(0, 1, 3.0), 0);
-        assert_eq!(member_budget(24_000, 0, 3.0), 0);
-    }
-
     /// A run of lists that miss the full heap stops the walk short of the 25% shortlist.
     #[test]
     fn test_patience_stops_before_the_shortlist_is_exhausted() {
@@ -1329,8 +1245,13 @@ mod tests {
         let query = [0.0f32, 0.0];
         let k = 16;
         let (_, full) = index.search(&query, k, 1.0, Metric::L2);
-        let (hits, stats) =
-            index.search_within(&query, k, 1.0, Metric::L2, None, Some(MEMBER_SCAN_PATIENCE));
+        let (hits, stats) = index.search_within(
+            &query,
+            k,
+            1.0,
+            Metric::L2,
+            aps::StopPolicy::Patience(aps::MEMBER_SCAN_PATIENCE),
+        );
 
         assert_eq!(hits.len(), k);
         assert!(
@@ -1340,53 +1261,6 @@ mod tests {
             full.lists_scanned
         );
         assert!(stats.members_scored < full.members_scored);
-    }
-
-    /// The budget stops the bottom level at the first list boundary past it, while its parent
-    /// still runs without a member budget; the nearest members are the same as the full scan's.
-    #[test]
-    fn test_member_budget_stops_bottom_level_only() {
-        let dim = 2;
-        let n = 2048;
-        let clusterer = SuperKMeansLevelClusterer::default();
-        let config = StackedIvfConfig {
-            nprobe_fraction: PARENT_NPROBE_FRACTION,
-            ..test_config()
-        };
-        let (mut index, _) =
-            StackedIvf::<InMemoryStore>::build(line_data(n), n, dim, &clusterer, config);
-        let parent_cfg = index.config.for_parent();
-        index.add_level(&clusterer, parent_cfg).expect("L1");
-        let parent = index.parent.as_deref().expect("L1");
-        assert!(parent.parent.is_none());
-
-        let query = [0.0f32, 0.0];
-        let k = 16;
-        let (_, parent_stats) = parent.search(&query, index.n_probe(), 1.0, Metric::L2);
-        let parent_cost = parent_stats.members_scored;
-        let budget = member_budget(n, k, 2.0);
-        let (full_hits, full) = index.search(&query, k, 1.0, Metric::L2);
-        let (hits, stats) = index.search_within(&query, k, 1.0, Metric::L2, Some(budget), None);
-
-        let scored_here = stats.members_scored - parent_cost;
-        let largest_list = index
-            .offsets
-            .iter()
-            .map(|&(start, end)| (end - start) as usize)
-            .max()
-            .unwrap();
-        assert!(
-            full.members_scored - parent_cost > budget,
-            "fixture must exceed the budget"
-        );
-        assert!(scored_here >= budget, "{scored_here} < {budget}");
-        assert!(
-            scored_here < budget + largest_list,
-            "{scored_here} vs {budget}"
-        );
-        assert!(stats.lists_scanned < full.lists_scanned);
-        let nodes = |hits: &[Candidate<ClusterId>]| hits.iter().map(|h| h.node).collect::<Vec<_>>();
-        assert_eq!(nodes(&hits), nodes(&full_hits));
     }
 
     #[test]
