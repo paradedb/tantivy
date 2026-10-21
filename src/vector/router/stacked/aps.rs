@@ -1,8 +1,8 @@
 //! When a ranked list walk should stop opening further lists.
 //!
-//! [`Aps`] is that decision. [`StopPolicy`] chooses the algorithm: the Quake
-//! geometry estimate when it applies, and otherwise either the whole shortlist
-//! or a patience window. The walk only calls [`Aps::observe`].
+//! [`Aps`] is that decision. The walk only calls [`Aps::observe`]. Which
+//! estimate produces the decision — the geometry profile, a patience window,
+//! or a later replacement — stays in this module.
 
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -13,13 +13,13 @@ use crate::schema::Metric;
 use crate::vector::distance::Similarity;
 
 /// The largest dimension whose stop uses the geometry estimate. Above this the
-/// cap-volume profile degenerates, so the walk uses the policy's fallback.
-/// The profile rests on `I_x((d+1)/2, 1/2)` and has not been validated above
-/// this dimension.
+/// cap-volume profile degenerates. The profile rests on `I_x((d+1)/2, 1/2)`
+/// and has not been validated above this dimension.
 pub(crate) const APS_MAX_DIM: usize = 128;
 
-/// Consecutive lists that leave a full size-`k` heap unchanged before patience stops.
-pub(crate) const MEMBER_SCAN_PATIENCE: usize = 5;
+/// Consecutive lists that leave a full size-`k` heap unchanged before the
+/// current fallback stops. The shortlist is still the hard cap.
+const MEMBER_SCAN_PATIENCE: usize = 5;
 
 /// Decides whether the list just scanned is the last one to open.
 pub(crate) trait Aps {
@@ -28,19 +28,28 @@ pub(crate) trait Aps {
     fn observe(&mut self, kth: Option<Similarity>) -> io::Result<bool>;
 }
 
-/// Which stop to use when the geometry estimate does not apply.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum StopPolicy {
-    /// Scan every selected list.
-    Full,
-    /// Stop after [`MEMBER_SCAN_PATIENCE`]-style `window` lists miss the heap.
-    Patience(usize),
+/// Recall a parent search should use so this level's stop sees a usable shortlist.
+///
+/// When the geometry estimate will run, the parent keeps `configured` (a near-full
+/// ranking). Otherwise the parent asks for the whole shortlist and this level's
+/// own stop decides how far to walk it.
+pub(crate) fn parent_recall(
+    dim: usize,
+    metric: Metric,
+    recall: f32,
+    has_matrix: bool,
+    configured: f32,
+) -> f32 {
+    if has_matrix && geometry_applies(dim, metric, recall) {
+        configured
+    } else {
+        recall.max(1.0)
+    }
 }
 
-/// Builds the stop for one level. Geometry wins whenever `recall < 1`, the metric
-/// has a query ball, and `matrix` is present; otherwise `policy` applies.
+/// Builds the stop for one level. The geometry estimate runs when it is reliable;
+/// every other case uses the current fallback. Callers do not choose.
 pub(crate) fn open<'a>(
-    policy: StopPolicy,
     query: &'a [f32],
     recall: f32,
     metric: Metric,
@@ -48,7 +57,7 @@ pub(crate) fn open<'a>(
     matrix: Option<(&'a [f32], usize)>,
     centroid_ids: &[u32],
 ) -> Box<dyn Aps + 'a> {
-    if recall < 1.0 && supports_metric(metric) {
+    if geometry_applies(query.len(), metric, recall) {
         if let Some((values, dim)) = matrix {
             let rows = SliceRows {
                 matrix: values,
@@ -61,10 +70,11 @@ pub(crate) fn open<'a>(
             });
         }
     }
-    match policy {
-        StopPolicy::Full => Box::new(ScanAll),
-        StopPolicy::Patience(window) => Box::new(Patience::new(window)),
-    }
+    Box::new(Patience::new(MEMBER_SCAN_PATIENCE))
+}
+
+fn geometry_applies(dim: usize, metric: Metric, recall: f32) -> bool {
+    dim > 0 && dim <= APS_MAX_DIM && recall < 1.0 && supports_metric(metric)
 }
 
 /// Geometry estimate: stop once covered recall reaches the target.
@@ -117,15 +127,6 @@ impl Aps for Patience {
                 self.last = Some(kth);
             }
         }
-        Ok(false)
-    }
-}
-
-/// Never stops. The shortlist is the whole walk.
-struct ScanAll;
-
-impl Aps for ScanAll {
-    fn observe(&mut self, _kth: Option<Similarity>) -> io::Result<bool> {
         Ok(false)
     }
 }

@@ -12,7 +12,6 @@ use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::aps::{
     supports_metric as aps_supports_metric, CandidateRows, RecallEstimator, APS_MAX_DIM,
 };
-use crate::vector::router::stacked::aps::{StopPolicy, MEMBER_SCAN_PATIENCE};
 use crate::vector::router::stacked::levels::{
     ClusterId, InMemoryStore, LazyStore, StackedIvf, StackedIvfBuilder, StackedIvfConfig,
     StackedSearchStats, SuperKMeansLevelClusterer, PARENT_NPROBE_FRACTION,
@@ -86,10 +85,9 @@ pub(super) fn open(
     )?)
 }
 
-/// The recall target the bottom router level runs with: the caller's,
-/// unless the metric has no query ball (Dot), the caller asked for a full
-/// scan (`recall >= 1.0`), or the dimension is past [`APS_MAX_DIM`], where
-/// the cap-volume estimate is unreliable. Those cases use the patience stop.
+/// The recall target reported for this query. A target the geometry estimate
+/// cannot serve (no query ball, `recall >= 1.0`, or past [`APS_MAX_DIM`])
+/// is reported as a full scan. The list walk's stop is chosen inside [`aps`].
 pub(crate) fn effective_recall(dim: usize, metric: Metric, recall: f32) -> f32 {
     if dim > APS_MAX_DIM || !aps_supports_metric(metric) || !(recall < 1.0) {
         1.0
@@ -113,13 +111,7 @@ pub(super) fn rank(
     // members into a size-`k` heap and may stop before the shortlist is exhausted. Capping
     // the heap is what ties the returned set to the probe budget.
     let k = params.k.clamp(1, index.vectors.len().max(1));
-    // Geometry when it applies. Otherwise patience: the shortlist stays the hard cap.
-    let policy = if recall >= 1.0 {
-        StopPolicy::Patience(MEMBER_SCAN_PATIENCE)
-    } else {
-        StopPolicy::Full
-    };
-    let (ranked, stats) = index.search_within(query, k, recall, metric, policy);
+    let (ranked, stats) = index.search(query, k, recall, metric);
     let candidate_count = ranked.len();
     Ranking {
         ranked: ranked.into_iter(),

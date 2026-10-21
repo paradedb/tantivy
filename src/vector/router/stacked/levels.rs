@@ -900,9 +900,8 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
     /// If a parent is present it ranks which lists to probe (`n_probe`,
     /// typically 25% of this level's lists). Otherwise every centroid is
     /// scored and only the best [`PARENT_NPROBE_FRACTION`] are expanded.
-    /// Lists are scanned nearest centroid first. The stop comes from
-    /// [`aps::StopPolicy`]: geometry when it applies, otherwise every selected list.
-    /// Parents are searched the same way.
+    /// Lists are scanned nearest centroid first. [`aps::Aps`] decides when to
+    /// stop. Parents are searched the same way.
     pub fn search(
         &self,
         query: &[S::Elem],
@@ -910,36 +909,21 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         recall: f32,
         metric: Metric,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-        self.search_within(query, k, recall, metric, aps::StopPolicy::Full)
-    }
-
-    /// [`search`](Self::search) with `policy` choosing the stop when geometry does not apply.
-    ///
-    /// Parents always search with [`aps::StopPolicy::Full`].
-    pub(crate) fn search_within(
-        &self,
-        query: &[S::Elem],
-        k: usize,
-        recall: f32,
-        metric: Metric,
-        policy: aps::StopPolicy,
-    ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
         if k == 0 {
             return (Vec::new(), StackedSearchStats::default());
         }
 
         let dim = query.len();
-        let geometry = recall < 1.0
-            && aps::supports_metric(metric)
-            && self.centroids.centroid_matrix().is_some();
 
         // Candidate lists, nearest centroid first; `candidates[0]` is P0.
         let (candidates, mut stats) = if let Some(parent) = &self.parent {
-            let parent_recall = if geometry {
-                self.config.parent_recall_target
-            } else {
-                recall.max(1.0)
-            };
+            let parent_recall = aps::parent_recall(
+                dim,
+                metric,
+                recall,
+                self.centroids.centroid_matrix().is_some(),
+                self.config.parent_recall_target,
+            );
             parent.search(query, self.n_probe(), parent_recall, metric)
         } else {
             let nlist = self.nlist();
@@ -969,7 +953,6 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         let sims: Vec<Similarity> = candidates.iter().map(|c| c.sim).collect();
         let ids: Vec<u32> = candidates.iter().map(|c| c.node.0).collect();
         let mut probe = aps::open(
-            policy,
             query,
             recall,
             metric,
@@ -1244,23 +1227,19 @@ mod tests {
 
         let query = [0.0f32, 0.0];
         let k = 16;
-        let (_, full) = index.search(&query, k, 1.0, Metric::L2);
-        let (hits, stats) = index.search_within(
-            &query,
-            k,
-            1.0,
-            Metric::L2,
-            aps::StopPolicy::Patience(aps::MEMBER_SCAN_PATIENCE),
-        );
+        let nlist = index.nlist();
+        let shortlist = ((nlist as f32 * PARENT_NPROBE_FRACTION).ceil() as usize)
+            .max(1)
+            .min(nlist);
+        let (hits, stats) = index.search(&query, k, 1.0, Metric::L2);
 
         assert_eq!(hits.len(), k);
         assert!(
-            stats.lists_scanned < full.lists_scanned,
-            "patience scanned {} lists, full shortlist {}",
+            stats.lists_scanned < shortlist,
+            "stop scanned {} lists, shortlist {}",
             stats.lists_scanned,
-            full.lists_scanned
+            shortlist
         );
-        assert!(stats.members_scored < full.members_scored);
     }
 
     #[test]
@@ -1581,8 +1560,8 @@ mod tests {
         assert_eq!(nodes(&unit_hits), nodes(&scaled_hits));
     }
 
-    /// Dot scores past 1 would clamp the query radius to zero and stop
-    /// APS after the first full heap; Dot scans its full nprobe instead.
+    /// Dot has no query ball, so the geometry estimate does not run. Both
+    /// targets share the same stop and therefore the same lists.
     #[test]
     fn test_aps_is_off_for_dot() {
         let n_per = 32;
