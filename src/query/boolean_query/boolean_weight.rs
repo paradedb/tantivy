@@ -335,6 +335,17 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         self
     }
 
+    /// The clause a single-MUST boolean scores exactly like, so Top K can use that clause's own
+    /// pruning scorer instead of treating it as an opaque `Other`.
+    fn single_must_clause(&self) -> Option<&dyn Weight> {
+        match self.weights.as_slice() {
+            [(Occur::Must, weight)] if self.minimum_number_should_match == 0 => {
+                Some(weight.as_ref())
+            }
+            _ => None,
+        }
+    }
+
     fn should_use_block_maxscore(&self, scorers: &[TermScorer], max_doc: DocId) -> bool {
         match self.disjunction_pruning {
             DisjunctionPruning::Auto => {
@@ -728,6 +739,9 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         boost: Score,
         init_threshold: Score,
     ) -> crate::Result<Box<dyn crate::query::scorer::PruningScorer>> {
+        if let Some(weight) = self.single_must_clause() {
+            return weight.pruning_scorer(reader, boost, init_threshold);
+        }
         let scorer = self.complex_scorer(reader, boost, &self.score_combiner_fn)?;
         match scorer {
             // Block-WAND scores by summing the matching terms, so it may only
@@ -924,6 +938,9 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         reader: &SegmentReader,
         callback: &mut dyn FnMut(DocId, Score) -> Score,
     ) -> crate::Result<()> {
+        if let Some(weight) = self.single_must_clause() {
+            return weight.for_each_pruning(threshold, reader, callback);
+        }
         let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
         match scorer {
             // Block-WAND scores by summing the matching terms, so it may only
@@ -1677,6 +1694,82 @@ mod tests {
             0.0
         })?;
         assert_eq!(count, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_single_must_uses_clause_pruning_scorer() -> crate::Result<()> {
+        use crate::query::boolean_query::BlockWandUnionScorer;
+        use crate::query::scorer::BasicPruningScorer;
+        use crate::query::{EnableScoring, Occur, Query, SumCombiner, TermQuery, Weight};
+        use crate::schema::{IndexRecordOption, Schema, TEXT};
+        use crate::{DocId, Index, Score, Term};
+
+        let mut schema_builder = Schema::builder();
+        let field = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer_for_tests()?;
+        for text in ["a", "b", "a b", "a a c", "b b b", "c"] {
+            writer.add_document(doc!(field => text))?;
+        }
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let reader = searcher.segment_reader(0);
+
+        let union = |searcher: &crate::Searcher| -> crate::Result<Box<dyn Weight>> {
+            let weight = |text: &str| {
+                TermQuery::new(
+                    Term::from_field_text(field, text),
+                    IndexRecordOption::WithFreqs,
+                )
+                .weight(EnableScoring::enabled_from_searcher(searcher))
+            };
+            Ok(Box::new(BooleanWeight::new(
+                vec![(Occur::Should, weight("a")?), (Occur::Should, weight("b")?)],
+                true,
+                Box::new(SumCombiner::default),
+            )))
+        };
+        let collect = |weight: &dyn Weight| -> crate::Result<Vec<(DocId, Score)>> {
+            let mut hits = Vec::new();
+            weight.for_each_pruning(0.0, reader, &mut |doc, score| {
+                hits.push((doc, score));
+                0.0
+            })?;
+            Ok(hits)
+        };
+
+        let inner = union(&searcher)?;
+        assert!(inner
+            .pruning_scorer(reader, 1.0, 0.0)?
+            .is::<BlockWandUnionScorer>());
+        let expected = collect(inner.as_ref())?;
+        assert_eq!(expected.len(), 5);
+
+        // A single MUST clause scores like the clause, so Top K uses its Block-WAND scorer.
+        let single_must = BooleanWeight::with_minimum_number_should_match(
+            vec![(Occur::Must, union(&searcher)?)],
+            0,
+            true,
+            Box::new(SumCombiner::default),
+        );
+        assert!(single_must
+            .pruning_scorer(reader, 1.0, 0.0)?
+            .is::<BlockWandUnionScorer>());
+        assert_eq!(collect(&single_must)?, expected);
+
+        // A required SHOULD that is missing still matches nothing.
+        let unsatisfiable = BooleanWeight::with_minimum_number_should_match(
+            vec![(Occur::Must, union(&searcher)?)],
+            1,
+            true,
+            Box::new(SumCombiner::default),
+        );
+        let mut scorer = unsatisfiable.pruning_scorer(reader, 1.0, 0.0)?;
+        assert!(scorer.is::<BasicPruningScorer>());
+        assert_eq!(scorer.doc(), crate::TERMINATED);
+        assert!(collect(&unsatisfiable)?.is_empty());
 
         Ok(())
     }
