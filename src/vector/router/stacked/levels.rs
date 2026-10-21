@@ -68,11 +68,20 @@ impl From<usize> for ClusterId {
 /// Default `nprobe_fraction` for parent levels (L1, L2, …).
 pub(crate) const PARENT_NPROBE_FRACTION: f32 = 0.25;
 
-/// Members the bottom router level scores before it stops opening lists: `multiplier × k`.
+/// Consecutive lists that miss the size-`k` heap before this level stops opening lists.
+///
+/// Used when geometric APS is off. The shortlist already in hand is the hard cap, so a query
+/// whose heap keeps moving scans every selected list.
+pub(crate) const MEMBER_SCAN_PATIENCE: usize = 5;
+
+/// Members a caller-supplied budget scores before it stops opening lists: `multiplier × k`.
+///
+/// The fixed-nprobe search path does not use this. It stops with [`MEMBER_SCAN_PATIENCE`].
 ///
 /// The floor is `k`. The cap is [`PARENT_NPROBE_FRACTION`] of `members`, or `multiplier × k`
 /// when that is larger, and never exceeds `members`. Lists are scanned whole, so the scan ends
 /// at the first list boundary at or past the budget.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn member_budget(members: usize, k: usize, multiplier: f32) -> usize {
     if members == 0 || k == 0 {
         return 0;
@@ -932,11 +941,14 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         recall: f32,
         metric: Metric,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-        self.search_within(query, k, recall, metric, None)
+        self.search_within(query, k, recall, metric, None, None)
     }
 
-    /// [`search`](Self::search) that stops opening this level's lists once it has scored
-    /// `member_budget` members here (see [`member_budget`]). Parents always search without one.
+    /// [`search`](Self::search) with optional early stops on this level's lists.
+    ///
+    /// `member_budget` stops once that many members have been scored here (see [`member_budget`]).
+    /// `patience` stops after that many consecutive lists leave the full size-`k` heap's worst
+    /// similarity unchanged. Parents always search without either.
     pub(crate) fn search_within(
         &self,
         query: &[S::Elem],
@@ -944,6 +956,7 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         recall: f32,
         metric: Metric,
         member_budget: Option<usize>,
+        patience: Option<usize>,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
         if k == 0 {
             return (Vec::new(), StackedSearchStats::default());
@@ -1002,13 +1015,35 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
 
         let mut result = BinaryHeap::with_capacity(k);
         let mut scored_here = 0;
+        let mut misses = 0usize;
+        let patience = patience.filter(|window| *window > 0);
         for c in &candidates {
+            let kth_before = if result.len() >= k {
+                result
+                    .peek()
+                    .map(|worst: &Reverse<Candidate<ClusterId>>| worst.0.sim)
+            } else {
+                None
+            };
             let scanned = self.scan_cluster(query, metric, c.node, &mut result, k);
             stats.members_scored += scanned;
             stats.lists_scanned += 1;
             scored_here += scanned;
             if member_budget.is_some_and(|budget| scored_here >= budget) {
                 break;
+            }
+            if let Some(window) = patience {
+                if let Some(before) = kth_before {
+                    let unchanged = result.peek().is_some_and(|worst| worst.0.sim == before);
+                    if unchanged {
+                        misses += 1;
+                        if misses >= window {
+                            break;
+                        }
+                    } else {
+                        misses = 0;
+                    }
+                }
             }
             let Some(estimator) = estimator.as_mut() else {
                 continue;
@@ -1281,6 +1316,32 @@ mod tests {
         assert_eq!(member_budget(24_000, 0, 3.0), 0);
     }
 
+    /// A run of lists that miss the full heap stops the walk short of the 25% shortlist.
+    #[test]
+    fn test_patience_stops_before_the_shortlist_is_exhausted() {
+        let dim = 2;
+        let n = 2048;
+        let clusterer = SuperKMeansLevelClusterer::default();
+        let (index, _) =
+            StackedIvf::<InMemoryStore>::build(line_data(n), n, dim, &clusterer, test_config());
+        assert!(index.parent.is_none());
+
+        let query = [0.0f32, 0.0];
+        let k = 16;
+        let (_, full) = index.search(&query, k, 1.0, Metric::L2);
+        let (hits, stats) =
+            index.search_within(&query, k, 1.0, Metric::L2, None, Some(MEMBER_SCAN_PATIENCE));
+
+        assert_eq!(hits.len(), k);
+        assert!(
+            stats.lists_scanned < full.lists_scanned,
+            "patience scanned {} lists, full shortlist {}",
+            stats.lists_scanned,
+            full.lists_scanned
+        );
+        assert!(stats.members_scored < full.members_scored);
+    }
+
     /// The budget stops the bottom level at the first list boundary past it, while its parent
     /// still runs without a member budget; the nearest members are the same as the full scan's.
     #[test]
@@ -1305,7 +1366,7 @@ mod tests {
         let parent_cost = parent_stats.members_scored;
         let budget = member_budget(n, k, 2.0);
         let (full_hits, full) = index.search(&query, k, 1.0, Metric::L2);
-        let (hits, stats) = index.search_within(&query, k, 1.0, Metric::L2, Some(budget));
+        let (hits, stats) = index.search_within(&query, k, 1.0, Metric::L2, Some(budget), None);
 
         let scored_here = stats.members_scored - parent_cost;
         let largest_list = index

@@ -13,8 +13,8 @@ use crate::vector::router::stacked::aps::{
     supports_metric as aps_supports_metric, CandidateRows, RecallEstimator, APS_MAX_DIM,
 };
 use crate::vector::router::stacked::levels::{
-    member_budget, ClusterId, InMemoryStore, LazyStore, StackedIvf, StackedIvfBuilder,
-    StackedIvfConfig, StackedSearchStats, SuperKMeansLevelClusterer, PARENT_NPROBE_FRACTION,
+    ClusterId, InMemoryStore, LazyStore, StackedIvf, StackedIvfBuilder, StackedIvfConfig,
+    StackedSearchStats, SuperKMeansLevelClusterer, MEMBER_SCAN_PATIENCE, PARENT_NPROBE_FRACTION,
 };
 use crate::vector::router::{RouterMetrics, RoutingParams};
 use crate::TantivyError;
@@ -108,18 +108,16 @@ pub(super) fn rank(
     // clusters the caller's probe budget buys under its filter
     // (`router_k` ← `max_probe` and filter selectivity).
     //
-    // The search still opens the parent nprobe lists and scores every
-    // member into a size-`k` heap: scanning all members of the selected
-    // lists avoids the classic IVF boundary miss; capping the heap (and
-    // thus `candidate_count`) is what ties the returned set to probe.
+    // Parents still select lists with their fixed fraction. This level scores those lists'
+    // members into a size-`k` heap and may stop before the shortlist is exhausted. Capping
+    // the heap is what ties the returned set to the probe budget.
     let k = params.k.clamp(1, index.vectors.len().max(1));
-    // APS already sizes the scan to its recall target; the budget only replaces the fixed
-    // fraction's full scan of the parent's lists.
-    let budget = params
-        .member_budget_multiplier
-        .filter(|_| recall >= 1.0)
-        .map(|multiplier| member_budget(index.vectors.len(), k, multiplier));
-    let (ranked, stats) = index.search_within(query, k, recall, metric, budget);
+    // Geometric APS sizes the scan when it is reliable. Above that, stop after a run of lists
+    // that miss the size-`k` heap. The shortlist is still the hard cap. `member_budget` is not
+    // applied: a fixed `c × k` did not hold recall across probe targets.
+    let _ = params.member_budget_multiplier;
+    let patience = (recall >= 1.0).then_some(MEMBER_SCAN_PATIENCE);
+    let (ranked, stats) = index.search_within(query, k, recall, metric, None, patience);
     let candidate_count = ranked.len();
     Ranking {
         ranked: ranked.into_iter(),
