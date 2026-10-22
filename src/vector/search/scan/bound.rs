@@ -1,23 +1,28 @@
 //! The pruning bounds of one query's scans.
 //!
 //! A [`SharedBound`] is per query, held by the collector: the `k` best exact scores the query's
-//! finished segments returned in this process.
+//! finished segments returned in this process, and the slot the query's participants, one per
+//! process, share their thresholds through.
 //!
 //! A [`PruningBound`] is per segment scan, owned by the scan. It keeps two views. The segment's
 //! own, its running top-k of lower endpoints and its exact scores, is what the router's feedback
-//! and the result heap read. The pruning threshold adds the shared scores and the floor, and
-//! decides admission, every boundary and every recheck.
+//! and the result heap read. The pruning threshold adds the shared scores, the floor and the slot,
+//! and decides admission, every boundary and every recheck: the bound reads the slot before each
+//! of those decisions and offers its threshold to the slot after each step that can raise it.
 //!
-//! Every value either bound holds is an exact score of a distinct row or a k-th largest lower
-//! endpoint over distinct rows, with k = limit + offset; under the intervals' kappa each is a
-//! lower bound on the k-th best score among the rows the query searches. A row drops only when its
-//! upper endpoint is strictly below the threshold, so ties are kept.
+//! Every value either bound holds is an exact score of a distinct row, a k-th largest lower
+//! endpoint over distinct rows, or another participant's value of either kind, with
+//! k = limit + offset; under the intervals' kappa each is a lower bound on the k-th best score
+//! among the rows the query searches. A row drops only when its upper endpoint is strictly below
+//! the threshold, so ties are kept.
 
 use std::sync::Mutex;
 
+use crate::collector::{SharedThreshold, SharedThresholdArcOpt};
 use crate::vector::search::cluster_source::ClusterRows;
 use crate::vector::search::interval::{Estimate, LowerEndpoint, Threshold};
 use crate::vector::search::scan::columns::{Columns, QuantizedCandidates};
+use crate::{Score, SegmentOrdinal};
 
 // --- Ordering ---
 
@@ -81,9 +86,10 @@ pub(crate) struct SharedOffer {
 }
 
 /// What one query's scans share beyond their own segment: the `k` best exact scores of the rows
-/// its finished segments returned in this process. The returned rows are real results, distinct
-/// from every later segment's rows, so each later segment scan carries their scores into its own
-/// bound. The scores only ever improve.
+/// its finished segments returned in this process, and the slot its participants share their
+/// thresholds through. The returned rows are real results, distinct from every later segment's
+/// rows, so each later segment scan carries their scores into its own bound. The scores only ever
+/// improve.
 ///
 /// Keeping the `k` scores, not one segment's k-th, lets a segment that returns fewer than `k`
 /// rows still raise it.
@@ -91,14 +97,22 @@ pub(crate) struct SharedBound {
     k: usize,
     /// The best `k` scores offered, descending.
     scores: Mutex<Vec<f32>>,
+    /// The participants' slot; `None` keeps the scans to this process.
+    slot: SharedThresholdArcOpt<Score>,
 }
 
 impl SharedBound {
-    pub(crate) fn new(k: usize) -> Self {
+    pub(crate) fn new(k: usize, slot: SharedThresholdArcOpt<Score>) -> Self {
         Self {
             k,
             scores: Mutex::new(Vec::with_capacity(k)),
+            slot,
         }
+    }
+
+    /// The participants' slot.
+    pub(crate) fn slot(&self) -> SharedThresholdArcOpt<Score> {
+        self.slot.clone()
     }
 
     /// Copies the best `k` scores offered, descending, into `out`.
@@ -150,7 +164,7 @@ impl SharedBound {
     /// A bound already holding `k` copies of `score`.
     #[cfg(test)]
     pub(crate) fn seeded(k: usize, score: f32) -> Self {
-        let bound = Self::new(k);
+        let bound = Self::new(k, None);
         bound.offer(std::iter::repeat_n(score, k));
         bound
     }
@@ -160,10 +174,11 @@ impl SharedBound {
 
 /// One segment scan's pruning bound: the k-th largest lower endpoint over every live candidate,
 /// quantized intervals and exactly scored rows (zero-width intervals) alike, including the rows
-/// the query's finished segments returned, held at the highest value it has reached. Only the top
-/// `k` of each side can affect it, so each side keeps at most `k` entries.
+/// the query's finished segments returned, held at the highest value it has reached and at the
+/// participants' slot. Only the top `k` of each side can affect it, so each side keeps at most `k`
+/// entries.
 #[cfg_attr(test, derive(Clone))]
-pub(crate) struct PruningBound {
+pub(crate) struct PruningBound<'a> {
     k: usize,
     /// Top-k exact scores of the segment's own rows, descending. Exact rows never move.
     own_exact: Vec<f32>,
@@ -180,14 +195,22 @@ pub(crate) struct PruningBound {
     floor: Option<f32>,
     /// The threshold the last boundary pruned at: no live candidate's upper endpoint is below it.
     pruned_at: Option<f32>,
+    /// The participants' slot.
+    slot: Option<&'a dyn SharedThreshold<Score>>,
+    /// The highest threshold offered to the slot.
+    published: Option<f32>,
+    /// Offers that updated the slot.
+    pub(super) publishes: usize,
+    /// Slot reads whose score was above the threshold.
+    pub(super) raises: usize,
     /// One cluster's entries for the running top-k.
     entries: Vec<(f32, usize, f32)>,
     merge: Vec<(f32, usize, f32)>,
 }
 
-impl PruningBound {
-    /// A bound for `k` rows that carries in `shared`'s scores.
-    pub(super) fn new(k: usize, shared: Option<&SharedBound>) -> Self {
+impl<'a> PruningBound<'a> {
+    /// A bound for `k` rows that carries in `shared`'s scores and shares through its slot.
+    pub(super) fn new(k: usize, shared: Option<&'a SharedBound>) -> Self {
         let mut known_exact = Vec::with_capacity(k);
         if let Some(shared) = shared {
             shared.copy_scores(&mut known_exact);
@@ -201,6 +224,10 @@ impl PruningBound {
             known_exact,
             floor: None,
             pruned_at: None,
+            slot: shared.and_then(|shared| shared.slot.as_deref()),
+            published: None,
+            publishes: 0,
+            raises: 0,
             entries: Vec::new(),
             merge: Vec::with_capacity(k.saturating_mul(2)),
         }
@@ -264,7 +291,7 @@ impl PruningBound {
     /// the running top-k. Those are the rows a scan pruning on its own bound alone admits, so the
     /// running top-k, and the router feedback drawn from it, are that scan's; of them, only rows
     /// whose lower endpoint reaches a full running top-k's k-th are merged, since no other can
-    /// enter it.
+    /// enter it. Offers the threshold to the slot after.
     pub(super) fn admit(
         &mut self,
         rows: &ClusterRows<'_>,
@@ -300,13 +327,16 @@ impl PruningBound {
             }
         }
         self.merge_entries();
+        self.publish();
     }
 
-    /// Merges one cluster's `(lower, global row, estimate)` entries into the running top-k.
+    /// Merges one cluster's `(lower, global row, estimate)` entries into the running top-k, then
+    /// offers the threshold to the slot.
     pub(super) fn merge_cluster(&mut self, entries: impl IntoIterator<Item = (f32, usize, f32)>) {
         self.entries.clear();
         self.entries.extend(entries);
         self.merge_entries();
+        self.publish();
     }
 
     /// Merges `self.entries` into the running top-k through their own top-k, so the merge stays
@@ -367,17 +397,19 @@ impl PruningBound {
         }
     }
 
-    /// The threshold admission prunes a cluster's rows at; `None` while unset, which leaves the
-    /// segment's own k-th unset too.
+    /// The threshold admission prunes a cluster's rows at, after reading the slot; `None` while
+    /// unset, which leaves the segment's own k-th unset too.
     pub(super) fn admission_threshold(&mut self) -> Option<Threshold> {
+        self.sync();
         let threshold = self.threshold();
         debug_assert!(threshold.is_some() || self.own_lower().is_none());
         threshold.map(|kth| Threshold(LowerEndpoint(kth)))
     }
 
-    /// The threshold a block's candidates are rechecked at before a read; `None` until it rises
-    /// past the last boundary's, below which no candidate can drop.
+    /// The threshold a block's candidates are rechecked at before a read, after reading the slot;
+    /// `None` until it rises past the last boundary's, below which no candidate can drop.
     pub(super) fn recheck_threshold(&mut self) -> Option<Threshold> {
+        self.sync();
         let threshold = self.threshold()?;
         if self
             .pruned_at
@@ -388,11 +420,13 @@ impl PruningBound {
         Some(Threshold(LowerEndpoint(threshold)))
     }
 
-    /// The threshold a boundary prunes `candidates` at: the bound's threshold once the k-th
-    /// largest lower endpoint over the live candidates and the known exact scores raises its
-    /// floor, as does the threshold before the boundary, which keeps every row admission dropped
-    /// below it. Clears the running top-k, which describes the rows admitted before the boundary.
+    /// The threshold a boundary prunes `candidates` at, after reading the slot: the bound's
+    /// threshold once the k-th largest lower endpoint over the live candidates and the known
+    /// exact scores raises its floor, as does the threshold before the boundary, which keeps
+    /// every row admission dropped below it. Clears the running top-k, which describes the rows
+    /// admitted before the boundary, and offers the threshold to the slot after.
     pub(super) fn boundary(&mut self, candidates: &mut QuantizedCandidates) -> Option<Threshold> {
+        self.sync();
         if let Some(before) = self.threshold() {
             self.raise_floor(before);
         }
@@ -404,6 +438,7 @@ impl PruningBound {
         }
         let threshold = self.threshold();
         self.pruned_at = threshold;
+        self.publish();
         threshold.map(|kth| Threshold(LowerEndpoint(kth)))
     }
 
@@ -442,6 +477,55 @@ impl PruningBound {
         }
     }
 
+    // --- The participants' slot ---
+
+    /// Raises the floor to the slot's score, read with one relaxed atomic load. The ordinal is
+    /// ignored: pruning keeps ties.
+    #[inline]
+    fn sync(&mut self) {
+        let Some(slot) = self.slot else {
+            return;
+        };
+        let Some((score, _)) = slot.load() else {
+            return;
+        };
+        if self.threshold().is_none_or(|threshold| score > threshold) {
+            self.raises += 1;
+        }
+        self.raise_floor(score);
+    }
+
+    /// Offers the threshold to the slot when it is above the last offer, and stores it unless the
+    /// slot already holds a score at least as high. A non-finite threshold is never offered: a
+    /// slot packs empty as minus infinity with `SegmentOrdinal::MAX`. That ordinal packs lowest
+    /// among equal scores and pruning keeps ties, so it never decides anything.
+    #[inline]
+    pub(super) fn publish(&mut self) {
+        let Some(slot) = self.slot else {
+            return;
+        };
+        let Some(kth) = self.threshold() else {
+            return;
+        };
+        if !kth.is_finite() || self.published.is_some_and(|published| kth <= published) {
+            return;
+        }
+        self.published = Some(kth);
+        let mut current = slot.load();
+        loop {
+            if current.is_some_and(|(shared, _)| shared >= kth) {
+                return;
+            }
+            match slot.try_update(&current, (kth, SegmentOrdinal::MAX)) {
+                Ok(()) => {
+                    self.publishes += 1;
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     /// The known exact scores, descending.
     #[cfg(test)]
     pub(super) fn known_exact(&self) -> &[f32] {
@@ -475,11 +559,15 @@ impl PruningBound {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
     use super::{lower_endpoint_order, merged_kth, PruningBound, SharedBound, SharedOffer};
+    use crate::collector::{AtomicSharedThreshold, SharedThreshold};
     use crate::vector::quantization::QUANTIZED_BOUNDARY_KAPPA;
     use crate::vector::search::interval::{Estimate, LowerEndpoint, Threshold};
     use crate::vector::search::scan::columns::BoundaryHarness;
-    use crate::DocId;
+    use crate::{DocId, Score, SegmentOrdinal};
 
     fn threshold(value: f32) -> Option<Threshold> {
         Some(Threshold(LowerEndpoint(value)))
@@ -731,7 +819,7 @@ mod tests {
     /// tightening exactly when it moves the k-th.
     #[test]
     fn shared_bound_holds_the_kth_best_offer() {
-        let bound = SharedBound::new(3);
+        let bound = SharedBound::new(3, None);
         assert_eq!(bound.kth(), None);
         let offer = bound.offer([5.0, 1.0]);
         assert_eq!(
@@ -761,7 +849,10 @@ mod tests {
         assert_eq!(bound.kth(), Some(3.0));
         bound.clear();
         assert_eq!(bound.kth(), None);
-        assert_eq!(SharedBound::new(0).offer([1.0]), SharedOffer::default());
+        assert_eq!(
+            SharedBound::new(0, None).offer([1.0]),
+            SharedOffer::default()
+        );
         assert_eq!(SharedBound::seeded(4, 2.5).kth(), Some(2.5));
 
         for seed in 0..256 {
@@ -770,7 +861,7 @@ mod tests {
             let scores: Vec<f32> = (0..rng.usize(0..40))
                 .map(|_| (rng.f32() * 20.0 - 10.0).round() / 2.0)
                 .collect();
-            let bound = SharedBound::new(k);
+            let bound = SharedBound::new(k, None);
             let mut offered: Vec<f32> = Vec::new();
             let mut previous = None;
             let mut rest = &scores[..];
@@ -811,7 +902,7 @@ mod tests {
             let k = 1 + rng.usize(0..12);
             let case = format!("seed {seed} k={k}");
             let seeded: Vec<f32> = (0..rng.usize(0..2 * k)).map(|_| value(&mut rng)).collect();
-            let shared = SharedBound::new(k);
+            let shared = SharedBound::new(k, None);
             shared.offer(seeded.iter().copied());
             let mut bound = PruningBound::new(k, Some(&shared));
             // Every carried score and every lower endpoint merged since the last boundary.
@@ -1007,6 +1098,150 @@ mod tests {
                 removed.candidates.doc_ids(),
                 "{case}"
             );
+        }
+    }
+
+    /// An in-process slot that counts its loads and updates.
+    #[derive(Default)]
+    struct CountingSlot {
+        slot: AtomicSharedThreshold,
+        loads: AtomicUsize,
+        updates: AtomicUsize,
+    }
+
+    impl SharedThreshold<Score> for CountingSlot {
+        fn load(&self) -> Option<(Score, SegmentOrdinal)> {
+            self.loads.fetch_add(1, Ordering::Relaxed);
+            self.slot.load()
+        }
+
+        fn try_update(
+            &self,
+            expected: &Option<(Score, SegmentOrdinal)>,
+            new: (Score, SegmentOrdinal),
+        ) -> Result<(), Option<(Score, SegmentOrdinal)>> {
+            let updated = self.slot.try_update(expected, new);
+            if updated.is_ok() {
+                self.updates.fetch_add(1, Ordering::Relaxed);
+            }
+            updated
+        }
+    }
+
+    impl CountingSlot {
+        fn score(&self) -> Option<Score> {
+            self.slot.load().map(|(score, _)| score)
+        }
+
+        fn counts(&self) -> (usize, usize) {
+            (
+                self.loads.load(Ordering::Relaxed),
+                self.updates.load(Ordering::Relaxed),
+            )
+        }
+    }
+
+    /// A bound at `k` sharing `shared`'s slot, holding `scores` as exact scores.
+    fn exact_bound<'a>(shared: &'a SharedBound, k: usize, scores: &[f32]) -> PruningBound<'a> {
+        let mut bound = PruningBound::new(k, Some(shared));
+        for &score in scores {
+            bound.push_exact(score);
+        }
+        bound
+    }
+
+    /// A bound publishes its threshold only when it is finite and above its last offer, the slot
+    /// takes it only when it is above the slot's score, and a sync raises the threshold to the
+    /// slot's score.
+    #[test]
+    fn publishes_only_higher_finite_thresholds() {
+        let slot = Arc::new(CountingSlot::default());
+        let shared = SharedBound::new(2, Some(slot.clone() as Arc<dyn SharedThreshold<Score>>));
+        exact_bound(&shared, 2, &[]).publish();
+        assert_eq!(slot.counts(), (0, 0), "an unset threshold is never offered");
+        let mut first = exact_bound(&shared, 2, &[5.0, 3.0]);
+        first.publish();
+        assert_eq!((slot.score(), slot.counts()), (Some(3.0), (1, 1)));
+        first.publish();
+        assert_eq!(slot.counts(), (1, 1), "a repeat offer reads nothing");
+
+        let mut second = exact_bound(&shared, 2, &[5.0, 2.0]);
+        second.publish();
+        assert_eq!(
+            (slot.score(), slot.counts()),
+            (Some(3.0), (2, 1)),
+            "lower is kept out"
+        );
+        second.publish();
+        assert_eq!(slot.counts(), (2, 1), "a repeat offer reads nothing");
+        second.push_exact(4.0);
+        second.publish();
+        assert_eq!((slot.score(), slot.counts()), (Some(4.0), (3, 2)));
+        assert_eq!((first.publishes, second.publishes), (1, 1));
+
+        for score in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            let mut bound = exact_bound(&shared, 1, &[score]);
+            bound.publish();
+            assert_eq!(
+                (slot.score(), slot.counts(), bound.publishes),
+                (Some(4.0), (3, 2), 0),
+                "{score} is never written"
+            );
+        }
+
+        let mut synced = exact_bound(&shared, 2, &[5.0, 3.0]);
+        synced.sync();
+        assert_eq!((synced.threshold(), synced.raises), (Some(4.0), 1));
+        synced.sync();
+        assert_eq!(synced.raises, 1, "an equal score raises nothing");
+        let mut above = exact_bound(&shared, 2, &[9.0, 8.0]);
+        above.sync();
+        assert_eq!((above.threshold(), above.raises), (Some(8.0), 0));
+        above.publish();
+        assert_eq!((slot.score(), above.publishes), (Some(8.0), 1));
+
+        let mut unshared = PruningBound::new(2, None);
+        for score in [9.0, 8.0] {
+            unshared.push_exact(score);
+        }
+        unshared.sync();
+        unshared.publish();
+        assert_eq!((unshared.raises, unshared.publishes), (0, 0));
+    }
+
+    /// Threads publishing interleaved, rising thresholds into one slot, some also syncing from
+    /// it, leave the slot at the highest threshold any of them reached.
+    #[test]
+    fn concurrent_publishes_leave_the_slot_at_the_max() {
+        for seed in 0..32 {
+            let slot = Arc::new(AtomicSharedThreshold::default());
+            let shared = SharedBound::new(8, Some(slot.clone() as Arc<dyn SharedThreshold<Score>>));
+            let threads = 2 + seed as usize % 7;
+            let barrier = Barrier::new(threads);
+            let finals: Vec<Option<f32>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|thread| {
+                        let (shared, barrier) = (&shared, &barrier);
+                        scope.spawn(move || {
+                            let mut rng = fastrand::Rng::with_seed(seed * 64 + thread as u64);
+                            let k = 1 + rng.usize(0..6);
+                            let mut bound = PruningBound::new(k, Some(shared));
+                            barrier.wait();
+                            for _ in 0..rng.usize(1..400) {
+                                bound.push_exact(rng.f32() * 100.0 - 50.0);
+                                if rng.usize(0..4) == 0 {
+                                    bound.sync();
+                                }
+                                bound.publish();
+                            }
+                            bound.threshold()
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let max = finals.iter().flatten().copied().reduce(f32::max);
+            assert_eq!(slot.load().map(|(score, _)| score), max, "seed {seed}");
         }
     }
 

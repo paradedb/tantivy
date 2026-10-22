@@ -100,6 +100,10 @@ pub(crate) struct ScanReport {
     pub(crate) exact_rows: usize,
     /// Survivors of the last boundary dropped before the exact phase read them.
     pub(crate) exact_recheck_dropped: usize,
+    /// Thresholds the scan stored in the participants' slot.
+    pub(crate) cross_bound_publishes: usize,
+    /// Slot reads that raised the scan's threshold.
+    pub(crate) cross_bound_raises: usize,
     /// Centroid rows read for shortlisted clusters without a centroid score.
     pub(crate) centroid_reads: usize,
     #[cfg(test)]
@@ -239,7 +243,7 @@ impl<'a> QuantizedState<'a> {
         &mut self,
         rows: &ClusterRows<'_>,
         read: LayerRead,
-        bound: &mut PruningBound,
+        bound: &mut PruningBound<'_>,
         scratch: &mut ReadScratch,
     ) -> crate::Result<()> {
         let centroid = match rows.centroid {
@@ -291,7 +295,7 @@ impl<'a> QuantizedState<'a> {
 
     /// The threshold admission prunes at; `None` while the bound's is unset or when a test
     /// disables pruning.
-    fn admission_threshold(&self, bound: &mut PruningBound) -> Option<Threshold> {
+    fn admission_threshold(&self, bound: &mut PruningBound<'_>) -> Option<Threshold> {
         #[cfg(test)]
         if self.admission_pruning_disabled {
             return None;
@@ -324,7 +328,7 @@ impl<'a> QuantizedState<'a> {
 
     /// Drops block `b`'s candidates whose upper endpoint fell below the bound's pruning threshold
     /// since the last boundary, before the block is read; returns the rows dropped.
-    fn recheck(&mut self, b: usize, bound: &mut PruningBound) -> usize {
+    fn recheck(&mut self, b: usize, bound: &mut PruningBound<'_>) -> usize {
         match bound.recheck_threshold() {
             Some(threshold) => self.candidates.recheck(b, threshold),
             None => 0,
@@ -341,7 +345,7 @@ impl<'a> QuantizedState<'a> {
     }
 
     /// Records the candidates `layer` scored and prunes them at its boundary.
-    fn prune(&mut self, layer: usize, bound: &mut PruningBound, report: &mut ScanReport) {
+    fn prune(&mut self, layer: usize, bound: &mut PruningBound<'_>, report: &mut ScanReport) {
         // Layer 0's kernel scores every admitted row; admission pruning drops rows before they
         // become candidates, so the scored count keeps its own counter.
         report.layers[layer].scored = if layer == 0 {
@@ -387,7 +391,7 @@ where
 {
     exact: ExactScorer<'a, T, K, C>,
     /// The segment's pruning bound.
-    bound: PruningBound,
+    bound: PruningBound<'a>,
     /// The quantized cascade; `None` scores every shortlisted row exactly.
     quantized: Option<QuantizedState<'a>>,
     scratch: ReadScratch,
@@ -584,6 +588,8 @@ where
     ) -> crate::Result<(TieBreakHits<K>, ScanReport)> {
         let _assembly = enter_vector_stage(VectorStage::ResultAssembly);
         let mut report = self.report;
+        report.cross_bound_publishes = self.bound.publishes;
+        report.cross_bound_raises = self.bound.raises;
         if let Some(state) = &self.quantized {
             report.centroid_reads = state.centroid_reads;
         }

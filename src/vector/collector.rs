@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{
     compare_for_top_k, Collector, ComparableDoc, SegmentCollector, SegmentSortKeyComputer,
-    SortKeyComputer,
+    SharedThresholdArcOpt, SortKeyComputer,
 };
 use crate::index::SegmentReader;
 use crate::query::Weight;
@@ -74,6 +74,8 @@ pub struct TopDocsByVectorSimilarityBuilder<T: VectorElement, S = NoTieBreak> {
     offset: usize,
     probe_params: ProbeParams,
     max_scan_levels: usize,
+    /// Optional slot shared with other collectors searching the same query.
+    shared_threshold: SharedThresholdArcOpt<Score>,
     tie_break: S,
 }
 
@@ -87,6 +89,7 @@ impl<T: VectorElement> TopDocsByVectorSimilarityBuilder<T, NoTieBreak> {
             offset: 0,
             probe_params: ProbeParams::default(),
             max_scan_levels: usize::MAX,
+            shared_threshold: None,
             tie_break: NoTieBreak,
         }
     }
@@ -112,6 +115,16 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
         self
     }
 
+    /// Shares every segment scan's pruning threshold through `slot` with the query's other
+    /// participants, each searching its own segments for the same query, filter and
+    /// `limit + offset`. Every score in the slot must be a lower bound on the k-th best score
+    /// among those rows, k = `limit + offset`: each scan raises its threshold to the slot's score
+    /// and publishes its own when that is higher. `None`, the default, shares nothing.
+    pub fn with_shared_threshold(mut self, slot: SharedThresholdArcOpt<Score>) -> Self {
+        self.shared_threshold = slot;
+        self
+    }
+
     /// Orders equal similarities by `tie_break`, as `ORDER BY embedding <=> $1, id` does.
     ///
     /// The tie-break takes part in each segment's eviction but never in routing. Segments cut on
@@ -127,6 +140,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
             offset: self.offset,
             probe_params: self.probe_params,
             max_scan_levels: self.max_scan_levels,
+            shared_threshold: self.shared_threshold,
             tie_break,
         }
     }
@@ -143,7 +157,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
             max_scan_levels: self.max_scan_levels,
             quantized_queries: Mutex::new(HashMap::new()),
             prepared: Mutex::new(None),
-            shared_bound: Arc::new(SharedBound::new(segment_top_n)),
+            shared_bound: Arc::new(SharedBound::new(segment_top_n, self.shared_threshold)),
             tie_break: self.tie_break,
         }
     }
@@ -168,8 +182,8 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     quantized_queries: Mutex<HashMap<PreparedKey, PreparedCell>>,
     /// The query prepared for the field's metric on first use.
     prepared: Mutex<Option<Arc<VectorQuery<T>>>>,
-    /// The best `limit + offset` exact scores the finished segments returned; every later
-    /// segment prunes against their k-th.
+    /// The best `limit + offset` exact scores the finished segments returned, and the slot the
+    /// query's participants share: every later segment prunes against both.
     shared_bound: Arc<SharedBound>,
     tie_break: S,
 }
