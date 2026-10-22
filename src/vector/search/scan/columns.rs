@@ -1,13 +1,16 @@
-//! Quantized candidates: one block per admitted cluster, their value columns, their admission
-//! into the pruning bound, and boundary selection in place.
+//! Quantized candidates: one block per admitted cluster, their value columns and interval
+//! endpoints, and their selection in place at a threshold.
 
 use std::ops::Range;
 
 use crate::vector::distance::Similarity;
 use crate::vector::quantization::{ArithmeticError, QUANTIZED_BOUNDARY_KAPPA};
 use crate::vector::search::cluster_source::ClusterRows;
-use crate::vector::search::interval::{Estimate, LowerEndpoint, Threshold, UpperEndpoint};
-use crate::vector::search::scan::bound::{lower_endpoint_order, tighter, KthBound};
+#[cfg(test)]
+use crate::vector::search::interval::LowerEndpoint;
+use crate::vector::search::interval::{Estimate, Threshold, UpperEndpoint};
+#[cfg(test)]
+use crate::vector::search::scan::bound::PruningBound;
 use crate::DocId;
 
 // --- Columns ---
@@ -115,8 +118,8 @@ pub(crate) struct QuantizedCandidates {
     blocks: Vec<AdmittedCluster>,
     /// Confidence multiplier of every interval endpoint.
     kappa: f32,
+    /// The live candidates' lower endpoints, written for a boundary.
     lowers: Vec<f32>,
-    cluster_top: Vec<(f32, usize, f32)>,
 }
 
 impl QuantizedCandidates {
@@ -130,8 +133,12 @@ impl QuantizedCandidates {
             blocks: Vec::new(),
             kappa: QUANTIZED_BOUNDARY_KAPPA,
             lowers: Vec::with_capacity(capacity),
-            cluster_top: Vec::new(),
         }
+    }
+
+    /// The confidence multiplier of every interval endpoint.
+    pub(crate) fn kappa(&self) -> f32 {
+        self.kappa
     }
 
     /// The live candidates: every block's range, summed.
@@ -171,27 +178,16 @@ impl QuantizedCandidates {
         at
     }
 
-    /// Appends the rows of `rows` whose interval can still reach the running top-k as a block
-    /// around `centroid`, taking their combined columns from `scratch`. The running k-th lower
-    /// endpoint only rises, so a dropped row's upper endpoint stays below every later boundary
-    /// threshold and its lower endpoint can never enter the running top-k: survivors, thresholds
-    /// and results are exactly those of appending every row. `keep` is reused scratch for the
-    /// selected row indices. Returns the block's range.
-    pub(crate) fn push_block_pruned(
+    /// Appends the rows of `rows` that `keep` selects as a block around `centroid`, taking their
+    /// combined columns from `scratch`. Returns the block's range.
+    pub(crate) fn push_selected(
         &mut self,
         rows: &ClusterRows<'_>,
         centroid: Similarity,
         scratch: &Columns,
-        keep: &mut Vec<u32>,
-        threshold: Threshold,
+        keep: &[u32],
     ) -> Range<usize> {
         debug_assert_eq!(scratch.estimates.len(), rows.len());
-        keep.clear();
-        keep.extend((0..rows.len() as u32).filter(|&i| {
-            let index = i as usize;
-            let upper = Estimate(scratch.estimates[index]).upper(scratch.sigmas[index], self.kappa);
-            threshold.admits(upper)
-        }));
         let start = self.offsets.len();
         match rows.offsets {
             Some(offsets) => self
@@ -272,42 +268,25 @@ impl QuantizedCandidates {
             .upper(self.columns.sigmas[index], self.kappa)
     }
 
-    /// Merges the last block's candidates, at `at`, into the bound's running top-k, through the
-    /// block's own top-k so the merge stays O(k).
-    pub(crate) fn finish_cluster(&mut self, at: Range<usize>, bound: &mut KthBound) {
-        let k = bound.k;
-        let Some(block) = self.blocks.last() else {
-            return;
-        };
+    /// The `(lower, global row, estimate)` entries of the last block's candidates, at `at`.
+    pub(crate) fn entries(&self, at: Range<usize>) -> impl Iterator<Item = (f32, usize, f32)> + '_ {
+        let block = self.blocks.last().expect("a block was just pushed");
         debug_assert_eq!(block.at, at, "the block just pushed");
-        if k == 0 || at.is_empty() {
-            return;
-        }
         let start = block.rows.start;
-        let mut cluster_top = std::mem::take(&mut self.cluster_top);
-        cluster_top.clear();
-        cluster_top.extend(at.map(|index| {
+        at.map(move |index| {
             (
                 self.lower(index),
                 start + self.offsets[index] as usize,
                 self.columns.estimates[index],
             )
-        }));
-        if cluster_top.len() > k {
-            cluster_top.select_nth_unstable_by(k - 1, lower_endpoint_order);
-            cluster_top.truncate(k);
-        }
-        bound.merge_running(&cluster_top);
-        self.cluster_top = cluster_top;
+        })
     }
 
-    /// Keeps, in place, each block's candidates whose upper endpoint reaches the k-th lower
-    /// endpoint, or `shared`, the shared bound's k-th, when that is tighter; selecting by lower
-    /// endpoint, not estimate, keeps every true top-k row whose interval encloses its score.
-    /// Blocks keep their row order and a retired block keeps nothing. Blocks are walked in
-    /// admission order, which is storage order, so writes never pass reads.
-    pub(crate) fn band(&mut self, bound: &mut KthBound, shared: Option<f32>) {
-        let threshold = self.boundary(bound, shared);
+    /// Keeps, in place, each block's candidates whose upper endpoint reaches `threshold`, a
+    /// boundary's; selecting by lower endpoint, not estimate, keeps every true top-k row whose
+    /// interval encloses its score. Blocks keep their row order and a retired block keeps nothing.
+    /// Blocks are walked in admission order, which is storage order, so writes never pass reads.
+    pub(crate) fn band(&mut self, threshold: Option<Threshold>) {
         let (mut write, mut docs_write) = (0, 0);
         for b in 0..self.blocks.len() {
             let (at, docs) = (self.blocks[b].at.clone(), self.blocks[b].docs);
@@ -331,9 +310,8 @@ impl QuantizedCandidates {
         self.docs.truncate(docs_write);
     }
 
-    /// The boundary threshold: the k-th largest lower endpoint over the live candidates and the
-    /// bound's exact scores, or `shared` when that is tighter.
-    fn boundary(&mut self, bound: &mut KthBound, shared: Option<f32>) -> Option<Threshold> {
+    /// The lower endpoint of every live candidate, in a buffer the caller may reorder.
+    pub(crate) fn live_lowers(&mut self) -> &mut [f32] {
         let mut lowers = std::mem::take(&mut self.lowers);
         lowers.clear();
         for block in &self.blocks {
@@ -347,10 +325,8 @@ impl QuantizedCandidates {
             );
             lowers.extend(block.at.clone().map(|index| self.lower(index)));
         }
-        let threshold = tighter(bound.boundary_lower(&mut lowers), shared)
-            .map(|kth| Threshold(LowerEndpoint(kth)));
         self.lowers = lowers;
-        threshold
+        &mut self.lowers
     }
 }
 
@@ -465,7 +441,7 @@ impl QuantizedCandidates {
 #[cfg(test)]
 pub(crate) struct BoundaryHarness {
     pub(crate) candidates: QuantizedCandidates,
-    bound: Option<KthBound>,
+    bound: Option<PruningBound>,
     /// Whether the last block is a cluster `begin_cluster` opened and `finish_cluster` has not
     /// closed yet.
     cluster_open: bool,
@@ -484,9 +460,9 @@ impl BoundaryHarness {
         }
     }
 
-    fn bound(&mut self, k: usize) -> &mut KthBound {
-        let bound = self.bound.get_or_insert_with(|| KthBound::new(k));
-        assert_eq!(bound.k, k, "one k per harness");
+    fn bound(&mut self, k: usize) -> &mut PruningBound {
+        let bound = self.bound.get_or_insert_with(|| PruningBound::new(k, None));
+        assert_eq!(bound.k_for_test(), k, "one k per harness");
         bound
     }
 
@@ -526,42 +502,47 @@ impl BoundaryHarness {
             .bound
             .as_mut()
             .expect("begin_cluster creates the bound");
-        self.candidates.finish_cluster(at, bound);
+        bound.merge_cluster(self.candidates.entries(at));
     }
 
-    pub(crate) fn running_lower(&mut self, k: usize) -> Option<Threshold> {
+    pub(crate) fn own_lower(&mut self, k: usize) -> Option<Threshold> {
         self.bound(k)
-            .running_lower()
+            .own_lower()
             .map(|kth| Threshold(LowerEndpoint(kth)))
     }
 
     /// `None` for a `k` above the harness's: the running top-k holds fewer than `k` entries.
-    pub(crate) fn running_estimate(&mut self, k: usize) -> Option<f32> {
+    pub(crate) fn own_estimate(&mut self, k: usize) -> Option<f32> {
         let bound = self.bound.as_ref()?;
-        if k > bound.k {
+        if k > bound.k_for_test() {
             return None;
         }
-        self.bound(k).running_estimate()
+        self.bound(k).own_estimate()
     }
 
     /// The threshold the next boundary would apply, leaving the running top-k intact.
     pub(crate) fn boundary_lower(&mut self, k: usize, kappa: f32) -> Option<Threshold> {
         let mut bound = self.bound(k).clone();
         self.candidates.kappa = kappa;
-        self.candidates.boundary(&mut bound, None)
+        bound.boundary(&mut self.candidates)
     }
 
     pub(crate) fn band(&mut self, k: usize, kappa: f32) {
         self.candidates.kappa = kappa;
         self.block_open = false;
-        let bound = self.bound.get_or_insert_with(|| KthBound::new(k));
-        self.candidates.band(bound, None);
+        let bound = self.bound.get_or_insert_with(|| PruningBound::new(k, None));
+        let threshold = bound.boundary(&mut self.candidates);
+        self.candidates.band(threshold);
     }
 
     /// Rows of the running top-k, in bound order.
     pub(crate) fn running_rows(&self) -> Vec<usize> {
         self.bound.as_ref().map_or_else(Vec::new, |bound| {
-            bound.running.iter().map(|entry| entry.1).collect()
+            bound
+                .running_for_test()
+                .iter()
+                .map(|entry| entry.1)
+                .collect()
         })
     }
 }
