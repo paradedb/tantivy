@@ -16,7 +16,9 @@ use crate::vector::search::source::router::{
     DocFilter, GatedRows, RouterClusters, RouterReport, RowGate,
 };
 use crate::vector::storage::bounds::{HeapPeek, QueryBound, QueryBoundTracker};
-use crate::vector::test_support::{DocsWeight, Fixture, FixtureSpec, Lcg, SegmentRun};
+use crate::vector::test_support::{
+    first_segment, DocsWeight, Fixture, FixtureSpec, Lcg, SegmentRun,
+};
 use crate::vector::tests::{exhaustive_params, routed_exhaustive_params, TestVectorIndex};
 use crate::vector::RouterKind;
 use crate::DocId;
@@ -30,7 +32,7 @@ struct Walk {
     report: RouterReport,
 }
 
-/// Walks segment 0's router source as a scan would, admitting every row of every cluster;
+/// Walks the first segment's router source as a scan would, admitting every row of every cluster;
 /// `feedback(rows)` is what the scan reports after `rows` admitted rows.
 fn walk(seg: &SegmentRun<'_>, feedback: impl Fn(usize) -> Feedback) -> crate::Result<Walk> {
     let plan = seg.plan()?;
@@ -197,7 +199,9 @@ fn controller_charges_opens_and_scored_rows() -> crate::Result<()> {
     let x = DEFAULT_FIXED_PROBE_COST_ROWS / (DEFAULT_FIXED_PROBE_COST_ROWS + n_avg);
     let row = (1.0 - x) / n_avg;
     let docs = fixture.cluster_docs(0)?[0][..3].to_vec();
-    let max_doc = fixture.index.reader()?.searcher().segment_readers()[0].max_doc();
+    let max_doc = first_segment(&fixture.index.reader()?.searcher())
+        .1
+        .max_doc();
     let filtered =
         fixture.with_segment(&AllQuery, &[0.0, 0.0], 23, &budget_params(1.0), |seg| {
             let weight = DocsWeight { max_doc, docs };
@@ -313,7 +317,9 @@ fn probe_termination() -> crate::Result<()> {
         ProbeTermination::Exhausted
     );
     assert_eq!(counters.postings_row + counters.postings_skipped, 9);
-    let docs = fixture.index.reader()?.searcher().segment_readers()[0].max_doc() as usize;
+    let docs = first_segment(&fixture.index.reader()?.searcher())
+        .1
+        .max_doc() as usize;
     assert_eq!(exhausted.rows, docs);
 
     // Recall target: a loose target stops on the estimate before the budget; 1.0 leaves APS off.
@@ -596,7 +602,9 @@ fn gate_bookkeeping() -> crate::Result<()> {
     // A gated cluster carries its rows' doc ids, aligned with its offsets; an open one reads none.
     let fixture = separated_fixture(2)?;
     let docs = fixture.cluster_docs(0)?;
-    let max_doc = fixture.index.reader()?.searcher().segment_readers()[0].max_doc();
+    let max_doc = first_segment(&fixture.index.reader()?.searcher())
+        .1
+        .max_doc();
     let keep: Vec<DocId> = docs
         .iter()
         .flat_map(|docs| docs.iter().step_by(2).copied())

@@ -37,7 +37,10 @@ use crate::vector::{
     ProbeStats, RouterKind, VectorQuantizationConfig, VectorQuantizationLayer,
     VectorSimilarityFruit, VectorStage,
 };
-use crate::{DocAddress, DocId, Index, IndexWriter, Score, SegmentReader, TantivyDocument};
+use crate::{
+    DocAddress, DocId, Index, IndexWriter, Score, Searcher, SegmentOrdinal, SegmentReader,
+    TantivyDocument,
+};
 
 // --- Segment searcher ---
 
@@ -469,7 +472,7 @@ impl Fixture {
         query: &[f32],
     ) -> crate::Result<Vec<Candidate>> {
         let searcher = self.index.reader()?.searcher();
-        let vectors = searcher.segment_readers()[0].vector_index(self.field)?;
+        let vectors = first_segment(&searcher).1.vector_index(self.field)?;
         let ivf = vectors.index().expect("IVF segment");
         let centroids = ivf.centroid_bytes()?;
         let stride = vectors.options().bytes_per_vector();
@@ -572,8 +575,8 @@ impl Fixture {
         backend.top_n(weight, segment_reader, top_n)
     }
 
-    /// Runs `run` over segment 0's full-precision searcher for `query` and `params`, with the
-    /// search arguments `filter` and `top_n`.
+    /// Runs `run` over the first segment's full-precision searcher for `query` and `params`, with
+    /// the search arguments `filter` and `top_n`.
     pub(crate) fn with_segment<R>(
         &self,
         filter: &dyn Query,
@@ -583,13 +586,13 @@ impl Fixture {
         run: impl FnOnce(&SegmentRun<'_>) -> crate::Result<R>,
     ) -> crate::Result<R> {
         let searcher = self.index.reader()?.searcher();
-        let segment = &searcher.segment_readers()[0];
+        let (ordinal, segment) = first_segment(&searcher);
         let reader = segment.vector_index(self.field)?;
         let index = reader.index().expect("IVF segment");
         let weight = filter.weight(EnableScoring::disabled_from_searcher(&searcher))?;
         let backend = SegmentSearcher::<f32>::for_segment(
             segment,
-            0,
+            ordinal,
             self.field,
             Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec()))),
             None,
@@ -695,11 +698,11 @@ impl Fixture {
         self.log().reads.lock().unwrap().clone()
     }
 
-    /// Byte ranges of segment 0's DocIds column requests and full-precision cluster spans, by
-    /// cluster; `None` for an empty cluster.
+    /// Byte ranges of the first segment's DocIds column requests and full-precision cluster spans,
+    /// by cluster; `None` for an empty cluster.
     pub(crate) fn column_ranges(&self) -> crate::Result<ColumnRanges> {
         let searcher = self.index.reader()?.searcher();
-        let vectors = searcher.segment_readers()[0].vector_index(self.field)?;
+        let vectors = first_segment(&searcher).1.vector_index(self.field)?;
         let clusters = vectors.index().expect("IVF segment").num_clusters();
         let mut ranges = ColumnRanges::default();
         let mut docs = Vec::new();
@@ -741,10 +744,23 @@ pub(crate) struct DocTrace {
     pub(crate) exact_phase_docs: Vec<DocId>,
 }
 
-/// Translates segment 0's trace rows of `field` in `index` into doc ids.
+/// The first segment and its ordinal: the one with the lowest id, which the per-segment helpers
+/// read. The searcher lists segments in the segment register's hash-map order, which differs
+/// between processes; test segment ids count up, so the lowest id is the same segment every run.
+pub(crate) fn first_segment(searcher: &Searcher) -> (SegmentOrdinal, &SegmentReader) {
+    let (ordinal, segment) = searcher
+        .segment_readers()
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, segment)| segment.segment_id())
+        .expect("the index has a segment");
+    (ordinal as SegmentOrdinal, segment)
+}
+
+/// Translates the first segment's trace rows of `field` in `index` into doc ids.
 pub(crate) fn doc_trace(index: &Index, field: Field, trace: &ScanTrace) -> crate::Result<DocTrace> {
     let searcher = index.reader()?.searcher();
-    let vectors = searcher.segment_readers()[0].vector_index(field)?;
+    let vectors = first_segment(&searcher).1.vector_index(field)?;
     let clusters = vectors.index().expect("IVF segment").num_clusters();
     let docs: Vec<DocId> = with_unarmed_log(|| {
         let mut all = Vec::new();
@@ -781,7 +797,7 @@ pub(crate) fn doc_trace(index: &Index, field: Field, trace: &ScanTrace) -> crate
 }
 
 impl Fixture {
-    /// Translates segment 0's trace rows into doc ids.
+    /// Translates the first segment's trace rows into doc ids.
     pub(crate) fn doc_trace(&self, trace: &ScanTrace) -> crate::Result<DocTrace> {
         doc_trace(&self.index, self.field, trace)
     }
