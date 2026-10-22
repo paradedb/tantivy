@@ -1,9 +1,23 @@
-//! The scan's pruning bound: the k-th largest lower endpoint over quantized intervals and exact
-//! scores; and the bound one query's segment scans share: the k-th best exact score its finished
-//! segments returned.
+//! The pruning bounds of one query's scans.
+//!
+//! A [`SharedBound`] is per query, held by the collector: the `k` best exact scores the query's
+//! finished segments returned in this process.
+//!
+//! A [`PruningBound`] is per segment scan, owned by the scan. It keeps two views. The segment's
+//! own, its running top-k of lower endpoints and its exact scores, is what the router's feedback
+//! and the result heap read. The pruning threshold adds the shared scores and decides admission
+//! and every boundary.
+//!
+//! Every value either bound holds is an exact score of a distinct row or a k-th largest lower
+//! endpoint over distinct rows, with k = limit + offset; under the intervals' kappa each is a
+//! lower bound on the k-th best score among the rows the query searches. A row drops only when its
+//! upper endpoint is strictly below the threshold, so ties are kept.
 
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
+
+use crate::vector::search::cluster_source::ClusterRows;
+use crate::vector::search::interval::{Estimate, LowerEndpoint, Threshold};
+use crate::vector::search::scan::columns::{Columns, QuantizedCandidates};
 
 // --- Ordering ---
 
@@ -42,152 +56,20 @@ pub(crate) fn lower_endpoint_order(
     b.0.total_cmp(&a.0).then(a.1.cmp(&b.1))
 }
 
-// --- Bound ---
-
-/// The scan's one pruning bound: the k-th largest lower endpoint over every live candidate,
-/// quantized intervals and exactly scored rows (zero-width intervals) alike. Only the top `k` of
-/// each side can affect it, so each side keeps at most `k` entries.
-#[derive(Clone)]
-pub(crate) struct KthBound {
-    pub(super) k: usize,
-    /// Top-k exact scores, descending. Exact rows never move.
-    exact: Vec<f32>,
-    /// Top-k quantized entries admitted since the last boundary, as `(lower, row, estimate)`,
-    /// ordered by [`lower_endpoint_order`].
-    pub(super) running: Vec<(f32, usize, f32)>,
-    /// The estimates of `running`, descending.
-    running_estimates: Vec<f32>,
-    merge: Vec<(f32, usize, f32)>,
-}
-
-impl KthBound {
-    pub(super) fn new(k: usize) -> Self {
-        Self {
-            k,
-            exact: Vec::with_capacity(k),
-            running: Vec::with_capacity(k),
-            running_estimates: Vec::with_capacity(k),
-            merge: Vec::with_capacity(k.saturating_mul(2)),
-        }
-    }
-
-    /// Records an exactly scored row.
-    pub(super) fn push_exact(&mut self, score: f32) {
-        if self.k == 0
-            || (self.exact.len() == self.k
-                && score.total_cmp(self.exact.last().unwrap()) != std::cmp::Ordering::Greater)
-        {
-            return;
-        }
-        let at = self
-            .exact
-            .partition_point(|kept| kept.total_cmp(&score) != std::cmp::Ordering::Less);
-        self.exact.insert(at, score);
-        self.exact.truncate(self.k);
-    }
-
-    /// The k-th exact score: no row scoring below it can enter the top k.
-    #[inline]
-    pub(super) fn exact_kth(&self) -> Option<f32> {
-        (self.k > 0 && self.exact.len() == self.k).then(|| self.exact[self.k - 1])
-    }
-
-    /// Merges one cluster's top-k entries into the running top-k.
-    pub(super) fn merge_running(&mut self, cluster_top: &[(f32, usize, f32)]) {
-        self.merge.clear();
-        self.merge.extend_from_slice(&self.running);
-        self.merge.extend_from_slice(cluster_top);
-        self.merge.sort_unstable_by(lower_endpoint_order);
-        self.merge.truncate(self.k);
-        std::mem::swap(&mut self.running, &mut self.merge);
-        self.running_estimates.clear();
-        self.running_estimates
-            .extend(self.running.iter().map(|&(_, _, estimate)| estimate));
-        self.running_estimates
-            .sort_unstable_by(|a, b| b.total_cmp(a));
-    }
-
-    /// The bounds gate's threshold: the k-th of the running lower endpoints and the exact scores;
-    /// `None` until `k` are in.
-    pub(crate) fn running_lower(&self) -> Option<f32> {
-        if self.exact.is_empty() {
-            return (self.k > 0 && self.running.len() >= self.k)
-                .then(|| self.running[self.k - 1].0);
-        }
-        merged_kth(
-            self.running.len(),
-            |i| self.running[i].0,
-            &self.exact,
-            self.k,
-        )
-    }
-
-    /// APS cover's threshold: the k-th of the running point estimates and the exact scores;
-    /// `None` until `k` are in. It never exceeds the k-th best estimate and carries no confidence
-    /// margin, so it must not drive pruning.
-    pub(crate) fn running_estimate(&self) -> Option<f32> {
-        if self.k == 0 {
-            return None;
-        }
-        if self.exact.is_empty() {
-            if self.running.len() < self.k {
-                return None;
-            }
-            return self
-                .running
-                .iter()
-                .map(|&(_, _, estimate)| estimate)
-                .min_by(f32::total_cmp);
-        }
-        let estimates = &self.running_estimates;
-        merged_kth(estimates.len(), |i| estimates[i], &self.exact, self.k)
-    }
-
-    /// The boundary threshold: the k-th largest of `candidate_lowers` (one per live quantized
-    /// candidate, reordered in place) and the exact scores. Clears the running top-k, which
-    /// describes the candidates before the boundary.
-    pub(super) fn boundary_lower(&mut self, candidate_lowers: &mut [f32]) -> Option<f32> {
-        self.running.clear();
-        self.running_estimates.clear();
-        let k = self.k;
-        if k == 0 {
-            return None;
-        }
-        if self.exact.is_empty() {
-            if candidate_lowers.len() < k {
-                return None;
-            }
-            let (_, kth, _) = candidate_lowers.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
-            return Some(*kth);
-        }
-        if candidate_lowers.len() + self.exact.len() < k {
-            return None;
-        }
-        let quantized = k.min(candidate_lowers.len());
-        if quantized > 0 && quantized < candidate_lowers.len() {
-            candidate_lowers.select_nth_unstable_by(quantized - 1, |a, b| b.total_cmp(a));
-        }
-        let top = &mut candidate_lowers[..quantized];
-        top.sort_unstable_by(|a, b| b.total_cmp(a));
-        merged_kth(top.len(), |i| top[i], &self.exact, k)
-    }
-}
-
-/// The tighter of a scan's own threshold and the shared bound's k-th; an unset side is the
-/// loosest value.
+/// Inserts `score` into `top`, the `k` largest values held, descending.
 #[inline]
-pub(crate) fn tighter(local: Option<f32>, shared: Option<f32>) -> Option<f32> {
-    match (local, shared) {
-        (Some(local), Some(shared)) => Some(if shared > local { shared } else { local }),
-        (local, None) => local,
-        (None, shared) => shared,
+fn insert_top_k(top: &mut Vec<f32>, k: usize, score: f32) {
+    if k == 0
+        || (top.len() == k && score.total_cmp(top.last().unwrap()) != std::cmp::Ordering::Greater)
+    {
+        return;
     }
+    let at = top.partition_point(|kept| kept.total_cmp(&score) != std::cmp::Ordering::Less);
+    top.insert(at, score);
+    top.truncate(k);
 }
 
 // --- Shared bound ---
-
-/// The k-th cached as `f32` bits; no score has these bits, since the high half is never set.
-const UNSET: u64 = u64::MAX;
 
 /// What one segment's offer did to a [`SharedBound`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -198,10 +80,10 @@ pub(crate) struct SharedOffer {
     pub(crate) tightenings: usize,
 }
 
-/// The bound one query's segment scans share within a process: the `k` best exact scores of the
-/// rows its finished segments returned. Those rows are real results, so no row scoring below
-/// their k-th can enter the query's top `k`, and that k-th prunes like a scan's own bound. It is
-/// unset until `k` scores are in and only ever tightens.
+/// What one query's scans share beyond their own segment: the `k` best exact scores of the rows
+/// its finished segments returned in this process. The returned rows are real results, distinct
+/// from every later segment's rows, so each later segment scan carries their scores into its own
+/// bound. The scores only ever improve.
 ///
 /// Keeping the `k` scores, not one segment's k-th, lets a segment that returns fewer than `k`
 /// rows still raise it.
@@ -209,8 +91,6 @@ pub(crate) struct SharedBound {
     k: usize,
     /// The best `k` scores offered, descending.
     scores: Mutex<Vec<f32>>,
-    /// The k-th of `scores` as bits, or [`UNSET`]; read without the lock.
-    kth: AtomicU64,
 }
 
 impl SharedBound {
@@ -218,16 +98,21 @@ impl SharedBound {
         Self {
             k,
             scores: Mutex::new(Vec::with_capacity(k)),
-            kth: AtomicU64::new(UNSET),
         }
     }
 
-    /// The k-th best score offered; `None` until `k` are in. Offers only raise it, so a read that
-    /// misses a concurrent offer sees an older, looser value and prunes less, never wrongly.
-    #[inline]
+    /// Copies the best `k` scores offered, descending, into `out`.
+    fn copy_scores(&self, out: &mut Vec<f32>) {
+        let kept = self.scores.lock().unwrap();
+        out.clear();
+        out.extend_from_slice(&kept);
+    }
+
+    /// The k-th best score offered; `None` until `k` are in.
+    #[cfg(test)]
     pub(crate) fn kth(&self) -> Option<f32> {
-        let bits = self.kth.load(AtomicOrdering::Relaxed);
-        (bits != UNSET).then(|| f32::from_bits(bits as u32))
+        let kept = self.scores.lock().unwrap();
+        (self.k > 0 && kept.len() == self.k).then(|| kept[self.k - 1])
     }
 
     /// Takes the exact scores of the rows a segment returns. A non-finite score is skipped: it is
@@ -252,10 +137,6 @@ impl SharedBound {
             kept.truncate(self.k);
             if kept.len() == self.k && before.is_none_or(|before| kept[self.k - 1] > before) {
                 offer.tightenings += 1;
-                self.kth.store(
-                    u64::from(kept[self.k - 1].to_bits()),
-                    AtomicOrdering::Relaxed,
-                );
             }
         }
         offer
@@ -263,9 +144,7 @@ impl SharedBound {
 
     /// Forgets every offer, for the next search of a reused collector.
     pub(crate) fn clear(&self) {
-        let mut kept = self.scores.lock().unwrap();
-        kept.clear();
-        self.kth.store(UNSET, AtomicOrdering::Relaxed);
+        self.scores.lock().unwrap().clear();
     }
 
     /// A bound already holding `k` copies of `score`.
@@ -277,9 +156,278 @@ impl SharedBound {
     }
 }
 
+// --- Pruning bound ---
+
+/// One segment scan's pruning bound: the k-th largest lower endpoint over every live candidate,
+/// quantized intervals and exactly scored rows (zero-width intervals) alike, including the rows
+/// the query's finished segments returned. Only the top `k` of each side can affect it, so each
+/// side keeps at most `k` entries.
+#[cfg_attr(test, derive(Clone))]
+pub(crate) struct PruningBound {
+    k: usize,
+    /// Top-k exact scores of the segment's own rows, descending. Exact rows never move.
+    own_exact: Vec<f32>,
+    /// Top-k quantized entries admitted since the last boundary, as `(lower, global row,
+    /// estimate)`, ordered by [`lower_endpoint_order`].
+    running: Vec<(f32, usize, f32)>,
+    /// The estimates of `running`, descending.
+    running_estimates: Vec<f32>,
+    /// Top-k exact scores of every row the scan knows of, its own and those the query's finished
+    /// segments returned, descending. Every score is a distinct row's.
+    known_exact: Vec<f32>,
+    /// One cluster's entries for the running top-k.
+    entries: Vec<(f32, usize, f32)>,
+    merge: Vec<(f32, usize, f32)>,
+}
+
+impl PruningBound {
+    /// A bound for `k` rows that carries in `shared`'s scores.
+    pub(super) fn new(k: usize, shared: Option<&SharedBound>) -> Self {
+        let mut known_exact = Vec::with_capacity(k);
+        if let Some(shared) = shared {
+            shared.copy_scores(&mut known_exact);
+            known_exact.truncate(k);
+        }
+        Self {
+            k,
+            own_exact: Vec::with_capacity(k),
+            running: Vec::with_capacity(k),
+            running_estimates: Vec::with_capacity(k),
+            known_exact,
+            entries: Vec::new(),
+            merge: Vec::with_capacity(k.saturating_mul(2)),
+        }
+    }
+
+    // --- The segment's own view ---
+
+    /// The segment's own k-th lower endpoint: the k-th of the running lower endpoints and its own
+    /// exact scores; `None` until `k` are in. The router's bounds gate reads it, and admission
+    /// merges into the running top-k the rows it admits.
+    pub(crate) fn own_lower(&self) -> Option<f32> {
+        if self.own_exact.is_empty() {
+            return (self.k > 0 && self.running.len() >= self.k)
+                .then(|| self.running[self.k - 1].0);
+        }
+        merged_kth(
+            self.running.len(),
+            |i| self.running[i].0,
+            &self.own_exact,
+            self.k,
+        )
+    }
+
+    /// APS cover's threshold: the k-th of the running point estimates and the segment's own exact
+    /// scores; `None` until `k` are in. It never exceeds the k-th best estimate and carries no
+    /// confidence margin, so it must not drive pruning.
+    pub(crate) fn own_estimate(&self) -> Option<f32> {
+        if self.k == 0 {
+            return None;
+        }
+        if self.own_exact.is_empty() {
+            if self.running.len() < self.k {
+                return None;
+            }
+            return self
+                .running
+                .iter()
+                .map(|&(_, _, estimate)| estimate)
+                .min_by(f32::total_cmp);
+        }
+        let estimates = &self.running_estimates;
+        merged_kth(estimates.len(), |i| estimates[i], &self.own_exact, self.k)
+    }
+
+    /// The k-th of the segment's own exact scores: no row scoring below it can enter its top k.
+    #[inline]
+    pub(super) fn own_exact_kth(&self) -> Option<f32> {
+        (self.k > 0 && self.own_exact.len() == self.k).then(|| self.own_exact[self.k - 1])
+    }
+
+    // --- Recording ---
+
+    /// Records an exactly scored row.
+    pub(super) fn push_exact(&mut self, score: f32) {
+        insert_top_k(&mut self.own_exact, self.k, score);
+        insert_top_k(&mut self.known_exact, self.k, score);
+    }
+
+    /// Admits one cluster's rows, their combined columns in `scratch`: the rows whose upper
+    /// endpoint reaches `threshold` go to `keep`, and the rows the segment's own k-th admits join
+    /// the running top-k. Those are the rows a scan pruning on its own bound alone admits, so the
+    /// running top-k, and the router feedback drawn from it, are that scan's; of them, only rows
+    /// whose lower endpoint reaches a full running top-k's k-th are merged, since no other can
+    /// enter it.
+    pub(super) fn admit(
+        &mut self,
+        rows: &ClusterRows<'_>,
+        scratch: &Columns,
+        kappa: f32,
+        threshold: Threshold,
+        keep: &mut Vec<u32>,
+    ) {
+        debug_assert_eq!(scratch.estimates.len(), rows.len());
+        let own = self.own_lower();
+        debug_assert!(own.is_none_or(|own| own <= threshold.0 .0));
+        let start = rows.rows.start;
+        // Unset thresholds admit every row. Ties on the lower endpoint order by row, so an entry
+        // equal to the k-th may still enter.
+        let own = Threshold(LowerEndpoint(own.unwrap_or(f32::NEG_INFINITY)));
+        let entry = self.running_entry().unwrap_or(f32::NEG_INFINITY);
+        self.entries.clear();
+        keep.clear();
+        for index in 0..rows.len() {
+            let estimate = Estimate(scratch.estimates[index]);
+            let sigma = scratch.sigmas[index];
+            let (lower, upper) = (estimate.lower(sigma, kappa), estimate.upper(sigma, kappa));
+            // One branch per test, without short-circuiting: entries are rare once the running
+            // top-k is full, and candidates are rare once the threshold is set.
+            if own.admits(upper) & (lower.0 >= entry) {
+                let offset = rows
+                    .offsets
+                    .map_or(index, |offsets| offsets[index] as usize);
+                self.entries.push((lower.0, start + offset, estimate.0));
+            }
+            if threshold.admits(upper) {
+                keep.push(index as u32);
+            }
+        }
+        self.merge_entries();
+    }
+
+    /// Merges one cluster's `(lower, global row, estimate)` entries into the running top-k.
+    pub(super) fn merge_cluster(&mut self, entries: impl IntoIterator<Item = (f32, usize, f32)>) {
+        self.entries.clear();
+        self.entries.extend(entries);
+        self.merge_entries();
+    }
+
+    /// Merges `self.entries` into the running top-k through their own top-k, so the merge stays
+    /// O(k).
+    fn merge_entries(&mut self) {
+        let k = self.k;
+        if k == 0 || self.entries.is_empty() {
+            return;
+        }
+        if self.entries.len() > k {
+            self.entries
+                .select_nth_unstable_by(k - 1, lower_endpoint_order);
+            self.entries.truncate(k);
+        }
+        let entries = std::mem::take(&mut self.entries);
+        self.merge_running(&entries);
+        self.entries = entries;
+    }
+
+    /// Merges one cluster's top-k entries into the running top-k.
+    fn merge_running(&mut self, cluster_top: &[(f32, usize, f32)]) {
+        self.merge.clear();
+        self.merge.extend_from_slice(&self.running);
+        self.merge.extend_from_slice(cluster_top);
+        self.merge.sort_unstable_by(lower_endpoint_order);
+        self.merge.truncate(self.k);
+        std::mem::swap(&mut self.running, &mut self.merge);
+        self.running_estimates.clear();
+        self.running_estimates
+            .extend(self.running.iter().map(|&(_, _, estimate)| estimate));
+        self.running_estimates
+            .sort_unstable_by(|a, b| b.total_cmp(a));
+    }
+
+    /// The k-th running lower endpoint once the running top-k is full: an entry below it cannot
+    /// enter; `None` while there is room.
+    #[inline]
+    fn running_entry(&self) -> Option<f32> {
+        (self.k > 0 && self.running.len() == self.k).then(|| self.running[self.k - 1].0)
+    }
+
+    // --- Pruning decisions ---
+
+    /// The pruning threshold: the k-th of the running lower endpoints and the known exact scores;
+    /// `None` until `k` are in.
+    #[inline]
+    fn threshold(&self) -> Option<f32> {
+        merged_kth(
+            self.running.len(),
+            |i| self.running[i].0,
+            &self.known_exact,
+            self.k,
+        )
+    }
+
+    /// The threshold admission prunes a cluster's rows at; `None` while unset, which leaves the
+    /// segment's own k-th unset too.
+    pub(super) fn admission_threshold(&mut self) -> Option<Threshold> {
+        let threshold = self.threshold();
+        debug_assert!(threshold.is_some() || self.own_lower().is_none());
+        threshold.map(|kth| Threshold(LowerEndpoint(kth)))
+    }
+
+    /// The threshold a boundary prunes `candidates` at: the k-th largest lower endpoint over the
+    /// live candidates and the known exact scores, or the bound's threshold before the boundary
+    /// when that is higher, which keeps every row admission dropped below it. Clears the running
+    /// top-k, which describes the rows admitted before the boundary.
+    pub(super) fn boundary(&mut self, candidates: &mut QuantizedCandidates) -> Option<Threshold> {
+        let before = self.threshold();
+        let kth = self.boundary_kth(candidates.live_lowers());
+        self.running.clear();
+        self.running_estimates.clear();
+        let kth = match (kth, before) {
+            (Some(kth), Some(before)) if before > kth => Some(before),
+            (None, before) => before,
+            (kth, _) => kth,
+        };
+        kth.map(|kth| Threshold(LowerEndpoint(kth)))
+    }
+
+    /// The k-th largest of `candidate_lowers` (one per live quantized candidate, reordered in
+    /// place) and the known exact scores.
+    fn boundary_kth(&self, candidate_lowers: &mut [f32]) -> Option<f32> {
+        let k = self.k;
+        if k == 0 {
+            return None;
+        }
+        if self.known_exact.is_empty() {
+            if candidate_lowers.len() < k {
+                return None;
+            }
+            let (_, kth, _) = candidate_lowers.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
+            return Some(*kth);
+        }
+        if candidate_lowers.len() + self.known_exact.len() < k {
+            return None;
+        }
+        let quantized = k.min(candidate_lowers.len());
+        if quantized > 0 && quantized < candidate_lowers.len() {
+            candidate_lowers.select_nth_unstable_by(quantized - 1, |a, b| b.total_cmp(a));
+        }
+        let top = &mut candidate_lowers[..quantized];
+        top.sort_unstable_by(|a, b| b.total_cmp(a));
+        merged_kth(top.len(), |i| top[i], &self.known_exact, k)
+    }
+
+    /// The known exact scores, descending.
+    #[cfg(test)]
+    pub(super) fn known_exact(&self) -> &[f32] {
+        &self.known_exact
+    }
+
+    /// `k`, for the boundary harness.
+    #[cfg(test)]
+    pub(super) fn k_for_test(&self) -> usize {
+        self.k
+    }
+
+    /// The running top-k, for the boundary harness.
+    #[cfg(test)]
+    pub(super) fn running_for_test(&self) -> &[(f32, usize, f32)] {
+        &self.running
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{merged_kth, SharedBound, SharedOffer};
+    use super::{lower_endpoint_order, merged_kth, PruningBound, SharedBound, SharedOffer};
     use crate::vector::quantization::QUANTIZED_BOUNDARY_KAPPA;
     use crate::vector::search::interval::{LowerEndpoint, Threshold};
     use crate::vector::search::scan::columns::BoundaryHarness;
@@ -307,17 +455,17 @@ mod tests {
     fn kth_bound_thresholds() {
         // Ties on estimate break by the row's own sigma: lower endpoints 10, 7, -191.
         let mut tie = admitted(2, 2.0, &[(0, 10.0, 0.0), (1, 9.0, 1.0), (2, 9.0, 100.0)]);
-        assert_eq!(tie.running_lower(2), threshold(7.0));
+        assert_eq!(tie.own_lower(2), threshold(7.0));
         assert_eq!(tie.boundary_lower(2, 2.0), threshold(7.0));
 
         // Lower endpoints 10, 7, 4: the top two by lower endpoint are rows 0 and 1, so the APS
         // threshold is 9 though row 2 has the best estimate.
         let mut empty = BoundaryHarness::new(3);
-        assert_eq!(empty.running_estimate(2), None);
+        assert_eq!(empty.own_estimate(2), None);
         let mut aps = admitted(2, 2.0, &[(0, 10.0, 0.0), (1, 9.0, 1.0), (2, 12.0, 4.0)]);
-        assert_eq!(aps.running_lower(2), threshold(7.0));
-        assert_eq!(aps.running_estimate(2), Some(9.0));
-        assert_eq!(aps.running_estimate(4), None);
+        assert_eq!(aps.own_lower(2), threshold(7.0));
+        assert_eq!(aps.own_estimate(2), Some(9.0));
+        assert_eq!(aps.own_estimate(4), None);
 
         // Cluster-local admission keeps the running k-th equal to the full partition's.
         let mut clustered = BoundaryHarness::new(24);
@@ -334,7 +482,7 @@ mod tests {
             }
             clustered.finish_cluster(2.0);
             assert_eq!(
-                clustered.running_lower(4),
+                clustered.own_lower(4),
                 clustered.boundary_lower(4, 2.0),
                 "cluster {cluster}"
             );
@@ -378,7 +526,7 @@ mod tests {
                 );
                 let kth =
                     (expected.len() == k).then(|| Threshold(LowerEndpoint(expected[k - 1].1)));
-                assert_eq!(harness.running_lower(k), kth, "cluster={cluster} k={k}");
+                assert_eq!(harness.own_lower(k), kth, "cluster={cluster} k={k}");
             }
         }
 
@@ -401,26 +549,26 @@ mod tests {
         for score in [3.0, 9.0, 5.0, 1.0, 9.0] {
             exact.push_exact(score, 3);
         }
-        assert_eq!(exact.running_lower(3), threshold(5.0));
-        assert_eq!(exact.running_estimate(3), Some(5.0));
+        assert_eq!(exact.own_lower(3), threshold(5.0));
+        assert_eq!(exact.own_estimate(3), Some(5.0));
         assert_eq!(exact.boundary_lower(3, 2.0), threshold(5.0));
         let mut short = BoundaryHarness::new(8);
         for score in [3.0, 9.0, 5.0] {
             short.push_exact(score, 4);
         }
-        assert_eq!(short.running_lower(4), None);
-        assert_eq!(short.running_estimate(4), None);
+        assert_eq!(short.own_lower(4), None);
+        assert_eq!(short.own_estimate(4), None);
         assert_eq!(short.boundary_lower(4, 2.0), None);
 
         // With both kinds, each threshold is the k-th of the union. Lower endpoints 10, 6, -2 and
         // exact 11, 7 give 7; estimates 12, 8, 2 and exact 11, 7 give 8.
         let quantized = [(0, 12.0, 1.0), (1, 8.0, 1.0), (2, 2.0, 2.0)];
         let mut mixed = admitted(3, 2.0, &quantized);
-        assert_eq!(mixed.running_lower(3), threshold(-2.0));
+        assert_eq!(mixed.own_lower(3), threshold(-2.0));
         mixed.push_exact(7.0, 3);
         mixed.push_exact(11.0, 3);
-        assert_eq!(mixed.running_lower(3), threshold(7.0));
-        assert_eq!(mixed.running_estimate(3), Some(8.0));
+        assert_eq!(mixed.own_lower(3), threshold(7.0));
+        assert_eq!(mixed.own_estimate(3), Some(8.0));
         assert_eq!(mixed.boundary_lower(3, 2.0), threshold(7.0));
         mixed.band(3, 2.0);
         assert_eq!(
@@ -500,7 +648,7 @@ mod tests {
                         harness.finish_cluster(QUANTIZED_BOUNDARY_KAPPA);
                     }
                     let case = format!("exact={with_exact} seed {seed}, cluster {cluster}");
-                    let running = harness.running_lower(k);
+                    let running = harness.own_lower(k);
                     assert_eq!(
                         running,
                         harness.boundary_lower(k, QUANTIZED_BOUNDARY_KAPPA),
@@ -600,6 +748,65 @@ mod tests {
                 }
                 previous = bound.kth();
             }
+        }
+    }
+
+    /// The pruning threshold is the k-th of the running lower endpoints and the carried scores,
+    /// the seed and every exact score, and a boundary's k-th is that of the candidates' lower
+    /// endpoints and the carried scores, whatever the order of merges, exact scores and
+    /// boundaries.
+    #[test]
+    fn threshold_merges_running_and_carried() {
+        let value = |rng: &mut fastrand::Rng| (rng.f32() * 20.0 - 10.0).round() / 2.0;
+        for seed in 0..512 {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            let k = 1 + rng.usize(0..12);
+            let case = format!("seed {seed} k={k}");
+            let seeded: Vec<f32> = (0..rng.usize(0..2 * k)).map(|_| value(&mut rng)).collect();
+            let shared = SharedBound::new(k);
+            shared.offer(seeded.iter().copied());
+            let mut bound = PruningBound::new(k, Some(&shared));
+            // Every carried score and every lower endpoint merged since the last boundary.
+            let mut carried = seeded.clone();
+            let mut running: Vec<f32> = Vec::new();
+            let mut row = 0;
+            assert_eq!(bound.threshold(), kth_best(&carried, k), "{case}");
+            for _ in 0..rng.usize(1..48) {
+                match rng.usize(0..4) {
+                    0 | 1 => {
+                        let mut cluster: Vec<(f32, usize, f32)> = (0..rng.usize(1..2 * k + 2))
+                            .map(|_| {
+                                row += 1;
+                                let lower = value(&mut rng);
+                                (lower, row, lower + rng.f32())
+                            })
+                            .collect();
+                        running.extend(cluster.iter().map(|entry| entry.0));
+                        cluster.sort_by(lower_endpoint_order);
+                        bound.merge_running(&cluster);
+                    }
+                    2 => {
+                        let score = value(&mut rng);
+                        carried.push(score);
+                        bound.push_exact(score);
+                    }
+                    _ => {
+                        let mut lowers: Vec<f32> =
+                            (0..rng.usize(0..3 * k)).map(|_| value(&mut rng)).collect();
+                        let expected = kth_best(&[&lowers[..], &carried[..]].concat(), k);
+                        assert_eq!(bound.boundary_kth(&mut lowers), expected, "{case}");
+                        bound.running.clear();
+                        bound.running_estimates.clear();
+                        running.clear();
+                    }
+                }
+                let expected = kth_best(&[&running[..], &carried[..]].concat(), k);
+                assert_eq!(bound.threshold(), expected, "{case}");
+            }
+            let mut top = carried.clone();
+            top.sort_by(|a, b| b.total_cmp(a));
+            top.truncate(k);
+            assert_eq!(bound.known_exact(), top, "{case}");
         }
     }
 
