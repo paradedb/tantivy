@@ -178,7 +178,7 @@ mod tests {
     use crate::schema::Metric;
     use crate::vector::params::{ProbeParams, Selectivity};
     use crate::vector::stats::AccessPath;
-    use crate::vector::test_support::{DocsWeight, FixtureSpec};
+    use crate::vector::test_support::{first_segment, DocsWeight, FixtureSpec};
     use crate::vector::tests::exhaustive_params;
 
     /// The plan resolves the budget once, builds no bitset for match-all filters, sees an empty
@@ -259,7 +259,7 @@ mod tests {
         );
 
         let searcher = fixture.index.reader()?.searcher();
-        let segment = &searcher.segment_readers()[0];
+        let segment = first_segment(&searcher).1;
         let selective = label("tenth");
         // The drain keeps deleted matches: docs 0 and 10 count.
         let count = 9;
