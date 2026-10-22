@@ -32,6 +32,7 @@ pub(crate) struct LayerProbeStats {
     full_clusters: usize,
     exact_clusters: usize,
     exact_rows: usize,
+    recheck_dropped: usize,
 }
 
 #[cfg(test)]
@@ -80,6 +81,11 @@ impl LayerProbeStats {
     pub(crate) fn exact_rows(&self) -> usize {
         self.exact_rows
     }
+
+    /// Survivors of the previous boundary the layer dropped before reading them.
+    pub(crate) fn recheck_dropped(&self) -> usize {
+        self.recheck_dropped
+    }
 }
 
 /// Per-layer instrumentation, flattened on the wire as `layer{i}_*` and `boundary{i}_ns`.
@@ -110,6 +116,11 @@ impl serde::Serialize for LayerProbeStatsSet {
             map.serialize_entry(&format!("layer{index}_scored"), &layer.scored)?;
             if index == 0 {
                 map.serialize_entry("layer0_admission_pruned", &layer.admission_pruned)?;
+            } else {
+                map.serialize_entry(
+                    &format!("layer{index}_recheck_dropped"),
+                    &layer.recheck_dropped,
+                )?;
             }
             map.serialize_entry(&format!("layer{index}_survivors"), &layer.survivors)?;
             map.serialize_entry(
@@ -214,6 +225,8 @@ pub struct ProbeStats {
     pub(crate) quantized_trace: ScanTrace,
     /// Rows scored at full precision, on every path.
     pub exact_rows: usize,
+    /// Survivors of the last boundary dropped before the exact phase read them.
+    pub exact_recheck_dropped: usize,
     /// Nanoseconds initializing the scan.
     pub scan_init_ns: u64,
     /// Nanoseconds evaluating the filter.
@@ -279,11 +292,12 @@ pub(crate) enum SegmentReport {
     Flat { rows_read: usize },
     /// Nothing could match; the located cap still reports.
     Empty { located_cap: usize },
-    /// An IVF segment search: its plan, cluster source and scan.
+    /// An IVF segment search: its plan, cluster source and scan. The scan's report is boxed, so
+    /// the enum stays close to the size of its other variants.
     Ivf {
         plan: PlanReport,
         source: SourceReport,
-        scan: ScanReport,
+        scan: Box<ScanReport>,
     },
 }
 
@@ -304,7 +318,7 @@ impl ProbeStats {
                 located_cap,
                 ..Self::default()
             },
-            SegmentReport::Ivf { plan, source, scan } => Self::ivf(plan, source, scan, &totals),
+            SegmentReport::Ivf { plan, source, scan } => Self::ivf(plan, source, *scan, &totals),
         };
         // Every segment search reports its result assembly, an empty one included.
         stats.result_assembly_ns = Some(0);
@@ -318,6 +332,7 @@ impl ProbeStats {
         let mut stats = Self {
             candidates_scored: scan.candidates_scored,
             exact_rows: scan.exact_rows,
+            exact_recheck_dropped: scan.exact_recheck_dropped,
             layers: LayerProbeStatsSet(
                 scan.layers
                     .iter()
@@ -332,6 +347,7 @@ impl ProbeStats {
                         full_clusters: report.full_clusters,
                         exact_clusters: report.exact_clusters,
                         exact_rows: report.exact_rows,
+                        recheck_dropped: report.recheck_dropped,
                         ..LayerProbeStats::default()
                     })
                     .collect(),
@@ -435,14 +451,14 @@ impl ProbeStats {
         }
     }
 
-    /// Adds the result-assembly time of the merge, measured after the segment's statistics were
-    /// built.
     /// Records what the segment's offer did to the query's shared bound.
     pub(crate) fn record_shared_offer(&mut self, offer: SharedOffer) {
         self.shared_bound_offers = offer.offers;
         self.shared_bound_tightenings = offer.tightenings;
     }
 
+    /// Adds the result-assembly time of the merge, measured after the segment's statistics were
+    /// built.
     pub(crate) fn add_assembly(&mut self, totals: &StageTotals) {
         let extra =
             totals.time_ns(VectorStage::ResultAssembly) + totals.time_ns(VectorStage::Other);
@@ -510,6 +526,7 @@ mod tests {
         "centroid_bytes_read",
         "centroid_storage_blocks",
         "exact_rows",
+        "exact_recheck_dropped",
         "scan_init_ns",
         "non_vector_search_ns",
         "query_prep_ns",
@@ -560,6 +577,9 @@ mod tests {
         if layers > 0 {
             keys.insert("layer0_admission_pruned".to_string());
         }
+        for layer in 1..layers {
+            keys.insert(format!("layer{layer}_recheck_dropped"));
+        }
         keys
     }
 
@@ -580,7 +600,7 @@ mod tests {
         let ivf = |scan| SegmentReport::Ivf {
             plan,
             source: routed(),
-            scan,
+            scan: Box::new(scan),
         };
         let stats = ProbeStats::new(ivf(quantized), StageTotals::default());
         assert_eq!(keys(&stats), expected(&segment, 2));
