@@ -16,7 +16,9 @@ use crate::vector::search::scan::bound::SharedBound;
 use crate::vector::search::scan::layer_read::LayerRead;
 use crate::vector::search::scan::plan::{ExactRule, PlanOverride};
 use crate::vector::stats::{AccessPath, LayerProbeStats};
-use crate::vector::test_support::{ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg, ReadLog};
+use crate::vector::test_support::{
+    first_segment, ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg, ReadLog,
+};
 use crate::vector::tests::{exhaustive_params, routed_exhaustive_params};
 use crate::vector::{ProbeStats, ProbeTermination, RouterKind, VectorSimilarityFruit, VectorStage};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal};
@@ -1049,7 +1051,7 @@ fn filtered_cluster_reads_only_doc_ids() -> crate::Result<()> {
             let case = format!("{metric:?} {schedule:?}");
             let ranges = fixture.column_ranges()?;
             let searcher = fixture.index.reader()?.searcher();
-            let vectors = searcher.segment_readers()[0].vector_index(fixture.field)?;
+            let vectors = first_segment(&searcher).1.vector_index(fixture.field)?;
             let ivf = vectors.index().unwrap();
             let ivf_rows = ivf.cluster_range(2).len();
             let (_, _, open) =
@@ -1297,7 +1299,7 @@ fn exact_reads_touch_only_survivor_pages() -> crate::Result<()> {
         Box::new(fixture.filter("d242")),
     ]);
     let searcher = fixture.index.reader()?.searcher();
-    let segment = &searcher.segment_readers()[0];
+    let segment = first_segment(&searcher).1;
     let vectors = segment.vector_index(fixture.field)?;
     let weight = filter.weight(EnableScoring::disabled_from_searcher(&searcher))?;
     let mut selected = Vec::new();
@@ -1503,7 +1505,7 @@ fn retired_groups_never_reach_a_later_band() -> crate::Result<()> {
     let layer1 = stats.layers.get(1).unwrap();
     assert!(layer1.exact_clusters() > 0, "{stats:?}");
     let searcher = fixture.index.reader()?.searcher();
-    let vectors = searcher.segment_readers()[0].vector_index(fixture.field)?;
+    let vectors = first_segment(&searcher).1.vector_index(fixture.field)?;
     let index = vectors.index().unwrap();
     let even = |row: &usize| {
         (0..index.num_clusters())
@@ -1597,7 +1599,7 @@ fn located_path_charges_the_work_meter() -> crate::Result<()> {
     let (hits, stats) =
         fixture.run_segment(0, weight.as_ref(), &reads_vector(42), 10, params.clone())?;
     let searcher = fixture.index.reader()?.searcher();
-    let vectors = searcher.segment_readers()[0].vector_index(fixture.field)?;
+    let vectors = first_segment(&searcher).1.vector_index(fixture.field)?;
     let ivf = vectors.index().unwrap();
     let (budget, n_avg, x) = params.resolved_work_budget(ivf.num_clusters(), ivf.num_docs())?;
     assert_eq!(stats.access_path, AccessPath::Located);

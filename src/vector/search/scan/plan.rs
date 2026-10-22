@@ -151,7 +151,7 @@ pub(crate) fn price(
 mod tests {
     use super::*;
     use crate::schema::Metric;
-    use crate::vector::test_support::FixtureSpec;
+    use crate::vector::test_support::{first_segment, FixtureSpec};
 
     fn costs(band: usize, sparse: Option<usize>) -> ReadCosts {
         ReadCosts {
@@ -269,7 +269,7 @@ mod tests {
             .build()?;
         for (storage, fixture) in [("ram", &ram), ("paged", &paged)] {
             let searcher = fixture.index.reader()?.searcher();
-            let reader = searcher.segment_readers()[0].vector_index(fixture.field)?;
+            let reader = first_segment(&searcher).1.vector_index(fixture.field)?;
             let rows = reader.index().expect("IVF segment").cluster_range(0).len();
             let one = vec![0];
             let dense: Vec<u32> = (0..rows as u32).filter(|row| row % 10 != 0).collect();
