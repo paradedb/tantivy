@@ -236,6 +236,58 @@ fn seeded_drops(
     Ok(drops)
 }
 
+/// Each segment scan carries the scores of the rows the other segments returned and ends holding
+/// the top k of those and its own exact scores, on every representation and plan.
+#[test]
+fn carried_scores_are_the_top_k_of_seed_and_segment() -> crate::Result<()> {
+    let mixed = PlanOverride::exact(|cluster, layer| (cluster + layer) % 2 == 0);
+    for representation in [
+        Representation::FullPrecision,
+        Representation::Quantized(&[1]),
+        Representation::Quantized(&[1, 4]),
+    ] {
+        let fixture = matrix_fixture(Metric::L2, representation, false)?;
+        let params = routed_exhaustive_params(MATRIX_CLUSTERS);
+        let weight = fixture.weight(&AllQuery)?;
+        let segments = fixture.index.reader()?.searcher().segment_readers().len();
+        assert!(segments > 1);
+        for query in matrix_queries() {
+            for k in [1, 10, 1000] {
+                let (hits, _) = planned_top_k(&fixture, &AllQuery, &query, k, &params, true)?;
+                for plan in [None, Some(mixed)] {
+                    for segment in 0..segments {
+                        let case = format!("{representation:?} k={k} plan={plan:?} {segment}");
+                        let seed: Vec<f32> = hits
+                            .iter()
+                            .filter(|(_, address)| address.segment_ord as usize != segment)
+                            .map(|&(score, _)| score)
+                            .collect();
+                        let shared = Arc::new(SharedBound::new(k));
+                        shared.offer(seed.iter().copied());
+                        let (_, stats) = fixture.run_planned_with(
+                            segment,
+                            weight.as_ref(),
+                            &query,
+                            k,
+                            params.clone(),
+                            plan,
+                            true,
+                            Some(shared),
+                        )?;
+                        let trace = &stats.quantized_trace;
+                        assert!(!trace.exact_scores.is_empty(), "{case}");
+                        let mut expected = [&seed[..], &trace.exact_scores[..]].concat();
+                        expected.sort_by(|a, b| b.total_cmp(a));
+                        expected.truncate(k);
+                        assert_eq!(trace.known_exact, expected, "{case}");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Oracle-matrix cases compared against a seeded shared bound, and those where the seed pruned
 /// more rows at admission than the scan's own bound.
 static SEEDED_CASES: AtomicUsize = AtomicUsize::new(0);

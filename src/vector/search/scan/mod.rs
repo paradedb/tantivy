@@ -11,7 +11,7 @@ pub(crate) mod plan;
 
 use std::ops::Range;
 
-use self::bound::{tighter, KthBound, SharedBound};
+use self::bound::{PruningBound, SharedBound};
 use self::columns::{Columns, QuantizedCandidates};
 use self::estimate::{combine_initial, combine_refine, CombineCtx};
 use self::exact::ExactScorer;
@@ -26,7 +26,7 @@ use crate::error::DataCorruption;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource, Feedback};
-use crate::vector::search::interval::{LowerEndpoint, Threshold};
+use crate::vector::search::interval::Threshold;
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery};
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::quantized::{QuantizedFieldReader, ReadScratch};
@@ -114,6 +114,10 @@ pub(crate) struct ScanTrace {
     pub(crate) layer_columns: Vec<Vec<(usize, [u32; 4])>>,
     /// Rows scored in the exact phase.
     pub(crate) exact_phase_rows: Vec<usize>,
+    /// Every exact score the scan computed, in order.
+    pub(crate) exact_scores: Vec<f32>,
+    /// The bound's known exact scores at the end of the scan.
+    pub(crate) known_exact: Vec<f32>,
 }
 
 // --- Quantized state ---
@@ -141,10 +145,6 @@ struct QuantizedState<'a> {
     index: &'a ClusterIndex,
     /// Centroid rows read for clusters without a centroid score.
     centroid_reads: usize,
-    /// The bound the query's segment scans share, when the collector supplies one.
-    shared: Option<&'a SharedBound>,
-    /// Its k-th as of segment start; later reads never fall below it.
-    shared_at_start: Option<f32>,
     #[cfg(test)]
     plan_override: Option<PlanOverride>,
     #[cfg(test)]
@@ -159,7 +159,6 @@ impl<'a> QuantizedState<'a> {
         reader: &'a VectorIndexReader,
         index: &'a ClusterIndex,
         config: &ScanConfig,
-        shared: Option<&'a SharedBound>,
     ) -> Self {
         let meta = query.index.meta.field();
         Self {
@@ -183,8 +182,6 @@ impl<'a> QuantizedState<'a> {
             exact: config.exact_plan.then_some(reader),
             index,
             centroid_reads: 0,
-            shared,
-            shared_at_start: shared.and_then(SharedBound::kth),
             #[cfg(test)]
             plan_override: config.plan_override,
             #[cfg(test)]
@@ -231,13 +228,13 @@ impl<'a> QuantizedState<'a> {
     }
 
     /// Scores a cluster's rows on layer 0, read as `read`, and appends the rows whose interval
-    /// can still reach the running top-k as a candidate block. The bound's k-th lower endpoint
-    /// only rises, so the rows dropped here are exactly rows every later boundary would drop.
+    /// can still reach the pruning threshold as a candidate block. The threshold only rises, so
+    /// the rows dropped here are rows every later boundary would drop.
     fn admit(
         &mut self,
         rows: &ClusterRows<'_>,
         read: LayerRead,
-        bound: &mut KthBound,
+        bound: &mut PruningBound,
         scratch: &mut ReadScratch,
     ) -> crate::Result<()> {
         let centroid = match rows.centroid {
@@ -250,7 +247,7 @@ impl<'a> QuantizedState<'a> {
         decode_layer(&spec, rows, read, &mut self.decoded, scratch)?;
         self.layer0_scored += rows.len();
         let ctx = self.combine_ctx(0, centroid);
-        let at = match prior {
+        match prior {
             Some(threshold) => {
                 combine_initial(
                     &ctx,
@@ -258,15 +255,20 @@ impl<'a> QuantizedState<'a> {
                     &mut self.admission_columns,
                     0..rows.len(),
                 );
-                let at = self.candidates.push_block_pruned(
+                bound.admit(
+                    rows,
+                    &self.admission_columns,
+                    self.candidates.kappa(),
+                    threshold,
+                    &mut self.admission_keep,
+                );
+                let at = self.candidates.push_selected(
                     rows,
                     centroid,
                     &self.admission_columns,
-                    &mut self.admission_keep,
-                    threshold,
+                    &self.admission_keep,
                 );
                 self.layer0_admission_pruned += rows.len() - at.len();
-                at
             }
             None => {
                 let at = self.candidates.push_block(rows, centroid);
@@ -276,32 +278,20 @@ impl<'a> QuantizedState<'a> {
                     &mut self.candidates.columns,
                     at.clone(),
                 );
-                at
+                bound.merge_cluster(self.candidates.entries(at));
             }
-        };
-        self.candidates.finish_cluster(at, bound);
+        }
         Ok(())
     }
 
-    /// The admission-pruning threshold: the tighter of the bound's running k-th lower endpoint and
-    /// the shared bound's k-th; `None` while both are unset or when a test disables pruning.
-    fn admission_threshold(&self, bound: &KthBound) -> Option<Threshold> {
+    /// The threshold admission prunes at; `None` while the bound's is unset or when a test
+    /// disables pruning.
+    fn admission_threshold(&self, bound: &mut PruningBound) -> Option<Threshold> {
         #[cfg(test)]
         if self.admission_pruning_disabled {
             return None;
         }
-        tighter(bound.running_lower(), self.shared_kth()).map(|kth| Threshold(LowerEndpoint(kth)))
-    }
-
-    /// The shared bound's current k-th; `None` without one or until it is set.
-    fn shared_kth(&self) -> Option<f32> {
-        let kth = self.shared.and_then(SharedBound::kth);
-        debug_assert!(
-            self.shared_at_start
-                .is_none_or(|start| kth.is_some_and(|now| now >= start)),
-            "the shared bound only tightens"
-        );
-        kth
+        bound.admission_threshold()
     }
 
     /// Refines block `b`'s candidates with `layer`, read as `read`.
@@ -337,7 +327,7 @@ impl<'a> QuantizedState<'a> {
     }
 
     /// Records the candidates `layer` scored and prunes them at its boundary.
-    fn prune(&mut self, layer: usize, bound: &mut KthBound, report: &mut ScanReport) {
+    fn prune(&mut self, layer: usize, bound: &mut PruningBound, report: &mut ScanReport) {
         // Layer 0's kernel scores every admitted row; admission pruning drops rows before they
         // become candidates, so the scored count keeps its own counter.
         report.layers[layer].scored = if layer == 0 {
@@ -360,8 +350,8 @@ impl<'a> QuantizedState<'a> {
                 .push(self.candidates.column_trace(row_order));
         }
         let _boundary = enter_vector_stage(VectorStage::Boundary(layer as u8));
-        let shared = self.shared_kth();
-        self.candidates.band(bound, shared);
+        let threshold = bound.boundary(&mut self.candidates);
+        self.candidates.band(threshold);
         report.layers[layer].survivors = self.candidates.len();
         #[cfg(test)]
         report
@@ -382,6 +372,8 @@ where
     C: Comparator<K::SegmentSortKey>,
 {
     exact: ExactScorer<'a, T, K, C>,
+    /// The segment's pruning bound.
+    bound: PruningBound,
     /// The quantized cascade; `None` scores every shortlisted row exactly.
     quantized: Option<QuantizedState<'a>>,
     scratch: ReadScratch,
@@ -414,7 +406,6 @@ where
                 reader,
                 index,
                 &config,
-                shared,
             )),
             (Some(_), None) => {
                 return Err(DataCorruption::comment_only(
@@ -427,6 +418,7 @@ where
         let layers = quantized.as_ref().map_or(0, |state| state.layers.len());
         Ok(Self {
             exact: ExactScorer::new(reader, query.query, config.top_n, tie_break, tie_comparator),
+            bound: PruningBound::new(config.top_n, shared),
             quantized,
             scratch: ReadScratch::default(),
             by_cluster: Vec::new(),
@@ -464,8 +456,8 @@ where
     /// The pruning thresholds as of the last shortlisted cluster.
     fn feedback(&self) -> Feedback {
         Feedback {
-            kth_lower: self.exact.bound.running_lower(),
-            kth_estimate: self.exact.bound.running_estimate(),
+            kth_lower: self.bound.own_lower(),
+            kth_estimate: self.bound.own_estimate(),
         }
     }
 
@@ -475,7 +467,7 @@ where
             return;
         };
         state.candidates.order_by_cluster(&mut self.by_cluster);
-        state.prune(0, &mut self.exact.bound, &mut self.report);
+        state.prune(0, &mut self.bound, &mut self.report);
     }
 
     /// The quantized layers after layer 0; none at full precision.
@@ -496,11 +488,12 @@ where
         self.report.trace.scored_rows.extend(rows.global_rows());
         match self.read_plan(rows, 0)? {
             Read::Exact => {
-                self.report.exact_rows += self.exact.score(rows, &mut self.scratch)?;
+                self.report.exact_rows +=
+                    self.exact.score(rows, &mut self.scratch, &mut self.bound)?;
             }
             Read::Layer(read) => {
                 if let Some(state) = &mut self.quantized {
-                    state.admit(rows, read, &mut self.exact.bound, &mut self.scratch)?;
+                    state.admit(rows, read, &mut self.bound, &mut self.scratch)?;
                 }
             }
         }
@@ -537,14 +530,16 @@ where
             self.report.layers[layer].count(read, group.len());
             match read {
                 Read::Exact => {
-                    self.report.exact_rows += self.exact.score(&group, &mut self.scratch)?;
+                    self.report.exact_rows +=
+                        self.exact
+                            .score(&group, &mut self.scratch, &mut self.bound)?;
                     state.candidates.retire(b);
                 }
                 Read::Layer(read) => state.refine(layer, b, read, &mut self.scratch)?,
             }
         }
         drop(stage);
-        state.prune(layer, &mut self.exact.bound, &mut self.report);
+        state.prune(layer, &mut self.bound, &mut self.report);
         Ok(())
     }
 
@@ -556,7 +551,9 @@ where
         for &b in &self.by_cluster {
             let group = state.candidates.rows(b);
             if group.len() > 0 {
-                self.report.exact_rows += self.exact.score_survivors(&group, &mut self.scratch)?;
+                self.report.exact_rows +=
+                    self.exact
+                        .score_survivors(&group, &mut self.scratch, &mut self.bound)?;
             }
         }
         Ok(())
@@ -568,19 +565,16 @@ where
         segment_ord: SegmentOrdinal,
     ) -> crate::Result<(TieBreakHits<K>, ScanReport)> {
         let _assembly = enter_vector_stage(VectorStage::ResultAssembly);
-        let Self {
-            exact,
-            quantized,
-            mut report,
-            ..
-        } = self;
-        if let Some(state) = &quantized {
+        let mut report = self.report;
+        if let Some(state) = &self.quantized {
             report.centroid_reads = state.centroid_reads;
         }
         #[cfg(test)]
         {
-            report.trace.exact_phase_rows = exact.exact_phase_rows.clone();
+            report.trace.exact_phase_rows = self.exact.exact_phase_rows.clone();
+            report.trace.exact_scores = self.exact.exact_scores.clone();
+            report.trace.known_exact = self.bound.known_exact().to_vec();
         }
-        Ok((exact.into_hits(segment_ord), report))
+        Ok((self.exact.into_hits(segment_ord), report))
     }
 }
