@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{
     compare_for_top_k, Collector, ComparableDoc, SegmentCollector, SegmentSortKeyComputer,
-    SortKeyComputer,
+    SharedThresholdArcOpt, SortKeyComputer,
 };
 use crate::index::SegmentReader;
 use crate::query::Weight;
@@ -81,8 +81,8 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     quantized_queries: Mutex<HashMap<PreparedKey, PreparedCell>>,
     /// The query prepared for the field's metric on first use.
     prepared: Mutex<Option<Arc<VectorQuery<T>>>>,
-    /// The best `limit + offset` exact scores the finished segments returned; every later
-    /// segment prunes against their k-th.
+    /// The best `limit + offset` exact scores the finished segments returned, and the slot the
+    /// query's participants share: every later segment prunes against both.
     shared_bound: Arc<SharedBound>,
     tie_break: S,
 }
@@ -99,7 +99,7 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
             max_scan_levels: usize::MAX,
             quantized_queries: Mutex::new(HashMap::new()),
             prepared: Mutex::new(None),
-            shared_bound: Arc::new(SharedBound::new(limit)),
+            shared_bound: Arc::new(SharedBound::new(limit, None)),
             tie_break: NoTieBreak,
         }
     }
@@ -110,7 +110,10 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     /// `limit + offset`.
     pub fn and_offset(mut self, offset: usize) -> Self {
         self.offset = offset;
-        self.shared_bound = Arc::new(SharedBound::new(self.segment_top_n()));
+        self.shared_bound = Arc::new(SharedBound::new(
+            self.segment_top_n(),
+            self.shared_bound.slot(),
+        ));
         self
     }
 
@@ -123,6 +126,16 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     /// Limits the quantized residual prefix.
     pub fn with_max_scan_levels(mut self, max_scan_levels: usize) -> Self {
         self.max_scan_levels = max_scan_levels;
+        self
+    }
+
+    /// Shares every segment scan's pruning threshold through `slot` with the query's other
+    /// participants, each searching its own segments for the same query, filter and
+    /// `limit + offset`. Every score in the slot must be a lower bound on the k-th best score
+    /// among those rows, k = `limit + offset`: each scan raises its threshold to the slot's score
+    /// and publishes its own when that is higher. `None`, the default, shares nothing.
+    pub fn with_shared_threshold(mut self, slot: SharedThresholdArcOpt<Score>) -> Self {
+        self.shared_bound = Arc::new(SharedBound::new(self.segment_top_n(), slot));
         self
     }
 

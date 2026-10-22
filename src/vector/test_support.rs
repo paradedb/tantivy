@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use common::BitSet;
 
-use crate::collector::TopDocs;
+use crate::collector::{SharedThresholdArcOpt, TopDocs};
 use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
 use crate::query::{
@@ -427,9 +427,25 @@ impl Fixture {
         k: usize,
         params: ProbeParams,
     ) -> crate::Result<VectorSimilarityFruit> {
-        let collector = TopDocs::with_limit(k)
+        self.search_with(filter, query, k, 0, params, None)
+    }
+
+    /// Searches every segment through the collector for the window `offset..offset + limit`,
+    /// sharing every scan's threshold through `slot` when given.
+    pub(crate) fn search_with(
+        &self,
+        filter: &dyn Query,
+        query: &[f32],
+        limit: usize,
+        offset: usize,
+        params: ProbeParams,
+        slot: SharedThresholdArcOpt<Score>,
+    ) -> crate::Result<VectorSimilarityFruit> {
+        let collector = TopDocs::with_limit(limit)
+            .and_offset(offset)
             .order_by_similarity(self.field, query.to_vec())
-            .with_probe_params(params);
+            .with_probe_params(params)
+            .with_shared_threshold(slot);
         self.index.reader()?.searcher().search(filter, &collector)
     }
 

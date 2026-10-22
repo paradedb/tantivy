@@ -464,7 +464,7 @@ impl QuantizedCandidates {
 #[cfg(test)]
 pub(crate) struct BoundaryHarness {
     pub(crate) candidates: QuantizedCandidates,
-    bound: Option<PruningBound>,
+    bound: Option<PruningBound<'static>>,
     /// Whether the last block is a cluster `begin_cluster` opened and `finish_cluster` has not
     /// closed yet.
     cluster_open: bool,
@@ -483,7 +483,7 @@ impl BoundaryHarness {
         }
     }
 
-    fn bound(&mut self, k: usize) -> &mut PruningBound {
+    fn bound(&mut self, k: usize) -> &mut PruningBound<'static> {
         let bound = self.bound.get_or_insert_with(|| PruningBound::new(k, None));
         assert_eq!(bound.k_for_test(), k, "one k per harness");
         bound
