@@ -73,16 +73,18 @@ where
 
     // --- Scoring ---
 
-    /// Scores every row `selected` selects into `bound` and the heap, reading through `scratch`;
-    /// returns the rows scored. A row without a doc id reads the cluster's DocIds column when it
-    /// first needs one.
+    /// Scores every row `selected` selects into `bound` and the heap, reading through `scratch`,
+    /// then offers the bound's threshold to the query's participants; returns the rows scored. A
+    /// row without a doc id reads the cluster's DocIds column when it first needs one.
     pub(super) fn score(
         &mut self,
         selected: &ClusterRows<'_>,
         scratch: &mut ReadScratch,
-        bound: &mut PruningBound,
+        bound: &mut PruningBound<'_>,
     ) -> crate::Result<usize> {
-        self.score_rows(selected, scratch, bound)
+        let scored = self.score_rows(selected, scratch, bound)?;
+        bound.publish();
+        Ok(scored)
     }
 
     /// Scores the exact phase's survivors in `selected`, as [`ExactScorer::score`] does.
@@ -90,7 +92,7 @@ where
         &mut self,
         selected: &ClusterRows<'_>,
         scratch: &mut ReadScratch,
-        bound: &mut PruningBound,
+        bound: &mut PruningBound<'_>,
     ) -> crate::Result<usize> {
         #[cfg(test)]
         self.exact_phase_rows.extend(selected.global_rows());
@@ -102,7 +104,7 @@ where
         &mut self,
         selected: &ClusterRows<'_>,
         scratch: &mut ReadScratch,
-        bound: &mut PruningBound,
+        bound: &mut PruningBound<'_>,
     ) -> crate::Result<usize> {
         let mut column_read = false;
         let rows = {
@@ -147,7 +149,7 @@ where
     fn offer(
         &mut self,
         selected: &ClusterRows<'_>,
-        bound: &mut PruningBound,
+        bound: &mut PruningBound<'_>,
         column_read: &mut bool,
         position: usize,
         offset: usize,
