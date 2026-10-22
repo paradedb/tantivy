@@ -70,6 +70,9 @@ pub(crate) struct LayerReport {
     pub(crate) exact_clusters: usize,
     /// Rows scored exactly, and finished, at this layer.
     pub(crate) exact_rows: usize,
+    /// Survivors of the previous boundary dropped before this layer read them, because the
+    /// pruning threshold rose past their upper endpoint; refining layers only.
+    pub(crate) recheck_dropped: usize,
 }
 
 impl LayerReport {
@@ -95,6 +98,8 @@ pub(crate) struct ScanReport {
     pub(crate) layers: Vec<LayerReport>,
     /// Rows scored at full precision.
     pub(crate) exact_rows: usize,
+    /// Survivors of the last boundary dropped before the exact phase read them.
+    pub(crate) exact_recheck_dropped: usize,
     /// Centroid rows read for shortlisted clusters without a centroid score.
     pub(crate) centroid_reads: usize,
     #[cfg(test)]
@@ -317,6 +322,15 @@ impl<'a> QuantizedState<'a> {
         Ok(())
     }
 
+    /// Drops block `b`'s candidates whose upper endpoint fell below the bound's pruning threshold
+    /// since the last boundary, before the block is read; returns the rows dropped.
+    fn recheck(&mut self, b: usize, bound: &mut PruningBound) -> usize {
+        match bound.recheck_threshold() {
+            Some(threshold) => self.candidates.recheck(b, threshold),
+            None => 0,
+        }
+    }
+
     /// The query's similarity to `cluster`'s centroid, from its stored row, scored as the router
     /// scores it.
     fn read_centroid(&mut self, cluster: usize) -> crate::Result<Similarity> {
@@ -513,15 +527,17 @@ where
     }
 
     /// Refines each block's surviving candidates with `layer`, cluster by cluster, then prunes them
-    /// at the layer's boundary. A block whose survivors are cheaper to read exactly is scored
-    /// immediately and retired before the boundary, so no row counts both as an interval and as
-    /// an exact score.
+    /// at the layer's boundary. Each block first drops the candidates the pruning threshold has
+    /// risen past, so its read is planned and priced on the rest. A block whose survivors are
+    /// cheaper to read exactly is scored immediately and retired before the boundary, so no row
+    /// counts both as an interval and as an exact score.
     fn narrow(&mut self, layer: usize) -> crate::Result<()> {
         let Some(state) = &mut self.quantized else {
             return Ok(());
         };
         let stage = enter_vector_stage(VectorStage::LayerScan(layer as u8));
         for &b in &self.by_cluster {
+            self.report.layers[layer].recheck_dropped += state.recheck(b, &mut self.bound);
             let group = state.candidates.rows(b);
             if group.len() == 0 {
                 continue;
@@ -543,12 +559,14 @@ where
         Ok(())
     }
 
-    /// Scores the last boundary's survivors exactly, one block at a time in cluster order.
+    /// Scores the last boundary's survivors exactly, one block at a time in cluster order, after
+    /// dropping each block's candidates the pruning threshold has risen past.
     fn score_shortlist(&mut self) -> crate::Result<()> {
-        let Some(state) = &self.quantized else {
+        let Some(state) = &mut self.quantized else {
             return Ok(());
         };
         for &b in &self.by_cluster {
+            self.report.exact_recheck_dropped += state.recheck(b, &mut self.bound);
             let group = state.candidates.rows(b);
             if group.len() > 0 {
                 self.report.exact_rows +=

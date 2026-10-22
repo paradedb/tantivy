@@ -256,7 +256,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
             SegmentReport::Ivf {
                 plan: report,
                 source,
-                scan,
+                scan: Box::new(scan),
             },
         ))
     }

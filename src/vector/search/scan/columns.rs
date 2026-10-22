@@ -236,6 +236,29 @@ impl QuantizedCandidates {
         }
     }
 
+    /// Drops, in place, block `b`'s candidates whose upper endpoint is below `threshold`, keeping
+    /// row order and the doc ids aligned; the block's range shrinks and the entries past it stay
+    /// dead until the next boundary compacts them. Returns the rows dropped.
+    pub(crate) fn recheck(&mut self, b: usize, threshold: Threshold) -> usize {
+        let (at, docs) = (self.blocks[b].at.clone(), self.blocks[b].docs);
+        let mut write = at.start;
+        for read in at.clone() {
+            if !threshold.admits(self.upper(read)) {
+                continue;
+            }
+            if write != read {
+                self.offsets[write] = self.offsets[read];
+                self.columns.move_entry(read, write);
+                if let Some(docs) = docs {
+                    self.docs[docs + (write - at.start)] = self.docs[docs + (read - at.start)];
+                }
+            }
+            write += 1;
+        }
+        self.blocks[b].at.end = write;
+        at.end - write
+    }
+
     /// Empties block `b`'s range; its candidates go at the next boundary.
     pub(crate) fn retire(&mut self, b: usize) {
         let at = &mut self.blocks[b].at;
@@ -533,6 +556,39 @@ impl BoundaryHarness {
         let bound = self.bound.get_or_insert_with(|| PruningBound::new(k, None));
         let threshold = bound.boundary(&mut self.candidates);
         self.candidates.band(threshold);
+    }
+
+    /// The bound's pruning threshold.
+    pub(crate) fn threshold(&mut self, k: usize) -> Option<f32> {
+        self.bound(k).threshold_for_test()
+    }
+
+    /// Raises the bound's floor.
+    pub(crate) fn raise_floor(&mut self, k: usize, value: f32) {
+        self.bound(k).raise_floor_for_test(value);
+    }
+
+    /// Opens an empty block that takes the next rows pushed, outside any cluster.
+    pub(crate) fn open_block(&mut self) {
+        assert!(!self.cluster_open);
+        self.candidates.open_test_block();
+        self.block_open = true;
+    }
+
+    /// Each block's live candidate count, in admission order.
+    pub(crate) fn block_lens(&self) -> Vec<usize> {
+        self.candidates
+            .blocks
+            .iter()
+            .map(|block| block.at.len())
+            .collect()
+    }
+
+    /// Rechecks block `b` against `threshold`; returns the rows dropped.
+    pub(crate) fn recheck(&mut self, b: usize, threshold: f32) -> usize {
+        self.block_open = false;
+        self.candidates
+            .recheck(b, Threshold(LowerEndpoint(threshold)))
     }
 
     /// Rows of the running top-k, in bound order.
