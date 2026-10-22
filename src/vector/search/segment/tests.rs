@@ -3,18 +3,25 @@
 
 use std::collections::BTreeSet;
 use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
-use crate::collector::TopDocs;
+use crate::collector::{AtomicSharedThreshold, SharedThreshold, TopDocs};
 use crate::query::{AllQuery, BooleanQuery, EnableScoring, Query};
 use crate::schema::Metric;
 use crate::vector::params::{LocatedPath, ProbeParams, Selectivity};
+use crate::vector::quantization::QUANTIZED_BOUNDARY_KAPPA;
+use crate::vector::search::interval::Estimate;
+use crate::vector::search::scan::bound::SharedBound;
 use crate::vector::search::scan::layer_read::LayerRead;
 use crate::vector::search::scan::plan::{ExactRule, PlanOverride};
 use crate::vector::stats::{AccessPath, LayerProbeStats};
-use crate::vector::test_support::{ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg, ReadLog};
+use crate::vector::test_support::{
+    first_segment, ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg, ReadLog,
+};
 use crate::vector::tests::{exhaustive_params, routed_exhaustive_params};
-use crate::vector::{ProbeStats, RouterKind, VectorStage};
-use crate::{DocAddress, DocId, Score};
+use crate::vector::{ProbeStats, ProbeTermination, RouterKind, VectorSimilarityFruit, VectorStage};
+use crate::{DocAddress, DocId, Score, SegmentOrdinal};
 
 // --- Oracle matrix ---
 
@@ -156,12 +163,25 @@ fn planned_top_k(
     params: &ProbeParams,
     admission_pruning: bool,
 ) -> crate::Result<(Hits, Vec<ProbeStats>)> {
+    planned_top_k_with(fixture, filter, query, k, params, admission_pruning, None)
+}
+
+/// [`planned_top_k`] with every segment pruning against `shared` too.
+fn planned_top_k_with(
+    fixture: &Fixture,
+    filter: &dyn Query,
+    query: &[f32],
+    k: usize,
+    params: &ProbeParams,
+    admission_pruning: bool,
+    shared: Option<Arc<SharedBound>>,
+) -> crate::Result<(Hits, Vec<ProbeStats>)> {
     let weight = fixture.weight(filter)?;
     let segments = fixture.index.reader()?.searcher().segment_readers().len();
     let mut hits = Vec::new();
     let mut stats = Vec::new();
     for segment in 0..segments {
-        let (segment_hits, segment_stats) = fixture.run_planned(
+        let (segment_hits, segment_stats) = fixture.run_planned_with(
             segment,
             weight.as_ref(),
             query,
@@ -169,6 +189,7 @@ fn planned_top_k(
             params.clone(),
             None,
             admission_pruning,
+            shared.clone(),
         )?;
         assert_identities(&segment_stats, "admission pruning");
         hits.extend(segment_hits);
@@ -177,6 +198,366 @@ fn planned_top_k(
     hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     hits.truncate(k);
     Ok((hits, stats))
+}
+
+/// The rows of `expected` missing from `seeded`, a run seeded with the k-th exact score `seed`:
+/// each with its upper endpoint at the first layer of `stats`' traces where it fell below the
+/// seed (`None` if none did), and its exact score.
+fn seeded_drops(
+    fixture: &Fixture,
+    expected: &Hits,
+    seeded: &Hits,
+    stats: &[ProbeStats],
+    seed: f32,
+) -> crate::Result<Vec<(DocAddress, Option<f32>, Score)>> {
+    let searcher = fixture.index.reader()?.searcher();
+    let mut drops = Vec::new();
+    for &(score, address) in expected {
+        if seeded.iter().any(|&(_, kept)| kept == address) {
+            continue;
+        }
+        let row = searcher
+            .segment_reader(address.segment_ord)
+            .vector_index(fixture.field)?
+            .row_id(address.doc_id)?
+            .expect("a result has a vector");
+        let trace = &stats[address.segment_ord as usize].quantized_trace;
+        let upper = trace.layer_columns.iter().find_map(|layer| {
+            layer
+                .iter()
+                .find(|&&(traced, _)| traced == row)
+                .map(|&(_, bits)| {
+                    Estimate(f32::from_bits(bits[2]))
+                        .upper(f32::from_bits(bits[3]), QUANTIZED_BOUNDARY_KAPPA)
+                        .0
+                })
+                .filter(|&upper| upper < seed)
+        });
+        drops.push((address, upper, score));
+    }
+    Ok(drops)
+}
+
+/// Each segment scan carries the scores of the rows the other segments returned and ends holding
+/// the top k of those and its own exact scores, on every representation and plan.
+#[test]
+fn carried_scores_are_the_top_k_of_seed_and_segment() -> crate::Result<()> {
+    let mixed = PlanOverride::exact(|cluster, layer| (cluster + layer) % 2 == 0);
+    for representation in [
+        Representation::FullPrecision,
+        Representation::Quantized(&[1]),
+        Representation::Quantized(&[1, 4]),
+    ] {
+        let fixture = matrix_fixture(Metric::L2, representation, false)?;
+        let params = routed_exhaustive_params(MATRIX_CLUSTERS);
+        let weight = fixture.weight(&AllQuery)?;
+        let segments = fixture.index.reader()?.searcher().segment_readers().len();
+        assert!(segments > 1);
+        for query in matrix_queries() {
+            for k in [1, 10, 1000] {
+                let (hits, _) = planned_top_k(&fixture, &AllQuery, &query, k, &params, true)?;
+                for plan in [None, Some(mixed)] {
+                    for segment in 0..segments {
+                        let case = format!("{representation:?} k={k} plan={plan:?} {segment}");
+                        let seed: Vec<f32> = hits
+                            .iter()
+                            .filter(|(_, address)| address.segment_ord as usize != segment)
+                            .map(|&(score, _)| score)
+                            .collect();
+                        let shared = Arc::new(SharedBound::new(k, None));
+                        shared.offer(seed.iter().copied());
+                        let (_, stats) = fixture.run_planned_with(
+                            segment,
+                            weight.as_ref(),
+                            &query,
+                            k,
+                            params.clone(),
+                            plan,
+                            true,
+                            Some(shared),
+                        )?;
+                        let trace = &stats.quantized_trace;
+                        assert!(!trace.exact_scores.is_empty(), "{case}");
+                        let mut expected = [&seed[..], &trace.exact_scores[..]].concat();
+                        expected.sort_by(|a, b| b.total_cmp(a));
+                        expected.truncate(k);
+                        assert_eq!(trace.known_exact, expected, "{case}");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every survivor of a boundary is rechecked away, scored exactly or refined by the next layer,
+/// and every survivor of the last boundary is rechecked away or scored in the exact phase; with
+/// carried scores raising the threshold, rechecks drop rows at both.
+#[test]
+fn recheck_accounts_for_every_survivor() -> crate::Result<()> {
+    let mixed = PlanOverride::exact(|cluster, layer| (cluster + layer) % 3 == 1);
+    let (mut layer_drops, mut exact_drops) = (0, 0);
+    for representation in [
+        Representation::Quantized(&[1]),
+        Representation::Quantized(&[1, 4]),
+    ] {
+        let fixture = matrix_fixture(Metric::L2, representation, false)?;
+        let params = routed_exhaustive_params(MATRIX_CLUSTERS);
+        let weight = fixture.weight(&AllQuery)?;
+        let segments = fixture.index.reader()?.searcher().segment_readers().len();
+        for query in matrix_queries() {
+            for k in [1, 10] {
+                let (hits, _) = planned_top_k(&fixture, &AllQuery, &query, k, &params, true)?;
+                for plan in [None, Some(mixed)] {
+                    for segment in 0..segments {
+                        let case = format!("{representation:?} k={k} plan={plan:?} {segment}");
+                        let shared = Arc::new(SharedBound::new(k, None));
+                        shared.offer(
+                            hits.iter()
+                                .filter(|(_, address)| address.segment_ord as usize != segment)
+                                .map(|&(score, _)| score),
+                        );
+                        let (_, stats) = fixture.run_planned_with(
+                            segment,
+                            weight.as_ref(),
+                            &query,
+                            k,
+                            params.clone(),
+                            plan,
+                            true,
+                            Some(shared),
+                        )?;
+                        let layers: Vec<&LayerProbeStats> =
+                            (0..).map_while(|layer| stats.layers.get(layer)).collect();
+                        for pair in layers.windows(2) {
+                            let (previous, layer) = (pair[0], pair[1]);
+                            assert_eq!(
+                                previous.survivors(),
+                                layer.recheck_dropped() + layer.exact_rows() + layer.scored(),
+                                "{case}"
+                            );
+                            layer_drops += layer.recheck_dropped();
+                        }
+                        let layer_exact: usize =
+                            layers.iter().map(|layer| layer.exact_rows()).sum();
+                        assert_eq!(
+                            layers.last().unwrap().survivors(),
+                            stats.exact_recheck_dropped + stats.exact_rows - layer_exact,
+                            "{case}"
+                        );
+                        exact_drops += stats.exact_recheck_dropped;
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("recheck drops: refining layers {layer_drops}, exact phase {exact_drops}");
+    assert!(layer_drops > 0 && exact_drops > 0);
+    Ok(())
+}
+
+/// Oracle-matrix cases compared against a seeded shared bound, and those where the seed pruned
+/// more rows at admission than the scan's own bound.
+static SEEDED_CASES: AtomicUsize = AtomicUsize::new(0);
+static SEEDED_CASES_PRUNING_MORE: AtomicUsize = AtomicUsize::new(0);
+/// Oracle-matrix windows compared against a seeded participants' slot, those where a sync
+/// raised a scan's threshold, and the window rows the seed dropped.
+static SLOT_CASES: AtomicUsize = AtomicUsize::new(0);
+static SLOT_CASES_RAISED: AtomicUsize = AtomicUsize::new(0);
+static SLOT_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+/// A segment's routing: what the router probed, skipped and charged, where its bound armed, how
+/// it stopped, and the rows it handed the scan.
+#[allow(clippy::type_complexity)]
+fn routing(
+    stats: &ProbeStats,
+) -> (
+    [usize; 7],
+    (u32, u32, u64),
+    ProbeTermination,
+    (u32, Option<u32>),
+    Option<usize>,
+) {
+    (
+        [
+            stats.postings_row,
+            stats.postings_skipped,
+            stats.routing_visited_count,
+            stats.vectors_visited,
+            stats.candidates_scored,
+            stats.layer0_eligible,
+            stats.clusters_skipped_empty,
+        ],
+        (
+            stats.bounds_skips,
+            stats.bound_armed_count,
+            stats.bound_armed_probe_sum,
+        ),
+        stats.termination,
+        (
+            stats.work_charged.to_bits(),
+            stats.recall_estimate.map(f32::to_bits),
+        ),
+        stats.layers.get(0).map(LayerProbeStats::scored),
+    )
+}
+
+/// A row of the unseeded window the seeded run lost: where it was dropped, its upper endpoint
+/// there, and its exact score.
+struct SlotDrop {
+    address: DocAddress,
+    site: String,
+    upper: Option<f32>,
+    score: Score,
+}
+
+/// The rows of `unseeded`'s window missing from `seeded`'s, each with its last upper endpoint in
+/// the seeded run: from the last layer whose candidates held it, or layer 0's of the unseeded run
+/// when admission dropped it.
+fn slot_drops(
+    fixture: &Fixture,
+    unseeded: &VectorSimilarityFruit,
+    seeded: &VectorSimilarityFruit,
+) -> crate::Result<Vec<SlotDrop>> {
+    let searcher = fixture.index.reader()?.searcher();
+    let upper = |bits: [u32; 4]| {
+        Estimate(f32::from_bits(bits[2]))
+            .upper(f32::from_bits(bits[3]), QUANTIZED_BOUNDARY_KAPPA)
+            .0
+    };
+    let mut drops = Vec::new();
+    for &(score, address) in &unseeded.results {
+        if seeded.results.iter().any(|&(_, kept)| kept == address) {
+            continue;
+        }
+        let row = searcher
+            .segment_reader(address.segment_ord)
+            .vector_index(fixture.field)?
+            .row_id(address.doc_id)?
+            .expect("a result has a vector");
+        let segment = address.segment_ord as usize;
+        let trace = &seeded.stats[segment].quantized_trace;
+        let last = trace
+            .layer_columns
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(layer, columns)| {
+                columns
+                    .iter()
+                    .find(|&&(traced, _)| traced == row)
+                    .map(|&(_, bits)| (layer, upper(bits)))
+            });
+        let (site, upper) = match last {
+            Some((layer, upper)) if trace.boundary_rows[layer].contains(&row) => {
+                if layer + 1 < trace.layer_columns.len() {
+                    (format!("recheck at layer {}", layer + 1), Some(upper))
+                } else {
+                    ("exact recheck".to_string(), Some(upper))
+                }
+            }
+            Some((layer, upper)) => (format!("boundary {layer}"), Some(upper)),
+            None => {
+                let unseeded_trace = &unseeded.stats[segment].quantized_trace;
+                let layer0 = unseeded_trace.layer_columns.first().and_then(|columns| {
+                    columns
+                        .iter()
+                        .find(|&&(traced, _)| traced == row)
+                        .map(|&(_, bits)| upper(bits))
+                });
+                ("admission".to_string(), layer0)
+            }
+        };
+        drops.push(SlotDrop {
+            address,
+            site,
+            upper,
+            score,
+        });
+    }
+    Ok(drops)
+}
+
+/// Stores `score` in an empty `slot`.
+fn seed_slot(slot: &AtomicSharedThreshold, score: Score) {
+    while slot
+        .try_update(&None, (score, SegmentOrdinal::MAX))
+        .is_err()
+    {}
+}
+
+/// A participants' slot seeded with the k-th exact score of the collector's window,
+/// k = `limit + offset`, prunes only rows that cannot enter the window and leaves every segment's
+/// routing as it is: the seeded run returns the same window, unless a dropped row's last upper
+/// endpoint fell below its exact score.
+fn assert_slot_seeded(
+    fixture: &Fixture,
+    filter: &dyn Query,
+    query: &[f32],
+    limit: usize,
+    offset: usize,
+    params: &ProbeParams,
+    case: &str,
+) -> crate::Result<()> {
+    let case = format!("{case} offset={offset}");
+    let unseeded = fixture.search_with(filter, query, limit, offset, params.clone(), None)?;
+    // A full window means k results exist; its last score is the k-th.
+    let Some(&(seed, _)) = unseeded.results.get(limit - 1) else {
+        return Ok(());
+    };
+    let slot = Arc::new(AtomicSharedThreshold::default());
+    seed_slot(&slot, seed);
+    let seeded = fixture.search_with(
+        filter,
+        query,
+        limit,
+        offset,
+        params.clone(),
+        Some(slot.clone()),
+    )?;
+    SLOT_CASES.fetch_add(1, Ordering::Relaxed);
+    if seeded
+        .stats
+        .iter()
+        .any(|stats| stats.cross_bound_raises > 0)
+    {
+        SLOT_CASES_RAISED.fetch_add(1, Ordering::Relaxed);
+    }
+    assert!(
+        slot.load().is_some_and(|(score, _)| score >= seed),
+        "{case}"
+    );
+    assert_eq!(seeded.stats.len(), unseeded.stats.len(), "{case}");
+    for (segment, (unseeded, seeded)) in unseeded.stats.iter().zip(&seeded.stats).enumerate() {
+        assert_eq!(
+            routing(unseeded),
+            routing(seeded),
+            "{case} segment {segment}: the seeded slot changed routing"
+        );
+    }
+    if seeded.results != unseeded.results {
+        let drops = slot_drops(fixture, &unseeded, &seeded)?;
+        assert!(
+            !drops.is_empty(),
+            "{case}: the seeded slot reordered the window"
+        );
+        for drop in &drops {
+            SLOT_DROPS.fetch_add(1, Ordering::Relaxed);
+            let SlotDrop {
+                address,
+                site,
+                upper,
+                score,
+            } = drop;
+            let row = format!("{address:?} at {site}: upper {upper:?}, exact {score}");
+            eprintln!("{case}: seeded slot {seed} dropped {row}");
+            assert!(
+                upper.is_some_and(|upper| upper < *score),
+                "{case}: seeded slot {seed} dropped {row}"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Every forced plan of the oracle matrix: each read, every cluster exact at admission, and
@@ -225,6 +606,9 @@ fn assert_case(
     for stats in &fruit.stats {
         assert_identities(stats, case);
     }
+    for offset in [0, 3] {
+        assert_slot_seeded(fixture, filter, query, k, offset, params, case)?;
+    }
     if !matches!(representation, Representation::Quantized(_)) {
         return Ok(fruit.stats);
     }
@@ -268,6 +652,37 @@ fn assert_case(
             "{case}"
         );
     }
+    // A shared bound seeded with the result's k-th exact score prunes only rows that cannot enter
+    // the top k: the seeded run returns the same hits, unless a dropped row's interval missed its
+    // exact score.
+    if let Some(&(seed, _)) = pruned.get(k - 1) {
+        let shared = Arc::new(SharedBound::seeded(k, seed));
+        let (seeded, seeded_stats) =
+            planned_top_k_with(fixture, filter, query, k, params, true, Some(shared))?;
+        SEEDED_CASES.fetch_add(1, Ordering::Relaxed);
+        let admission_pruned = |stats: &[ProbeStats]| -> usize {
+            stats
+                .iter()
+                .filter_map(|stats| stats.layers.get(0))
+                .map(LayerProbeStats::admission_pruned)
+                .sum()
+        };
+        if admission_pruned(&seeded_stats) > admission_pruned(&pruned_stats) {
+            SEEDED_CASES_PRUNING_MORE.fetch_add(1, Ordering::Relaxed);
+        }
+        if seeded != pruned {
+            let drops = seeded_drops(fixture, &pruned, &seeded, &pruned_stats, seed)?;
+            assert!(!drops.is_empty(), "{case} seeded bound reordered hits");
+            for (address, upper, score) in &drops {
+                eprintln!("{case}: seeded drop {address:?} upper {upper:?} exact {score}");
+                assert!(
+                    upper.is_some_and(|upper| upper < *score),
+                    "{case} seeded bound {seed} dropped {address:?}: upper {upper:?}, exact \
+                     {score}"
+                );
+            }
+        }
+    }
     Ok(fruit.stats)
 }
 
@@ -286,6 +701,8 @@ fn scan_matches_oracle() -> crate::Result<()> {
         for representation in representations {
             for deletes in [false, true] {
                 let fixture = matrix_fixture(metric, representation, deletes)?;
+                let segments = fixture.index.reader()?.searcher().segment_readers().len();
+                assert_eq!(segments, 2, "the matrix index holds two segments");
                 let filters: Vec<(&str, Box<dyn Query>)> = vec![
                     ("none", Box::new(AllQuery)),
                     ("half", Box::new(fixture.filter("half"))),
@@ -324,6 +741,25 @@ fn scan_matches_oracle() -> crate::Result<()> {
             }
         }
     }
+    let (seeded, pruning_more) = (
+        SEEDED_CASES.load(Ordering::Relaxed),
+        SEEDED_CASES_PRUNING_MORE.load(Ordering::Relaxed),
+    );
+    eprintln!("seeded shared-bound cases: {seeded}, pruning more at admission: {pruning_more}");
+    assert!(
+        pruning_more > 0,
+        "no seeded case pruned beyond the scan's own bound"
+    );
+    let (slot_cases, slot_raised, slot_drops) = (
+        SLOT_CASES.load(Ordering::Relaxed),
+        SLOT_CASES_RAISED.load(Ordering::Relaxed),
+        SLOT_DROPS.load(Ordering::Relaxed),
+    );
+    eprintln!(
+        "seeded slot windows: {slot_cases}, raising a scan's threshold: {slot_raised}, rows \
+         dropped: {slot_drops}; two segments per index"
+    );
+    assert!(slot_raised > 0, "no seeded slot raised a scan's threshold");
     Ok(())
 }
 
@@ -618,7 +1054,7 @@ fn filtered_cluster_reads_only_doc_ids() -> crate::Result<()> {
             let case = format!("{metric:?} {schedule:?}");
             let ranges = fixture.column_ranges()?;
             let searcher = fixture.index.reader()?.searcher();
-            let vectors = searcher.segment_readers()[0].vector_index(fixture.field)?;
+            let vectors = first_segment(&searcher).1.vector_index(fixture.field)?;
             let ivf = vectors.index().unwrap();
             let ivf_rows = ivf.cluster_range(2).len();
             let (_, _, open) =
@@ -866,7 +1302,7 @@ fn exact_reads_touch_only_survivor_pages() -> crate::Result<()> {
         Box::new(fixture.filter("d242")),
     ]);
     let searcher = fixture.index.reader()?.searcher();
-    let segment = &searcher.segment_readers()[0];
+    let segment = first_segment(&searcher).1;
     let vectors = segment.vector_index(fixture.field)?;
     let weight = filter.weight(EnableScoring::disabled_from_searcher(&searcher))?;
     let mut selected = Vec::new();
@@ -1072,7 +1508,7 @@ fn retired_groups_never_reach_a_later_band() -> crate::Result<()> {
     let layer1 = stats.layers.get(1).unwrap();
     assert!(layer1.exact_clusters() > 0, "{stats:?}");
     let searcher = fixture.index.reader()?.searcher();
-    let vectors = searcher.segment_readers()[0].vector_index(fixture.field)?;
+    let vectors = first_segment(&searcher).1.vector_index(fixture.field)?;
     let index = vectors.index().unwrap();
     let even = |row: &usize| {
         (0..index.num_clusters())
@@ -1084,7 +1520,7 @@ fn retired_groups_never_reach_a_later_band() -> crate::Result<()> {
     assert!(!trace.boundary_rows[1].iter().any(even));
     assert!(!trace.layer_columns[1].iter().any(|(row, _)| even(row)));
     assert_eq!(
-        layer1.scored() + layer1.exact_rows(),
+        layer1.scored() + layer1.exact_rows() + layer1.recheck_dropped(),
         trace.boundary_rows[0].len()
     );
     Ok(())
@@ -1166,7 +1602,7 @@ fn located_path_charges_the_work_meter() -> crate::Result<()> {
     let (hits, stats) =
         fixture.run_segment(0, weight.as_ref(), &reads_vector(42), 10, params.clone())?;
     let searcher = fixture.index.reader()?.searcher();
-    let vectors = searcher.segment_readers()[0].vector_index(fixture.field)?;
+    let vectors = first_segment(&searcher).1.vector_index(fixture.field)?;
     let ivf = vectors.index().unwrap();
     let (budget, n_avg, x) = params.resolved_work_budget(ivf.num_clusters(), ivf.num_docs())?;
     assert_eq!(stats.access_path, AccessPath::Located);

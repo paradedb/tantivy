@@ -18,6 +18,7 @@ use crate::query::Weight;
 use crate::schema::Field;
 use crate::vector::params::ProbeParams;
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery, VectorQuery};
+use crate::vector::search::scan::bound::SharedBound;
 use crate::vector::search::scan::heap::{tie_break_key, TieBreakHits};
 #[cfg(test)]
 use crate::vector::search::scan::plan::PlanOverride;
@@ -50,6 +51,8 @@ pub(crate) struct SegmentSearcher<T: VectorElement> {
     quantized: Option<Arc<QuantizedQueryCtx>>,
     probe_params: ProbeParams,
     segment_ord: SegmentOrdinal,
+    /// The bound the query's segment scans share; `None` prunes on the segment's own bound alone.
+    pub(crate) shared_bound: Option<Arc<SharedBound>>,
     #[cfg(test)]
     pub(crate) plan_override: Option<PlanOverride>,
     #[cfg(test)]
@@ -74,11 +77,18 @@ impl<T: VectorElement> SegmentSearcher<T> {
             quantized,
             probe_params,
             segment_ord,
+            shared_bound: None,
             #[cfg(test)]
             plan_override: None,
             #[cfg(test)]
             admission_pruning_disabled: false,
         })
+    }
+
+    /// Prunes against `bound` too, the bound the query's segment scans share.
+    pub(crate) fn with_shared_bound(mut self, bound: Arc<SharedBound>) -> Self {
+        self.shared_bound = Some(bound);
+        self
     }
 
     /// The query as this segment scores it.
@@ -216,6 +226,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
             index,
             self.scoring_query(),
             config,
+            self.shared_bound.as_deref(),
             tie_break,
             tie_comparator,
         )?;
@@ -245,7 +256,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
             SegmentReport::Ivf {
                 plan: report,
                 source,
-                scan,
+                scan: Box::new(scan),
             },
         ))
     }
