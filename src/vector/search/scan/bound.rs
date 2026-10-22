@@ -5,8 +5,8 @@
 //!
 //! A [`PruningBound`] is per segment scan, owned by the scan. It keeps two views. The segment's
 //! own, its running top-k of lower endpoints and its exact scores, is what the router's feedback
-//! and the result heap read. The pruning threshold adds the shared scores and decides admission
-//! and every boundary.
+//! and the result heap read. The pruning threshold adds the shared scores and the floor, and
+//! decides admission, every boundary and every recheck.
 //!
 //! Every value either bound holds is an exact score of a distinct row or a k-th largest lower
 //! endpoint over distinct rows, with k = limit + offset; under the intervals' kappa each is a
@@ -160,8 +160,8 @@ impl SharedBound {
 
 /// One segment scan's pruning bound: the k-th largest lower endpoint over every live candidate,
 /// quantized intervals and exactly scored rows (zero-width intervals) alike, including the rows
-/// the query's finished segments returned. Only the top `k` of each side can affect it, so each
-/// side keeps at most `k` entries.
+/// the query's finished segments returned, held at the highest value it has reached. Only the top
+/// `k` of each side can affect it, so each side keeps at most `k` entries.
 #[cfg_attr(test, derive(Clone))]
 pub(crate) struct PruningBound {
     k: usize,
@@ -175,6 +175,11 @@ pub(crate) struct PruningBound {
     /// Top-k exact scores of every row the scan knows of, its own and those the query's finished
     /// segments returned, descending. Every score is a distinct row's.
     known_exact: Vec<f32>,
+    /// The highest pruning threshold held; only raised. It keeps a boundary's threshold in force
+    /// once the running top-k is cleared.
+    floor: Option<f32>,
+    /// The threshold the last boundary pruned at: no live candidate's upper endpoint is below it.
+    pruned_at: Option<f32>,
     /// One cluster's entries for the running top-k.
     entries: Vec<(f32, usize, f32)>,
     merge: Vec<(f32, usize, f32)>,
@@ -194,6 +199,8 @@ impl PruningBound {
             running: Vec::with_capacity(k),
             running_estimates: Vec::with_capacity(k),
             known_exact,
+            floor: None,
+            pruned_at: None,
             entries: Vec::new(),
             merge: Vec::with_capacity(k.saturating_mul(2)),
         }
@@ -343,16 +350,21 @@ impl PruningBound {
 
     // --- Pruning decisions ---
 
-    /// The pruning threshold: the k-th of the running lower endpoints and the known exact scores;
-    /// `None` until `k` are in.
+    /// The pruning threshold: the higher of the floor and the k-th of the running lower endpoints
+    /// and the known exact scores; `None` while both are unset.
     #[inline]
     fn threshold(&self) -> Option<f32> {
-        merged_kth(
+        let kth = merged_kth(
             self.running.len(),
             |i| self.running[i].0,
             &self.known_exact,
             self.k,
-        )
+        );
+        match (self.floor, kth) {
+            (Some(floor), Some(kth)) => Some(if kth > floor { kth } else { floor }),
+            (floor, None) => floor,
+            (None, kth) => kth,
+        }
     }
 
     /// The threshold admission prunes a cluster's rows at; `None` while unset, which leaves the
@@ -363,21 +375,36 @@ impl PruningBound {
         threshold.map(|kth| Threshold(LowerEndpoint(kth)))
     }
 
-    /// The threshold a boundary prunes `candidates` at: the k-th largest lower endpoint over the
-    /// live candidates and the known exact scores, or the bound's threshold before the boundary
-    /// when that is higher, which keeps every row admission dropped below it. Clears the running
-    /// top-k, which describes the rows admitted before the boundary.
+    /// The threshold a block's candidates are rechecked at before a read; `None` until it rises
+    /// past the last boundary's, below which no candidate can drop.
+    pub(super) fn recheck_threshold(&mut self) -> Option<Threshold> {
+        let threshold = self.threshold()?;
+        if self
+            .pruned_at
+            .is_some_and(|pruned_at| threshold <= pruned_at)
+        {
+            return None;
+        }
+        Some(Threshold(LowerEndpoint(threshold)))
+    }
+
+    /// The threshold a boundary prunes `candidates` at: the bound's threshold once the k-th
+    /// largest lower endpoint over the live candidates and the known exact scores raises its
+    /// floor, as does the threshold before the boundary, which keeps every row admission dropped
+    /// below it. Clears the running top-k, which describes the rows admitted before the boundary.
     pub(super) fn boundary(&mut self, candidates: &mut QuantizedCandidates) -> Option<Threshold> {
-        let before = self.threshold();
+        if let Some(before) = self.threshold() {
+            self.raise_floor(before);
+        }
         let kth = self.boundary_kth(candidates.live_lowers());
         self.running.clear();
         self.running_estimates.clear();
-        let kth = match (kth, before) {
-            (Some(kth), Some(before)) if before > kth => Some(before),
-            (None, before) => before,
-            (kth, _) => kth,
-        };
-        kth.map(|kth| Threshold(LowerEndpoint(kth)))
+        if let Some(kth) = kth {
+            self.raise_floor(kth);
+        }
+        let threshold = self.threshold();
+        self.pruned_at = threshold;
+        threshold.map(|kth| Threshold(LowerEndpoint(kth)))
     }
 
     /// The k-th largest of `candidate_lowers` (one per live quantized candidate, reordered in
@@ -406,6 +433,15 @@ impl PruningBound {
         merged_kth(top.len(), |i| top[i], &self.known_exact, k)
     }
 
+    /// Raises the floor to `value`, a lower bound on the k-th best score; a lower value or NaN
+    /// leaves it.
+    #[inline]
+    fn raise_floor(&mut self, value: f32) {
+        if !value.is_nan() && self.floor.is_none_or(|floor| value > floor) {
+            self.floor = Some(value);
+        }
+    }
+
     /// The known exact scores, descending.
     #[cfg(test)]
     pub(super) fn known_exact(&self) -> &[f32] {
@@ -423,13 +459,25 @@ impl PruningBound {
     pub(super) fn running_for_test(&self) -> &[(f32, usize, f32)] {
         &self.running
     }
+
+    /// The pruning threshold, for the boundary harness.
+    #[cfg(test)]
+    pub(super) fn threshold_for_test(&self) -> Option<f32> {
+        self.threshold()
+    }
+
+    /// Raises the floor, for the boundary harness.
+    #[cfg(test)]
+    pub(super) fn raise_floor_for_test(&mut self, value: f32) {
+        self.raise_floor(value);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{lower_endpoint_order, merged_kth, PruningBound, SharedBound, SharedOffer};
     use crate::vector::quantization::QUANTIZED_BOUNDARY_KAPPA;
-    use crate::vector::search::interval::{LowerEndpoint, Threshold};
+    use crate::vector::search::interval::{Estimate, LowerEndpoint, Threshold};
     use crate::vector::search::scan::columns::BoundaryHarness;
     use crate::DocId;
 
@@ -807,6 +855,158 @@ mod tests {
             top.sort_by(|a, b| b.total_cmp(a));
             top.truncate(k);
             assert_eq!(bound.known_exact(), top, "{case}");
+        }
+    }
+
+    /// The pruning threshold never falls: not as clusters merge into the running top-k, exact
+    /// scores arrive, a boundary clears the running top-k, or the floor is raised.
+    #[test]
+    fn threshold_never_decreases() {
+        let value = |rng: &mut fastrand::Rng| (rng.f32() * 20.0 - 10.0).round() / 2.0;
+        for seed in 0..512 {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            let k = 1 + rng.usize(0..12);
+            let mut harness = BoundaryHarness::new(64);
+            let mut previous: Option<f32> = None;
+            let mut row = 0;
+            for step in 0..rng.usize(1..64) {
+                match rng.usize(0..4) {
+                    0 => {
+                        harness.begin_cluster(k);
+                        for _ in 0..rng.usize(1..2 * k + 2) {
+                            row += 1;
+                            let sigma = rng.f32() * 3.0;
+                            harness.push(row, row as DocId, value(&mut rng), sigma);
+                        }
+                        harness.finish_cluster(2.0);
+                    }
+                    1 => harness.push_exact(value(&mut rng), k),
+                    2 => harness.band(k, 2.0),
+                    _ => harness.raise_floor(k, value(&mut rng)),
+                }
+                let now = harness.threshold(k);
+                if let Some(previous) = previous {
+                    assert!(
+                        now.is_some_and(|now| now >= previous),
+                        "seed {seed} k={k} step {step}: {now:?} after {previous}"
+                    );
+                }
+                previous = now;
+            }
+        }
+    }
+
+    /// `(estimate, sigma)` rows for blocks of a harness, with global rows ascending across blocks.
+    fn blocks(rng: &mut fastrand::Rng) -> Vec<Vec<(usize, f32, f32)>> {
+        let mut row = 0;
+        (0..1 + rng.usize(0..6))
+            .map(|_| {
+                (0..rng.usize(0..12))
+                    .map(|_| {
+                        row += 1 + rng.usize(0..3);
+                        (row, rng.f32() * 20.0 - 10.0, rng.f32() * 3.0)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A harness holding `blocks`, each row's doc id derived from its global row.
+    fn harness_of(blocks: &[Vec<(usize, f32, f32)>]) -> BoundaryHarness {
+        let mut harness = BoundaryHarness::new(64);
+        for rows in blocks {
+            harness.open_block();
+            for &(row, estimate, sigma) in rows {
+                harness.push(row, (row * 7) as DocId, estimate, sigma);
+            }
+        }
+        harness
+    }
+
+    /// A recheck drops exactly the block's rows whose upper endpoint is below the threshold, keeps
+    /// the rest in row order with their doc ids and column values, and leaves the other blocks
+    /// alone.
+    #[test]
+    fn recheck_drops_exactly_the_rows_below_the_threshold() {
+        for seed in 0..512 {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            let blocks = blocks(&mut rng);
+            let mut harness = harness_of(&blocks);
+            let mut kept = blocks.clone();
+            for _ in 0..1 + rng.usize(0..4) {
+                let b = rng.usize(0..blocks.len());
+                let threshold = rng.f32() * 24.0 - 12.0;
+                let before = kept[b].len();
+                kept[b].retain(|&(_, estimate, sigma)| {
+                    Threshold(LowerEndpoint(threshold))
+                        .admits(Estimate(estimate).upper(sigma, QUANTIZED_BOUNDARY_KAPPA))
+                });
+                let dropped = harness.recheck(b, threshold);
+                let case = format!("seed {seed} block {b} threshold {threshold}");
+                assert_eq!(dropped, before - kept[b].len(), "{case}");
+                let expected = harness_of(&kept);
+                assert_eq!(harness.block_lens(), expected.block_lens(), "{case}");
+                assert_eq!(
+                    harness.candidates.column_trace(true),
+                    expected.candidates.column_trace(true),
+                    "{case}"
+                );
+                assert_eq!(
+                    harness.candidates.doc_ids(),
+                    expected.candidates.doc_ids(),
+                    "{case}"
+                );
+                assert_eq!(
+                    harness.candidates.len(),
+                    kept.iter().map(Vec::len).sum::<usize>(),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// A boundary after rechecks, over blocks with dead entries between their ranges, keeps the
+    /// rows and threshold of a boundary over the same blocks with the dropped rows never added.
+    #[test]
+    fn band_after_recheck_matches_rows_removed_up_front() {
+        for seed in 0..512 {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            let k = 1 + rng.usize(0..8);
+            let blocks = blocks(&mut rng);
+            let exact: Vec<f32> = (0..rng.usize(0..k + 2))
+                .map(|_| rng.f32() * 20.0 - 10.0)
+                .collect();
+            let mut rechecked = harness_of(&blocks);
+            let mut kept = blocks.clone();
+            for _ in 0..rng.usize(0..6) {
+                let b = rng.usize(0..blocks.len());
+                let threshold = rng.f32() * 24.0 - 12.0;
+                rechecked.recheck(b, threshold);
+                kept[b].retain(|&(_, estimate, sigma)| {
+                    Threshold(LowerEndpoint(threshold))
+                        .admits(Estimate(estimate).upper(sigma, QUANTIZED_BOUNDARY_KAPPA))
+                });
+            }
+            let mut removed = harness_of(&kept);
+            for harness in [&mut rechecked, &mut removed] {
+                for &score in &exact {
+                    harness.push_exact(score, k);
+                }
+                harness.band(k, QUANTIZED_BOUNDARY_KAPPA);
+            }
+            let case = format!("seed {seed} k={k}");
+            assert_eq!(rechecked.threshold(k), removed.threshold(k), "{case}");
+            assert_eq!(rechecked.block_lens(), removed.block_lens(), "{case}");
+            assert_eq!(
+                rechecked.candidates.column_trace(true),
+                removed.candidates.column_trace(true),
+                "{case}"
+            );
+            assert_eq!(
+                rechecked.candidates.doc_ids(),
+                removed.candidates.doc_ids(),
+                "{case}"
+            );
         }
     }
 

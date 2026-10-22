@@ -288,6 +288,72 @@ fn carried_scores_are_the_top_k_of_seed_and_segment() -> crate::Result<()> {
     Ok(())
 }
 
+/// Every survivor of a boundary is rechecked away, scored exactly or refined by the next layer,
+/// and every survivor of the last boundary is rechecked away or scored in the exact phase; with
+/// carried scores raising the threshold, rechecks drop rows at both.
+#[test]
+fn recheck_accounts_for_every_survivor() -> crate::Result<()> {
+    let mixed = PlanOverride::exact(|cluster, layer| (cluster + layer) % 3 == 1);
+    let (mut layer_drops, mut exact_drops) = (0, 0);
+    for representation in [
+        Representation::Quantized(&[1]),
+        Representation::Quantized(&[1, 4]),
+    ] {
+        let fixture = matrix_fixture(Metric::L2, representation, false)?;
+        let params = routed_exhaustive_params(MATRIX_CLUSTERS);
+        let weight = fixture.weight(&AllQuery)?;
+        let segments = fixture.index.reader()?.searcher().segment_readers().len();
+        for query in matrix_queries() {
+            for k in [1, 10] {
+                let (hits, _) = planned_top_k(&fixture, &AllQuery, &query, k, &params, true)?;
+                for plan in [None, Some(mixed)] {
+                    for segment in 0..segments {
+                        let case = format!("{representation:?} k={k} plan={plan:?} {segment}");
+                        let shared = Arc::new(SharedBound::new(k));
+                        shared.offer(
+                            hits.iter()
+                                .filter(|(_, address)| address.segment_ord as usize != segment)
+                                .map(|&(score, _)| score),
+                        );
+                        let (_, stats) = fixture.run_planned_with(
+                            segment,
+                            weight.as_ref(),
+                            &query,
+                            k,
+                            params.clone(),
+                            plan,
+                            true,
+                            Some(shared),
+                        )?;
+                        let layers: Vec<&LayerProbeStats> =
+                            (0..).map_while(|layer| stats.layers.get(layer)).collect();
+                        for pair in layers.windows(2) {
+                            let (previous, layer) = (pair[0], pair[1]);
+                            assert_eq!(
+                                previous.survivors(),
+                                layer.recheck_dropped() + layer.exact_rows() + layer.scored(),
+                                "{case}"
+                            );
+                            layer_drops += layer.recheck_dropped();
+                        }
+                        let layer_exact: usize =
+                            layers.iter().map(|layer| layer.exact_rows()).sum();
+                        assert_eq!(
+                            layers.last().unwrap().survivors(),
+                            stats.exact_recheck_dropped + stats.exact_rows - layer_exact,
+                            "{case}"
+                        );
+                        exact_drops += stats.exact_recheck_dropped;
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("recheck drops: refining layers {layer_drops}, exact phase {exact_drops}");
+    assert!(layer_drops > 0 && exact_drops > 0);
+    Ok(())
+}
+
 /// Oracle-matrix cases compared against a seeded shared bound, and those where the seed pruned
 /// more rows at admission than the scan's own bound.
 static SEEDED_CASES: AtomicUsize = AtomicUsize::new(0);
@@ -1238,7 +1304,7 @@ fn retired_groups_never_reach_a_later_band() -> crate::Result<()> {
     assert!(!trace.boundary_rows[1].iter().any(even));
     assert!(!trace.layer_columns[1].iter().any(|(row, _)| even(row)));
     assert_eq!(
-        layer1.scored() + layer1.exact_rows(),
+        layer1.scored() + layer1.exact_rows() + layer1.recheck_dropped(),
         trace.boundary_rows[0].len()
     );
     Ok(())
