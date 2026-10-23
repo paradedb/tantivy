@@ -6,12 +6,9 @@ use crate::query::{AllQuery, Query};
 use crate::schema::{Metric, VectorDType};
 use crate::vector::diagnostics::VectorStorageFormat;
 use crate::vector::params::{LocatedPath, ProbeParams, DEFAULT_FIXED_PROBE_COST_ROWS};
-use crate::vector::router::stacked::aps::RecallEstimator;
 use crate::vector::search::cluster_source::{ClusterSource, Feedback};
 use crate::vector::search::segment::plan::Source;
-use crate::vector::search::source::controller::{
-    open_share, ProbeController, ProbeTermination, WorkBudget, WorkMeter, WorkUnits,
-};
+use crate::vector::search::source::controller::{open_share, ProbeTermination};
 use crate::vector::search::source::router::{
     DocFilter, GatedRows, RouterClusters, RouterReport, RowGate,
 };
@@ -254,35 +251,9 @@ fn grid(metric: Metric, router: RouterKind) -> crate::Result<Fixture> {
         .into())
 }
 
-/// The loop stops on the ceiling, on exhaustion, or at the recall target, which only the stacked
-/// router estimates and only for metrics with a query ball.
+/// The loop stops on the ceiling or on exhaustion.
 #[test]
 fn probe_termination() -> crate::Result<()> {
-    // The controller alone: the first pull after the estimate reaches the target stops.
-    let meter = WorkMeter::new(WorkBudget {
-        total: WorkUnits::new(100.0),
-        per_cluster: WorkUnits::new(0.5),
-        per_row: WorkUnits::new(0.01),
-    });
-    let centroids = [[0.0f32, 0.0], [2.0, 0.0], [0.0, 2.0]];
-    let estimator = RecallEstimator::from_rows(
-        &[0.1, 0.0],
-        centroids.iter().map(|row| &row[..]).collect(),
-        Metric::L2,
-    );
-    let mut controller = ProbeController::new(3, Some(estimator), 0.5);
-    assert!(controller.admit(&meter));
-    controller.cover(None)?;
-    assert!(controller.admit(&meter), "no estimate while the heap fills");
-    // A ball of radius 0.2 lies inside the nearest cell.
-    controller.cover(Some(-(0.2f32 * 0.2)))?;
-    assert!(!controller.admit(&meter));
-    let outcome = controller.finish(&meter);
-    assert_eq!(outcome.termination, ProbeTermination::RecallTarget);
-    assert!(outcome
-        .recall_estimate
-        .is_some_and(|estimate| estimate >= 0.5));
-
     // Ceiling: a budget below one cluster stops after the first.
     let fixture = separated_fixture(6)?;
     let ceiling = walk_fixture(
@@ -297,7 +268,7 @@ fn probe_termination() -> crate::Result<()> {
     assert_eq!(ceiling.clusters.len(), 1);
 
     // Exhausted: an exhaustive, unarmed walk opens every cluster and admits every row.
-    // Exact: Stacked's hard 25% top prune cannot hand the probe every list on a 3×3 grid.
+    // Exact: Stacked's 25% top prune cannot hand the probe every list on a 3x3 grid.
     let fixture = grid(Metric::L2, RouterKind::Exact)?;
     let exhausted = walk_fixture(
         &fixture,
@@ -315,59 +286,6 @@ fn probe_termination() -> crate::Result<()> {
     assert_eq!(counters.postings_row + counters.postings_skipped, 9);
     let docs = fixture.index.reader()?.searcher().segment_readers()[0].max_doc() as usize;
     assert_eq!(exhausted.rows, docs);
-
-    // Recall target: a loose target stops on the estimate before the budget; 1.0 leaves APS off.
-    let stacked = grid(Metric::L2, RouterKind::Stacked)?;
-    let recall = |target| ProbeParams {
-        recall_target: target,
-        ..budget_params(1.0)
-    };
-    let kth = kth_score(&stacked, &[0.0, 0.0], 3)?;
-    let aps = walk_fixture(
-        &stacked,
-        &AllQuery,
-        &[0.0, 0.0],
-        3,
-        recall(0.5),
-        armed(3, kth),
-    )?
-    .report
-    .probe;
-    assert_eq!(aps.termination, ProbeTermination::RecallTarget, "{aps:?}");
-    assert!(aps.recall_estimate.is_some_and(|estimate| estimate >= 0.5));
-    let off = walk_fixture(
-        &stacked,
-        &AllQuery,
-        &[0.0, 0.0],
-        3,
-        recall(1.0),
-        armed(3, kth),
-    )?
-    .report
-    .probe;
-    assert_ne!(off.termination, ProbeTermination::RecallTarget, "{off:?}");
-    assert_eq!(off.recall_estimate, None);
-    assert!(aps.work_charged < off.work_charged && aps.work_charged < aps.work_budget);
-    assert_eq!(aps.work_budget, off.work_budget);
-
-    // Dot has no query ball; the exact router has no estimator.
-    for (metric, router) in [
-        (Metric::Dot, RouterKind::Stacked),
-        (Metric::L2, RouterKind::Exact),
-    ] {
-        let fixture = grid(metric, router)?;
-        let query = [1.0, 0.0];
-        let kth = kth_score(&fixture, &query, 3)?;
-        let probe = walk_fixture(&fixture, &AllQuery, &query, 3, recall(0.5), armed(3, kth))?
-            .report
-            .probe;
-        assert_ne!(
-            probe.termination,
-            ProbeTermination::RecallTarget,
-            "{metric:?} {router:?}"
-        );
-        assert_eq!(probe.recall_estimate, None, "{metric:?} {router:?}");
-    }
 
     // A binding budget is recorded, stops before exhaustion, and overshoots by at most one
     // cluster's charge.

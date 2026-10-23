@@ -1455,7 +1455,7 @@ mod bounds_storage_tests {
         for c in &centroids {
             let query = [c[0] + 0.3, 0.2];
             let owned: Vec<_> = stacked
-                .search(&query, 2, 1.0, Metric::L2)
+                .search(&query, 2, Metric::L2)
                 .0
                 .into_iter()
                 .take(2)

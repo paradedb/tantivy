@@ -1433,52 +1433,6 @@ fn quantized_probe_terminates_at_ceiling() -> crate::Result<()> {
     Ok(())
 }
 
-/// Under the stacked router the quantized loop runs APS: a loose
-/// recall target stops before the full budget is spent. With only two
-/// lists the hard 25% top prune hands the probe a single candidate, so
-/// the loop may exhaust that stream after the estimate already clears
-/// the target — both count as APS having fired.
-#[test]
-fn quantized_probe_terminates_at_recall_target() -> crate::Result<()> {
-    let index =
-        build_quantized_fixture_case_with_router(100, Metric::L2, &[1], true, RouterKind::Stacked)?;
-    let field = index.schema().get_field("embedding")?;
-    let query = fixture_search_query(Metric::L2, 100);
-    let searcher = index.reader()?.searcher();
-    let collector = TopDocsByVectorSimilarity::new(field, query.clone(), 3)
-        .with_probe_params(ProbeParams {
-            max_probe_fraction: 1.0,
-            min_probe_clusters: 1,
-            recall_target: 0.5,
-            exact_plan: false,
-            located: LocatedPath::Off,
-            ..Default::default()
-        })
-        .with_max_scan_levels(1);
-    let fruit = searcher.search(&AllQuery, &collector)?;
-    let stats = &fruit.stats[0];
-    assert!(
-        stats
-            .recall_estimate
-            .is_some_and(|estimate| estimate >= 0.5),
-        "{stats:?}"
-    );
-    assert!(
-        matches!(
-            stats.termination,
-            crate::vector::ProbeTermination::RecallTarget
-                | crate::vector::ProbeTermination::Exhausted
-        ),
-        "{stats:?}"
-    );
-    assert_eq!(
-        fruit.results,
-        fixture_exact_hits(&index, Metric::L2, &query, None, 3)?,
-        "{stats:?}"
-    );
-    Ok(())
-}
-
 #[test]
 fn quantized_filtered_rows_are_not_charged() -> crate::Result<()> {
     let index = build_quantized_fixture_case(100, Metric::L2, &[1], true)?;

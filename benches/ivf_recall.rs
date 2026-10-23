@@ -32,7 +32,6 @@ const COHERE_N: usize = 1_000_000;
 const COHERE_D: usize = 1024;
 const TOP_K: usize = 10;
 /// Quake's `f_M`: initial candidate fraction at L0.
-const APS_FRACTION: f32 = 0.02;
 
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data")
@@ -245,7 +244,6 @@ fn evaluate(
     queries: &[f32],
     n_queries: usize,
     d: usize,
-    recall_target: f32,
     truth: &[Vec<u32>],
     inv: &[u32],
 ) -> (f64, f64, f64, f64) {
@@ -254,7 +252,7 @@ fn evaluate(
         .into_par_iter()
         .map(|q| {
             let query = &queries[q * d..(q + 1) * d];
-            let (hits, stats) = index.search(query, TOP_K, recall_target, Metric::L2);
+            let (hits, stats) = index.search(query, TOP_K, Metric::L2);
             let found = hits
                 .iter()
                 .filter(|h| truth[q].contains(&inv[usize::from(h.node)]))
@@ -340,30 +338,9 @@ fn main() {
             break;
         }
         index.config.nprobe_fraction = nprobe as f32 / nlist as f32;
-        let (recall, cands, lists, ms) = evaluate(&index, queries, n_queries, d, 1.0, &truth, &inv);
+        let (recall, cands, lists, ms) = evaluate(&index, queries, n_queries, d, &truth, &inv);
         println!(
             "{nprobe:<8} {lists:<10.1} {:<12.2} {recall:<10.4} {ms:>6.2}",
-            100.0 * cands / n as f64
-        );
-    }
-
-    index.config.nprobe_fraction = APS_FRACTION;
-    println!(
-        "\nAPS: f_M={APS_FRACTION} -> {} candidate lists, parent recall {}\n{:<8} {:<10} {:<12} \
-         {:<10} {:>6}",
-        index.n_probe(),
-        index.config.parent_recall_target,
-        "target",
-        "lists",
-        "%_sims",
-        format!("recall@{TOP_K}"),
-        "ms/q"
-    );
-    for target in [0.80f32, 0.90, 0.95, 0.99] {
-        let (recall, cands, lists, ms) =
-            evaluate(&index, queries, n_queries, d, target, &truth, &inv);
-        println!(
-            "{target:<8.2} {lists:<10.1} {:<12.2} {recall:<10.4} {ms:>6.2}",
             100.0 * cands / n as f64
         );
     }

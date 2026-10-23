@@ -30,7 +30,6 @@ use common::{BinarySerializable, HasLen, OwnedBytes};
 
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
-use crate::vector::router::stacked::aps::RecallEstimator;
 use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RoutingParams};
 use crate::vector::storage::bounds::{BoundKind, BoundStore};
 use crate::vector::storage::header::VectorFileVersion;
@@ -330,26 +329,13 @@ impl ClusterIndex {
 
     /// Rank this segment's clusters for `query`, nearest first. `params`
     /// steers the stacked router only (how many clusters the caller will
-    /// probe and its recall target); other routers ignore it.
+    /// probe); other routers ignore it.
     pub(crate) fn rank_clusters(&self, query: &[f32], params: RoutingParams) -> RouterIter {
         #[cfg(test)]
         if let Some(clusters) = crate::vector::router::test_clusters() {
             return clusters;
         }
         self.router.rank(query, self.metric, params)
-    }
-
-    /// The APS estimator for scanning `ranked` (from
-    /// [`Self::rank_clusters`], not yet pulled) toward `recall`. `None`
-    /// unless the stacked router ranked it and APS is on.
-    pub(crate) fn recall_estimator(
-        &self,
-        ranked: &RouterIter,
-        query: &[f32],
-        recall: f32,
-    ) -> Option<RecallEstimator<'_>> {
-        self.router
-            .recall_estimator(ranked, query, self.metric, recall)
     }
 }
 
