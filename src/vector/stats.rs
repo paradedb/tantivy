@@ -258,9 +258,6 @@ pub struct ProbeStats {
     pub work_charged: f32,
     /// The work budget the probe loop ran against, in work units; 0 when no loop ran.
     pub work_budget: f32,
-    /// The APS recall estimate at the stop; absent when APS was off or never armed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recall_estimate: Option<f32>,
     /// Vector rows in the segment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segment_rows: Option<usize>,
@@ -382,7 +379,6 @@ impl ProbeStats {
         self.termination = probe.termination;
         self.work_charged = probe.work_charged;
         self.work_budget = probe.work_budget;
-        self.recall_estimate = probe.recall_estimate;
     }
 
     fn record_matches(&mut self, report: MatchReport) {
@@ -478,10 +474,7 @@ mod tests {
         SourceReport::Router(RouterReport {
             counters: RouterCounters::default(),
             routing: RouterMetrics::Exact { visited_count: 7 },
-            probe: ProbeOutcome {
-                recall_estimate: Some(0.9),
-                ..ProbeOutcome::default()
-            },
+            probe: ProbeOutcome::default(),
         })
     }
 
@@ -570,7 +563,7 @@ mod tests {
             layers: vec![LayerReport::default(); 2],
             ..ScanReport::default()
         };
-        let segment = ["recall_estimate", "segment_rows", "segment_clusters"];
+        let segment = ["segment_rows", "segment_clusters"];
         let ivf = |scan| SegmentReport::Ivf {
             plan,
             source: routed(),

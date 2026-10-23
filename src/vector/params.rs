@@ -1,4 +1,4 @@
-//! Query-time probe parameters: the work budget, the located path and the recall targets.
+//! Query-time probe parameters: the work budget and the located path.
 
 use crate::vector::search::source::controller::open_share;
 
@@ -21,13 +21,6 @@ pub struct ProbeParams {
     pub max_probe_fraction: f32,
     /// Floor on the resolved budget, in work units, applied before the capacity cap. Default 16.
     pub min_probe_clusters: usize,
-    /// Recall target for the stacked router's ranking, in `(0, 1]`; `1.0` routes with the fixed
-    /// nprobe fractions. Forced to `1.0` above 128 dimensions. Default [`DEFAULT_ROUTER_RECALL`].
-    pub router_recall_target: f32,
-    /// Recall target for each segment's cluster scan, in `(0, 1]`, estimated by the Quake APS;
-    /// `1.0` leaves the budget as the only bound. Stacked-router segments only; forced to `1.0`
-    /// above 128 dimensions. Default `1.0`.
-    pub recall_target: f32,
     /// Lets a quantized segment score a cluster's rows exactly before the exact phase when that
     /// reads strictly fewer storage blocks (bytes without block geometry) than the cheaper
     /// quantized read. Exact rows join the pruning bound as zero-width intervals. Default `true`.
@@ -77,8 +70,6 @@ impl Default for ProbeParams {
         Self {
             max_probe_fraction: 0.01,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
-            router_recall_target: DEFAULT_ROUTER_RECALL,
-            recall_target: 1.0,
             exact_plan: true,
             located: LocatedPath::Auto,
             fixed_probe_cost_rows: DEFAULT_FIXED_PROBE_COST_ROWS,
@@ -87,9 +78,6 @@ impl Default for ProbeParams {
 }
 
 pub(crate) const MIN_PROBE_CLUSTERS: usize = 16;
-
-/// Default [`ProbeParams::router_recall_target`].
-pub const DEFAULT_ROUTER_RECALL: f32 = 0.99;
 
 impl ProbeParams {
     /// The number of clusters the stacked router is asked to rank for a

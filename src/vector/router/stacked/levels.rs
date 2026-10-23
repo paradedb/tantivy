@@ -29,8 +29,6 @@ use crate::schema::Metric;
 use crate::vector::distance::Similarity;
 use crate::vector::router::arena::{FileSliceArena, VectorArena};
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::stacked::aps;
-use crate::vector::router::stacked::aps::RecallEstimator;
 use crate::vector::VectorElement;
 
 /// Row index into a level's centroid or member arena.
@@ -65,35 +63,32 @@ impl From<usize> for ClusterId {
     }
 }
 
-/// Default `nprobe_fraction` for parent levels (L1, L2, …).
+/// Default `nprobe_fraction` for parent levels (L1, L2, ...).
 pub(crate) const PARENT_NPROBE_FRACTION: f32 = 0.25;
 
-/// Recall target used when this level searches its parent.
-pub(crate) const PARENT_RECALL_TARGET: f32 = 0.99;
+/// Member-heap overscan when converting a size-`k` request into how many
+/// lists to open: beam ~ `LIST_OVERSCAN * k` members, then to lists.
+pub(crate) const LIST_OVERSCAN: usize = 2;
 
 /// [`StackedIvfBuilder`] hangs a parent only while the current top has at
 /// least this many lists. Below that, the top is scored in full and pruned
-/// to [`PARENT_NPROBE_FRACTION`].
+/// with [`StackedIvf::lists_to_open`] (floor [`PARENT_NPROBE_FRACTION`]).
 pub(crate) const MIN_NLIST_FOR_PARENT: usize = 256;
 
 /// Search and clustering knobs for this level. Not persisted.
 #[derive(Clone, Debug)]
 pub struct StackedIvfConfig {
     /// Initial candidate fraction `f_M`: `|S| = nprobe_fraction * nlist`.
-    /// At the top level (no parent), lists are pruned to
-    /// [`PARENT_NPROBE_FRACTION`] after scoring every centroid.
+    /// List selection at search time is [`StackedIvf::lists_to_open`]: floor
+    /// [`PARENT_NPROBE_FRACTION`], beam ~ [`LIST_OVERSCAN`] * `k` members, cap
+    /// `nlist`.
     pub nprobe_fraction: f32,
-    /// Recall target this level passes to its parent when APS is on.
-    /// `1.0` makes the parent scan its full candidate set (exact routing
-    /// when the parent is the top level).
-    pub parent_recall_target: f32,
 }
 
 impl Default for StackedIvfConfig {
     fn default() -> Self {
         Self {
             nprobe_fraction: 0.02,
-            parent_recall_target: PARENT_RECALL_TARGET,
         }
     }
 }
@@ -102,7 +97,6 @@ impl StackedIvfConfig {
     fn for_parent(&self) -> Self {
         Self {
             nprobe_fraction: PARENT_NPROBE_FRACTION,
-            parent_recall_target: self.parent_recall_target,
         }
     }
 
@@ -265,7 +259,7 @@ impl LazyStore {
     }
 
     /// Wraps `rows` and decodes them into memory once, so
-    /// [`CentroidMatrix`] is available and scoring skips the file.
+    /// held in memory so scoring skips the file.
     pub(crate) fn pinned(rows: FileSlice, dim: usize) -> io::Result<Self> {
         let bytes = rows.read_bytes()?;
         if bytes.len() % (dim * mem::size_of::<f32>()) != 0 {
@@ -418,24 +412,6 @@ where
         parent = level.parent.as_deref();
     }
     Ok(())
-}
-
-/// Row-major centroid access for APS. Stores without an in-memory matrix
-/// return `None` and search falls back to scanning every candidate list.
-pub(crate) trait CentroidMatrix {
-    fn centroid_matrix(&self) -> Option<(&[f32], usize)>;
-}
-
-impl CentroidMatrix for InMemoryStore {
-    fn centroid_matrix(&self) -> Option<(&[f32], usize)> {
-        Some((self.as_slice(), self.dim()))
-    }
-}
-
-impl CentroidMatrix for LazyStore {
-    fn centroid_matrix(&self) -> Option<(&[f32], usize)> {
-        self.pinned.as_deref().map(|rows| (rows, self.dim))
-    }
 }
 
 /// Work done by one [`StackedIvf::search`], summed over this level and
@@ -877,7 +853,7 @@ impl StackedIvf<LazyStore> {
 }
 
 impl<S> StackedIvf<S>
-where S: VectorArena<Elem = f32> + CentroidMatrix
+where S: VectorArena<Elem = f32>
 {
     pub fn nlist(&self) -> usize {
         self.offsets.len()
@@ -889,26 +865,51 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         1 + self.parent.as_ref().map(|p| p.depth()).unwrap_or(0)
     }
 
+    /// Fraction-only probe size (`nprobe_fraction * nlist`). Search uses
+    /// [`Self::lists_to_open`] instead; this remains for benches that sweep
+    /// `nprobe_fraction` directly.
+    #[cfg(any(test, feature = "unstable"))]
     pub fn n_probe(&self) -> usize {
         let nlist = self.nlist();
         let n = ((nlist as f32 * self.config.nprobe_fraction).ceil().max(1.0)) as usize;
         n.min(nlist).max(1)
     }
 
+    /// How many lists to open so a size-`k` member heap stays fed.
+    ///
+    /// Converts the member request into a list count with beam
+    /// [`LIST_OVERSCAN`] * `k`, then clamps to
+    /// `[ceil(PARENT_NPROBE_FRACTION * nlist), nlist]`. Used as the parent
+    /// ask when a parent exists, and as the flat-top keep otherwise.
+    pub fn lists_to_open(&self, k: usize) -> usize {
+        let nlist = self.nlist();
+        if nlist == 0 {
+            return 0;
+        }
+        let floor = ((nlist as f32 * PARENT_NPROBE_FRACTION).ceil() as usize).max(1);
+        let n_members = self
+            .offsets
+            .iter()
+            .map(|&(start, end)| (end - start) as usize)
+            .sum::<usize>()
+            .max(1);
+        let beam_members = k.saturating_mul(LIST_OVERSCAN).max(1);
+        let for_k = ((beam_members as f64 * nlist as f64) / n_members as f64).ceil() as usize;
+        for_k.max(floor).min(nlist).max(1)
+    }
+
     /// Nearest members from the lists selected at this level, plus the
     /// work done across the whole stack to find them.
     ///
-    /// If a parent is present it ranks which lists to probe (`n_probe`,
-    /// typically 25% of this level's lists). Otherwise every centroid is
-    /// scored and only the best [`PARENT_NPROBE_FRACTION`] are expanded.
-    /// Lists are scanned nearest centroid first. When `recall < 1.0` and
-    /// centroids are in-memory, scanning stops once the estimated recall
-    /// of the lists scanned so far reaches `recall` (Quake APS).
+    /// List count is [`Self::lists_to_open`]: enough clusters to feed the
+    /// size-`k` heap (~2x member overscan), floored at 25% of `nlist` and
+    /// capped at `nlist`. A parent is asked for that many of this level's
+    /// lists; without a parent every centroid is scored and only that many
+    /// are expanded. Lists are scanned nearest centroid first.
     pub fn search(
         &self,
         query: &[S::Elem],
         k: usize,
-        recall: f32,
         metric: Metric,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
         if k == 0 {
@@ -916,23 +917,13 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
         }
 
         let dim = query.len();
-        let can_aps = recall < 1.0
-            && aps::supports_metric(metric)
-            && self.centroids.centroid_matrix().is_some();
+        let open = self.lists_to_open(k);
 
         // Candidate lists, nearest centroid first; `candidates[0]` is P0.
         let (candidates, mut stats) = if let Some(parent) = &self.parent {
-            let parent_recall = if can_aps {
-                self.config.parent_recall_target
-            } else {
-                recall.max(1.0)
-            };
-            parent.search(query, self.n_probe(), parent_recall, metric)
+            parent.search(query, open, metric)
         } else {
             let nlist = self.nlist();
-            let keep = ((nlist as f32 * PARENT_NPROBE_FRACTION).ceil() as usize)
-                .max(1)
-                .min(nlist);
             let all: Vec<Candidate<ClusterId>> = (0..nlist)
                 .map(|i| Candidate {
                     sim: self.centroids.similarity(metric, dim, i as u32, query),
@@ -940,7 +931,7 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
                 })
                 .sorted()
                 .rev()
-                .take(keep)
+                .take(open)
                 .collect();
             let stats = StackedSearchStats {
                 lists_scanned: 0,
@@ -953,36 +944,10 @@ where S: VectorArena<Elem = f32> + CentroidMatrix
             return (Vec::new(), stats);
         }
 
-        let mut estimator = can_aps.then(|| {
-            let (matrix, _) = self.centroids.centroid_matrix().expect("can_aps");
-            let rows: Vec<&[f32]> = candidates
-                .iter()
-                .map(|c| {
-                    let j = usize::from(c.node);
-                    &matrix[j * dim..(j + 1) * dim]
-                })
-                .collect();
-            let sims: Vec<Similarity> = candidates.iter().map(|c| c.sim).collect();
-            RecallEstimator::new(query, &sims, Box::new(rows), metric)
-        });
-
         let mut result = BinaryHeap::with_capacity(k);
         for c in &candidates {
             stats.members_scored += self.scan_cluster(query, metric, c.node, &mut result, k);
             stats.lists_scanned += 1;
-            let Some(estimator) = estimator.as_mut() else {
-                continue;
-            };
-            let kth = result
-                .peek()
-                .filter(|_| result.len() >= k)
-                .map(|Reverse(kth)| kth.sim);
-            let estimate = estimator
-                .cover_next(kth)
-                .expect("in-memory centroid rows cannot fail to load");
-            if estimate.is_some_and(|est| est >= recall) {
-                break;
-            }
         }
 
         let hits = result
@@ -1070,7 +1035,7 @@ mod tests {
         assert_eq!(index.depth(), 1);
 
         let query = [1.0f32, 0.0];
-        let (hits, _) = index.search(&query, 4, 1.0, Metric::L2);
+        let (hits, _) = index.search(&query, 4, Metric::L2);
         assert!(!hits.is_empty());
         assert!(
             hits.len() < n,
@@ -1142,8 +1107,8 @@ mod tests {
         );
 
         for query in [[0.0f32, 0.0], [7.5, 0.0], [31.0, 0.0]] {
-            let (expected, _) = index.search(&query, 4, 1.0, Metric::L2);
-            let (got, _) = decoded.search(&query, 4, 1.0, Metric::L2);
+            let (expected, _) = index.search(&query, 4, Metric::L2);
+            let (got, _) = decoded.search(&query, 4, Metric::L2);
             assert_eq!(
                 got.len(),
                 expected.len(),
@@ -1230,18 +1195,48 @@ mod tests {
         assert!(index.parent.is_none());
         let nlist = index.nlist();
         assert!(nlist > 1);
-        let keep = ((nlist as f32 * PARENT_NPROBE_FRACTION).ceil() as usize).max(1);
+        let floor = ((nlist as f32 * PARENT_NPROBE_FRACTION).ceil() as usize).max(1);
+        // Small k: beam stays under the floor, so keep == 25% of nlist.
+        assert_eq!(index.lists_to_open(1), floor);
 
         let query = [0.0f32, 0.0];
-        let (hits, stats) = index.search(&query, n, 1.0, Metric::L2);
+        let (hits, stats) = index.search(&query, 1, Metric::L2);
         assert!(!hits.is_empty());
         assert_eq!(
-            stats.lists_scanned, keep,
-            "top level must expand only ceil(0.25 × nlist) lists"
+            stats.lists_scanned, floor,
+            "small-k top level must expand only ceil(0.25 × nlist) lists"
         );
         assert!(
             stats.members_scored >= nlist,
             "every top centroid is scored before the prune"
+        );
+    }
+
+    #[test]
+    fn test_lists_to_open_grows_with_k_then_caps_at_nlist() {
+        let dim = 2;
+        let n = 64;
+        let data = line_data(n);
+        let clusterer = SuperKMeansLevelClusterer::default();
+        let (index, _) =
+            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config());
+        let nlist = index.nlist();
+        let floor = ((nlist as f32 * PARENT_NPROBE_FRACTION).ceil() as usize).max(1);
+
+        assert_eq!(index.lists_to_open(1), floor);
+        // 2k members ≈ half the corpus → about half the lists (above the floor).
+        let mid = index.lists_to_open(n / 4);
+        assert!(
+            mid > floor && mid < nlist,
+            "mid-size k should sit between the 25% floor and nlist, got {mid}"
+        );
+        assert_eq!(index.lists_to_open(n), nlist);
+
+        let query = [0.0f32, 0.0];
+        let (_, stats) = index.search(&query, n, Metric::L2);
+        assert_eq!(
+            stats.lists_scanned, nlist,
+            "k covering all members must open every list"
         );
     }
 
@@ -1307,8 +1302,8 @@ mod tests {
         );
 
         for query in [[0.0f32, 0.0], [7.5, 0.0], [15.2, 0.0], [31.0, 0.0]] {
-            let (expected, _) = index.search(&query, 4, 1.0, Metric::L2);
-            let (got, _) = opened.search(&query, 4, 1.0, Metric::L2);
+            let (expected, _) = index.search(&query, 4, Metric::L2);
+            let (got, _) = opened.search(&query, 4, Metric::L2);
             assert_eq!(got.len(), expected.len());
             for (g, e) in got.iter().zip(&expected) {
                 assert_eq!(g.node, e.node);
@@ -1409,149 +1404,5 @@ mod tests {
             data.push(0.0);
         }
         data
-    }
-
-    #[test]
-    fn test_aps_recall_zero_still_scans_p0() {
-        let n_per = 16;
-        let data = two_blobs(n_per);
-        let clusterer = SuperKMeansLevelClusterer::default();
-        let (index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config());
-        let (hits, stats) = index.search(&[0.0f32, 0.0], 4, 0.0, Metric::L2);
-        assert!(
-            stats.lists_scanned >= 1,
-            "recall=0 must still scan P0, got {}",
-            stats.lists_scanned
-        );
-        assert!(!hits.is_empty());
-    }
-
-    #[test]
-    fn test_aps_low_recall_scans_fewer_lists_than_full() {
-        let n_per = 32;
-        let data = two_blobs(n_per);
-        let clusterer = SuperKMeansLevelClusterer::default();
-        let (mut index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config());
-        index.config.nprobe_fraction = 1.0;
-        let query = [0.0f32, 0.0];
-        let (full_hits, full) = index.search(&query, 4, 1.0, Metric::L2);
-        let (low_hits, low) = index.search(&query, 4, 0.8, Metric::L2);
-        assert!(
-            low.lists_scanned <= full.lists_scanned,
-            "APS 0.8 scanned {} lists, full scanned {}",
-            low.lists_scanned,
-            full.lists_scanned
-        );
-        assert!(!low_hits.is_empty());
-        assert!(
-            low_hits[0].sim >= full_hits[0].sim
-                || low_hits.iter().any(|h| h.node == full_hits[0].node),
-            "low-recall top hit should be in or as good as the full-scan nearest"
-        );
-    }
-
-    /// An opened (file-backed) index pins its centroids, so APS runs there
-    /// too: a low recall target scans fewer lists than the full nprobe
-    /// pass, and the two agree on the nearest member.
-    #[test]
-    fn test_opened_index_runs_aps() {
-        let n_per = 32;
-        let data = two_blobs(n_per);
-        let clusterer = SuperKMeansLevelClusterer::default();
-        let (mut index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config());
-        index.config.nprobe_fraction = 1.0;
-
-        let mut slot = Vec::new();
-        index.serialize_router_payload(&mut slot).unwrap();
-        let member_bytes: Vec<u8> = index
-            .vectors
-            .as_slice()
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect();
-        let opened = StackedIvf::<LazyStore>::open(
-            FileSlice::from(slot),
-            FileSlice::from(member_bytes),
-            2,
-            index.config.clone(),
-        )
-        .unwrap();
-        assert!(
-            opened.centroids.centroid_matrix().is_some(),
-            "opened router centroids must be pinned for APS"
-        );
-
-        let query = [0.0f32, 0.0];
-        let (full_hits, full) = opened.search(&query, 4, 1.0, Metric::L2);
-        let (low_hits, low) = opened.search(&query, 4, 0.8, Metric::L2);
-        assert!(
-            low.lists_scanned < full.lists_scanned,
-            "APS 0.8 scanned {} lists, full scanned {}",
-            low.lists_scanned,
-            full.lists_scanned
-        );
-        assert_eq!(low_hits[0].node, full_hits[0].node);
-    }
-
-    #[test]
-    fn test_aps_parent_keeps_high_recall() {
-        let n_per = 32;
-        let data = two_blobs(n_per);
-        let clusterer = SuperKMeansLevelClusterer::default();
-        let (index, _) = build_with_parent(&data, n_per * 2, 2, &clusterer);
-        let query = [0.0f32, 0.0];
-        let (leaf, _) = index.search(&query, 4, 0.9, Metric::L2);
-        let (full, _) = index.search(&query, 4, 1.0, Metric::L2);
-        assert!(!leaf.is_empty());
-        assert_eq!(leaf[0].node, full[0].node);
-    }
-
-    /// Cosine APS depends only on direction: scaling the query or the
-    /// data leaves the scan unchanged, and a low target scans no more than
-    /// the full nprobe.
-    #[test]
-    fn test_aps_cosine_ignores_vector_norms() {
-        let n = 256;
-        let angle = |i: usize| i as f32 * std::f32::consts::TAU / n as f32;
-        let data: Vec<f32> = (0..n)
-            .flat_map(|i| {
-                let norm = 1.0 + (i % 7) as f32;
-                [norm * angle(i).cos(), norm * angle(i).sin()]
-            })
-            .collect();
-        let clusterer = SuperKMeansLevelClusterer::default();
-        let (mut index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n, 2, &clusterer, test_config());
-        index.config.nprobe_fraction = 1.0;
-        let query = [0.3f32.cos(), 0.3f32.sin()];
-        let scaled = [query[0] * 10.0, query[1] * 10.0];
-        let (_, full) = index.search(&query, 8, 1.0, Metric::Cosine);
-        let (unit_hits, unit) = index.search(&query, 8, 0.8, Metric::Cosine);
-        let (scaled_hits, scaled) = index.search(&scaled, 8, 0.8, Metric::Cosine);
-        assert!(unit.lists_scanned <= full.lists_scanned);
-        assert_eq!(unit.lists_scanned, scaled.lists_scanned);
-        let nodes = |hits: &[Candidate<ClusterId>]| hits.iter().map(|h| h.node).collect::<Vec<_>>();
-        assert_eq!(nodes(&unit_hits), nodes(&scaled_hits));
-    }
-
-    /// Dot scores past 1 would clamp the query radius to zero and stop
-    /// APS after the first full heap; Dot scans its full nprobe instead.
-    #[test]
-    fn test_aps_is_off_for_dot() {
-        let n_per = 32;
-        let data = two_blobs(n_per);
-        let clusterer = SuperKMeansLevelClusterer::default();
-        let (mut index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config());
-        index.config.nprobe_fraction = 1.0;
-        let query = [1.0f32, 0.0];
-        let (full_hits, full) = index.search(&query, 4, 1.0, Metric::Dot);
-        let (low_hits, low) = index.search(&query, 4, 0.5, Metric::Dot);
-        assert!(full.lists_scanned > 1);
-        assert_eq!(low.lists_scanned, full.lists_scanned);
-        assert_eq!(low_hits, full_hits);
     }
 }

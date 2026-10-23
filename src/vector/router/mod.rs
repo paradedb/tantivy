@@ -11,7 +11,6 @@ use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::clustering::IvfCentroids;
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::stacked::aps::RecallEstimator;
 use crate::vector::router::stacked::levels::{InMemoryStore, LazyStore, StackedIvf};
 use crate::TantivyError;
 
@@ -118,23 +117,15 @@ impl BuiltRouter {
 /// way regardless.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RoutingParams {
-    /// Clusters the caller expects to probe. The stacked router ranks at
-    /// least this many members when APS is on; with APS off it ranks every
-    /// member of the lists its nprobe fraction selects.
+    /// Clusters the caller expects to probe. The stacked router opens
+    /// enough lists to feed a size-`k` member heap via
+    /// [`StackedIvf::lists_to_open`](crate::vector::router::stacked::levels::StackedIvf::lists_to_open).
     pub(crate) k: usize,
-    /// Stacked-router recall target in `(0, 1]`. `1.0` disables APS and
-    /// routes with the fixed nprobe fractions. APS is also disabled above
-    /// [`APS_MAX_DIM`](crate::vector::router::stacked::aps::APS_MAX_DIM) regardless of this
-    /// value.
-    pub(crate) recall: f32,
 }
 
 impl Default for RoutingParams {
     fn default() -> Self {
-        Self {
-            k: usize::MAX,
-            recall: 1.0,
-        }
+        Self { k: usize::MAX }
     }
 }
 
@@ -204,24 +195,6 @@ impl OpenedRouter {
             Self::Exact(router) => RouterIter::Exact(router.rank(query)),
         }
     }
-
-    /// The APS estimator for the segment's own cluster scan over
-    /// `ranking`, which must not have been pulled yet. Only the stacked
-    /// router supports APS; `None` otherwise, or when APS is off.
-    pub(crate) fn recall_estimator(
-        &self,
-        ranking: &RouterIter,
-        query: &[f32],
-        metric: Metric,
-        recall: f32,
-    ) -> Option<RecallEstimator<'_>> {
-        match (self, ranking) {
-            (Self::Stacked(router), RouterIter::Stacked(ranking)) => {
-                stacked::recall_estimator(router, ranking, query, metric, recall)
-            }
-            _ => None,
-        }
-    }
 }
 
 /// Router-specific statistics captured after a ranking iterator stops.
@@ -236,9 +209,6 @@ pub enum RouterMetrics {
         lists_scanned: usize,
         /// Similarity computations spent routing, summed over every level.
         members_scored: usize,
-        /// Recall target the bottom router level actually used; `1.0`
-        /// means the fixed nprobe path (requested, or forced by dimension).
-        recall_target: f32,
     },
     /// The exact router's work.
     Exact {
@@ -345,33 +315,25 @@ mod tests {
         RouterKind::open(FileSlice::from(bytes), FileSlice::from(rows), &options)
     }
 
-    fn stacked_metrics(metrics: RouterMetrics) -> (usize, usize, usize, f32) {
+    fn stacked_metrics(metrics: RouterMetrics) -> (usize, usize, usize) {
         match metrics {
             RouterMetrics::Stacked {
                 candidate_count,
                 lists_scanned,
                 members_scored,
-                recall_target,
-            } => (
-                candidate_count,
-                lists_scanned,
-                members_scored,
-                recall_target,
-            ),
+            } => (candidate_count, lists_scanned, members_scored),
             other => panic!("expected stacked metrics, got {other:?}"),
         }
     }
 
-    /// Up to `APS_MAX_DIM` the requested recall target is honoured and the
-    /// ranking is bounded by `k`; the metrics report the router's work.
+    /// Ranking is capped at `k`; metrics report the router's list work.
     #[test]
-    fn stacked_ranking_uses_requested_recall_within_dim_cap() -> crate::Result<()> {
+    fn stacked_ranking_honors_k() -> crate::Result<()> {
         let opened = open_stacked(2, 64)?;
         let query = vec![0.0f32; 2];
-        let params = RoutingParams { k: 8, recall: 0.5 };
+        let params = RoutingParams { k: 8 };
         let ranking = opened.rank(&query, Metric::L2, params);
-        let (candidates, lists, scored, recall) = stacked_metrics(ranking.metrics());
-        assert_eq!(recall, 0.5);
+        let (candidates, lists, scored) = stacked_metrics(ranking.metrics());
         assert!(candidates >= 1 && candidates <= 8, "{candidates}");
         assert!(lists >= 1);
         assert!(scored >= candidates);
@@ -379,56 +341,6 @@ mod tests {
         assert_eq!(json["kind"], "stacked");
         assert!(json["lists_scanned"].as_u64().unwrap() >= 1);
         Ok(())
-    }
-
-    /// Above `APS_MAX_DIM` the recall target is forced to `1.0` (fixed
-    /// nprobe list selection), but the returned set is still capped at `k`
-    /// so the caller's probe budget limits `candidate_count`.
-    #[test]
-    fn stacked_ranking_falls_back_to_nprobe_above_dim_cap() -> crate::Result<()> {
-        let dim = crate::vector::router::stacked::aps::APS_MAX_DIM + 1;
-        let opened = open_stacked(dim, 32)?;
-        let query = vec![0.0f32; dim];
-        let params = RoutingParams { k: 2, recall: 0.5 };
-        let ranking = opened.rank(&query, Metric::L2, params);
-        let (candidates, lists, scored, recall) = stacked_metrics(ranking.metrics());
-        assert_eq!(recall, 1.0, "dimension cap must force the nprobe path");
-        assert!(
-            candidates <= 2,
-            "returned set must honor params.k, got {candidates}"
-        );
-        assert!(lists >= 1, "nprobe path must still open parent lists");
-        assert!(
-            scored >= candidates,
-            "all members of selected lists are scored into the k-heap ({scored} < {candidates})"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn effective_recall_guards() {
-        assert_eq!(stacked::effective_recall(2, Metric::L2, 0.9), 0.9);
-        assert_eq!(stacked::effective_recall(2, Metric::Cosine, 0.9), 0.9);
-        assert_eq!(stacked::effective_recall(2, Metric::Dot, 0.9), 1.0);
-        assert_eq!(stacked::effective_recall(2, Metric::L2, 1.0), 1.0);
-        assert_eq!(stacked::effective_recall(2, Metric::L2, 1.5), 1.0);
-        assert_eq!(stacked::effective_recall(2, Metric::L2, f32::NAN), 1.0);
-        assert_eq!(
-            stacked::effective_recall(
-                crate::vector::router::stacked::aps::APS_MAX_DIM,
-                Metric::L2,
-                0.9
-            ),
-            0.9
-        );
-        assert_eq!(
-            stacked::effective_recall(
-                crate::vector::router::stacked::aps::APS_MAX_DIM + 1,
-                Metric::L2,
-                0.9
-            ),
-            1.0
-        );
     }
 
     /// Codes 1 and 2 open as the stacked and exact routers; any other code, the graph router's 0

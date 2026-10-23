@@ -72,9 +72,7 @@ pub(crate) mod tests;
 
 pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
 pub use element::{Accumulator, VectorElement, ENTRY_ALIGN};
-pub use params::{
-    LocatedPath, ProbeParams, Selectivity, DEFAULT_FIXED_PROBE_COST_ROWS, DEFAULT_ROUTER_RECALL,
-};
+pub use params::{LocatedPath, ProbeParams, Selectivity, DEFAULT_FIXED_PROBE_COST_ROWS};
 pub use quantization::{VectorQuantizationConfig, VectorQuantizationLayer};
 pub use router::{RouterKind, RouterMetrics};
 pub use search::source::controller::ProbeTermination;

@@ -190,7 +190,7 @@ pub(crate) struct RouterClusters<'a, T: VectorElement> {
     query: &'a VectorQuery<T>,
     ranked: RouterIter,
     meter: WorkMeter,
-    controller: ProbeController<'a>,
+    controller: ProbeController,
     bounds: BoundStore<'a>,
     tracker: QueryBoundTracker,
     gate: RowGate<'a>,
@@ -223,18 +223,16 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
                 filter.match_fraction(segment.max_doc()),
                 clusters,
             ),
-            recall: params.router_recall_target,
         };
         let _routing = enter_vector_stage(VectorStage::Routing);
         let ranked = index.rank_clusters(query.widened(), routing);
-        let estimator = index.recall_estimator(&ranked, query.widened(), params.recall_target);
         Self {
             index,
             reader,
             query,
             ranked,
             meter: WorkMeter::new(budget),
-            controller: ProbeController::new(clusters, estimator, params.recall_target),
+            controller: ProbeController::new(clusters),
             bounds: index.bounds(),
             tracker: QueryBoundTracker::new(),
             gate: RowGate::new(filter, segment.alive_bitset()),
@@ -300,10 +298,10 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
     }
 
     /// Counts an opened cluster that contributes no rows.
-    fn skip_empty(&mut self, feedback: Feedback) -> crate::Result<()> {
+    fn skip_empty(&mut self, _feedback: Feedback) -> crate::Result<()> {
         self.counters.postings_skipped += 1;
         self.counters.clusters_skipped_empty += 1;
-        self.controller.cover(feedback.kth_estimate)
+        Ok(())
     }
 
     /// Ends the walk and reports what it counted.
@@ -336,11 +334,10 @@ impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
             }
             let cluster = node as usize;
 
-            // A skip charges the open share and covers the cluster. The bound is the pessimistic
-            // k-th, so a skip never drops a true top-k row; APS covers with the point estimate.
+            // A skip charges the open share. The bound is the pessimistic k-th, so a skip
+            // never drops a true top-k row.
             if self.verdict(cluster, sim.score()) == Verdict::Skip {
                 self.meter.open();
-                self.controller.cover(feedback.kth_estimate)?;
                 self.counters.bounds_skips += 1;
                 continue;
             }
@@ -387,6 +384,6 @@ impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
             HeapPeek::from_kth(feedback.kth_lower),
             probe,
         );
-        self.controller.cover(feedback.kth_estimate)
+        Ok(())
     }
 }

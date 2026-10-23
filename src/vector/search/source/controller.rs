@@ -4,10 +4,6 @@
 //! open charges `x` and a scored row `(1 - x) / n_avg`, so an exhaustive, unfiltered, delete-free
 //! scan charges exactly `C`. The budget is checked only between clusters.
 
-use crate::vector::distance::Similarity;
-use crate::vector::router::stacked::aps::RecallEstimator;
-use crate::Score;
-
 /// How the probe loop stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize)]
 pub enum ProbeTermination {
@@ -16,9 +12,6 @@ pub enum ProbeTermination {
     /// The router ran out of clusters before the budget was spent.
     #[default]
     Exhausted,
-    /// The APS recall estimate of the covered clusters reached
-    /// [`ProbeParams::recall_target`](crate::vector::ProbeParams::recall_target).
-    RecallTarget,
 }
 
 // --- Work units ---
@@ -139,32 +132,20 @@ impl WorkMeter {
 
 // --- Controller ---
 
-/// Tracks the APS recall estimate and decides, from the work meter, whether the next ranked
-/// cluster opens.
-pub(in crate::vector) struct ProbeController<'a> {
+/// Decides, from the work meter, whether the next ranked cluster opens.
+pub(in crate::vector) struct ProbeController {
     termination: ProbeTermination,
     /// Clusters in the segment and clusters pulled from the ranking so far.
     clusters: usize,
     pulled: usize,
-    /// APS over the ranked clusters; `None` when APS is off.
-    estimator: Option<RecallEstimator<'a>>,
-    recall_target: f32,
-    recall_estimate: Option<f32>,
 }
 
-impl<'a> ProbeController<'a> {
-    pub(in crate::vector) fn new(
-        clusters: usize,
-        estimator: Option<RecallEstimator<'a>>,
-        recall_target: f32,
-    ) -> Self {
+impl ProbeController {
+    pub(in crate::vector) fn new(clusters: usize) -> Self {
         Self {
             termination: ProbeTermination::Exhausted,
             clusters,
             pulled: 0,
-            estimator,
-            recall_target,
-            recall_estimate: None,
         }
     }
 
@@ -173,30 +154,11 @@ impl<'a> ProbeController<'a> {
     /// Checked after the pull, so a stop proves another cluster existed.
     pub(in crate::vector) fn admit(&mut self, meter: &WorkMeter) -> bool {
         self.pulled += 1;
-        if self
-            .recall_estimate
-            .is_some_and(|estimate| estimate >= self.recall_target)
-        {
-            self.termination = ProbeTermination::RecallTarget;
-            return false;
-        }
         if meter.exhausted() {
             self.termination = ProbeTermination::Ceiling;
             return false;
         }
         true
-    }
-
-    /// Marks the admitted cluster covered: probed, skipped or without survivors.
-    ///
-    /// `kth` is the k-th result score after it, `None` while the heap fills.
-    pub(in crate::vector) fn cover(&mut self, kth: Option<Score>) -> crate::Result<()> {
-        if let Some(estimator) = self.estimator.as_mut() {
-            if let Some(estimate) = estimator.cover_next(kth.map(Similarity::new))? {
-                self.recall_estimate = Some(estimate);
-            }
-        }
-        Ok(())
     }
 
     /// How the probe loop ended and what `meter` charged.
@@ -213,7 +175,6 @@ impl<'a> ProbeController<'a> {
             termination,
             work_charged: meter.charged().to_f32(),
             work_budget: meter.budget().total.to_f32(),
-            recall_estimate: self.recall_estimate,
         }
     }
 }
@@ -226,6 +187,4 @@ pub(crate) struct ProbeOutcome {
     pub(crate) work_charged: f32,
     /// The resolved budget the loop ran against, in work units.
     pub(crate) work_budget: f32,
-    /// The APS recall estimate at the stop; `None` when APS was off or never armed.
-    pub(crate) recall_estimate: Option<f32>,
 }
