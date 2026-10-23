@@ -227,6 +227,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
             top_n,
             capacity,
             exact_plan: self.probe_params.exact_plan,
+            rate_aps: false,
             #[cfg(test)]
             plan_override: self.plan_override,
             #[cfg(test)]

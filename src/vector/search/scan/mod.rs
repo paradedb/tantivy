@@ -6,6 +6,7 @@ pub(crate) mod columns;
 pub(crate) mod estimate;
 mod exact;
 pub(crate) mod heap;
+pub(crate) mod histogram;
 pub(crate) mod layer_read;
 pub(crate) mod plan;
 
@@ -16,6 +17,7 @@ use self::columns::{Columns, QuantizedCandidates};
 use self::estimate::{combine_initial, combine_refine, CombineCtx};
 use self::exact::ExactScorer;
 use self::heap::TieBreakHits;
+use self::histogram::Fold;
 use self::layer_read::{decode_layer, Decoded, LayerRead, LayerSpec};
 #[cfg(test)]
 use self::plan::{forced_plan, PlanOverride};
@@ -45,6 +47,8 @@ pub(crate) struct ScanConfig {
     pub(crate) capacity: usize,
     /// Whether a cluster's rows may be scored exactly before the exact phase.
     pub(crate) exact_plan: bool,
+    /// Whether the scan measures survival scores for the RateAPS.
+    pub(crate) rate_aps: bool,
     #[cfg(test)]
     pub(crate) plan_override: Option<PlanOverride>,
     /// Disables layer-0 admission pruning, which never changes results; equivalence tests flip it.
@@ -237,13 +241,15 @@ impl<'a> QuantizedState<'a> {
 
     /// Scores a cluster's rows on layer 0, read as `read`, and appends the rows whose interval
     /// can still reach the pruning threshold as a candidate block. The threshold only rises, so
-    /// the rows dropped here are rows every later boundary would drop.
+    /// the rows dropped here are rows every later boundary would drop. Every row's survival score
+    /// goes to `fold`, pruned or not.
     fn admit(
         &mut self,
         rows: &ClusterRows<'_>,
         read: LayerRead,
         bound: &mut PruningBound,
         scratch: &mut ReadScratch,
+        fold: Option<Fold<'_>>,
     ) -> crate::Result<()> {
         let centroid = match rows.centroid {
             Some(centroid) => centroid,
@@ -263,6 +269,14 @@ impl<'a> QuantizedState<'a> {
                     &mut self.admission_columns,
                     0..rows.len(),
                 );
+                if let Some(mut fold) = fold {
+                    let columns = &self.admission_columns;
+                    fold.upper_endpoints(
+                        &columns.estimates[..rows.len()],
+                        &columns.sigmas[..rows.len()],
+                        self.candidates.kappa(),
+                    );
+                }
                 self.select_admitted(rows, threshold);
                 let at = self.candidates.push_selected(
                     rows,
@@ -281,6 +295,14 @@ impl<'a> QuantizedState<'a> {
                     &mut self.candidates.columns,
                     at.clone(),
                 );
+                if let Some(mut fold) = fold {
+                    let columns = &self.candidates.columns;
+                    fold.upper_endpoints(
+                        &columns.estimates[at.clone()],
+                        &columns.sigmas[at.clone()],
+                        self.candidates.kappa(),
+                    );
+                }
                 bound.offer(self.candidates.entries(at, self.segment_ord));
             }
         }
@@ -397,6 +419,12 @@ impl<'a> QuantizedState<'a> {
 
 // --- Segment scan ---
 
+/// The admission-rate measurement, armed by the segment plan when the RateAPS is on.
+struct RateApsState {
+    /// Survival scores seen before the fill; they size the grid and nothing else.
+    prefill: Vec<f32>,
+}
+
 /// One segment's IVF scan. A cluster source supplies each cluster's rows; the scan shortlists them
 /// under the segment's quantization, keeps the pruning bound, and scores what is left exactly.
 pub(crate) struct SegmentScan<'a, T, K, C>
@@ -413,6 +441,8 @@ where
     scratch: ReadScratch,
     /// The candidate blocks by cluster id, which is row order; set when the shortlist closes.
     by_cluster: Vec<usize>,
+    /// The admission-rate measurement; `None` unless the RateAPS is on.
+    rate: Option<RateApsState>,
     report: ScanReport,
 }
 
@@ -465,6 +495,9 @@ where
             quantized,
             scratch: ReadScratch::default(),
             by_cluster: Vec::new(),
+            rate: config.rate_aps.then(|| RateApsState {
+                prefill: Vec::new(),
+            }),
             report: ScanReport {
                 layers: vec![LayerReport::default(); layers],
                 ..ScanReport::default()
@@ -529,14 +562,20 @@ where
         debug_assert!(len > 0, "empty clusters never reach the scan");
         #[cfg(test)]
         self.report.trace.scored_rows.extend(rows.global_rows());
-        match self.read_plan(rows, 0)? {
+        let read = self.read_plan(rows, 0)?;
+        let fold = self
+            .rate
+            .as_mut()
+            .map(|rate| Fold::Prefill(&mut rate.prefill));
+        match read {
             Read::Exact => {
                 self.report.exact_rows +=
-                    self.exact.score(rows, &mut self.scratch, &mut self.bound)?;
+                    self.exact
+                        .score(rows, &mut self.scratch, &mut self.bound, fold)?;
             }
             Read::Layer(read) => {
                 if let Some(state) = &mut self.quantized {
-                    state.admit(rows, read, &mut self.bound, &mut self.scratch)?;
+                    state.admit(rows, read, &mut self.bound, &mut self.scratch, fold)?;
                 }
             }
         }
@@ -577,7 +616,7 @@ where
                 Read::Exact => {
                     self.report.exact_rows +=
                         self.exact
-                            .score(&group, &mut self.scratch, &mut self.bound)?;
+                            .score(&group, &mut self.scratch, &mut self.bound, None)?;
                     state.candidates.retire(b);
                 }
                 Read::Layer(read) => state.refine(layer, b, read, &mut self.scratch)?,
