@@ -1,5 +1,6 @@
 //! Storage reads of vector components, charged to the running search stage.
 use std::cell::Cell;
+use std::ops::Range;
 
 use common::{HasLen, OwnedBytes};
 
@@ -49,8 +50,35 @@ pub struct VectorIoStats {
 /// Reads vector bytes and charges the request to the running search stage.
 pub(crate) trait VectorRead {
     fn read_vector_bytes(&self, kind: VectorReadKind) -> std::io::Result<OwnedBytes>;
+    fn read_vector_bytes_batch(
+        &self,
+        ranges: &[Range<usize>],
+        kind: VectorReadKind,
+    ) -> std::io::Result<Vec<OwnedBytes>>;
 }
 impl VectorRead for FileSlice {
+    fn read_vector_bytes_batch(
+        &self,
+        ranges: &[Range<usize>],
+        kind: VectorReadKind,
+    ) -> std::io::Result<Vec<OwnedBytes>> {
+        let _kind = ReadKindGuard(READ_KIND.replace(kind));
+        let bytes = self.read_bytes_batch(ranges)?;
+        for range in ranges {
+            let mut storage_blocks = 0;
+            if !range.is_empty() {
+                if let (Some(first), Some(last)) = (
+                    self.storage_block_ord(range.start),
+                    self.storage_block_ord(range.end - 1),
+                ) {
+                    storage_blocks = (last - first + 1) as u64;
+                }
+            }
+            charge_read(range.len() as u64, storage_blocks);
+        }
+        Ok(bytes)
+    }
+
     fn read_vector_bytes(&self, kind: VectorReadKind) -> std::io::Result<OwnedBytes> {
         let _kind = ReadKindGuard(READ_KIND.replace(kind));
         let bytes = self.read_bytes()?;

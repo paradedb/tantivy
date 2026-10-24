@@ -555,6 +555,7 @@ impl VectorIndexReader {
         let ReadScratch {
             rows,
             runs: read_ranges,
+            byte_ranges,
             blocks: block_scratch,
             chunks,
             ..
@@ -601,15 +602,26 @@ impl VectorIndexReader {
                 read_ranges,
                 block_scratch,
             );
-            // The plan already establishes the block and row origin; reads keep that address.
-            for row_range in read_ranges[range_start..].iter().cloned() {
+            if let [row_range] = &read_ranges[range_start..] {
                 let bytes = column
                     .slice((row_range.start - first) * stride..(row_range.end - first) * stride)
                     .read_vector_bytes(VectorReadKind::FullPrecision)?;
                 chunks.push(VectorRowChunk {
-                    rows: row_range,
+                    rows: row_range.clone(),
                     bytes,
                 });
+            } else {
+                byte_ranges.clear();
+                byte_ranges.extend(
+                    read_ranges[range_start..]
+                        .iter()
+                        .map(|rows| (rows.start - first) * stride..(rows.end - first) * stride),
+                );
+                let bytes =
+                    column.read_vector_bytes_batch(byte_ranges, VectorReadKind::FullPrecision)?;
+                for (rows, bytes) in read_ranges[range_start..].iter().cloned().zip(bytes) {
+                    chunks.push(VectorRowChunk { rows, bytes });
+                }
             }
             selected = &selected[count..];
         }

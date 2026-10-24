@@ -25,6 +25,15 @@ pub trait FileHandle: 'static + Send + Sync + HasLen + fmt::Debug {
     /// This method may panic if the range requested is invalid.
     fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes>;
 
+    /// Reads multiple ranges in request order, allowing backends to overlap I/O.
+    /// Ranges may be empty, overlap, or appear in any order.
+    fn read_bytes_batch(&self, ranges: &[Range<usize>]) -> io::Result<Vec<OwnedBytes>> {
+        ranges
+            .iter()
+            .map(|range| self.read_bytes(range.clone()))
+            .collect()
+    }
+
     #[doc(hidden)]
     async fn read_bytes_async(&self, _byte_range: Range<usize>) -> io::Result<OwnedBytes> {
         Err(io::Error::new(
@@ -262,6 +271,15 @@ impl FileSlice {
         self.data.read_bytes(self.range.clone())
     }
 
+    /// Reads multiple ranges relative to this slice, preserving request order.
+    pub fn read_bytes_batch(&self, ranges: &[Range<usize>]) -> io::Result<Vec<OwnedBytes>> {
+        let ranges: Vec<_> = ranges
+            .iter()
+            .map(|range| combine_ranges(self.range.clone(), range.clone()))
+            .collect();
+        self.data.read_bytes_batch(&ranges)
+    }
+
     #[doc(hidden)]
     pub async fn read_bytes_async(&self) -> io::Result<OwnedBytes> {
         self.data.read_bytes_async(self.range.clone()).await
@@ -394,6 +412,10 @@ impl FileHandle for FileSlice {
         self.read_bytes_slice(range)
     }
 
+    fn read_bytes_batch(&self, ranges: &[Range<usize>]) -> io::Result<Vec<OwnedBytes>> {
+        self.read_bytes_batch(ranges)
+    }
+
     async fn read_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
         self.read_bytes_slice_async(byte_range).await
     }
@@ -497,6 +519,44 @@ mod tests {
         let blop: &'static [u8] = b"abc";
         let owned_bytes: Box<dyn FileHandle> = Box::new(blop);
         assert_eq!(owned_bytes.len(), 3);
+    }
+
+    #[test]
+    fn batch_reads_preserve_order_and_slice_offsets() -> io::Result<()> {
+        let bytes = OwnedBytes::new(&b"abcdefghijkl"[..]);
+        let ranges = [6..9, 0..0, 2..7, 2..7];
+        let batch = bytes.read_bytes_batch(&ranges)?;
+        for (range, actual) in ranges.iter().zip(batch) {
+            assert_eq!(actual.as_ref(), &bytes[range.clone()]);
+        }
+
+        #[derive(Debug)]
+        struct BatchOnly;
+        impl HasLen for BatchOnly {
+            fn len(&self) -> usize {
+                12
+            }
+        }
+        impl FileHandle for BatchOnly {
+            fn read_bytes(&self, _: std::ops::Range<usize>) -> io::Result<OwnedBytes> {
+                panic!("batch dispatch was lost");
+            }
+            fn read_bytes_batch(
+                &self,
+                ranges: &[std::ops::Range<usize>],
+            ) -> io::Result<Vec<OwnedBytes>> {
+                assert_eq!(ranges, &[7..9, 4..4, 5..8]);
+                OwnedBytes::new(&b"abcdefghijkl"[..]).read_bytes_batch(ranges)
+            }
+        }
+        let slice = FileSlice::new(Arc::new(BatchOnly)).slice(2..11);
+        let nested = FileSlice::new(Arc::new(slice)).slice(2..7);
+        let actual = nested.read_bytes_batch(&[3..5, 0..0, 1..4])?;
+        assert_eq!(
+            actual.iter().map(|b| b.as_ref()).collect::<Vec<_>>(),
+            [b"hi".as_slice(), b"", b"fgh"]
+        );
+        Ok(())
     }
 
     struct BlockHandle(&'static [u8]);

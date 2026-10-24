@@ -118,6 +118,7 @@ pub(crate) struct ReadScratch {
     /// Planned row runs, in row order: code runs of a sparse layer read, row runs of an exact
     /// read.
     pub(crate) runs: Vec<Range<usize>>,
+    pub(crate) byte_ranges: Vec<Range<usize>>,
     /// Offsets of the selected rows within one run or band, as the scoring kernels index them.
     pub(crate) offsets: Vec<usize>,
     /// Storage-block runs of an exact read.
