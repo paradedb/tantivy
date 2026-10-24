@@ -316,6 +316,7 @@ fn probing(clusters: usize, located: LocatedPath) -> ProbeParams {
         max_probe_fraction: 1e-6,
         min_probe_clusters: clusters,
         located,
+        recall_target: 1.0,
         ..ProbeParams::default()
     }
 }
@@ -522,6 +523,7 @@ fn peak_on_a_large_segment() -> tantivy::Result<()> {
             max_probe_fraction: 0.25,
             min_probe_clusters: 1,
             located,
+            recall_target: 1.0,
             ..ProbeParams::default()
         };
         let (stats, allocations) = fixture.search(&searcher, filter.as_ref(), &params);

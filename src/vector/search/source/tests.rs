@@ -146,6 +146,7 @@ fn budget_params(max_probe_fraction: f32) -> ProbeParams {
         min_probe_clusters: 1,
         exact_plan: false,
         located: LocatedPath::Off,
+        recall_target: 1.0,
         ..Default::default()
     }
 }

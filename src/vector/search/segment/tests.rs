@@ -654,6 +654,7 @@ fn adaptive_probe_finds_nn_outside_nearest_cluster() -> crate::Result<()> {
     let one_cluster = ProbeParams {
         max_probe_fraction: 0.5,
         min_probe_clusters: 1,
+        recall_target: 1.0,
         ..Default::default()
     };
     let missed = fixture.search(&AllQuery, &query, 1, one_cluster)?;
@@ -685,6 +686,7 @@ fn routes_home_below_ceiling() -> crate::Result<()> {
     let params = ProbeParams {
         max_probe_fraction: 0.1,
         min_probe_clusters: 1,
+        recall_target: 1.0,
         ..Default::default()
     };
     for centroid in centroids.iter().step_by(3) {
@@ -977,6 +979,7 @@ fn every_cluster() -> ProbeParams {
         min_probe_clusters: 4,
         exact_plan: false,
         located: LocatedPath::Off,
+        recall_target: 1.0,
         ..Default::default()
     }
 }
