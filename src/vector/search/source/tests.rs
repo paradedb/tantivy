@@ -7,8 +7,12 @@ use crate::schema::{Metric, VectorDType};
 use crate::vector::diagnostics::VectorStorageFormat;
 use crate::vector::params::{LocatedPath, ProbeParams, DEFAULT_FIXED_PROBE_COST_ROWS};
 use crate::vector::search::cluster_source::{ClusterSource, Feedback};
+use crate::vector::search::scan::rate::{OpeningSource, RateReading};
 use crate::vector::search::segment::plan::Source;
-use crate::vector::search::source::controller::{open_share, ProbeTermination};
+use crate::vector::search::source::controller::{
+    open_share, ProbeController, ProbeOutcome, ProbeTermination, RateAps, WorkBudget, WorkMeter,
+    WorkUnits,
+};
 use crate::vector::search::source::router::{
     DocFilter, GatedRows, RouterClusters, RouterReport, RowGate,
 };
@@ -73,6 +77,7 @@ fn armed(k: usize, kth: f32) -> impl Fn(usize) -> Feedback {
         Feedback {
             kth_lower: kth,
             kth_estimate: kth,
+            rate: None,
         }
     }
 }
@@ -315,6 +320,88 @@ fn probe_termination() -> crate::Result<()> {
     Ok(())
 }
 
+/// Readings as a scan reports them: decayed, steady, and with no opening row above the bar.
+const DECAYED: RateReading = RateReading {
+    opening: 0.5,
+    opening_rows: 10.0,
+    current: 0.01,
+    evidence: 20.0,
+    opening_from: OpeningSource::Own,
+};
+const STEADY: RateReading = RateReading {
+    current: 0.4,
+    ..DECAYED
+};
+const EMPTY: RateReading = RateReading {
+    opening: 0.0,
+    opening_rows: 0.0,
+    current: 0.0,
+    evidence: 0.0,
+    ..DECAYED
+};
+
+/// Feedback of a scan whose opening has closed once a row is in, reading `reading`.
+fn reading(reading: RateReading) -> impl Fn(usize) -> Feedback {
+    move |rows| Feedback {
+        rate: (rows > 0).then_some(reading),
+        ..Feedback::default()
+    }
+}
+
+/// Scripted readings stop the loop on the pull after the reading the RateAPS rejects, as
+/// `RateDecayed` or `OpeningEmpty`; no reading is taken at a target of 1.0.
+#[test]
+fn rate_termination() -> crate::Result<()> {
+    // The controller alone: no stop without a reading, then the verdict on the latest one.
+    let meter = WorkMeter::new(WorkBudget {
+        total: WorkUnits::new(100.0),
+        per_cluster: WorkUnits::new(0.5),
+        per_row: WorkUnits::new(0.01),
+    });
+    let mut controller = ProbeController::new(5, Some(RateAps::from_target(0.9)));
+    assert!(controller.admit(&meter, None));
+    assert!(
+        controller.admit(&meter, None),
+        "no reading before the opening closes"
+    );
+    assert!(controller.admit(&meter, Some(STEADY)));
+    assert!(!controller.admit(&meter, Some(DECAYED)));
+    let outcome = controller.finish(&meter);
+    assert_eq!(outcome.termination, ProbeTermination::RateDecayed);
+    assert_eq!(outcome.rate, Some(DECAYED));
+
+    // Through the router source: each walk admits one cluster, then reads the scripted reading.
+    // Exact: Stacked's 25% top prune cannot hand the probe every list on a 3x3 grid.
+    let fixture = grid(Metric::L2, RouterKind::Exact)?;
+    let probe = |recall_target, feedback| -> crate::Result<(usize, ProbeOutcome)> {
+        let params = ProbeParams {
+            recall_target,
+            ..budget_params(1.0)
+        };
+        let walk = walk_fixture(&fixture, &AllQuery, &[0.0, 0.0], 3, params, feedback)?;
+        Ok((walk.clusters.len(), walk.report.probe))
+    };
+    for (expected, script) in [
+        (ProbeTermination::RateDecayed, DECAYED),
+        (ProbeTermination::OpeningEmpty, EMPTY),
+    ] {
+        let (clusters, outcome) = probe(0.9, reading(script))?;
+        assert_eq!((clusters, outcome.termination), (1, expected));
+        assert_eq!(outcome.rate, Some(script));
+    }
+    let (all, steady) = probe(0.9, reading(STEADY))?;
+    assert!(all > 1);
+    assert_eq!(steady.termination, ProbeTermination::Exhausted);
+    assert_eq!(steady.rate, Some(STEADY));
+    let (clusters, off) = probe(1.0, reading(DECAYED))?;
+    assert_eq!(
+        (clusters, off.termination),
+        (all, ProbeTermination::Exhausted)
+    );
+    assert_eq!(off.rate, None);
+    Ok(())
+}
+
 // --- Bounds gate ---
 
 /// A random 2-d point away from the origin, so cosine's normalization stays well-conditioned.
@@ -389,6 +476,7 @@ fn gate_never_skips_a_true_member() -> crate::Result<()> {
             Feedback {
                 kth_lower: Some(kth),
                 kth_estimate: Some(kth),
+                rate: None,
             }
         })?;
         let cluster_docs = fixture.cluster_docs(0)?;

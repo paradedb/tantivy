@@ -274,6 +274,21 @@ pub struct ProbeStats {
     pub work_charged: f32,
     /// The work budget the probe loop ran against, in work units; 0 when no loop ran.
     pub work_budget: f32,
+    /// Segments whose probe loop stopped as the admission rate decayed: 0 or 1, absent at 0.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub rate_stops: u32,
+    /// Segments whose probe loop stopped as no opening row reached the pruning threshold: 0 or 1,
+    /// absent at 0.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub opening_empty_stops: u32,
+    /// The RateAPS's last reading: the opening share, the current share and the evidence; absent
+    /// without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_opening: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_current: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_evidence: Option<f32>,
     /// Exact scores of this segment's results offered to the query's shared bound.
     pub shared_bound_offers: usize,
     /// Offers that moved the shared bound's k-th.
@@ -284,6 +299,10 @@ pub struct ProbeStats {
     /// IVF clusters in the segment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segment_clusters: Option<usize>,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 // --- Segment report ---
@@ -403,6 +422,13 @@ impl ProbeStats {
         self.termination = probe.termination;
         self.work_charged = probe.work_charged;
         self.work_budget = probe.work_budget;
+        self.rate_stops = u32::from(probe.termination == ProbeTermination::RateDecayed);
+        self.opening_empty_stops = u32::from(probe.termination == ProbeTermination::OpeningEmpty);
+        if let Some(reading) = probe.rate {
+            self.rate_opening = Some(reading.opening);
+            self.rate_current = Some(reading.current);
+            self.rate_evidence = Some(reading.evidence);
+        }
     }
 
     fn record_matches(&mut self, report: MatchReport) {
@@ -486,6 +512,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    use crate::vector::search::scan::rate::{OpeningSource, RateReading};
     use crate::vector::search::scan::LayerReport;
     use crate::vector::search::source::controller::ProbeOutcome;
     use crate::vector::search::source::router::RouterCounters;
@@ -625,5 +652,67 @@ mod tests {
             StageTotals::default(),
         );
         assert_eq!(keys(&empty), expected(&[], 0));
+    }
+
+    /// A routed loop under the RateAPS reports its stop and its last reading; a stop of the other
+    /// kind reports only its own counter.
+    #[test]
+    fn rate_stats_keys() {
+        let reading = RateReading {
+            opening: 0.5,
+            opening_rows: 4.0,
+            current: 0.05,
+            evidence: 6.0,
+            opening_from: OpeningSource::Own,
+        };
+        let rated = |termination| {
+            let source = SourceReport::Router(RouterReport {
+                counters: RouterCounters::default(),
+                routing: RouterMetrics::Exact { visited_count: 7 },
+                probe: ProbeOutcome {
+                    termination,
+                    rate: Some(reading),
+                    ..ProbeOutcome::default()
+                },
+            });
+            let report = SegmentReport::Ivf {
+                plan: PlanReport {
+                    segment_rows: 100,
+                    segment_clusters: 5,
+                    located_cap: 0,
+                },
+                source,
+                scan: Box::new(ScanReport::default()),
+            };
+            ProbeStats::new(report, StageTotals::default())
+        };
+        let common = [
+            "segment_rows",
+            "segment_clusters",
+            "exact_scan_ns",
+            "rate_opening",
+            "rate_current",
+            "rate_evidence",
+        ];
+        let decayed = rated(ProbeTermination::RateDecayed);
+        assert_eq!(
+            keys(&decayed),
+            expected(&[&common[..], &["rate_stops"]].concat(), 0)
+        );
+        assert_eq!(decayed.rate_stops, 1);
+        assert_eq!(
+            (
+                decayed.rate_opening,
+                decayed.rate_current,
+                decayed.rate_evidence
+            ),
+            (Some(0.5), Some(0.05), Some(6.0))
+        );
+        let empty = rated(ProbeTermination::OpeningEmpty);
+        assert_eq!(
+            keys(&empty),
+            expected(&[&common[..], &["opening_empty_stops"]].concat(), 0)
+        );
+        assert_eq!((empty.rate_stops, empty.opening_empty_stops), (0, 1));
     }
 }

@@ -4,6 +4,7 @@
 use std::ops::Range;
 
 use crate::vector::distance::Similarity;
+use crate::vector::search::scan::rate::RateReading;
 use crate::DocId;
 
 /// One cluster's selected rows, with what is already known about them.
@@ -51,6 +52,9 @@ pub(crate) struct Feedback {
     pub(crate) kth_lower: Option<f32>,
     /// The APS cover threshold: never above the k-th best estimate, so it never prunes.
     pub(crate) kth_estimate: Option<f32>,
+    /// The admission rate under the pruning threshold; `None` with the RateAPS off or before the
+    /// opening exists.
+    pub(crate) rate: Option<RateReading>,
 }
 
 /// Supplies a segment scan's clusters in its own order and decides when to stop.

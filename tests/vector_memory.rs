@@ -415,6 +415,51 @@ fn allocations_do_not_grow_with_clusters_probed() -> tantivy::Result<()> {
     Ok(())
 }
 
+/// The RateAPS allocates its histograms and the scores before its fill once per scan, and nothing
+/// per cluster: what it adds to a search is the same whatever the clusters probed.
+#[test]
+fn rate_aps_allocates_per_scan() -> tantivy::Result<()> {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixture = Fixture::build(Shape {
+        dim: 64,
+        clusters: 128,
+        docs_per_segment: 128 * 64,
+        segments: 1,
+        deleted: |_| false,
+    })?;
+    let searcher = fixture.index.reader()?.searcher();
+    let mut added = Vec::new();
+    for probe in [16, 32, 64] {
+        let off = probing(probe, LocatedPath::Off);
+        // f = 1/256: the rate is read after every cluster and the ceiling still binds first.
+        let armed = ProbeParams {
+            recall_target: 0.999,
+            ..off.clone()
+        };
+        let (off_stats, off_allocations) = fixture.search(&searcher, &AllQuery, &off);
+        let (armed_stats, armed_allocations) = fixture.search(&searcher, &AllQuery, &armed);
+        let (off_stats, armed_stats) = (&off_stats[0], &armed_stats[0]);
+        assert!(armed_stats.rate_current.is_some(), "the opening closed");
+        assert_eq!(armed_stats.termination, off_stats.termination);
+        assert_eq!(armed_stats.clusters_probed(), off_stats.clusters_probed());
+        let calls = armed_allocations.calls - off_allocations.calls;
+        let bytes = armed_allocations.bytes - off_allocations.bytes;
+        println!(
+            "vector_memory: RateAPS at {} clusters: {calls} more calls, {bytes} more bytes",
+            armed_stats.clusters_probed()
+        );
+        added.push((calls, bytes));
+    }
+    assert!(
+        added.windows(2).all(|pair| pair[0] == pair[1]),
+        "the RateAPS's allocations grow with clusters probed: {added:?}"
+    );
+    assert!(added[0].0 >= 3, "three histograms: {added:?}");
+    Ok(())
+}
+
 /// Allocation calls and bytes of one segment's search, from an index of four same-shape
 /// segments against one of them alone. Reported only.
 #[test]

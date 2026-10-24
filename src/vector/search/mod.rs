@@ -227,7 +227,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
             top_n,
             capacity,
             exact_plan: self.probe_params.exact_plan,
-            rate_aps: false,
+            rate_aps: matches!(source, Source::Router(_)) && self.probe_params.rate_aps().is_some(),
             #[cfg(test)]
             plan_override: self.plan_override,
             #[cfg(test)]

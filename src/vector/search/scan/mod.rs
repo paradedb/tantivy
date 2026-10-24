@@ -9,6 +9,7 @@ pub(crate) mod heap;
 pub(crate) mod histogram;
 pub(crate) mod layer_read;
 pub(crate) mod plan;
+pub(crate) mod rate;
 
 use std::ops::Range;
 
@@ -22,6 +23,7 @@ use self::layer_read::{decode_layer, Decoded, LayerRead, LayerSpec};
 #[cfg(test)]
 use self::plan::{forced_plan, PlanOverride};
 use self::plan::{price, Read, ReadCosts};
+use self::rate::AdmissionHistograms;
 use crate::collector::sort_key::Comparator;
 use crate::collector::SegmentSortKeyComputer;
 use crate::error::DataCorruption;
@@ -127,6 +129,8 @@ pub(crate) struct ScanTrace {
     pub(crate) exact_phase_rows: Vec<usize>,
     /// Every exact score the scan computed, in order.
     pub(crate) exact_scores: Vec<f32>,
+    /// `(rows scored, survival scores folded)` per shortlisted cluster, with the RateAPS on.
+    pub(crate) rate_folds: Vec<(usize, usize)>,
 }
 
 // --- Quantized state ---
@@ -423,6 +427,7 @@ impl<'a> QuantizedState<'a> {
 struct RateApsState {
     /// Survival scores seen before the fill; they size the grid and nothing else.
     prefill: Vec<f32>,
+    histograms: Option<AdmissionHistograms>,
 }
 
 /// One segment's IVF scan. A cluster source supplies each cluster's rows; the scan shortlists them
@@ -497,6 +502,7 @@ where
             by_cluster: Vec::new(),
             rate: config.rate_aps.then(|| RateApsState {
                 prefill: Vec::new(),
+                histograms: None,
             }),
             report: ScanReport {
                 layers: vec![LayerReport::default(); layers],
@@ -529,11 +535,18 @@ where
         }
     }
 
-    /// The shared prune floor when set. The router reads `kth_lower`.
+    /// The pruning thresholds as of the last shortlisted cluster, and the admission rate under
+    /// the pruning threshold once its opening exists.
     fn feedback(&self) -> Feedback {
         Feedback {
             kth_lower: self.bound.shared_threshold(),
             kth_estimate: None,
+            rate: self
+                .rate
+                .as_ref()
+                .and_then(|rate| rate.histograms.as_ref())
+                .zip(self.bound.shared_threshold())
+                .and_then(|(histograms, bar)| histograms.reading(bar)),
         }
     }
 
@@ -563,10 +576,13 @@ where
         #[cfg(test)]
         self.report.trace.scored_rows.extend(rows.global_rows());
         let read = self.read_plan(rows, 0)?;
-        let fold = self
-            .rate
-            .as_mut()
-            .map(|rate| Fold::Prefill(&mut rate.prefill));
+        let fold = self.rate.as_mut().map(|rate| match &mut rate.histograms {
+            None => Fold::Prefill(&mut rate.prefill),
+            Some(histograms) => {
+                let grid = histograms.grid();
+                Fold::Binned(histograms.cluster_mut(), grid)
+            }
+        });
         match read {
             Read::Exact => {
                 self.report.exact_rows +=
@@ -580,7 +596,41 @@ where
             }
         }
         self.report.candidates_scored += len;
+        self.close_rate_cluster(len);
         Ok(len)
+    }
+
+    /// Ends the admission-rate measurement's cluster of `len` rows: at the fill, the cluster
+    /// after which the segment's own k-th first exists, the grid is set from the pruning
+    /// threshold and every survival score so far.
+    fn close_rate_cluster(&mut self, len: usize) {
+        let Some(rate) = &mut self.rate else {
+            return;
+        };
+        #[cfg(test)]
+        {
+            let folded = match &mut rate.histograms {
+                Some(histograms) => histograms.cluster_mut().rows() as usize,
+                None => {
+                    let before: usize = self.report.trace.rate_folds.iter().map(|f| f.1).sum();
+                    rate.prefill.len() - before
+                }
+            };
+            self.report.trace.rate_folds.push((len, folded));
+        }
+        match &mut rate.histograms {
+            Some(histograms) => histograms.finish_cluster(len),
+            None if self.bound.kth_lower().is_some() => {
+                let bar = self
+                    .bound
+                    .shared_threshold()
+                    .expect("the pruning threshold exists once the own k-th does");
+                let w0 = self.report.candidates_scored;
+                rate.histograms = Some(AdmissionHistograms::at_fill(bar, &rate.prefill, w0));
+                rate.prefill = Vec::new();
+            }
+            None => {}
+        }
     }
 
     /// How the rows of `selected` are read at `layer`: exactly at full precision, otherwise as the

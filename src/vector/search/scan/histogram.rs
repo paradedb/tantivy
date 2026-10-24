@@ -1,7 +1,6 @@
 //! Survival scores binned on a fixed per-segment grid. A row's survival score is the highest
 //! pruning threshold under which it still counts: `estimate + κσ` for a quantized row, the
 //! score itself for an exactly read row.
-#![cfg_attr(not(test), allow(dead_code))]
 
 /// A uniform grid over score space, fixed once per segment at the fill.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -54,16 +53,6 @@ impl ScoreGrid {
         }
     }
 
-    /// The lower edge of the first bin.
-    pub(crate) fn lo(&self) -> f32 {
-        self.lo
-    }
-
-    /// The width of one bin.
-    pub(crate) fn width(&self) -> f32 {
-        1.0 / self.inv_width
-    }
-
     /// The bucket `score` falls in.
     #[inline]
     fn bucket(&self, score: f32) -> Bucket {
@@ -104,6 +93,7 @@ impl ScoreHistogram {
         self.rows = 0.0;
     }
 
+    #[cfg(test)]
     pub(crate) fn add(&mut self, grid: ScoreGrid, scores: &[f32]) {
         for &score in scores {
             self.add_score(grid, score);
@@ -210,6 +200,10 @@ mod tests {
     use super::*;
     use crate::vector::search::interval::Estimate;
 
+    fn width_of(grid: ScoreGrid) -> f64 {
+        f64::from(1.0 / grid.inv_width)
+    }
+
     fn total(histogram: &ScoreHistogram) -> f32 {
         histogram.bins.iter().sum::<f32>() + histogram.below + histogram.above
     }
@@ -222,22 +216,22 @@ mod tests {
         let grid = ScoreGrid::at_fill(0.5, &scores);
         let sigma = 0.05f64.sqrt();
         let width = (0.8 + 4.0 * sigma - 0.5) / 255.0;
-        assert!((f64::from(grid.width()) - width).abs() < 1e-6);
-        assert!((f64::from(grid.lo()) - (0.5 - width)).abs() < 1e-6);
+        assert!((width_of(grid) - width).abs() < 1e-6);
+        assert!((f64::from(grid.lo) - (0.5 - width)).abs() < 1e-6);
         assert_eq!(grid.bucket(0.5 + 1e-6), Bucket::Bin(1));
-        let hi = grid.lo() + ScoreGrid::BINS as f32 * grid.width();
-        assert!((f64::from(hi) - (0.8 + 4.0 * sigma)).abs() < 1e-5);
+        let hi = f64::from(grid.lo) + ScoreGrid::BINS as f64 * width_of(grid);
+        assert!((hi - (0.8 + 4.0 * sigma)).abs() < 1e-5);
 
         // A bar above every score keeps the grid on the bar.
         let grid = ScoreGrid::at_fill(2.0, &scores);
-        assert!((f64::from(grid.lo()) - (2.0 - 4.0 * sigma / 255.0)).abs() < 1e-6);
+        assert!((f64::from(grid.lo) - (2.0 - 4.0 * sigma / 255.0)).abs() < 1e-6);
 
         // No spread: 1e-6 · max(1, |bar|).
         let grid = ScoreGrid::at_fill(-3.0, &[-3.0, -3.0]);
         let width = 4.0 * 3e-6 / 255.0;
-        assert!((f64::from(grid.width()) - width).abs() < 1e-9);
+        assert!((width_of(grid) - width).abs() < 1e-9);
         let grid = ScoreGrid::at_fill(0.1, &[]);
-        assert!((f64::from(grid.width()) - 4e-6 / 255.0).abs() < 1e-10);
+        assert!((width_of(grid) - 4e-6 / 255.0).abs() < 1e-10);
     }
 
     /// Scores at `lo`, on an inner edge and at `hi` land in the first bin, the bin above the edge

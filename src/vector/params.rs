@@ -1,6 +1,6 @@
-//! Query-time probe parameters: the work budget and the located path.
+//! Query-time probe parameters: the work budget, the RateAPS target and the located path.
 
-use crate::vector::search::source::controller::open_share;
+use crate::vector::search::source::controller::{open_share, RateAps};
 
 /// Default [`ProbeParams::fixed_probe_cost_rows`]: the cost of opening a cluster, in rows of full
 /// work, fitted on the reference fixture.
@@ -21,6 +21,12 @@ pub struct ProbeParams {
     pub max_probe_fraction: f32,
     /// Floor on the resolved budget, in work units, applied before the capacity cap. Default 16.
     pub min_probe_clusters: usize,
+    /// Target of the RateAPS, the adaptive stop of a routed segment scan, in `(0, 1]`. Below `1.0`
+    /// a scan stops once the rate of rows that can still enter the top k, read under the pruning
+    /// threshold, has decayed to `1 - recall_target` of its opening level, clamped to
+    /// `[1/256, 1/2]`; `max_probe_fraction` is then the ceiling and still sizes the ranking. `1.0`
+    /// leaves the budget as the only bound. Default `1.0`.
+    pub recall_target: f32,
     /// Lets a quantized segment score a cluster's rows exactly before the exact phase when that
     /// reads strictly fewer storage blocks (bytes without block geometry) than the cheaper
     /// quantized read. Exact rows join the pruning bound as zero-width intervals. Default `true`.
@@ -70,6 +76,7 @@ impl Default for ProbeParams {
         Self {
             max_probe_fraction: 0.01,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
+            recall_target: 1.0,
             exact_plan: true,
             located: LocatedPath::Auto,
             fixed_probe_cost_rows: DEFAULT_FIXED_PROBE_COST_ROWS,
@@ -80,6 +87,11 @@ impl Default for ProbeParams {
 pub(crate) const MIN_PROBE_CLUSTERS: usize = 16;
 
 impl ProbeParams {
+    /// The RateAPS `recall_target` arms; `None` at `1.0`, where the budget is the only bound.
+    pub(crate) fn rate_aps(&self) -> Option<RateAps> {
+        (self.recall_target < 1.0).then(|| RateAps::from_target(self.recall_target))
+    }
+
     /// The number of clusters the stacked router is asked to rank for a
     /// segment whose resolved work budget is `budget` units.
     ///
