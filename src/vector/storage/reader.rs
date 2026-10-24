@@ -546,6 +546,92 @@ impl VectorIndexReader {
         self.rows_slice.read_column(0, row..row + 1)
     }
 
+    pub(crate) fn supports_streaming_reads(&self) -> bool {
+        self.rows_slice.entry.supports_streaming_reads()
+    }
+
+    pub(crate) fn visit_vector_rows_planned(
+        &self,
+        scratch: &mut ReadScratch,
+        mut visitor: impl FnMut(usize, &[u8]) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        let ReadScratch {
+            rows,
+            runs,
+            byte_ranges,
+            blocks,
+            ..
+        } = scratch;
+        if rows.windows(2).any(|pair| pair[0] >= pair[1])
+            || rows
+                .last()
+                .is_some_and(|row| row >= self.rows_slice.block_rows.last().unwrap())
+        {
+            return Err(TantivyError::InvalidArgument(
+                "invalid planned vector rows".into(),
+            ));
+        }
+        runs.clear();
+        byte_ranges.clear();
+        let stride = self.options.bytes_per_vector();
+        let mut selected = rows.as_slice();
+        while let Some(&row) = selected.first() {
+            let b = self.rows_slice.block_of(row);
+            let first = self.rows_slice.block_rows[b];
+            let end = self.rows_slice.block_rows[b + 1];
+            let count = selected.partition_point(|&r| r < end);
+            let column = self.rows_slice.column(b, 0)?;
+            let start = runs.len();
+            QuantizedLayerReader::plan_slot_reads(
+                &column,
+                stride,
+                first,
+                first..end,
+                &selected[..count],
+                runs,
+                blocks,
+            );
+            let base = self.rows_slice.block_start(b)
+                + crate::vector::storage::blocks::column_range(
+                    &self.rows_slice.slots,
+                    end - first,
+                    0,
+                )
+                .start;
+            byte_ranges.extend(
+                runs[start..]
+                    .iter()
+                    .map(|r| base + (r.start - first) * stride..base + (r.end - first) * stride),
+            );
+            selected = &selected[count..];
+        }
+        let mut selected = rows.iter().copied().peekable();
+        let mut visitor_error = None;
+        let result = self.rows_slice.entry.visit_vector_bytes(
+            byte_ranges,
+            VectorReadKind::FullPrecision,
+            &mut |i, bytes| {
+                while let Some(&row) = selected.peek() {
+                    if row >= runs[i].end {
+                        break;
+                    }
+                    let start = (row - runs[i].start) * stride;
+                    if let Err(error) = visitor(row, &bytes[start..start + stride]) {
+                        visitor_error = Some(error);
+                        return Err(std::io::Error::other("vector visitor failed"));
+                    }
+                    selected.next();
+                }
+                Ok(())
+            },
+        );
+        if let Some(error) = visitor_error {
+            return Err(error);
+        }
+        result?;
+        Ok(())
+    }
+
     /// Fetches the increasing vector rows in `scratch.rows` through a storage-aware range plan. The
     /// batch borrows its rows and the read chunks from `scratch`.
     pub(crate) fn read_vector_rows_planned<'s>(
@@ -555,7 +641,6 @@ impl VectorIndexReader {
         let ReadScratch {
             rows,
             runs: read_ranges,
-            byte_ranges,
             blocks: block_scratch,
             chunks,
             ..
@@ -602,26 +687,15 @@ impl VectorIndexReader {
                 read_ranges,
                 block_scratch,
             );
-            if let [row_range] = &read_ranges[range_start..] {
+            // The plan already establishes the block and row origin; reads keep that address.
+            for row_range in read_ranges[range_start..].iter().cloned() {
                 let bytes = column
                     .slice((row_range.start - first) * stride..(row_range.end - first) * stride)
                     .read_vector_bytes(VectorReadKind::FullPrecision)?;
                 chunks.push(VectorRowChunk {
-                    rows: row_range.clone(),
+                    rows: row_range,
                     bytes,
                 });
-            } else {
-                byte_ranges.clear();
-                byte_ranges.extend(
-                    read_ranges[range_start..]
-                        .iter()
-                        .map(|rows| (rows.start - first) * stride..(rows.end - first) * stride),
-                );
-                let bytes =
-                    column.read_vector_bytes_batch(byte_ranges, VectorReadKind::FullPrecision)?;
-                for (rows, bytes) in read_ranges[range_start..].iter().cloned().zip(bytes) {
-                    chunks.push(VectorRowChunk { rows, bytes });
-                }
             }
             selected = &selected[count..];
         }

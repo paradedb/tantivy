@@ -33,8 +33,7 @@ impl IvfClusterer for FixedClusters {
         let mut assignments = Vec::with_capacity(num_rows);
         for_each_batch(source, num_rows, |IvfTrainingVectors::F32(batch)| {
             for row in batch.matrix.values.chunks_exact(DIM) {
-                assignments
-                    .push((0..4).max_by(|&a, &b| row[a].total_cmp(&row[b])).unwrap() as u32);
+                assignments.push((0..4).max_by(|&a, &b| row[a].total_cmp(&row[b])).unwrap() as u32);
             }
         })?;
         Ok(assignments)
@@ -183,6 +182,41 @@ fn vector_read_kinds_follow_data_for_dense_and_sparse_access() -> crate::Result<
             VectorReadKind::FullPrecision,
         ]
     );
+    assert_eq!(current_vector_read_kind(), VectorReadKind::Other);
+    Ok(())
+}
+
+#[test]
+fn streamed_vector_rows_match_planned_reads_across_clusters() -> crate::Result<()> {
+    use crate::vector::{current_vector_read_kind, VectorReadKind};
+    let (index, _) = fixture_with_deletes(Metric::Cosine, &[1, 1], false)?;
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let vectors =
+        searcher.segment_readers()[0].vector_index(index.schema().get_field("embedding")?)?;
+    let mut scratch = crate::vector::storage::quantized::ReadScratch::default();
+    for cluster in 0..vectors.index().unwrap().num_clusters() {
+        let rows = vectors.index().unwrap().cluster_range(cluster);
+        scratch.rows.extend(rows.step_by(3));
+    }
+    let expected: Vec<_> = vectors
+        .read_vector_rows_planned(&mut scratch)?
+        .iter()
+        .map(|(row, bytes)| (row, bytes.to_vec()))
+        .collect();
+    let mut actual = Vec::new();
+    vectors.visit_vector_rows_planned(&mut scratch, |row, bytes| {
+        assert_eq!(current_vector_read_kind(), VectorReadKind::Other);
+        actual.push((row, bytes.to_vec()));
+        Ok(())
+    })?;
+    assert_eq!(actual, expected);
+    let error = vectors
+        .visit_vector_rows_planned(&mut scratch, |_, _| {
+            Err(crate::TantivyError::InvalidArgument("stop".into()))
+        })
+        .unwrap_err();
+    assert!(matches!(error, crate::TantivyError::InvalidArgument(_)));
     assert_eq!(current_vector_read_kind(), VectorReadKind::Other);
     Ok(())
 }
@@ -490,7 +524,8 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
         return Ok(());
     }
     let query = input_vector(42);
-    let exact_query = crate::vector::search::prepared::VectorQuery::new(metric, Arc::new(query.clone()));
+    let exact_query =
+        crate::vector::search::prepared::VectorQuery::new(metric, Arc::new(query.clone()));
     let prepared = QuantizedQueryCtx::new(Arc::clone(ctx), &exact_query);
     for clusters in [vec![0, 1, 2, 3], vec![0, 1, 3]] {
         for filtered in [false, true] {
@@ -669,11 +704,6 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
     Ok(())
 }
 
-
-
-
-
-
 #[test]
 fn diagnostic_schedules_ignore_rotation_seeds() -> crate::Result<()> {
     use crate::vector::diagnostics::{VectorEstimatorQuery, VectorEstimatorSource};
@@ -845,4 +875,44 @@ fn doc_column_ranges(
     }
     directory.reads.lock().unwrap().clear();
     Ok(ranges)
+}
+
+#[test]
+fn streamed_shortlist_preserves_results_and_scoring_order() -> crate::Result<()> {
+    let (index, directory) = fixture(Metric::Cosine, &[1, 1])?;
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let field = index.schema().get_field("embedding")?;
+    let label = index.schema().get_field("label")?;
+    let filter = TermQuery::new(
+        Term::from_field_text(label, "keep"),
+        IndexRecordOption::Basic,
+    );
+    for query in [input_vector(0), input_vector(42), input_vector(101)] {
+        for filtered in [false, true] {
+            let query_filter: &dyn Query = if filtered { &filter } else { &AllQuery };
+            let collector = TopDocsByVectorSimilarity::new(field, query.clone(), 10)
+                .with_probe_params(ProbeParams {
+                    max_probe_fraction: 1.0,
+                    min_probe_clusters: 4,
+                    exact_plan: false,
+                    located: LocatedPath::Off,
+                    ..Default::default()
+                });
+            directory
+                .streaming
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            let expected = searcher.search(query_filter, &collector)?;
+            directory
+                .streaming
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let actual = searcher.search(query_filter, &collector)?;
+            assert_eq!(actual.results, expected.results);
+            assert_eq!(
+                actual.stats[0].quantized_trace.exact_phase_rows,
+                expected.stats[0].quantized_trace.exact_phase_rows
+            );
+        }
+    }
+    Ok(())
 }

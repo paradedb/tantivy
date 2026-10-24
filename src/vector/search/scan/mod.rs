@@ -534,6 +534,16 @@ where
         let Some(state) = &self.quantized else {
             return Ok(());
         };
+        if self.exact.reader.supports_streaming_reads() {
+            let groups: Vec<_> = self
+                .by_cluster
+                .iter()
+                .map(|&b| state.candidates.rows(b))
+                .filter(|group| group.len() > 0)
+                .collect();
+            self.report.exact_rows += self.exact.score_stream(&groups, &mut self.scratch)?;
+            return Ok(());
+        }
         for &b in &self.by_cluster {
             let group = state.candidates.rows(b);
             if group.len() > 0 {

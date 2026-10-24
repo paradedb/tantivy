@@ -34,6 +34,23 @@ pub trait FileHandle: 'static + Send + Sync + HasLen + fmt::Debug {
             .collect()
     }
 
+    /// Whether the backend can stream planned ranges with read-ahead.
+    fn supports_streaming_reads(&self) -> bool {
+        false
+    }
+
+    /// Visits ranges in request order, allowing scoring between reads. Stops on visitor error.
+    fn visit_bytes(
+        &self,
+        ranges: &[Range<usize>],
+        visitor: &mut dyn FnMut(usize, OwnedBytes) -> io::Result<()>,
+    ) -> io::Result<()> {
+        for (i, range) in ranges.iter().enumerate() {
+            visitor(i, self.read_bytes(range.clone())?)?;
+        }
+        Ok(())
+    }
+
     #[doc(hidden)]
     async fn read_bytes_async(&self, _byte_range: Range<usize>) -> io::Result<OwnedBytes> {
         Err(io::Error::new(
@@ -271,6 +288,24 @@ impl FileSlice {
         self.data.read_bytes(self.range.clone())
     }
 
+    /// Whether the underlying backend supports streaming planned reads.
+    pub fn supports_streaming_reads(&self) -> bool {
+        self.data.supports_streaming_reads()
+    }
+
+    /// Visits ranges relative to this slice in request order.
+    pub fn visit_bytes(
+        &self,
+        ranges: &[Range<usize>],
+        visitor: &mut dyn FnMut(usize, OwnedBytes) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let ranges: Vec<_> = ranges
+            .iter()
+            .map(|range| combine_ranges(self.range.clone(), range.clone()))
+            .collect();
+        self.data.visit_bytes(&ranges, visitor)
+    }
+
     /// Reads multiple ranges relative to this slice, preserving request order.
     pub fn read_bytes_batch(&self, ranges: &[Range<usize>]) -> io::Result<Vec<OwnedBytes>> {
         let ranges: Vec<_> = ranges
@@ -408,6 +443,18 @@ impl FileSlice {
 
 #[async_trait]
 impl FileHandle for FileSlice {
+    fn supports_streaming_reads(&self) -> bool {
+        self.supports_streaming_reads()
+    }
+
+    fn visit_bytes(
+        &self,
+        ranges: &[Range<usize>],
+        visitor: &mut dyn FnMut(usize, OwnedBytes) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.visit_bytes(ranges, visitor)
+    }
+
     fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
         self.read_bytes_slice(range)
     }
@@ -556,6 +603,24 @@ mod tests {
             actual.iter().map(|b| b.as_ref()).collect::<Vec<_>>(),
             [b"hi".as_slice(), b"", b"fgh"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_reads_preserve_offsets_and_stop_on_error() -> io::Result<()> {
+        let slice = FileSlice::from(&b"abcdefghijkl"[..])
+            .slice(2..11)
+            .slice(2..7);
+        let mut actual = Vec::new();
+        let result = slice.visit_bytes(&[3..5, 0..0, 1..4], &mut |i, bytes| {
+            actual.push((i, bytes.to_vec()));
+            if i == 1 {
+                return Err(io::Error::other("stop"));
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(actual, [(0, b"hi".to_vec()), (1, Vec::new())]);
         Ok(())
     }
 

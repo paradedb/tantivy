@@ -50,33 +50,35 @@ pub struct VectorIoStats {
 /// Reads vector bytes and charges the request to the running search stage.
 pub(crate) trait VectorRead {
     fn read_vector_bytes(&self, kind: VectorReadKind) -> std::io::Result<OwnedBytes>;
-    fn read_vector_bytes_batch(
+    fn visit_vector_bytes(
         &self,
         ranges: &[Range<usize>],
         kind: VectorReadKind,
-    ) -> std::io::Result<Vec<OwnedBytes>>;
+        visitor: &mut dyn FnMut(usize, OwnedBytes) -> std::io::Result<()>,
+    ) -> std::io::Result<()>;
 }
 impl VectorRead for FileSlice {
-    fn read_vector_bytes_batch(
+    fn visit_vector_bytes(
         &self,
         ranges: &[Range<usize>],
         kind: VectorReadKind,
-    ) -> std::io::Result<Vec<OwnedBytes>> {
-        let _kind = ReadKindGuard(READ_KIND.replace(kind));
-        let bytes = self.read_bytes_batch(ranges)?;
-        for range in ranges {
-            let mut storage_blocks = 0;
-            if !range.is_empty() {
-                if let (Some(first), Some(last)) = (
-                    self.storage_block_ord(range.start),
-                    self.storage_block_ord(range.end - 1),
-                ) {
-                    storage_blocks = (last - first + 1) as u64;
-                }
-            }
-            charge_read(range.len() as u64, storage_blocks);
-        }
-        Ok(bytes)
+        visitor: &mut dyn FnMut(usize, OwnedBytes) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let previous = READ_KIND.replace(kind);
+        let _kind = ReadKindGuard(previous);
+        self.visit_bytes(ranges, &mut |i, bytes| {
+            let range = &ranges[i];
+            let blocks = if range.is_empty() {
+                0
+            } else {
+                self.storage_block_ord(range.start)
+                    .zip(self.storage_block_ord(range.end - 1))
+                    .map_or(0, |(first, last)| (last - first + 1) as u64)
+            };
+            charge_read(range.len() as u64, blocks);
+            let _kind = ReadKindGuard(READ_KIND.replace(previous));
+            visitor(i, bytes)
+        })
     }
 
     fn read_vector_bytes(&self, kind: VectorReadKind) -> std::io::Result<OwnedBytes> {
@@ -167,12 +169,14 @@ pub(crate) mod test_support {
         inner: RamDirectory,
         pub(crate) reads: ReadLog,
         pub(crate) read_kinds: Arc<Mutex<Vec<VectorReadKind>>>,
+        pub(crate) streaming: Arc<std::sync::atomic::AtomicBool>,
     }
     #[derive(Debug)]
     struct PagedFile {
         inner: Arc<dyn FileHandle>,
         reads: ReadLog,
         read_kinds: Arc<Mutex<Vec<VectorReadKind>>>,
+        streaming: Arc<std::sync::atomic::AtomicBool>,
     }
     impl HasLen for PagedFile {
         fn len(&self) -> usize {
@@ -180,6 +184,9 @@ pub(crate) mod test_support {
         }
     }
     impl FileHandle for PagedFile {
+        fn supports_streaming_reads(&self) -> bool {
+            self.streaming.load(std::sync::atomic::Ordering::Relaxed)
+        }
         fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
             let bytes = self.inner.read_bytes(range.clone())?;
             if LOG_ARMED.get() {
@@ -206,6 +213,7 @@ pub(crate) mod test_support {
                     inner,
                     reads: self.reads.clone(),
                     read_kinds: self.read_kinds.clone(),
+                    streaming: self.streaming.clone(),
                 }))
             } else {
                 Ok(inner)

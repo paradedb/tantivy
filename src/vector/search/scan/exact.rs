@@ -30,7 +30,7 @@ where
     K: SegmentSortKeyComputer,
     C: Comparator<K::SegmentSortKey>,
 {
-    reader: &'a VectorIndexReader,
+    pub(super) reader: &'a VectorIndexReader,
     query: &'a VectorQuery<T>,
     topn: TieBreakHeap<K, C>,
     tie_break: &'a mut K,
@@ -68,6 +68,47 @@ where
     }
 
     // --- Scoring ---
+
+    pub(super) fn score_stream(
+        &mut self,
+        groups: &[ClusterRows<'_>],
+        scratch: &mut ReadScratch,
+    ) -> crate::Result<usize> {
+        scratch.rows.clear();
+        scratch
+            .rows
+            .extend(groups.iter().flat_map(ClusterRows::global_rows));
+        #[cfg(test)]
+        self.exact_phase_rows.extend_from_slice(&scratch.rows);
+        let count = scratch.rows.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        let mut group = 0;
+        let mut position = 0;
+        let mut column_read = false;
+        let _fetch = enter_vector_stage(VectorStage::ExactFetch);
+        self.reader
+            .visit_vector_rows_planned(scratch, |row, bytes| {
+                let _score = enter_vector_stage(VectorStage::ExactScore);
+                while row >= groups[group].rows.end {
+                    group += 1;
+                    position = 0;
+                    column_read = false;
+                }
+                let selected = &groups[group];
+                self.offer(
+                    selected,
+                    &mut column_read,
+                    position,
+                    row - selected.rows.start,
+                    bytes,
+                )?;
+                position += 1;
+                Ok(())
+            })?;
+        Ok(count)
+    }
 
     /// Scores every row `selected` selects, reading through `scratch`; returns the rows scored. A
     /// row without a doc id reads the cluster's DocIds column when it first needs one.
