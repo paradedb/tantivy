@@ -210,9 +210,11 @@ or increasing kappa cannot remove an existing survivor. Statistical intervals
 are not guaranteed to enclose every true score, so exact scoring of the survivors alone
 does not guarantee recall parity.
 
-The policy constants are uniform `kappa = 2.5`, statistical-width multiplier
-`1.15`, and serialized gamma clamp `[1, 4]`. None is fitted per dataset, layer,
-or query. The lower-endpoint threshold correction is independent of kappa.
+The policy constants are uniform `kappa = 1.9 / 1.15` (approximately `1.65217`),
+statistical-width multiplier `1.15`, and serialized gamma clamp `[1, 4]`. This
+sets the nominal model confidence multiplier to `1.9`. None is fitted per
+dataset, layer, or query. The lower-endpoint threshold correction is independent
+of kappa.
 
 ## Arithmetic uncertainty
 

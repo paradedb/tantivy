@@ -58,7 +58,7 @@ pub(crate) const QUANTIZED_RESIDUAL_NORM_STRIDE: usize = 4;
 /// Closed-form uncertainty safety multiplier declared by the scoring policy.
 pub(crate) const GAMMA_ANALYTICAL_SAFETY: f32 = 1.15;
 /// Uniform confidence width at every quantized layer boundary.
-pub(crate) const QUANTIZED_BOUNDARY_KAPPA: f32 = 2.5;
+pub(crate) const QUANTIZED_BOUNDARY_KAPPA: f32 = 1.9 / GAMMA_ANALYTICAL_SAFETY;
 /// Query-side bits used by every sign-layer estimator.
 pub(crate) const SIGN_QUERY_BITS: u8 = 4;
 
