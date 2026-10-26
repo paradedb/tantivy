@@ -149,16 +149,16 @@ mod neon {
     }
 }
 
-/// x86 decode: VCVTPH2PS widens eight values per iteration behind the AVX2 tier; other tiers
-/// keep the portable bit manipulation.
+/// x86 decode: VCVTPH2PS widens eight values per iteration behind the AVX2 and AVX-512 tiers;
+/// other tiers keep the portable bit manipulation.
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use crate::cpu::{tier, Tier};
 
     pub(super) fn decode(bytes: &[u8], out: &mut [f32]) {
         match tier() {
-            // SAFETY: the tier is only reported when the CPU has avx2, popcnt and f16c.
-            Tier::Avx2 => unsafe { decode_f16c(bytes, out) },
+            // SAFETY: both tiers are only reported when the CPU has avx2, popcnt and f16c.
+            Tier::Avx2 | Tier::Avx512 => unsafe { decode_f16c(bytes, out) },
             _ => super::decode_scalar(bytes, out),
         }
     }

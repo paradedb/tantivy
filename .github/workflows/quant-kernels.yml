@@ -135,6 +135,31 @@ jobs:
             exit 1
           fi
 
+  kernel-tier-avx512:
+    name: AVX-512 tier under Intel SDE
+    needs: changed-paths
+    if: needs.changed-paths.outputs.kernels == 'true'
+    runs-on: ubuntu-latest
+    # No target-cpu: the emulated CPU need not support every instruction the runner does.
+    env:
+      CARGO_TARGET_DIR: target/quant-sde
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned stable toolchain
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
+        with:
+          toolchain: 1.95.0
+          profile: minimal
+          override: true
+      - name: Install Intel SDE
+        uses: petarpetrovt/setup-sde@6d2773bc0ef3005fd52e0ae0bb91782321793aec # v6.0
+      - name: Run sign and f16 tests on an emulated Sapphire Rapids CPU
+        run: |
+          test_bin=$(cargo test -p tantivy-quant --release --lib --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable')
+          test -n "$test_bin"
+          "$SDE_PATH/sde64" -spr -- "$test_bin" --include-ignored sign::tests:: model::f16::tests::
+
   tantivy-scan-benches:
     name: Tantivy quantization benchmarks
     needs: changed-paths

@@ -843,6 +843,8 @@ mod x86 {
 
     pub(super) fn batch(rows: &[u64], words_per_row: usize, q: &QueryPlanes, out: &mut [f32]) {
         match tier() {
+            // SAFETY: the tier is only reported when the CPU has every feature the variant enables.
+            Tier::Avx512 => unsafe { batch_avx512(rows, words_per_row, q, out) },
             // SAFETY: the tier is only reported when the CPU has avx2, popcnt and f16c.
             Tier::Avx2 => unsafe { batch_avx2(rows, words_per_row, q, out) },
             // SAFETY: the tier is only reported when the CPU has popcnt.
@@ -859,6 +861,8 @@ mod x86 {
         out: &mut [f32],
     ) {
         match tier() {
+            // SAFETY: the tier is only reported when the CPU has every feature the variant enables.
+            Tier::Avx512 => unsafe { indexed_avx512(rows, words_per_row, row_offsets, q, out) },
             // SAFETY: the tier is only reported when the CPU has avx2, popcnt and f16c.
             Tier::Avx2 => unsafe { indexed_avx2(rows, words_per_row, row_offsets, q, out) },
             // SAFETY: the tier is only reported when the CPU has popcnt.
@@ -869,6 +873,8 @@ mod x86 {
 
     pub(super) fn single(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
         match tier() {
+            // SAFETY: the tier is only reported when the CPU has every feature the variant enables.
+            Tier::Avx512 => unsafe { single_avx512(x, q) },
             // SAFETY: the tier is only reported when the CPU has avx2, popcnt and f16c.
             Tier::Avx2 => unsafe { single_avx2(x, q) },
             // SAFETY: the tier is only reported when the CPU has popcnt.
@@ -895,6 +901,19 @@ mod x86 {
     /// The CPU must have AVX2, POPCNT and F16C.
     #[target_feature(enable = "avx2,popcnt,f16c")]
     pub(super) unsafe fn batch_avx2(
+        rows: &[u64],
+        words_per_row: usize,
+        q: &QueryPlanes,
+        out: &mut [f32],
+    ) {
+        batch_body(rows, words_per_row, q, out)
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must have AVX-512 F, BW, VL and VPOPCNTDQ, AVX2, POPCNT and F16C.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vpopcntdq,avx2,popcnt,f16c")]
+    pub(super) unsafe fn batch_avx512(
         rows: &[u64],
         words_per_row: usize,
         q: &QueryPlanes,
@@ -933,6 +952,20 @@ mod x86 {
 
     /// # Safety
     ///
+    /// The CPU must have AVX-512 F, BW, VL and VPOPCNTDQ, AVX2, POPCNT and F16C.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vpopcntdq,avx2,popcnt,f16c")]
+    pub(super) unsafe fn indexed_avx512(
+        rows: &[u64],
+        words_per_row: usize,
+        row_offsets: &[usize],
+        q: &QueryPlanes,
+        out: &mut [f32],
+    ) {
+        indexed_body(rows, words_per_row, row_offsets, q, out)
+    }
+
+    /// # Safety
+    ///
     /// The CPU must have POPCNT.
     #[target_feature(enable = "popcnt")]
     pub(super) unsafe fn single_popcnt(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
@@ -944,6 +977,14 @@ mod x86 {
     /// The CPU must have AVX2, POPCNT and F16C.
     #[target_feature(enable = "avx2,popcnt,f16c")]
     pub(super) unsafe fn single_avx2(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
+        score_asym_body(x, q)
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must have AVX-512 F, BW, VL and VPOPCNTDQ, AVX2, POPCNT and F16C.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vpopcntdq,avx2,popcnt,f16c")]
+    pub(super) unsafe fn single_avx512(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
         score_asym_body(x, q)
     }
 }
@@ -1296,6 +1337,28 @@ mod tests {
                             check("avx2 batch", &got, &expected);
                             check("avx2 indexed", &got_indexed, &expected_indexed);
                         }
+                        if std::arch::is_x86_feature_detected!("avx512f")
+                            && std::arch::is_x86_feature_detected!("avx512bw")
+                            && std::arch::is_x86_feature_detected!("avx512vl")
+                            && std::arch::is_x86_feature_detected!("avx512vpopcntdq")
+                            && std::arch::is_x86_feature_detected!("avx2")
+                            && std::arch::is_x86_feature_detected!("popcnt")
+                            && std::arch::is_x86_feature_detected!("f16c")
+                        {
+                            // SAFETY: every feature the avx512 variants enable was just detected.
+                            unsafe {
+                                x86::batch_avx512(&packed, words, &q, &mut got);
+                                x86::indexed_avx512(
+                                    &packed,
+                                    words,
+                                    &row_offsets,
+                                    &q,
+                                    &mut got_indexed,
+                                );
+                            }
+                            check("avx512 batch", &got, &expected);
+                            check("avx512 indexed", &got_indexed, &expected_indexed);
+                        }
                     }
 
                     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -1374,6 +1437,13 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "needs an AVX-512 VPOPCNTDQ CPU or emulator; CI runs it under Intel SDE"]
+    fn dispatch_selects_avx512_tier() {
+        assert_eq!(crate::cpu::tier(), crate::cpu::Tier::Avx512);
     }
 
     #[test]
