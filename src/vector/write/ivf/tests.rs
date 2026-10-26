@@ -1427,7 +1427,7 @@ fn quantized_probe_terminates_at_ceiling() -> crate::Result<()> {
     assert_eq!(stats.clusters_probed(), 1, "{stats:?}");
     assert_eq!(
         stats.vectors_visited,
-        stats.pruned_filter + stats.pruned_dead + stats.candidates_scored,
+        stats.pruned_filter + stats.pruned_dead + stats.pruned_duplicate + stats.candidates_scored,
         "{stats:?}"
     );
     Ok(())

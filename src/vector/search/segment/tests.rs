@@ -105,8 +105,8 @@ fn matrix_fixture(
 fn assert_identities(stats: &ProbeStats, case: &str) {
     assert_eq!(
         stats.vectors_visited,
-        stats.pruned_filter + stats.pruned_dead + stats.candidates_scored,
-        "{case}: visited must equal filtered + dead + scored ({stats:?})"
+        stats.pruned_filter + stats.pruned_dead + stats.pruned_duplicate + stats.candidates_scored,
+        "{case}: visited must equal filtered + dead + duplicate + scored ({stats:?})"
     );
 }
 
@@ -1240,6 +1240,95 @@ fn reads_follow_the_plan() -> crate::Result<()> {
     ];
     for (name, case) in cases {
         case().map_err(|error| crate::TantivyError::InternalError(format!("{name}: {error}")))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn boundary_replica_finds_the_neighbor_with_one_cluster() -> crate::Result<()> {
+    let pad = |mut v: Vec<f32>| {
+        v.resize(64, 0.0);
+        v
+    };
+    for schedule in [&[][..], &[1, 1][..]] {
+        let fixture = FixtureSpec::ivf(
+            Metric::L2,
+            vec![pad(vec![0.0, 0.0]), pad(vec![10.0, 10.0])],
+            vec![
+                vec![0.0, -10.0],
+                vec![-10.0, 0.0],
+                vec![5.0, 5.01],
+                vec![10.0, 10.0],
+            ]
+            .into_iter()
+            .map(pad)
+            .collect(),
+        )
+        .boundary_epsilon(0.1)
+        .schedule(schedule)
+        .build()?;
+        let query = pad(vec![1.0, 1.0]);
+        let one_cluster = ProbeParams {
+            max_probe_fraction: 0.5,
+            min_probe_clusters: 1,
+            ..routed_exhaustive_params(2)
+        };
+        let found = fixture.search(&AllQuery, &query, 1, one_cluster)?;
+        assert_eq!(fixture.ordinal(found.results[0].1)?, 2);
+        assert_eq!(found.stats[0].postings_row, 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn boundary_replicas_preserve_unique_top_k_across_search_paths() -> crate::Result<()> {
+    for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+        for representation in [
+            Representation::FullPrecision,
+            Representation::Quantized(&[1, 1]),
+        ] {
+            let mut spec = FixtureSpec::clustered(metric, 64, 6, 240)
+                .boundary_epsilon(100.0)
+                .segments(2)
+                .deletes(&[2, 70])
+                .without_vectors(|ordinal| ordinal % 37 == 5)
+                .label("half", |ordinal| ordinal % 2 == 0)
+                .label("rare", |ordinal| ordinal % 97 == 7);
+            if let Representation::Quantized(schedule) = representation {
+                spec = spec.schedule(schedule);
+            }
+            let fixture = spec.build()?;
+            let filters: Vec<Box<dyn Query>> = vec![
+                Box::new(AllQuery),
+                Box::new(fixture.filter("half")),
+                Box::new(fixture.filter("rare")),
+            ];
+            for (path, params) in paths(representation) {
+                for (filter_id, filter) in filters.iter().enumerate() {
+                    for k in [10, 1000] {
+                        let case = format!(
+                            "replicas {metric:?} {representation:?} {path} filter={filter_id} \
+                             k={k}"
+                        );
+                        let stats = assert_case(
+                            &fixture,
+                            representation,
+                            filter.as_ref(),
+                            &matrix_queries()[0],
+                            k,
+                            &params,
+                            &case,
+                        )?;
+                        if filter_id == 0 && k == 1000 {
+                            assert!(
+                                stats.iter().map(|s| s.pruned_duplicate).sum::<usize>() > 0,
+                                "{case}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }

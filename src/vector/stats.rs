@@ -237,6 +237,8 @@ pub struct ProbeStats {
     pub pruned_filter: usize,
     /// Rows the gate rejected as deleted.
     pub pruned_dead: usize,
+    /// Replica postings skipped after their document was already admitted.
+    pub pruned_duplicate: usize,
     /// Clusters admitted with at least one row.
     pub postings_row: usize,
     /// Clusters opened that contributed no row.
@@ -365,6 +367,7 @@ impl ProbeStats {
         self.vectors_visited = counters.vectors_visited;
         self.pruned_filter = counters.pruned_filter;
         self.pruned_dead = counters.pruned_dead;
+        self.pruned_duplicate = counters.pruned_duplicate;
         self.postings_row = counters.postings_row;
         self.postings_skipped = counters.postings_skipped;
         self.bounds_skips = counters.bounds_skips;
@@ -516,6 +519,7 @@ mod tests {
         "vectors_visited",
         "pruned_filter",
         "pruned_dead",
+        "pruned_duplicate",
         "postings_row",
         "postings_skipped",
         "routing_visited_count",

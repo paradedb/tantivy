@@ -19,7 +19,8 @@ use crate::schema::{
     STRING,
 };
 use crate::vector::clustering::{
-    for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
+    for_each_batch, ClusterAssignment, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors,
+    SuperKMeansClusterer, VectorSource,
 };
 use crate::vector::params::ProbeParams;
 use crate::vector::router::candidate::Candidate;
@@ -105,6 +106,45 @@ impl IvfClusterer for NearestClusterer {
     }
 }
 
+struct BoundaryClusterer {
+    fixed: NearestClusterer,
+    epsilon: f32,
+}
+
+impl IvfClusterer for BoundaryClusterer {
+    fn training_sample_ratio(&self) -> f32 {
+        1.0
+    }
+
+    fn train(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+    ) -> crate::Result<IvfCentroids> {
+        self.fixed.train(options, source)
+    }
+
+    fn assign(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        centroids: &IvfCentroids,
+    ) -> crate::Result<Vec<u32>> {
+        self.fixed.assign(options, source, centroids)
+    }
+
+    fn assign_with_replicas(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        centroids: &IvfCentroids,
+    ) -> crate::Result<Vec<ClusterAssignment>> {
+        SuperKMeansClusterer::new()
+            .with_boundary_epsilon(self.epsilon)
+            .assign_with_replicas(options, source, centroids)
+    }
+}
+
 /// The L2-nearest of `centroids`, first wins.
 pub(crate) fn nearest(vector: &[f32], centroids: &[Vec<f32>]) -> usize {
     let distance = |centroid: &[f32]| -> f32 {
@@ -168,6 +208,7 @@ pub(crate) struct FixtureSpec {
     pub(crate) schedule: Vec<u8>,
     pub(crate) paged: bool,
     pub(crate) router: RouterKind,
+    pub(crate) boundary_epsilon: f32,
     /// Segments after the build. IVF layouts write two flat segments per IVF segment and merge
     /// them pairwise.
     pub(crate) segments: usize,
@@ -190,6 +231,7 @@ impl FixtureSpec {
             // Exact: small fixtures have few lists; Stacked's hard 25% top prune
             // cannot open them all, so oracle/exhaustive tests would be invalid.
             router: RouterKind::Exact,
+            boundary_epsilon: 0.0,
             segments: 1,
             deletes: Vec::new(),
         }
@@ -232,6 +274,7 @@ impl FixtureSpec {
             schedule: Vec::new(),
             paged: false,
             router: RouterKind::Exact,
+            boundary_epsilon: 0.0,
             segments: 1,
             deletes: Vec::new(),
         }
@@ -239,6 +282,11 @@ impl FixtureSpec {
 
     pub(crate) fn schedule(mut self, schedule: &[u8]) -> Self {
         self.schedule = schedule.to_vec();
+        self
+    }
+
+    pub(crate) fn boundary_epsilon(mut self, epsilon: f32) -> Self {
+        self.boundary_epsilon = epsilon;
         self
     }
 
@@ -332,11 +380,18 @@ impl FixtureSpec {
         let directory = self.paged.then(PagedDirectory::default);
         let mut builder = Index::builder().schema(schema.build()).settings(settings);
         if let Layout::Ivf(centroids) = &self.layout {
-            builder = builder
-                .ivf_clusterer(Arc::new(NearestClusterer {
-                    centroids: centroids.clone(),
-                }))
-                .ivf_router(self.router);
+            let fixed = NearestClusterer {
+                centroids: centroids.clone(),
+            };
+            let clusterer: Arc<dyn IvfClusterer> = if self.boundary_epsilon > 0.0 {
+                Arc::new(BoundaryClusterer {
+                    fixed,
+                    epsilon: self.boundary_epsilon,
+                })
+            } else {
+                Arc::new(fixed)
+            };
+            builder = builder.ivf_clusterer(clusterer).ivf_router(self.router);
         }
         let index = match &directory {
             Some(directory) => builder.create(directory.clone())?,

@@ -167,6 +167,7 @@ pub(crate) struct RouterCounters {
     pub(crate) vectors_visited: usize,
     pub(crate) pruned_filter: usize,
     pub(crate) pruned_dead: usize,
+    pub(crate) pruned_duplicate: usize,
     /// Rows admitted and charged.
     pub(crate) eligible: usize,
     /// The zero-based probe at which the query bound armed.
@@ -194,7 +195,8 @@ pub(crate) struct RouterClusters<'a, T: VectorElement> {
     bounds: BoundStore<'a>,
     tracker: QueryBoundTracker,
     gate: RowGate<'a>,
-    /// The current cluster's DocIds column; read only when the gate is closed.
+    seen: Option<BitSet>,
+    /// The current cluster's DocIds column, read for filtering or replica deduplication.
     docs: Vec<DocId>,
     offsets: Vec<u32>,
     selected_docs: Vec<DocId>,
@@ -238,6 +240,8 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
             bounds: index.bounds(),
             tracker: QueryBoundTracker::new(),
             gate: RowGate::new(filter, segment.alive_bitset()),
+            seen: (index.num_rows() > index.num_docs())
+                .then(|| BitSet::with_max_value(segment.max_doc())),
             docs: Vec::new(),
             offsets: Vec::new(),
             selected_docs: Vec::new(),
@@ -285,14 +289,23 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
     /// Selects `cluster`'s rows into `offsets` and counts what the gate pruned.
     fn gate_cluster(&mut self, cluster: usize, rows: usize) -> crate::Result<GatedRows> {
         // DocIds alone, then the gate, before any payload read.
-        if !self.gate.is_open() {
+        if !self.gate.is_open() || self.seen.is_some() {
             self.reader.read_doc_ids(cluster, &mut self.docs)?;
             debug_assert_eq!(self.docs.len(), rows);
         }
-        let gated = {
-            let _routing = enter_vector_stage(VectorStage::Routing);
-            self.gate.select(&self.docs, &mut self.offsets)
-        };
+        let _routing = enter_vector_stage(VectorStage::Routing);
+        let mut gated = self.gate.select(&self.docs, &mut self.offsets);
+        if let Some(seen) = &mut self.seen {
+            if gated.all {
+                self.offsets.clear();
+                self.offsets.extend(0..rows as u32);
+            }
+            let eligible = self.offsets.len();
+            self.offsets
+                .retain(|&offset| seen.insert(self.docs[offset as usize]));
+            self.counters.pruned_duplicate += eligible - self.offsets.len();
+            gated.all = self.offsets.len() == rows;
+        }
         self.counters.vectors_visited += rows;
         self.counters.pruned_filter += gated.pruned_filter;
         self.counters.pruned_dead += gated.pruned_dead;
@@ -357,7 +370,7 @@ impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
                 continue;
             }
             let (offsets, docs) = if gated.all {
-                (None, None)
+                (None, self.seen.as_ref().map(|_| self.docs.as_slice()))
             } else {
                 self.selected_docs.clear();
                 self.selected_docs.extend(

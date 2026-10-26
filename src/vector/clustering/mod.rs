@@ -29,6 +29,30 @@ pub trait IvfClusterer: Send + Sync + 'static {
         source: &mut dyn VectorSource,
         centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>>;
+
+    /// Assigns one primary and at most one replica per source vector.
+    fn assign_with_replicas(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        centroids: &IvfCentroids,
+    ) -> crate::Result<Vec<ClusterAssignment>> {
+        Ok(self
+            .assign(options, source, centroids)?
+            .into_iter()
+            .map(|primary| ClusterAssignment {
+                primary,
+                secondary: None,
+            })
+            .collect())
+    }
+}
+
+/// A vector's primary cluster and optional boundary replica.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClusterAssignment {
+    pub primary: u32,
+    pub secondary: Option<u32>,
 }
 
 /// Replayable, read-only view of vectors for IVF [`IvfClusterer::train`] or
