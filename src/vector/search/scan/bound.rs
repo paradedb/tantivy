@@ -342,14 +342,15 @@ mod tests {
     fn boundary_keeps_enclosed_top_k() {
         // Minimal case: the runner-up's interval is narrow but encloses its exact score.
         let examples: [(f32, f32, f32); 3] = [
-            (0.10, 0.015, 0.065),
-            (0.09, 0.001, 0.090),
-            (0.08, 0.001, 0.080),
+            (0.10, 0.0375, 0.065),
+            (0.09, 0.0025, 0.090),
+            (0.08, 0.0025, 0.080),
         ];
         let rows: Vec<_> = examples
             .iter()
             .enumerate()
-            .map(|(row, &(estimate, sigma, truth))| {
+            .map(|(row, &(estimate, half_width, truth))| {
+                let sigma = half_width / QUANTIZED_BOUNDARY_KAPPA;
                 assert!((truth - estimate).abs() <= QUANTIZED_BOUNDARY_KAPPA * sigma);
                 (row, estimate, sigma)
             })
