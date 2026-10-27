@@ -19,7 +19,7 @@ use crate::query::Weight;
 use crate::schema::{Field, FieldType, Metric, Schema};
 use crate::vector::params::ProbeParams;
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
-use crate::vector::search::scan::bound::{clear_threshold, ExactMerge, LocalThreshold, TopK};
+use crate::vector::search::scan::bound::{ExactMerge, LocalThreshold, TopK};
 use crate::vector::search::SegmentSearcher;
 use crate::vector::stats::{ProbeStats, SegmentReport};
 use crate::vector::storage::metadata::VectorColMetadata;
@@ -149,10 +149,6 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
     /// Builds the collector. Configuration cannot be changed afterwards.
     pub fn build(self) -> TopDocsByVectorSimilarity<T, S> {
         let segment_top_n = self.limit.saturating_add(self.offset);
-        let external_global = self.shared_threshold.is_some();
-        let global = self
-            .shared_threshold
-            .unwrap_or_else(|| Arc::new(LocalThreshold::default()));
         TopDocsByVectorSimilarity {
             field: self.field,
             query: self.query,
@@ -162,9 +158,8 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
             max_scan_levels: self.max_scan_levels,
             quantized_queries: Mutex::new(HashMap::new()),
             prepared: Mutex::new(None),
-            carried: Arc::new(Mutex::new(TopK::new(segment_top_n))),
-            global,
-            external_global,
+            collector_topk: Arc::new(Mutex::new(TopK::new(segment_top_n))),
+            caller_threshold: self.shared_threshold,
             tie_break: self.tie_break,
         }
     }
@@ -189,16 +184,12 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     quantized_queries: Mutex<HashMap<PreparedKey, PreparedCell>>,
     /// The query prepared for the field's metric on first use.
     prepared: Mutex<Option<Arc<VectorQuery<T>>>>,
-    /// The best `limit + offset` exact scores the finished segments returned. Later segments seed
-    /// their threshold from the k-th and do not copy these scores into the segment top. Cleared
-    /// between searches.
-    carried: Arc<Mutex<TopK>>,
-    /// The threshold every segment publishes. A [`LocalThreshold`] unless the caller passed a slot
-    /// shared with other participants.
-    global: Arc<dyn SharedThreshold<Score>>,
-    /// `global` is the caller's slot. A process-local threshold is replaced between searches so a
-    /// reused collector does not keep the previous query's floor.
-    external_global: bool,
+    /// The top-k exact scores from segments this collector has finished. Later segments seed `tau`
+    /// from the k-th and do not copy these scores into the segment top. Cleared between searches.
+    collector_topk: Arc<Mutex<TopK>>,
+    /// The caller's shared top-k threshold, when this collector publishes into a slot other
+    /// participants also read. `None` gives each segment scan a fresh [`LocalThreshold`].
+    caller_threshold: Option<Arc<dyn SharedThreshold<Score>>>,
     tie_break: S,
 }
 
@@ -387,11 +378,8 @@ where
         if let Some(first) = merged.stats.first_mut() {
             first.add_assembly(&totals);
         }
-        // The bound describes this search's results only. An external slot belongs to the caller.
-        self.carried.lock().unwrap().clear();
-        if !self.external_global {
-            clear_threshold(&*self.global);
-        }
+        // The collector top-k describes this search's results only. A caller slot is the caller's.
+        self.collector_topk.lock().unwrap().clear();
         Ok(merged)
     }
 }
@@ -401,8 +389,9 @@ where
     T: VectorElement,
     S: SortKeyComputer + Send + Sync + 'static,
 {
-    /// Searches one segment: prepares the query, runs the segment searcher against the shared
-    /// bound, offers the hits' scores to it, and lifts each hit's tie-break key out of the segment.
+    /// Searches one segment. Prepares the query, runs the segment searcher with this collector's
+    /// top-k and shared top-k threshold, offers the hits' scores to the collector top-k, and lifts
+    /// each hit's tie-break key out of the segment.
     fn search_segment(
         &self,
         weight: &dyn Weight,
@@ -422,6 +411,10 @@ where
             };
             (query, quantized)
         };
+        let shared_topk_threshold = self
+            .caller_threshold
+            .clone()
+            .unwrap_or_else(|| Arc::new(LocalThreshold::default()));
         let backend = SegmentSearcher::for_segment(
             reader,
             segment_ord,
@@ -430,7 +423,7 @@ where
             quantized,
             self.probe_params.clone(),
         )?
-        .with_shared(Arc::clone(&self.carried), Arc::clone(&self.global));
+        .with_collector_topk(Arc::clone(&self.collector_topk), shared_topk_threshold);
         let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
         drop(init);
         let (hits, report) = backend.top_n_by(
@@ -442,7 +435,7 @@ where
         )?;
         let merge = {
             let _assembly = enter_vector_stage(VectorStage::ResultAssembly);
-            self.carried
+            self.collector_topk
                 .lock()
                 .unwrap()
                 .merge_exact(hits.iter().map(|((score, _), _)| *score))
@@ -530,6 +523,49 @@ mod ivf_e2e_tests {
                 assert_eq!(actual.results, expected, "IVF query={query:?} k={k}");
             }
         }
+        Ok(())
+    }
+
+    /// A collector with no caller slot searches twice. The second search must not load the first
+    /// search's threshold: each segment scan is given a fresh local threshold, so nothing from the
+    /// first search is there to raise `tau`.
+    #[test]
+    fn reused_collector_does_not_see_the_previous_search_threshold() -> crate::Result<()> {
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .metric(Metric::L2)
+            .vector_storage_format(VectorStorageFormat::Ivf)
+            .router(RouterKind::Exact)
+            .build()?;
+        let searcher = index.index.reader()?.searcher();
+        let query = [0.5_f32, 0.5];
+        let k = 1;
+        let collector = TopDocs::with_limit(k)
+            .order_by_similarity(index.embedding_field(), query.to_vec())
+            .with_probe_params(exhaustive_params(9));
+        let first = searcher.search(&AllQuery, &collector)?;
+        assert!(
+            first
+                .stats
+                .iter()
+                .any(|stats| stats.cross_bound_publishes > 0),
+            "the first search published a threshold its slot could have kept"
+        );
+        let second = searcher.search(&AllQuery, &collector)?;
+        let fresh = searcher.search(
+            &AllQuery,
+            &TopDocs::with_limit(k)
+                .order_by_similarity(index.embedding_field(), query.to_vec())
+                .with_probe_params(exhaustive_params(9)),
+        )?;
+        assert!(
+            second
+                .stats
+                .iter()
+                .all(|stats| stats.cross_bound_raises == 0),
+            "the second search loaded a threshold from the first: {second:?}"
+        );
+        assert_eq!(second.results, fresh.results);
+        assert_eq!(second.results, index.ground_truth(query, k)?);
         Ok(())
     }
 

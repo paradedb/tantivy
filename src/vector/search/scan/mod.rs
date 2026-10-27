@@ -299,7 +299,7 @@ impl<'a> QuantizedState<'a> {
         if self.admission_pruning_disabled {
             return None;
         }
-        bound.admission_threshold()
+        bound.pruning_threshold()
     }
 
     /// Refines block `b`'s candidates with `layer`, read as `read`.
@@ -328,7 +328,7 @@ impl<'a> QuantizedState<'a> {
     /// Drops block `b`'s candidates whose upper endpoint fell below the bound's pruning threshold
     /// since the last boundary, before the block is read; returns the rows dropped.
     fn recheck(&mut self, b: usize, bound: &mut PruningBound) -> usize {
-        match bound.recheck_threshold() {
+        match bound.pruning_threshold() {
             Some(threshold) => self.candidates.recheck(b, threshold),
             None => 0,
         }
@@ -411,8 +411,8 @@ where
         index: &'a ClusterIndex,
         query: ScoringQuery<'a, T>,
         config: ScanConfig,
-        carried_kth: Option<f32>,
-        global: Arc<dyn SharedThreshold<Score>>,
+        collector_kth: Option<f32>,
+        shared_topk_threshold: Arc<dyn SharedThreshold<Score>>,
         tie_break: &'a mut K,
         tie_comparator: C,
     ) -> crate::Result<Self> {
@@ -436,7 +436,7 @@ where
         let layers = quantized.as_ref().map_or(0, |state| state.layers.len());
         Ok(Self {
             exact: ExactScorer::new(reader, query.query, config.top_n, tie_break, tie_comparator),
-            bound: PruningBound::new(config.top_n, carried_kth, global),
+            bound: PruningBound::new(config.top_n, collector_kth, shared_topk_threshold),
             quantized,
             scratch: ReadScratch::default(),
             by_cluster: Vec::new(),
@@ -472,7 +472,8 @@ where
     }
 
     /// The segment top-k as of the last shortlisted cluster. The router reads `kth_lower` and APS
-    /// reads `kth_estimate`. Carried scores and the shared threshold are not in this top-k.
+    /// reads `kth_estimate`. The collector top-k and the shared top-k threshold are not in this
+    /// top-k.
     fn feedback(&self) -> Feedback {
         Feedback {
             kth_lower: self.bound.own_lower(),

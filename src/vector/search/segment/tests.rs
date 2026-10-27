@@ -166,7 +166,7 @@ fn planned_top_k(
     planned_top_k_with(fixture, filter, query, k, params, admission_pruning, None)
 }
 
-/// [`planned_top_k`] with every segment pruning against `shared` too.
+/// [`planned_top_k`] with every segment seeded from `collector_topk` when given.
 fn planned_top_k_with(
     fixture: &Fixture,
     filter: &dyn Query,
@@ -174,7 +174,7 @@ fn planned_top_k_with(
     k: usize,
     params: &ProbeParams,
     admission_pruning: bool,
-    shared: Option<Arc<Mutex<TopK>>>,
+    collector_topk: Option<Arc<Mutex<TopK>>>,
 ) -> crate::Result<(Hits, Vec<ProbeStats>)> {
     let weight = fixture.weight(filter)?;
     let segments = fixture.index.reader()?.searcher().segment_readers().len();
@@ -189,7 +189,7 @@ fn planned_top_k_with(
             params.clone(),
             None,
             admission_pruning,
-            shared.clone(),
+            collector_topk.clone(),
         )?;
         assert_identities(&segment_stats, "admission pruning");
         hits.extend(segment_hits);
@@ -492,17 +492,24 @@ fn assert_case(
             "{case}"
         );
     }
-    // A shared bound seeded with the result's k-th exact score prunes only rows that cannot enter
-    // the top k: the seeded run returns the same hits, unless a dropped row's interval missed its
-    // exact score.
+    // A collector top-k seeded with the result's k-th exact score prunes only rows that cannot
+    // enter the top k: the seeded run returns the same hits, unless a dropped row's interval
+    // missed its exact score.
     if let Some(&(seed, _)) = pruned.get(k - 1) {
-        let shared = Arc::new(Mutex::new(TopK::new(k)));
-        shared
+        let collector_topk = Arc::new(Mutex::new(TopK::new(k)));
+        collector_topk
             .lock()
             .unwrap()
             .merge_exact(std::iter::repeat_n(seed, k));
-        let (seeded, seeded_stats) =
-            planned_top_k_with(fixture, filter, query, k, params, true, Some(shared))?;
+        let (seeded, seeded_stats) = planned_top_k_with(
+            fixture,
+            filter,
+            query,
+            k,
+            params,
+            true,
+            Some(collector_topk),
+        )?;
         SEEDED_CASES.fetch_add(1, Ordering::Relaxed);
         let admission_pruned = |stats: &[ProbeStats]| -> usize {
             stats
@@ -589,7 +596,7 @@ fn scan_matches_oracle() -> crate::Result<()> {
         SEEDED_CASES.load(Ordering::Relaxed),
         SEEDED_CASES_PRUNING_MORE.load(Ordering::Relaxed),
     );
-    eprintln!("seeded shared-bound cases: {seeded}, pruning more at admission: {pruning_more}");
+    eprintln!("seeded collector top-k cases: {seeded}, pruning more at admission: {pruning_more}");
     assert!(
         pruning_more > 0,
         "no seeded case pruned beyond the scan's own bound"

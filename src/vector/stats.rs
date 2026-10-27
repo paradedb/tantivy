@@ -457,7 +457,7 @@ impl ProbeStats {
         }
     }
 
-    /// Records what the segment's exact scores did to the query's carried top-k.
+    /// Records what the segment's exact scores did to the collector top-k.
     pub(crate) fn record_shared_offer(&mut self, merge: ExactMerge) {
         self.shared_bound_offers = merge.offers;
         self.shared_bound_tightenings = merge.tightenings;

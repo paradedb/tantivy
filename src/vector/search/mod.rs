@@ -49,11 +49,11 @@ pub(crate) struct SegmentSearcher<T: VectorElement> {
     quantized: Option<Arc<QuantizedQueryCtx>>,
     probe_params: ProbeParams,
     segment_ord: SegmentOrdinal,
-    /// Exact scores finished segments have returned. The scan seeds its threshold from their k-th.
-    /// `None` seeds nothing.
-    pub(crate) carried: Option<Arc<Mutex<TopK>>>,
-    /// The threshold this scan publishes. A [`LocalThreshold`] when the query shares none.
-    pub(crate) global: Arc<dyn SharedThreshold<Score>>,
+    /// Exact scores segments of this collector have finished. The scan seeds its threshold from
+    /// their k-th. `None` seeds nothing.
+    pub(crate) collector_topk: Option<Arc<Mutex<TopK>>>,
+    /// The threshold this scan publishes. A fresh [`LocalThreshold`] when the query shares none.
+    pub(crate) shared_topk_threshold: Arc<dyn SharedThreshold<Score>>,
     #[cfg(test)]
     pub(crate) plan_override: Option<PlanOverride>,
     #[cfg(test)]
@@ -78,8 +78,8 @@ impl<T: VectorElement> SegmentSearcher<T> {
             quantized,
             probe_params,
             segment_ord,
-            carried: None,
-            global: Arc::new(LocalThreshold::default()),
+            collector_topk: None,
+            shared_topk_threshold: Arc::new(LocalThreshold::default()),
             #[cfg(test)]
             plan_override: None,
             #[cfg(test)]
@@ -87,15 +87,14 @@ impl<T: VectorElement> SegmentSearcher<T> {
         })
     }
 
-    /// Prunes against exact scores finished segments already returned, and publishes through
-    /// `global`.
-    pub(crate) fn with_shared(
+    /// Seeds `tau` from `collector_topk`'s k-th and publishes through `shared_topk_threshold`.
+    pub(crate) fn with_collector_topk(
         mut self,
-        carried: Arc<Mutex<TopK>>,
-        global: Arc<dyn SharedThreshold<Score>>,
+        collector_topk: Arc<Mutex<TopK>>,
+        shared_topk_threshold: Arc<dyn SharedThreshold<Score>>,
     ) -> Self {
-        self.carried = Some(carried);
-        self.global = global;
+        self.collector_topk = Some(collector_topk);
+        self.shared_topk_threshold = shared_topk_threshold;
         self
     }
 
@@ -229,17 +228,17 @@ impl<T: VectorElement> SegmentSearcher<T> {
             #[cfg(test)]
             admission_pruning_disabled: self.admission_pruning_disabled,
         };
-        let carried_kth = self
-            .carried
+        let collector_kth = self
+            .collector_topk
             .as_ref()
-            .and_then(|carried| carried.lock().unwrap().kth_lower());
+            .and_then(|collector_topk| collector_topk.lock().unwrap().kth_lower());
         let mut scan = SegmentScan::new(
             &self.reader,
             index,
             self.scoring_query(),
             config,
-            carried_kth,
-            Arc::clone(&self.global),
+            collector_kth,
+            Arc::clone(&self.shared_topk_threshold),
             tie_break,
             tie_comparator,
         )?;

@@ -551,8 +551,6 @@ impl BoundaryHarness {
     /// The threshold the next boundary would apply, leaving the running top-k intact.
     pub(crate) fn boundary_lower(&mut self, k: usize, kappa: f32) -> Option<Threshold> {
         let mut bound = self.bound(k).clone();
-        // The peek must not publish into the harness bound's threshold.
-        bound.detach_global();
         self.candidates.kappa = kappa;
         bound.boundary(&mut self.candidates)
     }
@@ -570,11 +568,6 @@ impl BoundaryHarness {
     /// The bound's pruning threshold.
     pub(crate) fn threshold(&mut self, k: usize) -> Option<f32> {
         self.bound(k).threshold()
-    }
-
-    /// Raises the bound's floor.
-    pub(crate) fn raise_floor(&mut self, k: usize, value: f32) {
-        self.bound(k).raise_floor(value);
     }
 
     /// Opens an empty block that takes the next rows pushed, outside any cluster.

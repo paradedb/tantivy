@@ -1,14 +1,15 @@
 //! The pruning bounds of one query's scans.
 //!
-//! The collector holds two things every segment scan shares. `carried` is the top-k exact scores
-//! finished segments in this process have already returned. `global` is the threshold the query's
-//! participants publish; it is a [`LocalThreshold`] when the query does not pass one in.
+//! The collector holds two things every segment scan shares. `collector_topk` is the top-k exact
+//! scores from segments this collector has already finished. `shared_topk_threshold` is the
+//! threshold the query's participants publish; a scan that is not given one uses a fresh
+//! [`LocalThreshold`].
 //!
 //! A [`PruningBound`] is one segment scan. Its [`TopK`] holds only that segment's candidates,
 //! ordered by lower endpoint, so the router and APS read [`TopK::kth_lower`] and
-//! [`TopK::kth_estimate`]. Carried scores and `global` seed `tau` and then only raise it. An exact
-//! score is a zero-width interval. Admission drops a row only when its upper endpoint is strictly
-//! below `tau`.
+//! [`TopK::kth_estimate`]. The collector top-k and `shared_topk_threshold` seed `tau` and then only
+//! raise it. An exact score is a zero-width interval. Admission drops a row only when its upper
+//! endpoint is strictly below `tau`.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -80,8 +81,8 @@ impl Ord for ByLower {
 
 // --- Shared threshold ---
 
-/// A process-local [`SharedThreshold<Score>`]. Queries that do not share a slot across
-/// participants still hold one of these, so `global` is never absent.
+/// A process-local [`SharedThreshold<Score>`]. A segment scan without a caller slot holds one of
+/// these, so [`PruningBound`] always has a threshold to read.
 #[derive(Default)]
 pub(crate) struct LocalThreshold(AtomicSharedThreshold);
 
@@ -99,41 +100,25 @@ impl SharedThreshold<Score> for LocalThreshold {
     }
 }
 
-/// Writes the empty sentinel, so the next search of a reused collector starts unset. An external
-/// slot is the caller's and is left alone. Loops on [`SharedThreshold::load`] and
-/// [`SharedThreshold::try_update`].
-pub(crate) fn clear_threshold(global: &dyn SharedThreshold<Score>) {
-    let mut current = global.load();
-    loop {
-        if current.is_none() {
-            return;
-        }
-        match global.try_update(&current, (Score::MIN, SegmentOrdinal::MAX)) {
-            Ok(()) => return,
-            Err(actual) => current = actual,
-        }
-    }
-}
-
-/// Raises `global` to `score` when `score` is finite and strictly above the value loaded.
-/// Returns whether this call stored it.
-fn raise(global: &dyn SharedThreshold<Score>, score: f32) -> bool {
+/// Raises `shared_topk_threshold` to `score` when `score` is finite and strictly above the value
+/// loaded. Returns whether this call stored it.
+fn raise(shared_topk_threshold: &dyn SharedThreshold<Score>, score: f32) -> bool {
     if !score.is_finite() {
         return false;
     }
-    let mut current = global.load();
+    let mut current = shared_topk_threshold.load();
     loop {
         if current.is_some_and(|(shared, _)| shared >= score) {
             return false;
         }
-        match global.try_update(&current, (score, SegmentOrdinal::MAX)) {
+        match shared_topk_threshold.try_update(&current, (score, SegmentOrdinal::MAX)) {
             Ok(()) => return true,
             Err(actual) => current = actual,
         }
     }
 }
 
-/// What merging exact scores into a carried [`TopK`] did.
+/// What merging exact scores into a collector [`TopK`] did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExactMerge {
     /// Finite scores offered.
@@ -279,57 +264,49 @@ impl TopK {
 /// One segment scan's pruning bound.
 ///
 /// `top` is this segment's candidates. `tau` is the pruning threshold: it starts at the higher of
-/// the carried exact k-th and `global`, and afterwards only rises, including to `top`'s k-th lower
-/// endpoint. The segment top is never seeded from the carried scores.
+/// the collector's exact k-th and `shared_topk_threshold`, and afterwards only rises, including to
+/// `top`'s k-th lower endpoint. The segment top is never seeded from the collector top-k.
 #[cfg_attr(test, derive(Clone))]
 pub(crate) struct PruningBound {
     /// Only rises. Non-finite until the first finite raise.
     tau: f32,
     top: TopK,
-    global: Arc<dyn SharedThreshold<Score>>,
-    /// Highest threshold offered to `global`.
+    shared_topk_threshold: Arc<dyn SharedThreshold<Score>>,
+    /// Highest threshold offered to `shared_topk_threshold`.
     last_published: f32,
-    /// Offers that stored a new value in `global`.
+    /// Offers that stored a new value in `shared_topk_threshold`.
     pub(super) publishes: usize,
-    /// Loads of `global` whose score was above `tau`.
+    /// Loads of `shared_topk_threshold` whose score was above `tau`.
     pub(super) raises: usize,
 }
 
 impl PruningBound {
-    /// A bound for `k` rows. `carried_kth` is the k-th exact score already returned by finished
-    /// segments, when they have filled `k`. `global` is the participants' threshold.
+    /// A bound for `k` rows. `collector_kth` is the k-th exact score already returned by finished
+    /// segments of this collector, when they have filled `k`. `shared_topk_threshold` is the
+    /// participants' threshold.
     pub(super) fn new(
         k: usize,
-        carried_kth: Option<f32>,
-        global: Arc<dyn SharedThreshold<Score>>,
+        collector_kth: Option<f32>,
+        shared_topk_threshold: Arc<dyn SharedThreshold<Score>>,
     ) -> Self {
         let mut bound = Self {
             tau: f32::NEG_INFINITY,
             top: TopK::new(k),
-            global,
+            shared_topk_threshold,
             last_published: f32::NEG_INFINITY,
             publishes: 0,
             raises: 0,
         };
-        if let Some(kth) = carried_kth {
+        if let Some(kth) = collector_kth {
             bound.raise_tau(kth);
         }
         bound
     }
 
-    /// No carried score, and a fresh process-local threshold.
+    /// No collector score, and a fresh process-local threshold.
     #[cfg(test)]
     pub(super) fn standalone(k: usize) -> Self {
         Self::new(k, None, Arc::new(LocalThreshold::default()))
-    }
-
-    /// Gives the bound its own local threshold, so a cloned peek cannot publish into the original.
-    #[cfg(test)]
-    pub(super) fn detach_global(&mut self) {
-        self.global = Arc::new(LocalThreshold::default());
-        self.last_published = f32::NEG_INFINITY;
-        self.publishes = 0;
-        self.raises = 0;
     }
 
     /// The segment's own k-th lower endpoint. The router reads this.
@@ -354,8 +331,12 @@ impl PruningBound {
         self.note_kth();
     }
 
-    /// Admits one cluster. A row whose upper endpoint is below `threshold` is dropped. Every other
-    /// row joins `top`. Publishes afterwards.
+    /// Admits one cluster. A row whose upper endpoint is below `threshold` never enters `top`.
+    ///
+    /// `threshold` already includes `shared_topk_threshold`, so another segment or worker narrows
+    /// the rows this segment offers the router and APS. That narrowing is recall-safe: an upper
+    /// endpoint below a lower bound on the k-th true score cannot be one of the top k. Every
+    /// admitted row joins `top`. Publishes afterwards.
     pub(super) fn admit(
         &mut self,
         rows: &ClusterRows<'_>,
@@ -411,31 +392,30 @@ impl PruningBound {
         self.tau.is_finite().then_some(self.tau)
     }
 
-    /// The threshold admission prunes at, after reading `global`.
-    pub(super) fn admission_threshold(&mut self) -> Option<Threshold> {
+    /// The threshold admission and recheck prune at, after reading `shared_topk_threshold`.
+    pub(super) fn pruning_threshold(&mut self) -> Option<Threshold> {
         self.sync();
         self.as_threshold()
     }
 
-    /// The threshold a block is rechecked at, after reading `global`.
-    pub(super) fn recheck_threshold(&mut self) -> Option<Threshold> {
-        self.sync();
-        self.as_threshold()
-    }
-
-    /// The threshold a boundary prunes at, after reading `global`.
-    ///
-    /// Rebuilds the segment intervals from the refined candidates, raises `tau` to the new k-th
-    /// lower endpoint, then drops the intervals. Exact scores stay. `tau` remembers the layer.
+    /// The threshold a boundary prunes at, after reading `shared_topk_threshold`.
     pub(super) fn boundary(&mut self, candidates: &QuantizedCandidates) -> Option<Threshold> {
         self.sync();
-        self.top.rescore(candidates.live_candidates());
-        self.note_kth();
-        // The layer's intervals are now inside `tau`. Leaving them in the heap would let the next
-        // exact scores raise `tau` before k of them exist.
-        self.top.retain_exacts();
+        self.commit_layer(candidates.live_candidates());
         self.publish();
         self.as_threshold()
+    }
+
+    /// Folds this layer's refined intervals into `tau`, then drops them from the heap.
+    ///
+    /// The k-th lower endpoint of those intervals and the exact scores already stored is a lower
+    /// bound on the k-th true score, so `tau` keeps it. The intervals themselves leave: a later
+    /// exact score sharing the heap with a leftover lower endpoint would raise `tau` before k
+    /// exact scores exist, and the next recheck would drop a true hit.
+    fn commit_layer(&mut self, fresh: impl IntoIterator<Item = Candidate>) {
+        self.top.rescore(fresh);
+        self.note_kth();
+        self.top.retain_exacts();
     }
 
     fn as_threshold(&self) -> Option<Threshold> {
@@ -449,9 +429,10 @@ impl PruningBound {
         }
     }
 
-    /// Raises `tau` to `global`'s score when that score is higher. The ordinal is ignored.
+    /// Raises `tau` to `shared_topk_threshold`'s score when that score is higher. The ordinal is
+    /// ignored.
     fn sync(&mut self) {
-        let Some((score, _)) = self.global.load() else {
+        let Some((score, _)) = self.shared_topk_threshold.load() else {
             return;
         };
         if score.is_finite() && self.current().is_none_or(|tau| score > tau) {
@@ -460,7 +441,7 @@ impl PruningBound {
         self.raise_tau(score);
     }
 
-    /// Offers `tau` to `global` when it is finite and above the last offer.
+    /// Offers `tau` to `shared_topk_threshold` when it is finite and above the last offer.
     pub(super) fn publish(&mut self) {
         let Some(kth) = self.current() else {
             return;
@@ -469,7 +450,7 @@ impl PruningBound {
             return;
         }
         self.last_published = kth;
-        if raise(&*self.global, kth) {
+        if raise(&*self.shared_topk_threshold, kth) {
             self.publishes += 1;
         }
     }
@@ -482,11 +463,6 @@ impl PruningBound {
     #[cfg(test)]
     pub(super) fn threshold(&self) -> Option<f32> {
         self.current()
-    }
-
-    #[cfg(test)]
-    pub(super) fn raise_floor(&mut self, value: f32) {
-        self.raise_tau(value);
     }
 }
 
@@ -728,11 +704,11 @@ mod tests {
         }
     }
 
-    /// The carried top-k is unset until `k` scores are in, then holds the k-th best score offered
+    /// The collector top-k is unset until `k` scores are in, then holds the k-th best score offered
     /// whatever the order and grouping of the offers, and never loosens; an offer counts as a
     /// tightening exactly when it moves the k-th.
     #[test]
-    fn carried_top_k_holds_the_kth_best_offer() {
+    fn collector_topk_holds_the_kth_best_offer() {
         let mut bound = TopK::new(3);
         assert_eq!(bound.kth_lower(), None);
         let offer = bound.merge_exact([5.0, 1.0]);
@@ -810,10 +786,10 @@ mod tests {
         }
     }
 
-    /// A carried k-th seeds `tau` and stays out of the segment top, so the router still reads an
+    /// A collector k-th seeds `tau` and stays out of the segment top, so the router still reads an
     /// empty segment. Segment candidates then raise `tau` and never lower it.
     #[test]
-    fn carried_kth_seeds_tau_without_entering_the_segment_top() {
+    fn collector_kth_seeds_tau_without_entering_the_segment_top() {
         let bound = PruningBound::new(3, Some(4.5), Arc::new(LocalThreshold::default()));
         assert_eq!(bound.threshold(), Some(4.5));
         assert_eq!(bound.own_lower(), None);
@@ -843,7 +819,7 @@ mod tests {
     }
 
     /// The pruning threshold never falls: not as clusters merge into the running top-k, exact
-    /// scores arrive, a boundary clears the running top-k, or the floor is raised.
+    /// scores arrive, or a boundary folds the layer into `tau`.
     #[test]
     fn threshold_never_decreases() {
         let value = |rng: &mut fastrand::Rng| (rng.f32() * 20.0 - 10.0).round() / 2.0;
@@ -854,7 +830,7 @@ mod tests {
             let mut previous: Option<f32> = None;
             let mut row = 0;
             for step in 0..rng.usize(1..64) {
-                match rng.usize(0..4) {
+                match rng.usize(0..3) {
                     0 => {
                         harness.begin_cluster(k);
                         for _ in 0..rng.usize(1..2 * k + 2) {
@@ -865,8 +841,7 @@ mod tests {
                         harness.finish_cluster(2.0);
                     }
                     1 => harness.push_exact(value(&mut rng), k),
-                    2 => harness.band(k, 2.0),
-                    _ => harness.raise_floor(k, value(&mut rng)),
+                    _ => harness.band(k, 2.0),
                 }
                 let now = harness.threshold(k);
                 if let Some(previous) = previous {
@@ -998,13 +973,14 @@ mod tests {
         slot.load().map(|(score, _)| score)
     }
 
-    /// A bound at `k` sharing `global`, holding `scores` as this segment's exact scores.
+    /// A bound at `k` sharing `shared_topk_threshold`, holding `scores` as this segment's exact
+    /// scores.
     fn exact_bound(
-        global: Arc<dyn SharedThreshold<Score>>,
+        shared_topk_threshold: Arc<dyn SharedThreshold<Score>>,
         k: usize,
         scores: &[f32],
     ) -> PruningBound {
-        let mut bound = PruningBound::new(k, None, global);
+        let mut bound = PruningBound::new(k, None, shared_topk_threshold);
         for &score in scores {
             bound.push_exact(score);
         }
@@ -1016,22 +992,22 @@ mod tests {
     #[test]
     fn slot_keeps_the_highest_finite_threshold() {
         let slot = Arc::new(AtomicSharedThreshold::default());
-        let global: Arc<dyn SharedThreshold<Score>> = slot.clone();
-        exact_bound(Arc::clone(&global), 2, &[]).publish();
+        let shared_topk_threshold: Arc<dyn SharedThreshold<Score>> = slot.clone();
+        exact_bound(Arc::clone(&shared_topk_threshold), 2, &[]).publish();
         assert_eq!(
             slot_score(&slot),
             None,
             "an unset threshold is never offered"
         );
 
-        let mut first = exact_bound(Arc::clone(&global), 2, &[5.0, 3.0]);
+        let mut first = exact_bound(Arc::clone(&shared_topk_threshold), 2, &[5.0, 3.0]);
         first.publish();
         assert_eq!(slot_score(&slot), Some(3.0));
         let held = first.threshold();
         first.publish();
         assert_eq!(first.threshold(), held);
 
-        let mut second = exact_bound(Arc::clone(&global), 2, &[5.0, 2.0]);
+        let mut second = exact_bound(Arc::clone(&shared_topk_threshold), 2, &[5.0, 2.0]);
         second.publish();
         assert_eq!(slot_score(&slot), Some(3.0), "a lower offer stays out");
         second.push_exact(4.0);
@@ -1039,12 +1015,12 @@ mod tests {
         assert_eq!(slot_score(&slot), Some(4.0));
 
         for score in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
-            let mut bound = exact_bound(Arc::clone(&global), 1, &[score]);
+            let mut bound = exact_bound(Arc::clone(&shared_topk_threshold), 1, &[score]);
             bound.publish();
             assert_eq!(slot_score(&slot), Some(4.0), "{score} is never written");
         }
 
-        let mut synced = exact_bound(Arc::clone(&global), 2, &[5.0, 3.0]);
+        let mut synced = exact_bound(Arc::clone(&shared_topk_threshold), 2, &[5.0, 3.0]);
         synced.sync();
         assert_eq!(synced.threshold(), Some(4.0));
         synced.sync();
@@ -1054,7 +1030,7 @@ mod tests {
             "an equal score changes nothing"
         );
 
-        let mut above = exact_bound(Arc::clone(&global), 2, &[9.0, 8.0]);
+        let mut above = exact_bound(Arc::clone(&shared_topk_threshold), 2, &[9.0, 8.0]);
         above.sync();
         assert_eq!(above.threshold(), Some(8.0));
         above.publish();
@@ -1067,17 +1043,18 @@ mod tests {
     fn concurrent_publishes_leave_the_slot_at_the_max() {
         for seed in 0..32 {
             let slot = Arc::new(AtomicSharedThreshold::default());
-            let global: Arc<dyn SharedThreshold<Score>> = slot.clone();
+            let shared_topk_threshold: Arc<dyn SharedThreshold<Score>> = slot.clone();
             let threads = 2 + seed as usize % 7;
             let barrier = Barrier::new(threads);
             let finals: Vec<Option<f32>> = std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..threads)
                     .map(|thread| {
-                        let (global, barrier) = (Arc::clone(&global), &barrier);
+                        let (shared_topk_threshold, barrier) =
+                            (Arc::clone(&shared_topk_threshold), &barrier);
                         scope.spawn(move || {
                             let mut rng = fastrand::Rng::with_seed(seed * 64 + thread as u64);
                             let k = 1 + rng.usize(0..6);
-                            let mut bound = PruningBound::new(k, None, global);
+                            let mut bound = PruningBound::new(k, None, shared_topk_threshold);
                             barrier.wait();
                             for _ in 0..rng.usize(1..400) {
                                 bound.push_exact(rng.f32() * 100.0 - 50.0);

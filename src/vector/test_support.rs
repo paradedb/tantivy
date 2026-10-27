@@ -535,7 +535,7 @@ impl Fixture {
         )
     }
 
-    /// [`Fixture::run_planned`], pruning against `shared` too when given.
+    /// [`Fixture::run_planned`], seeding the scan from `collector_topk` when given.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_planned_with(
         &self,
@@ -546,7 +546,7 @@ impl Fixture {
         params: ProbeParams,
         plan: Option<PlanOverride>,
         admission_pruning: bool,
-        shared: Option<Arc<Mutex<TopK>>>,
+        collector_topk: Option<Arc<Mutex<TopK>>>,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = self.index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[segment];
@@ -572,7 +572,7 @@ impl Fixture {
         )?;
         backend.plan_override = plan;
         backend.admission_pruning_disabled = !admission_pruning;
-        backend.carried = shared;
+        backend.collector_topk = collector_topk;
         backend.top_n(weight, segment_reader, top_n)
     }
 
