@@ -209,8 +209,8 @@ impl Searcher {
     /// Same as [`search(...)`](Searcher::search) but multithreaded.
     ///
     /// The current implementation is rather naive :
-    /// multithreading is by splitting search into as many task
-    /// as there are segments.
+    /// multithreading normally splits search into one task per segment. Collectors
+    /// can override this through [`Collector::collect_segments`].
     ///
     /// It is powerless at making search faster if your index consists in
     /// one large segment.
@@ -227,13 +227,13 @@ impl Searcher {
     ) -> crate::Result<C::Fruit> {
         let weight = query.weight(enabled_scoring)?;
         collector.check_schema(self.schema())?;
-        let segment_readers = self.segment_readers();
-        let fruits = executor.map(
-            |(segment_ord, segment_reader)| {
-                collector.collect_segment(weight.as_ref(), segment_ord as u32, segment_reader)
-            },
-            segment_readers.iter().enumerate(),
-        )?;
+        let readers: Vec<_> = self
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .map(|(ord, reader)| (ord as SegmentOrdinal, reader))
+            .collect();
+        let fruits = collector.collect_segments(weight.as_ref(), &readers, executor, &|_| {})?;
         collector.merge_fruits(fruits)
     }
 

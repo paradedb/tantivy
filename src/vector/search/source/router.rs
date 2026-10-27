@@ -226,6 +226,127 @@ impl<'a> RouterClusters<'a> {
         }
     }
 
+    pub(crate) fn scheduled(
+        reader: &'a VectorIndexReader,
+        query: &'a VectorQuery<T>,
+        budget: WorkBudget,
+        filter: DocFilter,
+        segment: &'a SegmentReader,
+        metrics: RouterMetrics,
+    ) -> Self {
+        let index = reader.index().expect("IVF segment");
+        Self {
+            index,
+            reader,
+            query,
+            ranked: RouterIter::Scheduled(metrics),
+            meter: WorkMeter::new(budget),
+            controller: ProbeController::new(index.num_clusters()),
+            bounds: index.bounds(),
+            tracker: QueryBoundTracker::new(),
+            gate: RowGate::new(filter, segment.alive_bitset()),
+            docs: Vec::new(),
+            offsets: Vec::new(),
+            selected_docs: Vec::new(),
+            counters: RouterCounters::default(),
+        }
+    }
+
+    pub(crate) fn probe_scheduled(
+        &mut self,
+        candidate: Candidate,
+        feedback: Feedback,
+    ) -> crate::Result<Option<ClusterRows<'_>>> {
+        // The threshold may have advanced in a different segment since our last probe.
+        self.tracker.observe(
+            self.query.metric(),
+            HeapPeek::from_kth(feedback.kth_lower),
+            (self.counters.postings_row + self.counters.postings_skipped) as u32,
+        );
+        if self.prepare_cluster(candidate, feedback)? {
+            Ok(Some(self.cluster_rows(candidate)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn prepare_cluster(&mut self, candidate: Candidate, feedback: Feedback) -> crate::Result<bool> {
+        let Candidate { sim, node } = candidate;
+        let cluster = node as usize;
+        self.meter.open();
+        if self.verdict(cluster, sim.score()) == Verdict::Skip {
+            self.counters.bounds_skips += 1;
+            return Ok(false);
+        }
+        let rows = self.index.cluster_range(cluster);
+        if rows.is_empty() {
+            self.skip_empty(feedback)?;
+            return Ok(false);
+        }
+        let gated = self.gate_cluster(cluster, rows.len())?;
+        if !gated.all && self.offsets.is_empty() {
+            self.skip_empty(feedback)?;
+            return Ok(false);
+        }
+        self.selected_docs.clear();
+        if !gated.all {
+            self.selected_docs.extend(
+                self.offsets
+                    .iter()
+                    .map(|&offset| self.docs[offset as usize]),
+            );
+        }
+        Ok(true)
+    }
+
+    fn cluster_rows(&self, candidate: Candidate) -> ClusterRows<'_> {
+        let all = self.gate.is_open();
+        ClusterRows {
+            cluster: candidate.node as usize,
+            rows: self.index.cluster_range(candidate.node as usize),
+            offsets: (!all).then_some(&self.offsets[..]),
+            docs: (!all).then_some(&self.selected_docs[..]),
+            centroid: Some(candidate.sim),
+        }
+    }
+
+    /// The bounds gate's verdict for `cluster`, whose routing key is `sim`.
+    fn verdict(&self, cluster: usize, sim: f32) -> Verdict {
+        let query_bound = self.tracker.bound();
+        bounds_verdict(query_bound, || {
+            let QueryBound::Armed { t } = query_bound else {
+                // Never called while filling; +inf keeps the impossible case fail-open.
+                return f32::INFINITY;
+            };
+            // Every margin assumes the stream key is the exact centroid similarity. The row is
+            // read unmetered, so debug builds report the same IO.
+            #[cfg(debug_assertions)]
+            {
+                let row = self
+                    .index
+                    .centroid_row_slice(cluster)
+                    .and_then(|row| Ok(row.read_bytes()?))
+                    .expect("readable centroid row");
+                let exact = self
+                    .query
+                    .metric()
+                    .similarity_bytes::<f32>(self.query.widened(), &row);
+                debug_assert_eq!(
+                    sim,
+                    exact.score(),
+                    "routing stream key must be the exact centroid similarity"
+                );
+            }
+            let r = self.bounds.ball_r(cluster);
+            match self.query.metric() {
+                Metric::L2 | Metric::Cosine => {
+                    margin_ball_ball(t, r, to_bound_space(self.query.metric(), sim))
+                }
+                Metric::Dot => margin_ball_halfspace(sim, self.query.norm(), r, t),
+            }
+        })
+    }
+
     /// Selects `cluster`'s rows into `offsets` and counts what the gate pruned.
     fn gate_cluster(&mut self, cluster: usize, rows: usize) -> crate::Result<GatedRows> {
         // DocIds alone, then the gate, before any payload read.
@@ -272,38 +393,10 @@ impl ClusterSource for RouterClusters<'_> {
             if !self.controller.admit(&self.meter) {
                 return Ok(None);
             }
-            let cluster = node as usize;
-
-            self.meter.open();
-            let rows = self.index.cluster_range(cluster);
-            if rows.is_empty() {
-                self.skip_empty();
-                continue;
+            let candidate = Candidate { sim, node };
+            if self.prepare_cluster(candidate, feedback)? {
+                return Ok(Some(self.cluster_rows(candidate)));
             }
-
-            let gated = self.gate_cluster(cluster, rows.len())?;
-            if !gated.all && self.offsets.is_empty() {
-                self.skip_empty();
-                continue;
-            }
-            let (offsets, docs) = if gated.all {
-                (None, None)
-            } else {
-                self.selected_docs.clear();
-                self.selected_docs.extend(
-                    self.offsets
-                        .iter()
-                        .map(|&offset| self.docs[offset as usize]),
-                );
-                (Some(&self.offsets[..]), Some(&self.selected_docs[..]))
-            };
-            return Ok(Some(ClusterRows {
-                cluster,
-                rows,
-                offsets,
-                docs,
-                centroid: Some(sim),
-            }));
         }
     }
 

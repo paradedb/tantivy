@@ -348,6 +348,26 @@ where
         Ok(SegmentVectorFruit { results, stats })
     }
 
+    fn collect_segments(
+        &self,
+        weight: &dyn Weight,
+        readers: &[(SegmentOrdinal, &SegmentReader)],
+        _executor: &crate::Executor,
+        on_segment: &(dyn Fn(SegmentOrdinal) + Sync),
+    ) -> crate::Result<Vec<SegmentVectorFruit<S::SortKey>>> {
+        if readers.len() <= 1 {
+            return readers
+                .iter()
+                .map(|&(ord, reader)| {
+                    let result = self.collect_segment(weight, ord, reader);
+                    on_segment(ord);
+                    result
+                })
+                .collect();
+        }
+        self.collect_global_segments(weight, readers, on_segment)
+    }
+
     fn merge_fruits(
         &self,
         segment_fruits: Vec<SegmentVectorFruit<S::SortKey>>,
@@ -390,9 +410,83 @@ where
     T: VectorElement,
     S: SortKeyComputer + Send + Sync + 'static,
 {
-    /// Searches one segment. Prepares the query, runs the segment searcher with this collector's
-    /// top-k and shared top-k threshold, offers the hits' scores to the collector top-k, and lifts
-    /// each hit's tie-break key out of the segment.
+    /// Searches a logical union of segment routers with one work budget and exact top-k bound.
+    /// Located filter matches are exhaustive and reserve their share of the budget.
+    /// Calls `on_segment` after each slice of work so an embedder can attribute physical reads.
+    fn collect_global_segments(
+        &self,
+        weight: &dyn Weight,
+        readers: &[(SegmentOrdinal, &SegmentReader)],
+        mut on_segment: impl FnMut(SegmentOrdinal),
+    ) -> crate::Result<Vec<SegmentVectorFruit<S::SortKey>>> {
+        if let Some((_, reader)) = readers.first() {
+            self.check_schema(reader.schema())?;
+        }
+        let mut backends = Vec::with_capacity(readers.len());
+        let mut tie_breaks = Vec::with_capacity(readers.len());
+        let mut totals = Vec::with_capacity(readers.len());
+        for &(ord, reader) in readers {
+            let (result, measured) = measure(|| {
+                let _init = enter_vector_stage(VectorStage::ScanInit);
+                let (query, quantized) = {
+                    let _prep = enter_vector_stage(VectorStage::QueryPrep);
+                    let vectors = reader.vector_index(self.field)?;
+                    let query = self.vector_query(vectors.options().metric());
+                    let quantized = vectors
+                        .quantization()
+                        .filter(|_| self.max_scan_levels > 0)
+                        .map(|field| self.quantized_query(field, &query));
+                    (query, quantized)
+                };
+                let backend = SegmentSearcher::for_segment(
+                    reader,
+                    ord,
+                    self.field,
+                    query,
+                    quantized,
+                    self.probe_params.clone(),
+                )?;
+                Ok::<_, TantivyError>((backend, self.tie_break.segment_sort_key_computer(reader)?))
+            });
+            on_segment(ord);
+            let (backend, tie_break) = result?;
+            backends.push(backend);
+            tie_breaks.push(tie_break);
+            totals.push(measured);
+        }
+        let segments: Vec<_> = readers.iter().map(|(_, reader)| *reader).collect();
+        let results = crate::vector::search::global::search(
+            &backends,
+            &segments,
+            weight,
+            self.segment_top_n(),
+            &mut tie_breaks,
+            || self.tie_break.comparator(),
+            &mut totals,
+            &mut |i| on_segment(readers[i].0),
+        )?;
+        let fruits = results
+            .into_iter()
+            .zip(tie_breaks)
+            .zip(totals)
+            .map(|(((hits, report), tie_break), totals)| {
+                let results = hits
+                    .into_iter()
+                    .map(|((score, key), address)| {
+                        ((score, tie_break.convert_segment_sort_key(key)), address)
+                    })
+                    .collect();
+                SegmentVectorFruit {
+                    results,
+                    stats: ProbeStats::new(report, totals),
+                }
+            })
+            .collect();
+        Ok(fruits)
+    }
+
+    /// Searches one segment: prepares the query, runs the segment searcher, and lifts each hit's
+    /// tie-break key out of the segment.
     fn search_segment(
         &self,
         weight: &dyn Weight,
@@ -499,7 +593,7 @@ mod ivf_e2e_tests {
 
     use super::VectorSimilarityFruit;
     use crate::collector::sort_key::{SortBySimilarityScore, SortByStaticFastValue};
-    use crate::collector::TopDocs;
+    use crate::collector::{Collector, TopDocs};
     use crate::index::IndexSettings;
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
@@ -534,6 +628,190 @@ mod ivf_e2e_tests {
                 assert_eq!(actual.results, expected, "IVF query={query:?} k={k}");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn global_schedule_preserves_filtered_quantized_results() -> crate::Result<()> {
+        use crate::query::Query;
+        use crate::vector::params::LocatedPath;
+        use crate::vector::test_support::FixtureSpec;
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            let fixture = FixtureSpec::clustered(metric, 128, 8, 768)
+                .segments(3)
+                .schedule(&[1, 1])
+                .label("rare", |i| i % 19 == 0)
+                .deletes(&[0, 19, 201, 700])
+                .without_vectors(|i| i % 23 == 0)
+                .build()?;
+            let searcher = fixture.index.reader()?.searcher();
+            let mut readers: Vec<_> = searcher
+                .segment_readers()
+                .iter()
+                .enumerate()
+                .map(|(ord, reader)| (ord as u32, reader))
+                .collect();
+            readers.reverse();
+            let mut query = vec![0.01; 128];
+            query[2] = 1.0;
+            for filter in [
+                &AllQuery as &dyn Query,
+                &fixture.filter("rare"),
+                &fixture.filter("absent"),
+            ] {
+                for (located, exact_plan) in [
+                    (LocatedPath::Off, false),
+                    (LocatedPath::Auto, false),
+                    (LocatedPath::Off, true),
+                    (LocatedPath::Auto, true),
+                ] {
+                    let params = crate::vector::ProbeParams {
+                        located,
+                        exact_plan,
+                        ..exhaustive_params(8)
+                    };
+                    let collector = TopDocs::with_limit(7)
+                        .and_offset(3)
+                        .order_by_similarity(fixture.field, query.clone())
+                        .with_probe_params(params);
+                    let fruit = collector.merge_fruits(collector.collect_segments(
+                        fixture.weight(filter)?.as_ref(),
+                        &readers,
+                        &crate::Executor::single_thread(),
+                        &|_| {},
+                    )?)?;
+                    let expected: Vec<_> = fixture
+                        .oracle(filter, &query, 10)?
+                        .into_iter()
+                        .skip(3)
+                        .collect();
+                    assert_eq!(fruit.results, expected, "{metric:?} {located:?}");
+                    assert_eq!(fruit.stats.len(), readers.len());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn located_work_cannot_starve_a_routed_segment() -> crate::Result<()> {
+        use crate::vector::test_support::{FixtureSpec, Layout};
+        let mut weak = FixtureSpec::clustered(Metric::L2, 32, 8, 128).label("matches", |i| i < 16);
+        for vector in weak.vectors.iter_mut().flatten() {
+            for value in vector {
+                *value += 10.0;
+            }
+        }
+        if let Layout::Ivf(centroids) = &mut weak.layout {
+            for value in centroids.iter_mut().flatten() {
+                *value += 10.0;
+            }
+        }
+        let weak_a = weak.build()?;
+        let weak_b = weak.build()?;
+        let near = FixtureSpec::clustered(Metric::L2, 32, 8, 128)
+            .label("matches", |_| true)
+            .build()?;
+        let searchers = [
+            weak_a.index.reader()?.searcher(),
+            weak_b.index.reader()?.searcher(),
+            near.index.reader()?.searcher(),
+        ];
+        let readers: Vec<_> = searchers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i as u32, &s.segment_readers()[0]))
+            .collect();
+        let mut query = vec![0.0; 32];
+        query[5] = 1.0;
+        let collector = TopDocs::with_limit(3)
+            .order_by_similarity(near.field, query)
+            .with_probe_params(crate::vector::ProbeParams {
+                max_probe_fraction: 0.001,
+                min_probe_clusters: 3,
+                ..Default::default()
+            });
+        let weight = near.weight(&near.filter("matches"))?;
+        let result = collector.merge_fruits(collector.collect_segments(
+            weight.as_ref(),
+            &readers,
+            &crate::Executor::single_thread(),
+            &|_| {},
+        )?)?;
+        assert_eq!(result.results.len(), 3);
+        assert!(result
+            .results
+            .iter()
+            .all(|(_, address)| address.segment_ord == 2));
+        assert_eq!(
+            result.stats[0].access_path,
+            crate::vector::stats::AccessPath::Located
+        );
+        assert_eq!(
+            result.stats[1].access_path,
+            crate::vector::stats::AccessPath::Located
+        );
+        assert_eq!(
+            result.stats[2].access_path,
+            crate::vector::stats::AccessPath::Routed
+        );
+        assert!(result.stats[2].work_charged > 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn global_schedule_has_one_budget_floor() -> crate::Result<()> {
+        use crate::vector::test_support::FixtureSpec;
+        let fixture = FixtureSpec::clustered(Metric::L2, 32, 16, 1024)
+            .segments(4)
+            .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let readers: Vec<_> = searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .map(|(ord, reader)| (ord as u32, reader))
+            .collect();
+        let mut query = vec![0.0; 32];
+        query[3] = 1.0;
+        let collector = TopDocs::with_limit(10)
+            .order_by_similarity(fixture.field, query)
+            .with_probe_params(crate::vector::ProbeParams {
+                max_probe_fraction: 0.0005,
+                ..Default::default()
+            });
+        let fruit = searcher.search(&AllQuery, &collector)?;
+        assert_eq!(fruit.stats.iter().map(|s| s.work_budget).sum::<f32>(), 16.0);
+        assert!(fruit.stats.iter().map(|s| s.work_charged).sum::<f32>() < 18.0);
+        let weight = fixture.all()?;
+        let single = [readers[2]];
+        let legacy = collector.collect_segment(weight.as_ref(), single[0].0, single[0].1)?;
+        let mut automatic = collector.collect_segments(
+            weight.as_ref(),
+            &single,
+            &crate::Executor::single_thread(),
+            &|_| {},
+        )?;
+        assert_eq!(automatic.len(), 1);
+        let automatic = automatic.pop().unwrap();
+        assert_eq!(automatic.results, legacy.results);
+        let counters = |stats| {
+            let mut value = serde_json::to_value(stats).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .retain(|key, _| !key.ends_with("_ns"));
+            value
+        };
+        assert_eq!(counters(automatic.stats), counters(legacy.stats));
+        let empty = collector.merge_fruits(collector.collect_segments(
+            weight.as_ref(),
+            &[],
+            &crate::Executor::single_thread(),
+            &|_| {},
+        )?)?;
+        assert!(empty.results.is_empty());
+        assert!(empty.stats.is_empty());
         Ok(())
     }
 
@@ -742,6 +1020,42 @@ mod ivf_e2e_tests {
                 let want: Vec<DocAddress> = expected.iter().take(k).map(|entry| entry.2).collect();
                 assert_eq!(actual, want, "query={query:?} k={k}");
 
+                let collector = TopDocs::with_limit(k)
+                    .and_offset(2)
+                    .order_by_similarity(embedding_field, query.to_vec())
+                    .with_probe_params(exhaustive_params(9))
+                    .with_tie_break(tie_break());
+                let readers: Vec<_> = searcher
+                    .segment_readers()
+                    .iter()
+                    .enumerate()
+                    .map(|(ord, reader)| (ord as u32, reader))
+                    .collect();
+                let weight = crate::query::Query::weight(
+                    &AllQuery,
+                    crate::query::EnableScoring::disabled_from_searcher(&searcher),
+                )?;
+                let global = collector.merge_fruits(collector.collect_segments(
+                    weight.as_ref(),
+                    &readers,
+                    &crate::Executor::single_thread(),
+                    &|_| {},
+                )?)?;
+                let want: Vec<_> = expected
+                    .iter()
+                    .skip(2)
+                    .take(k)
+                    .map(|entry| entry.2)
+                    .collect();
+                assert_eq!(
+                    global
+                        .results
+                        .iter()
+                        .map(|(_, address)| *address)
+                        .collect::<Vec<_>>(),
+                    want
+                );
+
                 // Probe invariance, under the default probe params so the
                 // gate/ceiling logic actually runs.
                 let collector =
@@ -944,6 +1258,26 @@ mod ivf_e2e_tests {
                     .build(),
             )?;
             assert_eq!(cities(&fruit), want, "k={k}");
+            let collector = TopDocs::with_limit(k)
+                .order_by_similarity(embedding_field, vec![0.0_f32, 0.0])
+                .with_tie_break((SortByString::for_field("city"), Order::Asc));
+            let readers: Vec<_> = searcher
+                .segment_readers()
+                .iter()
+                .enumerate()
+                .map(|(ord, reader)| (ord as u32, reader))
+                .collect();
+            let weight = crate::query::Query::weight(
+                &AllQuery,
+                crate::query::EnableScoring::disabled_from_searcher(&searcher),
+            )?;
+            let global = collector.merge_fruits(collector.collect_segments(
+                weight.as_ref(),
+                &readers,
+                &crate::Executor::single_thread(),
+                &|_| {},
+            )?)?;
+            assert_eq!(cities(&global), want, "global k={k}");
         }
         Ok(())
     }

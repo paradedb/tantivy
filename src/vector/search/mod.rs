@@ -4,6 +4,7 @@
 //! exactly. An IVF segment is planned, then scanned over its cluster source.
 
 pub(crate) mod cluster_source;
+pub(crate) mod global;
 pub(crate) mod interval;
 pub(crate) mod prepared;
 pub(crate) mod scan;
