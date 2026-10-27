@@ -16,6 +16,8 @@ mod x86 {
         Popcnt,
         /// AVX2 vectorization, hardware POPCNT and F16C conversions.
         Avx2,
+        /// AVX-512 VPOPCNTDQ on top of the AVX2 tier's features.
+        Avx512,
     }
 
     /// Returns the detected tier, probing CPU features once per process.
@@ -26,6 +28,7 @@ mod x86 {
             0 => Tier::Baseline,
             1 => Tier::Popcnt,
             2 => Tier::Avx2,
+            3 => Tier::Avx512,
             _ => {
                 let detected = detect();
                 TIER.store(detected as u8, Ordering::Relaxed);
@@ -35,10 +38,17 @@ mod x86 {
     }
 
     fn detect() -> Tier {
-        if std::arch::is_x86_feature_detected!("avx2")
+        let avx2 = std::arch::is_x86_feature_detected!("avx2")
             && std::arch::is_x86_feature_detected!("popcnt")
-            && std::arch::is_x86_feature_detected!("f16c")
+            && std::arch::is_x86_feature_detected!("f16c");
+        if avx2
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("avx512vpopcntdq")
         {
+            Tier::Avx512
+        } else if avx2 {
             Tier::Avx2
         } else if std::arch::is_x86_feature_detected!("popcnt") {
             Tier::Popcnt

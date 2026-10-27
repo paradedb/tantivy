@@ -58,6 +58,28 @@ if ! grep -Eq '\bpopcnt(l|q)?\b' "$dispatched_asm"; then
     exit 1
 fi
 
+# Prints the vpopcntq count of the sign::x86 function named by mangled segment $1.
+vpopcntq_count() {
+    variant_asm="$CARGO_TARGET_DIR/tantivy_quant-sign-x86-$1.s"
+    module_functions "$quant_asm" "4sign3x86$1" > "$variant_asm"
+    if [ ! -s "$variant_asm" ]; then
+        echo "no tantivy_quant::sign::x86 $1 found in $quant_asm" >&2
+        exit 1
+    fi
+    grep -Ec '\bvpopcntq\b' "$variant_asm" || true
+}
+
+# The AVX-512 tier exists for vectorized VPOPCNTQ, so the batch and indexed variants must
+# contain it. The single-row variant is reported, not required.
+batch_count=$(vpopcntq_count 12batch_avx512)
+indexed_count=$(vpopcntq_count 14indexed_avx512)
+single_count=$(vpopcntq_count 13single_avx512)
+echo "vpopcntq in sign::x86 AVX-512 variants: batch $batch_count, indexed $indexed_count, single $single_count"
+if [ "$batch_count" -eq 0 ] || [ "$indexed_count" -eq 0 ]; then
+    echo "tantivy_quant::sign::x86 batch_avx512 and indexed_avx512 must contain vpopcntq" >&2
+    exit 1
+fi
+
 rotation_asm="$CARGO_TARGET_DIR/tantivy_quant-rotation.s"
 module_functions "$quant_asm" 8rotation > "$rotation_asm"
 if [ ! -s "$rotation_asm" ]; then

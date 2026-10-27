@@ -64,22 +64,24 @@ posting range, so a later layer never touches rows an earlier one ruled out.
 - **Zero residuals serialize canonically:** zero codes, zero scale, γ = 1,
   E = 0.
 - **`unsafe` is confined to dispatched kernels.** `sign`'s NEON kernels and
-  its x86 `target_feature` variants run only behind CPU-feature checks (NEON
-  is baseline on aarch64, UDOT behind FEAT_DotProd detection), and every
-  variant is bit-identical to the portable body it wraps. The one other use
-  is an aligned `align_to::<u64>` cast in `cascade` with a decoding fallback
-  when the input is unaligned or big-endian.
+  its x86 `target_feature` variants (POPCNT, AVX2 and AVX-512 VPOPCNTDQ) run
+  only behind CPU-feature checks (NEON is baseline on aarch64, UDOT behind
+  FEAT_DotProd detection), and every variant is bit-identical to the portable
+  body it wraps. The one other use is an aligned `align_to::<u64>` cast in
+  `cascade` with a decoding fallback when the input is unaligned or
+  big-endian.
 
 ## Checks and benchmarks
 
 ```sh
 ./quant/check.sh           # nightly fmt --check, clippy -D warnings, tests in --release
-./quant/check_asm_x86.sh   # sign emits popcnt; rotation emits packed addps/subps
+./quant/check_asm_x86.sh   # sign emits popcnt and vpopcntq; rotation emits packed addps/subps
 ```
 
 CI (`.github/workflows/quant-kernels.yml`) runs both on x86 with
 `-C target-cpu=native` and thin LTO, checks for `cnt` in `sign`'s
-assembly on an ARM runner, and runs every Criterion target:
+assembly on an ARM runner, runs the `sign` and f16 tests under Intel SDE so
+the AVX-512 tier executes on any runner, and runs every Criterion target:
 
 ```sh
 cargo bench -p tantivy-quant --bench rotation
