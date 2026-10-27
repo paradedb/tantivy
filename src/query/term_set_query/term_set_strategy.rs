@@ -410,10 +410,18 @@ pub(crate) fn sorted_range_in_column(
 }
 
 /// Gallop admissibility: returns `Some(Gallop { .. })` when the segment is
-/// sorted by `field_name`, the column shape supports gallop, and no upstream
-/// filter has narrowed the work. Copies the already-pruned+sorted+deduped
-/// `pruned_terms` slice into `sorted_terms` only on commit. `cfg.gallop_enabled`
-/// is the only configurable gate.
+/// sorted by `field_name`, the column shape supports gallop, and the caller is
+/// driving a full-segment scan (`candidate_size.is_none()`).
+///
+/// When `candidate_size` is `Some(_)`, the caller is probing an upstream
+/// candidate set via `seek_danger(target)`. In that regime, `TermSetDocSet`
+/// does an `O(1)` column read + hash-set probe per candidate without eager
+/// positioning, whereas `TermSetGallopDocSet` eagerly gallops in `new()` and
+/// falls back to `seek(target)` (galloping the column on every miss).
+///
+/// Copies the already-pruned+sorted+deduped `pruned_terms` slice into
+/// `sorted_terms` only on commit. `cfg.gallop_enabled` is the only
+/// configurable gate.
 fn try_gallop(
     reader: &SegmentReader,
     column: &Column<u64>,

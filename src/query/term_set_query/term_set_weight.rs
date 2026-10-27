@@ -45,7 +45,7 @@ use crate::query::{
     AutomatonWeight, BooleanWeight, ConstScorer, EmptyScorer, EnableScoring, Explanation, Occur,
     Query, Scorer, Weight,
 };
-use crate::schema::{Field, FieldType, Type};
+use crate::schema::{Field, FieldType, DATE_TIME_PRECISION_INDEXED};
 use crate::{DocId, DocSet, Score, TantivyError, Term, TERMINATED};
 
 // ---------------------------------------------------------------------------
@@ -169,15 +169,23 @@ pub struct TermSetWeight {
     bitmap_enabled: bool,
 }
 
-/// Returns whether `field_type.value_type()` has a fast-field column
-/// representation the planner's FF strategies can open. Keep this in
-/// sync with `FastFieldTermSetWeight::scorer`'s old `ColumnType` allow
-/// list (U64/I64/F64/Date) plus IPv6.
+/// Returns whether `field_type` has a fast-field column representation the
+/// planner's FF strategies can open and use interchangeably with the inverted
+/// index. Keep this in sync with `dispatch_numeric_fast`'s `ColumnType` allow
+/// list (U64/I64/F64/DateTime) plus IPv6.
+///
+/// For `Date` fields that are also `INDEXED`, the inverted index always stores
+/// values truncated to `DATE_TIME_PRECISION_INDEXED`, so fast-field strategies
+/// and min/max range pruning are only sound when the fast-field storage
+/// precision matches `DATE_TIME_PRECISION_INDEXED`.
 fn type_supported_for_fast_field(field_type: &FieldType) -> bool {
-    matches!(
-        field_type.value_type(),
-        Type::U64 | Type::I64 | Type::F64 | Type::Date | Type::IpAddr
-    )
+    match field_type {
+        FieldType::U64(_) | FieldType::I64(_) | FieldType::F64(_) | FieldType::IpAddr(_) => true,
+        FieldType::Date(opts) => {
+            !opts.is_indexed() || opts.get_precision() == DATE_TIME_PRECISION_INDEXED
+        }
+        _ => false,
+    }
 }
 
 impl TermSetWeight {
@@ -252,7 +260,7 @@ impl TermSetWeight {
                 // correspondence with `terms_bytes`.
                 values.sort_unstable();
                 values.dedup();
-                debug_assert_eq!(values.len(), terms_bytes.len());
+                assert_eq!(values.len(), terms_bytes.len());
                 TermRepr::Numeric(values)
             } else {
                 // Text / string / json — bytes-only dispatch.
@@ -647,6 +655,7 @@ pub(crate) struct TermSetDocSet<T: Copy + Eq + std::hash::Hash> {
     values: FxHashSet<T>,
     doc_id: DocId,
     max_doc: DocId,
+    positioned: bool,
 }
 
 impl<T: Copy + Eq + std::hash::Hash + PartialOrd + std::fmt::Debug + Send + Sync + 'static>
@@ -674,6 +683,7 @@ impl<T: Copy + Eq + std::hash::Hash + PartialOrd + std::fmt::Debug + Send + Sync
             values,
             doc_id,
             max_doc,
+            positioned: doc_id == TERMINATED,
         }
     }
 }
@@ -1001,6 +1011,7 @@ impl<T: Copy + Eq + std::hash::Hash + PartialOrd + std::fmt::Debug + Send + Sync
     for TermSetDocSet<T>
 {
     fn advance(&mut self) -> DocId {
+        debug_assert!(self.positioned);
         if self.doc_id == TERMINATED {
             return TERMINATED;
         }
@@ -1009,6 +1020,7 @@ impl<T: Copy + Eq + std::hash::Hash + PartialOrd + std::fmt::Debug + Send + Sync
 
     fn seek(&mut self, target: DocId) -> DocId {
         debug_assert!(target >= self.doc_id || self.doc_id == TERMINATED);
+        self.positioned = true;
         if target >= self.max_doc {
             self.doc_id = TERMINATED;
             return TERMINATED;
@@ -1030,15 +1042,19 @@ impl<T: Copy + Eq + std::hash::Hash + PartialOrd + std::fmt::Debug + Send + Sync
     fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
         if target >= self.max_doc {
             self.doc_id = TERMINATED;
+            self.positioned = true;
             return SeekDangerResult::SeekLowerBound(TERMINATED);
         }
-        for value in self.column.values_for_doc(target) {
-            if self.values.contains(&value) {
-                self.doc_id = target;
-                return SeekDangerResult::Found;
-            }
+        self.positioned = self
+            .column
+            .values_for_doc(target)
+            .any(|value| self.values.contains(&value));
+        if self.positioned {
+            self.doc_id = target;
+            SeekDangerResult::Found
+        } else {
+            SeekDangerResult::SeekLowerBound(target + 1)
         }
-        SeekDangerResult::SeekLowerBound(target + 1)
     }
 
     fn doc(&self) -> DocId {
