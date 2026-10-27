@@ -10,7 +10,6 @@ pub(crate) mod layer_read;
 pub(crate) mod plan;
 
 use std::ops::Range;
-use std::sync::Arc;
 
 use self::bound::PruningBound;
 use self::columns::{Columns, QuantizedCandidates};
@@ -22,7 +21,7 @@ use self::layer_read::{decode_layer, Decoded, LayerRead, LayerSpec};
 use self::plan::{forced_plan, PlanOverride};
 use self::plan::{price, Read, ReadCosts};
 use crate::collector::sort_key::Comparator;
-use crate::collector::{SegmentSortKeyComputer, SharedThreshold};
+use crate::collector::SegmentSortKeyComputer;
 use crate::error::DataCorruption;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
@@ -34,7 +33,7 @@ use crate::vector::storage::quantized::{QuantizedFieldReader, ReadScratch};
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::enter_vector_stage;
 use crate::vector::{VectorElement, VectorStage};
-use crate::{Score, SegmentOrdinal};
+use crate::SegmentOrdinal;
 
 // --- Contracts ---
 
@@ -411,8 +410,7 @@ where
         index: &'a ClusterIndex,
         query: ScoringQuery<'a, T>,
         config: ScanConfig,
-        collector_kth: Option<f32>,
-        shared_topk_threshold: Arc<dyn SharedThreshold<Score>>,
+        bound: PruningBound,
         tie_break: &'a mut K,
         tie_comparator: C,
     ) -> crate::Result<Self> {
@@ -436,7 +434,7 @@ where
         let layers = quantized.as_ref().map_or(0, |state| state.layers.len());
         Ok(Self {
             exact: ExactScorer::new(reader, query.query, config.top_n, tie_break, tie_comparator),
-            bound: PruningBound::new(config.top_n, collector_kth, shared_topk_threshold),
+            bound,
             quantized,
             scratch: ReadScratch::default(),
             by_cluster: Vec::new(),

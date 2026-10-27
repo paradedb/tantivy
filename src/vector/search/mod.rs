@@ -20,7 +20,7 @@ use crate::query::Weight;
 use crate::schema::Field;
 use crate::vector::params::ProbeParams;
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery, VectorQuery};
-use crate::vector::search::scan::bound::TopK;
+use crate::vector::search::scan::bound::{PruningBound, TopK};
 use crate::vector::search::scan::heap::{tie_break_key, TieBreakHits};
 #[cfg(test)]
 use crate::vector::search::scan::plan::PlanOverride;
@@ -235,13 +235,17 @@ impl<T: VectorElement> SegmentSearcher<T> {
             .collector_topk
             .as_ref()
             .and_then(|collector_topk| collector_topk.lock().unwrap().kth_lower());
+        let bound = PruningBound::new(
+            top_n,
+            collector_kth,
+            Arc::clone(&self.shared_topk_threshold),
+        );
         let mut scan = SegmentScan::new(
             &self.reader,
             index,
             self.scoring_query(),
             config,
-            collector_kth,
-            Arc::clone(&self.shared_topk_threshold),
+            bound,
             tie_break,
             tie_comparator,
         )?;

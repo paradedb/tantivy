@@ -267,7 +267,7 @@ impl PruningBound {
     /// A bound for `k` rows. `collector_kth` is the k-th exact score already returned by finished
     /// segments of this collector, when they have filled `k`. `shared_topk_threshold` is the
     /// participants' threshold.
-    pub(super) fn new(
+    pub(crate) fn new(
         k: usize,
         collector_kth: Option<f32>,
         shared_topk_threshold: Arc<dyn SharedThreshold<Score>>,
