@@ -13,12 +13,14 @@ pub(crate) mod source;
 use std::sync::{Arc, Mutex};
 
 use crate::collector::sort_key::{Comparator, NaturalComparator};
-use crate::collector::{SegmentSortKeyComputer, SharedThreshold, TopNComputer};
+use crate::collector::{
+    AtomicSharedThreshold, SegmentSortKeyComputer, SharedThreshold, TopNComputer,
+};
 use crate::query::Weight;
 use crate::schema::Field;
 use crate::vector::params::ProbeParams;
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery, VectorQuery};
-use crate::vector::search::scan::bound::{LocalThreshold, TopK};
+use crate::vector::search::scan::bound::TopK;
 use crate::vector::search::scan::heap::{tie_break_key, TieBreakHits};
 #[cfg(test)]
 use crate::vector::search::scan::plan::PlanOverride;
@@ -52,7 +54,8 @@ pub(crate) struct SegmentSearcher<T: VectorElement> {
     /// Exact scores segments of this collector have finished. The scan seeds its threshold from
     /// their k-th. `None` seeds nothing.
     pub(crate) collector_topk: Option<Arc<Mutex<TopK>>>,
-    /// The threshold this scan publishes. A fresh [`LocalThreshold`] when the query shares none.
+    /// The threshold this scan publishes. Defaults to a process-local
+    /// [`AtomicSharedThreshold`] until the collector installs its shared slot.
     pub(crate) shared_topk_threshold: Arc<dyn SharedThreshold<Score>>,
     #[cfg(test)]
     pub(crate) plan_override: Option<PlanOverride>,
@@ -79,7 +82,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
             probe_params,
             segment_ord,
             collector_topk: None,
-            shared_topk_threshold: Arc::new(LocalThreshold::default()),
+            shared_topk_threshold: Arc::new(AtomicSharedThreshold::default()),
             #[cfg(test)]
             plan_override: None,
             #[cfg(test)]

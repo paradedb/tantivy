@@ -444,12 +444,14 @@ impl Fixture {
         params: ProbeParams,
         slot: SharedThresholdArcOpt<Score>,
     ) -> crate::Result<VectorSimilarityFruit> {
-        let collector = TopDocs::with_limit(limit)
+        let mut builder = TopDocs::with_limit(limit)
             .and_offset(offset)
             .order_by_similarity(self.field, query.to_vec())
-            .with_probe_params(params)
-            .with_shared_threshold(slot)
-            .build();
+            .with_probe_params(params);
+        if let Some(slot) = slot {
+            builder = builder.with_shared_threshold(slot);
+        }
+        let collector = builder.build();
         self.index.reader()?.searcher().search(filter, &collector)
     }
 

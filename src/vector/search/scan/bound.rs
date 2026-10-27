@@ -2,8 +2,8 @@
 //!
 //! The collector holds two things every segment scan shares. `collector_topk` is the top-k exact
 //! scores from segments this collector has already finished. `shared_topk_threshold` is the
-//! threshold the query's participants publish; a scan that is not given one uses a fresh
-//! [`LocalThreshold`].
+//! threshold the query's participants publish; when the caller provides none, the collector builds
+//! a process-local [`AtomicSharedThreshold`] shared by every segment of that search.
 //!
 //! A [`PruningBound`] is one segment scan. Its [`TopK`] holds only that segment's candidates,
 //! ordered by lower endpoint, so the router and APS read [`TopK::kth_lower`] and
@@ -15,7 +15,9 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
-use crate::collector::{AtomicSharedThreshold, SharedThreshold};
+#[cfg(test)]
+use crate::collector::AtomicSharedThreshold;
+use crate::collector::SharedThreshold;
 use crate::vector::search::cluster_source::ClusterRows;
 use crate::vector::search::interval::{Estimate, LowerEndpoint, Threshold};
 use crate::vector::search::scan::columns::{Columns, QuantizedCandidates};
@@ -80,25 +82,6 @@ impl Ord for ByLower {
 }
 
 // --- Shared threshold ---
-
-/// A process-local [`SharedThreshold<Score>`]. A segment scan without a caller slot holds one of
-/// these, so [`PruningBound`] always has a threshold to read.
-#[derive(Default)]
-pub(crate) struct LocalThreshold(AtomicSharedThreshold);
-
-impl SharedThreshold<Score> for LocalThreshold {
-    fn load(&self) -> Option<(Score, SegmentOrdinal)> {
-        self.0.load()
-    }
-
-    fn try_update(
-        &self,
-        expected_threshold: &Option<(Score, SegmentOrdinal)>,
-        new_threshold: (Score, SegmentOrdinal),
-    ) -> Result<(), Option<(Score, SegmentOrdinal)>> {
-        self.0.try_update(expected_threshold, new_threshold)
-    }
-}
 
 /// Raises `shared_topk_threshold` to `score` when `score` is finite and strictly above the value
 /// loaded. Returns whether this call stored it.
@@ -306,7 +289,7 @@ impl PruningBound {
     /// No collector score, and a fresh process-local threshold.
     #[cfg(test)]
     pub(super) fn standalone(k: usize) -> Self {
-        Self::new(k, None, Arc::new(LocalThreshold::default()))
+        Self::new(k, None, Arc::new(AtomicSharedThreshold::default()))
     }
 
     /// The segment's own k-th lower endpoint. The router reads this.
@@ -470,7 +453,7 @@ impl PruningBound {
 mod tests {
     use std::sync::{Arc, Barrier};
 
-    use super::{Bound, Candidate, ExactMerge, LocalThreshold, PruningBound, TopK};
+    use super::{Bound, Candidate, ExactMerge, PruningBound, TopK};
     use crate::collector::{AtomicSharedThreshold, SharedThreshold};
     use crate::vector::quantization::QUANTIZED_BOUNDARY_KAPPA;
     use crate::vector::search::interval::{Estimate, LowerEndpoint, Threshold};
@@ -790,12 +773,12 @@ mod tests {
     /// empty segment. Segment candidates then raise `tau` and never lower it.
     #[test]
     fn collector_kth_seeds_tau_without_entering_the_segment_top() {
-        let bound = PruningBound::new(3, Some(4.5), Arc::new(LocalThreshold::default()));
+        let bound = PruningBound::new(3, Some(4.5), Arc::new(AtomicSharedThreshold::default()));
         assert_eq!(bound.threshold(), Some(4.5));
         assert_eq!(bound.own_lower(), None);
         assert_eq!(bound.own_estimate(), None);
 
-        let mut bound = PruningBound::new(2, Some(1.0), Arc::new(LocalThreshold::default()));
+        let mut bound = PruningBound::new(2, Some(1.0), Arc::new(AtomicSharedThreshold::default()));
         bound.merge_cluster([
             Candidate {
                 row: 0,
