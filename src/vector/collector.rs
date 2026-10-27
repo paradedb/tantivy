@@ -189,8 +189,9 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     quantized_queries: Mutex<HashMap<PreparedKey, PreparedCell>>,
     /// The query prepared for the field's metric on first use.
     prepared: Mutex<Option<Arc<VectorQuery<T>>>>,
-    /// The best `limit + offset` exact scores the finished segments returned. Later segments clone
-    /// them into the pruning bound. Cleared between searches.
+    /// The best `limit + offset` exact scores the finished segments returned. Later segments seed
+    /// their threshold from the k-th and do not copy these scores into the segment top. Cleared
+    /// between searches.
     carried: Arc<Mutex<TopK>>,
     /// The threshold every segment publishes. A [`LocalThreshold`] unless the caller passed a slot
     /// shared with other participants.

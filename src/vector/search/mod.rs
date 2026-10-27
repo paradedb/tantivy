@@ -49,7 +49,8 @@ pub(crate) struct SegmentSearcher<T: VectorElement> {
     quantized: Option<Arc<QuantizedQueryCtx>>,
     probe_params: ProbeParams,
     segment_ord: SegmentOrdinal,
-    /// Exact scores finished segments have returned. `None` starts this scan from an empty top-k.
+    /// Exact scores finished segments have returned. The scan seeds its threshold from their k-th.
+    /// `None` seeds nothing.
     pub(crate) carried: Option<Arc<Mutex<TopK>>>,
     /// The threshold this scan publishes. A [`LocalThreshold`] when the query shares none.
     pub(crate) global: Arc<dyn SharedThreshold<Score>>,
@@ -228,15 +229,16 @@ impl<T: VectorElement> SegmentSearcher<T> {
             #[cfg(test)]
             admission_pruning_disabled: self.admission_pruning_disabled,
         };
+        let carried_kth = self
+            .carried
+            .as_ref()
+            .and_then(|carried| carried.lock().unwrap().kth_lower());
         let mut scan = SegmentScan::new(
             &self.reader,
             index,
             self.scoring_query(),
             config,
-            match &self.carried {
-                Some(carried) => carried.lock().unwrap().clone(),
-                None => TopK::new(top_n),
-            },
+            carried_kth,
             Arc::clone(&self.global),
             tie_break,
             tie_comparator,

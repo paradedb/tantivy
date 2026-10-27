@@ -119,13 +119,11 @@ pub(crate) struct QuantizedCandidates {
     blocks: Vec<AdmittedCluster>,
     /// Confidence multiplier of every interval endpoint.
     kappa: f32,
-    /// The live candidates' lower endpoints, written for a boundary.
-    lowers: Vec<f32>,
 }
 
 impl QuantizedCandidates {
-    /// Room for `capacity` candidates in the offsets, every column and the boundary's lower
-    /// endpoints; doc ids are reserved when a block first brings them.
+    /// Room for `capacity` candidates in the offsets and every column; doc ids are reserved when
+    /// a block first brings them.
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             offsets: Vec::with_capacity(capacity),
@@ -133,7 +131,6 @@ impl QuantizedCandidates {
             columns: Columns::with_capacity(capacity),
             blocks: Vec::new(),
             kappa: QUANTIZED_BOUNDARY_KAPPA,
-            lowers: Vec::with_capacity(capacity),
         }
     }
 
@@ -299,7 +296,7 @@ impl QuantizedCandidates {
         let start = block.rows.start;
         at.map(move |index| Candidate {
             row: start + self.offsets[index] as usize,
-            bound: Bound {
+            bound: Bound::Interval {
                 lo: self.lower(index),
                 est: self.columns.estimates[index],
             },
@@ -334,23 +331,28 @@ impl QuantizedCandidates {
         self.docs.truncate(docs_write);
     }
 
-    /// The lower endpoint of every live candidate, in a buffer the caller may reorder.
-    pub(crate) fn live_lowers(&mut self) -> &mut [f32] {
-        let mut lowers = std::mem::take(&mut self.lowers);
-        lowers.clear();
+    /// One interval per live candidate, in admission order. A boundary rebuilds the segment top-k
+    /// from these.
+    pub(crate) fn live_candidates(&self) -> Vec<Candidate> {
+        let mut out = Vec::new();
         for block in &self.blocks {
-            debug_assert!(
-                block
-                    .at
-                    .clone()
-                    .all(|index| self.columns.estimates[index].is_finite()
-                        && self.columns.sigmas[index].is_finite()),
-                "quantized boundary inputs must be finite"
-            );
-            lowers.extend(block.at.clone().map(|index| self.lower(index)));
+            let start = block.rows.start;
+            for index in block.at.clone() {
+                debug_assert!(
+                    self.columns.estimates[index].is_finite()
+                        && self.columns.sigmas[index].is_finite(),
+                    "quantized boundary inputs must be finite"
+                );
+                out.push(Candidate {
+                    row: start + self.offsets[index] as usize,
+                    bound: Bound::Interval {
+                        lo: self.lower(index),
+                        est: self.columns.estimates[index],
+                    },
+                });
+            }
         }
-        self.lowers = lowers;
-        &mut self.lowers
+        out
     }
 }
 
@@ -488,7 +490,7 @@ impl BoundaryHarness {
         let bound = self
             .bound
             .get_or_insert_with(|| PruningBound::standalone(k));
-        assert_eq!(bound.k_for_test(), k, "one k per harness");
+        assert_eq!(bound.k(), k, "one k per harness");
         bound
     }
 
@@ -540,7 +542,7 @@ impl BoundaryHarness {
     /// `None` for a `k` above the harness's: the running top-k holds fewer than `k` entries.
     pub(crate) fn own_estimate(&mut self, k: usize) -> Option<f32> {
         let bound = self.bound.as_ref()?;
-        if k > bound.k_for_test() {
+        if k > bound.k() {
             return None;
         }
         self.bound(k).own_estimate()
@@ -567,12 +569,12 @@ impl BoundaryHarness {
 
     /// The bound's pruning threshold.
     pub(crate) fn threshold(&mut self, k: usize) -> Option<f32> {
-        self.bound(k).threshold_for_test()
+        self.bound(k).threshold()
     }
 
     /// Raises the bound's floor.
     pub(crate) fn raise_floor(&mut self, k: usize, value: f32) {
-        self.bound(k).raise_floor_for_test(value);
+        self.bound(k).raise_floor(value);
     }
 
     /// Opens an empty block that takes the next rows pushed, outside any cluster.
@@ -596,16 +598,5 @@ impl BoundaryHarness {
         self.block_open = false;
         self.candidates
             .recheck(b, Threshold(LowerEndpoint(threshold)))
-    }
-
-    /// Rows of the running top-k, in bound order.
-    pub(crate) fn running_rows(&self) -> Vec<usize> {
-        self.bound.as_ref().map_or_else(Vec::new, |bound| {
-            bound
-                .running_for_test()
-                .iter()
-                .map(|entry| entry.1)
-                .collect()
-        })
     }
 }

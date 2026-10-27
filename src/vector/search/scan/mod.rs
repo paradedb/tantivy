@@ -12,7 +12,7 @@ pub(crate) mod plan;
 use std::ops::Range;
 use std::sync::Arc;
 
-use self::bound::{PruningBound, TopK};
+use self::bound::PruningBound;
 use self::columns::{Columns, QuantizedCandidates};
 use self::estimate::{combine_initial, combine_refine, CombineCtx};
 use self::exact::ExactScorer;
@@ -126,8 +126,6 @@ pub(crate) struct ScanTrace {
     pub(crate) exact_phase_rows: Vec<usize>,
     /// Every exact score the scan computed, in order.
     pub(crate) exact_scores: Vec<f32>,
-    /// The bound's known exact scores at the end of the scan.
-    pub(crate) known_exact: Vec<f32>,
 }
 
 // --- Quantized state ---
@@ -413,7 +411,7 @@ where
         index: &'a ClusterIndex,
         query: ScoringQuery<'a, T>,
         config: ScanConfig,
-        carried: TopK,
+        carried_kth: Option<f32>,
         global: Arc<dyn SharedThreshold<Score>>,
         tie_break: &'a mut K,
         tie_comparator: C,
@@ -438,7 +436,7 @@ where
         let layers = quantized.as_ref().map_or(0, |state| state.layers.len());
         Ok(Self {
             exact: ExactScorer::new(reader, query.query, config.top_n, tie_break, tie_comparator),
-            bound: PruningBound::new(config.top_n, carried, global),
+            bound: PruningBound::new(config.top_n, carried_kth, global),
             quantized,
             scratch: ReadScratch::default(),
             by_cluster: Vec::new(),
@@ -473,11 +471,8 @@ where
         }
     }
 
-    /// The segment-only pruning thresholds as of the last shortlisted cluster.
-    ///
-    /// Carried exact scores and the shared threshold raise admission, but the router and APS keep
-    /// reading this segment's own top-k. Folding the carried scores into either value would change
-    /// which clusters open.
+    /// The segment top-k as of the last shortlisted cluster. The router reads `kth_lower` and APS
+    /// reads `kth_estimate`. Carried scores and the shared threshold are not in this top-k.
     fn feedback(&self) -> Feedback {
         Feedback {
             kth_lower: self.bound.own_lower(),
@@ -603,7 +598,6 @@ where
         {
             report.trace.exact_phase_rows = self.exact.exact_phase_rows.clone();
             report.trace.exact_scores = self.exact.exact_scores.clone();
-            report.trace.known_exact = self.bound.known_exact();
         }
         Ok((self.exact.into_hits(segment_ord), report))
     }
