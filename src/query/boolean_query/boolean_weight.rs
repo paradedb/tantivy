@@ -722,6 +722,21 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         }
     }
 
+    fn scorer_for_candidates_unpositioned(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        candidate_size: u32,
+    ) -> crate::Result<Box<dyn Scorer>> {
+        if self.weights.len() == 1 {
+            let &(occur, ref weight) = &self.weights[0];
+            if occur != Occur::MustNot {
+                return weight.scorer_for_candidates_unpositioned(reader, boost, candidate_size);
+            }
+        }
+        self.scorer(reader, boost)
+    }
+
     fn pruning_scorer(
         &self,
         reader: &SegmentReader,

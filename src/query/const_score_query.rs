@@ -86,6 +86,18 @@ impl Weight for ConstWeight {
         Ok(Box::new(ConstScorer::new(inner_scorer, boost * self.score)))
     }
 
+    fn scorer_for_candidates_unpositioned(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        candidate_size: u32,
+    ) -> crate::Result<Box<dyn Scorer>> {
+        let inner_scorer =
+            self.weight
+                .scorer_for_candidates_unpositioned(reader, boost, candidate_size)?;
+        Ok(Box::new(ConstScorer::new(inner_scorer, boost * self.score)))
+    }
+
     fn explain(&self, reader: &SegmentReader, doc: u32) -> crate::Result<Explanation> {
         let mut scorer = self.scorer(reader, 1.0)?;
         if scorer.seek(doc) != doc {
