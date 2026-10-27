@@ -80,7 +80,7 @@ where
         &mut self,
         selected: &ClusterRows<'_>,
         scratch: &mut ReadScratch,
-        bound: &mut PruningBound<'_>,
+        bound: &mut PruningBound,
     ) -> crate::Result<usize> {
         let scored = self.score_rows(selected, scratch, bound)?;
         bound.publish();
@@ -92,7 +92,7 @@ where
         &mut self,
         selected: &ClusterRows<'_>,
         scratch: &mut ReadScratch,
-        bound: &mut PruningBound<'_>,
+        bound: &mut PruningBound,
     ) -> crate::Result<usize> {
         #[cfg(test)]
         self.exact_phase_rows.extend(selected.global_rows());
@@ -104,7 +104,7 @@ where
         &mut self,
         selected: &ClusterRows<'_>,
         scratch: &mut ReadScratch,
-        bound: &mut PruningBound<'_>,
+        bound: &mut PruningBound,
     ) -> crate::Result<usize> {
         let mut column_read = false;
         let rows = {
@@ -149,7 +149,7 @@ where
     fn offer(
         &mut self,
         selected: &ClusterRows<'_>,
-        bound: &mut PruningBound<'_>,
+        bound: &mut PruningBound,
         column_read: &mut bool,
         position: usize,
         offset: usize,
@@ -160,7 +160,7 @@ where
         self.exact_scores.push(score);
         bound.push_exact(score);
         // Rows that cannot enter the top k skip the tie-break and the doc id lookup.
-        if bound.own_exact_kth().is_some_and(|kth| score < kth)
+        if bound.exact_kth().is_some_and(|kth| score < kth)
             || self
                 .topn
                 .threshold

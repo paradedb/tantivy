@@ -11,6 +11,7 @@ use crate::vector::search::interval::LowerEndpoint;
 use crate::vector::search::interval::{Estimate, Threshold, UpperEndpoint};
 #[cfg(test)]
 use crate::vector::search::scan::bound::PruningBound;
+use crate::vector::search::scan::bound::{Bound, Candidate};
 use crate::DocId;
 
 // --- Columns ---
@@ -291,17 +292,17 @@ impl QuantizedCandidates {
             .upper(self.columns.sigmas[index], self.kappa)
     }
 
-    /// The `(lower, global row, estimate)` entries of the last block's candidates, at `at`.
-    pub(crate) fn entries(&self, at: Range<usize>) -> impl Iterator<Item = (f32, usize, f32)> + '_ {
+    /// One candidate per live row of the block just pushed, at `at`.
+    pub(crate) fn entries(&self, at: Range<usize>) -> impl Iterator<Item = Candidate> + '_ {
         let block = self.blocks.last().expect("a block was just pushed");
         debug_assert_eq!(block.at, at, "the block just pushed");
         let start = block.rows.start;
-        at.map(move |index| {
-            (
-                self.lower(index),
-                start + self.offsets[index] as usize,
-                self.columns.estimates[index],
-            )
+        at.map(move |index| Candidate {
+            row: start + self.offsets[index] as usize,
+            bound: Bound {
+                lo: self.lower(index),
+                est: self.columns.estimates[index],
+            },
         })
     }
 
@@ -464,7 +465,7 @@ impl QuantizedCandidates {
 #[cfg(test)]
 pub(crate) struct BoundaryHarness {
     pub(crate) candidates: QuantizedCandidates,
-    bound: Option<PruningBound<'static>>,
+    bound: Option<PruningBound>,
     /// Whether the last block is a cluster `begin_cluster` opened and `finish_cluster` has not
     /// closed yet.
     cluster_open: bool,
@@ -483,8 +484,10 @@ impl BoundaryHarness {
         }
     }
 
-    fn bound(&mut self, k: usize) -> &mut PruningBound<'static> {
-        let bound = self.bound.get_or_insert_with(|| PruningBound::new(k, None));
+    fn bound(&mut self, k: usize) -> &mut PruningBound {
+        let bound = self
+            .bound
+            .get_or_insert_with(|| PruningBound::standalone(k));
         assert_eq!(bound.k_for_test(), k, "one k per harness");
         bound
     }
@@ -546,6 +549,8 @@ impl BoundaryHarness {
     /// The threshold the next boundary would apply, leaving the running top-k intact.
     pub(crate) fn boundary_lower(&mut self, k: usize, kappa: f32) -> Option<Threshold> {
         let mut bound = self.bound(k).clone();
+        // The peek must not publish into the harness bound's threshold.
+        bound.detach_global();
         self.candidates.kappa = kappa;
         bound.boundary(&mut self.candidates)
     }
@@ -553,7 +558,9 @@ impl BoundaryHarness {
     pub(crate) fn band(&mut self, k: usize, kappa: f32) {
         self.candidates.kappa = kappa;
         self.block_open = false;
-        let bound = self.bound.get_or_insert_with(|| PruningBound::new(k, None));
+        let bound = self
+            .bound
+            .get_or_insert_with(|| PruningBound::standalone(k));
         let threshold = bound.boundary(&mut self.candidates);
         self.candidates.band(threshold);
     }

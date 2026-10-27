@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use common::BitSet;
 
@@ -25,7 +25,7 @@ use crate::vector::params::ProbeParams;
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::with_test_clusters;
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
-use crate::vector::search::scan::bound::SharedBound;
+use crate::vector::search::scan::bound::TopK;
 use crate::vector::search::scan::plan::PlanOverride;
 use crate::vector::search::scan::ScanTrace;
 use crate::vector::search::segment::plan::SegmentPlan;
@@ -546,7 +546,7 @@ impl Fixture {
         params: ProbeParams,
         plan: Option<PlanOverride>,
         admission_pruning: bool,
-        shared: Option<Arc<SharedBound>>,
+        shared: Option<Arc<Mutex<TopK>>>,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = self.index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[segment];
@@ -572,7 +572,7 @@ impl Fixture {
         )?;
         backend.plan_override = plan;
         backend.admission_pruning_disabled = !admission_pruning;
-        backend.shared_bound = shared;
+        backend.carried = shared;
         backend.top_n(weight, segment_reader, top_n)
     }
 

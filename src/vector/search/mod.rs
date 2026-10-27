@@ -10,15 +10,15 @@ pub(crate) mod scan;
 pub(crate) mod segment;
 pub(crate) mod source;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::collector::sort_key::{Comparator, NaturalComparator};
-use crate::collector::{SegmentSortKeyComputer, TopNComputer};
+use crate::collector::{SegmentSortKeyComputer, SharedThreshold, TopNComputer};
 use crate::query::Weight;
 use crate::schema::Field;
 use crate::vector::params::ProbeParams;
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery, VectorQuery};
-use crate::vector::search::scan::bound::SharedBound;
+use crate::vector::search::scan::bound::{LocalThreshold, TopK};
 use crate::vector::search::scan::heap::{tie_break_key, TieBreakHits};
 #[cfg(test)]
 use crate::vector::search::scan::plan::PlanOverride;
@@ -38,9 +38,7 @@ use crate::vector::telemetry::measure;
 #[cfg(test)]
 use crate::vector::tie_break::NoTieBreak;
 use crate::vector::{VectorElement, VectorStage};
-#[cfg(test)]
-use crate::Score;
-use crate::{DocAddress, SegmentOrdinal, SegmentReader, TantivyError};
+use crate::{DocAddress, Score, SegmentOrdinal, SegmentReader, TantivyError};
 
 /// Per-segment vector search state: the segment's [`VectorIndexReader`] and the prepared query.
 /// Build via [`SegmentSearcher::for_segment`].
@@ -51,8 +49,10 @@ pub(crate) struct SegmentSearcher<T: VectorElement> {
     quantized: Option<Arc<QuantizedQueryCtx>>,
     probe_params: ProbeParams,
     segment_ord: SegmentOrdinal,
-    /// The bound the query's segment scans share; `None` prunes on the segment's own bound alone.
-    pub(crate) shared_bound: Option<Arc<SharedBound>>,
+    /// Exact scores finished segments have returned. `None` starts this scan from an empty top-k.
+    pub(crate) carried: Option<Arc<Mutex<TopK>>>,
+    /// The threshold this scan publishes. A [`LocalThreshold`] when the query shares none.
+    pub(crate) global: Arc<dyn SharedThreshold<Score>>,
     #[cfg(test)]
     pub(crate) plan_override: Option<PlanOverride>,
     #[cfg(test)]
@@ -77,7 +77,8 @@ impl<T: VectorElement> SegmentSearcher<T> {
             quantized,
             probe_params,
             segment_ord,
-            shared_bound: None,
+            carried: None,
+            global: Arc::new(LocalThreshold::default()),
             #[cfg(test)]
             plan_override: None,
             #[cfg(test)]
@@ -85,9 +86,15 @@ impl<T: VectorElement> SegmentSearcher<T> {
         })
     }
 
-    /// Prunes against `bound` too, the bound the query's segment scans share.
-    pub(crate) fn with_shared_bound(mut self, bound: Arc<SharedBound>) -> Self {
-        self.shared_bound = Some(bound);
+    /// Prunes against exact scores finished segments already returned, and publishes through
+    /// `global`.
+    pub(crate) fn with_shared(
+        mut self,
+        carried: Arc<Mutex<TopK>>,
+        global: Arc<dyn SharedThreshold<Score>>,
+    ) -> Self {
+        self.carried = Some(carried);
+        self.global = global;
         self
     }
 
@@ -226,7 +233,11 @@ impl<T: VectorElement> SegmentSearcher<T> {
             index,
             self.scoring_query(),
             config,
-            self.shared_bound.as_deref(),
+            match &self.carried {
+                Some(carried) => carried.lock().unwrap().clone(),
+                None => TopK::new(top_n),
+            },
+            Arc::clone(&self.global),
             tie_break,
             tie_comparator,
         )?;

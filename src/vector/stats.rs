@@ -2,7 +2,7 @@
 //! serialized flat for EXPLAIN.
 
 use crate::vector::router::RouterMetrics;
-use crate::vector::search::scan::bound::SharedOffer;
+use crate::vector::search::scan::bound::ExactMerge;
 use crate::vector::search::scan::ScanReport;
 #[cfg(test)]
 use crate::vector::search::scan::ScanTrace;
@@ -457,10 +457,10 @@ impl ProbeStats {
         }
     }
 
-    /// Records what the segment's offer did to the query's shared bound.
-    pub(crate) fn record_shared_offer(&mut self, offer: SharedOffer) {
-        self.shared_bound_offers = offer.offers;
-        self.shared_bound_tightenings = offer.tightenings;
+    /// Records what the segment's exact scores did to the query's carried top-k.
+    pub(crate) fn record_shared_offer(&mut self, merge: ExactMerge) {
+        self.shared_bound_offers = merge.offers;
+        self.shared_bound_tightenings = merge.tightenings;
     }
 
     /// Adds the result-assembly time of the merge, measured after the segment's statistics were

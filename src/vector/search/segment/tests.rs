@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::collector::{AtomicSharedThreshold, SharedThreshold, TopDocs};
 use crate::query::{AllQuery, BooleanQuery, EnableScoring, Query};
@@ -12,7 +12,7 @@ use crate::schema::Metric;
 use crate::vector::params::{LocatedPath, ProbeParams, Selectivity};
 use crate::vector::quantization::QUANTIZED_BOUNDARY_KAPPA;
 use crate::vector::search::interval::Estimate;
-use crate::vector::search::scan::bound::SharedBound;
+use crate::vector::search::scan::bound::TopK;
 use crate::vector::search::scan::layer_read::LayerRead;
 use crate::vector::search::scan::plan::{ExactRule, PlanOverride};
 use crate::vector::stats::{AccessPath, LayerProbeStats};
@@ -174,7 +174,7 @@ fn planned_top_k_with(
     k: usize,
     params: &ProbeParams,
     admission_pruning: bool,
-    shared: Option<Arc<SharedBound>>,
+    shared: Option<Arc<Mutex<TopK>>>,
 ) -> crate::Result<(Hits, Vec<ProbeStats>)> {
     let weight = fixture.weight(filter)?;
     let segments = fixture.index.reader()?.searcher().segment_readers().len();
@@ -264,8 +264,8 @@ fn carried_scores_are_the_top_k_of_seed_and_segment() -> crate::Result<()> {
                             .filter(|(_, address)| address.segment_ord as usize != segment)
                             .map(|&(score, _)| score)
                             .collect();
-                        let shared = Arc::new(SharedBound::new(k, None));
-                        shared.offer(seed.iter().copied());
+                        let shared = Arc::new(Mutex::new(TopK::new(k)));
+                        shared.lock().unwrap().merge_exact(seed.iter().copied());
                         let (_, stats) = fixture.run_planned_with(
                             segment,
                             weight.as_ref(),
@@ -311,8 +311,8 @@ fn recheck_accounts_for_every_survivor() -> crate::Result<()> {
                 for plan in [None, Some(mixed)] {
                     for segment in 0..segments {
                         let case = format!("{representation:?} k={k} plan={plan:?} {segment}");
-                        let shared = Arc::new(SharedBound::new(k, None));
-                        shared.offer(
+                        let shared = Arc::new(Mutex::new(TopK::new(k)));
+                        shared.lock().unwrap().merge_exact(
                             hits.iter()
                                 .filter(|(_, address)| address.segment_ord as usize != segment)
                                 .map(|&(score, _)| score),
@@ -653,7 +653,11 @@ fn assert_case(
     // the top k: the seeded run returns the same hits, unless a dropped row's interval missed its
     // exact score.
     if let Some(&(seed, _)) = pruned.get(k - 1) {
-        let shared = Arc::new(SharedBound::seeded(k, seed));
+        let shared = Arc::new(Mutex::new(TopK::new(k)));
+        shared
+            .lock()
+            .unwrap()
+            .merge_exact(std::iter::repeat_n(seed, k));
         let (seeded, seeded_stats) =
             planned_top_k_with(fixture, filter, query, k, params, true, Some(shared))?;
         SEEDED_CASES.fetch_add(1, Ordering::Relaxed);

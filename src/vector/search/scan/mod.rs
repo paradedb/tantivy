@@ -10,8 +10,9 @@ pub(crate) mod layer_read;
 pub(crate) mod plan;
 
 use std::ops::Range;
+use std::sync::Arc;
 
-use self::bound::{PruningBound, SharedBound};
+use self::bound::{PruningBound, TopK};
 use self::columns::{Columns, QuantizedCandidates};
 use self::estimate::{combine_initial, combine_refine, CombineCtx};
 use self::exact::ExactScorer;
@@ -21,7 +22,7 @@ use self::layer_read::{decode_layer, Decoded, LayerRead, LayerSpec};
 use self::plan::{forced_plan, PlanOverride};
 use self::plan::{price, Read, ReadCosts};
 use crate::collector::sort_key::Comparator;
-use crate::collector::SegmentSortKeyComputer;
+use crate::collector::{SegmentSortKeyComputer, SharedThreshold};
 use crate::error::DataCorruption;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
@@ -33,7 +34,7 @@ use crate::vector::storage::quantized::{QuantizedFieldReader, ReadScratch};
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::enter_vector_stage;
 use crate::vector::{VectorElement, VectorStage};
-use crate::SegmentOrdinal;
+use crate::{Score, SegmentOrdinal};
 
 // --- Contracts ---
 
@@ -243,7 +244,7 @@ impl<'a> QuantizedState<'a> {
         &mut self,
         rows: &ClusterRows<'_>,
         read: LayerRead,
-        bound: &mut PruningBound<'_>,
+        bound: &mut PruningBound,
         scratch: &mut ReadScratch,
     ) -> crate::Result<()> {
         let centroid = match rows.centroid {
@@ -295,7 +296,7 @@ impl<'a> QuantizedState<'a> {
 
     /// The threshold admission prunes at; `None` while the bound's is unset or when a test
     /// disables pruning.
-    fn admission_threshold(&self, bound: &mut PruningBound<'_>) -> Option<Threshold> {
+    fn admission_threshold(&self, bound: &mut PruningBound) -> Option<Threshold> {
         #[cfg(test)]
         if self.admission_pruning_disabled {
             return None;
@@ -328,7 +329,7 @@ impl<'a> QuantizedState<'a> {
 
     /// Drops block `b`'s candidates whose upper endpoint fell below the bound's pruning threshold
     /// since the last boundary, before the block is read; returns the rows dropped.
-    fn recheck(&mut self, b: usize, bound: &mut PruningBound<'_>) -> usize {
+    fn recheck(&mut self, b: usize, bound: &mut PruningBound) -> usize {
         match bound.recheck_threshold() {
             Some(threshold) => self.candidates.recheck(b, threshold),
             None => 0,
@@ -345,7 +346,7 @@ impl<'a> QuantizedState<'a> {
     }
 
     /// Records the candidates `layer` scored and prunes them at its boundary.
-    fn prune(&mut self, layer: usize, bound: &mut PruningBound<'_>, report: &mut ScanReport) {
+    fn prune(&mut self, layer: usize, bound: &mut PruningBound, report: &mut ScanReport) {
         // Layer 0's kernel scores every admitted row; admission pruning drops rows before they
         // become candidates, so the scored count keeps its own counter.
         report.layers[layer].scored = if layer == 0 {
@@ -391,7 +392,7 @@ where
 {
     exact: ExactScorer<'a, T, K, C>,
     /// The segment's pruning bound.
-    bound: PruningBound<'a>,
+    bound: PruningBound,
     /// The quantized cascade; `None` scores every shortlisted row exactly.
     quantized: Option<QuantizedState<'a>>,
     scratch: ReadScratch,
@@ -412,7 +413,8 @@ where
         index: &'a ClusterIndex,
         query: ScoringQuery<'a, T>,
         config: ScanConfig,
-        shared: Option<&'a SharedBound>,
+        carried: TopK,
+        global: Arc<dyn SharedThreshold<Score>>,
         tie_break: &'a mut K,
         tie_comparator: C,
     ) -> crate::Result<Self> {
@@ -429,14 +431,14 @@ where
                 return Err(DataCorruption::comment_only(
                     "quantized query requires quantized slots",
                 )
-                .into())
+                .into());
             }
             (None, _) => None,
         };
         let layers = quantized.as_ref().map_or(0, |state| state.layers.len());
         Ok(Self {
             exact: ExactScorer::new(reader, query.query, config.top_n, tie_break, tie_comparator),
-            bound: PruningBound::new(config.top_n, shared),
+            bound: PruningBound::new(config.top_n, carried, global),
             quantized,
             scratch: ReadScratch::default(),
             by_cluster: Vec::new(),
@@ -471,7 +473,11 @@ where
         }
     }
 
-    /// The pruning thresholds as of the last shortlisted cluster.
+    /// The segment-only pruning thresholds as of the last shortlisted cluster.
+    ///
+    /// Carried exact scores and the shared threshold raise admission, but the router and APS keep
+    /// reading this segment's own top-k. Folding the carried scores into either value would change
+    /// which clusters open.
     fn feedback(&self) -> Feedback {
         Feedback {
             kth_lower: self.bound.own_lower(),
@@ -597,7 +603,7 @@ where
         {
             report.trace.exact_phase_rows = self.exact.exact_phase_rows.clone();
             report.trace.exact_scores = self.exact.exact_scores.clone();
-            report.trace.known_exact = self.bound.known_exact().to_vec();
+            report.trace.known_exact = self.bound.known_exact();
         }
         Ok((self.exact.into_hits(segment_ord), report))
     }
