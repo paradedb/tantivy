@@ -66,9 +66,6 @@ type PreparedCell = Arc<OnceLock<Arc<QuantizedQueryCtx>>>;
 // --- Builder ---
 
 /// Builds a [`TopDocsByVectorSimilarity`] collector.
-///
-/// Configuration is frozen at [`build`](Self::build): the finished collector has no
-/// `with_*` setters.
 pub struct TopDocsByVectorSimilarityBuilder<T: VectorElement, S = NoTieBreak> {
     field: Field,
     query: Arc<Vec<T>>,
