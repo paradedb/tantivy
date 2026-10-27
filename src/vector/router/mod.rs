@@ -17,6 +17,7 @@ use crate::TantivyError;
 pub(crate) mod arena;
 pub(crate) mod candidate;
 mod exact;
+pub(crate) mod global;
 pub(crate) mod stacked;
 
 /// The routing structure new IVF segments build. Codes are persisted; 0 belonged to the removed
@@ -130,6 +131,7 @@ impl Default for RoutingParams {
 }
 
 pub(crate) enum RouterIter {
+    Scheduled(RouterMetrics),
     #[cfg(test)]
     Explicit(std::vec::IntoIter<Candidate>),
     Stacked(stacked::Ranking),
@@ -139,6 +141,7 @@ pub(crate) enum RouterIter {
 impl RouterIter {
     pub(crate) fn metrics(&self) -> RouterMetrics {
         match self {
+            Self::Scheduled(metrics) => *metrics,
             #[cfg(test)]
             Self::Explicit(_) => RouterMetrics::Exact { visited_count: 0 },
             Self::Stacked(ranking) => ranking.metrics(),
@@ -154,6 +157,7 @@ impl Iterator for RouterIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
+            Self::Scheduled(_) => None,
             #[cfg(test)]
             Self::Explicit(ranking) => ranking.next(),
             Self::Stacked(ranking) => ranking.next(),

@@ -9,7 +9,9 @@ pub(crate) mod heap;
 pub(crate) mod layer_read;
 pub(crate) mod plan;
 
+use std::cell::RefCell;
 use std::ops::Range;
+use std::rc::Rc;
 
 use self::bound::PruningBound;
 use self::columns::{Columns, QuantizedCandidates};
@@ -361,12 +363,12 @@ impl<'a> QuantizedState<'a> {
     fn prune(&mut self, layer: usize, bound: &mut PruningBound, report: &mut ScanReport) {
         // Layer 0's kernel scores every admitted row; admission pruning drops rows before they
         // become candidates, so the scored count keeps its own counter.
-        report.layers[layer].scored = if layer == 0 {
+        if layer == 0 {
             report.layers[0].admission_pruned = self.layer0_admission_pruned;
-            self.layer0_scored
+            report.layers[0].scored = self.layer0_scored;
         } else {
-            self.candidates.len()
-        };
+            report.layers[layer].scored += self.candidates.len();
+        }
         #[cfg(test)]
         {
             // Layer 0's candidates are listed in admission order, later layers' in row order.
@@ -386,7 +388,7 @@ impl<'a> QuantizedState<'a> {
             .shared_threshold()
             .map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score)));
         self.candidates.band(threshold);
-        report.layers[layer].survivors = self.candidates.len();
+        report.layers[layer].survivors += self.candidates.len();
         #[cfg(test)]
         report
             .trace
@@ -472,6 +474,27 @@ where
         })
     }
 
+    pub(crate) fn share_exact(&mut self, exact: Rc<RefCell<Vec<f32>>>) {
+        self.exact.bound.share_exact(exact);
+    }
+
+    pub(crate) fn run_cluster(&mut self, rows: &ClusterRows<'_>) -> crate::Result<usize> {
+        let stage = enter_vector_stage(self.shortlist_stage());
+        let scored = self.shortlist(rows)?;
+        drop(stage);
+        self.close_shortlist();
+        for layer in self.refining_layers() {
+            self.narrow(layer)?;
+        }
+        self.score_shortlist()?;
+        if let Some(state) = &mut self.quantized {
+            state.candidates.clear();
+        }
+        self.by_cluster.clear();
+        self.exact.bound.clear_running();
+        Ok(scored)
+    }
+
     /// Scores one segment: shortlists each cluster `source` supplies, narrows the shortlist one
     /// quantized layer at a time, then scores what is left exactly.
     pub(crate) fn run(&mut self, source: &mut impl ClusterSource) -> crate::Result<()> {
@@ -497,7 +520,7 @@ where
     }
 
     /// The shared prune floor when set. The router reads `kth_lower`.
-    fn feedback(&self) -> Feedback {
+    pub(crate) fn feedback(&self) -> Feedback {
         Feedback {
             kth_lower: self.bound.shared_threshold(),
             kth_estimate: None,

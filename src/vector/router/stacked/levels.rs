@@ -70,6 +70,16 @@ pub(crate) const PARENT_NPROBE_FRACTION: f32 = 0.25;
 /// lists to open: beam ~ `LIST_OVERSCAN * k` members, then to lists.
 pub(crate) const LIST_OVERSCAN: usize = 2;
 
+pub(crate) fn lists_to_open(nlist: usize, n_members: usize, k: usize) -> usize {
+    if nlist == 0 {
+        return 0;
+    }
+    let floor = ((nlist as f32 * PARENT_NPROBE_FRACTION).ceil() as usize).max(1);
+    let beam_members = k.saturating_mul(LIST_OVERSCAN).max(1);
+    let for_k = ((beam_members as f64 * nlist as f64) / n_members.max(1) as f64).ceil() as usize;
+    for_k.max(floor).min(nlist).max(1)
+}
+
 /// [`StackedIvfBuilder`] hangs a parent only while the current top has at
 /// least this many lists. Below that, the top is scored in full and pruned
 /// with [`StackedIvf::lists_to_open`] (floor [`PARENT_NPROBE_FRACTION`]).
@@ -882,20 +892,12 @@ where S: VectorArena<Elem = f32>
     /// `[ceil(PARENT_NPROBE_FRACTION * nlist), nlist]`. Used as the parent
     /// ask when a parent exists, and as the flat-top keep otherwise.
     pub fn lists_to_open(&self, k: usize) -> usize {
-        let nlist = self.nlist();
-        if nlist == 0 {
-            return 0;
-        }
-        let floor = ((nlist as f32 * PARENT_NPROBE_FRACTION).ceil() as usize).max(1);
-        let n_members = self
+        let members = self
             .offsets
             .iter()
             .map(|&(start, end)| (end - start) as usize)
-            .sum::<usize>()
-            .max(1);
-        let beam_members = k.saturating_mul(LIST_OVERSCAN).max(1);
-        let for_k = ((beam_members as f64 * nlist as f64) / n_members as f64).ceil() as usize;
-        for_k.max(floor).min(nlist).max(1)
+            .sum();
+        lists_to_open(self.nlist(), members, k)
     }
 
     /// Nearest members from the lists selected at this level, plus the
