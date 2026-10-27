@@ -300,7 +300,8 @@ impl Fixture {
         let run = || {
             let collector = TopDocs::with_limit(10)
                 .order_by_similarity(self.field, query.clone())
-                .with_probe_params(params.clone());
+                .with_probe_params(params.clone())
+                .build();
             searcher.search(filter, &collector).map(|fruit| fruit.stats)
         };
         run().expect("warm-up search");

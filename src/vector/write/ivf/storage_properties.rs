@@ -33,8 +33,7 @@ impl IvfClusterer for FixedClusters {
         let mut assignments = Vec::with_capacity(num_rows);
         for_each_batch(source, num_rows, |IvfTrainingVectors::F32(batch)| {
             for row in batch.matrix.values.chunks_exact(DIM) {
-                assignments
-                    .push((0..4).max_by(|&a, &b| row[a].total_cmp(&row[b])).unwrap() as u32);
+                assignments.push((0..4).max_by(|&a, &b| row[a].total_cmp(&row[b])).unwrap() as u32);
             }
         })?;
         Ok(assignments)
@@ -490,7 +489,8 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
         return Ok(());
     }
     let query = input_vector(42);
-    let exact_query = crate::vector::search::prepared::VectorQuery::new(metric, Arc::new(query.clone()));
+    let exact_query =
+        crate::vector::search::prepared::VectorQuery::new(metric, Arc::new(query.clone()));
     let prepared = QuantizedQueryCtx::new(Arc::clone(ctx), &exact_query);
     for clusters in [vec![0, 1, 2, 3], vec![0, 1, 3]] {
         for filtered in [false, true] {
@@ -509,14 +509,15 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                 IndexRecordOption::Basic,
             );
             let filter: &dyn Query = if filtered { &keep } else { &AllQuery };
-            let collector = TopDocsByVectorSimilarity::new(field, query.clone(), DOCS + 1)
+            let collector = TopDocsByVectorSimilarityBuilder::new(field, query.clone(), DOCS + 1)
                 .with_probe_params(ProbeParams {
                     max_probe_fraction: 1.0,
                     min_probe_clusters: 4,
                     exact_plan: false,
                     located: LocatedPath::Off,
                     ..Default::default()
-                });
+                })
+                .build();
             let fruit = crate::vector::router::with_test_clusters(candidates, || {
                 searcher.search(filter, &collector)
             })
@@ -668,11 +669,6 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
     }
     Ok(())
 }
-
-
-
-
-
 
 #[test]
 fn diagnostic_schedules_ignore_rotation_seeds() -> crate::Result<()> {

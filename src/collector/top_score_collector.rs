@@ -14,7 +14,7 @@ use crate::collector::top_collector::ComparableDoc;
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
 use crate::fastfield::FastValue;
 use crate::schema::Field;
-use crate::vector::{TopDocsByVectorSimilarity, VectorElement};
+use crate::vector::{TopDocsByVectorSimilarityBuilder, VectorElement};
 use crate::{DocAddress, DocId, Order, Score, SegmentOrdinal, SegmentReader};
 
 /// The `TopDocs` collector keeps track of the top `K` documents
@@ -357,11 +357,11 @@ impl TopDocs {
         self,
         field: Field,
         query: Vec<T>,
-    ) -> TopDocsByVectorSimilarity<T>
+    ) -> TopDocsByVectorSimilarityBuilder<T>
     where
         T: VectorElement,
     {
-        TopDocsByVectorSimilarity::new(field, query, self.limit).and_offset(self.offset)
+        TopDocsByVectorSimilarityBuilder::new(field, query, self.limit).and_offset(self.offset)
     }
 
     /// Helper function to tweak the similarity score of documents using a function.
@@ -603,7 +603,8 @@ impl<Score, D, C> From<TopNComputerDeser<Score, D, C>> for TopNComputer<Score, D
 }
 
 impl<Score: std::fmt::Debug, D, C> std::fmt::Debug for TopNComputer<Score, D, C>
-where C: Comparator<Score>
+where
+    C: Comparator<Score>,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
         f.debug_struct("TopNComputer")
