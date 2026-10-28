@@ -166,13 +166,26 @@ impl TopK {
     }
 
     /// Upserts `candidate` by [`RowAddress`]. A new address enters when the map has room or it
-    /// beats the current worst lower; an existing address is replaced in place.
+    /// beats the current worst lower; an existing address keeps the better (higher) lower
+    /// endpoint. Exact scores and refinements should only raise a row's lower; a lower exact is a
+    /// bug. Interval re-offers after a layer refine may dip slightly, so those keep the better
+    /// lower without asserting.
     pub(crate) fn upsert(&mut self, candidate: Candidate) {
         if self.k == 0 {
             return;
         }
         let Candidate { address, bound } = candidate;
-        if self.by_addr.contains_key(&address) {
+        if let Some(existing) = self.by_addr.get(&address) {
+            let existing_lower = existing.lower();
+            let new_lower = bound.lower();
+            if new_lower < existing_lower {
+                debug_assert!(
+                    !matches!(existing, Bound::Exact(_)),
+                    "exact score for {address:?} must not be lowered: existing {existing_lower} \
+                     new {new_lower}"
+                );
+                return;
+            }
             self.by_addr.insert(address, bound);
             return;
         }
@@ -180,6 +193,7 @@ impl TopK {
             self.by_addr.insert(address, bound);
             return;
         }
+        // Full map: linear scan for the worst entry is fine while k (= limit + offset) is small.
         let Some((worst_addr, worst_lower)) = self.worst() else {
             return;
         };
@@ -338,8 +352,50 @@ mod tests {
 
     mod top_k {
         use super::addr;
-        use crate::vector::search::scan::bound::{ExactMerge, TopK};
+        use crate::vector::search::scan::bound::{Candidate, ExactMerge, TopK};
         use crate::DocId;
+
+        /// Same-address upserts keep the higher lower endpoint and never rewrite with a worse
+        /// interval. A raised exact replaces the interval.
+        #[test]
+        fn test_upsert_keeps_better_lower_for_same_address() {
+            let mut top = TopK::new(1);
+            top.upsert(Candidate::interval(addr(1), 6.0, 11.0));
+            assert_eq!(top.kth_lower(), Some(6.0));
+            top.upsert(Candidate::exact(addr(1), 8.0));
+            assert_eq!(
+                top.exact_kth(),
+                Some(8.0),
+                "exact raises and replaces the interval"
+            );
+            top.upsert(Candidate::exact(addr(1), 8.0));
+            assert_eq!(
+                top.exact_kth(),
+                Some(8.0),
+                "equal lower may replace in place"
+            );
+
+            let mut top = TopK::new(1);
+            top.upsert(Candidate::interval(addr(2), 5.0, 10.0));
+            top.upsert(Candidate::interval(addr(2), 4.0, 9.0));
+            assert_eq!(
+                top.kth_lower(),
+                Some(5.0),
+                "a lower interval must not rewrite"
+            );
+            top.upsert(Candidate::interval(addr(2), 5.5, 10.0));
+            assert_eq!(top.kth_lower(), Some(5.5));
+        }
+
+        /// Offering a lower exact for an address that already holds an exact is a bug.
+        #[test]
+        #[cfg(debug_assertions)]
+        #[should_panic(expected = "exact score")]
+        fn test_upsert_lower_exact_debug_asserts() {
+            let mut top = TopK::new(1);
+            top.upsert(Candidate::exact(addr(1), 8.0));
+            top.upsert(Candidate::exact(addr(1), 7.0));
+        }
 
         /// The collector top-k is unset until `k` scores are in, then holds the k-th best score
         /// offered whatever the order and grouping of the offers, and never loosens; an
@@ -603,18 +659,19 @@ mod tests {
             assert_eq!(far.candidates.global_rows(), [0]);
         }
 
-        /// Exact offer for the same address replaces the interval (no double-count).
+        /// Exact offer for the same address replaces the interval (no double-count) and only
+        /// raises that row's lower endpoint.
         #[test]
         fn test_offer_replaces_same_address() {
             let mut bound = PruningBound::new(2, Arc::new(AtomicSharedThreshold::default()));
             bound.offer([
-                Candidate::interval(addr(1), 10.0, 11.0),
-                Candidate::interval(addr(2), 9.0, 10.0),
+                Candidate::interval(addr(1), 6.0, 11.0),
+                Candidate::interval(addr(2), 5.0, 10.0),
             ]);
-            assert_eq!(bound.kth_lower(), Some(9.0));
-            // Exact for doc 1 replaces its interval; heap is Exact(8), Interval(9) → kth 8.
+            assert_eq!(bound.kth_lower(), Some(5.0));
+            // Exact raises addr 1's lower; heap is Exact(8), Interval(5) → kth 5.
             bound.offer([Candidate::exact(addr(1), 8.0)]);
-            assert_eq!(bound.kth_lower(), Some(8.0));
+            assert_eq!(bound.kth_lower(), Some(5.0));
             assert_eq!(bound.exact_kth(), None, "still mixed");
             bound.offer([Candidate::exact(addr(2), 8.5)]);
             assert_eq!(bound.exact_kth(), Some(8.0));
