@@ -14,8 +14,6 @@
 //! Search works on any [`VectorArena`]. Build and payload serialization require
 //! owned [`InMemoryStore`]s. [`StackedIvf::open`] is search-only.
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::io::{self, Write};
 use std::ops::Deref;
 use std::{fmt, mem};
@@ -27,6 +25,7 @@ use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperK
 use crate::directory::FileSlice;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
+use crate::vector::router::adaptive::AdaptiveProbe;
 use crate::vector::router::arena::{FileSliceArena, VectorArena};
 use crate::vector::router::candidate::Candidate;
 use crate::vector::VectorElement;
@@ -908,7 +907,7 @@ where S: VectorArena<Elem = f32>
     /// capped at `nlist`. A parent is asked for that many of this level's
     /// lists; without a parent every centroid is scored and only that many
     /// are expanded. Lists are scanned nearest centroid first.
-    /// [`super::aps`] decides when to stop short of the shortlist.
+    /// [`AdaptiveProbe`] decides when to stop short of the shortlist.
     pub fn search(
         &self,
         query: &[S::Elem],
@@ -947,30 +946,17 @@ where S: VectorArena<Elem = f32>
             return (Vec::new(), stats);
         }
 
-        let mut probe = super::aps::open(k);
-        let mut result = BinaryHeap::with_capacity(k);
+        let mut probe = AdaptiveProbe::new(k);
         for c in &candidates {
-            let scanned = self.scan_cluster(query, metric, c.node, &mut result, k);
+            let scanned = self.scan_cluster(query, metric, c.node, &mut probe);
             stats.members_scored += scanned;
             stats.lists_scanned += 1;
-            let kth = if result.len() >= k {
-                result
-                    .peek()
-                    .map(|worst: &Reverse<Candidate<ClusterId>>| worst.0.sim)
-            } else {
-                None
-            };
-            if probe.observe(kth, scanned) {
+            if probe.should_stop(scanned) {
                 break;
             }
         }
 
-        let hits = result
-            .into_sorted_vec()
-            .into_iter()
-            .map(|Reverse(c)| c)
-            .collect();
-        (hits, stats)
+        (probe.into_sorted_vec(), stats)
     }
 
     fn scan_cluster(
@@ -978,8 +964,7 @@ where S: VectorArena<Elem = f32>
         query: &[S::Elem],
         metric: Metric,
         list: ClusterId,
-        result: &mut BinaryHeap<Reverse<Candidate<ClusterId>>>,
-        k: usize,
+        probe: &mut AdaptiveProbe<ClusterId>,
     ) -> usize {
         let dim = query.len();
         let (start, end) = self.offsets[usize::from(list)];
@@ -991,13 +976,7 @@ where S: VectorArena<Elem = f32>
                 sim: self.vectors.similarity(metric, dim, id.0, query),
                 node: id,
             };
-            if result.len() < k {
-                result.push(Reverse(cand));
-            } else if let Some(mut worst) = result.peek_mut() {
-                if cand > worst.0 {
-                    *worst = Reverse(cand);
-                }
-            }
+            probe.push(cand);
         }
         end.saturating_sub(start)
     }

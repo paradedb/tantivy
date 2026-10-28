@@ -14,6 +14,7 @@ use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::levels::{InMemoryStore, LazyStore, StackedIvf};
 use crate::TantivyError;
 
+mod adaptive;
 pub(crate) mod arena;
 pub(crate) mod candidate;
 mod exact;
