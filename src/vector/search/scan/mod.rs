@@ -9,10 +9,9 @@ pub(crate) mod heap;
 pub(crate) mod layer_read;
 pub(crate) mod plan;
 
-use std::mem::swap;
 use std::ops::Range;
 
-use self::bound::PruningBound;
+use self::bound::{PruningBound, TopK};
 use self::columns::{Columns, QuantizedCandidates};
 use self::estimate::{combine_initial, combine_refine, CombineCtx};
 use self::exact::ExactScorer;
@@ -473,8 +472,8 @@ where
         })
     }
 
-    pub(crate) fn swap_exact(&mut self, exact: &mut Vec<f32>) {
-        swap(&mut self.exact.bound.exact, exact);
+    pub(crate) fn swap_topk(&mut self, top: &mut TopK) {
+        self.bound.swap_topk(top);
     }
 
     pub(crate) fn run_cluster(&mut self, rows: &ClusterRows<'_>) -> crate::Result<usize> {
@@ -490,7 +489,6 @@ where
             state.candidates.clear();
         }
         self.by_cluster.clear();
-        self.exact.bound.clear_running();
         Ok(scored)
     }
 
