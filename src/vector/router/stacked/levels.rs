@@ -906,6 +906,7 @@ where S: VectorArena<Elem = f32>
     /// capped at `nlist`. A parent is asked for that many of this level's
     /// lists; without a parent every centroid is scored and only that many
     /// are expanded. Lists are scanned nearest centroid first.
+    /// [`super::aps`] decides when to stop short of the shortlist.
     pub fn search(
         &self,
         query: &[S::Elem],
@@ -944,10 +945,21 @@ where S: VectorArena<Elem = f32>
             return (Vec::new(), stats);
         }
 
+        let mut probe = super::aps::open();
         let mut result = BinaryHeap::with_capacity(k);
         for c in &candidates {
             stats.members_scored += self.scan_cluster(query, metric, c.node, &mut result, k);
             stats.lists_scanned += 1;
+            let kth = if result.len() >= k {
+                result
+                    .peek()
+                    .map(|worst: &Reverse<Candidate<ClusterId>>| worst.0.sim)
+            } else {
+                None
+            };
+            if probe.observe(kth) {
+                break;
+            }
         }
 
         let hits = result
@@ -1184,6 +1196,30 @@ mod tests {
         assert_eq!(StackedIvfConfig::nlist_for(400_000), 633);
     }
 
+    /// A run of lists that miss the full heap stops the walk short of the shortlist.
+    #[test]
+    fn test_patience_stops_before_the_shortlist_is_exhausted() {
+        let dim = 2;
+        let n = 2048;
+        let clusterer = SuperKMeansLevelClusterer::default();
+        let (index, _) =
+            StackedIvf::<InMemoryStore>::build(line_data(n), n, dim, &clusterer, test_config());
+        assert!(index.parent.is_none());
+
+        let query = [0.0f32, 0.0];
+        let k = 16;
+        let shortlist = index.lists_to_open(k);
+        let (hits, stats) = index.search(&query, k, Metric::L2);
+
+        assert_eq!(hits.len(), k);
+        assert!(
+            stats.lists_scanned < shortlist,
+            "stop scanned {} lists, shortlist {}",
+            stats.lists_scanned,
+            shortlist
+        );
+    }
+
     #[test]
     fn test_top_level_prunes_to_parent_nprobe_fraction() {
         let dim = 2;
@@ -1202,6 +1238,8 @@ mod tests {
         let query = [0.0f32, 0.0];
         let (hits, stats) = index.search(&query, 1, Metric::L2);
         assert!(!hits.is_empty());
+        // Shortlist is only a few lists; patience needs a longer miss run, so the walk
+        // still expands the full floor.
         assert_eq!(
             stats.lists_scanned, floor,
             "small-k top level must expand only ceil(0.25 × nlist) lists"

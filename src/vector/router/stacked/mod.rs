@@ -1,6 +1,7 @@
 //! The stacked router: a stacked IVF over a segment's centroids, ranked with
-//! fixed nprobe fractions via [`StackedIvf::lists_to_open`].
+//! [`StackedIvf::lists_to_open`] and stopped by [`aps`].
 
+pub(crate) mod aps;
 pub(crate) mod levels;
 
 use crate::directory::FileSlice;
