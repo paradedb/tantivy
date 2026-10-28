@@ -28,17 +28,15 @@ pub trait VectorArena {
         query: &[Self::Elem],
     ) -> Similarity;
 
-    /// Replaces `out` with similarities for `rows`, in row order.
+    /// Replaces `out` with similarities for `rows`, using the caller's cached query norm.
     fn batch_similarity(
         &self,
         query: &[Self::Elem],
         metric: Metric,
+        query_norm: f32,
         rows: Range<usize>,
         out: &mut Vec<Similarity>,
-    ) {
-        out.clear();
-        out.extend(rows.map(|row| self.similarity(metric, query.len(), row as u32, query)));
-    }
+    );
 }
 
 /// Any `[T]`-shaped storage (`&[T]`, `Vec<T>`, …), scored with the typed kernels.
@@ -54,6 +52,21 @@ impl<T: VectorElement, S: std::ops::Deref<Target = [T]>> VectorArena for S {
     #[inline]
     fn similarity(&self, metric: Metric, dim: usize, index: u32, query: &[T]) -> Similarity {
         metric.similarity(query, &self[index as usize * dim..][..dim])
+    }
+
+    fn batch_similarity(
+        &self,
+        query: &[T],
+        metric: Metric,
+        query_norm: f32,
+        rows: Range<usize>,
+        out: &mut Vec<Similarity>,
+    ) {
+        let dim = query.len();
+        out.clear();
+        out.extend(rows.map(|row| {
+            metric.similarity_with_query_norm(query, &self[row * dim..][..dim], query_norm)
+        }));
     }
 }
 
@@ -115,6 +128,7 @@ impl<T: VectorElement> VectorArena for FileSliceArena<T> {
         &self,
         query: &[T],
         metric: Metric,
+        query_norm: f32,
         rows: Range<usize>,
         out: &mut Vec<Similarity>,
     ) {
@@ -131,7 +145,7 @@ impl<T: VectorElement> VectorArena for FileSliceArena<T> {
         out.extend(
             bytes
                 .chunks_exact(stride)
-                .map(|row| metric.similarity_bytes(query, row)),
+                .map(|row| metric.similarity_bytes_with_query_norm(query, row, query_norm)),
         );
     }
 }
@@ -145,6 +159,7 @@ mod tests {
 
     use super::*;
     use crate::directory::{FileHandle, FileSlice};
+    use crate::vector::search::prepared::VectorQuery;
 
     #[derive(Debug)]
     struct TrackedFile {
@@ -181,6 +196,8 @@ mod tests {
             let mut file_scores = Vec::new();
             for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
                 for query in [&query, &zero] {
+                    let prepared = VectorQuery::new(metric, Arc::new(query.clone()));
+                    let norm = prepared.routing_norm();
                     for range in [0..3, 1..3, 2..3, 3..3] {
                         let expected: Vec<_> = range
                             .clone()
@@ -190,8 +207,14 @@ mod tests {
                             .clone()
                             .map(|row| file.similarity(metric, dim, row as u32, query))
                             .collect();
-                        rows.batch_similarity(query, metric, range.clone(), &mut typed_scores);
-                        file.batch_similarity(query, metric, range, &mut file_scores);
+                        rows.batch_similarity(
+                            query,
+                            metric,
+                            norm,
+                            range.clone(),
+                            &mut typed_scores,
+                        );
+                        file.batch_similarity(query, metric, norm, range, &mut file_scores);
                         assert_eq!(typed_scores, expected);
                         assert_eq!(file_scores, expected_file);
                     }
@@ -210,14 +233,16 @@ mod tests {
             reads: reads.clone(),
         })));
         let query = &rows[..DIM];
+        let prepared = VectorQuery::new(Metric::Cosine, Arc::new(query.to_vec()));
+        let norm = prepared.routing_norm();
         let mut actual = Vec::new();
-        arena.batch_similarity(query, Metric::Cosine, 3..140, &mut actual);
+        arena.batch_similarity(query, Metric::Cosine, norm, 3..140, &mut actual);
         let mut expected = Vec::new();
-        rows.batch_similarity(query, Metric::Cosine, 3..140, &mut expected);
+        rows.batch_similarity(query, Metric::Cosine, norm, 3..140, &mut expected);
         assert_eq!(actual, expected);
         assert_eq!(*reads.lock().unwrap(), vec![3 * 4096..140 * 4096]);
         reads.lock().unwrap().clear();
-        arena.batch_similarity(query, Metric::Cosine, 150..150, &mut actual);
+        arena.batch_similarity(query, Metric::Cosine, norm, 150..150, &mut actual);
         assert!(actual.is_empty());
         assert!(reads.lock().unwrap().is_empty());
     }

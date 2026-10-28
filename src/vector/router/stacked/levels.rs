@@ -29,6 +29,7 @@ use crate::schema::Metric;
 use crate::vector::distance::Similarity;
 use crate::vector::router::arena::{FileSliceArena, VectorArena};
 use crate::vector::router::candidate::Candidate;
+use crate::vector::search::prepared::VectorQuery;
 use crate::vector::VectorElement;
 
 /// Row index into a level's centroid or member arena.
@@ -328,12 +329,15 @@ impl VectorArena for LazyStore {
         &self,
         query: &[Self::Elem],
         metric: Metric,
+        query_norm: f32,
         rows: std::ops::Range<usize>,
         out: &mut Vec<Similarity>,
     ) {
         match &self.pinned {
-            Some(values) => values.batch_similarity(query, metric, rows, out),
-            None => self.arena.batch_similarity(query, metric, rows, out),
+            Some(values) => values.batch_similarity(query, metric, query_norm, rows, out),
+            None => self
+                .arena
+                .batch_similarity(query, metric, query_norm, rows, out),
         }
     }
 }
@@ -427,7 +431,7 @@ where
     Ok(())
 }
 
-/// Work done by one [`StackedIvf::search`], summed over this level and
+/// Work done by one [`StackedIvf::search_prepared`], summed over this level and
 /// every parent above it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StackedSearchStats {
@@ -920,27 +924,48 @@ where S: VectorArena<Elem = f32>
     /// lists; without a parent every centroid is scored and only that many
     /// are expanded. Lists are scanned nearest centroid first.
     /// [`super::aps`] decides when to stop short of the shortlist.
+    #[cfg(any(test, feature = "unstable"))]
     pub fn search(
         &self,
         query: &[S::Elem],
         k: usize,
         metric: Metric,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
+        self.search_prepared(
+            &VectorQuery::new(metric, std::sync::Arc::new(query.to_vec())),
+            k,
+        )
+    }
+
+    pub(crate) fn search_prepared<T: VectorElement>(
+        &self,
+        query: &VectorQuery<T>,
+        k: usize,
+    ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
         if k == 0 {
             return (Vec::new(), StackedSearchStats::default());
         }
 
-        let dim = query.len();
         let open = self.lists_to_open(k);
 
         // Candidate lists, nearest centroid first; `candidates[0]` is P0.
         let (candidates, mut stats) = if let Some(parent) = &self.parent {
-            parent.search(query, open, metric)
+            parent.search_prepared(query, open)
         } else {
             let nlist = self.nlist();
-            let all: Vec<Candidate<ClusterId>> = (0..nlist)
-                .map(|i| Candidate {
-                    sim: self.centroids.similarity(metric, dim, i as u32, query),
+            let mut scores = Vec::with_capacity(nlist);
+            self.centroids.batch_similarity(
+                query.widened(),
+                query.metric(),
+                query.routing_norm(),
+                0..nlist,
+                &mut scores,
+            );
+            let all: Vec<Candidate<ClusterId>> = scores
+                .into_iter()
+                .enumerate()
+                .map(|(i, sim)| Candidate {
+                    sim,
                     node: ClusterId(i as u32),
                 })
                 .sorted()
@@ -962,7 +987,7 @@ where S: VectorArena<Elem = f32>
         let mut result = BinaryHeap::with_capacity(k);
         let mut scores = Vec::new();
         for c in &candidates {
-            let scanned = self.scan_cluster(query, metric, c.node, &mut result, k, &mut scores);
+            let scanned = self.scan_cluster(query, c.node, &mut result, k, &mut scores);
             stats.members_scored += scanned;
             stats.lists_scanned += 1;
             let kth = if result.len() >= k {
@@ -985,10 +1010,9 @@ where S: VectorArena<Elem = f32>
         (hits, stats)
     }
 
-    fn scan_cluster(
+    fn scan_cluster<T: VectorElement>(
         &self,
-        query: &[S::Elem],
-        metric: Metric,
+        query: &VectorQuery<T>,
         list: ClusterId,
         result: &mut BinaryHeap<Reverse<Candidate<ClusterId>>>,
         k: usize,
@@ -997,8 +1021,13 @@ where S: VectorArena<Elem = f32>
         let (start, end) = self.offsets[usize::from(list)];
         let start = start as usize;
         let end = end as usize;
-        self.vectors
-            .batch_similarity(query, metric, start..end, scores);
+        self.vectors.batch_similarity(
+            query.widened(),
+            query.metric(),
+            query.routing_norm(),
+            start..end,
+            scores,
+        );
         for (row, &sim) in (start..end).zip(scores.iter()) {
             let cand = Candidate {
                 sim,

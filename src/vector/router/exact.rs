@@ -10,6 +10,8 @@ use crate::vector::clustering::IvfCentroids;
 use crate::vector::router::arena::VectorArena;
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::levels::{InMemoryStore, LazyStore};
+use crate::vector::search::prepared::VectorQuery;
+use crate::vector::VectorElement;
 
 pub(crate) struct ExactRouter<S> {
     centroids: S,
@@ -19,11 +21,17 @@ pub(crate) struct ExactRouter<S> {
 }
 
 impl<S: VectorArena<Elem = f32>> ExactRouter<S> {
-    pub(super) fn rank(&self, query: &[f32]) -> Ranking {
-        assert_eq!(query.len(), self.dim);
+    pub(super) fn rank<T: VectorElement>(&self, query: &VectorQuery<T>) -> Ranking {
+        assert_eq!(query.widened().len(), self.dim);
+        debug_assert_eq!(query.metric(), self.metric);
         let mut scores = Vec::with_capacity(self.num_centroids);
-        self.centroids
-            .batch_similarity(query, self.metric, 0..self.num_centroids, &mut scores);
+        self.centroids.batch_similarity(
+            query.widened(),
+            query.metric(),
+            query.routing_norm(),
+            0..self.num_centroids,
+            &mut scores,
+        );
         let mut ranked = scores
             .into_iter()
             .enumerate()
@@ -134,6 +142,7 @@ mod tests {
                     })
                     .collect();
                 expected.sort_unstable_by(|a, b| b.cmp(a));
+                let query = VectorQuery::new(metric, std::sync::Arc::new(query.to_vec()));
                 assert_eq!(router.rank(&query).collect::<Vec<_>>(), expected);
                 assert_eq!(opened.rank(&query).collect::<Vec<_>>(), expected);
             }
