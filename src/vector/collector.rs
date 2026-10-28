@@ -968,7 +968,8 @@ mod ivf_e2e_tests {
                     let collector = TopDocs::with_limit(7)
                         .and_offset(3)
                         .order_by_similarity(fixture.field, query.clone())
-                        .with_probe_params(params);
+                        .with_probe_params(params)
+                        .build();
                     let fruit = collector.merge_fruits(collector.collect_segments(
                         fixture.weight(filter)?.as_ref(),
                         &readers,
@@ -1023,7 +1024,8 @@ mod ivf_e2e_tests {
                 max_probe_fraction: 0.001,
                 min_probe_clusters: 3,
                 ..Default::default()
-            });
+            })
+            .build();
         let weight = near.weight(&near.filter("matches"))?;
         let result = collector.merge_fruits(collector.collect_segments(
             weight.as_ref(),
@@ -1061,7 +1063,8 @@ mod ivf_e2e_tests {
             .with_probe_params(ProbeParams {
                 max_probe_fraction: 0.0005,
                 ..Default::default()
-            });
+            })
+            .build();
         let weight = fixture.all()?;
         let fruit = collector.merge_fruits(collector.collect_segments(
             weight.as_ref(),
@@ -1301,7 +1304,8 @@ mod ivf_e2e_tests {
                     .and_offset(2)
                     .order_by_similarity(embedding_field, query.to_vec())
                     .with_probe_params(exhaustive_params(9))
-                    .with_tie_break(tie_break());
+                    .with_tie_break(tie_break())
+                    .build();
                 let readers: Vec<_> = searcher
                     .segment_readers()
                     .iter()
@@ -1532,7 +1536,8 @@ mod ivf_e2e_tests {
             assert_eq!(cities(&fruit), want, "k={k}");
             let collector = TopDocs::with_limit(k)
                 .order_by_similarity(embedding_field, vec![0.0_f32, 0.0])
-                .with_tie_break((SortByString::for_field("city"), Order::Asc));
+                .with_tie_break((SortByString::for_field("city"), Order::Asc))
+                .build();
             let readers: Vec<_> = searcher
                 .segment_readers()
                 .iter()
