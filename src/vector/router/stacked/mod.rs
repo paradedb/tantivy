@@ -2,6 +2,7 @@
 //! [`StackedIvf::lists_to_open`] and stopped by [`super::adaptive`].
 
 pub(crate) mod levels;
+pub(crate) mod search;
 
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};

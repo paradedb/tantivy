@@ -1,7 +1,5 @@
-use super::adaptive::AdaptiveProbe;
-use super::arena::VectorArena;
 use super::candidate::Candidate;
-use super::stacked::levels::{lists_to_open, LazyStore, StackedIvf};
+use super::stacked::search::{AllScored, StackedRouting};
 use super::{OpenedRouter, Router, RouterMetrics};
 use crate::schema::Metric;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
@@ -23,134 +21,62 @@ impl GlobalRanking {
         totals: &mut [StageTotals],
         on_segment: &mut impl FnMut(usize),
     ) -> Self {
-        let mut levels: Vec<Vec<&StackedIvf<LazyStore>>> = Vec::with_capacity(routers.len());
-        let mut metrics = Vec::with_capacity(routers.len());
+        let mut indexes = Vec::with_capacity(routers.len());
         let mut leaves = Vec::new();
-        for (segment, router) in routers.iter().enumerate() {
-            let mut stack = Vec::new();
-            let mut stats = RouterMetrics::Stacked {
+        let mut metrics = vec![
+            RouterMetrics::Stacked {
                 candidate_count: 0,
                 lists_scanned: 0,
                 members_scored: 0,
             };
-            match router {
-                Some(Router::Stacked(router)) => {
-                    let mut current = Some(router);
-                    while let Some(level) = current {
-                        stack.push(level);
-                        current = level.parent.as_deref();
-                    }
-                }
-                Some(Router::Exact(router)) => {
+            routers.len()
+        ];
+        for (segment, router) in routers.iter().enumerate() {
+            let index = match router {
+                Some(Router::Stacked(index)) => Some(index),
+                Some(Router::Exact(index)) => {
                     let (ranked, measured) = measure(|| {
                         let _stage = enter_vector_stage(VectorStage::Routing);
-                        router.rank(query).collect::<Vec<_>>()
+                        index.rank(query).collect::<Vec<_>>()
                     });
                     totals[segment].append(&measured);
                     on_segment(segment);
-                    stats = RouterMetrics::Exact {
+                    metrics[segment] = RouterMetrics::Exact {
                         visited_count: ranked.len(),
                     };
                     leaves.extend(ranked.into_iter().map(|c| (segment, c)));
+                    None
                 }
-                None => {}
-            }
-            levels.push(stack);
-            metrics.push(stats);
+                None => None,
+            };
+            indexes.push(index);
         }
-        let depth = levels.iter().map(Vec::len).max().unwrap_or(0);
-        let mut requested = k;
-        let open: Vec<_> = (0..depth)
-            .map(|level| {
-                let indexes: Vec<_> = levels.iter().filter_map(|stack| stack.get(level)).collect();
-                let lists = indexes.iter().map(|index| index.nlist()).sum();
-                let members = indexes
-                    .iter()
-                    .flat_map(|index| &index.offsets)
-                    .map(|&(start, end)| (end - start) as usize)
-                    .sum();
-                requested = lists_to_open(lists, members, requested);
-                requested
-            })
-            .collect();
-        let mut candidates: Vec<(usize, Candidate)> = Vec::new();
-        for level in (0..depth).rev() {
-            for (segment, stack) in levels.iter().enumerate() {
-                if stack.len() != level + 1 {
-                    continue;
-                }
-                let index = stack[level];
-                let (_, measured) = measure(|| {
-                    let _stage = enter_vector_stage(VectorStage::Routing);
-                    candidates.extend((0..index.nlist()).map(|node| {
-                        (
-                            segment,
-                            Candidate {
-                                sim: index.centroids.similarity(
-                                    metric,
-                                    query.len(),
-                                    node as u32,
-                                    query,
-                                ),
-                                node: node as u32,
-                            },
-                        )
-                    }));
-                });
-                totals[segment].append(&measured);
-                on_segment(segment);
-                if let RouterMetrics::Stacked { members_scored, .. } = &mut metrics[segment] {
-                    *members_scored += index.nlist();
-                }
-            }
-            candidates.sort_unstable_by(|a, b| {
-                b.1.sim
-                    .cmp(&a.1.sim)
-                    .then(a.0.cmp(&b.0))
-                    .then(a.1.node.cmp(&b.1.node))
-            });
-            candidates.truncate(open[level]);
-            let mut next = Vec::new();
-            let requested = if level == 0 { k } else { open[level - 1] };
-            let mut probe = AdaptiveProbe::new(requested);
-            for (segment, candidate) in candidates {
-                let index = levels[segment][level];
-                let (scanned, measured) = measure(|| {
-                    let _stage = enter_vector_stage(VectorStage::Routing);
-                    let (start, end) = index.offsets[candidate.node as usize];
-                    for node in start..end {
-                        let candidate = Candidate {
-                            sim: index
-                                .vectors
-                                .similarity(metric, query.len(), node as u32, query),
-                            node: node as u32,
-                        };
-                        probe.push(Candidate {
-                            sim: candidate.sim,
-                            node: (segment, candidate.node),
-                        });
-                        next.push((segment, candidate));
-                    }
-                    (end - start) as usize
-                });
-                totals[segment].append(&measured);
-                on_segment(segment);
-                if let RouterMetrics::Stacked {
-                    lists_scanned,
-                    members_scored,
-                    ..
-                } = &mut metrics[segment]
-                {
-                    *lists_scanned += 1;
-                    *members_scored += scanned;
-                }
-                if probe.should_stop(scanned) {
-                    break;
-                }
-            }
-            candidates = next;
+        let ranking = StackedRouting::Global {
+            indexes,
+            totals,
+            on_segment,
         }
-        leaves.extend(candidates);
+        .search(query, k.max(1), metric, AllScored::default());
+        for (stats, metrics) in ranking.stats.iter().zip(&mut metrics) {
+            if let RouterMetrics::Stacked {
+                lists_scanned,
+                members_scored,
+                ..
+            } = metrics
+            {
+                *lists_scanned = stats.lists_scanned;
+                *members_scored = stats.members_scored;
+            }
+        }
+        leaves.extend(ranking.candidates.into_iter().map(|candidate| {
+            (
+                candidate.node.0,
+                Candidate {
+                    sim: candidate.sim,
+                    node: candidate.node.1,
+                },
+            )
+        }));
         leaves.sort_unstable_by(|a, b| {
             b.1.sim
                 .cmp(&a.1.sim)
@@ -178,7 +104,10 @@ mod tests {
     use crate::directory::FileSlice;
     use crate::schema::VectorOptions;
     use crate::vector::clustering::{IvfCentroids, IvfMatrix};
-    use crate::vector::router::stacked::levels::{InMemoryStore, StackedIvfConfig};
+    use crate::vector::router::stacked::levels::{
+        ClusterId, InMemoryStore, StackedIvf, StackedIvfConfig,
+    };
+    use crate::vector::router::stacked::search::TopK;
     use crate::vector::router::RouterKind;
 
     fn open_line_router(base: f32, count: u64, nested: bool) -> crate::Result<OpenedRouter> {
@@ -257,6 +186,59 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    fn one_stack_uses_the_same_walk_in_both_constructions() -> crate::Result<()> {
+        for nested in [false, true] {
+            let Router::Stacked(index) = open_line_router(0.0, 4, nested)? else {
+                unreachable!()
+            };
+            for query in [[0.0], [1.5], [200.0]] {
+                for k in [0, 1, 2, 4, 16] {
+                    let (segment, stats) = index.search(&query, k, Metric::L2);
+                    let mut totals = vec![StageTotals::default(); 2];
+                    let mut visited = Vec::new();
+                    let global = StackedRouting::Global {
+                        indexes: vec![None, Some(&index)],
+                        totals: &mut totals,
+                        on_segment: &mut |segment| visited.push(segment),
+                    }
+                    .search(&query, k, Metric::L2, TopK);
+                    let best: Vec<_> = global
+                        .candidates
+                        .into_iter()
+                        .map(|candidate| Candidate {
+                            sim: candidate.sim,
+                            node: ClusterId(candidate.node.1),
+                        })
+                        .collect();
+                    assert_eq!(best, segment);
+                    assert_eq!(global.stats[1].lists_scanned, stats.lists_scanned);
+                    assert_eq!(global.stats[1].members_scored, stats.members_scored);
+                    assert!(visited.iter().all(|&segment| segment == 1));
+                    let all = StackedRouting::Global {
+                        indexes: vec![None, Some(&index)],
+                        totals: &mut totals,
+                        on_segment: &mut |_| {},
+                    }
+                    .search(&query, k, Metric::L2, AllScored::default());
+                    assert_eq!(all.stats[1].lists_scanned, stats.lists_scanned);
+                    assert_eq!(all.stats[1].members_scored, stats.members_scored);
+                    let mut best_from_all = all.candidates;
+                    best_from_all.sort_unstable_by(|a, b| b.cmp(a));
+                    best_from_all.truncate(k);
+                    assert_eq!(
+                        best_from_all
+                            .iter()
+                            .map(|c| (c.sim, ClusterId(c.node.1)))
+                            .collect::<Vec<_>>(),
+                        segment.iter().map(|c| (c.sim, c.node)).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn patience_follows_global_order_and_counts_work_per_segment() -> crate::Result<()> {
         for far_base in [0.5, 100.0] {
