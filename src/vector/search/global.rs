@@ -17,9 +17,9 @@ use crate::vector::{VectorElement, VectorStage};
 use crate::SegmentReader;
 
 #[allow(clippy::large_enum_variant)]
-enum ScheduledSource<'a, T: VectorElement> {
+enum GlobalSource<'a, T: VectorElement> {
     Router(RouterClusters<'a, T>),
-    Matches(MatchClusters<'a>),
+    RouterBypass(MatchClusters<'a>),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -186,7 +186,7 @@ where
                 comparator(),
             )?;
             let source = match source {
-                Source::Router(filter) => ScheduledSource::Router(RouterClusters::for_global(
+                Source::Router(filter) => GlobalSource::Router(RouterClusters::for_global(
                     &backend.reader,
                     &backend.query,
                     budget,
@@ -196,7 +196,7 @@ where
                 )),
                 Source::FilterMatches(docs) => {
                     reserved += budget.total;
-                    ScheduledSource::Matches(MatchClusters::locate(
+                    GlobalSource::RouterBypass(MatchClusters::locate(
                         &backend.reader,
                         docs,
                         segment,
@@ -218,7 +218,7 @@ where
         ..global_budget
     });
     for (i, (source, scan)) in sources.iter_mut().zip(&mut scans).enumerate() {
-        let (Some(ScheduledSource::Matches(source)), Some(scan)) = (source, scan) else {
+        let (Some(GlobalSource::RouterBypass(source)), Some(scan)) = (source, scan) else {
             continue;
         };
         scan.swap_exact(&mut exact);
@@ -238,14 +238,14 @@ where
         if meter.exhausted() {
             break;
         }
-        let Some(ScheduledSource::Router(source)) = &mut sources[i] else {
+        let Some(GlobalSource::Router(source)) = &mut sources[i] else {
             unreachable!()
         };
         let scan = scans[i].as_mut().unwrap();
         scan.swap_exact(&mut exact);
         let (result, measured) = measure(|| {
             meter.open();
-            if let Some(rows) = source.probe_scheduled(candidate, scan.feedback())? {
+            if let Some(rows) = source.probe_global(candidate, scan.feedback())? {
                 let scored = scan.run_cluster(&rows)?;
                 source.admitted(scored, scan.feedback())?;
                 meter.rows(scored);
@@ -263,7 +263,7 @@ where
         };
         let (result, measured) = measure(|| {
             let source = match source.unwrap() {
-                ScheduledSource::Router(source) => {
+                GlobalSource::Router(source) => {
                     let mut report = source.finish();
                     report.probe.termination = if meter.exhausted() {
                         ProbeTermination::Ceiling
@@ -272,7 +272,7 @@ where
                     };
                     SourceReport::Router(report)
                 }
-                ScheduledSource::Matches(source) => SourceReport::Matches(source.finish()),
+                GlobalSource::RouterBypass(source) => SourceReport::Matches(source.finish()),
             };
             let (hits, scan) = scan.finish(backends[i].segment_ord)?;
             Ok::<_, crate::TantivyError>((

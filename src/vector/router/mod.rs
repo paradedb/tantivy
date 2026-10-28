@@ -133,7 +133,7 @@ impl Default for RoutingParams {
 }
 
 pub(crate) enum RouterIter {
-    Scheduled(RouterMetrics),
+    Global(RouterMetrics),
     #[cfg(test)]
     Explicit(std::vec::IntoIter<Candidate>),
     Stacked(stacked::Ranking),
@@ -143,7 +143,7 @@ pub(crate) enum RouterIter {
 impl RouterIter {
     pub(crate) fn metrics(&self) -> RouterMetrics {
         match self {
-            Self::Scheduled(metrics) => *metrics,
+            Self::Global(metrics) => *metrics,
             #[cfg(test)]
             Self::Explicit(_) => RouterMetrics::Exact { visited_count: 0 },
             Self::Stacked(ranking) => ranking.metrics(),
@@ -159,7 +159,7 @@ impl Iterator for RouterIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            Self::Scheduled(_) => None,
+            Self::Global(_) => None,
             #[cfg(test)]
             Self::Explicit(ranking) => ranking.next(),
             Self::Stacked(ranking) => ranking.next(),

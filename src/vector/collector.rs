@@ -634,7 +634,7 @@ mod ivf_e2e_tests {
     }
 
     #[test]
-    fn global_schedule_preserves_filtered_quantized_results() -> crate::Result<()> {
+    fn global_search_preserves_filtered_quantized_results() -> crate::Result<()> {
         use crate::query::Query;
         use crate::vector::params::LocatedPath;
         use crate::vector::test_support::FixtureSpec;
@@ -760,7 +760,7 @@ mod ivf_e2e_tests {
     }
 
     #[test]
-    fn global_schedule_has_one_budget_floor() -> crate::Result<()> {
+    fn global_search_has_one_budget_floor() -> crate::Result<()> {
         use crate::vector::test_support::FixtureSpec;
         let fixture = FixtureSpec::clustered(Metric::L2, 32, 16, 1024)
             .segments(4)

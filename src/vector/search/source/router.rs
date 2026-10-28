@@ -226,8 +226,8 @@ impl<'a> RouterClusters<'a> {
         }
     }
 
-    /// Prepares this segment to probe clusters chosen by the global scheduler.
-    /// The scheduler supplies the cluster order and enforces the shared search budget.
+    /// Prepares this segment for a global search across multiple segments.
+    /// The global search supplies clusters in ranked order and enforces the shared budget.
     pub(crate) fn for_global(
         reader: &'a VectorIndexReader,
         query: &'a VectorQuery<T>,
@@ -241,7 +241,7 @@ impl<'a> RouterClusters<'a> {
             index,
             reader,
             query,
-            ranked: RouterIter::Scheduled(metrics),
+            ranked: RouterIter::Global(metrics),
             meter: WorkMeter::new(budget),
             controller: ProbeController::new(index.num_clusters()),
             bounds: index.bounds(),
@@ -254,7 +254,8 @@ impl<'a> RouterClusters<'a> {
         }
     }
 
-    pub(crate) fn probe_scheduled(
+    /// Prepares a cluster chosen by the global router using the latest shared query bound.
+    pub(crate) fn probe_global(
         &mut self,
         candidate: Candidate,
         feedback: Feedback,
