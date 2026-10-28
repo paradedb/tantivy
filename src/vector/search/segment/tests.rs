@@ -242,10 +242,10 @@ fn seeded_drops(
 /// more rows at admission than the scan's own bound.
 static SEEDED_CASES: AtomicUsize = AtomicUsize::new(0);
 static SEEDED_CASES_PRUNING_MORE: AtomicUsize = AtomicUsize::new(0);
-/// Oracle-matrix windows compared against a seeded participants' slot, those where a sync
-/// raised a scan's threshold, and the window rows the seed dropped.
+/// Oracle-matrix windows compared against a seeded participants' slot, those where the seed
+/// pruned at least one row, and the window rows the seed dropped.
 static SLOT_CASES: AtomicUsize = AtomicUsize::new(0);
-static SLOT_CASES_RAISED: AtomicUsize = AtomicUsize::new(0);
+static SLOT_CASES_PRUNED: AtomicUsize = AtomicUsize::new(0);
 static SLOT_DROPS: AtomicUsize = AtomicUsize::new(0);
 
 /// A row of the unseeded window the seeded run lost: where it was dropped, its upper endpoint
@@ -362,12 +362,17 @@ fn assert_slot_seeded(
         Some(slot.clone()),
     )?;
     SLOT_CASES.fetch_add(1, Ordering::Relaxed);
-    if seeded
-        .stats
-        .iter()
-        .any(|stats| stats.cross_bound_raises > 0)
-    {
-        SLOT_CASES_RAISED.fetch_add(1, Ordering::Relaxed);
+    if seeded.stats.iter().any(|stats| {
+        stats
+            .layers
+            .get(0)
+            .is_some_and(|layer| layer.admission_pruned() > 0)
+            || (1..)
+                .map_while(|i| stats.layers.get(i))
+                .any(|layer| layer.recheck_dropped() > 0)
+            || stats.exact_recheck_dropped > 0
+    }) {
+        SLOT_CASES_PRUNED.fetch_add(1, Ordering::Relaxed);
     }
     assert!(
         slot.load().is_some_and(|(score, _)| score >= seed),
@@ -497,10 +502,15 @@ fn assert_case(
     // missed its exact score.
     if let Some(&(seed, _)) = pruned.get(k - 1) {
         let collector_topk = Arc::new(Mutex::new(TopK::new(k)));
-        collector_topk
-            .lock()
-            .unwrap()
-            .merge_exact(std::iter::repeat_n(seed, k));
+        collector_topk.lock().unwrap().merge_exact((0..k).map(|i| {
+            (
+                crate::vector::write::RowAddress {
+                    segment_ord: SegmentOrdinal::MAX,
+                    row_id: i,
+                },
+                seed,
+            )
+        }));
         let (seeded, seeded_stats) = planned_top_k_with(
             fixture,
             filter,
@@ -601,16 +611,16 @@ fn scan_matches_oracle() -> crate::Result<()> {
         pruning_more > 0,
         "no seeded case pruned beyond the scan's own bound"
     );
-    let (slot_cases, slot_raised, slot_drops) = (
+    let (slot_cases, slot_pruned, slot_drops) = (
         SLOT_CASES.load(Ordering::Relaxed),
-        SLOT_CASES_RAISED.load(Ordering::Relaxed),
+        SLOT_CASES_PRUNED.load(Ordering::Relaxed),
         SLOT_DROPS.load(Ordering::Relaxed),
     );
     eprintln!(
-        "seeded slot windows: {slot_cases}, raising a scan's threshold: {slot_raised}, rows \
-         dropped: {slot_drops}; two segments per index"
+        "seeded slot windows: {slot_cases}, pruning under the seed: {slot_pruned}, rows dropped: \
+         {slot_drops}; two segments per index"
     );
-    assert!(slot_raised > 0, "no seeded slot raised a scan's threshold");
+    assert!(slot_pruned > 0, "no seeded slot pruned any rows");
     Ok(())
 }
 

@@ -26,7 +26,7 @@ use crate::error::DataCorruption;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource, Feedback};
-use crate::vector::search::interval::Threshold;
+use crate::vector::search::interval::{Estimate, Threshold};
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery};
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::quantized::{QuantizedFieldReader, ReadScratch};
@@ -102,8 +102,6 @@ pub(crate) struct ScanReport {
     pub(crate) exact_recheck_dropped: usize,
     /// Thresholds the scan stored in the participants' slot.
     pub(crate) cross_bound_publishes: usize,
-    /// Slot reads that raised the scan's threshold.
-    pub(crate) cross_bound_raises: usize,
     /// Centroid rows read for shortlisted clusters without a centroid score.
     pub(crate) centroid_reads: usize,
     #[cfg(test)]
@@ -150,6 +148,7 @@ struct QuantizedState<'a> {
     /// The reader exact reads are priced through; `None` with the exact plan off.
     exact: Option<&'a VectorIndexReader>,
     index: &'a ClusterIndex,
+    segment_ord: SegmentOrdinal,
     /// Centroid rows read for clusters without a centroid score.
     centroid_reads: usize,
     #[cfg(test)]
@@ -165,6 +164,7 @@ impl<'a> QuantizedState<'a> {
         field: &'a QuantizedFieldReader,
         reader: &'a VectorIndexReader,
         index: &'a ClusterIndex,
+        segment_ord: SegmentOrdinal,
         config: &ScanConfig,
     ) -> Self {
         let meta = query.index.meta.field();
@@ -188,6 +188,7 @@ impl<'a> QuantizedState<'a> {
             layer0_admission_pruned: 0,
             exact: config.exact_plan.then_some(reader),
             index,
+            segment_ord,
             centroid_reads: 0,
             #[cfg(test)]
             plan_override: config.plan_override,
@@ -262,13 +263,7 @@ impl<'a> QuantizedState<'a> {
                     &mut self.admission_columns,
                     0..rows.len(),
                 );
-                bound.admit(
-                    rows,
-                    &self.admission_columns,
-                    self.candidates.kappa(),
-                    threshold,
-                    &mut self.admission_keep,
-                );
+                self.select_admitted(rows, threshold);
                 let at = self.candidates.push_selected(
                     rows,
                     centroid,
@@ -276,6 +271,7 @@ impl<'a> QuantizedState<'a> {
                     &self.admission_keep,
                 );
                 self.layer0_admission_pruned += rows.len() - at.len();
+                bound.offer(self.candidates.entries(at, self.segment_ord));
             }
             None => {
                 let at = self.candidates.push_block(rows, centroid);
@@ -285,20 +281,36 @@ impl<'a> QuantizedState<'a> {
                     &mut self.candidates.columns,
                     at.clone(),
                 );
-                bound.merge_cluster(self.candidates.entries(at));
+                bound.offer(self.candidates.entries(at, self.segment_ord));
             }
         }
         Ok(())
     }
 
-    /// The threshold admission prunes at; `None` while the bound's is unset or when a test
-    /// disables pruning.
-    fn admission_threshold(&self, bound: &mut PruningBound) -> Option<Threshold> {
+    /// Fills `admission_keep` with cluster-local indices whose upper endpoint reaches `threshold`.
+    fn select_admitted(&mut self, rows: &ClusterRows<'_>, threshold: Threshold) {
+        debug_assert_eq!(self.admission_columns.estimates.len(), rows.len());
+        let kappa = self.candidates.kappa();
+        self.admission_keep.clear();
+        for index in 0..rows.len() {
+            let estimate = Estimate(self.admission_columns.estimates[index]);
+            let sigma = self.admission_columns.sigmas[index];
+            let upper = estimate.upper(sigma, kappa);
+            if threshold.admits(upper) {
+                self.admission_keep.push(index as u32);
+            }
+        }
+    }
+
+    /// The threshold admission prunes at: the shared slot, or `None` when unset / pruning is off.
+    fn admission_threshold(&mut self, bound: &mut PruningBound) -> Option<Threshold> {
         #[cfg(test)]
         if self.admission_pruning_disabled {
             return None;
         }
-        bound.pruning_threshold()
+        bound
+            .shared_threshold()
+            .map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score)))
     }
 
     /// Refines block `b`'s candidates with `layer`, read as `read`.
@@ -324,11 +336,14 @@ impl<'a> QuantizedState<'a> {
         Ok(())
     }
 
-    /// Drops block `b`'s candidates whose upper endpoint fell below the bound's pruning threshold
-    /// since the last boundary, before the block is read; returns the rows dropped.
+    /// Drops block `b`'s candidates whose upper endpoint fell below the shared slot since the last
+    /// boundary, before the block is read; returns the rows dropped.
     fn recheck(&mut self, b: usize, bound: &mut PruningBound) -> usize {
-        match bound.pruning_threshold() {
-            Some(threshold) => self.candidates.recheck(b, threshold),
+        match bound.shared_threshold() {
+            Some(score) => self.candidates.recheck(
+                b,
+                Threshold(crate::vector::search::interval::LowerEndpoint(score)),
+            ),
             None => 0,
         }
     }
@@ -366,7 +381,10 @@ impl<'a> QuantizedState<'a> {
                 .push(self.candidates.column_trace(row_order));
         }
         let _boundary = enter_vector_stage(VectorStage::Boundary(layer as u8));
-        let threshold = bound.boundary(&mut self.candidates);
+        bound.offer(self.candidates.live_candidates(self.segment_ord));
+        let threshold = bound
+            .shared_threshold()
+            .map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score)));
         self.candidates.band(threshold);
         report.layers[layer].survivors = self.candidates.len();
         #[cfg(test)]
@@ -411,6 +429,7 @@ where
         query: ScoringQuery<'a, T>,
         config: ScanConfig,
         bound: PruningBound,
+        segment_ord: SegmentOrdinal,
         tie_break: &'a mut K,
         tie_comparator: C,
     ) -> crate::Result<Self> {
@@ -421,6 +440,7 @@ where
                 field,
                 reader,
                 index,
+                segment_ord,
                 &config,
             )),
             (Some(_), None) => {
@@ -433,7 +453,14 @@ where
         };
         let layers = quantized.as_ref().map_or(0, |state| state.layers.len());
         Ok(Self {
-            exact: ExactScorer::new(reader, query.query, config.top_n, tie_break, tie_comparator),
+            exact: ExactScorer::new(
+                reader,
+                query.query,
+                config.top_n,
+                segment_ord,
+                tie_break,
+                tie_comparator,
+            ),
             bound,
             quantized,
             scratch: ReadScratch::default(),
@@ -469,13 +496,11 @@ where
         }
     }
 
-    /// The segment top-k as of the last shortlisted cluster. The router reads `kth_lower` and APS
-    /// reads `kth_estimate`. The collector top-k and the shared top-k threshold are not in this
-    /// top-k.
+    /// The shared prune floor when set. The router reads `kth_lower`.
     fn feedback(&self) -> Feedback {
         Feedback {
-            kth_lower: self.bound.own_lower(),
-            kth_estimate: self.bound.own_estimate(),
+            kth_lower: self.bound.shared_threshold(),
+            kth_estimate: None,
         }
     }
 
@@ -589,7 +614,6 @@ where
         let _assembly = enter_vector_stage(VectorStage::ResultAssembly);
         let mut report = self.report;
         report.cross_bound_publishes = self.bound.publishes;
-        report.cross_bound_raises = self.bound.raises;
         if let Some(state) = &self.quantized {
             report.centroid_reads = state.centroid_reads;
         }

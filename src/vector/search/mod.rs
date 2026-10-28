@@ -51,8 +51,8 @@ pub(crate) struct SegmentSearcher<T: VectorElement> {
     quantized: Option<Arc<QuantizedQueryCtx>>,
     probe_params: ProbeParams,
     segment_ord: SegmentOrdinal,
-    /// Exact scores segments of this collector have finished. The scan seeds its threshold from
-    /// their k-th. `None` seeds nothing.
+    /// Exact scores segments of this collector have finished. The scan seeds its TopK from them
+    /// (partial k). `None` seeds nothing.
     pub(crate) collector_topk: Option<Arc<Mutex<TopK>>>,
     /// The threshold this scan publishes. Defaults to a process-local
     /// [`AtomicSharedThreshold`] until the collector installs its shared slot.
@@ -90,7 +90,8 @@ impl<T: VectorElement> SegmentSearcher<T> {
         })
     }
 
-    /// Seeds `tau` from `collector_topk`'s k-th and publishes through `shared_topk_threshold`.
+    /// Seeds the segment [`PruningBound`] from `collector_topk` and publishes through
+    /// `shared_topk_threshold`.
     pub(crate) fn with_collector_topk(
         mut self,
         collector_topk: Arc<Mutex<TopK>>,
@@ -231,21 +232,17 @@ impl<T: VectorElement> SegmentSearcher<T> {
             #[cfg(test)]
             admission_pruning_disabled: self.admission_pruning_disabled,
         };
-        let collector_kth = self
-            .collector_topk
-            .as_ref()
-            .and_then(|collector_topk| collector_topk.lock().unwrap().kth_lower());
-        let bound = PruningBound::new(
-            top_n,
-            collector_kth,
-            Arc::clone(&self.shared_topk_threshold),
-        );
+        let mut bound = PruningBound::new(top_n, Arc::clone(&self.shared_topk_threshold));
+        if let Some(collector_topk) = &self.collector_topk {
+            bound.seed(&collector_topk.lock().unwrap());
+        }
         let mut scan = SegmentScan::new(
             &self.reader,
             index,
             self.scoring_query(),
             config,
             bound,
+            self.segment_ord,
             tie_break,
             tie_comparator,
         )?;

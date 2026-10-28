@@ -149,9 +149,13 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
     /// Builds the collector. Configuration cannot be changed afterwards.
     pub fn build(self) -> TopDocsByVectorSimilarity<T, S> {
         let segment_top_n = self.limit.saturating_add(self.offset);
-        let shared_topk_threshold = self
-            .shared_threshold
-            .unwrap_or_else(|| Arc::new(AtomicSharedThreshold::default()));
+        let (shared_topk_threshold, owns_shared_threshold) = match self.shared_threshold {
+            Some(slot) => (slot, false),
+            None => (
+                Arc::new(AtomicSharedThreshold::default()) as SharedThresholdArc<Score>,
+                true,
+            ),
+        };
         TopDocsByVectorSimilarity {
             field: self.field,
             query: self.query,
@@ -163,6 +167,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
             prepared: Mutex::new(None),
             collector_topk: Arc::new(Mutex::new(TopK::new(segment_top_n))),
             shared_topk_threshold,
+            owns_shared_threshold,
             tie_break: self.tie_break,
         }
     }
@@ -187,12 +192,15 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     quantized_queries: Mutex<HashMap<PreparedKey, PreparedCell>>,
     /// The query prepared for the field's metric on first use.
     prepared: Mutex<Option<Arc<VectorQuery<T>>>>,
-    /// The top-k exact scores from segments this collector has finished. Later segments seed `tau`
-    /// from the k-th and do not copy these scores into the segment top. Cleared between searches.
+    /// The top-k exact scores (with addresses) from segments this collector has finished. Later
+    /// segments seed their pruning-bound TopK from these for partial-k accounting. Cleared between
+    /// searches.
     collector_topk: Arc<Mutex<TopK>>,
     /// The shared top-k threshold every segment scan of this collector syncs and publishes.
     /// Either the caller's slot or a process-local [`AtomicSharedThreshold`] from `build`.
     shared_topk_threshold: SharedThresholdArc<Score>,
+    /// When true, `shared_topk_threshold` was created by `build` and is cleared between searches.
+    owns_shared_threshold: bool,
     tie_break: S,
 }
 
@@ -381,8 +389,11 @@ where
         if let Some(first) = merged.stats.first_mut() {
             first.add_assembly(&totals);
         }
-        // The collector top-k describes this search's results only. A caller slot is the caller's.
+        // The collector top-k (and process-local slot, when we own it) describe this search only.
         self.collector_topk.lock().unwrap().clear();
+        if self.owns_shared_threshold {
+            self.shared_topk_threshold.clear();
+        }
         Ok(merged)
     }
 }
@@ -440,7 +451,16 @@ where
             self.collector_topk
                 .lock()
                 .unwrap()
-                .merge_exact(hits.iter().map(|((score, _), _)| *score))
+                .merge_exact(hits.iter().map(|((score, _), address)| {
+                    (
+                        crate::vector::write::RowAddress {
+                            segment_ord: address.segment_ord,
+                            // Opaque foreign key for seeding; never equals this segment's rows.
+                            row_id: address.doc_id as usize,
+                        },
+                        *score,
+                    )
+                }))
         };
         // A segment key can be a term ordinal: lift it before it leaves the segment.
         let results = hits

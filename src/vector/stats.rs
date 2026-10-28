@@ -229,8 +229,6 @@ pub struct ProbeStats {
     pub exact_recheck_dropped: usize,
     /// Thresholds this segment's scan stored in the query participants' shared slot.
     pub cross_bound_publishes: usize,
-    /// Reads of the participants' slot that raised this segment's pruning threshold.
-    pub cross_bound_raises: usize,
     /// Nanoseconds initializing the scan.
     pub scan_init_ns: u64,
     /// Nanoseconds evaluating the filter.
@@ -338,7 +336,6 @@ impl ProbeStats {
             exact_rows: scan.exact_rows,
             exact_recheck_dropped: scan.exact_recheck_dropped,
             cross_bound_publishes: scan.cross_bound_publishes,
-            cross_bound_raises: scan.cross_bound_raises,
             layers: LayerProbeStatsSet(
                 scan.layers
                     .iter()
@@ -534,7 +531,6 @@ mod tests {
         "exact_rows",
         "exact_recheck_dropped",
         "cross_bound_publishes",
-        "cross_bound_raises",
         "scan_init_ns",
         "non_vector_search_ns",
         "query_prep_ns",

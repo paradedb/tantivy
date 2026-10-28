@@ -7,11 +7,12 @@ use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::{SegmentSortKeyComputer, TopNComputer};
 use crate::vector::search::cluster_source::ClusterRows;
 use crate::vector::search::prepared::VectorQuery;
-use crate::vector::search::scan::bound::PruningBound;
+use crate::vector::search::scan::bound::{Candidate, PruningBound};
 use crate::vector::search::scan::heap::{tie_break_key, TieBreakHeap, TieBreakHits};
 use crate::vector::storage::quantized::ReadScratch;
 use crate::vector::storage::reader::{VectorIndexReader, VectorRowBatch};
 use crate::vector::telemetry::enter_vector_stage;
+use crate::vector::write::RowAddress;
 use crate::vector::{VectorElement, VectorStage};
 use crate::{DocAddress, DocId, SegmentOrdinal};
 
@@ -35,6 +36,7 @@ where
     query: &'a VectorQuery<T>,
     topn: TieBreakHeap<K, C>,
     tie_break: &'a mut K,
+    segment_ord: SegmentOrdinal,
     /// A cluster's DocIds column, read when its selected rows carry no doc ids.
     cluster_docs: Vec<DocId>,
     /// Global rows scored in the exact phase, in order; the scan copies them into its trace.
@@ -55,6 +57,7 @@ where
         reader: &'a VectorIndexReader,
         query: &'a VectorQuery<T>,
         top_n: usize,
+        segment_ord: SegmentOrdinal,
         tie_break: &'a mut K,
         tie_comparator: C,
     ) -> Self {
@@ -63,6 +66,7 @@ where
             query,
             topn: TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator)),
             tie_break,
+            segment_ord,
             cluster_docs: Vec::new(),
             #[cfg(test)]
             exact_phase_rows: Vec::new(),
@@ -73,18 +77,16 @@ where
 
     // --- Scoring ---
 
-    /// Scores every row `selected` selects into `bound` and the heap, reading through `scratch`,
-    /// then offers the bound's threshold to the query's participants; returns the rows scored. A
-    /// row without a doc id reads the cluster's DocIds column when it first needs one.
+    /// Scores every row `selected` selects into `bound` and the heap, reading through `scratch`;
+    /// returns the rows scored. A row without a doc id reads the cluster's DocIds column when it
+    /// first needs one. Each exact is `offer`ed to the bound (which CASes the shared slot).
     pub(super) fn score(
         &mut self,
         selected: &ClusterRows<'_>,
         scratch: &mut ReadScratch,
         bound: &mut PruningBound,
     ) -> crate::Result<usize> {
-        let scored = self.score_rows(selected, scratch, bound)?;
-        bound.publish();
-        Ok(scored)
+        self.score_rows(selected, scratch, bound)
     }
 
     /// Scores the exact phase's survivors in `selected`, as [`ExactScorer::score`] does.
@@ -117,7 +119,15 @@ where
             ExactRows::Span(bytes) => {
                 let stride = self.reader.options().bytes_per_vector();
                 for (local, row_bytes) in bytes.chunks_exact(stride).enumerate() {
-                    self.offer(selected, bound, &mut column_read, local, local, row_bytes)?;
+                    self.offer(
+                        selected,
+                        bound,
+                        &mut column_read,
+                        local,
+                        local,
+                        selected.rows.start + local,
+                        row_bytes,
+                    )?;
                 }
                 bytes.len() / stride
             }
@@ -130,6 +140,7 @@ where
                         &mut column_read,
                         position,
                         row - selected.rows.start,
+                        row,
                         row_bytes,
                     )?;
                     scored += 1;
@@ -144,7 +155,8 @@ where
     /// Scores one row into `bound` and, when it can enter the top k, the heap.
     ///
     /// `position` indexes the selection's doc ids and `offset` the cluster's DocIds column, read
-    /// once per selection on first use.
+    /// once per selection on first use. The bound is keyed by [`RowAddress`] so doc lookup stays
+    /// deferred until the score can enter the result heap.
     #[inline]
     fn offer(
         &mut self,
@@ -153,14 +165,22 @@ where
         column_read: &mut bool,
         position: usize,
         offset: usize,
+        global_row: usize,
         bytes: &[u8],
     ) -> crate::Result<()> {
         let score = self.query.score_row(bytes).score();
         #[cfg(test)]
         self.exact_scores.push(score);
-        bound.push_exact(score);
-        // Rows that cannot enter the top k skip the tie-break and the doc id lookup.
-        if bound.exact_kth().is_some_and(|kth| score < kth)
+        bound.offer([Candidate::exact(
+            RowAddress {
+                segment_ord: self.segment_ord,
+                row_id: global_row,
+            },
+            score,
+        )]);
+        // Rows that cannot enter the top k skip the tie-break and the doc id lookup: below the
+        // shared floor, or below the result heap's own threshold.
+        if bound.shared_threshold().is_some_and(|kth| score < kth)
             || self
                 .topn
                 .threshold

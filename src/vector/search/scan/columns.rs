@@ -2,17 +2,22 @@
 //! endpoints, and their selection in place at a threshold.
 
 use std::ops::Range;
+#[cfg(test)]
+use std::sync::Arc;
 
+#[cfg(test)]
+use crate::collector::AtomicSharedThreshold;
 use crate::vector::distance::Similarity;
 use crate::vector::quantization::{ArithmeticError, QUANTIZED_BOUNDARY_KAPPA};
 use crate::vector::search::cluster_source::ClusterRows;
 #[cfg(test)]
 use crate::vector::search::interval::LowerEndpoint;
 use crate::vector::search::interval::{Estimate, Threshold, UpperEndpoint};
+use crate::vector::search::scan::bound::Candidate;
 #[cfg(test)]
 use crate::vector::search::scan::bound::PruningBound;
-use crate::vector::search::scan::bound::{Bound, Candidate};
-use crate::DocId;
+use crate::vector::write::RowAddress;
+use crate::{DocId, SegmentOrdinal};
 
 // --- Columns ---
 
@@ -289,17 +294,24 @@ impl QuantizedCandidates {
             .upper(self.columns.sigmas[index], self.kappa)
     }
 
-    /// One candidate per live row of the block just pushed, at `at`.
-    pub(crate) fn entries(&self, at: Range<usize>) -> impl Iterator<Item = Candidate> + '_ {
+    /// One candidate per live row of the block just pushed, at `at`, keyed by [`RowAddress`].
+    pub(crate) fn entries(
+        &self,
+        at: Range<usize>,
+        segment_ord: SegmentOrdinal,
+    ) -> impl Iterator<Item = Candidate> + '_ {
         let block = self.blocks.last().expect("a block was just pushed");
         debug_assert_eq!(block.at, at, "the block just pushed");
         let start = block.rows.start;
-        at.map(move |index| Candidate {
-            row: start + self.offsets[index] as usize,
-            bound: Bound::Interval {
-                lo: self.lower(index),
-                est: self.columns.estimates[index],
-            },
+        at.map(move |index| {
+            Candidate::interval(
+                RowAddress {
+                    segment_ord,
+                    row_id: start + self.offsets[index] as usize,
+                },
+                self.lower(index),
+                self.columns.estimates[index],
+            )
         })
     }
 
@@ -331,9 +343,8 @@ impl QuantizedCandidates {
         self.docs.truncate(docs_write);
     }
 
-    /// One interval per live candidate, in admission order. A boundary rebuilds the segment top-k
-    /// from these.
-    pub(crate) fn live_candidates(&self) -> Vec<Candidate> {
+    /// One interval per live candidate, in admission order, keyed by [`RowAddress`].
+    pub(crate) fn live_candidates(&self, segment_ord: SegmentOrdinal) -> Vec<Candidate> {
         let mut out = Vec::new();
         for block in &self.blocks {
             let start = block.rows.start;
@@ -343,13 +354,14 @@ impl QuantizedCandidates {
                         && self.columns.sigmas[index].is_finite(),
                     "quantized boundary inputs must be finite"
                 );
-                out.push(Candidate {
-                    row: start + self.offsets[index] as usize,
-                    bound: Bound::Interval {
-                        lo: self.lower(index),
-                        est: self.columns.estimates[index],
+                out.push(Candidate::interval(
+                    RowAddress {
+                        segment_ord,
+                        row_id: start + self.offsets[index] as usize,
                     },
-                });
+                    self.lower(index),
+                    self.columns.estimates[index],
+                ));
             }
         }
         out
@@ -487,9 +499,9 @@ impl BoundaryHarness {
     }
 
     fn bound(&mut self, k: usize) -> &mut PruningBound {
-        let bound = self
-            .bound
-            .get_or_insert_with(|| PruningBound::standalone(k));
+        let bound = self.bound.get_or_insert_with(|| {
+            PruningBound::new(k, Arc::new(AtomicSharedThreshold::default()))
+        });
         assert_eq!(bound.k(), k, "one k per harness");
         bound
     }
@@ -512,8 +524,8 @@ impl BoundaryHarness {
     }
 
     /// Records an exactly scored row in the bound.
-    pub(crate) fn push_exact(&mut self, score: f32, k: usize) {
-        self.bound(k).push_exact(score);
+    pub(crate) fn push_exact(&mut self, address: RowAddress, score: f32, k: usize) {
+        self.bound(k).offer([Candidate::exact(address, score)]);
     }
 
     pub(crate) fn finish_cluster(&mut self, kappa: f32) {
@@ -530,12 +542,12 @@ impl BoundaryHarness {
             .bound
             .as_mut()
             .expect("begin_cluster creates the bound");
-        bound.merge_cluster(self.candidates.entries(at));
+        bound.offer(self.candidates.entries(at, 0));
     }
 
     pub(crate) fn own_lower(&mut self, k: usize) -> Option<Threshold> {
         self.bound(k)
-            .own_lower()
+            .kth_lower()
             .map(|kth| Threshold(LowerEndpoint(kth)))
     }
 
@@ -545,29 +557,35 @@ impl BoundaryHarness {
         if k > bound.k() {
             return None;
         }
-        self.bound(k).own_estimate()
+        self.bound(k).kth_estimate()
     }
 
     /// The threshold the next boundary would apply, leaving the running top-k intact.
     pub(crate) fn boundary_lower(&mut self, k: usize, kappa: f32) -> Option<Threshold> {
         let mut bound = self.bound(k).clone();
         self.candidates.kappa = kappa;
-        bound.boundary(&mut self.candidates)
+        bound.offer(self.candidates.live_candidates(0));
+        bound
+            .shared_threshold()
+            .map(|score| Threshold(LowerEndpoint(score)))
     }
 
     pub(crate) fn band(&mut self, k: usize, kappa: f32) {
         self.candidates.kappa = kappa;
         self.block_open = false;
-        let bound = self
-            .bound
-            .get_or_insert_with(|| PruningBound::standalone(k));
-        let threshold = bound.boundary(&mut self.candidates);
+        let bound = self.bound.get_or_insert_with(|| {
+            PruningBound::new(k, Arc::new(AtomicSharedThreshold::default()))
+        });
+        bound.offer(self.candidates.live_candidates(0));
+        let threshold = bound
+            .shared_threshold()
+            .map(|score| Threshold(LowerEndpoint(score)));
         self.candidates.band(threshold);
     }
 
-    /// The bound's pruning threshold.
-    pub(crate) fn threshold(&mut self, k: usize) -> Option<f32> {
-        self.bound(k).threshold()
+    /// The bound's shared-slot pruning threshold.
+    pub(crate) fn slot_threshold(&mut self, k: usize) -> Option<f32> {
+        self.bound(k).shared_threshold()
     }
 
     /// Opens an empty block that takes the next rows pushed, outside any cluster.

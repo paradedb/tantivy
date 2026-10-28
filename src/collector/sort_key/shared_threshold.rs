@@ -34,6 +34,11 @@ pub trait SharedThreshold<T>: Send + Sync {
         expected_threshold: &Option<(T, SegmentOrdinal)>,
         new_threshold: (T, SegmentOrdinal),
     ) -> Result<(), Option<(T, SegmentOrdinal)>>;
+
+    /// Resets to the uninitialized state. Collectors call this between searches so a reused
+    /// collector does not carry one search's floor into the next. Caller-owned slots that should
+    /// span searches can no-op.
+    fn clear(&self) {}
 }
 
 #[inline]
@@ -93,6 +98,13 @@ impl SharedThreshold<Score> for AtomicSharedThreshold {
         } else {
             Some((score, ord))
         }
+    }
+
+    fn clear(&self) {
+        self.value.store(
+            pack_score_and_ord(Score::MIN, SegmentOrdinal::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     fn try_update(
