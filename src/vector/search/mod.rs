@@ -4,7 +4,6 @@
 //! exactly. An IVF segment is planned, then scanned over its cluster source.
 
 pub(crate) mod cluster_source;
-pub(crate) mod global;
 pub(crate) mod interval;
 pub(crate) mod prepared;
 pub(crate) mod scan;
@@ -104,26 +103,27 @@ impl<T: VectorElement> SegmentSearcher<T> {
     }
 
     /// The query as this segment scores it.
-    fn scoring_query(&self) -> ScoringQuery<'_, T> {
+    pub(crate) fn scoring_query(&self) -> ScoringQuery<'_, T> {
         ScoringQuery {
             query: &self.query,
             quantized: self.quantized.as_deref(),
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn params(&self) -> &ProbeParams {
         &self.probe_params
     }
 
-    #[cfg(test)]
     pub(crate) fn reader(&self) -> &VectorIndexReader {
         &self.reader
     }
 
-    #[cfg(test)]
     pub(crate) fn query(&self) -> &VectorQuery<T> {
         &self.query
+    }
+
+    pub(crate) fn segment_ord(&self) -> SegmentOrdinal {
+        self.segment_ord
     }
 
     // --- Search ---

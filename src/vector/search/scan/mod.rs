@@ -9,6 +9,7 @@ pub(crate) mod heap;
 pub(crate) mod layer_read;
 pub(crate) mod plan;
 
+use std::mem::swap;
 use std::ops::Range;
 
 use self::bound::PruningBound;
@@ -473,7 +474,7 @@ where
     }
 
     pub(crate) fn swap_exact(&mut self, exact: &mut Vec<f32>) {
-        std::mem::swap(&mut self.exact.bound.exact, exact);
+        swap(&mut self.exact.bound.exact, exact);
     }
 
     pub(crate) fn run_cluster(&mut self, rows: &ClusterRows<'_>) -> crate::Result<usize> {
