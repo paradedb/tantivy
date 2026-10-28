@@ -3,11 +3,11 @@
 
 use std::collections::HashSet;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use common::BitSet;
 
-use crate::collector::TopDocs;
+use crate::collector::{SharedThresholdArcOpt, TopDocs};
 use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
 use crate::query::{
@@ -25,6 +25,7 @@ use crate::vector::params::ProbeParams;
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::with_test_clusters;
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
+use crate::vector::search::scan::bound::TopK;
 use crate::vector::search::scan::plan::PlanOverride;
 use crate::vector::search::scan::ScanTrace;
 use crate::vector::search::segment::plan::SegmentPlan;
@@ -36,7 +37,10 @@ use crate::vector::{
     ProbeStats, RouterKind, VectorQuantizationConfig, VectorQuantizationLayer,
     VectorSimilarityFruit, VectorStage,
 };
-use crate::{DocAddress, DocId, Index, IndexWriter, Score, SegmentReader, TantivyDocument};
+use crate::{
+    DocAddress, DocId, Index, IndexWriter, Score, Searcher, SegmentOrdinal, SegmentReader,
+    TantivyDocument,
+};
 
 // --- Segment searcher ---
 
@@ -426,10 +430,28 @@ impl Fixture {
         k: usize,
         params: ProbeParams,
     ) -> crate::Result<VectorSimilarityFruit> {
-        let collector = TopDocs::with_limit(k)
+        self.search_with(filter, query, k, 0, params, None)
+    }
+
+    /// Searches every segment through the collector for the window `offset..offset + limit`,
+    /// sharing every scan's threshold through `slot` when given.
+    pub(crate) fn search_with(
+        &self,
+        filter: &dyn Query,
+        query: &[f32],
+        limit: usize,
+        offset: usize,
+        params: ProbeParams,
+        slot: SharedThresholdArcOpt<Score>,
+    ) -> crate::Result<VectorSimilarityFruit> {
+        let mut builder = TopDocs::with_limit(limit)
+            .and_offset(offset)
             .order_by_similarity(self.field, query.to_vec())
-            .with_probe_params(params)
-            .build();
+            .with_probe_params(params);
+        if let Some(slot) = slot {
+            builder = builder.with_shared_threshold(slot);
+        }
+        let collector = builder.build();
         self.index.reader()?.searcher().search(filter, &collector)
     }
 
@@ -453,7 +475,7 @@ impl Fixture {
         query: &[f32],
     ) -> crate::Result<Vec<Candidate>> {
         let searcher = self.index.reader()?.searcher();
-        let vectors = searcher.segment_readers()[0].vector_index(self.field)?;
+        let vectors = first_segment(&searcher).1.vector_index(self.field)?;
         let ivf = vectors.index().expect("IVF segment");
         let centroids = ivf.centroid_bytes()?;
         let stride = vectors.options().bytes_per_vector();
@@ -503,6 +525,31 @@ impl Fixture {
         plan: Option<PlanOverride>,
         admission_pruning: bool,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
+        self.run_planned_with(
+            segment,
+            weight,
+            query,
+            top_n,
+            params,
+            plan,
+            admission_pruning,
+            None,
+        )
+    }
+
+    /// [`Fixture::run_planned`], seeding the scan from `collector_topk` when given.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_planned_with(
+        &self,
+        segment: usize,
+        weight: &dyn Weight,
+        query: &[f32],
+        top_n: usize,
+        params: ProbeParams,
+        plan: Option<PlanOverride>,
+        admission_pruning: bool,
+        collector_topk: Option<Arc<Mutex<TopK>>>,
+    ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = self.index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[segment];
         let query = Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec())));
@@ -527,11 +574,12 @@ impl Fixture {
         )?;
         backend.plan_override = plan;
         backend.admission_pruning_disabled = !admission_pruning;
+        backend.collector_topk = collector_topk;
         backend.top_n(weight, segment_reader, top_n)
     }
 
-    /// Runs `run` over segment 0's full-precision searcher for `query` and `params`, with the
-    /// search arguments `filter` and `top_n`.
+    /// Runs `run` over the first segment's full-precision searcher for `query` and `params`, with
+    /// the search arguments `filter` and `top_n`.
     pub(crate) fn with_segment<R>(
         &self,
         filter: &dyn Query,
@@ -541,13 +589,13 @@ impl Fixture {
         run: impl FnOnce(&SegmentRun<'_>) -> crate::Result<R>,
     ) -> crate::Result<R> {
         let searcher = self.index.reader()?.searcher();
-        let segment = &searcher.segment_readers()[0];
+        let (ordinal, segment) = first_segment(&searcher);
         let reader = segment.vector_index(self.field)?;
         let index = reader.index().expect("IVF segment");
         let weight = filter.weight(EnableScoring::disabled_from_searcher(&searcher))?;
         let backend = SegmentSearcher::<f32>::for_segment(
             segment,
-            0,
+            ordinal,
             self.field,
             Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec()))),
             None,
@@ -653,11 +701,11 @@ impl Fixture {
         self.log().reads.lock().unwrap().clone()
     }
 
-    /// Byte ranges of segment 0's DocIds column requests and full-precision cluster spans, by
-    /// cluster; `None` for an empty cluster.
+    /// Byte ranges of the first segment's DocIds column requests and full-precision cluster spans,
+    /// by cluster; `None` for an empty cluster.
     pub(crate) fn column_ranges(&self) -> crate::Result<ColumnRanges> {
         let searcher = self.index.reader()?.searcher();
-        let vectors = searcher.segment_readers()[0].vector_index(self.field)?;
+        let vectors = first_segment(&searcher).1.vector_index(self.field)?;
         let clusters = vectors.index().expect("IVF segment").num_clusters();
         let mut ranges = ColumnRanges::default();
         let mut docs = Vec::new();
@@ -699,10 +747,23 @@ pub(crate) struct DocTrace {
     pub(crate) exact_phase_docs: Vec<DocId>,
 }
 
-/// Translates segment 0's trace rows of `field` in `index` into doc ids.
+/// The first segment and its ordinal: the one with the lowest id, which the per-segment helpers
+/// read. The searcher lists segments in the segment register's hash-map order, which differs
+/// between processes; test segment ids count up, so the lowest id is the same segment every run.
+pub(crate) fn first_segment(searcher: &Searcher) -> (SegmentOrdinal, &SegmentReader) {
+    let (ordinal, segment) = searcher
+        .segment_readers()
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, segment)| segment.segment_id())
+        .expect("the index has a segment");
+    (ordinal as SegmentOrdinal, segment)
+}
+
+/// Translates the first segment's trace rows of `field` in `index` into doc ids.
 pub(crate) fn doc_trace(index: &Index, field: Field, trace: &ScanTrace) -> crate::Result<DocTrace> {
     let searcher = index.reader()?.searcher();
-    let vectors = searcher.segment_readers()[0].vector_index(field)?;
+    let vectors = first_segment(&searcher).1.vector_index(field)?;
     let clusters = vectors.index().expect("IVF segment").num_clusters();
     let docs: Vec<DocId> = with_unarmed_log(|| {
         let mut all = Vec::new();
@@ -739,7 +800,7 @@ pub(crate) fn doc_trace(index: &Index, field: Field, trace: &ScanTrace) -> crate
 }
 
 impl Fixture {
-    /// Translates segment 0's trace rows into doc ids.
+    /// Translates the first segment's trace rows into doc ids.
     pub(crate) fn doc_trace(&self, trace: &ScanTrace) -> crate::Result<DocTrace> {
         doc_trace(&self.index, self.field, trace)
     }

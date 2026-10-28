@@ -11,14 +11,15 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{
-    compare_for_top_k, Collector, ComparableDoc, SegmentCollector, SegmentSortKeyComputer,
-    SortKeyComputer,
+    compare_for_top_k, AtomicSharedThreshold, Collector, ComparableDoc, SegmentCollector,
+    SegmentSortKeyComputer, SharedThresholdArc, SortKeyComputer,
 };
 use crate::index::SegmentReader;
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Metric, Schema};
 use crate::vector::params::ProbeParams;
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
+use crate::vector::search::scan::bound::{ExactMerge, TopK};
 use crate::vector::search::SegmentSearcher;
 use crate::vector::stats::{ProbeStats, SegmentReport};
 use crate::vector::storage::metadata::VectorColMetadata;
@@ -73,6 +74,8 @@ pub struct TopDocsByVectorSimilarityBuilder<T: VectorElement, S = NoTieBreak> {
     offset: usize,
     probe_params: ProbeParams,
     max_scan_levels: usize,
+    /// Optional slot shared with other collectors searching the same query.
+    shared_threshold: Option<SharedThresholdArc<Score>>,
     tie_break: S,
 }
 
@@ -86,6 +89,7 @@ impl<T: VectorElement> TopDocsByVectorSimilarityBuilder<T, NoTieBreak> {
             offset: 0,
             probe_params: ProbeParams::default(),
             max_scan_levels: usize::MAX,
+            shared_threshold: None,
             tie_break: NoTieBreak,
         }
     }
@@ -111,6 +115,17 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
         self
     }
 
+    /// Shares every segment scan's pruning threshold through `slot` with the query's other
+    /// participants, each searching its own segments for the same query, filter and
+    /// `limit + offset`. Every score in the slot must be a lower bound on the k-th best score
+    /// among those rows, k = `limit + offset`: each scan raises its threshold to the slot's score
+    /// and publishes its own when that is higher. When omitted, `build` installs a process-local
+    /// [`AtomicSharedThreshold`] shared by every segment of this search.
+    pub fn with_shared_threshold(mut self, slot: SharedThresholdArc<Score>) -> Self {
+        self.shared_threshold = Some(slot);
+        self
+    }
+
     /// Orders equal similarities by `tie_break`, as `ORDER BY embedding <=> $1, id` does.
     ///
     /// The tie-break takes part in each segment's eviction but never in routing. Segments cut on
@@ -126,12 +141,17 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
             offset: self.offset,
             probe_params: self.probe_params,
             max_scan_levels: self.max_scan_levels,
+            shared_threshold: self.shared_threshold,
             tie_break,
         }
     }
 
     /// Builds the collector. Configuration cannot be changed afterwards.
     pub fn build(self) -> TopDocsByVectorSimilarity<T, S> {
+        let segment_top_n = self.limit.saturating_add(self.offset);
+        let shared_topk_threshold = self.shared_threshold.unwrap_or_else(|| {
+            Arc::new(AtomicSharedThreshold::default()) as SharedThresholdArc<Score>
+        });
         TopDocsByVectorSimilarity {
             field: self.field,
             query: self.query,
@@ -141,6 +161,8 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
             max_scan_levels: self.max_scan_levels,
             quantized_queries: Mutex::new(HashMap::new()),
             prepared: Mutex::new(None),
+            collector_topk: Arc::new(Mutex::new(TopK::new(segment_top_n))),
+            shared_topk_threshold,
             tie_break: self.tie_break,
         }
     }
@@ -165,6 +187,12 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     quantized_queries: Mutex<HashMap<PreparedKey, PreparedCell>>,
     /// The query prepared for the field's metric on first use.
     prepared: Mutex<Option<Arc<VectorQuery<T>>>>,
+    /// The top-k exact scores (with addresses) from segments this collector has finished. Later
+    /// segments seed their pruning-bound TopK from these for partial-k accounting.
+    collector_topk: Arc<Mutex<TopK>>,
+    /// The shared top-k threshold every segment scan of this collector syncs and publishes.
+    /// Either the caller's slot or a process-local [`AtomicSharedThreshold`] from `build`.
+    shared_topk_threshold: SharedThresholdArc<Score>,
     tie_break: S,
 }
 
@@ -314,11 +342,10 @@ where
         reader: &SegmentReader,
     ) -> crate::Result<SegmentVectorFruit<S::SortKey>> {
         let (searched, totals) = measure(|| self.search_segment(weight, segment_ord, reader));
-        let (results, report) = searched?;
-        Ok(SegmentVectorFruit {
-            results,
-            stats: ProbeStats::new(report, totals),
-        })
+        let (results, report, merge) = searched?;
+        let mut stats = ProbeStats::new(report, totals);
+        stats.record_shared_offer(merge);
+        Ok(SegmentVectorFruit { results, stats })
     }
 
     fn merge_fruits(
@@ -363,14 +390,15 @@ where
     T: VectorElement,
     S: SortKeyComputer + Send + Sync + 'static,
 {
-    /// Searches one segment: prepares the query, runs the segment searcher, and lifts each hit's
-    /// tie-break key out of the segment.
+    /// Searches one segment. Prepares the query, runs the segment searcher with this collector's
+    /// top-k and shared top-k threshold, offers the hits' scores to the collector top-k, and lifts
+    /// each hit's tie-break key out of the segment.
     fn search_segment(
         &self,
         weight: &dyn Weight,
         segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
-    ) -> crate::Result<(KeyedHits<S::SortKey>, SegmentReport)> {
+    ) -> crate::Result<(KeyedHits<S::SortKey>, SegmentReport, ExactMerge)> {
         let init = enter_vector_stage(VectorStage::ScanInit);
         let (query, quantized) = {
             let _prep = enter_vector_stage(VectorStage::QueryPrep);
@@ -391,7 +419,11 @@ where
             query,
             quantized,
             self.probe_params.clone(),
-        )?;
+        )?
+        .with_collector_topk(
+            Arc::clone(&self.collector_topk),
+            Arc::clone(&self.shared_topk_threshold),
+        );
         let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
         drop(init);
         let (hits, report) = backend.top_n_by(
@@ -401,6 +433,24 @@ where
             &mut tie_break,
             self.tie_break.comparator(),
         )?;
+        let merge = {
+            let _assembly = enter_vector_stage(VectorStage::ResultAssembly);
+            self.collector_topk
+                .lock()
+                .unwrap()
+                .merge_exact(hits.iter().map(|((score, _), address)| {
+                    (
+                        crate::vector::write::RowAddress {
+                            segment_ord: address.segment_ord,
+                            // Opaque foreign key for seeding. Doc ids and row ids share a
+                            // numeric range on the same segment, so the high bit keeps seed
+                            // keys out of the local RowAddress space.
+                            row_id: (address.doc_id as usize) | (1usize << (usize::BITS - 1)),
+                        },
+                        *score,
+                    )
+                }))
+        };
         // A segment key can be a term ordinal: lift it before it leaves the segment.
         let results = hits
             .into_iter()
@@ -411,7 +461,7 @@ where
                 )
             })
             .collect();
-        Ok((results, report))
+        Ok((results, report, merge))
     }
 }
 

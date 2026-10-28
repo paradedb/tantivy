@@ -37,7 +37,7 @@ pub(crate) struct VectorPlugin;
 pub(crate) type RowId = usize;
 
 /// A vector row within a set of segments, the row counterpart of [`DocAddress`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct RowAddress {
     pub(crate) segment_ord: SegmentOrdinal,
     pub(crate) row_id: RowId,

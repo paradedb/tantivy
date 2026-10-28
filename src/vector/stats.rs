@@ -2,6 +2,7 @@
 //! serialized flat for EXPLAIN.
 
 use crate::vector::router::RouterMetrics;
+use crate::vector::search::scan::bound::ExactMerge;
 use crate::vector::search::scan::ScanReport;
 #[cfg(test)]
 use crate::vector::search::scan::ScanTrace;
@@ -31,6 +32,7 @@ pub(crate) struct LayerProbeStats {
     full_clusters: usize,
     exact_clusters: usize,
     exact_rows: usize,
+    recheck_dropped: usize,
 }
 
 #[cfg(test)]
@@ -79,6 +81,11 @@ impl LayerProbeStats {
     pub(crate) fn exact_rows(&self) -> usize {
         self.exact_rows
     }
+
+    /// Survivors of the previous boundary the layer dropped before reading them.
+    pub(crate) fn recheck_dropped(&self) -> usize {
+        self.recheck_dropped
+    }
 }
 
 /// Per-layer instrumentation, flattened on the wire as `layer{i}_*` and `boundary{i}_ns`.
@@ -109,6 +116,11 @@ impl serde::Serialize for LayerProbeStatsSet {
             map.serialize_entry(&format!("layer{index}_scored"), &layer.scored)?;
             if index == 0 {
                 map.serialize_entry("layer0_admission_pruned", &layer.admission_pruned)?;
+            } else {
+                map.serialize_entry(
+                    &format!("layer{index}_recheck_dropped"),
+                    &layer.recheck_dropped,
+                )?;
             }
             map.serialize_entry(&format!("layer{index}_survivors"), &layer.survivors)?;
             map.serialize_entry(
@@ -213,6 +225,10 @@ pub struct ProbeStats {
     pub(crate) quantized_trace: ScanTrace,
     /// Rows scored at full precision, on every path.
     pub exact_rows: usize,
+    /// Survivors of the last boundary dropped before the exact phase read them.
+    pub exact_recheck_dropped: usize,
+    /// Thresholds this segment's scan stored in the query participants' shared slot.
+    pub cross_bound_publishes: usize,
     /// Nanoseconds initializing the scan.
     pub scan_init_ns: u64,
     /// Nanoseconds evaluating the filter.
@@ -258,6 +274,10 @@ pub struct ProbeStats {
     pub work_charged: f32,
     /// The work budget the probe loop ran against, in work units; 0 when no loop ran.
     pub work_budget: f32,
+    /// Exact scores of this segment's results offered to the query's shared bound.
+    pub shared_bound_offers: usize,
+    /// Offers that moved the shared bound's k-th.
+    pub shared_bound_tightenings: usize,
     /// Vector rows in the segment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segment_rows: Option<usize>,
@@ -274,11 +294,12 @@ pub(crate) enum SegmentReport {
     Flat { rows_read: usize },
     /// Nothing could match; the located cap still reports.
     Empty { located_cap: usize },
-    /// An IVF segment search: its plan, cluster source and scan.
+    /// An IVF segment search: its plan, cluster source and scan. The scan's report is boxed, so
+    /// the enum stays close to the size of its other variants.
     Ivf {
         plan: PlanReport,
         source: SourceReport,
-        scan: ScanReport,
+        scan: Box<ScanReport>,
     },
 }
 
@@ -299,7 +320,7 @@ impl ProbeStats {
                 located_cap,
                 ..Self::default()
             },
-            SegmentReport::Ivf { plan, source, scan } => Self::ivf(plan, source, scan, &totals),
+            SegmentReport::Ivf { plan, source, scan } => Self::ivf(plan, source, *scan, &totals),
         };
         // Every segment search reports its result assembly, an empty one included.
         stats.result_assembly_ns = Some(0);
@@ -313,6 +334,8 @@ impl ProbeStats {
         let mut stats = Self {
             candidates_scored: scan.candidates_scored,
             exact_rows: scan.exact_rows,
+            exact_recheck_dropped: scan.exact_recheck_dropped,
+            cross_bound_publishes: scan.cross_bound_publishes,
             layers: LayerProbeStatsSet(
                 scan.layers
                     .iter()
@@ -327,6 +350,7 @@ impl ProbeStats {
                         full_clusters: report.full_clusters,
                         exact_clusters: report.exact_clusters,
                         exact_rows: report.exact_rows,
+                        recheck_dropped: report.recheck_dropped,
                         ..LayerProbeStats::default()
                     })
                     .collect(),
@@ -430,6 +454,12 @@ impl ProbeStats {
         }
     }
 
+    /// Records what the segment's exact scores did to the collector top-k.
+    pub(crate) fn record_shared_offer(&mut self, merge: ExactMerge) {
+        self.shared_bound_offers = merge.offers;
+        self.shared_bound_tightenings = merge.tightenings;
+    }
+
     /// Adds the result-assembly time of the merge, measured after the segment's statistics were
     /// built.
     pub(crate) fn add_assembly(&mut self, totals: &StageTotals) {
@@ -499,6 +529,8 @@ mod tests {
         "centroid_bytes_read",
         "centroid_storage_blocks",
         "exact_rows",
+        "exact_recheck_dropped",
+        "cross_bound_publishes",
         "scan_init_ns",
         "non_vector_search_ns",
         "query_prep_ns",
@@ -518,6 +550,8 @@ mod tests {
         "termination",
         "work_charged",
         "work_budget",
+        "shared_bound_offers",
+        "shared_bound_tightenings",
     ];
 
     fn expected(extra: &[&str], layers: usize) -> BTreeSet<String> {
@@ -547,6 +581,9 @@ mod tests {
         if layers > 0 {
             keys.insert("layer0_admission_pruned".to_string());
         }
+        for layer in 1..layers {
+            keys.insert(format!("layer{layer}_recheck_dropped"));
+        }
         keys
     }
 
@@ -567,7 +604,7 @@ mod tests {
         let ivf = |scan| SegmentReport::Ivf {
             plan,
             source: routed(),
-            scan,
+            scan: Box::new(scan),
         };
         let stats = ProbeStats::new(ivf(quantized), StageTotals::default());
         assert_eq!(keys(&stats), expected(&segment, 2));

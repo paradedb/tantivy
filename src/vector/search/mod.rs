@@ -10,14 +10,17 @@ pub(crate) mod scan;
 pub(crate) mod segment;
 pub(crate) mod source;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::collector::sort_key::{Comparator, NaturalComparator};
-use crate::collector::{SegmentSortKeyComputer, TopNComputer};
+use crate::collector::{
+    AtomicSharedThreshold, SegmentSortKeyComputer, SharedThreshold, TopNComputer,
+};
 use crate::query::Weight;
 use crate::schema::Field;
 use crate::vector::params::ProbeParams;
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery, VectorQuery};
+use crate::vector::search::scan::bound::{PruningBound, TopK};
 use crate::vector::search::scan::heap::{tie_break_key, TieBreakHits};
 #[cfg(test)]
 use crate::vector::search::scan::plan::PlanOverride;
@@ -37,9 +40,7 @@ use crate::vector::telemetry::measure;
 #[cfg(test)]
 use crate::vector::tie_break::NoTieBreak;
 use crate::vector::{VectorElement, VectorStage};
-#[cfg(test)]
-use crate::Score;
-use crate::{DocAddress, SegmentOrdinal, SegmentReader, TantivyError};
+use crate::{DocAddress, Score, SegmentOrdinal, SegmentReader, TantivyError};
 
 /// Per-segment vector search state: the segment's [`VectorIndexReader`] and the prepared query.
 /// Build via [`SegmentSearcher::for_segment`].
@@ -50,6 +51,12 @@ pub(crate) struct SegmentSearcher<T: VectorElement> {
     quantized: Option<Arc<QuantizedQueryCtx>>,
     probe_params: ProbeParams,
     segment_ord: SegmentOrdinal,
+    /// Exact scores segments of this collector have finished. The scan seeds its TopK from them
+    /// (partial k). `None` seeds nothing.
+    pub(crate) collector_topk: Option<Arc<Mutex<TopK>>>,
+    /// The threshold this scan publishes. Defaults to a process-local
+    /// [`AtomicSharedThreshold`] until the collector installs its shared slot.
+    pub(crate) shared_topk_threshold: Arc<dyn SharedThreshold<Score>>,
     #[cfg(test)]
     pub(crate) plan_override: Option<PlanOverride>,
     #[cfg(test)]
@@ -74,11 +81,25 @@ impl<T: VectorElement> SegmentSearcher<T> {
             quantized,
             probe_params,
             segment_ord,
+            collector_topk: None,
+            shared_topk_threshold: Arc::new(AtomicSharedThreshold::default()),
             #[cfg(test)]
             plan_override: None,
             #[cfg(test)]
             admission_pruning_disabled: false,
         })
+    }
+
+    /// Seeds the segment [`PruningBound`] from `collector_topk` and publishes through
+    /// `shared_topk_threshold`.
+    pub(crate) fn with_collector_topk(
+        mut self,
+        collector_topk: Arc<Mutex<TopK>>,
+        shared_topk_threshold: Arc<dyn SharedThreshold<Score>>,
+    ) -> Self {
+        self.collector_topk = Some(collector_topk);
+        self.shared_topk_threshold = shared_topk_threshold;
+        self
     }
 
     /// The query as this segment scores it.
@@ -211,11 +232,17 @@ impl<T: VectorElement> SegmentSearcher<T> {
             #[cfg(test)]
             admission_pruning_disabled: self.admission_pruning_disabled,
         };
+        let mut bound = PruningBound::new(top_n, Arc::clone(&self.shared_topk_threshold));
+        if let Some(collector_topk) = &self.collector_topk {
+            bound.seed(&collector_topk.lock().unwrap());
+        }
         let mut scan = SegmentScan::new(
             &self.reader,
             index,
             self.scoring_query(),
             config,
+            bound,
+            self.segment_ord,
             tie_break,
             tie_comparator,
         )?;
@@ -245,7 +272,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
             SegmentReport::Ivf {
                 plan: report,
                 source,
-                scan,
+                scan: Box::new(scan),
             },
         ))
     }
