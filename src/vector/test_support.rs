@@ -428,7 +428,8 @@ impl Fixture {
     ) -> crate::Result<VectorSimilarityFruit> {
         let collector = TopDocs::with_limit(k)
             .order_by_similarity(self.field, query.to_vec())
-            .with_probe_params(params);
+            .with_probe_params(params)
+            .build();
         self.index.reader()?.searcher().search(filter, &collector)
     }
 

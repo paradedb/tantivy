@@ -455,7 +455,8 @@ fn flat_top_n_returns_nearest_when_more_than_k_docs_per_segment() -> crate::Resu
         .search(
             &AllQuery,
             &TopDocs::with_limit(top_k)
-                .order_by_similarity(index.embedding_field(), query.to_vec()),
+                .order_by_similarity(index.embedding_field(), query.to_vec())
+                .build(),
         )?
         .results;
     assert_eq!(hits, expected);
@@ -536,7 +537,8 @@ fn default_setup_clusters_past_the_threshold() -> crate::Result<()> {
             &AllQuery,
             &TopDocs::with_limit(10)
                 .order_by_similarity(field, query.to_vec())
-                .with_probe_params(exhaustive_params(0)),
+                .with_probe_params(exhaustive_params(0))
+                .build(),
         )?;
         assert_eq!(actual.results, expected);
         Ok(())
@@ -702,7 +704,9 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
     writer.commit()?;
 
     let searcher = index.reader()?.searcher();
-    let collector = TopDocs::with_limit(2).order_by_similarity(embedding_field, vec![1.0_f32, 0.0]);
+    let collector = TopDocs::with_limit(2)
+        .order_by_similarity(embedding_field, vec![1.0_f32, 0.0])
+        .build();
     let hits = searcher.search(&AllQuery, &collector)?.results;
     assert_eq!(hits.len(), 2, "zero vector must be ingested and returned");
     assert!(hits[0].0 > 0.0, "non-zero doc must rank first: {hits:?}");
@@ -1486,7 +1490,9 @@ mod bounds_storage_tests {
             let hits = searcher
                 .search(
                     &AllQuery,
-                    &TopDocs::with_limit(1).order_by_similarity(field, query),
+                    &TopDocs::with_limit(1)
+                        .order_by_similarity(field, query)
+                        .build(),
                 )?
                 .results;
             assert_eq!(hits.len(), 1);

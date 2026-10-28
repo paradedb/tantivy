@@ -63,28 +63,21 @@ impl Hash for PreparedKey {
 /// Shared initialization cell so each metadata key prepares its query exactly once.
 type PreparedCell = Arc<OnceLock<Arc<QuantizedQueryCtx>>>;
 
-// --- Collector ---
+// --- Builder ---
 
-/// Collects documents by descending vector similarity; docs without a vector are never returned.
-///
-/// `T` must match the field's dtype ([`Collector::check_schema`]). `S` orders equal similarities
-/// and defaults to [`NoTieBreak`]: ascending `DocAddress`.
-pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
+/// Builds a [`TopDocsByVectorSimilarity`] collector.
+pub struct TopDocsByVectorSimilarityBuilder<T: VectorElement, S = NoTieBreak> {
     field: Field,
     query: Arc<Vec<T>>,
     limit: usize,
     offset: usize,
     probe_params: ProbeParams,
     max_scan_levels: usize,
-    /// Exactly one prepared query for each distinct segment encoding.
-    quantized_queries: Mutex<HashMap<PreparedKey, PreparedCell>>,
-    /// The query prepared for the field's metric on first use.
-    prepared: Mutex<Option<Arc<VectorQuery<T>>>>,
     tie_break: S,
 }
 
-impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
-    /// Creates a top-vector-similarity collector.
+impl<T: VectorElement> TopDocsByVectorSimilarityBuilder<T, NoTieBreak> {
+    /// Starts a builder for a top-vector-similarity collector.
     pub fn new(field: Field, query: Vec<T>, limit: usize) -> Self {
         Self {
             field,
@@ -93,14 +86,12 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
             offset: 0,
             probe_params: ProbeParams::default(),
             max_scan_levels: usize::MAX,
-            quantized_queries: Mutex::new(HashMap::new()),
-            prepared: Mutex::new(None),
             tie_break: NoTieBreak,
         }
     }
 }
 
-impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
+impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
     /// Skips the first `offset` results of the global ranking; each segment keeps
     /// `limit + offset`.
     pub fn and_offset(mut self, offset: usize) -> Self {
@@ -127,7 +118,20 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     pub fn with_tie_break<S2: SortKeyComputer>(
         self,
         tie_break: S2,
-    ) -> TopDocsByVectorSimilarity<T, S2> {
+    ) -> TopDocsByVectorSimilarityBuilder<T, S2> {
+        TopDocsByVectorSimilarityBuilder {
+            field: self.field,
+            query: self.query,
+            limit: self.limit,
+            offset: self.offset,
+            probe_params: self.probe_params,
+            max_scan_levels: self.max_scan_levels,
+            tie_break,
+        }
+    }
+
+    /// Builds the collector. Configuration cannot be changed afterwards.
+    pub fn build(self) -> TopDocsByVectorSimilarity<T, S> {
         TopDocsByVectorSimilarity {
             field: self.field,
             query: self.query,
@@ -135,12 +139,43 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
             offset: self.offset,
             probe_params: self.probe_params,
             max_scan_levels: self.max_scan_levels,
-            quantized_queries: self.quantized_queries,
-            prepared: self.prepared,
-            tie_break,
+            quantized_queries: Mutex::new(HashMap::new()),
+            prepared: Mutex::new(None),
+            tie_break: self.tie_break,
         }
     }
+}
 
+// --- Collector ---
+
+/// Collects documents by descending vector similarity; docs without a vector are never returned.
+///
+/// `T` must match the field's dtype ([`Collector::check_schema`]). `S` orders equal similarities
+/// and defaults to [`NoTieBreak`]: ascending `DocAddress`.
+///
+/// Construct via [`TopDocsByVectorSimilarityBuilder`] or [`TopDocsByVectorSimilarity::new`].
+pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
+    field: Field,
+    query: Arc<Vec<T>>,
+    limit: usize,
+    offset: usize,
+    probe_params: ProbeParams,
+    max_scan_levels: usize,
+    /// Exactly one prepared query for each distinct segment encoding.
+    quantized_queries: Mutex<HashMap<PreparedKey, PreparedCell>>,
+    /// The query prepared for the field's metric on first use.
+    prepared: Mutex<Option<Arc<VectorQuery<T>>>>,
+    tie_break: S,
+}
+
+impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
+    /// Creates a top-vector-similarity collector with default probe settings.
+    pub fn new(field: Field, query: Vec<T>, limit: usize) -> Self {
+        TopDocsByVectorSimilarityBuilder::new(field, query, limit).build()
+    }
+}
+
+impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     fn segment_top_n(&self) -> usize {
         self.limit.saturating_add(self.offset)
     }
@@ -443,7 +478,8 @@ mod ivf_e2e_tests {
                 let expected = index.ground_truth(query, k)?;
                 let collector = TopDocs::with_limit(k)
                     .order_by_similarity(index.embedding_field(), query.to_vec())
-                    .with_probe_params(params.clone());
+                    .with_probe_params(params.clone())
+                    .build();
                 let actual = searcher.search(&AllQuery, &collector)?;
                 assert_eq!(actual.results, expected, "IVF query={query:?} k={k}");
             }
@@ -466,7 +502,8 @@ mod ivf_e2e_tests {
 
         let collector = TopDocs::with_limit(4)
             .order_by_similarity(index.embedding_field(), vec![0.5_f32, 0.5])
-            .with_probe_params(exhaustive_params(9));
+            .with_probe_params(exhaustive_params(9))
+            .build();
         let fruit = searcher.search(&AllQuery, &collector)?;
 
         // One ProbeStats per searched segment.
@@ -501,7 +538,8 @@ mod ivf_e2e_tests {
         let collector = TopDocs::with_limit(k)
             .and_offset(offset)
             .order_by_similarity(index.embedding_field(), query.to_vec())
-            .with_probe_params(exhaustive_params(9));
+            .with_probe_params(exhaustive_params(9))
+            .build();
         let actual = searcher.search(&AllQuery, &collector)?;
         assert_eq!(actual.results, expected);
         Ok(())
@@ -522,7 +560,8 @@ mod ivf_e2e_tests {
             for k in [1usize, 4, 8] {
                 let expected = index.ground_truth(query, k)?;
                 let collector = TopDocs::with_limit(k)
-                    .order_by_similarity(index.embedding_field(), query.to_vec());
+                    .order_by_similarity(index.embedding_field(), query.to_vec())
+                    .build();
                 let actual = searcher.search(&AllQuery, &collector)?;
                 assert_eq!(actual.results, expected, "Flat query={query:?} k={k}");
             }
@@ -645,7 +684,8 @@ mod ivf_e2e_tests {
                     &TopDocs::with_limit(k)
                         .order_by_similarity(embedding_field, query.to_vec())
                         .with_probe_params(exhaustive_params(9))
-                        .with_tie_break(tie_break()),
+                        .with_tie_break(tie_break())
+                        .build(),
                 )?;
                 let actual: Vec<DocAddress> =
                     fruit.results.iter().map(|(_, address)| *address).collect();
@@ -656,9 +696,9 @@ mod ivf_e2e_tests {
                 // gate/ceiling logic actually runs.
                 let collector =
                     || TopDocs::with_limit(k).order_by_similarity(embedding_field, query.to_vec());
-                let mut untied = searcher.search(&AllQuery, &collector())?;
+                let mut untied = searcher.search(&AllQuery, &collector().build())?;
                 let mut tied =
-                    searcher.search(&AllQuery, &collector().with_tie_break(tie_break()))?;
+                    searcher.search(&AllQuery, &collector().with_tie_break(tie_break()).build())?;
                 assert!(
                     untied.stats.iter().any(|s| s.candidates_scored > 0),
                     "no probe activity to compare for query={query:?} k={k}"
@@ -679,7 +719,8 @@ mod ivf_e2e_tests {
                 &AllQuery,
                 &TopDocs::with_limit(2)
                     .order_by_similarity(embedding_field, vec![0.0_f32, 0.0])
-                    .with_tie_break(SortBySimilarityScore::new()),
+                    .with_tie_break(SortBySimilarityScore::new())
+                    .build(),
             )
             .unwrap_err();
         assert!(
@@ -747,7 +788,8 @@ mod ivf_e2e_tests {
             &AllQuery,
             &TopDocs::with_limit(1)
                 .order_by_similarity(embedding_field, query.to_vec())
-                .with_probe_params(exhaustive_params(2)),
+                .with_probe_params(exhaustive_params(2))
+                .build(),
         )?;
         // All four docs tie at distance 1, so the lowest DocAddress wins.
         let scores: Vec<Score> = fruit.results.iter().map(|(score, _)| *score).collect();
@@ -848,7 +890,8 @@ mod ivf_e2e_tests {
                 &AllQuery,
                 &TopDocs::with_limit(k)
                     .order_by_similarity(embedding_field, vec![0.0_f32, 0.0])
-                    .with_tie_break((SortByString::for_field("city"), Order::Asc)),
+                    .with_tie_break((SortByString::for_field("city"), Order::Asc))
+                    .build(),
             )?;
             assert_eq!(cities(&fruit), want, "k={k}");
         }
@@ -957,7 +1000,8 @@ mod ivf_e2e_tests {
                 let expected = ground_truth::top_k(&index, embedding_field, metric, &query, k)?;
                 let collector = TopDocs::with_limit(k)
                     .order_by_similarity(embedding_field, query.to_vec())
-                    .with_probe_params(params.clone());
+                    .with_probe_params(params.clone())
+                    .build();
                 let actual = searcher.search(&AllQuery, &collector)?;
                 assert_eq!(actual.results, expected, "mixed query={query:?} k={k}");
             }

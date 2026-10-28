@@ -39,7 +39,9 @@
 //! let searcher = index.reader()?.searcher();
 //! let hits = searcher.search(
 //!     &even,
-//!     &TopDocs::with_limit(10).order_by_similarity(embedding, query),
+//!     &TopDocs::with_limit(10)
+//!         .order_by_similarity(embedding, query)
+//!         .build(),
 //! )?;
 //! assert_eq!(hits.results.len(), 10);
 //! # Ok(())
@@ -70,7 +72,10 @@ pub(crate) mod test_support;
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
+pub use collector::{
+    SegmentVectorFruit, TopDocsByVectorSimilarity, TopDocsByVectorSimilarityBuilder,
+    VectorSimilarityFruit,
+};
 pub use element::{Accumulator, VectorElement, ENTRY_ALIGN};
 pub use params::{LocatedPath, ProbeParams, Selectivity, DEFAULT_FIXED_PROBE_COST_ROWS};
 pub use quantization::{VectorQuantizationConfig, VectorQuantizationLayer};

@@ -1108,7 +1108,8 @@ fn located_path_reads_no_doc_ids() -> crate::Result<()> {
         };
         let collector = TopDocs::with_limit(10)
             .order_by_similarity(fixture.field, query.clone())
-            .with_probe_params(params);
+            .with_probe_params(params)
+            .build();
         let searcher = fixture.index.reader()?.searcher();
         // The first search opens the location map; measure the second.
         searcher.search(&filter, &collector)?;
