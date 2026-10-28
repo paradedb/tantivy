@@ -16,6 +16,7 @@ use crate::vector::search::prepared::VectorQuery;
 use crate::vector::VectorElement;
 use crate::TantivyError;
 
+mod adaptive;
 pub(crate) mod arena;
 pub(crate) mod candidate;
 mod exact;
