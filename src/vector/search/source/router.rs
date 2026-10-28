@@ -202,9 +202,9 @@ pub(crate) struct RouterClusters<'a, T: VectorElement> {
 }
 
 impl<'a, T: VectorElement> RouterClusters<'a, T> {
-    /// Ranks as many of `segment`'s clusters as `budget` buys at the filter's match fraction, and
-    /// prepares the probe controller. `reader` is the segment's IVF reader.
-    pub(crate) fn new(
+    /// Prepares this segment to choose and probe its own clusters.
+    /// Its router determines the cluster order, and its budget controls when probing stops.
+    pub(crate) fn for_segment(
         reader: &'a VectorIndexReader,
         query: &'a VectorQuery<T>,
         budget: WorkBudget,
@@ -243,7 +243,9 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
         }
     }
 
-    pub(crate) fn scheduled(
+    /// Prepares this segment to probe clusters chosen by the global scheduler.
+    /// The scheduler supplies the cluster order and enforces the shared search budget.
+    pub(crate) fn for_global(
         reader: &'a VectorIndexReader,
         query: &'a VectorQuery<T>,
         budget: WorkBudget,

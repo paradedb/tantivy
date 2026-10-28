@@ -186,7 +186,7 @@ where
                 comparator(),
             )?;
             let source = match source {
-                Source::Router(filter) => ScheduledSource::Router(RouterClusters::scheduled(
+                Source::Router(filter) => ScheduledSource::Router(RouterClusters::for_global(
                     &backend.reader,
                     &backend.query,
                     budget,

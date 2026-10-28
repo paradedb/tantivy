@@ -250,7 +250,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
         drop(init);
         let source = match source {
             Source::Router(filter) => {
-                let mut clusters = RouterClusters::new(
+                let mut clusters = RouterClusters::for_segment(
                     &self.reader,
                     &self.query,
                     budget,
