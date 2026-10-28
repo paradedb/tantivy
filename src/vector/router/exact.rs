@@ -7,7 +7,7 @@ use common::HasLen;
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::clustering::IvfCentroids;
-use crate::vector::router::arena::VectorArena;
+use crate::vector::router::arena::{ArenaQuery, VectorArena};
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::levels::{InMemoryStore, LazyStore};
 
@@ -20,14 +20,13 @@ pub(crate) struct ExactRouter<S> {
 
 impl<S: VectorArena<Elem = f32>> ExactRouter<S> {
     pub(super) fn rank(&self, query: &[f32]) -> Ranking {
-        let mut ranked = (0..self.num_centroids)
-            .map(|cluster| Candidate {
-                sim: self
-                    .centroids
-                    .similarity(self.metric, self.dim, cluster as u32, query),
-                node: cluster as u32,
-            })
-            .collect::<Vec<_>>();
+        assert_eq!(query.len(), self.dim);
+        let query = ArenaQuery::new(query, self.metric);
+        let mut ranked = Vec::with_capacity(self.num_centroids);
+        self.centroids
+            .score_range(&query, 0..self.num_centroids, |node, sim| {
+                ranked.push(Candidate { sim, node });
+            });
         ranked.sort_unstable_by(|a, b| b.cmp(a));
         Ranking {
             ranked: ranked.into_iter(),
