@@ -19,16 +19,14 @@ use std::ops::Deref;
 use std::{fmt, mem};
 
 use common::{BinarySerializable, HasLen};
-use itertools::Itertools;
 use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperKMeansConfig};
 
 use crate::directory::FileSlice;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
-use crate::vector::router::adaptive::AdaptiveProbe;
 use crate::vector::router::arena::{FileSliceArena, VectorArena};
 use crate::vector::router::candidate::Candidate;
-use crate::vector::search::prepared::VectorQuery;
+use crate::vector::router::stacked::search::{StackedRouting, TopK};
 use crate::vector::VectorElement;
 
 /// Row index into a level's centroid or member arena.
@@ -879,102 +877,23 @@ where S: VectorArena<Elem = f32>
     /// capped at `nlist`. A parent is asked for that many of this level's
     /// lists; without a parent every centroid is scored and only that many
     /// are expanded. Lists are scanned nearest centroid first.
-    /// [`AdaptiveProbe`] decides when to stop short of the shortlist.
+    /// [`StackedRouting`] shares the layer walk and adaptive stopping with global routing.
     pub fn search(
         &self,
         query: &[S::Elem],
         k: usize,
         metric: Metric,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-        self.search_prepared(
-            &VectorQuery::new(metric, std::sync::Arc::new(query.to_vec())),
-            k,
-        )
-    }
-
-    pub(crate) fn search_prepared<T: VectorElement>(
-        &self,
-        query: &VectorQuery<T>,
-        k: usize,
-    ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-        if k == 0 {
-            return (Vec::new(), StackedSearchStats::default());
-        }
-
-        let open = self.lists_to_open(k);
-
-        // Candidate lists, nearest centroid first; `candidates[0]` is P0.
-        let (candidates, mut stats) = if let Some(parent) = &self.parent {
-            parent.search_prepared(query, open)
-        } else {
-            let nlist = self.nlist();
-            let mut scores = Vec::with_capacity(nlist);
-            self.centroids.batch_similarity(
-                query.widened(),
-                query.metric(),
-                query.routing_norm(),
-                0..nlist,
-                &mut scores,
-            );
-            let all: Vec<Candidate<ClusterId>> = scores
-                .into_iter()
-                .enumerate()
-                .map(|(i, sim)| Candidate {
-                    sim,
-                    node: ClusterId(i as u32),
-                })
-                .sorted()
-                .rev()
-                .take(open)
-                .collect();
-            let stats = StackedSearchStats {
-                lists_scanned: 0,
-                members_scored: nlist,
-            };
-            (all, stats)
-        };
-
-        if candidates.is_empty() {
-            return (Vec::new(), stats);
-        }
-
-        let mut probe = AdaptiveProbe::new(k);
-        for c in &candidates {
-            let scanned = self.scan_cluster(query, metric, c.node, &mut probe);
-            stats.members_scored += scanned;
-            stats.lists_scanned += 1;
-            if probe.should_stop(scanned) {
-                break;
-            }
-        }
-
-        (probe.into_sorted_vec(), stats)
-    }
-
-    fn scan_cluster<T: VectorElement>(
-        &self,
-        query: &VectorQuery<T>,
-        list: ClusterId,
-        probe: &mut AdaptiveProbe<ClusterId>,
-    ) -> usize {
-        let (start, end) = self.offsets[usize::from(list)];
-        let start = start as usize;
-        let end = end as usize;
-        self.vectors.batch_similarity(
-            query.widened(),
-            query.metric(),
-            query.routing_norm(),
-            start..end,
-            scores,
-        );
-        for (row, &sim) in (start..end).zip(scores.iter()) {
-            let cand = Candidate {
-                sim,
-                node: ClusterId::from(row),
-            };
-            probe.push(cand);
-        }
-        end.saturating_sub(start)
+        let ranking = StackedRouting::Segment(self).search(query, k, metric, TopK);
+        let hits = ranking
+            .candidates
+            .into_iter()
+            .map(|candidate| Candidate {
+                sim: candidate.sim,
+                node: ClusterId(candidate.node.1),
+            })
+            .collect();
+        (hits, ranking.stats[0])
     }
 }
 
