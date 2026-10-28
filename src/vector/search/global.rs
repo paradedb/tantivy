@@ -223,7 +223,7 @@ where
         };
         scan.swap_exact(&mut exact);
         let (result, measured) = measure(|| {
-            while let Some(rows) = source.next(scan.feedback())? {
+            while let Some(rows) = source.next()? {
                 let scored = scan.run_cluster(&rows)?;
                 source.admitted(scored, scan.feedback())?;
             }
