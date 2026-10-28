@@ -7,7 +7,7 @@ use common::HasLen;
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::clustering::IvfCentroids;
-use crate::vector::router::arena::{ArenaQuery, VectorArena};
+use crate::vector::router::arena::VectorArena;
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::levels::{InMemoryStore, LazyStore};
 
@@ -21,12 +21,17 @@ pub(crate) struct ExactRouter<S> {
 impl<S: VectorArena<Elem = f32>> ExactRouter<S> {
     pub(super) fn rank(&self, query: &[f32]) -> Ranking {
         assert_eq!(query.len(), self.dim);
-        let query = ArenaQuery::new(query, self.metric);
-        let mut ranked = Vec::with_capacity(self.num_centroids);
+        let mut scores = Vec::with_capacity(self.num_centroids);
         self.centroids
-            .score_range(&query, 0..self.num_centroids, |node, sim| {
-                ranked.push(Candidate { sim, node });
-            });
+            .batch_similarity(query, self.metric, 0..self.num_centroids, &mut scores);
+        let mut ranked = scores
+            .into_iter()
+            .enumerate()
+            .map(|(cluster, sim)| Candidate {
+                sim,
+                node: cluster as u32,
+            })
+            .collect::<Vec<_>>();
         ranked.sort_unstable_by(|a, b| b.cmp(a));
         Ranking {
             ranked: ranked.into_iter(),
@@ -92,5 +97,47 @@ impl Iterator for Ranking {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.ranked.next()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vector::clustering::IvfMatrix;
+
+    #[test]
+    fn batch_ranking_matches_single_row_scoring() -> crate::Result<()> {
+        let matrix: IvfMatrix<f32> = IvfMatrix {
+            values: vec![
+                1.0, -2.0, 3.0, 0.0, 0.0, 0.0, -4.0, 5.0, -6.0, 1.0, -2.0, 3.0,
+            ],
+            rows: 4,
+            dims: 3,
+        };
+        let bytes: Vec<_> = matrix.values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+            let options = VectorOptions::new(matrix.dims, metric);
+            let router = build(&options, &IvfCentroids::F32(matrix.clone()));
+            let opened = open(
+                FileSlice::from(Vec::new()),
+                FileSlice::from(bytes.clone()),
+                &options,
+            )?;
+            for query in [[1.5, -0.5, 2.0], [0.0, 0.0, 0.0]] {
+                let mut expected: Vec<_> = matrix
+                    .values
+                    .chunks_exact(matrix.dims)
+                    .enumerate()
+                    .map(|(node, row)| Candidate {
+                        sim: metric.similarity(&query, row),
+                        node: node as u32,
+                    })
+                    .collect();
+                expected.sort_unstable_by(|a, b| b.cmp(a));
+                assert_eq!(router.rank(&query).collect::<Vec<_>>(), expected);
+                assert_eq!(opened.rank(&query).collect::<Vec<_>>(), expected);
+            }
+        }
+        Ok(())
     }
 }
