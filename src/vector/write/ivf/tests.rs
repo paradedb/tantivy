@@ -1431,12 +1431,14 @@ fn quantized_filtered_rows_are_not_charged() -> crate::Result<()> {
     let (_, n_avg, open_share) = params.resolved_work_budget(ivf.num_clusters(), ivf.num_docs())?;
     let row = (1.0 - open_share) / n_avg;
     // Request all fixture rows so both scans open every cluster.
-    let collector = TopDocsByVectorSimilarityBuilder::new(field, query.clone(), 8)
-        .with_probe_params(params)
-        .with_max_scan_levels(1)
-        .build();
-    let unfiltered = searcher.search(&AllQuery, &collector)?;
-    let filtered = searcher.search(&keep, &collector)?;
+    let collector = || {
+        TopDocsByVectorSimilarityBuilder::new(field, query.clone(), 8)
+            .with_probe_params(params.clone())
+            .with_max_scan_levels(1)
+            .build()
+    };
+    let unfiltered = searcher.search(&AllQuery, &collector())?;
+    let filtered = searcher.search(&keep, &collector())?;
     assert_eq!(
         unfiltered.results,
         fixture_exact_hits(&index, Metric::L2, &query, None, 8)?

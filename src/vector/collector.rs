@@ -442,8 +442,10 @@ where
                     (
                         crate::vector::write::RowAddress {
                             segment_ord: address.segment_ord,
-                            // Opaque foreign key for seeding; never equals this segment's rows.
-                            row_id: address.doc_id as usize,
+                            // Opaque foreign key for seeding. Doc ids and row ids share a
+                            // numeric range on the same segment, so the high bit keeps seed
+                            // keys out of the local RowAddress space.
+                            row_id: (address.doc_id as usize) | (1usize << (usize::BITS - 1)),
                         },
                         *score,
                     )

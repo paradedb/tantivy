@@ -1403,15 +1403,17 @@ fn located_path_reads_no_doc_ids() -> crate::Result<()> {
             located: LocatedPath::MaxSelectivity(Selectivity::new(1.0).unwrap()),
             ..every_cluster()
         };
-        let collector = TopDocs::with_limit(10)
-            .order_by_similarity(fixture.field, query.clone())
-            .with_probe_params(params)
-            .build();
+        let collector = || {
+            TopDocs::with_limit(10)
+                .order_by_similarity(fixture.field, query.clone())
+                .with_probe_params(params.clone())
+                .build()
+        };
         let searcher = fixture.index.reader()?.searcher();
         // The first search opens the location map; measure the second.
-        searcher.search(&filter, &collector)?;
+        searcher.search(&filter, &collector())?;
         fixture.clear_reads();
-        let fruit = searcher.search(&filter, &collector)?;
+        let fruit = searcher.search(&filter, &collector())?;
         let case = format!("{schedule:?}");
         assert_eq!(
             fruit.results,
