@@ -139,6 +139,13 @@ impl QuantizedCandidates {
         }
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.offsets.clear();
+        self.docs.clear();
+        self.columns.truncate(0);
+        self.blocks.clear();
+    }
+
     /// The confidence multiplier of every interval endpoint.
     pub(crate) fn kappa(&self) -> f32 {
         self.kappa

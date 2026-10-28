@@ -22,7 +22,7 @@ use crate::vector::params::ProbeParams;
 use crate::vector::router::global::GlobalRanking;
 use crate::vector::search::cluster_source::ClusterSource;
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
-use crate::vector::search::scan::bound::{ExactMerge, TopK};
+use crate::vector::search::scan::bound::{ExactMerge, PruningBound, TopK};
 use crate::vector::search::scan::heap::TieBreakHits;
 use crate::vector::search::scan::{ScanConfig, SegmentScan};
 use crate::vector::search::segment::plan::{SegmentPlan, Source};
@@ -38,6 +38,7 @@ use crate::vector::storage::metadata::{Quantizer, VectorColMetadata};
 use crate::vector::storage::quantized::QuantizedFieldReader;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
 use crate::vector::tie_break::NoTieBreak;
+use crate::vector::write::RowAddress;
 use crate::vector::{VectorElement, VectorStage};
 use crate::{DocAddress, DocId, Result, Score, SegmentOrdinal, TantivyError};
 
@@ -459,7 +460,11 @@ where
                     query,
                     quantized,
                     self.probe_params.clone(),
-                )?;
+                )?
+                .with_collector_topk(
+                    Arc::clone(&self.collector_topk),
+                    Arc::clone(&self.shared_topk_threshold),
+                );
                 Ok::<_, TantivyError>((backend, self.tie_break.segment_sort_key_computer(reader)?))
             });
             on_segment(ord);
@@ -484,16 +489,28 @@ where
             .zip(tie_breaks)
             .zip(totals)
             .map(|(((hits, report), tie_break), totals)| {
+                let merge = self
+                    .collector_topk
+                    .lock()
+                    .unwrap()
+                    .merge_exact(hits.iter().map(|((score, _), address)| {
+                        (
+                            RowAddress {
+                                segment_ord: address.segment_ord,
+                                row_id: (address.doc_id as usize) | (1usize << (usize::BITS - 1)),
+                            },
+                            *score,
+                        )
+                    }));
+                let mut stats = ProbeStats::new(report, totals);
+                stats.record_shared_offer(merge);
                 let results = hits
                     .into_iter()
                     .map(|((score, key), address)| {
                         ((score, tie_break.convert_segment_sort_key(key)), address)
                     })
                     .collect();
-                SegmentVectorFruit {
-                    results,
-                    stats: ProbeStats::new(report, totals),
-                }
+                SegmentVectorFruit { results, stats }
             })
             .collect();
         Ok(fruits)
@@ -548,7 +565,7 @@ where
                 .unwrap()
                 .merge_exact(hits.iter().map(|((score, _), address)| {
                     (
-                        crate::vector::write::RowAddress {
+                        RowAddress {
                             segment_ord: address.segment_ord,
                             // Opaque foreign key for seeding. Doc ids and row ids share a
                             // numeric range on the same segment, so the high bit keeps seed
@@ -616,7 +633,11 @@ where
         per_cluster: WorkUnits::new(x),
         per_row: WorkUnits::new((1.0 - x) / n_avg),
     };
-    let mut exact = Vec::with_capacity(top_n);
+    let mut topk = first
+        .collector_topk
+        .as_ref()
+        .map(|top| top.lock().unwrap().clone())
+        .unwrap_or_else(|| TopK::new(top_n));
     let mut plans = Vec::with_capacity(backends.len());
     let mut finished = Vec::with_capacity(backends.len());
     for (i, ((backend, segment), tie_break)) in backends
@@ -646,7 +667,15 @@ where
                 None => {
                     let (hits, report) =
                         backend.top_n_by(weight, segment, top_n, tie_break, comparator())?;
-                    exact.extend(hits.iter().map(|((score, _), _)| *score));
+                    topk.merge_exact(hits.iter().map(|((score, _), address)| {
+                        (
+                            RowAddress {
+                                segment_ord: address.segment_ord,
+                                row_id: (address.doc_id as usize) | (1usize << (usize::BITS - 1)),
+                            },
+                            *score,
+                        )
+                    }));
                     Ok((None, Some((hits, report))))
                 }
             }
@@ -657,8 +686,6 @@ where
         plans.push(plan);
         finished.push(result);
     }
-    exact.sort_unstable_by(|a, b| b.total_cmp(a));
-    exact.truncate(top_n);
     let routers: Vec<_> = backends
         .iter()
         .zip(&plans)
@@ -741,6 +768,8 @@ where
                 backend.reader().index().unwrap(),
                 backend.scoring_query(),
                 config,
+                PruningBound::new(top_n, Arc::clone(&backend.shared_topk_threshold)),
+                backend.segment_ord(),
                 tie_break,
                 comparator(),
             )?;
@@ -780,7 +809,7 @@ where
         let (Some(GlobalSource::RouterBypass(source)), Some(scan)) = (source, scan) else {
             continue;
         };
-        scan.swap_exact(&mut exact);
+        scan.swap_topk(&mut topk);
         let (result, measured) = measure(|| {
             while let Some(rows) = source.next()? {
                 let scored = scan.run_cluster(&rows)?;
@@ -788,7 +817,7 @@ where
             }
             Ok::<_, TantivyError>(())
         });
-        scan.swap_exact(&mut exact);
+        scan.swap_topk(&mut topk);
         totals[i].append(&measured);
         on_segment(i);
         result?;
@@ -801,7 +830,7 @@ where
             unreachable!()
         };
         let scan = scans[i].as_mut().unwrap();
-        scan.swap_exact(&mut exact);
+        scan.swap_topk(&mut topk);
         let (result, measured) = measure(|| {
             meter.open();
             if let Some(rows) = source.probe_global(candidate, scan.feedback())? {
@@ -811,7 +840,7 @@ where
             }
             Ok::<_, TantivyError>(())
         });
-        scan.swap_exact(&mut exact);
+        scan.swap_topk(&mut topk);
         totals[i].append(&measured);
         on_segment(i);
         result?;
@@ -839,7 +868,7 @@ where
                 SegmentReport::Ivf {
                     plan: report.unwrap(),
                     source,
-                    scan,
+                    scan: Box::new(scan),
                 },
             ))
         });
@@ -885,7 +914,7 @@ mod ivf_e2e_tests {
 
     use super::VectorSimilarityFruit;
     use crate::collector::sort_key::{SortBySimilarityScore, SortByStaticFastValue, SortByString};
-    use crate::collector::{Collector, TopDocs};
+    use crate::collector::{AtomicSharedThreshold, Collector, SharedThresholdArc, TopDocs};
     use crate::index::IndexSettings;
     use crate::indexer::NoMergePolicy;
     use crate::query::{AllQuery, EnableScoring, Query};
@@ -965,23 +994,37 @@ mod ivf_e2e_tests {
                         exact_plan,
                         ..exhaustive_params(8)
                     };
-                    let collector = TopDocs::with_limit(7)
-                        .and_offset(3)
-                        .order_by_similarity(fixture.field, query.clone())
-                        .with_probe_params(params)
-                        .build();
-                    let fruit = collector.merge_fruits(collector.collect_segments(
-                        fixture.weight(filter)?.as_ref(),
-                        &readers,
-                        |_| {},
-                    )?)?;
-                    let expected: Vec<_> = fixture
-                        .oracle(filter, &query, 10)?
-                        .into_iter()
-                        .skip(3)
-                        .collect();
-                    assert_eq!(fruit.results, expected, "{metric:?} {located:?}");
-                    assert_eq!(fruit.stats.len(), readers.len());
+                    for batch_size in [1, 2, readers.len()] {
+                        let threshold: SharedThresholdArc<Score> =
+                            Arc::new(AtomicSharedThreshold::default());
+                        let collector = TopDocs::with_limit(7)
+                            .and_offset(3)
+                            .order_by_similarity(fixture.field, query.clone())
+                            .with_probe_params(params.clone())
+                            .with_shared_threshold(Arc::clone(&threshold))
+                            .build();
+                        let weight = fixture.weight(filter)?;
+                        let mut fruits = Vec::new();
+                        for batch in readers.chunks(batch_size) {
+                            fruits.extend(collector.collect_segments(
+                                weight.as_ref(),
+                                batch,
+                                |_| {},
+                            )?);
+                        }
+                        let fruit = collector.merge_fruits(fruits)?;
+                        let expected: Vec<_> = fixture
+                            .oracle(filter, &query, 10)?
+                            .into_iter()
+                            .skip(3)
+                            .collect();
+                        assert_eq!(
+                            fruit.results, expected,
+                            "{metric:?} {located:?} batch={batch_size}"
+                        );
+                        assert_eq!(fruit.stats.len(), readers.len());
+                        assert_eq!(threshold.load().is_some(), !fruit.results.is_empty());
+                    }
                 }
             }
         }
@@ -1058,13 +1101,16 @@ mod ivf_e2e_tests {
             .collect();
         let mut query = vec![0.0; 32];
         query[3] = 1.0;
-        let collector = TopDocs::with_limit(10)
-            .order_by_similarity(fixture.field, query)
-            .with_probe_params(ProbeParams {
-                max_probe_fraction: 0.0005,
-                ..Default::default()
-            })
-            .build();
+        let new_collector = || {
+            TopDocs::with_limit(10)
+                .order_by_similarity(fixture.field, query.clone())
+                .with_probe_params(ProbeParams {
+                    max_probe_fraction: 0.0005,
+                    ..Default::default()
+                })
+                .build()
+        };
+        let collector = new_collector();
         let weight = fixture.all()?;
         let fruit = collector.merge_fruits(collector.collect_segments(
             weight.as_ref(),
@@ -1074,8 +1120,8 @@ mod ivf_e2e_tests {
         assert_eq!(fruit.stats.iter().map(|s| s.work_budget).sum::<f32>(), 16.0);
         assert!(fruit.stats.iter().map(|s| s.work_charged).sum::<f32>() < 18.0);
         let single = [readers[2]];
-        let legacy = collector.collect_segment(weight.as_ref(), single[0].0, single[0].1)?;
-        let mut automatic = collector.collect_segments(weight.as_ref(), &single, |_| {})?;
+        let legacy = new_collector().collect_segment(weight.as_ref(), single[0].0, single[0].1)?;
+        let mut automatic = new_collector().collect_segments(weight.as_ref(), &single, |_| {})?;
         assert_eq!(automatic.len(), 1);
         let automatic = automatic.pop().unwrap();
         assert_eq!(automatic.results, legacy.results);
