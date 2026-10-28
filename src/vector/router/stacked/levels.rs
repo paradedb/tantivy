@@ -945,10 +945,11 @@ where S: VectorArena<Elem = f32>
             return (Vec::new(), stats);
         }
 
-        let mut probe = super::aps::open();
+        let mut probe = super::aps::open(k);
         let mut result = BinaryHeap::with_capacity(k);
         for c in &candidates {
-            stats.members_scored += self.scan_cluster(query, metric, c.node, &mut result, k);
+            let scanned = self.scan_cluster(query, metric, c.node, &mut result, k);
+            stats.members_scored += scanned;
             stats.lists_scanned += 1;
             let kth = if result.len() >= k {
                 result
@@ -957,7 +958,7 @@ where S: VectorArena<Elem = f32>
             } else {
                 None
             };
-            if probe.observe(kth) {
+            if probe.observe(kth, scanned) {
                 break;
             }
         }
@@ -1238,11 +1239,13 @@ mod tests {
         let query = [0.0f32, 0.0];
         let (hits, stats) = index.search(&query, 1, Metric::L2);
         assert!(!hits.is_empty());
-        // Shortlist is only a few lists; patience needs a longer miss run, so the walk
-        // still expands the full floor.
-        assert_eq!(
-            stats.lists_scanned, floor,
-            "small-k top level must expand only ceil(0.25 × nlist) lists"
+        // Cap is the shortlist; member-relative patience may stop earlier when
+        // stagnant lists already cover ⌈5k⌉ rows.
+        assert!(
+            stats.lists_scanned <= floor,
+            "small-k top level must not expand past ceil(0.25 × nlist), scanned {} floor {}",
+            stats.lists_scanned,
+            floor
         );
         assert!(
             stats.members_scored >= nlist,
