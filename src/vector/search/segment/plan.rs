@@ -62,20 +62,37 @@ impl SegmentPlan {
         segment: &SegmentReader,
         top_n: usize,
     ) -> crate::Result<Self> {
-        let (total, n_avg, x) =
-            params.resolved_work_budget(index.num_clusters(), index.num_docs())?;
-        Self::with_budget(
-            params,
-            index,
-            weight,
-            segment,
-            top_n,
-            WorkBudget {
-                total: WorkUnits::new(total),
+        let max_doc = segment.max_doc();
+        let clusters = index.num_clusters();
+        let report = |located_cap| PlanReport {
+            segment_rows: index.num_rows(),
+            segment_clusters: clusters,
+            located_cap,
+        };
+        if top_n == 0 || max_doc == 0 || clusters == 0 {
+            return Ok(Self {
+                budget: WorkBudget::default(),
+                source: None,
+                report: report(0),
+            });
+        }
+        // Capacity counts native docs as written: deleted rows still charge on first touch.
+        let (budget, n_avg, x) = params.resolved_work_budget(clusters, index.num_docs())?;
+        debug_assert!(n_avg > 0.0);
+        let cap = located_cap(params.located, max_doc, budget, n_avg, x);
+        let source = {
+            let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
+            collect_segment_filter(weight, segment, max_doc, cap)?
+        };
+        Ok(Self {
+            budget: WorkBudget {
+                total: WorkUnits::new(budget),
                 per_cluster: WorkUnits::new(x),
                 per_row: WorkUnits::new((1.0 - x) / n_avg),
             },
-        )
+            source: (!source.is_empty()).then_some(source),
+            report: report(cap),
+        })
     }
 
     pub(crate) fn with_budget(

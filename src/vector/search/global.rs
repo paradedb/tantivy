@@ -1,6 +1,3 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use super::cluster_source::ClusterSource;
 use super::scan::heap::TieBreakHits;
 use super::scan::{ScanConfig, SegmentScan};
@@ -60,7 +57,7 @@ where
         per_cluster: WorkUnits::new(x),
         per_row: WorkUnits::new((1.0 - x) / n_avg),
     };
-    let exact = Rc::new(RefCell::new(Vec::with_capacity(top_n)));
+    let mut exact = Vec::with_capacity(top_n);
     let mut plans = Vec::with_capacity(backends.len());
     let mut finished = Vec::with_capacity(backends.len());
     for (i, ((backend, segment), tie_break)) in backends
@@ -90,9 +87,7 @@ where
                 None => {
                     let (hits, report) =
                         backend.top_n_by(weight, segment, top_n, tie_break, comparator())?;
-                    exact
-                        .borrow_mut()
-                        .extend(hits.iter().map(|((score, _), _)| *score));
+                    exact.extend(hits.iter().map(|((score, _), _)| *score));
                     Ok((None, Some((hits, report))))
                 }
             }
@@ -103,11 +98,8 @@ where
         plans.push(plan);
         finished.push(result);
     }
-    {
-        let mut scores = exact.borrow_mut();
-        scores.sort_unstable_by(|a, b| b.total_cmp(a));
-        scores.truncate(top_n);
-    }
+    exact.sort_unstable_by(|a, b| b.total_cmp(a));
+    exact.truncate(top_n);
     let routers: Vec<_> = backends
         .iter()
         .zip(&plans)
@@ -185,7 +177,7 @@ where
                 #[cfg(test)]
                 admission_pruning_disabled: backend.admission_pruning_disabled,
             };
-            let mut scan = SegmentScan::new(
+            let scan = SegmentScan::new(
                 &backend.reader,
                 backend.reader.index().unwrap(),
                 backend.scoring_query(),
@@ -193,7 +185,6 @@ where
                 tie_break,
                 comparator(),
             )?;
-            scan.share_exact(Rc::clone(&exact));
             let source = match source {
                 Source::Router(filter) => ScheduledSource::Router(RouterClusters::scheduled(
                     &backend.reader,
@@ -230,6 +221,7 @@ where
         let (Some(ScheduledSource::Matches(source)), Some(scan)) = (source, scan) else {
             continue;
         };
+        scan.swap_exact(&mut exact);
         let (result, measured) = measure(|| {
             while let Some(rows) = source.next(scan.feedback())? {
                 let scored = scan.run_cluster(&rows)?;
@@ -237,6 +229,7 @@ where
             }
             Ok::<_, crate::TantivyError>(())
         });
+        scan.swap_exact(&mut exact);
         totals[i].append(&measured);
         on_segment(i);
         result?;
@@ -249,6 +242,7 @@ where
             unreachable!()
         };
         let scan = scans[i].as_mut().unwrap();
+        scan.swap_exact(&mut exact);
         let (result, measured) = measure(|| {
             meter.open();
             if let Some(rows) = source.probe_scheduled(candidate, scan.feedback())? {
@@ -258,6 +252,7 @@ where
             }
             Ok::<_, crate::TantivyError>(())
         });
+        scan.swap_exact(&mut exact);
         totals[i].append(&measured);
         on_segment(i);
         result?;

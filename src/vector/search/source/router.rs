@@ -416,10 +416,45 @@ impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
             if !self.controller.admit(&self.meter) {
                 return Ok(None);
             }
-            let candidate = Candidate { sim, node };
-            if self.prepare_cluster(candidate, feedback)? {
-                return Ok(Some(self.cluster_rows(candidate)));
+            let cluster = node as usize;
+
+            // A skip charges the open share. The bound is the pessimistic k-th, so a skip
+            // never drops a true top-k row.
+            if self.verdict(cluster, sim.score()) == Verdict::Skip {
+                self.meter.open();
+                self.counters.bounds_skips += 1;
+                continue;
             }
+            self.meter.open();
+            let rows = self.index.cluster_range(cluster);
+            if rows.is_empty() {
+                self.skip_empty(feedback)?;
+                continue;
+            }
+
+            let gated = self.gate_cluster(cluster, rows.len())?;
+            if !gated.all && self.offsets.is_empty() {
+                self.skip_empty(feedback)?;
+                continue;
+            }
+            let (offsets, docs) = if gated.all {
+                (None, None)
+            } else {
+                self.selected_docs.clear();
+                self.selected_docs.extend(
+                    self.offsets
+                        .iter()
+                        .map(|&offset| self.docs[offset as usize]),
+                );
+                (Some(&self.offsets[..]), Some(&self.selected_docs[..]))
+            };
+            return Ok(Some(ClusterRows {
+                cluster,
+                rows,
+                offsets,
+                docs,
+                centroid: Some(sim),
+            }));
         }
     }
 
