@@ -497,7 +497,7 @@ where
     /// quantized layer at a time, then scores what is left exactly.
     pub(crate) fn run(&mut self, source: &mut impl ClusterSource) -> crate::Result<()> {
         let stage = enter_vector_stage(self.shortlist_stage());
-        while let Some(rows) = source.next(self.feedback())? {
+        while let Some(rows) = source.next()? {
             let scored = self.shortlist(&rows)?;
             source.admitted(scored, self.feedback())?;
         }

@@ -393,7 +393,7 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
 }
 
 impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
-    fn next(&mut self, _feedback: Feedback) -> crate::Result<Option<ClusterRows<'_>>> {
+    fn next(&mut self) -> crate::Result<Option<ClusterRows<'_>>> {
         loop {
             let next = {
                 let _routing = enter_vector_stage(VectorStage::Routing);
