@@ -348,26 +348,6 @@ where
         Ok(SegmentVectorFruit { results, stats })
     }
 
-    fn collect_segments(
-        &self,
-        weight: &dyn Weight,
-        readers: &[(SegmentOrdinal, &SegmentReader)],
-        _executor: &crate::Executor,
-        on_segment: &(dyn Fn(SegmentOrdinal) + Sync),
-    ) -> crate::Result<Vec<SegmentVectorFruit<S::SortKey>>> {
-        if readers.len() <= 1 {
-            return readers
-                .iter()
-                .map(|&(ord, reader)| {
-                    let result = self.collect_segment(weight, ord, reader);
-                    on_segment(ord);
-                    result
-                })
-                .collect();
-        }
-        self.collect_global_segments(weight, readers, on_segment)
-    }
-
     fn merge_fruits(
         &self,
         segment_fruits: Vec<SegmentVectorFruit<S::SortKey>>,
@@ -410,6 +390,28 @@ where
     T: VectorElement,
     S: SortKeyComputer + Send + Sync + 'static,
 {
+    /// Collects the supplied segments in input order. One segment uses the existing segment
+    /// search; multiple segments share routing, a work budget, and the exact top-k bound.
+    /// Calls `on_segment` after each slice of work for per-segment read accounting.
+    pub fn collect_segments(
+        &self,
+        weight: &dyn Weight,
+        readers: &[(SegmentOrdinal, &SegmentReader)],
+        mut on_segment: impl FnMut(SegmentOrdinal),
+    ) -> crate::Result<Vec<SegmentVectorFruit<S::SortKey>>> {
+        if readers.len() <= 1 {
+            return readers
+                .iter()
+                .map(|&(ord, reader)| {
+                    let result = self.collect_segment(weight, ord, reader);
+                    on_segment(ord);
+                    result
+                })
+                .collect();
+        }
+        self.collect_global_segments(weight, readers, on_segment)
+    }
+
     /// Searches a logical union of segment routers with one work budget and exact top-k bound.
     /// Located filter matches are exhaustive and reserve their share of the budget.
     /// Calls `on_segment` after each slice of work so an embedder can attribute physical reads.
@@ -677,8 +679,7 @@ mod ivf_e2e_tests {
                     let fruit = collector.merge_fruits(collector.collect_segments(
                         fixture.weight(filter)?.as_ref(),
                         &readers,
-                        &crate::Executor::single_thread(),
-                        &|_| {},
+                        |_| {},
                     )?)?;
                     let expected: Vec<_> = fixture
                         .oracle(filter, &query, 10)?
@@ -735,8 +736,7 @@ mod ivf_e2e_tests {
         let result = collector.merge_fruits(collector.collect_segments(
             weight.as_ref(),
             &readers,
-            &crate::Executor::single_thread(),
-            &|_| {},
+            |_| {},
         )?)?;
         assert_eq!(result.results.len(), 3);
         assert!(result
@@ -780,18 +780,17 @@ mod ivf_e2e_tests {
                 max_probe_fraction: 0.0005,
                 ..Default::default()
             });
-        let fruit = searcher.search(&AllQuery, &collector)?;
+        let weight = fixture.all()?;
+        let fruit = collector.merge_fruits(collector.collect_segments(
+            weight.as_ref(),
+            &readers,
+            |_| {},
+        )?)?;
         assert_eq!(fruit.stats.iter().map(|s| s.work_budget).sum::<f32>(), 16.0);
         assert!(fruit.stats.iter().map(|s| s.work_charged).sum::<f32>() < 18.0);
-        let weight = fixture.all()?;
         let single = [readers[2]];
         let legacy = collector.collect_segment(weight.as_ref(), single[0].0, single[0].1)?;
-        let mut automatic = collector.collect_segments(
-            weight.as_ref(),
-            &single,
-            &crate::Executor::single_thread(),
-            &|_| {},
-        )?;
+        let mut automatic = collector.collect_segments(weight.as_ref(), &single, |_| {})?;
         assert_eq!(automatic.len(), 1);
         let automatic = automatic.pop().unwrap();
         assert_eq!(automatic.results, legacy.results);
@@ -804,12 +803,8 @@ mod ivf_e2e_tests {
             value
         };
         assert_eq!(counters(automatic.stats), counters(legacy.stats));
-        let empty = collector.merge_fruits(collector.collect_segments(
-            weight.as_ref(),
-            &[],
-            &crate::Executor::single_thread(),
-            &|_| {},
-        )?)?;
+        let empty =
+            collector.merge_fruits(collector.collect_segments(weight.as_ref(), &[], |_| {})?)?;
         assert!(empty.results.is_empty());
         assert!(empty.stats.is_empty());
         Ok(())
@@ -1038,8 +1033,7 @@ mod ivf_e2e_tests {
                 let global = collector.merge_fruits(collector.collect_segments(
                     weight.as_ref(),
                     &readers,
-                    &crate::Executor::single_thread(),
-                    &|_| {},
+                    |_| {},
                 )?)?;
                 let want: Vec<_> = expected
                     .iter()
@@ -1274,8 +1268,7 @@ mod ivf_e2e_tests {
             let global = collector.merge_fruits(collector.collect_segments(
                 weight.as_ref(),
                 &readers,
-                &crate::Executor::single_thread(),
-                &|_| {},
+                |_| {},
             )?)?;
             assert_eq!(cities(&global), want, "global k={k}");
         }

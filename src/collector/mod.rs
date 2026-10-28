@@ -178,26 +178,6 @@ pub trait Collector: Sync + Send {
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
     ) -> crate::Result<Self::Fruit>;
 
-    /// Collects a set of segments, retaining their input order in the returned fruits.
-    /// Collectors may override this to coordinate work across segments. `on_segment`
-    /// runs after each segment's work and may run more than once per segment.
-    fn collect_segments(
-        &self,
-        weight: &dyn Weight,
-        readers: &[(SegmentOrdinal, &SegmentReader)],
-        executor: &crate::Executor,
-        on_segment: &(dyn Fn(SegmentOrdinal) + Sync),
-    ) -> crate::Result<Vec<<Self::Child as SegmentCollector>::Fruit>> {
-        executor.map(
-            |&(ord, reader)| {
-                let result = self.collect_segment(weight, ord, reader);
-                on_segment(ord);
-                result
-            },
-            readers.iter(),
-        )
-    }
-
     /// Created a segment collector and
     fn collect_segment(
         &self,
