@@ -6,120 +6,86 @@ use crate::schema::Metric;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
 use crate::vector::VectorStage;
 
+/// Clusters to probe across all segments, ordered by centroid similarity to the query.
+/// Each cluster carries its segment index, and metrics track the routing work for each segment.
 pub(crate) struct GlobalRanking {
     pub(crate) clusters: Vec<(usize, Candidate)>,
     pub(crate) metrics: Vec<RouterMetrics>,
 }
 
-pub(crate) fn rank(
-    routers: &[Option<&OpenedRouter>],
-    query: &[f32],
-    metric: Metric,
-    k: usize,
-    totals: &mut [StageTotals],
-    on_segment: &mut impl FnMut(usize),
-) -> GlobalRanking {
-    let mut levels: Vec<Vec<&StackedIvf<LazyStore>>> = Vec::with_capacity(routers.len());
-    let mut metrics = Vec::with_capacity(routers.len());
-    let mut leaves = Vec::new();
-    for (segment, router) in routers.iter().enumerate() {
-        let mut stack = Vec::new();
-        let mut stats = RouterMetrics::Stacked {
-            candidate_count: 0,
-            lists_scanned: 0,
-            members_scored: 0,
-        };
-        match router {
-            Some(Router::Stacked(router)) => {
-                let mut current = Some(router);
-                while let Some(level) = current {
-                    stack.push(level);
-                    current = level.parent.as_deref();
-                }
-            }
-            Some(Router::Exact(router)) => {
-                let (ranked, measured) = measure(|| {
-                    let _stage = enter_vector_stage(VectorStage::Routing);
-                    router.rank(query).collect::<Vec<_>>()
-                });
-                totals[segment].append(&measured);
-                on_segment(segment);
-                stats = RouterMetrics::Exact {
-                    visited_count: ranked.len(),
-                };
-                leaves.extend(ranked.into_iter().map(|c| (segment, c)));
-            }
-            None => {}
-        }
-        levels.push(stack);
-        metrics.push(stats);
-    }
-    let depth = levels.iter().map(Vec::len).max().unwrap_or(0);
-    let mut requested = k;
-    let open: Vec<_> = (0..depth)
-        .map(|level| {
-            let indexes: Vec<_> = levels.iter().filter_map(|stack| stack.get(level)).collect();
-            let lists = indexes.iter().map(|index| index.nlist()).sum();
-            let members = indexes
-                .iter()
-                .flat_map(|index| &index.offsets)
-                .map(|&(start, end)| (end - start) as usize)
-                .sum();
-            requested = lists_to_open(lists, members, requested);
-            requested
-        })
-        .collect();
-    let mut candidates: Vec<(usize, Candidate)> = Vec::new();
-    for level in (0..depth).rev() {
-        for (segment, stack) in levels.iter().enumerate() {
-            if stack.len() != level + 1 {
-                continue;
-            }
-            let index = stack[level];
-            let (_, measured) = measure(|| {
-                let _stage = enter_vector_stage(VectorStage::Routing);
-                candidates.extend((0..index.nlist()).map(|node| {
-                    (
-                        segment,
-                        Candidate {
-                            sim: index.centroids.similarity(
-                                metric,
-                                query.len(),
-                                node as u32,
-                                query,
-                            ),
-                            node: node as u32,
-                        },
-                    )
-                }));
-            });
-            totals[segment].append(&measured);
-            on_segment(segment);
-            if let RouterMetrics::Stacked { members_scored, .. } = &mut metrics[segment] {
-                *members_scored += index.nlist();
-            }
-        }
-        candidates.sort_unstable_by(|a, b| {
-            b.1.sim
-                .cmp(&a.1.sim)
-                .then(a.0.cmp(&b.0))
-                .then(a.1.node.cmp(&b.1.node))
-        });
-        candidates.truncate(open[level]);
-        let mut next = Vec::new();
-        for (segment, stack) in levels.iter().enumerate() {
-            let Some(index) = stack.get(level) else {
-                continue;
+impl GlobalRanking {
+    pub(crate) fn from(
+        routers: &[Option<&OpenedRouter>],
+        query: &[f32],
+        metric: Metric,
+        k: usize,
+        totals: &mut [StageTotals],
+        on_segment: &mut impl FnMut(usize),
+    ) -> Self {
+        let mut levels: Vec<Vec<&StackedIvf<LazyStore>>> = Vec::with_capacity(routers.len());
+        let mut metrics = Vec::with_capacity(routers.len());
+        let mut leaves = Vec::new();
+        for (segment, router) in routers.iter().enumerate() {
+            let mut stack = Vec::new();
+            let mut stats = RouterMetrics::Stacked {
+                candidate_count: 0,
+                lists_scanned: 0,
+                members_scored: 0,
             };
-            let (_, measured) = measure(|| {
-                let _stage = enter_vector_stage(VectorStage::Routing);
-                for (_, candidate) in candidates.iter().filter(|(s, _)| *s == segment) {
-                    let (start, end) = index.offsets[candidate.node as usize];
-                    next.extend((start..end).map(|node| {
+            match router {
+                Some(Router::Stacked(router)) => {
+                    let mut current = Some(router);
+                    while let Some(level) = current {
+                        stack.push(level);
+                        current = level.parent.as_deref();
+                    }
+                }
+                Some(Router::Exact(router)) => {
+                    let (ranked, measured) = measure(|| {
+                        let _stage = enter_vector_stage(VectorStage::Routing);
+                        router.rank(query).collect::<Vec<_>>()
+                    });
+                    totals[segment].append(&measured);
+                    on_segment(segment);
+                    stats = RouterMetrics::Exact {
+                        visited_count: ranked.len(),
+                    };
+                    leaves.extend(ranked.into_iter().map(|c| (segment, c)));
+                }
+                None => {}
+            }
+            levels.push(stack);
+            metrics.push(stats);
+        }
+        let depth = levels.iter().map(Vec::len).max().unwrap_or(0);
+        let mut requested = k;
+        let open: Vec<_> = (0..depth)
+            .map(|level| {
+                let indexes: Vec<_> = levels.iter().filter_map(|stack| stack.get(level)).collect();
+                let lists = indexes.iter().map(|index| index.nlist()).sum();
+                let members = indexes
+                    .iter()
+                    .flat_map(|index| &index.offsets)
+                    .map(|&(start, end)| (end - start) as usize)
+                    .sum();
+                requested = lists_to_open(lists, members, requested);
+                requested
+            })
+            .collect();
+        let mut candidates: Vec<(usize, Candidate)> = Vec::new();
+        for level in (0..depth).rev() {
+            for (segment, stack) in levels.iter().enumerate() {
+                if stack.len() != level + 1 {
+                    continue;
+                }
+                let index = stack[level];
+                let (_, measured) = measure(|| {
+                    let _stage = enter_vector_stage(VectorStage::Routing);
+                    candidates.extend((0..index.nlist()).map(|node| {
                         (
                             segment,
                             Candidate {
-                                sim: index.vectors.similarity(
+                                sim: index.centroids.similarity(
                                     metric,
                                     query.len(),
                                     node as u32,
@@ -129,40 +95,78 @@ pub(crate) fn rank(
                             },
                         )
                     }));
-                    if let RouterMetrics::Stacked {
-                        lists_scanned,
-                        members_scored,
-                        ..
-                    } = &mut metrics[segment]
-                    {
-                        *lists_scanned += 1;
-                        *members_scored += (end - start) as usize;
-                    }
+                });
+                totals[segment].append(&measured);
+                on_segment(segment);
+                if let RouterMetrics::Stacked { members_scored, .. } = &mut metrics[segment] {
+                    *members_scored += index.nlist();
                 }
+            }
+            candidates.sort_unstable_by(|a, b| {
+                b.1.sim
+                    .cmp(&a.1.sim)
+                    .then(a.0.cmp(&b.0))
+                    .then(a.1.node.cmp(&b.1.node))
             });
-            totals[segment].append(&measured);
-            on_segment(segment);
+            candidates.truncate(open[level]);
+            let mut next = Vec::new();
+            for (segment, stack) in levels.iter().enumerate() {
+                let Some(index) = stack.get(level) else {
+                    continue;
+                };
+                let (_, measured) = measure(|| {
+                    let _stage = enter_vector_stage(VectorStage::Routing);
+                    for (_, candidate) in candidates.iter().filter(|(s, _)| *s == segment) {
+                        let (start, end) = index.offsets[candidate.node as usize];
+                        next.extend((start..end).map(|node| {
+                            (
+                                segment,
+                                Candidate {
+                                    sim: index.vectors.similarity(
+                                        metric,
+                                        query.len(),
+                                        node as u32,
+                                        query,
+                                    ),
+                                    node: node as u32,
+                                },
+                            )
+                        }));
+                        if let RouterMetrics::Stacked {
+                            lists_scanned,
+                            members_scored,
+                            ..
+                        } = &mut metrics[segment]
+                        {
+                            *lists_scanned += 1;
+                            *members_scored += (end - start) as usize;
+                        }
+                    }
+                });
+                totals[segment].append(&measured);
+                on_segment(segment);
+            }
+            candidates = next;
         }
-        candidates = next;
-    }
-    leaves.extend(candidates);
-    leaves.sort_unstable_by(|a, b| {
-        b.1.sim
-            .cmp(&a.1.sim)
-            .then(a.0.cmp(&b.0))
-            .then(a.1.node.cmp(&b.1.node))
-    });
-    for (segment, _) in &leaves {
-        if let RouterMetrics::Stacked {
-            candidate_count, ..
-        } = &mut metrics[*segment]
-        {
-            *candidate_count += 1;
+        leaves.extend(candidates);
+        leaves.sort_unstable_by(|a, b| {
+            b.1.sim
+                .cmp(&a.1.sim)
+                .then(a.0.cmp(&b.0))
+                .then(a.1.node.cmp(&b.1.node))
+        });
+        for (segment, _) in &leaves {
+            if let RouterMetrics::Stacked {
+                candidate_count, ..
+            } = &mut metrics[*segment]
+            {
+                *candidate_count += 1;
+            }
         }
-    }
-    GlobalRanking {
-        clusters: leaves,
-        metrics,
+        Self {
+            clusters: leaves,
+            metrics,
+        }
     }
 }
 
@@ -221,8 +225,9 @@ mod tests {
             let near = open(0.0, near_nested)?;
             let routers = [Some(&far), None, Some(&near), Some(&exact)];
             let mut totals = vec![StageTotals::default(); routers.len()];
-            let ranked = rank(&routers, &[0.0], Metric::L2, 0, &mut totals, &mut |_| {});
-            let exhaustive = rank(
+            let ranked =
+                GlobalRanking::from(&routers, &[0.0], Metric::L2, 0, &mut totals, &mut |_| {});
+            let exhaustive = GlobalRanking::from(
                 &routers,
                 &[0.0],
                 Metric::L2,

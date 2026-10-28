@@ -457,7 +457,7 @@ where
             totals.push(measured);
         }
         let segments: Vec<_> = readers.iter().map(|(_, reader)| *reader).collect();
-        let results = crate::vector::search::global::search(
+        let results = crate::vector::search::global::search_global(
             &backends,
             &segments,
             weight,
