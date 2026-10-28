@@ -10,7 +10,7 @@ use super::SegmentSearcher;
 use crate::collector::sort_key::Comparator;
 use crate::collector::SegmentSortKeyComputer;
 use crate::query::Weight;
-use crate::vector::router::global;
+use crate::vector::router::global::GlobalRanking;
 use crate::vector::stats::SegmentReport;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
 use crate::vector::{VectorElement, VectorStage};
@@ -22,8 +22,10 @@ enum GlobalSource<'a, T: VectorElement> {
     RouterBypass(MatchClusters<'a>),
 }
 
+/// Searches multiple segments with a shared cluster order, work budget, and top-k score threshold.
+/// Returns each segment's hits and statistics so the collector can combine the results.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn search<T, K, C>(
+pub(crate) fn search_global<T, K, C>(
     backends: &[SegmentSearcher<T>],
     segments: &[&SegmentReader],
     weight: &dyn Weight,
@@ -129,7 +131,7 @@ where
     let k = first
         .probe_params
         .router_k(total, x, matched / routed_docs.max(1) as f64, clusters);
-    let ranking = global::rank(
+    let ranking = GlobalRanking::from(
         &routers,
         first.query.widened(),
         first.query.metric(),
