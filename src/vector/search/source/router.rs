@@ -283,30 +283,22 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
             HeapPeek::from_kth(feedback.kth_lower),
             (self.counters.postings_row + self.counters.postings_skipped) as u32,
         );
-        if self.prepare_cluster(candidate, feedback)? {
-            Ok(Some(self.cluster_rows(candidate)))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn prepare_cluster(&mut self, candidate: Candidate, feedback: Feedback) -> crate::Result<bool> {
         let Candidate { sim, node } = candidate;
         let cluster = node as usize;
         self.meter.open();
-        if self.verdict(cluster, sim.score()) == Verdict::Skip {
+        if !self.needs_scoring(cluster, sim.score()) {
             self.counters.bounds_skips += 1;
-            return Ok(false);
+            return Ok(None);
         }
         let rows = self.index.cluster_range(cluster);
         if rows.is_empty() {
-            self.skip_empty(feedback)?;
-            return Ok(false);
+            self.skip_empty();
+            return Ok(None);
         }
         let gated = self.gate_cluster(cluster, rows.len())?;
         if !gated.all && self.offsets.is_empty() {
-            self.skip_empty(feedback)?;
-            return Ok(false);
+            self.skip_empty();
+            return Ok(None);
         }
         self.selected_docs.clear();
         if !gated.all {
@@ -316,22 +308,17 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
                     .map(|&offset| self.docs[offset as usize]),
             );
         }
-        Ok(true)
+        Ok(Some(ClusterRows {
+            cluster,
+            rows,
+            offsets: (!gated.all).then_some(&self.offsets[..]),
+            docs: (!gated.all).then_some(&self.selected_docs[..]),
+            centroid: Some(sim),
+        }))
     }
 
-    fn cluster_rows(&self, candidate: Candidate) -> ClusterRows<'_> {
-        let all = self.gate.is_open();
-        ClusterRows {
-            cluster: candidate.node as usize,
-            rows: self.index.cluster_range(candidate.node as usize),
-            offsets: (!all).then_some(&self.offsets[..]),
-            docs: (!all).then_some(&self.selected_docs[..]),
-            centroid: Some(candidate.sim),
-        }
-    }
-
-    /// The bounds gate's verdict for `cluster`, whose routing key is `sim`.
-    fn verdict(&self, cluster: usize, sim: f32) -> Verdict {
+    /// Whether the cluster's bound allows it to improve the current top-k results.
+    fn needs_scoring(&self, cluster: usize, sim: f32) -> bool {
         let query_bound = self.tracker.bound();
         bounds_verdict(query_bound, || {
             let QueryBound::Armed { t } = query_bound else {
@@ -364,7 +351,7 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
                 }
                 Metric::Dot => margin_ball_halfspace(sim, self.query.norm(), r, t),
             }
-        })
+        }) != Verdict::Skip
     }
 
     /// Selects `cluster`'s rows into `offsets` and counts what the gate pruned.
@@ -385,10 +372,9 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
     }
 
     /// Counts an opened cluster that contributes no rows.
-    fn skip_empty(&mut self, _feedback: Feedback) -> crate::Result<()> {
+    fn skip_empty(&mut self) {
         self.counters.postings_skipped += 1;
         self.counters.clusters_skipped_empty += 1;
-        Ok(())
     }
 
     /// Ends the walk and reports what it counted.
@@ -407,7 +393,7 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
 }
 
 impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
-    fn next(&mut self, feedback: Feedback) -> crate::Result<Option<ClusterRows<'_>>> {
+    fn next(&mut self, _feedback: Feedback) -> crate::Result<Option<ClusterRows<'_>>> {
         loop {
             let next = {
                 let _routing = enter_vector_stage(VectorStage::Routing);
@@ -423,7 +409,7 @@ impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
 
             // A skip charges the open share. The bound is the pessimistic k-th, so a skip
             // never drops a true top-k row.
-            if self.verdict(cluster, sim.score()) == Verdict::Skip {
+            if !self.needs_scoring(cluster, sim.score()) {
                 self.meter.open();
                 self.counters.bounds_skips += 1;
                 continue;
@@ -431,13 +417,13 @@ impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
             self.meter.open();
             let rows = self.index.cluster_range(cluster);
             if rows.is_empty() {
-                self.skip_empty(feedback)?;
+                self.skip_empty();
                 continue;
             }
 
             let gated = self.gate_cluster(cluster, rows.len())?;
             if !gated.all && self.offsets.is_empty() {
-                self.skip_empty(feedback)?;
+                self.skip_empty();
                 continue;
             }
             let (offsets, docs) = if gated.all {
