@@ -229,7 +229,8 @@ impl TopK {
         merge
     }
 
-    /// Drops every candidate. The collector calls this between searches.
+    /// Drops every candidate.
+    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.by_addr.clear();
     }
@@ -337,8 +338,8 @@ mod tests {
 
     mod top_k {
         use super::addr;
-        use crate::vector::search::scan::bound::{ExactMerge, TopK};
         use crate::DocId;
+        use crate::vector::search::scan::bound::{ExactMerge, TopK};
 
         /// The collector top-k is unset until `k` scores are in, then holds the k-th best score
         /// offered whatever the order and grouping of the offers, and never loosens; an
@@ -686,7 +687,7 @@ mod tests {
                         if let Some(threshold) = running {
                             let mut sorted = truth.clone();
                             sorted.sort_by(|a, b| b.total_cmp(a));
-                            assert!(threshold.0 .0 <= sorted[k - 1] + 1e-5, "{case}");
+                            assert!(threshold.0.0 <= sorted[k - 1] + 1e-5, "{case}");
                         }
                     }
                     let mut order = (0..n).collect::<Vec<_>>();

@@ -11,16 +11,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{
-    compare_for_top_k, AtomicSharedThreshold, Collector, ComparableDoc, SegmentCollector,
-    SegmentSortKeyComputer, SharedThresholdArc, SortKeyComputer,
+    AtomicSharedThreshold, Collector, ComparableDoc, SegmentCollector, SegmentSortKeyComputer,
+    SharedThresholdArc, SortKeyComputer, compare_for_top_k,
 };
 use crate::index::SegmentReader;
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Metric, Schema};
 use crate::vector::params::ProbeParams;
+use crate::vector::search::SegmentSearcher;
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
 use crate::vector::search::scan::bound::{ExactMerge, TopK};
-use crate::vector::search::SegmentSearcher;
 use crate::vector::stats::{ProbeStats, SegmentReport};
 use crate::vector::storage::metadata::VectorColMetadata;
 use crate::vector::storage::quantized::QuantizedFieldReader;
@@ -149,13 +149,9 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
     /// Builds the collector. Configuration cannot be changed afterwards.
     pub fn build(self) -> TopDocsByVectorSimilarity<T, S> {
         let segment_top_n = self.limit.saturating_add(self.offset);
-        let (shared_topk_threshold, owns_shared_threshold) = match self.shared_threshold {
-            Some(slot) => (slot, false),
-            None => (
-                Arc::new(AtomicSharedThreshold::default()) as SharedThresholdArc<Score>,
-                true,
-            ),
-        };
+        let shared_topk_threshold = self.shared_threshold.unwrap_or_else(|| {
+            Arc::new(AtomicSharedThreshold::default()) as SharedThresholdArc<Score>
+        });
         TopDocsByVectorSimilarity {
             field: self.field,
             query: self.query,
@@ -167,7 +163,6 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
             prepared: Mutex::new(None),
             collector_topk: Arc::new(Mutex::new(TopK::new(segment_top_n))),
             shared_topk_threshold,
-            owns_shared_threshold,
             tie_break: self.tie_break,
         }
     }
@@ -193,14 +188,11 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     /// The query prepared for the field's metric on first use.
     prepared: Mutex<Option<Arc<VectorQuery<T>>>>,
     /// The top-k exact scores (with addresses) from segments this collector has finished. Later
-    /// segments seed their pruning-bound TopK from these for partial-k accounting. Cleared between
-    /// searches.
+    /// segments seed their pruning-bound TopK from these for partial-k accounting.
     collector_topk: Arc<Mutex<TopK>>,
     /// The shared top-k threshold every segment scan of this collector syncs and publishes.
     /// Either the caller's slot or a process-local [`AtomicSharedThreshold`] from `build`.
     shared_topk_threshold: SharedThresholdArc<Score>,
-    /// When true, `shared_topk_threshold` was created by `build` and is cleared between searches.
-    owns_shared_threshold: bool,
     tie_break: S,
 }
 
@@ -389,11 +381,6 @@ where
         if let Some(first) = merged.stats.first_mut() {
             first.add_assembly(&totals);
         }
-        // The collector top-k (and process-local slot, when we own it) describe this search only.
-        self.collector_topk.lock().unwrap().clear();
-        if self.owns_shared_threshold {
-            self.shared_topk_threshold.clear();
-        }
         Ok(merged)
     }
 }
@@ -509,15 +496,15 @@ mod ivf_e2e_tests {
     use std::sync::Arc;
 
     use super::VectorSimilarityFruit;
-    use crate::collector::sort_key::{SortBySimilarityScore, SortByStaticFastValue};
     use crate::collector::TopDocs;
+    use crate::collector::sort_key::{SortBySimilarityScore, SortByStaticFastValue};
     use crate::index::IndexSettings;
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
-    use crate::schema::{Field, Metric, Schema, VectorDType, VectorOptions, FAST, STORED, STRING};
-    use crate::vector::diagnostics::VectorStorageFormat;
-    use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
+    use crate::schema::{FAST, Field, Metric, STORED, STRING, Schema, VectorDType, VectorOptions};
     use crate::vector::RouterKind;
+    use crate::vector::diagnostics::VectorStorageFormat;
+    use crate::vector::tests::{Grid2DClusterer, TestVectorIndex, exhaustive_params, ground_truth};
     use crate::{DocAddress, Index, Order, Score, TantivyDocument, TantivyError};
 
     /// IVF + exhaustive probing matches the global oracle. Exact ranks
