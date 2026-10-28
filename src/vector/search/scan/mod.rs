@@ -9,9 +9,7 @@ pub(crate) mod heap;
 pub(crate) mod layer_read;
 pub(crate) mod plan;
 
-use std::cell::RefCell;
 use std::ops::Range;
-use std::rc::Rc;
 
 use self::bound::PruningBound;
 use self::columns::{Columns, QuantizedCandidates};
@@ -474,8 +472,8 @@ where
         })
     }
 
-    pub(crate) fn share_exact(&mut self, exact: Rc<RefCell<Vec<f32>>>) {
-        self.exact.bound.share_exact(exact);
+    pub(crate) fn swap_exact(&mut self, exact: &mut Vec<f32>) {
+        std::mem::swap(&mut self.exact.bound.exact, exact);
     }
 
     pub(crate) fn run_cluster(&mut self, rows: &ClusterRows<'_>) -> crate::Result<usize> {
