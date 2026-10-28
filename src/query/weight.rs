@@ -82,6 +82,28 @@ pub trait Weight: Send + Sync + 'static {
     /// See [`Query`](crate::query::Query).
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>>;
 
+    /// Returns an unpositioned scorer for the given segment when the caller will probe it against
+    /// an upstream candidate set of approximately `candidate_size` documents.
+    ///
+    /// Weights whose strategy selection depends on the upstream candidate count (such as
+    /// `TermSetWeight`) override this to pick candidate-probing strategies (e.g. fast-field point
+    /// lookups via `seek_danger`) instead of full-segment bitset construction or an eager scan to
+    /// the first matching document.
+    ///
+    /// Immediately after construction, `scorer.doc()` returns [`TERMINATED`](crate::TERMINATED) if
+    /// the segment is known to have no matches, and `0` (or the first match) otherwise. Callers
+    /// must position the scorer via `seek_danger` (until `Found` is returned) or `seek` before
+    /// relying on `doc()`, `score()`, or `advance()`.
+    fn scorer_for_candidates_unpositioned(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        candidate_size: u32,
+    ) -> crate::Result<Box<dyn Scorer>> {
+        let _ = candidate_size;
+        self.scorer(reader, boost)
+    }
+
     /// Returns a pruning scorer for the given segment.
     ///
     /// `boost` is a multiplier to apply to the score. `init_threshold` is the

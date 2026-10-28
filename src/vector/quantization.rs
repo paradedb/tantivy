@@ -1,12 +1,15 @@
-//! Field-keyed vector quantization settings and row-layout constants.
+//! Field-keyed vector quantization settings, row-layout constants, and the arithmetic of quantized
+//! estimates.
 
 use std::collections::BTreeSet;
 
-use quant_model::build_grid;
+use quant::model::build_grid;
 use serde::{Deserialize, Serialize};
 
 use crate::schema::{FieldType, Metric, Schema, VectorDType, VectorOptions};
 use crate::TantivyError;
+
+// --- Validation ---
 
 /// Validates model values shared by settings and stored segment metadata.
 pub(crate) fn validate_quantization_values<'a>(
@@ -33,35 +36,38 @@ pub(crate) fn validate_quantization_values<'a>(
     Ok(())
 }
 
+// --- Constants ---
+
 /// Settings identifier for the vector quantization format.
-pub const VECTOR_QUANTIZATION_FORMAT_VERSION: u32 = 3;
+pub(crate) const VECTOR_QUANTIZATION_FORMAT_VERSION: u32 = 3;
 /// Maximum number of residual layers stored by the vector format.
-pub const MAX_QUANTIZATION_LAYERS: usize = 3;
-/// Code sections begin at a 64-byte-aligned file offset.
-pub const QUANTIZED_CODE_ALIGNMENT: usize = 64;
+pub(crate) const MAX_QUANTIZATION_LAYERS: usize = 3;
 /// One little-endian binary32 scale per vector row and layer.
-pub const QUANTIZED_SCALE_STRIDE: usize = 4;
+pub(crate) const QUANTIZED_SCALE_STRIDE: usize = 4;
 /// One binary16 cumulative-prefix gamma per vector row and layer.
-pub const QUANTIZED_GAMMA_STRIDE: usize = 2;
+pub(crate) const QUANTIZED_GAMMA_STRIDE: usize = 2;
 /// One binary16 corrected-error ratio per vector row and layer.
-pub const QUANTIZED_ERROR_RATIO_STRIDE: usize = 2;
+pub(crate) const QUANTIZED_ERROR_RATIO_STRIDE: usize = 2;
 /// Combined per-layer sidecar bytes per vector row.
-pub const QUANTIZED_SIDECAR_STRIDE: usize =
+pub(crate) const QUANTIZED_SIDECAR_STRIDE: usize =
     QUANTIZED_SCALE_STRIDE + QUANTIZED_GAMMA_STRIDE + QUANTIZED_ERROR_RATIO_STRIDE;
 /// One binary32 split-form constant per vector row and layer.
-pub const QUANTIZED_CONSTANT_STRIDE: usize = 4;
+pub(crate) const QUANTIZED_CONSTANT_STRIDE: usize = 4;
 /// One binary32 residual squared norm per vector row.
-pub const QUANTIZED_RESIDUAL_NORM_STRIDE: usize = 4;
+pub(crate) const QUANTIZED_RESIDUAL_NORM_STRIDE: usize = 4;
 /// Closed-form uncertainty safety multiplier declared by the scoring policy.
 pub(crate) const GAMMA_ANALYTICAL_SAFETY: f32 = 1.15;
 /// Uniform confidence width at every quantized layer boundary.
 pub(crate) const QUANTIZED_BOUNDARY_KAPPA: f32 = 2.5;
 /// Query-side bits used by every sign-layer estimator.
 pub(crate) const SIGN_QUERY_BITS: u8 = 4;
-/// Normalization applied to fp32 rows before residual encoding and rerank.
+
+// --- Configuration ---
+
+/// Normalization applied to fp32 rows before residual encoding and exact scoring.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum VectorNormPolicy {
+pub(crate) enum VectorNormPolicy {
     /// Preserve input values.
     None,
     /// Normalize vectors to unit L2 norm.
@@ -70,7 +76,7 @@ pub enum VectorNormPolicy {
 
 impl VectorNormPolicy {
     /// Resolves the normalization policy for vector options.
-    pub fn for_options(options: &VectorOptions) -> Self {
+    pub(crate) fn for_options(options: &VectorOptions) -> Self {
         if options.needs_normalization() {
             Self::UnitL2
         } else {
@@ -90,13 +96,13 @@ pub struct VectorQuantizationLayer {
 
 /// Exact-density grid persisted as part of the index configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct VectorQuantizationGrid {
+pub(crate) struct VectorQuantizationGrid {
     /// Code width.
-    pub bits: u8,
+    pub(crate) bits: u8,
     /// Reconstruction points.
-    pub points: Vec<f32>,
+    pub(crate) points: Vec<f32>,
     /// Exact-density normalized RMSE resolved when the grid is materialized.
-    pub rho_model: f64,
+    pub(crate) rho_model: f64,
 }
 
 impl PartialEq for VectorQuantizationGrid {
@@ -126,11 +132,11 @@ pub struct VectorQuantizationConfig {
     /// Distance metric.
     pub metric: Metric,
     /// Vector normalization policy.
-    pub norm_policy: VectorNormPolicy,
+    pub(crate) norm_policy: VectorNormPolicy,
     /// Residual layers in scoring order.
     pub layers: Vec<VectorQuantizationLayer>,
     /// Persisted grids by code width.
-    pub grids: Vec<VectorQuantizationGrid>,
+    pub(crate) grids: Vec<VectorQuantizationGrid>,
 }
 
 impl VectorQuantizationConfig {
@@ -190,6 +196,27 @@ impl VectorQuantizationConfig {
         };
         config.validate(options)?;
         Ok(config)
+    }
+
+    /// Materializes one field's configuration with one layer per entry of `bits`, in scoring
+    /// order, each with a fresh random rotation seed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the dimension, schedule, or generated grids are invalid.
+    pub fn with_random_seeds(
+        field: String,
+        options: &VectorOptions,
+        bits: &[u8],
+    ) -> crate::Result<Self> {
+        let layers = bits
+            .iter()
+            .map(|&bits| VectorQuantizationLayer {
+                bits,
+                seed: fastrand::u64(..),
+            })
+            .collect();
+        Self::materialize(field, options, layers)
     }
 
     /// Validate the persisted configuration against its schema field.
@@ -350,7 +377,7 @@ pub(crate) fn validate_quantization_configs(
 /// # Panics
 ///
 /// Panics when `dim` is zero, `bits` is outside `1..=4`, or multiplication overflows.
-pub fn quantized_code_stride(dim: usize, bits: u8) -> usize {
+pub(crate) fn quantized_code_stride(dim: usize, bits: u8) -> usize {
     assert!(dim > 0);
     assert!((1..=4).contains(&bits));
     dim.checked_mul(usize::from(bits))
@@ -375,9 +402,294 @@ pub(crate) fn quantized_code_tail_is_zero(codes: &[u8], dim: usize, bits: u8) ->
     }
 }
 
+// --- Estimates ---
+
+/// Applies the metric-specific correction to a cumulative quantized estimate.
+#[inline(always)]
+pub(crate) fn corrected_quantized_estimate(
+    metric: Metric,
+    gamma: f32,
+    raw_prefix: f32,
+    base: f32,
+) -> f32 {
+    let metric_factor = if metric == Metric::L2 { 2.0 } else { 1.0 };
+    (metric_factor * gamma).mul_add(raw_prefix, base)
+}
+
+/// Combines the first L2 layer's unscaled kernel output.
+#[inline(always)]
+pub(crate) fn initial_l2_raw_prefix(kernel_score: f32, scale: f32, constant: f32) -> f32 {
+    scale.mul_add(kernel_score, -constant)
+}
+
+/// Combines the first dot-like layer's unscaled kernel output.
+#[inline(always)]
+pub(crate) fn initial_dot_raw_prefix(kernel_score: f32, scale: f32) -> f32 {
+    kernel_score * scale
+}
+
+/// Adds an L2 refinement to the cumulative raw prefix.
+#[inline(always)]
+pub(crate) fn refine_l2_raw_prefix(
+    raw_prefix: f32,
+    kernel_score: f32,
+    scale: f32,
+    constant: f32,
+) -> f32 {
+    scale.mul_add(kernel_score, raw_prefix - constant)
+}
+
+/// Squared rounding error of an L2 raw prefix, in raw-prefix units.
+///
+/// The split operands were rounded independently, so cancellation does not remove their error; a
+/// refinement adds the `previous_prefix - constant` subtraction.
+#[inline(always)]
+pub(crate) fn l2_arithmetic_variance(
+    kernel_score: f32,
+    scale: f32,
+    constant: f32,
+    previous_prefix: Option<f32>,
+) -> f32 {
+    // c = 2: independently rounded split operands, then the fused subtraction.
+    let subtraction = rounding_error(scale * kernel_score, constant, 2.0);
+    // c = 1: the separate `previous_prefix - constant` subtraction.
+    let refinement = previous_prefix.map_or(0.0, |prefix| rounding_error(prefix, constant, 1.0));
+    subtraction * subtraction + refinement * refinement
+}
+
+/// The f32 error of `rounding_count` roundings over operands `a` and `b`: machine epsilon times
+/// the sum of their magnitudes.
+#[inline(always)]
+pub(crate) fn rounding_error(a: f32, b: f32, rounding_count: f32) -> f32 {
+    rounding_count * f32::EPSILON * (a.abs() + b.abs())
+}
+
+/// An estimate's arithmetic rounding error, kept apart from gamma so a refinement can change gamma
+/// without losing or double-scaling the error already in the raw prefix.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ArithmeticError {
+    pub(crate) raw_variance: f32,
+    pub(crate) base_variance: f32,
+}
+
+impl ArithmeticError {
+    /// The error of a cluster's first layer.
+    pub(crate) fn initial(
+        metric: Metric,
+        kernel: f32,
+        scale: f32,
+        constant: f32,
+        cluster_score: f32,
+        residual_norm_sq: f32,
+    ) -> Self {
+        let raw_variance = if metric == Metric::L2 {
+            l2_arithmetic_variance(kernel, scale, constant, None)
+        } else {
+            // c = 1: the initial scale * kernel multiplication.
+            rounding_error(scale * kernel, 0.0, 1.0).powi(2)
+        };
+        let base_variance = if metric == Metric::L2 {
+            // c = 1: cluster_score - residual_norm_sq.
+            rounding_error(cluster_score, residual_norm_sq, 1.0).powi(2)
+        } else {
+            0.0
+        };
+        Self {
+            raw_variance,
+            base_variance,
+        }
+    }
+
+    /// Adds one refining layer's error.
+    pub(crate) fn refine(
+        &mut self,
+        metric: Metric,
+        prefix: f32,
+        kernel: f32,
+        scale: f32,
+        constant: f32,
+    ) {
+        self.raw_variance += if metric == Metric::L2 {
+            l2_arithmetic_variance(kernel, scale, constant, Some(prefix))
+        } else {
+            // c = 2: rounded layer contribution plus the refinement addition.
+            rounding_error(scale * kernel, prefix, 2.0).powi(2)
+        };
+    }
+}
+
+/// Adds a dot-like refinement to the cumulative raw prefix.
+#[inline(always)]
+pub(crate) fn refine_dot_raw_prefix(raw_prefix: f32, kernel_score: f32, scale: f32) -> f32 {
+    scale.mul_add(kernel_score, raw_prefix)
+}
+
+/// Rounding margin on the fused sigma, in units of `f32::EPSILON`. Every variance term is
+/// non-negative, so relative rounding errors accumulate along each term's path with no
+/// cancellation; the longest path is the model term's ten roundings (four in the data
+/// variance, the query-variance addition, the squared model scale, their product, and three
+/// sum additions). The square root halves that relative error and adds one rounding, the pad
+/// multiply adds one more, so the computed sigma sits at most (10/2 + 2) half-ulps below the
+/// exact-arithmetic value of the same expression, and the smallest sufficient integer pad is
+/// k = 4. With it, sigma is at or above that exact value wherever no term underflows f32. A
+/// float-rounding margin, not a fitted constant.
+pub(crate) const SIGMA_FUSED_ROUNDING_K: f32 = 4.0;
+
+/// The statistical width of a corrected estimate: its data and query quantization variance,
+/// scaled by the policy's safety factor, combined in quadrature with its arithmetic rounding
+/// variance, under one square root. The `(1 + kε)` pad keeps the result at or above the
+/// exact-arithmetic value of the expression ([`SIGMA_FUSED_ROUNDING_K`]), so the width never
+/// shrinks and lower endpoints only widen.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quantized_sigma(
+    metric: Metric,
+    dimension: usize,
+    residual_norm_squared: f32,
+    corrected_error_ratio: f32,
+    gamma: f32,
+    score_query_norm_squared: f32,
+    sign_query_error_term: f32,
+    arithmetic: ArithmeticError,
+    prefix: f32,
+    base: f32,
+) -> f32 {
+    debug_assert_ne!(dimension, 0);
+    let data_variance = residual_norm_squared
+        * (1.0 / dimension as f32)
+        * corrected_error_ratio
+        * score_query_norm_squared;
+    let query_variance = gamma * gamma * sign_query_error_term;
+    let (metric_factor, factor) = if metric == Metric::L2 {
+        (2.0, 2.0 * gamma)
+    } else {
+        (1.0, gamma)
+    };
+    let model_scale = metric_factor * GAMMA_ANALYTICAL_SAFETY;
+    // c = 1: the final fused base-plus-corrected-residual expression. This includes cosine's
+    // base-plus-residual sum even if its model width is zero.
+    let final_error = rounding_error(factor * prefix, base, 1.0);
+    let variance = model_scale * model_scale * (data_variance + query_variance)
+        + factor * factor * arithmetic.raw_variance
+        + arithmetic.base_variance
+        + final_error * final_error;
+    (1.0 + SIGMA_FUSED_ROUNDING_K * f32::EPSILON) * variance.sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Splitmix64 for deterministic sweeps without an RNG dependency.
+    fn splitmix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A positive value `mantissa * 2^e` with `e` uniform in `[lo, hi]`.
+    fn magnitude(state: &mut u64, lo: i32, hi: i32) -> f32 {
+        let e = lo + (splitmix(state) % (hi - lo + 1) as u64) as i32;
+        let mantissa = 1.0 + (splitmix(state) >> 40) as f32 / (1u64 << 24) as f32;
+        mantissa * (e as f32).exp2()
+    }
+
+    /// The fused sigma brackets the exact-arithmetic value of its own expression: at or above
+    /// an f64 evaluation from the same f32 inputs, and within `(1 + 2k eps)` of it. Samples
+    /// where a nonzero term sits below `f32::MIN_POSITIVE` are skipped: the bound holds away
+    /// from f32 underflow.
+    #[test]
+    fn fused_sigma_bounds_the_exact_value() {
+        let mut state = 0x5349_474d_4121_u64;
+        let upper = 1.0 + 2.0 * f64::from(SIGMA_FUSED_ROUNDING_K) * f64::from(f32::EPSILON);
+        for sample in 0..2_000_000_u64 {
+            let bits = splitmix(&mut state);
+            let metric = if bits & 1 == 0 {
+                Metric::Dot
+            } else {
+                Metric::L2
+            };
+            let dimension = [64, 768, 1024, 4096][(bits >> 1) as usize % 4];
+            let residual_norm_squared = magnitude(&mut state, -30, 30);
+            let corrected_error_ratio = magnitude(&mut state, -20, 4);
+            let gamma = magnitude(&mut state, -8, 4);
+            let query_norm_squared = magnitude(&mut state, -30, 30);
+            let sign_query_error_term = if bits & 4 == 0 {
+                0.0
+            } else {
+                magnitude(&mut state, -30, 20)
+            };
+            let arithmetic = ArithmeticError {
+                raw_variance: if bits & 8 == 0 {
+                    0.0
+                } else {
+                    magnitude(&mut state, -60, 10)
+                },
+                base_variance: if bits & 16 == 0 {
+                    0.0
+                } else {
+                    magnitude(&mut state, -60, 10)
+                },
+            };
+            let sign = if bits & 32 == 0 { 1.0 } else { -1.0 };
+            let prefix = sign * magnitude(&mut state, -20, 25);
+            let base = -sign * magnitude(&mut state, -20, 25);
+
+            // The same expression in f64, from the f32 inputs and constants.
+            let data_variance = f64::from(residual_norm_squared)
+                * (1.0 / dimension as f64)
+                * f64::from(corrected_error_ratio)
+                * f64::from(query_norm_squared);
+            let query_variance =
+                f64::from(gamma) * f64::from(gamma) * f64::from(sign_query_error_term);
+            let (metric_factor, factor) = if metric == Metric::L2 {
+                (2.0, 2.0 * f64::from(gamma))
+            } else {
+                (1.0, f64::from(gamma))
+            };
+            let model_scale = metric_factor * f64::from(GAMMA_ANALYTICAL_SAFETY);
+            let final_error = f64::from(f32::EPSILON)
+                * ((factor * f64::from(prefix)).abs() + f64::from(base).abs());
+            let terms = [
+                model_scale * model_scale * (data_variance + query_variance),
+                factor * factor * f64::from(arithmetic.raw_variance),
+                f64::from(arithmetic.base_variance),
+                final_error * final_error,
+            ];
+            if terms
+                .iter()
+                .any(|&term| term != 0.0 && term < f64::from(f32::MIN_POSITIVE))
+            {
+                continue;
+            }
+            let exact = terms.iter().sum::<f64>().sqrt();
+            let fused = f64::from(quantized_sigma(
+                metric,
+                dimension,
+                residual_norm_squared,
+                corrected_error_ratio,
+                gamma,
+                query_norm_squared,
+                sign_query_error_term,
+                arithmetic,
+                prefix,
+                base,
+            ));
+            if !exact.is_finite() || !fused.is_finite() {
+                continue;
+            }
+            assert!(
+                fused >= exact,
+                "sample {sample}: fused {fused} below exact {exact}"
+            );
+            assert!(
+                fused <= exact * upper,
+                "sample {sample}: fused {fused} above exact {exact} * (1 + 2k eps)"
+            );
+        }
+    }
 
     fn grid(bits: u8) -> VectorQuantizationGrid {
         let count = 1usize << bits;

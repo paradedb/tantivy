@@ -6,12 +6,15 @@ use crate::collector::{Count, TopDocs};
 use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
 use crate::query::{AllQuery, TermQuery};
-use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, STRING};
-use crate::vector::ivf::AdaptiveProbeParams;
-use crate::vector::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
-    Metric, RouterKind, VectorDType, VectorOptions,
+use crate::schema::{
+    Field, FieldType, IndexRecordOption, Metric, Schema, Term, VectorDType, VectorOptions, STORED,
+    STRING,
 };
+use crate::vector::clustering::{
+    for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
+};
+use crate::vector::params::{LocatedPath, ProbeParams};
+use crate::vector::RouterKind;
 use crate::{DocAddress, Index, Score, TantivyDocument};
 
 const EMBEDDING_FIELD_NAME: &str = "embedding";
@@ -23,7 +26,7 @@ const DOCS_PER_SEGMENT: usize = 10;
 // descriptor enum. Selected via the index settings (clustering threshold +
 // clusterer); the resulting segment is self-describing through its `.vec`
 // `IdMap`, so this is purely a build knob here.
-pub(crate) use crate::vector::VectorStorageFormat;
+pub(crate) use crate::vector::diagnostics::VectorStorageFormat;
 
 pub(crate) struct TestVectorIndex {
     pub(crate) index: Index,
@@ -114,7 +117,7 @@ impl TestVectorIndexBuilder {
             builder = builder.ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: self.centroids.clone(),
             }));
-            builder = builder.ivf_router(self.router)?;
+            builder = builder.ivf_router(self.router);
         }
         builder.create_in_ram()
     }
@@ -188,17 +191,10 @@ impl IvfClusterer for Grid2DClusterer {
         1.0
     }
 
-    fn merge_settings(&self, _total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
-        Ok(IvfMergeSettings {
-            training_sample_ratio: self.training_sample_ratio(),
-            assign_batch_size: self.assign_batch_size(),
-        })
-    }
-
     fn train(
         &self,
         options: &VectorOptions,
-        _vectors: IvfTrainingVectors,
+        _source: &mut dyn VectorSource,
     ) -> crate::Result<IvfCentroids> {
         assert_eq!(options.dim(), grid2d::DIM);
         let num_centroids = self.centroids.len();
@@ -216,18 +212,20 @@ impl IvfClusterer for Grid2DClusterer {
     fn assign(
         &self,
         options: &VectorOptions,
-        vectors: IvfVectors<'_>,
+        source: &mut dyn VectorSource,
         centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>> {
         assert_eq!(options.dim(), grid2d::DIM);
-        let IvfVectors::F32(vectors) = vectors;
         let IvfCentroids::F32(centroids) = centroids;
-        Ok(vectors
-            .matrix
-            .values
-            .chunks_exact(vectors.matrix.dims)
-            .map(|vector| grid2d::nearest_centroid(vector, centroids.values.as_slice()) as u32)
-            .collect())
+        let num_rows = source.num_rows();
+        let mut assignments = Vec::with_capacity(num_rows);
+        for_each_batch(source, num_rows, |IvfTrainingVectors::F32(batch)| {
+            for vector in batch.matrix.values.chunks_exact(batch.matrix.dims) {
+                assignments
+                    .push(grid2d::nearest_centroid(vector, centroids.values.as_slice()) as u32);
+            }
+        })?;
+        Ok(assignments)
     }
 }
 
@@ -290,9 +288,9 @@ fn fixture_uses_selected_storage_format() -> crate::Result<()> {
 fn vector_files_stamp_format_version_header() -> crate::Result<()> {
     use crate::directory::CompositeFile;
     use crate::index::SegmentComponent;
-    use crate::vector::header::{read_centroid_header, read_vector_header, VectorFileVersion};
-    use crate::vector::ivf::CENTROIDS_EXT;
-    use crate::vector::VEC_EXT;
+    use crate::vector::storage::header::{
+        read_centroid_header, read_vector_header, VectorFileVersion, CENTROIDS_EXT, VEC_EXT,
+    };
 
     for format in [VectorStorageFormat::Flat, VectorStorageFormat::Ivf] {
         let index = TestVectorIndex::builder(VectorDType::F32)
@@ -457,7 +455,8 @@ fn flat_top_n_returns_nearest_when_more_than_k_docs_per_segment() -> crate::Resu
         .search(
             &AllQuery,
             &TopDocs::with_limit(top_k)
-                .order_by_similarity(index.embedding_field(), query.to_vec()),
+                .order_by_similarity(index.embedding_field(), query.to_vec())
+                .build(),
         )?
         .results;
     assert_eq!(hits, expected);
@@ -465,30 +464,10 @@ fn flat_top_n_returns_nearest_when_more_than_k_docs_per_segment() -> crate::Resu
 }
 
 #[test]
-fn ivf_clusterer_requires_an_explicit_router() {
-    let mut schema_builder = Schema::builder();
-    schema_builder.add_vector_field(
-        EMBEDDING_FIELD_NAME,
-        VectorOptions::new(grid2d::DIM, Metric::L2),
-    );
-    let error = Index::builder()
-        .schema(schema_builder.build())
-        .ivf_clusterer(Arc::new(Grid2DClusterer {
-            centroids: grid2d::centroids(),
-        }))
-        .create_in_ram()
-        .err()
-        .expect("an IVF clusterer without a router must be rejected");
-    assert!(error
-        .to_string()
-        .contains("requires an explicitly configured Router"));
-}
-
-#[test]
 fn ivf_merge_writes_the_selected_stacked_router() -> crate::Result<()> {
     use crate::directory::CompositeFile;
     use crate::index::SegmentComponent;
-    use crate::vector::ivf::CENTROIDS_EXT;
+    use crate::vector::storage::header::CENTROIDS_EXT;
 
     let centroids = vec![[0.0, 0.0], [6.0, 6.0]];
     let index = TestVectorIndex::builder(VectorDType::F32)
@@ -501,7 +480,8 @@ fn ivf_merge_writes_the_selected_stacked_router() -> crate::Result<()> {
     for segment_reader in searcher.segment_readers() {
         let centroids_file =
             segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
-        let (_version, body) = super::header::read_centroid_header(&centroids_file)?;
+        let (_version, body) =
+            crate::vector::storage::header::read_centroid_header(&centroids_file)?;
         let composite = CompositeFile::open(&body)?;
         let router_bytes = composite
             .open_read_with_idx(index.embedding_field(), 2)
@@ -509,6 +489,136 @@ fn ivf_merge_writes_the_selected_stacked_router() -> crate::Result<()> {
             .read_bytes()?;
         assert_eq!(router_bytes[0], RouterKind::Stacked as u8);
         assert!(router_bytes.len() > 1);
+    }
+    Ok(())
+}
+
+/// With no clusterer or router configured, merges past the threshold write IVF with the default
+/// router, on the created index and after a reopen; an exhaustive search matches the oracle.
+#[test]
+fn default_setup_clusters_past_the_threshold() -> crate::Result<()> {
+    use crate::directory::RamDirectory;
+    use crate::IndexWriter;
+
+    let mut schema_builder = Schema::builder();
+    let field = schema_builder.add_vector_field(
+        EMBEDDING_FIELD_NAME,
+        VectorOptions::new(grid2d::DIM, Metric::L2),
+    );
+    let settings = IndexSettings {
+        vector_clustering_threshold: 64,
+        ..IndexSettings::default()
+    };
+    let directory = RamDirectory::create();
+    let vectors = grid2d::vectors(150);
+    let commit_and_merge = |index: &Index, commits: &[&[[f32; 2]]]| -> crate::Result<()> {
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for commit in commits {
+            for vector in *commit {
+                let mut doc = TantivyDocument::new();
+                doc.add_vector(field, vector);
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+        }
+        writer.merge(&index.searchable_segment_ids()?).wait()?;
+        writer.wait_merging_threads()
+    };
+    let assert_default_ivf = |index: &Index| -> crate::Result<()> {
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let vectors = searcher.segment_reader(0).vector_index(field)?;
+        let ivf = vectors.index().expect("the merge must write IVF");
+        assert_eq!(ivf.router(), RouterKind::default());
+        let query = [4.0_f32, 4.0];
+        let expected = ground_truth::top_k(index, field, Metric::L2, &query, 10)?;
+        let actual = searcher.search(
+            &AllQuery,
+            &TopDocs::with_limit(10)
+                .order_by_similarity(field, query.to_vec())
+                .with_probe_params(exhaustive_params(0))
+                .build(),
+        )?;
+        assert_eq!(actual.results, expected);
+        Ok(())
+    };
+
+    let index = Index::create(directory.clone(), schema_builder.build(), settings)?;
+    commit_and_merge(&index, &[&vectors[..48], &vectors[48..96]])?;
+    assert_default_ivf(&index)?;
+    drop(index);
+
+    let reopened = Index::open(directory)?;
+    commit_and_merge(&reopened, &[&vectors[96..]])?;
+    assert_default_ivf(&reopened)?;
+    assert_eq!(reopened.reader()?.searcher().num_docs(), 150);
+    Ok(())
+}
+
+/// `IndexBuilder::quantize` stores a fresh-seeded configuration at create that a reopen keeps; a
+/// field the settings already quantize, a text field and a vector below 64 dims are errors.
+#[test]
+fn quantize_on_the_builder() -> crate::Result<()> {
+    use crate::directory::RamDirectory;
+    use crate::vector::VectorQuantizationConfig;
+
+    let mut schema_builder = Schema::builder();
+    let options = VectorOptions::new(64, Metric::Cosine);
+    let embedding = schema_builder.add_vector_field(EMBEDDING_FIELD_NAME, options.clone());
+    let small = schema_builder.add_vector_field("small", VectorOptions::new(8, Metric::L2));
+    let label = schema_builder.add_text_field(LABEL_FIELD_NAME, STRING);
+    let schema = schema_builder.build();
+    let builder = |settings: IndexSettings, field: Field| {
+        Index::builder()
+            .schema(schema.clone())
+            .settings(settings)
+            .quantize(field, [1, 1])
+    };
+    let layers = |index: &Index| index.settings().vector_quantization[0].layers.clone();
+
+    let directory = RamDirectory::create();
+    let created = builder(IndexSettings::default(), embedding).create(directory.clone())?;
+    assert_eq!(created.settings().vector_quantization.len(), 1);
+    assert_eq!(
+        layers(&created)
+            .iter()
+            .map(|layer| layer.bits)
+            .collect::<Vec<_>>(),
+        [1, 1]
+    );
+    assert_eq!(layers(&Index::open(directory)?), layers(&created));
+    let other = builder(IndexSettings::default(), embedding).create_in_ram()?;
+    assert_ne!(layers(&other), layers(&created));
+
+    let explicit = IndexSettings {
+        vector_quantization: vec![VectorQuantizationConfig::with_random_seeds(
+            EMBEDDING_FIELD_NAME.to_string(),
+            &options,
+            &[1],
+        )?],
+        ..IndexSettings::default()
+    };
+    for (case, settings, field, message) in [
+        ("already quantized", explicit, embedding, "duplicated"),
+        (
+            "text field",
+            IndexSettings::default(),
+            label,
+            "not a vector field",
+        ),
+        (
+            "below 64 dims",
+            IndexSettings::default(),
+            small,
+            "dimension",
+        ),
+    ] {
+        let error = builder(settings, field)
+            .create_in_ram()
+            .expect_err(case)
+            .to_string();
+        assert!(error.contains(message), "{case}: {error}");
     }
     Ok(())
 }
@@ -594,7 +704,9 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
     writer.commit()?;
 
     let searcher = index.reader()?.searcher();
-    let collector = TopDocs::with_limit(2).order_by_similarity(embedding_field, vec![1.0_f32, 0.0]);
+    let collector = TopDocs::with_limit(2)
+        .order_by_similarity(embedding_field, vec![1.0_f32, 0.0])
+        .build();
     let hits = searcher.search(&AllQuery, &collector)?.results;
     assert_eq!(hits.len(), 2, "zero vector must be ingested and returned");
     assert!(hits[0].0 > 0.0, "non-zero doc must rank first: {hits:?}");
@@ -607,11 +719,20 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
 /// oracle-equality tests, where every cluster the bounds gate cannot
 /// PROVE useless must be probed - provable skips never change the
 /// top-K, so oracle equality still holds under them.
-pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
-    AdaptiveProbeParams {
+pub(crate) fn exhaustive_params(_num_centroids: usize) -> ProbeParams {
+    ProbeParams {
         max_probe_fraction: 1.0,
         min_probe_clusters: 1,
         ..Default::default()
+    }
+}
+
+/// [`exhaustive_params`] on the routed path, with no cluster scored exactly before the exact phase.
+pub(crate) fn routed_exhaustive_params(num_centroids: usize) -> ProbeParams {
+    ProbeParams {
+        exact_plan: false,
+        located: LocatedPath::Off,
+        ..exhaustive_params(num_centroids)
     }
 }
 
@@ -619,8 +740,8 @@ pub(crate) mod ground_truth {
     use std::cmp::Ordering;
     use std::sync::Arc;
 
-    use crate::schema::Field;
-    use crate::vector::{Metric, PreparedQuery};
+    use crate::schema::{Field, Metric};
+    use crate::vector::search::prepared::VectorQuery;
     use crate::{DocAddress, Index, Score};
 
     pub(crate) fn top_k(
@@ -630,7 +751,7 @@ pub(crate) mod ground_truth {
         query: &[f32],
         top_k: usize,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
-        let query = PreparedQuery::<f32>::new(metric, Arc::new(query.to_vec()));
+        let query = VectorQuery::<f32>::new(metric, Arc::new(query.to_vec()));
         let searcher = index.reader()?.searcher();
         let mut scored = Vec::new();
         for (seg_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
@@ -644,7 +765,7 @@ pub(crate) mod ground_truth {
                 }
                 if let Some(bytes) = vec_reader.vector_bytes(doc)? {
                     scored.push((
-                        query.score_doc_bytes(&bytes),
+                        query.score_row(&bytes).score(),
                         DocAddress::new(seg_ord as u32, doc),
                     ));
                 }
@@ -855,13 +976,17 @@ mod bounds_storage_tests {
     use crate::index::{IndexSettings, SegmentComponent};
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
-    use crate::schema::{Schema, STORED, STRING};
-    use crate::vector::ivf::{IvfIndex, CENTROIDS_EXT};
-    use crate::vector::{
-        residual_norm, BoundKind, InMemoryStackedIvf, IvfCentroids, IvfClusterer, IvfConfig,
-        IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors, Metric, RouterKind,
-        RoutingParams, VectorDType, VectorOptions, VectorStorageFormat,
+    use crate::schema::{Metric, Schema, VectorDType, VectorOptions, STORED, STRING};
+    use crate::vector::clustering::{
+        for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
     };
+    use crate::vector::diagnostics::VectorStorageFormat;
+    use crate::vector::router::stacked::levels::{InMemoryStore, StackedIvf, StackedIvfConfig};
+    use crate::vector::router::RoutingParams;
+    use crate::vector::storage::bounds::{residual_norm, BoundKind};
+    use crate::vector::storage::centroids::ClusterIndex;
+    use crate::vector::storage::header::CENTROIDS_EXT;
+    use crate::vector::RouterKind;
     use crate::{Index, IndexWriter, TantivyDocument};
 
     /// Recompute one segment's expected fold from its stored artifacts:
@@ -869,7 +994,7 @@ mod bounds_storage_tests {
     /// the stored centroid.
     fn fresh_fold(
         vec_reader: &crate::vector::VectorIndexReader,
-        ivf: &IvfIndex,
+        ivf: &ClusterIndex,
         dim: usize,
         metric: Metric,
     ) -> crate::Result<Vec<f32>> {
@@ -954,16 +1079,10 @@ mod bounds_storage_tests {
         fn training_sample_ratio(&self) -> f32 {
             1.0
         }
-        fn merge_settings(&self, _total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
-            Ok(IvfMergeSettings {
-                training_sample_ratio: self.training_sample_ratio(),
-                assign_batch_size: self.assign_batch_size(),
-            })
-        }
         fn train(
             &self,
             options: &VectorOptions,
-            vectors: IvfTrainingVectors,
+            source: &mut dyn VectorSource,
         ) -> crate::Result<IvfCentroids> {
             assert_eq!(options.dim(), 2);
             let num_centroids = self.num_centroids;
@@ -974,8 +1093,9 @@ mod bounds_storage_tests {
                     .flat_map(|centroid| centroid.iter().copied())
                     .collect(),
                 None => {
-                    let IvfTrainingVectors::F32(batch) = vectors;
-                    batch.matrix.values[..num_centroids * 2].to_vec()
+                    let rows: Vec<u32> = (0..num_centroids as u32).collect();
+                    let IvfTrainingVectors::F32(batch) = source.read_rows(&rows)?;
+                    batch.matrix.values
                 }
             };
             Ok(IvfCentroids::F32(IvfMatrix {
@@ -987,17 +1107,15 @@ mod bounds_storage_tests {
         fn assign(
             &self,
             options: &VectorOptions,
-            vectors: IvfVectors<'_>,
+            source: &mut dyn VectorSource,
             centroids: &IvfCentroids,
         ) -> crate::Result<Vec<u32>> {
             assert_eq!(options.dim(), 2);
-            let IvfVectors::F32(vectors) = vectors;
             let IvfCentroids::F32(centroids) = centroids;
-            Ok(vectors
-                .matrix
-                .values
-                .chunks_exact(2)
-                .map(|vector| {
+            let num_rows = source.num_rows();
+            let mut assignments = Vec::with_capacity(num_rows);
+            for_each_batch(source, num_rows, |IvfTrainingVectors::F32(batch)| {
+                for vector in batch.matrix.values.chunks_exact(2) {
                     let mut best = 0u32;
                     let mut best_d2 = f32::INFINITY;
                     for (i, centroid) in centroids.values.chunks_exact(2).enumerate() {
@@ -1009,9 +1127,10 @@ mod bounds_storage_tests {
                             best_d2 = d2;
                         }
                     }
-                    best
-                })
-                .collect())
+                    assignments.push(best);
+                }
+            })?;
+            Ok(assignments)
         }
     }
 
@@ -1039,7 +1158,7 @@ mod bounds_storage_tests {
             .schema(schema)
             .settings(settings)
             .ivf_clusterer(Arc::new(clusterer))
-            .ivf_router(RouterKind::Stacked)?;
+            .ivf_router(RouterKind::Stacked);
         let index = match directory {
             Some(directory) => builder.open_or_create(directory)?,
             None => builder.create_in_ram()?,
@@ -1204,9 +1323,8 @@ mod bounds_storage_tests {
         Ok(())
     }
 
-    /// Segments open under the router persisted in their `.centroids` file:
-    /// no configured router is needed to read them, and a different
-    /// configured router only applies to segments merged afterwards.
+    /// Segments open under the router persisted in their `.centroids` file; a different router
+    /// set on the index applies only to segments merged afterwards.
     #[test]
     fn opening_ivf_uses_the_persisted_router() -> crate::Result<()> {
         let clusterer = || TestClusterer {
@@ -1234,7 +1352,7 @@ mod bounds_storage_tests {
         drop(reopened);
 
         let mut reopened = Index::open(directory)?;
-        reopened.set_ivf_router(RouterKind::Rng)?;
+        reopened.set_ivf_router(RouterKind::Exact);
         reopened.set_ivf_clusterer(Arc::new(clusterer()));
         let routers = |index: &Index| -> crate::Result<Vec<RouterKind>> {
             let searcher = index.reader()?.searcher();
@@ -1260,33 +1378,9 @@ mod bounds_storage_tests {
         drop(writer);
         merge_all(&reopened)?;
 
-        assert_eq!(routers(&reopened)?, vec![RouterKind::Rng]);
+        assert_eq!(routers(&reopened)?, vec![RouterKind::Exact]);
         let searcher = reopened.reader()?.searcher();
         assert_eq!(searcher.num_docs(), 6);
-        Ok(())
-    }
-
-    #[test]
-    fn configured_router_cannot_be_changed() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        schema_builder.add_vector_field(EMBEDDING_FIELD_NAME, VectorOptions::new(2, Metric::L2));
-        let settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..IndexSettings::default()
-        };
-        let mut index = Index::builder()
-            .schema(schema_builder.build())
-            .settings(settings)
-            .ivf_clusterer(Arc::new(TestClusterer {
-                fixed_centroids: Some(vec![[0.0, 0.0], [10.0, 10.0]]),
-                num_centroids: 2,
-            }))
-            .ivf_router(RouterKind::Rng)?
-            .create_in_ram()?;
-        let error = index
-            .set_ivf_router(RouterKind::Stacked)
-            .expect_err("an Index must use one router");
-        assert!(error.to_string().contains("already configured as rng"));
         Ok(())
     }
 
@@ -1297,7 +1391,7 @@ mod bounds_storage_tests {
     /// staying exact.
     #[test]
     fn ivf_merge_writes_stacked_slot_at_v3() -> crate::Result<()> {
-        use crate::vector::header::{read_centroid_header, VectorFileVersion};
+        use crate::vector::storage::header::{read_centroid_header, VectorFileVersion};
 
         // 8 fixed centroids on a line; two tight docs per centroid split
         // across two commits.
@@ -1341,11 +1435,11 @@ mod bounds_storage_tests {
             .collect();
         assert_eq!(stacked_bytes[0], RouterKind::Stacked as u8);
         let payload_offset = 1;
-        let stacked = InMemoryStackedIvf::deserialize_owned(
+        let stacked = StackedIvf::<InMemoryStore>::deserialize_owned(
             &stacked_bytes[payload_offset..],
             stored_rows.clone(),
             2,
-            IvfConfig::default(),
+            StackedIvfConfig::default(),
         )
         .expect("slot [2] must parse as a stacked router");
         assert_eq!(stacked.vectors.len(), centroids.len());
@@ -1362,17 +1456,16 @@ mod bounds_storage_tests {
 
         // The reader's lazy router and the owned parse agree, query by
         // query — the FileSlice path scores the same rows.
-        let mut workspace = crate::vector::router::RouterWorkspace::default();
         for c in &centroids {
             let query = [c[0] + 0.3, 0.2];
             let owned: Vec<_> = stacked
-                .search(&query, 2, 1.0, Metric::L2)
+                .search(&query, 2, Metric::L2)
                 .0
                 .into_iter()
                 .take(2)
                 .collect();
             let lazy: Vec<_> = ivf
-                .rank_clusters(&mut workspace, &query, RoutingParams::default())
+                .rank_clusters(&query, RoutingParams::default())
                 .take(2)
                 .collect();
             assert_eq!(owned.len(), lazy.len());
@@ -1397,7 +1490,9 @@ mod bounds_storage_tests {
             let hits = searcher
                 .search(
                     &AllQuery,
-                    &TopDocs::with_limit(1).order_by_similarity(field, query),
+                    &TopDocs::with_limit(1)
+                        .order_by_similarity(field, query)
+                        .build(),
                 )?
                 .results;
             assert_eq!(hits.len(), 1);
@@ -1417,7 +1512,7 @@ mod bounds_storage_tests {
 // Both flat write paths preserve rows across the stored uniform-group boundary.
 #[test]
 fn flat_uniform_boundary_survives_merge_and_sparse_presence() -> crate::Result<()> {
-    let r = super::metadata::FLAT_ROWS_PER_BLOCK as usize;
+    let r = crate::vector::storage::metadata::FLAT_ROWS_PER_BLOCK as usize;
     let mut schema = Schema::builder();
     let dense = schema.add_vector_field("dense", VectorOptions::new(1, Metric::L2));
     let sparse = schema.add_vector_field("sparse", VectorOptions::new(1, Metric::L2));
@@ -1497,7 +1592,9 @@ fn unsupported_vector_versions_remain_typed_on_open_and_merge() -> crate::Result
             writer.commit()?;
         }
         let segment = index.searchable_segments()?.remove(0);
-        let path = segment.relative_path(SegmentComponent::Custom(super::VEC_EXT.into()));
+        let path = segment.relative_path(SegmentComponent::Custom(
+            crate::vector::storage::header::VEC_EXT.into(),
+        ));
         let mut bytes = directory.atomic_read(&path)?;
         bytes[..4].copy_from_slice(&version.to_le_bytes());
         directory.atomic_write(&path, &bytes)?;
@@ -1549,21 +1646,24 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
     writer.add_document(doc)?;
     writer.commit()?;
     let segment = index.searchable_segments()?.remove(0);
-    let vec_path = segment.relative_path(SegmentComponent::Custom(super::VEC_EXT.into()));
+    let vec_path = segment.relative_path(SegmentComponent::Custom(
+        crate::vector::storage::header::VEC_EXT.into(),
+    ));
     let mut bytes = directory.atomic_read(&vec_path)?;
     let mut centroids = 2u32.to_le_bytes().to_vec();
     let mut composite = CompositeWrite::wrap(&mut centroids);
     for slot in [
-        super::header::CentroidSlot::Centroids,
-        super::header::CentroidSlot::Offsets,
+        crate::vector::storage::header::CentroidSlot::Centroids,
+        crate::vector::storage::header::CentroidSlot::Offsets,
     ] {
         composite
             .for_field_with_idx(field, slot.index())
             .write_all(&[0; 8])?;
     }
     composite.close()?;
-    let mut centroid_file =
-        segment.open_write(SegmentComponent::Custom(super::ivf::CENTROIDS_EXT.into()))?;
+    let mut centroid_file = segment.open_write(SegmentComponent::Custom(
+        crate::vector::storage::header::CENTROIDS_EXT.into(),
+    ))?;
     centroid_file.write_all(&centroids)?;
     centroid_file.terminate()?;
     for version in [2u32, 3, 4] {
@@ -1596,6 +1696,65 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
                 "{error:?}"
             );
         }
+    }
+    Ok(())
+}
+
+/// A `.centroids` router slot holding the graph router's code 0 fails format validation as an
+/// incompatible index.
+#[test]
+fn graph_router_segments_fail_format_validation() -> crate::Result<()> {
+    use std::io::Write;
+
+    use common::TerminatingWrite;
+
+    use crate::directory::error::Incompatibility;
+    use crate::directory::{CompositeWrite, RamDirectory};
+    use crate::index::SegmentComponent;
+
+    let mut schema = Schema::builder();
+    let field = schema.add_vector_field("v", VectorOptions::new(2, Metric::L2));
+    let index = Index::create(
+        RamDirectory::create(),
+        schema.build(),
+        IndexSettings::default(),
+    )?;
+    let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+    let mut doc = TantivyDocument::new();
+    doc.add_vector(field, &[1.0, 0.0]);
+    writer.add_document(doc)?;
+    writer.commit()?;
+    let segment = index.searchable_segments()?.remove(0);
+    let mut centroids = 3u32.to_le_bytes().to_vec();
+    let mut composite = CompositeWrite::wrap(&mut centroids);
+    composite
+        .for_field_with_idx(
+            field,
+            crate::vector::storage::header::CentroidSlot::Router.index(),
+        )
+        .write_all(&[0, 1, 2])?;
+    composite.close()?;
+    let mut file = segment.open_write(SegmentComponent::Custom(
+        crate::vector::storage::header::CENTROIDS_EXT.into(),
+    ))?;
+    file.write_all(&centroids)?;
+    file.terminate()?;
+
+    let reader = crate::SegmentReader::open(&segment)?;
+    for error in [
+        segment.validate_vector_format().unwrap_err(),
+        reader.validate_vector_format().unwrap_err(),
+    ] {
+        assert!(
+            matches!(
+                error,
+                crate::TantivyError::IncompatibleIndex(Incompatibility::VectorRouterMismatch {
+                    kind: 0
+                })
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("rebuild required"), "{error}");
     }
     Ok(())
 }

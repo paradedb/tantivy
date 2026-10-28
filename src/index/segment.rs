@@ -81,11 +81,12 @@ impl Segment {
         self.index.directory().open_read(&path)
     }
 
-    /// Checks the vector format header without opening other components or vector readers.
-    /// Segments without a vector file are accepted.
+    /// Checks the vector format header and each vector field's IVF router kind, without opening
+    /// vector readers. Segments without vector files are accepted.
     pub fn validate_vector_format(&self) -> crate::Result<()> {
-        crate::vector::header::check_vector_format(
-            self.open_read(SegmentComponent::Custom(crate::vector::VEC_EXT.to_string())),
+        crate::vector::storage::header::check_vector_format(
+            |component| self.open_read(component),
+            &self.schema(),
         )
     }
 

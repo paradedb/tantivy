@@ -1,39 +1,45 @@
+//! Cluster routing: the router kinds an IVF segment persists, built at merge and opened per
+//! segment to rank its clusters for a query.
+
 use std::fmt;
 use std::io::{self, Write};
 
 use common::{BinarySerializable, HasLen};
 
-use super::ivf::graph::{
-    Candidate, NeighborhoodGraphSearchMetrics, RelativeNeighborhoodGraph, ResumableSearchIterator,
-    Workspace,
-};
-use super::ivf::{InMemoryStore, IvfCentroids, LazyStore, MultiLevelIvf, RecallEstimator};
+use crate::directory::error::Incompatibility;
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
-use crate::vector::header::VectorFileVersion;
+use crate::vector::clustering::IvfCentroids;
+use crate::vector::router::candidate::Candidate;
+use crate::vector::router::stacked::levels::{InMemoryStore, LazyStore, StackedIvf};
+use crate::TantivyError;
 
+pub(crate) mod arena;
+pub(crate) mod candidate;
 mod exact;
-mod rng;
-mod stacked;
+pub(crate) mod stacked;
 
-/// The routing structure used for every IVF segment in an index.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The routing structure new IVF segments build. Codes are persisted; 0 belonged to the removed
+/// graph router and is never reused.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RouterKind {
-    Rng = 0,
+    /// A stacked IVF over the centroids.
+    #[default]
     Stacked = 1,
+    /// Scores every centroid against the query.
     Exact = 2,
 }
 
 impl RouterKind {
-    fn from_code(code: u8) -> io::Result<Self> {
+    /// The kind persisted as `code`. A code this library doesn't build is an incompatible index
+    /// (rebuild required), not corruption.
+    pub(crate) fn from_code(code: u8) -> crate::Result<Self> {
         match code {
-            0 => Ok(Self::Rng),
             1 => Ok(Self::Stacked),
             2 => Ok(Self::Exact),
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown router kind: {other}"),
+            kind => Err(TantivyError::IncompatibleIndex(
+                Incompatibility::VectorRouterMismatch { kind },
             )),
         }
     }
@@ -44,7 +50,6 @@ impl RouterKind {
         centroids: &mut IvfCentroids,
     ) -> crate::Result<BuiltRouter> {
         match self {
-            Self::Rng => Ok(Router::Rng(rng::build(options, centroids)?)),
             Self::Stacked => Ok(Router::Stacked(stacked::build(options, centroids)?)),
             Self::Exact => Ok(Router::Exact(exact::build(options, centroids))),
         }
@@ -54,18 +59,10 @@ impl RouterKind {
     /// with. The configured router only decides what new segments build, so
     /// an index may hold segments routed by different kinds.
     pub(crate) fn open(
-        file_version: VectorFileVersion,
         slot: FileSlice,
         centroids: FileSlice,
         options: &VectorOptions,
     ) -> crate::Result<OpenedRouter> {
-        if file_version != VectorFileVersion::V3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("routers require vector file version V3, found {file_version:?}"),
-            )
-            .into());
-        }
         if slot.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -76,7 +73,6 @@ impl RouterKind {
         let persisted = Self::from_code(slot.read_byte(0)?)?;
         let payload = slot.slice_from(1);
         match persisted {
-            Self::Rng => Ok(Router::Rng(rng::open(payload, centroids, options)?)),
             Self::Stacked => Ok(Router::Stacked(stacked::open(payload, centroids, options)?)),
             Self::Exact => Ok(Router::Exact(exact::open(payload, centroids, options)?)),
         }
@@ -86,16 +82,14 @@ impl RouterKind {
 impl fmt::Display for RouterKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::Rng => "rng",
             Self::Stacked => "stacked",
             Self::Exact => "exact",
         })
     }
 }
 
-pub(crate) enum Router<S: super::VectorArena<Elem = f32>> {
-    Rng(RelativeNeighborhoodGraph<S>),
-    Stacked(MultiLevelIvf<S, S>),
+pub(crate) enum Router<S: crate::vector::router::arena::VectorArena<Elem = f32>> {
+    Stacked(StackedIvf<S>),
     Exact(exact::ExactRouter<S>),
 }
 
@@ -105,7 +99,6 @@ pub(crate) type OpenedRouter = Router<LazyStore>;
 impl BuiltRouter {
     pub(crate) fn kind(&self) -> RouterKind {
         match self {
-            Self::Rng(_) => RouterKind::Rng,
             Self::Stacked(_) => RouterKind::Stacked,
             Self::Exact(_) => RouterKind::Exact,
         }
@@ -114,56 +107,40 @@ impl BuiltRouter {
     pub(crate) fn serialize<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
         (self.kind() as u8).serialize(out)?;
         match self {
-            Self::Rng(router) => router.serialize(out),
             Self::Stacked(router) => router.serialize_router_payload(out),
             Self::Exact(router) => router.serialize_payload(out),
         }
     }
 }
 
-#[derive(Default)]
-pub(crate) struct RouterWorkspace {
-    rng: Workspace,
-}
-
-/// Per-query routing knobs. Only the stacked router reads them; the RNG
-/// and exact routers rank the same way regardless.
+/// Per-query routing knobs. Only the stacked router reads them; the exact router ranks the same
+/// way regardless.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RoutingParams {
-    /// Clusters the caller expects to probe. The stacked router ranks at
-    /// least this many members when APS is on; with APS off it ranks every
-    /// member of the lists its nprobe fraction selects.
-    pub k: usize,
-    /// Stacked-router recall target in `(0, 1]`. `1.0` disables APS and
-    /// routes with the fixed nprobe fractions. APS is also disabled above
-    /// [`APS_MAX_DIM`](crate::vector::ivf::APS_MAX_DIM) regardless of this
-    /// value.
-    pub recall: f32,
+pub(crate) struct RoutingParams {
+    /// Clusters the caller expects to probe. The stacked router opens
+    /// enough lists to feed a size-`k` member heap via
+    /// [`StackedIvf::lists_to_open`](crate::vector::router::stacked::levels::StackedIvf::lists_to_open).
+    pub(crate) k: usize,
 }
 
 impl Default for RoutingParams {
     fn default() -> Self {
-        Self {
-            k: usize::MAX,
-            recall: 1.0,
-        }
+        Self { k: usize::MAX }
     }
 }
 
-pub(crate) enum RouterIter<'router, 'workspace> {
+pub(crate) enum RouterIter {
     #[cfg(test)]
     Explicit(std::vec::IntoIter<Candidate>),
-    Rng(ResumableSearchIterator<'router, 'workspace, LazyStore>),
     Stacked(stacked::Ranking),
     Exact(exact::Ranking),
 }
 
-impl RouterIter<'_, '_> {
+impl RouterIter {
     pub(crate) fn metrics(&self) -> RouterMetrics {
         match self {
             #[cfg(test)]
             Self::Explicit(_) => RouterMetrics::Exact { visited_count: 0 },
-            Self::Rng(ranking) => RouterMetrics::Rng(ranking.metrics()),
             Self::Stacked(ranking) => ranking.metrics(),
             Self::Exact(ranking) => RouterMetrics::Exact {
                 visited_count: ranking.visited_count(),
@@ -172,14 +149,13 @@ impl RouterIter<'_, '_> {
     }
 }
 
-impl Iterator for RouterIter<'_, '_> {
+impl Iterator for RouterIter {
     type Item = Candidate;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             #[cfg(test)]
             Self::Explicit(ranking) => ranking.next(),
-            Self::Rng(ranking) => ranking.next(),
             Self::Stacked(ranking) => ranking.next(),
             Self::Exact(ranking) => ranking.next(),
         }
@@ -189,43 +165,34 @@ impl Iterator for RouterIter<'_, '_> {
 impl OpenedRouter {
     pub(crate) fn kind(&self) -> RouterKind {
         match self {
-            Self::Rng(_) => RouterKind::Rng,
             Self::Stacked(_) => RouterKind::Stacked,
             Self::Exact(_) => RouterKind::Exact,
         }
     }
 
-    pub(crate) fn rank<'router, 'workspace>(
-        &'router self,
-        workspace: &'workspace mut RouterWorkspace,
-        query: &'router [f32],
-        metric: Metric,
-        params: RoutingParams,
-    ) -> RouterIter<'router, 'workspace> {
+    /// Centroids at each router level, bottom (the level whose members are the segment's
+    /// centroids) to top. The exact router has no levels.
+    pub(crate) fn level_sizes(&self) -> Vec<usize> {
         match self {
-            Self::Rng(router) => RouterIter::Rng(rng::rank(router, &mut workspace.rng, query)),
+            Self::Stacked(router) => {
+                let mut sizes = Vec::new();
+                let mut level = Some(router);
+                while let Some(current) = level {
+                    sizes.push(current.nlist());
+                    level = current.parent.as_deref();
+                }
+                sizes
+            }
+            Self::Exact(_) => Vec::new(),
+        }
+    }
+
+    pub(crate) fn rank(&self, query: &[f32], metric: Metric, params: RoutingParams) -> RouterIter {
+        match self {
             Self::Stacked(router) => {
                 RouterIter::Stacked(stacked::rank(router, query, metric, params))
             }
             Self::Exact(router) => RouterIter::Exact(router.rank(query)),
-        }
-    }
-
-    /// The APS estimator for the segment's own cluster scan over
-    /// `ranking`, which must not have been pulled yet. Only the stacked
-    /// router supports APS; `None` otherwise, or when APS is off.
-    pub(crate) fn recall_estimator(
-        &self,
-        ranking: &RouterIter<'_, '_>,
-        query: &[f32],
-        metric: Metric,
-        recall: f32,
-    ) -> Option<RecallEstimator<'_>> {
-        match (self, ranking) {
-            (Self::Stacked(router), RouterIter::Stacked(ranking)) => {
-                stacked::recall_estimator(router, ranking, query, metric, recall)
-            }
-            _ => None,
         }
     }
 }
@@ -234,7 +201,7 @@ impl OpenedRouter {
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RouterMetrics {
-    Rng(NeighborhoodGraphSearchMetrics),
+    /// The stacked router's work.
     Stacked {
         /// Ranked centroids handed to the probe loop.
         candidate_count: usize,
@@ -242,11 +209,10 @@ pub enum RouterMetrics {
         lists_scanned: usize,
         /// Similarity computations spent routing, summed over every level.
         members_scored: usize,
-        /// Recall target the bottom router level actually used; `1.0`
-        /// means the fixed nprobe path (requested, or forced by dimension).
-        recall_target: f32,
     },
+    /// The exact router's work.
     Exact {
+        /// Centroids scored.
         visited_count: usize,
     },
 }
@@ -270,7 +236,7 @@ pub(crate) fn with_test_clusters<T>(clusters: Vec<Candidate>, scan: impl FnOnce(
 }
 
 #[cfg(test)]
-pub(crate) fn test_clusters() -> Option<RouterIter<'static, 'static>> {
+pub(crate) fn test_clusters() -> Option<RouterIter> {
     TEST_CLUSTERS.with(|slot| {
         slot.borrow()
             .clone()
@@ -281,7 +247,7 @@ pub(crate) fn test_clusters() -> Option<RouterIter<'static, 'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vector::IvfMatrix;
+    use crate::vector::clustering::IvfMatrix;
 
     fn centroids() -> IvfCentroids {
         IvfCentroids::F32(IvfMatrix {
@@ -305,60 +271,13 @@ mod tests {
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<_>>(),
         };
-        let opened = RouterKind::open(
-            VectorFileVersion::V3,
-            FileSlice::from(bytes),
-            FileSlice::from(rows),
-            &options,
-        )?;
-        let mut workspace = RouterWorkspace::default();
-        let mut ranking = opened.rank(&mut workspace, &[1.1], Metric::L2, RoutingParams::default());
+        let opened = RouterKind::open(FileSlice::from(bytes), FileSlice::from(rows), &options)?;
+        let mut ranking = opened.rank(&[1.1], Metric::L2, RoutingParams::default());
         assert_eq!(ranking.next().unwrap().node, 1);
         assert!(matches!(
             ranking.metrics(),
             RouterMetrics::Exact { visited_count: 3 }
         ));
-        Ok(())
-    }
-
-    #[test]
-    fn rng_ranking_reuses_workspace_and_reports_graph_metrics() -> crate::Result<()> {
-        let options = VectorOptions::new(1, Metric::L2);
-        let mut centroids = centroids();
-        let built = RouterKind::Rng.build(&options, &mut centroids)?;
-        let mut bytes = Vec::new();
-        built.serialize(&mut bytes)?;
-        assert_eq!(bytes[0], RouterKind::Rng as u8);
-        let rows = match centroids {
-            IvfCentroids::F32(matrix) => matrix
-                .values
-                .into_iter()
-                .flat_map(f32::to_le_bytes)
-                .collect::<Vec<_>>(),
-        };
-        let opened = RouterKind::open(
-            VectorFileVersion::V3,
-            FileSlice::from(bytes),
-            FileSlice::from(rows),
-            &options,
-        )?;
-        let mut workspace = RouterWorkspace::default();
-        for query in [[0.1], [1.9]] {
-            let mut ranking =
-                opened.rank(&mut workspace, &query, Metric::L2, RoutingParams::default());
-            assert!(ranking.next().is_some());
-            let metrics = ranking.metrics();
-            match metrics {
-                RouterMetrics::Rng(metrics) => {
-                    assert!(metrics.visited_count > 0);
-                    assert_eq!(metrics.result_count, 1);
-                }
-                metrics => panic!("expected RNG metrics, got {metrics:?}"),
-            }
-            let json = serde_json::to_value(metrics).unwrap();
-            assert_eq!(json["kind"], "rng");
-            assert!(json["visited_count"].as_u64().unwrap() > 0);
-        }
         Ok(())
     }
 
@@ -393,42 +312,28 @@ mod tests {
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<_>>(),
         };
-        RouterKind::open(
-            VectorFileVersion::V3,
-            FileSlice::from(bytes),
-            FileSlice::from(rows),
-            &options,
-        )
+        RouterKind::open(FileSlice::from(bytes), FileSlice::from(rows), &options)
     }
 
-    fn stacked_metrics(metrics: RouterMetrics) -> (usize, usize, usize, f32) {
+    fn stacked_metrics(metrics: RouterMetrics) -> (usize, usize, usize) {
         match metrics {
             RouterMetrics::Stacked {
                 candidate_count,
                 lists_scanned,
                 members_scored,
-                recall_target,
-            } => (
-                candidate_count,
-                lists_scanned,
-                members_scored,
-                recall_target,
-            ),
+            } => (candidate_count, lists_scanned, members_scored),
             other => panic!("expected stacked metrics, got {other:?}"),
         }
     }
 
-    /// Up to `APS_MAX_DIM` the requested recall target is honoured and the
-    /// ranking is bounded by `k`; the metrics report the router's work.
+    /// Ranking is capped at `k`; metrics report the router's list work.
     #[test]
-    fn stacked_ranking_uses_requested_recall_within_dim_cap() -> crate::Result<()> {
+    fn stacked_ranking_honors_k() -> crate::Result<()> {
         let opened = open_stacked(2, 64)?;
-        let mut workspace = RouterWorkspace::default();
         let query = vec![0.0f32; 2];
-        let params = RoutingParams { k: 8, recall: 0.5 };
-        let ranking = opened.rank(&mut workspace, &query, Metric::L2, params);
-        let (candidates, lists, scored, recall) = stacked_metrics(ranking.metrics());
-        assert_eq!(recall, 0.5);
+        let params = RoutingParams { k: 8 };
+        let ranking = opened.rank(&query, Metric::L2, params);
+        let (candidates, lists, scored) = stacked_metrics(ranking.metrics());
         assert!(candidates >= 1 && candidates <= 8, "{candidates}");
         assert!(lists >= 1);
         assert!(scored >= candidates);
@@ -438,100 +343,40 @@ mod tests {
         Ok(())
     }
 
-    /// Above `APS_MAX_DIM` the recall target is forced to `1.0` (fixed
-    /// nprobe list selection), but the returned set is still capped at `k`
-    /// so the caller's probe budget limits `candidate_count`.
+    /// Codes 1 and 2 open as the stacked and exact routers; any other code, the graph router's 0
+    /// included, is an incompatible index.
     #[test]
-    fn stacked_ranking_falls_back_to_nprobe_above_dim_cap() -> crate::Result<()> {
-        let dim = crate::vector::ivf::APS_MAX_DIM + 1;
-        let opened = open_stacked(dim, 32)?;
-        let mut workspace = RouterWorkspace::default();
-        let query = vec![0.0f32; dim];
-        let params = RoutingParams { k: 2, recall: 0.5 };
-        let ranking = opened.rank(&mut workspace, &query, Metric::L2, params);
-        let (candidates, lists, scored, recall) = stacked_metrics(ranking.metrics());
-        assert_eq!(recall, 1.0, "dimension cap must force the nprobe path");
-        assert!(
-            candidates <= 2,
-            "returned set must honor params.k, got {candidates}"
-        );
-        assert!(lists >= 1, "nprobe path must still open parent lists");
-        assert!(
-            scored >= candidates,
-            "all members of selected lists are scored into the k-heap ({scored} < {candidates})"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn effective_recall_guards() {
-        assert_eq!(stacked::effective_recall(2, Metric::L2, 0.9), 0.9);
-        assert_eq!(stacked::effective_recall(2, Metric::Cosine, 0.9), 0.9);
-        assert_eq!(stacked::effective_recall(2, Metric::Dot, 0.9), 1.0);
-        assert_eq!(stacked::effective_recall(2, Metric::L2, 1.0), 1.0);
-        assert_eq!(stacked::effective_recall(2, Metric::L2, 1.5), 1.0);
-        assert_eq!(stacked::effective_recall(2, Metric::L2, f32::NAN), 1.0);
-        assert_eq!(
-            stacked::effective_recall(crate::vector::ivf::APS_MAX_DIM, Metric::L2, 0.9),
-            0.9
-        );
-        assert_eq!(
-            stacked::effective_recall(crate::vector::ivf::APS_MAX_DIM + 1, Metric::L2, 0.9),
-            1.0
-        );
-    }
-
-    #[test]
-    fn open_uses_the_persisted_router_kind() -> crate::Result<()> {
+    fn router_kind_codes() -> crate::Result<()> {
         let options = VectorOptions::new(1, Metric::L2);
-        for kind in [RouterKind::Rng, RouterKind::Stacked, RouterKind::Exact] {
+        let open = |slot: Vec<u8>, centroids: IvfCentroids| {
+            let IvfCentroids::F32(matrix) = centroids;
+            let rows: Vec<u8> = matrix
+                .values
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect();
+            RouterKind::open(FileSlice::from(slot), FileSlice::from(rows), &options)
+        };
+        for kind in [RouterKind::Stacked, RouterKind::Exact] {
             let mut centroids = centroids();
-            let built = kind.build(&options, &mut centroids)?;
-            let mut bytes = Vec::new();
-            built.serialize(&mut bytes)?;
-            let rows = match centroids {
-                IvfCentroids::F32(matrix) => matrix
-                    .values
-                    .into_iter()
-                    .flat_map(f32::to_le_bytes)
-                    .collect::<Vec<_>>(),
+            let mut slot = Vec::new();
+            kind.build(&options, &mut centroids)?.serialize(&mut slot)?;
+            assert_eq!(slot[0], kind as u8);
+            assert_eq!(open(slot, centroids)?.kind(), kind);
+        }
+        for code in [0, 255] {
+            let Err(error) = open(vec![code], centroids()) else {
+                panic!("router kind {code} must not open");
             };
-            let opened = RouterKind::open(
-                VectorFileVersion::V3,
-                FileSlice::from(bytes),
-                FileSlice::from(rows),
-                &options,
-            )?;
-            assert_eq!(opened.kind(), kind);
+            assert!(
+                matches!(
+                    error,
+                    TantivyError::IncompatibleIndex(Incompatibility::VectorRouterMismatch { kind })
+                        if kind == code
+                ),
+                "{code}: {error:?}"
+            );
         }
         Ok(())
-    }
-
-    #[test]
-    fn pre_v3_router_format_is_rejected() {
-        let options = VectorOptions::new(1, Metric::L2);
-        let error = RouterKind::open(
-            VectorFileVersion::V2,
-            FileSlice::empty(),
-            FileSlice::empty(),
-            &options,
-        )
-        .err()
-        .expect("pre-V3 router formats must fail");
-        assert!(error.to_string().contains("require vector file version V3"));
-    }
-
-    #[test]
-    fn unknown_router_kind_is_rejected() {
-        let options = VectorOptions::new(1, Metric::L2);
-        let error = RouterKind::open(
-            VectorFileVersion::V3,
-            FileSlice::from(vec![u8::MAX]),
-            FileSlice::empty(),
-            &options,
-        )
-        .err()
-        .expect("unknown router kinds must fail");
-        assert!(error.to_string().contains("unknown router kind: 255"));
     }
 }

@@ -20,8 +20,10 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
-use crate::vector::index_reader::VectorFieldReader;
-use crate::vector::{VectorColMetadata, VectorIndexReader};
+#[cfg(test)]
+use crate::vector::storage::metadata::VectorColMetadata;
+use crate::vector::storage::reader::VectorFieldReader;
+use crate::vector::VectorIndexReader;
 use crate::{DocId, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
@@ -193,7 +195,11 @@ impl SegmentReader {
 
     /// Returns stored field metadata without reading IdMap, routing payloads or block geometry.
     /// A segment without vector data returns `None`.
-    pub fn vector_metadata(&self, field: Field) -> crate::Result<Option<Arc<VectorColMetadata>>> {
+    #[cfg(test)]
+    pub(crate) fn vector_metadata(
+        &self,
+        field: Field,
+    ) -> crate::Result<Option<Arc<VectorColMetadata>>> {
         Ok(self.vector_field(field)?.metadata())
     }
 
@@ -215,11 +221,12 @@ impl SegmentReader {
         Ok(reader)
     }
 
-    /// Checks the vector format header without opening field readers or routing data.
-    /// Segments without a vector file are accepted.
+    /// Checks the vector format header and each vector field's IVF router kind, without opening
+    /// vector readers. Segments without vector files are accepted.
     pub fn validate_vector_format(&self) -> crate::Result<()> {
-        crate::vector::header::check_vector_format(
-            self.open_read(SegmentComponent::Custom(crate::vector::VEC_EXT.to_string())),
+        crate::vector::storage::header::check_vector_format(
+            |component| self.open_read(component),
+            self.schema(),
         )
     }
 

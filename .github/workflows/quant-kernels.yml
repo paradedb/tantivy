@@ -4,13 +4,13 @@ on:
   push:
     branches: [main]
     paths:
-      - "quant-kernels/**"
+      - "quant/**"
       - "src/vector/**"
       - "benches/**"
       - ".github/workflows/quant-kernels.yml"
   pull_request:
     paths:
-      - "quant-kernels/**"
+      - "quant/**"
       - "src/vector/**"
       - "benches/**"
       - ".github/workflows/quant-kernels.yml"
@@ -43,12 +43,12 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           git diff --name-only "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/quantization-changed-files"
-          if grep -Eq '^(quant-kernels/|\.github/workflows/quant-kernels\.yml$)' "$RUNNER_TEMP/quantization-changed-files"; then
+          if grep -Eq '^(quant/|\.github/workflows/quant-kernels\.yml$)' "$RUNNER_TEMP/quantization-changed-files"; then
             echo "kernels=true" >> "$GITHUB_OUTPUT"
           else
             echo "kernels=false" >> "$GITHUB_OUTPUT"
           fi
-          if grep -Eq '^(quant-kernels/|src/vector/|benches/|\.github/workflows/quant-kernels\.yml$)' "$RUNNER_TEMP/quantization-changed-files"; then
+          if grep -Eq '^(quant/|src/vector/|benches/|\.github/workflows/quant-kernels\.yml$)' "$RUNNER_TEMP/quantization-changed-files"; then
             echo "tantivy_benches=true" >> "$GITHUB_OUTPUT"
           else
             echo "tantivy_benches=false" >> "$GITHUB_OUTPUT"
@@ -85,16 +85,16 @@ jobs:
         with:
           cache-targets: false
       - name: Run kernel goldens, determinism, clippy, and tests
-        run: ./quant-kernels/check.sh
+        run: ./quant/check.sh
       - name: Check x86 assembly expectations
-        run: ./quant-kernels/check_asm_x86.sh
+        run: ./quant/check_asm_x86.sh
       - name: Run kernel Criterion targets
         run: |
-          cargo bench -p fht --bench rotation -- --noplot
-          cargo bench -p sign-plane --bench score -- --noplot
-          cargo bench -p grid-plane --bench kernels -- --noplot
-          cargo bench -p cascade --bench baselines -- --noplot
-          cargo bench -p cascade --bench cascade -- --noplot
+          cargo bench -p tantivy-quant --bench rotation -- --noplot
+          cargo bench -p tantivy-quant --bench sign_score -- --noplot
+          cargo bench -p tantivy-quant --bench grid_kernels -- --noplot
+          cargo bench -p tantivy-quant --bench baselines -- --noplot
+          cargo bench -p tantivy-quant --bench cascade -- --noplot
 
   kernel-assembly-arm:
     name: ARM assembly expectations
@@ -103,7 +103,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     env:
       RUSTFLAGS: -C target-cpu=native
-      CARGO_TARGET_DIR: target/quant-kernels-asm-arm
+      CARGO_TARGET_DIR: target/quant-asm-arm
       CARGO_PROFILE_RELEASE_LTO: "false"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -115,10 +115,50 @@ jobs:
           override: true
       - name: Check ARM popcount assembly
         run: |
-          cargo rustc -p sign-plane --release --lib -- --emit=asm
-          sign_asm=$(find "$CARGO_TARGET_DIR/release/deps" -name 'sign_plane-*.s' -print | head -n 1)
-          test -n "$sign_asm"
-          grep -Eq '\bcnt\b' "$sign_asm"
+          cargo rustc -p tantivy-quant --release --lib -- --emit=asm
+          quant_asm=$(find "$CARGO_TARGET_DIR/release/deps" -name 'tantivy_quant-*.s' -print | head -n 1)
+          test -n "$quant_asm"
+          # The functions under tantivy_quant::sign, each from its label to its `.cfi_endproc` or
+          # the next symbol label.
+          sign_asm="$CARGO_TARGET_DIR/tantivy_quant-sign.s"
+          awk '
+            in_fn && (/\.cfi_endproc/ || (/^[A-Za-z_$][^:]*:/ && !/^[Ll]/)) { in_fn = 0 }
+            /^_?_ZN13tantivy_quant4sign[^:]*:/ { in_fn = 1 }
+            in_fn { print }
+          ' "$quant_asm" > "$sign_asm"
+          if [ ! -s "$sign_asm" ]; then
+            echo "no tantivy_quant::sign functions found in $quant_asm" >&2
+            exit 1
+          fi
+          if ! grep -Eq '\bcnt\b' "$sign_asm"; then
+            echo "tantivy_quant::sign assembly does not contain a cnt instruction" >&2
+            exit 1
+          fi
+
+  kernel-tier-avx512:
+    name: AVX-512 tier under Intel SDE
+    needs: changed-paths
+    if: needs.changed-paths.outputs.kernels == 'true'
+    runs-on: ubuntu-latest
+    # No target-cpu: the emulated CPU need not support every instruction the runner does.
+    env:
+      CARGO_TARGET_DIR: target/quant-sde
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned stable toolchain
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
+        with:
+          toolchain: 1.95.0
+          profile: minimal
+          override: true
+      - name: Install Intel SDE
+        uses: petarpetrovt/setup-sde@6d2773bc0ef3005fd52e0ae0bb91782321793aec # v6.0
+      - name: Run sign and f16 tests on an emulated Sapphire Rapids CPU
+        run: |
+          test_bin=$(cargo test -p tantivy-quant --release --lib --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable')
+          test -n "$test_bin"
+          "$SDE_PATH/sde64" -spr -- "$test_bin" --include-ignored sign::tests:: model::f16::tests::
 
   tantivy-scan-benches:
     name: Tantivy quantization benchmarks

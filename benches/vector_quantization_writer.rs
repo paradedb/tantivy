@@ -1,8 +1,8 @@
 use std::hint::black_box;
 
-use cascade::{encode_batch_in_place, prepare_centroid, LayerSpec};
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
-use quant_model::build_grid;
+use quant::cascade::{encode_batch_in_place, prepare_centroid, LayerSpec};
+use quant::model::build_grid;
 
 const DIM: usize = 768;
 const ROWS: usize = 100;
@@ -10,14 +10,14 @@ const ROWS: usize = 100;
 fn writer_context_encode(c: &mut Criterion) {
     let specs = [
         LayerSpec {
-            kind: cascade::LayerKind::Sign,
+            kind: quant::cascade::LayerKind::Sign,
             bits: 1,
-            rotation: cascade::Rotation::SeededFhtChaCha8 { seed: 0x1111 },
+            rotation: quant::cascade::Rotation::SeededFhtChaCha8 { seed: 0x1111 },
         },
         LayerSpec {
-            kind: cascade::LayerKind::Grid,
+            kind: quant::cascade::LayerKind::Grid,
             bits: 4,
-            rotation: cascade::Rotation::SeededFhtChaCha8 { seed: 0x2222 },
+            rotation: quant::cascade::Rotation::SeededFhtChaCha8 { seed: 0x2222 },
         },
     ];
     let grids = [build_grid(DIM, 1), build_grid(DIM, 4)];
