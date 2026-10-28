@@ -8,6 +8,17 @@ use crate::query::weight::for_each_pruning_scorer;
 use crate::query::Scorer;
 use crate::{DocId, DocSet, Score, TERMINATED};
 
+/// Seeks `scorer` to `filter.doc()` if it is behind, so the filter is never
+/// asked about a doc below its current one: `PhraseScorer::seek_danger` asserts
+/// against that, and an `Intersection` of `RangeDocSet`s overflows on it. A new
+/// filter is on its first match, so the skipped docs cannot match.
+pub(super) fn seek_to_filter_start(scorer: &mut TermScorer, filter: &dyn DocSet) {
+    let filter_doc = filter.doc();
+    if scorer.doc() < filter_doc {
+        scorer.seek(filter_doc);
+    }
+}
+
 /// Takes a term_scorers sorted by their current doc() and a threshold and returns
 /// Returns (pivot_len, pivot_ord) defined as follows:
 /// - `pivot_doc` lowest document that has a chance of exceeding (>) the threshold score.
@@ -251,6 +262,11 @@ impl BlockWandUnionScorer {
         filter_boost: Score,
     ) -> Self {
         debug_assert!(scorers.len() > 1);
+        if let Some(filter) = &filter {
+            for scorer in &mut scorers {
+                seek_to_filter_start(scorer, filter.as_ref());
+            }
+        }
         scorers.retain(|scorer| scorer.doc() < TERMINATED);
         let mut scorers: Vec<TermScorerWithMaxScore> = scorers
             .into_iter()
@@ -438,11 +454,14 @@ impl BlockWandSingleScorer {
     }
 
     fn with_filter_and_boost(
-        term_scorer: TermScorer,
+        mut term_scorer: TermScorer,
         threshold: Score,
         filter: Option<Box<dyn DocSet>>,
         filter_boost: Score,
     ) -> Self {
+        if let Some(filter) = &filter {
+            seek_to_filter_start(&mut term_scorer, filter.as_ref());
+        }
         let mut scorer = Self {
             scorer: term_scorer,
             filter,

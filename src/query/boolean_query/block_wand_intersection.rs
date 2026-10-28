@@ -1,3 +1,4 @@
+use super::block_wand_union::seek_to_filter_start;
 use crate::docset::SeekDangerResult;
 use crate::fieldnorm::FieldNormReader;
 use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
@@ -95,7 +96,10 @@ impl BlockWandIntersectionScorer {
 
         // Sort by cost (ascending). scorers[0] becomes the "leader" (rarest term).
         scorers.sort_by_key(TermScorer::size_hint);
-        let leader = scorers.remove(0);
+        let mut leader = scorers.remove(0);
+        if let Some(filter) = &filter {
+            seek_to_filter_start(&mut leader, filter.as_ref());
+        }
         let secondaries = scorers;
         let secondaries_len = secondaries.len();
         let shared_fieldnorms = secondaries
