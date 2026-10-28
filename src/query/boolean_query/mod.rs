@@ -1303,6 +1303,112 @@ mod tests {
 
         Ok(())
     }
+    // Each filter sits on its first match, doc 150, while the term scorers start at doc 0.
+    // A `seek_danger` target below doc 150 fails in debug builds:
+    // - two range filters form an `Intersection`, which seeks the `RangeDocSet`s to doc 150 on
+    //   construction, so `RangeDocSet::is_last_seek_distance_large` overflows;
+    // - a phrase filter fails the `target >= doc` assert in `PhraseScorer::seek_danger`.
+    #[test]
+    pub fn test_filtered_pruning_starts_at_filter_doc() -> crate::Result<()> {
+        use crate::query::{ConstScoreQuery, DisjunctionPruning, PhraseQuery};
+
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let tag_field = schema_builder.add_text_field("tag", TEXT);
+        let num_a =
+            schema_builder.add_i64_field("a", NumericOptions::default().set_fast().set_indexed());
+        let num_b =
+            schema_builder.add_i64_field("b", NumericOptions::default().set_fast().set_indexed());
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            for i in 0..300i64 {
+                let text = if i % 10 == 0 { "target other" } else { "other" };
+                let tag = if i >= 150 && i % 10 == 0 {
+                    "red apple"
+                } else {
+                    "apple red"
+                };
+                index_writer.add_document(doc!(
+                    text_field => text,
+                    tag_field => tag,
+                    num_a => i,
+                    num_b => i,
+                ))?;
+            }
+            index_writer.commit()?;
+        }
+        let searcher = index.reader()?.searcher();
+        let reader = searcher.segment_reader(0u32);
+
+        let term = |text: &str| -> Box<dyn Query> {
+            Box::new(TermQuery::new(
+                Term::from_field_text(text_field, text),
+                IndexRecordOption::WithFreqs,
+            ))
+        };
+        let range = |field: Field, lower: i64| -> Box<dyn Query> {
+            Box::new(RangeQuery::new(
+                Bound::Included(Term::from_field_i64(field, lower)),
+                Bound::Unbounded,
+            ))
+        };
+        let phrase = PhraseQuery::new(vec![
+            Term::from_field_text(tag_field, "red"),
+            Term::from_field_text(tag_field, "apple"),
+        ]);
+        let every_tenth: Vec<DocId> = (150..300).step_by(10).collect();
+        let all: Vec<DocId> = (150..300).collect();
+
+        let range_filters = vec![
+            (Occur::Must, range(num_a, 100)),
+            (Occur::Must, range(num_b, 150)),
+        ];
+        let phrase_filter: Vec<(Occur, Box<dyn Query>)> = vec![(
+            Occur::Must,
+            Box::new(ConstScoreQuery::new(
+                Box::new(phrase) as Box<dyn Query>,
+                1.0,
+            )),
+        )];
+
+        for (filters, union_expected) in [(range_filters, &all), (phrase_filter, &every_tenth)] {
+            let with_filters = |terms: Vec<(Occur, Box<dyn Query>)>| {
+                BooleanQuery::new([terms, filters.clone()].concat())
+            };
+            let single = with_filters(vec![(Occur::Must, term("target"))]);
+            let intersection = with_filters(vec![
+                (Occur::Must, term("target")),
+                (Occur::Must, term("other")),
+            ]);
+            let mut union = with_filters(vec![
+                (Occur::Should, term("target")),
+                (Occur::Should, term("other")),
+            ]);
+            union.set_minimum_number_should_match(1);
+
+            // `DisjunctionPruning` only selects the algorithm for unions.
+            for (query, pruning, expected) in [
+                (&single, DisjunctionPruning::Auto, &every_tenth),
+                (&intersection, DisjunctionPruning::Auto, &every_tenth),
+                (&union, DisjunctionPruning::BlockWand, union_expected),
+                (&union, DisjunctionPruning::BlockMaxScore, union_expected),
+            ] {
+                let scoring = EnableScoring::enabled_from_searcher(&searcher)
+                    .with_disjunction_pruning(pruning);
+                let weight = query.weight(scoring)?;
+                let mut docs = Vec::new();
+                weight.for_each_pruning(0.0, reader, &mut |doc, _score| {
+                    docs.push(doc);
+                    0.0
+                })?;
+                docs.sort_unstable();
+                assert_eq!(&docs, expected, "{query:?} {pruning:?}");
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// A proptest which generates arbitrary permutations of a simple boolean AST, and then matches
