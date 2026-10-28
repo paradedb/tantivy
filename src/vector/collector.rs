@@ -11,16 +11,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{
-    AtomicSharedThreshold, Collector, ComparableDoc, SegmentCollector, SegmentSortKeyComputer,
-    SharedThresholdArc, SortKeyComputer, compare_for_top_k,
+    compare_for_top_k, AtomicSharedThreshold, Collector, ComparableDoc, SegmentCollector,
+    SegmentSortKeyComputer, SharedThresholdArc, SortKeyComputer,
 };
 use crate::index::SegmentReader;
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Metric, Schema};
 use crate::vector::params::ProbeParams;
-use crate::vector::search::SegmentSearcher;
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
 use crate::vector::search::scan::bound::{ExactMerge, TopK};
+use crate::vector::search::SegmentSearcher;
 use crate::vector::stats::{ProbeStats, SegmentReport};
 use crate::vector::storage::metadata::VectorColMetadata;
 use crate::vector::storage::quantized::QuantizedFieldReader;
@@ -496,15 +496,15 @@ mod ivf_e2e_tests {
     use std::sync::Arc;
 
     use super::VectorSimilarityFruit;
-    use crate::collector::TopDocs;
     use crate::collector::sort_key::{SortBySimilarityScore, SortByStaticFastValue};
+    use crate::collector::TopDocs;
     use crate::index::IndexSettings;
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
-    use crate::schema::{FAST, Field, Metric, STORED, STRING, Schema, VectorDType, VectorOptions};
-    use crate::vector::RouterKind;
+    use crate::schema::{Field, Metric, Schema, VectorDType, VectorOptions, FAST, STORED, STRING};
     use crate::vector::diagnostics::VectorStorageFormat;
-    use crate::vector::tests::{Grid2DClusterer, TestVectorIndex, exhaustive_params, ground_truth};
+    use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
+    use crate::vector::RouterKind;
     use crate::{DocAddress, Index, Order, Score, TantivyDocument, TantivyError};
 
     /// IVF + exhaustive probing matches the global oracle. Exact ranks

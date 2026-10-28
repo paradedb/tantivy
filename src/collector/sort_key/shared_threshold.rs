@@ -172,8 +172,8 @@ impl SharedThreshold<Option<u64>> for RwLockSharedThresholdOptionU64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Order;
     use crate::collector::sort_key::{Comparator, ComparatorEnum};
+    use crate::Order;
 
     #[test]
     fn test_f32_ordered_roundtrip() {
