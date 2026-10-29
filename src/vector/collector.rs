@@ -42,6 +42,28 @@ use crate::vector::write::RowAddress;
 use crate::vector::{VectorElement, VectorStage};
 use crate::{DocAddress, DocId, Result, Score, SegmentOrdinal, TantivyError};
 
+/// A segment and its optional parent centroid in the global router.
+#[derive(Clone, Copy)]
+pub struct VectorSegment<'a> {
+    /// Ordinal used in returned document addresses.
+    pub ordinal: SegmentOrdinal,
+    /// Segment to search.
+    pub reader: &'a SegmentReader,
+    /// Coarse partition centroid, in the indexed vector field's coordinate space.
+    /// Segments without one join at their own topmost router layer.
+    pub partition_centroid: Option<&'a [f32]>,
+}
+
+impl<'a> From<(SegmentOrdinal, &'a SegmentReader)> for VectorSegment<'a> {
+    fn from((ordinal, reader): (SegmentOrdinal, &'a SegmentReader)) -> Self {
+        Self {
+            ordinal,
+            reader,
+            partition_centroid: None,
+        }
+    }
+}
+
 // --- Query preparation ---
 
 /// Query identity consists of dimension, metric tag and structural layer metadata.
@@ -410,24 +432,35 @@ where
     pub fn collect_segments(
         &self,
         weight: &dyn Weight,
-        readers: &[(SegmentOrdinal, &SegmentReader)],
+        segments: &[VectorSegment<'_>],
         mut on_segment: impl FnMut(SegmentOrdinal),
     ) -> Result<Vec<SegmentVectorFruit<S::SortKey>>> {
-        if readers.len() <= 1 {
-            return readers
+        if segments.len() <= 1 {
+            return segments
                 .iter()
-                .map(|&(ord, reader)| {
-                    let result = self.collect_segment(weight, ord, reader);
-                    on_segment(ord);
+                .map(|segment| {
+                    let result = self.collect_segment(weight, segment.ordinal, segment.reader);
+                    on_segment(segment.ordinal);
                     result
                 })
                 .collect();
         }
-        self.check_schema(readers[0].1.schema())?;
+        self.check_schema(segments[0].reader.schema())?;
+        for segment in segments {
+            if let Some(centroid) = segment.partition_centroid {
+                if centroid.len() != self.query.len() || centroid.iter().any(|x| !x.is_finite()) {
+                    return Err(TantivyError::InvalidArgument(
+                        "invalid vector partition centroid".into(),
+                    ));
+                }
+            }
+        }
+        let readers: Vec<_> = segments.iter().map(|s| (s.ordinal, s.reader)).collect();
+        let partitions: Vec<_> = segments.iter().map(|s| s.partition_centroid).collect();
         let mut backends = Vec::with_capacity(readers.len());
         let mut tie_breaks = Vec::with_capacity(readers.len());
         let mut totals = Vec::with_capacity(readers.len());
-        for &(ord, reader) in readers {
+        for &(ord, reader) in &readers {
             let (result, measured) = measure(|| {
                 let _init = enter_vector_stage(VectorStage::ScanInit);
                 let (query, quantized) = {
@@ -464,6 +497,7 @@ where
         let results = search_global(
             &backends,
             &segments,
+            &partitions,
             weight,
             self.segment_top_n(),
             &mut tie_breaks,
@@ -589,6 +623,7 @@ enum GlobalSource<'a, T: VectorElement> {
 fn search_global<T, K, C>(
     backends: &[SegmentSearcher<T>],
     segments: &[&SegmentReader],
+    partitions: &[Option<&[f32]>],
     weight: &dyn Weight,
     top_n: usize,
     tie_breaks: &mut [K],
@@ -702,7 +737,7 @@ where
     let k = first
         .params()
         .router_k(total, x, matched / routed_docs.max(1) as f64, clusters);
-    let ranking = GlobalRanking::from(&routers, first.query(), k, totals, on_segment);
+    let ranking = GlobalRanking::from(&routers, partitions, first.query(), k, totals, on_segment);
     let mut reserved = WorkUnits::ZERO;
     let mut scans = Vec::with_capacity(backends.len());
     let mut sources = Vec::with_capacity(backends.len());
@@ -903,7 +938,7 @@ mod ivf_e2e_tests {
     use std::ops::Range;
     use std::sync::Arc;
 
-    use super::VectorSimilarityFruit;
+    use super::{VectorSegment, VectorSimilarityFruit};
     use crate::collector::sort_key::{SortBySimilarityScore, SortByStaticFastValue, SortByString};
     use crate::collector::{AtomicSharedThreshold, Collector, SharedThresholdArc, TopDocs};
     use crate::index::IndexSettings;
@@ -964,7 +999,7 @@ mod ivf_e2e_tests {
                 .segment_readers()
                 .iter()
                 .enumerate()
-                .map(|(ord, reader)| (ord as u32, reader))
+                .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
                 .collect();
             readers.reverse();
             let mut query = vec![0.01; 128];
@@ -1037,7 +1072,7 @@ mod ivf_e2e_tests {
             .segment_readers()
             .iter()
             .enumerate()
-            .map(|(ord, reader)| (ord as u32, reader))
+            .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
             .collect();
         let mut query = vec![0.01; 128];
         query[2] = 1.0;
@@ -1108,7 +1143,7 @@ mod ivf_e2e_tests {
         let readers: Vec<_> = searchers
             .iter()
             .enumerate()
-            .map(|(i, s)| (i as u32, &s.segment_readers()[0]))
+            .map(|(i, s)| VectorSegment::from((i as u32, &s.segment_readers()[0])))
             .collect();
         let mut query = vec![0.0; 32];
         query[5] = 1.0;
@@ -1148,7 +1183,7 @@ mod ivf_e2e_tests {
             .segment_readers()
             .iter()
             .enumerate()
-            .map(|(ord, reader)| (ord as u32, reader))
+            .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
             .collect();
         let mut query = vec![0.0; 32];
         query[3] = 1.0;
@@ -1170,8 +1205,16 @@ mod ivf_e2e_tests {
         )?)?;
         assert_eq!(fruit.stats.iter().map(|s| s.work_budget).sum::<f32>(), 16.0);
         assert!(fruit.stats.iter().map(|s| s.work_charged).sum::<f32>() < 18.0);
-        let single = [readers[2]];
-        let legacy = new_collector().collect_segment(weight.as_ref(), single[0].0, single[0].1)?;
+        let centroid = vec![0.0; 32];
+        let single = [VectorSegment {
+            partition_centroid: Some(&centroid),
+            ..readers[2]
+        }];
+        let legacy = new_collector().collect_segment(
+            weight.as_ref(),
+            single[0].ordinal,
+            single[0].reader,
+        )?;
         let mut automatic = new_collector().collect_segments(weight.as_ref(), &single, |_| {})?;
         assert_eq!(automatic.len(), 1);
         let automatic = automatic.pop().unwrap();
@@ -1407,7 +1450,7 @@ mod ivf_e2e_tests {
                     .segment_readers()
                     .iter()
                     .enumerate()
-                    .map(|(ord, reader)| (ord as u32, reader))
+                    .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
                     .collect();
                 let weight =
                     Query::weight(&AllQuery, EnableScoring::disabled_from_searcher(&searcher))?;
@@ -1639,7 +1682,7 @@ mod ivf_e2e_tests {
                 .segment_readers()
                 .iter()
                 .enumerate()
-                .map(|(ord, reader)| (ord as u32, reader))
+                .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
                 .collect();
             let weight =
                 Query::weight(&AllQuery, EnableScoring::disabled_from_searcher(&searcher))?;
