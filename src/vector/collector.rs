@@ -20,20 +20,22 @@ use crate::query::Weight;
 use crate::schema::{Field, FieldType, Metric, Schema};
 use crate::vector::params::ProbeParams;
 use crate::vector::router::global::GlobalRanking;
+use crate::vector::router::RouterMetrics;
 use crate::vector::search::cluster_source::ClusterSource;
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
 use crate::vector::search::scan::bound::{ExactMerge, PruningBound, TopK};
 use crate::vector::search::scan::heap::TieBreakHits;
-use crate::vector::search::scan::{ScanConfig, SegmentScan};
-use crate::vector::search::segment::plan::{SegmentPlan, Source};
+use crate::vector::search::scan::{ScanConfig, ScanReport, SegmentScan};
+use crate::vector::search::segment::plan::{PlanReport, SegmentPlan, Source};
 use crate::vector::search::source::controller::{
-    ProbeTermination, WorkBudget, WorkMeter, WorkUnits,
+    ProbeOutcome, ProbeTermination, WorkBudget, WorkMeter, WorkUnits,
 };
 use crate::vector::search::source::matches::MatchClusters;
-use crate::vector::search::source::router::RouterClusters;
+use crate::vector::search::source::router::{RouterClusters, RouterReport};
 use crate::vector::search::source::SourceReport;
 use crate::vector::search::SegmentSearcher;
 use crate::vector::stats::{ProbeStats, SegmentReport};
+use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::metadata::{Quantizer, VectorColMetadata};
 use crate::vector::storage::quantized::QuantizedFieldReader;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
@@ -471,51 +473,29 @@ where
         if let Some((_, reader)) = readers.first() {
             self.check_schema(reader.schema())?;
         }
-        let mut backends = Vec::with_capacity(readers.len());
+        let mut indexes = Vec::with_capacity(readers.len());
         let mut tie_breaks = Vec::with_capacity(readers.len());
         let mut totals = Vec::with_capacity(readers.len());
         for &(ord, reader) in readers {
             let (result, measured) = measure(|| {
-                let _init = enter_vector_stage(VectorStage::ScanInit);
-                let (query, quantized) = {
-                    let _prep = enter_vector_stage(VectorStage::QueryPrep);
-                    let vectors = reader.vector_index(self.field)?;
-                    let query = self.vector_query(vectors.options().metric());
-                    let quantized = vectors
-                        .quantization()
-                        .filter(|_| self.max_scan_levels > 0)
-                        .map(|field| self.quantized_query(field, &query));
-                    (query, quantized)
-                };
-                let backend = SegmentSearcher::for_segment(
-                    reader,
-                    ord,
-                    self.field,
-                    query,
-                    quantized,
-                    self.probe_params.clone(),
-                )?
-                .with_collector_topk(
-                    Arc::clone(&self.collector_topk),
-                    Arc::clone(&self.shared_topk_threshold),
-                );
-                Ok::<_, TantivyError>((backend, self.tie_break.segment_sort_key_computer(reader)?))
+                let _prep = enter_vector_stage(VectorStage::QueryPrep);
+                Ok::<_, TantivyError>((
+                    reader.vector_field(self.field)?.routing_index()?,
+                    self.tie_break.segment_sort_key_computer(reader)?,
+                ))
             });
             on_segment(ord);
-            let (backend, tie_break) = result?;
-            backends.push(backend);
+            let (index, tie_break) = result?;
+            indexes.push(index);
             tie_breaks.push(tie_break);
             totals.push(measured);
         }
-        let segments: Vec<_> = readers.iter().map(|(_, reader)| *reader).collect();
-        let results = search_global(
-            &backends,
-            &segments,
+        let results = self.search_global(
+            &indexes,
+            readers,
             partitions,
             weight,
-            self.segment_top_n(),
             &mut tie_breaks,
-            || self.tie_break.comparator(),
             &mut totals,
             &mut |i| on_segment(readers[i].0),
         )?;
@@ -551,15 +531,11 @@ where
         Ok(fruits)
     }
 
-    /// Searches one segment: prepares the query, runs the segment searcher, and lifts each hit's
-    /// tie-break key out of the segment.
-    fn search_segment(
+    fn segment_searcher(
         &self,
-        weight: &dyn Weight,
-        segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
-    ) -> Result<(KeyedHits<S::SortKey>, SegmentReport, ExactMerge)> {
-        let init = enter_vector_stage(VectorStage::ScanInit);
+        segment_ord: SegmentOrdinal,
+    ) -> Result<SegmentSearcher<T>> {
         let (query, quantized) = {
             let _prep = enter_vector_stage(VectorStage::QueryPrep);
             let vectors = reader.vector_index(self.field)?;
@@ -572,7 +548,7 @@ where
             };
             (query, quantized)
         };
-        let backend = SegmentSearcher::for_segment(
+        Ok(SegmentSearcher::for_segment(
             reader,
             segment_ord,
             self.field,
@@ -583,7 +559,19 @@ where
         .with_collector_topk(
             Arc::clone(&self.collector_topk),
             Arc::clone(&self.shared_topk_threshold),
-        );
+        ))
+    }
+
+    /// Searches one segment: prepares the query, runs the segment searcher, and lifts each hit's
+    /// tie-break key out of the segment.
+    fn search_segment(
+        &self,
+        weight: &dyn Weight,
+        segment_ord: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> Result<(KeyedHits<S::SortKey>, SegmentReport, ExactMerge)> {
+        let init = enter_vector_stage(VectorStage::ScanInit);
+        let backend = self.segment_searcher(reader, segment_ord)?;
         let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
         drop(init);
         let (hits, report) = backend.top_n_by(
@@ -631,289 +619,380 @@ enum GlobalSource<'a, T: VectorElement> {
     RouterBypass(MatchClusters<'a>),
 }
 
-/// Searches multiple segments with a shared cluster order, work budget, and top-k score threshold.
-/// Returns each segment's hits and statistics so the collector can combine the results.
-#[allow(clippy::too_many_arguments)]
-fn search_global<T, K, C>(
-    backends: &[SegmentSearcher<T>],
-    segments: &[&SegmentReader],
-    partitions: &[Option<&[f32]>],
-    weight: &dyn Weight,
-    top_n: usize,
-    tie_breaks: &mut [K],
-    comparator: impl Fn() -> C,
-    totals: &mut [StageTotals],
-    on_segment: &mut impl FnMut(usize),
-) -> Result<Vec<(TieBreakHits<K>, SegmentReport)>>
+struct GlobalScan<'a, T, K, C>
 where
     T: VectorElement,
     K: SegmentSortKeyComputer,
     C: Comparator<K::SegmentSortKey>,
 {
-    let clusters = backends
-        .iter()
-        .filter_map(|b| b.reader().index())
-        .map(|i| i.num_clusters())
-        .sum();
-    let docs = backends
-        .iter()
-        .filter_map(|b| b.reader().index())
-        .map(|i| i.num_docs())
-        .sum();
-    let Some(first) = backends.first() else {
-        return Ok(Vec::new());
-    };
-    let (total, n_avg, x) = first.params().resolved_work_budget(clusters, docs)?;
-    let global_budget = WorkBudget {
-        total: WorkUnits::new(total),
-        per_cluster: WorkUnits::new(x),
-        per_row: WorkUnits::new((1.0 - x) / n_avg),
-    };
-    let mut topk = first
-        .collector_topk
-        .as_ref()
-        .map(|top| top.lock().unwrap().clone())
-        .unwrap_or_else(|| TopK::new(top_n));
-    let mut plans = Vec::with_capacity(backends.len());
-    let mut finished = Vec::with_capacity(backends.len());
-    for (i, ((backend, segment), tie_break)) in backends
-        .iter()
-        .zip(segments)
-        .zip(tie_breaks.iter_mut())
-        .enumerate()
-    {
-        let (result, measured) = measure(|| -> Result<_> {
-            let _init = enter_vector_stage(VectorStage::ScanInit);
-            match backend.reader().index() {
-                Some(index) => {
-                    let budget = WorkBudget {
-                        total: global_budget.total * (index.num_docs() as f64 / docs.max(1) as f64),
-                        ..global_budget
-                    };
-                    let plan = SegmentPlan::with_budget(
-                        backend.params(),
-                        index,
-                        weight,
-                        segment,
-                        top_n,
-                        budget,
-                    )?;
-                    Ok((Some(plan), None))
-                }
-                None => {
-                    let (hits, report) =
-                        backend.top_n_by(weight, segment, top_n, tie_break, comparator())?;
-                    topk.merge_exact(hits.iter().map(|((score, _), address)| {
-                        (
-                            RowAddress {
-                                segment_ord: address.segment_ord,
-                                row_id: (address.doc_id as usize) | (1usize << (usize::BITS - 1)),
-                            },
-                            *score,
-                        )
-                    }));
-                    Ok((None, Some((hits, report))))
-                }
-            }
-        });
-        totals[i].append(&measured);
-        on_segment(i);
-        let (plan, result) = result?;
-        plans.push(plan);
-        finished.push(result);
-    }
-    let routers: Vec<_> = backends
-        .iter()
-        .zip(&plans)
-        .map(|(backend, plan)| {
-            matches!(
-                plan.as_ref().and_then(|p| p.source.as_ref()),
-                Some(Source::Router(_))
-            )
-            .then(|| backend.reader().index().unwrap().opened_router())
+    scan: SegmentScan<'a, T, K, C>,
+    source: GlobalSource<'a, T>,
+    report: PlanReport,
+}
+
+impl<'a, T, K, C> GlobalScan<'a, T, K, C>
+where
+    T: VectorElement,
+    K: SegmentSortKeyComputer,
+    C: Comparator<K::SegmentSortKey>,
+{
+    fn new(
+        backend: &'a SegmentSearcher<T>,
+        segment: &'a SegmentReader,
+        plan: SegmentPlan,
+        top_n: usize,
+        tie_break: &'a mut K,
+        comparator: C,
+        metrics: RouterMetrics,
+    ) -> Result<Self> {
+        let config = ScanConfig {
+            top_n,
+            capacity: plan.capacity_hint().min(4096),
+            exact_plan: backend.params().exact_plan,
+            #[cfg(test)]
+            plan_override: backend.plan_override,
+            #[cfg(test)]
+            admission_pruning_disabled: backend.admission_pruning_disabled,
+        };
+        let scan = SegmentScan::new(
+            backend.reader(),
+            backend.reader().index().unwrap(),
+            backend.scoring_query(),
+            config,
+            PruningBound::new(top_n, Arc::clone(&backend.shared_topk_threshold)),
+            backend.segment_ord(),
+            tie_break,
+            comparator,
+        )?;
+        let source = match plan.source.expect("active segment has a cluster source") {
+            Source::Router(filter) => GlobalSource::Router(RouterClusters::for_global(
+                backend.reader(),
+                backend.query(),
+                plan.budget,
+                filter,
+                segment,
+                metrics,
+            )),
+            Source::FilterMatches(docs) => GlobalSource::RouterBypass(MatchClusters::locate(
+                backend.reader(),
+                docs,
+                segment,
+                plan.budget,
+            )?),
+        };
+        Ok(Self {
+            scan,
+            source,
+            report: plan.report,
         })
-        .collect();
-    let (matched, routed_docs) =
-        plans
+    }
+}
+
+impl<T, S> TopDocsByVectorSimilarity<T, S>
+where
+    T: VectorElement,
+    S: SortKeyComputer + Send + Sync + 'static,
+{
+    /// Routes over all segment layouts, then opens row storage only when a segment is probed.
+    /// Routing, budgets, and the exact top-k bound remain shared across segments.
+    #[allow(clippy::too_many_arguments)]
+    fn search_global(
+        &self,
+        indexes: &[Option<Arc<ClusterIndex>>],
+        readers: &[(SegmentOrdinal, &SegmentReader)],
+        partitions: &[Option<&[f32]>],
+        weight: &dyn Weight,
+        tie_breaks: &mut [S::Child],
+        totals: &mut [StageTotals],
+        on_segment: &mut impl FnMut(usize),
+    ) -> Result<Vec<(TieBreakHits<S::Child>, SegmentReport)>> {
+        let Some((_, first)) = readers.first() else {
+            return Ok(Vec::new());
+        };
+        let FieldType::Vector(options) = first.schema().get_field_entry(self.field).field_type()
+        else {
+            unreachable!("collector checked the vector field");
+        };
+        let query = self.vector_query(options.metric());
+        let top_n = self.segment_top_n();
+        let clusters = indexes.iter().flatten().map(|i| i.num_clusters()).sum();
+        let docs = indexes.iter().flatten().map(|i| i.num_docs()).sum();
+        let (total, n_avg, x) = self.probe_params.resolved_work_budget(clusters, docs)?;
+        let global_budget = WorkBudget {
+            total: WorkUnits::new(total),
+            per_cluster: WorkUnits::new(x),
+            per_row: WorkUnits::new((1.0 - x) / n_avg),
+        };
+        let mut topk = self.collector_topk.lock().unwrap().clone();
+        let backends: Vec<OnceLock<Result<SegmentSearcher<T>>>> =
+            (0..readers.len()).map(|_| OnceLock::new()).collect();
+        let backend = |i: usize| {
+            backends[i]
+                .get_or_init(|| self.segment_searcher(readers[i].1, readers[i].0))
+                .as_ref()
+                .map_err(Clone::clone)
+        };
+        let mut plans = Vec::with_capacity(readers.len());
+        let mut finished = Vec::with_capacity(readers.len());
+        for (i, ((index, (_, segment)), tie_break)) in indexes
             .iter()
-            .zip(segments)
-            .fold((0.0, 0u64), |(matched, docs), (plan, segment)| {
-                match plan.as_ref().and_then(|plan| plan.source.as_ref()) {
-                    Some(Source::Router(filter)) => (
-                        matched
-                            + filter.match_fraction(segment.max_doc())
-                                * f64::from(segment.max_doc()),
-                        docs + u64::from(segment.max_doc()),
-                    ),
-                    _ => (matched, docs),
+            .zip(readers)
+            .zip(tie_breaks.iter_mut())
+            .enumerate()
+        {
+            let (result, measured) = measure(|| -> Result<_> {
+                let _init = enter_vector_stage(VectorStage::ScanInit);
+                match index {
+                    Some(index) => {
+                        let budget = WorkBudget {
+                            total: global_budget.total
+                                * (index.num_docs() as f64 / docs.max(1) as f64),
+                            ..global_budget
+                        };
+                        let plan = SegmentPlan::with_budget(
+                            &self.probe_params,
+                            index,
+                            weight,
+                            segment,
+                            top_n,
+                            budget,
+                        )?;
+                        if plan.source.is_none() {
+                            return Ok((
+                                None,
+                                Some((
+                                    Vec::new(),
+                                    SegmentReport::Empty {
+                                        located_cap: plan.report.located_cap,
+                                    },
+                                )),
+                            ));
+                        }
+                        Ok((Some(plan), None))
+                    }
+                    None => {
+                        let (hits, report) = backend(i)?.top_n_by(
+                            weight,
+                            segment,
+                            top_n,
+                            tie_break,
+                            self.tie_break.comparator(),
+                        )?;
+                        topk.merge_exact(hits.iter().map(|((score, _), address)| {
+                            (
+                                RowAddress {
+                                    segment_ord: address.segment_ord,
+                                    row_id: (address.doc_id as usize)
+                                        | (1usize << (usize::BITS - 1)),
+                                },
+                                *score,
+                            )
+                        }));
+                        Ok((None, Some((hits, report))))
+                    }
                 }
             });
-    let k = first
-        .params()
-        .router_k(total, x, matched / routed_docs.max(1) as f64, clusters);
-    let ranking = GlobalRanking::from(
-        &routers,
-        partitions,
-        first.query().widened(),
-        first.query().metric(),
-        k,
-        totals,
-        on_segment,
-    );
-    let mut reserved = WorkUnits::ZERO;
-    let mut scans = Vec::with_capacity(backends.len());
-    let mut sources = Vec::with_capacity(backends.len());
-    let mut reports = Vec::with_capacity(backends.len());
-    for (i, (((backend, segment), plan), tie_break)) in backends
-        .iter()
-        .zip(segments)
-        .zip(plans)
-        .zip(tie_breaks.iter_mut())
-        .enumerate()
-    {
-        let (result, measured) = measure(|| -> Result<_> {
-            let _init = enter_vector_stage(VectorStage::ScanInit);
-            let Some(plan) = plan else {
-                return Ok((None, None, None));
-            };
-            let capacity = plan.capacity_hint().min(4096);
-            let SegmentPlan {
-                budget,
-                source,
-                report,
-            } = plan;
-            let Some(source) = source else {
-                finished[i] = Some((
-                    Vec::new(),
-                    SegmentReport::Empty {
-                        located_cap: report.located_cap,
-                    },
-                ));
-                return Ok((None, None, None));
-            };
-            let config = ScanConfig {
-                top_n,
-                capacity,
-                exact_plan: backend.params().exact_plan,
-                #[cfg(test)]
-                plan_override: backend.plan_override,
-                #[cfg(test)]
-                admission_pruning_disabled: backend.admission_pruning_disabled,
-            };
-            let scan = SegmentScan::new(
-                backend.reader(),
-                backend.reader().index().unwrap(),
-                backend.scoring_query(),
-                config,
-                PruningBound::new(top_n, Arc::clone(&backend.shared_topk_threshold)),
-                backend.segment_ord(),
-                tie_break,
-                comparator(),
-            )?;
-            let source = match source {
-                Source::Router(filter) => GlobalSource::Router(RouterClusters::for_global(
-                    backend.reader(),
-                    backend.query(),
-                    budget,
-                    filter,
-                    segment,
-                    ranking.metrics[i],
-                )),
-                Source::FilterMatches(docs) => {
-                    reserved += budget.total;
-                    GlobalSource::RouterBypass(MatchClusters::locate(
-                        backend.reader(),
-                        docs,
-                        segment,
-                        budget,
-                    )?)
-                }
-            };
-            Ok((Some(scan), Some(source), Some(report)))
-        });
-        totals[i].append(&measured);
-        on_segment(i);
-        let (scan, source, report) = result?;
-        scans.push(scan);
-        sources.push(source);
-        reports.push(report);
-    }
-    let mut meter = WorkMeter::new(WorkBudget {
-        total: WorkUnits::new((global_budget.total.get() - reserved.get()).max(0.0)),
-        ..global_budget
-    });
-    for (i, (source, scan)) in sources.iter_mut().zip(&mut scans).enumerate() {
-        let (Some(GlobalSource::RouterBypass(source)), Some(scan)) = (source, scan) else {
-            continue;
-        };
-        scan.swap_topk(&mut topk);
-        let (result, measured) = measure(|| {
-            while let Some(rows) = source.next()? {
-                let scored = scan.run_cluster(&rows)?;
-                source.admitted(scored, scan.feedback())?;
-            }
-            Ok::<_, TantivyError>(())
-        });
-        scan.swap_topk(&mut topk);
-        totals[i].append(&measured);
-        on_segment(i);
-        result?;
-    }
-    for (i, candidate) in ranking.clusters {
-        if meter.exhausted() {
-            break;
+            totals[i].append(&measured);
+            on_segment(i);
+            let (plan, result) = result?;
+            plans.push(plan);
+            finished.push(result);
         }
-        let Some(GlobalSource::Router(source)) = &mut sources[i] else {
-            unreachable!()
-        };
-        let scan = scans[i].as_mut().unwrap();
-        scan.swap_topk(&mut topk);
-        let (result, measured) = measure(|| {
-            meter.open();
-            if let Some(rows) = source.probe_global(candidate, scan.feedback())? {
-                let scored = scan.run_cluster(&rows)?;
-                source.admitted(scored, scan.feedback())?;
-                meter.rows(scored);
+        let routers: Vec<_> = indexes
+            .iter()
+            .zip(&plans)
+            .map(|(index, plan)| {
+                matches!(
+                    plan.as_ref().and_then(|p| p.source.as_ref()),
+                    Some(Source::Router(_))
+                )
+                .then(|| index.as_ref().unwrap().opened_router())
+            })
+            .collect();
+        let (matched, routed_docs) =
+            plans
+                .iter()
+                .zip(readers)
+                .fold(
+                    (0.0, 0u64),
+                    |(matched, docs), (plan, (_, segment))| match plan
+                        .as_ref()
+                        .and_then(|plan| plan.source.as_ref())
+                    {
+                        Some(Source::Router(filter)) => (
+                            matched
+                                + filter.match_fraction(segment.max_doc())
+                                    * f64::from(segment.max_doc()),
+                            docs + u64::from(segment.max_doc()),
+                        ),
+                        _ => (matched, docs),
+                    },
+                );
+        let k = self
+            .probe_params
+            .router_k(total, x, matched / routed_docs.max(1) as f64, clusters);
+        let ranking = GlobalRanking::from(
+            &routers,
+            partitions,
+            query.widened(),
+            query.metric(),
+            k,
+            totals,
+            on_segment,
+        );
+        let mut scans: Vec<Option<GlobalScan<'_, T, S::Child, S::Comparator>>> =
+            (0..readers.len()).map(|_| None).collect();
+        let mut keys: Vec<_> = tie_breaks.iter_mut().map(Some).collect();
+        let mut reserved = WorkUnits::ZERO;
+        for i in 0..readers.len() {
+            if !matches!(
+                plans[i].as_ref().and_then(|p| p.source.as_ref()),
+                Some(Source::FilterMatches(_))
+            ) {
+                continue;
             }
-            Ok::<_, TantivyError>(())
+            let plan = plans[i].take().unwrap();
+            reserved += plan.budget.total;
+            let (result, measured) = measure(|| {
+                let _init = enter_vector_stage(VectorStage::ScanInit);
+                GlobalScan::new(
+                    backend(i)?,
+                    readers[i].1,
+                    plan,
+                    top_n,
+                    keys[i].take().unwrap(),
+                    self.tie_break.comparator(),
+                    ranking.metrics[i],
+                )
+            });
+            totals[i].append(&measured);
+            on_segment(i);
+            scans[i] = Some(result?);
+        }
+        let mut meter = WorkMeter::new(WorkBudget {
+            total: WorkUnits::new((global_budget.total.get() - reserved.get()).max(0.0)),
+            ..global_budget
         });
-        scan.swap_topk(&mut topk);
-        totals[i].append(&measured);
-        on_segment(i);
-        result?;
-    }
-    for (i, ((scan, source), report)) in scans.into_iter().zip(sources).zip(reports).enumerate() {
-        let Some(scan) = scan else {
-            continue;
-        };
-        let (result, measured) = measure(|| {
-            let source = match source.unwrap() {
-                GlobalSource::Router(source) => {
-                    let mut report = source.finish();
-                    report.probe.termination = if meter.exhausted() {
-                        ProbeTermination::Ceiling
-                    } else {
-                        ProbeTermination::Exhausted
-                    };
-                    SourceReport::Router(report)
-                }
-                GlobalSource::RouterBypass(source) => SourceReport::Matches(source.finish()),
+        for (i, state) in scans.iter_mut().enumerate() {
+            let Some(GlobalScan {
+                scan,
+                source: GlobalSource::RouterBypass(source),
+                ..
+            }) = state
+            else {
+                continue;
             };
-            let (hits, scan) = scan.finish(backends[i].segment_ord())?;
-            Ok::<_, TantivyError>((
-                hits,
-                SegmentReport::Ivf {
-                    plan: report.unwrap(),
+            scan.swap_topk(&mut topk);
+            let (result, measured) = measure(|| {
+                while let Some(rows) = source.next()? {
+                    let scored = scan.run_cluster(&rows)?;
+                    source.admitted(scored, scan.feedback())?;
+                }
+                Ok::<_, TantivyError>(())
+            });
+            scan.swap_topk(&mut topk);
+            totals[i].append(&measured);
+            on_segment(i);
+            result?;
+        }
+        for (i, candidate) in ranking.clusters {
+            if meter.exhausted() {
+                break;
+            }
+            if scans[i].is_none() {
+                let (result, measured) = measure(|| {
+                    let _init = enter_vector_stage(VectorStage::ScanInit);
+                    GlobalScan::new(
+                        backend(i)?,
+                        readers[i].1,
+                        plans[i].take().unwrap(),
+                        top_n,
+                        keys[i].take().unwrap(),
+                        self.tie_break.comparator(),
+                        ranking.metrics[i],
+                    )
+                });
+                totals[i].append(&measured);
+                on_segment(i);
+                scans[i] = Some(result?);
+            }
+            let GlobalScan { scan, source, .. } = scans[i].as_mut().unwrap();
+            let GlobalSource::Router(source) = source else {
+                unreachable!()
+            };
+            scan.swap_topk(&mut topk);
+            let (result, measured) = measure(|| {
+                meter.open();
+                if let Some(rows) = source.probe_global(candidate, scan.feedback())? {
+                    let scored = scan.run_cluster(&rows)?;
+                    source.admitted(scored, scan.feedback())?;
+                    meter.rows(scored);
+                }
+                Ok::<_, TantivyError>(())
+            });
+            scan.swap_topk(&mut topk);
+            totals[i].append(&measured);
+            on_segment(i);
+            result?;
+        }
+        let termination = if meter.exhausted() {
+            ProbeTermination::Ceiling
+        } else {
+            ProbeTermination::Exhausted
+        };
+        for (i, state) in scans.into_iter().enumerate() {
+            let (result, measured) = measure(|| -> Result<_> {
+                let Some(GlobalScan {
+                    scan,
                     source,
-                    scan: Box::new(scan),
-                },
-            ))
-        });
-        totals[i].append(&measured);
-        on_segment(i);
-        finished[i] = Some(result?);
+                    report,
+                }) = state
+                else {
+                    return Ok(plans[i].take().map(|plan| {
+                        (
+                            Vec::new(),
+                            SegmentReport::Ivf {
+                                plan: plan.report,
+                                source: SourceReport::Router(RouterReport {
+                                    counters: Default::default(),
+                                    routing: ranking.metrics[i],
+                                    probe: ProbeOutcome {
+                                        termination,
+                                        work_charged: 0.0,
+                                        work_budget: plan.budget.total.to_f32(),
+                                    },
+                                }),
+                                scan: Box::new(ScanReport::default()),
+                            },
+                        )
+                    }));
+                };
+                let source = match source {
+                    GlobalSource::Router(source) => {
+                        let mut report = source.finish();
+                        report.probe.termination = termination;
+                        SourceReport::Router(report)
+                    }
+                    GlobalSource::RouterBypass(source) => SourceReport::Matches(source.finish()),
+                };
+                let (hits, scan) = scan.finish(readers[i].0)?;
+                Ok(Some((
+                    hits,
+                    SegmentReport::Ivf {
+                        plan: report,
+                        source,
+                        scan: Box::new(scan),
+                    },
+                )))
+            });
+            totals[i].append(&measured);
+            on_segment(i);
+            if let Some(result) = result? {
+                finished[i] = Some(result);
+            }
+        }
+        Ok(finished.into_iter().map(Option::unwrap).collect())
     }
-    Ok(finished.into_iter().map(Option::unwrap).collect())
 }
 
 /// Satisfies `Collector::Child`; [`Collector::collect_segment`] is overridden, so it never runs.
@@ -1064,6 +1143,91 @@ mod ivf_e2e_tests {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn partitioned_search_only_opens_probed_segments() -> Result<()> {
+        let fixtures = (0..8)
+            .map(|i| {
+                let mut spec = FixtureSpec::clustered(Metric::L2, 64, 8, 128).schedule(&[1, 1]);
+                spec.router = RouterKind::Stacked;
+                let shift = i as f32 * 100.0;
+                for vector in spec.vectors.iter_mut().flatten() {
+                    for value in vector {
+                        *value += shift;
+                    }
+                }
+                if let Layout::Ivf(centroids) = &mut spec.layout {
+                    for vector in centroids.iter_mut().flatten() {
+                        *vector += shift;
+                    }
+                }
+                spec.build()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let centroids: Vec<_> = (0..8).map(|i| vec![i as f32 * 100.0; 64]).collect();
+        for unassigned in [false, true] {
+            let searchers = fixtures
+                .iter()
+                .map(|f| Ok(f.index.reader()?.searcher()))
+                .collect::<Result<Vec<_>>>()?;
+            let segments: Vec<_> = searchers
+                .iter()
+                .enumerate()
+                .map(|(i, searcher)| VectorSegment {
+                    ordinal: i as u32,
+                    reader: &searcher.segment_readers()[0],
+                    partition_centroid: (!(unassigned && i == 7))
+                        .then_some(centroids[i].as_slice()),
+                })
+                .collect();
+            let fields = segments
+                .iter()
+                .map(|segment| segment.reader.vector_field(fixtures[0].field))
+                .collect::<Result<Vec<_>>>()?;
+            assert!(fields.iter().all(|field| !field.search_initialized()));
+            let nearest = if unassigned { 7 } else { 0 };
+            let query = centroids[nearest].clone();
+            let run = || -> Result<_> {
+                let collector = TopDocs::with_limit(5)
+                    .order_by_similarity(fixtures[0].field, query.clone())
+                    .with_probe_params(ProbeParams {
+                        max_probe_fraction: 0.05,
+                        min_probe_clusters: 1,
+                        located: LocatedPath::Off,
+                        ..Default::default()
+                    })
+                    .build();
+                collector.merge_fruits(collector.collect_segments(
+                    fixtures[0].weight(&AllQuery)?.as_ref(),
+                    &segments,
+                    |_| {},
+                )?)
+            };
+            let lazy = run()?;
+            assert_eq!(lazy.results.len(), 5);
+            assert!(lazy
+                .results
+                .iter()
+                .all(|(_, address)| address.segment_ord == nearest as u32));
+            assert!(fields[nearest].search_initialized());
+            let initialized = fields
+                .iter()
+                .filter(|field| field.search_initialized())
+                .count();
+            assert!(initialized < fields.len(), "opened {initialized} segments");
+            for (field, stats) in fields.iter().zip(&lazy.stats) {
+                if !field.search_initialized() {
+                    assert_eq!(stats.clusters_probed(), 0);
+                    assert_eq!(stats.candidates_scored, 0);
+                }
+            }
+            for field in fields {
+                field.search_reader()?;
+            }
+            assert_eq!(lazy.results, run()?.results);
         }
         Ok(())
     }

@@ -16,6 +16,7 @@
 
 use std::io::{self, Write};
 use std::ops::Deref;
+use std::sync::{Arc, OnceLock};
 use std::{fmt, mem};
 
 use common::{BinarySerializable, HasLen};
@@ -246,14 +247,13 @@ pub struct StackedIvf<S> {
 /// File-backed row-major `f32` matrix.
 ///
 /// Rows are fetched per call through a [`FileSliceArena`] unless the store
-/// was opened [`pinned`](Self::pinned), in which case the decoded rows are
-/// held in memory. Router-level centroids are pinned at open: they are
-/// `nlist × dim` (tiny next to the member rows) and APS needs the full
-/// matrix to compute query-to-bisector distances.
+/// uses [`pinned`](Self::pinned), which loads and retains the matrix on its first access.
+/// Opening a router does not read centroid arrays that traversal never reaches.
+#[derive(Clone)]
 pub(crate) struct LazyStore {
     arena: FileSliceArena<f32>,
     dim: usize,
-    pinned: Option<Vec<f32>>,
+    pinned: Option<Arc<OnceLock<crate::Result<Vec<f32>>>>>,
 }
 
 impl LazyStore {
@@ -266,26 +266,40 @@ impl LazyStore {
         }
     }
 
-    /// Wraps `rows` and decodes them into memory once, so
-    /// held in memory so scoring skips the file.
+    /// Keeps the matrix in memory after its first access.
     pub(crate) fn pinned(rows: FileSlice, dim: usize) -> io::Result<Self> {
-        let bytes = rows.read_bytes()?;
-        if bytes.len() % (dim * mem::size_of::<f32>()) != 0 {
+        if rows.len() % (dim * mem::size_of::<f32>()) != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "pinned store bytes are not a multiple of the row stride",
             ));
         }
-        let values = bytes
-            .as_slice()
-            .chunks_exact(mem::size_of::<f32>())
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("4-byte chunk")))
-            .collect();
         Ok(LazyStore {
             arena: FileSliceArena::new(rows),
             dim,
-            pinned: Some(values),
+            pinned: Some(Arc::new(OnceLock::new())),
         })
+    }
+
+    fn pinned_rows(&self) -> crate::Result<Option<&[f32]>> {
+        self.pinned
+            .as_ref()
+            .map(|rows| {
+                rows.get_or_init(|| {
+                    Ok(self
+                        .arena
+                        .slice
+                        .read_bytes()?
+                        .as_slice()
+                        .chunks_exact(4)
+                        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                        .collect())
+                })
+                .as_ref()
+                .map(Vec::as_slice)
+                .map_err(Clone::clone)
+            })
+            .transpose()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -294,7 +308,7 @@ impl LazyStore {
 
     /// Appends row `index` to `out`.
     pub(crate) fn extend_with_row(&self, index: u32, out: &mut Vec<f32>) -> io::Result<()> {
-        match &self.pinned {
+        match self.pinned_rows().map_err(io::Error::other)? {
             Some(rows) => out.extend_from_slice(&rows[index as usize * self.dim..][..self.dim]),
             None => {
                 let bytes = self.arena.row_bytes(self.dim, index)?;
@@ -326,7 +340,10 @@ impl VectorArena for LazyStore {
         index: u32,
         query: &[Self::Elem],
     ) -> Similarity {
-        match &self.pinned {
+        match self
+            .pinned_rows()
+            .expect("failed to read router centroid matrix")
+        {
             Some(rows) => metric.similarity(query, &rows[index as usize * dim..][..dim]),
             None => self.arena.similarity(metric, dim, index, query),
         }
@@ -824,9 +841,10 @@ impl StackedIvf<LazyStore> {
             start = end;
         }
 
-        // Every level's centroids are pinned: they are what APS reads, and
-        // they are small. L0 members (the caller's rows) stay file-backed;
-        // a parent's members are the level below's centroids, pinned too.
+        let centroid_stores = centroid_slices
+            .into_iter()
+            .map(|slice| LazyStore::pinned(slice, dim))
+            .collect::<io::Result<Vec<_>>>()?;
         let mut index: Option<Box<StackedIvf<LazyStore>>> = None;
         for level in (0..level_topology.len()).rev() {
             let (_, offsets) = &level_topology[level];
@@ -834,7 +852,7 @@ impl StackedIvf<LazyStore> {
                 (LazyStore::new(member_rows.clone(), dim), num_members)
             } else {
                 (
-                    LazyStore::pinned(centroid_slices[level - 1].clone(), dim)?,
+                    centroid_stores[level - 1].clone(),
                     level_topology[level - 1].0,
                 )
             };
@@ -852,7 +870,7 @@ impl StackedIvf<LazyStore> {
                 },
                 parent: index,
                 offsets: offsets.clone(),
-                centroids: LazyStore::pinned(centroid_slices[level].clone(), dim)?,
+                centroids: centroid_stores[level].clone(),
                 vectors: level_members,
             }));
         }
@@ -928,7 +946,10 @@ where S: VectorArena<Elem = f32>
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+    use crate::vector::storage::io::test_support::BlockTrackedBytes;
 
     fn line_data(n: usize) -> Vec<f32> {
         let mut data = Vec::with_capacity(n * 2);
@@ -1245,6 +1266,8 @@ mod tests {
 
         let mut slot = Vec::new();
         index.serialize_router_payload(&mut slot).unwrap();
+        let centroid_offset = u64::from_le_bytes(slot[..8].try_into().unwrap()) as usize;
+        let reads = Arc::new(Mutex::new(Vec::new()));
         let member_bytes: Vec<u8> = index
             .vectors
             .as_slice()
@@ -1252,12 +1275,32 @@ mod tests {
             .flat_map(|value| value.to_le_bytes())
             .collect();
         let opened = StackedIvf::<LazyStore>::open(
-            FileSlice::from(slot),
+            FileSlice::new(Arc::new(BlockTrackedBytes {
+                bytes: slot,
+                reads: Arc::clone(&reads),
+                block_len: 16,
+            })),
             FileSlice::from(member_bytes),
             dim,
             index.config.clone(),
         )
         .unwrap();
+        assert!(reads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|range| range.end <= centroid_offset));
+        assert!(Arc::ptr_eq(
+            opened.centroids.pinned.as_ref().unwrap(),
+            opened
+                .parent
+                .as_ref()
+                .unwrap()
+                .vectors
+                .pinned
+                .as_ref()
+                .unwrap(),
+        ));
 
         assert_eq!(opened.depth(), index.depth());
         assert_eq!(opened.offsets, index.offsets);
@@ -1276,6 +1319,15 @@ mod tests {
                 assert_eq!(g.sim, e.sim);
             }
         }
+        assert_eq!(
+            reads
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|range| range.start >= centroid_offset)
+                .count(),
+            opened.depth()
+        );
     }
 
     /// Empty lists after `add_level` share start offsets with the next
