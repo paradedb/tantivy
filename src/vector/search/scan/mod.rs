@@ -365,7 +365,7 @@ impl<'a> QuantizedState<'a> {
             report.layers[0].admission_pruned = self.layer0_admission_pruned;
             report.layers[0].scored = self.layer0_scored;
         } else {
-            report.layers[layer].scored += self.candidates.len();
+            report.layers[layer].scored = self.candidates.len();
         }
         #[cfg(test)]
         {
@@ -386,7 +386,7 @@ impl<'a> QuantizedState<'a> {
             .shared_threshold()
             .map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score)));
         self.candidates.band(threshold);
-        report.layers[layer].survivors += self.candidates.len();
+        report.layers[layer].survivors = self.candidates.len();
         #[cfg(test)]
         report
             .trace
@@ -476,22 +476,6 @@ where
         self.bound.swap_topk(top);
     }
 
-    pub(crate) fn run_cluster(&mut self, rows: &ClusterRows<'_>) -> crate::Result<usize> {
-        let stage = enter_vector_stage(self.shortlist_stage());
-        let scored = self.shortlist(rows)?;
-        drop(stage);
-        self.close_shortlist();
-        for layer in self.refining_layers() {
-            self.narrow(layer)?;
-        }
-        self.score_shortlist()?;
-        if let Some(state) = &mut self.quantized {
-            state.candidates.clear();
-        }
-        self.by_cluster.clear();
-        Ok(scored)
-    }
-
     /// Scores one segment: shortlists each cluster `source` supplies, narrows the shortlist one
     /// quantized layer at a time, then scores what is left exactly.
     pub(crate) fn run(&mut self, source: &mut impl ClusterSource) -> crate::Result<()> {
@@ -501,6 +485,10 @@ where
             source.admitted(scored, self.feedback())?;
         }
         drop(stage);
+        self.refine_shortlist()
+    }
+
+    pub(crate) fn refine_shortlist(&mut self) -> crate::Result<()> {
         self.close_shortlist();
         for layer in self.refining_layers() {
             self.narrow(layer)?;
@@ -544,7 +532,8 @@ where
     /// Adds a cluster's rows to the shortlist: scored immediately at full precision or when an
     /// exact read is strictly cheaper than the layer-0 read, otherwise as quantized candidates.
     /// Returns the rows scored.
-    fn shortlist(&mut self, rows: &ClusterRows<'_>) -> crate::Result<usize> {
+    pub(crate) fn shortlist(&mut self, rows: &ClusterRows<'_>) -> crate::Result<usize> {
+        let _stage = enter_vector_stage(self.shortlist_stage());
         let len = rows.len();
         debug_assert!(len > 0, "empty clusters never reach the scan");
         #[cfg(test)]

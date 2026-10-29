@@ -739,7 +739,7 @@ where
             let Some(plan) = plan else {
                 return Ok((None, None, None));
             };
-            let capacity = plan.capacity_hint().min(4096);
+            let capacity = plan.capacity_hint();
             let SegmentPlan {
                 budget,
                 source,
@@ -812,7 +812,7 @@ where
         scan.swap_topk(&mut topk);
         let (result, measured) = measure(|| {
             while let Some(rows) = source.next()? {
-                let scored = scan.run_cluster(&rows)?;
+                let scored = scan.shortlist(&rows)?;
                 source.admitted(scored, scan.feedback())?;
             }
             Ok::<_, TantivyError>(())
@@ -834,12 +834,23 @@ where
         let (result, measured) = measure(|| {
             meter.open();
             if let Some(rows) = source.probe_global(candidate, scan.feedback())? {
-                let scored = scan.run_cluster(&rows)?;
+                let scored = scan.shortlist(&rows)?;
                 source.admitted(scored, scan.feedback())?;
                 meter.rows(scored);
             }
             Ok::<_, TantivyError>(())
         });
+        scan.swap_topk(&mut topk);
+        totals[i].append(&measured);
+        on_segment(i);
+        result?;
+    }
+    for (i, scan) in scans.iter_mut().enumerate() {
+        let Some(scan) = scan else {
+            continue;
+        };
+        scan.swap_topk(&mut topk);
+        let (result, measured) = measure(|| scan.refine_shortlist());
         scan.swap_topk(&mut topk);
         totals[i].append(&measured);
         on_segment(i);
@@ -1026,6 +1037,66 @@ mod ivf_e2e_tests {
                         assert_eq!(threshold.load().is_some(), !fruit.results.is_empty());
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn global_search_shortlists_all_clusters_before_refining() -> Result<()> {
+        use crate::vector::VectorStage;
+
+        let fixture = FixtureSpec::clustered(Metric::L2, 128, 8, 768)
+            .segments(3)
+            .schedule(&[1, 1])
+            .label("matches", |i| i % 3 == 0)
+            .paged()
+            .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let readers: Vec<_> = searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .map(|(ord, reader)| (ord as u32, reader))
+            .collect();
+        let mut query = vec![0.01; 128];
+        query[2] = 1.0;
+        for filter in [&AllQuery as &dyn Query, &fixture.filter("matches")] {
+            for located in [LocatedPath::Off, LocatedPath::Auto] {
+                let collector = TopDocs::with_limit(10)
+                    .order_by_similarity(fixture.field, query.clone())
+                    .with_probe_params(ProbeParams {
+                        located,
+                        exact_plan: false,
+                        ..exhaustive_params(8)
+                    })
+                    .build();
+                let weight = fixture.weight(filter)?;
+                fixture.clear_reads();
+                let result = collector.merge_fruits(collector.collect_segments(
+                    weight.as_ref(),
+                    &readers,
+                    |_| {},
+                )?)?;
+                let reads = fixture.reads();
+                let last_shortlist = reads
+                    .iter()
+                    .rposition(|(stage, _)| *stage == VectorStage::LayerScan(0))
+                    .expect("layer-0 reads");
+                let first_refinement = reads
+                    .iter()
+                    .position(|(stage, _)| {
+                        matches!(
+                            stage,
+                            VectorStage::LayerScan(1)
+                                | VectorStage::ExactScan
+                                | VectorStage::ExactFetch
+                                | VectorStage::ExactScore
+                        )
+                    })
+                    .expect("refinement reads");
+                assert!(last_shortlist < first_refinement, "{located:?}");
+                assert_eq!(result.results, fixture.oracle(filter, &query, 10)?);
             }
         }
         Ok(())
