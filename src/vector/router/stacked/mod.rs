@@ -5,7 +5,7 @@ pub(crate) mod levels;
 pub(crate) mod search;
 
 use crate::directory::FileSlice;
-use crate::schema::{Metric, VectorOptions};
+use crate::schema::VectorOptions;
 use crate::vector::clustering::IvfCentroids;
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::levels::{
@@ -13,6 +13,8 @@ use crate::vector::router::stacked::levels::{
     StackedSearchStats, SuperKMeansLevelClusterer, PARENT_NPROBE_FRACTION,
 };
 use crate::vector::router::{RouterMetrics, RoutingParams};
+use crate::vector::search::prepared::VectorQuery;
+use crate::vector::VectorElement;
 use crate::TantivyError;
 
 /// The router's [`StackedIvfConfig`]. The segment's own IVF (`.vec` rows under
@@ -82,10 +84,9 @@ pub(super) fn open(
     )?)
 }
 
-pub(super) fn rank(
+pub(super) fn rank<T: VectorElement>(
     index: &StackedIvf<LazyStore>,
-    query: &[f32],
-    metric: Metric,
+    query: &VectorQuery<T>,
     params: RoutingParams,
 ) -> Ranking {
     // Always return at most `params.k` L0 centroids. That `k` is the
@@ -97,7 +98,7 @@ pub(super) fn rank(
     // lists avoids the classic IVF boundary miss; capping the heap (and
     // thus `candidate_count`) is what ties the returned set to probe.
     let k = params.k.clamp(1, index.vectors.len().max(1));
-    let (ranked, stats) = index.search(query, k, metric);
+    let (ranked, stats) = index.search_prepared(query, k);
     let candidate_count = ranked.len();
     Ranking {
         ranked: ranked.into_iter(),

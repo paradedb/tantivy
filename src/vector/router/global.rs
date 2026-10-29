@@ -1,9 +1,11 @@
 use super::candidate::Candidate;
 use super::stacked::search::{AllScored, StackedRouting};
 use super::{OpenedRouter, Router, RouterMetrics};
+#[cfg(test)]
 use crate::schema::Metric;
+use crate::vector::search::prepared::VectorQuery;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
-use crate::vector::VectorStage;
+use crate::vector::{VectorElement, VectorStage};
 
 /// Clusters to probe across all segments, ordered by centroid similarity to the query.
 /// Each cluster carries its segment index, and metrics track the routing work for each segment.
@@ -13,10 +15,27 @@ pub(crate) struct GlobalRanking {
 }
 
 impl GlobalRanking {
+    #[cfg(test)]
     pub(crate) fn from(
         routers: &[Option<&OpenedRouter>],
         query: &[f32],
         metric: Metric,
+        k: usize,
+        totals: &mut [StageTotals],
+        on_segment: &mut impl FnMut(usize),
+    ) -> Self {
+        Self::from_prepared(
+            routers,
+            &VectorQuery::new(metric, std::sync::Arc::new(query.to_vec())),
+            k,
+            totals,
+            on_segment,
+        )
+    }
+
+    pub(crate) fn from_prepared<T: VectorElement>(
+        routers: &[Option<&OpenedRouter>],
+        query: &VectorQuery<T>,
         k: usize,
         totals: &mut [StageTotals],
         on_segment: &mut impl FnMut(usize),
@@ -56,7 +75,7 @@ impl GlobalRanking {
             totals,
             on_segment,
         }
-        .search(query, k.max(1), metric, AllScored::default());
+        .search_prepared(query, k.max(1), AllScored::default());
         for (stats, metrics) in ranking.stats.iter().zip(&mut metrics) {
             if let RouterMetrics::Stacked {
                 lists_scanned,

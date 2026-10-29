@@ -27,6 +27,7 @@ use crate::vector::distance::Similarity;
 use crate::vector::router::arena::{FileSliceArena, VectorArena};
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::search::{StackedRouting, TopK};
+use crate::vector::search::prepared::VectorQuery;
 use crate::vector::VectorElement;
 
 /// Row index into a level's centroid or member arena.
@@ -331,6 +332,22 @@ impl VectorArena for LazyStore {
             None => self.arena.similarity(metric, dim, index, query),
         }
     }
+
+    fn batch_similarity(
+        &self,
+        query: &[Self::Elem],
+        metric: Metric,
+        query_norm: f32,
+        rows: std::ops::Range<usize>,
+        out: &mut Vec<Similarity>,
+    ) {
+        match &self.pinned {
+            Some(values) => values.batch_similarity(query, metric, query_norm, rows, out),
+            None => self
+                .arena
+                .batch_similarity(query, metric, query_norm, rows, out),
+        }
+    }
 }
 
 trait SerializableStore {
@@ -422,7 +439,7 @@ where
     Ok(())
 }
 
-/// Work done by one [`StackedIvf::search`], summed over this level and
+/// Work done by one [`StackedIvf::search_prepared`], summed over this level and
 /// every parent above it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StackedSearchStats {
@@ -907,13 +924,25 @@ where S: VectorArena<Elem = f32>
     /// lists; without a parent every centroid is scored and only that many
     /// are expanded. Lists are scanned nearest centroid first.
     /// [`StackedRouting`] shares the layer walk and adaptive stopping with global routing.
+    #[cfg(any(test, feature = "unstable"))]
     pub fn search(
         &self,
         query: &[S::Elem],
         k: usize,
         metric: Metric,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-        let ranking = StackedRouting::Segment(self).search(query, k, metric, TopK);
+        self.search_prepared(
+            &VectorQuery::new(metric, std::sync::Arc::new(query.to_vec())),
+            k,
+        )
+    }
+
+    pub(crate) fn search_prepared<T: VectorElement>(
+        &self,
+        query: &VectorQuery<T>,
+        k: usize,
+    ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
+        let ranking = StackedRouting::Segment(self).search_prepared(query, k, TopK);
         let hits = ranking
             .candidates
             .into_iter()
@@ -1267,13 +1296,11 @@ mod tests {
             index.parent.as_ref().unwrap().offsets
         );
 
-        for query in [[0.0f32, 0.0], [7.5, 0.0], [15.2, 0.0], [31.0, 0.0]] {
-            let (expected, _) = index.search(&query, 4, Metric::L2);
-            let (got, _) = opened.search(&query, 4, Metric::L2);
-            assert_eq!(got.len(), expected.len());
-            for (g, e) in got.iter().zip(&expected) {
-                assert_eq!(g.node, e.node);
-                assert_eq!(g.sim, e.sim);
+        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+            for query in [[0.0f32, 0.0], [7.5, 0.0], [15.2, 0.0], [31.0, 0.0]] {
+                let (expected, _) = index.search(&query, 4, metric);
+                let (got, _) = opened.search(&query, 4, metric);
+                assert_eq!(got, expected);
             }
         }
     }

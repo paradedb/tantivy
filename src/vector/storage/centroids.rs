@@ -31,16 +31,18 @@ use common::{BinarySerializable, HasLen, OwnedBytes};
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RoutingParams};
+use crate::vector::search::prepared::VectorQuery;
 use crate::vector::storage::bounds::{BoundKind, BoundStore};
 use crate::vector::storage::header::VectorFileVersion;
 use crate::vector::storage::io::{VectorRead, VectorReadKind};
+use crate::vector::VectorElement;
 
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
 ///
 /// Pinned state is small and touched by every query: the cluster offsets, the bounds and the
-/// router's lists. The centroid vectors stay behind a [`FileSlice`] and are read one row at a
-/// time as routing visits them. Everything row-scale (the rows and id-map) lives on
+/// router's lists. The centroid vectors stay behind a [`FileSlice`] and are read in contiguous
+/// batches as routing visits them. Everything row-scale (the rows and id-map) lives on
 /// [`VectorIndexReader`](crate::vector::VectorIndexReader).
 pub(crate) struct ClusterIndex {
     num_centroids: usize,
@@ -128,7 +130,7 @@ impl ClusterIndex {
 
     /// Parse a field's `.centroids` slots. Only the count words, the offsets,
     /// the bounds, and the router topology are materialized; the centroid
-    /// rows stay behind a [`FileSlice`] for lazy per-node reads.
+    /// rows stay behind a [`FileSlice`] for lazy range reads.
     /// The router is opened as the kind persisted in `router_slice`.
     pub(crate) fn open(
         version: VectorFileVersion,
@@ -322,7 +324,7 @@ impl ClusterIndex {
     }
 
     /// The centroid rows, materialized in one read — for introspection and
-    /// tests only. Routing fetches per-node ranges through the lazy arena.
+    /// tests only. Routing fetches selected list ranges through the lazy arena.
     pub(crate) fn centroid_bytes(&self) -> crate::Result<OwnedBytes> {
         Ok(self.centroids_slice.read_bytes()?)
     }
@@ -334,12 +336,17 @@ impl ClusterIndex {
     /// Rank this segment's clusters for `query`, nearest first. `params`
     /// steers the stacked router only (how many clusters the caller will
     /// probe); other routers ignore it.
-    pub(crate) fn rank_clusters(&self, query: &[f32], params: RoutingParams) -> RouterIter {
+    pub(crate) fn rank_clusters<T: VectorElement>(
+        &self,
+        query: &VectorQuery<T>,
+        params: RoutingParams,
+    ) -> RouterIter {
         #[cfg(test)]
         if let Some(clusters) = crate::vector::router::test_clusters() {
             return clusters;
         }
-        self.router.rank(query, self.metric, params)
+        debug_assert_eq!(query.metric(), self.metric);
+        self.router.rank(query, params)
     }
 }
 

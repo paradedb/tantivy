@@ -983,6 +983,7 @@ mod bounds_storage_tests {
     use crate::vector::diagnostics::VectorStorageFormat;
     use crate::vector::router::stacked::levels::{InMemoryStore, StackedIvf, StackedIvfConfig};
     use crate::vector::router::RoutingParams;
+    use crate::vector::search::prepared::VectorQuery;
     use crate::vector::storage::bounds::{residual_norm, BoundKind};
     use crate::vector::storage::centroids::ClusterIndex;
     use crate::vector::storage::header::CENTROIDS_EXT;
@@ -1464,8 +1465,9 @@ mod bounds_storage_tests {
                 .into_iter()
                 .take(2)
                 .collect();
+            let prepared = VectorQuery::new(Metric::L2, Arc::new(query.to_vec()));
             let lazy: Vec<_> = ivf
-                .rank_clusters(&query, RoutingParams::default())
+                .rank_clusters(&prepared, RoutingParams::default())
                 .take(2)
                 .collect();
             assert_eq!(owned.len(), lazy.len());

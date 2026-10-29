@@ -225,7 +225,7 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
             ),
         };
         let _routing = enter_vector_stage(VectorStage::Routing);
-        let ranked = index.rank_clusters(query.widened(), routing);
+        let ranked = index.rank_clusters(query, routing);
         Self {
             index,
             reader,
