@@ -20,7 +20,7 @@ use crate::vector::test_support::{
     first_segment, ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg, ReadLog,
 };
 use crate::vector::tests::{exhaustive_params, routed_exhaustive_params};
-use crate::vector::{ProbeStats, RouterKind, VectorSimilarityFruit, VectorStage};
+use crate::vector::{ProbeStats, ProbeTermination, RouterKind, VectorSimilarityFruit, VectorStage};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal};
 
 // --- Oracle matrix ---
