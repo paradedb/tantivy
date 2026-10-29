@@ -1,10 +1,14 @@
 //! Planning one segment's search: the work budget, the filter, and where clusters come from.
+//!
+//! A segment search runs in this order: the plan picks the located or the routed path from the
+//! filter's matches and the located cap; the router ranks the clusters the budget sizes; the walk
+//! stops on the ceiling, on exhaustion or on the RateAPS.
 
 use common::BitSet;
 
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::query::{for_each_docset_buffered, AllScorer, Weight};
-use crate::vector::params::{LocatedPath, ProbeParams};
+use crate::vector::params::{LocatedPath, ProbeParams, LOCATED_MAX_SELECTIVITY};
 use crate::vector::search::source::controller::{WorkBudget, WorkUnits};
 use crate::vector::search::source::router::DocFilter;
 use crate::vector::storage::centroids::ClusterIndex;
@@ -37,7 +41,7 @@ impl Source {
 pub(crate) struct PlanReport {
     pub(crate) segment_rows: usize,
     pub(crate) segment_clusters: usize,
-    /// The located-path cap in matches; 0 with the located path off.
+    /// The located-path cap the plan used, in matches; 0 with the located path off.
     pub(crate) located_cap: usize,
 }
 
@@ -110,14 +114,17 @@ impl SegmentPlan {
 }
 
 /// The most matches, deleted ones included, a filter may have and take the located path; `Auto`
-/// prices the work budget `(budget, n_avg, x)` the routed path runs against.
+/// takes the smaller of the rows the work budget `(budget, n_avg, x)` scores and
+/// [`LOCATED_MAX_SELECTIVITY`] of `max_doc`.
 fn located_cap(located: LocatedPath, max_doc: DocId, budget: f64, n_avg: f64, x: f64) -> usize {
+    let share = |selectivity: f32| (f64::from(selectivity) * f64::from(max_doc)).floor() as usize;
     match located {
         LocatedPath::Off => 0,
-        LocatedPath::MaxSelectivity(selectivity) => {
-            (f64::from(selectivity.get()) * f64::from(max_doc)).floor() as usize
+        LocatedPath::MaxSelectivity(selectivity) => share(selectivity.get()),
+        LocatedPath::Auto => {
+            let budget_rows = (budget * n_avg / (1.0 - x)).floor() as usize;
+            budget_rows.min(share(LOCATED_MAX_SELECTIVITY))
         }
-        LocatedPath::Auto => (budget * n_avg / (1.0 - x)).floor() as usize,
     }
 }
 
@@ -180,6 +187,37 @@ mod tests {
     use crate::vector::stats::AccessPath;
     use crate::vector::test_support::{first_segment, DocsWeight, FixtureSpec};
     use crate::vector::tests::exhaustive_params;
+
+    /// The located cap per mode: `Auto` takes the smaller of the rows the budget scores and 5% of
+    /// `max_doc`; at `max_probe_fraction = 1.0` the 5% side binds.
+    #[test]
+    fn located_caps() -> crate::Result<()> {
+        let selectivity = LocatedPath::MaxSelectivity(Selectivity::new(0.25).unwrap());
+        // `max_doc = 1000` and 500-row clusters at x = 0.2: 0.05 units score 31 rows and 20 units
+        // 12,500; 5% of the docs is 50.
+        for (located, budget, cap) in [
+            (LocatedPath::Off, 20.0, 0),
+            (selectivity, 20.0, 250),
+            (LocatedPath::Auto, 0.05, 31),
+            (LocatedPath::Auto, 20.0, 50),
+        ] {
+            assert_eq!(
+                located_cap(located, 1_000, budget, 500.0, 0.2),
+                cap,
+                "{located:?} at budget {budget}"
+            );
+        }
+        let full = ProbeParams {
+            max_probe_fraction: 1.0,
+            ..ProbeParams::default()
+        };
+        let (budget, n_avg, x) = full.resolved_work_budget(2_450, 1_000_000)?;
+        assert_eq!(
+            located_cap(LocatedPath::Auto, 1_000_000, budget, n_avg, x),
+            50_000
+        );
+        Ok(())
+    }
 
     /// The plan resolves the budget once, builds no bitset for match-all filters, sees an empty
     /// filter or `top_n == 0` as nothing to search, and sizes the scan from the budget. A filter
@@ -328,32 +366,46 @@ mod tests {
         assert_eq!(Selectivity::new(1.5), None);
         assert_eq!(Selectivity::new(f32::NAN), None);
 
-        // `Auto` caps at the rows the routed budget buys: matches at the cap are located, one more
-        // routes, and a filter matching nothing still reports the cap.
+        // `Auto` caps at the smaller of the rows the routed budget buys and 5% of the segment's
+        // docs. At `max_probe_fraction = 1.0` the 5% side binds, floor(0.05 * 90) = 4: four matches
+        // are located and five route. At a small budget the budget side binds, and a filter under
+        // both caps is located. A filter matching nothing reports the cap and routes.
         let ivf_docs = ivf.num_docs();
-        let auto = ProbeParams {
-            max_probe_fraction: 0.2,
-            min_probe_clusters: 1,
+        let auto = |max_probe_fraction| ProbeParams {
+            max_probe_fraction,
+            min_probe_clusters: 0,
             located: LocatedPath::Auto,
             ..ProbeParams::default()
         };
-        let (budget, n_avg, x) = auto.resolved_work_budget(ivf.num_clusters(), ivf_docs)?;
-        let cap = (budget * n_avg / (1.0 - x)).floor() as usize;
-        assert!(cap > 0 && cap + 1 < segment.max_doc() as usize, "cap {cap}");
-        for (matches, path) in [
-            (cap, AccessPath::Located),
-            (cap + 1, AccessPath::Routed),
-            (0, AccessPath::Routed),
+        let budget_rows = |params: &ProbeParams| -> crate::Result<usize> {
+            let (budget, n_avg, x) = params.resolved_work_budget(ivf.num_clusters(), ivf_docs)?;
+            Ok((budget * n_avg / (1.0 - x)).floor() as usize)
+        };
+        assert_eq!(segment.max_doc(), 90);
+        let small = auto(0.02);
+        let small_cap = budget_rows(&small)?;
+        assert!(budget_rows(&auto(1.0))? > 4, "the 5% side binds at 1.0");
+        assert!(
+            small_cap > 0 && small_cap < 4,
+            "the budget side binds: {small_cap}"
+        );
+        for (params, matches, cap, path) in [
+            (auto(1.0), 4, 4, AccessPath::Located),
+            (auto(1.0), 5, 4, AccessPath::Routed),
+            (auto(1.0), 0, 4, AccessPath::Routed),
+            (small.clone(), small_cap, small_cap, AccessPath::Located),
+            (small.clone(), small_cap + 1, small_cap, AccessPath::Routed),
         ] {
             let weight = DocsWeight {
                 max_doc: segment.max_doc(),
                 docs: (0..matches as DocId).collect(),
             };
-            let (_, stats) = fixture.run_segment(0, &weight, &[0.0, 0.0], 10, auto.clone())?;
+            let probe = params.max_probe_fraction;
+            let (_, stats) = fixture.run_segment(0, &weight, &[0.0, 0.0], 10, params)?;
             assert_eq!(
                 (stats.located_cap, stats.access_path),
                 (cap, path),
-                "matches={matches}"
+                "matches={matches} at max_probe_fraction {probe}"
             );
         }
         // Every mode reports its cap, and an unfiltered query routes.

@@ -153,6 +153,7 @@ fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
                 .with_probe_params(ProbeParams {
                     max_probe_fraction: 1.0,
                     min_probe_clusters: 2,
+                    recall_target: 1.0,
                     ..Default::default()
                 })
                 .build(),
@@ -779,6 +780,7 @@ fn run_quantized_matrix_query(
             min_probe_clusters: 2,
             exact_plan: false,
             located: LocatedPath::Off,
+            recall_target: 1.0,
             ..Default::default()
         })
         .with_max_scan_levels(depth)
@@ -848,6 +850,7 @@ fn run_quantized_matrix_query(
             min_probe_clusters: 2,
             exact_plan: false,
             located: LocatedPath::Off,
+            recall_target: 1.0,
             ..Default::default()
         };
         let quantized = searcher.search(
@@ -989,6 +992,7 @@ fn level_zero_matches_unquantized_ivf() -> crate::Result<()> {
         min_probe_clusters: 1,
         exact_plan: false,
         located: LocatedPath::Off,
+        recall_target: 1.0,
         ..Default::default()
     };
     let unquantized = build_quantized_fixture(DIM, false)?;
@@ -1143,6 +1147,7 @@ fn mixed_segments_share_preparation_by_stored_metadata() -> crate::Result<()> {
                 .with_probe_params(ProbeParams {
                     max_probe_fraction: 1.0,
                     min_probe_clusters: 2,
+                    recall_target: 1.0,
                     ..Default::default()
                 })
                 .build()
@@ -1284,6 +1289,7 @@ fn merge_quantization_matches_kernel_harness_and_is_reproducible() -> crate::Res
             min_probe_clusters: 2,
             exact_plan: false,
             located: LocatedPath::Off,
+            recall_target: 1.0,
             ..Default::default()
         })
         .build();
@@ -1351,6 +1357,7 @@ fn quantized_bounds_gate_skips_provably_useless_cluster() -> crate::Result<()> {
             min_probe_clusters: 1,
             exact_plan: false,
             located: LocatedPath::Off,
+            recall_target: 1.0,
             ..Default::default()
         })
         .with_max_scan_levels(1)
@@ -1382,6 +1389,7 @@ fn quantized_probe_terminates_at_ceiling() -> crate::Result<()> {
             min_probe_clusters: 1,
             exact_plan: false,
             located: LocatedPath::Off,
+            recall_target: 1.0,
             ..Default::default()
         })
         .with_max_scan_levels(1)
@@ -1424,6 +1432,7 @@ fn quantized_filtered_rows_are_not_charged() -> crate::Result<()> {
         min_probe_clusters: 2,
         exact_plan: false,
         located: LocatedPath::Off,
+        recall_target: 1.0,
         ..Default::default()
     };
     let vector_reader = searcher.segment_readers()[0].vector_index(field)?;
@@ -1570,6 +1579,7 @@ fn general_dimension_quantized_bridge_at_d100() -> crate::Result<()> {
                 .with_probe_params(ProbeParams {
                     max_probe_fraction: 1.0,
                     min_probe_clusters: 2,
+                    recall_target: 1.0,
                     ..Default::default()
                 })
                 .build(),
@@ -1676,6 +1686,7 @@ fn estimator_measurement_uses_production_path_and_is_centered() -> crate::Result
                 min_probe_clusters: 2,
                 exact_plan: false,
                 located: LocatedPath::Off,
+                recall_target: 1.0,
                 ..Default::default()
             })
             .build(),
@@ -1770,6 +1781,7 @@ fn layer_zero_io_matches_requested_page_spans() -> crate::Result<()> {
                 min_probe_clusters: 2,
                 exact_plan: false,
                 located: LocatedPath::Off,
+                recall_target: 1.0,
                 ..Default::default()
             })
             .build(),

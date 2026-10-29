@@ -232,7 +232,7 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
             query,
             ranked,
             meter: WorkMeter::new(budget),
-            controller: ProbeController::new(clusters),
+            controller: ProbeController::new(clusters, params.rate_aps()),
             bounds: index.bounds(),
             tracker: QueryBoundTracker::new(),
             gate: RowGate::new(filter, segment.alive_bitset()),
@@ -329,7 +329,7 @@ impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
             let Some(Candidate { sim, node }) = next else {
                 return Ok(None);
             };
-            if !self.controller.admit(&self.meter) {
+            if !self.controller.admit(&self.meter, feedback.rate) {
                 return Ok(None);
             }
             let cluster = node as usize;

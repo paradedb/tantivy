@@ -20,7 +20,7 @@ use crate::vector::test_support::{
     first_segment, ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg, ReadLog,
 };
 use crate::vector::tests::{exhaustive_params, routed_exhaustive_params};
-use crate::vector::{ProbeStats, RouterKind, VectorSimilarityFruit, VectorStage};
+use crate::vector::{ProbeStats, ProbeTermination, RouterKind, VectorSimilarityFruit, VectorStage};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal};
 
 // --- Oracle matrix ---
@@ -654,6 +654,7 @@ fn adaptive_probe_finds_nn_outside_nearest_cluster() -> crate::Result<()> {
     let one_cluster = ProbeParams {
         max_probe_fraction: 0.5,
         min_probe_clusters: 1,
+        recall_target: 1.0,
         ..Default::default()
     };
     let missed = fixture.search(&AllQuery, &query, 1, one_cluster)?;
@@ -685,6 +686,7 @@ fn routes_home_below_ceiling() -> crate::Result<()> {
     let params = ProbeParams {
         max_probe_fraction: 0.1,
         min_probe_clusters: 1,
+        recall_target: 1.0,
         ..Default::default()
     };
     for centroid in centroids.iter().step_by(3) {
@@ -717,6 +719,187 @@ fn single_centroid_segment_routes() -> crate::Result<()> {
     let fruit = fixture.search(&AllQuery, &query, 3, ProbeParams::default())?;
     assert_eq!(fruit.results, fixture.oracle(&AllQuery, &query, 3)?);
     assert_eq!(fruit.stats[0].clusters_probed(), 1);
+    Ok(())
+}
+
+// --- RateAPS ---
+
+/// A point of the decay fixture: `(x, y)` in the first two of 64 dimensions.
+fn decay_point(x: f32, y: f32) -> Vec<f32> {
+    let mut point = vec![0.0; MATRIX_DIM];
+    point[0] = x;
+    point[1] = y;
+    point
+}
+
+/// Eight clusters around `(10 c, 0)` and a query at `(4, 0)`, ranking them in order. Cluster 0
+/// holds ten rows the next cluster's ten all beat; each later cluster holds 19 rows near its
+/// centroid and one 100 away, so no bound skips it while none of its rows survives.
+fn decay_fixture(schedule: &[u8]) -> crate::Result<Fixture> {
+    let centroids = (0..8).map(|c| decay_point(10.0 * c as f32, 0.0)).collect();
+    let mut vectors: Vec<Vec<f32>> = (0..10)
+        .map(|i| decay_point(-0.45 + 0.1 * i as f32, 0.0))
+        .chain((0..10).map(|i| decay_point(5.5 + 0.1 * i as f32, 0.0)))
+        .collect();
+    for c in 2..8 {
+        let x = 10.0 * c as f32;
+        vectors.extend((0..19).map(|i| decay_point(x - 0.45 + 0.05 * i as f32, 0.0)));
+        vectors.push(decay_point(x, 100.0));
+    }
+    FixtureSpec::ivf(Metric::L2, centroids, vectors)
+        .schedule(schedule)
+        .build()
+}
+
+/// Every cluster of the decay fixture, with the planner's exact reads, under the RateAPS at
+/// `recall_target`.
+fn decay_params(recall_target: f32) -> ProbeParams {
+    ProbeParams {
+        recall_target,
+        located: LocatedPath::Off,
+        ..exhaustive_params(8)
+    }
+}
+
+/// On a steep decay the RateAPS stops the scan, whose hits are the top k of the clusters it
+/// probed; at a target of 1.0 the scan probes every cluster and reports no reading.
+#[test]
+fn rate_aps_returns_the_probed_prefix_top_k() -> crate::Result<()> {
+    let query = decay_point(4.0, 0.0);
+    for schedule in [&[][..], &[1, 4]] {
+        let fixture = decay_fixture(schedule)?;
+        let fruit = fixture.search(&AllQuery, &query, 10, decay_params(0.5))?;
+        let stats = &fruit.stats[0];
+        assert_eq!(
+            stats.termination,
+            ProbeTermination::RateDecayed,
+            "{stats:?}"
+        );
+        assert_eq!(stats.rate_stops, 1);
+        assert_eq!(stats.clusters_probed(), 3, "{schedule:?}");
+        let probed = fixture.doc_trace(&stats.quantized_trace)?.scored_docs;
+        let mut prefix = fixture.oracle(&AllQuery, &query, usize::MAX)?;
+        prefix.retain(|(_, address)| probed.binary_search(&address.doc_id).is_ok());
+        prefix.truncate(10);
+        assert_eq!(fruit.results, prefix, "{schedule:?}");
+
+        let full = fixture.search(&AllQuery, &query, 10, decay_params(1.0))?;
+        assert_eq!(full.results, fixture.oracle(&AllQuery, &query, 10)?);
+        let full = &full.stats[0];
+        assert_eq!(full.termination, ProbeTermination::Exhausted);
+        assert_eq!(full.clusters_probed(), 8);
+        assert_eq!(
+            serde_json::to_value(full)?.get("rate_opening"),
+            None,
+            "the RateAPS off reports no reading"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn adaptive_stops_when_shared_threshold_prunes_every_local_candidate() -> crate::Result<()> {
+    let clusters = 32;
+    let centroids = (0..clusters)
+        .map(|c| one_hot(64, 0, 10.0 * c as f32))
+        .collect();
+    let mut vectors = Vec::new();
+    for c in 0..clusters {
+        let x = 10.0 * c as f32;
+        vectors.extend((0..100).map(|i| one_hot(64, 0, x - 0.45 + 0.009 * i as f32)));
+        let mut outlier = one_hot(64, 0, x);
+        outlier[1] = 1000.0;
+        vectors.push(outlier);
+    }
+    let rows = vectors.len();
+    let fixture = FixtureSpec::ivf(Metric::L2, centroids, vectors)
+        .schedule(&[1, 4])
+        .build()?;
+    let query = one_hot(64, 0, 4.0);
+    for target in [0.95, 1.0] {
+        let slot = Arc::new(AtomicSharedThreshold::default());
+        seed_slot(&slot, -1.0);
+        let params = ProbeParams {
+            recall_target: target,
+            exact_plan: false,
+            located: LocatedPath::Off,
+            ..exhaustive_params(clusters)
+        };
+        let fruit = fixture.search_with(&AllQuery, &query, 10, 0, params, Some(slot))?;
+        let stats = &fruit.stats[0];
+        assert!(fruit.results.is_empty());
+        assert_eq!(stats.exact_rows, 0);
+        assert_eq!(
+            stats.layers.get(0).unwrap().admission_pruned(),
+            stats.candidates_scored
+        );
+        if target < 1.0 {
+            assert_eq!(
+                stats.termination,
+                crate::vector::ProbeTermination::OpeningEmpty
+            );
+            assert!(stats.clusters_probed() < clusters);
+            assert!(stats.candidates_scored < rows);
+        } else {
+            assert_eq!(
+                stats.termination,
+                crate::vector::ProbeTermination::Exhausted
+            );
+            assert_eq!(stats.clusters_probed(), clusters);
+            assert_eq!(stats.candidates_scored, rows);
+        }
+    }
+    Ok(())
+}
+
+/// Each shortlisted row folds exactly once, at the read that scores it: a layer read, a planned
+/// exact read and a full-precision read alike. Nothing folds with the RateAPS off.
+#[test]
+fn rate_folds_every_shortlisted_row_once() -> crate::Result<()> {
+    /// The rows a run's stats count as scored by the read under test.
+    type Scored = fn(&ProbeStats) -> usize;
+    let query = decay_point(4.0, 0.0);
+    let layer_scored: Scored = |stats| stats.layers.get(0).map_or(0, LayerProbeStats::scored);
+    let layer_exact: Scored = |stats| stats.layers.get(0).map_or(0, LayerProbeStats::exact_rows);
+    let full_precision: Scored = |stats| stats.exact_rows;
+    let runs: [(&str, &[u8], Option<PlanOverride>, Scored); 4] = [
+        (
+            "band",
+            &[1, 4],
+            Some(PlanOverride::read(LayerRead::Band)),
+            layer_scored,
+        ),
+        (
+            "sparse",
+            &[1, 4],
+            Some(PlanOverride::read(LayerRead::Sparse)),
+            layer_scored,
+        ),
+        (
+            "planned exact",
+            &[1, 4],
+            Some(PlanOverride::exact(|_, layer| layer == 0)),
+            layer_exact,
+        ),
+        ("full precision", &[], None, full_precision),
+    ];
+    for (name, schedule, plan, read) in runs {
+        let fixture = decay_fixture(schedule)?;
+        let weight = fixture.all()?;
+        let run = |recall_target| {
+            let params = decay_params(recall_target);
+            fixture.run_planned(0, weight.as_ref(), &query, 10, params, plan, true)
+        };
+        let (_, stats) = run(0.5)?;
+        assert_eq!(read(&stats), stats.candidates_scored, "{name}: {stats:?}");
+        let folds = &stats.quantized_trace.rate_folds;
+        assert_eq!(folds.len(), stats.clusters_probed(), "{name}");
+        for &(scored, folded) in folds {
+            assert_eq!(scored, folded, "{name}: {folds:?}");
+        }
+        let (_, stats) = run(1.0)?;
+        assert!(stats.quantized_trace.rate_folds.is_empty(), "{name}");
+    }
     Ok(())
 }
 
@@ -851,6 +1034,7 @@ fn every_cluster() -> ProbeParams {
         min_probe_clusters: 4,
         exact_plan: false,
         located: LocatedPath::Off,
+        recall_target: 1.0,
         ..Default::default()
     }
 }

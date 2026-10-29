@@ -723,6 +723,7 @@ pub(crate) fn exhaustive_params(_num_centroids: usize) -> ProbeParams {
     ProbeParams {
         max_probe_fraction: 1.0,
         min_probe_clusters: 1,
+        recall_target: 1.0,
         ..Default::default()
     }
 }

@@ -515,6 +515,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                     min_probe_clusters: 4,
                     exact_plan: false,
                     located: LocatedPath::Off,
+                    recall_target: 1.0,
                     ..Default::default()
                 })
                 .build();

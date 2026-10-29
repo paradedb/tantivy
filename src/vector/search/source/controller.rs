@@ -1,8 +1,11 @@
-//! The probe budget: work units, their pricing and the probe controller.
+//! The probe budget and the stop: work units, their pricing, the RateAPS and the probe
+//! controller.
 //!
 //! One unit is one average cluster of work, `n_avg = N / C` across the index's IVF segments. An
 //! open charges `x` and a scored row `(1 - x) / n_avg`, so an exhaustive, unfiltered, delete-free
 //! scan charges exactly `C`. The budget is checked only between clusters.
+
+use crate::vector::search::scan::rate::RateReading;
 
 /// How the probe loop stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize)]
@@ -12,6 +15,56 @@ pub enum ProbeTermination {
     /// The router ran out of clusters before the budget was spent.
     #[default]
     Exhausted,
+    /// The RateAPS: the admission rate under the pruning threshold fell to its fraction of the
+    /// opening rate.
+    RateDecayed,
+    /// The RateAPS: no row of the opening window reaches the pruning threshold.
+    OpeningEmpty,
+}
+
+// --- RateAPS ---
+
+/// The RateAPS: stops a routed scan once the admission rate has fallen to `fraction` of its
+/// opening level.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RateAps {
+    fraction: f32,
+}
+
+impl RateAps {
+    /// Expected admissions below which a zero in the recent window proves nothing.
+    ///
+    /// Five expected admissions make an empty recent window a 0.7% event under no decay.
+    pub(crate) const MIN_EVIDENCE: f32 = 5.0;
+
+    /// The RateAPS for `recall_target`: `f = 1 - target`, clamped to `[1/256, 1/2]`.
+    pub(crate) fn from_target(recall_target: f32) -> Self {
+        Self {
+            fraction: (1.0 - recall_target).clamp(1.0 / 256.0, 0.5),
+        }
+    }
+
+    /// Fewer than one opening row above the bar ends the segment; too little evidence continues;
+    /// otherwise the rate has decayed once the current share is at most `f` of the opening's.
+    pub(crate) fn verdict(&self, reading: RateReading) -> RateVerdict {
+        if reading.opening_rows < 1.0 {
+            RateVerdict::OpeningEmpty
+        } else if reading.evidence < Self::MIN_EVIDENCE {
+            RateVerdict::Continue
+        } else if reading.current <= self.fraction * reading.opening {
+            RateVerdict::Decayed
+        } else {
+            RateVerdict::Continue
+        }
+    }
+}
+
+/// What the RateAPS makes of a reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RateVerdict {
+    Continue,
+    Decayed,
+    OpeningEmpty,
 }
 
 // --- Work units ---
@@ -132,28 +185,54 @@ impl WorkMeter {
 
 // --- Controller ---
 
-/// Decides, from the work meter, whether the next ranked cluster opens.
+/// Applies the RateAPS and decides, from the work meter, whether the next ranked cluster opens.
 pub(in crate::vector) struct ProbeController {
     termination: ProbeTermination,
     /// Clusters in the segment and clusters pulled from the ranking so far.
     clusters: usize,
     pulled: usize,
+    /// The RateAPS; `None` at a target of `1.0`.
+    aps: Option<RateAps>,
+    /// The last admission-rate reading the RateAPS judged, and its verdict.
+    reading: Option<RateReading>,
+    verdict: RateVerdict,
 }
 
 impl ProbeController {
-    pub(in crate::vector) fn new(clusters: usize) -> Self {
+    pub(in crate::vector) fn new(clusters: usize, aps: Option<RateAps>) -> Self {
         Self {
             termination: ProbeTermination::Exhausted,
             clusters,
             pulled: 0,
+            aps,
+            reading: None,
+            verdict: RateVerdict::Continue,
         }
     }
 
-    /// Whether the cluster just pulled from the ranking may open.
+    /// Whether the cluster just pulled from the ranking may open: not past the RateAPS's stop or
+    /// the ceiling, in that order. `rate` is the scan's reading after the clusters before it.
     ///
     /// Checked after the pull, so a stop proves another cluster existed.
-    pub(in crate::vector) fn admit(&mut self, meter: &WorkMeter) -> bool {
+    pub(in crate::vector) fn admit(
+        &mut self,
+        meter: &WorkMeter,
+        rate: Option<RateReading>,
+    ) -> bool {
         self.pulled += 1;
+        if let (Some(aps), Some(reading)) = (self.aps, rate) {
+            self.reading = Some(reading);
+            self.verdict = aps.verdict(reading);
+        }
+        let stop = match self.verdict {
+            RateVerdict::Continue => None,
+            RateVerdict::Decayed => Some(ProbeTermination::RateDecayed),
+            RateVerdict::OpeningEmpty => Some(ProbeTermination::OpeningEmpty),
+        };
+        if let Some(termination) = stop {
+            self.termination = termination;
+            return false;
+        }
         if meter.exhausted() {
             self.termination = ProbeTermination::Ceiling;
             return false;
@@ -175,6 +254,7 @@ impl ProbeController {
             termination,
             work_charged: meter.charged().to_f32(),
             work_budget: meter.budget().total.to_f32(),
+            rate: self.reading,
         }
     }
 }
@@ -187,4 +267,65 @@ pub(crate) struct ProbeOutcome {
     pub(crate) work_charged: f32,
     /// The resolved budget the loop ran against, in work units.
     pub(crate) work_budget: f32,
+    /// The last admission-rate reading the RateAPS judged; `None` with it off or before the
+    /// opening existed.
+    pub(crate) rate: Option<RateReading>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vector::search::scan::rate::OpeningSource;
+
+    fn reading(opening_rows: f32, opening: f32, current: f32, evidence: f32) -> RateReading {
+        RateReading {
+            opening,
+            opening_rows,
+            current,
+            evidence,
+            opening_from: OpeningSource::Own,
+        }
+    }
+
+    /// Under one opening row the segment ends whatever else holds; under five expected admissions
+    /// the RateAPS continues; past both it stops once the current share is at most `f` of the
+    /// opening's.
+    #[test]
+    fn rate_verdicts() {
+        use RateVerdict::{Continue, Decayed, OpeningEmpty};
+        // f = 1/4.
+        let aps = RateAps::from_target(0.75);
+        let cases = [
+            ((0.0, 0.0, 0.0, 0.0), OpeningEmpty),
+            ((0.5, 0.01, 0.0, 100.0), OpeningEmpty),
+            ((0.5, 0.01, 1.0, 100.0), OpeningEmpty),
+            ((1.0, 0.5, 0.0, 4.99), Continue),
+            ((40.0, 0.5, 0.0, 4.99), Continue),
+            ((1.0, 0.5, 0.0, 5.0), Decayed),
+            ((10.0, 0.5, 0.125, 50.0), Decayed),
+            ((10.0, 0.5, 0.126, 50.0), Continue),
+            ((10.0, 0.5, 0.5, 50.0), Continue),
+            ((10.0, 0.5, 0.75, 50.0), Continue),
+        ];
+        for ((opening_rows, opening, current, evidence), verdict) in cases {
+            let reading = reading(opening_rows, opening, current, evidence);
+            assert_eq!(aps.verdict(reading), verdict, "{reading:?}");
+        }
+    }
+
+    /// `f = 1 - target`, clamped to `[1/256, 1/2]`.
+    #[test]
+    fn rate_fraction_from_target() {
+        for (target, fraction) in [
+            (0.0, 0.5),
+            (0.4, 0.5),
+            (0.5, 0.5),
+            (0.75, 0.25),
+            (0.9, 1.0 - 0.9f32),
+            (0.999, 1.0 / 256.0),
+            (1.0, 1.0 / 256.0),
+        ] {
+            assert_eq!(RateAps::from_target(target).fraction, fraction, "{target}");
+        }
+    }
 }

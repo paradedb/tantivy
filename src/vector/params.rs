@@ -1,6 +1,6 @@
-//! Query-time probe parameters: the work budget and the located path.
+//! Query-time probe parameters: the work budget, the RateAPS target and the located path.
 
-use crate::vector::search::source::controller::open_share;
+use crate::vector::search::source::controller::{open_share, RateAps};
 
 /// Default [`ProbeParams::fixed_probe_cost_rows`]: the cost of opening a cluster, in rows of full
 /// work, fitted on the reference fixture.
@@ -9,24 +9,38 @@ use crate::vector::search::source::controller::open_share;
 /// It covers the open only; routing cost is not modeled.
 pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 
+/// The most of a segment's docs, as a fraction of `max_doc`, a filter may match and still be
+/// scored through the document location map under [`LocatedPath::Auto`].
+pub const LOCATED_MAX_SELECTIVITY: f32 = 0.05;
+
 /// Query-time probe budget for IVF vector search.
 ///
 /// The budget is in work units: one unit is one average cluster of work, charged per opened
 /// cluster and per scored row, so a selective filter probes further down the ranking. A segment
-/// scan stops when its budget is spent or its ranking runs out. The numeric defaults are
-/// provisional pending real-data benchmarking.
+/// scan stops when its budget is spent, its ranking runs out or, below a `recall_target` of 1.0,
+/// the RateAPS ends it. By default the RateAPS runs at a target of 0.95 under a ceiling of a tenth
+/// of each segment's capacity.
 #[derive(Clone, Debug)]
 pub struct ProbeParams {
-    /// Work ceiling as a fraction of each segment's capacity. Default 0.01.
+    /// Work ceiling as a fraction of each segment's capacity; below a `recall_target` of 1.0 it is
+    /// the ceiling the RateAPS stops under. Default 0.1.
     pub max_probe_fraction: f32,
     /// Floor on the resolved budget, in work units, applied before the capacity cap. Default 16.
     pub min_probe_clusters: usize,
+    /// Target of the RateAPS, the adaptive stop of a routed segment scan, in `(0, 1]`. Below `1.0`
+    /// a scan stops once the rate of rows that can still enter the top k, read under the pruning
+    /// threshold, has decayed to `1 - recall_target` of its opening level, clamped to
+    /// `[1/256, 1/2]`; `max_probe_fraction` is then the ceiling and still sizes the ranking. `1.0`
+    /// leaves the budget as the only bound. Default `0.95`.
+    pub recall_target: f32,
     /// Lets a quantized segment score a cluster's rows exactly before the exact phase when that
     /// reads strictly fewer storage blocks (bytes without block geometry) than the cheaper
     /// quantized read. Exact rows join the pruning bound as zero-width intervals. Default `true`.
     pub exact_plan: bool,
     /// Which segments locate their filter's matches through the document location map instead
-    /// of routing; unfiltered queries always route. Default [`LocatedPath::Auto`].
+    /// of routing; unfiltered queries always route. Under [`LocatedPath::Auto`] the cap is the
+    /// smaller of the rows the work budget scores and [`LOCATED_MAX_SELECTIVITY`] of the segment's
+    /// docs. Default [`LocatedPath::Auto`].
     pub located: LocatedPath,
     /// Cost of opening a cluster, in rows of full work; finite and positive. Default
     /// [`DEFAULT_FIXED_PROBE_COST_ROWS`].
@@ -43,9 +57,9 @@ pub enum LocatedPath {
     Off,
     /// The cap is `floor(selectivity * max_doc)`.
     MaxSelectivity(Selectivity),
-    /// The cap is the rows the segment's routed work budget buys with no cluster opened,
-    /// `floor(budget * n_avg / (1 - x))`: a filter matching no more documents than routing may
-    /// score is located instead.
+    /// The cap is the smaller of the rows the segment's routed work budget buys with no cluster
+    /// opened, `floor(budget * n_avg / (1 - x))`, and [`LOCATED_MAX_SELECTIVITY`] of the segment's
+    /// docs, `floor(0.05 * max_doc)`: a filter matching no more documents is located instead.
     Auto,
 }
 
@@ -68,8 +82,9 @@ impl Selectivity {
 impl Default for ProbeParams {
     fn default() -> Self {
         Self {
-            max_probe_fraction: 0.01,
+            max_probe_fraction: 0.1,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
+            recall_target: 0.95,
             exact_plan: true,
             located: LocatedPath::Auto,
             fixed_probe_cost_rows: DEFAULT_FIXED_PROBE_COST_ROWS,
@@ -80,6 +95,11 @@ impl Default for ProbeParams {
 pub(crate) const MIN_PROBE_CLUSTERS: usize = 16;
 
 impl ProbeParams {
+    /// The RateAPS `recall_target` arms; `None` at `1.0`, where the budget is the only bound.
+    pub(crate) fn rate_aps(&self) -> Option<RateAps> {
+        (self.recall_target < 1.0).then(|| RateAps::from_target(self.recall_target))
+    }
+
     /// The number of clusters the stacked router is asked to rank for a
     /// segment whose resolved work budget is `budget` units.
     ///
