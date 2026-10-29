@@ -1,7 +1,7 @@
 //! Per-segment vector metadata, block columns and optional IVF routing.
 //!
-//! Metadata opens independently of search state. The first search-reader request
-//! pins routing state and validates deferred row-group geometry. Clustered IdMap
+//! Routing opens independently of row storage. The first search-reader request
+//! validates deferred row metadata and row-group geometry. Clustered IdMap
 //! entries open only for document lookups.
 //! Cluster boundaries come from the centroid file. See FORMAT.md.
 
@@ -25,8 +25,7 @@ use crate::vector::storage::id_map::{DocLocation, IdMap};
 use crate::vector::storage::io::{VectorRead, VectorReadKind};
 use crate::vector::storage::metadata::{SlotType, VectorColMetadata};
 use crate::vector::storage::quantized::{
-    exact_read_cost, range_cost, QuantizedFieldReader, QuantizedIndexCtx, QuantizedLayerReader,
-    ReadCost, ReadScratch,
+    exact_read_cost, range_cost, QuantizedFieldReader, QuantizedLayerReader, ReadCost, ReadScratch,
 };
 use crate::{DocId, SegmentReader, TantivyError};
 
@@ -120,11 +119,29 @@ type CentroidSlices = (
 );
 
 struct VectorSource {
-    metadata: BlockMetadata,
-    composite: CompositeFile,
+    vectors: FileSlice,
+    storage: OnceLock<crate::Result<(CompositeFile, BlockMetadata)>>,
+    index: OnceLock<crate::Result<Option<Arc<ClusterIndex>>>>,
     field: Field,
     max_doc: DocId,
     centroid_slots: Option<CentroidSlices>,
+}
+
+impl VectorSource {
+    fn storage(&self, options: &VectorOptions) -> crate::Result<&(CompositeFile, BlockMetadata)> {
+        self.storage
+            .get_or_init(|| {
+                let composite = CompositeFile::open(&self.vectors)?;
+                validate_vector_entries(&composite, self.field)?;
+                let data = composite
+                    .open_read_with_idx(self.field, VectorEntry::Data.index())
+                    .unwrap();
+                let metadata = BlockMetadata::open(data, options, self.centroid_slots.is_some())?;
+                Ok((composite, metadata))
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
 }
 
 /// Opens an addressing entry only when a document lookup needs it; failures are shared.
@@ -176,7 +193,7 @@ pub struct VectorIndexReader {
     id_map: DeferredIdMap,
     /// Deferred row-group columns and their validated geometry.
     rows_slice: Arc<Blocks>,
-    pub(crate) index: Option<ClusterIndex>,
+    pub(crate) index: Option<Arc<ClusterIndex>>,
     pub(crate) quantization: Option<QuantizedFieldReader>,
 }
 
@@ -243,17 +260,12 @@ impl VectorFieldReader {
                 Err(err) => return Err(err.into()),
             };
 
-        let vec_composite = CompositeFile::open(&body)?;
-        validate_vector_entries(&vec_composite, field)?;
-        let data = vec_composite
-            .open_read_with_idx(field, VectorEntry::Data.index())
-            .unwrap();
-        let metadata = BlockMetadata::open(data, &options, centroid_slots.is_some())?;
         Ok(Self {
             options,
             source: Some(VectorSource {
-                metadata,
-                composite: vec_composite,
+                vectors: body,
+                storage: OnceLock::new(),
+                index: OnceLock::new(),
                 field,
                 max_doc: segment_reader.max_doc(),
                 centroid_slots,
@@ -263,10 +275,47 @@ impl VectorFieldReader {
     }
 
     #[cfg(test)]
-    pub(crate) fn metadata(&self) -> Option<Arc<VectorColMetadata>> {
+    pub(crate) fn metadata(&self) -> crate::Result<Option<Arc<VectorColMetadata>>> {
         self.source
             .as_ref()
-            .map(|source| Arc::clone(&source.metadata.meta))
+            .map(|source| {
+                source
+                    .storage(&self.options)
+                    .map(|(_, metadata)| Arc::clone(&metadata.meta))
+            })
+            .transpose()
+    }
+
+    /// Opens only the routing layout; vector columns and quantization wait until scoring.
+    pub(crate) fn routing_index(&self) -> crate::Result<Option<Arc<ClusterIndex>>> {
+        let Some(source) = &self.source else {
+            return Ok(None);
+        };
+        source
+            .index
+            .get_or_init(|| {
+                source
+                    .centroid_slots
+                    .clone()
+                    .map(|(version, centroids, offsets, router, bounds)| {
+                        ClusterIndex::open(
+                            version,
+                            &self.options,
+                            centroids,
+                            offsets,
+                            router,
+                            bounds,
+                        )
+                        .map(Arc::new)
+                    })
+                    .transpose()
+            })
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_initialized(&self) -> bool {
+        self.search.get().is_some()
     }
 
     /// Initializes and validates search bytes once, including failures shared by concurrent
@@ -284,24 +333,12 @@ impl VectorIndexReader {
         let Some(source) = &field.source else {
             return Ok(Self::empty(options));
         };
-        let centroid_slots = source.centroid_slots.clone();
+        let (composite, metadata) = source.storage(&options)?;
         let id_map = DeferredIdMap {
-            source: Some((source.composite.clone(), source.field, source.max_doc)),
+            source: Some((composite.clone(), source.field, source.max_doc)),
             value: OnceLock::new(),
         };
-        let index = if let Some((version, centroids, offsets, router_slot, bounds)) = centroid_slots
-        {
-            Some(ClusterIndex::open(
-                version,
-                &options,
-                centroids,
-                offsets,
-                router_slot,
-                bounds,
-            )?)
-        } else {
-            None
-        };
+        let index = field.routing_index()?;
         let num_rows = match &index {
             Some(index) => index.num_rows(),
             None => id_map.get(false)?.num_rows() as usize,
@@ -313,7 +350,7 @@ impl VectorIndexReader {
                 .collect()
         });
         let rows_slice = Arc::new(Blocks::from_metadata(
-            source.metadata.clone(),
+            metadata.clone(),
             num_rows,
             cluster_rows,
         )?);
@@ -360,7 +397,7 @@ impl VectorIndexReader {
                     });
                 }
                 Some(QuantizedFieldReader {
-                    index_ctx: Arc::new(QuantizedIndexCtx::new(Arc::clone(&rows_slice.meta))?),
+                    index_ctx: OnceLock::new(),
                     layers,
                     blocks: Arc::clone(&rows_slice),
                     norms: rows_slice
@@ -449,7 +486,7 @@ impl VectorIndexReader {
     /// The routing index, present iff the segment's rows are IVF-clustered; `None` means search
     /// scans the rows exactly.
     pub(crate) fn index(&self) -> Option<&ClusterIndex> {
-        self.index.as_ref()
+        self.index.as_deref()
     }
 
     pub(crate) fn quantization(&self) -> Option<&QuantizedFieldReader> {
@@ -926,15 +963,16 @@ mod tests {
         let field = Arc::new(VectorFieldReader {
             options,
             source: Some(VectorSource {
-                metadata,
-                composite: tracked_id_composite(ids, &id_reads),
+                vectors: FileSlice::from(Vec::new()),
+                storage: OnceLock::from(Ok((tracked_id_composite(ids, &id_reads), metadata))),
+                index: OnceLock::new(),
                 field: Field::from_field_id(0),
                 max_doc: 3,
                 centroid_slots: None,
             }),
             search: OnceLock::new(),
         });
-        assert!(field.metadata().is_some());
+        assert!(field.metadata().unwrap().is_some());
         assert!(field.search.get().is_none());
         assert!(id_reads.lock().unwrap().is_empty());
         assert!(data_reads.lock().unwrap().iter().all(|r| r.end <= prefix));
@@ -987,8 +1025,12 @@ mod tests {
         let id_reads = Arc::new(Mutex::new(Vec::new()));
         let field = VectorFieldReader {
             source: Some(VectorSource {
-                metadata: BlockMetadata::open(FileSlice::from(data), &options, false)?,
-                composite: tracked_id_composite(vec![0], &id_reads),
+                vectors: FileSlice::from(Vec::new()),
+                storage: OnceLock::from(Ok((
+                    tracked_id_composite(vec![0], &id_reads),
+                    BlockMetadata::open(FileSlice::from(data), &options, false)?,
+                ))),
+                index: OnceLock::new(),
                 field: Field::from_field_id(0),
                 max_doc: 1,
                 centroid_slots: None,
@@ -996,7 +1038,7 @@ mod tests {
             options,
             search: OnceLock::new(),
         };
-        assert!(field.metadata().is_some());
+        assert!(field.metadata().unwrap().is_some());
         for _ in 0..2 {
             assert!(matches!(
                 field.search_reader(),
