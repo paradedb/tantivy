@@ -98,10 +98,7 @@ pub(super) fn rank<T: VectorElement>(
     // lists avoids the classic IVF boundary miss; capping the heap (and
     // thus `candidate_count`) is what ties the returned set to probe.
     let k = params.k.clamp(1, index.vectors.len().max(1));
-    let (ranked, stats) = match params.window {
-        Some(window) => index.search_windowed(query, k, Some(window)),
-        None => index.search_prepared(query, k),
-    };
+    let (ranked, stats) = index.search_prepared(query, k);
     let candidate_count = ranked.len();
     Ranking {
         ranked: ranked.into_iter(),
@@ -117,13 +114,8 @@ pub(crate) struct Ranking {
 }
 
 impl Ranking {
-    pub(super) fn unsearched_score(&self) -> Option<f32> {
-        self.stats.unsearched_score
-    }
-
     pub(super) fn metrics(&self) -> RouterMetrics {
         RouterMetrics::Stacked {
-            passes: 1,
             candidate_count: self.candidate_count,
             lists_scanned: self.stats.lists_scanned,
             members_scored: self.stats.members_scored,

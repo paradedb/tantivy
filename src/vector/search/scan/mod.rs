@@ -40,7 +40,6 @@ use crate::SegmentOrdinal;
 /// Sizes for one segment scan.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ScanConfig {
-    pub(crate) deferred_rerank: bool,
     pub(crate) quantized_recall: Option<crate::vector::QuantizedRecallParams>,
     pub(crate) top_n: usize,
     /// Upper bound on rows admitted, for sizing the candidate columns.
@@ -411,7 +410,6 @@ where
     exact: ExactScorer<'a, T, K, C>,
     /// The segment's pruning bound.
     bound: PruningBound,
-    deferred_rerank: bool,
     quantized_recall_gap: Option<f64>,
     /// The quantized cascade; `None` scores every shortlisted row exactly.
     quantized: Option<QuantizedState<'a>>,
@@ -467,7 +465,6 @@ where
                 tie_comparator,
             ),
             bound,
-            deferred_rerank: config.deferred_rerank,
             quantized_recall_gap: config
                 .quantized_recall
                 .and_then(|p| p.gap_threshold(config.top_n)),
@@ -484,9 +481,6 @@ where
     /// Scores one segment: shortlists each cluster `source` supplies, narrows the shortlist one
     /// quantized layer at a time, then scores what is left exactly.
     pub(crate) fn run(&mut self, source: &mut impl ClusterSource) -> crate::Result<()> {
-        if self.deferred_rerank && self.quantized.is_some() {
-            return self.run_deferred(source);
-        }
         let stage = enter_vector_stage(self.shortlist_stage());
         let mut completed = 0;
         while let Some(rows) = source.next(self.feedback())? {
@@ -502,67 +496,6 @@ where
         for layer in self.refining_layers() {
             self.narrow(layer)?;
         }
-        self.score_shortlist()
-    }
-
-    fn run_deferred(&mut self, source: &mut impl ClusterSource) -> crate::Result<()> {
-        let mut completed = 0;
-        while let Some(rows) = source.next(self.feedback())? {
-            let block = self.quantized.as_ref().unwrap().candidates.block_count();
-            let scored = {
-                let _stage = enter_vector_stage(self.shortlist_stage());
-                self.shortlist(&rows)?
-            };
-            let state = self.quantized.as_mut().unwrap();
-            if state.candidates.block_count() > block {
-                for layer in 0..state.layers.len() {
-                    let _stage = enter_vector_stage(VectorStage::LayerScan(layer as u8));
-                    let count = state.candidates.rows(block).len();
-                    if layer > 0 {
-                        if count > 0 {
-                            let selected = state.candidates.rows(block);
-                            let read = state.read_plan(&selected, layer, &mut self.scratch)?;
-                            self.report.layers[layer].count(read, count);
-                            match read {
-                                Read::Exact => {
-                                    self.report.exact_rows += self.exact.score(
-                                        &selected,
-                                        &mut self.scratch,
-                                        &mut self.bound,
-                                    )?;
-                                    state.candidates.retire(block);
-                                    break;
-                                }
-                                Read::Layer(read) => {
-                                    state.refine(layer, block, read, &mut self.scratch)?
-                                }
-                            }
-                        }
-                        let at = state.candidates.block(block).at.clone();
-                        self.bound
-                            .offer(state.candidates.entries(at, state.segment_ord));
-                    }
-                    self.report.layers[layer].scored += count;
-                    state.recheck(block, &mut self.bound);
-                    let count = state.candidates.rows(block).len();
-                    self.report.layers[layer].survivors += count;
-                }
-            }
-            completed += 1;
-            source.admitted(scored, self.feedback())?;
-            if self.recall_reached(source, completed) {
-                break;
-            }
-        }
-        let state = self.quantized.as_mut().unwrap();
-        self.report.layers[0].scored = state.layer0_scored;
-        self.report.layers[0].admission_pruned = state.layer0_admission_pruned;
-        state.candidates.band(
-            self.bound
-                .shared_threshold()
-                .map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score))),
-        );
-        state.candidates.order_by_cluster(&mut self.by_cluster);
         self.score_shortlist()
     }
 
@@ -590,7 +523,7 @@ where
     fn feedback(&self) -> Feedback {
         Feedback {
             kth_lower: self.bound.shared_threshold(),
-            kth_estimate: self.bound.kth_estimate(),
+            kth_estimate: None,
         }
     }
 

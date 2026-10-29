@@ -115,37 +115,10 @@ impl BuiltRouter {
     }
 }
 
-/// Controls the probe window when searching parent router levels.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum RoutingWindow {
-    #[default]
-    Initial,
-    Doubled,
-    Full,
-}
-
-impl RoutingWindow {
-    pub(crate) fn next(self) -> Self {
-        match self {
-            Self::Initial => Self::Doubled,
-            Self::Doubled | Self::Full => Self::Full,
-        }
-    }
-
-    pub(crate) fn probes(self, initial: usize, total: usize) -> usize {
-        match self {
-            Self::Initial => initial.min(total),
-            Self::Doubled => initial.saturating_mul(2).min(total),
-            Self::Full => total,
-        }
-    }
-}
-
 /// Per-query routing knobs. Only the stacked router reads them; the exact router ranks the same
 /// way regardless.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RoutingParams {
-    pub(crate) window: Option<RoutingWindow>,
     /// Clusters the caller expects to probe. The stacked router opens
     /// enough lists to feed a size-`k` member heap via
     /// [`StackedIvf::lists_to_open`](crate::vector::router::stacked::levels::StackedIvf::lists_to_open).
@@ -154,10 +127,7 @@ pub(crate) struct RoutingParams {
 
 impl Default for RoutingParams {
     fn default() -> Self {
-        Self {
-            k: usize::MAX,
-            window: None,
-        }
+        Self { k: usize::MAX }
     }
 }
 
@@ -169,12 +139,6 @@ pub(crate) enum RouterIter {
 }
 
 impl RouterIter {
-    pub(crate) fn unsearched_score(&self) -> Option<f32> {
-        match self {
-            Self::Stacked(ranking) => ranking.unsearched_score(),
-            _ => None,
-        }
-    }
     pub(crate) fn for_each_candidate(&self, mut visit: impl FnMut(Candidate)) {
         match self {
             #[cfg(test)]
@@ -259,8 +223,6 @@ impl OpenedRouter {
 pub enum RouterMetrics {
     /// The stacked router's work.
     Stacked {
-        /// Routing passes, including expansions.
-        passes: usize,
         /// Ranked centroids handed to the probe loop.
         candidate_count: usize,
         /// Router lists opened, summed over every router level.
@@ -273,42 +235,6 @@ pub enum RouterMetrics {
         /// Centroids scored.
         visited_count: usize,
     },
-}
-
-impl RouterMetrics {
-    /// Accumulates diagnostic counters across routing passes, including repeated work.
-    pub(crate) fn accumulate(&mut self, next: Self) {
-        match (self, next) {
-            (
-                Self::Stacked {
-                    passes,
-                    candidate_count,
-                    lists_scanned,
-                    members_scored,
-                    ..
-                },
-                Self::Stacked {
-                    passes: next_passes,
-                    candidate_count: candidates,
-                    lists_scanned: lists,
-                    members_scored: members,
-                    ..
-                },
-            ) => {
-                *passes += next_passes;
-                *candidate_count += candidates;
-                *lists_scanned += lists;
-                *members_scored += members;
-            }
-            (
-                Self::Exact { visited_count },
-                Self::Exact {
-                    visited_count: count,
-                },
-            ) => *visited_count += count,
-            _ => unreachable!("router kind cannot change during expansion"),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -419,7 +345,6 @@ mod tests {
                 candidate_count,
                 lists_scanned,
                 members_scored,
-                ..
             } => (candidate_count, lists_scanned, members_scored),
             other => panic!("expected stacked metrics, got {other:?}"),
         }
@@ -430,10 +355,7 @@ mod tests {
     fn stacked_ranking_honors_k() -> crate::Result<()> {
         let opened = open_stacked(2, 64)?;
         let query = vec![0.0f32; 2];
-        let params = RoutingParams {
-            k: 8,
-            ..Default::default()
-        };
+        let params = RoutingParams { k: 8 };
         let query = VectorQuery::new(Metric::L2, Arc::new(query));
         let ranking = opened.rank(&query, params);
         let (candidates, lists, scored) = stacked_metrics(ranking.metrics());

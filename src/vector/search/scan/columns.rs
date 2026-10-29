@@ -144,10 +144,6 @@ impl QuantizedCandidates {
         self.kappa
     }
 
-    pub(crate) fn block_count(&self) -> usize {
-        self.blocks.len()
-    }
-
     /// The live candidates: every block's range, summed.
     pub(crate) fn len(&self) -> usize {
         self.blocks.iter().map(|block| block.at.len()).sum()

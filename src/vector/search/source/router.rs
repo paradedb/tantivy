@@ -7,7 +7,7 @@ use crate::fastfield::AliveBitSet;
 use crate::schema::Metric;
 use crate::vector::params::ProbeParams;
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::{RouterIter, RouterMetrics, RoutingParams, RoutingWindow};
+use crate::vector::router::{RouterIter, RouterMetrics, RoutingParams};
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource, Feedback};
 use crate::vector::search::prepared::VectorQuery;
 use crate::vector::search::source::controller::{
@@ -216,8 +216,6 @@ struct AdaptiveProgress {
     total: f64,
     remaining: f64,
     centroid: f64,
-    outside: f64,
-    frontier: Option<f64>,
 }
 
 impl AdaptiveProgress {
@@ -249,8 +247,6 @@ impl AdaptiveProgress {
             total,
             remaining: total,
             centroid: best,
-            outside: (clusters - count) as f64 / clusters.max(1) as f64,
-            frontier: ranked.unsearched_score().map(f64::from),
         })
     }
 
@@ -267,30 +263,9 @@ impl AdaptiveProgress {
         })
     }
 
-    fn score(
-        &self,
-        cutoff: f32,
-        completed: usize,
-        threshold: f64,
-        local_scale: f64,
-    ) -> Option<(f64, bool)> {
-        let local_miss = (-self.local_score(cutoff, completed)?).exp() * local_scale;
-        let routing_miss = self.routing_miss(cutoff);
-        let budget = (-threshold).exp();
-        Some((
-            -(local_miss + routing_miss).ln(),
-            local_miss <= budget && routing_miss >= budget,
-        ))
-    }
-
-    fn routing_miss(&self, cutoff: f32) -> f64 {
-        if self.outside == 0.0 {
-            return 0.0;
-        }
-        self.frontier.map_or(1.0, |frontier| {
-            let gap = (f64::from(cutoff) - frontier) / self.sigma;
-            self.outside * 0.5 * libm::erfc(gap / std::f64::consts::SQRT_2)
-        })
+    fn score(&self, cutoff: f32, completed: usize, local_scale: f64) -> Option<f64> {
+        self.local_score(cutoff, completed)
+            .map(|score| score - local_scale.ln())
     }
 }
 
@@ -312,7 +287,7 @@ mod adaptive_tests {
     }
 
     #[test]
-    fn concentrated_matches_delay_local_stopping_without_discounting_routing_risk() {
+    fn concentrated_matches_delay_local_stopping() {
         let mut uniform = ClusterEvidence::default();
         let mut concentrated = ClusterEvidence::default();
         for matches in [100, 0, 0, 0] {
@@ -323,39 +298,16 @@ mod adaptive_tests {
         assert_eq!(uniform.risk_scale(), 1.0);
         assert_eq!(concentrated.risk_scale(), 2.0);
 
-        let mut progress = AdaptiveProgress {
+        let progress = AdaptiveProgress {
             weights: Box::default(),
             sigma: 1.0,
             total: 1.0,
             remaining: 0.1,
             centroid: 0.0,
-            outside: 0.0,
-            frontier: Some(0.0),
         };
         let threshold = -0.03_f64.ln();
-        assert!(
-            progress
-                .score(0.0, 4, threshold, uniform.risk_scale())
-                .unwrap()
-                .0
-                >= threshold
-        );
-        assert!(
-            progress
-                .score(0.0, 4, threshold, concentrated.risk_scale())
-                .unwrap()
-                .0
-                < threshold
-        );
-
-        progress.remaining = 0.0;
-        progress.outside = 0.5;
-        for scale in [0.1, uniform.risk_scale(), concentrated.risk_scale(), 100.0] {
-            let (score, expand) = progress.score(0.0, 4, threshold, scale).unwrap();
-            assert_eq!((-score).exp(), progress.routing_miss(0.0));
-            assert!(score < threshold);
-            assert!(expand);
-        }
+        assert!(progress.score(0.0, 4, uniform.risk_scale()).unwrap() >= threshold);
+        assert!(progress.score(0.0, 4, concentrated.risk_scale()).unwrap() < threshold);
     }
 
     #[test]
@@ -391,86 +343,6 @@ mod adaptive_tests {
                 reference = Some(score);
                 assert!(progress.local_score(f32::NAN, 2).is_none());
                 assert!(progress.local_score(0.0, 0).is_none());
-            }
-        }
-    }
-
-    #[test]
-    fn competitive_unexplored_frontier_does_not_decay_with_completed_clusters() {
-        let candidates: Vec<_> = (0..100)
-            .map(|node| Candidate {
-                node,
-                sim: Similarity::new(1.0 - node as f32 / 100.0),
-            })
-            .collect();
-        let ranked = RouterIter::Explicit(candidates.clone().into_iter());
-        let mut progress = AdaptiveProgress::new(&ranked, 10_000, |_| 100).unwrap();
-        progress.frontier = Some(2.0);
-        let threshold = crate::vector::QuantizedRecallParams {
-            target: 0.95,
-            recall_exponent: 1.5,
-        }
-        .gap_threshold(10)
-        .unwrap();
-        let routing_miss = progress.routing_miss(1.0);
-        assert!(routing_miss >= progress.outside / 2.0);
-        for (i, candidate) in candidates.into_iter().enumerate() {
-            progress.complete(candidate);
-            assert_eq!(progress.routing_miss(1.0), routing_miss);
-            let (score, expand) = progress.score(1.0, i + 1, threshold, 1.0).unwrap();
-            assert!(score < threshold, "stopped after {} clusters", i + 1);
-            if (-progress.local_score(1.0, i + 1).unwrap()).exp() <= (-threshold).exp() {
-                assert!(expand, "must explore the competitive frontier");
-            }
-        }
-        for completed in [100, 1_000, 10_000] {
-            let (score, expand) = progress.score(1.0, completed, threshold, 1.0).unwrap();
-            assert!(score < threshold);
-            assert!(expand);
-        }
-        progress.frontier = Some(-10.0);
-        assert!(progress.score(1.0, 100, threshold, 1.0).unwrap().0 >= threshold);
-        progress.frontier = Some(2.0);
-        progress.outside = 0.0;
-        assert!(progress.score(1.0, 100, threshold, 1.0).unwrap().0 >= threshold);
-    }
-
-    #[test]
-    fn routing_tail_is_scale_invariant_and_monotone() {
-        for scale in [0.125_f32, 1.0, 1024.0] {
-            for shift in [-16.0_f32, 0.0, 32.0] {
-                let ranked = RouterIter::Explicit(
-                    [1.0, -1.0]
-                        .into_iter()
-                        .enumerate()
-                        .map(|(node, score)| Candidate {
-                            node: node as u32,
-                            sim: Similarity::new(scale * score + shift),
-                        })
-                        .collect::<Vec<_>>()
-                        .into_iter(),
-                );
-                let mut progress = AdaptiveProgress::new(&ranked, 4, |_| 100).unwrap();
-                progress.frontier = Some(f64::from(shift));
-                let mut previous = 1.0;
-                for (gap, expected) in [
-                    (-1.0, 0.42067237303427146),
-                    (0.0, 0.25),
-                    (1.0, 0.07932762696572854),
-                    (2.0, 0.01137506597408961),
-                    (3.0, 0.0006749490158150479),
-                ] {
-                    let miss = progress.routing_miss(scale * gap + shift);
-                    assert!((miss - expected).abs() < 1e-12);
-                    assert!(miss < previous);
-                    previous = miss;
-                }
-                assert_eq!(progress.routing_miss(f32::MAX), 0.0);
-                assert_eq!(progress.routing_miss(f32::MIN), progress.outside);
-                progress.frontier = None;
-                assert_eq!(progress.routing_miss(shift), 1.0);
-                progress.outside = 0.0;
-                assert_eq!(progress.routing_miss(shift), 0.0);
             }
         }
     }
@@ -526,12 +398,6 @@ mod adaptive_tests {
         assert!((progress.local_score(3.0, 1).unwrap() - expected).abs() < 1e-10);
         progress.complete(candidates[1]);
         assert!(progress.remaining.abs() < 1e-10);
-        assert_eq!(progress.routing_miss(3.0), 1.0);
-        progress.frontier = Some(1.0);
-        assert!(progress.routing_miss(3.0) > 0.0);
-        assert!(progress.routing_miss(4.0) < progress.routing_miss(3.0));
-        progress.outside = 0.0;
-        assert_eq!(progress.routing_miss(3.0), 0.0);
         assert!(AdaptiveProgress::new(&ranked, 10, |_| 0).is_none());
     }
 }
@@ -544,12 +410,6 @@ pub(crate) struct RouterClusters<'a, T: VectorElement> {
     reader: &'a VectorIndexReader,
     query: &'a VectorQuery<T>,
     ranked: RouterIter,
-    routing: RoutingParams,
-    routing_metrics: RouterMetrics,
-    seen: Vec<bool>,
-    more_routing: bool,
-    expand_next: bool,
-    threshold: Option<f64>,
     adaptive: Option<AdaptiveProgress>,
     evidence: ClusterEvidence,
     pending: Option<Candidate>,
@@ -566,7 +426,8 @@ pub(crate) struct RouterClusters<'a, T: VectorElement> {
 }
 
 impl<'a, T: VectorElement> RouterClusters<'a, T> {
-    /// Ranks the initial candidates and prepares the probe controller.
+    /// Ranks as many of `segment`'s clusters as `budget` buys at the filter's match fraction, and
+    /// prepares the probe controller. `reader` is the segment's IVF reader.
     pub(crate) fn new(
         reader: &'a VectorIndexReader,
         query: &'a VectorQuery<T>,
@@ -580,7 +441,6 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
             .expect("the router source runs on an IVF segment");
         let clusters = index.num_clusters();
         let routing = RoutingParams {
-            window: params.quantized_recall.map(|_| RoutingWindow::Initial),
             k: params.router_k(
                 budget.total.get(),
                 budget.per_cluster.get(),
@@ -598,32 +458,16 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
                     index.cluster_range(cluster).len()
                 })
             });
-        let mut ranked_count = 0;
-        ranked.for_each_candidate(|_| ranked_count += 1);
-        let more_routing = params.quantized_recall.is_some()
-            && ranked_count < clusters
-            && ranked.unsearched_score().is_some();
-        let routing_metrics = ranked.metrics();
         Self {
             index,
             reader,
             query,
             ranked,
-            routing,
-            routing_metrics,
-            seen: if params.quantized_recall.is_some() {
-                vec![false; clusters]
-            } else {
-                Vec::new()
-            },
-            more_routing,
-            expand_next: false,
-            threshold: params.quantized_recall.and_then(|p| p.gap_threshold(1)),
             adaptive,
             evidence: ClusterEvidence::default(),
             pending: None,
             meter: WorkMeter::new(budget),
-            controller: ProbeController::new(clusters, params.quantized_recall.is_none()),
+            controller: ProbeController::new(clusters),
             bounds: index.bounds(),
             tracker: QueryBoundTracker::new(),
             gate: RowGate::new(filter, segment.alive_bitset()),
@@ -632,33 +476,6 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
             selected_docs: Vec::new(),
             counters: RouterCounters::default(),
         }
-    }
-
-    fn expand(&mut self) -> bool {
-        if !self.more_routing {
-            return false;
-        }
-        let _routing = enter_vector_stage(VectorStage::Routing);
-        self.routing.window = self.routing.window.map(RoutingWindow::next);
-        self.ranked = self.index.rank_clusters(self.query, self.routing);
-        self.routing_metrics.accumulate(self.ranked.metrics());
-        let mut count = 0;
-        self.ranked.for_each_candidate(|_| count += 1);
-        self.more_routing = count < self.seen.len() && self.ranked.unsearched_score().is_some();
-        self.adaptive = self.threshold.and_then(|_| {
-            AdaptiveProgress::new(&self.ranked, self.seen.len(), |cluster| {
-                self.index.cluster_range(cluster).len()
-            })
-        });
-        if let Some(progress) = &mut self.adaptive {
-            self.ranked.for_each_candidate(|candidate| {
-                if self.seen[candidate.node as usize] {
-                    progress.complete(candidate);
-                }
-            });
-        }
-        self.expand_next = false;
-        true
     }
 
     /// The bounds gate's verdict for `cluster`, whose routing key is `sim`.
@@ -709,7 +526,7 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
             let _routing = enter_vector_stage(VectorStage::Routing);
             self.gate.select(&self.docs, &mut self.offsets)
         };
-        if self.threshold.is_some() {
+        if self.adaptive.is_some() {
             self.evidence
                 .observe(rows, rows - gated.pruned_filter - gated.pruned_dead);
         }
@@ -735,7 +552,7 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
         self.counters.bound_armed_at = self.tracker.armed_at_probe();
         RouterReport {
             counters: self.counters,
-            routing: self.routing_metrics,
+            routing: self.ranked.metrics(),
             probe: self.controller.finish(&self.meter),
         }
     }
@@ -743,36 +560,20 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
 
 impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
     fn quantized_recall_score(&mut self, cutoff: f32, completed: usize) -> Option<f64> {
-        let (score, expand) = self.adaptive.as_ref()?.score(
-            cutoff,
-            completed,
-            self.threshold?,
-            self.evidence.risk_scale(),
-        )?;
-        self.expand_next = self.more_routing && expand;
-        Some(score)
+        self.adaptive
+            .as_ref()?
+            .score(cutoff, completed, self.evidence.risk_scale())
     }
 
     fn next(&mut self, feedback: Feedback) -> crate::Result<Option<ClusterRows<'_>>> {
         loop {
-            if self.expand_next {
-                self.expand();
-            }
             let next = {
                 let _routing = enter_vector_stage(VectorStage::Routing);
                 self.ranked.next()
             };
             let Some(Candidate { sim, node }) = next else {
-                if self.expand() {
-                    continue;
-                }
                 return Ok(None);
             };
-            if let Some(seen) = self.seen.get_mut(node as usize) {
-                if std::mem::replace(seen, true) {
-                    continue;
-                }
-            }
             if !self.controller.admit(&self.meter) {
                 return Ok(None);
             }

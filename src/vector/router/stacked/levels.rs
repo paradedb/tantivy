@@ -29,7 +29,6 @@ use crate::schema::Metric;
 use crate::vector::distance::Similarity;
 use crate::vector::router::arena::{FileSliceArena, VectorArena};
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::RoutingWindow;
 use crate::vector::search::prepared::VectorQuery;
 use crate::vector::VectorElement;
 
@@ -436,8 +435,6 @@ where
 /// every parent above it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StackedSearchStats {
-    pub(crate) excluded_score: Option<f32>,
-    pub(crate) unsearched_score: Option<f32>,
     /// Lists opened at any level.
     pub lists_scanned: usize,
     /// Similarity computations at any level: rows in scanned lists plus
@@ -885,8 +882,10 @@ where S: VectorArena<Elem = f32>
         1 + self.parent.as_ref().map(|p| p.depth()).unwrap_or(0)
     }
 
-    /// Initial adaptive routing window (`nprobe_fraction * nlist`). Fixed-budget
-    /// search uses [`Self::lists_to_open`] instead.
+    /// Fraction-only probe size (`nprobe_fraction * nlist`). Search uses
+    /// [`Self::lists_to_open`] instead; this remains for benches that sweep
+    /// `nprobe_fraction` directly.
+    #[cfg(any(test, feature = "unstable"))]
     pub fn n_probe(&self) -> usize {
         let nlist = self.nlist();
         let n = ((nlist as f32 * self.config.nprobe_fraction).ceil().max(1.0)) as usize;
@@ -943,27 +942,15 @@ where S: VectorArena<Elem = f32>
         query: &VectorQuery<T>,
         k: usize,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-        self.search_windowed(query, k, None)
-    }
-
-    pub(crate) fn search_windowed<T: VectorElement>(
-        &self,
-        query: &VectorQuery<T>,
-        k: usize,
-        window: Option<RoutingWindow>,
-    ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
         if k == 0 {
             return (Vec::new(), StackedSearchStats::default());
         }
 
-        let open = window.map_or_else(
-            || self.lists_to_open(k),
-            |window| window.probes(self.n_probe(), self.nlist()),
-        );
+        let open = self.lists_to_open(k);
 
         // Candidate lists, nearest centroid first; `candidates[0]` is P0.
         let (candidates, mut stats) = if let Some(parent) = &self.parent {
-            parent.search_windowed(query, open, window)
+            parent.search_prepared(query, open)
         } else {
             let nlist = self.nlist();
             let mut scores = Vec::with_capacity(nlist);
@@ -983,12 +970,11 @@ where S: VectorArena<Elem = f32>
                 })
                 .sorted()
                 .rev()
-                .take(if window.is_some() { nlist } else { open })
+                .take(open)
                 .collect();
             let stats = StackedSearchStats {
                 lists_scanned: 0,
                 members_scored: nlist,
-                ..Default::default()
             };
             (all, stats)
         };
@@ -997,28 +983,12 @@ where S: VectorArena<Elem = f32>
             return (Vec::new(), stats);
         }
 
-        stats.unsearched_score = stats
-            .unsearched_score
-            .into_iter()
-            .chain(stats.excluded_score.take())
-            .reduce(f32::max);
         let mut probe = super::aps::open(k);
         let mut result = BinaryHeap::with_capacity(k);
         let mut scores = Vec::new();
-        let (mut member_score_sum, mut parent_score_sum, mut members) = (0.0, 0.0, 0);
-        for (position, c) in candidates.iter().enumerate() {
-            let (scanned, score_sum) = self.scan_cluster(
-                query,
-                c.node,
-                &mut result,
-                k,
-                &mut scores,
-                &mut stats.excluded_score,
-            );
+        for c in &candidates {
+            let scanned = self.scan_cluster(query, c.node, &mut result, k, &mut scores);
             stats.members_scored += scanned;
-            members += scanned;
-            member_score_sum += score_sum;
-            parent_score_sum += f64::from(c.sim.score()) * scanned as f64;
             stats.lists_scanned += 1;
             let kth = if result.len() >= k {
                 result
@@ -1027,22 +997,11 @@ where S: VectorArena<Elem = f32>
             } else {
                 None
             };
-            if window.is_none() && probe.observe(kth, scanned) {
-                if let Some(next) = candidates.get(position + 1) {
-                    stats.unsearched_score = Some(
-                        stats
-                            .unsearched_score
-                            .map_or(next.sim.score(), |score| score.max(next.sim.score())),
-                    );
-                }
+            if probe.observe(kth, scanned) {
                 break;
             }
         }
 
-        if members > 0 {
-            let shift = ((member_score_sum - parent_score_sum) / members as f64) as f32;
-            stats.unsearched_score = stats.unsearched_score.map(|score| score + shift);
-        }
         let hits = result
             .into_sorted_vec()
             .into_iter()
@@ -1058,8 +1017,7 @@ where S: VectorArena<Elem = f32>
         result: &mut BinaryHeap<Reverse<Candidate<ClusterId>>>,
         k: usize,
         scores: &mut Vec<Similarity>,
-        excluded: &mut Option<f32>,
-    ) -> (usize, f64) {
+    ) -> usize {
         let (start, end) = self.offsets[usize::from(list)];
         let start = start as usize;
         let end = end as usize;
@@ -1070,9 +1028,7 @@ where S: VectorArena<Elem = f32>
             start..end,
             scores,
         );
-        let mut score_sum = 0.0;
         for (row, &sim) in (start..end).zip(scores.iter()) {
-            score_sum += f64::from(sim.score());
             let cand = Candidate {
                 sim,
                 node: ClusterId::from(row),
@@ -1080,18 +1036,12 @@ where S: VectorArena<Elem = f32>
             if result.len() < k {
                 result.push(Reverse(cand));
             } else if let Some(mut worst) = result.peek_mut() {
-                let dropped = if cand > worst.0 {
-                    worst.0.sim.score()
-                } else {
-                    cand.sim.score()
-                };
-                *excluded = Some(excluded.map_or(dropped, |score| score.max(dropped)));
                 if cand > worst.0 {
                     *worst = Reverse(cand);
                 }
             }
         }
-        (end.saturating_sub(start), score_sum)
+        end.saturating_sub(start)
     }
 }
 
@@ -1442,62 +1392,6 @@ mod tests {
                 let (got, _) = opened.search(&query, 4, metric);
                 assert_eq!(got, expected);
             }
-        }
-    }
-
-    #[test]
-    fn window_expansion_eventually_covers_every_member() {
-        let n = 256;
-        let data = line_data(n);
-        let clusterer = SuperKMeansLevelClusterer::default();
-        let (index, _) = build_with_parent(&data, n, 2, &clusterer);
-        let query = VectorQuery::new(Metric::L2, std::sync::Arc::new(vec![7.5, 0.0]));
-        let (initial, initial_stats) =
-            index.search_windowed(&query, n, Some(RoutingWindow::Initial));
-        assert!(initial_stats.unsearched_score.is_some());
-        let mut previous: std::collections::BTreeSet<_> = initial.iter().map(|c| c.node).collect();
-        let mut window = RoutingWindow::Initial;
-        for _ in 0..3 {
-            window = window.next();
-            let (hits, stats) = index.search_windowed(&query, n, Some(window));
-            let current: std::collections::BTreeSet<_> = hits.iter().map(|c| c.node).collect();
-            assert!(previous.is_subset(&current));
-            assert!(hits.windows(2).all(|pair| pair[0] >= pair[1]));
-            if hits.len() == n {
-                assert!(stats.unsearched_score.is_none());
-            }
-            previous = current;
-        }
-        assert_eq!(previous.len(), n);
-    }
-
-    #[test]
-    fn unsearched_parent_score_uses_observed_child_offset() {
-        for scale in [0.5, 1.0, 4.0] {
-            let store =
-                |values: &[f32]| InMemoryStore::new(values.iter().map(|v| v * scale).collect(), 1);
-            let parent = StackedIvf {
-                config: test_config(),
-                parent: None,
-                offsets: vec![(0, 2)],
-                centroids: store(&[5.0]),
-                vectors: store(&[0.0, 10.0]),
-            };
-            let index = StackedIvf {
-                config: test_config(),
-                parent: Some(Box::new(parent)),
-                offsets: vec![(0, 2), (2, 4)],
-                centroids: store(&[0.0, 10.0]),
-                vectors: store(&[-1.0, 1.0, 9.0, 11.0]),
-            };
-            let query = VectorQuery::new(Metric::L2, std::sync::Arc::new(vec![0.0]));
-            let (hits, stats) = index.search_windowed(&query, 4, Some(RoutingWindow::Initial));
-            assert_eq!(hits.len(), 2);
-            assert_eq!(stats.members_scored, 5);
-            assert_eq!(stats.unsearched_score, Some(-101.0 * scale * scale));
-            let (hits, stats) = index.search_windowed(&query, 4, Some(RoutingWindow::Doubled));
-            assert_eq!(hits.len(), 4);
-            assert_eq!(stats.unsearched_score, None);
         }
     }
 

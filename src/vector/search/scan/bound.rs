@@ -306,7 +306,7 @@ impl PruningBound {
         self.top.kth_lower()
     }
 
-    /// Local TopK k-th estimate (APS cover; unused in production).
+    /// Local TopK k-th estimate for adaptive stopping.
     pub(crate) fn kth_estimate(&self) -> Option<f32> {
         self.top.kth_estimate()
     }

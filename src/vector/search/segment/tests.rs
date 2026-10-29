@@ -231,6 +231,72 @@ fn adaptive_stops_when_shared_threshold_prunes_every_local_candidate() -> crate:
 }
 
 #[test]
+fn adaptive_preserves_routing_budget_and_access_path() -> crate::Result<()> {
+    for router in [RouterKind::Exact, RouterKind::Stacked] {
+        for schedule in [&[][..], &[1, 4][..]] {
+            let fixture = FixtureSpec::clustered(Metric::L2, 64, 64, 6400)
+                .router(router)
+                .schedule(schedule)
+                .paged()
+                .label("few", |i| i % 100 == 0)
+                .label("some", |i| i % 10 == 0)
+                .build()?;
+            let query = Lcg(42).vector(64, 0.5);
+            for filter in [
+                &AllQuery as &dyn Query,
+                &fixture.filter("few"),
+                &fixture.filter("some"),
+            ] {
+                for max_probe_fraction in [0.03, 0.2] {
+                    let params = ProbeParams {
+                        max_probe_fraction,
+                        min_probe_clusters: 1,
+                        ..Default::default()
+                    };
+                    fixture.clear_reads();
+                    let baseline = fixture.search(filter, &query, 10, params.clone())?;
+                    let baseline_reads = fixture.reads();
+                    let expected = &baseline.stats[0];
+                    for target in [0.5, 0.95, 1.0] {
+                        fixture.clear_reads();
+                        let adaptive = fixture.search(
+                            filter,
+                            &query,
+                            10,
+                            ProbeParams {
+                                quantized_recall: Some(crate::vector::QuantizedRecallParams {
+                                    target,
+                                    recall_exponent: 1.5,
+                                }),
+                                ..params.clone()
+                            },
+                        )?;
+                        let reads = fixture.reads();
+                        let actual = &adaptive.stats[0];
+                        assert_eq!(actual.work_budget, expected.work_budget);
+                        assert_eq!(actual.located_cap, expected.located_cap);
+                        assert_eq!(actual.access_path, expected.access_path);
+                        assert_eq!(actual.routing_visited_count, expected.routing_visited_count);
+                        assert_eq!(
+                            stage_reads(&reads, |stage| stage == VectorStage::Routing),
+                            stage_reads(&baseline_reads, |stage| stage == VectorStage::Routing),
+                        );
+                        assert!(actual.work_charged <= expected.work_charged);
+                        assert!(actual.candidates_scored <= expected.candidates_scored);
+                        if target == 1.0 {
+                            assert_eq!(adaptive.results, baseline.results);
+                            assert_eq!(actual.termination, expected.termination);
+                            assert_eq!(reads, baseline_reads);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn quantized_recall_rejects_invalid_parameters() {
     use crate::vector::QuantizedRecallParams;
     let stop = QuantizedRecallParams {
