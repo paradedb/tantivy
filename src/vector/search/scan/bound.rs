@@ -302,6 +302,7 @@ impl PruningBound {
     }
 
     /// Local TopK k-th lower. Production prune/router paths use [`Self::shared_threshold`].
+    #[cfg(test)]
     pub(crate) fn kth_lower(&self) -> Option<f32> {
         self.top.kth_lower()
     }

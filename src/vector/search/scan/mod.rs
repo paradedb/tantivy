@@ -600,9 +600,8 @@ where
         Ok(len)
     }
 
-    /// Ends the admission-rate measurement's cluster of `len` rows: at the fill, the cluster
-    /// after which the segment's own k-th first exists, the grid is set from the pruning
-    /// threshold and every survival score so far.
+    /// Ends the admission-rate measurement's cluster of `len` rows. Once the shared pruning
+    /// threshold exists, the grid is set from it and every survival score so far.
     fn close_rate_cluster(&mut self, len: usize) {
         let Some(rate) = &mut self.rate else {
             return;
@@ -620,16 +619,13 @@ where
         }
         match &mut rate.histograms {
             Some(histograms) => histograms.finish_cluster(len),
-            None if self.bound.kth_lower().is_some() => {
-                let bar = self
-                    .bound
-                    .shared_threshold()
-                    .expect("the pruning threshold exists once the own k-th does");
-                let w0 = self.report.candidates_scored;
-                rate.histograms = Some(AdmissionHistograms::at_fill(bar, &rate.prefill, w0));
-                rate.prefill = Vec::new();
+            None => {
+                if let Some(bar) = self.bound.shared_threshold() {
+                    let w0 = self.report.candidates_scored;
+                    rate.histograms = Some(AdmissionHistograms::at_fill(bar, &rate.prefill, w0));
+                    rate.prefill = Vec::new();
+                }
             }
-            None => {}
         }
     }
 
