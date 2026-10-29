@@ -200,10 +200,10 @@ impl SegmentReader {
         &self,
         field: Field,
     ) -> crate::Result<Option<Arc<VectorColMetadata>>> {
-        Ok(self.vector_field(field)?.metadata())
+        self.vector_field(field)?.metadata()
     }
 
-    fn vector_field(&self, field: Field) -> crate::Result<Arc<VectorFieldReader>> {
+    pub(crate) fn vector_field(&self, field: Field) -> crate::Result<Arc<VectorFieldReader>> {
         if let Some(reader) = self
             .vector_reader_cache
             .read()
