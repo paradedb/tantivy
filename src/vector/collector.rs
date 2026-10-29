@@ -1068,6 +1068,31 @@ mod prepared_key_tests {
         VectorNormPolicy, VectorQuantizationConfig, VectorQuantizationLayer,
     };
     use crate::vector::storage::metadata::{Grid, Partition, Quantizer, Rotation};
+
+    #[test]
+    fn concurrent_segments_share_prepared_query_state() {
+        let mut schema = Schema::builder();
+        let field = schema.add_vector_field("v", VectorOptions::new(3, Metric::Cosine));
+        let collector = TopDocsByVectorSimilarity::new(field, vec![3.0f32, 4.0, 0.0], 1);
+        let queries = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| collector.vector_query(Metric::Cosine)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for query in &queries {
+            assert!(Arc::ptr_eq(query, &queries[0]));
+            assert_eq!(query.routing_norm(), 5.0);
+            assert!(std::ptr::eq(
+                query.estimate_vector(),
+                queries[0].estimate_vector()
+            ));
+        }
+    }
+
     fn metadata(metric: Metric, schedule: &[u8]) -> VectorColMetadata {
         let opts = VectorOptions::new(100, metric);
         let config = VectorQuantizationConfig::materialize(

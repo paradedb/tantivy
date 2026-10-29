@@ -8,10 +8,12 @@ use common::{BinarySerializable, HasLen};
 
 use crate::directory::error::Incompatibility;
 use crate::directory::FileSlice;
-use crate::schema::{Metric, VectorOptions};
+use crate::schema::VectorOptions;
 use crate::vector::clustering::IvfCentroids;
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::levels::{InMemoryStore, LazyStore, StackedIvf};
+use crate::vector::search::prepared::VectorQuery;
+use crate::vector::VectorElement;
 use crate::TantivyError;
 
 pub(crate) mod arena;
@@ -187,11 +189,13 @@ impl OpenedRouter {
         }
     }
 
-    pub(crate) fn rank(&self, query: &[f32], metric: Metric, params: RoutingParams) -> RouterIter {
+    pub(crate) fn rank<T: VectorElement>(
+        &self,
+        query: &VectorQuery<T>,
+        params: RoutingParams,
+    ) -> RouterIter {
         match self {
-            Self::Stacked(router) => {
-                RouterIter::Stacked(stacked::rank(router, query, metric, params))
-            }
+            Self::Stacked(router) => RouterIter::Stacked(stacked::rank(router, query, params)),
             Self::Exact(router) => RouterIter::Exact(router.rank(query)),
         }
     }
@@ -246,7 +250,10 @@ pub(crate) fn test_clusters() -> Option<RouterIter> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::schema::Metric;
     use crate::vector::clustering::IvfMatrix;
 
     fn centroids() -> IvfCentroids {
@@ -272,7 +279,8 @@ mod tests {
                 .collect::<Vec<_>>(),
         };
         let opened = RouterKind::open(FileSlice::from(bytes), FileSlice::from(rows), &options)?;
-        let mut ranking = opened.rank(&[1.1], Metric::L2, RoutingParams::default());
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![1.1]));
+        let mut ranking = opened.rank(&query, RoutingParams::default());
         assert_eq!(ranking.next().unwrap().node, 1);
         assert!(matches!(
             ranking.metrics(),
@@ -332,7 +340,8 @@ mod tests {
         let opened = open_stacked(2, 64)?;
         let query = vec![0.0f32; 2];
         let params = RoutingParams { k: 8 };
-        let ranking = opened.rank(&query, Metric::L2, params);
+        let query = VectorQuery::new(Metric::L2, Arc::new(query));
+        let ranking = opened.rank(&query, params);
         let (candidates, lists, scored) = stacked_metrics(ranking.metrics());
         assert!(candidates >= 1 && candidates <= 8, "{candidates}");
         assert!(lists >= 1);

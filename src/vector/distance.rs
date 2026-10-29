@@ -337,6 +337,42 @@ impl Metric {
         })
     }
 
+    #[inline]
+    pub(crate) fn similarity_with_query_norm<T: VectorElement>(
+        self,
+        query: &[T],
+        doc: &[T],
+        query_norm: f32,
+    ) -> Similarity {
+        if self != Metric::Cosine {
+            return self.similarity(query, doc);
+        }
+        let doc_norm = norm_squared(doc).sqrt();
+        Similarity::new(if query_norm == 0.0 || doc_norm == 0.0 {
+            0.0
+        } else {
+            dot(query, doc) / (query_norm * doc_norm)
+        })
+    }
+
+    #[inline]
+    pub(crate) fn similarity_bytes_with_query_norm<T: VectorElement>(
+        self,
+        query: &[T],
+        doc: &[u8],
+        query_norm: f32,
+    ) -> Similarity {
+        if self != Metric::Cosine {
+            return self.similarity_bytes(query, doc);
+        }
+        let doc_norm = norm_squared_bytes::<T>(doc).sqrt();
+        Similarity::new(if query_norm == 0.0 || doc_norm == 0.0 {
+            0.0
+        } else {
+            dot_bytes(query, doc) / (query_norm * doc_norm)
+        })
+    }
+
     /// Like [`similarity`](Self::similarity), but the doc side is
     /// little-endian bytes — typically a borrowed slice straight out
     /// of the segment's file.
