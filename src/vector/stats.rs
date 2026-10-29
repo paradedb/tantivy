@@ -367,6 +367,9 @@ impl ProbeStats {
             SourceReport::Router(routed) => stats.record_routed(routed),
             SourceReport::Matches(matches) => stats.record_matches(matches),
         }
+        if scan.recall_reached {
+            stats.termination = ProbeTermination::QuantizedRecall;
+        }
         stats.record_io(totals);
         debug_assert_eq!(
             stats.centroid_io.reads, scan.centroid_reads as u64,

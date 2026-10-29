@@ -7,6 +7,8 @@
 /// How the probe loop stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize)]
 pub enum ProbeTermination {
+    /// The adaptive estimate reached the requested recall.
+    QuantizedRecall,
     /// The work budget was spent.
     Ceiling,
     /// The router ran out of clusters before the budget was spent.
@@ -134,6 +136,7 @@ impl WorkMeter {
 
 /// Decides, from the work meter, whether the next ranked cluster opens.
 pub(in crate::vector) struct ProbeController {
+    enforce_budget: bool,
     termination: ProbeTermination,
     /// Clusters in the segment and clusters pulled from the ranking so far.
     clusters: usize,
@@ -141,8 +144,9 @@ pub(in crate::vector) struct ProbeController {
 }
 
 impl ProbeController {
-    pub(in crate::vector) fn new(clusters: usize) -> Self {
+    pub(in crate::vector) fn new(clusters: usize, enforce_budget: bool) -> Self {
         Self {
+            enforce_budget,
             termination: ProbeTermination::Exhausted,
             clusters,
             pulled: 0,
@@ -154,7 +158,7 @@ impl ProbeController {
     /// Checked after the pull, so a stop proves another cluster existed.
     pub(in crate::vector) fn admit(&mut self, meter: &WorkMeter) -> bool {
         self.pulled += 1;
-        if meter.exhausted() {
+        if self.enforce_budget && meter.exhausted() {
             self.termination = ProbeTermination::Ceiling;
             return false;
         }
@@ -166,7 +170,9 @@ impl ProbeController {
         // A stacked ranking sized to the budget can run out as the budget is spent, short of the
         // segment's clusters; that stop is the ceiling's.
         let termination = match self.termination {
-            ProbeTermination::Exhausted if self.pulled < self.clusters && meter.exhausted() => {
+            ProbeTermination::Exhausted
+                if self.enforce_budget && self.pulled < self.clusters && meter.exhausted() =>
+            {
                 ProbeTermination::Ceiling
             }
             termination => termination,

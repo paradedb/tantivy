@@ -29,6 +29,204 @@ const MATRIX_DIM: usize = 64;
 const MATRIX_DOCS: usize = 240;
 const MATRIX_CLUSTERS: usize = 6;
 
+#[test]
+fn adaptive_cascade_matches_oracle_and_prefix_replay() -> crate::Result<()> {
+    use crate::vector::router::with_test_clusters;
+    use crate::vector::{ProbeTermination, QuantizedRecallParams};
+
+    let plans = [
+        PlanOverride::read(LayerRead::Sparse),
+        PlanOverride::exact(|_, _| true),
+        PlanOverride::exact(|_, layer| layer == 1),
+        PlanOverride::exact(|cluster, layer| cluster % 3 == layer),
+    ];
+    let mut stops = 0;
+    let mut plain_stops = 0;
+    let mut exact_layers = [0; 3];
+    for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+        for schedule in [&[][..], &[1][..], &[1, 1][..], &[1, 1, 4][..]] {
+            let representation = if schedule.is_empty() {
+                Representation::FullPrecision
+            } else {
+                Representation::Quantized(schedule)
+            };
+            let fixture = matrix_fixture(metric, representation, true)?;
+            for filter in [
+                &AllQuery as &dyn Query,
+                &fixture.filter("half"),
+                &fixture.filter("rare"),
+            ] {
+                let weight = fixture.weight(filter)?;
+                for query in matrix_queries() {
+                    let mut ranked =
+                        fixture.candidates(&(0..MATRIX_CLUSTERS).collect::<Vec<_>>(), &query)?;
+                    ranked.sort_unstable_by(|a, b| {
+                        b.sim
+                            .score()
+                            .total_cmp(&a.sim.score())
+                            .then(a.node.cmp(&b.node))
+                    });
+                    for k in [1, 10, MATRIX_DOCS] {
+                        let params = ProbeParams {
+                            quantized_recall: Some(QuantizedRecallParams {
+                                target: 1.0,
+                                recall_exponent: 1.5,
+                            }),
+                            exact_plan: true,
+                            ..routed_exhaustive_params(MATRIX_CLUSTERS)
+                        };
+                        for plan in plans {
+                            for located in [
+                                LocatedPath::Off,
+                                LocatedPath::MaxSelectivity(Selectivity::new(1.0).unwrap()),
+                            ] {
+                                let (hits, reports) = forced_top_k(
+                                    &fixture,
+                                    filter,
+                                    &query,
+                                    k,
+                                    &ProbeParams {
+                                        located,
+                                        ..params.clone()
+                                    },
+                                    plan,
+                                )?;
+                                assert_eq!(hits, fixture.oracle(filter, &query, k)?);
+                                for report in reports {
+                                    let planned: usize = (0..schedule.len())
+                                        .filter_map(|layer| report.layers.get(layer))
+                                        .map(|l| l.exact_rows())
+                                        .sum();
+                                    assert!(planned <= report.exact_rows);
+                                    assert!(report.exact_rows <= report.candidates_scored);
+                                    if k == MATRIX_DOCS {
+                                        assert_eq!(report.exact_rows, report.candidates_scored);
+                                    }
+                                    for (layer, total) in exact_layers.iter_mut().enumerate() {
+                                        *total += report
+                                            .layers
+                                            .get(layer)
+                                            .map_or(0, |counts| counts.exact_rows());
+                                    }
+                                }
+                            }
+                            let mut previous_prefix = 0;
+                            for target in [0.5, 0.95, 1.0] {
+                                let (active, report) = with_test_clusters(ranked.clone(), || {
+                                    fixture.run_planned(
+                                        0,
+                                        weight.as_ref(),
+                                        &query,
+                                        k,
+                                        ProbeParams {
+                                            quantized_recall: Some(QuantizedRecallParams {
+                                                target,
+                                                recall_exponent: 1.5,
+                                            }),
+                                            ..params.clone()
+                                        },
+                                        Some(plan),
+                                        true,
+                                    )
+                                })?;
+                                let prefix =
+                                    report.clusters_probed() + report.bounds_skips as usize;
+                                assert!(prefix >= previous_prefix);
+                                previous_prefix = prefix;
+                                if report.termination == ProbeTermination::QuantizedRecall {
+                                    stops += 1;
+                                    plain_stops += usize::from(schedule.is_empty());
+                                    assert!(target < 1.0);
+                                }
+                                let (replay, replay_report) =
+                                    with_test_clusters(ranked[..prefix].to_vec(), || {
+                                        fixture.run_planned(
+                                            0,
+                                            weight.as_ref(),
+                                            &query,
+                                            k,
+                                            params.clone(),
+                                            Some(plan),
+                                            true,
+                                        )
+                                    })?;
+                                assert_eq!(active, replay);
+                                assert_eq!(report.exact_rows, replay_report.exact_rows);
+                                assert_eq!(
+                                    report.candidates_scored,
+                                    replay_report.candidates_scored
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(stops > 0);
+    assert!(
+        plain_stops > 0,
+        "unquantized IVF must honor adaptive stopping"
+    );
+    assert!(exact_layers.iter().all(|&rows| rows > 0));
+    Ok(())
+}
+
+#[test]
+fn quantized_recall_rejects_invalid_parameters() {
+    use crate::vector::QuantizedRecallParams;
+    let stop = QuantizedRecallParams {
+        target: 0.95,
+        recall_exponent: 1.5,
+    };
+    for target in [0.0, -1.0, 1.1, f64::NAN, f64::INFINITY] {
+        assert!(ProbeParams {
+            quantized_recall: Some(QuantizedRecallParams { target, ..stop }),
+            ..Default::default()
+        }
+        .resolved_work_budget(MATRIX_CLUSTERS, MATRIX_DOCS)
+        .is_err());
+    }
+    assert_eq!(stop.gap_threshold(0), None);
+    assert!(stop.gap_threshold(10).unwrap() > 0.0);
+    assert_eq!(
+        QuantizedRecallParams {
+            target: 1.0,
+            ..stop
+        }
+        .gap_threshold(10),
+        None
+    );
+    for recall_exponent in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(ProbeParams {
+            quantized_recall: Some(QuantizedRecallParams {
+                recall_exponent,
+                ..stop
+            }),
+            ..Default::default()
+        }
+        .resolved_work_budget(MATRIX_CLUSTERS, MATRIX_DOCS)
+        .is_err());
+    }
+    for target in [0.9, 0.95, 0.99] {
+        let calibrated = QuantizedRecallParams { target, ..stop };
+        let raw = QuantizedRecallParams {
+            target: 1.0 - (1.0 - target).powf(stop.recall_exponent),
+            recall_exponent: 1.0,
+        };
+        assert!(
+            (calibrated.gap_threshold(10).unwrap() - raw.gap_threshold(10).unwrap()).abs() < 1e-10
+        );
+    }
+    assert!(QuantizedRecallParams {
+        target: 1.0 - f64::EPSILON,
+        recall_exponent: 100.0
+    }
+    .gap_threshold(10)
+    .unwrap()
+    .is_finite());
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Representation {
     Flat,

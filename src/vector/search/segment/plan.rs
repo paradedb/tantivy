@@ -1,10 +1,11 @@
 //! Planning one segment's search: the work budget, the filter, and where clusters come from.
 
-use common::BitSet;
+use common::{BitSet, HasLen};
 
+use crate::directory::FileSlice;
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::query::{for_each_docset_buffered, AllScorer, Weight};
-use crate::vector::params::{LocatedPath, ProbeParams};
+use crate::vector::params::{LocatedPath, ProbeParams, QuantizedRecallParams};
 use crate::vector::search::source::controller::{WorkBudget, WorkUnits};
 use crate::vector::search::source::router::DocFilter;
 use crate::vector::storage::centroids::ClusterIndex;
@@ -79,7 +80,12 @@ impl SegmentPlan {
         // Capacity counts native docs as written: deleted rows still charge on first touch.
         let (budget, n_avg, x) = params.resolved_work_budget(clusters, index.num_docs())?;
         debug_assert!(n_avg > 0.0);
-        let cap = located_cap(params.located, max_doc, budget, n_avg, x);
+        let cap =
+            if let (Some(recall), LocatedPath::Auto) = (params.quantized_recall, params.located) {
+                adaptive_located_cap(recall, clusters, max_doc, &index.centroid_row_slice(0)?)
+            } else {
+                located_cap(params.located, max_doc, budget, n_avg, x)
+            };
         let source = {
             let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
             collect_segment_filter(weight, segment, max_doc, cap)?
@@ -107,6 +113,20 @@ impl SegmentPlan {
         };
         rows.min(self.report.segment_rows)
     }
+}
+
+fn adaptive_located_cap(
+    recall: QuantizedRecallParams,
+    clusters: usize,
+    max_doc: DocId,
+    centroid: &FileSlice,
+) -> usize {
+    let baseline = -1.5 * (-0.95_f64).ln_1p();
+    let pressure = recall.gap_threshold(1).unwrap_or(f64::INFINITY) / baseline;
+    let per_cluster = centroid
+        .storage_block_len()
+        .map_or(0.5, |block| (centroid.len() as f64 / block as f64).min(0.5));
+    (clusters as f64 * per_cluster * pressure).min(f64::from(max_doc)) as usize
 }
 
 /// The most matches, deleted ones included, a filter may have and take the located path; `Auto`
@@ -180,6 +200,60 @@ mod tests {
     use crate::vector::stats::AccessPath;
     use crate::vector::test_support::{first_segment, DocsWeight, FixtureSpec};
     use crate::vector::tests::exhaustive_params;
+
+    #[test]
+    fn adaptive_bypass_prices_centroid_pages_without_reading_them() {
+        use std::sync::Arc;
+
+        use crate::vector::storage::io::test_support::BlockTrackedBytes;
+
+        let recall = QuantizedRecallParams {
+            target: 0.95,
+            recall_exponent: 1.5,
+        };
+        for (dims, block, cap) in [
+            (128, 8192, 1000),
+            (128, 16384, 500),
+            (1024, 8192, 8000),
+            (2048, 8192, 8000),
+        ] {
+            let reads = Default::default();
+            let centroid = FileSlice::new(Arc::new(BlockTrackedBytes {
+                bytes: vec![0; dims * 4],
+                reads: std::sync::Arc::clone(&reads),
+                block_len: block,
+            }));
+            assert_eq!(
+                adaptive_located_cap(recall, 16_000, 1_000_000, &centroid),
+                cap
+            );
+            assert_eq!(
+                adaptive_located_cap(
+                    QuantizedRecallParams {
+                        recall_exponent: 3.0,
+                        ..recall
+                    },
+                    16_000,
+                    1_000_000,
+                    &centroid
+                ),
+                2 * cap
+            );
+            assert_eq!(
+                adaptive_located_cap(
+                    QuantizedRecallParams {
+                        target: 1.0,
+                        ..recall
+                    },
+                    16_000,
+                    1_000_000,
+                    &centroid
+                ),
+                1_000_000
+            );
+            assert!(reads.lock().unwrap().is_empty());
+        }
+    }
 
     /// The plan resolves the budget once, builds no bitset for match-all filters, sees an empty
     /// filter or `top_n == 0` as nothing to search, and sizes the scan from the budget. A filter
@@ -355,6 +429,76 @@ mod tests {
                 (cap, path),
                 "matches={matches}"
             );
+        }
+        assert_eq!(ivf.num_clusters(), 9);
+        for (target, recall_exponent, adaptive_cap) in [
+            (0.90, 1.5, 3),
+            (0.95, 1.5, 4),
+            (0.99, 1.5, 6),
+            (0.95, 3.0, 9),
+            (1.0, 1.5, 90),
+        ] {
+            for (max_probe_fraction, min_probe_clusters) in [(0.000001, 0), (1.0, usize::MAX)] {
+                let adaptive = ProbeParams {
+                    quantized_recall: Some(crate::vector::QuantizedRecallParams {
+                        target,
+                        recall_exponent,
+                    }),
+                    max_probe_fraction,
+                    min_probe_clusters,
+                    ..auto.clone()
+                };
+                for (located, matches, cap, path) in [
+                    (
+                        LocatedPath::Auto,
+                        adaptive_cap,
+                        adaptive_cap,
+                        if adaptive_cap == segment.max_doc() as usize {
+                            AccessPath::Routed
+                        } else {
+                            AccessPath::Located
+                        },
+                    ),
+                    (
+                        LocatedPath::Auto,
+                        adaptive_cap + 1,
+                        adaptive_cap,
+                        AccessPath::Routed,
+                    ),
+                    (LocatedPath::Auto, 0, adaptive_cap, AccessPath::Routed),
+                    (
+                        LocatedPath::Auto,
+                        segment.max_doc() as usize,
+                        adaptive_cap,
+                        AccessPath::Routed,
+                    ),
+                    (LocatedPath::Off, adaptive_cap, 0, AccessPath::Routed),
+                    (capped(9).located, 9, 9, AccessPath::Located),
+                ]
+                .into_iter()
+                .filter(|(_, matches, _, _)| *matches <= segment.max_doc() as usize)
+                {
+                    let weight = DocsWeight {
+                        max_doc: segment.max_doc(),
+                        docs: (0..matches as DocId).collect(),
+                    };
+                    let (_, stats) = fixture.run_segment(
+                        0,
+                        &weight,
+                        &[0.0, 0.0],
+                        10,
+                        ProbeParams {
+                            located,
+                            ..adaptive.clone()
+                        },
+                    )?;
+                    assert_eq!(
+                        (stats.located_cap, stats.access_path),
+                        (cap, path),
+                        "matches={matches}"
+                    );
+                }
+            }
         }
         // Every mode reports its cap, and an unfiltered query routes.
         for (located, cap) in [(LocatedPath::Off, 0), (capped(9).located, 9)] {

@@ -223,9 +223,19 @@ impl<T: VectorElement> SegmentSearcher<T> {
                 },
             ));
         };
+        let deferred_rerank = self.probe_params.quantized_recall.is_some();
+        let quantized_recall = matches!(&source, Source::Router(_))
+            .then_some(self.probe_params.quantized_recall)
+            .flatten();
         let config = ScanConfig {
+            deferred_rerank,
+            quantized_recall,
             top_n,
-            capacity,
+            capacity: if deferred_rerank {
+                capacity.min(4096)
+            } else {
+                capacity
+            },
             exact_plan: self.probe_params.exact_plan,
             #[cfg(test)]
             plan_override: self.plan_override,
