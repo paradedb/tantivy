@@ -1,7 +1,7 @@
 //! Quantized layer storage: layer and cluster readers, read costs and decoded batches.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use common::{HasLen, OwnedBytes};
 use quant::cascade::{LayerSpec, QueryRotationPlan};
@@ -860,7 +860,7 @@ fn plan_block_column(
 
 /// Stored layer readers and shared query-preparation metadata.
 pub(crate) struct QuantizedFieldReader {
-    pub(crate) index_ctx: Arc<QuantizedIndexCtx>,
+    pub(crate) index_ctx: OnceLock<Arc<QuantizedIndexCtx>>,
     pub(crate) layers: Vec<QuantizedLayerReader>,
     pub(crate) blocks: Arc<Blocks>,
     pub(crate) norms: usize,
@@ -878,14 +878,18 @@ impl QuantizedFieldReader {
         self.blocks.read_column(self.norms, rows)
     }
     pub(crate) fn index_ctx(&self) -> &Arc<QuantizedIndexCtx> {
-        &self.index_ctx
+        self.index_ctx.get_or_init(|| {
+            Arc::new(
+                QuantizedIndexCtx::new(Arc::clone(&self.blocks.meta))
+                    .expect("quantized field has quantized metadata"),
+            )
+        })
     }
 }
 
 // --- Query preparation inputs ---
 
-/// Immutable quantization state for one segment's field, built when the
-/// segment's vector reader opens.
+/// Immutable quantization state, built only when a query needs this encoding.
 pub(crate) struct QuantizedIndexCtx {
     pub(crate) meta: Arc<VectorColMetadata>,
     pub(crate) specs: Vec<LayerSpec>,

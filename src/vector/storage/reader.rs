@@ -25,8 +25,7 @@ use crate::vector::storage::id_map::{DocLocation, IdMap};
 use crate::vector::storage::io::{VectorRead, VectorReadKind};
 use crate::vector::storage::metadata::{SlotType, VectorColMetadata};
 use crate::vector::storage::quantized::{
-    exact_read_cost, range_cost, QuantizedFieldReader, QuantizedIndexCtx, QuantizedLayerReader,
-    ReadCost, ReadScratch,
+    exact_read_cost, range_cost, QuantizedFieldReader, QuantizedLayerReader, ReadCost, ReadScratch,
 };
 use crate::{DocId, SegmentReader, TantivyError};
 
@@ -360,7 +359,7 @@ impl VectorIndexReader {
                     });
                 }
                 Some(QuantizedFieldReader {
-                    index_ctx: Arc::new(QuantizedIndexCtx::new(Arc::clone(&rows_slice.meta))?),
+                    index_ctx: OnceLock::new(),
                     layers,
                     blocks: Arc::clone(&rows_slice),
                     norms: rows_slice

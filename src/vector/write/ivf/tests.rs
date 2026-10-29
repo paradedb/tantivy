@@ -1138,6 +1138,17 @@ fn mixed_segments_share_preparation_by_stored_metadata() -> crate::Result<()> {
         index.settings_mut().vector_quantization.clear();
         let searcher = index.reader()?.searcher();
         assert_eq!(searcher.segment_readers().len(), 3);
+        let vectors = searcher
+            .segment_readers()
+            .iter()
+            .map(|segment| segment.vector_index(field))
+            .collect::<crate::Result<Vec<_>>>()?;
+        assert!(vectors.iter().all(|reader| reader
+            .quantization()
+            .unwrap()
+            .index_ctx
+            .get()
+            .is_none()));
         let make_collector = || {
             TopDocsByVectorSimilarityBuilder::new(field, fixture_search_query(Metric::L2, 64), 5)
                 .with_probe_params(ProbeParams {
@@ -1150,6 +1161,13 @@ fn mixed_segments_share_preparation_by_stored_metadata() -> crate::Result<()> {
         let collector = make_collector();
         let combined = searcher.search(&AllQuery, &collector)?;
         assert_eq!(collector.quantized_query_count(), if mixed { 2 } else { 1 });
+        assert_eq!(
+            vectors
+                .iter()
+                .filter(|reader| reader.quantization().unwrap().index_ctx.get().is_some())
+                .count(),
+            if mixed { 2 } else { 1 }
+        );
         let weight = AllQuery.weight(EnableScoring::disabled_from_searcher(&searcher))?;
         let mut union = Vec::new();
         for (ord, segment) in searcher.segment_readers().iter().enumerate() {

@@ -260,8 +260,8 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
         field: &QuantizedFieldReader,
         query: &VectorQuery<T>,
     ) -> Arc<QuantizedQueryCtx> {
-        let index_ctx = field.index_ctx();
         let prepare = || {
+            let index_ctx = field.index_ctx();
             let active_layers = self.max_scan_levels.min(index_ctx.specs.len());
             Arc::new(QuantizedQueryCtx::with_depth(
                 Arc::clone(index_ctx),
@@ -273,7 +273,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
             self.quantized_queries
                 .lock()
                 .unwrap()
-                .entry(PreparedKey(Arc::clone(&index_ctx.meta)))
+                .entry(PreparedKey(Arc::clone(&field.blocks.meta)))
                 .or_default(),
         );
         Arc::clone(cell.get_or_init(prepare))
