@@ -173,6 +173,64 @@ fn adaptive_cascade_matches_oracle_and_prefix_replay() -> crate::Result<()> {
 }
 
 #[test]
+fn adaptive_stops_when_shared_threshold_prunes_every_local_candidate() -> crate::Result<()> {
+    let clusters = 32;
+    let centroids = (0..clusters)
+        .map(|c| one_hot(64, 0, 10.0 * c as f32))
+        .collect();
+    let mut vectors = Vec::new();
+    for c in 0..clusters {
+        let x = 10.0 * c as f32;
+        vectors.extend((0..100).map(|i| one_hot(64, 0, x - 0.45 + 0.009 * i as f32)));
+        let mut outlier = one_hot(64, 0, x);
+        outlier[1] = 1000.0;
+        vectors.push(outlier);
+    }
+    let rows = vectors.len();
+    let fixture = FixtureSpec::ivf(Metric::L2, centroids, vectors)
+        .schedule(&[1, 4])
+        .build()?;
+    let query = one_hot(64, 0, 4.0);
+    for target in [0.95, 1.0] {
+        let slot = Arc::new(AtomicSharedThreshold::default());
+        seed_slot(&slot, -1.0);
+        let params = ProbeParams {
+            quantized_recall: Some(crate::vector::QuantizedRecallParams {
+                target: f64::from(target),
+                recall_exponent: 1.5,
+            }),
+            exact_plan: false,
+            located: LocatedPath::Off,
+            ..exhaustive_params(clusters)
+        };
+        let fruit = fixture.search_with(&AllQuery, &query, 10, 0, params, Some(slot))?;
+        let stats = &fruit.stats[0];
+        assert!(fruit.results.is_empty());
+        assert_eq!(stats.exact_rows, 0);
+        assert_eq!(
+            stats.layers.get(0).unwrap().admission_pruned(),
+            stats.candidates_scored
+        );
+        if target < 1.0 {
+            assert_eq!(
+                stats.termination,
+                crate::vector::ProbeTermination::QuantizedRecall
+            );
+            assert!(stats.clusters_probed() < clusters);
+            assert!(stats.candidates_scored < rows);
+        } else {
+            assert_eq!(
+                stats.termination,
+                crate::vector::ProbeTermination::Exhausted
+            );
+            assert_eq!(stats.clusters_probed(), clusters);
+            assert_eq!(stats.candidates_scored, rows);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn quantized_recall_rejects_invalid_parameters() {
     use crate::vector::QuantizedRecallParams;
     let stop = QuantizedRecallParams {

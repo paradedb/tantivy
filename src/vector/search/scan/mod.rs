@@ -570,6 +570,7 @@ where
         let reached = self.quantized_recall_gap.is_some_and(|threshold| {
             self.bound
                 .kth_estimate()
+                .or_else(|| self.bound.shared_threshold())
                 .and_then(|cutoff| source.quantized_recall_score(cutoff, completed))
                 .is_some_and(|score| score >= threshold)
         });
