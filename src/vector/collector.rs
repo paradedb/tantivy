@@ -840,8 +840,7 @@ where
             totals,
             on_segment,
         );
-        let mut scans: Vec<Option<GlobalScan<'_, T, S::Child, S::Comparator>>> =
-            (0..readers.len()).map(|_| None).collect();
+        let mut scans: Vec<Option<_>> = (0..readers.len()).map(|_| None).collect();
         let mut keys: Vec<_> = tie_breaks.iter_mut().map(Some).collect();
         let mut reserved = WorkUnits::ZERO;
         for i in 0..readers.len() {
