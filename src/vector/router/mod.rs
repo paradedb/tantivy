@@ -250,8 +250,14 @@ pub enum RouterMetrics {
     QuantizedStacked {
         /// Exact-ranked centroids handed to the document probe loop.
         candidate_count: usize,
+        /// Lists opened across all router levels.
         lists_scanned: usize,
+        /// One-bit scores across all levels, including root centroid ranking.
         approximate_scored: usize,
+        /// One-bit member scores at the bottom router level only. Members
+        /// retained from these scores are passed to the exact rerank.
+        approximate_members_scored: usize,
+        /// Full-precision scores during final reranking (or exact fallback).
         exact_scored: usize,
     },
     /// The exact router's work.

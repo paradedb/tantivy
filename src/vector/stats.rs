@@ -172,6 +172,59 @@ where S: serde::Serializer {
     serialize_io(io, "centroid", serializer)
 }
 
+/// Flat numeric fields survive ParadeDB's accumulation of repeated Top-K calls
+/// and parallel-worker segment reports. Keep parent traversal out of the leaf
+/// shortlist funnel: approximate members = pruned + exact rerank inputs.
+fn serialize_routing<S>(routing: &Option<RouterMetrics>, serializer: S) -> Result<S::Ok, S::Error>
+where S: serde::Serializer {
+    use serde::ser::SerializeMap;
+
+    let mut map = serializer.serialize_map(None)?;
+    match routing {
+        Some(RouterMetrics::QuantizedStacked {
+            candidate_count,
+            lists_scanned,
+            approximate_scored,
+            approximate_members_scored,
+            exact_scored,
+        }) => {
+            map.serialize_entry("routing_kind", "quantized_stacked")?;
+            map.serialize_entry("routing_lists_scanned", lists_scanned)?;
+            map.serialize_entry("routing_approximate_scored", approximate_scored)?;
+            map.serialize_entry(
+                "routing_approximate_members_scored",
+                approximate_members_scored,
+            )?;
+            // Exceptional non-finite queries bypass approximate scoring and
+            // rerank all raw rows; they have no approximate pruning.
+            map.serialize_entry(
+                "routing_approximate_pruned",
+                &approximate_members_scored.saturating_sub(*exact_scored),
+            )?;
+            map.serialize_entry("routing_exact_scored", exact_scored)?;
+            map.serialize_entry("routing_exact_pruned", &(exact_scored - candidate_count))?;
+            map.serialize_entry("routing_candidate_count", candidate_count)?;
+        }
+        Some(RouterMetrics::Stacked {
+            candidate_count,
+            lists_scanned,
+            members_scored,
+        }) => {
+            map.serialize_entry("routing_kind", "stacked")?;
+            map.serialize_entry("routing_lists_scanned", lists_scanned)?;
+            map.serialize_entry("routing_exact_scored", members_scored)?;
+            map.serialize_entry("routing_candidate_count", candidate_count)?;
+        }
+        Some(RouterMetrics::Exact { visited_count }) => {
+            map.serialize_entry("routing_kind", "exact")?;
+            map.serialize_entry("routing_exact_scored", visited_count)?;
+            map.serialize_entry("routing_candidate_count", visited_count)?;
+        }
+        None => {}
+    }
+    map.end()
+}
+
 /// Where a segment's layer-0 clusters came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, serde::Serialize)]
 pub(crate) enum AccessPath {
@@ -257,8 +310,8 @@ pub struct ProbeStats {
     pub postings_row: usize,
     /// Clusters opened that contributed no row.
     pub postings_skipped: usize,
-    /// The router's counters.
-    #[serde(skip)]
+    /// The router's counters, serialized as additive `routing_*` fields.
+    #[serde(flatten, serialize_with = "serialize_routing")]
     pub routing: Option<RouterMetrics>,
     /// Centroids scored while ranking.
     pub routing_visited_count: usize,
@@ -603,7 +656,13 @@ mod tests {
             layers: vec![LayerReport::default(); 2],
             ..ScanReport::default()
         };
-        let segment = ["segment_rows", "segment_clusters"];
+        let segment = [
+            "segment_rows",
+            "segment_clusters",
+            "routing_kind",
+            "routing_exact_scored",
+            "routing_candidate_count",
+        ];
         let ivf = |scan| SegmentReport::Ivf {
             plan,
             source: routed(),
@@ -628,5 +687,44 @@ mod tests {
             StageTotals::default(),
         );
         assert_eq!(keys(&empty), expected(&[], 0));
+    }
+
+    #[test]
+    fn routing_funnel_is_flat_and_separates_parent_scores_from_member_pruning() {
+        let stats = ProbeStats {
+            routing: Some(RouterMetrics::QuantizedStacked {
+                candidate_count: 3,
+                lists_scanned: 4,
+                approximate_scored: 32,
+                approximate_members_scored: 24,
+                exact_scored: 6,
+            }),
+            ..ProbeStats::default()
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["routing_kind"], "quantized_stacked");
+        assert_eq!(json["routing_lists_scanned"], 4);
+        assert_eq!(json["routing_approximate_scored"], 32);
+        assert_eq!(json["routing_approximate_members_scored"], 24);
+        assert_eq!(json["routing_approximate_pruned"], 18);
+        assert_eq!(json["routing_exact_scored"], 6);
+        assert_eq!(json["routing_exact_pruned"], 3);
+        assert_eq!(json["routing_candidate_count"], 3);
+        assert!(json.get("routing").is_none());
+
+        let fallback = ProbeStats {
+            routing: Some(RouterMetrics::QuantizedStacked {
+                candidate_count: 3,
+                lists_scanned: 0,
+                approximate_scored: 0,
+                approximate_members_scored: 0,
+                exact_scored: 96,
+            }),
+            ..ProbeStats::default()
+        };
+        let json = serde_json::to_value(&fallback).unwrap();
+        assert_eq!(json["routing_approximate_pruned"], 0);
+        assert_eq!(json["routing_exact_scored"], 96);
+        assert_eq!(json["routing_exact_pruned"], 93);
     }
 }

@@ -334,6 +334,7 @@ impl Ranking {
             candidate_count: self.candidate_count,
             lists_scanned: self.stats.lists_scanned,
             approximate_scored: self.stats.members_scored,
+            approximate_members_scored: self.stats.leaf_members_scored,
             exact_scored: self.exact_scored,
         }
     }
@@ -439,12 +440,16 @@ mod tests {
                 let RouterMetrics::QuantizedStacked {
                     exact_scored,
                     candidate_count,
+                    approximate_scored,
+                    approximate_members_scored,
                     ..
                 } = metrics
                 else {
                     unreachable!()
                 };
                 assert_eq!(candidate_count, 3);
+                assert!(approximate_scored > approximate_members_scored);
+                assert!(approximate_members_scored >= exact_scored);
                 assert!(
                     exact_scored >= 3
                         && exact_scored <= 3usize.saturating_mul(factor).min(matrix.rows)
@@ -615,6 +620,7 @@ mod tests {
             RouterMetrics::QuantizedStacked {
                 exact_scored: 16,
                 approximate_scored: 22,
+                approximate_members_scored: 16,
                 ..
             }
         ));
@@ -665,6 +671,20 @@ mod tests {
                         stats.routing,
                         Some(RouterMetrics::QuantizedStacked { .. })
                     )));
+                    for stats in actual.stats.iter().filter(|stats| stats.routing.is_some()) {
+                        let json = serde_json::to_value(stats)?;
+                        assert_eq!(json["routing_kind"], "quantized_stacked");
+                        let count = |key: &str| json[key].as_u64().unwrap();
+                        assert!(count("routing_approximate_scored") > 0);
+                        assert_eq!(
+                            count("routing_approximate_members_scored"),
+                            count("routing_approximate_pruned") + count("routing_exact_scored")
+                        );
+                        assert_eq!(
+                            count("routing_exact_scored"),
+                            count("routing_exact_pruned") + count("routing_candidate_count")
+                        );
+                    }
                 }
             }
         }

@@ -438,6 +438,10 @@ pub struct StackedSearchStats {
     /// the top level's brute-force centroid ranking. A parent's members
     /// are this level's centroids, so this is the total query cost.
     pub members_scored: usize,
+    /// Members scored at the level where search was invoked, excluding parent
+    /// traversal and the root's centroid ranking. This is the input to the
+    /// output heap, and therefore the denominator for final shortlist pruning.
+    pub leaf_members_scored: usize,
 }
 
 /// Counting sort into list order. `perm[old] = new_row`.
