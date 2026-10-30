@@ -99,6 +99,7 @@ pub(super) fn rank<T: VectorElement>(
     // thus `candidate_count`) is what ties the returned set to probe.
     let k = params.k.clamp(1, index.vectors.len().max(1));
     let (ranked, stats) = super::search::search(index, query, k, k, params.aps);
+    let ranked = ranked.into_sorted();
     let candidate_count = ranked.len();
     Ranking {
         ranked: ranked.into_iter(),

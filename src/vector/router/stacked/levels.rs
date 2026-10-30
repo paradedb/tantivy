@@ -944,7 +944,8 @@ where S: VectorArena<Elem = f32>
         query: &VectorQuery<T>,
         k: usize,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-        crate::vector::router::search::search(self, query, k, k, true)
+        let (selected, stats) = crate::vector::router::search::search(self, query, k, k, true);
+        (selected.into_sorted(), stats)
     }
 }
 

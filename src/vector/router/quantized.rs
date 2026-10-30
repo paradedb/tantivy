@@ -287,7 +287,8 @@ impl<S: VectorArena<Elem = f32>> QuantizedRouter<S> {
             )
         } else {
             let prepared = SignQuery::new(query, &self.rotation);
-            search::search(&self.level, &prepared, k, capacity, params.aps)
+            let (selected, stats) = search::search(&self.level, &prepared, k, capacity, params.aps);
+            (selected.into_unordered(), stats)
         };
         let exact_scored = candidates.len();
         let ranked = rerank_exact(&self.raw, query, &candidates, k);
@@ -879,6 +880,7 @@ mod tests {
             let mut scored = 0;
             for (query, truth) in queries.iter().zip(&truth) {
                 let (hits, stats) = search::search(&index, query, k, k, aps);
+                let hits = hits.into_sorted();
                 found += hits.iter().filter(|c| truth.contains(&c.node.0)).count();
                 scored += stats.members_scored;
             }

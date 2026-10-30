@@ -91,6 +91,16 @@ impl<I: Copy + Ord> TopCandidates<I> {
             .map(|Reverse(candidate)| candidate)
             .collect()
     }
+
+    /// Retention does not require ordering when another precision stage will
+    /// rescore these identities and choose the final order.
+    pub(crate) fn into_unordered(self) -> Vec<Candidate<I>> {
+        self.heap
+            .into_vec()
+            .into_iter()
+            .map(|Reverse(candidate)| candidate)
+            .collect()
+    }
 }
 
 pub(crate) fn lists_to_open(lists: usize, members: usize, k: usize) -> usize {
@@ -127,16 +137,17 @@ pub(crate) fn rank_centroids<Q, S: LevelSource<Q>>(
 
 /// Probe any supplied ranked shortlist. Representation and hierarchy are source
 /// concerns; retention and stopping are explicit policies of this invocation.
+/// The caller orders the retained set only when its next stage needs ranking.
 pub(crate) fn probe_clusters<Q, S: LevelSource<Q>>(
     source: &S,
     query: &Q,
     lists: Vec<Candidate<S::ClusterId>>,
     capacity: usize,
     aps: bool,
-) -> (Vec<Candidate<S::MemberId>>, StackedSearchStats) {
+) -> (TopCandidates<S::MemberId>, StackedSearchStats) {
     let mut stats = StackedSearchStats::default();
     if capacity == 0 {
-        return (Vec::new(), stats);
+        return (TopCandidates::new(0), stats);
     }
     let mut buffer = ScoreBuffer::default();
     let mut result = TopCandidates::new(capacity.min(source.member_count()));
@@ -153,24 +164,26 @@ pub(crate) fn probe_clusters<Q, S: LevelSource<Q>>(
             break;
         }
     }
-    (result.into_sorted(), stats)
+    (result, stats)
 }
 
 /// `k` sizes the traversal; `capacity` independently sizes the output heap.
 /// Parents produce ordinary, unpadded shortlists. Precision is a source concern.
+/// Parent results are ordered for descent; output ordering belongs to the caller.
 pub(crate) fn search<Q, S: Hierarchy<Q>>(
     source: &S,
     query: &Q,
     k: usize,
     capacity: usize,
     aps: bool,
-) -> (Vec<Candidate<S::MemberId>>, StackedSearchStats) {
+) -> (TopCandidates<S::MemberId>, StackedSearchStats) {
     if k == 0 || capacity == 0 || source.member_count() == 0 {
-        return (Vec::new(), StackedSearchStats::default());
+        return (TopCandidates::new(0), StackedSearchStats::default());
     }
     let open = lists_to_open(source.list_count(), source.member_count(), k);
     let (lists, mut stats) = if let Some(parent) = source.parent() {
-        search(parent, query, open, open, aps)
+        let (selected, stats) = search(parent, query, open, open, aps);
+        (selected.into_sorted(), stats)
     } else {
         rank_centroids(source, query, open)
     };
@@ -244,7 +257,10 @@ mod tests {
         let (_, stats) = search(&source, &(), 1, 40, true);
         assert_eq!(stats.lists_scanned, 10); // never fills
         source.scored.set(0);
-        assert!(search(&source, &(), 0, 0, true).0.is_empty());
+        assert!(search(&source, &(), 0, 0, true)
+            .0
+            .into_unordered()
+            .is_empty());
         assert_eq!(source.scored.get(), 0);
     }
 
@@ -295,6 +311,7 @@ mod tests {
         let (lists, _) = rank_centroids(&PostingLists, &(), 2);
         assert_eq!(lists.iter().map(|c| c.node).collect::<Vec<_>>(), [6, 4]);
         let (members, stats) = probe_clusters(&PostingLists, &(), lists, 2, false);
+        let members = members.into_sorted();
         assert_eq!(
             members.iter().map(|c| c.node).collect::<Vec<_>>(),
             [
