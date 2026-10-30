@@ -111,8 +111,8 @@ impl ProbeParams {
     /// the budget buys `budget / that` clusters: `budget` unfiltered, up to
     /// `budget / open_share` as the filter approaches empty. The count is
     /// capped at the segment's cluster count. Adaptive scans scale a base window by the
-    /// admission fraction, with a filter adjustment whose relative effect shrinks as the window grows.
-    /// Nonadaptive scans apply the `min_probe_clusters` floor.
+    /// admission fraction, with a filter adjustment whose relative effect shrinks as the window
+    /// grows. Nonadaptive scans apply the `min_probe_clusters` floor.
     ///
     /// * `open_share` (`f64`) — the per-index open share `x`.
     /// * `match_fraction` (`f64`) — the share of the segment's docs the filter matches, in `(0,
@@ -133,8 +133,8 @@ impl ProbeParams {
             .and_then(QuantizedRecallParams::admission_fraction)
         {
             let base = (0.002 / fraction.powf(0.625)).min(1.0);
-            let headroom = 0.05 * (cluster_cost.sqrt().recip() - 1.0);
-            let adjusted = (base + headroom * base.powf(0.125) * (1.0 - base)).min(1.0);
+            let headroom = (0.06 * (cluster_cost.sqrt().recip() - 1.0)).min(0.5);
+            let adjusted = base + headroom * base.powf(0.125) * (1.0 - base).powi(3);
             let window = (adjusted * clusters_in_segment as f64).ceil();
             (clusters as usize).min(window as usize)
         } else {
@@ -219,11 +219,12 @@ mod tests {
         assert_eq!(params(0.9).router_k(1000.0, 0.1, 1.0, 1000), 13);
         assert_eq!(params(0.95).router_k(1000.0, 0.1, 1.0, 1000), 21);
         assert_eq!(params(0.99).router_k(1000.0, 0.1, 1.0, 1000), 74);
-        assert_eq!(params(0.95).router_k(2000.0, 0.1, 0.01, 2000), 164);
+        assert_eq!(params(0.95).router_k(2000.0, 0.1, 0.01, 2000), 183);
         for open_share in [f64::MIN_POSITIVE, 1e-9, 0.004, 0.1, 1.0] {
             for match_fraction in [0.0, 0.001, 0.01, 0.1, 1.0] {
                 let mut previous = 0;
-                for target in [0.01, 0.5, 0.9, 0.95, 0.99, 0.999, 1.0] {
+                for step in 1..=1000 {
+                    let target = step as f64 / 1000.0;
                     let window = params(target).router_k(4000.0, open_share, match_fraction, 4000);
                     assert!(window >= previous && window <= 4000);
                     previous = window;
