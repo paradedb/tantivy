@@ -21,7 +21,7 @@ pub struct ProbeParams {
     pub quantized_recall: Option<QuantizedRecallParams>,
     /// Work ceiling as a fraction of segment capacity. Default 0.01.
     pub max_probe_fraction: f32,
-    /// Work-budget floor. Default 16.
+    /// Work-budget floor when adaptive probing is disabled. Default 16.
     pub min_probe_clusters: usize,
     /// Lets a quantized segment score a cluster's rows exactly before the exact phase when that
     /// reads strictly fewer storage blocks (bytes without block geometry) than the cheaper
@@ -58,9 +58,9 @@ pub enum LocatedPath {
     Off,
     /// The cap is `floor(selectivity * max_doc)`.
     MaxSelectivity(Selectivity),
-    /// The cap is the rows the segment's routed work budget buys with no cluster opened,
-    /// `floor(budget * n_avg / (1 - x))`: a filter matching no more documents than routing may
-    /// score is located instead.
+    /// The cap is the rows the initial routed work estimate buys with no cluster opened,
+    /// `floor(work * n_avg / (1 - x))`. Adaptive scans use their expected work estimate;
+    /// nonadaptive scans use their work ceiling.
     Auto,
 }
 
@@ -96,6 +96,13 @@ impl Default for ProbeParams {
 pub(crate) const MIN_PROBE_CLUSTERS: usize = 16;
 
 impl ProbeParams {
+    /// Expected initial work for bypass selection and allocation, separate from routing headroom.
+    pub(crate) fn initial_work(&self, clusters: usize) -> Option<f64> {
+        let recall = self.quantized_recall.filter(|recall| recall.target < 1.0)?;
+        let fraction = 0.005 * (-recall.target).ln_1p() / 0.05_f64.ln();
+        Some((fraction * clusters as f64).clamp(1.0, clusters.max(1) as f64))
+    }
+
     /// The number of clusters the stacked router is asked to rank for a
     /// segment whose resolved work budget is `budget` units.
     ///
@@ -103,10 +110,9 @@ impl ProbeParams {
     /// match_fraction` units, since only filter matches charge row work, so
     /// the budget buys `budget / that` clusters: `budget` unfiltered, up to
     /// `budget / open_share` as the filter approaches empty. The count is
-    /// floored at `min_probe_clusters` and capped at the segment's cluster
-    /// count. There is no headroom: when ranked clusters run smaller than
-    /// average or the bounds gate skips some, the ranking can run out
-    /// before the budget and the scan ends `Exhausted`.
+    /// capped at the segment's cluster count. Adaptive scans further cap the window
+    /// at `0.02 / sqrt((1 - target) * cluster_cost)` of the segment's clusters, without a minimum
+    /// beyond one cluster. Nonadaptive scans apply the `min_probe_clusters` floor.
     ///
     /// * `open_share` (`f64`) — the per-index open share `x`.
     /// * `match_fraction` (`f64`) — the share of the segment's docs the filter matches, in `(0,
@@ -122,10 +128,16 @@ impl ProbeParams {
         let cluster_cost =
             (open_share + (1.0 - open_share) * match_fraction).max(f64::MIN_POSITIVE);
         let clusters = (budget.max(0.0) / cluster_cost).ceil();
-        (clusters as usize)
-            .max(self.min_probe_clusters)
-            .min(clusters_in_segment)
-            .max(1)
+        let clusters =
+            if let Some(recall) = self.quantized_recall.filter(|recall| recall.target < 1.0) {
+                let window = (0.02 / ((1.0 - recall.target) * cluster_cost).sqrt()
+                    * clusters_in_segment as f64)
+                    .ceil();
+                (clusters as usize).min(window as usize)
+            } else {
+                (clusters as usize).max(self.min_probe_clusters)
+            };
+        clusters.min(clusters_in_segment).max(1)
     }
 }
 
@@ -133,7 +145,8 @@ impl ProbeParams {
     /// The segment's work budget with the pricing it was resolved under, `(budget, n_avg, x)`.
     ///
     /// The budget is `max_probe_fraction` of the segment's capacity in work units, floored at
-    /// `min_probe_clusters` and capped at the capacity; `n_avg` is the docs per cluster and `x` the
+    /// one for adaptive scans or `min_probe_clusters` otherwise, and capped at capacity.
+    /// `n_avg` is the docs per cluster and `x` the
     /// open share. `native_docs_in_segment` counts distinct docs with a vector, as written. A
     /// non-positive `max_probe_fraction` or a non-finite or non-positive `fixed_probe_cost_rows` is
     /// an error.
@@ -170,7 +183,11 @@ impl ProbeParams {
         let segment_units = clusters_in_segment as f64 * x
             + (1.0 - x) * native_docs_in_segment as f64 / n_avg.max(f64::MIN_POSITIVE);
         let budget = (self.max_probe_fraction as f64 * segment_units)
-            .max(self.min_probe_clusters as f64)
+            .max(if self.initial_work(clusters_in_segment).is_some() {
+                1.0
+            } else {
+                self.min_probe_clusters as f64
+            })
             .min(segment_units);
         Ok((budget, n_avg, x))
     }
@@ -179,6 +196,33 @@ impl ProbeParams {
 #[cfg(test)]
 mod tests {
     use super::ProbeParams;
+
+    #[test]
+    fn adaptive_window_scales_with_recall_and_segment_size_without_a_probe_floor() {
+        let params = |target| ProbeParams {
+            quantized_recall: Some(super::QuantizedRecallParams {
+                target,
+                recall_exponent: 3.0,
+            }),
+            max_probe_fraction: 0.001,
+            ..Default::default()
+        };
+        assert!(params(0.9).initial_work(1000) < params(0.95).initial_work(1000));
+        assert!(params(0.95).initial_work(1000) < params(0.99).initial_work(1000));
+        assert!((params(0.95).initial_work(1000).unwrap() - 5.0).abs() < 1e-10);
+        assert!((params(0.95).initial_work(4000).unwrap() - 20.0).abs() < 1e-10);
+        assert!((params(0.95).resolved_work_budget(1000, 100_000).unwrap().0 - 1.0).abs() < 1e-6);
+        assert_eq!(params(0.95).router_k(2.0, 0.1, 1.0, 1000), 2);
+        assert_eq!(params(0.9).router_k(1000.0, 0.1, 1.0, 1000), 64);
+        assert_eq!(params(0.95).router_k(1000.0, 0.1, 1.0, 1000), 90);
+        assert_eq!(params(0.99).router_k(1000.0, 0.1, 1.0, 1000), 200);
+        assert_eq!(params(0.95).router_k(2000.0, 0.1, 0.01, 2000), 542);
+        assert_eq!(params(1.0).initial_work(1000), None);
+        assert_eq!(
+            params(1.0).resolved_work_budget(1000, 100_000).unwrap().0,
+            16.0
+        );
+    }
 
     /// Capacity is the cluster count, exactly, whatever the granularity:
     /// `units_seg = C*x + (1 - x)*N/n_avg == C` for every x the open

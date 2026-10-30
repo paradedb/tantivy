@@ -208,7 +208,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
     {
         let init = enter_vector_stage(VectorStage::ScanInit);
         let plan = SegmentPlan::build(&self.probe_params, index, weight, segment, top_n)?;
-        let capacity = plan.capacity_hint();
+        let capacity = plan.capacity_hint(&self.probe_params);
         let SegmentPlan {
             budget,
             source,

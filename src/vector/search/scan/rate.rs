@@ -97,10 +97,13 @@ pub(crate) struct RateReading {
 
 impl RateReading {
     pub(crate) fn reached(self, fraction: f64) -> bool {
-        if self.opening_rows < 1.0 {
-            return self.current == 0.0 && self.recent_rows >= 5.0 * self.opening_total;
-        }
-        self.evidence >= 5.0 && f64::from(self.current) <= fraction * f64::from(self.opening)
+        let (opening, evidence) = if self.opening_rows < 1.0 {
+            let opening = 1.0 / self.opening_total;
+            (opening, opening * self.recent_rows)
+        } else {
+            (self.opening, self.evidence)
+        };
+        evidence >= 5.0 && f64::from(self.current) <= fraction * f64::from(opening)
     }
 }
 
@@ -126,6 +129,25 @@ mod tests {
         .reached(0.01));
         assert!(!RateReading {
             recent_rows: 499.0,
+            ..quiet
+        }
+        .reached(0.01));
+    }
+
+    #[test]
+    fn a_late_admission_can_decay_after_an_empty_opening() {
+        let quiet = RateReading {
+            opening: 0.0,
+            opening_rows: 0.0,
+            current: 0.00001,
+            evidence: 0.0,
+            recent_rows: 1000.0,
+            opening_total: 100.0,
+        };
+        assert!(quiet.reached(0.01));
+        assert!(!quiet.reached(0.000001));
+        assert!(!RateReading {
+            current: 0.001,
             ..quiet
         }
         .reached(0.01));

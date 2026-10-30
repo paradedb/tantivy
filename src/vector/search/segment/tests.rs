@@ -231,7 +231,7 @@ fn adaptive_stops_when_shared_threshold_prunes_every_local_candidate() -> crate:
 }
 
 #[test]
-fn adaptive_preserves_routing_budget_and_access_path() -> crate::Result<()> {
+fn disabled_adaptive_preserves_routing_budget_and_access_path() -> crate::Result<()> {
     for router in [RouterKind::Exact, RouterKind::Stacked] {
         for schedule in [&[][..], &[1, 4][..]] {
             let fixture = FixtureSpec::clustered(Metric::L2, 64, 64, 6400)
@@ -257,40 +257,103 @@ fn adaptive_preserves_routing_budget_and_access_path() -> crate::Result<()> {
                     let baseline = fixture.search(filter, &query, 10, params.clone())?;
                     let baseline_reads = fixture.reads();
                     let expected = &baseline.stats[0];
-                    for target in [0.5, 0.95, 1.0] {
-                        fixture.clear_reads();
-                        let adaptive = fixture.search(
-                            filter,
-                            &query,
-                            10,
-                            ProbeParams {
-                                quantized_recall: Some(crate::vector::QuantizedRecallParams {
-                                    target,
-                                    recall_exponent: 1.5,
-                                }),
-                                ..params.clone()
-                            },
-                        )?;
-                        let reads = fixture.reads();
-                        let actual = &adaptive.stats[0];
-                        assert_eq!(actual.work_budget, expected.work_budget);
-                        assert_eq!(actual.located_cap, expected.located_cap);
-                        assert_eq!(actual.access_path, expected.access_path);
-                        assert_eq!(actual.routing_visited_count, expected.routing_visited_count);
-                        assert_eq!(
-                            stage_reads(&reads, |stage| stage == VectorStage::Routing),
-                            stage_reads(&baseline_reads, |stage| stage == VectorStage::Routing),
-                        );
-                        assert!(actual.work_charged <= expected.work_charged);
-                        assert!(actual.candidates_scored <= expected.candidates_scored);
-                        if target == 1.0 {
-                            assert_eq!(adaptive.results, baseline.results);
-                            assert_eq!(actual.termination, expected.termination);
-                            assert_eq!(reads, baseline_reads);
-                        }
-                    }
+                    fixture.clear_reads();
+                    let adaptive = fixture.search(
+                        filter,
+                        &query,
+                        10,
+                        ProbeParams {
+                            quantized_recall: Some(crate::vector::QuantizedRecallParams {
+                                target: 1.0,
+                                recall_exponent: 1.5,
+                            }),
+                            ..params.clone()
+                        },
+                    )?;
+                    let reads = fixture.reads();
+                    let actual = &adaptive.stats[0];
+                    assert_eq!(actual.work_budget, expected.work_budget);
+                    assert_eq!(actual.located_cap, expected.located_cap);
+                    assert_eq!(actual.access_path, expected.access_path);
+                    assert_eq!(actual.routing_visited_count, expected.routing_visited_count);
+                    assert_eq!(
+                        stage_reads(&reads, |stage| stage == VectorStage::Routing),
+                        stage_reads(&baseline_reads, |stage| stage == VectorStage::Routing),
+                    );
+                    assert!(actual.work_charged <= expected.work_charged);
+                    assert!(actual.candidates_scored <= expected.candidates_scored);
+                    assert_eq!(adaptive.results, baseline.results);
+                    assert_eq!(actual.termination, expected.termination);
+                    assert_eq!(reads, baseline_reads);
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn adaptive_routing_uses_one_window_without_expansion() -> crate::Result<()> {
+    let fixture = FixtureSpec::clustered(Metric::L2, 64, 64, 640)
+        .router(RouterKind::Stacked)
+        .paged()
+        .build()?;
+    let query = Lcg(42).vector(64, 0.5);
+    let adaptive = fixture.search(
+        &AllQuery,
+        &query,
+        640,
+        ProbeParams {
+            max_probe_fraction: 1.0,
+            located: LocatedPath::Off,
+            quantized_recall: Some(crate::vector::QuantizedRecallParams {
+                target: 0.95,
+                recall_exponent: 1.25,
+            }),
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(
+        adaptive.stats[0].termination,
+        crate::vector::ProbeTermination::Exhausted
+    );
+    assert_eq!(adaptive.stats[0].routing_visited_count, 6);
+    assert_eq!(adaptive.stats[0].postings_row, 6);
+    assert!(adaptive.stats[0].candidates_scored < 640);
+    Ok(())
+}
+
+#[test]
+fn adaptive_bypass_is_independent_of_ceiling_headroom() -> crate::Result<()> {
+    let fixture = FixtureSpec::clustered(Metric::L2, 64, 64, 6400)
+        .label("few", |i| i % 200 == 0)
+        .label("some", |i| i % 10 == 0)
+        .build()?;
+    let query = Lcg(42).vector(64, 0.5);
+    for (filter, path) in [
+        (fixture.filter("few"), AccessPath::Located),
+        (fixture.filter("some"), AccessPath::Routed),
+    ] {
+        let mut cap = None;
+        for max_probe_fraction in [0.1, 0.25, 1.0] {
+            let result = fixture.search(
+                &filter,
+                &query,
+                10,
+                ProbeParams {
+                    max_probe_fraction,
+                    quantized_recall: Some(crate::vector::QuantizedRecallParams {
+                        target: 0.95,
+                        recall_exponent: 3.0,
+                    }),
+                    ..Default::default()
+                },
+            )?;
+            assert_eq!(result.stats[0].access_path, path);
+            assert_eq!(
+                *cap.get_or_insert(result.stats[0].located_cap),
+                result.stats[0].located_cap
+            );
         }
     }
     Ok(())
