@@ -137,7 +137,8 @@ impl ProbeParams {
             let remaining = 1.0 - base;
             let taper = (remaining / 0.9).min(1.0);
             let adjusted = base + headroom * base.powf(0.125) * remaining * taper * taper;
-            let window = (adjusted * clusters_in_segment as f64).ceil();
+            let expected = self.initial_work(clusters_in_segment).unwrap_or(0.0) / cluster_cost;
+            let window = (adjusted * clusters_in_segment as f64).max(expected).ceil();
             (clusters as usize).min(window as usize)
         } else {
             (clusters as usize).max(self.min_probe_clusters)
@@ -222,6 +223,14 @@ mod tests {
         assert_eq!(params(0.95).router_k(1000.0, 0.1, 1.0, 1000), 21);
         assert_eq!(params(0.99).router_k(1000.0, 0.1, 1.0, 1000), 74);
         assert_eq!(params(0.95).router_k(2000.0, 0.1, 0.01, 2000), 164);
+        let cost = 0.004 + 0.996 * 0.0067;
+        let expected = params(0.95).initial_work(4000).unwrap();
+        let window = params(0.95).router_k(4000.0, 0.004, 0.0067, 4000);
+        assert!(window as f64 * cost >= expected);
+        assert_eq!(
+            params(0.95).router_k(2.0, 0.004, 0.0067, 4000),
+            (2.0_f64 / cost).ceil() as usize
+        );
         for open_share in [f64::MIN_POSITIVE, 1e-9, 0.004, 0.1, 1.0] {
             for match_fraction in [0.0, 0.001, 0.01, 0.1, 1.0] {
                 let mut previous = 0;

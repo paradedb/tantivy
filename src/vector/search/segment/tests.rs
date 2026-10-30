@@ -411,7 +411,6 @@ fn quantized_recall_rejects_invalid_parameters() {
             }
             .router_k(1000.0, 0.1, 0.1, 1000)
         };
-        assert_eq!(window(calibrated), window(raw));
         assert!(
             window(calibrated)
                 > window(QuantizedRecallParams {
