@@ -983,7 +983,7 @@ where S: VectorArena<Elem = f32>
             return (Vec::new(), stats);
         }
 
-        let mut probe = super::aps::open(k);
+        let mut probe = super::aps::open();
         let mut result = BinaryHeap::with_capacity(k);
         let mut scores = Vec::new();
         for c in &candidates {
@@ -997,7 +997,7 @@ where S: VectorArena<Elem = f32>
             } else {
                 None
             };
-            if probe.observe(kth, scanned) {
+            if probe.observe(kth) {
                 break;
             }
         }
@@ -1283,8 +1283,7 @@ mod tests {
         let query = [0.0f32, 0.0];
         let (hits, stats) = index.search(&query, 1, Metric::L2);
         assert!(!hits.is_empty());
-        // Cap is the shortlist; member-relative patience may stop earlier when
-        // stagnant lists already cover ⌈5k⌉ rows.
+        // Cap is the shortlist; patience may stop earlier after five quiet lists.
         assert!(
             stats.lists_scanned <= floor,
             "small-k top level must not expand past ceil(0.25 × nlist), scanned {} floor {}",
