@@ -20,7 +20,7 @@ pub struct ProbeParams {
     /// Work ceiling as a fraction of each segment's capacity. Default 0.01.
     pub max_probe_fraction: f32,
     /// Approximate members retained per requested cluster by the quantized router.
-    /// Clamped to at least one. Does not widen list selection. Default 2;
+    /// Clamped to at least one. Does not widen list selection. Default 4;
     /// provisional until real-data recall/latency tuning.
     pub router_rerank_factor: usize,
     /// Whether stacked routing may stop after lists cease improving its heap.
@@ -76,7 +76,7 @@ impl Default for ProbeParams {
     fn default() -> Self {
         Self {
             max_probe_fraction: 0.01,
-            router_rerank_factor: 2,
+            router_rerank_factor: 4,
             router_aps: true,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
             exact_plan: true,
