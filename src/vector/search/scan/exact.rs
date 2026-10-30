@@ -9,6 +9,7 @@ use crate::vector::search::cluster_source::ClusterRows;
 use crate::vector::search::prepared::VectorQuery;
 use crate::vector::search::scan::bound::{Candidate, PruningBound};
 use crate::vector::search::scan::heap::{tie_break_key, TieBreakHeap, TieBreakHits};
+use crate::vector::search::scan::histogram::Fold;
 use crate::vector::storage::quantized::ReadScratch;
 use crate::vector::storage::reader::{VectorIndexReader, VectorRowBatch};
 use crate::vector::telemetry::enter_vector_stage;
@@ -85,8 +86,9 @@ where
         selected: &ClusterRows<'_>,
         scratch: &mut ReadScratch,
         bound: &mut PruningBound,
+        mut fold: Option<Fold<'_>>,
     ) -> crate::Result<usize> {
-        self.score_rows(selected, scratch, bound)
+        self.score_rows(selected, scratch, bound, &mut fold)
     }
 
     /// Scores the exact phase's survivors in `selected`, as [`ExactScorer::score`] does.
@@ -98,7 +100,7 @@ where
     ) -> crate::Result<usize> {
         #[cfg(test)]
         self.exact_phase_rows.extend(selected.global_rows());
-        self.score(selected, scratch, bound)
+        self.score(selected, scratch, bound, None)
     }
 
     /// Reads `selected`'s rows in `ExactFetch` and scores them in `ExactScore`.
@@ -107,6 +109,7 @@ where
         selected: &ClusterRows<'_>,
         scratch: &mut ReadScratch,
         bound: &mut PruningBound,
+        fold: &mut Option<Fold<'_>>,
     ) -> crate::Result<usize> {
         let mut column_read = false;
         let rows = {
@@ -122,6 +125,7 @@ where
                     self.offer(
                         selected,
                         bound,
+                        fold,
                         &mut column_read,
                         local,
                         local,
@@ -137,6 +141,7 @@ where
                     self.offer(
                         selected,
                         bound,
+                        fold,
                         &mut column_read,
                         position,
                         row - selected.rows.start,
@@ -152,16 +157,18 @@ where
         Ok(scored)
     }
 
-    /// Scores one row into `bound` and, when it can enter the top k, the heap.
+    /// Scores one row into `bound`, `fold` and, when it can enter the top k, the heap.
     ///
     /// `position` indexes the selection's doc ids and `offset` the cluster's DocIds column, read
     /// once per selection on first use. The bound is keyed by [`RowAddress`] so doc lookup stays
     /// deferred until the score can enter the result heap.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn offer(
         &mut self,
         selected: &ClusterRows<'_>,
         bound: &mut PruningBound,
+        fold: &mut Option<Fold<'_>>,
         column_read: &mut bool,
         position: usize,
         offset: usize,
@@ -178,6 +185,9 @@ where
             },
             score,
         )]);
+        if let Some(fold) = fold {
+            fold.score(score);
+        }
         // Rows that cannot enter the top k skip the tie-break and the doc id lookup: below the
         // shared floor, or below the result heap's own threshold.
         if bound.shared_threshold().is_some_and(|kth| score < kth)

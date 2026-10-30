@@ -260,8 +260,12 @@ pub struct ProbeStats {
     /// The router's counters.
     #[serde(skip)]
     pub routing: Option<RouterMetrics>,
-    /// Centroids scored while ranking.
+    /// Ranked centroids returned to probing (all scored centroids for the exact router).
     pub routing_visited_count: usize,
+    /// Centroid similarity computations across every router level.
+    pub routing_members_scored: usize,
+    /// Lists scanned across every stacked router level.
+    pub routing_lists_scanned: usize,
     /// Clusters the bounds gate passed over.
     pub bounds_skips: u32,
     /// Segment scans in which the query bound armed: 0 or 1.
@@ -367,6 +371,9 @@ impl ProbeStats {
             SourceReport::Router(routed) => stats.record_routed(routed),
             SourceReport::Matches(matches) => stats.record_matches(matches),
         }
+        if scan.recall_reached {
+            stats.termination = ProbeTermination::QuantizedRecall;
+        }
         stats.record_io(totals);
         debug_assert_eq!(
             stats.centroid_io.reads, scan.centroid_reads as u64,
@@ -394,12 +401,17 @@ impl ProbeStats {
             self.bound_armed_probe_sum = u64::from(probe);
         }
         self.routing = Some(routing);
-        self.routing_visited_count = match routing {
+        let (returned, scored, lists) = match routing {
             RouterMetrics::Stacked {
-                candidate_count, ..
-            } => candidate_count,
-            RouterMetrics::Exact { visited_count } => visited_count,
+                candidate_count,
+                members_scored,
+                lists_scanned,
+            } => (candidate_count, members_scored, lists_scanned),
+            RouterMetrics::Exact { visited_count } => (visited_count, visited_count, 0),
         };
+        self.routing_visited_count = returned;
+        self.routing_members_scored = scored;
+        self.routing_lists_scanned = lists;
         self.termination = probe.termination;
         self.work_charged = probe.work_charged;
         self.work_budget = probe.work_budget;
@@ -544,6 +556,8 @@ mod tests {
         "postings_row",
         "postings_skipped",
         "routing_visited_count",
+        "routing_members_scored",
+        "routing_lists_scanned",
         "bounds_skips",
         "bound_armed_count",
         "bound_armed_probe_sum",
@@ -608,6 +622,8 @@ mod tests {
         };
         let stats = ProbeStats::new(ivf(quantized), StageTotals::default());
         assert_eq!(keys(&stats), expected(&segment, 2));
+        assert_eq!(stats.routing_members_scored, 7);
+        assert_eq!(stats.routing_lists_scanned, 0);
         let layer = stats.layers.get(1).unwrap();
         assert_eq!((layer.scan_ns(), layer.boundary_ns()), (0, 0));
         let full_precision = [&segment[..], &["exact_scan_ns"]].concat();
@@ -625,5 +641,24 @@ mod tests {
             StageTotals::default(),
         );
         assert_eq!(keys(&empty), expected(&[], 0));
+        let stacked = ProbeStats::new(
+            SegmentReport::Ivf {
+                plan,
+                source: SourceReport::Router(RouterReport {
+                    counters: RouterCounters::default(),
+                    routing: RouterMetrics::Stacked {
+                        candidate_count: 7,
+                        members_scored: 31,
+                        lists_scanned: 3,
+                    },
+                    probe: ProbeOutcome::default(),
+                }),
+                scan: Box::new(ScanReport::default()),
+            },
+            StageTotals::default(),
+        );
+        assert_eq!(stacked.routing_visited_count, 7);
+        assert_eq!(stacked.routing_members_scored, 31);
+        assert_eq!(stacked.routing_lists_scanned, 3);
     }
 }

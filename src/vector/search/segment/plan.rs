@@ -79,7 +79,10 @@ impl SegmentPlan {
         // Capacity counts native docs as written: deleted rows still charge on first touch.
         let (budget, n_avg, x) = params.resolved_work_budget(clusters, index.num_docs())?;
         debug_assert!(n_avg > 0.0);
-        let cap = located_cap(params.located, max_doc, budget, n_avg, x);
+        let initial_work = params
+            .initial_work(clusters)
+            .map_or(budget, |work| work.min(budget));
+        let cap = located_cap(params.located, max_doc, initial_work, n_avg, x);
         let source = {
             let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
             collect_segment_filter(weight, segment, max_doc, cap)?
@@ -121,7 +124,10 @@ impl SegmentPlan {
         let x = budget.per_cluster.get();
         let n_avg = (1.0 - x) / budget.per_row.get();
         debug_assert!(n_avg > 0.0);
-        let cap = located_cap(params.located, max_doc, budget.total.get(), n_avg, x);
+        let initial_work = params
+            .initial_work(clusters)
+            .map_or(budget.total.get(), |work| work.min(budget.total.get()));
+        let cap = located_cap(params.located, max_doc, initial_work, n_avg, x);
         let source = {
             let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
             collect_segment_filter(weight, segment, max_doc, cap)?
@@ -133,13 +139,16 @@ impl SegmentPlan {
         })
     }
 
-    /// The rows the scan admits under the budget, for reserving its columns once. The last
-    /// cluster can overshoot the budget, growing the columns once more.
-    pub(crate) fn capacity_hint(&self) -> usize {
+    /// Initial candidate capacity; columns grow as additional clusters are probed.
+    pub(crate) fn capacity_hint(&self, params: &ProbeParams) -> usize {
         let rows = match &self.source {
-            Some(Source::Router(_)) => {
-                (self.budget.total.get() / self.budget.per_row.get()).ceil() as usize
-            }
+            Some(Source::Router(_)) => (params
+                .initial_work(self.report.segment_clusters)
+                .map_or(self.budget.total.get(), |work| {
+                    work.min(self.budget.total.get())
+                })
+                / self.budget.per_row.get())
+            .ceil() as usize,
             Some(Source::FilterMatches(docs)) => docs.len(),
             None => 0,
         };
@@ -148,7 +157,7 @@ impl SegmentPlan {
 }
 
 /// The most matches, deleted ones included, a filter may have and take the located path; `Auto`
-/// prices the work budget `(budget, n_avg, x)` the routed path runs against.
+/// prices the initial routed work estimate `(budget, n_avg, x)`.
 fn located_cap(located: LocatedPath, max_doc: DocId, budget: f64, n_avg: f64, x: f64) -> usize {
     match located {
         LocatedPath::Off => 0,
@@ -274,7 +283,7 @@ mod tests {
                         },
                         Source::FilterMatches(docs) => (true, Some(docs.len())),
                     };
-                    (plan.budget, plan.capacity_hint(), plan.report, source)
+                    (plan.budget, plan.capacity_hint(params), plan.report, source)
                 }))
             })
         };
