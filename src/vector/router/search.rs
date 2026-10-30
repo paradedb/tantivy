@@ -116,6 +116,7 @@ pub(crate) fn rank_centroids<Q, S: LevelSource<Q>>(
     let stats = StackedSearchStats {
         lists_scanned: 0,
         members_scored: buffer.candidates.len(),
+        leaf_members_scored: 0,
     };
     let mut selected = TopCandidates::new(k);
     for candidate in buffer.candidates {
@@ -143,6 +144,7 @@ pub(crate) fn probe_clusters<Q, S: LevelSource<Q>>(
     for list in lists {
         source.score_members(list.node, query, &mut buffer);
         stats.members_scored += buffer.candidates.len();
+        stats.leaf_members_scored += buffer.candidates.len();
         stats.lists_scanned += 1;
         for candidate in buffer.candidates.drain(..) {
             result.offer(candidate);
@@ -175,6 +177,7 @@ pub(crate) fn search<Q, S: Hierarchy<Q>>(
     let (candidates, probed) = probe_clusters(source, query, lists, capacity, aps);
     stats.members_scored += probed.members_scored;
     stats.lists_scanned += probed.lists_scanned;
+    stats.leaf_members_scored = probed.leaf_members_scored;
     (candidates, stats)
 }
 
