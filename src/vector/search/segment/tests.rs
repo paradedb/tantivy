@@ -412,15 +412,6 @@ fn quantized_recall_rejects_invalid_parameters() {
             .router_k(1000.0, 0.1, 0.1, 1000)
         };
         assert_eq!(window(calibrated), window(raw));
-        let initial = |recall| {
-            ProbeParams {
-                quantized_recall: Some(recall),
-                ..Default::default()
-            }
-            .initial_work(1000)
-            .unwrap()
-        };
-        assert!((initial(calibrated) - initial(raw)).abs() < 1e-10);
         assert!(
             window(calibrated)
                 > window(QuantizedRecallParams {

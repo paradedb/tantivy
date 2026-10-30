@@ -99,7 +99,7 @@ impl ProbeParams {
     /// Expected initial work for bypass selection and allocation, separate from routing headroom.
     pub(crate) fn initial_work(&self, clusters: usize) -> Option<f64> {
         let recall = self.quantized_recall.filter(|recall| recall.target < 1.0)?;
-        let fraction = 0.005 * recall.recall_exponent * (-recall.target).ln_1p() / 0.05_f64.ln();
+        let fraction = 0.005 * (-recall.target).ln_1p() / 0.05_f64.ln();
         Some((fraction * clusters as f64).clamp(1.0, clusters.max(1) as f64))
     }
 
@@ -214,8 +214,8 @@ mod tests {
         };
         assert!(params(0.9).initial_work(1000) < params(0.95).initial_work(1000));
         assert!(params(0.95).initial_work(1000) < params(0.99).initial_work(1000));
-        assert!((params(0.95).initial_work(1000).unwrap() - 6.25).abs() < 1e-10);
-        assert!((params(0.95).initial_work(4000).unwrap() - 25.0).abs() < 1e-10);
+        assert!((params(0.95).initial_work(1000).unwrap() - 5.0).abs() < 1e-10);
+        assert!((params(0.95).initial_work(4000).unwrap() - 20.0).abs() < 1e-10);
         assert!((params(0.95).resolved_work_budget(1000, 100_000).unwrap().0 - 1.0).abs() < 1e-6);
         assert_eq!(params(0.95).router_k(2.0, 0.1, 1.0, 1000), 2);
         assert_eq!(params(0.9).router_k(1000.0, 0.1, 1.0, 1000), 13);
