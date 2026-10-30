@@ -160,8 +160,19 @@ impl QuantizedRouter<LazyStore> {
         raw: FileSlice,
         options: &VectorOptions,
     ) -> crate::Result<Self> {
-        let bytes = payload.read_bytes()?;
-        let mut input = bytes.as_slice();
+        let mut payload = payload;
+        let read_metadata = |input: &mut FileSlice, len: usize| -> io::Result<common::OwnedBytes> {
+            if len > input.len() {
+                return Err(invalid("truncated quantized router metadata"));
+            }
+            let bytes = input.slice_to(len).read_bytes()?;
+            *input = input.slice_from(len);
+            Ok(bytes)
+        };
+        // Fixed header only. The remaining cursor skips vector column ranges
+        // without fetching them, including the small root centroid codes.
+        let header = read_metadata(&mut payload, 21)?;
+        let mut input = header.as_slice();
         if u32::deserialize(&mut input)? != VERSION {
             return Err(
                 invalid("unsupported quantized router payload version; rebuild required").into(),
@@ -174,15 +185,18 @@ impl QuantizedRouter<LazyStore> {
         }
         let seed = u64::deserialize(&mut input)?;
         let count = u32::deserialize(&mut input)? as usize;
-        if count == 0 || count > input.len() / 4 {
+        if count == 0 || count > payload.len() / 4 {
             return Err(invalid("invalid quantized router level count").into());
         }
         let mut topology = Vec::with_capacity(count);
         for _ in 0..count {
-            let lists = u32::deserialize(&mut input)? as usize;
-            if lists > input.len() / 16 {
-                return Err(invalid("truncated quantized router topology").into());
-            }
+            let header = read_metadata(&mut payload, 4)?;
+            let lists = u32::deserialize(&mut header.as_slice())? as usize;
+            let len = lists
+                .checked_mul(16)
+                .ok_or_else(|| invalid("router topology size overflow"))?;
+            let bytes = read_metadata(&mut payload, len)?;
+            let mut input = bytes.as_slice();
             let offsets = (0..lists)
                 .map(|_| Ok((u64::deserialize(&mut input)?, u64::deserialize(&mut input)?)))
                 .collect::<io::Result<Vec<_>>>()?;
@@ -190,9 +204,9 @@ impl QuantizedRouter<LazyStore> {
         }
         let mut sets = Vec::with_capacity(count + 1);
         for _ in 0..=count {
-            sets.push(Arc::new(SignVectors::deserialize(&mut input, dim)?));
+            sets.push(Arc::new(SignVectors::open(&mut payload, dim)?));
         }
-        if !input.is_empty() {
+        if !payload.is_empty() {
             return Err(invalid("trailing quantized router bytes").into());
         }
         let raw_len = sets[0]
@@ -384,6 +398,72 @@ mod tests {
             rows: count,
             dims: dim,
         })
+    }
+
+    #[test]
+    fn open_reads_metadata_only_and_probing_reads_only_selected_columns() -> crate::Result<()> {
+        let (dim, rows) = (65, 96);
+        let options = VectorOptions::new(dim, Metric::L2);
+        let mut centroids = vectors(dim, rows);
+        let built = QuantizedRouter::build(&options, &mut centroids)?;
+        assert!(built.level.parent.is_none());
+        let mut payload = Vec::new();
+        built.serialize(&mut payload)?;
+        let topology_end = 21 + 4 + built.level.offsets.len() * 16;
+        let codes_start = topology_end + 4;
+        let words = dim.div_ceil(64);
+        let coefficients_start = codes_start + rows * words * 8;
+        let norms_start = coefficients_start + rows * 4;
+        let root_header = norms_start + rows * 4;
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let tracked = FileSlice::new(Arc::new(TrackedRaw {
+            bytes: payload,
+            reads: reads.clone(),
+        }));
+        let raw = FileSlice::from(vec![0u8; rows * dim * 4]);
+        let opened = QuantizedRouter::open(tracked, raw, &options)?;
+        assert_eq!(
+            *reads.lock().unwrap(),
+            vec![
+                0..21,
+                21..25,
+                25..topology_end,
+                topology_end..codes_start,
+                root_header..root_header + 4,
+            ]
+        );
+        let query = SignQuery::new(
+            &VectorQuery::new(Metric::L2, Arc::new(vec![0.15; dim])),
+            &opened.rotation,
+        );
+        let mut actual = ScoreBuffer::default();
+        let mut expected = ScoreBuffer::default();
+        reads.lock().unwrap().clear();
+        opened
+            .level
+            .score_members(ClusterId(0), &query, &mut actual);
+        built
+            .level
+            .score_members(ClusterId(0), &query, &mut expected);
+        assert_eq!(actual.candidates, expected.candidates);
+        let (start, end) = opened.level.offsets[0];
+        let (start, end) = (start as usize, end as usize);
+        assert_eq!(
+            *reads.lock().unwrap(),
+            vec![
+                codes_start + start * words * 8..codes_start + end * words * 8,
+                coefficients_start + start * 4..coefficients_start + end * 4,
+                norms_start + start * 4..norms_start + end * 4,
+            ]
+        );
+        reads.lock().unwrap().clear();
+        opened
+            .level
+            .members
+            .score(rows..rows, &query, &mut actual, ClusterId::from);
+        assert!(reads.lock().unwrap().is_empty());
+        assert!(actual.candidates.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -841,6 +921,86 @@ mod tests {
                     start.elapsed().as_secs_f64() * 1e6 / queries.len() as f64,
                     approx as f64 / queries.len() as f64,
                     exact as f64 / queries.len() as f64
+                );
+            }
+        }
+        Ok(())
+    }
+    /// Fresh-reader CPU diagnostic, including initialization rather than only a
+    /// warmed router. FileSlice memory does not model PostgreSQL buffer costs.
+    #[test]
+    #[ignore]
+    fn quantized_router_open_measurement() -> crate::Result<()> {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let (dim, count, repeats) = (1024, 4096, 128);
+        let options = VectorOptions::new(dim, Metric::Cosine);
+        let mut centroids = vectors(dim, count);
+        let index = super::super::stacked::build(&options, &mut centroids)?;
+        let raw = FileSlice::from(
+            index
+                .vectors
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        let mut full_payload = Vec::new();
+        index.serialize_router_payload(&mut full_payload)?;
+        let full_payload = FileSlice::from(full_payload);
+        let quantized = QuantizedRouter::from_index(index, &options)?;
+        let mut payload = Vec::new();
+        quantized.serialize(&mut payload)?;
+        let payload = FileSlice::from(payload);
+        let query = VectorQuery::new(
+            Metric::Cosine,
+            Arc::new((0..dim).map(|i| (i as f32 * 0.19).cos()).collect()),
+        );
+        for quantized in [false, true] {
+            let start = Instant::now();
+            for _ in 0..repeats {
+                if quantized {
+                    black_box(QuantizedRouter::open(
+                        payload.clone(),
+                        raw.clone(),
+                        &options,
+                    )?);
+                } else {
+                    black_box(super::super::stacked::open(
+                        full_payload.clone(),
+                        raw.clone(),
+                        &options,
+                    )?);
+                }
+            }
+            let open_us = start.elapsed().as_secs_f64() * 1e6 / repeats as f64;
+            for k in [16, 128, 1024] {
+                let params = RoutingParams {
+                    k,
+                    rerank_factor: 2,
+                    aps: false,
+                };
+                let start = Instant::now();
+                let mut checksum = 0u64;
+                for _ in 0..repeats {
+                    let hits: Vec<_> = if quantized {
+                        QuantizedRouter::open(payload.clone(), raw.clone(), &options)?
+                            .rank(&query, params)
+                            .collect()
+                    } else {
+                        let opened = super::super::stacked::open(
+                            full_payload.clone(),
+                            raw.clone(),
+                            &options,
+                        )?;
+                        super::super::stacked::rank(&opened, &query, params).collect()
+                    };
+                    checksum += hits.iter().map(|c| c.node as u64).sum::<u64>();
+                    black_box(hits);
+                }
+                eprintln!(
+                    "quantized={quantized}, k={k}: open_us={open_us:.1}, open_rank_us={:.1}, \
+                     checksum={checksum}",
+                    start.elapsed().as_secs_f64() * 1e6 / repeats as f64
                 );
             }
         }
