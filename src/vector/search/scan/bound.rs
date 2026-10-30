@@ -144,7 +144,6 @@ impl TopK {
     }
 
     /// The k-th of the estimates in the map, once it is full. It carries no confidence margin.
-    #[cfg(test)]
     pub(crate) fn kth_estimate(&self) -> Option<f32> {
         if self.k == 0 || self.by_addr.len() != self.k {
             return None;
@@ -307,8 +306,7 @@ impl PruningBound {
         self.top.kth_lower()
     }
 
-    /// Local TopK k-th estimate (APS cover; unused in production).
-    #[cfg(test)]
+    /// Local TopK k-th estimate for adaptive stopping.
     pub(crate) fn kth_estimate(&self) -> Option<f32> {
         self.top.kth_estimate()
     }
