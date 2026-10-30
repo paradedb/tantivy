@@ -150,7 +150,7 @@ impl Default for RoutingParams {
     fn default() -> Self {
         Self {
             k: usize::MAX,
-            rerank_factor: 2,
+            rerank_factor: 4,
             aps: true,
         }
     }
