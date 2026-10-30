@@ -14,14 +14,11 @@
 //! Search works on any [`VectorArena`]. Build and payload serialization require
 //! owned [`InMemoryStore`]s. [`StackedIvf::open`] is search-only.
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::io::{self, Write};
 use std::ops::Deref;
 use std::{fmt, mem};
 
 use common::{BinarySerializable, HasLen};
-use itertools::Itertools;
 use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperKMeansConfig};
 
 use crate::directory::FileSlice;
@@ -431,7 +428,7 @@ where
     Ok(())
 }
 
-/// Work done by one [`StackedIvf::search_prepared`], summed over this level and
+/// Work done by one stacked search, summed over this level and
 /// every parent above it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StackedSearchStats {
@@ -754,9 +751,15 @@ fn parse_level_topology(mut topology: &[u8]) -> io::Result<Vec<(usize, Vec<(u64,
 }
 
 /// Ranges must be a partition of `0..n` (possibly not in list-id order).
-fn ranges_cover_members(ranges: &[(u64, u64)], n: usize) -> bool {
+pub(crate) fn ranges_cover_members(ranges: &[(u64, u64)], n: usize) -> bool {
     if ranges.is_empty() {
         return n == 0;
+    }
+    if ranges
+        .iter()
+        .any(|&(start, end)| start > end || end > n as u64)
+    {
+        return false;
     }
     let mut packed: Vec<(u64, u64)> = ranges.to_vec();
     // Sort by (start, end) so empty ranges `(s, s)` precede a non-empty
@@ -899,20 +902,14 @@ where S: VectorArena<Elem = f32>
     /// `[ceil(PARENT_NPROBE_FRACTION * nlist), nlist]`. Used as the parent
     /// ask when a parent exists, and as the flat-top keep otherwise.
     pub fn lists_to_open(&self, k: usize) -> usize {
-        let nlist = self.nlist();
-        if nlist == 0 {
-            return 0;
-        }
-        let floor = ((nlist as f32 * PARENT_NPROBE_FRACTION).ceil() as usize).max(1);
-        let n_members = self
-            .offsets
-            .iter()
-            .map(|&(start, end)| (end - start) as usize)
-            .sum::<usize>()
-            .max(1);
-        let beam_members = k.saturating_mul(LIST_OVERSCAN).max(1);
-        let for_k = ((beam_members as f64 * nlist as f64) / n_members as f64).ceil() as usize;
-        for_k.max(floor).min(nlist).max(1)
+        crate::vector::router::search::lists_to_open(
+            self.nlist(),
+            self.offsets
+                .iter()
+                .map(|&(start, end)| (end - start) as usize)
+                .sum(),
+            k,
+        )
     }
 
     /// Nearest members from the lists selected at this level, plus the
@@ -937,111 +934,94 @@ where S: VectorArena<Elem = f32>
         )
     }
 
+    #[cfg(any(test, feature = "unstable"))]
     pub(crate) fn search_prepared<T: VectorElement>(
         &self,
         query: &VectorQuery<T>,
         k: usize,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-        if k == 0 {
-            return (Vec::new(), StackedSearchStats::default());
-        }
+        crate::vector::router::search::search(self, query, k, k, true)
+    }
+}
 
-        let open = self.lists_to_open(k);
+impl<S, T> crate::vector::router::search::LevelSource<VectorQuery<T>> for StackedIvf<S>
+where
+    S: VectorArena<Elem = f32>,
+    T: VectorElement,
+{
+    type ClusterId = ClusterId;
+    type MemberId = ClusterId;
 
-        // Candidate lists, nearest centroid first; `candidates[0]` is P0.
-        let (candidates, mut stats) = if let Some(parent) = &self.parent {
-            parent.search_prepared(query, open)
-        } else {
-            let nlist = self.nlist();
-            let mut scores = Vec::with_capacity(nlist);
-            self.centroids.batch_similarity(
-                query.widened(),
-                query.metric(),
-                query.routing_norm(),
-                0..nlist,
-                &mut scores,
-            );
-            let all: Vec<Candidate<ClusterId>> = scores
-                .into_iter()
-                .enumerate()
-                .map(|(i, sim)| Candidate {
-                    sim,
-                    node: ClusterId(i as u32),
-                })
-                .sorted()
-                .rev()
-                .take(open)
-                .collect();
-            let stats = StackedSearchStats {
-                lists_scanned: 0,
-                members_scored: nlist,
-            };
-            (all, stats)
-        };
-
-        if candidates.is_empty() {
-            return (Vec::new(), stats);
-        }
-
-        let mut probe = super::aps::open();
-        let mut result = BinaryHeap::with_capacity(k);
-        let mut scores = Vec::new();
-        for c in &candidates {
-            let scanned = self.scan_cluster(query, c.node, &mut result, k, &mut scores);
-            stats.members_scored += scanned;
-            stats.lists_scanned += 1;
-            let kth = if result.len() >= k {
-                result
-                    .peek()
-                    .map(|worst: &Reverse<Candidate<ClusterId>>| worst.0.sim)
-            } else {
-                None
-            };
-            if probe.observe(kth) {
-                break;
-            }
-        }
-
-        let hits = result
-            .into_sorted_vec()
-            .into_iter()
-            .map(|Reverse(c)| c)
-            .collect();
-        (hits, stats)
+    fn list_count(&self) -> usize {
+        self.nlist()
     }
 
-    fn scan_cluster<T: VectorElement>(
+    fn member_count(&self) -> usize {
+        self.offsets
+            .iter()
+            .map(|&(start, end)| (end - start) as usize)
+            .sum()
+    }
+
+    fn score_centroids(
         &self,
         query: &VectorQuery<T>,
+        out: &mut crate::vector::router::search::ScoreBuffer<ClusterId>,
+    ) {
+        self.centroids.batch_similarity(
+            query.widened(),
+            query.metric(),
+            query.routing_norm(),
+            0..self.nlist(),
+            &mut out.similarities,
+        );
+        out.candidates.clear();
+        out.candidates.extend(
+            out.similarities
+                .iter()
+                .enumerate()
+                .map(|(row, &sim)| Candidate {
+                    sim,
+                    node: ClusterId(row as u32),
+                }),
+        );
+    }
+
+    fn score_members(
+        &self,
         list: ClusterId,
-        result: &mut BinaryHeap<Reverse<Candidate<ClusterId>>>,
-        k: usize,
-        scores: &mut Vec<Similarity>,
-    ) -> usize {
+        query: &VectorQuery<T>,
+        out: &mut crate::vector::router::search::ScoreBuffer<ClusterId>,
+    ) {
         let (start, end) = self.offsets[usize::from(list)];
-        let start = start as usize;
-        let end = end as usize;
         self.vectors.batch_similarity(
             query.widened(),
             query.metric(),
             query.routing_norm(),
-            start..end,
-            scores,
+            start as usize..end as usize,
+            &mut out.similarities,
         );
-        for (row, &sim) in (start..end).zip(scores.iter()) {
-            let cand = Candidate {
-                sim,
-                node: ClusterId::from(row),
-            };
-            if result.len() < k {
-                result.push(Reverse(cand));
-            } else if let Some(mut worst) = result.peek_mut() {
-                if cand > worst.0 {
-                    *worst = Reverse(cand);
-                }
-            }
-        }
-        end.saturating_sub(start)
+        out.candidates.clear();
+        out.candidates.extend(
+            out.similarities
+                .iter()
+                .enumerate()
+                .map(|(row, &sim)| Candidate {
+                    sim,
+                    node: ClusterId(start as u32 + row as u32),
+                }),
+        );
+    }
+}
+
+impl<S, T> crate::vector::router::search::Hierarchy<VectorQuery<T>> for StackedIvf<S>
+where
+    S: VectorArena<Elem = f32>,
+    T: VectorElement,
+{
+    type Parent = Self;
+    fn parent(&self) -> Option<&Self> {
+        self.parent.as_deref()
     }
 }
 

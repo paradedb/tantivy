@@ -8,6 +8,75 @@ its version **3** describe routing, posting offsets, and cluster bounds.
 `VectorQuantizationConfig.format_version = 3` identifies the independent index
 settings grammar; settings specify the target for future builds.
 
+## Quantized stacked router
+
+The `.centroids` router slot starts with a router-kind byte: 1 is the existing
+full-precision stacked router, 2 the exhaustive exact router, and 3 the opt-in
+quantized stacked router. Kind 3 has its own versioned payload; existing kind 1
+and 2 layouts and the outer `.centroids` version remain unchanged. Older readers
+reject kind 3 as an incompatible router. New readers support mixed router kinds
+across segments. The configured kind affects future builds, not existing files.
+
+Kind 3 payload version 1 uses little-endian scalars:
+
+```text
+payload_version:u32 = 1
+dimension:u32
+metric:u8                    // 0 L2, 1 dot, 2 cosine
+rotation_seed:u64
+level_count:u32              // positive, bottom router level first
+for each level:
+  list_count:u32
+  member_ranges:(start:u64, end:u64)[list_count]
+vector_set[0]                // posting-list centroid codes
+vector_set[1..level_count]   // each router level's centroid codes, bottom first
+```
+
+Each fixed-stride vector set is:
+
+```text
+row_count:u32
+codes:u64[row_count * ceil(dimension / 64)]
+coefficients:f32[row_count]
+norms_squared:f32[row_count]
+```
+
+The containing payload supplies dimension and rotation for every set. There is
+no inter-column padding; readers decode little-endian words into aligned compact
+arrays. Unused high bits of each row's last code word must be zero. Coefficients
+and squared norms are finite and nonnegative, and are zero together for a zero
+row (including norms that underflow binary32).
+
+Version 1 fixes zero centering and the seeded `quant::rotation::Rotation`
+construction. Codes contain signs of the rotated vector. The coefficient is
+`||x||² / sum(abs(Rx))`, or zero for a zero norm. Asymmetric sign scoring estimates
+the dot product using a prepared four-bit query and that coefficient. L2 uses
+the stored original norm and query norm; cosine also divides by both norms.
+There are no error-bound, gamma, or refinement columns in this router format.
+
+Level i references vector set i for its members and vector set i+1 for its
+centroids. Consequently parent members and child centroids share one stored set.
+Ranges must partition the member rows, although list order need not be physical
+row order. The centroid set's row count must equal the level's list count.
+
+Full-precision posting-list centroids remain in `.centroids` slot 0, in exactly
+the same canonical row order as vector set 0; the router payload does not copy
+them. Internal router raw vectors are not required by this final-rerank-only
+policy. Opening validates topology, counts, framing, metric, dimension, sidecars,
+and code padding, then pins the compact arrays. Raw posting-list centroid rows
+stay file-backed and are fetched only for the final retained candidates.
+
+Query-time list sizing still uses the original `router_k`. The approximate heap
+retains up to `router_rerank_factor * router_k` members, capped at the available
+count, and APS observes that heap at complete-list boundaries when enabled.
+Only the final posting-list candidates are exact-reranked and truncated to
+`router_k`. Intermediate hierarchy levels use unpadded approximate shortlists.
+Non-finite queries bypass sign preparation and use the raw exact scorer.
+
+Representation metadata is persisted. Rerank expansion and APS are query policy
+and are not stored. Building the sign representation does not depend on document
+quantization settings; plain and quantized document storage can use either router.
+
 Each vector field declares exactly these composite entries:
 
 | Index | Entry | Contents |

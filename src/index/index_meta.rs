@@ -329,6 +329,11 @@ pub struct IndexSettings {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub vector_quantization: Vec<VectorQuantizationConfig>,
+    /// Build new IVF segments with one-bit centroid routing and exact reranking.
+    /// Captured at index creation and restored on open, independently of document
+    /// quantization. Existing segments retain their own persisted router kind.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub vector_centroid_quantization: bool,
     /// Eligibility and storage limits for fields with bitmap postings enabled.
     #[serde(default, skip_serializing_if = "BitmapPostingsConfig::is_default")]
     pub bitmap_postings: BitmapPostingsConfig,
@@ -337,6 +342,10 @@ pub struct IndexSettings {
 /// Must be a function to be compatible with serde defaults
 fn default_docstore_blocksize() -> usize {
     16_384
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 fn default_codec_types() -> Vec<columnar::CodecType> {
@@ -366,6 +375,7 @@ impl Default for IndexSettings {
             codec_types: default_codec_types(),
             vector_clustering_threshold: default_vector_clustering_threshold(),
             vector_quantization: Vec::new(),
+            vector_centroid_quantization: false,
             bitmap_postings: BitmapPostingsConfig::default(),
         }
     }
@@ -663,6 +673,7 @@ mod tests {
                 codec_types: columnar::DEFAULT_CODEC_TYPES.to_vec(),
                 vector_clustering_threshold: 10_000,
                 vector_quantization: Vec::new(),
+                vector_centroid_quantization: false,
                 bitmap_postings: super::BitmapPostingsConfig::default(),
             }
         );

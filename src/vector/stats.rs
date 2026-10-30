@@ -399,6 +399,9 @@ impl ProbeStats {
                 candidate_count, ..
             } => candidate_count,
             RouterMetrics::Exact { visited_count } => visited_count,
+            RouterMetrics::QuantizedStacked {
+                candidate_count, ..
+            } => candidate_count,
         };
         self.termination = probe.termination;
         self.work_charged = probe.work_charged;
