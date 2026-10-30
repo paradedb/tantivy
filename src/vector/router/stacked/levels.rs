@@ -1193,8 +1193,7 @@ mod tests {
         let query = [0.0f32, 0.0];
         let (hits, stats) = index.search(&query, 1, Metric::L2);
         assert!(!hits.is_empty());
-        // Cap is the shortlist; member-relative patience may stop earlier when
-        // stagnant lists already cover ⌈5k⌉ rows.
+        // Cap is the shortlist; patience may stop earlier after five quiet lists.
         assert!(
             stats.lists_scanned <= floor,
             "small-k top level must not expand past ceil(0.25 × nlist), scanned {} floor {}",

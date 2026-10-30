@@ -193,7 +193,7 @@ impl<'a, S: VectorArena<Elem = f32>> StackedRouting<'a, S> {
                 });
                 stats[segment].lists_scanned += 1;
                 stats[segment].members_scored += scanned;
-                if probe.should_stop(scanned) {
+                if probe.should_stop() {
                     break;
                 }
             }

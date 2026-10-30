@@ -4,11 +4,8 @@ use std::collections::BinaryHeap;
 use super::candidate::Candidate;
 use crate::vector::distance::Similarity;
 
-/// Members scored with an unchanged full size-`k` heap, as a multiple of `k`,
-/// before patience stops. Counted in members (not lists) so √n list sizing
-/// does not make the same constant a different share of the shortlist at
-/// 1M vs 10M.
-const PATIENCE_K_MULTIPLIER: f32 = 5.0;
+/// Consecutive lists that leave the full heap's worst similarity unchanged.
+const PATIENCE_LISTS: usize = 5;
 
 /// Tracks the best members at one router level and stops opening lists when
 /// they stop improving. Segment and global routing share the same patience rule.
@@ -21,11 +18,10 @@ pub(crate) struct AdaptiveProbe<N: Ord> {
 impl<N: Ord> AdaptiveProbe<N> {
     pub(crate) fn new(k: usize) -> Self {
         let k = k.max(1);
-        let window = ((k as f32 * PATIENCE_K_MULTIPLIER).ceil() as usize).max(1);
         Self {
             k,
             best: BinaryHeap::new(),
-            patience: Patience::new(window),
+            patience: Patience::new(PATIENCE_LISTS),
         }
     }
 
@@ -39,14 +35,14 @@ impl<N: Ord> AdaptiveProbe<N> {
         }
     }
 
-    /// Call after scoring a complete list, counting its members even if none entered the heap.
-    pub(crate) fn should_stop(&mut self, members: usize) -> bool {
+    /// Call once after scoring a complete list, even if none of its members entered the heap.
+    pub(crate) fn should_stop(&mut self) -> bool {
         let kth = self
             .best
             .peek()
             .filter(|_| self.best.len() >= self.k)
             .map(|worst| worst.0.sim);
-        self.patience.observe(kth, members)
+        self.patience.observe(kth)
     }
 
     pub(crate) fn into_sorted_vec(self) -> Vec<Candidate<N>> {
@@ -58,11 +54,10 @@ impl<N: Ord> AdaptiveProbe<N> {
     }
 }
 
-/// Stops after `window` members in a row leave the full heap's worst similarity
-/// unchanged. Lists are still scanned whole; the check runs at list boundaries.
+/// Stops after `window` lists in a row leave the full heap's worst similarity unchanged.
 struct Patience {
     window: usize,
-    /// Members scored since the last kth change (while the heap is full).
+    /// Lists scored since the last kth change (while the heap is full).
     stagnant: usize,
     last: Option<Similarity>,
 }
@@ -76,7 +71,7 @@ impl Patience {
         }
     }
 
-    fn observe(&mut self, kth: Option<Similarity>, members: usize) -> bool {
+    fn observe(&mut self, kth: Option<Similarity>) -> bool {
         let Some(kth) = kth else {
             // Heap still filling: improvements are structural, not stagnation.
             self.stagnant = 0;
@@ -90,7 +85,7 @@ impl Patience {
                 self.stagnant = 0;
             }
             Some(previous) if previous == kth => {
-                self.stagnant = self.stagnant.saturating_add(members);
+                self.stagnant = self.stagnant.saturating_add(1);
             }
             Some(_) => {
                 // Heap improved: restart the window after this list.
@@ -117,24 +112,28 @@ mod tests {
             sim: Similarity::new(10.0),
             node: 0,
         });
-        assert!(!probe.should_stop(100));
+        assert!(!probe.should_stop());
         probe.push(Candidate {
             sim: Similarity::new(20.0),
             node: 1,
         });
-        assert!(!probe.should_stop(1));
+        assert!(!probe.should_stop());
         probe.push(Candidate {
             sim: Similarity::new(5.0),
             node: 2,
         });
-        assert!(!probe.should_stop(9));
+        for _ in 0..4 {
+            assert!(!probe.should_stop());
+        }
         probe.push(Candidate {
             sim: Similarity::new(30.0),
             node: 3,
         });
-        assert!(!probe.should_stop(1));
-        assert!(!probe.should_stop(9));
-        assert!(probe.should_stop(1));
+        assert!(!probe.should_stop());
+        for _ in 0..4 {
+            assert!(!probe.should_stop());
+        }
+        assert!(probe.should_stop());
         assert_eq!(
             probe
                 .into_sorted_vec()
@@ -164,19 +163,22 @@ mod tests {
     }
 
     #[test]
-    fn patience_stops_after_stagnant_members() {
-        let mut stop = Patience::new(10);
+    fn patience_stops_after_five_quiet_lists() {
+        let mut stop = Patience::new(PATIENCE_LISTS);
         let a = sim(1);
         let b = sim(2);
-        assert!(!stop.observe(None, 100));
-        assert!(!stop.observe(Some(a), 4)); // first full: stagnant = 0
-        assert!(!stop.observe(Some(a), 4));
-        assert!(!stop.observe(Some(a), 4));
-        assert!(stop.observe(Some(a), 2)); // 4+4+2 = 10
-        let mut stop = Patience::new(5);
-        assert!(!stop.observe(Some(a), 3)); // first full
-        assert!(!stop.observe(Some(b), 3)); // improved: stagnant = 0
-        assert!(!stop.observe(Some(b), 4));
-        assert!(stop.observe(Some(b), 1)); // 4+1 = 5
+        assert!(!stop.observe(None));
+        assert!(!stop.observe(Some(a)));
+        for _ in 0..4 {
+            assert!(!stop.observe(Some(a)));
+        }
+        assert!(stop.observe(Some(a)));
+        let mut stop = Patience::new(PATIENCE_LISTS);
+        assert!(!stop.observe(Some(a)));
+        assert!(!stop.observe(Some(b)));
+        for _ in 0..4 {
+            assert!(!stop.observe(Some(b)));
+        }
+        assert!(stop.observe(Some(b)));
     }
 }
