@@ -139,22 +139,6 @@ pub(crate) enum RouterIter {
 }
 
 impl RouterIter {
-    pub(crate) fn for_each_candidate(&self, mut visit: impl FnMut(Candidate)) {
-        match self {
-            #[cfg(test)]
-            Self::Explicit(ranking) => ranking.as_slice().iter().copied().for_each(visit),
-            Self::Exact(ranking) => ranking.ranked.as_slice().iter().copied().for_each(visit),
-            Self::Stacked(ranking) => {
-                for candidate in ranking.ranked.as_slice() {
-                    visit(Candidate {
-                        sim: candidate.sim,
-                        node: candidate.node.0,
-                    });
-                }
-            }
-        }
-    }
-
     pub(crate) fn metrics(&self) -> RouterMetrics {
         match self {
             #[cfg(test)]

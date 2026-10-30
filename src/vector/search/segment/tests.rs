@@ -311,14 +311,14 @@ fn quantized_recall_rejects_invalid_parameters() {
         .resolved_work_budget(MATRIX_CLUSTERS, MATRIX_DOCS)
         .is_err());
     }
-    assert_eq!(stop.gap_threshold(0), None);
-    assert!(stop.gap_threshold(10).unwrap() > 0.0);
+    assert_eq!(stop.admission_fraction(0), None);
+    assert!(stop.admission_fraction(10).unwrap() > 0.0);
     assert_eq!(
         QuantizedRecallParams {
             target: 1.0,
             ..stop
         }
-        .gap_threshold(10),
+        .admission_fraction(10),
         None
     );
     for recall_exponent in [0.0, -1.0, f64::NAN, f64::INFINITY] {
@@ -339,14 +339,16 @@ fn quantized_recall_rejects_invalid_parameters() {
             recall_exponent: 1.0,
         };
         assert!(
-            (calibrated.gap_threshold(10).unwrap() - raw.gap_threshold(10).unwrap()).abs() < 1e-10
+            (calibrated.admission_fraction(10).unwrap() - raw.admission_fraction(10).unwrap())
+                .abs()
+                < 1e-10
         );
     }
     assert!(QuantizedRecallParams {
         target: 1.0 - f64::EPSILON,
         recall_exponent: 100.0
     }
-    .gap_threshold(10)
+    .admission_fraction(10)
     .unwrap()
     .is_finite());
 }

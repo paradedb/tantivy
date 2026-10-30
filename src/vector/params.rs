@@ -17,7 +17,7 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 /// provisional pending real-data benchmarking.
 #[derive(Clone, Debug)]
 pub struct ProbeParams {
-    /// Adaptive score-gap stopping within the routed candidates and work budget.
+    /// Adaptive admission-rate stopping within the routed candidates and work budget.
     pub quantized_recall: Option<QuantizedRecallParams>,
     /// Work ceiling as a fraction of segment capacity. Default 0.01.
     pub max_probe_fraction: f32,
@@ -35,7 +35,7 @@ pub struct ProbeParams {
     pub fixed_probe_cost_rows: f64,
 }
 
-/// Normalized centroid-gap recall estimate within the routed candidates.
+/// Admission-rate decay calibrated to a requested recall target.
 #[derive(Clone, Copy, Debug)]
 pub struct QuantizedRecallParams {
     pub target: f64,
@@ -43,8 +43,8 @@ pub struct QuantizedRecallParams {
 }
 
 impl QuantizedRecallParams {
-    pub(crate) fn gap_threshold(self, k: usize) -> Option<f64> {
-        (k > 0 && self.target < 1.0).then(|| -self.recall_exponent * (-self.target).ln_1p())
+    pub(crate) fn admission_fraction(self, k: usize) -> Option<f64> {
+        (k > 0 && self.target < 1.0).then(|| (self.recall_exponent * (-self.target).ln_1p()).exp())
     }
 }
 

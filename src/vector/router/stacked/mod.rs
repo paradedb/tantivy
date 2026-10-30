@@ -108,7 +108,7 @@ pub(super) fn rank<T: VectorElement>(
 }
 
 pub(crate) struct Ranking {
-    pub(super) ranked: std::vec::IntoIter<Candidate<ClusterId>>,
+    ranked: std::vec::IntoIter<Candidate<ClusterId>>,
     candidate_count: usize,
     stats: StackedSearchStats,
 }
