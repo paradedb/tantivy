@@ -29,6 +29,405 @@ const MATRIX_DIM: usize = 64;
 const MATRIX_DOCS: usize = 240;
 const MATRIX_CLUSTERS: usize = 6;
 
+#[test]
+fn adaptive_cascade_matches_oracle_and_prefix_replay() -> crate::Result<()> {
+    use crate::vector::router::with_test_clusters;
+    use crate::vector::{ProbeTermination, QuantizedRecallParams};
+
+    let plans = [
+        PlanOverride::read(LayerRead::Sparse),
+        PlanOverride::exact(|_, _| true),
+        PlanOverride::exact(|_, layer| layer == 1),
+        PlanOverride::exact(|cluster, layer| cluster % 3 == layer),
+    ];
+    let mut stops = 0;
+    let mut plain_stops = 0;
+    let mut exact_layers = [0; 3];
+    for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+        for schedule in [&[][..], &[1][..], &[1, 1][..], &[1, 1, 4][..]] {
+            let representation = if schedule.is_empty() {
+                Representation::FullPrecision
+            } else {
+                Representation::Quantized(schedule)
+            };
+            let fixture = matrix_fixture(metric, representation, true)?;
+            for filter in [
+                &AllQuery as &dyn Query,
+                &fixture.filter("half"),
+                &fixture.filter("rare"),
+            ] {
+                let weight = fixture.weight(filter)?;
+                for query in matrix_queries() {
+                    let mut ranked =
+                        fixture.candidates(&(0..MATRIX_CLUSTERS).collect::<Vec<_>>(), &query)?;
+                    ranked.sort_unstable_by(|a, b| {
+                        b.sim
+                            .score()
+                            .total_cmp(&a.sim.score())
+                            .then(a.node.cmp(&b.node))
+                    });
+                    for k in [1, 10, MATRIX_DOCS] {
+                        let params = ProbeParams {
+                            quantized_recall: Some(QuantizedRecallParams {
+                                target: 1.0,
+                                recall_exponent: 1.5,
+                            }),
+                            exact_plan: true,
+                            ..routed_exhaustive_params(MATRIX_CLUSTERS)
+                        };
+                        for plan in plans {
+                            for located in [
+                                LocatedPath::Off,
+                                LocatedPath::MaxSelectivity(Selectivity::new(1.0).unwrap()),
+                            ] {
+                                let (hits, reports) = forced_top_k(
+                                    &fixture,
+                                    filter,
+                                    &query,
+                                    k,
+                                    &ProbeParams {
+                                        located,
+                                        ..params.clone()
+                                    },
+                                    plan,
+                                )?;
+                                assert_eq!(hits, fixture.oracle(filter, &query, k)?);
+                                for report in reports {
+                                    let planned: usize = (0..schedule.len())
+                                        .filter_map(|layer| report.layers.get(layer))
+                                        .map(|l| l.exact_rows())
+                                        .sum();
+                                    assert!(planned <= report.exact_rows);
+                                    assert!(report.exact_rows <= report.candidates_scored);
+                                    if k == MATRIX_DOCS {
+                                        assert_eq!(report.exact_rows, report.candidates_scored);
+                                    }
+                                    for (layer, total) in exact_layers.iter_mut().enumerate() {
+                                        *total += report
+                                            .layers
+                                            .get(layer)
+                                            .map_or(0, |counts| counts.exact_rows());
+                                    }
+                                }
+                            }
+                            let mut previous_prefix = 0;
+                            for target in [0.5, 0.95, 1.0] {
+                                let (active, report) = with_test_clusters(ranked.clone(), || {
+                                    fixture.run_planned(
+                                        0,
+                                        weight.as_ref(),
+                                        &query,
+                                        k,
+                                        ProbeParams {
+                                            quantized_recall: Some(QuantizedRecallParams {
+                                                target,
+                                                recall_exponent: 1.5,
+                                            }),
+                                            ..params.clone()
+                                        },
+                                        Some(plan),
+                                        true,
+                                    )
+                                })?;
+                                let prefix =
+                                    report.clusters_probed() + report.bounds_skips as usize;
+                                assert!(prefix >= previous_prefix);
+                                previous_prefix = prefix;
+                                if report.termination == ProbeTermination::QuantizedRecall {
+                                    stops += 1;
+                                    plain_stops += usize::from(schedule.is_empty());
+                                    assert!(target < 1.0);
+                                }
+                                let (replay, replay_report) =
+                                    with_test_clusters(ranked[..prefix].to_vec(), || {
+                                        fixture.run_planned(
+                                            0,
+                                            weight.as_ref(),
+                                            &query,
+                                            k,
+                                            params.clone(),
+                                            Some(plan),
+                                            true,
+                                        )
+                                    })?;
+                                assert_eq!(active, replay);
+                                assert_eq!(report.exact_rows, replay_report.exact_rows);
+                                assert_eq!(
+                                    report.candidates_scored,
+                                    replay_report.candidates_scored
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(stops > 0);
+    assert!(
+        plain_stops > 0,
+        "unquantized IVF must honor adaptive stopping"
+    );
+    assert!(exact_layers.iter().all(|&rows| rows > 0));
+    Ok(())
+}
+
+#[test]
+fn adaptive_stops_when_shared_threshold_prunes_every_local_candidate() -> crate::Result<()> {
+    let clusters = 32;
+    let centroids = (0..clusters)
+        .map(|c| one_hot(64, 0, 10.0 * c as f32))
+        .collect();
+    let mut vectors = Vec::new();
+    for c in 0..clusters {
+        let x = 10.0 * c as f32;
+        vectors.extend((0..100).map(|i| one_hot(64, 0, x - 0.45 + 0.009 * i as f32)));
+        let mut outlier = one_hot(64, 0, x);
+        outlier[1] = 1000.0;
+        vectors.push(outlier);
+    }
+    let rows = vectors.len();
+    let fixture = FixtureSpec::ivf(Metric::L2, centroids, vectors)
+        .schedule(&[1, 4])
+        .build()?;
+    let query = one_hot(64, 0, 4.0);
+    for target in [0.95, 1.0] {
+        let slot = Arc::new(AtomicSharedThreshold::default());
+        seed_slot(&slot, -1.0);
+        let params = ProbeParams {
+            quantized_recall: Some(crate::vector::QuantizedRecallParams {
+                target: f64::from(target),
+                recall_exponent: 1.5,
+            }),
+            exact_plan: false,
+            located: LocatedPath::Off,
+            ..exhaustive_params(clusters)
+        };
+        let fruit = fixture.search_with(&AllQuery, &query, 10, 0, params, Some(slot))?;
+        let stats = &fruit.stats[0];
+        assert!(fruit.results.is_empty());
+        assert_eq!(stats.exact_rows, 0);
+        assert_eq!(
+            stats.layers.get(0).unwrap().admission_pruned(),
+            stats.candidates_scored
+        );
+        if target < 1.0 {
+            assert_eq!(
+                stats.termination,
+                crate::vector::ProbeTermination::QuantizedRecall
+            );
+            assert!(stats.clusters_probed() < clusters);
+            assert!(stats.candidates_scored < rows);
+        } else {
+            assert_eq!(
+                stats.termination,
+                crate::vector::ProbeTermination::Exhausted
+            );
+            assert_eq!(stats.clusters_probed(), clusters);
+            assert_eq!(stats.candidates_scored, rows);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn disabled_adaptive_preserves_routing_budget_and_access_path() -> crate::Result<()> {
+    for router in [RouterKind::Exact, RouterKind::Stacked] {
+        for schedule in [&[][..], &[1, 4][..]] {
+            let fixture = FixtureSpec::clustered(Metric::L2, 64, 64, 6400)
+                .router(router)
+                .schedule(schedule)
+                .paged()
+                .label("few", |i| i % 100 == 0)
+                .label("some", |i| i % 10 == 0)
+                .build()?;
+            let query = Lcg(42).vector(64, 0.5);
+            for filter in [
+                &AllQuery as &dyn Query,
+                &fixture.filter("few"),
+                &fixture.filter("some"),
+            ] {
+                for max_probe_fraction in [0.03, 0.2] {
+                    let params = ProbeParams {
+                        max_probe_fraction,
+                        min_probe_clusters: 1,
+                        ..Default::default()
+                    };
+                    fixture.clear_reads();
+                    let baseline = fixture.search(filter, &query, 10, params.clone())?;
+                    let baseline_reads = fixture.reads();
+                    let expected = &baseline.stats[0];
+                    fixture.clear_reads();
+                    let adaptive = fixture.search(
+                        filter,
+                        &query,
+                        10,
+                        ProbeParams {
+                            quantized_recall: Some(crate::vector::QuantizedRecallParams {
+                                target: 1.0,
+                                recall_exponent: 1.5,
+                            }),
+                            ..params.clone()
+                        },
+                    )?;
+                    let reads = fixture.reads();
+                    let actual = &adaptive.stats[0];
+                    assert_eq!(actual.work_budget, expected.work_budget);
+                    assert_eq!(actual.located_cap, expected.located_cap);
+                    assert_eq!(actual.access_path, expected.access_path);
+                    assert_eq!(actual.routing_visited_count, expected.routing_visited_count);
+                    assert_eq!(
+                        stage_reads(&reads, |stage| stage == VectorStage::Routing),
+                        stage_reads(&baseline_reads, |stage| stage == VectorStage::Routing),
+                    );
+                    assert!(actual.work_charged <= expected.work_charged);
+                    assert!(actual.candidates_scored <= expected.candidates_scored);
+                    assert_eq!(adaptive.results, baseline.results);
+                    assert_eq!(actual.termination, expected.termination);
+                    assert_eq!(reads, baseline_reads);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn adaptive_routing_uses_one_window_without_expansion() -> crate::Result<()> {
+    let fixture = FixtureSpec::clustered(Metric::L2, 64, 64, 640)
+        .router(RouterKind::Stacked)
+        .paged()
+        .build()?;
+    let query = Lcg(42).vector(64, 0.5);
+    let adaptive = fixture.search(
+        &AllQuery,
+        &query,
+        640,
+        ProbeParams {
+            max_probe_fraction: 1.0,
+            located: LocatedPath::Off,
+            quantized_recall: Some(crate::vector::QuantizedRecallParams {
+                target: 0.95,
+                recall_exponent: 1.25,
+            }),
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(
+        adaptive.stats[0].termination,
+        crate::vector::ProbeTermination::Exhausted
+    );
+    assert_eq!(adaptive.stats[0].routing_visited_count, 2);
+    assert_eq!(adaptive.stats[0].postings_row, 2);
+    assert!(adaptive.stats[0].candidates_scored < 640);
+    Ok(())
+}
+
+#[test]
+fn adaptive_bypass_is_independent_of_ceiling_headroom() -> crate::Result<()> {
+    let fixture = FixtureSpec::clustered(Metric::L2, 64, 64, 6400)
+        .label("few", |i| i % 200 == 0)
+        .label("some", |i| i % 10 == 0)
+        .build()?;
+    let query = Lcg(42).vector(64, 0.5);
+    for (filter, path) in [
+        (fixture.filter("few"), AccessPath::Located),
+        (fixture.filter("some"), AccessPath::Routed),
+    ] {
+        let mut cap = None;
+        for max_probe_fraction in [0.1, 0.25, 1.0] {
+            let result = fixture.search(
+                &filter,
+                &query,
+                10,
+                ProbeParams {
+                    max_probe_fraction,
+                    quantized_recall: Some(crate::vector::QuantizedRecallParams {
+                        target: 0.95,
+                        recall_exponent: 3.0,
+                    }),
+                    ..Default::default()
+                },
+            )?;
+            assert_eq!(result.stats[0].access_path, path);
+            assert_eq!(
+                *cap.get_or_insert(result.stats[0].located_cap),
+                result.stats[0].located_cap
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn quantized_recall_rejects_invalid_parameters() {
+    use crate::vector::QuantizedRecallParams;
+    let stop = QuantizedRecallParams {
+        target: 0.95,
+        recall_exponent: 1.5,
+    };
+    for target in [0.0, -1.0, 1.1, f64::NAN, f64::INFINITY] {
+        assert!(ProbeParams {
+            quantized_recall: Some(QuantizedRecallParams { target, ..stop }),
+            ..Default::default()
+        }
+        .resolved_work_budget(MATRIX_CLUSTERS, MATRIX_DOCS)
+        .is_err());
+    }
+    assert!(stop.admission_fraction().unwrap() > 0.0);
+    assert_eq!(
+        QuantizedRecallParams {
+            target: 1.0,
+            ..stop
+        }
+        .admission_fraction(),
+        None
+    );
+    for recall_exponent in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(ProbeParams {
+            quantized_recall: Some(QuantizedRecallParams {
+                recall_exponent,
+                ..stop
+            }),
+            ..Default::default()
+        }
+        .resolved_work_budget(MATRIX_CLUSTERS, MATRIX_DOCS)
+        .is_err());
+    }
+    for target in [0.9, 0.95, 0.99] {
+        let calibrated = QuantizedRecallParams { target, ..stop };
+        let raw = QuantizedRecallParams {
+            target: 1.0 - (1.0 - target).powf(stop.recall_exponent),
+            recall_exponent: 1.0,
+        };
+        assert!(
+            (calibrated.admission_fraction().unwrap() - raw.admission_fraction().unwrap()).abs()
+                < 1e-10
+        );
+        let window = |recall| {
+            ProbeParams {
+                quantized_recall: Some(recall),
+                ..Default::default()
+            }
+            .router_k(1000.0, 0.1, 0.1, 1000)
+        };
+        assert!(
+            window(calibrated)
+                > window(QuantizedRecallParams {
+                    target,
+                    recall_exponent: 1.0,
+                })
+        );
+    }
+    assert!(QuantizedRecallParams {
+        target: 1.0 - f64::EPSILON,
+        recall_exponent: 100.0
+    }
+    .admission_fraction()
+    .unwrap()
+    .is_finite());
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Representation {
     Flat,

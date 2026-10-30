@@ -209,7 +209,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
     {
         let init = enter_vector_stage(VectorStage::ScanInit);
         let plan = SegmentPlan::build(&self.probe_params, index, weight, segment, top_n)?;
-        let capacity = plan.capacity_hint();
+        let capacity = plan.capacity_hint(&self.probe_params);
         let SegmentPlan {
             budget,
             source,
@@ -224,7 +224,11 @@ impl<T: VectorElement> SegmentSearcher<T> {
                 },
             ));
         };
+        let quantized_recall = matches!(&source, Source::Router(_))
+            .then_some(self.probe_params.quantized_recall)
+            .flatten();
         let config = ScanConfig {
+            quantized_recall,
             top_n,
             capacity,
             exact_plan: self.probe_params.exact_plan,

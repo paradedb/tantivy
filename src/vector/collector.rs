@@ -769,7 +769,7 @@ where
             let Some(plan) = plan else {
                 return Ok((None, None, None));
             };
-            let capacity = plan.capacity_hint();
+            let capacity = plan.capacity_hint(backend.params());
             let SegmentPlan {
                 budget,
                 source,
@@ -785,6 +785,9 @@ where
                 return Ok((None, None, None));
             };
             let config = ScanConfig {
+                quantized_recall: matches!(&source, Source::Router(_))
+                    .then_some(backend.params().quantized_recall)
+                    .flatten(),
                 top_n,
                 capacity,
                 exact_plan: backend.params().exact_plan,
@@ -852,8 +855,15 @@ where
         on_segment(i);
         result?;
     }
+    let mut rate = first
+        .params()
+        .quantized_recall
+        .filter(|_| top_n > 0)
+        .and_then(|recall| recall.admission_fraction())
+        .map(|_| crate::vector::search::scan::RateApsState::default());
+    let mut recall_reached = false;
     for (i, candidate) in ranking.clusters {
-        if meter.exhausted() {
+        if meter.exhausted() || recall_reached {
             break;
         }
         let Some(GlobalSource::Router(source)) = &mut sources[i] else {
@@ -861,15 +871,18 @@ where
         };
         let scan = scans[i].as_mut().unwrap();
         scan.swap_topk(&mut topk);
+        scan.swap_rate(&mut rate);
         let (result, measured) = measure(|| {
             meter.open();
             if let Some(rows) = source.probe_global(candidate, scan.feedback())? {
                 let scored = scan.shortlist(&rows)?;
                 source.admitted(scored, scan.feedback())?;
                 meter.rows(scored);
+                recall_reached = scan.recall_reached();
             }
             Ok::<_, TantivyError>(())
         });
+        scan.swap_rate(&mut rate);
         scan.swap_topk(&mut topk);
         totals[i].append(&measured);
         on_segment(i);
@@ -894,7 +907,9 @@ where
             let source = match source.unwrap() {
                 GlobalSource::Router(source) => {
                     let mut report = source.finish();
-                    report.probe.termination = if meter.exhausted() {
+                    report.probe.termination = if recall_reached {
+                        ProbeTermination::QuantizedRecall
+                    } else if meter.exhausted() {
                         ProbeTermination::Ceiling
                     } else {
                         ProbeTermination::Exhausted
@@ -1066,6 +1081,82 @@ mod ivf_e2e_tests {
                         assert_eq!(fruit.stats.len(), readers.len());
                         assert_eq!(threshold.load().is_some(), !fruit.results.is_empty());
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn global_adaptive_stopping_shares_evidence_across_segments() -> Result<()> {
+        use crate::vector::{ProbeTermination, QuantizedRecallParams};
+
+        let vector = |x| {
+            let mut v = vec![0.0; 64];
+            v[0] = x;
+            v
+        };
+        let fixture = FixtureSpec::ivf(
+            Metric::L2,
+            (0..64).map(|c| vector(c as f32 * 10.0)).collect(),
+            (0..19392)
+                .map(|i| {
+                    let mut v = vector((i % 64) as f32 * 10.0);
+                    if i / 64 % 10 == 9 {
+                        v[1] = 1000.0;
+                    }
+                    v
+                })
+                .collect(),
+        )
+        .segments(3)
+        .label("half", |i| i % 3 != 0)
+        .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let readers: Vec<_> = searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
+            .collect();
+        for filter in [&AllQuery as &dyn Query, &fixture.filter("half")] {
+            let query = vector(0.0);
+            let weight = fixture.weight(filter)?;
+            for target in [0.9, 1.0] {
+                let collector = TopDocs::with_limit(10)
+                    .order_by_similarity(fixture.field, query.clone())
+                    .with_probe_params(ProbeParams {
+                        quantized_recall: Some(QuantizedRecallParams {
+                            target,
+                            recall_exponent: 1.25,
+                        }),
+                        located: LocatedPath::Off,
+                        ..exhaustive_params(64)
+                    })
+                    .build();
+                let result = collector.merge_fruits(collector.collect_segments(
+                    weight.as_ref(),
+                    &readers,
+                    |_| {},
+                )?)?;
+                assert_eq!(result.results, fixture.oracle(filter, &query, 10)?);
+                let probed: usize = result.stats.iter().map(|s| s.clusters_probed()).sum();
+                if target < 1.0 {
+                    assert!(result
+                        .stats
+                        .iter()
+                        .all(|s| s.termination == ProbeTermination::QuantizedRecall));
+                    assert!(
+                        probed < 32,
+                        "global admission history should stop across segment switches: {probed}"
+                    );
+                    assert!(result.stats.iter().all(|s| s.candidates_scored > 0));
+                } else {
+                    assert_eq!(probed, 192);
+                    assert!(result
+                        .stats
+                        .iter()
+                        .all(|s| s.termination != ProbeTermination::QuantizedRecall));
                 }
             }
         }
