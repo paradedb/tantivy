@@ -397,7 +397,7 @@ where
     Ok(())
 }
 
-/// Work done by one [`StackedIvf::search_prepared`], summed over this level and
+/// Work done by one stacked search, summed over this level and
 /// every parent above it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StackedSearchStats {
@@ -720,9 +720,15 @@ fn parse_level_topology(mut topology: &[u8]) -> io::Result<Vec<(usize, Vec<(u64,
 }
 
 /// Ranges must be a partition of `0..n` (possibly not in list-id order).
-fn ranges_cover_members(ranges: &[(u64, u64)], n: usize) -> bool {
+pub(crate) fn ranges_cover_members(ranges: &[(u64, u64)], n: usize) -> bool {
     if ranges.is_empty() {
         return n == 0;
+    }
+    if ranges
+        .iter()
+        .any(|&(start, end)| start > end || end > n as u64)
+    {
+        return false;
     }
     let mut packed: Vec<(u64, u64)> = ranges.to_vec();
     // Sort by (start, end) so empty ranges `(s, s)` precede a non-empty
@@ -862,12 +868,14 @@ where S: VectorArena<Elem = f32>
     /// `[ceil(PARENT_NPROBE_FRACTION * nlist), nlist]`. Used as the parent
     /// ask when a parent exists, and as the flat-top keep otherwise.
     pub fn lists_to_open(&self, k: usize) -> usize {
-        let members = self
-            .offsets
-            .iter()
-            .map(|&(start, end)| (end - start) as usize)
-            .sum();
-        lists_to_open(self.nlist(), members, k)
+        crate::vector::router::search::lists_to_open(
+            self.nlist(),
+            self.offsets
+                .iter()
+                .map(|&(start, end)| (end - start) as usize)
+                .sum(),
+            k,
+        )
     }
 
     /// Nearest members from the lists selected at this level, plus the
@@ -892,21 +900,94 @@ where S: VectorArena<Elem = f32>
         )
     }
 
+    #[cfg(any(test, feature = "unstable"))]
     pub(crate) fn search_prepared<T: VectorElement>(
         &self,
         query: &VectorQuery<T>,
         k: usize,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-        let ranking = StackedRouting::Segment(self).search(query, k, TopK);
-        let hits = ranking
-            .candidates
-            .into_iter()
-            .map(|candidate| Candidate {
-                sim: candidate.sim,
-                node: ClusterId(candidate.node.1),
-            })
-            .collect();
-        (hits, ranking.stats[0])
+        crate::vector::router::search::search(self, query, k, k, true)
+    }
+}
+
+impl<S, T> crate::vector::router::search::LevelSource<VectorQuery<T>> for StackedIvf<S>
+where
+    S: VectorArena<Elem = f32>,
+    T: VectorElement,
+{
+    type ClusterId = ClusterId;
+    type MemberId = ClusterId;
+
+    fn list_count(&self) -> usize {
+        self.nlist()
+    }
+
+    fn member_count(&self) -> usize {
+        self.offsets
+            .iter()
+            .map(|&(start, end)| (end - start) as usize)
+            .sum()
+    }
+
+    fn score_centroids(
+        &self,
+        query: &VectorQuery<T>,
+        out: &mut crate::vector::router::search::ScoreBuffer<ClusterId>,
+    ) {
+        self.centroids.batch_similarity(
+            query.widened(),
+            query.metric(),
+            query.routing_norm(),
+            0..self.nlist(),
+            &mut out.similarities,
+        );
+        out.candidates.clear();
+        out.candidates.extend(
+            out.similarities
+                .iter()
+                .enumerate()
+                .map(|(row, &sim)| Candidate {
+                    sim,
+                    node: ClusterId(row as u32),
+                }),
+        );
+    }
+
+    fn score_members(
+        &self,
+        list: ClusterId,
+        query: &VectorQuery<T>,
+        out: &mut crate::vector::router::search::ScoreBuffer<ClusterId>,
+    ) {
+        let (start, end) = self.offsets[usize::from(list)];
+        self.vectors.batch_similarity(
+            query.widened(),
+            query.metric(),
+            query.routing_norm(),
+            start as usize..end as usize,
+            &mut out.similarities,
+        );
+        out.candidates.clear();
+        out.candidates.extend(
+            out.similarities
+                .iter()
+                .enumerate()
+                .map(|(row, &sim)| Candidate {
+                    sim,
+                    node: ClusterId(start as u32 + row as u32),
+                }),
+        );
+    }
+}
+
+impl<S, T> crate::vector::router::search::Hierarchy<VectorQuery<T>> for StackedIvf<S>
+where
+    S: VectorArena<Elem = f32>,
+    T: VectorElement,
+{
+    type Parent = Self;
+    fn parent(&self) -> Option<&Self> {
+        self.parent.as_deref()
     }
 }
 
