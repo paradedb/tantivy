@@ -1,5 +1,7 @@
 //! Sign-plane encoding and popcount scoring kernels.
 
+use std::borrow::Cow;
+
 use crate::model::f16::{f16_to_f32, f32_to_f16};
 
 #[derive(Clone, Debug)]
@@ -22,6 +24,44 @@ impl QueryPlanes {
     pub fn error_squared(&self) -> f64 {
         self.error_squared
     }
+}
+
+/// Borrows little-endian sign words when their bytes are aligned on a little-endian
+/// host; otherwise decodes only the supplied byte range into owned words.
+///
+/// # Panics
+///
+/// Panics when the byte count is not a multiple of eight.
+#[inline]
+pub fn words_from_le_bytes(bytes: &[u8]) -> Cow<'_, [u64]> {
+    assert_eq!(bytes.len() % std::mem::size_of::<u64>(), 0);
+
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: `align_to` validates alignment; empty prefix and suffix gate borrowing.
+        let (prefix, words, suffix) = unsafe { bytes.align_to::<u64>() };
+        if prefix.is_empty()
+            && suffix.is_empty()
+            && words.len() == bytes.len() / std::mem::size_of::<u64>()
+        {
+            return Cow::Borrowed(words);
+        }
+    }
+
+    Cow::Owned(decode_le_words(bytes))
+}
+
+fn decode_le_words(bytes: &[u8]) -> Vec<u64> {
+    assert_eq!(bytes.len() % 8, 0);
+    bytes
+        .chunks(8)
+        .map(|chunk| {
+            let bytes: [u8; 8] = chunk
+                .try_into()
+                .expect("chunk size is fixed at eight bytes");
+            u64::from_le_bytes(bytes)
+        })
+        .collect()
 }
 
 fn packed_words(d: usize) -> usize {

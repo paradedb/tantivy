@@ -4,12 +4,15 @@
 use std::io::{self, Write};
 use std::ops::Range;
 
-use common::BinarySerializable;
+use common::{BinarySerializable, HasLen};
 use quant::rotation::Rotation;
-use quant::sign::{estimate_asym_batch_unscaled, pack, prepare_query, QueryPlanes};
+use quant::sign::{
+    estimate_asym_batch_unscaled, pack, prepare_query, words_from_le_bytes, QueryPlanes,
+};
 
 use super::candidate::Candidate;
 use super::search::ScoreBuffer;
+use crate::directory::FileSlice;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
 use crate::vector::quantization::SIGN_QUERY_BITS;
@@ -20,11 +23,24 @@ use crate::vector::VectorElement;
 /// asymmetric sign estimator. Raw vectors are kept separately for exact reads.
 pub(crate) struct SignVectors {
     dim: usize,
-    codes: Vec<u64>,
-    /// ||x||² / <Rx, sign(Rx)>. Unlike reconstruction's mean-absolute
-    /// scale, this corrects the systematic shrinkage of estimated dot products.
-    coefficients: Vec<f32>,
-    norms_squared: Vec<f32>,
+    rows: usize,
+    storage: SignStorage,
+}
+
+enum SignStorage {
+    Owned {
+        codes: Vec<u64>,
+        /// ||x||² / <Rx, sign(Rx)>. Unlike reconstruction's mean-absolute
+        /// scale, this corrects the systematic shrinkage of estimated dot products.
+        coefficients: Vec<f32>,
+        norms_squared: Vec<f32>,
+    },
+    /// Each column is addressed without reading its contents at open.
+    File {
+        codes: FileSlice,
+        coefficients: FileSlice,
+        norms_squared: FileSlice,
+    },
 }
 
 pub(crate) struct SignQuery {
@@ -90,14 +106,17 @@ impl SignVectors {
         }
         Ok(Self {
             dim,
-            codes,
-            coefficients,
-            norms_squared,
+            rows,
+            storage: SignStorage::Owned {
+                codes,
+                coefficients,
+                norms_squared,
+            },
         })
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.coefficients.len()
+        self.rows
     }
 
     pub(crate) fn score<I>(
@@ -105,37 +124,113 @@ impl SignVectors {
         rows: Range<usize>,
         query: &SignQuery,
         out: &mut ScoreBuffer<I>,
-        mut identify: impl FnMut(usize) -> I,
+        identify: impl FnMut(usize) -> I,
     ) {
-        let words = self.dim.div_ceil(64);
-        out.estimates.resize(rows.len(), 0.0);
-        estimate_asym_batch_unscaled(
-            &self.codes[rows.start * words..rows.end * words],
-            words,
-            &query.planes,
-            &mut out.estimates,
-        );
+        self.try_score(rows, query, out, identify)
+            .expect("failed to read quantized router rows");
+    }
+
+    fn try_score<I>(
+        &self,
+        rows: Range<usize>,
+        query: &SignQuery,
+        out: &mut ScoreBuffer<I>,
+        identify: impl FnMut(usize) -> I,
+    ) -> io::Result<()> {
+        assert!(rows.start <= rows.end && rows.end <= self.rows);
         out.candidates.clear();
-        out.candidates
-            .extend(rows.zip(&out.estimates).map(|(row, &estimate)| {
-                let dot = estimate * self.coefficients[row];
-                let score = match query.metric {
-                    Metric::L2 => -(query.norm_squared + self.norms_squared[row] - 2.0 * dot),
-                    Metric::Dot => dot,
-                    Metric::Cosine => {
-                        let denominator = query.norm * self.norms_squared[row].sqrt();
-                        if denominator == 0.0 {
-                            0.0
-                        } else {
-                            dot / denominator
-                        }
+        out.estimates.clear();
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let words = self.dim.div_ceil(64);
+        match &self.storage {
+            SignStorage::Owned {
+                codes,
+                coefficients,
+                norms_squared,
+            } => self.score_codes(
+                rows.clone(),
+                &codes[rows.start * words..rows.end * words],
+                query,
+                out,
+                identify,
+                |i| (coefficients[rows.start + i], norms_squared[rows.start + i]),
+            ),
+            SignStorage::File {
+                codes,
+                coefficients,
+                norms_squared,
+            } => {
+                let codes = codes
+                    .slice(rows.start * words * 8..rows.end * words * 8)
+                    .read_bytes()?;
+                let coefficients = coefficients
+                    .slice(rows.start * 4..rows.end * 4)
+                    .read_bytes()?;
+                let norms = norms_squared
+                    .slice(rows.start * 4..rows.end * 4)
+                    .read_bytes()?;
+                let words = words_from_le_bytes(&codes);
+                self.score_codes(rows, &words, query, out, identify, |i| {
+                    let at = i * 4;
+                    (
+                        f32::from_le_bytes(coefficients[at..at + 4].try_into().unwrap()),
+                        f32::from_le_bytes(norms[at..at + 4].try_into().unwrap()),
+                    )
+                })
+            }
+        }
+    }
+
+    fn score_codes<I>(
+        &self,
+        rows: Range<usize>,
+        codes: &[u64],
+        query: &SignQuery,
+        out: &mut ScoreBuffer<I>,
+        mut identify: impl FnMut(usize) -> I,
+        sidecars: impl Fn(usize) -> (f32, f32),
+    ) -> io::Result<()> {
+        let words = self.dim.div_ceil(64);
+        if self.dim % 64 != 0
+            && codes
+                .chunks_exact(words)
+                .any(|row| row[words - 1] >> (self.dim % 64) != 0)
+        {
+            return Err(invalid("nonzero sign-code tail padding"));
+        }
+        out.estimates.resize(rows.len(), 0.0);
+        estimate_asym_batch_unscaled(codes, words, &query.planes, &mut out.estimates);
+        for (i, (row, &estimate)) in rows.zip(&out.estimates).enumerate() {
+            let (coefficient, norm_squared) = sidecars(i);
+            if !coefficient.is_finite()
+                || coefficient < 0.0
+                || !norm_squared.is_finite()
+                || norm_squared < 0.0
+                || (coefficient == 0.0) != (norm_squared == 0.0)
+            {
+                return Err(invalid("invalid sign-vector sidecars"));
+            }
+            let dot = estimate * coefficient;
+            let score = match query.metric {
+                Metric::L2 => -(query.norm_squared + norm_squared - 2.0 * dot),
+                Metric::Dot => dot,
+                Metric::Cosine => {
+                    let denominator = query.norm * norm_squared.sqrt();
+                    if denominator == 0.0 {
+                        0.0
+                    } else {
+                        dot / denominator
                     }
-                };
-                Candidate {
-                    sim: Similarity::new(score),
-                    node: identify(row),
                 }
-            }));
+            };
+            out.candidates.push(Candidate {
+                sim: Similarity::new(score),
+                node: identify(row),
+            });
+        }
+        Ok(())
     }
 
     /// Columnar, fixed-stride representation. The containing format supplies
@@ -144,67 +239,65 @@ impl SignVectors {
         u32::try_from(self.len())
             .map_err(|_| invalid("too many sign rows"))?
             .serialize(out)?;
-        for word in &self.codes {
-            word.serialize(out)?;
-        }
-        for coefficient in &self.coefficients {
-            coefficient.serialize(out)?;
-        }
-        for norm in &self.norms_squared {
-            norm.serialize(out)?;
+        match &self.storage {
+            SignStorage::Owned {
+                codes,
+                coefficients,
+                norms_squared,
+            } => {
+                for word in codes {
+                    word.serialize(out)?;
+                }
+                for coefficient in coefficients {
+                    coefficient.serialize(out)?;
+                }
+                for norm in norms_squared {
+                    norm.serialize(out)?;
+                }
+            }
+            SignStorage::File {
+                codes,
+                coefficients,
+                norms_squared,
+            } => {
+                for column in [codes, coefficients, norms_squared] {
+                    out.write_all(&column.read_bytes()?)?;
+                }
+            }
         }
         Ok(())
     }
 
-    pub(crate) fn deserialize(input: &mut &[u8], dim: usize) -> io::Result<Self> {
-        if dim == 0 {
-            return Err(invalid("sign-vector dimension must be positive"));
+    /// Reads only the row count and validates framing. Code and sidecar validity
+    /// is checked when a scoring batch reads those rows, never at open.
+    pub(crate) fn open(input: &mut FileSlice, dim: usize) -> io::Result<Self> {
+        if dim == 0 || input.len() < 4 {
+            return Err(invalid("missing sign-vector header or dimension"));
         }
-        let rows = u32::deserialize(input)? as usize;
-        let words = dim.div_ceil(64);
-        let count = rows
-            .checked_mul(words)
+        let header = input.slice_to(4).read_bytes()?;
+        let rows = u32::deserialize(&mut header.as_slice())? as usize;
+        let code_bytes = rows
+            .checked_mul(dim.div_ceil(64))
+            .and_then(|n| n.checked_mul(8))
             .ok_or_else(|| invalid("sign code size overflow"))?;
-        let bytes = count
-            .checked_mul(8)
-            .and_then(|n| rows.checked_mul(8).and_then(|m| n.checked_add(m)))
+        let sidecar_bytes = rows
+            .checked_mul(4)
+            .ok_or_else(|| invalid("sign sidecar size overflow"))?;
+        let total = sidecar_bytes
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(code_bytes))
             .ok_or_else(|| invalid("sign-vector size overflow"))?;
-        if input.len() < bytes {
+        let data = input.slice_from(4);
+        if data.len() < total {
             return Err(invalid("truncated sign-vector columns"));
         }
-        let codes = (0..count)
-            .map(|_| u64::deserialize(input))
-            .collect::<io::Result<Vec<_>>>()?;
-        let coefficients = (0..rows)
-            .map(|_| f32::deserialize(input))
-            .collect::<io::Result<Vec<_>>>()?;
-        let norms_squared = (0..rows)
-            .map(|_| f32::deserialize(input))
-            .collect::<io::Result<Vec<_>>>()?;
-        if coefficients
-            .iter()
-            .chain(&norms_squared)
-            .any(|x| !x.is_finite() || *x < 0.0)
-            || coefficients
-                .iter()
-                .zip(&norms_squared)
-                .any(|(&scale, &norm)| (scale == 0.0) != (norm == 0.0))
-        {
-            return Err(invalid("invalid sign-vector sidecars"));
-        }
-        if dim % 64 != 0
-            && codes
-                .chunks_exact(words)
-                .any(|row| row[words - 1] >> (dim % 64) != 0)
-        {
-            return Err(invalid("nonzero sign-code tail padding"));
-        }
-        Ok(Self {
-            dim,
-            codes,
-            coefficients,
-            norms_squared,
-        })
+        let storage = SignStorage::File {
+            codes: data.slice_to(code_bytes),
+            coefficients: data.slice(code_bytes..code_bytes + sidecar_bytes),
+            norms_squared: data.slice(code_bytes + sidecar_bytes..total),
+        };
+        *input = data.slice_from(total);
+        Ok(Self { dim, rows, storage })
     }
 }
 
@@ -223,7 +316,7 @@ mod tests {
         let vectors = SignVectors::encode(&values, dim, &rotation)?;
         let mut bytes = Vec::new();
         vectors.serialize(&mut bytes)?;
-        let opened = SignVectors::deserialize(&mut bytes.as_slice(), dim)?;
+        let opened = SignVectors::open(&mut FileSlice::from(bytes.clone()), dim)?;
         for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
             let query = VectorQuery::new(metric, Arc::new(values[..dim].to_vec()));
             let query = SignQuery::new(&query, &rotation);
@@ -235,14 +328,28 @@ mod tests {
             assert!(after.candidates.iter().all(|c| c.sim.score().is_finite()));
         }
         for end in 0..bytes.len() {
-            assert!(SignVectors::deserialize(&mut &bytes[..end], dim).is_err());
+            assert!(SignVectors::open(&mut FileSlice::from(bytes[..end].to_vec()), dim).is_err());
         }
         let mut bad_tail = bytes.clone();
         bad_tail[4 + 8 + 7] |= 0x80;
-        assert!(SignVectors::deserialize(&mut bad_tail.as_slice(), dim).is_err());
+        let corrupt = SignVectors::open(&mut FileSlice::from(bad_tail), dim)?;
+        let query = SignQuery::new(
+            &VectorQuery::new(Metric::Dot, Arc::new(values[..dim].to_vec())),
+            &rotation,
+        );
+        let mut scores = ScoreBuffer::default();
+        // Invalid bytes outside the selected range are not read or validated.
+        corrupt.try_score(1..3, &query, &mut scores, ClusterId::from)?;
+        assert!(corrupt
+            .try_score(0..1, &query, &mut scores, ClusterId::from)
+            .is_err());
         let scales_start = 4 + 3 * dim.div_ceil(64) * 8;
         bytes[scales_start..scales_start + 4].copy_from_slice(&f32::NAN.to_le_bytes());
-        assert!(SignVectors::deserialize(&mut bytes.as_slice(), dim).is_err());
+        let corrupt = SignVectors::open(&mut FileSlice::from(bytes), dim)?;
+        corrupt.try_score(1..3, &query, &mut scores, ClusterId::from)?;
+        assert!(corrupt
+            .try_score(0..1, &query, &mut scores, ClusterId::from)
+            .is_err());
         Ok(())
     }
 

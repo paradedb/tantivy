@@ -42,8 +42,12 @@ norms_squared:f32[row_count]
 ```
 
 The containing payload supplies dimension and rotation for every set. There is
-no inter-column padding; readers decode little-endian words into aligned compact
-arrays. Unused high bits of each row's last code word must be zero. Coefficients
+no inter-column padding. Open reads only the fixed header, list topology, and
+vector-set row counts; code and sidecar columns remain behind file slices.
+Scoring reads only the requested contiguous row ranges. Aligned little-endian
+code bytes can be borrowed as words; unaligned or big-endian input is decoded
+for that batch only. Payload validation is deferred to the rows being scored.
+Unused high bits of each row's last code word must be zero. Coefficients
 and squared norms are finite and nonnegative, and are zero together for a zero
 row (including norms that underflow binary32).
 
