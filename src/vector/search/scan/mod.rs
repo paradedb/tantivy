@@ -11,7 +11,7 @@ pub(crate) mod plan;
 
 use std::ops::Range;
 
-use self::bound::PruningBound;
+use self::bound::{PruningBound, TopK};
 use self::columns::{Columns, QuantizedCandidates};
 use self::estimate::{combine_initial, combine_refine, CombineCtx};
 use self::exact::ExactScorer;
@@ -361,12 +361,12 @@ impl<'a> QuantizedState<'a> {
     fn prune(&mut self, layer: usize, bound: &mut PruningBound, report: &mut ScanReport) {
         // Layer 0's kernel scores every admitted row; admission pruning drops rows before they
         // become candidates, so the scored count keeps its own counter.
-        report.layers[layer].scored = if layer == 0 {
+        if layer == 0 {
             report.layers[0].admission_pruned = self.layer0_admission_pruned;
-            self.layer0_scored
+            report.layers[0].scored = self.layer0_scored;
         } else {
-            self.candidates.len()
-        };
+            report.layers[layer].scored = self.candidates.len();
+        }
         #[cfg(test)]
         {
             // Layer 0's candidates are listed in admission order, later layers' in row order.
@@ -472,15 +472,23 @@ where
         })
     }
 
+    pub(crate) fn swap_topk(&mut self, top: &mut TopK) {
+        self.bound.swap_topk(top);
+    }
+
     /// Scores one segment: shortlists each cluster `source` supplies, narrows the shortlist one
     /// quantized layer at a time, then scores what is left exactly.
     pub(crate) fn run(&mut self, source: &mut impl ClusterSource) -> crate::Result<()> {
         let stage = enter_vector_stage(self.shortlist_stage());
-        while let Some(rows) = source.next(self.feedback())? {
+        while let Some(rows) = source.next()? {
             let scored = self.shortlist(&rows)?;
             source.admitted(scored, self.feedback())?;
         }
         drop(stage);
+        self.refine_shortlist()
+    }
+
+    pub(crate) fn refine_shortlist(&mut self) -> crate::Result<()> {
         self.close_shortlist();
         for layer in self.refining_layers() {
             self.narrow(layer)?;
@@ -497,7 +505,7 @@ where
     }
 
     /// The shared prune floor when set. The router reads `kth_lower`.
-    fn feedback(&self) -> Feedback {
+    pub(crate) fn feedback(&self) -> Feedback {
         Feedback {
             kth_lower: self.bound.shared_threshold(),
             kth_estimate: None,
@@ -524,7 +532,8 @@ where
     /// Adds a cluster's rows to the shortlist: scored immediately at full precision or when an
     /// exact read is strictly cheaper than the layer-0 read, otherwise as quantized candidates.
     /// Returns the rows scored.
-    fn shortlist(&mut self, rows: &ClusterRows<'_>) -> crate::Result<usize> {
+    pub(crate) fn shortlist(&mut self, rows: &ClusterRows<'_>) -> crate::Result<usize> {
+        let _stage = enter_vector_stage(self.shortlist_stage());
         let len = rows.len();
         debug_assert!(len > 0, "empty clusters never reach the scan");
         #[cfg(test)]

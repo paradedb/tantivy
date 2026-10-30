@@ -202,9 +202,9 @@ pub(crate) struct RouterClusters<'a, T: VectorElement> {
 }
 
 impl<'a, T: VectorElement> RouterClusters<'a, T> {
-    /// Ranks as many of `segment`'s clusters as `budget` buys at the filter's match fraction, and
-    /// prepares the probe controller. `reader` is the segment's IVF reader.
-    pub(crate) fn new(
+    /// Prepares this segment to choose and probe its own clusters.
+    /// Its router determines the cluster order, and its budget controls when probing stops.
+    pub(crate) fn for_segment(
         reader: &'a VectorIndexReader,
         query: &'a VectorQuery<T>,
         budget: WorkBudget,
@@ -243,8 +243,82 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
         }
     }
 
-    /// The bounds gate's verdict for `cluster`, whose routing key is `sim`.
-    fn verdict(&self, cluster: usize, sim: f32) -> Verdict {
+    /// Prepares this segment for a global search across multiple segments.
+    /// The global search supplies clusters in ranked order and enforces the shared budget.
+    pub(crate) fn for_global(
+        reader: &'a VectorIndexReader,
+        query: &'a VectorQuery<T>,
+        budget: WorkBudget,
+        filter: DocFilter,
+        segment: &'a SegmentReader,
+        metrics: RouterMetrics,
+    ) -> Self {
+        let index = reader.index().expect("IVF segment");
+        Self {
+            index,
+            reader,
+            query,
+            ranked: RouterIter::Global(metrics),
+            meter: WorkMeter::new(budget),
+            controller: ProbeController::new(index.num_clusters()),
+            bounds: index.bounds(),
+            tracker: QueryBoundTracker::new(),
+            gate: RowGate::new(filter, segment.alive_bitset()),
+            docs: Vec::new(),
+            offsets: Vec::new(),
+            selected_docs: Vec::new(),
+            counters: RouterCounters::default(),
+        }
+    }
+
+    /// Prepares a cluster chosen by the global router using the latest shared query bound.
+    pub(crate) fn probe_global(
+        &mut self,
+        candidate: Candidate,
+        feedback: Feedback,
+    ) -> crate::Result<Option<ClusterRows<'_>>> {
+        // The threshold may have advanced in a different segment since our last probe.
+        self.tracker.observe(
+            self.query.metric(),
+            HeapPeek::from_kth(feedback.kth_lower),
+            (self.counters.postings_row + self.counters.postings_skipped) as u32,
+        );
+        let Candidate { sim, node } = candidate;
+        let cluster = node as usize;
+        self.meter.open();
+        if !self.needs_scoring(cluster, sim.score()) {
+            self.counters.bounds_skips += 1;
+            return Ok(None);
+        }
+        let rows = self.index.cluster_range(cluster);
+        if rows.is_empty() {
+            self.skip_empty();
+            return Ok(None);
+        }
+        let gated = self.gate_cluster(cluster, rows.len())?;
+        if !gated.all && self.offsets.is_empty() {
+            self.skip_empty();
+            return Ok(None);
+        }
+        self.selected_docs.clear();
+        if !gated.all {
+            self.selected_docs.extend(
+                self.offsets
+                    .iter()
+                    .map(|&offset| self.docs[offset as usize]),
+            );
+        }
+        Ok(Some(ClusterRows {
+            cluster,
+            rows,
+            offsets: (!gated.all).then_some(&self.offsets[..]),
+            docs: (!gated.all).then_some(&self.selected_docs[..]),
+            centroid: Some(sim),
+        }))
+    }
+
+    /// Whether the cluster's bound allows it to improve the current top-k results.
+    fn needs_scoring(&self, cluster: usize, sim: f32) -> bool {
         let query_bound = self.tracker.bound();
         bounds_verdict(query_bound, || {
             let QueryBound::Armed { t } = query_bound else {
@@ -277,7 +351,7 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
                 }
                 Metric::Dot => margin_ball_halfspace(sim, self.query.norm(), r, t),
             }
-        })
+        }) != Verdict::Skip
     }
 
     /// Selects `cluster`'s rows into `offsets` and counts what the gate pruned.
@@ -298,10 +372,9 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
     }
 
     /// Counts an opened cluster that contributes no rows.
-    fn skip_empty(&mut self, _feedback: Feedback) -> crate::Result<()> {
+    fn skip_empty(&mut self) {
         self.counters.postings_skipped += 1;
         self.counters.clusters_skipped_empty += 1;
-        Ok(())
     }
 
     /// Ends the walk and reports what it counted.
@@ -320,7 +393,7 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
 }
 
 impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
-    fn next(&mut self, feedback: Feedback) -> crate::Result<Option<ClusterRows<'_>>> {
+    fn next(&mut self) -> crate::Result<Option<ClusterRows<'_>>> {
         loop {
             let next = {
                 let _routing = enter_vector_stage(VectorStage::Routing);
@@ -336,7 +409,7 @@ impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
 
             // A skip charges the open share. The bound is the pessimistic k-th, so a skip
             // never drops a true top-k row.
-            if self.verdict(cluster, sim.score()) == Verdict::Skip {
+            if !self.needs_scoring(cluster, sim.score()) {
                 self.meter.open();
                 self.counters.bounds_skips += 1;
                 continue;
@@ -344,13 +417,13 @@ impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
             self.meter.open();
             let rows = self.index.cluster_range(cluster);
             if rows.is_empty() {
-                self.skip_empty(feedback)?;
+                self.skip_empty();
                 continue;
             }
 
             let gated = self.gate_cluster(cluster, rows.len())?;
             if !gated.all && self.offsets.is_empty() {
-                self.skip_empty(feedback)?;
+                self.skip_empty();
                 continue;
             }
             let (offsets, docs) = if gated.all {

@@ -112,7 +112,7 @@ impl<'a> MatchClusters<'a> {
 }
 
 impl ClusterSource for MatchClusters<'_> {
-    fn next(&mut self, _feedback: Feedback) -> crate::Result<Option<ClusterRows<'_>>> {
+    fn next(&mut self) -> crate::Result<Option<ClusterRows<'_>>> {
         let Some((cluster, positions)) = self.clusters.get(self.next).cloned() else {
             return Ok(None);
         };

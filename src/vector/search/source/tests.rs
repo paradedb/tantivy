@@ -36,7 +36,7 @@ fn walk(seg: &SegmentRun<'_>, feedback: impl Fn(usize) -> Feedback) -> crate::Re
     let Some(Source::Router(filter)) = plan.source else {
         panic!("the router source walks router plans");
     };
-    let mut source = RouterClusters::new(
+    let mut source = RouterClusters::for_segment(
         seg.searcher.reader(),
         seg.searcher.query(),
         plan.budget,
@@ -46,10 +46,7 @@ fn walk(seg: &SegmentRun<'_>, feedback: impl Fn(usize) -> Feedback) -> crate::Re
     );
     let mut clusters = Vec::new();
     let mut rows = 0;
-    while let Some((cluster, len)) = source
-        .next(feedback(rows))?
-        .map(|rows| (rows.cluster, rows.len()))
-    {
+    while let Some((cluster, len)) = source.next()?.map(|rows| (rows.cluster, rows.len())) {
         clusters.push(cluster);
         rows += len;
         source.admitted(len, feedback(rows))?;
@@ -546,7 +543,7 @@ fn gate_bookkeeping() -> crate::Result<()> {
                 let Some(Source::Router(filter)) = plan.source else {
                     panic!("the router source walks router plans");
                 };
-                let mut source = RouterClusters::new(
+                let mut source = RouterClusters::for_segment(
                     run.searcher.reader(),
                     run.searcher.query(),
                     plan.budget,
@@ -554,7 +551,7 @@ fn gate_bookkeeping() -> crate::Result<()> {
                     run.segment,
                     run.searcher.params(),
                 );
-                while let Some(rows) = source.next(Feedback::default())? {
+                while let Some(rows) = source.next()? {
                     match rows.docs {
                         None => assert!(open),
                         Some(given) => {

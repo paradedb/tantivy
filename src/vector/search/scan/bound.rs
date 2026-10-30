@@ -13,6 +13,7 @@
 //! drops a row only when its upper endpoint is strictly below the floor.
 
 use std::collections::HashMap;
+use std::mem::swap;
 use std::sync::Arc;
 
 use crate::collector::SharedThreshold;
@@ -278,6 +279,12 @@ impl PruningBound {
     /// `k` hits). CASes the slot when the seed already holds `k` values.
     pub(crate) fn seed(&mut self, collector: &TopK) {
         self.offer(collector.candidates());
+    }
+
+    /// Moves the global top-k into or out of the active segment scan.
+    pub(super) fn swap_topk(&mut self, top: &mut TopK) {
+        swap(&mut self.top, top);
+        self.publish();
     }
 
     /// Finite score currently in the shared slot, if any.

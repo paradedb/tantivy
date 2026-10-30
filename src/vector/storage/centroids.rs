@@ -329,6 +329,10 @@ impl ClusterIndex {
         Ok(self.centroids_slice.read_bytes()?)
     }
 
+    pub(crate) fn opened_router(&self) -> &OpenedRouter {
+        &self.router
+    }
+
     /// Rank this segment's clusters for `query`, nearest first. `params`
     /// steers the stacked router only (how many clusters the caller will
     /// probe); other routers ignore it.

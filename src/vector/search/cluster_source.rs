@@ -56,7 +56,7 @@ pub(crate) struct Feedback {
 /// Supplies a segment scan's clusters in its own order and decides when to stop.
 pub(crate) trait ClusterSource {
     /// The next cluster's rows, or `None` when the source stops.
-    fn next(&mut self, feedback: Feedback) -> crate::Result<Option<ClusterRows<'_>>>;
+    fn next(&mut self) -> crate::Result<Option<ClusterRows<'_>>>;
     /// Records that the last cluster was shortlisted with `rows` scored; `feedback` includes them.
     fn admitted(&mut self, rows: usize, feedback: Feedback) -> crate::Result<()>;
 }
