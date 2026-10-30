@@ -133,8 +133,10 @@ impl ProbeParams {
             .and_then(QuantizedRecallParams::admission_fraction)
         {
             let base = (0.002 / fraction.powf(0.625)).min(1.0);
-            let headroom = (0.06 * (cluster_cost.sqrt().recip() - 1.0)).min(0.5);
-            let adjusted = base + headroom * base.powf(0.125) * (1.0 - base).powi(3);
+            let headroom = (0.05 * (cluster_cost.sqrt().recip() - 1.0)).min(0.4);
+            let remaining = 1.0 - base;
+            let taper = (remaining / 0.9).min(1.0);
+            let adjusted = base + headroom * base.powf(0.125) * remaining * taper * taper;
             let window = (adjusted * clusters_in_segment as f64).ceil();
             (clusters as usize).min(window as usize)
         } else {
@@ -219,7 +221,7 @@ mod tests {
         assert_eq!(params(0.9).router_k(1000.0, 0.1, 1.0, 1000), 13);
         assert_eq!(params(0.95).router_k(1000.0, 0.1, 1.0, 1000), 21);
         assert_eq!(params(0.99).router_k(1000.0, 0.1, 1.0, 1000), 74);
-        assert_eq!(params(0.95).router_k(2000.0, 0.1, 0.01, 2000), 183);
+        assert_eq!(params(0.95).router_k(2000.0, 0.1, 0.01, 2000), 164);
         for open_share in [f64::MIN_POSITIVE, 1e-9, 0.004, 0.1, 1.0] {
             for match_fraction in [0.0, 0.001, 0.01, 0.1, 1.0] {
                 let mut previous = 0;
