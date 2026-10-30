@@ -317,8 +317,8 @@ fn adaptive_routing_uses_one_window_without_expansion() -> crate::Result<()> {
         adaptive.stats[0].termination,
         crate::vector::ProbeTermination::Exhausted
     );
-    assert_eq!(adaptive.stats[0].routing_visited_count, 6);
-    assert_eq!(adaptive.stats[0].postings_row, 6);
+    assert_eq!(adaptive.stats[0].routing_visited_count, 2);
+    assert_eq!(adaptive.stats[0].postings_row, 2);
     assert!(adaptive.stats[0].candidates_scored < 640);
     Ok(())
 }
@@ -374,14 +374,13 @@ fn quantized_recall_rejects_invalid_parameters() {
         .resolved_work_budget(MATRIX_CLUSTERS, MATRIX_DOCS)
         .is_err());
     }
-    assert_eq!(stop.admission_fraction(0), None);
-    assert!(stop.admission_fraction(10).unwrap() > 0.0);
+    assert!(stop.admission_fraction().unwrap() > 0.0);
     assert_eq!(
         QuantizedRecallParams {
             target: 1.0,
             ..stop
         }
-        .admission_fraction(10),
+        .admission_fraction(),
         None
     );
     for recall_exponent in [0.0, -1.0, f64::NAN, f64::INFINITY] {
@@ -402,16 +401,39 @@ fn quantized_recall_rejects_invalid_parameters() {
             recall_exponent: 1.0,
         };
         assert!(
-            (calibrated.admission_fraction(10).unwrap() - raw.admission_fraction(10).unwrap())
-                .abs()
+            (calibrated.admission_fraction().unwrap() - raw.admission_fraction().unwrap()).abs()
                 < 1e-10
+        );
+        let window = |recall| {
+            ProbeParams {
+                quantized_recall: Some(recall),
+                ..Default::default()
+            }
+            .router_k(1000.0, 0.1, 0.1, 1000)
+        };
+        assert_eq!(window(calibrated), window(raw));
+        let initial = |recall| {
+            ProbeParams {
+                quantized_recall: Some(recall),
+                ..Default::default()
+            }
+            .initial_work(1000)
+            .unwrap()
+        };
+        assert!((initial(calibrated) - initial(raw)).abs() < 1e-10);
+        assert!(
+            window(calibrated)
+                > window(QuantizedRecallParams {
+                    target,
+                    recall_exponent: 1.0,
+                })
         );
     }
     assert!(QuantizedRecallParams {
         target: 1.0 - f64::EPSILON,
         recall_exponent: 100.0
     }
-    .admission_fraction(10)
+    .admission_fraction()
     .unwrap()
     .is_finite());
 }

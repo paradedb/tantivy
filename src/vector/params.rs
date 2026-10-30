@@ -43,8 +43,8 @@ pub struct QuantizedRecallParams {
 }
 
 impl QuantizedRecallParams {
-    pub(crate) fn admission_fraction(self, k: usize) -> Option<f64> {
-        (k > 0 && self.target < 1.0).then(|| (self.recall_exponent * (-self.target).ln_1p()).exp())
+    pub(crate) fn admission_fraction(self) -> Option<f64> {
+        (self.target < 1.0).then(|| (self.recall_exponent * (-self.target).ln_1p()).exp())
     }
 }
 
@@ -99,7 +99,7 @@ impl ProbeParams {
     /// Expected initial work for bypass selection and allocation, separate from routing headroom.
     pub(crate) fn initial_work(&self, clusters: usize) -> Option<f64> {
         let recall = self.quantized_recall.filter(|recall| recall.target < 1.0)?;
-        let fraction = 0.005 * (-recall.target).ln_1p() / 0.05_f64.ln();
+        let fraction = 0.005 * recall.recall_exponent * (-recall.target).ln_1p() / 0.05_f64.ln();
         Some((fraction * clusters as f64).clamp(1.0, clusters.max(1) as f64))
     }
 
@@ -110,9 +110,9 @@ impl ProbeParams {
     /// match_fraction` units, since only filter matches charge row work, so
     /// the budget buys `budget / that` clusters: `budget` unfiltered, up to
     /// `budget / open_share` as the filter approaches empty. The count is
-    /// capped at the segment's cluster count. Adaptive scans further cap the window
-    /// at `0.02 / sqrt((1 - target) * cluster_cost)` of the segment's clusters, without a minimum
-    /// beyond one cluster. Nonadaptive scans apply the `min_probe_clusters` floor.
+    /// capped at the segment's cluster count. Adaptive scans scale a base window by the
+    /// admission fraction, with a filter adjustment whose relative effect shrinks as the window grows.
+    /// Nonadaptive scans apply the `min_probe_clusters` floor.
     ///
     /// * `open_share` (`f64`) — the per-index open share `x`.
     /// * `match_fraction` (`f64`) — the share of the segment's docs the filter matches, in `(0,
@@ -128,15 +128,18 @@ impl ProbeParams {
         let cluster_cost =
             (open_share + (1.0 - open_share) * match_fraction).max(f64::MIN_POSITIVE);
         let clusters = (budget.max(0.0) / cluster_cost).ceil();
-        let clusters =
-            if let Some(recall) = self.quantized_recall.filter(|recall| recall.target < 1.0) {
-                let window = (0.02 / ((1.0 - recall.target) * cluster_cost).sqrt()
-                    * clusters_in_segment as f64)
-                    .ceil();
-                (clusters as usize).min(window as usize)
-            } else {
-                (clusters as usize).max(self.min_probe_clusters)
-            };
+        let clusters = if let Some(fraction) = self
+            .quantized_recall
+            .and_then(QuantizedRecallParams::admission_fraction)
+        {
+            let base = (0.002 / fraction.powf(0.625)).min(1.0);
+            let headroom = 0.05 * (cluster_cost.sqrt().recip() - 1.0);
+            let adjusted = (base + headroom * base.powf(0.125) * (1.0 - base)).min(1.0);
+            let window = (adjusted * clusters_in_segment as f64).ceil();
+            (clusters as usize).min(window as usize)
+        } else {
+            (clusters as usize).max(self.min_probe_clusters)
+        };
         clusters.min(clusters_in_segment).max(1)
     }
 }
@@ -202,21 +205,31 @@ mod tests {
         let params = |target| ProbeParams {
             quantized_recall: Some(super::QuantizedRecallParams {
                 target,
-                recall_exponent: 3.0,
+                recall_exponent: 1.25,
             }),
             max_probe_fraction: 0.001,
             ..Default::default()
         };
         assert!(params(0.9).initial_work(1000) < params(0.95).initial_work(1000));
         assert!(params(0.95).initial_work(1000) < params(0.99).initial_work(1000));
-        assert!((params(0.95).initial_work(1000).unwrap() - 5.0).abs() < 1e-10);
-        assert!((params(0.95).initial_work(4000).unwrap() - 20.0).abs() < 1e-10);
+        assert!((params(0.95).initial_work(1000).unwrap() - 6.25).abs() < 1e-10);
+        assert!((params(0.95).initial_work(4000).unwrap() - 25.0).abs() < 1e-10);
         assert!((params(0.95).resolved_work_budget(1000, 100_000).unwrap().0 - 1.0).abs() < 1e-6);
         assert_eq!(params(0.95).router_k(2.0, 0.1, 1.0, 1000), 2);
-        assert_eq!(params(0.9).router_k(1000.0, 0.1, 1.0, 1000), 64);
-        assert_eq!(params(0.95).router_k(1000.0, 0.1, 1.0, 1000), 90);
-        assert_eq!(params(0.99).router_k(1000.0, 0.1, 1.0, 1000), 200);
-        assert_eq!(params(0.95).router_k(2000.0, 0.1, 0.01, 2000), 542);
+        assert_eq!(params(0.9).router_k(1000.0, 0.1, 1.0, 1000), 13);
+        assert_eq!(params(0.95).router_k(1000.0, 0.1, 1.0, 1000), 21);
+        assert_eq!(params(0.99).router_k(1000.0, 0.1, 1.0, 1000), 74);
+        assert_eq!(params(0.95).router_k(2000.0, 0.1, 0.01, 2000), 164);
+        for open_share in [f64::MIN_POSITIVE, 1e-9, 0.004, 0.1, 1.0] {
+            for match_fraction in [0.0, 0.001, 0.01, 0.1, 1.0] {
+                let mut previous = 0;
+                for target in [0.01, 0.5, 0.9, 0.95, 0.99, 0.999, 1.0] {
+                    let window = params(target).router_k(4000.0, open_share, match_fraction, 4000);
+                    assert!(window >= previous && window <= 4000);
+                    previous = window;
+                }
+            }
+        }
         assert_eq!(params(1.0).initial_work(1000), None);
         assert_eq!(
             params(1.0).resolved_work_budget(1000, 100_000).unwrap().0,

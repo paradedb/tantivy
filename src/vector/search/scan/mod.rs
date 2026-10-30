@@ -490,7 +490,8 @@ where
         let layers = quantized.as_ref().map_or(0, |state| state.layers.len());
         let recall_fraction = config
             .quantized_recall
-            .and_then(|p| p.admission_fraction(config.top_n));
+            .filter(|_| config.top_n > 0)
+            .and_then(|p| p.admission_fraction());
         Ok(Self {
             exact: ExactScorer::new(
                 reader,
