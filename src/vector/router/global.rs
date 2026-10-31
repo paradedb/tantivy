@@ -1,5 +1,5 @@
 use super::candidate::Candidate;
-use super::stacked::search::{AllScored, StackedRouting};
+use super::stacked::search::{AllScored, StackedRouting, TopK};
 use super::{OpenedRouter, Router, RouterMetrics};
 #[cfg(test)]
 use crate::schema::Metric;
@@ -30,6 +30,7 @@ impl GlobalRanking {
             partitions,
             &VectorQuery::new(metric, std::sync::Arc::new(query.to_vec())),
             k,
+            false,
             totals,
             on_segment,
         )
@@ -40,6 +41,7 @@ impl GlobalRanking {
         partitions: &[Option<&[f32]>],
         query: &VectorQuery<T>,
         k: usize,
+        bounded: bool,
         totals: &mut [StageTotals],
         on_segment: &mut impl FnMut(usize),
     ) -> Self {
@@ -73,13 +75,17 @@ impl GlobalRanking {
             };
             indexes.push(index);
         }
-        let ranking = StackedRouting::Global {
+        let routing = StackedRouting::Global {
             indexes,
             partitions,
             totals,
             on_segment,
-        }
-        .search_prepared(query, k.max(1), AllScored::default());
+        };
+        let ranking = if bounded {
+            routing.search_prepared(query, k.max(1), TopK)
+        } else {
+            routing.search_prepared(query, k.max(1), AllScored::default())
+        };
         for (stats, metrics) in ranking.stats.iter().zip(&mut metrics) {
             if let RouterMetrics::Stacked {
                 lists_scanned,
@@ -106,6 +112,9 @@ impl GlobalRanking {
                 .then(a.0.cmp(&b.0))
                 .then(a.1.node.cmp(&b.1.node))
         });
+        if bounded {
+            leaves.truncate(k.max(1));
+        }
         for (segment, _) in &leaves {
             if let RouterMetrics::Stacked {
                 candidate_count, ..
@@ -130,7 +139,6 @@ mod tests {
     use crate::vector::router::stacked::levels::{
         ClusterId, InMemoryStore, StackedIvf, StackedIvfConfig,
     };
-    use crate::vector::router::stacked::search::TopK;
     use crate::vector::router::RouterKind;
 
     fn open_line_router(base: f32, count: u64, nested: bool) -> crate::Result<OpenedRouter> {
@@ -335,6 +343,52 @@ mod tests {
                 vec![(2, 0), (3, 0), (2, 1)],
                 "depths {far_nested}/{near_nested}"
             );
+            let query = VectorQuery::new(Metric::L2, std::sync::Arc::new(vec![0.0]));
+            for k in [1, 2, 4, 16] {
+                let all = GlobalRanking::from_prepared(
+                    &routers,
+                    &[],
+                    &query,
+                    k,
+                    false,
+                    &mut totals,
+                    &mut |_| {},
+                );
+                let bounded = GlobalRanking::from_prepared(
+                    &routers,
+                    &[],
+                    &query,
+                    k,
+                    true,
+                    &mut totals,
+                    &mut |_| {},
+                );
+                assert_eq!(bounded.clusters, all.clusters[..k.min(all.clusters.len())]);
+                for (limited, all) in bounded.metrics.iter().zip(&all.metrics) {
+                    match (limited, all) {
+                        (
+                            RouterMetrics::Stacked {
+                                lists_scanned: limited_lists,
+                                members_scored: limited_members,
+                                ..
+                            },
+                            RouterMetrics::Stacked {
+                                lists_scanned,
+                                members_scored,
+                                ..
+                            },
+                        ) => {
+                            assert_eq!(limited_lists, lists_scanned);
+                            assert_eq!(limited_members, members_scored);
+                        }
+                        (
+                            RouterMetrics::Exact { visited_count: a },
+                            RouterMetrics::Exact { visited_count: b },
+                        ) => assert_eq!(a, b),
+                        _ => unreachable!(),
+                    }
+                }
+            }
         }
         Ok(())
     }

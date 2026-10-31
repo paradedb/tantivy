@@ -751,8 +751,20 @@ where
     let k = first
         .params()
         .router_k(total, x, matched / routed_docs.max(1) as f64, clusters);
-    let ranking =
-        GlobalRanking::from_prepared(&routers, partitions, first.query(), k, totals, on_segment);
+    let bounded = first
+        .params()
+        .quantized_recall
+        .and_then(|recall| recall.admission_fraction())
+        .is_some();
+    let ranking = GlobalRanking::from_prepared(
+        &routers,
+        partitions,
+        first.query(),
+        k,
+        bounded,
+        totals,
+        on_segment,
+    );
     let mut reserved = WorkUnits::ZERO;
     let mut scans = Vec::with_capacity(backends.len());
     let mut sources = Vec::with_capacity(backends.len());
@@ -1128,7 +1140,7 @@ mod ivf_e2e_tests {
                     .with_probe_params(ProbeParams {
                         quantized_recall: Some(QuantizedRecallParams {
                             target,
-                            recall_exponent: 1.25,
+                            recall_exponent: 4.0,
                         }),
                         located: LocatedPath::Off,
                         ..exhaustive_params(64)
