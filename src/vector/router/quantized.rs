@@ -287,7 +287,37 @@ impl<S: VectorArena<Elem = f32>> QuantizedRouter<S> {
             )
         } else {
             let prepared = SignQuery::new(query, &self.rotation);
-            let (selected, stats) = search::search(&self.level, &prepared, k, capacity, params.aps);
+            let (selected, stats) = if params.flat {
+                let mut scores = ScoreBuffer::default();
+                self.level.members.score(
+                    0..self.level.members.len(),
+                    &prepared,
+                    &mut scores,
+                    ClusterId::from,
+                );
+                let scored = scores.candidates.len();
+                let mut selected = TopCandidates::new(capacity);
+                for candidate in scores.candidates {
+                    selected.offer(candidate);
+                }
+                (
+                    selected,
+                    StackedSearchStats {
+                        lists_scanned: 0,
+                        members_scored: scored,
+                        leaf_members_scored: scored,
+                    },
+                )
+            } else {
+                search::search(
+                    &self.level,
+                    &prepared,
+                    k,
+                    capacity,
+                    params.aps,
+                    params.min_beam_fraction,
+                )
+            };
             (selected.into_unordered(), stats)
         };
         let exact_scored = candidates.len();
@@ -298,6 +328,7 @@ impl<S: VectorArena<Elem = f32>> QuantizedRouter<S> {
             stats,
             exact_scored,
             candidate_count,
+            flat: params.flat,
         }
     }
 }
@@ -341,11 +372,13 @@ pub(crate) struct Ranking {
     stats: StackedSearchStats,
     exact_scored: usize,
     candidate_count: usize,
+    flat: bool,
 }
 
 impl Ranking {
     pub(crate) fn metrics(&self) -> RouterMetrics {
         RouterMetrics::QuantizedStacked {
+            flat: self.flat,
             candidate_count: self.candidate_count,
             lists_scanned: self.stats.lists_scanned,
             approximate_scored: self.stats.members_scored,
@@ -468,6 +501,73 @@ mod tests {
     }
 
     #[test]
+    fn flat_batch_matches_exhaustive_beam_and_reads_leaf_columns_once() -> crate::Result<()> {
+        let (dim, rows) = (65, 96);
+        let options = VectorOptions::new(dim, Metric::Cosine);
+        let mut centroids = vectors(dim, rows);
+        let built = QuantizedRouter::build(&options, &mut centroids)?;
+        let mut payload = Vec::new();
+        built.serialize(&mut payload)?;
+        let topology_end = 21 + 4 + built.level.offsets.len() * 16;
+        let codes_start = topology_end + 4;
+        let coefficients_start = codes_start + rows * dim.div_ceil(64) * 8;
+        let norms_start = coefficients_start + rows * 4;
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let raw = FileSlice::from(
+            built
+                .raw
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        let opened = QuantizedRouter::open(
+            FileSlice::new(Arc::new(TrackedRaw {
+                bytes: payload,
+                reads: reads.clone(),
+            })),
+            raw,
+            &options,
+        )?;
+        let query = VectorQuery::new(Metric::Cosine, Arc::new(vec![0.15; dim]));
+        let params = RoutingParams {
+            k: 3,
+            min_beam_fraction: 1.0,
+            aps: false,
+            ..Default::default()
+        };
+        let hierarchical = opened.rank(&query, params).collect::<Vec<_>>();
+        reads.lock().unwrap().clear();
+        let flat = opened.rank(
+            &query,
+            RoutingParams {
+                flat: true,
+                ..params
+            },
+        );
+        assert!(matches!(
+            flat.metrics(),
+            RouterMetrics::QuantizedStacked {
+                flat: true,
+                lists_scanned: 0,
+                approximate_scored: 96,
+                approximate_members_scored: 96,
+                exact_scored: 6,
+                candidate_count: 3,
+            }
+        ));
+        assert_eq!(flat.collect::<Vec<_>>(), hierarchical);
+        assert_eq!(
+            *reads.lock().unwrap(),
+            vec![
+                codes_start..coefficients_start,
+                coefficients_start..norms_start,
+                norms_start..norms_start + rows * 4,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn persisted_router_reads_only_rerank_rows_and_returns_exact_scores() -> crate::Result<()> {
         for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
             let dim = 65;
@@ -494,6 +594,7 @@ mod tests {
                     k: 3,
                     rerank_factor: factor,
                     aps: false,
+                    ..RoutingParams::default()
                 };
                 let mut ranking = opened.rank(&query, params);
                 let metrics = ranking.metrics();
@@ -743,28 +844,42 @@ mod tests {
                 let filter = fixture.filter("third");
                 for filter in [&AllQuery as &dyn crate::query::Query, &filter] {
                     let expected = fixture.oracle(filter, &query, 7)?;
-                    let actual = fixture.search(filter, &query, 7, params.clone())?;
-                    assert_eq!(
-                        actual.results, expected,
-                        "{metric:?}, schedule {schedule:?}"
-                    );
-                    assert!(actual.stats.iter().any(|stats| matches!(
-                        stats.routing,
-                        Some(RouterMetrics::QuantizedStacked { .. })
-                    )));
-                    for stats in actual.stats.iter().filter(|stats| stats.routing.is_some()) {
-                        let json = serde_json::to_value(stats)?;
-                        assert_eq!(json["routing_kind"], "quantized_stacked");
-                        let count = |key: &str| json[key].as_u64().unwrap();
-                        assert!(count("routing_approximate_scored") > 0);
+                    for flat in [false, true] {
+                        let actual = fixture.search(
+                            filter,
+                            &query,
+                            7,
+                            ProbeParams {
+                                router_flat: flat,
+                                ..params.clone()
+                            },
+                        )?;
                         assert_eq!(
-                            count("routing_approximate_members_scored"),
-                            count("routing_approximate_pruned") + count("routing_exact_scored")
+                            actual.results, expected,
+                            "{metric:?}, schedule {schedule:?}"
                         );
-                        assert_eq!(
-                            count("routing_exact_scored"),
-                            count("routing_exact_pruned") + count("routing_candidate_count")
-                        );
+                        assert!(actual.stats.iter().any(|stats| matches!(
+                            stats.routing,
+                            Some(RouterMetrics::QuantizedStacked { .. })
+                        )));
+                        for stats in actual.stats.iter().filter(|stats| stats.routing.is_some()) {
+                            let json = serde_json::to_value(stats)?;
+                            assert_eq!(json["routing_kind"], "quantized_stacked");
+                            assert_eq!(
+                                json["routing_mode"],
+                                if flat { "flat" } else { "hierarchical" }
+                            );
+                            let count = |key: &str| json[key].as_u64().unwrap();
+                            assert!(count("routing_approximate_scored") > 0);
+                            assert_eq!(
+                                count("routing_approximate_members_scored"),
+                                count("routing_approximate_pruned") + count("routing_exact_scored")
+                            );
+                            assert_eq!(
+                                count("routing_exact_scored"),
+                                count("routing_exact_pruned") + count("routing_candidate_count")
+                            );
+                        }
                     }
                 }
             }
@@ -879,7 +994,7 @@ mod tests {
             let mut found = 0;
             let mut scored = 0;
             for (query, truth) in queries.iter().zip(&truth) {
-                let (hits, stats) = search::search(&index, query, k, k, aps);
+                let (hits, stats) = search::search(&index, query, k, k, aps, 0.25);
                 let hits = hits.into_sorted();
                 found += hits.iter().filter(|c| truth.contains(&c.node.0)).count();
                 scored += stats.members_scored;
@@ -903,6 +1018,7 @@ mod tests {
                             k,
                             rerank_factor: factor,
                             aps,
+                            ..RoutingParams::default()
                         },
                     );
                     if let RouterMetrics::QuantizedStacked {
@@ -980,6 +1096,7 @@ mod tests {
                     k,
                     rerank_factor: 2,
                     aps: false,
+                    ..RoutingParams::default()
                 };
                 let start = Instant::now();
                 let mut checksum = 0u64;

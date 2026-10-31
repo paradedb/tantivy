@@ -204,6 +204,8 @@ impl<'a> RouterClusters<'a> {
         let clusters = index.num_clusters();
         let routing = RoutingParams {
             rerank_factor: params.router_rerank_factor,
+            min_beam_fraction: params.router_min_beam_fraction,
+            flat: params.router_flat,
             aps: params.router_aps,
             k: params.router_k(
                 budget.total.get(),

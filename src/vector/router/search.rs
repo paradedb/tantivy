@@ -103,13 +103,18 @@ impl<I: Copy + Ord> TopCandidates<I> {
     }
 }
 
-pub(crate) fn lists_to_open(lists: usize, members: usize, k: usize) -> usize {
+pub(crate) fn lists_to_open(lists: usize, members: usize, k: usize, min_fraction: f32) -> usize {
     use super::stacked::levels::{LIST_OVERSCAN, PARENT_NPROBE_FRACTION};
 
     if lists == 0 {
         return 0;
     }
-    let floor = ((lists as f32 * PARENT_NPROBE_FRACTION).ceil() as usize).max(1);
+    let min_fraction = if min_fraction.is_finite() {
+        min_fraction.clamp(0.0, 1.0)
+    } else {
+        PARENT_NPROBE_FRACTION
+    };
+    let floor = ((lists as f32 * min_fraction).ceil() as usize).max(1);
     let beam = k.saturating_mul(LIST_OVERSCAN).max(1);
     let requested = ((beam as f64 * lists as f64) / members.max(1) as f64).ceil() as usize;
     requested.max(floor).min(lists).max(1)
@@ -176,13 +181,14 @@ pub(crate) fn search<Q, S: Hierarchy<Q>>(
     k: usize,
     capacity: usize,
     aps: bool,
+    min_fraction: f32,
 ) -> (TopCandidates<S::MemberId>, StackedSearchStats) {
     if k == 0 || capacity == 0 || source.member_count() == 0 {
         return (TopCandidates::new(0), StackedSearchStats::default());
     }
-    let open = lists_to_open(source.list_count(), source.member_count(), k);
+    let open = lists_to_open(source.list_count(), source.member_count(), k, min_fraction);
     let (lists, mut stats) = if let Some(parent) = source.parent() {
-        let (selected, stats) = search(parent, query, open, open, aps);
+        let (selected, stats) = search(parent, query, open, open, aps, min_fraction);
         (selected.into_sorted(), stats)
     } else {
         rank_centroids(source, query, open)
@@ -203,6 +209,7 @@ mod tests {
     struct Source {
         lists: usize,
         scored: Cell<usize>,
+        best: Option<u32>,
     }
 
     impl LevelSource<()> for Source {
@@ -227,7 +234,7 @@ mod tests {
             out.candidates.clear();
             out.candidates.push(Candidate {
                 node: list,
-                sim: Similarity::new(1.0),
+                sim: Similarity::new(if self.best == Some(list) { 100.0 } else { 1.0 }),
             });
         }
     }
@@ -244,24 +251,42 @@ mod tests {
         let source = Source {
             lists: 40,
             scored: Cell::new(0),
+            best: None,
         };
         // Fixed k=1 selects ten lists. Changing retention alone preserves that.
         for capacity in [1, 4, 40] {
-            let (_, stats) = search(&source, &(), 1, capacity, false);
+            let (_, stats) = search(&source, &(), 1, capacity, false, 0.25);
             assert_eq!(stats.lists_scanned, 10);
         }
-        let (_, stats) = search(&source, &(), 1, 1, true);
+        let (_, stats) = search(&source, &(), 1, 1, true, 0.25);
         assert_eq!(stats.lists_scanned, 6); // first full list + five quiet lists
-        let (_, stats) = search(&source, &(), 1, 4, true);
+        let (_, stats) = search(&source, &(), 1, 4, true, 0.25);
         assert_eq!(stats.lists_scanned, 9); // four filling lists + five quiet lists
-        let (_, stats) = search(&source, &(), 1, 40, true);
+        let (_, stats) = search(&source, &(), 1, 40, true, 0.25);
         assert_eq!(stats.lists_scanned, 10); // never fills
         source.scored.set(0);
-        assert!(search(&source, &(), 0, 0, true)
+        assert!(search(&source, &(), 0, 0, true, 0.25)
             .0
             .into_unordered()
             .is_empty());
         assert_eq!(source.scored.get(), 0);
+    }
+
+    #[test]
+    fn widening_selection_recovers_a_misranked_list_without_growing_retention() {
+        let source = Source {
+            lists: 40,
+            scored: Cell::new(0),
+            best: Some(11),
+        };
+        let (narrow, _) = search(&source, &(), 1, 1, false, 0.25);
+        let (wide, _) = search(&source, &(), 1, 1, false, 0.5);
+        let narrow = narrow.into_sorted();
+        let wide = wide.into_sorted();
+        assert_eq!(narrow.len(), 1);
+        assert_eq!(wide.len(), 1);
+        assert!(wide[0].sim > narrow[0].sim);
+        assert_eq!(wide[0].node, 11);
     }
 
     #[test]
