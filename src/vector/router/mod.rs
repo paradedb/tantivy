@@ -153,7 +153,7 @@ impl Default for RoutingParams {
         Self {
             k: usize::MAX,
             rerank_factor: 2,
-            min_beam_fraction: 0.25,
+            min_beam_fraction: 0.5,
             flat: false,
             aps: true,
         }

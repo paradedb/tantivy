@@ -84,7 +84,7 @@ impl Default for ProbeParams {
         Self {
             max_probe_fraction: 0.01,
             router_rerank_factor: 2,
-            router_min_beam_fraction: 0.25,
+            router_min_beam_fraction: 0.5,
             router_flat: false,
             router_aps: true,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
