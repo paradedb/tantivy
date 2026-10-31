@@ -243,10 +243,20 @@ impl QuantizedCandidates {
     /// row order and the doc ids aligned; the block's range shrinks and the entries past it stay
     /// dead until the next boundary compacts them. Returns the rows dropped.
     pub(crate) fn recheck(&mut self, b: usize, threshold: Threshold) -> usize {
+        self.retain(b, |candidates, row| threshold.admits(candidates.upper(row)))
+    }
+
+    pub(crate) fn remove_rows(&mut self, b: usize, offsets: &[u32]) {
+        self.retain(b, |candidates, row| {
+            offsets.binary_search(&candidates.offsets[row]).is_err()
+        });
+    }
+
+    fn retain(&mut self, b: usize, mut keep: impl FnMut(&Self, usize) -> bool) -> usize {
         let (at, docs) = (self.blocks[b].at.clone(), self.blocks[b].docs);
         let mut write = at.start;
         for read in at.clone() {
-            if !threshold.admits(self.upper(read)) {
+            if !keep(self, read) {
                 continue;
             }
             if write != read {

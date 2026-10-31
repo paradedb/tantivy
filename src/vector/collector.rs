@@ -734,9 +734,13 @@ where
                     _ => (matched, docs),
                 }
             });
-    let k = first
-        .params()
-        .router_k(total, x, matched / routed_docs.max(1) as f64, clusters);
+    let k = first.params().router_k(
+        total,
+        x,
+        matched / routed_docs.max(1) as f64,
+        clusters,
+        first.scoring_query().quantized.is_some(),
+    );
     let bounded = first
         .params()
         .quantized_recall
@@ -885,6 +889,35 @@ where
         totals[i].append(&measured);
         on_segment(i);
         result?;
+        if !recall_reached && rate.as_mut().is_some_and(|rate| rate.refinement_due()) {
+            let mut candidates: Vec<_> = scans
+                .iter_mut()
+                .flatten()
+                .flat_map(|scan| scan.refinement_candidates(top_n))
+                .collect();
+            if candidates.len() > top_n {
+                candidates.select_nth_unstable_by(top_n, |a, b| {
+                    b.bound
+                        .estimate()
+                        .total_cmp(&a.bound.estimate())
+                        .then_with(|| a.address.cmp(&b.address))
+                });
+                candidates.truncate(top_n);
+            }
+            for (j, scan) in scans.iter_mut().enumerate() {
+                let Some(scan) = scan else { continue };
+                scan.swap_topk(&mut topk);
+                let (result, measured) = measure(|| scan.refine_topk(&candidates));
+                scan.swap_topk(&mut topk);
+                totals[j].append(&measured);
+                on_segment(j);
+                result?;
+            }
+            let scan = scans[i].as_mut().unwrap();
+            scan.swap_rate(&mut rate);
+            recall_reached = scan.recall_reached();
+            scan.swap_rate(&mut rate);
+        }
     }
     for (i, scan) in scans.iter_mut().enumerate() {
         let Some(scan) = scan else {
@@ -1162,60 +1195,89 @@ mod ivf_e2e_tests {
     }
 
     #[test]
-    fn global_search_shortlists_all_clusters_before_refining() -> Result<()> {
+    fn global_search_refines_during_probing_only_with_adaptive() -> Result<()> {
         use crate::vector::VectorStage;
 
-        let fixture = FixtureSpec::clustered(Metric::L2, 128, 8, 768)
-            .segments(3)
-            .schedule(&[1, 1])
-            .label("matches", |i| i % 3 == 0)
-            .paged()
-            .build()?;
-        let searcher = fixture.index.reader()?.searcher();
-        let readers: Vec<_> = searcher
-            .segment_readers()
-            .iter()
-            .enumerate()
-            .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
-            .collect();
-        let mut query = vec![0.01; 128];
-        query[2] = 1.0;
-        for filter in [&AllQuery as &dyn Query, &fixture.filter("matches")] {
-            for located in [LocatedPath::Off, LocatedPath::Auto] {
-                let collector = TopDocs::with_limit(10)
-                    .order_by_similarity(fixture.field, query.clone())
-                    .with_probe_params(ProbeParams {
-                        located,
-                        exact_plan: false,
-                        ..exhaustive_params(8)
-                    })
-                    .build();
-                let weight = fixture.weight(filter)?;
-                fixture.clear_reads();
-                let result = collector.merge_fruits(collector.collect_segments(
-                    weight.as_ref(),
-                    &readers,
-                    |_| {},
-                )?)?;
-                let reads = fixture.reads();
-                let last_shortlist = reads
-                    .iter()
-                    .rposition(|(stage, _)| *stage == VectorStage::LayerScan(0))
-                    .expect("layer-0 reads");
-                let first_refinement = reads
-                    .iter()
-                    .position(|(stage, _)| {
-                        matches!(
-                            stage,
-                            VectorStage::LayerScan(1)
-                                | VectorStage::ExactScan
-                                | VectorStage::ExactFetch
-                                | VectorStage::ExactScore
-                        )
-                    })
-                    .expect("refinement reads");
-                assert!(last_shortlist < first_refinement, "{located:?}");
-                assert_eq!(result.results, fixture.oracle(filter, &query, 10)?);
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            let fixture = FixtureSpec::clustered(metric, 128, 8, 768)
+                .segments(3)
+                .schedule(&[1, 1])
+                .label("matches", |i| i % 3 == 0)
+                .paged()
+                .build()?;
+            let searcher = fixture.index.reader()?.searcher();
+            let mut readers: Vec<_> = searcher
+                .segment_readers()
+                .iter()
+                .enumerate()
+                .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
+                .collect();
+            readers.reverse();
+            let mut query = vec![0.01; 128];
+            query[2] = 1.0;
+            for filter in [&AllQuery as &dyn Query, &fixture.filter("matches")] {
+                for (located, adaptive) in [
+                    (LocatedPath::Off, false),
+                    (LocatedPath::Auto, false),
+                    (LocatedPath::Off, true),
+                    (LocatedPath::Auto, true),
+                ] {
+                    let collector = TopDocs::with_limit(10)
+                        .order_by_similarity(fixture.field, query.clone())
+                        .with_probe_params(ProbeParams {
+                            located,
+                            exact_plan: false,
+                            quantized_recall: adaptive.then_some(
+                                crate::vector::QuantizedRecallParams {
+                                    target: 0.99999999,
+                                    recall_exponent: 1.0,
+                                },
+                            ),
+                            ..exhaustive_params(8)
+                        })
+                        .build();
+                    let weight = fixture.weight(filter)?;
+                    fixture.clear_reads();
+                    let result = collector.merge_fruits(collector.collect_segments(
+                        weight.as_ref(),
+                        &readers,
+                        |_| {},
+                    )?)?;
+                    let reads = fixture.reads();
+                    let last_shortlist = reads
+                        .iter()
+                        .rposition(|(stage, _)| *stage == VectorStage::LayerScan(0))
+                        .expect("layer-0 reads");
+                    let first_refinement = reads
+                        .iter()
+                        .position(|(stage, _)| {
+                            matches!(
+                                stage,
+                                VectorStage::LayerScan(1)
+                                    | VectorStage::ExactScan
+                                    | VectorStage::ExactFetch
+                                    | VectorStage::ExactScore
+                            )
+                        })
+                        .expect("refinement reads");
+                    assert_eq!(first_refinement < last_shortlist, adaptive, "{located:?}");
+                    assert_eq!(result.results, fixture.oracle(filter, &query, 10)?);
+                    let mut refined = 0;
+                    for stats in &result.stats {
+                        let trace = &stats.quantized_trace;
+                        let rows: std::collections::HashSet<_> =
+                            trace.refined_topk_rows.iter().copied().collect();
+                        assert_eq!(rows.len(), trace.refined_topk_rows.len());
+                        assert!(trace
+                            .boundary_rows
+                            .iter()
+                            .flatten()
+                            .all(|row| !rows.contains(row)));
+                        assert!(trace.exact_phase_rows.iter().all(|row| !rows.contains(row)));
+                        refined += rows.len();
+                    }
+                    assert_eq!(refined > 0, adaptive);
+                }
             }
         }
         Ok(())

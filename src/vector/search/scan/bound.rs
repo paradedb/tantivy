@@ -861,6 +861,32 @@ mod tests {
             harness
         }
 
+        #[test]
+        fn removing_refined_rows_preserves_columns_and_docs() {
+            for seed in 0..128 {
+                let mut rng = fastrand::Rng::with_seed(seed);
+                let blocks = blocks(&mut rng);
+                let mut harness = harness_of(&blocks);
+                let mut kept = blocks.clone();
+                for (b, rows) in kept.iter_mut().enumerate() {
+                    let removed: Vec<_> = rows
+                        .iter()
+                        .filter(|_| rng.bool())
+                        .map(|row| row.0 as u32)
+                        .collect();
+                    harness.candidates.remove_rows(b, &removed);
+                    rows.retain(|row| removed.binary_search(&(row.0 as u32)).is_err());
+                }
+                harness.candidates.band(None);
+                let expected = harness_of(&kept);
+                assert_eq!(
+                    harness.candidates.column_trace(true),
+                    expected.candidates.column_trace(true)
+                );
+                assert_eq!(harness.candidates.doc_ids(), expected.candidates.doc_ids());
+            }
+        }
+
         /// A recheck drops exactly the block's rows whose upper endpoint is below the threshold,
         /// keeps the rest in row order with their doc ids and column values, and leaves the
         /// other blocks alone.

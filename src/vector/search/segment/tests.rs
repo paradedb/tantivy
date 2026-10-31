@@ -409,7 +409,7 @@ fn quantized_recall_rejects_invalid_parameters() {
                 quantized_recall: Some(recall),
                 ..Default::default()
             }
-            .router_k(1000.0, 0.1, 0.1, 1000)
+            .router_k(1000.0, 0.1, 0.1, 1000, false)
         };
         assert!(
             window(calibrated)

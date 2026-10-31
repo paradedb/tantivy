@@ -123,6 +123,7 @@ impl ProbeParams {
         open_share: f64,
         match_fraction: f64,
         clusters_in_segment: usize,
+        early_refinement: bool,
     ) -> usize {
         let match_fraction = match_fraction.clamp(0.0, 1.0);
         let cluster_cost =
@@ -132,7 +133,12 @@ impl ProbeParams {
             .quantized_recall
             .and_then(QuantizedRecallParams::admission_fraction)
         {
-            let base = (0.002 / fraction.powf(0.625)).min(1.0);
+            let base = if early_refinement {
+                0.0015 / fraction.sqrt()
+            } else {
+                0.002 / fraction.powf(0.625)
+            }
+            .min(1.0);
             let headroom = (0.05 * (cluster_cost.sqrt().recip() - 1.0)).min(0.4);
             let remaining = 1.0 - base;
             let taper = (remaining / 0.9).min(1.0);
@@ -218,27 +224,35 @@ mod tests {
         assert!((params(0.95).initial_work(1000).unwrap() - 5.0).abs() < 1e-10);
         assert!((params(0.95).initial_work(4000).unwrap() - 20.0).abs() < 1e-10);
         assert!((params(0.95).resolved_work_budget(1000, 100_000).unwrap().0 - 1.0).abs() < 1e-6);
-        assert_eq!(params(0.95).router_k(2.0, 0.1, 1.0, 1000), 2);
-        assert_eq!(params(0.9).router_k(1000.0, 0.1, 1.0, 1000), 13);
-        assert_eq!(params(0.95).router_k(1000.0, 0.1, 1.0, 1000), 21);
-        assert_eq!(params(0.99).router_k(1000.0, 0.1, 1.0, 1000), 74);
-        assert_eq!(params(0.95).router_k(2000.0, 0.1, 0.01, 2000), 164);
+        assert_eq!(params(0.95).router_k(2.0, 0.1, 1.0, 1000, false), 2);
+        assert_eq!(params(0.9).router_k(1000.0, 0.1, 1.0, 1000, false), 13);
+        assert_eq!(params(0.95).router_k(1000.0, 0.1, 1.0, 1000, false), 21);
+        assert_eq!(params(0.99).router_k(1000.0, 0.1, 1.0, 1000, false), 74);
+        assert_eq!(params(0.95).router_k(2000.0, 0.1, 0.01, 2000, false), 164);
         let cost = 0.004 + 0.996 * 0.0067;
         let expected = params(0.95).initial_work(4000).unwrap();
-        let window = params(0.95).router_k(4000.0, 0.004, 0.0067, 4000);
+        let window = params(0.95).router_k(4000.0, 0.004, 0.0067, 4000, false);
         assert!(window as f64 * cost >= expected);
         assert_eq!(
-            params(0.95).router_k(2.0, 0.004, 0.0067, 4000),
+            params(0.95).router_k(2.0, 0.004, 0.0067, 4000, false),
             (2.0_f64 / cost).ceil() as usize
         );
-        for open_share in [f64::MIN_POSITIVE, 1e-9, 0.004, 0.1, 1.0] {
-            for match_fraction in [0.0, 0.001, 0.01, 0.1, 1.0] {
-                let mut previous = 0;
-                for step in 1..=1000 {
-                    let target = step as f64 / 1000.0;
-                    let window = params(target).router_k(4000.0, open_share, match_fraction, 4000);
-                    assert!(window >= previous && window <= 4000);
-                    previous = window;
+        for early_refinement in [false, true] {
+            for open_share in [f64::MIN_POSITIVE, 1e-9, 0.004, 0.1, 1.0] {
+                for match_fraction in [0.0, 0.001, 0.01, 0.1, 1.0] {
+                    let mut previous = 0;
+                    for step in 1..=1000 {
+                        let target = step as f64 / 1000.0;
+                        let window = params(target).router_k(
+                            4000.0,
+                            open_share,
+                            match_fraction,
+                            4000,
+                            early_refinement,
+                        );
+                        assert!(window >= previous && window <= 4000);
+                        previous = window;
+                    }
                 }
             }
         }
@@ -308,19 +322,19 @@ mod tests {
     fn router_k_tracks_budget_and_filter_selectivity() {
         let params = ProbeParams::default();
         let x = 0.2;
-        assert_eq!(params.router_k(20.0, x, 1.0, 1000), 20);
-        assert_eq!(params.router_k(20.4, x, 1.0, 1000), 21);
+        assert_eq!(params.router_k(20.0, x, 1.0, 1000, false), 20);
+        assert_eq!(params.router_k(20.4, x, 1.0, 1000, false), 21);
         // Half the docs match: a cluster costs 0.2 + 0.8 * 0.5 = 0.6 units.
-        assert_eq!(params.router_k(20.0, x, 0.5, 1000), 34);
+        assert_eq!(params.router_k(20.0, x, 0.5, 1000, false), 34);
         // Nothing matches: only opens charge.
-        assert_eq!(params.router_k(20.0, x, 0.0, 1000), 100);
+        assert_eq!(params.router_k(20.0, x, 0.0, 1000, false), 100);
         assert_eq!(
-            params.router_k(2.0, x, 1.0, 1000),
+            params.router_k(2.0, x, 1.0, 1000, false),
             super::MIN_PROBE_CLUSTERS
         );
-        assert_eq!(params.router_k(20.0, x, 1.0, 18), 18);
-        assert_eq!(params.router_k(20.0, 0.0, 0.0, 1000), 1000);
-        assert_eq!(params.router_k(0.0, x, 1.0, 0), 1);
+        assert_eq!(params.router_k(20.0, x, 1.0, 18, false), 18);
+        assert_eq!(params.router_k(20.0, 0.0, 0.0, 1000, false), 1000);
+        assert_eq!(params.router_k(0.0, x, 1.0, 0, false), 1);
     }
 
     /// A non-positive probe fraction or a non-finite or non-positive open cost is an error.

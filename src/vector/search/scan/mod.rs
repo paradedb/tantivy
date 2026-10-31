@@ -13,7 +13,7 @@ pub(crate) mod rate;
 
 use std::ops::Range;
 
-use self::bound::{PruningBound, TopK};
+use self::bound::{Candidate, PruningBound, TopK};
 use self::columns::{Columns, QuantizedCandidates};
 use self::estimate::{combine_initial, combine_refine, CombineCtx};
 use self::exact::ExactScorer;
@@ -104,6 +104,8 @@ pub(crate) struct ScanReport {
     pub(crate) layers: Vec<LayerReport>,
     /// Rows scored at full precision.
     pub(crate) exact_rows: usize,
+    pub(crate) early_refine_rows: usize,
+    pub(crate) early_refine_ns: u64,
     /// Survivors of the last boundary dropped before the exact phase read them.
     pub(crate) exact_recheck_dropped: usize,
     /// Thresholds the scan stored in the participants' slot.
@@ -127,6 +129,7 @@ pub(crate) struct ScanTrace {
     pub(crate) layer_columns: Vec<Vec<(usize, [u32; 4])>>,
     /// Rows scored in the exact phase.
     pub(crate) exact_phase_rows: Vec<usize>,
+    pub(crate) refined_topk_rows: Vec<usize>,
     /// Every exact score the scan computed, in order.
     pub(crate) exact_scores: Vec<f32>,
     /// `(rows scored, survival scores folded)` per shortlisted cluster, with the RateAPS on.
@@ -430,6 +433,17 @@ pub(crate) struct RateApsState {
     prefill: Vec<f32>,
     rows: usize,
     histograms: Option<AdmissionHistograms>,
+    next_refinement: usize,
+}
+
+impl RateApsState {
+    pub(crate) fn refinement_due(&mut self) -> bool {
+        if self.next_refinement == 0 || self.rows < self.next_refinement {
+            return false;
+        }
+        self.next_refinement = self.rows.saturating_mul(2);
+        true
+    }
 }
 
 /// One segment's IVF scan. A cluster source supplies each cluster's rows; the scan shortlists them
@@ -564,6 +578,75 @@ where
         self.score_shortlist()
     }
 
+    pub(crate) fn refinement_candidates(&mut self, limit: usize) -> Vec<Candidate> {
+        let Some(state) = &self.quantized else {
+            return Vec::new();
+        };
+        let started = std::time::Instant::now();
+        let mut candidates = state.candidates.live_candidates(state.segment_ord);
+        if let Some(bar) = self.bound.shared_threshold() {
+            candidates.retain(|candidate| candidate.bound.estimate() > bar);
+        }
+        if candidates.len() > limit {
+            candidates.select_nth_unstable_by(limit, |a, b| {
+                b.bound
+                    .estimate()
+                    .total_cmp(&a.bound.estimate())
+                    .then_with(|| a.address.cmp(&b.address))
+            });
+            candidates.truncate(limit);
+        }
+        self.report.early_refine_ns += started.elapsed().as_nanos() as u64;
+        candidates
+    }
+
+    pub(crate) fn refine_topk(&mut self, top: &[Candidate]) -> crate::Result<()> {
+        let Some(state) = &mut self.quantized else {
+            return Ok(());
+        };
+        let started = std::time::Instant::now();
+        let mut rows: Vec<_> = top
+            .iter()
+            .filter(|candidate| candidate.address.segment_ord == state.segment_ord)
+            .map(|candidate| candidate.address.row_id)
+            .collect();
+        if rows.is_empty() {
+            return Ok(());
+        }
+        rows.sort_unstable();
+        state.candidates.order_by_cluster(&mut self.by_cluster);
+        for &b in &self.by_cluster {
+            let group = state.candidates.rows(b);
+            let offsets: Vec<_> = rows
+                .iter()
+                .filter(|row| group.rows.contains(row))
+                .map(|row| (row - group.rows.start) as u32)
+                .filter(|offset| group.offsets.unwrap().binary_search(offset).is_ok())
+                .collect();
+            if offsets.is_empty() {
+                continue;
+            }
+            let selected = ClusterRows {
+                offsets: Some(&offsets),
+                docs: None,
+                ..group
+            };
+            let scored = self
+                .exact
+                .score(&selected, &mut self.scratch, &mut self.bound, None)?;
+            self.report.exact_rows += scored;
+            self.report.early_refine_rows += scored;
+            #[cfg(test)]
+            self.report
+                .trace
+                .refined_topk_rows
+                .extend(selected.global_rows());
+            state.candidates.remove_rows(b, &offsets);
+        }
+        self.report.early_refine_ns += started.elapsed().as_nanos() as u64;
+        Ok(())
+    }
+
     /// The stage the shortlist is built in: layer 0, or the exact scan at full precision.
     fn shortlist_stage(&self) -> VectorStage {
         match self.quantized {
@@ -652,6 +735,7 @@ where
                 if let Some(bar) = self.bound.shared_threshold() {
                     let w0 = rate.rows;
                     rate.histograms = Some(AdmissionHistograms::at_fill(bar, &rate.prefill, w0));
+                    rate.next_refinement = w0.saturating_mul(2);
                     rate.prefill = Vec::new();
                 }
             }

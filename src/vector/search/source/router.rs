@@ -222,6 +222,7 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
                 budget.per_cluster.get(),
                 filter.match_fraction(segment.max_doc()),
                 clusters,
+                false,
             ),
         };
         let _routing = enter_vector_stage(VectorStage::Routing);
