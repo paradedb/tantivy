@@ -913,6 +913,7 @@ where S: VectorArena<Elem = f32>
                 .map(|&(start, end)| (end - start) as usize)
                 .sum(),
             k,
+            PARENT_NPROBE_FRACTION,
         )
     }
 
@@ -944,7 +945,8 @@ where S: VectorArena<Elem = f32>
         query: &VectorQuery<T>,
         k: usize,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-        let (selected, stats) = crate::vector::router::search::search(self, query, k, k, true);
+        let (selected, stats) =
+            crate::vector::router::search::search(self, query, k, k, true, PARENT_NPROBE_FRACTION);
         (selected.into_sorted(), stats)
     }
 }

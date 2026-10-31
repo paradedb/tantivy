@@ -142,6 +142,9 @@ pub(crate) struct RoutingParams {
     pub(crate) k: usize,
     /// Quantized member retention only; never changes the list request.
     pub(crate) rerank_factor: usize,
+    /// List-selection policy, independent of retention; quantized routing only.
+    pub(crate) min_beam_fraction: f32,
+    pub(crate) flat: bool,
     pub(crate) aps: bool,
 }
 
@@ -149,7 +152,9 @@ impl Default for RoutingParams {
     fn default() -> Self {
         Self {
             k: usize::MAX,
-            rerank_factor: 4,
+            rerank_factor: 2,
+            min_beam_fraction: 0.25,
+            flat: false,
             aps: true,
         }
     }
@@ -248,6 +253,8 @@ pub enum RouterMetrics {
     },
     /// Scalar-estimate routing and its separate exact output stage.
     QuantizedStacked {
+        /// Whether this invocation bypassed the persisted hierarchy.
+        flat: bool,
         /// Exact-ranked centroids handed to the document probe loop.
         candidate_count: usize,
         /// Lists opened across all router levels.
