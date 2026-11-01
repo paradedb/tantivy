@@ -746,16 +746,11 @@ where
         .quantized_recall
         .and_then(|recall| recall.admission_fraction())
         .is_some();
-    let routing_k = if bounded && k < clusters && first.scoring_query().quantized.is_some() {
-        k.div_ceil(2)
-    } else {
-        k
-    };
     let ranking = GlobalRanking::from(
         &routers,
         partitions,
         first.query(),
-        routing_k,
+        k,
         bounded.then_some(k),
         totals,
         on_segment,
