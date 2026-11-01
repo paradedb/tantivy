@@ -1,6 +1,7 @@
 //! The stacked router: a stacked IVF over a segment's centroids, ranked with
-//! [`StackedIvf::lists_to_open`] and stopped by [`super::adaptive`].
+//! [`StackedIvf::lists_to_open`] and stopped by [`aps`].
 
+pub(crate) mod aps;
 pub(crate) mod levels;
 pub(crate) mod search;
 
