@@ -1,5 +1,4 @@
 use super::levels::{lists_to_open, StackedIvf, StackedSearchStats};
-use crate::schema::Metric;
 use crate::vector::router::adaptive::AdaptiveProbe;
 use crate::vector::router::arena::VectorArena;
 use crate::vector::router::candidate::Candidate;
@@ -89,11 +88,10 @@ impl<'a, S: VectorArena<Elem = f32>> StackedRouting<'a, S> {
 
     /// Descends the combined layers, opening the nearest lists until their shared
     /// best candidates stop improving. Shorter stacks join at their topmost layer.
-    pub(crate) fn search(
+    pub(crate) fn search<T: VectorElement>(
         mut self,
-        query: &[f32],
+        query: &VectorQuery<T>,
         k: usize,
-        metric: Metric,
         mut output: impl RoutingOutput,
     ) -> StackedRanking {
         let levels = self.levels();

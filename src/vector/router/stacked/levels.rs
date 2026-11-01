@@ -884,7 +884,18 @@ where S: VectorArena<Elem = f32>
         k: usize,
         metric: Metric,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-        let ranking = StackedRouting::Segment(self).search(query, k, metric, TopK);
+        self.search_prepared(
+            &VectorQuery::new(metric, std::sync::Arc::new(query.to_vec())),
+            k,
+        )
+    }
+
+    pub(crate) fn search_prepared<T: VectorElement>(
+        &self,
+        query: &VectorQuery<T>,
+        k: usize,
+    ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
+        let ranking = StackedRouting::Segment(self).search(query, k, TopK);
         let hits = ranking
             .candidates
             .into_iter()
