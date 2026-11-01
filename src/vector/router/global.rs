@@ -1,7 +1,7 @@
 use super::candidate::Candidate;
 use super::stacked::search::{AllScored, StackedRouting};
 use super::{OpenedRouter, Router, RouterMetrics};
-use crate::schema::Metric;
+use crate::vector::search::prepared::VectorQuery;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
 use crate::vector::VectorStage;
 
@@ -13,10 +13,9 @@ pub(crate) struct GlobalRanking {
 }
 
 impl GlobalRanking {
-    pub(crate) fn from(
+    pub(crate) fn from<T: VectorElement>(
         routers: &[Option<&OpenedRouter>],
-        query: &[f32],
-        metric: Metric,
+        query: &VectorQuery<T>,
         k: usize,
         totals: &mut [StageTotals],
         on_segment: &mut impl FnMut(usize),
@@ -100,9 +99,11 @@ impl GlobalRanking {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::directory::FileSlice;
-    use crate::schema::VectorOptions;
+    use crate::schema::{Metric, VectorOptions};
     use crate::vector::clustering::{IvfCentroids, IvfMatrix};
     use crate::vector::router::stacked::levels::{
         ClusterId, InMemoryStore, StackedIvf, StackedIvfConfig,
@@ -151,6 +152,7 @@ mod tests {
             FileSlice::from(0.25f32.to_le_bytes().to_vec()),
             &options,
         )?;
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.0_f32]));
         for (far_nested, near_nested) in
             [(false, false), (true, true), (true, false), (false, true)]
         {
@@ -158,16 +160,9 @@ mod tests {
             let near = open_line_router(0.0, 4, near_nested)?;
             let routers = [Some(&far), None, Some(&near), Some(&exact)];
             let mut totals = vec![StageTotals::default(); routers.len()];
-            let ranked =
-                GlobalRanking::from(&routers, &[0.0], Metric::L2, 0, &mut totals, &mut |_| {});
-            let exhaustive = GlobalRanking::from(
-                &routers,
-                &[0.0],
-                Metric::L2,
-                usize::MAX,
-                &mut totals,
-                &mut |_| {},
-            );
+            let ranked = GlobalRanking::from(&routers, &query, 0, &mut totals, &mut |_| {});
+            let exhaustive =
+                GlobalRanking::from(&routers, &query, usize::MAX, &mut totals, &mut |_| {});
             assert_eq!(
                 exhaustive.clusters.len(),
                 9,
@@ -193,7 +188,7 @@ mod tests {
                 unreachable!()
             };
             for query in [[0.0], [1.5], [200.0]] {
-                let prepared = VectorQuery::new(Metric::L2, std::sync::Arc::new(query.to_vec()));
+                let prepared = VectorQuery::new(Metric::L2, Arc::new(query.to_vec()));
                 for k in [0, 1, 2, 4, 16] {
                     let (segment, stats) = index.search(&query, k, Metric::L2);
                     let mut totals = vec![StageTotals::default(); 2];
@@ -242,13 +237,13 @@ mod tests {
 
     #[test]
     fn patience_follows_global_order_and_counts_work_per_segment() -> crate::Result<()> {
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.0_f32]));
         for far_base in [0.5, 100.0] {
             let far = open_line_router(far_base, 80, false)?;
             let near = open_line_router(0.0, 80, false)?;
             let routers = [Some(&far), Some(&near)];
             let mut totals = vec![StageTotals::default(); routers.len()];
-            let ranked =
-                GlobalRanking::from(&routers, &[0.0], Metric::L2, 1, &mut totals, &mut |_| {});
+            let ranked = GlobalRanking::from(&routers, &query, 1, &mut totals, &mut |_| {});
             assert_eq!(ranked.clusters.len(), 6);
             assert_eq!(ranked.clusters[0].0, 1);
             assert_eq!(ranked.clusters[0].1.node, 0);
@@ -258,14 +253,8 @@ mod tests {
                     candidate_count, lists_scanned, members_scored,
                 } if *candidate_count == expected && *lists_scanned == expected && *members_scored == 80 + expected));
             }
-            let exhaustive = GlobalRanking::from(
-                &routers,
-                &[0.0],
-                Metric::L2,
-                usize::MAX,
-                &mut totals,
-                &mut |_| {},
-            );
+            let exhaustive =
+                GlobalRanking::from(&routers, &query, usize::MAX, &mut totals, &mut |_| {});
             assert_eq!(exhaustive.clusters.len(), 160);
         }
         Ok(())
