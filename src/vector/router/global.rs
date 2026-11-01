@@ -1,5 +1,5 @@
 use super::candidate::Candidate;
-use super::stacked::search::{AllScored, StackedRouting, TopK};
+use super::stacked::search::{AllScored, StackedRouting};
 use super::{OpenedRouter, Router, RouterMetrics};
 use crate::vector::search::prepared::VectorQuery;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
@@ -18,7 +18,7 @@ impl GlobalRanking {
         partitions: &[Option<&[f32]>],
         query: &VectorQuery<T>,
         k: usize,
-        bounded: bool,
+        limit: Option<usize>,
         totals: &mut [StageTotals],
         on_segment: &mut impl FnMut(usize),
     ) -> Self {
@@ -58,11 +58,7 @@ impl GlobalRanking {
             totals,
             on_segment,
         };
-        let ranking = if bounded {
-            routing.search(query, k.max(1), TopK)
-        } else {
-            routing.search(query, k.max(1), AllScored::default())
-        };
+        let ranking = routing.search(query, k.max(1), AllScored::default());
         for (stats, metrics) in ranking.stats.iter().zip(&mut metrics) {
             if let RouterMetrics::Stacked {
                 lists_scanned,
@@ -89,8 +85,8 @@ impl GlobalRanking {
                 .then(a.0.cmp(&b.0))
                 .then(a.1.node.cmp(&b.1.node))
         });
-        if bounded {
-            leaves.truncate(k.max(1));
+        if let Some(limit) = limit {
+            leaves.truncate(limit.max(1));
         }
         for (segment, _) in &leaves {
             if let RouterMetrics::Stacked {
@@ -118,6 +114,7 @@ mod tests {
     use crate::vector::router::stacked::levels::{
         ClusterId, InMemoryStore, StackedIvf, StackedIvfConfig,
     };
+    use crate::vector::router::stacked::search::TopK;
     use crate::vector::router::RouterKind;
 
     fn open_line_router(base: f32, count: u64, nested: bool) -> crate::Result<OpenedRouter> {
@@ -182,6 +179,17 @@ mod tests {
                 .sum::<usize>()
         };
         assert!(scored(&partitioned) < scored(&plain) * 3 / 4);
+        let with_headroom = GlobalRanking::from(
+            &routers,
+            &partitions,
+            &VectorQuery::new(Metric::L2, std::sync::Arc::new(vec![0.0])),
+            1,
+            Some(4),
+            &mut totals,
+            &mut |_| {},
+        );
+        assert_eq!(with_headroom.clusters, partitioned.clusters[..4]);
+        assert_eq!(scored(&with_headroom), scored(&partitioned));
         assert!(partitioned.metrics.iter().skip(4).all(|m| matches!(
             m,
             RouterMetrics::Stacked {
@@ -308,7 +316,7 @@ mod tests {
                     &[],
                     &query,
                     k,
-                    false,
+                    None,
                     &mut totals,
                     &mut |_| {},
                 );
@@ -317,11 +325,14 @@ mod tests {
                     &[],
                     &query,
                     k,
-                    true,
+                    Some(k * 2),
                     &mut totals,
                     &mut |_| {},
                 );
-                assert_eq!(bounded.clusters, all.clusters[..k.min(all.clusters.len())]);
+                assert_eq!(
+                    bounded.clusters,
+                    all.clusters[..(k * 2).min(all.clusters.len())]
+                );
                 for (limited, all) in bounded.metrics.iter().zip(&all.metrics) {
                     match (limited, all) {
                         (

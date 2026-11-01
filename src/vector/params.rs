@@ -134,7 +134,7 @@ impl ProbeParams {
             .and_then(QuantizedRecallParams::admission_fraction)
         {
             let base = if early_refinement {
-                0.0015 / fraction.sqrt()
+                0.00075 / fraction.sqrt()
             } else {
                 0.002 / fraction.powf(0.625)
             }
