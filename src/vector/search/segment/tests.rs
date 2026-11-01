@@ -32,7 +32,7 @@ const MATRIX_CLUSTERS: usize = 6;
 #[test]
 fn adaptive_cascade_matches_oracle_and_prefix_replay() -> crate::Result<()> {
     use crate::vector::router::with_test_clusters;
-    use crate::vector::{ProbeTermination, QuantizedRecallParams};
+    use crate::vector::{AdaptiveProbeParams, ProbeTermination};
 
     let plans = [
         PlanOverride::read(LayerRead::Sparse),
@@ -68,10 +68,7 @@ fn adaptive_cascade_matches_oracle_and_prefix_replay() -> crate::Result<()> {
                     });
                     for k in [1, 10, MATRIX_DOCS] {
                         let params = ProbeParams {
-                            quantized_recall: Some(QuantizedRecallParams {
-                                target: 1.0,
-                                recall_exponent: 1.5,
-                            }),
+                            adaptive_probing: None,
                             exact_plan: true,
                             ..routed_exhaustive_params(MATRIX_CLUSTERS)
                         };
@@ -119,9 +116,10 @@ fn adaptive_cascade_matches_oracle_and_prefix_replay() -> crate::Result<()> {
                                         &query,
                                         k,
                                         ProbeParams {
-                                            quantized_recall: Some(QuantizedRecallParams {
-                                                target,
-                                                recall_exponent: 1.5,
+                                            adaptive_probing: (target < 1.0).then(|| {
+                                                AdaptiveProbeParams {
+                                                    effort: -1.5 * (1.0_f64 - target).log10(),
+                                                }
                                             }),
                                             ..params.clone()
                                         },
@@ -195,9 +193,8 @@ fn adaptive_stops_when_shared_threshold_prunes_every_local_candidate() -> crate:
         let slot = Arc::new(AtomicSharedThreshold::default());
         seed_slot(&slot, -1.0);
         let params = ProbeParams {
-            quantized_recall: Some(crate::vector::QuantizedRecallParams {
-                target: f64::from(target),
-                recall_exponent: 1.5,
+            adaptive_probing: (target < 1.0).then(|| crate::vector::AdaptiveProbeParams {
+                effort: -1.5 * (1.0_f64 - target).log10(),
             }),
             exact_plan: false,
             located: LocatedPath::Off,
@@ -231,68 +228,6 @@ fn adaptive_stops_when_shared_threshold_prunes_every_local_candidate() -> crate:
 }
 
 #[test]
-fn disabled_adaptive_preserves_routing_budget_and_access_path() -> crate::Result<()> {
-    for router in [RouterKind::Exact, RouterKind::Stacked] {
-        for schedule in [&[][..], &[1, 4][..]] {
-            let fixture = FixtureSpec::clustered(Metric::L2, 64, 64, 6400)
-                .router(router)
-                .schedule(schedule)
-                .paged()
-                .label("few", |i| i % 100 == 0)
-                .label("some", |i| i % 10 == 0)
-                .build()?;
-            let query = Lcg(42).vector(64, 0.5);
-            for filter in [
-                &AllQuery as &dyn Query,
-                &fixture.filter("few"),
-                &fixture.filter("some"),
-            ] {
-                for max_probe_fraction in [0.03, 0.2] {
-                    let params = ProbeParams {
-                        max_probe_fraction,
-                        min_probe_clusters: 1,
-                        ..Default::default()
-                    };
-                    fixture.clear_reads();
-                    let baseline = fixture.search(filter, &query, 10, params.clone())?;
-                    let baseline_reads = fixture.reads();
-                    let expected = &baseline.stats[0];
-                    fixture.clear_reads();
-                    let adaptive = fixture.search(
-                        filter,
-                        &query,
-                        10,
-                        ProbeParams {
-                            quantized_recall: Some(crate::vector::QuantizedRecallParams {
-                                target: 1.0,
-                                recall_exponent: 1.5,
-                            }),
-                            ..params.clone()
-                        },
-                    )?;
-                    let reads = fixture.reads();
-                    let actual = &adaptive.stats[0];
-                    assert_eq!(actual.work_budget, expected.work_budget);
-                    assert_eq!(actual.located_cap, expected.located_cap);
-                    assert_eq!(actual.access_path, expected.access_path);
-                    assert_eq!(actual.routing_visited_count, expected.routing_visited_count);
-                    assert_eq!(
-                        stage_reads(&reads, |stage| stage == VectorStage::Routing),
-                        stage_reads(&baseline_reads, |stage| stage == VectorStage::Routing),
-                    );
-                    assert!(actual.work_charged <= expected.work_charged);
-                    assert!(actual.candidates_scored <= expected.candidates_scored);
-                    assert_eq!(adaptive.results, baseline.results);
-                    assert_eq!(actual.termination, expected.termination);
-                    assert_eq!(reads, baseline_reads);
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-#[test]
 fn adaptive_routing_uses_one_window_without_expansion() -> crate::Result<()> {
     let fixture = FixtureSpec::clustered(Metric::L2, 64, 64, 640)
         .router(RouterKind::Stacked)
@@ -306,9 +241,8 @@ fn adaptive_routing_uses_one_window_without_expansion() -> crate::Result<()> {
         ProbeParams {
             max_probe_fraction: 1.0,
             located: LocatedPath::Off,
-            quantized_recall: Some(crate::vector::QuantizedRecallParams {
-                target: 0.95,
-                recall_exponent: 1.25,
+            adaptive_probing: Some(crate::vector::AdaptiveProbeParams {
+                effort: -1.25 * (1.0_f64 - 0.95).log10(),
             }),
             ..Default::default()
         },
@@ -342,9 +276,8 @@ fn adaptive_bypass_is_independent_of_ceiling_headroom() -> crate::Result<()> {
                 10,
                 ProbeParams {
                     max_probe_fraction,
-                    quantized_recall: Some(crate::vector::QuantizedRecallParams {
-                        target: 0.95,
-                        recall_exponent: 3.0,
+                    adaptive_probing: Some(crate::vector::AdaptiveProbeParams {
+                        effort: -3.0 * (1.0_f64 - 0.95).log10(),
                     }),
                     ..Default::default()
                 },
@@ -360,72 +293,20 @@ fn adaptive_bypass_is_independent_of_ceiling_headroom() -> crate::Result<()> {
 }
 
 #[test]
-fn quantized_recall_rejects_invalid_parameters() {
-    use crate::vector::QuantizedRecallParams;
-    let stop = QuantizedRecallParams {
-        target: 0.95,
-        recall_exponent: 1.5,
-    };
-    for target in [0.0, -1.0, 1.1, f64::NAN, f64::INFINITY] {
+fn adaptive_probing_rejects_invalid_effort() {
+    use crate::vector::AdaptiveProbeParams;
+    for effort in [0.0, -1.0, f64::NAN, f64::INFINITY] {
         assert!(ProbeParams {
-            quantized_recall: Some(QuantizedRecallParams { target, ..stop }),
+            adaptive_probing: Some(AdaptiveProbeParams { effort }),
             ..Default::default()
         }
         .resolved_work_budget(MATRIX_CLUSTERS, MATRIX_DOCS)
         .is_err());
     }
-    assert!(stop.admission_fraction().unwrap() > 0.0);
-    assert_eq!(
-        QuantizedRecallParams {
-            target: 1.0,
-            ..stop
-        }
-        .admission_fraction(),
-        None
-    );
-    for recall_exponent in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-        assert!(ProbeParams {
-            quantized_recall: Some(QuantizedRecallParams {
-                recall_exponent,
-                ..stop
-            }),
-            ..Default::default()
-        }
-        .resolved_work_budget(MATRIX_CLUSTERS, MATRIX_DOCS)
-        .is_err());
+    for effort in [0.1, 1.0, 4.4, 10.0, f64::MAX] {
+        let fraction = AdaptiveProbeParams { effort }.admission_fraction();
+        assert!(fraction.is_finite() && (0.0..=1.0).contains(&fraction));
     }
-    for target in [0.9, 0.95, 0.99] {
-        let calibrated = QuantizedRecallParams { target, ..stop };
-        let raw = QuantizedRecallParams {
-            target: 1.0 - (1.0 - target).powf(stop.recall_exponent),
-            recall_exponent: 1.0,
-        };
-        assert!(
-            (calibrated.admission_fraction().unwrap() - raw.admission_fraction().unwrap()).abs()
-                < 1e-10
-        );
-        let window = |recall| {
-            ProbeParams {
-                quantized_recall: Some(recall),
-                ..Default::default()
-            }
-            .router_k(1000.0, 0.1, 0.1, 1000, false)
-        };
-        assert!(
-            window(calibrated)
-                > window(QuantizedRecallParams {
-                    target,
-                    recall_exponent: 1.0,
-                })
-        );
-    }
-    assert!(QuantizedRecallParams {
-        target: 1.0 - f64::EPSILON,
-        recall_exponent: 100.0
-    }
-    .admission_fraction()
-    .unwrap()
-    .is_finite());
 }
 
 #[derive(Clone, Copy, Debug)]

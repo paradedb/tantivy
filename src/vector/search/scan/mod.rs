@@ -49,7 +49,7 @@ pub(crate) struct ScanConfig {
     pub(crate) capacity: usize,
     /// Whether a cluster's rows may be scored exactly before the exact phase.
     pub(crate) exact_plan: bool,
-    pub(crate) quantized_recall: Option<crate::vector::QuantizedRecallParams>,
+    pub(crate) adaptive_probing: Option<crate::vector::AdaptiveProbeParams>,
     #[cfg(test)]
     pub(crate) plan_override: Option<PlanOverride>,
     /// Disables layer-0 admission pruning, which never changes results; equivalence tests flip it.
@@ -505,9 +505,9 @@ where
         };
         let layers = quantized.as_ref().map_or(0, |state| state.layers.len());
         let recall_fraction = config
-            .quantized_recall
+            .adaptive_probing
             .filter(|_| config.top_n > 0)
-            .and_then(|p| p.admission_fraction());
+            .map(|p| p.admission_fraction());
         Ok(Self {
             exact: ExactScorer::new(
                 reader,

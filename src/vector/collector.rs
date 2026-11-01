@@ -743,8 +743,8 @@ where
     );
     let bounded = first
         .params()
-        .quantized_recall
-        .and_then(|recall| recall.admission_fraction())
+        .adaptive_probing
+        .map(|adaptive| adaptive.admission_fraction())
         .is_some();
     let ranking = GlobalRanking::from(
         &routers,
@@ -787,8 +787,8 @@ where
                 return Ok((None, None, None));
             };
             let config = ScanConfig {
-                quantized_recall: matches!(&source, Source::Router(_))
-                    .then_some(backend.params().quantized_recall)
+                adaptive_probing: matches!(&source, Source::Router(_))
+                    .then_some(backend.params().adaptive_probing)
                     .flatten(),
                 top_n,
                 capacity,
@@ -859,9 +859,9 @@ where
     }
     let mut rate = first
         .params()
-        .quantized_recall
+        .adaptive_probing
         .filter(|_| top_n > 0)
-        .and_then(|recall| recall.admission_fraction())
+        .map(|adaptive| adaptive.admission_fraction())
         .map(|_| crate::vector::search::scan::RateApsState::default());
     let mut recall_reached = false;
     for (i, candidate) in ranking.clusters {
@@ -1120,7 +1120,7 @@ mod ivf_e2e_tests {
 
     #[test]
     fn global_adaptive_stopping_shares_evidence_across_segments() -> Result<()> {
-        use crate::vector::{ProbeTermination, QuantizedRecallParams};
+        use crate::vector::{AdaptiveProbeParams, ProbeTermination};
 
         let vector = |x| {
             let mut v = vec![0.0; 64];
@@ -1157,9 +1157,8 @@ mod ivf_e2e_tests {
                 let collector = TopDocs::with_limit(10)
                     .order_by_similarity(fixture.field, query.clone())
                     .with_probe_params(ProbeParams {
-                        quantized_recall: Some(QuantizedRecallParams {
-                            target,
-                            recall_exponent: 4.0,
+                        adaptive_probing: (target < 1.0).then(|| AdaptiveProbeParams {
+                            effort: -4.0 * (1.0_f64 - target).log10(),
                         }),
                         located: LocatedPath::Off,
                         ..exhaustive_params(64)
@@ -1227,10 +1226,9 @@ mod ivf_e2e_tests {
                         .with_probe_params(ProbeParams {
                             located,
                             exact_plan: false,
-                            quantized_recall: adaptive.then_some(
-                                crate::vector::QuantizedRecallParams {
-                                    target: 0.99999999,
-                                    recall_exponent: 2.0,
+                            adaptive_probing: adaptive.then_some(
+                                crate::vector::AdaptiveProbeParams {
+                                    effort: -2.0 * (1.0_f64 - 0.99999999).log10(),
                                 },
                             ),
                             ..exhaustive_params(8)

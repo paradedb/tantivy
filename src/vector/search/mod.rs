@@ -224,11 +224,11 @@ impl<T: VectorElement> SegmentSearcher<T> {
                 },
             ));
         };
-        let quantized_recall = matches!(&source, Source::Router(_))
-            .then_some(self.probe_params.quantized_recall)
+        let adaptive_probing = matches!(&source, Source::Router(_))
+            .then_some(self.probe_params.adaptive_probing)
             .flatten();
         let config = ScanConfig {
-            quantized_recall,
+            adaptive_probing,
             top_n,
             capacity,
             exact_plan: self.probe_params.exact_plan,
