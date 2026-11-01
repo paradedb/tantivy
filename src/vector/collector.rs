@@ -405,6 +405,7 @@ where
 {
     /// Collects the supplied segments in input order. One segment uses the existing segment
     /// search; multiple segments share routing, a work budget, and the exact top-k bound.
+    /// Located filter matches are exhaustive and reserve their share of the budget.
     /// Calls `on_segment` after each slice of work for per-segment read accounting.
     pub fn collect_segments(
         &self,
@@ -422,21 +423,7 @@ where
                 })
                 .collect();
         }
-        self.collect_global_segments(weight, readers, on_segment)
-    }
-
-    /// Searches a logical union of segment routers with one work budget and exact top-k bound.
-    /// Located filter matches are exhaustive and reserve their share of the budget.
-    /// Calls `on_segment` after each slice of work so an embedder can attribute physical reads.
-    fn collect_global_segments(
-        &self,
-        weight: &dyn Weight,
-        readers: &[(SegmentOrdinal, &SegmentReader)],
-        mut on_segment: impl FnMut(SegmentOrdinal),
-    ) -> Result<Vec<SegmentVectorFruit<S::SortKey>>> {
-        if let Some((_, reader)) = readers.first() {
-            self.check_schema(reader.schema())?;
-        }
+        self.check_schema(readers[0].1.schema())?;
         let mut backends = Vec::with_capacity(readers.len());
         let mut tie_breaks = Vec::with_capacity(readers.len());
         let mut totals = Vec::with_capacity(readers.len());
