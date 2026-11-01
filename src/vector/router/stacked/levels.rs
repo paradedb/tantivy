@@ -942,7 +942,7 @@ where S: VectorArena<Elem = f32>
         query: &VectorQuery<T>,
         k: usize,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-        let ranking = StackedRouting::Segment(self).search_prepared(query, k, TopK);
+        let ranking = StackedRouting::Segment(self).search(query, k, TopK);
         let hits = ranking
             .candidates
             .into_iter()

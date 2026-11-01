@@ -75,7 +75,7 @@ impl GlobalRanking {
             totals,
             on_segment,
         }
-        .search_prepared(query, k.max(1), AllScored::default());
+        .search(query, k.max(1), AllScored::default());
         for (stats, metrics) in ranking.stats.iter().zip(&mut metrics) {
             if let RouterMetrics::Stacked {
                 lists_scanned,
@@ -212,6 +212,7 @@ mod tests {
                 unreachable!()
             };
             for query in [[0.0], [1.5], [200.0]] {
+                let prepared = VectorQuery::new(Metric::L2, std::sync::Arc::new(query.to_vec()));
                 for k in [0, 1, 2, 4, 16] {
                     let (segment, stats) = index.search(&query, k, Metric::L2);
                     let mut totals = vec![StageTotals::default(); 2];
@@ -221,7 +222,7 @@ mod tests {
                         totals: &mut totals,
                         on_segment: &mut |segment| visited.push(segment),
                     }
-                    .search(&query, k, Metric::L2, TopK);
+                    .search(&prepared, k, TopK);
                     let best: Vec<_> = global
                         .candidates
                         .into_iter()
@@ -239,7 +240,7 @@ mod tests {
                         totals: &mut totals,
                         on_segment: &mut |_| {},
                     }
-                    .search(&query, k, Metric::L2, AllScored::default());
+                    .search(&prepared, k, AllScored::default());
                     assert_eq!(all.stats[1].lists_scanned, stats.lists_scanned);
                     assert_eq!(all.stats[1].members_scored, stats.members_scored);
                     let mut best_from_all = all.candidates;
