@@ -622,7 +622,7 @@ impl VectorIndexReader {
 
     /// Reads a clustered document id from its Data column, or selects a flat bitmap row.
     pub fn doc_id_at(&self, row: usize) -> crate::Result<DocId> {
-        if row >= self.num_vectors() {
+        if row >= *self.rows_slice.block_rows.last().unwrap() {
             return Err(TantivyError::InvalidArgument(format!(
                 "vector row {row} is out of bounds"
             )));

@@ -3,12 +3,16 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use superkmeans::batch::find_k_nearest_neighbors;
+use superkmeans::utils::{normalize_rows_l2, squared_norms};
 use superkmeans::{Dataset, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, Matrix};
 
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::clustering::{
-    for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
+    for_each_batch, ClusterAssignment, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors,
+    VectorSource,
 };
+use crate::vector::distance::{cosine, dot, l2_squared};
 use crate::TantivyError;
 
 /// Default [`SuperKMeansClusterer::with_max_leaf_size`].
@@ -101,6 +105,7 @@ pub struct SuperKMeansClusterer {
     config: HierarchicalSuperKMeansConfig,
     training_sample_ratio: f32,
     memory_limit: Option<usize>,
+    boundary_epsilon: f32,
     /// The assigner for the last `(dim, angular)`, reused across a merge's batches.
     assigner: Arc<Mutex<Option<Assigner>>>,
 }
@@ -122,6 +127,7 @@ impl fmt::Debug for SuperKMeansClusterer {
         f.debug_struct("SuperKMeansClusterer")
             .field("config", &self.config)
             .field("training_sample_ratio", &self.training_sample_ratio)
+            .field("boundary_epsilon", &self.boundary_epsilon)
             .finish_non_exhaustive()
     }
 }
@@ -136,6 +142,7 @@ impl SuperKMeansClusterer {
             config,
             training_sample_ratio: DEFAULT_TRAINING_SAMPLE_RATIO as f32,
             memory_limit: None,
+            boundary_epsilon: 0.0,
             assigner: Arc::new(Mutex::new(None)),
         }
     }
@@ -156,6 +163,14 @@ impl SuperKMeansClusterer {
     /// Trains on `ratio` of the vectors, in `(0, 1]`.
     pub fn with_training_sample_ratio(mut self, ratio: f32) -> Self {
         self.training_sample_ratio = ratio;
+        self
+    }
+
+    /// Adds one runner-up posting when `(d2 - d1) / abs(d1) <= epsilon`.
+    /// L2 and cosine use squared distances; Dot uses negative inner products.
+    /// Zero disables replication; a zero primary distance never replicates.
+    pub fn with_boundary_epsilon(mut self, epsilon: f32) -> Self {
+        self.boundary_epsilon = epsilon;
         self
     }
 
@@ -341,6 +356,116 @@ impl IvfClusterer for SuperKMeansClusterer {
         )?;
         Ok(assignments)
     }
+
+    fn assign_with_replicas(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        centroids: &IvfCentroids,
+    ) -> crate::Result<Vec<ClusterAssignment>> {
+        if !self.boundary_epsilon.is_finite() || self.boundary_epsilon < 0.0 {
+            return Err(TantivyError::InvalidArgument(
+                "boundary_epsilon must be finite and non-negative".into(),
+            ));
+        }
+        let IvfCentroids::F32(matrix) = centroids;
+        let dim = options.dim();
+        if matrix.rows == 0 || matrix.dims != dim || matrix.values.len() != matrix.rows * dim {
+            return Err(TantivyError::InvalidArgument(
+                "invalid assignment centroids".into(),
+            ));
+        }
+        if self.boundary_epsilon == 0.0 || matrix.rows == 1 {
+            return Ok(self
+                .assign(options, source, centroids)?
+                .into_iter()
+                .map(|primary| ClusterAssignment {
+                    primary,
+                    secondary: None,
+                })
+                .collect());
+        }
+
+        let mut normalized_centroids;
+        let centers = if options.metric() == Metric::Cosine {
+            normalized_centroids = matrix.values.clone();
+            normalize_rows_l2(&mut normalized_centroids, matrix.rows, dim);
+            &normalized_centroids[..]
+        } else {
+            &matrix.values[..]
+        };
+        let mut centroid_norms = squared_norms(centers, matrix.rows, dim);
+        let max_centroid_norm = centroid_norms.iter().copied().fold(0.0f32, f32::max).sqrt();
+        if options.metric() == Metric::Dot {
+            centroid_norms.fill(0.0);
+        }
+        let mut assignments = Vec::with_capacity(source.num_rows());
+        let batch_rows = self.budget_rows(options);
+        for start in (0..source.num_rows()).step_by(batch_rows) {
+            if source.wants_cancel() {
+                return Err(TantivyError::Cancelled);
+            }
+            let end = (start + batch_rows).min(source.num_rows());
+            let IvfTrainingVectors::F32(batch) = source.read_range(start..end)?;
+            let mut batch = checked_matrix(batch.matrix, end - start, dim)?;
+            if options.metric() == Metric::Cosine {
+                normalize_rows_l2(&mut batch.values, batch.rows, dim);
+            }
+            let mut norms = squared_norms(&batch.values, batch.rows, dim);
+            if options.metric() == Metric::Dot {
+                // A query-constant shift keeps the helper's distances non-negative without
+                // changing dot-product ranking or normalizing the indexed vectors.
+                for norm in &mut norms {
+                    *norm = 2.0 * norm.sqrt() * max_centroid_norm;
+                }
+            }
+            let mut ids = vec![0; batch.rows * 2];
+            let mut distances = vec![0.0; batch.rows * 2];
+            find_k_nearest_neighbors(
+                &batch.values,
+                centers,
+                batch.rows,
+                matrix.rows,
+                dim,
+                &norms,
+                &centroid_norms,
+                2,
+                &mut ids,
+                &mut distances,
+            );
+            for (vector, pair) in batch.values.chunks_exact(dim).zip(ids.chunks_exact(2)) {
+                let primary = pair[0];
+                let mut assignment = ClusterAssignment {
+                    primary,
+                    secondary: None,
+                };
+                if pair[1] < matrix.rows as u32 && pair[1] != primary {
+                    let distance = |cluster: u32| {
+                        let center = &centers[cluster as usize * dim..][..dim];
+                        match options.metric() {
+                            Metric::L2 => l2_squared(vector, center),
+                            Metric::Cosine => 2.0 * (1.0 - cosine(vector, center)).max(0.0),
+                            Metric::Dot => -dot(vector, center),
+                        }
+                    };
+                    let d1 = f64::from(distance(primary));
+                    let d2 = f64::from(distance(pair[1]));
+                    let valid_cosine =
+                        options.metric() != Metric::Cosine || vector.iter().any(|&v| v != 0.0);
+                    if valid_cosine
+                        && d1.is_finite()
+                        && d2.is_finite()
+                        && d1 != 0.0
+                        && (d2 - d1) / d1.abs() <= f64::from(self.boundary_epsilon)
+                    {
+                        assignment.secondary = Some(pair[1]);
+                    }
+                }
+                assignments.push(assignment);
+            }
+        }
+        Ok(assignments)
+    }
 }
 
 #[cfg(test)]
@@ -437,6 +562,92 @@ mod tests {
         let options = VectorOptions::new(source.dim, Metric::L2);
         let IvfCentroids::F32(centroids) = clusterer.train(&options, source).unwrap();
         centroids
+    }
+
+    #[test]
+    fn boundary_assignments_choose_only_the_runner_up() -> crate::Result<()> {
+        let options = VectorOptions::new(2, Metric::L2);
+        let centers = IvfCentroids::F32(IvfMatrix {
+            values: vec![0.0, 0.0, 10.0, 0.0, 5.0, 20.0],
+            rows: 3,
+            dims: 2,
+        });
+        let vectors = vec![4.9, 0.0, 1.0, 0.0, 5.0, 0.0, 0.0, 0.0];
+        for (epsilon, replicas) in [
+            (0.0, vec![None; 4]),
+            (0.05, vec![None, None, Some(1), None]),
+            (0.1, vec![Some(1), None, Some(1), None]),
+        ] {
+            let clusterer = SuperKMeansClusterer::new()
+                .with_boundary_epsilon(epsilon)
+                .with_memory_limit(16);
+            let mut source = VecSource::new(vectors.clone(), 2);
+            let assignments = clusterer.assign_with_replicas(&options, &mut source, &centers)?;
+            assert_eq!(
+                assignments.iter().map(|a| a.primary).collect::<Vec<_>>(),
+                vec![0; 4]
+            );
+            assert_eq!(
+                assignments.iter().map(|a| a.secondary).collect::<Vec<_>>(),
+                replicas
+            );
+            assert!(source.ranges.iter().all(|range| range.len() <= 2));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn boundary_assignment_handles_angular_metrics_and_zero_vectors() -> crate::Result<()> {
+        let centers = IvfCentroids::F32(IvfMatrix {
+            values: vec![1.0, 0.0, 0.0, 1.0, -1.0, 0.0],
+            rows: 3,
+            dims: 2,
+        });
+        for metric in [Metric::Cosine, Metric::Dot] {
+            let options = VectorOptions::new(2, metric);
+            for scale in [0.1, 1.0, 10.0] {
+                let mut source = VecSource::new(vec![scale, scale * 0.9, 0.0, 0.0, scale, 0.0], 2);
+                let assignments = SuperKMeansClusterer::new()
+                    .with_boundary_epsilon(0.35)
+                    .assign_with_replicas(&options, &mut source, &centers)?;
+                assert_eq!(
+                    assignments[0],
+                    ClusterAssignment {
+                        primary: 0,
+                        secondary: Some(1)
+                    }
+                );
+                assert!(assignments[1..].iter().all(|a| a.secondary.is_none()));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn boundary_assignment_rejects_invalid_epsilon_and_stops_on_cancel() {
+        let options = VectorOptions::new(2, Metric::L2);
+        let centers = IvfCentroids::F32(IvfMatrix {
+            values: vec![0.0, 0.0, 1.0, 1.0],
+            rows: 2,
+            dims: 2,
+        });
+        for epsilon in [-1.0, f32::NAN, f32::INFINITY] {
+            assert!(SuperKMeansClusterer::new()
+                .with_boundary_epsilon(epsilon)
+                .assign_with_replicas(&options, &mut VecSource::new(vec![0.5, 0.5], 2), &centers)
+                .is_err());
+        }
+        let mut source = CancellingSource {
+            inner: VecSource::new(vec![0.5; 8], 2),
+            polls_before_cancel: 1,
+            polls: Cell::new(0),
+        };
+        let result = SuperKMeansClusterer::new()
+            .with_boundary_epsilon(0.35)
+            .with_memory_limit(8)
+            .assign_with_replicas(&options, &mut source, &centers);
+        assert!(matches!(result, Err(TantivyError::Cancelled)));
+        assert_eq!(source.inner.ranges, vec![0..1]);
     }
 
     #[test]

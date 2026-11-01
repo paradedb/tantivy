@@ -1,4 +1,4 @@
-//! The assign step: every vector to its nearest centroid, and the clusters' row ranges.
+//! Primary and optional boundary assignments, and the clusters' row ranges.
 
 use std::time::Instant;
 
@@ -10,7 +10,7 @@ use crate::vector::clustering::{IvfCentroids, IvfClusterer, VectorSource};
 use crate::vector::write::RowAddress;
 use crate::{DocId, TantivyError};
 
-/// Assigns each of the field's vectors to one of `centroids`, reading the sources in storage
+/// Assigns each vector to its primary and optional secondary, reading the sources in storage
 /// order through a [`MergeVectorSource`].
 pub(super) fn assign(
     merge: &FieldMerge,
@@ -36,7 +36,7 @@ pub(super) fn assign(
     let mut source =
         MergeVectorSource::new(&merge.readers, assign_sources, opts.dim(), merge.ctx.cancel);
     let assign_start = Instant::now();
-    let clusters = clusterer.assign(opts, &mut source, centroids)?;
+    let clusters = clusterer.assign_with_replicas(opts, &mut source, centroids)?;
     timings.assign += assign_start.elapsed();
     timings.assign_reads += source.reads;
 
@@ -49,19 +49,35 @@ pub(super) fn assign(
     }
 
     let mut assigned_vectors = Vec::with_capacity(clusters.len());
-    for (cluster, &(row, target_doc_id)) in clusters.into_iter().zip(source.rows()) {
-        let cluster = cluster as usize;
-        if cluster >= num_centroids {
+    for (assignment, &(row, target_doc_id)) in clusters.into_iter().zip(source.rows()) {
+        if assignment.secondary == Some(assignment.primary) {
             return Err(TantivyError::InvalidArgument(format!(
-                "IvfClusterer assigned vector to cluster {cluster}, but only {num_centroids} \
-                 centroids were trained"
+                "IvfClusterer duplicated primary cluster {}",
+                assignment.primary
             )));
         }
-        assigned_vectors.push(AssignedVector {
-            cluster,
-            target_doc_id,
-            source: row,
-        });
+        for (cluster, primary) in std::iter::once((assignment.primary, true))
+            .chain(assignment.secondary.map(|cluster| (cluster, false)))
+        {
+            let cluster = cluster as usize;
+            if cluster >= num_centroids {
+                return Err(TantivyError::InvalidArgument(format!(
+                    "IvfClusterer assigned vector to cluster {cluster}, but only {num_centroids} \
+                     centroids were trained"
+                )));
+            }
+            assigned_vectors.push(AssignedVector {
+                cluster,
+                primary,
+                target_doc_id,
+                source: row,
+            });
+        }
+    }
+    if assigned_vectors.len() > u32::MAX as usize {
+        return Err(TantivyError::InvalidArgument(
+            "too many vector postings".into(),
+        ));
     }
     Ok(assigned_vectors)
 }

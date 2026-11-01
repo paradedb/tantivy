@@ -46,6 +46,7 @@ mod write;
 
 struct AssignedVector {
     cluster: usize,
+    primary: bool,
     target_doc_id: DocId,
     source: RowAddress,
 }
@@ -59,6 +60,7 @@ struct IvfBuildTimings {
     assign_reads: usize,
     /// Source vectors read while encoding the clustered rows.
     encode_reads: usize,
+    replicas: usize,
     spill_bytes: usize,
     pad_bytes: usize,
     /// Bytes written to this field's vector entries, including entry padding.
@@ -194,9 +196,8 @@ pub(crate) fn merge_ivf(
                     vector_count,
                     &mut timings,
                 )?;
-                debug_assert_eq!(assigned_vectors.len(), trained.present_vectors);
-                // The `.centroids` doc count: one posting row per document.
-                let num_present_docs = assigned_vectors.len();
+                let num_present_docs = trained.present_vectors;
+                timings.replicas = assigned_vectors.len() - num_present_docs;
                 let cluster_offsets = assign::cluster_offsets(&mut assigned_vectors, num_centroids);
 
                 let (centroid_bytes, mut bounds_builder) =

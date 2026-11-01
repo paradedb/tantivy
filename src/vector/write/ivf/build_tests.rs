@@ -451,3 +451,68 @@ fn vector_info_reports_router_levels() -> crate::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn repeated_merges_keep_one_source_vector_and_two_postings_per_doc() -> crate::Result<()> {
+    let pad = |mut v: Vec<f32>| {
+        v.resize(64, 0.0);
+        v
+    };
+    let fixture = FixtureSpec::ivf(
+        Metric::L2,
+        vec![pad(vec![0.0, 0.0]), pad(vec![10.0, 0.0])],
+        (0..64)
+            .map(|i| pad(vec![4.8 + i as f32 * 0.01, 0.1]))
+            .collect(),
+    )
+    .boundary_epsilon(1.0)
+    .schedule(&[1, 1])
+    .segments(2)
+    .without_vectors(|i| i == 3)
+    .deletes(&[1])
+    .build()?;
+    let mut writer: IndexWriter = fixture.index.writer_with_num_threads(1, 30_000_000)?;
+    writer.set_merge_policy(Box::new(NoMergePolicy));
+    for round in 0..2 {
+        if round > 0 {
+            let mut doc = TantivyDocument::new();
+            doc.add_text(fixture.label, "d100");
+            doc.add_vector(fixture.field, pad(vec![4.9, 0.1]).as_slice());
+            writer.add_document(doc)?;
+            writer.commit()?;
+        }
+        writer
+            .merge(&fixture.index.searchable_segment_ids()?)
+            .wait()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let segment = &searcher.segment_readers()[0];
+        let reader = segment.vector_index(fixture.field)?;
+        let index = reader.index().unwrap();
+        let expected = 62 + round;
+        assert_eq!(reader.num_vectors(), expected);
+        assert_eq!(index.num_docs(), expected);
+        assert_eq!(index.num_rows(), expected * 2);
+        let mut occurrences = vec![0; segment.max_doc() as usize];
+        for row in 0..index.num_rows() {
+            occurrences[reader.doc_id_at(row)? as usize] += 1;
+        }
+        assert_eq!(occurrences.iter().filter(|&&n| n == 2).count(), expected);
+        assert!(reader.doc_id_at(index.num_rows()).is_err());
+        for doc in 0..segment.max_doc() {
+            let Some(row) = reader.row_id(doc)? else {
+                continue;
+            };
+            let bytes = reader.vector_bytes(doc)?.unwrap();
+            let x = f32::from_le_bytes(bytes[..4].try_into().unwrap());
+            let primary = usize::from(x > 5.0);
+            assert!(index.cluster_range(primary).contains(&row));
+        }
+        let hits = fixture
+            .search(&AllQuery, &pad(vec![4.95, 0.1]), 100, exhaustive_params(2))?
+            .results;
+        assert_eq!(hits.len(), expected);
+        assert_eq!(hits, fixture.oracle(&AllQuery, &pad(vec![4.95, 0.1]), 100)?);
+    }
+    writer.wait_merging_threads()?;
+    Ok(())
+}

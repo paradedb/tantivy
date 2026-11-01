@@ -150,10 +150,12 @@ pub(super) fn write_data_entry(
             for assigned in tile {
                 timings.encode_reads += 1;
                 bufs[1].extend_from_slice(&assigned.target_doc_id.to_le_bytes());
-                locations[assigned.target_doc_id as usize] = DocLocation {
-                    cluster: cluster as u32,
-                    local,
-                };
+                if assigned.primary {
+                    locations[assigned.target_doc_id as usize] = DocLocation {
+                        cluster: cluster as u32,
+                        local,
+                    };
+                }
                 local += 1;
                 let bytes = merge.readers[assigned.source.segment_ord as usize]
                     .vector_bytes_for_row(assigned.source.row_id)?;

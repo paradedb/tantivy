@@ -1047,8 +1047,21 @@ mod ivf_e2e_tests {
 
     #[test]
     fn global_search_preserves_filtered_quantized_results() -> Result<()> {
-        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+        for (metric, epsilon, adaptive_probing) in [Metric::L2, Metric::Cosine, Metric::Dot]
+            .into_iter()
+            .flat_map(|metric| {
+                [0.0, 100.0].into_iter().flat_map(move |epsilon| {
+                    [
+                        None,
+                        Some(crate::vector::AdaptiveProbeParams { effort: 12.0 }),
+                    ]
+                    .into_iter()
+                    .map(move |adaptive| (metric, epsilon, adaptive))
+                })
+            })
+        {
             let fixture = FixtureSpec::clustered(metric, 128, 8, 768)
+                .boundary_epsilon(epsilon)
                 .segments(3)
                 .schedule(&[1, 1])
                 .label("rare", |i| i % 19 == 0)
@@ -1079,6 +1092,7 @@ mod ivf_e2e_tests {
                     let params = ProbeParams {
                         located,
                         exact_plan,
+                        adaptive_probing,
                         ..exhaustive_params(8)
                     };
                     for batch_size in [1, 2, readers.len()] {
@@ -1110,6 +1124,16 @@ mod ivf_e2e_tests {
                             "{metric:?} {located:?} batch={batch_size}"
                         );
                         assert_eq!(fruit.stats.len(), readers.len());
+                        for (stats, reader) in fruit.stats.iter().zip(&readers) {
+                            assert!(stats.candidates_scored <= reader.reader.max_doc() as usize);
+                            assert_eq!(
+                                stats.vectors_visited,
+                                stats.candidates_scored
+                                    + stats.pruned_filter
+                                    + stats.pruned_dead
+                                    + stats.pruned_duplicate
+                            );
+                        }
                         assert_eq!(threshold.load().is_some(), !fruit.results.is_empty());
                     }
                 }
