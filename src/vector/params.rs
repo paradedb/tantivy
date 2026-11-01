@@ -134,7 +134,10 @@ impl ProbeParams {
             .and_then(QuantizedRecallParams::admission_fraction)
         {
             let base = if early_refinement {
-                0.00075 / fraction.sqrt()
+                let recall = self.quantized_recall.unwrap();
+                // Reserve one power of the miss probability for stopping.
+                let exponent = (recall.recall_exponent - 1.0).max(0.0);
+                0.00075 * (-0.5 * exponent * (-recall.target).ln_1p()).exp()
             } else {
                 0.002 / fraction.powf(0.625)
             }
@@ -237,21 +240,25 @@ mod tests {
             params(0.95).router_k(2.0, 0.004, 0.0067, 4000, false),
             (2.0_f64 / cost).ceil() as usize
         );
-        for early_refinement in [false, true] {
-            for open_share in [f64::MIN_POSITIVE, 1e-9, 0.004, 0.1, 1.0] {
-                for match_fraction in [0.0, 0.001, 0.01, 0.1, 1.0] {
-                    let mut previous = 0;
-                    for step in 1..=1000 {
-                        let target = step as f64 / 1000.0;
-                        let window = params(target).router_k(
-                            4000.0,
-                            open_share,
-                            match_fraction,
-                            4000,
-                            early_refinement,
-                        );
-                        assert!(window >= previous && window <= 4000);
-                        previous = window;
+        for exponent in [0.05, 0.5, 1.0, 1.25, 2.5, 8.0] {
+            for early_refinement in [false, true] {
+                for open_share in [f64::MIN_POSITIVE, 1e-9, 0.004, 0.1, 1.0] {
+                    for match_fraction in [0.0, 0.001, 0.01, 0.1, 1.0] {
+                        let mut previous = 0;
+                        for step in 1..=1000 {
+                            let target = step as f64 / 1000.0;
+                            let mut params = params(target);
+                            params.quantized_recall.as_mut().unwrap().recall_exponent = exponent;
+                            let window = params.router_k(
+                                4000.0,
+                                open_share,
+                                match_fraction,
+                                4000,
+                                early_refinement,
+                            );
+                            assert!(window >= previous && window <= 4000);
+                            previous = window;
+                        }
                     }
                 }
             }

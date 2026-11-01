@@ -1230,7 +1230,7 @@ mod ivf_e2e_tests {
                             quantized_recall: adaptive.then_some(
                                 crate::vector::QuantizedRecallParams {
                                     target: 0.99999999,
-                                    recall_exponent: 1.0,
+                                    recall_exponent: 2.0,
                                 },
                             ),
                             ..exhaustive_params(8)
