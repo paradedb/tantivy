@@ -1,5 +1,7 @@
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
 use super::levels::{lists_to_open, StackedIvf, StackedSearchStats};
-use crate::vector::router::adaptive::AdaptiveProbe;
 use crate::vector::router::arena::VectorArena;
 use crate::vector::router::candidate::Candidate;
 use crate::vector::search::prepared::VectorQuery;
@@ -20,7 +22,10 @@ pub(crate) enum StackedRouting<'a, S> {
 /// Selects which scored leaf members the caller receives, without changing the walk.
 pub(crate) trait RoutingOutput {
     fn record(&mut self, candidate: Candidate<(usize, u32)>);
-    fn finish(self, best: AdaptiveProbe<(usize, u32)>) -> Vec<Candidate<(usize, u32)>>;
+    fn finish(
+        self,
+        best: BinaryHeap<Reverse<Candidate<(usize, u32)>>>,
+    ) -> Vec<Candidate<(usize, u32)>>;
 }
 
 pub(crate) struct TopK;
@@ -28,8 +33,14 @@ pub(crate) struct TopK;
 impl RoutingOutput for TopK {
     fn record(&mut self, _candidate: Candidate<(usize, u32)>) {}
 
-    fn finish(self, best: AdaptiveProbe<(usize, u32)>) -> Vec<Candidate<(usize, u32)>> {
+    fn finish(
+        self,
+        best: BinaryHeap<Reverse<Candidate<(usize, u32)>>>,
+    ) -> Vec<Candidate<(usize, u32)>> {
         best.into_sorted_vec()
+            .into_iter()
+            .map(|Reverse(candidate)| candidate)
+            .collect()
     }
 }
 
@@ -41,7 +52,10 @@ impl RoutingOutput for AllScored {
         self.0.push(candidate);
     }
 
-    fn finish(self, _best: AdaptiveProbe<(usize, u32)>) -> Vec<Candidate<(usize, u32)>> {
+    fn finish(
+        self,
+        _best: BinaryHeap<Reverse<Candidate<(usize, u32)>>>,
+    ) -> Vec<Candidate<(usize, u32)>> {
         self.0
     }
 }
@@ -148,8 +162,9 @@ impl<'a, S: VectorArena<Elem = f32>> StackedRouting<'a, S> {
             }
             candidates.sort_unstable_by(|a, b| b.cmp(a));
             candidates.truncate(open[level]);
-            let requested = if level == 0 { k } else { open[level - 1] };
-            let mut probe = AdaptiveProbe::new(requested);
+            let requested = if level == 0 { k } else { open[level - 1] }.max(1);
+            let mut probe = super::aps::open();
+            let mut best = BinaryHeap::new();
             for candidate in candidates {
                 let (segment, list) = candidate.node;
                 let index = levels[segment][level];
@@ -167,7 +182,13 @@ impl<'a, S: VectorArena<Elem = f32>> StackedRouting<'a, S> {
                             sim,
                             node: (segment, node as u32),
                         };
-                        probe.push(candidate);
+                        if best.len() < requested {
+                            best.push(Reverse(candidate));
+                        } else if let Some(mut worst) = best.peek_mut() {
+                            if candidate > worst.0 {
+                                *worst = Reverse(candidate);
+                            }
+                        }
                         if level == 0 {
                             output.record(candidate);
                         }
@@ -176,17 +197,21 @@ impl<'a, S: VectorArena<Elem = f32>> StackedRouting<'a, S> {
                 });
                 stats[segment].lists_scanned += 1;
                 stats[segment].members_scored += scanned;
-                if probe.should_stop() {
+                let kth = best
+                    .peek()
+                    .filter(|_| best.len() >= requested)
+                    .map(|worst| worst.0.sim);
+                if probe.observe(kth) {
                     break;
                 }
             }
             if level == 0 {
                 return StackedRanking {
-                    candidates: output.finish(probe),
+                    candidates: output.finish(best),
                     stats,
                 };
             }
-            candidates = probe.into_sorted_vec();
+            candidates = TopK.finish(best);
         }
         StackedRanking { candidates, stats }
     }
