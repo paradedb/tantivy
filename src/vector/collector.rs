@@ -715,7 +715,7 @@ where
     let k = first
         .params()
         .router_k(total, x, matched / routed_docs.max(1) as f64, clusters);
-    let ranking = GlobalRanking::from_prepared(&routers, first.query(), k, totals, on_segment);
+    let ranking = GlobalRanking::from(&routers, first.query(), k, totals, on_segment);
     let mut reserved = WorkUnits::ZERO;
     let mut scans = Vec::with_capacity(backends.len());
     let mut sources = Vec::with_capacity(backends.len());
