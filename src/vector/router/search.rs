@@ -1,17 +1,18 @@
-//! Storage-independent level search. Sources score batches; the caller composes
-//! list selection, candidate retention, stopping, and optional exact reranking.
+//! Level traversal and precision-stage composition over data-only vector sources.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use super::arena::VectorArena;
 use super::candidate::Candidate;
-use super::stacked::levels::{ClusterId, StackedSearchStats};
+use super::scoring::{score_initial, ScoringQuery};
+use super::source::VectorSource;
+use super::stacked::levels::{ClusterId, StackedIvf, StackedSearchStats};
 use crate::vector::distance::Similarity;
 use crate::vector::search::prepared::VectorQuery;
 use crate::vector::VectorElement;
 
-/// Reused across batches, including representation-specific scoring scratch.
+/// Reused output and representation-specific scratch for one scoring batch.
 pub(crate) struct ScoreBuffer<I> {
     pub(crate) candidates: Vec<Candidate<I>>,
     pub(crate) similarities: Vec<Similarity>,
@@ -28,29 +29,205 @@ impl<I> Default for ScoreBuffer<I> {
     }
 }
 
-/// A source resolves storage and scores whole batches, without deciding how
-/// many candidates to retain or when to stop. Cluster and member identities may
-/// differ (for example, a posting list contains addressed document-vector rows).
-pub(crate) trait LevelSource<Q>: Sized {
-    type ClusterId: Copy + Ord;
-    type MemberId: Copy + Ord;
-
-    fn list_count(&self) -> usize;
-    fn member_count(&self) -> usize;
-    fn score_centroids(&self, query: &Q, out: &mut ScoreBuffer<Self::ClusterId>);
-    fn score_members(
-        &self,
-        list: Self::ClusterId,
-        query: &Q,
-        out: &mut ScoreBuffer<Self::MemberId>,
-    );
+#[derive(Clone, Copy)]
+pub(crate) struct SearchPolicy {
+    pub(crate) aps: bool,
+    pub(crate) min_fraction: f32,
+    pub(crate) rerank_factor: usize,
 }
 
-/// Hierarchy composition is separate from batch access. Parent results must
-/// identify child clusters; leaf sources need not implement this trait to probe.
-pub(crate) trait Hierarchy<Q>: LevelSource<Q> {
-    type Parent: Hierarchy<Q> + LevelSource<Q, MemberId = Self::ClusterId>;
-    fn parent(&self) -> Option<&Self::Parent>;
+/// A caller explicitly chooses whether selection must produce exact scores.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum OutputPrecision {
+    Estimated,
+    Exact,
+}
+
+fn precision<S: VectorSource>(source: &S) -> OutputPrecision {
+    if source.raw().is_some() {
+        OutputPrecision::Exact
+    } else {
+        OutputPrecision::Estimated
+    }
+}
+
+fn capacity<S: VectorSource>(
+    source: &S,
+    dim: usize,
+    k: usize,
+    output: OutputPrecision,
+    policy: SearchPolicy,
+) -> usize {
+    let factor = if source.compressed().is_some() && output == OutputPrecision::Exact {
+        policy.rerank_factor.max(1)
+    } else {
+        1
+    };
+    k.saturating_mul(factor).min(source.num_vectors(dim))
+}
+
+/// Refine a retained population, without opening additional clusters. Sources
+/// provide representations; this operation owns final selection and its policy.
+fn finish<S: VectorSource, T: VectorElement>(
+    source: &S,
+    query: &ScoringQuery<'_, T>,
+    candidates: TopCandidates<ClusterId>,
+    k: usize,
+    output: OutputPrecision,
+    stats: &mut StackedSearchStats,
+) -> Vec<Candidate<ClusterId>> {
+    if source.compressed().is_some() && output == OutputPrecision::Exact {
+        let raw = source.raw().expect("exact refinement requires raw rows");
+        let retained = candidates.into_unordered();
+        stats.leaf_exact_scored = retained.len();
+        stats.members_scored += retained.len();
+        rerank_exact(raw, query.query, &retained, k)
+    } else {
+        candidates.into_sorted()
+    }
+}
+
+/// Score/select any vector bank. Root centroids and flat member scans use the
+/// same operations as the cluster walk, including optional exact refinement.
+pub(crate) fn rank_vectors<S: VectorSource, T: VectorElement>(
+    source: &S,
+    query: &ScoringQuery<'_, T>,
+    k: usize,
+    policy: SearchPolicy,
+    output: OutputPrecision,
+) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
+    assert!(
+        output != OutputPrecision::Exact || source.raw().is_some(),
+        "exact vector output requires raw rows"
+    );
+    let mut stats = StackedSearchStats::default();
+    if k == 0 {
+        return (Vec::new(), stats);
+    }
+    let mut buffer = ScoreBuffer::default();
+    let approximate = score_initial(
+        source,
+        query,
+        0..source.num_vectors(query.query.widened().len()),
+        &mut buffer,
+    );
+    let scored = buffer.candidates.len();
+    stats.members_scored = scored;
+    stats.leaf_members_scored = scored;
+    if approximate {
+        stats.approximate_scored = scored;
+        stats.leaf_approximate_scored = scored;
+    } else {
+        stats.leaf_exact_scored = scored;
+    }
+    let mut retained = TopCandidates::new(capacity(
+        source,
+        query.query.widened().len(),
+        k,
+        output,
+        policy,
+    ));
+    for candidate in buffer.candidates {
+        retained.offer(candidate);
+    }
+    let ranked = finish(source, query, retained, k, output, &mut stats);
+    (ranked, stats)
+}
+
+/// Score whole clusters into one retained population; stopping is observed only
+/// at completed-cluster boundaries and does not force precision refinement.
+pub(crate) fn probe_clusters<S: VectorSource, T: VectorElement>(
+    level: &StackedIvf<S>,
+    query: &ScoringQuery<'_, T>,
+    lists: Vec<Candidate<ClusterId>>,
+    capacity: usize,
+    aps: bool,
+) -> (TopCandidates<ClusterId>, StackedSearchStats) {
+    let mut stats = StackedSearchStats::default();
+    let mut result = TopCandidates::new(capacity);
+    if capacity == 0 {
+        return (result, stats);
+    }
+    let mut buffer = ScoreBuffer::default();
+    let mut stop = super::stacked::aps::open();
+    for list in lists {
+        let (start, end) = level.offsets[usize::from(list.node)];
+        let approximate = score_initial(
+            &level.vectors,
+            query,
+            start as usize..end as usize,
+            &mut buffer,
+        );
+        let scored = buffer.candidates.len();
+        stats.members_scored += scored;
+        stats.leaf_members_scored += scored;
+        stats.lists_scanned += 1;
+        if approximate {
+            stats.approximate_scored += scored;
+            stats.leaf_approximate_scored += scored;
+        } else {
+            stats.leaf_exact_scored += scored;
+        }
+        for candidate in buffer.candidates.drain(..) {
+            result.offer(candidate);
+        }
+        if aps && stop.observe(result.worst_when_full()) {
+            break;
+        }
+    }
+    (result, stats)
+}
+
+/// One walk for all level representations. Parent recursion receives the same
+/// original query/context; representation-specific preparation is lazy.
+pub(crate) fn search<S: VectorSource, T: VectorElement>(
+    level: &StackedIvf<S>,
+    query: &ScoringQuery<'_, T>,
+    k: usize,
+    policy: SearchPolicy,
+    output: OutputPrecision,
+) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
+    let members = level.vectors.num_vectors(query.query.widened().len());
+    if k == 0 || members == 0 {
+        return (Vec::new(), StackedSearchStats::default());
+    }
+    assert!(
+        output != OutputPrecision::Exact || level.vectors.raw().is_some(),
+        "exact level output requires raw member rows"
+    );
+    let open = lists_to_open(level.offsets.len(), members, k, policy.min_fraction);
+    let (lists, mut stats) = if let Some(parent) = &level.parent {
+        search(parent, query, open, policy, precision(&parent.vectors))
+    } else {
+        rank_vectors(
+            &level.centroids,
+            query,
+            open,
+            policy,
+            precision(&level.centroids),
+        )
+    };
+    let (retained, probed) = probe_clusters(
+        level,
+        query,
+        lists,
+        capacity(
+            &level.vectors,
+            query.query.widened().len(),
+            k,
+            output,
+            policy,
+        ),
+        policy.aps,
+    );
+    stats.members_scored += probed.members_scored;
+    stats.lists_scanned += probed.lists_scanned;
+    stats.approximate_scored += probed.approximate_scored;
+    stats.leaf_members_scored = probed.leaf_members_scored;
+    stats.leaf_approximate_scored = probed.leaf_approximate_scored;
+    stats.leaf_exact_scored = probed.leaf_exact_scored;
+    let ranked = finish(&level.vectors, query, retained, k, output, &mut stats);
+    (ranked, stats)
 }
 
 /// Deterministic bounded retention, independent of precision and storage.
@@ -123,84 +300,70 @@ pub(crate) fn lists_to_open(lists: usize, members: usize, k: usize, min_fraction
     requested.max(floor).min(lists).max(1)
 }
 
-/// Score and select centroids without requiring a hierarchy or probing members.
-pub(crate) fn rank_centroids<Q, S: LevelSource<Q>>(
-    source: &S,
-    query: &Q,
-    k: usize,
-) -> (Vec<Candidate<S::ClusterId>>, StackedSearchStats) {
-    let mut buffer = ScoreBuffer::default();
-    source.score_centroids(query, &mut buffer);
-    let stats = StackedSearchStats {
-        lists_scanned: 0,
-        members_scored: buffer.candidates.len(),
-        leaf_members_scored: 0,
-    };
-    let mut selected = TopCandidates::new(k);
-    for candidate in buffer.candidates {
-        selected.offer(candidate);
-    }
-    (selected.into_sorted(), stats)
-}
-
-/// Probe any supplied ranked shortlist. Representation and hierarchy are source
-/// concerns; retention and stopping are explicit policies of this invocation.
-/// The caller orders the retained set only when its next stage needs ranking.
-pub(crate) fn probe_clusters<Q, S: LevelSource<Q>>(
-    source: &S,
-    query: &Q,
-    lists: Vec<Candidate<S::ClusterId>>,
-    capacity: usize,
-    aps: bool,
-) -> (TopCandidates<S::MemberId>, StackedSearchStats) {
-    let mut stats = StackedSearchStats::default();
-    if capacity == 0 {
-        return (TopCandidates::new(0), stats);
-    }
-    let mut buffer = ScoreBuffer::default();
-    let mut result = TopCandidates::new(capacity.min(source.member_count()));
-    let mut stop = super::stacked::aps::open();
-    for list in lists {
-        source.score_members(list.node, query, &mut buffer);
-        stats.members_scored += buffer.candidates.len();
-        stats.leaf_members_scored += buffer.candidates.len();
-        stats.lists_scanned += 1;
-        for candidate in buffer.candidates.drain(..) {
-            result.offer(candidate);
-        }
-        if aps && stop.observe(result.worst_when_full()) {
-            break;
-        }
-    }
-    (result, stats)
-}
-
-/// `k` sizes the traversal; `capacity` independently sizes the output heap.
-/// Parents produce ordinary, unpadded shortlists. Precision is a source concern.
-/// Parent results are ordered for descent; output ordering belongs to the caller.
-pub(crate) fn search<Q, S: Hierarchy<Q>>(
-    source: &S,
-    query: &Q,
-    k: usize,
-    capacity: usize,
-    aps: bool,
-    min_fraction: f32,
-) -> (TopCandidates<S::MemberId>, StackedSearchStats) {
-    if k == 0 || capacity == 0 || source.member_count() == 0 {
-        return (TopCandidates::new(0), StackedSearchStats::default());
-    }
-    let open = lists_to_open(source.list_count(), source.member_count(), k, min_fraction);
-    let (lists, mut stats) = if let Some(parent) = source.parent() {
-        let (selected, stats) = search(parent, query, open, open, aps, min_fraction);
-        (selected.into_sorted(), stats)
+/// Compose a final routing request. Flat scheduling and exceptional-query
+/// fallback use the same bank scoring/refinement operations as the level walk.
+pub(crate) fn rank<S: VectorSource, T: VectorElement>(
+    level: &StackedIvf<S>,
+    query: &VectorQuery<T>,
+    params: super::RoutingParams,
+) -> (Vec<Candidate<ClusterId>>, StackedSearchStats, bool) {
+    let compressed = level.vectors.compressed().is_some();
+    let count = level.vectors.num_vectors(query.widened().len());
+    let k = if compressed {
+        params.k.min(count)
     } else {
-        rank_centroids(source, query, open)
+        params.k.clamp(1, count.max(1))
     };
-    let (candidates, probed) = probe_clusters(source, query, lists, capacity, aps);
-    stats.members_scored += probed.members_scored;
-    stats.lists_scanned += probed.lists_scanned;
-    stats.leaf_members_scored = probed.leaf_members_scored;
-    (candidates, stats)
+    let flat = compressed && params.flat;
+    if k == 0 {
+        return (Vec::new(), StackedSearchStats::default(), flat);
+    }
+    let has_compressed = level.vectors.compressed().is_some()
+        || level
+            .levels()
+            .any(|level| level.centroids.compressed().is_some());
+    if has_compressed
+        && (!query.routing_norm().is_finite() || query.widened().iter().any(|x| !x.is_finite()))
+    {
+        let candidates: Vec<_> = (0..count)
+            .map(|row| Candidate {
+                node: ClusterId::from(row),
+                sim: Similarity::new(0.0),
+            })
+            .collect();
+        let result = rerank_exact(
+            level
+                .vectors
+                .raw()
+                .expect("final routing requires raw rows"),
+            query,
+            &candidates,
+            k,
+        );
+        let stats = StackedSearchStats {
+            leaf_exact_scored: count,
+            members_scored: count,
+            leaf_members_scored: if compressed { 0 } else { count },
+            ..Default::default()
+        };
+        return (result, stats, flat);
+    }
+    let context = ScoringQuery::new(query);
+    let policy = SearchPolicy {
+        aps: params.aps,
+        rerank_factor: params.rerank_factor,
+        min_fraction: if compressed {
+            params.min_beam_fraction
+        } else {
+            super::stacked::levels::PARENT_NPROBE_FRACTION
+        },
+    };
+    let (ranked, stats) = if flat {
+        rank_vectors(&level.vectors, &context, k, policy, OutputPrecision::Exact)
+    } else {
+        search(level, &context, k, policy, OutputPrecision::Exact)
+    };
+    (ranked, stats, flat)
 }
 
 /// Exact reads are grouped into contiguous selected runs. The heap stores
@@ -239,154 +402,158 @@ pub(crate) fn rerank_exact<S: VectorArena<Elem = f32>, T: VectorElement>(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::sync::Arc;
 
     use super::*;
+    use crate::schema::Metric;
+    use crate::vector::router::source::{EncodingContext, VectorSet, ROUTER_SEED};
+    use crate::vector::router::stacked::levels::InMemoryStore;
+    use crate::vector::storage::quantized::sign::SignVectors;
 
-    struct Source {
-        lists: usize,
-        scored: Cell<usize>,
-        best: Option<u32>,
-    }
-
-    impl LevelSource<()> for Source {
-        type ClusterId = u32;
-        type MemberId = u32;
-        fn list_count(&self) -> usize {
-            self.lists
+    fn lists(best: Option<usize>) -> StackedIvf<InMemoryStore> {
+        let mut members = vec![1.0; 40];
+        if let Some(best) = best {
+            members[best] = 0.0;
         }
-        fn member_count(&self) -> usize {
-            self.lists
-        }
-        fn score_centroids(&self, _: &(), out: &mut ScoreBuffer<u32>) {
-            out.candidates = (0..self.lists)
-                .map(|node| Candidate {
-                    node: node as u32,
-                    sim: Similarity::new(-(node as f32)),
-                })
-                .collect();
-        }
-        fn score_members(&self, list: u32, _: &(), out: &mut ScoreBuffer<u32>) {
-            self.scored.set(self.scored.get() + 1);
-            out.candidates.clear();
-            out.candidates.push(Candidate {
-                node: list,
-                sim: Similarity::new(if self.best == Some(list) { 100.0 } else { 1.0 }),
-            });
-        }
-    }
-
-    impl Hierarchy<()> for Source {
-        type Parent = Self;
-        fn parent(&self) -> Option<&Self> {
-            None
+        StackedIvf {
+            config: Default::default(),
+            parent: None,
+            offsets: (0..40).map(|i| (i, i + 1)).collect(),
+            centroids: InMemoryStore::new((0..40).map(|i| i as f32).collect(), 1),
+            vectors: InMemoryStore::new(members, 1),
         }
     }
 
     #[test]
     fn retention_does_not_change_list_request_and_aps_waits_for_full_heap() {
-        let source = Source {
-            lists: 40,
-            scored: Cell::new(0),
-            best: None,
+        let level = lists(None);
+        let base = VectorQuery::new(Metric::L2, Arc::new(vec![0.0]));
+        let query = ScoringQuery::new(&base);
+        let policy = SearchPolicy {
+            aps: false,
+            min_fraction: 0.25,
+            rerank_factor: 1,
         };
-        // Fixed k=1 selects ten lists. Changing retention alone preserves that.
+        let open = lists_to_open(40, 40, 1, policy.min_fraction);
+        let (lists, _) = rank_vectors(
+            &level.centroids,
+            &query,
+            open,
+            policy,
+            OutputPrecision::Exact,
+        );
+        assert_eq!(lists.len(), 10);
         for capacity in [1, 4, 40] {
-            let (_, stats) = search(&source, &(), 1, capacity, false, 0.25);
+            let (_, stats) = probe_clusters(&level, &query, lists.clone(), capacity, false);
             assert_eq!(stats.lists_scanned, 10);
         }
-        let (_, stats) = search(&source, &(), 1, 1, true, 0.25);
-        assert_eq!(stats.lists_scanned, 6); // first full list + five quiet lists
-        let (_, stats) = search(&source, &(), 1, 4, true, 0.25);
-        assert_eq!(stats.lists_scanned, 9); // four filling lists + five quiet lists
-        let (_, stats) = search(&source, &(), 1, 40, true, 0.25);
-        assert_eq!(stats.lists_scanned, 10); // never fills
-        source.scored.set(0);
-        assert!(search(&source, &(), 0, 0, true, 0.25)
-            .0
-            .into_unordered()
-            .is_empty());
-        assert_eq!(source.scored.get(), 0);
+        for (capacity, expected) in [(1, 6), (4, 9), (40, 10)] {
+            let (_, stats) = probe_clusters(&level, &query, lists.clone(), capacity, true);
+            assert_eq!(stats.lists_scanned, expected);
+        }
+        let (empty, stats) = search(&level, &query, 0, policy, OutputPrecision::Exact);
+        assert!(empty.is_empty());
+        assert_eq!(stats.members_scored, 0);
     }
 
     #[test]
     fn widening_selection_recovers_a_misranked_list_without_growing_retention() {
-        let source = Source {
-            lists: 40,
-            scored: Cell::new(0),
-            best: Some(11),
+        let level = lists(Some(11));
+        let base = VectorQuery::new(Metric::L2, Arc::new(vec![0.0]));
+        let query = ScoringQuery::new(&base);
+        let policy = SearchPolicy {
+            aps: false,
+            min_fraction: 0.25,
+            rerank_factor: 1,
         };
-        let (narrow, _) = search(&source, &(), 1, 1, false, 0.25);
-        let (wide, _) = search(&source, &(), 1, 1, false, 0.5);
-        let narrow = narrow.into_sorted();
-        let wide = wide.into_sorted();
+        let (narrow, _) = search(&level, &query, 1, policy, OutputPrecision::Exact);
+        let (wide, _) = search(
+            &level,
+            &query,
+            1,
+            SearchPolicy {
+                min_fraction: 0.5,
+                ..policy
+            },
+            OutputPrecision::Exact,
+        );
         assert_eq!(narrow.len(), 1);
         assert_eq!(wide.len(), 1);
         assert!(wide[0].sim > narrow[0].sim);
-        assert_eq!(wide[0].node, 11);
+        assert_eq!(wide[0].node.0, 11);
     }
 
     #[test]
-    fn probing_preserves_addressed_members_without_a_parent_or_shared_id_type() {
-        use crate::vector::write::RowAddress;
-
-        struct PostingLists;
-        impl LevelSource<()> for PostingLists {
-            type ClusterId = u32;
-            type MemberId = RowAddress;
-            fn list_count(&self) -> usize {
-                2
-            }
-            fn member_count(&self) -> usize {
-                4
-            }
-            fn score_centroids(&self, _: &(), out: &mut ScoreBuffer<u32>) {
-                out.candidates = vec![
-                    Candidate {
-                        node: 4,
-                        sim: Similarity::new(2.0),
-                    },
-                    Candidate {
-                        node: 6,
-                        sim: Similarity::new(3.0),
-                    },
-                ];
-            }
-            fn score_members(&self, list: u32, _: &(), out: &mut ScoreBuffer<RowAddress>) {
-                let members = match list {
-                    4 => [(10, 8.0), (11, 1.0)],
-                    6 => [(40, 2.0), (41, 9.0)],
-                    _ => unreachable!(),
-                };
-                out.candidates = members
-                    .into_iter()
-                    .map(|(row_id, score)| Candidate {
-                        node: RowAddress {
-                            segment_ord: 9,
-                            row_id,
-                        },
-                        sim: Similarity::new(score),
-                    })
-                    .collect();
-            }
-        }
-        let (lists, _) = rank_centroids(&PostingLists, &(), 2);
-        assert_eq!(lists.iter().map(|c| c.node).collect::<Vec<_>>(), [6, 4]);
-        let (members, stats) = probe_clusters(&PostingLists, &(), lists, 2, false);
-        let members = members.into_sorted();
-        assert_eq!(
-            members.iter().map(|c| c.node).collect::<Vec<_>>(),
-            [
-                RowAddress {
-                    segment_ord: 9,
-                    row_id: 41
-                },
-                RowAddress {
-                    segment_ord: 9,
-                    row_id: 10
-                },
-            ]
-        );
-        assert_eq!(stats.members_scored, 4);
+    fn mixed_levels_share_query_preparation_and_refine_available_banks() -> crate::Result<()> {
+        let dim = 8;
+        let context = Arc::new(EncodingContext::new(dim, ROUTER_SEED));
+        let encoded = |values: Vec<f32>| -> crate::Result<VectorSet<InMemoryStore>> {
+            let raw = InMemoryStore::new(values, dim);
+            Ok(VectorSet::Encoded {
+                codes: Arc::new(SignVectors::encode(&raw, dim, &context.rotation)?),
+                context: context.clone(),
+                raw: Some(Arc::new(raw)),
+            })
+        };
+        let raw_members: Vec<f32> = (0..8).flat_map(|i| vec![i as f32 * 0.25; dim]).collect();
+        let middle = VectorSet::Raw(Arc::new(InMemoryStore::new(
+            [0.125, 0.625, 1.125, 1.625]
+                .into_iter()
+                .flat_map(|x| vec![x; dim])
+                .collect(),
+            dim,
+        )));
+        let level = StackedIvf {
+            config: Default::default(),
+            parent: Some(Box::new(StackedIvf {
+                config: Default::default(),
+                parent: None,
+                offsets: vec![(0, 2), (2, 4)],
+                vectors: middle.clone(),
+                centroids: encoded(
+                    [0.375, 1.375]
+                        .into_iter()
+                        .flat_map(|x| vec![x; dim])
+                        .collect(),
+                )?,
+            })),
+            offsets: vec![(0, 2), (2, 4), (4, 6), (6, 8)],
+            centroids: middle,
+            vectors: encoded(raw_members.clone())?,
+        };
+        let base = VectorQuery::new(Metric::L2, Arc::new(vec![0.8; dim]));
+        let query = ScoringQuery::new(&base);
+        #[cfg(debug_assertions)]
+        quant::rotation::debug_reset_apply_count();
+        let policy = SearchPolicy {
+            aps: false,
+            min_fraction: 1.0,
+            rerank_factor: 4,
+        };
+        let (actual, stats) = search(&level, &query, 2, policy, OutputPrecision::Exact);
+        #[cfg(debug_assertions)]
+        assert_eq!(quant::rotation::debug_apply_count(), 1);
+        let mut expected: Vec<_> = raw_members
+            .chunks_exact(dim)
+            .enumerate()
+            .map(|(i, raw)| Candidate {
+                node: ClusterId::from(i),
+                sim: Metric::L2.similarity(base.widened(), raw),
+            })
+            .collect();
+        expected.sort_unstable_by(|a, b| b.cmp(a));
+        expected.truncate(2);
+        assert_eq!(actual, expected);
+        assert_eq!(stats.members_scored, 24); // all initial and refining scores
+        assert_eq!(stats.approximate_scored, 10); // two root vectors + eight final members
+        assert_eq!(stats.leaf_approximate_scored, 8);
+        assert_eq!(stats.leaf_exact_scored, 8);
+        assert_eq!(stats.lists_scanned, 6); // two parent lists + four child lists
+        let router = super::super::stacked::StackedRouter::new(
+            level,
+            &crate::schema::VectorOptions::new(dim, Metric::L2),
+        )?;
+        assert!(router.serialize(&mut Vec::new()).is_err());
+        Ok(())
     }
 }

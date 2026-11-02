@@ -26,10 +26,14 @@ use crate::directory::FileSlice;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
 use crate::vector::router::arena::{FileSliceArena, VectorArena};
+#[cfg(any(test, feature = "unstable"))]
 use crate::vector::router::candidate::Candidate;
 #[cfg(any(test, feature = "unstable"))]
 use crate::vector::search::prepared::VectorQuery;
 use crate::vector::VectorElement;
+
+/// List count and member-row ranges for one persisted level.
+pub(crate) type LevelTopology = (usize, Vec<(u64, u64)>);
 
 /// Row index into a level's centroid or member arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -310,7 +314,7 @@ impl VectorArena for LazyStore {
     }
 }
 
-trait SerializableStore {
+pub(crate) trait SerializableStore {
     fn len(&self) -> usize;
     fn serialize_rows<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()>;
 }
@@ -341,7 +345,7 @@ impl SerializableStore for LazyStore {
     }
 }
 
-fn serialize_stacked_index<S, W>(index: &StackedIvf<S>, out: &mut W) -> io::Result<()>
+pub(crate) fn serialize_stacked_index<S, W>(index: &StackedIvf<S>, out: &mut W) -> io::Result<()>
 where
     S: SerializableStore,
     W: Write + ?Sized,
@@ -369,12 +373,18 @@ pub struct StackedSearchStats {
     pub lists_scanned: usize,
     /// Similarity computations at any level: rows in scanned lists plus
     /// the top level's brute-force centroid ranking. A parent's members
-    /// are this level's centroids, so this is the total query cost.
+    /// are this level's centroids. Includes optional exact refinement.
     pub members_scored: usize,
     /// Members scored at the level where search was invoked, excluding parent
     /// traversal and the root's centroid ranking. This is the input to the
     /// output heap, and therefore the denominator for final shortlist pruning.
     pub leaf_members_scored: usize,
+    /// Initial estimated scores across the whole invocation, including parents.
+    pub approximate_scored: usize,
+    /// Initial estimated member scores only at the requested level.
+    pub leaf_approximate_scored: usize,
+    /// Exact member evaluations at the requested level, including refinement.
+    pub leaf_exact_scored: usize,
 }
 
 /// Counting sort into list order. `perm[old] = new_row`.
@@ -637,7 +647,7 @@ impl StackedIvf<InMemoryStore> {
 pub(crate) fn read_level_topology<B: AsRef<[u8]>>(
     num_levels: usize,
     mut read: impl FnMut(usize) -> io::Result<B>,
-) -> io::Result<Vec<(usize, Vec<(u64, u64)>)>> {
+) -> io::Result<Vec<LevelTopology>> {
     if num_levels == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -669,7 +679,7 @@ pub(crate) fn read_level_topology<B: AsRef<[u8]>>(
     Ok(topology)
 }
 
-fn parse_level_topology(mut topology: &[u8]) -> io::Result<Vec<(usize, Vec<(u64, u64)>)>> {
+fn parse_level_topology(mut topology: &[u8]) -> io::Result<Vec<LevelTopology>> {
     let num_levels = u32::deserialize(&mut topology)? as usize;
     let levels = read_level_topology(num_levels, |len| {
         if len > topology.len() {
@@ -692,6 +702,33 @@ fn parse_level_topology(mut topology: &[u8]) -> io::Result<Vec<(usize, Vec<(u64,
 }
 
 impl<S> StackedIvf<S> {
+    /// Consume the hierarchy as one member bank followed by each centroid bank.
+    /// Parent member copies are redundant with their child's centroid bank.
+    pub(crate) fn into_vector_sets(self) -> (StackedIvfConfig, Vec<LevelTopology>, Vec<S>) {
+        let Self {
+            config,
+            parent,
+            offsets,
+            centroids,
+            vectors,
+        } = self;
+        let mut topology = vec![(offsets.len(), offsets)];
+        let mut sets = vec![vectors, centroids];
+        let mut next = parent;
+        while let Some(level) = next {
+            let Self {
+                parent,
+                offsets,
+                centroids,
+                ..
+            } = *level;
+            topology.push((offsets.len(), offsets));
+            sets.push(centroids);
+            next = parent;
+        }
+        (config, topology, sets)
+    }
+
     pub(crate) fn levels(&self) -> impl Iterator<Item = &Self> {
         std::iter::successors(Some(self), |level| level.parent.as_deref())
     }
@@ -726,7 +763,7 @@ impl<S> StackedIvf<S> {
     /// One member set followed by one centroid set per level. A parent's
     /// members reuse its child's centroid set, regardless of representation.
     pub(crate) fn from_vector_sets(
-        topology: Vec<(usize, Vec<(u64, u64)>)>,
+        topology: Vec<LevelTopology>,
         sets: Vec<S>,
         config: StackedIvfConfig,
         rows: impl Fn(&S) -> usize,
@@ -934,83 +971,17 @@ where S: VectorArena<Elem = f32>
         query: &VectorQuery<T>,
         k: usize,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-        let (selected, stats) =
-            crate::vector::router::search::search(self, query, k, k, true, PARENT_NPROBE_FRACTION);
-        (selected.into_sorted(), stats)
-    }
-}
-
-impl<S, Q> crate::vector::router::search::LevelSource<Q> for StackedIvf<S>
-where S: crate::vector::router::arena::VectorScorer<Q>
-{
-    type ClusterId = ClusterId;
-    type MemberId = ClusterId;
-
-    fn list_count(&self) -> usize {
-        self.offsets.len()
-    }
-    fn member_count(&self) -> usize {
-        self.offsets
-            .iter()
-            .map(|&(start, end)| (end - start) as usize)
-            .sum()
-    }
-
-    fn score_centroids(
-        &self,
-        query: &Q,
-        out: &mut crate::vector::router::search::ScoreBuffer<ClusterId>,
-    ) {
-        self.centroids.score_rows(
-            query,
-            0..self.offsets.len(),
-            &mut out.similarities,
-            &mut out.estimates,
-        );
-        out.candidates.clear();
-        out.candidates.extend(
-            out.similarities
-                .iter()
-                .enumerate()
-                .map(|(row, &sim)| Candidate {
-                    sim,
-                    node: ClusterId(row as u32),
-                }),
-        );
-    }
-
-    fn score_members(
-        &self,
-        list: ClusterId,
-        query: &Q,
-        out: &mut crate::vector::router::search::ScoreBuffer<ClusterId>,
-    ) {
-        let (start, end) = self.offsets[usize::from(list)];
-        self.vectors.score_rows(
-            query,
-            start as usize..end as usize,
-            &mut out.similarities,
-            &mut out.estimates,
-        );
-        out.candidates.clear();
-        out.candidates.extend(
-            out.similarities
-                .iter()
-                .enumerate()
-                .map(|(row, &sim)| Candidate {
-                    sim,
-                    node: ClusterId(start as u32 + row as u32),
-                }),
-        );
-    }
-}
-
-impl<S, Q> crate::vector::router::search::Hierarchy<Q> for StackedIvf<S>
-where S: crate::vector::router::arena::VectorScorer<Q>
-{
-    type Parent = Self;
-    fn parent(&self) -> Option<&Self> {
-        self.parent.as_deref()
+        crate::vector::router::search::search(
+            self,
+            &crate::vector::router::scoring::ScoringQuery::new(query),
+            k,
+            crate::vector::router::search::SearchPolicy {
+                aps: true,
+                min_fraction: PARENT_NPROBE_FRACTION,
+                rerank_factor: 1,
+            },
+            crate::vector::router::search::OutputPrecision::Exact,
+        )
     }
 }
 

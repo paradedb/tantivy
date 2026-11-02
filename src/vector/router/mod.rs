@@ -11,7 +11,7 @@ use crate::directory::FileSlice;
 use crate::schema::VectorOptions;
 use crate::vector::clustering::IvfCentroids;
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::stacked::levels::{InMemoryStore, LazyStore, StackedIvf};
+use crate::vector::router::stacked::levels::{ClusterId, InMemoryStore, LazyStore};
 use crate::vector::search::prepared::VectorQuery;
 use crate::vector::VectorElement;
 use crate::TantivyError;
@@ -21,11 +21,14 @@ pub(crate) mod candidate;
 mod exact;
 pub(crate) mod global;
 mod quantized;
+mod scoring;
 mod search;
+mod source;
 pub(crate) mod stacked;
 
-/// The routing structure new IVF segments build. Codes are persisted; 0 belonged to the removed
-/// graph router and is never reused.
+/// Build/format compatibility identifiers. Both stacked formats open into the
+/// same runtime algorithm; quantization is a vector representation. Code 0 belonged
+/// to the removed graph router and is never reused.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RouterKind {
@@ -59,11 +62,13 @@ impl RouterKind {
         centroids: &mut IvfCentroids,
     ) -> crate::Result<BuiltRouter> {
         match self {
-            Self::Stacked => Ok(Router::Stacked(stacked::build(options, centroids)?)),
+            Self::Stacked => Ok(Router::Stacked(stacked::StackedRouter::build(
+                options, centroids, false,
+            )?)),
             Self::Exact => Ok(Router::Exact(exact::build(options, centroids))),
-            Self::QuantizedStacked => Ok(Router::QuantizedStacked(
-                quantized::QuantizedRouter::build(options, centroids)?,
-            )),
+            Self::QuantizedStacked => Ok(Router::Stacked(stacked::StackedRouter::build(
+                options, centroids, true,
+            )?)),
         }
     }
 
@@ -85,11 +90,13 @@ impl RouterKind {
         let persisted = Self::from_code(slot.read_byte(0)?)?;
         let payload = slot.slice_from(1);
         match persisted {
-            Self::Stacked => Ok(Router::Stacked(stacked::open(payload, centroids, options)?)),
+            Self::Stacked => Ok(Router::Stacked(stacked::StackedRouter::open_raw(
+                payload, centroids, options,
+            )?)),
             Self::Exact => Ok(Router::Exact(exact::open(payload, centroids, options)?)),
-            Self::QuantizedStacked => Ok(Router::QuantizedStacked(
-                quantized::QuantizedRouter::open(payload, centroids, options)?,
-            )),
+            Self::QuantizedStacked => Ok(Router::Stacked(quantized::open(
+                payload, centroids, options,
+            )?)),
         }
     }
 }
@@ -104,10 +111,9 @@ impl fmt::Display for RouterKind {
     }
 }
 
-pub(crate) enum Router<S: crate::vector::router::arena::VectorArena<Elem = f32>> {
-    Stacked(StackedIvf<S>),
+pub(crate) enum Router<S> {
+    Stacked(stacked::StackedRouter<S>),
     Exact(exact::ExactRouter<S>),
-    QuantizedStacked(quantized::QuantizedRouter<S>),
 }
 
 pub(crate) type BuiltRouter = Router<InMemoryStore>;
@@ -116,18 +122,16 @@ pub(crate) type OpenedRouter = Router<LazyStore>;
 impl BuiltRouter {
     pub(crate) fn kind(&self) -> RouterKind {
         match self {
-            Self::Stacked(_) => RouterKind::Stacked,
+            Self::Stacked(router) => router.kind(),
             Self::Exact(_) => RouterKind::Exact,
-            Self::QuantizedStacked(_) => RouterKind::QuantizedStacked,
         }
     }
 
     pub(crate) fn serialize<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
         (self.kind() as u8).serialize(out)?;
         match self {
-            Self::Stacked(router) => router.serialize_router_payload(out),
+            Self::Stacked(router) => router.serialize(out),
             Self::Exact(router) => router.serialize_payload(out),
-            Self::QuantizedStacked(router) => router.serialize(out),
         }
     }
 }
@@ -160,51 +164,40 @@ impl Default for RoutingParams {
     }
 }
 
-pub(crate) enum RouterIter {
-    Global(RouterMetrics),
-    #[cfg(test)]
-    Explicit(std::vec::IntoIter<Candidate>),
-    Stacked(stacked::Ranking),
-    Exact(exact::Ranking),
-    QuantizedStacked(quantized::Ranking),
+/// Owned routing output; its producer's algorithm and representation do not
+/// change the iteration contract or require a distinct result type.
+pub(crate) struct RouterIter {
+    ranked: std::vec::IntoIter<Candidate<ClusterId>>,
+    metrics: RouterMetrics,
 }
 
 impl RouterIter {
-    pub(crate) fn metrics(&self) -> RouterMetrics {
-        match self {
-            Self::Global(metrics) => *metrics,
-            #[cfg(test)]
-            Self::Explicit(_) => RouterMetrics::Exact { visited_count: 0 },
-            Self::Stacked(ranking) => ranking.metrics(),
-            Self::QuantizedStacked(ranking) => ranking.metrics(),
-            Self::Exact(ranking) => RouterMetrics::Exact {
-                visited_count: ranking.visited_count(),
-            },
+    pub(crate) fn new(ranked: Vec<Candidate<ClusterId>>, metrics: RouterMetrics) -> Self {
+        Self {
+            ranked: ranked.into_iter(),
+            metrics,
         }
+    }
+    pub(crate) fn metrics(&self) -> RouterMetrics {
+        self.metrics
     }
 }
 
 impl Iterator for RouterIter {
     type Item = Candidate;
-
     fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Global(_) => None,
-            #[cfg(test)]
-            Self::Explicit(ranking) => ranking.next(),
-            Self::Stacked(ranking) => ranking.next(),
-            Self::Exact(ranking) => ranking.next(),
-            Self::QuantizedStacked(ranking) => ranking.next(),
-        }
+        self.ranked.next().map(|candidate| Candidate {
+            node: candidate.node.0,
+            sim: candidate.sim,
+        })
     }
 }
 
 impl OpenedRouter {
     pub(crate) fn kind(&self) -> RouterKind {
         match self {
-            Self::Stacked(_) => RouterKind::Stacked,
+            Self::Stacked(router) => router.kind(),
             Self::Exact(_) => RouterKind::Exact,
-            Self::QuantizedStacked(_) => RouterKind::QuantizedStacked,
         }
     }
 
@@ -212,17 +205,8 @@ impl OpenedRouter {
     /// centroids) to top. The exact router has no levels.
     pub(crate) fn level_sizes(&self) -> Vec<usize> {
         match self {
-            Self::Stacked(router) => {
-                let mut sizes = Vec::new();
-                let mut level = Some(router);
-                while let Some(current) = level {
-                    sizes.push(current.nlist());
-                    level = current.parent.as_deref();
-                }
-                sizes
-            }
+            Self::Stacked(router) => router.level_sizes(),
             Self::Exact(_) => Vec::new(),
-            Self::QuantizedStacked(router) => router.level_sizes(),
         }
     }
 
@@ -232,11 +216,8 @@ impl OpenedRouter {
         params: RoutingParams,
     ) -> RouterIter {
         match self {
-            Self::Stacked(router) => RouterIter::Stacked(stacked::rank(router, query, params)),
-            Self::Exact(router) => RouterIter::Exact(router.rank(query)),
-            Self::QuantizedStacked(router) => {
-                RouterIter::QuantizedStacked(router.rank(query, params))
-            }
+            Self::Stacked(router) => router.rank(query, params),
+            Self::Exact(router) => router.rank(query),
         }
     }
 }
@@ -298,9 +279,17 @@ pub(crate) fn with_test_clusters<T>(clusters: Vec<Candidate>, scan: impl FnOnce(
 #[cfg(test)]
 pub(crate) fn test_clusters() -> Option<RouterIter> {
     TEST_CLUSTERS.with(|slot| {
-        slot.borrow()
-            .clone()
-            .map(|rows| RouterIter::Explicit(rows.into_iter()))
+        slot.borrow().clone().map(|rows| {
+            RouterIter::new(
+                rows.into_iter()
+                    .map(|c| Candidate {
+                        node: ClusterId(c.node),
+                        sim: c.sim,
+                    })
+                    .collect(),
+                RouterMetrics::Exact { visited_count: 0 },
+            )
+        })
     })
 }
 

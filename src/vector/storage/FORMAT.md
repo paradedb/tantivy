@@ -535,8 +535,12 @@ and 2 layouts and the outer `.centroids` version remain unchanged. Older readers
 reject kind 3 as an incompatible router. New readers support mixed router kinds
 across segments. The configured kind affects future builds, not existing files.
 
-Full-precision and quantized routers share the hierarchy, topology codec, and
-range validation. Their outer framing and vector representations differ.
+Both stacked formats open into the same stacked search implementation. Router
+kind is a build/format compatibility identifier; quantization is a vector-bank
+representation. Each bank exposes raw vectors, encoded vectors, or both, while
+scoring, retention, APS, and exact refinement remain separate operations. Runtime
+banks may mix representations, but existing formats only persist their original
+raw-only or encoded-hierarchy layouts.
 
 Kind 3 payload version 1 uses little-endian scalars:
 
@@ -587,8 +591,10 @@ row order. The centroid set's row count must equal the level's list count.
 Full-precision posting-list centroids remain in `.centroids` slot 0, in exactly
 the same canonical row order as vector set 0; the router payload does not copy
 them. Internal router raw vectors are not required by this final-rerank-only
-policy. Opening validates topology, counts, framing, metric, dimension, sidecars,
-and code padding, then pins the compact arrays. Raw posting-list centroid rows
+policy. Opening validates topology, counts, framing, metric, and dimension.
+Code padding and sidecars are checked as their selected rows are consumed.
+All encoded banks share one zero-origin rotation context, and its query is
+prepared lazily once per routing invocation. Raw posting-list centroid rows
 stay file-backed and are fetched only for the final retained candidates.
 
 Query-time list sizing still uses the original `router_k`. The approximate heap

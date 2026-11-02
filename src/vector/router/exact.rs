@@ -9,7 +9,8 @@ use crate::schema::{Metric, VectorOptions};
 use crate::vector::clustering::IvfCentroids;
 use crate::vector::router::arena::VectorArena;
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::stacked::levels::{InMemoryStore, LazyStore};
+use crate::vector::router::stacked::levels::{ClusterId, InMemoryStore, LazyStore};
+use crate::vector::router::{RouterIter, RouterMetrics};
 use crate::vector::search::prepared::VectorQuery;
 use crate::vector::VectorElement;
 
@@ -21,7 +22,7 @@ pub(crate) struct ExactRouter<S> {
 }
 
 impl<S: VectorArena<Elem = f32>> ExactRouter<S> {
-    pub(super) fn rank<T: VectorElement>(&self, query: &VectorQuery<T>) -> Ranking {
+    pub(super) fn rank<T: VectorElement>(&self, query: &VectorQuery<T>) -> RouterIter {
         assert_eq!(query.widened().len(), self.dim);
         debug_assert_eq!(query.metric(), self.metric);
         let mut scores = Vec::with_capacity(self.num_centroids);
@@ -37,14 +38,16 @@ impl<S: VectorArena<Elem = f32>> ExactRouter<S> {
             .enumerate()
             .map(|(cluster, sim)| Candidate {
                 sim,
-                node: cluster as u32,
+                node: ClusterId::from(cluster),
             })
             .collect::<Vec<_>>();
         ranked.sort_unstable_by(|a, b| b.cmp(a));
-        Ranking {
-            ranked: ranked.into_iter(),
-            visited_count: self.num_centroids,
-        }
+        RouterIter::new(
+            ranked,
+            RouterMetrics::Exact {
+                visited_count: self.num_centroids,
+            },
+        )
     }
 
     pub(super) fn serialize_payload<W: Write + ?Sized>(&self, _out: &mut W) -> io::Result<()> {
@@ -87,25 +90,6 @@ pub(super) fn open(
         dim: options.dim(),
         metric: options.metric(),
     })
-}
-
-pub(crate) struct Ranking {
-    ranked: std::vec::IntoIter<Candidate>,
-    visited_count: usize,
-}
-
-impl Ranking {
-    pub(super) fn visited_count(&self) -> usize {
-        self.visited_count
-    }
-}
-
-impl Iterator for Ranking {
-    type Item = Candidate;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.ranked.next()
-    }
 }
 
 #[cfg(test)]

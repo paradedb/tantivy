@@ -1,17 +1,14 @@
-//! Persisted one-bit vector rows and their scalar distance estimator. No search
-//! policy lives here: codes can score centroids or members at any level.
+//! Persisted one-bit vector rows and their scalar sidecars. Reads expose and
+//! validate representations without query preparation or scoring policy.
 
 use std::io::{self, Write};
 use std::ops::Range;
 
-use common::{BinarySerializable, HasLen};
-use quant::cascade::{LayerKind, LayerSpec, QueryRotationPlan, Rotation};
+use common::{BinarySerializable, HasLen, OwnedBytes};
+use quant::cascade::QueryRotationPlan;
 use quant::sign::encode_unbiased;
 
 use crate::directory::FileSlice;
-use crate::schema::Metric;
-use crate::vector::distance::Similarity;
-use crate::vector::search::prepared::QuantizedVectorQuery;
 
 /// The format fixes zero centering, a seeded orthogonal rotation, and the
 /// asymmetric sign estimator. Raw vectors are kept separately for exact reads.
@@ -91,124 +88,52 @@ impl SignVectors {
         self.rows
     }
 
-    pub(crate) fn score(
-        &self,
-        rows: Range<usize>,
-        query: &QuantizedVectorQuery,
-        out: &mut Vec<Similarity>,
-        scratch: &mut Vec<f32>,
-    ) {
-        self.try_score(rows, query, out, scratch)
-            .expect("failed to read quantized vector rows");
-    }
-
-    fn try_score(
-        &self,
-        rows: Range<usize>,
-        query: &QuantizedVectorQuery,
-        out: &mut Vec<Similarity>,
-        scratch: &mut Vec<f32>,
-    ) -> io::Result<()> {
+    /// Pins only the selected code and sidecar ranges. Validation is deferred
+    /// until those rows are read; no query or search policy is needed here.
+    pub(crate) fn read(&self, rows: Range<usize>) -> io::Result<SignBatch<'_>> {
         assert!(rows.start <= rows.end && rows.end <= self.rows);
-        out.clear();
-        scratch.clear();
         if rows.is_empty() {
-            return Ok(());
+            return Ok(SignBatch::Borrowed {
+                codes: &[],
+                coefficients: &[],
+                norms: &[],
+            });
         }
         let words = self.dim.div_ceil(64);
-        match &self.storage {
+        let batch = match &self.storage {
             SignStorage::Owned {
                 codes,
                 coefficients,
                 norms_squared,
-            } => self.score_codes(
-                rows.clone(),
-                &codes[rows.start * words * 8..rows.end * words * 8],
-                query,
-                out,
-                scratch,
-                |i| (coefficients[rows.start + i], norms_squared[rows.start + i]),
-            ),
+            } => SignBatch::Borrowed {
+                codes: &codes[rows.start * words * 8..rows.end * words * 8],
+                coefficients: &coefficients[rows.clone()],
+                norms: &norms_squared[rows.clone()],
+            },
             SignStorage::File {
                 codes,
                 coefficients,
                 norms_squared,
-            } => {
-                let codes = codes
+            } => SignBatch::Pinned {
+                codes: codes
                     .slice(rows.start * words * 8..rows.end * words * 8)
-                    .read_bytes()?;
-                let coefficients = coefficients
+                    .read_bytes()?,
+                coefficients: coefficients
                     .slice(rows.start * 4..rows.end * 4)
-                    .read_bytes()?;
-                let norms = norms_squared
+                    .read_bytes()?,
+                norms: norms_squared
                     .slice(rows.start * 4..rows.end * 4)
-                    .read_bytes()?;
-                self.score_codes(rows, &codes, query, out, scratch, |i| {
-                    let at = i * 4;
-                    (
-                        f32::from_le_bytes(coefficients[at..at + 4].try_into().unwrap()),
-                        f32::from_le_bytes(norms[at..at + 4].try_into().unwrap()),
-                    )
-                })
-            }
-        }
-    }
-
-    fn score_codes(
-        &self,
-        rows: Range<usize>,
-        codes: &[u8],
-        query: &QuantizedVectorQuery,
-        out: &mut Vec<Similarity>,
-        scratch: &mut Vec<f32>,
-        sidecars: impl Fn(usize) -> (f32, f32),
-    ) -> io::Result<()> {
-        let words = self.dim.div_ceil(64);
+                    .read_bytes()?,
+            },
+        };
         if self.dim % 64 != 0
-            && codes.chunks_exact(words * 8).any(|row| {
-                !crate::vector::quantization::quantized_code_tail_is_zero(row, self.dim, 1)
+            && batch.codes().chunks_exact(words * 8).any(|code| {
+                !crate::vector::quantization::quantized_code_tail_is_zero(code, self.dim, 1)
             })
         {
             return Err(invalid("nonzero sign-code tail padding"));
         }
-        scratch.resize(rows.len(), 0.0);
-        query.codes.score_layer_batch_unscaled(
-            0,
-            codes,
-            words * 8,
-            LayerSpec {
-                kind: LayerKind::Sign,
-                bits: 1,
-                rotation: Rotation::None,
-            },
-            scratch,
-        );
-        for (i, &estimate) in scratch.iter().enumerate() {
-            let (coefficient, norm_squared) = sidecars(i);
-            if !coefficient.is_finite()
-                || coefficient < 0.0
-                || !norm_squared.is_finite()
-                || norm_squared < 0.0
-                || (coefficient == 0.0) != (norm_squared == 0.0)
-            {
-                return Err(invalid("invalid sign-vector sidecars"));
-            }
-            let dot = estimate * coefficient;
-            let score = match query.metric {
-                Metric::L2 => -(query.norm_squared + norm_squared - 2.0 * dot),
-                Metric::Dot => dot,
-                Metric::Cosine => {
-                    let denominator = query.norm * norm_squared.sqrt();
-                    if denominator == 0.0 {
-                        0.0
-                    } else {
-                        dot / denominator
-                    }
-                }
-            };
-            out.push(Similarity::new(score));
-        }
-        Ok(())
+        Ok(batch)
     }
 
     /// Columnar, fixed-stride representation. The containing format supplies
@@ -277,12 +202,66 @@ impl SignVectors {
     }
 }
 
+/// A representation batch, borrowing owned rows or pinning selected file bytes.
+pub(crate) enum SignBatch<'a> {
+    Borrowed {
+        codes: &'a [u8],
+        coefficients: &'a [f32],
+        norms: &'a [f32],
+    },
+    Pinned {
+        codes: OwnedBytes,
+        coefficients: OwnedBytes,
+        norms: OwnedBytes,
+    },
+}
+
+impl SignBatch<'_> {
+    pub(crate) fn codes(&self) -> &[u8] {
+        match self {
+            Self::Borrowed { codes, .. } => codes,
+            Self::Pinned { codes, .. } => codes,
+        }
+    }
+    /// Decode and validate the addressed sidecars when consumed, so scoring
+    /// need not traverse these columns a second time.
+    #[inline]
+    pub(crate) fn sidecar(&self, row: usize) -> io::Result<(f32, f32)> {
+        let (coefficient, norm) = match self {
+            Self::Borrowed {
+                coefficients,
+                norms,
+                ..
+            } => (coefficients[row], norms[row]),
+            Self::Pinned {
+                coefficients,
+                norms,
+                ..
+            } => {
+                let at = row * 4;
+                (
+                    f32::from_le_bytes(coefficients[at..at + 4].try_into().unwrap()),
+                    f32::from_le_bytes(norms[at..at + 4].try_into().unwrap()),
+                )
+            }
+        };
+        if !coefficient.is_finite()
+            || coefficient < 0.0
+            || !norm.is_finite()
+            || norm < 0.0
+            || (coefficient == 0.0) != (norm == 0.0)
+        {
+            return Err(invalid("invalid sign-vector sidecars"));
+        }
+        Ok((coefficient, norm))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use quant::cascade::{LayerKind, LayerSpec, Rotation};
 
     use super::*;
-    use crate::vector::search::prepared::VectorQuery;
 
     fn rotation_plan(dim: usize, seed: u64) -> QueryRotationPlan {
         QueryRotationPlan::new(
@@ -304,15 +283,11 @@ mod tests {
         let mut bytes = Vec::new();
         vectors.serialize(&mut bytes)?;
         let opened = SignVectors::open(&mut FileSlice::from(bytes.clone()), dim)?;
-        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
-            let query = VectorQuery::new(metric, Arc::new(values[..dim].to_vec()));
-            let query = QuantizedVectorQuery::for_sign(&query, &rotation);
-            let mut before = Vec::new();
-            let mut after = Vec::new();
-            vectors.score(0..3, &query, &mut before, &mut Vec::new());
-            opened.score(0..3, &query, &mut after, &mut Vec::new());
-            assert_eq!(before, after);
-            assert!(after.iter().all(|c| c.score().is_finite()));
+        let before = vectors.read(0..3)?;
+        let after = opened.read(0..3)?;
+        assert_eq!(before.codes(), after.codes());
+        for i in 0..3 {
+            assert_eq!(before.sidecar(i)?, after.sidecar(i)?);
         }
         for end in 0..bytes.len() {
             assert!(SignVectors::open(&mut FileSlice::from(bytes[..end].to_vec()), dim).is_err());
@@ -320,37 +295,23 @@ mod tests {
         let mut bad_tail = bytes.clone();
         bad_tail[4 + 8 + 7] |= 0x80;
         let corrupt = SignVectors::open(&mut FileSlice::from(bad_tail), dim)?;
-        let query = QuantizedVectorQuery::for_sign(
-            &VectorQuery::new(Metric::Dot, Arc::new(values[..dim].to_vec())),
-            &rotation,
-        );
-        let mut scores = Vec::new();
-        // Invalid bytes outside the selected range are not read or validated.
-        corrupt.try_score(1..3, &query, &mut scores, &mut Vec::new())?;
-        assert!(corrupt
-            .try_score(0..1, &query, &mut scores, &mut Vec::new())
-            .is_err());
+        corrupt.read(1..3)?;
+        assert!(corrupt.read(0..1).is_err());
         let scales_start = 4 + 3 * dim.div_ceil(64) * 8;
         bytes[scales_start..scales_start + 4].copy_from_slice(&f32::NAN.to_le_bytes());
         let corrupt = SignVectors::open(&mut FileSlice::from(bytes), dim)?;
-        corrupt.try_score(1..3, &query, &mut scores, &mut Vec::new())?;
-        assert!(corrupt
-            .try_score(0..1, &query, &mut scores, &mut Vec::new())
-            .is_err());
+        corrupt.read(1..3)?.sidecar(0)?;
+        assert!(corrupt.read(0..1)?.sidecar(0).is_err());
         Ok(())
     }
 
     #[test]
-    fn zero_vectors_and_zero_queries_have_finite_estimates() -> io::Result<()> {
-        let rotation = rotation_plan(64, 17);
-        let vectors = SignVectors::encode(&vec![0.0; 128], 64, &rotation)?;
-        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
-            let query = VectorQuery::new(metric, Arc::new(vec![0.0; 64]));
-            let query = QuantizedVectorQuery::for_sign(&query, &rotation);
-            let mut out = Vec::new();
-            vectors.score(0..2, &query, &mut out, &mut Vec::new());
-            assert!(out.iter().all(|c| c.score() == 0.0));
-        }
+    fn zero_vector_storage_preserves_zero_codes_and_sidecars() -> io::Result<()> {
+        let vectors = SignVectors::encode(&vec![0.0; 128], 64, &rotation_plan(64, 17))?;
+        let batch = vectors.read(0..2)?;
+        assert!(batch.codes().iter().all(|&b| b == 0));
+        assert_eq!(batch.sidecar(0)?, (0.0, 0.0));
+        assert_eq!(batch.sidecar(1)?, (0.0, 0.0));
         Ok(())
     }
 }
