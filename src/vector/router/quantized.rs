@@ -292,25 +292,29 @@ mod tests {
         };
         let hierarchical = opened.rank(&query, params).collect::<Vec<_>>();
         reads.lock().unwrap().clear();
-        let flat = opened.rank(
-            &query,
-            RoutingParams {
-                flat: true,
-                ..params
+        // Exercise flat composition internally without a production search flag.
+        let (flat, stats) = search::rank_vectors(
+            &opened.level.vectors,
+            &ScoringQuery::new(&query),
+            params.k,
+            SearchPolicy {
+                aps: false,
+                min_fraction: params.min_beam_fraction,
+                rerank_factor: params.rerank_factor,
             },
+            OutputPrecision::Exact,
         );
-        assert!(matches!(
-            flat.metrics(),
-            RouterMetrics::QuantizedStacked {
-                flat: true,
-                lists_scanned: 0,
-                approximate_scored: 96,
-                approximate_members_scored: 96,
-                exact_scored: 6,
-                candidate_count: 3,
-            }
-        ));
-        assert_eq!(flat.collect::<Vec<_>>(), hierarchical);
+        assert_eq!(stats.lists_scanned, 0);
+        assert_eq!(stats.approximate_scored, 96);
+        assert_eq!(stats.leaf_exact_scored, 6);
+        let flat: Vec<_> = flat
+            .into_iter()
+            .map(|c| Candidate {
+                node: c.node.0,
+                sim: c.sim,
+            })
+            .collect();
+        assert_eq!(flat, hierarchical);
         assert_eq!(
             *reads.lock().unwrap(),
             vec![
@@ -611,42 +615,29 @@ mod tests {
                 let filter = fixture.filter("third");
                 for filter in [&AllQuery as &dyn crate::query::Query, &filter] {
                     let expected = fixture.oracle(filter, &query, 7)?;
-                    for flat in [false, true] {
-                        let actual = fixture.search(
-                            filter,
-                            &query,
-                            7,
-                            ProbeParams {
-                                router_flat: flat,
-                                ..params.clone()
-                            },
-                        )?;
+                    let actual = fixture.search(filter, &query, 7, params.clone())?;
+                    assert_eq!(
+                        actual.results, expected,
+                        "{metric:?}, schedule {schedule:?}"
+                    );
+                    assert!(actual.stats.iter().any(|stats| matches!(
+                        stats.routing,
+                        Some(RouterMetrics::QuantizedStacked { .. })
+                    )));
+                    for stats in actual.stats.iter().filter(|stats| stats.routing.is_some()) {
+                        let json = serde_json::to_value(stats)?;
+                        assert_eq!(json["routing_kind"], "quantized_stacked");
+                        assert_eq!(json["routing_mode"], "hierarchical");
+                        let count = |key: &str| json[key].as_u64().unwrap();
+                        assert!(count("routing_approximate_scored") > 0);
                         assert_eq!(
-                            actual.results, expected,
-                            "{metric:?}, schedule {schedule:?}"
+                            count("routing_approximate_members_scored"),
+                            count("routing_approximate_pruned") + count("routing_exact_scored")
                         );
-                        assert!(actual.stats.iter().any(|stats| matches!(
-                            stats.routing,
-                            Some(RouterMetrics::QuantizedStacked { .. })
-                        )));
-                        for stats in actual.stats.iter().filter(|stats| stats.routing.is_some()) {
-                            let json = serde_json::to_value(stats)?;
-                            assert_eq!(json["routing_kind"], "quantized_stacked");
-                            assert_eq!(
-                                json["routing_mode"],
-                                if flat { "flat" } else { "hierarchical" }
-                            );
-                            let count = |key: &str| json[key].as_u64().unwrap();
-                            assert!(count("routing_approximate_scored") > 0);
-                            assert_eq!(
-                                count("routing_approximate_members_scored"),
-                                count("routing_approximate_pruned") + count("routing_exact_scored")
-                            );
-                            assert_eq!(
-                                count("routing_exact_scored"),
-                                count("routing_exact_pruned") + count("routing_candidate_count")
-                            );
-                        }
+                        assert_eq!(
+                            count("routing_exact_scored"),
+                            count("routing_exact_pruned") + count("routing_candidate_count")
+                        );
                     }
                 }
             }

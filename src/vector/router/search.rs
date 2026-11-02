@@ -300,13 +300,12 @@ pub(crate) fn lists_to_open(lists: usize, members: usize, k: usize, min_fraction
     requested.max(floor).min(lists).max(1)
 }
 
-/// Compose a final routing request. Flat scheduling and exceptional-query
-/// fallback use the same bank scoring/refinement operations as the level walk.
+/// Compose a hierarchical routing request, with exact fallback for exceptional queries.
 pub(crate) fn rank<S: VectorSource, T: VectorElement>(
     level: &StackedIvf<S>,
     query: &VectorQuery<T>,
     params: super::RoutingParams,
-) -> (Vec<Candidate<ClusterId>>, StackedSearchStats, bool) {
+) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
     let compressed = level.vectors.compressed().is_some();
     let count = level.vectors.num_vectors(query.widened().len());
     let k = if compressed {
@@ -314,9 +313,8 @@ pub(crate) fn rank<S: VectorSource, T: VectorElement>(
     } else {
         params.k.clamp(1, count.max(1))
     };
-    let flat = compressed && params.flat;
     if k == 0 {
-        return (Vec::new(), StackedSearchStats::default(), flat);
+        return (Vec::new(), StackedSearchStats::default());
     }
     let has_compressed = level.vectors.compressed().is_some()
         || level
@@ -346,7 +344,7 @@ pub(crate) fn rank<S: VectorSource, T: VectorElement>(
             leaf_members_scored: if compressed { 0 } else { count },
             ..Default::default()
         };
-        return (result, stats, flat);
+        return (result, stats);
     }
     let context = ScoringQuery::new(query);
     let policy = SearchPolicy {
@@ -358,12 +356,7 @@ pub(crate) fn rank<S: VectorSource, T: VectorElement>(
             super::stacked::levels::PARENT_NPROBE_FRACTION
         },
     };
-    let (ranked, stats) = if flat {
-        rank_vectors(&level.vectors, &context, k, policy, OutputPrecision::Exact)
-    } else {
-        search(level, &context, k, policy, OutputPrecision::Exact)
-    };
-    (ranked, stats, flat)
+    search(level, &context, k, policy, OutputPrecision::Exact)
 }
 
 /// Exact reads are grouped into contiguous selected runs. The heap stores

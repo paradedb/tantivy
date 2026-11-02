@@ -25,11 +25,8 @@ pub struct ProbeParams {
     pub router_rerank_factor: usize,
     /// Minimum fraction of each quantized router level's lists to open.
     /// Clamped to [0, 1]; non-finite values use 0.25. Full-precision routing
-    /// keeps its existing beam. Default 0.25.
+    /// keeps its existing beam. Default 0.5.
     pub router_min_beam_fraction: f32,
-    /// Rank all bottom-router codes as one batch, bypassing the hierarchy.
-    /// Only quantized routers read this flag. Default false.
-    pub router_flat: bool,
     /// Whether stacked routing may stop after lists cease improving its heap.
     /// Quantized routing observes its approximate padded heap. Default true.
     pub router_aps: bool,
@@ -85,7 +82,6 @@ impl Default for ProbeParams {
             max_probe_fraction: 0.01,
             router_rerank_factor: 2,
             router_min_beam_fraction: 0.5,
-            router_flat: false,
             router_aps: true,
             min_probe_clusters: 0,
             exact_plan: true,

@@ -246,11 +246,10 @@ pub(super) fn rank<S: VectorSource, T: VectorElement>(
     params: RoutingParams,
 ) -> RouterIter {
     let compressed = level.vectors.compressed().is_some();
-    let (ranked, stats, flat) = super::search::rank(level, query, params);
+    let (ranked, stats) = super::search::rank(level, query, params);
     let candidate_count = ranked.len();
     let metrics = if compressed {
         RouterMetrics::QuantizedStacked {
-            flat,
             candidate_count,
             lists_scanned: stats.lists_scanned,
             approximate_scored: stats.approximate_scored,

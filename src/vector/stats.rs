@@ -182,7 +182,6 @@ where S: serde::Serializer {
     let mut map = serializer.serialize_map(None)?;
     match routing {
         Some(RouterMetrics::QuantizedStacked {
-            flat,
             candidate_count,
             lists_scanned,
             approximate_scored,
@@ -190,7 +189,7 @@ where S: serde::Serializer {
             exact_scored,
         }) => {
             map.serialize_entry("routing_kind", "quantized_stacked")?;
-            map.serialize_entry("routing_mode", if *flat { "flat" } else { "hierarchical" })?;
+            map.serialize_entry("routing_mode", "hierarchical")?;
             map.serialize_entry("routing_lists_scanned", lists_scanned)?;
             map.serialize_entry("routing_approximate_scored", approximate_scored)?;
             map.serialize_entry(
@@ -684,7 +683,6 @@ mod tests {
     fn routing_funnel_is_flat_and_separates_parent_scores_from_member_pruning() {
         let stats = ProbeStats {
             routing: Some(RouterMetrics::QuantizedStacked {
-                flat: true,
                 candidate_count: 3,
                 lists_scanned: 4,
                 approximate_scored: 32,
@@ -695,7 +693,7 @@ mod tests {
         };
         let json = serde_json::to_value(&stats).unwrap();
         assert_eq!(json["routing_kind"], "quantized_stacked");
-        assert_eq!(json["routing_mode"], "flat");
+        assert_eq!(json["routing_mode"], "hierarchical");
         assert_eq!(json["routing_lists_scanned"], 4);
         assert_eq!(json["routing_approximate_scored"], 32);
         assert_eq!(json["routing_approximate_members_scored"], 24);
@@ -707,7 +705,6 @@ mod tests {
 
         let fallback = ProbeStats {
             routing: Some(RouterMetrics::QuantizedStacked {
-                flat: false,
                 candidate_count: 3,
                 lists_scanned: 0,
                 approximate_scored: 0,
