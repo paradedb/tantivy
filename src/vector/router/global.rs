@@ -156,6 +156,7 @@ mod tests {
             &[],
             &VectorQuery::new(Metric::L2, Arc::new([0.0].to_vec())),
             1,
+            None,
             &mut totals,
             &mut |_| {},
         );
@@ -164,6 +165,7 @@ mod tests {
             &partitions,
             &VectorQuery::new(Metric::L2, Arc::new([0.0].to_vec())),
             1,
+            None,
             &mut totals,
             &mut |_| {},
         );
@@ -204,6 +206,7 @@ mod tests {
             &partitions,
             &VectorQuery::new(Metric::L2, Arc::new([7000.0].to_vec())),
             1,
+            None,
             &mut totals,
             &mut |_| {},
         );
@@ -213,6 +216,7 @@ mod tests {
             &partitions,
             &VectorQuery::new(Metric::L2, Arc::new([0.0].to_vec())),
             usize::MAX,
+            None,
             &mut totals,
             &mut |_| {},
         );
@@ -240,6 +244,7 @@ mod tests {
                         &partitions,
                         &VectorQuery::new(Metric::L2, Arc::new(query.to_vec())),
                         1,
+                        None,
                         &mut totals,
                         &mut |_| {},
                     );
@@ -249,6 +254,7 @@ mod tests {
                         &partitions,
                         &VectorQuery::new(Metric::L2, Arc::new(query.to_vec())),
                         usize::MAX,
+                        None,
                         &mut totals,
                         &mut |_| {},
                     );
@@ -257,6 +263,7 @@ mod tests {
                         &[],
                         &VectorQuery::new(Metric::L2, Arc::new(query.to_vec())),
                         usize::MAX,
+                        None,
                         &mut totals,
                         &mut |_| {},
                     );
@@ -291,9 +298,17 @@ mod tests {
             let near = open_line_router(0.0, 4, near_nested)?;
             let routers = [Some(&far), None, Some(&near), Some(&exact)];
             let mut totals = vec![StageTotals::default(); routers.len()];
-            let ranked = GlobalRanking::from(&routers, &[], &query, 0, &mut totals, &mut |_| {});
-            let exhaustive =
-                GlobalRanking::from(&routers, &[], &query, usize::MAX, &mut totals, &mut |_| {});
+            let ranked =
+                GlobalRanking::from(&routers, &[], &query, 0, None, &mut totals, &mut |_| {});
+            let exhaustive = GlobalRanking::from(
+                &routers,
+                &[],
+                &query,
+                usize::MAX,
+                None,
+                &mut totals,
+                &mut |_| {},
+            );
             assert_eq!(
                 exhaustive.clusters.len(),
                 9,
@@ -311,15 +326,8 @@ mod tests {
             );
             let query = VectorQuery::new(Metric::L2, std::sync::Arc::new(vec![0.0]));
             for k in [1, 2, 4, 16] {
-                let all = GlobalRanking::from(
-                    &routers,
-                    &[],
-                    &query,
-                    k,
-                    None,
-                    &mut totals,
-                    &mut |_| {},
-                );
+                let all =
+                    GlobalRanking::from(&routers, &[], &query, k, None, &mut totals, &mut |_| {});
                 let bounded = GlobalRanking::from(
                     &routers,
                     &[],
@@ -425,7 +433,8 @@ mod tests {
             let near = open_line_router(0.0, 80, false)?;
             let routers = [Some(&far), Some(&near)];
             let mut totals = vec![StageTotals::default(); routers.len()];
-            let ranked = GlobalRanking::from(&routers, &[], &query, 1, &mut totals, &mut |_| {});
+            let ranked =
+                GlobalRanking::from(&routers, &[], &query, 1, None, &mut totals, &mut |_| {});
             assert_eq!(ranked.clusters.len(), 6);
             assert_eq!(ranked.clusters[0].0, 1);
             assert_eq!(ranked.clusters[0].1.node, 0);
@@ -435,8 +444,15 @@ mod tests {
                     candidate_count, lists_scanned, members_scored,
                 } if *candidate_count == expected && *lists_scanned == expected && *members_scored == 80 + expected));
             }
-            let exhaustive =
-                GlobalRanking::from(&routers, &[], &query, usize::MAX, &mut totals, &mut |_| {});
+            let exhaustive = GlobalRanking::from(
+                &routers,
+                &[],
+                &query,
+                usize::MAX,
+                None,
+                &mut totals,
+                &mut |_| {},
+            );
             assert_eq!(exhaustive.clusters.len(), 160);
         }
         Ok(())
