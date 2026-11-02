@@ -99,7 +99,25 @@ pub(super) fn rank<T: VectorElement>(
     // lists avoids the classic IVF boundary miss; capping the heap (and
     // thus `candidate_count`) is what ties the returned set to probe.
     let k = params.k.clamp(1, index.vectors.len().max(1));
-    let (ranked, stats) = index.search_prepared(query, k);
+    let ranking = search::StackedRouting::Segment(index).search_with_params(
+        query,
+        RoutingParams {
+            k,
+            rerank_factor: 1,
+            min_beam_fraction: PARENT_NPROBE_FRACTION,
+            ..params
+        },
+        search::TopK,
+    );
+    let stats = ranking.stats[0];
+    let ranked: Vec<_> = ranking
+        .candidates
+        .into_iter()
+        .map(|candidate| Candidate {
+            sim: candidate.sim,
+            node: ClusterId(candidate.node.1),
+        })
+        .collect();
     let candidate_count = ranked.len();
     Ranking {
         ranked: ranked.into_iter(),

@@ -1,6 +1,6 @@
 use super::candidate::Candidate;
 use super::stacked::search::{AllScored, StackedRouting};
-use super::{OpenedRouter, Router, RouterMetrics};
+use super::{OpenedRouter, Router, RouterMetrics, RoutingParams};
 use crate::vector::search::prepared::VectorQuery;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
 use crate::vector::{VectorElement, VectorStage};
@@ -13,6 +13,7 @@ pub(crate) struct GlobalRanking {
 }
 
 impl GlobalRanking {
+    #[cfg(test)]
     pub(crate) fn from<T: VectorElement>(
         routers: &[Option<&OpenedRouter>],
         partitions: &[Option<&[f32]>],
@@ -22,7 +23,32 @@ impl GlobalRanking {
         totals: &mut [StageTotals],
         on_segment: &mut impl FnMut(usize),
     ) -> Self {
+        Self::from_with_params(
+            routers,
+            partitions,
+            query,
+            RoutingParams {
+                k,
+                ..Default::default()
+            },
+            limit,
+            totals,
+            on_segment,
+        )
+    }
+
+    pub(crate) fn from_with_params<T: VectorElement>(
+        routers: &[Option<&OpenedRouter>],
+        partitions: &[Option<&[f32]>],
+        query: &VectorQuery<T>,
+        params: RoutingParams,
+        limit: Option<usize>,
+        totals: &mut [StageTotals],
+        on_segment: &mut impl FnMut(usize),
+    ) -> Self {
+        let k = params.k;
         let mut indexes = Vec::with_capacity(routers.len());
+        let mut quantized = Vec::with_capacity(routers.len());
         let mut leaves = Vec::new();
         let mut metrics = vec![
             RouterMetrics::Stacked {
@@ -33,6 +59,10 @@ impl GlobalRanking {
             routers.len()
         ];
         for (segment, router) in routers.iter().enumerate() {
+            quantized.push(match router {
+                Some(Router::QuantizedStacked(index)) => Some(index),
+                _ => None,
+            });
             let index = match router {
                 Some(Router::Stacked(index)) => Some(index),
                 Some(Router::Exact(index)) => {
@@ -48,9 +78,20 @@ impl GlobalRanking {
                     leaves.extend(ranked.into_iter().map(|c| (segment, c)));
                     None
                 }
-                None => None,
+                Some(Router::QuantizedStacked(_)) | None => None,
             };
             indexes.push(index);
+        }
+        if quantized.iter().any(Option::is_some) {
+            let ranking = super::quantized::rank_global(
+                quantized, partitions, query, params, totals, on_segment,
+            );
+            for (segment, router) in routers.iter().enumerate() {
+                if matches!(router, Some(Router::QuantizedStacked(_))) {
+                    metrics[segment] = ranking.metrics[segment];
+                }
+            }
+            leaves.extend(ranking.clusters);
         }
         let routing = StackedRouting::Global {
             indexes,
@@ -58,7 +99,16 @@ impl GlobalRanking {
             totals,
             on_segment,
         };
-        let ranking = routing.search(query, k.max(1), AllScored::default());
+        let ranking = routing.search_with_params(
+            query,
+            RoutingParams {
+                k: k.max(1),
+                rerank_factor: 1,
+                min_beam_fraction: super::stacked::levels::PARENT_NPROBE_FRACTION,
+                ..params
+            },
+            AllScored::default(),
+        );
         for (stats, metrics) in ranking.stats.iter().zip(&mut metrics) {
             if let RouterMetrics::Stacked {
                 lists_scanned,
@@ -88,8 +138,19 @@ impl GlobalRanking {
         if let Some(limit) = limit {
             leaves.truncate(limit.max(1));
         }
+        for metric in &mut metrics {
+            if let RouterMetrics::QuantizedStacked {
+                candidate_count, ..
+            } = metric
+            {
+                *candidate_count = 0;
+            }
+        }
         for (segment, _) in &leaves {
             if let RouterMetrics::Stacked {
+                candidate_count, ..
+            }
+            | RouterMetrics::QuantizedStacked {
                 candidate_count, ..
             } = &mut metrics[*segment]
             {

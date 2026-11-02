@@ -746,11 +746,17 @@ where
         .adaptive_probing
         .map(|adaptive| adaptive.admission_fraction())
         .is_some();
-    let ranking = GlobalRanking::from(
+    let ranking = GlobalRanking::from_with_params(
         &routers,
         partitions,
         first.query(),
-        k,
+        crate::vector::router::RoutingParams {
+            k,
+            rerank_factor: first.params().router_rerank_factor,
+            min_beam_fraction: first.params().router_min_beam_fraction,
+            aps: first.params().router_aps,
+            flat: first.params().router_flat,
+        },
         bounded.then_some(k),
         totals,
         on_segment,
@@ -1198,83 +1204,89 @@ mod ivf_e2e_tests {
         use crate::vector::VectorStage;
 
         for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
-            let fixture = FixtureSpec::clustered(metric, 128, 8, 768)
-                .segments(3)
-                .schedule(&[1, 1])
-                .label("matches", |i| i % 3 == 0)
-                .paged()
-                .build()?;
-            let searcher = fixture.index.reader()?.searcher();
-            let mut readers: Vec<_> = searcher
-                .segment_readers()
-                .iter()
-                .enumerate()
-                .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
-                .collect();
-            readers.reverse();
-            let mut query = vec![0.01; 128];
-            query[2] = 1.0;
-            for filter in [&AllQuery as &dyn Query, &fixture.filter("matches")] {
-                for (located, adaptive) in [
-                    (LocatedPath::Off, false),
-                    (LocatedPath::Auto, false),
-                    (LocatedPath::Off, true),
-                    (LocatedPath::Auto, true),
-                ] {
-                    let collector = TopDocs::with_limit(10)
-                        .order_by_similarity(fixture.field, query.clone())
-                        .with_probe_params(ProbeParams {
-                            located,
-                            exact_plan: false,
-                            adaptive_probing: adaptive.then_some(
-                                crate::vector::AdaptiveProbeParams {
-                                    effort: -2.0 * (1.0_f64 - 0.99999999).log10(),
-                                },
-                            ),
-                            ..exhaustive_params(8)
-                        })
-                        .build();
-                    let weight = fixture.weight(filter)?;
-                    fixture.clear_reads();
-                    let result = collector.merge_fruits(collector.collect_segments(
-                        weight.as_ref(),
-                        &readers,
-                        |_| {},
-                    )?)?;
-                    let reads = fixture.reads();
-                    let last_shortlist = reads
-                        .iter()
-                        .rposition(|(stage, _)| *stage == VectorStage::LayerScan(0))
-                        .expect("layer-0 reads");
-                    let first_refinement = reads
-                        .iter()
-                        .position(|(stage, _)| {
-                            matches!(
-                                stage,
-                                VectorStage::LayerScan(1)
-                                    | VectorStage::ExactScan
-                                    | VectorStage::ExactFetch
-                                    | VectorStage::ExactScore
-                            )
-                        })
-                        .expect("refinement reads");
-                    assert_eq!(first_refinement < last_shortlist, adaptive, "{located:?}");
-                    assert_eq!(result.results, fixture.oracle(filter, &query, 10)?);
-                    let mut refined = 0;
-                    for stats in &result.stats {
-                        let trace = &stats.quantized_trace;
-                        let rows: std::collections::HashSet<_> =
-                            trace.refined_topk_rows.iter().copied().collect();
-                        assert_eq!(rows.len(), trace.refined_topk_rows.len());
-                        assert!(trace
-                            .boundary_rows
+            for router in [
+                crate::vector::router::RouterKind::Stacked,
+                crate::vector::router::RouterKind::QuantizedStacked,
+            ] {
+                let fixture = FixtureSpec::clustered(metric, 128, 8, 768)
+                    .router(router)
+                    .segments(3)
+                    .schedule(&[1, 1])
+                    .label("matches", |i| i % 3 == 0)
+                    .paged()
+                    .build()?;
+                let searcher = fixture.index.reader()?.searcher();
+                let mut readers: Vec<_> = searcher
+                    .segment_readers()
+                    .iter()
+                    .enumerate()
+                    .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
+                    .collect();
+                readers.reverse();
+                let mut query = vec![0.01; 128];
+                query[2] = 1.0;
+                for filter in [&AllQuery as &dyn Query, &fixture.filter("matches")] {
+                    for (located, adaptive) in [
+                        (LocatedPath::Off, false),
+                        (LocatedPath::Auto, false),
+                        (LocatedPath::Off, true),
+                        (LocatedPath::Auto, true),
+                    ] {
+                        let collector = TopDocs::with_limit(10)
+                            .order_by_similarity(fixture.field, query.clone())
+                            .with_probe_params(ProbeParams {
+                                located,
+                                exact_plan: false,
+                                adaptive_probing: adaptive.then_some(
+                                    crate::vector::AdaptiveProbeParams {
+                                        effort: -2.0 * (1.0_f64 - 0.99999999).log10(),
+                                    },
+                                ),
+                                ..exhaustive_params(8)
+                            })
+                            .build();
+                        let weight = fixture.weight(filter)?;
+                        fixture.clear_reads();
+                        let result = collector.merge_fruits(collector.collect_segments(
+                            weight.as_ref(),
+                            &readers,
+                            |_| {},
+                        )?)?;
+                        let reads = fixture.reads();
+                        let last_shortlist = reads
                             .iter()
-                            .flatten()
-                            .all(|row| !rows.contains(row)));
-                        assert!(trace.exact_phase_rows.iter().all(|row| !rows.contains(row)));
-                        refined += rows.len();
+                            .rposition(|(stage, _)| *stage == VectorStage::LayerScan(0))
+                            .expect("layer-0 reads");
+                        let first_refinement = reads
+                            .iter()
+                            .position(|(stage, _)| {
+                                matches!(
+                                    stage,
+                                    VectorStage::LayerScan(1)
+                                        | VectorStage::ExactScan
+                                        | VectorStage::ExactFetch
+                                        | VectorStage::ExactScore
+                                )
+                            })
+                            .expect("refinement reads");
+                        assert_eq!(first_refinement < last_shortlist, adaptive, "{located:?}");
+                        assert_eq!(result.results, fixture.oracle(filter, &query, 10)?);
+                        let mut refined = 0;
+                        for stats in &result.stats {
+                            let trace = &stats.quantized_trace;
+                            let rows: std::collections::HashSet<_> =
+                                trace.refined_topk_rows.iter().copied().collect();
+                            assert_eq!(rows.len(), trace.refined_topk_rows.len());
+                            assert!(trace
+                                .boundary_rows
+                                .iter()
+                                .flatten()
+                                .all(|row| !rows.contains(row)));
+                            assert!(trace.exact_phase_rows.iter().all(|row| !rows.contains(row)));
+                            refined += rows.len();
+                        }
+                        assert_eq!(refined > 0, adaptive);
                     }
-                    assert_eq!(refined > 0, adaptive);
                 }
             }
         }

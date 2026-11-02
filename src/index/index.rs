@@ -608,7 +608,11 @@ impl Index {
             inventory,
             custom_plugins: Vec::new(),
             ivf_clusterer: Arc::new(SuperKMeansClusterer::new()),
-            ivf_router: RouterKind::default(),
+            ivf_router: if metas.index_settings.vector_centroid_quantization {
+                RouterKind::QuantizedStacked
+            } else {
+                RouterKind::default()
+            },
         }
     }
 

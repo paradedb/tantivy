@@ -1,10 +1,14 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::sync::Arc;
 
-use super::levels::{lists_to_open, StackedIvf, StackedSearchStats};
-use crate::vector::distance::Similarity;
+use super::levels::{ClusterId, StackedIvf, StackedSearchStats, PARENT_NPROBE_FRACTION};
 use crate::vector::router::arena::VectorArena;
 use crate::vector::router::candidate::Candidate;
+use crate::vector::router::quantized::{QuantizedLevel, QuantizedRouter};
+use crate::vector::router::search::{LevelSource, ScoreBuffer};
+use crate::vector::router::sign::SignQuery;
+use crate::vector::router::RoutingParams;
 use crate::vector::search::prepared::VectorQuery;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
 use crate::vector::{VectorElement, VectorStage};
@@ -13,6 +17,13 @@ use crate::vector::{VectorElement, VectorStage};
 /// Construction controls the layer sources and where their work is recorded.
 pub(crate) enum StackedRouting<'a, S> {
     Segment(&'a StackedIvf<S>),
+    QuantizedGlobal {
+        indexes: Vec<Option<&'a QuantizedRouter<S>>>,
+        queries: &'a [Option<Arc<SignQuery>>],
+        partitions: &'a [Option<&'a [f32]>],
+        totals: &'a mut [StageTotals],
+        on_segment: &'a mut dyn FnMut(usize),
+    },
     Global {
         indexes: Vec<Option<&'a StackedIvf<S>>>,
         partitions: &'a [Option<&'a [f32]>],
@@ -69,6 +80,13 @@ pub(crate) struct StackedRanking {
 
 enum RoutingLayer<'a, S> {
     Stored(&'a StackedIvf<S>),
+    Quantized(&'a QuantizedLevel, &'a SignQuery),
+    QuantizedPartition {
+        centroid: &'a [f32],
+        child: &'a QuantizedLevel,
+        query: &'a SignQuery,
+        child_level: usize,
+    },
     Partition {
         centroid: &'a [f32],
         child: &'a StackedIvf<S>,
@@ -84,13 +102,15 @@ impl<S: VectorArena<Elem = f32>> RoutingLayer<'_, S> {
                 index.offsets.iter().map(|&(a, b)| (b - a) as usize).sum(),
             ),
             Self::Partition { child, .. } => (1, child.nlist()),
+            Self::Quantized(index, _) => (index.list_count(), index.member_count()),
+            Self::QuantizedPartition { child, .. } => (1, child.list_count()),
         }
     }
 
     fn score_centroids<T: VectorElement>(
         &self,
         query: &VectorQuery<T>,
-        scores: &mut Vec<Similarity>,
+        scores: &mut ScoreBuffer<ClusterId>,
         mut visit: impl FnMut(Candidate<u32>),
     ) {
         match self {
@@ -100,23 +120,34 @@ impl<S: VectorArena<Elem = f32>> RoutingLayer<'_, S> {
                     query.metric(),
                     query.routing_norm(),
                     0..index.nlist(),
-                    scores,
+                    &mut scores.similarities,
                 );
-                for (node, &sim) in scores.iter().enumerate() {
+                for (node, &sim) in scores.similarities.iter().enumerate() {
                     visit(Candidate {
                         sim,
                         node: node as u32,
                     });
                 }
             }
-            Self::Partition { centroid, .. } => visit(Candidate {
-                sim: query.metric().similarity_with_query_norm(
-                    query.widened(),
-                    centroid,
-                    query.routing_norm(),
-                ),
-                node: 0,
-            }),
+            Self::Quantized(index, prepared) => {
+                index.score_centroids(prepared, scores);
+                for candidate in &scores.candidates {
+                    visit(Candidate {
+                        sim: candidate.sim,
+                        node: candidate.node.0,
+                    });
+                }
+            }
+            Self::Partition { centroid, .. } | Self::QuantizedPartition { centroid, .. } => {
+                visit(Candidate {
+                    sim: query.metric().similarity_with_query_norm(
+                        query.widened(),
+                        centroid,
+                        query.routing_norm(),
+                    ),
+                    node: 0,
+                })
+            }
         }
     }
 
@@ -124,7 +155,7 @@ impl<S: VectorArena<Elem = f32>> RoutingLayer<'_, S> {
         &self,
         list: u32,
         query: &VectorQuery<T>,
-        scores: &mut Vec<Similarity>,
+        scores: &mut ScoreBuffer<ClusterId>,
         mut visit: impl FnMut(Candidate<u32>),
     ) -> usize {
         match self {
@@ -135,9 +166,9 @@ impl<S: VectorArena<Elem = f32>> RoutingLayer<'_, S> {
                     query.metric(),
                     query.routing_norm(),
                     start as usize..end as usize,
-                    scores,
+                    &mut scores.similarities,
                 );
-                for (node, &sim) in (start..end).zip(scores.iter()) {
+                for (node, &sim) in (start..end).zip(scores.similarities.iter()) {
                     visit(Candidate {
                         sim,
                         node: node as u32,
@@ -151,9 +182,9 @@ impl<S: VectorArena<Elem = f32>> RoutingLayer<'_, S> {
                     query.metric(),
                     query.routing_norm(),
                     0..child.nlist(),
-                    scores,
+                    &mut scores.similarities,
                 );
-                for (node, &sim) in scores.iter().enumerate() {
+                for (node, &sim) in scores.similarities.iter().enumerate() {
                     visit(Candidate {
                         sim,
                         node: node as u32,
@@ -161,21 +192,84 @@ impl<S: VectorArena<Elem = f32>> RoutingLayer<'_, S> {
                 }
                 child.nlist()
             }
+            Self::Quantized(index, prepared) => {
+                index.score_members(ClusterId(list), prepared, scores);
+                for candidate in &scores.candidates {
+                    visit(Candidate {
+                        sim: candidate.sim,
+                        node: candidate.node.0,
+                    });
+                }
+                scores.candidates.len()
+            }
+            Self::QuantizedPartition { child, query, .. } => {
+                child.score_centroids(query, scores);
+                for candidate in &scores.candidates {
+                    visit(Candidate {
+                        sim: candidate.sim,
+                        node: candidate.node.0,
+                    });
+                }
+                scores.candidates.len()
+            }
         }
     }
 
     fn child_level(&self, level: usize) -> Option<usize> {
         match self {
-            Self::Stored(_) => level.checked_sub(1),
-            Self::Partition { child_level, .. } => Some(*child_level),
+            Self::Stored(_) | Self::Quantized(..) => level.checked_sub(1),
+            Self::Partition { child_level, .. } | Self::QuantizedPartition { child_level, .. } => {
+                Some(*child_level)
+            }
         }
     }
 }
 
 impl<'a, S: VectorArena<Elem = f32>> StackedRouting<'a, S> {
     fn levels(&self) -> Vec<Vec<Option<RoutingLayer<'a, S>>>> {
+        if let Self::QuantizedGlobal {
+            indexes,
+            queries,
+            partitions,
+            ..
+        } = self
+        {
+            let mut stacks: Vec<Vec<_>> = indexes
+                .iter()
+                .zip(*queries)
+                .map(|(index, query)| {
+                    let mut levels = Vec::new();
+                    if let (Some(index), Some(query)) = (index, query) {
+                        let mut level = Some(&index.level);
+                        while let Some(current) = level {
+                            levels.push(Some(RoutingLayer::Quantized(current, query)));
+                            level = current.parent.as_deref();
+                        }
+                    }
+                    levels
+                })
+                .collect();
+            let depth = stacks.iter().map(Vec::len).max().unwrap_or(0);
+            for (stack, centroid) in stacks.iter_mut().zip(*partitions) {
+                if let (Some(Some(RoutingLayer::Quantized(child, query))), Some(centroid)) =
+                    (stack.last(), centroid)
+                {
+                    let (child, query) = (*child, *query);
+                    let child_level = stack.len() - 1;
+                    stack.resize_with(depth, || None);
+                    stack.push(Some(RoutingLayer::QuantizedPartition {
+                        centroid,
+                        child,
+                        query,
+                        child_level,
+                    }));
+                }
+            }
+            return stacks;
+        }
         let (indexes, partitions) = match self {
             Self::Segment(index) => (vec![Some(*index)], &[][..]),
+            Self::QuantizedGlobal { .. } => unreachable!(),
             Self::Global {
                 indexes,
                 partitions,
@@ -216,6 +310,9 @@ impl<'a, S: VectorArena<Elem = f32>> StackedRouting<'a, S> {
             Self::Segment(_) => op(),
             Self::Global {
                 totals, on_segment, ..
+            }
+            | Self::QuantizedGlobal {
+                totals, on_segment, ..
             } => {
                 let (result, measured) = measure(|| {
                     let _stage = enter_vector_stage(VectorStage::Routing);
@@ -232,11 +329,30 @@ impl<'a, S: VectorArena<Elem = f32>> StackedRouting<'a, S> {
     /// best candidates stop improving. Stacks without a partition centroid join at their topmost
     /// layer.
     pub(crate) fn search<T: VectorElement>(
-        mut self,
+        self,
         query: &VectorQuery<T>,
         k: usize,
+        output: impl RoutingOutput,
+    ) -> StackedRanking {
+        self.search_with_params(
+            query,
+            RoutingParams {
+                k,
+                rerank_factor: 1,
+                min_beam_fraction: PARENT_NPROBE_FRACTION,
+                ..Default::default()
+            },
+            output,
+        )
+    }
+
+    pub(crate) fn search_with_params<T: VectorElement>(
+        mut self,
+        query: &VectorQuery<T>,
+        params: RoutingParams,
         mut output: impl RoutingOutput,
     ) -> StackedRanking {
+        let k = params.k;
         let levels = self.levels();
         let mut stats = vec![StackedSearchStats::default(); levels.len()];
         if k == 0 {
@@ -272,11 +388,20 @@ impl<'a, S: VectorArena<Elem = f32>> StackedRouting<'a, S> {
                 .iter()
                 .map(|layer| layer.sizes())
                 .fold((0, 0), |(a, b), (c, d)| (a + c, b + d));
-            open.push(lists_to_open(lists, members, requested));
-            beams.push(requested);
+            open.push(crate::vector::router::search::lists_to_open(
+                lists,
+                members,
+                requested,
+                params.min_beam_fraction,
+            ));
+            beams.push(if level == 0 {
+                requested.saturating_mul(params.rerank_factor.max(1))
+            } else {
+                requested
+            });
         }
         let mut pending = vec![Vec::new(); depth];
-        let mut scores = Vec::new();
+        let mut scores = ScoreBuffer::default();
         for level in (0..depth).rev() {
             let mut candidates = std::mem::take(&mut pending[level]);
             for (segment, stack) in levels.iter().enumerate() {
@@ -322,11 +447,14 @@ impl<'a, S: VectorArena<Elem = f32>> StackedRouting<'a, S> {
                 });
                 stats[segment].lists_scanned += 1;
                 stats[segment].members_scored += scanned;
+                if level == 0 {
+                    stats[segment].leaf_members_scored += scanned;
+                }
                 let kth = best
                     .peek()
                     .filter(|_| best.len() >= requested)
                     .map(|worst| worst.0.sim);
-                if probe.observe(kth) {
+                if params.aps && probe.observe(kth) {
                     break;
                 }
             }

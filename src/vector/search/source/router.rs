@@ -217,6 +217,10 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
             .expect("the router source runs on an IVF segment");
         let clusters = index.num_clusters();
         let routing = RoutingParams {
+            rerank_factor: params.router_rerank_factor,
+            min_beam_fraction: params.router_min_beam_fraction,
+            flat: params.router_flat,
+            aps: params.router_aps,
             k: params.router_k(
                 budget.total.get(),
                 budget.per_cluster.get(),

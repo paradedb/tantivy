@@ -21,6 +21,20 @@ pub struct ProbeParams {
     pub adaptive_probing: Option<AdaptiveProbeParams>,
     /// Work ceiling as a fraction of segment capacity. Default 0.01.
     pub max_probe_fraction: f32,
+    /// Approximate members retained per requested cluster by the quantized router.
+    /// Clamped to at least one. Does not widen list selection. Default 2;
+    /// provisional until real-data recall/latency tuning.
+    pub router_rerank_factor: usize,
+    /// Minimum fraction of each quantized router level's lists to open.
+    /// Clamped to [0, 1]; non-finite values use 0.25. Full-precision routing
+    /// keeps its existing beam. Default 0.25.
+    pub router_min_beam_fraction: f32,
+    /// Rank all bottom-router codes as one batch, bypassing the hierarchy.
+    /// Only quantized routers read this flag. Default false.
+    pub router_flat: bool,
+    /// Whether stacked routing may stop after lists cease improving its heap.
+    /// Quantized routing observes its approximate padded heap. Default true.
+    pub router_aps: bool,
     /// Work-budget floor when adaptive probing is disabled. Default 16.
     pub min_probe_clusters: usize,
     /// Lets a quantized segment score a cluster's rows exactly before the exact phase when that
@@ -84,6 +98,10 @@ impl Default for ProbeParams {
         Self {
             adaptive_probing: None,
             max_probe_fraction: 0.01,
+            router_rerank_factor: 2,
+            router_min_beam_fraction: 0.5,
+            router_flat: false,
+            router_aps: true,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
             exact_plan: true,
             located: LocatedPath::Auto,
