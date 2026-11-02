@@ -358,7 +358,10 @@ impl VectorArena for LazyStore {
         rows: std::ops::Range<usize>,
         out: &mut Vec<Similarity>,
     ) {
-        match &self.pinned {
+        match self
+            .pinned_rows()
+            .expect("failed to read router centroid matrix")
+        {
             Some(values) => values.batch_similarity(query, metric, query_norm, rows, out),
             None => self
                 .arena
