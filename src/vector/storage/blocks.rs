@@ -150,7 +150,7 @@ impl BlockMetadata {
 /// Data entry plus its validated stored directory. Per-column offsets are recomputed, never cached
 /// per block.
 pub(crate) struct Blocks {
-    entry: FileSlice,
+    pub(crate) entry: FileSlice,
     pub(crate) meta: Arc<VectorColMetadata>,
     pub(crate) slots: Vec<Slot>,
     bands: Vec<Range<usize>>,

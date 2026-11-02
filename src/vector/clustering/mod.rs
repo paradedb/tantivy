@@ -60,6 +60,12 @@ pub trait VectorSource {
     fn wants_cancel(&self) -> bool {
         false
     }
+
+    /// Bytes in one storage block of the directory holding these vectors, or `None` when the
+    /// directory has no fixed block.
+    fn storage_block_len(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Reads every row of `source` in scan order, at most `batch_rows` at a time, and calls `f`
