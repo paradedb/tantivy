@@ -4,9 +4,12 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+use super::arena::VectorArena;
 use super::candidate::Candidate;
-use super::stacked::levels::StackedSearchStats;
+use super::stacked::levels::{ClusterId, StackedSearchStats};
 use crate::vector::distance::Similarity;
+use crate::vector::search::prepared::VectorQuery;
+use crate::vector::VectorElement;
 
 /// Reused across batches, including representation-specific scoring scratch.
 pub(crate) struct ScoreBuffer<I> {
@@ -198,6 +201,40 @@ pub(crate) fn search<Q, S: Hierarchy<Q>>(
     stats.lists_scanned += probed.lists_scanned;
     stats.leaf_members_scored = probed.leaf_members_scored;
     (candidates, stats)
+}
+
+/// Exact reads are grouped into contiguous selected runs. The heap stores
+/// canonical identities, so changing read order does not change tie breaking.
+pub(crate) fn rerank_exact<S: VectorArena<Elem = f32>, T: VectorElement>(
+    source: &S,
+    query: &VectorQuery<T>,
+    candidates: &[Candidate<ClusterId>],
+    k: usize,
+) -> Vec<Candidate<ClusterId>> {
+    let mut rows: Vec<_> = candidates.iter().map(|c| c.node).collect();
+    rows.sort_unstable();
+    let mut result = TopCandidates::new(k);
+    let mut scores = Vec::new();
+    let mut start = 0;
+    while start < rows.len() {
+        let mut end = start + 1;
+        while end < rows.len() && rows[end].0 == rows[end - 1].0 + 1 {
+            end += 1;
+        }
+        let first = rows[start].0 as usize;
+        source.batch_similarity(
+            query.widened(),
+            query.metric(),
+            query.routing_norm(),
+            first..first + end - start,
+            &mut scores,
+        );
+        for (&node, &sim) in rows[start..end].iter().zip(&scores) {
+            result.offer(Candidate { node, sim });
+        }
+        start = end;
+    }
+    result.into_sorted()
 }
 
 #[cfg(test)]

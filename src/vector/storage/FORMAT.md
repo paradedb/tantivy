@@ -535,6 +535,9 @@ and 2 layouts and the outer `.centroids` version remain unchanged. Older readers
 reject kind 3 as an incompatible router. New readers support mixed router kinds
 across segments. The configured kind affects future builds, not existing files.
 
+Full-precision and quantized routers share the hierarchy, topology codec, and
+range validation. Their outer framing and vector representations differ.
+
 Kind 3 payload version 1 uses little-endian scalars:
 
 ```text

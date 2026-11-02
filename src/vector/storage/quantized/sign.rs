@@ -5,19 +5,13 @@ use std::io::{self, Write};
 use std::ops::Range;
 
 use common::{BinarySerializable, HasLen};
-use quant::rotation::Rotation;
-use quant::sign::{
-    estimate_asym_batch_unscaled, pack, prepare_query, words_from_le_bytes, QueryPlanes,
-};
+use quant::cascade::{LayerKind, LayerSpec, QueryRotationPlan, Rotation};
+use quant::sign::encode_unbiased;
 
-use super::candidate::Candidate;
-use super::search::ScoreBuffer;
 use crate::directory::FileSlice;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
-use crate::vector::quantization::SIGN_QUERY_BITS;
-use crate::vector::search::prepared::VectorQuery;
-use crate::vector::VectorElement;
+use crate::vector::search::prepared::QuantizedVectorQuery;
 
 /// The format fixes zero centering, a seeded orthogonal rotation, and the
 /// asymmetric sign estimator. Raw vectors are kept separately for exact reads.
@@ -29,7 +23,7 @@ pub(crate) struct SignVectors {
 
 enum SignStorage {
     Owned {
-        codes: Vec<u64>,
+        codes: Vec<u8>,
         /// ||x||² / <Rx, sign(Rx)>. Unlike reconstruction's mean-absolute
         /// scale, this corrects the systematic shrinkage of estimated dot products.
         coefficients: Vec<f32>,
@@ -43,32 +37,12 @@ enum SignStorage {
     },
 }
 
-pub(crate) struct SignQuery {
-    planes: QueryPlanes,
-    norm_squared: f32,
-    norm: f32,
-    metric: Metric,
-}
-
-impl SignQuery {
-    pub(crate) fn new<T: VectorElement>(query: &VectorQuery<T>, rotation: &Rotation) -> Self {
-        let mut rotated = query.widened().to_vec();
-        rotation.apply(&mut rotated);
-        Self {
-            planes: prepare_query(&rotated, SIGN_QUERY_BITS),
-            norm_squared: query.widened().iter().map(|x| x * x).sum(),
-            norm: query.routing_norm(),
-            metric: query.metric(),
-        }
-    }
-}
-
 pub(crate) fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 impl SignVectors {
-    pub(crate) fn encode(values: &[f32], dim: usize, rotation: &Rotation) -> io::Result<Self> {
+    pub(crate) fn encode(values: &[f32], dim: usize, plan: &QueryRotationPlan) -> io::Result<Self> {
         if dim == 0 || values.len() % dim != 0 {
             return Err(invalid("invalid sign-vector matrix shape"));
         }
@@ -89,18 +63,16 @@ impl SignVectors {
             }
             let norm_squared = values.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>();
             rotated.copy_from_slice(values);
-            rotation.apply_with_scratch(&mut rotated, &mut scratch);
-            let sum_abs = rotated.iter().map(|x| f64::from(x.abs())).sum::<f64>();
-            let coefficient = if sum_abs == 0.0 || norm_squared as f32 == 0.0 {
-                0.0
-            } else {
-                norm_squared / sum_abs
-            } as f32;
+            plan.rotate_layer_in_place(0, &mut rotated, &mut scratch);
+            let coefficient = encode_unbiased(
+                &rotated,
+                norm_squared,
+                &mut codes[row * words..(row + 1) * words],
+            );
             let norm_squared = norm_squared as f32;
             if !coefficient.is_finite() || !norm_squared.is_finite() {
                 return Err(invalid("sign-vector norm exceeds the estimator's range"));
             }
-            pack(&rotated, &mut codes[row * words..(row + 1) * words]);
             coefficients.push(coefficient);
             norms_squared.push(norm_squared);
         }
@@ -108,7 +80,7 @@ impl SignVectors {
             dim,
             rows,
             storage: SignStorage::Owned {
-                codes,
+                codes: codes.into_iter().flat_map(u64::to_le_bytes).collect(),
                 coefficients,
                 norms_squared,
             },
@@ -119,27 +91,27 @@ impl SignVectors {
         self.rows
     }
 
-    pub(crate) fn score<I>(
+    pub(crate) fn score(
         &self,
         rows: Range<usize>,
-        query: &SignQuery,
-        out: &mut ScoreBuffer<I>,
-        identify: impl FnMut(usize) -> I,
+        query: &QuantizedVectorQuery,
+        out: &mut Vec<Similarity>,
+        scratch: &mut Vec<f32>,
     ) {
-        self.try_score(rows, query, out, identify)
-            .expect("failed to read quantized router rows");
+        self.try_score(rows, query, out, scratch)
+            .expect("failed to read quantized vector rows");
     }
 
-    fn try_score<I>(
+    fn try_score(
         &self,
         rows: Range<usize>,
-        query: &SignQuery,
-        out: &mut ScoreBuffer<I>,
-        identify: impl FnMut(usize) -> I,
+        query: &QuantizedVectorQuery,
+        out: &mut Vec<Similarity>,
+        scratch: &mut Vec<f32>,
     ) -> io::Result<()> {
         assert!(rows.start <= rows.end && rows.end <= self.rows);
-        out.candidates.clear();
-        out.estimates.clear();
+        out.clear();
+        scratch.clear();
         if rows.is_empty() {
             return Ok(());
         }
@@ -151,10 +123,10 @@ impl SignVectors {
                 norms_squared,
             } => self.score_codes(
                 rows.clone(),
-                &codes[rows.start * words..rows.end * words],
+                &codes[rows.start * words * 8..rows.end * words * 8],
                 query,
                 out,
-                identify,
+                scratch,
                 |i| (coefficients[rows.start + i], norms_squared[rows.start + i]),
             ),
             SignStorage::File {
@@ -171,8 +143,7 @@ impl SignVectors {
                 let norms = norms_squared
                     .slice(rows.start * 4..rows.end * 4)
                     .read_bytes()?;
-                let words = words_from_le_bytes(&codes);
-                self.score_codes(rows, &words, query, out, identify, |i| {
+                self.score_codes(rows, &codes, query, out, scratch, |i| {
                     let at = i * 4;
                     (
                         f32::from_le_bytes(coefficients[at..at + 4].try_into().unwrap()),
@@ -183,26 +154,36 @@ impl SignVectors {
         }
     }
 
-    fn score_codes<I>(
+    fn score_codes(
         &self,
         rows: Range<usize>,
-        codes: &[u64],
-        query: &SignQuery,
-        out: &mut ScoreBuffer<I>,
-        mut identify: impl FnMut(usize) -> I,
+        codes: &[u8],
+        query: &QuantizedVectorQuery,
+        out: &mut Vec<Similarity>,
+        scratch: &mut Vec<f32>,
         sidecars: impl Fn(usize) -> (f32, f32),
     ) -> io::Result<()> {
         let words = self.dim.div_ceil(64);
         if self.dim % 64 != 0
-            && codes
-                .chunks_exact(words)
-                .any(|row| row[words - 1] >> (self.dim % 64) != 0)
+            && codes.chunks_exact(words * 8).any(|row| {
+                !crate::vector::quantization::quantized_code_tail_is_zero(row, self.dim, 1)
+            })
         {
             return Err(invalid("nonzero sign-code tail padding"));
         }
-        out.estimates.resize(rows.len(), 0.0);
-        estimate_asym_batch_unscaled(codes, words, &query.planes, &mut out.estimates);
-        for (i, (row, &estimate)) in rows.zip(&out.estimates).enumerate() {
+        scratch.resize(rows.len(), 0.0);
+        query.codes.score_layer_batch_unscaled(
+            0,
+            codes,
+            words * 8,
+            LayerSpec {
+                kind: LayerKind::Sign,
+                bits: 1,
+                rotation: Rotation::None,
+            },
+            scratch,
+        );
+        for (i, &estimate) in scratch.iter().enumerate() {
             let (coefficient, norm_squared) = sidecars(i);
             if !coefficient.is_finite()
                 || coefficient < 0.0
@@ -225,10 +206,7 @@ impl SignVectors {
                     }
                 }
             };
-            out.candidates.push(Candidate {
-                sim: Similarity::new(score),
-                node: identify(row),
-            });
+            out.push(Similarity::new(score));
         }
         Ok(())
     }
@@ -245,9 +223,7 @@ impl SignVectors {
                 coefficients,
                 norms_squared,
             } => {
-                for word in codes {
-                    word.serialize(out)?;
-                }
+                out.write_all(codes)?;
                 for coefficient in coefficients {
                     coefficient.serialize(out)?;
                 }
@@ -306,12 +282,23 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::vector::router::stacked::levels::ClusterId;
+    use crate::vector::search::prepared::VectorQuery;
+
+    fn rotation_plan(dim: usize, seed: u64) -> QueryRotationPlan {
+        QueryRotationPlan::new(
+            dim,
+            &[LayerSpec {
+                kind: LayerKind::Sign,
+                bits: 1,
+                rotation: Rotation::SeededFhtChaCha8 { seed },
+            }],
+        )
+    }
 
     #[test]
     fn sign_columns_roundtrip_and_validate_framing_and_tail_bits() -> io::Result<()> {
         let dim = 65;
-        let rotation = Rotation::new(dim, 7);
+        let rotation = rotation_plan(dim, 7);
         let values: Vec<_> = (0..dim * 3).map(|i| (i as f32 * 0.37).sin()).collect();
         let vectors = SignVectors::encode(&values, dim, &rotation)?;
         let mut bytes = Vec::new();
@@ -319,13 +306,13 @@ mod tests {
         let opened = SignVectors::open(&mut FileSlice::from(bytes.clone()), dim)?;
         for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
             let query = VectorQuery::new(metric, Arc::new(values[..dim].to_vec()));
-            let query = SignQuery::new(&query, &rotation);
-            let mut before = ScoreBuffer::default();
-            let mut after = ScoreBuffer::default();
-            vectors.score(0..3, &query, &mut before, ClusterId::from);
-            opened.score(0..3, &query, &mut after, ClusterId::from);
-            assert_eq!(before.candidates, after.candidates);
-            assert!(after.candidates.iter().all(|c| c.sim.score().is_finite()));
+            let query = QuantizedVectorQuery::for_sign(&query, &rotation);
+            let mut before = Vec::new();
+            let mut after = Vec::new();
+            vectors.score(0..3, &query, &mut before, &mut Vec::new());
+            opened.score(0..3, &query, &mut after, &mut Vec::new());
+            assert_eq!(before, after);
+            assert!(after.iter().all(|c| c.score().is_finite()));
         }
         for end in 0..bytes.len() {
             assert!(SignVectors::open(&mut FileSlice::from(bytes[..end].to_vec()), dim).is_err());
@@ -333,36 +320,36 @@ mod tests {
         let mut bad_tail = bytes.clone();
         bad_tail[4 + 8 + 7] |= 0x80;
         let corrupt = SignVectors::open(&mut FileSlice::from(bad_tail), dim)?;
-        let query = SignQuery::new(
+        let query = QuantizedVectorQuery::for_sign(
             &VectorQuery::new(Metric::Dot, Arc::new(values[..dim].to_vec())),
             &rotation,
         );
-        let mut scores = ScoreBuffer::default();
+        let mut scores = Vec::new();
         // Invalid bytes outside the selected range are not read or validated.
-        corrupt.try_score(1..3, &query, &mut scores, ClusterId::from)?;
+        corrupt.try_score(1..3, &query, &mut scores, &mut Vec::new())?;
         assert!(corrupt
-            .try_score(0..1, &query, &mut scores, ClusterId::from)
+            .try_score(0..1, &query, &mut scores, &mut Vec::new())
             .is_err());
         let scales_start = 4 + 3 * dim.div_ceil(64) * 8;
         bytes[scales_start..scales_start + 4].copy_from_slice(&f32::NAN.to_le_bytes());
         let corrupt = SignVectors::open(&mut FileSlice::from(bytes), dim)?;
-        corrupt.try_score(1..3, &query, &mut scores, ClusterId::from)?;
+        corrupt.try_score(1..3, &query, &mut scores, &mut Vec::new())?;
         assert!(corrupt
-            .try_score(0..1, &query, &mut scores, ClusterId::from)
+            .try_score(0..1, &query, &mut scores, &mut Vec::new())
             .is_err());
         Ok(())
     }
 
     #[test]
     fn zero_vectors_and_zero_queries_have_finite_estimates() -> io::Result<()> {
-        let rotation = Rotation::new(64, 17);
+        let rotation = rotation_plan(64, 17);
         let vectors = SignVectors::encode(&vec![0.0; 128], 64, &rotation)?;
         for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
             let query = VectorQuery::new(metric, Arc::new(vec![0.0; 64]));
-            let query = SignQuery::new(&query, &rotation);
-            let mut out = ScoreBuffer::default();
-            vectors.score(0..2, &query, &mut out, ClusterId::from);
-            assert!(out.candidates.iter().all(|c| c.sim.score() == 0.0));
+            let query = QuantizedVectorQuery::for_sign(&query, &rotation);
+            let mut out = Vec::new();
+            vectors.score(0..2, &query, &mut out, &mut Vec::new());
+            assert!(out.iter().all(|c| c.score() == 0.0));
         }
         Ok(())
     }

@@ -22,7 +22,6 @@ mod exact;
 pub(crate) mod global;
 mod quantized;
 mod search;
-mod sign;
 pub(crate) mod stacked;
 
 /// The routing structure new IVF segments build. Codes are persisted; 0 belonged to the removed

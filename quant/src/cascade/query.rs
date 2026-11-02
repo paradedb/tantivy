@@ -56,6 +56,31 @@ impl QueryRotationPlan {
         &self.specs
     }
 
+    /// Applies one layer's transform using reusable encoding scratch. Query
+    /// preparation and vector encoding share the same resolved rotation plan.
+    ///
+    /// # Panics
+    ///
+    /// Panics for an invalid layer or a vector/scratch dimension mismatch.
+    pub fn rotate_layer_in_place(&self, layer: usize, values: &mut [f32], scratch: &mut [f32]) {
+        assert_eq!(values.len(), self.d);
+        assert_eq!(scratch.len(), self.d);
+        if let Some(rotation) = &self.rotations[layer] {
+            rotation.apply_with_scratch(values, scratch);
+        }
+    }
+
+    /// Prepares a single sign representation without requiring grid metadata.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the plan has one sign layer, dimensions match, and query bits are in 1..=8.
+    pub fn prepare_sign_query(&self, query: &[f32], sign_query_bits: u8) -> PreparedSplitQuery {
+        assert_eq!(self.specs.len(), 1);
+        assert_eq!(self.specs[0].kind, LayerKind::Sign);
+        prepare_layers_with_plan(query, self, &[], 1, sign_query_bits)
+    }
+
     fn active_specs(&self, active_layers: usize) -> &[LayerSpec] {
         assert!((1..=self.specs.len()).contains(&active_layers));
         &self.specs[..active_layers]
@@ -133,11 +158,22 @@ pub fn prepare_split_query_with_plan(
 ) -> PreparedSplitQuery {
     let specs = plan.active_specs(grids.len());
     validate(query.len(), specs, grids);
+    prepare_layers_with_plan(query, plan, grids, grids.len(), sign_query_bits)
+}
+
+fn prepare_layers_with_plan(
+    query: &[f32],
+    plan: &QueryRotationPlan,
+    grids: &[Grid],
+    active_layers: usize,
+    sign_query_bits: u8,
+) -> PreparedSplitQuery {
+    let specs = plan.active_specs(active_layers);
     assert_eq!(query.len(), plan.dimension());
     assert!((1..=8).contains(&sign_query_bits));
     let rotated_layers = plan.prepare_layers(query, specs.len());
     let mut layers = Vec::with_capacity(specs.len());
-    for ((spec, grid), current) in specs.iter().zip(grids).zip(rotated_layers) {
+    for (layer, (spec, current)) in specs.iter().zip(rotated_layers).enumerate() {
         match spec.kind {
             LayerKind::Sign => {
                 layers.push(PreparedSplitLayer::Sign(prepare_query(
@@ -146,7 +182,7 @@ pub fn prepare_split_query_with_plan(
                 )));
             }
             LayerKind::Grid => {
-                let lut = build_lut(&current, &grid.points, spec.bits);
+                let lut = build_lut(&current, &grids[layer].points, spec.bits);
                 let packed_lut_4 = (spec.bits == 4).then(|| build_packed_lut_4(&lut, query.len()));
                 layers.push(PreparedSplitLayer::Grid { lut, packed_lut_4 });
             }
@@ -451,6 +487,41 @@ mod tests {
     use crate::grid::encode_f32 as encode_grid;
     use crate::model::{build_grid, empirical_sigma, isotropic_sigma};
     use crate::sign::encode_f32 as encode_sign;
+
+    #[test]
+    fn sign_only_preparation_matches_the_posting_layer_contract() {
+        for dim in [8, 65, 100, 1024] {
+            let spec = LayerSpec {
+                kind: LayerKind::Sign,
+                bits: 1,
+                rotation: Rotation::SeededFhtChaCha8 { seed: 71 },
+            };
+            let plan = QueryRotationPlan::new(dim, &[spec]);
+            let query: Vec<_> = (0..dim).map(|i| (i as f32 * 0.17).sin()).collect();
+            let grids = [Grid {
+                bits: 1,
+                points: Vec::new(),
+                rho_model: 0.0,
+            }];
+            let mut rotated = query.clone();
+            plan.rotate_layer_in_place(0, &mut rotated, &mut vec![0.0; dim]);
+            let mut words = vec![0; dim.div_ceil(64)];
+            crate::sign::pack(&rotated, &mut words);
+            let bytes = super::super::words_to_bytes(&words);
+            for bits in [1, 4, 8] {
+                let router = plan.prepare_sign_query(&query, bits);
+                let posting = prepare_split_query_with_plan(&query, &plan, &grids, bits);
+                assert_eq!(
+                    router.query_error_squared(0),
+                    posting.query_error_squared(0)
+                );
+                assert_eq!(
+                    router.score_layer_without_constant(0, &bytes, 1.0, spec),
+                    posting.score_layer_without_constant(0, &bytes, 1.0, spec)
+                );
+            }
+        }
+    }
 
     #[test]
     fn reusable_rotation_plan_matches_direct_query_preparation() {

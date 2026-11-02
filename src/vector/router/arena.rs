@@ -39,6 +39,52 @@ pub trait VectorArena {
     );
 }
 
+/// Batch scoring over one vector representation. Selection and topology belong
+/// to the caller; representations only produce similarities for addressed rows.
+pub(crate) trait VectorScorer<Q> {
+    fn score_rows(
+        &self,
+        query: &Q,
+        rows: Range<usize>,
+        out: &mut Vec<Similarity>,
+        scratch: &mut Vec<f32>,
+    );
+}
+
+impl<S: VectorArena<Elem = f32>, T: VectorElement>
+    VectorScorer<crate::vector::search::prepared::VectorQuery<T>> for S
+{
+    fn score_rows(
+        &self,
+        query: &crate::vector::search::prepared::VectorQuery<T>,
+        rows: Range<usize>,
+        out: &mut Vec<Similarity>,
+        _scratch: &mut Vec<f32>,
+    ) {
+        self.batch_similarity(
+            query.widened(),
+            query.metric(),
+            query.routing_norm(),
+            rows,
+            out,
+        );
+    }
+}
+
+impl VectorScorer<crate::vector::search::prepared::QuantizedVectorQuery>
+    for std::sync::Arc<crate::vector::storage::quantized::sign::SignVectors>
+{
+    fn score_rows(
+        &self,
+        query: &crate::vector::search::prepared::QuantizedVectorQuery,
+        rows: Range<usize>,
+        out: &mut Vec<Similarity>,
+        scratch: &mut Vec<f32>,
+    ) {
+        self.score(rows, query, out, scratch);
+    }
+}
+
 /// Any `[T]`-shaped storage (`&[T]`, `Vec<T>`, …), scored with the typed kernels.
 impl<T: VectorElement, S: std::ops::Deref<Target = [T]>> VectorArena for S {
     type Elem = T;
@@ -75,6 +121,7 @@ impl<T: VectorElement, S: std::ops::Deref<Target = [T]>> VectorArena for S {
 /// stride-sized ranged read scored with the byte kernels ([`Metric::similarity_bytes`]).
 ///
 /// [`similarity`]: VectorArena::similarity
+#[derive(Clone)]
 pub(crate) struct FileSliceArena<T> {
     pub(crate) slice: crate::directory::FileSlice,
     _elem: std::marker::PhantomData<T>,

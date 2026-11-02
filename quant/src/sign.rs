@@ -138,6 +138,23 @@ pub fn encode_f32(y: &[f32], out_bits: &mut [u64]) -> f32 {
     y.iter().map(|value| value.abs()).sum::<f32>() / y.len() as f32
 }
 
+/// Packs signs and returns the coefficient for an unbiased dot estimate.
+/// `norm_squared` is measured before rotation, in binary64, to preserve the
+/// original vector's metric geometry despite floating-point rotation error.
+///
+/// # Panics
+///
+/// Panics when the input is empty or the packed output has the wrong shape.
+pub fn encode_unbiased(y: &[f32], norm_squared: f64, out: &mut [u64]) -> f32 {
+    pack(y, out);
+    let sum_abs = y.iter().map(|x| f64::from(x.abs())).sum::<f64>();
+    if sum_abs == 0.0 || norm_squared as f32 == 0.0 {
+        0.0
+    } else {
+        (norm_squared / sum_abs) as f32
+    }
+}
+
 /// Hamming distance between two sign-code vectors.
 ///
 /// # Panics
@@ -1076,6 +1093,21 @@ mod tests {
     use rand_core::{RngCore, SeedableRng};
 
     use super::*;
+
+    #[test]
+    fn unbiased_coefficient_preserves_self_dot_and_zero_rows() {
+        for dim in [8_usize, 65, 100] {
+            let values: Vec<f32> = (0..dim).map(|i| ((i % 7) as f32 - 3.0) * 0.25).collect();
+            let norm_squared = values.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>();
+            let mut codes = vec![0; dim.div_ceil(64)];
+            let coefficient = encode_unbiased(&values, norm_squared, &mut codes);
+            let reconstructed = coefficient * estimate_fp_unscaled(&codes, &values);
+            assert!((reconstructed - norm_squared as f32).abs() < 1e-5);
+            assert!(tail_is_zero(&codes, dim));
+            assert_eq!(encode_unbiased(&vec![0.0; dim], 0.0, &mut codes), 0.0);
+            assert!(codes.iter().all(|&word| word == 0));
+        }
+    }
 
     #[test]
     fn packing_round_trip() {

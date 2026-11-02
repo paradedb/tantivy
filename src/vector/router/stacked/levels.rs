@@ -11,11 +11,12 @@
 //! is `ceil(√n)`; [`StackedIvfBuilder`] hangs a parent while the current
 //! top has at least [`MIN_NLIST_FOR_PARENT`] lists.
 //!
-//! Search works on any [`VectorArena`]. Build and payload serialization require
-//! owned [`InMemoryStore`]s. [`StackedIvf::open`] is search-only.
+//! Search uses the same hierarchy with full-precision or quantized scoring sources.
+//! Build requires owned [`InMemoryStore`]s. [`StackedIvf::open`] is search-only.
 
 use std::io::{self, Write};
 use std::ops::Deref;
+use std::sync::Arc;
 use std::{fmt, mem};
 
 use common::{BinarySerializable, HasLen};
@@ -26,7 +27,7 @@ use crate::schema::Metric;
 use crate::vector::distance::Similarity;
 use crate::vector::router::arena::{FileSliceArena, VectorArena};
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::stacked::search::{StackedRouting, TopK};
+#[cfg(any(test, feature = "unstable"))]
 use crate::vector::search::prepared::VectorQuery;
 use crate::vector::VectorElement;
 
@@ -232,7 +233,7 @@ impl LevelClusterer for SuperKMeansLevelClusterer {
 /// One IVF level. `parent` is the next level up (L0's parent is L1).
 ///
 /// List `j` is `vectors` rows `offsets[j].0..offsets[j].1`. Search is
-/// available for any [`VectorArena`]; [`build`](StackedIvf::build) and
+/// available for any batch-scoring representation; [`build`](StackedIvf::build) and
 /// [`add_level`](StackedIvf::add_level) require [`InMemoryStore`].
 pub struct StackedIvf<S> {
     pub config: StackedIvfConfig,
@@ -245,6 +246,7 @@ pub struct StackedIvf<S> {
 }
 
 /// File-backed row-major `f32` matrix, read only as rows are scored.
+#[derive(Clone)]
 pub(crate) struct LazyStore {
     arena: FileSliceArena<f32>,
     dim: usize,
@@ -344,46 +346,8 @@ where
     S: SerializableStore,
     W: Write + ?Sized,
 {
-    let mut num_levels = 1usize;
-    let mut parent = index.parent.as_deref();
-    while let Some(level) = parent {
-        num_levels += 1;
-        parent = level.parent.as_deref();
-    }
-
     let mut topology = Vec::new();
-    u32::try_from(num_levels)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "level count exceeds u32"))?
-        .serialize(&mut topology)?;
-
-    fn serialize_level<S>(index: &StackedIvf<S>, out: &mut Vec<u8>) -> io::Result<()>
-    where S: SerializableStore {
-        let nlist = index.centroids.len();
-        if index.offsets.len() != nlist {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "level has {} offset ranges for {nlist} lists",
-                    index.offsets.len()
-                ),
-            ));
-        }
-        u32::try_from(nlist)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "nlist exceeds u32"))?
-            .serialize(out)?;
-        for &(start, end) in &index.offsets {
-            start.serialize(out)?;
-            end.serialize(out)?;
-        }
-        Ok(())
-    }
-
-    serialize_level(index, &mut topology)?;
-    let mut parent = index.parent.as_deref();
-    while let Some(level) = parent {
-        serialize_level(level, &mut topology)?;
-        parent = level.parent.as_deref();
-    }
+    index.serialize_topology(&mut topology, |store| store.len())?;
 
     let centroids_byte_offset = (mem::size_of::<u64>() + topology.len()) as u64;
     centroids_byte_offset.serialize(out)?;
@@ -658,52 +622,40 @@ impl StackedIvf<InMemoryStore> {
             level_centroids.push(values);
         }
 
-        let mut index: Option<Box<StackedIvf<InMemoryStore>>> = None;
-        for level in (0..level_topology.len()).rev() {
-            let (nlist, offsets) = &level_topology[level];
-            let level_members = if level == 0 {
-                members.clone()
-            } else {
-                level_centroids[level - 1].clone()
-            };
-            if !ranges_cover_members(offsets, level_members.len() / dim) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("level {level} offsets do not cover its members"),
-                ));
-            }
-            let _ = nlist;
-            index = Some(Box::new(StackedIvf {
-                config: if level == 0 {
-                    config.clone()
-                } else {
-                    config.for_parent()
-                },
-                parent: index,
-                offsets: offsets.clone(),
-                centroids: InMemoryStore::new(level_centroids[level].clone(), dim),
-                vectors: InMemoryStore::new(level_members, dim),
-            }));
-        }
-        Ok(*index.expect("at least one level"))
+        let mut sets = vec![InMemoryStore::new(members, dim)];
+        sets.extend(
+            level_centroids
+                .into_iter()
+                .map(|values| InMemoryStore::new(values, dim)),
+        );
+        Self::from_vector_sets(level_topology, sets, config, InMemoryStore::len)
     }
 }
 
-fn parse_level_topology(mut topology: &[u8]) -> io::Result<Vec<(usize, Vec<(u64, u64)>)>> {
-    let num_levels = u32::deserialize(&mut topology)? as usize;
+/// Reads the same topology layout for every vector representation. `read`
+/// supplies one metadata range at a time, from memory or a lazy file cursor.
+pub(crate) fn read_level_topology<B: AsRef<[u8]>>(
+    num_levels: usize,
+    mut read: impl FnMut(usize) -> io::Result<B>,
+) -> io::Result<Vec<(usize, Vec<(u64, u64)>)>> {
     if num_levels == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "stacked IVF has zero levels",
         ));
     }
-    let mut level_topology = Vec::with_capacity(num_levels);
+    let mut topology = Vec::new();
     for _ in 0..num_levels {
-        let nlist = u32::deserialize(&mut topology)? as usize;
-        let mut offsets = Vec::with_capacity(nlist);
+        let header = read(4)?;
+        let nlist = u32::deserialize(&mut header.as_ref())? as usize;
+        let bytes = read(nlist.checked_mul(16).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "router topology size overflow")
+        })?)?;
+        let mut input = bytes.as_ref();
+        let mut offsets = Vec::new();
         for _ in 0..nlist {
-            let start = u64::deserialize(&mut topology)?;
-            let end = u64::deserialize(&mut topology)?;
+            let start = u64::deserialize(&mut input)?;
+            let end = u64::deserialize(&mut input)?;
             if start > end {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -712,15 +664,107 @@ fn parse_level_topology(mut topology: &[u8]) -> io::Result<Vec<(usize, Vec<(u64,
             }
             offsets.push((start, end));
         }
-        level_topology.push((nlist, offsets));
+        topology.push((nlist, offsets));
     }
+    Ok(topology)
+}
+
+fn parse_level_topology(mut topology: &[u8]) -> io::Result<Vec<(usize, Vec<(u64, u64)>)>> {
+    let num_levels = u32::deserialize(&mut topology)? as usize;
+    let levels = read_level_topology(num_levels, |len| {
+        if len > topology.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated stacked IVF topology",
+            ));
+        }
+        let (bytes, rest) = topology.split_at(len);
+        topology = rest;
+        Ok(bytes)
+    })?;
     if !topology.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "stacked IVF topology has trailing bytes before centroids",
         ));
     }
-    Ok(level_topology)
+    Ok(levels)
+}
+
+impl<S> StackedIvf<S> {
+    pub(crate) fn levels(&self) -> impl Iterator<Item = &Self> {
+        std::iter::successors(Some(self), |level| level.parent.as_deref())
+    }
+
+    pub(crate) fn serialize_topology<W: Write + ?Sized>(
+        &self,
+        out: &mut W,
+        rows: impl Fn(&S) -> usize,
+    ) -> io::Result<()> {
+        let count = u32::try_from(self.levels().count())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "level count exceeds u32"))?;
+        count.serialize(out)?;
+        for level in self.levels() {
+            let nlist = rows(&level.centroids);
+            if nlist != level.offsets.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "centroid count differs from list count",
+                ));
+            }
+            u32::try_from(nlist)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "nlist exceeds u32"))?
+                .serialize(out)?;
+            for &(start, end) in &level.offsets {
+                start.serialize(out)?;
+                end.serialize(out)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One member set followed by one centroid set per level. A parent's
+    /// members reuse its child's centroid set, regardless of representation.
+    pub(crate) fn from_vector_sets(
+        topology: Vec<(usize, Vec<(u64, u64)>)>,
+        sets: Vec<S>,
+        config: StackedIvfConfig,
+        rows: impl Fn(&S) -> usize,
+    ) -> io::Result<Self>
+    where
+        S: Clone,
+    {
+        if topology.is_empty() || sets.len() != topology.len() + 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stacked IVF vector-set count differs from topology",
+            ));
+        }
+        let mut parent = None;
+        for (level, (nlist, offsets)) in topology.into_iter().enumerate().rev() {
+            if nlist != rows(&sets[level + 1])
+                || offsets.len() != nlist
+                || !ranges_cover_members(&offsets, rows(&sets[level]))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stacked IVF offsets do not cover their vector set",
+                ));
+            }
+            parent = Some(Box::new(Self {
+                config: if level == 0 {
+                    config.clone()
+                } else {
+                    config.for_parent()
+                },
+                parent,
+                offsets,
+                centroids: sets[level + 1].clone(),
+                vectors: sets[level].clone(),
+            }));
+        }
+        Ok(*parent.expect("validated nonempty hierarchy"))
+    }
 }
 
 /// Ranges must be a partition of `0..n` (possibly not in list-id order).
@@ -789,7 +833,6 @@ impl StackedIvf<LazyStore> {
                 "stacked IVF member rows are not a multiple of the row stride",
             ));
         }
-        let num_members = member_rows.len() / row_bytes;
         let expected: usize = level_topology
             .iter()
             .map(|(nlist, _)| nlist * row_bytes)
@@ -809,36 +852,16 @@ impl StackedIvf<LazyStore> {
             start = end;
         }
 
-        let mut index: Option<Box<StackedIvf<LazyStore>>> = None;
-        for level in (0..level_topology.len()).rev() {
-            let (_, offsets) = &level_topology[level];
-            let (level_members, level_member_count) = if level == 0 {
-                (LazyStore::new(member_rows.clone(), dim), num_members)
-            } else {
-                (
-                    LazyStore::new(centroid_slices[level - 1].clone(), dim),
-                    level_topology[level - 1].0,
-                )
-            };
-            if !ranges_cover_members(offsets, level_member_count) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("level {level} offsets do not cover its members"),
-                ));
-            }
-            index = Some(Box::new(StackedIvf {
-                config: if level == 0 {
-                    config.clone()
-                } else {
-                    config.for_parent()
-                },
-                parent: index,
-                offsets: offsets.clone(),
-                centroids: LazyStore::new(centroid_slices[level].clone(), dim),
-                vectors: level_members,
-            }));
-        }
-        Ok(*index.expect("at least one level"))
+        // Raw member rows remain lazy. Parent members reuse the child centroid
+        // stores; all centroid rows remain file-backed.
+        let mut sets = vec![LazyStore::new(member_rows, dim)];
+        sets.extend(
+            centroid_slices
+                .into_iter()
+                .map(|slice| LazyStore::new(slice, dim))
+                .collect::<Vec<_>>(),
+        );
+        Self::from_vector_sets(level_topology, sets, config, LazyStore::len)
     }
 }
 
@@ -917,18 +940,15 @@ where S: VectorArena<Elem = f32>
     }
 }
 
-impl<S, T> crate::vector::router::search::LevelSource<VectorQuery<T>> for StackedIvf<S>
-where
-    S: VectorArena<Elem = f32>,
-    T: VectorElement,
+impl<S, Q> crate::vector::router::search::LevelSource<Q> for StackedIvf<S>
+where S: crate::vector::router::arena::VectorScorer<Q>
 {
     type ClusterId = ClusterId;
     type MemberId = ClusterId;
 
     fn list_count(&self) -> usize {
-        self.nlist()
+        self.offsets.len()
     }
-
     fn member_count(&self) -> usize {
         self.offsets
             .iter()
@@ -938,15 +958,14 @@ where
 
     fn score_centroids(
         &self,
-        query: &VectorQuery<T>,
+        query: &Q,
         out: &mut crate::vector::router::search::ScoreBuffer<ClusterId>,
     ) {
-        self.centroids.batch_similarity(
-            query.widened(),
-            query.metric(),
-            query.routing_norm(),
-            0..self.nlist(),
+        self.centroids.score_rows(
+            query,
+            0..self.offsets.len(),
             &mut out.similarities,
+            &mut out.estimates,
         );
         out.candidates.clear();
         out.candidates.extend(
@@ -963,16 +982,15 @@ where
     fn score_members(
         &self,
         list: ClusterId,
-        query: &VectorQuery<T>,
+        query: &Q,
         out: &mut crate::vector::router::search::ScoreBuffer<ClusterId>,
     ) {
         let (start, end) = self.offsets[usize::from(list)];
-        self.vectors.batch_similarity(
-            query.widened(),
-            query.metric(),
-            query.routing_norm(),
+        self.vectors.score_rows(
+            query,
             start as usize..end as usize,
             &mut out.similarities,
+            &mut out.estimates,
         );
         out.candidates.clear();
         out.candidates.extend(
@@ -987,10 +1005,8 @@ where
     }
 }
 
-impl<S, T> crate::vector::router::search::Hierarchy<VectorQuery<T>> for StackedIvf<S>
-where
-    S: VectorArena<Elem = f32>,
-    T: VectorElement,
+impl<S, Q> crate::vector::router::search::Hierarchy<Q> for StackedIvf<S>
+where S: crate::vector::router::arena::VectorScorer<Q>
 {
     type Parent = Self;
     fn parent(&self) -> Option<&Self> {

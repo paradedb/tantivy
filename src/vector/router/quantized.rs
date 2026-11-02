@@ -5,64 +5,45 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use common::{BinarySerializable, HasLen};
-use quant::rotation::Rotation;
+use quant::cascade::{LayerKind, LayerSpec, QueryRotationPlan, Rotation};
 
-use super::arena::VectorArena;
+use super::arena::{VectorArena, VectorScorer};
 use super::candidate::Candidate;
-use super::search::{self, Hierarchy, LevelSource, ScoreBuffer, TopCandidates};
-use super::sign::{invalid, SignQuery, SignVectors};
-use super::stacked::levels::{ClusterId, InMemoryStore, LazyStore, StackedIvf, StackedSearchStats};
+#[cfg(test)]
+use super::search::LevelSource;
+use super::search::{self, ScoreBuffer, TopCandidates};
+use super::stacked::levels::{
+    read_level_topology, ClusterId, InMemoryStore, LazyStore, StackedIvf, StackedSearchStats,
+};
 use super::{RouterMetrics, RoutingParams};
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::clustering::IvfCentroids;
-use crate::vector::search::prepared::VectorQuery;
+use crate::vector::search::prepared::{QuantizedVectorQuery, VectorQuery};
+use crate::vector::storage::quantized::sign::{invalid, SignVectors};
 use crate::vector::VectorElement;
 
 const VERSION: u32 = 1;
 const ROTATION_SEED: u64 = 0x726f_7574_6572_0001;
 
-struct QuantizedLevel {
-    parent: Option<Box<Self>>,
-    offsets: Vec<(u64, u64)>,
-    centroids: Arc<SignVectors>,
-    members: Arc<SignVectors>,
-}
-
-impl LevelSource<SignQuery> for QuantizedLevel {
-    type ClusterId = ClusterId;
-    type MemberId = ClusterId;
-    fn list_count(&self) -> usize {
-        self.offsets.len()
-    }
-    fn member_count(&self) -> usize {
-        self.members.len()
-    }
-    fn score_centroids(&self, query: &SignQuery, out: &mut ScoreBuffer<ClusterId>) {
-        self.centroids
-            .score(0..self.centroids.len(), query, out, ClusterId::from);
-    }
-    fn score_members(&self, list: ClusterId, query: &SignQuery, out: &mut ScoreBuffer<ClusterId>) {
-        let (start, end) = self.offsets[usize::from(list)];
-        self.members
-            .score(start as usize..end as usize, query, out, ClusterId::from);
-    }
-}
-
-impl Hierarchy<SignQuery> for QuantizedLevel {
-    type Parent = Self;
-    fn parent(&self) -> Option<&Self> {
-        self.parent.as_deref()
-    }
+fn rotation_plan(dim: usize, seed: u64) -> QueryRotationPlan {
+    QueryRotationPlan::new(
+        dim,
+        &[LayerSpec {
+            kind: LayerKind::Sign,
+            bits: 1,
+            rotation: Rotation::SeededFhtChaCha8 { seed },
+        }],
+    )
 }
 
 pub(crate) struct QuantizedRouter<S> {
-    level: QuantizedLevel,
+    level: StackedIvf<Arc<SignVectors>>,
     raw: S,
     dim: usize,
     metric: Metric,
     seed: u64,
-    rotation: Rotation,
+    rotation_plan: QueryRotationPlan,
 }
 
 impl QuantizedRouter<InMemoryStore> {
@@ -78,44 +59,37 @@ impl QuantizedRouter<InMemoryStore> {
     }
 
     fn from_index(
-        mut index: StackedIvf<InMemoryStore>,
+        index: StackedIvf<InMemoryStore>,
         options: &VectorOptions,
     ) -> crate::Result<Self> {
-        let rotation = Rotation::new(options.dim(), ROTATION_SEED);
-        let members = Arc::new(SignVectors::encode(
+        let rotation = rotation_plan(options.dim(), ROTATION_SEED);
+        let mut sets = vec![Arc::new(SignVectors::encode(
             &index.vectors,
             options.dim(),
             &rotation,
-        )?);
-        let raw = std::mem::replace(
-            &mut index.vectors,
-            InMemoryStore::new(Vec::new(), options.dim()),
-        );
-        fn encode(
-            index: StackedIvf<InMemoryStore>,
-            members: Arc<SignVectors>,
-            dim: usize,
-            rotation: &Rotation,
-        ) -> io::Result<QuantizedLevel> {
-            let centroids = Arc::new(SignVectors::encode(&index.centroids, dim, rotation)?);
-            let parent = index
-                .parent
-                .map(|parent| encode(*parent, centroids.clone(), dim, rotation).map(Box::new))
-                .transpose()?;
-            Ok(QuantizedLevel {
-                parent,
-                offsets: index.offsets,
-                centroids,
-                members,
-            })
+        )?)];
+        let topology = index
+            .levels()
+            .map(|level| (level.offsets.len(), level.offsets.clone()))
+            .collect();
+        for level in index.levels() {
+            sets.push(Arc::new(SignVectors::encode(
+                &level.centroids,
+                options.dim(),
+                &rotation,
+            )?));
         }
+        let level = StackedIvf::from_vector_sets(topology, sets, index.config.clone(), |store| {
+            store.len()
+        })?;
+
         Ok(Self {
-            level: encode(index, members, options.dim(), &rotation)?,
-            raw,
+            level,
+            raw: index.vectors,
             dim: options.dim(),
             metric: options.metric(),
             seed: ROTATION_SEED,
-            rotation,
+            rotation_plan: rotation,
         })
     }
 
@@ -124,22 +98,9 @@ impl QuantizedRouter<InMemoryStore> {
         (self.dim as u32).serialize(out)?;
         metric_code(self.metric).serialize(out)?;
         self.seed.serialize(out)?;
-        let mut levels = Vec::new();
-        let mut next = Some(&self.level);
-        while let Some(level) = next {
-            levels.push(level);
-            next = level.parent.as_deref();
-        }
-        (levels.len() as u32).serialize(out)?;
-        for level in &levels {
-            (level.offsets.len() as u32).serialize(out)?;
-            for &(start, end) in &level.offsets {
-                start.serialize(out)?;
-                end.serialize(out)?;
-            }
-        }
-        self.level.members.serialize(out)?;
-        for level in levels {
+        self.level.serialize_topology(out, |store| store.len())?;
+        self.level.vectors.serialize(out)?;
+        for level in self.level.levels() {
             level.centroids.serialize(out)?;
         }
         Ok(())
@@ -188,20 +149,7 @@ impl QuantizedRouter<LazyStore> {
         if count == 0 || count > payload.len() / 4 {
             return Err(invalid("invalid quantized router level count").into());
         }
-        let mut topology = Vec::with_capacity(count);
-        for _ in 0..count {
-            let header = read_metadata(&mut payload, 4)?;
-            let lists = u32::deserialize(&mut header.as_slice())? as usize;
-            let len = lists
-                .checked_mul(16)
-                .ok_or_else(|| invalid("router topology size overflow"))?;
-            let bytes = read_metadata(&mut payload, len)?;
-            let mut input = bytes.as_slice();
-            let offsets = (0..lists)
-                .map(|_| Ok((u64::deserialize(&mut input)?, u64::deserialize(&mut input)?)))
-                .collect::<io::Result<Vec<_>>>()?;
-            topology.push(offsets);
-        }
+        let topology = read_level_topology(count, |len| read_metadata(&mut payload, len))?;
         let mut sets = Vec::with_capacity(count + 1);
         for _ in 0..=count {
             sets.push(Arc::new(SignVectors::open(&mut payload, dim)?));
@@ -219,42 +167,25 @@ impl QuantizedRouter<LazyStore> {
                 invalid("quantized router member count differs from raw centroid rows").into(),
             );
         }
-        let mut parent = None;
-        for (level, offsets) in topology.into_iter().enumerate().rev() {
-            if offsets.len() != sets[level + 1].len()
-                || !super::stacked::levels::ranges_cover_members(&offsets, sets[level].len())
-            {
-                return Err(
-                    invalid("quantized router membership does not cover its vector set").into(),
-                );
-            }
-            parent = Some(Box::new(QuantizedLevel {
-                parent,
-                offsets,
-                centroids: sets[level + 1].clone(),
-                members: sets[level].clone(),
-            }));
-        }
+        let level =
+            StackedIvf::from_vector_sets(topology, sets, Default::default(), |store| store.len())?;
         Ok(Self {
-            level: *parent.expect("validated nonempty hierarchy"),
+            level,
             raw: LazyStore::new(raw, dim),
             dim,
             metric: options.metric(),
             seed,
-            rotation: Rotation::new(dim, seed),
+            rotation_plan: rotation_plan(dim, seed),
         })
     }
 }
 
 impl<S: VectorArena<Elem = f32>> QuantizedRouter<S> {
     pub(crate) fn level_sizes(&self) -> Vec<usize> {
-        let mut sizes = Vec::new();
-        let mut level = Some(&self.level);
-        while let Some(current) = level {
-            sizes.push(current.offsets.len());
-            level = current.parent.as_deref();
-        }
-        sizes
+        self.level
+            .levels()
+            .map(|level| level.offsets.len())
+            .collect()
     }
 
     pub(crate) fn rank<T: VectorElement>(
@@ -264,10 +195,10 @@ impl<S: VectorArena<Elem = f32>> QuantizedRouter<S> {
     ) -> Ranking {
         assert_eq!(query.widened().len(), self.dim);
         debug_assert_eq!(query.metric(), self.metric);
-        let k = params.k.min(self.level.members.len());
+        let k = params.k.min(self.level.vectors.len());
         let capacity = k
             .saturating_mul(params.rerank_factor.max(1))
-            .min(self.level.members.len());
+            .min(self.level.vectors.len());
         let (candidates, stats) = if k == 0 {
             (Vec::new(), StackedSearchStats::default())
         } else if !query.routing_norm().is_finite()
@@ -277,7 +208,7 @@ impl<S: VectorArena<Elem = f32>> QuantizedRouter<S> {
             // scorer's total-order behavior for exceptional queries instead of
             // passing infinities/NaNs to bitplane preparation.
             (
-                (0..self.level.members.len())
+                (0..self.level.vectors.len())
                     .map(|row| Candidate {
                         node: ClusterId(row as u32),
                         sim: crate::vector::distance::Similarity::new(0.0),
@@ -286,19 +217,22 @@ impl<S: VectorArena<Elem = f32>> QuantizedRouter<S> {
                 StackedSearchStats::default(),
             )
         } else {
-            let prepared = SignQuery::new(query, &self.rotation);
+            let prepared = QuantizedVectorQuery::for_sign(query, &self.rotation_plan);
             let (selected, stats) = if params.flat {
-                let mut scores = ScoreBuffer::default();
-                self.level.members.score(
-                    0..self.level.members.len(),
+                let mut scores = ScoreBuffer::<ClusterId>::default();
+                self.level.vectors.score_rows(
                     &prepared,
-                    &mut scores,
-                    ClusterId::from,
+                    0..self.level.vectors.len(),
+                    &mut scores.similarities,
+                    &mut scores.estimates,
                 );
-                let scored = scores.candidates.len();
+                let scored = scores.similarities.len();
                 let mut selected = TopCandidates::new(capacity);
-                for candidate in scores.candidates {
-                    selected.offer(candidate);
+                for (row, sim) in scores.similarities.into_iter().enumerate() {
+                    selected.offer(Candidate {
+                        node: ClusterId::from(row),
+                        sim,
+                    });
                 }
                 (
                     selected,
@@ -321,7 +255,7 @@ impl<S: VectorArena<Elem = f32>> QuantizedRouter<S> {
             (selected.into_unordered(), stats)
         };
         let exact_scored = candidates.len();
-        let ranked = rerank_exact(&self.raw, query, &candidates, k);
+        let ranked = search::rerank_exact(&self.raw, query, &candidates, k);
         let candidate_count = ranked.len();
         Ranking {
             ranked: ranked.into_iter(),
@@ -331,40 +265,6 @@ impl<S: VectorArena<Elem = f32>> QuantizedRouter<S> {
             flat: params.flat,
         }
     }
-}
-
-/// Exact reads are grouped into contiguous selected runs. The heap stores
-/// canonical identities, so changing read order does not change tie breaking.
-pub(crate) fn rerank_exact<S: VectorArena<Elem = f32>, T: VectorElement>(
-    source: &S,
-    query: &VectorQuery<T>,
-    candidates: &[Candidate<ClusterId>],
-    k: usize,
-) -> Vec<Candidate<ClusterId>> {
-    let mut rows: Vec<_> = candidates.iter().map(|c| c.node).collect();
-    rows.sort_unstable();
-    let mut result = TopCandidates::new(k);
-    let mut scores = Vec::new();
-    let mut start = 0;
-    while start < rows.len() {
-        let mut end = start + 1;
-        while end < rows.len() && rows[end].0 == rows[end - 1].0 + 1 {
-            end += 1;
-        }
-        let first = rows[start].0 as usize;
-        source.batch_similarity(
-            query.widened(),
-            query.metric(),
-            query.routing_norm(),
-            first..first + end - start,
-            &mut scores,
-        );
-        for (&node, &sim) in rows[start..end].iter().zip(&scores) {
-            result.offer(Candidate { node, sim });
-        }
-        start = end;
-    }
-    result.into_sorted()
 }
 
 pub(crate) struct Ranking {
@@ -403,6 +303,7 @@ mod tests {
     use std::ops::Range;
     use std::sync::Mutex;
 
+    use super::search::rerank_exact;
     use super::*;
     use crate::directory::FileHandle;
     use crate::vector::clustering::IvfMatrix;
@@ -466,9 +367,9 @@ mod tests {
                 root_header..root_header + 4,
             ]
         );
-        let query = SignQuery::new(
+        let query = QuantizedVectorQuery::for_sign(
             &VectorQuery::new(Metric::L2, Arc::new(vec![0.15; dim])),
-            &opened.rotation,
+            &opened.rotation_plan,
         );
         let mut actual = ScoreBuffer::default();
         let mut expected = ScoreBuffer::default();
@@ -491,12 +392,14 @@ mod tests {
             ]
         );
         reads.lock().unwrap().clear();
-        opened
-            .level
-            .members
-            .score(rows..rows, &query, &mut actual, ClusterId::from);
+        opened.level.vectors.score(
+            rows..rows,
+            &query,
+            &mut actual.similarities,
+            &mut actual.estimates,
+        );
         assert!(reads.lock().unwrap().is_empty());
-        assert!(actual.candidates.is_empty());
+        assert!(actual.similarities.is_empty());
         Ok(())
     }
 
@@ -742,7 +645,7 @@ mod tests {
     #[test]
     fn deeper_hierarchy_shares_vector_sets_and_reranks_only_final_members() -> crate::Result<()> {
         let dim = 8;
-        let rotation = Rotation::new(dim, ROTATION_SEED);
+        let rotation = rotation_plan(dim, ROTATION_SEED);
         let raw: Vec<_> = (0..16).flat_map(|row| vec![row as f32; dim]).collect();
         let centroids: Vec<_> = [1.5, 5.5, 9.5, 13.5]
             .into_iter()
@@ -751,24 +654,26 @@ mod tests {
         let roots: Vec<_> = [3.5, 11.5].into_iter().flat_map(|x| vec![x; dim]).collect();
         let members = Arc::new(SignVectors::encode(&raw, dim, &rotation)?);
         let centroids = Arc::new(SignVectors::encode(&centroids, dim, &rotation)?);
-        let parent = QuantizedLevel {
+        let parent = StackedIvf {
+            config: Default::default(),
             parent: None,
             offsets: vec![(0, 2), (2, 4)],
-            members: centroids.clone(),
+            vectors: centroids.clone(),
             centroids: Arc::new(SignVectors::encode(&roots, dim, &rotation)?),
         };
         let built = QuantizedRouter {
-            level: QuantizedLevel {
+            level: StackedIvf {
+                config: Default::default(),
                 parent: Some(Box::new(parent)),
                 offsets: vec![(0, 4), (4, 8), (8, 12), (12, 16)],
                 centroids,
-                members,
+                vectors: members,
             },
             raw: InMemoryStore::new(raw.clone(), dim),
             dim,
             metric: Metric::L2,
             seed: ROTATION_SEED,
-            rotation,
+            rotation_plan: rotation,
         };
         let mut payload = Vec::new();
         built.serialize(&mut payload)?;
@@ -786,7 +691,7 @@ mod tests {
         assert_eq!(opened.level_sizes(), [4, 2]);
         assert!(Arc::ptr_eq(
             &opened.level.centroids,
-            &opened.level.parent.as_ref().unwrap().members
+            &opened.level.parent.as_ref().unwrap().vectors
         ));
         let query = VectorQuery::new(Metric::L2, Arc::new(vec![2.1; dim]));
         let ranking = opened.rank(

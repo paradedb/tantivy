@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use quant::cascade::{prepare_split_query_with_plan, PreparedSplitQuery};
+use quant::cascade::{prepare_split_query_with_plan, PreparedSplitQuery, QueryRotationPlan};
 
 use crate::schema::Metric;
 use crate::vector::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide, Similarity};
@@ -124,11 +124,48 @@ impl<T: VectorElement> VectorQuery<T> {
 
 // --- Quantized query ---
 
+/// Prepared code scoring independent of index topology and storage. Posting
+/// lists and routers use the same rotation/bitplane/LUT preparation and kernels;
+/// each caller chooses whether its stored vectors require cosine normalization.
+pub(crate) struct QuantizedVectorQuery {
+    pub(crate) codes: PreparedSplitQuery,
+    pub(crate) norm_squared: f32,
+    pub(crate) norm: f32,
+    pub(crate) metric: Metric,
+}
+
+impl QuantizedVectorQuery {
+    pub(crate) fn for_sign<T: VectorElement>(
+        query: &VectorQuery<T>,
+        plan: &QueryRotationPlan,
+    ) -> Self {
+        Self {
+            codes: plan.prepare_sign_query(query.widened(), SIGN_QUERY_BITS),
+            norm_squared: query.widened().iter().map(|x| x * x).sum(),
+            norm: query.routing_norm(),
+            metric: query.metric(),
+        }
+    }
+
+    fn for_documents<T: VectorElement>(
+        query: &VectorQuery<T>,
+        plan: &QueryRotationPlan,
+        grids: &[quant::model::Grid],
+    ) -> Self {
+        let vector = query.estimate_vector();
+        Self {
+            codes: prepare_split_query_with_plan(vector, plan, grids, SIGN_QUERY_BITS),
+            norm_squared: vector.iter().map(|x| x * x).sum(),
+            norm: query.estimate_norm,
+            metric: query.metric(),
+        }
+    }
+}
+
 /// Immutable query rotations, sign bitplanes, and LUTs shared across segments.
 pub(crate) struct QuantizedQueryCtx {
     pub(crate) index: Arc<QuantizedIndexCtx>,
-    prepared: PreparedSplitQuery,
-    query_norm: f32,
+    prepared: QuantizedVectorQuery,
     active_layers: usize,
 }
 
@@ -150,17 +187,14 @@ impl QuantizedQueryCtx {
     ) -> Self {
         assert!((1..=index.specs.len()).contains(&active_layers));
         debug_assert_eq!(index.meta.field().metric, query.metric());
-        let vector = query.estimate_vector();
-        let prepared = prepare_split_query_with_plan(
-            vector,
+        let prepared = QuantizedVectorQuery::for_documents(
+            query,
             &index.rotation_plan,
             &index.grids[..active_layers],
-            SIGN_QUERY_BITS,
         );
         Self {
             index,
             prepared,
-            query_norm: query.estimate_norm,
             active_layers,
         }
     }
@@ -173,7 +207,7 @@ impl QuantizedQueryCtx {
     /// sign-plane error for a 1-bit layer, zero for a grid layer. Callers that
     /// need the cumulative term sum it themselves (see `combine_refinement_decoded`).
     pub(crate) fn query_error_squared(&self, layer: usize) -> f64 {
-        self.prepared.query_error_squared(layer)
+        self.prepared.codes.query_error_squared(layer)
     }
 
     pub(crate) fn score_layer(
@@ -184,7 +218,7 @@ impl QuantizedQueryCtx {
         constant: Option<f32>,
     ) -> crate::Result<f32> {
         match (self.index.meta.field().metric, constant) {
-            (Metric::L2, Some(constant)) => Ok(self.prepared.score_layer(
+            (Metric::L2, Some(constant)) => Ok(self.prepared.codes.score_layer(
                 layer,
                 codes,
                 scale,
@@ -196,12 +230,10 @@ impl QuantizedQueryCtx {
                     "quantized L2 scoring requires a split constant",
                 ),
             )),
-            (Metric::Dot | Metric::Cosine, None) => Ok(self.prepared.score_layer_without_constant(
-                layer,
-                codes,
-                scale,
-                self.index.specs[layer],
-            )),
+            (Metric::Dot | Metric::Cosine, None) => Ok(self
+                .prepared
+                .codes
+                .score_layer_without_constant(layer, codes, scale, self.index.specs[layer])),
             (Metric::Dot | Metric::Cosine, Some(_)) => Err(TantivyError::DataCorruption(
                 crate::error::DataCorruption::comment_only(
                     "quantized dot and cosine scoring omit split constants",
@@ -220,7 +252,7 @@ impl QuantizedQueryCtx {
         code_stride: usize,
         out: &mut [f32],
     ) {
-        let fallbacks = self.prepared.score_layer_batch_unscaled(
+        let fallbacks = self.prepared.codes.score_layer_batch_unscaled(
             layer,
             codes,
             code_stride,
@@ -241,7 +273,7 @@ impl QuantizedQueryCtx {
         row_offsets: &[usize],
         out: &mut [f32],
     ) {
-        let fallbacks = self.prepared.score_layer_batch_unscaled_indexed(
+        let fallbacks = self.prepared.codes.score_layer_batch_unscaled_indexed(
             layer,
             codes,
             code_stride,
@@ -258,7 +290,7 @@ impl QuantizedQueryCtx {
         if self.index.meta.field().metric == Metric::L2 {
             (-centroid_score).max(0.0).sqrt()
         } else {
-            self.query_norm
+            self.prepared.norm
         }
     }
 
