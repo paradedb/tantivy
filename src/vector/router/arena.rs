@@ -1,10 +1,58 @@
 //! Centroid arenas: dense `dim`-strided vector storage the routers score against.
 
 use std::ops::Range;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
-use crate::schema::Metric;
-use crate::vector::distance::Similarity;
+use lru::LruCache;
+
+use crate::index::SegmentId;
+use crate::schema::{Field, Metric};
+use crate::vector::distance::{dot_bytes, norm_squared, norm_squared_bytes, Similarity};
 use crate::vector::VectorElement;
+
+type NormKey = (SegmentId, Field, usize, usize);
+type Norms = Arc<[OnceLock<f32>]>;
+
+struct NormCache {
+    entries: LruCache<NormKey, Norms>,
+    slots: usize,
+    capacity: usize,
+}
+
+impl NormCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: LruCache::unbounded(),
+            slots: 0,
+            capacity,
+        }
+    }
+
+    fn get(&mut self, key: NormKey) -> Option<Norms> {
+        let count = key.3;
+        if count == 0 || count > self.capacity {
+            return None;
+        }
+        if let Some(norms) = self.entries.get(&key) {
+            return Some(Arc::clone(norms));
+        }
+        while self.slots + count > self.capacity || self.entries.len() >= 256 {
+            let (_, evicted) = self.entries.pop_lru().unwrap();
+            self.slots -= evicted.len();
+        }
+        let norms: Norms = (0..count).map(|_| OnceLock::new()).collect();
+        self.slots += count;
+        self.entries.put(key, Arc::clone(&norms));
+        Some(norms)
+    }
+}
+
+// Segment UUIDs identify immutable centroid rows. Retain only scalar norms, never file handles.
+static CENTROID_NORMS: LazyLock<Mutex<NormCache>> = LazyLock::new(|| {
+    Mutex::new(NormCache::new(
+        32 * 1024 * 1024 / size_of::<OnceLock<f32>>(),
+    ))
+});
 
 /// A flat, `dim`-strided arena of vectors addressed by dense row index.
 ///
@@ -77,6 +125,7 @@ impl<T: VectorElement, S: std::ops::Deref<Target = [T]>> VectorArena for S {
 /// [`similarity`]: VectorArena::similarity
 pub(crate) struct FileSliceArena<T> {
     pub(crate) slice: crate::directory::FileSlice,
+    norms: Option<Norms>,
     _elem: std::marker::PhantomData<T>,
 }
 
@@ -85,12 +134,45 @@ impl<T> FileSliceArena<T> {
     pub(crate) fn new(slice: crate::directory::FileSlice) -> Self {
         FileSliceArena {
             slice,
+            norms: None,
             _elem: std::marker::PhantomData,
         }
     }
 }
 
+impl FileSliceArena<f32> {
+    pub(crate) fn cache_norms(&mut self, segment: SegmentId, field: Field, dim: usize) {
+        let count = self.num_vectors(dim);
+        self.norms = CENTROID_NORMS
+            .lock()
+            .unwrap()
+            .get((segment, field, dim, count));
+    }
+}
+
 impl<T: VectorElement> FileSliceArena<T> {
+    #[inline]
+    fn score(
+        &self,
+        query: &[T],
+        metric: Metric,
+        query_norm: f32,
+        index: usize,
+        bytes: &[u8],
+    ) -> Similarity {
+        if metric == Metric::Cosine {
+            if let Some(norms) = &self.norms {
+                let norm = *norms[index].get_or_init(|| norm_squared_bytes::<T>(bytes).sqrt());
+                return Similarity::new(if query_norm == 0.0 || norm == 0.0 {
+                    0.0
+                } else {
+                    dot_bytes(query, bytes) / (query_norm * norm)
+                });
+            }
+        }
+        metric.similarity_bytes_with_query_norm(query, bytes, query_norm)
+    }
+
     /// Row `index`'s little-endian bytes, one stride-sized ranged read.
     pub(crate) fn row_bytes(&self, dim: usize, index: u32) -> std::io::Result<common::OwnedBytes> {
         let stride = dim * T::SIZE_BYTES;
@@ -121,7 +203,12 @@ impl<T: VectorElement> VectorArena for FileSliceArena<T> {
         let bytes = self
             .row_bytes(dim, index)
             .expect("failed to read vector arena row");
-        metric.similarity_bytes(query, &bytes)
+        let query_norm = if metric == Metric::Cosine {
+            norm_squared(query).sqrt()
+        } else {
+            0.0
+        };
+        self.score(query, metric, query_norm, index as usize, &bytes)
     }
 
     fn batch_similarity(
@@ -145,7 +232,8 @@ impl<T: VectorElement> VectorArena for FileSliceArena<T> {
         out.extend(
             bytes
                 .chunks_exact(stride)
-                .map(|row| metric.similarity_bytes_with_query_norm(query, row, query_norm)),
+                .enumerate()
+                .map(|(i, row)| self.score(query, metric, query_norm, rows.start + i, row)),
         );
     }
 }
@@ -245,5 +333,86 @@ mod tests {
         arena.batch_similarity(query, Metric::Cosine, norm, 150..150, &mut actual);
         assert!(actual.is_empty());
         assert!(reads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cached_centroid_norms_preserve_scores_across_queries_and_reopens() {
+        for dim in [1, 7, 16, 37, 1024] {
+            let segment = SegmentId::generate_random();
+            let field = Field::from_field_id(0);
+            let values: Vec<f32> = [0.0, 1.0, 1e-19, 1e19]
+                .into_iter()
+                .flat_map(|scale| (0..dim).map(move |i| (i as f32 - 3.5) * scale))
+                .collect();
+            let slice = FileSlice::from(
+                values
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            );
+            let control = FileSliceArena::<f32>::new(slice.clone());
+            let mut cached = FileSliceArena::<f32>::new(slice.clone());
+            cached.cache_norms(segment, field, dim);
+            let norms = Arc::clone(cached.norms.as_ref().unwrap());
+            assert!(norms.iter().all(|n| n.get().is_none()));
+            for _ in 0..2 {
+                for scale in [0.0, 0.7, 1e-19, 1e19] {
+                    let query: Vec<f32> = (0..dim).map(|i| (i as f32 + 1.5) * scale).collect();
+                    for metric in [Metric::Cosine, Metric::L2, Metric::Dot] {
+                        let mut expected = Vec::new();
+                        let mut actual = Vec::new();
+                        let norm = norm_squared(&query).sqrt();
+                        control.batch_similarity(&query, metric, norm, 1..4, &mut expected);
+                        cached.batch_similarity(&query, metric, norm, 1..4, &mut actual);
+                        assert_eq!(
+                            expected
+                                .iter()
+                                .map(|v| v.score().to_bits())
+                                .collect::<Vec<_>>(),
+                            actual
+                                .iter()
+                                .map(|v| v.score().to_bits())
+                                .collect::<Vec<_>>(),
+                        );
+                        for row in 0..4 {
+                            assert_eq!(
+                                control
+                                    .similarity(metric, dim, row, &query)
+                                    .score()
+                                    .to_bits(),
+                                cached
+                                    .similarity(metric, dim, row, &query)
+                                    .score()
+                                    .to_bits(),
+                            );
+                        }
+                    }
+                }
+                cached = FileSliceArena::<f32>::new(slice.clone());
+                cached.cache_norms(segment, field, dim);
+                assert!(Arc::ptr_eq(&norms, cached.norms.as_ref().unwrap()));
+                assert!(norms.iter().all(|n| n.get().is_some()));
+            }
+        }
+    }
+
+    #[test]
+    fn norm_cache_isolates_segments_and_fields_and_evicts_by_size() {
+        let mut cache = NormCache::new(6);
+        let segment = SegmentId::generate_random();
+        let key = (segment, Field::from_field_id(0), 1024, 2);
+        let original = cache.get(key).unwrap();
+        original[0].set(3.0).unwrap();
+        let other_field = (segment, Field::from_field_id(1), 1024, 2);
+        let other_segment = (SegmentId::generate_random(), key.1, 1024, 2);
+        assert!(cache.get(other_field).unwrap()[0].get().is_none());
+        assert!(cache.get(other_segment).unwrap()[0].get().is_none());
+        assert!(Arc::ptr_eq(&original, &cache.get(key).unwrap()));
+        assert!(cache.get((segment, key.1, 1024, 7)).is_none());
+        cache.get((segment, key.1, 1024, 4)).unwrap();
+        assert_eq!(cache.slots, 6);
+        assert!(!cache.entries.contains(&other_field));
+        assert!(!cache.entries.contains(&other_segment));
+        assert_eq!(original[0].get(), Some(&3.0));
     }
 }

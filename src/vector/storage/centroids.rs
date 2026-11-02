@@ -64,6 +64,16 @@ pub(crate) struct ClusterIndex {
 }
 
 impl ClusterIndex {
+    pub(crate) fn cache_norms(
+        &mut self,
+        segment: crate::index::SegmentId,
+        field: crate::schema::Field,
+    ) {
+        if self.metric == Metric::Cosine {
+            self.router.cache_norms(segment, field);
+        }
+    }
+
     /// Write slot `[0]` of the `.centroids` composite for a field. `num_docs`
     /// is the number of distinct docs assigned, not the posting-row total.
     pub(crate) fn serialize_centroids<W: Write + ?Sized>(

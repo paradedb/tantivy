@@ -14,7 +14,7 @@ use crate::vector::search::prepared::VectorQuery;
 use crate::vector::VectorElement;
 
 pub(crate) struct ExactRouter<S> {
-    centroids: S,
+    pub(super) centroids: S,
     num_centroids: usize,
     dim: usize,
     metric: Metric,

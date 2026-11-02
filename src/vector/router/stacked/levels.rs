@@ -258,6 +258,14 @@ pub(crate) struct LazyStore {
 }
 
 impl LazyStore {
+    pub(crate) fn cache_norms(
+        &mut self,
+        segment: crate::index::SegmentId,
+        field: crate::schema::Field,
+    ) {
+        self.arena.cache_norms(segment, field, self.dim);
+    }
+
     /// Wraps `rows` (row-major `n × dim` little-endian `f32`s).
     pub(crate) fn new(rows: FileSlice, dim: usize) -> Self {
         LazyStore {

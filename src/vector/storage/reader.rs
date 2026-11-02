@@ -120,6 +120,7 @@ type CentroidSlices = (
 );
 
 struct VectorSource {
+    segment: crate::index::SegmentId,
     metadata: BlockMetadata,
     composite: CompositeFile,
     field: Field,
@@ -252,6 +253,7 @@ impl VectorFieldReader {
         Ok(Self {
             options,
             source: Some(VectorSource {
+                segment: segment_reader.segment_id(),
                 metadata,
                 composite: vec_composite,
                 field,
@@ -291,14 +293,10 @@ impl VectorIndexReader {
         };
         let index = if let Some((version, centroids, offsets, router_slot, bounds)) = centroid_slots
         {
-            Some(ClusterIndex::open(
-                version,
-                &options,
-                centroids,
-                offsets,
-                router_slot,
-                bounds,
-            )?)
+            let mut index =
+                ClusterIndex::open(version, &options, centroids, offsets, router_slot, bounds)?;
+            index.cache_norms(source.segment, source.field);
+            Some(index)
         } else {
             None
         };
@@ -928,6 +926,7 @@ mod tests {
             source: Some(VectorSource {
                 metadata,
                 composite: tracked_id_composite(ids, &id_reads),
+                segment: crate::index::SegmentId::generate_random(),
                 field: Field::from_field_id(0),
                 max_doc: 3,
                 centroid_slots: None,
@@ -989,6 +988,7 @@ mod tests {
             source: Some(VectorSource {
                 metadata: BlockMetadata::open(FileSlice::from(data), &options, false)?,
                 composite: tracked_id_composite(vec![0], &id_reads),
+                segment: crate::index::SegmentId::generate_random(),
                 field: Field::from_field_id(0),
                 max_doc: 1,
                 centroid_slots: None,

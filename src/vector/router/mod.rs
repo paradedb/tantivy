@@ -169,6 +169,17 @@ impl Iterator for RouterIter {
 }
 
 impl OpenedRouter {
+    pub(crate) fn cache_norms(
+        &mut self,
+        segment: crate::index::SegmentId,
+        field: crate::schema::Field,
+    ) {
+        match self {
+            Self::Stacked(router) => router.vectors.cache_norms(segment, field),
+            Self::Exact(router) => router.centroids.cache_norms(segment, field),
+        }
+    }
+
     pub(crate) fn kind(&self) -> RouterKind {
         match self {
             Self::Stacked(_) => RouterKind::Stacked,
