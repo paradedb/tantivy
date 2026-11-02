@@ -62,7 +62,6 @@ pub(crate) struct QuantizedRouter<S> {
     dim: usize,
     metric: Metric,
     seed: u64,
-    rotation: Rotation,
 }
 
 impl QuantizedRouter<InMemoryStore> {
@@ -115,7 +114,6 @@ impl QuantizedRouter<InMemoryStore> {
             dim: options.dim(),
             metric: options.metric(),
             seed: ROTATION_SEED,
-            rotation,
         })
     }
 
@@ -241,7 +239,6 @@ impl QuantizedRouter<LazyStore> {
             dim,
             metric: options.metric(),
             seed,
-            rotation: Rotation::new(dim, seed),
         })
     }
 }
@@ -286,7 +283,7 @@ impl<S: VectorArena<Elem = f32>> QuantizedRouter<S> {
                 StackedSearchStats::default(),
             )
         } else {
-            let prepared = SignQuery::new(query, &self.rotation);
+            let prepared = SignQuery::new(query, &Rotation::new(self.dim, self.seed));
             let (selected, stats) = if params.flat {
                 let mut scores = ScoreBuffer::default();
                 self.level.members.score(
@@ -356,7 +353,9 @@ pub(crate) fn rank_global<S: VectorArena<Elem = f32>, T: VectorElement>(
                 debug_assert_eq!(query.metric(), index.metric);
                 prepared
                     .entry(index.seed)
-                    .or_insert_with(|| Arc::new(SignQuery::new(query, &index.rotation)))
+                    .or_insert_with(|| {
+                        Arc::new(SignQuery::new(query, &Rotation::new(index.dim, index.seed)))
+                    })
                     .clone()
             })
         });
@@ -741,7 +740,7 @@ mod tests {
         );
         let query = SignQuery::new(
             &VectorQuery::new(Metric::L2, Arc::new(vec![0.15; dim])),
-            &opened.rotation,
+            &Rotation::new(opened.dim, opened.seed),
         );
         let mut actual = ScoreBuffer::default();
         let mut expected = ScoreBuffer::default();
@@ -1041,7 +1040,6 @@ mod tests {
             dim,
             metric: Metric::L2,
             seed: ROTATION_SEED,
-            rotation,
         };
         let mut payload = Vec::new();
         built.serialize(&mut payload)?;

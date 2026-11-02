@@ -4,7 +4,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use common::{HasLen, OwnedBytes};
-use quant::cascade::{LayerSpec, QueryRotationPlan};
+use quant::cascade::LayerSpec;
 use quant::model::f16::f16_to_f32;
 use quant::model::Grid;
 
@@ -227,19 +227,19 @@ impl QuantizedSidecarBatch {
         Ok(f16_to_f32(bits))
     }
 
-    #[cfg(test)]
     pub(crate) fn scales(&self) -> &[u8] {
         &self.scales
     }
 
-    #[cfg(test)]
     pub(crate) fn gammas(&self) -> &[u8] {
         &self.gammas
     }
 
-    #[cfg(test)]
     pub(crate) fn error_ratios(&self) -> &[u8] {
         &self.error_ratios
+    }
+    pub(crate) fn constants(&self) -> Option<&[u8]> {
+        self.constants.as_deref()
     }
 }
 
@@ -468,6 +468,9 @@ impl QuantizedLayerReader {
         Ok(cost)
     }
     fn validate_codes(&self, bytes: &OwnedBytes, rows: &Range<usize>) -> crate::Result<()> {
+        if self.dim * usize::from(self.bits) == self.code_stride * 8 {
+            return Ok(());
+        }
         for (local, code) in bytes.chunks_exact(self.code_stride).enumerate() {
             if !quantized_code_tail_is_zero(code, self.dim, self.bits) {
                 return Err(DataCorruption::comment_only(format!(
@@ -736,6 +739,24 @@ pub(crate) struct QuantizedClusterReader<'a> {
 }
 
 impl QuantizedClusterReader<'_> {
+    pub(crate) fn spans_pages(&self) -> bool {
+        self.codes
+            .storage_block_len()
+            .is_some_and(|len| self.codes.len() > len)
+    }
+
+    pub(crate) fn read_code_chunk(&self, rows: Range<usize>) -> crate::Result<(usize, OwnedBytes)> {
+        let stride = self.layer.code_stride;
+        let offset = (rows.start - self.rows.start) * stride;
+        let end = self
+            .codes
+            .storage_block_range(offset)
+            .map(|page| (self.rows.start + page.end / stride).max(rows.start + 1))
+            .unwrap_or(rows.end)
+            .min(rows.end);
+        Ok((end, self.read_codes(rows.start..end)?))
+    }
+
     /// Emits code ranges in row order into reusable scratch, with overlap-only page grouping.
     pub(crate) fn plan_codes(&self, rows: &[usize], ranges: &mut Vec<Range<usize>>) {
         ranges.clear();
@@ -890,7 +911,6 @@ pub(crate) struct QuantizedIndexCtx {
     pub(crate) meta: Arc<VectorColMetadata>,
     pub(crate) specs: Vec<LayerSpec>,
     pub(crate) grids: Vec<Grid>,
-    pub(crate) rotation_plan: QueryRotationPlan,
 }
 
 impl QuantizedIndexCtx {
@@ -902,13 +922,7 @@ impl QuantizedIndexCtx {
             ));
         }
         let (specs, grids) = meta.runtime();
-        let rotation_plan = QueryRotationPlan::new(meta.field().dim as usize, &specs);
-        Ok(Self {
-            meta,
-            specs,
-            grids,
-            rotation_plan,
-        })
+        Ok(Self { meta, specs, grids })
     }
     #[cfg(test)]
     pub(crate) fn from_config(config: VectorQuantizationConfig) -> crate::Result<Self> {
@@ -1245,6 +1259,64 @@ mod tests {
             );
         }
         assert!(validate_decoded_sidecar(&[1.0, 1.0], &[0.0, 0.5], 0).is_ok());
+    }
+
+    #[test]
+    fn code_chunks_preserve_rows_across_page_boundaries() -> crate::Result<()> {
+        for dim in [64, 65, 1024] {
+            let stride = quantized_code_stride(dim, 1);
+            let mut codes = vec![0_u8; 137 * stride];
+            for (row, code) in codes.chunks_exact_mut(stride).enumerate() {
+                for (byte, value) in code[..dim.div_ceil(8)].iter_mut().enumerate() {
+                    *value = ((row * 17 + byte * 31) % 251) as u8;
+                }
+                if dim % 8 != 0 {
+                    code[dim / 8] &= (1 << (dim % 8)) - 1;
+                }
+            }
+            for page_len in [127, 8192] {
+                let reads = Arc::new(Mutex::new(Vec::new()));
+                let reader = test_layer_tracked(
+                    FileSlice::from(codes.clone()),
+                    FileSlice::from(test_sidecar(&[0.5; 137], &[1.0; 137])),
+                    None,
+                    &[0, 5, 137],
+                    dim,
+                    1,
+                    Some((Arc::clone(&reads), page_len)),
+                );
+                let cluster = reader.cluster(5)?;
+                reads.lock().unwrap().clear();
+                let mut actual = Vec::new();
+                let mut start = 7;
+                while start < 135 {
+                    let (end, bytes) = cluster.read_code_chunk(start..135)?;
+                    assert!(end > start && end <= 135);
+                    let read = reads.lock().unwrap().last().unwrap().clone();
+                    assert!(read.start / page_len == (read.end - 1) / page_len || end == start + 1);
+                    actual.extend_from_slice(&bytes);
+                    start = end;
+                }
+                assert_eq!(actual, codes[7 * stride..135 * stride]);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn padding_checks_distinguish_payload_from_tail() {
+        for dim in [64, 65, 1024] {
+            let stride = quantized_code_stride(dim, 1);
+            let reader = test_layer(
+                FileSlice::from(vec![0xff; stride]),
+                FileSlice::from(test_sidecar(&[0.5], &[1.0])),
+                None,
+                &[0, 1],
+                dim,
+                1,
+            );
+            assert_eq!(reader.read_codes(0..1).is_ok(), dim != 65);
+        }
     }
 
     // A whole band requires one read; sparse columns plan independently without crossing blocks.

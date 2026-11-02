@@ -93,6 +93,43 @@ fn decode_band(
     out: &mut Decoded,
     kernel_offsets: &mut Vec<usize>,
 ) -> crate::Result<()> {
+    if selected.offsets.is_none() {
+        let cluster = spec.reader.cluster_in_block(selected.cluster)?;
+        if cluster.spans_pages() {
+            let first = selected.rows.start - cluster.rows.start;
+            let last = first + selected.len();
+            if spec.reader.has_norms() {
+                let norms = cluster.read_norms()?;
+                out.norms.resize(selected.len(), 0.0);
+                decode_f32s(&norms[first * 4..last * 4], &mut out.norms);
+            }
+            let mut start = selected.rows.start;
+            while start < selected.rows.end {
+                let (end, codes) = cluster.read_code_chunk(start..selected.rows.end)?;
+                spec.query.score_layer_batch_unscaled(
+                    spec.index,
+                    &codes,
+                    spec.reader.code_stride(),
+                    &mut out.kernel[start - selected.rows.start..end - selected.rows.start],
+                );
+                start = end;
+            }
+            let sidecar = cluster.read_sidecar()?;
+            decode_f32s(&sidecar.scales()[first * 4..last * 4], &mut out.scales);
+            decode_f16s(&sidecar.gammas()[first * 2..last * 2], &mut out.gammas);
+            decode_f16s(
+                &sidecar.error_ratios()[first * 2..last * 2],
+                &mut out.errors,
+            );
+            if spec.metric() == Metric::L2 {
+                let constants = sidecar.constants().ok_or_else(|| {
+                    DataCorruption::comment_only("quantized L2 band is missing constants")
+                })?;
+                decode_f32s(&constants[first * 4..last * 4], &mut out.constants);
+            }
+            return validate_decoded_sidecar(&out.gammas, &out.errors, selected.rows.start);
+        }
+    }
     let band = spec
         .reader
         .read_batch_in_block(selected.cluster, selected.rows.clone())?;

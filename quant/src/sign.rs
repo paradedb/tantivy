@@ -405,14 +405,28 @@ pub fn estimate_asym_batch_unscaled(
             let planes = [p0.as_slice(), p1.as_slice(), p2.as_slice(), p3.as_slice()];
             // SAFETY: the assertions above checked the batch shape.
             return unsafe {
-                neon::batch(neon::accumulator(), rows, words_per_row, planes, q, out)
+                neon::batch(
+                    neon::accumulator(),
+                    rows.as_ptr(),
+                    words_per_row,
+                    planes,
+                    q,
+                    out,
+                )
             };
         }
         [p0, p1, p2] => {
             let planes = [p0.as_slice(), p1.as_slice(), p2.as_slice()];
             // SAFETY: the assertions above checked the batch shape.
             return unsafe {
-                neon::batch(neon::accumulator(), rows, words_per_row, planes, q, out)
+                neon::batch(
+                    neon::accumulator(),
+                    rows.as_ptr(),
+                    words_per_row,
+                    planes,
+                    q,
+                    out,
+                )
             };
         }
         _ => {}
@@ -453,7 +467,7 @@ pub fn estimate_asym_batch_unscaled_indexed(
             return unsafe {
                 neon::indexed(
                     neon::accumulator(),
-                    rows,
+                    rows.as_ptr(),
                     words_per_row,
                     row_offsets,
                     planes,
@@ -468,7 +482,7 @@ pub fn estimate_asym_batch_unscaled_indexed(
             return unsafe {
                 neon::indexed(
                     neon::accumulator(),
-                    rows,
+                    rows.as_ptr(),
                     words_per_row,
                     row_offsets,
                     planes,
@@ -483,6 +497,94 @@ pub fn estimate_asym_batch_unscaled_indexed(
     x86::indexed(rows, words_per_row, row_offsets, q, out);
     #[cfg(not(target_arch = "x86_64"))]
     indexed_body(rows, words_per_row, row_offsets, q, out);
+}
+
+/// Scores little-endian sign bytes, returning whether an alignment copy was needed.
+pub fn estimate_asym_bytes_batch_unscaled(
+    rows: &[u8],
+    words_per_row: usize,
+    q: &QueryPlanes,
+    out: &mut [f32],
+) -> u64 {
+    assert!(words_per_row > 0);
+    assert_eq!(rows.len() % 8, 0);
+    assert_eq!((rows.len() / 8) % words_per_row, 0);
+    assert_eq!((rows.len() / 8) / words_per_row, out.len());
+    assert!(!q.planes.is_empty());
+    assert!(q.planes.iter().all(|plane| plane.len() == words_per_row));
+
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
+    {
+        let base = rows.as_ptr().cast::<u64>();
+        let acc = neon::accumulator();
+        // SAFETY: shape checks bound every read; the kernels accept unaligned pointers.
+        unsafe {
+            match q.planes.as_slice() {
+                [a, b, c, d] => {
+                    neon::batch(acc, base, words_per_row, [a, b, c, d], q, out);
+                    return 0;
+                }
+                [a, b, c] => {
+                    neon::batch(acc, base, words_per_row, [a, b, c], q, out);
+                    return 0;
+                }
+                _ => {}
+            }
+        }
+    }
+    let words = words_from_le_bytes(rows);
+    estimate_asym_batch_unscaled(&words, words_per_row, q, out);
+    u64::from(matches!(words, Cow::Owned(_)))
+}
+
+/// Scores selected little-endian sign rows, returning whether an alignment copy was needed.
+pub fn estimate_asym_bytes_batch_unscaled_indexed(
+    rows: &[u8],
+    words_per_row: usize,
+    row_offsets: &[usize],
+    q: &QueryPlanes,
+    out: &mut [f32],
+) -> u64 {
+    assert!(words_per_row > 0);
+    assert_eq!(rows.len() % 8, 0);
+    assert_eq!((rows.len() / 8) % words_per_row, 0);
+    assert_eq!(row_offsets.len(), out.len());
+    assert!(row_offsets
+        .iter()
+        .all(|&row| row < rows.len() / 8 / words_per_row));
+    assert!(!q.planes.is_empty());
+    assert!(q.planes.iter().all(|plane| plane.len() == words_per_row));
+
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
+    {
+        let base = rows.as_ptr().cast::<u64>();
+        let acc = neon::accumulator();
+        // SAFETY: every offset is in bounds; the kernels accept unaligned pointers.
+        unsafe {
+            match q.planes.as_slice() {
+                [a, b, c, d] => {
+                    neon::indexed(acc, base, words_per_row, row_offsets, [a, b, c, d], q, out);
+                    return 0;
+                }
+                [a, b, c] => {
+                    neon::indexed(acc, base, words_per_row, row_offsets, [a, b, c], q, out);
+                    return 0;
+                }
+                _ => {}
+            }
+        }
+    }
+    let words = words_from_le_bytes(rows);
+    estimate_asym_batch_unscaled_indexed(&words, words_per_row, row_offsets, q, out);
+    u64::from(matches!(words, Cow::Owned(_)))
 }
 
 /// NEON popcount kernels for the three- and four-plane batch scorers.
@@ -529,10 +631,11 @@ mod neon {
     /// # Safety
     ///
     /// The caller must have checked the batch shape: `words_per_row > 0`, every plane holds
-    /// `words_per_row` words, and `rows.len() == out.len() * words_per_row`.
+    /// `words_per_row` words, and `rows` addresses `out.len() * words_per_row` readable words.
+    /// Row pointers may be unaligned.
     pub(super) unsafe fn batch<const P: usize>(
         acc: Accumulator,
-        rows: &[u64],
+        rows: *const u64,
         words_per_row: usize,
         planes: [&[u64]; P],
         q: &QueryPlanes,
@@ -555,10 +658,10 @@ mod neon {
     ///
     /// The caller must have checked the batch shape: `words_per_row > 0`, every plane holds
     /// `words_per_row` words, `row_offsets.len() == out.len()`, and every offset is below
-    /// `rows.len() / words_per_row`.
+    /// the number of readable rows. Row pointers may be unaligned.
     pub(super) unsafe fn indexed<const P: usize>(
         acc: Accumulator,
-        rows: &[u64],
+        rows: *const u64,
         words_per_row: usize,
         row_offsets: &[usize],
         planes: [&[u64]; P],
@@ -583,17 +686,18 @@ mod neon {
     /// # Safety
     ///
     /// FEAT_DotProd must be present, every plane must hold `words` words, and
-    /// `row_index(i) * words + words <= rows.len()` for every `i < out.len()`.
+    /// `rows` must address the complete row at `row_index(i)` for every `i < out.len()`.
+    /// Row pointers may be unaligned.
     #[target_feature(enable = "dotprod")]
     unsafe fn drive_dot<const P: usize>(
-        rows: &[u64],
+        rows: *const u64,
         words: usize,
         row_index: impl Fn(usize) -> usize,
         planes: [&[u64]; P],
         q: &QueryPlanes,
         out: &mut [f32],
     ) {
-        let base = rows.as_ptr();
+        let base = rows;
         for pair in 0..out.len() / 2 {
             let rows2 = [
                 base.add(row_index(pair * 2) * words),
@@ -614,17 +718,17 @@ mod neon {
     ///
     /// # Safety
     ///
-    /// Every plane must hold `words` words, and `row_index(i) * words + words <= rows.len()` for
-    /// every `i < out.len()`.
+    /// Every plane must hold `words` words, and `rows` must address the complete row at
+    /// `row_index(i)` for every `i < out.len()`. Row pointers may be unaligned.
     unsafe fn drive_widen<const P: usize>(
-        rows: &[u64],
+        rows: *const u64,
         words: usize,
         row_index: impl Fn(usize) -> usize,
         planes: [&[u64]; P],
         q: &QueryPlanes,
         out: &mut [f32],
     ) {
-        let base = rows.as_ptr();
+        let base = rows;
         for pair in 0..out.len() / 2 {
             let rows2 = [
                 base.add(row_index(pair * 2) * words),
@@ -829,7 +933,7 @@ mod neon {
     ) {
         if words % 2 == 1 {
             let last = words - 1;
-            let signs = *row.add(last);
+            let signs = row.add(last).read_unaligned();
             *positives += signs.count_ones();
             for (sum, plane) in sums.iter_mut().zip(planes) {
                 *sum += u64::from((signs & plane[last]).count_ones());
@@ -1076,6 +1180,54 @@ mod tests {
     use rand_core::{RngCore, SeedableRng};
 
     use super::*;
+
+    #[test]
+    fn byte_batches_match_words_at_every_alignment() {
+        for d in [1_usize, 63, 64, 65, 128, 129, 1024, 1536] {
+            let words = d.div_ceil(64);
+            for bits in 1..=4 {
+                let q = prepare_query(
+                    &(0..d).map(|i| (i as f32 * 0.017).sin()).collect::<Vec<_>>(),
+                    bits,
+                );
+                for count in [0, 1, 2, 5] {
+                    let rows = (0..count * words)
+                        .map(|i| (i as u64).wrapping_mul(0x9e3779b97f4a7c15))
+                        .collect::<Vec<_>>();
+                    let mut expected = vec![0.0; count];
+                    estimate_asym_batch_unscaled(&rows, words, &q, &mut expected);
+                    let indices = if count > 1 {
+                        vec![count - 1, 0, count - 1]
+                    } else {
+                        (0..count).collect()
+                    };
+                    let mut storage = vec![0_u8; rows.len() * 8 + 8];
+                    for offset in 0..8 {
+                        for (i, row) in rows.iter().enumerate() {
+                            storage[offset + i * 8..offset + (i + 1) * 8]
+                                .copy_from_slice(&row.to_le_bytes());
+                        }
+                        let bytes = &storage[offset..offset + rows.len() * 8];
+                        let mut actual = vec![0.0; count];
+                        estimate_asym_bytes_batch_unscaled(bytes, words, &q, &mut actual);
+                        assert_eq!(actual, expected, "dim={d} bits={bits} offset={offset}");
+                        let mut indexed = vec![0.0; indices.len()];
+                        estimate_asym_bytes_batch_unscaled_indexed(
+                            bytes,
+                            words,
+                            &indices,
+                            &q,
+                            &mut indexed,
+                        );
+                        assert_eq!(
+                            indexed,
+                            indices.iter().map(|&i| expected[i]).collect::<Vec<_>>()
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn packing_round_trip() {
@@ -1420,7 +1572,9 @@ mod tests {
                                 let mut got = vec![0.0_f32; expected.len()];
                                 // SAFETY: the fixture packs `expected.len()` whole rows of
                                 // `words` words and planes of `words` words.
-                                unsafe { neon::batch(acc, packed, words, planes, q, &mut got) };
+                                unsafe {
+                                    neon::batch(acc, packed.as_ptr(), words, planes, q, &mut got)
+                                };
                                 for (row, (got, want)) in got.iter().zip(expected).enumerate() {
                                     assert_eq!(
                                         got.to_bits(),
@@ -1434,7 +1588,7 @@ mod tests {
                                 unsafe {
                                     neon::indexed(
                                         acc,
-                                        packed,
+                                        packed.as_ptr(),
                                         words,
                                         row_offsets,
                                         planes,

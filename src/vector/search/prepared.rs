@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use quant::cascade::{prepare_split_query_with_plan, PreparedSplitQuery};
+use quant::cascade::{prepare_split_query_with_plan, PreparedSplitQuery, QueryRotationPlan};
 
 use crate::schema::Metric;
 use crate::vector::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide, Similarity};
@@ -161,7 +161,7 @@ impl QuantizedQueryCtx {
         let vector = query.estimate_vector();
         let prepared = prepare_split_query_with_plan(
             vector,
-            &index.rotation_plan,
+            &QueryRotationPlan::new(vector.len(), &index.specs),
             &index.grids[..active_layers],
             SIGN_QUERY_BITS,
         );
@@ -284,7 +284,7 @@ impl QuantizedQueryCtx {
 mod tests {
     use std::sync::Arc;
 
-    use super::{QuantizedIndexCtx, QuantizedQueryCtx, VectorQuery};
+    use super::{QuantizedIndexCtx, QuantizedQueryCtx, QueryRotationPlan, VectorQuery};
     use crate::schema::{Metric, VectorOptions};
     use crate::vector::distance::{norm_squared, norm_squared_wide};
     use crate::vector::{VectorQuantizationConfig, VectorQuantizationLayer};
@@ -393,7 +393,7 @@ mod tests {
         let index = Arc::new(QuantizedIndexCtx::from_config(config).unwrap());
         let expected = quant::cascade::audit_split_query_layer_error_squared_with_plan(
             &query_values,
-            &index.rotation_plan,
+            &QueryRotationPlan::new(query_values.len(), &index.specs),
             &index.grids,
             4,
         );
