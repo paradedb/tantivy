@@ -36,7 +36,7 @@ impl Drop for ReadKindGuard {
 }
 
 /// Summable physical read requests; storage blocks count repetitions across requests.
-#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct VectorIoStats {
     /// Successful byte-read requests.
     pub reads: u64,

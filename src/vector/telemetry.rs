@@ -100,7 +100,7 @@ fn slot(stage: VectorStage) -> usize {
 
 /// Exclusive time and storage reads per stage, and sign-word fallbacks per layer, of one measured
 /// operation.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct StageTotals {
     time_ns: [u64; STAGE_SLOTS],
     io: [VectorIoStats; STAGE_SLOTS],

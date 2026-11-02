@@ -206,7 +206,7 @@ impl OpenedRouter {
 }
 
 /// Router-specific statistics captured after a ranking iterator stops.
-#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RouterMetrics {
     /// The stacked router's work.

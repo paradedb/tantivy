@@ -19,6 +19,7 @@ use crate::collector::{
 use crate::query::Weight;
 use crate::schema::Field;
 use crate::vector::params::ProbeParams;
+use crate::vector::search::cluster_source::ClusterSource;
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery, VectorQuery};
 use crate::vector::search::scan::bound::{PruningBound, TopK};
 use crate::vector::search::scan::heap::{tie_break_key, TieBreakHits};
@@ -39,7 +40,7 @@ use crate::vector::telemetry::enter_vector_stage;
 use crate::vector::telemetry::measure;
 #[cfg(test)]
 use crate::vector::tie_break::NoTieBreak;
-use crate::vector::{VectorElement, VectorStage};
+use crate::vector::{VectorElement, VectorRoutingPlan, VectorStage};
 use crate::{DocAddress, Score, SegmentOrdinal, SegmentReader, TantivyError};
 
 /// Per-segment vector search state: the segment's [`VectorIndexReader`] and the prepared query.
@@ -50,6 +51,7 @@ pub(crate) struct SegmentSearcher<T: VectorElement> {
     /// `None` when the segment is not quantized or quantized scanning is off.
     quantized: Option<Arc<QuantizedQueryCtx>>,
     probe_params: ProbeParams,
+    routing_plan: Option<Arc<VectorRoutingPlan>>,
     segment_ord: SegmentOrdinal,
     /// Exact scores segments of this collector have finished. The scan seeds its TopK from them
     /// (partial k). `None` seeds nothing.
@@ -80,6 +82,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
             query,
             quantized,
             probe_params,
+            routing_plan: None,
             segment_ord,
             collector_topk: None,
             shared_topk_threshold: Arc::new(AtomicSharedThreshold::default()),
@@ -99,6 +102,11 @@ impl<T: VectorElement> SegmentSearcher<T> {
     ) -> Self {
         self.collector_topk = Some(collector_topk);
         self.shared_topk_threshold = shared_topk_threshold;
+        self
+    }
+
+    pub(crate) fn with_routing_plan(mut self, plan: Option<Arc<VectorRoutingPlan>>) -> Self {
+        self.routing_plan = plan;
         self
     }
 
@@ -208,7 +216,26 @@ impl<T: VectorElement> SegmentSearcher<T> {
         C: Comparator<K::SegmentSortKey>,
     {
         let init = enter_vector_stage(VectorStage::ScanInit);
-        let plan = SegmentPlan::build(&self.probe_params, index, weight, segment, top_n)?;
+        let routed = self
+            .routing_plan
+            .as_ref()
+            .map(|plan| {
+                plan.segments.get(&segment.segment_id()).ok_or_else(|| {
+                    TantivyError::InvalidArgument("segment is missing from the routing plan".into())
+                })
+            })
+            .transpose()?;
+        let plan = match routed {
+            Some(route) => SegmentPlan::with_budget(
+                &self.probe_params,
+                index,
+                weight,
+                segment,
+                top_n,
+                route.budget,
+            )?,
+            None => SegmentPlan::build(&self.probe_params, index, weight, segment, top_n)?,
+        };
         let capacity = plan.capacity_hint();
         let SegmentPlan {
             budget,
@@ -249,6 +276,25 @@ impl<T: VectorElement> SegmentSearcher<T> {
         )?;
         drop(init);
         let source = match source {
+            Source::Router(filter) if routed.is_some() => {
+                let route = routed.unwrap();
+                let mut clusters = RouterClusters::for_global(
+                    &self.reader,
+                    &self.query,
+                    budget,
+                    filter,
+                    segment,
+                    route.metrics,
+                );
+                for &candidate in &route.clusters {
+                    if let Some(rows) = clusters.probe_global(candidate, scan.feedback())? {
+                        let scored = scan.shortlist(&rows)?;
+                        clusters.admitted(scored, scan.feedback())?;
+                    }
+                }
+                scan.refine_shortlist()?;
+                SourceReport::Router(clusters.finish())
+            }
             Source::Router(filter) => {
                 let mut clusters = RouterClusters::for_segment(
                     &self.reader,

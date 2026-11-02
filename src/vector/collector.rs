@@ -15,11 +15,13 @@ use crate::collector::{
     compare_for_top_k, AtomicSharedThreshold, Collector, ComparableDoc, SegmentCollector,
     SegmentSortKeyComputer, SharedThresholdArc, SortKeyComputer,
 };
-use crate::index::SegmentReader;
+use crate::index::{SegmentId, SegmentReader};
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Metric, Schema};
 use crate::vector::params::ProbeParams;
+use crate::vector::router::candidate::Candidate;
 use crate::vector::router::global::GlobalRanking;
+use crate::vector::router::RouterMetrics;
 use crate::vector::search::cluster_source::ClusterSource;
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
 use crate::vector::search::scan::bound::{ExactMerge, PruningBound, TopK};
@@ -77,6 +79,23 @@ impl Hash for PreparedKey {
 /// Shared initialization cell so each metadata key prepares its query exactly once.
 type PreparedCell = Arc<OnceLock<Arc<QuantizedQueryCtx>>>;
 
+/// A fixed, globally selected set of IVF probes for one query and segment snapshot.
+/// Serialize this plan to share routing across processes. Consumers must use the same
+/// field, query vector and segment contents as the collector that created it.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct VectorRoutingPlan {
+    field: Field,
+    pub(crate) segments: HashMap<SegmentId, SegmentRoutingPlan>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SegmentRoutingPlan {
+    pub(crate) clusters: Vec<Candidate>,
+    pub(crate) budget: WorkBudget,
+    pub(crate) metrics: RouterMetrics,
+    totals: StageTotals,
+}
+
 // --- Builder ---
 
 /// Builds a [`TopDocsByVectorSimilarity`] collector.
@@ -87,6 +106,7 @@ pub struct TopDocsByVectorSimilarityBuilder<T: VectorElement, S = NoTieBreak> {
     offset: usize,
     probe_params: ProbeParams,
     max_scan_levels: usize,
+    routing_plan: Option<Arc<VectorRoutingPlan>>,
     /// Optional slot shared with other collectors searching the same query.
     shared_threshold: Option<SharedThresholdArc<Score>>,
     tie_break: S,
@@ -102,6 +122,7 @@ impl<T: VectorElement> TopDocsByVectorSimilarityBuilder<T, NoTieBreak> {
             offset: 0,
             probe_params: ProbeParams::default(),
             max_scan_levels: usize::MAX,
+            routing_plan: None,
             shared_threshold: None,
             tie_break: NoTieBreak,
         }
@@ -139,6 +160,12 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
         self
     }
 
+    /// Probes the supplied plan without rerouting. See [`VectorRoutingPlan`] for its scope.
+    pub fn with_routing_plan(mut self, plan: Arc<VectorRoutingPlan>) -> Self {
+        self.routing_plan = Some(plan);
+        self
+    }
+
     /// Orders equal similarities by `tie_break`, as `ORDER BY embedding <=> $1, id` does.
     ///
     /// The tie-break takes part in each segment's eviction but never in routing. Segments cut on
@@ -154,6 +181,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
             offset: self.offset,
             probe_params: self.probe_params,
             max_scan_levels: self.max_scan_levels,
+            routing_plan: self.routing_plan,
             shared_threshold: self.shared_threshold,
             tie_break,
         }
@@ -172,6 +200,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
             offset: self.offset,
             probe_params: self.probe_params,
             max_scan_levels: self.max_scan_levels,
+            routing_plan: self.routing_plan,
             quantized_queries: Mutex::new(HashMap::new()),
             prepared: Mutex::new(None),
             collector_topk: Arc::new(Mutex::new(TopK::new(segment_top_n))),
@@ -196,6 +225,7 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     offset: usize,
     probe_params: ProbeParams,
     max_scan_levels: usize,
+    routing_plan: Option<Arc<VectorRoutingPlan>>,
     /// Exactly one prepared query for each distinct segment encoding.
     quantized_queries: Mutex<HashMap<PreparedKey, PreparedCell>>,
     /// The query prepared for the field's metric on first use.
@@ -354,7 +384,14 @@ where
         segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
     ) -> Result<SegmentVectorFruit<S::SortKey>> {
-        let (searched, totals) = measure(|| self.search_segment(weight, segment_ord, reader));
+        let (searched, mut totals) = measure(|| self.search_segment(weight, segment_ord, reader));
+        if let Some(plan) = self
+            .routing_plan
+            .as_ref()
+            .and_then(|p| p.segments.get(&reader.segment_id()))
+        {
+            totals.append(&plan.totals);
+        }
         let (results, report, merge) = searched?;
         let mut stats = ProbeStats::new(report, totals);
         stats.record_shared_offer(merge);
@@ -403,6 +440,93 @@ where
     T: VectorElement,
     S: SortKeyComputer + Send + Sync + 'static,
 {
+    /// Routes unfiltered search across all supplied segments, then selects a global prefix
+    /// using cluster sizes as the estimated row work. Bounds skips during probing do not
+    /// replenish this fixed plan. Flat segments retain their exhaustive search path.
+    pub fn route_segments(
+        &self,
+        readers: &[(SegmentOrdinal, &SegmentReader)],
+        mut on_segment: impl FnMut(SegmentOrdinal),
+    ) -> Result<VectorRoutingPlan> {
+        let mut vectors = Vec::with_capacity(readers.len());
+        let mut totals = Vec::with_capacity(readers.len());
+        for &(ord, reader) in readers {
+            self.check_schema(reader.schema())?;
+            let (vector, measured) = measure(|| reader.vector_index(self.field));
+            on_segment(ord);
+            vectors.push(vector?);
+            totals.push(measured);
+        }
+        let clusters = vectors
+            .iter()
+            .filter_map(|v| v.index())
+            .map(|i| i.num_clusters())
+            .sum();
+        let docs = vectors
+            .iter()
+            .filter_map(|v| v.index())
+            .map(|i| i.num_docs())
+            .sum();
+        let mut plan = VectorRoutingPlan {
+            field: self.field,
+            segments: HashMap::new(),
+        };
+        let Some(first) = vectors.first() else {
+            return Ok(plan);
+        };
+        let query = self.vector_query(first.options().metric());
+        let (total, n_avg, x) = self.probe_params.resolved_work_budget(clusters, docs)?;
+        let budget = WorkBudget {
+            total: WorkUnits::new(total),
+            per_cluster: WorkUnits::new(x),
+            per_row: WorkUnits::new((1.0 - x) / n_avg.max(f64::MIN_POSITIVE)),
+        };
+        let routers = vectors
+            .iter()
+            .map(|v| v.index().map(|i| i.opened_router()))
+            .collect::<Vec<_>>();
+        let ranking = GlobalRanking::from(
+            &routers,
+            &query,
+            self.probe_params.router_k(total, x, 1.0, clusters),
+            &mut totals,
+            &mut |i| on_segment(readers[i].0),
+        );
+        for (i, (_, reader)) in readers.iter().enumerate() {
+            if vectors[i].index().is_some() {
+                plan.segments.insert(
+                    reader.segment_id(),
+                    SegmentRoutingPlan {
+                        clusters: Vec::new(),
+                        budget: WorkBudget {
+                            total: WorkUnits::ZERO,
+                            ..budget
+                        },
+                        metrics: ranking.metrics[i],
+                        totals: totals[i].clone(),
+                    },
+                );
+            }
+        }
+        let mut meter = WorkMeter::new(budget);
+        for (i, candidate) in ranking.clusters {
+            if meter.exhausted() {
+                break;
+            }
+            let rows = vectors[i]
+                .index()
+                .unwrap()
+                .cluster_range(candidate.node as usize)
+                .len();
+            meter.open();
+            meter.rows(rows);
+            let segment = plan.segments.get_mut(&readers[i].1.segment_id()).unwrap();
+            segment.budget.total += budget.per_cluster + budget.per_row * rows as f64;
+            segment.clusters.push(candidate);
+        }
+        Ok(plan)
+    }
+
     /// Collects the supplied segments in input order. One segment uses the existing segment
     /// search; multiple segments share routing, a work budget, and the exact top-k bound.
     /// Located filter matches are exhaustive and reserve their share of the budget.
@@ -413,7 +537,7 @@ where
         readers: &[(SegmentOrdinal, &SegmentReader)],
         mut on_segment: impl FnMut(SegmentOrdinal),
     ) -> Result<Vec<SegmentVectorFruit<S::SortKey>>> {
-        if readers.len() <= 1 {
+        if readers.len() <= 1 || self.routing_plan.is_some() {
             return readers
                 .iter()
                 .map(|&(ord, reader)| {
@@ -511,6 +635,15 @@ where
         segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
     ) -> Result<(KeyedHits<S::SortKey>, SegmentReport, ExactMerge)> {
+        if self
+            .routing_plan
+            .as_ref()
+            .is_some_and(|p| p.field != self.field)
+        {
+            return Err(TantivyError::InvalidArgument(
+                "routing plan belongs to a different vector field".into(),
+            ));
+        }
         let init = enter_vector_stage(VectorStage::ScanInit);
         let (query, quantized) = {
             let _prep = enter_vector_stage(VectorStage::QueryPrep);
@@ -536,6 +669,7 @@ where
             Arc::clone(&self.collector_topk),
             Arc::clone(&self.shared_topk_threshold),
         );
+        let backend = backend.with_routing_plan(self.routing_plan.clone());
         let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
         drop(init);
         let (hits, report) = backend.top_n_by(
@@ -903,7 +1037,7 @@ mod ivf_e2e_tests {
     use std::ops::Range;
     use std::sync::Arc;
 
-    use super::VectorSimilarityFruit;
+    use super::{VectorRoutingPlan, VectorSimilarityFruit};
     use crate::collector::sort_key::{SortBySimilarityScore, SortByStaticFastValue, SortByString};
     use crate::collector::{AtomicSharedThreshold, Collector, SharedThresholdArc, TopDocs};
     use crate::index::IndexSettings;
@@ -1135,6 +1269,121 @@ mod ivf_e2e_tests {
         assert_eq!(result.stats[1].access_path, AccessPath::Located);
         assert_eq!(result.stats[2].access_path, AccessPath::Routed);
         assert!(result.stats[2].work_charged > 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn routing_plan_preserves_results_across_parallel_segments() -> Result<()> {
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            let fixture = FixtureSpec::clustered(metric, 64, 8, 384)
+                .segments(3)
+                .schedule(&[1, 1])
+                .deletes(&[0, 3, 80])
+                .build()?;
+            let searcher = fixture.index.reader()?.searcher();
+            let readers: Vec<_> = searcher
+                .segment_readers()
+                .iter()
+                .enumerate()
+                .map(|(ord, reader)| (ord as u32, reader))
+                .collect();
+            let mut query = vec![0.01; 64];
+            query[2] = 1.0;
+            let builder = || {
+                TopDocs::with_limit(7)
+                    .and_offset(3)
+                    .order_by_similarity(fixture.field, query.clone())
+                    .with_probe_params(exhaustive_params(8))
+            };
+            let plan = builder().build().route_segments(&readers, |_| {})?;
+            let bytes = serde_json::to_vec(&plan).unwrap();
+            let plan: VectorRoutingPlan = serde_json::from_slice(&bytes).unwrap();
+            let plan = Arc::new(plan);
+            let threshold: SharedThresholdArc<Score> = Arc::new(AtomicSharedThreshold::default());
+            let weight = fixture.all()?;
+            let fruits = std::thread::scope(|scope| {
+                readers
+                    .iter()
+                    .rev()
+                    .map(|&(ord, reader)| {
+                        let collector = builder()
+                            .with_routing_plan(Arc::clone(&plan))
+                            .with_shared_threshold(Arc::clone(&threshold))
+                            .build();
+                        let weight = &weight;
+                        scope.spawn(move || collector.collect_segment(weight.as_ref(), ord, reader))
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|thread| thread.join().unwrap())
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            let fruit = builder().build().merge_fruits(fruits)?;
+            let expected: Vec<_> = fixture
+                .oracle(&AllQuery, &query, 10)?
+                .into_iter()
+                .skip(3)
+                .collect();
+            assert_eq!(fruit.results, expected, "{metric:?}");
+            assert_eq!(fruit.stats.len(), readers.len());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn routing_plan_spends_one_budget_on_competitive_segments() -> Result<()> {
+        let mut distant = FixtureSpec::clustered(Metric::L2, 32, 8, 128);
+        for vector in distant.vectors.iter_mut().flatten() {
+            for value in vector {
+                *value += 100.0;
+            }
+        }
+        if let Layout::Ivf(centroids) = &mut distant.layout {
+            for value in centroids.iter_mut().flatten() {
+                *value += 100.0;
+            }
+        }
+        let distant = distant.build()?;
+        let near = FixtureSpec::clustered(Metric::L2, 32, 8, 128).build()?;
+        let searchers = [
+            distant.index.reader()?.searcher(),
+            near.index.reader()?.searcher(),
+        ];
+        let readers: Vec<_> = searchers
+            .iter()
+            .enumerate()
+            .map(|(ord, searcher)| (ord as u32, &searcher.segment_readers()[0]))
+            .collect();
+        let mut query = vec![0.0; 32];
+        query[3] = 1.0;
+        let builder = || {
+            TopDocs::with_limit(3)
+                .order_by_similarity(near.field, query.clone())
+                .with_probe_params(ProbeParams {
+                    max_probe_fraction: 0.0001,
+                    min_probe_clusters: 3,
+                    ..Default::default()
+                })
+        };
+        let plan = builder().build().route_segments(&readers, |_| {})?;
+        assert!(plan.segments[&readers[0].1.segment_id()]
+            .clusters
+            .is_empty());
+        assert_eq!(plan.segments[&readers[1].1.segment_id()].clusters.len(), 3);
+        let collector = builder().with_routing_plan(Arc::new(plan)).build();
+        let weight = near.all()?;
+        let fruit = collector.merge_fruits(collector.collect_segments(
+            weight.as_ref(),
+            &readers,
+            |_| {},
+        )?)?;
+        assert_eq!(fruit.results.len(), 3);
+        assert!(fruit
+            .results
+            .iter()
+            .all(|(_, address)| address.segment_ord == 1));
+        assert_eq!(fruit.stats[0].candidates_scored, 0);
+        assert!(fruit.stats.iter().map(|s| s.work_budget).sum::<f32>() < 4.0);
         Ok(())
     }
 
