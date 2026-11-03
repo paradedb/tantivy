@@ -33,7 +33,7 @@ impl<I> Default for ScoreBuffer<I> {
 pub(crate) struct SearchPolicy {
     pub(crate) aps: bool,
     pub(crate) min_fraction: f32,
-    pub(crate) rerank_factor: usize,
+    pub(crate) rerank_factor: f32,
 }
 
 /// A caller explicitly chooses whether selection must produce exact scores.
@@ -59,11 +59,17 @@ fn capacity<S: VectorSource>(
     policy: SearchPolicy,
 ) -> usize {
     let factor = if source.compressed().is_some() && output == OutputPrecision::Exact {
-        policy.rerank_factor.max(1)
+        policy.rerank_factor.max(1.0)
     } else {
-        1
+        1.0
     };
-    k.saturating_mul(factor).min(source.num_vectors(dim))
+    let members = source.num_vectors(dim);
+    let requested = k.min(members);
+    // Widen the product before rounding, then cap even infinite/overflowing
+    // factors. Never retain fewer than the requested output population.
+    ((requested as f64 * f64::from(factor)).ceil() as usize)
+        .max(requested)
+        .min(members)
 }
 
 /// Refine a retained population, without opening additional clusters. Sources
@@ -425,7 +431,7 @@ mod tests {
         let policy = SearchPolicy {
             aps: false,
             min_fraction: 0.25,
-            rerank_factor: 1,
+            rerank_factor: 1.0,
         };
         let open = lists_to_open(40, 40, 1, policy.min_fraction);
         let (lists, _) = rank_vectors(
@@ -457,7 +463,7 @@ mod tests {
         let policy = SearchPolicy {
             aps: false,
             min_fraction: 0.25,
-            rerank_factor: 1,
+            rerank_factor: 1.0,
         };
         let (narrow, _) = search(&level, &query, 1, policy, OutputPrecision::Exact);
         let (wide, _) = search(
@@ -521,7 +527,7 @@ mod tests {
         let policy = SearchPolicy {
             aps: false,
             min_fraction: 1.0,
-            rerank_factor: 4,
+            rerank_factor: 4.0,
         };
         let (actual, stats) = search(&level, &query, 2, policy, OutputPrecision::Exact);
         #[cfg(debug_assertions)]

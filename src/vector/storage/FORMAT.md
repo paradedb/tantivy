@@ -598,10 +598,12 @@ prepared lazily once per routing invocation. Raw posting-list centroid rows
 stay file-backed and are fetched only for the final retained candidates.
 
 Query-time list sizing still uses the original `router_k`. The approximate heap
-retains up to `router_rerank_factor * router_k` members, capped at the available
-count, and APS observes that heap at complete-list boundaries when enabled.
-Only the final posting-list candidates are exact-reranked and truncated to
-`router_k`. Intermediate hierarchy levels use unpadded approximate shortlists.
+retains up to `ceil(router_rerank_factor * router_k)` members, capped at the
+available count, and APS observes that heap at complete-list boundaries when
+enabled. The fractional rerank factor is at least 1.0; 1.0 removes padding while
+retaining exact refinement. Only the final posting-list candidates are
+exact-reranked and truncated to `router_k`. Intermediate hierarchy levels use
+unpadded approximate shortlists.
 Non-finite queries bypass sign preparation and use the raw exact scorer.
 
 Representation metadata is persisted. Rerank expansion and APS are query policy

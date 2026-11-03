@@ -978,7 +978,7 @@ where S: VectorArena<Elem = f32>
             crate::vector::router::search::SearchPolicy {
                 aps: true,
                 min_fraction: PARENT_NPROBE_FRACTION,
-                rerank_factor: 1,
+                rerank_factor: 1.0,
             },
             crate::vector::router::search::OutputPrecision::Exact,
         )

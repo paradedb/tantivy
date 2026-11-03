@@ -144,8 +144,8 @@ pub(crate) struct RoutingParams {
     /// enough lists to feed a size-`k` member heap via
     /// [`StackedIvf::lists_to_open`](crate::vector::router::stacked::levels::StackedIvf::lists_to_open).
     pub(crate) k: usize,
-    /// Quantized member retention only; never changes the list request.
-    pub(crate) rerank_factor: usize,
+    /// Fractional quantized member padding, at least 1.0; never changes the list request.
+    pub(crate) rerank_factor: f32,
     /// List-selection policy, independent of retention; quantized routing only.
     pub(crate) min_beam_fraction: f32,
     pub(crate) aps: bool,
@@ -155,7 +155,7 @@ impl Default for RoutingParams {
     fn default() -> Self {
         Self {
             k: usize::MAX,
-            rerank_factor: 2,
+            rerank_factor: 2.0,
             min_beam_fraction: 0.5,
             aps: true,
         }

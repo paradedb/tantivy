@@ -20,9 +20,10 @@ pub struct ProbeParams {
     /// Work ceiling as a fraction of each segment's capacity. Default 0.01.
     pub max_probe_fraction: f32,
     /// Approximate members retained per requested cluster by the quantized router.
-    /// Clamped to at least one. Does not widen list selection. Default 2;
-    /// provisional until real-data recall/latency tuning.
-    pub router_rerank_factor: usize,
+    /// Fractional values are rounded up to whole candidates and clamped to at
+    /// least 1.0. A factor of 1.0 still reranks exactly; it only removes padding.
+    /// Does not widen list selection. Default 2.0.
+    pub router_rerank_factor: f32,
     /// Minimum fraction of each quantized router level's lists to open.
     /// Clamped to [0, 1]; non-finite values use 0.25. Full-precision routing
     /// keeps its existing beam. Default 0.5.
@@ -80,7 +81,7 @@ impl Default for ProbeParams {
     fn default() -> Self {
         Self {
             max_probe_fraction: 0.01,
-            router_rerank_factor: 2,
+            router_rerank_factor: 2.0,
             router_min_beam_fraction: 0.5,
             router_aps: true,
             min_probe_clusters: 0,

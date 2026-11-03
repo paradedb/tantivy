@@ -347,7 +347,19 @@ mod tests {
                 "opening must not fetch raw rows"
             );
             let query = VectorQuery::new(metric, Arc::new(vec![0.15; dim]));
-            for factor in [1, 2, 4, usize::MAX] {
+            for (factor, retained) in [
+                (-1.0, 3),
+                (0.0, 3),
+                (0.5, 3),
+                (f32::NAN, 3),
+                (1.0, 3),
+                (1.25, 4),
+                (1.5, 5),
+                (2.0, 6),
+                (4.0, 12),
+                (f32::MAX, 96),
+                (f32::INFINITY, 96),
+            ] {
                 reads.lock().unwrap().clear();
                 let params = RoutingParams {
                     k: 3,
@@ -391,10 +403,7 @@ mod tests {
                 assert_eq!(candidate_count, 3);
                 assert!(approximate_scored > approximate_members_scored);
                 assert!(approximate_members_scored >= exact_scored);
-                assert!(
-                    exact_scored >= 3
-                        && exact_scored <= 3usize.saturating_mul(factor).min(matrix.rows)
-                );
+                assert_eq!(exact_scored, retained.min(approximate_members_scored));
                 let read_rows: usize = reads
                     .lock()
                     .unwrap()
@@ -759,7 +768,7 @@ mod tests {
                     SearchPolicy {
                         aps,
                         min_fraction: 0.25,
-                        rerank_factor: 1,
+                        rerank_factor: 1.0,
                     },
                     OutputPrecision::Exact,
                 );
@@ -776,7 +785,7 @@ mod tests {
         }
         let quantized = StackedRouter::from_index(index, &options, true)?;
         for aps in [false, true] {
-            for factor in [1, 2, 4, 8] {
+            for factor in [1.0, 2.0, 4.0, 8.0] {
                 let start = Instant::now();
                 let (mut found, mut approx, mut exact) = (0, 0, 0);
                 for (query, truth) in queries.iter().zip(&truth) {
@@ -858,7 +867,7 @@ mod tests {
             for k in [16, 128, 1024] {
                 let params = RoutingParams {
                     k,
-                    rerank_factor: 2,
+                    rerank_factor: 2.0,
                     aps: false,
                     ..RoutingParams::default()
                 };
