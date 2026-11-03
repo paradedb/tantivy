@@ -1,10 +1,10 @@
 //! Per-segment vector metadata, block columns and optional IVF routing.
 //!
 //! Metadata opens independently of search state. The first search-reader request
-//! pins routing state and validates deferred row-group geometry. Clustered IdMap
-//! entries open only for document lookups.
-//! Cluster boundaries come from the centroid file. See FORMAT.md.
+//! pins routing state. Block addresses are read and validated only when accessed.
+//! Clustered IdMap entries open only for document lookups. See FORMAT.md.
 
+use std::io;
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
@@ -276,31 +276,20 @@ impl VectorIndexReader {
             source: Some((source.composite.clone(), source.field, source.max_doc)),
             value: OnceLock::new(),
         };
-        let index = if let Some((centroids, offsets, router_slot)) = centroid_slots {
+        let rows_slice = Arc::new(Blocks::from_metadata(source.metadata.clone())?);
+        let index = if let Some((centroids, _offsets, router_slot)) = centroid_slots {
             Some(ClusterIndex::open(
                 &options,
                 centroids,
-                offsets,
+                Arc::clone(&rows_slice),
                 router_slot,
             )?)
         } else {
             None
         };
-        let num_rows = match &index {
-            Some(index) => index.num_rows(),
-            None => id_map.get(false)?.num_rows() as usize,
-        };
-        let cluster_rows = index.as_ref().map(|ivf| {
-            (0..ivf.num_clusters())
-                .map(|b| ivf.cluster_range(b).start)
-                .chain(std::iter::once(ivf.num_rows()))
-                .collect()
-        });
-        let rows_slice = Arc::new(Blocks::from_metadata(
-            source.metadata.clone(),
-            num_rows,
-            cluster_rows,
-        )?);
+        if index.is_none() && rows_slice.num_rows() != id_map.get(false)?.num_rows() as usize {
+            return Err(DataCorruption::comment_only("flat vector row count mismatch").into());
+        }
         let quantization =
             if let VectorColMetadata::Quantized { layers: quants, .. } = rows_slice.meta.as_ref() {
                 let mut layers = Vec::new();
@@ -359,7 +348,7 @@ impl VectorIndexReader {
 
         let num_vectors = match &index {
             Some(index) => index.num_docs(),
-            None => num_rows,
+            None => rows_slice.num_rows(),
         };
         Ok(Self {
             max_doc: source.max_doc,
@@ -385,7 +374,7 @@ impl VectorIndexReader {
         crate::vector::storage::blocks::BlockDirectory::new(end as u64)
             .finish(&mut bytes)
             .unwrap();
-        let rows_slice = Arc::new(Blocks::open(FileSlice::from(bytes), &options, 0, None).unwrap());
+        let rows_slice = Arc::new(Blocks::open(FileSlice::from(bytes), &options, false).unwrap());
         Self {
             max_doc: 0,
             options,
@@ -396,6 +385,11 @@ impl VectorIndexReader {
             index: None,
             quantization: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn directory_clusters(&self) -> Vec<usize> {
+        self.rows_slice.accessed_clusters()
     }
 
     #[cfg(test)]
@@ -447,10 +441,16 @@ impl VectorIndexReader {
     }
 
     /// Each cluster's posting-list size, in cluster order; `None` when the storage is not IVF.
-    pub fn cluster_sizes(&self) -> Option<Vec<u32>> {
+    pub fn cluster_sizes(&self) -> crate::Result<Option<Vec<u32>>> {
         self.index
             .as_ref()
-            .map(|index| index.cluster_sizes().map(|size| size as u32).collect())
+            .map(|index| {
+                index
+                    .cluster_sizes()
+                    .map(|size| size.map(|n| n as u32))
+                    .collect()
+            })
+            .transpose()
     }
 
     /// Returns the number of live IVF posting rows.
@@ -485,7 +485,9 @@ impl VectorIndexReader {
             let Some(location) = self
                 .id_map
                 .get(true)?
-                .locate(doc_id, &self.rows_slice.block_rows)
+                .locate(doc_id, |cluster| {
+                    self.rows_slice.row_range(cluster).map_err(io::Error::other)
+                })
                 .map_err(|e| DataCorruption::comment_only(e.to_string()))?
             else {
                 return Ok(None);
@@ -511,7 +513,7 @@ impl VectorIndexReader {
     ///
     /// Returns an error when `row` is out of bounds or cannot be read.
     pub fn vector_bytes_for_row(&self, row: usize) -> crate::Result<OwnedBytes> {
-        if row >= *self.rows_slice.block_rows.last().unwrap() {
+        if row >= self.rows_slice.num_rows() {
             return Err(TantivyError::InvalidArgument(format!(
                 "vector row {row} is out of bounds"
             )));
@@ -525,6 +527,20 @@ impl VectorIndexReader {
         &self,
         scratch: &'s mut ReadScratch,
     ) -> crate::Result<VectorRowBatch<'s>> {
+        self.read_vector_rows(scratch, None)
+    }
+    pub(crate) fn read_vector_rows_in_cluster<'s>(
+        &self,
+        cluster: usize,
+        scratch: &'s mut ReadScratch,
+    ) -> crate::Result<VectorRowBatch<'s>> {
+        self.read_vector_rows(scratch, Some(cluster))
+    }
+    fn read_vector_rows<'s>(
+        &self,
+        scratch: &'s mut ReadScratch,
+        cluster: Option<usize>,
+    ) -> crate::Result<VectorRowBatch<'s>> {
         let ReadScratch {
             rows,
             runs: read_ranges,
@@ -533,7 +549,7 @@ impl VectorIndexReader {
             ..
         } = scratch;
         let rows: &'s [usize] = rows;
-        let num_rows = *self.rows_slice.block_rows.last().unwrap();
+        let num_rows = self.rows_slice.num_rows();
         if rows.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(TantivyError::InvalidArgument(
                 "planned vector rows must be strictly increasing".to_string(),
@@ -559,9 +575,16 @@ impl VectorIndexReader {
 
         let mut selected = rows;
         while let Some(&row) = selected.first() {
-            let block = self.rows_slice.block_of(row);
-            let first = self.rows_slice.block_rows[block];
-            let end = self.rows_slice.block_rows[block + 1];
+            let block = match cluster {
+                Some(cluster) => {
+                    self.rows_slice
+                        .check_block_rows(cluster, &(row..rows.last().unwrap() + 1))?;
+                    cluster
+                }
+                None => self.rows_slice.block_of(row)?,
+            };
+            let first = self.rows_slice.row_range(block)?.start;
+            let end = self.rows_slice.row_range(block)?.end;
             let count = selected.partition_point(|&r| r < end);
             let column = self.rows_slice.column(block, 0)?;
             let range_start = read_ranges.len();
@@ -612,10 +635,10 @@ impl VectorIndexReader {
         let mut docs = Vec::new();
         let mut row = rows.start;
         while row < rows.end {
-            let cluster = self.rows_slice.block_of(row);
+            let cluster = self.rows_slice.block_of(row)?;
             self.read_doc_ids(cluster, &mut docs)?;
-            let first = self.rows_slice.block_rows[cluster];
-            let end = rows.end.min(self.rows_slice.block_rows[cluster + 1]);
+            let first = self.rows_slice.row_range(cluster)?.start;
+            let end = rows.end.min(self.rows_slice.row_range(cluster)?.end);
             result.extend_from_slice(&docs[row - first..end - first]);
             row = end;
         }
@@ -639,10 +662,15 @@ impl VectorIndexReader {
         let map = self.id_map.get(clustered)?;
         if clustered {
             let location = map
-                .locate(doc_id, &self.rows_slice.block_rows)
+                .locate(doc_id, |cluster| {
+                    self.rows_slice.row_range(cluster).map_err(io::Error::other)
+                })
                 .map_err(|e| DataCorruption::comment_only(e.to_string()))?;
-            Ok(location
-                .map(|loc| self.rows_slice.block_rows[loc.cluster as usize] + loc.local as usize))
+            location
+                .map(|loc| {
+                    Ok(self.rows_slice.row_range(loc.cluster as usize)?.start + loc.local as usize)
+                })
+                .transpose()
         } else {
             Ok(map.rank_if_exists(doc_id).map(|row| row as usize))
         }
@@ -651,10 +679,10 @@ impl VectorIndexReader {
     pub(crate) fn read_doc_ids(&self, cluster: usize, out: &mut Vec<DocId>) -> crate::Result<()> {
         out.clear();
         let blocks = &self.rows_slice;
-        if !blocks.clustered() || cluster >= blocks.block_rows.len() - 1 {
+        if !blocks.clustered() || cluster >= blocks.num_blocks() {
             return Err(DataCorruption::comment_only("invalid DocIds cluster").into());
         }
-        if blocks.rows_in(cluster) == 0 {
+        if blocks.rows_in(cluster)? == 0 {
             return Ok(());
         }
         let idx = blocks
@@ -665,7 +693,7 @@ impl VectorIndexReader {
         let bytes = blocks
             .column(cluster, idx)?
             .read_vector_bytes(VectorReadKind::Other)?;
-        out.reserve(blocks.rows_in(cluster));
+        out.reserve(blocks.rows_in(cluster)?);
         let mut previous = None;
         for bytes in bytes.chunks_exact(std::mem::size_of::<DocId>()) {
             let doc = DocId::from_le_bytes(bytes.try_into().unwrap());
@@ -693,7 +721,7 @@ impl VectorIndexReader {
             &self.rows_slice.column(cluster, 0)?,
             self.options.bytes_per_vector(),
             offsets,
-            self.rows_slice.rows_in(cluster),
+            self.rows_slice.rows_in(cluster)?,
         ))
     }
 
@@ -717,7 +745,11 @@ impl VectorIndexReader {
     ) -> crate::Result<()> {
         self.id_map
             .get(true)?
-            .locate_many(docs, &self.rows_slice.block_rows, out)
+            .locate_many(
+                docs,
+                |cluster| self.rows_slice.row_range(cluster).map_err(io::Error::other),
+                out,
+            )
             .map_err(|error| match error.kind() {
                 std::io::ErrorKind::InvalidData => {
                     DataCorruption::comment_only(error.to_string()).into()
@@ -728,8 +760,8 @@ impl VectorIndexReader {
 
     /// Reads a cluster's full-precision rows without document ids or quantized columns.
     pub(crate) fn read_cluster_rows(&self, cluster: usize) -> crate::Result<OwnedBytes> {
-        let rows = self.rows_slice.block_rows[cluster]..self.rows_slice.block_rows[cluster + 1];
-        self.rows_slice.read_column(0, rows)
+        let rows = self.rows_slice.row_range(cluster)?;
+        self.rows_slice.read_column_in_block(cluster, 0, rows)
     }
 }
 
@@ -796,7 +828,10 @@ mod tests {
         assert_eq!(&*reads.lock().unwrap(), &[0..1]);
         reads.lock().unwrap().clear();
         assert_eq!(
-            opened.locate(2, &[0, 2])?,
+            opened.locate(
+                2,
+                crate::vector::storage::id_map::tests::boundaries(&[0, 2])
+            )?,
             Some(DocLocation {
                 cluster: 0,
                 local: 1
@@ -834,12 +869,7 @@ mod tests {
             let mut directory = BlockDirectory::new(first as u64);
             directory.push(data.len() as u64, docs.len() as u32);
             directory.finish(&mut data)?;
-            let blocks = Arc::new(Blocks::open(
-                FileSlice::from(data),
-                &options,
-                3,
-                Some(vec![0, 3]),
-            )?);
+            let blocks = Arc::new(Blocks::open(FileSlice::from(data), &options, true)?);
             let reader = VectorIndexReader {
                 max_doc: 3,
                 options,
@@ -881,7 +911,7 @@ mod tests {
         let mut directory = crate::vector::storage::blocks::BlockDirectory::new(prefix as u64);
         directory.push(end as u64, 1);
         directory.finish(&mut data)?;
-        let footer = data.len() - 8;
+        let footer = data.len() - 16;
         let directory_start = footer - 2 * 12;
         let mut ids = Vec::new();
         IdMap::serialize(&[1], 3, &mut ids)?;
@@ -922,15 +952,18 @@ mod tests {
         assert!(readers.iter().all(|r| Arc::ptr_eq(r, &readers[0])));
         let reads = data_reads.lock().unwrap();
         assert_eq!(
-            reads.iter().filter(|r| **r == (footer..footer + 8)).count(),
+            reads
+                .iter()
+                .filter(|r| **r == (footer..footer + 16))
+                .count(),
             1
         );
         assert_eq!(
             reads
                 .iter()
-                .filter(|r| **r == (directory_start..footer))
+                .filter(|r| r.start < footer && r.end > directory_start)
                 .count(),
-            1
+            0
         );
         drop(reads);
         assert_eq!(
@@ -1007,7 +1040,8 @@ mod tests {
             reads: Arc::clone(&reads),
             block_len: 32,
         });
-        let blocks = Arc::new(Blocks::open(FileSlice::new(storage), &opts, ROWS, None)?);
+        let blocks = Arc::new(Blocks::open(FileSlice::new(storage), &opts, false)?);
+        blocks.row_range(0)?;
         reads.lock().unwrap().clear();
         let reader = VectorIndexReader {
             max_doc: ROWS as DocId,

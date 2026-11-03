@@ -449,8 +449,10 @@ impl VectorEstimatorMeasurements {
 
 impl VectorIndexReader {
     /// Storage information for tooling; `None` when the segment has no vector data for the field.
-    pub fn info(&self) -> Option<VectorInfo> {
-        let meta = self.metadata()?;
+    pub fn info(&self) -> crate::Result<Option<VectorInfo>> {
+        let Some(meta) = self.metadata() else {
+            return Ok(None);
+        };
         let (quantized_layers, quantized_bytes_per_row) = match meta {
             VectorColMetadata::Quantized { .. } => (
                 Some(meta.layers().iter().map(|layer| layer.bits()).collect()),
@@ -459,7 +461,7 @@ impl VectorIndexReader {
             VectorColMetadata::Plain(_) => (None, None),
         };
         let Some(index) = &self.index else {
-            return Some(VectorInfo {
+            return Ok(Some(VectorInfo {
                 format: VectorStorageFormat::Flat,
                 num_vectors: self.num_vectors,
                 num_centroids: None,
@@ -468,13 +470,14 @@ impl VectorIndexReader {
                 router_levels: None,
                 quantized_layers,
                 quantized_bytes_per_row,
-            });
+            }));
         };
         let mut empty_clusters = 0;
         let mut min_cluster_size = usize::MAX;
         let mut max_cluster_size = 0;
         let mut total_cluster_size = 0;
         for cluster_size in index.cluster_sizes() {
+            let cluster_size = cluster_size?;
             empty_clusters += usize::from(cluster_size == 0);
             min_cluster_size = min_cluster_size.min(cluster_size);
             max_cluster_size = max_cluster_size.max(cluster_size);
@@ -491,7 +494,7 @@ impl VectorIndexReader {
         } else {
             min_cluster_size
         };
-        Some(VectorInfo {
+        Ok(Some(VectorInfo {
             format: VectorStorageFormat::Ivf,
             num_vectors: self.num_vectors,
             num_centroids: Some(num_centroids),
@@ -505,6 +508,6 @@ impl VectorIndexReader {
             router_levels: Some(index.router_levels()),
             quantized_layers,
             quantized_bytes_per_row,
-        })
+        }))
     }
 }

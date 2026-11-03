@@ -221,7 +221,10 @@ where
             Some(_) => {
                 scratch.rows.clear();
                 scratch.rows.extend(selected.global_rows());
-                ExactRows::Planned(self.reader.read_vector_rows_planned(scratch)?)
+                ExactRows::Planned(
+                    self.reader
+                        .read_vector_rows_in_cluster(selected.cluster, scratch)?,
+                )
             }
         })
     }

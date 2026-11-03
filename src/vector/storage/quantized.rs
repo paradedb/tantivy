@@ -514,15 +514,16 @@ impl QuantizedLayerReader {
     ) -> crate::Result<QuantizedLayerBatch> {
         self.blocks.check_block_rows(b, &rows)?;
         let (span, bytes) = self.blocks.read_band(b, self.layer)?;
+        let address = self.blocks.address(b)?;
         let view = |idx: usize| -> OwnedBytes {
             let column = crate::vector::storage::blocks::column_range(
                 &self.blocks.slots,
-                self.blocks.rows_in(b),
+                address.rows.len(),
                 idx,
             );
-            let start = self.blocks.block_start(b) + column.start - span.start;
+            let start = address.bytes.start + column.start - span.start;
             let stride = self.blocks.slots[idx].stride as usize;
-            let first = self.blocks.block_rows[b];
+            let first = address.rows.start;
             bytes.slice(start + (rows.start - first) * stride..start + (rows.end - first) * stride)
         };
         let codes = view(self.codes);
@@ -691,7 +692,7 @@ impl QuantizedLayerReader {
     /// Resolves a cluster once so ordered code reads need no repeated block lookup.
     #[cfg(test)]
     pub(crate) fn cluster(&self, row: usize) -> crate::Result<QuantizedClusterReader<'_>> {
-        self.cluster_in_block(self.blocks.block_of(row))
+        self.cluster_in_block(self.blocks.block_of(row)?)
     }
     /// Preserves a cluster address already established by the scan.
     pub(crate) fn cluster_in_block(
@@ -701,7 +702,7 @@ impl QuantizedLayerReader {
         Ok(QuantizedClusterReader {
             layer: self,
             block,
-            rows: self.blocks.block_rows[block]..self.blocks.block_rows[block + 1],
+            rows: self.blocks.row_range(block)?,
             codes: self.blocks.column(block, self.codes)?,
         })
     }
@@ -766,7 +767,7 @@ impl QuantizedClusterReader<'_> {
         use crate::vector::storage::blocks::column_range;
         let layer = self.layer;
         let blocks = &layer.blocks;
-        let n = blocks.rows_in(self.block);
+        let n = blocks.rows_in(self.block)?;
         let first = column_range(&blocks.slots, n, layer.scales).start;
         let bytes = self
             .sidecar_slice()?
@@ -789,7 +790,7 @@ impl QuantizedClusterReader<'_> {
         use crate::vector::storage::blocks::column_range;
         let layer = self.layer;
         let blocks = &layer.blocks;
-        let n = blocks.rows_in(self.block);
+        let n = blocks.rows_in(self.block)?;
         let first = column_range(&blocks.slots, n, layer.scales).start;
         let last = column_range(&blocks.slots, n, layer.constants.unwrap_or(layer.errors)).end;
         blocks.block_slice(self.block, first..last)
@@ -827,9 +828,9 @@ fn plan_block_column(
     ranges.clear();
     let mut selected = rows;
     while let Some(&row) = selected.first() {
-        let b = blocks.block_of(row);
-        let first = blocks.block_rows[b];
-        let end = blocks.block_rows[b + 1];
+        let b = blocks.block_of(row)?;
+        let first = blocks.row_range(b)?.start;
+        let end = blocks.row_range(b)?.end;
         let count = selected.partition_point(|&r| r < end);
         if matches!(
             blocks.slots[idx].slot_type,
@@ -1021,15 +1022,7 @@ mod tests {
         } else {
             FileSlice::from(out)
         };
-        let blocks = Arc::new(
-            Blocks::open(
-                entry,
-                &opts,
-                *offsets.last().unwrap(),
-                Some(offsets.to_vec()),
-            )
-            .unwrap(),
-        );
+        let blocks = Arc::new(Blocks::open(entry, &opts, true).unwrap());
         QuantizedLayerReader {
             blocks,
             layer: 0,
@@ -1084,14 +1077,15 @@ mod tests {
             1,
             Some((Arc::clone(&reads), 32)),
         );
+        layer.blocks.row_range(0)?;
         reads.lock().unwrap().clear();
         let rows = layer.blocks.read_column(0, 0..3)?;
         assert_eq!(rows.len(), 3 * 64 * 4);
-        let start = layer.blocks.block_start(0);
+        let start = layer.blocks.block_start(0)?;
         assert_eq!(&*reads.lock().unwrap(), &[start..start + rows.len()]);
         reads.lock().unwrap().clear();
         layer.read_batch(0..3)?;
-        assert_eq!(&*reads.lock().unwrap(), &[layer.blocks.layer_span(0, 0)]);
+        assert_eq!(&*reads.lock().unwrap(), &[layer.blocks.layer_span(0, 0)?]);
         Ok(())
     }
 
@@ -1266,6 +1260,7 @@ mod tests {
             1,
             Some((Arc::clone(&reads), 16)),
         );
+        reader.blocks.block_for_range(&(0..8))?;
         reads.lock().unwrap().clear();
         let (batch, totals) = crate::vector::telemetry::measure(|| {
             let _stage = crate::vector::telemetry::enter_vector_stage(
@@ -1397,8 +1392,7 @@ mod tests {
                         }))
                         .slice_from(prefix)
                     };
-                    let blocks =
-                        Arc::new(Blocks::open(entry, &opts, 118, Some(boundaries.to_vec()))?);
+                    let blocks = Arc::new(Blocks::open(entry, &opts, true)?);
                     let codes = slots
                         .iter()
                         .position(|s| {

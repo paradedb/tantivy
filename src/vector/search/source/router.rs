@@ -275,7 +275,7 @@ impl ClusterSource for RouterClusters<'_> {
             let cluster = node as usize;
 
             self.meter.open();
-            let rows = self.index.cluster_range(cluster);
+            let rows = self.index.cluster_range(cluster)?;
             if rows.is_empty() {
                 self.skip_empty();
                 continue;

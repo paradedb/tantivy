@@ -900,8 +900,13 @@ fn empty_cluster_skips_its_band() -> crate::Result<()> {
     assert_eq!(stats.postings_skipped, 1);
     assert_eq!(stats.clusters_probed(), 1);
     assert_eq!(stats.vectors_visited, 0);
-    assert_eq!(stats.layers.get(0).unwrap().io.reads, 0);
-    assert!(stage_reads(&fixture.reads(), |stage| stage == VectorStage::LayerScan(0)).is_empty());
+    assert_eq!(stats.layers.get(0).unwrap().io.reads, 1);
+    assert_eq!(stats.layers.get(0).unwrap().io.bytes_read, 24);
+    assert!(
+        stage_reads(&fixture.reads(), |stage| stage == VectorStage::LayerScan(0))
+            .iter()
+            .all(|range| ranges.directory.contains(range))
+    );
     Ok(())
 }
 
@@ -916,7 +921,7 @@ fn filtered_cluster_reads_only_doc_ids() -> crate::Result<()> {
             let searcher = fixture.index.reader()?.searcher();
             let vectors = first_segment(&searcher).1.vector_index(fixture.field)?;
             let ivf = vectors.index().unwrap();
-            let ivf_rows = ivf.cluster_range(2).len();
+            let ivf_rows = ivf.cluster_range(2)?.len();
             let (_, _, open) =
                 every_cluster().resolved_work_budget(ivf.num_clusters(), ivf.num_docs())?;
             fixture.clear_reads();
@@ -941,7 +946,8 @@ fn filtered_cluster_reads_only_doc_ids() -> crate::Result<()> {
                 (stats.work_charged - open as f32).abs() <= f32::EPSILON,
                 "{case}: only the open is charged ({stats:?})"
             );
-            let log = fixture.reads();
+            let mut log = fixture.reads();
+            log.retain(|(_, range)| !ranges.directory.contains(range));
             assert_eq!(
                 stage_reads(&log, admission(schedule)),
                 vec![ranges.docs[2].as_ref().unwrap()],
@@ -994,7 +1000,11 @@ fn filtered_clusters_read_doc_ids_before_payload() -> crate::Result<()> {
             let mut expected: Vec<_> = ranges.docs.iter().flatten().collect();
             expected.push(ranges.rows[1].as_ref().unwrap());
             expected.sort_by_key(|range| range.start);
-            let mut actual = scans.clone();
+            let mut actual: Vec<_> = scans
+                .iter()
+                .copied()
+                .filter(|range| !ranges.directory.contains(range))
+                .collect();
             actual.sort_by_key(|range| range.start);
             assert_eq!(
                 actual, expected,
@@ -1144,7 +1154,10 @@ fn flat_path_reads_one_row_per_survivor() -> crate::Result<()> {
         assert_eq!(stats.candidates_scored, 0, "{percent}%");
         assert_eq!(stats.clusters_probed(), 0, "{percent}%");
         assert_eq!(
-            stage_reads(&fixture.reads(), |stage| stage == VectorStage::ExactScan).len(),
+            stage_reads(&fixture.reads(), |stage| stage == VectorStage::ExactScan)
+                .iter()
+                .filter(|range| range.len() == 2 * std::mem::size_of::<f32>())
+                .count(),
             admitted,
             "{percent}%: one row request per survivor"
         );
@@ -1197,8 +1210,9 @@ fn exact_reads_touch_only_survivor_pages() -> crate::Result<()> {
     assert!(
         admission_reads
             .iter()
-            .all(|range| ranges.docs.iter().flatten().any(|docs| docs == *range)),
-        "admission reads only DocIds"
+            .all(|range| ranges.directory.contains(range)
+                || ranges.docs.iter().flatten().any(|docs| docs == *range)),
+        "admission reads only DocIds and cluster addresses"
     );
     let mut payload = BTreeSet::new();
     for range in stage_reads(&log, |stage| {
@@ -1292,6 +1306,7 @@ fn layout_plans_selective_filters() -> crate::Result<()> {
 /// A cluster scored exactly never reads its band; its rows are read in the exact stages.
 fn exact_clusters_never_read_their_band() -> crate::Result<()> {
     let fixture = reads_fixture(Metric::L2, &[1], &[])?;
+    let ranges = fixture.column_ranges()?;
     let query = reads_vector(42);
     let rules: [(ExactRule, bool); 3] = [
         (|_, _| true, true),
@@ -1316,9 +1331,12 @@ fn exact_clusters_never_read_their_band() -> crate::Result<()> {
         assert_eq!(hits, fixture.oracle(&AllQuery, &query, 10)?);
         let log = fixture.reads();
         let layer0 = stats.layers.get(0).unwrap();
-        // Unfiltered admission reads no DocIds: its reads are bands alone.
+        // Apart from cluster addresses, unfiltered admission reads bands alone.
         assert_eq!(
-            stage_reads(&log, |stage| stage == VectorStage::LayerScan(0)).len(),
+            stage_reads(&log, |stage| stage == VectorStage::LayerScan(0))
+                .iter()
+                .filter(|range| !ranges.directory.contains(range))
+                .count(),
             layer0.full_clusters(),
             "{stats:?}"
         );
@@ -1372,7 +1390,7 @@ fn retired_groups_never_reach_a_later_band() -> crate::Result<()> {
     let index = vectors.index().unwrap();
     let even = |row: &usize| {
         (0..index.num_clusters())
-            .find(|&cluster| index.cluster_range(cluster).contains(row))
+            .find(|&cluster| index.cluster_range(cluster).unwrap().contains(row))
             .is_some_and(|cluster| cluster % 2 == 0)
     };
     let trace = &stats.quantized_trace;
@@ -1539,6 +1557,34 @@ fn reads_follow_the_plan() -> crate::Result<()> {
     ];
     for (name, case) in cases {
         case().map_err(|error| crate::TantivyError::InternalError(format!("{name}: {error}")))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn ann_reads_directory_entries_only_for_probed_clusters() -> crate::Result<()> {
+    for schedule in [&[][..], &[1, 4][..]] {
+        let fixture = FixtureSpec::clustered(Metric::L2, 64, 32, 640)
+            .schedule(schedule)
+            .label("some", |ordinal| (ordinal / 32) % 2 == 0)
+            .paged()
+            .build()?;
+        let query = Lcg(17).vector(64, 0.5);
+        for filter in [&AllQuery as &dyn Query, &fixture.filter("some")] {
+            let searcher = fixture.index.reader()?.searcher();
+            let vectors = first_segment(&searcher).1.vector_index(fixture.field)?;
+            assert!(vectors.directory_clusters().is_empty());
+            let collector = TopDocs::with_limit(5)
+                .order_by_similarity(fixture.field, query.clone())
+                .with_probe_params(routed_exhaustive_params(32))
+                .build();
+            let fruit = crate::vector::router::with_test_clusters(
+                fixture.candidates(&[17], &query)?,
+                || searcher.search(filter, &collector),
+            )?;
+            assert!(!fruit.results.is_empty());
+            assert_eq!(vectors.directory_clusters(), [17], "schedule={schedule:?}");
+        }
     }
     Ok(())
 }

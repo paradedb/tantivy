@@ -151,7 +151,7 @@ fn vector_read_kinds_follow_data_for_dense_and_sparse_access() -> crate::Result<
     let searcher = reader.searcher();
     let vectors =
         searcher.segment_readers()[0].vector_index(index.schema().get_field("embedding")?)?;
-    let rows = vectors.index().unwrap().cluster_range(2);
+    let rows = vectors.index().unwrap().cluster_range(2)?;
     let layers = vectors.quantization().unwrap().layers();
     directory.read_kinds.lock().unwrap().clear();
 
@@ -231,17 +231,17 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
     let mut row_docs = Vec::new();
     let mut expected_rows = vec![None; segment.max_doc() as usize];
     assert_eq!(
-        ivf.cluster_range(0).len(),
+        ivf.cluster_range(0)?.len(),
         0,
         "cluster=0 row=all column=Rows empty fixture"
     );
     assert_eq!(
-        ivf.cluster_range(1).len(),
+        ivf.cluster_range(1)?.len(),
         1,
         "cluster=1 row=all column=Rows singleton fixture"
     );
     for cluster in 0..ivf.num_clusters() {
-        let rows = ivf.cluster_range(cluster);
+        let rows = ivf.cluster_range(cluster)?;
         let row_bytes = vectors.read_cluster_rows(cluster)?;
         let mut docs = Vec::new();
         vectors.read_doc_ids(cluster, &mut docs)?;
@@ -541,7 +541,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
             let mut pruned_dead = 0;
             let mut pruned_filter = 0;
             for &cluster in &clusters {
-                for row in ivf.cluster_range(cluster) {
+                for row in ivf.cluster_range(cluster)? {
                     let doc = row_docs[row];
                     let original = originals[doc as usize];
                     let live = segment
@@ -580,9 +580,9 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                 );
                 for &(row, doc, bits) in trace {
                     let cluster = (0..4)
-                        .find(|&c| ivf.cluster_range(c).contains(&row))
+                        .find(|&c| ivf.cluster_range(c).unwrap().contains(&row))
                         .unwrap();
-                    let local = row - ivf.cluster_range(cluster).start;
+                    let local = row - ivf.cluster_range(cluster)?.start;
                     assert_eq!(
                         doc, row_docs[row],
                         "cluster={cluster} row={local} column=DocIds layer{layer}"
@@ -717,7 +717,7 @@ fn diagnostics_skip_empty_clusters() -> crate::Result<()> {
     let searcher = reader.searcher();
     let segment = &searcher.segment_readers()[0];
     let vectors = segment.vector_index(index.schema().get_field("embedding")?)?;
-    assert!(vectors.index().unwrap().cluster_range(0).is_empty());
+    assert!(vectors.index().unwrap().cluster_range(0)?.is_empty());
     let queries = vectors
         .sample_estimator_pseudo_queries(3, segment.alive_bitset())?
         .unwrap();
@@ -829,6 +829,7 @@ fn doc_column_ranges(
     let mut docs = Vec::new();
     let mut ranges = Vec::new();
     for cluster in 0..vectors.index().unwrap().num_clusters() {
+        vectors.index().unwrap().cluster_range(cluster)?;
         directory.reads.lock().unwrap().clear();
         vectors.read_doc_ids(cluster, &mut docs)?;
         let reads = directory.reads.lock().unwrap();
