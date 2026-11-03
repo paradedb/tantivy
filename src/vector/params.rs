@@ -22,7 +22,7 @@ pub struct ProbeParams {
     /// Approximate members retained per requested cluster by the quantized router.
     /// Fractional values are rounded up to whole candidates and clamped to at
     /// least 1.0. A factor of 1.0 still reranks exactly; it only removes padding.
-    /// Does not widen list selection. Default 2.0.
+    /// Does not widen list selection. Default 1.0.
     pub router_rerank_factor: f32,
     /// Minimum fraction of each quantized router level's lists to open.
     /// Clamped to [0, 1]; non-finite values use 0.25. Full-precision routing
@@ -81,7 +81,7 @@ impl Default for ProbeParams {
     fn default() -> Self {
         Self {
             max_probe_fraction: 0.01,
-            router_rerank_factor: 2.0,
+            router_rerank_factor: 1.0,
             router_min_beam_fraction: 0.5,
             router_aps: true,
             min_probe_clusters: 0,

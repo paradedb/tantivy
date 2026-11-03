@@ -306,7 +306,7 @@ mod tests {
         );
         assert_eq!(stats.lists_scanned, 0);
         assert_eq!(stats.approximate_scored, 96);
-        assert_eq!(stats.leaf_exact_scored, 6);
+        assert_eq!(stats.leaf_exact_scored, params.k);
         let flat: Vec<_> = flat
             .into_iter()
             .map(|c| Candidate {
