@@ -684,7 +684,6 @@ fn routes_home_below_ceiling() -> crate::Result<()> {
     let fixture = FixtureSpec::ivf(Metric::L2, centroids.clone(), vectors).build()?;
     let params = ProbeParams {
         max_probe_fraction: 0.1,
-        min_probe_clusters: 1,
         ..Default::default()
     };
     for centroid in centroids.iter().step_by(3) {
