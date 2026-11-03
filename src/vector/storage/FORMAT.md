@@ -4,7 +4,8 @@
 
 `.vec` uses a little-endian u32 version header, with current and supported version
 **4**. Other versions fail with “rebuild required.” The `.centroids` grammar and
-its version **3** describe routing, posting offsets, and cluster bounds.
+its version **4** describe routing and posting offsets. Earlier centroid files
+require rebuilding. The former per-cluster radius slot is no longer written or read.
 `VectorQuantizationConfig.format_version = 3` identifies the independent index
 settings grammar; settings specify the target for future builds.
 

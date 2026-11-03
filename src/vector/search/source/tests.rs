@@ -1,4 +1,4 @@
-//! Router source tests: the source driven by scripted feedback, with no scan.
+//! Router source tests: cluster admission and work accounting, with no scan.
 
 use common::BitSet;
 
@@ -6,13 +6,12 @@ use crate::query::{AllQuery, Query};
 use crate::schema::{Metric, VectorDType};
 use crate::vector::diagnostics::VectorStorageFormat;
 use crate::vector::params::{LocatedPath, ProbeParams, DEFAULT_FIXED_PROBE_COST_ROWS};
-use crate::vector::search::cluster_source::{ClusterSource, Feedback};
+use crate::vector::search::cluster_source::ClusterSource;
 use crate::vector::search::segment::plan::Source;
-use crate::vector::search::source::controller::{open_share, ProbeTermination};
+use crate::vector::search::source::controller::ProbeTermination;
 use crate::vector::search::source::router::{
     DocFilter, GatedRows, RouterClusters, RouterReport, RowGate,
 };
-use crate::vector::storage::bounds::{HeapPeek, QueryBound, QueryBoundTracker};
 use crate::vector::test_support::{
     first_segment, DocsWeight, Fixture, FixtureSpec, Lcg, SegmentRun,
 };
@@ -29,9 +28,8 @@ struct Walk {
     report: RouterReport,
 }
 
-/// Walks the first segment's router source as a scan would, admitting every row of every cluster;
-/// `feedback(rows)` is what the scan reports after `rows` admitted rows.
-fn walk(seg: &SegmentRun<'_>, feedback: impl Fn(usize) -> Feedback) -> crate::Result<Walk> {
+/// Walks the first segment's router source, admitting every row of every cluster.
+fn walk(seg: &SegmentRun<'_>) -> crate::Result<Walk> {
     let plan = seg.plan()?;
     let Some(Source::Router(filter)) = plan.source else {
         panic!("the router source walks router plans");
@@ -46,35 +44,16 @@ fn walk(seg: &SegmentRun<'_>, feedback: impl Fn(usize) -> Feedback) -> crate::Re
     );
     let mut clusters = Vec::new();
     let mut rows = 0;
-    while let Some((cluster, len)) = source
-        .next(feedback(rows))?
-        .map(|rows| (rows.cluster, rows.len()))
-    {
+    while let Some((cluster, len)) = source.next()?.map(|rows| (rows.cluster, rows.len())) {
         clusters.push(cluster);
         rows += len;
-        source.admitted(len, feedback(rows))?;
+        source.admitted(len)?;
     }
     Ok(Walk {
         clusters,
         rows,
         report: source.finish(),
     })
-}
-
-/// Feedback of a scan whose heap never fills.
-fn unarmed(_: usize) -> Feedback {
-    Feedback::default()
-}
-
-/// Feedback of a scan that holds the final k-th score once `k` rows are in.
-fn armed(k: usize, kth: f32) -> impl Fn(usize) -> Feedback {
-    move |rows| {
-        let kth = (rows >= k).then_some(kth);
-        Feedback {
-            kth_lower: kth,
-            kth_estimate: kth,
-        }
-    }
 }
 
 /// A walk over `fixture`'s first segment.
@@ -84,9 +63,8 @@ fn walk_fixture(
     query: &[f32],
     k: usize,
     params: ProbeParams,
-    feedback: impl Fn(usize) -> Feedback,
 ) -> crate::Result<Walk> {
-    fixture.with_segment(filter, query, k, &params, |seg| walk(seg, feedback))
+    fixture.with_segment(filter, query, k, &params, walk)
 }
 
 /// A 2-d fixture with `sizes[c]` docs around centroid `[10 c, 0]`.
@@ -103,8 +81,7 @@ fn sized_fixture(sizes: &[usize], spacing: f32) -> crate::Result<Fixture> {
     FixtureSpec::ivf(Metric::L2, centroids, vectors).build()
 }
 
-/// Six separated clusters of six docs: probing the home cluster arms a bound that proves the
-/// other five useless.
+/// Up to six separated clusters of six docs.
 fn separated_fixture(clusters: usize) -> crate::Result<Fixture> {
     let centroids: Vec<Vec<f32>> = [
         [1.0, 1.0],
@@ -129,11 +106,6 @@ fn separated_fixture(clusters: usize) -> crate::Result<Fixture> {
     FixtureSpec::ivf(Metric::L2, centroids, vectors).build()
 }
 
-/// The `k`-th oracle score for `query` over `fixture`.
-fn kth_score(fixture: &Fixture, query: &[f32], k: usize) -> crate::Result<f32> {
-    Ok(fixture.oracle(&AllQuery, query, k)?[k - 1].0)
-}
-
 /// A budget of `max_probe_fraction` on the routed path.
 fn budget_params(max_probe_fraction: f32) -> ProbeParams {
     ProbeParams {
@@ -148,20 +120,12 @@ fn budget_params(max_probe_fraction: f32) -> ProbeParams {
 // --- Charges ---
 
 /// Opens charge `x` and scored rows `(1 - x)/n_avg`: an exhaustive unfiltered walk charges
-/// exactly the cluster count, skew moves the stop point, filtered rows charge nothing, and gate
-/// skips charge their open.
+/// exactly the cluster count, skew moves the stop point, and filtered rows charge nothing.
 #[test]
 fn controller_charges_opens_and_scored_rows() -> crate::Result<()> {
     // Sizes [5, 2, 2, 1]: an exhaustive walk charges exactly C = 4 whatever the skew.
     let fixture = sized_fixture(&[5, 2, 2, 1], 0.01)?;
-    let full = walk_fixture(
-        &fixture,
-        &AllQuery,
-        &[0.0, 0.0],
-        11,
-        budget_params(1.0),
-        unarmed,
-    )?;
+    let full = walk_fixture(&fixture, &AllQuery, &[0.0, 0.0], 11, budget_params(1.0))?;
     assert_eq!(full.report.probe.termination, ProbeTermination::Exhausted);
     assert!(
         (full.report.probe.work_charged - 4.0).abs() <= 4e-6,
@@ -172,14 +136,7 @@ fn controller_charges_opens_and_scored_rows() -> crate::Result<()> {
     // Sizes [30, 2, 2, 2, 2, 2]: n_avg = 20/3, x ~ 0.1975, a row ~ 0.1204. At f = 0.8 (budget 4.8)
     // the big cluster charges ~3.809 and each small one ~0.438, so the fourth open crosses it.
     let fixture = sized_fixture(&[30, 2, 2, 2, 2, 2], 0.001)?;
-    let skewed = walk_fixture(
-        &fixture,
-        &AllQuery,
-        &[0.0, 0.0],
-        41,
-        budget_params(0.8),
-        unarmed,
-    )?;
+    let skewed = walk_fixture(&fixture, &AllQuery, &[0.0, 0.0], 41, budget_params(0.8))?;
     let probe = skewed.report.probe;
     assert_eq!(probe.termination, ProbeTermination::Ceiling);
     assert_eq!(skewed.clusters.len(), 4, "{:?}", skewed.report);
@@ -202,13 +159,10 @@ fn controller_charges_opens_and_scored_rows() -> crate::Result<()> {
     let filtered =
         fixture.with_segment(&AllQuery, &[0.0, 0.0], 23, &budget_params(1.0), |seg| {
             let weight = DocsWeight { max_doc, docs };
-            walk(
-                &SegmentRun {
-                    weight: &weight,
-                    ..*seg
-                },
-                unarmed,
-            )
+            walk(&SegmentRun {
+                weight: &weight,
+                ..*seg
+            })
         })?;
     let counters = filtered.report.counters;
     assert_eq!(counters.postings_row + counters.postings_skipped, 2);
@@ -220,27 +174,6 @@ fn controller_charges_opens_and_scored_rows() -> crate::Result<()> {
         filtered.report
     );
 
-    // The bound proves five of six clusters useless: each skip charges its open.
-    let fixture = separated_fixture(6)?;
-    let query = [0.2, 0.3];
-    let kth = kth_score(&fixture, &query, 5)?;
-    let gated = walk_fixture(
-        &fixture,
-        &AllQuery,
-        &query,
-        5,
-        exhaustive_params(6),
-        armed(5, kth),
-    )?;
-    assert_eq!(gated.clusters.len(), 1);
-    assert_eq!(gated.report.counters.bounds_skips, 5);
-    let x = open_share(DEFAULT_FIXED_PROBE_COST_ROWS, 6.0);
-    let expected = 6.0 * x + 6.0 * (1.0 - x) / 6.0;
-    assert!(
-        (gated.report.probe.work_charged as f64 - expected).abs() < 1e-5,
-        "skips charge the open share: {:?}",
-        gated.report
-    );
     Ok(())
 }
 
@@ -260,28 +193,14 @@ fn grid(metric: Metric, router: RouterKind) -> crate::Result<Fixture> {
 fn probe_termination() -> crate::Result<()> {
     // Ceiling: a budget below one cluster stops after the first.
     let fixture = separated_fixture(6)?;
-    let ceiling = walk_fixture(
-        &fixture,
-        &AllQuery,
-        &[11.0, 11.0],
-        3,
-        budget_params(0.1),
-        unarmed,
-    )?;
+    let ceiling = walk_fixture(&fixture, &AllQuery, &[11.0, 11.0], 3, budget_params(0.1))?;
     assert_eq!(ceiling.report.probe.termination, ProbeTermination::Ceiling);
     assert_eq!(ceiling.clusters.len(), 1);
 
-    // Exhausted: an exhaustive, unarmed walk opens every cluster and admits every row.
+    // Exhausted: an exhaustive walk opens every cluster and admits every row.
     // Exact: Stacked's 25% top prune cannot hand the probe every list on a 3x3 grid.
     let fixture = grid(Metric::L2, RouterKind::Exact)?;
-    let exhausted = walk_fixture(
-        &fixture,
-        &AllQuery,
-        &[0.0, 0.0],
-        64,
-        exhaustive_params(9),
-        unarmed,
-    )?;
+    let exhausted = walk_fixture(&fixture, &AllQuery, &[0.0, 0.0], 64, exhaustive_params(9))?;
     let counters = exhausted.report.counters;
     assert_eq!(
         exhausted.report.probe.termination,
@@ -302,7 +221,7 @@ fn probe_termination() -> crate::Result<()> {
             params.resolved_work_budget(seg.index.num_clusters(), seg.index.num_docs())?;
         let clusters = seg.index.num_clusters();
         let docs = seg.index.num_docs() as f64;
-        let walk = walk(seg, unarmed)?;
+        let walk = walk(seg)?;
         assert!(budget < clusters as f64, "the budget binds");
         assert!(walk.clusters.len() < clusters);
         let probe = walk.report.probe;
@@ -315,7 +234,7 @@ fn probe_termination() -> crate::Result<()> {
     Ok(())
 }
 
-// --- Bounds gate ---
+// --- Exhaustive search ---
 
 /// A random 2-d point away from the origin, so cosine's normalization stays well-conditioned.
 fn point(rng: &mut Lcg) -> Vec<f32> {
@@ -327,8 +246,8 @@ fn point(rng: &mut Lcg) -> Vec<f32> {
     }
 }
 
-/// One fixture of the gate property: its geometry, query and k.
-struct GateCase {
+/// One search fixture: its geometry, query and k.
+struct SearchCase {
     name: String,
     metric: Metric,
     centroids: Vec<Vec<f32>>,
@@ -337,15 +256,14 @@ struct GateCase {
     k: usize,
 }
 
-/// Under the final, tightest bound no cluster holding a true top-k member is skipped, so none is
-/// skipped at any looser bound during the scan; exact ties at the bound probe.
+/// Exhaustive routing visits every cluster and matches the exact oracle, including ties.
 #[test]
-fn gate_never_skips_a_true_member() -> crate::Result<()> {
+fn exhaustive_routing_matches_oracle() -> crate::Result<()> {
     let mut rows = Vec::new();
     for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
         for seed in [11u64, 29, 47] {
             let mut rng = Lcg(seed ^ ((metric as u64) << 32));
-            rows.push(GateCase {
+            rows.push(SearchCase {
                 name: format!("{metric:?} seed {seed}"),
                 metric,
                 centroids: (0..5).map(|_| point(&mut rng)).collect(),
@@ -355,25 +273,25 @@ fn gate_never_skips_a_true_member() -> crate::Result<()> {
             });
         }
     }
-    // L2: the second cluster's margin is exactly zero (powers of two), and its doc ties the k-th.
-    rows.push(GateCase {
-        name: "L2 tie at the bound".into(),
+    // The two nearest documents tie under L2.
+    rows.push(SearchCase {
+        name: "L2 tie".into(),
         metric: Metric::L2,
         centroids: vec![vec![0.0, 4.0], vec![4.0, 0.0], vec![8.0, 0.0]],
         docs: vec![vec![0.0, 2.0], vec![2.0, 0.0], vec![7.0, 0.0]],
         query: vec![0.0, 0.0],
         k: 1,
     });
-    // Dot: the second cluster's best possible score q.c + |q| r equals the k-th score.
-    rows.push(GateCase {
-        name: "Dot tie at the bound".into(),
+    // Equal dot products in different clusters.
+    rows.push(SearchCase {
+        name: "Dot tie".into(),
         metric: Metric::Dot,
         centroids: vec![vec![2.0, 0.0], vec![4.0, 4.0]],
         docs: vec![vec![3.0, 0.0], vec![3.0, 4.0]],
         query: vec![1.0, 0.0],
         k: 1,
     });
-    for GateCase {
+    for SearchCase {
         name,
         metric,
         centroids,
@@ -384,13 +302,12 @@ fn gate_never_skips_a_true_member() -> crate::Result<()> {
     {
         let fixture = FixtureSpec::ivf(metric, centroids, docs).build()?;
         let oracle = fixture.oracle(&AllQuery, &query, k)?;
-        let kth = oracle[k - 1].0;
-        let walk = walk_fixture(&fixture, &AllQuery, &query, k, exhaustive_params(5), |_| {
-            Feedback {
-                kth_lower: Some(kth),
-                kth_estimate: Some(kth),
-            }
-        })?;
+        let walk = walk_fixture(&fixture, &AllQuery, &query, k, exhaustive_params(5))?;
+        assert_eq!(
+            walk.report.counters.postings_row + walk.report.counters.postings_skipped,
+            fixture.cluster_docs(0)?.len(),
+            "{name}"
+        );
         let cluster_docs = fixture.cluster_docs(0)?;
         for (_, address) in &oracle {
             let home = cluster_docs
@@ -405,98 +322,14 @@ fn gate_never_skips_a_true_member() -> crate::Result<()> {
         let fruit = fixture.search(&AllQuery, &query, k, exhaustive_params(5))?;
         assert_eq!(
             fruit.results, oracle,
-            "{name}: gated top-k equals the oracle"
+            "{name}: exhaustive top-k equals the oracle"
         );
     }
     Ok(())
 }
 
-/// The gate's bookkeeping: what the tracker arms on, what the source counts, and what the row
-/// gate keeps.
 #[test]
-fn gate_bookkeeping() -> crate::Result<()> {
-    // The bound tracks k-th improvements in bound space per metric; an unchanged k-th keeps it.
-    for (metric, first, t_first, improved, t_improved) in [
-        (Metric::L2, -4.0f32, 2.0f32, -1.0f32, 1.0f32),
-        (Metric::Cosine, 0.5, 1.0, 0.875, 0.5),
-        (Metric::Dot, 3.0, 3.0, 4.5, 4.5),
-    ] {
-        let mut tracker = QueryBoundTracker::new();
-        tracker.observe(metric, HeapPeek::Filling, 0);
-        assert_eq!(tracker.bound(), QueryBound::Filling, "{metric:?}");
-        tracker.observe(metric, HeapPeek::Full { kth_key: first }, 1);
-        assert_eq!(
-            tracker.bound(),
-            QueryBound::Armed { t: t_first },
-            "{metric:?}"
-        );
-        tracker.observe(metric, HeapPeek::Full { kth_key: first }, 2);
-        assert_eq!(
-            tracker.bound(),
-            QueryBound::Armed { t: t_first },
-            "{metric:?}"
-        );
-        tracker.observe(metric, HeapPeek::Full { kth_key: improved }, 3);
-        assert_eq!(
-            tracker.bound(),
-            QueryBound::Armed { t: t_improved },
-            "{metric:?}"
-        );
-        assert_eq!(
-            tracker.armed_at_probe(),
-            Some(1),
-            "the armed probe never moves"
-        );
-    }
-
-    // Armed at the first cluster, the source counts the other five as skips.
-    let fixture = separated_fixture(6)?;
-    let query = [0.2, 0.3];
-    let kth = kth_score(&fixture, &query, 5)?;
-    let walk = walk_fixture(
-        &fixture,
-        &AllQuery,
-        &query,
-        5,
-        exhaustive_params(6),
-        armed(5, kth),
-    )?;
-    assert_eq!(walk.report.probe.termination, ProbeTermination::Exhausted);
-    assert_eq!(walk.clusters.len(), 1);
-    assert_eq!(walk.report.counters.bounds_skips, 5);
-    assert_eq!(walk.report.counters.bound_armed_at, Some(0));
-
-    // A heap that fills only in the second cluster arms there, and still skips the far tail.
-    let kth = kth_score(&fixture, &query, 10)?;
-    let walk = walk_fixture(
-        &fixture,
-        &AllQuery,
-        &query,
-        10,
-        exhaustive_params(6),
-        armed(10, kth),
-    )?;
-    assert_eq!(walk.report.counters.bound_armed_at, Some(1));
-    assert!(walk.report.counters.bounds_skips > 0);
-
-    // Unarmed, nothing is skipped and the armed probe stays absent.
-    let fixture = separated_fixture(3)?;
-    let walk = walk_fixture(
-        &fixture,
-        &AllQuery,
-        &query,
-        100,
-        exhaustive_params(3),
-        unarmed,
-    )?;
-    assert_eq!(walk.clusters.len(), 3);
-    assert_eq!(walk.rows, 18);
-    assert_eq!(walk.report.counters.bounds_skips, 0);
-    assert_eq!(walk.report.counters.bound_armed_at, None);
-    let x = open_share(DEFAULT_FIXED_PROBE_COST_ROWS, 6.0);
-    let expected = 3.0 * x + 18.0 * (1.0 - x) / 6.0;
-    assert!((walk.report.probe.work_charged as f64 - expected).abs() < 1e-5);
-
+fn row_gate_bookkeeping() -> crate::Result<()> {
     // The row gate keeps the filter's offsets; an open gate keeps every row unread.
     let mut filter = BitSet::with_max_value(32);
     filter.insert(4);
@@ -554,7 +387,7 @@ fn gate_bookkeeping() -> crate::Result<()> {
                     run.segment,
                     run.searcher.params(),
                 );
-                while let Some(rows) = source.next(Feedback::default())? {
+                while let Some(rows) = source.next()? {
                     match rows.docs {
                         None => assert!(open),
                         Some(given) => {
@@ -564,7 +397,7 @@ fn gate_bookkeeping() -> crate::Result<()> {
                         }
                     }
                     let len = rows.len();
-                    source.admitted(len, Feedback::default())?;
+                    source.admitted(len)?;
                 }
             }
             Ok(())

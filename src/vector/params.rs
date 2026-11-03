@@ -89,7 +89,7 @@ impl ProbeParams {
     /// `budget / open_share` as the filter approaches empty. The count is
     /// floored at `min_probe_clusters` and capped at the segment's cluster
     /// count. There is no headroom: when ranked clusters run smaller than
-    /// average or the bounds gate skips some, the ranking can run out
+    /// average, the ranking can run out
     /// before the budget and the scan ends `Exhausted`.
     ///
     /// * `open_share` (`f64`) — the per-index open share `x`.

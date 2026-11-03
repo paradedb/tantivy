@@ -1,4 +1,4 @@
-//! The encode step: the stored centroids and their bounds, and the Data entry's cluster blocks of
+//! The encode step: the stored centroids, and the Data entry's cluster blocks of
 //! full-precision rows, doc ids and, for a quantized field, the encoded layer columns.
 
 use std::io::Write;
@@ -12,26 +12,23 @@ use quant::cascade::{
 
 use super::{AssignedVector, FieldMerge, IvfBuildTimings};
 use crate::directory::CompositeWrite;
-use crate::schema::VectorDType;
 use crate::vector::clustering::{decode_row_append, encode_vector, IvfCentroids};
 use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::storage::blocks::{
     block_len, column_range, pad, write_metadata, BlockDirectory,
 };
-use crate::vector::storage::bounds::{residual_norm, BoundsBuilder};
 use crate::vector::storage::header::{VectorEntry, HEADER_LEN};
 use crate::vector::storage::id_map::DocLocation;
 use crate::vector::storage::metadata::{Slot, SlotType, VectorColMetadata};
 use crate::vector::ENTRY_ALIGN;
 use crate::TantivyError;
 
-/// The stored centroid rows, normalized as the field's vectors are, and a bounds builder that
-/// saturates every cluster whose stored centroid is not finite.
+/// The stored centroid rows, normalized as the field's vectors are.
 pub(super) fn encode_centroids(
     merge: &FieldMerge,
     centroids: &IvfCentroids,
     num_centroids: usize,
-) -> crate::Result<(Vec<u8>, BoundsBuilder)> {
+) -> crate::Result<Vec<u8>> {
     let opts = merge.opts;
     let IvfCentroids::F32(centroid_matrix) = centroids;
     let centroid_rows: Vec<Vec<f32>> = centroid_matrix
@@ -40,8 +37,6 @@ pub(super) fn encode_centroids(
         .map(|centroid| centroid.to_vec())
         .collect();
     let mut centroid_bytes = Vec::with_capacity(num_centroids * opts.bytes_per_vector());
-    let mut bounds_builder = BoundsBuilder::new(num_centroids);
-    let mut stored_centroid = Vec::with_capacity(opts.dim());
     for (centroid_ord, centroid) in centroid_rows.iter().enumerate() {
         let mut bytes = encode_vector(centroid, opts.dim())?;
         let outcome = maybe_normalize_bytes(opts, &mut bytes);
@@ -52,16 +47,9 @@ pub(super) fn encode_centroids(
                 merge.name,
             );
         }
-        stored_centroid.clear();
-        decode_row_append::<f32>(&bytes, opts.dim(), &mut stored_centroid)?;
-        if outcome != NormalizeOutcome::Normalized
-            || stored_centroid.iter().any(|value| !value.is_finite())
-        {
-            bounds_builder.saturate(centroid_ord);
-        }
         centroid_bytes.extend_from_slice(&bytes);
     }
-    Ok((centroid_bytes, bounds_builder))
+    Ok(centroid_bytes)
 }
 
 /// Writes the field's Data entry: metadata, then one aligned block per cluster of rows, doc ids
@@ -72,14 +60,10 @@ pub(super) fn write_data_entry(
     assigned_vectors: &[AssignedVector],
     cluster_offsets: &[u64],
     centroid_bytes: &[u8],
-    bounds_builder: &mut BoundsBuilder,
     timings: &mut IvfBuildTimings,
 ) -> crate::Result<Vec<DocLocation>> {
     let (ctx, opts, quantization) = (merge.ctx, merge.opts, merge.quantization);
     let num_centroids = cluster_offsets.len() - 1;
-    let residual: fn(&[u8], &[f32]) -> f32 = match opts.dtype() {
-        VectorDType::F32 => residual_norm::<f32>,
-    };
     let centroid_stride = opts.bytes_per_vector();
 
     // IdMaps are emitted after Data so inter-entry padding never enters an id map.
@@ -131,12 +115,14 @@ pub(super) fn write_data_entry(
         }
         let block_start = pos;
         assert_eq!(data.written_bytes() - entry_start, block_start as u64);
-        centroid.clear();
-        decode_row_append::<f32>(
-            &centroid_bytes[cluster * centroid_stride..][..centroid_stride],
-            opts.dim(),
-            &mut centroid,
-        )?;
+        if quantization.is_some() {
+            centroid.clear();
+            decode_row_append::<f32>(
+                &centroid_bytes[cluster * centroid_stride..][..centroid_stride],
+                opts.dim(),
+                &mut centroid,
+            )?;
+        }
         let prepared = centroid_workspace
             .as_mut()
             .map(|workspace| workspace.prepare(&centroid));
@@ -167,7 +153,6 @@ pub(super) fn write_data_entry(
                 };
                 data.write_all(row)?;
                 pos += row.len();
-                bounds_builder.add_native(cluster, residual(row, &centroid));
                 if quantization.is_some() {
                     decode_row_append::<f32>(row, opts.dim(), &mut batch_values)?;
                 }

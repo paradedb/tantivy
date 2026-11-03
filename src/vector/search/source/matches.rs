@@ -1,10 +1,10 @@
 //! The filter-match source: a sparse filter's own matches, found through the document location
-//! map and served one cluster at a time in ascending id. No router or bounds gate; the work meter
+//! map and served one cluster at a time in ascending id. No router; the work meter
 //! charges every cluster and row, but every match is scored.
 
 use std::ops::Range;
 
-use crate::vector::search::cluster_source::{ClusterRows, ClusterSource, Feedback};
+use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
 use crate::vector::search::source::controller::{WorkBudget, WorkMeter};
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::reader::VectorIndexReader;
@@ -112,7 +112,7 @@ impl<'a> MatchClusters<'a> {
 }
 
 impl ClusterSource for MatchClusters<'_> {
-    fn next(&mut self, _feedback: Feedback) -> crate::Result<Option<ClusterRows<'_>>> {
+    fn next(&mut self) -> crate::Result<Option<ClusterRows<'_>>> {
         let Some((cluster, positions)) = self.clusters.get(self.next).cloned() else {
             return Ok(None);
         };
@@ -127,7 +127,7 @@ impl ClusterSource for MatchClusters<'_> {
         }))
     }
 
-    fn admitted(&mut self, rows: usize, _feedback: Feedback) -> crate::Result<()> {
+    fn admitted(&mut self, rows: usize) -> crate::Result<()> {
         self.meter.rows(rows);
         Ok(())
     }

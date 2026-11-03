@@ -24,8 +24,6 @@ pub(crate) struct VectorQuery<T: VectorElement> {
     raw: Arc<Vec<T>>,
     /// The values widened losslessly to `f32`: what routers rank with.
     widened: Arc<[f32]>,
-    /// `||q||`, for the dot margin's Cauchy-Schwarz term.
-    norm: f32,
     routing_norm: f32,
     estimate_norm: f32,
     kind: QueryKind,
@@ -86,7 +84,6 @@ impl<T: VectorElement> VectorQuery<T> {
         Self {
             metric,
             widened,
-            norm: norm as f32,
             routing_norm,
             estimate_norm,
             kind,
@@ -107,11 +104,6 @@ impl<T: VectorElement> VectorQuery<T> {
     /// The values widened to `f32`: what routers rank with.
     pub(crate) fn widened(&self) -> &[f32] {
         &self.widened
-    }
-
-    /// `||q||`, for the dot margin's Cauchy-Schwarz term.
-    pub(crate) fn norm(&self) -> f32 {
-        self.norm
     }
 
     pub(crate) fn routing_norm(&self) -> f32 {
@@ -312,7 +304,6 @@ mod tests {
                     .collect()
             };
             let query = VectorQuery::new(Metric::Cosine, Arc::new(raw.clone()));
-            assert_eq!(query.norm(), norm as f32);
             assert_eq!(query.routing_norm(), norm_squared(&raw).sqrt());
             assert_eq!(query.estimate_vector(), expected);
 

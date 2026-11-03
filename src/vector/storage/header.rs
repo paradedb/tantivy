@@ -22,11 +22,10 @@ pub(crate) const HEADER_LEN: usize = 4;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum VectorFileVersion {
     V1 = 1,
-    /// `.centroids` includes required per-cluster bounds.
     V2 = 2,
     /// `.centroids` includes a tagged router and `.vec` includes quantized slots.
     V3 = 3,
-    /// Block-major vector columns with per-field metadata.
+    /// Block-major vector columns; `.centroids` omits cluster bounds.
     V4 = 4,
 }
 
@@ -54,7 +53,7 @@ pub(crate) const VECTOR_FILE_FORMAT_VERSION: u32 = VectorFileVersion::V4 as u32;
 /// Version written to `.vec` files.
 pub(crate) const CURRENT_VECTOR: VectorFileVersion = VectorFileVersion::V4;
 /// Version written to `.centroids` files.
-pub(crate) const CURRENT_CENTROID: VectorFileVersion = VectorFileVersion::V3;
+pub(crate) const CURRENT_CENTROID: VectorFileVersion = VectorFileVersion::V4;
 
 /// `.centroids` composite slot indices.
 pub(crate) mod centroid_slot {
@@ -64,8 +63,6 @@ pub(crate) mod centroid_slot {
     pub(crate) const OFFSETS: usize = 1;
     /// Router kind and payload (V3).
     pub(crate) const ROUTER: usize = 2;
-    /// Per-cluster centroid bounds.
-    pub(crate) const BOUNDS: usize = 3;
 }
 
 /// Slots in a centroid composite file.
@@ -78,8 +75,6 @@ pub(crate) enum CentroidSlot {
     Offsets = centroid_slot::OFFSETS,
     /// Routing payload.
     Router = centroid_slot::ROUTER,
-    /// Cluster bounds.
-    Bounds = centroid_slot::BOUNDS,
 }
 
 impl CentroidSlot {
@@ -109,16 +104,28 @@ fn write_header<W: Write + ?Sized>(writer: &mut W, version: VectorFileVersion) -
     version.serialize(writer)
 }
 
-fn parse_header(file: &FileSlice, file_kind: &str) -> io::Result<(VectorFileVersion, FileSlice)> {
+/// Validates a `.centroids` header and returns its version and composite body.
+pub(crate) fn read_centroid_header(
+    file: &FileSlice,
+) -> crate::Result<(VectorFileVersion, FileSlice)> {
     if file.len() < HEADER_LEN {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
-            format!("{file_kind} file is smaller than its header"),
-        ));
+            "centroid file is smaller than its header",
+        )
+        .into());
     }
     let header_bytes = file.slice_to(HEADER_LEN).read_bytes()?;
-    let version = VectorFileVersion::deserialize(&mut header_bytes.as_slice())?;
-    Ok((version, file.slice_from(HEADER_LEN)))
+    let version = u32::deserialize(&mut header_bytes.as_slice())?;
+    if version != CURRENT_CENTROID as u32 {
+        return Err(crate::TantivyError::IncompatibleIndex(
+            crate::directory::error::Incompatibility::CentroidFormatMismatch {
+                index_version: version,
+                supported_version: CURRENT_CENTROID as u32,
+            },
+        ));
+    }
+    Ok((CURRENT_CENTROID, file.slice_from(HEADER_LEN)))
 }
 
 /// Writes a `.vec` header.
@@ -196,11 +203,6 @@ pub(crate) fn write_centroid_header<W: Write + ?Sized>(writer: &mut W) -> io::Re
     write_header(writer, CURRENT_CENTROID)
 }
 
-/// Parses a `.centroids` header and returns its version and composite body.
-pub(crate) fn read_centroid_header(file: &FileSlice) -> io::Result<(VectorFileVersion, FileSlice)> {
-    parse_header(file, "centroid")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +216,31 @@ mod tests {
         let (version, body) = read_vector_header(&FileSlice::from(buf)).unwrap();
         assert_eq!(version, VectorFileVersion::V4);
         assert_eq!(body.len(), 0);
+    }
+
+    #[test]
+    fn centroid_header_round_trip_and_version_check() {
+        let mut buf = Vec::new();
+        write_centroid_header(&mut buf).unwrap();
+        assert_eq!(buf, [4, 0, 0, 0]);
+        buf.extend_from_slice(b"composite-bytes");
+        let (version, body) = read_centroid_header(&FileSlice::from(buf)).unwrap();
+        assert_eq!(version, CURRENT_CENTROID);
+        assert_eq!(body.read_bytes().unwrap().as_slice(), b"composite-bytes");
+        for version in [1u32, 2, 3, 5, 99] {
+            let error =
+                read_centroid_header(&FileSlice::from(version.to_le_bytes().to_vec())).unwrap_err();
+            assert!(matches!(error, crate::TantivyError::IncompatibleIndex(
+                crate::directory::error::Incompatibility::CentroidFormatMismatch {
+                    index_version, supported_version: 4,
+                }
+            ) if index_version == version));
+            assert!(error.to_string().contains("rebuild required"));
+        }
+        let error = read_centroid_header(&FileSlice::from(vec![4, 0])).unwrap_err();
+        assert!(
+            matches!(error, crate::TantivyError::IoError(ref error) if error.kind() == io::ErrorKind::UnexpectedEof)
+        );
     }
 
     #[test]

@@ -199,15 +199,13 @@ pub(crate) fn merge_ivf(
                 let num_present_docs = assigned_vectors.len();
                 let cluster_offsets = assign::cluster_offsets(&mut assigned_vectors, num_centroids);
 
-                let (centroid_bytes, mut bounds_builder) =
-                    encode::encode_centroids(&merge, &centroids, num_centroids)?;
+                let centroid_bytes = encode::encode_centroids(&merge, &centroids, num_centroids)?;
                 let locations = encode::write_data_entry(
                     &merge,
                     &mut vec_write,
                     &assigned_vectors,
                     &cluster_offsets,
                     &centroid_bytes,
-                    &mut bounds_builder,
                     &mut timings,
                 )?;
                 id_maps.push((field, locations));
@@ -218,7 +216,6 @@ pub(crate) fn merge_ivf(
                     num_present_docs,
                     &centroid_bytes,
                     &cluster_offsets,
-                    &bounds_builder.finish(),
                     &router,
                 )?;
 

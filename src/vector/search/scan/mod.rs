@@ -25,7 +25,7 @@ use crate::collector::SegmentSortKeyComputer;
 use crate::error::DataCorruption;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
-use crate::vector::search::cluster_source::{ClusterRows, ClusterSource, Feedback};
+use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
 use crate::vector::search::interval::{Estimate, Threshold};
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery};
 use crate::vector::storage::centroids::ClusterIndex;
@@ -476,9 +476,9 @@ where
     /// quantized layer at a time, then scores what is left exactly.
     pub(crate) fn run(&mut self, source: &mut impl ClusterSource) -> crate::Result<()> {
         let stage = enter_vector_stage(self.shortlist_stage());
-        while let Some(rows) = source.next(self.feedback())? {
+        while let Some(rows) = source.next()? {
             let scored = self.shortlist(&rows)?;
-            source.admitted(scored, self.feedback())?;
+            source.admitted(scored)?;
         }
         drop(stage);
         self.close_shortlist();
@@ -493,14 +493,6 @@ where
         match self.quantized {
             Some(_) => VectorStage::LayerScan(0),
             None => VectorStage::ExactScan,
-        }
-    }
-
-    /// The shared prune floor when set. The router reads `kth_lower`.
-    fn feedback(&self) -> Feedback {
-        Feedback {
-            kth_lower: self.bound.shared_threshold(),
-            kth_estimate: None,
         }
     }
 
