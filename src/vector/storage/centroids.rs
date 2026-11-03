@@ -12,7 +12,6 @@
 //! [0] num_centroids (u32) + num_docs (u32) + centroid_bytes (N · stride),
 //!     rows in the router's canonical cluster-sorted order when a stacked
 //!     router was built
-//! [1] cluster_offsets (u64[N+1], prefix sum)
 //! [2] a router-kind byte followed by the selected router's payload, REQUIRED
 //! ```
 //!
@@ -20,9 +19,11 @@
 use std::io::{self, Write};
 use std::mem;
 use std::ops::Range;
+use std::sync::Arc;
 
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
+use super::blocks::Blocks;
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RoutingParams};
@@ -45,8 +46,8 @@ pub(crate) struct ClusterIndex {
     centroids_slice: FileSlice,
     /// Bytes per centroid row: the field's vector stride.
     centroid_stride: usize,
-    /// Slot `[1]`: the `u64[N+1]` prefix sum, pinned.
-    cluster_offsets: OwnedBytes,
+    /// The single directory shared with vector-column readers.
+    blocks: Arc<Blocks>,
     metric: Metric,
     router: OpenedRouter,
 }
@@ -99,7 +100,7 @@ impl ClusterIndex {
     pub(crate) fn open(
         options: &VectorOptions,
         centroids_slice: FileSlice,
-        offsets_slice: FileSlice,
+        blocks: Arc<Blocks>,
         router_slice: FileSlice,
     ) -> crate::Result<Self> {
         let count_words = 2 * mem::size_of::<u32>();
@@ -128,16 +129,10 @@ impl ClusterIndex {
             .into());
         }
 
-        let cluster_offsets = offsets_slice.read_bytes()?;
-        let expected_offsets = (num_centroids + 1)
-            .checked_mul(mem::size_of::<u64>())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "cluster offset length overflow")
-            })?;
-        if cluster_offsets.len() != expected_offsets {
+        if num_centroids != blocks.num_blocks() || !blocks.clustered() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "IVF cluster offset byte length mismatch",
+                "centroid count differs from vector directory",
             )
             .into());
         }
@@ -149,7 +144,7 @@ impl ClusterIndex {
             num_docs,
             centroids_slice,
             centroid_stride: options.bytes_per_vector(),
-            cluster_offsets,
+            blocks,
             metric: options.metric(),
             router,
         };
@@ -184,28 +179,17 @@ impl ClusterIndex {
 
     /// Total posting rows across all clusters.
     pub(crate) fn num_rows(&self) -> usize {
-        self.cluster_offset(self.num_centroids) as usize
+        self.blocks.num_rows()
     }
 
-    fn cluster_offset(&self, cluster: usize) -> u64 {
-        let start = cluster * mem::size_of::<u64>();
-        let end = start + mem::size_of::<u64>();
-        u64::from_le_bytes(self.cluster_offsets[start..end].try_into().unwrap())
-    }
-
-    /// The contiguous row range of `cluster` within the `.vec` rows.
-    #[inline]
-    pub(crate) fn cluster_range(&self, cluster: usize) -> Range<usize> {
-        debug_assert!(cluster < self.num_centroids, "cluster out of bounds");
-        self.cluster_offset(cluster) as usize..self.cluster_offset(cluster + 1) as usize
+    pub(crate) fn cluster_range(&self, cluster: usize) -> crate::Result<Range<usize>> {
+        self.blocks.row_range(cluster)
     }
 
     /// Per-cluster posting-list sizes, in cluster order — memberships, like
     /// [`Self::num_rows`].
-    pub(crate) fn cluster_sizes(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.num_centroids).map(|cluster| {
-            (self.cluster_offset(cluster + 1) - self.cluster_offset(cluster)) as usize
-        })
+    pub(crate) fn cluster_sizes(&self) -> impl Iterator<Item = crate::Result<usize>> + '_ {
+        (0..self.num_centroids).map(|cluster| self.blocks.rows_in(cluster))
     }
 
     /// One centroid row as a file slice.

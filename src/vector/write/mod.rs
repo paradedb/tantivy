@@ -125,7 +125,7 @@ fn for_each_row(
         let mut doc_ids = Vec::new();
         for cluster in 0..index.num_clusters() {
             reader.read_doc_ids(cluster, &mut doc_ids)?;
-            for (row_id, &doc_id) in index.cluster_range(cluster).zip(&doc_ids) {
+            for (row_id, &doc_id) in index.cluster_range(cluster)?.zip(&doc_ids) {
                 f(row_id, doc_id)?;
             }
         }

@@ -711,6 +711,11 @@ impl Fixture {
         let mut docs = Vec::new();
         for cluster in 0..clusters {
             self.clear_reads();
+            vectors.index().unwrap().cluster_range(cluster)?;
+            ranges
+                .directory
+                .extend(self.reads().into_iter().map(|(_, range)| range));
+            self.clear_reads();
             vectors.read_doc_ids(cluster, &mut docs)?;
             ranges
                 .docs
@@ -731,6 +736,7 @@ impl Fixture {
 /// Per-cluster byte ranges of the DocIds column and the full-precision rows.
 #[derive(Debug, Default)]
 pub(crate) struct ColumnRanges {
+    pub(crate) directory: Vec<Range<usize>>,
     pub(crate) docs: Vec<Option<Range<usize>>>,
     pub(crate) rows: Vec<Option<Range<usize>>>,
 }

@@ -303,7 +303,7 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
             let vec_file =
                 segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))?;
             let (version, body) = read_vector_header(&vec_file)?;
-            assert_eq!(version, VectorFileVersion::V4);
+            assert_eq!(version, VectorFileVersion::V5);
             // Body must be a valid composite — proves the stamp sits in front
             // of the framing, not inside a slot.
             CompositeFile::open(&body)?;
@@ -1421,7 +1421,7 @@ fn unsupported_vector_versions_remain_typed_on_open_and_merge() -> crate::Result
             assert!(
                 matches!(error,
             crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch {
-                index_version, supported_version: 4,
+                index_version, supported_version: 5,
             }) if index_version == version),
                 "version {version}: {error:?}"
             )
@@ -1470,10 +1470,7 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
     let mut bytes = directory.atomic_read(&vec_path)?;
     let mut centroids = 4u32.to_le_bytes().to_vec();
     let mut composite = CompositeWrite::wrap(&mut centroids);
-    for slot in [
-        crate::vector::storage::header::CentroidSlot::Centroids,
-        crate::vector::storage::header::CentroidSlot::Offsets,
-    ] {
+    for slot in [crate::vector::storage::header::CentroidSlot::Centroids] {
         composite
             .for_field_with_idx(field, slot.index())
             .write_all(&[0; 8])?;
@@ -1484,7 +1481,7 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
     ))?;
     centroid_file.write_all(&centroids)?;
     centroid_file.terminate()?;
-    for version in [2u32, 3, 4] {
+    for version in [2u32, 3, 4, 5] {
         bytes[..4].copy_from_slice(&version.to_le_bytes());
         directory.atomic_write(&vec_path, &bytes)?;
         let reader = crate::SegmentReader::open(&segment)?;
@@ -1492,7 +1489,7 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
             .vector_index(field)
             .err()
             .expect("unsupported segment");
-        if version == 4 {
+        if version == 5 {
             segment.validate_vector_format()?;
             reader.validate_vector_format()?;
             assert!(
@@ -1505,12 +1502,12 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
                 reader.validate_vector_format().unwrap_err(),
             ] {
                 assert!(
-                    matches!(error, crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch { index_version, supported_version: 4 }) if index_version == version),
+                    matches!(error, crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch { index_version, supported_version: 5 }) if index_version == version),
                     "{error:?}"
                 );
             }
             assert!(
-                matches!(error, crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch { index_version, supported_version: 4 }) if index_version == version),
+                matches!(error, crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch { index_version, supported_version: 5 }) if index_version == version),
                 "{error:?}"
             );
         }

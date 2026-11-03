@@ -283,7 +283,7 @@ impl VectorIndexReader {
         let mut first_row_by_doc = BTreeMap::new();
         let mut docs = Vec::new();
         for cluster in 0..index.num_clusters() {
-            let rows = index.cluster_range(cluster);
+            let rows = index.cluster_range(cluster)?;
             if rows.is_empty() {
                 continue;
             }
@@ -424,7 +424,7 @@ impl VectorIndexReader {
 
         let mut docs = Vec::new();
         for cluster in 0..index.num_clusters() {
-            let rows = index.cluster_range(cluster);
+            let rows = index.cluster_range(cluster)?;
             if rows.is_empty() {
                 continue;
             }
@@ -678,7 +678,7 @@ impl VectorIndexReader {
 
         let mut docs = Vec::new();
         for cluster in 0..index.num_clusters() {
-            let rows = index.cluster_range(cluster);
+            let rows = index.cluster_range(cluster)?;
             if rows.is_empty() {
                 continue;
             }
@@ -738,7 +738,7 @@ impl VectorIndexReader {
             candidates.estimates.reserve(row_count);
             candidates.sigmas.reserve(row_count);
             for cluster in 0..index.num_clusters() {
-                let rows = index.cluster_range(cluster);
+                let rows = index.cluster_range(cluster)?;
                 if rows.is_empty() {
                     continue;
                 }
@@ -839,12 +839,12 @@ impl VectorIndexReader {
                     for candidate in 0..candidates.len() {
                         let row = candidates.rows[candidate];
                         while cluster < index.num_clusters()
-                            && index.cluster_range(cluster).end <= row
+                            && index.cluster_range(cluster)?.end <= row
                         {
                             cluster += 1;
                         }
                         if cluster == index.num_clusters()
-                            || !index.cluster_range(cluster).contains(&row)
+                            || !index.cluster_range(cluster)?.contains(&row)
                         {
                             return Err(DataCorruption::comment_only(format!(
                                 "exact-E cone survivor row {row} is outside IVF cluster ranges"

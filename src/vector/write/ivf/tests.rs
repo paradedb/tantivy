@@ -161,7 +161,7 @@ fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
         assert!(!vector.id_map_initialized(), "scan must not open IdMap");
         let ivf = vector.index().unwrap();
         for b in 0..ivf.num_clusters() {
-            let range = ivf.cluster_range(b);
+            let range = ivf.cluster_range(b)?;
             let docs = vector.cluster_doc_ids(b).unwrap().unwrap();
             assert!(docs.windows(2).all(|pair| pair[0] < pair[1]));
             for (row, doc) in range.zip(docs) {
@@ -182,10 +182,6 @@ fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
                 assert!(vector.vector_bytes(doc)?.is_none());
             }
         }
-        let rows = (0..ivf.num_clusters())
-            .map(|b| ivf.cluster_range(b).start)
-            .chain(std::iter::once(count))
-            .collect();
         let data = composite
             .open_read_with_idx(field, VectorEntry::Data.index())
             .unwrap();
@@ -196,12 +192,17 @@ fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
         let start = data.storage_block_ord(0).unwrap();
         assert_eq!(start % ENTRY_ALIGN, 0);
         assert_eq!(data.len() % ENTRY_ALIGN, 0);
-        let blocks = Blocks::open(data.clone(), &opts, count, Some(rows))?;
+        let blocks = Blocks::open(data.clone(), &opts, true)?;
         assert_eq!(
             data.len(),
             data_entry_len(
-                *blocks.block_starts.last().unwrap() as usize,
-                blocks.block_rows.len() - 1
+                data.len()
+                    - 16
+                    - crate::vector::storage::blocks::align_up(
+                        (blocks.num_blocks() + 1) * 12,
+                        ENTRY_ALIGN
+                    ),
+                blocks.num_blocks()
             )
         );
         aligns.push(block_align(&blocks.slots));
@@ -272,7 +273,7 @@ fn clustered_merge_preserves_vectors_assignments_and_missing_docs() -> crate::Re
                 let mut rows_by_doc = BTreeMap::new();
                 for cluster in 0..ivf.num_clusters() {
                     let docs = vectors.cluster_doc_ids(cluster).unwrap().unwrap();
-                    for (row, doc) in ivf.cluster_range(cluster).zip(docs) {
+                    for (row, doc) in ivf.cluster_range(cluster)?.zip(docs) {
                         rows_by_doc
                             .insert(doc, (cluster, vectors.vector_bytes_for_row(row)?.to_vec()));
                     }
@@ -965,13 +966,13 @@ fn bridge_exactness_d768_and_d100() -> crate::Result<()> {
 
 // Settings version three remains a valid write target for vector format four.
 #[test]
-fn settings_v3_builds_v4_and_readers_ignore_global_changes() -> crate::Result<()> {
+fn settings_v3_builds_v5_and_readers_ignore_global_changes() -> crate::Result<()> {
     let mut index = build_quantized_fixture(QUANT_FIXTURE_DIM, true)?;
     let field = index.schema().get_field("embedding")?;
     let config = &index.settings().vector_quantization[0];
     assert_eq!(config.format_version, 3);
     config.validate(&VectorOptions::new(QUANT_FIXTURE_DIM, Metric::L2))?;
-    assert_eq!(&quantized_vec_file(&index)?[..4], &[4, 0, 0, 0]);
+    assert_eq!(&quantized_vec_file(&index)?[..4], &[5, 0, 0, 0]);
     index.settings_mut().vector_quantization.clear();
     let searcher = index.reader()?.searcher();
     let vector = searcher.segment_readers()[0].vector_index(field)?;
@@ -1227,7 +1228,7 @@ fn merge_quantization_matches_kernel_harness_and_is_reproducible() -> crate::Res
             QUANT_FIXTURE_DIM,
         )?;
         let prepared = prepare_centroid(&centroid, &specs);
-        for row in ivf.cluster_range(cluster) {
+        for row in ivf.cluster_range(cluster)? {
             let vector =
                 decode_row::<f32>(&vector_reader.vector_bytes_for_row(row)?, QUANT_FIXTURE_DIM)?;
             let mut expected_input = vector.clone();
@@ -1535,7 +1536,7 @@ fn general_dimension_quantized_bridge_at_d100() -> crate::Result<()> {
             DIM,
         )?;
         let prepared = prepare_centroid(&centroid, &specs);
-        for row in ivf.cluster_range(cluster) {
+        for row in ivf.cluster_range(cluster)? {
             let vector = decode_row::<f32>(&vector_reader.vector_bytes_for_row(row)?, DIM)?;
             let residual: Vec<f32> = vector
                 .iter()
