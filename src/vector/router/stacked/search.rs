@@ -67,6 +67,9 @@ pub(crate) struct StackedRanking {
     pub(crate) stats: Vec<StackedSearchStats>,
 }
 
+/// `Stored` is a layer of a segment's search tree saved on disk. `Partition` adds
+/// a single coarse centroid above that tree at query time, so the search can
+/// decide which segments' stored layers to explore.
 enum RoutingLayer<'a, S> {
     Stored(&'a StackedIvf<S>),
     Partition {
