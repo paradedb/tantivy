@@ -3,6 +3,7 @@
 
 pub(crate) mod aps;
 pub(crate) mod levels;
+pub(crate) mod search;
 
 use crate::directory::FileSlice;
 use crate::schema::VectorOptions;

@@ -103,26 +103,27 @@ impl<T: VectorElement> SegmentSearcher<T> {
     }
 
     /// The query as this segment scores it.
-    fn scoring_query(&self) -> ScoringQuery<'_, T> {
+    pub(crate) fn scoring_query(&self) -> ScoringQuery<'_, T> {
         ScoringQuery {
             query: &self.query,
             quantized: self.quantized.as_deref(),
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn params(&self) -> &ProbeParams {
         &self.probe_params
     }
 
-    #[cfg(test)]
     pub(crate) fn reader(&self) -> &VectorIndexReader {
         &self.reader
     }
 
-    #[cfg(test)]
     pub(crate) fn query(&self) -> &VectorQuery<T> {
         &self.query
+    }
+
+    pub(crate) fn segment_ord(&self) -> SegmentOrdinal {
+        self.segment_ord
     }
 
     // --- Search ---
@@ -249,7 +250,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
         drop(init);
         let source = match source {
             Source::Router(filter) => {
-                let mut clusters = RouterClusters::new(
+                let mut clusters = RouterClusters::for_segment(
                     &self.reader,
                     &self.query,
                     budget,

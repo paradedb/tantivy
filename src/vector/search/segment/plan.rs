@@ -95,6 +95,44 @@ impl SegmentPlan {
         })
     }
 
+    pub(crate) fn with_budget(
+        params: &ProbeParams,
+        index: &ClusterIndex,
+        weight: &dyn Weight,
+        segment: &SegmentReader,
+        top_n: usize,
+        budget: WorkBudget,
+    ) -> crate::Result<Self> {
+        let max_doc = segment.max_doc();
+        let clusters = index.num_clusters();
+        let report = |located_cap| PlanReport {
+            segment_rows: index.num_rows(),
+            segment_clusters: clusters,
+            located_cap,
+        };
+        if top_n == 0 || max_doc == 0 || clusters == 0 {
+            return Ok(Self {
+                budget: WorkBudget::default(),
+                source: None,
+                report: report(0),
+            });
+        }
+        // Capacity counts native docs as written: deleted rows still charge on first touch.
+        let x = budget.per_cluster.get();
+        let n_avg = (1.0 - x) / budget.per_row.get();
+        debug_assert!(n_avg > 0.0);
+        let cap = located_cap(params.located, max_doc, budget.total.get(), n_avg, x);
+        let source = {
+            let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
+            collect_segment_filter(weight, segment, max_doc, cap)?
+        };
+        Ok(Self {
+            budget,
+            source: (!source.is_empty()).then_some(source),
+            report: report(cap),
+        })
+    }
+
     /// The rows the scan admits under the budget, for reserving its columns once. The last
     /// cluster can overshoot the budget, growing the columns once more.
     pub(crate) fn capacity_hint(&self) -> usize {

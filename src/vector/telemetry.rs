@@ -108,6 +108,24 @@ pub(crate) struct StageTotals {
 }
 
 impl StageTotals {
+    pub(crate) fn append(&mut self, other: &Self) {
+        for (total, added) in self.time_ns.iter_mut().zip(other.time_ns) {
+            *total += added;
+        }
+        for (total, added) in self.io.iter_mut().zip(other.io) {
+            total.reads += added.reads;
+            total.bytes_read += added.bytes_read;
+            total.storage_blocks += added.storage_blocks;
+        }
+        for (total, added) in self
+            .sign_word_fallbacks
+            .iter_mut()
+            .zip(other.sign_word_fallbacks)
+        {
+            *total += added;
+        }
+    }
+
     /// Nanoseconds spent in `stage` with no inner stage running.
     pub(crate) fn time_ns(&self, stage: VectorStage) -> u64 {
         self.time_ns[slot(stage)]

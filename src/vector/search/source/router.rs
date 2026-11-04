@@ -188,9 +188,9 @@ pub(crate) struct RouterClusters<'a> {
 }
 
 impl<'a> RouterClusters<'a> {
-    /// Ranks as many of `segment`'s clusters as `budget` buys at the filter's match fraction, and
-    /// prepares the probe controller. `reader` is the segment's IVF reader.
-    pub(crate) fn new<T: VectorElement>(
+    /// Prepares this segment to choose and probe its own clusters.
+    /// Its router determines the cluster order, and its budget controls when probing stops.
+    pub(crate) fn for_segment<T: VectorElement>(
         reader: &'a VectorIndexReader,
         query: &'a VectorQuery<T>,
         budget: WorkBudget,
@@ -224,6 +224,65 @@ impl<'a> RouterClusters<'a> {
             selected_docs: Vec::new(),
             counters: RouterCounters::default(),
         }
+    }
+
+    /// Prepares this segment for a global search across multiple segments.
+    /// The global search supplies clusters in ranked order and enforces the shared budget.
+    pub(crate) fn for_global(
+        reader: &'a VectorIndexReader,
+        budget: WorkBudget,
+        filter: DocFilter,
+        segment: &'a SegmentReader,
+        metrics: RouterMetrics,
+    ) -> Self {
+        let index = reader.index().expect("IVF segment");
+        Self {
+            index,
+            reader,
+            ranked: RouterIter::Global(metrics),
+            meter: WorkMeter::new(budget),
+            controller: ProbeController::new(index.num_clusters()),
+            gate: RowGate::new(filter, segment.alive_bitset()),
+            docs: Vec::new(),
+            offsets: Vec::new(),
+            selected_docs: Vec::new(),
+            counters: RouterCounters::default(),
+        }
+    }
+
+    /// Prepares a cluster chosen by the global router.
+    pub(crate) fn probe_global(
+        &mut self,
+        candidate: Candidate,
+    ) -> crate::Result<Option<ClusterRows<'_>>> {
+        let Candidate { sim, node } = candidate;
+        let cluster = node as usize;
+        self.meter.open();
+        let rows = self.index.cluster_range(cluster);
+        if rows.is_empty() {
+            self.skip_empty();
+            return Ok(None);
+        }
+        let gated = self.gate_cluster(cluster, rows.len())?;
+        if !gated.all && self.offsets.is_empty() {
+            self.skip_empty();
+            return Ok(None);
+        }
+        self.selected_docs.clear();
+        if !gated.all {
+            self.selected_docs.extend(
+                self.offsets
+                    .iter()
+                    .map(|&offset| self.docs[offset as usize]),
+            );
+        }
+        Ok(Some(ClusterRows {
+            cluster,
+            rows,
+            offsets: (!gated.all).then_some(&self.offsets[..]),
+            docs: (!gated.all).then_some(&self.selected_docs[..]),
+            centroid: Some(sim),
+        }))
     }
 
     /// Selects `cluster`'s rows into `offsets` and counts what the gate pruned.
