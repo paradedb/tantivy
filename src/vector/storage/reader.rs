@@ -519,6 +519,25 @@ impl VectorIndexReader {
         self.rows_slice.read_column(0, row..row + 1)
     }
 
+    /// Announces that `row`'s full-precision bytes will be read, through the block and column-0
+    /// range [`Self::vector_bytes_for_row`] reads. Advisory; a row out of bounds announces nothing.
+    pub(crate) fn prefetch_row(&self, row: usize) {
+        let num_rows = *self.rows_slice.block_rows.last().unwrap();
+        debug_assert!(row < num_rows, "vector row {row} is out of bounds");
+        if row >= num_rows {
+            return;
+        }
+        let Ok(b) = self.rows_slice.block_for_range(&(row..row + 1)) else {
+            return;
+        };
+        let Ok(column) = self.rows_slice.column(b, 0) else {
+            return;
+        };
+        let stride = self.rows_slice.slots[0].stride as usize;
+        let local = row - self.rows_slice.block_rows[b];
+        column.prefetch(local * stride..(local + 1) * stride);
+    }
+
     /// Fetches the increasing vector rows in `scratch.rows` through a storage-aware range plan. The
     /// batch borrows its rows and the read chunks from `scratch`.
     pub(crate) fn read_vector_rows_planned<'s>(
@@ -1048,6 +1067,89 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    /// `prefetch_row` announces exactly the column-0 byte range `vector_bytes_for_row` reads.
+    #[test]
+    fn prefetch_row_announces_the_row_read() -> crate::Result<()> {
+        use crate::directory::FileHandle;
+
+        /// Announced and read ranges, in order.
+        type IoLog = Arc<Mutex<Vec<(&'static str, Range<usize>)>>>;
+
+        /// Bytes that log every announced and read range.
+        #[derive(Debug)]
+        struct Tracked {
+            bytes: Vec<u8>,
+            log: IoLog,
+        }
+        impl HasLen for Tracked {
+            fn len(&self) -> usize {
+                self.bytes.len()
+            }
+        }
+        impl FileHandle for Tracked {
+            fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
+                self.log.lock().unwrap().push(("read", range.clone()));
+                Ok(OwnedBytes::new(self.bytes[range].to_vec()))
+            }
+            fn prefetch(&self, range: Range<usize>) {
+                self.log.lock().unwrap().push(("prefetch", range));
+            }
+        }
+
+        const DIM: usize = 3;
+        const ROWS: usize = 10;
+        let row_bytes = (0..ROWS)
+            .flat_map(|row| {
+                (0..DIM).flat_map(move |d| (row as f32 * 10.0 + d as f32).to_le_bytes())
+            })
+            .collect::<Vec<_>>();
+        let opts = VectorOptions::new(DIM, Metric::L2);
+        let mut data = Vec::new();
+        let prefix = crate::vector::storage::blocks::write_metadata(
+            &mut data,
+            &VectorColMetadata::build_flat(&opts),
+        )?;
+        data.extend_from_slice(&row_bytes);
+        let mut directory = crate::vector::storage::blocks::BlockDirectory::new(prefix as u64);
+        directory.push(data.len() as u64, ROWS as u32);
+        directory.finish(&mut data)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let storage = Arc::new(Tracked {
+            bytes: data,
+            log: Arc::clone(&log),
+        });
+        let blocks = Arc::new(Blocks::open(FileSlice::new(storage), &opts, ROWS, None)?);
+        let reader = VectorIndexReader {
+            max_doc: ROWS as DocId,
+            options: VectorOptions::new(DIM, Metric::L2),
+            num_vectors: ROWS,
+            present: true,
+            id_map: DeferredIdMap::ready(IdMap::Identity {
+                num_docs: ROWS as u32,
+            }),
+            rows_slice: blocks,
+            index: None,
+            quantization: None,
+        };
+        let stride = DIM * std::mem::size_of::<f32>();
+        for row in [0, 4, ROWS - 1] {
+            log.lock().unwrap().clear();
+            reader.prefetch_row(row);
+            let bytes = reader.vector_bytes_for_row(row)?;
+            assert_eq!(
+                bytes.as_slice(),
+                &row_bytes[row * stride..(row + 1) * stride]
+            );
+            let range = prefix + row * stride..prefix + (row + 1) * stride;
+            assert_eq!(
+                &*log.lock().unwrap(),
+                &[("prefetch", range.clone()), ("read", range)],
+                "row {row}"
+            );
+        }
         Ok(())
     }
 

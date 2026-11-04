@@ -60,6 +60,11 @@ pub trait FileHandle: 'static + Send + Sync + HasLen + fmt::Debug {
     fn storage_block_len(&self) -> Option<usize> {
         None
     }
+
+    /// Announces that `range` will be read soon, so a backend can start its I/O early.
+    ///
+    /// Advisory: the default does nothing, and no implementation reads or fails.
+    fn prefetch(&self, _range: Range<usize>) {}
 }
 
 #[derive(Debug)]
@@ -326,6 +331,16 @@ impl FileSlice {
             .read_bytes(self.range.start + range.start..self.range.start + range.end)
     }
 
+    /// Announces that `range`, relative to this slice, will be read soon. Advisory; the range is
+    /// clipped to the slice and nothing is read. See [`FileHandle::prefetch`].
+    pub fn prefetch(&self, range: Range<usize>) {
+        let end = range.end.min(self.len());
+        if range.start < end {
+            self.data
+                .prefetch(self.range.start + range.start..self.range.start + end);
+        }
+    }
+
     #[doc(hidden)]
     pub async fn read_bytes_slice_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
         assert!(
@@ -392,6 +407,10 @@ impl FileSlice {
 impl FileHandle for FileSlice {
     fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
         self.read_bytes_slice(range)
+    }
+
+    fn prefetch(&self, range: Range<usize>) {
+        FileSlice::prefetch(self, range)
     }
 
     async fn read_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {

@@ -1,12 +1,22 @@
 //! IVF build and merge tests.
 
-use std::sync::Arc;
+use std::io;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use crate::index::IndexSettings;
+use common::{HasLen, OwnedBytes};
+
+use crate::directory::error::{DeleteError, OpenReadError, OpenWriteError};
+use crate::directory::{
+    Directory, FileHandle, InnerWritePtr, RamDirectory, TempFilePtr, WatchCallback, WatchHandle,
+};
+use crate::index::{IndexSettings, SegmentComponent};
 use crate::indexer::NoMergePolicy;
 use crate::query::AllQuery;
 use crate::schema::{Field, Metric, Schema, Term, VectorDType, VectorOptions, STORED, STRING};
 use crate::vector::diagnostics::{VectorClusterStats, VectorInfo, VectorStorageFormat};
+use crate::vector::storage::header::VEC_EXT;
 use crate::vector::test_support::{Fixture, FixtureSpec, NearestClusterer};
 use crate::vector::tests::{exhaustive_params, TestVectorIndex};
 use crate::vector::RouterKind;
@@ -449,5 +459,181 @@ fn vector_info_reports_router_levels() -> crate::Result<()> {
             .expect("vector info");
         assert_eq!((info.router, info.router_levels), (None, None));
     }
+    Ok(())
+}
+
+// --- Encode prefetch ---
+
+/// Every `.vec` range announced or read through a [`LoggedDirectory`], in order.
+type VecIoLog = Arc<Mutex<Vec<(PathBuf, VecIo, Range<usize>)>>>;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum VecIo {
+    Prefetch,
+    Read,
+}
+
+/// A RAM directory whose `.vec` handles log their announced and read ranges.
+#[derive(Clone, Debug, Default)]
+struct LoggedDirectory {
+    inner: RamDirectory,
+    log: VecIoLog,
+}
+
+#[derive(Debug)]
+struct LoggedVec {
+    inner: Arc<dyn FileHandle>,
+    path: PathBuf,
+    log: VecIoLog,
+}
+
+impl HasLen for LoggedVec {
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+impl FileHandle for LoggedVec {
+    fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+        self.log
+            .lock()
+            .unwrap()
+            .push((self.path.clone(), VecIo::Read, range.clone()));
+        self.inner.read_bytes(range)
+    }
+    fn prefetch(&self, range: Range<usize>) {
+        self.log
+            .lock()
+            .unwrap()
+            .push((self.path.clone(), VecIo::Prefetch, range));
+    }
+}
+
+impl Directory for LoggedDirectory {
+    fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+        let inner = self.inner.get_file_handle(path)?;
+        if path.extension().is_some_and(|ext| ext == "vec") {
+            Ok(Arc::new(LoggedVec {
+                inner,
+                path: path.to_path_buf(),
+                log: self.log.clone(),
+            }))
+        } else {
+            Ok(inner)
+        }
+    }
+    fn delete(&self, path: &Path) -> Result<(), DeleteError> {
+        self.inner.delete(path)
+    }
+    fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
+        self.inner.exists(path)
+    }
+    fn open_write_inner(&self, path: &Path) -> Result<InnerWritePtr, OpenWriteError> {
+        self.inner.open_write_inner(path)
+    }
+    fn open_temp_file(&self) -> io::Result<TempFilePtr> {
+        self.inner.open_temp_file()
+    }
+    fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+        self.inner.atomic_read(path)
+    }
+    fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+        self.inner.atomic_write(path, data)
+    }
+    fn sync_directory(&self) -> io::Result<()> {
+        self.inner.sync_directory()
+    }
+    fn watch(&self, callback: WatchCallback) -> crate::Result<WatchHandle> {
+        self.inner.watch(callback)
+    }
+}
+
+/// One IVF segment of `n` docs over two clusters in `directory`: two flat commits, merged in
+/// commit order so two builds lay their rows out identically.
+fn build_two_cluster_ivf(
+    directory: impl Directory + Clone,
+    n: usize,
+) -> crate::Result<(Index, Field)> {
+    let mut sb = Schema::builder();
+    let field = sb.add_vector_field(
+        "embedding",
+        VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32),
+    );
+    let label = sb.add_text_field("label", STRING | STORED);
+    let index = Index::builder()
+        .schema(sb.build())
+        .settings(IndexSettings {
+            vector_clustering_threshold: 1,
+            ..IndexSettings::default()
+        })
+        .ivf_clusterer(Arc::new(NearestClusterer {
+            centroids: vec![vec![0.0, 0.0], vec![10.0, 0.0]],
+        }))
+        .ivf_router(RouterKind::Exact)
+        .create(directory)?;
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+    writer.set_merge_policy(Box::new(NoMergePolicy));
+    let mut segments = Vec::new();
+    for half in 0..2 {
+        for i in half * n / 2..(half + 1) * n / 2 {
+            let mut doc = TantivyDocument::new();
+            doc.add_text(label, format!("d{i}"));
+            doc.add_vector(field, &[(i % 2) as f32 * 10.0 + 0.001 * i as f32, 0.0]);
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+        for id in index.searchable_segment_ids()? {
+            if !segments.contains(&id) {
+                segments.push(id);
+            }
+        }
+    }
+    writer.merge(&segments).wait()?;
+    writer.wait_merging_threads()?;
+    Ok((index, field))
+}
+
+/// The encode pass announces each window of source rows before reading it: every announced
+/// `.vec` range is read afterwards, and announcing changes no written byte.
+#[test]
+fn encode_announces_source_rows_before_reading_them() -> crate::Result<()> {
+    use std::sync::atomic::Ordering;
+
+    // Two clusters of 150 rows: a window of 128 and one of 22 per cluster.
+    let n = 300;
+    let logged = LoggedDirectory::default();
+    let (index, _) = build_two_cluster_ivf(logged.clone(), n)?;
+    let entries = logged.log.lock().unwrap().clone();
+    let announced: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, io, _))| *io == VecIo::Prefetch)
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(announced.len(), n, "one announcement per encoded row");
+    for at in announced {
+        let (path, _, range) = &entries[at];
+        assert!(
+            entries[at + 1..]
+                .iter()
+                .any(|(p, io, r)| *io == VecIo::Read && p == path && r == range),
+            "{path:?} {range:?} announced but never read"
+        );
+    }
+    let merged_vec = |index: &Index| -> crate::Result<Vec<u8>> {
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1, "one merged segment");
+        let file =
+            searcher.segment_readers()[0].open_read(SegmentComponent::Custom(VEC_EXT.into()))?;
+        Ok(file.read_bytes()?.to_vec())
+    };
+    let announced_bytes = merged_vec(&index)?;
+    assert!(!announced_bytes.is_empty());
+
+    super::encode::PREFETCH_DISABLED.store(true, Ordering::Relaxed);
+    let plain = build_two_cluster_ivf(RamDirectory::default(), n);
+    super::encode::PREFETCH_DISABLED.store(false, Ordering::Relaxed);
+    let (plain, _) = plain?;
+    assert_eq!(merged_vec(&plain)?, announced_bytes);
     Ok(())
 }

@@ -23,6 +23,25 @@ use crate::vector::storage::metadata::{Slot, SlotType, VectorColMetadata};
 use crate::vector::ENTRY_ALIGN;
 use crate::TantivyError;
 
+/// Source rows announced ahead of their reads, so a backend can start their I/O early.
+const PREFETCH_ROWS: usize = 128;
+
+#[cfg(test)]
+pub(super) static PREFETCH_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the encode pass announces its reads ahead; tests switch it off to compare builds.
+fn prefetch_enabled() -> bool {
+    #[cfg(test)]
+    {
+        !PREFETCH_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
 /// The stored centroid rows, normalized as the field's vectors are.
 pub(super) fn encode_centroids(
     merge: &FieldMerge,
@@ -134,6 +153,15 @@ pub(super) fn write_data_entry(
             }
             batch_values.clear();
             for assigned in tile {
+                // Cluster order is random over the sources: announce the next window of rows.
+                let local_row = local as usize;
+                if local_row % PREFETCH_ROWS == 0 && prefetch_enabled() {
+                    let window_end = (start + local_row + PREFETCH_ROWS).min(end);
+                    for next in &assigned_vectors[start + local_row..window_end] {
+                        merge.readers[next.source.segment_ord as usize]
+                            .prefetch_row(next.source.row_id);
+                    }
+                }
                 timings.encode_reads += 1;
                 bufs[1].extend_from_slice(&assigned.target_doc_id.to_le_bytes());
                 locations[assigned.target_doc_id as usize] = DocLocation {
