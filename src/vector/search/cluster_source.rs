@@ -9,7 +9,7 @@ use crate::DocId;
 /// One cluster's selected rows, with what is already known about them.
 pub(crate) struct ClusterRows<'a> {
     pub(crate) cluster: usize,
-    /// The cluster's full global row range.
+    /// The cluster's local row range, starting at zero.
     pub(crate) rows: Range<usize>,
     /// Strictly ascending cluster-local offsets of the selected rows, at least one; `None`
     /// selects every row.
@@ -30,8 +30,8 @@ impl ClusterRows<'_> {
         self.offsets.map_or(self.rows.len(), <[u32]>::len)
     }
 
-    /// The selected rows' global row numbers, ascending.
-    pub(crate) fn global_rows(&self) -> impl Iterator<Item = usize> + '_ {
+    /// The selected local row numbers, ascending.
+    pub(crate) fn local_rows(&self) -> impl Iterator<Item = usize> + '_ {
         let (span, offsets) = match self.offsets {
             None => (self.rows.clone(), &[][..]),
             Some(offsets) => (0..0, offsets),

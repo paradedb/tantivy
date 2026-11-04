@@ -20,6 +20,7 @@ use crate::vector::storage::blocks::{Block, Blocks};
 use crate::vector::storage::io::{VectorRead, VectorReadKind};
 use crate::vector::storage::metadata::{SlotType, VectorColMetadata};
 use crate::vector::storage::reader::VectorRowChunk;
+use crate::vector::BlockAddress;
 use crate::TantivyError;
 
 /// Deferred code, sidecar, and optional L2-constant slices for one residual layer.
@@ -481,12 +482,16 @@ impl QuantizedLayerReader {
         }
         Ok(())
     }
-    pub(crate) fn read_codes(&self, rows: Range<usize>) -> crate::Result<OwnedBytes> {
-        let bytes = self.blocks.read_column(self.codes, rows.clone())?;
+    pub(crate) fn read_codes(&self, block: usize, rows: Range<usize>) -> crate::Result<OwnedBytes> {
+        let bytes = self.blocks.read_column(block, self.codes, rows.clone())?;
         self.validate_codes(&bytes, &rows)?;
         Ok(bytes)
     }
-    pub(crate) fn read_sidecar(&self, rows: Range<usize>) -> crate::Result<QuantizedSidecarBatch> {
+    pub(crate) fn read_sidecar(
+        &self,
+        block: usize,
+        rows: Range<usize>,
+    ) -> crate::Result<QuantizedSidecarBatch> {
         // Preserve the empty-span behavior of the column reader.
         if rows.start == rows.end && rows.end <= self.blocks.num_rows() {
             return Ok(QuantizedSidecarBatch {
@@ -497,7 +502,7 @@ impl QuantizedLayerReader {
                 rows,
             });
         }
-        let block = self.blocks.block_for_range(&rows)?;
+        let block = self.blocks.block_for_range(block, &rows)?;
         Ok(QuantizedSidecarBatch {
             scales: block.read_column(self.scales, rows.clone())?,
             gammas: block.read_column(self.gammas, rows.clone())?,
@@ -506,18 +511,26 @@ impl QuantizedLayerReader {
             rows,
         })
     }
-    pub(crate) fn read_constants(&self, rows: Range<usize>) -> crate::Result<Option<OwnedBytes>> {
+    pub(crate) fn read_constants(
+        &self,
+        block: usize,
+        rows: Range<usize>,
+    ) -> crate::Result<Option<OwnedBytes>> {
         self.constants
-            .map(|idx| self.blocks.read_column(idx, rows))
+            .map(|idx| self.blocks.read_column(block, idx, rows))
             .transpose()
     }
     /// Pins one band's columns in a single request, then restricts views to the requested rows.
     #[cfg(test)]
-    pub(crate) fn read_batch(&self, rows: Range<usize>) -> crate::Result<QuantizedLayerBatch> {
-        let block = self.blocks.block_for_range(&rows)?;
+    pub(crate) fn read_batch(
+        &self,
+        block: usize,
+        rows: Range<usize>,
+    ) -> crate::Result<QuantizedLayerBatch> {
+        let block = self.blocks.block_for_range(block, &rows)?;
         self.read_batch_from_block(&block, rows)
     }
-    /// Uses a known block without resolving its global row range again.
+    /// Uses a known block and local row range.
     pub(crate) fn read_batch_in_block(
         &self,
         b: usize,
@@ -680,17 +693,18 @@ impl QuantizedLayerReader {
         }));
     }
 
-    /// Plans global row identifiers against a block-local column and restores global ranges.
+    /// Plans local row ranges against one block's column geometry.
     #[cfg(test)]
     pub(crate) fn plan_column_reads(
         &self,
+        block: usize,
         idx: usize,
         available: Range<usize>,
         rows: &[usize],
         ranges: &mut Vec<Range<usize>>,
         scratch: &mut Vec<(usize, usize)>,
     ) {
-        plan_block_column(&self.blocks, idx, available, rows, ranges, scratch).unwrap();
+        plan_block_column(&self.blocks, block, idx, available, rows, ranges, scratch).unwrap();
     }
     #[cfg(test)]
     pub(crate) fn plan_code_reads(
@@ -700,12 +714,12 @@ impl QuantizedLayerReader {
         ranges: &mut Vec<Range<usize>>,
         scratch: &mut Vec<(usize, usize)>,
     ) {
-        self.plan_column_reads(self.codes, available, rows, ranges, scratch);
+        self.plan_column_reads(0, self.codes, available, rows, ranges, scratch);
     }
     /// Resolves a cluster once so ordered code reads need no repeated block lookup.
     #[cfg(test)]
     pub(crate) fn cluster(&self, row: usize) -> crate::Result<QuantizedClusterReader<'_>> {
-        self.cluster_in_block(self.blocks.block_of(row)?)
+        self.cluster_in_block(row)
     }
     /// Preserves a cluster address already established by the scan.
     pub(crate) fn cluster_in_block(
@@ -721,24 +735,34 @@ impl QuantizedLayerReader {
         })
     }
     #[cfg(test)]
-    pub(crate) fn read_column(&self, idx: usize, rows: Range<usize>) -> crate::Result<OwnedBytes> {
-        self.blocks.read_column(idx, rows)
+    pub(crate) fn read_column(
+        &self,
+        block: usize,
+        idx: usize,
+        rows: Range<usize>,
+    ) -> crate::Result<OwnedBytes> {
+        self.blocks.read_column(block, idx, rows)
     }
-    pub(crate) fn code_bytes(&self, row: usize) -> crate::Result<OwnedBytes> {
-        self.read_codes(row..row + 1)
+    pub(crate) fn code_bytes(&self, address: BlockAddress) -> crate::Result<OwnedBytes> {
+        let (block, row) = (address.block as usize, address.row as usize);
+        self.read_codes(block, row..row + 1)
     }
-    pub(crate) fn scale(&self, row: usize) -> crate::Result<f32> {
-        self.read_sidecar(row..row + 1)?.scale(row)
+    pub(crate) fn scale(&self, address: BlockAddress) -> crate::Result<f32> {
+        let (block, row) = (address.block as usize, address.row as usize);
+        self.read_sidecar(block, row..row + 1)?.scale(row)
     }
-    pub(crate) fn gamma(&self, row: usize) -> crate::Result<f32> {
-        self.read_sidecar(row..row + 1)?.gamma(row)
+    pub(crate) fn gamma(&self, address: BlockAddress) -> crate::Result<f32> {
+        let (block, row) = (address.block as usize, address.row as usize);
+        self.read_sidecar(block, row..row + 1)?.gamma(row)
     }
-    pub(crate) fn error_ratio(&self, row: usize) -> crate::Result<f32> {
-        self.read_sidecar(row..row + 1)?.error_ratio(row)
+    pub(crate) fn error_ratio(&self, address: BlockAddress) -> crate::Result<f32> {
+        let (block, row) = (address.block as usize, address.row as usize);
+        self.read_sidecar(block, row..row + 1)?.error_ratio(row)
     }
-    pub(crate) fn constant(&self, row: usize) -> crate::Result<Option<f32>> {
+    pub(crate) fn constant(&self, address: BlockAddress) -> crate::Result<Option<f32>> {
+        let (block, row) = (address.block as usize, address.row as usize);
         Ok(self
-            .read_constants(row..row + 1)?
+            .read_constants(block, row..row + 1)?
             .map(|b| f32::from_le_bytes(b.as_slice().try_into().unwrap())))
     }
 }
@@ -833,6 +857,7 @@ impl QuantizedClusterReader<'_> {
 #[cfg(test)]
 fn plan_block_column(
     blocks: &Blocks,
+    block_index: usize,
     idx: usize,
     available: Range<usize>,
     rows: &[usize],
@@ -840,35 +865,33 @@ fn plan_block_column(
     scratch: &mut Vec<(usize, usize)>,
 ) -> crate::Result<()> {
     ranges.clear();
-    let mut selected = rows;
-    while let Some(&row) = selected.first() {
-        let block = blocks.block(blocks.block_of(row)?)?;
-        let first = block.row_range().start;
-        let end = block.row_range().end;
-        let count = selected.partition_point(|&r| r < end);
-        if matches!(
-            blocks.schema[idx].slot_type,
-            SlotType::QuantLayerCodes { .. }
-        ) {
-            QuantizedLayerReader::plan_code_slot_reads(
-                &block.column(idx),
-                blocks.schema[idx].stride as usize,
-                first,
-                &selected[..count],
-                ranges,
-            );
-        } else {
-            QuantizedLayerReader::plan_slot_reads(
-                &block.column(idx),
-                blocks.schema[idx].stride as usize,
-                first,
-                available.start.max(first)..available.end.min(end),
-                &selected[..count],
-                ranges,
-                scratch,
-            );
-        }
-        selected = &selected[count..];
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let block = blocks.block(block_index)?;
+    block.check_rows(&(rows[0]..rows.last().unwrap() + 1))?;
+    let column = block.column(idx);
+    if matches!(
+        blocks.schema[idx].slot_type,
+        SlotType::QuantLayerCodes { .. }
+    ) {
+        QuantizedLayerReader::plan_code_slot_reads(
+            &column,
+            blocks.schema[idx].stride as usize,
+            0,
+            rows,
+            ranges,
+        );
+    } else {
+        QuantizedLayerReader::plan_slot_reads(
+            &column,
+            blocks.schema[idx].stride as usize,
+            0,
+            available,
+            rows,
+            ranges,
+            scratch,
+        );
     }
     Ok(())
 }
@@ -885,12 +908,17 @@ impl QuantizedFieldReader {
     pub(crate) fn layers(&self) -> &[QuantizedLayerReader] {
         &self.layers
     }
-    pub(crate) fn residual_norm(&self, row: usize) -> crate::Result<f32> {
-        let bytes = self.read_residual_norms(row..row + 1)?;
+    pub(crate) fn residual_norm(&self, address: BlockAddress) -> crate::Result<f32> {
+        let (block, row) = (address.block as usize, address.row as usize);
+        let bytes = self.read_residual_norms(block, row..row + 1)?;
         Ok(f32::from_le_bytes(bytes.as_slice().try_into().unwrap()))
     }
-    pub(crate) fn read_residual_norms(&self, rows: Range<usize>) -> crate::Result<OwnedBytes> {
-        self.blocks.read_column(self.norms, rows)
+    pub(crate) fn read_residual_norms(
+        &self,
+        block: usize,
+        rows: Range<usize>,
+    ) -> crate::Result<OwnedBytes> {
+        self.blocks.read_column(block, self.norms, rows)
     }
     pub(crate) fn index_ctx(&self) -> &Arc<QuantizedIndexCtx> {
         &self.index_ctx
@@ -944,7 +972,6 @@ mod tests {
     use super::*;
     use crate::schema::{Metric, VectorOptions};
     use crate::vector::quantization::{quantized_code_stride, VectorQuantizationConfig};
-    use crate::vector::storage::blocks::RowOffsets;
     use crate::vector::storage::io::test_support::{BlockTrackedBytes, TrackedReads};
 
     fn test_layer(
@@ -983,7 +1010,8 @@ mod tests {
         let slots = meta.slots();
         let mut out = Vec::new();
         write_metadata(&mut out, &meta).unwrap();
-        let mut directory = crate::vector::storage::blocks::BlockDirectory::new(out.len() as u64);
+        let mut directory =
+            crate::vector::storage::blocks::BlockOffsetsWriter::new(out.len() as u64);
         let codes = codes.read_bytes().unwrap();
         let sidecar = sidecar.read_bytes().unwrap();
         let constants = constants.map(|s| s.read_bytes().unwrap());
@@ -1025,7 +1053,7 @@ mod tests {
             }
             let padding = start + block_len(&slots, n) - out.len();
             pad(&mut out, padding).unwrap();
-            directory.push(out.len() as u64);
+            directory.push(out.len() as u64, n);
         }
         directory.finish(&mut out).unwrap();
         let entry = if let Some((reads, block_len)) = tracking {
@@ -1037,14 +1065,7 @@ mod tests {
         } else {
             FileSlice::from(out)
         };
-        let blocks = Arc::new(
-            Blocks::open(
-                entry,
-                &opts,
-                RowOffsets::clusters(&offsets.iter().map(|&n| n as u64).collect::<Vec<_>>()),
-            )
-            .unwrap(),
-        );
+        let blocks = Arc::new(Blocks::open(entry, &opts, true).unwrap());
         QuantizedLayerReader {
             blocks,
             layer: 0,
@@ -1157,7 +1178,7 @@ mod tests {
             65,
             1,
         );
-        assert_eq!(valid.code_bytes(0)?.as_slice(), codes);
+        assert_eq!(valid.code_bytes(BlockAddress::new(0, 0))?.as_slice(), codes);
 
         codes[8] |= 2;
         let corrupt = test_layer(
@@ -1168,7 +1189,7 @@ mod tests {
             65,
             1,
         );
-        assert!(corrupt.code_bytes(0).is_err());
+        assert!(corrupt.code_bytes(BlockAddress::new(0, 0)).is_err());
         Ok(())
     }
 
@@ -1194,9 +1215,9 @@ mod tests {
         let mut blocks = Vec::new();
         reader.plan_code_reads(0..3, &[0, 2], &mut ranges, &mut blocks);
         assert_eq!(ranges, [0..1, 2..3]);
-        assert!(reader.read_codes(0..1).is_ok());
-        assert!(reader.read_codes(2..3).is_ok());
-        assert!(reader.read_codes(0..3).is_err());
+        assert!(reader.read_codes(0, 0..1).is_ok());
+        assert!(reader.read_codes(0, 2..3).is_ok());
+        assert!(reader.read_codes(0, 0..3).is_err());
     }
 
     #[test]
@@ -1218,7 +1239,7 @@ mod tests {
             65,
             1,
         );
-        let batch = reader.read_batch(0..2)?;
+        let batch = reader.read_batch(0, 0..2)?;
         assert_eq!(batch.code_bytes(0)?, &codes[..stride]);
         assert_eq!(batch.code_bytes(1)?, &codes[stride..]);
         assert_eq!(batch.scale(0)?, 17.0);
@@ -1242,7 +1263,7 @@ mod tests {
             65,
             1,
         );
-        assert!(corrupt.read_batch(0..2).is_err());
+        assert!(corrupt.read_batch(0, 0..2).is_err());
         Ok(())
     }
 
@@ -1259,19 +1280,19 @@ mod tests {
             1,
         );
 
-        let first = reader.read_sidecar(0..2)?;
+        let first = reader.read_sidecar(0, 0..2)?;
         assert_eq!(first.scale(0)?, 11.0);
         assert_eq!(first.scale(1)?, 12.0);
         assert_eq!(first.gamma(0)?, 1.0);
         assert_eq!(first.gamma(1)?, 2.0);
         assert_eq!(first.error_ratio(0)?, 0.25);
         assert_eq!(first.error_ratio(1)?, 0.25);
-        let second = reader.read_sidecar(2..3)?;
-        assert_eq!(second.scale(2)?, 13.0);
-        assert_eq!(second.gamma(2)?, 3.0);
-        assert_eq!(second.error_ratio(2)?, 0.25);
-        assert_eq!(reader.scale(2)?, 13.0);
-        assert_eq!(reader.gamma(2)?, 3.0);
+        let second = reader.read_sidecar(1, 0..1)?;
+        assert_eq!(second.scale(0)?, 13.0);
+        assert_eq!(second.gamma(0)?, 3.0);
+        assert_eq!(second.error_ratio(0)?, 0.25);
+        assert_eq!(reader.scale(BlockAddress::new(1, 0))?, 13.0);
+        assert_eq!(reader.gamma(BlockAddress::new(1, 0))?, 3.0);
         Ok(())
     }
 
@@ -1316,7 +1337,7 @@ mod tests {
             1,
             Some((Arc::clone(&reads), 16)),
         );
-        let block = reader.blocks.block_for_range(&(0..8))?;
+        let block = reader.blocks.block_for_range(0, &(0..8))?;
         reads.lock().unwrap().clear();
         let (batch, totals) = crate::vector::telemetry::measure(|| {
             let _stage = crate::vector::telemetry::enter_vector_stage(
@@ -1335,21 +1356,23 @@ mod tests {
             ((range.end - 1) / 16 - range.start / 16 + 1) as u64
         );
         assert!(batch.residual_norms.is_some());
-        let sidecar = reader.read_sidecar(0..8)?;
+        let sidecar = reader.read_sidecar(0, 0..8)?;
         assert_eq!(batch.scales(), sidecar.scales());
         assert_eq!(batch.gammas(), sidecar.gammas());
         assert_eq!(batch.error_ratios(), sidecar.error_ratios());
         let mut ranges = Vec::new();
         let mut scratch = Vec::new();
-        for column in [reader.codes, reader.scales, reader.gammas, reader.errors] {
-            reader.plan_column_reads(column, 0..12, &[0, 7, 8, 11], &mut ranges, &mut scratch);
-            assert!(ranges.iter().all(|r| r.end <= 8 || r.start >= 8));
-            for r in ranges.clone() {
-                reader.read_column(column, r)?;
+        for (b, count, selected) in [(0, 8, vec![0, 7]), (2, 4, vec![0, 3])] {
+            for column in [reader.codes, reader.scales, reader.gammas, reader.errors] {
+                reader.plan_column_reads(b, column, 0..count, &selected, &mut ranges, &mut scratch);
+                assert!(ranges.iter().all(|r| r.end <= count));
+                for r in ranges.clone() {
+                    reader.read_column(b, column, r)?;
+                }
             }
         }
         for column in [reader.codes, reader.scales, reader.gammas, reader.errors] {
-            assert!(reader.read_column(column, 7..9).is_err());
+            assert!(reader.read_column(0, column, 7..9).is_err());
         }
         Ok(())
     }
@@ -1379,7 +1402,7 @@ mod tests {
     #[test]
     fn sparse_cluster_reads_pin_one_sidecar_span() -> crate::Result<()> {
         use crate::vector::storage::blocks::{
-            block_len, column_range, write_metadata, BlockDirectory,
+            block_len, column_range, write_metadata, BlockOffsetsWriter,
         };
         use crate::vector::telemetry::{enter_vector_stage, measure};
         use crate::vector::{VectorQuantizationLayer, VectorStage};
@@ -1397,7 +1420,7 @@ mod tests {
             let slots = meta.slots();
             let mut data = Vec::new();
             write_metadata(&mut data, &meta)?;
-            let mut directory = BlockDirectory::new(data.len() as u64);
+            let mut directory = BlockOffsetsWriter::new(data.len() as u64);
             let boundaries = [0, 59, 59, 118];
             for rows in boundaries.windows(2) {
                 let n = rows[1] - rows[0];
@@ -1430,7 +1453,7 @@ mod tests {
                         _ => {}
                     }
                 }
-                directory.push(data.len() as u64);
+                directory.push(data.len() as u64, n);
             }
             directory.finish(&mut data)?;
             for block_len in [0, 16, 8160] {
@@ -1448,13 +1471,7 @@ mod tests {
                         }))
                         .slice_from(prefix)
                     };
-                    let blocks = Arc::new(Blocks::open(
-                        entry,
-                        &opts,
-                        RowOffsets::clusters(
-                            &boundaries.iter().map(|&n| n as u64).collect::<Vec<_>>(),
-                        ),
-                    )?);
+                    let blocks = Arc::new(Blocks::open(entry, &opts, true)?);
                     let codes = slots
                         .iter()
                         .position(|s| {
@@ -1477,15 +1494,22 @@ mod tests {
                         let mut ranges = Vec::new();
                         let mut start = 0;
                         while start < selected.len() {
-                            let cluster = reader.cluster(selected[start])?;
-                            let end = start
-                                + selected[start..].partition_point(|&r| r < cluster.rows.end);
-                            cluster.plan_codes(&selected[start..end], &mut ranges);
+                            let group = selected[start] / 59;
+                            let block_index = group * 2;
+                            let local_rows = selected[start..]
+                                .iter()
+                                .take_while(|&&r| r / 59 == group)
+                                .map(|&r| r % 59)
+                                .collect::<Vec<_>>();
+                            let cluster = reader.cluster(block_index)?;
+                            let end = start + local_rows.len();
+                            cluster.plan_codes(&local_rows, &mut ranges);
                             let mut expected = Vec::new();
                             reader.plan_column_reads(
+                                block_index,
                                 reader.codes,
-                                0..118,
-                                &selected[start..end],
+                                cluster.rows.clone(),
+                                &local_rows,
                                 &mut expected,
                                 &mut Vec::new(),
                             );
@@ -1517,36 +1541,75 @@ mod tests {
                             let row_range = cluster.rows.clone();
                             assert_eq!(
                                 sidecar.scales,
-                                reader.read_column(reader.scales, row_range.clone())?
+                                reader.read_column(
+                                    block_index,
+                                    reader.scales,
+                                    row_range.clone()
+                                )?
                             );
                             assert_eq!(
                                 sidecar.gammas,
-                                reader.read_column(reader.gammas, row_range.clone())?
+                                reader.read_column(
+                                    block_index,
+                                    reader.gammas,
+                                    row_range.clone()
+                                )?
                             );
                             assert_eq!(
                                 sidecar.error_ratios,
-                                reader.read_column(reader.errors, row_range.clone())?
+                                reader.read_column(
+                                    block_index,
+                                    reader.errors,
+                                    row_range.clone()
+                                )?
                             );
-                            assert_eq!(sidecar.constants, reader.read_constants(row_range)?);
+                            assert_eq!(
+                                sidecar.constants,
+                                reader.read_constants(block_index, row_range)?
+                            );
                             let n = end - start;
                             let (mut scales, mut gammas, mut errors) =
                                 (vec![0.; n], vec![0.; n], vec![0.; n]);
                             let mut constants = vec![0.; if metric == Metric::L2 { n } else { 0 }];
                             sidecar.decode_selected(
-                                &selected[start..end],
+                                &local_rows,
                                 &mut scales,
                                 &mut gammas,
                                 &mut errors,
                                 &mut constants,
                             )?;
-                            for (i, &row) in selected[start..end].iter().enumerate() {
-                                assert_eq!(scales[i].to_bits(), reader.scale(row)?.to_bits());
-                                assert_eq!(gammas[i].to_bits(), reader.gamma(row)?.to_bits());
-                                assert_eq!(errors[i].to_bits(), reader.error_ratio(row)?.to_bits());
+                            for (i, &row) in local_rows.iter().enumerate() {
+                                assert_eq!(
+                                    scales[i].to_bits(),
+                                    reader
+                                        .scale(BlockAddress::new(block_index as u32, row as u32))?
+                                        .to_bits()
+                                );
+                                assert_eq!(
+                                    gammas[i].to_bits(),
+                                    reader
+                                        .gamma(BlockAddress::new(block_index as u32, row as u32))?
+                                        .to_bits()
+                                );
+                                assert_eq!(
+                                    errors[i].to_bits(),
+                                    reader
+                                        .error_ratio(BlockAddress::new(
+                                            block_index as u32,
+                                            row as u32
+                                        ))?
+                                        .to_bits()
+                                );
                                 if metric == Metric::L2 {
                                     assert_eq!(
                                         constants[i].to_bits(),
-                                        reader.constant(row)?.unwrap().to_bits()
+                                        reader
+                                            .constant(BlockAddress::new(
+                                                block_index as u32,
+                                                row as u32
+                                            ))?
+                                            .unwrap()
+                                            .to_bits()
                                     );
                                 }
                             }

@@ -18,7 +18,9 @@ use crate::vector::storage::blocks::block_len;
 use crate::vector::storage::header::VectorEntry;
 use crate::vector::storage::metadata::SlotType;
 use crate::vector::tests::ground_truth;
-use crate::vector::{TopDocsByVectorSimilarityBuilder, VectorQuantizationLayer, ENTRY_ALIGN};
+use crate::vector::{
+    BlockAddress, TopDocsByVectorSimilarityBuilder, VectorQuantizationLayer, ENTRY_ALIGN,
+};
 use crate::{Index, TantivyDocument};
 
 /// The merge's production sources carry no estimator or audit entry point.
@@ -71,14 +73,23 @@ fn merge_runtime_uses_persisted_grid_and_rho() {
     }
 }
 
+fn block_rows(
+    index: &crate::vector::storage::centroids::ClusterIndex,
+) -> crate::Result<Vec<(usize, usize)>> {
+    let mut rows = Vec::new();
+    for block in 0..index.num_clusters() {
+        rows.extend((0..index.cluster_num_rows(block)?).map(|row| (block, row)));
+    }
+    Ok(rows)
+}
+
 // Mixed field contracts retain exact entry lengths and aligned Data boundaries.
 fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
     use common::{HasLen, OwnedBytes};
 
     use crate::directory::{CompositeFile, FileHandle, FileSlice};
-    use crate::vector::storage::blocks::{block_align, data_entry_len, Blocks, RowOffsets};
-    use crate::vector::storage::centroids::ClusterOffsets;
-    use crate::vector::storage::header::{read_centroid_header, read_vector_header, CentroidSlot};
+    use crate::vector::storage::blocks::{block_align, data_entry_len, Blocks};
+    use crate::vector::storage::header::{read_centroid_header, read_vector_header};
     #[derive(Debug)]
     struct ByteAddressed(Vec<u8>);
     impl HasLen for ByteAddressed {
@@ -162,12 +173,15 @@ fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
         assert!(!vector.id_map_initialized(), "scan must not open IdMap");
         let ivf = vector.index().unwrap();
         for b in 0..ivf.num_clusters() {
-            let range = ivf.cluster_range(b)?;
+            let range = 0..ivf.cluster_num_rows(b)?;
             let docs = vector.cluster_doc_ids(b).unwrap().unwrap();
             assert!(docs.windows(2).all(|pair| pair[0] < pair[1]));
             for (row, doc) in range.zip(docs) {
-                assert_eq!(vector.row_id(doc)?, Some(row));
-                let bytes = vector.vector_bytes_for_row(row)?;
+                assert_eq!(
+                    vector.row_location(doc)?,
+                    Some(BlockAddress::new(b as u32, row as u32))
+                );
+                let bytes = vector.vector_bytes_for_row(BlockAddress::new(b as u32, row as u32))?;
                 assert_eq!(Some(bytes.clone()), vector.vector_bytes(doc)?);
                 assert_eq!(
                     decode_row::<f32>(&bytes, 65)?,
@@ -196,19 +210,12 @@ fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
         let centroid_file = segment.open_read(SegmentComponent::Custom(CENTROIDS_EXT.into()))?;
         let (_, centroid_body) = read_centroid_header(&centroid_file)?;
         let centroid_composite = CompositeFile::open(&centroid_body)?;
-        let offsets = centroid_composite
-            .open_read_with_idx(field, CentroidSlot::Offsets.index())
-            .unwrap();
-        assert_eq!(offsets.len(), (ivf.num_clusters() + 1) * 8);
-        let blocks = Blocks::open(
-            data.clone(),
-            &opts,
-            RowOffsets::Clustered(ClusterOffsets::open(offsets)?),
-        )?;
+        assert!(centroid_composite.open_read_with_idx(field, 1).is_none());
+        let blocks = Blocks::open(data.clone(), &opts, true)?;
         assert_eq!(
             data.len(),
             data_entry_len(
-                data.len() - 8 - (blocks.num_blocks() + 1) * 8,
+                data.len() - 16 - (blocks.num_blocks() + 1) * 16,
                 blocks.num_blocks()
             )
         );
@@ -280,9 +287,19 @@ fn clustered_merge_preserves_vectors_assignments_and_missing_docs() -> crate::Re
                 let mut rows_by_doc = BTreeMap::new();
                 for cluster in 0..ivf.num_clusters() {
                     let docs = vectors.cluster_doc_ids(cluster).unwrap().unwrap();
-                    for (row, doc) in ivf.cluster_range(cluster)?.zip(docs) {
-                        rows_by_doc
-                            .insert(doc, (cluster, vectors.vector_bytes_for_row(row)?.to_vec()));
+                    for (row, doc) in (0..ivf.cluster_num_rows(cluster)?).zip(docs) {
+                        rows_by_doc.insert(
+                            doc,
+                            (
+                                cluster,
+                                vectors
+                                    .vector_bytes_for_row(BlockAddress::new(
+                                        cluster as u32,
+                                        row as u32,
+                                    ))?
+                                    .to_vec(),
+                            ),
+                        );
                     }
                 }
                 for doc in 0..segment.max_doc() {
@@ -741,14 +758,21 @@ fn assert_quantized_matrix_storage(
             .collect::<Vec<_>>(),
         schedule
     );
-    for row in 0..ivf.num_rows() {
-        assert!(quantized.residual_norm(row)?.is_finite());
+    for (cluster, row) in block_rows(ivf)? {
+        assert!(quantized
+            .residual_norm(BlockAddress::new(cluster as u32, row as u32))?
+            .is_finite());
         for (layer, stored) in quantized.layers().iter().enumerate() {
-            assert!((1.0..=4.0).contains(&stored.gamma(row)?));
-            let corrected_error = stored.error_ratio(row)?;
+            assert!(
+                (1.0..=4.0).contains(&stored.gamma(BlockAddress::new(cluster as u32, row as u32))?)
+            );
+            let corrected_error =
+                stored.error_ratio(BlockAddress::new(cluster as u32, row as u32))?;
             assert!(corrected_error.is_finite() && corrected_error >= 0.0);
             assert_eq!(
-                stored.constant(row)?.is_some(),
+                stored
+                    .constant(BlockAddress::new(cluster as u32, row as u32))?
+                    .is_some(),
                 metric == Metric::L2,
                 "layer {layer} split-constant presence must follow the metric at row {row}"
             );
@@ -940,13 +964,13 @@ fn assert_quantized_bridge_exactness(dim: usize) -> crate::Result<()> {
         &VectorQuery::new(quantized.index_ctx().meta.field().metric, Arc::new(query)),
     );
 
-    for row in 0..ivf.num_rows() {
+    for (cluster, row) in block_rows(ivf)? {
         let mut scan_sum = 0.0;
         let mut harness_sum = 0.0;
         for (layer, stored) in quantized.layers().iter().enumerate() {
-            let codes = stored.code_bytes(row)?;
-            let scale = stored.scale(row)?;
-            let constant = stored.constant(row)?;
+            let codes = stored.code_bytes(BlockAddress::new(cluster as u32, row as u32))?;
+            let scale = stored.scale(BlockAddress::new(cluster as u32, row as u32))?;
+            let constant = stored.constant(BlockAddress::new(cluster as u32, row as u32))?;
             let scan_estimate = scan.score_layer(layer, &codes, scale, constant)?;
             let harness_estimate = match constant {
                 Some(constant) => harness.score_layer(layer, &codes, scale, constant, specs[layer]),
@@ -973,18 +997,22 @@ fn bridge_exactness_d768_and_d100() -> crate::Result<()> {
 
 // Settings version three remains a valid write target for vector format four.
 #[test]
-fn settings_v3_builds_v5_and_readers_ignore_global_changes() -> crate::Result<()> {
+fn settings_v3_builds_v6_and_readers_ignore_global_changes() -> crate::Result<()> {
     let mut index = build_quantized_fixture(QUANT_FIXTURE_DIM, true)?;
     let field = index.schema().get_field("embedding")?;
     let config = &index.settings().vector_quantization[0];
     assert_eq!(config.format_version, 3);
     config.validate(&VectorOptions::new(QUANT_FIXTURE_DIM, Metric::L2))?;
-    assert_eq!(&quantized_vec_file(&index)?[..4], &[5, 0, 0, 0]);
+    assert_eq!(&quantized_vec_file(&index)?[..4], &[6, 0, 0, 0]);
     index.settings_mut().vector_quantization.clear();
     let searcher = index.reader()?.searcher();
     let vector = searcher.segment_readers()[0].vector_index(field)?;
     assert_eq!(vector.quantization().unwrap().layers().len(), 2);
-    assert!(vector.quantization().unwrap().residual_norm(0)?.is_finite());
+    assert!(vector
+        .quantization()
+        .unwrap()
+        .residual_norm(BlockAddress::new(0, 0))?
+        .is_finite());
     Ok(())
 }
 
@@ -1235,9 +1263,12 @@ fn merge_quantization_matches_kernel_harness_and_is_reproducible() -> crate::Res
             QUANT_FIXTURE_DIM,
         )?;
         let prepared = prepare_centroid(&centroid, &specs);
-        for row in ivf.cluster_range(cluster)? {
-            let vector =
-                decode_row::<f32>(&vector_reader.vector_bytes_for_row(row)?, QUANT_FIXTURE_DIM)?;
+        for row in 0..ivf.cluster_num_rows(cluster)? {
+            let vector = decode_row::<f32>(
+                &vector_reader
+                    .vector_bytes_for_row(BlockAddress::new(cluster as u32, row as u32))?,
+                QUANT_FIXTURE_DIM,
+            )?;
             let mut expected_input = vector.clone();
             let mut workspace = quant::cascade::BatchEncodeWorkspace::new();
             let expected = quant::cascade::encode_batch_in_place_with_workspace(
@@ -1250,11 +1281,14 @@ fn merge_quantization_matches_kernel_harness_and_is_reproducible() -> crate::Res
                 true,
             );
             assert_eq!(
-                quantized.residual_norm(row)?.to_bits(),
+                quantized
+                    .residual_norm(BlockAddress::new(cluster as u32, row as u32))?
+                    .to_bits(),
                 l2_squared(&vector, &centroid).to_bits()
             );
             for (layer, stored) in quantized.layers().iter().enumerate() {
-                let stored_codes = stored.code_bytes(row)?;
+                let stored_codes =
+                    stored.code_bytes(BlockAddress::new(cluster as u32, row as u32))?;
                 assert_eq!(
                     stored_codes.len(),
                     QUANT_FIXTURE_DIM * usize::from(specs[layer].bits) / 8,
@@ -1264,19 +1298,26 @@ fn merge_quantization_matches_kernel_harness_and_is_reproducible() -> crate::Res
                     stored_codes.as_slice(),
                     expected.layers[layer].codes.as_slice()
                 );
-                assert_eq!(stored.scale(row)?, expected.layers[layer].scales[0]);
                 assert_eq!(
-                    stored.gamma(row)?.to_bits(),
+                    stored.scale(BlockAddress::new(cluster as u32, row as u32))?,
+                    expected.layers[layer].scales[0]
+                );
+                assert_eq!(
+                    stored
+                        .gamma(BlockAddress::new(cluster as u32, row as u32))?
+                        .to_bits(),
                     quant::model::f16::f16_to_f32(expected.layers[layer].gammas[0]).to_bits()
                 );
                 assert_eq!(
-                    stored.error_ratio(row)?.to_bits(),
+                    stored
+                        .error_ratio(BlockAddress::new(cluster as u32, row as u32))?
+                        .to_bits(),
                     quant::model::f16::f16_to_f32(expected.layers[layer].corrected_error_ratios[0])
                         .to_bits()
                 );
                 assert_eq!(
                     stored
-                        .constant(row)?
+                        .constant(BlockAddress::new(cluster as u32, row as u32))?
                         .expect("L2 fixture requires split constants")
                         .to_bits(),
                     expected.layers[layer].constants[0].to_bits()
@@ -1543,8 +1584,12 @@ fn general_dimension_quantized_bridge_at_d100() -> crate::Result<()> {
             DIM,
         )?;
         let prepared = prepare_centroid(&centroid, &specs);
-        for row in ivf.cluster_range(cluster)? {
-            let vector = decode_row::<f32>(&vector_reader.vector_bytes_for_row(row)?, DIM)?;
+        for row in 0..ivf.cluster_num_rows(cluster)? {
+            let vector = decode_row::<f32>(
+                &vector_reader
+                    .vector_bytes_for_row(BlockAddress::new(cluster as u32, row as u32))?,
+                DIM,
+            )?;
             let residual: Vec<f32> = vector
                 .iter()
                 .zip(&centroid)
@@ -1553,11 +1598,19 @@ fn general_dimension_quantized_bridge_at_d100() -> crate::Result<()> {
             let expected =
                 quant::cascade::encode_layers(&residual, Some(&prepared), &specs, &grids);
             for (layer, stored) in quantized.layers().iter().enumerate() {
-                assert_eq!(stored.code_bytes(row)?.as_slice(), expected.codes[layer]);
-                assert_eq!(stored.scale(row)?, expected.scales[layer]);
                 assert_eq!(
                     stored
-                        .constant(row)?
+                        .code_bytes(BlockAddress::new(cluster as u32, row as u32))?
+                        .as_slice(),
+                    expected.codes[layer]
+                );
+                assert_eq!(
+                    stored.scale(BlockAddress::new(cluster as u32, row as u32))?,
+                    expected.scales[layer]
+                );
+                assert_eq!(
+                    stored
+                        .constant(BlockAddress::new(cluster as u32, row as u32))?
                         .expect("L2 fixture requires split constants")
                         .to_bits(),
                     expected.constants[layer].to_bits()
@@ -1700,8 +1753,15 @@ fn estimator_samples_only_live_posting_rows() -> crate::Result<()> {
     let field = index.schema().get_field("embedding")?;
     let vector_reader = segment.vector_index(field)?;
     let alive = crate::fastfield::AliveBitSet::for_test_from_deleted_docs(&[1, 3], 8);
-    let live_posting_rows = (0..vector_reader.index().unwrap().num_rows())
-        .filter(|&row| alive.is_alive(vector_reader.doc_id_at(row).unwrap()))
+    let live_posting_rows = block_rows(vector_reader.index().unwrap())?
+        .into_iter()
+        .filter(|&(block, row)| {
+            alive.is_alive(
+                vector_reader
+                    .doc_id_at(BlockAddress::new(block as u32, row as u32))
+                    .unwrap(),
+            )
+        })
         .count();
     assert_eq!(live_posting_rows, 6);
 

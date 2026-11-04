@@ -34,7 +34,7 @@ use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::io::test_support::{with_unarmed_log, PagedDirectory};
 use crate::vector::tests::TestVectorIndex;
 use crate::vector::{
-    ProbeStats, RouterKind, VectorQuantizationConfig, VectorQuantizationLayer,
+    BlockAddress, ProbeStats, RouterKind, VectorQuantizationConfig, VectorQuantizationLayer,
     VectorSimilarityFruit, VectorStage,
 };
 use crate::{
@@ -723,10 +723,7 @@ impl Fixture {
             ranges
                 .docs
                 .push((!docs.is_empty()).then(|| reads.pop().expect("DocIds read")));
-            ranges.directory.extend(reads);
-            ranges
-                .cluster_offsets
-                .extend(self.centroid_reads().into_iter().map(|(_, range)| range));
+            ranges.block_offsets.extend(reads);
             self.clear_reads();
             if !docs.is_empty() {
                 vectors.read_cluster_rows(cluster)?;
@@ -735,7 +732,7 @@ impl Fixture {
                 self.reads()
                     .into_iter()
                     .map(|(_, range)| range)
-                    .find(|range| !ranges.directory.contains(range)),
+                    .find(|range| !ranges.block_offsets.contains(range)),
             );
         }
         self.clear_reads();
@@ -746,8 +743,7 @@ impl Fixture {
 /// Per-cluster byte ranges of the DocIds column and the full-precision rows.
 #[derive(Debug, Default)]
 pub(crate) struct ColumnRanges {
-    pub(crate) directory: Vec<Range<usize>>,
-    pub(crate) cluster_offsets: Vec<Range<usize>>,
+    pub(crate) block_offsets: Vec<Range<usize>>,
     pub(crate) docs: Vec<Option<Range<usize>>>,
     pub(crate) rows: Vec<Option<Range<usize>>>,
 }
@@ -760,7 +756,7 @@ pub(crate) struct DocTrace {
     pub(crate) scored_docs: Vec<DocId>,
     pub(crate) boundary_docs: Vec<Vec<DocId>>,
     /// `(row, doc, estimate bits)` after admission and after each refining layer.
-    pub(crate) estimates: Vec<Vec<(usize, DocId, u32)>>,
+    pub(crate) estimates: Vec<Vec<(BlockAddress, DocId, u32)>>,
     pub(crate) exact_phase_docs: Vec<DocId>,
 }
 
@@ -782,17 +778,16 @@ pub(crate) fn doc_trace(index: &Index, field: Field, trace: &ScanTrace) -> crate
     let searcher = index.reader()?.searcher();
     let vectors = first_segment(&searcher).1.vector_index(field)?;
     let clusters = vectors.index().expect("IVF segment").num_clusters();
-    let docs: Vec<DocId> = with_unarmed_log(|| {
-        let mut all = Vec::new();
-        let mut cluster_docs = Vec::new();
-        for cluster in 0..clusters {
-            vectors.read_doc_ids(cluster, &mut cluster_docs)?;
-            all.extend_from_slice(&cluster_docs);
-        }
-        Ok::<_, crate::TantivyError>(all)
+    let docs: Vec<Vec<DocId>> = with_unarmed_log(|| {
+        (0..clusters)
+            .map(|cluster| vectors.cluster_doc_ids(cluster).map(Option::unwrap))
+            .collect::<crate::Result<_>>()
     })?;
-    let sorted = |rows: &[usize]| {
-        let mut out: Vec<DocId> = rows.iter().map(|&row| docs[row]).collect();
+    let sorted = |rows: &[BlockAddress]| {
+        let mut out: Vec<DocId> = rows
+            .iter()
+            .map(|address| docs[address.block as usize][address.row as usize])
+            .collect();
         out.sort_unstable();
         out
     };
@@ -808,7 +803,7 @@ pub(crate) fn doc_trace(index: &Index, field: Field, trace: &ScanTrace) -> crate
             .iter()
             .map(|rows| {
                 rows.iter()
-                    .map(|&(row, bits)| (row, docs[row], bits))
+                    .map(|&(row, bits)| (row, docs[row.block as usize][row.row as usize], bits))
                     .collect()
             })
             .collect(),

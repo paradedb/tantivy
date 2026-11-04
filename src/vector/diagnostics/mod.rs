@@ -483,6 +483,12 @@ impl VectorIndexReader {
             max_cluster_size = max_cluster_size.max(cluster_size);
             total_cluster_size += cluster_size;
         }
+        if total_cluster_size != index.num_rows() {
+            return Err(crate::error::DataCorruption::comment_only(
+                "block counts differ from total row count",
+            )
+            .into());
+        }
         let num_centroids = index.num_clusters();
         let avg_cluster_size = if num_centroids == 0 {
             0.0
