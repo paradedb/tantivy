@@ -14,7 +14,7 @@ use crate::vector::clustering::{
     for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
 };
 use crate::vector::params::{LocatedPath, ProbeParams};
-use crate::vector::RouterKind;
+use crate::vector::{BlockAddress, RouterKind};
 use crate::{DocAddress, Index, Score, TantivyDocument};
 
 const EMBEDDING_FIELD_NAME: &str = "embedding";
@@ -303,7 +303,7 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
             let vec_file =
                 segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))?;
             let (version, body) = read_vector_header(&vec_file)?;
-            assert_eq!(version, VectorFileVersion::V5);
+            assert_eq!(version, VectorFileVersion::V6);
             // Body must be a valid composite — proves the stamp sits in front
             // of the framing, not inside a slot.
             CompositeFile::open(&body)?;
@@ -321,7 +321,7 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
                     let centroids_file = segment_reader
                         .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
                     let (version, body) = read_centroid_header(&centroids_file)?;
-                    assert_eq!(version, VectorFileVersion::V4);
+                    assert_eq!(version, VectorFileVersion::V5);
                     let composite = CompositeFile::open(&body)?;
                     let mut slots: Vec<_> = composite
                         .field_indices()
@@ -330,7 +330,7 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
                         })
                         .collect();
                     slots.sort_unstable();
-                    assert_eq!(slots, [0, 1, 2]);
+                    assert_eq!(slots, [0, 2]);
                 }
             }
         }
@@ -1214,7 +1214,7 @@ mod centroid_storage_tests {
     /// proven by parsing the router against the stored rows and by search
     /// staying exact.
     #[test]
-    fn ivf_merge_writes_stacked_slot_at_v4() -> crate::Result<()> {
+    fn ivf_merge_writes_stacked_slot_at_v5() -> crate::Result<()> {
         use crate::vector::storage::header::{read_centroid_header, VectorFileVersion};
 
         // 8 fixed centroids on a line; two tight docs per centroid split
@@ -1241,7 +1241,7 @@ mod centroid_storage_tests {
         let centroids_file =
             segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
         let (version, body) = read_centroid_header(&centroids_file)?;
-        assert_eq!(version, VectorFileVersion::V4, "stacked files stamp V4");
+        assert_eq!(version, VectorFileVersion::V5, "stacked files stamp V5");
         let composite = CompositeFile::open(&body)?;
         assert!(composite.open_read_with_idx(field, 3).is_none());
         let stacked_bytes = composite
@@ -1383,7 +1383,8 @@ fn flat_uniform_boundary_survives_merge_and_sparse_presence() -> crate::Result<(
                 if row >= dense_reader.num_vectors() {
                     continue;
                 }
-                let bytes = dense_reader.vector_bytes_for_row(row)?;
+                let bytes = dense_reader
+                    .vector_bytes_for_row(BlockAddress::new((row / r) as u32, (row % r) as u32))?;
                 let value = f32::from_le_bytes(bytes.as_slice().try_into().unwrap()) as usize;
                 if let Some(sparse_bytes) = sparse_reader.vector_bytes(row as u32)? {
                     assert_eq!(value % 2, 0);
@@ -1429,7 +1430,7 @@ fn unsupported_vector_versions_remain_typed_on_open_and_merge() -> crate::Result
             assert!(
                 matches!(error,
             crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch {
-                index_version, supported_version: 5,
+                index_version, supported_version: 6,
             }) if index_version == version),
                 "version {version}: {error:?}"
             )
@@ -1476,12 +1477,9 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
         crate::vector::storage::header::VEC_EXT.into(),
     ));
     let mut bytes = directory.atomic_read(&vec_path)?;
-    let mut centroids = 4u32.to_le_bytes().to_vec();
+    let mut centroids = 5u32.to_le_bytes().to_vec();
     let mut composite = CompositeWrite::wrap(&mut centroids);
-    for slot in [
-        crate::vector::storage::header::CentroidSlot::Centroids,
-        crate::vector::storage::header::CentroidSlot::Offsets,
-    ] {
+    for slot in [crate::vector::storage::header::CentroidSlot::Centroids] {
         composite
             .for_field_with_idx(field, slot.index())
             .write_all(&[0; 8])?;
@@ -1500,7 +1498,7 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
             .vector_index(field)
             .err()
             .expect("unsupported segment");
-        if version == 5 {
+        if version == 6 {
             segment.validate_vector_format()?;
             reader.validate_vector_format()?;
             assert!(
@@ -1513,12 +1511,12 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
                 reader.validate_vector_format().unwrap_err(),
             ] {
                 assert!(
-                    matches!(error, crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch { index_version, supported_version: 5 }) if index_version == version),
+                    matches!(error, crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch { index_version, supported_version: 6 }) if index_version == version),
                     "{error:?}"
                 );
             }
             assert!(
-                matches!(error, crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch { index_version, supported_version: 5 }) if index_version == version),
+                matches!(error, crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch { index_version, supported_version: 6 }) if index_version == version),
                 "{error:?}"
             );
         }
@@ -1551,7 +1549,7 @@ fn graph_router_segments_fail_format_validation() -> crate::Result<()> {
     writer.add_document(doc)?;
     writer.commit()?;
     let segment = index.searchable_segments()?.remove(0);
-    let mut centroids = 4u32.to_le_bytes().to_vec();
+    let mut centroids = 5u32.to_le_bytes().to_vec();
     let mut composite = CompositeWrite::wrap(&mut centroids);
     composite
         .for_field_with_idx(

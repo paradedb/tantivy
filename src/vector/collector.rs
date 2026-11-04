@@ -442,10 +442,11 @@ where
                     (
                         crate::vector::write::RowAddress {
                             segment_ord: address.segment_ord,
-                            // Opaque foreign key for seeding. Doc ids and row ids share a
-                            // numeric range on the same segment, so the high bit keeps seed
-                            // keys out of the local RowAddress space.
-                            row_id: (address.doc_id as usize) | (1usize << (usize::BITS - 1)),
+                            // Real block indices are below u32::MAX; reserve it for seed keys.
+                            block_address: crate::vector::BlockAddress::new(
+                                u32::MAX,
+                                address.doc_id,
+                            ),
                         },
                         *score,
                     )
@@ -699,8 +700,8 @@ mod ivf_e2e_tests {
                 let id_column = reader.fast_fields().u64("id")?;
                 let vector_reader = reader.vector_index(embedding_field)?;
                 for doc_id in 0..reader.max_doc() {
-                    let row = vector_reader.row_id(doc_id)?.unwrap();
-                    let bytes = vector_reader.vector_bytes_for_row(row)?;
+                    let address = vector_reader.row_location(doc_id)?.unwrap();
+                    let bytes = vector_reader.vector_bytes_for_row(address)?;
                     expected.push((
                         -crate::vector::distance::l2_squared_bytes(&query, &bytes),
                         id_column.first(doc_id).unwrap(),

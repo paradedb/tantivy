@@ -3,6 +3,7 @@ use crate::schema::Value;
 use crate::vector::clustering::{for_each_batch, IvfTrainingVectors, VectorSource};
 use crate::vector::quantization::{corrected_quantized_estimate, ArithmeticError};
 use crate::vector::storage::io::test_support::{PagedDirectory, PAGE_BYTES};
+use crate::vector::BlockAddress;
 
 const DIM: usize = 64;
 const DOCS: usize = 1200;
@@ -151,24 +152,24 @@ fn vector_read_kinds_follow_data_for_dense_and_sparse_access() -> crate::Result<
     let searcher = reader.searcher();
     let vectors =
         searcher.segment_readers()[0].vector_index(index.schema().get_field("embedding")?)?;
-    let rows = vectors.index().unwrap().cluster_range(2)?;
+    let rows = 0..vectors.index().unwrap().cluster_num_rows(2)?;
     let layers = vectors.quantization().unwrap().layers();
     directory.read_kinds.lock().unwrap().clear();
 
     vectors.read_cluster_rows(2)?;
     vectors.read_doc_ids(2, &mut Vec::new())?;
-    layers[0].read_batch(rows.clone())?;
-    layers[1].read_batch(rows.clone())?;
+    layers[0].read_batch(2, rows.clone())?;
+    layers[1].read_batch(2, rows.clone())?;
     let sparse = layers[1].cluster_in_block(2)?;
     sparse.read_codes(rows.start..rows.start + 1)?;
     sparse.read_sidecar()?;
     vectors
         .quantization()
         .unwrap()
-        .read_residual_norms(rows.start..rows.start + 1)?;
+        .read_residual_norms(2, rows.start..rows.start + 1)?;
     let mut scratch = crate::vector::storage::quantized::ReadScratch::default();
     scratch.rows.push(rows.start);
-    vectors.read_vector_rows_planned(&mut scratch)?;
+    vectors.read_vector_rows_planned(2, &mut scratch)?;
     assert_eq!(
         *directory.read_kinds.lock().unwrap(),
         [
@@ -238,17 +239,17 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
     let mut row_docs = Vec::new();
     let mut expected_rows = vec![None; segment.max_doc() as usize];
     assert_eq!(
-        ivf.cluster_range(0)?.len(),
+        (0..ivf.cluster_num_rows(0)?).len(),
         0,
         "cluster=0 row=all column=Rows empty fixture"
     );
     assert_eq!(
-        ivf.cluster_range(1)?.len(),
+        (0..ivf.cluster_num_rows(1)?).len(),
         1,
         "cluster=1 row=all column=Rows singleton fixture"
     );
     for cluster in 0..ivf.num_clusters() {
-        let rows = ivf.cluster_range(cluster)?;
+        let rows = 0..ivf.cluster_num_rows(cluster)?;
         let row_bytes = vectors.read_cluster_rows(cluster)?;
         let mut docs = Vec::new();
         vectors.read_doc_ids(cluster, &mut docs)?;
@@ -275,10 +276,10 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
         );
         for (local, &doc) in docs.iter().enumerate() {
             let row = rows.start + local;
-            expected_rows[doc as usize] = Some(row);
+            expected_rows[doc as usize] = Some(BlockAddress::new(cluster as u32, row as u32));
             assert_eq!(
-                vectors.row_id(doc)?,
-                Some(row),
+                vectors.row_location(doc)?,
+                Some(BlockAddress::new(cluster as u32, row as u32)),
                 "cluster={cluster} row={local} column=DocLocations"
             );
             assert_eq!(
@@ -287,7 +288,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                 "cluster={cluster} row={local} column=Rows locate"
             );
         }
-        row_docs.extend(docs.iter().copied());
+        row_docs.push(docs.clone());
         for (column, slot) in slots.iter().enumerate() {
             let expected = match slot.slot_type {
                 SlotType::Rows { .. } => row_bytes.to_vec(),
@@ -316,7 +317,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                 );
                 continue;
             }
-            let actual = quantized.layers()[0].read_column(column, rows.clone())?;
+            let actual = quantized.layers()[0].read_column(cluster, column, rows.clone())?;
             assert_eq!(
                 actual.len(),
                 expected.len(),
@@ -330,8 +331,11 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                     &expected[bytes.clone()],
                     "{metric:?} {schedule:?} cluster={cluster} row={local} column={column} encoder"
                 );
-                let single = quantized.layers()[0]
-                    .read_column(column, rows.start + local..rows.start + local + 1)?;
+                let single = quantized.layers()[0].read_column(
+                    cluster,
+                    column,
+                    rows.start + local..rows.start + local + 1,
+                )?;
                 assert_eq!(
                     single.as_slice(),
                     &expected[bytes],
@@ -342,7 +346,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
         if !rows.is_empty() {
             for (layer_idx, layer) in quantized.layers().iter().enumerate() {
                 let band = layer.read_batch_in_block(cluster, rows.clone())?;
-                let sidecar_columns = layer.read_sidecar(rows.clone())?;
+                let sidecar_columns = layer.read_sidecar(cluster, rows.clone())?;
                 let sparse = layer.cluster_in_block(cluster)?;
                 let sidecars = sparse.read_sidecar()?;
                 let selected: Vec<_> = rows
@@ -417,7 +421,9 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                     );
                     assert_eq!(
                         band.code_bytes(row)?,
-                        layer.code_bytes(row)?.as_slice(),
+                        layer
+                            .code_bytes(BlockAddress::new(cluster as u32, row as u32))?
+                            .as_slice(),
                         "{context}.codes band"
                     );
                     for actual in [
@@ -427,7 +433,9 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                     ] {
                         assert_eq!(
                             actual.to_bits(),
-                            layer.scale(row)?.to_bits(),
+                            layer
+                                .scale(BlockAddress::new(cluster as u32, row as u32))?
+                                .to_bits(),
                             "{context}.scales"
                         );
                     }
@@ -438,7 +446,9 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                     ] {
                         assert_eq!(
                             actual.to_bits(),
-                            layer.gamma(row)?.to_bits(),
+                            layer
+                                .gamma(BlockAddress::new(cluster as u32, row as u32))?
+                                .to_bits(),
                             "{context}.gammas"
                         );
                     }
@@ -449,13 +459,17 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                     ] {
                         assert_eq!(
                             actual.to_bits(),
-                            layer.error_ratio(row)?.to_bits(),
+                            layer
+                                .error_ratio(BlockAddress::new(cluster as u32, row as u32))?
+                                .to_bits(),
                             "{context}.errors"
                         );
                     }
                     assert_eq!(
                         band.constant(row)?.map(f32::to_bits),
-                        layer.constant(row)?.map(f32::to_bits),
+                        layer
+                            .constant(BlockAddress::new(cluster as u32, row as u32))?
+                            .map(f32::to_bits),
                         "{context}.constants"
                     );
                 }
@@ -472,7 +486,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
     }
     for (doc, &original) in originals.iter().enumerate() {
         assert_eq!(
-            vectors.row_id(doc as u32)?,
+            vectors.row_location(doc as u32)?,
             expected_rows[doc],
             "cluster=none row=doc{doc} column=DocLocations"
         );
@@ -548,8 +562,8 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
             let mut pruned_dead = 0;
             let mut pruned_filter = 0;
             for &cluster in &clusters {
-                for row in ivf.cluster_range(cluster)? {
-                    let doc = row_docs[row];
+                for row in 0..ivf.cluster_num_rows(cluster)? {
+                    let doc = row_docs[cluster][row];
                     let original = originals[doc as usize];
                     let live = segment
                         .alive_bitset()
@@ -586,12 +600,9 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                     "cluster={clusters:?} row=all column=layer{layer} coverage"
                 );
                 for &(row, doc, bits) in trace {
-                    let cluster = (0..4)
-                        .find(|&c| ivf.cluster_range(c).unwrap().contains(&row))
-                        .unwrap();
-                    let local = row - ivf.cluster_range(cluster)?.start;
+                    let (cluster, local) = (row.block as usize, row.row as usize);
                     assert_eq!(
-                        doc, row_docs[row],
+                        doc, row_docs[cluster][local],
                         "cluster={cluster} row={local} column=DocIds layer{layer}"
                     );
                     let encoded = &encodings[cluster];
@@ -724,7 +735,7 @@ fn diagnostics_skip_empty_clusters() -> crate::Result<()> {
     let searcher = reader.searcher();
     let segment = &searcher.segment_readers()[0];
     let vectors = segment.vector_index(index.schema().get_field("embedding")?)?;
-    assert!(vectors.index().unwrap().cluster_range(0)?.is_empty());
+    assert!((0..vectors.index().unwrap().cluster_num_rows(0)?).is_empty());
     let queries = vectors
         .sample_estimator_pseudo_queries(3, segment.alive_bitset())?
         .unwrap();
@@ -817,10 +828,10 @@ fn merge_source_addresses_read_only_document_columns() -> crate::Result<()> {
             Some(source) => {
                 assert_eq!(source.segment_ord, 0);
                 assert_eq!(
-                    vectors.doc_id_at(source.row_id)?,
+                    vectors.doc_id_at(source.block_address)?,
                     target.doc_id,
                     "row={} column=DocIds",
-                    source.row_id
+                    source.block_address.row
                 );
             }
             None => assert!(!vectors.contains(target.doc_id)?),

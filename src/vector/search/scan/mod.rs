@@ -32,6 +32,8 @@ use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::quantized::{QuantizedFieldReader, ReadScratch};
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::enter_vector_stage;
+#[cfg(test)]
+use crate::vector::BlockAddress;
 use crate::vector::{VectorElement, VectorStage};
 use crate::SegmentOrdinal;
 
@@ -108,19 +110,19 @@ pub(crate) struct ScanReport {
     pub(crate) trace: Box<ScanTrace>,
 }
 
-/// Rows each stage of a scan scored and kept, by global row.
+/// Rows each stage of a scan scored and kept, by (block, local row).
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct ScanTrace {
     /// Rows shortlisted at layer 0.
-    pub(crate) scored_rows: Vec<usize>,
-    pub(crate) boundary_rows: Vec<Vec<usize>>,
+    pub(crate) scored_rows: Vec<BlockAddress>,
+    pub(crate) boundary_rows: Vec<Vec<BlockAddress>>,
     /// `(row, estimate bits)` after the shortlist and after each refining layer.
-    pub(crate) estimate_rows: Vec<Vec<(usize, u32)>>,
+    pub(crate) estimate_rows: Vec<Vec<(BlockAddress, u32)>>,
     /// `(row, [raw prefix, base, estimate, sigma] bits)` at the same points.
-    pub(crate) layer_columns: Vec<Vec<(usize, [u32; 4])>>,
+    pub(crate) layer_columns: Vec<Vec<(BlockAddress, [u32; 4])>>,
     /// Rows scored in the exact phase.
-    pub(crate) exact_phase_rows: Vec<usize>,
+    pub(crate) exact_phase_rows: Vec<BlockAddress>,
     /// Every exact score the scan computed, in order.
     pub(crate) exact_scores: Vec<f32>,
 }
@@ -391,7 +393,7 @@ impl<'a> QuantizedState<'a> {
         report
             .trace
             .boundary_rows
-            .push(self.candidates.global_rows());
+            .push(self.candidates.row_addresses());
     }
 }
 
@@ -520,7 +522,10 @@ where
         let len = rows.len();
         debug_assert!(len > 0, "empty clusters never reach the scan");
         #[cfg(test)]
-        self.report.trace.scored_rows.extend(rows.global_rows());
+        self.report.trace.scored_rows.extend(
+            rows.local_rows()
+                .map(|row| BlockAddress::new(rows.cluster as u32, row as u32)),
+        );
         match self.read_plan(rows, 0)? {
             Read::Exact => {
                 self.report.exact_rows +=

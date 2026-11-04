@@ -270,7 +270,7 @@ mod tests {
         for (storage, fixture) in [("ram", &ram), ("paged", &paged)] {
             let searcher = fixture.index.reader()?.searcher();
             let reader = first_segment(&searcher).1.vector_index(fixture.field)?;
-            let rows = reader.index().expect("IVF segment").cluster_range(0)?.len();
+            let rows = reader.index().expect("IVF segment").cluster_num_rows(0)?;
             let one = vec![0];
             let dense: Vec<u32> = (0..rows as u32).filter(|row| row % 10 != 0).collect();
             let every: Vec<u32> = (0..rows as u32).collect();

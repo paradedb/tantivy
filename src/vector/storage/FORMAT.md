@@ -19,9 +19,9 @@ distance metric; the segment stores the metadata needed to decode its values.
 +----------------------------------------------------------------------+
 | <segment-id>.centroids (present for clustered storage)               |
 | +----------------------------------------------------------------+   |
-| | Vector field A: cluster centers, row offsets, router           |   |
+| | Vector field A: cluster centers, counts, router           |   |
 | +----------------------------------------------------------------+   |
-| | Vector field B: cluster centers, row offsets, router           |   |
+| | Vector field B: cluster centers, counts, router           |   |
 | +----------------------------------------------------------------+   |
 +----------------------------------------------------------------------+
 | Other files: documents, postings, deletion visibility, ...           |
@@ -47,10 +47,10 @@ Segment vector files are immutable once written. Inserts produce new segments.
 Deletion visibility is stored separately; a merge omits deleted documents and
 writes new vector files.
 
-This document describes the implemented `.vec` **V5** and `.centroids` **V4**
-formats. Cluster row offsets live only in `.centroids`; `.vec` stores block byte
-offsets. All multibyte numbers below are little-endian. Ranges use an exclusive
-end: `[start, end)`.
+This document describes the implemented `.vec` **V6** and `.centroids` **V5**
+formats. Block byte offsets and vector counts live together in `.vec`; `.centroids`
+stores cluster centers and routing data. All multibyte numbers below are
+little-endian. Ranges use an exclusive end: `[start, end)`.
 Diagrams show grouping and byte order; box sizes are not proportional to byte
 sizes. Borders and labels do not represent extra headers on disk.
 
@@ -73,18 +73,19 @@ the field metadata, vector blocks, and byte offsets locating those blocks.
 | | Block 1: vectors | doc_ids | codes | ...                       |   |
 | | ...                                                            |   |
 | +----------------------------------------------------------------+   |
-| | byte_offsets: u64[B+1]   start of each block, in bytes         |   |
+| | block_offsets: (byte_offset:u64, num_rows:u64)[B+1]           |   |
+| +----------------------------------------------------------------+   |
+| | total_rows: u64        total number of stored vectors          |   |
 | +----------------------------------------------------------------+   |
 | | num_blocks:   u64        B                                     |   |
 | +----------------------------------------------------------------+   |
 +----------------------------------------------------------------------+
 ```
 
-The writer records `byte_offsets` in `BlockDirectory`. The reader retains the
-complete Data entry as `data_slice` and reads offset pairs directly by byte
-range. For clustered fields, row boundaries come from the field's cluster-offset
-slot in `.centroids`. Flat fields derive row boundaries from their fixed block
-size and IdMap row count.
+The writer records `(byte_offset, num_rows)` tuples in `BlockOffsetsWriter`.
+The reader keeps the Data entry behind a `FileSlice` and fetches only the tuples
+for accessed blocks. Both flat and clustered blocks store their vector counts.
+No cumulative row-offset array is stored in either file.
 
 ### File framing and field entries
 
@@ -187,7 +188,9 @@ One field's Data entry: bytes from start to end
 +----------------------------------------------------------------------+
 | Zero padding to 8 bytes                                              |
 +----------------------------------------------------------------------+
-| byte_offsets: u64[B+1]   [start 0][start 1] ... [offsets start]      |
+| block_offsets: (byte_offset:u64, num_rows:u64)[B+1]                  |
++----------------------------------------------------------------------+
+| total_rows: u64        sum of the B block counts                      |
 +----------------------------------------------------------------------+
 | num_blocks: u64 = B     final 8 bytes of the Data entry              |
 +----------------------------------------------------------------------+
@@ -215,62 +218,58 @@ the target for future builds; it does not change how existing segments decode.
 
 #### Block offsets
 
-For clustered block `b`, `.vec` gives its location and `.centroids` gives its
-vector count:
+Every block has one tuple containing its byte position and vector count:
 
 ```text
-block_start = byte_offsets[b]             relative to the Data entry start
-block_end   = byte_offsets[b + 1]
-count       = cluster_offsets[b + 1] - cluster_offsets[b]  clustered only
+block_offsets[b]     = (byte_start, num_rows)
+block_offsets[b + 1] = (next_byte_start, next_num_rows)
+
+block_start = byte_start             relative to the Data entry start
+block_end   = next_byte_start
+count       = num_rows
 ```
 
-For clustered fields, **block index equals cluster index**. For flat fields,
-blocks are consecutive groups of up to 16,384 vectors. Flat block `b` contains
-rows `[b*r, min((b+1)*r, total_rows))`, where `r = rows_per_block`.
+Block index equals cluster index for clustered fields. Flat fields use groups
+of up to 16,384 vectors, with a possibly smaller final group. Stored counts are
+validated against that uniform partition geometry when each flat block is read.
 
-The byte-offset array has an extra terminal boundary pointing to the offset array,
-after any padding at the end of the block area. Empty clusters consume no column
-bytes but retain their byte and row boundaries. An empty flat field has zero
-blocks and a single byte-offset sentinel. Flat fields need no stored row-offset
-array: the IdMap supplies the total row count and metadata supplies `r`.
-
-The trailing `num_blocks` locates the offsets without scanning block contents.
-With `entry_end` relative to the Data entry start:
+The extra tuple is a sentinel `(block_offsets_start, 0)`. An empty field has
+zero blocks, one sentinel, and `total_rows = 0`. Zero-row clusters have count zero and no column payload. The final block range
+can also include alignment padding before the offset table.
 
 ```text
-block_offsets_start = entry_end - 8 - 8 * (B + 1)
+Block 0                Block 1                 End sentinel
++----------------------+-----------------------+------------------------+
+| (start 0, 3)         | (start 1, 5)          | (offsets start, 0)     |
++----------------------+-----------------------+------------------------+
+total_rows = 8
+num_blocks = 2
 ```
 
-Search-reader initialization reads the block-count footer and checks offset-array
-framing without loading the byte-offset array. For clustered fields, it opens
-the `.centroids` offset slot and reads only its first and final values. The first
-must be zero; the final value supplies the total row count. An empty field also
-validates its sole byte-offset sentinel and padding.
+The final 16 bytes contain `total_rows: u64` and `num_blocks: u64`. The offset
+table is found without scanning block contents:
 
-For a clustered field, `Blocks::block(b)` reads two adjacent `u64` byte offsets
-from `.vec` and two adjacent `u64` row offsets from `.centroids`: two 16-byte reads. It checks
-ordered boundaries, alignment, row-count limits, and that the calculated columns
-fit the stored block size. Accessing the final block also checks the terminal
-byte boundary and zero padding before the offsets. These reads use the existing
-file handles directly, without creating temporary `FileSlice` objects.
+```text
+block_offsets_start = entry_end - 16 - 16 * (B + 1)
+```
 
-`Blocks` holds the eagerly decoded metadata and column schema, the complete
-Data entry slice, the block count, the metadata boundary, and `row_offsets`.
-`row_offsets` is either the lazy `.centroids` offsets or the flat field's row
-count. The byte-offset array's position is derived from the Data entry length
-and block count.
+Reader initialization validates the footer, sentinel, and table framing without
+loading all tuples. `Blocks::block(b)` makes one contiguous 24-byte read: the
+current tuple and the next tuple's byte offset. It checks boundaries, alignment,
+row-count limits, and the derived column lengths. Final-block padding is also
+checked when that block is accessed. No temporary `FileSlice` is needed for
+these tuple reads.
 
-`ClusterIndex` retains a cloned `ClusterOffsets` handle to the same `.centroids`
-storage. Its cluster ranges and counts read only row offsets, without touching
-`.vec`. Opening checks that the centroid count and the vector block count each
-match this offset array's cluster count. Byte boundaries are validated when a
-`Block` is requested.
+`BlockOffsets` is a small cloneable handle to the Data entry, block and total-row
+counts, and metadata boundary. `Blocks` adds the decoded field metadata, column
+schema, and layer groupings. `ClusterIndex` shares a `BlockOffsets` handle so it
+can read cluster counts without depending on the vector columns.
 
-The returned `Block` borrows `Blocks` and retains that block's validated byte
-and row ranges. Its column and band methods reuse those ranges without reading
-offsets again. There is no shared address cache or mutex; obtaining another
-`Block` reads its boundaries again. Invalid boundaries in an unvisited cluster
-are detected when that cluster is accessed.
+A `BlockAddress { block, row }` identifies a local row. `RowAddress` adds
+`segment_ord` to that address. Both coordinates are `u32`, matching the storage
+limits. Merge and training requests retain those coordinates and sort them in
+physical storage order. Readers no longer binary-search cumulative row offsets
+or reconstruct a block from a field-wide row number.
 
 ### Block: a collection of vectors stored as columns
 
@@ -433,23 +432,21 @@ not guarantee an aligned memory address; decoders support unaligned bytes.
 ## `.centroids`: clustering data for each field
 
 This file describes the clusters whose vector data is in `.vec`. A centroid is
-a representative vector for a cluster. Each field has three composite slots:
+a representative vector for a cluster. Each field has two composite slots:
 
 ```text
 <segment-id>.centroids: bytes from start to end
 +----------------------------------------------------------------------+
-| Version: u32 = 4                                                     |
+| Version: u32 = 5                                                     |
 +----------------------------------------------------------------------+
 | Field A                                                              |
 | +----------------------------------------------------------------+   |
 | | Slot 0: counts and full-precision cluster centers              |   |
 | +----------------------------------------------------------------+   |
-| | Slot 1: cluster_offsets, cumulative vector counts              |   |
-| +----------------------------------------------------------------+   |
 | | Slot 2: router, navigation among cluster centers               |   |
 | +----------------------------------------------------------------+   |
 +----------------------------------------------------------------------+
-| Field B: the same three slots                                        |
+| Field B: the same two slots                                          |
 | ... remaining fields                                                 |
 +----------------------------------------------------------------------+
 | Composite directory: (field, slot index) -> entry location           |
@@ -460,16 +457,15 @@ a representative vector for a cluster. Each field has three composite slots:
 +----------------------------------------------------------------------+
 ```
 
-The writer emits slots in the order **0, 1, 2** for each field. Slot indices
-are lookup keys. The file begins with `version: u32 = 4` and ends with the same
+The writer emits slots in the order **0, 2** for each field. Slot indices
+are lookup keys. The file begins with `version: u32 = 5` and ends with the same
 composite directory, directory-length word, and standard footer used by `.vec`.
-V4 removes the former slot 3 containing cluster radius bounds. No radius bounds
-are written or read, and earlier centroid formats require rebuilding.
+V5 omits slot 1, the former cumulative cluster offsets. Radius bounds were
+removed in V4 and remain absent. Earlier centroid formats require rebuilding.
 
-The cluster index is shared across both files: center `c`, offsets `c` and
-`c+1`, and `.vec` block `c` all refer to the same cluster. Stacked
-routing can reorder clusters during construction; all these structures use
-the resulting order.
+Center `c`, router cluster `c`, IdMap block `c`, and `.vec` block tuple `c`
+refer to the same cluster. Stacked routing can reorder clusters during
+construction; all these structures follow the resulting order.
 
 ### Slot 0: counts and centroid vectors
 
@@ -488,36 +484,6 @@ Slot 0: counts and centroid vectors
 Each center uses `4 * dim` bytes and the field's normalization policy. The counts
 occupy 8 bytes; the remaining slot length must be exactly `K * 4 * dim`. The
 current writer assigns each vector-bearing document to one cluster.
-
-### Slot 1: cluster row offsets
-
-This slot contains `cluster_offsets: u64[K+1]`. Each entry is the number of
-vectors preceding that cluster, so adjacent entries give its vector count:
-
-```text
-count = cluster_offsets[c + 1] - cluster_offsets[c]
-```
-
-These are row offsets, not byte locations. Together with the byte offsets in
-`.vec`, they describe each cluster's position and count:
-
-```text
-                                    Cluster 0  Cluster 1  End
-                                  +----------+----------+----------+
-.centroids cluster_offsets (u64)  | 0        | 3        | 8        |
-                                  +----------+----------+----------+
-.vec byte_offsets (u64)           | start 0  | start 1  | end      |
-                                  +----------+----------+----------+
-```
-
-Cluster 0 has `3 - 0 = 3` vectors; cluster 1 has `8 - 3 = 5`. The byte offsets
-locate their blocks, and these counts determine the column offsets within them.
-The slot must contain exactly `K+1` offsets and agree with the `.vec` block count.
-Offsets are read lazily and must be nondecreasing and no larger than the final
-row count, which is limited to `u32::MAX` by vector row addressing.
-
-`.vec` V4 duplicated these counts in a `row_offsets: u32[K+1]` array. `.vec` V5
-removes that array. Slot 1 keeps the same `u64[K+1]` encoding in `.centroids` V4.
 
 ### Slot 2: router
 
@@ -546,8 +512,7 @@ for each routing level:
 
 The bottom level's members are the centers already in slot 0; those vectors are
 not duplicated in the router payload. The routing configuration itself is not
-serialized. The offsets above describe routing membership, distinct from slot
-1's mapping from clusters to document-vector rows.
+serialized. The offsets above describe routing membership, distinct from the block positions and vector counts in `.vec`.
 The reader loads list membership ranges eagerly. Centroid rows at every routing
 level remain behind file slices and are read as routing visits those lists.
 
@@ -595,15 +560,15 @@ IdMap entry
 | doc 4 -> (cluster 1, local 1)                                        |
 +----------------------------------------------------------------------+
 
-.centroids cluster_offsets = [0, 2, 4]
+.vec block_offsets = [(start 0, 2), (start 1, 2), (offsets start, 0)]
 ```
 
 To retrieve document 4, IdMap supplies cluster 1 and local position 1. The
-byte and row offsets supply that cluster's starting byte and count of 2. Rows
+block tuple supplies that cluster's starting byte and count of 2. Rows
 is the first column, so the requested vector starts at:
 
 ```text
-Data entry start + byte_offsets[1] + 1 * (4 * dim)
+Data entry start + block_offsets[1].byte_offset + 1 * (4 * dim)
 ```
 
 To scan cluster 1's codes instead, the reader computes the Codes column range
@@ -661,13 +626,12 @@ boundaries; sorted row requests are split into their containing blocks.
 
 The writer streams full vector rows immediately and buffers encoded columns
 for one cluster, then flushes them in layout order. The reader materializes
-field metadata, count words, and router topology. Block byte offsets, cluster
-row offsets, and centroid vectors at every routing level remain available
-through lazy range reads. Each local `Block` reuses its
-resolved boundaries while reading columns; the shared reader retains no
-addresses. ANN carries cluster IDs through exact reranking, avoiding a search
-through unrelated clusters. Row-only merge and diagnostic APIs use lazy binary
-search when they need to resolve a global row to a cluster.
+field metadata, count words, and router topology. Block tuples and centroid
+vectors at every routing level remain available through lazy range reads. Each
+local `Block` reuses its resolved boundaries while reading columns; the shared
+reader retains no resolved block addresses. ANN carries cluster IDs through exact reranking, avoiding a search
+through unrelated clusters. Merge and diagnostic reads use `BlockAddress`
+values rather than field-wide row numbers.
 
 ## Metadata grammar
 
@@ -706,9 +670,10 @@ DataCorruption before payload access.
 
 ## Versioning rules
 
-The current `.vec` reader supports V5; earlier vector formats require rebuilding.
-The `.centroids` reader supports V4, containing centers, cluster row offsets,
-and a tagged router. Earlier centroid formats require rebuilding.
+The current `.vec` reader supports V6; earlier vector formats require rebuilding.
+The `.centroids` reader supports V5, containing centers and a tagged router.
+Block counts and byte locations are stored only in `.vec`. Earlier centroid
+formats require rebuilding.
 `VectorQuantizationConfig.format_version = 3` identifies the independent index
 settings grammar and specifies a build target, not a segment file version.
 

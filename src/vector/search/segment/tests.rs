@@ -20,7 +20,7 @@ use crate::vector::test_support::{
     first_segment, ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg, ReadLog,
 };
 use crate::vector::tests::{exhaustive_params, routed_exhaustive_params};
-use crate::vector::{ProbeStats, RouterKind, VectorSimilarityFruit, VectorStage};
+use crate::vector::{BlockAddress, ProbeStats, RouterKind, VectorSimilarityFruit, VectorStage};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal};
 
 // --- Oracle matrix ---
@@ -219,7 +219,7 @@ fn seeded_drops(
         let row = searcher
             .segment_reader(address.segment_ord)
             .vector_index(fixture.field)?
-            .row_id(address.doc_id)?
+            .row_location(address.doc_id)?
             .expect("a result has a vector");
         let trace = &stats[address.segment_ord as usize].quantized_trace;
         let upper = trace.layer_columns.iter().find_map(|layer| {
@@ -279,7 +279,7 @@ fn slot_drops(
         let row = searcher
             .segment_reader(address.segment_ord)
             .vector_index(fixture.field)?
-            .row_id(address.doc_id)?
+            .row_location(address.doc_id)?
             .expect("a result has a vector");
         let segment = address.segment_ord as usize;
         let trace = &seeded.stats[segment].quantized_trace;
@@ -506,7 +506,7 @@ fn assert_case(
             (
                 crate::vector::write::RowAddress {
                     segment_ord: SegmentOrdinal::MAX,
-                    row_id: i,
+                    block_address: BlockAddress::new(0, i as u32),
                 },
                 seed,
             )
@@ -901,8 +901,11 @@ fn empty_cluster_skips_its_band() -> crate::Result<()> {
     assert_eq!(stats.clusters_probed(), 1);
     assert_eq!(stats.vectors_visited, 0);
     assert_eq!(stats.layers.get(0).unwrap().io.reads, 1);
-    assert_eq!(stats.layers.get(0).unwrap().io.bytes_read, 16);
-    assert!(stage_reads(&fixture.reads(), |stage| stage == VectorStage::LayerScan(0)).is_empty());
+    assert_eq!(stats.layers.get(0).unwrap().io.bytes_read, 24);
+    let log = fixture.reads();
+    let reads = stage_reads(&log, |stage| stage == VectorStage::LayerScan(0));
+    assert_eq!(reads.len(), 1);
+    assert!(ranges.block_offsets.contains(&reads[0]));
     Ok(())
 }
 
@@ -917,7 +920,7 @@ fn filtered_cluster_reads_only_doc_ids() -> crate::Result<()> {
             let searcher = fixture.index.reader()?.searcher();
             let vectors = first_segment(&searcher).1.vector_index(fixture.field)?;
             let ivf = vectors.index().unwrap();
-            let ivf_rows = ivf.cluster_range(2)?.len();
+            let ivf_rows = (0..ivf.cluster_num_rows(2)?).len();
             let (_, _, open) =
                 every_cluster().resolved_work_budget(ivf.num_clusters(), ivf.num_docs())?;
             fixture.clear_reads();
@@ -943,7 +946,7 @@ fn filtered_cluster_reads_only_doc_ids() -> crate::Result<()> {
                 "{case}: only the open is charged ({stats:?})"
             );
             let mut log = fixture.reads();
-            log.retain(|(_, range)| !ranges.directory.contains(range));
+            log.retain(|(_, range)| !ranges.block_offsets.contains(range));
             assert_eq!(
                 stage_reads(&log, admission(schedule)),
                 vec![ranges.docs[2].as_ref().unwrap()],
@@ -999,7 +1002,7 @@ fn filtered_clusters_read_doc_ids_before_payload() -> crate::Result<()> {
             let mut actual: Vec<_> = scans
                 .iter()
                 .copied()
-                .filter(|range| !ranges.directory.contains(range))
+                .filter(|range| !ranges.block_offsets.contains(range))
                 .collect();
             actual.sort_by_key(|range| range.start);
             assert_eq!(
@@ -1019,7 +1022,6 @@ fn open_gate_reads_doc_ids_only_for_competitive_survivors() -> crate::Result<()>
     fixture.clear_reads();
     let open = fixture.search(&AllQuery, &query, 3, every_cluster())?;
     let log = fixture.reads();
-    let centroid_reads = fixture.centroid_reads();
     for range in stage_reads(&log, |stage| matches!(stage, VectorStage::LayerScan(_))) {
         assert!(
             !ranges
@@ -1067,16 +1069,9 @@ fn open_gate_reads_doc_ids_only_for_competitive_survivors() -> crate::Result<()>
         }
     }
     for layer in 0..2 {
-        let mut requested = stage_reads(&log, |stage| stage == VectorStage::LayerScan(layer as u8));
+        let requested = stage_reads(&log, |stage| stage == VectorStage::LayerScan(layer as u8));
         // The router can also fetch centroid payloads under this stage. Compare the
         // column and address requests charged by VectorRead, excluding router payloads.
-        requested.extend(
-            stage_reads(&centroid_reads, |stage| {
-                stage == VectorStage::LayerScan(layer as u8)
-            })
-            .into_iter()
-            .filter(|range| ranges.cluster_offsets.contains(range)),
-        );
         let io = open.stats[0].layers.get(layer).unwrap().io;
         assert_eq!(
             io.reads,
@@ -1220,7 +1215,7 @@ fn exact_reads_touch_only_survivor_pages() -> crate::Result<()> {
     assert!(
         admission_reads
             .iter()
-            .all(|range| ranges.directory.contains(range)
+            .all(|range| ranges.block_offsets.contains(range)
                 || ranges.docs.iter().flatten().any(|docs| docs == *range)),
         "admission reads only DocIds and cluster addresses"
     );
@@ -1228,7 +1223,7 @@ fn exact_reads_touch_only_survivor_pages() -> crate::Result<()> {
     for range in stage_reads(&log, |stage| {
         matches!(stage, VectorStage::ExactFetch | VectorStage::ExactScore)
     }) {
-        if ranges.directory.contains(range) {
+        if ranges.block_offsets.contains(range) {
             continue;
         }
         payload.extend(range.start / 8192..=(range.end - 1) / 8192);
@@ -1348,7 +1343,7 @@ fn exact_clusters_never_read_their_band() -> crate::Result<()> {
         assert_eq!(
             stage_reads(&log, |stage| stage == VectorStage::LayerScan(0))
                 .iter()
-                .filter(|range| !ranges.directory.contains(range))
+                .filter(|range| !ranges.block_offsets.contains(range))
                 .count(),
             layer0.full_clusters(),
             "{stats:?}"
@@ -1357,17 +1352,9 @@ fn exact_clusters_never_read_their_band() -> crate::Result<()> {
             layer0.full_clusters() + layer0.exact_clusters(),
             stats.postings_row
         );
-        let centroid_reads = fixture.centroid_reads();
-        let mut exact_reads = stage_reads(&log, |stage| {
+        let exact_reads = stage_reads(&log, |stage| {
             matches!(stage, VectorStage::ExactFetch | VectorStage::ExactScore)
         });
-        exact_reads.extend(
-            stage_reads(&centroid_reads, |stage| {
-                matches!(stage, VectorStage::ExactFetch | VectorStage::ExactScore)
-            })
-            .into_iter()
-            .filter(|range| ranges.cluster_offsets.contains(range)),
-        );
         let exact_reads = exact_reads.len();
         assert_eq!(stats.exact_io.reads, exact_reads as u64, "{stats:?}");
         assert_eq!(exact_reads > 0, stats.exact_rows > 0, "{stats:?}");
@@ -1406,14 +1393,7 @@ fn retired_groups_never_reach_a_later_band() -> crate::Result<()> {
     assert_eq!(hits, fixture.oracle(&filter, &query, 10)?);
     let layer1 = stats.layers.get(1).unwrap();
     assert!(layer1.exact_clusters() > 0, "{stats:?}");
-    let searcher = fixture.index.reader()?.searcher();
-    let vectors = first_segment(&searcher).1.vector_index(fixture.field)?;
-    let index = vectors.index().unwrap();
-    let even = |row: &usize| {
-        (0..index.num_clusters())
-            .find(|&cluster| index.cluster_range(cluster).unwrap().contains(row))
-            .is_some_and(|cluster| cluster % 2 == 0)
-    };
+    let even = |address: &BlockAddress| address.block % 2 == 0;
     let trace = &stats.quantized_trace;
     assert!(trace.boundary_rows[0].iter().any(even));
     assert!(!trace.boundary_rows[1].iter().any(even));
@@ -1587,7 +1567,7 @@ fn reads_follow_the_plan() -> crate::Result<()> {
 }
 
 #[test]
-fn cluster_ranges_and_sizes_read_only_centroid_offsets() -> crate::Result<()> {
+fn cluster_sizes_read_only_the_tuple_table() -> crate::Result<()> {
     let fixture = FixtureSpec::clustered(Metric::L2, 8, 4, 40)
         .paged()
         .build()?;
@@ -1595,49 +1575,39 @@ fn cluster_ranges_and_sizes_read_only_centroid_offsets() -> crate::Result<()> {
     let searcher = fixture.index.reader()?.searcher();
     let vectors = first_segment(&searcher).1.vector_index(fixture.field)?;
     let index = vectors.index().unwrap();
-
     fixture.clear_reads();
     assert_eq!(index.num_rows(), vectors.num_vectors());
     assert!(fixture.reads().is_empty());
-    assert!(fixture.centroid_reads().is_empty());
-
     let mut counts = Vec::new();
-    let mut previous_end = 0;
+    let mut offsets = Vec::new();
     for cluster in 0..index.num_clusters() {
         fixture.clear_reads();
-        let rows = index.cluster_range(cluster)?;
-        assert_eq!(rows.start, previous_end);
-        previous_end = rows.end;
-        counts.push(rows.len());
-        assert!(fixture.reads().is_empty());
-        let reads: Vec<_> = fixture
-            .centroid_reads()
-            .into_iter()
-            .map(|(_, r)| r)
-            .collect();
-        assert_eq!(reads, [ranges.cluster_offsets[cluster].clone()]);
-        assert_eq!(reads[0].len(), 16);
+        counts.push(index.cluster_num_rows(cluster)?);
+        assert!(fixture.centroid_reads().is_empty());
+        let reads: Vec<_> = fixture.reads().into_iter().map(|(_, r)| r).collect();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].len(), 24);
+        assert!(ranges.block_offsets.contains(&reads[0]));
+        offsets.extend(reads);
     }
-    assert_eq!(previous_end, index.num_rows());
-
+    assert_eq!(counts.iter().sum::<usize>(), index.num_rows());
     fixture.clear_reads();
     assert_eq!(
         index.cluster_sizes().collect::<crate::Result<Vec<_>>>()?,
         counts
     );
-    assert!(fixture.reads().is_empty());
     assert_eq!(
         fixture
-            .centroid_reads()
+            .reads()
             .into_iter()
             .map(|(_, r)| r)
             .collect::<Vec<_>>(),
-        ranges.cluster_offsets,
+        offsets
     );
-    fixture.clear_reads();
-    assert!(index.cluster_range(index.num_clusters()).is_err());
-    assert!(fixture.reads().is_empty());
     assert!(fixture.centroid_reads().is_empty());
+    fixture.clear_reads();
+    assert!(index.cluster_num_rows(index.num_clusters()).is_err());
+    assert!(fixture.reads().is_empty());
     Ok(())
 }
 
@@ -1655,19 +1625,12 @@ fn ann_reads_offsets_only_for_probed_clusters() -> crate::Result<()> {
             let searcher = fixture.index.reader()?.searcher();
             let vectors = first_segment(&searcher).1.vector_index(fixture.field)?;
             fixture.clear_reads();
-            vectors.index().unwrap().cluster_range(17)?;
-            assert!(fixture.reads().is_empty());
-            let allowed_row_offsets: Vec<_> = fixture
-                .centroid_reads()
-                .into_iter()
-                .map(|(_, r)| r)
-                .collect();
             vectors.read_doc_ids(17, &mut Vec::new())?;
-            let allowed_byte_offsets: Vec<_> = fixture
+            let allowed: Vec<_> = fixture
                 .reads()
                 .into_iter()
                 .map(|(_, r)| r)
-                .filter(|r| ranges.directory.contains(r))
+                .filter(|r| ranges.block_offsets.contains(r))
                 .collect();
             let collector = TopDocs::with_limit(5)
                 .order_by_similarity(fixture.field, query.clone())
@@ -1679,25 +1642,17 @@ fn ann_reads_offsets_only_for_probed_clusters() -> crate::Result<()> {
                 searcher.search(filter, &collector)
             })?;
             assert!(!fruit.results.is_empty());
-            for (reads, all_offsets, allowed) in [
-                (fixture.reads(), &ranges.directory, &allowed_byte_offsets),
-                (
-                    fixture.centroid_reads(),
-                    &ranges.cluster_offsets,
-                    &allowed_row_offsets,
-                ),
-            ] {
-                let offsets: Vec<_> = reads
-                    .into_iter()
-                    .map(|(_, r)| r)
-                    .filter(|r| all_offsets.contains(r))
-                    .collect();
-                assert!(!offsets.is_empty());
-                assert!(
-                    offsets.iter().all(|r| allowed.contains(r)),
-                    "schedule={schedule:?}: {offsets:?}"
-                );
-            }
+            let offsets: Vec<_> = fixture
+                .reads()
+                .into_iter()
+                .map(|(_, r)| r)
+                .filter(|r| ranges.block_offsets.contains(r))
+                .collect();
+            assert!(!offsets.is_empty());
+            assert!(
+                offsets.iter().all(|r| allowed.contains(r)),
+                "schedule={schedule:?}: {offsets:?}"
+            );
         }
     }
     Ok(())

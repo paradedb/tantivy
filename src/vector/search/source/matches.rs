@@ -120,7 +120,7 @@ impl ClusterSource for MatchClusters<'_> {
         self.meter.open();
         Ok(Some(ClusterRows {
             cluster,
-            rows: self.index.cluster_range(cluster)?,
+            rows: (0..self.index.cluster_num_rows(cluster)?),
             offsets: Some(&self.offsets[positions.clone()]),
             docs: Some(&self.docs[positions]),
             centroid: None,

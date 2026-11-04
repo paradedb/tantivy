@@ -11,7 +11,9 @@ use crate::plugin::{PluginMergeContext, PluginWriter};
 use crate::schema::document::{ErasedDocument, ErasedValue, ReferenceValueLeaf};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
 use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
-use crate::vector::storage::blocks::{align_up, block_align, pad, write_metadata, BlockDirectory};
+use crate::vector::storage::blocks::{
+    align_up, block_align, pad, write_metadata, BlockOffsetsWriter,
+};
 use crate::vector::storage::header::{write_vector_header, VectorEntry, HEADER_LEN, VEC_EXT};
 use crate::vector::storage::id_map::IdMap;
 use crate::vector::storage::metadata::{VectorColMetadata, FLAT_ROWS_PER_BLOCK};
@@ -159,14 +161,14 @@ impl PluginWriter for FlatVecWriter {
             let data = composite.for_field_with_idx(field, VectorEntry::Data.index());
             let start = data.written_bytes();
             write_metadata(data, &meta)?;
-            let mut directory = BlockDirectory::new(data.written_bytes() - start);
+            let mut block_offsets = BlockOffsetsWriter::new(data.written_bytes() - start);
             // A full row group or the final partial group forms one aligned Rows column.
             for block in row_bytes.chunks(FLAT_ROWS_PER_BLOCK as usize * stride) {
                 data.write_all(block)?;
                 pad(data, align_up(block.len(), align) - block.len())?;
-                directory.push(data.written_bytes() - start);
+                block_offsets.push(data.written_bytes() - start, block.len() / stride);
             }
-            directory.finish(data)?;
+            block_offsets.finish(data)?;
             assert_eq!((data.written_bytes() - start) as usize % ENTRY_ALIGN, 0);
             data.flush()?;
         }
@@ -245,7 +247,7 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
             let rows_w = composite.for_field_with_idx(field, VectorEntry::Data.index());
             let start = rows_w.written_bytes();
             write_metadata(rows_w, &meta)?;
-            let mut directory = BlockDirectory::new(rows_w.written_bytes() - start);
+            let mut block_offsets = BlockOffsetsWriter::new(rows_w.written_bytes() - start);
             let mut block_bytes = 0;
             // Row groups can be streamed without knowing the final vector count.
 
@@ -255,13 +257,14 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
                 }
                 if let Some(source) = source {
                     let bytes = field_readers[source.segment_ord as usize]
-                        .vector_bytes_for_row(source.row_id)?;
+                        .vector_bytes_for_row(source.block_address)?;
                     target_present.push(target_doc_id);
                     rows_w.write_all(&bytes)?;
                     block_bytes += bytes.len();
                     if target_present.len() % FLAT_ROWS_PER_BLOCK as usize == 0 {
                         pad(rows_w, align_up(block_bytes, align) - block_bytes)?;
-                        directory.push(rows_w.written_bytes() - start);
+                        block_offsets
+                            .push(rows_w.written_bytes() - start, FLAT_ROWS_PER_BLOCK as usize);
                         block_bytes = 0;
                     }
                 }
@@ -269,9 +272,12 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
             }
             pad(rows_w, align_up(block_bytes, align) - block_bytes)?;
             if block_bytes != 0 {
-                directory.push(rows_w.written_bytes() - start);
+                block_offsets.push(
+                    rows_w.written_bytes() - start,
+                    target_present.len() % FLAT_ROWS_PER_BLOCK as usize,
+                );
             }
-            directory.finish(rows_w)?;
+            block_offsets.finish(rows_w)?;
             assert_eq!((rows_w.written_bytes() - start) as usize % ENTRY_ALIGN, 0);
             rows_w.flush()?;
         }

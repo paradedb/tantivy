@@ -17,6 +17,7 @@ use crate::vector::search::scan::bound::Candidate;
 #[cfg(test)]
 use crate::vector::search::scan::bound::PruningBound;
 use crate::vector::write::RowAddress;
+use crate::vector::BlockAddress;
 use crate::{DocId, SegmentOrdinal};
 
 // --- Columns ---
@@ -102,7 +103,7 @@ impl Columns {
 #[derive(Clone, Debug)]
 pub(crate) struct AdmittedCluster {
     pub(crate) cluster: usize,
-    /// The cluster's global row range.
+    /// The cluster's local row range.
     pub(crate) rows: Range<usize>,
     pub(crate) centroid: Similarity,
     /// The block's candidates; empty once retired or pruned away.
@@ -302,12 +303,11 @@ impl QuantizedCandidates {
     ) -> impl Iterator<Item = Candidate> + '_ {
         let block = self.blocks.last().expect("a block was just pushed");
         debug_assert_eq!(block.at, at, "the block just pushed");
-        let start = block.rows.start;
         at.map(move |index| {
             Candidate::interval(
                 RowAddress {
                     segment_ord,
-                    row_id: start + self.offsets[index] as usize,
+                    block_address: BlockAddress::new(block.cluster as u32, self.offsets[index]),
                 },
                 self.lower(index),
                 self.columns.estimates[index],
@@ -347,7 +347,6 @@ impl QuantizedCandidates {
     pub(crate) fn live_candidates(&self, segment_ord: SegmentOrdinal) -> Vec<Candidate> {
         let mut out = Vec::new();
         for block in &self.blocks {
-            let start = block.rows.start;
             for index in block.at.clone() {
                 debug_assert!(
                     self.columns.estimates[index].is_finite()
@@ -357,7 +356,7 @@ impl QuantizedCandidates {
                 out.push(Candidate::interval(
                     RowAddress {
                         segment_ord,
-                        row_id: start + self.offsets[index] as usize,
+                        block_address: BlockAddress::new(block.cluster as u32, self.offsets[index]),
                     },
                     self.lower(index),
                     self.columns.estimates[index],
@@ -372,9 +371,9 @@ impl QuantizedCandidates {
 
 #[cfg(test)]
 impl QuantizedCandidates {
-    /// `(global row, position)` of every live candidate, block by block: in admission order, or
+    /// `(block address, position)` of every live candidate, block by block: in admission order, or
     /// by cluster id, which is row order.
-    fn live(&self, row_order: bool) -> Vec<(usize, usize)> {
+    fn live(&self, row_order: bool) -> Vec<(BlockAddress, usize)> {
         let mut order: Vec<usize> = (0..self.blocks.len()).collect();
         if row_order {
             self.order_by_cluster(&mut order);
@@ -383,19 +382,34 @@ impl QuantizedCandidates {
             .iter()
             .flat_map(|&b| {
                 let block = &self.blocks[b];
-                block
-                    .at
-                    .clone()
-                    .map(move |index| (block.rows.start + self.offsets[index] as usize, index))
+                block.at.clone().map(move |index| {
+                    (
+                        BlockAddress::new(block.cluster as u32, self.offsets[index]),
+                        index,
+                    )
+                })
             })
             .collect()
     }
 
-    /// The live candidates' global rows, in row order.
-    pub(crate) fn global_rows(&self) -> Vec<usize> {
+    /// The live candidates' block addresses, in row order.
+    pub(crate) fn row_addresses(&self) -> Vec<BlockAddress> {
         self.live(true).into_iter().map(|(row, _)| row).collect()
     }
 
+    /// Synthetic arithmetic tests use the local offset as an opaque row label.
+    pub(crate) fn row_labels(&self) -> Vec<usize> {
+        self.row_addresses()
+            .into_iter()
+            .map(|address| address.row as usize)
+            .collect()
+    }
+    pub(crate) fn column_labels(&self, order: bool) -> Vec<(usize, [u32; 4])> {
+        self.column_trace(order)
+            .into_iter()
+            .map(|(address, value)| (address.row as usize, value))
+            .collect()
+    }
     /// The live candidates' doc ids, in row order, for the blocks admitted with them.
     pub(crate) fn doc_ids(&self) -> Vec<DocId> {
         let mut order = Vec::new();
@@ -414,7 +428,7 @@ impl QuantizedCandidates {
     }
 
     /// `(row, estimate bits)` of every live candidate, in admission or row order.
-    pub(crate) fn estimate_trace(&self, row_order: bool) -> Vec<(usize, u32)> {
+    pub(crate) fn estimate_trace(&self, row_order: bool) -> Vec<(BlockAddress, u32)> {
         self.live(row_order)
             .into_iter()
             .map(|(row, index)| (row, self.columns.estimates[index].to_bits()))
@@ -423,7 +437,7 @@ impl QuantizedCandidates {
 
     /// `(row, [raw prefix, base, estimate, sigma] bits)` of every live candidate, in admission or
     /// row order.
-    pub(crate) fn column_trace(&self, row_order: bool) -> Vec<(usize, [u32; 4])> {
+    pub(crate) fn column_trace(&self, row_order: bool) -> Vec<(BlockAddress, [u32; 4])> {
         let columns = &self.columns;
         self.live(row_order)
             .into_iter()

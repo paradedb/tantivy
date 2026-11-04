@@ -6,91 +6,34 @@
 //! The on-disk file is a 4-byte format-version stamp (see `vector::storage::header`)
 //! followed by a [`CompositeFile`](crate::directory::CompositeFile). Written
 //! per field, only for IVF segments (⟺ the field's `.vec` `IdMap` is
-//! `DocLocations`). The composite has three slots per field:
+//! `DocLocations`). The composite has two slots per field:
 //!
 //! ```text
 //! [0] num_centroids (u32) + num_docs (u32) + centroid_bytes (N · stride),
 //!     rows in the router's canonical cluster-sorted order when a stacked
 //!     router was built
-//! [1] cumulative cluster row offsets (N + 1 little-endian u64s)
 //! [2] a router-kind byte followed by the selected router's payload, REQUIRED
 //! ```
 //!
-//! The V4 layout omits the former bounds slot. Earlier layouts require rebuilding.
+//! V5 stores block byte offsets and row counts only in `.vec`. Earlier layouts require rebuilding.
 use std::io::{self, Write};
 use std::mem;
-use std::ops::Range;
 
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
 use crate::directory::FileSlice;
-use crate::error::DataCorruption;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RoutingParams};
 use crate::vector::search::prepared::VectorQuery;
+use crate::vector::storage::blocks::BlockOffsets;
 use crate::vector::storage::io::{VectorRead, VectorReadKind};
 use crate::vector::VectorElement;
-
-/// Lazy cumulative row offsets from slot 1 of `.centroids`.
-#[derive(Clone)]
-pub(crate) struct ClusterOffsets {
-    slice: FileSlice,
-    num_rows: usize,
-}
-
-impl ClusterOffsets {
-    pub(crate) fn open(slice: FileSlice) -> crate::Result<Self> {
-        if slice.len() < 8 || slice.len() % 8 != 0 {
-            return Err(DataCorruption::comment_only("invalid cluster offset length").into());
-        }
-        let first = slice.read_bytes_slice(0..8)?;
-        if u64::from_le_bytes(first.as_slice().try_into().unwrap()) != 0 {
-            return Err(DataCorruption::comment_only("cluster offsets must start at zero").into());
-        }
-        let last = if slice.len() == 8 {
-            first
-        } else {
-            slice.read_bytes_slice(slice.len() - 8..slice.len())?
-        };
-        let num_rows = u64::from_le_bytes(last.as_slice().try_into().unwrap());
-        if num_rows > u64::from(u32::MAX) {
-            return Err(DataCorruption::comment_only("cluster row count overflow").into());
-        }
-        Ok(Self {
-            slice,
-            num_rows: num_rows as usize,
-        })
-    }
-
-    pub(crate) fn num_clusters(&self) -> usize {
-        self.slice.len() / 8 - 1
-    }
-
-    pub(crate) fn num_rows(&self) -> usize {
-        self.num_rows
-    }
-
-    pub(crate) fn range(&self, cluster: usize) -> crate::Result<Range<usize>> {
-        if cluster >= self.num_clusters() {
-            return Err(DataCorruption::comment_only("cluster offset out of range").into());
-        }
-        let bytes = self
-            .slice
-            .read_vector_bytes_slice(cluster * 8..(cluster + 2) * 8, VectorReadKind::Other)?;
-        let first = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-        let last = u64::from_le_bytes(bytes[8..].try_into().unwrap());
-        if first > last || last > self.num_rows as u64 {
-            return Err(DataCorruption::comment_only("invalid cluster row boundaries").into());
-        }
-        Ok(first as usize..last as usize)
-    }
-}
 
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
 ///
-/// Pinned state includes the router's lists. Cluster row offsets and centroid
-/// vectors are read lazily from `.centroids`. Vector blocks and the id-map live on
+/// Router topology is pinned. Centroid vectors remain lazy in `.centroids`; block
+/// offsets and row counts remain lazy in `.vec`. Vector columns and the id-map live on
 /// [`VectorIndexReader`](crate::vector::VectorIndexReader).
 pub(crate) struct ClusterIndex {
     num_centroids: usize,
@@ -100,8 +43,8 @@ pub(crate) struct ClusterIndex {
     centroids_slice: FileSlice,
     /// Bytes per centroid row: the field's vector stride.
     centroid_stride: usize,
-    /// Lazy row boundaries from slot 1, sharing storage with the vector-column reader.
-    cluster_offsets: ClusterOffsets,
+    /// The same lazy tuple table used by the vector-column reader.
+    block_offsets: BlockOffsets,
     metric: Metric,
     router: OpenedRouter,
 }
@@ -136,24 +79,13 @@ impl ClusterIndex {
         out.write_all(centroid_bytes)
     }
 
-    /// Write slot `[1]` of the `.centroids` composite for a field.
-    pub(crate) fn serialize_offsets<W: Write + ?Sized>(
-        cluster_offsets: &[u64],
-        out: &mut W,
-    ) -> io::Result<()> {
-        for offset in cluster_offsets {
-            offset.serialize(out)?;
-        }
-        Ok(())
-    }
-
     /// Parse a field's `.centroids` slots. Count words and router topology are
-    /// materialized; centroid rows and cluster offsets remain lazy.
+    /// materialized; centroid rows and block offsets remain lazy.
     /// The router is opened as the kind persisted in `router_slice`.
     pub(crate) fn open(
         options: &VectorOptions,
         centroids_slice: FileSlice,
-        cluster_offsets: ClusterOffsets,
+        block_offsets: BlockOffsets,
         router_slice: FileSlice,
     ) -> crate::Result<Self> {
         let count_words = 2 * mem::size_of::<u32>();
@@ -182,10 +114,10 @@ impl ClusterIndex {
             .into());
         }
 
-        if num_centroids != cluster_offsets.num_clusters() {
+        if num_centroids != block_offsets.num_blocks() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "centroid count differs from cluster row offsets",
+                "centroid count differs from vector block count",
             )
             .into());
         }
@@ -197,7 +129,7 @@ impl ClusterIndex {
             num_docs,
             centroids_slice,
             centroid_stride: options.bytes_per_vector(),
-            cluster_offsets,
+            block_offsets,
             metric: options.metric(),
             router,
         };
@@ -232,18 +164,32 @@ impl ClusterIndex {
 
     /// Total posting rows across all clusters.
     pub(crate) fn num_rows(&self) -> usize {
-        self.cluster_offsets.num_rows()
+        self.block_offsets.num_rows()
     }
 
-    pub(crate) fn cluster_range(&self, cluster: usize) -> crate::Result<Range<usize>> {
-        self.cluster_offsets.range(cluster)
+    pub(crate) fn cluster_num_rows(&self, cluster: usize) -> crate::Result<usize> {
+        self.block_offsets.num_rows_in(cluster)
     }
 
     /// Per-cluster posting-list sizes, in cluster order — memberships, like
     /// [`Self::num_rows`].
     pub(crate) fn cluster_sizes(&self) -> impl Iterator<Item = crate::Result<usize>> + '_ {
-        (0..self.num_centroids)
-            .map(|cluster| self.cluster_offsets.range(cluster).map(|rows| rows.len()))
+        let mut total = 0usize;
+        (0..self.num_centroids).map(move |cluster| {
+            let count = self.cluster_num_rows(cluster)?;
+            total = total.checked_add(count).ok_or_else(|| {
+                crate::error::DataCorruption::comment_only("cluster row total overflow")
+            })?;
+            if total > self.num_rows()
+                || (cluster + 1 == self.num_centroids && total != self.num_rows())
+            {
+                return Err(crate::error::DataCorruption::comment_only(
+                    "block counts differ from total row count",
+                )
+                .into());
+            }
+            Ok(count)
+        })
     }
 
     /// One centroid row as a file slice.
@@ -294,63 +240,66 @@ impl ClusterIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vector::storage::blocks::{
+        block_len, pad, write_metadata, BlockOffsetsWriter, Blocks,
+    };
+    use crate::vector::storage::metadata::VectorColMetadata;
 
-    #[test]
-    fn cluster_offsets_validate_framing_and_requested_boundaries() -> crate::Result<()> {
-        let encode = |values: &[u64]| -> FileSlice {
-            FileSlice::from(
-                values
-                    .iter()
-                    .flat_map(|n| n.to_le_bytes())
-                    .collect::<Vec<_>>(),
-            )
-        };
-        for bytes in [vec![], vec![0; 7], vec![0; 9]] {
-            assert!(ClusterOffsets::open(FileSlice::from(bytes)).is_err());
-        }
-        for values in [&[1][..], &[1, 2], &[0, u64::MAX]] {
-            assert!(ClusterOffsets::open(encode(values)).is_err());
-        }
-        let empty = ClusterOffsets::open(encode(&[0]))?;
-        assert_eq!(empty.num_clusters(), 0);
-        assert_eq!(empty.num_rows(), 0);
-        assert!(empty.range(0).is_err());
-
-        let offsets = ClusterOffsets::open(encode(&[0, 0, 3, 3, 8, 8]))?;
-        assert_eq!(offsets.num_clusters(), 5);
-        assert_eq!(offsets.num_rows(), 8);
-        assert_eq!(offsets.range(0)?, 0..0);
-        assert_eq!(offsets.range(1)?, 0..3);
-        assert_eq!(offsets.range(3)?, 3..8);
-        assert_eq!(offsets.range(4)?, 8..8);
-        assert!(offsets.range(5).is_err());
-
-        let descending = ClusterOffsets::open(encode(&[0, 3, 2, 8]))?;
-        assert!(descending.range(1).is_err());
-        let past_end = ClusterOffsets::open(encode(&[0, 9, 8]))?;
-        assert!(past_end.range(0).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn centroid_count_must_match_cluster_offsets() -> crate::Result<()> {
+    fn blocks(
+        counts: &[usize],
+        total: Option<u64>,
+    ) -> crate::Result<crate::vector::storage::blocks::BlockOffsets> {
         let options = VectorOptions::new(1, Metric::L2);
-        let mut centroids = Vec::new();
-        ClusterIndex::serialize_centroids(2, 0, &[0; 8], &options, &mut centroids)?;
+        let metadata = VectorColMetadata::build_ivf(&options, None)?;
+        let mut data = Vec::new();
+        write_metadata(&mut data, &metadata)?;
+        let mut offsets = BlockOffsetsWriter::new(data.len() as u64);
+        for &count in counts {
+            pad(&mut data, block_len(&metadata.slots(), count))?;
+            offsets.push(data.len() as u64, count);
+        }
+        offsets.finish(&mut data)?;
+        if let Some(total) = total {
+            let at = data.len() - 16;
+            data[at..at + 8].copy_from_slice(&total.to_le_bytes());
+        }
+        Ok(Blocks::open(FileSlice::from(data), &options, true)?.block_offsets())
+    }
+    #[test]
+    fn centroid_count_must_match_vector_blocks() -> crate::Result<()> {
+        let options = VectorOptions::new(1, Metric::L2);
+        let mut centers = Vec::new();
+        ClusterIndex::serialize_centroids(2, 0, &[0; 8], &options, &mut centers)?;
         for count in [0, 1, 3] {
-            let offsets = ClusterOffsets::open(FileSlice::from(vec![0; (count + 1) * 8]))?;
             let error = ClusterIndex::open(
                 &options,
-                FileSlice::from(centroids.clone()),
-                offsets,
+                FileSlice::from(centers.clone()),
+                blocks(&vec![0; count], None)?,
                 FileSlice::empty(),
             )
             .err()
-            .expect("mismatched centroid and offset counts must fail");
+            .expect("mismatched block count");
             assert!(error
                 .to_string()
-                .contains("centroid count differs from cluster row offsets"));
+                .contains("centroid count differs from vector block count"));
         }
+        Ok(())
+    }
+    #[test]
+    fn cluster_counts_must_sum_to_the_footer_total() -> crate::Result<()> {
+        let options = VectorOptions::new(1, Metric::L2);
+        let mut centers = Vec::new();
+        ClusterIndex::serialize_centroids(2, 2, &[0; 8], &options, &mut centers)?;
+        let index = ClusterIndex::open(
+            &options,
+            FileSlice::from(centers),
+            blocks(&[1, 1], Some(3))?,
+            FileSlice::from(vec![2]),
+        )?;
+        assert!(index
+            .cluster_sizes()
+            .collect::<crate::Result<Vec<_>>>()
+            .is_err());
         Ok(())
     }
 }

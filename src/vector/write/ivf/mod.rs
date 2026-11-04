@@ -215,7 +215,7 @@ pub(crate) fn merge_ivf(
                     &merge,
                     num_present_docs,
                     &centroid_bytes,
-                    &cluster_offsets,
+                    num_centroids,
                     &router,
                 )?;
 

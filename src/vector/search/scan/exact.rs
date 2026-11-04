@@ -13,7 +13,7 @@ use crate::vector::storage::quantized::ReadScratch;
 use crate::vector::storage::reader::{VectorIndexReader, VectorRowBatch};
 use crate::vector::telemetry::enter_vector_stage;
 use crate::vector::write::RowAddress;
-use crate::vector::{VectorElement, VectorStage};
+use crate::vector::{BlockAddress, VectorElement, VectorStage};
 use crate::{DocAddress, DocId, SegmentOrdinal};
 
 /// Full-precision rows of one cluster's selection.
@@ -41,7 +41,7 @@ where
     cluster_docs: Vec<DocId>,
     /// Global rows scored in the exact phase, in order; the scan copies them into its trace.
     #[cfg(test)]
-    pub(super) exact_phase_rows: Vec<usize>,
+    pub(super) exact_phase_rows: Vec<BlockAddress>,
     /// Every score computed, in order; the scan copies them into its trace.
     #[cfg(test)]
     pub(super) exact_scores: Vec<f32>,
@@ -97,7 +97,11 @@ where
         bound: &mut PruningBound,
     ) -> crate::Result<usize> {
         #[cfg(test)]
-        self.exact_phase_rows.extend(selected.global_rows());
+        self.exact_phase_rows.extend(
+            selected
+                .local_rows()
+                .map(|row| BlockAddress::new(selected.cluster as u32, row as u32)),
+        );
         self.score(selected, scratch, bound)
     }
 
@@ -165,7 +169,7 @@ where
         column_read: &mut bool,
         position: usize,
         offset: usize,
-        global_row: usize,
+        local_row: usize,
         bytes: &[u8],
     ) -> crate::Result<()> {
         let score = self.query.score_row(bytes).score();
@@ -174,7 +178,7 @@ where
         bound.offer([Candidate::exact(
             RowAddress {
                 segment_ord: self.segment_ord,
-                row_id: global_row,
+                block_address: BlockAddress::new(selected.cluster as u32, local_row as u32),
             },
             score,
         )]);
@@ -220,7 +224,7 @@ where
             None => ExactRows::Span(self.reader.read_cluster_rows(selected.cluster)?),
             Some(_) => {
                 scratch.rows.clear();
-                scratch.rows.extend(selected.global_rows());
+                scratch.rows.extend(selected.local_rows());
                 ExactRows::Planned(
                     self.reader
                         .read_vector_rows_in_cluster(selected.cluster, scratch)?,
