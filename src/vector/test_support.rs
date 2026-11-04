@@ -717,21 +717,16 @@ impl Fixture {
         let mut docs = Vec::new();
         for cluster in 0..clusters {
             self.clear_reads();
-            vectors.index().unwrap().cluster_range(cluster)?;
+            vectors.read_doc_ids(cluster, &mut docs)?;
+            let mut reads: Vec<_> = self.reads().into_iter().map(|(_, range)| range).collect();
+            // Block boundaries precede the DocIds payload, which is absent for empty clusters.
             ranges
-                .directory
-                .extend(self.reads().into_iter().map(|(_, range)| range));
+                .docs
+                .push((!docs.is_empty()).then(|| reads.pop().expect("DocIds read")));
+            ranges.directory.extend(reads);
             ranges
                 .cluster_offsets
                 .extend(self.centroid_reads().into_iter().map(|(_, range)| range));
-            self.clear_reads();
-            vectors.read_doc_ids(cluster, &mut docs)?;
-            ranges.docs.push(
-                self.reads()
-                    .into_iter()
-                    .map(|(_, range)| range)
-                    .find(|range| !ranges.directory.contains(range)),
-            );
             self.clear_reads();
             if !docs.is_empty() {
                 vectors.read_cluster_rows(cluster)?;

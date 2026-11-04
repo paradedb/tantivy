@@ -900,13 +900,9 @@ fn empty_cluster_skips_its_band() -> crate::Result<()> {
     assert_eq!(stats.postings_skipped, 1);
     assert_eq!(stats.clusters_probed(), 1);
     assert_eq!(stats.vectors_visited, 0);
-    assert_eq!(stats.layers.get(0).unwrap().io.reads, 2);
-    assert_eq!(stats.layers.get(0).unwrap().io.bytes_read, 32);
-    assert!(
-        stage_reads(&fixture.reads(), |stage| stage == VectorStage::LayerScan(0))
-            .iter()
-            .all(|range| ranges.directory.contains(range))
-    );
+    assert_eq!(stats.layers.get(0).unwrap().io.reads, 1);
+    assert_eq!(stats.layers.get(0).unwrap().io.bytes_read, 16);
+    assert!(stage_reads(&fixture.reads(), |stage| stage == VectorStage::LayerScan(0)).is_empty());
     Ok(())
 }
 
@@ -1591,6 +1587,61 @@ fn reads_follow_the_plan() -> crate::Result<()> {
 }
 
 #[test]
+fn cluster_ranges_and_sizes_read_only_centroid_offsets() -> crate::Result<()> {
+    let fixture = FixtureSpec::clustered(Metric::L2, 8, 4, 40)
+        .paged()
+        .build()?;
+    let ranges = fixture.column_ranges()?;
+    let searcher = fixture.index.reader()?.searcher();
+    let vectors = first_segment(&searcher).1.vector_index(fixture.field)?;
+    let index = vectors.index().unwrap();
+
+    fixture.clear_reads();
+    assert_eq!(index.num_rows(), vectors.num_vectors());
+    assert!(fixture.reads().is_empty());
+    assert!(fixture.centroid_reads().is_empty());
+
+    let mut counts = Vec::new();
+    let mut previous_end = 0;
+    for cluster in 0..index.num_clusters() {
+        fixture.clear_reads();
+        let rows = index.cluster_range(cluster)?;
+        assert_eq!(rows.start, previous_end);
+        previous_end = rows.end;
+        counts.push(rows.len());
+        assert!(fixture.reads().is_empty());
+        let reads: Vec<_> = fixture
+            .centroid_reads()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
+        assert_eq!(reads, [ranges.cluster_offsets[cluster].clone()]);
+        assert_eq!(reads[0].len(), 16);
+    }
+    assert_eq!(previous_end, index.num_rows());
+
+    fixture.clear_reads();
+    assert_eq!(
+        index.cluster_sizes().collect::<crate::Result<Vec<_>>>()?,
+        counts
+    );
+    assert!(fixture.reads().is_empty());
+    assert_eq!(
+        fixture
+            .centroid_reads()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect::<Vec<_>>(),
+        ranges.cluster_offsets,
+    );
+    fixture.clear_reads();
+    assert!(index.cluster_range(index.num_clusters()).is_err());
+    assert!(fixture.reads().is_empty());
+    assert!(fixture.centroid_reads().is_empty());
+    Ok(())
+}
+
+#[test]
 fn ann_reads_offsets_only_for_probed_clusters() -> crate::Result<()> {
     for schedule in [&[][..], &[1, 4][..]] {
         let fixture = FixtureSpec::clustered(Metric::L2, 64, 32, 640)
@@ -1605,12 +1656,18 @@ fn ann_reads_offsets_only_for_probed_clusters() -> crate::Result<()> {
             let vectors = first_segment(&searcher).1.vector_index(fixture.field)?;
             fixture.clear_reads();
             vectors.index().unwrap().cluster_range(17)?;
-            let allowed_byte_offsets: Vec<_> =
-                fixture.reads().into_iter().map(|(_, r)| r).collect();
+            assert!(fixture.reads().is_empty());
             let allowed_row_offsets: Vec<_> = fixture
                 .centroid_reads()
                 .into_iter()
                 .map(|(_, r)| r)
+                .collect();
+            vectors.read_doc_ids(17, &mut Vec::new())?;
+            let allowed_byte_offsets: Vec<_> = fixture
+                .reads()
+                .into_iter()
+                .map(|(_, r)| r)
+                .filter(|r| ranges.directory.contains(r))
                 .collect();
             let collector = TopDocs::with_limit(5)
                 .order_by_similarity(fixture.field, query.clone())
