@@ -3,10 +3,12 @@ use std::fmt;
 use crate::docset::{DocSet, TERMINATED};
 use crate::fieldnorm::FieldNormReader;
 use crate::index::{Bm25Params, SegmentReader};
-use crate::postings::{Postings, SegmentPostings};
+use crate::postings::{FreqReadingOption, Postings, SegmentPostings};
 use crate::query::bm25::Bm25Weight;
+use crate::query::boolean_query::BlockWandSingleScorer;
 use crate::query::explanation::does_not_match;
-use crate::query::{EnableScoring, EmptyScorer, Explanation, Query, Scorer, Weight};
+use crate::query::scorer::{BasicPruningScorer, BlockMaxScorer, PruningScorer};
+use crate::query::{EmptyScorer, EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::schema::{Field, IndexRecordOption};
 use crate::{DocId, Score, Term};
 
@@ -20,8 +22,8 @@ use crate::{DocId, Score, Term};
 /// into a boolean OR of term queries:
 ///
 /// * a rare synonym receiving a large idf boost relative to a common one, and
-/// * documents containing several variants outscoring documents containing a
-///   single variant, purely because scores of separate clauses are summed.
+/// * documents containing several variants outscoring documents containing a single variant, purely
+///   because scores of separate clauses are summed.
 ///
 /// All terms must belong to the same field.
 #[derive(Clone)]
@@ -41,10 +43,7 @@ impl SynonymQuery {
     /// Panics if `terms` is empty or if the terms do not all belong to the
     /// same field.
     pub fn new(terms: Vec<Term>) -> SynonymQuery {
-        assert!(
-            !terms.is_empty(),
-            "SynonymQuery requires at least one term"
-        );
+        assert!(!terms.is_empty(), "SynonymQuery requires at least one term");
         let field = terms[0].field();
         assert!(
             terms[1..].iter().all(|term| term.field() == field),
@@ -181,6 +180,24 @@ impl Weight for SynonymWeight {
         }
     }
 
+    fn pruning_scorer(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        init_threshold: Score,
+    ) -> crate::Result<Box<dyn PruningScorer>> {
+        match self.specialized_scorer(reader, boost)? {
+            Some(scorer) if scorer.reads_freqs() => {
+                Ok(Box::new(BlockWandSingleScorer::new(scorer, init_threshold)))
+            }
+            Some(scorer) => Ok(Box::new(BasicPruningScorer::new(
+                Box::new(scorer),
+                init_threshold,
+            ))),
+            None => Ok(Box::new(EmptyScorer)),
+        }
+    }
+
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
         let Some(mut scorer) = self.specialized_scorer(reader, 1.0)? else {
             return Err(does_not_match(doc));
@@ -223,6 +240,13 @@ impl SynonymScorer {
             fieldnorm_reader,
             similarity_weight,
         }
+    }
+
+    /// Block-WAND needs the frequencies, which a scorer built without scoring does not read.
+    pub(crate) fn reads_freqs(&self) -> bool {
+        self.postings.iter().all(|postings| {
+            postings.block_cursor.freq_reading_option() == FreqReadingOption::ReadFreq
+        })
     }
 
     fn fieldnorm_id(&self) -> u8 {
@@ -297,13 +321,58 @@ impl Scorer for SynonymScorer {
     }
 }
 
+impl BlockMaxScorer for SynonymScorer {
+    /// The members' bounds summed, no higher than the group's own ceiling. BM25 grows less than
+    /// linearly with the term frequency, so the score of a summed frequency never exceeds the sum
+    /// of the scores, and a member whose block starts after this one contributes nothing here.
+    fn block_max_score(&mut self) -> Score {
+        let fieldnorm_reader = &self.fieldnorm_reader;
+        let weight = &self.similarity_weight;
+        self.postings
+            .iter_mut()
+            .filter(|postings| postings.doc() != TERMINATED)
+            .map(|postings| {
+                postings
+                    .block_cursor
+                    .block_max_score(fieldnorm_reader, weight)
+            })
+            .sum::<Score>()
+            .min(weight.max_score())
+    }
+
+    /// The nearest block end among the members, so no member crosses into a new block before it.
+    fn last_doc_in_block(&self) -> DocId {
+        self.postings
+            .iter()
+            .filter(|postings| postings.doc() != TERMINATED)
+            .map(|postings| postings.block_cursor.skip_reader().last_doc_in_block())
+            .min()
+            .unwrap_or(TERMINATED)
+    }
+
+    fn seek_block(&mut self, target: DocId) {
+        for postings in &mut self.postings {
+            if postings.doc() < target {
+                postings.block_cursor.seek_block(target);
+            }
+        }
+    }
+
+    fn max_score(&self) -> Score {
+        self.similarity_weight.max_score()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::SynonymQuery;
+    use super::{SynonymQuery, SynonymScorer};
     use crate::collector::{Count, TopDocs};
-    use crate::query::{BooleanQuery, EnableScoring, Occur, Query, TermQuery};
-    use crate::schema::{IndexRecordOption, Schema, TEXT};
-    use crate::{assert_nearly_equals, DocAddress, Index, IndexWriter, Term};
+    use crate::docset::{DocSet, TERMINATED};
+    use crate::query::{
+        BlockMaxScorer, BooleanQuery, EnableScoring, Occur, Query, Scorer, TermQuery,
+    };
+    use crate::schema::{Field, IndexRecordOption, Schema, TEXT};
+    use crate::{assert_nearly_equals, DocAddress, Index, IndexWriter, Score, Term};
 
     fn build_test_index() -> crate::Result<Index> {
         let mut schema_builder = Schema::builder();
@@ -374,8 +443,10 @@ mod tests {
         // A doc matching both synonyms scores as one pseudo-term with tf=2,
         // strictly less than 2x the single-variant score (saturation), and
         // identical to what a single term with tf=2 would get.
-        let scores: std::collections::HashMap<DocAddress, f32> =
-            top_docs.iter().map(|(score, addr)| (*addr, *score)).collect();
+        let scores: std::collections::HashMap<DocAddress, f32> = top_docs
+            .iter()
+            .map(|(score, addr)| (*addr, *score))
+            .collect();
         let single = scores[&DocAddress::new(0, 0)];
         let both = scores[&DocAddress::new(0, 2)];
         assert!(both > 0.0 && single > 0.0);
@@ -384,8 +455,8 @@ mod tests {
     }
 
     #[test]
-    fn test_synonym_query_scores_lower_than_boolean_or_for_multi_variant_docs(
-    ) -> crate::Result<()> {
+    fn test_synonym_query_scores_lower_than_boolean_or_for_multi_variant_docs() -> crate::Result<()>
+    {
         // Documents containing both variants should NOT be double-counted the
         // way a boolean OR of term queries does.
         let index = build_test_index()?;
@@ -457,5 +528,125 @@ mod tests {
             Term::from_field_text(a, "x"),
             Term::from_field_text(b, "y"),
         ]);
+    }
+
+    /// Thousands of docs in one segment, so the posting lists span many blocks and the term
+    /// frequencies and field lengths vary from block to block.
+    fn large_index() -> crate::Result<(Index, Field)> {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        for i in 0..6_000u32 {
+            let mut words = Vec::new();
+            if i % 3 == 0 {
+                words.extend(std::iter::repeat_n("cat", (i % 5 + 1) as usize));
+            }
+            if i % 7 == 0 {
+                words.extend(std::iter::repeat_n("feline", (i % 4 + 1) as usize));
+            }
+            if i % 11 == 0 {
+                words.extend(std::iter::repeat_n("dog", 2));
+            }
+            words.extend(std::iter::repeat_n("pad", (i % 9) as usize));
+            writer.add_document(doc!(text => words.join(" ")))?;
+        }
+        writer.commit()?;
+        Ok((index, text))
+    }
+
+    fn cat_feline(text: Field) -> SynonymQuery {
+        SynonymQuery::new(vec![
+            Term::from_field_text(text, "cat"),
+            Term::from_field_text(text, "feline"),
+        ])
+    }
+
+    /// Every `(score, doc)` of `query`, best first, with no pruning involved.
+    fn exhaustive(
+        searcher: &crate::Searcher,
+        query: &dyn Query,
+    ) -> crate::Result<Vec<(Score, DocAddress)>> {
+        let weight = query.weight(EnableScoring::enabled_from_searcher(searcher))?;
+        let mut hits = Vec::new();
+        for (ord, reader) in searcher.segment_readers().iter().enumerate() {
+            weight.for_each(reader, &mut |doc, score| {
+                hits.push((score, DocAddress::new(ord as u32, doc)))
+            })?;
+        }
+        hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        Ok(hits)
+    }
+
+    fn assert_same_top(pruned: &[(Score, DocAddress)], all: &[(Score, DocAddress)]) {
+        assert_eq!(pruned.len(), all.len().min(pruned.len()));
+        let by_doc: std::collections::HashMap<DocAddress, Score> =
+            all.iter().map(|(score, doc)| (*doc, *score)).collect();
+        for (i, (score, doc)) in pruned.iter().enumerate() {
+            assert_nearly_equals!(*score, all[i].0);
+            assert_nearly_equals!(*score, by_doc[doc]);
+        }
+    }
+
+    #[test]
+    fn the_block_bound_covers_every_doc_of_the_block() -> crate::Result<()> {
+        let (index, text) = large_index()?;
+        let searcher = index.reader()?.searcher();
+        let query = cat_feline(text);
+        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
+        let mut scorer = scorer.downcast::<SynonymScorer>().map_err(|_| ()).unwrap();
+        let mut blocks = 0;
+        while scorer.doc() != TERMINATED {
+            let bound = scorer.block_max_score();
+            let end = scorer.last_doc_in_block();
+            assert!(bound <= scorer.max_score());
+            while scorer.doc() != TERMINATED && scorer.doc() <= end {
+                let score = scorer.score();
+                assert!(
+                    score <= bound,
+                    "doc {} scores {score} over the bound {bound}",
+                    scorer.doc()
+                );
+                scorer.advance();
+            }
+            blocks += 1;
+            if end == TERMINATED {
+                break;
+            }
+            scorer.seek_block(end + 1);
+            scorer.seek(end + 1);
+        }
+        assert!(blocks > 10, "the index spans {blocks} blocks only");
+        Ok(())
+    }
+
+    #[test]
+    fn pruned_top_k_matches_the_exhaustive_order() -> crate::Result<()> {
+        let (index, text) = large_index()?;
+        let searcher = index.reader()?.searcher();
+        let query = cat_feline(text);
+        let pruned = searcher.search(&query, &TopDocs::with_limit(10).order_by_score())?;
+        assert_same_top(&pruned, &exhaustive(&searcher, &query)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_union_with_a_term_prunes_to_the_same_top_k() -> crate::Result<()> {
+        let (index, text) = large_index()?;
+        let searcher = index.reader()?.searcher();
+        let query = BooleanQuery::new(vec![
+            (
+                Occur::Should,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(text, "dog"),
+                    IndexRecordOption::WithFreqs,
+                )),
+            ),
+            (Occur::Should, Box::new(cat_feline(text))),
+        ]);
+        let pruned = searcher.search(&query, &TopDocs::with_limit(10).order_by_score())?;
+        assert_same_top(&pruned, &exhaustive(&searcher, &query)?);
+        Ok(())
     }
 }
