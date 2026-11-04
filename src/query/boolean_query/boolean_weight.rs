@@ -59,6 +59,11 @@ pub(crate) enum SpecializedScorer {
     /// Term and synonym scorers together. Block-WAND prunes them through the trait, with none of
     /// the term-only specializations.
     BlockMaxUnion(Vec<Box<dyn BlockMaxScorer>>),
+    /// A `BlockMaxUnion` under a non-scoring `must` filter.
+    FilteredBlockMaxUnion {
+        scorers: Vec<Box<dyn BlockMaxScorer>>,
+        filter: Box<dyn Scorer>,
+    },
     TermIntersection(Vec<TermScorer>),
     FilteredTermUnion {
         terms: Vec<TermScorer>,
@@ -243,6 +248,26 @@ fn into_box_scorer<TScoreCombiner: ScoreCombiner>(
             };
             intersect_scorers(
                 vec![term_scorer, filter],
+                num_docs,
+                TScoreCombiner::constant_score().is_none(),
+                bitmap_enabled,
+            )
+        }
+        SpecializedScorer::FilteredBlockMaxUnion {
+            mut scorers,
+            filter,
+        } => {
+            let union: Box<dyn Scorer> = if scorers.len() == 1 {
+                scorers.pop().unwrap()
+            } else {
+                Box::new(BufferedUnionScorer::build(
+                    scorers,
+                    score_combiner_fn,
+                    num_docs,
+                ))
+            };
+            intersect_scorers(
+                vec![union, filter],
                 num_docs,
                 TScoreCombiner::constant_score().is_none(),
                 bitmap_enabled,
@@ -521,7 +546,25 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     }
                 }
 
-                if combined_all_scorer_count == 0 && other_scorers.is_empty() {
+                // A lone synonym group as the only must clause prunes like a lone term.
+                let lone_group = if combined_all_scorer_count == 0
+                    && term_scorers.is_empty()
+                    && other_scorers.len() == 1
+                {
+                    match block_max_scorer(other_scorers.pop().unwrap()) {
+                        Ok(scorer) => Some(scorer),
+                        Err(scorer) => {
+                            other_scorers.push(scorer);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(scorer) = lone_group {
+                    SpecializedScorer::BlockMaxUnion(vec![scorer])
+                } else if combined_all_scorer_count == 0 && other_scorers.is_empty() {
                     if term_scorers.len() >= 2 {
                         SpecializedScorer::TermIntersection(term_scorers)
                     } else if term_scorers.len() == 1 {
@@ -647,6 +690,12 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                         SpecializedScorer::TermIntersection(terms) => {
                             SpecializedScorer::FilteredTermIntersection {
                                 terms,
+                                filter: must_scorer,
+                            }
+                        }
+                        SpecializedScorer::BlockMaxUnion(scorers) => {
+                            SpecializedScorer::FilteredBlockMaxUnion {
+                                scorers,
                                 filter: must_scorer,
                             }
                         }
@@ -867,6 +916,41 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     ))),
                 }
             }
+            SpecializedScorer::FilteredBlockMaxUnion { scorers, filter } => {
+                if !TScoreCombiner::SUPPORTS_BLOCK_WAND
+                    || !self.scoring_enabled
+                    || filter.constant_score().is_none()
+                {
+                    let union_scorer = into_box_scorer(
+                        SpecializedScorer::FilteredBlockMaxUnion { scorers, filter },
+                        &self.score_combiner_fn,
+                        reader.num_docs(),
+                        self.bitmap_enabled && reader.bitmap_postings_enabled,
+                    );
+                    return Ok(Box::new(BasicPruningScorer::new(
+                        union_scorer,
+                        init_threshold,
+                    )));
+                }
+                let filter_boost = filter.constant_score().unwrap();
+                let mut scorers = scorers;
+                scorers.retain(|scorer| scorer.doc() < TERMINATED);
+                match scorers.len() {
+                    0 => Ok(Box::new(EmptyScorer)),
+                    1 => Ok(Box::new(BlockWandSingleScorer::with_filter(
+                        scorers.pop().unwrap(),
+                        init_threshold,
+                        filter,
+                        filter_boost,
+                    ))),
+                    _ => Ok(Box::new(BlockWandUnionScorer::with_filter(
+                        scorers,
+                        init_threshold,
+                        filter,
+                        filter_boost,
+                    ))),
+                }
+            }
             SpecializedScorer::FilteredTermIntersection { terms, filter } => {
                 if !self.scoring_enabled || filter.constant_score().is_none() {
                     let intersection_scorer = into_box_scorer(
@@ -981,7 +1065,8 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             }
             SpecializedScorer::FilteredTermUnion { .. }
             | SpecializedScorer::FilteredTermIntersection { .. }
-            | SpecializedScorer::BlockMaxUnion(_) => {
+            | SpecializedScorer::BlockMaxUnion(_)
+            | SpecializedScorer::FilteredBlockMaxUnion { .. } => {
                 let mut scorer = into_box_scorer(
                     scorer,
                     &self.score_combiner_fn,
@@ -1107,6 +1192,46 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     }
                 }
             }
+            SpecializedScorer::FilteredBlockMaxUnion { scorers, filter } => {
+                if !TScoreCombiner::SUPPORTS_BLOCK_WAND
+                    || !self.scoring_enabled
+                    || filter.constant_score().is_none()
+                {
+                    let union_scorer = into_box_scorer(
+                        SpecializedScorer::FilteredBlockMaxUnion { scorers, filter },
+                        &self.score_combiner_fn,
+                        reader.num_docs(),
+                        self.bitmap_enabled && reader.bitmap_postings_enabled,
+                    );
+                    let mut scorer = BasicPruningScorer::new(union_scorer, threshold);
+                    for_each_pruning_scorer(&mut scorer, callback);
+                    return Ok(());
+                }
+                let filter_boost = filter.constant_score().unwrap();
+                let mut scorers = scorers;
+                scorers.retain(|scorer| scorer.doc() < TERMINATED);
+                match scorers.len() {
+                    0 => {}
+                    1 => {
+                        let mut scorer = BlockWandSingleScorer::with_filter(
+                            scorers.pop().unwrap(),
+                            threshold,
+                            filter,
+                            filter_boost,
+                        );
+                        for_each_pruning_scorer(&mut scorer, callback);
+                    }
+                    _ => {
+                        let mut scorer = BlockWandUnionScorer::with_filter(
+                            scorers,
+                            threshold,
+                            filter,
+                            filter_boost,
+                        );
+                        for_each_pruning_scorer(&mut scorer, callback);
+                    }
+                }
+            }
             SpecializedScorer::FilteredTermIntersection { terms, filter } => {
                 if !self.scoring_enabled || filter.constant_score().is_none() {
                     let intersection_scorer = into_box_scorer(
@@ -1210,7 +1335,8 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             }
             SpecializedScorer::FilteredTermUnion { .. }
             | SpecializedScorer::FilteredTermIntersection { .. }
-            | SpecializedScorer::BlockMaxUnion(_) => {
+            | SpecializedScorer::BlockMaxUnion(_)
+            | SpecializedScorer::FilteredBlockMaxUnion { .. } => {
                 let mut scorer = into_box_scorer(
                     scorer,
                     DoNothingCombiner::default,
@@ -1260,7 +1386,8 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             }
             SpecializedScorer::FilteredTermUnion { .. }
             | SpecializedScorer::FilteredTermIntersection { .. }
-            | SpecializedScorer::BlockMaxUnion(_) => {
+            | SpecializedScorer::BlockMaxUnion(_)
+            | SpecializedScorer::FilteredBlockMaxUnion { .. } => {
                 let mut scorer = into_box_scorer(
                     scorer,
                     DoNothingCombiner::default,
