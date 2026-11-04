@@ -39,7 +39,7 @@ use crate::vector::storage::quantized::QuantizedFieldReader;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
 use crate::vector::tie_break::NoTieBreak;
 use crate::vector::write::RowAddress;
-use crate::vector::{VectorElement, VectorStage};
+use crate::vector::{BlockAddress, VectorElement, VectorStage};
 use crate::{DocAddress, DocId, Result, Score, SegmentOrdinal, TantivyError};
 
 /// A segment and its optional parent centroid in the global router.
@@ -518,7 +518,8 @@ where
                         (
                             RowAddress {
                                 segment_ord: address.segment_ord,
-                                row_id: (address.doc_id as usize) | (1usize << (usize::BITS - 1)),
+                                // Reserve the sentinel block for exact document seed keys.
+                                block_address: BlockAddress::new(u32::MAX, address.doc_id),
                             },
                             *score,
                         )
@@ -589,10 +590,7 @@ where
                         RowAddress {
                             segment_ord: address.segment_ord,
                             // Real block indices are below u32::MAX; reserve it for seed keys.
-                            block_address: crate::vector::BlockAddress::new(
-                                u32::MAX,
-                                address.doc_id,
-                            ),
+                            block_address: BlockAddress::new(u32::MAX, address.doc_id),
                         },
                         *score,
                     )
@@ -694,7 +692,8 @@ where
                         (
                             RowAddress {
                                 segment_ord: address.segment_ord,
-                                row_id: (address.doc_id as usize) | (1usize << (usize::BITS - 1)),
+                                // Keep flat document seeds disjoint from physical block rows.
+                                block_address: BlockAddress::new(u32::MAX, address.doc_id),
                             },
                             *score,
                         )

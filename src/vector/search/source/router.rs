@@ -258,7 +258,7 @@ impl<'a> RouterClusters<'a> {
         let Candidate { sim, node } = candidate;
         let cluster = node as usize;
         self.meter.open();
-        let rows = self.index.cluster_range(cluster);
+        let rows = 0..self.index.cluster_num_rows(cluster)?;
         if rows.is_empty() {
             self.skip_empty();
             return Ok(None);
