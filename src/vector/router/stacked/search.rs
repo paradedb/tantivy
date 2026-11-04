@@ -4,8 +4,9 @@ use std::collections::BinaryHeap;
 use super::levels::{lists_to_open, StackedIvf, StackedSearchStats};
 use crate::vector::router::arena::VectorArena;
 use crate::vector::router::candidate::Candidate;
+use crate::vector::search::prepared::VectorQuery;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
-use crate::vector::VectorStage;
+use crate::vector::{VectorElement, VectorStage};
 
 /// Views one segment's stack or several segments' stacks as one logical router.
 /// Construction controls the layer sources and where their work is recorded.
@@ -137,6 +138,7 @@ impl<'a, S: VectorArena<Elem = f32>> StackedRouting<'a, S> {
             })
             .collect();
         let mut candidates = Vec::new();
+        let mut scores = Vec::new();
         for level in (0..depth).rev() {
             for (segment, stack) in levels.iter().enumerate() {
                 if stack.len() != level + 1 {
@@ -144,16 +146,16 @@ impl<'a, S: VectorArena<Elem = f32>> StackedRouting<'a, S> {
                 }
                 let index = stack[level];
                 self.measure(segment, || {
-                    candidates.extend((0..index.nlist()).map(|node| {
-                        Candidate {
-                            sim: index.centroids.similarity(
-                                metric,
-                                query.len(),
-                                node as u32,
-                                query,
-                            ),
-                            node: (segment, node as u32),
-                        }
+                    index.centroids.batch_similarity(
+                        query.widened(),
+                        query.metric(),
+                        query.routing_norm(),
+                        0..index.nlist(),
+                        &mut scores,
+                    );
+                    candidates.extend(scores.iter().enumerate().map(|(node, &sim)| Candidate {
+                        sim,
+                        node: (segment, node as u32),
                     }));
                 });
                 stats[segment].members_scored += index.nlist();
@@ -168,11 +170,16 @@ impl<'a, S: VectorArena<Elem = f32>> StackedRouting<'a, S> {
                 let index = levels[segment][level];
                 let scanned = self.measure(segment, || {
                     let (start, end) = index.offsets[list as usize];
-                    for node in start..end {
+                    index.vectors.batch_similarity(
+                        query.widened(),
+                        query.metric(),
+                        query.routing_norm(),
+                        start as usize..end as usize,
+                        &mut scores,
+                    );
+                    for (node, &sim) in (start..end).zip(&scores) {
                         let candidate = Candidate {
-                            sim: index
-                                .vectors
-                                .similarity(metric, query.len(), node as u32, query),
+                            sim,
                             node: (segment, node as u32),
                         };
                         if best.len() < requested {

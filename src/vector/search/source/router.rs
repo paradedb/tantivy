@@ -230,7 +230,6 @@ impl<'a> RouterClusters<'a> {
     /// The global search supplies clusters in ranked order and enforces the shared budget.
     pub(crate) fn for_global(
         reader: &'a VectorIndexReader,
-        query: &'a VectorQuery<T>,
         budget: WorkBudget,
         filter: DocFilter,
         segment: &'a SegmentReader,
@@ -240,12 +239,9 @@ impl<'a> RouterClusters<'a> {
         Self {
             index,
             reader,
-            query,
             ranked: RouterIter::Global(metrics),
             meter: WorkMeter::new(budget),
             controller: ProbeController::new(index.num_clusters()),
-            bounds: index.bounds(),
-            tracker: QueryBoundTracker::new(),
             gate: RowGate::new(filter, segment.alive_bitset()),
             docs: Vec::new(),
             offsets: Vec::new(),
@@ -254,25 +250,14 @@ impl<'a> RouterClusters<'a> {
         }
     }
 
-    /// Prepares a cluster chosen by the global router using the latest shared query bound.
+    /// Prepares a cluster chosen by the global router.
     pub(crate) fn probe_global(
         &mut self,
         candidate: Candidate,
-        feedback: Feedback,
     ) -> crate::Result<Option<ClusterRows<'_>>> {
-        // The threshold may have advanced in a different segment since our last probe.
-        self.tracker.observe(
-            self.query.metric(),
-            HeapPeek::from_kth(feedback.kth_lower),
-            (self.counters.postings_row + self.counters.postings_skipped) as u32,
-        );
         let Candidate { sim, node } = candidate;
         let cluster = node as usize;
         self.meter.open();
-        if !self.needs_scoring(cluster, sim.score()) {
-            self.counters.bounds_skips += 1;
-            return Ok(None);
-        }
         let rows = self.index.cluster_range(cluster);
         if rows.is_empty() {
             self.skip_empty();
@@ -298,43 +283,6 @@ impl<'a> RouterClusters<'a> {
             docs: (!gated.all).then_some(&self.selected_docs[..]),
             centroid: Some(sim),
         }))
-    }
-
-    /// Whether the cluster's bound allows it to improve the current top-k results.
-    fn needs_scoring(&self, cluster: usize, sim: f32) -> bool {
-        let query_bound = self.tracker.bound();
-        bounds_verdict(query_bound, || {
-            let QueryBound::Armed { t } = query_bound else {
-                // Never called while filling; +inf keeps the impossible case fail-open.
-                return f32::INFINITY;
-            };
-            // Every margin assumes the stream key is the exact centroid similarity. The row is
-            // read unmetered, so debug builds report the same IO.
-            #[cfg(debug_assertions)]
-            {
-                let row = self
-                    .index
-                    .centroid_row_slice(cluster)
-                    .and_then(|row| Ok(row.read_bytes()?))
-                    .expect("readable centroid row");
-                let exact = self
-                    .query
-                    .metric()
-                    .similarity_bytes::<f32>(self.query.widened(), &row);
-                debug_assert_eq!(
-                    sim,
-                    exact.score(),
-                    "routing stream key must be the exact centroid similarity"
-                );
-            }
-            let r = self.bounds.ball_r(cluster);
-            match self.query.metric() {
-                Metric::L2 | Metric::Cosine => {
-                    margin_ball_ball(t, r, to_bound_space(self.query.metric(), sim))
-                }
-                Metric::Dot => margin_ball_halfspace(sim, self.query.norm(), r, t),
-            }
-        }) != Verdict::Skip
     }
 
     /// Selects `cluster`'s rows into `offsets` and counts what the gate pruned.
@@ -385,13 +333,6 @@ impl ClusterSource for RouterClusters<'_> {
             }
             let cluster = node as usize;
 
-            // A skip charges the open share. The bound is the pessimistic k-th, so a skip
-            // never drops a true top-k row.
-            if !self.needs_scoring(cluster, sim.score()) {
-                self.meter.open();
-                self.counters.bounds_skips += 1;
-                continue;
-            }
             self.meter.open();
             let rows = self.index.cluster_range(cluster);
             if rows.is_empty() {

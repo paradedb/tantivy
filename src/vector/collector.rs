@@ -578,8 +578,8 @@ where
 }
 
 #[allow(clippy::large_enum_variant)]
-enum GlobalSource<'a, T: VectorElement> {
-    Router(RouterClusters<'a, T>),
+enum GlobalSource<'a> {
+    Router(RouterClusters<'a>),
     RouterBypass(MatchClusters<'a>),
 }
 
@@ -756,7 +756,6 @@ where
             let source = match source {
                 Source::Router(filter) => GlobalSource::Router(RouterClusters::for_global(
                     backend.reader(),
-                    backend.query(),
                     budget,
                     filter,
                     segment,
@@ -793,7 +792,7 @@ where
         let (result, measured) = measure(|| {
             while let Some(rows) = source.next()? {
                 let scored = scan.shortlist(&rows)?;
-                source.admitted(scored, scan.feedback())?;
+                source.admitted(scored)?;
             }
             Ok::<_, TantivyError>(())
         });
@@ -813,9 +812,9 @@ where
         scan.swap_topk(&mut topk);
         let (result, measured) = measure(|| {
             meter.open();
-            if let Some(rows) = source.probe_global(candidate, scan.feedback())? {
+            if let Some(rows) = source.probe_global(candidate)? {
                 let scored = scan.shortlist(&rows)?;
-                source.admitted(scored, scan.feedback())?;
+                source.admitted(scored)?;
                 meter.rows(scored);
             }
             Ok::<_, TantivyError>(())
@@ -1157,6 +1156,7 @@ mod ivf_e2e_tests {
                 .order_by_similarity(fixture.field, query.clone())
                 .with_probe_params(ProbeParams {
                     max_probe_fraction: 0.0005,
+                    min_probe_clusters: 16,
                     ..Default::default()
                 })
                 .build()

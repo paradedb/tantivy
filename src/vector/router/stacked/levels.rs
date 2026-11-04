@@ -27,6 +27,7 @@ use crate::vector::distance::Similarity;
 use crate::vector::router::arena::{FileSliceArena, VectorArena};
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::search::{StackedRouting, TopK};
+use crate::vector::search::prepared::VectorQuery;
 use crate::vector::VectorElement;
 
 /// Row index into a level's centroid or member arena.
@@ -878,6 +879,7 @@ where S: VectorArena<Elem = f32>
     /// lists; without a parent every centroid is scored and only that many
     /// are expanded. Lists are scanned nearest centroid first.
     /// [`StackedRouting`] shares the layer walk and adaptive stopping with global routing.
+    #[cfg(any(test, feature = "unstable"))]
     pub fn search(
         &self,
         query: &[S::Elem],

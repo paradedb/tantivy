@@ -504,14 +504,6 @@ where
         }
     }
 
-    /// The shared prune floor when set. The router reads `kth_lower`.
-    pub(crate) fn feedback(&self) -> Feedback {
-        Feedback {
-            kth_lower: self.bound.shared_threshold(),
-            kth_estimate: None,
-        }
-    }
-
     /// Orders the candidate blocks by cluster and prunes the shortlist at layer 0's boundary.
     fn close_shortlist(&mut self) {
         let Some(state) = &mut self.quantized else {

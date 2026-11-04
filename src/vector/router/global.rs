@@ -3,7 +3,7 @@ use super::stacked::search::{AllScored, StackedRouting};
 use super::{OpenedRouter, Router, RouterMetrics};
 use crate::vector::search::prepared::VectorQuery;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
-use crate::vector::VectorStage;
+use crate::vector::{VectorElement, VectorStage};
 
 /// Clusters to probe across all segments, ordered by centroid similarity to the query.
 /// Each cluster carries its segment index, and metrics track the routing work for each segment.
