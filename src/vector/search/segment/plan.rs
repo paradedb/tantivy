@@ -84,6 +84,22 @@ impl SegmentPlan {
             let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
             collect_segment_filter(weight, segment, max_doc, cap)?
         };
+        let match_fraction = match &source {
+            Source::Router(filter) => filter.match_fraction(max_doc),
+            Source::FilterMatches(docs) => docs.len() as f64 / f64::from(max_doc),
+        };
+        let budget = params.normalized_budget(budget, x, match_fraction);
+        let cap = located_cap(params.located, max_doc, budget, n_avg, x);
+        let source = match source {
+            Source::FilterMatches(docs) if docs.len() > cap => {
+                let mut filter = BitSet::with_max_value(max_doc);
+                for doc in docs {
+                    filter.insert(doc);
+                }
+                Source::Router(DocFilter::Docs(filter))
+            }
+            source => source,
+        };
         Ok(Self {
             budget: WorkBudget {
                 total: WorkUnits::new(budget),
@@ -394,6 +410,60 @@ mod tests {
                 "matches={matches}"
             );
         }
+        let normalized = ProbeParams {
+            selectivity_exponent: 0.7,
+            ..auto.clone()
+        };
+        let weight = DocsWeight {
+            max_doc: segment.max_doc(),
+            docs: (0..cap as DocId).collect(),
+        };
+        let normalized_budget =
+            normalized.normalized_budget(budget, x, cap as f64 / f64::from(segment.max_doc()));
+        let normalized_cap = (normalized_budget * n_avg / (1.0 - x)).floor() as usize;
+        assert!(normalized_cap < cap);
+        let (_, stats) = fixture.run_segment(0, &weight, &[0.0, 0.0], 10, normalized)?;
+        assert_eq!(stats.located_cap, normalized_cap);
+        assert_eq!(stats.access_path, AccessPath::Routed);
+
+        for matches in [0, 1, 9, 45, 90] {
+            let weight = DocsWeight {
+                max_doc: segment.max_doc(),
+                docs: (0..matches).collect(),
+            };
+            for fraction in [0.05, 0.2, 0.6, 1.0] {
+                let normalized = ProbeParams {
+                    max_probe_fraction: fraction,
+                    selectivity_exponent: -0.86,
+                    selectivity_slope: -0.73,
+                    ..ProbeParams::default()
+                };
+                let (budget, _, x) =
+                    normalized.resolved_work_budget(ivf.num_clusters(), ivf_docs)?;
+                let effective = normalized.normalized_budget(
+                    budget,
+                    x,
+                    f64::from(matches) / f64::from(segment.max_doc()),
+                );
+                let original = ProbeParams {
+                    max_probe_fraction: (effective / ivf.num_clusters() as f64) as f32,
+                    ..ProbeParams::default()
+                };
+                let (hits, stats) = fixture.run_segment(0, &weight, &[0.0, 0.0], 10, normalized)?;
+                let (original_hits, original_stats) =
+                    fixture.run_segment(0, &weight, &[0.0, 0.0], 10, original)?;
+                assert_eq!(hits, original_hits);
+                assert_eq!(stats.access_path, original_stats.access_path);
+                assert_eq!(stats.located_cap, original_stats.located_cap);
+                assert_eq!(stats.clusters_probed(), original_stats.clusters_probed());
+                assert_eq!(
+                    stats.routing_visited_count,
+                    original_stats.routing_visited_count
+                );
+                assert_eq!(stats.work_charged, original_stats.work_charged);
+            }
+        }
+
         // Every mode reports its cap, and an unfiltered query routes.
         for (located, cap) in [(LocatedPath::Off, 0), (capped(9).located, 9)] {
             let params = ProbeParams {
