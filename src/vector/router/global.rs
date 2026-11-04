@@ -15,6 +15,7 @@ pub(crate) struct GlobalRanking {
 impl GlobalRanking {
     pub(crate) fn from<T: VectorElement>(
         routers: &[Option<&OpenedRouter>],
+        partitions: &[Option<&[f32]>],
         query: &VectorQuery<T>,
         k: usize,
         totals: &mut [StageTotals],
@@ -52,6 +53,7 @@ impl GlobalRanking {
         }
         let ranking = StackedRouting::Global {
             indexes,
+            partitions,
             totals,
             on_segment,
         }
@@ -137,6 +139,53 @@ mod tests {
     }
 
     #[test]
+    fn partition_children_join_at_their_actual_depth() -> crate::Result<()> {
+        for nested in [[true, false, true], [false, true, false]] {
+            let indexes = nested
+                .into_iter()
+                .enumerate()
+                .map(|(i, nested)| open_line_router(i as f32 * 100.0, 4, nested))
+                .collect::<crate::Result<Vec<_>>>()?;
+            let routers: Vec<_> = indexes.iter().map(Some).collect();
+            for partitions in [
+                vec![Some(&[0.0][..]), Some(&[100.0][..]), None],
+                vec![None, Some(&[100.0][..]), Some(&[200.0][..])],
+            ] {
+                for query in [[0.0], [100.0], [200.0]] {
+                    let mut totals = vec![StageTotals::default(); 3];
+                    let ranked = GlobalRanking::from(
+                        &routers,
+                        &partitions,
+                        &VectorQuery::new(Metric::L2, Arc::new(query.to_vec())),
+                        1,
+                        &mut totals,
+                        &mut |_| {},
+                    );
+                    assert_eq!(ranked.clusters[0].0, (query[0] / 100.0) as usize);
+                    let full = GlobalRanking::from(
+                        &routers,
+                        &partitions,
+                        &VectorQuery::new(Metric::L2, Arc::new(query.to_vec())),
+                        usize::MAX,
+                        &mut totals,
+                        &mut |_| {},
+                    );
+                    let plain = GlobalRanking::from(
+                        &routers,
+                        &[],
+                        &VectorQuery::new(Metric::L2, Arc::new(query.to_vec())),
+                        usize::MAX,
+                        &mut totals,
+                        &mut |_| {},
+                    );
+                    assert_eq!(full.clusters, plain.clusters);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn layers_compete_across_segments_and_depths() -> crate::Result<()> {
         let options = VectorOptions::new(1, Metric::L2);
         let mut centroids = IvfCentroids::F32(IvfMatrix {
@@ -160,9 +209,9 @@ mod tests {
             let near = open_line_router(0.0, 4, near_nested)?;
             let routers = [Some(&far), None, Some(&near), Some(&exact)];
             let mut totals = vec![StageTotals::default(); routers.len()];
-            let ranked = GlobalRanking::from(&routers, &query, 0, &mut totals, &mut |_| {});
+            let ranked = GlobalRanking::from(&routers, &[], &query, 0, &mut totals, &mut |_| {});
             let exhaustive =
-                GlobalRanking::from(&routers, &query, usize::MAX, &mut totals, &mut |_| {});
+                GlobalRanking::from(&routers, &[], &query, usize::MAX, &mut totals, &mut |_| {});
             assert_eq!(
                 exhaustive.clusters.len(),
                 9,
@@ -195,6 +244,7 @@ mod tests {
                     let mut visited = Vec::new();
                     let global = StackedRouting::Global {
                         indexes: vec![None, Some(&index)],
+                        partitions: &[],
                         totals: &mut totals,
                         on_segment: &mut |segment| visited.push(segment),
                     }
@@ -213,6 +263,7 @@ mod tests {
                     assert!(visited.iter().all(|&segment| segment == 1));
                     let all = StackedRouting::Global {
                         indexes: vec![None, Some(&index)],
+                        partitions: &[],
                         totals: &mut totals,
                         on_segment: &mut |_| {},
                     }
@@ -243,7 +294,7 @@ mod tests {
             let near = open_line_router(0.0, 80, false)?;
             let routers = [Some(&far), Some(&near)];
             let mut totals = vec![StageTotals::default(); routers.len()];
-            let ranked = GlobalRanking::from(&routers, &query, 1, &mut totals, &mut |_| {});
+            let ranked = GlobalRanking::from(&routers, &[], &query, 1, &mut totals, &mut |_| {});
             assert_eq!(ranked.clusters.len(), 6);
             assert_eq!(ranked.clusters[0].0, 1);
             assert_eq!(ranked.clusters[0].1.node, 0);
@@ -254,7 +305,7 @@ mod tests {
                 } if *candidate_count == expected && *lists_scanned == expected && *members_scored == 80 + expected));
             }
             let exhaustive =
-                GlobalRanking::from(&routers, &query, usize::MAX, &mut totals, &mut |_| {});
+                GlobalRanking::from(&routers, &[], &query, usize::MAX, &mut totals, &mut |_| {});
             assert_eq!(exhaustive.clusters.len(), 160);
         }
         Ok(())
