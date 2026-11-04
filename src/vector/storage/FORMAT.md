@@ -260,6 +260,12 @@ Data entry slice, the block count, the metadata boundary, and `row_offsets`.
 count. The byte-offset array's position is derived from the Data entry length
 and block count.
 
+`ClusterIndex` retains a cloned `ClusterOffsets` handle to the same `.centroids`
+storage. Its cluster ranges and counts read only row offsets, without touching
+`.vec`. Opening checks that the centroid count and the vector block count each
+match this offset array's cluster count. Byte boundaries are validated when a
+`Block` is requested.
+
 The returned `Block` borrows `Blocks` and retains that block's validated byte
 and row ranges. Its column and band methods reuse those ranges without reading
 offsets again. There is no shared address cache or mutex; obtaining another

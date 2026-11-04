@@ -294,22 +294,28 @@ impl VectorIndexReader {
             source: Some((source.composite.clone(), source.field, source.max_doc)),
             value: OnceLock::new(),
         };
-        let row_offsets = match &centroid_slots {
-            Some(slots) => RowOffsets::Clustered(ClusterOffsets::open(slots.offsets.clone())?),
-            None => RowOffsets::Uniform {
-                num_rows: id_map.get(false)?.num_rows() as usize,
-            },
-        };
-        let rows_slice = Arc::new(Blocks::from_metadata(source.metadata.clone(), row_offsets)?);
-        let index = if let Some(slots) = centroid_slots {
-            Some(ClusterIndex::open(
+        let (rows_slice, index) = if let Some(slots) = centroid_slots {
+            let cluster_offsets = ClusterOffsets::open(slots.offsets)?;
+            // Both readers check their counts against the same row-offset array.
+            let rows_slice = Arc::new(Blocks::from_metadata(
+                source.metadata.clone(),
+                RowOffsets::Clustered(cluster_offsets.clone()),
+            )?);
+            let index = ClusterIndex::open(
                 &options,
                 slots.centroids,
-                Arc::clone(&rows_slice),
+                cluster_offsets,
                 slots.router,
-            )?)
+            )?;
+            (rows_slice, Some(index))
         } else {
-            None
+            let rows_slice = Arc::new(Blocks::from_metadata(
+                source.metadata.clone(),
+                RowOffsets::Uniform {
+                    num_rows: id_map.get(false)?.num_rows() as usize,
+                },
+            )?);
+            (rows_slice, None)
         };
         let quantization = if let VectorColMetadata::Quantized { layers: quants, .. } =
             rows_slice.metadata.as_ref()

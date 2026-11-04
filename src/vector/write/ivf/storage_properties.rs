@@ -842,31 +842,16 @@ fn doc_column_ranges(
     let mut offsets = Vec::new();
     for cluster in 0..vectors.index().unwrap().num_clusters() {
         directory.reads.lock().unwrap().clear();
-        vectors.index().unwrap().cluster_range(cluster)?;
-        offsets.extend(
-            directory
-                .reads
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(_, range)| range.clone()),
-        );
-        directory.reads.lock().unwrap().clear();
         vectors.read_doc_ids(cluster, &mut docs)?;
-        let reads: Vec<_> = directory
+        let mut reads: Vec<_> = directory
             .reads
             .lock()
             .unwrap()
             .iter()
             .map(|(_, range)| range.clone())
-            .filter(|range| !offsets.contains(range))
             .collect();
-        assert_eq!(
-            reads.len(),
-            usize::from(!docs.is_empty()),
-            "cluster={cluster} column=DocIds"
-        );
-        ranges.push(reads.first().cloned());
+        ranges.push((!docs.is_empty()).then(|| reads.pop().expect("DocIds read")));
+        offsets.extend(reads);
     }
     directory.reads.lock().unwrap().clear();
     Ok((ranges, offsets))

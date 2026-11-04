@@ -20,11 +20,9 @@
 use std::io::{self, Write};
 use std::mem;
 use std::ops::Range;
-use std::sync::Arc;
 
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
-use super::blocks::Blocks;
 use crate::directory::FileSlice;
 use crate::error::DataCorruption;
 use crate::schema::{Metric, VectorOptions};
@@ -34,6 +32,7 @@ use crate::vector::storage::io::{VectorRead, VectorReadKind};
 use crate::vector::VectorElement;
 
 /// Lazy cumulative row offsets from slot 1 of `.centroids`.
+#[derive(Clone)]
 pub(crate) struct ClusterOffsets {
     slice: FileSlice,
     num_rows: usize,
@@ -90,9 +89,8 @@ impl ClusterOffsets {
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
 ///
-/// Pinned state is small and touched by every query: the cluster offsets and the
-/// router's lists. The centroid vectors stay behind a [`FileSlice`] and are read in contiguous
-/// batches as routing visits them. Everything row-scale (the rows and id-map) lives on
+/// Pinned state includes the router's lists. Cluster row offsets and centroid
+/// vectors are read lazily from `.centroids`. Vector blocks and the id-map live on
 /// [`VectorIndexReader`](crate::vector::VectorIndexReader).
 pub(crate) struct ClusterIndex {
     num_centroids: usize,
@@ -102,8 +100,8 @@ pub(crate) struct ClusterIndex {
     centroids_slice: FileSlice,
     /// Bytes per centroid row: the field's vector stride.
     centroid_stride: usize,
-    /// Lazy byte and row boundaries shared with vector-column readers.
-    blocks: Arc<Blocks>,
+    /// Lazy row boundaries from slot 1, sharing storage with the vector-column reader.
+    cluster_offsets: ClusterOffsets,
     metric: Metric,
     router: OpenedRouter,
 }
@@ -156,7 +154,7 @@ impl ClusterIndex {
     pub(crate) fn open(
         options: &VectorOptions,
         centroids_slice: FileSlice,
-        blocks: Arc<Blocks>,
+        cluster_offsets: ClusterOffsets,
         router_slice: FileSlice,
     ) -> crate::Result<Self> {
         let count_words = 2 * mem::size_of::<u32>();
@@ -185,10 +183,10 @@ impl ClusterIndex {
             .into());
         }
 
-        if num_centroids != blocks.num_blocks() || !blocks.clustered() {
+        if num_centroids != cluster_offsets.num_clusters() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "centroid count differs from vector directory",
+                "centroid count differs from cluster row offsets",
             )
             .into());
         }
@@ -200,7 +198,7 @@ impl ClusterIndex {
             num_docs,
             centroids_slice,
             centroid_stride: options.bytes_per_vector(),
-            blocks,
+            cluster_offsets,
             metric: options.metric(),
             router,
         };
@@ -235,18 +233,18 @@ impl ClusterIndex {
 
     /// Total posting rows across all clusters.
     pub(crate) fn num_rows(&self) -> usize {
-        self.blocks.num_rows()
+        self.cluster_offsets.num_rows()
     }
 
     pub(crate) fn cluster_range(&self, cluster: usize) -> crate::Result<Range<usize>> {
-        self.blocks.row_range(cluster)
+        self.cluster_offsets.range(cluster)
     }
 
     /// Per-cluster posting-list sizes, in cluster order — memberships, like
     /// [`Self::num_rows`].
     pub(crate) fn cluster_sizes(&self) -> impl Iterator<Item = crate::Result<usize>> + '_ {
         (0..self.num_centroids)
-            .map(|cluster| self.blocks.block(cluster).map(|block| block.num_rows()))
+            .map(|cluster| self.cluster_offsets.range(cluster).map(|rows| rows.len()))
     }
 
     /// One centroid row as a file slice.
@@ -339,4 +337,25 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn centroid_count_must_match_cluster_offsets() -> crate::Result<()> {
+        let options = VectorOptions::new(1, Metric::L2);
+        let mut centroids = Vec::new();
+        ClusterIndex::serialize_centroids(2, 0, &[0; 8], &options, &mut centroids)?;
+        for count in [0, 1, 3] {
+            let offsets = ClusterOffsets::open(FileSlice::from(vec![0; (count + 1) * 8]))?;
+            let error = ClusterIndex::open(
+                &options,
+                FileSlice::from(centroids.clone()),
+                offsets,
+                FileSlice::empty(),
+            )
+            .err()
+            .expect("mismatched centroid and offset counts must fail");
+            assert!(error
+                .to_string()
+                .contains("centroid count differs from cluster row offsets"));
+        }
+        Ok(())
+    }
 }
