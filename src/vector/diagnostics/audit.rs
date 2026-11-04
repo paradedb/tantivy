@@ -273,7 +273,7 @@ impl VectorIndexReader {
         count: usize,
         alive: Option<&AliveBitSet>,
     ) -> crate::Result<Option<Vec<VectorEstimatorQuery>>> {
-        let (Some(index), Some(_quantization)) = (&self.index, &self.quantization) else {
+        let (Some(index), Some(_quantization)) = (&self.index, self.quantization()?) else {
             return Ok(None);
         };
         if count == 0 {
@@ -347,7 +347,7 @@ impl VectorIndexReader {
         sample_rows: usize,
         alive: Option<&AliveBitSet>,
     ) -> crate::Result<Option<VectorErrorAuditMeasurements>> {
-        let (Some(index), Some(quantization)) = (&self.index, &self.quantization) else {
+        let (Some(index), Some(quantization)) = (&self.index, self.quantization()?) else {
             return Ok(None);
         };
         if sample_rows == 0 {
@@ -628,7 +628,7 @@ impl VectorIndexReader {
         queries: &[VectorEstimatorQuery],
         alive: Option<&AliveBitSet>,
     ) -> crate::Result<Option<VectorErrorConeAuditMeasurements>> {
-        let (Some(index), Some(quantization)) = (&self.index, &self.quantization) else {
+        let (Some(index), Some(quantization)) = (&self.index, self.quantization()?) else {
             return Ok(None);
         };
         if queries.len() != ERROR_CONE_QUERY_COUNT {

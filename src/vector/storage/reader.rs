@@ -171,7 +171,7 @@ pub struct VectorIndexReader {
     /// Deferred row-group columns and their validated geometry.
     rows_slice: Arc<Blocks>,
     pub(crate) index: Option<ClusterIndex>,
-    pub(crate) quantization: Option<QuantizedFieldReader>,
+    quantization: OnceLock<crate::Result<Option<QuantizedFieldReader>>>,
 }
 
 impl VectorFieldReader {
@@ -301,61 +301,6 @@ impl VectorIndexReader {
             num_rows,
             cluster_rows,
         )?);
-        let quantization =
-            if let VectorColMetadata::Quantized { layers: quants, .. } = rows_slice.meta.as_ref() {
-                let mut layers = Vec::new();
-                for (layer, quant) in quants.iter().enumerate() {
-                    let mut codes = None;
-                    let mut scales = None;
-                    let mut gammas = None;
-                    let mut errors = None;
-                    let mut constants = None;
-                    for (idx, slot) in rows_slice.slots.iter().enumerate() {
-                        match &slot.slot_type {
-                            SlotType::QuantLayerCodes { layer: l, .. } if *l as usize == layer => {
-                                codes = Some(idx)
-                            }
-                            SlotType::QuantLayerScales { layer: l } if *l as usize == layer => {
-                                scales = Some(idx)
-                            }
-                            SlotType::QuantLayerGammas { layer: l } if *l as usize == layer => {
-                                gammas = Some(idx)
-                            }
-                            SlotType::QuantLayerErrors { layer: l } if *l as usize == layer => {
-                                errors = Some(idx)
-                            }
-                            SlotType::QuantLayerConstants { layer: l } if *l as usize == layer => {
-                                constants = Some(idx)
-                            }
-                            _ => (),
-                        }
-                    }
-                    layers.push(QuantizedLayerReader {
-                        blocks: Arc::clone(&rows_slice),
-                        layer,
-                        codes: codes.unwrap(),
-                        scales: scales.unwrap(),
-                        gammas: gammas.unwrap(),
-                        errors: errors.unwrap(),
-                        constants,
-                        code_stride: quant.code_stride(options.dim()),
-                        dim: options.dim(),
-                        bits: quant.bits(),
-                    });
-                }
-                Some(QuantizedFieldReader {
-                    index_ctx: Arc::new(QuantizedIndexCtx::new(Arc::clone(&rows_slice.meta))?),
-                    layers,
-                    blocks: Arc::clone(&rows_slice),
-                    norms: rows_slice
-                        .slots
-                        .iter()
-                        .position(|slot| matches!(slot.slot_type, SlotType::ResidualNorms))
-                        .expect("validated residual norms column"),
-                })
-            } else {
-                None
-            };
 
         let num_vectors = match &index {
             Some(index) => index.num_docs(),
@@ -369,7 +314,7 @@ impl VectorIndexReader {
             rows_slice,
             id_map,
             index,
-            quantization,
+            quantization: OnceLock::new(),
         })
     }
 
@@ -394,7 +339,7 @@ impl VectorIndexReader {
             rows_slice,
             id_map: DeferredIdMap::ready(IdMap::Identity { num_docs: 0 }),
             index: None,
-            quantization: None,
+            quantization: OnceLock::new(),
         }
     }
 
@@ -436,14 +381,88 @@ impl VectorIndexReader {
         self.index.as_ref()
     }
 
-    pub(crate) fn quantization(&self) -> Option<&QuantizedFieldReader> {
-        self.quantization.as_ref()
+    pub(crate) fn quantization(&self) -> crate::Result<Option<&QuantizedFieldReader>> {
+        self.quantization
+            .get_or_init(|| self.open_quantization())
+            .as_ref()
+            .map(Option::as_ref)
+            .map_err(Clone::clone)
+    }
+
+    fn open_quantization(&self) -> crate::Result<Option<QuantizedFieldReader>> {
+        let quantization = if let VectorColMetadata::Quantized { layers: quants, .. } =
+            self.rows_slice.meta.as_ref()
+        {
+            let mut layers = Vec::new();
+            for (layer, quant) in quants.iter().enumerate() {
+                let mut codes = None;
+                let mut scales = None;
+                let mut gammas = None;
+                let mut errors = None;
+                let mut constants = None;
+                for (idx, slot) in self.rows_slice.slots.iter().enumerate() {
+                    match &slot.slot_type {
+                        SlotType::QuantLayerCodes { layer: l, .. } if *l as usize == layer => {
+                            codes = Some(idx)
+                        }
+                        SlotType::QuantLayerScales { layer: l } if *l as usize == layer => {
+                            scales = Some(idx)
+                        }
+                        SlotType::QuantLayerGammas { layer: l } if *l as usize == layer => {
+                            gammas = Some(idx)
+                        }
+                        SlotType::QuantLayerErrors { layer: l } if *l as usize == layer => {
+                            errors = Some(idx)
+                        }
+                        SlotType::QuantLayerConstants { layer: l } if *l as usize == layer => {
+                            constants = Some(idx)
+                        }
+                        _ => (),
+                    }
+                }
+                layers.push(QuantizedLayerReader {
+                    blocks: Arc::clone(&self.rows_slice),
+                    layer,
+                    codes: codes.unwrap(),
+                    scales: scales.unwrap(),
+                    gammas: gammas.unwrap(),
+                    errors: errors.unwrap(),
+                    constants,
+                    code_stride: quant.code_stride(self.options.dim()),
+                    dim: self.options.dim(),
+                    bits: quant.bits(),
+                });
+            }
+            Some(QuantizedFieldReader {
+                index_ctx: Arc::new(QuantizedIndexCtx::new(Arc::clone(&self.rows_slice.meta))?),
+                layers,
+                blocks: Arc::clone(&self.rows_slice),
+                norms: self
+                    .rows_slice
+                    .slots
+                    .iter()
+                    .position(|slot| matches!(slot.slot_type, SlotType::ResidualNorms))
+                    .expect("validated residual norms column"),
+            })
+        } else {
+            None
+        };
+
+        Ok(quantization)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quantization_initialized(&self) -> bool {
+        self.quantization.get().is_some()
     }
 
     /// Whether this segment contains the field's quantized storage slots. Field
     /// policy can enable quantization while a small flat segment stores no codes.
     pub fn has_quantized_storage(&self) -> bool {
-        self.quantization.is_some()
+        matches!(
+            self.rows_slice.meta.as_ref(),
+            VectorColMetadata::Quantized { .. }
+        )
     }
 
     /// Each cluster's posting-list size, in cluster order; `None` when the storage is not IVF.
@@ -848,7 +867,7 @@ mod tests {
                 rows_slice: blocks,
                 id_map: DeferredIdMap::ready(IdMap::Identity { num_docs: 3 }),
                 index: None,
-                quantization: None,
+                quantization: OnceLock::new(),
             };
             let mut decoded = Vec::new();
             let error = reader.read_doc_ids(0, &mut decoded).unwrap_err();
@@ -1019,7 +1038,7 @@ mod tests {
             }),
             rows_slice: blocks,
             index: None,
-            quantization: None,
+            quantization: OnceLock::new(),
         };
         let selected = [1, 2, 10, 11];
         let mut scratch = ReadScratch::default();

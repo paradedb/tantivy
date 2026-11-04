@@ -274,7 +274,7 @@ mod tests {
             let one = vec![0];
             let dense: Vec<u32> = (0..rows as u32).filter(|row| row % 10 != 0).collect();
             let every: Vec<u32> = (0..rows as u32).collect();
-            for (layer, layer_reader) in reader.quantization().unwrap().layers().iter().enumerate()
+            for (layer, layer_reader) in reader.quantization()?.unwrap().layers().iter().enumerate()
             {
                 let band_cost = layer_reader.band_cost(0)?;
                 let cost = |offsets: Option<&[u32]>| -> crate::Result<ReadCosts> {

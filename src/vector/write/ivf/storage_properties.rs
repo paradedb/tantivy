@@ -152,7 +152,7 @@ fn vector_read_kinds_follow_data_for_dense_and_sparse_access() -> crate::Result<
     let vectors =
         searcher.segment_readers()[0].vector_index(index.schema().get_field("embedding")?)?;
     let rows = vectors.index().unwrap().cluster_range(2);
-    let layers = vectors.quantization().unwrap().layers();
+    let layers = vectors.quantization()?.unwrap().layers();
     directory.read_kinds.lock().unwrap().clear();
 
     vectors.read_cluster_rows(2)?;
@@ -163,7 +163,7 @@ fn vector_read_kinds_follow_data_for_dense_and_sparse_access() -> crate::Result<
     sparse.read_codes(rows.start..rows.start + 1)?;
     sparse.read_sidecar()?;
     vectors
-        .quantization()
+        .quantization()?
         .unwrap()
         .read_residual_norms(rows.start..rows.start + 1)?;
     let mut scratch = crate::vector::storage::quantized::ReadScratch::default();
@@ -216,7 +216,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
     let label = index.schema().get_field("label")?;
     let vectors = segment.vector_index(field)?;
     let ivf = vectors.index().unwrap();
-    let quantized = vectors.quantization().unwrap();
+    let quantized = vectors.quantization()?.unwrap();
     let ctx = quantized.index_ctx();
     let metadata = vectors.metadata().unwrap();
     let slots = metadata.slots();

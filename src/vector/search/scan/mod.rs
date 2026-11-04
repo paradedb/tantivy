@@ -433,8 +433,11 @@ where
         tie_break: &'a mut K,
         tie_comparator: C,
     ) -> crate::Result<Self> {
-        let quantized = match (query.quantized, reader.quantization()) {
-            (Some(quantized), Some(field)) => Some(QuantizedState::new(
+        let quantized = if let Some(quantized) = query.quantized {
+            let field = reader.quantization()?.ok_or_else(|| {
+                DataCorruption::comment_only("quantized query requires quantized slots")
+            })?;
+            Some(QuantizedState::new(
                 quantized,
                 query.query.widened(),
                 field,
@@ -442,14 +445,9 @@ where
                 index,
                 segment_ord,
                 &config,
-            )),
-            (Some(_), None) => {
-                return Err(DataCorruption::comment_only(
-                    "quantized query requires quantized slots",
-                )
-                .into());
-            }
-            (None, _) => None,
+            ))
+        } else {
+            None
         };
         let layers = quantized.as_ref().map_or(0, |state| state.layers.len());
         Ok(Self {
