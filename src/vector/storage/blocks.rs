@@ -163,13 +163,14 @@ impl BlockMetadata {
 /// Lazy `(byte_offset, num_rows)` entries shared by routing and column readers.
 #[derive(Clone)]
 pub(crate) struct BlockOffsets {
-    data_slice: FileSlice,
+    offsets_slice: FileSlice,
+    offsets_start: usize,
     num_blocks: usize,
     num_rows: usize,
     metadata_end: usize,
 }
 impl BlockOffsets {
-    fn open(data_slice: FileSlice, metadata_end: usize) -> crate::Result<Self> {
+    fn open(data_slice: &FileSlice, metadata_end: usize) -> crate::Result<Self> {
         if data_slice.len() < 32 || data_slice.len() % ENTRY_ALIGN != 0 {
             return Err(DataCorruption::comment_only("invalid vector block footer").into());
         }
@@ -206,14 +207,15 @@ impl BlockOffsets {
             return Err(DataCorruption::comment_only("invalid empty vector blocks").into());
         }
         Ok(Self {
-            data_slice,
+            offsets_slice: data_slice.slice(start..start + offsets_len),
+            offsets_start: start,
             num_blocks: num_blocks as usize,
             num_rows: num_rows as usize,
             metadata_end,
         })
     }
     fn start(&self) -> usize {
-        self.data_slice.len() - 16 - (self.num_blocks + 1) * 16
+        self.offsets_start
     }
     pub(crate) fn num_blocks(&self) -> usize {
         self.num_blocks
@@ -225,10 +227,10 @@ impl BlockOffsets {
         if block >= self.num_blocks {
             return Err(DataCorruption::comment_only("vector block out of range").into());
         }
-        let at = self.start() + block * 16;
+        let at = block * 16;
         // Current tuple and the next byte offset, in one range read.
         let bytes = self
-            .data_slice
+            .offsets_slice
             .read_vector_bytes_slice(at..at + 24, VectorReadKind::Other)?;
         let word = |i: usize| u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
         let (start, count, end) = (word(0), word(8), word(16));
@@ -248,6 +250,7 @@ impl BlockOffsets {
 
 /// All blocks for one field, with eager metadata and lazy byte and row offsets.
 pub(crate) struct Blocks {
+    data_slice: FileSlice,
     offsets: BlockOffsets,
     pub(crate) metadata: Arc<VectorColMetadata>,
     pub(crate) schema: Vec<Slot>,
@@ -275,7 +278,7 @@ impl Blocks {
             meta,
             metadata_end,
         } = metadata;
-        let offsets = BlockOffsets::open(entry, metadata_end)?;
+        let offsets = BlockOffsets::open(&entry, metadata_end)?;
         if let Partition::Uniform { rows_per_block } = meta.field().partition {
             if offsets.num_blocks != offsets.num_rows.div_ceil(rows_per_block as usize) {
                 return Err(DataCorruption::comment_only("invalid uniform block count").into());
@@ -293,6 +296,7 @@ impl Blocks {
             }
         }
         Ok(Self {
+            data_slice: entry,
             offsets,
             metadata: meta,
             schema: slots,
@@ -340,7 +344,6 @@ impl Blocks {
         }
         if payload_end < end
             && self
-                .offsets
                 .data_slice
                 .read_vector_bytes_slice(payload_end..end, VectorReadKind::Other)?
                 .iter()
@@ -404,7 +407,7 @@ impl Block<'_> {
 
     /// A complete column as a lazy slice preserving the underlying storage geometry.
     pub(crate) fn column(&self, idx: usize) -> FileSlice {
-        self.blocks.offsets.data_slice.slice(self.column_range(idx))
+        self.blocks.data_slice.slice(self.column_range(idx))
     }
 
     /// A byte range relative to the block's start.
@@ -414,7 +417,6 @@ impl Block<'_> {
         }
         Ok(self
             .blocks
-            .offsets
             .data_slice
             .slice(self.bytes.start + range.start..self.bytes.start + range.end))
     }
@@ -443,7 +445,7 @@ impl Block<'_> {
                 .map(VectorReadKind::QuantizedLayer)
                 .unwrap_or_default(),
         };
-        Ok(self.blocks.offsets.data_slice.read_vector_bytes_slice(
+        Ok(self.blocks.data_slice.read_vector_bytes_slice(
             start + (rows.start - self.rows.start) * stride
                 ..start + (rows.end - self.rows.start) * stride,
             kind,
@@ -457,7 +459,7 @@ impl Block<'_> {
     }
 
     pub(crate) fn band_slice(&self, layer: usize) -> FileSlice {
-        self.blocks.offsets.data_slice.slice(self.band_range(layer))
+        self.blocks.data_slice.slice(self.band_range(layer))
     }
 
     /// Pins a band's payload in one read, sharing it among the decoded column views.
@@ -465,7 +467,6 @@ impl Block<'_> {
         let range = self.band_range(layer);
         let bytes = self
             .blocks
-            .offsets
             .data_slice
             .read_vector_bytes_slice(range.clone(), VectorReadKind::QuantizedLayer(layer as u8))?;
         Ok((range, bytes))

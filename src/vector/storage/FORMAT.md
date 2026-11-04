@@ -260,10 +260,12 @@ row-count limits, and the derived column lengths. Final-block padding is also
 checked when that block is accessed. No temporary `FileSlice` is needed for
 these tuple reads.
 
-`BlockOffsets` is a small cloneable handle to the Data entry, block and total-row
-counts, and metadata boundary. `Blocks` adds the decoded field metadata, column
-schema, and layer groupings. `ClusterIndex` shares a `BlockOffsets` handle so it
-can read cluster counts without depending on the vector columns.
+`BlockOffsets` holds a slice scoped to the tuple table and sentinel, block and
+total-row counts, and the entry-relative boundaries used to validate offsets.
+`Blocks` owns the full Data entry slice, decoded field metadata, column schema,
+and layer groupings. Block columns and padding are read directly from that Data
+slice. `ClusterIndex` shares a cheap clone of `BlockOffsets` so it can read cluster
+counts without depending on the vector columns.
 
 A `BlockAddress { block, row }` identifies a local row. `RowAddress` adds
 `segment_ord` to that address. Both coordinates are `u32`, matching the storage
