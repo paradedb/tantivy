@@ -726,16 +726,22 @@ impl Fixture {
                 .extend(self.centroid_reads().into_iter().map(|(_, range)| range));
             self.clear_reads();
             vectors.read_doc_ids(cluster, &mut docs)?;
-            ranges
-                .docs
-                .push(self.reads().first().map(|(_, range)| range.clone()));
+            ranges.docs.push(
+                self.reads()
+                    .into_iter()
+                    .map(|(_, range)| range)
+                    .find(|range| !ranges.directory.contains(range)),
+            );
             self.clear_reads();
             if !docs.is_empty() {
                 vectors.read_cluster_rows(cluster)?;
             }
-            ranges
-                .rows
-                .push(self.reads().first().map(|(_, range)| range.clone()));
+            ranges.rows.push(
+                self.reads()
+                    .into_iter()
+                    .map(|(_, range)| range)
+                    .find(|range| !ranges.directory.contains(range)),
+            );
         }
         self.clear_reads();
         Ok(ranges)

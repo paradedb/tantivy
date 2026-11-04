@@ -16,7 +16,7 @@ use crate::vector::quantization::{
     quantized_code_tail_is_zero, QUANTIZED_CONSTANT_STRIDE, QUANTIZED_ERROR_RATIO_STRIDE,
     QUANTIZED_GAMMA_STRIDE, QUANTIZED_SCALE_STRIDE,
 };
-use crate::vector::storage::blocks::Blocks;
+use crate::vector::storage::blocks::{Block, Blocks};
 use crate::vector::storage::io::{VectorRead, VectorReadKind};
 use crate::vector::storage::metadata::{SlotType, VectorColMetadata};
 use crate::vector::storage::reader::VectorRowChunk;
@@ -431,7 +431,7 @@ impl QuantizedLayerReader {
     }
     /// The cost of reading `cluster`'s whole band in one request.
     pub(crate) fn band_cost(&self, cluster: usize) -> crate::Result<ReadCost> {
-        let band = self.blocks.band_slice(cluster, self.layer)?;
+        let band = self.blocks.block(cluster)?.band_slice(self.layer);
         Ok(range_cost(&band, 0..band.len(), band.storage_block_len()))
     }
     /// The cost of reading `cluster`'s rows at `offsets` sparsely: their planned code runs, the
@@ -487,10 +487,21 @@ impl QuantizedLayerReader {
         Ok(bytes)
     }
     pub(crate) fn read_sidecar(&self, rows: Range<usize>) -> crate::Result<QuantizedSidecarBatch> {
+        // Preserve the empty-span behavior of the column reader.
+        if rows.start == rows.end && rows.end <= self.blocks.num_rows() {
+            return Ok(QuantizedSidecarBatch {
+                scales: OwnedBytes::empty(),
+                gammas: OwnedBytes::empty(),
+                error_ratios: OwnedBytes::empty(),
+                constants: None,
+                rows,
+            });
+        }
+        let block = self.blocks.block_for_range(&rows)?;
         Ok(QuantizedSidecarBatch {
-            scales: self.blocks.read_column(self.scales, rows.clone())?,
-            gammas: self.blocks.read_column(self.gammas, rows.clone())?,
-            error_ratios: self.blocks.read_column(self.errors, rows.clone())?,
+            scales: block.read_column(self.scales, rows.clone())?,
+            gammas: block.read_column(self.gammas, rows.clone())?,
+            error_ratios: block.read_column(self.errors, rows.clone())?,
             constants: None,
             rows,
         })
@@ -503,8 +514,8 @@ impl QuantizedLayerReader {
     /// Pins one band's columns in a single request, then restricts views to the requested rows.
     #[cfg(test)]
     pub(crate) fn read_batch(&self, rows: Range<usize>) -> crate::Result<QuantizedLayerBatch> {
-        let b = self.blocks.block_for_range(&rows)?;
-        self.read_batch_in_block(b, rows)
+        let block = self.blocks.block_for_range(&rows)?;
+        self.read_batch_from_block(&block, rows)
     }
     /// Uses a known block without resolving its global row range again.
     pub(crate) fn read_batch_in_block(
@@ -512,18 +523,20 @@ impl QuantizedLayerReader {
         b: usize,
         rows: Range<usize>,
     ) -> crate::Result<QuantizedLayerBatch> {
-        self.blocks.check_block_rows(b, &rows)?;
-        let (span, bytes) = self.blocks.read_band(b, self.layer)?;
-        let address = self.blocks.address(b)?;
+        self.read_batch_from_block(&self.blocks.block(b)?, rows)
+    }
+
+    fn read_batch_from_block(
+        &self,
+        block: &Block<'_>,
+        rows: Range<usize>,
+    ) -> crate::Result<QuantizedLayerBatch> {
+        block.check_rows(&rows)?;
+        let (span, bytes) = block.read_band(self.layer)?;
         let view = |idx: usize| -> OwnedBytes {
-            let column = crate::vector::storage::blocks::column_range(
-                &self.blocks.slots,
-                address.rows.len(),
-                idx,
-            );
-            let start = address.bytes.start + column.start - span.start;
-            let stride = self.blocks.slots[idx].stride as usize;
-            let first = address.rows.start;
+            let start = block.column_range(idx).start - span.start;
+            let stride = self.blocks.schema[idx].stride as usize;
+            let first = block.row_range().start;
             bytes.slice(start + (rows.start - first) * stride..start + (rows.end - first) * stride)
         };
         let codes = view(self.codes);
@@ -537,7 +550,7 @@ impl QuantizedLayerReader {
             residual_norms: self.has_norms().then(|| {
                 view(
                     self.blocks
-                        .slots
+                        .schema
                         .iter()
                         .position(|slot| matches!(slot.slot_type, SlotType::ResidualNorms))
                         .expect("validated residual norms column"),
@@ -699,11 +712,12 @@ impl QuantizedLayerReader {
         &self,
         block: usize,
     ) -> crate::Result<QuantizedClusterReader<'_>> {
+        let block = self.blocks.block(block)?;
         Ok(QuantizedClusterReader {
             layer: self,
+            rows: block.row_range(),
+            codes: block.column(self.codes),
             block,
-            rows: self.blocks.row_range(block)?,
-            codes: self.blocks.column(block, self.codes)?,
         })
     }
     #[cfg(test)]
@@ -731,7 +745,7 @@ impl QuantizedLayerReader {
 /// Block-local code geometry and sidecar addressing for one selected cluster.
 pub(crate) struct QuantizedClusterReader<'a> {
     layer: &'a QuantizedLayerReader,
-    block: usize,
+    block: Block<'a>,
     pub(crate) rows: Range<usize>,
     codes: FileSlice,
 }
@@ -752,10 +766,10 @@ impl QuantizedClusterReader<'_> {
     /// Reads an ordered code range directly; code padding is checked before scoring.
     pub(crate) fn read_codes(&self, rows: Range<usize>) -> crate::Result<OwnedBytes> {
         let stride = self.layer.code_stride;
-        let bytes = self
-            .codes
-            .slice((rows.start - self.rows.start) * stride..(rows.end - self.rows.start) * stride)
-            .read_vector_bytes(VectorReadKind::QuantizedLayer(self.layer.layer as u8))?;
+        let bytes = self.codes.read_vector_bytes_slice(
+            (rows.start - self.rows.start) * stride..(rows.end - self.rows.start) * stride,
+            VectorReadKind::QuantizedLayer(self.layer.layer as u8),
+        )?;
         self.layer.validate_codes(&bytes, &rows)?;
         Ok(bytes)
     }
@@ -767,13 +781,13 @@ impl QuantizedClusterReader<'_> {
         use crate::vector::storage::blocks::column_range;
         let layer = self.layer;
         let blocks = &layer.blocks;
-        let n = blocks.rows_in(self.block)?;
-        let first = column_range(&blocks.slots, n, layer.scales).start;
+        let n = self.block.num_rows();
+        let first = column_range(&blocks.schema, n, layer.scales).start;
         let bytes = self
             .sidecar_slice()?
             .read_vector_bytes(VectorReadKind::QuantizedLayer(self.layer.layer as u8))?;
         let view = |idx| {
-            let column = column_range(&blocks.slots, n, idx);
+            let column = column_range(&blocks.schema, n, idx);
             bytes.slice(column.start - first..column.end - first)
         };
         Ok(QuantizedSidecarBatch {
@@ -790,21 +804,21 @@ impl QuantizedClusterReader<'_> {
         use crate::vector::storage::blocks::column_range;
         let layer = self.layer;
         let blocks = &layer.blocks;
-        let n = blocks.rows_in(self.block)?;
-        let first = column_range(&blocks.slots, n, layer.scales).start;
-        let last = column_range(&blocks.slots, n, layer.constants.unwrap_or(layer.errors)).end;
-        blocks.block_slice(self.block, first..last)
+        let n = self.block.num_rows();
+        let first = column_range(&blocks.schema, n, layer.scales).start;
+        let last = column_range(&blocks.schema, n, layer.constants.unwrap_or(layer.errors)).end;
+        self.block.byte_slice(first..last)
     }
 
     /// The cluster's residual-norms column, stored in layer 0's band.
     fn norms_slice(&self) -> crate::Result<FileSlice> {
         let blocks = &self.layer.blocks;
         let idx = blocks
-            .slots
+            .schema
             .iter()
             .position(|slot| matches!(slot.slot_type, SlotType::ResidualNorms))
             .ok_or_else(|| DataCorruption::comment_only("missing residual norms column"))?;
-        blocks.column(self.block, idx)
+        Ok(self.block.column(idx))
     }
 
     /// Reads the cluster's residual norms in one request.
@@ -828,25 +842,25 @@ fn plan_block_column(
     ranges.clear();
     let mut selected = rows;
     while let Some(&row) = selected.first() {
-        let b = blocks.block_of(row)?;
-        let first = blocks.row_range(b)?.start;
-        let end = blocks.row_range(b)?.end;
+        let block = blocks.block(blocks.block_of(row)?)?;
+        let first = block.row_range().start;
+        let end = block.row_range().end;
         let count = selected.partition_point(|&r| r < end);
         if matches!(
-            blocks.slots[idx].slot_type,
+            blocks.schema[idx].slot_type,
             SlotType::QuantLayerCodes { .. }
         ) {
             QuantizedLayerReader::plan_code_slot_reads(
-                &blocks.column(b, idx)?,
-                blocks.slots[idx].stride as usize,
+                &block.column(idx),
+                blocks.schema[idx].stride as usize,
                 first,
                 &selected[..count],
                 ranges,
             );
         } else {
             QuantizedLayerReader::plan_slot_reads(
-                &blocks.column(b, idx)?,
-                blocks.slots[idx].stride as usize,
+                &block.column(idx),
+                blocks.schema[idx].stride as usize,
                 first,
                 available.start.max(first)..available.end.min(end),
                 &selected[..count],
@@ -930,7 +944,7 @@ mod tests {
     use super::*;
     use crate::schema::{Metric, VectorOptions};
     use crate::vector::quantization::{quantized_code_stride, VectorQuantizationConfig};
-    use crate::vector::storage::blocks::BlockRows;
+    use crate::vector::storage::blocks::RowOffsets;
     use crate::vector::storage::io::test_support::{BlockTrackedBytes, TrackedReads};
 
     fn test_layer(
@@ -1027,7 +1041,7 @@ mod tests {
             Blocks::open(
                 entry,
                 &opts,
-                BlockRows::clusters(&offsets.iter().map(|&n| n as u64).collect::<Vec<_>>()),
+                RowOffsets::clusters(&offsets.iter().map(|&n| n as u64).collect::<Vec<_>>()),
             )
             .unwrap(),
         );
@@ -1085,15 +1099,49 @@ mod tests {
             1,
             Some((Arc::clone(&reads), 32)),
         );
-        layer.blocks.row_range(0)?;
+        let block = layer.blocks.block(0)?;
         reads.lock().unwrap().clear();
-        let rows = layer.blocks.read_column(0, 0..3)?;
+        let rows = block.read_column(0, 0..3)?;
         assert_eq!(rows.len(), 3 * 64 * 4);
-        let start = layer.blocks.block_start(0)?;
+        let start = block.column_range(0).start;
         assert_eq!(&*reads.lock().unwrap(), &[start..start + rows.len()]);
         reads.lock().unwrap().clear();
-        layer.read_batch(0..3)?;
-        assert_eq!(&*reads.lock().unwrap(), &[layer.blocks.layer_span(0, 0)?]);
+        layer.read_batch_from_block(&block, 0..3)?;
+        assert_eq!(&*reads.lock().unwrap(), &[block.band_range(0)]);
+        Ok(())
+    }
+
+    #[test]
+    fn cluster_reuses_boundaries_for_codes_sidecars_and_norms() -> crate::Result<()> {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let layer = test_layer_tracked(
+            FileSlice::from(Vec::new()),
+            FileSlice::from(Vec::new()),
+            None,
+            &[0, 3],
+            64,
+            1,
+            Some((Arc::clone(&reads), 32)),
+        );
+        let cluster = layer.cluster_in_block(0)?;
+        let codes = cluster.block.column_range(layer.codes);
+        let sidecar = cluster.block.column_range(layer.scales).start
+            ..cluster.block.column_range(layer.errors).end;
+        let norms = layer
+            .blocks
+            .schema
+            .iter()
+            .position(|slot| matches!(slot.slot_type, SlotType::ResidualNorms))
+            .unwrap();
+        let norms = cluster.block.column_range(norms);
+        reads.lock().unwrap().clear();
+        cluster.read_codes(0..1)?;
+        cluster.read_sidecar()?;
+        cluster.read_norms()?;
+        assert_eq!(
+            *reads.lock().unwrap(),
+            [codes.start..codes.start + layer.code_stride, sidecar, norms],
+        );
         Ok(())
     }
 
@@ -1268,13 +1316,13 @@ mod tests {
             1,
             Some((Arc::clone(&reads), 16)),
         );
-        reader.blocks.block_for_range(&(0..8))?;
+        let block = reader.blocks.block_for_range(&(0..8))?;
         reads.lock().unwrap().clear();
         let (batch, totals) = crate::vector::telemetry::measure(|| {
             let _stage = crate::vector::telemetry::enter_vector_stage(
                 crate::vector::VectorStage::LayerScan(0),
             );
-            reader.read_batch(0..8)
+            reader.read_batch_from_block(&block, 0..8)
         });
         let batch = batch?;
         assert_eq!(reads.lock().unwrap().len(), 1);
@@ -1403,7 +1451,7 @@ mod tests {
                     let blocks = Arc::new(Blocks::open(
                         entry,
                         &opts,
-                        BlockRows::clusters(
+                        RowOffsets::clusters(
                             &boundaries.iter().map(|&n| n as u64).collect::<Vec<_>>(),
                         ),
                     )?);

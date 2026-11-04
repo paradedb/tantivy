@@ -44,14 +44,14 @@ impl ClusterOffsets {
         if slice.len() < 8 || slice.len() % 8 != 0 {
             return Err(DataCorruption::comment_only("invalid cluster offset length").into());
         }
-        let first = slice.slice_to(8).read_bytes()?;
+        let first = slice.read_bytes_slice(0..8)?;
         if u64::from_le_bytes(first.as_slice().try_into().unwrap()) != 0 {
             return Err(DataCorruption::comment_only("cluster offsets must start at zero").into());
         }
         let last = if slice.len() == 8 {
             first
         } else {
-            slice.slice_from(slice.len() - 8).read_bytes()?
+            slice.read_bytes_slice(slice.len() - 8..slice.len())?
         };
         let num_rows = u64::from_le_bytes(last.as_slice().try_into().unwrap());
         if num_rows > u64::from(u32::MAX) {
@@ -77,8 +77,7 @@ impl ClusterOffsets {
         }
         let bytes = self
             .slice
-            .slice(cluster * 8..(cluster + 2) * 8)
-            .read_vector_bytes(VectorReadKind::Other)?;
+            .read_vector_bytes_slice(cluster * 8..(cluster + 2) * 8, VectorReadKind::Other)?;
         let first = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         let last = u64::from_le_bytes(bytes[8..].try_into().unwrap());
         if first > last || last > self.num_rows as u64 {
@@ -246,7 +245,8 @@ impl ClusterIndex {
     /// Per-cluster posting-list sizes, in cluster order — memberships, like
     /// [`Self::num_rows`].
     pub(crate) fn cluster_sizes(&self) -> impl Iterator<Item = crate::Result<usize>> + '_ {
-        (0..self.num_centroids).map(|cluster| self.blocks.rows_in(cluster))
+        (0..self.num_centroids)
+            .map(|cluster| self.blocks.block(cluster).map(|block| block.num_rows()))
     }
 
     /// One centroid row as a file slice.
