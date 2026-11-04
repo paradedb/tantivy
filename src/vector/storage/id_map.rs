@@ -140,6 +140,7 @@ impl IdMap {
             let bytes = body
                 .slice(start..end)
                 .read_vector_bytes(VectorReadKind::Other)?;
+            // TODO: Group location validation by cluster to avoid per-document offset reads.
             for &doc in &docs[first..last] {
                 let at = doc as usize * 8 - start;
                 if let Some(location) = decode_location(&bytes[at..at + 8], &rows)? {

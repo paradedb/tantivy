@@ -119,6 +119,8 @@ pub(crate) fn forced_plan(
 
 /// Prices the rows of `selected` at `spec`'s layer, and exactly through `exact` when the exact plan
 /// is on. A sparse price leaves its rows and code runs in `scratch` for the read.
+// TODO: Re-write the price method to re-use the block / cluster instead of re-fetching it for each
+// estimate.
 pub(crate) fn price(
     spec: &LayerSpec<'_>,
     exact: Option<&VectorIndexReader>,
