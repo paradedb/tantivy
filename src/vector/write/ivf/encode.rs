@@ -18,9 +18,9 @@ use crate::vector::storage::blocks::{
     block_len, column_range, pad, write_metadata, BlockOffsetsWriter,
 };
 use crate::vector::storage::header::{VectorEntry, HEADER_LEN};
-use crate::vector::storage::id_map::DocLocation;
+use crate::vector::storage::id_map::IdMap;
 use crate::vector::storage::metadata::{Slot, SlotType, VectorColMetadata};
-use crate::vector::ENTRY_ALIGN;
+use crate::vector::{BlockAddress, ENTRY_ALIGN};
 use crate::TantivyError;
 
 /// The stored centroid rows, normalized as the field's vectors are.
@@ -61,7 +61,7 @@ pub(super) fn write_data_entry(
     cluster_offsets: &[u64],
     centroid_bytes: &[u8],
     timings: &mut IvfBuildTimings,
-) -> crate::Result<Vec<DocLocation>> {
+) -> crate::Result<Vec<BlockAddress>> {
     let (ctx, opts, quantization) = (merge.ctx, merge.opts, merge.quantization);
     let num_centroids = cluster_offsets.len() - 1;
     let centroid_stride = opts.bytes_per_vector();
@@ -73,7 +73,7 @@ pub(super) fn write_data_entry(
             "too many clusters for document locations".into(),
         ));
     }
-    let mut locations = vec![DocLocation::ABSENT; merge.num_target_docs as usize];
+    let mut locations = IdMap::empty_locations(merge.num_target_docs);
     timings.id_map_write = id_map_start.elapsed();
 
     // Data entry: metadata followed by aligned cluster blocks.
@@ -136,10 +136,8 @@ pub(super) fn write_data_entry(
             for assigned in tile {
                 timings.encode_reads += 1;
                 bufs[1].extend_from_slice(&assigned.target_doc_id.to_le_bytes());
-                locations[assigned.target_doc_id as usize] = DocLocation {
-                    cluster: cluster as u32,
-                    local,
-                };
+                locations[assigned.target_doc_id as usize] =
+                    BlockAddress::new(cluster as u32, local);
                 local += 1;
                 let bytes = merge.readers[assigned.source.segment_ord as usize]
                     .vector_bytes_for_row(assigned.source.block_address)?;

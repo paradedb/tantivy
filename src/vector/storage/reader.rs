@@ -21,7 +21,7 @@ use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::header::{
     read_centroid_header, read_vector_header, CentroidSlot, VectorEntry, CENTROIDS_EXT, VEC_EXT,
 };
-use crate::vector::storage::id_map::{DocLocation, IdMap};
+use crate::vector::storage::id_map::IdMap;
 use crate::vector::storage::io::{VectorRead, VectorReadKind};
 use crate::vector::storage::metadata::{SlotType, VectorColMetadata};
 use crate::vector::storage::quantized::{
@@ -605,12 +605,10 @@ impl VectorIndexReader {
         let clustered = self.rows_slice.clustered();
         let map = self.id_map.get(clustered)?;
         if clustered {
-            Ok(map
-                .locate(doc_id, |block| {
-                    self.rows_slice.row_range(block).map_err(io::Error::other)
-                })
-                .map_err(|e| DataCorruption::comment_only(e.to_string()))?
-                .map(|loc| BlockAddress::new(loc.cluster, loc.local)))
+            map.locate(doc_id, |block| {
+                self.rows_slice.row_range(block).map_err(io::Error::other)
+            })
+            .map_err(|e| DataCorruption::comment_only(e.to_string()).into())
         } else {
             let crate::vector::storage::metadata::Partition::Uniform { rows_per_block } =
                 self.rows_slice.metadata.field().partition
@@ -710,7 +708,7 @@ impl VectorIndexReader {
     pub(crate) fn locate_docs(
         &self,
         docs: &[DocId],
-        out: &mut Vec<(DocId, DocLocation)>,
+        out: &mut Vec<(DocId, BlockAddress)>,
     ) -> crate::Result<()> {
         self.id_map
             .get(true)?
@@ -767,23 +765,12 @@ mod tests {
     // Opening reads only the tag; a lookup reads exactly its eight-byte record.
     #[test]
     fn location_lookup_reads_one_record_and_defers_entry() -> crate::Result<()> {
-        use crate::vector::storage::id_map::DocLocation;
         let reads = Arc::new(Mutex::new(Vec::new()));
         let mut bytes = Vec::new();
-        IdMap::serialize_locations(
-            &[
-                DocLocation::ABSENT,
-                DocLocation {
-                    cluster: 0,
-                    local: 0,
-                },
-                DocLocation {
-                    cluster: 0,
-                    local: 1,
-                },
-            ],
-            &mut bytes,
-        )?;
+        let mut locations = IdMap::empty_locations(3);
+        locations[1] = BlockAddress::new(0, 0);
+        locations[2] = BlockAddress::new(0, 1);
+        IdMap::serialize_locations(&locations, &mut bytes)?;
         let map = DeferredIdMap {
             source: Some((
                 tracked_id_composite(bytes, &reads),
@@ -801,10 +788,7 @@ mod tests {
                 2,
                 crate::vector::storage::id_map::tests::boundaries(&[0, 2])
             )?,
-            Some(DocLocation {
-                cluster: 0,
-                local: 1
-            })
+            Some(BlockAddress::new(0, 1))
         );
         assert_eq!(&*reads.lock().unwrap(), &[17..25]);
         Ok(())
