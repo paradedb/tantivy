@@ -1,7 +1,7 @@
 use std::ops::{Deref, DerefMut};
 
 use crate::docset::SeekDangerResult;
-use crate::query::scorer::PruningScorer;
+use crate::query::scorer::{BlockMaxScorer, PruningScorer};
 use crate::query::term_query::TermScorer;
 #[cfg(test)]
 use crate::query::weight::for_each_pruning_scorer;
@@ -12,7 +12,7 @@ use crate::{DocId, DocSet, Score, TERMINATED};
 /// asked about a doc below its current one: `PhraseScorer::seek_danger` asserts
 /// against that, and an `Intersection` of `RangeDocSet`s overflows on it. A new
 /// filter is on its first match, so the skipped docs cannot match.
-pub(super) fn seek_to_filter_start(scorer: &mut TermScorer, filter: &dyn DocSet) {
+pub(super) fn seek_to_filter_start<T: DocSet + ?Sized>(scorer: &mut T, filter: &dyn DocSet) {
     let filter_doc = filter.doc();
     if scorer.doc() < filter_doc {
         scorer.seek(filter_doc);
@@ -28,8 +28,8 @@ pub(super) fn seek_to_filter_start(scorer: &mut TermScorer, filter: &dyn DocSet)
 /// We always have `before_pivot_len` < `pivot_len`.
 ///
 /// `None` is returned if we establish that no document can exceed the threshold.
-fn find_pivot_doc(
-    term_scorers: &[TermScorerWithMaxScore],
+fn find_pivot_doc<T: BlockMaxScorer>(
+    term_scorers: &[TermScorerWithMaxScore<T>],
     threshold: Score,
 ) -> Option<(usize, usize, DocId)> {
     let mut max_score = 0.0;
@@ -61,8 +61,8 @@ fn find_pivot_doc(
 /// the next doc candidate defined by the min of `last_doc_in_block + 1` for
 /// scorer in scorers[..pivot_len] and `scorer.doc()` for scorer in scorers[pivot_len..].
 /// Note: before and after calling this method, scorers need to be sorted by their `.doc()`.
-fn block_max_was_too_low_advance_one_scorer(
-    scorers: &mut [TermScorerWithMaxScore],
+fn block_max_was_too_low_advance_one_scorer<T: BlockMaxScorer>(
+    scorers: &mut [TermScorerWithMaxScore<T>],
     pivot_len: usize,
 ) {
     debug_assert!(scorers.iter().map(|scorer| scorer.doc()).is_sorted());
@@ -97,7 +97,7 @@ fn block_max_was_too_low_advance_one_scorer(
 // Given a list of term_scorers and a `ord` and assuming that `term_scorers[ord]` is sorted
 // except term_scorers[ord] that might be in advance compared to its ranks,
 // bubble up term_scorers[ord] in order to restore the ordering.
-fn restore_ordering(term_scorers: &mut [TermScorerWithMaxScore], ord: usize) {
+fn restore_ordering<T: BlockMaxScorer>(term_scorers: &mut [TermScorerWithMaxScore<T>], ord: usize) {
     let doc = term_scorers[ord].doc();
     for i in ord + 1..term_scorers.len() {
         if term_scorers[i].doc() >= doc {
@@ -113,8 +113,8 @@ fn restore_ordering(term_scorers: &mut [TermScorerWithMaxScore], ord: usize) {
 // If this fails (ie: one of the term_scorer does not contain `pivot_doc` and seek goes past the
 // pivot), reorder the term_scorers to ensure the list is still sorted and returns `false`.
 // If a term_scorer reach TERMINATED in the process return false remove the term_scorer and return.
-fn align_scorers(
-    term_scorers: &mut Vec<TermScorerWithMaxScore>,
+fn align_scorers<T: BlockMaxScorer>(
+    term_scorers: &mut Vec<TermScorerWithMaxScore<T>>,
     pivot_doc: DocId,
     before_pivot_len: usize,
 ) -> bool {
@@ -141,7 +141,10 @@ fn align_scorers(
 // Assumes terms_scorers[..pivot_len] are positioned on the same doc (pivot_doc).
 // Advance term_scorers[..pivot_len] and out of these removes the terminated scores.
 // Restores the ordering of term_scorers.
-fn advance_all_scorers_on_pivot(term_scorers: &mut Vec<TermScorerWithMaxScore>, pivot_len: usize) {
+fn advance_all_scorers_on_pivot<T: BlockMaxScorer>(
+    term_scorers: &mut Vec<TermScorerWithMaxScore<T>>,
+    pivot_len: usize,
+) {
     if pivot_len == 1 {
         if term_scorers[0].advance() == TERMINATED {
             term_scorers.swap_remove(0);
@@ -190,28 +193,28 @@ pub fn block_wand_single_scorer(
     for_each_pruning_scorer(&mut scorer, callback);
 }
 
-struct TermScorerWithMaxScore {
-    scorer: Box<TermScorer>,
+struct TermScorerWithMaxScore<T: BlockMaxScorer = TermScorer> {
+    scorer: Box<T>,
     max_score: Score,
 }
 
-impl From<TermScorer> for TermScorerWithMaxScore {
-    fn from(scorer: TermScorer) -> Self {
-        let scorer = Box::new(scorer);
+impl<T: BlockMaxScorer> From<T> for TermScorerWithMaxScore<T> {
+    fn from(scorer: T) -> Self {
         let max_score = scorer.max_score();
+        let scorer = Box::new(scorer);
         TermScorerWithMaxScore { scorer, max_score }
     }
 }
 
-impl Deref for TermScorerWithMaxScore {
-    type Target = TermScorer;
+impl<T: BlockMaxScorer> Deref for TermScorerWithMaxScore<T> {
+    type Target = T;
 
     fn deref(&self) -> &Self::Target {
         &self.scorer
     }
 }
 
-impl DerefMut for TermScorerWithMaxScore {
+impl<T: BlockMaxScorer> DerefMut for TermScorerWithMaxScore<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.scorer
     }
@@ -228,16 +231,16 @@ impl DerefMut for TermScorerWithMaxScore {
 /// # Preconditions
 /// - `scorers` has at least 2 elements
 /// - All scorers read frequencies (`FreqReadingOption::ReadFreq`)
-pub struct BlockWandUnionScorer {
-    scorers: Vec<TermScorerWithMaxScore>,
+pub struct BlockWandUnionScorer<T: BlockMaxScorer = TermScorer> {
+    scorers: Vec<TermScorerWithMaxScore<T>>,
     filter: Option<Box<dyn DocSet>>,
     filter_boost: Score,
     threshold: Score,
     current: (DocId, Score),
 }
-impl BlockWandUnionScorer {
+impl<T: BlockMaxScorer> BlockWandUnionScorer<T> {
     /// Construction positions `current` on the first match
-    pub fn new(scorers: Vec<TermScorer>, threshold: Score) -> Self {
+    pub fn new(scorers: Vec<T>, threshold: Score) -> Self {
         Self::with_filter_and_boost(scorers, threshold, None, 0.0)
     }
 
@@ -247,7 +250,7 @@ impl BlockWandUnionScorer {
     /// `filter_boost` is added to matching document scores and accounted for in the
     /// internal pruning threshold.
     pub fn with_filter(
-        scorers: Vec<TermScorer>,
+        scorers: Vec<T>,
         threshold: Score,
         filter: Box<dyn DocSet>,
         filter_boost: Score,
@@ -256,7 +259,7 @@ impl BlockWandUnionScorer {
     }
 
     fn with_filter_and_boost(
-        mut scorers: Vec<TermScorer>,
+        mut scorers: Vec<T>,
         threshold: Score,
         filter: Option<Box<dyn DocSet>>,
         filter_boost: Score,
@@ -268,7 +271,7 @@ impl BlockWandUnionScorer {
             }
         }
         scorers.retain(|scorer| scorer.doc() < TERMINATED);
-        let mut scorers: Vec<TermScorerWithMaxScore> = scorers
+        let mut scorers: Vec<TermScorerWithMaxScore<T>> = scorers
             .into_iter()
             .map(TermScorerWithMaxScore::from)
             .collect();
@@ -287,19 +290,19 @@ impl BlockWandUnionScorer {
         scorer
     }
 }
-impl Scorer for BlockWandUnionScorer {
+impl<T: BlockMaxScorer> Scorer for BlockWandUnionScorer<T> {
     #[inline]
     fn score(&mut self) -> Score {
         self.current.1
     }
 }
-impl PruningScorer for BlockWandUnionScorer {
+impl<T: BlockMaxScorer> PruningScorer for BlockWandUnionScorer<T> {
     #[inline]
     fn set_threshold(&mut self, score: Score) {
         self.threshold = score;
     }
 }
-impl DocSet for BlockWandUnionScorer {
+impl<T: BlockMaxScorer> DocSet for BlockWandUnionScorer<T> {
     fn advance(&mut self) -> DocId {
         // hoist threshold into a local while we loop to avoid going to memory
         let threshold = self.threshold;
@@ -426,16 +429,16 @@ impl DocSet for BlockWandUnionScorer {
 ///
 /// # Preconditions
 /// - The scorer reads frequencies (`FreqReadingOption::ReadFreq`)
-pub struct BlockWandSingleScorer {
-    scorer: TermScorer,
+pub struct BlockWandSingleScorer<T: BlockMaxScorer = TermScorer> {
+    scorer: T,
     filter: Option<Box<dyn DocSet>>,
     filter_boost: Score,
     threshold: Score,
     current: (DocId, Score),
 }
-impl BlockWandSingleScorer {
+impl<T: BlockMaxScorer> BlockWandSingleScorer<T> {
     /// Construction positions `current` on the first match
-    pub fn new(term_scorer: TermScorer, threshold: Score) -> Self {
+    pub fn new(term_scorer: T, threshold: Score) -> Self {
         Self::with_filter_and_boost(term_scorer, threshold, None, 0.0)
     }
 
@@ -445,7 +448,7 @@ impl BlockWandSingleScorer {
     /// `filter_boost` is added to matching document scores and accounted for in the
     /// internal pruning threshold.
     pub fn with_filter(
-        term_scorer: TermScorer,
+        term_scorer: T,
         threshold: Score,
         filter: Box<dyn DocSet>,
         filter_boost: Score,
@@ -454,7 +457,7 @@ impl BlockWandSingleScorer {
     }
 
     fn with_filter_and_boost(
-        mut term_scorer: TermScorer,
+        mut term_scorer: T,
         threshold: Score,
         filter: Option<Box<dyn DocSet>>,
         filter_boost: Score,
@@ -474,20 +477,20 @@ impl BlockWandSingleScorer {
         scorer
     }
 }
-impl Scorer for BlockWandSingleScorer {
+impl<T: BlockMaxScorer> Scorer for BlockWandSingleScorer<T> {
     #[inline]
     fn score(&mut self) -> Score {
         self.current.1
     }
 }
-impl PruningScorer for BlockWandSingleScorer {
+impl<T: BlockMaxScorer> PruningScorer for BlockWandSingleScorer<T> {
     #[inline]
     fn set_threshold(&mut self, score: Score) {
         self.threshold = score;
     }
 }
 
-impl DocSet for BlockWandSingleScorer {
+impl<T: BlockMaxScorer> DocSet for BlockWandSingleScorer<T> {
     fn advance(&mut self) -> DocId {
         if self.doc() == TERMINATED || self.scorer.doc() == TERMINATED {
             self.current = (TERMINATED, Score::MIN);
