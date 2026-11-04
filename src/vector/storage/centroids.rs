@@ -6,12 +6,13 @@
 //! The on-disk file is a 4-byte format-version stamp (see `vector::storage::header`)
 //! followed by a [`CompositeFile`](crate::directory::CompositeFile). Written
 //! per field, only for IVF segments (⟺ the field's `.vec` `IdMap` is
-//! `DocLocations`). The composite has three slots per field:
+//! `DocLocations`). The composite has four slots per field:
 //!
 //! ```text
 //! [0] num_centroids (u32) + num_docs (u32) + centroid_bytes (N · stride),
 //!     rows in the router's canonical cluster-sorted order when a stacked
 //!     router was built
+//! [1] cumulative cluster row offsets (N + 1 little-endian u64s)
 //! [2] a router-kind byte followed by the selected router's payload, REQUIRED
 //! ```
 //!
@@ -25,11 +26,67 @@ use common::{BinarySerializable, HasLen, OwnedBytes};
 
 use super::blocks::Blocks;
 use crate::directory::FileSlice;
+use crate::error::DataCorruption;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RoutingParams};
 use crate::vector::search::prepared::VectorQuery;
 use crate::vector::storage::io::{VectorRead, VectorReadKind};
 use crate::vector::VectorElement;
+
+/// Lazy cumulative row offsets from slot 1 of `.centroids`.
+pub(crate) struct ClusterOffsets {
+    slice: FileSlice,
+    num_rows: usize,
+}
+
+impl ClusterOffsets {
+    pub(crate) fn open(slice: FileSlice) -> crate::Result<Self> {
+        if slice.len() < 8 || slice.len() % 8 != 0 {
+            return Err(DataCorruption::comment_only("invalid cluster offset length").into());
+        }
+        let first = slice.slice_to(8).read_bytes()?;
+        if u64::from_le_bytes(first.as_slice().try_into().unwrap()) != 0 {
+            return Err(DataCorruption::comment_only("cluster offsets must start at zero").into());
+        }
+        let last = if slice.len() == 8 {
+            first
+        } else {
+            slice.slice_from(slice.len() - 8).read_bytes()?
+        };
+        let num_rows = u64::from_le_bytes(last.as_slice().try_into().unwrap());
+        if num_rows > u64::from(u32::MAX) {
+            return Err(DataCorruption::comment_only("cluster row count overflow").into());
+        }
+        Ok(Self {
+            slice,
+            num_rows: num_rows as usize,
+        })
+    }
+
+    pub(crate) fn num_clusters(&self) -> usize {
+        self.slice.len() / 8 - 1
+    }
+
+    pub(crate) fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    pub(crate) fn range(&self, cluster: usize) -> crate::Result<Range<usize>> {
+        if cluster >= self.num_clusters() {
+            return Err(DataCorruption::comment_only("cluster offset out of range").into());
+        }
+        let bytes = self
+            .slice
+            .slice(cluster * 8..(cluster + 2) * 8)
+            .read_vector_bytes(VectorReadKind::Other)?;
+        let first = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let last = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+        if first > last || last > self.num_rows as u64 {
+            return Err(DataCorruption::comment_only("invalid cluster row boundaries").into());
+        }
+        Ok(first as usize..last as usize)
+    }
+}
 
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
@@ -46,7 +103,7 @@ pub(crate) struct ClusterIndex {
     centroids_slice: FileSlice,
     /// Bytes per centroid row: the field's vector stride.
     centroid_stride: usize,
-    /// The single directory shared with vector-column readers.
+    /// Lazy byte and row boundaries shared with vector-column readers.
     blocks: Arc<Blocks>,
     metric: Metric,
     router: OpenedRouter,
@@ -235,4 +292,47 @@ impl ClusterIndex {
         debug_assert_eq!(query.metric(), self.metric);
         self.router.rank(query, params)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cluster_offsets_validate_framing_and_requested_boundaries() -> crate::Result<()> {
+        let encode = |values: &[u64]| -> FileSlice {
+            FileSlice::from(
+                values
+                    .iter()
+                    .flat_map(|n| n.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for bytes in [vec![], vec![0; 7], vec![0; 9]] {
+            assert!(ClusterOffsets::open(FileSlice::from(bytes)).is_err());
+        }
+        for values in [&[1][..], &[1, 2], &[0, u64::MAX]] {
+            assert!(ClusterOffsets::open(encode(values)).is_err());
+        }
+        let empty = ClusterOffsets::open(encode(&[0]))?;
+        assert_eq!(empty.num_clusters(), 0);
+        assert_eq!(empty.num_rows(), 0);
+        assert!(empty.range(0).is_err());
+
+        let offsets = ClusterOffsets::open(encode(&[0, 0, 3, 3, 8, 8]))?;
+        assert_eq!(offsets.num_clusters(), 5);
+        assert_eq!(offsets.num_rows(), 8);
+        assert_eq!(offsets.range(0)?, 0..0);
+        assert_eq!(offsets.range(1)?, 0..3);
+        assert_eq!(offsets.range(3)?, 3..8);
+        assert_eq!(offsets.range(4)?, 8..8);
+        assert!(offsets.range(5).is_err());
+
+        let descending = ClusterOffsets::open(encode(&[0, 3, 2, 8]))?;
+        assert!(descending.range(1).is_err());
+        let past_end = ClusterOffsets::open(encode(&[0, 9, 8]))?;
+        assert!(past_end.range(0).is_err());
+        Ok(())
+    }
+
 }

@@ -27,7 +27,7 @@ pub(crate) enum VectorFileVersion {
     V3 = 3,
     /// Block-major vector columns; `.centroids` omits cluster bounds.
     V4 = 4,
-    /// Lazy interleaved block directory; no centroid offset slot.
+    /// Lazy byte-only block directory; cluster row offsets remain in `.centroids` V3.
     V5 = 5,
 }
 
@@ -62,6 +62,8 @@ pub(crate) const CURRENT_CENTROID: VectorFileVersion = VectorFileVersion::V4;
 pub(crate) mod centroid_slot {
     /// Centroid vectors.
     pub(crate) const CENTROIDS: usize = 0;
+    /// Cumulative cluster row offsets.
+    pub(crate) const OFFSETS: usize = 1;
     /// Router kind and payload (V3).
     pub(crate) const ROUTER: usize = 2;
 }
@@ -72,6 +74,8 @@ pub(crate) mod centroid_slot {
 pub(crate) enum CentroidSlot {
     /// Centroid vectors.
     Centroids = centroid_slot::CENTROIDS,
+    /// Cumulative cluster row offsets.
+    Offsets = centroid_slot::OFFSETS,
     /// Routing payload.
     Router = centroid_slot::ROUTER,
 }

@@ -930,6 +930,7 @@ mod tests {
     use super::*;
     use crate::schema::{Metric, VectorOptions};
     use crate::vector::quantization::{quantized_code_stride, VectorQuantizationConfig};
+    use crate::vector::storage::blocks::BlockRows;
     use crate::vector::storage::io::test_support::{BlockTrackedBytes, TrackedReads};
 
     fn test_layer(
@@ -1010,7 +1011,7 @@ mod tests {
             }
             let padding = start + block_len(&slots, n) - out.len();
             pad(&mut out, padding).unwrap();
-            directory.push(out.len() as u64, rows[1] as u32);
+            directory.push(out.len() as u64);
         }
         directory.finish(&mut out).unwrap();
         let entry = if let Some((reads, block_len)) = tracking {
@@ -1022,7 +1023,14 @@ mod tests {
         } else {
             FileSlice::from(out)
         };
-        let blocks = Arc::new(Blocks::open(entry, &opts, true).unwrap());
+        let blocks = Arc::new(
+            Blocks::open(
+                entry,
+                &opts,
+                BlockRows::clusters(&offsets.iter().map(|&n| n as u64).collect::<Vec<_>>()),
+            )
+            .unwrap(),
+        );
         QuantizedLayerReader {
             blocks,
             layer: 0,
@@ -1374,7 +1382,7 @@ mod tests {
                         _ => {}
                     }
                 }
-                directory.push(data.len() as u64, rows[1] as u32);
+                directory.push(data.len() as u64);
             }
             directory.finish(&mut data)?;
             for block_len in [0, 16, 8160] {
@@ -1392,7 +1400,13 @@ mod tests {
                         }))
                         .slice_from(prefix)
                     };
-                    let blocks = Arc::new(Blocks::open(entry, &opts, true)?);
+                    let blocks = Arc::new(Blocks::open(
+                        entry,
+                        &opts,
+                        BlockRows::clusters(
+                            &boundaries.iter().map(|&n| n as u64).collect::<Vec<_>>(),
+                        ),
+                    )?);
                     let codes = slots
                         .iter()
                         .position(|s| {

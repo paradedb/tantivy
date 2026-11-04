@@ -160,13 +160,11 @@ impl PluginWriter for FlatVecWriter {
             let start = data.written_bytes();
             write_metadata(data, &meta)?;
             let mut directory = BlockDirectory::new(data.written_bytes() - start);
-            let mut rows = 0u32;
             // A full row group or the final partial group forms one aligned Rows column.
             for block in row_bytes.chunks(FLAT_ROWS_PER_BLOCK as usize * stride) {
                 data.write_all(block)?;
                 pad(data, align_up(block.len(), align) - block.len())?;
-                rows += (block.len() / stride) as u32;
-                directory.push(data.written_bytes() - start, rows);
+                directory.push(data.written_bytes() - start);
             }
             directory.finish(data)?;
             assert_eq!((data.written_bytes() - start) as usize % ENTRY_ALIGN, 0);
@@ -263,7 +261,7 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
                     block_bytes += bytes.len();
                     if target_present.len() % FLAT_ROWS_PER_BLOCK as usize == 0 {
                         pad(rows_w, align_up(block_bytes, align) - block_bytes)?;
-                        directory.push(rows_w.written_bytes() - start, target_present.len() as u32);
+                        directory.push(rows_w.written_bytes() - start);
                         block_bytes = 0;
                     }
                 }
@@ -271,7 +269,7 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
             }
             pad(rows_w, align_up(block_bytes, align) - block_bytes)?;
             if block_bytes != 0 {
-                directory.push(rows_w.written_bytes() - start, target_present.len() as u32);
+                directory.push(rows_w.written_bytes() - start);
             }
             directory.finish(rows_w)?;
             assert_eq!((rows_w.written_bytes() - start) as usize % ENTRY_ALIGN, 0);

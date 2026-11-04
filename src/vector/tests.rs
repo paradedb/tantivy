@@ -1470,7 +1470,10 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
     let mut bytes = directory.atomic_read(&vec_path)?;
     let mut centroids = 4u32.to_le_bytes().to_vec();
     let mut composite = CompositeWrite::wrap(&mut centroids);
-    for slot in [crate::vector::storage::header::CentroidSlot::Centroids] {
+    for slot in [
+        crate::vector::storage::header::CentroidSlot::Centroids,
+        crate::vector::storage::header::CentroidSlot::Offsets,
+    ] {
         composite
             .for_field_with_idx(field, slot.index())
             .write_all(&[0; 8])?;

@@ -16,8 +16,8 @@ use crate::error::DataCorruption;
 use crate::fastfield::AliveBitSet;
 use crate::index::SegmentComponent;
 use crate::schema::{Field, FieldType, VectorOptions};
-use crate::vector::storage::blocks::{BlockMetadata, Blocks};
-use crate::vector::storage::centroids::ClusterIndex;
+use crate::vector::storage::blocks::{BlockMetadata, BlockRows, Blocks};
+use crate::vector::storage::centroids::{ClusterIndex, ClusterOffsets};
 use crate::vector::storage::header::{
     read_centroid_header, read_vector_header, CentroidSlot, VectorEntry, CENTROIDS_EXT, VEC_EXT,
 };
@@ -111,7 +111,12 @@ pub(crate) struct VectorFieldReader {
     search: OnceLock<crate::Result<Arc<VectorIndexReader>>>,
 }
 
-type CentroidSlices = (FileSlice, FileSlice, FileSlice);
+#[derive(Clone)]
+struct CentroidSlices {
+    centroids: FileSlice,
+    offsets: FileSlice,
+    router: FileSlice,
+}
 
 struct VectorSource {
     metadata: BlockMetadata,
@@ -204,31 +209,44 @@ impl VectorFieldReader {
         };
         let (_, body) = read_vector_header(&vec_file)?;
 
-        let centroid_slots =
-            match segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string())) {
-                Ok(file) => {
-                    let (_, body) = read_centroid_header(&file)?;
-                    let composite = CompositeFile::open(&body)?;
-                    match (
-                        composite.open_read_with_idx(field, CentroidSlot::Centroids.index()),
-                        composite.open_read_with_idx(field, CentroidSlot::Offsets.index()),
-                        composite.open_read_with_idx(field, CentroidSlot::Router.index()),
-                    ) {
-                        (Some(centroids), Some(offsets), Some(router)) => {
-                            Some((centroids, offsets, router))
-                        }
-                        (Some(_), Some(_), None) => {
-                            return Err(TantivyError::InternalError(format!(
-                                "vector field {:?} has no router slot",
-                                entry.name()
-                            )));
-                        }
-                        _ => None,
+        let centroid_slots = match segment_reader
+            .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))
+        {
+            Ok(file) => {
+                let (_, body) = read_centroid_header(&file)?;
+                let composite = CompositeFile::open(&body)?;
+                match (
+                    composite.open_read_with_idx(field, CentroidSlot::Centroids.index()),
+                    composite.open_read_with_idx(field, CentroidSlot::Offsets.index()),
+                    composite.open_read_with_idx(field, CentroidSlot::Router.index()),
+                ) {
+                    (Some(centroids), Some(offsets), Some(router)) => {
+                        Some(CentroidSlices {
+                            centroids,
+                            offsets,
+                            router,
+                        })
+                    }
+                    (Some(_), None, _) => {
+                        return Err(
+                            DataCorruption::comment_only("missing cluster offsets slot").into()
+                        );
+                    }
+                    (Some(_), _, None) => {
+                        return Err(TantivyError::InternalError(format!(
+                            "vector field {:?} has no router slot",
+                            entry.name()
+                        )));
+                    }
+                    (None, None, None) => None,
+                    _ => {
+                        return Err(DataCorruption::comment_only("incomplete centroid slots").into())
                     }
                 }
-                Err(OpenReadError::FileDoesNotExist(_)) => None,
-                Err(err) => return Err(err.into()),
-            };
+            }
+            Err(OpenReadError::FileDoesNotExist(_)) => None,
+            Err(err) => return Err(err.into()),
+        };
 
         let vec_composite = CompositeFile::open(&body)?;
         validate_vector_entries(&vec_composite, field)?;
@@ -276,20 +294,21 @@ impl VectorIndexReader {
             source: Some((source.composite.clone(), source.field, source.max_doc)),
             value: OnceLock::new(),
         };
-        let rows_slice = Arc::new(Blocks::from_metadata(source.metadata.clone())?);
-        let index = if let Some((centroids, _offsets, router_slot)) = centroid_slots {
+        let rows = match &centroid_slots {
+            Some(slots) => BlockRows::Clusters(ClusterOffsets::open(slots.offsets.clone())?),
+            None => BlockRows::Uniform(id_map.get(false)?.num_rows() as usize),
+        };
+        let rows_slice = Arc::new(Blocks::from_metadata(source.metadata.clone(), rows)?);
+        let index = if let Some(slots) = centroid_slots {
             Some(ClusterIndex::open(
                 &options,
-                centroids,
+                slots.centroids,
                 Arc::clone(&rows_slice),
-                router_slot,
+                slots.router,
             )?)
         } else {
             None
         };
-        if index.is_none() && rows_slice.num_rows() != id_map.get(false)?.num_rows() as usize {
-            return Err(DataCorruption::comment_only("flat vector row count mismatch").into());
-        }
         let quantization =
             if let VectorColMetadata::Quantized { layers: quants, .. } = rows_slice.meta.as_ref() {
                 let mut layers = Vec::new();
@@ -374,7 +393,9 @@ impl VectorIndexReader {
         crate::vector::storage::blocks::BlockDirectory::new(end as u64)
             .finish(&mut bytes)
             .unwrap();
-        let rows_slice = Arc::new(Blocks::open(FileSlice::from(bytes), &options, false).unwrap());
+        let rows_slice = Arc::new(
+            Blocks::open(FileSlice::from(bytes), &options, BlockRows::Uniform(0)).unwrap(),
+        );
         Self {
             max_doc: 0,
             options,
@@ -451,6 +472,17 @@ impl VectorIndexReader {
                     .collect()
             })
             .transpose()
+    }
+
+    /// Each cluster's ball radius around its stored centroid, in cluster order, with
+    /// `f32::INFINITY` for a saturated cluster; `None` when the storage is not IVF.
+    pub fn cluster_radii(&self) -> Option<Vec<f32>> {
+        self.index.as_ref().map(|index| {
+            let bounds = index.bounds();
+            (0..index.num_clusters())
+                .map(|cluster| bounds.ball_r(cluster))
+                .collect()
+        })
     }
 
     /// Returns the number of live IVF posting rows.
@@ -867,9 +899,13 @@ mod tests {
             let padding = first + block_len(&slots, docs.len()) - data.len();
             pad(&mut data, padding)?;
             let mut directory = BlockDirectory::new(first as u64);
-            directory.push(data.len() as u64, docs.len() as u32);
+            directory.push(data.len() as u64);
             directory.finish(&mut data)?;
-            let blocks = Arc::new(Blocks::open(FileSlice::from(data), &options, true)?);
+            let blocks = Arc::new(Blocks::open(
+                FileSlice::from(data),
+                &options,
+                BlockRows::clusters(&[0, docs.len() as u64]),
+            )?);
             let reader = VectorIndexReader {
                 max_doc: 3,
                 options,
@@ -909,10 +945,10 @@ mod tests {
         data.extend([0; 12]);
         let end = data.len();
         let mut directory = crate::vector::storage::blocks::BlockDirectory::new(prefix as u64);
-        directory.push(end as u64, 1);
+        directory.push(end as u64);
         directory.finish(&mut data)?;
-        let footer = data.len() - 16;
-        let directory_start = footer - 2 * 12;
+        let footer = data.len() - 8;
+        let directory_start = footer - 2 * 8;
         let mut ids = Vec::new();
         IdMap::serialize(&[1], 3, &mut ids)?;
         let data_reads = Arc::new(Mutex::new(Vec::new()));
@@ -952,10 +988,7 @@ mod tests {
         assert!(readers.iter().all(|r| Arc::ptr_eq(r, &readers[0])));
         let reads = data_reads.lock().unwrap();
         assert_eq!(
-            reads
-                .iter()
-                .filter(|r| **r == (footer..footer + 16))
-                .count(),
+            reads.iter().filter(|r| **r == (footer..footer + 8)).count(),
             1
         );
         assert_eq!(
@@ -1033,14 +1066,18 @@ mod tests {
         )?;
         data.extend_from_slice(&expected_bytes);
         let mut directory = crate::vector::storage::blocks::BlockDirectory::new(prefix as u64);
-        directory.push(data.len() as u64, ROWS as u32);
+        directory.push(data.len() as u64);
         directory.finish(&mut data)?;
         let storage = Arc::new(BlockTrackedBytes {
             bytes: data,
             reads: Arc::clone(&reads),
             block_len: 32,
         });
-        let blocks = Arc::new(Blocks::open(FileSlice::new(storage), &opts, false)?);
+        let blocks = Arc::new(Blocks::open(
+            FileSlice::new(storage),
+            &opts,
+            BlockRows::Uniform(ROWS),
+        )?);
         blocks.row_range(0)?;
         reads.lock().unwrap().clear();
         let reader = VectorIndexReader {

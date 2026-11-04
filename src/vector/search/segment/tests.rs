@@ -900,8 +900,8 @@ fn empty_cluster_skips_its_band() -> crate::Result<()> {
     assert_eq!(stats.postings_skipped, 1);
     assert_eq!(stats.clusters_probed(), 1);
     assert_eq!(stats.vectors_visited, 0);
-    assert_eq!(stats.layers.get(0).unwrap().io.reads, 1);
-    assert_eq!(stats.layers.get(0).unwrap().io.bytes_read, 24);
+    assert_eq!(stats.layers.get(0).unwrap().io.reads, 2);
+    assert_eq!(stats.layers.get(0).unwrap().io.bytes_read, 32);
     assert!(
         stage_reads(&fixture.reads(), |stage| stage == VectorStage::LayerScan(0))
             .iter()
@@ -1023,6 +1023,7 @@ fn open_gate_reads_doc_ids_only_for_competitive_survivors() -> crate::Result<()>
     fixture.clear_reads();
     let open = fixture.search(&AllQuery, &query, 3, every_cluster())?;
     let log = fixture.reads();
+    let centroid_reads = fixture.centroid_reads();
     for range in stage_reads(&log, |stage| matches!(stage, VectorStage::LayerScan(_))) {
         assert!(
             !ranges
@@ -1070,9 +1071,22 @@ fn open_gate_reads_doc_ids_only_for_competitive_survivors() -> crate::Result<()>
         }
     }
     for layer in 0..2 {
-        let requested = stage_reads(&log, |stage| stage == VectorStage::LayerScan(layer as u8));
+        let mut requested = stage_reads(&log, |stage| stage == VectorStage::LayerScan(layer as u8));
+        // The router can also fetch centroid payloads under this stage. Compare the
+        // column and address requests charged by VectorRead, excluding router payloads.
+        requested.extend(
+            stage_reads(&centroid_reads, |stage| {
+                stage == VectorStage::LayerScan(layer as u8)
+            })
+            .into_iter()
+            .filter(|range| ranges.cluster_offsets.contains(range)),
+        );
         let io = open.stats[0].layers.get(layer).unwrap().io;
-        assert_eq!(io.reads, requested.len() as u64, "layer {layer}");
+        assert_eq!(
+            io.reads,
+            requested.len() as u64,
+            "layer {layer}: {requested:?}"
+        );
         assert_eq!(
             io.bytes_read,
             requested
@@ -1449,10 +1463,14 @@ fn located_path_reads_no_doc_ids() -> crate::Result<()> {
                 .all(|docs| !overlaps(read, docs))),
             "{case}: a DocIds column was read"
         );
-        let locate_reads = stage_reads(&log, |stage| stage == VectorStage::Locate).len();
+        let locate_reads = stage_reads(&log, |stage| stage == VectorStage::Locate).len()
+            + stage_reads(&fixture.centroid_reads(), |stage| {
+                stage == VectorStage::Locate
+            })
+            .len();
         assert!(locate_reads > 0, "{case}");
         assert_eq!(stats.locate_io.reads, locate_reads as u64, "{case}");
-        // Centroid rows live in the centroid file, which the read log does not record.
+        // Centroid rows are charged separately from offset reads in Locate.
         let quantized_clusters = stats.layers.get(0).map_or(0, |layer0| {
             layer0.sparse_clusters() + layer0.full_clusters()
         });

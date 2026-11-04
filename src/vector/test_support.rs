@@ -694,11 +694,17 @@ impl Fixture {
     /// Forgets every logged request.
     pub(crate) fn clear_reads(&self) {
         self.log().reads.lock().unwrap().clear();
+        self.log().centroid_reads.lock().unwrap().clear();
     }
 
     /// The requests logged since the last clear.
     pub(crate) fn reads(&self) -> ReadLog {
         self.log().reads.lock().unwrap().clone()
+    }
+
+    /// Requests to `.centroids`, kept separate because offsets are relative to that file.
+    pub(crate) fn centroid_reads(&self) -> ReadLog {
+        self.log().centroid_reads.lock().unwrap().clone()
     }
 
     /// Byte ranges of the first segment's DocIds column requests and full-precision cluster spans,
@@ -715,6 +721,9 @@ impl Fixture {
             ranges
                 .directory
                 .extend(self.reads().into_iter().map(|(_, range)| range));
+            ranges
+                .cluster_offsets
+                .extend(self.centroid_reads().into_iter().map(|(_, range)| range));
             self.clear_reads();
             vectors.read_doc_ids(cluster, &mut docs)?;
             ranges
@@ -737,6 +746,7 @@ impl Fixture {
 #[derive(Debug, Default)]
 pub(crate) struct ColumnRanges {
     pub(crate) directory: Vec<Range<usize>>,
+    pub(crate) cluster_offsets: Vec<Range<usize>>,
     pub(crate) docs: Vec<Option<Range<usize>>>,
     pub(crate) rows: Vec<Option<Range<usize>>>,
 }
