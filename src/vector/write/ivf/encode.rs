@@ -15,7 +15,7 @@ use crate::directory::CompositeWrite;
 use crate::vector::clustering::{decode_row_append, encode_vector, IvfCentroids};
 use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::storage::blocks::{
-    block_len, column_range, pad, write_metadata, BlockDirectory,
+    block_len, column_range, pad, write_metadata, BlockOffsetsWriter,
 };
 use crate::vector::storage::header::{VectorEntry, HEADER_LEN};
 use crate::vector::storage::id_map::DocLocation;
@@ -85,7 +85,7 @@ pub(super) fn write_data_entry(
     let data = vec_write.for_field_with_idx(merge.field, VectorEntry::Data.index());
     let entry_start = data.written_bytes();
     let mut pos = write_metadata(data, &meta)?;
-    let mut directory = BlockDirectory::new(data.written_bytes() - entry_start);
+    let mut block_offsets = BlockOffsetsWriter::new(data.written_bytes() - entry_start);
     timings.pad_bytes += pos - 4 - meta.to_bytes().len();
     let (specs, grids) = meta.runtime();
     let row_bytes = opts.bytes_per_vector();
@@ -110,7 +110,7 @@ pub(super) fn write_data_entry(
         let end = offsets[1] as usize;
         let n = end - start;
         if n == 0 {
-            directory.push(data.written_bytes() - entry_start, offsets[1] as u32);
+            block_offsets.push(data.written_bytes() - entry_start, n);
             continue;
         }
         let block_start = pos;
@@ -142,7 +142,7 @@ pub(super) fn write_data_entry(
                 };
                 local += 1;
                 let bytes = merge.readers[assigned.source.segment_ord as usize]
-                    .vector_bytes_for_row(assigned.source.row_id)?;
+                    .vector_bytes_for_row(assigned.source.block_address)?;
                 let row: &[u8] = if opts.needs_normalization() {
                     normalized.clear();
                     normalized.extend_from_slice(&bytes);
@@ -191,10 +191,10 @@ pub(super) fn write_data_entry(
         timings.pad_bytes += padding;
         pos += padding;
         assert_eq!(data.written_bytes() - entry_start, pos as u64);
-        directory.push(data.written_bytes() - entry_start, offsets[1] as u32);
+        block_offsets.push(data.written_bytes() - entry_start, n);
     }
-    let entry_len = directory.finish(data)?;
-    timings.pad_bytes += entry_len - pos - (num_centroids + 1) * 12 - 8;
+    let entry_len = block_offsets.finish(data)?;
+    timings.pad_bytes += entry_len - pos - (num_centroids + 1) * 8 - 8;
     assert_eq!(
         (data.written_bytes() - entry_start) as usize % ENTRY_ALIGN,
         0

@@ -93,7 +93,11 @@ impl IdMap {
         }
     }
     /// Reads one document location and validates both coordinates before exposing it.
-    pub(crate) fn locate(&self, doc: DocId, rows: &[usize]) -> io::Result<Option<DocLocation>> {
+    pub(crate) fn locate(
+        &self,
+        doc: DocId,
+        rows: impl Fn(usize) -> io::Result<std::ops::Range<usize>>,
+    ) -> io::Result<Option<DocLocation>> {
         let body = self.location_body()?;
         let Some(start) = (doc as usize).checked_mul(8) else {
             return Ok(None);
@@ -105,7 +109,7 @@ impl IdMap {
             &body
                 .slice(start..start + 8)
                 .read_vector_bytes(VectorReadKind::Other)?,
-            rows,
+            &rows,
         )
     }
     /// Locates ascending `docs`, appending `(doc, location)` for each one with a vector to `out`.
@@ -116,7 +120,7 @@ impl IdMap {
     pub(crate) fn locate_many(
         &self,
         docs: &[DocId],
-        rows: &[usize],
+        rows: impl Fn(usize) -> io::Result<std::ops::Range<usize>>,
         out: &mut Vec<(DocId, DocLocation)>,
     ) -> io::Result<()> {
         let body = self.location_body()?;
@@ -136,9 +140,10 @@ impl IdMap {
             let bytes = body
                 .slice(start..end)
                 .read_vector_bytes(VectorReadKind::Other)?;
+            // TODO: Group location validation by cluster to avoid per-document offset reads.
             for &doc in &docs[first..last] {
                 let at = doc as usize * 8 - start;
-                if let Some(location) = decode_location(&bytes[at..at + 8], rows)? {
+                if let Some(location) = decode_location(&bytes[at..at + 8], &rows)? {
                     out.push((doc, location));
                 }
             }
@@ -186,7 +191,10 @@ impl IdMap {
 }
 
 /// Decodes one 8-byte location entry; the absent sentinel decodes to `None`.
-fn decode_location(bytes: &[u8], rows: &[usize]) -> io::Result<Option<DocLocation>> {
+fn decode_location(
+    bytes: &[u8],
+    rows: impl Fn(usize) -> io::Result<std::ops::Range<usize>>,
+) -> io::Result<Option<DocLocation>> {
     let cluster = u32::from_le_bytes(bytes[..4].try_into().unwrap());
     let local = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
     if cluster == u32::MAX {
@@ -200,9 +208,7 @@ fn decode_location(bytes: &[u8], rows: &[usize]) -> io::Result<Option<DocLocatio
         };
     }
     let cluster_idx = cluster as usize;
-    if cluster_idx >= rows.len().saturating_sub(1)
-        || local as usize >= rows[cluster_idx + 1] - rows[cluster_idx]
-    {
+    if local as usize >= rows(cluster_idx)?.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "document location is outside its cluster",
@@ -212,8 +218,17 @@ fn decode_location(bytes: &[u8], rows: &[usize]) -> io::Result<Option<DocLocatio
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    pub(crate) fn boundaries(
+        rows: &[usize],
+    ) -> impl Fn(usize) -> io::Result<std::ops::Range<usize>> + '_ {
+        move |cluster| {
+            rows.get(cluster..cluster + 2)
+                .map(|r| r[0]..r[1])
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cluster out of range"))
+        }
+    }
 
     fn round_trip(present: &[DocId], num_docs: u32) -> IdMap {
         let mut buf = Vec::new();
@@ -326,11 +341,11 @@ mod tests {
         let map = IdMap::open(FileSlice::from(bytes.clone()), 5).unwrap();
         for (doc, &location) in expected.iter().enumerate() {
             assert_eq!(
-                map.locate(doc as u32, &[0, 2, 4]).unwrap(),
+                map.locate(doc as u32, boundaries(&[0, 2, 4])).unwrap(),
                 (location != DocLocation::ABSENT).then_some(location)
             );
         }
-        assert_eq!(map.locate(5, &[0, 2, 4]).unwrap(), None);
+        assert_eq!(map.locate(5, boundaries(&[0, 2, 4])).unwrap(), None);
         for location in [
             DocLocation {
                 cluster: 2,
@@ -350,7 +365,7 @@ mod tests {
             corrupt[5..9].copy_from_slice(&location.local.to_le_bytes());
             let map = IdMap::open(FileSlice::from(corrupt), 5).unwrap();
             assert_eq!(
-                map.locate(0, &[0, 2, 4]).unwrap_err().kind(),
+                map.locate(0, boundaries(&[0, 2, 4])).unwrap_err().kind(),
                 io::ErrorKind::InvalidData
             );
         }
@@ -433,11 +448,16 @@ mod tests {
                 docs.extend([DOCS, DOCS + 900]);
                 reads.lock().unwrap().clear();
                 let mut located = Vec::new();
-                map.locate_many(&docs, &rows, &mut located).unwrap();
+                map.locate_many(&docs, boundaries(&rows), &mut located)
+                    .unwrap();
                 let read_count = reads.lock().unwrap().len();
                 let expected: Vec<(DocId, DocLocation)> = docs
                     .iter()
-                    .filter_map(|&doc| map.locate(doc, &rows).unwrap().map(|loc| (doc, loc)))
+                    .filter_map(|&doc| {
+                        map.locate(doc, boundaries(&rows))
+                            .unwrap()
+                            .map(|loc| (doc, loc))
+                    })
                     .collect();
                 let case = format!("block_len={block_len:?} seed={seed}");
                 assert_eq!(located, expected, "{case}");
@@ -488,11 +508,13 @@ mod tests {
             IdMap::serialize_locations(&locations, &mut bytes).unwrap();
             let map = IdMap::open(FileSlice::from(bytes), 8).unwrap();
             let error = map
-                .locate_many(&[1, 5, 6], &rows, &mut Vec::new())
+                .locate_many(&[1, 5, 6], boundaries(&rows), &mut Vec::new())
                 .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{location:?}");
         }
         let flat = round_trip(&[0, 1], 2);
-        assert!(flat.locate_many(&[0], &rows, &mut Vec::new()).is_err());
+        assert!(flat
+            .locate_many(&[0], boundaries(&rows), &mut Vec::new())
+            .is_err());
     }
 }

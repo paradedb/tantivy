@@ -8,7 +8,7 @@ use super::{no_centroids, train, FieldMerge, IvfBuildTimings};
 use crate::directory::CompositeWrite;
 use crate::schema::Field;
 use crate::vector::router::{BuiltRouter, RouterKind};
-use crate::vector::storage::blocks::{write_metadata, BlockDirectory};
+use crate::vector::storage::blocks::{write_metadata, BlockOffsetsWriter};
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::header::{CentroidSlot, VectorEntry, HEADER_LEN};
 use crate::vector::storage::id_map::{DocLocation, IdMap};
@@ -16,17 +16,16 @@ use crate::vector::storage::metadata::VectorColMetadata;
 use crate::vector::ENTRY_ALIGN;
 use crate::TantivyError;
 
-/// Writes a field's `.centroids` slots: centroids, offsets, then the router.
+/// Writes a field's `.centroids` slots: centroids and the router.
 pub(super) fn centroid_slots(
     centroids_write: &mut CompositeWrite,
     merge: &FieldMerge,
     num_present_docs: usize,
     centroid_bytes: &[u8],
-    cluster_offsets: &[u64],
+    num_centroids: usize,
     router: &BuiltRouter,
 ) -> crate::Result<()> {
     let field = merge.field;
-    let num_centroids = cluster_offsets.len() - 1;
     {
         let centroids_w =
             centroids_write.for_field_with_idx(field, CentroidSlot::Centroids.index());
@@ -38,11 +37,6 @@ pub(super) fn centroid_slots(
             centroids_w,
         )?;
         centroids_w.flush()?;
-    }
-    {
-        let offsets_w = centroids_write.for_field_with_idx(field, CentroidSlot::Offsets.index());
-        ClusterIndex::serialize_offsets(cluster_offsets, offsets_w)?;
-        offsets_w.flush()?;
     }
 
     if merge.ctx.cancel.wants_cancel() {
@@ -68,18 +62,13 @@ pub(super) fn empty_field(
     let data = vec_write.for_field_with_idx(field, VectorEntry::Data.index());
     let start = data.written_bytes();
     write_metadata(data, &meta)?;
-    BlockDirectory::new(data.written_bytes() - start).finish(data)?;
+    BlockOffsetsWriter::new(data.written_bytes() - start).finish(data)?;
     assert_eq!((data.written_bytes() - start) as usize % ENTRY_ALIGN, 0);
     {
         let centroids_w =
             centroids_write.for_field_with_idx(field, CentroidSlot::Centroids.index());
         ClusterIndex::serialize_centroids(0, 0, &[], opts, centroids_w)?;
         centroids_w.flush()?;
-    }
-    {
-        let offsets_w = centroids_write.for_field_with_idx(field, CentroidSlot::Offsets.index());
-        ClusterIndex::serialize_offsets(&[0u64], offsets_w)?;
-        offsets_w.flush()?;
     }
     {
         let router_w = centroids_write.for_field_with_idx(field, CentroidSlot::Router.index());

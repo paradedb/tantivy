@@ -708,7 +708,7 @@ mod tests {
                 );
                 initial_sigmas = scan.candidates.columns.sigmas[at].to_vec();
             } else {
-                let rows = scan.candidates.global_rows();
+                let rows = scan.candidates.row_labels();
                 let select =
                     |values: &[f32]| -> Vec<f32> { rows.iter().map(|&row| values[row]).collect() };
                 let refined = decoded(
@@ -723,14 +723,14 @@ mod tests {
                 combine_refine(&combine, &refined, &mut scan.candidates.columns, 0..count);
             }
             scan.band(k, QUANTIZED_BOUNDARY_KAPPA);
-            let survivors = scan.candidates.global_rows();
+            let survivors = scan.candidates.row_labels();
             assert!(
                 exact[..k].iter().all(|row| survivors.contains(row)),
                 "true top-k lost at layer {level}"
             );
             boundaries.push(survivors);
         }
-        let mut result = scan.candidates.global_rows();
+        let mut result = scan.candidates.row_labels();
         result.sort_by(|&a, &b| truth[b].total_cmp(&truth[a]).then(a.cmp(&b)));
         result.truncate(k);
         assert_eq!(result, exact[..k]);

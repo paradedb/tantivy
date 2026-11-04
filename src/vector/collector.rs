@@ -39,7 +39,7 @@ use crate::vector::storage::quantized::QuantizedFieldReader;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
 use crate::vector::tie_break::NoTieBreak;
 use crate::vector::write::RowAddress;
-use crate::vector::{VectorElement, VectorStage};
+use crate::vector::{BlockAddress, VectorElement, VectorStage};
 use crate::{DocAddress, DocId, Result, Score, SegmentOrdinal, TantivyError};
 
 /// A segment and its optional parent centroid in the global router.
@@ -518,7 +518,8 @@ where
                         (
                             RowAddress {
                                 segment_ord: address.segment_ord,
-                                row_id: (address.doc_id as usize) | (1usize << (usize::BITS - 1)),
+                                // Reserve the sentinel block for exact document seed keys.
+                                block_address: BlockAddress::new(u32::MAX, address.doc_id),
                             },
                             *score,
                         )
@@ -588,10 +589,8 @@ where
                     (
                         RowAddress {
                             segment_ord: address.segment_ord,
-                            // Opaque foreign key for seeding. Doc ids and row ids share a
-                            // numeric range on the same segment, so the high bit keeps seed
-                            // keys out of the local RowAddress space.
-                            row_id: (address.doc_id as usize) | (1usize << (usize::BITS - 1)),
+                            // Real block indices are below u32::MAX; reserve it for seed keys.
+                            block_address: BlockAddress::new(u32::MAX, address.doc_id),
                         },
                         *score,
                     )
@@ -693,7 +692,8 @@ where
                         (
                             RowAddress {
                                 segment_ord: address.segment_ord,
-                                row_id: (address.doc_id as usize) | (1usize << (usize::BITS - 1)),
+                                // Keep flat document seeds disjoint from physical block rows.
+                                block_address: BlockAddress::new(u32::MAX, address.doc_id),
                             },
                             *score,
                         )
@@ -1397,8 +1397,8 @@ mod ivf_e2e_tests {
                 let id_column = reader.fast_fields().u64("id")?;
                 let vector_reader = reader.vector_index(embedding_field)?;
                 for doc_id in 0..reader.max_doc() {
-                    let row = vector_reader.row_id(doc_id)?.unwrap();
-                    let bytes = vector_reader.vector_bytes_for_row(row)?;
+                    let address = vector_reader.row_location(doc_id)?.unwrap();
+                    let bytes = vector_reader.vector_bytes_for_row(address)?;
                     expected.push((
                         -l2_squared_bytes(&query, &bytes),
                         id_column.first(doc_id).unwrap(),

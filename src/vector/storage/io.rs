@@ -1,5 +1,6 @@
 //! Storage reads of vector components, charged to the running search stage.
 use std::cell::Cell;
+use std::ops::Range;
 
 use common::{HasLen, OwnedBytes};
 
@@ -49,22 +50,75 @@ pub struct VectorIoStats {
 /// Reads vector bytes and charges the request to the running search stage.
 pub(crate) trait VectorRead {
     fn read_vector_bytes(&self, kind: VectorReadKind) -> std::io::Result<OwnedBytes>;
+    fn read_vector_bytes_slice(
+        &self,
+        range: Range<usize>,
+        kind: VectorReadKind,
+    ) -> std::io::Result<OwnedBytes>;
 }
 impl VectorRead for FileSlice {
     fn read_vector_bytes(&self, kind: VectorReadKind) -> std::io::Result<OwnedBytes> {
+        self.read_vector_bytes_slice(0..self.len(), kind)
+    }
+
+    fn read_vector_bytes_slice(
+        &self,
+        range: Range<usize>,
+        kind: VectorReadKind,
+    ) -> std::io::Result<OwnedBytes> {
+        assert!(range.start <= range.end, "invalid vector byte range");
         let _kind = ReadKindGuard(READ_KIND.replace(kind));
-        let bytes = self.read_bytes()?;
+        let bytes = self.read_bytes_slice(range.clone())?;
         let mut storage_blocks = 0;
-        if self.len() != 0 {
+        if !range.is_empty() {
             if let (Some(first), Some(last)) = (
-                self.storage_block_ord(0),
-                self.storage_block_ord(self.len() - 1),
+                self.storage_block_ord(range.start),
+                self.storage_block_ord(range.end - 1),
             ) {
                 storage_blocks = (last - first + 1) as u64;
             }
         }
-        charge_read(self.len() as u64, storage_blocks);
+        charge_read(range.len() as u64, storage_blocks);
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::test_support::BlockTrackedBytes;
+    use super::*;
+    use crate::vector::telemetry::{enter_vector_stage, measure};
+    use crate::vector::VectorStage;
+
+    #[test]
+    fn ranged_reads_preserve_origin_and_charge_only_requested_bytes() -> std::io::Result<()> {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let slice = FileSlice::new(Arc::new(BlockTrackedBytes {
+            bytes: (0..64).collect(),
+            reads: Arc::clone(&reads),
+            block_len: 8,
+        }))
+        .slice(11..53);
+        let (bytes, totals) = measure(|| {
+            let _stage = enter_vector_stage(VectorStage::LayerScan(2));
+            slice.read_vector_bytes_slice(3..16, VectorReadKind::QuantizedLayer(2))
+        });
+        assert_eq!(&*bytes?, &(14..27).collect::<Vec<u8>>());
+        assert_eq!(*reads.lock().unwrap(), [14..27]);
+        let io = totals.io(VectorStage::LayerScan(2));
+        assert_eq!((io.reads, io.bytes_read, io.storage_blocks), (1, 13, 3));
+        assert_eq!(current_vector_read_kind(), VectorReadKind::Other);
+
+        let (bytes, totals) = measure(|| {
+            let _stage = enter_vector_stage(VectorStage::LayerScan(2));
+            slice.read_vector_bytes_slice(42..42, VectorReadKind::QuantizedLayer(2))
+        });
+        assert!(bytes?.is_empty());
+        let io = totals.io(VectorStage::LayerScan(2));
+        assert_eq!((io.reads, io.bytes_read, io.storage_blocks), (1, 0, 0));
+        Ok(())
     }
 }
 
@@ -138,6 +192,7 @@ pub(crate) mod test_support {
     pub(crate) struct PagedDirectory {
         inner: RamDirectory,
         pub(crate) reads: ReadLog,
+        pub(crate) centroid_reads: ReadLog,
         pub(crate) read_kinds: Arc<Mutex<Vec<VectorReadKind>>>,
     }
     #[derive(Debug)]
@@ -178,6 +233,12 @@ pub(crate) mod test_support {
                     inner,
                     reads: self.reads.clone(),
                     read_kinds: self.read_kinds.clone(),
+                }))
+            } else if path.extension().is_some_and(|ext| ext == "centroids") {
+                Ok(Arc::new(PagedFile {
+                    inner,
+                    reads: self.centroid_reads.clone(),
+                    read_kinds: Arc::default(),
                 }))
             } else {
                 Ok(inner)

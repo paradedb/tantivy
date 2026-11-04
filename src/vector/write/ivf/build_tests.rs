@@ -117,7 +117,7 @@ fn merge_flat_segments_with_deletes_into_ivf() -> crate::Result<()> {
     assert_eq!(searcher.segment_readers().len(), 1, "one merged segment");
     let segment_reader = &searcher.segment_readers()[0];
     let vec_reader = segment_reader.vector_index(embed_field)?;
-    let info = vec_reader.info().expect("vector info");
+    let info = vec_reader.info()?.expect("vector info");
     assert_eq!(info.format, VectorStorageFormat::Ivf, "merge must cluster");
     assert_eq!(info.num_vectors, alive, "deleted docs must not be counted");
     assert_eq!(vec_reader.num_vectors(), alive);
@@ -214,7 +214,7 @@ fn merge_deleting_every_doc_of_one_field_writes_empty_ivf() -> crate::Result<()>
     // The emptied field reads back as a zeroed IVF field, not an error.
     let vec_reader = segment_reader.vector_index(doomed_field)?;
     assert_eq!(vec_reader.num_vectors(), 0);
-    let info = vec_reader.info().expect("vector info");
+    let info = vec_reader.info()?.expect("vector info");
     assert_eq!(
         info,
         VectorInfo {
@@ -345,9 +345,9 @@ fn ivf_cluster_sizes_match_vector_info() -> crate::Result<()> {
     for segment_reader in searcher.segment_readers() {
         let vec_reader = segment_reader.vector_index(field)?;
         let sizes = vec_reader
-            .cluster_sizes()
+            .cluster_sizes()?
             .expect("ivf segment exposes cluster sizes");
-        let info = vec_reader.info().expect("vector info");
+        let info = vec_reader.info()?.expect("vector info");
         assert_eq!(info.format, VectorStorageFormat::Ivf);
         let stats = info.cluster_stats.expect("ivf cluster stats");
 
@@ -392,7 +392,7 @@ fn ivf_cluster_sizes_match_vector_info() -> crate::Result<()> {
         assert!(
             segment_reader
                 .vector_index(flat_field)?
-                .cluster_sizes()
+                .cluster_sizes()?
                 .is_none(),
             "flat segments expose no cluster sizes"
         );
@@ -416,7 +416,7 @@ fn vector_info_reports_router_levels() -> crate::Result<()> {
         for segment_reader in searcher.segment_readers() {
             let info = segment_reader
                 .vector_index(field)?
-                .info()
+                .info()?
                 .expect("vector info");
             assert_eq!(info.router, Some(router));
             let levels = info.router_levels.expect("ivf router levels");
@@ -445,7 +445,7 @@ fn vector_info_reports_router_levels() -> crate::Result<()> {
     for segment_reader in flat.index.reader()?.searcher().segment_readers() {
         let info = segment_reader
             .vector_index(flat.embedding_field())?
-            .info()
+            .info()?
             .expect("vector info");
         assert_eq!((info.router, info.router_levels), (None, None));
     }

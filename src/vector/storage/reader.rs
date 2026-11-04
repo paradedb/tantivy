@@ -1,10 +1,10 @@
 //! Per-segment vector metadata, block columns and optional IVF routing.
 //!
 //! Metadata opens independently of search state. The first search-reader request
-//! pins routing state and validates deferred row-group geometry. Clustered IdMap
-//! entries open only for document lookups.
-//! Cluster boundaries come from the centroid file. See FORMAT.md.
+//! pins routing state. Block addresses are read and validated only when accessed.
+//! Clustered IdMap entries open only for document lookups. See FORMAT.md.
 
+use std::io;
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
@@ -16,7 +16,7 @@ use crate::error::DataCorruption;
 use crate::fastfield::AliveBitSet;
 use crate::index::SegmentComponent;
 use crate::schema::{Field, FieldType, VectorOptions};
-use crate::vector::storage::blocks::{BlockMetadata, Blocks};
+use crate::vector::storage::blocks::{Block, BlockMetadata, Blocks};
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::header::{
     read_centroid_header, read_vector_header, CentroidSlot, VectorEntry, CENTROIDS_EXT, VEC_EXT,
@@ -28,6 +28,7 @@ use crate::vector::storage::quantized::{
     exact_read_cost, range_cost, QuantizedFieldReader, QuantizedIndexCtx, QuantizedLayerReader,
     ReadCost, ReadScratch,
 };
+use crate::vector::BlockAddress;
 use crate::{DocId, SegmentReader, TantivyError};
 
 /// Storage-planned views of selected fp32 rows, borrowing their rows and chunks from the read's
@@ -111,7 +112,11 @@ pub(crate) struct VectorFieldReader {
     search: OnceLock<crate::Result<Arc<VectorIndexReader>>>,
 }
 
-type CentroidSlices = (FileSlice, FileSlice, FileSlice);
+#[derive(Clone)]
+struct CentroidSlices {
+    centroids: FileSlice,
+    router: FileSlice,
+}
 
 struct VectorSource {
     metadata: BlockMetadata,
@@ -204,31 +209,38 @@ impl VectorFieldReader {
         };
         let (_, body) = read_vector_header(&vec_file)?;
 
-        let centroid_slots =
-            match segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string())) {
-                Ok(file) => {
-                    let (_, body) = read_centroid_header(&file)?;
-                    let composite = CompositeFile::open(&body)?;
-                    match (
-                        composite.open_read_with_idx(field, CentroidSlot::Centroids.index()),
-                        composite.open_read_with_idx(field, CentroidSlot::Offsets.index()),
-                        composite.open_read_with_idx(field, CentroidSlot::Router.index()),
-                    ) {
-                        (Some(centroids), Some(offsets), Some(router)) => {
-                            Some((centroids, offsets, router))
-                        }
-                        (Some(_), Some(_), None) => {
-                            return Err(TantivyError::InternalError(format!(
-                                "vector field {:?} has no router slot",
-                                entry.name()
-                            )));
-                        }
-                        _ => None,
+        let centroid_slots = match segment_reader
+            .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))
+        {
+            Ok(file) => {
+                let (_, body) = read_centroid_header(&file)?;
+                let composite = CompositeFile::open(&body)?;
+                if composite
+                    .field_indices()
+                    .any(|(f, slot)| f == field && !matches!(slot, 0 | 2))
+                {
+                    return Err(DataCorruption::comment_only("unexpected centroid slot").into());
+                }
+                match (
+                    composite.open_read_with_idx(field, CentroidSlot::Centroids.index()),
+                    composite.open_read_with_idx(field, CentroidSlot::Router.index()),
+                ) {
+                    (Some(centroids), Some(router)) => Some(CentroidSlices { centroids, router }),
+                    (Some(_), None) => {
+                        return Err(TantivyError::InternalError(format!(
+                            "vector field {:?} has no router slot",
+                            entry.name()
+                        )));
+                    }
+                    (None, None) => None,
+                    _ => {
+                        return Err(DataCorruption::comment_only("incomplete centroid slots").into())
                     }
                 }
-                Err(OpenReadError::FileDoesNotExist(_)) => None,
-                Err(err) => return Err(err.into()),
-            };
+            }
+            Err(OpenReadError::FileDoesNotExist(_)) => None,
+            Err(err) => return Err(err.into()),
+        };
 
         let vec_composite = CompositeFile::open(&body)?;
         validate_vector_entries(&vec_composite, field)?;
@@ -276,90 +288,80 @@ impl VectorIndexReader {
             source: Some((source.composite.clone(), source.field, source.max_doc)),
             value: OnceLock::new(),
         };
-        let index = if let Some((centroids, offsets, router_slot)) = centroid_slots {
+        let rows_slice = Arc::new(Blocks::from_metadata(source.metadata.clone())?);
+        let index = if let Some(slots) = centroid_slots {
             Some(ClusterIndex::open(
                 &options,
-                centroids,
-                offsets,
-                router_slot,
+                slots.centroids,
+                rows_slice.block_offsets(),
+                slots.router,
             )?)
+        } else {
+            if rows_slice.num_rows() != id_map.get(false)?.num_rows() as usize {
+                return Err(DataCorruption::comment_only("flat vector row count mismatch").into());
+            }
+            None
+        };
+        let quantization = if let VectorColMetadata::Quantized { layers: quants, .. } =
+            rows_slice.metadata.as_ref()
+        {
+            let mut layers = Vec::new();
+            for (layer, quant) in quants.iter().enumerate() {
+                let mut codes = None;
+                let mut scales = None;
+                let mut gammas = None;
+                let mut errors = None;
+                let mut constants = None;
+                for (idx, slot) in rows_slice.schema.iter().enumerate() {
+                    match &slot.slot_type {
+                        SlotType::QuantLayerCodes { layer: l, .. } if *l as usize == layer => {
+                            codes = Some(idx)
+                        }
+                        SlotType::QuantLayerScales { layer: l } if *l as usize == layer => {
+                            scales = Some(idx)
+                        }
+                        SlotType::QuantLayerGammas { layer: l } if *l as usize == layer => {
+                            gammas = Some(idx)
+                        }
+                        SlotType::QuantLayerErrors { layer: l } if *l as usize == layer => {
+                            errors = Some(idx)
+                        }
+                        SlotType::QuantLayerConstants { layer: l } if *l as usize == layer => {
+                            constants = Some(idx)
+                        }
+                        _ => (),
+                    }
+                }
+                layers.push(QuantizedLayerReader {
+                    blocks: Arc::clone(&rows_slice),
+                    layer,
+                    codes: codes.unwrap(),
+                    scales: scales.unwrap(),
+                    gammas: gammas.unwrap(),
+                    errors: errors.unwrap(),
+                    constants,
+                    code_stride: quant.code_stride(options.dim()),
+                    dim: options.dim(),
+                    bits: quant.bits(),
+                });
+            }
+            Some(QuantizedFieldReader {
+                index_ctx: Arc::new(QuantizedIndexCtx::new(Arc::clone(&rows_slice.metadata))?),
+                layers,
+                blocks: Arc::clone(&rows_slice),
+                norms: rows_slice
+                    .schema
+                    .iter()
+                    .position(|slot| matches!(slot.slot_type, SlotType::ResidualNorms))
+                    .expect("validated residual norms column"),
+            })
         } else {
             None
         };
-        let num_rows = match &index {
-            Some(index) => index.num_rows(),
-            None => id_map.get(false)?.num_rows() as usize,
-        };
-        let cluster_rows = index.as_ref().map(|ivf| {
-            (0..ivf.num_clusters())
-                .map(|b| ivf.cluster_range(b).start)
-                .chain(std::iter::once(ivf.num_rows()))
-                .collect()
-        });
-        let rows_slice = Arc::new(Blocks::from_metadata(
-            source.metadata.clone(),
-            num_rows,
-            cluster_rows,
-        )?);
-        let quantization =
-            if let VectorColMetadata::Quantized { layers: quants, .. } = rows_slice.meta.as_ref() {
-                let mut layers = Vec::new();
-                for (layer, quant) in quants.iter().enumerate() {
-                    let mut codes = None;
-                    let mut scales = None;
-                    let mut gammas = None;
-                    let mut errors = None;
-                    let mut constants = None;
-                    for (idx, slot) in rows_slice.slots.iter().enumerate() {
-                        match &slot.slot_type {
-                            SlotType::QuantLayerCodes { layer: l, .. } if *l as usize == layer => {
-                                codes = Some(idx)
-                            }
-                            SlotType::QuantLayerScales { layer: l } if *l as usize == layer => {
-                                scales = Some(idx)
-                            }
-                            SlotType::QuantLayerGammas { layer: l } if *l as usize == layer => {
-                                gammas = Some(idx)
-                            }
-                            SlotType::QuantLayerErrors { layer: l } if *l as usize == layer => {
-                                errors = Some(idx)
-                            }
-                            SlotType::QuantLayerConstants { layer: l } if *l as usize == layer => {
-                                constants = Some(idx)
-                            }
-                            _ => (),
-                        }
-                    }
-                    layers.push(QuantizedLayerReader {
-                        blocks: Arc::clone(&rows_slice),
-                        layer,
-                        codes: codes.unwrap(),
-                        scales: scales.unwrap(),
-                        gammas: gammas.unwrap(),
-                        errors: errors.unwrap(),
-                        constants,
-                        code_stride: quant.code_stride(options.dim()),
-                        dim: options.dim(),
-                        bits: quant.bits(),
-                    });
-                }
-                Some(QuantizedFieldReader {
-                    index_ctx: Arc::new(QuantizedIndexCtx::new(Arc::clone(&rows_slice.meta))?),
-                    layers,
-                    blocks: Arc::clone(&rows_slice),
-                    norms: rows_slice
-                        .slots
-                        .iter()
-                        .position(|slot| matches!(slot.slot_type, SlotType::ResidualNorms))
-                        .expect("validated residual norms column"),
-                })
-            } else {
-                None
-            };
 
         let num_vectors = match &index {
             Some(index) => index.num_docs(),
-            None => num_rows,
+            None => rows_slice.num_rows(),
         };
         Ok(Self {
             max_doc: source.max_doc,
@@ -382,10 +384,10 @@ impl VectorIndexReader {
         )
         .unwrap();
         let end = bytes.len();
-        crate::vector::storage::blocks::BlockDirectory::new(end as u64)
+        crate::vector::storage::blocks::BlockOffsetsWriter::new(end as u64)
             .finish(&mut bytes)
             .unwrap();
-        let rows_slice = Arc::new(Blocks::open(FileSlice::from(bytes), &options, 0, None).unwrap());
+        let rows_slice = Arc::new(Blocks::open(FileSlice::from(bytes), &options, false).unwrap());
         Self {
             max_doc: 0,
             options,
@@ -407,7 +409,7 @@ impl VectorIndexReader {
     /// `None` means the segment has no stored vector data; an empty stored field still
     /// returns its metadata.
     pub(crate) fn metadata(&self) -> Option<&VectorColMetadata> {
-        self.present.then_some(self.rows_slice.meta.as_ref())
+        self.present.then_some(self.rows_slice.metadata.as_ref())
     }
 
     /// Returns the field options.
@@ -421,6 +423,9 @@ impl VectorIndexReader {
     }
 
     /// Number of distinct docs with a vector value.
+    pub(crate) fn num_blocks(&self) -> usize {
+        self.rows_slice.num_blocks()
+    }
     pub fn num_vectors(&self) -> usize {
         self.num_vectors
     }
@@ -447,10 +452,16 @@ impl VectorIndexReader {
     }
 
     /// Each cluster's posting-list size, in cluster order; `None` when the storage is not IVF.
-    pub fn cluster_sizes(&self) -> Option<Vec<u32>> {
+    pub fn cluster_sizes(&self) -> crate::Result<Option<Vec<u32>>> {
         self.index
             .as_ref()
-            .map(|index| index.cluster_sizes().map(|size| size as u32).collect())
+            .map(|index| {
+                index
+                    .cluster_sizes()
+                    .map(|size| size.map(|n| n as u32))
+                    .collect()
+            })
+            .transpose()
     }
 
     /// Returns the number of live IVF posting rows.
@@ -472,119 +483,82 @@ impl VectorIndexReader {
 
     /// Returns whether the document has a vector, propagating storage errors.
     pub fn contains(&self, doc_id: DocId) -> crate::Result<bool> {
-        Ok(self.row_id(doc_id)?.is_some())
+        Ok(self.row_location(doc_id)?.is_some())
     }
 
-    /// Returns one document's raw little-endian vector bytes, or None if absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the vector row cannot be read.
+    /// Reads a document's vector through its stored block-local location.
     pub fn vector_bytes(&self, doc_id: DocId) -> crate::Result<Option<OwnedBytes>> {
-        if self.rows_slice.clustered() {
-            let Some(location) = self
-                .id_map
-                .get(true)?
-                .locate(doc_id, &self.rows_slice.block_rows)
-                .map_err(|e| DataCorruption::comment_only(e.to_string()))?
-            else {
-                return Ok(None);
-            };
-            let stride = self.options.bytes_per_vector();
-            let start = location.local as usize * stride;
-            return Ok(Some(
-                self.rows_slice
-                    .column(location.cluster as usize, 0)?
-                    .slice(start..start + stride)
-                    .read_vector_bytes(VectorReadKind::FullPrecision)?,
+        self.row_location(doc_id)?
+            .map(|address| self.vector_bytes_for_row(address))
+            .transpose()
+    }
+
+    /// Reads one full-precision vector at a block-local row.
+    pub fn vector_bytes_for_row(&self, address: BlockAddress) -> crate::Result<OwnedBytes> {
+        let (block, row) = (address.block as usize, address.row as usize);
+        if block >= self.num_blocks() {
+            return Err(TantivyError::InvalidArgument(
+                "vector block is out of bounds".into(),
             ));
         }
-        let Some(row) = self.row_id(doc_id)? else {
-            return Ok(None);
-        };
-        self.vector_bytes_for_row(row).map(Some)
-    }
-
-    /// Returns one dense vector row by row index without a document lookup.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `row` is out of bounds or cannot be read.
-    pub fn vector_bytes_for_row(&self, row: usize) -> crate::Result<OwnedBytes> {
-        if row >= *self.rows_slice.block_rows.last().unwrap() {
-            return Err(TantivyError::InvalidArgument(format!(
-                "vector row {row} is out of bounds"
-            )));
+        let view = self.rows_slice.block(block)?;
+        if row >= view.num_rows() {
+            return Err(TantivyError::InvalidArgument(
+                "vector row is out of bounds".into(),
+            ));
         }
-        self.rows_slice.read_column(0, row..row + 1)
+        view.read_column(0, row..row + 1)
     }
 
-    /// Fetches the increasing vector rows in `scratch.rows` through a storage-aware range plan. The
-    /// batch borrows its rows and the read chunks from `scratch`.
+    /// Fetches increasing local rows from one known block using storage-aware range reads.
     pub(crate) fn read_vector_rows_planned<'s>(
         &self,
+        block: usize,
+        scratch: &'s mut ReadScratch,
+    ) -> crate::Result<VectorRowBatch<'s>> {
+        self.read_vector_rows_in_cluster(block, scratch)
+    }
+    pub(crate) fn read_vector_rows_in_cluster<'s>(
+        &self,
+        cluster: usize,
         scratch: &'s mut ReadScratch,
     ) -> crate::Result<VectorRowBatch<'s>> {
         let ReadScratch {
             rows,
-            runs: read_ranges,
+            runs: ranges,
             blocks: block_scratch,
             chunks,
             ..
         } = scratch;
-        let rows: &'s [usize] = rows;
-        let num_rows = *self.rows_slice.block_rows.last().unwrap();
         if rows.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(TantivyError::InvalidArgument(
                 "planned vector rows must be strictly increasing".to_string(),
             ));
         }
         let stride = self.options.bytes_per_vector();
-        read_ranges.clear();
+        ranges.clear();
         chunks.clear();
-        if let Some(&row) = rows.last() {
-            if row >= num_rows {
-                return Err(TantivyError::InvalidArgument(format!(
-                    "vector row {row} is out of bounds"
-                )));
-            }
-        } else {
-            block_scratch.clear();
-            return Ok(VectorRowBatch {
-                rows,
-                chunks,
-                stride,
-            });
-        }
-
-        let mut selected = rows;
-        while let Some(&row) = selected.first() {
-            let block = self.rows_slice.block_of(row);
-            let first = self.rows_slice.block_rows[block];
-            let end = self.rows_slice.block_rows[block + 1];
-            let count = selected.partition_point(|&r| r < end);
-            let column = self.rows_slice.column(block, 0)?;
-            let range_start = read_ranges.len();
+        block_scratch.clear();
+        if let Some(&last) = rows.last() {
+            let block = self.rows_slice.block(cluster)?;
+            block.check_rows(&(rows[0]..last + 1))?;
+            let column = block.column(0);
             QuantizedLayerReader::plan_slot_reads(
                 &column,
                 stride,
-                first,
-                first..end,
-                &selected[..count],
-                read_ranges,
+                0,
+                block.row_range(),
+                rows,
+                ranges,
                 block_scratch,
             );
-            // The plan already establishes the block and row origin; reads keep that address.
-            for row_range in read_ranges[range_start..].iter().cloned() {
-                let bytes = column
-                    .slice((row_range.start - first) * stride..(row_range.end - first) * stride)
-                    .read_vector_bytes(VectorReadKind::FullPrecision)?;
-                chunks.push(VectorRowChunk {
-                    rows: row_range,
-                    bytes,
-                });
+            for range in ranges.iter().cloned() {
+                let bytes = column.read_vector_bytes_slice(
+                    range.start * stride..range.end * stride,
+                    VectorReadKind::FullPrecision,
+                )?;
+                chunks.push(VectorRowChunk { rows: range, bytes });
             }
-            selected = &selected[count..];
         }
         Ok(VectorRowBatch {
             rows,
@@ -593,34 +567,24 @@ impl VectorIndexReader {
         })
     }
 
-    /// Reads a clustered document id from its Data column, or selects a flat bitmap row.
-    pub fn doc_id_at(&self, row: usize) -> crate::Result<DocId> {
-        if row >= self.num_vectors() {
-            return Err(TantivyError::InvalidArgument(format!(
-                "vector row {row} is out of bounds"
-            )));
+    pub fn doc_id_at(&self, address: BlockAddress) -> crate::Result<DocId> {
+        let (block, row) = (address.block as usize, address.row as usize);
+        if block >= self.num_blocks() {
+            return Err(TantivyError::InvalidArgument(
+                "vector block is out of bounds".into(),
+            ));
         }
-        Ok(self.row_doc_ids(row..row + 1)?[0])
-    }
-    /// Reads and validates ascending document ids without opening the clustered IdMap.
-    pub(crate) fn row_doc_ids(&self, rows: Range<usize>) -> crate::Result<Vec<DocId>> {
-        if !self.rows_slice.clustered() {
-            let map = self.id_map.get(false)?;
-            return Ok(rows.map(|row| map.doc_at(row as u32)).collect());
+        let view = self.rows_slice.block(block)?;
+        if row >= view.num_rows() {
+            return Err(TantivyError::InvalidArgument(
+                "vector row is out of bounds".into(),
+            ));
         }
-        let mut result = Vec::with_capacity(rows.len());
         let mut docs = Vec::new();
-        let mut row = rows.start;
-        while row < rows.end {
-            let cluster = self.rows_slice.block_of(row);
-            self.read_doc_ids(cluster, &mut docs)?;
-            let first = self.rows_slice.block_rows[cluster];
-            let end = rows.end.min(self.rows_slice.block_rows[cluster + 1]);
-            result.extend_from_slice(&docs[row - first..end - first]);
-            row = end;
-        }
-        Ok(result)
+        self.read_doc_ids_from_block(block, &view, &mut docs)?;
+        Ok(docs[row])
     }
+
     /// Returns sorted document ids assigned to a cluster, or None for an invalid cluster.
     pub fn cluster_doc_ids(&self, cluster: usize) -> crate::Result<Option<Vec<DocId>>> {
         let Some(index) = &self.index else {
@@ -633,39 +597,67 @@ impl VectorIndexReader {
         self.read_doc_ids(cluster, &mut docs)?;
         Ok(Some(docs))
     }
-    /// Resolves one document by direct location or flat bitmap rank, validating stored coordinates.
-    pub(crate) fn row_id(&self, doc_id: DocId) -> crate::Result<Option<usize>> {
+    /// Resolves a document to a block and local row without global row numbering.
+    pub(crate) fn row_location(&self, doc_id: DocId) -> crate::Result<Option<BlockAddress>> {
+        if doc_id >= self.max_doc {
+            return Ok(None);
+        }
         let clustered = self.rows_slice.clustered();
         let map = self.id_map.get(clustered)?;
         if clustered {
-            let location = map
-                .locate(doc_id, &self.rows_slice.block_rows)
-                .map_err(|e| DataCorruption::comment_only(e.to_string()))?;
-            Ok(location
-                .map(|loc| self.rows_slice.block_rows[loc.cluster as usize] + loc.local as usize))
+            Ok(map
+                .locate(doc_id, |block| {
+                    self.rows_slice.row_range(block).map_err(io::Error::other)
+                })
+                .map_err(|e| DataCorruption::comment_only(e.to_string()))?
+                .map(|loc| BlockAddress::new(loc.cluster, loc.local)))
         } else {
-            Ok(map.rank_if_exists(doc_id).map(|row| row as usize))
+            let crate::vector::storage::metadata::Partition::Uniform { rows_per_block } =
+                self.rows_slice.metadata.field().partition
+            else {
+                unreachable!()
+            };
+            Ok(map
+                .rank_if_exists(doc_id)
+                .map(|row| BlockAddress::new(row / rows_per_block, row % rows_per_block)))
         }
     }
-    /// Reads only a cluster's document column, validating bounds and ordering while decoding.
+    /// Reads a block's document ids from its column or the flat presence map.
     pub(crate) fn read_doc_ids(&self, cluster: usize, out: &mut Vec<DocId>) -> crate::Result<()> {
+        let block = self.rows_slice.block(cluster)?;
+        self.read_doc_ids_from_block(cluster, &block, out)
+    }
+
+    fn read_doc_ids_from_block(
+        &self,
+        cluster: usize,
+        block: &Block<'_>,
+        out: &mut Vec<DocId>,
+    ) -> crate::Result<()> {
         out.clear();
         let blocks = &self.rows_slice;
-        if !blocks.clustered() || cluster >= blocks.block_rows.len() - 1 {
-            return Err(DataCorruption::comment_only("invalid DocIds cluster").into());
+        if !blocks.clustered() {
+            let crate::vector::storage::metadata::Partition::Uniform { rows_per_block } =
+                blocks.metadata.field().partition
+            else {
+                unreachable!()
+            };
+            let first = cluster * rows_per_block as usize;
+            let map = self.id_map.get(false)?;
+            out.extend((first..first + block.num_rows()).map(|row| map.doc_at(row as u32)));
+            return Ok(());
         }
-        if blocks.rows_in(cluster) == 0 {
+
+        if block.num_rows() == 0 {
             return Ok(());
         }
         let idx = blocks
-            .slots
+            .schema
             .iter()
             .position(|slot| matches!(slot.slot_type, SlotType::DocIds))
             .ok_or_else(|| DataCorruption::comment_only("missing DocIds column"))?;
-        let bytes = blocks
-            .column(cluster, idx)?
-            .read_vector_bytes(VectorReadKind::Other)?;
-        out.reserve(blocks.rows_in(cluster));
+        let bytes = block.read_column(idx, block.row_range())?;
+        out.reserve(block.num_rows());
         let mut previous = None;
         for bytes in bytes.chunks_exact(std::mem::size_of::<DocId>()) {
             let doc = DocId::from_le_bytes(bytes.try_into().unwrap());
@@ -689,11 +681,12 @@ impl VectorIndexReader {
         cluster: usize,
         offsets: Option<&[u32]>,
     ) -> crate::Result<ReadCost> {
+        let block = self.rows_slice.block(cluster)?;
         Ok(exact_read_cost(
-            &self.rows_slice.column(cluster, 0)?,
+            &block.column(0),
             self.options.bytes_per_vector(),
             offsets,
-            self.rows_slice.rows_in(cluster),
+            block.num_rows(),
         ))
     }
 
@@ -704,7 +697,11 @@ impl VectorIndexReader {
             .ok_or_else(|| DataCorruption::comment_only("centroid rows need an IVF index"))?;
         let row = index.centroid_row_slice(cluster)?;
         // Priced in the unit of the cluster's rows, whatever storage the centroids sit on.
-        let unit = self.rows_slice.column(cluster, 0)?.storage_block_len();
+        let unit = self
+            .rows_slice
+            .block(cluster)?
+            .column(0)
+            .storage_block_len();
         Ok(range_cost(&row, 0..row.len(), unit))
     }
 
@@ -717,7 +714,11 @@ impl VectorIndexReader {
     ) -> crate::Result<()> {
         self.id_map
             .get(true)?
-            .locate_many(docs, &self.rows_slice.block_rows, out)
+            .locate_many(
+                docs,
+                |cluster| self.rows_slice.row_range(cluster).map_err(io::Error::other),
+                out,
+            )
             .map_err(|error| match error.kind() {
                 std::io::ErrorKind::InvalidData => {
                     DataCorruption::comment_only(error.to_string()).into()
@@ -728,8 +729,8 @@ impl VectorIndexReader {
 
     /// Reads a cluster's full-precision rows without document ids or quantized columns.
     pub(crate) fn read_cluster_rows(&self, cluster: usize) -> crate::Result<OwnedBytes> {
-        let rows = self.rows_slice.block_rows[cluster]..self.rows_slice.block_rows[cluster + 1];
-        self.rows_slice.read_column(0, rows)
+        let block = self.rows_slice.block(cluster)?;
+        block.read_column(0, block.row_range())
     }
 }
 
@@ -796,7 +797,10 @@ mod tests {
         assert_eq!(&*reads.lock().unwrap(), &[0..1]);
         reads.lock().unwrap().clear();
         assert_eq!(
-            opened.locate(2, &[0, 2])?,
+            opened.locate(
+                2,
+                crate::vector::storage::id_map::tests::boundaries(&[0, 2])
+            )?,
             Some(DocLocation {
                 cluster: 0,
                 local: 1
@@ -809,7 +813,7 @@ mod tests {
     #[test]
     fn doc_ids_reject_out_of_bounds_and_nonascending_values() -> crate::Result<()> {
         use crate::vector::storage::blocks::{
-            block_len, column_range, pad, write_metadata, BlockDirectory,
+            block_len, column_range, pad, write_metadata, BlockOffsetsWriter,
         };
         for docs in [[0u32, 1, 3], [0, 0, 2], [1, 0, 2]] {
             let options = VectorOptions::new(2, Metric::L2);
@@ -831,15 +835,10 @@ mod tests {
             }
             let padding = first + block_len(&slots, docs.len()) - data.len();
             pad(&mut data, padding)?;
-            let mut directory = BlockDirectory::new(first as u64);
-            directory.push(data.len() as u64, docs.len() as u32);
+            let mut directory = BlockOffsetsWriter::new(first as u64);
+            directory.push(data.len() as u64, docs.len());
             directory.finish(&mut data)?;
-            let blocks = Arc::new(Blocks::open(
-                FileSlice::from(data),
-                &options,
-                3,
-                Some(vec![0, 3]),
-            )?);
+            let blocks = Arc::new(Blocks::open(FileSlice::from(data), &options, true)?);
             let reader = VectorIndexReader {
                 max_doc: 3,
                 options,
@@ -857,11 +856,11 @@ mod tests {
                 "column=DocIds values={docs:?}: {error}"
             );
             assert!(matches!(
-                reader.doc_id_at(0),
+                reader.doc_id_at(BlockAddress::new(0, 0)),
                 Err(TantivyError::DataCorruption(_))
             ));
             assert!(matches!(
-                reader.doc_id_at(3),
+                reader.doc_id_at(BlockAddress::new(0, 3)),
                 Err(TantivyError::InvalidArgument(_))
             ));
         }
@@ -878,11 +877,11 @@ mod tests {
         )?;
         data.extend([0; 12]);
         let end = data.len();
-        let mut directory = crate::vector::storage::blocks::BlockDirectory::new(prefix as u64);
+        let mut directory = crate::vector::storage::blocks::BlockOffsetsWriter::new(prefix as u64);
         directory.push(end as u64, 1);
         directory.finish(&mut data)?;
-        let footer = data.len() - 8;
-        let directory_start = footer - 2 * 12;
+        let footer = data.len() - 32;
+        let directory_start = data.len() - 16 - 2 * 16;
         let mut ids = Vec::new();
         IdMap::serialize(&[1], 3, &mut ids)?;
         let data_reads = Arc::new(Mutex::new(Vec::new()));
@@ -922,15 +921,18 @@ mod tests {
         assert!(readers.iter().all(|r| Arc::ptr_eq(r, &readers[0])));
         let reads = data_reads.lock().unwrap();
         assert_eq!(
-            reads.iter().filter(|r| **r == (footer..footer + 8)).count(),
+            reads
+                .iter()
+                .filter(|r| **r == (footer..footer + 32))
+                .count(),
             1
         );
         assert_eq!(
             reads
                 .iter()
-                .filter(|r| **r == (directory_start..footer))
+                .filter(|r| r.start < directory_start && r.end > prefix)
                 .count(),
-            1
+            0
         );
         drop(reads);
         assert_eq!(
@@ -943,7 +945,7 @@ mod tests {
             1
         );
         assert_eq!(readers[0].num_vectors(), 1);
-        assert_eq!(readers[0].row_id(1)?, Some(0));
+        assert_eq!(readers[0].row_location(1)?, Some(BlockAddress::new(0, 0)));
         Ok(())
     }
 
@@ -956,7 +958,7 @@ mod tests {
             &VectorColMetadata::build_flat(&options),
         )?;
         let end = data.len();
-        crate::vector::storage::blocks::BlockDirectory::new(end as u64).finish(&mut data)?;
+        crate::vector::storage::blocks::BlockOffsetsWriter::new(end as u64).finish(&mut data)?;
         let id_reads = Arc::new(Mutex::new(Vec::new()));
         let field = VectorFieldReader {
             source: Some(VectorSource {
@@ -999,15 +1001,15 @@ mod tests {
             &VectorColMetadata::build_flat(&opts),
         )?;
         data.extend_from_slice(&expected_bytes);
-        let mut directory = crate::vector::storage::blocks::BlockDirectory::new(prefix as u64);
-        directory.push(data.len() as u64, ROWS as u32);
+        let mut directory = crate::vector::storage::blocks::BlockOffsetsWriter::new(prefix as u64);
+        directory.push(data.len() as u64, ROWS);
         directory.finish(&mut data)?;
         let storage = Arc::new(BlockTrackedBytes {
             bytes: data,
             reads: Arc::clone(&reads),
             block_len: 32,
         });
-        let blocks = Arc::new(Blocks::open(FileSlice::new(storage), &opts, ROWS, None)?);
+        let blocks = Arc::new(Blocks::open(FileSlice::new(storage), &opts, false)?);
         reads.lock().unwrap().clear();
         let reader = VectorIndexReader {
             max_doc: ROWS as DocId,
@@ -1024,7 +1026,7 @@ mod tests {
         let selected = [1, 2, 10, 11];
         let mut scratch = ReadScratch::default();
         scratch.rows.extend(selected);
-        let batch = reader.read_vector_rows_planned(&mut scratch)?;
+        let batch = reader.read_vector_rows_planned(0, &mut scratch)?;
 
         assert_eq!(batch.read_count(), 2);
         assert!(batch.read_count() < selected.len());
@@ -1035,9 +1037,17 @@ mod tests {
             .map(|(row, bytes)| (row, query.score_row(bytes).score().to_bits()))
             .collect::<Vec<_>>();
         assert_eq!(scratch.runs, [1..3, 10..12]);
+        let blocks_end = prefix + expected_bytes.len();
+        let offsets_start = crate::vector::storage::blocks::align_up(blocks_end, 8);
         assert_eq!(
             &*reads.lock().unwrap(),
-            &[prefix + 8..prefix + 24, prefix + 80..prefix + 96]
+            &[
+                // One offset pair and terminal alignment check, then the two planned runs.
+                offsets_start..offsets_start + 24,
+                blocks_end..offsets_start,
+                prefix + 8..prefix + 24,
+                prefix + 80..prefix + 96,
+            ]
         );
         let stride = DIM * std::mem::size_of::<f32>();
         let expected = selected

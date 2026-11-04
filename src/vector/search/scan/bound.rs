@@ -353,7 +353,7 @@ mod tests {
     fn addr(row: u32) -> RowAddress {
         RowAddress {
             segment_ord: 0,
-            row_id: row as usize,
+            block_address: crate::vector::BlockAddress::new(0, row),
         }
     }
 
@@ -647,7 +647,7 @@ mod tests {
             assert_eq!(mixed.boundary_lower(3, 2.0), threshold(7.0));
             mixed.band(3, 2.0);
             assert_eq!(
-                mixed.candidates.global_rows(),
+                mixed.candidates.row_labels(),
                 [0, 1],
                 "exact rows push row 2 out"
             );
@@ -663,7 +663,7 @@ mod tests {
                 far.push(row, row as DocId, estimate, 0.1);
             }
             far.band(1, 2.0);
-            assert_eq!(far.candidates.global_rows(), [0]);
+            assert_eq!(far.candidates.row_labels(), [0]);
         }
 
         /// Exact offer for the same address replaces the interval (no double-count) and only
@@ -757,7 +757,7 @@ mod tests {
                     let mut order = (0..n).collect::<Vec<_>>();
                     order.sort_by(|&a, &b| truth[b].total_cmp(&truth[a]));
                     harness.band(k, QUANTIZED_BOUNDARY_KAPPA);
-                    let survivors = harness.candidates.global_rows();
+                    let survivors = harness.candidates.row_labels();
                     for row in &order[..k] {
                         assert!(
                             exact_rows.contains(row) || survivors.contains(row),
@@ -885,8 +885,8 @@ mod tests {
                     let expected = harness_of(&kept);
                     assert_eq!(harness.block_lens(), expected.block_lens(), "{case}");
                     assert_eq!(
-                        harness.candidates.column_trace(true),
-                        expected.candidates.column_trace(true),
+                        harness.candidates.column_labels(true),
+                        expected.candidates.column_labels(true),
                         "{case}"
                     );
                     assert_eq!(
@@ -940,8 +940,8 @@ mod tests {
                 );
                 assert_eq!(rechecked.block_lens(), removed.block_lens(), "{case}");
                 assert_eq!(
-                    rechecked.candidates.column_trace(true),
-                    removed.candidates.column_trace(true),
+                    rechecked.candidates.column_labels(true),
+                    removed.candidates.column_labels(true),
                     "{case}"
                 );
                 assert_eq!(
@@ -1053,7 +1053,7 @@ mod tests {
                 harness.push(row, row as DocId, estimate, sigma);
             }
             harness.band(k, kappa);
-            harness.candidates.global_rows()
+            harness.candidates.row_labels()
         }
 
         /// Widening kappa, or any one row's sigma, never removes a survivor.
@@ -1119,7 +1119,7 @@ mod tests {
             scan.band(TOP_N, KAPPA);
             let scan_first: Vec<u32> = scan
                 .candidates
-                .global_rows()
+                .row_labels()
                 .iter()
                 .map(|&row| row as u32)
                 .collect();
@@ -1149,14 +1149,14 @@ mod tests {
                     .map(|&local| harness_first[local as usize])
                     .collect();
 
-            for (index, row) in scan.candidates.global_rows().into_iter().enumerate() {
+            for (index, row) in scan.candidates.row_labels().into_iter().enumerate() {
                 scan.candidates.columns.estimates[index] += refinements[row];
                 scan.candidates.columns.sigmas[index] = layer1_sigmas[row];
             }
             scan.band(TOP_N, KAPPA);
             let scan_second: Vec<u32> = scan
                 .candidates
-                .global_rows()
+                .row_labels()
                 .iter()
                 .map(|&row| row as u32)
                 .collect();

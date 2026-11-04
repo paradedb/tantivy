@@ -307,6 +307,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
             if read_err.is_some() {
                 return;
             }
+            // TODO: Batch vector reads by block instead of reopening the block per document.
             for &doc in docs {
                 if let Some(bs) = alive {
                     if !bs.is_alive(doc) {

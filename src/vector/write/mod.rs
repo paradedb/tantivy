@@ -25,22 +25,16 @@ use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, Segme
 use crate::vector::storage::header::{CENTROIDS_EXT, VEC_EXT};
 use crate::vector::write::flat::{merge_flat, FlatVecWriter};
 use crate::vector::write::ivf::merge_ivf;
-use crate::vector::VectorIndexReader;
+use crate::vector::{BlockAddress, VectorIndexReader};
 use crate::{DocAddress, DocId, SegmentOrdinal, TantivyError};
 
 pub(crate) struct VectorPlugin;
 
-/// Physical position of a vector in a segment's vector storage.
-///
-/// Not a `DocId`: docs without a vector have no row, and clustered segments order rows by
-/// cluster.
-pub(crate) type RowId = usize;
-
-/// A vector row within a set of segments, the row counterpart of [`DocAddress`].
+/// A vector's physical location within one source segment and block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct RowAddress {
     pub(crate) segment_ord: SegmentOrdinal,
-    pub(crate) row_id: RowId,
+    pub(crate) block_address: BlockAddress,
 }
 
 impl SegmentPlugin for VectorPlugin {
@@ -94,7 +88,7 @@ pub(crate) fn merge_source_rows(
     let mut source_rows = vec![None; num_target_docs];
     for (segment_ord, reader) in readers.iter().enumerate() {
         let segment_ord = segment_ord as SegmentOrdinal;
-        for_each_row(reader, |row_id, doc_id| {
+        for_each_row(reader, |block, row, doc_id| {
             if ctx.cancel.wants_cancel() {
                 return Err(TantivyError::Cancelled);
             }
@@ -107,7 +101,7 @@ pub(crate) fn merge_source_rows(
             if let Some(target_doc_id) = *target_doc_id {
                 source_rows[target_doc_id as usize] = Some(RowAddress {
                     segment_ord,
-                    row_id,
+                    block_address: BlockAddress::new(block as u32, row as u32),
                 });
             }
             Ok(())
@@ -116,23 +110,16 @@ pub(crate) fn merge_source_rows(
     Ok(source_rows)
 }
 
-/// Calls `f` with every vector row in `reader` and the source `DocId` stored in it.
+/// Enumerates source vectors with their already-known block-local coordinates.
 fn for_each_row(
     reader: &VectorIndexReader,
-    mut f: impl FnMut(RowId, DocId) -> crate::Result<()>,
+    mut f: impl FnMut(usize, usize, DocId) -> crate::Result<()>,
 ) -> crate::Result<()> {
-    if let Some(index) = reader.index() {
-        let mut doc_ids = Vec::new();
-        for cluster in 0..index.num_clusters() {
-            reader.read_doc_ids(cluster, &mut doc_ids)?;
-            for (row_id, &doc_id) in index.cluster_range(cluster).zip(&doc_ids) {
-                f(row_id, doc_id)?;
-            }
-        }
-    } else {
-        let doc_ids = reader.row_doc_ids(0..reader.num_vectors())?;
-        for (row_id, doc_id) in doc_ids.into_iter().enumerate() {
-            f(row_id, doc_id)?;
+    let mut docs = Vec::new();
+    for block in 0..reader.num_blocks() {
+        reader.read_doc_ids(block, &mut docs)?;
+        for (row, &doc) in docs.iter().enumerate() {
+            f(block, row, doc)?;
         }
     }
     Ok(())

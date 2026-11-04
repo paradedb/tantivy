@@ -21,6 +21,7 @@ use crate::vector::search::interval::{Estimate, Threshold};
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
 use crate::vector::storage::metadata::QuantizationSchedule;
 use crate::vector::storage::reader::VectorIndexReader;
+use crate::vector::BlockAddress;
 use crate::{DocId, TantivyError};
 
 const ERROR_CONE_QUERY_COUNT: usize = 100;
@@ -119,7 +120,7 @@ pub(crate) fn diagnostic_advance_raw_prefix(
 /// SoA boundary state for corrected-error diagnostics.
 #[derive(Default)]
 struct ErrorConeCandidates {
-    rows: Vec<usize>,
+    rows: Vec<BlockAddress>,
     docs: Vec<DocId>,
     raw_prefixes: Vec<f32>,
     sign_query_error_terms: Vec<f32>,
@@ -135,7 +136,7 @@ impl ErrorConeCandidates {
 
     fn push(
         &mut self,
-        row: usize,
+        row: BlockAddress,
         doc: DocId,
         raw_prefix: f32,
         sign_query_error_term: f32,
@@ -283,7 +284,7 @@ impl VectorIndexReader {
         let mut first_row_by_doc = BTreeMap::new();
         let mut docs = Vec::new();
         for cluster in 0..index.num_clusters() {
-            let rows = index.cluster_range(cluster);
+            let rows = 0..index.cluster_num_rows(cluster)?;
             if rows.is_empty() {
                 continue;
             }
@@ -292,19 +293,25 @@ impl VectorIndexReader {
                 if alive.is_some_and(|alive| !alive.is_alive(doc_id)) {
                     continue;
                 }
-                first_row_by_doc.entry(doc_id).or_insert(row);
+                first_row_by_doc
+                    .entry(doc_id)
+                    .or_insert(BlockAddress::new(cluster as u32, row as u32));
             }
         }
         let target = count.min(first_row_by_doc.len());
         if target == 0 {
             return Ok(Some(Vec::new()));
         }
-        let candidates: Vec<(DocId, usize)> = first_row_by_doc.into_iter().collect();
+        let candidates: Vec<(DocId, BlockAddress)> = first_row_by_doc.into_iter().collect();
         let mut queries = Vec::with_capacity(target);
         for sample in 0..target {
             let candidate = sample * candidates.len() / target;
-            let (doc_id, row) = candidates[candidate];
-            let values = decode_row::<f32>(&self.vector_bytes_for_row(row)?, self.options.dim())?;
+            let (doc_id, address) = candidates[candidate];
+            let (cluster, row) = (address.block as usize, address.row as usize);
+            let values = decode_row::<f32>(
+                &self.vector_bytes_for_row(BlockAddress::new(cluster as u32, row as u32))?,
+                self.options.dim(),
+            )?;
             queries.push(VectorEstimatorQuery {
                 values,
                 excluded_doc_id: Some(doc_id),
@@ -424,7 +431,7 @@ impl VectorIndexReader {
 
         let mut docs = Vec::new();
         for cluster in 0..index.num_clusters() {
-            let rows = index.cluster_range(cluster);
+            let rows = 0..index.cluster_num_rows(cluster)?;
             if rows.is_empty() {
                 continue;
             }
@@ -443,7 +450,8 @@ impl VectorIndexReader {
                 sampled += 1;
                 next_sample_ordinal = sampled * live_row_count / target_rows;
 
-                let vector_bytes = self.vector_bytes_for_row(row)?;
+                let vector_bytes =
+                    self.vector_bytes_for_row(BlockAddress::new(cluster as u32, row as u32))?;
                 let values = decode_row::<f32>(&vector_bytes, self.options.dim())?;
                 let residual: Vec<f32> = values
                     .iter()
@@ -451,7 +459,8 @@ impl VectorIndexReader {
                     .map(|(&value, &center)| value - center)
                     .collect();
                 let mut stored_layers = Vec::with_capacity(layer_count);
-                let residual_norm_squared = quantization.residual_norm(row)?;
+                let residual_norm_squared =
+                    quantization.residual_norm(BlockAddress::new(cluster as u32, row as u32))?;
                 if !residual_norm_squared.is_finite() || residual_norm_squared < 0.0 {
                     return Err(DataCorruption::comment_only(format!(
                         "exact-E audit row {row} has invalid stored residual squared norm \
@@ -460,12 +469,12 @@ impl VectorIndexReader {
                     .into());
                 }
                 for layer in &quantization.layers {
-                    let codes = layer.code_bytes(row)?;
-                    let sidecar = layer.read_sidecar(row..row + 1)?;
+                    let codes = layer.code_bytes(BlockAddress::new(cluster as u32, row as u32))?;
+                    let sidecar = layer.read_sidecar(cluster, row..row + 1)?;
                     let scale = sidecar.scale(row)?;
                     let stored_gamma = sidecar.gamma(row)?;
                     let corrected_error_ratio = sidecar.error_ratio(row)?;
-                    let constant = layer.constant(row)?;
+                    let constant = layer.constant(BlockAddress::new(cluster as u32, row as u32))?;
                     stored_layers.push((
                         codes,
                         scale,
@@ -669,16 +678,23 @@ impl VectorIndexReader {
 
         let row_count = index.num_rows();
         let layer_count = measurement_ctx.specs.len();
-        let mut gammas = vec![vec![f32::NAN; row_count]; layer_count];
-        let mut stored_scales = vec![vec![f32::NAN; row_count]; layer_count];
-        let mut corrected_error_ratios = vec![vec![f32::NAN; row_count]; layer_count];
-        let mut residual_norms_squared = vec![f32::NAN; row_count];
+        let row_counts = index.cluster_sizes().collect::<crate::Result<Vec<_>>>()?;
+        let empty_rows = || {
+            row_counts
+                .iter()
+                .map(|&n| vec![f32::NAN; n])
+                .collect::<Vec<_>>()
+        };
+        let mut gammas = (0..layer_count).map(|_| empty_rows()).collect::<Vec<_>>();
+        let mut stored_scales = (0..layer_count).map(|_| empty_rows()).collect::<Vec<_>>();
+        let mut corrected_error_ratios = (0..layer_count).map(|_| empty_rows()).collect::<Vec<_>>();
+        let mut residual_norms_squared = empty_rows();
         let centroid_stride = self.options.bytes_per_vector();
         let centroid_bytes = index.centroid_bytes()?;
 
         let mut docs = Vec::new();
         for cluster in 0..index.num_clusters() {
-            let rows = index.cluster_range(cluster);
+            let rows = 0..index.cluster_num_rows(cluster)?;
             if rows.is_empty() {
                 continue;
             }
@@ -688,18 +704,21 @@ impl VectorIndexReader {
                     continue;
                 }
                 for (depth, layer) in quantization.layers.iter().enumerate() {
-                    let sidecar = layer.read_sidecar(row..row + 1)?;
+                    let sidecar = layer.read_sidecar(cluster, row..row + 1)?;
                     let scale = sidecar.scale(row)?;
                     let stored_gamma = sidecar.gamma(row)?;
-                    stored_scales[depth][row] = scale;
-                    gammas[depth][row] = stored_gamma;
-                    corrected_error_ratios[depth][row] = sidecar.error_ratio(row)?;
+                    stored_scales[depth][cluster][row] = scale;
+                    gammas[depth][cluster][row] = stored_gamma;
+                    corrected_error_ratios[depth][cluster][row] = sidecar.error_ratio(row)?;
                 }
-                residual_norms_squared[row] = quantization.residual_norm(row)?;
-                if !residual_norms_squared[row].is_finite() || residual_norms_squared[row] < 0.0 {
+                residual_norms_squared[cluster][row] =
+                    quantization.residual_norm(BlockAddress::new(cluster as u32, row as u32))?;
+                if !residual_norms_squared[cluster][row].is_finite()
+                    || residual_norms_squared[cluster][row] < 0.0
+                {
                     return Err(DataCorruption::comment_only(format!(
                         "exact-E cone row {row} has invalid stored residual squared norm {}",
-                        residual_norms_squared[row]
+                        residual_norms_squared[cluster][row]
                     ))
                     .into());
                 }
@@ -738,7 +757,7 @@ impl VectorIndexReader {
             candidates.estimates.reserve(row_count);
             candidates.sigmas.reserve(row_count);
             for cluster in 0..index.num_clusters() {
-                let rows = index.cluster_range(cluster);
+                let rows = 0..index.cluster_num_rows(cluster)?;
                 if rows.is_empty() {
                     continue;
                 }
@@ -748,7 +767,8 @@ impl VectorIndexReader {
                     if alive.is_some_and(|alive| !alive.is_alive(doc)) {
                         continue;
                     }
-                    let bytes = self.vector_bytes_for_row(row)?;
+                    let bytes =
+                        self.vector_bytes_for_row(BlockAddress::new(cluster as u32, row as u32))?;
                     let exact_score = exact_query.score_row(&bytes).score();
                     match exact_by_doc.entry(doc) {
                         std::collections::btree_map::Entry::Vacant(entry) => {
@@ -766,8 +786,8 @@ impl VectorIndexReader {
                     }
                     let scale = layer.scale(row)?;
                     let constant = layer.constant(row)?;
-                    let gamma = gammas[0][row];
-                    let residual_norm_squared = residual_norms_squared[row];
+                    let gamma = gammas[0][cluster][row];
+                    let residual_norm_squared = residual_norms_squared[cluster][row];
                     let mut arithmetic = ArithmeticError::default();
                     let raw_prefix = diagnostic_advance_raw_prefix(
                         &query,
@@ -800,7 +820,7 @@ impl VectorIndexReader {
                         metric,
                         self.options.dim(),
                         residual_norm_squared,
-                        corrected_error_ratios[0][row],
+                        corrected_error_ratios[0][cluster][row],
                         gamma,
                         query_norm * query_norm,
                         sign_query_error_term,
@@ -815,7 +835,14 @@ impl VectorIndexReader {
                         ))
                         .into());
                     }
-                    candidates.push(row, doc, raw_prefix, sign_query_error_term, estimate, sigma);
+                    candidates.push(
+                        BlockAddress::new(cluster as u32, row as u32),
+                        doc,
+                        raw_prefix,
+                        sign_query_error_term,
+                        estimate,
+                        sigma,
+                    );
                     *candidates.arithmetic_errors.last_mut().unwrap() = arithmetic;
                 }
             }
@@ -835,35 +862,23 @@ impl VectorIndexReader {
 
             for depth in 0..layer_count {
                 if depth != 0 {
-                    let mut cluster = 0usize;
                     for candidate in 0..candidates.len() {
-                        let row = candidates.rows[candidate];
-                        while cluster < index.num_clusters()
-                            && index.cluster_range(cluster).end <= row
-                        {
-                            cluster += 1;
-                        }
-                        if cluster == index.num_clusters()
-                            || !index.cluster_range(cluster).contains(&row)
-                        {
-                            return Err(DataCorruption::comment_only(format!(
-                                "exact-E cone survivor row {row} is outside IVF cluster ranges"
-                            ))
-                            .into());
-                        }
+                        let address = candidates.rows[candidate];
+                        let (cluster, row) = (address.block as usize, address.row as usize);
                         let layer = &quantization.layers()[depth];
-                        let scale = stored_scales[depth][row];
-                        let constant = layer.constant(row)?;
+                        let scale = stored_scales[depth][cluster][row];
+                        let constant =
+                            layer.constant(BlockAddress::new(cluster as u32, row as u32))?;
                         candidates.raw_prefixes[candidate] = diagnostic_advance_raw_prefix(
                             &query,
                             metric,
                             depth,
-                            &layer.code_bytes(row)?,
+                            &layer.code_bytes(BlockAddress::new(cluster as u32, row as u32))?,
                             scale,
                             constant,
                             candidates.raw_prefixes[candidate],
                             cluster_scores[cluster],
-                            residual_norms_squared[row],
+                            residual_norms_squared[cluster][row],
                             &mut candidates.arithmetic_errors[candidate],
                         )?;
                         if matches!(
@@ -873,8 +888,8 @@ impl VectorIndexReader {
                             candidates.sign_query_error_terms[candidate] +=
                                 scale * scale * query.query_error_squared(depth) as f32;
                         }
-                        let gamma = gammas[depth][row];
-                        let residual_norm_squared = residual_norms_squared[row];
+                        let gamma = gammas[depth][cluster][row];
+                        let residual_norm_squared = residual_norms_squared[cluster][row];
                         let base = if metric == Metric::L2 {
                             cluster_scores[cluster] - residual_norm_squared
                         } else {
@@ -891,7 +906,7 @@ impl VectorIndexReader {
                             metric,
                             self.options.dim(),
                             residual_norm_squared,
-                            corrected_error_ratios[depth][row],
+                            corrected_error_ratios[depth][cluster][row],
                             gamma,
                             query_norm * query_norm,
                             candidates.sign_query_error_terms[candidate],
@@ -1068,10 +1083,17 @@ mod tests {
     #[test]
     fn error_cone_boundary_includes_optimistic_equality() {
         let mut candidates = ErrorConeCandidates::default();
-        candidates.push(0, 1, 0.0, 0.0, 10.0, 0.0);
-        candidates.push(1, 2, 0.0, 0.0, 8.0, 1.0);
-        candidates.push(2, 3, 0.0, 0.0, 4.0, 1.0);
+        candidates.push(BlockAddress::new(0, 0), 1, 0.0, 0.0, 10.0, 0.0);
+        candidates.push(BlockAddress::new(0, 1), 2, 0.0, 0.0, 8.0, 1.0);
+        candidates.push(BlockAddress::new(0, 2), 3, 0.0, 0.0, 4.0, 1.0);
         candidates.band(2, 2.0);
-        assert_eq!(candidates.rows, vec![0, 1, 2]);
+        assert_eq!(
+            candidates.rows,
+            vec![
+                BlockAddress::new(0, 0),
+                BlockAddress::new(0, 1),
+                BlockAddress::new(0, 2)
+            ]
+        );
     }
 }
