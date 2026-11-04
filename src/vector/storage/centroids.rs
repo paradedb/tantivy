@@ -6,7 +6,7 @@
 //! The on-disk file is a 4-byte format-version stamp (see `vector::storage::header`)
 //! followed by a [`CompositeFile`](crate::directory::CompositeFile). Written
 //! per field, only for IVF segments (⟺ the field's `.vec` `IdMap` is
-//! `DocLocations`). The composite has four slots per field:
+//! `DocLocations`). The composite has three slots per field:
 //!
 //! ```text
 //! [0] num_centroids (u32) + num_docs (u32) + centroid_bytes (N · stride),
@@ -147,9 +147,8 @@ impl ClusterIndex {
         Ok(())
     }
 
-    /// Parse a field's `.centroids` slots. Only the count words, the offsets,
-    /// and the router topology are materialized; the centroid
-    /// rows stay behind a [`FileSlice`] for lazy range reads.
+    /// Parse a field's `.centroids` slots. Count words and router topology are
+    /// materialized; centroid rows and cluster offsets remain lazy.
     /// The router is opened as the kind persisted in `router_slice`.
     pub(crate) fn open(
         options: &VectorOptions,

@@ -322,7 +322,15 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
                         .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
                     let (version, body) = read_centroid_header(&centroids_file)?;
                     assert_eq!(version, VectorFileVersion::V4);
-                    CompositeFile::open(&body)?;
+                    let composite = CompositeFile::open(&body)?;
+                    let mut slots: Vec<_> = composite
+                        .field_indices()
+                        .filter_map(|(field, idx)| {
+                            (field == index.embedding_field()).then_some(idx)
+                        })
+                        .collect();
+                    slots.sort_unstable();
+                    assert_eq!(slots, [0, 1, 2]);
                 }
             }
         }

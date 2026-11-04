@@ -19,9 +19,9 @@ distance metric; the segment stores the metadata needed to decode its values.
 +----------------------------------------------------------------------+
 | <segment-id>.centroids (present for clustered storage)               |
 | +----------------------------------------------------------------+   |
-| | Vector field A: cluster centers, counts, bounds, router        |   |
+| | Vector field A: cluster centers, row offsets, router           |   |
 | +----------------------------------------------------------------+   |
-| | Vector field B: cluster centers, counts, bounds, router        |   |
+| | Vector field B: cluster centers, row offsets, router           |   |
 | +----------------------------------------------------------------+   |
 +----------------------------------------------------------------------+
 | Other files: documents, postings, deletion visibility, ...           |
@@ -47,7 +47,7 @@ Segment vector files are immutable once written. Inserts produce new segments.
 Deletion visibility is stored separately; a merge omits deleted documents and
 writes new vector files.
 
-This document describes the implemented `.vec` **V5** and `.centroids` **V3**
+This document describes the implemented `.vec` **V5** and `.centroids` **V4**
 formats. Cluster row offsets live only in `.centroids`; `.vec` stores block byte
 offsets. All multibyte numbers below are little-endian. Ranges use an exclusive
 end: `[start, end)`.
@@ -433,12 +433,12 @@ not guarantee an aligned memory address; decoders support unaligned bytes.
 ## `.centroids`: clustering data for each field
 
 This file describes the clusters whose vector data is in `.vec`. A centroid is
-a representative vector for a cluster. Each field has four composite slots:
+a representative vector for a cluster. Each field has three composite slots:
 
 ```text
 <segment-id>.centroids: bytes from start to end
 +----------------------------------------------------------------------+
-| Version: u32 = 3                                                     |
+| Version: u32 = 4                                                     |
 +----------------------------------------------------------------------+
 | Field A                                                              |
 | +----------------------------------------------------------------+   |
@@ -446,12 +446,10 @@ a representative vector for a cluster. Each field has four composite slots:
 | +----------------------------------------------------------------+   |
 | | Slot 1: cluster_offsets, cumulative vector counts              |   |
 | +----------------------------------------------------------------+   |
-| | Slot 3: bounds, a radius around each cluster center            |   |
-| +----------------------------------------------------------------+   |
 | | Slot 2: router, navigation among cluster centers               |   |
 | +----------------------------------------------------------------+   |
 +----------------------------------------------------------------------+
-| Field B: the same four slots                                         |
+| Field B: the same three slots                                        |
 | ... remaining fields                                                 |
 +----------------------------------------------------------------------+
 | Composite directory: (field, slot index) -> entry location           |
@@ -462,12 +460,14 @@ a representative vector for a cluster. Each field has four composite slots:
 +----------------------------------------------------------------------+
 ```
 
-The writer emits slots in the order **0, 1, 3, 2** for each field. Slot indices
-are lookup keys. The file begins with `version: u32 = 3` and ends with the same
+The writer emits slots in the order **0, 1, 2** for each field. Slot indices
+are lookup keys. The file begins with `version: u32 = 4` and ends with the same
 composite directory, directory-length word, and standard footer used by `.vec`.
+V4 removes the former slot 3 containing cluster radius bounds. No radius bounds
+are written or read, and earlier centroid formats require rebuilding.
 
 The cluster index is shared across both files: center `c`, offsets `c` and
-`c+1`, bound `c`, and `.vec` block `c` all refer to the same cluster. Stacked
+`c+1`, and `.vec` block `c` all refer to the same cluster. Stacked
 routing can reorder clusters during construction; all these structures use
 the resulting order.
 
@@ -516,24 +516,8 @@ The slot must contain exactly `K+1` offsets and agree with the `.vec` block coun
 Offsets are read lazily and must be nondecreasing and no larger than the final
 row count, which is limited to `u32::MAX` by vector row addressing.
 
-V4 duplicated these counts in a `.vec` `row_offsets: u32[K+1]` array. V5 removes
-that array. The `.centroids` slot keeps its V3 encoding.
-
-### Slot 3: cluster bounds
-
-```text
-Slot 3: cluster bounds
-+----------------------------------------------------------------------+
-| bound_kind: u8 = 0     Ball                                          |
-+----------------------------------------------------------------------+
-| radii: f32[K]         [radius 0][radius 1] ... [radius K-1]          |
-+----------------------------------------------------------------------+
-```
-
-A radius covers the cluster's stored members around its stored center, using
-the Euclidean residual norm. Search uses it to determine when a cluster cannot
-improve the current results. Infinite radii disable that skip. Negative bounds
-are rejected. The slot occupies `1 + 4*K` bytes.
+`.vec` V4 duplicated these counts in a `row_offsets: u32[K+1]` array. `.vec` V5
+removes that array. Slot 1 keeps the same `u64[K+1]` encoding in `.centroids` V4.
 
 ### Slot 2: router
 
@@ -564,6 +548,8 @@ The bottom level's members are the centers already in slot 0; those vectors are
 not duplicated in the router payload. The routing configuration itself is not
 serialized. The offsets above describe routing membership, distinct from slot
 1's mapping from clusters to document-vector rows.
+The reader loads list membership ranges eagerly. Centroid rows at every routing
+level remain behind file slices and are read as routing visits those lists.
 
 The Exact router has tag 2 and no payload. It scores the centers from slot 0
 directly. Other router tags are rejected. Readers follow the persisted router
@@ -675,8 +661,9 @@ boundaries; sorted row requests are split into their containing blocks.
 
 The writer streams full vector rows immediately and buffers encoded columns
 for one cluster, then flushes them in layout order. The reader materializes
-bounds and router topology. Block byte offsets, cluster row offsets, and centroid
-vectors remain available through lazy range reads. Each local `Block` reuses its
+field metadata, count words, and router topology. Block byte offsets, cluster
+row offsets, and centroid vectors at every routing level remain available
+through lazy range reads. Each local `Block` reuses its
 resolved boundaries while reading columns; the shared reader retains no
 addresses. ANN carries cluster IDs through exact reranking, avoiding a search
 through unrelated clusters. Row-only merge and diagnostic APIs use lazy binary
@@ -720,14 +707,16 @@ DataCorruption before payload access.
 ## Versioning rules
 
 The current `.vec` reader supports V5; earlier vector formats require rebuilding.
-The `.centroids` reader uses V3 for its required bounds and tagged router.
+The `.centroids` reader supports V4, containing centers, cluster row offsets,
+and a tagged router. Earlier centroid formats require rebuilding.
 `VectorQuantizationConfig.format_version = 3` identifies the independent index
 settings grammar and specifies a build target, not a segment file version.
 
 1. Stored values need no version: grid points, rho_model, block size,
    and IdMap data are self-describing inputs.
-2. The `.vec` version alone versions byte grammar, entry framing, and metadata
-   encoding. New tag values need no bump; adding fields to an existing record does.
+2. Each file's version covers its byte grammar and entry framing. The `.vec`
+   version also covers field metadata. New tag values need no bump; adding
+   fields to an existing record does.
 3. Quantizer contracts and seed-derived rotation semantics are pinned by enum
    tags. Semantic changes add a variant and retain the existing decode arm.
 4. `slots()` and `layer_slots()` are format semantics, including ordering,
@@ -758,8 +747,8 @@ settings.
 
 ### Threshold and policy
 
-All scores use higher-is-better score space. At each layer, and while admitting
-clusters, the threshold is the **k-th largest lower endpoint**
+All scores use higher-is-better score space. At each quantization layer,
+the threshold is the **k-th largest lower endpoint**
 `estimate - kappa * sigma`. It is not the lower endpoint of the k-th point
 estimate. A candidate survives when its upper endpoint reaches the threshold.
 Consequently, enclosing intervals preserve the true top-k; widening any interval

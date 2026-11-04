@@ -27,7 +27,7 @@ pub(crate) enum VectorFileVersion {
     V3 = 3,
     /// Block-major vector columns; `.centroids` omits cluster bounds.
     V4 = 4,
-    /// Lazy byte-only block directory; cluster row offsets remain in `.centroids` V3.
+    /// Lazy byte-only block offsets; cluster row offsets remain in `.centroids`.
     V5 = 5,
 }
 
