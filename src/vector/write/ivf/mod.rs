@@ -26,7 +26,7 @@ use crate::vector::router::RouterKind;
 use crate::vector::storage::header::{
     write_centroid_header, write_vector_header, CENTROIDS_EXT, VEC_EXT,
 };
-use crate::vector::storage::id_map::DocLocation;
+use crate::vector::storage::id_map::IdMap;
 #[cfg(test)]
 use crate::vector::storage::metadata::VectorColMetadata;
 use crate::vector::storage::reader::VectorIndexReader;
@@ -165,7 +165,7 @@ pub(crate) fn merge_ivf(
         };
         if vector_count == 0 {
             write::empty_field(&mut vec_write, &mut centroids_write, &merge, router)?;
-            id_maps.push((field, vec![DocLocation::ABSENT; num_target_docs as usize]));
+            id_maps.push((field, IdMap::empty_locations(num_target_docs)));
             continue;
         }
 
@@ -179,7 +179,7 @@ pub(crate) fn merge_ivf(
                     // no-vectors path: the reader errors on slots missing from composites the
                     // other fields still write.
                     write::empty_field(&mut vec_write, &mut centroids_write, &merge, router)?;
-                    id_maps.push((field, vec![DocLocation::ABSENT; num_target_docs as usize]));
+                    id_maps.push((field, IdMap::empty_locations(num_target_docs)));
                     continue;
                 };
                 let mut centroids = trained.centroids;

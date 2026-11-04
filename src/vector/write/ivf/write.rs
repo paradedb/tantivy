@@ -11,9 +11,9 @@ use crate::vector::router::{BuiltRouter, RouterKind};
 use crate::vector::storage::blocks::{write_metadata, BlockOffsetsWriter};
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::header::{CentroidSlot, VectorEntry, HEADER_LEN};
-use crate::vector::storage::id_map::{DocLocation, IdMap};
+use crate::vector::storage::id_map::IdMap;
 use crate::vector::storage::metadata::VectorColMetadata;
-use crate::vector::ENTRY_ALIGN;
+use crate::vector::{BlockAddress, ENTRY_ALIGN};
 use crate::TantivyError;
 
 /// Writes a field's `.centroids` slots: centroids and the router.
@@ -85,7 +85,7 @@ pub(super) type BuildReport = (Field, IvfBuildTimings, Duration, usize, usize);
 /// timings on `paradedb::ivf_build`.
 pub(super) fn id_maps(
     vec_write: &mut CompositeWrite,
-    id_maps: Vec<(Field, Vec<DocLocation>)>,
+    id_maps: Vec<(Field, Vec<BlockAddress>)>,
     build_reports: &mut [BuildReport],
 ) -> crate::Result<()> {
     for (field, docs) in id_maps {

@@ -135,37 +135,39 @@ IdMap begins with a one-byte tag:
 |---|---|---|---|
 | 0 | Identity | None | Row number equals document ID |
 | 1 | Bitmap | Columnar OptionalIndex encoding of documents with vectors | Bitmap rank gives the row number |
-| 3 | DocLocations | One `(cluster: u32, local: u32)` per segment document | Cluster index and position within that cluster |
+| 3 | DocLocations | One `(block: u32, row: u32)` per segment document | Block index and row within that block |
 
 All other tags, including 2, are rejected. Flat fields use Identity when every
 document has a vector, otherwise Bitmap. Identity occupies just one byte; the
 document count comes from the segment.
 
-Clustered fields use DocLocations:
+Clustered fields use DocLocations, encoding each `BlockAddress` as two words.
+The block index is the cluster index:
 
 ```text
 IdMap entry: clustered encoding
 +----------------------------------------------------------------------+
 | Tag: u8 = 3                                                          |
 +----------------------------------------------------------------------+
-| Document 0:         [cluster: u32][local: u32]   8 bytes             |
+| Document 0:         [block: u32][row: u32]   8 bytes                 |
 +----------------------------------------------------------------------+
-| Document 1:         [cluster: u32][local: u32]   8 bytes             |
+| Document 1:         [block: u32][row: u32]   8 bytes                 |
 +----------------------------------------------------------------------+
 | ...                                                                  |
 +----------------------------------------------------------------------+
-| Document max_doc-1: [cluster: u32][local: u32]   8 bytes             |
+| Document max_doc-1: [block: u32][row: u32]   8 bytes                 |
 +----------------------------------------------------------------------+
 ```
 
 The entry occupies `1 + 8 * max_doc` bytes, including records for documents
 without vectors. `max_doc` includes deleted documents until a merge removes
 them. Record `d` begins at byte `1 + 8*d` within IdMap. Missing vectors use
-`(u32::MAX, 0)`, so the cluster count must be less than `u32::MAX`.
+`(u32::MAX, 0)`, so the block count must be less than `u32::MAX`.
 
-Opening validates the table length. Individual lookups validate the cluster
-index and local position. The clustered table is read lazily for document
-lookups; scans use the reverse mapping in each block's DocIds column.
+Opening validates the table length. Individual lookups return `BlockAddress`
+after validating the block index and row, or `None` for the absent sentinel.
+The clustered table is read lazily for document lookups; scans use the reverse
+mapping in each block's DocIds column.
 
 ### Data: metadata, blocks, and offsets
 
@@ -551,21 +553,21 @@ assigns documents 0 and 3 to cluster 0, and documents 1 and 4 to cluster 1:
 
 IdMap entry
 +----------------------------------------------------------------------+
-| doc 0 -> (cluster 0, local 0)                                        |
+| doc 0 -> (block 0, row 0)                                            |
 +----------------------------------------------------------------------+
-| doc 1 -> (cluster 1, local 0)                                        |
+| doc 1 -> (block 1, row 0)                                            |
 +----------------------------------------------------------------------+
 | doc 2 -> absent                                                      |
 +----------------------------------------------------------------------+
-| doc 3 -> (cluster 0, local 1)                                        |
+| doc 3 -> (block 0, row 1)                                            |
 +----------------------------------------------------------------------+
-| doc 4 -> (cluster 1, local 1)                                        |
+| doc 4 -> (block 1, row 1)                                            |
 +----------------------------------------------------------------------+
 
 .vec block_offsets = [(start 0, 2), (start 1, 2), (offsets start, 0)]
 ```
 
-To retrieve document 4, IdMap supplies cluster 1 and local position 1. The
+To retrieve document 4, IdMap supplies `BlockAddress { block: 1, row: 1 }`. The
 block tuple supplies that cluster's starting byte and count of 2. Rows
 is the first column, so the requested vector starts at:
 
