@@ -47,7 +47,7 @@ Segment vector files are immutable once written. Inserts produce new segments.
 Deletion visibility is stored separately; a merge omits deleted documents and
 writes new vector files.
 
-This document describes the implemented `.vec` **V6** and `.centroids` **V5**
+This document describes the implemented `.vec` **V5** and `.centroids` **V5**
 formats. Block byte offsets and vector counts live together in `.vec`; `.centroids`
 stores cluster centers and routing data. All multibyte numbers below are
 little-endian. Ranges use an exclusive end: `[start, end)`.
@@ -672,7 +672,7 @@ DataCorruption before payload access.
 
 ## Versioning rules
 
-The current `.vec` reader supports V6; earlier vector formats require rebuilding.
+The current `.vec` reader supports V5; earlier vector formats require rebuilding.
 The `.centroids` reader supports V5, containing centers and a tagged router.
 Block counts and byte locations are stored only in `.vec`. Earlier centroid
 formats require rebuilding.

@@ -997,13 +997,13 @@ fn bridge_exactness_d768_and_d100() -> crate::Result<()> {
 
 // Settings version three remains a valid write target for vector format four.
 #[test]
-fn settings_v3_builds_v6_and_readers_ignore_global_changes() -> crate::Result<()> {
+fn settings_v3_builds_v5_and_readers_ignore_global_changes() -> crate::Result<()> {
     let mut index = build_quantized_fixture(QUANT_FIXTURE_DIM, true)?;
     let field = index.schema().get_field("embedding")?;
     let config = &index.settings().vector_quantization[0];
     assert_eq!(config.format_version, 3);
     config.validate(&VectorOptions::new(QUANT_FIXTURE_DIM, Metric::L2))?;
-    assert_eq!(&quantized_vec_file(&index)?[..4], &[6, 0, 0, 0]);
+    assert_eq!(&quantized_vec_file(&index)?[..4], &[5, 0, 0, 0]);
     index.settings_mut().vector_quantization.clear();
     let searcher = index.reader()?.searcher();
     let vector = searcher.segment_readers()[0].vector_index(field)?;

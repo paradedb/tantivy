@@ -27,10 +27,9 @@ pub(crate) enum VectorFileVersion {
     V3 = 3,
     /// Block-major vector columns; `.centroids` omits cluster bounds.
     V4 = 4,
-    /// `.vec` has lazy byte-only offsets; `.centroids` no longer stores row offsets.
+    /// `.vec` stores (byte_offset, num_rows) tuples and total row count;
+    /// `.centroids` no longer stores row offsets.
     V5 = 5,
-    /// `.vec` stores (byte_offset, num_rows) tuples and total row count.
-    V6 = 6,
 }
 
 impl BinarySerializable for VectorFileVersion {
@@ -45,7 +44,6 @@ impl BinarySerializable for VectorFileVersion {
             3 => Ok(Self::V3),
             4 => Ok(Self::V4),
             5 => Ok(Self::V5),
-            6 => Ok(Self::V6),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported vector file format version: {other}"),
@@ -55,9 +53,9 @@ impl BinarySerializable for VectorFileVersion {
 }
 
 /// Format identifier written to `.vec` files.
-pub(crate) const VECTOR_FILE_FORMAT_VERSION: u32 = VectorFileVersion::V6 as u32;
+pub(crate) const VECTOR_FILE_FORMAT_VERSION: u32 = VectorFileVersion::V5 as u32;
 /// Version written to `.vec` files.
-pub(crate) const CURRENT_VECTOR: VectorFileVersion = VectorFileVersion::V6;
+pub(crate) const CURRENT_VECTOR: VectorFileVersion = VectorFileVersion::V5;
 /// Version written to `.centroids` files.
 pub(crate) const CURRENT_CENTROID: VectorFileVersion = VectorFileVersion::V5;
 
@@ -100,7 +98,7 @@ impl VectorEntry {
     }
 }
 /// Accepted vector grammars; all other versions require rebuilding.
-pub(crate) const SUPPORTED_VECTOR: &[VectorFileVersion] = &[VectorFileVersion::V6];
+pub(crate) const SUPPORTED_VECTOR: &[VectorFileVersion] = &[VectorFileVersion::V5];
 
 fn write_header<W: Write + ?Sized>(writer: &mut W, version: VectorFileVersion) -> io::Result<()> {
     version.serialize(writer)
@@ -213,10 +211,10 @@ mod tests {
     fn vector_header_round_trip() {
         let mut buf = Vec::new();
         write_vector_header(&mut buf).unwrap();
-        assert_eq!(buf, [6, 0, 0, 0]);
+        assert_eq!(buf, [5, 0, 0, 0]);
 
         let (version, body) = read_vector_header(&FileSlice::from(buf)).unwrap();
-        assert_eq!(version, VectorFileVersion::V6);
+        assert_eq!(version, VectorFileVersion::V5);
         assert_eq!(body.len(), 0);
     }
 
@@ -262,13 +260,12 @@ mod tests {
     }
 
     #[test]
-    fn vector_headers_before_v6_require_rebuild() {
+    fn vector_headers_before_v5_require_rebuild() {
         for version in [
             VectorFileVersion::V1,
             VectorFileVersion::V2,
             VectorFileVersion::V3,
             VectorFileVersion::V4,
-            VectorFileVersion::V5,
         ] {
             let mut buf = Vec::new();
             version.serialize(&mut buf).unwrap();
