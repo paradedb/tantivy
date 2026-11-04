@@ -172,13 +172,20 @@ fn vector_read_kinds_follow_data_for_dense_and_sparse_access() -> crate::Result<
     assert_eq!(
         *directory.read_kinds.lock().unwrap(),
         [
+            VectorReadKind::Other, // Block offsets before the full-precision column.
             VectorReadKind::FullPrecision,
+            VectorReadKind::Other, // Block offsets before DocIds.
+            VectorReadKind::Other,
+            VectorReadKind::Other, // Block offsets before each band's payload.
+            VectorReadKind::QuantizedLayer(0),
+            VectorReadKind::Other,
+            VectorReadKind::QuantizedLayer(1),
+            VectorReadKind::Other, // The sparse reader reuses this block for codes and sidecars.
+            VectorReadKind::QuantizedLayer(1),
+            VectorReadKind::QuantizedLayer(1),
             VectorReadKind::Other,
             VectorReadKind::QuantizedLayer(0),
-            VectorReadKind::QuantizedLayer(1),
-            VectorReadKind::QuantizedLayer(1),
-            VectorReadKind::QuantizedLayer(1),
-            VectorReadKind::QuantizedLayer(0),
+            VectorReadKind::Other,
             VectorReadKind::FullPrecision,
         ]
     );
@@ -770,7 +777,7 @@ fn merge_source_addresses_read_only_document_columns() -> crate::Result<()> {
     let segments = searcher.segment_readers();
     let segment = &segments[0];
     let vectors = segment.vector_index(index.schema().get_field("embedding")?)?;
-    let ranges = doc_column_ranges(&vectors, &directory)?;
+    let (ranges, offsets) = doc_column_ranges(&vectors, &directory)?;
     let docs: Vec<_> = (0..segment.max_doc())
         .filter(|&doc| {
             segment
@@ -800,6 +807,7 @@ fn merge_source_addresses_read_only_document_columns() -> crate::Result<()> {
         reads
             .iter()
             .map(|(_, range)| range.clone())
+            .filter(|range| !offsets.contains(range))
             .collect::<Vec<_>>(),
         expected
     );
@@ -825,21 +833,41 @@ fn merge_source_addresses_read_only_document_columns() -> crate::Result<()> {
 fn doc_column_ranges(
     vectors: &crate::vector::VectorIndexReader,
     directory: &PagedDirectory,
-) -> crate::Result<Vec<Option<std::ops::Range<usize>>>> {
+) -> crate::Result<(
+    Vec<Option<std::ops::Range<usize>>>,
+    Vec<std::ops::Range<usize>>,
+)> {
     let mut docs = Vec::new();
     let mut ranges = Vec::new();
+    let mut offsets = Vec::new();
     for cluster in 0..vectors.index().unwrap().num_clusters() {
+        directory.reads.lock().unwrap().clear();
         vectors.index().unwrap().cluster_range(cluster)?;
+        offsets.extend(
+            directory
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, range)| range.clone()),
+        );
         directory.reads.lock().unwrap().clear();
         vectors.read_doc_ids(cluster, &mut docs)?;
-        let reads = directory.reads.lock().unwrap();
+        let reads: Vec<_> = directory
+            .reads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, range)| range.clone())
+            .filter(|range| !offsets.contains(range))
+            .collect();
         assert_eq!(
             reads.len(),
             usize::from(!docs.is_empty()),
             "cluster={cluster} column=DocIds"
         );
-        ranges.push(reads.first().map(|(_, range)| range.clone()));
+        ranges.push(reads.first().cloned());
     }
     directory.reads.lock().unwrap().clear();
-    Ok(ranges)
+    Ok((ranges, offsets))
 }

@@ -1,11 +1,9 @@
 //! Block addressing and entry framing. See FORMAT.md for the column contract.
-use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::ops::Range;
 use std::sync::Arc;
 
 use common::{HasLen, OwnedBytes};
-use parking_lot::Mutex;
 
 use crate::directory::FileSlice;
 use crate::error::DataCorruption;
@@ -141,88 +139,88 @@ impl BlockMetadata {
     }
 }
 /// Row geometry: uniform blocks use the IdMap count; clusters use `.centroids` offsets.
-pub(crate) enum BlockRows {
-    Uniform(usize),
-    Clusters(ClusterOffsets),
+pub(crate) enum RowOffsets {
+    Uniform { num_rows: usize },
+    Clustered(ClusterOffsets),
 }
 
-impl BlockRows {
+impl RowOffsets {
     fn num_rows(&self) -> usize {
         match self {
-            Self::Uniform(count) => *count,
-            Self::Clusters(offsets) => offsets.num_rows(),
+            Self::Uniform { num_rows } => *num_rows,
+            Self::Clustered(offsets) => offsets.num_rows(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn clusters(offsets: &[u64]) -> Self {
         let bytes: Vec<u8> = offsets.iter().flat_map(|n| n.to_le_bytes()).collect();
-        Self::Clusters(ClusterOffsets::open(FileSlice::from(bytes)).unwrap())
+        Self::Clustered(ClusterOffsets::open(FileSlice::from(bytes)).unwrap())
     }
 }
 
-/// Data entry with lazy byte offsets and separate row geometry. Only accessed addresses are
-/// retained.
+/// All blocks for one field, with eager metadata and lazy byte and row offsets.
 pub(crate) struct Blocks {
-    entry: FileSlice,
-    pub(crate) meta: Arc<VectorColMetadata>,
-    pub(crate) slots: Vec<Slot>,
+    data_slice: FileSlice,
+    pub(crate) metadata: Arc<VectorColMetadata>,
+    pub(crate) schema: Vec<Slot>,
     bands: Vec<Range<usize>>,
-    directory: FileSlice,
-    directory_start: usize,
-    metadata_end: usize,
     num_blocks: usize,
-    num_rows: usize,
-    rows: BlockRows,
-    accessed: Mutex<BTreeMap<usize, BlockAddress>>,
+    metadata_end: usize,
+    row_offsets: RowOffsets,
 }
-#[derive(Clone, Debug)]
-pub(crate) struct BlockAddress {
-    pub(crate) bytes: Range<usize>,
-    pub(crate) rows: Range<usize>,
+
+/// One block's validated boundaries, reused locally while accessing its columns.
+pub(crate) struct Block<'a> {
+    blocks: &'a Blocks,
+    bytes: Range<usize>,
+    rows: Range<usize>,
 }
 
 impl Blocks {
     pub(crate) fn open(
         entry: FileSlice,
         options: &VectorOptions,
-        rows: BlockRows,
+        row_offsets: RowOffsets,
     ) -> crate::Result<Self> {
-        let clustered = matches!(rows, BlockRows::Clusters(_));
-        Self::from_metadata(BlockMetadata::open(entry, options, clustered)?, rows)
+        let clustered = matches!(row_offsets, RowOffsets::Clustered(_));
+        Self::from_metadata(BlockMetadata::open(entry, options, clustered)?, row_offsets)
     }
-    pub(crate) fn from_metadata(metadata: BlockMetadata, rows: BlockRows) -> crate::Result<Self> {
+    pub(crate) fn from_metadata(
+        metadata: BlockMetadata,
+        row_offsets: RowOffsets,
+    ) -> crate::Result<Self> {
         let BlockMetadata {
             entry,
             meta,
             metadata_end,
         } = metadata;
         if entry.len() < 8 || entry.len() % ENTRY_ALIGN != 0 {
-            return Err(DataCorruption::comment_only("invalid vector directory footer").into());
+            return Err(DataCorruption::comment_only("invalid vector block-count footer").into());
         }
         let footer = entry.len() - 8;
-        let bytes = entry.slice_from(footer).read_bytes()?;
+        let bytes = entry.read_bytes_slice(footer..entry.len())?;
         let count = usize::try_from(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
             .map_err(|_| DataCorruption::comment_only("vector block count overflow"))?;
-        let num_rows = rows.num_rows();
+        let num_rows = row_offsets.num_rows();
         if num_rows > u32::MAX as usize || (count == 0 && num_rows != 0) {
             return Err(DataCorruption::comment_only("invalid vector row count").into());
         }
-        let directory_len = count
+        let block_offsets_len = count
             .checked_add(1)
             .and_then(|n| n.checked_mul(8))
-            .ok_or_else(|| DataCorruption::comment_only("vector directory size overflow"))?;
-        let directory_start = footer
-            .checked_sub(directory_len)
+            .ok_or_else(|| DataCorruption::comment_only("vector block offsets size overflow"))?;
+        let block_offsets_start = footer
+            .checked_sub(block_offsets_len)
             .filter(|&start| start >= metadata_end && start % ENTRY_ALIGN == 0)
-            .ok_or_else(|| DataCorruption::comment_only("truncated vector directory"))?;
-        match (&rows, &meta.field().partition) {
-            (BlockRows::Uniform(_), Partition::Uniform { rows_per_block }) => {
+            .ok_or_else(|| DataCorruption::comment_only("truncated vector block offsets"))?;
+        match (&row_offsets, &meta.field().partition) {
+            (RowOffsets::Uniform { .. }, Partition::Uniform { rows_per_block }) => {
                 if count != num_rows.div_ceil(*rows_per_block as usize) {
                     return Err(DataCorruption::comment_only("invalid uniform block count").into());
                 }
             }
-            (BlockRows::Clusters(offsets), Partition::Clusters) => {
+            (RowOffsets::Clustered(offsets), Partition::Clusters) => {
                 if count != offsets.num_clusters() {
                     return Err(
                         DataCorruption::comment_only("cluster offset count mismatch").into(),
@@ -233,18 +231,18 @@ impl Blocks {
                 return Err(DataCorruption::comment_only("partition/row geometry mismatch").into());
             }
         }
-        let directory = entry.slice(directory_start..directory_start + directory_len);
         if count == 0 {
-            let sentinel = directory.read_bytes()?;
-            if u64::from_le_bytes(sentinel[..8].try_into().unwrap()) != directory_start as u64
-                || directory_start - metadata_end >= ENTRY_ALIGN
+            let sentinel = entry.read_bytes_slice(block_offsets_start..footer)?;
+            if u64::from_le_bytes(sentinel[..8].try_into().unwrap()) != block_offsets_start as u64
+                || block_offsets_start - metadata_end >= ENTRY_ALIGN
                 || entry
-                    .slice(metadata_end..directory_start)
-                    .read_bytes()?
+                    .read_bytes_slice(metadata_end..block_offsets_start)?
                     .iter()
                     .any(|&v| v != 0)
             {
-                return Err(DataCorruption::comment_only("invalid empty vector directory").into());
+                return Err(
+                    DataCorruption::comment_only("invalid empty vector block offsets").into(),
+                );
             }
         }
         let slots = meta.slots();
@@ -259,42 +257,31 @@ impl Blocks {
             }
         }
         Ok(Self {
-            entry,
-            meta,
-            slots,
+            data_slice: entry,
+            metadata: meta,
+            schema: slots,
             bands,
-            directory,
-            directory_start,
             metadata_end,
             num_blocks: count,
-            num_rows,
-            rows,
-            accessed: Mutex::new(BTreeMap::new()),
+            row_offsets,
         })
     }
-    #[cfg(test)]
-    pub(crate) fn accessed_clusters(&self) -> Vec<usize> {
-        self.accessed.lock().keys().copied().collect()
-    }
-
     pub(crate) fn num_blocks(&self) -> usize {
         self.num_blocks
     }
     pub(crate) fn num_rows(&self) -> usize {
-        self.num_rows
+        self.row_offsets.num_rows()
     }
 
-    pub(crate) fn address(&self, b: usize) -> crate::Result<BlockAddress> {
+    pub(crate) fn block(&self, b: usize) -> crate::Result<Block<'_>> {
         if b >= self.num_blocks {
             return Err(DataCorruption::comment_only("vector block out of range").into());
         }
-        if let Some(address) = self.accessed.lock().get(&b) {
-            return Ok(address.clone());
-        }
+        let offsets_start = self.block_offsets_start();
+        let offset = offsets_start + b * 8;
         let bytes = self
-            .directory
-            .slice(b * 8..(b + 2) * 8)
-            .read_vector_bytes(VectorReadKind::Other)?;
+            .data_slice
+            .read_vector_bytes_slice(offset..offset + 16, VectorReadKind::Other)?;
         let decode = |at: usize| -> crate::Result<usize> {
             Ok(
                 usize::try_from(u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()))
@@ -303,38 +290,30 @@ impl Blocks {
         };
         let start = decode(0)?;
         let end = decode(8)?;
-        let rows = match &self.rows {
-            BlockRows::Uniform(_) => {
-                let Partition::Uniform { rows_per_block } = self.meta.field().partition else {
-                    unreachable!("validated row geometry")
-                };
-                let size = rows_per_block as usize;
-                b * size..((b + 1) * size).min(self.num_rows)
-            }
-            BlockRows::Clusters(offsets) => offsets.range(b)?,
-        };
+        let rows = self.block_row_range(b)?;
+        let num_rows = self.num_rows();
         let (first, last) = (rows.start, rows.end);
-        let align = block_align(&self.slots);
+        let align = block_align(&self.schema);
         if start < self.metadata_end
-            || end > self.directory_start
+            || end > offsets_start
             || start > end
             || start % align != 0
             || end % align != 0
             || first > last
-            || last > self.num_rows
+            || last > num_rows
             || (b == 0 && (first != 0 || start - self.metadata_end >= align))
-            || (b + 1 == self.num_blocks && (end != self.directory_start || last != self.num_rows))
+            || (b + 1 == self.num_blocks && (end != offsets_start || last != num_rows))
         {
             return Err(DataCorruption::comment_only("invalid vector block boundaries").into());
         }
         let n = last - first;
-        let row_bytes: usize = self.slots.iter().map(|s| s.stride as usize).sum();
+        let row_bytes: usize = self.schema.iter().map(|s| s.stride as usize).sum();
         if n.checked_mul(row_bytes)
             .is_none_or(|bytes| bytes > end - start)
         {
             return Err(DataCorruption::comment_only("truncated vector block").into());
         }
-        let payload_end = start + block_len(&self.slots, n);
+        let payload_end = start + block_len(&self.schema, n);
         if payload_end > end
             || (b + 1 < self.num_blocks && payload_end != end)
             || end - payload_end >= ENTRY_ALIGN
@@ -343,165 +322,166 @@ impl Blocks {
         }
         if payload_end < end
             && self
-                .entry
-                .slice(payload_end..end)
-                .read_vector_bytes(VectorReadKind::Other)?
+                .data_slice
+                .read_vector_bytes_slice(payload_end..end, VectorReadKind::Other)?
                 .iter()
                 .any(|&v| v != 0)
         {
             return Err(DataCorruption::comment_only("nonzero vector block padding").into());
         }
-        let address = BlockAddress {
+        Ok(Block {
+            blocks: self,
             bytes: start..end,
             rows: first..last,
-        };
-        self.accessed.lock().insert(b, address.clone());
-        Ok(address)
+        })
     }
-    #[cfg(test)]
-    pub(crate) fn block_start(&self, b: usize) -> crate::Result<usize> {
-        Ok(self.address(b)?.bytes.start)
+    // Construction checks the arithmetic and framing before any block access.
+    fn block_offsets_start(&self) -> usize {
+        self.data_slice.len() - 8 - (self.num_blocks + 1) * 8
     }
-    pub(crate) fn rows_in(&self, b: usize) -> crate::Result<usize> {
-        Ok(self.address(b)?.rows.len())
+
+    fn block_row_range(&self, b: usize) -> crate::Result<Range<usize>> {
+        match &self.row_offsets {
+            RowOffsets::Uniform { num_rows } => {
+                let Partition::Uniform { rows_per_block } = self.metadata.field().partition else {
+                    unreachable!("validated row offsets")
+                };
+                let size = rows_per_block as usize;
+                Ok(b * size..((b + 1) * size).min(*num_rows))
+            }
+            RowOffsets::Clustered(offsets) => offsets.range(b),
+        }
     }
+
     pub(crate) fn row_range(&self, b: usize) -> crate::Result<Range<usize>> {
-        Ok(self.address(b)?.rows)
+        Ok(self.block(b)?.row_range())
     }
+
+    /// Finds a block by row, reading only row offsets during clustered binary search.
     pub(crate) fn block_of(&self, row: usize) -> crate::Result<usize> {
-        if row >= self.num_rows {
+        if row >= self.num_rows() {
             return Err(DataCorruption::comment_only("vector row out of range").into());
         }
-        if let Partition::Uniform { rows_per_block } = self.meta.field().partition {
+        if let Partition::Uniform { rows_per_block } = self.metadata.field().partition {
             return Ok(row / rows_per_block as usize);
         }
         let (mut lo, mut hi) = (0, self.num_blocks);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let address = self.address(mid)?;
-            if row < address.rows.start {
+            let rows = self.block_row_range(mid)?;
+            if row < rows.start {
                 hi = mid;
-            } else if row >= address.rows.end {
+            } else if row >= rows.end {
                 lo = mid + 1;
             } else {
                 return Ok(mid);
             }
         }
-        Err(DataCorruption::comment_only("vector row missing from directory").into())
+        Err(DataCorruption::comment_only("vector row missing from row offsets").into())
     }
-    /// Resolves one complete column as a file slice preserving parent storage geometry.
-    pub(crate) fn column(&self, b: usize, idx: usize) -> crate::Result<FileSlice> {
-        let range = column_range(&self.slots, self.rows_in(b)?, idx);
-        self.block_slice(b, range)
-    }
-    /// Resolves a byte span relative to a validated block while preserving storage geometry.
-    pub(crate) fn block_slice(&self, b: usize, range: Range<usize>) -> crate::Result<FileSlice> {
-        let address = self.address(b)?;
-        let start = address.bytes.start;
-        if range.start > range.end || range.end > address.bytes.end - start {
-            return Err(crate::TantivyError::DataCorruption(
-                DataCorruption::comment_only(
-                    "invalid vector blocks: column crosses stored block boundary",
-                ),
-            ));
+
+    /// Resolves a nonempty field-wide row span contained in one block.
+    pub(crate) fn block_for_range(&self, rows: &Range<usize>) -> crate::Result<Block<'_>> {
+        if rows.start >= rows.end || rows.end > self.num_rows() {
+            return Err(DataCorruption::comment_only("invalid vector row range").into());
         }
-        Ok(self.entry.slice(start + range.start..start + range.end))
+        let block = self.block(self.block_of(rows.start)?)?;
+        block.check_rows(rows)?;
+        Ok(block)
     }
-    /// Rejects row spans crossing a block, including malformed and out-of-range spans.
-    pub(crate) fn block_for_range(&self, rows: &Range<usize>) -> crate::Result<usize> {
-        if rows.start >= rows.end || rows.end > self.num_rows {
-            return Err(crate::TantivyError::DataCorruption(
-                DataCorruption::comment_only("invalid vector blocks: invalid row range"),
-            ));
+
+    /// Reads field-wide rows from one column; the range must fit within a single block.
+    pub(crate) fn read_column(&self, idx: usize, rows: Range<usize>) -> crate::Result<OwnedBytes> {
+        if rows.start == rows.end && rows.end <= self.num_rows() {
+            return Ok(OwnedBytes::empty());
         }
-        let b = self.block_of(rows.start)?;
-        if rows.end > self.row_range(b)?.end {
-            return Err(crate::TantivyError::DataCorruption(
-                DataCorruption::comment_only(
-                    "invalid vector blocks: row range crosses block boundary",
-                ),
-            ));
-        }
-        Ok(b)
+        self.block_for_range(&rows)?.read_column(idx, rows)
     }
-    /// Checks a known block-local address without searching the row directory.
-    pub(crate) fn check_block_rows(&self, b: usize, rows: &Range<usize>) -> crate::Result<()> {
-        let block_rows = self.row_range(b)?;
-        if rows.start < block_rows.start || rows.start >= rows.end || rows.end > block_rows.end {
-            return Err(crate::TantivyError::DataCorruption(
-                DataCorruption::comment_only(
-                    "invalid vector blocks: invalid block-local row range",
-                ),
-            ));
+
+    pub(crate) fn clustered(&self) -> bool {
+        matches!(self.row_offsets, RowOffsets::Clustered(_))
+    }
+}
+
+impl Block<'_> {
+    pub(crate) fn num_rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub(crate) fn row_range(&self) -> Range<usize> {
+        self.rows.clone()
+    }
+
+    /// Column byte range relative to the Data entry, calculated without storage reads.
+    pub(crate) fn column_range(&self, idx: usize) -> Range<usize> {
+        let range = column_range(&self.blocks.schema, self.num_rows(), idx);
+        self.bytes.start + range.start..self.bytes.start + range.end
+    }
+
+    /// A complete column as a lazy slice preserving the underlying storage geometry.
+    pub(crate) fn column(&self, idx: usize) -> FileSlice {
+        self.blocks.data_slice.slice(self.column_range(idx))
+    }
+
+    /// A byte range relative to the block's start.
+    pub(crate) fn byte_slice(&self, range: Range<usize>) -> crate::Result<FileSlice> {
+        if range.start > range.end || range.end > self.bytes.len() {
+            return Err(DataCorruption::comment_only("byte range crosses block boundary").into());
+        }
+        Ok(self
+            .blocks
+            .data_slice
+            .slice(self.bytes.start + range.start..self.bytes.start + range.end))
+    }
+
+    /// Validates a nonempty range of field-wide row numbers against this block.
+    pub(crate) fn check_rows(&self, rows: &Range<usize>) -> crate::Result<()> {
+        if rows.start < self.rows.start || rows.start >= rows.end || rows.end > self.rows.end {
+            return Err(DataCorruption::comment_only("row range crosses block boundary").into());
         }
         Ok(())
     }
-    /// Reads a block-local row span from one column.
+
+    /// Reads field-wide rows directly from a column, without creating a temporary FileSlice.
     pub(crate) fn read_column(&self, idx: usize, rows: Range<usize>) -> crate::Result<OwnedBytes> {
-        if rows.start == rows.end && rows.end <= self.num_rows {
+        if rows.is_empty() && rows == self.rows {
             return Ok(OwnedBytes::empty());
         }
-        let b = self.block_for_range(&rows)?;
-        self.read_column_in_block(b, idx, rows)
-    }
-    pub(crate) fn read_column_in_block(
-        &self,
-        b: usize,
-        idx: usize,
-        rows: Range<usize>,
-    ) -> crate::Result<OwnedBytes> {
-        if rows.is_empty() && rows == self.row_range(b)? {
-            return Ok(OwnedBytes::empty());
-        }
-        self.check_block_rows(b, &rows)?;
-        let stride = self.slots[idx].stride as usize;
-        let first = self.row_range(b)?.start;
-        let kind = match self.slots[idx].slot_type {
+        self.check_rows(&rows)?;
+        let slot = &self.blocks.schema[idx];
+        let stride = slot.stride as usize;
+        let start = self.column_range(idx).start;
+        let kind = match slot.slot_type {
             SlotType::Rows { .. } => VectorReadKind::FullPrecision,
             ref slot => slot
                 .band()
                 .map(VectorReadKind::QuantizedLayer)
                 .unwrap_or_default(),
         };
-        Ok(self
-            .column(b, idx)?
-            .slice((rows.start - first) * stride..(rows.end - first) * stride)
-            .read_vector_bytes(kind)?)
+        Ok(self.blocks.data_slice.read_vector_bytes_slice(
+            start + (rows.start - self.rows.start) * stride
+                ..start + (rows.end - self.rows.start) * stride,
+            kind,
+        )?)
     }
-    /// Whether blocks carry a document-id column and variable cluster boundaries.
-    pub(crate) fn clustered(&self) -> bool {
-        matches!(self.meta.field().partition, Partition::Clusters)
+
+    /// One quantization layer's columns within the Data entry; layer zero includes norms.
+    pub(crate) fn band_range(&self, layer: usize) -> Range<usize> {
+        let band = &self.blocks.bands[layer];
+        self.column_range(band.start).start..self.column_range(band.end - 1).end
     }
-    /// Layer zero spans residual norms through its last sidecar; document ids are read separately.
-    pub(crate) fn layer_span(&self, b: usize, layer: usize) -> crate::Result<Range<usize>> {
-        self.band_range(b, layer)
+
+    pub(crate) fn band_slice(&self, layer: usize) -> FileSlice {
+        self.blocks.data_slice.slice(self.band_range(layer))
     }
-    /// Range of one scan band within the Data entry; band zero includes residual norms.
-    pub(crate) fn band_range(&self, b: usize, layer: usize) -> crate::Result<Range<usize>> {
-        let band = &self.bands[layer];
-        let address = self.address(b)?;
-        let n = address.rows.len();
-        let start = column_range(&self.slots, n, band.start).start;
-        let end = column_range(&self.slots, n, band.end - 1).end;
-        Ok(address.bytes.start + start..address.bytes.start + end)
-    }
-    /// One scan band of block `b` as a file slice.
-    pub(crate) fn band_slice(&self, b: usize, layer: usize) -> crate::Result<FileSlice> {
-        let range = self.layer_span(b, layer)?;
-        let address = self.address(b)?;
-        let start = address.bytes.start;
-        self.block_slice(b, range.start - start..range.end - start)
-    }
-    /// Pins a band with exactly one read. Column views borrow this span without a heap list.
-    pub(crate) fn read_band(
-        &self,
-        b: usize,
-        layer: usize,
-    ) -> crate::Result<(Range<usize>, OwnedBytes)> {
-        let range = self.layer_span(b, layer)?;
+
+    /// Pins a band's payload in one read, sharing it among the decoded column views.
+    pub(crate) fn read_band(&self, layer: usize) -> crate::Result<(Range<usize>, OwnedBytes)> {
+        let range = self.band_range(layer);
         let bytes = self
-            .band_slice(b, layer)?
-            .read_vector_bytes(VectorReadKind::QuantizedLayer(layer as u8))?;
+            .blocks
+            .data_slice
+            .read_vector_bytes_slice(range.clone(), VectorReadKind::QuantizedLayer(layer as u8))?;
         Ok((range, bytes))
     }
 }
@@ -541,9 +521,10 @@ mod tests {
                     block_len: 8192,
                 })),
                 &opts,
-                BlockRows::Clusters(cluster_offsets),
+                RowOffsets::Clustered(cluster_offsets),
             )?;
-            let directory = blocks.directory_start..blocks.directory_start + (count + 1) * 8;
+            let directory =
+                blocks.block_offsets_start()..blocks.block_offsets_start() + (count + 1) * 8;
             assert!(reads
                 .lock()
                 .unwrap()
@@ -554,10 +535,10 @@ mod tests {
                 *offset_reads.lock().unwrap(),
                 [0..8, count * 8..(count + 1) * 8]
             );
-            assert!(blocks.accessed_clusters().is_empty());
             reads.lock().unwrap().clear();
             offset_reads.lock().unwrap().clear();
-            assert_eq!(blocks.row_range(17)?, 17..18);
+            let block = blocks.block(17)?;
+            assert_eq!(block.row_range(), 17..18);
             assert_eq!(
                 *reads.lock().unwrap(),
                 [directory.start + 17 * 8..directory.start + 19 * 8]
@@ -565,15 +546,17 @@ mod tests {
             assert_eq!(*offset_reads.lock().unwrap(), [17 * 8..19 * 8]);
             reads.lock().unwrap().clear();
             offset_reads.lock().unwrap().clear();
-            blocks.column(17, 0)?;
-            blocks.read_column_in_block(17, 0, 17..18)?;
+            block.column(0);
+            block.read_column(0, 17..18)?;
             assert!(reads
                 .lock()
                 .unwrap()
                 .iter()
                 .all(|r| r.end <= directory.start));
             assert!(offset_reads.lock().unwrap().is_empty());
-            assert_eq!(blocks.accessed_clusters(), [17]);
+            // A fresh Block reads its boundaries again; the collection retains no addresses.
+            blocks.block(17)?;
+            assert_eq!(*offset_reads.lock().unwrap(), [17 * 8..19 * 8]);
 
             // Corruption in either file is deferred until its cluster is accessed.
             for corrupt_rows in [false, true] {
@@ -585,11 +568,11 @@ mod tests {
                     data[directory.start + 25 * 8..directory.start + 26 * 8]
                         .copy_from_slice(&u64::MAX.to_le_bytes());
                 }
-                let rows = BlockRows::Clusters(ClusterOffsets::open(FileSlice::from(offsets))?);
+                let rows = RowOffsets::Clustered(ClusterOffsets::open(FileSlice::from(offsets))?);
                 let blocks = Blocks::open(FileSlice::from(data), &opts, rows)?;
                 assert_eq!(blocks.row_range(17)?, 17..18);
                 assert!(matches!(
-                    blocks.address(25),
+                    blocks.block(25),
                     Err(crate::TantivyError::DataCorruption(_))
                 ));
             }
@@ -612,7 +595,7 @@ mod tests {
             assert!(Blocks::open(
                 FileSlice::from(data.clone()),
                 &opts,
-                BlockRows::clusters(offsets)
+                RowOffsets::clusters(offsets)
             )
             .is_err());
         }
@@ -620,11 +603,11 @@ mod tests {
             let blocks = Blocks::open(
                 FileSlice::from(data.clone()),
                 &opts,
-                BlockRows::clusters(offsets),
+                RowOffsets::clusters(offsets),
             )?;
-            assert!(blocks.address(0).is_err());
+            assert!(blocks.block(0).is_err());
         }
-        let blocks = Blocks::open(FileSlice::from(data), &opts, BlockRows::clusters(&[0, 3]))?;
+        let blocks = Blocks::open(FileSlice::from(data), &opts, RowOffsets::clusters(&[0, 3]))?;
         assert_eq!(blocks.row_range(0)?, 0..3);
         Ok(())
     }
@@ -661,11 +644,14 @@ mod tests {
                     directory.push(bytes.len() as u64);
                 }
                 directory.finish(&mut bytes).unwrap();
-                let blocks =
-                    Blocks::open(FileSlice::from(bytes.clone()), &opts, BlockRows::Uniform(n))
-                        .unwrap();
+                let blocks = Blocks::open(
+                    FileSlice::from(bytes.clone()),
+                    &opts,
+                    RowOffsets::Uniform { num_rows: n },
+                )
+                .unwrap();
                 assert_eq!(
-                    data_entry_len(blocks.directory_start, blocks.num_blocks()),
+                    data_entry_len(blocks.block_offsets_start(), blocks.num_blocks()),
                     bytes.len()
                 );
                 for row in 0..n {
@@ -679,9 +665,12 @@ mod tests {
                     assert!(blocks.read_column(0, r - 1..r + 1).is_err());
                 }
                 bytes.push(0);
-                assert!(
-                    Blocks::open(FileSlice::from(bytes), &opts, BlockRows::Uniform(n)).is_err()
-                );
+                assert!(Blocks::open(
+                    FileSlice::from(bytes),
+                    &opts,
+                    RowOffsets::Uniform { num_rows: n }
+                )
+                .is_err());
             }
         }
     }
@@ -701,11 +690,15 @@ mod tests {
                 directory.push(block_end as u64);
             }
             directory.finish(&mut bytes).unwrap();
-            let blocks =
-                Blocks::open(FileSlice::from(bytes.clone()), &opts, BlockRows::Uniform(n)).unwrap();
+            let blocks = Blocks::open(
+                FileSlice::from(bytes.clone()),
+                &opts,
+                RowOffsets::Uniform { num_rows: n },
+            )
+            .unwrap();
             let b = usize::from(n != 0);
             let start = align_up(block_end, ENTRY_ALIGN);
-            assert_eq!(blocks.directory_start, start);
+            assert_eq!(blocks.block_offsets_start(), start);
             assert_eq!(blocks.num_rows(), n);
             assert_eq!(
                 u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()),
@@ -713,14 +706,17 @@ mod tests {
             );
             let reject = |corrupt: Vec<u8>| {
                 assert!(matches!(
-                    Blocks::open(FileSlice::from(corrupt), &opts, BlockRows::Uniform(n)).and_then(
-                        |blocks| {
-                            for b in 0..blocks.num_blocks() {
-                                blocks.address(b)?;
-                            }
-                            Ok(())
+                    Blocks::open(
+                        FileSlice::from(corrupt),
+                        &opts,
+                        RowOffsets::Uniform { num_rows: n }
+                    )
+                    .and_then(|blocks| {
+                        for b in 0..blocks.num_blocks() {
+                            blocks.block(b)?;
                         }
-                    ),
+                        Ok(())
+                    }),
                     Err(crate::TantivyError::DataCorruption(_))
                 ))
             };
@@ -788,38 +784,32 @@ mod tests {
                 let blocks = Blocks::open(
                     FileSlice::from(bytes.clone()),
                     &opts,
-                    BlockRows::clusters(&[0, 0, 3, 3, 8, 8]),
+                    RowOffsets::clusters(&[0, 0, 3, 3, 8, 8]),
                 )
                 .unwrap();
                 assert_eq!(blocks.block_of(0).unwrap(), 1);
                 assert_eq!(blocks.block_of(3).unwrap(), 3);
                 for b in [1, 3] {
-                    let mut previous = blocks.block_start(b).unwrap();
+                    let block = blocks.block(b).unwrap();
+                    let mut previous = block.bytes.start;
                     for idx in 0..slots.len() {
-                        let col = column_range(&slots, blocks.rows_in(b).unwrap(), idx);
-                        assert!(bytes[previous..blocks.block_start(b).unwrap() + col.start]
+                        let col = column_range(&slots, block.num_rows(), idx);
+                        assert!(bytes[previous..block.bytes.start + col.start]
                             .iter()
                             .all(|&v| v == 0));
-                        previous = blocks.block_start(b).unwrap() + col.end;
+                        previous = block.bytes.start + col.end;
                     }
-                    assert!(bytes[previous..blocks.address(b).unwrap().bytes.end]
-                        .iter()
-                        .all(|&v| v == 0));
+                    assert!(bytes[previous..block.bytes.end].iter().all(|&v| v == 0));
                     for l in 0..schedule.len() {
-                        let (span, pinned) = blocks.read_band(b, l).unwrap();
+                        let (span, pinned) = block.read_band(l).unwrap();
                         let first = blocks.bands[l].start;
                         for idx in first..blocks.bands[l].end {
-                            let col = column_range(&slots, blocks.rows_in(b).unwrap(), idx);
-                            let start = blocks.block_start(b).unwrap() + col.start - span.start;
+                            let col = column_range(&slots, block.num_rows(), idx);
+                            let start = block.bytes.start + col.start - span.start;
                             let view = pinned.slice(start..start + col.len());
                             assert_eq!(
                                 view.as_slice(),
-                                blocks
-                                    .column(b, idx)
-                                    .unwrap()
-                                    .read_bytes()
-                                    .unwrap()
-                                    .as_slice()
+                                block.column(idx).read_bytes().unwrap().as_slice()
                             );
                         }
                     }

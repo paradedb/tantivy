@@ -1232,6 +1232,9 @@ fn exact_reads_touch_only_survivor_pages() -> crate::Result<()> {
     for range in stage_reads(&log, |stage| {
         matches!(stage, VectorStage::ExactFetch | VectorStage::ExactScore)
     }) {
+        if ranges.directory.contains(range) {
+            continue;
+        }
         payload.extend(range.start / 8192..=(range.end - 1) / 8192);
     }
     assert_eq!(
@@ -1358,10 +1361,18 @@ fn exact_clusters_never_read_their_band() -> crate::Result<()> {
             layer0.full_clusters() + layer0.exact_clusters(),
             stats.postings_row
         );
-        let exact_reads = stage_reads(&log, |stage| {
+        let centroid_reads = fixture.centroid_reads();
+        let mut exact_reads = stage_reads(&log, |stage| {
             matches!(stage, VectorStage::ExactFetch | VectorStage::ExactScore)
-        })
-        .len();
+        });
+        exact_reads.extend(
+            stage_reads(&centroid_reads, |stage| {
+                matches!(stage, VectorStage::ExactFetch | VectorStage::ExactScore)
+            })
+            .into_iter()
+            .filter(|range| ranges.cluster_offsets.contains(range)),
+        );
+        let exact_reads = exact_reads.len();
         assert_eq!(stats.exact_io.reads, exact_reads as u64, "{stats:?}");
         assert_eq!(exact_reads > 0, stats.exact_rows > 0, "{stats:?}");
         assert_eq!(
@@ -1580,7 +1591,7 @@ fn reads_follow_the_plan() -> crate::Result<()> {
 }
 
 #[test]
-fn ann_reads_directory_entries_only_for_probed_clusters() -> crate::Result<()> {
+fn ann_reads_offsets_only_for_probed_clusters() -> crate::Result<()> {
     for schedule in [&[][..], &[1, 4][..]] {
         let fixture = FixtureSpec::clustered(Metric::L2, 64, 32, 640)
             .schedule(schedule)
@@ -1588,20 +1599,48 @@ fn ann_reads_directory_entries_only_for_probed_clusters() -> crate::Result<()> {
             .paged()
             .build()?;
         let query = Lcg(17).vector(64, 0.5);
+        let ranges = fixture.column_ranges()?;
         for filter in [&AllQuery as &dyn Query, &fixture.filter("some")] {
             let searcher = fixture.index.reader()?.searcher();
             let vectors = first_segment(&searcher).1.vector_index(fixture.field)?;
-            assert!(vectors.directory_clusters().is_empty());
+            fixture.clear_reads();
+            vectors.index().unwrap().cluster_range(17)?;
+            let allowed_byte_offsets: Vec<_> =
+                fixture.reads().into_iter().map(|(_, r)| r).collect();
+            let allowed_row_offsets: Vec<_> = fixture
+                .centroid_reads()
+                .into_iter()
+                .map(|(_, r)| r)
+                .collect();
             let collector = TopDocs::with_limit(5)
                 .order_by_similarity(fixture.field, query.clone())
                 .with_probe_params(routed_exhaustive_params(32))
                 .build();
-            let fruit = crate::vector::router::with_test_clusters(
-                fixture.candidates(&[17], &query)?,
-                || searcher.search(filter, &collector),
-            )?;
+            let candidates = fixture.candidates(&[17], &query)?;
+            fixture.clear_reads();
+            let fruit = crate::vector::router::with_test_clusters(candidates, || {
+                searcher.search(filter, &collector)
+            })?;
             assert!(!fruit.results.is_empty());
-            assert_eq!(vectors.directory_clusters(), [17], "schedule={schedule:?}");
+            for (reads, all_offsets, allowed) in [
+                (fixture.reads(), &ranges.directory, &allowed_byte_offsets),
+                (
+                    fixture.centroid_reads(),
+                    &ranges.cluster_offsets,
+                    &allowed_row_offsets,
+                ),
+            ] {
+                let offsets: Vec<_> = reads
+                    .into_iter()
+                    .map(|(_, r)| r)
+                    .filter(|r| all_offsets.contains(r))
+                    .collect();
+                assert!(!offsets.is_empty());
+                assert!(
+                    offsets.iter().all(|r| allowed.contains(r)),
+                    "schedule={schedule:?}: {offsets:?}"
+                );
+            }
         }
     }
     Ok(())

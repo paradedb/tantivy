@@ -76,7 +76,7 @@ fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
     use common::{HasLen, OwnedBytes};
 
     use crate::directory::{CompositeFile, FileHandle, FileSlice};
-    use crate::vector::storage::blocks::{block_align, data_entry_len, BlockRows, Blocks};
+    use crate::vector::storage::blocks::{block_align, data_entry_len, Blocks, RowOffsets};
     use crate::vector::storage::centroids::ClusterOffsets;
     use crate::vector::storage::header::{read_centroid_header, read_vector_header, CentroidSlot};
     #[derive(Debug)]
@@ -203,7 +203,7 @@ fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
         let blocks = Blocks::open(
             data.clone(),
             &opts,
-            BlockRows::Clusters(ClusterOffsets::open(offsets)?),
+            RowOffsets::Clustered(ClusterOffsets::open(offsets)?),
         )?;
         assert_eq!(
             data.len(),
@@ -212,7 +212,7 @@ fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
                 blocks.num_blocks()
             )
         );
-        aligns.push(block_align(&blocks.slots));
+        aligns.push(block_align(&blocks.schema));
         data_ends.push(start + data.len());
         id_starts.push(id_map.storage_block_ord(0).unwrap());
     }
