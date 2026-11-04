@@ -90,6 +90,7 @@ impl<S: VectorArena<Elem = f32>> RoutingLayer<'_, S> {
         }
     }
 
+    #[inline]
     fn score_centroids<T: VectorElement>(
         &self,
         query: &VectorQuery<T>,
@@ -123,6 +124,7 @@ impl<S: VectorArena<Elem = f32>> RoutingLayer<'_, S> {
         }
     }
 
+    #[inline]
     fn score_members<T: VectorElement>(
         &self,
         list: u32,
@@ -249,44 +251,50 @@ impl<'a, S: VectorArena<Elem = f32>> StackedRouting<'a, S> {
             };
         }
         let depth = levels.iter().map(Vec::len).max().unwrap_or(0);
+        let partition_level = levels
+            .iter()
+            .any(|stack| matches!(stack.last(), Some(Some(RoutingLayer::Partition { .. }))))
+            .then(|| depth - 1);
         let mut open = Vec::with_capacity(depth);
-        let mut beams = Vec::with_capacity(depth);
+        let mut requested = k;
+        let mut partition_beam = 0;
         for level in 0..depth {
-            let layers: Vec<_> = levels
-                .iter()
-                .filter_map(|stack| stack.get(level)?.as_ref())
-                .collect();
-            let mut children: Vec<_> = layers
-                .iter()
-                .filter_map(|layer| layer.child_level(level))
-                .collect();
-            children.sort_unstable();
-            children.dedup();
-            // A layer spanning unequal depths needs room for each child layer's beam.
-            let requested = if level == 0 {
-                k
-            } else {
-                children
-                    .into_iter()
+            let layers = levels.iter().filter_map(|stack| stack.get(level)?.as_ref());
+            if partition_level == Some(level) {
+                requested = (0..level)
+                    .filter(|&child| {
+                        layers
+                            .clone()
+                            .any(|layer| layer.child_level(level) == Some(child))
+                    })
                     .map(|child| open[child])
-                    .fold(0usize, usize::saturating_add)
-            };
+                    .fold(0usize, usize::saturating_add);
+                partition_beam = requested;
+            }
             let (lists, members) = layers
-                .iter()
                 .map(|layer| layer.sizes())
                 .fold((0, 0), |(a, b), (c, d)| (a + c, b + d));
-            open.push(lists_to_open(lists, members, requested));
-            beams.push(requested);
+            requested = lists_to_open(lists, members, requested);
+            open.push(requested);
         }
-        let mut pending = vec![Vec::new(); depth];
+        let mut pending = vec![Vec::new(); partition_level.unwrap_or(0)];
+        let mut candidates = Vec::new();
         let mut scores = Vec::new();
         for level in (0..depth).rev() {
-            let mut candidates = std::mem::take(&mut pending[level]);
+            if let Some(direct) = pending.get_mut(level) {
+                if candidates.is_empty() {
+                    std::mem::swap(&mut candidates, direct);
+                } else {
+                    candidates.append(direct);
+                }
+            }
             for (segment, stack) in levels.iter().enumerate() {
                 if stack.len() != level + 1 {
                     continue;
                 }
                 let layer = stack[level].as_ref().unwrap();
+                let count = layer.sizes().0;
+                candidates.reserve(count);
                 self.measure(segment, || {
                     layer.score_centroids(query, &mut scores, |candidate| {
                         candidates.push(Candidate {
@@ -295,11 +303,18 @@ impl<'a, S: VectorArena<Elem = f32>> StackedRouting<'a, S> {
                         });
                     })
                 });
-                stats[segment].members_scored += layer.sizes().0;
+                stats[segment].members_scored += count;
             }
             candidates.sort_unstable_by(|a, b| b.cmp(a));
             candidates.truncate(open[level]);
-            let requested = beams[level].max(1);
+            let requested = if partition_level == Some(level) {
+                partition_beam
+            } else if level == 0 {
+                k
+            } else {
+                open[level - 1]
+            }
+            .max(1);
             let mut probe = super::aps::open();
             let mut best = BinaryHeap::new();
             for candidate in candidates {
@@ -339,13 +354,16 @@ impl<'a, S: VectorArena<Elem = f32>> StackedRouting<'a, S> {
                     stats,
                 };
             }
-            for candidate in TopK.finish(best) {
-                let child_level = levels[candidate.node.0][level]
-                    .as_ref()
-                    .unwrap()
-                    .child_level(level)
-                    .unwrap();
-                pending[child_level].push(candidate);
+            candidates = TopK.finish(best);
+            if partition_level == Some(level) {
+                for candidate in candidates.drain(..) {
+                    let child_level = levels[candidate.node.0][level]
+                        .as_ref()
+                        .unwrap()
+                        .child_level(level)
+                        .unwrap();
+                    pending[child_level].push(candidate);
+                }
             }
         }
         StackedRanking {
