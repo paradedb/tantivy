@@ -3,7 +3,7 @@ use std::fmt;
 use crate::docset::{DocSet, TERMINATED};
 use crate::fieldnorm::FieldNormReader;
 use crate::index::{Bm25Params, SegmentReader};
-use crate::postings::{FreqReadingOption, Postings, SegmentPostings};
+use crate::postings::{BlockInfo, FreqReadingOption, Postings, SegmentPostings};
 use crate::query::bm25::Bm25Weight;
 use crate::query::boolean_query::BlockWandSingleScorer;
 use crate::query::explanation::does_not_match;
@@ -141,10 +141,12 @@ impl SynonymWeight {
         let mut postings: Vec<SegmentPostings> = Vec::with_capacity(self.terms.len());
         for term in &self.terms {
             if let Some(term_info) = inverted_index.get_term_info(term)? {
-                postings.push(
-                    inverted_index
-                        .read_postings_from_terminfo(&term_info, self.index_record_option)?,
-                );
+                let mut segment_postings = inverted_index
+                    .read_postings_from_terminfo(&term_info, self.index_record_option)?;
+                if !self.scoring_enabled {
+                    segment_postings.block_cursor.disable_term_norms();
+                }
+                postings.push(segment_postings);
             }
         }
         if postings.is_empty() {
@@ -352,8 +354,20 @@ impl BlockMaxScorer for SynonymScorer {
 
     fn seek_block(&mut self, target: DocId) {
         for postings in &mut self.postings {
-            if postings.doc() < target {
-                postings.block_cursor.seek_block(target);
+            if postings.doc() >= target {
+                continue;
+            }
+            postings.block_cursor.seek_block(target);
+            // The last block has no skip entry to bound it, so read it now. It is short, and a
+            // member that ends before `target` then drops out of the bound instead of adding its
+            // ceiling to it.
+            if !postings.block_cursor.block_is_loaded()
+                && matches!(
+                    postings.block_cursor.skip_reader().block_info(),
+                    BlockInfo::VInt { .. }
+                )
+            {
+                postings.seek(target);
             }
         }
     }
@@ -369,7 +383,8 @@ mod tests {
     use crate::collector::{Count, TopDocs};
     use crate::docset::{DocSet, TERMINATED};
     use crate::query::{
-        BlockMaxScorer, BooleanQuery, EnableScoring, Occur, Query, Scorer, TermQuery,
+        BlockMaxScorer, BooleanQuery, ConstScoreQuery, EnableScoring, Occur, Query, Scorer,
+        TermQuery,
     };
     use crate::schema::{Field, IndexRecordOption, Schema, TEXT};
     use crate::{assert_nearly_equals, DocAddress, Index, IndexWriter, Score, Term};
@@ -647,6 +662,55 @@ mod tests {
         ]);
         let pruned = searcher.search(&query, &TopDocs::with_limit(10).order_by_score())?;
         assert_same_top(&pruned, &exhaustive(&searcher, &query)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_filtered_union_prunes_to_the_same_top_k() -> crate::Result<()> {
+        let (index, text) = large_index()?;
+        let searcher = index.reader()?.searcher();
+        let filter = ConstScoreQuery::new(
+            TermQuery::new(Term::from_field_text(text, "pad"), IndexRecordOption::Basic),
+            0.0,
+        );
+        let query = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(filter)),
+            (
+                Occur::Should,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(text, "dog"),
+                    IndexRecordOption::WithFreqs,
+                )),
+            ),
+            (Occur::Should, Box::new(cat_feline(text))),
+        ]);
+        let pruned = searcher.search(&query, &TopDocs::with_limit(10).order_by_score())?;
+        assert_same_top(&pruned, &exhaustive(&searcher, &query)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_member_that_ended_drops_out_of_the_bound() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        // "rare" spans two blocks and ends early, "common" runs to the end.
+        for i in 0..3_000u32 {
+            let body = if i < 200 { "common rare" } else { "common" };
+            writer.add_document(doc!(text => body))?;
+        }
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let query = SynonymQuery::new(vec![
+            Term::from_field_text(text, "common"),
+            Term::from_field_text(text, "rare"),
+        ]);
+        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
+        let mut scorer = scorer.downcast::<SynonymScorer>().map_err(|_| ()).unwrap();
+        scorer.seek_block(2_000);
+        assert!(scorer.block_max_score() < scorer.max_score());
         Ok(())
     }
 }
