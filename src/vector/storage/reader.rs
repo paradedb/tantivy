@@ -425,6 +425,11 @@ impl VectorIndexReader {
         self.num_vectors
     }
 
+    /// Bytes in one storage block of this field's `.vec` data, when its directory has one.
+    pub(crate) fn storage_block_len(&self) -> Option<usize> {
+        self.rows_slice.entry.storage_block_len()
+    }
+
     /// Returns whether the field contains no vectors.
     pub fn is_empty(&self) -> bool {
         self.num_vectors == 0

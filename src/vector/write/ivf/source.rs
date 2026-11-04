@@ -159,4 +159,11 @@ impl VectorSource for MergeVectorSource<'_> {
     fn wants_cancel(&self) -> bool {
         self.reader.cancel.wants_cancel()
     }
+
+    fn storage_block_len(&self) -> Option<usize> {
+        self.reader
+            .readers
+            .iter()
+            .find_map(|reader| reader.storage_block_len())
+    }
 }
