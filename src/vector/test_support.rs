@@ -555,7 +555,7 @@ impl Fixture {
         let query = Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec())));
         let quantized = segment_reader
             .vector_index(self.field)?
-            .quantization()
+            .quantization()?
             .map(|field| {
                 let index = field.index_ctx();
                 Arc::new(QuantizedQueryCtx::with_depth(

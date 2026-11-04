@@ -746,7 +746,7 @@ fn assert_quantized_matrix_storage(
     let ivf = vector_reader.index().expect("matrix fixture must be IVF");
     assert_eq!(ivf.num_rows(), 8);
     let quantized = vector_reader
-        .quantization()
+        .quantization()?
         .expect("matrix fixture must carry quantized slots");
     assert_eq!(
         quantized
@@ -949,7 +949,7 @@ fn assert_quantized_bridge_exactness(dim: usize) -> crate::Result<()> {
     let vector_reader = segment.vector_index(field)?;
     let ivf = vector_reader.index().expect("merged fixture must be IVF");
     let quantized = vector_reader
-        .quantization()
+        .quantization()?
         .expect("configured IVF fixture must carry quantized slots");
     let (specs, grids) = (
         quantized.index_ctx().specs.clone(),
@@ -1007,9 +1007,9 @@ fn settings_v3_builds_v5_and_readers_ignore_global_changes() -> crate::Result<()
     index.settings_mut().vector_quantization.clear();
     let searcher = index.reader()?.searcher();
     let vector = searcher.segment_readers()[0].vector_index(field)?;
-    assert_eq!(vector.quantization().unwrap().layers().len(), 2);
+    assert_eq!(vector.quantization()?.unwrap().layers().len(), 2);
     assert!(vector
-        .quantization()
+        .quantization()?
         .unwrap()
         .residual_norm(BlockAddress::new(0, 0))?
         .is_finite());
@@ -1044,7 +1044,7 @@ fn level_zero_matches_unquantized_ivf() -> crate::Result<()> {
     let quantized_searcher = quantized_reader.searcher();
     assert!(quantized_searcher.segment_readers()[0]
         .vector_index(field)?
-        .quantization()
+        .quantization()?
         .is_some());
     let level_zero_fruit = quantized_searcher.search(&AllQuery, &level_zero_collector)?;
     assert!(level_zero_collector.quantized_query_count() == 0);
@@ -1211,7 +1211,7 @@ fn level_zero_flat_segment_remains_exact() -> crate::Result<()> {
     let field = flat.schema().get_field("embedding")?;
     let vector_reader = searcher.segment_readers()[0].vector_index(field)?;
     assert!(vector_reader.index().is_none());
-    assert!(vector_reader.quantization().is_none());
+    assert!(vector_reader.quantization()?.is_none());
 
     let fruit = searcher.search(
         &AllQuery,
@@ -1248,7 +1248,7 @@ fn merge_quantization_matches_kernel_harness_and_is_reproducible() -> crate::Res
     let ivf = vector_reader.index().expect("merged fixture must be IVF");
     assert_eq!(ivf.num_rows(), 8);
     let quantized = vector_reader
-        .quantization()
+        .quantization()?
         .expect("configured IVF fixture must carry quantized slots");
     let (specs, grids) = (
         quantized.index_ctx().specs.clone(),
@@ -1569,7 +1569,7 @@ fn general_dimension_quantized_bridge_at_d100() -> crate::Result<()> {
     })?;
     let ivf = vector_reader.index().expect("merged fixture must be IVF");
     let quantized = vector_reader
-        .quantization()
+        .quantization()?
         .expect("configured IVF fixture must carry quantized slots");
     let (specs, grids) = (
         quantized.index_ctx().specs.clone(),
@@ -1689,7 +1689,7 @@ fn estimator_measurement_uses_production_path_and_is_centered() -> crate::Result
     let searcher = reader.searcher();
     let field = index.schema().get_field("embedding")?;
     let vector_reader = searcher.segment_readers()[0].vector_index(field)?;
-    assert!(vector_reader.quantization().is_some());
+    assert!(vector_reader.quantization()?.is_some());
     let queries = fixture_estimator_queries(DIM);
     let estimator_queries = queries
         .iter()

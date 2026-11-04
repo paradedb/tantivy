@@ -110,6 +110,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn params(&self) -> &ProbeParams {
         &self.probe_params
     }
@@ -118,6 +119,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
         &self.reader
     }
 
+    #[cfg(test)]
     pub(crate) fn query(&self) -> &VectorQuery<T> {
         &self.query
     }
