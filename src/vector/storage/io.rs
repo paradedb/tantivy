@@ -138,6 +138,7 @@ pub(crate) mod test_support {
     pub(crate) struct PagedDirectory {
         inner: RamDirectory,
         pub(crate) reads: ReadLog,
+        pub(crate) centroid_reads: ReadLog,
         pub(crate) read_kinds: Arc<Mutex<Vec<VectorReadKind>>>,
     }
     #[derive(Debug)]
@@ -178,6 +179,12 @@ pub(crate) mod test_support {
                     inner,
                     reads: self.reads.clone(),
                     read_kinds: self.read_kinds.clone(),
+                }))
+            } else if path.extension().is_some_and(|ext| ext == "centroids") {
+                Ok(Arc::new(PagedFile {
+                    inner,
+                    reads: self.centroid_reads.clone(),
+                    read_kinds: Arc::default(),
                 }))
             } else {
                 Ok(inner)

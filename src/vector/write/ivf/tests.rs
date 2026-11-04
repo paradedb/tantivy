@@ -76,8 +76,9 @@ fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
     use common::{HasLen, OwnedBytes};
 
     use crate::directory::{CompositeFile, FileHandle, FileSlice};
-    use crate::vector::storage::blocks::{block_align, data_entry_len, Blocks};
-    use crate::vector::storage::header::read_vector_header;
+    use crate::vector::storage::blocks::{block_align, data_entry_len, BlockRows, Blocks};
+    use crate::vector::storage::centroids::ClusterOffsets;
+    use crate::vector::storage::header::{read_centroid_header, read_vector_header, CentroidSlot};
     #[derive(Debug)]
     struct ByteAddressed(Vec<u8>);
     impl HasLen for ByteAddressed {
@@ -192,16 +193,22 @@ fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
         let start = data.storage_block_ord(0).unwrap();
         assert_eq!(start % ENTRY_ALIGN, 0);
         assert_eq!(data.len() % ENTRY_ALIGN, 0);
-        let blocks = Blocks::open(data.clone(), &opts, true)?;
+        let centroid_file = segment.open_read(SegmentComponent::Custom(CENTROIDS_EXT.into()))?;
+        let (_, centroid_body) = read_centroid_header(&centroid_file)?;
+        let centroid_composite = CompositeFile::open(&centroid_body)?;
+        let offsets = centroid_composite
+            .open_read_with_idx(field, CentroidSlot::Offsets.index())
+            .unwrap();
+        assert_eq!(offsets.len(), (ivf.num_clusters() + 1) * 8);
+        let blocks = Blocks::open(
+            data.clone(),
+            &opts,
+            BlockRows::Clusters(ClusterOffsets::open(offsets)?),
+        )?;
         assert_eq!(
             data.len(),
             data_entry_len(
-                data.len()
-                    - 16
-                    - crate::vector::storage::blocks::align_up(
-                        (blocks.num_blocks() + 1) * 12,
-                        ENTRY_ALIGN
-                    ),
+                data.len() - 8 - (blocks.num_blocks() + 1) * 8,
                 blocks.num_blocks()
             )
         );
@@ -1759,6 +1766,7 @@ fn layer_zero_io_matches_requested_page_spans() -> crate::Result<()> {
     let field = index.schema().get_field("embedding")?;
     let searcher = index.reader()?.searcher();
     directory.reads.lock().unwrap().clear();
+    directory.centroid_reads.lock().unwrap().clear();
     let result = searcher.search(
         &AllQuery,
         &TopDocsByVectorSimilarityBuilder::new(field, fixture_search_query(Metric::L2, 64), 16)
@@ -1772,8 +1780,10 @@ fn layer_zero_io_matches_requested_page_spans() -> crate::Result<()> {
             .build(),
     )?;
     let reads = directory.reads.lock().unwrap();
+    let centroid_reads = directory.centroid_reads.lock().unwrap();
     let ranges: Vec<_> = reads
         .iter()
+        .chain(centroid_reads.iter())
         .filter_map(|(stage, range)| matches!(stage, VectorStage::LayerScan(0)).then_some(range))
         .collect();
     let io = result.stats[0].layers.get(0).unwrap().io;

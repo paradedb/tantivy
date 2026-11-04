@@ -110,7 +110,7 @@ pub(super) fn write_data_entry(
         let end = offsets[1] as usize;
         let n = end - start;
         if n == 0 {
-            directory.push(data.written_bytes() - entry_start, offsets[1] as u32);
+            directory.push(data.written_bytes() - entry_start);
             continue;
         }
         let block_start = pos;
@@ -191,10 +191,10 @@ pub(super) fn write_data_entry(
         timings.pad_bytes += padding;
         pos += padding;
         assert_eq!(data.written_bytes() - entry_start, pos as u64);
-        directory.push(data.written_bytes() - entry_start, offsets[1] as u32);
+        directory.push(data.written_bytes() - entry_start);
     }
     let entry_len = directory.finish(data)?;
-    timings.pad_bytes += entry_len - pos - (num_centroids + 1) * 12 - 8;
+    timings.pad_bytes += entry_len - pos - (num_centroids + 1) * 8 - 8;
     assert_eq!(
         (data.written_bytes() - entry_start) as usize % ENTRY_ALIGN,
         0
