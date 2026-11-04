@@ -220,13 +220,11 @@ impl VectorFieldReader {
                     composite.open_read_with_idx(field, CentroidSlot::Offsets.index()),
                     composite.open_read_with_idx(field, CentroidSlot::Router.index()),
                 ) {
-                    (Some(centroids), Some(offsets), Some(router)) => {
-                        Some(CentroidSlices {
-                            centroids,
-                            offsets,
-                            router,
-                        })
-                    }
+                    (Some(centroids), Some(offsets), Some(router)) => Some(CentroidSlices {
+                        centroids,
+                        offsets,
+                        router,
+                    }),
                     (Some(_), None, _) => {
                         return Err(
                             DataCorruption::comment_only("missing cluster offsets slot").into()
@@ -301,12 +299,8 @@ impl VectorIndexReader {
                 source.metadata.clone(),
                 RowOffsets::Clustered(cluster_offsets.clone()),
             )?);
-            let index = ClusterIndex::open(
-                &options,
-                slots.centroids,
-                cluster_offsets,
-                slots.router,
-            )?;
+            let index =
+                ClusterIndex::open(&options, slots.centroids, cluster_offsets, slots.router)?;
             (rows_slice, Some(index))
         } else {
             let rows_slice = Arc::new(Blocks::from_metadata(
@@ -481,17 +475,6 @@ impl VectorIndexReader {
                     .collect()
             })
             .transpose()
-    }
-
-    /// Each cluster's ball radius around its stored centroid, in cluster order, with
-    /// `f32::INFINITY` for a saturated cluster; `None` when the storage is not IVF.
-    pub fn cluster_radii(&self) -> Option<Vec<f32>> {
-        self.index.as_ref().map(|index| {
-            let bounds = index.bounds();
-            (0..index.num_clusters())
-                .map(|cluster| bounds.ball_r(cluster))
-                .collect()
-        })
     }
 
     /// Returns the number of live IVF posting rows.
