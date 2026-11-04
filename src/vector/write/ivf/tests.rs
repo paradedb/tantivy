@@ -1379,7 +1379,6 @@ fn quantized_probe_terminates_at_ceiling() -> crate::Result<()> {
     let collector = TopDocsByVectorSimilarityBuilder::new(field, query.clone(), 3)
         .with_probe_params(ProbeParams {
             max_probe_fraction: 0.1,
-            min_probe_clusters: 1,
             exact_plan: false,
             located: LocatedPath::Off,
             ..Default::default()

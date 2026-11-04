@@ -19,7 +19,7 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 pub struct ProbeParams {
     /// Work ceiling as a fraction of each segment's capacity. Default 0.01.
     pub max_probe_fraction: f32,
-    /// Floor on the resolved budget, in work units, applied before the capacity cap. Default 16.
+    /// Floor on the resolved budget, in work units, applied before the capacity cap. Default 0.
     pub min_probe_clusters: usize,
     /// Lets a quantized segment score a cluster's rows exactly before the exact phase when that
     /// reads strictly fewer storage blocks (bytes without block geometry) than the cheaper
@@ -69,15 +69,13 @@ impl Default for ProbeParams {
     fn default() -> Self {
         Self {
             max_probe_fraction: 0.01,
-            min_probe_clusters: MIN_PROBE_CLUSTERS,
+            min_probe_clusters: 0,
             exact_plan: true,
             located: LocatedPath::Auto,
             fixed_probe_cost_rows: DEFAULT_FIXED_PROBE_COST_ROWS,
         }
     }
 }
-
-pub(crate) const MIN_PROBE_CLUSTERS: usize = 16;
 
 impl ProbeParams {
     /// The number of clusters the stacked router is asked to rank for a
@@ -173,26 +171,19 @@ mod tests {
         Ok(())
     }
 
-    /// The fraction scales the capacity, the floor lifts small segments,
-    /// and the capacity caps both.
+    /// The fraction scales the capacity without a default floor, including sub-cluster budgets.
     #[test]
     fn budget_resolves_against_capacity() -> crate::Result<()> {
         let params = ProbeParams {
             max_probe_fraction: 0.25,
             ..Default::default()
         };
-        // A quarter of the capacity - well above the floor.
         let (budget, _, _) = params.resolved_work_budget(1000, 20_000)?;
         assert!((budget - 250.0).abs() < 1e-6, "{budget}");
-        // A fraction resolving below MIN_PROBE_CLUSTERS is lifted to it...
         let (budget, _, _) = params.resolved_work_budget(40, 800)?;
-        assert!(
-            (budget - super::MIN_PROBE_CLUSTERS as f64).abs() < 1e-6,
-            "{budget}"
-        );
-        // ...but the floor never exceeds the capacity.
+        assert!((budget - 10.0).abs() < 1e-6, "{budget}");
         let (budget, _, _) = params.resolved_work_budget(2, 40)?;
-        assert!((budget - 2.0).abs() < 1e-6, "{budget}");
+        assert!((budget - 0.5).abs() < 1e-6, "{budget}");
         // A fraction above 1.0 clamps to the capacity - small segments
         // scan exhaustively.
         let all = ProbeParams {
@@ -205,8 +196,7 @@ mod tests {
     }
 
     /// Unfiltered, the stacked router is asked for the budget; a selective
-    /// filter stretches it toward `budget / open_share`. Either way it is
-    /// lifted to the probe floor and capped at the segment's clusters.
+    /// filter stretches it toward `budget / open_share`, capped at the segment's clusters.
     #[test]
     fn router_k_tracks_budget_and_filter_selectivity() {
         let params = ProbeParams::default();
@@ -217,10 +207,8 @@ mod tests {
         assert_eq!(params.router_k(20.0, x, 0.5, 1000), 34);
         // Nothing matches: only opens charge.
         assert_eq!(params.router_k(20.0, x, 0.0, 1000), 100);
-        assert_eq!(
-            params.router_k(2.0, x, 1.0, 1000),
-            super::MIN_PROBE_CLUSTERS
-        );
+        assert_eq!(params.router_k(2.0, x, 1.0, 1000), 2);
+        assert_eq!(params.router_k(0.01, x, 1.0, 1000), 1);
         assert_eq!(params.router_k(20.0, x, 1.0, 18), 18);
         assert_eq!(params.router_k(20.0, 0.0, 0.0, 1000), 1000);
         assert_eq!(params.router_k(0.0, x, 1.0, 0), 1);
