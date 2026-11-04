@@ -9,7 +9,6 @@ use crate::directory::CompositeWrite;
 use crate::schema::Field;
 use crate::vector::router::{BuiltRouter, RouterKind};
 use crate::vector::storage::blocks::{write_metadata, BlockDirectory};
-use crate::vector::storage::bounds::BoundKind;
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::header::{CentroidSlot, VectorEntry, HEADER_LEN};
 use crate::vector::storage::id_map::{DocLocation, IdMap};
@@ -17,14 +16,13 @@ use crate::vector::storage::metadata::VectorColMetadata;
 use crate::vector::ENTRY_ALIGN;
 use crate::TantivyError;
 
-/// Writes a field's `.centroids` slots: centroids, offsets, bounds, then the router.
+/// Writes a field's `.centroids` slots: centroids, offsets, then the router.
 pub(super) fn centroid_slots(
     centroids_write: &mut CompositeWrite,
     merge: &FieldMerge,
     num_present_docs: usize,
     centroid_bytes: &[u8],
     cluster_offsets: &[u64],
-    bounds: &[f32],
     router: &BuiltRouter,
 ) -> crate::Result<()> {
     let field = merge.field;
@@ -45,11 +43,6 @@ pub(super) fn centroid_slots(
         let offsets_w = centroids_write.for_field_with_idx(field, CentroidSlot::Offsets.index());
         ClusterIndex::serialize_offsets(cluster_offsets, offsets_w)?;
         offsets_w.flush()?;
-    }
-    {
-        let bounds_w = centroids_write.for_field_with_idx(field, CentroidSlot::Bounds.index());
-        ClusterIndex::serialize_bounds(BoundKind::Ball, bounds, bounds_w)?;
-        bounds_w.flush()?;
     }
 
     if merge.ctx.cancel.wants_cancel() {
@@ -87,11 +80,6 @@ pub(super) fn empty_field(
         let offsets_w = centroids_write.for_field_with_idx(field, CentroidSlot::Offsets.index());
         ClusterIndex::serialize_offsets(&[0u64], offsets_w)?;
         offsets_w.flush()?;
-    }
-    {
-        let bounds_w = centroids_write.for_field_with_idx(field, CentroidSlot::Bounds.index());
-        ClusterIndex::serialize_bounds(BoundKind::Ball, &[], bounds_w)?;
-        bounds_w.flush()?;
     }
     {
         let router_w = centroids_write.for_field_with_idx(field, CentroidSlot::Router.index());

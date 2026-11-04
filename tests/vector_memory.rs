@@ -184,7 +184,7 @@ fn vector(seed: u64, dim: usize) -> Vec<f32> {
 }
 
 /// Center `doc % centers` plus noise as wide as the centers' spread, so clusters overlap and the
-/// bounds gate rarely skips one.
+/// routing must explore many of them.
 fn doc_vector(doc: u64, centers: u64, dim: usize) -> Vec<f32> {
     let center = vector(1_000_000 + doc % centers, dim);
     let noise = vector(doc, dim);

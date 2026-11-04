@@ -111,13 +111,7 @@ pub(crate) struct VectorFieldReader {
     search: OnceLock<crate::Result<Arc<VectorIndexReader>>>,
 }
 
-type CentroidSlices = (
-    crate::vector::storage::header::VectorFileVersion,
-    FileSlice,
-    FileSlice,
-    FileSlice,
-    FileSlice,
-);
+type CentroidSlices = (FileSlice, FileSlice, FileSlice);
 
 struct VectorSource {
     metadata: BlockMetadata,
@@ -213,26 +207,19 @@ impl VectorFieldReader {
         let centroid_slots =
             match segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string())) {
                 Ok(file) => {
-                    let (centroids_version, body) = read_centroid_header(&file)?;
+                    let (_, body) = read_centroid_header(&file)?;
                     let composite = CompositeFile::open(&body)?;
                     match (
                         composite.open_read_with_idx(field, CentroidSlot::Centroids.index()),
                         composite.open_read_with_idx(field, CentroidSlot::Offsets.index()),
                         composite.open_read_with_idx(field, CentroidSlot::Router.index()),
-                        composite.open_read_with_idx(field, CentroidSlot::Bounds.index()),
                     ) {
-                        (Some(centroids), Some(offsets), Some(router), Some(bounds)) => {
-                            Some((centroids_version, centroids, offsets, router, bounds))
+                        (Some(centroids), Some(offsets), Some(router)) => {
+                            Some((centroids, offsets, router))
                         }
-                        (Some(_), Some(_), None, _) => {
+                        (Some(_), Some(_), None) => {
                             return Err(TantivyError::InternalError(format!(
                                 "vector field {:?} has no router slot",
-                                entry.name()
-                            )));
-                        }
-                        (Some(_), Some(_), Some(_), None) => {
-                            return Err(TantivyError::InternalError(format!(
-                                "vector field {:?} has no bounds slot",
                                 entry.name()
                             )));
                         }
@@ -289,15 +276,12 @@ impl VectorIndexReader {
             source: Some((source.composite.clone(), source.field, source.max_doc)),
             value: OnceLock::new(),
         };
-        let index = if let Some((version, centroids, offsets, router_slot, bounds)) = centroid_slots
-        {
+        let index = if let Some((centroids, offsets, router_slot)) = centroid_slots {
             Some(ClusterIndex::open(
-                version,
                 &options,
                 centroids,
                 offsets,
                 router_slot,
-                bounds,
             )?)
         } else {
             None
@@ -467,17 +451,6 @@ impl VectorIndexReader {
         self.index
             .as_ref()
             .map(|index| index.cluster_sizes().map(|size| size as u32).collect())
-    }
-
-    /// Each cluster's ball radius around its stored centroid, in cluster order, with
-    /// `f32::INFINITY` for a saturated cluster; `None` when the storage is not IVF.
-    pub fn cluster_radii(&self) -> Option<Vec<f32>> {
-        self.index.as_ref().map(|index| {
-            let bounds = index.bounds();
-            (0..index.num_clusters())
-                .map(|cluster| bounds.ball_r(cluster))
-                .collect()
-        })
     }
 
     /// Returns the number of live IVF posting rows.

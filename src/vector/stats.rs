@@ -262,12 +262,6 @@ pub struct ProbeStats {
     pub routing: Option<RouterMetrics>,
     /// Centroids scored while ranking.
     pub routing_visited_count: usize,
-    /// Clusters the bounds gate passed over.
-    pub bounds_skips: u32,
-    /// Segment scans in which the query bound armed: 0 or 1.
-    pub bound_armed_count: u32,
-    /// The zero-based probe at which the query bound armed; 0 when it never armed.
-    pub bound_armed_probe_sum: u64,
     /// How the routed probe loop stopped.
     pub termination: ProbeTermination,
     /// Work units the probe loop charged.
@@ -388,11 +382,6 @@ impl ProbeStats {
         self.pruned_dead = counters.pruned_dead;
         self.postings_row = counters.postings_row;
         self.postings_skipped = counters.postings_skipped;
-        self.bounds_skips = counters.bounds_skips;
-        if let Some(probe) = counters.bound_armed_at {
-            self.bound_armed_count = 1;
-            self.bound_armed_probe_sum = u64::from(probe);
-        }
         self.routing = Some(routing);
         self.routing_visited_count = match routing {
             RouterMetrics::Stacked {
@@ -544,9 +533,6 @@ mod tests {
         "postings_row",
         "postings_skipped",
         "routing_visited_count",
-        "bounds_skips",
-        "bound_armed_count",
-        "bound_armed_probe_sum",
         "termination",
         "work_charged",
         "work_budget",

@@ -471,7 +471,7 @@ fn build_quantized_fixture_case(
     quantized: bool,
 ) -> crate::Result<Index> {
     // Exact: the fixture has two lists; Stacked's hard 25% top prune keeps one,
-    // which breaks oracle and bounds-gate assertions that need both.
+    // which breaks oracle and probe-budget assertions that need both.
     build_quantized_fixture_case_with_router(dim, metric, schedule, quantized, RouterKind::Exact)
 }
 
@@ -1340,7 +1340,7 @@ fn merge_quantization_matches_kernel_harness_and_is_reproducible() -> crate::Res
 }
 
 #[test]
-fn quantized_bounds_gate_skips_provably_useless_cluster() -> crate::Result<()> {
+fn quantized_exhaustive_search_probes_all_clusters() -> crate::Result<()> {
     let index = build_quantized_fixture_case(100, Metric::L2, &[1], true)?;
     let field = index.schema().get_field("embedding")?;
     let query = fixture_search_query(Metric::L2, 100);
@@ -1363,10 +1363,7 @@ fn quantized_bounds_gate_skips_provably_useless_cluster() -> crate::Result<()> {
         fixture_exact_hits(&index, Metric::L2, &query, None, 3)?,
         "{stats:?}"
     );
-    assert_eq!(stats.bounds_skips, 1, "{stats:?}");
-    assert_eq!(stats.bound_armed_count, 1, "{stats:?}");
-    assert_eq!(stats.bound_armed_probe_sum, 0, "{stats:?}");
-    assert_eq!(stats.clusters_probed(), 1, "{stats:?}");
+    assert_eq!(stats.clusters_probed(), 2, "{stats:?}");
     Ok(())
 }
 

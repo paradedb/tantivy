@@ -1,5 +1,5 @@
 //! The vocabulary shared by cluster sources and the segment scan: one cluster's selected rows,
-//! the scan's feedback to its source, and the source contract.
+//! and the source contract.
 
 use std::ops::Range;
 
@@ -44,19 +44,10 @@ impl ClusterRows<'_> {
     }
 }
 
-/// What the scan reports to a source after each cluster.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct Feedback {
-    /// The pruning threshold: the k-th largest lower endpoint, once `k` rows are in.
-    pub(crate) kth_lower: Option<f32>,
-    /// The APS cover threshold: never above the k-th best estimate, so it never prunes.
-    pub(crate) kth_estimate: Option<f32>,
-}
-
 /// Supplies a segment scan's clusters in its own order and decides when to stop.
 pub(crate) trait ClusterSource {
     /// The next cluster's rows, or `None` when the source stops.
-    fn next(&mut self, feedback: Feedback) -> crate::Result<Option<ClusterRows<'_>>>;
-    /// Records that the last cluster was shortlisted with `rows` scored; `feedback` includes them.
-    fn admitted(&mut self, rows: usize, feedback: Feedback) -> crate::Result<()>;
+    fn next(&mut self) -> crate::Result<Option<ClusterRows<'_>>>;
+    /// Records that the last cluster was shortlisted with `rows` scored.
+    fn admitted(&mut self, rows: usize) -> crate::Result<()>;
 }
