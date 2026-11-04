@@ -625,10 +625,13 @@ impl VectorIndexReader {
         let clustered = self.rows_slice.clustered();
         let map = self.id_map.get(clustered)?;
         if clustered {
-            map.locate(doc_id, |block| {
-                self.rows_slice.row_range(block).map_err(io::Error::other)
-            })
-            .map_err(|e| DataCorruption::comment_only(e.to_string()).into())
+            let location = map
+                .locate(doc_id)
+                .map_err(|e| DataCorruption::comment_only(e.to_string()))?;
+            if let Some(address) = location {
+                self.validate_location(address)?;
+            }
+            Ok(location)
         } else {
             let crate::vector::storage::metadata::Partition::Uniform { rows_per_block } =
                 self.rows_slice.metadata.field().partition
@@ -639,6 +642,17 @@ impl VectorIndexReader {
                 .rank_if_exists(doc_id)
                 .map(|row| BlockAddress::new(row / rows_per_block, row % rows_per_block)))
         }
+    }
+
+    /// Checks one address against its block's stored row count.
+    fn validate_location(&self, address: BlockAddress) -> crate::Result<()> {
+        let rows = self.rows_slice.row_range(address.block as usize)?;
+        if !rows.contains(&(address.row as usize)) {
+            return Err(
+                DataCorruption::comment_only("document location is outside its block").into(),
+            );
+        }
+        Ok(())
     }
     /// Reads a block's document ids from its column or the flat presence map.
     pub(crate) fn read_doc_ids(&self, cluster: usize, out: &mut Vec<DocId>) -> crate::Result<()> {
@@ -723,26 +737,32 @@ impl VectorIndexReader {
         Ok(range_cost(&row, 0..row.len(), unit))
     }
 
-    /// Locates ascending `docs` through the location map, appending `(doc, location)` for each
-    /// one with a vector; an invalid map entry is `DataCorruption`.
+    /// Appends locations for ascending `docs` in block/row order, validating each block once.
+    /// An invalid map entry is `DataCorruption`.
     pub(crate) fn locate_docs(
         &self,
         docs: &[DocId],
         out: &mut Vec<(DocId, BlockAddress)>,
     ) -> crate::Result<()> {
-        self.id_map
-            .get(true)?
-            .locate_many(
-                docs,
-                |cluster| self.rows_slice.row_range(cluster).map_err(io::Error::other),
-                out,
-            )
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::InvalidData => {
+        let start = out.len();
+        if let Err(error) = self.id_map.get(true)?.locate_many(docs, out) {
+            out.truncate(start);
+            return Err(match error.kind() {
+                io::ErrorKind::InvalidData => {
                     DataCorruption::comment_only(error.to_string()).into()
                 }
                 _ => error.into(),
-            })
+            });
+        }
+        out[start..].sort_unstable_by_key(|&(_, address)| address);
+        for group in out[start..].chunk_by(|a, b| a.1.block == b.1.block) {
+            // Row order makes the last row sufficient to validate the entire block group.
+            if let Err(error) = self.validate_location(group[group.len() - 1].1) {
+                out.truncate(start);
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     /// Reads a cluster's full-precision rows without document ids or quantized columns.
@@ -762,7 +782,7 @@ mod tests {
     use crate::directory::CompositeWrite;
     use crate::schema::Metric;
     use crate::vector::search::prepared::VectorQuery;
-    use crate::vector::storage::io::test_support::BlockTrackedBytes;
+    use crate::vector::storage::io::test_support::{BlockTrackedBytes, TrackedReads};
 
     fn tracked_id_composite(ids: Vec<u8>, reads: &Arc<Mutex<Vec<Range<usize>>>>) -> CompositeFile {
         let mut bytes = Vec::new();
@@ -803,14 +823,129 @@ mod tests {
         let opened = map.get(true)?;
         assert_eq!(&*reads.lock().unwrap(), &[0..1]);
         reads.lock().unwrap().clear();
-        assert_eq!(
-            opened.locate(
-                2,
-                crate::vector::storage::id_map::tests::boundaries(&[0, 2])
-            )?,
-            Some(BlockAddress::new(0, 1))
-        );
+        assert_eq!(opened.locate(2)?, Some(BlockAddress::new(0, 1)));
         assert_eq!(&*reads.lock().unwrap(), &[17..25]);
+        Ok(())
+    }
+
+    /// A metadata-only fixture: location validation must never read block payloads.
+    fn location_reader(
+        locations: &[BlockAddress],
+        counts: &[usize],
+    ) -> crate::Result<(VectorIndexReader, TrackedReads, usize)> {
+        use crate::vector::storage::blocks::{block_len, pad, write_metadata, BlockOffsetsWriter};
+        let options = VectorOptions::new(2, Metric::L2);
+        let metadata = VectorColMetadata::build_ivf(&options, None)?;
+        let mut data = Vec::new();
+        write_metadata(&mut data, &metadata)?;
+        let mut offsets = BlockOffsetsWriter::new(data.len() as u64);
+        for &count in counts {
+            pad(&mut data, block_len(&metadata.slots(), count))?;
+            offsets.push(data.len() as u64, count);
+        }
+        offsets.finish(&mut data)?;
+        let offsets_start = data.len() - 16 - 16 * (counts.len() + 1);
+        let reads = TrackedReads::default();
+        let blocks = Blocks::open(
+            FileSlice::new(Arc::new(BlockTrackedBytes {
+                bytes: data,
+                reads: Arc::clone(&reads),
+                block_len: 8192,
+            })),
+            &options,
+            true,
+        )?;
+        let mut ids = Vec::new();
+        IdMap::serialize_locations(locations, &mut ids)?;
+        let max_doc = locations.len() as u32;
+        let reader = VectorIndexReader {
+            max_doc,
+            options,
+            num_vectors: counts.iter().sum(),
+            present: true,
+            id_map: DeferredIdMap::ready(IdMap::open(FileSlice::from(ids), max_doc)?),
+            rows_slice: Arc::new(blocks),
+            index: None,
+            quantization: OnceLock::new(),
+        };
+        reads.lock().unwrap().clear();
+        Ok((reader, reads, offsets_start))
+    }
+
+    #[test]
+    fn locate_docs_validates_distinct_blocks_in_storage_order() -> crate::Result<()> {
+        let expected = [
+            (1, BlockAddress::new(0, 0)),
+            (4, BlockAddress::new(0, 1)),
+            (7, BlockAddress::new(0, 2)),
+            (3, BlockAddress::new(1, 0)),
+            (6, BlockAddress::new(1, 1)),
+            (0, BlockAddress::new(2, 0)),
+            (5, BlockAddress::new(2, 1)),
+            (8, BlockAddress::new(2, 2)),
+        ];
+        let mut locations = IdMap::empty_locations(10);
+        for &(doc, address) in &expected {
+            locations[doc as usize] = address;
+        }
+        let (reader, reads, start) = location_reader(&locations, &[3, 2, 3])?;
+        for docs in [
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 99],
+            vec![0, 2, 5, 8],
+            vec![2, 9, 99],
+            Vec::new(),
+        ] {
+            reads.lock().unwrap().clear();
+            let prefix = (100, BlockAddress::new(100, 100));
+            let mut located = vec![prefix];
+            reader.locate_docs(&docs, &mut located)?;
+            assert!(!reader.quantization_initialized());
+            let expected: Vec<_> = expected
+                .iter()
+                .copied()
+                .filter(|(doc, _)| docs.binary_search(doc).is_ok())
+                .collect();
+            assert_eq!(located[0], prefix);
+            assert_eq!(&located[1..], expected);
+            let blocks: std::collections::BTreeSet<_> =
+                expected.iter().map(|(_, address)| address.block).collect();
+            let expected_reads: Vec<_> = blocks
+                .into_iter()
+                .map(|block| {
+                    let at = start + block as usize * 16;
+                    at..at + 24
+                })
+                .collect();
+            assert_eq!(*reads.lock().unwrap(), expected_reads, "docs={docs:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn location_bounds_are_checked_by_single_and_grouped_lookups() -> crate::Result<()> {
+        for (count, invalid) in [
+            (3, BlockAddress::new(0, 3)),
+            (3, BlockAddress::new(1, 0)),
+            (3, BlockAddress::new(0, u32::MAX)),
+            (3, BlockAddress::new(u32::MAX, 1)),
+            (0, BlockAddress::new(0, 0)),
+        ] {
+            let mut locations = IdMap::empty_locations(3);
+            locations[0] = BlockAddress::new(0, 0);
+            locations[1] = invalid;
+            let (reader, _, _) = location_reader(&locations, &[count])?;
+            assert!(matches!(
+                reader.row_location(1),
+                Err(TantivyError::DataCorruption(_))
+            ));
+            let prefix = (100, BlockAddress::new(100, 100));
+            let mut located = vec![prefix];
+            assert!(matches!(
+                reader.locate_docs(&[0, 1], &mut located),
+                Err(TantivyError::DataCorruption(_))
+            ));
+            assert_eq!(located, [prefix]);
+        }
         Ok(())
     }
 

@@ -90,12 +90,8 @@ impl IdMap {
             )),
         }
     }
-    /// Reads one document location and validates both coordinates before exposing it.
-    pub(crate) fn locate(
-        &self,
-        doc: DocId,
-        rows: impl Fn(usize) -> io::Result<std::ops::Range<usize>>,
-    ) -> io::Result<Option<BlockAddress>> {
+    /// Decodes one document location; the reader validates its block and row bounds.
+    pub(crate) fn locate(&self, doc: DocId) -> io::Result<Option<BlockAddress>> {
         let body = self.location_body()?;
         let Some(start) = (doc as usize).checked_mul(8) else {
             return Ok(None);
@@ -107,18 +103,16 @@ impl IdMap {
             &body
                 .slice(start..start + 8)
                 .read_vector_bytes(VectorReadKind::Other)?,
-            &rows,
         )
     }
     /// Locates ascending `docs`, appending `(doc, location)` for each one with a vector to `out`.
     ///
     /// Entries are read in runs: a run extends while the next entry starts within one storage
     /// block of the run's end ([`LOCATION_RUN_GAP`] bytes without block geometry), so each run
-    /// costs one read. Validation matches [`Self::locate`].
+    /// costs one read. The reader validates the decoded coordinates after grouping by block.
     pub(crate) fn locate_many(
         &self,
         docs: &[DocId],
-        rows: impl Fn(usize) -> io::Result<std::ops::Range<usize>>,
         out: &mut Vec<(DocId, BlockAddress)>,
     ) -> io::Result<()> {
         let body = self.location_body()?;
@@ -138,10 +132,9 @@ impl IdMap {
             let bytes = body
                 .slice(start..end)
                 .read_vector_bytes(VectorReadKind::Other)?;
-            // TODO: Group location validation by cluster to avoid per-document offset reads.
             for &doc in &docs[first..last] {
                 let at = doc as usize * 8 - start;
-                if let Some(location) = decode_location(&bytes[at..at + 8], &rows)? {
+                if let Some(location) = decode_location(&bytes[at..at + 8])? {
                     out.push((doc, location));
                 }
             }
@@ -189,10 +182,7 @@ impl IdMap {
 }
 
 /// Decodes one 8-byte location entry; the absent sentinel decodes to `None`.
-fn decode_location(
-    bytes: &[u8],
-    rows: impl Fn(usize) -> io::Result<std::ops::Range<usize>>,
-) -> io::Result<Option<BlockAddress>> {
+fn decode_location(bytes: &[u8]) -> io::Result<Option<BlockAddress>> {
     let block = u32::from_le_bytes(bytes[..4].try_into().unwrap());
     let row = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
     if block == ABSENT_LOCATION.block {
@@ -205,27 +195,12 @@ fn decode_location(
             ))
         };
     }
-    if row as usize >= rows(block as usize)?.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "document location is outside its block",
-        ));
-    }
     Ok(Some(BlockAddress::new(block, row)))
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
-    pub(crate) fn boundaries(
-        rows: &[usize],
-    ) -> impl Fn(usize) -> io::Result<std::ops::Range<usize>> + '_ {
-        move |block| {
-            rows.get(block..block + 2)
-                .map(|r| r[0]..r[1])
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "block out of range"))
-        }
-    }
 
     fn round_trip(present: &[DocId], num_docs: u32) -> IdMap {
         let mut buf = Vec::new();
@@ -310,7 +285,7 @@ pub(crate) mod tests {
         assert!(!p.contains(100));
         assert_eq!(p.rank_if_exists(10), None);
     }
-    // Every present document resolves to a checked pair; sentinels and invalid pairs are distinct.
+    // Present documents decode to addresses; absent sentinels retain their wire validation.
     #[test]
     fn locations_round_trip_absence_and_corruption() {
         let expected = [
@@ -334,28 +309,19 @@ pub(crate) mod tests {
         let map = IdMap::open(FileSlice::from(bytes.clone()), 5).unwrap();
         for (doc, &location) in expected.iter().enumerate() {
             assert_eq!(
-                map.locate(doc as u32, boundaries(&[0, 2, 4])).unwrap(),
+                map.locate(doc as u32).unwrap(),
                 (location != ABSENT_LOCATION).then_some(location)
             );
         }
-        assert_eq!(map.locate(5, boundaries(&[0, 2, 4])).unwrap(), None);
-        for location in [
-            BlockAddress { block: 2, row: 0 },
-            BlockAddress { block: 0, row: 2 },
-            BlockAddress {
-                block: u32::MAX,
-                row: 1,
-            },
-        ] {
-            let mut corrupt = bytes.clone();
-            corrupt[1..5].copy_from_slice(&location.block.to_le_bytes());
-            corrupt[5..9].copy_from_slice(&location.row.to_le_bytes());
-            let map = IdMap::open(FileSlice::from(corrupt), 5).unwrap();
-            assert_eq!(
-                map.locate(0, boundaries(&[0, 2, 4])).unwrap_err().kind(),
-                io::ErrorKind::InvalidData
-            );
-        }
+        assert_eq!(map.locate(5).unwrap(), None);
+        let mut corrupt = bytes.clone();
+        corrupt[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
+        corrupt[5..9].copy_from_slice(&1u32.to_le_bytes());
+        let map = IdMap::open(FileSlice::from(corrupt), 5).unwrap();
+        assert_eq!(
+            map.locate(0).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
         assert!(IdMap::open(FileSlice::from(bytes.clone()), 4).is_err());
         bytes[0] = 2;
         assert!(IdMap::open(FileSlice::from(bytes), 5).is_err());
@@ -393,7 +359,7 @@ pub(crate) mod tests {
         clusters: u32,
         rows_per: u32,
         block_len: Option<usize>,
-    ) -> (IdMap, Vec<usize>, Reads) {
+    ) -> (IdMap, Reads) {
         let locations: Vec<BlockAddress> = (0..num_docs)
             .map(|doc| {
                 if doc % 7 == 3 {
@@ -414,10 +380,7 @@ pub(crate) mod tests {
             block_len,
             reads: reads.clone(),
         }));
-        let rows: Vec<usize> = (0..=clusters as usize)
-            .map(|cluster| cluster * rows_per as usize)
-            .collect();
-        (IdMap::open(file, num_docs).unwrap(), rows, reads)
+        (IdMap::open(file, num_docs).unwrap(), reads)
     }
 
     /// `locate_many` returns what `locate` returns for each document, skipping absent ones and
@@ -426,7 +389,7 @@ pub(crate) mod tests {
     fn locate_many_matches_locate() {
         const DOCS: u32 = 5000;
         for block_len in [Some(64), Some(4096), None] {
-            let (map, rows, reads) = locations_map(DOCS, 13, 1000, block_len);
+            let (map, reads) = locations_map(DOCS, 13, 1000, block_len);
             for seed in 0..64 {
                 let mut rng = fastrand::Rng::with_seed(seed);
                 let density = 1 + rng.usize(0..300);
@@ -435,16 +398,11 @@ pub(crate) mod tests {
                 docs.extend([DOCS, DOCS + 900]);
                 reads.lock().unwrap().clear();
                 let mut located = Vec::new();
-                map.locate_many(&docs, boundaries(&rows), &mut located)
-                    .unwrap();
+                map.locate_many(&docs, &mut located).unwrap();
                 let read_count = reads.lock().unwrap().len();
                 let expected: Vec<(DocId, BlockAddress)> = docs
                     .iter()
-                    .filter_map(|&doc| {
-                        map.locate(doc, boundaries(&rows))
-                            .unwrap()
-                            .map(|loc| (doc, loc))
-                    })
+                    .filter_map(|&doc| map.locate(doc).unwrap().map(|loc| (doc, loc)))
                     .collect();
                 let case = format!("block_len={block_len:?} seed={seed}");
                 assert_eq!(located, expected, "{case}");
@@ -464,32 +422,17 @@ pub(crate) mod tests {
         }
     }
 
-    /// A location outside its cluster, or an absent entry with a local row, is invalid data, and
-    /// a flat map has no locations.
+    /// A malformed absent entry is invalid data, and a flat map has no locations.
     #[test]
     fn locate_many_rejects_corruption() {
-        let rows = [0, 40, 80];
-        for location in [
-            BlockAddress { block: 2, row: 0 },
-            BlockAddress { block: 0, row: 40 },
-            BlockAddress {
-                block: u32::MAX,
-                row: 1,
-            },
-        ] {
-            let mut locations = vec![BlockAddress { block: 0, row: 0 }; 8];
-            locations[5] = location;
-            let mut bytes = Vec::new();
-            IdMap::serialize_locations(&locations, &mut bytes).unwrap();
-            let map = IdMap::open(FileSlice::from(bytes), 8).unwrap();
-            let error = map
-                .locate_many(&[1, 5, 6], boundaries(&rows), &mut Vec::new())
-                .unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{location:?}");
-        }
+        let mut locations = vec![BlockAddress::new(0, 0); 8];
+        locations[5] = BlockAddress::new(u32::MAX, 1);
+        let mut bytes = Vec::new();
+        IdMap::serialize_locations(&locations, &mut bytes).unwrap();
+        let map = IdMap::open(FileSlice::from(bytes), 8).unwrap();
+        let error = map.locate_many(&[1, 5, 6], &mut Vec::new()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         let flat = round_trip(&[0, 1], 2);
-        assert!(flat
-            .locate_many(&[0], boundaries(&rows), &mut Vec::new())
-            .is_err());
+        assert!(flat.locate_many(&[0], &mut Vec::new()).is_err());
     }
 }

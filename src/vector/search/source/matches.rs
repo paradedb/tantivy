@@ -63,8 +63,6 @@ impl<'a> MatchClusters<'a> {
         }
         let mut located = Vec::with_capacity(docs.len());
         reader.locate_docs(&docs, &mut located)?;
-        // Cluster ids ascend with their row ranges, so this is ascending row order.
-        located.sort_unstable_by_key(|&(_, address)| address);
         let report = MatchReport {
             matches: located.len(),
             absent: docs.len() - located.len(),

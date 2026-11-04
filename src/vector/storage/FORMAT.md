@@ -164,8 +164,10 @@ without vectors. `max_doc` includes deleted documents until a merge removes
 them. Record `d` begins at byte `1 + 8*d` within IdMap. Missing vectors use
 `(u32::MAX, 0)`, so the block count must be less than `u32::MAX`.
 
-Opening validates the table length. Individual lookups return `BlockAddress`
-after validating the block index and row, or `None` for the absent sentinel.
+Opening validates the table length. The reader validates decoded block and row
+bounds before returning `BlockAddress`, or `None` for the absent sentinel.
+Batched lookups decode entries in document order, then group and return them in
+block/row order, reading each distinct block's row count once for validation.
 The clustered table is read lazily for document lookups; scans use the reverse
 mapping in each block's DocIds column.
 
