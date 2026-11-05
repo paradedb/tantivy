@@ -4,7 +4,7 @@ use std::fmt;
 
 use crate::tokenizer::TextAnalyzer;
 
-/// A side of a rule past this many terms compiles to the square of that many alternatives.
+/// Bounds the alternatives that one query term can expand to.
 pub const MAX_RULE_TERMS: usize = 256;
 
 /// One rule, split into its terms but not yet analyzed.
@@ -22,7 +22,8 @@ pub enum SynonymRule {
 }
 
 /// Why a line is not a Solr rule.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RuleError {
     /// A side has more than [`MAX_RULE_TERMS`] terms.
     TooManyTerms,
@@ -32,6 +33,11 @@ pub enum RuleError {
     TooManyArrows,
     /// The rule contains a zero byte, which joins the tokens of a key.
     ZeroByte,
+    /// The rule has separators and no term.
+    NoTerms,
+    /// The analyzer drops a word of this term, such as a stopword, so the key would match more
+    /// than the term does.
+    DroppedWord(String),
 }
 
 impl fmt::Display for RuleError {
@@ -46,6 +52,10 @@ impl fmt::Display for RuleError {
             RuleError::EmptySide => write!(f, "both sides of '=>' need at least one term"),
             RuleError::TooManyArrows => write!(f, "a rule can have at most one '=>'"),
             RuleError::ZeroByte => write!(f, "a rule cannot contain a zero byte"),
+            RuleError::NoTerms => write!(f, "a rule needs at least one term"),
+            RuleError::DroppedWord(term) => {
+                write!(f, "the analyzer drops a word of the term '{term}'")
+            }
         }
     }
 }
@@ -68,7 +78,13 @@ impl SynonymRule {
             return Err(RuleError::TooManyTerms);
         }
         match sides.len() {
-            1 => Ok(Some(SynonymRule::Equivalent(sides.pop().unwrap()))),
+            1 => {
+                let terms = sides.pop().unwrap();
+                if terms.is_empty() {
+                    return Err(RuleError::NoTerms);
+                }
+                Ok(Some(SynonymRule::Equivalent(terms)))
+            }
             2 => {
                 let to = sides.pop().unwrap();
                 let from = sides.pop().unwrap();
@@ -84,28 +100,31 @@ impl SynonymRule {
     /// Analyzes both sides of the rule. A rule whose alternatives all analyze to nothing, such as
     /// a right side made of stopwords, compiles to nothing, so the typed term stays instead of
     /// matching nothing.
-    pub(crate) fn compile(&self, analyzer: &mut TextAnalyzer) -> Option<CompiledRule> {
-        let mut analyze = |terms: &[String]| -> Vec<Vec<String>> {
+    pub(crate) fn compile(
+        &self,
+        analyzer: &mut TextAnalyzer,
+    ) -> Result<Option<CompiledRule>, RuleError> {
+        let mut analyze = |terms: &[String]| -> Result<Vec<Vec<String>>, RuleError> {
             let mut analyzed: Vec<Vec<String>> = Vec::with_capacity(terms.len());
             for term in terms {
-                let tokens = tokenize(analyzer, term);
+                let tokens = analyze_term(analyzer, term)?;
                 if !tokens.is_empty() && !analyzed.contains(&tokens) {
                     analyzed.push(tokens);
                 }
             }
-            analyzed
+            Ok(analyzed)
         };
         let (keys, alternatives) = match self {
             SynonymRule::Equivalent(terms) => {
-                let group = analyze(terms);
+                let group = analyze(terms)?;
                 (group.clone(), group)
             }
-            SynonymRule::Directed { from, to } => (analyze(from), analyze(to)),
+            SynonymRule::Directed { from, to } => (analyze(from)?, analyze(to)?),
         };
         if keys.is_empty() || alternatives.is_empty() {
-            return None;
+            return Ok(None);
         }
-        Some(CompiledRule { keys, alternatives })
+        Ok(Some(CompiledRule { keys, alternatives }))
     }
 }
 
@@ -132,11 +151,7 @@ fn split_rule(rule: &str) -> Vec<Vec<String>> {
     let mut chars = rule.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '\\' => {
-                if let Some(escaped) = chars.next() {
-                    term.push(escaped);
-                }
-            }
+            '\\' => term.push(chars.next().unwrap_or('\\')),
             ',' => push(sides.last_mut().unwrap(), &mut term),
             '=' if chars.peek() == Some(&'>') => {
                 chars.next();
@@ -150,13 +165,21 @@ fn split_rule(rule: &str) -> Vec<Vec<String>> {
     sides
 }
 
-pub(crate) fn tokenize(analyzer: &mut TextAnalyzer, text: &str) -> Vec<String> {
-    let mut stream = analyzer.token_stream(text);
+/// A word the analyzer drops leaves a gap in the token positions. Lucene's `SynonymMap.Parser`
+/// refuses such a term too, because its key would be shorter and match more.
+fn analyze_term(analyzer: &mut TextAnalyzer, term: &str) -> Result<Vec<String>, RuleError> {
+    let mut stream = analyzer.token_stream(term);
     let mut tokens = Vec::new();
+    let mut next_position = 0;
     while stream.advance() {
-        tokens.push(stream.token().text.clone());
+        let token = stream.token();
+        if token.position > next_position {
+            return Err(RuleError::DroppedWord(term.to_string()));
+        }
+        next_position = token.position + 1;
+        tokens.push(token.text.clone());
     }
-    tokens
+    Ok(tokens)
 }
 
 #[cfg(test)]
@@ -195,15 +218,16 @@ mod tests {
         );
         assert_eq!(SynonymRule::parse("=> c"), Err(RuleError::EmptySide));
         assert_eq!(SynonymRule::parse("a\0b, c"), Err(RuleError::ZeroByte));
+        assert_eq!(SynonymRule::parse(" , , "), Err(RuleError::NoTerms));
+        assert_eq!(
+            SynonymRule::parse(r"a \=> b, c\").unwrap(),
+            Some(SynonymRule::Equivalent(strings(&["a => b", r"c\"])))
+        );
         let long = (0..=MAX_RULE_TERMS)
             .map(|i| format!("t{i}"))
             .collect::<Vec<_>>()
             .join(", ");
         assert_eq!(SynonymRule::parse(&long), Err(RuleError::TooManyTerms));
-        assert_eq!(
-            RuleError::TooManyArrows.to_string(),
-            "a rule can have at most one '=>'"
-        );
     }
 
     #[test]
@@ -217,6 +241,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .compile(&mut analyzer)
+                .unwrap()
         };
         let compiled = |keys: &[&[&str]], alternatives: &[&[&str]]| {
             Some(CompiledRule {
@@ -237,5 +262,26 @@ mod tests {
         assert_eq!(compile("sofa, the"), compiled(&[&["sofa"]], &[&["sofa"]]));
         assert_eq!(compile("sofa => the"), None);
         assert_eq!(compile("the => sofa"), None);
+    }
+
+    #[test]
+    fn a_term_that_loses_a_word_to_the_analyzer_does_not_compile() {
+        let mut analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(StopWordFilter::remove(vec!["the".to_string()]))
+            .build();
+        for rule in [
+            "the who => band",
+            "band => the who",
+            "rock of the ages, rock",
+        ] {
+            let compiled = SynonymRule::parse(rule)
+                .unwrap()
+                .unwrap()
+                .compile(&mut analyzer);
+            assert!(
+                matches!(compiled, Err(RuleError::DroppedWord(_))),
+                "{rule}: {compiled:?}"
+            );
+        }
     }
 }

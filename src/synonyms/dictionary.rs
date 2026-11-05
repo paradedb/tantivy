@@ -1,16 +1,18 @@
 //! The `.syn` component of a segment.
 //!
-//! The file starts with the group section, which holds the alternatives of each rule once. Then
-//! comes an sstable from the analyzed tokens of a key to the groups that expand it, and a footer.
-//! A key points into the group section, so the keys of one equivalence rule share one copy of
-//! its alternatives, the layout of Lucene's `SynonymMap`.
+//! The group section holds the alternatives of each rule once, so the keys of one equivalence
+//! rule share one copy, as in Lucene's `SynonymMap`. The sstable maps the joined tokens of a key
+//! to a byte range of the refs section, and that range lists the groups of the key. The lists
+//! stay out of the sstable because a lookup decodes every value of its block, and one key can
+//! have the groups of thousands of rules.
 
 use std::io::{self, Write};
+use std::ops::Range;
 
 use common::file_slice::FileSlice;
-use common::{HasLen, OwnedBytes};
-use sstable::value::{ValueReader, ValueWriter};
-use sstable::{Dictionary, SSTable};
+use common::{CountingWriter, HasLen, OwnedBytes};
+use sstable::value::RangeValueReader;
+use sstable::{Dictionary, RangeSSTable, SSTable, Streamer};
 
 use crate::DocId;
 
@@ -19,16 +21,16 @@ pub const SYNONYM_EXT: &str = "syn";
 
 const FORMAT_VERSION: u8 = 1;
 
-/// The length of the group section as a `u64`, the longest key in tokens as a `u32`, then the
-/// format version as a `u8`.
-const FOOTER_LEN: usize = 13;
+/// The lengths of the group section and of the sstable as `u64`s, the longest key in tokens as a
+/// `u32`, then the format version as a `u8`.
+const FOOTER_LEN: usize = 21;
 
 /// The footer `sstable::Dictionary::open` reads from the end of its slice.
 const SSTABLE_FOOTER_LEN: usize = 20;
 
 /// Joins the tokens of a key. A rule cannot contain this byte, so two keys never join to the
 /// same bytes.
-const KEY_SEPARATOR: u8 = 0;
+pub(crate) const KEY_SEPARATOR: u8 = 0;
 
 pub(crate) fn encode_key(tokens: &[String]) -> Vec<u8> {
     tokens
@@ -38,7 +40,7 @@ pub(crate) fn encode_key(tokens: &[String]) -> Vec<u8> {
         .join(&KEY_SEPARATOR)
 }
 
-fn key_tokens(key: &[u8]) -> usize {
+pub(crate) fn key_tokens(key: &[u8]) -> usize {
     key.iter().filter(|&&byte| byte == KEY_SEPARATOR).count() + 1
 }
 
@@ -51,6 +53,12 @@ pub(crate) struct GroupRef {
     len: u64,
 }
 
+impl GroupRef {
+    pub(crate) fn offset(&self) -> u64 {
+        self.offset
+    }
+}
+
 /// The alternatives that one rule gives a key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuleAlternatives {
@@ -58,16 +66,6 @@ pub struct RuleAlternatives {
     pub doc: DocId,
     /// Each alternative is a list of analyzed tokens.
     pub alternatives: Vec<Vec<String>>,
-}
-
-/// The groups of one key, in document order.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SynonymSSTable;
-
-impl SSTable for SynonymSSTable {
-    type Value = Vec<GroupRef>;
-    type ValueReader = GroupRefsReader;
-    type ValueWriter = GroupRefsWriter;
 }
 
 fn put_varint(out: &mut Vec<u8>, mut value: u64) {
@@ -128,13 +126,21 @@ fn encode_alternatives(alternatives: &[Vec<String>], out: &mut Vec<u8>) {
     }
 }
 
+/// The writer never writes a group without alternatives or an alternative without tokens, so
+/// either one is damage.
 fn decode_alternatives(mut data: &[u8]) -> io::Result<Vec<Vec<String>>> {
     // Each reservation is capped by the bytes left, so a damaged count cannot ask for an
     // arbitrary allocation.
     let num_alternatives = get_count(&mut data)?;
+    if num_alternatives == 0 {
+        return Err(damaged("group without alternatives"));
+    }
     let mut alternatives = Vec::with_capacity(num_alternatives.min(data.len()));
     for _ in 0..num_alternatives {
         let num_tokens = get_count(&mut data)?;
+        if num_tokens == 0 {
+            return Err(damaged("alternative without tokens"));
+        }
         let mut alternative = Vec::with_capacity(num_tokens.min(data.len()));
         for _ in 0..num_tokens {
             let len = get_count(&mut data)?;
@@ -155,84 +161,36 @@ fn decode_alternatives(mut data: &[u8]) -> io::Result<Vec<Vec<String>>> {
     Ok(alternatives)
 }
 
-#[derive(Default)]
-pub(crate) struct GroupRefsWriter {
-    num_values: u64,
-    buffer: Vec<u8>,
-}
-
-impl ValueWriter for GroupRefsWriter {
-    type Value = Vec<GroupRef>;
-
-    fn write(&mut self, groups: &Vec<GroupRef>) {
-        self.num_values += 1;
-        put_varint(&mut self.buffer, groups.len() as u64);
-        for group in groups {
-            put_varint(&mut self.buffer, u64::from(group.doc));
-            put_varint(&mut self.buffer, group.offset);
-            put_varint(&mut self.buffer, group.len);
-        }
-    }
-
-    fn serialize_block(&self, output: &mut Vec<u8>) {
-        put_varint(output, self.num_values);
-        output.extend_from_slice(&self.buffer);
-    }
-
-    fn clear(&mut self) {
-        self.num_values = 0;
-        self.buffer.clear();
+fn encode_refs(groups: &[GroupRef], out: &mut Vec<u8>) {
+    for group in groups {
+        put_varint(out, u64::from(group.doc));
+        put_varint(out, group.offset);
+        put_varint(out, group.len);
     }
 }
 
-/// A damaged block can have fewer values than keys. Its extra keys read as having no groups.
-static NO_GROUPS: Vec<GroupRef> = Vec::new();
-
-#[derive(Default)]
-pub(crate) struct GroupRefsReader {
-    values: Vec<Vec<GroupRef>>,
-}
-
-impl ValueReader for GroupRefsReader {
-    type Value = Vec<GroupRef>;
-
-    fn value(&self, idx: usize) -> &Vec<GroupRef> {
-        self.values.get(idx).unwrap_or(&NO_GROUPS)
+fn decode_refs(mut data: &[u8]) -> io::Result<Vec<GroupRef>> {
+    let mut groups = Vec::new();
+    while !data.is_empty() {
+        let doc = get_doc(&mut data)?;
+        let offset = get_varint(&mut data)?;
+        let len = get_varint(&mut data)?;
+        groups.push(GroupRef { doc, offset, len });
     }
-
-    fn load(&mut self, mut data: &[u8]) -> io::Result<usize> {
-        let original_len = data.len();
-        self.values.clear();
-        let num_values = get_count(&mut data)?;
-        self.values.reserve(num_values.min(data.len()));
-        for _ in 0..num_values {
-            let num_groups = get_count(&mut data)?;
-            let mut groups = Vec::with_capacity(num_groups.min(data.len()));
-            for _ in 0..num_groups {
-                let doc = get_doc(&mut data)?;
-                let offset = get_varint(&mut data)?;
-                let len = get_varint(&mut data)?;
-                groups.push(GroupRef { doc, offset, len });
-            }
-            self.values.push(groups);
-        }
-        Ok(original_len - data.len())
-    }
+    Ok(groups)
 }
 
 /// Writes the group section of a `.syn` component. The keys come after it, through
 /// [`SynonymKeysWriter`].
 pub(crate) struct SynonymFileWriter<W: Write> {
-    wrt: W,
-    groups_len: u64,
+    wrt: CountingWriter<W>,
     buffer: Vec<u8>,
 }
 
 impl<W: Write> SynonymFileWriter<W> {
     pub(crate) fn new(wrt: W) -> Self {
         SynonymFileWriter {
-            wrt,
-            groups_len: 0,
+            wrt: CountingWriter::wrap(wrt),
             buffer: Vec::new(),
         }
     }
@@ -256,9 +214,8 @@ impl<W: Write> SynonymFileWriter<W> {
         put_varint(&mut header, u64::from(doc));
         put_varint(&mut header, payload.len() as u64);
         self.wrt.write_all(&header)?;
+        let offset = self.wrt.written_bytes();
         self.wrt.write_all(payload)?;
-        let offset = self.groups_len + header.len() as u64;
-        self.groups_len = offset + payload.len() as u64;
         Ok(GroupRef {
             doc,
             offset,
@@ -267,19 +224,23 @@ impl<W: Write> SynonymFileWriter<W> {
     }
 
     pub(crate) fn into_keys(self) -> SynonymKeysWriter<W> {
+        let groups_len = self.wrt.written_bytes();
         SynonymKeysWriter {
-            sstable: SynonymSSTable::writer(self.wrt),
-            groups_len: self.groups_len,
+            sstable: RangeSSTable::writer(self.wrt),
+            groups_len,
+            refs: Vec::new(),
             max_key_tokens: 0,
             last_key: None,
         }
     }
 }
 
-/// Writes the keys of a `.syn` component, in byte order of their joined form.
+/// Writes the keys of a `.syn` component, in byte order of their joined form. The refs section
+/// comes after the sstable in the file, so the writer keeps it in memory until `finish`.
 pub(crate) struct SynonymKeysWriter<W: Write> {
-    sstable: sstable::Writer<W, GroupRefsWriter>,
+    sstable: sstable::Writer<CountingWriter<W>, sstable::value::RangeValueWriter>,
     groups_len: u64,
+    refs: Vec<u8>,
     max_key_tokens: usize,
     last_key: Option<Vec<u8>>,
 }
@@ -287,27 +248,34 @@ pub(crate) struct SynonymKeysWriter<W: Write> {
 impl<W: Write> SynonymKeysWriter<W> {
     /// Inserts a key as joined by [`encode_key`]. A key out of order returns an error, because a
     /// merge reads its keys from files that can be damaged and the sstable writer panics on one.
-    pub(crate) fn insert(&mut self, key: &[u8], groups: &Vec<GroupRef>) -> io::Result<()> {
-        if self
-            .last_key
-            .as_deref()
-            .is_some_and(|last_key| last_key >= key)
-        {
-            return Err(damaged("keys out of order"));
+    pub(crate) fn insert(&mut self, key: &[u8], groups: &[GroupRef]) -> io::Result<()> {
+        match &mut self.last_key {
+            Some(last_key) if last_key.as_slice() >= key => {
+                return Err(damaged("keys out of order"));
+            }
+            Some(last_key) => {
+                last_key.clear();
+                last_key.extend_from_slice(key);
+            }
+            None => self.last_key = Some(key.to_vec()),
         }
-        self.last_key = Some(key.to_vec());
         self.max_key_tokens = self.max_key_tokens.max(key_tokens(key));
-        self.sstable.insert(key, groups)
+        let start = self.refs.len() as u64;
+        encode_refs(groups, &mut self.refs);
+        self.sstable.insert(key, &(start..self.refs.len() as u64))
     }
 
     pub(crate) fn finish(self) -> io::Result<W> {
         let max_key_tokens = u32::try_from(self.max_key_tokens)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "synonym key too long"))?;
         let mut wrt = self.sstable.finish()?;
+        let sstable_len = wrt.written_bytes() - self.groups_len;
+        wrt.write_all(&self.refs)?;
         wrt.write_all(&self.groups_len.to_le_bytes())?;
+        wrt.write_all(&sstable_len.to_le_bytes())?;
         wrt.write_all(&max_key_tokens.to_le_bytes())?;
         wrt.write_all(&[FORMAT_VERSION])?;
-        Ok(wrt)
+        Ok(wrt.finish())
     }
 }
 
@@ -316,7 +284,8 @@ impl<W: Write> SynonymKeysWriter<W> {
 #[derive(Clone, Debug)]
 pub struct SynonymDictionary {
     groups: FileSlice,
-    keys: Dictionary<SynonymSSTable>,
+    keys: Dictionary<RangeSSTable>,
+    refs: FileSlice,
     max_key_tokens: usize,
 }
 
@@ -335,20 +304,28 @@ impl SynonymDictionary {
                 format!("unknown synonym dictionary format {version}"),
             ));
         }
-        let groups_len = u64::from_le_bytes(footer[..8].try_into().unwrap());
-        let max_key_tokens = u32::from_le_bytes(footer[8..12].try_into().unwrap()) as usize;
-        let groups_len = usize::try_from(groups_len)
+        let len_at = |start: usize| {
+            usize::try_from(u64::from_le_bytes(
+                footer[start..start + 8].try_into().unwrap(),
+            ))
             .ok()
-            .filter(|&groups_len| {
-                groups_len
-                    .checked_add(SSTABLE_FOOTER_LEN)
-                    .is_some_and(|min_len| min_len <= body.len())
+        };
+        let max_key_tokens = u32::from_le_bytes(footer[16..20].try_into().unwrap()) as usize;
+        let (groups_len, sstable_len) = len_at(0)
+            .zip(len_at(8))
+            .filter(|&(groups_len, sstable_len)| {
+                sstable_len >= SSTABLE_FOOTER_LEN
+                    && groups_len
+                        .checked_add(sstable_len)
+                        .is_some_and(|end| end <= body.len())
             })
-            .ok_or_else(|| damaged("group section past the end of the file"))?;
-        let (groups, keys) = body.split(groups_len);
+            .ok_or_else(|| damaged("sections past the end of the file"))?;
+        let (groups, rest) = body.split(groups_len);
+        let (keys, refs) = rest.split(sstable_len);
         Ok(SynonymDictionary {
             groups,
             keys: Dictionary::open(keys)?,
+            refs,
             max_key_tokens,
         })
     }
@@ -365,9 +342,10 @@ impl SynonymDictionary {
 
     /// The rules that expand `key`, in document order, deleted ones included.
     pub fn get(&self, key: &[String]) -> io::Result<Option<Vec<RuleAlternatives>>> {
-        let Some(groups) = self.groups_of(key)? else {
+        let Some(refs) = self.keys.get(encode_key(key))? else {
             return Ok(None);
         };
+        let groups = self.groups_in(refs)?;
         let mut rules = Vec::with_capacity(groups.len());
         for group in &groups {
             rules.push(RuleAlternatives {
@@ -378,8 +356,23 @@ impl SynonymDictionary {
         Ok(Some(rules))
     }
 
-    pub(crate) fn groups_of(&self, key: &[String]) -> io::Result<Option<Vec<GroupRef>>> {
-        self.keys.get(encode_key(key))
+    /// The keys between `low` and `high`, both included, each with the range of its groups.
+    pub(crate) fn keys_between(
+        &self,
+        low: &[u8],
+        high: &[u8],
+    ) -> io::Result<Streamer<'_, RangeSSTable>> {
+        self.keys.range().ge(low).le(high).into_stream()
+    }
+
+    pub(crate) fn groups_in(&self, refs: Range<u64>) -> io::Result<Vec<GroupRef>> {
+        let range = usize::try_from(refs.start)
+            .ok()
+            .zip(usize::try_from(refs.end).ok())
+            .map(|(start, end)| start..end)
+            .filter(|range| range.start <= range.end && range.end <= self.refs.len())
+            .ok_or_else(|| damaged("ref list past the end of its section"))?;
+        decode_refs(&self.refs.read_bytes_slice(range)?)
     }
 
     pub(crate) fn alternatives(&self, group: &GroupRef) -> io::Result<Vec<Vec<String>>> {
@@ -397,11 +390,38 @@ impl SynonymDictionary {
         self.groups.read_bytes()
     }
 
-    /// Reads the whole sstable, for a merge that streams every key.
-    pub(crate) fn read_keys(&self) -> io::Result<sstable::Reader<GroupRefsReader>> {
-        Ok(SynonymSSTable::reader(
-            self.keys.sstable_slice.read_bytes()?,
-        ))
+    /// Reads every key with its groups, for a merge.
+    pub(crate) fn read_keys(&self) -> io::Result<KeyStream> {
+        Ok(KeyStream {
+            keys: RangeSSTable::reader(self.keys.sstable_slice.read_bytes()?),
+            refs: self.refs.read_bytes()?,
+        })
+    }
+}
+
+/// Every key of a dictionary in byte order, read from memory.
+pub(crate) struct KeyStream {
+    keys: sstable::Reader<RangeValueReader>,
+    refs: OwnedBytes,
+}
+
+impl KeyStream {
+    pub(crate) fn advance(&mut self) -> io::Result<bool> {
+        self.keys.advance()
+    }
+
+    pub(crate) fn key(&self) -> &[u8] {
+        self.keys.key()
+    }
+
+    pub(crate) fn groups(&self) -> io::Result<Vec<GroupRef>> {
+        let refs = self.keys.value();
+        let range = usize::try_from(refs.start)
+            .ok()
+            .zip(usize::try_from(refs.end).ok())
+            .filter(|&(start, end)| start <= end && end <= self.refs.len())
+            .ok_or_else(|| damaged("ref list past the end of its section"))?;
+        decode_refs(&self.refs.as_slice()[range.0..range.1])
     }
 }
 
@@ -411,12 +431,6 @@ pub(crate) struct EncodedGroup<'a> {
     /// Where the group is in its section, the offset a [`GroupRef`] holds.
     pub(crate) offset: u64,
     pub(crate) payload: &'a [u8],
-}
-
-impl GroupRef {
-    pub(crate) fn offset(&self) -> u64 {
-        self.offset
-    }
 }
 
 /// Walks a group section in file order.
@@ -450,7 +464,6 @@ pub(crate) fn groups(section: &[u8]) -> impl Iterator<Item = io::Result<EncodedG
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::ops::Range;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -542,10 +555,13 @@ pub(crate) mod tests {
             &[&["couch"], &["sofa"], &["divan"]],
         )]))
         .unwrap();
-        let couch = dictionary.groups_of(&strings(&["couch"])).unwrap();
-        assert_eq!(couch, dictionary.groups_of(&strings(&["sofa"])).unwrap());
-        assert_eq!(couch, dictionary.groups_of(&strings(&["divan"])).unwrap());
-        assert_eq!(couch.unwrap().len(), 1);
+        let groups = |key: &str| {
+            let refs = dictionary.keys.get(key).unwrap().unwrap();
+            dictionary.groups_in(refs).unwrap()
+        };
+        assert_eq!(groups("couch"), groups("sofa"));
+        assert_eq!(groups("couch"), groups("divan"));
+        assert_eq!(groups("couch").len(), 1);
     }
 
     #[test]
@@ -564,13 +580,17 @@ pub(crate) mod tests {
             open(wrong_version).unwrap_err().to_string(),
             "unknown synonym dictionary format 2"
         );
-        let mut long_groups = bytes.clone();
-        let footer = long_groups.len() - FOOTER_LEN;
-        long_groups[footer..footer + 8].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(open(long_groups).is_err());
+        let footer = bytes.len() - FOOTER_LEN;
+        for field in [footer, footer + 8] {
+            let mut long_section = bytes.clone();
+            long_section[field..field + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+            assert!(open(long_section).is_err());
+        }
 
         let dictionary = open(bytes).unwrap();
-        let group = dictionary.groups_of(&strings(&["sofa"])).unwrap().unwrap()[0];
+        let refs = dictionary.keys.get("sofa").unwrap().unwrap();
+        assert!(dictionary.groups_in(refs.start..refs.end + 1_000).is_err());
+        let group = dictionary.groups_in(refs).unwrap()[0];
         let past_end = GroupRef {
             offset: group.offset + 1_000,
             ..group
@@ -595,58 +615,44 @@ pub(crate) mod tests {
         assert!(decode_alternatives(&[1, 1, 1, 0xff]).is_err());
         // Bytes after the last alternative.
         assert!(decode_alternatives(&[1, 1, 1, b'a', 0]).is_err());
+        // No alternatives, or an alternative without tokens.
+        assert!(decode_alternatives(&[0]).is_err());
+        assert!(decode_alternatives(&[1, 0]).is_err());
         assert_eq!(
             decode_alternatives(&[1, 1, 1, b'a']).unwrap(),
             vec![strings(&["a"])]
         );
+        // A ref list cut inside a ref.
+        assert!(decode_refs(&[3, 7]).is_err());
     }
 
-    #[test]
-    fn the_value_reader_returns_the_bytes_it_read() {
-        let group = GroupRef {
-            doc: 2,
-            offset: 300,
-            len: 17,
-        };
-        let mut writer = GroupRefsWriter::default();
-        writer.write(&vec![group, group]);
-        writer.write(&vec![]);
-        let mut block = Vec::new();
-        writer.serialize_block(&mut block);
-        let len = block.len();
-        block.extend_from_slice(b"next block");
-        let mut reader = GroupRefsReader::default();
-        assert_eq!(reader.load(&block).unwrap(), len);
-        assert_eq!(reader.value(0), &vec![group, group]);
-        assert!(reader.value(1).is_empty());
-        // A damaged block with fewer values than keys reads as no groups.
-        assert!(reader.value(2).is_empty());
-        assert!(reader.load(&[1, 1, 0xff]).is_err());
-    }
-
-    /// A file with no in-memory slice, so the sstable index takes its paged path, the way it
-    /// does on Postgres blocks.
+    /// A file with no in-memory slice and 8 KiB pages, so the sstable index takes its paged path,
+    /// the way it does on Postgres blocks.
     #[derive(Debug)]
-    struct CountingFile {
+    struct PagedFile {
         bytes: OwnedBytes,
         read: Arc<AtomicUsize>,
     }
 
-    impl HasLen for CountingFile {
+    impl HasLen for PagedFile {
         fn len(&self) -> usize {
             self.bytes.len()
         }
     }
 
-    impl FileHandle for CountingFile {
+    impl FileHandle for PagedFile {
         fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
             self.read.fetch_add(range.len(), Ordering::Relaxed);
             Ok(self.bytes.slice(range))
         }
+
+        fn storage_block_len(&self) -> Option<usize> {
+            Some(8192)
+        }
     }
 
     #[test]
-    fn a_lookup_in_a_large_dictionary_reads_a_few_blocks() {
+    fn a_lookup_in_a_large_dictionary_reads_a_few_pages() {
         const NUM_RULES: usize = 100_000;
         let mut file = SynonymFileWriter::new(Vec::new());
         let mut keys = Vec::with_capacity(NUM_RULES);
@@ -664,12 +670,14 @@ pub(crate) mod tests {
         let bytes = writer.finish().unwrap();
 
         let read = Arc::new(AtomicUsize::new(0));
-        let file = FileSlice::new(Arc::new(CountingFile {
+        let file = FileSlice::new(Arc::new(PagedFile {
             bytes: OwnedBytes::new(bytes.clone()),
             read: read.clone(),
         }));
         let dictionary = SynonymDictionary::open(file).unwrap();
         assert_eq!(dictionary.num_keys(), NUM_RULES);
+        let opened = read.swap(0, Ordering::Relaxed);
+        assert!(opened < 1024, "opening read {opened} bytes");
 
         for i in [0, 4_242, NUM_RULES / 2, NUM_RULES - 1] {
             read.store(0, Ordering::Relaxed);
@@ -679,10 +687,10 @@ pub(crate) mod tests {
                 rules[0].alternatives,
                 vec![vec![format!("syn{i:06}")], vec![key]]
             );
-            let bytes_read = read.load(Ordering::Relaxed);
+            let looked_up = read.load(Ordering::Relaxed);
             assert!(
-                bytes_read * 50 < bytes.len(),
-                "a lookup read {bytes_read} of {} bytes",
+                looked_up < 32 * 1024,
+                "a lookup read {looked_up} of {} bytes",
                 bytes.len()
             );
         }
