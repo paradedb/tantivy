@@ -184,6 +184,25 @@ impl FragmentCandidate {
     fn is_empty(&self) -> bool {
         self.highlighted.is_empty()
     }
+
+    /// Renders the fragment with its highlights.
+    ///
+    /// A tokenizer can emit a token that starts before an earlier one. If the earlier token
+    /// opened this fragment, the later one starts before it, so the rendered text reaches
+    /// back to cover every highlight.
+    fn to_snippet(&self, text: &str) -> Snippet {
+        let start = self
+            .highlighted
+            .iter()
+            .map(|(range, _)| range.start)
+            .fold(self.start_offset, usize::min);
+        let highlighted = self
+            .highlighted
+            .iter()
+            .map(|(range, _)| range.start - start..range.end - start)
+            .collect();
+        Snippet::new(&text[start..self.stop_offset], highlighted)
+    }
 }
 
 /// `Snippet`
@@ -481,13 +500,7 @@ fn select_best_fragment_combination(fragments: &[FragmentCandidate], text: &str)
         }
     });
     if let Some(fragment) = best_fragment_opt {
-        let fragment_text = &text[fragment.start_offset..fragment.stop_offset];
-        let highlighted = fragment
-            .highlighted
-            .iter()
-            .map(|(item, _)| item.start - fragment.start_offset..item.end - fragment.start_offset)
-            .collect();
-        Snippet::new(fragment_text, highlighted)
+        fragment.to_snippet(text)
     } else {
         // When there are no fragments to chose from,
         // for now create an empty snippet.
@@ -555,17 +568,7 @@ fn select_top_fragments(
     // Convert to Snippets
     selected
         .iter()
-        .map(|&fragment| {
-            let fragment_text = &text[fragment.start_offset..fragment.stop_offset];
-            let highlighted = fragment
-                .highlighted
-                .iter()
-                .map(|(item, _)| {
-                    item.start - fragment.start_offset..item.end - fragment.start_offset
-                })
-                .collect();
-            Snippet::new(fragment_text, highlighted)
-        })
+        .map(|&fragment| fragment.to_snippet(text))
         .collect()
 }
 
@@ -1574,6 +1577,22 @@ Survey in 2016, 2017, and 2018."#;
         let snippet = select_best_fragment_combination(&fragments[..], text);
         assert_eq!(snippet.fragment, "abc");
         assert_eq!(snippet.to_html(), "<b>abc</b>");
+    }
+
+    #[test]
+    fn test_snippet_token_starting_before_fragment() {
+        // A tokenizer can emit a token that starts before an earlier one, as jieba does with
+        // 悟空 and 孙悟空. Here 悟空 overflows the fragment limit and opens a new fragment,
+        // and 孙悟空 then starts before the fragment that holds it.
+        let text = format!("{}孙悟空", "我".repeat(48));
+        let mut accumulator = super::FragmentAccumulator::new(150);
+        accumulator.observe(147, 153, Some(1.0));
+        accumulator.observe(144, 153, Some(1.0));
+        let fragments = accumulator.finish();
+        let snippet = select_best_fragment_combination(&fragments, &text);
+        assert_eq!(snippet.to_html(), "<b>孙悟空</b>");
+        let snippets = select_top_fragments(&fragments, &text, 0, 0, SnippetSortOrder::Position);
+        assert_eq!(snippets[0].to_html(), "<b>孙悟空</b>");
     }
 
     #[test]
