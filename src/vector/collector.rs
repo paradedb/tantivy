@@ -732,10 +732,13 @@ where
                     _ => (matched, docs),
                 }
             });
-    let k =
-        collector
-            .probe_params
-            .router_k(total, x, matched / routed_docs.max(1) as f64, clusters);
+    let k = collector.probe_params.router_k(
+        total,
+        x,
+        matched / routed_docs.max(1) as f64,
+        clusters,
+        collector.max_scan_levels > 0 && vectors.iter().any(|v| v.has_quantized_storage()),
+    );
     let partitions: Vec<_> = segments.iter().map(|s| s.partition_centroid).collect();
     let routing = crate::vector::router::RoutingParams {
         k,
@@ -743,7 +746,15 @@ where
         min_beam_fraction: collector.probe_params.router_min_beam_fraction,
         aps: collector.probe_params.router_aps,
     };
-    let ranking = GlobalRanking::from(&routers, &partitions, &query, routing, totals, on_segment);
+    let ranking = GlobalRanking::from(
+        &routers,
+        &partitions,
+        &query,
+        routing,
+        totals,
+        on_segment,
+        collector.probe_params.adaptive_probing.map(|_| k),
+    );
     let mut reserved = WorkUnits::ZERO;
     let mut scans: Vec<_> = (0..vectors.len()).map(|_| None).collect();
     let mut pending_scans = Vec::with_capacity(vectors.len());
@@ -761,7 +772,7 @@ where
             let Some(plan) = plan else {
                 return Ok((None, None, None));
             };
-            let capacity = plan.capacity_hint();
+            let capacity = plan.capacity_hint(&collector.probe_params);
             let SegmentPlan {
                 budget,
                 source,
@@ -777,6 +788,9 @@ where
                 return Ok((None, None, None));
             };
             let config = ScanConfig {
+                adaptive_probing: matches!(&source, Source::Router(_))
+                    .then_some(collector.probe_params.adaptive_probing)
+                    .flatten(),
                 top_n,
                 capacity,
                 exact_plan: collector.probe_params.exact_plan,
@@ -849,8 +863,15 @@ where
         on_segment(i);
         result?;
     }
+    let mut rate = collector
+        .probe_params
+        .adaptive_probing
+        .filter(|_| top_n > 0)
+        .map(|adaptive| adaptive.admission_fraction())
+        .map(|_| crate::vector::search::scan::RateApsState::default());
+    let mut recall_reached = false;
     for (i, candidate) in ranking.clusters {
-        if meter.exhausted() {
+        if meter.exhausted() || recall_reached {
             break;
         }
         let Some(GlobalSource::Router(source)) = &mut sources[i] else {
@@ -862,18 +883,50 @@ where
             }
             let scan = scans[i].as_mut().unwrap();
             scan.swap_topk(&mut topk);
+            scan.swap_rate(&mut rate);
             meter.open();
             if let Some(rows) = source.probe_global(candidate)? {
                 let scored = scan.shortlist(&rows)?;
                 source.admitted(scored)?;
                 meter.rows(scored);
+                recall_reached = scan.recall_reached();
             }
+            scan.swap_rate(&mut rate);
             scan.swap_topk(&mut topk);
             Ok::<_, TantivyError>(())
         });
         totals[i].append(&measured);
         on_segment(i);
         result?;
+        if !recall_reached && rate.as_mut().is_some_and(|rate| rate.refinement_due()) {
+            let mut candidates: Vec<_> = scans
+                .iter_mut()
+                .flatten()
+                .flat_map(|scan| scan.refinement_candidates(top_n))
+                .collect();
+            if candidates.len() > top_n {
+                candidates.select_nth_unstable_by(top_n, |a, b| {
+                    b.bound
+                        .estimate()
+                        .total_cmp(&a.bound.estimate())
+                        .then_with(|| a.address.cmp(&b.address))
+                });
+                candidates.truncate(top_n);
+            }
+            for (j, scan) in scans.iter_mut().enumerate() {
+                let Some(scan) = scan else { continue };
+                scan.swap_topk(&mut topk);
+                let (result, measured) = measure(|| scan.refine_topk(&candidates));
+                scan.swap_topk(&mut topk);
+                totals[j].append(&measured);
+                on_segment(j);
+                result?;
+            }
+            let scan = scans[i].as_mut().unwrap();
+            scan.swap_rate(&mut rate);
+            recall_reached = scan.recall_reached();
+            scan.swap_rate(&mut rate);
+        }
     }
     for (i, scan) in scans.iter_mut().enumerate() {
         let Some(scan) = scan else {
@@ -894,7 +947,9 @@ where
             let source = match source {
                 GlobalSource::Router(source) => {
                     let mut report = source.finish();
-                    report.probe.termination = if meter.exhausted() {
+                    report.probe.termination = if recall_reached {
+                        ProbeTermination::QuantizedRecall
+                    } else if meter.exhausted() {
                         ProbeTermination::Ceiling
                     } else {
                         ProbeTermination::Exhausted
@@ -1186,15 +1241,30 @@ mod ivf_e2e_tests {
     }
 
     #[test]
-    fn global_search_shortlists_all_clusters_before_refining() -> Result<()> {
-        use crate::vector::VectorStage;
+    fn global_adaptive_stopping_shares_evidence_across_segments() -> Result<()> {
+        use crate::vector::{AdaptiveProbeParams, ProbeTermination};
 
-        let fixture = FixtureSpec::clustered(Metric::L2, 128, 8, 768)
-            .segments(3)
-            .schedule(&[1, 1])
-            .label("matches", |i| i % 3 == 0)
-            .paged()
-            .build()?;
+        let vector = |x| {
+            let mut v = vec![0.0; 64];
+            v[0] = x;
+            v
+        };
+        let fixture = FixtureSpec::ivf(
+            Metric::L2,
+            (0..64).map(|c| vector(c as f32 * 10.0)).collect(),
+            (0..19392)
+                .map(|i| {
+                    let mut v = vector((i % 64) as f32 * 10.0);
+                    if i / 64 % 10 == 9 {
+                        v[1] = 1000.0;
+                    }
+                    v
+                })
+                .collect(),
+        )
+        .segments(3)
+        .label("half", |i| i % 3 != 0)
+        .build()?;
         let searcher = fixture.index.reader()?.searcher();
         let readers: Vec<_> = searcher
             .segment_readers()
@@ -1202,44 +1272,135 @@ mod ivf_e2e_tests {
             .enumerate()
             .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
             .collect();
-        let mut query = vec![0.01; 128];
-        query[2] = 1.0;
-        for filter in [&AllQuery as &dyn Query, &fixture.filter("matches")] {
-            for located in [LocatedPath::Off, LocatedPath::Auto] {
+        for filter in [&AllQuery as &dyn Query, &fixture.filter("half")] {
+            let query = vector(0.0);
+            let weight = fixture.weight(filter)?;
+            for target in [0.9, 1.0] {
                 let collector = TopDocs::with_limit(10)
                     .order_by_similarity(fixture.field, query.clone())
                     .with_probe_params(ProbeParams {
-                        located,
-                        exact_plan: false,
-                        ..exhaustive_params(8)
+                        adaptive_probing: (target < 1.0).then(|| AdaptiveProbeParams {
+                            effort: -4.0 * (1.0_f64 - target).log10(),
+                        }),
+                        located: LocatedPath::Off,
+                        ..exhaustive_params(64)
                     })
                     .build();
-                let weight = fixture.weight(filter)?;
-                fixture.clear_reads();
                 let result = collector.merge_fruits(collector.collect_segments(
                     weight.as_ref(),
                     &readers,
                     |_| {},
                 )?)?;
-                let reads = fixture.reads();
-                let last_shortlist = reads
-                    .iter()
-                    .rposition(|(stage, _)| *stage == VectorStage::LayerScan(0))
-                    .expect("layer-0 reads");
-                let first_refinement = reads
-                    .iter()
-                    .position(|(stage, _)| {
-                        matches!(
-                            stage,
-                            VectorStage::LayerScan(1)
-                                | VectorStage::ExactScan
-                                | VectorStage::ExactFetch
-                                | VectorStage::ExactScore
-                        )
-                    })
-                    .expect("refinement reads");
-                assert!(last_shortlist < first_refinement, "{located:?}");
                 assert_eq!(result.results, fixture.oracle(filter, &query, 10)?);
+                let probed: usize = result.stats.iter().map(|s| s.clusters_probed()).sum();
+                if target < 1.0 {
+                    assert!(result
+                        .stats
+                        .iter()
+                        .all(|s| s.termination == ProbeTermination::QuantizedRecall));
+                    assert!(
+                        probed < 32,
+                        "global admission history should stop across segment switches: {probed}"
+                    );
+                    assert!(result.stats.iter().all(|s| s.candidates_scored > 0));
+                } else {
+                    assert_eq!(probed, 192);
+                    assert!(result
+                        .stats
+                        .iter()
+                        .all(|s| s.termination != ProbeTermination::QuantizedRecall));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn global_search_refines_during_probing_only_with_adaptive() -> Result<()> {
+        use crate::vector::VectorStage;
+
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            let fixture = FixtureSpec::clustered(metric, 128, 8, 768)
+                .router(crate::vector::RouterKind::QuantizedStacked)
+                .segments(3)
+                .schedule(&[1, 1])
+                .label("matches", |i| i % 3 == 0)
+                .paged()
+                .build()?;
+            let searcher = fixture.index.reader()?.searcher();
+            let mut readers: Vec<_> = searcher
+                .segment_readers()
+                .iter()
+                .enumerate()
+                .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
+                .collect();
+            readers.reverse();
+            let mut query = vec![0.01; 128];
+            query[2] = 1.0;
+            for filter in [&AllQuery as &dyn Query, &fixture.filter("matches")] {
+                for (located, adaptive) in [
+                    (LocatedPath::Off, false),
+                    (LocatedPath::Auto, false),
+                    (LocatedPath::Off, true),
+                    (LocatedPath::Auto, true),
+                ] {
+                    let collector = TopDocs::with_limit(10)
+                        .order_by_similarity(fixture.field, query.clone())
+                        .with_probe_params(ProbeParams {
+                            located,
+                            exact_plan: false,
+                            router_min_beam_fraction: 1.0,
+                            router_aps: false,
+                            adaptive_probing: adaptive.then_some(
+                                crate::vector::AdaptiveProbeParams {
+                                    effort: -2.0 * (1.0_f64 - 0.99999999).log10(),
+                                },
+                            ),
+                            ..exhaustive_params(8)
+                        })
+                        .build();
+                    let weight = fixture.weight(filter)?;
+                    fixture.clear_reads();
+                    let result = collector.merge_fruits(collector.collect_segments(
+                        weight.as_ref(),
+                        &readers,
+                        |_| {},
+                    )?)?;
+                    let reads = fixture.reads();
+                    let last_shortlist = reads
+                        .iter()
+                        .rposition(|(stage, _)| *stage == VectorStage::LayerScan(0))
+                        .expect("layer-0 reads");
+                    let first_refinement = reads
+                        .iter()
+                        .position(|(stage, _)| {
+                            matches!(
+                                stage,
+                                VectorStage::LayerScan(1)
+                                    | VectorStage::ExactScan
+                                    | VectorStage::ExactFetch
+                                    | VectorStage::ExactScore
+                            )
+                        })
+                        .expect("refinement reads");
+                    assert_eq!(first_refinement < last_shortlist, adaptive, "{located:?}");
+                    assert_eq!(result.results, fixture.oracle(filter, &query, 10)?);
+                    let mut refined = 0;
+                    for stats in &result.stats {
+                        let trace = &stats.quantized_trace;
+                        let rows: std::collections::HashSet<_> =
+                            trace.refined_topk_rows.iter().copied().collect();
+                        assert_eq!(rows.len(), trace.refined_topk_rows.len());
+                        assert!(trace
+                            .boundary_rows
+                            .iter()
+                            .flatten()
+                            .all(|row| !rows.contains(row)));
+                        assert!(trace.exact_phase_rows.iter().all(|row| !rows.contains(row)));
+                        refined += rows.len();
+                    }
+                    assert_eq!(refined > 0, adaptive);
+                }
             }
         }
         Ok(())

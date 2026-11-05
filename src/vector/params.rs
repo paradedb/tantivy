@@ -17,7 +17,9 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 /// provisional pending real-data benchmarking.
 #[derive(Clone, Debug)]
 pub struct ProbeParams {
-    /// Work ceiling as a fraction of each segment's capacity. Default 0.01.
+    /// Adaptive admission-rate stopping within the routed candidates and work budget.
+    pub adaptive_probing: Option<AdaptiveProbeParams>,
+    /// Work ceiling as a fraction of segment capacity. Default 0.01.
     pub max_probe_fraction: f32,
     /// Approximate members retained per requested cluster by the quantized router.
     /// Fractional values are rounded up to whole candidates and clamped to at
@@ -45,6 +47,18 @@ pub struct ProbeParams {
     pub fixed_probe_cost_rows: f64,
 }
 
+/// Search effort shared by adaptive stopping, routing, and bypass selection.
+#[derive(Clone, Copy, Debug)]
+pub struct AdaptiveProbeParams {
+    pub effort: f64,
+}
+
+impl AdaptiveProbeParams {
+    pub(crate) fn admission_fraction(self) -> f64 {
+        10.0_f64.powf(-self.effort)
+    }
+}
+
 /// Which segments take the located path: a segment whose filter matches at most a cap of
 /// documents, deleted ones included, skips routing and scores every match, located through the
 /// document location map.
@@ -55,9 +69,9 @@ pub enum LocatedPath {
     Off,
     /// The cap is `floor(selectivity * max_doc)`.
     MaxSelectivity(Selectivity),
-    /// The cap is the rows the segment's routed work budget buys with no cluster opened,
-    /// `floor(budget * n_avg / (1 - x))`: a filter matching no more documents than routing may
-    /// score is located instead.
+    /// The cap is the rows the initial routed work estimate buys with no cluster opened,
+    /// `floor(work * n_avg / (1 - x))`. Adaptive scans use their expected work estimate;
+    /// nonadaptive scans use their work ceiling.
     Auto,
 }
 
@@ -80,6 +94,7 @@ impl Selectivity {
 impl Default for ProbeParams {
     fn default() -> Self {
         Self {
+            adaptive_probing: None,
             max_probe_fraction: 0.01,
             router_rerank_factor: 1.0,
             router_min_beam_fraction: 0.5,
@@ -93,6 +108,13 @@ impl Default for ProbeParams {
 }
 
 impl ProbeParams {
+    /// Expected initial work for bypass selection and allocation, separate from routing headroom.
+    pub(crate) fn initial_work(&self, clusters: usize) -> Option<f64> {
+        let adaptive = self.adaptive_probing?;
+        let fraction = 0.005 * adaptive.effort / 4.4;
+        Some((fraction * clusters as f64).clamp(1.0, clusters.max(1) as f64))
+    }
+
     /// The number of clusters the stacked router is asked to rank for a
     /// segment whose resolved work budget is `budget` units.
     ///
@@ -100,10 +122,9 @@ impl ProbeParams {
     /// match_fraction` units, since only filter matches charge row work, so
     /// the budget buys `budget / that` clusters: `budget` unfiltered, up to
     /// `budget / open_share` as the filter approaches empty. The count is
-    /// floored at `min_probe_clusters` and capped at the segment's cluster
-    /// count. There is no headroom: when ranked clusters run smaller than
-    /// average, the ranking can run out
-    /// before the budget and the scan ends `Exhausted`.
+    /// capped at the segment's cluster count. Adaptive scans scale a base window by the
+    /// admission fraction, with a filter adjustment whose relative effect shrinks as the window
+    /// grows. Nonadaptive scans apply the `min_probe_clusters` floor.
     ///
     /// * `open_share` (`f64`) — the per-index open share `x`.
     /// * `match_fraction` (`f64`) — the share of the segment's docs the filter matches, in `(0,
@@ -114,15 +135,36 @@ impl ProbeParams {
         open_share: f64,
         match_fraction: f64,
         clusters_in_segment: usize,
+        early_refinement: bool,
     ) -> usize {
         let match_fraction = match_fraction.clamp(0.0, 1.0);
         let cluster_cost =
             (open_share + (1.0 - open_share) * match_fraction).max(f64::MIN_POSITIVE);
         let clusters = (budget.max(0.0) / cluster_cost).ceil();
-        (clusters as usize)
-            .max(self.min_probe_clusters)
-            .min(clusters_in_segment)
-            .max(1)
+        let clusters = if let Some(fraction) = self
+            .adaptive_probing
+            .map(AdaptiveProbeParams::admission_fraction)
+        {
+            let base = if early_refinement {
+                let effort = self.adaptive_probing.unwrap().effort;
+                (0.00075_f64.ln() + 0.32 * effort * std::f64::consts::LN_10)
+                    .min(0.0)
+                    .exp()
+            } else {
+                0.002 / fraction.powf(0.625)
+            }
+            .min(1.0);
+            let headroom = (0.05 * (cluster_cost.sqrt().recip() - 1.0)).min(0.4);
+            let remaining = 1.0 - base;
+            let taper = (remaining / 0.9).min(1.0);
+            let adjusted = base + headroom * base.powf(0.125) * remaining * taper * taper;
+            let expected = self.initial_work(clusters_in_segment).unwrap_or(0.0) / cluster_cost;
+            let window = (adjusted * clusters_in_segment as f64).max(expected).ceil();
+            (clusters as usize).min(window as usize)
+        } else {
+            (clusters as usize).max(self.min_probe_clusters)
+        };
+        clusters.min(clusters_in_segment).max(1)
     }
 }
 
@@ -130,7 +172,8 @@ impl ProbeParams {
     /// The segment's work budget with the pricing it was resolved under, `(budget, n_avg, x)`.
     ///
     /// The budget is `max_probe_fraction` of the segment's capacity in work units, floored at
-    /// `min_probe_clusters` and capped at the capacity; `n_avg` is the docs per cluster and `x` the
+    /// one for adaptive scans or `min_probe_clusters` otherwise, and capped at capacity.
+    /// `n_avg` is the docs per cluster and `x` the
     /// open share. `native_docs_in_segment` counts distinct docs with a vector, as written. A
     /// non-positive `max_probe_fraction` or a non-finite or non-positive `fixed_probe_cost_rows` is
     /// an error.
@@ -139,6 +182,14 @@ impl ProbeParams {
         clusters_in_segment: usize,
         native_docs_in_segment: usize,
     ) -> crate::Result<(f64, f64, f64)> {
+        if self
+            .adaptive_probing
+            .is_some_and(|adaptive| !adaptive.effort.is_finite() || adaptive.effort <= 0.0)
+        {
+            return Err(crate::TantivyError::InvalidArgument(
+                "adaptive search effort must be finite and greater than zero".into(),
+            ));
+        }
         if !(self.max_probe_fraction > 0.0) {
             return Err(crate::TantivyError::InvalidArgument(
                 "max_probe_fraction must be greater than 0".to_string(),
@@ -155,7 +206,11 @@ impl ProbeParams {
         let segment_units = clusters_in_segment as f64 * x
             + (1.0 - x) * native_docs_in_segment as f64 / n_avg.max(f64::MIN_POSITIVE);
         let budget = (self.max_probe_fraction as f64 * segment_units)
-            .max(self.min_probe_clusters as f64)
+            .max(if self.initial_work(clusters_in_segment).is_some() {
+                1.0
+            } else {
+                self.min_probe_clusters as f64
+            })
             .min(segment_units);
         Ok((budget, n_avg, x))
     }
@@ -164,6 +219,54 @@ impl ProbeParams {
 #[cfg(test)]
 mod tests {
     use super::ProbeParams;
+
+    #[test]
+    fn adaptive_effort_scales_work_and_routing_without_a_probe_floor() {
+        let params = |effort| ProbeParams {
+            adaptive_probing: Some(super::AdaptiveProbeParams { effort }),
+            max_probe_fraction: 1.0,
+            ..Default::default()
+        };
+        assert!((params(4.4).initial_work(1000).unwrap() - 5.0).abs() < 1e-10);
+        assert!((params(4.4).initial_work(4000).unwrap() - 20.0).abs() < 1e-10);
+        assert_eq!(params(0.1).router_k(1000.0, 0.1, 1.0, 1000, true), 1);
+        assert_eq!(params(4.4).router_k(2.0, 0.1, 1.0, 1000, true), 2);
+        assert!(
+            (ProbeParams {
+                max_probe_fraction: 0.001,
+                ..params(4.4)
+            }
+            .resolved_work_budget(1000, 100_000)
+            .unwrap()
+            .0 - 1.0)
+                .abs()
+                < 1e-6
+        );
+        for early_refinement in [false, true] {
+            for open_share in [f64::MIN_POSITIVE, 1e-9, 0.004, 0.1, 1.0] {
+                for match_fraction in [0.0, 0.001, 0.01, 0.1, 1.0] {
+                    let mut previous = 0;
+                    for step in 1..=1000 {
+                        let params = params(step as f64 / 50.0);
+                        let window = params.router_k(
+                            4000.0,
+                            open_share,
+                            match_fraction,
+                            4000,
+                            early_refinement,
+                        );
+                        assert!(window >= previous && window <= 4000);
+                        previous = window;
+                    }
+                    assert_eq!(previous, 4000);
+                }
+            }
+        }
+        assert_eq!(
+            params(f64::MAX).router_k(4000.0, 0.1, 1.0, 4000, true),
+            4000
+        );
+    }
 
     /// Capacity is the cluster count, exactly, whatever the granularity:
     /// `units_seg = C*x + (1 - x)*N/n_avg == C` for every x the open
@@ -216,17 +319,17 @@ mod tests {
     fn router_k_tracks_budget_and_filter_selectivity() {
         let params = ProbeParams::default();
         let x = 0.2;
-        assert_eq!(params.router_k(20.0, x, 1.0, 1000), 20);
-        assert_eq!(params.router_k(20.4, x, 1.0, 1000), 21);
+        assert_eq!(params.router_k(20.0, x, 1.0, 1000, false), 20);
+        assert_eq!(params.router_k(20.4, x, 1.0, 1000, false), 21);
         // Half the docs match: a cluster costs 0.2 + 0.8 * 0.5 = 0.6 units.
-        assert_eq!(params.router_k(20.0, x, 0.5, 1000), 34);
+        assert_eq!(params.router_k(20.0, x, 0.5, 1000, false), 34);
         // Nothing matches: only opens charge.
-        assert_eq!(params.router_k(20.0, x, 0.0, 1000), 100);
-        assert_eq!(params.router_k(2.0, x, 1.0, 1000), 2);
-        assert_eq!(params.router_k(0.01, x, 1.0, 1000), 1);
-        assert_eq!(params.router_k(20.0, x, 1.0, 18), 18);
-        assert_eq!(params.router_k(20.0, 0.0, 0.0, 1000), 1000);
-        assert_eq!(params.router_k(0.0, x, 1.0, 0), 1);
+        assert_eq!(params.router_k(20.0, x, 0.0, 1000, false), 100);
+        assert_eq!(params.router_k(2.0, x, 1.0, 1000, false), 2);
+        assert_eq!(params.router_k(0.01, x, 1.0, 1000, false), 1);
+        assert_eq!(params.router_k(20.0, x, 1.0, 18, false), 18);
+        assert_eq!(params.router_k(20.0, 0.0, 0.0, 1000, false), 1000);
+        assert_eq!(params.router_k(0.0, x, 1.0, 0, false), 1);
     }
 
     /// A non-positive probe fraction or a non-finite or non-positive open cost is an error.

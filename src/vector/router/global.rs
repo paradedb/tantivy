@@ -22,6 +22,7 @@ impl GlobalRanking {
         params: RoutingParams,
         totals: &mut [StageTotals],
         on_segment: &mut impl FnMut(usize),
+        limit: Option<usize>,
     ) -> Self {
         let mut indexes = Vec::with_capacity(routers.len());
         let mut leaves = Vec::new();
@@ -93,6 +94,9 @@ impl GlobalRanking {
                 .then(a.0.cmp(&b.0))
                 .then(a.1.node.cmp(&b.1.node))
         });
+        if let Some(limit) = limit {
+            leaves.truncate(limit.max(1));
+        }
         let mut counts = vec![0; routers.len()];
         for (segment, _) in &leaves {
             counts[*segment] += 1;
@@ -180,6 +184,7 @@ mod tests {
                         },
                         &mut totals,
                         &mut |_| {},
+                        None,
                     );
                     assert_eq!(ranked.clusters[0].0, (query[0] / 100.0) as usize);
                     let full = GlobalRanking::from(
@@ -189,6 +194,7 @@ mod tests {
                         RoutingParams::default(),
                         &mut totals,
                         &mut |_| {},
+                        None,
                     );
                     let plain = GlobalRanking::from(
                         &routers,
@@ -197,6 +203,7 @@ mod tests {
                         RoutingParams::default(),
                         &mut totals,
                         &mut |_| {},
+                        None,
                     );
                     assert_eq!(full.clusters, plain.clusters);
                 }
@@ -239,6 +246,7 @@ mod tests {
                 },
                 &mut totals,
                 &mut |_| {},
+                None,
             );
             let exhaustive = GlobalRanking::from(
                 &routers,
@@ -247,6 +255,7 @@ mod tests {
                 RoutingParams::default(),
                 &mut totals,
                 &mut |_| {},
+                None,
             );
             assert_eq!(
                 exhaustive.clusters.len(),
@@ -370,6 +379,7 @@ mod tests {
                 },
                 &mut totals,
                 &mut |_| {},
+                None,
             );
             assert_eq!(ranked.clusters.len(), 6);
             assert_eq!(ranked.clusters[0].0, 1);
@@ -387,6 +397,7 @@ mod tests {
                 RoutingParams::default(),
                 &mut totals,
                 &mut |_| {},
+                None,
             );
             assert_eq!(exhaustive.clusters.len(), 160);
         }
@@ -518,6 +529,7 @@ mod tests {
                             params,
                             &mut totals,
                             &mut |_| {},
+                            None,
                         );
                         assert_eq!(
                             global.clusters,
@@ -583,6 +595,7 @@ mod tests {
                 params,
                 &mut totals,
                 &mut |_| {},
+                None,
             );
             #[cfg(debug_assertions)]
             assert_eq!(
@@ -591,7 +604,7 @@ mod tests {
                 "prepare once for each persisted rotation seed"
             );
             assert_eq!(ranking.clusters.len(), 37);
-            for (segment, candidate) in ranking.clusters {
+            for &(segment, candidate) in &ranking.clusters {
                 let values = match segment {
                     0 => &a.1,
                     1 => &b.1,
@@ -621,6 +634,16 @@ mod tests {
                     }
                 ));
             }
+            let bounded = GlobalRanking::from(
+                &routers,
+                &partitions,
+                &query,
+                params,
+                &mut vec![StageTotals::default(); routers.len()],
+                &mut |_| {},
+                Some(5),
+            );
+            assert_eq!(bounded.clusters, ranking.clusters[..5]);
         }
         Ok(())
     }
@@ -644,6 +667,7 @@ mod tests {
             },
             &mut totals,
             &mut |_| {},
+            None,
         );
         assert_eq!(ranking.clusters.len(), 3);
         let exact: usize = ranking
@@ -686,6 +710,7 @@ mod tests {
             },
             &mut totals,
             &mut |_| {},
+            None,
         );
         assert_eq!(ranking.clusters.len(), 3);
         assert!(matches!(
