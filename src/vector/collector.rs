@@ -652,6 +652,7 @@ where
         per_row: WorkUnits::new((1.0 - x) / n_avg),
     };
     let mut topk = collector.collector_topk.lock().unwrap().clone();
+    let mut normalized_reduction = 0.0;
     let mut plans = Vec::with_capacity(vectors.len());
     let mut finished = Vec::with_capacity(vectors.len());
     for (i, ((reader, segment), tie_break)) in vectors
@@ -676,6 +677,7 @@ where
                         top_n,
                         budget,
                     )?;
+                    normalized_reduction += budget.total.get() - plan.budget.total.get();
                     Ok((Some(plan), None))
                 }
                 None => {
@@ -706,6 +708,11 @@ where
         plans.push(plan);
         finished.push(result);
     }
+    let total = (total - normalized_reduction).max(0.0);
+    let global_budget = WorkBudget {
+        total: WorkUnits::new(total),
+        ..global_budget
+    };
     let routers: Vec<_> = vectors
         .iter()
         .zip(&plans)
@@ -1175,6 +1182,80 @@ mod ivf_e2e_tests {
                 .reader
                 .vector_index(fixture.field)?
                 .quantization_initialized());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn global_normalization_preserves_equivalent_budgets() -> Result<()> {
+        let fixture = FixtureSpec::clustered(Metric::L2, 32, 16, 1024)
+            .segments(4)
+            .label("half", |i| i % 2 == 0)
+            .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let readers: Vec<_> = searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
+            .collect();
+        let mut clusters = 0;
+        let mut docs = 0;
+        for segment in searcher.segment_readers() {
+            let vectors = segment.vector_index(fixture.field)?;
+            let index = vectors.index().unwrap();
+            clusters += index.num_clusters();
+            docs += index.num_docs();
+        }
+        let mut query = vec![0.0; 32];
+        query[3] = 1.0;
+        for (filter, cost) in [
+            (&AllQuery as &dyn Query, 1.0),
+            (&fixture.filter("half"), 0.75),
+        ] {
+            for located in [LocatedPath::Off, LocatedPath::Auto] {
+                for fraction in [0.125, 0.25, 0.5, 1.0] {
+                    let params = ProbeParams {
+                        max_probe_fraction: fraction,
+                        selectivity_exponent: 1.0,
+                        fixed_probe_cost_rows: docs as f64 / clusters as f64,
+                        located,
+                        ..Default::default()
+                    };
+                    let control = ProbeParams {
+                        max_probe_fraction: if fraction < 1.0 {
+                            fraction * cost
+                        } else {
+                            fraction
+                        },
+                        selectivity_exponent: 0.0,
+                        ..params.clone()
+                    };
+                    let run = |params| -> Result<_> {
+                        let collector = TopDocs::with_limit(10)
+                            .order_by_similarity(fixture.field, query.clone())
+                            .with_probe_params(params)
+                            .build();
+                        let weight = fixture.weight(filter)?;
+                        collector.merge_fruits(collector.collect_segments(
+                            weight.as_ref(),
+                            &readers,
+                            |_| {},
+                        )?)
+                    };
+                    let actual = run(params)?;
+                    let expected = run(control)?;
+                    assert_eq!(actual.results, expected.results);
+                    for (actual, expected) in actual.stats.iter().zip(&expected.stats) {
+                        assert_eq!(actual.access_path, expected.access_path);
+                        assert_eq!(actual.located_cap, expected.located_cap);
+                        assert_eq!(actual.work_budget, expected.work_budget);
+                        assert_eq!(actual.work_charged, expected.work_charged);
+                        assert_eq!(actual.clusters_probed(), expected.clusters_probed());
+                        assert_eq!(actual.routing_visited_count, expected.routing_visited_count);
+                    }
+                }
+            }
         }
         Ok(())
     }

@@ -79,36 +79,18 @@ impl SegmentPlan {
         // Capacity counts native docs as written: deleted rows still charge on first touch.
         let (budget, n_avg, x) = params.resolved_work_budget(clusters, index.num_docs())?;
         debug_assert!(n_avg > 0.0);
-        let cap = located_cap(params.located, max_doc, budget, n_avg, x);
-        let source = {
-            let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-            collect_segment_filter(weight, segment, max_doc, cap)?
-        };
-        let match_fraction = match &source {
-            Source::Router(filter) => filter.match_fraction(max_doc),
-            Source::FilterMatches(docs) => docs.len() as f64 / f64::from(max_doc),
-        };
-        let budget = params.normalized_budget(budget, x, match_fraction);
-        let cap = located_cap(params.located, max_doc, budget, n_avg, x);
-        let source = match source {
-            Source::FilterMatches(docs) if docs.len() > cap => {
-                let mut filter = BitSet::with_max_value(max_doc);
-                for doc in docs {
-                    filter.insert(doc);
-                }
-                Source::Router(DocFilter::Docs(filter))
-            }
-            source => source,
-        };
-        Ok(Self {
-            budget: WorkBudget {
+        Self::with_budget(
+            params,
+            index,
+            weight,
+            segment,
+            top_n,
+            WorkBudget {
                 total: WorkUnits::new(budget),
                 per_cluster: WorkUnits::new(x),
                 per_row: WorkUnits::new((1.0 - x) / n_avg),
             },
-            source: (!source.is_empty()).then_some(source),
-            report: report(cap),
-        })
+        )
     }
 
     pub(crate) fn with_budget(
@@ -141,6 +123,25 @@ impl SegmentPlan {
         let source = {
             let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
             collect_segment_filter(weight, segment, max_doc, cap)?
+        };
+        let match_fraction = match &source {
+            Source::Router(filter) => filter.match_fraction(max_doc),
+            Source::FilterMatches(docs) => docs.len() as f64 / f64::from(max_doc),
+        };
+        let budget = WorkBudget {
+            total: WorkUnits::new(params.normalized_budget(budget.total.get(), x, match_fraction)),
+            ..budget
+        };
+        let cap = located_cap(params.located, max_doc, budget.total.get(), n_avg, x);
+        let source = match source {
+            Source::FilterMatches(docs) if docs.len() > cap => {
+                let mut filter = BitSet::with_max_value(max_doc);
+                for doc in docs {
+                    filter.insert(doc);
+                }
+                Source::Router(DocFilter::Docs(filter))
+            }
+            source => source,
         };
         Ok(Self {
             budget,
