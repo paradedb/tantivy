@@ -33,8 +33,8 @@ pub struct SegmentWriter {
     pub(crate) inverted_index: InvertedIndexPluginWriter,
     pub(crate) fast_fields: FastFieldsPluginWriter,
     pub(crate) store_writer: StorePluginWriter,
-    /// Writers for `Index::erased_plugins()`, in that order: the erased built-ins
-    /// (currently the vector plugin), then the registered custom plugins.
+    /// Writers for `Index::erased_plugins()`, in that order: the erased built-ins, then the
+    /// registered custom plugins.
     erased_plugin_writers: Vec<Box<dyn PluginWriter>>,
     pub(crate) doc_opstamps: Vec<Opstamp>,
     schema: Schema,

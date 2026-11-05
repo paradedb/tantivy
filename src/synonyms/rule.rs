@@ -97,6 +97,12 @@ impl SynonymRule {
         }
     }
 
+    /// Checks the rule with the analyzer of the rule field, so a caller can reject the rule before
+    /// its document is added.
+    pub fn check(&self, analyzer: &mut TextAnalyzer) -> Result<(), RuleError> {
+        self.compile(analyzer).map(drop)
+    }
+
     /// Analyzes both sides of the rule. A rule whose alternatives all analyze to nothing, such as
     /// a right side made of stopwords, compiles to nothing, so the typed term stays instead of
     /// matching nothing.

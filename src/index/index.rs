@@ -29,7 +29,7 @@ use crate::reader::{IndexReader, IndexReaderBuilder};
 use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
-use crate::synonyms::plugin::SynonymPlugin;
+use crate::synonyms::plugin::{synonym_rule_field, SynonymPlugin};
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
 use crate::vector::clustering::{IvfClusterer, SuperKMeansClusterer};
 use crate::vector::write::VectorPlugin;
@@ -397,6 +397,7 @@ impl IndexBuilder {
                     }
                 }
             }
+            synonym_rule_field(schema)?;
             self.index_settings.validate_vector_quantization(schema)?;
             if !(1..=100).contains(&self.index_settings.bitmap_postings.min_density_percent) {
                 return Err(crate::TantivyError::InvalidArgument(

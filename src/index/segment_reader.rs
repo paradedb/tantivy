@@ -19,6 +19,7 @@ use crate::json_utils::json_path_sep_to_dot;
 use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
+use crate::synonyms::plugin::synonym_rule_field;
 use crate::synonyms::{SynonymDictionary, SYNONYM_EXT};
 use crate::termdict::TermDictionary;
 #[cfg(test)]
@@ -223,13 +224,13 @@ impl SegmentReader {
     }
 
     /// Opens the segment's synonym dictionary. A segment whose schema holds no synonym rules has
-    /// none.
+    /// none. Every segment of a schema with a rule field has one, so a missing file is an error.
     pub fn synonym_dictionary(&self) -> crate::Result<Option<SynonymDictionary>> {
-        match self.open_read(SegmentComponent::Custom(SYNONYM_EXT.to_string())) {
-            Ok(file) => Ok(Some(SynonymDictionary::open(file)?)),
-            Err(OpenReadError::FileDoesNotExist(_)) => Ok(None),
-            Err(err) => Err(err.into()),
+        if synonym_rule_field(self.schema())?.is_none() {
+            return Ok(None);
         }
+        let file = self.open_read(SegmentComponent::Custom(SYNONYM_EXT.to_string()))?;
+        Ok(Some(SynonymDictionary::open(file)?))
     }
 
     /// Checks the vector format header and each vector field's IVF router kind, without opening

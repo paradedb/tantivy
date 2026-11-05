@@ -17,13 +17,9 @@ use crate::schema::{Field, FieldType, Schema};
 use crate::tokenizer::TextAnalyzer;
 use crate::{DocId, TantivyError};
 
-/// Checks for cancellation once per this many merged groups or keys.
-const ITEMS_PER_CANCEL_CHECK: usize = 1024;
-
 pub(crate) struct SynonymPlugin;
 
-/// The text field that holds the rules, and the name of the tokenizer that analyzes them.
-fn synonym_rule_field(schema: &Schema) -> crate::Result<Option<(Field, String)>> {
+pub(crate) fn synonym_rule_field(schema: &Schema) -> crate::Result<Option<Field>> {
     let mut fields = schema
         .fields()
         .filter_map(|(field, entry)| match entry.field_type() {
@@ -40,12 +36,12 @@ fn synonym_rule_field(schema: &Schema) -> crate::Result<Option<(Field, String)>>
             "a schema can hold synonym rules in one field, found '{name}' and '{other}'"
         )));
     }
-    let indexing = options.get_indexing_options().ok_or_else(|| {
-        TantivyError::SchemaError(format!(
+    if options.get_indexing_options().is_none() {
+        return Err(TantivyError::SchemaError(format!(
             "synonym rule field '{name}' must be indexed, since its tokenizer analyzes the rules"
-        ))
-    })?;
-    Ok(Some((field, indexing.tokenizer().to_string())))
+        )));
+    }
+    Ok(Some(field))
 }
 
 impl SegmentPlugin for SynonymPlugin {
@@ -56,19 +52,10 @@ impl SegmentPlugin for SynonymPlugin {
     fn create_writer(&self, ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
         let rules = match synonym_rule_field(&ctx.segment.schema())? {
             None => None,
-            Some((field, tokenizer)) => {
-                let analyzer = ctx
-                    .segment
-                    .index()
-                    .tokenizers()
-                    .get(&tokenizer)
-                    .ok_or_else(|| {
-                        TantivyError::SchemaError(format!(
-                            "synonym rule tokenizer '{tokenizer}' is not registered"
-                        ))
-                    })?;
-                Some(RuleField { field, analyzer })
-            }
+            Some(field) => Some(RuleField {
+                field,
+                analyzer: ctx.segment.index().tokenizer_for_field(field)?,
+            }),
         };
         Ok(Box::new(SynonymWriter {
             rules,
@@ -109,6 +96,37 @@ struct SynonymWriter {
 }
 
 impl SynonymWriter {
+    fn add_value(&mut self, doc: DocId, value: ErasedValue<'_>) -> crate::Result<()> {
+        match value {
+            ErasedValue::Leaf(ReferenceValueLeaf::Str(text)) => self.add_text(doc, text),
+            ErasedValue::Leaf(ReferenceValueLeaf::PreTokStr(_)) => Err(
+                TantivyError::InvalidArgument("a synonym rule can't be pre-tokenized".to_string()),
+            ),
+            ErasedValue::Array(values) => {
+                for value in values {
+                    self.add_value(doc, value)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn add_text(&mut self, doc: DocId, text: &str) -> crate::Result<()> {
+        let Some(rule_field) = self.rules.as_mut() else {
+            return Ok(());
+        };
+        let invalid =
+            |err| TantivyError::InvalidArgument(format!("invalid synonym rule '{text}': {err}"));
+        let Some(rule) = SynonymRule::parse(text).map_err(invalid)? else {
+            return Ok(());
+        };
+        if let Some(rule) = rule.compile(&mut rule_field.analyzer).map_err(invalid)? {
+            self.add_rule(doc, rule);
+        }
+        Ok(())
+    }
+
     fn add_rule(&mut self, doc: DocId, rule: CompiledRule) {
         let group = self.groups.len();
         for key in rule.keys {
@@ -144,18 +162,6 @@ fn alternative_mem_usage(alternative: &[String]) -> usize {
             .sum::<usize>()
 }
 
-fn collect_strings<'a>(value: ErasedValue<'a>, out: &mut Vec<&'a str>) {
-    match value {
-        ErasedValue::Leaf(ReferenceValueLeaf::Str(text)) => out.push(text),
-        ErasedValue::Array(values) => {
-            for value in values {
-                collect_strings(value, out);
-            }
-        }
-        _ => {}
-    }
-}
-
 impl PluginWriter for SynonymWriter {
     fn add_document(
         &mut self,
@@ -163,28 +169,13 @@ impl PluginWriter for SynonymWriter {
         doc: &dyn ErasedDocument,
         _schema: &Schema,
     ) -> crate::Result<()> {
-        let Some(rule_field) = self.rules.as_mut() else {
+        let Some(rule_field) = self.rules.as_ref().map(|rules| rules.field) else {
             return Ok(());
         };
-        let mut values = Vec::new();
         for (field, value) in doc.erased_fields() {
-            if field == rule_field.field {
-                collect_strings(value, &mut values);
+            if field == rule_field {
+                self.add_value(doc_id, value)?;
             }
-        }
-        // Every value compiles before any is added, so an invalid rule leaves nothing of its
-        // document behind.
-        let mut compiled: Vec<CompiledRule> = Vec::with_capacity(values.len());
-        for value in values {
-            let invalid = |err| {
-                TantivyError::InvalidArgument(format!("invalid synonym rule '{value}': {err}"))
-            };
-            if let Some(rule) = SynonymRule::parse(value).map_err(invalid)? {
-                compiled.extend(rule.compile(&mut rule_field.analyzer).map_err(invalid)?);
-            }
-        }
-        for rule in compiled {
-            self.add_rule(doc_id, rule);
         }
         Ok(())
     }
@@ -236,9 +227,8 @@ impl PluginWriter for SynonymWriter {
     }
 }
 
-fn check_cancel(ctx: &PluginMergeContext, items: &mut usize) -> crate::Result<()> {
-    *items += 1;
-    if *items % ITEMS_PER_CANCEL_CHECK == 0 && ctx.cancel.wants_cancel() {
+fn check_cancel(ctx: &PluginMergeContext) -> crate::Result<()> {
+    if ctx.cancel.wants_cancel() {
         return Err(TantivyError::Cancelled);
     }
     Ok(())
@@ -278,14 +268,13 @@ fn merge_dictionaries(ctx: &PluginMergeContext) -> crate::Result<()> {
         .target_segment
         .open_write(SegmentComponent::Custom(SYNONYM_EXT.to_string()))?;
     let mut file = SynonymFileWriter::new(write);
-    let mut items = 0;
     // For each source, the target group of each alive source group, by source offset.
     let mut moved: Vec<HashMap<u64, GroupRef>> = Vec::with_capacity(sources.len());
     for (segment_ord, dictionary) in &sources {
         let section = dictionary.read_groups()?;
         let mut source_moved = HashMap::new();
         for group in groups(&section) {
-            check_cancel(ctx, &mut items)?;
+            check_cancel(ctx)?;
             let group = group?;
             if let Some(doc) = target_doc(*segment_ord, group.doc)? {
                 source_moved.insert(group.offset, file.add_encoded_group(doc, group.payload)?);
@@ -307,7 +296,7 @@ fn merge_dictionaries(ctx: &PluginMergeContext) -> crate::Result<()> {
     let mut writer = file.into_keys();
     let mut merged: Vec<GroupRef> = Vec::new();
     while let Some(Reverse((key, mut source))) = heap.pop() {
-        check_cancel(ctx, &mut items)?;
+        check_cancel(ctx)?;
         merged.clear();
         loop {
             let segment_ord = sources[source].0;

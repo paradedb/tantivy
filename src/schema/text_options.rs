@@ -179,7 +179,9 @@ impl TextOptions {
     }
 
     /// Makes each value of the field a Solr synonym rule, analyzed with the field's tokenizer
-    /// into the segment's synonym component. A schema can have one such field.
+    /// into the segment's synonym component. A schema can have one such field, and it must be
+    /// indexed. An invalid rule makes the add fail and the segment writer unusable, so check each
+    /// rule first with [`SynonymRule::check`](crate::synonyms::SynonymRule::check).
     #[must_use]
     pub fn set_synonym_rules(mut self) -> TextOptions {
         self.synonym_rules = true;

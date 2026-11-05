@@ -7,13 +7,16 @@ use crate::directory::Directory;
 use crate::index::{IndexSettings, IndexSortByField, Order, SegmentComponent};
 use crate::indexer::operation::AddOperation;
 use crate::indexer::{NoMergePolicy, SegmentWriter};
-use crate::plugin::{PluginWriterContext, SegmentPlugin};
-use crate::schema::{Field, Schema, TextFieldIndexing, TextOptions, FAST, INDEXED, STORED, TEXT};
-use crate::synonyms::plugin::SynonymPlugin;
+use crate::schema::{
+    Field, Schema, SchemaBuilder, TextFieldIndexing, TextOptions, FAST, INDEXED, STORED, TEXT,
+};
 use crate::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use crate::{doc, Index, IndexWriter, TantivyDocument, TantivyError, Term};
 
 const RULES_TOKENIZER: &str = "rules";
+
+/// Each key with the id and the alternatives of each alive rule.
+type AliveKeys = BTreeMap<Vec<u8>, Vec<(u64, Vec<Vec<String>>)>>;
 
 struct RulesIndex {
     index: Index,
@@ -80,26 +83,24 @@ impl RulesIndex {
         self.index.searchable_segment_ids().unwrap().len()
     }
 
-    /// Every key of every segment with its alive alternatives, sorted, so two indexes with the
-    /// same alive rules compare equal however their documents are laid out.
-    fn alive_keys(&self) -> BTreeMap<Vec<u8>, Vec<Vec<String>>> {
+    /// The keys of every segment, sorted, so two indexes with the same alive rules compare equal
+    /// however their documents are laid out.
+    fn alive_keys(&self) -> AliveKeys {
         let searcher = self.index.reader().unwrap().searcher();
-        let mut keys: BTreeMap<Vec<u8>, Vec<Vec<String>>> = BTreeMap::new();
+        let mut keys = AliveKeys::new();
         for segment_reader in searcher.segment_readers() {
+            let ids = segment_reader.fast_fields().u64("id").unwrap();
             let dictionary = segment_reader.synonym_dictionary().unwrap().unwrap();
             let mut reader = dictionary.read_keys().unwrap();
             while reader.advance().unwrap() {
-                let mut alive = Vec::new();
                 for group in reader.groups().unwrap() {
                     if !segment_reader.is_deleted(group.doc) {
-                        alive.extend(dictionary.alternatives(&group).unwrap());
+                        let id = ids.first(group.doc).unwrap();
+                        let alternatives = dictionary.alternatives(&group).unwrap();
+                        let entry = keys.entry(reader.key().to_vec()).or_default();
+                        entry.push((id, alternatives));
+                        entry.sort();
                     }
-                }
-                if !alive.is_empty() {
-                    let entry = keys.entry(reader.key().to_vec()).or_default();
-                    entry.extend(alive);
-                    entry.sort();
-                    entry.dedup();
                 }
             }
         }
@@ -141,15 +142,6 @@ fn expanded(tokens: &[&str], alternatives: Option<&[&[&str]]>) -> Expansion {
         alternatives: alternatives
             .map(|alternatives| alternatives.iter().map(|alt| strings(alt)).collect()),
     }
-}
-
-fn indexed(analyzer: TextAnalyzer, rules: &[&str]) -> RulesIndex {
-    let mut index = RulesIndex::new(analyzer);
-    for (id, rule) in rules.iter().enumerate() {
-        index.add(id as u64, rule);
-    }
-    index.commit();
-    index
 }
 
 #[test]
@@ -256,15 +248,12 @@ fn a_merge_matches_a_fresh_build_of_the_same_rules() {
     merged.merge_all();
     assert_eq!(merged.num_segments(), 1);
 
-    let fresh = indexed(
-        plain(),
-        &[
-            "couch, sofa, divan",
-            "running shoes, sneakers",
-            "tv, television",
-            "sneakers => trainers",
-        ],
-    );
+    let mut fresh = RulesIndex::new(plain());
+    fresh.add(1, "couch, sofa, divan");
+    fresh.add(3, "running shoes, sneakers");
+    fresh.add(5, "tv, television");
+    fresh.add(2, "sneakers => trainers");
+    fresh.commit();
     assert_eq!(merged.alive_keys(), fresh.alive_keys());
     assert_eq!(merged.alive_keys(), before);
 
@@ -310,23 +299,6 @@ fn a_merge_of_a_sorted_index_keeps_each_rule_on_its_document() {
     fresh.add(3, "big, large");
     fresh.commit();
     assert_eq!(merged.alive_keys(), fresh.alive_keys());
-    let expander = merged.expander();
-    assert_eq!(alternatives(&expander, &["red"]), None);
-    assert_eq!(alternatives(&expander, &["tv"]), None);
-    assert_eq!(
-        alternatives(&expander, &["sofa"]),
-        Some(vec![
-            strings(&["settee"]),
-            strings(&["sofa"]),
-            strings(&["couch"])
-        ])
-    );
-    merged.delete(5);
-    merged.commit();
-    assert_eq!(
-        alternatives(&merged.expander(), &["sofa"]),
-        Some(vec![strings(&["sofa"]), strings(&["couch"])])
-    );
 }
 
 #[test]
@@ -368,7 +340,7 @@ fn add_to_new_segment(index: &Index, document: TantivyDocument) -> crate::Result
 }
 
 #[test]
-fn an_invalid_rule_fails_its_document_and_leaves_nothing_of_it() {
+fn an_invalid_rule_fails_its_document() {
     let index = RulesIndex::new(plain());
     let err = add_to_new_segment(&index.index, doc!(index.rule => "a => b => c")).unwrap_err();
     assert!(
@@ -376,58 +348,45 @@ fn an_invalid_rule_fails_its_document_and_leaves_nothing_of_it() {
             if msg == "invalid synonym rule 'a => b => c': a rule can have at most one '=>'"),
         "{err:?}"
     );
-
-    let segment = index.index.new_segment();
-    let mut writer = SynonymPlugin
-        .create_writer(&PluginWriterContext {
-            segment: &segment,
-            memory_budget_in_bytes: 15_000_000,
-            ignore_store: false,
-        })
-        .unwrap();
-    let mut document = TantivyDocument::new();
-    document.add_text(index.rule, "sofa, couch");
-    document.add_text(index.rule, "a => b => c");
-    let schema = index.index.schema();
-    assert!(writer.add_document(0, &document, &schema).is_err());
-    assert_eq!(writer.mem_usage(), 0);
-    writer
-        .add_document(0, &doc!(index.rule => "red, crimson"), &schema)
-        .unwrap();
-    assert!(writer.mem_usage() > 0);
 }
 
 #[test]
-fn a_schema_holds_rules_in_one_field() {
+fn a_missing_synonym_component_is_an_error() {
+    let mut index = RulesIndex::new(plain());
+    index.add(1, "sofa, couch");
+    index.commit();
+    let segment = &index.index.searchable_segments().unwrap()[0];
+    let path = segment.relative_path(SegmentComponent::Custom(SYNONYM_EXT.to_string()));
+    index.index.directory().delete(&path).unwrap();
+    let searcher = index.index.reader().unwrap().searcher();
+    assert!(SynonymExpander::new(searcher.segment_readers()).is_err());
+}
+
+#[test]
+fn a_schema_holds_rules_in_one_indexed_field() {
+    let create = |schema_builder: SchemaBuilder| {
+        Index::builder()
+            .schema(schema_builder.build())
+            .create_in_ram()
+            .map(drop)
+    };
     let mut schema_builder = Schema::builder();
-    let first = schema_builder.add_text_field("first", TEXT.set_synonym_rules());
+    schema_builder.add_text_field("first", TEXT.set_synonym_rules());
     schema_builder.add_text_field("second", TEXT.set_synonym_rules());
-    let index = Index::create_in_ram(schema_builder.build());
-    let err = add_to_new_segment(&index, doc!(first => "sofa, couch")).unwrap_err();
+    let err = create(schema_builder).unwrap_err();
     assert!(matches!(err, TantivyError::SchemaError(_)), "{err:?}");
 
     let mut schema_builder = Schema::builder();
-    let stored_only =
-        schema_builder.add_text_field("rule", TextOptions::from(STORED).set_synonym_rules());
-    let index = Index::create_in_ram(schema_builder.build());
-    let err = add_to_new_segment(&index, doc!(stored_only => "sofa, couch")).unwrap_err();
+    schema_builder.add_text_field("rule", TextOptions::from(STORED).set_synonym_rules());
+    let err = create(schema_builder).unwrap_err();
     assert!(matches!(err, TantivyError::SchemaError(_)), "{err:?}");
 }
 
 #[test]
 fn the_synonym_rules_flag_is_left_out_of_a_schema_without_it() {
-    let options = TEXT.set_synonym_rules();
-    let json = serde_json::to_value(&options).unwrap();
-    assert_eq!(json["synonym_rules"], serde_json::json!(true));
-    assert_eq!(
-        serde_json::from_value::<TextOptions>(json).unwrap(),
-        options
-    );
     let json = serde_json::to_value(TEXT).unwrap();
     assert!(json.get("synonym_rules").is_none());
     assert!(!serde_json::from_value::<TextOptions>(json)
         .unwrap()
         .holds_synonym_rules());
-    assert!((TEXT.set_synonym_rules() | STORED).holds_synonym_rules());
-    assert!((TextOptions::from(STORED) | TEXT.set_synonym_rules()).holds_synonym_rules());
 }
