@@ -4,7 +4,8 @@
 //! Document scoring uses write-time cosine normalization. Routing also handles unnormalized
 //! centroids and shares the query's cached norm across every level and segment.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use quant::cascade::{prepare_split_query_with_plan, PreparedSplitQuery, QueryRotationPlan};
 
@@ -18,6 +19,8 @@ use crate::TantivyError;
 
 // --- Query ---
 
+type RouterQueryCell = Arc<OnceLock<Arc<QuantizedVectorQuery>>>;
+
 /// Shared query values, norms, and cosine normalization, prepared once per search.
 pub(crate) struct VectorQuery<T: VectorElement> {
     metric: Metric,
@@ -27,6 +30,9 @@ pub(crate) struct VectorQuery<T: VectorElement> {
     routing_norm: f32,
     estimate_norm: f32,
     kind: QueryKind,
+    /// Router preparation is shared by every segment and routing invocation.
+    /// Dimension and metric belong to this query; version-1 encodings vary by seed.
+    router_queries: Mutex<HashMap<u64, RouterQueryCell>>,
 }
 
 /// Metric-specific per-query state.
@@ -88,7 +94,19 @@ impl<T: VectorElement> VectorQuery<T> {
             estimate_norm,
             kind,
             raw,
+            router_queries: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Prepares the router's sign query once per rotation seed, across threads.
+    /// Release the map lock before rotating; each encoding has its own initialization cell.
+    pub(crate) fn quantized_router_query(
+        &self,
+        seed: u64,
+        rotation: &QueryRotationPlan,
+    ) -> Arc<QuantizedVectorQuery> {
+        let cell = Arc::clone(self.router_queries.lock().unwrap().entry(seed).or_default());
+        Arc::clone(cell.get_or_init(|| Arc::new(QuantizedVectorQuery::for_sign(self, rotation))))
     }
 
     /// Similarity to one stored row under the metric.
@@ -312,6 +330,70 @@ mod tests {
     use crate::schema::{Metric, VectorOptions};
     use crate::vector::distance::{norm_squared, norm_squared_wide};
     use crate::vector::{VectorQuantizationConfig, VectorQuantizationLayer};
+
+    #[test]
+    fn router_queries_are_lazy_and_shared_across_threads_by_seed() {
+        use quant::cascade::{LayerKind, LayerSpec, QueryRotationPlan, Rotation};
+
+        let query = VectorQuery::new(Metric::Cosine, Arc::new(vec![3.0, 4.0, 0.0, 0.0]));
+        let plans: Vec<_> = [17, 23]
+            .into_iter()
+            .map(|seed| {
+                (
+                    seed,
+                    QueryRotationPlan::new(
+                        4,
+                        &[LayerSpec {
+                            kind: LayerKind::Sign,
+                            bits: 1,
+                            rotation: Rotation::SeededFhtChaCha8 { seed },
+                        }],
+                    ),
+                )
+            })
+            .collect();
+        assert!(query.router_queries.lock().unwrap().is_empty());
+        let row: Vec<_> = [0.6_f32, 0.8, 0.0, 0.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        assert_eq!(query.score_row(&row).score(), 1.0);
+        assert!(
+            query.router_queries.lock().unwrap().is_empty(),
+            "raw scoring must not prepare router codes"
+        );
+
+        let barrier = std::sync::Barrier::new(8);
+        let prepared = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let query = &query;
+                    let plans = &plans;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let (seed, plan) = &plans[i % plans.len()];
+                        (*seed, query.quantized_router_query(*seed, plan))
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(query.router_queries.lock().unwrap().len(), 2);
+        for (seed, plan) in &plans {
+            let cached = query.quantized_router_query(*seed, plan);
+            for (_, prepared) in prepared.iter().filter(|(key, _)| key == seed) {
+                assert!(Arc::ptr_eq(prepared, &cached));
+            }
+            // Routing uses the original query, independently of document cosine normalization.
+            assert_eq!(cached.norm_squared, 25.0);
+            assert_eq!(cached.norm, 5.0);
+        }
+        assert!(!Arc::ptr_eq(&prepared[0].1, &prepared[1].1));
+    }
 
     #[test]
     fn cosine_normalization_is_shared_across_encodings() {

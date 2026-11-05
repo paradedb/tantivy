@@ -135,7 +135,7 @@ mod tests {
     use crate::directory::FileHandle;
     use crate::vector::clustering::{IvfCentroids, IvfMatrix};
     use crate::vector::router::candidate::Candidate;
-    use crate::vector::router::scoring::{score_initial, ScoringQuery};
+    use crate::vector::router::scoring::score_initial;
     use crate::vector::router::search::{
         self, rerank_exact, OutputPrecision, ScoreBuffer, SearchPolicy, TopCandidates,
     };
@@ -210,8 +210,7 @@ mod tests {
                 root_header..root_header + 4,
             ]
         );
-        let base = VectorQuery::new(Metric::L2, Arc::new(vec![0.15; dim]));
-        let query = ScoringQuery::new(&base);
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.15; dim]));
         let mut actual = ScoreBuffer::default();
         let mut expected = ScoreBuffer::default();
         reads.lock().unwrap().clear();
@@ -295,7 +294,7 @@ mod tests {
         // Exercise flat composition internally without a production search flag.
         let (flat, stats) = search::rank_vectors(
             &opened.level.vectors,
-            &ScoringQuery::new(&query),
+            &query,
             params.k,
             SearchPolicy {
                 aps: false,
@@ -763,7 +762,7 @@ mod tests {
             for (query, truth) in queries.iter().zip(&truth) {
                 let (hits, stats) = search::search(
                     &index,
-                    &ScoringQuery::new(query),
+                    query,
                     k,
                     SearchPolicy {
                         aps,

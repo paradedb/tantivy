@@ -963,7 +963,7 @@ where S: VectorArena<Elem = f32>
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
         crate::vector::router::search::search(
             self,
-            &crate::vector::router::scoring::ScoringQuery::new(query),
+            query,
             k,
             crate::vector::router::search::SearchPolicy {
                 aps: true,

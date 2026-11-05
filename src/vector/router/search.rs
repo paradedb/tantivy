@@ -7,7 +7,6 @@ use super::arena::VectorArena;
 use super::candidate::Candidate;
 #[cfg(test)]
 use super::scoring::score_initial;
-use super::scoring::ScoringQuery;
 use super::source::VectorSource;
 use super::stacked::levels::{ClusterId, StackedIvf, StackedSearchStats};
 use crate::vector::distance::Similarity;
@@ -73,7 +72,7 @@ fn capacity<S: VectorSource>(
 #[cfg(test)]
 fn finish<S: VectorSource, T: VectorElement>(
     source: &S,
-    query: &ScoringQuery<'_, T>,
+    query: &VectorQuery<T>,
     candidates: TopCandidates<ClusterId>,
     k: usize,
     output: OutputPrecision,
@@ -84,7 +83,7 @@ fn finish<S: VectorSource, T: VectorElement>(
         let retained = candidates.into_unordered();
         stats.leaf_exact_scored = retained.len();
         stats.members_scored += retained.len();
-        rerank_exact(raw, query.query, &retained, k)
+        rerank_exact(raw, query, &retained, k)
     } else {
         candidates.into_sorted()
     }
@@ -95,7 +94,7 @@ fn finish<S: VectorSource, T: VectorElement>(
 #[cfg(test)]
 pub(crate) fn rank_vectors<S: VectorSource, T: VectorElement>(
     source: &S,
-    query: &ScoringQuery<'_, T>,
+    query: &VectorQuery<T>,
     k: usize,
     policy: SearchPolicy,
     output: OutputPrecision,
@@ -112,7 +111,7 @@ pub(crate) fn rank_vectors<S: VectorSource, T: VectorElement>(
     let approximate = score_initial(
         source,
         query,
-        0..source.num_vectors(query.query.widened().len()),
+        0..source.num_vectors(query.widened().len()),
         &mut buffer,
     );
     let scored = buffer.candidates.len();
@@ -124,13 +123,8 @@ pub(crate) fn rank_vectors<S: VectorSource, T: VectorElement>(
     } else {
         stats.leaf_exact_scored = scored;
     }
-    let mut retained = TopCandidates::new(capacity(
-        source,
-        query.query.widened().len(),
-        k,
-        output,
-        policy,
-    ));
+    let mut retained =
+        TopCandidates::new(capacity(source, query.widened().len(), k, output, policy));
     for candidate in buffer.candidates {
         retained.offer(candidate);
     }
@@ -143,7 +137,7 @@ pub(crate) fn rank_vectors<S: VectorSource, T: VectorElement>(
 #[cfg(test)]
 pub(crate) fn probe_clusters<S: VectorSource, T: VectorElement>(
     level: &StackedIvf<S>,
-    query: &ScoringQuery<'_, T>,
+    query: &VectorQuery<T>,
     lists: Vec<Candidate<ClusterId>>,
     capacity: usize,
     aps: bool,
@@ -186,7 +180,7 @@ pub(crate) fn probe_clusters<S: VectorSource, T: VectorElement>(
 /// Single-segment entry point into the same layer walk used by global routing.
 pub(crate) fn search<S: VectorSource, T: VectorElement>(
     level: &StackedIvf<S>,
-    query: &ScoringQuery<'_, T>,
+    query: &VectorQuery<T>,
     k: usize,
     policy: SearchPolicy,
     output: OutputPrecision,
@@ -295,7 +289,6 @@ pub(crate) fn rank<S: VectorSource, T: VectorElement>(
     if k == 0 {
         return (Vec::new(), StackedSearchStats::default());
     }
-    let context = ScoringQuery::new(query);
     let policy = SearchPolicy {
         aps: params.aps,
         rerank_factor: params.rerank_factor,
@@ -305,7 +298,7 @@ pub(crate) fn rank<S: VectorSource, T: VectorElement>(
             super::stacked::levels::PARENT_NPROBE_FRACTION
         },
     };
-    search(level, &context, k, policy, OutputPrecision::Exact)
+    search(level, query, k, policy, OutputPrecision::Exact)
 }
 
 /// Exact reads are grouped into contiguous selected runs. The heap stores
@@ -369,8 +362,7 @@ mod tests {
     #[test]
     fn retention_does_not_change_list_request_and_aps_waits_for_full_heap() {
         let level = lists(None);
-        let base = VectorQuery::new(Metric::L2, Arc::new(vec![0.0]));
-        let query = ScoringQuery::new(&base);
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.0]));
         let policy = SearchPolicy {
             aps: false,
             min_fraction: 0.25,
@@ -401,8 +393,7 @@ mod tests {
     #[test]
     fn widening_selection_recovers_a_misranked_list_without_growing_retention() {
         let level = lists(Some(11));
-        let base = VectorQuery::new(Metric::L2, Arc::new(vec![0.0]));
-        let query = ScoringQuery::new(&base);
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.0]));
         let policy = SearchPolicy {
             aps: false,
             min_fraction: 0.25,
@@ -463,8 +454,7 @@ mod tests {
             centroids: middle,
             vectors: encoded(raw_members.clone())?,
         };
-        let base = VectorQuery::new(Metric::L2, Arc::new(vec![0.8; dim]));
-        let query = ScoringQuery::new(&base);
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.8; dim]));
         #[cfg(debug_assertions)]
         quant::rotation::debug_reset_apply_count();
         let policy = SearchPolicy {
@@ -480,7 +470,7 @@ mod tests {
             .enumerate()
             .map(|(i, raw)| Candidate {
                 node: ClusterId::from(i),
-                sim: Metric::L2.similarity(base.widened(), raw),
+                sim: Metric::L2.similarity(query.widened(), raw),
             })
             .collect();
         expected.sort_unstable_by(|a, b| b.cmp(a));

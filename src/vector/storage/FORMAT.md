@@ -595,8 +595,9 @@ them. Internal router raw vectors are not required by this final-rerank-only
 policy. Opening validates topology, counts, framing, metric, and dimension.
 Code padding and sidecars are checked as their selected rows are consumed.
 All encoded banks share one zero-origin rotation context, and its query is
-prepared lazily once per persisted seed during a routing invocation. Raw posting-list centroid rows
-stay file-backed and are fetched only for the final retained candidates.
+prepared lazily once per query and persisted rotation seed, shared across routing
+invocations and threads. Raw posting-list centroid rows stay file-backed and are
+fetched only for the final retained candidates.
 
 Query-time list sizing still uses the original `router_k`. The approximate heap
 retains up to `ceil(router_rerank_factor * router_k)` members, capped at the

@@ -1,8 +1,6 @@
 //! Precision operations over vector banks. Sources expose data; these functions
 //! prepare queries and score batches without owning retention or stopping.
 
-use std::cell::{Ref, RefCell};
-use std::collections::BTreeMap;
 use std::ops::Range;
 
 use quant::cascade::{LayerKind, LayerSpec, Rotation};
@@ -10,40 +8,18 @@ use quant::cascade::{LayerKind, LayerSpec, Rotation};
 use super::arena::VectorArena;
 use super::candidate::Candidate;
 use super::search::ScoreBuffer;
-use super::source::{EncodingContext, VectorSource};
+use super::source::VectorSource;
 use super::stacked::levels::ClusterId;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
-use crate::vector::search::prepared::{QuantizedVectorQuery, VectorQuery};
+use crate::vector::search::prepared::VectorQuery;
 use crate::vector::VectorElement;
-
-/// One base query, prepared lazily once for each rotation seed used by its segments.
-pub(crate) struct ScoringQuery<'q, T: VectorElement> {
-    pub(crate) query: &'q VectorQuery<T>,
-    encoded: RefCell<BTreeMap<u64, QuantizedVectorQuery>>,
-}
-
-impl<'q, T: VectorElement> ScoringQuery<'q, T> {
-    pub(crate) fn new(query: &'q VectorQuery<T>) -> Self {
-        Self {
-            query,
-            encoded: RefCell::new(BTreeMap::new()),
-        }
-    }
-    fn prepared(&self, encoding: &EncodingContext) -> Ref<'_, QuantizedVectorQuery> {
-        self.encoded
-            .borrow_mut()
-            .entry(encoding.seed)
-            .or_insert_with(|| QuantizedVectorQuery::for_sign(self.query, &encoding.rotation));
-        Ref::map(self.encoded.borrow(), |prepared| &prepared[&encoding.seed])
-    }
-}
 
 /// Produce scores for addressed rows in the source's initial representation.
 /// Returns whether those scores are approximate. Identities remain unchanged.
 pub(crate) fn score_initial<S: VectorSource, T: VectorElement>(
     source: &S,
-    query: &ScoringQuery<'_, T>,
+    query: &VectorQuery<T>,
     rows: Range<usize>,
     out: &mut ScoreBuffer<ClusterId>,
 ) -> bool {
@@ -55,7 +31,7 @@ pub(crate) fn score_initial<S: VectorSource, T: VectorElement>(
         return approximate;
     }
     if let Some((codes, context)) = source.compressed() {
-        let prepared = query.prepared(context);
+        let prepared = query.quantized_router_query(context.seed, &context.rotation);
         let batch = codes
             .read(rows.clone())
             .expect("failed to read quantized vector rows");
@@ -63,7 +39,7 @@ pub(crate) fn score_initial<S: VectorSource, T: VectorElement>(
         prepared.codes.score_layer_batch_unscaled(
             0,
             batch.codes(),
-            query.query.widened().len().div_ceil(64) * 8,
+            query.widened().len().div_ceil(64) * 8,
             LayerSpec {
                 kind: LayerKind::Sign,
                 bits: 1,
@@ -87,24 +63,74 @@ pub(crate) fn score_initial<S: VectorSource, T: VectorElement>(
                     }
                 }
             };
-            out.similarities.push(Similarity::new(score));
+            out.candidates.push(Candidate {
+                node: ClusterId::from(rows.start + i),
+                sim: Similarity::new(score),
+            });
         }
     } else {
         source
             .raw()
             .expect("a vector source must have a representation")
             .batch_similarity(
-                query.query.widened(),
-                query.query.metric(),
-                query.query.routing_norm(),
+                query.widened(),
+                query.metric(),
+                query.routing_norm(),
                 rows.clone(),
                 &mut out.similarities,
             );
+        out.candidates
+            .extend(rows.zip(&out.similarities).map(|(row, &sim)| Candidate {
+                node: ClusterId::from(row),
+                sim,
+            }));
     }
-    out.candidates
-        .extend(rows.zip(&out.similarities).map(|(row, &sim)| Candidate {
-            node: ClusterId::from(row),
-            sim,
-        }));
     approximate
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::vector::router::source::{EncodingContext, VectorSet, ROUTER_SEED};
+    use crate::vector::router::stacked::levels::InMemoryStore;
+    use crate::vector::storage::quantized::sign::SignVectors;
+
+    #[test]
+    fn quantized_batches_emit_addressed_candidates_without_similarity_scratch() -> crate::Result<()>
+    {
+        let dim = 8;
+        let values: Vec<f32> = [0.0, 1.0, -2.0, 3.0]
+            .into_iter()
+            .flat_map(|v| vec![v; dim])
+            .collect();
+        let raw = Arc::new(InMemoryStore::new(values.clone(), dim));
+        let context = Arc::new(EncodingContext::new(dim, ROUTER_SEED));
+        let encoded = VectorSet::Encoded {
+            codes: Arc::new(SignVectors::encode(&values, dim, &context.rotation)?),
+            context,
+            raw: Some(raw.clone()),
+        };
+        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+            let query = VectorQuery::new(metric, Arc::new(vec![0.0; dim]));
+            let mut buffer = ScoreBuffer::default();
+            assert!(!score_initial(raw.as_ref(), &query, 0..4, &mut buffer));
+            assert_eq!(buffer.similarities.len(), 4);
+            assert!(score_initial(&encoded, &query, 1..3, &mut buffer));
+            assert!(buffer.similarities.is_empty());
+            let expected: Vec<_> = (1..3)
+                .map(|row| Candidate {
+                    node: ClusterId::from(row),
+                    sim: metric.similarity(query.widened(), &values[row * dim..][..dim]),
+                })
+                .collect();
+            assert_eq!(buffer.candidates, expected);
+            assert!(score_initial(&encoded, &query, 2..2, &mut buffer));
+            assert!(buffer.candidates.is_empty());
+            assert!(buffer.estimates.is_empty());
+            assert!(buffer.similarities.is_empty());
+        }
+        Ok(())
+    }
 }

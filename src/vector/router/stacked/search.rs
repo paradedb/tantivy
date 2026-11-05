@@ -1,11 +1,12 @@
 use super::levels::{ClusterId, StackedIvf, StackedSearchStats};
 use crate::vector::router::arena::VectorArena;
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::scoring::{score_initial, ScoringQuery};
+use crate::vector::router::scoring::score_initial;
 use crate::vector::router::search::{
     lists_to_open, rerank_exact, OutputPrecision, ScoreBuffer, SearchPolicy, TopCandidates,
 };
 use crate::vector::router::source::VectorSource;
+use crate::vector::search::prepared::VectorQuery;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
 use crate::vector::{VectorElement, VectorStage};
 
@@ -92,7 +93,7 @@ impl<S: VectorSource> RoutingLayer<'_, S> {
 
     fn score_centroids<T: VectorElement>(
         &self,
-        query: &ScoringQuery<'_, T>,
+        query: &VectorQuery<T>,
         out: &mut ScoreBuffer<ClusterId>,
     ) -> bool {
         match self {
@@ -100,10 +101,10 @@ impl<S: VectorSource> RoutingLayer<'_, S> {
             Self::Partition { centroid, .. } => {
                 out.candidates.clear();
                 out.candidates.push(Candidate {
-                    sim: query.query.metric().similarity_with_query_norm(
-                        query.query.widened(),
+                    sim: query.metric().similarity_with_query_norm(
+                        query.widened(),
                         centroid,
-                        query.query.routing_norm(),
+                        query.routing_norm(),
                     ),
                     node: ClusterId(0),
                 });
@@ -115,7 +116,7 @@ impl<S: VectorSource> RoutingLayer<'_, S> {
     fn score_members<T: VectorElement>(
         &self,
         list: u32,
-        query: &ScoringQuery<'_, T>,
+        query: &VectorQuery<T>,
         out: &mut ScoreBuffer<ClusterId>,
     ) -> bool {
         let rows = match self {
@@ -196,7 +197,7 @@ impl<'a, S: VectorSource> StackedRouting<'a, S> {
     /// Banks without raw rows keep their estimates until the final routing level.
     fn refine<T: VectorElement>(
         &mut self,
-        query: &ScoringQuery<'_, T>,
+        query: &VectorQuery<T>,
         retained: TopCandidates<(usize, u32)>,
         k: usize,
         sources: &[Option<&S>],
@@ -222,9 +223,7 @@ impl<'a, S: VectorSource> StackedRouting<'a, S> {
                         node: ClusterId(c.node.1),
                     })
                     .collect();
-                let exact = self.measure(segment, || {
-                    rerank_exact(raw, query.query, &rows, rows.len())
-                });
+                let exact = self.measure(segment, || rerank_exact(raw, query, &rows, rows.len()));
                 stats[segment].members_scored += rows.len();
                 if leaf {
                     stats[segment].leaf_exact_scored += rows.len();
@@ -248,7 +247,7 @@ impl<'a, S: VectorSource> StackedRouting<'a, S> {
     /// Descends shared layers, retaining one population across segments before refinement.
     pub(crate) fn search<T: VectorElement>(
         mut self,
-        query: &ScoringQuery<'_, T>,
+        query: &VectorQuery<T>,
         k: usize,
         policy: SearchPolicy,
         precision: OutputPrecision,
@@ -269,8 +268,7 @@ impl<'a, S: VectorSource> StackedRouting<'a, S> {
                     .is_some_and(|source| source.compressed().is_some())
         });
         if has_compressed
-            && (!query.query.routing_norm().is_finite()
-                || query.query.widened().iter().any(|x| !x.is_finite()))
+            && (!query.routing_norm().is_finite() || query.widened().iter().any(|x| !x.is_finite()))
         {
             let mut best = TopCandidates::new(k);
             for (segment, stack) in levels.iter().enumerate() {
@@ -281,13 +279,13 @@ impl<'a, S: VectorSource> StackedRouting<'a, S> {
                     .members()
                     .raw()
                     .expect("final routing requires raw rows");
-                let count = VectorArena::num_vectors(raw, query.query.widened().len());
+                let count = VectorArena::num_vectors(raw, query.widened().len());
                 let mut scores = Vec::new();
                 self.measure(segment, || {
                     raw.batch_similarity(
-                        query.query.widened(),
-                        query.query.metric(),
-                        query.query.routing_norm(),
+                        query.widened(),
+                        query.metric(),
+                        query.routing_norm(),
                         0..count,
                         &mut scores,
                     )

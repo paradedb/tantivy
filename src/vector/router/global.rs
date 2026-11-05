@@ -1,5 +1,4 @@
 use super::candidate::Candidate;
-use super::scoring::ScoringQuery;
 use super::search::{OutputPrecision, SearchPolicy};
 use super::stacked::search::{AllScored, StackedRouting};
 use super::{OpenedRouter, Router, RouterMetrics, RoutingParams};
@@ -64,7 +63,7 @@ impl GlobalRanking {
             on_segment,
         }
         .search(
-            &ScoringQuery::new(query),
+            query,
             params.k.max(1),
             SearchPolicy {
                 aps: params.aps,
@@ -277,7 +276,7 @@ mod tests {
                 for k in [0, 1, 2, 4, 16] {
                     let (segment, stats) = super::super::search::search(
                         &index.level,
-                        &ScoringQuery::new(&prepared),
+                        &prepared,
                         k,
                         SearchPolicy {
                             aps: true,
@@ -295,7 +294,7 @@ mod tests {
                         on_segment: &mut |segment| visited.push(segment),
                     }
                     .search(
-                        &ScoringQuery::new(&prepared),
+                        &prepared,
                         k,
                         SearchPolicy {
                             aps: true,
@@ -324,7 +323,7 @@ mod tests {
                         on_segment: &mut |_| {},
                     }
                     .search(
-                        &ScoringQuery::new(&prepared),
+                        &prepared,
                         k,
                         SearchPolicy {
                             aps: true,
@@ -498,6 +497,8 @@ mod tests {
             for nested in [false, true] {
                 let (router, _, _) = open_represented_router(metric, nested, Some(ROUTER_SEED))?;
                 let query = VectorQuery::new(metric, Arc::new(vec![0.3; 8]));
+                #[cfg(debug_assertions)]
+                quant::rotation::debug_reset_apply_count();
                 for k in [1, 3, usize::MAX] {
                     for factor in [1.0, 1.25, 2.0] {
                         let params = RoutingParams {
@@ -526,6 +527,12 @@ mod tests {
                         assert_eq!(serde_json::to_value(global.metrics[1]).unwrap(), metrics);
                     }
                 }
+                #[cfg(debug_assertions)]
+                assert_eq!(
+                    quant::rotation::debug_apply_count(),
+                    1,
+                    "all segment and global rankings must reuse the shared query preparation"
+                );
             }
         }
         Ok(())
