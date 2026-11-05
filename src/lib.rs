@@ -203,6 +203,7 @@ pub mod query;
 pub mod schema;
 pub mod space_usage;
 pub mod store;
+pub mod synonyms;
 pub mod termdict;
 pub mod vector;
 
