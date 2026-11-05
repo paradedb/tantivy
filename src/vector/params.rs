@@ -17,8 +17,12 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 /// provisional pending real-data benchmarking.
 #[derive(Clone, Debug)]
 pub struct ProbeParams {
-    /// Work ceiling as a fraction of each segment's capacity. Default 0.01.
+    /// Probe fraction before selectivity normalization. Default 0.01.
     pub max_probe_fraction: f32,
+    /// Intercept of the clipped filter-cost exponent. Default 0.
+    pub selectivity_exponent: f64,
+    /// Non-positive slope of the exponent against log probe fraction. Default 0.
+    pub selectivity_slope: f64,
     /// Floor on the resolved budget, in work units, applied before the capacity cap. Default 0.
     pub min_probe_clusters: usize,
     /// Lets a quantized segment score a cluster's rows exactly before the exact phase when that
@@ -69,6 +73,8 @@ impl Default for ProbeParams {
     fn default() -> Self {
         Self {
             max_probe_fraction: 0.01,
+            selectivity_exponent: 0.0,
+            selectivity_slope: 0.0,
             min_probe_clusters: 0,
             exact_plan: true,
             located: LocatedPath::Auto,
@@ -77,7 +83,25 @@ impl Default for ProbeParams {
     }
 }
 
+fn filtered_cluster_cost(open_share: f64, match_fraction: f64) -> f64 {
+    (open_share + (1.0 - open_share) * match_fraction.clamp(0.0, 1.0)).max(f64::MIN_POSITIVE)
+}
+
 impl ProbeParams {
+    pub(crate) fn normalized_budget(&self, budget: f64, open_share: f64, matches: f64) -> f64 {
+        if self.max_probe_fraction >= 1.0
+            || (self.selectivity_exponent == 0.0 && self.selectivity_slope == 0.0)
+        {
+            return budget;
+        }
+        let exponent = (self.selectivity_exponent
+            + self.selectivity_slope * f64::from(self.max_probe_fraction).ln())
+        .clamp(0.0, 2.0);
+        (budget * filtered_cluster_cost(open_share, matches).powf(exponent))
+            .max(self.min_probe_clusters as f64)
+            .min(budget)
+    }
+
     /// The number of clusters the stacked router is asked to rank for a
     /// segment whose resolved work budget is `budget` units.
     ///
@@ -100,9 +124,7 @@ impl ProbeParams {
         match_fraction: f64,
         clusters_in_segment: usize,
     ) -> usize {
-        let match_fraction = match_fraction.clamp(0.0, 1.0);
-        let cluster_cost =
-            (open_share + (1.0 - open_share) * match_fraction).max(f64::MIN_POSITIVE);
+        let cluster_cost = filtered_cluster_cost(open_share, match_fraction);
         let clusters = (budget.max(0.0) / cluster_cost).ceil();
         (clusters as usize)
             .max(self.min_probe_clusters)
@@ -134,6 +156,16 @@ impl ProbeParams {
                 "fixed_probe_cost_rows must be finite and greater than 0".to_string(),
             ));
         }
+        for (name, value, low, high) in [
+            ("selectivity_exponent", self.selectivity_exponent, -2.0, 2.0),
+            ("selectivity_slope", self.selectivity_slope, -1.0, 0.0),
+        ] {
+            if !(low..=high).contains(&value) {
+                return Err(crate::TantivyError::InvalidArgument(format!(
+                    "{name} must be between {low} and {high}"
+                )));
+            }
+        }
         let n_avg = native_docs_in_segment as f64 / clusters_in_segment.max(1) as f64;
         // The unit identity (1 unit = x + (1 - x); exhaustive scan = C units) holds for any x.
         let x = open_share(self.fixed_probe_cost_rows, n_avg);
@@ -149,6 +181,51 @@ impl ProbeParams {
 #[cfg(test)]
 mod tests {
     use super::ProbeParams;
+
+    #[test]
+    fn normalized_budget_preserves_controls_and_reduces_filtered_budget() {
+        let mut params = ProbeParams::default();
+        assert_eq!(params.normalized_budget(20.0, 0.2, 0.1), 20.0);
+        params.selectivity_exponent = 1.0;
+        assert_eq!(params.normalized_budget(20.0, 0.2, 1.0), 20.0);
+        assert!((params.normalized_budget(20.0, 0.2, 0.1) - 5.6).abs() < 1e-9);
+        params.min_probe_clusters = 8;
+        assert_eq!(params.normalized_budget(20.0, 0.2, 0.1), 8.0);
+        params.max_probe_fraction = 1.0;
+        assert_eq!(params.normalized_budget(20.0, 0.2, 0.1), 20.0);
+        params.selectivity_exponent = f64::NAN;
+        assert!(params.resolved_work_budget(100, 1000).is_err());
+    }
+
+    #[test]
+    fn normalized_budget_is_monotone_and_preserves_unfiltered_capacity() {
+        for (intercept, slope) in [(-0.86, -0.73), (0.8, 0.0), (-2.0, -1.0), (2.0, -1.0)] {
+            let mut params = ProbeParams {
+                selectivity_exponent: intercept,
+                selectivity_slope: slope,
+                ..Default::default()
+            };
+            for density in [0.0, 0.0001, 0.001, 0.01, 0.1, 0.5, 1.0] {
+                let mut previous = 0.0;
+                for step in 1..=1000 {
+                    params.max_probe_fraction = step as f32 / 1000.0;
+                    let budget = f64::from(params.max_probe_fraction) * 100.0;
+                    let normalized = params.normalized_budget(budget, 0.004, density);
+                    assert!(normalized >= previous && normalized <= budget);
+                    assert_eq!(params.normalized_budget(budget, 0.004, 1.0), budget);
+                    previous = normalized;
+                }
+                assert_eq!(previous, 100.0);
+            }
+        }
+        for slope in [f64::NAN, f64::INFINITY, -1.01, 0.01] {
+            let params = ProbeParams {
+                selectivity_slope: slope,
+                ..Default::default()
+            };
+            assert!(params.resolved_work_budget(100, 1000).is_err());
+        }
+    }
 
     /// Capacity is the cluster count, exactly, whatever the granularity:
     /// `units_seg = C*x + (1 - x)*N/n_avg == C` for every x the open
