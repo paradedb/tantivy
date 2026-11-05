@@ -1,0 +1,352 @@
+use std::fmt;
+
+use downcast_rs::impl_downcast;
+
+use super::bm25::Bm25StatisticsProvider;
+use super::Weight;
+use crate::core::searcher::Searcher;
+use crate::query::Explanation;
+use crate::schema::{Field, Schema};
+use crate::{DocAddress, SegmentReader, Term};
+
+/// Pruning strategy for scored term disjunctions collected through
+/// [`Weight::for_each_pruning`], including score-ordered top-k searches.
+///
+/// Single-term queries, intersections, unsupported score combiners, and cursor-based
+/// [`Weight::pruning_scorer`] retain their existing execution paths.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub enum DisjunctionPruning {
+    /// Select the strategy automatically for each segment.
+    #[default]
+    Auto,
+    /// Use Block-WAND for eligible multi-term disjunctions.
+    BlockWand,
+    /// Use Block-Max MaxScore for eligible multi-term disjunctions, bypassing
+    /// the automatic term-count and postings-density cutoffs.
+    BlockMaxScore,
+}
+
+/// Argument used in `Query::weight(..)`
+#[derive(Copy, Clone)]
+pub enum EnableScoring<'a> {
+    /// Pass this to enable scoring.
+    Enabled {
+        /// The searcher to use during scoring.
+        searcher: &'a Searcher,
+
+        /// A [Bm25StatisticsProvider] used to compute BM25 scores.
+        ///
+        /// Normally this should be the [Searcher], but you can specify a custom
+        /// one to adjust the statistics.
+        statistics_provider: &'a dyn Bm25StatisticsProvider,
+
+        /// Pruning strategy for scored term disjunctions.
+        disjunction_pruning: DisjunctionPruning,
+    },
+    /// Pass this to disable scoring.
+    /// This can improve performance.
+    Disabled {
+        /// Schema is required.
+        schema: &'a Schema,
+        /// Searcher should be provided if available.
+        searcher_opt: Option<&'a Searcher>,
+        /// Whether unscored execution may use posting bitmaps. Defaults to false.
+        bitmap_postings: bool,
+    },
+}
+
+impl<'a> EnableScoring<'a> {
+    /// Create using [Searcher] with scoring enabled.
+    pub fn enabled_from_searcher(searcher: &'a Searcher) -> EnableScoring<'a> {
+        EnableScoring::Enabled {
+            searcher,
+            statistics_provider: searcher,
+            disjunction_pruning: DisjunctionPruning::Auto,
+        }
+    }
+
+    /// Create using a custom [Bm25StatisticsProvider] with scoring enabled.
+    pub fn enabled_from_statistics_provider(
+        statistics_provider: &'a dyn Bm25StatisticsProvider,
+        searcher: &'a Searcher,
+    ) -> EnableScoring<'a> {
+        EnableScoring::Enabled {
+            statistics_provider,
+            searcher,
+            disjunction_pruning: DisjunctionPruning::Auto,
+        }
+    }
+
+    /// Override disjunction pruning for this scoring context. Constructors default
+    /// to [`DisjunctionPruning::Auto`]. Has no effect when scoring is disabled.
+    #[must_use]
+    pub fn with_disjunction_pruning(mut self, pruning: DisjunctionPruning) -> Self {
+        if let Self::Enabled {
+            disjunction_pruning,
+            ..
+        } = &mut self
+        {
+            *disjunction_pruning = pruning;
+        }
+        self
+    }
+
+    /// Returns the requested strategy, or [`DisjunctionPruning::Auto`] if scoring
+    /// is disabled.
+    pub fn disjunction_pruning(&self) -> DisjunctionPruning {
+        match self {
+            Self::Enabled {
+                disjunction_pruning,
+                ..
+            } => *disjunction_pruning,
+            Self::Disabled { .. } => DisjunctionPruning::Auto,
+        }
+    }
+
+    /// Create using [Searcher] with scoring disabled.
+    pub fn disabled_from_searcher(searcher: &'a Searcher) -> EnableScoring<'a> {
+        EnableScoring::Disabled {
+            schema: searcher.schema(),
+            searcher_opt: Some(searcher),
+            bitmap_postings: false,
+        }
+    }
+
+    /// Create using [Schema] with scoring disabled.
+    pub fn disabled_from_schema(schema: &'a Schema) -> EnableScoring<'a> {
+        Self::Disabled {
+            schema,
+            searcher_opt: None,
+            bitmap_postings: false,
+        }
+    }
+
+    /// Opts unscored execution into posting bitmaps, subject to the index setting.
+    #[must_use]
+    pub fn with_bitmap_postings(mut self, enabled: bool) -> Self {
+        if let Self::Disabled {
+            bitmap_postings, ..
+        } = &mut self
+        {
+            *bitmap_postings = enabled;
+        }
+        self
+    }
+
+    /// Returns whether the caller requested posting bitmaps for unscored execution.
+    pub fn bitmap_postings_enabled(&self) -> bool {
+        matches!(
+            self,
+            Self::Disabled {
+                bitmap_postings: true,
+                ..
+            }
+        )
+    }
+
+    /// Returns the searcher if available.
+    pub fn searcher(&self) -> Option<&Searcher> {
+        match self {
+            EnableScoring::Enabled { searcher, .. } => Some(*searcher),
+            EnableScoring::Disabled { searcher_opt, .. } => searcher_opt.to_owned(),
+        }
+    }
+
+    /// Returns the schema.
+    pub fn schema(&self) -> &Schema {
+        match self {
+            EnableScoring::Enabled { searcher, .. } => searcher.schema(),
+            EnableScoring::Disabled { schema, .. } => schema,
+        }
+    }
+
+    /// Returns true if the scoring is enabled.
+    pub fn is_scoring_enabled(&self) -> bool {
+        matches!(self, EnableScoring::Enabled { .. })
+    }
+}
+
+/// The `Query` trait defines a set of documents and a scoring method
+/// for those documents.
+///
+/// The `Query` trait is in charge of defining :
+///
+/// - a set of documents
+/// - a way to score these documents
+///
+/// When performing a [search](Searcher::search), these documents will then
+/// be pushed to a [`Collector`](crate::collector::Collector),
+/// which will in turn be in charge of deciding what to do with them.
+///
+/// Concretely, this scored docset is represented by the
+/// [`Scorer`] trait.
+///
+/// Because our index is actually split into segments, the
+/// query does not actually directly creates [`DocSet`](crate::DocSet) object.
+/// Instead, the query creates a [`Weight`] object for a given searcher.
+///
+/// The weight object, in turn, makes it possible to create
+/// a scorer for a specific [`SegmentReader`].
+///
+/// So to sum it up :
+/// - a `Query` is a recipe to define a set of documents as well the way to score them.
+/// - a [`Weight`] is this recipe tied to a specific [`Searcher`]. It may for instance hold
+///   statistics about the different term of the query. It is created by the query.
+/// - a [`Scorer`] is a cursor over the set of matching documents, for a specific [`SegmentReader`].
+///   It is created by the [`Weight`].
+///
+/// When implementing a new type of `Query`, it is normal to implement a
+/// dedicated `Query`, [`Weight`] and [`Scorer`].
+///
+/// [`Scorer`]: crate::query::Scorer
+/// [`SegmentReader`]: crate::SegmentReader
+pub trait Query: QueryClone + Send + Sync + downcast_rs::Downcast + fmt::Debug {
+    /// Create the weight associated with a query.
+    ///
+    /// If scoring is not required, setting `scoring_enabled` to `false`
+    /// can increase performances.
+    ///
+    /// See [`Weight`].
+    fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>>;
+
+    /// Returns an `Explanation` for the score of the document.
+    fn explain(&self, searcher: &Searcher, doc_address: DocAddress) -> crate::Result<Explanation> {
+        let weight = self.weight(EnableScoring::enabled_from_searcher(searcher))?;
+        let reader = searcher.segment_reader(doc_address.segment_ord);
+        weight.explain(reader, doc_address.doc_id)
+    }
+
+    /// Returns the number of documents matching the query.
+    fn count(&self, searcher: &Searcher) -> crate::Result<usize> {
+        let weight = self
+            .weight(EnableScoring::disabled_from_searcher(searcher).with_bitmap_postings(true))?;
+        let mut result = 0;
+        for reader in searcher.segment_readers() {
+            result += weight.count(reader)? as usize;
+        }
+        Ok(result)
+    }
+
+    /// Extract all of the terms associated with the query and pass them to the
+    /// given closure.
+    ///
+    /// Each term is associated with a boolean indicating whether
+    /// positions are required or not.
+    ///
+    /// Note that there can be multiple instances of any given term
+    /// in a query and deduplication must be handled by the visitor.
+    fn query_terms(
+        &self,
+        _field: Field,
+        _segment_reader: &SegmentReader,
+        _visitor: &mut dyn FnMut(&Term, bool),
+    ) {
+    }
+}
+
+/// Implements `box_clone`.
+pub trait QueryClone {
+    /// Returns a boxed clone of `self`.
+    fn box_clone(&self) -> Box<dyn Query>;
+}
+
+impl<T> QueryClone for T
+where T: 'static + Query + Clone
+{
+    fn box_clone(&self) -> Box<dyn Query> {
+        // If T is Box<dyn Query>, wrapping self.clone() in Box::new would double-box
+        // into Box<Box<dyn Query>>, breaking trait object downcasting and causing
+        // recursive calls. Delegate to the inner query directly instead.
+        if let Some(boxed) = (self as &dyn std::any::Any).downcast_ref::<Box<dyn Query>>() {
+            boxed.as_ref().box_clone()
+        } else {
+            Box::new(self.clone())
+        }
+    }
+}
+
+impl Query for Box<dyn Query> {
+    fn weight(&self, enabled_scoring: EnableScoring) -> crate::Result<Box<dyn Weight>> {
+        self.as_ref().weight(enabled_scoring)
+    }
+
+    fn count(&self, searcher: &Searcher) -> crate::Result<usize> {
+        self.as_ref().count(searcher)
+    }
+
+    fn query_terms(
+        &self,
+        field: Field,
+        segment_reader: &SegmentReader,
+        visitor: &mut dyn FnMut(&Term, bool),
+    ) {
+        self.as_ref().query_terms(field, segment_reader, visitor);
+    }
+}
+
+impl Clone for Box<dyn Query> {
+    fn clone(&self) -> Self {
+        self.as_ref().box_clone()
+    }
+}
+
+impl_downcast!(Query);
+
+#[cfg(test)]
+mod tests {
+    use super::{DisjunctionPruning, EnableScoring, Query};
+    use crate::schema::Schema;
+    use crate::Index;
+
+    #[test]
+    fn test_disjunction_pruning_defaults_and_overrides() -> crate::Result<()> {
+        let index = Index::create_in_ram(Schema::builder().build());
+        let searcher = index.reader()?.searcher();
+        assert_eq!(DisjunctionPruning::default(), DisjunctionPruning::Auto);
+        for scoring in [
+            EnableScoring::enabled_from_searcher(&searcher),
+            EnableScoring::enabled_from_statistics_provider(&searcher, &searcher),
+        ] {
+            assert_eq!(scoring.disjunction_pruning(), DisjunctionPruning::Auto);
+            for pruning in [
+                DisjunctionPruning::BlockWand,
+                DisjunctionPruning::BlockMaxScore,
+            ] {
+                let overridden = scoring.with_disjunction_pruning(pruning);
+                assert!(overridden.is_scoring_enabled());
+                assert_eq!(overridden.disjunction_pruning(), pruning);
+                assert_eq!(scoring.disjunction_pruning(), DisjunctionPruning::Auto);
+                assert_eq!(
+                    overridden
+                        .with_disjunction_pruning(DisjunctionPruning::Auto)
+                        .disjunction_pruning(),
+                    DisjunctionPruning::Auto
+                );
+            }
+        }
+        for scoring in [
+            EnableScoring::disabled_from_searcher(&searcher),
+            EnableScoring::disabled_from_schema(searcher.schema()),
+        ] {
+            let overridden = scoring.with_disjunction_pruning(DisjunctionPruning::BlockMaxScore);
+            assert!(!overridden.is_scoring_enabled());
+            assert_eq!(overridden.disjunction_pruning(), DisjunctionPruning::Auto);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_box_dyn_query_clone_and_downcast() {
+        use crate::query::AllQuery;
+
+        let original: Box<dyn Query> = Box::new(AllQuery);
+        let cloned = original.clone();
+        assert!(cloned.downcast_ref::<AllQuery>().is_some());
+
+        let box_cloned = original.box_clone();
+        assert!(box_cloned.downcast_ref::<AllQuery>().is_some());
+
+        let boxed_box_cloned = box_cloned.box_clone();
+        assert!(boxed_box_cloned.downcast_ref::<AllQuery>().is_some());
+    }
+}

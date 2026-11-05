@@ -1,0 +1,650 @@
+use common::TinySet;
+
+use super::size_hint::estimate_intersection;
+use crate::docset::{DocSet, SeekDangerResult, BLOCK_NUM_TINYBITSETS, TERMINATED};
+use crate::query::term_query::TermScorer;
+use crate::query::{EmptyScorer, Scorer};
+use crate::{DocId, Score};
+
+/// Returns the intersection scorer.
+///
+/// The score associated with the documents is the sum of the
+/// score of the `Scorer`s given in argument.
+///
+/// For better performance, the function uses a
+/// specialized implementation if the two
+/// shortest scorers are `TermScorer`s.
+///
+/// num_docs_segment is the number of documents in the segment. It is used for estimating the
+/// `size_hint` of the intersection.
+pub fn intersect_scorers(
+    mut scorers: Vec<Box<dyn Scorer>>,
+    segment_num_docs: u32,
+) -> Box<dyn Scorer> {
+    if scorers.is_empty() {
+        return Box::new(EmptyScorer);
+    }
+    if scorers.len() == 1 {
+        return scorers.pop().unwrap();
+    }
+    // Order by estimated cost to drive each scorer.
+    scorers.sort_by_key(|scorer| scorer.cost());
+    let doc = go_to_first_doc(&mut scorers[..]);
+    if doc == TERMINATED {
+        return Box::new(EmptyScorer);
+    }
+    // We know that we have at least 2 elements.
+    let left = scorers.remove(0);
+    let right = scorers.remove(0);
+    let all_term_scorers = [&left, &right]
+        .iter()
+        .all(|&scorer| scorer.is::<TermScorer>());
+    if all_term_scorers {
+        return Box::new(Intersection {
+            left: *(left.downcast::<TermScorer>().map_err(|_| ()).unwrap()),
+            right: *(right.downcast::<TermScorer>().map_err(|_| ()).unwrap()),
+            others: scorers,
+            segment_num_docs,
+        });
+    }
+    Box::new(Intersection {
+        left,
+        right,
+        others: scorers,
+        segment_num_docs,
+    })
+}
+
+/// Creates a `DocSet` that iterate through the intersection of two or more `DocSet`s.
+pub struct Intersection<TDocSet: DocSet, TOtherDocSet: DocSet = Box<dyn Scorer>> {
+    left: TDocSet,
+    right: TDocSet,
+    others: Vec<TOtherDocSet>,
+    segment_num_docs: u32,
+}
+
+fn go_to_first_doc<TDocSet: DocSet>(docsets: &mut [TDocSet]) -> DocId {
+    assert!(!docsets.is_empty());
+    let mut candidate = docsets.iter().map(TDocSet::doc).max().unwrap();
+    'outer: loop {
+        for docset in docsets.iter_mut() {
+            let seek_doc = docset.seek(candidate);
+            if seek_doc > candidate {
+                candidate = docset.doc();
+                continue 'outer;
+            }
+        }
+        return candidate;
+    }
+}
+
+impl<TDocSet: DocSet> Intersection<TDocSet, TDocSet> {
+    /// num_docs is the number of documents in the segment.
+    pub(crate) fn new(
+        docsets: Vec<TDocSet>,
+        segment_num_docs: u32,
+    ) -> Intersection<TDocSet, TDocSet> {
+        let mut intersection = Self::new_unpositioned(docsets, segment_num_docs);
+        intersection.seek(intersection.doc());
+        intersection
+    }
+
+    /// Call `seek` or `seek_danger` to align the document sets before using the intersection.
+    pub(crate) fn new_unpositioned(
+        mut docsets: Vec<TDocSet>,
+        segment_num_docs: u32,
+    ) -> Intersection<TDocSet, TDocSet> {
+        let num_docsets = docsets.len();
+        assert!(num_docsets >= 2);
+        docsets.sort_by_key(|docset| docset.cost());
+        let left = docsets.remove(0);
+        let right = docsets.remove(0);
+        Intersection {
+            left,
+            right,
+            others: docsets,
+            segment_num_docs,
+        }
+    }
+
+    pub fn with_two_sets(
+        left: TDocSet,
+        right: TDocSet,
+        num_docs: u32,
+    ) -> Intersection<TDocSet, TDocSet> {
+        let mut docsets = vec![left, right];
+        go_to_first_doc(&mut docsets);
+        let left = docsets.remove(0);
+        let right = docsets.remove(0);
+        Intersection {
+            left,
+            right,
+            others: docsets,
+            segment_num_docs: num_docs,
+        }
+    }
+}
+
+impl<TDocSet: DocSet> Intersection<TDocSet, TDocSet> {
+    /// Returns a participating document set, positioned on the intersection's current document.
+    pub fn docset_specialized(&self, ord: usize) -> &TDocSet {
+        match ord {
+            0 => &self.left,
+            1 => &self.right,
+            n => &self.others[n - 2],
+        }
+    }
+
+    pub fn docset_mut_specialized(&mut self, ord: usize) -> &mut TDocSet {
+        match ord {
+            0 => &mut self.left,
+            1 => &mut self.right,
+            n => &mut self.others[n - 2],
+        }
+    }
+}
+
+impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOtherDocSet> {
+    #[inline]
+    fn advance(&mut self) -> DocId {
+        let (left, right) = (&mut self.left, &mut self.right);
+
+        // Invariant:
+        // - candidate is always <= to the next document in the intersection.
+        // - candidate strictly increases at every occurence of the loop.
+        let mut candidate = left.doc() + 1;
+
+        // Termination: candidate strictly increases.
+        'outer: while candidate < TERMINATED {
+            // As we enter the loop, we should always have candidate < next_doc.
+
+            candidate = left.seek(candidate);
+
+            // Left is positionned on `candidate`.
+            debug_assert_eq!(left.doc(), candidate);
+
+            if let SeekDangerResult::SeekLowerBound(seek_lower_bound) = right.seek_danger(candidate)
+            {
+                debug_assert!(
+                    seek_lower_bound == TERMINATED || seek_lower_bound > candidate,
+                    "seek_lower_bound {seek_lower_bound} must be greater than candidate \
+                     {candidate}"
+                );
+                candidate = seek_lower_bound;
+                continue;
+            }
+
+            // Left and right are positionned on `candidate`.
+            debug_assert_eq!(right.doc(), candidate);
+
+            for other in &mut self.others {
+                if let SeekDangerResult::SeekLowerBound(seek_lower_bound) =
+                    other.seek_danger(candidate)
+                {
+                    // One of the scorer does not match, let's restart at the top of the loop.
+                    debug_assert!(
+                        seek_lower_bound == TERMINATED || seek_lower_bound > candidate,
+                        "seek_lower_bound {seek_lower_bound} must be greater than candidate \
+                         {candidate}"
+                    );
+                    candidate = seek_lower_bound;
+                    continue 'outer;
+                }
+            }
+
+            // At this point all scorers are in a valid state, aligned on the next document in the
+            // intersection.
+            debug_assert!(self.others.iter().all(|docset| docset.doc() == candidate));
+            return candidate;
+        }
+
+        // We make sure our docset is in a valid state.
+        // In particular, we want .doc() to return TERMINATED.
+        left.seek(TERMINATED);
+
+        TERMINATED
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        self.left.seek(target);
+        let mut docsets: Vec<&mut dyn DocSet> = vec![&mut self.left, &mut self.right];
+        for docset in &mut self.others {
+            docsets.push(docset);
+        }
+        let doc = go_to_first_doc(&mut docsets[..]);
+        debug_assert!(docsets.iter().all(|docset| docset.doc() == doc));
+        debug_assert!(doc >= target);
+        doc
+    }
+
+    /// Seeks to the target if necessary and checks if the target is an exact match.
+    ///
+    /// Some implementations may choose to advance past the target if beneficial for performance.
+    /// The return value is `true` if the target is in the docset, and `false` otherwise.
+    fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
+        if let SeekDangerResult::SeekLowerBound(new_target) = self.left.seek_danger(target) {
+            return SeekDangerResult::SeekLowerBound(new_target);
+        }
+        if let SeekDangerResult::SeekLowerBound(new_target) = self.right.seek_danger(target) {
+            return SeekDangerResult::SeekLowerBound(new_target);
+        }
+        for docset in &mut self.others {
+            if let SeekDangerResult::SeekLowerBound(new_target) = docset.seek_danger(target) {
+                return SeekDangerResult::SeekLowerBound(new_target);
+            }
+        }
+        SeekDangerResult::Found
+    }
+
+    #[inline]
+    fn doc(&self) -> DocId {
+        self.left.doc()
+    }
+
+    fn size_hint(&self) -> u32 {
+        estimate_intersection(
+            [self.left.size_hint(), self.right.size_hint()]
+                .into_iter()
+                .chain(self.others.iter().map(DocSet::size_hint)),
+            self.segment_num_docs,
+        )
+    }
+
+    fn cost(&self) -> u64 {
+        // What's the best way to compute the cost of an intersection?
+        // For now we take the cost of the docset driver, which is the first docset.
+        // If there are docsets that are bad at skipping, they should also influence the cost.
+        self.left.cost()
+    }
+
+    fn count_including_deleted(&mut self) -> u32 {
+        const DENSITY_THRESHOLD_INVERSE: u32 = 32;
+        if self
+            .left
+            .size_hint()
+            .saturating_mul(DENSITY_THRESHOLD_INVERSE)
+            < self.segment_num_docs
+        {
+            // Sparse path: if the lead iterator covers less than ~3% of docs,
+            // the block approach wastes time on mostly-empty blocks.
+            self.count_including_deleted_sparse()
+        } else {
+            // Dense approach. We push documents into a block bitset to then
+            // perform count using popcount.
+            self.count_including_deleted_dense()
+        }
+    }
+}
+
+const EMPTY_BLOCK: [TinySet; BLOCK_NUM_TINYBITSETS] = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
+
+/// ANDs `other` into `mask` in-place. Returns `true` if the result is all zeros.
+#[inline]
+pub(crate) fn and_blocks_and_return_is_empty(
+    mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
+    update: &[TinySet; BLOCK_NUM_TINYBITSETS],
+) -> bool {
+    let mut all_empty = true;
+    for (mask_tinyset, update_tinyset) in mask.iter_mut().zip(update.iter()) {
+        *mask_tinyset = mask_tinyset.intersect(*update_tinyset);
+        all_empty &= mask_tinyset.is_empty();
+    }
+    all_empty
+}
+
+impl<TDocSet: DocSet, TOtherDocSet: DocSet> Intersection<TDocSet, TOtherDocSet> {
+    fn count_including_deleted_sparse(&mut self) -> u32 {
+        let mut count = 0u32;
+        let mut doc = self.doc();
+        while doc != TERMINATED {
+            count += 1;
+            doc = self.advance();
+        }
+        count
+    }
+
+    /// Dense block-wise bitmask intersection count.
+    ///
+    /// Fills a 1024-doc window from each iterator, ANDs the bitmasks together,
+    /// and popcounts the result. `fill_bitset_block` handles seeking tails forward
+    /// when they lag behind the current block.
+    fn count_including_deleted_dense(&mut self) -> u32 {
+        let mut count = 0u32;
+        let mut next_base = self.left.doc();
+
+        while next_base < TERMINATED {
+            let base = next_base;
+
+            // Fill lead bitmask.
+            let mut mask = EMPTY_BLOCK;
+            next_base = next_base.max(self.left.fill_bitset_block(base, &mut mask));
+
+            let mut tail_mask = EMPTY_BLOCK;
+            next_base = next_base.max(self.right.fill_bitset_block(base, &mut tail_mask));
+
+            if and_blocks_and_return_is_empty(&mut mask, &tail_mask) {
+                continue;
+            }
+            // AND with each additional tail.
+            for other in &mut self.others {
+                let mut other_mask = EMPTY_BLOCK;
+                next_base = next_base.max(other.fill_bitset_block(base, &mut other_mask));
+                if and_blocks_and_return_is_empty(&mut mask, &other_mask) {
+                    continue;
+                }
+            }
+
+            for tinyset in &mask {
+                count += tinyset.len();
+            }
+        }
+
+        count
+    }
+}
+
+impl<TScorer, TOtherScorer> Scorer for Intersection<TScorer, TOtherScorer>
+where
+    TScorer: Scorer,
+    TOtherScorer: Scorer,
+{
+    #[inline]
+    fn score(&mut self) -> Score {
+        self.left.score()
+            + self.right.score()
+            + self.others.iter_mut().map(Scorer::score).sum::<Score>()
+    }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        let mut sum = self.left.constant_score()? + self.right.constant_score()?;
+        for other in &self.others {
+            sum += other.constant_score()?;
+        }
+        Some(sum)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::Intersection;
+    use crate::collector::Count;
+    use crate::docset::{DocSet, TERMINATED};
+    use crate::postings::tests::test_skip_against_unoptimized;
+    use crate::query::{QueryParser, VecDocSet};
+    use crate::schema::{Schema, TEXT};
+    use crate::Index;
+
+    #[test]
+    fn test_intersection() {
+        {
+            let left = VecDocSet::from(vec![1, 3, 9]);
+            let right = VecDocSet::from(vec![3, 4, 9, 18]);
+            let mut intersection = Intersection::new(vec![left, right], 10);
+            assert_eq!(intersection.doc(), 3);
+            assert_eq!(intersection.advance(), 9);
+            assert_eq!(intersection.doc(), 9);
+            assert_eq!(intersection.advance(), TERMINATED);
+        }
+        {
+            let a = VecDocSet::from(vec![1, 3, 9]);
+            let b = VecDocSet::from(vec![3, 4, 9, 18]);
+            let c = VecDocSet::from(vec![1, 5, 9, 111]);
+            let mut intersection = Intersection::new(vec![a, b, c], 10);
+            assert_eq!(intersection.doc(), 9);
+            assert_eq!(intersection.advance(), TERMINATED);
+        }
+    }
+
+    #[test]
+    fn test_intersection_zero() {
+        let left = VecDocSet::from(vec![0]);
+        let right = VecDocSet::from(vec![0]);
+        let mut intersection = Intersection::new(vec![left, right], 10);
+        assert_eq!(intersection.doc(), 0);
+        assert_eq!(intersection.advance(), TERMINATED);
+    }
+
+    #[test]
+    fn test_intersection_skip() {
+        let left = VecDocSet::from(vec![0, 1, 2, 4]);
+        let right = VecDocSet::from(vec![2, 5]);
+        let mut intersection = Intersection::new(vec![left, right], 10);
+        assert_eq!(intersection.seek(2), 2);
+        assert_eq!(intersection.doc(), 2);
+    }
+
+    #[test]
+    fn test_intersection_skip_against_unoptimized() {
+        test_skip_against_unoptimized(
+            || {
+                let left = VecDocSet::from(vec![4]);
+                let right = VecDocSet::from(vec![2, 5]);
+                Box::new(Intersection::new(vec![left, right], 10))
+            },
+            vec![0, 2, 4, 5, 6],
+        );
+        test_skip_against_unoptimized(
+            || {
+                let mut left = VecDocSet::from(vec![1, 4, 5, 6]);
+                let mut right = VecDocSet::from(vec![2, 5, 10]);
+                left.advance();
+                right.advance();
+                Box::new(Intersection::new(vec![left, right], 10))
+            },
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 10, 11],
+        );
+        test_skip_against_unoptimized(
+            || {
+                Box::new(Intersection::new(
+                    vec![
+                        VecDocSet::from(vec![1, 4, 5, 6]),
+                        VecDocSet::from(vec![1, 2, 5, 6]),
+                        VecDocSet::from(vec![1, 4, 5, 6]),
+                        VecDocSet::from(vec![1, 5, 6]),
+                        VecDocSet::from(vec![2, 4, 5, 7, 8]),
+                    ],
+                    10,
+                ))
+            },
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 10, 11],
+        );
+    }
+
+    #[test]
+    fn test_intersection_empty() {
+        let a = VecDocSet::from(vec![1, 3]);
+        let b = VecDocSet::from(vec![1, 4]);
+        let c = VecDocSet::from(vec![3, 9]);
+        let intersection = Intersection::new(vec![a, b, c], 10);
+        assert_eq!(intersection.doc(), TERMINATED);
+    }
+
+    #[test]
+    fn test_intersection_abc() {
+        let a = VecDocSet::from(vec![2, 3, 6]);
+        let b = VecDocSet::from(vec![1, 3, 5]);
+        let c = VecDocSet::from(vec![1, 3, 5]);
+        let mut intersection = Intersection::new(vec![c, b, a], 10);
+        let mut docs = Vec::new();
+        use crate::DocSet;
+        while intersection.doc() != TERMINATED {
+            docs.push(intersection.doc());
+            intersection.advance();
+        }
+        assert_eq!(&docs, &[3]);
+    }
+
+    #[test]
+    fn test_intersection_termination() {
+        use crate::query::score_combiner::DoNothingCombiner;
+        use crate::query::{BufferedUnionScorer, ConstScorer, VecDocSet};
+
+        let a1 = ConstScorer::new(VecDocSet::from(vec![0u32, 10000]), 1.0);
+        let a2 = ConstScorer::new(VecDocSet::from(vec![0u32, 10000]), 1.0);
+
+        let mut b_scorers = vec![];
+        for _ in 0..2 {
+            // Union matches 0 and 10000.
+            b_scorers.push(ConstScorer::new(VecDocSet::from(vec![0, 10000]), 1.0));
+        }
+        // That's the union of two scores matching 0, and 10_000.
+        let union = BufferedUnionScorer::build(b_scorers, DoNothingCombiner::default, 30000);
+
+        // Mismatching scorer: matches 0 and 20000. We then append more docs at the end to ensure it
+        // is last.
+        let mut m_docs = vec![0, 20000];
+        for i in 30000..30100 {
+            m_docs.push(i);
+        }
+        let m = ConstScorer::new(VecDocSet::from(m_docs), 1.0);
+
+        // Costs: A1=2, A2=2, Union=4, M=102.
+        // Sorted: A1, A2, Union, M.
+        // Left=A1, Right=A2, Others=[Union, M].
+        let mut intersection = crate::query::intersect_scorers(
+            vec![Box::new(a1), Box::new(a2), Box::new(union), Box::new(m)],
+            40000,
+        );
+
+        while intersection.doc() != TERMINATED {
+            intersection.advance();
+        }
+    }
+
+    // Strategy to generate sorted and deduplicated vectors of u32 document IDs
+    fn sorted_deduped_vec(max_val: u32, max_size: usize) -> impl Strategy<Value = Vec<u32>> {
+        prop::collection::vec(0..max_val, 0..max_size).prop_map(|mut vec| {
+            vec.sort();
+            vec.dedup();
+            vec
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn prop_test_intersection_consistency(
+            a in sorted_deduped_vec(100, 10),
+            b in sorted_deduped_vec(100, 10),
+            num_docs in 100u32..500u32
+        ) {
+            let left = VecDocSet::from(a.clone());
+            let right = VecDocSet::from(b.clone());
+            let mut intersection = Intersection::new(vec![left, right], num_docs);
+
+            let expected: Vec<u32> = a.iter()
+                .cloned()
+                .filter(|doc| b.contains(doc))
+                .collect();
+
+            for expected_doc in expected {
+                assert_eq!(intersection.doc(), expected_doc);
+                intersection.advance();
+            }
+            assert_eq!(intersection.doc(), TERMINATED);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_test_count_including_deleted_matches_default(
+            a in sorted_deduped_vec(1200, 400),
+            b in sorted_deduped_vec(1200, 400),
+            c in sorted_deduped_vec(1200, 400),
+            num_docs in 1200u32..2000u32,
+        ) {
+            // Compute expected count via set intersection.
+            let expected: u32 = a.iter()
+                .filter(|doc| b.contains(doc) && c.contains(doc))
+                .count() as u32;
+
+            // Test count_including_deleted (dense path).
+            let make_intersection = || {
+                Intersection::new(
+                    vec![
+                        VecDocSet::from(a.clone()),
+                        VecDocSet::from(b.clone()),
+                        VecDocSet::from(c.clone()),
+                    ],
+                    num_docs,
+                )
+            };
+
+            let mut intersection = make_intersection();
+            let count = intersection.count_including_deleted();
+            prop_assert_eq!(count, expected,
+                "count_including_deleted mismatch: a={:?}, b={:?}, c={:?}", a, b, c);
+        }
+    }
+
+    #[test]
+    fn test_count_including_deleted_two_way() {
+        let left = VecDocSet::from(vec![1, 3, 9]);
+        let right = VecDocSet::from(vec![3, 4, 9, 18]);
+        let mut intersection = Intersection::new(vec![left, right], 100);
+        assert_eq!(intersection.count_including_deleted(), 2);
+    }
+
+    #[test]
+    fn test_count_including_deleted_empty() {
+        let a = VecDocSet::from(vec![1, 3]);
+        let b = VecDocSet::from(vec![1, 4]);
+        let c = VecDocSet::from(vec![3, 9]);
+        let mut intersection = Intersection::new(vec![a, b, c], 100);
+        assert_eq!(intersection.count_including_deleted(), 0);
+    }
+
+    /// Test with enough documents to exercise the dense path (>= num_docs/32).
+    #[test]
+    fn test_count_including_deleted_dense_path() {
+        // Create dense docsets: many docs relative to segment size.
+        let docs_a: Vec<u32> = (0..2000).step_by(2).collect(); // even numbers 0..2000
+        let docs_b: Vec<u32> = (0..2000).step_by(3).collect(); // multiples of 3
+        let expected = docs_a.iter().filter(|d| *d % 3 == 0).count() as u32;
+
+        let a = VecDocSet::from(docs_a);
+        let b = VecDocSet::from(docs_b);
+        let mut intersection = Intersection::new(vec![a, b], 2000);
+        assert_eq!(intersection.count_including_deleted(), expected);
+    }
+
+    /// Test that spans multiple blocks (>1024 docs).
+    #[test]
+    fn test_count_including_deleted_multi_block() {
+        let docs_a: Vec<u32> = (0..5000).collect();
+        let docs_b: Vec<u32> = (0..5000).step_by(7).collect();
+        let expected = docs_b.len() as u32; // all of b is in a
+
+        let a = VecDocSet::from(docs_a);
+        let b = VecDocSet::from(docs_b);
+        let mut intersection = Intersection::new(vec![a, b], 5000);
+        assert_eq!(intersection.count_including_deleted(), expected);
+    }
+
+    #[test]
+    fn test_bug_2811_intersection_candidate_should_increase() {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+        let mut writer = index.writer_for_tests().unwrap();
+        writer
+            .add_document(doc!(text_field=>"hello happy tax"))
+            .unwrap();
+        writer.add_document(doc!(text_field=>"hello")).unwrap();
+        writer.add_document(doc!(text_field=>"hello")).unwrap();
+        writer.add_document(doc!(text_field=>"happy tax")).unwrap();
+
+        writer.commit().unwrap();
+        let query_parser = QueryParser::for_index(&index, Vec::new());
+        let query = query_parser
+            .parse_query(r#"+text:hello +text:"happy tax""#)
+            .unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let c = searcher.search(&*query, &Count).unwrap();
+        assert_eq!(c, 1);
+    }
+}

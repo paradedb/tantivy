@@ -1,0 +1,1606 @@
+#![allow(dead_code)]
+
+use std::sync::Arc;
+
+use crate::collector::{Count, TopDocs};
+use crate::index::IndexSettings;
+use crate::indexer::NoMergePolicy;
+use crate::query::{AllQuery, TermQuery};
+use crate::schema::{
+    Field, FieldType, IndexRecordOption, Metric, Schema, Term, VectorDType, VectorOptions, STORED,
+    STRING,
+};
+use crate::vector::clustering::{
+    for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
+};
+use crate::vector::params::{LocatedPath, ProbeParams};
+use crate::vector::{BlockAddress, RouterKind};
+use crate::{DocAddress, Index, Score, TantivyDocument};
+
+const EMBEDDING_FIELD_NAME: &str = "embedding";
+const LABEL_FIELD_NAME: &str = "label";
+const NUM_DOCS: usize = 100;
+const DOCS_PER_SEGMENT: usize = 10;
+
+// Which on-disk layout the fixture should produce, reusing the public
+// descriptor enum. Selected via the index settings (clustering threshold +
+// clusterer); the resulting segment is self-describing through its `.vec`
+// `IdMap`, so this is purely a build knob here.
+pub(crate) use crate::vector::diagnostics::VectorStorageFormat;
+
+pub(crate) struct TestVectorIndex {
+    pub(crate) index: Index,
+}
+
+pub(crate) struct TestVectorIndexBuilder {
+    centroids: Vec<[f32; grid2d::DIM]>,
+    dtype: VectorDType,
+    metric: Metric,
+    selectivities: Vec<f32>,
+    vector_storage_format: VectorStorageFormat,
+    router: RouterKind,
+}
+
+impl TestVectorIndexBuilder {
+    pub(crate) fn router(mut self, router: RouterKind) -> Self {
+        self.router = router;
+        self
+    }
+
+    pub(crate) fn vector_storage_format(
+        mut self,
+        vector_storage_format: VectorStorageFormat,
+    ) -> Self {
+        self.vector_storage_format = vector_storage_format;
+        self
+    }
+
+    pub(crate) fn selectivities(mut self, selectivities: &[f32]) -> Self {
+        self.selectivities = selectivities.to_vec();
+        self
+    }
+
+    pub(crate) fn metric(mut self, metric: Metric) -> Self {
+        self.metric = metric;
+        self
+    }
+
+    pub(crate) fn centroids(mut self, centroids: &[[f32; grid2d::DIM]]) -> Self {
+        assert!(!centroids.is_empty(), "need at least one centroid");
+        self.centroids = centroids.to_vec();
+        self
+    }
+
+    pub(crate) fn build(self) -> crate::Result<TestVectorIndex> {
+        let vector_options = VectorOptions::new(grid2d::DIM, self.metric).with_dtype(self.dtype);
+        let mut schema_builder = Schema::builder();
+        let embedding_field =
+            schema_builder.add_vector_field(EMBEDDING_FIELD_NAME, vector_options.clone());
+        let label_field = schema_builder.add_text_field(LABEL_FIELD_NAME, STRING | STORED);
+        let schema = schema_builder.build();
+        let index = self.create_index(schema)?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        let doc_labels = labels::values(NUM_DOCS, &self.selectivities);
+
+        for (doc_ord, embedding) in grid2d::vectors(NUM_DOCS).into_iter().enumerate() {
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(embedding_field, &embedding);
+            for label in &doc_labels[doc_ord] {
+                doc.add_text(label_field, label);
+            }
+            writer.add_document(doc)?;
+            if (doc_ord + 1) % DOCS_PER_SEGMENT == 0 {
+                writer.commit()?;
+            }
+        }
+
+        if self.vector_storage_format == VectorStorageFormat::Ivf {
+            let mut segment_ids = index.searchable_segment_ids()?;
+            segment_ids.sort();
+            for pair in segment_ids.chunks_exact(2) {
+                writer.merge(pair).wait()?;
+            }
+        }
+        writer.wait_merging_threads()?;
+
+        Ok(TestVectorIndex { index })
+    }
+
+    fn create_index(&self, schema: Schema) -> crate::Result<Index> {
+        let mut settings = IndexSettings::default();
+        if self.vector_storage_format == VectorStorageFormat::Ivf {
+            settings.vector_clustering_threshold = 1;
+        }
+        let mut builder = Index::builder().schema(schema).settings(settings);
+        if self.vector_storage_format == VectorStorageFormat::Ivf {
+            builder = builder.ivf_clusterer(Arc::new(Grid2DClusterer {
+                centroids: self.centroids.clone(),
+            }));
+            builder = builder.ivf_router(self.router);
+        }
+        builder.create_in_ram()
+    }
+}
+
+impl TestVectorIndex {
+    pub(crate) fn builder(dtype: VectorDType) -> TestVectorIndexBuilder {
+        TestVectorIndexBuilder {
+            centroids: grid2d::centroids(),
+            dtype,
+            metric: Metric::L2,
+            selectivities: Vec::new(),
+            vector_storage_format: VectorStorageFormat::Flat,
+            router: RouterKind::Stacked,
+        }
+    }
+
+    pub(crate) fn embedding_field(&self) -> Field {
+        self.index.schema().get_field(EMBEDDING_FIELD_NAME).unwrap()
+    }
+
+    pub(crate) fn label_field(&self) -> Field {
+        self.index.schema().get_field(LABEL_FIELD_NAME).unwrap()
+    }
+
+    pub(crate) fn vector_options(&self) -> VectorOptions {
+        let schema = self.index.schema();
+        let field_entry = schema.get_field_entry(self.embedding_field());
+        match field_entry.field_type() {
+            FieldType::Vector(options) => options.clone(),
+            _ => unreachable!("embedding field must be a vector"),
+        }
+    }
+
+    pub(crate) fn dtype(&self) -> VectorDType {
+        self.vector_options().dtype()
+    }
+
+    pub(crate) fn embedding(&self, doc_ord: usize) -> [f32; grid2d::DIM] {
+        grid2d::vectors(self.ndocs())
+            .get(doc_ord)
+            .copied()
+            .expect("fixture doc")
+    }
+
+    pub(crate) fn ndocs(&self) -> usize {
+        self.index.reader().expect("reader").searcher().num_docs() as usize
+    }
+
+    pub(crate) fn ground_truth(
+        &self,
+        query: [f32; grid2d::DIM],
+        top_k: usize,
+    ) -> crate::Result<Vec<(Score, DocAddress)>> {
+        ground_truth::top_k(
+            &self.index,
+            self.embedding_field(),
+            self.vector_options().metric(),
+            &query,
+            top_k,
+        )
+    }
+}
+
+pub(crate) struct Grid2DClusterer {
+    pub(crate) centroids: Vec<[f32; grid2d::DIM]>,
+}
+
+impl IvfClusterer for Grid2DClusterer {
+    fn training_sample_ratio(&self) -> f32 {
+        1.0
+    }
+
+    fn train(
+        &self,
+        options: &VectorOptions,
+        _source: &mut dyn VectorSource,
+    ) -> crate::Result<IvfCentroids> {
+        assert_eq!(options.dim(), grid2d::DIM);
+        let num_centroids = self.centroids.len();
+        Ok(IvfCentroids::F32(IvfMatrix {
+            values: self
+                .centroids
+                .iter()
+                .flat_map(|centroid| centroid.iter().copied())
+                .collect(),
+            rows: num_centroids,
+            dims: grid2d::DIM,
+        }))
+    }
+
+    fn assign(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        centroids: &IvfCentroids,
+    ) -> crate::Result<Vec<u32>> {
+        assert_eq!(options.dim(), grid2d::DIM);
+        let IvfCentroids::F32(centroids) = centroids;
+        let num_rows = source.num_rows();
+        let mut assignments = Vec::with_capacity(num_rows);
+        for_each_batch(source, num_rows, |IvfTrainingVectors::F32(batch)| {
+            for vector in batch.matrix.values.chunks_exact(batch.matrix.dims) {
+                assignments
+                    .push(grid2d::nearest_centroid(vector, centroids.values.as_slice()) as u32);
+            }
+        })?;
+        Ok(assignments)
+    }
+}
+
+#[test]
+fn fixture_builds_expected_schema_docs_and_labels() -> crate::Result<()> {
+    let index = TestVectorIndex::builder(VectorDType::F32)
+        .metric(Metric::Cosine)
+        .selectivities(&[0.1, 0.5])
+        .build()?;
+
+    assert_eq!(index.ndocs(), NUM_DOCS);
+    assert_eq!(index.dtype(), VectorDType::F32);
+    let vector_options = index.vector_options();
+    assert_eq!(vector_options.dim(), grid2d::DIM);
+    assert_eq!(vector_options.dtype(), VectorDType::F32);
+    assert_eq!(vector_options.metric(), Metric::Cosine);
+    assert!(matches!(
+        index
+            .index
+            .schema()
+            .get_field_entry(index.label_field())
+            .field_type(),
+        FieldType::Str(_)
+    ));
+    let searcher = index.index.reader()?.searcher();
+    for (selectivity, expected_count) in [(0.1, 10), (0.5, 50)] {
+        let label = labels::LabelWithSelectivity::new(selectivity).label();
+        let term = Term::from_field_text(index.label_field(), &label);
+        assert_eq!(
+            searcher.search(&TermQuery::new(term, IndexRecordOption::Basic), &Count)?,
+            expected_count
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn fixture_uses_selected_storage_format() -> crate::Result<()> {
+    for vector_storage_format in [VectorStorageFormat::Flat, VectorStorageFormat::Ivf] {
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .vector_storage_format(vector_storage_format)
+            .build()?;
+        let searcher = index.index.reader()?.searcher();
+        let vec_reader = searcher.segment_readers()[0].vector_index(index.embedding_field())?;
+        let is_ivf = vec_reader.index().is_some();
+        assert_eq!(
+            is_ivf,
+            vector_storage_format == VectorStorageFormat::Ivf,
+            "storage format mismatch: index present = {is_ivf}, expected {vector_storage_format:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// Both vector segment files must stamp the current format-generation header
+/// ahead of their composite body, so future layout changes can be gated.
+#[test]
+fn vector_files_stamp_format_version_header() -> crate::Result<()> {
+    use crate::directory::CompositeFile;
+    use crate::index::SegmentComponent;
+    use crate::vector::storage::header::{
+        read_centroid_header, read_vector_header, VectorFileVersion, CENTROIDS_EXT, VEC_EXT,
+    };
+
+    for format in [VectorStorageFormat::Flat, VectorStorageFormat::Ivf] {
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .vector_storage_format(format)
+            .build()?;
+        let searcher = index.index.reader()?.searcher();
+        assert!(!searcher.segment_readers().is_empty());
+
+        for segment_reader in searcher.segment_readers() {
+            let vec_file =
+                segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))?;
+            let (version, body) = read_vector_header(&vec_file)?;
+            assert_eq!(version, VectorFileVersion::V5);
+            // Body must be a valid composite — proves the stamp sits in front
+            // of the framing, not inside a slot.
+            CompositeFile::open(&body)?;
+
+            match format {
+                VectorStorageFormat::Flat => {
+                    assert!(
+                        segment_reader
+                            .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))
+                            .is_err(),
+                        "flat segments must not write `.centroids`"
+                    );
+                }
+                VectorStorageFormat::Ivf => {
+                    let centroids_file = segment_reader
+                        .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
+                    let (version, body) = read_centroid_header(&centroids_file)?;
+                    assert_eq!(version, VectorFileVersion::V5);
+                    let composite = CompositeFile::open(&body)?;
+                    let mut slots: Vec<_> = composite
+                        .field_indices()
+                        .filter_map(|(field, idx)| {
+                            (field == index.embedding_field()).then_some(idx)
+                        })
+                        .collect();
+                    slots.sort_unstable();
+                    assert_eq!(slots, [0, 2]);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn fixture_vectors_round_trip_from_readers() -> crate::Result<()> {
+    let mut expected = grid2d::vectors(NUM_DOCS);
+    expected.sort_by(|left, right| {
+        left[0]
+            .partial_cmp(&right[0])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                left[1]
+                    .partial_cmp(&right[1])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    for vector_storage_format in [VectorStorageFormat::Flat, VectorStorageFormat::Ivf] {
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .vector_storage_format(vector_storage_format)
+            .build()?;
+        let searcher = index.index.reader()?.searcher();
+        let mut got = Vec::new();
+        for segment_reader in searcher.segment_readers() {
+            let vec_reader = segment_reader.vector_index(index.embedding_field())?;
+            for doc in 0..segment_reader.max_doc() {
+                if let Some(bytes) = vec_reader.vector_bytes(doc)? {
+                    let vector: [f32; grid2d::DIM] = bytes
+                        .chunks_exact(VectorDType::F32.size_bytes())
+                        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 bytes")))
+                        .collect::<Vec<_>>()
+                        .try_into()
+                        .expect("2D vector");
+                    got.push(vector);
+                }
+            }
+        }
+        got.sort_by(|left: &[f32; grid2d::DIM], right| {
+            left[0]
+                .partial_cmp(&right[0])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    left[1]
+                        .partial_cmp(&right[1])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        assert_eq!(got, expected);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn ivf_fixture_uses_custom_centroids_for_assignment() -> crate::Result<()> {
+    let centroids = vec![[0.0, 0.0], [6.0, 6.0]];
+    let index = TestVectorIndex::builder(VectorDType::F32)
+        .vector_storage_format(VectorStorageFormat::Ivf)
+        .centroids(&centroids)
+        .build()?;
+    let centroid_values: Vec<f32> = centroids
+        .iter()
+        .flat_map(|vector| vector.iter().copied())
+        .collect();
+    let searcher = index.index.reader()?.searcher();
+    let mut assigned_docs = 0;
+
+    for segment_reader in searcher.segment_readers() {
+        let vec_reader = segment_reader.vector_index(index.embedding_field())?;
+        let ivf = vec_reader.index().expect("expected IVF storage");
+        assert_eq!(
+            ivf.centroid_bytes()?
+                .chunks_exact(VectorDType::F32.size_bytes())
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 bytes")))
+                .collect::<Vec<_>>(),
+            centroid_values
+        );
+        for cluster_ord in 0..centroids.len() {
+            let doc_ids = vec_reader
+                .cluster_doc_ids(cluster_ord)
+                .unwrap()
+                .expect("in-bounds cluster");
+            for doc in doc_ids {
+                let vector: Vec<f32> = vec_reader
+                    .vector_bytes(doc)?
+                    .expect("vector bytes")
+                    .chunks_exact(VectorDType::F32.size_bytes())
+                    .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 bytes")))
+                    .collect();
+                assert_eq!(
+                    grid2d::nearest_centroid(&vector, &centroid_values),
+                    cluster_ord
+                );
+                assigned_docs += 1;
+            }
+        }
+    }
+
+    assert_eq!(assigned_docs, NUM_DOCS);
+    Ok(())
+}
+
+/// Regression for `FlatBackend::top_n` under truncation. A bare
+/// `TopNComputer::new` defaults to `ReverseComparator`, which keeps
+/// the K *smallest* sort_keys — for our "higher = closer" similarity
+/// convention that returned the K *farthest* docs once a segment had
+/// more than K matches. Latent before the fix because every previous
+/// flat test had ≤ K docs per segment, so the truncate_top_n path
+/// never fired. The backend now wires `NaturalComparator` explicitly;
+/// this test would fail under the old code.
+///
+/// The shared fixture commits every `DOCS_PER_SEGMENT = 10` docs, so
+/// each segment has 10 > K = 3 docs — the truncation path is on.
+#[test]
+fn flat_top_n_returns_nearest_when_more_than_k_docs_per_segment() -> crate::Result<()> {
+    let index = TestVectorIndex::builder(VectorDType::F32)
+        .vector_storage_format(VectorStorageFormat::Flat)
+        .build()?;
+    let query = grid2d::centroids()[0];
+    let top_k = 3;
+    let expected = index.ground_truth(query, top_k)?;
+    let hits = index
+        .index
+        .reader()?
+        .searcher()
+        .search(
+            &AllQuery,
+            &TopDocs::with_limit(top_k)
+                .order_by_similarity(index.embedding_field(), query.to_vec())
+                .build(),
+        )?
+        .results;
+    assert_eq!(hits, expected);
+    Ok(())
+}
+
+#[test]
+fn ivf_merge_writes_the_selected_stacked_router() -> crate::Result<()> {
+    use crate::directory::CompositeFile;
+    use crate::index::SegmentComponent;
+    use crate::vector::storage::header::CENTROIDS_EXT;
+
+    let centroids = vec![[0.0, 0.0], [6.0, 6.0]];
+    let index = TestVectorIndex::builder(VectorDType::F32)
+        .vector_storage_format(VectorStorageFormat::Ivf)
+        .centroids(&centroids)
+        .build()?;
+    let searcher = index.index.reader()?.searcher();
+    assert!(!searcher.segment_readers().is_empty());
+
+    for segment_reader in searcher.segment_readers() {
+        let centroids_file =
+            segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
+        let (_version, body) =
+            crate::vector::storage::header::read_centroid_header(&centroids_file)?;
+        let composite = CompositeFile::open(&body)?;
+        let router_bytes = composite
+            .open_read_with_idx(index.embedding_field(), 2)
+            .expect("IVF merge should write the router slot")
+            .read_bytes()?;
+        assert_eq!(router_bytes[0], RouterKind::Stacked as u8);
+        assert!(router_bytes.len() > 1);
+    }
+    Ok(())
+}
+
+/// With no clusterer or router configured, merges past the threshold write IVF with the default
+/// router, on the created index and after a reopen; an exhaustive search matches the oracle.
+#[test]
+fn default_setup_clusters_past_the_threshold() -> crate::Result<()> {
+    use crate::directory::RamDirectory;
+    use crate::IndexWriter;
+
+    let mut schema_builder = Schema::builder();
+    let field = schema_builder.add_vector_field(
+        EMBEDDING_FIELD_NAME,
+        VectorOptions::new(grid2d::DIM, Metric::L2),
+    );
+    let settings = IndexSettings {
+        vector_clustering_threshold: 64,
+        ..IndexSettings::default()
+    };
+    let directory = RamDirectory::create();
+    let vectors = grid2d::vectors(150);
+    let commit_and_merge = |index: &Index, commits: &[&[[f32; 2]]]| -> crate::Result<()> {
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for commit in commits {
+            for vector in *commit {
+                let mut doc = TantivyDocument::new();
+                doc.add_vector(field, vector);
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+        }
+        writer.merge(&index.searchable_segment_ids()?).wait()?;
+        writer.wait_merging_threads()
+    };
+    let assert_default_ivf = |index: &Index| -> crate::Result<()> {
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let vectors = searcher.segment_reader(0).vector_index(field)?;
+        let ivf = vectors.index().expect("the merge must write IVF");
+        assert_eq!(ivf.router(), RouterKind::default());
+        let query = [4.0_f32, 4.0];
+        let expected = ground_truth::top_k(index, field, Metric::L2, &query, 10)?;
+        let actual = searcher.search(
+            &AllQuery,
+            &TopDocs::with_limit(10)
+                .order_by_similarity(field, query.to_vec())
+                .with_probe_params(exhaustive_params(0))
+                .build(),
+        )?;
+        assert_eq!(actual.results, expected);
+        Ok(())
+    };
+
+    let index = Index::create(directory.clone(), schema_builder.build(), settings)?;
+    commit_and_merge(&index, &[&vectors[..48], &vectors[48..96]])?;
+    assert_default_ivf(&index)?;
+    drop(index);
+
+    let reopened = Index::open(directory)?;
+    commit_and_merge(&reopened, &[&vectors[96..]])?;
+    assert_default_ivf(&reopened)?;
+    assert_eq!(reopened.reader()?.searcher().num_docs(), 150);
+    Ok(())
+}
+
+/// `IndexBuilder::quantize` stores a fresh-seeded configuration at create that a reopen keeps; a
+/// field the settings already quantize, a text field and a vector below 64 dims are errors.
+#[test]
+fn quantize_on_the_builder() -> crate::Result<()> {
+    use crate::directory::RamDirectory;
+    use crate::vector::VectorQuantizationConfig;
+
+    let mut schema_builder = Schema::builder();
+    let options = VectorOptions::new(64, Metric::Cosine);
+    let embedding = schema_builder.add_vector_field(EMBEDDING_FIELD_NAME, options.clone());
+    let small = schema_builder.add_vector_field("small", VectorOptions::new(8, Metric::L2));
+    let label = schema_builder.add_text_field(LABEL_FIELD_NAME, STRING);
+    let schema = schema_builder.build();
+    let builder = |settings: IndexSettings, field: Field| {
+        Index::builder()
+            .schema(schema.clone())
+            .settings(settings)
+            .quantize(field, [1, 1])
+    };
+    let layers = |index: &Index| index.settings().vector_quantization[0].layers.clone();
+
+    let directory = RamDirectory::create();
+    let created = builder(IndexSettings::default(), embedding).create(directory.clone())?;
+    assert_eq!(created.settings().vector_quantization.len(), 1);
+    assert_eq!(
+        layers(&created)
+            .iter()
+            .map(|layer| layer.bits)
+            .collect::<Vec<_>>(),
+        [1, 1]
+    );
+    assert_eq!(layers(&Index::open(directory)?), layers(&created));
+    let other = builder(IndexSettings::default(), embedding).create_in_ram()?;
+    assert_ne!(layers(&other), layers(&created));
+
+    let explicit = IndexSettings {
+        vector_quantization: vec![VectorQuantizationConfig::with_random_seeds(
+            EMBEDDING_FIELD_NAME.to_string(),
+            &options,
+            &[1],
+        )?],
+        ..IndexSettings::default()
+    };
+    for (case, settings, field, message) in [
+        ("already quantized", explicit, embedding, "duplicated"),
+        (
+            "text field",
+            IndexSettings::default(),
+            label,
+            "not a vector field",
+        ),
+        (
+            "below 64 dims",
+            IndexSettings::default(),
+            small,
+            "dimension",
+        ),
+    ] {
+        let error = builder(settings, field)
+            .create_in_ram()
+            .expect_err(case)
+            .to_string();
+        assert!(error.contains(message), "{case}: {error}");
+    }
+    Ok(())
+}
+
+#[test]
+fn ground_truth_orders_by_metric() -> crate::Result<()> {
+    let index = TestVectorIndex::builder(VectorDType::F32)
+        .metric(Metric::L2)
+        .build()?;
+    let query = grid2d::centroids()[0];
+    let hits = index.ground_truth(query, 5)?;
+    let mut expected_scores: Vec<Score> = grid2d::vectors(NUM_DOCS)
+        .iter()
+        .map(|vector| Metric::L2.similarity(&query, vector).score())
+        .collect();
+    expected_scores
+        .sort_by(|left, right| right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal));
+
+    assert_eq!(hits.len(), 5);
+    for (got, expected) in hits.iter().map(|(score, _)| *score).zip(expected_scores) {
+        assert!((got - expected).abs() < 1e-6);
+    }
+
+    Ok(())
+}
+
+/// Non-finite elements are rejected at ingest on normalizing fields
+/// (Cosine+F32) and accepted on non-normalizing ones (L2) — validation
+/// rides the normalize path only. `IndexWriter::add_document` enqueues
+/// to a worker, so the rejection may surface either from the enqueue or
+/// from the following `commit`.
+#[test]
+fn ingest_rejects_non_finite_cosine_vector() -> crate::Result<()> {
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        // L2: same vector is accepted; nothing normalizes, data is stored raw.
+        let mut schema_builder = Schema::builder();
+        let l2_field = schema_builder.add_vector_field("l2", VectorOptions::new(2, Metric::L2));
+        let schema = schema_builder.build();
+        let index = Index::builder().schema(schema).create_in_ram()?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        let mut doc = TantivyDocument::new();
+        doc.add_vector(l2_field, &[bad, 1.0]);
+        writer.add_document(doc)?;
+        writer.commit()?;
+
+        // Cosine: rejected.
+        let mut schema_builder = Schema::builder();
+        let cos_field =
+            schema_builder.add_vector_field("cos", VectorOptions::new(2, Metric::Cosine));
+        let schema = schema_builder.build();
+        let index = Index::builder().schema(schema).create_in_ram()?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        let mut doc = TantivyDocument::new();
+        doc.add_vector(cos_field, &[bad, 1.0]);
+        let err = match writer.add_document(doc) {
+            Err(err) => err.to_string(),
+            Ok(_) => writer
+                .commit()
+                .expect_err("non-finite vector must fail ingest")
+                .to_string(),
+        };
+        assert!(err.contains("non-finite"), "bad={bad}, err={err}");
+    }
+    Ok(())
+}
+
+/// A zero vector is honest data: ingest accepts it (`ZeroSkipped`), and
+/// at query time it scores exactly 0.0 — behind any non-zero doc.
+#[test]
+fn ingest_accepts_zero_vector() -> crate::Result<()> {
+    let mut schema_builder = Schema::builder();
+    let embedding_field =
+        schema_builder.add_vector_field("embedding", VectorOptions::new(2, Metric::Cosine));
+    let schema = schema_builder.build();
+    let index = Index::builder().schema(schema).create_in_ram()?;
+    let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+    let mut zero_doc = TantivyDocument::new();
+    zero_doc.add_vector(embedding_field, &[0.0_f32, 0.0]);
+    writer.add_document(zero_doc)?;
+    let mut unit_doc = TantivyDocument::new();
+    unit_doc.add_vector(embedding_field, &[0.6_f32, 0.8]);
+    writer.add_document(unit_doc)?;
+    writer.commit()?;
+
+    let searcher = index.reader()?.searcher();
+    let collector = TopDocs::with_limit(2)
+        .order_by_similarity(embedding_field, vec![1.0_f32, 0.0])
+        .build();
+    let hits = searcher.search(&AllQuery, &collector)?.results;
+    assert_eq!(hits.len(), 2, "zero vector must be ingested and returned");
+    assert!(hits[0].0 > 0.0, "non-zero doc must rank first: {hits:?}");
+    assert_eq!(hits[1].0, 0.0, "zero vector scores 0.0: {hits:?}");
+    Ok(())
+}
+
+/// "Scan everything" probe params: the full-capacity ceiling, so the
+/// budget never binds before the stream is exhausted. Used by
+/// oracle-equality tests, where every cluster must be probed.
+pub(crate) fn exhaustive_params(_num_centroids: usize) -> ProbeParams {
+    ProbeParams {
+        max_probe_fraction: 1.0,
+        min_probe_clusters: 1,
+        ..Default::default()
+    }
+}
+
+/// [`exhaustive_params`] on the routed path, with no cluster scored exactly before the exact phase.
+pub(crate) fn routed_exhaustive_params(num_centroids: usize) -> ProbeParams {
+    ProbeParams {
+        exact_plan: false,
+        located: LocatedPath::Off,
+        ..exhaustive_params(num_centroids)
+    }
+}
+
+pub(crate) mod ground_truth {
+    use std::cmp::Ordering;
+    use std::sync::Arc;
+
+    use crate::schema::{Field, Metric};
+    use crate::vector::search::prepared::VectorQuery;
+    use crate::{DocAddress, Index, Score};
+
+    pub(crate) fn top_k(
+        index: &Index,
+        vec_field: Field,
+        metric: Metric,
+        query: &[f32],
+        top_k: usize,
+    ) -> crate::Result<Vec<(Score, DocAddress)>> {
+        let query = VectorQuery::<f32>::new(metric, Arc::new(query.to_vec()));
+        let searcher = index.reader()?.searcher();
+        let mut scored = Vec::new();
+        for (seg_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
+            let vec_reader = segment_reader.vector_index(vec_field)?;
+            let alive = segment_reader.alive_bitset();
+            for doc in 0..segment_reader.max_doc() {
+                if let Some(alive) = alive {
+                    if !alive.is_alive(doc) {
+                        continue;
+                    }
+                }
+                if let Some(bytes) = vec_reader.vector_bytes(doc)? {
+                    scored.push((
+                        query.score_row(&bytes).score(),
+                        DocAddress::new(seg_ord as u32, doc),
+                    ));
+                }
+            }
+        }
+        scored.sort_by(|a: &(Score, DocAddress), b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(Ordering::Equal)
+                .then(a.1.segment_ord.cmp(&b.1.segment_ord))
+                .then(a.1.doc_id.cmp(&b.1.doc_id))
+        });
+        scored.truncate(top_k);
+        Ok(scored)
+    }
+}
+
+// Generates mock string labels with controlled selectivity for filter tests.
+mod labels {
+    use std::fmt;
+
+    pub(crate) fn values(ndocs: usize, selectivities: &[f32]) -> Vec<Vec<String>> {
+        let mut labels = vec![Vec::new(); ndocs];
+        for selectivity in selectivities.iter().copied().map(LabelWithSelectivity::new) {
+            let label = selectivity.label();
+            let doc_count = selectivity.doc_count(ndocs);
+            for doc_labels in labels.iter_mut().take(doc_count) {
+                doc_labels.push(label.clone());
+            }
+        }
+        labels
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct LabelWithSelectivity(f32);
+
+    impl LabelWithSelectivity {
+        pub(crate) fn new(value: f32) -> Self {
+            assert!(
+                value.is_finite() && (0.0..=1.0).contains(&value),
+                "selectivity must be in [0, 1]"
+            );
+            Self(value)
+        }
+
+        pub(crate) fn label(self) -> String {
+            format!("selectivity_{self}")
+        }
+
+        pub(crate) fn doc_count(self, total_docs: usize) -> usize {
+            ((total_docs as f64) * f64::from(self.0)).round() as usize
+        }
+    }
+
+    impl fmt::Display for LabelWithSelectivity {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let mut formatted = format!("{:.6}", self.0);
+            while formatted.contains('.') && formatted.ends_with('0') {
+                formatted.pop();
+            }
+            if formatted.ends_with('.') {
+                formatted.pop();
+            }
+            f.write_str(&formatted)
+        }
+    }
+}
+
+// Generates deterministic mock 2D embeddings scattered around a centroid grid.
+mod grid2d {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    pub(crate) const DIM: usize = 2;
+
+    const CLUSTER_RADIUS: f32 = 0.5;
+    const GRID_GAP: f32 = 3.0;
+    const GRID_ROWS: usize = 3;
+    const GRID_COLS: usize = 3;
+    const SEED: u64 = 21;
+
+    pub(crate) fn vectors(ndocs: usize) -> Vec<[f32; DIM]> {
+        if ndocs == 0 {
+            return Vec::new();
+        }
+        let centroids = centroids();
+        let fixture = Fixture2D {
+            points_per_cluster: points_per_cluster(ndocs, centroids.len()),
+            cluster_radius: CLUSTER_RADIUS,
+            seed: SEED,
+        };
+        fixture
+            .points(&centroids)
+            .into_iter()
+            .take(ndocs)
+            .map(|point| point.vector)
+            .collect()
+    }
+
+    pub(crate) fn centroids() -> Vec<[f32; DIM]> {
+        grid([0.0, 0.0], GRID_ROWS, GRID_COLS, GRID_GAP)
+    }
+
+    pub(crate) fn nearest_centroid(vector: &[f32], centroids: &[f32]) -> usize {
+        assert_eq!(vector.len(), DIM);
+        let mut best = 0;
+        let mut best_d2 = f32::INFINITY;
+        for (ord, centroid) in centroids.chunks_exact(DIM).enumerate() {
+            let dx = vector[0] - centroid[0];
+            let dy = vector[1] - centroid[1];
+            let d2 = dx * dx + dy * dy;
+            if d2 < best_d2 {
+                best = ord;
+                best_d2 = d2;
+            }
+        }
+        best
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct Fixture2D {
+        points_per_cluster: usize,
+        cluster_radius: f32,
+        seed: u64,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct Point {
+        vector: [f32; DIM],
+        cluster_ord: usize,
+    }
+
+    impl Fixture2D {
+        fn points(&self, centroids: &[[f32; DIM]]) -> Vec<Point> {
+            assert!(!centroids.is_empty(), "need at least one centroid");
+            assert!(self.points_per_cluster >= 1);
+            assert_non_overlapping(centroids, self.cluster_radius);
+
+            let mut rng = StdRng::seed_from_u64(self.seed);
+            let mut points = Vec::with_capacity(centroids.len() * self.points_per_cluster);
+            for (cluster_ord, centroid) in centroids.iter().enumerate() {
+                for _ in 0..self.points_per_cluster {
+                    points.push(Point {
+                        vector: sample_disk(centroid, self.cluster_radius, &mut rng),
+                        cluster_ord,
+                    });
+                }
+            }
+            points
+        }
+    }
+
+    fn points_per_cluster(ndocs: usize, num_clusters: usize) -> usize {
+        (ndocs + num_clusters - 1) / num_clusters
+    }
+
+    fn grid(origin: [f32; DIM], rows: usize, cols: usize, gap: f32) -> Vec<[f32; DIM]> {
+        assert!(rows >= 1 && cols >= 1);
+        let mut out = Vec::with_capacity(rows * cols);
+        for row in 0..rows {
+            for col in 0..cols {
+                out.push([
+                    origin[0] + (col as f32) * gap,
+                    origin[1] + (row as f32) * gap,
+                ]);
+            }
+        }
+        out
+    }
+
+    fn sample_disk(center: &[f32; DIM], radius: f32, rng: &mut StdRng) -> [f32; DIM] {
+        let u: f32 = rng.random_range(0.0..1.0);
+        let v: f32 = rng.random_range(0.0..1.0);
+        let r = radius * u.sqrt();
+        let theta = 2.0 * std::f32::consts::PI * v;
+        [center[0] + r * theta.cos(), center[1] + r * theta.sin()]
+    }
+
+    fn assert_non_overlapping(centroids: &[[f32; DIM]], radius: f32) {
+        let min_dist = 2.0 * radius;
+        for left in 0..centroids.len() {
+            for right in (left + 1)..centroids.len() {
+                let d = dist(&centroids[left], &centroids[right]);
+                assert!(d >= min_dist);
+            }
+        }
+    }
+
+    fn dist(a: &[f32; DIM], b: &[f32; DIM]) -> f32 {
+        let dx = a[0] - b[0];
+        let dy = a[1] - b[1];
+        (dx * dx + dy * dy).sqrt()
+    }
+}
+
+mod centroid_storage_tests {
+    use std::sync::Arc;
+
+    use super::EMBEDDING_FIELD_NAME;
+    use crate::collector::TopDocs;
+    use crate::directory::{CompositeFile, Directory, RamDirectory};
+    use crate::index::{IndexSettings, SegmentComponent};
+    use crate::indexer::NoMergePolicy;
+    use crate::query::AllQuery;
+    use crate::schema::{Metric, Schema, VectorDType, VectorOptions, STORED, STRING};
+    use crate::vector::clustering::{
+        for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
+    };
+    use crate::vector::router::stacked::levels::{InMemoryStore, StackedIvf, StackedIvfConfig};
+    use crate::vector::router::RoutingParams;
+    use crate::vector::search::prepared::VectorQuery;
+    use crate::vector::storage::header::CENTROIDS_EXT;
+    use crate::vector::RouterKind;
+    use crate::{Index, IndexWriter, TantivyDocument};
+
+    /// A clusterer with deterministic centroids for crafted-geometry
+    /// builds: fixed rows when supplied, else the first
+    /// `num_centroids` training samples — data-dependent, so a merge of
+    /// merged segments re-trains onto different centroids.
+    struct TestClusterer {
+        fixed_centroids: Option<Vec<[f32; 2]>>,
+        num_centroids: usize,
+    }
+
+    impl IvfClusterer for TestClusterer {
+        fn training_sample_ratio(&self) -> f32 {
+            1.0
+        }
+        fn train(
+            &self,
+            options: &VectorOptions,
+            source: &mut dyn VectorSource,
+        ) -> crate::Result<IvfCentroids> {
+            assert_eq!(options.dim(), 2);
+            let num_centroids = self.num_centroids;
+            let values = match &self.fixed_centroids {
+                Some(centroids) => centroids
+                    .iter()
+                    .take(num_centroids)
+                    .flat_map(|centroid| centroid.iter().copied())
+                    .collect(),
+                None => {
+                    let rows: Vec<u32> = (0..num_centroids as u32).collect();
+                    let IvfTrainingVectors::F32(batch) = source.read_rows(&rows)?;
+                    batch.matrix.values
+                }
+            };
+            Ok(IvfCentroids::F32(IvfMatrix {
+                values,
+                rows: num_centroids,
+                dims: 2,
+            }))
+        }
+        fn assign(
+            &self,
+            options: &VectorOptions,
+            source: &mut dyn VectorSource,
+            centroids: &IvfCentroids,
+        ) -> crate::Result<Vec<u32>> {
+            assert_eq!(options.dim(), 2);
+            let IvfCentroids::F32(centroids) = centroids;
+            let num_rows = source.num_rows();
+            let mut assignments = Vec::with_capacity(num_rows);
+            for_each_batch(source, num_rows, |IvfTrainingVectors::F32(batch)| {
+                for vector in batch.matrix.values.chunks_exact(2) {
+                    let mut best = 0u32;
+                    let mut best_d2 = f32::INFINITY;
+                    for (i, centroid) in centroids.values.chunks_exact(2).enumerate() {
+                        let dx = vector[0] - centroid[0];
+                        let dy = vector[1] - centroid[1];
+                        let d2 = dx * dx + dy * dy;
+                        if d2 < best_d2 {
+                            best = i as u32;
+                            best_d2 = d2;
+                        }
+                    }
+                    assignments.push(best);
+                }
+            })?;
+            Ok(assignments)
+        }
+    }
+
+    /// A 2-dim IVF index over `commits` (one flat segment per inner
+    /// slice), merged per `merge_plan` (segment ordinals into the
+    /// searchable set at each step). Returns the index and the field.
+    fn build_ivf_with_plan(
+        metric: Metric,
+        clusterer: TestClusterer,
+        commits: &[&[[f32; 2]]],
+        directory: Option<RamDirectory>,
+    ) -> crate::Result<(Index, crate::schema::Field)> {
+        let mut schema_builder = Schema::builder();
+        let embed_field = schema_builder.add_vector_field(
+            EMBEDDING_FIELD_NAME,
+            VectorOptions::new(2, metric).with_dtype(VectorDType::F32),
+        );
+        schema_builder.add_text_field("label", STRING | STORED);
+        let schema = schema_builder.build();
+        let settings = IndexSettings {
+            vector_clustering_threshold: 1,
+            ..IndexSettings::default()
+        };
+        let builder = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .ivf_clusterer(Arc::new(clusterer))
+            .ivf_router(RouterKind::Stacked);
+        let index = match directory {
+            Some(directory) => builder.open_or_create(directory)?,
+            None => builder.create_in_ram()?,
+        };
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for chunk in commits {
+            for vector in *chunk {
+                let mut doc = TantivyDocument::new();
+                doc.add_vector(embed_field, vector.as_slice());
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+        }
+        Ok((index, embed_field))
+    }
+
+    /// Merge every searchable segment pair-wise per `pairs`, then all
+    /// remaining segments into one.
+    fn merge_all(index: &Index) -> crate::Result<()> {
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        let segment_ids = index.searchable_segment_ids()?;
+        writer.merge(&segment_ids).wait()?;
+        writer.wait_merging_threads()?;
+        Ok(())
+    }
+
+    #[test]
+    fn old_centroid_format_requires_rebuild_on_open_and_merge() -> crate::Result<()> {
+        let directory = RamDirectory::create();
+        let (index, field) = build_ivf_with_plan(
+            Metric::L2,
+            TestClusterer {
+                fixed_centroids: Some(vec![[0.0, 0.0], [10.0, 10.0]]),
+                num_centroids: 2,
+            },
+            &[&[[0.0, 0.0]], &[[10.0, 10.0]]],
+            Some(directory.clone()),
+        )?;
+        merge_all(&index)?;
+        let segment = index.searchable_segments()?.remove(0);
+        let path = segment.relative_path(SegmentComponent::Custom(CENTROIDS_EXT.into()));
+        let mut bytes = directory.atomic_read(&path)?;
+        bytes[..4].copy_from_slice(&3u32.to_le_bytes());
+        directory.atomic_write(&path, &bytes)?;
+        let reader = crate::SegmentReader::open(&segment)?;
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        for error in [
+            segment.validate_vector_format().unwrap_err(),
+            reader.validate_vector_format().unwrap_err(),
+            reader
+                .vector_index(field)
+                .err()
+                .expect("old centroid reader"),
+            writer
+                .merge_foreground(&index.searchable_segment_ids()?, true)
+                .unwrap_err(),
+        ] {
+            assert!(
+                error.to_string().contains("centroid file format version 3"),
+                "{error}"
+            );
+            assert!(error.to_string().contains("rebuild required"), "{error}");
+        }
+        Ok(())
+    }
+
+    /// Segments open under the router persisted in their `.centroids` file; a different router
+    /// set on the index applies only to segments merged afterwards.
+    #[test]
+    fn opening_ivf_uses_the_persisted_router() -> crate::Result<()> {
+        let clusterer = || TestClusterer {
+            fixed_centroids: Some(vec![[0.0, 0.0], [10.0, 10.0]]),
+            num_centroids: 2,
+        };
+        let directory = RamDirectory::create();
+        let (index, field) = build_ivf_with_plan(
+            Metric::L2,
+            clusterer(),
+            &[&[[0.0, 0.0], [0.1, 0.0]], &[[10.0, 10.0], [10.1, 10.0]]],
+            Some(directory.clone()),
+        )?;
+        merge_all(&index)?;
+        drop(index);
+
+        let reopened = Index::open(directory.clone())?;
+        let searcher = reopened.reader()?.searcher();
+        let vec_reader = searcher.segment_readers()[0].vector_index(field)?;
+        assert_eq!(
+            vec_reader.index().expect("IVF segment").router(),
+            RouterKind::Stacked
+        );
+        drop(searcher);
+        drop(reopened);
+
+        let mut reopened = Index::open(directory)?;
+        reopened.set_ivf_router(RouterKind::Exact);
+        reopened.set_ivf_clusterer(Arc::new(clusterer()));
+        let routers = |index: &Index| -> crate::Result<Vec<RouterKind>> {
+            let searcher = index.reader()?.searcher();
+            searcher
+                .segment_readers()
+                .iter()
+                .map(|segment_reader| {
+                    let vec_reader = segment_reader.vector_index(field)?;
+                    Ok(vec_reader.index().expect("IVF segment").router())
+                })
+                .collect()
+        };
+        assert_eq!(routers(&reopened)?, vec![RouterKind::Stacked]);
+
+        let mut writer: IndexWriter = reopened.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for vector in [[0.2, 0.0], [10.2, 10.0]] {
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(field, vector.as_slice());
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+        drop(writer);
+        merge_all(&reopened)?;
+
+        assert_eq!(routers(&reopened)?, vec![RouterKind::Exact]);
+        let searcher = reopened.reader()?.searcher();
+        assert_eq!(searcher.num_docs(), 6);
+        Ok(())
+    }
+
+    /// A clusterer that builds a stacked router: the merge stamps V4,
+    /// writes the router into slot [2], and cascades the canonical
+    /// centroid permutation into slot [0] / the assignments —
+    /// proven by parsing the router against the stored rows and by search
+    /// staying exact.
+    #[test]
+    fn ivf_merge_writes_stacked_slot_at_v5() -> crate::Result<()> {
+        use crate::vector::storage::header::{read_centroid_header, VectorFileVersion};
+
+        // 8 fixed centroids on a line; two tight docs per centroid split
+        // across two commits.
+        let centroids: Vec<[f32; 2]> = (0..8).map(|i| [i as f32 * 10.0, 0.0]).collect();
+        let docs: Vec<[f32; 2]> = centroids
+            .iter()
+            .flat_map(|c| [[c[0] + 0.1, 0.0], [c[0] + 0.2, 0.0]])
+            .collect();
+        let (first, second) = docs.split_at(docs.len() / 2);
+        let (index, field) = build_ivf_with_plan(
+            Metric::L2,
+            TestClusterer {
+                fixed_centroids: Some(centroids.clone()),
+                num_centroids: centroids.len(),
+            },
+            &[first, second],
+            None,
+        )?;
+        merge_all(&index)?;
+
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let centroids_file =
+            segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
+        let (version, body) = read_centroid_header(&centroids_file)?;
+        assert_eq!(version, VectorFileVersion::V5, "stacked files stamp V5");
+        let composite = CompositeFile::open(&body)?;
+        assert!(composite.open_read_with_idx(field, 3).is_none());
+        let stacked_bytes = composite
+            .open_read_with_idx(field, 2)
+            .expect("stacked router slot must be written")
+            .read_bytes()?;
+
+        // The reader invokes the caller-selected router at open.
+        let vec_reader = segment_reader.vector_index(field)?;
+        let ivf = vec_reader.index().expect("IVF segment");
+        assert_eq!(ivf.router(), RouterKind::Stacked);
+        let stored_rows: Vec<f32> = ivf
+            .centroid_bytes()?
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(stacked_bytes[0], RouterKind::Stacked as u8);
+        let payload_offset = 1;
+        let stacked = StackedIvf::<InMemoryStore>::deserialize_owned(
+            &stacked_bytes[payload_offset..],
+            stored_rows.clone(),
+            2,
+            StackedIvfConfig::default(),
+        )
+        .expect("slot [2] must parse as a stacked router");
+        assert_eq!(stacked.vectors.len(), centroids.len());
+        assert_eq!(
+            stacked
+                .offsets
+                .iter()
+                .map(|&(_, end)| end)
+                .max()
+                .unwrap_or(0) as usize,
+            centroids.len(),
+            "level-0 offsets must cover the stored centroid rows"
+        );
+
+        // The reader's lazy router and the owned parse agree, query by
+        // query — the FileSlice path scores the same rows.
+        for c in &centroids {
+            let query = [c[0] + 0.3, 0.2];
+            let owned: Vec<_> = stacked
+                .search(&query, 2, Metric::L2)
+                .0
+                .into_iter()
+                .take(2)
+                .collect();
+            let prepared = VectorQuery::new(Metric::L2, Arc::new(query.to_vec()));
+            let lazy: Vec<_> = ivf
+                .rank_clusters(&prepared, RoutingParams::default())
+                .take(2)
+                .collect();
+            assert_eq!(owned.len(), lazy.len());
+            for (o, l) in owned.iter().zip(&lazy) {
+                assert_eq!(u32::from(o.node), l.node);
+                assert_eq!(o.sim, l.sim);
+            }
+        }
+
+        // The stored rows are a permutation of the trained centroids.
+        let mut stored_sorted: Vec<[f32; 2]> = stored_rows
+            .chunks_exact(2)
+            .map(|row| [row[0], row[1]])
+            .collect();
+        stored_sorted.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        assert_eq!(stored_sorted, centroids, "rows permuted, none lost");
+
+        // End-to-end search stays exact — the permutation cascaded
+        // coherently into the assignments and posting rows.
+        for c in &centroids {
+            let query = vec![c[0] + 0.12, 0.0];
+            let hits = searcher
+                .search(
+                    &AllQuery,
+                    &TopDocs::with_limit(1)
+                        .order_by_similarity(field, query)
+                        .build(),
+                )?
+                .results;
+            assert_eq!(hits.len(), 1);
+            let bytes = vec_reader
+                .vector_bytes(hits[0].1.doc_id)?
+                .expect("top hit has a vector");
+            let top: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+            assert_eq!(top, vec![c[0] + 0.1, 0.0], "nearest doc must win");
+        }
+        Ok(())
+    }
+}
+
+// Both flat write paths preserve rows across the stored uniform-group boundary.
+#[test]
+fn flat_uniform_boundary_survives_merge_and_sparse_presence() -> crate::Result<()> {
+    let r = crate::vector::storage::metadata::FLAT_ROWS_PER_BLOCK as usize;
+    let mut schema = Schema::builder();
+    let dense = schema.add_vector_field("dense", VectorOptions::new(1, Metric::L2));
+    let sparse = schema.add_vector_field("sparse", VectorOptions::new(1, Metric::L2));
+    let index = Index::builder()
+        .schema(schema.build())
+        .settings(IndexSettings {
+            vector_clustering_threshold: usize::MAX,
+            ..Default::default()
+        })
+        .create_in_ram()?;
+    let mut writer = index.writer_with_num_threads(1, 30_000_000)?;
+    writer.set_merge_policy(Box::new(NoMergePolicy));
+    let mut segment_ids = Vec::new();
+    for doc in 0..2 * r + 3 {
+        let mut document = TantivyDocument::new();
+        document.add_vector(dense, &[doc as f32]);
+        if doc % 2 == 0 {
+            document.add_vector(sparse, &[doc as f32]);
+        }
+        writer.add_document(document)?;
+        if doc == r || doc == 2 * r + 2 {
+            writer.commit()?;
+            for id in index.searchable_segment_ids()? {
+                if !segment_ids.contains(&id) {
+                    segment_ids.push(id);
+                }
+            }
+        }
+    }
+    for merged in [false, true] {
+        if merged {
+            writer.merge(&segment_ids).wait()?;
+        }
+        let searcher = index.reader()?.searcher();
+        let mut doc_start = 0;
+        // Inspect each segment's exact bytes through the public row API. Its dense vector is the
+        // identity oracle.
+        for segment in searcher.segment_readers() {
+            let dense_reader = segment.vector_index(dense)?;
+            let sparse_reader = segment.vector_index(sparse)?;
+            for row in [0, r - 1, r, dense_reader.num_vectors().saturating_sub(1)] {
+                if row >= dense_reader.num_vectors() {
+                    continue;
+                }
+                let bytes = dense_reader
+                    .vector_bytes_for_row(BlockAddress::new((row / r) as u32, (row % r) as u32))?;
+                let value = f32::from_le_bytes(bytes.as_slice().try_into().unwrap()) as usize;
+                if let Some(sparse_bytes) = sparse_reader.vector_bytes(row as u32)? {
+                    assert_eq!(value % 2, 0);
+                    assert_eq!(bytes.as_slice(), sparse_bytes.as_slice());
+                } else {
+                    assert_eq!(value % 2, 1);
+                }
+            }
+            doc_start += dense_reader.num_vectors();
+        }
+        assert_eq!(doc_start, 2 * r + 3);
+    }
+    Ok(())
+}
+
+#[test]
+fn unsupported_vector_versions_remain_typed_on_open_and_merge() -> crate::Result<()> {
+    use crate::directory::error::Incompatibility;
+    use crate::directory::{Directory, RamDirectory};
+    use crate::index::SegmentComponent;
+    for version in [3u32, 4, 6, 99] {
+        let directory = RamDirectory::create();
+        let mut schema = Schema::builder();
+        let field = schema.add_vector_field("v", VectorOptions::new(2, Metric::L2));
+        let index = Index::create(directory.clone(), schema.build(), IndexSettings::default())?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for value in [1.0, 2.0] {
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(field, &[value, 0.0]);
+            writer.add_document(doc)?;
+            writer.commit()?;
+        }
+        let segment = index.searchable_segments()?.remove(0);
+        let path = segment.relative_path(SegmentComponent::Custom(
+            crate::vector::storage::header::VEC_EXT.into(),
+        ));
+        let mut bytes = directory.atomic_read(&path)?;
+        bytes[..4].copy_from_slice(&version.to_le_bytes());
+        directory.atomic_write(&path, &bytes)?;
+        let reader = crate::SegmentReader::open(&segment)?;
+        let assert_typed = |error| {
+            assert!(
+                matches!(error,
+            crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch {
+                index_version, supported_version: 5,
+            }) if index_version == version),
+                "version {version}: {error:?}"
+            )
+        };
+        assert_typed(segment.validate_vector_format().unwrap_err());
+        assert_typed(reader.validate_vector_format().unwrap_err());
+        assert_typed(
+            reader
+                .vector_index(field)
+                .err()
+                .expect("unsupported vector reader"),
+        );
+        assert_typed(reader.vector_metadata(field).unwrap_err());
+        assert_typed(
+            writer
+                .merge_foreground(&index.searchable_segment_ids()?, true)
+                .unwrap_err(),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()> {
+    use std::io::Write;
+
+    use common::TerminatingWrite;
+
+    use crate::directory::error::Incompatibility;
+    use crate::directory::{CompositeWrite, Directory, RamDirectory};
+    use crate::index::SegmentComponent;
+
+    let directory = RamDirectory::create();
+    let mut schema = Schema::builder();
+    let field = schema.add_vector_field("v", VectorOptions::new(2, Metric::L2));
+    let index = Index::create(directory.clone(), schema.build(), IndexSettings::default())?;
+    let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+    let mut doc = TantivyDocument::new();
+    doc.add_vector(field, &[1.0, 0.0]);
+    writer.add_document(doc)?;
+    writer.commit()?;
+    let segment = index.searchable_segments()?.remove(0);
+    let vec_path = segment.relative_path(SegmentComponent::Custom(
+        crate::vector::storage::header::VEC_EXT.into(),
+    ));
+    let mut bytes = directory.atomic_read(&vec_path)?;
+    let mut centroids = 5u32.to_le_bytes().to_vec();
+    let mut composite = CompositeWrite::wrap(&mut centroids);
+    for slot in [crate::vector::storage::header::CentroidSlot::Centroids] {
+        composite
+            .for_field_with_idx(field, slot.index())
+            .write_all(&[0; 8])?;
+    }
+    composite.close()?;
+    let mut centroid_file = segment.open_write(SegmentComponent::Custom(
+        crate::vector::storage::header::CENTROIDS_EXT.into(),
+    ))?;
+    centroid_file.write_all(&centroids)?;
+    centroid_file.terminate()?;
+    for version in [2u32, 3, 4, 5, 6] {
+        bytes[..4].copy_from_slice(&version.to_le_bytes());
+        directory.atomic_write(&vec_path, &bytes)?;
+        let reader = crate::SegmentReader::open(&segment)?;
+        let error = reader
+            .vector_index(field)
+            .err()
+            .expect("unsupported segment");
+        if version == 5 {
+            segment.validate_vector_format()?;
+            reader.validate_vector_format()?;
+            assert!(
+                matches!(error, crate::TantivyError::InternalError(ref message) if message.contains("no router slot")),
+                "{error:?}"
+            );
+        } else {
+            for error in [
+                segment.validate_vector_format().unwrap_err(),
+                reader.validate_vector_format().unwrap_err(),
+            ] {
+                assert!(
+                    matches!(error, crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch { index_version, supported_version: 5 }) if index_version == version),
+                    "{error:?}"
+                );
+            }
+            assert!(
+                matches!(error, crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch { index_version, supported_version: 5 }) if index_version == version),
+                "{error:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A `.centroids` router slot holding the graph router's code 0 fails format validation as an
+/// incompatible index.
+#[test]
+fn graph_router_segments_fail_format_validation() -> crate::Result<()> {
+    use std::io::Write;
+
+    use common::TerminatingWrite;
+
+    use crate::directory::error::Incompatibility;
+    use crate::directory::{CompositeWrite, RamDirectory};
+    use crate::index::SegmentComponent;
+
+    let mut schema = Schema::builder();
+    let field = schema.add_vector_field("v", VectorOptions::new(2, Metric::L2));
+    let index = Index::create(
+        RamDirectory::create(),
+        schema.build(),
+        IndexSettings::default(),
+    )?;
+    let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+    let mut doc = TantivyDocument::new();
+    doc.add_vector(field, &[1.0, 0.0]);
+    writer.add_document(doc)?;
+    writer.commit()?;
+    let segment = index.searchable_segments()?.remove(0);
+    let mut centroids = 5u32.to_le_bytes().to_vec();
+    let mut composite = CompositeWrite::wrap(&mut centroids);
+    composite
+        .for_field_with_idx(
+            field,
+            crate::vector::storage::header::CentroidSlot::Router.index(),
+        )
+        .write_all(&[0, 1, 2])?;
+    composite.close()?;
+    let mut file = segment.open_write(SegmentComponent::Custom(
+        crate::vector::storage::header::CENTROIDS_EXT.into(),
+    ))?;
+    file.write_all(&centroids)?;
+    file.terminate()?;
+
+    let reader = crate::SegmentReader::open(&segment)?;
+    for error in [
+        segment.validate_vector_format().unwrap_err(),
+        reader.validate_vector_format().unwrap_err(),
+    ] {
+        assert!(
+            matches!(
+                error,
+                crate::TantivyError::IncompatibleIndex(Incompatibility::VectorRouterMismatch {
+                    kind: 0
+                })
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("rebuild required"), "{error}");
+    }
+    Ok(())
+}
+
+#[test]
+fn segments_without_vector_files_pass_format_validation() -> crate::Result<()> {
+    use crate::directory::RamDirectory;
+
+    let mut schema = Schema::builder();
+    let label = schema.add_text_field("label", STRING);
+    let index = Index::create(
+        RamDirectory::create(),
+        schema.build(),
+        IndexSettings::default(),
+    )?;
+    let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+    let mut doc = TantivyDocument::new();
+    doc.add_text(label, "present");
+    writer.add_document(doc)?;
+    writer.commit()?;
+    let segment = index.searchable_segments()?.remove(0);
+    segment.validate_vector_format()?;
+    crate::SegmentReader::open(&segment)?.validate_vector_format()?;
+    Ok(())
+}

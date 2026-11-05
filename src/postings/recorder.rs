@@ -1,0 +1,500 @@
+use common::read_u32_vint;
+use stacker::{ExpUnrolledLinkedList, MemoryArena};
+
+use crate::indexer::doc_id_mapping::DocIdMapping;
+use crate::postings::FieldSerializer;
+use crate::DocId;
+
+const POSITION_END: u32 = 0;
+
+#[derive(Default)]
+pub(crate) struct BufferLender {
+    pub buffer_u8: Vec<u8>,
+    pub buffer_u32: Vec<u32>,
+    pub doc_id_and_tf: Vec<(u32, u32)>,
+    pub buffer_positions_flat: Vec<u32>,
+    pub doc_id_and_offsets: Vec<(u32, u32, u32)>,
+}
+
+impl BufferLender {
+    pub fn lend_u8(&mut self) -> &mut Vec<u8> {
+        self.buffer_u8.clear();
+        &mut self.buffer_u8
+    }
+    pub fn lend_all(&mut self) -> (&mut Vec<u8>, &mut Vec<u32>) {
+        self.buffer_u8.clear();
+        self.buffer_u32.clear();
+        (&mut self.buffer_u8, &mut self.buffer_u32)
+    }
+}
+
+pub struct VInt32Reader<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> VInt32Reader<'a> {
+    fn new(data: &'a [u8]) -> VInt32Reader<'a> {
+        VInt32Reader { data }
+    }
+}
+
+impl Iterator for VInt32Reader<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        if self.data.is_empty() {
+            None
+        } else {
+            Some(read_u32_vint(&mut self.data))
+        }
+    }
+}
+
+/// `Recorder` is in charge of recording relevant information about
+/// the presence of a term in a document.
+///
+/// Depending on the [`TextOptions`](crate::schema::TextOptions) associated
+/// with the field, the recorder may record:
+///   * the document frequency
+///   * the document id
+///   * the term frequency
+///   * the term positions
+pub(crate) trait Recorder: Copy + Default + Send + Sync + 'static {
+    /// Returns the current document
+    fn current_doc(&self) -> u32;
+    /// Starts recording information about a new document
+    /// This method shall only be called if the term is within the document.
+    fn new_doc(&mut self, doc: DocId, arena: &mut MemoryArena);
+    /// Record the position of a term. For each document,
+    /// this method will be called `term_freq` times.
+    fn record_position(&mut self, position: u32, arena: &mut MemoryArena);
+    /// Close the document. It will help record the term frequency.
+    fn close_doc(&mut self, arena: &mut MemoryArena);
+    /// Pushes the postings information to the serializer.
+    fn serialize(
+        &self,
+        arena: &MemoryArena,
+        doc_id_map: Option<&DocIdMapping>,
+        serializer: &mut FieldSerializer<'_>,
+        buffer_lender: &mut BufferLender,
+    );
+    /// Returns the number of document containing this term.
+    ///
+    /// Returns `None` if not available.
+    fn term_doc_freq(&self) -> Option<u32>;
+
+    #[inline]
+    fn has_term_freq(&self) -> bool {
+        true
+    }
+}
+
+/// Only records the doc ids
+#[derive(Clone, Copy, Default)]
+pub struct DocIdRecorder {
+    stack: ExpUnrolledLinkedList,
+    current_doc: DocId,
+}
+
+impl Recorder for DocIdRecorder {
+    #[inline]
+    fn current_doc(&self) -> DocId {
+        self.current_doc
+    }
+
+    #[inline]
+    fn new_doc(&mut self, doc: DocId, arena: &mut MemoryArena) {
+        let delta = doc - self.current_doc;
+        self.current_doc = doc;
+        self.stack.writer(arena).write_u32_vint(delta);
+    }
+
+    #[inline]
+    fn record_position(&mut self, _position: u32, _arena: &mut MemoryArena) {}
+
+    #[inline]
+    fn close_doc(&mut self, _arena: &mut MemoryArena) {}
+
+    fn serialize(
+        &self,
+        arena: &MemoryArena,
+        doc_id_map: Option<&DocIdMapping>,
+        serializer: &mut FieldSerializer<'_>,
+        buffer_lender: &mut BufferLender,
+    ) {
+        let (buffer, doc_ids) = buffer_lender.lend_all();
+        // TODO avoid reading twice.
+        self.stack.read_to_end(arena, buffer);
+        if let Some(doc_id_map) = doc_id_map {
+            let iter = get_sum_reader(VInt32Reader::new(&buffer[..]));
+            doc_ids.extend(iter.map(|old_doc_id| doc_id_map.get_new_doc_id(old_doc_id)));
+            doc_ids.sort_unstable();
+
+            for doc in doc_ids {
+                serializer.write_doc(*doc, 0u32, &[][..]);
+            }
+        } else {
+            let iter = get_sum_reader(VInt32Reader::new(&buffer[..]));
+            for doc_id in iter {
+                serializer.write_doc(doc_id, 0u32, &[][..]);
+            }
+        }
+    }
+
+    fn term_doc_freq(&self) -> Option<u32> {
+        None
+    }
+
+    fn has_term_freq(&self) -> bool {
+        false
+    }
+}
+
+/// Takes an Iterator of delta encoded elements and returns an iterator
+/// that yields the sum of the elements.
+fn get_sum_reader(iter: impl Iterator<Item = u32>) -> impl Iterator<Item = u32> {
+    iter.scan(0, |state, delta| {
+        *state += delta;
+        Some(*state)
+    })
+}
+
+/// Recorder encoding document ids, and term frequencies
+#[derive(Clone, Copy, Default)]
+pub struct TermFrequencyRecorder {
+    stack: ExpUnrolledLinkedList,
+    current_doc: DocId,
+    current_tf: u32,
+    term_doc_freq: u32,
+}
+
+impl Recorder for TermFrequencyRecorder {
+    #[inline]
+    fn current_doc(&self) -> DocId {
+        self.current_doc
+    }
+
+    #[inline]
+    fn new_doc(&mut self, doc: DocId, arena: &mut MemoryArena) {
+        let delta = doc - self.current_doc;
+        self.term_doc_freq += 1;
+        self.current_doc = doc;
+        self.stack.writer(arena).write_u32_vint(delta);
+    }
+
+    #[inline]
+    fn record_position(&mut self, _position: u32, _arena: &mut MemoryArena) {
+        self.current_tf += 1;
+    }
+
+    #[inline]
+    fn close_doc(&mut self, arena: &mut MemoryArena) {
+        debug_assert!(self.current_tf > 0);
+        self.stack.writer(arena).write_u32_vint(self.current_tf);
+        self.current_tf = 0;
+    }
+
+    fn serialize(
+        &self,
+        arena: &MemoryArena,
+        doc_id_map: Option<&DocIdMapping>,
+        serializer: &mut FieldSerializer<'_>,
+        buffer_lender: &mut BufferLender,
+    ) {
+        if let Some(doc_id_map) = doc_id_map {
+            buffer_lender.buffer_u8.clear();
+            buffer_lender.doc_id_and_tf.clear();
+            let buffer = &mut buffer_lender.buffer_u8;
+            self.stack.read_to_end(arena, buffer);
+            let mut u32_it = VInt32Reader::new(&buffer[..]);
+
+            let doc_id_and_tf = &mut buffer_lender.doc_id_and_tf;
+            let mut prev_doc = 0;
+            while let Some(delta_doc_id) = u32_it.next() {
+                let doc_id = prev_doc + delta_doc_id;
+                prev_doc = doc_id;
+                let term_freq = u32_it.next().unwrap_or(self.current_tf);
+                doc_id_and_tf.push((doc_id_map.get_new_doc_id(doc_id), term_freq));
+            }
+            doc_id_and_tf.sort_unstable_by_key(|&(doc_id, _)| doc_id);
+
+            for &(doc_id, tf) in doc_id_and_tf.iter() {
+                serializer.write_doc(doc_id, tf, &[][..]);
+            }
+        } else {
+            let buffer = buffer_lender.lend_u8();
+            self.stack.read_to_end(arena, buffer);
+            let mut u32_it = VInt32Reader::new(&buffer[..]);
+            let mut prev_doc = 0;
+            while let Some(delta_doc_id) = u32_it.next() {
+                let doc_id = prev_doc + delta_doc_id;
+                prev_doc = doc_id;
+                let term_freq = u32_it.next().unwrap_or(self.current_tf);
+                serializer.write_doc(doc_id, term_freq, &[][..]);
+            }
+        }
+    }
+
+    fn term_doc_freq(&self) -> Option<u32> {
+        Some(self.term_doc_freq)
+    }
+}
+
+/// Recorder encoding term frequencies as well as positions.
+#[derive(Clone, Copy, Default)]
+pub struct TfAndPositionRecorder {
+    stack: ExpUnrolledLinkedList,
+    current_doc: DocId,
+    term_doc_freq: u32,
+}
+
+impl Recorder for TfAndPositionRecorder {
+    #[inline]
+    fn current_doc(&self) -> DocId {
+        self.current_doc
+    }
+
+    #[inline]
+    fn new_doc(&mut self, doc: DocId, arena: &mut MemoryArena) {
+        let delta = doc - self.current_doc;
+        self.current_doc = doc;
+        self.term_doc_freq += 1u32;
+        self.stack.writer(arena).write_u32_vint(delta);
+    }
+
+    #[inline]
+    fn record_position(&mut self, position: u32, arena: &mut MemoryArena) {
+        self.stack
+            .writer(arena)
+            .write_u32_vint(position.wrapping_add(1u32));
+    }
+
+    #[inline]
+    fn close_doc(&mut self, arena: &mut MemoryArena) {
+        self.stack.writer(arena).write_u32_vint(POSITION_END);
+    }
+
+    fn serialize(
+        &self,
+        arena: &MemoryArena,
+        doc_id_map: Option<&DocIdMapping>,
+        serializer: &mut FieldSerializer<'_>,
+        buffer_lender: &mut BufferLender,
+    ) {
+        if let Some(doc_id_map) = doc_id_map {
+            buffer_lender.buffer_u8.clear();
+            buffer_lender.buffer_positions_flat.clear();
+            buffer_lender.doc_id_and_offsets.clear();
+
+            let buffer_u8 = &mut buffer_lender.buffer_u8;
+            self.stack.read_to_end(arena, buffer_u8);
+            let mut u32_it = VInt32Reader::new(&buffer_u8[..]);
+
+            let buffer_positions_flat = &mut buffer_lender.buffer_positions_flat;
+            let doc_id_and_offsets = &mut buffer_lender.doc_id_and_offsets;
+
+            let mut prev_doc = 0;
+            while let Some(delta_doc_id) = u32_it.next() {
+                let doc_id = prev_doc + delta_doc_id;
+                prev_doc = doc_id;
+
+                let start_offset = buffer_positions_flat.len() as u32;
+                let mut prev_position_plus_one = 1u32;
+
+                loop {
+                    match u32_it.next() {
+                        Some(POSITION_END) | None => {
+                            break;
+                        }
+                        Some(position_plus_one) => {
+                            let delta_position = position_plus_one - prev_position_plus_one;
+                            buffer_positions_flat.push(delta_position);
+                            prev_position_plus_one = position_plus_one;
+                        }
+                    }
+                }
+
+                let end_offset = buffer_positions_flat.len() as u32;
+                doc_id_and_offsets.push((
+                    doc_id_map.get_new_doc_id(doc_id),
+                    start_offset,
+                    end_offset,
+                ));
+            }
+
+            doc_id_and_offsets.sort_unstable_by_key(|&(doc_id, _, _)| doc_id);
+            for &(doc_id, start_offset, end_offset) in doc_id_and_offsets.iter() {
+                let positions =
+                    &buffer_positions_flat[(start_offset as usize)..(end_offset as usize)];
+                serializer.write_doc(doc_id, positions.len() as u32, positions);
+            }
+        } else {
+            let (buffer_u8, buffer_positions) = buffer_lender.lend_all();
+            self.stack.read_to_end(arena, buffer_u8);
+            let mut u32_it = VInt32Reader::new(&buffer_u8[..]);
+            let mut prev_doc = 0;
+            while let Some(delta_doc_id) = u32_it.next() {
+                let doc_id = prev_doc + delta_doc_id;
+                prev_doc = doc_id;
+                let mut prev_position_plus_one = 1u32;
+                buffer_positions.clear();
+                loop {
+                    match u32_it.next() {
+                        Some(POSITION_END) | None => {
+                            break;
+                        }
+                        Some(position_plus_one) => {
+                            let delta_position = position_plus_one - prev_position_plus_one;
+                            buffer_positions.push(delta_position);
+                            prev_position_plus_one = position_plus_one;
+                        }
+                    }
+                }
+                serializer.write_doc(doc_id, buffer_positions.len() as u32, buffer_positions);
+            }
+        }
+    }
+
+    fn term_doc_freq(&self) -> Option<u32> {
+        Some(self.term_doc_freq)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common::write_u32_vint;
+    use stacker::MemoryArena;
+
+    use super::{BufferLender, Recorder, TermFrequencyRecorder, VInt32Reader};
+
+    #[test]
+    fn test_buffer_lender() {
+        let mut buffer_lender = BufferLender::default();
+        {
+            let buf = buffer_lender.lend_u8();
+            assert!(buf.is_empty());
+            buf.push(1u8);
+        }
+        {
+            let buf = buffer_lender.lend_u8();
+            assert!(buf.is_empty());
+            buf.push(1u8);
+        }
+        {
+            let (_, buf) = buffer_lender.lend_all();
+            assert!(buf.is_empty());
+            buf.push(1u32);
+        }
+        {
+            let (_, buf) = buffer_lender.lend_all();
+            assert!(buf.is_empty());
+            buf.push(1u32);
+        }
+    }
+
+    #[test]
+    fn test_vint_u32() {
+        let mut buffer = vec![];
+        let vals = [0, 1, 324_234_234, u32::MAX];
+        for &i in &vals {
+            assert!(write_u32_vint(i, &mut buffer).is_ok());
+        }
+        assert_eq!(buffer.len(), 1 + 1 + 5 + 5);
+        let res: Vec<u32> = VInt32Reader::new(&buffer[..]).collect();
+        assert_eq!(&res[..], &vals[..]);
+    }
+
+    // ── TermFrequencyRecorder ─────────────────────────────────────────────────
+
+    #[test]
+    fn term_frequency_recorder_has_term_freq() {
+        let rec = TermFrequencyRecorder::default();
+        assert!(
+            rec.has_term_freq(),
+            "TermFrequencyRecorder must advertise term-frequency support"
+        );
+    }
+
+    #[test]
+    fn term_frequency_recorder_term_doc_freq_single_doc() {
+        let mut arena = MemoryArena::default();
+        let mut rec = TermFrequencyRecorder::default();
+
+        // Record one document with two term occurrences.
+        rec.new_doc(0, &mut arena);
+        rec.record_position(0, &mut arena);
+        rec.record_position(1, &mut arena);
+        rec.close_doc(&mut arena);
+
+        assert_eq!(
+            rec.term_doc_freq(),
+            Some(1),
+            "term_doc_freq should be 1 after recording one document"
+        );
+    }
+
+    #[test]
+    fn term_frequency_recorder_term_doc_freq_multiple_docs() {
+        let mut arena = MemoryArena::default();
+        let mut rec = TermFrequencyRecorder::default();
+
+        // Three documents with 1, 3, and 2 occurrences respectively.
+        for (doc, tf) in [(0u32, 1u32), (5, 3), (10, 2)] {
+            rec.new_doc(doc, &mut arena);
+            for pos in 0..tf {
+                rec.record_position(pos, &mut arena);
+            }
+            rec.close_doc(&mut arena);
+        }
+
+        assert_eq!(
+            rec.term_doc_freq(),
+            Some(3),
+            "term_doc_freq should equal the number of documents recorded"
+        );
+    }
+
+    #[test]
+    fn term_frequency_recorder_zero_docs() {
+        let rec = TermFrequencyRecorder::default();
+        assert_eq!(
+            rec.term_doc_freq(),
+            Some(0),
+            "term_doc_freq should be 0 before any document is recorded"
+        );
+    }
+
+    #[test]
+    fn term_frequency_recorder_single_occurrence_per_doc() {
+        let mut arena = MemoryArena::default();
+        let mut rec = TermFrequencyRecorder::default();
+
+        // Each document has exactly one occurrence — the minimum non-trivial case.
+        for doc in [1u32, 2, 100] {
+            rec.new_doc(doc, &mut arena);
+            rec.record_position(0, &mut arena);
+            rec.close_doc(&mut arena);
+        }
+
+        assert_eq!(rec.term_doc_freq(), Some(3));
+    }
+
+    #[test]
+    fn term_frequency_recorder_high_frequency_doc() {
+        let mut arena = MemoryArena::default();
+        let mut rec = TermFrequencyRecorder::default();
+
+        // A document where the term appears many times.
+        rec.new_doc(42, &mut arena);
+        for pos in 0..1000 {
+            rec.record_position(pos, &mut arena);
+        }
+        rec.close_doc(&mut arena);
+
+        assert_eq!(
+            rec.term_doc_freq(),
+            Some(1),
+            "term_doc_freq counts documents, not occurrences"
+        );
+    }
+}

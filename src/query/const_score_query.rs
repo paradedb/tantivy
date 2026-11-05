@@ -1,0 +1,230 @@
+use std::fmt;
+
+use common::TinySet;
+
+use crate::docset::{SeekDangerResult, BLOCK_NUM_TINYBITSETS, COLLECT_BLOCK_BUFFER_LEN};
+use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::schema::Field;
+use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
+
+/// `ConstScoreQuery` is a wrapper over a query to provide a constant score.
+/// It can avoid unnecessary score computation on the wrapped query.
+///
+/// The document set matched by the `ConstScoreQuery` is strictly the same as the underlying query.
+/// The configured score is used for each document.
+pub struct ConstScoreQuery<Q = Box<dyn Query>> {
+    query: Q,
+    score: Score,
+}
+
+impl<Q> ConstScoreQuery<Q> {
+    /// Builds a const score query.
+    pub fn new(query: Q, score: Score) -> ConstScoreQuery<Q> {
+        ConstScoreQuery { query, score }
+    }
+
+    /// Returns the underlying query.
+    pub fn query(&self) -> &Q {
+        &self.query
+    }
+
+    /// Returns the constant score.
+    pub fn score(&self) -> Score {
+        self.score
+    }
+}
+
+impl<Q: Clone> Clone for ConstScoreQuery<Q> {
+    fn clone(&self) -> Self {
+        ConstScoreQuery {
+            query: self.query.clone(),
+            score: self.score,
+        }
+    }
+}
+
+impl<Q: fmt::Debug> fmt::Debug for ConstScoreQuery<Q> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Const(score={}, query={:?})", self.score, self.query)
+    }
+}
+
+impl<Q: Query + Clone> Query for ConstScoreQuery<Q> {
+    fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+        let inner_weight = self.query.weight(enable_scoring)?;
+        Ok(if enable_scoring.is_scoring_enabled() {
+            Box::new(ConstWeight::new(inner_weight, self.score))
+        } else {
+            inner_weight
+        })
+    }
+
+    fn query_terms(
+        &self,
+        field: Field,
+        segment_reader: &SegmentReader,
+        visitor: &mut dyn FnMut(&Term, bool),
+    ) {
+        self.query.query_terms(field, segment_reader, visitor);
+    }
+}
+
+struct ConstWeight {
+    weight: Box<dyn Weight>,
+    score: Score,
+}
+
+impl ConstWeight {
+    pub fn new(weight: Box<dyn Weight>, score: Score) -> Self {
+        ConstWeight { weight, score }
+    }
+}
+
+impl Weight for ConstWeight {
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
+        let inner_scorer = self.weight.scorer(reader, boost)?;
+        Ok(Box::new(ConstScorer::new(inner_scorer, boost * self.score)))
+    }
+
+    fn scorer_for_candidates_unpositioned(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        candidate_size: u32,
+    ) -> crate::Result<Box<dyn Scorer>> {
+        let inner_scorer =
+            self.weight
+                .scorer_for_candidates_unpositioned(reader, boost, candidate_size)?;
+        Ok(Box::new(ConstScorer::new(inner_scorer, boost * self.score)))
+    }
+
+    fn explain(&self, reader: &SegmentReader, doc: u32) -> crate::Result<Explanation> {
+        let mut scorer = self.scorer(reader, 1.0)?;
+        if scorer.seek(doc) != doc {
+            return Err(TantivyError::InvalidArgument(format!(
+                "Document #({doc}) does not match"
+            )));
+        }
+        let mut explanation = Explanation::new("Const", self.score);
+        let underlying_explanation = self.weight.explain(reader, doc)?;
+        explanation.add_detail(underlying_explanation);
+        Ok(explanation)
+    }
+
+    fn count(&self, reader: &SegmentReader) -> crate::Result<u32> {
+        self.weight.count(reader)
+    }
+}
+
+/// Wraps a `DocSet` and simply returns a constant `Scorer`.
+/// The `ConstScorer` is useful if you have a `DocSet` where
+/// you needed a scorer.
+///
+/// The `ConstScorer`'s constant score can be set
+/// by calling `.set_score(...)`.
+pub struct ConstScorer<TDocSet: DocSet> {
+    docset: TDocSet,
+    score: Score,
+}
+
+impl<TDocSet: DocSet> ConstScorer<TDocSet> {
+    /// Creates a new `ConstScorer`.
+    pub fn new(docset: TDocSet, score: Score) -> ConstScorer<TDocSet> {
+        ConstScorer { docset, score }
+    }
+}
+
+impl<TDocSet: DocSet> From<TDocSet> for ConstScorer<TDocSet> {
+    fn from(docset: TDocSet) -> Self {
+        ConstScorer::new(docset, 1.0)
+    }
+}
+
+impl<TDocSet: DocSet> DocSet for ConstScorer<TDocSet> {
+    fn advance(&mut self) -> DocId {
+        self.docset.advance()
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        self.docset.seek(target)
+    }
+
+    fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
+        self.docset.seek_danger(target)
+    }
+
+    fn has_fast_bitset(&self) -> bool {
+        self.docset.has_fast_bitset()
+    }
+
+    fn fill_bitset_block(
+        &mut self,
+        base: DocId,
+        mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
+    ) -> DocId {
+        self.docset.fill_bitset_block(base, mask)
+    }
+
+    fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
+        self.docset.fill_buffer(buffer)
+    }
+
+    fn doc(&self) -> DocId {
+        self.docset.doc()
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.docset.size_hint()
+    }
+
+    fn cost(&self) -> u64 {
+        self.docset.cost()
+    }
+}
+
+impl<TDocSet: DocSet + 'static> Scorer for ConstScorer<TDocSet> {
+    #[inline]
+    fn score(&mut self) -> Score {
+        self.score
+    }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        Some(self.score)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConstScoreQuery;
+    use crate::query::{AllQuery, Query};
+    use crate::schema::Schema;
+    use crate::{DocAddress, Index, IndexWriter, TantivyDocument};
+
+    #[test]
+    fn test_const_score_query_explain() -> crate::Result<()> {
+        let schema = Schema::builder().build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        index_writer.add_document(TantivyDocument::new())?;
+        index_writer.commit()?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let query = ConstScoreQuery::new(AllQuery, 0.42);
+        let explanation = query.explain(&searcher, DocAddress::new(0, 0u32)).unwrap();
+        assert_eq!(
+            explanation.to_pretty_json(),
+            r#"{
+  "value": 0.42,
+  "description": "Const",
+  "details": [
+    {
+      "value": 1.0,
+      "description": "AllQuery"
+    }
+  ]
+}"#
+        );
+        Ok(())
+    }
+}

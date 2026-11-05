@@ -1,0 +1,788 @@
+use std::fmt;
+use std::fmt::{Debug, Formatter};
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+
+use super::SegmentComponent;
+use crate::index::SegmentId;
+use crate::schema::Schema;
+use crate::store::Compressor;
+use crate::vector::quantization::validate_quantization_configs;
+use crate::vector::VectorQuantizationConfig;
+use crate::{Inventory, Opstamp, TrackedObject};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeleteMeta {
+    pub num_deleted_docs: u32,
+    pub opstamp: Opstamp,
+}
+
+#[derive(Clone, Default)]
+pub struct SegmentMetaInventory {
+    inventory: Inventory<InnerSegmentMeta>,
+}
+
+impl Debug for SegmentMetaInventory {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SegmentMetaInventory")
+            .field("inventory", &self.inventory.list())
+            .finish()
+    }
+}
+
+impl SegmentMetaInventory {
+    /// Lists all living `SegmentMeta` object at the time of the call.
+    pub fn all(&self) -> Vec<SegmentMeta> {
+        self.inventory
+            .list()
+            .into_iter()
+            .map(SegmentMeta::from)
+            .collect::<Vec<_>>()
+    }
+
+    pub fn new_segment_meta(&self, segment_id: SegmentId, max_doc: u32) -> SegmentMeta {
+        let inner = InnerSegmentMeta {
+            segment_id,
+            max_doc,
+            include_temp_doc_store: Arc::new(AtomicBool::new(true)),
+            deletes: None,
+        };
+        SegmentMeta::from(self.inventory.track(inner))
+    }
+}
+
+/// `SegmentMeta` contains simple meta information about a segment.
+///
+/// For instance the number of docs it contains,
+/// how many are deleted, etc.
+#[derive(Clone)]
+pub struct SegmentMeta {
+    pub tracked: TrackedObject<InnerSegmentMeta>,
+}
+
+impl fmt::Debug for SegmentMeta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        self.tracked.fmt(f)
+    }
+}
+
+impl serde::Serialize for SegmentMeta {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.tracked.serialize(serializer)
+    }
+}
+
+impl From<TrackedObject<InnerSegmentMeta>> for SegmentMeta {
+    fn from(tracked: TrackedObject<InnerSegmentMeta>) -> SegmentMeta {
+        SegmentMeta { tracked }
+    }
+}
+
+impl SegmentMeta {
+    // Creates a new `SegmentMeta` object.
+
+    /// Returns the segment id.
+    pub fn id(&self) -> SegmentId {
+        self.tracked.segment_id
+    }
+
+    /// Removes the Component::TempStore from the alive list and
+    /// therefore marks the temp docstore file to be deleted by
+    /// the garbage collection.
+    pub fn untrack_temp_docstore(&self) {
+        self.tracked
+            .include_temp_doc_store
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns the number of deleted documents.
+    pub fn num_deleted_docs(&self) -> u32 {
+        self.tracked
+            .deletes
+            .as_ref()
+            .map(|delete_meta| delete_meta.num_deleted_docs)
+            .unwrap_or(0u32)
+    }
+
+    pub(crate) fn include_temp_store(&self) -> bool {
+        self.tracked
+            .include_temp_doc_store
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Returns the relative path of a component of our segment.
+    ///
+    /// It just joins the segment id with the extension
+    /// associated with a segment component.
+    pub fn relative_path(&self, component: SegmentComponent) -> PathBuf {
+        let mut path = self.id().uuid_string();
+        path.push_str(&match component {
+            SegmentComponent::Postings => ".idx".to_string(),
+            SegmentComponent::Positions => ".pos".to_string(),
+            SegmentComponent::Terms => ".term".to_string(),
+            SegmentComponent::Store => ".store".to_string(),
+            SegmentComponent::TempStore => ".store.temp".to_string(),
+            SegmentComponent::FastFields => ".fast".to_string(),
+            SegmentComponent::FieldNorms => ".fieldnorm".to_string(),
+            SegmentComponent::PostingNorms => ".pnorm".to_string(),
+            SegmentComponent::PostingBitmaps => ".bmap".to_string(),
+            SegmentComponent::Delete => format!(".{}.del", self.delete_opstamp().unwrap_or(0)),
+            SegmentComponent::Custom(ext) => format!(".{ext}"),
+        });
+        PathBuf::from(path)
+    }
+
+    /// Return the highest doc id + 1
+    ///
+    /// If there are no deletes, then num_docs = max_docs
+    /// and all the doc ids contains in this segment
+    /// are exactly (0..max_doc).
+    pub fn max_doc(&self) -> u32 {
+        self.tracked.max_doc
+    }
+
+    /// Return the number of documents in the segment.
+    pub fn num_docs(&self) -> u32 {
+        self.max_doc() - self.num_deleted_docs()
+    }
+
+    /// Returns the `Opstamp` of the last delete operation
+    /// taken in account in this segment.
+    pub fn delete_opstamp(&self) -> Option<Opstamp> {
+        self.tracked
+            .deletes
+            .as_ref()
+            .map(|delete_meta| delete_meta.opstamp)
+    }
+
+    /// Returns true iff the segment meta contains
+    /// delete information.
+    pub fn has_deletes(&self) -> bool {
+        self.num_deleted_docs() > 0
+    }
+
+    /// Updates the max_doc value from the `SegmentMeta`.
+    pub fn with_max_doc(self, max_doc: u32) -> SegmentMeta {
+        assert_eq!(self.tracked.max_doc, 0);
+        assert!(self.tracked.deletes.is_none());
+        let tracked = self.tracked.map(move |inner_meta| InnerSegmentMeta {
+            segment_id: inner_meta.segment_id,
+            max_doc,
+            deletes: None,
+            include_temp_doc_store: Arc::new(AtomicBool::new(true)),
+        });
+        SegmentMeta { tracked }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_delete_meta(self, num_deleted_docs: u32, opstamp: Opstamp) -> SegmentMeta {
+        assert!(
+            num_deleted_docs <= self.max_doc(),
+            "There cannot be more deleted docs than there are docs."
+        );
+        let delete_meta = DeleteMeta {
+            num_deleted_docs,
+            opstamp,
+        };
+        let tracked = self.tracked.map(move |inner_meta| InnerSegmentMeta {
+            segment_id: inner_meta.segment_id,
+            max_doc: inner_meta.max_doc,
+            include_temp_doc_store: Arc::new(AtomicBool::new(true)),
+            deletes: Some(delete_meta),
+        });
+        SegmentMeta { tracked }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InnerSegmentMeta {
+    pub segment_id: SegmentId,
+    pub max_doc: u32,
+    pub deletes: Option<DeleteMeta>,
+    /// If you want to avoid the SegmentComponent::TempStore file to be covered by
+    /// garbage collection and deleted, set this to true. This is used during merge.
+    #[serde(skip)]
+    #[serde(default = "default_temp_store")]
+    pub include_temp_doc_store: Arc<AtomicBool>,
+}
+fn default_temp_store() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
+impl InnerSegmentMeta {
+    pub fn track(self, inventory: &SegmentMetaInventory) -> SegmentMeta {
+        SegmentMeta {
+            tracked: inventory.inventory.track(self),
+        }
+    }
+}
+
+fn return_true() -> bool {
+    true
+}
+
+fn is_true(val: &bool) -> bool {
+    *val
+}
+
+/// BM25 scoring parameters.
+///
+/// `k1` controls term-frequency saturation (must be non-negative).
+/// `b` controls length normalization (must be in `[0, 1]`).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Bm25Params {
+    k1: f32,
+    b: f32,
+}
+
+impl Bm25Params {
+    pub const DEFAULT: Self = Self { k1: 1.2, b: 0.75 };
+
+    pub fn new(k1: f32, b: f32) -> Self {
+        assert!(k1 >= 0.0, "k1 must be non-negative, got {k1}");
+        assert!((0.0..=1.0).contains(&b), "b must be in [0, 1], got {b}");
+        Self { k1, b }
+    }
+
+    pub fn k1(&self) -> f32 {
+        self.k1
+    }
+
+    pub fn b(&self) -> f32 {
+        self.b
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::DEFAULT
+    }
+}
+
+impl Default for Bm25Params {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+// Uses to_bits() so that -0.0 != 0.0, which is required for Eq soundness
+// (IEEE 754 considers -0.0 == 0.0, but Eq requires consistency with Hash).
+impl PartialEq for Bm25Params {
+    fn eq(&self, other: &Self) -> bool {
+        self.k1.to_bits() == other.k1.to_bits() && self.b.to_bits() == other.b.to_bits()
+    }
+}
+
+impl Eq for Bm25Params {}
+
+/// Search Index Settings.
+///
+/// Contains settings which are applied on the whole
+/// index, like presort documents.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct IndexSettings {
+    /// Sorts the documents by information
+    /// provided in `IndexSortByField`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_by_field: Option<IndexSortByField>,
+    /// If true, enables caller-provided doc id mappings at segment finalization time.
+    /// Always skip serializing this field since it's only used at segment finalization time.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub manual_doc_id_mapping: bool,
+    /// The `Compressor` used to compress the doc store.
+    #[serde(default)]
+    pub docstore_compression: Compressor,
+    /// If set to true, docstore compression will happen on a dedicated thread.
+    /// (defaults: true)
+    #[doc(hidden)]
+    #[serde(default = "return_true")]
+    #[serde(skip_serializing_if = "is_true")]
+    pub docstore_compress_dedicated_thread: bool,
+    #[serde(default = "default_docstore_blocksize")]
+    /// The size of each block that will be compressed and written to disk
+    pub docstore_blocksize: usize,
+    /// Codec types for u64-based column serialization.
+    #[serde(default = "default_codec_types")]
+    #[serde(skip_serializing_if = "is_default_codec_types")]
+    pub codec_types: Vec<columnar::CodecType>,
+    /// Doc-count boundary for choosing the vector-storage format on merge.
+    ///
+    /// A merge whose target segment has strictly fewer than this many
+    /// docs writes `.flatvec`; at or above this many docs writes
+    /// `.ivfvec` (clustered). Exactly one format is written per merge —
+    /// `FlatVecPlugin` and `IvfVecPlugin` short-circuit symmetrically
+    /// off this threshold.
+    #[serde(default = "default_vector_clustering_threshold")]
+    #[serde(skip_serializing_if = "is_default_vector_clustering_threshold")]
+    pub vector_clustering_threshold: usize,
+    /// Per-vector-field quantization configuration. The empty default keeps
+    /// existing and flat-only indexes on the exact path.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub vector_quantization: Vec<VectorQuantizationConfig>,
+    /// Eligibility and storage limits for fields with bitmap postings enabled.
+    #[serde(default, skip_serializing_if = "BitmapPostingsConfig::is_default")]
+    pub bitmap_postings: BitmapPostingsConfig,
+}
+
+/// Must be a function to be compatible with serde defaults
+fn default_docstore_blocksize() -> usize {
+    16_384
+}
+
+fn default_codec_types() -> Vec<columnar::CodecType> {
+    columnar::DEFAULT_CODEC_TYPES.to_vec()
+}
+
+fn is_default_codec_types(types: &[columnar::CodecType]) -> bool {
+    types == columnar::DEFAULT_CODEC_TYPES
+}
+
+fn default_vector_clustering_threshold() -> usize {
+    10_000
+}
+
+fn is_default_vector_clustering_threshold(threshold: &usize) -> bool {
+    *threshold == default_vector_clustering_threshold()
+}
+
+impl Default for IndexSettings {
+    fn default() -> Self {
+        Self {
+            sort_by_field: None,
+            manual_doc_id_mapping: false,
+            docstore_compression: Compressor::default(),
+            docstore_blocksize: default_docstore_blocksize(),
+            docstore_compress_dedicated_thread: true,
+            codec_types: default_codec_types(),
+            vector_clustering_threshold: default_vector_clustering_threshold(),
+            vector_quantization: Vec::new(),
+            bitmap_postings: BitmapPostingsConfig::default(),
+        }
+    }
+}
+
+impl IndexSettings {
+    /// Returns the codec types to use for u64-based column serialization.
+    pub fn columnar_codec_types(&self) -> &[columnar::CodecType] {
+        &self.codec_types
+    }
+
+    /// Returns the doc-count boundary at which merges switch from flat
+    /// to IVF storage. See [`IndexSettings::vector_clustering_threshold`].
+    pub fn vector_clustering_threshold(&self) -> usize {
+        self.vector_clustering_threshold
+    }
+
+    /// Validate field-keyed quantization metadata before an index is built.
+    pub fn validate_vector_quantization(&self, schema: &Schema) -> crate::Result<()> {
+        validate_quantization_configs(&self.vector_quantization, schema)
+    }
+}
+
+/// Settings to presort the documents in an index
+///
+/// Presorting documents can greatly improve performance
+/// in some scenarios, by applying top n
+/// optimizations.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct IndexSortByField {
+    /// The field to sort the documents by
+    pub field: String,
+    /// The order to sort the documents by
+    pub order: Order,
+}
+/// The order to sort by
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum Order {
+    /// Ascending Order
+    Asc,
+    /// Descending Order
+    Desc,
+}
+
+impl Order {
+    /// return if the Order is ascending
+    pub fn is_asc(&self) -> bool {
+        self == &Order::Asc
+    }
+    /// return if the Order is descending
+    pub fn is_desc(&self) -> bool {
+        self == &Order::Desc
+    }
+}
+
+/// Meta information about the `Index`.
+///
+/// This object is serialized on disk in the `meta.json` file.
+/// It keeps information about
+/// * the searchable segments,
+/// * the index `docstamp`
+/// * the schema
+#[derive(Clone, Serialize)]
+pub struct IndexMeta {
+    /// `IndexSettings` to configure index options.
+    #[serde(default)]
+    pub index_settings: IndexSettings,
+    /// Custom (non-built-in) plugin extensions this index was created with.
+    ///
+    /// Fixed at index creation. This is the single source of truth for which
+    /// custom plugins the index requires: garbage collection keeps their files,
+    /// and the writer/merger fails closed if an owning plugin is not registered.
+    /// An index created before this field existed deserializes to empty, i.e.
+    /// built-in plugins only.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub persisted_custom_extensions: Vec<String>,
+    /// List of `SegmentMeta` information associated with each finalized segment of the index.
+    pub segments: Vec<SegmentMeta>,
+    /// Index `Schema`
+    pub schema: Schema,
+    /// Opstamp associated with the last `commit` operation.
+    pub opstamp: Opstamp,
+    /// Payload associated with the last commit.
+    ///
+    /// Upon commit, clients can optionally add a small `String` payload to their commit
+    /// to help identify this commit.
+    /// This payload is entirely unused by tantivy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct UntrackedIndexMeta {
+    pub segments: Vec<InnerSegmentMeta>,
+    #[serde(default)]
+    pub index_settings: IndexSettings,
+    #[serde(default)]
+    pub persisted_custom_extensions: Vec<String>,
+    pub schema: Schema,
+    pub opstamp: Opstamp,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
+}
+
+impl UntrackedIndexMeta {
+    pub fn track(self, inventory: &SegmentMetaInventory) -> IndexMeta {
+        IndexMeta {
+            index_settings: self.index_settings,
+            persisted_custom_extensions: self.persisted_custom_extensions,
+            segments: self
+                .segments
+                .into_iter()
+                .map(|inner_seg_meta| inner_seg_meta.track(inventory))
+                .collect::<Vec<SegmentMeta>>(),
+            schema: self.schema,
+            opstamp: self.opstamp,
+            payload: self.payload,
+        }
+    }
+}
+
+impl IndexMeta {
+    /// Create an `IndexMeta` object representing a brand new `Index`
+    /// with the given index.
+    ///
+    /// This new index does not contains any segments.
+    /// Opstamp will the value `0u64`.
+    pub fn with_schema(schema: Schema) -> IndexMeta {
+        IndexMeta {
+            index_settings: IndexSettings::default(),
+            persisted_custom_extensions: Vec::new(),
+            segments: vec![],
+            schema,
+            opstamp: 0u64,
+            payload: None,
+        }
+    }
+
+    pub(crate) fn deserialize(
+        meta_json: &str,
+        inventory: &SegmentMetaInventory,
+    ) -> serde_json::Result<IndexMeta> {
+        let untracked_meta_json: UntrackedIndexMeta = serde_json::from_str(meta_json)?;
+        Ok(untracked_meta_json.track(inventory))
+    }
+}
+
+impl fmt::Debug for IndexMeta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            serde_json::ser::to_string(self)
+                .expect("JSON serialization for IndexMeta should never fail.")
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::IndexMeta;
+    use crate::index::index_meta::UntrackedIndexMeta;
+    use crate::schema::{Schema, TEXT};
+    use crate::store::Compressor;
+    #[cfg(feature = "zstd-compression")]
+    use crate::store::ZstdCompressor;
+    use crate::{IndexSettings, IndexSortByField, Order};
+
+    #[test]
+    fn test_serialize_metas() {
+        let schema = {
+            let mut schema_builder = Schema::builder();
+            schema_builder.add_text_field("text", TEXT);
+            schema_builder.build()
+        };
+        let index_metas = IndexMeta {
+            index_settings: IndexSettings {
+                docstore_compression: Compressor::None,
+                sort_by_field: Some(IndexSortByField {
+                    field: "text".to_string(),
+                    order: Order::Asc,
+                }),
+                ..Default::default()
+            },
+            persisted_custom_extensions: Vec::new(),
+            segments: Vec::new(),
+            schema,
+            opstamp: 0u64,
+            payload: None,
+        };
+        let json = serde_json::ser::to_string(&index_metas).expect("serialization failed");
+        assert_eq!(
+            json,
+            r#"{"index_settings":{"sort_by_field":{"field":"text","order":"Asc"},"docstore_compression":"none","docstore_blocksize":16384},"segments":[],"schema":[{"name":"text","type":"text","options":{"indexing":{"record":"position","fieldnorms":true,"tokenizer":"default"},"stored":false,"fast":false}}],"opstamp":0}"#
+        );
+
+        let deser_meta: UntrackedIndexMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(index_metas.index_settings, deser_meta.index_settings);
+        assert_eq!(index_metas.schema, deser_meta.schema);
+        assert_eq!(index_metas.opstamp, deser_meta.opstamp);
+    }
+
+    #[test]
+    #[cfg(feature = "zstd-compression")]
+    fn test_serialize_metas_zstd_compressor() {
+        let schema = {
+            let mut schema_builder = Schema::builder();
+            schema_builder.add_text_field("text", TEXT);
+            schema_builder.build()
+        };
+        let index_metas = IndexMeta {
+            index_settings: IndexSettings {
+                sort_by_field: Some(IndexSortByField {
+                    field: "text".to_string(),
+                    order: Order::Asc,
+                }),
+                manual_doc_id_mapping: false,
+                docstore_compression: crate::store::Compressor::Zstd(ZstdCompressor {
+                    compression_level: Some(4),
+                }),
+                docstore_blocksize: 1_000_000,
+                docstore_compress_dedicated_thread: true,
+                ..IndexSettings::default()
+            },
+            persisted_custom_extensions: Vec::new(),
+            segments: Vec::new(),
+            schema,
+            opstamp: 0u64,
+            payload: None,
+        };
+        let json = serde_json::ser::to_string(&index_metas).expect("serialization failed");
+        assert_eq!(
+            json,
+            r#"{"index_settings":{"sort_by_field":{"field":"text","order":"Asc"},"docstore_compression":"zstd(compression_level=4)","docstore_blocksize":1000000},"segments":[],"schema":[{"name":"text","type":"text","options":{"indexing":{"record":"position","fieldnorms":true,"tokenizer":"default"},"stored":false,"fast":false}}],"opstamp":0}"#
+        );
+
+        let deser_meta: UntrackedIndexMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(index_metas.index_settings, deser_meta.index_settings);
+        assert_eq!(index_metas.schema, deser_meta.schema);
+        assert_eq!(index_metas.opstamp, deser_meta.opstamp);
+    }
+
+    #[test]
+    #[cfg(all(feature = "lz4-compression", feature = "zstd-compression"))]
+    fn test_serialize_metas_invalid_comp() {
+        let json = r#"{"index_settings":{"sort_by_field":{"field":"text","order":"Asc"},"docstore_compression":"zsstd","docstore_blocksize":1000000},"segments":[],"schema":[{"name":"text","type":"text","options":{"indexing":{"record":"position","fieldnorms":true,"tokenizer":"default"},"stored":false,"fast":false}}],"opstamp":0}"#;
+
+        let err = serde_json::from_str::<UntrackedIndexMeta>(json).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unknown variant `zsstd`, expected one of `none`, `lz4`, `zstd`, \
+             `zstd(compression_level=5)` at line 1 column 96"
+                .to_string()
+        );
+
+        let json = r#"{"index_settings":{"sort_by_field":{"field":"text","order":"Asc"},"docstore_compression":"zstd(bla=10)","docstore_blocksize":1000000},"segments":[],"schema":[{"name":"text","type":"text","options":{"indexing":{"record":"position","fieldnorms":true,"tokenizer":"default"},"stored":false,"fast":false}}],"opstamp":0}"#;
+
+        let err = serde_json::from_str::<UntrackedIndexMeta>(json).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unknown zstd option \"bla\" at line 1 column 103".to_string()
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "zstd-compression"))]
+    fn test_serialize_metas_unsupported_comp() {
+        let json = r#"{"index_settings":{"sort_by_field":{"field":"text","order":"Asc"},"docstore_compression":"zstd","docstore_blocksize":1000000},"segments":[],"schema":[{"name":"text","type":"text","options":{"indexing":{"record":"position","fieldnorms":true,"tokenizer":"default"},"stored":false,"fast":false}}],"opstamp":0}"#;
+
+        let err = serde_json::from_str::<UntrackedIndexMeta>(json).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unsupported variant `zstd`, please enable Tantivy's `zstd-compression` feature at \
+             line 1 column 95"
+                .to_string()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lz4-compression")]
+    fn test_index_settings_default() {
+        use crate::store::Compressor;
+
+        let mut index_settings = IndexSettings::default();
+        assert_eq!(
+            index_settings,
+            IndexSettings {
+                sort_by_field: None,
+                manual_doc_id_mapping: false,
+                docstore_compression: Compressor::default(),
+                docstore_compress_dedicated_thread: true,
+                docstore_blocksize: 16_384,
+                codec_types: columnar::DEFAULT_CODEC_TYPES.to_vec(),
+                vector_clustering_threshold: 10_000,
+                vector_quantization: Vec::new(),
+                bitmap_postings: super::BitmapPostingsConfig::default(),
+            }
+        );
+        {
+            let index_settings_json = serde_json::to_value(&index_settings).unwrap();
+            assert_eq!(
+                index_settings_json,
+                serde_json::json!({
+                    "docstore_compression": "lz4",
+                    "docstore_blocksize": 16384
+                })
+            );
+            let index_settings_deser: IndexSettings =
+                serde_json::from_value(index_settings_json).unwrap();
+            assert_eq!(index_settings_deser, index_settings);
+        }
+        {
+            // manual_doc_id_mapping should not be persisted.
+            index_settings.manual_doc_id_mapping = true;
+            let index_settings_json = serde_json::to_value(&index_settings).unwrap();
+            assert_eq!(
+                index_settings_json,
+                serde_json::json!({
+                    "docstore_compression": "lz4",
+                    "docstore_blocksize": 16384
+                })
+            );
+            index_settings.manual_doc_id_mapping = false;
+        }
+        {
+            index_settings.docstore_compress_dedicated_thread = false;
+            let index_settings_json = serde_json::to_value(&index_settings).unwrap();
+            assert_eq!(
+                index_settings_json,
+                serde_json::json!({
+                    "docstore_compression": "lz4",
+                    "docstore_blocksize": 16384,
+                    "docstore_compress_dedicated_thread": false,
+                })
+            );
+            let index_settings_deser: IndexSettings =
+                serde_json::from_value(index_settings_json).unwrap();
+            assert_eq!(index_settings_deser, index_settings);
+        }
+    }
+
+    #[test]
+    fn test_codec_types_settings() {
+        use columnar::CodecType;
+
+        // Empty codec_types = default (V1)
+        let settings = IndexSettings::default();
+        assert_eq!(
+            settings.columnar_codec_types(),
+            &[CodecType::Bitpacked, CodecType::BlockwiseLinear]
+        );
+
+        // Explicit codec_types round-trips through JSON
+        let settings = IndexSettings {
+            codec_types: vec![CodecType::Bitpacked, CodecType::Linear],
+            ..IndexSettings::default()
+        };
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(
+            json["codec_types"],
+            serde_json::json!(["Bitpacked", "Linear"])
+        );
+        let deser: IndexSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            deser.codec_types,
+            vec![CodecType::Bitpacked, CodecType::Linear]
+        );
+        assert_eq!(
+            deser.columnar_codec_types(),
+            &[CodecType::Bitpacked, CodecType::Linear]
+        );
+
+        // Missing codec_types in JSON = default (V1)
+        let json = serde_json::json!({
+            "docstore_compression": "none",
+            "docstore_blocksize": 16384
+        });
+        let deser: IndexSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            deser.columnar_codec_types(),
+            &[CodecType::Bitpacked, CodecType::BlockwiseLinear]
+        );
+    }
+}
+
+/// Storage policy for optional dense-term membership bitmaps.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BitmapPostingsConfig {
+    /// Use existing bitmap payloads for unscored queries. Disable for comparison or rollback.
+    pub use_for_queries: bool,
+    /// Minimum percentage of segment document slots containing the term (1..=100).
+    pub min_density_percent: u8,
+    /// Minimum document frequency eligible for a bitmap.
+    pub min_docs: u32,
+}
+
+impl Default for BitmapPostingsConfig {
+    fn default() -> Self {
+        Self {
+            use_for_queries: true,
+            min_density_percent: 10,
+            min_docs: 128,
+        }
+    }
+}
+
+impl BitmapPostingsConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub(crate) fn eligible(&self, doc_freq: u32, max_doc: u32) -> bool {
+        doc_freq >= self.min_docs
+            && doc_freq < max_doc
+            && u64::from(doc_freq) * 100 >= u64::from(max_doc) * u64::from(self.min_density_percent)
+    }
+}

@@ -1,0 +1,25 @@
+tantivy.iml
+.cargo
+proptest-regressions
+*.swp
+target
+target/debug
+.vscode
+target/release
+benchmark
+agg_bench
+.DS_Store
+*.bk
+.idea
+trace.dat
+cargo-timing*
+control
+variable
+
+# for `sample record -p`
+profile.json
+profile.json.gz
+
+# Cohere Embed-V3 1M dump used by benches/ivf_recall.rs (~4 GiB)
+data/data_cohere_1m.bin
+data/sift/
