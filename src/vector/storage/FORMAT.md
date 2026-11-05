@@ -496,7 +496,7 @@ current writer assigns each vector-bearing document to one cluster.
 ```text
 Slot 2: router
 +----------------------------------------------------------------------+
-| router_kind: u8       1 = Stacked, 2 = Exact                         |
+| router_kind: u8       1 = Stacked, 2 = Exact, 3 = QuantizedStacked  |
 +----------------------------------------------------------------------+
 | router_payload       variable length; empty for Exact                |
 +----------------------------------------------------------------------+
@@ -523,8 +523,9 @@ The reader loads list membership ranges eagerly. Centroid rows at every routing
 level remain behind file slices and are read as routing visits those lists.
 
 The Exact router has tag 2 and no payload. It scores the centers from slot 0
-directly. Other router tags are rejected. Readers follow the persisted router
-kind, regardless of the settings used for future builds.
+directly. The opt-in QuantizedStacked router has tag 3, described below. Other
+router tags are rejected. Readers follow the persisted router kind, regardless
+of the settings used for future builds.
 
 ## Quantized stacked router
 
@@ -594,7 +595,7 @@ them. Internal router raw vectors are not required by this final-rerank-only
 policy. Opening validates topology, counts, framing, metric, and dimension.
 Code padding and sidecars are checked as their selected rows are consumed.
 All encoded banks share one zero-origin rotation context, and its query is
-prepared lazily once per routing invocation. Raw posting-list centroid rows
+prepared lazily once per persisted seed during a routing invocation. Raw posting-list centroid rows
 stay file-backed and are fetched only for the final retained candidates.
 
 Query-time list sizing still uses the original `router_k`. The approximate heap
@@ -604,7 +605,13 @@ enabled. The fractional rerank factor is at least 1.0; 1.0 removes padding while
 retaining exact refinement. Only the final posting-list candidates are
 exact-reranked and truncated to `router_k`. Intermediate hierarchy levels use
 unpadded approximate shortlists.
-Non-finite queries bypass sign preparation and use the raw exact scorer.
+Global routing uses the same layer walk across segments, including mixed raw
+and quantized routers and optional coarse partition centroids. Its list beam and
+padded member shortlist are shared across segments; the shortlist is not expanded
+separately for every segment. When quantized routers participate, only retained
+members are read for exact reranking before the global `router_k` selection.
+Full-precision-only global routing can return all scored members to the shared
+probe loop. Non-finite queries bypass sign preparation and use the raw exact scorer.
 
 Representation metadata is persisted. Rerank expansion and APS are query policy
 and are not stored. Building the sign representation does not depend on document

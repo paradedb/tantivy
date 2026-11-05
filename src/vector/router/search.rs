@@ -5,7 +5,9 @@ use std::collections::BinaryHeap;
 
 use super::arena::VectorArena;
 use super::candidate::Candidate;
-use super::scoring::{score_initial, ScoringQuery};
+#[cfg(test)]
+use super::scoring::score_initial;
+use super::scoring::ScoringQuery;
 use super::source::VectorSource;
 use super::stacked::levels::{ClusterId, StackedIvf, StackedSearchStats};
 use crate::vector::distance::Similarity;
@@ -39,18 +41,12 @@ pub(crate) struct SearchPolicy {
 /// A caller explicitly chooses whether selection must produce exact scores.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum OutputPrecision {
+    #[cfg(test)]
     Estimated,
     Exact,
 }
 
-fn precision<S: VectorSource>(source: &S) -> OutputPrecision {
-    if source.raw().is_some() {
-        OutputPrecision::Exact
-    } else {
-        OutputPrecision::Estimated
-    }
-}
-
+#[cfg(test)]
 fn capacity<S: VectorSource>(
     source: &S,
     dim: usize,
@@ -74,6 +70,7 @@ fn capacity<S: VectorSource>(
 
 /// Refine a retained population, without opening additional clusters. Sources
 /// provide representations; this operation owns final selection and its policy.
+#[cfg(test)]
 fn finish<S: VectorSource, T: VectorElement>(
     source: &S,
     query: &ScoringQuery<'_, T>,
@@ -95,6 +92,7 @@ fn finish<S: VectorSource, T: VectorElement>(
 
 /// Score/select any vector bank. Root centroids and flat member scans use the
 /// same operations as the cluster walk, including optional exact refinement.
+#[cfg(test)]
 pub(crate) fn rank_vectors<S: VectorSource, T: VectorElement>(
     source: &S,
     query: &ScoringQuery<'_, T>,
@@ -142,6 +140,7 @@ pub(crate) fn rank_vectors<S: VectorSource, T: VectorElement>(
 
 /// Score whole clusters into one retained population; stopping is observed only
 /// at completed-cluster boundaries and does not force precision refinement.
+#[cfg(test)]
 pub(crate) fn probe_clusters<S: VectorSource, T: VectorElement>(
     level: &StackedIvf<S>,
     query: &ScoringQuery<'_, T>,
@@ -184,8 +183,7 @@ pub(crate) fn probe_clusters<S: VectorSource, T: VectorElement>(
     (result, stats)
 }
 
-/// One walk for all level representations. Parent recursion receives the same
-/// original query/context; representation-specific preparation is lazy.
+/// Single-segment entry point into the same layer walk used by global routing.
 pub(crate) fn search<S: VectorSource, T: VectorElement>(
     level: &StackedIvf<S>,
     query: &ScoringQuery<'_, T>,
@@ -193,47 +191,22 @@ pub(crate) fn search<S: VectorSource, T: VectorElement>(
     policy: SearchPolicy,
     output: OutputPrecision,
 ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-    let members = level.vectors.num_vectors(query.query.widened().len());
-    if k == 0 || members == 0 {
-        return (Vec::new(), StackedSearchStats::default());
-    }
-    assert!(
-        output != OutputPrecision::Exact || level.vectors.raw().is_some(),
-        "exact level output requires raw member rows"
-    );
-    let open = lists_to_open(level.offsets.len(), members, k, policy.min_fraction);
-    let (lists, mut stats) = if let Some(parent) = &level.parent {
-        search(parent, query, open, policy, precision(&parent.vectors))
-    } else {
-        rank_vectors(
-            &level.centroids,
-            query,
-            open,
-            policy,
-            precision(&level.centroids),
-        )
-    };
-    let (retained, probed) = probe_clusters(
-        level,
+    let ranked = super::stacked::search::StackedRouting::Segment(level).search(
         query,
-        lists,
-        capacity(
-            &level.vectors,
-            query.query.widened().len(),
-            k,
-            output,
-            policy,
-        ),
-        policy.aps,
+        k,
+        policy,
+        output,
+        super::stacked::search::TopK,
     );
-    stats.members_scored += probed.members_scored;
-    stats.lists_scanned += probed.lists_scanned;
-    stats.approximate_scored += probed.approximate_scored;
-    stats.leaf_members_scored = probed.leaf_members_scored;
-    stats.leaf_approximate_scored = probed.leaf_approximate_scored;
-    stats.leaf_exact_scored = probed.leaf_exact_scored;
-    let ranked = finish(&level.vectors, query, retained, k, output, &mut stats);
-    (ranked, stats)
+    let candidates = ranked
+        .candidates
+        .into_iter()
+        .map(|candidate| Candidate {
+            sim: candidate.sim,
+            node: ClusterId(candidate.node.1),
+        })
+        .collect();
+    (candidates, ranked.stats[0])
 }
 
 /// Deterministic bounded retention, independent of precision and storage.
@@ -321,36 +294,6 @@ pub(crate) fn rank<S: VectorSource, T: VectorElement>(
     };
     if k == 0 {
         return (Vec::new(), StackedSearchStats::default());
-    }
-    let has_compressed = level.vectors.compressed().is_some()
-        || level
-            .levels()
-            .any(|level| level.centroids.compressed().is_some());
-    if has_compressed
-        && (!query.routing_norm().is_finite() || query.widened().iter().any(|x| !x.is_finite()))
-    {
-        let candidates: Vec<_> = (0..count)
-            .map(|row| Candidate {
-                node: ClusterId::from(row),
-                sim: Similarity::new(0.0),
-            })
-            .collect();
-        let result = rerank_exact(
-            level
-                .vectors
-                .raw()
-                .expect("final routing requires raw rows"),
-            query,
-            &candidates,
-            k,
-        );
-        let stats = StackedSearchStats {
-            leaf_exact_scored: count,
-            members_scored: count,
-            leaf_members_scored: if compressed { 0 } else { count },
-            ..Default::default()
-        };
-        return (result, stats);
     }
     let context = ScoringQuery::new(query);
     let policy = SearchPolicy {
@@ -548,6 +491,12 @@ mod tests {
         assert_eq!(stats.leaf_approximate_scored, 8);
         assert_eq!(stats.leaf_exact_scored, 8);
         assert_eq!(stats.lists_scanned, 6); // two parent lists + four child lists
+        let (_, estimated) = search(&level, &query, 2, policy, OutputPrecision::Estimated);
+        assert_eq!(estimated.leaf_approximate_scored, 8);
+        assert_eq!(
+            estimated.leaf_exact_scored, 0,
+            "estimated output does not fetch final raw rows"
+        );
         let router = super::super::stacked::StackedRouter::new(
             level,
             &crate::schema::VectorOptions::new(dim, Metric::L2),

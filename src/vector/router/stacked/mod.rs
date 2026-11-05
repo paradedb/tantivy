@@ -14,7 +14,7 @@ use crate::vector::router::arena::VectorArena;
 use crate::vector::router::source::{EncodingContext, VectorSet, VectorSource, ROUTER_SEED};
 use crate::vector::router::stacked::levels::{
     serialize_stacked_index, InMemoryStore, LazyStore, StackedIvf, StackedIvfBuilder,
-    StackedIvfConfig, SuperKMeansLevelClusterer, PARENT_NPROBE_FRACTION,
+    StackedIvfConfig, StackedSearchStats, SuperKMeansLevelClusterer, PARENT_NPROBE_FRACTION,
 };
 use crate::vector::router::{RouterIter, RouterKind, RouterMetrics, RoutingParams};
 use crate::vector::search::prepared::VectorQuery;
@@ -248,7 +248,16 @@ pub(super) fn rank<S: VectorSource, T: VectorElement>(
     let compressed = level.vectors.compressed().is_some();
     let (ranked, stats) = super::search::rank(level, query, params);
     let candidate_count = ranked.len();
-    let metrics = if compressed {
+    let metrics = routing_metrics(compressed, candidate_count, stats);
+    RouterIter::new(ranked, metrics)
+}
+
+pub(super) fn routing_metrics(
+    compressed: bool,
+    candidate_count: usize,
+    stats: StackedSearchStats,
+) -> RouterMetrics {
+    if compressed {
         RouterMetrics::QuantizedStacked {
             candidate_count,
             lists_scanned: stats.lists_scanned,
@@ -262,8 +271,7 @@ pub(super) fn rank<S: VectorSource, T: VectorElement>(
             lists_scanned: stats.lists_scanned,
             members_scored: stats.members_scored,
         }
-    };
-    RouterIter::new(ranked, metrics)
+    }
 }
 
 #[cfg(test)]

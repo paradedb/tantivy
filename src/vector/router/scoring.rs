@@ -1,7 +1,8 @@
 //! Precision operations over vector banks. Sources expose data; these functions
 //! prepare queries and score batches without owning retention or stopping.
 
-use std::cell::OnceCell;
+use std::cell::{Ref, RefCell};
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 use quant::cascade::{LayerKind, LayerSpec, Rotation};
@@ -16,31 +17,25 @@ use crate::vector::distance::Similarity;
 use crate::vector::search::prepared::{QuantizedVectorQuery, VectorQuery};
 use crate::vector::VectorElement;
 
-/// One base query with lazily prepared state for the router's shared context.
+/// One base query, prepared lazily once for each rotation seed used by its segments.
 pub(crate) struct ScoringQuery<'q, T: VectorElement> {
     pub(crate) query: &'q VectorQuery<T>,
-    encoded: OnceCell<(u64, QuantizedVectorQuery)>,
+    encoded: RefCell<BTreeMap<u64, QuantizedVectorQuery>>,
 }
 
 impl<'q, T: VectorElement> ScoringQuery<'q, T> {
     pub(crate) fn new(query: &'q VectorQuery<T>) -> Self {
         Self {
             query,
-            encoded: OnceCell::new(),
+            encoded: RefCell::new(BTreeMap::new()),
         }
     }
-    fn prepared(&self, encoding: &EncodingContext) -> &QuantizedVectorQuery {
-        let (seed, prepared) = self.encoded.get_or_init(|| {
-            (
-                encoding.seed,
-                QuantizedVectorQuery::for_sign(self.query, &encoding.rotation),
-            )
-        });
-        assert_eq!(
-            *seed, encoding.seed,
-            "router banks must share their encoding context"
-        );
-        prepared
+    fn prepared(&self, encoding: &EncodingContext) -> Ref<'_, QuantizedVectorQuery> {
+        self.encoded
+            .borrow_mut()
+            .entry(encoding.seed)
+            .or_insert_with(|| QuantizedVectorQuery::for_sign(self.query, &encoding.rotation));
+        Ref::map(self.encoded.borrow(), |prepared| &prepared[&encoding.seed])
     }
 }
 

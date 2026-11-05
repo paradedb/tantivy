@@ -737,7 +737,13 @@ where
             .probe_params
             .router_k(total, x, matched / routed_docs.max(1) as f64, clusters);
     let partitions: Vec<_> = segments.iter().map(|s| s.partition_centroid).collect();
-    let ranking = GlobalRanking::from(&routers, &partitions, &query, k, totals, on_segment);
+    let routing = crate::vector::router::RoutingParams {
+        k,
+        rerank_factor: collector.probe_params.router_rerank_factor,
+        min_beam_fraction: collector.probe_params.router_min_beam_fraction,
+        aps: collector.probe_params.router_aps,
+    };
+    let ranking = GlobalRanking::from(&routers, &partitions, &query, routing, totals, on_segment);
     let mut reserved = WorkUnits::ZERO;
     let mut scans: Vec<_> = (0..vectors.len()).map(|_| None).collect();
     let mut pending_scans = Vec::with_capacity(vectors.len());

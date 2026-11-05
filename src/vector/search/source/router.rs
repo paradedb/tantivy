@@ -242,7 +242,7 @@ impl<'a> RouterClusters<'a> {
         Self {
             index,
             reader,
-            ranked: RouterIter::Global(metrics),
+            ranked: RouterIter::new(Vec::new(), metrics),
             meter: WorkMeter::new(budget),
             controller: ProbeController::new(index.num_clusters()),
             gate: RowGate::new(filter, segment.alive_bitset()),
