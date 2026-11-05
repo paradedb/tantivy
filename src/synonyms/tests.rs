@@ -1,12 +1,15 @@
 //! Tests of synonym expansion over an index, across writes, deletes and merges.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
 use super::*;
 use crate::indexer::NoMergePolicy;
 use crate::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, INDEXED, TEXT,
 };
 use crate::tokenizer::{LowerCaser, SimpleTokenizer, StopWordFilter, TextAnalyzer};
-use crate::{doc, Index, IndexWriter, Searcher, TantivyDocument, TantivyError, Term};
+use crate::{doc, DocId, Index, IndexWriter, Searcher, TantivyDocument, TantivyError, Term};
 
 const RULE_TOKENIZER: &str = "synonym_rule";
 
@@ -366,4 +369,69 @@ fn the_rule_field_is_indexed_and_fast() {
     let searcher = index.reader().unwrap().searcher();
     let err = SynonymExpander::new(searcher.segment_readers(), rule, plain()).unwrap_err();
     assert!(matches!(err, TantivyError::SchemaError(_)), "{err:?}");
+}
+
+/// Keeps what each segment holds for a token across expansions, and asks for liveness each time.
+struct CachingSource {
+    segments: Vec<SegmentSynonyms>,
+    analyzer: TextAnalyzer,
+    cache: HashMap<(usize, String), Arc<[KeyRules]>>,
+    fetches: usize,
+    deleted: HashSet<DocId>,
+}
+
+impl SynonymSource for CachingSource {
+    fn num_segments(&self) -> usize {
+        self.segments.len()
+    }
+
+    fn token_rules(&mut self, segment: usize, token: &str) -> crate::Result<Arc<[KeyRules]>> {
+        let key = (segment, token.to_string());
+        if let Some(rules) = self.cache.get(&key) {
+            return Ok(rules.clone());
+        }
+        self.fetches += 1;
+        let rules: Arc<[KeyRules]> = self.segments[segment]
+            .token_rules(token, &mut self.analyzer)?
+            .into();
+        self.cache.insert(key, rules.clone());
+        Ok(rules)
+    }
+
+    fn is_alive(&mut self, _segment: usize, doc: DocId) -> bool {
+        !self.deleted.contains(&doc)
+    }
+}
+
+#[test]
+fn a_cached_lookup_still_drops_a_rule_deleted_after_it() {
+    let index = RulesIndex::with_rules(plain(), &["running shoes, sneakers", "shoes, footwear"]);
+    let searcher = index.searcher();
+    let mut source = CachingSource {
+        segments: searcher
+            .segment_readers()
+            .iter()
+            .filter_map(|segment_reader| SegmentSynonyms::open(segment_reader, index.rule).unwrap())
+            .collect(),
+        analyzer: plain(),
+        cache: HashMap::new(),
+        fetches: 0,
+        deleted: HashSet::new(),
+    };
+    let tokens = strings(&["running", "shoes"]);
+    assert_eq!(
+        expand(&tokens, &mut source).unwrap(),
+        index.expand(&["running", "shoes"])
+    );
+    let fetches = source.fetches;
+    source.deleted.insert(0);
+    // Only `shoes` is new, since the first expansion matched both tokens at once.
+    assert_eq!(
+        expand(&tokens, &mut source).unwrap(),
+        vec![
+            expanded(&["running"], None),
+            expanded(&["shoes"], Some(&[&["shoes"], &["footwear"]])),
+        ]
+    );
+    assert_eq!(source.fetches, fetches + 1);
 }

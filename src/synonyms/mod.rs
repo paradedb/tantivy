@@ -6,8 +6,10 @@
 //! field is also fast with the `raw` tokenizer, so the expander reads the text of a matched rule
 //! back from its column.
 //!
-//! [`SynonymExpander`] looks the keys up in every segment and rewrites a list of query tokens into
-//! [`Expansion`]s, the longest key first, the way Lucene's `SynonymGraphFilter` does.
+//! [`expand`](fn@expand) looks the keys up in every segment and rewrites a list of query tokens
+//! into [`Expansion`]s, the longest key first, the way Lucene's `SynonymGraphFilter` does. It reads
+//! the rules through a [`SynonymSource`], so a caller can cache what each segment holds for a
+//! token. [`SynonymExpander`] is the source that reads the segment readers on every expansion.
 //!
 //! ```
 //! use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions};
@@ -55,6 +57,8 @@ mod rule;
 mod tests;
 mod tokenizer;
 
-pub use self::expand::{Expansion, SynonymExpander};
+pub use self::expand::{
+    expand, Expansion, KeyRules, RuleAlternatives, SegmentSynonyms, SynonymExpander, SynonymSource,
+};
 pub use self::rule::{RuleError, SynonymRule, MAX_RULE_TERMS};
 pub use self::tokenizer::SynonymRuleTokenizer;

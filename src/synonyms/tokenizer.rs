@@ -11,10 +11,6 @@ pub(crate) fn join_key(tokens: &[String]) -> String {
     tokens.join("\0")
 }
 
-pub(crate) fn key_tokens(key: &[u8]) -> usize {
-    key.iter().filter(|&&byte| byte == KEY_SEPARATOR).count() + 1
-}
-
 /// Indexes a Solr synonym rule, such as `couch, sofa, divan` or `sneakers => running shoes`, as
 /// one term per key, the analyzed tokens of the key joined with a zero byte.
 ///
