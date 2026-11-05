@@ -211,7 +211,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
     {
         let init = enter_vector_stage(VectorStage::ScanInit);
         let plan = SegmentPlan::build(&self.probe_params, index, weight, segment, top_n)?;
-        let capacity = plan.capacity_hint();
+        let capacity = plan.capacity_hint(&self.probe_params);
         let SegmentPlan {
             budget,
             source,
@@ -226,7 +226,11 @@ impl<T: VectorElement> SegmentSearcher<T> {
                 },
             ));
         };
+        let adaptive_probing = matches!(&source, Source::Router(_))
+            .then_some(self.probe_params.adaptive_probing)
+            .flatten();
         let config = ScanConfig {
+            adaptive_probing,
             top_n,
             capacity,
             exact_plan: self.probe_params.exact_plan,
