@@ -1,10 +1,9 @@
 //! Residual quantization cascade and layer-boundary operations: the shared schedule types,
 //! encoding, query preparation and the error-model audits.
 
-use std::borrow::Cow;
-
 use crate::model::Grid;
 use crate::rotation::Rotation as FhtRotation;
+use crate::sign::words_from_le_bytes as aligned_le_words;
 
 mod audit;
 mod encode;
@@ -128,40 +127,10 @@ fn words_to_bytes(words: &[u64]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
-#[inline]
-fn aligned_le_words(bytes: &[u8]) -> Cow<'_, [u64]> {
-    assert_eq!(bytes.len() % std::mem::size_of::<u64>(), 0);
-
-    #[cfg(target_endian = "little")]
-    {
-        // SAFETY: `align_to` validates alignment; empty prefix and suffix gate borrowing.
-        let (prefix, words, suffix) = unsafe { bytes.align_to::<u64>() };
-        if prefix.is_empty()
-            && suffix.is_empty()
-            && words.len() == bytes.len() / std::mem::size_of::<u64>()
-        {
-            return Cow::Borrowed(words);
-        }
-    }
-
-    Cow::Owned(decode_le_words(bytes))
-}
-
-fn decode_le_words(bytes: &[u8]) -> Vec<u64> {
-    assert_eq!(bytes.len() % 8, 0);
-    bytes
-        .chunks(8)
-        .map(|chunk| {
-            let bytes: [u8; 8] = chunk
-                .try_into()
-                .expect("chunk size is fixed at eight bytes");
-            u64::from_le_bytes(bytes)
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use rand_chacha::ChaCha8Rng;
     use rand_core::{RngCore, SeedableRng};
 

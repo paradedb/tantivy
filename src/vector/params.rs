@@ -19,6 +19,18 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 pub struct ProbeParams {
     /// Work ceiling as a fraction of each segment's capacity. Default 0.01.
     pub max_probe_fraction: f32,
+    /// Approximate members retained per requested cluster by the quantized router.
+    /// Fractional values are rounded up to whole candidates and clamped to at
+    /// least 1.0. A factor of 1.0 still reranks exactly; it only removes padding.
+    /// Does not widen list selection. Default 1.0.
+    pub router_rerank_factor: f32,
+    /// Minimum fraction of each quantized router level's lists to open.
+    /// Clamped to [0, 1]; non-finite values use 0.25. Full-precision routing
+    /// keeps its existing beam. Default 0.5.
+    pub router_min_beam_fraction: f32,
+    /// Whether stacked routing may stop after lists cease improving its heap.
+    /// Quantized routing observes its approximate padded heap. Default true.
+    pub router_aps: bool,
     /// Floor on the resolved budget, in work units, applied before the capacity cap. Default 0.
     pub min_probe_clusters: usize,
     /// Lets a quantized segment score a cluster's rows exactly before the exact phase when that
@@ -69,6 +81,9 @@ impl Default for ProbeParams {
     fn default() -> Self {
         Self {
             max_probe_fraction: 0.01,
+            router_rerank_factor: 1.0,
+            router_min_beam_fraction: 0.5,
+            router_aps: true,
             min_probe_clusters: 0,
             exact_plan: true,
             located: LocatedPath::Auto,

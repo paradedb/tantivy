@@ -75,6 +75,7 @@ impl<T: VectorElement, S: std::ops::Deref<Target = [T]>> VectorArena for S {
 /// stride-sized ranged read scored with the byte kernels ([`Metric::similarity_bytes`]).
 ///
 /// [`similarity`]: VectorArena::similarity
+#[derive(Clone)]
 pub(crate) struct FileSliceArena<T> {
     pub(crate) slice: crate::directory::FileSlice,
     _elem: std::marker::PhantomData<T>,

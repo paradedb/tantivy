@@ -203,6 +203,9 @@ impl<'a> RouterClusters<'a> {
             .expect("the router source runs on an IVF segment");
         let clusters = index.num_clusters();
         let routing = RoutingParams {
+            rerank_factor: params.router_rerank_factor,
+            min_beam_fraction: params.router_min_beam_fraction,
+            aps: params.router_aps,
             k: params.router_k(
                 budget.total.get(),
                 budget.per_cluster.get(),
@@ -239,7 +242,7 @@ impl<'a> RouterClusters<'a> {
         Self {
             index,
             reader,
-            ranked: RouterIter::Global(metrics),
+            ranked: RouterIter::new(Vec::new(), metrics),
             meter: WorkMeter::new(budget),
             controller: ProbeController::new(index.num_clusters()),
             gate: RowGate::new(filter, segment.alive_bitset()),

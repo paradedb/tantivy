@@ -405,7 +405,11 @@ fn ivf_cluster_sizes_match_vector_info() -> crate::Result<()> {
 /// none, and flat segments have no router.
 #[test]
 fn vector_info_reports_router_levels() -> crate::Result<()> {
-    for router in [RouterKind::Stacked, RouterKind::Exact] {
+    for router in [
+        RouterKind::Stacked,
+        RouterKind::Exact,
+        RouterKind::QuantizedStacked,
+    ] {
         let index = TestVectorIndex::builder(VectorDType::F32)
             .metric(Metric::L2)
             .vector_storage_format(VectorStorageFormat::Ivf)
@@ -421,7 +425,7 @@ fn vector_info_reports_router_levels() -> crate::Result<()> {
             assert_eq!(info.router, Some(router));
             let levels = info.router_levels.expect("ivf router levels");
             match router {
-                RouterKind::Stacked => {
+                RouterKind::Stacked | RouterKind::QuantizedStacked => {
                     let num_centroids = info.num_centroids.expect("ivf centroids");
                     assert!(!levels.is_empty(), "stacked router has a level");
                     assert!(

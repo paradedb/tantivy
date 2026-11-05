@@ -13,7 +13,7 @@ use crate::grid::{
 };
 use crate::model::f16::{f16_to_f32, f32_to_f16};
 use crate::model::Grid;
-use crate::sign::{encode_f32 as encode_sign, pack as pack_sign, unpack as unpack_sign};
+use crate::sign::{encode_f32 as encode_sign, unpack as unpack_sign};
 
 /// Encoded layers for one vector.
 #[derive(Clone, Debug)]
@@ -364,14 +364,15 @@ fn encode_batch_in_place_reusing<F>(
         });
     for (layer, (spec, grid)) in specs.iter().zip(grids).enumerate() {
         if spec.rotation != Rotation::None {
-            let rotation = centroid.rotation_plan.rotations[layer]
-                .as_ref()
-                .expect("rotating layer must have a prepared rotation");
             for row in vectors.chunks_exact_mut(d) {
-                rotation.apply_with_scratch(row, rotation_scratch);
+                centroid
+                    .rotation_plan
+                    .rotate_layer_in_place(layer, row, rotation_scratch);
             }
             for row in prefix_reconstructions.chunks_exact_mut(d) {
-                rotation.apply_with_scratch(row, rotation_scratch);
+                centroid
+                    .rotation_plan
+                    .rotate_layer_in_place(layer, row, rotation_scratch);
             }
         }
 
@@ -406,8 +407,7 @@ fn encode_batch_in_place_reusing<F>(
         {
             match spec.kind {
                 LayerKind::Sign => {
-                    pack_sign(residual, sign_words);
-                    let scale = residual.iter().map(|value| value.abs()).sum::<f32>() / d as f32;
+                    let scale = encode_sign(residual, sign_words);
                     let constant = if compute_constants {
                         let mut constant = 0.0_f32;
                         for i in 0..d {

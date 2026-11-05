@@ -11,7 +11,7 @@ use crate::directory::FileSlice;
 use crate::schema::VectorOptions;
 use crate::vector::clustering::IvfCentroids;
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::stacked::levels::{InMemoryStore, LazyStore, StackedIvf};
+use crate::vector::router::stacked::levels::{ClusterId, InMemoryStore, LazyStore};
 use crate::vector::search::prepared::VectorQuery;
 use crate::vector::VectorElement;
 use crate::TantivyError;
@@ -20,10 +20,15 @@ pub(crate) mod arena;
 pub(crate) mod candidate;
 mod exact;
 pub(crate) mod global;
+mod quantized;
+mod scoring;
+mod search;
+mod source;
 pub(crate) mod stacked;
 
-/// The routing structure new IVF segments build. Codes are persisted; 0 belonged to the removed
-/// graph router and is never reused.
+/// Build/format compatibility identifiers. Both stacked formats open into the
+/// same runtime algorithm; quantization is a vector representation. Code 0 belonged
+/// to the removed graph router and is never reused.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RouterKind {
@@ -32,6 +37,9 @@ pub enum RouterKind {
     Stacked = 1,
     /// Scores every centroid against the query.
     Exact = 2,
+    /// Opt-in one-bit stacked routing with a padded exact centroid rerank.
+    /// Existing full-precision stacked routing remains the default.
+    QuantizedStacked = 3,
 }
 
 impl RouterKind {
@@ -41,6 +49,7 @@ impl RouterKind {
         match code {
             1 => Ok(Self::Stacked),
             2 => Ok(Self::Exact),
+            3 => Ok(Self::QuantizedStacked),
             kind => Err(TantivyError::IncompatibleIndex(
                 Incompatibility::VectorRouterMismatch { kind },
             )),
@@ -53,8 +62,13 @@ impl RouterKind {
         centroids: &mut IvfCentroids,
     ) -> crate::Result<BuiltRouter> {
         match self {
-            Self::Stacked => Ok(Router::Stacked(stacked::build(options, centroids)?)),
+            Self::Stacked => Ok(Router::Stacked(stacked::StackedRouter::build(
+                options, centroids, false,
+            )?)),
             Self::Exact => Ok(Router::Exact(exact::build(options, centroids))),
+            Self::QuantizedStacked => Ok(Router::Stacked(stacked::StackedRouter::build(
+                options, centroids, true,
+            )?)),
         }
     }
 
@@ -76,8 +90,13 @@ impl RouterKind {
         let persisted = Self::from_code(slot.read_byte(0)?)?;
         let payload = slot.slice_from(1);
         match persisted {
-            Self::Stacked => Ok(Router::Stacked(stacked::open(payload, centroids, options)?)),
+            Self::Stacked => Ok(Router::Stacked(stacked::StackedRouter::open_raw(
+                payload, centroids, options,
+            )?)),
             Self::Exact => Ok(Router::Exact(exact::open(payload, centroids, options)?)),
+            Self::QuantizedStacked => Ok(Router::Stacked(quantized::open(
+                payload, centroids, options,
+            )?)),
         }
     }
 }
@@ -87,12 +106,13 @@ impl fmt::Display for RouterKind {
         formatter.write_str(match self {
             Self::Stacked => "stacked",
             Self::Exact => "exact",
+            Self::QuantizedStacked => "quantized_stacked",
         })
     }
 }
 
-pub(crate) enum Router<S: crate::vector::router::arena::VectorArena<Elem = f32>> {
-    Stacked(StackedIvf<S>),
+pub(crate) enum Router<S> {
+    Stacked(stacked::StackedRouter<S>),
     Exact(exact::ExactRouter<S>),
 }
 
@@ -102,7 +122,7 @@ pub(crate) type OpenedRouter = Router<LazyStore>;
 impl BuiltRouter {
     pub(crate) fn kind(&self) -> RouterKind {
         match self {
-            Self::Stacked(_) => RouterKind::Stacked,
+            Self::Stacked(router) => router.kind(),
             Self::Exact(_) => RouterKind::Exact,
         }
     }
@@ -110,7 +130,7 @@ impl BuiltRouter {
     pub(crate) fn serialize<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
         (self.kind() as u8).serialize(out)?;
         match self {
-            Self::Stacked(router) => router.serialize_router_payload(out),
+            Self::Stacked(router) => router.serialize(out),
             Self::Exact(router) => router.serialize_payload(out),
         }
     }
@@ -124,54 +144,57 @@ pub(crate) struct RoutingParams {
     /// enough lists to feed a size-`k` member heap via
     /// [`StackedIvf::lists_to_open`](crate::vector::router::stacked::levels::StackedIvf::lists_to_open).
     pub(crate) k: usize,
+    /// Fractional quantized member padding, at least 1.0; never changes the list request.
+    pub(crate) rerank_factor: f32,
+    /// List-selection policy, independent of retention; quantized routing only.
+    pub(crate) min_beam_fraction: f32,
+    pub(crate) aps: bool,
 }
 
 impl Default for RoutingParams {
     fn default() -> Self {
-        Self { k: usize::MAX }
+        Self {
+            k: usize::MAX,
+            rerank_factor: 1.0,
+            min_beam_fraction: 0.5,
+            aps: true,
+        }
     }
 }
 
-pub(crate) enum RouterIter {
-    Global(RouterMetrics),
-    #[cfg(test)]
-    Explicit(std::vec::IntoIter<Candidate>),
-    Stacked(stacked::Ranking),
-    Exact(exact::Ranking),
+/// Owned routing output; its producer's algorithm and representation do not
+/// change the iteration contract or require a distinct result type.
+pub(crate) struct RouterIter {
+    ranked: std::vec::IntoIter<Candidate<ClusterId>>,
+    metrics: RouterMetrics,
 }
 
 impl RouterIter {
-    pub(crate) fn metrics(&self) -> RouterMetrics {
-        match self {
-            Self::Global(metrics) => *metrics,
-            #[cfg(test)]
-            Self::Explicit(_) => RouterMetrics::Exact { visited_count: 0 },
-            Self::Stacked(ranking) => ranking.metrics(),
-            Self::Exact(ranking) => RouterMetrics::Exact {
-                visited_count: ranking.visited_count(),
-            },
+    pub(crate) fn new(ranked: Vec<Candidate<ClusterId>>, metrics: RouterMetrics) -> Self {
+        Self {
+            ranked: ranked.into_iter(),
+            metrics,
         }
+    }
+    pub(crate) fn metrics(&self) -> RouterMetrics {
+        self.metrics
     }
 }
 
 impl Iterator for RouterIter {
     type Item = Candidate;
-
     fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Global(_) => None,
-            #[cfg(test)]
-            Self::Explicit(ranking) => ranking.next(),
-            Self::Stacked(ranking) => ranking.next(),
-            Self::Exact(ranking) => ranking.next(),
-        }
+        self.ranked.next().map(|candidate| Candidate {
+            node: candidate.node.0,
+            sim: candidate.sim,
+        })
     }
 }
 
 impl OpenedRouter {
     pub(crate) fn kind(&self) -> RouterKind {
         match self {
-            Self::Stacked(_) => RouterKind::Stacked,
+            Self::Stacked(router) => router.kind(),
             Self::Exact(_) => RouterKind::Exact,
         }
     }
@@ -180,15 +203,7 @@ impl OpenedRouter {
     /// centroids) to top. The exact router has no levels.
     pub(crate) fn level_sizes(&self) -> Vec<usize> {
         match self {
-            Self::Stacked(router) => {
-                let mut sizes = Vec::new();
-                let mut level = Some(router);
-                while let Some(current) = level {
-                    sizes.push(current.nlist());
-                    level = current.parent.as_deref();
-                }
-                sizes
-            }
+            Self::Stacked(router) => router.level_sizes(),
             Self::Exact(_) => Vec::new(),
         }
     }
@@ -199,8 +214,8 @@ impl OpenedRouter {
         params: RoutingParams,
     ) -> RouterIter {
         match self {
-            Self::Stacked(router) => RouterIter::Stacked(stacked::rank(router, query, params)),
-            Self::Exact(router) => RouterIter::Exact(router.rank(query)),
+            Self::Stacked(router) => router.rank(query, params),
+            Self::Exact(router) => router.rank(query),
         }
     }
 }
@@ -217,6 +232,20 @@ pub enum RouterMetrics {
         lists_scanned: usize,
         /// Similarity computations spent routing, summed over every level.
         members_scored: usize,
+    },
+    /// Scalar-estimate routing and its separate exact output stage.
+    QuantizedStacked {
+        /// Exact-ranked centroids handed to the document probe loop.
+        candidate_count: usize,
+        /// Lists opened across all router levels.
+        lists_scanned: usize,
+        /// One-bit scores across all levels, including root centroid ranking.
+        approximate_scored: usize,
+        /// One-bit member scores at the bottom router level only. Members
+        /// retained from these scores are passed to the exact rerank.
+        approximate_members_scored: usize,
+        /// Full-precision scores during final reranking (or exact fallback).
+        exact_scored: usize,
     },
     /// The exact router's work.
     Exact {
@@ -246,9 +275,17 @@ pub(crate) fn with_test_clusters<T>(clusters: Vec<Candidate>, scan: impl FnOnce(
 #[cfg(test)]
 pub(crate) fn test_clusters() -> Option<RouterIter> {
     TEST_CLUSTERS.with(|slot| {
-        slot.borrow()
-            .clone()
-            .map(|rows| RouterIter::Explicit(rows.into_iter()))
+        slot.borrow().clone().map(|rows| {
+            RouterIter::new(
+                rows.into_iter()
+                    .map(|c| Candidate {
+                        node: ClusterId(c.node),
+                        sim: c.sim,
+                    })
+                    .collect(),
+                RouterMetrics::Exact { visited_count: 0 },
+            )
+        })
     })
 }
 
@@ -343,7 +380,10 @@ mod tests {
     fn stacked_ranking_honors_k() -> crate::Result<()> {
         let opened = open_stacked(2, 64)?;
         let query = vec![0.0f32; 2];
-        let params = RoutingParams { k: 8 };
+        let params = RoutingParams {
+            k: 8,
+            ..Default::default()
+        };
         let query = VectorQuery::new(Metric::L2, Arc::new(query));
         let ranking = opened.rank(&query, params);
         let (candidates, lists, scored) = stacked_metrics(ranking.metrics());
@@ -356,8 +396,8 @@ mod tests {
         Ok(())
     }
 
-    /// Codes 1 and 2 open as the stacked and exact routers; any other code, the graph router's 0
-    /// included, is an incompatible index.
+    /// Codes 1, 2, and 3 open full-precision stacked, exact, and quantized stacked
+    /// routers. Unknown codes, including the removed graph router's 0, are incompatible.
     #[test]
     fn router_kind_codes() -> crate::Result<()> {
         let options = VectorOptions::new(1, Metric::L2);
@@ -370,7 +410,11 @@ mod tests {
                 .collect();
             RouterKind::open(FileSlice::from(slot), FileSlice::from(rows), &options)
         };
-        for kind in [RouterKind::Stacked, RouterKind::Exact] {
+        for kind in [
+            RouterKind::Stacked,
+            RouterKind::Exact,
+            RouterKind::QuantizedStacked,
+        ] {
             let mut centroids = centroids();
             let mut slot = Vec::new();
             kind.build(&options, &mut centroids)?.serialize(&mut slot)?;

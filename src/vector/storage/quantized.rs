@@ -1,5 +1,7 @@
 //! Quantized layer storage: layer and cluster readers, read costs and decoded batches.
 
+pub(crate) mod sign;
+
 use std::ops::Range;
 use std::sync::Arc;
 
