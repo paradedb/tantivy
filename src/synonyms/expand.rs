@@ -1,7 +1,8 @@
 //! Query-time expansion with the synonym rules of an index's segments.
 
+use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
@@ -11,7 +12,7 @@ use super::rule::{CompiledRule, SynonymRule};
 use super::tokenizer::KEY_SEPARATOR;
 use crate::fastfield::AliveBitSet;
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema};
-use crate::tokenizer::TextAnalyzer;
+use crate::tokenizer::{TextAnalyzer, RAW_TOKENIZER_NAME};
 use crate::{DocId, DocSet, InvertedIndexReader, SegmentReader, TantivyError, TERMINATED};
 
 /// A run of query tokens and what it expands to. `alternatives` is `None` when no rule matched.
@@ -19,15 +20,13 @@ use crate::{DocId, DocSet, InvertedIndexReader, SegmentReader, TantivyError, TER
 pub struct Expansion {
     /// The query tokens of the run.
     pub tokens: Vec<String>,
-    /// The alternatives of the run, each a list of tokens. Within a segment they come in
-    /// document order, and the segments come in the order the expander was given them. A
-    /// searcher lists its segments in no fixed order.
+    /// The alternatives of the run, each a list of tokens. They are sorted, so the order does not
+    /// depend on how the rules are spread over the segments.
     pub alternatives: Option<Vec<Vec<String>>>,
 }
 
 impl Expansion {
-    /// True when a query for this expansion is one term, which Block-WAND prunes. A token in no
-    /// rule, or a rule whose one alternative is one word, is a single term.
+    /// True when a query for this expansion is one term, which Block-WAND prunes.
     pub fn is_single_term(&self) -> bool {
         match &self.alternatives {
             None => true,
@@ -79,13 +78,15 @@ fn check_rule_field(schema: &Schema, field: Field) -> crate::Result<()> {
     let entry = schema.get_field_entry(field);
     match entry.field_type() {
         FieldType::Str(options)
-            if options.get_indexing_options().is_some() && options.is_fast() =>
+            if options.get_indexing_options().is_some()
+                && options.get_fast_field_tokenizer_name() == Some(RAW_TOKENIZER_NAME) =>
         {
             Ok(())
         }
         _ => Err(TantivyError::SchemaError(format!(
-            "synonym rule field '{}' must be an indexed and fast text field",
-            entry.name()
+            "synonym rule field '{}' must be an indexed text field, fast with the '{}' tokenizer",
+            entry.name(),
+            RAW_TOKENIZER_NAME
         ))),
     }
 }
@@ -124,13 +125,13 @@ impl SegmentSynonyms {
         analyzer: &mut TextAnalyzer,
     ) -> crate::Result<Vec<KeyRules>> {
         let mut found = Vec::new();
-        if token.as_bytes().contains(&KEY_SEPARATOR) {
+        if token.contains(KEY_SEPARATOR) {
             return Ok(found);
         }
         // The keys that start with the token are the token itself and the token followed by the
         // separator, and all of them sort before the token followed by the next byte.
         let mut end = token.as_bytes().to_vec();
-        end.push(KEY_SEPARATOR + 1);
+        end.push(KEY_SEPARATOR as u8 + 1);
         let mut keys = self
             .keys
             .terms()
@@ -143,7 +144,7 @@ impl SegmentSynonyms {
             let Ok(key) = std::str::from_utf8(keys.key()) else {
                 continue;
             };
-            let key: Vec<String> = key.split('\0').map(str::to_string).collect();
+            let key: Vec<String> = key.split(KEY_SEPARATOR).map(str::to_string).collect();
             let mut postings = self
                 .keys
                 .read_postings_from_terminfo(keys.value(), IndexRecordOption::Basic)?;
@@ -179,7 +180,7 @@ impl SegmentSynonyms {
                 continue;
             }
             if let Ok(Some(rule)) = SynonymRule::parse(&text) {
-                if let Ok(Some(rule)) = rule.compile(analyzer) {
+                if let Ok(rule) = rule.compile(analyzer) {
                     compiled.push(rule);
                 }
             }
@@ -202,8 +203,9 @@ pub trait SynonymSource {
     fn is_alive(&mut self, segment: usize, doc: DocId) -> bool;
 }
 
-/// Expands query tokens with the rules of `source`. Longest key first, left to right, one pass.
-/// An alternative is never expanded again, the same as Lucene's `SynonymGraphFilter`.
+/// Expands query tokens with the rules of `source`. At each position, from left to right, the
+/// longest key wins. An alternative is never expanded again, the same as in Lucene's
+/// `SynonymGraphFilter`.
 pub fn expand(tokens: &[String], source: &mut impl SynonymSource) -> crate::Result<Vec<Expansion>> {
     let mut expansions = Vec::with_capacity(tokens.len());
     let mut i = 0;
@@ -234,40 +236,34 @@ fn longest_match(
     source: &mut impl SynonymSource,
 ) -> crate::Result<Option<(usize, Vec<Vec<String>>)>> {
     let mut fetched = Vec::with_capacity(source.num_segments());
-    // Each candidate is the length of a key, its segment, and its place in what the segment
-    // returned.
-    let mut candidates: Vec<(usize, usize, usize)> = Vec::new();
     for segment in 0..source.num_segments() {
-        let keys = source.token_rules(segment, &run[0])?;
-        for (place, key_rules) in keys.iter().enumerate() {
+        fetched.push(source.token_rules(segment, &run[0])?);
+    }
+    let mut candidates: Vec<(usize, &KeyRules)> = Vec::new();
+    for (segment, keys) in fetched.iter().enumerate() {
+        for key_rules in keys.iter() {
             if run.starts_with(&key_rules.key) {
-                candidates.push((key_rules.key.len(), segment, place));
+                candidates.push((segment, key_rules));
             }
         }
-        fetched.push(keys);
     }
-    // Longest first. The sort is stable, so the segments of one length keep their order.
-    candidates.sort_by(|left, right| right.0.cmp(&left.0));
-    for same_len in candidates.chunk_by(|left, right| left.0 == right.0) {
-        let len = same_len[0].0;
-        let mut alternatives: Vec<Vec<String>> = Vec::new();
-        for &(_, segment, place) in same_len {
-            for rule in &fetched[segment][place].rules {
-                if !source.is_alive(segment, rule.doc) {
-                    continue;
-                }
-                for alternative in &rule.alternatives {
-                    if !alternatives.contains(alternative) {
-                        alternatives.push(alternative.clone());
-                    }
+    candidates.sort_by_key(|(_, key_rules)| Reverse(key_rules.key.len()));
+    for same_len in candidates.chunk_by(|(_, left), (_, right)| left.key.len() == right.key.len()) {
+        let len = same_len[0].1.key.len();
+        let mut alternatives: BTreeSet<&[String]> = BTreeSet::new();
+        for &(segment, key_rules) in same_len {
+            for rule in &key_rules.rules {
+                if source.is_alive(segment, rule.doc) {
+                    alternatives.extend(rule.alternatives.iter().map(Vec::as_slice));
                 }
             }
         }
         // A key whose alternatives are only the key itself changes nothing, so the scan goes on to
         // a shorter key. The check runs on the union, because `sofa` alone and `sofa => couch`
         // together expand `sofa` to both words.
-        let only_the_key = alternatives.len() == 1 && alternatives[0] == run[..len];
+        let only_the_key = alternatives.len() == 1 && alternatives.first() == Some(&&run[..len]);
         if !alternatives.is_empty() && !only_the_key {
+            let alternatives = alternatives.into_iter().map(<[String]>::to_vec).collect();
             return Ok(Some((len, alternatives)));
         }
     }
@@ -370,7 +366,7 @@ impl<F: FnMut(usize, DocId) -> bool> SynonymSource for ReaderSource<'_, F> {
         let in_bitset = segment
             .alive
             .as_ref()
-            .is_none_or(|alive| doc < alive.bitset().max_value() && alive.is_alive(doc));
+            .is_none_or(|alive| alive.is_alive(doc));
         in_bitset && (self.is_alive)(segment.ord, doc)
     }
 }

@@ -45,7 +45,7 @@
 //! assert_eq!(expansions[0].alternatives, None);
 //! assert_eq!(
 //!     expansions[1].alternatives,
-//!     Some(vec![vec!["couch".to_string()], vec!["sofa".to_string()], vec!["divan".to_string()]])
+//!     Some(vec![vec!["couch".to_string()], vec!["divan".to_string()], vec!["sofa".to_string()]])
 //! );
 //! # Ok(())
 //! # }

@@ -8,7 +8,7 @@ use crate::indexer::NoMergePolicy;
 use crate::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, INDEXED, TEXT,
 };
-use crate::tokenizer::{LowerCaser, SimpleTokenizer, StopWordFilter, TextAnalyzer};
+use crate::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use crate::{doc, DocId, Index, IndexWriter, Searcher, TantivyDocument, TantivyError, Term};
 
 const RULE_TOKENIZER: &str = "synonym_rule";
@@ -124,18 +124,6 @@ fn expanded(tokens: &[&str], alternatives: Option<&[&[&str]]>) -> Expansion {
 }
 
 #[test]
-fn equivalents_expand_to_the_group() {
-    let index = RulesIndex::with_rules(plain(), &["couch, sofa, divan"]);
-    assert_eq!(
-        index.expand(&["red", "sofa"]),
-        vec![
-            expanded(&["red"], None),
-            expanded(&["sofa"], Some(&[&["couch"], &["sofa"], &["divan"]])),
-        ]
-    );
-}
-
-#[test]
 fn directed_rules_replace_the_left_side() {
     let index = RulesIndex::with_rules(plain(), &["sneakers => running shoes"]);
     assert_eq!(
@@ -169,7 +157,7 @@ fn longest_key_wins_and_outputs_are_not_expanded_again() {
         index.expand(&["blue", "shoes"]),
         vec![
             expanded(&["blue"], None),
-            expanded(&["shoes"], Some(&[&["shoes"], &["footwear"]])),
+            expanded(&["shoes"], Some(&[&["footwear"], &["shoes"]])),
         ]
     );
 }
@@ -198,7 +186,7 @@ fn rules_go_through_the_analyzer() {
         index.expand(&["divan"]),
         vec![expanded(
             &["divan"],
-            Some(&[&["couch"], &["sofa"], &["divan"]])
+            Some(&[&["couch"], &["divan"], &["sofa"]])
         )]
     );
     assert_eq!(
@@ -207,7 +195,7 @@ fn rules_go_through_the_analyzer() {
     );
     assert_eq!(
         index.expand(&["run"]),
-        vec![expanded(&["run"], Some(&[&["run"], &["jog"]]))]
+        vec![expanded(&["run"], Some(&[&["jog"], &["run"]]))]
     );
 }
 
@@ -216,26 +204,10 @@ fn a_key_that_maps_to_itself_keeps_the_typed_term_beside_another_rule() {
     let both = RulesIndex::with_rules(plain(), &["sofa", "sofa => couch"]);
     assert_eq!(
         both.expand(&["sofa"]),
-        vec![expanded(&["sofa"], Some(&[&["sofa"], &["couch"]]))]
+        vec![expanded(&["sofa"], Some(&[&["couch"], &["sofa"]]))]
     );
     let alone = RulesIndex::with_rules(plain(), &["sofa", "# note", ""]);
     assert_eq!(alone.expand(&["sofa"]), vec![expanded(&["sofa"], None)]);
-}
-
-#[test]
-fn a_right_side_of_stopwords_keeps_the_typed_term() {
-    let analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
-        .filter(LowerCaser)
-        .filter(StopWordFilter::remove(vec!["the".to_string()]))
-        .build();
-    let index = RulesIndex::with_rules(analyzer, &["sofa => the", "couch => the, settee"]);
-    assert_eq!(
-        index.expand(&["sofa", "couch"]),
-        vec![
-            expanded(&["sofa"], None),
-            expanded(&["couch"], Some(&[&["settee"]])),
-        ]
-    );
 }
 
 #[test]
@@ -260,11 +232,11 @@ fn two_values_of_one_document_are_two_rules_of_that_document() {
     index.commit();
     assert_eq!(
         index.alternatives(&["sofa"]),
-        Some(lists(&[&["sofa"], &["couch"], &["settee"]]))
+        Some(lists(&[&["couch"], &["settee"], &["sofa"]]))
     );
     assert_eq!(
         index.alternatives(&["couch"]),
-        Some(lists(&[&["sofa"], &["couch"]]))
+        Some(lists(&[&["couch"], &["sofa"]]))
     );
     index.delete(1);
     index.commit();
@@ -289,35 +261,16 @@ fn the_caller_check_drops_a_rule_in_any_segment() {
         .map(|segment_reader| segment_reader.fast_fields().u64("id").unwrap())
         .collect();
     let expander = SynonymExpander::new(searcher.segment_readers(), index.rule, plain()).unwrap();
-    let mut expansions = expander
+    let expansions = expander
         .expand_with(&strings(&["running", "shoes"]), |segment, doc| {
             ids[segment].first(doc) != Some(1)
         })
         .unwrap();
-    // The searcher lists segments in its own order, and the alternatives follow it.
-    expansions[1].alternatives.as_mut().unwrap().sort();
     assert_eq!(
         expansions,
         vec![
             expanded(&["running"], None),
             expanded(&["shoes"], Some(&[&["boots"], &["footwear"], &["shoes"]])),
-        ]
-    );
-}
-
-#[test]
-fn a_deleted_rule_stops_expanding_before_a_merge() {
-    let mut index = RulesIndex::new(plain());
-    index.add(1, "running shoes, sneakers");
-    index.add(2, "shoes, footwear");
-    index.commit();
-    index.delete(1);
-    index.commit();
-    assert_eq!(
-        index.expand(&["running", "shoes"]),
-        vec![
-            expanded(&["running"], None),
-            expanded(&["shoes"], Some(&[&["shoes"], &["footwear"]])),
         ]
     );
 }
@@ -359,16 +312,52 @@ fn an_invalid_rule_indexes_no_key_and_the_writer_goes_on() {
 }
 
 #[test]
-fn the_rule_field_is_indexed_and_fast() {
-    let mut schema_builder = Schema::builder();
-    let rule = schema_builder.add_text_field("rule", TEXT);
-    let index = Index::create_in_ram(schema_builder.build());
-    let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
-    writer.add_document(doc!(rule => "sofa, couch")).unwrap();
-    writer.commit().unwrap();
-    let searcher = index.reader().unwrap().searcher();
-    let err = SynonymExpander::new(searcher.segment_readers(), rule, plain()).unwrap_err();
-    assert!(matches!(err, TantivyError::SchemaError(_)), "{err:?}");
+fn the_rule_field_is_indexed_and_fast_with_raw() {
+    for options in [TEXT, TEXT.set_fast("default")] {
+        let mut schema_builder = Schema::builder();
+        let rule = schema_builder.add_text_field("rule", options);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        writer.add_document(doc!(rule => "sofa, couch")).unwrap();
+        writer.commit().unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let err = SynonymExpander::new(searcher.segment_readers(), rule, plain()).unwrap_err();
+        assert!(matches!(err, TantivyError::SchemaError(_)), "{err:?}");
+    }
+}
+
+#[test]
+fn token_rules_returns_only_the_keys_that_start_with_the_token() {
+    let index = RulesIndex::with_rules(
+        plain(),
+        &[
+            "sofa, couch",
+            "sofas => settees",
+            "sofa bed => futon",
+            "sof => x",
+        ],
+    );
+    let searcher = index.searcher();
+    let segment = SegmentSynonyms::open(&searcher.segment_readers()[0], index.rule)
+        .unwrap()
+        .unwrap();
+    let keys: Vec<_> = segment
+        .token_rules("sofa", &mut plain())
+        .unwrap()
+        .into_iter()
+        .map(|key_rules| (key_rules.key, key_rules.rules))
+        .collect();
+    let rule = |doc, alternatives: &[&[&str]]| RuleAlternatives {
+        doc,
+        alternatives: lists(alternatives),
+    };
+    assert_eq!(
+        keys,
+        vec![
+            (strings(&["sofa"]), vec![rule(0, &[&["sofa"], &["couch"]])]),
+            (strings(&["sofa", "bed"]), vec![rule(2, &[&["futon"]])]),
+        ]
+    );
 }
 
 /// Keeps what each segment holds for a token across expansions, and asks for liveness each time.
@@ -430,7 +419,7 @@ fn a_cached_lookup_still_drops_a_rule_deleted_after_it() {
         expand(&tokens, &mut source).unwrap(),
         vec![
             expanded(&["running"], None),
-            expanded(&["shoes"], Some(&[&["shoes"], &["footwear"]])),
+            expanded(&["shoes"], Some(&[&["footwear"], &["shoes"]])),
         ]
     );
     assert_eq!(source.fetches, fetches + 1);

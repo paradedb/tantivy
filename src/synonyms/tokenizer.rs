@@ -3,13 +3,8 @@
 use super::rule::SynonymRule;
 use crate::tokenizer::{PreTokenizedStream, PreTokenizedString, TextAnalyzer, Token, Tokenizer};
 
-/// Joins the tokens of a key. A rule cannot contain this byte, so two keys never join to the
-/// same term.
-pub(crate) const KEY_SEPARATOR: u8 = b'\0';
-
-pub(crate) fn join_key(tokens: &[String]) -> String {
-    tokens.join("\0")
-}
+/// Joins the tokens of a key. A rule cannot contain it, so two keys never join to the same term.
+pub(crate) const KEY_SEPARATOR: char = '\0';
 
 /// Indexes a Solr synonym rule, such as `couch, sofa, divan` or `sneakers => running shoes`, as
 /// one term per key, the analyzed tokens of the key joined with a zero byte.
@@ -34,12 +29,13 @@ impl Tokenizer for SynonymRuleTokenizer {
 
     fn token_stream<'a>(&'a mut self, text: &'a str) -> PreTokenizedStream {
         let keys = match SynonymRule::parse(text) {
-            Ok(Some(rule)) => match rule.compile(&mut self.analyzer) {
-                Ok(Some(rule)) => rule.keys,
-                _ => Vec::new(),
-            },
+            Ok(Some(rule)) => rule
+                .compile(&mut self.analyzer)
+                .map(|rule| rule.keys)
+                .unwrap_or_default(),
             _ => Vec::new(),
         };
+        let separator = KEY_SEPARATOR.to_string();
         let tokens = keys
             .iter()
             .enumerate()
@@ -47,7 +43,7 @@ impl Tokenizer for SynonymRuleTokenizer {
                 offset_from: 0,
                 offset_to: text.len(),
                 position,
-                text: join_key(key),
+                text: key.join(&separator),
                 position_length: 1,
             })
             .collect();
