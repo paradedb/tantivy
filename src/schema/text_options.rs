@@ -24,6 +24,9 @@ pub struct TextOptions {
     #[serde(skip_serializing_if = "is_false")]
     /// coerce values into string if they are not of type string
     coerce: bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_false")]
+    synonym_rules: bool,
 }
 
 /// Options controlling how a text fast field is tokenized.
@@ -138,6 +141,13 @@ impl TextOptions {
         self.coerce
     }
 
+    /// Returns true if each value of the field is a synonym rule, compiled into the segment's
+    /// synonym component. See [`synonyms`](crate::synonyms).
+    #[inline]
+    pub fn holds_synonym_rules(&self) -> bool {
+        self.synonym_rules
+    }
+
     /// Set the field as a fast field.
     ///
     /// Fast fields are designed for random access.
@@ -165,6 +175,14 @@ impl TextOptions {
     #[must_use]
     pub fn set_coerce(mut self) -> TextOptions {
         self.coerce = true;
+        self
+    }
+
+    /// Makes each value of the field a Solr synonym rule, analyzed with the field's tokenizer
+    /// into the segment's synonym component. A schema can have one such field.
+    #[must_use]
+    pub fn set_synonym_rules(mut self) -> TextOptions {
+        self.synonym_rules = true;
         self
     }
 
@@ -326,6 +344,7 @@ pub const STRING: TextOptions = TextOptions {
     stored: false,
     fast: None,
     coerce: false,
+    synonym_rules: false,
 };
 
 /// The field will be tokenized and indexed.
@@ -341,6 +360,7 @@ pub const TEXT: TextOptions = TextOptions {
     stored: false,
     coerce: false,
     fast: None,
+    synonym_rules: false,
 };
 
 impl<T: Into<TextOptions>> BitOr<T> for TextOptions {
@@ -353,6 +373,7 @@ impl<T: Into<TextOptions>> BitOr<T> for TextOptions {
             stored: self.stored | other.stored,
             fast: merge_fast_field_options(self.fast, other.fast),
             coerce: self.coerce | other.coerce,
+            synonym_rules: self.synonym_rules | other.synonym_rules,
         }
     }
 }
@@ -370,6 +391,7 @@ impl From<StoredFlag> for TextOptions {
             stored: true,
             fast: None,
             coerce: false,
+            synonym_rules: false,
         }
     }
 }
@@ -381,6 +403,7 @@ impl From<CoerceFlag> for TextOptions {
             stored: false,
             fast: None,
             coerce: true,
+            synonym_rules: false,
         }
     }
 }
@@ -392,6 +415,7 @@ impl From<FastFlag> for TextOptions {
             stored: false,
             fast: Some(FastFieldTextOptions::default()),
             coerce: false,
+            synonym_rules: false,
         }
     }
 }

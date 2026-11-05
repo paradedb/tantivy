@@ -29,6 +29,7 @@ use crate::reader::{IndexReader, IndexReaderBuilder};
 use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
+use crate::synonyms::plugin::SynonymPlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
 use crate::vector::clustering::{IvfClusterer, SuperKMeansClusterer};
 use crate::vector::write::VectorPlugin;
@@ -80,7 +81,7 @@ pub(crate) fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
 /// [`PluginWriter`](crate::plugin::PluginWriter) interface, unlike the first three
 /// built-ins, whose concrete writer types the `SegmentWriter` constructs directly.
 pub(crate) fn erased_builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
-    vec![Arc::new(VectorPlugin)]
+    vec![Arc::new(VectorPlugin), Arc::new(SynonymPlugin)]
 }
 
 /// The files owned by the given segments: one per plugin extension (the built-in
@@ -862,7 +863,7 @@ impl Index {
 
     /// The plugins whose writers are driven through the type-erased
     /// [`PluginWriter`](crate::plugin::PluginWriter) interface, in write order: the
-    /// erased built-ins (currently the vector plugin) followed by the registered
+    /// erased built-ins (the vector and synonym plugins) followed by the registered
     /// custom plugins.
     pub(crate) fn erased_plugins(&self) -> Vec<Arc<dyn SegmentPlugin>> {
         erased_builtin_plugins()
