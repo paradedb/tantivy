@@ -1,4 +1,5 @@
-//! The assign step: every vector to its nearest centroid, and the clusters' row ranges.
+//! The assign step: every vector to its nearest centroid and, when the field spills, to a second
+//! one; and the clusters' row ranges.
 
 use std::time::Instant;
 
@@ -6,12 +7,14 @@ use itertools::Itertools;
 
 use super::source::MergeVectorSource;
 use super::{AssignedVector, FieldMerge, IvfBuildTimings};
+use crate::vector::clustering::soar::SOAR_LAMBDA;
 use crate::vector::clustering::{IvfCentroids, IvfClusterer, VectorSource};
 use crate::vector::write::RowAddress;
 use crate::{DocId, TantivyError};
 
-/// Assigns each of the field's vectors to one of `centroids`, reading the sources in storage
-/// order through a [`MergeVectorSource`].
+/// Assigns each of the field's vectors to one of `centroids`, and to a second one when the field
+/// spills, reading the sources in storage order through a [`MergeVectorSource`]. A spilled vector
+/// yields two entries with the same source and document, the primary first.
 pub(super) fn assign(
     merge: &FieldMerge,
     clusterer: &dyn IvfClusterer,
@@ -36,20 +39,27 @@ pub(super) fn assign(
     let mut source =
         MergeVectorSource::new(&merge.readers, assign_sources, opts.dim(), merge.ctx.cancel);
     let assign_start = Instant::now();
-    let clusters = clusterer.assign(opts, &mut source, centroids)?;
+    let pairs: Vec<(u32, Option<u32>)> = if merge.spill {
+        clusterer.assign_pairs(opts, &mut source, centroids, SOAR_LAMBDA)?
+    } else {
+        clusterer
+            .assign(opts, &mut source, centroids)?
+            .into_iter()
+            .map(|cluster| (cluster, None))
+            .collect()
+    };
     timings.assign += assign_start.elapsed();
     timings.assign_reads += source.reads;
 
-    if clusters.len() != source.num_rows() {
+    if pairs.len() != source.num_rows() {
         return Err(TantivyError::InvalidArgument(format!(
             "IvfClusterer assigned {} clusters for {} vectors",
-            clusters.len(),
+            pairs.len(),
             source.num_rows()
         )));
     }
 
-    let mut assigned_vectors = Vec::with_capacity(clusters.len());
-    for (cluster, &(row, target_doc_id)) in clusters.into_iter().zip(source.rows()) {
+    let check = |cluster: u32| -> crate::Result<usize> {
         let cluster = cluster as usize;
         if cluster >= num_centroids {
             return Err(TantivyError::InvalidArgument(format!(
@@ -57,17 +67,38 @@ pub(super) fn assign(
                  centroids were trained"
             )));
         }
+        Ok(cluster)
+    };
+    let mut assigned_vectors = Vec::with_capacity(pairs.len());
+    for ((primary, secondary), &(row, target_doc_id)) in pairs.into_iter().zip(source.rows()) {
+        let cluster = check(primary)?;
         assigned_vectors.push(AssignedVector {
             cluster,
             target_doc_id,
             source: row,
+            primary: true,
         });
+        if let Some(secondary) = secondary {
+            let secondary = check(secondary)?;
+            if secondary == cluster {
+                return Err(TantivyError::InvalidArgument(format!(
+                    "IvfClusterer spilled a vector into its own cluster {cluster}"
+                )));
+            }
+            assigned_vectors.push(AssignedVector {
+                cluster: secondary,
+                target_doc_id,
+                source: row,
+                primary: false,
+            });
+        }
     }
     Ok(assigned_vectors)
 }
 
 /// Sorts `assigned` by (cluster, target doc) and returns the clusters' row offsets: a prefix sum
-/// of `num_centroids + 1` entries.
+/// of `num_centroids + 1` entries. A document appears at most once per cluster, so each block's
+/// documents stay strictly ascending.
 pub(super) fn cluster_offsets(assigned: &mut [AssignedVector], num_centroids: usize) -> Vec<u64> {
     let mut cluster_counts = vec![0usize; num_centroids];
     for assigned_vector in assigned.iter() {

@@ -341,6 +341,39 @@ impl IvfClusterer for SuperKMeansClusterer {
         )?;
         Ok(assignments)
     }
+
+    /// The nearest centroid and the SOAR secondary over every centroid, from two passes per
+    /// batch; `None` with a single centroid.
+    fn assign_pairs(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        centroids: &IvfCentroids,
+        lambda: f32,
+    ) -> crate::Result<Vec<(u32, Option<u32>)>> {
+        let mut pairs = Vec::with_capacity(source.num_rows());
+        let kmeans = self.assigner(options.dim(), is_angular(options.metric()));
+        let IvfCentroids::F32(centroids) = centroids;
+        for_each_batch(
+            source,
+            self.budget_rows(options),
+            |IvfTrainingVectors::F32(batch)| {
+                let (primary, secondary) = kmeans.assign_soar(
+                    &batch.matrix.values,
+                    centroids.values.as_slice(),
+                    batch.matrix.rows,
+                    lambda,
+                );
+                pairs.extend(
+                    primary
+                        .into_iter()
+                        .zip(secondary)
+                        .map(|(first, second)| (first, (second != u32::MAX).then_some(second))),
+                );
+            },
+        )?;
+        Ok(pairs)
+    }
 }
 
 #[cfg(test)]
@@ -486,6 +519,73 @@ mod tests {
             assert_eq!(source.polls.get(), polls_before_cancel + 1);
             assert_eq!(source.inner.ranges, vec![0..n]);
         }
+    }
+
+    /// Every vector gets a secondary distinct from its primary; with a large `lambda` the
+    /// secondary's residual lies further off the primary residual than the second-nearest
+    /// centroid's does for most vectors; one centroid gives no secondary.
+    #[test]
+    fn assigns_pairs_off_the_primary_residual() {
+        let (n, dim) = (3_000, 16);
+        let mut source = VecSource::new(blobs(n, dim), dim);
+        let clusterer = SuperKMeansClusterer::new().with_max_leaf_size(100);
+        let options = VectorOptions::new(dim, Metric::L2);
+        let centroids = train(&clusterer, &mut source);
+        let trained = IvfCentroids::F32(centroids.clone());
+        let nearest = clusterer.assign(&options, &mut source, &trained).unwrap();
+        let pairs = clusterer
+            .assign_pairs(&options, &mut source, &trained, 50.0)
+            .unwrap();
+        assert_eq!(pairs.len(), n);
+        let projection = |x: &[f32], primary: u32, cluster: u32| -> f32 {
+            let c1 = &centroids.values[primary as usize * dim..][..dim];
+            let c = &centroids.values[cluster as usize * dim..][..dim];
+            let residual: Vec<f32> = x.iter().zip(c1).map(|(a, b)| a - b).collect();
+            let norm = residual.iter().map(|v| v * v).sum::<f32>().sqrt();
+            x.iter()
+                .zip(c)
+                .zip(&residual)
+                .map(|((a, b), r)| (a - b) * r / norm)
+                .sum::<f32>()
+                .abs()
+        };
+        let mut off_residual = 0;
+        for (row, &(primary, second)) in pairs.iter().enumerate() {
+            assert_eq!(primary, nearest[row]);
+            let second = second.expect("more than one centroid");
+            assert_ne!(second, primary, "row {row}");
+            let x = &source.values[row * dim..(row + 1) * dim];
+            let mut by_distance: Vec<(f32, u32)> = (0..centroids.rows as u32)
+                .map(|c| {
+                    let centroid = &centroids.values[c as usize * dim..][..dim];
+                    (
+                        x.iter().zip(centroid).map(|(a, b)| (a - b) * (a - b)).sum(),
+                        c,
+                    )
+                })
+                .collect();
+            by_distance.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let second_nearest = by_distance[1].1;
+            if projection(x, primary, second) <= projection(x, primary, second_nearest) {
+                off_residual += 1;
+            }
+        }
+        assert!(
+            off_residual * 10 >= n * 9,
+            "{off_residual} of {n} secondaries lie at least as far off the residual as nearest-2"
+        );
+
+        let one = IvfCentroids::F32(IvfMatrix {
+            values: centroids.values[..dim].to_vec(),
+            rows: 1,
+            dims: dim,
+        });
+        let pairs = clusterer
+            .assign_pairs(&options, &mut source, &one, 1.0)
+            .unwrap();
+        assert!(pairs
+            .iter()
+            .all(|&(primary, second)| primary == 0 && second.is_none()));
     }
 
     #[test]
