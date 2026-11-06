@@ -107,7 +107,7 @@ type PreparedCell = Arc<OnceLock<Arc<QuantizedQueryCtx>>>;
 /// Each consumer evaluates its filter and enforces its segment's probe budget.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct VectorRoutingPlan {
-    field: Field,
+    pub(crate) field: Field,
     pub(crate) segments: HashMap<SegmentId, SegmentRoutingPlan>,
 }
 
@@ -116,6 +116,18 @@ pub(crate) struct SegmentRoutingPlan {
     pub(crate) clusters: Vec<Candidate>,
     pub(crate) metrics: RouterMetrics,
     totals: StageTotals,
+}
+
+/// Supplies a shared routing plan after a segment has evaluated its filter.
+pub trait VectorRoutingPlanProvider: Send + Sync {
+    /// May block until publication; every call must return the same plan.
+    fn get(&self) -> Result<&VectorRoutingPlan>;
+}
+
+impl VectorRoutingPlanProvider for VectorRoutingPlan {
+    fn get(&self) -> Result<&VectorRoutingPlan> {
+        Ok(self)
+    }
 }
 
 // --- Builder ---
@@ -128,7 +140,7 @@ pub struct TopDocsByVectorSimilarityBuilder<T: VectorElement, S = NoTieBreak> {
     offset: usize,
     probe_params: ProbeParams,
     max_scan_levels: usize,
-    routing_plan: Option<Arc<VectorRoutingPlan>>,
+    routing_plan: Option<Arc<dyn VectorRoutingPlanProvider>>,
     /// Optional slot shared with other collectors searching the same query.
     shared_threshold: Option<SharedThresholdArc<Score>>,
     tie_break: S,
@@ -184,6 +196,12 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
 
     /// Probes the supplied plan without rerouting. See [`VectorRoutingPlan`] for its scope.
     pub fn with_routing_plan(mut self, plan: Arc<VectorRoutingPlan>) -> Self {
+        self.routing_plan = Some(plan);
+        self
+    }
+
+    /// Defers obtaining the routing plan until the segment filter has been evaluated.
+    pub fn with_routing_plan_provider(mut self, plan: Arc<dyn VectorRoutingPlanProvider>) -> Self {
         self.routing_plan = Some(plan);
         self
     }
@@ -247,7 +265,7 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     offset: usize,
     probe_params: ProbeParams,
     max_scan_levels: usize,
-    routing_plan: Option<Arc<VectorRoutingPlan>>,
+    routing_plan: Option<Arc<dyn VectorRoutingPlanProvider>>,
     /// Exactly one prepared query for each distinct segment encoding.
     quantized_queries: Mutex<HashMap<PreparedKey, PreparedCell>>,
     /// The query prepared for the field's metric on first use.
@@ -407,14 +425,24 @@ where
         reader: &SegmentReader,
     ) -> Result<SegmentVectorFruit<S::SortKey>> {
         let (searched, mut totals) = measure(|| self.search_segment(weight, segment_ord, reader));
+        let (results, report, merge) = searched?;
         if let Some(plan) = self
             .routing_plan
             .as_ref()
+            .map(|provider| {
+                let plan = provider.get()?;
+                if plan.field != self.field {
+                    return Err(TantivyError::InvalidArgument(
+                        "routing plan belongs to a different vector field".into(),
+                    ));
+                }
+                Ok(plan)
+            })
+            .transpose()?
             .and_then(|p| p.segments.get(&reader.segment_id()))
         {
             totals.append(&plan.totals);
         }
-        let (results, report, merge) = searched?;
         let mut stats = ProbeStats::new(report, totals);
         stats.record_shared_offer(merge);
         Ok(SegmentVectorFruit { results, stats })
@@ -653,16 +681,6 @@ where
         segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
     ) -> Result<SegmentSearcher<T>> {
-        if self
-            .routing_plan
-            .as_ref()
-            .is_some_and(|p| p.field != self.field)
-        {
-            return Err(TantivyError::InvalidArgument(
-                "routing plan belongs to a different vector field".into(),
-            ));
-        }
-
         let (query, quantized) = {
             let _prep = enter_vector_stage(VectorStage::QueryPrep);
             let vectors = reader.vector_index(self.field)?;
@@ -1584,6 +1602,110 @@ mod ivf_e2e_tests {
         }
         let expected = searcher.search(&filter, &builder().build())?;
         assert_eq!(fruit.results, expected.results);
+        Ok(())
+    }
+
+    #[test]
+    fn routing_plan_waits_until_filter_is_drained() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::query::{Explanation, Scorer, Weight};
+        use crate::vector::test_support::DocsWeight;
+        use crate::{DocId, DocSet, SegmentReader, TERMINATED};
+
+        struct TrackedFilter {
+            weight: DocsWeight,
+            consumed: Arc<AtomicUsize>,
+            calls: Arc<AtomicUsize>,
+        }
+        struct TrackedScorer {
+            inner: Box<dyn Scorer>,
+            consumed: Arc<AtomicUsize>,
+        }
+        impl DocSet for TrackedScorer {
+            fn advance(&mut self) -> DocId {
+                if self.inner.doc() != TERMINATED {
+                    self.consumed.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.advance()
+            }
+            fn doc(&self) -> DocId {
+                self.inner.doc()
+            }
+            fn size_hint(&self) -> u32 {
+                self.inner.size_hint()
+            }
+        }
+        impl Scorer for TrackedScorer {
+            fn score(&mut self) -> Score {
+                self.inner.score()
+            }
+        }
+        impl Weight for TrackedFilter {
+            fn scorer(&self, reader: &SegmentReader, boost: Score) -> Result<Box<dyn Scorer>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(TrackedScorer {
+                    inner: self.weight.scorer(reader, boost)?,
+                    consumed: Arc::clone(&self.consumed),
+                }))
+            }
+            fn explain(&self, _: &SegmentReader, _: DocId) -> Result<Explanation> {
+                unreachable!()
+            }
+        }
+        struct DeferredPlan {
+            plan: VectorRoutingPlan,
+            consumed: Arc<AtomicUsize>,
+            expected: usize,
+        }
+        impl super::VectorRoutingPlanProvider for DeferredPlan {
+            fn get(&self) -> Result<&VectorRoutingPlan> {
+                assert_eq!(self.consumed.load(Ordering::SeqCst), self.expected);
+                Ok(&self.plan)
+            }
+        }
+
+        let fixture = FixtureSpec::clustered(Metric::L2, 32, 8, 256).build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let reader = searcher.segment_reader(0);
+        let docs: Vec<_> = (0..reader.max_doc()).step_by(3).collect();
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let filter = TrackedFilter {
+            weight: DocsWeight {
+                max_doc: reader.max_doc(),
+                docs: docs.clone(),
+            },
+            consumed: Arc::clone(&consumed),
+            calls: Arc::clone(&calls),
+        };
+        let builder = || {
+            TopDocs::with_limit(5)
+                .order_by_similarity(fixture.field, vec![0.0; 32])
+                .with_probe_params(ProbeParams {
+                    located: LocatedPath::Off,
+                    ..exhaustive_params(8)
+                })
+        };
+        let plan = builder().build().route_segments(
+            docs.len() as f64 / f64::from(reader.max_doc()),
+            &[VectorSegment::from((0, reader))],
+            |_| {},
+        )?;
+        let ready = builder().with_routing_plan(Arc::new(plan.clone())).build();
+        let expected =
+            ready.merge_fruits(vec![ready.collect_segment(&filter.weight, 0, reader)?])?;
+        let collector = builder()
+            .with_routing_plan_provider(Arc::new(DeferredPlan {
+                plan,
+                consumed,
+                expected: docs.len(),
+            }))
+            .build();
+        let result =
+            collector.merge_fruits(vec![collector.collect_segment(&filter, 0, reader)?])?;
+        assert_eq!(result.results, expected.results);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
