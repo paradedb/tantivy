@@ -3,6 +3,7 @@ use crate::schema::Value;
 use crate::vector::clustering::{for_each_batch, IvfTrainingVectors, VectorSource};
 use crate::vector::quantization::{corrected_quantized_estimate, ArithmeticError};
 use crate::vector::storage::io::test_support::{PagedDirectory, PAGE_BYTES};
+use crate::vector::test_support::routing_plan_for_clusters;
 use crate::vector::BlockAddress;
 
 const DIM: usize = 64;
@@ -538,11 +539,9 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                     located: LocatedPath::Off,
                     ..Default::default()
                 })
+                .with_routing_plan(routing_plan_for_clusters(field, segment, candidates))
                 .build();
-            let fruit = crate::vector::router::with_test_clusters(candidates, || {
-                searcher.search(filter, &collector)
-            })
-            .unwrap_or_else(|error| {
+            let fruit = searcher.search(filter, &collector).unwrap_or_else(|error| {
                 panic!(
                     "{metric:?} {schedule:?} cluster={clusters:?} row=all column=layer0 probe: \
                      {error}"

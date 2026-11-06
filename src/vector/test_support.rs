@@ -23,7 +23,8 @@ use crate::vector::clustering::{
 };
 use crate::vector::params::ProbeParams;
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::with_test_clusters;
+use crate::vector::router::plan::SegmentRoutingPlan;
+use crate::vector::router::RouterMetrics;
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
 use crate::vector::search::scan::bound::TopK;
 use crate::vector::search::scan::plan::PlanOverride;
@@ -35,7 +36,7 @@ use crate::vector::storage::io::test_support::{with_unarmed_log, PagedDirectory}
 use crate::vector::tests::TestVectorIndex;
 use crate::vector::{
     BlockAddress, ProbeStats, RouterKind, VectorQuantizationConfig, VectorQuantizationLayer,
-    VectorSimilarityFruit, VectorStage,
+    VectorRoutingPlan, VectorSimilarityFruit, VectorStage,
 };
 use crate::{
     DocAddress, DocId, Index, IndexWriter, Score, Searcher, SegmentOrdinal, SegmentReader,
@@ -414,6 +415,25 @@ impl From<TestVectorIndex> for Fixture {
 
 // --- Running ---
 
+pub(crate) fn routing_plan_for_clusters(
+    field: Field,
+    segment: &SegmentReader,
+    clusters: Vec<Candidate>,
+) -> Arc<VectorRoutingPlan> {
+    Arc::new(VectorRoutingPlan {
+        field,
+        segments: [(
+            segment.segment_id(),
+            SegmentRoutingPlan {
+                clusters,
+                metrics: RouterMetrics::Exact { visited_count: 0 },
+                totals: Default::default(),
+            },
+        )]
+        .into(),
+    })
+}
+
 impl Fixture {
     /// A filter on one label.
     pub(crate) fn filter(&self, label: &str) -> TermQuery {
@@ -465,8 +485,18 @@ impl Fixture {
         k: usize,
         params: ProbeParams,
     ) -> crate::Result<VectorSimilarityFruit> {
-        let candidates = self.candidates(clusters, query)?;
-        with_test_clusters(candidates, || self.search(filter, query, k, params))
+        let searcher = self.index.reader()?.searcher();
+        let plan = routing_plan_for_clusters(
+            self.field,
+            first_segment(&searcher).1,
+            self.candidates(clusters, query)?,
+        );
+        let collector = TopDocs::with_limit(k)
+            .order_by_similarity(self.field, query.to_vec())
+            .with_probe_params(params)
+            .with_routing_plan(plan)
+            .build();
+        searcher.search(filter, &collector)
     }
 
     /// Router candidates for `clusters`, keyed by the exact centroid similarity.

@@ -259,41 +259,6 @@ pub enum RouterMetrics {
 }
 
 #[cfg(test)]
-thread_local! {
-    static TEST_CLUSTERS: std::cell::RefCell<Option<Vec<Candidate>>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Scans the supplied cluster similarities without invoking a router.
-#[cfg(test)]
-pub(crate) fn with_test_clusters<T>(clusters: Vec<Candidate>, scan: impl FnOnce() -> T) -> T {
-    struct Restore(Option<Vec<Candidate>>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            TEST_CLUSTERS.with(|slot| *slot.borrow_mut() = self.0.take());
-        }
-    }
-    let _restore = Restore(TEST_CLUSTERS.with(|slot| slot.replace(Some(clusters))));
-    scan()
-}
-
-#[cfg(test)]
-pub(crate) fn test_clusters() -> Option<RouterIter> {
-    TEST_CLUSTERS.with(|slot| {
-        slot.borrow().clone().map(|rows| {
-            RouterIter::new(
-                rows.into_iter()
-                    .map(|c| Candidate {
-                        node: ClusterId(c.node),
-                        sim: c.sim,
-                    })
-                    .collect(),
-                RouterMetrics::Exact { visited_count: 0 },
-            )
-        })
-    })
-}
-
-#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 

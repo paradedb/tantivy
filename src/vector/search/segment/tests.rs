@@ -17,7 +17,8 @@ use crate::vector::search::scan::layer_read::LayerRead;
 use crate::vector::search::scan::plan::{ExactRule, PlanOverride};
 use crate::vector::stats::{AccessPath, LayerProbeStats};
 use crate::vector::test_support::{
-    first_segment, ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg, ReadLog,
+    first_segment, routing_plan_for_clusters, ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg,
+    ReadLog,
 };
 use crate::vector::tests::{exhaustive_params, routed_exhaustive_params};
 use crate::vector::{BlockAddress, ProbeStats, RouterKind, VectorSimilarityFruit, VectorStage};
@@ -1635,12 +1636,14 @@ fn ann_reads_offsets_only_for_probed_clusters() -> crate::Result<()> {
             let collector = TopDocs::with_limit(5)
                 .order_by_similarity(fixture.field, query.clone())
                 .with_probe_params(routed_exhaustive_params(32))
+                .with_routing_plan(routing_plan_for_clusters(
+                    fixture.field,
+                    first_segment(&searcher).1,
+                    fixture.candidates(&[17], &query)?,
+                ))
                 .build();
-            let candidates = fixture.candidates(&[17], &query)?;
             fixture.clear_reads();
-            let fruit = crate::vector::router::with_test_clusters(candidates, || {
-                searcher.search(filter, &collector)
-            })?;
+            let fruit = searcher.search(filter, &collector)?;
             assert!(!fruit.results.is_empty());
             let offsets: Vec<_> = fixture
                 .reads()

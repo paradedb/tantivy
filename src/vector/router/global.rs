@@ -22,26 +22,6 @@ impl GlobalRanking {
         totals: &mut [StageTotals],
         on_segment: &mut impl FnMut(usize),
     ) -> Self {
-        #[cfg(test)]
-        if routers.len() == 1 {
-            if let Some(clusters) = super::test_clusters() {
-                let metrics = vec![clusters.metrics()];
-                return Self {
-                    clusters: clusters
-                        .map(|candidate| {
-                            (
-                                0,
-                                Candidate {
-                                    node: candidate.node as u32,
-                                    sim: candidate.sim,
-                                },
-                            )
-                        })
-                        .collect(),
-                    metrics,
-                };
-            }
-        }
         let mut indexes = Vec::with_capacity(routers.len());
         let mut leaves = Vec::new();
         let mut metrics = vec![
