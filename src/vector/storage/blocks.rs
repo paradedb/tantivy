@@ -50,7 +50,11 @@ pub(crate) fn block_len(slots: &[Slot], n: usize) -> usize {
 }
 /// Maximum decoder element width in a field, also its block alignment.
 pub(crate) fn block_align(slots: &[Slot]) -> usize {
-    slots.iter().map(Slot::type_bytes).max().expect("Rows slot")
+    slots
+        .iter()
+        .map(Slot::type_bytes)
+        .max()
+        .expect("every field has a column")
 }
 /// Logical Data entry length, including its directory and footer.
 pub(crate) fn data_entry_len(blocks_end: usize, num_blocks: usize) -> usize {
@@ -255,6 +259,48 @@ pub(crate) struct Blocks {
     pub(crate) metadata: Arc<VectorColMetadata>,
     pub(crate) schema: Vec<Slot>,
     bands: Vec<Range<usize>>,
+    /// A uniform partition's rows as one contiguous span, row `r` at `r * row_bytes`, confirmed
+    /// at open against the last block's tuple. Clustered blocks have none.
+    flat_rows: Option<FileSlice>,
+}
+
+/// The span of a uniform partition's rows. Block `b` starts `b * rows_per_block * row_bytes`
+/// past block 0, which follows the metadata at the block alignment, so a row's bytes are
+/// arithmetic on its index; the last block's tuple, the one offsets read of the open, confirms
+/// the layout.
+fn flat_rows_span(
+    entry: &FileSlice,
+    offsets: &BlockOffsets,
+    slots: &[Slot],
+    metadata_end: usize,
+    rows_per_block: usize,
+) -> crate::Result<FileSlice> {
+    let [slot] = slots else {
+        return Err(DataCorruption::comment_only("flat vector blocks carry one column").into());
+    };
+    let row_bytes = slot.stride as usize;
+    let start = align_up(metadata_end, block_align(slots));
+    let num_blocks = offsets.num_blocks();
+    let num_rows = offsets.num_rows();
+    let end = num_rows
+        .checked_mul(row_bytes)
+        .and_then(|bytes| start.checked_add(bytes))
+        .filter(|&end| end <= offsets.start())
+        .ok_or_else(|| DataCorruption::comment_only("flat vector rows overrun their entry"))?;
+    if num_blocks > 0 {
+        let full = rows_per_block * row_bytes;
+        let (last, last_rows) = offsets.read(num_blocks - 1)?;
+        if block_len(slots, rows_per_block) != full
+            || last.start != start + (num_blocks - 1) * full
+            || last_rows != num_rows - (num_blocks - 1) * rows_per_block
+            || last.end < last.start + last_rows * row_bytes
+        {
+            return Err(
+                DataCorruption::comment_only("flat vector blocks are not contiguous").into(),
+            );
+        }
+    }
+    Ok(entry.slice(start..end))
 }
 
 /// One block's validated boundaries, reused locally while accessing its columns.
@@ -285,6 +331,16 @@ impl Blocks {
             }
         }
         let slots = meta.slots();
+        let flat_rows = match meta.field().partition {
+            Partition::Uniform { rows_per_block } => Some(flat_rows_span(
+                &entry,
+                &offsets,
+                &slots,
+                metadata_end,
+                rows_per_block as usize,
+            )?),
+            Partition::Clusters => None,
+        };
         let mut bands: Vec<Range<usize>> = Vec::new();
         for (i, slot) in slots.iter().enumerate() {
             if let Some(band) = slot.slot_type.band() {
@@ -301,10 +357,16 @@ impl Blocks {
             metadata: meta,
             schema: slots,
             bands,
+            flat_rows,
         })
     }
     pub(crate) fn num_blocks(&self) -> usize {
         self.offsets.num_blocks
+    }
+
+    /// A uniform partition's rows as one contiguous span; `None` for clustered blocks.
+    pub(crate) fn flat_rows(&self) -> Option<&FileSlice> {
+        self.flat_rows.as_ref()
     }
     pub(crate) fn num_rows(&self) -> usize {
         self.offsets.num_rows()
@@ -387,6 +449,11 @@ impl Blocks {
 
     pub(crate) fn clustered(&self) -> bool {
         matches!(self.metadata.field().partition, Partition::Clusters)
+    }
+
+    /// The storage block length the entry's bytes report, when its storage has one.
+    pub(crate) fn storage_block_len(&self) -> Option<usize> {
+        self.data_slice.storage_block_len()
     }
 }
 
@@ -602,12 +669,11 @@ mod tests {
         )?;
         assert_eq!(blocks.num_rows(), 2 * n + 3);
         assert_eq!(blocks.block(2)?.row_range(), 0..3);
+        // A wrong count in the last tuple breaks the contiguous layout the open confirms.
         let mut data = encoded(&opts, &[n, n, 3], false);
         let at = blocks.offsets.start() + 2 * 16 + 8;
         data[at..at + 8].copy_from_slice(&2u64.to_le_bytes());
-        assert!(Blocks::open(FileSlice::from(data), &opts, false)?
-            .block(2)
-            .is_err());
+        assert!(Blocks::open(FileSlice::from(data), &opts, false).is_err());
         Ok(())
     }
 

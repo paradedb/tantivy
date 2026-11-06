@@ -30,6 +30,10 @@ pub(crate) enum VectorFileVersion {
     /// `.vec` stores (byte_offset, num_rows) tuples and total row count;
     /// `.centroids` no longer stores row offsets.
     V5 = 5,
+    /// A quantized clustered field keeps its full-precision rows in document order in their own
+    /// `ExactRows` entry, addressed by an `ExactIdMap`; its cluster blocks carry no `Rows` column.
+    /// The field grammar gains the assignment byte.
+    V6 = 6,
 }
 
 impl BinarySerializable for VectorFileVersion {
@@ -44,6 +48,7 @@ impl BinarySerializable for VectorFileVersion {
             3 => Ok(Self::V3),
             4 => Ok(Self::V4),
             5 => Ok(Self::V5),
+            6 => Ok(Self::V6),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported vector file format version: {other}"),
@@ -53,9 +58,9 @@ impl BinarySerializable for VectorFileVersion {
 }
 
 /// Format identifier written to `.vec` files.
-pub(crate) const VECTOR_FILE_FORMAT_VERSION: u32 = VectorFileVersion::V5 as u32;
+pub(crate) const VECTOR_FILE_FORMAT_VERSION: u32 = VectorFileVersion::V6 as u32;
 /// Version written to `.vec` files.
-pub(crate) const CURRENT_VECTOR: VectorFileVersion = VectorFileVersion::V5;
+pub(crate) const CURRENT_VECTOR: VectorFileVersion = VectorFileVersion::V6;
 /// Version written to `.centroids` files.
 pub(crate) const CURRENT_CENTROID: VectorFileVersion = VectorFileVersion::V5;
 
@@ -83,7 +88,9 @@ impl CentroidSlot {
     }
 }
 
-/// Composite entries of every vector field. Column slots live inside Data blocks.
+/// Composite entries of a vector field. Column slots live inside Data blocks. A flat field and
+/// a plain clustered field declare `IdMap` and `Data`; a quantized clustered field also declares
+/// `ExactIdMap` and `ExactRows`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
 pub(crate) enum VectorEntry {
@@ -91,6 +98,10 @@ pub(crate) enum VectorEntry {
     IdMap = 0,
     /// Stored metadata and block columns.
     Data = 1,
+    /// Identity or bitmap of the documents with a row in `ExactRows`.
+    ExactIdMap = 2,
+    /// Full-precision rows in document order, in flat blocks.
+    ExactRows = 3,
 }
 impl VectorEntry {
     pub(crate) const fn index(self) -> usize {
@@ -98,7 +109,7 @@ impl VectorEntry {
     }
 }
 /// Accepted vector grammars; all other versions require rebuilding.
-pub(crate) const SUPPORTED_VECTOR: &[VectorFileVersion] = &[VectorFileVersion::V5];
+pub(crate) const SUPPORTED_VECTOR: &[VectorFileVersion] = &[VectorFileVersion::V6];
 
 fn write_header<W: Write + ?Sized>(writer: &mut W, version: VectorFileVersion) -> io::Result<()> {
     version.serialize(writer)
@@ -211,10 +222,10 @@ mod tests {
     fn vector_header_round_trip() {
         let mut buf = Vec::new();
         write_vector_header(&mut buf).unwrap();
-        assert_eq!(buf, [5, 0, 0, 0]);
+        assert_eq!(buf, [6, 0, 0, 0]);
 
         let (version, body) = read_vector_header(&FileSlice::from(buf)).unwrap();
-        assert_eq!(version, VectorFileVersion::V5);
+        assert_eq!(version, VectorFileVersion::V6);
         assert_eq!(body.len(), 0);
     }
 
@@ -260,12 +271,13 @@ mod tests {
     }
 
     #[test]
-    fn vector_headers_before_v5_require_rebuild() {
+    fn vector_headers_before_v6_require_rebuild() {
         for version in [
             VectorFileVersion::V1,
             VectorFileVersion::V2,
             VectorFileVersion::V3,
             VectorFileVersion::V4,
+            VectorFileVersion::V5,
         ] {
             let mut buf = Vec::new();
             version.serialize(&mut buf).unwrap();

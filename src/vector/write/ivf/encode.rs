@@ -52,8 +52,8 @@ pub(super) fn encode_centroids(
     Ok(centroid_bytes)
 }
 
-/// Writes the field's Data entry: metadata, then one aligned block per cluster of rows, doc ids
-/// and encoded columns. Returns each target document's location.
+/// Writes the field's Data entry: metadata, then one aligned block per cluster of doc ids, encoded
+/// columns and, for plain storage, the rows themselves. Returns each target document's location.
 pub(super) fn write_data_entry(
     merge: &FieldMerge,
     vec_write: &mut CompositeWrite,
@@ -80,6 +80,17 @@ pub(super) fn write_data_entry(
     let encode_start = Instant::now();
     let meta = VectorColMetadata::build_ivf(opts, quantization)?;
     let slots = meta.slots();
+    // Plain blocks stream their rows first; quantized blocks keep the rows in `ExactRows` and
+    // buffer every column.
+    let rows_streamed = matches!(
+        slots.first().map(|slot| &slot.slot_type),
+        Some(SlotType::Rows { .. })
+    );
+    let first_buffered = usize::from(rows_streamed);
+    let doc_ids_slot = slots
+        .iter()
+        .position(|slot| matches!(slot.slot_type, SlotType::DocIds))
+        .expect("clustered blocks carry document ids");
     timings.pad_bytes += vec_write.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
     let data_start = vec_write.written_bytes();
     let data = vec_write.for_field_with_idx(merge.field, VectorEntry::Data.index());
@@ -126,7 +137,7 @@ pub(super) fn write_data_entry(
         let prepared = centroid_workspace
             .as_mut()
             .map(|workspace| workspace.prepare(&centroid));
-        // Rows stream directly to disk; only encoded columns need cluster buffers.
+        // Plain rows stream directly to disk; the other columns gather in cluster buffers.
         let mut local = 0u32;
         for tile in assigned_vectors[start..end].chunks(tile_rows) {
             if ctx.cancel.wants_cancel() {
@@ -135,7 +146,7 @@ pub(super) fn write_data_entry(
             batch_values.clear();
             for assigned in tile {
                 timings.encode_reads += 1;
-                bufs[1].extend_from_slice(&assigned.target_doc_id.to_le_bytes());
+                bufs[doc_ids_slot].extend_from_slice(&assigned.target_doc_id.to_le_bytes());
                 locations[assigned.target_doc_id as usize] =
                     BlockAddress::new(cluster as u32, local);
                 local += 1;
@@ -149,8 +160,10 @@ pub(super) fn write_data_entry(
                 } else {
                     &bytes
                 };
-                data.write_all(row)?;
-                pos += row.len();
+                if rows_streamed {
+                    data.write_all(row)?;
+                    pos += row.len();
+                }
                 if quantization.is_some() {
                     decode_row_append::<f32>(row, opts.dim(), &mut batch_values)?;
                 }
@@ -169,7 +182,7 @@ pub(super) fn write_data_entry(
             }
         }
         // Column flushes poll cancellation and retain capacity for the next cluster.
-        for idx in 1..slots.len() {
+        for idx in first_buffered..slots.len() {
             let col = column_range(&slots, n, idx);
             let padding = block_start + col.start - pos;
             pad(data, padding)?;
@@ -203,13 +216,14 @@ pub(super) fn write_data_entry(
     Ok(locations)
 }
 
-/// Appends one encoded tile's columns to the cluster's column buffers, in slot order.
+/// Appends one encoded tile's columns to the cluster's column buffers, in slot order; rows and
+/// document ids are gathered elsewhere.
 fn append_encoded_columns(
     bufs: &mut [Vec<u8>],
     slots: &[Slot],
     batch: &EncodedBatch,
 ) -> std::io::Result<()> {
-    for (idx, slot) in slots.iter().enumerate().skip(1) {
+    for (idx, slot) in slots.iter().enumerate() {
         match &slot.slot_type {
             SlotType::ResidualNorms => {
                 write_f32_run(&mut bufs[idx], &batch.residual_norms_squared)?
@@ -230,8 +244,7 @@ fn append_encoded_columns(
             SlotType::QuantLayerConstants { layer } => {
                 write_f32_run(&mut bufs[idx], &batch.layers[*layer as usize].constants)?
             }
-            SlotType::DocIds => (),
-            SlotType::Rows { .. } => unreachable!(),
+            SlotType::DocIds | SlotType::Rows { .. } => (),
         }
     }
     Ok(())
