@@ -7,8 +7,12 @@ use std::sync::Arc;
 use columnar::{Column, StrColumn};
 
 use super::*;
+use crate::collector::DocSetCollector;
 use crate::indexer::NoMergePolicy;
-use crate::schema::{Field, Schema, TextOptions, FAST, INDEXED, STORED, TEXT};
+use crate::query::{DisjunctionMaxQuery, Query, SynonymQuery, TermQuery};
+use crate::schema::{
+    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, INDEXED, STORED, TEXT,
+};
 use crate::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use crate::{
     doc, DocId, Index, IndexWriter, Searcher, SegmentReader, TantivyDocument, TantivyError, Term,
@@ -274,6 +278,100 @@ fn a_key_in_more_rules_than_the_limit_reads_the_first_ones() {
             Some(&[&["couch"], &["divan"], &["sofa"]])
         )]
     );
+}
+
+/// A text field with positions, analyzed like the rules, one document per text.
+fn docs_index(texts: &[&str]) -> (Index, Field) {
+    let mut schema_builder = Schema::builder();
+    let indexing = TextFieldIndexing::default()
+        .set_tokenizer("plain")
+        .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+    let body = schema_builder.add_text_field(
+        "body",
+        TextOptions::default().set_indexing_options(indexing),
+    );
+    let index = Index::create_in_ram(schema_builder.build());
+    index.tokenizers().register("plain", plain());
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+    for text in texts {
+        writer.add_document(doc!(body => *text)).unwrap();
+    }
+    writer.commit().unwrap();
+    (index, body)
+}
+
+#[test]
+fn each_expansion_becomes_the_query_that_matches_its_alternatives() {
+    let rules = RulesIndex::with_rules(
+        plain(),
+        &[
+            "sofa, couch, divan",
+            "sneakers, running shoes",
+            "armchair => chair",
+        ],
+    );
+    let (docs, body) = docs_index(&[
+        "a red couch",
+        "a blue divan",
+        "running shoes for sale",
+        "shoes for running",
+        "a red chair",
+    ]);
+    let searcher = docs.reader().unwrap().searcher();
+    let query = |text: &str| {
+        let [expansion] = rules.expand(&[text]).try_into().unwrap();
+        expansion_query(
+            &expansion,
+            |token| Term::from_field_text(body, token),
+            IndexRecordOption::WithFreqsAndPositions,
+        )
+        .unwrap()
+    };
+    let matches = |query: &dyn Query| {
+        let mut docs: Vec<DocId> = searcher
+            .search(query, &DocSetCollector)
+            .unwrap()
+            .into_iter()
+            .map(|address| address.doc_id)
+            .collect();
+        docs.sort();
+        docs
+    };
+
+    let sofa = query("sofa");
+    assert!(sofa.downcast_ref::<SynonymQuery>().is_some(), "{sofa:?}");
+    assert_eq!(matches(sofa.as_ref()), vec![0, 1]);
+
+    // The phrase alternative matches the words next to each other only.
+    let sneakers = query("sneakers");
+    assert!(
+        sneakers.downcast_ref::<DisjunctionMaxQuery>().is_some(),
+        "{sneakers:?}"
+    );
+    assert_eq!(matches(sneakers.as_ref()), vec![2]);
+
+    let armchair = query("armchair");
+    assert!(
+        armchair.downcast_ref::<TermQuery>().is_some(),
+        "{armchair:?}"
+    );
+    assert_eq!(matches(armchair.as_ref()), vec![4]);
+
+    let red = query("red");
+    assert!(red.downcast_ref::<TermQuery>().is_some(), "{red:?}");
+    assert_eq!(matches(red.as_ref()), vec![0, 4]);
+}
+
+#[test]
+fn a_phrase_alternative_needs_positions() {
+    let expansion = expanded(&["sneakers"], Some(&[&["running", "shoes"], &["sneakers"]]));
+    let term = |token: &str| Term::from_field_text(Field::from_field_id(0), token);
+    let without_positions = expansion_query(&expansion, term, IndexRecordOption::WithFreqs);
+    assert!(
+        matches!(without_positions, Err(TantivyError::InvalidArgument(_))),
+        "{without_positions:?}"
+    );
+    assert!(expansion_query(&expansion, term, IndexRecordOption::WithFreqsAndPositions).is_ok());
 }
 
 /// The same sequence on every run, so a failing seed replays.
