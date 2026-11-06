@@ -10,8 +10,9 @@
 //!
 //! The grid only draws curves: `m_r` is the exact smallest request reaching a target. The order a
 //! clusterer sees its rows in moves `m_r` by far more than a comparison between routers can
-//! resolve, so each rebuilt structure is built [`REBUILDS`] times over shuffled rows and judged by
-//! its median and range.
+//! resolve, so each rebuilt structure is built over shuffled rows, [`REBUILDS`] times, and judged
+//! by its median and range. K3r gets [`K3R_REBUILDS`] builds: it is the distribution the stored
+//! router's percentile is read from.
 
 use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
@@ -48,8 +49,15 @@ pub const TARGETS: [f64; 3] = [0.90, 0.95, 0.99];
 /// A rule's median `m_r` matches the flat ranking within this ratio of its probe count.
 const GATE_RATIO: f64 = 1.02;
 
-/// Builds of each rebuilt structure. Each shuffles the rows its clusterer sees, seeded by build.
+/// Builds of K1 and L. Each shuffles the rows its clusterer sees, seeded by build.
 pub const REBUILDS: u64 = 5;
+
+/// Builds of K3r, the same way.
+pub const K3R_REBUILDS: u64 = 40;
+
+/// The rows [`rebuild_check_stops`] reads: the production query set and policy.
+const STOP_QUERY_SET: &str = "held_out";
+const STOP_RERANK_FACTOR: f32 = 2.0;
 
 /// Requests walked either side of a bisected `m_r`, since recall need not rise with the request.
 const MONOTONE_SCAN: usize = 8;
@@ -291,6 +299,8 @@ pub struct TargetSpread {
     pub min: Option<usize>,
     /// Largest `m_r`; `None` when a build never reaches the target.
     pub max: Option<usize>,
+    /// 95th percentile `m_r`, nearest rank; `None` when it lies past every build that reached.
+    pub p95: Option<usize>,
     /// Builds that never reach the target.
     pub unreached: usize,
     /// Median vectors scored at `m_r`, over the builds that reach the target.
@@ -337,8 +347,12 @@ pub struct RebuildCheck {
     pub min: Option<usize>,
     /// The rebuilds' largest `m_r`; `None` when a rebuild never reaches the target.
     pub max: Option<usize>,
-    /// Whether the stored `m_r` lies inside the rebuilds' range.
-    pub within: bool,
+    /// The rebuilds' 95th percentile `m_r`.
+    pub p95: Option<usize>,
+    /// Share of rebuilds whose `m_r` is at or below the stored one.
+    pub percentile: f64,
+    /// Whether the stored `m_r` is above the rebuilds' 95th percentile.
+    pub above_p95: bool,
 }
 
 /// The gate's answer for one structure and query set.
@@ -817,6 +831,24 @@ fn median_m_r(m_rs: &[Option<usize>]) -> Option<usize> {
     Some(sorted[sorted.len() / 2]).filter(|&m| m != usize::MAX)
 }
 
+/// The nearest-rank 95th percentile of `m_r`s, unreached ones last.
+fn p95_m_r(m_rs: &[Option<usize>]) -> Option<usize> {
+    let mut sorted: Vec<usize> = m_rs.iter().map(|m| m.unwrap_or(usize::MAX)).collect();
+    sorted.sort_unstable();
+    let rank = (0.95 * sorted.len() as f64).ceil() as usize;
+    Some(sorted[rank.clamp(1, sorted.len()) - 1]).filter(|&m| m != usize::MAX)
+}
+
+/// Share of `m_rs` at or below `stored`, unreached values above every reached one.
+fn stored_percentile(stored: Option<usize>, m_rs: &[Option<usize>]) -> f64 {
+    let stored = stored.unwrap_or(usize::MAX);
+    let at_or_below = m_rs
+        .iter()
+        .filter(|m| m.unwrap_or(usize::MAX) <= stored)
+        .count();
+    at_or_below as f64 / m_rs.len().max(1) as f64
+}
+
 /// One target's spread over `rows`, a build each.
 fn target_spread(rows: &[&RankingTarget]) -> TargetSpread {
     let m_rs: Vec<Option<usize>> = rows.iter().map(|row| row.m_r).collect();
@@ -837,6 +869,7 @@ fn target_spread(rows: &[&RankingTarget]) -> TargetSpread {
         median: median_m_r(&m_rs),
         min,
         max,
+        p95: p95_m_r(&m_rs),
         unreached,
         median_scored: scored.get(scored.len() / 2).copied(),
         straddles: min.is_some_and(|min| min as f64 <= line)
@@ -1259,9 +1292,9 @@ impl Audit<'_> {
         )
     }
 
-    /// Every build of a rebuilt router.
-    fn rebuilds(&self, compressed: bool) -> crate::Result<Vec<Ranking>> {
-        (0..REBUILDS)
+    /// `builds` builds of a rebuilt router.
+    fn rebuilds(&self, compressed: bool, builds: u64) -> crate::Result<Vec<Ranking>> {
+        (0..builds)
             .map(|seed| self.rebuilt(compressed, seed))
             .collect()
     }
@@ -1303,7 +1336,7 @@ impl Audit<'_> {
         .map(Some)
     }
 
-    /// Each stored quantized target against its rebuilds' range.
+    /// Where each stored quantized target falls among its rebuilds.
     fn rebuild_checks(
         &self,
         stored: &[RankingReport],
@@ -1317,14 +1350,14 @@ impl Audit<'_> {
                 continue;
             };
             for (set, spread) in &rebuilds.spread {
-                for (spread, stored_row) in spread.iter().zip(&stored.targets[set]) {
-                    let within = match stored_row.m_r {
-                        Some(m_r) => {
-                            spread.min.is_some_and(|min| min <= m_r)
-                                && spread.max.is_none_or(|max| m_r <= max)
-                        }
-                        None => spread.unreached > 0,
-                    };
+                for (target, (spread, stored_row)) in
+                    spread.iter().zip(&stored.targets[set]).enumerate()
+                {
+                    let m_rs: Vec<Option<usize>> = rebuilds
+                        .builds
+                        .iter()
+                        .map(|build| build.targets[set][target].m_r)
+                        .collect();
                     checks.push(RebuildCheck {
                         rerank_factor: rebuilds.rerank_factor,
                         aps: rebuilds.aps,
@@ -1334,7 +1367,10 @@ impl Audit<'_> {
                         median: spread.median,
                         min: spread.min,
                         max: spread.max,
-                        within,
+                        p95: spread.p95,
+                        percentile: stored_percentile(stored_row.m_r, &m_rs),
+                        above_p95: stored_row.m_r.unwrap_or(usize::MAX)
+                            > spread.p95.unwrap_or(usize::MAX),
                     });
                 }
             }
@@ -1349,7 +1385,7 @@ impl Audit<'_> {
         full_precision: &[Ranking],
     ) -> crate::Result<(Vec<RankingReport>, Vec<RebuiltReport>)> {
         let stored = self.stored()?;
-        let quantized = self.rebuilds(true)?;
+        let quantized = self.rebuilds(true, K3R_REBUILDS)?;
         let mut rankings = Vec::new();
         let mut rebuilt = Vec::new();
         for aps in [true, false] {
@@ -1693,7 +1729,7 @@ pub fn run_audit(input: &AuditInput, phases: Phases) -> crate::Result<AuditRepor
             .collect(),
         ..AuditReport::default()
     };
-    let full_precision = audit.rebuilds(false)?;
+    let full_precision = audit.rebuilds(false, REBUILDS)?;
     if phases.a {
         let (rankings, rebuilt) = audit.phase_a(&ks, &full_precision)?;
         report.rebuild_check = audit.rebuild_checks(&rankings, &rebuilt);
@@ -1733,6 +1769,21 @@ pub fn run_audit(input: &AuditInput, phases: Phases) -> crate::Result<AuditRepor
         });
     }
     Ok(report)
+}
+
+/// Whether the stored router is an outlier among its rebuilds: above their 95th percentile on the
+/// production query set and policy, patience on, at every target. A stored router is one build, so
+/// its rows are correlated and one row says little; only all of them together stop the audit.
+pub fn rebuild_check_stops(checks: &[RebuildCheck]) -> bool {
+    let mut rows = checks
+        .iter()
+        .filter(|check| {
+            check.query_set == STOP_QUERY_SET
+                && check.aps
+                && check.rerank_factor == STOP_RERANK_FACTOR
+        })
+        .peekable();
+    rows.peek().is_some() && rows.all(|check| check.above_p95)
 }
 
 /// The kind `router_slot` opens to over `centroid_rows`, in stored order.
@@ -1952,6 +2003,57 @@ mod tests {
         target_spread(&rows.iter().collect::<Vec<_>>())
     }
 
+    fn check(query_set: &str, aps: bool, rerank_factor: f32, above_p95: bool) -> RebuildCheck {
+        RebuildCheck {
+            rerank_factor,
+            aps,
+            query_set: query_set.to_string(),
+            target: 0.9,
+            stored: None,
+            median: None,
+            min: None,
+            max: None,
+            p95: None,
+            percentile: 0.0,
+            above_p95,
+        }
+    }
+
+    #[test]
+    fn only_every_production_row_above_p95_stops() {
+        let row = |above| check(STOP_QUERY_SET, true, STOP_RERANK_FACTOR, above);
+        assert!(rebuild_check_stops(&[row(true), row(true), row(true)]));
+        assert!(!rebuild_check_stops(&[row(true), row(false), row(true)]));
+        // Other sets, factors and patience settings do not vote.
+        assert!(rebuild_check_stops(&[
+            row(true),
+            check("self_held_out", true, STOP_RERANK_FACTOR, false),
+            check(STOP_QUERY_SET, false, STOP_RERANK_FACTOR, false),
+            check(STOP_QUERY_SET, true, 4.0, false),
+        ]));
+        assert!(!rebuild_check_stops(&[check(
+            "self_held_out",
+            true,
+            2.0,
+            true
+        )]));
+        assert!(!rebuild_check_stops(&[]));
+    }
+
+    #[test]
+    fn percentiles_rank_ties_at_or_below_and_unreached_last() {
+        let m_rs: Vec<Option<usize>> = (1..=40).map(Some).collect();
+        assert_eq!(p95_m_r(&m_rs), Some(38));
+        assert_eq!(stored_percentile(Some(30), &m_rs), 0.75);
+        assert_eq!(stored_percentile(Some(0), &m_rs), 0.0);
+        assert_eq!(stored_percentile(Some(50), &m_rs), 1.0);
+        assert_eq!(stored_percentile(None, &m_rs), 1.0);
+
+        let mostly_unreached = [Some(5), None, None, None];
+        assert_eq!(p95_m_r(&mostly_unreached), None);
+        assert_eq!(stored_percentile(Some(5), &mostly_unreached), 0.25);
+    }
+
     /// The line sits at 102 for a flat `m_r` of 100.
     #[test]
     fn spreads_take_medians_and_mark_the_gate_line() {
@@ -2141,10 +2243,14 @@ mod tests {
         let report = run_audit(&input, Phases { a: true, b: true })?;
         assert_eq!(report.rankings.len(), 4);
         assert_eq!(report.rebuilt.len(), 6);
-        assert!(report
-            .rebuilt
-            .iter()
-            .all(|rebuilt| rebuilt.builds.len() == REBUILDS as usize));
+        for rebuilt in &report.rebuilt {
+            let builds = if rebuilt.name.starts_with("K3r") {
+                K3R_REBUILDS
+            } else {
+                REBUILDS
+            };
+            assert_eq!(rebuilt.builds.len(), builds as usize, "{}", rebuilt.name);
+        }
         let phase_b = report.phase_b.as_ref().unwrap();
         assert_eq!(phase_b.structures.len(), 2);
         assert_eq!(phase_b.rules.len(), 32);
