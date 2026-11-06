@@ -6,20 +6,24 @@ pub(crate) mod columns;
 pub(crate) mod estimate;
 mod exact;
 pub(crate) mod heap;
+pub(crate) mod histogram;
 pub(crate) mod layer_read;
 pub(crate) mod plan;
+pub(crate) mod rate;
 
 use std::ops::Range;
 
-use self::bound::{PruningBound, TopK};
+use self::bound::{Candidate, PruningBound, TopK};
 use self::columns::{Columns, QuantizedCandidates};
 use self::estimate::{combine_initial, combine_refine, CombineCtx};
 use self::exact::ExactScorer;
 use self::heap::TieBreakHits;
+use self::histogram::Fold;
 use self::layer_read::{decode_layer, Decoded, LayerRead, LayerSpec};
 #[cfg(test)]
 use self::plan::{forced_plan, PlanOverride};
 use self::plan::{price, Read, ReadCosts};
+use self::rate::AdmissionHistograms;
 use crate::collector::sort_key::Comparator;
 use crate::collector::SegmentSortKeyComputer;
 use crate::error::DataCorruption;
@@ -47,6 +51,7 @@ pub(crate) struct ScanConfig {
     pub(crate) capacity: usize,
     /// Whether a cluster's rows may be scored exactly before the exact phase.
     pub(crate) exact_plan: bool,
+    pub(crate) adaptive_probing: Option<crate::vector::AdaptiveProbeParams>,
     #[cfg(test)]
     pub(crate) plan_override: Option<PlanOverride>,
     /// Disables layer-0 admission pruning, which never changes results; equivalence tests flip it.
@@ -96,6 +101,7 @@ impl LayerReport {
 pub(crate) struct ScanReport {
     /// Rows shortlisted from the source.
     pub(crate) candidates_scored: usize,
+    pub(crate) recall_reached: bool,
     /// One per active layer on a quantized segment; empty at full precision.
     pub(crate) layers: Vec<LayerReport>,
     /// Rows scored at full precision.
@@ -123,6 +129,7 @@ pub(crate) struct ScanTrace {
     pub(crate) layer_columns: Vec<Vec<(BlockAddress, [u32; 4])>>,
     /// Rows scored in the exact phase.
     pub(crate) exact_phase_rows: Vec<BlockAddress>,
+    pub(crate) refined_topk_rows: Vec<BlockAddress>,
     /// Every exact score the scan computed, in order.
     pub(crate) exact_scores: Vec<f32>,
 }
@@ -239,13 +246,15 @@ impl<'a> QuantizedState<'a> {
 
     /// Scores a cluster's rows on layer 0, read as `read`, and appends the rows whose interval
     /// can still reach the pruning threshold as a candidate block. The threshold only rises, so
-    /// the rows dropped here are rows every later boundary would drop.
+    /// the rows dropped here are rows every later boundary would drop. Every row's survival score
+    /// goes to `fold`, pruned or not.
     fn admit(
         &mut self,
         rows: &ClusterRows<'_>,
         read: LayerRead,
         bound: &mut PruningBound,
         scratch: &mut ReadScratch,
+        fold: Option<Fold<'_>>,
     ) -> crate::Result<()> {
         let centroid = match rows.centroid {
             Some(centroid) => centroid,
@@ -265,6 +274,14 @@ impl<'a> QuantizedState<'a> {
                     &mut self.admission_columns,
                     0..rows.len(),
                 );
+                if let Some(mut fold) = fold {
+                    let columns = &self.admission_columns;
+                    fold.upper_endpoints(
+                        &columns.estimates[..rows.len()],
+                        &columns.sigmas[..rows.len()],
+                        self.candidates.kappa(),
+                    );
+                }
                 self.select_admitted(rows, threshold);
                 let at = self.candidates.push_selected(
                     rows,
@@ -283,6 +300,14 @@ impl<'a> QuantizedState<'a> {
                     &mut self.candidates.columns,
                     at.clone(),
                 );
+                if let Some(mut fold) = fold {
+                    let columns = &self.candidates.columns;
+                    fold.upper_endpoints(
+                        &columns.estimates[at.clone()],
+                        &columns.sigmas[at.clone()],
+                        self.candidates.kappa(),
+                    );
+                }
                 bound.offer(self.candidates.entries(at, self.segment_ord));
             }
         }
@@ -399,6 +424,26 @@ impl<'a> QuantizedState<'a> {
 
 // --- Segment scan ---
 
+/// The admission-rate measurement, armed by the segment plan when the RateAPS is on.
+#[derive(Default)]
+pub(crate) struct RateApsState {
+    /// Survival scores seen before the fill; they size the grid and nothing else.
+    prefill: Vec<f32>,
+    rows: usize,
+    histograms: Option<AdmissionHistograms>,
+    next_refinement: usize,
+}
+
+impl RateApsState {
+    pub(crate) fn refinement_due(&mut self) -> bool {
+        if self.next_refinement == 0 || self.rows < self.next_refinement {
+            return false;
+        }
+        self.next_refinement = self.rows.saturating_mul(2);
+        true
+    }
+}
+
 /// One segment's IVF scan. A cluster source supplies each cluster's rows; the scan shortlists them
 /// under the segment's quantization, keeps the pruning bound, and scores what is left exactly.
 pub(crate) struct SegmentScan<'a, T, K, C>
@@ -415,6 +460,9 @@ where
     scratch: ReadScratch,
     /// The candidate blocks by cluster id, which is row order; set when the shortlist closes.
     by_cluster: Vec<usize>,
+    /// The admission-rate measurement; `None` unless the RateAPS is on.
+    rate: Option<RateApsState>,
+    recall_fraction: Option<f64>,
     report: ScanReport,
 }
 
@@ -452,6 +500,10 @@ where
             None
         };
         let layers = quantized.as_ref().map_or(0, |state| state.layers.len());
+        let recall_fraction = config
+            .adaptive_probing
+            .filter(|_| config.top_n > 0)
+            .map(|p| p.admission_fraction);
         Ok(Self {
             exact: ExactScorer::new(
                 reader,
@@ -465,6 +517,8 @@ where
             quantized,
             scratch: ReadScratch::default(),
             by_cluster: Vec::new(),
+            recall_fraction,
+            rate: recall_fraction.map(|_| RateApsState::default()),
             report: ScanReport {
                 layers: vec![LayerReport::default(); layers],
                 ..ScanReport::default()
@@ -483,9 +537,33 @@ where
         while let Some(rows) = source.next()? {
             let scored = self.shortlist(&rows)?;
             source.admitted(scored)?;
+            if self.recall_reached() {
+                break;
+            }
         }
         drop(stage);
         self.refine_shortlist()
+    }
+
+    pub(crate) fn swap_rate(&mut self, rate: &mut Option<RateApsState>) {
+        std::mem::swap(&mut self.rate, rate);
+    }
+
+    pub(crate) fn recall_reached(&mut self) -> bool {
+        let reached = self
+            .recall_fraction
+            .zip(self.bound.shared_threshold())
+            .and_then(|(fraction, bar)| {
+                self.rate
+                    .as_ref()?
+                    .histograms
+                    .as_ref()?
+                    .reading(bar)
+                    .map(|reading| reading.reached(fraction))
+            })
+            .unwrap_or(false);
+        self.report.recall_reached |= reached;
+        reached
     }
 
     pub(crate) fn refine_shortlist(&mut self) -> crate::Result<()> {
@@ -494,6 +572,73 @@ where
             self.narrow(layer)?;
         }
         self.score_shortlist()
+    }
+
+    pub(crate) fn refinement_candidates(&self, limit: usize) -> Vec<Candidate> {
+        let Some(state) = &self.quantized else {
+            return Vec::new();
+        };
+        let mut candidates = state.candidates.live_candidates(state.segment_ord);
+        if let Some(bar) = self.bound.shared_threshold() {
+            candidates.retain(|candidate| candidate.bound.estimate() > bar);
+        }
+        if candidates.len() > limit {
+            candidates.select_nth_unstable_by(limit, |a, b| {
+                b.bound
+                    .estimate()
+                    .total_cmp(&a.bound.estimate())
+                    .then_with(|| a.address.cmp(&b.address))
+            });
+            candidates.truncate(limit);
+        }
+        candidates
+    }
+
+    pub(crate) fn refine_topk(&mut self, top: &[Candidate]) -> crate::Result<()> {
+        let Some(state) = &mut self.quantized else {
+            return Ok(());
+        };
+        let mut rows: Vec<_> = top
+            .iter()
+            .filter(|candidate| candidate.address.segment_ord == state.segment_ord)
+            .map(|candidate| candidate.address.block_address)
+            .collect();
+        if rows.is_empty() {
+            return Ok(());
+        }
+        rows.sort_unstable();
+        state.candidates.order_by_cluster(&mut self.by_cluster);
+        for &b in &self.by_cluster {
+            let group = state.candidates.rows(b);
+            let offsets: Vec<_> = rows
+                .iter()
+                .filter(|row| {
+                    row.block as usize == group.cluster && group.rows.contains(&(row.row as usize))
+                })
+                .map(|row| row.row - group.rows.start as u32)
+                .filter(|offset| group.offsets.unwrap().binary_search(offset).is_ok())
+                .collect();
+            if offsets.is_empty() {
+                continue;
+            }
+            let selected = ClusterRows {
+                offsets: Some(&offsets),
+                docs: None,
+                ..group
+            };
+            let scored = self
+                .exact
+                .score(&selected, &mut self.scratch, &mut self.bound, None)?;
+            self.report.exact_rows += scored;
+            #[cfg(test)]
+            self.report.trace.refined_topk_rows.extend(
+                selected
+                    .local_rows()
+                    .map(|row| BlockAddress::new(selected.cluster as u32, row as u32)),
+            );
+            state.candidates.remove_rows(b, &offsets);
+        }
+        Ok(())
     }
 
     /// The stage the shortlist is built in: layer 0, or the exact scan at full precision.
@@ -533,19 +678,49 @@ where
             rows.local_rows()
                 .map(|row| BlockAddress::new(rows.cluster as u32, row as u32)),
         );
-        match self.read_plan(rows, 0)? {
+        let read = self.read_plan(rows, 0)?;
+        let fold = self.rate.as_mut().map(|rate| match &mut rate.histograms {
+            None => Fold::Prefill(&mut rate.prefill),
+            Some(histograms) => {
+                let grid = histograms.grid();
+                Fold::Binned(histograms.cluster_mut(), grid)
+            }
+        });
+        match read {
             Read::Exact => {
                 self.report.exact_rows +=
-                    self.exact.score(rows, &mut self.scratch, &mut self.bound)?;
+                    self.exact
+                        .score(rows, &mut self.scratch, &mut self.bound, fold)?;
             }
             Read::Layer(read) => {
                 if let Some(state) = &mut self.quantized {
-                    state.admit(rows, read, &mut self.bound, &mut self.scratch)?;
+                    state.admit(rows, read, &mut self.bound, &mut self.scratch, fold)?;
                 }
             }
         }
         self.report.candidates_scored += len;
+        self.close_rate_cluster(len);
         Ok(len)
+    }
+
+    /// Ends the admission-rate measurement's cluster of `len` rows. Once the shared pruning
+    /// threshold exists, the grid is set from it and every survival score so far.
+    fn close_rate_cluster(&mut self, len: usize) {
+        let Some(rate) = &mut self.rate else {
+            return;
+        };
+        rate.rows += len;
+        match &mut rate.histograms {
+            Some(histograms) => histograms.finish_cluster(len),
+            None => {
+                if let Some(bar) = self.bound.shared_threshold() {
+                    let w0 = rate.rows;
+                    rate.histograms = Some(AdmissionHistograms::at_fill(bar, &rate.prefill, w0));
+                    rate.next_refinement = w0.saturating_mul(2);
+                    rate.prefill = Vec::new();
+                }
+            }
+        }
     }
 
     /// How the rows of `selected` are read at `layer`: exactly at full precision, otherwise as the
@@ -581,7 +756,7 @@ where
                 Read::Exact => {
                     self.report.exact_rows +=
                         self.exact
-                            .score(&group, &mut self.scratch, &mut self.bound)?;
+                            .score(&group, &mut self.scratch, &mut self.bound, None)?;
                     state.candidates.retire(b);
                 }
                 Read::Layer(read) => state.refine(layer, b, read, &mut self.scratch)?,
