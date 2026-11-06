@@ -1,6 +1,7 @@
 //! Tests of synonym expansion over an index, across writes, deletes and merges.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::panic;
 use std::sync::Arc;
 
 use columnar::Column;
@@ -414,108 +415,141 @@ fn without(
         .collect()
 }
 
+/// Set it to a seed to run the model test for that seed only.
+const MODEL_SEED_VAR: &str = "SYNONYM_MODEL_SEED";
+
+/// The number of seeds a run checks when `MODEL_SEED_VAR` is not set.
+const MODEL_SEEDS_PER_RUN: u64 = 16;
+
 /// An expansion must not depend on how the rules are spread over segments, deleted, cached or
 /// merged.
 #[test]
 fn expand_matches_a_plain_model_of_the_rules() {
-    for seed in 0..16 {
-        let mut rng = Lcg(seed);
-        let queries: Vec<Vec<String>> = (0..100).map(|_| random_query(&mut rng)).collect();
-        let mut index = RulesIndex::new(plain());
-        let mut alive: BTreeMap<u64, Vec<String>> = BTreeMap::new();
-        let mut next_id = 0;
-        for _ in 0..5 {
-            for _ in 0..rng.below(8) {
-                let rules: Vec<String> = (0..1 + rng.below(2))
-                    .map(|_| random_rule(&mut rng))
-                    .collect();
-                index.add(next_id, &rules);
-                alive.insert(next_id, rules);
-                next_id += 1;
+    let seeds: Vec<u64> = match std::env::var(MODEL_SEED_VAR) {
+        Ok(seed) => {
+            let seed: u64 = seed
+                .parse()
+                .unwrap_or_else(|_| panic!("{MODEL_SEED_VAR} must be a number, not {seed:?}"));
+            vec![seed]
+        }
+        // A new start on every run, so the runs together check more cases than a fixed list.
+        Err(_) => {
+            let start = u64::from(rand::random::<u32>());
+            (start..start + MODEL_SEEDS_PER_RUN).collect()
+        }
+    };
+    for seed in seeds {
+        if let Err(payload) = panic::catch_unwind(|| check_against_the_model(seed)) {
+            let features = if cfg!(feature = "quickwit") {
+                " --features quickwit"
+            } else {
+                ""
+            };
+            eprintln!(
+                "seed {seed} fails. Run it again with:\n{MODEL_SEED_VAR}={seed} cargo test \
+                 --lib{features} expand_matches_a_plain_model_of_the_rules"
+            );
+            panic::resume_unwind(payload);
+        }
+    }
+}
+
+fn check_against_the_model(seed: u64) {
+    let mut rng = Lcg(seed);
+    let queries: Vec<Vec<String>> = (0..100).map(|_| random_query(&mut rng)).collect();
+    let mut index = RulesIndex::new(plain());
+    let mut alive: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+    let mut next_id = 0;
+    for _ in 0..5 {
+        for _ in 0..rng.below(8) {
+            let rules: Vec<String> = (0..1 + rng.below(2))
+                .map(|_| random_rule(&mut rng))
+                .collect();
+            index.add(next_id, &rules);
+            alive.insert(next_id, rules);
+            next_id += 1;
+        }
+        // A delete, or an update, which is a delete and an add of the same id.
+        for _ in 0..rng.below(3) {
+            let Some(&id) = alive.keys().nth(rng.below(alive.len().max(1))) else {
+                break;
+            };
+            index.delete(id);
+            alive.remove(&id);
+            if rng.below(2) == 0 {
+                let rules = vec![random_rule(&mut rng)];
+                index.add(id, &rules);
+                alive.insert(id, rules);
             }
-            // A delete, or an update, which is a delete and an add of the same id.
-            for _ in 0..rng.below(3) {
-                let Some(&id) = alive.keys().nth(rng.below(alive.len().max(1))) else {
-                    break;
-                };
-                index.delete(id);
-                alive.remove(&id);
-                if rng.below(2) == 0 {
-                    let rules = vec![random_rule(&mut rng)];
-                    index.add(id, &rules);
-                    alive.insert(id, rules);
-                }
-            }
-            index.commit();
         }
-        let searcher = index.searcher();
-        let expander =
-            SynonymExpander::new(searcher.segment_readers(), index.rule, plain()).unwrap();
-        for query in &queries {
-            let expansions = expander.expand(query).unwrap();
-            assert_eq!(
-                expansions,
-                model_expand(&alive, query),
-                "seed {seed}, {query:?}"
-            );
-        }
+        index.commit();
+    }
+    let searcher = index.searcher();
+    let expander = SynonymExpander::new(searcher.segment_readers(), index.rule, plain()).unwrap();
+    for query in &queries {
+        let expansions = expander.expand(query).unwrap();
+        assert_eq!(
+            expansions,
+            model_expand(&alive, query),
+            "with the deletes in the bitsets, query {query:?}"
+        );
+    }
 
-        let deleted: BTreeSet<u64> = alive
-            .keys()
-            .copied()
-            .filter(|_| rng.below(3) == 0)
-            .collect();
-        let visible = without(&alive, &deleted);
-        let ids: Vec<Column<u64>> = searcher
-            .segment_readers()
-            .iter()
-            .map(|segment_reader| segment_reader.fast_fields().u64("id").unwrap())
-            .collect();
-        for query in &queries {
-            let expansions = expander
-                .expand_with(query, |segment, doc| {
-                    !deleted.contains(&ids[segment].first(doc).unwrap())
-                })
-                .unwrap();
-            assert_eq!(
-                expansions,
-                model_expand(&visible, query),
-                "seed {seed}, {query:?}"
-            );
-        }
+    let deleted: BTreeSet<u64> = alive
+        .keys()
+        .copied()
+        .filter(|_| rng.below(3) == 0)
+        .collect();
+    let visible = without(&alive, &deleted);
+    let ids: Vec<Column<u64>> = searcher
+        .segment_readers()
+        .iter()
+        .map(|segment_reader| segment_reader.fast_fields().u64("id").unwrap())
+        .collect();
+    for query in &queries {
+        let expansions = expander
+            .expand_with(query, |segment, doc| {
+                !deleted.contains(&ids[segment].first(doc).unwrap())
+            })
+            .unwrap();
+        assert_eq!(
+            expansions,
+            model_expand(&visible, query),
+            "with the caller check, query {query:?}"
+        );
+    }
 
-        let mut source = CachingSource::new(&searcher, index.rule);
-        source.deleted = deleted;
-        for query in &queries {
-            let expansions = expand(query, &mut source).unwrap();
-            assert_eq!(
-                expansions,
-                model_expand(&visible, query),
-                "seed {seed}, {query:?}"
-            );
-        }
-        source
-            .deleted
-            .extend(visible.keys().copied().filter(|_| rng.below(3) == 0));
-        let visible = without(&alive, &source.deleted);
-        for query in &queries {
-            let expansions = expand(query, &mut source).unwrap();
-            assert_eq!(
-                expansions,
-                model_expand(&visible, query),
-                "seed {seed}, {query:?}"
-            );
-        }
+    let mut source = CachingSource::new(&searcher, index.rule);
+    source.deleted = deleted;
+    for query in &queries {
+        let expansions = expand(query, &mut source).unwrap();
+        assert_eq!(
+            expansions,
+            model_expand(&visible, query),
+            "with a cold cache, query {query:?}"
+        );
+    }
+    source
+        .deleted
+        .extend(visible.keys().copied().filter(|_| rng.below(3) == 0));
+    let visible = without(&alive, &source.deleted);
+    for query in &queries {
+        let expansions = expand(query, &mut source).unwrap();
+        assert_eq!(
+            expansions,
+            model_expand(&visible, query),
+            "with a warm cache and more deletes, query {query:?}"
+        );
+    }
 
-        index.merge_all();
-        let expander = index.expander();
-        for query in &queries {
-            let expansions = expander.expand(query).unwrap();
-            assert_eq!(
-                expansions,
-                model_expand(&alive, query),
-                "seed {seed}, {query:?}"
-            );
-        }
+    index.merge_all();
+    let expander = index.expander();
+    for query in &queries {
+        let expansions = expander.expand(query).unwrap();
+        assert_eq!(
+            expansions,
+            model_expand(&alive, query),
+            "after a merge, query {query:?}"
+        );
     }
 }
