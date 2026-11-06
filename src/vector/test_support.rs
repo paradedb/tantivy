@@ -48,7 +48,7 @@ use crate::{
 #[derive(Clone, Copy)]
 pub(crate) struct SegmentRun<'a> {
     pub(crate) searcher: &'a SegmentSearcher<f32>,
-    pub(crate) routing: Option<&'a crate::vector::collector::SegmentRoutingPlan>,
+    pub(crate) routing: Option<&'a crate::vector::router::plan::SegmentRoutingPlan>,
     pub(crate) index: &'a ClusterIndex,
     pub(crate) weight: &'a dyn Weight,
     pub(crate) segment: &'a SegmentReader,
@@ -508,17 +508,14 @@ impl Fixture {
         let Some(crate::vector::search::segment::plan::Source::Router(filter)) = plan.source else {
             return Ok(None);
         };
-        Ok(Some(Arc::new(
-            crate::collector::TopDocs::with_limit(top_n.max(1))
-                .order_by_similarity(self.field, query.to_vec())
-                .with_probe_params(params.clone())
-                .build()
-                .route_segments(
-                    filter.match_fraction(segment.max_doc()),
-                    &[crate::vector::VectorSegment::from((0, segment))],
-                    |_| {},
-                )?,
-        )))
+        Ok(Some(Arc::new(crate::vector::VectorRoutingPlan::build(
+            self.field,
+            query.to_vec(),
+            params.clone(),
+            filter.match_fraction(segment.max_doc()),
+            &[crate::vector::VectorSegment::from((0, segment))],
+            |_| {},
+        )?)))
     }
 
     /// Runs one segment's search directly, with any `top_n`, under `weight`.

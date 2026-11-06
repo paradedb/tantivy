@@ -22,6 +22,7 @@ pub(crate) mod arena;
 pub(crate) mod candidate;
 mod exact;
 pub(crate) mod global;
+pub(crate) mod plan;
 mod quantized;
 mod scoring;
 mod search;
