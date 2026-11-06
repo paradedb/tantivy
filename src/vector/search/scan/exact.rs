@@ -19,10 +19,13 @@ use crate::{DocAddress, DocId, SegmentOrdinal};
 
 /// Full-precision rows of one cluster's selection.
 enum ExactRows<'s> {
-    /// The cluster's whole full-precision span, in one request.
+    /// A plain cluster's whole full-precision span, in one request.
     Span(OwnedBytes),
-    /// The selected rows, through a storage-aware read plan into the scan's scratch.
+    /// A plain cluster's selected rows, through a storage-aware read plan into the scan's scratch.
     Planned(VectorRowBatch<'s>),
+    /// The selected documents' rows from the document-ordered rows of a quantized field, in
+    /// selection order.
+    Docs(VectorRowBatch<'s>),
 }
 
 /// Scores rows exactly into the pruning bound and the result heap; the only way rows reach the
@@ -40,6 +43,9 @@ where
     segment_ord: SegmentOrdinal,
     /// A cluster's DocIds column, read when its selected rows carry no doc ids.
     cluster_docs: Vec<DocId>,
+    /// The selected rows' doc ids picked from `cluster_docs`, for a quantized field whose rows are
+    /// read by document.
+    selected_docs: Vec<DocId>,
     /// Global rows scored in the exact phase, in order; the scan copies them into its trace.
     #[cfg(test)]
     pub(super) exact_phase_rows: Vec<BlockAddress>,
@@ -69,6 +75,7 @@ where
             tie_break,
             segment_ord,
             cluster_docs: Vec::new(),
+            selected_docs: Vec::new(),
             #[cfg(test)]
             exact_phase_rows: Vec::new(),
             #[cfg(test)]
@@ -79,8 +86,10 @@ where
     // --- Scoring ---
 
     /// Scores every row `selected` selects into `bound` and the heap, reading through `scratch`;
-    /// returns the rows scored. A row without a doc id reads the cluster's DocIds column when it
-    /// first needs one. Each exact is `offer`ed to the bound (which CASes the shared slot).
+    /// returns the rows scored. On plain storage a row without a doc id reads the cluster's DocIds
+    /// column when it first needs one; on quantized storage the rows are read by document, so the
+    /// column is read once, before the rows, when the selection carries no doc ids. Each exact is
+    /// `offer`ed to the bound (which CASes the shared slot).
     pub(super) fn score(
         &mut self,
         selected: &ClusterRows<'_>,
@@ -135,6 +144,7 @@ where
                         local,
                         selected.rows.start + local,
                         row_bytes,
+                        None,
                     )?;
                 }
                 bytes.len() / stride
@@ -151,6 +161,34 @@ where
                         row - selected.rows.start,
                         row,
                         row_bytes,
+                        None,
+                    )?;
+                    scored += 1;
+                }
+                scored
+            }
+            ExactRows::Docs(batch) => {
+                // Selection order: the i-th row read is the i-th selected row, whose doc id is in
+                // hand.
+                let mut scored = 0;
+                for (position, (_, row_bytes)) in batch.iter().enumerate() {
+                    let offset = match selected.offsets {
+                        Some(offsets) => offsets[position] as usize,
+                        None => position,
+                    };
+                    let doc = match selected.docs {
+                        Some(docs) => docs[position],
+                        None => self.selected_docs[position],
+                    };
+                    self.offer(
+                        selected,
+                        bound,
+                        &mut column_read,
+                        position,
+                        offset,
+                        selected.rows.start + offset,
+                        row_bytes,
+                        Some(doc),
                     )?;
                     scored += 1;
                 }
@@ -163,9 +201,10 @@ where
 
     /// Scores one row into `bound`, `fold` and, when it can enter the top k, the heap.
     ///
-    /// `position` indexes the selection's doc ids and `offset` the cluster's DocIds column, read
-    /// once per selection on first use. The bound is keyed by [`RowAddress`] so doc lookup stays
-    /// deferred until the score can enter the result heap.
+    /// `doc` is the row's document when the read resolved it; otherwise `position` indexes the
+    /// selection's doc ids and `offset` the cluster's DocIds column, read once per selection on
+    /// first use. The bound is keyed by [`RowAddress`] so doc lookup stays deferred until the score
+    /// can enter the result heap.
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn offer(
@@ -178,6 +217,7 @@ where
         offset: usize,
         local_row: usize,
         bytes: &[u8],
+        doc: Option<DocId>,
     ) -> crate::Result<()> {
         let score = self.query.score_row(bytes).score();
         #[cfg(test)]
@@ -203,9 +243,10 @@ where
         {
             return Ok(());
         }
-        let doc = match selected.docs {
-            Some(docs) => docs[position],
-            None => {
+        let doc = match (doc, selected.docs) {
+            (Some(doc), _) => doc,
+            (None, Some(docs)) => docs[position],
+            (None, None) => {
                 if !*column_read {
                     let _fetch = enter_vector_stage(VectorStage::ExactFetch);
                     self.reader
@@ -223,13 +264,35 @@ where
 
     // --- Reads ---
 
-    /// Reads the selected full-precision rows: the cluster's span, or the rows planned into
-    /// `scratch`.
+    /// Reads the selected full-precision rows: on plain storage the cluster's span, or the rows
+    /// planned into `scratch`; on quantized storage the selected documents' rows from the
+    /// document-ordered entry, reading the cluster's DocIds column first when the selection
+    /// carries no doc ids.
     fn read<'s>(
-        &self,
+        &mut self,
         selected: &ClusterRows<'_>,
         scratch: &'s mut ReadScratch,
     ) -> crate::Result<ExactRows<'s>> {
+        if self.reader.has_exact_rows() {
+            let docs = match selected.docs {
+                Some(docs) => docs,
+                None => {
+                    self.reader
+                        .read_doc_ids(selected.cluster, &mut self.cluster_docs)?;
+                    self.selected_docs.clear();
+                    match selected.offsets {
+                        Some(offsets) => self.selected_docs.extend(
+                            offsets
+                                .iter()
+                                .map(|&offset| self.cluster_docs[offset as usize]),
+                        ),
+                        None => self.selected_docs.extend_from_slice(&self.cluster_docs),
+                    }
+                    &self.selected_docs
+                }
+            };
+            return Ok(ExactRows::Docs(self.reader.read_exact_docs(docs, scratch)?));
+        }
         Ok(match selected.offsets {
             None => ExactRows::Span(self.reader.read_cluster_rows(selected.cluster)?),
             Some(_) => {

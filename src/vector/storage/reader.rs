@@ -2,7 +2,9 @@
 //!
 //! Metadata opens independently of search state. The first search-reader request
 //! pins routing state. Block addresses are read and validated only when accessed.
-//! Clustered IdMap entries open only for document lookups. See FORMAT.md.
+//! Clustered IdMap entries open only for document lookups. A quantized clustered field keeps
+//! its full-precision rows in document order in its `ExactRows` entry; one set of flat-row
+//! primitives, [`FlatRows`], serves that entry and flat fields alike. See FORMAT.md.
 
 use std::io;
 use std::ops::Range;
@@ -23,10 +25,10 @@ use crate::vector::storage::header::{
 };
 use crate::vector::storage::id_map::IdMap;
 use crate::vector::storage::io::{VectorRead, VectorReadKind};
-use crate::vector::storage::metadata::{SlotType, VectorColMetadata};
+use crate::vector::storage::metadata::{Partition, SlotType, VectorColMetadata};
 use crate::vector::storage::quantized::{
-    exact_read_cost, range_cost, QuantizedFieldReader, QuantizedIndexCtx, QuantizedLayerReader,
-    ReadCost, ReadScratch,
+    exact_read_cost, push_consecutive_runs, range_cost, rows_read_cost, QuantizedFieldReader,
+    QuantizedIndexCtx, QuantizedLayerReader, ReadCost, ReadScratch,
 };
 use crate::vector::BlockAddress;
 use crate::{DocId, SegmentReader, TantivyError};
@@ -87,19 +89,37 @@ impl<'s> Iterator for VectorRowBatchIter<'s> {
     }
 }
 
-/// Every vector field declares exactly the two format entries.
-fn validate_vector_entries(composite: &CompositeFile, field: Field) -> crate::Result<()> {
-    if composite.field_indices().any(|(_, idx)| idx > 1)
-        || !composite
+/// A flat or plain clustered field declares exactly the IdMap and Data entries; a quantized
+/// clustered field also declares exactly the ExactIdMap and ExactRows entries.
+fn validate_vector_entries(
+    composite: &CompositeFile,
+    field: Field,
+    exact_rows: bool,
+) -> crate::Result<()> {
+    let declared = |entry: VectorEntry| {
+        composite
             .field_indices()
-            .any(|(f, idx)| f == field && idx == VectorEntry::IdMap.index())
-        || composite
-            .open_read_with_idx(field, VectorEntry::Data.index())
-            .is_none()
+            .any(|(f, idx)| f == field && idx == entry.index())
+    };
+    let last = if exact_rows {
+        VectorEntry::ExactRows.index()
+    } else {
+        VectorEntry::Data.index()
+    };
+    let exact_declared = declared(VectorEntry::ExactIdMap) && declared(VectorEntry::ExactRows);
+    if composite
+        .field_indices()
+        .any(|(f, idx)| f == field && idx > last)
+        || !declared(VectorEntry::IdMap)
+        || !declared(VectorEntry::Data)
+        || exact_declared != exact_rows
     {
-        return Err(DataCorruption::comment_only(
-            "vector field requires exactly IdMap and Data entries",
-        )
+        return Err(DataCorruption::comment_only(if exact_rows {
+            "quantized clustered vector field requires exactly IdMap, Data, ExactIdMap and \
+             ExactRows entries"
+        } else {
+            "vector field requires exactly IdMap and Data entries"
+        })
         .into());
     }
     Ok(())
@@ -124,11 +144,21 @@ struct VectorSource {
     field: Field,
     max_doc: DocId,
     centroid_slots: Option<CentroidSlices>,
+    /// The validated `ExactRows` metadata of a quantized clustered field.
+    exact: Option<BlockMetadata>,
+}
+
+/// The entry a deferred addressing map is read from.
+struct DeferredIdMapSource {
+    composite: CompositeFile,
+    field: Field,
+    max_doc: DocId,
+    entry: VectorEntry,
 }
 
 /// Opens an addressing entry only when a document lookup needs it; failures are shared.
 struct DeferredIdMap {
-    source: Option<(CompositeFile, Field, DocId)>,
+    source: Option<DeferredIdMapSource>,
     value: OnceLock<crate::Result<IdMap>>,
 }
 impl DeferredIdMap {
@@ -139,15 +169,34 @@ impl DeferredIdMap {
             value: OnceLock::from(Ok(map)),
         }
     }
+    /// Defers `entry` of `field` in `composite`.
+    fn deferred(
+        composite: CompositeFile,
+        field: Field,
+        max_doc: DocId,
+        entry: VectorEntry,
+    ) -> Self {
+        Self {
+            source: Some(DeferredIdMapSource {
+                composite,
+                field,
+                max_doc,
+                entry,
+            }),
+            value: OnceLock::new(),
+        }
+    }
     /// Initializes the entry once and checks its variant against the stored partition.
     fn get(&self, clustered: bool) -> crate::Result<&IdMap> {
         self.value
             .get_or_init(|| {
-                let (composite, field, max_doc) =
-                    self.source.as_ref().expect("deferred entry source");
-                let entry = composite
-                    .open_read_with_idx(*field, VectorEntry::IdMap.index())
-                    .unwrap();
+                let DeferredIdMapSource {
+                    composite,
+                    field,
+                    max_doc,
+                    entry,
+                } = self.source.as_ref().expect("deferred entry source");
+                let entry = composite.open_read_with_idx(*field, entry.index()).unwrap();
                 let map = IdMap::open(entry, *max_doc)
                     .map_err(|e| DataCorruption::comment_only(e.to_string()))?;
                 if matches!(map, IdMap::DocLocations(_)) != clustered {
@@ -171,12 +220,135 @@ pub struct VectorIndexReader {
     /// `false` for the placeholder built by [`Self::empty`] — the segment has
     /// no vector data for this field at all.
     pub(crate) present: bool,
-    /// Document addressing, deferred until a lookup requires the entry.
+    /// Document addressing, deferred until a lookup requires the entry. Clustered storage maps a
+    /// document to its primary row.
     id_map: DeferredIdMap,
     /// Deferred row-group columns and their validated geometry.
     rows_slice: Arc<Blocks>,
     pub(crate) index: Option<ClusterIndex>,
+    /// The document-ordered full-precision rows of a quantized clustered field.
+    exact: Option<ExactRows>,
     quantization: OnceLock<crate::Result<Option<QuantizedFieldReader>>>,
+}
+
+/// A quantized clustered field's full-precision rows in document order: flat blocks and the
+/// presence map that ranks a document to its row.
+struct ExactRows {
+    blocks: Arc<Blocks>,
+    id_map: DeferredIdMap,
+}
+
+/// Document-ordered full-precision rows in flat blocks: a flat field's Data entry, or a quantized
+/// clustered field's ExactRows entry. Every flat row access goes through here.
+pub(crate) struct FlatRows<'a> {
+    blocks: &'a Blocks,
+    id_map: &'a DeferredIdMap,
+}
+
+impl FlatRows<'_> {
+    fn rows_per_block(&self) -> u32 {
+        let Partition::Uniform { rows_per_block } = self.blocks.metadata.field().partition else {
+            unreachable!("flat rows have a uniform partition")
+        };
+        rows_per_block
+    }
+
+    fn map(&self) -> crate::Result<&IdMap> {
+        self.id_map.get(false)
+    }
+
+    /// The block and local row of flat row `row`.
+    pub(crate) fn address(&self, row: u32) -> BlockAddress {
+        let rows_per_block = self.rows_per_block();
+        BlockAddress::new(row / rows_per_block, row % rows_per_block)
+    }
+
+    /// Rows stored, every document with a vector once.
+    pub(crate) fn num_rows(&self) -> usize {
+        self.blocks.num_rows()
+    }
+
+    /// The location of `doc`'s row, by presence rank.
+    pub(crate) fn location(&self, doc: DocId) -> crate::Result<Option<BlockAddress>> {
+        Ok(self.map()?.rank_if_exists(doc).map(|row| self.address(row)))
+    }
+
+    /// The document of flat row `row`.
+    pub(crate) fn doc_at(&self, row: u32) -> crate::Result<DocId> {
+        Ok(self.map()?.doc_at(row))
+    }
+
+    /// The flat rows of ascending `docs`, which must all have one; ascending as well.
+    fn rows_of(&self, docs: &[DocId], out: &mut Vec<usize>) -> crate::Result<()> {
+        debug_assert!(docs.windows(2).all(|pair| pair[0] < pair[1]));
+        let map = self.map()?;
+        out.clear();
+        for &doc in docs {
+            let row = map.rank_if_exists(doc).ok_or_else(|| {
+                DataCorruption::comment_only(format!("document {doc} has no full-precision row"))
+            })?;
+            out.push(row as usize);
+        }
+        Ok(())
+    }
+
+    /// The rows as one contiguous span, row `r` at `r * stride`.
+    fn span(&self, stride: usize) -> &FileSlice {
+        debug_assert_eq!(stride, self.blocks.schema[0].stride as usize);
+        self.blocks
+            .flat_rows()
+            .expect("flat rows have a uniform partition")
+    }
+
+    /// Reads the rows of ascending `docs` as one range read per run of consecutive rows,
+    /// addressed by row within the contiguous span; the batch yields them in document order,
+    /// keyed by flat row.
+    pub(crate) fn read_docs<'s>(
+        &self,
+        docs: &[DocId],
+        stride: usize,
+        scratch: &'s mut ReadScratch,
+    ) -> crate::Result<VectorRowBatch<'s>> {
+        let ReadScratch {
+            rows, runs, chunks, ..
+        } = scratch;
+        runs.clear();
+        chunks.clear();
+        self.rows_of(docs, rows)?;
+        let span = self.span(stride);
+        push_consecutive_runs(rows, runs);
+        for range in runs.iter().cloned() {
+            let bytes = span.read_vector_bytes_slice(
+                range.start * stride..range.end * stride,
+                VectorReadKind::FullPrecision,
+            )?;
+            chunks.push(VectorRowChunk { rows: range, bytes });
+        }
+        Ok(VectorRowBatch {
+            rows,
+            chunks,
+            stride,
+        })
+    }
+
+    /// The cost of reading the rows of ascending `docs`: the distinct storage blocks they touch,
+    /// or their bytes without block geometry, from the rows' arithmetic offsets within the span.
+    /// Reads nothing. Uses `scratch.offsets`.
+    pub(crate) fn docs_cost(
+        &self,
+        docs: &[DocId],
+        stride: usize,
+        scratch: &mut ReadScratch,
+    ) -> crate::Result<ReadCost> {
+        let rows = &mut scratch.offsets;
+        self.rows_of(docs, rows)?;
+        Ok(rows_read_cost(
+            self.span(stride),
+            stride,
+            rows.iter().copied(),
+            rows.len(),
+        ))
+    }
 }
 
 impl VectorFieldReader {
@@ -243,11 +415,20 @@ impl VectorFieldReader {
         };
 
         let vec_composite = CompositeFile::open(&body)?;
-        validate_vector_entries(&vec_composite, field)?;
         let data = vec_composite
             .open_read_with_idx(field, VectorEntry::Data.index())
-            .unwrap();
+            .ok_or_else(|| DataCorruption::comment_only("vector field has no Data entry"))?;
         let metadata = BlockMetadata::open(data, &options, centroid_slots.is_some())?;
+        let exact_rows = metadata.meta.has_exact_rows();
+        validate_vector_entries(&vec_composite, field, exact_rows)?;
+        let exact = if exact_rows {
+            let entry = vec_composite
+                .open_read_with_idx(field, VectorEntry::ExactRows.index())
+                .expect("validated ExactRows entry");
+            Some(BlockMetadata::open(entry, &options, false)?)
+        } else {
+            None
+        };
         Ok(Self {
             options,
             source: Some(VectorSource {
@@ -256,6 +437,7 @@ impl VectorFieldReader {
                 field,
                 max_doc: segment_reader.max_doc(),
                 centroid_slots,
+                exact,
             }),
             search: OnceLock::new(),
         })
@@ -284,10 +466,12 @@ impl VectorIndexReader {
             return Ok(Self::empty(options));
         };
         let centroid_slots = source.centroid_slots.clone();
-        let id_map = DeferredIdMap {
-            source: Some((source.composite.clone(), source.field, source.max_doc)),
-            value: OnceLock::new(),
-        };
+        let id_map = DeferredIdMap::deferred(
+            source.composite.clone(),
+            source.field,
+            source.max_doc,
+            VectorEntry::IdMap,
+        );
         let rows_slice = Arc::new(Blocks::from_metadata(source.metadata.clone())?);
         let index = if let Some(slots) = centroid_slots {
             Some(ClusterIndex::open(
@@ -307,6 +491,28 @@ impl VectorIndexReader {
             Some(index) => index.num_docs(),
             None => rows_slice.num_rows(),
         };
+        // The document-ordered rows hold every document once: as many as the routing index counts
+        // and as the presence map ranks.
+        let exact = match &source.exact {
+            Some(metadata) => {
+                let blocks = Arc::new(Blocks::from_metadata(metadata.clone())?);
+                let id_map = DeferredIdMap::deferred(
+                    source.composite.clone(),
+                    source.field,
+                    source.max_doc,
+                    VectorEntry::ExactIdMap,
+                );
+                if blocks.num_rows() != id_map.get(false)?.num_rows() as usize
+                    || blocks.num_rows() != num_vectors
+                {
+                    return Err(
+                        DataCorruption::comment_only("exact vector row count mismatch").into(),
+                    );
+                }
+                Some(ExactRows { blocks, id_map })
+            }
+            None => None,
+        };
         Ok(Self {
             max_doc: source.max_doc,
             options,
@@ -315,6 +521,7 @@ impl VectorIndexReader {
             rows_slice,
             id_map,
             index,
+            exact,
             quantization: OnceLock::new(),
         })
     }
@@ -340,6 +547,7 @@ impl VectorIndexReader {
             rows_slice,
             id_map: DeferredIdMap::ready(IdMap::Identity { num_docs: 0 }),
             index: None,
+            exact: None,
             quantization: OnceLock::new(),
         }
     }
@@ -383,6 +591,38 @@ impl VectorIndexReader {
     /// scans the rows exactly.
     pub(crate) fn index(&self) -> Option<&ClusterIndex> {
         self.index.as_ref()
+    }
+
+    /// Whether the full-precision rows live in their own document-ordered entry: quantized
+    /// clustered storage.
+    pub(crate) fn has_exact_rows(&self) -> bool {
+        self.exact.is_some()
+    }
+
+    /// The document-ordered full-precision rows: a flat field's blocks, or a quantized clustered
+    /// field's `ExactRows`. `None` for plain clustered storage, whose rows sit in the cluster
+    /// blocks.
+    pub(crate) fn flat_rows(&self) -> Option<FlatRows<'_>> {
+        match &self.exact {
+            Some(exact) => Some(FlatRows {
+                blocks: &exact.blocks,
+                id_map: &exact.id_map,
+            }),
+            None if !self.rows_slice.clustered() => Some(FlatRows {
+                blocks: &self.rows_slice,
+                id_map: &self.id_map,
+            }),
+            None => None,
+        }
+    }
+
+    /// The blocks holding the field's full-precision rows: `ExactRows` for quantized clustered
+    /// storage, the Data blocks otherwise.
+    fn full_precision_blocks(&self) -> &Blocks {
+        match &self.exact {
+            Some(exact) => &exact.blocks,
+            None => &self.rows_slice,
+        }
     }
 
     pub(crate) fn quantization(&self) -> crate::Result<Option<&QuantizedFieldReader>> {
@@ -471,7 +711,8 @@ impl VectorIndexReader {
         )
     }
 
-    /// Each cluster's posting-list size, in cluster order; `None` when the storage is not IVF.
+    /// Each cluster's row count, in cluster order; `None` when the storage is not IVF. Rows, not
+    /// documents: a document assigned to two clusters counts in both.
     pub fn cluster_sizes(&self) -> crate::Result<Option<Vec<u32>>> {
         self.index
             .as_ref()
@@ -484,7 +725,8 @@ impl VectorIndexReader {
             .transpose()
     }
 
-    /// Returns the number of live IVF posting rows.
+    /// Returns the number of live IVF posting rows: the work an exhaustive scan does, counting a
+    /// document once per cluster it is assigned to, not the number of live documents.
     pub fn live_posting_row_count(&self, alive: Option<&AliveBitSet>) -> crate::Result<usize> {
         let Some(index) = &self.index else {
             return Ok(0);
@@ -506,22 +748,44 @@ impl VectorIndexReader {
         Ok(self.row_location(doc_id)?.is_some())
     }
 
-    /// Reads a document's vector through its stored block-local location.
+    /// The location of `doc`'s full-precision row in the document-ordered blocks: a flat field's
+    /// row, or a quantized clustered field's row in `ExactRows`. `None` for plain clustered
+    /// storage, whose rows sit at the document's cluster location, and for documents without a
+    /// vector.
+    pub(crate) fn exact_location(&self, doc_id: DocId) -> crate::Result<Option<BlockAddress>> {
+        if doc_id >= self.max_doc {
+            return Ok(None);
+        }
+        match self.flat_rows() {
+            Some(flat) => flat.location(doc_id),
+            None => Ok(None),
+        }
+    }
+
+    /// Reads a document's vector: from the document-ordered rows where the field has them, else
+    /// through its stored cluster location.
     pub fn vector_bytes(&self, doc_id: DocId) -> crate::Result<Option<OwnedBytes>> {
-        self.row_location(doc_id)?
+        let location = if self.flat_rows().is_some() {
+            self.exact_location(doc_id)?
+        } else {
+            self.row_location(doc_id)?
+        };
+        location
             .map(|address| self.vector_bytes_for_row(address))
             .transpose()
     }
 
-    /// Reads one full-precision vector at a block-local row.
+    /// Reads one full-precision vector at a block-local row of the blocks that hold the rows:
+    /// `ExactRows` for quantized clustered storage, the Data blocks otherwise.
     pub fn vector_bytes_for_row(&self, address: BlockAddress) -> crate::Result<OwnedBytes> {
+        let blocks = self.full_precision_blocks();
         let (block, row) = (address.block as usize, address.row as usize);
-        if block >= self.num_blocks() {
+        if block >= blocks.num_blocks() {
             return Err(TantivyError::InvalidArgument(
                 "vector block is out of bounds".into(),
             ));
         }
-        let view = self.rows_slice.block(block)?;
+        let view = blocks.block(block)?;
         if row >= view.num_rows() {
             return Err(TantivyError::InvalidArgument(
                 "vector row is out of bounds".into(),
@@ -530,61 +794,91 @@ impl VectorIndexReader {
         view.read_column(0, row..row + 1)
     }
 
-    /// Fetches increasing local rows from one known block using storage-aware range reads.
+    /// The full-precision row at `(cluster, row)` of a clustered field, whose document is `doc`:
+    /// from the cluster block for plain storage, from `ExactRows` for quantized storage.
+    pub(crate) fn cluster_row_bytes(
+        &self,
+        cluster: usize,
+        row: usize,
+        doc: DocId,
+    ) -> crate::Result<OwnedBytes> {
+        if self.exact.is_none() {
+            return self.vector_bytes_for_row(BlockAddress::new(cluster as u32, row as u32));
+        }
+        self.vector_bytes(doc)?.ok_or_else(|| {
+            DataCorruption::comment_only(format!(
+                "cluster {cluster} row {row} names document {doc}, which has no full-precision row"
+            ))
+            .into()
+        })
+    }
+
+    /// Reads the rows of ascending `docs` from the document-ordered rows through storage-aware
+    /// range reads; the batch yields them in document order.
+    pub(crate) fn read_exact_docs<'s>(
+        &self,
+        docs: &[DocId],
+        scratch: &'s mut ReadScratch,
+    ) -> crate::Result<VectorRowBatch<'s>> {
+        let flat = self.flat_rows().ok_or_else(|| {
+            DataCorruption::comment_only("document-ordered rows need a flat entry")
+        })?;
+        flat.read_docs(docs, self.options.bytes_per_vector(), scratch)
+    }
+
+    /// An upper bound on the cost of reading `rows` document-ordered rows whose documents are not
+    /// in hand: each row spans at most one storage block more than its stride fills, or its bytes
+    /// without block geometry.
+    pub(crate) fn exact_rows_cost_bound(&self, rows: usize) -> ReadCost {
+        let stride = self.options.bytes_per_vector();
+        match self.full_precision_blocks().storage_block_len() {
+            Some(block_len) => ReadCost(rows * (stride.div_ceil(block_len) + 1)),
+            None => ReadCost(rows * stride),
+        }
+    }
+
+    /// The cost of [`Self::read_exact_docs`] for ascending `docs`: the distinct storage blocks of
+    /// `ExactRows` they touch, or their bytes without block geometry.
+    pub(crate) fn exact_docs_cost(
+        &self,
+        docs: &[DocId],
+        scratch: &mut ReadScratch,
+    ) -> crate::Result<ReadCost> {
+        let flat = self.flat_rows().ok_or_else(|| {
+            DataCorruption::comment_only("document-ordered rows need a flat entry")
+        })?;
+        flat.docs_cost(docs, self.options.bytes_per_vector(), scratch)
+    }
+
+    /// Fetches increasing local rows from one known block of the blocks that hold the
+    /// full-precision rows, using storage-aware range reads.
     pub(crate) fn read_vector_rows_planned<'s>(
         &self,
         block: usize,
         scratch: &'s mut ReadScratch,
     ) -> crate::Result<VectorRowBatch<'s>> {
-        self.read_vector_rows_in_cluster(block, scratch)
+        read_rows_planned_in(
+            self.full_precision_blocks(),
+            block,
+            self.options.bytes_per_vector(),
+            scratch,
+        )
     }
+
+    /// Fetches increasing local rows of a plain cluster block; quantized clustered storage keeps
+    /// its rows in `ExactRows` and never calls this.
     pub(crate) fn read_vector_rows_in_cluster<'s>(
         &self,
         cluster: usize,
         scratch: &'s mut ReadScratch,
     ) -> crate::Result<VectorRowBatch<'s>> {
-        let ReadScratch {
-            rows,
-            runs: ranges,
-            blocks: block_scratch,
-            chunks,
-            ..
-        } = scratch;
-        if rows.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(TantivyError::InvalidArgument(
-                "planned vector rows must be strictly increasing".to_string(),
-            ));
-        }
-        let stride = self.options.bytes_per_vector();
-        ranges.clear();
-        chunks.clear();
-        block_scratch.clear();
-        if let Some(&last) = rows.last() {
-            let block = self.rows_slice.block(cluster)?;
-            block.check_rows(&(rows[0]..last + 1))?;
-            let column = block.column(0);
-            QuantizedLayerReader::plan_slot_reads(
-                &column,
-                stride,
-                0,
-                block.row_range(),
-                rows,
-                ranges,
-                block_scratch,
-            );
-            for range in ranges.iter().cloned() {
-                let bytes = column.read_vector_bytes_slice(
-                    range.start * stride..range.end * stride,
-                    VectorReadKind::FullPrecision,
-                )?;
-                chunks.push(VectorRowChunk { rows: range, bytes });
-            }
-        }
-        Ok(VectorRowBatch {
-            rows,
-            chunks,
-            stride,
-        })
+        debug_assert!(self.exact.is_none(), "cluster blocks hold no rows");
+        read_rows_planned_in(
+            &self.rows_slice,
+            cluster,
+            self.options.bytes_per_vector(),
+            scratch,
+        )
     }
 
     pub fn doc_id_at(&self, address: BlockAddress) -> crate::Result<DocId> {
@@ -617,7 +911,8 @@ impl VectorIndexReader {
         self.read_doc_ids(cluster, &mut docs)?;
         Ok(Some(docs))
     }
-    /// Resolves a document to a block and local row without global row numbering.
+    /// Resolves a document to a block and local row of the Data blocks without global row
+    /// numbering: its primary cluster row for clustered storage, its flat row otherwise.
     pub(crate) fn row_location(&self, doc_id: DocId) -> crate::Result<Option<BlockAddress>> {
         if doc_id >= self.max_doc {
             return Ok(None);
@@ -633,14 +928,11 @@ impl VectorIndexReader {
             }
             Ok(location)
         } else {
-            let crate::vector::storage::metadata::Partition::Uniform { rows_per_block } =
-                self.rows_slice.metadata.field().partition
-            else {
-                unreachable!()
-            };
-            Ok(map
-                .rank_if_exists(doc_id)
-                .map(|row| BlockAddress::new(row / rows_per_block, row % rows_per_block)))
+            FlatRows {
+                blocks: &self.rows_slice,
+                id_map: &self.id_map,
+            }
+            .location(doc_id)
         }
     }
 
@@ -669,12 +961,11 @@ impl VectorIndexReader {
         out.clear();
         let blocks = &self.rows_slice;
         if !blocks.clustered() {
-            let crate::vector::storage::metadata::Partition::Uniform { rows_per_block } =
-                blocks.metadata.field().partition
-            else {
-                unreachable!()
+            let flat = FlatRows {
+                blocks,
+                id_map: &self.id_map,
             };
-            let first = cluster * rows_per_block as usize;
+            let first = cluster * flat.rows_per_block() as usize;
             let map = self.id_map.get(false)?;
             out.extend((first..first + block.num_rows()).map(|row| map.doc_at(row as u32)));
             return Ok(());
@@ -706,13 +997,15 @@ impl VectorIndexReader {
         Ok(())
     }
 
-    /// The cost of reading `cluster`'s full-precision rows at `offsets` exactly; `None` reads
-    /// every row as one span.
+    /// The cost of reading a plain cluster's full-precision rows at `offsets` exactly; `None`
+    /// reads every row as one span. Quantized clustered storage prices [`Self::exact_docs_cost`]
+    /// instead.
     pub(crate) fn exact_cost(
         &self,
         cluster: usize,
         offsets: Option<&[u32]>,
     ) -> crate::Result<ReadCost> {
+        debug_assert!(self.exact.is_none(), "cluster blocks hold no rows");
         let block = self.rows_slice.block(cluster)?;
         Ok(exact_read_cost(
             &block.column(0),
@@ -765,11 +1058,64 @@ impl VectorIndexReader {
         Ok(())
     }
 
-    /// Reads a cluster's full-precision rows without document ids or quantized columns.
+    /// Reads a plain cluster's full-precision rows without document ids; quantized clustered
+    /// storage keeps its rows in `ExactRows` and never calls this.
     pub(crate) fn read_cluster_rows(&self, cluster: usize) -> crate::Result<OwnedBytes> {
+        debug_assert!(self.exact.is_none(), "cluster blocks hold no rows");
         let block = self.rows_slice.block(cluster)?;
         block.read_column(0, block.row_range())
     }
+}
+
+/// Fetches increasing local `scratch.rows` of `block` in `blocks` through storage-aware range
+/// reads of its Rows column, the first column of every block that holds rows.
+fn read_rows_planned_in<'s>(
+    blocks: &Blocks,
+    block: usize,
+    stride: usize,
+    scratch: &'s mut ReadScratch,
+) -> crate::Result<VectorRowBatch<'s>> {
+    let ReadScratch {
+        rows,
+        runs: ranges,
+        blocks: block_scratch,
+        chunks,
+        ..
+    } = scratch;
+    if rows.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(TantivyError::InvalidArgument(
+            "planned vector rows must be strictly increasing".to_string(),
+        ));
+    }
+    ranges.clear();
+    chunks.clear();
+    block_scratch.clear();
+    if let Some(&last) = rows.last() {
+        let view = blocks.block(block)?;
+        view.check_rows(&(rows[0]..last + 1))?;
+        let column = view.column(0);
+        QuantizedLayerReader::plan_slot_reads(
+            &column,
+            stride,
+            0,
+            view.row_range(),
+            rows,
+            ranges,
+            block_scratch,
+        );
+        for range in ranges.iter().cloned() {
+            let bytes = column.read_vector_bytes_slice(
+                range.start * stride..range.end * stride,
+                VectorReadKind::FullPrecision,
+            )?;
+            chunks.push(VectorRowChunk { rows: range, bytes });
+        }
+    }
+    Ok(VectorRowBatch {
+        rows,
+        chunks,
+        stride,
+    })
 }
 
 #[cfg(test)]
@@ -811,14 +1157,12 @@ mod tests {
         locations[1] = BlockAddress::new(0, 0);
         locations[2] = BlockAddress::new(0, 1);
         IdMap::serialize_locations(&locations, &mut bytes)?;
-        let map = DeferredIdMap {
-            source: Some((
-                tracked_id_composite(bytes, &reads),
-                Field::from_field_id(0),
-                3,
-            )),
-            value: OnceLock::new(),
-        };
+        let map = DeferredIdMap::deferred(
+            tracked_id_composite(bytes, &reads),
+            Field::from_field_id(0),
+            3,
+            VectorEntry::IdMap,
+        );
         assert!(reads.lock().unwrap().is_empty());
         let opened = map.get(true)?;
         assert_eq!(&*reads.lock().unwrap(), &[0..1]);
@@ -866,6 +1210,7 @@ mod tests {
             id_map: DeferredIdMap::ready(IdMap::open(FileSlice::from(ids), max_doc)?),
             rows_slice: Arc::new(blocks),
             index: None,
+            exact: None,
             quantization: OnceLock::new(),
         };
         reads.lock().unwrap().clear();
@@ -986,6 +1331,7 @@ mod tests {
                 rows_slice: blocks,
                 id_map: DeferredIdMap::ready(IdMap::Identity { num_docs: 3 }),
                 index: None,
+                exact: None,
                 quantization: OnceLock::new(),
             };
             let mut decoded = Vec::new();
@@ -1042,6 +1388,7 @@ mod tests {
                 field: Field::from_field_id(0),
                 max_doc: 3,
                 centroid_slots: None,
+                exact: None,
             }),
             search: OnceLock::new(),
         });
@@ -1106,6 +1453,7 @@ mod tests {
                 field: Field::from_field_id(0),
                 max_doc: 1,
                 centroid_slots: None,
+                exact: None,
             }),
             options,
             search: OnceLock::new(),
@@ -1160,6 +1508,7 @@ mod tests {
             }),
             rows_slice: blocks,
             index: None,
+            exact: None,
             quantization: OnceLock::new(),
         };
         let selected = [1, 2, 10, 11];
@@ -1200,11 +1549,20 @@ mod tests {
         Ok(())
     }
 
-    // Missing entries and unknown entry indices are corruption regardless of field order.
+    // Missing entries and unknown entry indices are corruption regardless of field order: a flat
+    // or plain field declares exactly entries 0 and 1, a quantized clustered field exactly 0 to 3.
     #[test]
-    fn vector_entries_require_exact_pair() -> crate::Result<()> {
+    fn vector_entries_require_exact_set() -> crate::Result<()> {
         let field = Field::from_field_id(0);
-        for entries in [vec![0], vec![1], vec![0, 1, 2], vec![1, 0]] {
+        for (entries, plain_ok, exact_ok) in [
+            (vec![0], false, false),
+            (vec![1], false, false),
+            (vec![0, 1, 2], false, false),
+            (vec![0, 1, 3], false, false),
+            (vec![1, 0], true, false),
+            (vec![1, 3, 0, 2], false, true),
+            (vec![0, 1, 2, 3, 4], false, false),
+        ] {
             let mut bytes = Vec::new();
             let mut writer = CompositeWrite::wrap(&mut bytes);
             for &idx in &entries {
@@ -1213,8 +1571,14 @@ mod tests {
             writer.close()?;
             let composite = CompositeFile::open(&FileSlice::from(bytes))?;
             assert_eq!(
-                validate_vector_entries(&composite, field).is_ok(),
-                entries == [1, 0]
+                validate_vector_entries(&composite, field, false).is_ok(),
+                plain_ok,
+                "{entries:?}"
+            );
+            assert_eq!(
+                validate_vector_entries(&composite, field, true).is_ok(),
+                exact_ok,
+                "{entries:?}"
             );
         }
         Ok(())
