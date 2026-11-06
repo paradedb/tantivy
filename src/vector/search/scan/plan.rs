@@ -131,9 +131,16 @@ pub(crate) fn price(
         (Some(reader), None) => reader.centroid_cost(selected.cluster)?,
         _ => ReadCost(0),
     };
-    let exact = exact
-        .map(|reader| reader.exact_cost(selected.cluster, selected.offsets))
-        .transpose()?;
+    // Quantized storage reads exact rows by document, so their price is the document-ordered rows
+    // those documents touch, bounded from above when the documents are not in hand.
+    let exact = match exact {
+        None => None,
+        Some(reader) if reader.has_exact_rows() => Some(match selected.docs {
+            Some(docs) => reader.exact_docs_cost(docs, scratch)?,
+            None => reader.exact_rows_cost_bound(selected.len()),
+        }),
+        Some(reader) => Some(reader.exact_cost(selected.cluster, selected.offsets)?),
+    };
     let band = spec.reader.band_cost(selected.cluster)?;
     let sparse = selected
         .offsets

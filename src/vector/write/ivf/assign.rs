@@ -15,7 +15,7 @@ use crate::{DocId, TantivyError};
 pub(super) fn assign(
     merge: &FieldMerge,
     clusterer: &dyn IvfClusterer,
-    source_rows: Vec<Option<RowAddress>>,
+    source_rows: &[Option<RowAddress>],
     centroids: &IvfCentroids,
     vector_count: usize,
     timings: &mut IvfBuildTimings,
@@ -26,7 +26,7 @@ pub(super) fn assign(
     // Assignment is per vector, so the source follows storage order;
     // `assigned_vectors` is re-sorted by (cluster, target doc) afterwards.
     let assign_sources: Vec<(RowAddress, DocId)> = source_rows
-        .into_iter()
+        .iter()
         .enumerate()
         .filter_map(|(doc_id, row)| row.map(|row| (row, doc_id as DocId)))
         .sorted()
