@@ -159,6 +159,12 @@ impl SuperKMeansClusterer {
         self
     }
 
+    /// The cap on training vectors per leaf.
+    #[cfg(any(test, feature = "unstable"))]
+    pub(crate) fn max_leaf_size(&self) -> usize {
+        self.config.max_leaf_size
+    }
+
     /// Vectors the memory limit holds at once.
     fn budget_rows(&self, vector_options: &VectorOptions) -> usize {
         let budget_rows = match self.memory_limit {

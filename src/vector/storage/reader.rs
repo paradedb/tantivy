@@ -226,6 +226,9 @@ pub struct VectorIndexReader {
     /// Deferred row-group columns and their validated geometry.
     rows_slice: Arc<Blocks>,
     pub(crate) index: Option<ClusterIndex>,
+    /// The persisted router slot, its kind byte included.
+    #[cfg(any(test, feature = "unstable"))]
+    router_slot: Option<FileSlice>,
     /// The document-ordered full-precision rows of a quantized clustered field.
     exact: Option<ExactRows>,
     quantization: OnceLock<crate::Result<Option<QuantizedFieldReader>>>,
@@ -466,6 +469,8 @@ impl VectorIndexReader {
             return Ok(Self::empty(options));
         };
         let centroid_slots = source.centroid_slots.clone();
+        #[cfg(any(test, feature = "unstable"))]
+        let router_slot = centroid_slots.as_ref().map(|slots| slots.router.clone());
         let id_map = DeferredIdMap::deferred(
             source.composite.clone(),
             source.field,
@@ -521,6 +526,8 @@ impl VectorIndexReader {
             rows_slice,
             id_map,
             index,
+            #[cfg(any(test, feature = "unstable"))]
+            router_slot,
             exact,
             quantization: OnceLock::new(),
         })
@@ -547,6 +554,8 @@ impl VectorIndexReader {
             rows_slice,
             id_map: DeferredIdMap::ready(IdMap::Identity { num_docs: 0 }),
             index: None,
+            #[cfg(any(test, feature = "unstable"))]
+            router_slot: None,
             exact: None,
             quantization: OnceLock::new(),
         }
@@ -733,6 +742,33 @@ impl VectorIndexReader {
                     .collect()
             })
             .transpose()
+    }
+
+    /// Router audit inputs for an IVF field; `None` for flat storage.
+    #[cfg(any(test, feature = "unstable"))]
+    #[doc(hidden)]
+    pub fn router_audit_export(
+        &self,
+    ) -> crate::Result<Option<crate::vector::router_audit::RouterAuditExport>> {
+        let (Some(index), Some(router_slot)) = (&self.index, &self.router_slot) else {
+            return Ok(None);
+        };
+        let docs: Vec<DocId> = (0..self.max_doc).collect();
+        let mut located = Vec::new();
+        self.id_map
+            .get(self.rows_slice.clustered())?
+            .locate_many(&docs, &mut located)?;
+        Ok(Some(crate::vector::router_audit::RouterAuditExport {
+            dim: self.options.dim(),
+            metric: self.options.metric(),
+            centroid_rows: index.centroid_bytes()?,
+            router_slot: router_slot.read_bytes()?,
+            cluster_sizes: self.cluster_sizes()?.unwrap_or_default(),
+            doc_clusters: located
+                .into_iter()
+                .map(|(doc, address)| (doc, address.block))
+                .collect(),
+        }))
     }
 
     /// Returns the number of live IVF posting rows: the work an exhaustive scan does, counting a
@@ -1220,6 +1256,8 @@ mod tests {
             id_map: DeferredIdMap::ready(IdMap::open(FileSlice::from(ids), max_doc)?),
             rows_slice: Arc::new(blocks),
             index: None,
+            #[cfg(any(test, feature = "unstable"))]
+            router_slot: None,
             exact: None,
             quantization: OnceLock::new(),
         };
@@ -1341,6 +1379,8 @@ mod tests {
                 rows_slice: blocks,
                 id_map: DeferredIdMap::ready(IdMap::Identity { num_docs: 3 }),
                 index: None,
+                #[cfg(any(test, feature = "unstable"))]
+                router_slot: None,
                 exact: None,
                 quantization: OnceLock::new(),
             };
@@ -1518,6 +1558,8 @@ mod tests {
             }),
             rows_slice: blocks,
             index: None,
+            #[cfg(any(test, feature = "unstable"))]
+            router_slot: None,
             exact: None,
             quantization: OnceLock::new(),
         };

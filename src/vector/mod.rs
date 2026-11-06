@@ -79,6 +79,9 @@ pub use collector::{
 pub use element::{Accumulator, VectorElement, ENTRY_ALIGN};
 pub use params::{LocatedPath, ProbeParams, Selectivity, DEFAULT_FIXED_PROBE_COST_ROWS};
 pub use quantization::{VectorQuantizationConfig, VectorQuantizationLayer};
+#[cfg(any(test, feature = "unstable"))]
+#[doc(hidden)]
+pub use router::audit as router_audit;
 pub use router::{RouterKind, RouterMetrics};
 pub use search::source::controller::ProbeTermination;
 pub use stats::ProbeStats;

@@ -43,6 +43,8 @@ mod source;
 #[cfg(test)]
 mod tests;
 mod train;
+#[cfg(any(test, feature = "unstable"))]
+pub(crate) use train::training_sample;
 mod write;
 
 struct AssignedVector {

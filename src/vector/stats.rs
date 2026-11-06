@@ -163,6 +163,16 @@ where S: serde::Serializer {
     serialize_io(io, "exact", serializer)
 }
 
+fn serialize_routing_io<S>(io: &VectorIoStats, serializer: S) -> Result<S::Ok, S::Error>
+where S: serde::Serializer {
+    serialize_io(io, "routing", serializer)
+}
+
+fn serialize_routing_exact_io<S>(io: &VectorIoStats, serializer: S) -> Result<S::Ok, S::Error>
+where S: serde::Serializer {
+    serialize_io(io, "routing_exact", serializer)
+}
+
 fn serialize_locate_io<S>(io: &VectorIoStats, serializer: S) -> Result<S::Ok, S::Error>
 where S: serde::Serializer {
     serialize_io(io, "locate", serializer)
@@ -294,8 +304,16 @@ pub struct ProbeStats {
     pub non_vector_search_ns: u64,
     /// Nanoseconds preparing the query.
     pub query_prep_ns: u64,
-    /// Nanoseconds ranking clusters and gating rows.
+    /// Nanoseconds ranking clusters and gating rows, the router's exact rerank aside.
     pub routing_ns: u64,
+    /// Reads while ranking clusters, the router's exact rerank aside.
+    #[serde(flatten, serialize_with = "serialize_routing_io")]
+    pub routing_io: VectorIoStats,
+    /// Nanoseconds in the router's exact rerank.
+    pub routing_exact_ns: u64,
+    /// Reads of the centroid rows the router's exact rerank scores.
+    #[serde(flatten, serialize_with = "serialize_routing_exact_io")]
+    pub routing_exact_io: VectorIoStats,
     /// Nanoseconds in full-precision admission or the flat scan, outside exact reads and scoring.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exact_scan_ns: Option<u64>,
@@ -479,6 +497,8 @@ impl ProbeStats {
             bytes_read: fetch.bytes_read + score.bytes_read,
             storage_blocks: fetch.storage_blocks + score.storage_blocks,
         };
+        self.routing_io = totals.io(VectorStage::Routing);
+        self.routing_exact_io = totals.io(VectorStage::RoutingExact);
         self.locate_io = totals.io(VectorStage::Locate);
         self.centroid_io = totals.io(VectorStage::Centroid);
     }
@@ -489,6 +509,7 @@ impl ProbeStats {
         self.non_vector_search_ns = totals.time_ns(VectorStage::NonVectorSearch);
         self.query_prep_ns = totals.time_ns(VectorStage::QueryPrep);
         self.routing_ns = totals.time_ns(VectorStage::Routing);
+        self.routing_exact_ns = totals.time_ns(VectorStage::RoutingExact);
         self.locate_ns = totals.time_ns(VectorStage::Locate);
         self.centroid_ns = totals.time_ns(VectorStage::Centroid);
         self.exact_fetch_ns = totals.time_ns(VectorStage::ExactFetch);
@@ -588,6 +609,13 @@ mod tests {
         "non_vector_search_ns",
         "query_prep_ns",
         "routing_ns",
+        "routing_reads",
+        "routing_bytes_read",
+        "routing_storage_blocks",
+        "routing_exact_ns",
+        "routing_exact_reads",
+        "routing_exact_bytes_read",
+        "routing_exact_storage_blocks",
         "result_assembly_ns",
         "exact_fetch_ns",
         "exact_score_ns",

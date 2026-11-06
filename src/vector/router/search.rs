@@ -35,6 +35,8 @@ pub(crate) struct SearchPolicy {
     pub(crate) aps: bool,
     pub(crate) min_fraction: f32,
     pub(crate) rerank_factor: f32,
+    /// Members of beam per requested member when a request becomes a list count.
+    pub(crate) list_overscan: usize,
 }
 
 /// A caller explicitly chooses whether selection must produce exact scores.
@@ -237,6 +239,12 @@ impl<I: Copy + Ord> TopCandidates<I> {
             .map(|worst| worst.0.sim)
     }
 
+    /// The retained identities, in no order.
+    #[cfg(any(test, feature = "unstable"))]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Candidate<I>> {
+        self.heap.iter().map(|Reverse(candidate)| candidate)
+    }
+
     pub(crate) fn into_sorted(self) -> Vec<Candidate<I>> {
         self.heap
             .into_sorted_vec()
@@ -256,8 +264,14 @@ impl<I: Copy + Ord> TopCandidates<I> {
     }
 }
 
-pub(crate) fn lists_to_open(lists: usize, members: usize, k: usize, min_fraction: f32) -> usize {
-    use super::stacked::levels::{LIST_OVERSCAN, PARENT_NPROBE_FRACTION};
+pub(crate) fn lists_to_open(
+    lists: usize,
+    members: usize,
+    k: usize,
+    min_fraction: f32,
+    overscan: usize,
+) -> usize {
+    use super::stacked::levels::PARENT_NPROBE_FRACTION;
 
     if lists == 0 {
         return 0;
@@ -268,9 +282,33 @@ pub(crate) fn lists_to_open(lists: usize, members: usize, k: usize, min_fraction
         PARENT_NPROBE_FRACTION
     };
     let floor = ((lists as f32 * min_fraction).ceil() as usize).max(1);
-    let beam = k.saturating_mul(LIST_OVERSCAN).max(1);
+    let beam = k.saturating_mul(overscan).max(1);
     let requested = ((beam as f64 * lists as f64) / members.max(1) as f64).ceil() as usize;
     requested.max(floor).min(lists).max(1)
+}
+
+/// The member count and policy `params` asks of a router of `count` members.
+pub(crate) fn request(
+    compressed: bool,
+    count: usize,
+    params: super::RoutingParams,
+) -> (usize, SearchPolicy) {
+    let k = if compressed {
+        params.k.min(count)
+    } else {
+        params.k.clamp(1, count.max(1))
+    };
+    let policy = SearchPolicy {
+        aps: params.aps,
+        rerank_factor: params.rerank_factor,
+        min_fraction: if compressed {
+            params.min_beam_fraction
+        } else {
+            super::stacked::levels::PARENT_NPROBE_FRACTION
+        },
+        list_overscan: super::stacked::levels::LIST_OVERSCAN,
+    };
+    (k, policy)
 }
 
 /// Compose a hierarchical routing request, with exact fallback for exceptional queries.
@@ -281,23 +319,10 @@ pub(crate) fn rank<S: VectorSource, T: VectorElement>(
 ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
     let compressed = level.vectors.compressed().is_some();
     let count = level.vectors.num_vectors(query.widened().len());
-    let k = if compressed {
-        params.k.min(count)
-    } else {
-        params.k.clamp(1, count.max(1))
-    };
+    let (k, policy) = request(compressed, count, params);
     if k == 0 {
         return (Vec::new(), StackedSearchStats::default());
     }
-    let policy = SearchPolicy {
-        aps: params.aps,
-        rerank_factor: params.rerank_factor,
-        min_fraction: if compressed {
-            params.min_beam_fraction
-        } else {
-            super::stacked::levels::PARENT_NPROBE_FRACTION
-        },
-    };
     search(level, query, k, policy, OutputPrecision::Exact)
 }
 
@@ -342,7 +367,7 @@ mod tests {
     use super::*;
     use crate::schema::Metric;
     use crate::vector::router::source::{EncodingContext, VectorSet, ROUTER_SEED};
-    use crate::vector::router::stacked::levels::InMemoryStore;
+    use crate::vector::router::stacked::levels::{InMemoryStore, LIST_OVERSCAN};
     use crate::vector::storage::quantized::sign::SignVectors;
 
     fn lists(best: Option<usize>) -> StackedIvf<InMemoryStore> {
@@ -367,8 +392,9 @@ mod tests {
             aps: false,
             min_fraction: 0.25,
             rerank_factor: 1.0,
+            list_overscan: LIST_OVERSCAN,
         };
-        let open = lists_to_open(40, 40, 1, policy.min_fraction);
+        let open = lists_to_open(40, 40, 1, policy.min_fraction, policy.list_overscan);
         let (lists, _) = rank_vectors(
             &level.centroids,
             &query,
@@ -398,6 +424,7 @@ mod tests {
             aps: false,
             min_fraction: 0.25,
             rerank_factor: 1.0,
+            list_overscan: LIST_OVERSCAN,
         };
         let (narrow, _) = search(&level, &query, 1, policy, OutputPrecision::Exact);
         let (wide, _) = search(
@@ -461,6 +488,7 @@ mod tests {
             aps: false,
             min_fraction: 1.0,
             rerank_factor: 4.0,
+            list_overscan: LIST_OVERSCAN,
         };
         let (actual, stats) = search(&level, &query, 2, policy, OutputPrecision::Exact);
         #[cfg(debug_assertions)]

@@ -26,6 +26,12 @@ pub(crate) enum StackedRouting<'a, S> {
 pub(crate) trait RoutingOutput {
     fn record(&mut self, candidate: Candidate<(usize, u32)>);
     fn finish(self, best: TopCandidates<(usize, u32)>) -> Vec<Candidate<(usize, u32)>>;
+
+    /// The walk opened `list` of `level`. Observers only; routing ignores it.
+    fn opened(&mut self, _level: usize, _list: u32) {}
+
+    /// `best` is what `level` retained, before any exact rerank. Observers only.
+    fn retained(&mut self, _level: usize, _best: &TopCandidates<(usize, u32)>) {}
 }
 
 pub(crate) struct TopK;
@@ -223,7 +229,10 @@ impl<'a, S: VectorSource> StackedRouting<'a, S> {
                         node: ClusterId(c.node.1),
                     })
                     .collect();
-                let exact = self.measure(segment, || rerank_exact(raw, query, &rows, rows.len()));
+                let exact = self.measure(segment, || {
+                    let _stage = enter_vector_stage(VectorStage::RoutingExact);
+                    rerank_exact(raw, query, &rows, rows.len())
+                });
                 stats[segment].members_scored += rows.len();
                 if leaf {
                     stats[segment].leaf_exact_scored += rows.len();
@@ -329,7 +338,13 @@ impl<'a, S: VectorSource> StackedRouting<'a, S> {
                 .iter()
                 .map(|layer| layer.sizes())
                 .fold((0, 0), |(a, b), (c, d)| (a + c, b + d));
-            requested = lists_to_open(lists, members, requested, policy.min_fraction);
+            requested = lists_to_open(
+                lists,
+                members,
+                requested,
+                policy.min_fraction,
+                policy.list_overscan,
+            );
             open.push(requested);
         }
         let mut pending = vec![Vec::new(); partition_level.unwrap_or(0)];
@@ -431,6 +446,7 @@ impl<'a, S: VectorSource> StackedRouting<'a, S> {
                 let approximate =
                     self.measure(segment, || layer.score_members(list, query, &mut buffer));
                 let scanned = buffer.candidates.len();
+                output.opened(level, list);
                 stats[segment].lists_scanned += 1;
                 stats[segment].members_scored += scanned;
                 if approximate {
@@ -458,6 +474,7 @@ impl<'a, S: VectorSource> StackedRouting<'a, S> {
                     break;
                 }
             }
+            output.retained(level, &best);
             if refine {
                 best = self.refine(query, best, requested, &sources, &mut stats, level == 0);
             }

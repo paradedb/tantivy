@@ -4,6 +4,7 @@ use std::ops::Range;
 
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
+use crate::vector::storage::io::{VectorRead, VectorReadKind};
 use crate::vector::VectorElement;
 
 /// A flat, `dim`-strided arena of vectors addressed by dense row index.
@@ -141,7 +142,7 @@ impl<T: VectorElement> VectorArena for FileSliceArena<T> {
         let bytes = self
             .slice
             .slice(rows.start * stride..rows.end * stride)
-            .read_bytes()
+            .read_vector_bytes(VectorReadKind::Other)
             .expect("failed to read vector arena rows");
         out.extend(
             bytes

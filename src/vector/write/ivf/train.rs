@@ -11,6 +11,15 @@ use crate::vector::router::{BuiltRouter, RouterKind};
 use crate::vector::write::RowAddress;
 use crate::{DocId, TantivyError};
 
+/// The sample a training pass takes of `vector_count` vectors: its size, and the stride between
+/// its rows in target-doc order.
+pub(crate) fn training_sample(vector_count: usize, ratio: f32) -> (usize, usize) {
+    let ratio = f64::from(ratio).clamp(f64::MIN_POSITIVE, 1.0);
+    let target = ((vector_count as f64) * ratio).ceil() as usize;
+    let size = target.clamp(1, vector_count);
+    (size, (vector_count / size).max(1))
+}
+
 /// A field's trained centroids.
 pub(super) struct Trained {
     pub(super) centroids: IvfCentroids,
@@ -29,12 +38,8 @@ pub(super) fn train(
     timings: &mut IvfBuildTimings,
 ) -> crate::Result<Option<Trained>> {
     let opts = merge.opts;
-    let training_sample_size = {
-        let ratio = f64::from(clusterer.training_sample_ratio()).clamp(f64::MIN_POSITIVE, 1.0);
-        let target = ((vector_count as f64) * ratio).ceil() as usize;
-        target.clamp(1, vector_count)
-    };
-    let training_sample_interval = (vector_count / training_sample_size).max(1);
+    let (training_sample_size, training_sample_interval) =
+        training_sample(vector_count, clusterer.training_sample_ratio());
 
     // The sample is picked in target-doc order, then scanned in source storage order so every
     // training pass reads sequentially.

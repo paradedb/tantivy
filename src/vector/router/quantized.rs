@@ -140,7 +140,7 @@ mod tests {
         self, rerank_exact, OutputPrecision, ScoreBuffer, SearchPolicy, TopCandidates,
     };
     use crate::vector::router::source::ROUTER_SEED;
-    use crate::vector::router::stacked::levels::ClusterId;
+    use crate::vector::router::stacked::levels::{ClusterId, LIST_OVERSCAN};
     use crate::vector::router::{RouterMetrics, RoutingParams};
     use crate::vector::search::prepared::VectorQuery;
 
@@ -300,6 +300,7 @@ mod tests {
                 aps: false,
                 min_fraction: params.min_beam_fraction,
                 rerank_factor: params.rerank_factor,
+                list_overscan: LIST_OVERSCAN,
             },
             OutputPrecision::Exact,
         );
@@ -738,7 +739,7 @@ mod tests {
             .map(|_| VectorQuery::new(Metric::L2, Arc::new((0..dim).map(|_| random()).collect())))
             .collect();
         let options = VectorOptions::new(dim, Metric::L2);
-        let index = super::super::stacked::build(&options, &mut rows)?;
+        let (index, _) = super::super::stacked::build(&options, &mut rows)?;
         let truth: Vec<_> = queries
             .iter()
             .map(|q| {
@@ -768,6 +769,7 @@ mod tests {
                         aps,
                         min_fraction: 0.25,
                         rerank_factor: 1.0,
+                        list_overscan: LIST_OVERSCAN,
                     },
                     OutputPrecision::Exact,
                 );
@@ -830,7 +832,7 @@ mod tests {
         let (dim, count, repeats) = (1024, 4096, 128);
         let options = VectorOptions::new(dim, Metric::Cosine);
         let mut centroids = vectors(dim, count);
-        let index = super::super::stacked::build(&options, &mut centroids)?;
+        let (index, _) = super::super::stacked::build(&options, &mut centroids)?;
         let raw = FileSlice::from(
             index
                 .vectors

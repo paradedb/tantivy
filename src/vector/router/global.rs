@@ -73,6 +73,7 @@ impl GlobalRanking {
                     super::stacked::levels::PARENT_NPROBE_FRACTION
                 },
                 rerank_factor: params.rerank_factor,
+                list_overscan: super::stacked::levels::LIST_OVERSCAN,
             },
             OutputPrecision::Exact,
             AllScored::default(),
@@ -282,6 +283,7 @@ mod tests {
                             aps: true,
                             min_fraction: 0.25,
                             rerank_factor: 1.0,
+                            list_overscan: crate::vector::router::stacked::levels::LIST_OVERSCAN,
                         },
                         OutputPrecision::Exact,
                     );
@@ -300,6 +302,7 @@ mod tests {
                             aps: true,
                             min_fraction: 0.25,
                             rerank_factor: 1.0,
+                            list_overscan: crate::vector::router::stacked::levels::LIST_OVERSCAN,
                         },
                         OutputPrecision::Exact,
                         TopK,
@@ -329,6 +332,7 @@ mod tests {
                             aps: true,
                             min_fraction: 0.25,
                             rerank_factor: 1.0,
+                            list_overscan: crate::vector::router::stacked::levels::LIST_OVERSCAN,
                         },
                         OutputPrecision::Exact,
                         AllScored::default(),
