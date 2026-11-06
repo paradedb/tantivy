@@ -9,7 +9,7 @@
 //! the rules through a [`SynonymSource`], which gives the rules of a matched document from where
 //! the caller keeps their text, so it can also cache them. [`SynonymExpander`] expands with no
 //! cache and reads the text from the field's column, so it needs the field fast with the `raw`
-//! tokenizer.
+//! tokenizer. [`expansion_query`] turns each [`Expansion`] into the query that matches it.
 //!
 //! ```
 //! use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions};
@@ -52,6 +52,7 @@
 //! ```
 
 mod expand;
+mod query;
 mod rule;
 #[cfg(test)]
 mod tests;
@@ -61,5 +62,6 @@ pub use self::expand::{
     expand, Expansion, KeyDocs, SegmentSynonyms, SynonymExpander, SynonymSource,
     DEFAULT_MAX_RULES_PER_KEY,
 };
+pub use self::query::expansion_query;
 pub use self::rule::{CompiledRule, RuleError, SynonymRule, MAX_RULE_TERMS};
 pub use self::tokenizer::SynonymRuleTokenizer;
