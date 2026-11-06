@@ -732,16 +732,18 @@ where
                     _ => (matched, docs),
                 }
             });
-    let k = collector.probe_params.router_k(
-        total,
-        x,
-        matched / routed_docs.max(1) as f64,
-        clusters,
-        collector.max_scan_levels > 0 && vectors.iter().any(|v| v.has_quantized_storage()),
-    );
+    let router_k = |budget| {
+        collector.probe_params.router_k(
+            budget,
+            x,
+            matched / routed_docs.max(1) as f64,
+            clusters,
+            collector.max_scan_levels > 0 && vectors.iter().any(|v| v.has_quantized_storage()),
+        )
+    };
     let partitions: Vec<_> = segments.iter().map(|s| s.partition_centroid).collect();
     let routing = crate::vector::router::RoutingParams {
-        k,
+        k: router_k(total),
         rerank_factor: collector.probe_params.router_rerank_factor,
         min_beam_fraction: collector.probe_params.router_min_beam_fraction,
         aps: collector.probe_params.router_aps,
@@ -753,7 +755,10 @@ where
         routing,
         totals,
         on_segment,
-        collector.probe_params.adaptive_probing.map(|_| k),
+        collector
+            .probe_params
+            .adaptive_probing
+            .map(|_| router_k(clusters as f64)),
     );
     let mut reserved = WorkUnits::ZERO;
     let mut scans: Vec<_> = (0..vectors.len()).map(|_| None).collect();
@@ -1521,6 +1526,54 @@ mod ivf_e2e_tests {
             collector.merge_fruits(collector.collect_segments(weight.as_ref(), &[], |_| {})?)?;
         assert!(empty.results.is_empty());
         assert!(empty.stats.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_global_ceiling_charges_work_not_cluster_count() -> Result<()> {
+        let centroids: Vec<_> = (0..16).map(|c| vec![c as f32 * 10.0, 0.0]).collect();
+        let vectors = (0..4)
+            .flat_map(|_| {
+                centroids
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(c, v)| std::iter::repeat_n(v.clone(), if c < 8 { 1 } else { 32 }))
+            })
+            .collect();
+        let fixture = FixtureSpec::ivf(Metric::L2, centroids, vectors)
+            .segments(2)
+            .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let readers: Vec<_> = searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
+            .collect();
+        let weight = fixture.all()?;
+        let mut results = Vec::new();
+        for adaptive in [false, true] {
+            let collector = TopDocs::with_limit(20)
+                .order_by_similarity(fixture.field, vec![0.0_f32, 0.0])
+                .with_probe_params(ProbeParams {
+                    adaptive_probing: adaptive
+                        .then_some(crate::vector::AdaptiveProbeParams { effort: 20.0 }),
+                    max_probe_fraction: 0.25,
+                    located: LocatedPath::Off,
+                    ..Default::default()
+                })
+                .build();
+            let result = collector.merge_fruits(collector.collect_segments(
+                weight.as_ref(),
+                &readers,
+                |_| {},
+            )?)?;
+            assert_eq!(result.stats.iter().map(|s| s.work_budget).sum::<f32>(), 8.0);
+            assert!(result.stats.iter().map(|s| s.work_charged).sum::<f32>() < 10.0);
+            results.push(result.results);
+        }
+        assert_eq!(results[0].len(), 20);
+        assert_eq!(results[0], results[1]);
         Ok(())
     }
 
