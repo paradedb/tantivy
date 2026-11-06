@@ -743,23 +743,23 @@ where
         .enumerate()
         .map(|(i, s)| (s.ordinal, i))
         .collect();
-    let assigned_docs: usize = if collector
+    let assigned_rows: usize = if collector
         .inputs
         .prepared
         .segments
         .iter()
         .all(|s| ordinals.contains_key(&s.ordinal))
     {
-        collector.inputs.prepared.docs
+        collector.inputs.prepared.rows
     } else {
         vectors
             .iter()
             .filter_map(|reader| reader.index())
-            .map(|index| index.num_docs())
+            .map(|index| index.num_rows())
             .sum()
     };
     global_budget.total = global_budget.total
-        * (assigned_docs as f64 / collector.inputs.prepared.budget.docs.max(1) as f64);
+        * (assigned_rows as f64 / collector.inputs.prepared.budget.rows.max(1) as f64);
     let mut topk = collector.collector_topk.lock().unwrap().clone();
     let mut plans = Vec::with_capacity(vectors.len());
     let mut finished = Vec::with_capacity(vectors.len());

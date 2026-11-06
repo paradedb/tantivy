@@ -181,7 +181,10 @@ pub(crate) struct RouterClusters<'a> {
     meter: WorkMeter,
     controller: ProbeController,
     gate: RowGate<'a>,
-    /// The current cluster's DocIds column; read only when the gate is closed.
+    /// Whether a document may sit in two clusters: the scan then needs every opened cluster's
+    /// doc ids to score each document once.
+    spilled: bool,
+    /// The current cluster's DocIds column; read when the gate is closed or the segment spills.
     docs: Vec<DocId>,
     offsets: Vec<u32>,
     selected_docs: Vec<DocId>,
@@ -205,6 +208,7 @@ impl<'a> RouterClusters<'a> {
             meter: WorkMeter::new(budget, shared_work),
             controller: ProbeController::new(index.num_clusters()),
             gate: RowGate::new(filter, segment.alive_bitset()),
+            spilled: reader.spilled(),
             docs: Vec::new(),
             offsets: Vec::new(),
             selected_docs: Vec::new(),
@@ -249,27 +253,36 @@ impl<'a> RouterClusters<'a> {
             self.skip_empty();
             return Ok(None);
         }
-        self.selected_docs.clear();
-        if !gated.all {
-            self.selected_docs.extend(
-                self.offsets
-                    .iter()
-                    .map(|&offset| self.docs[offset as usize]),
-            );
-        }
+        let (offsets, docs) = self.selection(gated);
         Ok(Some(ClusterRows {
             cluster,
             rows,
-            offsets: (!gated.all).then_some(&self.offsets[..]),
-            docs: (!gated.all).then_some(&self.selected_docs[..]),
+            offsets,
+            docs,
             centroid: Some(sim),
         }))
     }
 
+    /// The gated selection as the scan takes it: offsets and doc ids of the kept rows, or, with
+    /// every row kept, no offsets and the whole DocIds column when the segment spills.
+    fn selection(&mut self, gated: GatedRows) -> (Option<&[u32]>, Option<&[DocId]>) {
+        if gated.all {
+            return (None, self.spilled.then_some(&self.docs[..]));
+        }
+        self.selected_docs.clear();
+        self.selected_docs.extend(
+            self.offsets
+                .iter()
+                .map(|&offset| self.docs[offset as usize]),
+        );
+        (Some(&self.offsets[..]), Some(&self.selected_docs[..]))
+    }
+
     /// Selects `cluster`'s rows into `offsets` and counts what the gate pruned.
     fn gate_cluster(&mut self, cluster: usize, rows: usize) -> crate::Result<GatedRows> {
-        // DocIds alone, then the gate, before any payload read.
-        if !self.gate.is_open() {
+        // DocIds alone, then the gate, before any payload read; a spilled segment reads them for
+        // every cluster so the scan can drop a document's second copy.
+        if !self.gate.is_open() || self.spilled {
             self.reader.read_doc_ids(cluster, &mut self.docs)?;
             debug_assert_eq!(self.docs.len(), rows);
         }
@@ -326,17 +339,7 @@ impl ClusterSource for RouterClusters<'_> {
                 self.skip_empty();
                 continue;
             }
-            let (offsets, docs) = if gated.all {
-                (None, None)
-            } else {
-                self.selected_docs.clear();
-                self.selected_docs.extend(
-                    self.offsets
-                        .iter()
-                        .map(|&offset| self.docs[offset as usize]),
-                );
-                (Some(&self.offsets[..]), Some(&self.selected_docs[..]))
-            };
+            let (offsets, docs) = self.selection(gated);
             return Ok(Some(ClusterRows {
                 cluster,
                 rows,

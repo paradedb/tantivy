@@ -147,12 +147,12 @@ impl<T: VectorElement> TopClustersBySimilarityCollector<T> {
             .filter_map(|s| s.vectors.index())
             .map(|i| i.num_clusters())
             .sum();
-        let docs = segments
+        let rows = segments
             .iter()
             .filter_map(|s| s.vectors.index())
-            .map(|i| i.num_docs())
+            .map(|i| i.num_rows())
             .sum();
-        let (total, _, x) = self.params.resolved_work_budget(clusters, docs)?;
+        let (total, _, x) = self.params.resolved_work_budget(clusters, rows)?;
         let (total, x, capacity) = self.budget.map_or((total, x, clusters), |b| {
             (b.work.total.get(), b.work.per_cluster.get(), b.clusters)
         });

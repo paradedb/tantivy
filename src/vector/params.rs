@@ -146,14 +146,15 @@ impl ProbeParams {
 impl ProbeParams {
     /// The segment's work budget with the pricing it was resolved under, `(budget, n_avg, x)`.
     ///
-    /// The absolute `max_probe` budget is floored at
-    /// `min_probe_clusters` and capped at the capacity; `n_avg` is the docs per cluster and `x` the
-    /// open share. `native_docs_in_segment` counts distinct docs with a vector, as written. A
-    /// zero `max_probe` or a non-finite or non-positive `fixed_probe_cost_rows` is an error.
+    /// The absolute `max_probe` budget is floored at `min_probe_clusters` and capped at the
+    /// capacity; `n_avg` is the rows per cluster and `x` the open share. `rows_in_segment` counts
+    /// the rows across the segment's clusters, a spilled segment's second copies included, so a
+    /// cluster's rows cost the same share of the capacity whether or not the segment spills. A zero
+    /// `max_probe` or a non-finite or non-positive `fixed_probe_cost_rows` is an error.
     pub(crate) fn resolved_work_budget(
         &self,
         clusters_in_segment: usize,
-        native_docs_in_segment: usize,
+        rows_in_segment: usize,
     ) -> crate::Result<(f64, f64, f64)> {
         if self.adaptive_probing.is_some_and(|p| {
             !p.admission_fraction.is_finite() || !(0.0..=1.0).contains(&p.admission_fraction)
@@ -172,11 +173,11 @@ impl ProbeParams {
                 "fixed_probe_cost_rows must be finite and greater than 0".to_string(),
             ));
         }
-        let n_avg = native_docs_in_segment as f64 / clusters_in_segment.max(1) as f64;
+        let n_avg = rows_in_segment as f64 / clusters_in_segment.max(1) as f64;
         // The unit identity (1 unit = x + (1 - x); exhaustive scan = C units) holds for any x.
         let x = open_share(self.fixed_probe_cost_rows, n_avg);
         let segment_units = clusters_in_segment as f64 * x
-            + (1.0 - x) * native_docs_in_segment as f64 / n_avg.max(f64::MIN_POSITIVE);
+            + (1.0 - x) * rows_in_segment as f64 / n_avg.max(f64::MIN_POSITIVE);
         let budget = (self.max_probe.max(self.min_probe_clusters) as f64).min(segment_units);
         Ok((budget, n_avg, x))
     }

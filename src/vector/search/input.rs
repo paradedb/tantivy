@@ -47,7 +47,8 @@ pub type ClusterRef = (SegmentOrdinal, u32);
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct VectorSearchBudget {
     pub(crate) clusters: usize,
-    pub(crate) docs: usize,
+    /// Rows across the snapshot's clusters, a spilled segment's second copies included.
+    pub(crate) rows: usize,
     pub(crate) work: WorkBudget,
 }
 
@@ -59,18 +60,18 @@ impl VectorSearchBudget {
         segments: &[VectorSegment],
     ) -> Result<Self> {
         let mut clusters = 0;
-        let mut docs = 0;
+        let mut rows = 0;
         for segment in segments {
             let vectors = segment.reader.vector_index(field)?;
             if let Some(index) = vectors.index() {
                 clusters += index.num_clusters();
-                docs += index.num_docs();
+                rows += index.num_rows();
             }
         }
-        let (total, n_avg, x) = params.resolved_work_budget(clusters, docs)?;
+        let (total, n_avg, x) = params.resolved_work_budget(clusters, rows)?;
         Ok(Self {
             clusters,
-            docs,
+            rows,
             work: WorkBudget {
                 total: WorkUnits::new(total),
                 per_cluster: WorkUnits::new(x),
@@ -94,7 +95,8 @@ pub struct PreparedVectorSearch {
     pub(crate) field: Field,
     pub(crate) top_n: usize,
     pub(crate) budget: VectorSearchBudget,
-    pub(crate) docs: usize,
+    /// Rows across the prepared segments' clusters, a spilled segment's second copies included.
+    pub(crate) rows: usize,
     pub(crate) segments: Vec<VectorSegment>,
     pub(crate) scope: HashMap<SegmentOrdinal, (SegmentId, usize, StageTotals)>,
 }
@@ -113,7 +115,7 @@ impl PreparedVectorSearch {
             field,
             top_n,
             budget,
-            docs: 0,
+            rows: 0,
             segments: Vec::new(),
             scope: HashMap::new(),
         };
@@ -127,7 +129,7 @@ impl PreparedVectorSearch {
                 let vectors = segment.reader.vector_index(field)?;
                 let max_doc = segment.reader.max_doc();
                 let (scan, cap) = if let Some(index) = vectors.index() {
-                    prepared.docs += index.num_docs();
+                    prepared.rows += index.num_rows();
                     if top_n == 0 || max_doc == 0 || index.num_clusters() == 0 {
                         (None, 0)
                     } else {

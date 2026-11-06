@@ -25,6 +25,7 @@ pub(crate) struct LayerProbeStats {
     pub(crate) io: VectorIoStats,
     scan_ns: u64,
     boundary_ns: u64,
+    /// Rows the layer scored, a spilled document's second copy included at layer 0.
     scored: usize,
     admission_pruned: usize,
     survivors: usize,
@@ -244,10 +245,12 @@ pub(crate) enum AccessPath {
 /// `segment_*` fields are per segment.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct ProbeStats {
-    /// Rows admitted and scored at layer 0 or exactly.
+    /// Rows admitted and scored at layer 0 or exactly, a spilled document's second copy included.
     pub candidates_scored: usize,
-    /// Rows the routed source admitted and charged.
+    /// Rows the routed source admitted and charged, a spilled document's second copy included.
     pub layer0_eligible: usize,
+    /// Rows dropped at admission as the second copy of a document an earlier cluster held.
+    pub spill_dropped: usize,
     /// Routed clusters opened with no eligible row.
     pub clusters_skipped_empty: usize,
     /// Reads for exact scoring: full-precision rows and the DocIds they need.
@@ -387,6 +390,7 @@ impl ProbeStats {
             candidates_scored: scan.candidates_scored,
             exact_rows: scan.exact_rows,
             exact_recheck_dropped: scan.exact_recheck_dropped,
+            spill_dropped: scan.spill_dropped,
             cross_bound_publishes: scan.cross_bound_publishes,
             layers: LayerProbeStatsSet(
                 scan.layers
@@ -584,6 +588,7 @@ mod tests {
         "centroid_storage_blocks",
         "exact_rows",
         "exact_recheck_dropped",
+        "spill_dropped",
         "cross_bound_publishes",
         "scan_init_ns",
         "non_vector_search_ns",

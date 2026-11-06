@@ -334,6 +334,13 @@ pub struct IndexSettings {
     /// quantization. Existing segments retain their own persisted router kind.
     #[serde(default, skip_serializing_if = "is_false")]
     pub vector_centroid_quantization: bool,
+    /// Assign each vector of a quantized IVF field to a second cluster chosen to cover queries
+    /// its first cluster misses, writing its codes there too. Doubles the quantized rows scanned
+    /// per opened cluster and adds about one quantized row per vector to the segment; the probe
+    /// budget counts rows scanned, spills included. Applies to new IVF segments; each segment
+    /// keeps the assignment it was built with.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub vector_spill: bool,
     /// Eligibility and storage limits for fields with bitmap postings enabled.
     #[serde(default, skip_serializing_if = "BitmapPostingsConfig::is_default")]
     pub bitmap_postings: BitmapPostingsConfig,
@@ -376,6 +383,7 @@ impl Default for IndexSettings {
             vector_clustering_threshold: default_vector_clustering_threshold(),
             vector_quantization: Vec::new(),
             vector_centroid_quantization: false,
+            vector_spill: false,
             bitmap_postings: BitmapPostingsConfig::default(),
         }
     }
@@ -674,6 +682,7 @@ mod tests {
                 vector_clustering_threshold: 10_000,
                 vector_quantization: Vec::new(),
                 vector_centroid_quantization: false,
+                vector_spill: false,
                 bitmap_postings: super::BitmapPostingsConfig::default(),
             }
         );
