@@ -141,17 +141,13 @@ impl ProbeParams {
         let cluster_cost =
             (open_share + (1.0 - open_share) * match_fraction).max(f64::MIN_POSITIVE);
         let clusters = (budget.max(0.0) / cluster_cost).ceil();
-        let clusters = if let Some(fraction) = self
-            .adaptive_probing
-            .map(AdaptiveProbeParams::admission_fraction)
-        {
+        let clusters = if let Some(adaptive) = self.adaptive_probing {
             let base = if early_refinement {
-                let effort = self.adaptive_probing.unwrap().effort;
-                (0.00075_f64.ln() + 0.32 * effort * std::f64::consts::LN_10)
+                (0.00075_f64.ln() + 0.32 * adaptive.effort * std::f64::consts::LN_10)
                     .min(0.0)
                     .exp()
             } else {
-                0.002 / fraction.powf(0.625)
+                0.002 / adaptive.admission_fraction().powf(0.625)
             }
             .min(1.0);
             let headroom = (0.05 * (cluster_cost.sqrt().recip() - 1.0)).min(0.4);
@@ -206,7 +202,7 @@ impl ProbeParams {
         let segment_units = clusters_in_segment as f64 * x
             + (1.0 - x) * native_docs_in_segment as f64 / n_avg.max(f64::MIN_POSITIVE);
         let budget = (self.max_probe_fraction as f64 * segment_units)
-            .max(if self.initial_work(clusters_in_segment).is_some() {
+            .max(if self.adaptive_probing.is_some() {
                 1.0
             } else {
                 self.min_probe_clusters as f64

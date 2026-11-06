@@ -67,11 +67,10 @@ impl ScoreGrid {
     }
 }
 
-/// Row counts by bucket on one grid; `bins + below + above == rows`.
+/// Row counts on one grid, including rows below its lower edge.
 #[derive(Clone, Debug)]
 pub(crate) struct ScoreHistogram {
     bins: Box<[f32; ScoreGrid::BINS]>,
-    below: f32,
     above: f32,
     rows: f32,
 }
@@ -80,7 +79,6 @@ impl ScoreHistogram {
     pub(crate) fn zero() -> Self {
         Self {
             bins: Box::new([0.0; ScoreGrid::BINS]),
-            below: 0.0,
             above: 0.0,
             rows: 0.0,
         }
@@ -88,7 +86,6 @@ impl ScoreHistogram {
 
     pub(crate) fn clear(&mut self) {
         self.bins.fill(0.0);
-        self.below = 0.0;
         self.above = 0.0;
         self.rows = 0.0;
     }
@@ -117,7 +114,7 @@ impl ScoreHistogram {
     #[inline]
     fn add_score(&mut self, grid: ScoreGrid, score: f32) {
         match grid.bucket(score) {
-            Bucket::Below => self.below += 1.0,
+            Bucket::Below => {}
             Bucket::Bin(bin) => self.bins[bin] += 1.0,
             Bucket::Above => self.above += 1.0,
         }
@@ -128,7 +125,6 @@ impl ScoreHistogram {
         for (count, &more) in self.bins.iter_mut().zip(other.bins.iter()) {
             *count += more;
         }
-        self.below += other.below;
         self.above += other.above;
         self.rows += other.rows;
     }
@@ -137,7 +133,6 @@ impl ScoreHistogram {
         for count in self.bins.iter_mut() {
             *count *= factor;
         }
-        self.below *= factor;
         self.above *= factor;
         self.rows *= factor;
     }
@@ -204,10 +199,6 @@ mod tests {
         f64::from(1.0 / grid.inv_width)
     }
 
-    fn total(histogram: &ScoreHistogram) -> f32 {
-        histogram.bins.iter().sum::<f32>() + histogram.below + histogram.above
-    }
-
     /// The bar sits one bin above `lo`, the last bin ends 4σ above the top score, and a flat set
     /// of scores falls back to a spread from the bar's magnitude.
     #[test]
@@ -266,7 +257,7 @@ mod tests {
         rows.extend([at(10.5), at(41.5), at(100.5), at(300.0), -0.5]);
         let mut histogram = ScoreHistogram::zero();
         histogram.add(grid, &rows);
-        assert_eq!(total(&histogram), histogram.rows());
+        assert_eq!(histogram.rows(), rows.len() as f32);
         let brute = |bar: f32| rows.iter().filter(|&&row| row >= bar).count() as f32;
         // The row under `lo` counts below every bar.
         assert_eq!(histogram.at_or_above(grid, -1.0), brute(-1.0) - 1.0);
@@ -280,8 +271,7 @@ mod tests {
         assert_eq!(histogram.at_or_above(grid, at(400.0)), 1.0);
     }
 
-    /// Decaying then adding, cluster by cluster, is the explicit weighted sum of the clusters, and
-    /// every operation keeps the counts adding up to the rows.
+    /// Decaying then adding, cluster by cluster, is the explicit weighted sum of the clusters.
     #[test]
     fn scale_and_add_are_a_weighted_sum() {
         let grid = ScoreGrid {
@@ -299,7 +289,6 @@ mod tests {
         for (part, &decay) in parts.iter().zip(&decays) {
             running.scale(decay);
             running.add_histogram(&histogram(part));
-            assert!((total(&running) - running.rows()).abs() < 1e-5);
         }
         let mut explicit = ScoreHistogram::zero();
         for (j, part) in parts.iter().enumerate() {
@@ -317,7 +306,8 @@ mod tests {
             assert!((a - b).abs() < 1e-5, "{bar}: {a} {b}");
         }
         running.clear();
-        assert_eq!((running.rows(), total(&running)), (0.0, 0.0));
+        assert_eq!(running.rows(), 0.0);
+        assert_eq!(running.at_or_above(grid, 0.0), 0.0);
     }
 
     /// A fold of upper endpoints records `Estimate::upper` per row, before the fill as scores and

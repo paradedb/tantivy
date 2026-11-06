@@ -281,8 +281,6 @@ pub struct ProbeStats {
     pub(crate) quantized_trace: ScanTrace,
     /// Rows scored at full precision, on every path.
     pub exact_rows: usize,
-    pub early_refine_rows: usize,
-    pub early_refine_ns: u64,
     /// Survivors of the last boundary dropped before the exact phase read them.
     pub exact_recheck_dropped: usize,
     /// Thresholds this segment's scan stored in the query participants' shared slot.
@@ -386,8 +384,6 @@ impl ProbeStats {
         let mut stats = Self {
             candidates_scored: scan.candidates_scored,
             exact_rows: scan.exact_rows,
-            early_refine_rows: scan.early_refine_rows,
-            early_refine_ns: scan.early_refine_ns,
             exact_recheck_dropped: scan.exact_recheck_dropped,
             cross_bound_publishes: scan.cross_bound_publishes,
             layers: LayerProbeStatsSet(
@@ -584,8 +580,6 @@ mod tests {
         "centroid_bytes_read",
         "centroid_storage_blocks",
         "exact_rows",
-        "early_refine_rows",
-        "early_refine_ns",
         "exact_recheck_dropped",
         "cross_bound_publishes",
         "scan_init_ns",

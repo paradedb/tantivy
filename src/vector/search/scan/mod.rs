@@ -106,8 +106,6 @@ pub(crate) struct ScanReport {
     pub(crate) layers: Vec<LayerReport>,
     /// Rows scored at full precision.
     pub(crate) exact_rows: usize,
-    pub(crate) early_refine_rows: usize,
-    pub(crate) early_refine_ns: u64,
     /// Survivors of the last boundary dropped before the exact phase read them.
     pub(crate) exact_recheck_dropped: usize,
     /// Thresholds the scan stored in the participants' slot.
@@ -134,8 +132,6 @@ pub(crate) struct ScanTrace {
     pub(crate) refined_topk_rows: Vec<BlockAddress>,
     /// Every exact score the scan computed, in order.
     pub(crate) exact_scores: Vec<f32>,
-    /// `(rows scored, survival scores folded)` per shortlisted cluster, with the RateAPS on.
-    pub(crate) rate_folds: Vec<(usize, usize)>,
 }
 
 // --- Quantized state ---
@@ -578,11 +574,10 @@ where
         self.score_shortlist()
     }
 
-    pub(crate) fn refinement_candidates(&mut self, limit: usize) -> Vec<Candidate> {
+    pub(crate) fn refinement_candidates(&self, limit: usize) -> Vec<Candidate> {
         let Some(state) = &self.quantized else {
             return Vec::new();
         };
-        let started = std::time::Instant::now();
         let mut candidates = state.candidates.live_candidates(state.segment_ord);
         if let Some(bar) = self.bound.shared_threshold() {
             candidates.retain(|candidate| candidate.bound.estimate() > bar);
@@ -596,7 +591,6 @@ where
             });
             candidates.truncate(limit);
         }
-        self.report.early_refine_ns += started.elapsed().as_nanos() as u64;
         candidates
     }
 
@@ -604,7 +598,6 @@ where
         let Some(state) = &mut self.quantized else {
             return Ok(());
         };
-        let started = std::time::Instant::now();
         let mut rows: Vec<_> = top
             .iter()
             .filter(|candidate| candidate.address.segment_ord == state.segment_ord)
@@ -637,7 +630,6 @@ where
                 .exact
                 .score(&selected, &mut self.scratch, &mut self.bound, None)?;
             self.report.exact_rows += scored;
-            self.report.early_refine_rows += scored;
             #[cfg(test)]
             self.report.trace.refined_topk_rows.extend(
                 selected
@@ -646,7 +638,6 @@ where
             );
             state.candidates.remove_rows(b, &offsets);
         }
-        self.report.early_refine_ns += started.elapsed().as_nanos() as u64;
         Ok(())
     }
 
@@ -718,14 +709,6 @@ where
         let Some(rate) = &mut self.rate else {
             return;
         };
-        #[cfg(test)]
-        {
-            let folded = match &mut rate.histograms {
-                Some(histograms) => histograms.cluster_mut().rows() as usize,
-                None => rate.prefill.len() - rate.rows,
-            };
-            self.report.trace.rate_folds.push((len, folded));
-        }
         rate.rows += len;
         match &mut rate.histograms {
             Some(histograms) => histograms.finish_cluster(len),

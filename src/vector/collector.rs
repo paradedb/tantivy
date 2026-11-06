@@ -867,7 +867,6 @@ where
         .probe_params
         .adaptive_probing
         .filter(|_| top_n > 0)
-        .map(|adaptive| adaptive.admission_fraction())
         .map(|_| crate::vector::search::scan::RateApsState::default());
     let mut recall_reached = false;
     for (i, candidate) in ranking.clusters {

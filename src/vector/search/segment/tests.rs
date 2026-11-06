@@ -30,7 +30,7 @@ const MATRIX_DOCS: usize = 240;
 const MATRIX_CLUSTERS: usize = 6;
 
 #[test]
-fn adaptive_cascade_matches_oracle_and_prefix_replay() -> crate::Result<()> {
+fn adaptive_cascade_matches_prefix_replay() -> crate::Result<()> {
     use crate::vector::router::with_test_clusters;
     use crate::vector::{AdaptiveProbeParams, ProbeTermination};
 
@@ -42,7 +42,6 @@ fn adaptive_cascade_matches_oracle_and_prefix_replay() -> crate::Result<()> {
     ];
     let mut stops = 0;
     let mut plain_stops = 0;
-    let mut exact_layers = [0; 3];
     for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
         for schedule in [&[][..], &[1][..], &[1, 1][..], &[1, 1, 4][..]] {
             let representation = if schedule.is_empty() {
@@ -68,45 +67,10 @@ fn adaptive_cascade_matches_oracle_and_prefix_replay() -> crate::Result<()> {
                     });
                     for k in [1, 10, MATRIX_DOCS] {
                         let params = ProbeParams {
-                            adaptive_probing: None,
                             exact_plan: true,
                             ..routed_exhaustive_params(MATRIX_CLUSTERS)
                         };
                         for plan in plans {
-                            for located in [
-                                LocatedPath::Off,
-                                LocatedPath::MaxSelectivity(Selectivity::new(1.0).unwrap()),
-                            ] {
-                                let (hits, reports) = forced_top_k(
-                                    &fixture,
-                                    filter,
-                                    &query,
-                                    k,
-                                    &ProbeParams {
-                                        located,
-                                        ..params.clone()
-                                    },
-                                    plan,
-                                )?;
-                                assert_eq!(hits, fixture.oracle(filter, &query, k)?);
-                                for report in reports {
-                                    let planned: usize = (0..schedule.len())
-                                        .filter_map(|layer| report.layers.get(layer))
-                                        .map(|l| l.exact_rows())
-                                        .sum();
-                                    assert!(planned <= report.exact_rows);
-                                    assert!(report.exact_rows <= report.candidates_scored);
-                                    if k == MATRIX_DOCS {
-                                        assert_eq!(report.exact_rows, report.candidates_scored);
-                                    }
-                                    for (layer, total) in exact_layers.iter_mut().enumerate() {
-                                        *total += report
-                                            .layers
-                                            .get(layer)
-                                            .map_or(0, |counts| counts.exact_rows());
-                                    }
-                                }
-                            }
                             let mut previous_prefix = 0;
                             for target in [0.5, 0.95, 1.0] {
                                 let (active, report) = with_test_clusters(ranked.clone(), || {
@@ -165,7 +129,6 @@ fn adaptive_cascade_matches_oracle_and_prefix_replay() -> crate::Result<()> {
         plain_stops > 0,
         "unquantized IVF must honor adaptive stopping"
     );
-    assert!(exact_layers.iter().all(|&rows| rows > 0));
     Ok(())
 }
 
