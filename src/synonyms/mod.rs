@@ -9,7 +9,8 @@
 //! [`expand`](fn@expand) looks the keys up in every segment and rewrites a list of query tokens
 //! into [`Expansion`]s, the longest key first, the way Lucene's `SynonymGraphFilter` does. It reads
 //! the rules through a [`SynonymSource`], so a caller can cache what each segment holds for a
-//! token. [`SynonymExpander`] is the source that reads the segment readers on every expansion.
+//! token. [`SynonymExpander`] expands with no cache, so it reads the segment readers on every
+//! expansion.
 //!
 //! ```
 //! use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions};

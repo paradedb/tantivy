@@ -53,3 +53,43 @@ impl Tokenizer for SynonymRuleTokenizer {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tokenizer::{SimpleTokenizer, StopWordFilter, TokenStream};
+
+    /// The insert check and the tokenizer must agree. Otherwise a rule that passes the check is
+    /// stored and never expands.
+    #[test]
+    fn a_rule_indexes_keys_exactly_when_the_check_accepts_it() {
+        let mut analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(StopWordFilter::remove(vec!["the".to_string()]))
+            .build();
+        let mut tokenizer = SynonymRuleTokenizer::new(analyzer.clone());
+        for rule in [
+            "sofa, couch",
+            "sofa",
+            "sneakers => running shoes",
+            "a => b => c",
+            "the who => band",
+            "who the => band",
+            "the => sofa",
+            " , ",
+            "a\0b, c",
+            "# a comment",
+            "",
+        ] {
+            let accepted = match SynonymRule::parse(rule) {
+                Ok(Some(parsed)) => parsed.check(&mut analyzer).is_ok(),
+                _ => false,
+            };
+            let mut stream = tokenizer.token_stream(rule);
+            let mut keys = 0;
+            while stream.advance() {
+                keys += 1;
+            }
+            assert_eq!(keys > 0, accepted, "{rule:?}");
+        }
+    }
+}

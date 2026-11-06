@@ -100,20 +100,19 @@ pub struct SegmentSynonyms {
 }
 
 impl SegmentSynonyms {
-    /// Opens the rules in `field`, or `None` when no document of the segment has a rule.
-    pub fn open(segment_reader: &SegmentReader, field: Field) -> crate::Result<Option<Self>> {
+    /// Opens the rules in `field`.
+    pub fn open(segment_reader: &SegmentReader, field: Field) -> crate::Result<Self> {
         let schema = segment_reader.schema();
         check_rule_field(schema, field)?;
-        let Some(rules) = segment_reader
-            .fast_fields()
-            .str(schema.get_field_name(field))?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(SegmentSynonyms {
+        let name = schema.get_field_name(field);
+        // Every segment has a column for each fast field, so a missing column is an error.
+        let rules = segment_reader.fast_fields().str(name)?.ok_or_else(|| {
+            TantivyError::InternalError(format!("synonym rule field '{name}' has no column"))
+        })?;
+        Ok(SegmentSynonyms {
             keys: segment_reader.inverted_index(field)?,
             rules,
-        }))
+        })
     }
 
     /// Every key that starts with `token`, with its rules. `analyzer` is the one the field's
@@ -272,8 +271,6 @@ fn longest_match(
 
 #[derive(Clone)]
 struct ReaderSegment {
-    /// The ordinal `expand_with` passes to its liveness check.
-    ord: usize,
     synonyms: SegmentSynonyms,
     alive: Option<AliveBitSet>,
 }
@@ -306,16 +303,15 @@ impl SynonymExpander {
         field: Field,
         analyzer: TextAnalyzer,
     ) -> crate::Result<Self> {
-        let mut segments = Vec::with_capacity(segment_readers.len());
-        for (ord, segment_reader) in segment_readers.iter().enumerate() {
-            if let Some(synonyms) = SegmentSynonyms::open(segment_reader, field)? {
-                segments.push(ReaderSegment {
-                    ord,
-                    synonyms,
+        let segments = segment_readers
+            .iter()
+            .map(|segment_reader| {
+                Ok(ReaderSegment {
+                    synonyms: SegmentSynonyms::open(segment_reader, field)?,
                     alive: segment_reader.alive_bitset().cloned(),
-                });
-            }
-        }
+                })
+            })
+            .collect::<crate::Result<_>>()?;
         Ok(SynonymExpander { segments, analyzer })
     }
 
@@ -362,12 +358,11 @@ impl<F: FnMut(usize, DocId) -> bool> SynonymSource for ReaderSource<'_, F> {
     }
 
     fn is_alive(&mut self, segment: usize, doc: DocId) -> bool {
-        let segment = &self.segments[segment];
-        let in_bitset = segment
+        let in_bitset = self.segments[segment]
             .alive
             .as_ref()
             .is_none_or(|alive| alive.is_alive(doc));
-        in_bitset && (self.is_alive)(segment.ord, doc)
+        in_bitset && (self.is_alive)(segment, doc)
     }
 }
 
