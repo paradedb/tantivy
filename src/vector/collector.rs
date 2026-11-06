@@ -732,18 +732,16 @@ where
                     _ => (matched, docs),
                 }
             });
-    let router_k = |budget| {
-        collector.probe_params.router_k(
-            budget,
-            x,
-            matched / routed_docs.max(1) as f64,
-            clusters,
-            collector.max_scan_levels > 0 && vectors.iter().any(|v| v.has_quantized_storage()),
-        )
-    };
+    let k = collector.probe_params.router_k(
+        total,
+        x,
+        matched / routed_docs.max(1) as f64,
+        clusters,
+        collector.max_scan_levels > 0 && vectors.iter().any(|v| v.has_quantized_storage()),
+    );
     let partitions: Vec<_> = segments.iter().map(|s| s.partition_centroid).collect();
     let routing = crate::vector::router::RoutingParams {
-        k: router_k(total),
+        k,
         rerank_factor: collector.probe_params.router_rerank_factor,
         min_beam_fraction: collector.probe_params.router_min_beam_fraction,
         aps: collector.probe_params.router_aps,
@@ -755,10 +753,7 @@ where
         routing,
         totals,
         on_segment,
-        collector
-            .probe_params
-            .adaptive_probing
-            .map(|_| router_k(clusters as f64)),
+        collector.probe_params.adaptive_probing.map(|_| k),
     );
     let mut reserved = WorkUnits::ZERO;
     let mut scans: Vec<_> = (0..vectors.len()).map(|_| None).collect();

@@ -122,9 +122,10 @@ impl ProbeParams {
     /// match_fraction` units, since only filter matches charge row work, so
     /// the budget buys `budget / that` clusters: `budget` unfiltered, up to
     /// `budget / open_share` as the filter approaches empty. The count is
-    /// capped at the segment's cluster count. Adaptive scans scale a base window by the
+    /// capped at the segment's cluster count. Adaptive scans instead scale a base window by the
     /// admission fraction, halving its growth above effort 4.4 with early refinement or 2.0
-    /// without it. A filter adjustment shrinks in relative effect as the window grows.
+    /// without it. Their work meter enforces the budget independently of this candidate window.
+    /// A filter adjustment shrinks in relative effect as the window grows.
     /// Nonadaptive scans apply the `min_probe_clusters` floor.
     ///
     /// * `open_share` (`f64`) — the per-index open share `x`.
@@ -160,7 +161,7 @@ impl ProbeParams {
             let adjusted = base + headroom * base.powf(0.125) * remaining * taper * taper;
             let expected = self.initial_work(clusters_in_segment).unwrap_or(0.0) / cluster_cost;
             let window = (adjusted * clusters_in_segment as f64).max(expected).ceil();
-            (clusters as usize).min(window as usize)
+            window as usize
         } else {
             (clusters as usize).max(self.min_probe_clusters)
         };
@@ -230,7 +231,7 @@ mod tests {
         assert!((params(4.4).initial_work(1000).unwrap() - 5.0).abs() < 1e-10);
         assert!((params(4.4).initial_work(4000).unwrap() - 20.0).abs() < 1e-10);
         assert_eq!(params(0.1).router_k(1000.0, 0.1, 1.0, 1000, true), 1);
-        assert_eq!(params(4.4).router_k(2.0, 0.1, 1.0, 1000, true), 2);
+        assert_eq!(params(4.4).router_k(2.0, 0.1, 1.0, 1000, true), 20);
         assert_eq!(params(4.4).router_k(1000.0, 0.1, 1.0, 1000, true), 20);
         assert_eq!(params(2.0).router_k(1000.0, 0.1, 1.0, 1000, false), 36);
         let high_recall = params(5.58).router_k(100_000.0, 0.004, 1.0, 100_000, true);
