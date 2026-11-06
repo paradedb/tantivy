@@ -732,13 +732,10 @@ where
                     _ => (matched, docs),
                 }
             });
-    let k = collector.probe_params.router_k(
-        total,
-        x,
-        matched / routed_docs.max(1) as f64,
-        clusters,
-        collector.max_scan_levels > 0 && vectors.iter().any(|v| v.has_quantized_storage()),
-    );
+    let k =
+        collector
+            .probe_params
+            .router_k(total, x, matched / routed_docs.max(1) as f64, clusters);
     let partitions: Vec<_> = segments.iter().map(|s| s.partition_centroid).collect();
     let routing = crate::vector::router::RoutingParams {
         k,
@@ -746,15 +743,7 @@ where
         min_beam_fraction: collector.probe_params.router_min_beam_fraction,
         aps: collector.probe_params.router_aps,
     };
-    let ranking = GlobalRanking::from(
-        &routers,
-        &partitions,
-        &query,
-        routing,
-        totals,
-        on_segment,
-        collector.probe_params.adaptive_probing.map(|_| k),
-    );
+    let ranking = GlobalRanking::from(&routers, &partitions, &query, routing, totals, on_segment);
     let mut reserved = WorkUnits::ZERO;
     let mut scans: Vec<_> = (0..vectors.len()).map(|_| None).collect();
     let mut pending_scans = Vec::with_capacity(vectors.len());
@@ -772,7 +761,7 @@ where
             let Some(plan) = plan else {
                 return Ok((None, None, None));
             };
-            let capacity = plan.capacity_hint(&collector.probe_params);
+            let capacity = plan.capacity_hint();
             let SegmentPlan {
                 budget,
                 source,
@@ -1279,7 +1268,7 @@ mod ivf_e2e_tests {
                     .order_by_similarity(fixture.field, query.clone())
                     .with_probe_params(ProbeParams {
                         adaptive_probing: (target < 1.0).then(|| AdaptiveProbeParams {
-                            effort: -4.0 * (1.0_f64 - target).log10(),
+                            admission_fraction: (1.0_f64 - target).powi(4),
                         }),
                         located: LocatedPath::Off,
                         ..exhaustive_params(64)
@@ -1352,7 +1341,7 @@ mod ivf_e2e_tests {
                             router_aps: false,
                             adaptive_probing: adaptive.then_some(
                                 crate::vector::AdaptiveProbeParams {
-                                    effort: -2.0 * (1.0_f64 - 0.99999999).log10(),
+                                    admission_fraction: 1e-16,
                                 },
                             ),
                             ..exhaustive_params(8)
@@ -1382,7 +1371,15 @@ mod ivf_e2e_tests {
                             )
                         })
                         .expect("refinement reads");
-                    assert_eq!(first_refinement < last_shortlist, adaptive, "{located:?}");
+                    let refines_during_probing = adaptive
+                        && result.stats.iter().any(|stats| {
+                            stats.access_path == crate::vector::stats::AccessPath::Routed
+                        });
+                    assert_eq!(
+                        first_refinement < last_shortlist,
+                        refines_during_probing,
+                        "{located:?}"
+                    );
                     assert_eq!(result.results, fixture.oracle(filter, &query, 10)?);
                     let mut refined = 0;
                     for stats in &result.stats {
@@ -1398,7 +1395,7 @@ mod ivf_e2e_tests {
                         assert!(trace.exact_phase_rows.iter().all(|row| !rows.contains(row)));
                         refined += rows.len();
                     }
-                    assert_eq!(refined > 0, adaptive);
+                    assert_eq!(refined > 0, refines_during_probing);
                 }
             }
         }
@@ -1551,8 +1548,9 @@ mod ivf_e2e_tests {
             let collector = TopDocs::with_limit(20)
                 .order_by_similarity(fixture.field, vec![0.0_f32, 0.0])
                 .with_probe_params(ProbeParams {
-                    adaptive_probing: adaptive
-                        .then_some(crate::vector::AdaptiveProbeParams { effort: 20.0 }),
+                    adaptive_probing: adaptive.then_some(crate::vector::AdaptiveProbeParams {
+                        admission_fraction: 1e-20,
+                    }),
                     max_probe_fraction: 0.25,
                     located: LocatedPath::Off,
                     ..Default::default()

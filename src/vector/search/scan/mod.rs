@@ -503,7 +503,7 @@ where
         let recall_fraction = config
             .adaptive_probing
             .filter(|_| config.top_n > 0)
-            .map(|p| p.admission_fraction());
+            .map(|p| p.admission_fraction);
         Ok(Self {
             exact: ExactScorer::new(
                 reader,

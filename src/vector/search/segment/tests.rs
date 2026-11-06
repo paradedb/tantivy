@@ -82,7 +82,8 @@ fn adaptive_cascade_matches_prefix_replay() -> crate::Result<()> {
                                         ProbeParams {
                                             adaptive_probing: (target < 1.0).then(|| {
                                                 AdaptiveProbeParams {
-                                                    effort: -1.5 * (1.0_f64 - target).log10(),
+                                                    admission_fraction: (1.0_f64 - target)
+                                                        .powf(1.5),
                                                 }
                                             }),
                                             ..params.clone()
@@ -156,7 +157,7 @@ fn adaptive_stops_when_shared_threshold_prunes_every_local_candidate() -> crate:
         seed_slot(&slot, -1.0);
         let params = ProbeParams {
             adaptive_probing: (target < 1.0).then(|| crate::vector::AdaptiveProbeParams {
-                effort: -1.5 * (1.0_f64 - target).log10(),
+                admission_fraction: (1.0_f64 - target).powf(1.5),
             }),
             exact_plan: false,
             located: LocatedPath::Off,
@@ -190,84 +191,59 @@ fn adaptive_stops_when_shared_threshold_prunes_every_local_candidate() -> crate:
 }
 
 #[test]
-fn adaptive_routing_uses_one_window_without_expansion() -> crate::Result<()> {
-    let fixture = FixtureSpec::clustered(Metric::L2, 64, 64, 640)
-        .router(RouterKind::Stacked)
-        .paged()
-        .build()?;
-    let query = Lcg(42).vector(64, 0.5);
-    let adaptive = fixture.search(
-        &AllQuery,
-        &query,
-        640,
-        ProbeParams {
-            max_probe_fraction: 1.0,
-            located: LocatedPath::Off,
-            adaptive_probing: Some(crate::vector::AdaptiveProbeParams {
-                effort: -1.25 * (1.0_f64 - 0.95).log10(),
-            }),
-            ..Default::default()
-        },
-    )?;
-    assert_eq!(
-        adaptive.stats[0].termination,
-        crate::vector::ProbeTermination::Exhausted
-    );
-    assert_eq!(adaptive.stats[0].routing_visited_count, 2);
-    assert_eq!(adaptive.stats[0].postings_row, 2);
-    assert!(adaptive.stats[0].candidates_scored < 640);
-    Ok(())
-}
-
-#[test]
-fn adaptive_bypass_is_independent_of_ceiling_headroom() -> crate::Result<()> {
-    let fixture = FixtureSpec::clustered(Metric::L2, 64, 64, 6400)
-        .label("few", |i| i % 200 == 0)
-        .label("some", |i| i % 10 == 0)
-        .build()?;
-    let query = Lcg(42).vector(64, 0.5);
-    for (filter, path) in [
-        (fixture.filter("few"), AccessPath::Located),
-        (fixture.filter("some"), AccessPath::Routed),
-    ] {
-        let mut cap = None;
-        for max_probe_fraction in [0.1, 0.25, 1.0] {
-            let result = fixture.search(
-                &filter,
-                &query,
-                10,
-                ProbeParams {
+fn adaptive_stopping_preserves_router_work_and_path_selection() -> crate::Result<()> {
+    for router in [RouterKind::Stacked, RouterKind::QuantizedStacked] {
+        let fixture = FixtureSpec::clustered(Metric::L2, 64, 64, 6400)
+            .router(router)
+            .label("few", |i| i % 200 == 0)
+            .label("some", |i| i % 10 == 0)
+            .paged()
+            .build()?;
+        let query = Lcg(42).vector(64, 0.5);
+        for filter in [
+            &AllQuery as &dyn Query,
+            &fixture.filter("few"),
+            &fixture.filter("some"),
+        ] {
+            for max_probe_fraction in [0.001, 0.02, 0.1, 0.25, 1.0] {
+                let params = ProbeParams {
                     max_probe_fraction,
-                    adaptive_probing: Some(crate::vector::AdaptiveProbeParams {
-                        effort: -3.0 * (1.0_f64 - 0.95).log10(),
-                    }),
                     ..Default::default()
-                },
-            )?;
-            assert_eq!(result.stats[0].access_path, path);
-            assert_eq!(
-                *cap.get_or_insert(result.stats[0].located_cap),
-                result.stats[0].located_cap
-            );
+                };
+                let fixed = fixture.search(filter, &query, 6400, params.clone())?;
+                let adaptive = fixture.search(
+                    filter,
+                    &query,
+                    6400,
+                    ProbeParams {
+                        adaptive_probing: Some(crate::vector::AdaptiveProbeParams::default()),
+                        ..params
+                    },
+                )?;
+                assert_eq!(fixed.results, adaptive.results);
+                let (fixed, adaptive) = (&fixed.stats[0], &adaptive.stats[0]);
+                assert_eq!(fixed.work_budget, adaptive.work_budget);
+                assert_eq!(fixed.located_cap, adaptive.located_cap);
+                assert_eq!(fixed.access_path, adaptive.access_path);
+                assert_eq!(fixed.routing_visited_count, adaptive.routing_visited_count);
+                assert_eq!(fixed.postings_row, adaptive.postings_row);
+                assert_eq!(fixed.clusters_probed(), adaptive.clusters_probed());
+            }
         }
     }
     Ok(())
 }
 
 #[test]
-fn adaptive_probing_rejects_invalid_effort() {
+fn adaptive_probing_rejects_invalid_admission_fraction() {
     use crate::vector::AdaptiveProbeParams;
-    for effort in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+    for admission_fraction in [-1.0, 1.01, f64::NAN, f64::INFINITY] {
         assert!(ProbeParams {
-            adaptive_probing: Some(AdaptiveProbeParams { effort }),
+            adaptive_probing: Some(AdaptiveProbeParams { admission_fraction }),
             ..Default::default()
         }
         .resolved_work_budget(MATRIX_CLUSTERS, MATRIX_DOCS)
         .is_err());
-    }
-    for effort in [0.1, 1.0, 4.4, 10.0, f64::MAX] {
-        let fraction = AdaptiveProbeParams { effort }.admission_fraction();
-        assert!(fraction.is_finite() && (0.0..=1.0).contains(&fraction));
     }
 }
 
