@@ -1,9 +1,12 @@
 //! IVF merge tests: the written layout, quantized encoding, and searches over merged segments.
 
+use std::io::Write;
 use std::sync::Arc;
 
+use common::TerminatingWrite;
+
 use super::*;
-use crate::index::IndexSettings;
+use crate::index::{IndexSettings, SegmentComponent};
 use crate::indexer::NoMergePolicy;
 use crate::query::{AllQuery, EnableScoring, Query, TermQuery};
 use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
@@ -15,13 +18,14 @@ use crate::vector::distance::maybe_normalize_bytes;
 use crate::vector::params::{LocatedPath, ProbeParams};
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
 use crate::vector::storage::blocks::block_len;
-use crate::vector::storage::header::VectorEntry;
+use crate::vector::storage::header::{write_vector_header, VectorEntry, VEC_EXT};
 use crate::vector::storage::metadata::SlotType;
-use crate::vector::tests::ground_truth;
+use crate::vector::test_support::{Fixture, FixtureSpec, Lcg};
+use crate::vector::tests::{ground_truth, routed_exhaustive_params};
 use crate::vector::{
     BlockAddress, TopDocsByVectorSimilarityBuilder, VectorQuantizationLayer, ENTRY_ALIGN,
 };
-use crate::{Index, TantivyDocument};
+use crate::{DocAddress, Index, IndexWriter, TantivyDocument};
 
 /// The merge's production sources carry no estimator or audit entry point.
 #[test]
@@ -181,7 +185,7 @@ fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
                     vector.row_location(doc)?,
                     Some(BlockAddress::new(b as u32, row as u32))
                 );
-                let bytes = vector.vector_bytes_for_row(BlockAddress::new(b as u32, row as u32))?;
+                let bytes = vector.cluster_row_bytes(b, row, doc)?;
                 assert_eq!(Some(bytes.clone()), vector.vector_bytes(doc)?);
                 assert_eq!(
                     decode_row::<f32>(&bytes, 65)?,
@@ -204,9 +208,36 @@ fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
             .open_read_with_idx(field, VectorEntry::IdMap.index())
             .unwrap();
         assert_eq!(id_map.len(), 1 + segment.max_doc() as usize * 8);
-        let start = data.storage_block_ord(0).unwrap();
-        assert_eq!(start % ENTRY_ALIGN, 0);
-        assert_eq!(data.len() % ENTRY_ALIGN, 0);
+        // A quantized field declares the exact-row entries, a plain field exactly the other two.
+        let mut entries: Vec<_> = composite
+            .field_indices()
+            .filter_map(|(f, idx)| (f == field).then_some(idx))
+            .collect();
+        entries.sort_unstable();
+        let quantized = vector.has_exact_rows();
+        assert_eq!(
+            entries,
+            if quantized {
+                vec![0, 1, 2, 3]
+            } else {
+                vec![0, 1]
+            }
+        );
+        // Row entries start and end 8-aligned and precede every addressing entry.
+        for entry in [VectorEntry::Data, VectorEntry::ExactRows] {
+            let Some(rows) = composite.open_read_with_idx(field, entry.index()) else {
+                continue;
+            };
+            let start = rows.storage_block_ord(0).unwrap();
+            assert_eq!(start % ENTRY_ALIGN, 0);
+            assert_eq!(rows.len() % ENTRY_ALIGN, 0);
+            data_ends.push(start + rows.len());
+        }
+        for entry in [VectorEntry::IdMap, VectorEntry::ExactIdMap] {
+            if let Some(map) = composite.open_read_with_idx(field, entry.index()) {
+                id_starts.push(map.storage_block_ord(0).unwrap());
+            }
+        }
         let centroid_file = segment.open_read(SegmentComponent::Custom(CENTROIDS_EXT.into()))?;
         let (_, centroid_body) = read_centroid_header(&centroid_file)?;
         let centroid_composite = CompositeFile::open(&centroid_body)?;
@@ -219,9 +250,15 @@ fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
                 blocks.num_blocks()
             )
         );
+        if quantized {
+            let exact = composite
+                .open_read_with_idx(field, VectorEntry::ExactRows.index())
+                .unwrap();
+            let exact_blocks = Blocks::open(exact.clone(), &opts, false)?;
+            assert_eq!(exact_blocks.num_rows(), count);
+            assert_eq!(exact_blocks.num_blocks(), usize::from(count > 0));
+        }
         aligns.push(block_align(&blocks.schema));
-        data_ends.push(start + data.len());
-        id_starts.push(id_map.storage_block_ord(0).unwrap());
     }
     assert_ne!(aligns[0], aligns[1]);
     assert_eq!(data_ends.iter().max(), id_starts.iter().min());
@@ -292,12 +329,7 @@ fn clustered_merge_preserves_vectors_assignments_and_missing_docs() -> crate::Re
                             doc,
                             (
                                 cluster,
-                                vectors
-                                    .vector_bytes_for_row(BlockAddress::new(
-                                        cluster as u32,
-                                        row as u32,
-                                    ))?
-                                    .to_vec(),
+                                vectors.cluster_row_bytes(cluster, row, doc)?.to_vec(),
                             ),
                         );
                     }
@@ -997,13 +1029,13 @@ fn bridge_exactness_d768_and_d100() -> crate::Result<()> {
 
 // Settings version three remains a valid write target for vector format four.
 #[test]
-fn settings_v3_builds_v5_and_readers_ignore_global_changes() -> crate::Result<()> {
+fn settings_v3_builds_v6_and_readers_ignore_global_changes() -> crate::Result<()> {
     let mut index = build_quantized_fixture(QUANT_FIXTURE_DIM, true)?;
     let field = index.schema().get_field("embedding")?;
     let config = &index.settings().vector_quantization[0];
     assert_eq!(config.format_version, 3);
     config.validate(&VectorOptions::new(QUANT_FIXTURE_DIM, Metric::L2))?;
-    assert_eq!(&quantized_vec_file(&index)?[..4], &[5, 0, 0, 0]);
+    assert_eq!(&quantized_vec_file(&index)?[..4], &[6, 0, 0, 0]);
     index.settings_mut().vector_quantization.clear();
     let searcher = index.reader()?.searcher();
     let vector = searcher.segment_readers()[0].vector_index(field)?;
@@ -1326,10 +1358,10 @@ fn merge_quantization_matches_kernel_harness_and_is_reproducible() -> crate::Res
             QUANT_FIXTURE_DIM,
         )?;
         let prepared = prepare_centroid(&centroid, &specs);
-        for row in 0..ivf.cluster_num_rows(cluster)? {
+        let docs = vector_reader.cluster_doc_ids(cluster)?.unwrap();
+        for (row, doc) in (0..ivf.cluster_num_rows(cluster)?).zip(docs) {
             let vector = decode_row::<f32>(
-                &vector_reader
-                    .vector_bytes_for_row(BlockAddress::new(cluster as u32, row as u32))?,
+                &vector_reader.cluster_row_bytes(cluster, row, doc)?,
                 QUANT_FIXTURE_DIM,
             )?;
             let mut expected_input = vector.clone();
@@ -1651,12 +1683,10 @@ fn general_dimension_quantized_bridge_at_d100() -> crate::Result<()> {
             DIM,
         )?;
         let prepared = prepare_centroid(&centroid, &specs);
-        for row in 0..ivf.cluster_num_rows(cluster)? {
-            let vector = decode_row::<f32>(
-                &vector_reader
-                    .vector_bytes_for_row(BlockAddress::new(cluster as u32, row as u32))?,
-                DIM,
-            )?;
+        let docs = vector_reader.cluster_doc_ids(cluster)?.unwrap();
+        for (row, doc) in (0..ivf.cluster_num_rows(cluster)?).zip(docs) {
+            let vector =
+                decode_row::<f32>(&vector_reader.cluster_row_bytes(cluster, row, doc)?, DIM)?;
             let residual: Vec<f32> = vector
                 .iter()
                 .zip(&centroid)
@@ -1731,18 +1761,23 @@ fn l2_quantized_fixture_growth_matches_768_1_plus_4_ledger() -> crate::Result<()
     let opts = VectorOptions::new(DIM, Metric::L2);
     let plain_meta = VectorColMetadata::build_ivf(&opts, None)?;
     let quant_meta = VectorColMetadata::build_ivf(&opts, Some(&config))?;
-    let entry_len = |meta: &VectorColMetadata| {
+    let flat_meta = VectorColMetadata::build_flat(&opts);
+    let entry_len = |meta: &VectorColMetadata, blocks: usize| {
         use crate::vector::storage::blocks::{align_up, block_align, data_entry_len};
         data_entry_len(
             align_up(4 + meta.to_bytes().len(), block_align(&meta.slots()))
-                + 2 * block_len(&meta.slots(), ROWS / 2),
-            2,
+                + blocks * block_len(&meta.slots(), ROWS / blocks),
+            blocks,
         )
     };
-    let expected_growth = entry_len(&quant_meta) - entry_len(&plain_meta);
+    // The quantized field adds its code columns in the cluster blocks, moves the rows into one
+    // ExactRows block, and addresses them with a one-byte identity ExactIdMap.
+    let expected_growth =
+        entry_len(&quant_meta, 2) + entry_len(&flat_meta, 1) + 1 - entry_len(&plain_meta, 2);
     assert!(
-        physical_growth.abs_diff(expected_growth) <= 8,
-        "only composite footer varints may differ"
+        physical_growth >= expected_growth && physical_growth - expected_growth <= 24,
+        "only the two extra composite directory entries may differ: physical {physical_growth} \
+         expected {expected_growth}"
     );
     assert_eq!(logical_growth, ROWS * 508);
     Ok(())
@@ -1935,4 +1970,279 @@ fn layer_zero_io_matches_requested_page_spans() -> crate::Result<()> {
 }
 mod storage_properties {
     include!("storage_properties.rs");
+}
+
+// --- Document-ordered rows ---
+
+/// The vectors of a storage test, one of four one-hot clusters plus a signal; every 11th document
+/// has none.
+fn storage_vectors(docs: usize) -> Vec<Option<Vec<f32>>> {
+    (0..docs)
+        .map(|doc| {
+            if doc % 11 == 4 {
+                return None;
+            }
+            let mut rng = Lcg(doc as u64 * 31 + 7);
+            let mut vector = rng.vector(64, 0.2);
+            vector[doc % 4] += 1.0;
+            Some(vector)
+        })
+        .collect()
+}
+
+fn storage_spec(layout: &str, vectors: &[Option<Vec<f32>>]) -> FixtureSpec {
+    let centroids: Vec<Vec<f32>> = (0..4)
+        .map(|axis| {
+            let mut centroid = vec![0.0; 64];
+            centroid[axis] = 1.0;
+            centroid
+        })
+        .collect();
+    let present: Vec<Vec<f32>> = vectors.iter().flatten().cloned().collect();
+    let absent: Vec<usize> = vectors
+        .iter()
+        .enumerate()
+        .filter_map(|(doc, vector)| vector.is_none().then_some(doc))
+        .collect();
+    // Absent docs are written as docs without a vector, at their own ordinals.
+    let mut dense: Vec<Vec<f32>> = Vec::with_capacity(vectors.len());
+    let mut next = present.iter();
+    for vector in vectors {
+        dense.push(match vector {
+            Some(_) => next.next().unwrap().clone(),
+            None => vec![0.0; 64],
+        });
+    }
+    let spec = match layout {
+        "flat" => FixtureSpec::flat(Metric::L2, 64, dense.into_iter().map(Some).collect()),
+        "plain" => FixtureSpec::ivf(Metric::L2, centroids, dense),
+        "quantized" => FixtureSpec::ivf(Metric::L2, centroids, dense).schedule(&[1, 4]),
+        _ => unreachable!(),
+    };
+    spec.without_vectors(move |ordinal| absent.contains(&ordinal))
+}
+
+/// Every representation returns each document's vector bytes as written: a flat field from its
+/// rows, a plain clustered field from its cluster block, a quantized clustered field from its
+/// document-ordered rows at the location its presence map ranks it to.
+#[test]
+fn document_vector_bytes_agree_across_representations() -> crate::Result<()> {
+    let vectors = storage_vectors(300);
+    for layout in ["flat", "plain", "quantized"] {
+        let fixture = storage_spec(layout, &vectors).build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let mut seen = 0;
+        for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {
+            let reader = segment.vector_index(fixture.field)?;
+            assert_eq!(reader.has_exact_rows(), layout == "quantized", "{layout}");
+            for doc in 0..segment.max_doc() {
+                let ordinal = fixture.ordinal(DocAddress::new(segment_ord as u32, doc))?;
+                let bytes = reader.vector_bytes(doc)?;
+                match &vectors[ordinal] {
+                    None => {
+                        assert!(bytes.is_none(), "{layout} doc {ordinal}");
+                        assert!(!reader.contains(doc)?, "{layout} doc {ordinal}");
+                        assert_eq!(reader.exact_location(doc)?, None, "{layout} doc {ordinal}");
+                    }
+                    Some(expected) => {
+                        let bytes = bytes.expect("present vector");
+                        assert_eq!(
+                            decode_row::<f32>(&bytes, 64)?,
+                            *expected,
+                            "{layout} doc {ordinal}"
+                        );
+                        seen += 1;
+                        let location = reader.row_location(doc)?.expect("located");
+                        match layout {
+                            "quantized" => {
+                                let exact = reader.exact_location(doc)?.expect("exact row");
+                                assert_eq!(reader.vector_bytes_for_row(exact)?, bytes);
+                                let docs =
+                                    reader.cluster_doc_ids(location.block as usize)?.unwrap();
+                                assert_eq!(
+                                    docs[location.row as usize], doc,
+                                    "{layout} primary row"
+                                );
+                            }
+                            "plain" => {
+                                assert_eq!(reader.exact_location(doc)?, None);
+                                assert_eq!(reader.vector_bytes_for_row(location)?, bytes);
+                                assert_eq!(reader.doc_id_at(location)?, doc);
+                            }
+                            _ => {
+                                assert_eq!(reader.exact_location(doc)?, Some(location));
+                                assert_eq!(reader.vector_bytes_for_row(location)?, bytes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(seen, vectors.iter().flatten().count(), "{layout}");
+    }
+    Ok(())
+}
+
+/// The vectors every alive document of `index` resolves to, by ordinal.
+fn vectors_by_ordinal(fixture: &Fixture) -> crate::Result<Vec<(usize, Option<Vec<f32>>)>> {
+    let searcher = fixture.index.reader()?.searcher();
+    let mut out = Vec::new();
+    for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {
+        let reader = segment.vector_index(fixture.field)?;
+        for doc in 0..segment.max_doc() {
+            if segment
+                .alive_bitset()
+                .is_some_and(|alive| !alive.is_alive(doc))
+            {
+                continue;
+            }
+            let ordinal = fixture.ordinal(DocAddress::new(segment_ord as u32, doc))?;
+            let vector = reader
+                .vector_bytes(doc)?
+                .map(|bytes| decode_row::<f32>(&bytes, 64))
+                .transpose()?;
+            out.push((ordinal, vector));
+        }
+    }
+    out.sort_by_key(|(ordinal, _)| *ordinal);
+    Ok(out)
+}
+
+/// Quantized segments round-trip every vector through every merge shape: two quantized segments
+/// into one, a quantized segment with a flat one into one, and a quantized segment alone into a
+/// flat segment once the clustering threshold is out of reach.
+#[test]
+fn quantized_segments_round_trip_through_every_merge_shape() -> crate::Result<()> {
+    let vectors = storage_vectors(260);
+    let expected: Vec<(usize, Option<Vec<f32>>)> = vectors
+        .iter()
+        .cloned()
+        .enumerate()
+        .filter(|(ordinal, _)| ordinal % 61 != 9)
+        .collect();
+    let formats = |fixture: &Fixture| -> crate::Result<Vec<bool>> {
+        let searcher = fixture.index.reader()?.searcher();
+        searcher
+            .segment_readers()
+            .iter()
+            .map(|segment| Ok(segment.vector_index(fixture.field)?.has_exact_rows()))
+            .collect()
+    };
+    for shape in ["quantized+quantized", "quantized+flat", "quantized->flat"] {
+        let spec = storage_spec("quantized", &vectors)
+            .segments(if shape == "quantized+quantized" { 2 } else { 1 })
+            .deletes(&[9, 70, 131, 192, 253]);
+        let mut fixture = spec.build()?;
+        let mut writer: IndexWriter = fixture.index.writer_with_num_threads(1, 30_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        if shape == "quantized+flat" {
+            // Move the last 60 docs into a flat segment of their own: delete them from the
+            // quantized segment and write them again.
+            for ordinal in 200..260 {
+                writer.delete_term(Term::from_field_text(fixture.label, &format!("d{ordinal}")));
+            }
+            writer.commit()?;
+            for (ordinal, vector) in vectors.iter().enumerate().skip(200) {
+                if ordinal % 61 == 9 {
+                    continue;
+                }
+                let mut doc = TantivyDocument::new();
+                doc.add_text(fixture.label, format!("d{ordinal}"));
+                if let Some(vector) = vector {
+                    doc.add_vector(fixture.field, vector.as_slice());
+                }
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+            assert_eq!(
+                formats(&fixture)?.iter().filter(|exact| **exact).count(),
+                1,
+                "{shape}"
+            );
+            assert_eq!(formats(&fixture)?.len(), 2, "{shape}");
+        } else if shape == "quantized->flat" {
+            fixture.index.settings_mut().vector_clustering_threshold = usize::MAX;
+            drop(writer);
+            writer = fixture.index.writer_with_num_threads(1, 30_000_000)?;
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+        }
+        assert_eq!(vectors_by_ordinal(&fixture)?, expected, "{shape} before");
+        writer
+            .merge(&fixture.index.searchable_segment_ids()?)
+            .wait()?;
+        writer.wait_merging_threads()?;
+        let merged = formats(&fixture)?;
+        assert_eq!(merged.len(), 1, "{shape}");
+        assert_eq!(merged[0], shape != "quantized->flat", "{shape}");
+        assert_eq!(vectors_by_ordinal(&fixture)?, expected, "{shape} after");
+        let query = Lcg(99).vector(64, 0.5);
+        let fruit = fixture.search(&AllQuery, &query, 7, routed_exhaustive_params(4))?;
+        assert_eq!(
+            fruit.results,
+            fixture.oracle(&AllQuery, &query, 7)?,
+            "{shape}"
+        );
+    }
+    Ok(())
+}
+
+/// A quantized clustered field whose composite lacks ExactIdMap or ExactRows is corruption at
+/// open.
+#[test]
+fn quantized_field_requires_both_exact_entries() -> crate::Result<()> {
+    use crate::directory::{CompositeFile, CompositeWrite, Directory, RamDirectory};
+    use crate::vector::storage::header::{read_vector_header, HEADER_LEN};
+    for dropped in [VectorEntry::ExactIdMap, VectorEntry::ExactRows] {
+        let directory = RamDirectory::create();
+        let index = build_quantized_fixture_in_directory(
+            QUANT_FIXTURE_DIM,
+            Metric::L2,
+            &[1, 4],
+            true,
+            directory.clone(),
+        )?;
+        let field = index.schema().get_field("embedding")?;
+        let segment = index.searchable_segments()?.remove(0);
+        let path = segment.relative_path(SegmentComponent::Custom(VEC_EXT.into()));
+        let file = segment.open_read(SegmentComponent::Custom(VEC_EXT.into()))?;
+        let (_, body) = read_vector_header(&file)?;
+        let composite = CompositeFile::open(&body)?;
+        let mut rewritten = Vec::new();
+        write_vector_header(&mut rewritten)?;
+        let mut writer = CompositeWrite::wrap(&mut rewritten);
+        for entry in [
+            VectorEntry::Data,
+            VectorEntry::ExactRows,
+            VectorEntry::IdMap,
+            VectorEntry::ExactIdMap,
+        ] {
+            if entry == dropped {
+                continue;
+            }
+            let bytes = composite
+                .open_read_with_idx(field, entry.index())
+                .expect("entry")
+                .read_bytes()?;
+            if matches!(entry, VectorEntry::Data | VectorEntry::ExactRows) {
+                writer.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
+            }
+            writer
+                .for_field_with_idx(field, entry.index())
+                .write_all(&bytes)?;
+        }
+        writer.close()?;
+        directory
+            .delete(&path)
+            .map_err(|error| TantivyError::InternalError(error.to_string()))?;
+        let mut write = segment.open_write(SegmentComponent::Custom(VEC_EXT.into()))?;
+        write.write_all(&rewritten)?;
+        write.terminate()?;
+        let reader = crate::SegmentReader::open(&segment)?;
+        let error = reader.vector_index(field).err().expect("missing entry");
+        assert!(
+            matches!(error, TantivyError::DataCorruption(_)),
+            "{dropped:?}: {error:?}"
+        );
+    }
+    Ok(())
 }

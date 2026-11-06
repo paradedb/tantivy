@@ -309,7 +309,7 @@ impl VectorIndexReader {
             let (doc_id, address) = candidates[candidate];
             let (cluster, row) = (address.block as usize, address.row as usize);
             let values = decode_row::<f32>(
-                &self.vector_bytes_for_row(BlockAddress::new(cluster as u32, row as u32))?,
+                &self.cluster_row_bytes(cluster, row, doc_id)?,
                 self.options.dim(),
             )?;
             queries.push(VectorEstimatorQuery {
@@ -450,8 +450,7 @@ impl VectorIndexReader {
                 sampled += 1;
                 next_sample_ordinal = sampled * live_row_count / target_rows;
 
-                let vector_bytes =
-                    self.vector_bytes_for_row(BlockAddress::new(cluster as u32, row as u32))?;
+                let vector_bytes = self.cluster_row_bytes(cluster, row, row_doc)?;
                 let values = decode_row::<f32>(&vector_bytes, self.options.dim())?;
                 let residual: Vec<f32> = values
                     .iter()
@@ -767,8 +766,7 @@ impl VectorIndexReader {
                     if alive.is_some_and(|alive| !alive.is_alive(doc)) {
                         continue;
                     }
-                    let bytes =
-                        self.vector_bytes_for_row(BlockAddress::new(cluster as u32, row as u32))?;
+                    let bytes = self.cluster_row_bytes(cluster, row, doc)?;
                     let exact_score = exact_query.score_row(&bytes).score();
                     match exact_by_doc.entry(doc) {
                         std::collections::btree_map::Entry::Vacant(entry) => {

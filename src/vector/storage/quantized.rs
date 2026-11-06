@@ -91,16 +91,31 @@ pub(crate) fn exact_read_cost(
     let Some(offsets) = offsets else {
         return range_cost(column, 0..rows * stride, column.storage_block_len());
     };
+    rows_read_cost(
+        column,
+        stride,
+        offsets.iter().map(|&offset| offset as usize),
+        offsets.len(),
+    )
+}
+
+/// The cost of reading `count` full-precision rows of `stride` bytes at ascending local `rows` of
+/// one block's `column`: the distinct storage blocks they touch, or their bytes without block
+/// geometry.
+pub(crate) fn rows_read_cost(
+    column: &FileSlice,
+    stride: usize,
+    rows: impl Iterator<Item = usize>,
+    count: usize,
+) -> ReadCost {
     if column.storage_block_len().is_none() {
-        return ReadCost(offsets.len() * stride);
+        return ReadCost(count * stride);
     }
     // Ascending rows: a block counts once, when it lies past the last block counted.
     let mut blocks = 0usize;
     let mut next = 0usize;
-    for &offset in offsets {
-        let offset = offset as usize;
-        let Some((first, last)) =
-            storage_block_span(column, offset * stride..(offset + 1) * stride)
+    for row in rows {
+        let Some((first, last)) = storage_block_span(column, row * stride..(row + 1) * stride)
         else {
             continue;
         };
@@ -368,7 +383,7 @@ pub(crate) fn validate_decoded_sidecar(
 }
 
 /// Splits strictly increasing `rows` into maximal runs of consecutive rows.
-fn push_consecutive_runs(rows: &[usize], read_ranges: &mut Vec<Range<usize>>) {
+pub(crate) fn push_consecutive_runs(rows: &[usize], read_ranges: &mut Vec<Range<usize>>) {
     debug_assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
     let Some(&first) = rows.first() else { return };
     let mut start = first;
@@ -1069,14 +1084,21 @@ mod tests {
             FileSlice::from(out)
         };
         let blocks = Arc::new(Blocks::open(entry, &opts, true).unwrap());
+        let position = |wanted: fn(&SlotType) -> bool| {
+            slots
+                .iter()
+                .position(|slot| wanted(&slot.slot_type))
+                .expect("layer column")
+        };
         QuantizedLayerReader {
             blocks,
             layer: 0,
-            codes: 3,
-            scales: 4,
-            gammas: 5,
-            errors: 6,
-            constants: constants.map(|_| 7),
+            codes: position(|slot| matches!(slot, SlotType::QuantLayerCodes { .. })),
+            scales: position(|slot| matches!(slot, SlotType::QuantLayerScales { .. })),
+            gammas: position(|slot| matches!(slot, SlotType::QuantLayerGammas { .. })),
+            errors: position(|slot| matches!(slot, SlotType::QuantLayerErrors { .. })),
+            constants: constants
+                .map(|_| position(|slot| matches!(slot, SlotType::QuantLayerConstants { .. }))),
             code_stride: stride,
             dim,
             bits,
@@ -1110,9 +1132,9 @@ mod tests {
             .collect()
     }
 
-    // Rows and layer bands each pin their own columns with one request.
+    // Document ids and layer bands each pin their own columns with one request.
     #[test]
-    fn rows_and_layer_spans_read_once_per_block() -> crate::Result<()> {
+    fn doc_ids_and_layer_spans_read_once_per_block() -> crate::Result<()> {
         let reads = Arc::new(Mutex::new(Vec::new()));
         let layer = test_layer_tracked(
             FileSlice::from(Vec::new()),
@@ -1125,10 +1147,11 @@ mod tests {
         );
         let block = layer.blocks.block(0)?;
         reads.lock().unwrap().clear();
-        let rows = block.read_column(0, 0..3)?;
-        assert_eq!(rows.len(), 3 * 64 * 4);
+        let docs = block.read_column(0, 0..3)?;
+        assert_eq!(docs.len(), 3 * std::mem::size_of::<u32>());
         let start = block.column_range(0).start;
-        assert_eq!(&*reads.lock().unwrap(), &[start..start + rows.len()]);
+        let doc_ids = start..start + docs.len();
+        assert_eq!(&*reads.lock().unwrap(), std::slice::from_ref(&doc_ids));
         reads.lock().unwrap().clear();
         layer.read_batch_from_block(&block, 0..3)?;
         assert_eq!(&*reads.lock().unwrap(), &[block.band_range(0)]);
