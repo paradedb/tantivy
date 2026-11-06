@@ -1642,6 +1642,21 @@ impl VectorFieldReader {
 }
 
 impl VectorIndexReader {
+    /// Stored IVF centroids in cluster order and the original vector coordinates.
+    /// Flat segments return `None`.
+    pub fn cluster_centroids(&self) -> crate::Result<Option<Vec<Vec<f32>>>> {
+        let Some(index) = &self.index else {
+            return Ok(None);
+        };
+        let bytes = index.centroid_bytes()?;
+        let dim = self.options.dim();
+        bytes
+            .chunks_exact(dim * std::mem::size_of::<f32>())
+            .map(|row| decode_row::<f32>(row, dim))
+            .collect::<crate::Result<Vec<_>>>()
+            .map(Some)
+    }
+
     fn open(field: &VectorFieldReader) -> crate::Result<Self> {
         let options = field.options.clone();
         let Some(source) = &field.source else {

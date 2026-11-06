@@ -438,7 +438,9 @@ impl LayerProbeStatsSet {
 
 impl serde::Serialize for LayerProbeStatsSet {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: serde::Serializer {
+    where
+        S: serde::Serializer,
+    {
         use serde::ser::SerializeMap;
 
         let mut map = serializer.serialize_map(None)?;
@@ -489,7 +491,9 @@ where
 }
 
 fn serialize_rerank_io<S>(io: &super::VectorIoStats, serializer: S) -> Result<S::Ok, S::Error>
-where S: serde::Serializer {
+where
+    S: serde::Serializer,
+{
     use serde::ser::SerializeMap;
 
     let mut map = serializer.serialize_map(Some(3))?;
@@ -4573,6 +4577,52 @@ mod tests {
     /// — the invariant `paradedb.ivf_cluster_sizes` relies on to reconcile
     /// with `paradedb.index_info`. Flat segments expose no sizes.
     #[test]
+    fn ivf_cluster_exports_preserve_centroids_and_memberships() -> crate::Result<()> {
+        let expected = [[0.0, 0.0], [6.0, 0.0], [0.0, 6.0], [6.0, 6.0]];
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .metric(Metric::L2)
+            .centroids(&expected)
+            .vector_storage_format(VectorStorageFormat::Ivf)
+            .build()?;
+        let searcher = index.index.reader()?.searcher();
+        for segment in searcher.segment_readers() {
+            let reader = segment.vector_index(index.embedding_field())?;
+            let centroids = reader.cluster_centroids()?.unwrap();
+            assert_eq!(centroids.len(), expected.len());
+            for centroid in &expected {
+                assert!(centroids.iter().any(|export| export.as_slice() == centroid));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for (cluster, centroid) in centroids.iter().enumerate() {
+                let docs = reader.cluster_doc_ids(cluster)?.unwrap();
+                assert_eq!(
+                    docs.len(),
+                    reader.cluster_sizes().unwrap()[cluster] as usize
+                );
+                for doc in docs {
+                    assert!(seen.insert(doc));
+                    let vector = crate::vector::ivf::decode_row::<f32>(
+                        &reader.vector_bytes(doc)?.unwrap(),
+                        2,
+                    )?;
+                    let distance = |center: &[f32]| {
+                        vector
+                            .iter()
+                            .zip(center)
+                            .map(|(x, c)| (x - c).powi(2))
+                            .sum::<f32>()
+                    };
+                    assert!(centroids
+                        .iter()
+                        .all(|other| distance(centroid) <= distance(other)));
+                }
+            }
+            assert_eq!(seen.len(), reader.num_vectors());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn ivf_cluster_sizes_match_vector_info() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
             .metric(Metric::L2)
@@ -4629,6 +4679,10 @@ mod tests {
         let flat_field = flat.embedding_field();
         let flat_searcher = flat.index.reader()?.searcher();
         for segment_reader in flat_searcher.segment_readers() {
+            assert!(segment_reader
+                .vector_index(flat_field)?
+                .cluster_centroids()?
+                .is_none());
             assert!(
                 segment_reader
                     .vector_index(flat_field)?
