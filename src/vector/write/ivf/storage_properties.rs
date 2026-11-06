@@ -155,9 +155,13 @@ fn vector_read_kinds_follow_data_for_dense_and_sparse_access() -> crate::Result<
         searcher.segment_readers()[0].vector_index(index.schema().get_field("embedding")?)?;
     let rows = 0..vectors.index().unwrap().cluster_num_rows(2)?;
     let layers = vectors.quantization()?.unwrap().layers();
+    let mut docs = Vec::new();
+    vectors.read_doc_ids(2, &mut docs)?;
     directory.read_kinds.lock().unwrap().clear();
 
-    vectors.read_cluster_rows(2)?;
+    let mut scratch = crate::vector::storage::quantized::ReadScratch::default();
+    let exact = vectors.read_exact_docs(&docs, &mut scratch)?;
+    let exact_chunks = exact.iter().count().min(scratch.chunks.len());
     vectors.read_doc_ids(2, &mut Vec::new())?;
     layers[0].read_batch(2, rows.clone())?;
     layers[1].read_batch(2, rows.clone())?;
@@ -168,29 +172,28 @@ fn vector_read_kinds_follow_data_for_dense_and_sparse_access() -> crate::Result<
         .quantization()?
         .unwrap()
         .read_residual_norms(2, rows.start..rows.start + 1)?;
-    let mut scratch = crate::vector::storage::quantized::ReadScratch::default();
-    scratch.rows.push(rows.start);
-    vectors.read_vector_rows_planned(2, &mut scratch)?;
-    assert_eq!(
-        *directory.read_kinds.lock().unwrap(),
-        [
-            VectorReadKind::Other, // Block offsets before the full-precision column.
-            VectorReadKind::FullPrecision,
-            VectorReadKind::Other, // Block offsets before DocIds.
-            VectorReadKind::Other,
-            VectorReadKind::Other, // Block offsets before each band's payload.
-            VectorReadKind::QuantizedLayer(0),
-            VectorReadKind::Other,
-            VectorReadKind::QuantizedLayer(1),
-            VectorReadKind::Other, // The sparse reader reuses this block for codes and sidecars.
-            VectorReadKind::QuantizedLayer(1),
-            VectorReadKind::QuantizedLayer(1),
-            VectorReadKind::Other,
-            VectorReadKind::QuantizedLayer(0),
-            VectorReadKind::Other,
-            VectorReadKind::FullPrecision,
-        ]
-    );
+    vectors.read_exact_docs(&docs[..1], &mut scratch)?;
+    // ExactRows are addressed within their contiguous entry: no offsets read precedes them.
+    let mut expected = Vec::new();
+    expected.extend(std::iter::repeat_n(
+        VectorReadKind::FullPrecision,
+        exact_chunks,
+    ));
+    expected.extend([
+        VectorReadKind::Other, // Block offsets before DocIds.
+        VectorReadKind::Other,
+        VectorReadKind::Other, // Block offsets before each band's payload.
+        VectorReadKind::QuantizedLayer(0),
+        VectorReadKind::Other,
+        VectorReadKind::QuantizedLayer(1),
+        VectorReadKind::Other, // The sparse reader reuses this block for codes and sidecars.
+        VectorReadKind::QuantizedLayer(1),
+        VectorReadKind::QuantizedLayer(1),
+        VectorReadKind::Other,
+        VectorReadKind::QuantizedLayer(0),
+        VectorReadKind::FullPrecision, // One document's row, addressed within ExactRows.
+    ]);
+    assert_eq!(*directory.read_kinds.lock().unwrap(), expected);
     assert_eq!(current_vector_read_kind(), VectorReadKind::Other);
     Ok(())
 }
@@ -251,9 +254,13 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
     );
     for cluster in 0..ivf.num_clusters() {
         let rows = 0..ivf.cluster_num_rows(cluster)?;
-        let row_bytes = vectors.read_cluster_rows(cluster)?;
         let mut docs = Vec::new();
         vectors.read_doc_ids(cluster, &mut docs)?;
+        // The rows live in ExactRows, by document; the cluster block holds their codes.
+        let row_bytes: Vec<u8> = docs
+            .iter()
+            .flat_map(|&doc| vectors.vector_bytes(doc).unwrap().unwrap().to_vec())
+            .collect();
         let centroid = floats(&centroids[cluster * DIM * 4..(cluster + 1) * DIM * 4]);
         let prepared = quant::cascade::prepare_centroid(&centroid, &ctx.specs);
         let mut values = floats(&row_bytes);
@@ -283,8 +290,9 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                 Some(BlockAddress::new(cluster as u32, row as u32)),
                 "cluster={cluster} row={local} column=DocLocations"
             );
+            let exact = vectors.exact_location(doc)?.expect("exact row");
             assert_eq!(
-                vectors.vector_bytes(doc)?.unwrap().as_slice(),
+                vectors.vector_bytes_for_row(exact)?.as_slice(),
                 &row_bytes[local * DIM * 4..(local + 1) * DIM * 4],
                 "cluster={cluster} row={local} column=Rows locate"
             );
@@ -778,10 +786,19 @@ fn diagnostics_skip_empty_clusters() -> crate::Result<()> {
     Ok(())
 }
 
+/// A plain source maps target documents through its cluster DocIds columns, reading nothing else;
+/// a quantized source maps them through its document-ordered rows and reads no cluster column.
 #[test]
 fn merge_source_addresses_read_only_document_columns() -> crate::Result<()> {
+    for schedule in [&[][..], &[1, 4][..]] {
+        merge_source_addresses_case(schedule)?;
+    }
+    Ok(())
+}
+
+fn merge_source_addresses_case(schedule: &[u8]) -> crate::Result<()> {
     use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
-    let (index, directory) = fixture(Metric::Cosine, &[1, 4])?;
+    let (index, directory) = fixture(Metric::Cosine, schedule)?;
     let reader = index.reader()?;
     let searcher = reader.searcher();
     let segments = searcher.segment_readers();
@@ -812,25 +829,45 @@ fn merge_source_addresses_read_only_document_columns() -> crate::Result<()> {
     directory.reads.lock().unwrap().clear();
     let rows = crate::vector::write::merge_source_rows(&context, &[Arc::clone(&vectors)])?;
     let reads = directory.reads.lock().unwrap().clone();
-    let expected: Vec<_> = ranges.into_iter().flatten().collect();
+    let expected: Vec<_> = if schedule.is_empty() {
+        ranges.into_iter().flatten().collect()
+    } else {
+        Vec::new()
+    };
     assert_eq!(
         reads
             .iter()
             .map(|(_, range)| range.clone())
             .filter(|range| !offsets.contains(range))
             .collect::<Vec<_>>(),
-        expected
+        expected,
+        "{schedule:?}"
     );
     assert_eq!(rows.len(), docs.len());
     for (source, target) in rows.into_iter().zip(docs) {
         match source {
             Some(source) => {
                 assert_eq!(source.segment_ord, 0);
+                if schedule.is_empty() {
+                    assert_eq!(
+                        vectors.doc_id_at(source.block_address)?,
+                        target.doc_id,
+                        "row={} column=DocIds",
+                        source.block_address.row
+                    );
+                } else {
+                    assert_eq!(
+                        vectors.exact_location(target.doc_id)?,
+                        Some(source.block_address),
+                        "doc={} ExactRows",
+                        target.doc_id
+                    );
+                }
                 assert_eq!(
-                    vectors.doc_id_at(source.block_address)?,
-                    target.doc_id,
-                    "row={} column=DocIds",
-                    source.block_address.row
+                    vectors.vector_bytes_for_row(source.block_address)?,
+                    vectors.vector_bytes(target.doc_id)?.unwrap(),
+                    "doc={}",
+                    target.doc_id
                 );
             }
             None => assert!(!vectors.contains(target.doc_id)?),

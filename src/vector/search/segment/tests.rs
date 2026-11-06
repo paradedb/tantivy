@@ -684,6 +684,9 @@ fn assert_case(
     if !matches!(representation, Representation::Quantized(_)) {
         return Ok(fruit.stats);
     }
+    // The IVF-exact scan reads every admitted row from the document-ordered rows.
+    let exact_scan = fixture.search_levels(filter, query, k, params.clone(), 0)?;
+    assert_eq!(exact_scan.results, oracle, "{case} levels=0");
     for (name, forced) in forced_plans() {
         let (hits, stats) = forced_top_k(fixture, filter, query, k, params, forced)?;
         assert_eq!(hits, oracle, "{case} forced={name}");
@@ -1193,7 +1196,9 @@ fn filtered_cluster_reads_only_doc_ids() -> crate::Result<()> {
 }
 
 /// Filtered clusters read their DocIds column before any payload, and clusters without a match
-/// read nothing more; at full precision the survivor's row is the only payload read.
+/// read nothing more; at full precision the survivor's row is the only payload read, and on
+/// quantized storage the survivor's cluster reads its DocIds before its band and its row from the
+/// document-ordered rows.
 fn filtered_clusters_read_doc_ids_before_payload() -> crate::Result<()> {
     for schedule in [&[][..], &[1, 4][..]] {
         let fixture = reads_fixture(Metric::L2, schedule, &[])?;
@@ -1215,12 +1220,59 @@ fn filtered_clusters_read_doc_ids_before_payload() -> crate::Result<()> {
         });
         for cluster in [2, 3] {
             let docs = ranges.docs[cluster].as_ref().unwrap();
-            let rows = ranges.rows[cluster].as_ref().unwrap();
+            let rows = ranges.rows[cluster].as_ref();
+            let band = ranges.bands[cluster].as_ref();
             let reads: Vec<_> = scans
                 .iter()
-                .filter(|range| overlaps(range, docs) || overlaps(range, rows))
+                .filter(|range| {
+                    overlaps(range, docs)
+                        || rows.is_some_and(|rows| overlaps(range, rows))
+                        || band.is_some_and(|band| overlaps(range, band))
+                })
                 .collect();
             assert_eq!(reads, vec![&docs], "{schedule:?} cluster={cluster}");
+        }
+        if !schedule.is_empty() {
+            // Doc 0 is cluster 1's only row: its DocIds read precedes its band read, and its
+            // exact score reads from the document-ordered rows, never from the cluster block.
+            let docs = ranges.docs[1].as_ref().unwrap();
+            let band = ranges.bands[1].as_ref().unwrap();
+            let docs_at = log
+                .iter()
+                .position(|(_, read)| read == docs)
+                .expect("DocIds read");
+            let band_at = log
+                .iter()
+                .position(|(_, read)| overlaps(read, band))
+                .expect("band read");
+            assert!(docs_at < band_at, "{schedule:?}: DocIds before the band");
+            let exact = ranges.exact.as_ref().unwrap();
+            let exact_reads: Vec<_> = stage_reads(&log, |stage| {
+                matches!(stage, VectorStage::ExactFetch | VectorStage::ExactScore)
+            })
+            .into_iter()
+            .filter(|range| {
+                !ranges.block_offsets.contains(range)
+                    && !ranges.docs.iter().flatten().any(|docs| docs == *range)
+            })
+            .collect();
+            assert!(
+                !exact_reads.is_empty(),
+                "{schedule:?}: the survivor's row is read"
+            );
+            assert!(
+                exact_reads.iter().all(|range| {
+                    range.start >= exact.start
+                        && range.end <= exact.end
+                        && ranges
+                            .docs
+                            .iter()
+                            .flatten()
+                            .chain(ranges.bands.iter().flatten())
+                            .all(|column| !overlaps(range, column))
+                }),
+                "{schedule:?}: exact reads stay in ExactRows"
+            );
         }
         if schedule.is_empty() {
             let mut expected: Vec<_> = ranges.docs.iter().flatten().collect();
@@ -1241,10 +1293,13 @@ fn filtered_clusters_read_doc_ids_before_payload() -> crate::Result<()> {
     Ok(())
 }
 
-/// With no filter and no deletes, DocIds are read only for competitive exact scores.
+/// With no filter and no deletes, a cluster's DocIds are read once, in the exact phase, only when
+/// a survivor of it is scored exactly, right before its rows are read from the document-ordered
+/// rows.
 fn open_gate_reads_doc_ids_only_for_competitive_survivors() -> crate::Result<()> {
     let fixture = reads_fixture(Metric::L2, &[1, 4], &[])?;
     let ranges = fixture.column_ranges()?;
+    let exact = ranges.exact.as_ref().unwrap();
     let query = reads_vector(42);
     fixture.clear_reads();
     let open = fixture.search(&AllQuery, &query, 3, every_cluster())?;
@@ -1269,8 +1324,8 @@ fn open_gate_reads_doc_ids_only_for_competitive_survivors() -> crate::Result<()>
             .iter()
             .filter(|(stage, read)| *stage == VectorStage::ExactFetch && read == range)
             .count();
-        assert!(
-            fetched <= expected,
+        assert_eq!(
+            fetched, expected,
             "cluster={cluster} DocIds exact-phase reads"
         );
         if open
@@ -1286,12 +1341,15 @@ fn open_gate_reads_doc_ids_only_for_competitive_survivors() -> crate::Result<()>
             "cluster={cluster} DocIds reads outside the exact phase"
         );
         if let Some(position) = log.iter().position(|(_, read)| read == range) {
-            let rows = ranges.rows[cluster].as_ref().unwrap();
+            let next = log[position + 1..]
+                .iter()
+                .find(|(_, read)| !ranges.block_offsets.contains(read))
+                .expect("the survivors' rows follow their DocIds");
             assert!(
-                log[..position].iter().any(|(stage, read)| {
-                    *stage == VectorStage::ExactFetch && overlaps(read, rows)
-                }),
-                "cluster={cluster} DocIds read before its vectors"
+                next.0 == VectorStage::ExactFetch
+                    && next.1.start >= exact.start
+                    && next.1.end <= exact.end,
+                "cluster={cluster}: DocIds then the document-ordered rows, got {next:?}"
             );
         }
     }
@@ -1347,11 +1405,16 @@ fn all_dead_cluster_reads_only_doc_ids() -> crate::Result<()> {
         assert_eq!(stats.postings_row, 2, "{schedule:?}: {stats:?}");
         assert_identities(stats, "all dead");
         let docs = ranges.docs[1].as_ref().unwrap();
-        let rows = ranges.rows[1].as_ref().unwrap();
+        let rows = ranges.rows[1].as_ref();
+        let band = ranges.bands[1].as_ref();
         let cluster_reads: Vec<_> = fixture
             .reads()
             .into_iter()
-            .filter(|(_, range)| overlaps(range, docs) || overlaps(range, rows))
+            .filter(|(_, range)| {
+                overlaps(range, docs)
+                    || rows.is_some_and(|rows| overlaps(range, rows))
+                    || band.is_some_and(|band| overlaps(range, band))
+            })
             .map(|(_, range)| range)
             .collect();
         assert_eq!(cluster_reads, vec![docs.clone()], "{schedule:?}");
@@ -1731,13 +1794,208 @@ fn located_path_charges_the_work_meter() -> crate::Result<()> {
     Ok(())
 }
 
+/// Every exact read of a quantized segment lands in the document-ordered rows: no cluster block
+/// byte is read in the exact stages beyond DocIds columns and block addresses.
+fn quantized_exact_reads_touch_only_the_document_ordered_rows() -> crate::Result<()> {
+    for schedule in [&[1][..], &[1, 4][..]] {
+        let fixture = reads_fixture(Metric::L2, schedule, &[])?;
+        let ranges = fixture.column_ranges()?;
+        let exact = ranges
+            .exact
+            .as_ref()
+            .expect("quantized storage has exact rows");
+        assert!(ranges.rows.iter().all(Option::is_none), "{schedule:?}");
+        let query = reads_vector(42);
+        fixture.clear_reads();
+        let fruit = fixture.search(&AllQuery, &query, 3, every_cluster())?;
+        assert_eq!(fruit.results, fixture.oracle(&AllQuery, &query, 3)?);
+        let stats = &fruit.stats[0];
+        assert!(stats.exact_rows > 0, "{schedule:?}: {stats:?}");
+        let log = fixture.reads();
+        let reads: Vec<_> = stage_reads(&log, |stage| {
+            matches!(stage, VectorStage::ExactFetch | VectorStage::ExactScore)
+        })
+        .into_iter()
+        .filter(|range| {
+            !ranges.block_offsets.contains(range)
+                && !ranges.docs.iter().flatten().any(|docs| docs == *range)
+        })
+        .collect();
+        assert!(!reads.is_empty(), "{schedule:?}");
+        for range in &reads {
+            assert!(
+                range.start >= exact.start && range.end <= exact.end,
+                "{schedule:?}: exact read {range:?} outside ExactRows {exact:?}"
+            );
+            assert!(
+                ranges
+                    .bands
+                    .iter()
+                    .flatten()
+                    .all(|band| !overlaps(range, band)),
+                "{schedule:?}: exact read {range:?} touched a cluster block"
+            );
+        }
+        // Every request of the exact stages, DocIds columns and block addresses included, is
+        // charged to the exact IO.
+        assert_eq!(
+            stats.exact_io.reads as usize,
+            stage_reads(&log, |stage| {
+                matches!(stage, VectorStage::ExactFetch | VectorStage::ExactScore)
+            })
+            .len(),
+            "{schedule:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A plain clustered segment reads its exact rows from the cluster block that holds them.
+fn plain_exact_reads_touch_the_cluster_block() -> crate::Result<()> {
+    let fixture = reads_fixture(Metric::L2, &[], &[])?;
+    let ranges = fixture.column_ranges()?;
+    assert!(ranges.exact.is_none());
+    let query = reads_vector(42);
+    fixture.clear_reads();
+    let fruit = fixture.search(&AllQuery, &query, 3, every_cluster())?;
+    assert_eq!(fruit.results, fixture.oracle(&AllQuery, &query, 3)?);
+    let log = fixture.reads();
+    let reads: Vec<_> = stage_reads(&log, |stage| {
+        matches!(
+            stage,
+            VectorStage::ExactScan | VectorStage::ExactFetch | VectorStage::ExactScore
+        )
+    })
+    .into_iter()
+    .filter(|range| {
+        !ranges.block_offsets.contains(range)
+            && !ranges.docs.iter().flatten().any(|docs| docs == *range)
+    })
+    .collect();
+    assert!(!reads.is_empty());
+    for range in &reads {
+        assert!(
+            ranges
+                .rows
+                .iter()
+                .flatten()
+                .any(|rows| range.start >= rows.start && range.end <= rows.end),
+            "exact read {range:?} outside every cluster's rows"
+        );
+    }
+    Ok(())
+}
+
+/// Pricing a V6 quantized batch's exact leg reads nothing: the documents' rows are arithmetic
+/// within the contiguous document-ordered entry. Its exact read is one range per run of
+/// consecutive rows.
+fn exact_pricing_and_reads_are_arithmetic() -> crate::Result<()> {
+    let deletes = [101usize, 202];
+    let fixture = reads_fixture(Metric::L2, &[1], &deletes)?;
+    let ranges = fixture.column_ranges()?;
+    let exact = ranges
+        .exact
+        .clone()
+        .expect("quantized storage has exact rows");
+    let stride = READS_DIM * 4;
+    let in_exact = |read: &Range<usize>| read.start >= exact.start && read.end <= exact.end;
+    let known = |read: &Range<usize>| {
+        ranges.block_offsets.contains(read)
+            || ranges.docs.iter().flatten().any(|docs| docs == read)
+            || ranges
+                .bands
+                .iter()
+                .flatten()
+                .any(|band| overlaps(read, band))
+            || in_exact(read)
+    };
+    let scan_stage = |stage: VectorStage| {
+        matches!(
+            stage,
+            VectorStage::LayerScan(_) | VectorStage::ExactFetch | VectorStage::ExactScore
+        )
+    };
+    let query = reads_vector(42);
+    let oracle = fixture.oracle(&AllQuery, &query, 3)?;
+
+    // Dead rows close the gate, so every cluster's documents are in hand and its exact leg is
+    // priced on them: nothing is read for geometry.
+    let params = ProbeParams {
+        exact_plan: true,
+        ..every_cluster()
+    };
+    fixture.clear_reads();
+    let fruit = fixture.search(&AllQuery, &query, 3, params)?;
+    let log = fixture.reads();
+    assert_eq!(fruit.results, oracle);
+    for (stage, read) in log {
+        if scan_stage(stage) {
+            assert!(
+                known(&read),
+                "{stage:?} read {read:?} outside DocIds, bands, block offsets and exact rows"
+            );
+        }
+    }
+
+    // Every cluster read exactly: its live rows, one read per run of consecutive rows.
+    fixture.clear_reads();
+    let (hits, _) = forced_top_k(
+        &fixture,
+        &AllQuery,
+        &query,
+        3,
+        &every_cluster(),
+        PlanOverride::exact(|_, _| true),
+    )?;
+    let log = fixture.reads();
+    assert_eq!(hits, oracle);
+    for (stage, read) in &log {
+        if scan_stage(*stage) {
+            assert!(
+                known(read),
+                "{stage:?} read {read:?} outside the known columns"
+            );
+        }
+    }
+    let mut exact_reads: Vec<Range<usize>> = log
+        .iter()
+        .map(|(_, read)| read.clone())
+        .filter(in_exact)
+        .collect();
+    let row_of = |doc: DocId| (0..doc as usize).filter(|&d| has_vector(d)).count();
+    let mut expected = Vec::new();
+    for docs in fixture.cluster_docs(0)? {
+        let rows: Vec<usize> = docs
+            .iter()
+            .filter(|&&doc| !deletes.contains(&(doc as usize)))
+            .map(|&doc| row_of(doc))
+            .collect();
+        let mut start = 0;
+        while start < rows.len() {
+            let mut end = start + 1;
+            while end < rows.len() && rows[end] == rows[end - 1] + 1 {
+                end += 1;
+            }
+            expected.push(
+                exact.start + rows[start] * stride..exact.start + (rows[end - 1] + 1) * stride,
+            );
+            start = end;
+        }
+    }
+    exact_reads.sort_by_key(|read| (read.start, read.end));
+    expected.sort_by_key(|read| (read.start, read.end));
+    assert!(!expected.is_empty());
+    assert_eq!(exact_reads, expected);
+    Ok(())
+}
+
 /// One named row of the reads table.
 type ReadCase = (&'static str, fn() -> crate::Result<()>);
 
 /// Every plan reads only what it needs, in the documented order.
 #[test]
 fn reads_follow_the_plan() -> crate::Result<()> {
-    let cases: [ReadCase; 12] = [
+    let cases: [ReadCase; 15] = [
         (
             "an empty cluster skips its band",
             empty_cluster_skips_its_band,
@@ -1785,6 +2043,19 @@ fn reads_follow_the_plan() -> crate::Result<()> {
         (
             "the located path reads no DocIds",
             located_path_reads_no_doc_ids,
+        ),
+        (
+            "pricing a V6 quantized batch's exact leg issues no reads; its exact read issues one \
+             range per run of consecutive rows",
+            exact_pricing_and_reads_are_arithmetic,
+        ),
+        (
+            "a quantized exact read touches ExactRows, never the cluster block",
+            quantized_exact_reads_touch_only_the_document_ordered_rows,
+        ),
+        (
+            "a plain exact read touches the cluster block",
+            plain_exact_reads_touch_the_cluster_block,
         ),
     ];
     for (name, case) in cases {
@@ -1882,6 +2153,42 @@ fn ann_reads_offsets_only_for_probed_clusters() -> crate::Result<()> {
                 offsets.iter().all(|r| allowed.contains(r)),
                 "schedule={schedule:?}: {offsets:?}"
             );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn zz_probe_layer0_reads() -> crate::Result<()> {
+    for schedule in [&[1, 1][..]] {
+        let fixture = reads_fixture(Metric::Cosine, schedule, &[])?;
+        let ranges = fixture.column_ranges()?;
+        let query = reads_vector(42);
+        let params = ProbeParams {
+            max_probe_fraction: 1.0,
+            min_probe_clusters: 1,
+            ..Default::default()
+        };
+        fixture.clear_reads();
+        let fruit = fixture.search(&AllQuery, &query, 1, params)?;
+        eprintln!("stats: {:?}", fruit.stats[0].layers.get(0));
+        for (stage, read) in fixture.reads() {
+            let what = if ranges.block_offsets.contains(&read) {
+                "block-offsets"
+            } else if ranges.docs.iter().flatten().any(|d| d == &read) {
+                "docids"
+            } else if ranges.bands.iter().flatten().any(|b| overlaps(&read, b)) {
+                "band"
+            } else if ranges
+                .exact
+                .as_ref()
+                .is_some_and(|e| read.start >= e.start && read.end <= e.end)
+            {
+                "exact"
+            } else {
+                "OTHER"
+            };
+            eprintln!("{stage:?} {read:?} len={} {what}", read.len());
         }
     }
     Ok(())
