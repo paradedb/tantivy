@@ -30,16 +30,18 @@ use crate::TantivyError;
 /// ~2x `k` member beam, 100% cap). Each level uses `nlist = ceil(sqrt(n))`;
 /// parents are added while the top has at least 256 lists. The config is
 /// not persisted, so open must agree with build only on what search reads.
-fn router_config() -> StackedIvfConfig {
+pub(super) fn router_config() -> StackedIvfConfig {
     StackedIvfConfig {
         nprobe_fraction: PARENT_NPROBE_FRACTION,
     }
 }
 
+/// Builds the stack and reorders `centroids` into router order; also returns that permutation,
+/// `perm[old] = new`.
 pub(super) fn build(
     options: &VectorOptions,
     centroids: &mut IvfCentroids,
-) -> crate::Result<StackedIvf<InMemoryStore>> {
+) -> crate::Result<(StackedIvf<InMemoryStore>, Vec<u32>)> {
     let IvfCentroids::F32(matrix) = &*centroids;
     let clusterer = SuperKMeansLevelClusterer::for_metric(options.metric());
     let (index, permutation) = StackedIvfBuilder::new(
@@ -72,7 +74,7 @@ pub(super) fn build(
             .copy_from_slice(&matrix.values[old * matrix.dims..(old + 1) * matrix.dims]);
     }
     matrix.values = values;
-    Ok(index)
+    Ok((index, permutation))
 }
 
 pub(super) fn open(
@@ -102,12 +104,22 @@ impl StackedRouter<InMemoryStore> {
         centroids: &mut IvfCentroids,
         compressed: bool,
     ) -> crate::Result<Self> {
+        Ok(Self::build_with_permutation(options, centroids, compressed)?.0)
+    }
+
+    /// [`Self::build`], also returning how it reordered `centroids`: `perm[old] = new`.
+    pub(crate) fn build_with_permutation(
+        options: &VectorOptions,
+        centroids: &mut IvfCentroids,
+        compressed: bool,
+    ) -> crate::Result<(Self, Vec<u32>)> {
         if options.dim() == 0 || options.dim() > u32::MAX as usize {
             return Err(TantivyError::InvalidArgument(
                 "routing requires a positive supported dimension".into(),
             ));
         }
-        Self::from_index(build(options, centroids)?, options, compressed)
+        let (index, permutation) = build(options, centroids)?;
+        Ok((Self::from_index(index, options, compressed)?, permutation))
     }
 
     pub(crate) fn from_index(

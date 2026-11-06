@@ -929,6 +929,7 @@ where S: VectorArena<Elem = f32>
                 .sum(),
             k,
             PARENT_NPROBE_FRACTION,
+            LIST_OVERSCAN,
         )
     }
 
@@ -969,6 +970,7 @@ where S: VectorArena<Elem = f32>
                 aps: true,
                 min_fraction: PARENT_NPROBE_FRACTION,
                 rerank_factor: 1.0,
+                list_overscan: LIST_OVERSCAN,
             },
             crate::vector::router::search::OutputPrecision::Exact,
         )

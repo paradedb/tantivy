@@ -17,6 +17,9 @@ use crate::vector::VectorElement;
 use crate::TantivyError;
 
 pub(crate) mod arena;
+#[cfg(any(test, feature = "unstable"))]
+#[doc(hidden)]
+pub mod audit;
 pub(crate) mod candidate;
 mod exact;
 pub(crate) mod global;
