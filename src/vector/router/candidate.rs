@@ -6,7 +6,7 @@ use crate::vector::distance::Similarity;
 
 /// A `(similarity, node)` pair ordered by similarity, ties broken by node id, so a max-heap yields
 /// the most similar first.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Candidate<N = u32> {
     /// Similarity to the query; higher is more similar.
     pub sim: Similarity,

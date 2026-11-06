@@ -73,8 +73,8 @@ pub(crate) mod test_support;
 pub(crate) mod tests;
 
 pub use collector::{
-    SegmentVectorFruit, TopDocsByVectorSimilarity, TopDocsByVectorSimilarityBuilder, VectorSegment,
-    VectorSimilarityFruit,
+    SegmentVectorFruit, TopDocsByVectorSimilarity, TopDocsByVectorSimilarityBuilder,
+    VectorRoutingPlan, VectorSegment, VectorSimilarityFruit,
 };
 pub use element::{Accumulator, VectorElement, ENTRY_ALIGN};
 pub use params::{LocatedPath, ProbeParams, Selectivity, DEFAULT_FIXED_PROBE_COST_ROWS};
