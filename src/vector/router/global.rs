@@ -1,6 +1,6 @@
 use super::candidate::Candidate;
 use super::search::{OutputPrecision, SearchPolicy};
-use super::stacked::search::{AllScored, StackedRouting};
+use super::stacked::search::{AllScored, RoutingOutput, StackedRouting};
 use super::{OpenedRouter, Router, RouterMetrics, RoutingParams};
 use crate::vector::search::prepared::VectorQuery;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
@@ -21,6 +21,27 @@ impl GlobalRanking {
         params: RoutingParams,
         totals: &mut [StageTotals],
         on_segment: &mut impl FnMut(usize),
+    ) -> Self {
+        Self::with_output(
+            routers,
+            partitions,
+            query,
+            params,
+            totals,
+            on_segment,
+            AllScored::default(),
+        )
+    }
+
+    /// [`Self::from`] with the walk's output supplied, so an observer can follow it.
+    pub(crate) fn with_output<T: VectorElement>(
+        routers: &[Option<&OpenedRouter>],
+        partitions: &[Option<&[f32]>],
+        query: &VectorQuery<T>,
+        params: RoutingParams,
+        totals: &mut [StageTotals],
+        on_segment: &mut impl FnMut(usize),
+        output: impl RoutingOutput,
     ) -> Self {
         let mut indexes = Vec::with_capacity(routers.len());
         let mut leaves = Vec::new();
@@ -76,7 +97,7 @@ impl GlobalRanking {
                 list_overscan: super::stacked::levels::LIST_OVERSCAN,
             },
             OutputPrecision::Exact,
-            AllScored::default(),
+            output,
         );
         leaves.extend(ranking.candidates.into_iter().map(|candidate| {
             (

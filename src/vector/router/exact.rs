@@ -22,7 +22,7 @@ pub(crate) struct ExactRouter<S> {
 }
 
 impl<S: VectorArena<Elem = f32>> ExactRouter<S> {
-    pub(super) fn rank<T: VectorElement>(&self, query: &VectorQuery<T>) -> RouterIter {
+    pub(crate) fn rank<T: VectorElement>(&self, query: &VectorQuery<T>) -> RouterIter {
         assert_eq!(query.widened().len(), self.dim);
         debug_assert_eq!(query.metric(), self.metric);
         let mut scores = Vec::with_capacity(self.num_centroids);
@@ -55,7 +55,7 @@ impl<S: VectorArena<Elem = f32>> ExactRouter<S> {
     }
 }
 
-pub(super) fn build(
+pub(crate) fn build(
     options: &VectorOptions,
     centroids: &IvfCentroids,
 ) -> ExactRouter<InMemoryStore> {

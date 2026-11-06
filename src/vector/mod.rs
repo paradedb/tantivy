@@ -82,6 +82,9 @@ pub use quantization::{VectorQuantizationConfig, VectorQuantizationLayer};
 #[cfg(any(test, feature = "unstable"))]
 #[doc(hidden)]
 pub use router::audit as router_audit;
+#[cfg(any(test, feature = "unstable"))]
+#[doc(hidden)]
+pub use router::audit_global as router_audit_global;
 pub use router::{RouterKind, RouterMetrics};
 pub use search::source::controller::ProbeTermination;
 pub use stats::ProbeStats;

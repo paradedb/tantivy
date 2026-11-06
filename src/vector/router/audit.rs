@@ -64,7 +64,7 @@ const MONOTONE_SCAN: usize = 8;
 
 /// Layer-0 bytes per posting row of a `[1,1]` cluster at d = 1024: the unit router work is priced
 /// in.
-const POSTING_ROW_BYTES: f64 = 140.0;
+pub(super) const POSTING_ROW_BYTES: f64 = 140.0;
 
 /// Rerank factors of the quantized rankings. Factor 1 is not a mode the audit measures.
 const RERANK_FACTORS: [f32; 2] = [2.0, 4.0];
@@ -478,7 +478,7 @@ impl RoutingOutput for Trace<'_> {
         best.into_sorted()
     }
 
-    fn opened(&mut self, level: usize, list: u32) {
+    fn opened(&mut self, level: usize, _segment: usize, list: u32) {
         self.0.opened[level].push(list);
     }
 
@@ -664,7 +664,7 @@ impl Ranking {
 // --- Harness ---
 
 /// `f` over `0..n` on every core, results in order.
-fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+pub(super) fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     let threads = std::thread::available_parallelism()
         .map_or(1, |threads| threads.get())
         .min(n.max(1));
@@ -695,7 +695,7 @@ fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
 }
 
 /// The value at nearest rank `q` of `sorted`, or 0 when empty.
-fn nearest_rank(sorted: &[u32], q: f64) -> u32 {
+pub(super) fn nearest_rank(sorted: &[u32], q: f64) -> u32 {
     if sorted.is_empty() {
         return 0;
     }
@@ -703,7 +703,7 @@ fn nearest_rank(sorted: &[u32], q: f64) -> u32 {
     sorted[rank.clamp(1, sorted.len()) - 1]
 }
 
-fn percentiles(mut values: Vec<u32>) -> Percentiles {
+pub(super) fn percentiles(mut values: Vec<u32>) -> Percentiles {
     values.sort_unstable();
     Percentiles {
         p50: nearest_rank(&values, 0.50),
@@ -736,13 +736,70 @@ struct Audit<'a> {
 }
 
 /// What one ranking resolves against a set's targets, before pricing.
-struct Solved {
-    m_r: Option<usize>,
-    non_monotone: Vec<NonMonotoneStep>,
-    recall: Option<f64>,
-    best_recall: f64,
-    below: Option<CurvePoint>,
-    above: Option<CurvePoint>,
+pub(super) struct Solved {
+    pub(super) m_r: Option<usize>,
+    pub(super) non_monotone: Vec<NonMonotoneStep>,
+    pub(super) recall: Option<f64>,
+    pub(super) best_recall: f64,
+    pub(super) below: Option<CurvePoint>,
+    pub(super) above: Option<CurvePoint>,
+}
+
+/// Draws the curve on the grid `ks`, then solves every target exactly inside the bracket the grid
+/// leaves. `recall` is memoized: the searches revisit requests.
+pub(super) fn solve_curve(
+    ks: &[usize],
+    recall: impl Fn(usize) -> f64,
+) -> (Vec<CurvePoint>, Vec<Solved>) {
+    let mut memo = BTreeMap::new();
+    let mut at = |k: usize| *memo.entry(k).or_insert_with(|| recall(k));
+    let curve: Vec<CurvePoint> = ks
+        .iter()
+        .map(|&k| CurvePoint { k, recall: at(k) })
+        .collect();
+    let best_recall = curve.iter().map(|point| point.recall).fold(0.0, f64::max);
+    let last = ks.last().copied().unwrap_or(1);
+    let solved = TARGETS
+        .iter()
+        .map(|&target| {
+            let Some(hit) = curve.iter().position(|point| point.recall >= target) else {
+                return Solved {
+                    m_r: None,
+                    non_monotone: Vec::new(),
+                    recall: None,
+                    best_recall,
+                    below: curve.last().copied(),
+                    above: None,
+                };
+            };
+            let below = hit.checked_sub(1).map(|below| curve[below]);
+            let lo = below.map_or(0, |point| point.k);
+            let exact = exact_m_r(lo, curve[hit].k, last, target, &mut at);
+            Solved {
+                m_r: Some(exact.m_r),
+                non_monotone: exact.non_monotone,
+                recall: Some(exact.recall),
+                best_recall,
+                below,
+                above: Some(curve[hit]),
+            }
+        })
+        .collect();
+    (curve, solved)
+}
+
+/// The smallest prefix of `hits`, ground-truth documents per rank, reaching `target` of `docs`, and
+/// its recall.
+pub(super) fn flat_m_r(hits: &[u64], docs: u64, target: f64) -> (usize, f64) {
+    let mut covered = 0u64;
+    for (m, &hit) in hits.iter().enumerate() {
+        covered += hit;
+        let recall = covered as f64 / docs.max(1) as f64;
+        if recall >= target {
+            return (m + 1, recall);
+        }
+    }
+    (hits.len(), 1.0)
 }
 
 /// An exact `m_r`.
@@ -893,8 +950,7 @@ impl Audit<'_> {
         covers.iter().sum::<f64>() / covers.len().max(1) as f64
     }
 
-    /// Draws the curve on the grid, then solves every target exactly inside the bracket the grid
-    /// leaves.
+    /// [`solve_curve`] for `ranking` under `params` over `queries`.
     fn solve(
         &self,
         ranking: &Ranking,
@@ -902,46 +958,10 @@ impl Audit<'_> {
         ks: &[usize],
         params: impl Fn(usize) -> (usize, SearchPolicy),
     ) -> (Vec<CurvePoint>, Vec<Solved>) {
-        let mut memo = BTreeMap::new();
-        let mut at = |k: usize| {
-            *memo.entry(k).or_insert_with(|| {
-                let (request, policy) = params(k);
-                self.recall(ranking, queries, request, policy)
-            })
-        };
-        let curve: Vec<CurvePoint> = ks
-            .iter()
-            .map(|&k| CurvePoint { k, recall: at(k) })
-            .collect();
-        let best_recall = curve.iter().map(|point| point.recall).fold(0.0, f64::max);
-        let last = ks.last().copied().unwrap_or(1);
-        let solved = TARGETS
-            .iter()
-            .map(|&target| {
-                let Some(hit) = curve.iter().position(|point| point.recall >= target) else {
-                    return Solved {
-                        m_r: None,
-                        non_monotone: Vec::new(),
-                        recall: None,
-                        best_recall,
-                        below: curve.last().copied(),
-                        above: None,
-                    };
-                };
-                let below = hit.checked_sub(1).map(|below| curve[below]);
-                let lo = below.map_or(0, |point| point.k);
-                let exact = exact_m_r(lo, curve[hit].k, last, target, &mut at);
-                Solved {
-                    m_r: Some(exact.m_r),
-                    non_monotone: exact.non_monotone,
-                    recall: Some(exact.recall),
-                    best_recall,
-                    below,
-                    above: Some(curve[hit]),
-                }
-            })
-            .collect();
-        (curve, solved)
+        solve_curve(ks, |k| {
+            let (request, policy) = params(k);
+            self.recall(ranking, queries, request, policy)
+        })
     }
 
     /// Mean work of `ranking` at `k` over `queries`.
@@ -1186,18 +1206,7 @@ impl Audit<'_> {
         TARGETS
             .iter()
             .map(|&target| {
-                let mut covered = 0u64;
-                let mut m_r = clusters;
-                let mut recall = 1.0;
-                for (m, &hit) in hits.iter().enumerate() {
-                    covered += hit;
-                    let at = covered as f64 / docs.max(1) as f64;
-                    if at >= target {
-                        m_r = m + 1;
-                        recall = at;
-                        break;
-                    }
-                }
+                let (m_r, recall) = flat_m_r(&hits, docs, target);
                 let rows: f64 = queries
                     .iter()
                     .map(|&q| {

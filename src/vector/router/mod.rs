@@ -20,8 +20,11 @@ pub(crate) mod arena;
 #[cfg(any(test, feature = "unstable"))]
 #[doc(hidden)]
 pub mod audit;
+#[cfg(any(test, feature = "unstable"))]
+#[doc(hidden)]
+pub mod audit_global;
 pub(crate) mod candidate;
-mod exact;
+pub(crate) mod exact;
 pub(crate) mod global;
 mod quantized;
 mod scoring;
