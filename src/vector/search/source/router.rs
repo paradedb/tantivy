@@ -215,12 +215,23 @@ impl<'a> RouterClusters<'a> {
         };
         let _routing = enter_vector_stage(VectorStage::Routing);
         let ranked = index.rank_clusters(query, routing);
+        Self::from_ranked(reader, ranked, budget, filter, segment)
+    }
+
+    pub(crate) fn from_ranked(
+        reader: &'a VectorIndexReader,
+        ranked: RouterIter,
+        budget: WorkBudget,
+        filter: DocFilter,
+        segment: &'a SegmentReader,
+    ) -> Self {
+        let index = reader.index().expect("IVF segment");
         Self {
             index,
             reader,
             ranked,
             meter: WorkMeter::new(budget),
-            controller: ProbeController::new(clusters),
+            controller: ProbeController::new(index.num_clusters()),
             gate: RowGate::new(filter, segment.alive_bitset()),
             docs: Vec::new(),
             offsets: Vec::new(),
@@ -238,19 +249,13 @@ impl<'a> RouterClusters<'a> {
         segment: &'a SegmentReader,
         metrics: RouterMetrics,
     ) -> Self {
-        let index = reader.index().expect("IVF segment");
-        Self {
-            index,
+        Self::from_ranked(
             reader,
-            ranked: RouterIter::new(Vec::new(), metrics),
-            meter: WorkMeter::new(budget),
-            controller: ProbeController::new(index.num_clusters()),
-            gate: RowGate::new(filter, segment.alive_bitset()),
-            docs: Vec::new(),
-            offsets: Vec::new(),
-            selected_docs: Vec::new(),
-            counters: RouterCounters::default(),
-        }
+            RouterIter::new(Vec::new(), metrics),
+            budget,
+            filter,
+            segment,
+        )
     }
 
     /// Prepares a cluster chosen by the global router.

@@ -19,7 +19,8 @@ use crate::collector::{
 use crate::query::Weight;
 use crate::schema::Field;
 use crate::vector::params::ProbeParams;
-use crate::vector::search::cluster_source::ClusterSource;
+use crate::vector::router::candidate::Candidate;
+use crate::vector::router::RouterIter;
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery, VectorQuery};
 use crate::vector::search::scan::bound::{PruningBound, TopK};
 use crate::vector::search::scan::heap::{tie_break_key, TieBreakHits};
@@ -227,20 +228,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
                 })
             })
             .transpose()?;
-        let mut plan = match routed {
-            Some(route) => SegmentPlan::with_budget(
-                &self.probe_params,
-                index,
-                weight,
-                segment,
-                top_n,
-                route.planning_budget,
-            )?,
-            None => SegmentPlan::build(&self.probe_params, index, weight, segment, top_n)?,
-        };
-        if let Some(route) = routed {
-            plan.budget = route.budget;
-        }
+        let plan = SegmentPlan::build(&self.probe_params, index, weight, segment, top_n)?;
         let capacity = plan.capacity_hint();
         let SegmentPlan {
             budget,
@@ -281,33 +269,34 @@ impl<T: VectorElement> SegmentSearcher<T> {
         )?;
         drop(init);
         let source = match source {
-            Source::Router(filter) if routed.is_some() => {
-                let route = routed.unwrap();
-                let mut clusters = RouterClusters::for_global(
-                    &self.reader,
-                    budget,
-                    filter,
-                    segment,
-                    route.metrics,
-                );
-                for &candidate in &route.clusters {
-                    if let Some(rows) = clusters.probe_global(candidate)? {
-                        let scored = scan.shortlist(&rows)?;
-                        clusters.admitted(scored)?;
-                    }
-                }
-                scan.refine_shortlist()?;
-                SourceReport::Router(clusters.finish())
-            }
             Source::Router(filter) => {
-                let mut clusters = RouterClusters::for_segment(
-                    &self.reader,
-                    &self.query,
-                    budget,
-                    filter,
-                    segment,
-                    &self.probe_params,
-                );
+                let mut clusters = match routed {
+                    Some(route) => RouterClusters::from_ranked(
+                        &self.reader,
+                        RouterIter::new(
+                            route
+                                .clusters
+                                .iter()
+                                .map(|candidate| Candidate {
+                                    sim: candidate.sim,
+                                    node: candidate.node.into(),
+                                })
+                                .collect(),
+                            route.metrics,
+                        ),
+                        budget,
+                        filter,
+                        segment,
+                    ),
+                    None => RouterClusters::for_segment(
+                        &self.reader,
+                        &self.query,
+                        budget,
+                        filter,
+                        segment,
+                        &self.probe_params,
+                    ),
+                };
                 scan.run(&mut clusters)?;
                 SourceReport::Router(clusters.finish())
             }

@@ -102,9 +102,9 @@ impl Hash for PreparedKey {
 /// Shared initialization cell so each metadata key prepares its query exactly once.
 type PreparedCell = Arc<OnceLock<Arc<QuantizedQueryCtx>>>;
 
-/// A fixed, globally selected set of IVF probes for one query and segment snapshot.
-/// Serialize this plan to share routing across processes. Consumers must use the same
-/// field, query, filter, probe parameters, and segment snapshot as the routing collector.
+/// A global centroid ranking split by segment, for sharing routing across processes.
+/// Consumers must use the same field, query, probe parameters, and segment snapshot.
+/// Each consumer evaluates its filter and enforces its segment's probe budget.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct VectorRoutingPlan {
     field: Field,
@@ -114,8 +114,6 @@ pub struct VectorRoutingPlan {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SegmentRoutingPlan {
     pub(crate) clusters: Vec<Candidate>,
-    pub(crate) budget: WorkBudget,
-    pub(crate) planning_budget: WorkBudget,
     pub(crate) metrics: RouterMetrics,
     totals: StageTotals,
 }
@@ -464,15 +462,20 @@ where
     T: VectorElement,
     S: SortKeyComputer + Send + Sync + 'static,
 {
-    /// Routes all supplied segments and selects a global prefix priced by matching rows.
-    /// Located matches reserve their budget and bypass routing. Flat segments remain exhaustive.
-    /// Probing does not replenish this fixed plan when duplicate rows avoid scoring.
+    /// Ranks centroids without evaluating filters or reading cluster rows.
+    /// `match_fraction` estimates the filter's selectivity for sizing the ranking;
+    /// use zero when unknown to retain enough candidates for the cluster-open budget.
     pub fn route_segments(
         &self,
-        weight: &dyn Weight,
+        match_fraction: f64,
         segments: &[VectorSegment<'_>],
         mut on_segment: impl FnMut(SegmentOrdinal),
     ) -> Result<VectorRoutingPlan> {
+        if !(0.0..=1.0).contains(&match_fraction) {
+            return Err(TantivyError::InvalidArgument(
+                "routing match fraction must be between zero and one".into(),
+            ));
+        }
         let mut vectors = Vec::with_capacity(segments.len());
         let mut totals = Vec::with_capacity(segments.len());
         for segment in segments {
@@ -508,68 +511,16 @@ where
             return Ok(plan);
         };
         let query = self.vector_query(first.options().metric());
-        let (total, n_avg, x) = self.probe_params.resolved_work_budget(clusters, docs)?;
-        let budget = WorkBudget {
-            total: WorkUnits::new(total),
-            per_cluster: WorkUnits::new(x),
-            per_row: WorkUnits::new((1.0 - x) / n_avg.max(f64::MIN_POSITIVE)),
-        };
-        let mut plans = Vec::with_capacity(segments.len());
-        for (i, segment) in segments.iter().enumerate() {
-            let (segment_plan, measured) = measure(|| {
-                vectors[i]
-                    .index()
-                    .map(|index| {
-                        SegmentPlan::with_budget(
-                            &self.probe_params,
-                            index,
-                            weight,
-                            segment.reader,
-                            self.segment_top_n(),
-                            WorkBudget {
-                                total: budget.total
-                                    * (index.num_docs() as f64 / docs.max(1) as f64),
-                                ..budget
-                            },
-                        )
-                    })
-                    .transpose()
-            });
-            totals[i].append(&measured);
-            on_segment(segment.ordinal);
-            plans.push(segment_plan?);
-        }
+        let (total, _, x) = self.probe_params.resolved_work_budget(clusters, docs)?;
         let routers = vectors
             .iter()
-            .zip(&plans)
-            .map(|(reader, plan)| {
-                matches!(
-                    plan.as_ref().and_then(|p| p.source.as_ref()),
-                    Some(Source::Router(_))
-                )
-                .then(|| reader.index().unwrap().opened_router())
-            })
+            .map(|reader| reader.index().map(|index| index.opened_router()))
             .collect::<Vec<_>>();
-        let (matched, routed_docs) =
-            plans
-                .iter()
-                .zip(segments)
-                .fold((0.0, 0u64), |(matched, docs), (plan, segment)| {
-                    match plan.as_ref().and_then(|p| p.source.as_ref()) {
-                        Some(Source::Router(filter)) => (
-                            matched
-                                + filter.match_fraction(segment.reader.max_doc())
-                                    * f64::from(segment.reader.max_doc()),
-                            docs + u64::from(segment.reader.max_doc()),
-                        ),
-                        _ => (matched, docs),
-                    }
-                });
         let partitions: Vec<_> = segments.iter().map(|s| s.partition_centroid).collect();
         let routing = crate::vector::router::RoutingParams {
             k: self
                 .probe_params
-                .router_k(total, x, matched / routed_docs.max(1) as f64, clusters),
+                .router_k(total, x, match_fraction, clusters),
             rerank_factor: self.probe_params.router_rerank_factor,
             min_beam_fraction: self.probe_params.router_min_beam_fraction,
             aps: self.probe_params.router_aps,
@@ -582,79 +533,22 @@ where
             &mut totals,
             &mut |i| on_segment(segments[i].ordinal),
         );
-        let mut reserved = WorkUnits::ZERO;
-        let mut sources = Vec::with_capacity(segments.len());
-        for (i, (segment, segment_plan)) in segments.iter().zip(plans).enumerate() {
-            let Some(segment_plan) = segment_plan else {
-                sources.push(None);
-                continue;
-            };
-            let planning_budget = segment_plan.budget;
-            let source = match segment_plan.source {
-                Some(Source::Router(filter)) => Some(RouterClusters::for_global(
-                    &vectors[i],
-                    budget,
-                    filter,
-                    segment.reader,
-                    ranking.metrics[i],
-                )),
-                Some(Source::FilterMatches(_)) => {
-                    reserved += planning_budget.total;
-                    None
-                }
-                None => None,
-            };
+        for (i, (segment, totals)) in segments.iter().zip(totals).enumerate() {
             plan.segments.insert(
                 segment.reader.segment_id(),
                 SegmentRoutingPlan {
                     clusters: Vec::new(),
-                    budget: if source.is_some() {
-                        WorkBudget {
-                            total: WorkUnits::ZERO,
-                            ..budget
-                        }
-                    } else {
-                        planning_budget
-                    },
-                    planning_budget,
                     metrics: ranking.metrics[i],
-                    totals: StageTotals::default(),
+                    totals,
                 },
             );
-            sources.push(source);
         }
-        let mut meter = WorkMeter::new(WorkBudget {
-            total: WorkUnits::new((budget.total.get() - reserved.get()).max(0.0)),
-            ..budget
-        });
-        for (i, candidate) in ranking.clusters {
-            if meter.exhausted() {
-                break;
-            }
-            let (rows, measured) = measure(|| {
-                let _stage = enter_vector_stage(VectorStage::Routing);
-                sources[i]
-                    .as_mut()
-                    .unwrap()
-                    .probe_global(candidate)
-                    .map(|rows| rows.map_or(0, |rows| rows.len()))
-            });
-            totals[i].append(&measured);
-            on_segment(segments[i].ordinal);
-            let rows = rows?;
-            meter.open();
-            meter.rows(rows);
-            let segment = plan
-                .segments
+        for (i, candidate) in ranking.clusters.into_iter().take(routing.k) {
+            plan.segments
                 .get_mut(&segments[i].reader.segment_id())
-                .unwrap();
-            segment.budget.total += budget.per_cluster + budget.per_row * rows as f64;
-            segment.clusters.push(candidate);
-        }
-        for (segment, totals) in segments.iter().zip(totals) {
-            if let Some(plan) = plan.segments.get_mut(&segment.reader.segment_id()) {
-                plan.totals = totals;
-            }
+                .unwrap()
+                .clusters
+                .push(candidate);
         }
         Ok(plan)
     }
@@ -1529,9 +1423,7 @@ mod ivf_e2e_tests {
                 });
             let weight = near.weight(&near.filter("matches"))?;
             let collector = if planned {
-                let plan = builder
-                    .build()
-                    .route_segments(weight.as_ref(), &readers, |_| {})?;
+                let plan = builder.build().route_segments(1.0, &readers, |_| {})?;
                 TopDocs::with_limit(3)
                     .order_by_similarity(near.field, query.clone())
                     .with_probe_params(ProbeParams {
@@ -1592,10 +1484,7 @@ mod ivf_e2e_tests {
                             })
                     };
                     let weight = fixture.weight(filter)?;
-                    let plan =
-                        builder()
-                            .build()
-                            .route_segments(weight.as_ref(), &readers, |_| {})?;
+                    let plan = builder().build().route_segments(1.0, &readers, |_| {})?;
                     let bytes = serde_json::to_vec(&plan).unwrap();
                     let plan: VectorRoutingPlan = serde_json::from_slice(&bytes).unwrap();
                     let plan = Arc::new(plan);
@@ -1636,7 +1525,70 @@ mod ivf_e2e_tests {
     }
 
     #[test]
-    fn routing_plan_spends_one_budget_on_competitive_segments() -> Result<()> {
+    fn routing_plan_leaves_row_reads_and_budget_checks_to_consumers() -> Result<()> {
+        let fixture = FixtureSpec::clustered(Metric::L2, 64, 8, 768)
+            .segments(3)
+            .schedule(&[1, 1])
+            .label("matches", |i| i % 3 == 0)
+            .paged()
+            .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let readers: Vec<_> = searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
+            .collect();
+        for segment in &readers {
+            segment.reader.vector_index(fixture.field)?;
+        }
+        let mut query = vec![0.0; 64];
+        query[2] = 1.0;
+        let builder = || {
+            TopDocs::with_limit(5)
+                .order_by_similarity(fixture.field, query.clone())
+                .with_probe_params(ProbeParams {
+                    max_probe_fraction: 0.125,
+                    located: LocatedPath::Off,
+                    exact_plan: false,
+                    ..Default::default()
+                })
+        };
+        fixture.clear_reads();
+        let plan = builder().build().route_segments(0.0, &readers, |_| {})?;
+        assert!(
+            fixture.reads().is_empty(),
+            "routing read vector rows or document IDs"
+        );
+        assert!(!fixture.centroid_reads().is_empty());
+        assert!(plan.segments.values().all(|segment| {
+            segment
+                .totals
+                .time_ns(crate::vector::VectorStage::NonVectorSearch)
+                == 0
+        }));
+        let filter = fixture.filter("matches");
+        let weight = fixture.weight(&filter)?;
+        let collector = builder().with_routing_plan(Arc::new(plan)).build();
+        let fruit = collector.merge_fruits(collector.collect_segments(
+            weight.as_ref(),
+            &readers,
+            |_| {},
+        )?)?;
+        assert!(!fixture.reads().is_empty());
+        for stats in &fruit.stats {
+            assert!(stats.pruned_filter > 0);
+            assert!(stats.work_charged >= stats.work_budget);
+            assert!(stats.work_charged <= stats.work_budget + 1.0);
+            assert!(stats.postings_row < 8);
+        }
+        let expected = searcher.search(&filter, &builder().build())?;
+        assert_eq!(fruit.results, expected.results);
+        Ok(())
+    }
+
+    #[test]
+    fn routing_plan_selects_competitive_segments() -> Result<()> {
         let mut distant = FixtureSpec::clustered(Metric::L2, 32, 8, 128);
         for vector in distant.vectors.iter_mut().flatten() {
             for value in vector {
@@ -1672,9 +1624,7 @@ mod ivf_e2e_tests {
                     ..Default::default()
                 })
         };
-        let plan = builder()
-            .build()
-            .route_segments(near.all()?.as_ref(), &readers, |_| {})?;
+        let plan = builder().build().route_segments(1.0, &readers, |_| {})?;
         assert!(plan.segments[&readers[0].reader.segment_id()]
             .clusters
             .is_empty());
@@ -1697,7 +1647,8 @@ mod ivf_e2e_tests {
             .iter()
             .all(|(_, address)| address.segment_ord == 1));
         assert_eq!(fruit.stats[0].candidates_scored, 0);
-        assert!(fruit.stats.iter().map(|s| s.work_budget).sum::<f32>() < 4.0);
+        assert!(fruit.stats.iter().all(|s| s.work_budget == 3.0));
+        assert!(fruit.stats.iter().map(|s| s.work_charged).sum::<f32>() < 4.1);
         Ok(())
     }
 
