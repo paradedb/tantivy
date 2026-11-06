@@ -56,7 +56,7 @@ pub struct AdaptiveProbeParams {
 impl Default for AdaptiveProbeParams {
     fn default() -> Self {
         Self {
-            admission_fraction: 0.00001,
+            admission_fraction: 0.0001,
         }
     }
 }
