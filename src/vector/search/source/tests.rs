@@ -218,16 +218,16 @@ fn probe_termination() -> crate::Result<()> {
     let params = budget_params(0.2);
     let probe = fixture.with_segment(&AllQuery, &[0.0, 0.0], 3, &params, |seg| {
         let (budget, n_avg, x) =
-            params.resolved_work_budget(seg.index.num_clusters(), seg.index.num_docs())?;
+            params.resolved_work_budget(seg.index.num_clusters(), seg.index.num_rows())?;
         let clusters = seg.index.num_clusters();
-        let docs = seg.index.num_docs() as f64;
+        let rows = seg.index.num_rows() as f64;
         let walk = walk(seg)?;
         assert!(budget < clusters as f64, "the budget binds");
         assert!(walk.clusters.len() < clusters);
         let probe = walk.report.probe;
         assert!((probe.work_budget as f64 - budget).abs() <= 1e-6 * budget);
         assert!(probe.work_charged as f64 > budget);
-        assert!(probe.work_charged as f64 <= budget + x + docs * (1.0 - x) / n_avg + 1e-6);
+        assert!(probe.work_charged as f64 <= budget + x + rows * (1.0 - x) / n_avg + 1e-6);
         Ok(probe)
     })?;
     assert_eq!(probe.termination, ProbeTermination::Ceiling);
