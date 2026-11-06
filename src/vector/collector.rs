@@ -628,10 +628,10 @@ where
         .filter_map(|reader| reader.index())
         .map(|i| i.num_clusters())
         .sum();
-    let docs = vectors
+    let rows = vectors
         .iter()
         .filter_map(|reader| reader.index())
-        .map(|i| i.num_docs())
+        .map(|i| i.num_rows())
         .sum();
     let top_n = collector.segment_top_n();
     let query = collector.vector_query(vectors[0].options().metric());
@@ -645,7 +645,7 @@ where
     };
     let (total, n_avg, x) = collector
         .probe_params
-        .resolved_work_budget(clusters, docs)?;
+        .resolved_work_budget(clusters, rows)?;
     let global_budget = WorkBudget {
         total: WorkUnits::new(total),
         per_cluster: WorkUnits::new(x),
@@ -665,7 +665,7 @@ where
             match reader.index() {
                 Some(index) => {
                     let budget = WorkBudget {
-                        total: global_budget.total * (index.num_docs() as f64 / docs.max(1) as f64),
+                        total: global_budget.total * (index.num_rows() as f64 / rows.max(1) as f64),
                         ..global_budget
                     };
                     let plan = SegmentPlan::with_budget(

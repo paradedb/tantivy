@@ -190,6 +190,17 @@ impl VectorFieldMeta {
     }
 }
 impl VectorColMetadata {
+    /// Whether documents may have a second row in another cluster.
+    pub(crate) fn spilled(&self) -> bool {
+        self.field().assignment == Assignment::Soar
+    }
+    /// The same metadata under `assignment`.
+    pub(crate) fn with_assignment(mut self, assignment: Assignment) -> Self {
+        match &mut self {
+            Self::Plain(field) | Self::Quantized { field, .. } => field.assignment = assignment,
+        }
+        self
+    }
     /// Whether the field's full-precision rows live in their own document-ordered entry rather
     /// than in its blocks: quantized clustered storage.
     pub(crate) fn has_exact_rows(&self) -> bool {
@@ -706,12 +717,7 @@ impl VectorColMetadata {
             };
             let assignment = match u8::deserialize(input)? {
                 0 => Assignment::Nearest,
-                1 => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "spill assignment is not supported by this build; rebuild required",
-                    ))
-                }
+                1 => Assignment::Soar,
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -1046,19 +1052,16 @@ mod tests {
                 "offset {offset}"
             );
         }
-        // The spill assignment is a known tag this build does not read.
+        // The spill assignment round-trips and needs quantized clustered storage.
         let mut spilled = meta.to_bytes();
         spilled[9] = 1;
-        let error = VectorColMetadata::from_bytes(&spilled)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("spill assignment"), "{error}");
-        // In memory, the spill assignment needs quantized clustered storage.
+        let decoded = VectorColMetadata::from_bytes(&spilled).unwrap();
+        assert!(decoded.spilled());
+        assert_eq!(decoded.to_bytes(), spilled);
         let opts = VectorOptions::new(100, Metric::L2);
-        let mut soar = meta.clone();
-        if let VectorColMetadata::Quantized { field, .. } = &mut soar {
-            field.assignment = Assignment::Soar;
-        }
+        let mut soar = meta.clone().with_assignment(Assignment::Soar);
+        assert!(soar.spilled());
+        assert!(!meta.spilled());
         soar.validate(&opts, true).unwrap();
         if let VectorColMetadata::Quantized { field, .. } = &mut soar {
             field.partition = Partition::Uniform {

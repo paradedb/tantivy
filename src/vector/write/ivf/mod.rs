@@ -26,6 +26,7 @@ use crate::vector::router::RouterKind;
 use crate::vector::storage::header::{
     write_centroid_header, write_vector_header, VectorEntry, CENTROIDS_EXT, HEADER_LEN, VEC_EXT,
 };
+use crate::vector::storage::metadata::Assignment;
 #[cfg(test)]
 use crate::vector::storage::metadata::VectorColMetadata;
 use crate::vector::storage::reader::VectorIndexReader;
@@ -48,6 +49,9 @@ struct AssignedVector {
     cluster: usize,
     target_doc_id: DocId,
     source: RowAddress,
+    /// Whether this is the document's primary row, the one its location map points at; a
+    /// document's spill row is the same vector encoded against a second cluster.
+    primary: bool,
 }
 
 /// Per-field IVF build counters and timings, reported on `paradedb::ivf_build`.
@@ -84,6 +88,8 @@ struct FieldMerge<'a> {
     /// The field's reader in each source segment.
     readers: Vec<Arc<VectorIndexReader>>,
     num_target_docs: u32,
+    /// Whether every vector also gets a spill row in a second cluster.
+    spill: bool,
 }
 
 #[cfg(test)]
@@ -166,6 +172,8 @@ pub(crate) fn merge_ivf(
             quantization,
             readers: field_readers,
             num_target_docs,
+            // Spill rows carry codes alone, so only a quantized field can hold them.
+            spill: ctx.settings.vector_spill && quantization.is_some(),
         };
         if vector_count == 0 {
             write::empty_field(&mut vec_write, &mut centroids_write, &merge, router)?;
@@ -198,18 +206,29 @@ pub(crate) fn merge_ivf(
                     vector_count,
                     &mut timings,
                 )?;
-                debug_assert_eq!(assigned_vectors.len(), trained.present_vectors);
-                // The `.centroids` doc count: one posting row per document.
-                let num_present_docs = assigned_vectors.len();
+                // The `.centroids` doc count: one primary row per document.
+                let num_present_docs = assigned_vectors
+                    .iter()
+                    .filter(|assigned| assigned.primary)
+                    .count();
+                debug_assert_eq!(num_present_docs, trained.present_vectors);
                 let cluster_offsets = assign::cluster_offsets(&mut assigned_vectors, num_centroids);
 
                 let centroid_bytes = encode::encode_centroids(&merge, &centroids, num_centroids)?;
+                // The stored assignment says what the blocks hold: spill rows, or one row per
+                // document when the clusterer produced no secondary.
+                let assignment = if assigned_vectors.len() > num_present_docs {
+                    Assignment::Soar
+                } else {
+                    Assignment::Nearest
+                };
                 let locations = encode::write_data_entry(
                     &merge,
                     &mut vec_write,
                     &assigned_vectors,
                     &cluster_offsets,
                     &centroid_bytes,
+                    assignment,
                     &mut timings,
                 )?;
                 // A quantized field keeps its full-precision rows in document order, in their own

@@ -84,6 +84,7 @@ fn merge_flat_segments_with_deletes_into_ivf() -> crate::Result<()> {
         .settings(settings)
         .ivf_clusterer(Arc::new(NearestClusterer {
             centroids: centroids.clone(),
+            pairs: true,
         }))
         // Exact: exhaustive top-N below assumes every alive cluster is probed.
         .ivf_router(RouterKind::Exact)
@@ -173,6 +174,7 @@ fn merge_deleting_every_doc_of_one_field_writes_empty_ivf() -> crate::Result<()>
         .settings(settings)
         .ivf_clusterer(Arc::new(NearestClusterer {
             centroids: centroids.clone(),
+            pairs: true,
         }))
         // Exact: exhaustive search below assumes every alive cluster is probed.
         .ivf_router(RouterKind::Exact)
