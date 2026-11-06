@@ -123,8 +123,9 @@ impl ProbeParams {
     /// the budget buys `budget / that` clusters: `budget` unfiltered, up to
     /// `budget / open_share` as the filter approaches empty. The count is
     /// capped at the segment's cluster count. Adaptive scans scale a base window by the
-    /// admission fraction, with a filter adjustment whose relative effect shrinks as the window
-    /// grows. Nonadaptive scans apply the `min_probe_clusters` floor.
+    /// admission fraction, halving its growth above effort 4.4 with early refinement or 2.0
+    /// without it. A filter adjustment shrinks in relative effect as the window grows.
+    /// Nonadaptive scans apply the `min_probe_clusters` floor.
     ///
     /// * `open_share` (`f64`) — the per-index open share `x`.
     /// * `match_fraction` (`f64`) — the share of the segment's docs the filter matches, in `(0,
@@ -142,14 +143,17 @@ impl ProbeParams {
             (open_share + (1.0 - open_share) * match_fraction).max(f64::MIN_POSITIVE);
         let clusters = (budget.max(0.0) / cluster_cost).ceil();
         let clusters = if let Some(adaptive) = self.adaptive_probing {
+            let knee = if early_refinement { 4.4 } else { 2.0 };
+            let effort = adaptive.effort.min(knee) + 0.5 * (adaptive.effort - knee).max(0.0);
             let base = if early_refinement {
-                (0.00075_f64.ln() + 0.32 * adaptive.effort * std::f64::consts::LN_10)
+                (0.00075_f64.ln() + 0.32 * effort * std::f64::consts::LN_10)
                     .min(0.0)
                     .exp()
             } else {
-                0.002 / adaptive.admission_fraction().powf(0.625)
-            }
-            .min(1.0);
+                (0.002_f64.ln() + 0.625 * effort * std::f64::consts::LN_10)
+                    .min(0.0)
+                    .exp()
+            };
             let headroom = (0.05 * (cluster_cost.sqrt().recip() - 1.0)).min(0.4);
             let remaining = 1.0 - base;
             let taper = (remaining / 0.9).min(1.0);
@@ -227,6 +231,12 @@ mod tests {
         assert!((params(4.4).initial_work(4000).unwrap() - 20.0).abs() < 1e-10);
         assert_eq!(params(0.1).router_k(1000.0, 0.1, 1.0, 1000, true), 1);
         assert_eq!(params(4.4).router_k(2.0, 0.1, 1.0, 1000, true), 2);
+        assert_eq!(params(4.4).router_k(1000.0, 0.1, 1.0, 1000, true), 20);
+        assert_eq!(params(2.0).router_k(1000.0, 0.1, 1.0, 1000, false), 36);
+        let high_recall = params(5.58).router_k(100_000.0, 0.004, 1.0, 100_000, true);
+        assert!((2900..=3000).contains(&high_recall));
+        let filtered = params(3.32).router_k(100_000.0, 0.004, 0.1, 100_000, false);
+        assert!((10_000..=20_000).contains(&filtered));
         assert!(
             (ProbeParams {
                 max_probe_fraction: 0.001,
