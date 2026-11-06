@@ -76,6 +76,17 @@ pub(crate) fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
     plugins
 }
 
+/// The built-in plugins, in write order, as static references.
+///
+/// Must list the same plugins, in the same order, as [`builtin_plugins`]. Used by the
+/// merger, which must not heap-allocate outside its own allocator.
+pub(crate) const BUILTIN_PLUGIN_REFS: [&dyn SegmentPlugin; 4] = [
+    &InvertedIndexPlugin,
+    &FastFieldsPlugin,
+    &StorePlugin,
+    &VectorPlugin,
+];
+
 /// The built-in plugins whose writers are driven entirely through the type-erased
 /// [`PluginWriter`](crate::plugin::PluginWriter) interface, unlike the first three
 /// built-ins, whose concrete writer types the `SegmentWriter` constructs directly.
@@ -1062,5 +1073,24 @@ impl Index {
 impl fmt::Debug for Index {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Index({:?})", self.directory)
+    }
+}
+
+#[cfg(test)]
+mod builtin_plugin_tests {
+    use super::{builtin_plugins, BUILTIN_PLUGIN_REFS};
+
+    #[test]
+    fn test_builtin_plugin_refs_match_builtin_plugins() {
+        let builtins = builtin_plugins();
+        let owned: Vec<_> = builtins
+            .iter()
+            .map(|plugin| plugin.extensions().to_vec())
+            .collect();
+        let refs: Vec<_> = BUILTIN_PLUGIN_REFS
+            .iter()
+            .map(|plugin| plugin.extensions().to_vec())
+            .collect();
+        assert_eq!(owned, refs);
     }
 }
