@@ -70,9 +70,11 @@ impl SegmentRun<'_> {
 
 // --- Clusterer ---
 
-/// Trains exactly the given centroids and assigns each vector to its L2-nearest one, first wins.
+/// Trains exactly the given centroids and assigns each vector to its L2-nearest one, first wins;
+/// with `pairs`, also the SOAR secondary by brute force, else the trait's default pairs.
 pub(crate) struct NearestClusterer {
     pub(crate) centroids: Vec<Vec<f32>>,
+    pub(crate) pairs: bool,
 }
 
 impl IvfClusterer for NearestClusterer {
@@ -107,6 +109,73 @@ impl IvfClusterer for NearestClusterer {
             }
         })?;
         Ok(assignments)
+    }
+
+    /// The nearest centroid and the SOAR secondary over every centroid, by brute force; without
+    /// `pairs`, what the trait's default yields.
+    fn assign_pairs(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        centroids: &IvfCentroids,
+        lambda: f32,
+    ) -> crate::Result<Vec<(u32, Option<u32>)>> {
+        if !self.pairs {
+            return Ok(self
+                .assign(options, source, centroids)?
+                .into_iter()
+                .map(|cluster| (cluster, None))
+                .collect());
+        }
+        let dim = options.dim();
+        let num_rows = source.num_rows();
+        let IvfCentroids::F32(_) = centroids;
+        let mut pairs = Vec::with_capacity(num_rows);
+        for_each_batch(source, num_rows, |IvfTrainingVectors::F32(batch)| {
+            for vector in batch.matrix.values.chunks_exact(dim) {
+                let distances: Vec<f32> = self
+                    .centroids
+                    .iter()
+                    .map(|centroid| {
+                        vector
+                            .iter()
+                            .zip(centroid)
+                            .map(|(a, b)| (a - b) * (a - b))
+                            .sum::<f32>()
+                    })
+                    .collect();
+                let primary = nearest(vector, &self.centroids);
+                if self.centroids.len() == 1 {
+                    pairs.push((primary as u32, None));
+                    continue;
+                }
+                // The unit residual to the primary, zero on the centroid itself.
+                let mut residual: Vec<f32> = vector
+                    .iter()
+                    .zip(&self.centroids[primary])
+                    .map(|(a, b)| a - b)
+                    .collect();
+                let norm = residual.iter().map(|v| v * v).sum::<f32>().sqrt();
+                for v in &mut residual {
+                    *v = if norm > 0.0 { *v / norm } else { 0.0 };
+                }
+                let along: f32 = vector.iter().zip(&residual).map(|(a, b)| a * b).sum();
+                let mut best: Option<(f32, u32)> = None;
+                for (index, centroid) in self.centroids.iter().enumerate() {
+                    if index == primary {
+                        continue;
+                    }
+                    let projection: f32 = residual.iter().zip(centroid).map(|(a, b)| a * b).sum();
+                    let gap = along - projection;
+                    let cost = distances[index] + lambda * gap * gap;
+                    if best.is_none_or(|(least, _)| cost < least) {
+                        best = Some((cost, index as u32));
+                    }
+                }
+                pairs.push((primary as u32, best.map(|(_, second)| second)));
+            }
+        })?;
+        Ok(pairs)
     }
 }
 
@@ -172,6 +241,10 @@ pub(crate) struct FixtureSpec {
     /// Quantization layer bits; empty for full precision.
     pub(crate) schedule: Vec<u8>,
     pub(crate) paged: bool,
+    /// Whether quantized clustered segments spill every vector into a second cluster.
+    pub(crate) spill: bool,
+    /// Whether the clusterer answers `assign_pairs` itself; otherwise the trait's default does.
+    pub(crate) pairs: bool,
     pub(crate) router: RouterKind,
     /// Segments after the build. IVF layouts write two flat segments per IVF segment and merge
     /// them pairwise.
@@ -192,6 +265,8 @@ impl FixtureSpec {
             layout: Layout::Ivf(centroids),
             schedule: Vec::new(),
             paged: false,
+            spill: false,
+            pairs: true,
             // Exact: small fixtures have few lists; Stacked's hard 25% top prune
             // cannot open them all, so oracle/exhaustive tests would be invalid.
             router: RouterKind::Exact,
@@ -236,6 +311,8 @@ impl FixtureSpec {
             layout: Layout::Flat,
             schedule: Vec::new(),
             paged: false,
+            spill: false,
+            pairs: true,
             router: RouterKind::Exact,
             segments: 1,
             deletes: Vec::new(),
@@ -249,6 +326,17 @@ impl FixtureSpec {
 
     pub(crate) fn paged(mut self) -> Self {
         self.paged = true;
+        self
+    }
+
+    pub(crate) fn spill(mut self) -> Self {
+        self.spill = true;
+        self
+    }
+
+    /// A clusterer without an `assign_pairs` of its own.
+    pub(crate) fn nearest_only(mut self) -> Self {
+        self.pairs = false;
         self
     }
 
@@ -332,6 +420,7 @@ impl FixtureSpec {
         let settings = IndexSettings {
             vector_clustering_threshold: if ivf { 1 } else { usize::MAX },
             vector_quantization: self.quantization(),
+            vector_spill: self.spill,
             ..IndexSettings::default()
         };
         let directory = self.paged.then(PagedDirectory::default);
@@ -340,6 +429,7 @@ impl FixtureSpec {
             builder = builder
                 .ivf_clusterer(Arc::new(NearestClusterer {
                     centroids: centroids.clone(),
+                    pairs: self.pairs,
                 }))
                 .ivf_router(self.router);
         }
@@ -766,7 +856,9 @@ impl Fixture {
         }
         self.clear_reads();
         if vectors.has_exact_rows() && !all_docs.is_empty() {
+            // A spilled segment lists a document under both of its clusters.
             all_docs.sort_unstable();
+            all_docs.dedup();
             let mut scratch = ReadScratch::default();
             vectors.read_exact_docs(&all_docs, &mut scratch)?;
             let reads: Vec<_> = self

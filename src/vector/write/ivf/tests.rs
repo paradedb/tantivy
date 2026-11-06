@@ -1505,7 +1505,7 @@ fn quantized_filtered_rows_are_not_charged() -> crate::Result<()> {
     };
     let vector_reader = searcher.segment_readers()[0].vector_index(field)?;
     let ivf = vector_reader.index().expect("merged fixture must be IVF");
-    let (_, n_avg, open_share) = params.resolved_work_budget(ivf.num_clusters(), ivf.num_docs())?;
+    let (_, n_avg, open_share) = params.resolved_work_budget(ivf.num_clusters(), ivf.num_rows())?;
     let row = (1.0 - open_share) / n_avg;
     // Request all fixture rows so both scans open every cluster.
     let collector = || {

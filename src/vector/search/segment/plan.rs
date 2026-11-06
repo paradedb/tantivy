@@ -76,8 +76,9 @@ impl SegmentPlan {
                 report: report(0),
             });
         }
-        // Capacity counts native docs as written: deleted rows still charge on first touch.
-        let (budget, n_avg, x) = params.resolved_work_budget(clusters, index.num_docs())?;
+        // Capacity counts the rows as written, a spilled segment's second copies included:
+        // deleted rows still charge on first touch.
+        let (budget, n_avg, x) = params.resolved_work_budget(clusters, index.num_rows())?;
         debug_assert!(n_avg > 0.0);
         let initial_work = params
             .initial_work(clusters)
@@ -314,7 +315,7 @@ mod tests {
         assert_eq!(source, (false, Some(count)));
         let vectors = segment.vector_index(fixture.field)?;
         let ivf = vectors.index().unwrap();
-        let (budget, n_avg, x) = params.resolved_work_budget(ivf.num_clusters(), ivf.num_docs())?;
+        let (budget, n_avg, x) = params.resolved_work_budget(ivf.num_clusters(), ivf.num_rows())?;
         assert_eq!(work.total.get(), budget);
         assert_eq!(work.per_cluster.get(), x);
         assert_eq!(work.per_row.get(), (1.0 - x) / n_avg);
@@ -377,14 +378,14 @@ mod tests {
 
         // `Auto` caps at the rows the routed budget buys: matches at the cap are located, one more
         // routes, and a filter matching nothing still reports the cap.
-        let ivf_docs = ivf.num_docs();
+        let ivf_rows = ivf.num_rows();
         let auto = ProbeParams {
             max_probe_fraction: 0.2,
             min_probe_clusters: 1,
             located: LocatedPath::Auto,
             ..ProbeParams::default()
         };
-        let (budget, n_avg, x) = auto.resolved_work_budget(ivf.num_clusters(), ivf_docs)?;
+        let (budget, n_avg, x) = auto.resolved_work_budget(ivf.num_clusters(), ivf_rows)?;
         let cap = (budget * n_avg / (1.0 - x)).floor() as usize;
         assert!(cap > 0 && cap + 1 < segment.max_doc() as usize, "cap {cap}");
         for (matches, path) in [
