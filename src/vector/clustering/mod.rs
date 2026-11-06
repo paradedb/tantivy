@@ -7,6 +7,7 @@ use crate::schema::VectorOptions;
 use crate::vector::VectorElement;
 use crate::{DocId, TantivyError};
 
+pub(crate) mod soar;
 mod superkmeans;
 
 pub use superkmeans::{SuperKMeansClusterer, DEFAULT_MAX_LEAF_SIZE, DEFAULT_TRAINING_SAMPLE_RATIO};
@@ -29,6 +30,25 @@ pub trait IvfClusterer: Send + Sync + 'static {
         source: &mut dyn VectorSource,
         centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>>;
+
+    /// Assigns each vector to its nearest centroid and to a second cell that misses different
+    /// queries; `None` when there is no second centroid. `lambda` weighs how much the second cell
+    /// should lie off the vector's residual to the first. The default gives every vector its
+    /// nearest centroid alone.
+    fn assign_pairs(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        centroids: &IvfCentroids,
+        lambda: f32,
+    ) -> crate::Result<Vec<(u32, Option<u32>)>> {
+        let _ = lambda;
+        Ok(self
+            .assign(options, source, centroids)?
+            .into_iter()
+            .map(|cluster| (cluster, None))
+            .collect())
+    }
 }
 
 /// Replayable, read-only view of vectors for IVF [`IvfClusterer::train`] or

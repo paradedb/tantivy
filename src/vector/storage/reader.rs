@@ -599,6 +599,16 @@ impl VectorIndexReader {
         self.exact.is_some()
     }
 
+    /// Whether a document may have a row in two clusters.
+    pub(crate) fn spilled(&self) -> bool {
+        self.rows_slice.metadata.spilled()
+    }
+
+    /// One past the segment's largest document id.
+    pub(crate) fn max_doc(&self) -> DocId {
+        self.max_doc
+    }
+
     /// The document-ordered full-precision rows: a flat field's blocks, or a quantized clustered
     /// field's `ExactRows`. `None` for plain clustered storage, whose rows sit in the cluster
     /// blocks.
