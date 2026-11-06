@@ -12,7 +12,9 @@ use crate::schema::VectorOptions;
 use crate::vector::clustering::IvfCentroids;
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::levels::{ClusterId, InMemoryStore, LazyStore};
+#[cfg(test)]
 use crate::vector::search::prepared::VectorQuery;
+#[cfg(test)]
 use crate::vector::VectorElement;
 use crate::TantivyError;
 
@@ -208,6 +210,7 @@ impl OpenedRouter {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn rank<T: VectorElement>(
         &self,
         query: &VectorQuery<T>,

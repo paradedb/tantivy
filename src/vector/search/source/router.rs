@@ -4,18 +4,16 @@
 use common::BitSet;
 
 use crate::fastfield::AliveBitSet;
-use crate::vector::params::ProbeParams;
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::{RouterIter, RouterMetrics, RoutingParams};
+use crate::vector::router::{RouterIter, RouterMetrics};
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
-use crate::vector::search::prepared::VectorQuery;
 use crate::vector::search::source::controller::{
     ProbeController, ProbeOutcome, WorkBudget, WorkMeter,
 };
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::enter_vector_stage;
-use crate::vector::{VectorElement, VectorStage};
+use crate::vector::VectorStage;
 use crate::{DocId, SegmentReader};
 
 // --- Filter and gate ---
@@ -188,36 +186,6 @@ pub(crate) struct RouterClusters<'a> {
 }
 
 impl<'a> RouterClusters<'a> {
-    /// Prepares this segment to choose and probe its own clusters.
-    /// Its router determines the cluster order, and its budget controls when probing stops.
-    pub(crate) fn for_segment<T: VectorElement>(
-        reader: &'a VectorIndexReader,
-        query: &'a VectorQuery<T>,
-        budget: WorkBudget,
-        filter: DocFilter,
-        segment: &'a SegmentReader,
-        params: &'a ProbeParams,
-    ) -> Self {
-        let index = reader
-            .index()
-            .expect("the router source runs on an IVF segment");
-        let clusters = index.num_clusters();
-        let routing = RoutingParams {
-            rerank_factor: params.router_rerank_factor,
-            min_beam_fraction: params.router_min_beam_fraction,
-            aps: params.router_aps,
-            k: params.router_k(
-                budget.total.get(),
-                budget.per_cluster.get(),
-                filter.match_fraction(segment.max_doc()),
-                clusters,
-            ),
-        };
-        let _routing = enter_vector_stage(VectorStage::Routing);
-        let ranked = index.rank_clusters(query, routing);
-        Self::from_ranked(reader, ranked, budget, filter, segment)
-    }
-
     pub(crate) fn from_ranked(
         reader: &'a VectorIndexReader,
         ranked: RouterIter,

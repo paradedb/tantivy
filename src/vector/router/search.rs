@@ -274,6 +274,7 @@ pub(crate) fn lists_to_open(lists: usize, members: usize, k: usize, min_fraction
 }
 
 /// Compose a hierarchical routing request, with exact fallback for exceptional queries.
+#[cfg(test)]
 pub(crate) fn rank<S: VectorSource, T: VectorElement>(
     level: &StackedIvf<S>,
     query: &VectorQuery<T>,

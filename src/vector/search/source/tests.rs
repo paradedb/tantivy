@@ -34,13 +34,12 @@ fn walk(seg: &SegmentRun<'_>) -> crate::Result<Walk> {
     let Some(Source::Router(filter)) = plan.source else {
         panic!("the router source walks router plans");
     };
-    let mut source = RouterClusters::for_segment(
+    let mut source = RouterClusters::from_ranked(
         seg.searcher.reader(),
-        seg.searcher.query(),
+        seg.routing.unwrap().ranked_clusters(),
         plan.budget,
         filter,
         seg.segment,
-        seg.searcher.params(),
     );
     let mut clusters = Vec::new();
     let mut rows = 0;
@@ -379,13 +378,12 @@ fn row_gate_bookkeeping() -> crate::Result<()> {
                 let Some(Source::Router(filter)) = plan.source else {
                     panic!("the router source walks router plans");
                 };
-                let mut source = RouterClusters::for_segment(
+                let mut source = RouterClusters::from_ranked(
                     run.searcher.reader(),
-                    run.searcher.query(),
+                    run.routing.unwrap().ranked_clusters(),
                     plan.budget,
                     filter,
                     run.segment,
-                    run.searcher.params(),
                 );
                 while let Some(rows) = source.next()? {
                     match rows.docs {

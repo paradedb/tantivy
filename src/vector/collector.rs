@@ -118,6 +118,21 @@ pub(crate) struct SegmentRoutingPlan {
     totals: StageTotals,
 }
 
+impl SegmentRoutingPlan {
+    pub(crate) fn ranked_clusters(&self) -> crate::vector::router::RouterIter {
+        crate::vector::router::RouterIter::new(
+            self.clusters
+                .iter()
+                .map(|candidate| Candidate {
+                    sim: candidate.sim,
+                    node: candidate.node.into(),
+                })
+                .collect(),
+            self.metrics,
+        )
+    }
+}
+
 /// Supplies a shared routing plan after a segment has evaluated its filter.
 pub trait VectorRoutingPlanProvider: Send + Sync {
     /// May block until publication; every call must return the same plan.
@@ -424,6 +439,16 @@ where
         segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
     ) -> Result<SegmentVectorFruit<S::SortKey>> {
+        if self.routing_plan.is_none() {
+            return self
+                .collect_segments(
+                    weight,
+                    &[VectorSegment::from((segment_ord, reader))],
+                    |_| {},
+                )?
+                .pop()
+                .ok_or_else(|| TantivyError::InternalError("missing segment result".into()));
+        }
         let (searched, mut totals) = measure(|| self.search_segment(weight, segment_ord, reader));
         let (results, report, merge) = searched?;
         if let Some(plan) = self
@@ -581,8 +606,8 @@ where
         Ok(plan)
     }
 
-    /// Collects the supplied segments in input order. One segment uses the existing segment
-    /// search; multiple segments share routing, a work budget, and the exact top-k bound.
+    /// Collects the supplied segments with global routing, a shared work budget, and an exact
+    /// top-k bound, unless the caller supplies a shared routing plan for independent probing.
     /// Located filter matches are exhaustive and reserve their share of the budget.
     /// Calls `on_segment` after each slice of work for per-segment read accounting.
     pub fn collect_segments(
@@ -591,7 +616,7 @@ where
         segments: &[VectorSegment<'_>],
         mut on_segment: impl FnMut(SegmentOrdinal),
     ) -> Result<Vec<SegmentVectorFruit<S::SortKey>>> {
-        if segments.len() <= 1 || self.routing_plan.is_some() {
+        if segments.is_empty() || self.routing_plan.is_some() {
             return segments
                 .iter()
                 .map(|segment| {
@@ -993,6 +1018,7 @@ where
         let (result, measured) = measure(|| {
             let mut scan = start_scan(i, pending_scans[i].take().unwrap())?;
             scan.swap_topk(&mut topk);
+            let _stage = enter_vector_stage(scan.shortlist_stage());
             while let Some(rows) = source.next()? {
                 let scored = scan.shortlist(&rows)?;
                 source.admitted(scored)?;
@@ -1018,6 +1044,7 @@ where
             }
             let scan = scans[i].as_mut().unwrap();
             scan.swap_topk(&mut topk);
+            let _stage = enter_vector_stage(scan.shortlist_stage());
             meter.open();
             if let Some(rows) = source.probe_global(candidate)? {
                 let scored = scan.shortlist(&rows)?;

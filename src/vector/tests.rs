@@ -1291,7 +1291,8 @@ mod centroid_storage_tests {
                 .collect();
             let prepared = VectorQuery::new(Metric::L2, Arc::new(query.to_vec()));
             let lazy: Vec<_> = ivf
-                .rank_clusters(&prepared, RoutingParams::default())
+                .opened_router()
+                .rank(&prepared, RoutingParams::default())
                 .take(2)
                 .collect();
             assert_eq!(owned.len(), lazy.len());

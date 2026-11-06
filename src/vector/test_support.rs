@@ -48,6 +48,7 @@ use crate::{
 #[derive(Clone, Copy)]
 pub(crate) struct SegmentRun<'a> {
     pub(crate) searcher: &'a SegmentSearcher<f32>,
+    pub(crate) routing: Option<&'a crate::vector::collector::SegmentRoutingPlan>,
     pub(crate) index: &'a ClusterIndex,
     pub(crate) weight: &'a dyn Weight,
     pub(crate) segment: &'a SegmentReader,
@@ -491,6 +492,35 @@ impl Fixture {
             .collect())
     }
 
+    fn routing_plan(
+        &self,
+        segment: &SegmentReader,
+        weight: &dyn Weight,
+        query: &[f32],
+        top_n: usize,
+        params: &ProbeParams,
+    ) -> crate::Result<Option<Arc<crate::vector::VectorRoutingPlan>>> {
+        let vectors = segment.vector_index(self.field)?;
+        let Some(index) = vectors.index() else {
+            return Ok(None);
+        };
+        let plan = SegmentPlan::build(params, index, weight, segment, top_n)?;
+        let Some(crate::vector::search::segment::plan::Source::Router(filter)) = plan.source else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(
+            crate::collector::TopDocs::with_limit(top_n.max(1))
+                .order_by_similarity(self.field, query.to_vec())
+                .with_probe_params(params.clone())
+                .build()
+                .route_segments(
+                    filter.match_fraction(segment.max_doc()),
+                    &[crate::vector::VectorSegment::from((0, segment))],
+                    |_| {},
+                )?,
+        )))
+    }
+
     /// Runs one segment's search directly, with any `top_n`, under `weight`.
     pub(crate) fn run_segment(
         &self,
@@ -502,6 +532,7 @@ impl Fixture {
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = self.index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[segment];
+        let routing = self.routing_plan(segment_reader, weight, query, top_n, &params)?;
         let backend = SegmentSearcher::<f32>::for_segment(
             segment_reader,
             segment as u32,
@@ -509,7 +540,8 @@ impl Fixture {
             Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec()))),
             None,
             params,
-        )?;
+        )?
+        .with_routing_plan(routing.map(|p| p as Arc<_>));
         backend.top_n(weight, segment_reader, top_n)
     }
 
@@ -552,6 +584,7 @@ impl Fixture {
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = self.index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[segment];
+        let routing = self.routing_plan(segment_reader, weight, query, top_n, &params)?;
         let query = Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec())));
         let quantized = segment_reader
             .vector_index(self.field)?
@@ -571,7 +604,8 @@ impl Fixture {
             query,
             quantized,
             params,
-        )?;
+        )?
+        .with_routing_plan(routing.map(|p| p as Arc<_>));
         backend.plan_override = plan;
         backend.admission_pruning_disabled = !admission_pruning;
         backend.collector_topk = collector_topk;
@@ -593,6 +627,7 @@ impl Fixture {
         let reader = segment.vector_index(self.field)?;
         let index = reader.index().expect("IVF segment");
         let weight = filter.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let routing = self.routing_plan(segment, weight.as_ref(), query, top_n, params)?;
         let backend = SegmentSearcher::<f32>::for_segment(
             segment,
             ordinal,
@@ -600,8 +635,10 @@ impl Fixture {
             Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec()))),
             None,
             params.clone(),
-        )?;
+        )?
+        .with_routing_plan(routing.clone().map(|p| p as Arc<_>));
         run(&SegmentRun {
+            routing: routing.as_ref().map(|p| &p.segments[&segment.segment_id()]),
             searcher: &backend,
             index,
             weight: weight.as_ref(),

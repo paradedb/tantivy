@@ -19,8 +19,6 @@ use crate::collector::{
 use crate::query::Weight;
 use crate::schema::Field;
 use crate::vector::params::ProbeParams;
-use crate::vector::router::candidate::Candidate;
-use crate::vector::router::RouterIter;
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery, VectorQuery};
 use crate::vector::search::scan::bound::{PruningBound, TopK};
 use crate::vector::search::scan::heap::{tie_break_key, TieBreakHits};
@@ -131,11 +129,6 @@ impl<T: VectorElement> SegmentSearcher<T> {
 
     pub(crate) fn reader(&self) -> &VectorIndexReader {
         &self.reader
-    }
-
-    #[cfg(test)]
-    pub(crate) fn query(&self) -> &VectorQuery<T> {
-        &self.query
     }
 
     pub(crate) fn segment_ord(&self) -> SegmentOrdinal {
@@ -281,33 +274,18 @@ impl<T: VectorElement> SegmentSearcher<T> {
         drop(init);
         let source = match source {
             Source::Router(filter) => {
-                let mut clusters = match routed {
-                    Some(route) => RouterClusters::from_ranked(
-                        &self.reader,
-                        RouterIter::new(
-                            route
-                                .clusters
-                                .iter()
-                                .map(|candidate| Candidate {
-                                    sim: candidate.sim,
-                                    node: candidate.node.into(),
-                                })
-                                .collect(),
-                            route.metrics,
-                        ),
-                        budget,
-                        filter,
-                        segment,
-                    ),
-                    None => RouterClusters::for_segment(
-                        &self.reader,
-                        &self.query,
-                        budget,
-                        filter,
-                        segment,
-                        &self.probe_params,
-                    ),
-                };
+                let route = routed.ok_or_else(|| {
+                    TantivyError::InvalidArgument(
+                        "IVF probing requires a global routing plan".into(),
+                    )
+                })?;
+                let mut clusters = RouterClusters::from_ranked(
+                    &self.reader,
+                    route.ranked_clusters(),
+                    budget,
+                    filter,
+                    segment,
+                );
                 scan.run(&mut clusters)?;
                 SourceReport::Router(clusters.finish())
             }

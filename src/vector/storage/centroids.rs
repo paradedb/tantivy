@@ -22,12 +22,10 @@ use std::mem;
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
 use crate::directory::FileSlice;
-use crate::schema::{Metric, VectorOptions};
-use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RoutingParams};
-use crate::vector::search::prepared::VectorQuery;
+use crate::schema::VectorOptions;
+use crate::vector::router::{OpenedRouter, RouterKind};
 use crate::vector::storage::blocks::BlockOffsets;
 use crate::vector::storage::io::{VectorRead, VectorReadKind};
-use crate::vector::VectorElement;
 
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
@@ -45,7 +43,6 @@ pub(crate) struct ClusterIndex {
     centroid_stride: usize,
     /// The same lazy tuple table used by the vector-column reader.
     block_offsets: BlockOffsets,
-    metric: Metric,
     router: OpenedRouter,
 }
 
@@ -130,7 +127,6 @@ impl ClusterIndex {
             centroids_slice,
             centroid_stride: options.bytes_per_vector(),
             block_offsets,
-            metric: options.metric(),
             router,
         };
         // Every distinct doc owns at least its primary row, so a doc count
@@ -223,27 +219,12 @@ impl ClusterIndex {
     pub(crate) fn opened_router(&self) -> &OpenedRouter {
         &self.router
     }
-
-    /// Rank this segment's clusters for `query`, nearest first. `params`
-    /// steers the stacked router only (how many clusters the caller will
-    /// probe); other routers ignore it.
-    pub(crate) fn rank_clusters<T: VectorElement>(
-        &self,
-        query: &VectorQuery<T>,
-        params: RoutingParams,
-    ) -> RouterIter {
-        #[cfg(test)]
-        if let Some(clusters) = crate::vector::router::test_clusters() {
-            return clusters;
-        }
-        debug_assert_eq!(query.metric(), self.metric);
-        self.router.rank(query, params)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::Metric;
     use crate::vector::storage::blocks::{
         block_len, pad, write_metadata, BlockOffsetsWriter, Blocks,
     };
