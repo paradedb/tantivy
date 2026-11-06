@@ -9,6 +9,7 @@ use quant::cascade::QueryRotationPlan;
 use quant::sign::encode_unbiased;
 
 use crate::directory::FileSlice;
+use crate::vector::storage::io::{VectorRead, VectorReadKind};
 
 /// The format fixes zero centering, a seeded orthogonal rotation, and the
 /// asymmetric sign estimator. Raw vectors are kept separately for exact reads.
@@ -117,13 +118,13 @@ impl SignVectors {
             } => SignBatch::Pinned {
                 codes: codes
                     .slice(rows.start * words * 8..rows.end * words * 8)
-                    .read_bytes()?,
+                    .read_vector_bytes(VectorReadKind::Other)?,
                 coefficients: coefficients
                     .slice(rows.start * 4..rows.end * 4)
-                    .read_bytes()?,
+                    .read_vector_bytes(VectorReadKind::Other)?,
                 norms: norms_squared
                     .slice(rows.start * 4..rows.end * 4)
-                    .read_bytes()?,
+                    .read_vector_bytes(VectorReadKind::Other)?,
             },
         };
         if self.dim % 64 != 0

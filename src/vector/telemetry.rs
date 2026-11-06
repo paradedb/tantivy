@@ -26,6 +26,8 @@ pub enum VectorStage {
     QueryPrep,
     /// Cluster routing.
     Routing,
+    /// The router's exact rerank of its retained members.
+    RoutingExact,
     /// Quantized layer scanning.
     LayerScan(u8),
     /// Quantized layer boundary selection.
@@ -53,6 +55,7 @@ impl VectorStage {
             Self::NonVectorSearch => Some(Cow::Borrowed("non_vector_search")),
             Self::QueryPrep => Some(Cow::Borrowed("query_prep")),
             Self::Routing => Some(Cow::Borrowed("routing")),
+            Self::RoutingExact => Some(Cow::Borrowed("routing_exact")),
             Self::LayerScan(layer) => Some(Cow::Owned(format!("layer{layer}_scan"))),
             Self::Boundary(layer) => Some(Cow::Owned(format!("boundary{layer}"))),
             Self::ExactScan => Some(Cow::Borrowed("exact_scan")),
@@ -67,7 +70,7 @@ impl VectorStage {
 
 // --- Totals ---
 
-const FIXED_SLOTS: usize = 11;
+const FIXED_SLOTS: usize = 12;
 const STAGE_SLOTS: usize = FIXED_SLOTS + 2 * MAX_QUANTIZATION_LAYERS;
 const FALLBACK_LAYERS: usize = 3;
 
@@ -93,6 +96,7 @@ fn slot(stage: VectorStage) -> usize {
         VectorStage::ResultAssembly => 8,
         VectorStage::Locate => 9,
         VectorStage::Centroid => 10,
+        VectorStage::RoutingExact => 11,
         VectorStage::LayerScan(l) => layer(FIXED_SLOTS, l),
         VectorStage::Boundary(l) => layer(FIXED_SLOTS + MAX_QUANTIZATION_LAYERS, l),
     }
@@ -282,6 +286,10 @@ mod tests {
         );
         assert_eq!(VectorStage::QueryPrep.name().as_deref(), Some("query_prep"));
         assert_eq!(VectorStage::Routing.name().as_deref(), Some("routing"));
+        assert_eq!(
+            VectorStage::RoutingExact.name().as_deref(),
+            Some("routing_exact")
+        );
         assert_eq!(
             VectorStage::LayerScan(2).name().as_deref(),
             Some("layer2_scan")

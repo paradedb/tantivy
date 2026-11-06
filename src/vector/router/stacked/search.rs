@@ -26,6 +26,12 @@ pub(crate) enum StackedRouting<'a, S> {
 pub(crate) trait RoutingOutput {
     fn record(&mut self, candidate: Candidate<(usize, u32)>);
     fn finish(self, best: TopCandidates<(usize, u32)>) -> Vec<Candidate<(usize, u32)>>;
+
+    /// The walk opened `list` of `level`. Observers only; routing ignores it.
+    fn opened(&mut self, _level: usize, _list: u32) {}
+
+    /// `best` is what `level` retained, before any exact rerank. Observers only.
+    fn retained(&mut self, _level: usize, _best: &TopCandidates<(usize, u32)>) {}
 }
 
 pub(crate) struct TopK;
