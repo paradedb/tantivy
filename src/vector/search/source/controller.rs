@@ -7,6 +7,8 @@
 /// How the probe loop stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize)]
 pub enum ProbeTermination {
+    /// The adaptive estimate reached the requested recall.
+    QuantizedRecall,
     /// The work budget was spent.
     Ceiling,
     /// The router ran out of clusters before the budget was spent.

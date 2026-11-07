@@ -17,6 +17,8 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 /// provisional pending real-data benchmarking.
 #[derive(Clone, Debug)]
 pub struct ProbeParams {
+    /// Stop probing when competitive-candidate admission has decayed.
+    pub adaptive_probing: Option<AdaptiveProbeParams>,
     /// Work ceiling as a fraction of each segment's capacity. Default 0.01.
     pub max_probe_fraction: f32,
     /// Approximate members retained per requested cluster by the quantized router.
@@ -43,6 +45,20 @@ pub struct ProbeParams {
     /// Cost of opening a cluster, in rows of full work; finite and positive. Default
     /// [`DEFAULT_FIXED_PROBE_COST_ROWS`].
     pub fixed_probe_cost_rows: f64,
+}
+
+/// Admission-rate stopping within the fixed routing and work budgets.
+#[derive(Clone, Copy, Debug)]
+pub struct AdaptiveProbeParams {
+    pub admission_fraction: f64,
+}
+
+impl Default for AdaptiveProbeParams {
+    fn default() -> Self {
+        Self {
+            admission_fraction: 0.0001,
+        }
+    }
 }
 
 /// Which segments take the located path: a segment whose filter matches at most a cap of
@@ -80,6 +96,7 @@ impl Selectivity {
 impl Default for ProbeParams {
     fn default() -> Self {
         Self {
+            adaptive_probing: None,
             max_probe_fraction: 0.01,
             router_rerank_factor: 1.0,
             router_min_beam_fraction: 0.5,
@@ -139,6 +156,13 @@ impl ProbeParams {
         clusters_in_segment: usize,
         native_docs_in_segment: usize,
     ) -> crate::Result<(f64, f64, f64)> {
+        if self.adaptive_probing.is_some_and(|p| {
+            !p.admission_fraction.is_finite() || !(0.0..=1.0).contains(&p.admission_fraction)
+        }) {
+            return Err(crate::TantivyError::InvalidArgument(
+                "adaptive admission fraction must be finite and between zero and one".into(),
+            ));
+        }
         if !(self.max_probe_fraction > 0.0) {
             return Err(crate::TantivyError::InvalidArgument(
                 "max_probe_fraction must be greater than 0".to_string(),
@@ -164,6 +188,34 @@ impl ProbeParams {
 #[cfg(test)]
 mod tests {
     use super::ProbeParams;
+
+    #[test]
+    fn adaptive_stopping_preserves_budget_and_routing() -> crate::Result<()> {
+        for fraction in [0.00001, 0.001, 0.02, 0.25, 1.0] {
+            for min_probe_clusters in [0, 10] {
+                let fixed = ProbeParams {
+                    max_probe_fraction: fraction,
+                    min_probe_clusters,
+                    ..Default::default()
+                };
+                let adaptive = ProbeParams {
+                    adaptive_probing: Some(super::AdaptiveProbeParams::default()),
+                    ..fixed.clone()
+                };
+                for (clusters, rows) in [(2, 40), (1000, 20_000)] {
+                    let budget = fixed.resolved_work_budget(clusters, rows)?;
+                    assert_eq!(budget, adaptive.resolved_work_budget(clusters, rows)?);
+                    for selectivity in [0.0, 0.001, 0.01, 0.1, 1.0] {
+                        assert_eq!(
+                            fixed.router_k(budget.0, budget.2, selectivity, clusters),
+                            adaptive.router_k(budget.0, budget.2, selectivity, clusters),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// Capacity is the cluster count, exactly, whatever the granularity:
     /// `units_seg = C*x + (1 - x)*N/n_avg == C` for every x the open

@@ -248,7 +248,11 @@ impl<T: VectorElement> SegmentSearcher<T> {
                 },
             ));
         };
+        let adaptive_probing = matches!(&source, Source::Router(_))
+            .then_some(self.probe_params.adaptive_probing)
+            .flatten();
         let config = ScanConfig {
+            adaptive_probing,
             top_n,
             capacity,
             exact_plan: self.probe_params.exact_plan,

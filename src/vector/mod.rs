@@ -77,7 +77,9 @@ pub use collector::{
     VectorSimilarityFruit,
 };
 pub use element::{Accumulator, VectorElement, ENTRY_ALIGN};
-pub use params::{LocatedPath, ProbeParams, Selectivity, DEFAULT_FIXED_PROBE_COST_ROWS};
+pub use params::{
+    AdaptiveProbeParams, LocatedPath, ProbeParams, Selectivity, DEFAULT_FIXED_PROBE_COST_ROWS,
+};
 pub use quantization::{VectorQuantizationConfig, VectorQuantizationLayer};
 pub use router::plan::{VectorRoutingPlan, VectorRoutingPlanProvider, VectorSegment};
 pub use router::{RouterKind, RouterMetrics};

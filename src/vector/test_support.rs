@@ -593,6 +593,7 @@ impl Fixture {
             plan,
             admission_pruning,
             None,
+            None,
         )
     }
 
@@ -608,10 +609,14 @@ impl Fixture {
         plan: Option<PlanOverride>,
         admission_pruning: bool,
         collector_topk: Option<Arc<Mutex<TopK>>>,
+        routing: Option<Arc<VectorRoutingPlan>>,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = self.index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[segment];
-        let routing = self.routing_plan(segment_reader, weight, query, top_n, &params)?;
+        let routing = match routing {
+            Some(plan) => Some(plan),
+            None => self.routing_plan(segment_reader, weight, query, top_n, &params)?,
+        };
         let query = Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec())));
         let quantized = segment_reader
             .vector_index(self.field)?
