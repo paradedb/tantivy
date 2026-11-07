@@ -59,6 +59,7 @@ mod tokenizer;
 
 pub use self::expand::{
     expand, Expansion, KeyDocs, SegmentSynonyms, SynonymExpander, SynonymSource,
+    DEFAULT_MAX_RULES_PER_KEY,
 };
 pub use self::rule::{CompiledRule, RuleError, SynonymRule, MAX_RULE_TERMS};
 pub use self::tokenizer::SynonymRuleTokenizer;

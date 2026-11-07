@@ -55,6 +55,11 @@ impl Expansion {
     }
 }
 
+/// The rules a key reads by default. A word in more rules reads only the first ones, so a common
+/// word costs a bounded lookup, the same way `PhrasePrefixQuery` caps its expansions. Lucene caps
+/// a boolean query at the same 1024 clauses.
+pub const DEFAULT_MAX_RULES_PER_KEY: usize = 1024;
+
 /// A key of a segment, with the documents of the rules that list it, deleted ones included.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyDocs {
@@ -115,9 +120,11 @@ impl SegmentSynonyms {
         })
     }
 
-    /// Every key that starts with `token`, with the documents of its rules. The result holds no
-    /// reader, so a caller can keep it for the life of the segment.
-    pub fn token_keys(&self, token: &str) -> crate::Result<Vec<KeyDocs>> {
+    /// Every key that starts with `token`, with the documents of its rules, at most `max_rules`
+    /// of them for a key. Past the limit a key keeps its first documents, so a merge can change
+    /// which rules count. The result holds no reader, so a caller can keep it for the life of the
+    /// segment.
+    pub fn token_keys(&self, token: &str, max_rules: usize) -> crate::Result<Vec<KeyDocs>> {
         let mut found = Vec::new();
         if token.contains(KEY_SEPARATOR) {
             return Ok(found);
@@ -142,7 +149,7 @@ impl SegmentSynonyms {
                 .read_postings_from_terminfo(keys.value(), IndexRecordOption::Basic)?;
             let mut docs = Vec::new();
             let mut doc = postings.doc();
-            while doc != TERMINATED {
+            while doc != TERMINATED && docs.len() < max_rules {
                 docs.push(doc);
                 doc = postings.advance();
             }
@@ -283,6 +290,7 @@ struct ReaderSegment {
 pub struct SynonymExpander {
     segments: Vec<ReaderSegment>,
     analyzer: TextAnalyzer,
+    max_rules_per_key: usize,
 }
 
 impl fmt::Debug for SynonymExpander {
@@ -322,7 +330,18 @@ impl SynonymExpander {
                 })
             })
             .collect::<crate::Result<_>>()?;
-        Ok(SynonymExpander { segments, analyzer })
+        Ok(SynonymExpander {
+            segments,
+            analyzer,
+            max_rules_per_key: DEFAULT_MAX_RULES_PER_KEY,
+        })
+    }
+
+    /// Reads at most `max_rules` rules for a key in each segment, instead of
+    /// [`DEFAULT_MAX_RULES_PER_KEY`].
+    pub fn with_max_rules_per_key(mut self, max_rules: usize) -> Self {
+        self.max_rules_per_key = max_rules;
+        self
     }
 
     /// Expands like [`expand`](fn@expand), and skips a rule whose document is deleted in its
@@ -343,6 +362,7 @@ impl SynonymExpander {
         let mut source = ReaderSource {
             segments: &self.segments,
             analyzer: self.analyzer.clone(),
+            max_rules_per_key: self.max_rules_per_key,
             is_alive,
         };
         expand(tokens, &mut source)
@@ -352,6 +372,7 @@ impl SynonymExpander {
 struct ReaderSource<'a, F> {
     segments: &'a [ReaderSegment],
     analyzer: TextAnalyzer,
+    max_rules_per_key: usize,
     is_alive: F,
 }
 
@@ -361,7 +382,10 @@ impl<F: FnMut(usize, DocId) -> bool> SynonymSource for ReaderSource<'_, F> {
     }
 
     fn token_keys(&mut self, segment: usize, token: &str) -> crate::Result<Arc<[KeyDocs]>> {
-        Ok(self.segments[segment].synonyms.token_keys(token)?.into())
+        Ok(self.segments[segment]
+            .synonyms
+            .token_keys(token, self.max_rules_per_key)?
+            .into())
     }
 
     fn alive_rules(

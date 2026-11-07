@@ -247,11 +247,43 @@ fn token_keys_returns_only_the_keys_that_start_with_the_token() {
         docs,
     };
     assert_eq!(
-        segment.token_keys("sofa").unwrap(),
+        segment
+            .token_keys("sofa", DEFAULT_MAX_RULES_PER_KEY)
+            .unwrap(),
         vec![
             key_docs(&["sofa"], vec![0]),
             key_docs(&["sofa", "bed"], vec![2])
         ]
+    );
+}
+
+#[test]
+fn a_key_in_more_rules_than_the_limit_reads_the_first_ones() {
+    let index = RulesIndex::with_rules(
+        plain(),
+        &[
+            "sofa, couch",
+            "sofa, divan",
+            "sofa, settee",
+            "sofa bed => futon",
+        ],
+    );
+    let searcher = index.searcher();
+    let segment = SegmentSynonyms::open(&searcher.segment_readers()[0], index.rule).unwrap();
+    let docs: Vec<Vec<DocId>> = segment
+        .token_keys("sofa", 2)
+        .unwrap()
+        .into_iter()
+        .map(|key_docs| key_docs.docs)
+        .collect();
+    assert_eq!(docs, vec![vec![0, 1], vec![3]]);
+    let expander = index.expander().with_max_rules_per_key(2);
+    assert_eq!(
+        expander.expand(&strings(&["sofa"])).unwrap(),
+        vec![expanded(
+            &["sofa"],
+            Some(&[&["couch"], &["divan"], &["sofa"]])
+        )]
     );
 }
 
@@ -390,7 +422,10 @@ impl SynonymSource for CachingSource {
         if let Some(keys) = self.keys.get(&key) {
             return Ok(keys.clone());
         }
-        let keys: Arc<[KeyDocs]> = self.segments[segment].synonyms.token_keys(token)?.into();
+        let keys: Arc<[KeyDocs]> = self.segments[segment]
+            .synonyms
+            .token_keys(token, DEFAULT_MAX_RULES_PER_KEY)?
+            .into();
         self.keys.insert(key, keys.clone());
         Ok(keys)
     }
