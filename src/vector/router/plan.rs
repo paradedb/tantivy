@@ -39,6 +39,7 @@ impl<'a> From<(SegmentOrdinal, &'a SegmentReader)> for VectorSegment<'a> {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct VectorRoutingPlan {
     pub(crate) field: Field,
+    pub(crate) num_clusters: usize,
     pub(crate) segments: HashMap<SegmentId, SegmentRoutingPlan>,
 }
 
@@ -122,6 +123,7 @@ impl VectorRoutingPlan {
             .sum();
         let mut plan = Self {
             field,
+            num_clusters: clusters,
             segments: HashMap::new(),
         };
         let Some(first) = vectors.first() else {

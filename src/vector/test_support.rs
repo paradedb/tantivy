@@ -422,6 +422,12 @@ pub(crate) fn routing_plan_for_clusters(
 ) -> Arc<VectorRoutingPlan> {
     Arc::new(VectorRoutingPlan {
         field,
+        num_clusters: segment
+            .vector_index(field)
+            .unwrap()
+            .index()
+            .unwrap()
+            .num_clusters(),
         segments: [(
             segment.segment_id(),
             SegmentRoutingPlan {

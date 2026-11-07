@@ -163,7 +163,7 @@ fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
             &AllQuery,
             &TopDocsByVectorSimilarityBuilder::new(field, vec![0.25; 65], 3)
                 .with_probe_params(ProbeParams {
-                    max_probe_fraction: 1.0,
+                    max_probe: f64::MAX,
                     min_probe_clusters: 2,
                     ..Default::default()
                 })
@@ -807,7 +807,7 @@ fn run_quantized_matrix_query(
     let expected = fixture_exact_hits(index, metric, &query, Some(filter), TOP_N)?;
     let collector = TopDocsByVectorSimilarityBuilder::new(field, query.clone(), TOP_N)
         .with_probe_params(ProbeParams {
-            max_probe_fraction: 1.0,
+            max_probe: f64::MAX,
             min_probe_clusters: 2,
             exact_plan: false,
             located: LocatedPath::Off,
@@ -873,10 +873,10 @@ fn run_quantized_matrix_query(
             .is_some_and(|boundary| boundary.contains(doc))),
         "{context}: the exact phase read a row absent from the final selection"
     );
-    for max_probe_fraction in [0.25, 1.0] {
+    for max_probe in [0.5, f64::MAX] {
         const ELIGIBILITY_TOP_N: usize = 8;
         let params = ProbeParams {
-            max_probe_fraction,
+            max_probe,
             min_probe_clusters: 2,
             exact_plan: false,
             located: LocatedPath::Off,
@@ -905,7 +905,7 @@ fn run_quantized_matrix_query(
             .scored_docs,
             crate::vector::test_support::doc_trace(index, field, &level0.stats[0].quantized_trace)?
                 .scored_docs,
-            "{context}: selected candidate set at probe fraction {max_probe_fraction}"
+            "{context}: selected candidate set at probe budget {max_probe}"
         );
     }
     match scenario {
@@ -1021,7 +1021,7 @@ fn level_zero_matches_unquantized_ivf() -> crate::Result<()> {
     const DIM: usize = 64;
     let query = vec![0.05_f32; DIM];
     let params = ProbeParams {
-        max_probe_fraction: 0.5,
+        max_probe: 1.0,
         min_probe_clusters: 1,
         exact_plan: false,
         located: LocatedPath::Off,
@@ -1177,7 +1177,7 @@ fn mixed_segments_share_preparation_by_stored_metadata() -> crate::Result<()> {
         let make_collector = || {
             TopDocsByVectorSimilarityBuilder::new(field, fixture_search_query(Metric::L2, 64), 5)
                 .with_probe_params(ProbeParams {
-                    max_probe_fraction: 1.0,
+                    max_probe: f64::MAX,
                     min_probe_clusters: 2,
                     ..Default::default()
                 })
@@ -1329,7 +1329,7 @@ fn merge_quantization_matches_kernel_harness_and_is_reproducible() -> crate::Res
     let query = vec![0.05_f32; QUANT_FIXTURE_DIM];
     let collector = TopDocsByVectorSimilarityBuilder::new(field, query.clone(), 3)
         .with_probe_params(ProbeParams {
-            max_probe_fraction: 1.0,
+            max_probe: f64::MAX,
             min_probe_clusters: 2,
             exact_plan: false,
             located: LocatedPath::Off,
@@ -1396,7 +1396,7 @@ fn quantized_exhaustive_search_probes_all_clusters() -> crate::Result<()> {
     let searcher = index.reader()?.searcher();
     let collector = TopDocsByVectorSimilarityBuilder::new(field, query.clone(), 3)
         .with_probe_params(ProbeParams {
-            max_probe_fraction: 1.0,
+            max_probe: f64::MAX,
             min_probe_clusters: 1,
             exact_plan: false,
             located: LocatedPath::Off,
@@ -1424,7 +1424,7 @@ fn quantized_probe_terminates_at_ceiling() -> crate::Result<()> {
     let searcher = index.reader()?.searcher();
     let collector = TopDocsByVectorSimilarityBuilder::new(field, query.clone(), 3)
         .with_probe_params(ProbeParams {
-            max_probe_fraction: 0.1,
+            max_probe: 0.2,
             exact_plan: false,
             located: LocatedPath::Off,
             ..Default::default()
@@ -1465,7 +1465,7 @@ fn quantized_filtered_rows_are_not_charged() -> crate::Result<()> {
         IndexRecordOption::Basic,
     );
     let params = ProbeParams {
-        max_probe_fraction: 1.0,
+        max_probe: f64::MAX,
         min_probe_clusters: 2,
         exact_plan: false,
         located: LocatedPath::Off,
@@ -1625,7 +1625,7 @@ fn general_dimension_quantized_bridge_at_d100() -> crate::Result<()> {
             &AllQuery,
             &TopDocsByVectorSimilarityBuilder::new(field, query.clone(), 3)
                 .with_probe_params(ProbeParams {
-                    max_probe_fraction: 1.0,
+                    max_probe: f64::MAX,
                     min_probe_clusters: 2,
                     ..Default::default()
                 })
@@ -1729,7 +1729,7 @@ fn estimator_measurement_uses_production_path_and_is_centered() -> crate::Result
         &AllQuery,
         &TopDocsByVectorSimilarityBuilder::new(field, queries[0].clone(), 3)
             .with_probe_params(ProbeParams {
-                max_probe_fraction: 1.0,
+                max_probe: f64::MAX,
                 min_probe_clusters: 2,
                 exact_plan: false,
                 located: LocatedPath::Off,
@@ -1831,7 +1831,7 @@ fn layer_zero_io_matches_requested_page_spans() -> crate::Result<()> {
         &AllQuery,
         &TopDocsByVectorSimilarityBuilder::new(field, fixture_search_query(Metric::L2, 64), 16)
             .with_probe_params(ProbeParams {
-                max_probe_fraction: 1.0,
+                max_probe: f64::MAX,
                 min_probe_clusters: 2,
                 exact_plan: false,
                 located: LocatedPath::Off,

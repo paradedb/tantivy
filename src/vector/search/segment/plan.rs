@@ -133,6 +133,38 @@ impl SegmentPlan {
         })
     }
 
+    pub(crate) fn apply_global_budget(
+        &mut self,
+        params: &ProbeParams,
+        max_doc: DocId,
+        global_clusters: usize,
+    ) {
+        if self.source.is_none() {
+            return;
+        }
+        let global_budget = params
+            .max_probe
+            .max(params.min_probe_clusters as f64)
+            .min(global_clusters as f64);
+        self.budget.total = WorkUnits::new(
+            global_budget * self.report.segment_clusters as f64 / global_clusters.max(1) as f64,
+        );
+        let x = self.budget.per_cluster.get();
+        let n_avg = (1.0 - x) / self.budget.per_row.get();
+        let cap = located_cap(params.located, max_doc, self.budget.total.get(), n_avg, x);
+        self.report.located_cap = cap;
+        self.source = self.source.take().map(|source| match source {
+            Source::FilterMatches(docs) if docs.len() > cap => {
+                let mut filter = BitSet::with_max_value(max_doc);
+                for doc in docs {
+                    filter.insert(doc);
+                }
+                Source::Router(DocFilter::Docs(filter))
+            }
+            source => source,
+        });
+    }
+
     /// The rows the scan admits under the budget, for reserving its columns once. The last
     /// cluster can overshoot the budget, growing the columns once more.
     pub(crate) fn capacity_hint(&self) -> usize {
@@ -370,7 +402,7 @@ mod tests {
         // routes, and a filter matching nothing still reports the cap.
         let ivf_docs = ivf.num_docs();
         let auto = ProbeParams {
-            max_probe_fraction: 0.2,
+            max_probe: 1.8,
             min_probe_clusters: 1,
             located: LocatedPath::Auto,
             ..ProbeParams::default()
@@ -394,6 +426,20 @@ mod tests {
                 "matches={matches}"
             );
         }
+        let weight = DocsWeight {
+            max_doc: segment.max_doc(),
+            docs: (0..cap as DocId).collect(),
+        };
+        let mut shared = SegmentPlan::build(&auto, ivf, &weight, segment, 10)?;
+        assert!(matches!(shared.source, Some(Source::FilterMatches(_))));
+        shared.apply_global_budget(&auto, segment.max_doc(), ivf.num_clusters() * 2);
+        assert!((shared.budget.total.get() - budget / 2.0).abs() < 1e-9);
+        let Some(Source::Router(DocFilter::Docs(matches))) = shared.source else {
+            panic!("matches exceeding the reduced budget must route");
+        };
+        assert_eq!(matches.len(), weight.docs.len());
+        assert!(weight.docs.iter().all(|&doc| matches.contains(doc)));
+
         // Every mode reports its cap, and an unfiltered query routes.
         for (located, cap) in [(LocatedPath::Off, 0), (capped(9).located, 9)] {
             let params = ProbeParams {

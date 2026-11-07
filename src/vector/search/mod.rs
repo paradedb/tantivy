@@ -217,18 +217,23 @@ impl<T: VectorElement> SegmentSearcher<T> {
         C: Comparator<K::SegmentSortKey>,
     {
         let init = enter_vector_stage(VectorStage::ScanInit);
-        let plan = SegmentPlan::build(&self.probe_params, index, weight, segment, top_n)?;
+        let mut plan = SegmentPlan::build(&self.probe_params, index, weight, segment, top_n)?;
         let routed = self
             .routing_plan
             .as_ref()
             .map(|provider| {
-                let plan = provider.get()?;
-                if plan.field != self.field {
+                let routing = provider.get()?;
+                if routing.field != self.field {
                     return Err(TantivyError::InvalidArgument(
                         "routing plan belongs to a different vector field".into(),
                     ));
                 }
-                plan.segments.get(&segment.segment_id()).ok_or_else(|| {
+                plan.apply_global_budget(
+                    &self.probe_params,
+                    segment.max_doc(),
+                    routing.num_clusters,
+                );
+                routing.segments.get(&segment.segment_id()).ok_or_else(|| {
                     TantivyError::InvalidArgument("segment is missing from the routing plan".into())
                 })
             })

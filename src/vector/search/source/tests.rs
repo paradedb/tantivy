@@ -105,10 +105,10 @@ fn separated_fixture(clusters: usize) -> crate::Result<Fixture> {
     FixtureSpec::ivf(Metric::L2, centroids, vectors).build()
 }
 
-/// A budget of `max_probe_fraction` on the routed path.
-fn budget_params(max_probe_fraction: f32) -> ProbeParams {
+/// A budget of `max_probe` on the routed path.
+fn budget_params(max_probe: f64) -> ProbeParams {
     ProbeParams {
-        max_probe_fraction,
+        max_probe,
         min_probe_clusters: 1,
         exact_plan: false,
         located: LocatedPath::Off,
@@ -124,7 +124,13 @@ fn budget_params(max_probe_fraction: f32) -> ProbeParams {
 fn controller_charges_opens_and_scored_rows() -> crate::Result<()> {
     // Sizes [5, 2, 2, 1]: an exhaustive walk charges exactly C = 4 whatever the skew.
     let fixture = sized_fixture(&[5, 2, 2, 1], 0.01)?;
-    let full = walk_fixture(&fixture, &AllQuery, &[0.0, 0.0], 11, budget_params(1.0))?;
+    let full = walk_fixture(
+        &fixture,
+        &AllQuery,
+        &[0.0, 0.0],
+        11,
+        budget_params(f64::MAX),
+    )?;
     assert_eq!(full.report.probe.termination, ProbeTermination::Exhausted);
     assert!(
         (full.report.probe.work_charged - 4.0).abs() <= 4e-6,
@@ -132,10 +138,10 @@ fn controller_charges_opens_and_scored_rows() -> crate::Result<()> {
         full.report
     );
 
-    // Sizes [30, 2, 2, 2, 2, 2]: n_avg = 20/3, x ~ 0.1975, a row ~ 0.1204. At f = 0.8 (budget 4.8)
+    // Sizes [30, 2, 2, 2, 2, 2]: n_avg = 20/3, x ~ 0.1975, a row ~ 0.1204. At a budget of 4.8
     // the big cluster charges ~3.809 and each small one ~0.438, so the fourth open crosses it.
     let fixture = sized_fixture(&[30, 2, 2, 2, 2, 2], 0.001)?;
-    let skewed = walk_fixture(&fixture, &AllQuery, &[0.0, 0.0], 41, budget_params(0.8))?;
+    let skewed = walk_fixture(&fixture, &AllQuery, &[0.0, 0.0], 41, budget_params(4.8))?;
     let probe = skewed.report.probe;
     assert_eq!(probe.termination, ProbeTermination::Ceiling);
     assert_eq!(skewed.clusters.len(), 4, "{:?}", skewed.report);
@@ -155,14 +161,19 @@ fn controller_charges_opens_and_scored_rows() -> crate::Result<()> {
     let max_doc = first_segment(&fixture.index.reader()?.searcher())
         .1
         .max_doc();
-    let filtered =
-        fixture.with_segment(&AllQuery, &[0.0, 0.0], 23, &budget_params(1.0), |seg| {
+    let filtered = fixture.with_segment(
+        &AllQuery,
+        &[0.0, 0.0],
+        23,
+        &budget_params(f64::MAX),
+        |seg| {
             let weight = DocsWeight { max_doc, docs };
             walk(&SegmentRun {
                 weight: &weight,
                 ..*seg
             })
-        })?;
+        },
+    )?;
     let counters = filtered.report.counters;
     assert_eq!(counters.postings_row + counters.postings_skipped, 2);
     assert_eq!(counters.vectors_visited, 22);
@@ -214,7 +225,7 @@ fn probe_termination() -> crate::Result<()> {
     // A binding budget is recorded, stops before exhaustion, and overshoots by at most one
     // cluster's charge.
     let fixture = grid(Metric::L2, RouterKind::Exact)?;
-    let params = budget_params(0.2);
+    let params = budget_params(1.8);
     let probe = fixture.with_segment(&AllQuery, &[0.0, 0.0], 3, &params, |seg| {
         let (budget, n_avg, x) =
             params.resolved_work_budget(seg.index.num_clusters(), seg.index.num_docs())?;

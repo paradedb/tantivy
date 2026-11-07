@@ -313,8 +313,7 @@ impl Fixture {
 /// Probes about `clusters` clusters: the budget is that many average clusters of work.
 fn probing(clusters: usize, located: LocatedPath) -> ProbeParams {
     ProbeParams {
-        max_probe_fraction: 1e-6,
-        min_probe_clusters: clusters,
+        max_probe: clusters as f64,
         located,
         ..ProbeParams::default()
     }
@@ -474,7 +473,7 @@ fn peak_on_a_large_segment() -> tantivy::Result<()> {
         ("located", located_everything()),
     ] {
         let params = ProbeParams {
-            max_probe_fraction: 0.25,
+            max_probe: 64.0,
             min_probe_clusters: 1,
             located,
             ..ProbeParams::default()

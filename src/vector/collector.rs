@@ -1165,7 +1165,7 @@ mod ivf_e2e_tests {
                 .order_by_similarity(fixture.field, query.clone())
                 .with_max_scan_levels(max_scan_levels)
                 .with_probe_params(ProbeParams {
-                    max_probe_fraction: 0.0005,
+                    max_probe: 0.0005,
                     min_probe_clusters: 0,
                     exact_plan: false,
                     located: LocatedPath::Off,
@@ -1439,7 +1439,7 @@ mod ivf_e2e_tests {
         let mut query = vec![0.0; 32];
         query[5] = 1.0;
         let params = ProbeParams {
-            max_probe_fraction: 0.001,
+            max_probe: 0.001,
             min_probe_clusters: 3,
             ..Default::default()
         };
@@ -1578,7 +1578,7 @@ mod ivf_e2e_tests {
         let mut query = vec![0.0; 64];
         query[2] = 1.0;
         let params = ProbeParams {
-            max_probe_fraction: 0.125,
+            max_probe: 3.0,
             located: LocatedPath::Off,
             exact_plan: false,
             ..Default::default()
@@ -1625,6 +1625,67 @@ mod ivf_e2e_tests {
         }
         let expected = searcher.search(&filter, &builder().build())?;
         assert_eq!(fruit.results, expected.results);
+        Ok(())
+    }
+
+    #[test]
+    fn routing_plan_shares_absolute_budget_across_unequal_segments() -> Result<()> {
+        let fixtures = [4, 8, 16]
+            .map(|clusters| FixtureSpec::clustered(Metric::L2, 32, clusters, clusters * 32).build())
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let searchers = fixtures
+            .iter()
+            .map(|fixture| fixture.index.reader().map(|reader| reader.searcher()))
+            .collect::<Result<Vec<_>>>()?;
+        let segments = searchers
+            .iter()
+            .enumerate()
+            .map(|(ordinal, searcher)| {
+                VectorSegment::from((ordinal as u32, searcher.segment_reader(0)))
+            })
+            .collect::<Vec<_>>();
+        let field = fixtures[0].field;
+        let weight = fixtures[0].all()?;
+        for max_probe in [3.0, 8.0, 100.0] {
+            let params = ProbeParams {
+                max_probe,
+                located: LocatedPath::Off,
+                ..Default::default()
+            };
+            let plan = VectorRoutingPlan::build(
+                field,
+                vec![0.0f32; 32],
+                params.clone(),
+                1.0,
+                &segments,
+                |_| {},
+            )?;
+            let collector = TopDocs::with_limit(3)
+                .order_by_similarity(field, vec![0.0f32; 32])
+                .with_probe_params(params)
+                .with_routing_plan(Arc::new(plan))
+                .build();
+            let fruit = collector.merge_fruits(collector.collect_segments(
+                weight.as_ref(),
+                &segments,
+                |_| {},
+            )?)?;
+            let total = max_probe.min(28.0);
+            assert!(
+                (fruit
+                    .stats
+                    .iter()
+                    .map(|stats| stats.work_budget)
+                    .sum::<f32>() as f64
+                    - total)
+                    .abs()
+                    < 1e-5
+            );
+            for (stats, clusters) in fruit.stats.iter().zip([4, 8, 16]) {
+                assert!((stats.work_budget as f64 - total * clusters as f64 / 28.0).abs() < 1e-5);
+            }
+        }
         Ok(())
     }
 
@@ -1765,7 +1826,7 @@ mod ivf_e2e_tests {
         let mut query = vec![0.0; 32];
         query[3] = 1.0;
         let params = ProbeParams {
-            max_probe_fraction: 0.0001,
+            max_probe: 0.0001,
             min_probe_clusters: 3,
             ..Default::default()
         };
@@ -1804,7 +1865,7 @@ mod ivf_e2e_tests {
             .iter()
             .all(|(_, address)| address.segment_ord == 1));
         assert_eq!(fruit.stats[0].candidates_scored, 0);
-        assert!(fruit.stats.iter().all(|s| s.work_budget == 3.0));
+        assert!(fruit.stats.iter().all(|s| s.work_budget == 1.5));
         assert!(fruit.stats.iter().map(|s| s.work_charged).sum::<f32>() < 4.1);
         Ok(())
     }
@@ -1827,7 +1888,7 @@ mod ivf_e2e_tests {
             TopDocs::with_limit(10)
                 .order_by_similarity(fixture.field, query.clone())
                 .with_probe_params(ProbeParams {
-                    max_probe_fraction: 0.0005,
+                    max_probe: 0.0005,
                     min_probe_clusters: 16,
                     ..Default::default()
                 })
@@ -1902,7 +1963,7 @@ mod ivf_e2e_tests {
                     adaptive_probing: adaptive.then_some(crate::vector::AdaptiveProbeParams {
                         admission_fraction: 1e-20,
                     }),
-                    max_probe_fraction: 0.25,
+                    max_probe: 8.0,
                     located: LocatedPath::Off,
                     ..Default::default()
                 })

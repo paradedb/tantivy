@@ -19,8 +19,8 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 pub struct ProbeParams {
     /// Stop probing when competitive-candidate admission has decayed.
     pub adaptive_probing: Option<AdaptiveProbeParams>,
-    /// Work ceiling as a fraction of each segment's capacity. Default 0.01.
-    pub max_probe_fraction: f32,
+    /// Global work ceiling in average-cluster units. Default 100.
+    pub max_probe: f64,
     /// Approximate members retained per requested cluster by the quantized router.
     /// Fractional values are rounded up to whole candidates and clamped to at
     /// least 1.0. A factor of 1.0 still reranks exactly; it only removes padding.
@@ -97,7 +97,7 @@ impl Default for ProbeParams {
     fn default() -> Self {
         Self {
             adaptive_probing: None,
-            max_probe_fraction: 0.01,
+            max_probe: 100.0,
             router_rerank_factor: 1.0,
             router_min_beam_fraction: 0.5,
             router_aps: true,
@@ -146,10 +146,10 @@ impl ProbeParams {
 impl ProbeParams {
     /// The segment's work budget with the pricing it was resolved under, `(budget, n_avg, x)`.
     ///
-    /// The budget is `max_probe_fraction` of the segment's capacity in work units, floored at
+    /// The absolute `max_probe` budget is floored at
     /// `min_probe_clusters` and capped at the capacity; `n_avg` is the docs per cluster and `x` the
     /// open share. `native_docs_in_segment` counts distinct docs with a vector, as written. A
-    /// non-positive `max_probe_fraction` or a non-finite or non-positive `fixed_probe_cost_rows` is
+    /// non-finite or non-positive `max_probe` or `fixed_probe_cost_rows` is
     /// an error.
     pub(crate) fn resolved_work_budget(
         &self,
@@ -163,9 +163,9 @@ impl ProbeParams {
                 "adaptive admission fraction must be finite and between zero and one".into(),
             ));
         }
-        if !(self.max_probe_fraction > 0.0) {
+        if !(self.max_probe.is_finite() && self.max_probe > 0.0) {
             return Err(crate::TantivyError::InvalidArgument(
-                "max_probe_fraction must be greater than 0".to_string(),
+                "max_probe must be finite and greater than 0".to_string(),
             ));
         }
         if !(self.fixed_probe_cost_rows.is_finite() && self.fixed_probe_cost_rows > 0.0) {
@@ -178,7 +178,8 @@ impl ProbeParams {
         let x = open_share(self.fixed_probe_cost_rows, n_avg);
         let segment_units = clusters_in_segment as f64 * x
             + (1.0 - x) * native_docs_in_segment as f64 / n_avg.max(f64::MIN_POSITIVE);
-        let budget = (self.max_probe_fraction as f64 * segment_units)
+        let budget = self
+            .max_probe
             .max(self.min_probe_clusters as f64)
             .min(segment_units);
         Ok((budget, n_avg, x))
@@ -191,10 +192,10 @@ mod tests {
 
     #[test]
     fn adaptive_stopping_preserves_budget_and_routing() -> crate::Result<()> {
-        for fraction in [0.00001, 0.001, 0.02, 0.25, 1.0] {
+        for budget in [0.01, 1.0, 20.0, 250.0, 1000.0] {
             for min_probe_clusters in [0, 10] {
                 let fixed = ProbeParams {
-                    max_probe_fraction: fraction,
+                    max_probe: budget,
                     min_probe_clusters,
                     ..Default::default()
                 };
@@ -217,14 +218,11 @@ mod tests {
         Ok(())
     }
 
-    /// Capacity is the cluster count, exactly, whatever the granularity:
-    /// `units_seg = C*x + (1 - x)*N/n_avg == C` for every x the open
-    /// share can resolve to. That identity is what lets `f` keep meaning
-    /// "this fraction of the index's work" at any granularity.
+    /// Exhaustive work is the cluster count at every granularity.
     #[test]
     fn capacity_is_the_cluster_count() -> crate::Result<()> {
         let all = ProbeParams {
-            max_probe_fraction: 1.0,
+            max_probe: f64::MAX,
             min_probe_clusters: 1,
             ..Default::default()
         };
@@ -232,33 +230,27 @@ mod tests {
             let (budget, _n_avg, _x) = all.resolved_work_budget(clusters, docs)?;
             assert!(
                 (budget - clusters as f64).abs() <= 1e-9 * clusters as f64,
-                "f=1 must buy exactly C units at C={clusters}, N={docs}: {budget}"
+                "an exhaustive budget must buy exactly C units at C={clusters}, N={docs}: {budget}"
             );
         }
         Ok(())
     }
 
-    /// The fraction scales the capacity without a default floor, including sub-cluster budgets.
     #[test]
-    fn budget_resolves_against_capacity() -> crate::Result<()> {
+    fn budget_is_absolute_and_capped_by_capacity() -> crate::Result<()> {
         let params = ProbeParams {
-            max_probe_fraction: 0.25,
+            max_probe: 10.0,
             ..Default::default()
         };
-        let (budget, _, _) = params.resolved_work_budget(1000, 20_000)?;
-        assert!((budget - 250.0).abs() < 1e-6, "{budget}");
-        let (budget, _, _) = params.resolved_work_budget(40, 800)?;
-        assert!((budget - 10.0).abs() < 1e-6, "{budget}");
-        let (budget, _, _) = params.resolved_work_budget(2, 40)?;
-        assert!((budget - 0.5).abs() < 1e-6, "{budget}");
-        // A fraction above 1.0 clamps to the capacity - small segments
-        // scan exhaustively.
-        let all = ProbeParams {
-            max_probe_fraction: 2.0,
-            ..Default::default()
+        for (clusters, rows, expected) in [(1000, 20_000, 10.0), (40, 800, 10.0), (2, 40, 2.0)] {
+            let (budget, _, _) = params.resolved_work_budget(clusters, rows)?;
+            assert!((budget - expected).abs() < 1e-9);
+        }
+        let fractional = ProbeParams {
+            max_probe: 0.5,
+            ..params
         };
-        let (budget, _, _) = all.resolved_work_budget(10, 200)?;
-        assert!((budget - 10.0).abs() < 1e-6, "{budget}");
+        assert_eq!(fractional.resolved_work_budget(1000, 20_000)?.0, 0.5);
         Ok(())
     }
 
@@ -281,12 +273,12 @@ mod tests {
         assert_eq!(params.router_k(0.0, x, 1.0, 0), 1);
     }
 
-    /// A non-positive probe fraction or a non-finite or non-positive open cost is an error.
+    /// Budgets and open costs must be finite and positive.
     #[test]
     fn invalid_budget_params_error() {
-        for fraction in [0.0, -1.0] {
+        for budget in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let params = ProbeParams {
-                max_probe_fraction: fraction,
+                max_probe: budget,
                 ..Default::default()
             };
             assert!(params.resolved_work_budget(9, 180).is_err());
