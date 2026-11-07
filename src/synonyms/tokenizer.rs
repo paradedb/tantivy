@@ -1,6 +1,6 @@
 //! The tokenizer of a synonym rule field.
 
-use super::rule::SynonymRule;
+use super::rule::CompiledRule;
 use crate::tokenizer::{PreTokenizedStream, PreTokenizedString, TextAnalyzer, Token, Tokenizer};
 
 /// Joins the tokens of a key. A rule cannot contain it, so two keys never join to the same term.
@@ -10,7 +10,7 @@ pub(crate) const KEY_SEPARATOR: char = '\0';
 /// one term per key, the analyzed tokens of the key joined with a zero byte.
 ///
 /// A line that is not a valid rule gives no term, and its document is still added. Use
-/// [`SynonymRule::check`] to reject it instead.
+/// [`SynonymRule::check`](super::SynonymRule::check) to reject it instead.
 #[derive(Clone)]
 pub struct SynonymRuleTokenizer {
     analyzer: TextAnalyzer,
@@ -28,13 +28,9 @@ impl Tokenizer for SynonymRuleTokenizer {
     type TokenStream<'a> = PreTokenizedStream;
 
     fn token_stream<'a>(&'a mut self, text: &'a str) -> PreTokenizedStream {
-        let keys = match SynonymRule::parse(text) {
-            Ok(Some(rule)) => rule
-                .compile(&mut self.analyzer)
-                .map(|rule| rule.keys)
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
+        let keys = CompiledRule::from_line(text, &mut self.analyzer)
+            .map(|rule| rule.keys)
+            .unwrap_or_default();
         let separator = KEY_SEPARATOR.to_string();
         let tokens = keys
             .iter()
@@ -57,6 +53,7 @@ impl Tokenizer for SynonymRuleTokenizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::synonyms::SynonymRule;
     use crate::tokenizer::{SimpleTokenizer, StopWordFilter, TokenStream};
 
     /// The insert check and the tokenizer must agree. Otherwise a rule that passes the check is

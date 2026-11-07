@@ -206,9 +206,10 @@ fn a_query_token_with_a_zero_byte_matches_no_key() {
     );
 }
 
+/// A caller with the rule text elsewhere needs no column, but the expander reads it from one.
 #[test]
-fn the_rule_field_is_indexed_and_fast_with_raw() {
-    for options in [TEXT, TEXT.set_fast("default")] {
+fn the_rule_field_is_fast_only_with_raw() {
+    let open = |options: TextOptions| {
         let mut schema_builder = Schema::builder();
         let rule = schema_builder.add_text_field("rule", options);
         let index = Index::create_in_ram(schema_builder.build());
@@ -216,13 +217,20 @@ fn the_rule_field_is_indexed_and_fast_with_raw() {
         writer.add_document(doc!(rule => "sofa, couch")).unwrap();
         writer.commit().unwrap();
         let searcher = index.reader().unwrap().searcher();
-        let err = SynonymExpander::new(searcher.segment_readers(), rule, plain()).unwrap_err();
-        assert!(matches!(err, TantivyError::SchemaError(_)), "{err:?}");
-    }
+        let segment = SegmentSynonyms::open(&searcher.segment_readers()[0], rule).map(drop);
+        let expander = SynonymExpander::new(searcher.segment_readers(), rule, plain()).map(drop);
+        (segment, expander)
+    };
+    let schema_error =
+        |result: crate::Result<()>| matches!(result, Err(TantivyError::SchemaError(_)));
+    let (segment, expander) = open(TEXT);
+    assert!(segment.is_ok() && schema_error(expander));
+    let (segment, expander) = open(TEXT.set_fast("default"));
+    assert!(schema_error(segment) && schema_error(expander));
 }
 
 #[test]
-fn token_rules_returns_only_the_keys_that_start_with_the_token() {
+fn token_keys_returns_only_the_keys_that_start_with_the_token() {
     let index = RulesIndex::with_rules(
         plain(),
         &[
@@ -234,21 +242,15 @@ fn token_rules_returns_only_the_keys_that_start_with_the_token() {
     );
     let searcher = index.searcher();
     let segment = SegmentSynonyms::open(&searcher.segment_readers()[0], index.rule).unwrap();
-    let keys: Vec<_> = segment
-        .token_rules("sofa", &mut plain())
-        .unwrap()
-        .into_iter()
-        .map(|key_rules| (key_rules.key, key_rules.rules))
-        .collect();
-    let rule = |doc, alternatives: &[&[&str]]| RuleAlternatives {
-        doc,
-        alternatives: lists(alternatives),
+    let key_docs = |key: &[&str], docs: Vec<DocId>| KeyDocs {
+        key: strings(key),
+        docs,
     };
     assert_eq!(
-        keys,
+        segment.token_keys("sofa").unwrap(),
         vec![
-            (strings(&["sofa"]), vec![rule(0, &[&["sofa"], &["couch"]])]),
-            (strings(&["sofa", "bed"]), vec![rule(2, &[&["futon"]])]),
+            key_docs(&["sofa"], vec![0]),
+            key_docs(&["sofa", "bed"], vec![2])
         ]
     );
 }
@@ -347,12 +349,13 @@ struct CachedSegment {
     ids: Column<u64>,
 }
 
-/// Caches what each segment holds for a token, and checks liveness on every call. `deleted` holds
-/// the deletes that are not in the bitsets yet.
+/// Caches what each segment holds for a token and the compiled rules of each document, and
+/// checks liveness on every call. `deleted` holds the deletes that are not in the bitsets yet.
 struct CachingSource {
     segments: Vec<CachedSegment>,
     analyzer: TextAnalyzer,
-    cache: HashMap<(usize, String), Arc<[KeyRules]>>,
+    keys: HashMap<(usize, String), Arc<[KeyDocs]>>,
+    rules: HashMap<(usize, DocId), Arc<[CompiledRule]>>,
     deleted: BTreeSet<u64>,
 }
 
@@ -370,7 +373,8 @@ impl CachingSource {
         CachingSource {
             segments,
             analyzer: plain(),
-            cache: HashMap::new(),
+            keys: HashMap::new(),
+            rules: HashMap::new(),
             deleted: BTreeSet::new(),
         }
     }
@@ -381,26 +385,39 @@ impl SynonymSource for CachingSource {
         self.segments.len()
     }
 
-    fn token_rules(&mut self, segment: usize, token: &str) -> crate::Result<Arc<[KeyRules]>> {
+    fn token_keys(&mut self, segment: usize, token: &str) -> crate::Result<Arc<[KeyDocs]>> {
         let key = (segment, token.to_string());
-        if let Some(rules) = self.cache.get(&key) {
-            return Ok(rules.clone());
+        if let Some(keys) = self.keys.get(&key) {
+            return Ok(keys.clone());
         }
-        let rules: Arc<[KeyRules]> = self.segments[segment]
-            .synonyms
-            .token_rules(token, &mut self.analyzer)?
-            .into();
-        self.cache.insert(key, rules.clone());
-        Ok(rules)
+        let keys: Arc<[KeyDocs]> = self.segments[segment].synonyms.token_keys(token)?.into();
+        self.keys.insert(key, keys.clone());
+        Ok(keys)
     }
 
-    fn is_alive(&mut self, segment: usize, doc: DocId) -> bool {
-        let segment = &self.segments[segment];
-        let in_bitset = segment
+    fn alive_rules(
+        &mut self,
+        segment: usize,
+        doc: DocId,
+    ) -> crate::Result<Option<Arc<[CompiledRule]>>> {
+        let cached = &self.segments[segment];
+        let in_bitset = cached
             .alive
             .as_ref()
             .is_none_or(|alive| alive.is_alive(doc));
-        in_bitset && !self.deleted.contains(&segment.ids.first(doc).unwrap())
+        if !in_bitset || self.deleted.contains(&cached.ids.first(doc).unwrap()) {
+            return Ok(None);
+        }
+        if let Some(rules) = self.rules.get(&(segment, doc)) {
+            return Ok(Some(rules.clone()));
+        }
+        let rules: Arc<[CompiledRule]> = cached
+            .synonyms
+            .column_rules(doc, &mut self.analyzer)?
+            .unwrap_or_default()
+            .into();
+        self.rules.insert((segment, doc), rules.clone());
+        Ok(Some(rules))
     }
 }
 

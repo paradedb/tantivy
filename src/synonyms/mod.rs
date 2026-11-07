@@ -2,15 +2,14 @@
 //!
 //! A field that holds one rule per value, such as `couch, sofa, divan` or
 //! `sneakers => running shoes`, is indexed with a [`SynonymRuleTokenizer`]. It emits each key of a
-//! rule as one term, so the postings of the field map a key to the documents of its rules. The
-//! field is also fast with the `raw` tokenizer, so the expander reads the text of a matched rule
-//! back from its column.
+//! rule as one term, so the postings of the field map a key to the documents of its rules.
 //!
 //! [`expand`](fn@expand) looks the keys up in every segment and rewrites a list of query tokens
 //! into [`Expansion`]s, the longest key first, the way Lucene's `SynonymGraphFilter` does. It reads
-//! the rules through a [`SynonymSource`], so a caller can cache what each segment holds for a
-//! token. [`SynonymExpander`] expands with no cache, so it reads the segment readers on every
-//! expansion.
+//! the rules through a [`SynonymSource`], which gives the rules of a matched document from where
+//! the caller keeps their text, so it can also cache them. [`SynonymExpander`] expands with no
+//! cache and reads the text from the field's column, so it needs the field fast with the `raw`
+//! tokenizer.
 //!
 //! ```
 //! use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions};
@@ -59,7 +58,7 @@ mod tests;
 mod tokenizer;
 
 pub use self::expand::{
-    expand, Expansion, KeyRules, RuleAlternatives, SegmentSynonyms, SynonymExpander, SynonymSource,
+    expand, Expansion, KeyDocs, SegmentSynonyms, SynonymExpander, SynonymSource,
 };
-pub use self::rule::{RuleError, SynonymRule, MAX_RULE_TERMS};
+pub use self::rule::{CompiledRule, RuleError, SynonymRule, MAX_RULE_TERMS};
 pub use self::tokenizer::SynonymRuleTokenizer;

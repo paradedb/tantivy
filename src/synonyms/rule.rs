@@ -93,7 +93,8 @@ impl SynonymRule {
         self.compile(analyzer).map(drop)
     }
 
-    pub(crate) fn compile(&self, analyzer: &mut TextAnalyzer) -> Result<CompiledRule, RuleError> {
+    /// Analyzes the terms of the rule, which gives its keys and their alternatives.
+    pub fn compile(&self, analyzer: &mut TextAnalyzer) -> Result<CompiledRule, RuleError> {
         let mut analyze = |terms: &[String]| -> Result<Vec<Vec<String>>, RuleError> {
             let mut analyzed: Vec<Vec<String>> = Vec::with_capacity(terms.len());
             for term in terms {
@@ -116,10 +117,20 @@ impl SynonymRule {
 }
 
 /// A rule after analysis. Every key of the rule expands to the same alternatives.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct CompiledRule {
-    pub(crate) keys: Vec<Vec<String>>,
-    pub(crate) alternatives: Vec<Vec<String>>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompiledRule {
+    /// The analyzed tokens of each term that the rule replaces.
+    pub keys: Vec<Vec<String>>,
+    /// The analyzed tokens of each term that a key expands to.
+    pub alternatives: Vec<Vec<String>>,
+}
+
+impl CompiledRule {
+    /// The rule of one line, or `None` when the line is blank, a comment or not a valid rule. The
+    /// rule tokenizer indexes no key for such a line, so a lookup drops it the same way.
+    pub fn from_line(line: &str, analyzer: &mut TextAnalyzer) -> Option<CompiledRule> {
+        SynonymRule::parse(line).ok()??.compile(analyzer).ok()
+    }
 }
 
 /// Splits a rule on `=>` and `,`. A backslash escapes the character after it, as in Solr, so a
