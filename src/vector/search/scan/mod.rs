@@ -642,7 +642,7 @@ where
     }
 
     /// The stage the shortlist is built in: layer 0, or the exact scan at full precision.
-    fn shortlist_stage(&self) -> VectorStage {
+    pub(crate) fn shortlist_stage(&self) -> VectorStage {
         match self.quantized {
             Some(_) => VectorStage::LayerScan(0),
             None => VectorStage::ExactScan,

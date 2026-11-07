@@ -16,9 +16,13 @@ use crate::vector::router::stacked::levels::{
     serialize_stacked_index, InMemoryStore, LazyStore, StackedIvf, StackedIvfBuilder,
     StackedIvfConfig, StackedSearchStats, SuperKMeansLevelClusterer, PARENT_NPROBE_FRACTION,
 };
-use crate::vector::router::{RouterIter, RouterKind, RouterMetrics, RoutingParams};
+#[cfg(test)]
+use crate::vector::router::{RouterIter, RoutingParams};
+use crate::vector::router::{RouterKind, RouterMetrics};
+#[cfg(test)]
 use crate::vector::search::prepared::VectorQuery;
 use crate::vector::storage::quantized::sign::SignVectors;
+#[cfg(test)]
 use crate::vector::VectorElement;
 use crate::TantivyError;
 
@@ -228,6 +232,7 @@ impl<S: VectorArena<Elem = f32>> StackedRouter<S> {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn rank<T: VectorElement>(
         &self,
         query: &VectorQuery<T>,
@@ -240,6 +245,7 @@ impl<S: VectorArena<Elem = f32>> StackedRouter<S> {
 }
 
 /// The result contract is independent of the precision pipeline that produced it.
+#[cfg(test)]
 pub(super) fn rank<S: VectorSource, T: VectorElement>(
     level: &StackedIvf<S>,
     query: &VectorQuery<T>,

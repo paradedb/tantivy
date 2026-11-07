@@ -17,7 +17,7 @@ use crate::collector::{
 };
 use crate::index::SegmentReader;
 use crate::query::Weight;
-use crate::schema::{Field, FieldType, Metric, Schema};
+use crate::schema::{Field, Metric, Schema};
 use crate::vector::params::ProbeParams;
 use crate::vector::router::global::GlobalRanking;
 use crate::vector::search::cluster_source::ClusterSource;
@@ -40,30 +40,11 @@ use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
 use crate::vector::tie_break::NoTieBreak;
 use crate::vector::write::RowAddress;
-use crate::vector::{BlockAddress, VectorElement, VectorStage};
+use crate::vector::{
+    BlockAddress, VectorElement, VectorRoutingPlan, VectorRoutingPlanProvider, VectorSegment,
+    VectorStage,
+};
 use crate::{DocAddress, DocId, Result, Score, SegmentOrdinal, TantivyError};
-
-/// A segment and its optional parent centroid in the global router.
-#[derive(Clone, Copy)]
-pub struct VectorSegment<'a> {
-    /// Ordinal used in returned document addresses.
-    pub ordinal: SegmentOrdinal,
-    /// Segment to search.
-    pub reader: &'a SegmentReader,
-    /// Coarse partition centroid, in the indexed vector field's coordinate space.
-    /// Segments without one join at their own topmost router layer.
-    pub partition_centroid: Option<&'a [f32]>,
-}
-
-impl<'a> From<(SegmentOrdinal, &'a SegmentReader)> for VectorSegment<'a> {
-    fn from((ordinal, reader): (SegmentOrdinal, &'a SegmentReader)) -> Self {
-        Self {
-            ordinal,
-            reader,
-            partition_centroid: None,
-        }
-    }
-}
 
 // --- Query preparation ---
 
@@ -110,6 +91,7 @@ pub struct TopDocsByVectorSimilarityBuilder<T: VectorElement, S = NoTieBreak> {
     offset: usize,
     probe_params: ProbeParams,
     max_scan_levels: usize,
+    routing_plan: Option<Arc<dyn VectorRoutingPlanProvider>>,
     /// Optional slot shared with other collectors searching the same query.
     shared_threshold: Option<SharedThresholdArc<Score>>,
     tie_break: S,
@@ -125,6 +107,7 @@ impl<T: VectorElement> TopDocsByVectorSimilarityBuilder<T, NoTieBreak> {
             offset: 0,
             probe_params: ProbeParams::default(),
             max_scan_levels: usize::MAX,
+            routing_plan: None,
             shared_threshold: None,
             tie_break: NoTieBreak,
         }
@@ -162,6 +145,18 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
         self
     }
 
+    /// Probes the supplied plan without rerouting. See [`VectorRoutingPlan`] for its scope.
+    pub fn with_routing_plan(mut self, plan: Arc<VectorRoutingPlan>) -> Self {
+        self.routing_plan = Some(plan);
+        self
+    }
+
+    /// Defers obtaining the routing plan until the segment filter has been evaluated.
+    pub fn with_routing_plan_provider(mut self, plan: Arc<dyn VectorRoutingPlanProvider>) -> Self {
+        self.routing_plan = Some(plan);
+        self
+    }
+
     /// Orders equal similarities by `tie_break`, as `ORDER BY embedding <=> $1, id` does.
     ///
     /// The tie-break takes part in each segment's eviction but never in routing. Segments cut on
@@ -177,6 +172,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
             offset: self.offset,
             probe_params: self.probe_params,
             max_scan_levels: self.max_scan_levels,
+            routing_plan: self.routing_plan,
             shared_threshold: self.shared_threshold,
             tie_break,
         }
@@ -195,6 +191,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
             offset: self.offset,
             probe_params: self.probe_params,
             max_scan_levels: self.max_scan_levels,
+            routing_plan: self.routing_plan,
             quantized_queries: Mutex::new(HashMap::new()),
             prepared: Mutex::new(None),
             collector_topk: Arc::new(Mutex::new(TopK::new(segment_top_n))),
@@ -219,6 +216,7 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     offset: usize,
     probe_params: ProbeParams,
     max_scan_levels: usize,
+    routing_plan: Option<Arc<dyn VectorRoutingPlanProvider>>,
     /// Exactly one prepared query for each distinct segment encoding.
     quantized_queries: Mutex<HashMap<PreparedKey, PreparedCell>>,
     /// The query prepared for the field's metric on first use.
@@ -320,32 +318,7 @@ where
     type Child = NoOpSegmentCollector<S::SortKey>;
 
     fn check_schema(&self, schema: &Schema) -> Result<()> {
-        let entry = schema.get_field_entry(self.field);
-        let opts = match entry.field_type() {
-            FieldType::Vector(o) => o,
-            _ => {
-                return Err(TantivyError::SchemaError(format!(
-                    "field {:?} is not a vector field",
-                    entry.name(),
-                )));
-            }
-        };
-        if opts.dim() != self.query.len() {
-            return Err(TantivyError::SchemaError(format!(
-                "query vector length {} does not match field {:?} dim {}",
-                self.query.len(),
-                entry.name(),
-                opts.dim(),
-            )));
-        }
-        if opts.dtype() != T::DTYPE {
-            return Err(TantivyError::SchemaError(format!(
-                "query dtype {:?} does not match field {:?} dtype {:?}",
-                T::DTYPE,
-                entry.name(),
-                opts.dtype(),
-            )));
-        }
+        VectorQuery::check_schema(self.field, &self.query, schema)?;
         if self.tie_break.requires_scoring() {
             // No score is computed (`requires_scoring` is false), so every doc would tie.
             return Err(TantivyError::InvalidArgument(
@@ -377,8 +350,35 @@ where
         segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
     ) -> Result<SegmentVectorFruit<S::SortKey>> {
-        let (searched, totals) = measure(|| self.search_segment(weight, segment_ord, reader));
+        if self.routing_plan.is_none() {
+            return self
+                .collect_segments(
+                    weight,
+                    &[VectorSegment::from((segment_ord, reader))],
+                    |_| {},
+                )?
+                .pop()
+                .ok_or_else(|| TantivyError::InternalError("missing segment result".into()));
+        }
+        let (searched, mut totals) = measure(|| self.search_segment(weight, segment_ord, reader));
         let (results, report, merge) = searched?;
+        if let Some(plan) = self
+            .routing_plan
+            .as_ref()
+            .map(|provider| {
+                let plan = provider.get()?;
+                if plan.field != self.field {
+                    return Err(TantivyError::InvalidArgument(
+                        "routing plan belongs to a different vector field".into(),
+                    ));
+                }
+                Ok(plan)
+            })
+            .transpose()?
+            .and_then(|p| p.segments.get(&reader.segment_id()))
+        {
+            totals.append(&plan.totals);
+        }
         let mut stats = ProbeStats::new(report, totals);
         stats.record_shared_offer(merge);
         Ok(SegmentVectorFruit { results, stats })
@@ -426,8 +426,8 @@ where
     T: VectorElement,
     S: SortKeyComputer + Send + Sync + 'static,
 {
-    /// Collects the supplied segments in input order. One segment uses the existing segment
-    /// search; multiple segments share routing, a work budget, and the exact top-k bound.
+    /// Collects the supplied segments with global routing, a shared work budget, and an exact
+    /// top-k bound, unless the caller supplies a shared routing plan for independent probing.
     /// Located filter matches are exhaustive and reserve their share of the budget.
     /// Calls `on_segment` after each slice of work for per-segment read accounting.
     pub fn collect_segments(
@@ -436,7 +436,7 @@ where
         segments: &[VectorSegment<'_>],
         mut on_segment: impl FnMut(SegmentOrdinal),
     ) -> Result<Vec<SegmentVectorFruit<S::SortKey>>> {
-        if segments.len() <= 1 {
+        if segments.is_empty() || self.routing_plan.is_some() {
             return segments
                 .iter()
                 .map(|segment| {
@@ -550,7 +550,8 @@ where
         .with_collector_topk(
             Arc::clone(&self.collector_topk),
             Arc::clone(&self.shared_topk_threshold),
-        ))
+        )
+        .with_routing_plan(self.routing_plan.clone()))
     }
 
     /// Searches one segment: prepares the query, runs the segment searcher, and lifts each hit's
@@ -840,6 +841,7 @@ where
         let (result, measured) = measure(|| {
             let mut scan = start_scan(i, pending_scans[i].take().unwrap())?;
             scan.swap_topk(&mut topk);
+            let _stage = enter_vector_stage(scan.shortlist_stage());
             while let Some(rows) = source.next()? {
                 let scored = scan.shortlist(&rows)?;
                 source.admitted(scored)?;
@@ -872,6 +874,7 @@ where
             let scan = scans[i].as_mut().unwrap();
             scan.swap_topk(&mut topk);
             scan.swap_rate(&mut rate);
+            let _stage = enter_vector_stage(scan.shortlist_stage());
             meter.open();
             if let Some(rows) = source.probe_global(candidate)? {
                 let scored = scan.shortlist(&rows)?;
@@ -937,7 +940,10 @@ where
                     let mut report = source.finish();
                     report.probe.termination = if recall_reached {
                         ProbeTermination::QuantizedRecall
-                    } else if meter.exhausted() {
+                    } else if meter.exhausted()
+                        && report.counters.postings_row + report.counters.postings_skipped
+                            < vectors[i].index().unwrap().num_clusters()
+                    {
                         ProbeTermination::Ceiling
                     } else {
                         ProbeTermination::Exhausted
@@ -1013,7 +1019,7 @@ mod ivf_e2e_tests {
     use std::ops::Range;
     use std::sync::Arc;
 
-    use super::{VectorSegment, VectorSimilarityFruit};
+    use super::{VectorRoutingPlan, VectorSegment, VectorSimilarityFruit};
     use crate::collector::sort_key::{SortBySimilarityScore, SortByStaticFastValue, SortByString};
     use crate::collector::{AtomicSharedThreshold, Collector, SharedThresholdArc, TopDocs};
     use crate::index::IndexSettings;
@@ -1432,29 +1438,374 @@ mod ivf_e2e_tests {
             .collect();
         let mut query = vec![0.0; 32];
         query[5] = 1.0;
-        let collector = TopDocs::with_limit(3)
-            .order_by_similarity(near.field, query)
-            .with_probe_params(ProbeParams {
-                max_probe_fraction: 0.001,
-                min_probe_clusters: 3,
-                ..Default::default()
-            })
-            .build();
-        let weight = near.weight(&near.filter("matches"))?;
-        let result = collector.merge_fruits(collector.collect_segments(
+        let params = ProbeParams {
+            max_probe_fraction: 0.001,
+            min_probe_clusters: 3,
+            ..Default::default()
+        };
+        for planned in [false, true] {
+            let builder = TopDocs::with_limit(3)
+                .order_by_similarity(near.field, query.clone())
+                .with_probe_params(params.clone());
+            let weight = near.weight(&near.filter("matches"))?;
+            let collector = if planned {
+                let plan = VectorRoutingPlan::build(
+                    near.field,
+                    query.clone(),
+                    params.clone(),
+                    1.0,
+                    &readers,
+                    |_| {},
+                )?;
+                builder.with_routing_plan(Arc::new(plan)).build()
+            } else {
+                builder.build()
+            };
+            let result = collector.merge_fruits(collector.collect_segments(
+                weight.as_ref(),
+                &readers,
+                |_| {},
+            )?)?;
+            assert_eq!(result.results.len(), 3);
+            assert!(result
+                .results
+                .iter()
+                .all(|(_, address)| address.segment_ord == 2));
+            assert_eq!(result.stats[0].access_path, AccessPath::Located);
+            assert_eq!(result.stats[1].access_path, AccessPath::Located);
+            assert_eq!(result.stats[2].access_path, AccessPath::Routed);
+            assert!(result.stats[2].work_charged > 0.0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn routing_plan_preserves_results_across_parallel_segments() -> Result<()> {
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            let fixture = FixtureSpec::clustered(metric, 64, 8, 384)
+                .label("matches", |i| i % 3 == 0)
+                .segments(3)
+                .schedule(&[1, 1])
+                .deletes(&[0, 3, 80])
+                .build()?;
+            let searcher = fixture.index.reader()?.searcher();
+            let readers: Vec<_> = searcher
+                .segment_readers()
+                .iter()
+                .enumerate()
+                .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
+                .collect();
+            let mut query = vec![0.01; 64];
+            query[2] = 1.0;
+            for filter in [&AllQuery as &dyn Query, &fixture.filter("matches")] {
+                for located in [LocatedPath::Off, LocatedPath::Auto] {
+                    let params = ProbeParams {
+                        located,
+                        ..exhaustive_params(8)
+                    };
+                    let builder = || {
+                        TopDocs::with_limit(7)
+                            .and_offset(3)
+                            .order_by_similarity(fixture.field, query.clone())
+                            .with_probe_params(params.clone())
+                    };
+                    let weight = fixture.weight(filter)?;
+                    let plan = VectorRoutingPlan::build(
+                        fixture.field,
+                        query.clone(),
+                        params.clone(),
+                        1.0,
+                        &readers,
+                        |_| {},
+                    )?;
+                    let bytes = serde_json::to_vec(&plan).unwrap();
+                    let plan: VectorRoutingPlan = serde_json::from_slice(&bytes).unwrap();
+                    let plan = Arc::new(plan);
+                    let threshold: SharedThresholdArc<Score> =
+                        Arc::new(AtomicSharedThreshold::default());
+                    let fruits = std::thread::scope(|scope| {
+                        readers
+                            .iter()
+                            .rev()
+                            .map(|segment| {
+                                let (ord, reader) = (segment.ordinal, segment.reader);
+                                let collector = builder()
+                                    .with_routing_plan(Arc::clone(&plan))
+                                    .with_shared_threshold(Arc::clone(&threshold))
+                                    .build();
+                                let weight = &weight;
+                                scope.spawn(move || {
+                                    collector.collect_segment(weight.as_ref(), ord, reader)
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .map(|thread| thread.join().unwrap())
+                            .collect::<Result<Vec<_>>>()
+                    })?;
+                    let fruit = builder().build().merge_fruits(fruits)?;
+                    let expected: Vec<_> = fixture
+                        .oracle(filter, &query, 10)?
+                        .into_iter()
+                        .skip(3)
+                        .collect();
+                    assert_eq!(fruit.results, expected, "{metric:?}");
+                    assert_eq!(fruit.stats.len(), readers.len());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn routing_plan_leaves_row_reads_and_budget_checks_to_consumers() -> Result<()> {
+        let fixture = FixtureSpec::clustered(Metric::L2, 64, 8, 768)
+            .segments(3)
+            .schedule(&[1, 1])
+            .label("matches", |i| i % 3 == 0)
+            .paged()
+            .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let readers: Vec<_> = searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
+            .collect();
+        for segment in &readers {
+            segment.reader.vector_index(fixture.field)?;
+        }
+        let mut query = vec![0.0; 64];
+        query[2] = 1.0;
+        let params = ProbeParams {
+            max_probe_fraction: 0.125,
+            located: LocatedPath::Off,
+            exact_plan: false,
+            ..Default::default()
+        };
+        let builder = || {
+            TopDocs::with_limit(5)
+                .order_by_similarity(fixture.field, query.clone())
+                .with_probe_params(params.clone())
+        };
+        fixture.clear_reads();
+        let plan = VectorRoutingPlan::build(
+            fixture.field,
+            query.clone(),
+            params.clone(),
+            0.0,
+            &readers,
+            |_| {},
+        )?;
+        assert!(
+            fixture.reads().is_empty(),
+            "routing read vector rows or document IDs"
+        );
+        assert!(!fixture.centroid_reads().is_empty());
+        assert!(plan.segments.values().all(|segment| {
+            segment
+                .totals
+                .time_ns(crate::vector::VectorStage::NonVectorSearch)
+                == 0
+        }));
+        let filter = fixture.filter("matches");
+        let weight = fixture.weight(&filter)?;
+        let collector = builder().with_routing_plan(Arc::new(plan)).build();
+        let fruit = collector.merge_fruits(collector.collect_segments(
             weight.as_ref(),
             &readers,
             |_| {},
         )?)?;
-        assert_eq!(result.results.len(), 3);
-        assert!(result
+        assert!(!fixture.reads().is_empty());
+        for stats in &fruit.stats {
+            assert!(stats.pruned_filter > 0);
+            assert!(stats.work_charged >= stats.work_budget);
+            assert!(stats.work_charged <= stats.work_budget + 1.0);
+            assert!(stats.postings_row < 8);
+        }
+        let expected = searcher.search(&filter, &builder().build())?;
+        assert_eq!(fruit.results, expected.results);
+        Ok(())
+    }
+
+    #[test]
+    fn routing_plan_waits_until_filter_is_drained() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::query::{Explanation, Scorer, Weight};
+        use crate::vector::test_support::DocsWeight;
+        use crate::{DocId, DocSet, SegmentReader, TERMINATED};
+
+        struct TrackedFilter {
+            weight: DocsWeight,
+            consumed: Arc<AtomicUsize>,
+            calls: Arc<AtomicUsize>,
+        }
+        struct TrackedScorer {
+            inner: Box<dyn Scorer>,
+            consumed: Arc<AtomicUsize>,
+        }
+        impl DocSet for TrackedScorer {
+            fn advance(&mut self) -> DocId {
+                if self.inner.doc() != TERMINATED {
+                    self.consumed.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.advance()
+            }
+            fn doc(&self) -> DocId {
+                self.inner.doc()
+            }
+            fn size_hint(&self) -> u32 {
+                self.inner.size_hint()
+            }
+        }
+        impl Scorer for TrackedScorer {
+            fn score(&mut self) -> Score {
+                self.inner.score()
+            }
+        }
+        impl Weight for TrackedFilter {
+            fn scorer(&self, reader: &SegmentReader, boost: Score) -> Result<Box<dyn Scorer>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(TrackedScorer {
+                    inner: self.weight.scorer(reader, boost)?,
+                    consumed: Arc::clone(&self.consumed),
+                }))
+            }
+            fn explain(&self, _: &SegmentReader, _: DocId) -> Result<Explanation> {
+                unreachable!()
+            }
+        }
+        struct DeferredPlan {
+            plan: VectorRoutingPlan,
+            consumed: Arc<AtomicUsize>,
+            expected: usize,
+        }
+        impl super::VectorRoutingPlanProvider for DeferredPlan {
+            fn get(&self) -> Result<&VectorRoutingPlan> {
+                assert_eq!(self.consumed.load(Ordering::SeqCst), self.expected);
+                Ok(&self.plan)
+            }
+        }
+
+        let fixture = FixtureSpec::clustered(Metric::L2, 32, 8, 256).build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let reader = searcher.segment_reader(0);
+        let docs: Vec<_> = (0..reader.max_doc()).step_by(3).collect();
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let filter = TrackedFilter {
+            weight: DocsWeight {
+                max_doc: reader.max_doc(),
+                docs: docs.clone(),
+            },
+            consumed: Arc::clone(&consumed),
+            calls: Arc::clone(&calls),
+        };
+        let params = ProbeParams {
+            located: LocatedPath::Off,
+            ..exhaustive_params(8)
+        };
+        let builder = || {
+            TopDocs::with_limit(5)
+                .order_by_similarity(fixture.field, vec![0.0; 32])
+                .with_probe_params(params.clone())
+        };
+        let plan = VectorRoutingPlan::build(
+            fixture.field,
+            vec![0.0; 32],
+            params.clone(),
+            docs.len() as f64 / f64::from(reader.max_doc()),
+            &[VectorSegment::from((0, reader))],
+            |_| {},
+        )?;
+        let ready = builder().with_routing_plan(Arc::new(plan.clone())).build();
+        let expected =
+            ready.merge_fruits(vec![ready.collect_segment(&filter.weight, 0, reader)?])?;
+        let collector = builder()
+            .with_routing_plan_provider(Arc::new(DeferredPlan {
+                plan,
+                consumed,
+                expected: docs.len(),
+            }))
+            .build();
+        let result =
+            collector.merge_fruits(vec![collector.collect_segment(&filter, 0, reader)?])?;
+        assert_eq!(result.results, expected.results);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn routing_plan_selects_competitive_segments() -> Result<()> {
+        let mut distant = FixtureSpec::clustered(Metric::L2, 32, 8, 128);
+        for vector in distant.vectors.iter_mut().flatten() {
+            for value in vector {
+                *value += 100.0;
+            }
+        }
+        if let Layout::Ivf(centroids) = &mut distant.layout {
+            for value in centroids.iter_mut().flatten() {
+                *value += 100.0;
+            }
+        }
+        let distant = distant.build()?;
+        let near = FixtureSpec::clustered(Metric::L2, 32, 8, 128).build()?;
+        let searchers = [
+            distant.index.reader()?.searcher(),
+            near.index.reader()?.searcher(),
+        ];
+        let readers: Vec<_> = searchers
+            .iter()
+            .enumerate()
+            .map(|(ord, searcher)| {
+                VectorSegment::from((ord as u32, &searcher.segment_readers()[0]))
+            })
+            .collect();
+        let mut query = vec![0.0; 32];
+        query[3] = 1.0;
+        let params = ProbeParams {
+            max_probe_fraction: 0.0001,
+            min_probe_clusters: 3,
+            ..Default::default()
+        };
+        let builder = || {
+            TopDocs::with_limit(3)
+                .order_by_similarity(near.field, query.clone())
+                .with_probe_params(params.clone())
+        };
+        let plan = VectorRoutingPlan::build(
+            near.field,
+            query.clone(),
+            params.clone(),
+            1.0,
+            &readers,
+            |_| {},
+        )?;
+        assert!(plan.segments[&readers[0].reader.segment_id()]
+            .clusters
+            .is_empty());
+        assert_eq!(
+            plan.segments[&readers[1].reader.segment_id()]
+                .clusters
+                .len(),
+            3
+        );
+        let collector = builder().with_routing_plan(Arc::new(plan)).build();
+        let weight = near.all()?;
+        let fruit = collector.merge_fruits(collector.collect_segments(
+            weight.as_ref(),
+            &readers,
+            |_| {},
+        )?)?;
+        assert_eq!(fruit.results.len(), 3);
+        assert!(fruit
             .results
             .iter()
-            .all(|(_, address)| address.segment_ord == 2));
-        assert_eq!(result.stats[0].access_path, AccessPath::Located);
-        assert_eq!(result.stats[1].access_path, AccessPath::Located);
-        assert_eq!(result.stats[2].access_path, AccessPath::Routed);
-        assert!(result.stats[2].work_charged > 0.0);
+            .all(|(_, address)| address.segment_ord == 1));
+        assert_eq!(fruit.stats[0].candidates_scored, 0);
+        assert!(fruit.stats.iter().all(|s| s.work_budget == 3.0));
+        assert!(fruit.stats.iter().map(|s| s.work_charged).sum::<f32>() < 4.1);
         Ok(())
     }
 

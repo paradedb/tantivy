@@ -28,7 +28,9 @@ pub(crate) fn open_share(fixed_cost_rows: f64, n_avg: f64) -> f64 {
 }
 
 /// Probe work in average-cluster units; budgets, prices and spends compose only with each other.
-#[derive(Clone, Copy, PartialEq, PartialOrd, Debug, Default)]
+#[derive(
+    Clone, Copy, PartialEq, PartialOrd, Debug, Default, serde::Serialize, serde::Deserialize,
+)]
 pub(crate) struct WorkUnits(f64);
 
 impl WorkUnits {
@@ -80,7 +82,7 @@ impl std::ops::Mul<f64> for WorkUnits {
 
 /// A segment's work budget and what a cluster open and a scored row cost against it, from
 /// [`ProbeParams::resolved_work_budget`](crate::vector::params::ProbeParams::resolved_work_budget).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct WorkBudget {
     /// Work the segment may spend before the ceiling binds.
     pub(crate) total: WorkUnits,

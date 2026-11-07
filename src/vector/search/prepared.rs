@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use quant::cascade::{prepare_split_query_with_plan, PreparedSplitQuery, QueryRotationPlan};
 
-use crate::schema::Metric;
+use crate::schema::{Field, FieldType, Metric, Schema};
 use crate::vector::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide, Similarity};
 use crate::vector::quantization::SIGN_QUERY_BITS;
 use crate::vector::storage::quantized::QuantizedIndexCtx;
@@ -54,6 +54,36 @@ pub(crate) struct ScoringQuery<'q, T: VectorElement> {
 }
 
 impl<T: VectorElement> VectorQuery<T> {
+    pub(crate) fn check_schema(field: Field, query: &[T], schema: &Schema) -> crate::Result<()> {
+        let entry = schema.get_field_entry(field);
+        let opts = match entry.field_type() {
+            FieldType::Vector(o) => o,
+            _ => {
+                return Err(TantivyError::SchemaError(format!(
+                    "field {:?} is not a vector field",
+                    entry.name(),
+                )));
+            }
+        };
+        if opts.dim() != query.len() {
+            return Err(TantivyError::SchemaError(format!(
+                "query vector length {} does not match field {:?} dim {}",
+                query.len(),
+                entry.name(),
+                opts.dim(),
+            )));
+        }
+        if opts.dtype() != T::DTYPE {
+            return Err(TantivyError::SchemaError(format!(
+                "query dtype {:?} does not match field {:?} dtype {:?}",
+                T::DTYPE,
+                entry.name(),
+                opts.dtype(),
+            )));
+        }
+        Ok(())
+    }
+
     /// Prepares `raw` under `metric`.
     pub(crate) fn new(metric: Metric, raw: Arc<Vec<T>>) -> Self {
         // Wide accumulation keeps a huge but finite norm finite. Queries are user input, so the

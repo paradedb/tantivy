@@ -17,10 +17,14 @@ use crate::vector::search::scan::layer_read::LayerRead;
 use crate::vector::search::scan::plan::{ExactRule, PlanOverride};
 use crate::vector::stats::{AccessPath, LayerProbeStats};
 use crate::vector::test_support::{
-    first_segment, ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg, ReadLog,
+    first_segment, routing_plan_for_clusters, ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg,
+    ReadLog,
 };
 use crate::vector::tests::{exhaustive_params, routed_exhaustive_params};
-use crate::vector::{BlockAddress, ProbeStats, RouterKind, VectorSimilarityFruit, VectorStage};
+use crate::vector::{
+    AdaptiveProbeParams, BlockAddress, ProbeStats, ProbeTermination, RouterKind,
+    VectorSimilarityFruit, VectorStage,
+};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal};
 
 // --- Oracle matrix ---
@@ -31,9 +35,6 @@ const MATRIX_CLUSTERS: usize = 6;
 
 #[test]
 fn adaptive_cascade_matches_prefix_replay() -> crate::Result<()> {
-    use crate::vector::router::with_test_clusters;
-    use crate::vector::{AdaptiveProbeParams, ProbeTermination};
-
     let plans = [
         PlanOverride::read(LayerRead::Sparse),
         PlanOverride::exact(|_, _| true),
@@ -50,6 +51,8 @@ fn adaptive_cascade_matches_prefix_replay() -> crate::Result<()> {
                 Representation::Quantized(schedule)
             };
             let fixture = matrix_fixture(metric, representation, true)?;
+            let searcher = fixture.index.reader()?.searcher();
+            let (ordinal, segment) = first_segment(&searcher);
             for filter in [
                 &AllQuery as &dyn Query,
                 &fixture.filter("half"),
@@ -73,25 +76,28 @@ fn adaptive_cascade_matches_prefix_replay() -> crate::Result<()> {
                         for plan in plans {
                             let mut previous_prefix = 0;
                             for target in [0.5, 0.95, 1.0] {
-                                let (active, report) = with_test_clusters(ranked.clone(), || {
-                                    fixture.run_planned(
-                                        0,
-                                        weight.as_ref(),
-                                        &query,
-                                        k,
-                                        ProbeParams {
-                                            adaptive_probing: (target < 1.0).then(|| {
-                                                AdaptiveProbeParams {
-                                                    admission_fraction: (1.0_f64 - target)
-                                                        .powf(1.5),
-                                                }
-                                            }),
-                                            ..params.clone()
-                                        },
-                                        Some(plan),
-                                        true,
-                                    )
-                                })?;
+                                let (active, report) = fixture.run_planned_with(
+                                    ordinal as usize,
+                                    weight.as_ref(),
+                                    &query,
+                                    k,
+                                    ProbeParams {
+                                        adaptive_probing: (target < 1.0).then(|| {
+                                            AdaptiveProbeParams {
+                                                admission_fraction: (1.0_f64 - target).powf(1.5),
+                                            }
+                                        }),
+                                        ..params.clone()
+                                    },
+                                    Some(plan),
+                                    true,
+                                    None,
+                                    Some(routing_plan_for_clusters(
+                                        fixture.field,
+                                        segment,
+                                        ranked.clone(),
+                                    )),
+                                )?;
                                 let prefix = report.clusters_probed();
                                 assert!(prefix >= previous_prefix);
                                 previous_prefix = prefix;
@@ -100,18 +106,21 @@ fn adaptive_cascade_matches_prefix_replay() -> crate::Result<()> {
                                     plain_stops += usize::from(schedule.is_empty());
                                     assert!(target < 1.0);
                                 }
-                                let (replay, replay_report) =
-                                    with_test_clusters(ranked[..prefix].to_vec(), || {
-                                        fixture.run_planned(
-                                            0,
-                                            weight.as_ref(),
-                                            &query,
-                                            k,
-                                            params.clone(),
-                                            Some(plan),
-                                            true,
-                                        )
-                                    })?;
+                                let (replay, replay_report) = fixture.run_planned_with(
+                                    ordinal as usize,
+                                    weight.as_ref(),
+                                    &query,
+                                    k,
+                                    params.clone(),
+                                    Some(plan),
+                                    true,
+                                    None,
+                                    Some(routing_plan_for_clusters(
+                                        fixture.field,
+                                        segment,
+                                        ranked[..prefix].to_vec(),
+                                    )),
+                                )?;
                                 assert_eq!(active, replay);
                                 assert_eq!(report.exact_rows, replay_report.exact_rows);
                                 assert_eq!(
@@ -236,7 +245,6 @@ fn adaptive_stopping_preserves_router_work_and_path_selection() -> crate::Result
 
 #[test]
 fn adaptive_probing_rejects_invalid_admission_fraction() {
-    use crate::vector::AdaptiveProbeParams;
     for admission_fraction in [-1.0, 1.01, f64::NAN, f64::INFINITY] {
         assert!(ProbeParams {
             adaptive_probing: Some(AdaptiveProbeParams { admission_fraction }),
@@ -408,6 +416,7 @@ fn planned_top_k_with(
             None,
             admission_pruning,
             collector_topk.clone(),
+            None,
         )?;
         assert_identities(&segment_stats, "admission pruning");
         hits.extend(segment_hits);
@@ -1853,12 +1862,14 @@ fn ann_reads_offsets_only_for_probed_clusters() -> crate::Result<()> {
             let collector = TopDocs::with_limit(5)
                 .order_by_similarity(fixture.field, query.clone())
                 .with_probe_params(routed_exhaustive_params(32))
+                .with_routing_plan(routing_plan_for_clusters(
+                    fixture.field,
+                    first_segment(&searcher).1,
+                    fixture.candidates(&[17], &query)?,
+                ))
                 .build();
-            let candidates = fixture.candidates(&[17], &query)?;
             fixture.clear_reads();
-            let fruit = crate::vector::router::with_test_clusters(candidates, || {
-                searcher.search(filter, &collector)
-            })?;
+            let fruit = searcher.search(filter, &collector)?;
             assert!(!fruit.results.is_empty());
             let offsets: Vec<_> = fixture
                 .reads()

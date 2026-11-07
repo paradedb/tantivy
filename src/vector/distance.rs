@@ -33,7 +33,7 @@ use crate::vector::{Accumulator, VectorElement};
 /// Ordered totally via [`f32::total_cmp`], so it works directly in heaps and
 /// sorts: greater means more similar, and "best-first" always means
 /// descending `Similarity`.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Similarity(f32);
 
 impl Similarity {
