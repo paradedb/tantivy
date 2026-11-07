@@ -99,6 +99,18 @@ pub enum Incompatibility {
         /// Vector file version supported by this library.
         supported_version: u32,
     },
+    /// The centroid file grammar is unsupported by this library.
+    CentroidFormatMismatch {
+        /// Raw version stored in the centroid file header.
+        index_version: u32,
+        /// Centroid file version supported by this library.
+        supported_version: u32,
+    },
+    /// A segment's IVF router is of a kind this library does not read.
+    VectorRouterMismatch {
+        /// Router kind byte stored in the segment's `.centroids`.
+        kind: u8,
+    },
     /// This library cannot decompress the index found on disk
     CompressionMismatch {
         /// Compression algorithm used by the current version of tantivy
@@ -127,6 +139,19 @@ impl fmt::Debug for Incompatibility {
                     "vector file format version {index_version} is unsupported; supported version \
                      is {supported_version}; rebuild required"
                 )?;
+            }
+            Incompatibility::CentroidFormatMismatch {
+                index_version,
+                supported_version,
+            } => {
+                write!(
+                    f,
+                    "centroid file format version {index_version} is unsupported; supported \
+                     version is {supported_version}; rebuild required"
+                )?;
+            }
+            Incompatibility::VectorRouterMismatch { kind } => {
+                write!(f, "IVF router kind {kind} is unsupported; rebuild required")?;
             }
             Incompatibility::CompressionMismatch {
                 library_compression_format,

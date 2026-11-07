@@ -24,7 +24,6 @@ jobs:
 
     permissions:
       contents: read
-      checks: write
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -54,11 +53,8 @@ jobs:
     - name: Check Bench Compilation
       run: cargo +nightly-2026-08-28 bench --no-run --profile=dev --all-features
 
-    - uses: actions-rs/clippy-check@b5b5f21f4797c02da247df37026fcd0a5024aa4d # v1.0.7
-      with:
-        toolchain: stable
-        token: ${{ secrets.GITHUB_TOKEN }}
-        args: --tests
+    - name: Check Clippy
+      run: cargo +stable clippy --tests
 
   test:
 

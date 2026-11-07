@@ -1378,7 +1378,7 @@ where
 
             if term_req.req.min_doc_count == 0 {
                 // TODO: Handle rev streaming for descending sorting by keys
-                let mut stream = term_dict.stream()?;
+                let mut stream = term_dict.range().interruptible().into_stream()?;
                 let empty_sub_aggregation =
                     IntermediateAggregationResults::empty_from_req(&term_req.sug_aggregations);
                 while stream.advance() {

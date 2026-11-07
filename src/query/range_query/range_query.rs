@@ -207,7 +207,7 @@ impl InvertedIndexRangeWeight {
         if let Some(limit) = self.limit {
             term_stream_builder = term_stream_builder.limit(limit);
         }
-        term_stream_builder.into_stream()
+        term_stream_builder.interruptible().into_stream()
     }
 }
 

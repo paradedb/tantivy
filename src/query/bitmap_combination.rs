@@ -111,6 +111,8 @@ impl BitmapCombination {
 
     fn refill(&mut self, target: DocId) -> DocId {
         loop {
+            // Same reason as in `BufferedUnionScorer::refill`.
+            common::interrupt::check_for_interrupt();
             let next = self.next_base().max(target);
             if next >= TERMINATED {
                 self.doc = TERMINATED;
@@ -302,6 +304,20 @@ mod tests {
         fn score(&mut self) -> Score {
             1.0
         }
+    }
+
+    /// Same reason as `test_union_runs_the_interrupt_check` in `query::union`.
+    #[test]
+    fn union_runs_the_interrupt_check() {
+        let calls_before = crate::query::interrupt_counter::install();
+        let children = vec![
+            leaf((0..100_000).step_by(3).collect(), false),
+            leaf((0..100_000).step_by(7).collect(), false),
+        ];
+        let mut scorer = BitmapCombination::new(children, BitmapOperation::Union, 100_000);
+        while scorer.advance() != TERMINATED {}
+        let checks = crate::query::interrupt_counter::calls() - calls_before;
+        assert!(checks >= 100_000 / 4096, "{checks} checks");
     }
 
     #[test]

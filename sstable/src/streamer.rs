@@ -20,6 +20,7 @@ where
     lower: Bound<Vec<u8>>,
     upper: Bound<Vec<u8>>,
     limit: Option<u64>,
+    interruptible: bool,
 }
 
 fn bound_as_byte_slice(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
@@ -43,6 +44,7 @@ where
             lower: Bound::Unbounded,
             upper: Bound::Unbounded,
             limit: None,
+            interruptible: false,
         }
     }
 
@@ -77,6 +79,14 @@ where
     /// more than `limit` elements.
     pub fn limit(mut self, limit: u64) -> Self {
         self.limit = Some(limit);
+        self
+    }
+
+    /// Runs the host's interrupt check every few thousand keys. Query walks ask for it. Walks
+    /// inside a merge don't, since a host that exits the process from the check would leave the
+    /// half-written segment behind, and a merge polls its own cancel sentinel instead.
+    pub fn interruptible(mut self) -> Self {
+        self.interruptible = true;
         self
     }
 
@@ -132,6 +142,8 @@ where
             term_ord: first_term.checked_sub(1),
             lower_bound: self.lower,
             upper_bound: self.upper,
+            interruptible: self.interruptible,
+            keys_visited: 0,
             _lifetime: std::marker::PhantomData,
         })
     }
@@ -159,6 +171,9 @@ where
     }
 }
 
+/// Keys visited between two calls of the host's interrupt check.
+const KEYS_PER_INTERRUPT_CHECK: u32 = 4096;
+
 /// `Streamer` acts as a cursor over a range of terms of a segment.
 /// Terms are guaranteed to be sorted.
 pub struct Streamer<'a, TSSTable, A = AlwaysMatch>
@@ -174,6 +189,8 @@ where
     term_ord: Option<TermOrdinal>,
     lower_bound: Bound<Vec<u8>>,
     upper_bound: Bound<Vec<u8>>,
+    interruptible: bool,
+    keys_visited: u32,
     // this field is used to please the type-interface of a dictionary in tantivy
     _lifetime: std::marker::PhantomData<&'a ()>,
 }
@@ -190,6 +207,8 @@ where TSSTable: SSTable
             term_ord: None,
             lower_bound: Bound::Unbounded,
             upper_bound: Bound::Unbounded,
+            interruptible: false,
+            keys_visited: 0,
             _lifetime: std::marker::PhantomData,
         }
     }
@@ -206,6 +225,14 @@ where
     /// is an uninitialized state.
     pub fn advance(&mut self) -> bool {
         while self.delta_reader.advance().unwrap() {
+            // A walk over a big dictionary runs for seconds with nothing above it able to
+            // interrupt it, so the host's check runs from in here.
+            if self.interruptible {
+                self.keys_visited = self.keys_visited.wrapping_add(1);
+                if self.keys_visited % KEYS_PER_INTERRUPT_CHECK == 0 {
+                    common::interrupt::check_for_interrupt();
+                }
+            }
             // An automaton prunes whole blocks, so the ordinal is not simply the previous one
             // plus one: on entering a new slice it jumps to that slice's first term ordinal.
             // Counting alone would report a term's position among the blocks actually scanned.
@@ -332,6 +359,40 @@ mod tests {
         assert_eq!(streamer.key(), b"abandon");
         assert_eq!(streamer.value(), &3);
         assert!(!streamer.advance());
+        Ok(())
+    }
+
+    #[test]
+    fn test_stream_runs_the_interrupt_check() -> io::Result<()> {
+        use std::cell::Cell;
+        // Per thread, since the hook is process-wide and other tests walk dictionaries too.
+        thread_local! { static CALLS: Cell<usize> = const { Cell::new(0) }; }
+        fn count() {
+            CALLS.with(|calls| calls.set(calls.get() + 1));
+        }
+        fn walk(mut streamer: super::Streamer<'_, MonotonicU64SSTable>) -> (usize, usize) {
+            let calls_before = CALLS.with(Cell::get);
+            let mut keys = 0;
+            while streamer.advance() {
+                keys += 1;
+            }
+            (keys, CALLS.with(Cell::get) - calls_before)
+        }
+        let mut dict_builder = Dictionary::<MonotonicU64SSTable>::builder(Vec::new())?;
+        for key in 0..10_000u64 {
+            dict_builder.insert(format!("{key:08}").as_bytes(), &key)?;
+        }
+        let dict = Dictionary::<MonotonicU64SSTable>::from_bytes_for_tests(OwnedBytes::new(
+            dict_builder.finish()?,
+        ))?;
+
+        common::interrupt::set_interrupt_check(count);
+        // Only a walk that asked for the check runs it.
+        assert_eq!(walk(dict.stream()?), (10_000, 0));
+        assert_eq!(
+            walk(dict.range().interruptible().into_stream()?),
+            (10_000, 10_000 / 4096)
+        );
         Ok(())
     }
 

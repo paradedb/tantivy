@@ -246,19 +246,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
-name = "cascade"
-version = "0.1.0"
-dependencies = [
- "criterion 0.5.1",
- "fht",
- "grid-plane",
- "quant-model",
- "rand_chacha 0.3.1",
- "rand_core 0.6.4",
- "sign-plane",
-]
-
-[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -670,15 +657,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
-name = "fht"
-version = "0.1.0"
-dependencies = [
- "criterion 0.5.1",
- "rand_chacha 0.3.1",
- "rand_core 0.6.4",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -846,16 +824,6 @@ dependencies = [
  "r-efi 6.0.0",
  "wasip2",
  "wasip3",
-]
-
-[[package]]
-name = "grid-plane"
-version = "0.1.0"
-dependencies = [
- "criterion 0.5.1",
- "quant-model",
- "rand_chacha 0.3.1",
- "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -1136,10 +1104,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f607c237553f086e7043417a51df26b2eb899d3caff94e6a67592ff992fedc7"
 dependencies = [
  "autocfg",
- "num_cpus",
- "once_cell",
  "rawpointer",
- "thread-tree",
 ]
 
 [[package]]
@@ -1249,16 +1214,6 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
-]
-
-[[package]]
-name = "num_cpus"
-version = "1.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
-dependencies = [
- "hermit-abi 0.5.2",
- "libc",
 ]
 
 [[package]]
@@ -1543,15 +1498,6 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
-]
-
-[[package]]
-name = "quant-model"
-version = "0.1.0"
-dependencies = [
- "half",
- "rand_chacha 0.3.1",
- "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -1886,16 +1832,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
-name = "sign-plane"
-version = "0.1.0"
-dependencies = [
- "criterion 0.5.1",
- "quant-model",
- "rand_chacha 0.3.1",
- "rand_core 0.6.4",
-]
-
-[[package]]
 name = "sketches-ddsketch"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1936,8 +1872,8 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "superkmeans-rs"
-version = "0.2.0"
-source = "git+https://github.com/paradedb/superkmeans-rs.git?rev=c06dc2b6e9bd15fb5c4a0627178bebbe1fb37a64#c06dc2b6e9bd15fb5c4a0627178bebbe1fb37a64"
+version = "0.3.0"
+source = "git+https://github.com/paradedb/superkmeans-rs.git?rev=ec3c9befe84d8beb437111a8eb4876eebc58e7a3#ec3c9befe84d8beb437111a8eb4876eebc58e7a3"
 dependencies = [
  "matrixmultiply",
  "pkg-config",
@@ -1980,7 +1916,6 @@ dependencies = [
  "bitpacking",
  "bon",
  "byteorder",
- "cascade",
  "census",
  "crc32fast",
  "criterion 0.8.2",
@@ -2000,7 +1935,6 @@ dependencies = [
  "htmlescape",
  "itertools 0.14.0",
  "levenshtein_automata",
- "libm",
  "log",
  "lru",
  "lz4_flex",
@@ -2016,7 +1950,6 @@ dependencies = [
  "postcard",
  "pretty_assertions",
  "proptest",
- "quant-model",
  "rand 0.9.4",
  "rand_distr 0.5.1",
  "rayon",
@@ -2031,6 +1964,7 @@ dependencies = [
  "tantivy-columnar",
  "tantivy-common",
  "tantivy-fst",
+ "tantivy-quant",
  "tantivy-query-grammar 0.26.0",
  "tantivy-sstable",
  "tantivy-stacker",
@@ -2097,6 +2031,16 @@ dependencies = [
  "byteorder",
  "regex-syntax",
  "utf8-ranges",
+]
+
+[[package]]
+name = "tantivy-quant"
+version = "0.1.0"
+dependencies = [
+ "criterion 0.5.1",
+ "half",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -2267,15 +2211,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "thread-tree"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffbd370cb847953a25954d9f63e14824a36113f8c72eecf6eccef5dc4b45d630"
-dependencies = [
- "crossbeam-channel",
 ]
 
 [[package]]

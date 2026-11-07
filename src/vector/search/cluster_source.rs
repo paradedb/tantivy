@@ -1,0 +1,53 @@
+//! The vocabulary shared by cluster sources and the segment scan: one cluster's selected rows,
+//! and the source contract.
+
+use std::ops::Range;
+
+use crate::vector::distance::Similarity;
+use crate::DocId;
+
+/// One cluster's selected rows, with what is already known about them.
+pub(crate) struct ClusterRows<'a> {
+    pub(crate) cluster: usize,
+    /// The cluster's local row range, starting at zero.
+    pub(crate) rows: Range<usize>,
+    /// Strictly ascending cluster-local offsets of the selected rows, at least one; `None`
+    /// selects every row.
+    pub(crate) offsets: Option<&'a [u32]>,
+    /// Doc ids aligned with `offsets`, when already in hand; otherwise the scan reads the DocIds
+    /// column for the rows that need one.
+    pub(crate) docs: Option<&'a [DocId]>,
+    /// The query's similarity to the cluster's centroid under the field metric, when already
+    /// computed; otherwise the scan computes it if a quantized read needs it, and the plan prices
+    /// that read.
+    pub(crate) centroid: Option<Similarity>,
+}
+
+impl ClusterRows<'_> {
+    /// Number of selected rows.
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.offsets.map_or(self.rows.len(), <[u32]>::len)
+    }
+
+    /// The selected local row numbers, ascending.
+    pub(crate) fn local_rows(&self) -> impl Iterator<Item = usize> + '_ {
+        let (span, offsets) = match self.offsets {
+            None => (self.rows.clone(), &[][..]),
+            Some(offsets) => (0..0, offsets),
+        };
+        span.chain(
+            offsets
+                .iter()
+                .map(|&offset| self.rows.start + offset as usize),
+        )
+    }
+}
+
+/// Supplies a segment scan's clusters in its own order and decides when to stop.
+pub(crate) trait ClusterSource {
+    /// The next cluster's rows, or `None` when the source stops.
+    fn next(&mut self) -> crate::Result<Option<ClusterRows<'_>>>;
+    /// Records that the last cluster was shortlisted with `rows` scored.
+    fn admitted(&mut self, rows: usize) -> crate::Result<()>;
+}

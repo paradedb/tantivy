@@ -19,7 +19,7 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use tantivy::vector::{cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes};
+use tantivy::vector::bench::{cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes};
 
 const DIMS: &[usize] = &[1024, 2048];
 

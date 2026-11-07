@@ -1255,14 +1255,18 @@ fn for_each_matching_term_ord(
                 crate::TantivyError::InvalidArgument(format!("Invalid regex `{}`: {}", pattern, e))
             })?;
             // TODO: we can handle patterns like `^prefix.*` more efficiently
-            let mut stream = str_col.dictionary().search(re).into_stream()?;
+            let mut stream = str_col
+                .dictionary()
+                .search(re)
+                .interruptible()
+                .into_stream()?;
             while stream.advance() {
                 cb(stream.term_ord() as u32);
             }
         }
         IncludeExcludeParam::Values(values) => {
             let set: FxHashSet<&str> = values.iter().map(|s| s.as_str()).collect();
-            let mut stream = str_col.dictionary().stream()?;
+            let mut stream = str_col.dictionary().range().interruptible().into_stream()?;
             while stream.advance() {
                 if let Ok(key_str) = std::str::from_utf8(stream.key()) {
                     if set.contains(key_str) {

@@ -45,7 +45,7 @@ use crate::query::{
     AutomatonWeight, BooleanWeight, ConstScorer, EmptyScorer, EnableScoring, Explanation, Occur,
     Query, Scorer, Weight,
 };
-use crate::schema::{Field, FieldType, Type};
+use crate::schema::{Field, FieldType, DATE_TIME_PRECISION_INDEXED};
 use crate::{DocId, DocSet, Score, TantivyError, Term, TERMINATED};
 
 // ---------------------------------------------------------------------------
@@ -146,9 +146,10 @@ pub struct TermSetWeight {
     /// Pre-built FST set-membership map. Consumed by the `Automaton`
     /// dispatch (`AutomatonWeight::new(field, SetDfaWrapper(map))`).
     /// Built once at construction so per-segment dispatch is alloc-free.
-    /// `None` when the input was empty. Wrapped in `Arc` because
-    /// `Map<Vec<u8>>` isn't `Clone` (and the surrounding `TermSetWeight`
-    /// needs to be — `BooleanWeight` requires it).
+    /// `None` when the input is empty or when fast-field strategies handle
+    /// the field. Wrapped in `Arc` because `Map<Vec<u8>>` isn't `Clone` (and
+    /// the surrounding `TermSetWeight` needs to be — `BooleanWeight` requires
+    /// it).
     terms_fst: Option<Arc<Map<Vec<u8>>>>,
     /// Typed representation. Drives the per-segment dispatch path.
     repr: TermRepr,
@@ -168,15 +169,23 @@ pub struct TermSetWeight {
     bitmap_enabled: bool,
 }
 
-/// Returns whether `field_type.value_type()` has a fast-field column
-/// representation the planner's FF strategies can open. Keep this in
-/// sync with `FastFieldTermSetWeight::scorer`'s old `ColumnType` allow
-/// list (U64/I64/F64/Date) plus IPv6.
+/// Returns whether `field_type` has a fast-field column representation the
+/// planner's FF strategies can open and use interchangeably with the inverted
+/// index. Keep this in sync with `dispatch_numeric_fast`'s `ColumnType` allow
+/// list (U64/I64/F64/DateTime) plus IPv6.
+///
+/// For `Date` fields that are also `INDEXED`, the inverted index always stores
+/// values truncated to `DATE_TIME_PRECISION_INDEXED`, so fast-field strategies
+/// and min/max range pruning are only sound when the fast-field storage
+/// precision matches `DATE_TIME_PRECISION_INDEXED`.
 fn type_supported_for_fast_field(field_type: &FieldType) -> bool {
-    matches!(
-        field_type.value_type(),
-        Type::U64 | Type::I64 | Type::F64 | Type::Date | Type::IpAddr
-    )
+    match field_type {
+        FieldType::U64(_) | FieldType::I64(_) | FieldType::F64(_) | FieldType::IpAddr(_) => true,
+        FieldType::Date(opts) => {
+            !opts.is_indexed() || opts.get_precision() == DATE_TIME_PRECISION_INDEXED
+        }
+        _ => false,
+    }
 }
 
 impl TermSetWeight {
@@ -214,18 +223,6 @@ impl TermSetWeight {
         terms_bytes.sort_unstable();
         terms_bytes.dedup();
 
-        // Build the FST once. `Map::from_iter` requires strictly
-        // ascending keys, which the sort+dedup above guarantees. Skip
-        // FST construction when there are no terms — the scorer
-        // short-circuits to `EmptyScorer` before consulting the FST.
-        let terms_fst = if terms_bytes.is_empty() {
-            None
-        } else {
-            let map = Map::from_iter(terms_bytes.iter().map(|k| (k.as_slice(), 0u64)))
-                .map_err(io::Error::other)?;
-            Some(Arc::new(map))
-        };
-
         // Pick a typed representation based on the first Term's value
         // type. Numeric / IP terms decode to typed arms that the
         // fast-field dispatch path consumes; everything else (text /
@@ -258,6 +255,12 @@ impl TermSetWeight {
                         }
                     }
                 }
+                // `as_u64_lenient` decodes the 8-byte big-endian payload, so
+                // sorting+deduping `values` produces an array in 1-to-1
+                // correspondence with `terms_bytes`.
+                values.sort_unstable();
+                values.dedup();
+                assert_eq!(values.len(), terms_bytes.len());
                 TermRepr::Numeric(values)
             } else {
                 // Text / string / json — bytes-only dispatch.
@@ -266,6 +269,20 @@ impl TermSetWeight {
         } else {
             // Empty input — repr doesn't matter; scorer short-circuits.
             TermRepr::Bytes
+        };
+
+        // Build the FST once when the `Automaton` path may be needed.
+        // `Map::from_iter` requires strictly ascending keys, which the
+        // sort+dedup above guarantees. Skip FST construction when there
+        // are no terms or when fast-field strategies handle the field.
+        let terms_fst = if terms_bytes.is_empty()
+            || (fast_strategies_available && !matches!(repr, TermRepr::Bytes))
+        {
+            None
+        } else {
+            let map = Map::from_iter(terms_bytes.iter().map(|k| (k.as_slice(), 0u64)))
+                .map_err(io::Error::other)?;
+            Some(Arc::new(map))
         };
 
         Ok(Self {
@@ -304,18 +321,29 @@ impl TermSetWeight {
         reader: &SegmentReader,
         boost: Score,
     ) -> crate::Result<Box<dyn Scorer>> {
-        let Some(map_arc) = self.terms_fst.clone() else {
+        if self.terms_bytes.is_empty() {
             return Ok(Box::new(EmptyScorer));
+        }
+        let map_arc = match self.terms_fst.clone() {
+            Some(map) => map,
+            None => {
+                let map = Map::from_iter(self.terms_bytes.iter().map(|k| (k.as_slice(), 0u64)))
+                    .map_err(io::Error::other)?;
+                Arc::new(map)
+            }
         };
         let weight = AutomatonWeight::new(self.field, SetDfaWrapper(map_arc))
             .with_scoring_enabled(!self.bitmap_enabled)
             .with_bitmap_postings(self.bitmap_enabled);
         weight.scorer(reader, boost)
     }
-}
 
-impl Weight for TermSetWeight {
-    fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
+    fn scorer_with_candidates(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        candidate_size: Option<u32>,
+    ) -> crate::Result<Box<dyn Scorer>> {
         if self.terms_bytes.is_empty() {
             return Ok(Box::new(EmptyScorer));
         }
@@ -342,7 +370,11 @@ impl Weight for TermSetWeight {
                 // built unconditionally here. Sink gets `Linear`.
                 self.record_strategy_tag(StrategyTag::Linear);
                 let term_set: FxHashSet<Ipv6Addr> = values.iter().copied().collect();
-                let docset = TermSetDocSet::new(ip_addr_column, term_set);
+                let docset = if candidate_size.is_some() {
+                    TermSetDocSet::new_unpositioned(ip_addr_column, term_set)
+                } else {
+                    TermSetDocSet::new(ip_addr_column, term_set)
+                };
                 Ok(Box::new(ConstScorer::new(docset, boost)))
             }
 
@@ -354,7 +386,7 @@ impl Weight for TermSetWeight {
                     )));
                 }
                 if self.fast_strategies_available {
-                    self.dispatch_numeric_fast(reader, field_name, values, boost)
+                    self.dispatch_numeric_fast(reader, field_name, values, boost, candidate_size)
                 } else {
                     self.dispatch_non_fast(reader, boost)
                 }
@@ -367,6 +399,23 @@ impl Weight for TermSetWeight {
                 self.dispatch_non_fast(reader, boost)
             }
         }
+    }
+}
+
+impl Weight for TermSetWeight {
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
+        self.scorer_with_candidates(reader, boost, None)
+    }
+
+    fn scorer_for_candidates_unpositioned(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        candidate_size: u32,
+    ) -> crate::Result<Box<dyn Scorer>> {
+        // `DocSet::size_hint()` is a heuristic estimate that can return `0` for non-empty
+        // docsets (such as `ExistsDocSet` or small-segment `RangeDocSet`), so clamp to `>= 1`.
+        self.scorer_with_candidates(reader, boost, Some(candidate_size.max(1)))
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
@@ -381,14 +430,16 @@ impl Weight for TermSetWeight {
 }
 
 impl TermSetWeight {
-    /// Fast-numeric dispatch path: open the `Column<u64>`, estimate D,
-    /// run the planner, dispatch on the returned variant.
+    /// Fast-numeric dispatch path: open the `Column<u64>`, prune terms to
+    /// `[column.min_value(), column.max_value()]`, estimate D, run the
+    /// planner, and dispatch on the returned variant.
     fn dispatch_numeric_fast(
         &self,
         reader: &SegmentReader,
         field_name: &str,
         values: &[u64],
         boost: Score,
+        candidate_size: Option<u32>,
     ) -> crate::Result<Box<dyn Scorer>> {
         let fast_field_reader = reader.fast_fields();
         let Some((column, _col_type)) = fast_field_reader.u64_lenient_for_type(
@@ -404,18 +455,40 @@ impl TermSetWeight {
             return Ok(Box::new(EmptyScorer));
         };
 
-        // Estimate `D = N / dict_size`. Pre-gate by K'/N before opening
-        // the inverted index — when K'/N already exceeds the loosest
-        // admissible bitset density, no D value can rescue bitset
-        // admission. Saves the dict open on high-K queries.
         let n = column.num_docs() as u64;
-        let k_prime = super::term_set_strategy::k_prime_in_range(values, &column);
-        let density = k_prime as f64 / n as f64;
-        let loosest_gate = self
-            .strategy_config
-            .bitset_max_density_unique
-            .max(self.strategy_config.bitset_max_density_multi);
-        let d = if density <= loosest_gate && self.is_indexed {
+        if n == 0 || values.is_empty() {
+            self.record_strategy_tag(StrategyTag::Empty);
+            return Ok(Box::new(EmptyScorer));
+        }
+
+        // `values` and `self.terms_bytes` are sorted and deduped in lockstep.
+        // Slice both to `[column.min_value(), column.max_value()]` in O(log K)
+        // before touching the inverted index or building a scorer.
+        let range = super::term_set_strategy::sorted_range_in_column(values, &column);
+        if range.is_empty() {
+            self.record_strategy_tag(StrategyTag::Empty);
+            return Ok(Box::new(EmptyScorer));
+        }
+        let pruned_values = &values[range.clone()];
+        let pruned_terms_bytes = &self.terms_bytes[range];
+
+        // Estimate `D = N / dict_size`. Pre-gate by K'/N (or K'/C when
+        // `candidate_size` is provided) before opening the inverted index —
+        // when density already exceeds the loosest admissible bitset gate, no
+        // `D >= 1` value can admit `BitsetFromPostings`.
+        let k_prime = pruned_values.len() as u64;
+        let bitset_could_admit = if let Some(c) = candidate_size {
+            let c = (c as u64).clamp(1, n);
+            (k_prime as f64) / (c as f64) <= self.strategy_config.subsequent_bitset_max_density
+        } else {
+            let density = k_prime as f64 / n as f64;
+            let loosest_gate = self
+                .strategy_config
+                .bitset_max_density_unique
+                .max(self.strategy_config.bitset_max_density_multi);
+            density <= loosest_gate
+        };
+        let d = if bitset_could_admit && self.is_indexed {
             let dict_size = reader
                 .inverted_index(self.field)?
                 .terms()
@@ -431,11 +504,11 @@ impl TermSetWeight {
             &column,
             PlannerInputs {
                 field_name,
-                candidate_size: None,
+                candidate_size,
                 avg_docs_per_term: Some(d),
                 fast_available: true,
             },
-            values,
+            pruned_values,
             &self.strategy_config,
         );
 
@@ -451,18 +524,23 @@ impl TermSetWeight {
                 Ok(Box::new(ConstScorer::new(docset, boost)))
             }
             TermSetStrategy::BitsetFromPostings if self.is_indexed => {
-                // `terms_bytes` was pre-sorted+deduped at construction.
+                // `pruned_terms_bytes` is already sorted, deduped, and restricted
+                // to `[column.min_value(), column.max_value()]`.
                 bitset_from_postings_scorer(
                     reader,
                     self.field,
-                    &self.terms_bytes,
+                    pruned_terms_bytes,
                     boost,
                     self.bitmap_enabled,
                 )
             }
             TermSetStrategy::LinearScan | TermSetStrategy::BitsetFromPostings => {
-                let term_set: FxHashSet<u64> = values.iter().copied().collect();
-                let docset = TermSetDocSet::new(column, term_set);
+                let term_set: FxHashSet<u64> = pruned_values.iter().copied().collect();
+                let docset = if candidate_size.is_some() {
+                    TermSetDocSet::new_unpositioned(column, term_set)
+                } else {
+                    TermSetDocSet::new(column, term_set)
+                };
                 Ok(Box::new(ConstScorer::new(docset, boost)))
             }
             TermSetStrategy::Automaton => {
@@ -483,7 +561,7 @@ impl TermSetWeight {
     ///
     /// Decision is a simple K/max_doc density gate against the
     /// `bitset_max_density_multi` threshold. We don't have a
-    /// `Column<u64>` so we can't run `k_prime_in_range` pruning —
+    /// `Column<u64>` so we can't run `sorted_range_in_column` pruning —
     /// `K' = K` here. `D` is approximated as ≥2 (typical for non-fast
     /// text columns); the user can override via
     /// `bitset_max_density_unique` if their column is unique-valued
@@ -577,21 +655,36 @@ pub(crate) struct TermSetDocSet<T: Copy + Eq + std::hash::Hash> {
     values: FxHashSet<T>,
     doc_id: DocId,
     max_doc: DocId,
+    positioned: bool,
 }
 
 impl<T: Copy + Eq + std::hash::Hash + PartialOrd + std::fmt::Debug + Send + Sync + 'static>
     TermSetDocSet<T>
 {
     pub fn new(column: Column<T>, values: FxHashSet<T>) -> Self {
+        let mut doc_set = Self::new_unpositioned(column, values);
+        if doc_set.doc_id != TERMINATED {
+            doc_set.seek(0);
+        }
+        doc_set
+    }
+
+    /// Creates a `TermSetDocSet` for candidate probing (`seek_danger` / `seek`)
+    /// without eagerly scanning the column from `doc_id = 0` to the first match.
+    pub fn new_unpositioned(column: Column<T>, values: FxHashSet<T>) -> Self {
         let max_doc = column.num_docs();
-        let mut doc_set = Self {
+        let doc_id = if max_doc == 0 || values.is_empty() {
+            TERMINATED
+        } else {
+            0
+        };
+        Self {
             column,
             values,
-            doc_id: TERMINATED,
+            doc_id,
             max_doc,
-        };
-        doc_set.advance();
-        doc_set
+            positioned: doc_id == TERMINATED,
+        }
     }
 }
 
@@ -841,6 +934,75 @@ mod tests {
             docset.seek_danger(10),
             crate::docset::SeekDangerResult::SeekLowerBound(TERMINATED)
         );
+        assert_eq!(docset.advance(), TERMINATED);
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_scorer_for_candidates_and_range_pruning() -> crate::Result<()> {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::Arc;
+
+        use super::{StrategyTag, TermSetStrategyConfig};
+        use crate::query::{ConstScoreQuery, EnableScoring, Query, TermSetQuery};
+
+        let index = create_test_index()?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let segment_reader = searcher.segment_reader(0);
+        let u64_field_fast = index.schema().get_field("u64_fast").unwrap();
+
+        // Segment has values 1, 2, 3. Query with out-of-range terms (0, 100) + in-range term (2).
+        let sink = Arc::new(AtomicU8::new(0));
+        let cfg = TermSetStrategyConfig {
+            strategy_sink: Some(sink.clone()),
+            ..TermSetStrategyConfig::default()
+        };
+        let query = ConstScoreQuery::new(
+            TermSetQuery::new(vec![
+                Term::from_field_u64(u64_field_fast, 100),
+                Term::from_field_u64(u64_field_fast, 0),
+                Term::from_field_u64(u64_field_fast, 2),
+            ])
+            .with_strategy_config(cfg),
+            0.0,
+        );
+        let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+
+        // With candidate_size = 1 (< n = 3), K' = 1 => K'*D/C = 1.0 > 1/2000 => LinearScan
+        // (unpositioned).
+        let mut scorer = weight.scorer_for_candidates_unpositioned(segment_reader, 1.0, 1)?;
+        assert_eq!(sink.load(Ordering::Relaxed), StrategyTag::Linear as u8);
+        assert_eq!(scorer.doc(), 0);
+        assert_eq!(
+            scorer.seek_danger(0),
+            crate::docset::SeekDangerResult::SeekLowerBound(1)
+        );
+        assert_eq!(
+            scorer.seek_danger(1),
+            crate::docset::SeekDangerResult::Found
+        );
+        assert_eq!(
+            scorer.seek_danger(2),
+            crate::docset::SeekDangerResult::SeekLowerBound(3)
+        );
+
+        // All terms outside [1, 3] should short-circuit to EmptyScorer.
+        let empty_sink = Arc::new(AtomicU8::new(0));
+        let empty_cfg = TermSetStrategyConfig {
+            strategy_sink: Some(empty_sink.clone()),
+            ..TermSetStrategyConfig::default()
+        };
+        let empty_query = TermSetQuery::new(vec![
+            Term::from_field_u64(u64_field_fast, 0),
+            Term::from_field_u64(u64_field_fast, 10),
+        ])
+        .with_strategy_config(empty_cfg);
+        let empty_weight = empty_query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let empty_scorer =
+            empty_weight.scorer_for_candidates_unpositioned(segment_reader, 1.0, 1)?;
+        assert_eq!(empty_sink.load(Ordering::Relaxed), StrategyTag::Empty as u8);
+        assert_eq!(empty_scorer.doc(), TERMINATED);
         Ok(())
     }
 }
@@ -849,26 +1011,16 @@ impl<T: Copy + Eq + std::hash::Hash + PartialOrd + std::fmt::Debug + Send + Sync
     for TermSetDocSet<T>
 {
     fn advance(&mut self) -> DocId {
-        let mut next_doc_id = if self.doc_id == TERMINATED {
-            0
-        } else {
-            self.doc_id + 1
-        };
-        while next_doc_id < self.max_doc {
-            for value in self.column.values_for_doc(next_doc_id) {
-                if self.values.contains(&value) {
-                    self.doc_id = next_doc_id;
-                    return self.doc_id;
-                }
-            }
-            next_doc_id += 1;
+        debug_assert!(self.positioned);
+        if self.doc_id == TERMINATED {
+            return TERMINATED;
         }
-        self.doc_id = TERMINATED;
-        TERMINATED
+        self.seek(self.doc_id + 1)
     }
 
     fn seek(&mut self, target: DocId) -> DocId {
         debug_assert!(target >= self.doc_id || self.doc_id == TERMINATED);
+        self.positioned = true;
         if target >= self.max_doc {
             self.doc_id = TERMINATED;
             return TERMINATED;
@@ -890,15 +1042,19 @@ impl<T: Copy + Eq + std::hash::Hash + PartialOrd + std::fmt::Debug + Send + Sync
     fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
         if target >= self.max_doc {
             self.doc_id = TERMINATED;
+            self.positioned = true;
             return SeekDangerResult::SeekLowerBound(TERMINATED);
         }
-        for value in self.column.values_for_doc(target) {
-            if self.values.contains(&value) {
-                self.doc_id = target;
-                return SeekDangerResult::Found;
-            }
+        self.positioned = self
+            .column
+            .values_for_doc(target)
+            .any(|value| self.values.contains(&value));
+        if self.positioned {
+            self.doc_id = target;
+            SeekDangerResult::Found
+        } else {
+            SeekDangerResult::SeekLowerBound(target + 1)
         }
-        SeekDangerResult::SeekLowerBound(target + 1)
     }
 
     fn doc(&self) -> DocId {
