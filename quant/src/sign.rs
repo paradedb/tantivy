@@ -1568,7 +1568,8 @@ mod tests {
                                     storage[offset..offset + bytes.len()].copy_from_slice(&bytes);
                                     let input = storage[offset..].as_ptr().cast::<u64>();
                                     let mut got = vec![0.0_f32; row_offsets.len()];
-                                    // SAFETY: each selected row and plane has `words` words; Dot was detected above.
+                                    // SAFETY: each selected row and plane has `words` words; Dot
+                                    // was detected above.
                                     unsafe {
                                         neon::drive(
                                             acc,
