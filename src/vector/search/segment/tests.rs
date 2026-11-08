@@ -1368,7 +1368,9 @@ fn open_gate_reads_doc_ids_only_for_competitive_survivors() -> crate::Result<()>
         if let Some(position) = log.iter().position(|(_, read)| read == range) {
             let next = log[position + 1..]
                 .iter()
-                .find(|(_, read)| !ranges.block_offsets.contains(read))
+                .find(|(stage, read)| {
+                    *stage != VectorStage::ScanInit && !ranges.block_offsets.contains(read)
+                })
                 .expect("the survivors' rows follow their DocIds");
             assert!(
                 next.0 == VectorStage::ExactFetch

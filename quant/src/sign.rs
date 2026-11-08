@@ -502,6 +502,76 @@ pub fn estimate_asym_batch_unscaled_indexed(
     indexed_body(rows, words_per_row, row_offsets, q, out);
 }
 
+/// Scores little-endian sign bytes, borrowing unaligned input on NEON. Returns copy fallbacks.
+#[inline]
+pub(crate) fn estimate_asym_bytes(
+    bytes: &[u8],
+    words: usize,
+    offsets: Option<&[usize]>,
+    q: &QueryPlanes,
+    out: &mut [f32],
+) -> u64 {
+    assert!(words > 0);
+    assert_eq!(bytes.len() % 8, 0);
+    assert_eq!(bytes.len() / 8 % words, 0);
+    assert!(!q.planes.is_empty());
+    assert!(q.planes.iter().all(|plane| plane.len() == words));
+    if let Some(offsets) = offsets {
+        assert_eq!(offsets.len(), out.len());
+        assert!(offsets.iter().all(|&row| row < bytes.len() / 8 / words));
+    } else {
+        assert_eq!(bytes.len() / 8 / words, out.len());
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
+    {
+        let rows = bytes.as_ptr().cast::<u64>();
+        let index = |i| offsets.map_or(i, |offsets| offsets[i]);
+        match q.planes.as_slice() {
+            [p0, p1, p2, p3] => {
+                // SAFETY: shape and row bounds are checked above; the kernels use unaligned loads.
+                unsafe {
+                    neon::drive(
+                        neon::accumulator(),
+                        rows,
+                        words,
+                        index,
+                        [p0, p1, p2, p3],
+                        q,
+                        out,
+                    )
+                };
+                return 0;
+            }
+            [p0, p1, p2] => {
+                // SAFETY: shape and row bounds are checked above; the kernels use unaligned loads.
+                unsafe {
+                    neon::drive(
+                        neon::accumulator(),
+                        rows,
+                        words,
+                        index,
+                        [p0, p1, p2],
+                        q,
+                        out,
+                    )
+                };
+                return 0;
+            }
+            _ => {}
+        }
+    }
+    let rows = words_from_le_bytes(bytes);
+    match offsets {
+        Some(offsets) => estimate_asym_batch_unscaled_indexed(&rows, words, offsets, q, out),
+        None => estimate_asym_batch_unscaled(&rows, words, q, out),
+    }
+    u64::from(matches!(rows, Cow::Owned(_)))
+}
+
 /// NEON popcount kernels for the three- and four-plane batch scorers.
 ///
 /// Per 16-byte chunk per row over `P` bitplanes: `P` AND, `P + 1` CNT, `P + 1` accumulates. With
@@ -555,15 +625,7 @@ mod neon {
         q: &QueryPlanes,
         out: &mut [f32],
     ) {
-        match acc {
-            // SAFETY: the caller's shape checks keep every row index below `out.len()` in
-            // bounds, and `Dot` is only constructed behind FEAT_DotProd detection.
-            Accumulator::Dot => unsafe { drive_dot(rows, words_per_row, |i| i, planes, q, out) },
-            // SAFETY: bounds as above.
-            Accumulator::Widen => unsafe {
-                drive_widen(rows, words_per_row, |i| i, planes, q, out)
-            },
-        }
+        drive(acc, rows.as_ptr(), words_per_row, |i| i, planes, q, out);
     }
 
     /// Scores selected rows of a fixed-stride posting range.
@@ -582,16 +644,32 @@ mod neon {
         q: &QueryPlanes,
         out: &mut [f32],
     ) {
+        drive(
+            acc,
+            rows.as_ptr(),
+            words_per_row,
+            |i| row_offsets[i],
+            planes,
+            q,
+            out,
+        );
+    }
+
+    /// # Safety
+    /// Every selected row must be readable for `words` words, and each plane must hold `words`.
+    /// `Dot` requires FEAT_DotProd. Rows need not be aligned.
+    pub(super) unsafe fn drive<const P: usize>(
+        acc: Accumulator,
+        rows: *const u64,
+        words: usize,
+        row_index: impl Fn(usize) -> usize,
+        planes: [&[u64]; P],
+        q: &QueryPlanes,
+        out: &mut [f32],
+    ) {
         match acc {
-            // SAFETY: the caller's offset bounds keep every selected row in bounds, and `Dot`
-            // is only constructed behind FEAT_DotProd detection.
-            Accumulator::Dot => unsafe {
-                drive_dot(rows, words_per_row, |i| row_offsets[i], planes, q, out)
-            },
-            // SAFETY: bounds as above.
-            Accumulator::Widen => unsafe {
-                drive_widen(rows, words_per_row, |i| row_offsets[i], planes, q, out)
-            },
+            Accumulator::Dot => drive_dot(rows, words, row_index, planes, q, out),
+            Accumulator::Widen => drive_widen(rows, words, row_index, planes, q, out),
         }
     }
 
@@ -600,17 +678,16 @@ mod neon {
     /// # Safety
     ///
     /// FEAT_DotProd must be present, every plane must hold `words` words, and
-    /// `row_index(i) * words + words <= rows.len()` for every `i < out.len()`.
+    /// `base.add(row_index(i) * words)` must be readable for `words` words for every output.
     #[target_feature(enable = "dotprod")]
     unsafe fn drive_dot<const P: usize>(
-        rows: &[u64],
+        base: *const u64,
         words: usize,
         row_index: impl Fn(usize) -> usize,
         planes: [&[u64]; P],
         q: &QueryPlanes,
         out: &mut [f32],
     ) {
-        let base = rows.as_ptr();
         for pair in 0..out.len() / 2 {
             let rows2 = [
                 base.add(row_index(pair * 2) * words),
@@ -631,17 +708,15 @@ mod neon {
     ///
     /// # Safety
     ///
-    /// Every plane must hold `words` words, and `row_index(i) * words + words <= rows.len()` for
-    /// every `i < out.len()`.
+    /// Every plane must hold `words` words. Each selected row must be readable for `words` words.
     unsafe fn drive_widen<const P: usize>(
-        rows: &[u64],
+        base: *const u64,
         words: usize,
         row_index: impl Fn(usize) -> usize,
         planes: [&[u64]; P],
         q: &QueryPlanes,
         out: &mut [f32],
     ) {
-        let base = rows.as_ptr();
         for pair in 0..out.len() / 2 {
             let rows2 = [
                 base.add(row_index(pair * 2) * words),
@@ -846,7 +921,7 @@ mod neon {
     ) {
         if words % 2 == 1 {
             let last = words - 1;
-            let signs = *row.add(last);
+            let signs = row.add(last).read_unaligned();
             *positives += signs.count_ones();
             for (sum, plane) in sums.iter_mut().zip(planes) {
                 *sum += u64::from((signs & plane[last]).count_ones());
@@ -1356,6 +1431,43 @@ mod tests {
                         );
                     }
 
+                    let bytes: Vec<_> = packed.iter().flat_map(|word| word.to_le_bytes()).collect();
+                    let mut storage = vec![0; bytes.len() + 7];
+                    for offset in 0..8 {
+                        storage[offset..offset + bytes.len()].copy_from_slice(&bytes);
+                        let input = &storage[offset..offset + bytes.len()];
+                        let fallbacks =
+                            estimate_asym_bytes(input, words, None, &q, &mut contiguous);
+                        let indexed_fallbacks =
+                            estimate_asym_bytes(input, words, Some(&row_offsets), &q, &mut indexed);
+                        let direct = cfg!(all(
+                            target_arch = "aarch64",
+                            target_feature = "neon",
+                            target_endian = "little"
+                        )) && matches!(bq, 3 | 4);
+                        let expected_fallbacks = u64::from(
+                            !direct
+                                && (!cfg!(target_endian = "little")
+                                    || !input.as_ptr().cast::<u64>().is_aligned()),
+                        );
+                        assert_eq!(fallbacks, expected_fallbacks);
+                        assert_eq!(indexed_fallbacks, expected_fallbacks);
+                        for (got, want) in contiguous.iter().zip(&expected) {
+                            assert_eq!(
+                                got.to_bits(),
+                                want.to_bits(),
+                                "bytes d={d} bq={bq} offset={offset}"
+                            );
+                        }
+                        for (got, &row) in indexed.iter().zip(&row_offsets) {
+                            assert_eq!(
+                                got.to_bits(),
+                                expected[row].to_bits(),
+                                "indexed bytes d={d} bq={bq} offset={offset}"
+                            );
+                        }
+                    }
+
                     #[cfg(target_arch = "x86_64")]
                     {
                         let context = format!("d={d}, bq={bq}, rows={rows}");
@@ -1449,6 +1561,33 @@ mod tests {
                                 accumulators.push(neon::Accumulator::Dot);
                             }
                             for acc in accumulators {
+                                let bytes: Vec<_> =
+                                    packed.iter().flat_map(|word| word.to_le_bytes()).collect();
+                                let mut storage = vec![0; bytes.len() + 7];
+                                for offset in 0..8 {
+                                    storage[offset..offset + bytes.len()].copy_from_slice(&bytes);
+                                    let input = storage[offset..].as_ptr().cast::<u64>();
+                                    let mut got = vec![0.0_f32; row_offsets.len()];
+                                    // SAFETY: each selected row and plane has `words` words; Dot was detected above.
+                                    unsafe {
+                                        neon::drive(
+                                            acc,
+                                            input,
+                                            words,
+                                            |i| row_offsets[i],
+                                            planes,
+                                            q,
+                                            &mut got,
+                                        )
+                                    };
+                                    for (got, &row) in got.iter().zip(row_offsets) {
+                                        assert_eq!(
+                                            got.to_bits(),
+                                            expected[row].to_bits(),
+                                            "unaligned neon {context}, offset={offset}"
+                                        );
+                                    }
+                                }
                                 let mut got = vec![0.0_f32; expected.len()];
                                 // SAFETY: the fixture packs `expected.len()` whole rows of
                                 // `words` words and planes of `words` words.

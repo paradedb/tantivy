@@ -935,6 +935,8 @@ impl Fixture {
             all_docs.sort_unstable();
             all_docs.dedup();
             let mut scratch = ReadScratch::default();
+            vectors.flat_rows()?;
+            self.clear_reads();
             vectors.read_exact_docs(&all_docs, &mut scratch)?;
             let reads: Vec<_> = self
                 .reads()

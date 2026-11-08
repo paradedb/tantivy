@@ -144,8 +144,8 @@ struct VectorSource {
     field: Field,
     max_doc: DocId,
     centroid_slots: Option<CentroidSlices>,
-    /// The validated `ExactRows` metadata of a quantized clustered field.
-    exact: Option<BlockMetadata>,
+    /// The deferred full-precision entry of a quantized clustered field.
+    exact: Option<FileSlice>,
 }
 
 /// The entry a deferred addressing map is read from.
@@ -234,7 +234,8 @@ pub struct VectorIndexReader {
 /// A quantized clustered field's full-precision rows in document order: flat blocks and the
 /// presence map that ranks a document to its row.
 struct ExactRows {
-    blocks: Arc<Blocks>,
+    source: FileSlice,
+    blocks: OnceLock<crate::Result<Blocks>>,
     id_map: DeferredIdMap,
 }
 
@@ -425,7 +426,7 @@ impl VectorFieldReader {
             let entry = vec_composite
                 .open_read_with_idx(field, VectorEntry::ExactRows.index())
                 .expect("validated ExactRows entry");
-            Some(BlockMetadata::open(entry, &options, false)?)
+            Some(entry)
         } else {
             None
         };
@@ -493,26 +494,16 @@ impl VectorIndexReader {
         };
         // The document-ordered rows hold every document once: as many as the routing index counts
         // and as the presence map ranks.
-        let exact = match &source.exact {
-            Some(metadata) => {
-                let blocks = Arc::new(Blocks::from_metadata(metadata.clone())?);
-                let id_map = DeferredIdMap::deferred(
-                    source.composite.clone(),
-                    source.field,
-                    source.max_doc,
-                    VectorEntry::ExactIdMap,
-                );
-                if blocks.num_rows() != id_map.get(false)?.num_rows() as usize
-                    || blocks.num_rows() != num_vectors
-                {
-                    return Err(
-                        DataCorruption::comment_only("exact vector row count mismatch").into(),
-                    );
-                }
-                Some(ExactRows { blocks, id_map })
-            }
-            None => None,
-        };
+        let exact = source.exact.as_ref().map(|entry| ExactRows {
+            source: entry.clone(),
+            blocks: OnceLock::new(),
+            id_map: DeferredIdMap::deferred(
+                source.composite.clone(),
+                source.field,
+                source.max_doc,
+                VectorEntry::ExactIdMap,
+            ),
+        });
         Ok(Self {
             max_doc: source.max_doc,
             options,
@@ -612,26 +603,43 @@ impl VectorIndexReader {
     /// The document-ordered full-precision rows: a flat field's blocks, or a quantized clustered
     /// field's `ExactRows`. `None` for plain clustered storage, whose rows sit in the cluster
     /// blocks.
-    pub(crate) fn flat_rows(&self) -> Option<FlatRows<'_>> {
+    pub(crate) fn flat_rows(&self) -> crate::Result<Option<FlatRows<'_>>> {
         match &self.exact {
-            Some(exact) => Some(FlatRows {
-                blocks: &exact.blocks,
+            Some(exact) => Ok(Some(FlatRows {
+                blocks: self.full_precision_blocks()?,
                 id_map: &exact.id_map,
-            }),
-            None if !self.rows_slice.clustered() => Some(FlatRows {
+            })),
+            None if !self.rows_slice.clustered() => Ok(Some(FlatRows {
                 blocks: &self.rows_slice,
                 id_map: &self.id_map,
-            }),
-            None => None,
+            })),
+            None => Ok(None),
         }
     }
 
-    /// The blocks holding the field's full-precision rows: `ExactRows` for quantized clustered
-    /// storage, the Data blocks otherwise.
-    fn full_precision_blocks(&self) -> &Blocks {
+    fn full_precision_blocks(&self) -> crate::Result<&Blocks> {
         match &self.exact {
-            Some(exact) => &exact.blocks,
-            None => &self.rows_slice,
+            Some(exact) => exact
+                .blocks
+                .get_or_init(|| {
+                    let _init = crate::vector::telemetry::enter_vector_stage(
+                        crate::vector::VectorStage::ScanInit,
+                    );
+                    let metadata = BlockMetadata::open(exact.source.clone(), &self.options, false)?;
+                    let blocks = Blocks::from_metadata(metadata)?;
+                    if blocks.num_rows() != self.num_vectors
+                        || blocks.num_rows() != exact.id_map.get(false)?.num_rows() as usize
+                    {
+                        return Err(DataCorruption::comment_only(
+                            "exact vector row count mismatch",
+                        )
+                        .into());
+                    }
+                    Ok(blocks)
+                })
+                .as_ref()
+                .map_err(Clone::clone),
+            None => Ok(&self.rows_slice),
         }
     }
 
@@ -766,7 +774,7 @@ impl VectorIndexReader {
         if doc_id >= self.max_doc {
             return Ok(None);
         }
-        match self.flat_rows() {
+        match self.flat_rows()? {
             Some(flat) => flat.location(doc_id),
             None => Ok(None),
         }
@@ -775,7 +783,7 @@ impl VectorIndexReader {
     /// Reads a document's vector: from the document-ordered rows where the field has them, else
     /// through its stored cluster location.
     pub fn vector_bytes(&self, doc_id: DocId) -> crate::Result<Option<OwnedBytes>> {
-        let location = if self.flat_rows().is_some() {
+        let location = if self.has_exact_rows() || !self.rows_slice.clustered() {
             self.exact_location(doc_id)?
         } else {
             self.row_location(doc_id)?
@@ -788,7 +796,7 @@ impl VectorIndexReader {
     /// Reads one full-precision vector at a block-local row of the blocks that hold the rows:
     /// `ExactRows` for quantized clustered storage, the Data blocks otherwise.
     pub fn vector_bytes_for_row(&self, address: BlockAddress) -> crate::Result<OwnedBytes> {
-        let blocks = self.full_precision_blocks();
+        let blocks = self.full_precision_blocks()?;
         let (block, row) = (address.block as usize, address.row as usize);
         if block >= blocks.num_blocks() {
             return Err(TantivyError::InvalidArgument(
@@ -830,7 +838,7 @@ impl VectorIndexReader {
         docs: &[DocId],
         scratch: &'s mut ReadScratch,
     ) -> crate::Result<VectorRowBatch<'s>> {
-        let flat = self.flat_rows().ok_or_else(|| {
+        let flat = self.flat_rows()?.ok_or_else(|| {
             DataCorruption::comment_only("document-ordered rows need a flat entry")
         })?;
         flat.read_docs(docs, self.options.bytes_per_vector(), scratch)
@@ -841,7 +849,11 @@ impl VectorIndexReader {
     /// without block geometry.
     pub(crate) fn exact_rows_cost_bound(&self, rows: usize) -> ReadCost {
         let stride = self.options.bytes_per_vector();
-        match self.full_precision_blocks().storage_block_len() {
+        let block_len = match &self.exact {
+            Some(exact) => exact.source.storage_block_len(),
+            None => self.rows_slice.storage_block_len(),
+        };
+        match block_len {
             Some(block_len) => ReadCost(rows * (stride.div_ceil(block_len) + 1)),
             None => ReadCost(rows * stride),
         }
@@ -854,7 +866,7 @@ impl VectorIndexReader {
         docs: &[DocId],
         scratch: &mut ReadScratch,
     ) -> crate::Result<ReadCost> {
-        let flat = self.flat_rows().ok_or_else(|| {
+        let flat = self.flat_rows()?.ok_or_else(|| {
             DataCorruption::comment_only("document-ordered rows need a flat entry")
         })?;
         flat.docs_cost(docs, self.options.bytes_per_vector(), scratch)
@@ -868,7 +880,7 @@ impl VectorIndexReader {
         scratch: &'s mut ReadScratch,
     ) -> crate::Result<VectorRowBatch<'s>> {
         read_rows_planned_in(
-            self.full_precision_blocks(),
+            self.full_precision_blocks()?,
             block,
             self.options.bytes_per_vector(),
             scratch,
@@ -1359,6 +1371,72 @@ mod tests {
                 Err(TantivyError::InvalidArgument(_))
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn routing_defers_exact_entries_and_shares_their_validation() -> crate::Result<()> {
+        use crate::vector::test_support::FixtureSpec;
+        let fixture = FixtureSpec::clustered(Metric::L2, 64, 4, 32)
+            .schedule(&[1, 1])
+            .spill()
+            .build()?;
+        let segment = fixture.index.searchable_segments()?.remove(0);
+        let segment = SegmentReader::open(&segment)?;
+        let mut field = VectorFieldReader::open(&segment, fixture.field)?;
+        let source = field.source.as_mut().unwrap();
+        let bytes = source.exact.as_ref().unwrap().read_bytes()?.to_vec();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        source.exact = Some(FileSlice::new(Arc::new(BlockTrackedBytes {
+            bytes,
+            reads: Arc::clone(&reads),
+            block_len: 16,
+        })));
+        let reader = Arc::new(VectorIndexReader::open(&field)?);
+        assert_eq!(reader.index().unwrap().num_docs(), 32);
+        reader.exact_rows_cost_bound(10);
+        let exact = reader.exact.as_ref().unwrap();
+        assert!(exact.blocks.get().is_none());
+        assert!(exact.id_map.value.get().is_none());
+        assert!(reads.lock().unwrap().is_empty());
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| reader.full_precision_blocks().unwrap()))
+                .collect();
+            let blocks: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert!(blocks.iter().all(|b| std::ptr::eq(*b, blocks[0])));
+        });
+        let metadata_reads = reads.lock().unwrap().len();
+        assert!(metadata_reads > 0);
+        assert!(exact.id_map.value.get().is_some());
+        assert_eq!(reader.flat_rows()?.unwrap().num_rows(), 32);
+        assert_eq!(reads.lock().unwrap().len(), metadata_reads);
+        assert!(reader.vector_bytes(0)?.is_some());
+        assert!(exact.id_map.value.get().is_some());
+
+        let mut mismatch = VectorIndexReader::open(&field)?;
+        mismatch.num_vectors += 1;
+        for _ in 0..2 {
+            assert!(matches!(
+                mismatch.full_precision_blocks(),
+                Err(TantivyError::DataCorruption(_))
+            ));
+        }
+        let exact = mismatch.exact.as_ref().unwrap();
+        assert!(matches!(
+            exact.blocks.get(),
+            Some(Err(TantivyError::DataCorruption(_)))
+        ));
+
+        let mut mismatch = VectorIndexReader::open(&field)?;
+        let mut ids = Vec::new();
+        IdMap::serialize(&[0], 32, &mut ids)?;
+        mismatch.exact.as_mut().unwrap().id_map =
+            DeferredIdMap::ready(IdMap::open(FileSlice::from(ids), 32)?);
+        assert!(matches!(
+            mismatch.vector_bytes_for_row(BlockAddress::new(0, 0)),
+            Err(TantivyError::DataCorruption(_))
+        ));
         Ok(())
     }
 
