@@ -250,7 +250,7 @@ impl BlockOffsets {
 
 /// All blocks for one field, with eager metadata and lazy byte and row offsets.
 pub(crate) struct Blocks {
-    data_slice: FileSlice,
+    pub(crate) data_slice: FileSlice,
     offsets: BlockOffsets,
     pub(crate) metadata: Arc<VectorColMetadata>,
     pub(crate) schema: Vec<Slot>,
