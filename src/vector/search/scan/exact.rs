@@ -183,6 +183,7 @@ where
                     self.offer(
                         selected,
                         bound,
+                        fold,
                         &mut column_read,
                         position,
                         offset,

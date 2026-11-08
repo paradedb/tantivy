@@ -1067,70 +1067,73 @@ mod ivf_e2e_tests {
 
     #[test]
     fn global_search_preserves_filtered_quantized_results() -> Result<()> {
-        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
-            let fixture = FixtureSpec::clustered(metric, 128, 8, 768)
-                .segments(3)
-                .schedule(&[1, 1])
-                .label("rare", |i| i % 19 == 0)
-                .deletes(&[0, 19, 201, 700])
-                .without_vectors(|i| i % 23 == 0)
-                .build()?;
-            let searcher = fixture.index.reader()?.searcher();
-            let mut readers: Vec<_> = searcher
-                .segment_readers()
-                .iter()
-                .enumerate()
-                .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
-                .collect();
-            readers.reverse();
-            let mut query = vec![0.01; 128];
-            query[2] = 1.0;
-            for filter in [
-                &AllQuery as &dyn Query,
-                &fixture.filter("rare"),
-                &fixture.filter("absent"),
-            ] {
-                for (located, exact_plan) in [
-                    (LocatedPath::Off, false),
-                    (LocatedPath::Auto, false),
-                    (LocatedPath::Off, true),
-                    (LocatedPath::Auto, true),
+        for spill in [false, true] {
+            for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+                let mut spec = FixtureSpec::clustered(metric, 128, 8, 768)
+                    .segments(3)
+                    .schedule(&[1, 1])
+                    .label("rare", |i| i % 19 == 0)
+                    .deletes(&[0, 19, 201, 700])
+                    .without_vectors(|i| i % 23 == 0);
+                spec.spill = spill;
+                let fixture = spec.build()?;
+                let searcher = fixture.index.reader()?.searcher();
+                let mut readers: Vec<_> = searcher
+                    .segment_readers()
+                    .iter()
+                    .enumerate()
+                    .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
+                    .collect();
+                readers.reverse();
+                let mut query = vec![0.01; 128];
+                query[2] = 1.0;
+                for filter in [
+                    &AllQuery as &dyn Query,
+                    &fixture.filter("rare"),
+                    &fixture.filter("absent"),
                 ] {
-                    let params = ProbeParams {
-                        located,
-                        exact_plan,
-                        ..exhaustive_params(8)
-                    };
-                    for batch_size in [1, 2, readers.len()] {
-                        let threshold: SharedThresholdArc<Score> =
-                            Arc::new(AtomicSharedThreshold::default());
-                        let collector = TopDocs::with_limit(7)
-                            .and_offset(3)
-                            .order_by_similarity(fixture.field, query.clone())
-                            .with_probe_params(params.clone())
-                            .with_shared_threshold(Arc::clone(&threshold))
-                            .build();
-                        let weight = fixture.weight(filter)?;
-                        let mut fruits = Vec::new();
-                        for batch in readers.chunks(batch_size) {
-                            fruits.extend(collector.collect_segments(
-                                weight.as_ref(),
-                                batch,
-                                |_| {},
-                            )?);
+                    for (located, exact_plan) in [
+                        (LocatedPath::Off, false),
+                        (LocatedPath::Auto, false),
+                        (LocatedPath::Off, true),
+                        (LocatedPath::Auto, true),
+                    ] {
+                        let params = ProbeParams {
+                            located,
+                            exact_plan,
+                            ..exhaustive_params(8)
+                        };
+                        for batch_size in [1, 2, readers.len()] {
+                            let threshold: SharedThresholdArc<Score> =
+                                Arc::new(AtomicSharedThreshold::default());
+                            let collector = TopDocs::with_limit(7)
+                                .and_offset(3)
+                                .order_by_similarity(fixture.field, query.clone())
+                                .with_probe_params(params.clone())
+                                .with_shared_threshold(Arc::clone(&threshold))
+                                .build();
+                            let weight = fixture.weight(filter)?;
+                            let mut fruits = Vec::new();
+                            for batch in readers.chunks(batch_size) {
+                                fruits.extend(collector.collect_segments(
+                                    weight.as_ref(),
+                                    batch,
+                                    |_| {},
+                                )?);
+                            }
+                            let fruit = collector.merge_fruits(fruits)?;
+                            let expected: Vec<_> = fixture
+                                .oracle(filter, &query, 10)?
+                                .into_iter()
+                                .skip(3)
+                                .collect();
+                            assert_eq!(
+                                fruit.results, expected,
+                                "{metric:?} {located:?} batch={batch_size}"
+                            );
+                            assert_eq!(fruit.stats.len(), readers.len());
+                            assert_eq!(threshold.load().is_some(), !fruit.results.is_empty());
                         }
-                        let fruit = collector.merge_fruits(fruits)?;
-                        let expected: Vec<_> = fixture
-                            .oracle(filter, &query, 10)?
-                            .into_iter()
-                            .skip(3)
-                            .collect();
-                        assert_eq!(
-                            fruit.results, expected,
-                            "{metric:?} {located:?} batch={batch_size}"
-                        );
-                        assert_eq!(fruit.stats.len(), readers.len());
-                        assert_eq!(threshold.load().is_some(), !fruit.results.is_empty());
                     }
                 }
             }
@@ -1481,76 +1484,79 @@ mod ivf_e2e_tests {
 
     #[test]
     fn routing_plan_preserves_results_across_parallel_segments() -> Result<()> {
-        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
-            let fixture = FixtureSpec::clustered(metric, 64, 8, 384)
-                .label("matches", |i| i % 3 == 0)
-                .segments(3)
-                .schedule(&[1, 1])
-                .deletes(&[0, 3, 80])
-                .build()?;
-            let searcher = fixture.index.reader()?.searcher();
-            let readers: Vec<_> = searcher
-                .segment_readers()
-                .iter()
-                .enumerate()
-                .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
-                .collect();
-            let mut query = vec![0.01; 64];
-            query[2] = 1.0;
-            for filter in [&AllQuery as &dyn Query, &fixture.filter("matches")] {
-                for located in [LocatedPath::Off, LocatedPath::Auto] {
-                    let params = ProbeParams {
-                        located,
-                        ..exhaustive_params(8)
-                    };
-                    let builder = || {
-                        TopDocs::with_limit(7)
-                            .and_offset(3)
-                            .order_by_similarity(fixture.field, query.clone())
-                            .with_probe_params(params.clone())
-                    };
-                    let weight = fixture.weight(filter)?;
-                    let plan = VectorRoutingPlan::build(
-                        fixture.field,
-                        query.clone(),
-                        params.clone(),
-                        1.0,
-                        &readers,
-                        |_| {},
-                    )?;
-                    let bytes = serde_json::to_vec(&plan).unwrap();
-                    let plan: VectorRoutingPlan = serde_json::from_slice(&bytes).unwrap();
-                    let plan = Arc::new(plan);
-                    let threshold: SharedThresholdArc<Score> =
-                        Arc::new(AtomicSharedThreshold::default());
-                    let fruits = std::thread::scope(|scope| {
-                        readers
-                            .iter()
-                            .rev()
-                            .map(|segment| {
-                                let (ord, reader) = (segment.ordinal, segment.reader);
-                                let collector = builder()
-                                    .with_routing_plan(Arc::clone(&plan))
-                                    .with_shared_threshold(Arc::clone(&threshold))
-                                    .build();
-                                let weight = &weight;
-                                scope.spawn(move || {
-                                    collector.collect_segment(weight.as_ref(), ord, reader)
+        for spill in [false, true] {
+            for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+                let mut spec = FixtureSpec::clustered(metric, 64, 8, 384)
+                    .label("matches", |i| i % 3 == 0)
+                    .segments(3)
+                    .schedule(&[1, 1])
+                    .deletes(&[0, 3, 80]);
+                spec.spill = spill;
+                let fixture = spec.build()?;
+                let searcher = fixture.index.reader()?.searcher();
+                let readers: Vec<_> = searcher
+                    .segment_readers()
+                    .iter()
+                    .enumerate()
+                    .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
+                    .collect();
+                let mut query = vec![0.01; 64];
+                query[2] = 1.0;
+                for filter in [&AllQuery as &dyn Query, &fixture.filter("matches")] {
+                    for located in [LocatedPath::Off, LocatedPath::Auto] {
+                        let params = ProbeParams {
+                            located,
+                            ..exhaustive_params(8)
+                        };
+                        let builder = || {
+                            TopDocs::with_limit(7)
+                                .and_offset(3)
+                                .order_by_similarity(fixture.field, query.clone())
+                                .with_probe_params(params.clone())
+                        };
+                        let weight = fixture.weight(filter)?;
+                        let plan = VectorRoutingPlan::build(
+                            fixture.field,
+                            query.clone(),
+                            params.clone(),
+                            1.0,
+                            &readers,
+                            |_| {},
+                        )?;
+                        let bytes = serde_json::to_vec(&plan).unwrap();
+                        let plan: VectorRoutingPlan = serde_json::from_slice(&bytes).unwrap();
+                        let plan = Arc::new(plan);
+                        let threshold: SharedThresholdArc<Score> =
+                            Arc::new(AtomicSharedThreshold::default());
+                        let fruits = std::thread::scope(|scope| {
+                            readers
+                                .iter()
+                                .rev()
+                                .map(|segment| {
+                                    let (ord, reader) = (segment.ordinal, segment.reader);
+                                    let collector = builder()
+                                        .with_routing_plan(Arc::clone(&plan))
+                                        .with_shared_threshold(Arc::clone(&threshold))
+                                        .build();
+                                    let weight = &weight;
+                                    scope.spawn(move || {
+                                        collector.collect_segment(weight.as_ref(), ord, reader)
+                                    })
                                 })
-                            })
-                            .collect::<Vec<_>>()
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .map(|thread| thread.join().unwrap())
+                                .collect::<Result<Vec<_>>>()
+                        })?;
+                        let fruit = builder().build().merge_fruits(fruits)?;
+                        let expected: Vec<_> = fixture
+                            .oracle(filter, &query, 10)?
                             .into_iter()
-                            .map(|thread| thread.join().unwrap())
-                            .collect::<Result<Vec<_>>>()
-                    })?;
-                    let fruit = builder().build().merge_fruits(fruits)?;
-                    let expected: Vec<_> = fixture
-                        .oracle(filter, &query, 10)?
-                        .into_iter()
-                        .skip(3)
-                        .collect();
-                    assert_eq!(fruit.results, expected, "{metric:?}");
-                    assert_eq!(fruit.stats.len(), readers.len());
+                            .skip(3)
+                            .collect();
+                        assert_eq!(fruit.results, expected, "{metric:?}");
+                        assert_eq!(fruit.stats.len(), readers.len());
+                    }
                 }
             }
         }

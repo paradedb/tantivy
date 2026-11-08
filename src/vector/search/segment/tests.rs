@@ -43,102 +43,105 @@ fn adaptive_cascade_matches_prefix_replay() -> crate::Result<()> {
     ];
     let mut stops = 0;
     let mut plain_stops = 0;
-    for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
-        for schedule in [&[][..], &[1][..], &[1, 1][..], &[1, 1, 4][..]] {
-            let representation = if schedule.is_empty() {
-                Representation::FullPrecision
-            } else {
-                Representation::Quantized(schedule)
-            };
-            let fixture = matrix_fixture(metric, representation, true)?;
-            let searcher = fixture.index.reader()?.searcher();
-            let (ordinal, segment) = first_segment(&searcher);
-            for filter in [
-                &AllQuery as &dyn Query,
-                &fixture.filter("half"),
-                &fixture.filter("rare"),
-            ] {
-                let weight = fixture.weight(filter)?;
-                for query in matrix_queries() {
-                    let mut ranked =
-                        fixture.candidates(&(0..MATRIX_CLUSTERS).collect::<Vec<_>>(), &query)?;
-                    ranked.sort_unstable_by(|a, b| {
-                        b.sim
-                            .score()
-                            .total_cmp(&a.sim.score())
-                            .then(a.node.cmp(&b.node))
-                    });
-                    for k in [1, 10, MATRIX_DOCS] {
-                        let params = ProbeParams {
-                            exact_plan: true,
-                            ..routed_exhaustive_params(MATRIX_CLUSTERS)
-                        };
-                        for plan in plans {
-                            let mut previous_prefix = 0;
-                            for target in [0.5, 0.95, 1.0] {
-                                let (active, report) = fixture.run_planned_with(
-                                    ordinal as usize,
-                                    weight.as_ref(),
-                                    &query,
-                                    k,
-                                    ProbeParams {
-                                        adaptive_probing: (target < 1.0).then(|| {
-                                            AdaptiveProbeParams {
-                                                admission_fraction: (1.0_f64 - target).powf(1.5),
-                                            }
-                                        }),
-                                        ..params.clone()
-                                    },
-                                    Some(plan),
-                                    true,
-                                    None,
-                                    Some(routing_plan_for_clusters(
-                                        fixture.field,
-                                        segment,
-                                        ranked.clone(),
-                                    )),
-                                )?;
-                                let prefix = report.clusters_probed();
-                                assert!(prefix >= previous_prefix);
-                                previous_prefix = prefix;
-                                if report.termination == ProbeTermination::QuantizedRecall {
-                                    stops += 1;
-                                    plain_stops += usize::from(schedule.is_empty());
-                                    assert!(target < 1.0);
+    for spill in [false, true] {
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            for schedule in [&[][..], &[1][..], &[1, 1][..], &[1, 1, 4][..]] {
+                let representation = if schedule.is_empty() {
+                    Representation::FullPrecision
+                } else {
+                    Representation::Quantized(schedule)
+                };
+                let fixture = matrix_fixture(metric, representation, true, spill)?;
+                let searcher = fixture.index.reader()?.searcher();
+                let (ordinal, segment) = first_segment(&searcher);
+                for filter in [
+                    &AllQuery as &dyn Query,
+                    &fixture.filter("half"),
+                    &fixture.filter("rare"),
+                ] {
+                    let weight = fixture.weight(filter)?;
+                    for query in matrix_queries() {
+                        let mut ranked = fixture
+                            .candidates(&(0..MATRIX_CLUSTERS).collect::<Vec<_>>(), &query)?;
+                        ranked.sort_unstable_by(|a, b| {
+                            b.sim
+                                .score()
+                                .total_cmp(&a.sim.score())
+                                .then(a.node.cmp(&b.node))
+                        });
+                        for k in [1, 10, MATRIX_DOCS] {
+                            let params = ProbeParams {
+                                exact_plan: true,
+                                ..routed_exhaustive_params(MATRIX_CLUSTERS)
+                            };
+                            for plan in plans {
+                                let mut previous_prefix = 0;
+                                for target in [0.5, 0.95, 1.0] {
+                                    let (active, report) = fixture.run_planned_with(
+                                        ordinal as usize,
+                                        weight.as_ref(),
+                                        &query,
+                                        k,
+                                        ProbeParams {
+                                            adaptive_probing: (target < 1.0).then(|| {
+                                                AdaptiveProbeParams {
+                                                    admission_fraction: (1.0_f64 - target)
+                                                        .powf(1.5),
+                                                }
+                                            }),
+                                            ..params.clone()
+                                        },
+                                        Some(plan),
+                                        true,
+                                        None,
+                                        Some(routing_plan_for_clusters(
+                                            fixture.field,
+                                            segment,
+                                            ranked.clone(),
+                                        )),
+                                    )?;
+                                    let prefix = report.clusters_probed();
+                                    assert!(prefix >= previous_prefix);
+                                    previous_prefix = prefix;
+                                    if report.termination == ProbeTermination::QuantizedRecall {
+                                        stops += 1;
+                                        plain_stops += usize::from(schedule.is_empty());
+                                        assert!(target < 1.0);
+                                    }
+                                    let (replay, replay_report) = fixture.run_planned_with(
+                                        ordinal as usize,
+                                        weight.as_ref(),
+                                        &query,
+                                        k,
+                                        params.clone(),
+                                        Some(plan),
+                                        true,
+                                        None,
+                                        Some(routing_plan_for_clusters(
+                                            fixture.field,
+                                            segment,
+                                            ranked[..prefix].to_vec(),
+                                        )),
+                                    )?;
+                                    assert_eq!(active, replay);
+                                    assert_eq!(report.exact_rows, replay_report.exact_rows);
+                                    assert_eq!(
+                                        report.candidates_scored,
+                                        replay_report.candidates_scored
+                                    );
                                 }
-                                let (replay, replay_report) = fixture.run_planned_with(
-                                    ordinal as usize,
-                                    weight.as_ref(),
-                                    &query,
-                                    k,
-                                    params.clone(),
-                                    Some(plan),
-                                    true,
-                                    None,
-                                    Some(routing_plan_for_clusters(
-                                        fixture.field,
-                                        segment,
-                                        ranked[..prefix].to_vec(),
-                                    )),
-                                )?;
-                                assert_eq!(active, replay);
-                                assert_eq!(report.exact_rows, replay_report.exact_rows);
-                                assert_eq!(
-                                    report.candidates_scored,
-                                    replay_report.candidates_scored
-                                );
                             }
                         }
                     }
                 }
             }
         }
+        assert!(stops > 0);
+        assert!(
+            plain_stops > 0,
+            "unquantized IVF must honor adaptive stopping"
+        );
     }
-    assert!(stops > 0);
-    assert!(
-        plain_stops > 0,
-        "unquantized IVF must honor adaptive stopping"
-    );
     Ok(())
 }
 
@@ -2300,7 +2303,7 @@ fn zz_probe_layer0_reads() -> crate::Result<()> {
         let ranges = fixture.column_ranges()?;
         let query = reads_vector(42);
         let params = ProbeParams {
-            max_probe_fraction: 1.0,
+            max_probe: f64::MAX,
             min_probe_clusters: 1,
             ..Default::default()
         };
@@ -2342,7 +2345,7 @@ fn spill_recall_and_located_path() -> crate::Result<()> {
         let plain = matrix_fixture(metric, Representation::Quantized(&[1, 4]), false, false)?;
         // One cluster per segment: a budget below one cluster's work with a floor of one.
         let one_cluster = ProbeParams {
-            max_probe_fraction: 1e-6,
+            max_probe: 1e-6,
             min_probe_clusters: 1,
             exact_plan: false,
             located: LocatedPath::Off,

@@ -116,10 +116,10 @@ impl VectorRoutingPlan {
             .filter_map(|v| v.index())
             .map(|i| i.num_clusters())
             .sum();
-        let docs = vectors
+        let rows = vectors
             .iter()
             .filter_map(|v| v.index())
-            .map(|i| i.num_docs())
+            .map(|i| i.num_rows())
             .sum();
         let mut plan = Self {
             field,
@@ -130,7 +130,7 @@ impl VectorRoutingPlan {
             return Ok(plan);
         };
         let query = VectorQuery::new(first.options().metric(), Arc::new(query));
-        let (total, _, x) = probe_params.resolved_work_budget(clusters, docs)?;
+        let (total, _, x) = probe_params.resolved_work_budget(clusters, rows)?;
         let routers = vectors
             .iter()
             .map(|reader| reader.index().map(|index| index.opened_router()))
