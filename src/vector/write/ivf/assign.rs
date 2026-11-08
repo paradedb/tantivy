@@ -1,5 +1,5 @@
-//! The assign step: every vector to its nearest centroid and, when the field spills, to a second
-//! one; and the clusters' row ranges.
+//! The assign step: every vector to its nearest centroid and, when the field spills, to additional
+//! cells; and the clusters' row ranges.
 
 use std::time::Instant;
 
@@ -7,14 +7,12 @@ use itertools::Itertools;
 
 use super::source::MergeVectorSource;
 use super::{AssignedVector, FieldMerge, IvfBuildTimings};
-use crate::vector::clustering::soar::SOAR_LAMBDA;
+use crate::vector::clustering::soar::{SOAR_LAMBDA, SOAR_REPLICAS};
 use crate::vector::clustering::{IvfCentroids, IvfClusterer, VectorSource};
 use crate::vector::write::RowAddress;
 use crate::{DocId, TantivyError};
 
-/// Assigns each of the field's vectors to one of `centroids`, and to a second one when the field
-/// spills, reading the sources in storage order through a [`MergeVectorSource`]. A spilled vector
-/// yields two entries with the same source and document, the primary first.
+/// Assigns vectors in storage order, with the primary followed by distinct spill cells.
 pub(super) fn assign(
     merge: &FieldMerge,
     clusterer: &dyn IvfClusterer,
@@ -39,22 +37,20 @@ pub(super) fn assign(
     let mut source =
         MergeVectorSource::new(&merge.readers, assign_sources, opts.dim(), merge.ctx.cancel);
     let assign_start = Instant::now();
-    let pairs: Vec<(u32, Option<u32>)> = if merge.spill {
-        clusterer.assign_pairs(opts, &mut source, centroids, SOAR_LAMBDA)?
+    let replicas = if merge.spill { SOAR_REPLICAS } else { 1 };
+    let (primary, secondary) = if merge.spill {
+        clusterer.assign_replicas(opts, &mut source, centroids, SOAR_LAMBDA, replicas)?
     } else {
-        clusterer
-            .assign(opts, &mut source, centroids)?
-            .into_iter()
-            .map(|cluster| (cluster, None))
-            .collect()
+        (clusterer.assign(opts, &mut source, centroids)?, Vec::new())
     };
     timings.assign += assign_start.elapsed();
     timings.assign_reads += source.reads;
 
-    if pairs.len() != source.num_rows() {
+    if primary.len() != source.num_rows() || secondary.len() != primary.len() * (replicas - 1) {
         return Err(TantivyError::InvalidArgument(format!(
-            "IvfClusterer assigned {} clusters for {} vectors",
-            pairs.len(),
+            "IvfClusterer returned {} primaries and {} secondary slots for {} vectors",
+            primary.len(),
+            secondary.len(),
             source.num_rows()
         )));
     }
@@ -69,8 +65,10 @@ pub(super) fn assign(
         }
         Ok(cluster)
     };
-    let mut assigned_vectors = Vec::with_capacity(pairs.len());
-    for ((primary, secondary), &(row, target_doc_id)) in pairs.into_iter().zip(source.rows()) {
+    let mut assigned_vectors = Vec::with_capacity(primary.len() * replicas);
+    for (index, (primary, &(row, target_doc_id))) in
+        primary.into_iter().zip(source.rows()).enumerate()
+    {
         let cluster = check(primary)?;
         assigned_vectors.push(AssignedVector {
             cluster,
@@ -78,15 +76,19 @@ pub(super) fn assign(
             source: row,
             primary: true,
         });
-        if let Some(secondary) = secondary {
-            let secondary = check(secondary)?;
-            if secondary == cluster {
+        let secondaries = &secondary[index * (replicas - 1)..(index + 1) * (replicas - 1)];
+        for (slot, &secondary) in secondaries.iter().enumerate() {
+            if secondary == u32::MAX {
+                continue;
+            }
+            let secondary_cluster = check(secondary)?;
+            if secondary == primary || secondaries[..slot].contains(&secondary) {
                 return Err(TantivyError::InvalidArgument(format!(
-                    "IvfClusterer spilled a vector into its own cluster {cluster}"
+                    "IvfClusterer repeated cluster {secondary} for one vector"
                 )));
             }
             assigned_vectors.push(AssignedVector {
-                cluster: secondary,
+                cluster: secondary_cluster,
                 target_doc_id,
                 source: row,
                 primary: false,

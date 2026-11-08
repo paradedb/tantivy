@@ -50,7 +50,7 @@ struct AssignedVector {
     target_doc_id: DocId,
     source: RowAddress,
     /// Whether this is the document's primary row, the one its location map points at; a
-    /// document's spill row is the same vector encoded against a second cluster.
+    /// document's spill rows encode the same vector against other clusters.
     primary: bool,
 }
 
@@ -88,7 +88,7 @@ struct FieldMerge<'a> {
     /// The field's reader in each source segment.
     readers: Vec<Arc<VectorIndexReader>>,
     num_target_docs: u32,
-    /// Whether every vector also gets a spill row in a second cluster.
+    /// Whether vectors also get spill rows in other clusters.
     spill: bool,
 }
 

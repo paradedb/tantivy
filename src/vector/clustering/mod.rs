@@ -49,6 +49,33 @@ pub trait IvfClusterer: Send + Sync + 'static {
             .map(|cluster| (cluster, None))
             .collect())
     }
+
+    /// Primary assignments and row-major secondary slots (`replicas - 1` per vector).
+    /// Missing secondaries are `u32::MAX`. Custom pair-only clusterers retain their behavior.
+    fn assign_replicas(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        centroids: &IvfCentroids,
+        lambda: f32,
+        replicas: usize,
+    ) -> crate::Result<(Vec<u32>, Vec<u32>)> {
+        if replicas == 0 {
+            return Err(TantivyError::InvalidArgument(
+                "replicas must be positive".into(),
+            ));
+        }
+        let pairs = self.assign_pairs(options, source, centroids, lambda)?;
+        let mut primary = Vec::with_capacity(pairs.len());
+        let mut secondary = vec![u32::MAX; pairs.len() * (replicas - 1)];
+        for (row, (first, second)) in pairs.into_iter().enumerate() {
+            primary.push(first);
+            if replicas > 1 {
+                secondary[row * (replicas - 1)] = second.unwrap_or(u32::MAX);
+            }
+        }
+        Ok((primary, secondary))
+    }
 }
 
 /// Replayable, read-only view of vectors for IVF [`IvfClusterer::train`] or

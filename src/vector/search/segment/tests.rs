@@ -2053,9 +2053,8 @@ fn spilled_segment_reads_doc_ids_for_every_opened_cluster() -> crate::Result<()>
     Ok(())
 }
 
-/// With every cluster open, each document's second copy is dropped at admission: the exact
-/// phase scores every live document once, and `spill_dropped` counts one drop per document.
-fn a_doc_in_two_opened_clusters_is_scored_once() -> crate::Result<()> {
+/// With every cluster open, admission drops three replicas and scores each live document once.
+fn a_doc_in_four_opened_clusters_is_scored_once() -> crate::Result<()> {
     let fixture = reads_spec(Metric::L2, &[1, 4], &[101, 202])
         .spill()
         .build()?;
@@ -2082,8 +2081,8 @@ fn a_doc_in_two_opened_clusters_is_scored_once() -> crate::Result<()> {
             .iter()
             .map(|&n| n as usize)
             .sum::<usize>(),
-        2 * vectors.num_vectors(),
-        "every document has two rows"
+        4 * vectors.num_vectors(),
+        "every document has four rows"
     );
     let query = reads_vector(42);
     let (hits, stats) = fixture.run_planned(
@@ -2096,13 +2095,13 @@ fn a_doc_in_two_opened_clusters_is_scored_once() -> crate::Result<()> {
         false,
     )?;
     assert_eq!(hits, fixture.oracle(&AllQuery, &query, READS_DOCS + 1)?);
-    assert_eq!(stats.spill_dropped, live_docs, "{stats:?}");
+    assert_eq!(stats.spill_dropped, 3 * live_docs, "{stats:?}");
     assert_eq!(
         stats.layers.get(0).unwrap().scored(),
-        2 * live_docs,
+        4 * live_docs,
         "{stats:?}"
     );
-    assert_eq!(stats.candidates_scored, 2 * live_docs, "{stats:?}");
+    assert_eq!(stats.candidates_scored, 4 * live_docs, "{stats:?}");
     let trace = fixture.doc_trace(&stats.quantized_trace)?;
     let mut exact = trace.exact_phase_docs.clone();
     exact.dedup();
@@ -2193,7 +2192,7 @@ fn reads_follow_the_plan() -> crate::Result<()> {
         ),
         (
             "a doc whose two clusters are both opened is scored once",
-            a_doc_in_two_opened_clusters_is_scored_once,
+            a_doc_in_four_opened_clusters_is_scored_once,
         ),
     ];
     for (name, case) in cases {
@@ -2403,16 +2402,24 @@ fn spill_recall_and_located_path() -> crate::Result<()> {
 }
 
 /// The writer gives every document a row in its nearest cluster, the one its location names, and
-/// one in a second cluster; each block's DocIds stay strictly ascending; a single centroid, or a
-/// clusterer without pairs of its own, writes one row per document and no spill assignment.
+/// three in distinct spill clusters; each block's DocIds stay strictly ascending. Fewer centroids
+/// cap replication, and nearest-only clusterers write no spill rows.
 #[test]
-fn spilled_blocks_hold_each_document_twice() -> crate::Result<()> {
+fn spilled_blocks_hold_each_document_four_times() -> crate::Result<()> {
     let centroids: Vec<Vec<f32>> = (0..4).map(|axis| one_hot(READS_DIM, axis, 1.0)).collect();
     let vectors: Vec<Vec<f32>> = (0..300).map(reads_vector).collect();
     for (name, spec, rows_per_doc, spilled) in [
         (
             "four centroids",
             FixtureSpec::ivf(Metric::L2, centroids.clone(), vectors.clone())
+                .schedule(&[1, 4])
+                .spill(),
+            4,
+            true,
+        ),
+        (
+            "two centroids",
+            FixtureSpec::ivf(Metric::L2, centroids[..2].to_vec(), vectors.clone())
                 .schedule(&[1, 4])
                 .spill(),
             2,

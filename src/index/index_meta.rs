@@ -334,11 +334,9 @@ pub struct IndexSettings {
     /// quantization. Existing segments retain their own persisted router kind.
     #[serde(default, skip_serializing_if = "is_false")]
     pub vector_centroid_quantization: bool,
-    /// Assign each vector of a quantized IVF field to a second cluster chosen to cover queries
-    /// its first cluster misses, writing its codes there too. Doubles the quantized rows scanned
-    /// per opened cluster and adds about one quantized row per vector to the segment; the probe
-    /// budget counts rows scanned, spills included. Applies to new IVF segments; each segment
-    /// keeps the assignment it was built with.
+    /// Assign quantized IVF vectors to up to four distinct clusters, storing codes for each
+    /// assignment and exact rows once. The probe budget includes spill rows. Applies to new
+    /// IVF segments; existing segments retain their stored assignments.
     #[serde(default, skip_serializing_if = "is_false")]
     pub vector_spill: bool,
     /// Eligibility and storage limits for fields with bitmap postings enabled.

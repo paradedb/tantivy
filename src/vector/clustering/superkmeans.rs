@@ -374,6 +374,39 @@ impl IvfClusterer for SuperKMeansClusterer {
         )?;
         Ok(pairs)
     }
+
+    fn assign_replicas(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        centroids: &IvfCentroids,
+        lambda: f32,
+        replicas: usize,
+    ) -> crate::Result<(Vec<u32>, Vec<u32>)> {
+        if replicas == 0 {
+            return Err(TantivyError::InvalidArgument(
+                "replicas must be positive".into(),
+            ));
+        }
+        let mut primary = Vec::with_capacity(source.num_rows());
+        let mut secondary = Vec::with_capacity(source.num_rows() * (replicas - 1));
+        let IvfCentroids::F32(centroids) = centroids;
+        for_each_batch(
+            source,
+            self.budget_rows(options),
+            |IvfTrainingVectors::F32(batch)| {
+                let (first, rest) = superkmeans::assign_soar_replicas(
+                    Matrix::new(&batch.matrix.values, batch.matrix.rows, options.dim()),
+                    Matrix::new(&centroids.values, centroids.rows, options.dim()),
+                    lambda,
+                    replicas,
+                );
+                primary.extend(first);
+                secondary.extend(rest);
+            },
+        )?;
+        Ok((primary, secondary))
+    }
 }
 
 #[cfg(test)]
@@ -586,6 +619,35 @@ mod tests {
         assert!(pairs
             .iter()
             .all(|&(primary, second)| primary == 0 && second.is_none()));
+    }
+
+    #[test]
+    fn replica_assignment_preserves_pairs_and_batch_order() {
+        let (n, dim) = (3_000, 16);
+        let mut source = VecSource::new(blobs(n, dim), dim);
+        let clusterer = SuperKMeansClusterer::new().with_max_leaf_size(100);
+        let options = VectorOptions::new(dim, Metric::L2);
+        let centroids = IvfCentroids::F32(train(&clusterer, &mut source));
+        let pairs = clusterer
+            .assign_pairs(&options, &mut source, &centroids, 2.0)
+            .unwrap();
+        let (primary, secondary) = clusterer
+            .assign_replicas(&options, &mut source, &centroids, 2.0, 4)
+            .unwrap();
+        assert_eq!(primary.len(), n);
+        assert_eq!(secondary.len(), n * 3);
+        for (row, (&first, rest)) in primary.iter().zip(secondary.chunks_exact(3)).enumerate() {
+            assert_eq!(pairs[row], (first, Some(rest[0])));
+            let mut unique = vec![first];
+            unique.extend_from_slice(rest);
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), 4);
+            assert!(!unique.contains(&u32::MAX));
+        }
+        assert!(clusterer
+            .assign_replicas(&options, &mut source, &centroids, 2.0, 0)
+            .is_err());
     }
 
     #[test]

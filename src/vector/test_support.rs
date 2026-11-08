@@ -113,29 +113,25 @@ impl IvfClusterer for NearestClusterer {
         Ok(assignments)
     }
 
-    /// The nearest centroid and the SOAR secondary over every centroid, by brute force; without
-    /// `pairs`, what the trait's default yields.
-    fn assign_pairs(
+    fn assign_replicas(
         &self,
         options: &VectorOptions,
         source: &mut dyn VectorSource,
         centroids: &IvfCentroids,
         lambda: f32,
-    ) -> crate::Result<Vec<(u32, Option<u32>)>> {
-        if !self.pairs {
-            return Ok(self
-                .assign(options, source, centroids)?
-                .into_iter()
-                .map(|cluster| (cluster, None))
-                .collect());
+        replicas: usize,
+    ) -> crate::Result<(Vec<u32>, Vec<u32>)> {
+        assert!(replicas > 0);
+        let primary = self.assign(options, source, centroids)?;
+        let mut secondary = vec![u32::MAX; primary.len() * (replicas - 1)];
+        if !self.pairs || replicas == 1 {
+            return Ok((primary, secondary));
         }
         let dim = options.dim();
         let num_rows = source.num_rows();
-        let IvfCentroids::F32(_) = centroids;
-        let mut pairs = Vec::with_capacity(num_rows);
         for_each_batch(source, num_rows, |IvfTrainingVectors::F32(batch)| {
-            for vector in batch.matrix.values.chunks_exact(dim) {
-                let distances: Vec<f32> = self
+            for (row, vector) in batch.matrix.values.chunks_exact(dim).enumerate() {
+                let mut costs: Vec<f32> = self
                     .centroids
                     .iter()
                     .map(|centroid| {
@@ -143,41 +139,41 @@ impl IvfClusterer for NearestClusterer {
                             .iter()
                             .zip(centroid)
                             .map(|(a, b)| (a - b) * (a - b))
-                            .sum::<f32>()
+                            .sum()
                     })
                     .collect();
-                let primary = nearest(vector, &self.centroids);
-                if self.centroids.len() == 1 {
-                    pairs.push((primary as u32, None));
-                    continue;
-                }
-                // The unit residual to the primary, zero on the centroid itself.
-                let mut residual: Vec<f32> = vector
-                    .iter()
-                    .zip(&self.centroids[primary])
-                    .map(|(a, b)| a - b)
-                    .collect();
-                let norm = residual.iter().map(|v| v * v).sum::<f32>().sqrt();
-                for v in &mut residual {
-                    *v = if norm > 0.0 { *v / norm } else { 0.0 };
-                }
-                let along: f32 = vector.iter().zip(&residual).map(|(a, b)| a * b).sum();
-                let mut best: Option<(f32, u32)> = None;
-                for (index, centroid) in self.centroids.iter().enumerate() {
-                    if index == primary {
-                        continue;
+                let mut chosen = vec![primary[row]];
+                for replica in 0..(replicas - 1).min(self.centroids.len() - 1) {
+                    let previous = *chosen.last().unwrap() as usize;
+                    let residual: Vec<f32> = vector
+                        .iter()
+                        .zip(&self.centroids[previous])
+                        .map(|(a, b)| a - b)
+                        .collect();
+                    let norm = residual.iter().map(|v| v * v).sum::<f32>();
+                    for (cost, centroid) in costs.iter_mut().zip(&self.centroids) {
+                        let projection = residual
+                            .iter()
+                            .zip(vector.iter().zip(centroid))
+                            .map(|(r, (a, b))| r * (a - b))
+                            .sum::<f32>();
+                        if norm > 0.0 {
+                            *cost += lambda * projection * projection / norm;
+                        }
                     }
-                    let projection: f32 = residual.iter().zip(centroid).map(|(a, b)| a * b).sum();
-                    let gap = along - projection;
-                    let cost = distances[index] + lambda * gap * gap;
-                    if best.is_none_or(|(least, _)| cost < least) {
-                        best = Some((cost, index as u32));
-                    }
+                    let next = costs
+                        .iter()
+                        .enumerate()
+                        .filter(|(c, _)| !chosen.contains(&(*c as u32)))
+                        .min_by(|a, b| a.1.total_cmp(b.1).then(a.0.cmp(&b.0)))
+                        .unwrap()
+                        .0 as u32;
+                    secondary[row * (replicas - 1) + replica] = next;
+                    chosen.push(next);
                 }
-                pairs.push((primary as u32, best.map(|(_, second)| second)));
             }
         })?;
-        Ok(pairs)
+        Ok((primary, secondary))
     }
 }
 

@@ -44,7 +44,7 @@ pub(crate) struct VectorFieldMeta {
 pub(crate) enum Assignment {
     /// Every document has one row, in its nearest cluster.
     Nearest,
-    /// Every document has a row in its nearest cluster and a second row in a cluster chosen to
+    /// Every document has a row in its nearest cluster and spill rows in clusters chosen to
     /// cover queries the first misses; valid only for quantized clustered fields.
     Soar,
 }
@@ -190,7 +190,7 @@ impl VectorFieldMeta {
     }
 }
 impl VectorColMetadata {
-    /// Whether documents may have a second row in another cluster.
+    /// Whether documents may have spill rows in other clusters.
     pub(crate) fn spilled(&self) -> bool {
         self.field().assignment == Assignment::Soar
     }

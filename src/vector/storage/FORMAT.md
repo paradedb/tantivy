@@ -268,10 +268,11 @@ and `Partition::Uniform` with 16,384 rows per block.
 
 The assignment byte says how a clustered field's documents were placed in its
 blocks: `Nearest` (0) gives every document one row, in its nearest cluster;
-`Soar` (1) gives every document a row in its nearest cluster and a second row in
-a cluster chosen to cover queries the first misses. `Soar` is valid only for
+`Soar` (1) gives every document a row in its nearest cluster and spill rows in
+other clusters chosen to cover queries the preceding assignments miss. The built-in
+clusterer uses up to four distinct clusters per document. `Soar` is valid only for
 quantized clustered storage, where a row is codes and a document ID. Under
-`Soar` a document may appear in two blocks; the IdMap holds its primary
+`Soar` a document may appear in multiple blocks; the IdMap holds its primary
 location, and DocIds stay strictly ascending within each block because a
 document appears at most once per cluster. Flat fields write `Nearest`.
 
