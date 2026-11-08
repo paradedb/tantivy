@@ -11,8 +11,8 @@ use crate::vector::clustering::{
 };
 use crate::TantivyError;
 
-/// Default [`SuperKMeansClusterer::with_max_leaf_size`].
-pub const DEFAULT_MAX_LEAF_SIZE: usize = 200;
+/// Default [`SuperKMeansClusterer::with_max_leaf_size`]: leaves sized in storage pages.
+pub const DEFAULT_MAX_LEAF_SIZE: usize = 0;
 /// Default [`SuperKMeansClusterer::with_training_sample_ratio`].
 pub const DEFAULT_TRAINING_SAMPLE_RATIO: f64 = 0.32;
 
@@ -144,7 +144,8 @@ impl SuperKMeansClusterer {
         }
     }
 
-    /// Target indexed vectors per cluster, accounting for the training sample ratio.
+    /// Indexed vectors per cluster; zero sizes clusters to four storage pages of the layer-0
+    /// quantized band.
     pub fn with_max_leaf_size(mut self, max_leaf_size: usize) -> Self {
         self.max_leaf_size = max_leaf_size;
         self
@@ -172,9 +173,27 @@ impl SuperKMeansClusterer {
         budget_rows.max(1)
     }
 
-    fn leaf_cap(&self) -> usize {
+    /// The SuperKMeans leaf cap for `options`' field, in sampled rows, given the storage block
+    /// length of the vectors being merged.
+    ///
+    /// A cluster of `max_leaf_size` vectors holds `max_leaf_size * ratio` of the training
+    /// sample, and SuperKMeans splits leaves to between half its cap and the cap, so the cap is
+    /// twice that share. Zero sizes clusters to four pages, a page being the rows of the one-bit
+    /// layer-0 band that fit one storage block.
+    fn leaf_cap(&self, options: &VectorOptions, block_len: Option<usize>) -> usize {
+        // Band-0 row: sign codes, then the residual norm, scale, gamma and error, plus the L2
+        // constant; see FORMAT.md.
+        let l2_constant = if options.metric() == Metric::L2 { 4 } else { 0 };
+        let stride = options.dim().div_ceil(64) * 8 + 12 + l2_constant;
+        // RAM and mmap directories have no storage block; size them as a Postgres block.
+        let page_rows = (block_len.unwrap_or(8192) / stride).max(1);
+        let leaf = if self.max_leaf_size > 0 {
+            self.max_leaf_size
+        } else {
+            4 * page_rows
+        };
         let ratio = f64::from(self.training_sample_ratio);
-        ((self.max_leaf_size.saturating_mul(2) as f64 * ratio).ceil() as usize).max(1)
+        ((leaf.saturating_mul(2) as f64 * ratio).ceil() as usize).max(1)
     }
 
     /// The assigner for `(dim, angular, max_leaf_size)`, built on first use and kept for the
@@ -255,7 +274,7 @@ impl IvfClusterer for SuperKMeansClusterer {
             ));
         }
         let mut config = self.config.clone();
-        config.max_leaf_size = self.leaf_cap();
+        config.max_leaf_size = self.leaf_cap(options, source.storage_block_len());
         if is_angular(options.metric()) {
             config.base.angular = true;
         }
@@ -348,7 +367,7 @@ impl IvfClusterer for SuperKMeansClusterer {
         centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>> {
         let mut assignments = Vec::with_capacity(source.num_rows());
-        let cap = self.leaf_cap();
+        let cap = self.leaf_cap(options, source.storage_block_len());
         let kmeans = self.assigner(options.dim(), is_angular(options.metric()), cap);
         let IvfCentroids::F32(centroids) = centroids;
         for_each_batch(
@@ -623,29 +642,57 @@ mod tests {
         assert_eq!(clusterer.max_leaf_size, 20);
     }
 
+    /// Auto caps at the default ratio on pg_search's block payload, an explicit size on the
+    /// same field, and the Postgres-block fallback for a source without blocks.
+    #[test]
+    fn leaf_cap_matches_the_check_values() {
+        let auto = SuperKMeansClusterer::new();
+        let cosine = VectorOptions::new(1024, Metric::Cosine);
+        let l2 = VectorOptions::new(128, Metric::L2);
+        assert_eq!(auto.leaf_cap(&cosine, Some(8160)), 149);
+        assert_eq!(auto.leaf_cap(&l2, Some(8160)), 653);
+        assert_eq!(
+            SuperKMeansClusterer::new()
+                .with_max_leaf_size(100)
+                .leaf_cap(&cosine, Some(8160)),
+            64
+        );
+        assert_eq!(auto.leaf_cap(&l2, None), 656);
+        assert_eq!(auto.leaf_cap(&l2, None), auto.leaf_cap(&l2, Some(8192)));
+    }
+
     #[test]
     fn leaf_cap_scales_with_the_training_sample() {
-        let clusterer = SuperKMeansClusterer::new();
+        let clusterer = SuperKMeansClusterer::new().with_max_leaf_size(200);
+        let options = VectorOptions::new(1024, Metric::Cosine);
         assert_eq!(clusterer.max_leaf_size, 200);
-        assert_eq!(clusterer.leaf_cap(), 128);
+        assert_eq!(clusterer.leaf_cap(&options, Some(8160)), 128);
         assert_eq!(
             clusterer
                 .clone()
                 .with_training_sample_ratio(0.25)
-                .leaf_cap(),
+                .leaf_cap(&options, Some(8160)),
             100
         );
         assert_eq!(
-            clusterer.clone().with_training_sample_ratio(1.0).leaf_cap(),
+            clusterer
+                .clone()
+                .with_training_sample_ratio(1.0)
+                .leaf_cap(&options, Some(8160)),
             400
         );
         assert_eq!(
             clusterer
                 .clone()
                 .with_training_sample_ratio(0.000001)
-                .leaf_cap(),
+                .leaf_cap(&options, Some(8160)),
             1
         );
-        assert_eq!(clusterer.with_max_leaf_size(100).leaf_cap(), 64);
+        assert_eq!(
+            clusterer
+                .with_max_leaf_size(100)
+                .leaf_cap(&options, Some(8160)),
+            64
+        );
     }
 }
