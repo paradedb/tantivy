@@ -4,11 +4,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::panic;
 use std::sync::Arc;
 
-use columnar::Column;
+use columnar::{Column, StrColumn};
 
 use super::*;
 use crate::indexer::NoMergePolicy;
-use crate::schema::{Field, Schema, TextOptions, FAST, INDEXED, TEXT};
+use crate::schema::{Field, Schema, TextOptions, FAST, INDEXED, STORED, TEXT};
 use crate::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use crate::{
     doc, DocId, Index, IndexWriter, Searcher, SegmentReader, TantivyDocument, TantivyError, Term,
@@ -28,7 +28,9 @@ impl RulesIndex {
     fn new(analyzer: TextAnalyzer) -> Self {
         let mut schema_builder = Schema::builder();
         let id = schema_builder.add_u64_field("id", FAST | INDEXED);
-        let rule = schema_builder.add_text_field("rule", rule_field_options(RULE_TOKENIZER));
+        // The tests keep the rule text in a column, where a caller would keep it in its own store.
+        let rule = schema_builder
+            .add_text_field("rule", rule_field_options(RULE_TOKENIZER).set_fast("raw"));
         let index = Index::create_in_ram(schema_builder.build());
         index
             .tokenizers()
@@ -82,13 +84,12 @@ impl RulesIndex {
         self.index.reader().unwrap().searcher()
     }
 
-    fn expander(&self) -> SynonymExpander {
-        let searcher = self.searcher();
-        SynonymExpander::new(searcher.segment_readers(), self.rule, self.analyzer.clone()).unwrap()
+    fn source(&self) -> CachingSource {
+        CachingSource::new(&self.searcher(), self.rule, self.analyzer.clone())
     }
 
     fn expand(&self, tokens: &[&str]) -> Vec<Expansion> {
-        self.expander().expand(&strings(tokens)).unwrap()
+        expand(&strings(tokens), &mut self.source()).unwrap()
     }
 }
 
@@ -197,9 +198,8 @@ fn a_query_token_with_a_zero_byte_matches_no_key() {
     );
 }
 
-/// A caller with the rule text elsewhere needs no column, but the expander reads it from one.
 #[test]
-fn the_rule_field_is_fast_only_with_raw() {
+fn the_rule_field_must_be_indexed() {
     let open = |options: TextOptions| {
         let mut schema_builder = Schema::builder();
         let rule = schema_builder.add_text_field("rule", options);
@@ -208,16 +208,13 @@ fn the_rule_field_is_fast_only_with_raw() {
         writer.add_document(doc!(rule => "sofa, couch")).unwrap();
         writer.commit().unwrap();
         let searcher = index.reader().unwrap().searcher();
-        let segment = SegmentSynonyms::open(&searcher.segment_readers()[0], rule).map(drop);
-        let expander = SynonymExpander::new(searcher.segment_readers(), rule, plain()).map(drop);
-        (segment, expander)
+        SegmentSynonyms::open(&searcher.segment_readers()[0], rule).map(drop)
     };
-    let schema_error =
-        |result: crate::Result<()>| matches!(result, Err(TantivyError::SchemaError(_)));
-    let (segment, expander) = open(TEXT);
-    assert!(segment.is_ok() && schema_error(expander));
-    let (segment, expander) = open(TEXT.set_fast("default"));
-    assert!(schema_error(segment) && schema_error(expander));
+    assert!(open(TEXT).is_ok());
+    assert!(matches!(
+        open(STORED.into()),
+        Err(TantivyError::SchemaError(_))
+    ));
 }
 
 #[test]
@@ -268,9 +265,10 @@ fn a_key_in_more_rules_than_the_limit_reads_the_first_ones() {
         .map(|key_docs| key_docs.docs)
         .collect();
     assert_eq!(docs, vec![vec![0, 1], vec![3]]);
-    let expander = index.expander().with_max_rules_per_key(2);
+    let mut source = index.source();
+    source.max_rules_per_key = 2;
     assert_eq!(
-        expander.expand(&strings(&["sofa"])).unwrap(),
+        expand(&strings(&["sofa"]), &mut source).unwrap(),
         vec![expanded(
             &["sofa"],
             Some(&[&["couch"], &["divan"], &["sofa"]])
@@ -370,6 +368,7 @@ struct CachedSegment {
     synonyms: SegmentSynonyms,
     reader: SegmentReader,
     ids: Column<u64>,
+    texts: StrColumn,
 }
 
 /// Caches what each segment holds for a token and the compiled rules of each document, and
@@ -377,13 +376,14 @@ struct CachedSegment {
 struct CachingSource {
     segments: Vec<CachedSegment>,
     analyzer: TextAnalyzer,
+    max_rules_per_key: usize,
     keys: HashMap<(usize, String), Arc<[KeyDocs]>>,
     rules: HashMap<(usize, DocId), Arc<[CompiledRule]>>,
     deleted: BTreeSet<u64>,
 }
 
 impl CachingSource {
-    fn new(searcher: &Searcher, rule: Field) -> Self {
+    fn new(searcher: &Searcher, rule: Field, analyzer: TextAnalyzer) -> Self {
         let segments = searcher
             .segment_readers()
             .iter()
@@ -391,11 +391,13 @@ impl CachingSource {
                 synonyms: SegmentSynonyms::open(segment_reader, rule).unwrap(),
                 reader: segment_reader.clone(),
                 ids: segment_reader.fast_fields().u64("id").unwrap(),
+                texts: segment_reader.fast_fields().str("rule").unwrap().unwrap(),
             })
             .collect();
         CachingSource {
             segments,
-            analyzer: plain(),
+            analyzer,
+            max_rules_per_key: DEFAULT_MAX_RULES_PER_KEY,
             keys: HashMap::new(),
             rules: HashMap::new(),
             deleted: BTreeSet::new(),
@@ -414,7 +416,7 @@ impl SynonymSource for CachingSource {
             }
             let keys: Arc<[KeyDocs]> = cached
                 .synonyms
-                .token_keys(token, DEFAULT_MAX_RULES_PER_KEY)?
+                .token_keys(token, self.max_rules_per_key)?
                 .into();
             self.keys.insert(key, keys.clone());
             found.push(keys);
@@ -434,11 +436,15 @@ impl SynonymSource for CachingSource {
         if let Some(rules) = self.rules.get(&(segment, doc)) {
             return Ok(Some(rules.clone()));
         }
-        let rules: Arc<[CompiledRule]> = cached
-            .synonyms
-            .column_rules(doc, &mut self.analyzer)?
-            .unwrap_or_default()
-            .into();
+        let mut rules = Vec::new();
+        let mut text = String::new();
+        for ord in cached.texts.term_ords(doc) {
+            text.clear();
+            if cached.texts.ord_to_str(ord, &mut text)? {
+                rules.extend(CompiledRule::from_line(&text, &mut self.analyzer));
+            }
+        }
+        let rules: Arc<[CompiledRule]> = rules.into();
         self.rules.insert((segment, doc), rules.clone());
         Ok(Some(rules))
     }
@@ -525,9 +531,9 @@ fn check_against_the_model(seed: u64) {
         index.commit();
     }
     let searcher = index.searcher();
-    let expander = SynonymExpander::new(searcher.segment_readers(), index.rule, plain()).unwrap();
+    let mut source = CachingSource::new(&searcher, index.rule, plain());
     for query in &queries {
-        let expansions = expander.expand(query).unwrap();
+        let expansions = expand(query, &mut source).unwrap();
         assert_eq!(
             expansions,
             model_expand(&alive, query),
@@ -541,25 +547,7 @@ fn check_against_the_model(seed: u64) {
         .filter(|_| rng.below(3) == 0)
         .collect();
     let visible = without(&alive, &deleted);
-    let ids: Vec<Column<u64>> = searcher
-        .segment_readers()
-        .iter()
-        .map(|segment_reader| segment_reader.fast_fields().u64("id").unwrap())
-        .collect();
-    for query in &queries {
-        let expansions = expander
-            .expand_with(query, |segment, doc| {
-                !deleted.contains(&ids[segment].first(doc).unwrap())
-            })
-            .unwrap();
-        assert_eq!(
-            expansions,
-            model_expand(&visible, query),
-            "with the caller check, query {query:?}"
-        );
-    }
-
-    let mut source = CachingSource::new(&searcher, index.rule);
+    let mut source = CachingSource::new(&searcher, index.rule, plain());
     source.deleted = deleted;
     for query in &queries {
         let expansions = expand(query, &mut source).unwrap();
@@ -583,9 +571,9 @@ fn check_against_the_model(seed: u64) {
     }
 
     index.merge_all();
-    let expander = index.expander();
+    let mut source = index.source();
     for query in &queries {
-        let expansions = expander.expand(query).unwrap();
+        let expansions = expand(query, &mut source).unwrap();
         assert_eq!(
             expansions,
             model_expand(&alive, query),

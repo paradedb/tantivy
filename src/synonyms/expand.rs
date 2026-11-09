@@ -2,15 +2,11 @@
 
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
-use std::fmt;
 use std::sync::Arc;
-
-use columnar::StrColumn;
 
 use super::rule::CompiledRule;
 use super::tokenizer::KEY_SEPARATOR;
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema, TextFieldIndexing, TextOptions};
-use crate::tokenizer::{TextAnalyzer, RAW_TOKENIZER_NAME};
 use crate::{DocId, DocSet, InvertedIndexReader, SegmentReader, TantivyError, TERMINATED};
 
 /// A run of query tokens and what it expands to. `alternatives` is `None` when no rule matched.
@@ -69,67 +65,40 @@ pub struct KeyDocs {
 }
 
 /// Options for a field of synonym rules, indexed with the tokenizer registered as
-/// `tokenizer_name`. Rules are never scored, so the field has no positions or fieldnorms. The `raw`
-/// column keeps the text of each rule for [`SynonymExpander`]. A caller that reads the text through
-/// its own [`SynonymSource`] can build the options without the column.
+/// `tokenizer_name`. Rules are never scored, so the field has no positions or fieldnorms. The
+/// caller keeps the text of the rules and gives it through a [`SynonymSource`].
 pub fn rule_field_options(tokenizer_name: &str) -> TextOptions {
     let indexing = TextFieldIndexing::default()
         .set_tokenizer(tokenizer_name)
         .set_index_option(IndexRecordOption::Basic)
         .set_fieldnorms(false);
-    TextOptions::default()
-        .set_indexing_options(indexing)
-        .set_fast(RAW_TOKENIZER_NAME)
+    TextOptions::default().set_indexing_options(indexing)
 }
 
 fn check_rule_field(schema: &Schema, field: Field) -> crate::Result<()> {
     let entry = schema.get_field_entry(field);
     match entry.field_type() {
-        FieldType::Str(options)
-            if options.get_indexing_options().is_some()
-                && options
-                    .get_fast_field_tokenizer_name()
-                    .is_none_or(|name| name == RAW_TOKENIZER_NAME) =>
-        {
-            Ok(())
-        }
-        // Another fast tokenizer keeps words in the column and not the rule.
+        FieldType::Str(options) if options.get_indexing_options().is_some() => Ok(()),
         _ => Err(TantivyError::SchemaError(format!(
-            "synonym rule field '{}' must be an indexed text field, and fast only with the '{}' \
-             tokenizer",
-            entry.name(),
-            RAW_TOKENIZER_NAME
+            "synonym rule field '{}' must be an indexed text field",
+            entry.name()
         ))),
     }
 }
 
-/// The synonym rules of one segment. The rule field is indexed with a
-/// [`SynonymRuleTokenizer`](super::SynonymRuleTokenizer). When it is also fast with the `raw`
-/// tokenizer, its column keeps the text of each rule.
+/// The synonym keys of one segment. The rule field is indexed with a
+/// [`SynonymRuleTokenizer`](super::SynonymRuleTokenizer).
 #[derive(Clone)]
 pub struct SegmentSynonyms {
     keys: Arc<InvertedIndexReader>,
-    rules: Option<StrColumn>,
 }
 
 impl SegmentSynonyms {
     /// Opens the rules in `field`.
     pub fn open(segment_reader: &SegmentReader, field: Field) -> crate::Result<Self> {
-        let schema = segment_reader.schema();
-        check_rule_field(schema, field)?;
-        let rules = if schema.get_field_entry(field).is_fast() {
-            let name = schema.get_field_name(field);
-            // Every segment has a column for each fast field, so a missing column is an error.
-            let column = segment_reader.fast_fields().str(name)?.ok_or_else(|| {
-                TantivyError::InternalError(format!("synonym rule field '{name}' has no column"))
-            })?;
-            Some(column)
-        } else {
-            None
-        };
+        check_rule_field(segment_reader.schema(), field)?;
         Ok(SegmentSynonyms {
             keys: segment_reader.inverted_index(field)?,
-            rules,
         })
     }
 
@@ -173,33 +142,13 @@ impl SegmentSynonyms {
         }
         Ok(found)
     }
-
-    /// The rules of `doc`, compiled from the field's column, or `None` when the field is not
-    /// fast. `analyzer` is the one the field's tokenizer wraps.
-    pub fn column_rules(
-        &self,
-        doc: DocId,
-        analyzer: &mut TextAnalyzer,
-    ) -> crate::Result<Option<Vec<CompiledRule>>> {
-        let Some(column) = &self.rules else {
-            return Ok(None);
-        };
-        let mut compiled = Vec::new();
-        let mut text = String::new();
-        for ord in column.term_ords(doc) {
-            text.clear();
-            if column.ord_to_str(ord, &mut text)? {
-                compiled.extend(CompiledRule::from_line(&text, analyzer));
-            }
-        }
-        Ok(Some(compiled))
-    }
 }
 
 /// Where [`expand`](fn@expand) reads the rules of each segment. What a segment holds for a token
 /// never changes, so a source can cache [`SegmentSynonyms::token_keys`] for the life of the
 /// segment. The text of a document's rules never changes either, so a source can cache them
-/// compiled. A rule can be deleted, so its liveness is asked on every expansion.
+/// compiled with [`CompiledRule::from_line`]. A rule can be deleted, so its liveness is asked on
+/// every expansion.
 pub trait SynonymSource {
     /// Every key that starts with `token`, with the documents of its rules, one entry for each
     /// segment. [`alive_rules`](Self::alive_rules) names a segment by its position in this list.
@@ -283,136 +232,6 @@ fn longest_match(
         }
     }
     Ok(None)
-}
-
-#[derive(Clone)]
-struct ReaderSegment {
-    synonyms: SegmentSynonyms,
-    reader: SegmentReader,
-}
-
-/// Expands query tokens with the synonym rules of every segment of an index, read from the
-/// segment readers on each expansion. The rules are spread over the segments, so a key is looked
-/// up in each one. It reads the rule text from the field's column, so the field must be fast with
-/// the `raw` tokenizer.
-#[derive(Clone)]
-pub struct SynonymExpander {
-    segments: Vec<ReaderSegment>,
-    analyzer: TextAnalyzer,
-    max_rules_per_key: usize,
-}
-
-impl fmt::Debug for SynonymExpander {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SynonymExpander")
-            .field("segments", &self.segments.len())
-            .finish()
-    }
-}
-
-impl SynonymExpander {
-    /// An expander over the segments of a searcher and the rules in `field`. The field's
-    /// [`SynonymRuleTokenizer`](super::SynonymRuleTokenizer) wraps `analyzer`.
-    ///
-    /// A rule whose document is deleted in its segment is skipped. The ordinal of a segment is its
-    /// position in `segment_readers`.
-    pub fn new(
-        segment_readers: &[SegmentReader],
-        field: Field,
-        analyzer: TextAnalyzer,
-    ) -> crate::Result<Self> {
-        let segments = segment_readers
-            .iter()
-            .map(|segment_reader| {
-                let synonyms = SegmentSynonyms::open(segment_reader, field)?;
-                if synonyms.rules.is_none() {
-                    return Err(TantivyError::SchemaError(format!(
-                        "SynonymExpander reads the rule text from the column of field '{}', so \
-                         the field must be fast with the '{}' tokenizer",
-                        segment_reader.schema().get_field_name(field),
-                        RAW_TOKENIZER_NAME
-                    )));
-                }
-                Ok(ReaderSegment {
-                    synonyms,
-                    reader: segment_reader.clone(),
-                })
-            })
-            .collect::<crate::Result<_>>()?;
-        Ok(SynonymExpander {
-            segments,
-            analyzer,
-            max_rules_per_key: DEFAULT_MAX_RULES_PER_KEY,
-        })
-    }
-
-    /// Reads at most `max_rules` rules for a key in each segment, instead of
-    /// [`DEFAULT_MAX_RULES_PER_KEY`].
-    pub fn with_max_rules_per_key(mut self, max_rules: usize) -> Self {
-        self.max_rules_per_key = max_rules;
-        self
-    }
-
-    /// Expands like [`expand`](fn@expand), and skips a rule whose document is deleted in its
-    /// segment.
-    pub fn expand(&self, tokens: &[String]) -> crate::Result<Vec<Expansion>> {
-        self.expand_with(tokens, |_, _| true)
-    }
-
-    /// Expands like [`expand`](Self::expand), and skips a rule when `is_alive` returns false for
-    /// the ordinal of its segment and its document. A caller whose deletes are not in the
-    /// segments' delete bitsets yet, such as a Postgres scan under an MVCC snapshot, checks them
-    /// here.
-    pub fn expand_with(
-        &self,
-        tokens: &[String],
-        is_alive: impl FnMut(usize, DocId) -> bool,
-    ) -> crate::Result<Vec<Expansion>> {
-        let mut source = ReaderSource {
-            segments: &self.segments,
-            analyzer: self.analyzer.clone(),
-            max_rules_per_key: self.max_rules_per_key,
-            is_alive,
-        };
-        expand(tokens, &mut source)
-    }
-}
-
-struct ReaderSource<'a, F> {
-    segments: &'a [ReaderSegment],
-    analyzer: TextAnalyzer,
-    max_rules_per_key: usize,
-    is_alive: F,
-}
-
-impl<F: FnMut(usize, DocId) -> bool> SynonymSource for ReaderSource<'_, F> {
-    fn token_keys(&mut self, token: &str) -> crate::Result<Vec<Arc<[KeyDocs]>>> {
-        self.segments
-            .iter()
-            .map(|segment| {
-                Ok(segment
-                    .synonyms
-                    .token_keys(token, self.max_rules_per_key)?
-                    .into())
-            })
-            .collect()
-    }
-
-    fn alive_rules(
-        &mut self,
-        segment: usize,
-        doc: DocId,
-    ) -> crate::Result<Option<Arc<[CompiledRule]>>> {
-        let reader_segment = &self.segments[segment];
-        if reader_segment.reader.is_deleted(doc) || !(self.is_alive)(segment, doc) {
-            return Ok(None);
-        }
-        let rules = reader_segment
-            .synonyms
-            .column_rules(doc, &mut self.analyzer)?
-            .unwrap_or_default();
-        Ok(Some(rules.into()))
-    }
 }
 
 #[cfg(test)]
