@@ -1189,6 +1189,66 @@ fn mixed_segments_share_preparation_by_stored_metadata() -> crate::Result<()> {
         let combined = searcher.search(&AllQuery, &collector)?;
         assert_eq!(collector.quantized_query_count(), if mixed { 2 } else { 1 });
         let weight = AllQuery.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let segments = searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .map(|(ord, reader)| crate::vector::VectorSegment::from((ord as u32, reader)))
+            .collect::<Vec<_>>();
+        let params = ProbeParams {
+            max_probe: usize::MAX,
+            ..Default::default()
+        };
+        let budget = crate::vector::VectorSearchBudget::for_segments(field, &params, &segments)?
+            .distributed();
+        let builder =
+            TopDocsByVectorSimilarityBuilder::new(field, fixture_search_query(Metric::L2, 64), 5)
+                .with_probe_params(params.clone());
+        let router = crate::vector::TopClustersBySimilarityCollector::new(
+            field,
+            fixture_search_query(Metric::L2, 64),
+            params,
+            1.0,
+        )?
+        .with_budget(budget);
+        let candidates = router.collect_segments(&segments, |_| {})?;
+        let allocation = budget.allocate_routing(&candidates, 1.0, 0.0)?;
+        let mut incremental: Option<crate::vector::TopDocsByVectorSimilarity<f32>> = None;
+        let mut fruits = Vec::new();
+        for segment in &segments {
+            let prepared = builder.prepare(
+                weight.as_ref(),
+                std::slice::from_ref(segment),
+                budget,
+                |_| {},
+            )?;
+            let inputs = prepared.with_candidates(
+                candidates
+                    .iter()
+                    .filter(|c| c.node.0 == segment.ordinal)
+                    .copied()
+                    .collect(),
+                &allocation,
+            )?;
+            let collector = match &mut incremental {
+                Some(collector) => {
+                    collector.set_inputs(inputs)?;
+                    collector
+                }
+                slot @ None => slot.insert(builder.clone().build(inputs)),
+            };
+            fruits.push(collector.collect_segment(
+                weight.as_ref(),
+                segment.ordinal,
+                &segment.reader,
+            )?);
+        }
+        let incremental = incremental.unwrap();
+        assert_eq!(
+            incremental.quantized_query_count(),
+            if mixed { 2 } else { 1 }
+        );
+        assert_eq!(incremental.merge_fruits(fruits)?.results, combined.results);
         let mut union = Vec::new();
         for (ord, segment) in searcher.segment_readers().iter().enumerate() {
             let single = make_collector();

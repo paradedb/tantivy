@@ -82,6 +82,7 @@ type PreparedCell = Arc<OnceLock<Arc<QuantizedQueryCtx>>>;
 // --- Builder ---
 
 /// Builds a [`TopDocsByVectorSimilarity`] collector.
+#[derive(Clone)]
 pub struct TopDocsByVectorSimilarityBuilder<T: VectorElement, S = NoTieBreak> {
     field: Field,
     query: Arc<Vec<T>>,
@@ -301,6 +302,22 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
 }
 
 impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
+    /// Replaces a distributed scan's inputs for the next assignment in the same query,
+    /// preserving prepared queries and pruning state. Field, filter and top-k must be unchanged.
+    pub fn set_inputs(&mut self, inputs: VectorScanInputs) -> Result<()> {
+        if inputs.prepared.field != self.field
+            || inputs.prepared.top_n != self.segment_top_n()
+            || !inputs.prepared.budget.distributed
+            || !self.inputs.prepared.budget.distributed
+        {
+            return Err(TantivyError::InvalidArgument(
+                "replacement inputs require the same field and top-k in a distributed scan".into(),
+            ));
+        }
+        self.inputs = inputs;
+        Ok(())
+    }
+
     fn segment_top_n(&self) -> usize {
         self.limit.saturating_add(self.offset)
     }
