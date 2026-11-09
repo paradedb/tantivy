@@ -7,6 +7,7 @@ use quant::cascade::{LayerKind, LayerSpec, QueryRotationPlan, Rotation};
 
 use super::arena::VectorArena;
 use super::stacked::levels::SerializableStore;
+use crate::vector::rotation_plan::cached_rotation_plan;
 use crate::vector::storage::quantized::sign::SignVectors;
 
 pub(crate) const ROUTER_SEED: u64 = 0x726f_7574_6572_0001;
@@ -15,14 +16,14 @@ pub(crate) const ROUTER_SEED: u64 = 0x726f_7574_6572_0001;
 /// Levels independently select a representation without changing coordinates.
 pub(crate) struct EncodingContext {
     pub(crate) seed: u64,
-    pub(crate) rotation: QueryRotationPlan,
+    pub(crate) rotation: Arc<QueryRotationPlan>,
 }
 
 impl EncodingContext {
     pub(crate) fn new(dim: usize, seed: u64) -> Self {
         Self {
             seed,
-            rotation: QueryRotationPlan::new(
+            rotation: cached_rotation_plan(
                 dim,
                 &[LayerSpec {
                     kind: LayerKind::Sign,

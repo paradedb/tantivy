@@ -53,6 +53,7 @@ mod distance;
 mod element;
 mod params;
 pub(crate) mod quantization;
+mod rotation_plan;
 mod stats;
 mod telemetry;
 mod tie_break;

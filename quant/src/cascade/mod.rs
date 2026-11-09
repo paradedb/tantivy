@@ -35,14 +35,14 @@ pub const GAMMA_MIN: f32 = 1.0;
 pub const GAMMA_MAX: f32 = 4.0;
 
 /// Tagged encoder/scorer contract, independent of the numeric code width.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum LayerKind {
     Sign,
     Grid,
 }
 
 /// Pins the complete rotation construction; semantic changes require a new variant.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Rotation {
     None,
     SeededFhtChaCha8 { seed: u64 },
@@ -58,7 +58,7 @@ impl Rotation {
 }
 
 /// Quantization parameters resolved from a segment's explicit tags.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct LayerSpec {
     /// Encoder and scorer contract.
     pub kind: LayerKind,
