@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use superkmeans::{Dataset, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, Matrix};
 
 use crate::schema::{Metric, VectorOptions};
+use crate::vector::clustering::soar::SOAR_CANDIDATES;
 use crate::vector::clustering::{
     for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
 };
@@ -342,8 +343,8 @@ impl IvfClusterer for SuperKMeansClusterer {
         Ok(assignments)
     }
 
-    /// The nearest centroid and the SOAR secondary over every centroid, from two passes per
-    /// batch; `None` with a single centroid.
+    /// The nearest centroid and the SOAR secondary among the [`SOAR_CANDIDATES`] nearest; `None`
+    /// with a single centroid.
     fn assign_pairs(
         &self,
         options: &VectorOptions,
@@ -363,6 +364,7 @@ impl IvfClusterer for SuperKMeansClusterer {
                     centroids.values.as_slice(),
                     batch.matrix.rows,
                     lambda,
+                    SOAR_CANDIDATES,
                 );
                 pairs.extend(
                     primary
@@ -400,6 +402,7 @@ impl IvfClusterer for SuperKMeansClusterer {
                     Matrix::new(&centroids.values, centroids.rows, options.dim()),
                     lambda,
                     replicas,
+                    SOAR_CANDIDATES,
                 );
                 primary.extend(first);
                 secondary.extend(rest);

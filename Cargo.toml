@@ -98,7 +98,7 @@ fnv = "1.0.7"
 parking_lot = "0.12.4"
 typetag = "0.2.21"
 unwrap-infallible = "1.0.0"
-superkmeans = { git = "https://github.com/paradedb/superkmeans-rs.git", package = "superkmeans-rs", rev = "9685c90e406a94424d15194fa8d49deded0873ec" }
+superkmeans = { git = "https://github.com/paradedb/superkmeans-rs.git", package = "superkmeans-rs", rev = "22db41221c7880d6e44f513468c7c0b688235403" }
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"
