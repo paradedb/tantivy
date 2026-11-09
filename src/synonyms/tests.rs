@@ -7,13 +7,12 @@ use std::sync::Arc;
 use columnar::Column;
 
 use super::*;
-use crate::fastfield::AliveBitSet;
 use crate::indexer::NoMergePolicy;
-use crate::schema::{
-    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, INDEXED, TEXT,
-};
+use crate::schema::{Field, Schema, TextOptions, FAST, INDEXED, TEXT};
 use crate::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
-use crate::{doc, DocId, Index, IndexWriter, Searcher, TantivyDocument, TantivyError, Term};
+use crate::{
+    doc, DocId, Index, IndexWriter, Searcher, SegmentReader, TantivyDocument, TantivyError, Term,
+};
 
 const RULE_TOKENIZER: &str = "synonym_rule";
 
@@ -29,15 +28,7 @@ impl RulesIndex {
     fn new(analyzer: TextAnalyzer) -> Self {
         let mut schema_builder = Schema::builder();
         let id = schema_builder.add_u64_field("id", FAST | INDEXED);
-        let indexing = TextFieldIndexing::default()
-            .set_tokenizer(RULE_TOKENIZER)
-            .set_index_option(IndexRecordOption::Basic);
-        let rule = schema_builder.add_text_field(
-            "rule",
-            TextOptions::default()
-                .set_indexing_options(indexing)
-                .set_fast("raw"),
-        );
+        let rule = schema_builder.add_text_field("rule", rule_field_options(RULE_TOKENIZER));
         let index = Index::create_in_ram(schema_builder.build());
         index
             .tokenizers()
@@ -377,7 +368,7 @@ fn model_expand(rules: &BTreeMap<u64, Vec<String>>, tokens: &[String]) -> Vec<Ex
 
 struct CachedSegment {
     synonyms: SegmentSynonyms,
-    alive: Option<AliveBitSet>,
+    reader: SegmentReader,
     ids: Column<u64>,
 }
 
@@ -398,7 +389,7 @@ impl CachingSource {
             .iter()
             .map(|segment_reader| CachedSegment {
                 synonyms: SegmentSynonyms::open(segment_reader, rule).unwrap(),
-                alive: segment_reader.alive_bitset().cloned(),
+                reader: segment_reader.clone(),
                 ids: segment_reader.fast_fields().u64("id").unwrap(),
             })
             .collect();
@@ -413,21 +404,22 @@ impl CachingSource {
 }
 
 impl SynonymSource for CachingSource {
-    fn num_segments(&self) -> usize {
-        self.segments.len()
-    }
-
-    fn token_keys(&mut self, segment: usize, token: &str) -> crate::Result<Arc<[KeyDocs]>> {
-        let key = (segment, token.to_string());
-        if let Some(keys) = self.keys.get(&key) {
-            return Ok(keys.clone());
+    fn token_keys(&mut self, token: &str) -> crate::Result<Vec<Arc<[KeyDocs]>>> {
+        let mut found = Vec::with_capacity(self.segments.len());
+        for (segment, cached) in self.segments.iter().enumerate() {
+            let key = (segment, token.to_string());
+            if let Some(keys) = self.keys.get(&key) {
+                found.push(keys.clone());
+                continue;
+            }
+            let keys: Arc<[KeyDocs]> = cached
+                .synonyms
+                .token_keys(token, DEFAULT_MAX_RULES_PER_KEY)?
+                .into();
+            self.keys.insert(key, keys.clone());
+            found.push(keys);
         }
-        let keys: Arc<[KeyDocs]> = self.segments[segment]
-            .synonyms
-            .token_keys(token, DEFAULT_MAX_RULES_PER_KEY)?
-            .into();
-        self.keys.insert(key, keys.clone());
-        Ok(keys)
+        Ok(found)
     }
 
     fn alive_rules(
@@ -436,11 +428,7 @@ impl SynonymSource for CachingSource {
         doc: DocId,
     ) -> crate::Result<Option<Arc<[CompiledRule]>>> {
         let cached = &self.segments[segment];
-        let in_bitset = cached
-            .alive
-            .as_ref()
-            .is_none_or(|alive| alive.is_alive(doc));
-        if !in_bitset || self.deleted.contains(&cached.ids.first(doc).unwrap()) {
+        if cached.reader.is_deleted(doc) || self.deleted.contains(&cached.ids.first(doc).unwrap()) {
             return Ok(None);
         }
         if let Some(rules) = self.rules.get(&(segment, doc)) {

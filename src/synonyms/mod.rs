@@ -9,11 +9,11 @@
 //! the rules through a [`SynonymSource`], which gives the rules of a matched document from where
 //! the caller keeps their text, so it can also cache them. [`SynonymExpander`] expands with no
 //! cache and reads the text from the field's column, so it needs the field fast with the `raw`
-//! tokenizer.
+//! tokenizer, as [`rule_field_options`] sets it.
 //!
 //! ```
-//! use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions};
-//! use tantivy::synonyms::{SynonymExpander, SynonymRuleTokenizer};
+//! use tantivy::schema::Schema;
+//! use tantivy::synonyms::{rule_field_options, SynonymExpander, SynonymRuleTokenizer};
 //! use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 //! use tantivy::{doc, Index, IndexWriter};
 //!
@@ -21,16 +21,8 @@
 //! let analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
 //!     .filter(LowerCaser)
 //!     .build();
-//! let indexing = TextFieldIndexing::default()
-//!     .set_tokenizer("synonym_rule")
-//!     .set_index_option(IndexRecordOption::Basic);
 //! let mut schema_builder = Schema::builder();
-//! let rule = schema_builder.add_text_field(
-//!     "rule",
-//!     TextOptions::default()
-//!         .set_indexing_options(indexing)
-//!         .set_fast("raw"),
-//! );
+//! let rule = schema_builder.add_text_field("rule", rule_field_options("synonym_rule"));
 //! let index = Index::create_in_ram(schema_builder.build());
 //! index
 //!     .tokenizers()
@@ -58,8 +50,8 @@ mod tests;
 mod tokenizer;
 
 pub use self::expand::{
-    expand, Expansion, KeyDocs, SegmentSynonyms, SynonymExpander, SynonymSource,
-    DEFAULT_MAX_RULES_PER_KEY,
+    expand, rule_field_options, Expansion, KeyDocs, SegmentSynonyms, SynonymExpander,
+    SynonymSource, DEFAULT_MAX_RULES_PER_KEY,
 };
 pub use self::rule::{CompiledRule, RuleError, SynonymRule, MAX_RULE_TERMS};
 pub use self::tokenizer::SynonymRuleTokenizer;

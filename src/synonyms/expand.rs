@@ -9,8 +9,7 @@ use columnar::StrColumn;
 
 use super::rule::CompiledRule;
 use super::tokenizer::KEY_SEPARATOR;
-use crate::fastfield::AliveBitSet;
-use crate::schema::{Field, FieldType, IndexRecordOption, Schema};
+use crate::schema::{Field, FieldType, IndexRecordOption, Schema, TextFieldIndexing, TextOptions};
 use crate::tokenizer::{TextAnalyzer, RAW_TOKENIZER_NAME};
 use crate::{DocId, DocSet, InvertedIndexReader, SegmentReader, TantivyError, TERMINATED};
 
@@ -67,6 +66,20 @@ pub struct KeyDocs {
     pub key: Vec<String>,
     /// The documents whose rules list the key, in document order.
     pub docs: Vec<DocId>,
+}
+
+/// Options for a field of synonym rules, indexed with the tokenizer registered as
+/// `tokenizer_name`. Rules are never scored, so the field has no positions or fieldnorms. The `raw`
+/// column keeps the text of each rule for [`SynonymExpander`]. A caller that reads the text through
+/// its own [`SynonymSource`] can build the options without the column.
+pub fn rule_field_options(tokenizer_name: &str) -> TextOptions {
+    let indexing = TextFieldIndexing::default()
+        .set_tokenizer(tokenizer_name)
+        .set_index_option(IndexRecordOption::Basic)
+        .set_fieldnorms(false);
+    TextOptions::default()
+        .set_indexing_options(indexing)
+        .set_fast(RAW_TOKENIZER_NAME)
 }
 
 fn check_rule_field(schema: &Schema, field: Field) -> crate::Result<()> {
@@ -188,11 +201,9 @@ impl SegmentSynonyms {
 /// segment. The text of a document's rules never changes either, so a source can cache them
 /// compiled. A rule can be deleted, so its liveness is asked on every expansion.
 pub trait SynonymSource {
-    /// The number of segments. The other methods name a segment by its ordinal.
-    fn num_segments(&self) -> usize;
-
-    /// Every key of the segment that starts with `token`, with the documents of its rules.
-    fn token_keys(&mut self, segment: usize, token: &str) -> crate::Result<Arc<[KeyDocs]>>;
+    /// Every key that starts with `token`, with the documents of its rules, one entry for each
+    /// segment. [`alive_rules`](Self::alive_rules) names a segment by its position in this list.
+    fn token_keys(&mut self, token: &str) -> crate::Result<Vec<Arc<[KeyDocs]>>>;
 
     /// The compiled rules of `doc` in the segment, or `None` when the document is deleted.
     fn alive_rules(
@@ -204,7 +215,8 @@ pub trait SynonymSource {
 
 /// Expands query tokens with the rules of `source`. At each position, from left to right, the
 /// longest key wins. An alternative is never expanded again, the same as in Lucene's
-/// `SynonymGraphFilter`.
+/// `SynonymGraphFilter`. A key can match part of the tokens, so `red running shoes` expands
+/// `running shoes` with a rule on that key.
 pub fn expand(tokens: &[String], source: &mut impl SynonymSource) -> crate::Result<Vec<Expansion>> {
     let mut expansions = Vec::with_capacity(tokens.len());
     let mut i = 0;
@@ -234,10 +246,7 @@ fn longest_match(
     run: &[String],
     source: &mut impl SynonymSource,
 ) -> crate::Result<Option<(usize, Vec<Vec<String>>)>> {
-    let mut fetched = Vec::with_capacity(source.num_segments());
-    for segment in 0..source.num_segments() {
-        fetched.push(source.token_keys(segment, &run[0])?);
-    }
+    let fetched = source.token_keys(&run[0])?;
     let mut candidates: Vec<(usize, &KeyDocs)> = Vec::new();
     for (segment, keys) in fetched.iter().enumerate() {
         for key_docs in keys.iter() {
@@ -279,7 +288,7 @@ fn longest_match(
 #[derive(Clone)]
 struct ReaderSegment {
     synonyms: SegmentSynonyms,
-    alive: Option<AliveBitSet>,
+    reader: SegmentReader,
 }
 
 /// Expands query tokens with the synonym rules of every segment of an index, read from the
@@ -326,7 +335,7 @@ impl SynonymExpander {
                 }
                 Ok(ReaderSegment {
                     synonyms,
-                    alive: segment_reader.alive_bitset().cloned(),
+                    reader: segment_reader.clone(),
                 })
             })
             .collect::<crate::Result<_>>()?;
@@ -377,15 +386,16 @@ struct ReaderSource<'a, F> {
 }
 
 impl<F: FnMut(usize, DocId) -> bool> SynonymSource for ReaderSource<'_, F> {
-    fn num_segments(&self) -> usize {
-        self.segments.len()
-    }
-
-    fn token_keys(&mut self, segment: usize, token: &str) -> crate::Result<Arc<[KeyDocs]>> {
-        Ok(self.segments[segment]
-            .synonyms
-            .token_keys(token, self.max_rules_per_key)?
-            .into())
+    fn token_keys(&mut self, token: &str) -> crate::Result<Vec<Arc<[KeyDocs]>>> {
+        self.segments
+            .iter()
+            .map(|segment| {
+                Ok(segment
+                    .synonyms
+                    .token_keys(token, self.max_rules_per_key)?
+                    .into())
+            })
+            .collect()
     }
 
     fn alive_rules(
@@ -394,11 +404,7 @@ impl<F: FnMut(usize, DocId) -> bool> SynonymSource for ReaderSource<'_, F> {
         doc: DocId,
     ) -> crate::Result<Option<Arc<[CompiledRule]>>> {
         let reader_segment = &self.segments[segment];
-        let in_bitset = reader_segment
-            .alive
-            .as_ref()
-            .is_none_or(|alive| alive.is_alive(doc));
-        if !in_bitset || !(self.is_alive)(segment, doc) {
+        if reader_segment.reader.is_deleted(doc) || !(self.is_alive)(segment, doc) {
             return Ok(None);
         }
         let rules = reader_segment
