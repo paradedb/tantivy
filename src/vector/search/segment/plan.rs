@@ -2,15 +2,14 @@
 
 use common::BitSet;
 
-use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
-use crate::query::{for_each_docset_buffered, AllScorer, Weight};
+use crate::query::{for_each_docset_batch, AllScorer, Weight};
 use crate::vector::params::{LocatedPath, ProbeParams};
 use crate::vector::search::source::controller::{WorkBudget, WorkUnits};
 use crate::vector::search::source::router::DocFilter;
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::telemetry::enter_vector_stage;
 use crate::vector::VectorStage;
-use crate::{DocId, SegmentReader};
+use crate::{DocId, DocSet, DocSetBatch, SegmentReader};
 
 // --- Plan ---
 
@@ -164,8 +163,9 @@ fn located_cap(located: LocatedPath, max_doc: DocId, budget: f64, n_avg: f64, x:
 /// Drains the filter `DocSet` once, in ascending doc order, keeping up to `cap` matches as a list.
 ///
 /// The first match past `cap` moves the list into a bitset and the drain continues there. A
-/// match-all scorer, or a drain that matches every doc, routes unfiltered. The bitset allocates
-/// `max_doc / 8` bytes whatever the selectivity.
+/// scorer with a fast bitset whose size hint exceeds `cap` starts in the bitset, and its bitmap
+/// batches union into it by word. A match-all scorer, or a drain that matches every doc, routes
+/// unfiltered. The bitset allocates `max_doc / 8` bytes whatever the selectivity.
 #[inline(never)]
 pub(crate) fn collect_segment_filter(
     weight: &dyn Weight,
@@ -177,27 +177,36 @@ pub(crate) fn collect_segment_filter(
     if scorer.is::<AllScorer>() {
         return Ok(Source::Router(DocFilter::All));
     }
+    let dense_from_start =
+        cap == 0 || (scorer.has_fast_bitset() && scorer.size_hint() as usize > cap);
+    let mut dense = dense_from_start.then(|| BitSet::with_max_value(max_doc));
     let mut sparse = Vec::new();
-    let mut dense = (cap == 0).then(|| BitSet::with_max_value(max_doc));
-    let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
-    for_each_docset_buffered(scorer.as_mut(), &mut buffer, |docs| {
-        for &doc in docs {
-            match &mut dense {
-                Some(filter) => {
-                    filter.insert(doc);
-                }
-                None if sparse.len() < cap => sparse.push(doc),
-                None => {
-                    let mut filter = BitSet::with_max_value(max_doc);
-                    for &doc in &sparse {
+    for_each_docset_batch(scorer.as_mut(), &mut |batch| {
+        if let (DocSetBatch::Bitmap(base, mask), Some(filter)) = (batch, &mut dense) {
+            // A window of 1024 membership bits as 16 words: one union per word, which also keeps
+            // the bitset's length current.
+            filter.union_tinysets(base / 64, mask);
+            return;
+        }
+        batch.for_each_doc_block(|docs| {
+            for &doc in docs {
+                match &mut dense {
+                    Some(filter) => {
                         filter.insert(doc);
                     }
-                    filter.insert(doc);
-                    sparse = Vec::new();
-                    dense = Some(filter);
+                    None if sparse.len() < cap => sparse.push(doc),
+                    None => {
+                        let mut filter = BitSet::with_max_value(max_doc);
+                        for &doc in &sparse {
+                            filter.insert(doc);
+                        }
+                        filter.insert(doc);
+                        sparse = Vec::new();
+                        dense = Some(filter);
+                    }
                 }
             }
-        }
+        });
     });
     let matched = dense.as_ref().map_or(sparse.len(), BitSet::len);
     if matched == max_doc as usize {
@@ -212,7 +221,7 @@ pub(crate) fn collect_segment_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::{AllQuery, BooleanQuery, Occur, Query};
+    use crate::query::{AllQuery, BooleanQuery, EnableScoring, Occur, Query};
     use crate::schema::Metric;
     use crate::vector::params::{ProbeParams, Selectivity};
     use crate::vector::stats::AccessPath;
@@ -413,6 +422,86 @@ mod tests {
         assert!(hits.is_empty());
         assert_eq!(stats.clusters_probed(), 0);
         assert_eq!(stats.candidates_scored, 0);
+        Ok(())
+    }
+
+    /// A bitmap-backed filter builds the same `DocFilter` as a per-doc drain of the same scorer:
+    /// the routed bitset below the located cap, the located list at or above it.
+    #[test]
+    fn bitmap_filters_match_the_per_doc_drain() -> crate::Result<()> {
+        use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
+        use crate::query::for_each_docset_buffered;
+        use crate::DocSet;
+
+        // 400 docs over two clusters; both labels clear the bitmap density and doc-count floors.
+        let n = 400usize;
+        let fixture = FixtureSpec::ivf(
+            Metric::L2,
+            vec![vec![0.0, 0.0], vec![10.0, 0.0]],
+            (0..n)
+                .map(|i| vec![(i % 2) as f32 * 10.0 + 0.001 * i as f32, 0.0])
+                .collect(),
+        )
+        .label("half", |i| i % 2 == 0)
+        .label("third", |i| i % 3 == 0)
+        .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let segment = first_segment(&searcher).1;
+        let max_doc = segment.max_doc();
+        // The fixture's weights leave posting bitmaps off; the drain sees them only when asked.
+        let weight = |query: &dyn Query| {
+            query
+                .weight(EnableScoring::disabled_from_searcher(&searcher).with_bitmap_postings(true))
+        };
+        let per_doc = |weight: &dyn Weight| -> crate::Result<Vec<DocId>> {
+            let mut scorer = weight.scorer(segment, 1.0)?;
+            let mut docs = Vec::new();
+            let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
+            for_each_docset_buffered(scorer.as_mut(), &mut buffer, |block| {
+                docs.extend_from_slice(block)
+            });
+            Ok(docs)
+        };
+        // The source as `(located, docs)`.
+        let drained = |weight: &dyn Weight, cap: usize| -> crate::Result<(bool, Vec<DocId>)> {
+            Ok(
+                match collect_segment_filter(weight, segment, max_doc, cap)? {
+                    Source::Router(DocFilter::Docs(filter)) => {
+                        let docs: Vec<DocId> =
+                            (0..max_doc).filter(|&doc| filter.contains(doc)).collect();
+                        assert_eq!(filter.len(), docs.len());
+                        (false, docs)
+                    }
+                    Source::Router(DocFilter::All) => panic!("the filter is not match-all"),
+                    Source::FilterMatches(docs) => (true, docs),
+                },
+            )
+        };
+
+        let half = weight(&fixture.filter("half"))?;
+        let both = weight(&BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(fixture.filter("half")) as Box<dyn Query>,
+            ),
+            (Occur::Must, Box::new(fixture.filter("third"))),
+        ]))?;
+        let matches = per_doc(half.as_ref())?.len();
+        // A conjunction's size hint is an estimate, so its caps stay clear of it.
+        for (name, weight, caps) in [
+            ("half", &half, vec![0, matches - 1, matches, n]),
+            ("half and third", &both, vec![0, n]),
+        ] {
+            assert!(weight.scorer(segment, 1.0)?.has_fast_bitset(), "{name}");
+            let expected = per_doc(weight.as_ref())?;
+            for cap in caps {
+                assert_eq!(
+                    drained(weight.as_ref(), cap)?,
+                    (cap >= expected.len(), expected.clone()),
+                    "{name} cap {cap}"
+                );
+            }
+        }
         Ok(())
     }
 }
