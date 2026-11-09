@@ -4,32 +4,20 @@ use common::BitSet;
 
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::query::{for_each_docset_buffered, AllScorer, Weight};
-use crate::vector::params::{LocatedPath, ProbeParams};
-use crate::vector::search::source::controller::{WorkBudget, WorkUnits};
+use crate::vector::params::LocatedPath;
+use crate::vector::search::source::controller::WorkBudget;
 use crate::vector::search::source::router::DocFilter;
-use crate::vector::storage::centroids::ClusterIndex;
-use crate::vector::telemetry::enter_vector_stage;
-use crate::vector::VectorStage;
 use crate::{DocId, SegmentReader};
 
 // --- Plan ---
 
 /// Where a segment's clusters come from.
+#[derive(Clone)]
 pub(crate) enum Source {
     /// The router's ranking, gated by the filter.
     Router(DocFilter),
     /// The filter's matches, few enough to look up directly: ascending, deleted ones included.
     FilterMatches(Vec<DocId>),
-}
-
-impl Source {
-    /// Whether the filter matches nothing.
-    fn is_empty(&self) -> bool {
-        match self {
-            Self::Router(filter) => filter.is_empty(),
-            Self::FilterMatches(docs) => docs.is_empty(),
-        }
-    }
 }
 
 /// What planning reports for the segment's statistics.
@@ -41,147 +29,44 @@ pub(crate) struct PlanReport {
     pub(crate) located_cap: usize,
 }
 
-/// One segment's search plan.
-pub(crate) struct SegmentPlan {
-    /// Zero when nothing can match before the budget resolves.
-    pub(crate) budget: WorkBudget,
-    /// `None` when nothing can match.
-    pub(crate) source: Option<Source>,
-    pub(crate) report: PlanReport,
+#[derive(Clone)]
+pub(crate) enum ScanInput {
+    Flat {
+        filter: DocFilter,
+    },
+    Routed {
+        filter: DocFilter,
+        budget: WorkBudget,
+        report: PlanReport,
+    },
+    Located {
+        docs: Vec<DocId>,
+        budget: WorkBudget,
+        report: PlanReport,
+    },
 }
 
-impl SegmentPlan {
-    /// Resolves the budget once, drains the filter under the located cap, and picks the source.
-    ///
-    /// Plans no source when nothing can match: `top_n` is zero, the segment holds no clusters or
-    /// docs, or the filter matches nothing.
-    pub(crate) fn build(
-        params: &ProbeParams,
-        index: &ClusterIndex,
-        weight: &dyn Weight,
-        segment: &SegmentReader,
-        top_n: usize,
-    ) -> crate::Result<Self> {
-        let max_doc = segment.max_doc();
-        let clusters = index.num_clusters();
-        let report = |located_cap| PlanReport {
-            segment_rows: index.num_rows(),
-            segment_clusters: clusters,
-            located_cap,
-        };
-        if top_n == 0 || max_doc == 0 || clusters == 0 {
-            return Ok(Self {
-                budget: WorkBudget::default(),
-                source: None,
-                report: report(0),
-            });
-        }
-        // Capacity counts native docs as written: deleted rows still charge on first touch.
-        let (budget, n_avg, x) = params.resolved_work_budget(clusters, index.num_docs())?;
-        debug_assert!(n_avg > 0.0);
-        let cap = located_cap(params.located, max_doc, budget, n_avg, x);
-        let source = {
-            let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-            collect_segment_filter(weight, segment, max_doc, cap)?
-        };
-        Ok(Self {
-            budget: WorkBudget {
-                total: WorkUnits::new(budget),
-                per_cluster: WorkUnits::new(x),
-                per_row: WorkUnits::new((1.0 - x) / n_avg),
-            },
-            source: (!source.is_empty()).then_some(source),
-            report: report(cap),
-        })
-    }
-
-    pub(crate) fn with_budget(
-        params: &ProbeParams,
-        index: &ClusterIndex,
-        weight: &dyn Weight,
-        segment: &SegmentReader,
-        top_n: usize,
-        budget: WorkBudget,
-    ) -> crate::Result<Self> {
-        let max_doc = segment.max_doc();
-        let clusters = index.num_clusters();
-        let report = |located_cap| PlanReport {
-            segment_rows: index.num_rows(),
-            segment_clusters: clusters,
-            located_cap,
-        };
-        if top_n == 0 || max_doc == 0 || clusters == 0 {
-            return Ok(Self {
-                budget: WorkBudget::default(),
-                source: None,
-                report: report(0),
-            });
-        }
-        // Capacity counts native docs as written: deleted rows still charge on first touch.
-        let x = budget.per_cluster.get();
-        let n_avg = (1.0 - x) / budget.per_row.get();
-        debug_assert!(n_avg > 0.0);
-        let cap = located_cap(params.located, max_doc, budget.total.get(), n_avg, x);
-        let source = {
-            let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-            collect_segment_filter(weight, segment, max_doc, cap)?
-        };
-        Ok(Self {
-            budget,
-            source: (!source.is_empty()).then_some(source),
-            report: report(cap),
-        })
-    }
-
-    pub(crate) fn apply_global_budget(
-        &mut self,
-        params: &ProbeParams,
-        max_doc: DocId,
-        global_clusters: usize,
-    ) {
-        if self.source.is_none() {
-            return;
-        }
-        let global_budget = params
-            .max_probe
-            .max(params.min_probe_clusters)
-            .min(global_clusters) as f64;
-        self.budget.total = WorkUnits::new(
-            global_budget * self.report.segment_clusters as f64 / global_clusters.max(1) as f64,
-        );
-        let x = self.budget.per_cluster.get();
-        let n_avg = (1.0 - x) / self.budget.per_row.get();
-        let cap = located_cap(params.located, max_doc, self.budget.total.get(), n_avg, x);
-        self.report.located_cap = cap;
-        self.source = self.source.take().map(|source| match source {
-            Source::FilterMatches(docs) if docs.len() > cap => {
-                let mut filter = BitSet::with_max_value(max_doc);
-                for doc in docs {
-                    filter.insert(doc);
-                }
-                Source::Router(DocFilter::Docs(filter))
-            }
-            source => source,
-        });
-    }
-
-    /// The rows the scan admits under the budget, for reserving its columns once. The last
-    /// cluster can overshoot the budget, growing the columns once more.
+impl ScanInput {
     pub(crate) fn capacity_hint(&self) -> usize {
-        let rows = match &self.source {
-            Some(Source::Router(_)) => {
-                (self.budget.total.get() / self.budget.per_row.get()).ceil() as usize
-            }
-            Some(Source::FilterMatches(docs)) => docs.len(),
-            None => 0,
-        };
-        rows.min(self.report.segment_rows)
+        match self {
+            Self::Routed { budget, report, .. } => ((budget.total.get() / budget.per_row.get())
+                .ceil() as usize)
+                .min(report.segment_rows),
+            Self::Located { docs, report, .. } => docs.len().min(report.segment_rows),
+            Self::Flat { .. } => 0,
+        }
     }
 }
 
 /// The most matches, deleted ones included, a filter may have and take the located path; `Auto`
 /// prices the work budget `(budget, n_avg, x)` the routed path runs against.
-fn located_cap(located: LocatedPath, max_doc: DocId, budget: f64, n_avg: f64, x: f64) -> usize {
+pub(crate) fn located_cap(
+    located: LocatedPath,
+    max_doc: DocId,
+    budget: f64,
+    n_avg: f64,
+    x: f64,
+) -> usize {
     match located {
         LocatedPath::Off => 0,
         LocatedPath::MaxSelectivity(selectivity) => {
@@ -236,7 +121,7 @@ pub(crate) fn collect_segment_filter(
         return Ok(Source::Router(DocFilter::All));
     }
     Ok(match dense {
-        Some(filter) => Source::Router(DocFilter::Docs(filter)),
+        Some(filter) => Source::Router(DocFilter::Docs(filter.into())),
         None => Source::FilterMatches(sparse),
     })
 }
@@ -297,16 +182,28 @@ mod tests {
         // The source as `(located, matches)`; `None` matches for a match-all routed filter.
         let plan_with = |filter: &dyn Query, top_n: usize, params: &ProbeParams| {
             fixture.with_segment(filter, &[0.0, 0.0], top_n, params, |seg| {
-                let plan = seg.plan()?;
-                Ok(plan.source.as_ref().map(|source| {
-                    let source = match source {
-                        Source::Router(filter) => match filter {
-                            DocFilter::All => (false, None),
-                            DocFilter::Docs(docs) => (false, Some(docs.len())),
-                        },
-                        Source::FilterMatches(docs) => (true, Some(docs.len())),
+                Ok(seg.input()?.map(|input| {
+                    let capacity = input.capacity_hint();
+                    let (budget, report, source) = match input {
+                        ScanInput::Routed {
+                            filter,
+                            budget,
+                            report,
+                        } => {
+                            let matches = match filter {
+                                DocFilter::All => None,
+                                DocFilter::Docs(docs) => Some(docs.len()),
+                            };
+                            (budget, report, (false, matches))
+                        }
+                        ScanInput::Located {
+                            docs,
+                            budget,
+                            report,
+                        } => (budget, report, (true, Some(docs.len()))),
+                        ScanInput::Flat { .. } => unreachable!(),
                     };
-                    (plan.budget, plan.capacity_hint(), plan.report, source)
+                    (budget, capacity, report, source)
                 }))
             })
         };
@@ -426,20 +323,6 @@ mod tests {
                 "matches={matches}"
             );
         }
-        let weight = DocsWeight {
-            max_doc: segment.max_doc(),
-            docs: (0..cap as DocId).collect(),
-        };
-        let mut shared = SegmentPlan::build(&auto, ivf, &weight, segment, 10)?;
-        assert!(matches!(shared.source, Some(Source::FilterMatches(_))));
-        shared.apply_global_budget(&auto, segment.max_doc(), ivf.num_clusters() * 2);
-        assert!((shared.budget.total.get() - budget / 2.0).abs() < 1e-9);
-        let Some(Source::Router(DocFilter::Docs(matches))) = shared.source else {
-            panic!("matches exceeding the reduced budget must route");
-        };
-        assert_eq!(matches.len(), weight.docs.len());
-        assert!(weight.docs.iter().all(|&doc| matches.contains(doc)));
-
         // Every mode reports its cap, and an unfiltered query routes.
         for (located, cap) in [(LocatedPath::Off, 0), (capped(9).located, 9)] {
             let params = ProbeParams {

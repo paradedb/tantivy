@@ -7,7 +7,7 @@ use crate::schema::{Metric, VectorDType};
 use crate::vector::diagnostics::VectorStorageFormat;
 use crate::vector::params::{LocatedPath, ProbeParams, DEFAULT_FIXED_PROBE_COST_ROWS};
 use crate::vector::search::cluster_source::ClusterSource;
-use crate::vector::search::segment::plan::Source;
+use crate::vector::search::segment::plan::ScanInput;
 use crate::vector::search::source::controller::ProbeTermination;
 use crate::vector::search::source::router::{
     DocFilter, GatedRows, RouterClusters, RouterReport, RowGate,
@@ -30,14 +30,13 @@ struct Walk {
 
 /// Walks the first segment's router source, admitting every row of every cluster.
 fn walk(seg: &SegmentRun<'_>) -> crate::Result<Walk> {
-    let plan = seg.plan()?;
-    let Some(Source::Router(filter)) = plan.source else {
+    let Some(ScanInput::Routed { filter, budget, .. }) = seg.input()? else {
         panic!("the router source walks router plans");
     };
     let mut source = RouterClusters::from_ranked(
-        seg.searcher.reader(),
+        seg.reader,
         seg.routing.unwrap().ranked_clusters(),
-        plan.budget,
+        budget,
         filter,
         seg.segment,
     );
@@ -345,7 +344,8 @@ fn row_gate_bookkeeping() -> crate::Result<()> {
     filter.insert(4);
     filter.insert(12);
     let mut offsets = Vec::new();
-    let gated = RowGate::new(DocFilter::Docs(filter), None).select(&[4, 9, 12, 22], &mut offsets);
+    let gated =
+        RowGate::new(DocFilter::Docs(filter.into()), None).select(&[4, 9, 12, 22], &mut offsets);
     assert_eq!(
         gated,
         GatedRows {
@@ -385,14 +385,13 @@ fn row_gate_bookkeeping() -> crate::Result<()> {
                 ..*seg
             };
             for (run, open) in [(seg, true), (&gated, false)] {
-                let plan = run.plan()?;
-                let Some(Source::Router(filter)) = plan.source else {
+                let Some(ScanInput::Routed { filter, budget, .. }) = run.input()? else {
                     panic!("the router source walks router plans");
                 };
                 let mut source = RouterClusters::from_ranked(
-                    run.searcher.reader(),
+                    run.reader,
                     run.routing.unwrap().ranked_clusters(),
-                    plan.budget,
+                    budget,
                     filter,
                     run.segment,
                 );

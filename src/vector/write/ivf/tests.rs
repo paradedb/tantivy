@@ -167,7 +167,7 @@ fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
                     min_probe_clusters: 2,
                     ..Default::default()
                 })
-                .build(),
+                .build_for_searcher(&searcher, &AllQuery)?,
         )?;
         assert_eq!(hits.results.len(), count.min(3));
         assert!(!vector.id_map_initialized(), "scan must not open IdMap");
@@ -814,7 +814,7 @@ fn run_quantized_matrix_query(
             ..Default::default()
         })
         .with_max_scan_levels(depth)
-        .build();
+        .build_for_searcher(&searcher, filter)?;
     let fruit = searcher.search(filter, &collector)?;
     assert_eq!(fruit.stats.len(), 1);
     let stats = &fruit.stats[0];
@@ -887,14 +887,14 @@ fn run_quantized_matrix_query(
             &TopDocsByVectorSimilarityBuilder::new(field, query.clone(), ELIGIBILITY_TOP_N)
                 .with_probe_params(params.clone())
                 .with_max_scan_levels(depth)
-                .build(),
+                .build_for_searcher(&searcher, filter)?,
         )?;
         let level0 = searcher.search(
             filter,
             &TopDocsByVectorSimilarityBuilder::new(field, query.clone(), ELIGIBILITY_TOP_N)
                 .with_probe_params(params)
                 .with_max_scan_levels(0)
-                .build(),
+                .build_for_searcher(&searcher, filter)?,
         )?;
         assert_eq!(
             crate::vector::test_support::doc_trace(
@@ -1030,18 +1030,19 @@ fn level_zero_matches_unquantized_ivf() -> crate::Result<()> {
     let unquantized = build_quantized_fixture(DIM, false)?;
     let quantized = build_quantized_fixture(DIM, true)?;
     let field = unquantized.schema().get_field("embedding")?;
-    let unquantized_fruit = unquantized.reader()?.searcher().search(
+    let unquantized_searcher = unquantized.reader()?.searcher();
+    let quantized_reader = quantized.reader()?;
+    let quantized_searcher = quantized_reader.searcher();
+    let unquantized_fruit = unquantized_searcher.search(
         &AllQuery,
         &TopDocsByVectorSimilarityBuilder::new(field, query.clone(), 3)
             .with_probe_params(params.clone())
-            .build(),
+            .build_for_searcher(&unquantized_searcher, &AllQuery)?,
     )?;
     let level_zero_collector = TopDocsByVectorSimilarityBuilder::new(field, query, 3)
         .with_probe_params(params)
         .with_max_scan_levels(0)
-        .build();
-    let quantized_reader = quantized.reader()?;
-    let quantized_searcher = quantized_reader.searcher();
+        .build_for_searcher(&quantized_searcher, &AllQuery)?;
     assert!(quantized_searcher.segment_readers()[0]
         .vector_index(field)?
         .quantization()?
@@ -1181,7 +1182,8 @@ fn mixed_segments_share_preparation_by_stored_metadata() -> crate::Result<()> {
                     min_probe_clusters: 2,
                     ..Default::default()
                 })
-                .build()
+                .build_for_searcher(&searcher, &crate::query::AllQuery)
+                .unwrap()
         };
         let collector = make_collector();
         let combined = searcher.search(&AllQuery, &collector)?;
@@ -1217,7 +1219,8 @@ fn level_zero_flat_segment_remains_exact() -> crate::Result<()> {
         &AllQuery,
         &TopDocsByVectorSimilarityBuilder::new(field, query, 3)
             .with_max_scan_levels(0)
-            .build(),
+            .build_for_searcher(&searcher, &crate::query::AllQuery)
+            .unwrap(),
     )?;
     assert_eq!(
         fruit
@@ -1335,7 +1338,8 @@ fn merge_quantization_matches_kernel_harness_and_is_reproducible() -> crate::Res
             located: LocatedPath::Off,
             ..Default::default()
         })
-        .build();
+        .build_for_searcher(&searcher, &crate::query::AllQuery)
+        .unwrap();
     let quantized_fruit = searcher.search(&AllQuery, &collector)?;
     assert!(collector.quantized_query_count() > 0);
     assert_eq!(quantized_fruit.stats.len(), 1);
@@ -1403,7 +1407,8 @@ fn quantized_exhaustive_search_probes_all_clusters() -> crate::Result<()> {
             ..Default::default()
         })
         .with_max_scan_levels(1)
-        .build();
+        .build_for_searcher(&searcher, &crate::query::AllQuery)
+        .unwrap();
     let fruit = searcher.search(&AllQuery, &collector)?;
     assert_eq!(fruit.stats.len(), 1);
     let stats = &fruit.stats[0];
@@ -1430,7 +1435,8 @@ fn quantized_probe_terminates_at_ceiling() -> crate::Result<()> {
             ..Default::default()
         })
         .with_max_scan_levels(1)
-        .build();
+        .build_for_searcher(&searcher, &crate::query::AllQuery)
+        .unwrap();
     let fruit = searcher.search(&AllQuery, &collector)?;
     assert_eq!(fruit.stats.len(), 1);
     let stats = &fruit.stats[0];
@@ -1476,14 +1482,15 @@ fn quantized_filtered_rows_are_not_charged() -> crate::Result<()> {
     let (_, n_avg, open_share) = params.resolved_work_budget(ivf.num_clusters(), ivf.num_docs())?;
     let row = (1.0 - open_share) / n_avg;
     // Request all fixture rows so both scans open every cluster.
-    let collector = || {
+    let collector = |filter: &dyn Query| {
         TopDocsByVectorSimilarityBuilder::new(field, query.clone(), 8)
             .with_probe_params(params.clone())
             .with_max_scan_levels(1)
-            .build()
+            .build_for_searcher(&searcher, filter)
+            .unwrap()
     };
-    let unfiltered = searcher.search(&AllQuery, &collector())?;
-    let filtered = searcher.search(&keep, &collector())?;
+    let unfiltered = searcher.search(&AllQuery, &collector(&AllQuery))?;
+    let filtered = searcher.search(&keep, &collector(&keep))?;
     assert_eq!(
         unfiltered.results,
         fixture_exact_hits(&index, Metric::L2, &query, None, 8)?
@@ -1629,7 +1636,8 @@ fn general_dimension_quantized_bridge_at_d100() -> crate::Result<()> {
                     min_probe_clusters: 2,
                     ..Default::default()
                 })
-                .build(),
+                .build_for_searcher(&searcher, &crate::query::AllQuery)
+                .unwrap(),
         )?
         .results;
     assert_eq!(
@@ -1735,7 +1743,8 @@ fn estimator_measurement_uses_production_path_and_is_centered() -> crate::Result
                 located: LocatedPath::Off,
                 ..Default::default()
             })
-            .build(),
+            .build_for_searcher(&searcher, &crate::query::AllQuery)
+            .unwrap(),
     )?;
     assert!(fruit.stats[0].layers.get(0).is_some());
     assert!(fruit.stats[0].postings_row > 0);
@@ -1837,7 +1846,8 @@ fn layer_zero_io_matches_requested_page_spans() -> crate::Result<()> {
                 located: LocatedPath::Off,
                 ..Default::default()
             })
-            .build(),
+            .build_for_searcher(&searcher, &crate::query::AllQuery)
+            .unwrap(),
     )?;
     let reads = directory.reads.lock().unwrap();
     let centroid_reads = directory.centroid_reads.lock().unwrap();

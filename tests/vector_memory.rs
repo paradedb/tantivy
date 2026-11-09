@@ -301,7 +301,8 @@ impl Fixture {
             let collector = TopDocs::with_limit(10)
                 .order_by_similarity(self.field, query.clone())
                 .with_probe_params(params.clone())
-                .build();
+                .build_for_searcher(searcher, filter)
+                .unwrap();
             searcher.search(filter, &collector).map(|fruit| fruit.stats)
         };
         run().expect("warm-up search");

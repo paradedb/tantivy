@@ -1,6 +1,8 @@
 //! The router cluster source: clusters in the router's order, admitted under the work budget,
 //! and the filter.
 
+use std::sync::Arc;
+
 use common::BitSet;
 
 use crate::fastfield::AliveBitSet;
@@ -19,11 +21,12 @@ use crate::{DocId, SegmentReader};
 // --- Filter and gate ---
 
 /// The filter's matches as the router source gates rows with them.
+#[derive(Clone)]
 pub(crate) enum DocFilter {
     /// Every doc id below `max_doc` matches, deleted docs included; no bitset is built.
     All,
     /// The matching doc ids.
-    Docs(BitSet),
+    Docs(Arc<BitSet>),
 }
 
 impl DocFilter {
@@ -44,9 +47,9 @@ impl DocFilter {
 pub(crate) enum RowGate<'a> {
     Open,
     AliveOnly(&'a AliveBitSet),
-    FilterOnly(BitSet),
+    FilterOnly(Arc<BitSet>),
     FilterAndAlive {
-        filter: BitSet,
+        filter: Arc<BitSet>,
         alive: &'a AliveBitSet,
     },
 }

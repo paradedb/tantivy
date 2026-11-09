@@ -17,8 +17,7 @@ use crate::vector::search::scan::layer_read::LayerRead;
 use crate::vector::search::scan::plan::{ExactRule, PlanOverride};
 use crate::vector::stats::{AccessPath, LayerProbeStats};
 use crate::vector::test_support::{
-    first_segment, routing_plan_for_clusters, ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg,
-    ReadLog,
+    first_segment, ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg, ReadLog,
 };
 use crate::vector::tests::{exhaustive_params, routed_exhaustive_params};
 use crate::vector::{
@@ -52,7 +51,7 @@ fn adaptive_cascade_matches_prefix_replay() -> crate::Result<()> {
             };
             let fixture = matrix_fixture(metric, representation, true)?;
             let searcher = fixture.index.reader()?.searcher();
-            let (ordinal, segment) = first_segment(&searcher);
+            let (ordinal, _) = first_segment(&searcher);
             for filter in [
                 &AllQuery as &dyn Query,
                 &fixture.filter("half"),
@@ -92,11 +91,7 @@ fn adaptive_cascade_matches_prefix_replay() -> crate::Result<()> {
                                     Some(plan),
                                     true,
                                     None,
-                                    Some(routing_plan_for_clusters(
-                                        fixture.field,
-                                        segment,
-                                        ranked.clone(),
-                                    )),
+                                    Some(ranked.clone()),
                                 )?;
                                 let prefix = report.clusters_probed();
                                 assert!(prefix >= previous_prefix);
@@ -115,11 +110,7 @@ fn adaptive_cascade_matches_prefix_replay() -> crate::Result<()> {
                                     Some(plan),
                                     true,
                                     None,
-                                    Some(routing_plan_for_clusters(
-                                        fixture.field,
-                                        segment,
-                                        ranked[..prefix].to_vec(),
-                                    )),
+                                    Some(ranked[..prefix].to_vec()),
                                 )?;
                                 assert_eq!(active, replay);
                                 assert_eq!(report.exact_rows, replay_report.exact_rows);
@@ -1648,13 +1639,14 @@ fn located_path_reads_no_doc_ids() -> crate::Result<()> {
             located: LocatedPath::MaxSelectivity(Selectivity::new(1.0).unwrap()),
             ..every_cluster()
         };
+        let searcher = fixture.index.reader()?.searcher();
         let collector = || {
             TopDocs::with_limit(10)
                 .order_by_similarity(fixture.field, query.clone())
                 .with_probe_params(params.clone())
-                .build()
+                .build_for_searcher(&searcher, &filter)
+                .unwrap()
         };
-        let searcher = fixture.index.reader()?.searcher();
         // The first search opens the location map; measure the second.
         searcher.search(&filter, &collector())?;
         fixture.clear_reads();
@@ -1860,15 +1852,25 @@ fn ann_reads_offsets_only_for_probed_clusters() -> crate::Result<()> {
                 .map(|(_, r)| r)
                 .filter(|r| ranges.block_offsets.contains(r))
                 .collect();
-            let collector = TopDocs::with_limit(5)
+            let params = routed_exhaustive_params(32);
+            let builder = TopDocs::with_limit(5)
                 .order_by_similarity(fixture.field, query.clone())
-                .with_probe_params(routed_exhaustive_params(32))
-                .with_routing_plan(routing_plan_for_clusters(
-                    fixture.field,
-                    first_segment(&searcher).1,
-                    fixture.candidates(&[17], &query)?,
-                ))
-                .build();
+                .with_probe_params(params.clone());
+            let weight = fixture.weight(filter)?;
+            let (ordinal, segment) = first_segment(&searcher);
+            let segments = [crate::vector::VectorSegment::from((ordinal, segment))];
+            let budget =
+                crate::vector::VectorSearchBudget::for_segments(fixture.field, &params, &segments)?;
+            let prepared = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
+            let candidates = fixture
+                .candidates(&[17], &query)?
+                .into_iter()
+                .map(|c| crate::vector::Candidate {
+                    sim: c.sim,
+                    node: (ordinal, c.node),
+                })
+                .collect();
+            let collector = builder.build(prepared.with_candidates(candidates)?);
             fixture.clear_reads();
             let fruit = searcher.search(filter, &collector)?;
             assert!(!fruit.results.is_empty());

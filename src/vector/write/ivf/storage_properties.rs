@@ -3,7 +3,6 @@ use crate::schema::Value;
 use crate::vector::clustering::{for_each_batch, IvfTrainingVectors, VectorSource};
 use crate::vector::quantization::{corrected_quantized_estimate, ArithmeticError};
 use crate::vector::storage::io::test_support::{PagedDirectory, PAGE_BYTES};
-use crate::vector::test_support::routing_plan_for_clusters;
 use crate::vector::BlockAddress;
 
 const DIM: usize = 64;
@@ -516,7 +515,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
     let prepared = QuantizedQueryCtx::new(Arc::clone(ctx), &exact_query);
     for clusters in [vec![0, 1, 2, 3], vec![0, 1, 3]] {
         for filtered in [false, true] {
-            let candidates = clusters
+            let candidates: Vec<_> = clusters
                 .iter()
                 .map(|&cluster| crate::vector::router::candidate::Candidate {
                     node: cluster as u32,
@@ -531,16 +530,34 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                 IndexRecordOption::Basic,
             );
             let filter: &dyn Query = if filtered { &keep } else { &AllQuery };
-            let collector = TopDocsByVectorSimilarityBuilder::new(field, query.clone(), DOCS + 1)
-                .with_probe_params(ProbeParams {
-                    max_probe: usize::MAX,
-                    min_probe_clusters: 4,
-                    exact_plan: false,
-                    located: LocatedPath::Off,
-                    ..Default::default()
+            let params = ProbeParams {
+                max_probe: usize::MAX,
+                min_probe_clusters: 4,
+                exact_plan: false,
+                located: LocatedPath::Off,
+                ..Default::default()
+            };
+            let builder = TopDocsByVectorSimilarityBuilder::new(field, query.clone(), DOCS + 1)
+                .with_probe_params(params.clone());
+            let weight = filter.weight(crate::query::EnableScoring::disabled_from_searcher(
+                &searcher,
+            ))?;
+            let ordinal = searcher
+                .segment_readers()
+                .iter()
+                .position(|r| r.segment_id() == segment.segment_id())
+                .unwrap() as u32;
+            let segments = [crate::vector::VectorSegment::from((ordinal, segment))];
+            let budget = crate::vector::VectorSearchBudget::for_segments(field, &params, &segments)?;
+            let scan_preparation = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
+            let candidates = candidates
+                .into_iter()
+                .map(|c| crate::vector::Candidate {
+                    sim: c.sim,
+                    node: (ordinal, c.node),
                 })
-                .with_routing_plan(routing_plan_for_clusters(field, segment, candidates))
-                .build();
+                .collect();
+            let collector = builder.build(scan_preparation.with_candidates(candidates)?);
             let fruit = searcher.search(filter, &collector).unwrap_or_else(|error| {
                 panic!(
                     "{metric:?} {schedule:?} cluster={clusters:?} row=all column=layer0 probe: \

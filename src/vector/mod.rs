@@ -41,12 +41,48 @@
 //!     &even,
 //!     &TopDocs::with_limit(10)
 //!         .order_by_similarity(embedding, query)
-//!         .build(),
+//!         .build_for_searcher(&searcher, &even)?,
+//! )?;
+//! assert_eq!(hits.results.len(), 10);
+//!
+//! // The same search with explicit preparation, routing, and document collection.
+//! use tantivy::collector::Collector;
+//! use tantivy::query::{EnableScoring, Query};
+//! use tantivy::vector::{
+//!     ProbeParams, TopClustersBySimilarityCollector, VectorSearchBudget, VectorSegment,
+//! };
+//! let params = ProbeParams::default();
+//! let query = vec![0.5_f32; 64];
+//! let builder = TopDocs::with_limit(10)
+//!     .order_by_similarity(embedding, query.clone())
+//!     .with_probe_params(params.clone());
+//! let weight = even.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+//! let segments: Vec<_> = searcher.segment_readers().iter().enumerate()
+//!     .map(|(ord, reader)| VectorSegment::from((ord as u32, reader))).collect();
+//! let budget = VectorSearchBudget::for_segments(embedding, &params, &segments)?;
+//! let prepared = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
+//! let router = TopClustersBySimilarityCollector::new(
+//!     embedding, query, params, prepared.match_fraction(),
+//! )?.with_budget(prepared.budget());
+//! let candidates = router.collect_segments(&prepared.routing_segments(), |_| {})?;
+//! let inputs = prepared.with_candidates(candidates)?
+//!     .with_routing_statistics(router.take_statistics());
+//! let collector = builder.build(inputs);
+//! let hits = collector.merge_fruits(
+//!     collector.collect_segments(weight.as_ref(), &segments, |_| {})?,
 //! )?;
 //! assert_eq!(hits.results.len(), 10);
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! Parallel callers resolve a [`VectorSearchBudget`] over the complete snapshot, call
+//! [`VectorSearchBudget::distributed`], and pass it to each worker's
+//! [`TopDocsByVectorSimilarityBuilder::prepare`]. Workers retain their prepared
+//! filters while the coordinator ranks eligible segments. Distribute the resulting
+//! `Vec<Candidate<ClusterRef>>` by the original segment ordinals, then attach each assignment
+//! with [`PreparedVectorSearch::with_candidates`]. Located and flat inputs need no candidates;
+//! segments with no work are omitted. Routing telemetry can be transferred separately.
 
 mod collector;
 mod distance;
@@ -81,8 +117,12 @@ pub use params::{
     AdaptiveProbeParams, LocatedPath, ProbeParams, Selectivity, DEFAULT_FIXED_PROBE_COST_ROWS,
 };
 pub use quantization::{VectorQuantizationConfig, VectorQuantizationLayer};
-pub use router::plan::{VectorRoutingPlan, VectorRoutingPlanProvider, VectorSegment};
+pub use router::candidate::Candidate;
+pub use router::collector::{TopClustersBySimilarityCollector, VectorRoutingStats};
 pub use router::{RouterKind, RouterMetrics};
+pub use search::input::{
+    ClusterRef, PreparedVectorSearch, VectorScanInputs, VectorSearchBudget, VectorSegment,
+};
 pub use search::source::controller::ProbeTermination;
 pub use stats::ProbeStats;
 pub use storage::blocks::BlockAddress;

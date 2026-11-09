@@ -4,6 +4,7 @@
 //! exactly. An IVF segment is planned, then scanned over its cluster source.
 
 pub(crate) mod cluster_source;
+pub(crate) mod input;
 pub(crate) mod interval;
 pub(crate) mod prepared;
 pub(crate) mod scan;
@@ -16,18 +17,19 @@ use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::{
     AtomicSharedThreshold, SegmentSortKeyComputer, SharedThreshold, TopNComputer,
 };
-use crate::query::Weight;
 use crate::schema::Field;
 use crate::vector::params::ProbeParams;
+use crate::vector::router::RouterIter;
+use crate::vector::search::input::VectorSegment;
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery, VectorQuery};
 use crate::vector::search::scan::bound::{PruningBound, TopK};
 use crate::vector::search::scan::heap::{tie_break_key, TieBreakHits};
 #[cfg(test)]
 use crate::vector::search::scan::plan::PlanOverride;
 use crate::vector::search::scan::{ScanConfig, SegmentScan};
-use crate::vector::search::segment::plan::{SegmentPlan, Source};
+use crate::vector::search::segment::plan::ScanInput;
 use crate::vector::search::source::matches::MatchClusters;
-use crate::vector::search::source::router::RouterClusters;
+use crate::vector::search::source::router::{DocFilter, RouterClusters};
 use crate::vector::search::source::SourceReport;
 #[cfg(test)]
 use crate::vector::stats::ProbeStats;
@@ -39,20 +41,20 @@ use crate::vector::telemetry::enter_vector_stage;
 use crate::vector::telemetry::measure;
 #[cfg(test)]
 use crate::vector::tie_break::NoTieBreak;
-use crate::vector::{VectorElement, VectorRoutingPlanProvider, VectorStage};
-use crate::{DocAddress, Score, SegmentOrdinal, SegmentReader, TantivyError};
+use crate::vector::{Candidate, RouterMetrics, VectorElement, VectorStage};
+use crate::{DocAddress, Score, SegmentOrdinal, TantivyError};
 
 /// Per-segment vector search state: the segment's [`VectorIndexReader`] and the prepared query.
 /// Build via [`SegmentSearcher::for_segment`].
 pub(crate) struct SegmentSearcher<T: VectorElement> {
-    field: Field,
     reader: Arc<VectorIndexReader>,
     query: Arc<VectorQuery<T>>,
     /// `None` when the segment is not quantized or quantized scanning is off.
     quantized: Option<Arc<QuantizedQueryCtx>>,
     probe_params: ProbeParams,
-    routing_plan: Option<Arc<dyn VectorRoutingPlanProvider>>,
-    segment_ord: SegmentOrdinal,
+    segment: VectorSegment,
+    ranked: Vec<Candidate>,
+    routing_metrics: RouterMetrics,
     /// Exact scores segments of this collector have finished. The scan seeds its TopK from them
     /// (partial k). `None` seeds nothing.
     pub(crate) collector_topk: Option<Arc<Mutex<TopK>>>,
@@ -68,23 +70,27 @@ pub(crate) struct SegmentSearcher<T: VectorElement> {
 impl<T: VectorElement> SegmentSearcher<T> {
     // --- Construction ---
 
-    /// Opens `field`'s vector reader for one segment.
+    /// Opens `field`'s vector reader for a prepared segment.
     pub(crate) fn for_segment(
-        segment_reader: &SegmentReader,
-        segment_ord: SegmentOrdinal,
+        segment: VectorSegment,
         field: Field,
         query: Arc<VectorQuery<T>>,
         quantized: Option<Arc<QuantizedQueryCtx>>,
         probe_params: ProbeParams,
     ) -> crate::Result<Self> {
+        if segment.scan.is_none() {
+            return Err(TantivyError::InvalidArgument(
+                "vector scan requires a prepared segment".into(),
+            ));
+        }
         Ok(Self {
-            field,
-            reader: segment_reader.vector_index(field)?,
+            reader: segment.reader.vector_index(field)?,
             query,
             quantized,
             probe_params,
-            routing_plan: None,
-            segment_ord,
+            segment,
+            ranked: Vec::new(),
+            routing_metrics: RouterMetrics::Exact { visited_count: 0 },
             collector_topk: None,
             shared_topk_threshold: Arc::new(AtomicSharedThreshold::default()),
             #[cfg(test)]
@@ -106,11 +112,19 @@ impl<T: VectorElement> SegmentSearcher<T> {
         self
     }
 
-    pub(crate) fn with_routing_plan(
+    pub(crate) fn with_candidates(
         mut self,
-        plan: Option<Arc<dyn VectorRoutingPlanProvider>>,
+        ranked: Vec<Candidate>,
+        metrics: Option<RouterMetrics>,
     ) -> Self {
-        self.routing_plan = plan;
+        self.ranked = ranked;
+        self.routing_metrics = metrics.unwrap_or_else(|| {
+            self.reader
+                .index()
+                .map_or(RouterMetrics::Exact { visited_count: 0 }, |index| {
+                    index.opened_router().kind().empty_metrics()
+                })
+        });
         self
     }
 
@@ -122,17 +136,12 @@ impl<T: VectorElement> SegmentSearcher<T> {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn params(&self) -> &ProbeParams {
-        &self.probe_params
-    }
-
     pub(crate) fn reader(&self) -> &VectorIndexReader {
         &self.reader
     }
 
     pub(crate) fn segment_ord(&self) -> SegmentOrdinal {
-        self.segment_ord
+        self.segment.ordinal
     }
 
     // --- Search ---
@@ -145,19 +154,10 @@ impl<T: VectorElement> SegmentSearcher<T> {
     #[cfg(test)]
     pub(crate) fn top_n(
         &self,
-        weight: &dyn Weight,
-        segment_reader: &SegmentReader,
         top_n: usize,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
-        let (searched, totals) = measure(|| {
-            self.top_n_by(
-                weight,
-                segment_reader,
-                top_n,
-                &mut NoTieBreak,
-                NaturalComparator,
-            )
-        });
+        let (searched, totals) =
+            measure(|| self.top_n_by(top_n, &mut NoTieBreak, NaturalComparator));
         let (hits, report) = searched?;
         Ok((
             hits.into_iter()
@@ -174,8 +174,6 @@ impl<T: VectorElement> SegmentSearcher<T> {
     /// Returns an error when segment vector data cannot be opened or scored.
     pub(crate) fn top_n_by<K, CTail>(
         &self,
-        weight: &dyn Weight,
-        segment_reader: &SegmentReader,
         top_n: usize,
         tie_break: &mut K,
         tie_comparator: CTail,
@@ -184,16 +182,15 @@ impl<T: VectorElement> SegmentSearcher<T> {
         K: SegmentSortKeyComputer,
         CTail: Comparator<K::SegmentSortKey>,
     {
-        match self.reader.index() {
-            None => {
+        match self.segment.scan.as_ref().expect("prepared segment") {
+            ScanInput::Flat { filter } => {
                 let (hits, rows_read) =
-                    self.flat_top_n(weight, segment_reader, top_n, tie_break, tie_comparator)?;
+                    self.flat_top_n(filter, top_n, tie_break, tie_comparator)?;
                 Ok((hits, SegmentReport::Flat { rows_read }))
             }
-            Some(index) => self.search_ivf(
-                index,
-                weight,
-                segment_reader,
+            input => self.search_ivf(
+                self.reader.index().expect("IVF input"),
+                input,
                 top_n,
                 tie_break,
                 tie_comparator,
@@ -201,13 +198,11 @@ impl<T: VectorElement> SegmentSearcher<T> {
         }
     }
 
-    /// Searches one IVF segment: plans it, runs the scan over its cluster source, and returns the
-    /// hits with every stage's report.
+    /// Scans one prepared IVF segment and returns its hits and stage reports.
     fn search_ivf<K, C>(
         &self,
         index: &ClusterIndex,
-        weight: &dyn Weight,
-        segment: &SegmentReader,
+        input: &ScanInput,
         top_n: usize,
         tie_break: &mut K,
         tie_comparator: C,
@@ -217,43 +212,12 @@ impl<T: VectorElement> SegmentSearcher<T> {
         C: Comparator<K::SegmentSortKey>,
     {
         let init = enter_vector_stage(VectorStage::ScanInit);
-        let mut plan = SegmentPlan::build(&self.probe_params, index, weight, segment, top_n)?;
-        let routed = self
-            .routing_plan
-            .as_ref()
-            .map(|provider| {
-                let routing = provider.get()?;
-                if routing.field != self.field {
-                    return Err(TantivyError::InvalidArgument(
-                        "routing plan belongs to a different vector field".into(),
-                    ));
-                }
-                plan.apply_global_budget(
-                    &self.probe_params,
-                    segment.max_doc(),
-                    routing.num_clusters,
-                );
-                routing.segments.get(&segment.segment_id()).ok_or_else(|| {
-                    TantivyError::InvalidArgument("segment is missing from the routing plan".into())
-                })
-            })
-            .transpose()?;
-        let capacity = plan.capacity_hint();
-        let SegmentPlan {
-            budget,
-            source,
-            report,
-        } = plan;
-        let Some(source) = source else {
-            drop(init);
-            return Ok((
-                Vec::new(),
-                SegmentReport::Empty {
-                    located_cap: report.located_cap,
-                },
-            ));
+        let capacity = input.capacity_hint();
+        let report = match input {
+            ScanInput::Routed { report, .. } | ScanInput::Located { report, .. } => *report,
+            ScanInput::Flat { .. } => unreachable!(),
         };
-        let adaptive_probing = matches!(&source, Source::Router(_))
+        let adaptive_probing = matches!(input, ScanInput::Routed { .. })
             .then_some(self.probe_params.adaptive_probing)
             .flatten();
         let config = ScanConfig {
@@ -276,35 +240,41 @@ impl<T: VectorElement> SegmentSearcher<T> {
             self.scoring_query(),
             config,
             bound,
-            self.segment_ord,
+            self.segment.ordinal,
             tie_break,
             tie_comparator,
         )?;
         drop(init);
-        let source = match source {
-            Source::Router(filter) => {
-                let route = routed.ok_or_else(|| {
-                    TantivyError::InvalidArgument(
-                        "IVF probing requires a global routing plan".into(),
-                    )
-                })?;
+        let source = match input.clone() {
+            ScanInput::Routed { filter, budget, .. } => {
                 let mut clusters = RouterClusters::from_ranked(
                     &self.reader,
-                    route.ranked_clusters(),
+                    RouterIter::new(
+                        self.ranked
+                            .iter()
+                            .map(|c| Candidate {
+                                sim: c.sim,
+                                node: c.node.into(),
+                            })
+                            .collect(),
+                        self.routing_metrics,
+                    ),
                     budget,
                     filter,
-                    segment,
+                    &self.segment.reader,
                 );
                 scan.run(&mut clusters)?;
                 SourceReport::Router(clusters.finish())
             }
-            Source::FilterMatches(docs) => {
-                let mut clusters = MatchClusters::locate(&self.reader, docs, segment, budget)?;
+            ScanInput::Located { docs, budget, .. } => {
+                let mut clusters =
+                    MatchClusters::locate(&self.reader, docs, &self.segment.reader, budget)?;
                 scan.run(&mut clusters)?;
                 SourceReport::Matches(clusters.finish())
             }
+            ScanInput::Flat { .. } => unreachable!(),
         };
-        let (hits, scan) = scan.finish(self.segment_ord)?;
+        let (hits, scan) = scan.finish(self.segment.ordinal)?;
         Ok((
             hits,
             SegmentReport::Ivf {
@@ -321,8 +291,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
     /// the rows read.
     fn flat_top_n<K, CTail>(
         &self,
-        weight: &dyn Weight,
-        segment_reader: &SegmentReader,
+        filter: &DocFilter,
         top_n: usize,
         tie_break: &mut K,
         tie_comparator: CTail,
@@ -334,44 +303,37 @@ impl<T: VectorElement> SegmentSearcher<T> {
         let init = enter_vector_stage(VectorStage::ScanInit);
         let mut topn =
             TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator));
-        let alive = segment_reader.alive_bitset();
+        let alive = self.segment.reader.alive_bitset();
         let mut rows_read = 0usize;
-        // The `for_each` closure can't return an error; the first one is re-raised after the walk.
-        let mut read_err: Option<TantivyError> = None;
         drop(init);
         let scan = enter_vector_stage(VectorStage::ExactScan);
-        weight.for_each_no_score(segment_reader, &mut |docs| {
-            if read_err.is_some() {
-                return;
-            }
-            // TODO: Batch vector reads by block instead of reopening the block per document.
-            for &doc in docs {
-                if let Some(bs) = alive {
-                    if !bs.is_alive(doc) {
-                        continue;
-                    }
-                }
-                match self.reader.vector_bytes(doc) {
-                    Ok(None) => continue,
-                    Ok(Some(vbytes)) => {
-                        rows_read += 1;
-                        let score = self.query.score_row(&vbytes).score();
-                        if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
-                            topn.push(key, doc);
-                        }
-                    }
-                    Err(err) => {
-                        read_err = Some(err);
-                        return;
-                    }
+        let docs = match filter {
+            DocFilter::All => itertools::Either::Left(0..self.segment.reader.max_doc()),
+            DocFilter::Docs(docs) => itertools::Either::Right(
+                (0..docs.max_value().div_ceil(64)).flat_map(move |bucket| {
+                    docs.tinyset(bucket)
+                        .into_iter()
+                        .map(move |bit| bucket * 64 + bit)
+                }),
+            ),
+        };
+        for doc in docs {
+            if let Some(bs) = alive {
+                if !bs.is_alive(doc) {
+                    continue;
                 }
             }
-        })?;
-        if let Some(err) = read_err {
-            return Err(err);
+            let Some(vbytes) = self.reader.vector_bytes(doc)? else {
+                continue;
+            };
+            rows_read += 1;
+            let score = self.query.score_row(&vbytes).score();
+            if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
+                topn.push(key, doc);
+            }
         }
         drop(scan);
-        let segment_ord = self.segment_ord;
+        let segment_ord = self.segment.ordinal;
         let _assembly = enter_vector_stage(VectorStage::ResultAssembly);
         let hits = topn
             .into_sorted_vec()

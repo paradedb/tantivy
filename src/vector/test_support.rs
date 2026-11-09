@@ -23,20 +23,23 @@ use crate::vector::clustering::{
 };
 use crate::vector::params::ProbeParams;
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::plan::SegmentRoutingPlan;
 use crate::vector::router::RouterMetrics;
+use crate::vector::search::input::PreparedVectorSearch;
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
 use crate::vector::search::scan::bound::TopK;
 use crate::vector::search::scan::plan::PlanOverride;
 use crate::vector::search::scan::ScanTrace;
-use crate::vector::search::segment::plan::SegmentPlan;
+use crate::vector::search::segment::plan::ScanInput;
 use crate::vector::search::SegmentSearcher;
+use crate::vector::stats::SegmentReport;
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::io::test_support::{with_unarmed_log, PagedDirectory};
+use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::tests::TestVectorIndex;
 use crate::vector::{
-    BlockAddress, ProbeStats, RouterKind, VectorQuantizationConfig, VectorQuantizationLayer,
-    VectorRoutingPlan, VectorSimilarityFruit, VectorStage,
+    BlockAddress, ProbeStats, RouterKind, TopClustersBySimilarityCollector,
+    VectorQuantizationConfig, VectorQuantizationLayer, VectorScanInputs, VectorSearchBudget,
+    VectorSegment, VectorSimilarityFruit, VectorStage,
 };
 use crate::{
     DocAddress, DocId, Index, IndexWriter, Score, Searcher, SegmentOrdinal, SegmentReader,
@@ -45,11 +48,14 @@ use crate::{
 
 // --- Segment searcher ---
 
-/// One segment's searcher and the arguments a search passes it.
+/// A segment and its source-test search parameters.
 #[derive(Clone, Copy)]
 pub(crate) struct SegmentRun<'a> {
-    pub(crate) searcher: &'a SegmentSearcher<f32>,
-    pub(crate) routing: Option<&'a crate::vector::router::plan::SegmentRoutingPlan>,
+    pub(crate) field: Field,
+    pub(crate) ordinal: SegmentOrdinal,
+    pub(crate) reader: &'a VectorIndexReader,
+    pub(crate) params: &'a ProbeParams,
+    pub(crate) routing: Option<&'a TestRouting>,
     pub(crate) index: &'a ClusterIndex,
     pub(crate) weight: &'a dyn Weight,
     pub(crate) segment: &'a SegmentReader,
@@ -57,14 +63,36 @@ pub(crate) struct SegmentRun<'a> {
 }
 
 impl SegmentRun<'_> {
-    /// The segment's search plan.
-    pub(crate) fn plan(&self) -> crate::Result<SegmentPlan> {
-        SegmentPlan::build(
-            self.searcher.params(),
-            self.index,
-            self.weight,
-            self.segment,
+    pub(crate) fn input(&self) -> crate::Result<Option<ScanInput>> {
+        let segments = [VectorSegment::from((self.ordinal, self.segment))];
+        let budget = VectorSearchBudget::for_segments(self.field, self.params, &segments)?;
+        let prepared = PreparedVectorSearch::prepare(
+            self.field,
             self.top_n,
+            self.params,
+            self.weight,
+            &segments,
+            budget,
+            |_| {},
+        )?;
+        Ok(prepared.segments.into_iter().next().and_then(|s| s.scan))
+    }
+}
+
+impl<T: crate::vector::VectorElement> SegmentSearcher<T> {
+    pub(crate) fn with_test_candidates(self, inputs: &VectorScanInputs) -> Self {
+        let ordinal = self.segment_ord();
+        self.with_candidates(
+            inputs
+                .candidates
+                .iter()
+                .filter(|c| c.node.0 == ordinal)
+                .map(|c| Candidate {
+                    sim: c.sim,
+                    node: c.node.1,
+                })
+                .collect(),
+            inputs.routing_stats.get(&ordinal).map(|s| s.metrics),
         )
     }
 }
@@ -415,29 +443,24 @@ impl From<TestVectorIndex> for Fixture {
 
 // --- Running ---
 
-pub(crate) fn routing_plan_for_clusters(
-    field: Field,
-    segment: &SegmentReader,
+pub(crate) struct TestRouting {
     clusters: Vec<Candidate>,
-) -> Arc<VectorRoutingPlan> {
-    Arc::new(VectorRoutingPlan {
-        field,
-        num_clusters: segment
-            .vector_index(field)
-            .unwrap()
-            .index()
-            .unwrap()
-            .num_clusters(),
-        segments: [(
-            segment.segment_id(),
-            SegmentRoutingPlan {
-                clusters,
-                metrics: RouterMetrics::Exact { visited_count: 0 },
-                totals: Default::default(),
-            },
-        )]
-        .into(),
-    })
+    metrics: RouterMetrics,
+}
+
+impl TestRouting {
+    pub(crate) fn ranked_clusters(&self) -> crate::vector::router::RouterIter {
+        crate::vector::router::RouterIter::new(
+            self.clusters
+                .iter()
+                .map(|c| Candidate {
+                    sim: c.sim,
+                    node: c.node.into(),
+                })
+                .collect(),
+            self.metrics,
+        )
+    }
 }
 
 impl Fixture {
@@ -478,8 +501,9 @@ impl Fixture {
         if let Some(slot) = slot {
             builder = builder.with_shared_threshold(slot);
         }
-        let collector = builder.build();
-        self.index.reader()?.searcher().search(filter, &collector)
+        let searcher = self.index.reader()?.searcher();
+        let collector = builder.build_for_searcher(&searcher, filter)?;
+        searcher.search(filter, &collector)
     }
 
     /// Searches, probing `clusters` in that order instead of the router's ranking.
@@ -492,17 +516,29 @@ impl Fixture {
         params: ProbeParams,
     ) -> crate::Result<VectorSimilarityFruit> {
         let searcher = self.index.reader()?.searcher();
-        let plan = routing_plan_for_clusters(
-            self.field,
-            first_segment(&searcher).1,
-            self.candidates(clusters, query)?,
-        );
-        let collector = TopDocs::with_limit(k)
+        let (ordinal, segment) = first_segment(&searcher);
+        let segments = [VectorSegment::from((ordinal, segment))];
+        let budget = VectorSearchBudget::for_segments(self.field, &params, &segments)?;
+        let builder = TopDocs::with_limit(k)
             .order_by_similarity(self.field, query.to_vec())
-            .with_probe_params(params)
-            .with_routing_plan(plan)
-            .build();
-        searcher.search(filter, &collector)
+            .with_probe_params(params);
+        let weight = self.weight(filter)?;
+        let prepared = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
+        let candidates = self
+            .candidates(clusters, query)?
+            .into_iter()
+            .map(|c| Candidate {
+                sim: c.sim,
+                node: (ordinal, c.node),
+            })
+            .collect();
+        let collector = builder.build(prepared.with_candidates(candidates)?);
+        use crate::collector::Collector;
+        collector.merge_fruits(vec![collector.collect_segment(
+            weight.as_ref(),
+            ordinal,
+            segment,
+        )?])
     }
 
     /// Router candidates for `clusters`, keyed by the exact centroid similarity.
@@ -528,30 +564,41 @@ impl Fixture {
             .collect())
     }
 
-    fn routing_plan(
+    fn scan_inputs(
         &self,
-        segment: &SegmentReader,
+        segment: VectorSegment,
         weight: &dyn Weight,
         query: &[f32],
         top_n: usize,
         params: &ProbeParams,
-    ) -> crate::Result<Option<Arc<crate::vector::VectorRoutingPlan>>> {
-        let vectors = segment.vector_index(self.field)?;
-        let Some(index) = vectors.index() else {
-            return Ok(None);
-        };
-        let plan = SegmentPlan::build(params, index, weight, segment, top_n)?;
-        let Some(crate::vector::search::segment::plan::Source::Router(filter)) = plan.source else {
-            return Ok(None);
-        };
-        Ok(Some(Arc::new(crate::vector::VectorRoutingPlan::build(
+        candidates: Option<Vec<Candidate>>,
+    ) -> crate::Result<VectorScanInputs> {
+        let builder =
+            crate::vector::TopDocsByVectorSimilarityBuilder::new(self.field, query.to_vec(), top_n)
+                .with_probe_params(params.clone());
+        let budget =
+            VectorSearchBudget::for_segments(self.field, params, std::slice::from_ref(&segment))?;
+        let prepared = builder.prepare(weight, std::slice::from_ref(&segment), budget, |_| {})?;
+        let router = TopClustersBySimilarityCollector::new(
             self.field,
             query.to_vec(),
             params.clone(),
-            filter.match_fraction(segment.max_doc()),
-            &[crate::vector::VectorSegment::from((0, segment))],
-            |_| {},
-        )?)))
+            prepared.match_fraction(),
+        )?
+        .with_budget(prepared.budget());
+        let candidates = match candidates {
+            Some(candidates) => candidates
+                .into_iter()
+                .map(|c| Candidate {
+                    sim: c.sim,
+                    node: (segment.ordinal, c.node),
+                })
+                .collect(),
+            None => router.collect_segments(&prepared.routing_segments(), |_| {})?,
+        };
+        Ok(prepared
+            .with_candidates(candidates)?
+            .with_routing_statistics(router.take_statistics()))
     }
 
     /// Runs one segment's search directly, with any `top_n`, under `weight`.
@@ -565,17 +612,30 @@ impl Fixture {
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = self.index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[segment];
-        let routing = self.routing_plan(segment_reader, weight, query, top_n, &params)?;
+        let inputs = self.scan_inputs(
+            VectorSegment::from((segment as u32, segment_reader)),
+            weight,
+            query,
+            top_n,
+            &params,
+            None,
+        )?;
+        let Some(prepared) = inputs.segments().first() else {
+            let (_, cap, totals) = &inputs.prepared.scope[&(segment as u32)];
+            return Ok((
+                Vec::new(),
+                ProbeStats::new(SegmentReport::Empty { located_cap: *cap }, totals.clone()),
+            ));
+        };
         let backend = SegmentSearcher::<f32>::for_segment(
-            segment_reader,
-            segment as u32,
+            prepared.clone(),
             self.field,
             Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec()))),
             None,
             params,
         )?
-        .with_routing_plan(routing.map(|p| p as Arc<_>));
-        backend.top_n(weight, segment_reader, top_n)
+        .with_test_candidates(&inputs);
+        backend.top_n(top_n)
     }
 
     /// Searches segment `segment` directly with the quantized query a collector prepares, every
@@ -615,13 +675,24 @@ impl Fixture {
         plan: Option<PlanOverride>,
         admission_pruning: bool,
         collector_topk: Option<Arc<Mutex<TopK>>>,
-        routing: Option<Arc<VectorRoutingPlan>>,
+        routing: Option<Vec<Candidate>>,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = self.index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[segment];
-        let routing = match routing {
-            Some(plan) => Some(plan),
-            None => self.routing_plan(segment_reader, weight, query, top_n, &params)?,
+        let inputs = self.scan_inputs(
+            VectorSegment::from((segment as u32, segment_reader)),
+            weight,
+            query,
+            top_n,
+            &params,
+            routing,
+        )?;
+        let Some(prepared) = inputs.segments().first() else {
+            let (_, cap, totals) = &inputs.prepared.scope[&(segment as u32)];
+            return Ok((
+                Vec::new(),
+                ProbeStats::new(SegmentReport::Empty { located_cap: *cap }, totals.clone()),
+            ));
         };
         let query = Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec())));
         let quantized = segment_reader
@@ -636,22 +707,20 @@ impl Fixture {
                 ))
             });
         let mut backend = SegmentSearcher::<f32>::for_segment(
-            segment_reader,
-            segment as u32,
+            prepared.clone(),
             self.field,
             query,
             quantized,
             params,
         )?
-        .with_routing_plan(routing.map(|p| p as Arc<_>));
+        .with_test_candidates(&inputs);
         backend.plan_override = plan;
         backend.admission_pruning_disabled = !admission_pruning;
         backend.collector_topk = collector_topk;
-        backend.top_n(weight, segment_reader, top_n)
+        backend.top_n(top_n)
     }
 
-    /// Runs `run` over the first segment's full-precision searcher for `query` and `params`, with
-    /// the search arguments `filter` and `top_n`.
+    /// Runs `run` over the first segment's prepared source for the supplied search arguments.
     pub(crate) fn with_segment<R>(
         &self,
         filter: &dyn Query,
@@ -665,19 +734,31 @@ impl Fixture {
         let reader = segment.vector_index(self.field)?;
         let index = reader.index().expect("IVF segment");
         let weight = filter.weight(EnableScoring::disabled_from_searcher(&searcher))?;
-        let routing = self.routing_plan(segment, weight.as_ref(), query, top_n, params)?;
-        let backend = SegmentSearcher::<f32>::for_segment(
-            segment,
-            ordinal,
-            self.field,
-            Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec()))),
+        let inputs = self.scan_inputs(
+            VectorSegment::from((ordinal, segment)),
+            weight.as_ref(),
+            query,
+            top_n,
+            params,
             None,
-            params.clone(),
-        )?
-        .with_routing_plan(routing.clone().map(|p| p as Arc<_>));
+        )?;
+        let routing = inputs.routing_stats.get(&ordinal).map(|stats| TestRouting {
+            clusters: inputs
+                .candidates
+                .iter()
+                .map(|c| Candidate {
+                    sim: c.sim,
+                    node: c.node.1,
+                })
+                .collect(),
+            metrics: stats.metrics,
+        });
         run(&SegmentRun {
-            routing: routing.as_ref().map(|p| &p.segments[&segment.segment_id()]),
-            searcher: &backend,
+            routing: routing.as_ref(),
+            field: self.field,
+            ordinal,
+            reader: &reader,
+            params,
             index,
             weight: weight.as_ref(),
             segment,

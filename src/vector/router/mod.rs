@@ -20,9 +20,9 @@ use crate::TantivyError;
 
 pub(crate) mod arena;
 pub(crate) mod candidate;
+pub(crate) mod collector;
 mod exact;
 pub(crate) mod global;
-pub(crate) mod plan;
 mod quantized;
 mod scoring;
 mod search;
@@ -46,6 +46,15 @@ pub enum RouterKind {
 }
 
 impl RouterKind {
+    pub(crate) fn empty_metrics(self) -> RouterMetrics {
+        match self {
+            Self::Exact => RouterMetrics::Exact { visited_count: 0 },
+            Self::Stacked | Self::QuantizedStacked => {
+                stacked::routing_metrics(self == Self::QuantizedStacked, 0, Default::default())
+            }
+        }
+    }
+
     /// The kind persisted as `code`. A code this library doesn't build is an incompatible index
     /// (rebuild required), not corruption.
     pub(crate) fn from_code(code: u8) -> crate::Result<Self> {

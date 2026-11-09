@@ -349,10 +349,10 @@ impl TopDocs {
     /// inferred from the `query` argument; it must match the schema's
     /// declared dtype.
     ///
-    /// The driving query (passed to `searcher.search`) decides which docs
-    /// are candidates. For brute-force scan over every doc, pair this with
-    /// [`AllQuery`](crate::query::AllQuery); pair with a filter query to
-    /// restrict candidates.
+    /// Prepare the filter and cluster candidates before building the collector, or use
+    /// [`TopDocsByVectorSimilarityBuilder::build_for_searcher`] to perform both stages.
+    /// The resulting collector is bound to that filter and segment snapshot; the driving
+    /// query passed to `searcher.search` must be the same filter.
     pub fn order_by_similarity<T>(
         self,
         field: Field,
