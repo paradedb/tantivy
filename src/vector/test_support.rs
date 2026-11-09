@@ -768,6 +768,8 @@ impl Fixture {
         if vectors.has_exact_rows() && !all_docs.is_empty() {
             all_docs.sort_unstable();
             let mut scratch = ReadScratch::default();
+            vectors.flat_rows()?;
+            self.clear_reads();
             vectors.read_exact_docs(&all_docs, &mut scratch)?;
             let reads: Vec<_> = self
                 .reads()

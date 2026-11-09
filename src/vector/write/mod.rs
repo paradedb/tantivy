@@ -117,7 +117,7 @@ fn for_each_row(
     reader: &VectorIndexReader,
     mut f: impl FnMut(usize, usize, DocId) -> crate::Result<()>,
 ) -> crate::Result<()> {
-    if let Some(flat) = reader.flat_rows() {
+    if let Some(flat) = reader.flat_rows()? {
         for row in 0..flat.num_rows() as u32 {
             let address = flat.address(row);
             f(

@@ -156,6 +156,7 @@ fn vector_read_kinds_follow_data_for_dense_and_sparse_access() -> crate::Result<
     let layers = vectors.quantization()?.unwrap().layers();
     let mut docs = Vec::new();
     vectors.read_doc_ids(2, &mut docs)?;
+    vectors.flat_rows()?;
     directory.read_kinds.lock().unwrap().clear();
 
     let mut scratch = crate::vector::storage::quantized::ReadScratch::default();
@@ -827,6 +828,7 @@ fn merge_source_addresses_case(schedule: &[u8]) -> crate::Result<()> {
         ignore_store: false,
         cancel: &|| false,
     };
+    vectors.flat_rows()?;
     directory.reads.lock().unwrap().clear();
     let rows = crate::vector::write::merge_source_rows(&context, &[Arc::clone(&vectors)])?;
     let reads = directory.reads.lock().unwrap().clone();
