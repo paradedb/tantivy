@@ -524,7 +524,7 @@ impl Fixture {
             .with_probe_params(params);
         let weight = self.weight(filter)?;
         let prepared = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
-        let candidates = self
+        let candidates: Vec<_> = self
             .candidates(clusters, query)?
             .into_iter()
             .map(|c| Candidate {
@@ -532,7 +532,12 @@ impl Fixture {
                 node: (ordinal, c.node),
             })
             .collect();
-        let collector = builder.build(prepared.with_candidates(candidates)?);
+        let routing_budget = budget.allocate_routing(
+            &candidates,
+            prepared.match_fraction(),
+            prepared.located_budget(),
+        )?;
+        let collector = builder.build(prepared.with_candidates(candidates, &routing_budget)?);
         use crate::collector::Collector;
         collector.merge_fruits(vec![collector.collect_segment(
             weight.as_ref(),
@@ -586,7 +591,7 @@ impl Fixture {
             prepared.match_fraction(),
         )?
         .with_budget(prepared.budget());
-        let candidates = match candidates {
+        let candidates: Vec<_> = match candidates {
             Some(candidates) => candidates
                 .into_iter()
                 .map(|c| Candidate {
@@ -596,8 +601,13 @@ impl Fixture {
                 .collect(),
             None => router.collect_segments(&prepared.routing_segments(), |_| {})?,
         };
+        let routing_budget = budget.allocate_routing(
+            &candidates,
+            prepared.match_fraction(),
+            prepared.located_budget(),
+        )?;
         Ok(prepared
-            .with_candidates(candidates)?
+            .with_candidates(candidates, &routing_budget)?
             .with_routing_statistics(router.take_statistics()))
     }
 

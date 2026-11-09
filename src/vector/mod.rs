@@ -65,7 +65,10 @@
 //!     embedding, query, params, prepared.match_fraction(),
 //! )?.with_budget(prepared.budget());
 //! let candidates = router.collect_segments(&prepared.routing_segments(), |_| {})?;
-//! let inputs = prepared.with_candidates(candidates)?
+//! let routing_budget = budget.allocate_routing(
+//!     &candidates, prepared.match_fraction(), prepared.located_budget(),
+//! )?;
+//! let inputs = prepared.with_candidates(candidates, &routing_budget)?
 //!     .with_routing_statistics(router.take_statistics());
 //! let collector = builder.build(inputs);
 //! let hits = collector.merge_fruits(
@@ -79,8 +82,11 @@
 //! Parallel callers resolve a [`VectorSearchBudget`] over the complete snapshot, call
 //! [`VectorSearchBudget::distributed`], and pass it to each worker's
 //! [`TopDocsByVectorSimilarityBuilder::prepare`]. Workers retain their prepared
-//! filters while the coordinator ranks eligible segments. Distribute the resulting
-//! `Vec<Candidate<ClusterRef>>` by the original segment ordinals, then attach each assignment
+//! filters while the coordinator ranks eligible segments. The coordinator sums workers'
+//! [`PreparedVectorSearch::located_budget`] reservations and calls
+//! [`VectorSearchBudget::allocate_routing`] on the full ranking with the router's selectivity
+//! estimate. Distribute the resulting `Vec<Candidate<ClusterRef>>` by original segment ordinal
+//! along with the serializable [`VectorRoutingBudget`], then attach each assignment
 //! with [`PreparedVectorSearch::with_candidates`]. Located and flat inputs need no candidates;
 //! segments with no work are omitted. Routing telemetry can be transferred separately.
 
@@ -121,7 +127,8 @@ pub use router::candidate::Candidate;
 pub use router::collector::{TopClustersBySimilarityCollector, VectorRoutingStats};
 pub use router::{RouterKind, RouterMetrics};
 pub use search::input::{
-    ClusterRef, PreparedVectorSearch, VectorScanInputs, VectorSearchBudget, VectorSegment,
+    ClusterRef, PreparedVectorSearch, VectorRoutingBudget, VectorScanInputs, VectorSearchBudget,
+    VectorSegment,
 };
 pub use search::source::controller::ProbeTermination;
 pub use stats::ProbeStats;

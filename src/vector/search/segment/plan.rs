@@ -59,7 +59,7 @@ impl ScanInput {
 }
 
 /// The most matches, deleted ones included, a filter may have and take the located path; `Auto`
-/// prices the work budget `(budget, n_avg, x)` the routed path runs against.
+/// prices the segment's size share of the global work budget `(budget, n_avg, x)`.
 pub(crate) fn located_cap(
     located: LocatedPath,
     max_doc: DocId,

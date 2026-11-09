@@ -1862,7 +1862,7 @@ fn ann_reads_offsets_only_for_probed_clusters() -> crate::Result<()> {
             let budget =
                 crate::vector::VectorSearchBudget::for_segments(fixture.field, &params, &segments)?;
             let prepared = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
-            let candidates = fixture
+            let candidates: Vec<_> = fixture
                 .candidates(&[17], &query)?
                 .into_iter()
                 .map(|c| crate::vector::Candidate {
@@ -1870,7 +1870,12 @@ fn ann_reads_offsets_only_for_probed_clusters() -> crate::Result<()> {
                     node: (ordinal, c.node),
                 })
                 .collect();
-            let collector = builder.build(prepared.with_candidates(candidates)?);
+            let routing_budget = budget.allocate_routing(
+                &candidates,
+                prepared.match_fraction(),
+                prepared.located_budget(),
+            )?;
+            let collector = builder.build(prepared.with_candidates(candidates, &routing_budget)?);
             fixture.clear_reads();
             let fruit = searcher.search(filter, &collector)?;
             assert!(!fruit.results.is_empty());

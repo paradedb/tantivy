@@ -212,8 +212,13 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
         )?
         .with_budget(prepared.budget());
         let candidates = router.collect_segments(&prepared.routing_segments(), &mut on_segment)?;
+        let routing_budget = budget.allocate_routing(
+            &candidates,
+            prepared.match_fraction(),
+            prepared.located_budget(),
+        )?;
         let inputs = prepared
-            .with_candidates(candidates)?
+            .with_candidates(candidates, &routing_budget)?
             .with_routing_statistics(router.take_statistics());
         Ok(self.build(inputs))
     }
@@ -1120,9 +1125,14 @@ mod ivf_e2e_tests {
         )?
         .with_budget(budget);
         let candidates = router.collect_segments(&prepared.routing_segments(), |_| {})?;
+        let routing_budget = budget.allocate_routing(
+            &candidates,
+            prepared.match_fraction(),
+            prepared.located_budget(),
+        )?;
         Ok(builder.build(
             prepared
-                .with_candidates(candidates)?
+                .with_candidates(candidates, &routing_budget)?
                 .with_routing_statistics(router.take_statistics()),
         ))
     }
@@ -1561,6 +1571,153 @@ mod ivf_e2e_tests {
     }
 
     #[test]
+    fn partitioned_parallel_search_preserves_serial_recall_and_work() -> Result<()> {
+        let fixtures = (0..8)
+            .map(|partition| {
+                let centroids: Vec<_> = (0..8)
+                    .map(|cluster| {
+                        let mut vector = vec![0.0; 32];
+                        vector[0] = (partition * 100 + cluster) as f32;
+                        vector
+                    })
+                    .collect();
+                let vectors = (0..256)
+                    .map(|row| {
+                        let mut vector = centroids[row % 8].clone();
+                        vector[1] = row as f32 * 0.0001;
+                        vector
+                    })
+                    .collect();
+                FixtureSpec::ivf(Metric::L2, centroids, vectors)
+                    .label("half", |row| (row / 8) % 2 == 0)
+                    .build()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let searchers = fixtures
+            .iter()
+            .map(|fixture| fixture.index.reader().map(|reader| reader.searcher()))
+            .collect::<Result<Vec<_>>>()?;
+        let segments: Vec<_> = searchers
+            .iter()
+            .enumerate()
+            .map(|(ordinal, searcher)| {
+                VectorSegment::from((ordinal as u32, searcher.segment_reader(0)))
+            })
+            .collect();
+        let fixture = &fixtures[0];
+        let mut query = vec![0.0f32; 32];
+        query[0] = 1.5;
+        let params = ProbeParams {
+            max_probe: 4,
+            located: LocatedPath::Off,
+            ..Default::default()
+        };
+        for (filter, fraction) in [
+            (&AllQuery as &dyn Query, 1.0),
+            (&fixture.filter("half"), 0.5),
+        ] {
+            let weight = fixture.weight(filter)?;
+            let builder = || {
+                TopDocs::with_limit(10)
+                    .order_by_similarity(fixture.field, query.clone())
+                    .with_probe_params(params.clone())
+            };
+            let serial = builder().build_for_segments(weight.as_ref(), &segments, |_| {})?;
+            let serial = serial.merge_fruits(serial.collect_segments(
+                weight.as_ref(),
+                &segments,
+                |_| {},
+            )?)?;
+            let budget =
+                VectorSearchBudget::for_segments(fixture.field, &params, &segments)?.distributed();
+            let worker_builder = || {
+                TopDocs::with_limit(10)
+                    .order_by_similarity(fixture.field, query.clone())
+                    .with_probe_params(ProbeParams {
+                        max_probe: 1,
+                        ..params.clone()
+                    })
+            };
+            let prepared = segments
+                .iter()
+                .map(|segment| {
+                    worker_builder().prepare(
+                        weight.as_ref(),
+                        std::slice::from_ref(segment),
+                        budget,
+                        |_| {},
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let routed: Vec<_> = prepared.iter().flat_map(|p| p.routing_segments()).collect();
+            let router = TopClustersBySimilarityCollector::new(
+                fixture.field,
+                query.clone(),
+                params.clone(),
+                fraction,
+            )?
+            .with_budget(budget);
+            let candidates = router.collect_segments(&routed, |_| {})?;
+            let routing_budget = budget.allocate_routing(
+                &candidates,
+                fraction,
+                prepared.iter().map(|p| p.located_budget()).sum(),
+            )?;
+            let fruits = std::thread::scope(|scope| {
+                segments
+                    .iter()
+                    .zip(prepared)
+                    .map(|(segment, prepared)| {
+                        let inputs = prepared.with_candidates(
+                            candidates
+                                .iter()
+                                .filter(|c| c.node.0 == segment.ordinal)
+                                .copied()
+                                .collect(),
+                            &routing_budget,
+                        )?;
+                        let collector = worker_builder().build(inputs);
+                        let weight = &weight;
+                        Ok(scope.spawn(move || {
+                            collector.collect_segment(
+                                weight.as_ref(),
+                                segment.ordinal,
+                                &segment.reader,
+                            )
+                        }))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .map(|thread| thread.join().unwrap())
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            let parallel = builder()
+                .build_for_segments(weight.as_ref(), &[], |_| {})?
+                .merge_fruits(fruits)?;
+            let expected = fixture.oracle(filter, &query, 10)?;
+            let recall = |fruit: &VectorSimilarityFruit| {
+                fruit
+                    .results
+                    .iter()
+                    .filter(|(_, doc)| expected.iter().any(|(_, wanted)| wanted == doc))
+                    .count() as f64
+                    / 10.0
+            };
+            assert_eq!(recall(&serial), 1.0);
+            assert_eq!(recall(&parallel), recall(&serial));
+            let work = |fruit: &VectorSimilarityFruit| {
+                fruit.stats.iter().map(|s| s.work_charged).sum::<f32>()
+            };
+            assert!((work(&parallel) - work(&serial)).abs() < 1e-5);
+            assert_eq!(parallel.stats[0].work_budget, 4.0);
+            assert!(parallel.stats[1..]
+                .iter()
+                .all(|s| s.work_budget == 0.0 && s.work_charged == 0.0));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn routing_candidates_preserves_results_across_parallel_segments() -> Result<()> {
         for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
             let fixture = FixtureSpec::clustered(metric, 64, 8, 384)
@@ -1620,6 +1777,14 @@ mod ivf_e2e_tests {
                     let bytes = serde_json::to_vec(&candidates).unwrap();
                     let candidates: Vec<Candidate<ClusterRef>> =
                         serde_json::from_slice(&bytes).unwrap();
+                    let routing_budget = budget.allocate_routing(
+                        &candidates,
+                        0.0,
+                        prepared.iter().map(|p| p.located_budget()).sum(),
+                    )?;
+                    let bytes = serde_json::to_vec(&routing_budget).unwrap();
+                    let routing_budget: crate::vector::VectorRoutingBudget =
+                        serde_json::from_slice(&bytes).unwrap();
                     let threshold: SharedThresholdArc<Score> =
                         Arc::new(AtomicSharedThreshold::default());
                     let fruits = std::thread::scope(|scope| {
@@ -1636,6 +1801,7 @@ mod ivf_e2e_tests {
                                             .filter(|c| c.node.0 == ord)
                                             .copied()
                                             .collect(),
+                                        &routing_budget,
                                     )
                                     .unwrap();
                                 let collector = builder()
@@ -1721,9 +1887,11 @@ mod ivf_e2e_tests {
         let budget =
             VectorSearchBudget::for_segments(fixture.field, &params, &readers)?.distributed();
         let prepared = builder().prepare(weight.as_ref(), &readers, budget, |_| {})?;
+        let routing_budget =
+            budget.allocate_routing(&candidates, 0.0, prepared.located_budget())?;
         let collector = builder().build(
             prepared
-                .with_candidates(candidates)?
+                .with_candidates(candidates, &routing_budget)?
                 .with_routing_statistics(statistics),
         );
         let fruit = collector.merge_fruits(collector.collect_segments(
@@ -1948,9 +2116,14 @@ mod ivf_e2e_tests {
         )?
         .with_budget(prepared.budget());
         let candidates = router.collect_segments(&prepared.routing_segments(), |_| {})?;
+        let routing_budget = budget.allocate_routing(
+            &candidates,
+            prepared.match_fraction(),
+            prepared.located_budget(),
+        )?;
         let collector = builder().build(
             prepared
-                .with_candidates(candidates)?
+                .with_candidates(candidates, &routing_budget)?
                 .with_routing_statistics(router.take_statistics()),
         );
         let ready = builder().build_for_segments(&filter.weight, &segments, |_| {})?;
@@ -2011,7 +2184,9 @@ mod ivf_e2e_tests {
         candidates.truncate(3);
         assert_eq!(candidates.len(), 3);
         assert!(candidates.iter().all(|c| c.node.0 == 1));
-        let inputs = prepared.with_candidates(candidates.clone())?;
+        let routing_budget =
+            budget.allocate_routing(&candidates, 1.0, prepared.located_budget())?;
+        let inputs = prepared.with_candidates(candidates.clone(), &routing_budget)?;
         assert_eq!(inputs.segments().len(), 1);
         assert_eq!(inputs.segments()[0].ordinal, 1);
         let collector = builder().build(inputs.with_routing_statistics(router.take_statistics()));
@@ -2027,11 +2202,11 @@ mod ivf_e2e_tests {
             .all(|(_, address)| address.segment_ord == 1));
         assert_eq!(fruit.stats[0].candidates_scored, 0);
         assert_eq!(fruit.stats[0].work_budget, 0.0);
-        assert_eq!(fruit.stats[1].work_budget, 1.5);
+        assert_eq!(fruit.stats[1].work_budget, 3.0);
         assert!(fruit.stats.iter().map(|s| s.work_charged).sum::<f32>() < 4.1);
         let budget = VectorSearchBudget::for_segments(near.field, &params, &readers)?;
         let prepared = builder().prepare(weight.as_ref(), &readers, budget, |_| {})?;
-        let inputs = prepared.with_candidates(candidates)?;
+        let inputs = prepared.with_candidates(candidates, &routing_budget)?;
         let collect = |segments: &[VectorSegment]| -> Result<_> {
             let collector = builder().build(inputs.clone());
             collector.merge_fruits(collector.collect_segments(weight.as_ref(), segments, |_| {})?)
