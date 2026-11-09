@@ -214,7 +214,7 @@ fn adaptive_stopping_preserves_router_work_and_path_selection() -> crate::Result
             &fixture.filter("few"),
             &fixture.filter("some"),
         ] {
-            for max_probe in [0.064, 1.28, 6.4, 16.0, 64.0] {
+            for max_probe in [1, 2, 7, 16, 64] {
                 let params = ProbeParams {
                     max_probe,
                     ..Default::default()
@@ -879,7 +879,7 @@ fn adaptive_probe_finds_nn_outside_nearest_cluster() -> crate::Result<()> {
         "the trap doc is the true nearest"
     );
     let one_cluster = ProbeParams {
-        max_probe: 1.0,
+        max_probe: 1,
         min_probe_clusters: 1,
         ..Default::default()
     };
@@ -910,7 +910,7 @@ fn routes_home_below_ceiling() -> crate::Result<()> {
         .collect();
     let fixture = FixtureSpec::ivf(Metric::L2, centroids.clone(), vectors).build()?;
     let params = ProbeParams {
-        max_probe: 1.6,
+        max_probe: 2,
         ..Default::default()
     };
     for centroid in centroids.iter().step_by(3) {
@@ -1073,7 +1073,7 @@ fn reads_fixture(metric: Metric, schedule: &[u8], deletes: &[usize]) -> crate::R
 /// cluster scored exactly before the exact phase.
 fn every_cluster() -> ProbeParams {
     ProbeParams {
-        max_probe: f64::MAX,
+        max_probe: usize::MAX,
         min_probe_clusters: 4,
         exact_plan: false,
         located: LocatedPath::Off,
@@ -1704,11 +1704,12 @@ fn located_path_charges_the_work_meter() -> crate::Result<()> {
         Box::new(fixture.filter("d242")),
         Box::new(fixture.filter("d1101")),
     ]);
-    // Far below one cluster's work: the routed path would stop after its first cluster.
+    // Opening three clusters exceeds one work unit at this open cost.
     let params = ProbeParams {
         located: LocatedPath::MaxSelectivity(Selectivity::new(1.0).unwrap()),
-        max_probe: 1e-6,
+        max_probe: 1,
         min_probe_clusters: 0,
+        fixed_probe_cost_rows: 1000.0,
         ..Default::default()
     };
     let weight = fixture.weight(&filter)?;

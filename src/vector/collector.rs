@@ -1165,7 +1165,7 @@ mod ivf_e2e_tests {
                 .order_by_similarity(fixture.field, query.clone())
                 .with_max_scan_levels(max_scan_levels)
                 .with_probe_params(ProbeParams {
-                    max_probe: 0.0005,
+                    max_probe: 1,
                     min_probe_clusters: 0,
                     exact_plan: false,
                     located: LocatedPath::Off,
@@ -1439,7 +1439,7 @@ mod ivf_e2e_tests {
         let mut query = vec![0.0; 32];
         query[5] = 1.0;
         let params = ProbeParams {
-            max_probe: 0.001,
+            max_probe: 1,
             min_probe_clusters: 3,
             ..Default::default()
         };
@@ -1578,7 +1578,7 @@ mod ivf_e2e_tests {
         let mut query = vec![0.0; 64];
         query[2] = 1.0;
         let params = ProbeParams {
-            max_probe: 3.0,
+            max_probe: 3,
             located: LocatedPath::Off,
             exact_plan: false,
             ..Default::default()
@@ -1647,7 +1647,7 @@ mod ivf_e2e_tests {
             .collect::<Vec<_>>();
         let field = fixtures[0].field;
         let weight = fixtures[0].all()?;
-        for max_probe in [3.0, 8.0, 100.0] {
+        for max_probe in [3, 8, 100] {
             let params = ProbeParams {
                 max_probe,
                 located: LocatedPath::Off,
@@ -1671,7 +1671,7 @@ mod ivf_e2e_tests {
                 &segments,
                 |_| {},
             )?)?;
-            let total = max_probe.min(28.0);
+            let total = max_probe.min(28) as f64;
             assert!(
                 (fruit
                     .stats
@@ -1826,7 +1826,7 @@ mod ivf_e2e_tests {
         let mut query = vec![0.0; 32];
         query[3] = 1.0;
         let params = ProbeParams {
-            max_probe: 0.0001,
+            max_probe: 1,
             min_probe_clusters: 3,
             ..Default::default()
         };
@@ -1888,7 +1888,7 @@ mod ivf_e2e_tests {
             TopDocs::with_limit(10)
                 .order_by_similarity(fixture.field, query.clone())
                 .with_probe_params(ProbeParams {
-                    max_probe: 0.0005,
+                    max_probe: 1,
                     min_probe_clusters: 16,
                     ..Default::default()
                 })
@@ -1963,7 +1963,7 @@ mod ivf_e2e_tests {
                     adaptive_probing: adaptive.then_some(crate::vector::AdaptiveProbeParams {
                         admission_fraction: 1e-20,
                     }),
-                    max_probe: 8.0,
+                    max_probe: 8,
                     located: LocatedPath::Off,
                     ..Default::default()
                 })

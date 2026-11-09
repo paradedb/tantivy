@@ -144,8 +144,8 @@ impl SegmentPlan {
         }
         let global_budget = params
             .max_probe
-            .max(params.min_probe_clusters as f64)
-            .min(global_clusters as f64);
+            .max(params.min_probe_clusters)
+            .min(global_clusters) as f64;
         self.budget.total = WorkUnits::new(
             global_budget * self.report.segment_clusters as f64 / global_clusters.max(1) as f64,
         );
@@ -402,7 +402,7 @@ mod tests {
         // routes, and a filter matching nothing still reports the cap.
         let ivf_docs = ivf.num_docs();
         let auto = ProbeParams {
-            max_probe: 1.8,
+            max_probe: 2,
             min_probe_clusters: 1,
             located: LocatedPath::Auto,
             ..ProbeParams::default()

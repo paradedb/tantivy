@@ -615,7 +615,7 @@ mod tests {
                     .build()?;
                 let query: Vec<_> = (0..64).map(|i| (i as f32 * 0.31).cos()).collect();
                 let params = ProbeParams {
-                    max_probe: f64::MAX,
+                    max_probe: usize::MAX,
                     router_aps: false,
                     located: LocatedPath::Off,
                     ..Default::default()

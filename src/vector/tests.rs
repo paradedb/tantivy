@@ -727,7 +727,7 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
 /// oracle-equality tests, where every cluster must be probed.
 pub(crate) fn exhaustive_params(_num_centroids: usize) -> ProbeParams {
     ProbeParams {
-        max_probe: f64::MAX,
+        max_probe: usize::MAX,
         min_probe_clusters: 1,
         ..Default::default()
     }
