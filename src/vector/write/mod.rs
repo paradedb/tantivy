@@ -110,11 +110,24 @@ pub(crate) fn merge_source_rows(
     Ok(source_rows)
 }
 
-/// Enumerates source vectors with their already-known block-local coordinates.
+/// Enumerates source vectors with the block-local coordinates their rows are read at: the
+/// document-ordered rows of a flat or quantized clustered field, each document once, or the
+/// cluster rows of a plain clustered field.
 fn for_each_row(
     reader: &VectorIndexReader,
     mut f: impl FnMut(usize, usize, DocId) -> crate::Result<()>,
 ) -> crate::Result<()> {
+    if let Some(flat) = reader.flat_rows()? {
+        for row in 0..flat.num_rows() as u32 {
+            let address = flat.address(row);
+            f(
+                address.block as usize,
+                address.row as usize,
+                flat.doc_at(row)?,
+            )?;
+        }
+        return Ok(());
+    }
     let mut docs = Vec::new();
     for block in 0..reader.num_blocks() {
         reader.read_doc_ids(block, &mut docs)?;
