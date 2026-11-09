@@ -25,7 +25,7 @@ pub(crate) struct LayerProbeStats {
     pub(crate) io: VectorIoStats,
     scan_ns: u64,
     boundary_ns: u64,
-    /// Rows the layer scored, a spilled document's second copy included at layer 0.
+    /// Rows the layer scored, excluding spilled copies dropped before layer 0.
     scored: usize,
     admission_pruned: usize,
     survivors: usize,
@@ -245,7 +245,7 @@ pub(crate) enum AccessPath {
 /// `segment_*` fields are per segment.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct ProbeStats {
-    /// Rows admitted and scored at layer 0 or exactly, a spilled document's second copy included.
+    /// Rows shortlisted from the source, including spilled copies dropped before scoring.
     pub candidates_scored: usize,
     /// Rows the routed source admitted and charged, a spilled document's second copy included.
     pub layer0_eligible: usize,

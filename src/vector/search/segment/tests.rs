@@ -336,6 +336,13 @@ fn assert_identities(stats: &ProbeStats, case: &str) {
         stats.pruned_filter + stats.pruned_dead + stats.candidates_scored,
         "{case}: visited must equal filtered + dead + scored ({stats:?})"
     );
+    if let Some(layer0) = stats.layers.get(0) {
+        assert_eq!(
+            layer0.scored() + layer0.exact_rows() + stats.spill_dropped,
+            stats.candidates_scored,
+            "{case}: each eligible row is scored or dropped as a duplicate ({stats:?})"
+        );
+    }
 }
 
 /// Hits as `(score, address)`, best first.
@@ -693,10 +700,12 @@ fn assert_case(
             let Some(layer0) = stats.layers.get(0) else {
                 continue;
             };
-            // The plan counts every row of a cluster; on a spilled segment a document's second
-            // copy is dropped before the exact read.
-            assert_eq!(layer0.exact_clusters(), stats.postings_row, "{case}");
-            assert_eq!(layer0.exact_rows(), stats.candidates_scored, "{case}");
+            assert!(layer0.exact_clusters() <= stats.postings_row, "{case}");
+            assert_eq!(
+                layer0.exact_rows() + stats.spill_dropped,
+                stats.candidates_scored,
+                "{case}"
+            );
             assert_eq!(layer0.scored(), 0, "{case}");
             assert_eq!(
                 stats.exact_rows,
@@ -2024,22 +2033,44 @@ fn spilled_segment_reads_doc_ids_for_every_opened_cluster() -> crate::Result<()>
         .map(|(cluster, _)| cluster)
         .collect();
     assert_eq!(opened.len(), stats.postings_row, "{stats:?}");
+    let clusters = fixture.cluster_docs(0)?;
+    let mut opened = opened;
+    opened.sort_by_key(|&cluster| {
+        log.iter()
+            .position(|(_, read)| Some(read) == ranges.docs[cluster].as_ref())
+            .unwrap()
+    });
+    let mut seen = BTreeSet::new();
+    let mut skipped = 0;
     for cluster in opened {
         let docs = ranges.docs[cluster].as_ref().unwrap();
         let reads: Vec<_> = log.iter().filter(|(_, read)| read == docs).collect();
         assert_eq!(reads.len(), 1, "cluster={cluster}: {reads:?}");
         assert_eq!(reads[0].0, VectorStage::LayerScan(0), "cluster={cluster}");
+        let unseen = clusters[cluster]
+            .iter()
+            .filter(|&&doc| seen.insert(doc))
+            .count();
         let band = ranges.bands[cluster].as_ref().unwrap();
         let docs_at = log.iter().position(|(_, read)| read == docs).unwrap();
-        let band_at = log
-            .iter()
-            .position(|(_, read)| overlaps(read, band))
-            .unwrap();
-        assert!(
-            docs_at < band_at,
-            "cluster={cluster}: DocIds before the band"
-        );
+        let band_at = log.iter().position(|(_, read)| overlaps(read, band));
+        if unseen == 0 {
+            assert!(
+                band_at.is_none(),
+                "cluster={cluster}: duplicate-only cluster read its band"
+            );
+            skipped += 1;
+        } else {
+            assert!(
+                docs_at < band_at.unwrap(),
+                "cluster={cluster}: DocIds before the band"
+            );
+        }
     }
+    assert!(
+        skipped > 0,
+        "the fixture must exercise a duplicate-only cluster"
+    );
     Ok(())
 }
 
@@ -2089,7 +2120,7 @@ fn a_doc_in_two_opened_clusters_is_scored_once() -> crate::Result<()> {
     assert_eq!(stats.spill_dropped, live_docs, "{stats:?}");
     assert_eq!(
         stats.layers.get(0).unwrap().scored(),
-        2 * live_docs,
+        live_docs,
         "{stats:?}"
     );
     assert_eq!(stats.candidates_scored, 2 * live_docs, "{stats:?}");

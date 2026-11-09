@@ -77,8 +77,7 @@ pub(crate) struct LayerReport {
     pub(crate) full_clusters: usize,
     /// Clusters planned exact, and finished, at this layer.
     pub(crate) exact_clusters: usize,
-    /// Rows of the clusters planned exact at this layer; on a spilled segment the copies dropped
-    /// at admission count here and in `spill_dropped`, not in the rows scored exactly.
+    /// Rows planned exact at this layer, excluding copies dropped before scoring.
     pub(crate) exact_rows: usize,
     /// Survivors of the previous boundary dropped before this layer read them, because the
     /// pruning threshold rose past their upper endpoint; refining layers only.
@@ -249,13 +248,8 @@ impl<'a> QuantizedState<'a> {
         }
     }
 
-    /// Scores a cluster's rows on layer 0, read as `read`, and appends the rows whose interval
-    /// can still reach the pruning threshold as a candidate block. The threshold only rises, so
-    /// the rows dropped here are rows every later boundary would drop. Every row's survival score
-    /// goes to `fold`, pruned or not. With `seen`, the documents of a spilled segment's clusters
-    /// opened so far, a row whose document an earlier cluster held is dropped first: the first
-    /// opened cluster holding a document decides it, whatever the threshold did to that copy, so
-    /// pruning never changes which copy competes. Returns the rows dropped as second copies.
+    /// Scores unseen rows on layer 0 and admits those that can reach the pruning threshold. Every
+    /// row's survival score goes to `fold`, pruned or not.
     fn admit(
         &mut self,
         rows: &ClusterRows<'_>,
@@ -263,8 +257,7 @@ impl<'a> QuantizedState<'a> {
         bound: &mut PruningBound,
         scratch: &mut ReadScratch,
         fold: Option<Fold<'_>>,
-        seen: Option<&mut BitSet>,
-    ) -> crate::Result<usize> {
+    ) -> crate::Result<()> {
         let centroid = match rows.centroid {
             Some(centroid) => centroid,
             None => self.read_centroid(rows.cluster)?,
@@ -275,87 +268,67 @@ impl<'a> QuantizedState<'a> {
         decode_layer(&spec, rows, read, &mut self.decoded, scratch)?;
         self.layer0_scored += rows.len();
         let ctx = self.combine_ctx(0, centroid);
-        if prior.is_none() && seen.is_none() {
-            let at = self.candidates.push_block(rows, centroid);
-            combine_initial(
-                &ctx,
-                &self.decoded,
-                &mut self.candidates.columns,
-                at.clone(),
-            );
-            if let Some(mut fold) = fold {
-                let columns = &self.candidates.columns;
-                fold.upper_endpoints(
-                    &columns.estimates[at.clone()],
-                    &columns.sigmas[at.clone()],
-                    self.candidates.kappa(),
+        match prior {
+            Some(threshold) => {
+                combine_initial(
+                    &ctx,
+                    &self.decoded,
+                    &mut self.admission_columns,
+                    0..rows.len(),
                 );
+                if let Some(mut fold) = fold {
+                    let columns = &self.admission_columns;
+                    fold.upper_endpoints(
+                        &columns.estimates[..rows.len()],
+                        &columns.sigmas[..rows.len()],
+                        self.candidates.kappa(),
+                    );
+                }
+                self.select_admitted(rows, threshold);
+                let at = self.candidates.push_selected(
+                    rows,
+                    centroid,
+                    &self.admission_columns,
+                    &self.admission_keep,
+                );
+                self.layer0_admission_pruned += rows.len() - at.len();
+                bound.offer(self.candidates.entries(at, self.segment_ord));
             }
-            bound.offer(self.candidates.entries(at, self.segment_ord));
-            return Ok(0);
+            None => {
+                let at = self.candidates.push_block(rows, centroid);
+                combine_initial(
+                    &ctx,
+                    &self.decoded,
+                    &mut self.candidates.columns,
+                    at.clone(),
+                );
+                if let Some(mut fold) = fold {
+                    let columns = &self.candidates.columns;
+                    fold.upper_endpoints(
+                        &columns.estimates[at.clone()],
+                        &columns.sigmas[at.clone()],
+                        self.candidates.kappa(),
+                    );
+                }
+                bound.offer(self.candidates.entries(at, self.segment_ord));
+            }
         }
-        combine_initial(
-            &ctx,
-            &self.decoded,
-            &mut self.admission_columns,
-            0..rows.len(),
-        );
-        if let Some(mut fold) = fold {
-            let columns = &self.admission_columns;
-            fold.upper_endpoints(
-                &columns.estimates[..rows.len()],
-                &columns.sigmas[..rows.len()],
-                self.candidates.kappa(),
-            );
-        }
-        let (pruned, duplicates) = self.select_admitted(rows, prior, seen);
-        let at = self.candidates.push_selected(
-            rows,
-            centroid,
-            &self.admission_columns,
-            &self.admission_keep,
-        );
-        self.layer0_admission_pruned += pruned;
-        bound.offer(self.candidates.entries(at, self.segment_ord));
-        Ok(duplicates)
+        Ok(())
     }
 
-    /// Fills `admission_keep` with the cluster-local indices whose document, with `seen`, no
-    /// earlier cluster held, and whose upper endpoint reaches `threshold`; every row's document is
-    /// marked held. Returns the rows dropped by the threshold and as second copies.
-    fn select_admitted(
-        &mut self,
-        rows: &ClusterRows<'_>,
-        threshold: Option<Threshold>,
-        mut seen: Option<&mut BitSet>,
-    ) -> (usize, usize) {
+    /// Fills `admission_keep` with rows whose upper endpoint reaches `threshold`.
+    fn select_admitted(&mut self, rows: &ClusterRows<'_>, threshold: Threshold) {
         debug_assert_eq!(self.admission_columns.estimates.len(), rows.len());
         let kappa = self.candidates.kappa();
         self.admission_keep.clear();
-        let (mut pruned, mut duplicates) = (0, 0);
-        let docs = seen.as_ref().map(|_| {
-            rows.docs
-                .expect("a spilled segment's rows carry their doc ids")
-        });
         for index in 0..rows.len() {
-            if let (Some(seen), Some(docs)) = (seen.as_deref_mut(), docs) {
-                if seen.contains(docs[index]) {
-                    duplicates += 1;
-                    continue;
-                }
-                seen.insert(docs[index]);
+            let estimate = Estimate(self.admission_columns.estimates[index]);
+            let sigma = self.admission_columns.sigmas[index];
+            let upper = estimate.upper(sigma, kappa);
+            if threshold.admits(upper) {
+                self.admission_keep.push(index as u32);
             }
-            if let Some(threshold) = threshold {
-                let estimate = Estimate(self.admission_columns.estimates[index]);
-                let sigma = self.admission_columns.sigmas[index];
-                if !threshold.admits(estimate.upper(sigma, kappa)) {
-                    pruned += 1;
-                    continue;
-                }
-            }
-            self.admission_keep.push(index as u32);
         }
-        (pruned, duplicates)
     }
 
     /// The threshold admission prunes at: the shared slot, or `None` when unset / pruning is off.
@@ -526,8 +499,7 @@ where
     seen: Option<BitSet>,
     /// Rows dropped as a document's second copy.
     spill_dropped: usize,
-    /// A spilled cluster's rows left after dropping admitted documents, when scored exactly at
-    /// admission.
+    /// A spilled cluster's rows left after dropping previously encountered documents.
     unseen_offsets: Vec<u32>,
     unseen_docs: Vec<DocId>,
     /// The candidate blocks by cluster id, which is row order; set when the shortlist closes.
@@ -746,7 +718,7 @@ where
 
     /// Adds a cluster's rows to the shortlist: scored immediately at full precision or when an
     /// exact read is strictly cheaper than the layer-0 read, otherwise as quantized candidates.
-    /// Returns the rows scored.
+    /// Returns eligible rows, including duplicate copies, for probe-budget accounting.
     pub(crate) fn shortlist(&mut self, rows: &ClusterRows<'_>) -> crate::Result<usize> {
         let _stage = enter_vector_stage(self.shortlist_stage());
         let len = rows.len();
@@ -756,45 +728,52 @@ where
             rows.local_rows()
                 .map(|row| BlockAddress::new(rows.cluster as u32, row as u32)),
         );
-        let read = self.read_plan(rows, 0)?;
-        let fold = self.rate.as_mut().map(|rate| match &mut rate.histograms {
-            None => Fold::Prefill(&mut rate.prefill),
-            Some(histograms) => {
-                let grid = histograms.grid();
-                Fold::Binned(histograms.cluster_mut(), grid)
-            }
+        // Keep the original exact-versus-quantized choice and probe charge.
+        let read = match &self.quantized {
+            Some(state) => state.read_plan(rows, 0, &mut self.scratch)?,
+            None => Read::Exact,
+        };
+        let unseen = self.seen.as_mut().map(|seen| {
+            unseen_rows(
+                seen,
+                rows,
+                &mut self.unseen_offsets,
+                &mut self.unseen_docs,
+                &mut self.spill_dropped,
+            )
         });
-        match read {
-            Read::Exact => {
-                let unseen = self.seen.as_mut().map(|seen| {
-                    unseen_rows(
-                        seen,
-                        rows,
-                        &mut self.unseen_offsets,
-                        &mut self.unseen_docs,
-                        &mut self.spill_dropped,
-                    )
-                });
-                let selected = match &unseen {
-                    Some(unseen) => (unseen.len() > 0).then_some(unseen),
-                    None => Some(rows),
-                };
-                if let Some(selected) = selected {
+        let selected = unseen
+            .as_ref()
+            .filter(|unseen| unseen.len() != len)
+            .unwrap_or(rows);
+        if selected.len() > 0 {
+            if self.quantized.is_some() {
+                self.report.layers[0].count(read, selected.len());
+            }
+            let fold = self.rate.as_mut().map(|rate| match &mut rate.histograms {
+                None => Fold::Prefill(&mut rate.prefill),
+                Some(histograms) => {
+                    let grid = histograms.grid();
+                    Fold::Binned(histograms.cluster_mut(), grid)
+                }
+            });
+            match read {
+                Read::Exact => {
                     self.report.exact_rows +=
                         self.exact
                             .score(selected, &mut self.scratch, &mut self.bound, fold)?;
                 }
-            }
-            Read::Layer(read) => {
-                if let Some(state) = &mut self.quantized {
-                    self.spill_dropped += state.admit(
-                        rows,
-                        read,
-                        &mut self.bound,
-                        &mut self.scratch,
-                        fold,
-                        self.seen.as_mut(),
-                    )?;
+                Read::Layer(read) => {
+                    if let Some(state) = &mut self.quantized {
+                        if read == LayerRead::Sparse && selected.len() != len {
+                            state.layers[0].reader.sparse_cost(
+                                selected.cluster,
+                                selected.offsets.expect("deduplicated rows carry offsets"),
+                                &mut self.scratch,
+                            )?;
+                        }
+                        state.admit(selected, read, &mut self.bound, &mut self.scratch, fold)?;
+                    }
                 }
             }
         }
@@ -821,17 +800,6 @@ where
                 }
             }
         }
-    }
-
-    /// How the rows of `selected` are read at `layer`: exactly at full precision, otherwise as the
-    /// layer's costs plan, counted in the layer's report.
-    fn read_plan(&mut self, selected: &ClusterRows<'_>, layer: usize) -> crate::Result<Read> {
-        let Some(state) = &self.quantized else {
-            return Ok(Read::Exact);
-        };
-        let read = state.read_plan(selected, layer, &mut self.scratch)?;
-        self.report.layers[layer].count(read, selected.len());
-        Ok(read)
     }
 
     /// Refines each block's surviving candidates with `layer`, cluster by cluster, then prunes them
