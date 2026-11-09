@@ -5,17 +5,42 @@
 //! rule as one term, so the postings of the field map a key to the documents of its rules.
 //!
 //! [`expand`](fn@expand) looks the keys up in every segment and rewrites a list of query tokens
-//! into [`Expansion`]s, the longest key first, the way Lucene's `SynonymGraphFilter` does. It reads
-//! the rules through a [`SynonymSource`], which gives the rules of a matched document from where
-//! the caller keeps their text, so it can also cache them. [`SynonymExpander`] expands with no
-//! cache and reads the text from the field's column, so it needs the field fast with the `raw`
-//! tokenizer, as [`rule_field_options`] sets it.
+//! into [`Expansion`]s, the longest key first, the way Lucene's `SynonymGraphFilter` does. The
+//! index keeps only the keys. The caller keeps the text of the rules, and gives it through a
+//! [`SynonymSource`], which can also cache what it reads.
 //!
 //! ```
+//! use std::sync::Arc;
+//!
 //! use tantivy::schema::Schema;
-//! use tantivy::synonyms::{rule_field_options, SynonymExpander, SynonymRuleTokenizer};
+//! use tantivy::synonyms::{
+//!     expand, rule_field_options, CompiledRule, KeyDocs, SegmentSynonyms, SynonymRuleTokenizer,
+//!     SynonymSource, DEFAULT_MAX_RULES_PER_KEY,
+//! };
 //! use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
-//! use tantivy::{doc, Index, IndexWriter};
+//! use tantivy::{doc, DocId, Index, IndexWriter};
+//!
+//! /// One segment, and the text of each rule at the position of its document.
+//! struct Rules {
+//!     segment: SegmentSynonyms,
+//!     texts: Vec<&'static str>,
+//!     analyzer: TextAnalyzer,
+//! }
+//!
+//! impl SynonymSource for Rules {
+//!     fn token_keys(&mut self, token: &str) -> tantivy::Result<Vec<Arc<[KeyDocs]>>> {
+//!         Ok(vec![self.segment.token_keys(token, DEFAULT_MAX_RULES_PER_KEY)?.into()])
+//!     }
+//!
+//!     fn alive_rules(
+//!         &mut self,
+//!         _segment: usize,
+//!         doc: DocId,
+//!     ) -> tantivy::Result<Option<Arc<[CompiledRule]>>> {
+//!         let rule = CompiledRule::from_line(self.texts[doc as usize], &mut self.analyzer);
+//!         Ok(Some(rule.into_iter().collect()))
+//!     }
+//! }
 //!
 //! # fn main() -> tantivy::Result<()> {
 //! let analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
@@ -28,12 +53,19 @@
 //!     .tokenizers()
 //!     .register("synonym_rule", SynonymRuleTokenizer::new(analyzer.clone()));
 //! let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
-//! writer.add_document(doc!(rule => "couch, sofa, divan"))?;
+//! let texts = vec!["couch, sofa, divan"];
+//! for text in &texts {
+//!     writer.add_document(doc!(rule => *text))?;
+//! }
 //! writer.commit()?;
 //!
 //! let searcher = index.reader()?.searcher();
-//! let expander = SynonymExpander::new(searcher.segment_readers(), rule, analyzer)?;
-//! let expansions = expander.expand(&["red".to_string(), "sofa".to_string()])?;
+//! let mut rules = Rules {
+//!     segment: SegmentSynonyms::open(searcher.segment_reader(0), rule)?,
+//!     texts,
+//!     analyzer,
+//! };
+//! let expansions = expand(&["red".to_string(), "sofa".to_string()], &mut rules)?;
 //! assert_eq!(expansions[0].alternatives, None);
 //! assert_eq!(
 //!     expansions[1].alternatives,
@@ -50,8 +82,8 @@ mod tests;
 mod tokenizer;
 
 pub use self::expand::{
-    expand, rule_field_options, Expansion, KeyDocs, SegmentSynonyms, SynonymExpander,
-    SynonymSource, DEFAULT_MAX_RULES_PER_KEY,
+    expand, rule_field_options, Expansion, KeyDocs, SegmentSynonyms, SynonymSource,
+    DEFAULT_MAX_RULES_PER_KEY,
 };
 pub use self::rule::{CompiledRule, RuleError, SynonymRule, MAX_RULE_TERMS};
 pub use self::tokenizer::SynonymRuleTokenizer;
