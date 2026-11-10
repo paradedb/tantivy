@@ -247,8 +247,14 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
         debug_assert_eq!(source_rows.len(), num_target_docs as usize);
         composite.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
         let rows_w = composite.for_field_with_idx(field, VectorEntry::Data.index());
-        let target_present =
-            write_flat_rows(rows_w, opts, &source_rows, &field_readers, ctx.cancel)?;
+        let target_present = write_flat_rows(
+            rows_w,
+            opts,
+            &source_rows,
+            &field_readers,
+            RowBytes::Stored,
+            ctx.cancel,
+        )?;
         id_maps.push((field, target_present));
     }
     for (field, present) in id_maps {
@@ -262,16 +268,30 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
     Ok(())
 }
 
+/// The bytes [`write_flat_rows`] writes for each source row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowBytes {
+    /// The row as stored, for a flat merge.
+    Stored,
+    /// The row re-normalized under the field's rule, as the encode pass normalizes it before
+    /// encoding, so a quantized field's exact rows are the bytes its codes were built from.
+    Normalized,
+}
+
 /// Streams the rows of `source_rows`, in target document order, into `rows_w` as one flat entry:
-/// metadata, row groups of [`FLAT_ROWS_PER_BLOCK`] rows and the block offsets. Row groups stream
-/// without knowing the final vector count. Returns the target documents with a row, ascending.
+/// metadata, row groups of [`FLAT_ROWS_PER_BLOCK`] rows and the block offsets, each row's bytes as
+/// `row_bytes` says. Row groups stream without knowing the final vector count. Returns the target
+/// documents with a row, ascending.
 pub(crate) fn write_flat_rows<W: Write>(
     rows_w: &mut CountingWriter<W>,
     opts: &VectorOptions,
     source_rows: &[Option<RowAddress>],
     readers: &[Arc<VectorIndexReader>],
+    row_bytes: RowBytes,
     cancel: &dyn CancelSentinel,
 ) -> crate::Result<Vec<DocId>> {
+    let normalize = row_bytes == RowBytes::Normalized && opts.needs_normalization();
+    let mut normalized = Vec::new();
     let meta = VectorColMetadata::build_flat(opts);
     let align = block_align(&meta.slots());
     let start = rows_w.written_bytes();
@@ -288,9 +308,17 @@ pub(crate) fn write_flat_rows<W: Write>(
         };
         let bytes =
             readers[source.segment_ord as usize].vector_bytes_for_row(source.block_address)?;
+        let row: &[u8] = if normalize {
+            normalized.clear();
+            normalized.extend_from_slice(&bytes);
+            maybe_normalize_bytes(opts, &mut normalized);
+            &normalized
+        } else {
+            &bytes
+        };
         present.push(target_doc_id as DocId);
-        rows_w.write_all(&bytes)?;
-        block_bytes += bytes.len();
+        rows_w.write_all(row)?;
+        block_bytes += row.len();
         if present.len() % FLAT_ROWS_PER_BLOCK as usize == 0 {
             pad(rows_w, align_up(block_bytes, align) - block_bytes)?;
             block_offsets.push(rows_w.written_bytes() - start, FLAT_ROWS_PER_BLOCK as usize);

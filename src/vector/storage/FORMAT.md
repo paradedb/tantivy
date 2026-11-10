@@ -87,7 +87,9 @@ A quantized clustered field has two more entries: **ExactIdMap** and
 **ExactRows**. Its Data blocks hold document IDs and quantization columns; the
 full-precision vectors sit in ExactRows, a flat entry in document order,
 addressed through ExactIdMap exactly as a flat field's rows are addressed
-through its IdMap. No full-precision vector is stored twice.
+through its IdMap. Each row holds the bytes its codes were encoded from: the
+source row, normalized under the field's metric as the encode pass normalizes
+it. No full-precision vector is stored twice.
 
 ```text
 <segment-id>.vec: logical contents of one quantized clustered field

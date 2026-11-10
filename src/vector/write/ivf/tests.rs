@@ -1990,7 +1990,7 @@ fn storage_vectors(docs: usize) -> Vec<Option<Vec<f32>>> {
         .collect()
 }
 
-fn storage_spec(layout: &str, vectors: &[Option<Vec<f32>>]) -> FixtureSpec {
+fn storage_spec(layout: &str, metric: Metric, vectors: &[Option<Vec<f32>>]) -> FixtureSpec {
     let centroids: Vec<Vec<f32>> = (0..4)
         .map(|axis| {
             let mut centroid = vec![0.0; 64];
@@ -2014,9 +2014,9 @@ fn storage_spec(layout: &str, vectors: &[Option<Vec<f32>>]) -> FixtureSpec {
         });
     }
     let spec = match layout {
-        "flat" => FixtureSpec::flat(Metric::L2, 64, dense.into_iter().map(Some).collect()),
-        "plain" => FixtureSpec::ivf(Metric::L2, centroids, dense),
-        "quantized" => FixtureSpec::ivf(Metric::L2, centroids, dense).schedule(&[1, 4]),
+        "flat" => FixtureSpec::flat(metric, 64, dense.into_iter().map(Some).collect()),
+        "plain" => FixtureSpec::ivf(metric, centroids, dense),
+        "quantized" => FixtureSpec::ivf(metric, centroids, dense).schedule(&[1, 4]),
         _ => unreachable!(),
     };
     spec.without_vectors(move |ordinal| absent.contains(&ordinal))
@@ -2029,7 +2029,7 @@ fn storage_spec(layout: &str, vectors: &[Option<Vec<f32>>]) -> FixtureSpec {
 fn document_vector_bytes_agree_across_representations() -> crate::Result<()> {
     let vectors = storage_vectors(300);
     for layout in ["flat", "plain", "quantized"] {
-        let fixture = storage_spec(layout, &vectors).build()?;
+        let fixture = storage_spec(layout, Metric::L2, &vectors).build()?;
         let searcher = fixture.index.reader()?.searcher();
         let mut seen = 0;
         for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {
@@ -2129,7 +2129,7 @@ fn quantized_segments_round_trip_through_every_merge_shape() -> crate::Result<()
             .collect()
     };
     for shape in ["quantized+quantized", "quantized+flat", "quantized->flat"] {
-        let spec = storage_spec("quantized", &vectors)
+        let spec = storage_spec("quantized", Metric::L2, &vectors)
             .segments(if shape == "quantized+quantized" { 2 } else { 1 })
             .deletes(&[9, 70, 131, 192, 253]);
         let mut fixture = spec.build()?;
@@ -2183,6 +2183,88 @@ fn quantized_segments_round_trip_through_every_merge_shape() -> crate::Result<()
             "{shape}"
         );
     }
+    Ok(())
+}
+
+/// A quantized cosine field's exact rows are the bytes its codes were built from: the clustered
+/// merge re-normalizes each stored row as the encode pass does, while a flat merge keeps the
+/// stored bytes. Stored rows are unit-norm only to within an ulp; rows concentrated on two axes
+/// add their rounding errors up in the norm, so re-normalizing moves some of their bytes.
+#[test]
+fn exact_rows_carry_the_bytes_the_codes_were_built_from() -> crate::Result<()> {
+    let vectors: Vec<Option<Vec<f32>>> = (0..300)
+        .map(|doc| {
+            if doc % 11 == 4 {
+                return None;
+            }
+            let mut vector = Lcg(doc as u64 * 31 + 7).vector(64, 0.05);
+            vector[doc % 4] += 0.7;
+            vector[(doc + 1) % 4] += 0.7;
+            Some(vector)
+        })
+        .collect();
+    let options = VectorOptions::new(64, Metric::Cosine);
+    let normalized = |mut bytes: Vec<u8>| {
+        maybe_normalize_bytes(&options, &mut bytes);
+        bytes
+    };
+    // Ingest normalizes each input once.
+    let stored: Vec<Option<Vec<u8>>> = vectors
+        .iter()
+        .map(|vector| {
+            vector
+                .as_ref()
+                .map(|vector| normalized(vector.iter().flat_map(|x| x.to_le_bytes()).collect()))
+        })
+        .collect();
+    let encoded: Vec<Option<Vec<u8>>> = stored
+        .iter()
+        .map(|row| row.clone().map(normalized))
+        .collect();
+    assert!(
+        stored
+            .iter()
+            .zip(&encoded)
+            .any(|(stored, encoded)| stored != encoded),
+        "some stored row re-normalizes to other bytes"
+    );
+    let bytes_by_ordinal = |fixture: &Fixture| -> crate::Result<Vec<Option<Vec<u8>>>> {
+        let searcher = fixture.index.reader()?.searcher();
+        let mut out = vec![None; vectors.len()];
+        for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {
+            let reader = segment.vector_index(fixture.field)?;
+            for doc in 0..segment.max_doc() {
+                let ordinal = fixture.ordinal(DocAddress::new(segment_ord as u32, doc))?;
+                out[ordinal] = reader
+                    .vector_bytes(doc)?
+                    .map(|bytes| bytes.as_slice().to_vec());
+            }
+        }
+        Ok(out)
+    };
+
+    let flat = storage_spec("flat", Metric::Cosine, &vectors)
+        .segments(2)
+        .build()?;
+    assert_eq!(bytes_by_ordinal(&flat)?, stored, "flat before the merge");
+    let mut writer: IndexWriter = flat.index.writer_with_num_threads(1, 30_000_000)?;
+    writer.set_merge_policy(Box::new(NoMergePolicy));
+    writer.merge(&flat.index.searchable_segment_ids()?).wait()?;
+    writer.wait_merging_threads()?;
+    assert_eq!(flat.index.searchable_segment_ids()?.len(), 1);
+    assert_eq!(bytes_by_ordinal(&flat)?, stored, "flat after the merge");
+
+    let quantized = storage_spec("quantized", Metric::Cosine, &vectors).build()?;
+    let searcher = quantized.index.reader()?.searcher();
+    assert_eq!(searcher.segment_readers().len(), 1);
+    assert!(searcher.segment_readers()[0]
+        .vector_index(quantized.field)?
+        .has_exact_rows());
+    assert_eq!(
+        bytes_by_ordinal(&quantized)?,
+        encoded,
+        "quantized exact rows"
+    );
     Ok(())
 }
 

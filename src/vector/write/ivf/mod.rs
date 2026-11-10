@@ -29,7 +29,7 @@ use crate::vector::storage::header::{
 #[cfg(test)]
 use crate::vector::storage::metadata::VectorColMetadata;
 use crate::vector::storage::reader::VectorIndexReader;
-use crate::vector::write::flat::write_flat_rows;
+use crate::vector::write::flat::{write_flat_rows, RowBytes};
 use crate::vector::write::{merge_source_rows, RowAddress};
 use crate::vector::{VectorQuantizationConfig, ENTRY_ALIGN};
 use crate::{DocId, TantivyError};
@@ -213,15 +213,22 @@ pub(crate) fn merge_ivf(
                     &mut timings,
                 )?;
                 // A quantized field keeps its full-precision rows in document order, in their own
-                // entry; the cluster blocks carry codes and document ids only.
+                // entry, normalized as the encode pass normalizes the rows it codes; the cluster
+                // blocks carry codes and document ids only.
                 let exact_present = if quantization.is_some() {
                     let exact_start = Instant::now();
                     timings.pad_bytes += vec_write.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
                     let entry_start = vec_write.written_bytes();
                     let rows_w =
                         vec_write.for_field_with_idx(field, VectorEntry::ExactRows.index());
-                    let present =
-                        write_flat_rows(rows_w, opts, &source_rows, &merge.readers, ctx.cancel)?;
+                    let present = write_flat_rows(
+                        rows_w,
+                        opts,
+                        &source_rows,
+                        &merge.readers,
+                        RowBytes::Normalized,
+                        ctx.cancel,
+                    )?;
                     timings.exact_reads += present.len();
                     timings.vec_bytes += vec_write.written_bytes() - entry_start;
                     timings.exact = exact_start.elapsed();
