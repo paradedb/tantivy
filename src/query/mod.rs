@@ -71,7 +71,7 @@ pub use self::regex_query::RegexQuery;
 pub use self::reqopt_scorer::RequiredOptionalScorer;
 pub use self::score_combiner::{DisjunctionMaxCombiner, ScoreCombiner, SumCombiner};
 pub use self::scorer::{BlockMaxScorer, PruningScorer, Scorer};
-pub use self::synonym_query::{SynonymQuery, SynonymScorer};
+pub use self::synonym_query::SynonymQuery;
 pub use self::term_query::{TermQuery, TermScorer};
 pub use self::term_set_query::*;
 pub use self::union::{BufferedUnionScorer, SimpleUnion};

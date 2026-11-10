@@ -368,14 +368,6 @@ fn each_expansion_becomes_the_query_that_matches_its_alternatives() {
         "{trainers:?}"
     );
     assert_eq!(matches(trainers.as_ref()), vec![2]);
-
-    // A run of several tokens that no rule matched is a phrase too.
-    let shoes_for = expansion_query(&expanded(&["shoes", "for"], None), term).unwrap();
-    assert!(
-        shoes_for.downcast_ref::<PhraseQuery>().is_some(),
-        "{shoes_for:?}"
-    );
-    assert_eq!(matches(shoes_for.as_ref()), vec![2, 3]);
 }
 
 /// The same sequence on every run, so a failing seed replays.

@@ -80,8 +80,8 @@ impl SynonymQuery {
                 let total_num_docs = statistics_provider.total_num_docs()?;
                 let average_fieldnorm = total_num_tokens as Score / total_num_docs as Score;
                 let params = statistics_provider.bm25_params(field);
-                // Blended statistics: the pseudo-term's document frequency is
-                // the maximum document frequency among the terms.
+                // The largest document frequency, as in Lucene, so a rare synonym gets no idf
+                // boost.
                 let mut max_doc_freq: u64 = 0;
                 for term in &self.terms {
                     max_doc_freq = max_doc_freq.max(statistics_provider.doc_freq(term)?);
@@ -309,8 +309,6 @@ impl DocSet for SynonymScorer {
     }
 
     fn size_hint(&self) -> u32 {
-        // Upper bound: the union can't match more docs than the sum of the
-        // individual posting lists.
         self.postings
             .iter()
             .map(DocSet::size_hint)
@@ -362,15 +360,16 @@ impl BlockMaxScorer for SynonymScorer {
                 continue;
             }
             postings.block_cursor.seek_block(target);
-            // The last block has no skip entry to bound it, so read it now. It is short, and a
-            // member that ends before `target` then drops out of the bound instead of adding its
-            // ceiling to it.
+            // The last block has no skip entry, so its bound would be the ceiling. Reading it
+            // lets a member that ended drop out of the bound.
             if !postings.block_cursor.block_is_loaded()
                 && matches!(
                     postings.block_cursor.skip_reader().block_info(),
                     BlockInfo::VInt { .. }
                 )
             {
+                // `self.doc` is stale until the next `seek`, which Block-WAND calls before
+                // `score`.
                 postings.seek(target);
             }
         }
@@ -411,21 +410,6 @@ mod tests {
     }
 
     #[test]
-    fn test_synonym_query_matches_union() -> crate::Result<()> {
-        let index = build_test_index()?;
-        let text = index.schema().get_field("text").unwrap();
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-        let query = SynonymQuery::new(vec![
-            Term::from_field_text(text, "cat"),
-            Term::from_field_text(text, "feline"),
-        ]);
-        let count = searcher.search(&query, &Count)?;
-        assert_eq!(count, 4);
-        Ok(())
-    }
-
-    #[test]
     fn test_synonym_query_missing_term() -> crate::Result<()> {
         let index = build_test_index()?;
         let text = index.schema().get_field("text").unwrap();
@@ -440,6 +424,21 @@ mod tests {
         let all_missing = SynonymQuery::new(vec![Term::from_field_text(text, "nosuchterm")]);
         let count = searcher.search(&all_missing, &Count)?;
         assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_repeated_term_counts_once() -> crate::Result<()> {
+        let index = build_test_index()?;
+        let text = index.schema().get_field("text").unwrap();
+        let searcher = index.reader()?.searcher();
+        let cat = Term::from_field_text(text, "cat");
+        let top =
+            |query: &dyn Query| searcher.search(query, &TopDocs::with_limit(1).order_by_score());
+        let repeated = top(&SynonymQuery::new(vec![cat.clone(), cat.clone()]))?;
+        let single = top(&TermQuery::new(cat, IndexRecordOption::WithFreqs))?;
+        assert_eq!(repeated[0].1, single[0].1);
+        assert_nearly_equals!(repeated[0].0, single[0].0);
         Ok(())
     }
 

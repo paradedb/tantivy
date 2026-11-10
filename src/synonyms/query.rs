@@ -10,9 +10,9 @@ use crate::{TantivyError, Term};
 /// expand.
 ///
 /// A run that no rule matched and a group with one alternative are that one term or phrase. A
-/// group of single-token alternatives is a [`SynonymQuery`], which scores them as one term, so
-/// Block-WAND can prune it. Any other group is a [`DisjunctionMaxQuery`] whose multi-token
-/// alternatives are phrases. A phrase fails at search time on a field without positions.
+/// group of single-token alternatives is a [`SynonymQuery`], which scores them as one term. Any
+/// other group is a [`DisjunctionMaxQuery`] whose multi-token alternatives are phrases. A phrase
+/// fails at search time on a field without positions.
 pub fn expansion_query(
     expansion: &Expansion,
     term: impl Fn(&str) -> Term,
