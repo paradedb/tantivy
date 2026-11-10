@@ -50,7 +50,7 @@ struct AssignedVector {
     target_doc_id: DocId,
     source: RowAddress,
     /// Whether this is the document's primary row, the one its location map points at; a
-    /// document's spill row is the same vector encoded against a second cluster.
+    /// document's replica row is the same vector encoded against a second cluster.
     primary: bool,
 }
 
@@ -65,7 +65,7 @@ struct IvfBuildTimings {
     encode_reads: usize,
     /// Source vectors read while writing the document-ordered full-precision rows.
     exact_reads: usize,
-    spill_bytes: usize,
+    replica_bytes: usize,
     pad_bytes: usize,
     /// Bytes written to this field's vector entries, including entry padding.
     /// File headers and the composite footer are excluded.
@@ -88,8 +88,8 @@ struct FieldMerge<'a> {
     /// The field's reader in each source segment.
     readers: Vec<Arc<VectorIndexReader>>,
     num_target_docs: u32,
-    /// Whether every vector also gets a spill row in a second cluster.
-    spill: bool,
+    /// IVF clusters each vector is assigned to: 1, or 2 with a replica row in a second cluster.
+    replication: u8,
 }
 
 #[cfg(test)]
@@ -118,6 +118,7 @@ pub(crate) fn merge_ivf(
     if !has_vector_field {
         return Ok(());
     }
+    ctx.settings.validate_vector_replication()?;
 
     let num_target_docs: u32 = ctx.readers.iter().map(|r| r.num_docs()).sum();
     if num_target_docs == 0 {
@@ -172,8 +173,12 @@ pub(crate) fn merge_ivf(
             quantization,
             readers: field_readers,
             num_target_docs,
-            // Spill rows carry codes alone, so only a quantized field can hold them.
-            spill: ctx.settings.vector_spill && quantization.is_some(),
+            // Replica rows carry codes alone, so only a quantized field can hold them.
+            replication: if quantization.is_some() {
+                ctx.settings.vector_replication
+            } else {
+                1
+            },
         };
         if vector_count == 0 {
             write::empty_field(&mut vec_write, &mut centroids_write, &merge, router)?;
@@ -215,7 +220,7 @@ pub(crate) fn merge_ivf(
                 let cluster_offsets = assign::cluster_offsets(&mut assigned_vectors, num_centroids);
 
                 let centroid_bytes = encode::encode_centroids(&merge, &centroids, num_centroids)?;
-                // The stored assignment says what the blocks hold: spill rows, or one row per
+                // The stored assignment says what the blocks hold: replica rows, or one row per
                 // document when the clusterer produced no secondary.
                 let assignment = if assigned_vectors.len() > num_present_docs {
                     Assignment::Soar

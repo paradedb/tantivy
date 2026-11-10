@@ -148,8 +148,9 @@ impl ProbeParams {
     ///
     /// The absolute `max_probe` budget is floored at `min_probe_clusters` and capped at the
     /// capacity; `n_avg` is the rows per cluster and `x` the open share. `rows_in_segment` counts
-    /// the rows across the segment's clusters, a spilled segment's second copies included, so a
-    /// cluster's rows cost the same share of the capacity whether or not the segment spills. A zero
+    /// the rows across the segment's clusters, a replicated segment's second copies included, so a
+    /// cluster's rows cost the same share of the capacity whether or not the segment replicates. A
+    /// zero
     /// `max_probe` or a non-finite or non-positive `fixed_probe_cost_rows` is an error.
     pub(crate) fn resolved_work_budget(
         &self,

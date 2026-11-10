@@ -271,8 +271,8 @@ pub(crate) struct FixtureSpec {
     /// Quantization layer bits; empty for full precision.
     pub(crate) schedule: Vec<u8>,
     pub(crate) paged: bool,
-    /// Whether quantized clustered segments spill every vector into a second cluster.
-    pub(crate) spill: bool,
+    /// Whether quantized clustered segments assign every vector to a second cluster as well.
+    pub(crate) replicated: bool,
     /// Whether the clusterer answers `assign_pairs` itself; otherwise the trait's default does.
     pub(crate) pairs: bool,
     pub(crate) router: RouterKind,
@@ -295,7 +295,7 @@ impl FixtureSpec {
             layout: Layout::Ivf(centroids),
             schedule: Vec::new(),
             paged: false,
-            spill: false,
+            replicated: false,
             pairs: true,
             // Exact: small fixtures have few lists; Stacked's hard 25% top prune
             // cannot open them all, so oracle/exhaustive tests would be invalid.
@@ -341,7 +341,7 @@ impl FixtureSpec {
             layout: Layout::Flat,
             schedule: Vec::new(),
             paged: false,
-            spill: false,
+            replicated: false,
             pairs: true,
             router: RouterKind::Exact,
             segments: 1,
@@ -359,8 +359,8 @@ impl FixtureSpec {
         self
     }
 
-    pub(crate) fn spill(mut self) -> Self {
-        self.spill = true;
+    pub(crate) fn replicated(mut self) -> Self {
+        self.replicated = true;
         self
     }
 
@@ -450,7 +450,7 @@ impl FixtureSpec {
         let settings = IndexSettings {
             vector_clustering_threshold: if ivf { 1 } else { usize::MAX },
             vector_quantization: self.quantization(),
-            vector_spill: self.spill,
+            vector_replication: if self.replicated { 2 } else { 1 },
             ..IndexSettings::default()
         };
         let directory = self.paged.then(PagedDirectory::default);
@@ -1013,7 +1013,7 @@ impl Fixture {
         }
         self.clear_reads();
         if vectors.has_exact_rows() && !all_docs.is_empty() {
-            // A spilled segment lists a document under both of its clusters.
+            // A replicated segment lists a document under both of its clusters.
             all_docs.sort_unstable();
             all_docs.dedup();
             let mut scratch = ReadScratch::default();

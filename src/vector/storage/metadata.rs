@@ -191,7 +191,7 @@ impl VectorFieldMeta {
 }
 impl VectorColMetadata {
     /// Whether documents may have a second row in another cluster.
-    pub(crate) fn spilled(&self) -> bool {
+    pub(crate) fn replicated(&self) -> bool {
         self.field().assignment == Assignment::Soar
     }
     /// The same metadata under `assignment`.
@@ -523,8 +523,8 @@ impl VectorColMetadata {
         if f.assignment == Assignment::Soar && !self.has_exact_rows() {
             return Err(crate::TantivyError::DataCorruption(
                 DataCorruption::comment_only(
-                    "invalid vector metadata: spill assignment requires quantized clustered \
-                     storage",
+                    "invalid vector metadata: a replicated assignment requires quantized \
+                     clustered storage",
                 ),
             ));
         }
@@ -1052,16 +1052,16 @@ mod tests {
                 "offset {offset}"
             );
         }
-        // The spill assignment round-trips and needs quantized clustered storage.
-        let mut spilled = meta.to_bytes();
-        spilled[9] = 1;
-        let decoded = VectorColMetadata::from_bytes(&spilled).unwrap();
-        assert!(decoded.spilled());
-        assert_eq!(decoded.to_bytes(), spilled);
+        // The replicated assignment round-trips and needs quantized clustered storage.
+        let mut replicated = meta.to_bytes();
+        replicated[9] = 1;
+        let decoded = VectorColMetadata::from_bytes(&replicated).unwrap();
+        assert!(decoded.replicated());
+        assert_eq!(decoded.to_bytes(), replicated);
         let opts = VectorOptions::new(100, Metric::L2);
         let mut soar = meta.clone().with_assignment(Assignment::Soar);
-        assert!(soar.spilled());
-        assert!(!meta.spilled());
+        assert!(soar.replicated());
+        assert!(!meta.replicated());
         soar.validate(&opts, true).unwrap();
         if let VectorColMetadata::Quantized { field, .. } = &mut soar {
             field.partition = Partition::Uniform {

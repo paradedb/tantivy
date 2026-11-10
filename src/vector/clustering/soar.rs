@@ -1,4 +1,5 @@
-//! The second cell of a spilled vector (SOAR): over every centroid, the one minimizing
+//! The second cell of a replicated vector, which the SOAR paper calls a spill: over every centroid,
+//! the one minimizing
 //! `||x - c||^2 + lambda * <x - c, r1_hat>^2`, `r1_hat` being the unit residual of `x` to its
 //! nearest centroid, so the two cells miss different queries. Clusterers compute the pair through
 //! [`IvfClusterer::assign_pairs`](crate::vector::clustering::IvfClusterer::assign_pairs).
