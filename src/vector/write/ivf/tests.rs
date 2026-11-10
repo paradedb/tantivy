@@ -1199,8 +1199,7 @@ fn mixed_segments_share_preparation_by_stored_metadata() -> crate::Result<()> {
             max_probe: usize::MAX,
             ..Default::default()
         };
-        let budget = crate::vector::VectorSearchBudget::for_segments(field, &params, &segments)?
-            .distributed();
+        let budget = crate::vector::VectorSearchBudget::for_segments(field, &params, &segments)?;
         let builder =
             TopDocsByVectorSimilarityBuilder::new(field, fixture_search_query(Metric::L2, 64), 5)
                 .with_probe_params(params.clone());
@@ -1212,7 +1211,8 @@ fn mixed_segments_share_preparation_by_stored_metadata() -> crate::Result<()> {
         )?
         .with_budget(budget);
         let candidates = router.collect_segments(&segments, |_| {})?;
-        let allocation = budget.allocate_routing(&candidates, 1.0, 0.0)?;
+        let work: std::sync::Arc<dyn crate::vector::SharedVectorWork> =
+            std::sync::Arc::new(crate::vector::AtomicVectorWork::default());
         let mut incremental: Option<crate::vector::TopDocsByVectorSimilarity<f32>> = None;
         let mut fruits = Vec::new();
         for segment in &segments {
@@ -1228,7 +1228,7 @@ fn mixed_segments_share_preparation_by_stored_metadata() -> crate::Result<()> {
                     .filter(|c| c.node.0 == segment.ordinal)
                     .copied()
                     .collect(),
-                &allocation,
+                Some(work.clone()),
             )?;
             let collector = match &mut incremental {
                 Some(collector) => {

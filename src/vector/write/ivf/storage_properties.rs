@@ -548,7 +548,8 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                 .position(|r| r.segment_id() == segment.segment_id())
                 .unwrap() as u32;
             let segments = [crate::vector::VectorSegment::from((ordinal, segment))];
-            let budget = crate::vector::VectorSearchBudget::for_segments(field, &params, &segments)?;
+            let budget =
+                crate::vector::VectorSearchBudget::for_segments(field, &params, &segments)?;
             let scan_preparation = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
             let candidates: Vec<_> = candidates
                 .into_iter()
@@ -557,10 +558,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                     node: (ordinal, c.node),
                 })
                 .collect();
-            let routing_budget = budget.allocate_routing(
-                &candidates, scan_preparation.match_fraction(), scan_preparation.located_budget(),
-            )?;
-            let collector = builder.build(scan_preparation.with_candidates(candidates, &routing_budget)?);
+            let collector = builder.build(scan_preparation.with_candidates(candidates, None)?);
             let fruit = searcher.search(filter, &collector).unwrap_or_else(|error| {
                 panic!(
                     "{metric:?} {schedule:?} cluster={clusters:?} row=all column=layer0 probe: \

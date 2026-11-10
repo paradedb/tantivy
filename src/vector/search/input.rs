@@ -8,7 +8,7 @@ use crate::vector::router::candidate::Candidate;
 use crate::vector::search::segment::plan::{
     collect_segment_filter, located_cap, PlanReport, ScanInput, Source,
 };
-use crate::vector::search::source::controller::{WorkBudget, WorkUnits};
+use crate::vector::search::source::controller::{SharedVectorWork, WorkBudget, WorkUnits};
 #[cfg(test)]
 use crate::vector::search::source::router::DocFilter;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
@@ -49,7 +49,6 @@ pub struct VectorSearchBudget {
     pub(crate) clusters: usize,
     pub(crate) docs: usize,
     pub(crate) work: WorkBudget,
-    pub(crate) distributed: bool,
 }
 
 impl VectorSearchBudget {
@@ -77,50 +76,8 @@ impl VectorSearchBudget {
                 per_cluster: WorkUnits::new(x),
                 per_row: WorkUnits::new(if n_avg > 0.0 { (1.0 - x) / n_avg } else { 0.0 }),
             },
-            distributed: false,
         })
     }
-
-    /// Uses independently scanned segments with budgets assigned from the global ranking.
-    pub fn distributed(mut self) -> Self {
-        self.distributed = true;
-        self
-    }
-
-    /// Allocates routed work in global candidate order, before assigning candidates to workers.
-    /// `located_budget` is the sum of all workers' [`PreparedVectorSearch::located_budget`].
-    /// Use the same selectivity estimate as the cluster collector, or zero when unknown.
-    pub fn allocate_routing(
-        self,
-        candidates: &[Candidate<ClusterRef>],
-        match_fraction: f64,
-        located_budget: f64,
-    ) -> Result<VectorRoutingBudget> {
-        if !(0.0..=1.0).contains(&match_fraction)
-            || !located_budget.is_finite()
-            || located_budget < 0.0
-        {
-            return Err(TantivyError::InvalidArgument(
-                "invalid routing selectivity or located budget".into(),
-            ));
-        }
-        let x = self.work.per_cluster.get();
-        let cost = x + (1.0 - x) * match_fraction;
-        let mut left = (self.work.total.get() - located_budget).max(0.0);
-        let mut segments = HashMap::new();
-        for candidate in candidates {
-            let charge = cost.min(left);
-            *segments.entry(candidate.node.0).or_insert(WorkUnits::ZERO) += WorkUnits::new(charge);
-            left = (left - charge).max(0.0);
-        }
-        Ok(VectorRoutingBudget { segments })
-    }
-}
-
-/// Producer-assigned work ceilings, transferable separately from the routing candidates.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct VectorRoutingBudget {
-    segments: HashMap<SegmentOrdinal, WorkUnits>,
 }
 
 impl VectorSegment {
@@ -257,17 +214,6 @@ impl PreparedVectorSearch {
         self.budget
     }
 
-    /// Work reserved for this worker's exhaustive located scans.
-    pub fn located_budget(&self) -> f64 {
-        self.segments
-            .iter()
-            .filter_map(|segment| match &segment.scan {
-                Some(ScanInput::Located { budget, .. }) => Some(budget.total.get()),
-                _ => None,
-            })
-            .sum()
-    }
-
     /// Observed selectivity across the segments that require routing.
     pub fn match_fraction(&self) -> f64 {
         let mut matched = 0.0;
@@ -284,12 +230,12 @@ impl PreparedVectorSearch {
 
     /// Attaches this worker's ordered candidates. Routed segments with no candidates are
     /// omitted; located and flat scans need no candidates. Candidate ordinals must use the
-    /// original prepared snapshot, and each cluster may occur only once. Independent scans use
-    /// the producer's allocation; the shared scan keeps one global meter.
+    /// original prepared snapshot, and each cluster may occur only once. Independent workers
+    /// must supply the same work counter; `None` scans one global order in this process.
     pub fn with_candidates(
         mut self,
         candidates: Vec<Candidate<ClusterRef>>,
-        routing_budget: &VectorRoutingBudget,
+        shared_work: Option<Arc<dyn SharedVectorWork>>,
     ) -> Result<VectorScanInputs> {
         let cluster_counts: HashMap<_, _> = self
             .segments
@@ -319,31 +265,18 @@ impl PreparedVectorSearch {
         }
         self.segments
             .retain(|s| !s.routed() || routed.contains(&s.ordinal));
-        if self.budget.distributed {
+        if shared_work.is_some() {
             for segment in &mut self.segments {
                 if let Some(ScanInput::Routed { budget, .. }) = &mut segment.scan {
-                    budget.total =
-                        *routing_budget
-                            .segments
-                            .get(&segment.ordinal)
-                            .ok_or_else(|| {
-                                TantivyError::InvalidArgument(
-                                    "missing routed segment budget".into(),
-                                )
-                            })?;
+                    budget.total = self.budget.work.total;
                 }
             }
-            self.segments.retain(|segment| {
-                !matches!(
-                    &segment.scan,
-                    Some(ScanInput::Routed { budget, .. }) if budget.total == WorkUnits::ZERO
-                )
-            });
         }
         Ok(VectorScanInputs {
             prepared: self,
             candidates,
             routing_stats: HashMap::new(),
+            shared_work,
         })
     }
 }
@@ -355,6 +288,7 @@ pub struct VectorScanInputs {
     pub(crate) prepared: PreparedVectorSearch,
     pub(crate) candidates: Vec<Candidate<ClusterRef>>,
     pub(crate) routing_stats: HashMap<SegmentOrdinal, crate::vector::VectorRoutingStats>,
+    pub(crate) shared_work: Option<Arc<dyn SharedVectorWork>>,
 }
 
 impl VectorScanInputs {
@@ -382,45 +316,81 @@ mod tests {
     use crate::vector::{LocatedPath, TopClustersBySimilarityCollector};
 
     #[test]
-    fn routing_budget_follows_global_order_and_reserves_located_work() -> Result<()> {
-        let budget = VectorSearchBudget {
-            clusters: 8,
-            docs: 80,
-            work: WorkBudget {
-                total: WorkUnits::new(3.0),
-                per_cluster: WorkUnits::new(0.25),
-                per_row: WorkUnits::new(0.075),
-            },
-            distributed: true,
-        };
-        let candidates: Vec<_> = [0, 0, 1, 2, 2]
-            .into_iter()
-            .enumerate()
-            .map(|(cluster, segment)| Candidate {
-                sim: Metric::L2.similarity(&[0.0f32], &[cluster as f32]),
-                node: (segment, cluster as u32),
+    fn shared_work_uses_unused_budget_with_skewed_filters() -> Result<()> {
+        let fixtures = [true, false]
+            .map(|dense| {
+                FixtureSpec::clustered(Metric::L2, 32, 32, 4096)
+                    .label("matches", |i| dense && i % 2 == 0)
+                    .build()
             })
-            .collect();
-        for (fraction, reserved, expected) in [
-            (1.0, 0.0, [2.0, 1.0, 0.0]),
-            (1.0, 1.0, [2.0, 0.0, 0.0]),
-            (0.5, 0.0, [1.25, 0.625, 1.125]),
-            (0.0, 0.0, [0.5, 0.25, 0.5]),
-            (1.0, 3.0, [0.0; 3]),
-        ] {
-            let allocation = budget.allocate_routing(&candidates, fraction, reserved)?;
-            for (ordinal, expected) in expected.into_iter().enumerate() {
-                assert_eq!(allocation.segments[&(ordinal as u32)].get(), expected);
-            }
-            assert!(allocation.segments.values().map(|b| b.get()).sum::<f64>() + reserved <= 3.0);
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let searchers = fixtures
+            .iter()
+            .map(|f| f.index.reader().map(|r| r.searcher()))
+            .collect::<Result<Vec<_>>>()?;
+        let segments = searchers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| VectorSegment::from((i as u32, s.segment_reader(0))))
+            .collect::<Vec<_>>();
+        let field = fixtures[0].field;
+        let filter = fixtures[0].filter("matches");
+        let weight = fixtures[0].weight(&filter)?;
+        for max_probe in [20, 30, 40, 64] {
+            let params = ProbeParams {
+                max_probe,
+                located: LocatedPath::Off,
+                ..Default::default()
+            };
+            let query = vec![0.0f32; 32];
+            let builder = TopDocs::with_limit(10)
+                .order_by_similarity(field, query.clone())
+                .with_probe_params(params.clone());
+            let budget = VectorSearchBudget::for_segments(field, &params, &segments)?;
+            let prepared = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
+            let router = TopClustersBySimilarityCollector::new(field, query, params, 0.25)?
+                .with_budget(budget);
+            let candidates = router.collect_segments(&segments, |_| {})?;
+            let work: Arc<dyn SharedVectorWork> =
+                Arc::new(crate::vector::AtomicVectorWork::default());
+            let routed = prepared.routing_segments();
+            assert_eq!(candidates.len(), 64);
+            let candidates = candidates
+                .into_iter()
+                .filter(|c| routed.iter().any(|s| s.ordinal == c.node.0))
+                .collect();
+            let collector =
+                builder.build(prepared.with_candidates(candidates, Some(work.clone()))?);
+            let fruit = collector.merge_fruits(collector.collect_segments(
+                weight.as_ref(),
+                &segments,
+                |_| {},
+            )?)?;
+            assert_eq!(
+                fruit
+                    .stats
+                    .iter()
+                    .map(|s| s.candidates_scored)
+                    .sum::<usize>(),
+                2048
+            );
+            assert!(
+                (work.charged()
+                    - fruit
+                        .stats
+                        .iter()
+                        .map(|s| f64::from(s.work_charged))
+                        .sum::<f64>())
+                .abs()
+                    < 1e-5
+            );
+            assert!(work.charged() < max_probe as f64);
+            assert!(fruit
+                .stats
+                .iter()
+                .all(|s| s.termination != crate::vector::ProbeTermination::Ceiling));
         }
-        for fraction in [f64::NAN, -0.1, 1.1] {
-            assert!(budget.allocate_routing(&candidates, fraction, 0.0).is_err());
-        }
-        for reserved in [f64::NAN, f64::INFINITY, -1.0] {
-            assert!(budget.allocate_routing(&candidates, 1.0, reserved).is_err());
-        }
-        assert!(budget.allocate_routing(&[], 1.0, 0.0)?.segments.is_empty());
         Ok(())
     }
 
@@ -456,8 +426,7 @@ mod tests {
             assert!(prepared.routing_segments().is_empty());
             assert_eq!(prepared.segments().is_empty(), empty);
             assert!(fixture.centroid_reads().is_empty());
-            let routing_budget = budget.allocate_routing(&[], 0.0, prepared.located_budget())?;
-            let inputs = prepared.with_candidates(Vec::new(), &routing_budget)?;
+            let inputs = prepared.with_candidates(Vec::new(), None)?;
             let active = inputs.segments();
             assert_eq!(active.is_empty(), empty);
             let active = active.iter().map(|s| s.ordinal).collect::<Vec<_>>();
@@ -514,8 +483,7 @@ mod tests {
         let local =
             builder.prepare(&weight, std::slice::from_ref(segment), local_budget, |_| {})?;
         assert!(local.routing_segments().is_empty());
-        let budget =
-            VectorSearchBudget::for_segments(fixture.field, &params, &segments)?.distributed();
+        let budget = VectorSearchBudget::for_segments(fixture.field, &params, &segments)?;
         let distributed =
             builder.prepare(&weight, std::slice::from_ref(segment), budget, |_| {})?;
         assert_eq!(distributed.routing_segments().len(), 1);
@@ -548,39 +516,22 @@ mod tests {
         let prepared = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
         let router = TopClustersBySimilarityCollector::new(fixture.field, query, params, 1.0)?;
         let candidates = router.collect_segments(&prepared.routing_segments(), |_| {})?;
-        let routing_budget =
-            budget.allocate_routing(&candidates, 1.0, prepared.located_budget())?;
-        let distributed =
-            builder.prepare(weight.as_ref(), &segments, budget.distributed(), |_| {})?;
-        let missing = budget.allocate_routing(&[], 1.0, 0.0)?;
-        assert!(distributed
-            .with_candidates(candidates.clone(), &missing)
-            .is_err());
         assert!(candidates.iter().all(|c| c.node.0 == 7));
         let mut invalid = candidates.clone();
         invalid[0].node.0 = 0;
-        assert!(prepared
-            .clone()
-            .with_candidates(invalid, &routing_budget)
-            .is_err());
+        assert!(prepared.clone().with_candidates(invalid, None).is_err());
         let mut invalid = candidates.clone();
         invalid[0].node.1 = u32::MAX;
-        assert!(prepared
-            .clone()
-            .with_candidates(invalid, &routing_budget)
-            .is_err());
+        assert!(prepared.clone().with_candidates(invalid, None).is_err());
         let mut invalid = candidates.clone();
         invalid.push(candidates[0]);
+        assert!(prepared.clone().with_candidates(invalid, None).is_err());
         assert!(prepared
             .clone()
-            .with_candidates(invalid, &routing_budget)
-            .is_err());
-        assert!(prepared
-            .clone()
-            .with_candidates(Vec::new(), &routing_budget)?
+            .with_candidates(Vec::new(), None)?
             .segments()
             .is_empty());
-        let collector = builder.build(prepared.with_candidates(candidates, &routing_budget)?);
+        let collector = builder.build(prepared.with_candidates(candidates, None)?);
         assert!(collector
             .collect_segment(weight.as_ref(), 0, &segments[0].reader)
             .is_err());

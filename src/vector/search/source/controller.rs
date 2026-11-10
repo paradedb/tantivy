@@ -4,6 +4,37 @@
 //! open charges `x` and a scored row `(1 - x) / n_avg`, so an exhaustive, unfiltered, delete-free
 //! scan charges exactly `C`. The budget is checked only between clusters.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+/// Actual routed work charged by all participants in one query. Located scans are separate.
+pub trait SharedVectorWork: Send + Sync {
+    /// Adds finite, nonnegative work. Implementations must not lose concurrent charges.
+    fn charge(&self, work: f64);
+    /// Total work charged by every participant.
+    fn charged(&self) -> f64;
+}
+
+/// A query work counter that can live in an `Arc` or process-shared memory.
+#[derive(Default, Debug)]
+#[repr(transparent)]
+pub struct AtomicVectorWork(AtomicU64);
+
+impl SharedVectorWork for AtomicVectorWork {
+    fn charge(&self, work: f64) {
+        assert!(work.is_finite() && work >= 0.0);
+        let _ = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+                Some((f64::from_bits(bits) + work).to_bits())
+            });
+    }
+
+    fn charged(&self) -> f64 {
+        f64::from_bits(self.0.load(Ordering::Relaxed))
+    }
+}
+
 /// How the probe loop stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize)]
 pub enum ProbeTermination {
@@ -99,29 +130,41 @@ pub(crate) struct WorkBudget {
 pub(crate) struct WorkMeter {
     budget: WorkBudget,
     charged: WorkUnits,
+    shared: Option<Arc<dyn SharedVectorWork>>,
 }
 
 impl WorkMeter {
-    pub(crate) fn new(budget: WorkBudget) -> Self {
+    pub(crate) fn new(budget: WorkBudget, shared: Option<Arc<dyn SharedVectorWork>>) -> Self {
         Self {
             budget,
             charged: WorkUnits::ZERO,
+            shared,
         }
     }
 
     /// Charges one cluster open.
     pub(crate) fn open(&mut self) {
         self.charged += self.budget.per_cluster;
+        if let Some(shared) = &self.shared {
+            shared.charge(self.budget.per_cluster.get());
+        }
     }
 
     /// Charges `rows` scored rows.
     pub(crate) fn rows(&mut self, rows: usize) {
-        self.charged += self.budget.per_row * rows as f64;
+        let work = self.budget.per_row * rows as f64;
+        self.charged += work;
+        if let Some(shared) = &self.shared {
+            shared.charge(work.get());
+        }
     }
 
     /// Whether the charges have reached the budget.
     pub(crate) fn exhausted(&self) -> bool {
-        self.charged >= self.budget.total
+        self.shared
+            .as_ref()
+            .map_or(self.charged.get(), |shared| shared.charged())
+            >= self.budget.total.get()
     }
 
     /// The work charged so far.
@@ -191,4 +234,44 @@ pub(crate) struct ProbeOutcome {
     pub(crate) work_charged: f32,
     /// The resolved budget the loop ran against, in work units.
     pub(crate) work_budget: f32,
+}
+
+#[cfg(test)]
+mod shared_work_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_meters_enforce_one_ceiling() {
+        let work: Arc<dyn SharedVectorWork> = Arc::new(AtomicVectorWork::default());
+        let barrier = std::sync::Barrier::new(8);
+        let charges = std::thread::scope(|scope| {
+            (0..8)
+                .map(|_| {
+                    let work = Arc::clone(&work);
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let mut meter = WorkMeter::new(
+                            WorkBudget {
+                                total: WorkUnits::new(20.0),
+                                per_cluster: WorkUnits::new(0.25),
+                                per_row: WorkUnits::new(0.075),
+                            },
+                            Some(work),
+                        );
+                        barrier.wait();
+                        while !meter.exhausted() {
+                            meter.open();
+                            meter.rows(10);
+                        }
+                        meter.charged().get()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .sum::<f64>()
+        });
+        assert_eq!(work.charged(), charges);
+        assert!((20.0..=27.0).contains(&charges));
+    }
 }

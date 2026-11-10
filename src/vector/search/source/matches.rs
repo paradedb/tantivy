@@ -79,7 +79,7 @@ impl<'a> MatchClusters<'a> {
             docs,
             clusters: Vec::new(),
             next: 0,
-            meter: WorkMeter::new(budget),
+            meter: WorkMeter::new(budget, None),
             report,
         };
         for (position, &(doc, address)) in located.iter().enumerate() {

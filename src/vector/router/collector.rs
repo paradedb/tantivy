@@ -26,12 +26,14 @@ pub struct VectorRoutingStats {
 
 /// Ranks clusters globally without filtering or reading document rows. Callers supply only
 /// the segments that need routing. Its fruit retains the global router's ordered candidates;
-/// scanners enforce the work budget even when cluster sizes differ.
+/// scanners enforce the work budget even when cluster sizes differ. The result is limited to
+/// the requested candidate count, including when a router scores extra clusters.
 pub struct TopClustersBySimilarityCollector<T: VectorElement> {
     field: Field,
     query: Arc<Vec<T>>,
     params: ProbeParams,
     match_fraction: f64,
+    limit_candidates: bool,
     budget: Option<VectorSearchBudget>,
     partition_centroids: HashMap<SegmentOrdinal, Vec<f32>>,
     stats: Mutex<Vec<VectorRoutingStats>>,
@@ -56,10 +58,16 @@ impl<T: VectorElement> TopClustersBySimilarityCollector<T> {
             query: Arc::new(query),
             params,
             match_fraction,
+            limit_candidates: true,
             budget: None,
             partition_centroids: HashMap::new(),
             stats: Mutex::new(Vec::new()),
         })
+    }
+
+    pub(crate) fn without_candidate_limit(mut self) -> Self {
+        self.limit_candidates = false;
+        self
     }
 
     /// Uses accounting from the full search, including segments bypassing routing.
@@ -194,6 +202,11 @@ impl<T: VectorElement> TopClustersBySimilarityCollector<T> {
         Ok(ranking
             .clusters
             .into_iter()
+            .take(if self.limit_candidates {
+                routing.k
+            } else {
+                usize::MAX
+            })
             .map(|(i, candidate)| Candidate {
                 sim: candidate.sim,
                 node: (segments[i].ordinal, candidate.node),

@@ -10,7 +10,7 @@ use crate::vector::router::candidate::Candidate;
 use crate::vector::router::{RouterIter, RouterMetrics};
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
 use crate::vector::search::source::controller::{
-    ProbeController, ProbeOutcome, WorkBudget, WorkMeter,
+    ProbeController, ProbeOutcome, SharedVectorWork, WorkBudget, WorkMeter,
 };
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::reader::VectorIndexReader;
@@ -195,13 +195,14 @@ impl<'a> RouterClusters<'a> {
         budget: WorkBudget,
         filter: DocFilter,
         segment: &'a SegmentReader,
+        shared_work: Option<Arc<dyn SharedVectorWork>>,
     ) -> Self {
         let index = reader.index().expect("IVF segment");
         Self {
             index,
             reader,
             ranked,
-            meter: WorkMeter::new(budget),
+            meter: WorkMeter::new(budget, shared_work),
             controller: ProbeController::new(index.num_clusters()),
             gate: RowGate::new(filter, segment.alive_bitset()),
             docs: Vec::new(),
@@ -226,6 +227,7 @@ impl<'a> RouterClusters<'a> {
             budget,
             filter,
             segment,
+            None,
         )
     }
 

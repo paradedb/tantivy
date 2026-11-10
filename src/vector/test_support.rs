@@ -532,12 +532,7 @@ impl Fixture {
                 node: (ordinal, c.node),
             })
             .collect();
-        let routing_budget = budget.allocate_routing(
-            &candidates,
-            prepared.match_fraction(),
-            prepared.located_budget(),
-        )?;
-        let collector = builder.build(prepared.with_candidates(candidates, &routing_budget)?);
+        let collector = builder.build(prepared.with_candidates(candidates, None)?);
         use crate::collector::Collector;
         collector.merge_fruits(vec![collector.collect_segment(
             weight.as_ref(),
@@ -601,13 +596,8 @@ impl Fixture {
                 .collect(),
             None => router.collect_segments(&prepared.routing_segments(), |_| {})?,
         };
-        let routing_budget = budget.allocate_routing(
-            &candidates,
-            prepared.match_fraction(),
-            prepared.located_budget(),
-        )?;
         Ok(prepared
-            .with_candidates(candidates, &routing_budget)?
+            .with_candidates(candidates, None)?
             .with_routing_statistics(router.take_statistics()))
     }
 

@@ -28,6 +28,7 @@ use crate::vector::search::scan::heap::{tie_break_key, TieBreakHits};
 use crate::vector::search::scan::plan::PlanOverride;
 use crate::vector::search::scan::{ScanConfig, SegmentScan};
 use crate::vector::search::segment::plan::ScanInput;
+use crate::vector::search::source::controller::SharedVectorWork;
 use crate::vector::search::source::matches::MatchClusters;
 use crate::vector::search::source::router::{DocFilter, RouterClusters};
 use crate::vector::search::source::SourceReport;
@@ -55,6 +56,7 @@ pub(crate) struct SegmentSearcher<T: VectorElement> {
     segment: VectorSegment,
     ranked: Vec<Candidate>,
     routing_metrics: RouterMetrics,
+    pub(crate) shared_work: Option<Arc<dyn SharedVectorWork>>,
     /// Exact scores segments of this collector have finished. The scan seeds its TopK from them
     /// (partial k). `None` seeds nothing.
     pub(crate) collector_topk: Option<Arc<Mutex<TopK>>>,
@@ -92,6 +94,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
             ranked: Vec::new(),
             routing_metrics: RouterMetrics::Exact { visited_count: 0 },
             collector_topk: None,
+            shared_work: None,
             shared_topk_threshold: Arc::new(AtomicSharedThreshold::default()),
             #[cfg(test)]
             plan_override: None,
@@ -262,6 +265,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
                     budget,
                     filter,
                     &self.segment.reader,
+                    self.shared_work.clone(),
                 );
                 scan.run(&mut clusters)?;
                 SourceReport::Router(clusters.finish())

@@ -211,15 +211,11 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
             self.probe_params.clone(),
             prepared.match_fraction(),
         )?
-        .with_budget(prepared.budget());
+        .with_budget(prepared.budget())
+        .without_candidate_limit();
         let candidates = router.collect_segments(&prepared.routing_segments(), &mut on_segment)?;
-        let routing_budget = budget.allocate_routing(
-            &candidates,
-            prepared.match_fraction(),
-            prepared.located_budget(),
-        )?;
         let inputs = prepared
-            .with_candidates(candidates, &routing_budget)?
+            .with_candidates(candidates, None)?
             .with_routing_statistics(router.take_statistics());
         Ok(self.build(inputs))
     }
@@ -303,15 +299,19 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
 
 impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     /// Replaces a distributed scan's inputs for the next assignment in the same query,
-    /// preserving prepared queries and pruning state. Field, filter and top-k must be unchanged.
+    /// preserving prepared queries and pruning state. Field, filter, top-k and shared work
+    /// counter must be unchanged.
     pub fn set_inputs(&mut self, inputs: VectorScanInputs) -> Result<()> {
         if inputs.prepared.field != self.field
             || inputs.prepared.top_n != self.segment_top_n()
-            || !inputs.prepared.budget.distributed
-            || !self.inputs.prepared.budget.distributed
+            || !inputs
+                .shared_work
+                .as_ref()
+                .zip(self.inputs.shared_work.as_ref())
+                .is_some_and(|(next, current)| Arc::ptr_eq(next, current))
         {
             return Err(TantivyError::InvalidArgument(
-                "replacement inputs require the same field and top-k in a distributed scan".into(),
+                "replacement inputs require the same field, top-k and shared work counter".into(),
             ));
         }
         self.inputs = inputs;
@@ -501,7 +501,7 @@ where
     S: SortKeyComputer + Send + Sync + 'static,
 {
     /// Scans the supplied segments using prepared inputs and their explicit candidate order.
-    /// The preparation determines whether work accounting is shared or allocated per segment.
+    /// Uses either the shared work counter or one meter over the global candidate order.
     /// Located filter matches are exhaustive and reserve their share of the budget.
     /// Calls `on_segment` after each slice of work for per-segment read accounting.
     pub fn collect_segments(
@@ -510,7 +510,7 @@ where
         segments: &[VectorSegment],
         mut on_segment: impl FnMut(SegmentOrdinal),
     ) -> Result<Vec<SegmentVectorFruit<S::SortKey>>> {
-        if segments.is_empty() || self.inputs.prepared.budget.distributed {
+        if segments.is_empty() || self.inputs.shared_work.is_some() {
             return segments
                 .iter()
                 .map(|segment| {
@@ -632,32 +632,34 @@ where
             };
             (query, quantized)
         };
-        Ok(SegmentSearcher::for_segment(
+        let mut backend = SegmentSearcher::for_segment(
             segment,
             self.field,
             query,
             quantized,
             self.probe_params.clone(),
-        )?
-        .with_collector_topk(
-            Arc::clone(&self.collector_topk),
-            Arc::clone(&self.shared_topk_threshold),
-        )
-        .with_candidates(
-            self.inputs
-                .candidates
-                .iter()
-                .filter(|c| c.node.0 == segment_ord)
-                .map(|c| crate::vector::Candidate {
-                    sim: c.sim,
-                    node: c.node.1,
-                })
-                .collect(),
-            self.inputs
-                .routing_stats
-                .get(&segment_ord)
-                .map(|s| s.metrics),
-        ))
+        )?;
+        backend.shared_work = self.inputs.shared_work.clone();
+        Ok(backend
+            .with_collector_topk(
+                Arc::clone(&self.collector_topk),
+                Arc::clone(&self.shared_topk_threshold),
+            )
+            .with_candidates(
+                self.inputs
+                    .candidates
+                    .iter()
+                    .filter(|c| c.node.0 == segment_ord)
+                    .map(|c| crate::vector::Candidate {
+                        sim: c.sim,
+                        node: c.node.1,
+                    })
+                    .collect(),
+                self.inputs
+                    .routing_stats
+                    .get(&segment_ord)
+                    .map(|s| s.metrics),
+            ))
     }
 
     /// Searches one segment: prepares the query, runs the segment searcher, and lifts each hit's
@@ -903,10 +905,13 @@ where
             collector.tie_break.comparator(),
         )
     };
-    let mut meter = WorkMeter::new(WorkBudget {
-        total: WorkUnits::new((global_budget.total.get() - reserved.get()).max(0.0)),
-        ..global_budget
-    });
+    let mut meter = WorkMeter::new(
+        WorkBudget {
+            total: WorkUnits::new((global_budget.total.get() - reserved.get()).max(0.0)),
+            ..global_budget
+        },
+        None,
+    );
     for (i, source) in sources.iter_mut().enumerate() {
         let Some(GlobalSource::RouterBypass(source)) = source else {
             continue;
@@ -1124,16 +1129,7 @@ mod ivf_e2e_tests {
     {
         let budget =
             VectorSearchBudget::for_segments(builder.field, &builder.probe_params, segments)?;
-        let prepared = builder.prepare(
-            weight,
-            segments,
-            if distributed {
-                budget.distributed()
-            } else {
-                budget
-            },
-            |_| {},
-        )?;
+        let prepared = builder.prepare(weight, segments, budget, |_| {})?;
         let router = TopClustersBySimilarityCollector::new(
             builder.field,
             builder.query.as_ref().clone(),
@@ -1142,14 +1138,14 @@ mod ivf_e2e_tests {
         )?
         .with_budget(budget);
         let candidates = router.collect_segments(&prepared.routing_segments(), |_| {})?;
-        let routing_budget = budget.allocate_routing(
-            &candidates,
-            prepared.match_fraction(),
-            prepared.located_budget(),
-        )?;
+        let shared_work: Option<Arc<dyn crate::vector::SharedVectorWork>> =
+            distributed.then(|| {
+                Arc::new(crate::vector::AtomicVectorWork::default())
+                    as Arc<dyn crate::vector::SharedVectorWork>
+            });
         Ok(builder.build(
             prepared
-                .with_candidates(candidates, &routing_budget)?
+                .with_candidates(candidates, shared_work.clone())?
                 .with_routing_statistics(router.take_statistics()),
         ))
     }
@@ -1645,8 +1641,7 @@ mod ivf_e2e_tests {
                 &segments,
                 |_| {},
             )?)?;
-            let budget =
-                VectorSearchBudget::for_segments(fixture.field, &params, &segments)?.distributed();
+            let budget = VectorSearchBudget::for_segments(fixture.field, &params, &segments)?;
             let worker_builder = || {
                 TopDocs::with_limit(10)
                     .order_by_similarity(fixture.field, query.clone())
@@ -1675,11 +1670,8 @@ mod ivf_e2e_tests {
             )?
             .with_budget(budget);
             let candidates = router.collect_segments(&routed, |_| {})?;
-            let routing_budget = budget.allocate_routing(
-                &candidates,
-                fraction,
-                prepared.iter().map(|p| p.located_budget()).sum(),
-            )?;
+            let shared_work: Option<Arc<dyn crate::vector::SharedVectorWork>> =
+                Some(Arc::new(crate::vector::AtomicVectorWork::default()));
             let fruits = std::thread::scope(|scope| {
                 segments
                     .iter()
@@ -1691,7 +1683,7 @@ mod ivf_e2e_tests {
                                 .filter(|c| c.node.0 == segment.ordinal)
                                 .copied()
                                 .collect(),
-                            &routing_budget,
+                            shared_work.clone(),
                         )?;
                         let collector = worker_builder().build(inputs);
                         let weight = &weight;
@@ -1725,7 +1717,17 @@ mod ivf_e2e_tests {
             let work = |fruit: &VectorSimilarityFruit| {
                 fruit.stats.iter().map(|s| s.work_charged).sum::<f32>()
             };
-            assert!((work(&parallel) - work(&serial)).abs() < 1e-5);
+            assert!(
+                (work(&parallel) - work(&serial)).abs() < 1e-5,
+                "fraction={fraction} parallel={} serial={} stats={:?}",
+                work(&parallel),
+                work(&serial),
+                parallel
+                    .stats
+                    .iter()
+                    .map(|s| (s.work_budget, s.work_charged, s.candidates_scored))
+                    .collect::<Vec<_>>()
+            );
             assert_eq!(parallel.stats[0].work_budget, 4.0);
             assert!(parallel.stats[1..]
                 .iter()
@@ -1766,8 +1768,7 @@ mod ivf_e2e_tests {
                     };
                     let weight = fixture.weight(filter)?;
                     let budget =
-                        VectorSearchBudget::for_segments(fixture.field, &params, &readers)?
-                            .distributed();
+                        VectorSearchBudget::for_segments(fixture.field, &params, &readers)?;
                     let prepared = readers
                         .iter()
                         .map(|segment| {
@@ -1794,14 +1795,8 @@ mod ivf_e2e_tests {
                     let bytes = serde_json::to_vec(&candidates).unwrap();
                     let candidates: Vec<Candidate<ClusterRef>> =
                         serde_json::from_slice(&bytes).unwrap();
-                    let routing_budget = budget.allocate_routing(
-                        &candidates,
-                        0.0,
-                        prepared.iter().map(|p| p.located_budget()).sum(),
-                    )?;
-                    let bytes = serde_json::to_vec(&routing_budget).unwrap();
-                    let routing_budget: crate::vector::VectorRoutingBudget =
-                        serde_json::from_slice(&bytes).unwrap();
+                    let shared_work: Option<Arc<dyn crate::vector::SharedVectorWork>> =
+                        Some(Arc::new(crate::vector::AtomicVectorWork::default()));
                     let threshold: SharedThresholdArc<Score> =
                         Arc::new(AtomicSharedThreshold::default());
                     let fruits = std::thread::scope(|scope| {
@@ -1818,7 +1813,7 @@ mod ivf_e2e_tests {
                                             .filter(|c| c.node.0 == ord)
                                             .copied()
                                             .collect(),
-                                        &routing_budget,
+                                        shared_work.clone(),
                                     )
                                     .unwrap();
                                 let collector = builder()
@@ -1901,14 +1896,13 @@ mod ivf_e2e_tests {
             == 0));
         let filter = fixture.filter("matches");
         let weight = fixture.weight(&filter)?;
-        let budget =
-            VectorSearchBudget::for_segments(fixture.field, &params, &readers)?.distributed();
+        let budget = VectorSearchBudget::for_segments(fixture.field, &params, &readers)?;
         let prepared = builder().prepare(weight.as_ref(), &readers, budget, |_| {})?;
-        let routing_budget =
-            budget.allocate_routing(&candidates, 0.0, prepared.located_budget())?;
+        let shared_work: Option<Arc<dyn crate::vector::SharedVectorWork>> =
+            Some(Arc::new(crate::vector::AtomicVectorWork::default()));
         let collector = builder().build(
             prepared
-                .with_candidates(candidates, &routing_budget)?
+                .with_candidates(candidates, shared_work.clone())?
                 .with_routing_statistics(statistics),
         );
         let fruit = collector.merge_fruits(collector.collect_segments(
@@ -1917,15 +1911,17 @@ mod ivf_e2e_tests {
             |_| {},
         )?)?;
         assert!(!fixture.reads().is_empty());
-        for stats in &fruit.stats {
-            assert!(stats.pruned_filter > 0);
-            assert!(stats.work_charged >= stats.work_budget);
-            assert!(stats.work_charged <= stats.work_budget + 1.0);
-            assert!(stats.postings_row < 8);
-        }
-        let expected_collector = build_routed(builder(), weight.as_ref(), &readers, true)?;
-        let expected = searcher.search(&filter, &expected_collector)?;
-        assert_eq!(fruit.results, expected.results);
+        let charged = fruit.stats.iter().map(|s| s.work_charged).sum::<f32>();
+        assert!((3.0..=4.0).contains(&charged));
+        assert!((shared_work.as_ref().unwrap().charged() - f64::from(charged)).abs() < 1e-5);
+        assert!(fruit.stats.iter().any(|s| s.pruned_filter > 0));
+        assert!(fruit
+            .stats
+            .iter()
+            .any(|s| s.termination == crate::vector::ProbeTermination::Ceiling));
+        let exact = fixture.oracle(&filter, &query, 768)?;
+        assert_eq!(fruit.results.len(), 5);
+        assert!(fruit.results.iter().all(|hit| exact.contains(hit)));
         Ok(())
     }
 
@@ -1957,7 +1953,7 @@ mod ivf_e2e_tests {
             let builder = TopDocs::with_limit(3)
                 .order_by_similarity(field, vec![0.0f32; 32])
                 .with_probe_params(params.clone());
-            let budget = VectorSearchBudget::for_segments(field, &params, &segments)?.distributed();
+            let budget = VectorSearchBudget::for_segments(field, &params, &segments)?;
             let prepared = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
             let total = max_probe.min(28) as f64;
             for (segment, clusters) in prepared.segments.iter().zip([4, 8, 16]) {
@@ -1972,7 +1968,13 @@ mod ivf_e2e_tests {
                 &segments,
                 |_| {},
             )?)?;
-            assert!(fruit.stats.iter().map(|s| s.work_budget).sum::<f32>() as f64 <= total + 1e-5);
+            assert!(fruit
+                .stats
+                .iter()
+                .all(|s| f64::from(s.work_budget) <= total + 1e-5));
+            assert!(
+                f64::from(fruit.stats.iter().map(|s| s.work_charged).sum::<f32>()) <= total + 1.0
+            );
         }
         Ok(())
     }
@@ -2133,14 +2135,10 @@ mod ivf_e2e_tests {
         )?
         .with_budget(prepared.budget());
         let candidates = router.collect_segments(&prepared.routing_segments(), |_| {})?;
-        let routing_budget = budget.allocate_routing(
-            &candidates,
-            prepared.match_fraction(),
-            prepared.located_budget(),
-        )?;
+        let shared_work: Option<Arc<dyn crate::vector::SharedVectorWork>> = None;
         let collector = builder().build(
             prepared
-                .with_candidates(candidates, &routing_budget)?
+                .with_candidates(candidates, shared_work.clone())?
                 .with_routing_statistics(router.take_statistics()),
         );
         let ready = builder().build_for_segments(&filter.weight, &segments, |_| {})?;
@@ -2192,7 +2190,7 @@ mod ivf_e2e_tests {
                 .with_probe_params(params.clone())
         };
         let weight = near.all()?;
-        let budget = VectorSearchBudget::for_segments(near.field, &params, &readers)?.distributed();
+        let budget = VectorSearchBudget::for_segments(near.field, &params, &readers)?;
         let prepared = builder().prepare(weight.as_ref(), &readers, budget, |_| {})?;
         let router =
             TopClustersBySimilarityCollector::new(near.field, query.clone(), params.clone(), 1.0)?
@@ -2201,9 +2199,9 @@ mod ivf_e2e_tests {
         candidates.truncate(3);
         assert_eq!(candidates.len(), 3);
         assert!(candidates.iter().all(|c| c.node.0 == 1));
-        let routing_budget =
-            budget.allocate_routing(&candidates, 1.0, prepared.located_budget())?;
-        let inputs = prepared.with_candidates(candidates.clone(), &routing_budget)?;
+        let shared_work: Option<Arc<dyn crate::vector::SharedVectorWork>> =
+            Some(Arc::new(crate::vector::AtomicVectorWork::default()));
+        let inputs = prepared.with_candidates(candidates.clone(), shared_work.clone())?;
         assert_eq!(inputs.segments().len(), 1);
         assert_eq!(inputs.segments()[0].ordinal, 1);
         let collector = builder().build(inputs.with_routing_statistics(router.take_statistics()));
@@ -2223,7 +2221,7 @@ mod ivf_e2e_tests {
         assert!(fruit.stats.iter().map(|s| s.work_charged).sum::<f32>() < 4.1);
         let budget = VectorSearchBudget::for_segments(near.field, &params, &readers)?;
         let prepared = builder().prepare(weight.as_ref(), &readers, budget, |_| {})?;
-        let inputs = prepared.with_candidates(candidates, &routing_budget)?;
+        let inputs = prepared.with_candidates(candidates, None)?;
         let collect = |segments: &[VectorSegment]| -> Result<_> {
             let collector = builder().build(inputs.clone());
             collector.merge_fruits(collector.collect_segments(weight.as_ref(), segments, |_| {})?)

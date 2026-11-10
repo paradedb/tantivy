@@ -39,6 +39,7 @@ fn walk(seg: &SegmentRun<'_>) -> crate::Result<Walk> {
         budget,
         filter,
         seg.segment,
+        None,
     );
     let mut clusters = Vec::new();
     let mut rows = 0;
@@ -394,6 +395,7 @@ fn row_gate_bookkeeping() -> crate::Result<()> {
                     budget,
                     filter,
                     run.segment,
+                    None,
                 );
                 while let Some(rows) = source.next()? {
                     match rows.docs {
