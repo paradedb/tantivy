@@ -935,7 +935,7 @@ pub(crate) struct QuantizedIndexCtx {
     pub(crate) meta: Arc<VectorColMetadata>,
     pub(crate) specs: Vec<LayerSpec>,
     pub(crate) grids: Vec<Grid>,
-    pub(crate) rotation_plan: QueryRotationPlan,
+    pub(crate) rotation_plan: Arc<QueryRotationPlan>,
 }
 
 impl QuantizedIndexCtx {
@@ -947,7 +947,8 @@ impl QuantizedIndexCtx {
             ));
         }
         let (specs, grids) = meta.runtime();
-        let rotation_plan = QueryRotationPlan::new(meta.field().dim as usize, &specs);
+        let rotation_plan =
+            crate::vector::rotation_plan::cached_rotation_plan(meta.field().dim as usize, &specs);
         Ok(Self {
             meta,
             specs,
