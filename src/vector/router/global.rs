@@ -8,8 +8,8 @@ use crate::vector::{VectorElement, VectorStage};
 
 /// Clusters to probe across all segments, ordered by centroid similarity to the query.
 /// Each cluster carries its segment index, and metrics track the routing work for each segment.
-/// With [`RoutingParams::flat`], every segment is ranked as an exact router ranks it, partition
-/// centroids are unused, and the merged ranking keeps its best `k`.
+/// With [`RoutingParams::flat`], every segment is ranked as an exact router ranks it and partition
+/// centroids are unused; the consumer bounds the merged ranking as it bounds a stored ranking.
 pub(crate) struct GlobalRanking {
     pub(crate) clusters: Vec<(usize, Candidate)>,
     pub(crate) metrics: Vec<RouterMetrics>,
@@ -94,9 +94,6 @@ impl GlobalRanking {
                 .then(a.0.cmp(&b.0))
                 .then(a.1.node.cmp(&b.1.node))
         });
-        if params.flat {
-            leaves.truncate(params.k.max(1));
-        }
         let mut counts = vec![0; routers.len()];
         for (segment, _) in &leaves {
             counts[*segment] += 1;
@@ -730,7 +727,7 @@ mod tests {
 
     /// Flat routing of a stacked and a quantized stacked segment reads each bottom bank once,
     /// ignores partition centroids, and returns the ranking exact routers over the same centroid
-    /// rows return, truncated to `k`.
+    /// rows return, whatever `k` the caller passes.
     #[test]
     fn flat_ranking_matches_exact_routers_over_the_same_centroids() -> crate::Result<()> {
         use super::super::source::ROUTER_SEED;
@@ -775,7 +772,7 @@ mod tests {
                         &mut totals,
                         &mut |segment| routed.push(segment),
                     );
-                    assert_eq!(flat.clusters, expected.clusters[..k.min(24)]);
+                    assert_eq!(flat.clusters, expected.clusters);
                     assert!(flat
                         .metrics
                         .iter()

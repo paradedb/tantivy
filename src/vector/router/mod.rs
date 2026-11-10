@@ -162,7 +162,7 @@ pub(crate) struct RoutingParams {
     pub(crate) min_beam_fraction: f32,
     pub(crate) aps: bool,
     /// Ranks every segment's centroids exactly, as the exact router does, instead of walking a
-    /// stacked router; the merged ranking keeps its best `k`.
+    /// stacked router. The whole ranking is returned, as for an exact router.
     pub(crate) flat: bool,
 }
 
