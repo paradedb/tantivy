@@ -24,14 +24,14 @@ use crate::vector::clustering::{IvfCentroids, IvfClusterer, IvfMatrix};
 use crate::vector::distance::l2_squared;
 use crate::vector::router::RouterKind;
 use crate::vector::storage::header::{
-    write_centroid_header, write_vector_header, CENTROIDS_EXT, VEC_EXT,
+    write_centroid_header, write_vector_header, VectorEntry, CENTROIDS_EXT, HEADER_LEN, VEC_EXT,
 };
-use crate::vector::storage::id_map::IdMap;
 #[cfg(test)]
 use crate::vector::storage::metadata::VectorColMetadata;
 use crate::vector::storage::reader::VectorIndexReader;
+use crate::vector::write::flat::{write_flat_rows, RowBytes};
 use crate::vector::write::{merge_source_rows, RowAddress};
-use crate::vector::VectorQuantizationConfig;
+use crate::vector::{VectorQuantizationConfig, ENTRY_ALIGN};
 use crate::{DocId, TantivyError};
 
 mod assign;
@@ -59,6 +59,8 @@ struct IvfBuildTimings {
     assign_reads: usize,
     /// Source vectors read while encoding the clustered rows.
     encode_reads: usize,
+    /// Source vectors read while writing the document-ordered full-precision rows.
+    exact_reads: usize,
     spill_bytes: usize,
     pad_bytes: usize,
     /// Bytes written to this field's vector entries, including entry padding.
@@ -68,6 +70,8 @@ struct IvfBuildTimings {
     assign: Duration,
     id_map_write: Duration,
     encode: Duration,
+    /// Time writing the document-ordered full-precision rows.
+    exact: Duration,
 }
 
 /// One vector field's merge inputs.
@@ -165,7 +169,7 @@ pub(crate) fn merge_ivf(
         };
         if vector_count == 0 {
             write::empty_field(&mut vec_write, &mut centroids_write, &merge, router)?;
-            id_maps.push((field, IdMap::empty_locations(num_target_docs)));
+            id_maps.push(write::FieldIdMaps::empty(&merge));
             continue;
         }
 
@@ -179,7 +183,7 @@ pub(crate) fn merge_ivf(
                     // no-vectors path: the reader errors on slots missing from composites the
                     // other fields still write.
                     write::empty_field(&mut vec_write, &mut centroids_write, &merge, router)?;
-                    id_maps.push((field, IdMap::empty_locations(num_target_docs)));
+                    id_maps.push(write::FieldIdMaps::empty(&merge));
                     continue;
                 };
                 let mut centroids = trained.centroids;
@@ -189,7 +193,7 @@ pub(crate) fn merge_ivf(
                 let mut assigned_vectors = assign::assign(
                     &merge,
                     clusterer,
-                    source_rows,
+                    &source_rows,
                     &centroids,
                     vector_count,
                     &mut timings,
@@ -208,7 +212,36 @@ pub(crate) fn merge_ivf(
                     &centroid_bytes,
                     &mut timings,
                 )?;
-                id_maps.push((field, locations));
+                // A quantized field keeps its full-precision rows in document order, in their own
+                // entry, normalized as the encode pass normalizes the rows it codes; the cluster
+                // blocks carry codes and document ids only.
+                let exact_present = if quantization.is_some() {
+                    let exact_start = Instant::now();
+                    timings.pad_bytes += vec_write.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
+                    let entry_start = vec_write.written_bytes();
+                    let rows_w =
+                        vec_write.for_field_with_idx(field, VectorEntry::ExactRows.index());
+                    let present = write_flat_rows(
+                        rows_w,
+                        opts,
+                        &source_rows,
+                        &merge.readers,
+                        RowBytes::Normalized,
+                        ctx.cancel,
+                    )?;
+                    timings.exact_reads += present.len();
+                    timings.vec_bytes += vec_write.written_bytes() - entry_start;
+                    timings.exact = exact_start.elapsed();
+                    Some(present)
+                } else {
+                    None
+                };
+                id_maps.push(write::FieldIdMaps {
+                    field,
+                    locations,
+                    exact_present,
+                    num_target_docs,
+                });
 
                 write::centroid_slots(
                     &mut centroids_write,

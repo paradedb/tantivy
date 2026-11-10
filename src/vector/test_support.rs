@@ -34,6 +34,7 @@ use crate::vector::search::SegmentSearcher;
 use crate::vector::stats::SegmentReport;
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::io::test_support::{with_unarmed_log, PagedDirectory};
+use crate::vector::storage::quantized::ReadScratch;
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::tests::TestVectorIndex;
 use crate::vector::{
@@ -483,6 +484,25 @@ impl Fixture {
         self.search_with(filter, query, k, 0, params, None)
     }
 
+    /// Searches every segment through the collector, scanning at most `levels` quantized layers;
+    /// zero scores every admitted row exactly.
+    pub(crate) fn search_levels(
+        &self,
+        filter: &dyn Query,
+        query: &[f32],
+        k: usize,
+        params: ProbeParams,
+        levels: usize,
+    ) -> crate::Result<VectorSimilarityFruit> {
+        let searcher = self.index.reader()?.searcher();
+        let collector = TopDocs::with_limit(k)
+            .order_by_similarity(self.field, query.to_vec())
+            .with_probe_params(params)
+            .with_max_scan_levels(levels)
+            .build_for_searcher(&searcher, filter)?;
+        searcher.search(filter, &collector)
+    }
+
     /// Searches every segment through the collector for the window `offset..offset + limit`,
     /// sharing every scan's threshold through `slot` when given.
     pub(crate) fn search_with(
@@ -863,17 +883,27 @@ impl Fixture {
         self.log().centroid_reads.lock().unwrap().clone()
     }
 
-    /// Byte ranges of the first segment's DocIds column requests and full-precision cluster spans,
-    /// by cluster; `None` for an empty cluster.
+    /// Byte ranges of the first segment's DocIds column requests, full-precision cluster spans and
+    /// band-0 spans, by cluster, `None` for an empty cluster; and, for quantized storage, the span
+    /// of every document-ordered row.
     pub(crate) fn column_ranges(&self) -> crate::Result<ColumnRanges> {
         let searcher = self.index.reader()?.searcher();
         let vectors = first_segment(&searcher).1.vector_index(self.field)?;
         let clusters = vectors.index().expect("IVF segment").num_clusters();
         let mut ranges = ColumnRanges::default();
         let mut docs = Vec::new();
+        let mut all_docs = Vec::new();
+        let payload = |fixture: &Self, ranges: &ColumnRanges| {
+            fixture
+                .reads()
+                .into_iter()
+                .map(|(_, range)| range)
+                .find(|range| !ranges.block_offsets.contains(range))
+        };
         for cluster in 0..clusters {
             self.clear_reads();
             vectors.read_doc_ids(cluster, &mut docs)?;
+            all_docs.extend_from_slice(&docs);
             let mut reads: Vec<_> = self.reads().into_iter().map(|(_, range)| range).collect();
             // Block boundaries precede the DocIds payload, which is absent for empty clusters.
             ranges
@@ -881,27 +911,53 @@ impl Fixture {
                 .push((!docs.is_empty()).then(|| reads.pop().expect("DocIds read")));
             ranges.block_offsets.extend(reads);
             self.clear_reads();
-            if !docs.is_empty() {
+            if !docs.is_empty() && !vectors.has_exact_rows() {
                 vectors.read_cluster_rows(cluster)?;
             }
-            ranges.rows.push(
-                self.reads()
-                    .into_iter()
-                    .map(|(_, range)| range)
-                    .find(|range| !ranges.block_offsets.contains(range)),
-            );
+            ranges.rows.push(payload(self, &ranges));
+            self.clear_reads();
+            if let (false, Some(quantized)) = (docs.is_empty(), vectors.quantization()?) {
+                quantized.layers()[0].read_batch_in_block(cluster, 0..docs.len())?;
+            }
+            ranges.bands.push(payload(self, &ranges));
+        }
+        self.clear_reads();
+        if vectors.has_exact_rows() && !all_docs.is_empty() {
+            all_docs.sort_unstable();
+            let mut scratch = ReadScratch::default();
+            vectors.read_exact_docs(&all_docs, &mut scratch)?;
+            let reads: Vec<_> = self
+                .reads()
+                .into_iter()
+                .map(|(_, range)| range)
+                .filter(|range| !ranges.block_offsets.contains(range))
+                .collect();
+            let start = reads
+                .iter()
+                .map(|range| range.start)
+                .min()
+                .expect("exact rows read");
+            let end = reads
+                .iter()
+                .map(|range| range.end)
+                .max()
+                .expect("exact rows read");
+            ranges.exact = Some(start..end);
         }
         self.clear_reads();
         Ok(ranges)
     }
 }
 
-/// Per-cluster byte ranges of the DocIds column and the full-precision rows.
+/// Per-cluster byte ranges of the DocIds column, the full-precision rows and the band-0 payload,
+/// and the span of the document-ordered rows of quantized storage.
 #[derive(Debug, Default)]
 pub(crate) struct ColumnRanges {
     pub(crate) block_offsets: Vec<Range<usize>>,
     pub(crate) docs: Vec<Option<Range<usize>>>,
     pub(crate) rows: Vec<Option<Range<usize>>>,
+    pub(crate) bands: Vec<Option<Range<usize>>>,
+    pub(crate) exact: Option<Range<usize>>,
 }
 
 // --- Trace ---

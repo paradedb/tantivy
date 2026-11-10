@@ -41,13 +41,13 @@ the full-precision vectors.
 |---|---|---|---|
 | Flat | Document ID order, skipping missing vectors | Full vectors | Absent |
 | Clustered, plain | Cluster order, then document ID | Full vectors and document IDs | Present |
-| Clustered, quantized | Cluster order, then document ID | Full vectors, document IDs, and quantization columns | Present |
+| Clustered, quantized | Codes and document IDs in cluster order, then document ID; full vectors in document order in their own entry | Document IDs and quantization columns; full vectors in flat blocks of the `ExactRows` entry | Present |
 
 Segment vector files are immutable once written. Inserts produce new segments.
 Deletion visibility is stored separately; a merge omits deleted documents and
 writes new vector files.
 
-This document describes the implemented `.vec` **V5** and `.centroids` **V5**
+This document describes the implemented `.vec` **V6** and `.centroids` **V5**
 formats. Block byte offsets and vector counts live together in `.vec`; `.centroids`
 stores cluster centers and routing data. All multibyte numbers below are
 little-endian. Ranges use an exclusive end: `[start, end)`.
@@ -56,11 +56,12 @@ sizes. Borders and labels do not represent extra headers on disk.
 
 ## `.vec`: vector data for each field
 
-Each vector field has two composite entries: **IdMap** and **Data**. Data holds
-the field metadata, vector blocks, and byte offsets locating those blocks.
+A flat field and a plain clustered field have two composite entries: **IdMap**
+and **Data**. Data holds the field metadata, vector blocks, and byte offsets
+locating those blocks.
 
 ```text
-<segment-id>.vec: logical contents of one field
+<segment-id>.vec: logical contents of one flat or plain clustered field
 +----------------------------------------------------------------------+
 | IdMap (entry 0)                                                      |
 |   Document ID -> vector location                                     |
@@ -69,8 +70,8 @@ the field metadata, vector blocks, and byte offsets locating those blocks.
 | +----------------------------------------------------------------+   |
 | | Metadata: dimension, metric, column layout, ...                |   |
 | +----------------------------------------------------------------+   |
-| | Block 0: vectors | doc_ids | codes | ...                       |   |
-| | Block 1: vectors | doc_ids | codes | ...                       |   |
+| | Block 0: vectors | doc_ids                                     |   |
+| | Block 1: vectors | doc_ids                                     |   |
 | | ...                                                            |   |
 | +----------------------------------------------------------------+   |
 | | block_offsets: (byte_offset:u64, num_rows:u64)[B+1]           |   |
@@ -82,6 +83,47 @@ the field metadata, vector blocks, and byte offsets locating those blocks.
 +----------------------------------------------------------------------+
 ```
 
+A quantized clustered field has two more entries: **ExactIdMap** and
+**ExactRows**. Its Data blocks hold document IDs and quantization columns; the
+full-precision vectors sit in ExactRows, a flat entry in document order,
+addressed through ExactIdMap exactly as a flat field's rows are addressed
+through its IdMap. Each row holds the bytes its codes were encoded from: the
+source row, normalized under the field's metric as the encode pass normalizes
+it. No full-precision vector is stored twice.
+
+```text
+<segment-id>.vec: logical contents of one quantized clustered field
++----------------------------------------------------------------------+
+| IdMap (entry 0)                                                      |
+|   Document ID -> primary cluster location                            |
++----------------------------------------------------------------------+
+| Data (entry 1)                                                       |
+| +----------------------------------------------------------------+   |
+| | Metadata: dimension, metric, column layout, assignment, ...    |   |
+| +----------------------------------------------------------------+   |
+| | Block 0: doc_ids | norms | codes | ...                         |   |
+| | Block 1: doc_ids | norms | codes | ...                         |   |
+| | ...                                                            |   |
+| +----------------------------------------------------------------+   |
+| | block_offsets, total_rows, num_blocks                          |   |
+| +----------------------------------------------------------------+   |
++----------------------------------------------------------------------+
+| ExactIdMap (entry 2)                                                 |
+|   Document ID -> row number, identity or bitmap                      |
++----------------------------------------------------------------------+
+| ExactRows (entry 3)                                                  |
+| +----------------------------------------------------------------+   |
+| | Flat metadata                                                  |   |
+| +----------------------------------------------------------------+   |
+| | Block 0: vectors (16,384 rows)                                 |   |
+| | Block 1: vectors                                               |   |
+| | ...                                                            |   |
+| +----------------------------------------------------------------+   |
+| | block_offsets, total_rows, num_blocks                          |   |
+| +----------------------------------------------------------------+   |
++----------------------------------------------------------------------+
+```
+
 The writer records `(byte_offset, num_rows)` tuples in `BlockOffsetsWriter`.
 The reader keeps the Data entry behind a `FileSlice` and fetches only the tuples
 for accessed blocks. Both flat and clustered blocks store their vector counts.
@@ -89,25 +131,31 @@ No cumulative row-offset array is stored in either file.
 
 ### File framing and field entries
 
-The diagram above groups entries by field. The physical writer places **all
-Data entries before all IdMap entries**, followed by the composite directory:
+The diagram above groups entries by field. The physical writer places **every
+field's Data entry, each followed by its ExactRows entry when the field has one,
+before every field's IdMap entry, each followed by its ExactIdMap entry**, then
+the composite directory:
 
 ```text
 <segment-id>.vec: bytes from start to end
 +----------------------------------------------------------------------+
-| Version: u32 = 5                                                     |
+| Version: u32 = 6                                                     |
 +----------------------------------------------------------------------+
 | Zero padding to an absolute 8-byte boundary                          |
 +----------------------------------------------------------------------+
 | Data(field A)                                                        |
 +----------------------------------------------------------------------+
+| ExactRows(field A), when field A is quantized and clustered          |
++----------------------------------------------------------------------+
 | Data(field B)                                                        |
-| ... remaining Data entries                                           |
+| ... remaining Data and ExactRows entries                             |
 +----------------------------------------------------------------------+
 | IdMap(field A)                                                       |
 +----------------------------------------------------------------------+
+| ExactIdMap(field A), when field A is quantized and clustered         |
++----------------------------------------------------------------------+
 | IdMap(field B)                                                       |
-| ... remaining IdMap entries                                          |
+| ... remaining IdMap and ExactIdMap entries                           |
 +----------------------------------------------------------------------+
 | Composite directory: (field, entry index) -> entry location          |
 +----------------------------------------------------------------------+
@@ -117,10 +165,12 @@ Data entries before all IdMap entries**, followed by the composite directory:
 +----------------------------------------------------------------------+
 ```
 
-Entry indices are lookup keys, not physical positions. Each field must declare
-exactly entry 0 (IdMap) and entry 1 (Data); missing or additional entry indices
-are corruption. Data entries start and end on absolute 8-byte boundaries.
-IdMaps need no alignment or inter-entry padding.
+Entry indices are lookup keys, not physical positions. A flat or plain
+clustered field must declare exactly entry 0 (IdMap) and entry 1 (Data); a
+quantized clustered field must declare exactly entries 0 to 3 (IdMap, Data,
+ExactIdMap, ExactRows); missing or additional entry indices are corruption.
+Data and ExactRows entries start and end on absolute 8-byte boundaries. IdMaps
+need no alignment or inter-entry padding.
 
 ### IdMap: document to vector location
 
@@ -139,10 +189,12 @@ IdMap begins with a one-byte tag:
 
 All other tags, including 2, are rejected. Flat fields use Identity when every
 document has a vector, otherwise Bitmap. Identity occupies just one byte; the
-document count comes from the segment.
+document count comes from the segment. A quantized clustered field's ExactIdMap
+is encoded the same way and ranks a document to its row in ExactRows.
 
-Clustered fields use DocLocations, encoding each `BlockAddress` as two words.
-The block index is the cluster index:
+Clustered fields use DocLocations for their IdMap, encoding each `BlockAddress`
+as two words. The block index is the cluster index, and a document's location is
+its primary row: the row in the cluster its assignment names first.
 
 ```text
 IdMap entry: clustered encoding
@@ -206,12 +258,24 @@ per-column offset table is written between the blocks.
 #### Metadata
 
 Metadata records the field's dimensions, element type, metric, normalization
-policy, and partitioning. Quantized fields also record the ordered quantization
-layers, code widths, rotations, seeds, and reconstruction/error models.
+policy, partitioning, and assignment. Quantized fields also record the ordered
+quantization layers, code widths, rotations, seeds, and reconstruction/error
+models.
 
 `Partition::Clusters` requires a DocLocations IdMap and centroid data.
 `Partition::Uniform { rows_per_block }` requires a nonzero block size, an
-Identity or Bitmap IdMap, and no centroid data for the field.
+Identity or Bitmap IdMap, and no centroid data for the field. The ExactRows
+entry of a quantized clustered field carries flat metadata: plain representation
+and `Partition::Uniform` with 16,384 rows per block.
+
+The assignment byte says how a clustered field's documents were placed in its
+blocks: `Nearest` (0) gives every document one row, in its nearest cluster;
+`Soar` (1) gives every document a row in its nearest cluster and a second row in
+a cluster chosen to cover queries the first misses. `Soar` is valid only for
+quantized clustered storage, where a row is codes and a document ID. Under
+`Soar` a document may appear in two blocks; the IdMap holds its primary
+location, and DocIds stay strictly ascending within each block because a
+document appears at most once per cluster. Flat fields write `Nearest`.
 
 These values determine the column order, alignment, and bytes per vector in
 each column. They are shared by every block in this field. The
@@ -236,6 +300,12 @@ count       = num_rows
 Block index equals cluster index for clustered fields. Flat fields use groups
 of up to 16,384 vectors, with a possibly smaller final group. Stored counts are
 validated against that uniform partition geometry when each flat block is read.
+Flat blocks are contiguous: block *b* starts `b * 16,384 * row_bytes` past
+block 0, which follows the metadata at the block alignment, so a row's bytes
+are arithmetic on its index. The reader confirms this once, against the last
+block's tuple, when it opens the entry; document-ordered row reads and their
+pricing then never consult the offset table, and a read covers one run of
+consecutive rows.
 
 The extra tuple is a sentinel `(block_offsets_start, 0)`. An empty field has
 zero blocks, one sentinel, and `total_rows = 0`. Zero-row clusters have count zero and no column payload. The final block range
@@ -302,8 +372,6 @@ Clustered, plain block
 
 Clustered, quantized block: bytes from start to end
 +----------------------------------------------------------------------+
-| Rows:          [v0][v1] ... [vN-1]                                   |
-+----------------------------------------------------------------------+
 | DocIds:        [d0][d1] ... [dN-1]                                   |
 +----------------------------------------------------------------------+
 | ResidualNorms: [n0][n1] ... [nN-1]                                   |
@@ -324,8 +392,9 @@ Clustered, quantized block: bytes from start to end
 ```
 
 All columns use the same local row order. For example, the entries at local
-row 7 in Rows, DocIds, and Codes describe the same member of the cluster.
-Full vectors remain present when quantization is enabled.
+row 7 in DocIds and Codes describe the same member of the cluster. A quantized
+cluster block carries no Rows column: the member's full vector is the row its
+document ID ranks to in the ExactRows entry, whose flat blocks hold Rows alone.
 
 #### Columns and their encodings
 
@@ -334,7 +403,7 @@ vectors, the column contains `count * stride` bytes.
 
 | Column in write order | Decoder element | Stride | Meaning |
 |---|---|---:|---|
-| Rows | F32 | `4 * dim` | Full-precision vector values |
+| Rows, flat and plain clustered only | F32 | `4 * dim` | Full-precision vector values |
 | DocIds, clustered only | U32 | 4 | Segment document ID for each vector |
 | ResidualNorms, quantized only | F32 | 4 | Squared norm of each vector's residual from its centroid |
 | QuantLayerCodes(l) | U64 for SignPlane; U8 for GridPlane | Quantizer code stride | Compact residual representation |
@@ -363,12 +432,13 @@ Rows column: vectors laid out one after another
 
 The current element type is F32. Cosine vectors are normalized when written, so
 full precision refers to the stored representation, not necessarily the original
-input bytes. Flat blocks have no other columns, making their vector bytes
-contiguous across block boundaries.
+input bytes. Flat blocks, the ExactRows blocks included, have no other columns,
+making their vector bytes contiguous across block boundaries.
 
 **DocIds** contains strictly ascending `u32` document IDs within each cluster,
 all below `max_doc`. It answers which document owns a local vector row, the
-reverse of IdMap's document-to-location lookup.
+reverse of IdMap's document-to-location lookup. Under the `Soar` assignment a
+document ID may appear in two clusters' columns, never twice in one.
 
 **Codes** use `8 * ceil(dim / 64)` bytes per vector for one-bit SignPlane.
 GridPlane uses two to four bits per dimension and
@@ -426,8 +496,9 @@ Other dimensions, layer schedules, or metrics can insert alignment padding.
 
 Each column starts at a multiple of its decoder element size relative to the
 block start. Every stride is a multiple of that size. The block ends on a
-multiple of its largest decoder element: 4 bytes for plain storage, 8 bytes when
-SignPlane is present. Empty blocks consume no column bytes. All padding is zero.
+multiple of its largest decoder element: 4 bytes for plain storage and for
+quantized blocks of grid layers alone, 8 bytes when SignPlane is present. Empty
+blocks consume no column bytes. All padding is zero.
 
 Sizes come from fixed-width representations, independent of ABI alignment; F16
 uses the size of `u16`. Every element size is a power of two. The exported
@@ -620,28 +691,25 @@ quantization settings; plain and quantized document storage can use either route
 
 ## Following a document lookup
 
-Suppose a segment has five documents, document 2 has no vector, and clustering
-assigns documents 0 and 3 to cluster 0, and documents 1 and 4 to cluster 1:
+Suppose a quantized field in a segment of five documents, document 2 has no
+vector, and clustering assigns documents 0 and 3 to cluster 0, and documents 1
+and 4 to cluster 1:
 
 ```text
-.vec: two clusters for one field
+.vec Data: two clusters for one quantized field
 +----------------------------------------------------------------------+
 | Block 0 = cluster 0                                                  |
 | +----------------------------------------------------------------+   |
-| | Rows: [v0][v3]                                                 |   |
-| +----------------------------------------------------------------+   |
 | | DocIds: [0][3]                                                 |   |
 | +----------------------------------------------------------------+   |
-| | Quantization columns, when enabled                             |   |
+| | ResidualNorms and layer columns for [0][3]                     |   |
 | +----------------------------------------------------------------+   |
 +----------------------------------------------------------------------+
 | Block 1 = cluster 1                                                  |
 | +----------------------------------------------------------------+   |
-| | Rows: [v1][v4]                                                 |   |
-| +----------------------------------------------------------------+   |
 | | DocIds: [1][4]                                                 |   |
 | +----------------------------------------------------------------+   |
-| | Quantization columns, when enabled                             |   |
+| | ResidualNorms and layer columns for [1][4]                     |   |
 | +----------------------------------------------------------------+   |
 +----------------------------------------------------------------------+
 
@@ -658,21 +726,37 @@ IdMap entry
 | doc 4 -> (block 1, row 1)                                            |
 +----------------------------------------------------------------------+
 
-.vec block_offsets = [(start 0, 2), (start 1, 2), (offsets start, 0)]
+.vec ExactRows: one flat block in document order
++----------------------------------------------------------------------+
+| Block 0                                                              |
+| +----------------------------------------------------------------+   |
+| | Rows: [v0][v1][v3][v4]                                         |   |
+| +----------------------------------------------------------------+   |
++----------------------------------------------------------------------+
+
+ExactIdMap entry: Bitmap of documents {0, 1, 3, 4}
+  rank(0) = 0, rank(1) = 1, rank(3) = 2, rank(4) = 3
+
+Data block_offsets      = [(start 0, 2), (start 1, 2), (offsets start, 0)]
+ExactRows block_offsets = [(start 0, 4), (offsets start, 0)]
 ```
 
-To retrieve document 4, IdMap supplies `BlockAddress { block: 1, row: 1 }`. The
-block tuple supplies that cluster's starting byte and count of 2. Rows
-is the first column, so the requested vector starts at:
+To retrieve document 4's vector, ExactIdMap ranks it to row 3, which is
+`BlockAddress { block: 0, row: 3 }` of ExactRows under 16,384 rows per block.
+Rows is that block's only column, so the requested vector starts at:
 
 ```text
-Data entry start + block_offsets[1].byte_offset + 1 * (4 * dim)
+ExactRows entry start + block_offsets[0].byte_offset + 3 * (4 * dim)
 ```
 
-To scan cluster 1's codes instead, the reader computes the Codes column range
-using count 2 and the field metadata. It can read that range without reading
-Rows or DocIds. Resolving a result back to a document uses DocIds at the same
-local position.
+A plain clustered field has no ExactRows: its IdMap location names the row in
+the cluster block, whose Rows column comes first, so the vector starts at
+`Data entry start + block_offsets[1].byte_offset + 1 * (4 * dim)`.
+
+To scan cluster 1's codes, the reader computes the Codes column range using
+count 2 and the field metadata and reads that range without reading DocIds.
+Resolving a result back to a document uses DocIds at the same local position;
+scoring the survivors exactly then reads their rows from ExactRows by document.
 
 ## Composite directory and standard footer
 
@@ -702,12 +786,13 @@ This framing is independent of the vector file versions and per-field metadata.
 ## Read behavior
 
 The independently addressable columns allow search to fetch the representation
-needed at each stage. Full vectors are read for exact scoring. DocIds can be
-read first to apply filters and deletion visibility; a cluster with no surviving
-rows then needs no vector payload read. Without filtering or deletions,
-quantized search defers DocIds until the exact phase resolves final candidates.
-Exact scans without a row gate resolve DocIds only when a score reaches heap
-admission.
+needed at each stage. Full vectors are read for exact scoring: from the cluster
+block on plain storage, from ExactRows by document on quantized storage. DocIds
+can be read first to apply filters and deletion visibility; a cluster with no
+surviving rows then needs no vector payload read. Without filtering or
+deletions, quantized search defers DocIds until the exact phase, where a cluster
+with survivors reads its column once before their rows. Plain exact scans
+without a row gate resolve DocIds only when a score reaches heap admission.
 
 A **band** is a contiguous group of quantization columns read together. Band 0
 spans ResidualNorms through the final layer-0 column. Each higher band spans
@@ -722,8 +807,10 @@ Multi-page reads may copy under paged storage, so fewer logical reads do not
 necessarily mean less work. A row-range read from one column cannot cross block
 boundaries; sorted row requests are split into their containing blocks.
 
-The writer streams full vector rows immediately and buffers encoded columns
-for one cluster, then flushes them in layout order. The reader materializes
+The writer streams a plain cluster's full vector rows immediately and buffers
+encoded columns for one cluster, then flushes them in layout order; a quantized
+field's full vectors stream in document order into ExactRows in a pass of their
+own. The reader materializes
 field metadata, count words, and router topology. Block tuples and centroid
 vectors at every routing level remain available through lazy range reads. Each
 local `Block` reuses its resolved boundaries while reading columns; the shared
@@ -739,7 +826,7 @@ additional version field.
 
 ```
 meta       := repr:u8 field [n_layers:u8 quantizer{n_layers} if repr=1]
-field      := dim:u32 dtype:u8 metric:u8 norm_policy:u8 partition
+field      := dim:u32 dtype:u8 metric:u8 norm_policy:u8 partition assignment:u8
 partition  := kind:u8 [rows_per_block:u32 if kind=1]
 quantizer  := kind:u8 payload
   SignPlane := rotation rho_model:f64
@@ -755,20 +842,21 @@ rotation   := kind:u8 [seed:u64 if kind=1]
 | metric | 0 L2, 1 Dot, 2 Cosine |
 | norm_policy | 0 None, 1 UnitL2 |
 | partition | 0 Clusters, 1 Uniform |
+| assignment | 0 Nearest, 1 Soar |
 | quantizer | 0 SignPlane, 1 GridPlane |
 | rotation | 0 None, 1 SeededFhtChaCha8 |
 
 Unknown tags fail at open. SignPlane is the one-bit popcount contract without
 grid points. GridPlane permits bits 2 through 4 and exactly `1 << bits` points.
 SeededFhtChaCha8 pins FHT construction, ChaCha8, and `rand_core::seed_from_u64`.
-Quantized fields contain one to three layers. Dimension, dtype, metric and
-normalization must match the schema. Parsing rejects truncated records,
+Quantized fields contain one to three layers. `Soar` requires `Clusters` and
+`Quantized`. Dimension, dtype, metric and normalization must match the schema. Parsing rejects truncated records,
 trailing metadata bytes, invalid geometry, and entry-length mismatches as
 DataCorruption before payload access.
 
 ## Versioning rules
 
-The current `.vec` reader supports V5; earlier vector formats require rebuilding.
+The current `.vec` reader supports V6; earlier vector formats require rebuilding.
 The `.centroids` reader supports V5, containing centers and a tagged router.
 Block counts and byte locations are stored only in `.vec`. Earlier centroid
 formats require rebuilding.

@@ -36,6 +36,17 @@ pub(crate) struct VectorFieldMeta {
     pub(crate) metric: Metric,
     pub(crate) norm_policy: VectorNormPolicy,
     pub(crate) partition: Partition,
+    pub(crate) assignment: Assignment,
+}
+/// How a clustered field's rows were assigned to its blocks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub(crate) enum Assignment {
+    /// Every document has one row, in its nearest cluster.
+    Nearest,
+    /// Every document has a row in its nearest cluster and a second row in a cluster chosen to
+    /// cover queries the first misses; valid only for quantized clustered fields.
+    Soar,
 }
 /// Source of block row boundaries; cluster offsets reside in the centroid file.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,6 +187,14 @@ impl VectorFieldMeta {
     #[cfg(test)]
     pub(crate) fn partition(&self) -> &Partition {
         &self.partition
+    }
+}
+impl VectorColMetadata {
+    /// Whether the field's full-precision rows live in their own document-ordered entry rather
+    /// than in its blocks: quantized clustered storage.
+    pub(crate) fn has_exact_rows(&self) -> bool {
+        matches!(self, Self::Quantized { .. })
+            && matches!(self.field().partition, Partition::Clusters)
     }
 }
 impl Grid {}
@@ -371,14 +390,19 @@ impl VectorColMetadata {
             ),
         }
     }
-    /// Rows and clustered document ids precede residual norms and ordered layer bands.
+    /// Rows, for plain or flat storage, and clustered document ids precede residual norms and
+    /// ordered layer bands. Quantized clustered blocks carry no rows: those live in the field's
+    /// `ExactRows` entry.
     pub(crate) fn slots(&self) -> Vec<Slot> {
         let field = self.field();
-        let mut slots = vec![Slot {
-            slot_type: SlotType::Rows { dtype: field.dtype },
-            elem: ElemType::F32,
-            stride: field.dim * ElemType::F32.size() as u32,
-        }];
+        let mut slots = Vec::new();
+        if !self.has_exact_rows() {
+            slots.push(Slot {
+                slot_type: SlotType::Rows { dtype: field.dtype },
+                elem: ElemType::F32,
+                stride: field.dim * ElemType::F32.size() as u32,
+            });
+        }
         if matches!(field.partition, Partition::Clusters) {
             slots.push(Slot {
                 slot_type: SlotType::DocIds,
@@ -405,6 +429,7 @@ impl VectorColMetadata {
             metric: opts.metric(),
             norm_policy: VectorNormPolicy::for_options(opts),
             partition,
+            assignment: Assignment::Nearest,
         }
     }
     /// Builds clustered metadata from the index's write target, persisting all models.
@@ -483,6 +508,14 @@ impl VectorColMetadata {
                     ),
                 ))
             }
+        }
+        if f.assignment == Assignment::Soar && !self.has_exact_rows() {
+            return Err(crate::TantivyError::DataCorruption(
+                DataCorruption::comment_only(
+                    "invalid vector metadata: spill assignment requires quantized clustered \
+                     storage",
+                ),
+            ));
         }
         if let Self::Quantized { layers, .. } = self {
             if !(1..=MAX_QUANTIZATION_LAYERS).contains(&layers.len()) {
@@ -569,7 +602,7 @@ impl VectorColMetadata {
             })
             .unzip()
     }
-    /// Serializes the V4 grammar using explicit tag maps, never Rust discriminants.
+    /// Serializes the field grammar using explicit tag maps, never Rust discriminants.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.push(u8::from(matches!(self, Self::Quantized { .. })));
@@ -590,6 +623,10 @@ impl VectorColMetadata {
                 out.extend(rows_per_block.to_le_bytes());
             }
         }
+        out.push(match f.assignment {
+            Assignment::Nearest => 0,
+            Assignment::Soar => 1,
+        });
         if let Self::Quantized { layers, .. } = self {
             out.push(layers.len() as u8);
             for quant in layers {
@@ -667,12 +704,28 @@ impl VectorColMetadata {
                     ))
                 }
             };
+            let assignment = match u8::deserialize(input)? {
+                0 => Assignment::Nearest,
+                1 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "spill assignment is not supported by this build; rebuild required",
+                    ))
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unknown metadata tag; rebuild required",
+                    ))
+                }
+            };
             let field = VectorFieldMeta {
                 dim,
                 dtype,
                 metric,
                 norm_policy,
                 partition,
+                assignment,
             };
             Ok(match repr {
                 0 => VectorColMetadata::Plain(field),
@@ -796,7 +849,8 @@ mod tests {
             QuantizationSchedule::new(vec![(QuantizerKind::Sign, 1), (QuantizerKind::Grid, 4)]);
         assert_eq!(schedule.to_string(), "[sign:1, grid:4]");
     }
-    // Pins ordered slot semantics, widths, strides, and scan-band ownership.
+    // Pins ordered slot semantics, widths, strides, and scan-band ownership: quantized clustered
+    // blocks start at DocIds and carry no rows, every other layout starts at Rows.
     #[test]
     fn golden_slot_contract() {
         for clustered in [false, true] {
@@ -810,25 +864,31 @@ mod tests {
                             };
                         }
                     }
-                    let norms = if clustered { 2 } else { 1 };
+                    assert_eq!(meta.has_exact_rows(), clustered);
+                    assert_eq!(meta.field().assignment, Assignment::Nearest);
                     let slots = meta.slots();
-                    assert!(matches!(
-                        slots[0].slot_type,
-                        SlotType::Rows {
-                            dtype: VectorDType::F32
-                        }
-                    ));
-                    assert_eq!(
-                        (slots[0].elem, slots[0].stride, slots[0].slot_type.band()),
-                        (ElemType::F32, 400, None)
-                    );
                     if clustered {
-                        assert!(matches!(slots[1].slot_type, SlotType::DocIds));
+                        assert!(matches!(slots[0].slot_type, SlotType::DocIds));
                         assert_eq!(
-                            (slots[1].elem, slots[1].stride, slots[1].slot_type.band()),
+                            (slots[0].elem, slots[0].stride, slots[0].slot_type.band()),
                             (ElemType::U32, 4, None)
                         );
+                        assert!(!slots
+                            .iter()
+                            .any(|slot| matches!(slot.slot_type, SlotType::Rows { .. })));
+                    } else {
+                        assert!(matches!(
+                            slots[0].slot_type,
+                            SlotType::Rows {
+                                dtype: VectorDType::F32
+                            }
+                        ));
+                        assert_eq!(
+                            (slots[0].elem, slots[0].stride, slots[0].slot_type.band()),
+                            (ElemType::F32, 400, None)
+                        );
                     }
+                    let norms = 1;
                     assert!(matches!(slots[norms].slot_type, SlotType::ResidualNorms));
                     assert_eq!(
                         (
@@ -900,6 +960,7 @@ mod tests {
                 } else {
                     VectorColMetadata::build_flat(&opts)
                 };
+                assert!(!plain.has_exact_rows());
                 assert_eq!(plain.slots().len(), if clustered { 2 } else { 1 });
                 if clustered {
                     let slot = &plain.slots()[1];
@@ -977,7 +1038,7 @@ mod tests {
     #[test]
     fn metadata_rejects_corruption() {
         let meta = metadata(Metric::L2, &[1]);
-        for offset in [0, 5, 6, 7, 8, 10, 11] {
+        for offset in [0, 5, 6, 7, 8, 9, 10, 11, 12] {
             let mut bytes = meta.to_bytes();
             bytes[offset] = 255;
             assert!(
@@ -985,6 +1046,31 @@ mod tests {
                 "offset {offset}"
             );
         }
+        // The spill assignment is a known tag this build does not read.
+        let mut spilled = meta.to_bytes();
+        spilled[9] = 1;
+        let error = VectorColMetadata::from_bytes(&spilled)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("spill assignment"), "{error}");
+        // In memory, the spill assignment needs quantized clustered storage.
+        let opts = VectorOptions::new(100, Metric::L2);
+        let mut soar = meta.clone();
+        if let VectorColMetadata::Quantized { field, .. } = &mut soar {
+            field.assignment = Assignment::Soar;
+        }
+        soar.validate(&opts, true).unwrap();
+        if let VectorColMetadata::Quantized { field, .. } = &mut soar {
+            field.partition = Partition::Uniform {
+                rows_per_block: FLAT_ROWS_PER_BLOCK,
+            };
+        }
+        assert!(soar.validate(&opts, false).is_err());
+        let mut plain_soar = VectorColMetadata::build_ivf(&opts, None).unwrap();
+        if let VectorColMetadata::Plain(field) = &mut plain_soar {
+            field.assignment = Assignment::Soar;
+        }
+        assert!(plain_soar.validate(&opts, true).is_err());
         let opts = VectorOptions::new(100, Metric::L2);
         for change in 0..5 {
             let mut broken = meta.clone();
@@ -1112,7 +1198,7 @@ mod tests {
             },
         };
         let expected = [
-            1, 100, 0, 0, 0, 0, 1, 0, 0, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 208, 63, 4, 0, 0, 0, 128,
+            1, 100, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 208, 63, 4, 0, 0, 0, 128,
             191, 0, 0, 0, 191, 0, 0, 0, 63, 0, 0, 128, 63,
         ];
         assert_eq!(meta.to_bytes(), expected);
@@ -1125,7 +1211,10 @@ mod tests {
     fn metadata_grammar_golden_bytes() {
         let opts = VectorOptions::new(100, Metric::Dot);
         let plain = VectorColMetadata::build_flat(&opts);
-        assert_eq!(plain.to_bytes(), [0, 100, 0, 0, 0, 0, 1, 0, 1, 0, 64, 0, 0]);
+        assert_eq!(
+            plain.to_bytes(),
+            [0, 100, 0, 0, 0, 0, 1, 0, 1, 0, 64, 0, 0, 0]
+        );
         let mut quant = metadata(Metric::Dot, &[1]);
         if let VectorColMetadata::Quantized { layers, .. } = &mut quant {
             layers[0] = Quantizer::SignPlane {
@@ -1133,7 +1222,7 @@ mod tests {
                 rho_model: F64Bits(1.0f64.to_bits()),
             };
         }
-        let mut expected = vec![1, 100, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0];
+        let mut expected = vec![1, 100, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0];
         expected.extend(1.0f64.to_le_bytes());
         assert_eq!(quant.to_bytes(), expected);
         assert_eq!(
