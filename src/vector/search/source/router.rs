@@ -1,31 +1,32 @@
 //! The router cluster source: clusters in the router's order, admitted under the work budget,
 //! and the filter.
 
+use std::sync::Arc;
+
 use common::BitSet;
 
 use crate::fastfield::AliveBitSet;
-use crate::vector::params::ProbeParams;
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::{RouterIter, RouterMetrics, RoutingParams};
+use crate::vector::router::{RouterIter, RouterMetrics};
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
-use crate::vector::search::prepared::VectorQuery;
 use crate::vector::search::source::controller::{
-    ProbeController, ProbeOutcome, WorkBudget, WorkMeter,
+    ProbeController, ProbeOutcome, SharedVectorWork, WorkBudget, WorkMeter,
 };
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::enter_vector_stage;
-use crate::vector::{VectorElement, VectorStage};
+use crate::vector::VectorStage;
 use crate::{DocId, SegmentReader};
 
 // --- Filter and gate ---
 
 /// The filter's matches as the router source gates rows with them.
+#[derive(Clone)]
 pub(crate) enum DocFilter {
     /// Every doc id below `max_doc` matches, deleted docs included; no bitset is built.
     All,
     /// The matching doc ids.
-    Docs(BitSet),
+    Docs(Arc<BitSet>),
 }
 
 impl DocFilter {
@@ -46,9 +47,9 @@ impl DocFilter {
 pub(crate) enum RowGate<'a> {
     Open,
     AliveOnly(&'a AliveBitSet),
-    FilterOnly(BitSet),
+    FilterOnly(Arc<BitSet>),
     FilterAndAlive {
-        filter: BitSet,
+        filter: Arc<BitSet>,
         alive: &'a AliveBitSet,
     },
 }
@@ -188,39 +189,21 @@ pub(crate) struct RouterClusters<'a> {
 }
 
 impl<'a> RouterClusters<'a> {
-    /// Prepares this segment to choose and probe its own clusters.
-    /// Its router determines the cluster order, and its budget controls when probing stops.
-    pub(crate) fn for_segment<T: VectorElement>(
+    pub(crate) fn from_ranked(
         reader: &'a VectorIndexReader,
-        query: &'a VectorQuery<T>,
+        ranked: RouterIter,
         budget: WorkBudget,
         filter: DocFilter,
         segment: &'a SegmentReader,
-        params: &'a ProbeParams,
+        shared_work: Option<Arc<dyn SharedVectorWork>>,
     ) -> Self {
-        let index = reader
-            .index()
-            .expect("the router source runs on an IVF segment");
-        let clusters = index.num_clusters();
-        let routing = RoutingParams {
-            rerank_factor: params.router_rerank_factor,
-            min_beam_fraction: params.router_min_beam_fraction,
-            aps: params.router_aps,
-            k: params.router_k(
-                budget.total.get(),
-                budget.per_cluster.get(),
-                filter.match_fraction(segment.max_doc()),
-                clusters,
-            ),
-        };
-        let _routing = enter_vector_stage(VectorStage::Routing);
-        let ranked = index.rank_clusters(query, routing);
+        let index = reader.index().expect("IVF segment");
         Self {
             index,
             reader,
             ranked,
-            meter: WorkMeter::new(budget),
-            controller: ProbeController::new(clusters),
+            meter: WorkMeter::new(budget, shared_work),
+            controller: ProbeController::new(index.num_clusters()),
             gate: RowGate::new(filter, segment.alive_bitset()),
             docs: Vec::new(),
             offsets: Vec::new(),
@@ -238,19 +221,14 @@ impl<'a> RouterClusters<'a> {
         segment: &'a SegmentReader,
         metrics: RouterMetrics,
     ) -> Self {
-        let index = reader.index().expect("IVF segment");
-        Self {
-            index,
+        Self::from_ranked(
             reader,
-            ranked: RouterIter::new(Vec::new(), metrics),
-            meter: WorkMeter::new(budget),
-            controller: ProbeController::new(index.num_clusters()),
-            gate: RowGate::new(filter, segment.alive_bitset()),
-            docs: Vec::new(),
-            offsets: Vec::new(),
-            selected_docs: Vec::new(),
-            counters: RouterCounters::default(),
-        }
+            RouterIter::new(Vec::new(), metrics),
+            budget,
+            filter,
+            segment,
+            None,
+        )
     }
 
     /// Prepares a cluster chosen by the global router.

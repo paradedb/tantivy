@@ -301,7 +301,8 @@ impl Fixture {
             let collector = TopDocs::with_limit(10)
                 .order_by_similarity(self.field, query.clone())
                 .with_probe_params(params.clone())
-                .build();
+                .build_for_searcher(searcher, filter)
+                .unwrap();
             searcher.search(filter, &collector).map(|fruit| fruit.stats)
         };
         run().expect("warm-up search");
@@ -313,8 +314,7 @@ impl Fixture {
 /// Probes about `clusters` clusters: the budget is that many average clusters of work.
 fn probing(clusters: usize, located: LocatedPath) -> ProbeParams {
     ProbeParams {
-        max_probe_fraction: 1e-6,
-        min_probe_clusters: clusters,
+        max_probe: clusters,
         located,
         ..ProbeParams::default()
     }
@@ -474,7 +474,7 @@ fn peak_on_a_large_segment() -> tantivy::Result<()> {
         ("located", located_everything()),
     ] {
         let params = ProbeParams {
-            max_probe_fraction: 0.25,
+            max_probe: 64,
             min_probe_clusters: 1,
             located,
             ..ProbeParams::default()

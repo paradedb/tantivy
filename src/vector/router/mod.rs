@@ -12,12 +12,15 @@ use crate::schema::VectorOptions;
 use crate::vector::clustering::IvfCentroids;
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::stacked::levels::{ClusterId, InMemoryStore, LazyStore};
+#[cfg(test)]
 use crate::vector::search::prepared::VectorQuery;
+#[cfg(test)]
 use crate::vector::VectorElement;
 use crate::TantivyError;
 
 pub(crate) mod arena;
 pub(crate) mod candidate;
+pub(crate) mod collector;
 mod exact;
 pub(crate) mod global;
 mod quantized;
@@ -43,6 +46,15 @@ pub enum RouterKind {
 }
 
 impl RouterKind {
+    pub(crate) fn empty_metrics(self) -> RouterMetrics {
+        match self {
+            Self::Exact => RouterMetrics::Exact { visited_count: 0 },
+            Self::Stacked | Self::QuantizedStacked => {
+                stacked::routing_metrics(self == Self::QuantizedStacked, 0, Default::default())
+            }
+        }
+    }
+
     /// The kind persisted as `code`. A code this library doesn't build is an incompatible index
     /// (rebuild required), not corruption.
     pub(crate) fn from_code(code: u8) -> crate::Result<Self> {
@@ -208,6 +220,7 @@ impl OpenedRouter {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn rank<T: VectorElement>(
         &self,
         query: &VectorQuery<T>,
@@ -221,7 +234,7 @@ impl OpenedRouter {
 }
 
 /// Router-specific statistics captured after a ranking iterator stops.
-#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RouterMetrics {
     /// The stacked router's work.
@@ -252,41 +265,6 @@ pub enum RouterMetrics {
         /// Centroids scored.
         visited_count: usize,
     },
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_CLUSTERS: std::cell::RefCell<Option<Vec<Candidate>>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Scans the supplied cluster similarities without invoking a router.
-#[cfg(test)]
-pub(crate) fn with_test_clusters<T>(clusters: Vec<Candidate>, scan: impl FnOnce() -> T) -> T {
-    struct Restore(Option<Vec<Candidate>>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            TEST_CLUSTERS.with(|slot| *slot.borrow_mut() = self.0.take());
-        }
-    }
-    let _restore = Restore(TEST_CLUSTERS.with(|slot| slot.replace(Some(clusters))));
-    scan()
-}
-
-#[cfg(test)]
-pub(crate) fn test_clusters() -> Option<RouterIter> {
-    TEST_CLUSTERS.with(|slot| {
-        slot.borrow().clone().map(|rows| {
-            RouterIter::new(
-                rows.into_iter()
-                    .map(|c| Candidate {
-                        node: ClusterId(c.node),
-                        sim: c.sim,
-                    })
-                    .collect(),
-                RouterMetrics::Exact { visited_count: 0 },
-            )
-        })
-    })
 }
 
 #[cfg(test)]

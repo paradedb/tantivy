@@ -456,15 +456,14 @@ fn flat_top_n_returns_nearest_when_more_than_k_docs_per_segment() -> crate::Resu
     let query = grid2d::centroids()[0];
     let top_k = 3;
     let expected = index.ground_truth(query, top_k)?;
-    let hits = index
-        .index
-        .reader()?
-        .searcher()
+    let searcher = index.index.reader()?.searcher();
+    let hits = searcher
         .search(
             &AllQuery,
             &TopDocs::with_limit(top_k)
                 .order_by_similarity(index.embedding_field(), query.to_vec())
-                .build(),
+                .build_for_searcher(&searcher, &crate::query::AllQuery)
+                .unwrap(),
         )?
         .results;
     assert_eq!(hits, expected);
@@ -546,7 +545,8 @@ fn default_setup_clusters_past_the_threshold() -> crate::Result<()> {
             &TopDocs::with_limit(10)
                 .order_by_similarity(field, query.to_vec())
                 .with_probe_params(exhaustive_params(0))
-                .build(),
+                .build_for_searcher(&searcher, &crate::query::AllQuery)
+                .unwrap(),
         )?;
         assert_eq!(actual.results, expected);
         Ok(())
@@ -714,7 +714,8 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
     let searcher = index.reader()?.searcher();
     let collector = TopDocs::with_limit(2)
         .order_by_similarity(embedding_field, vec![1.0_f32, 0.0])
-        .build();
+        .build_for_searcher(&searcher, &crate::query::AllQuery)
+        .unwrap();
     let hits = searcher.search(&AllQuery, &collector)?.results;
     assert_eq!(hits.len(), 2, "zero vector must be ingested and returned");
     assert!(hits[0].0 > 0.0, "non-zero doc must rank first: {hits:?}");
@@ -727,7 +728,7 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
 /// oracle-equality tests, where every cluster must be probed.
 pub(crate) fn exhaustive_params(_num_centroids: usize) -> ProbeParams {
     ProbeParams {
-        max_probe_fraction: 1.0,
+        max_probe: usize::MAX,
         min_probe_clusters: 1,
         ..Default::default()
     }
@@ -1291,7 +1292,8 @@ mod centroid_storage_tests {
                 .collect();
             let prepared = VectorQuery::new(Metric::L2, Arc::new(query.to_vec()));
             let lazy: Vec<_> = ivf
-                .rank_clusters(&prepared, RoutingParams::default())
+                .opened_router()
+                .rank(&prepared, RoutingParams::default())
                 .take(2)
                 .collect();
             assert_eq!(owned.len(), lazy.len());
@@ -1318,7 +1320,8 @@ mod centroid_storage_tests {
                     &AllQuery,
                     &TopDocs::with_limit(1)
                         .order_by_similarity(field, query)
-                        .build(),
+                        .build_for_searcher(&searcher, &crate::query::AllQuery)
+                        .unwrap(),
                 )?
                 .results;
             assert_eq!(hits.len(), 1);
