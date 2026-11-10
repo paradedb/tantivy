@@ -9,7 +9,9 @@ use crate::{DocId, TantivyError};
 
 mod superkmeans;
 
-pub use superkmeans::{SuperKMeansClusterer, DEFAULT_MAX_LEAF_SIZE, DEFAULT_TRAINING_SAMPLE_RATIO};
+pub use superkmeans::{
+    SuperKMeansClusterer, DEFAULT_TARGET_LEAF_SIZE, DEFAULT_TRAINING_SAMPLE_RATIO,
+};
 
 pub trait IvfClusterer: Send + Sync + 'static {
     /// Fraction of vectors sampled for training, in `(0, 1]`.
