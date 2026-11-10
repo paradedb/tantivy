@@ -33,6 +33,10 @@ pub struct ProbeParams {
     /// Whether stacked routing may stop after lists cease improving its heap.
     /// Quantized routing observes its approximate padded heap. Default true.
     pub router_aps: bool,
+    /// Ranks every centroid of every routed segment exactly, from the segment's raw centroid
+    /// rows, in place of its stored router. A diagnostic for measuring a stored router against
+    /// the exhaustive ranking under the same `k` and budget. Default false.
+    pub router_flat: bool,
     /// Floor on the resolved budget, in work units, applied before the capacity cap. Default 0.
     pub min_probe_clusters: usize,
     /// Lets a quantized segment score a cluster's rows exactly before the exact phase when that
@@ -101,6 +105,7 @@ impl Default for ProbeParams {
             router_rerank_factor: 1.0,
             router_min_beam_fraction: 0.5,
             router_aps: true,
+            router_flat: false,
             min_probe_clusters: 0,
             exact_plan: true,
             located: LocatedPath::Auto,

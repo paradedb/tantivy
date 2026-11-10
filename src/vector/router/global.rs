@@ -8,6 +8,8 @@ use crate::vector::{VectorElement, VectorStage};
 
 /// Clusters to probe across all segments, ordered by centroid similarity to the query.
 /// Each cluster carries its segment index, and metrics track the routing work for each segment.
+/// With [`RoutingParams::flat`], every segment is ranked as an exact router ranks it, partition
+/// centroids are unused, and the merged ranking keeps its best `k`.
 pub(crate) struct GlobalRanking {
     pub(crate) clusters: Vec<(usize, Candidate)>,
     pub(crate) metrics: Vec<RouterMetrics>,
@@ -34,11 +36,11 @@ impl GlobalRanking {
         ];
         for (segment, router) in routers.iter().enumerate() {
             let index = match router {
-                Some(Router::Stacked(index)) => Some(&index.level),
-                Some(Router::Exact(index)) => {
+                Some(Router::Stacked(index)) if !params.flat => Some(&index.level),
+                Some(router) => {
                     let (ranked, measured) = measure(|| {
                         let _stage = enter_vector_stage(VectorStage::Routing);
-                        index.rank(query).collect::<Vec<_>>()
+                        router.rank_exhaustive(query).collect::<Vec<_>>()
                     });
                     totals[segment].append(&measured);
                     on_segment(segment);
@@ -92,12 +94,15 @@ impl GlobalRanking {
                 .then(a.0.cmp(&b.0))
                 .then(a.1.node.cmp(&b.1.node))
         });
+        if params.flat {
+            leaves.truncate(params.k.max(1));
+        }
         let mut counts = vec![0; routers.len()];
         for (segment, _) in &leaves {
             counts[*segment] += 1;
         }
         for (segment, router) in routers.iter().enumerate() {
-            if let Some(Router::Stacked(index)) = router {
+            if let (Some(Router::Stacked(index)), false) = (router, params.flat) {
                 metrics[segment] = super::stacked::routing_metrics(
                     index.kind() == super::RouterKind::QuantizedStacked,
                     counts[segment],
@@ -648,6 +653,7 @@ mod tests {
                 rerank_factor: 1.5,
                 aps: false,
                 min_beam_fraction: 1.0,
+                flat: false,
             },
             &mut totals,
             &mut |_| {},
@@ -704,6 +710,83 @@ mod tests {
             }
         ));
         assert_eq!(*reads.lock().unwrap(), vec![0..12 * 8 * 4]);
+        Ok(())
+    }
+
+    fn open_exact_router(metric: Metric, rows: &[f32], dim: usize) -> crate::Result<OpenedRouter> {
+        let options = VectorOptions::new(dim, metric);
+        let mut centroids = IvfCentroids::F32(IvfMatrix {
+            values: rows.to_vec(),
+            rows: rows.len() / dim,
+            dims: dim,
+        });
+        let mut payload = Vec::new();
+        RouterKind::Exact
+            .build(&options, &mut centroids)?
+            .serialize(&mut payload)?;
+        let bytes: Vec<_> = rows.iter().flat_map(|x| x.to_le_bytes()).collect();
+        RouterKind::open(FileSlice::from(payload), FileSlice::from(bytes), &options)
+    }
+
+    /// Flat routing of a stacked and a quantized stacked segment reads each bottom bank once,
+    /// ignores partition centroids, and returns the ranking exact routers over the same centroid
+    /// rows return, truncated to `k`.
+    #[test]
+    fn flat_ranking_matches_exact_routers_over_the_same_centroids() -> crate::Result<()> {
+        use super::super::source::ROUTER_SEED;
+        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+            for nested in [false, true] {
+                let stacked = open_represented_router(metric, nested, None)?;
+                let quantized = open_represented_router(metric, nested, Some(ROUTER_SEED))?;
+                assert_eq!(stacked.0.kind(), RouterKind::Stacked);
+                assert_eq!(quantized.0.kind(), RouterKind::QuantizedStacked);
+                let exact = [
+                    open_exact_router(metric, &stacked.1, 8)?,
+                    open_exact_router(metric, &quantized.1, 8)?,
+                ];
+                let query = VectorQuery::new(
+                    metric,
+                    Arc::new((0..8).map(|d| 0.1 * d as f32 - 0.3).collect()),
+                );
+                let mut totals = vec![StageTotals::default(); 2];
+                let expected = GlobalRanking::from(
+                    &[Some(&exact[0]), Some(&exact[1])],
+                    &[],
+                    &query,
+                    RoutingParams::default(),
+                    &mut totals,
+                    &mut |_| {},
+                );
+                assert_eq!(expected.clusters.len(), 24);
+                for k in [1, 5, usize::MAX] {
+                    stacked.2.lock().unwrap().clear();
+                    quantized.2.lock().unwrap().clear();
+                    let mut totals = vec![StageTotals::default(); 2];
+                    let mut routed = Vec::new();
+                    let flat = GlobalRanking::from(
+                        &[Some(&stacked.0), Some(&quantized.0)],
+                        &[Some(&[0.9f32; 8][..]), Some(&[-0.9f32; 8][..])],
+                        &query,
+                        RoutingParams {
+                            k,
+                            flat: true,
+                            ..Default::default()
+                        },
+                        &mut totals,
+                        &mut |segment| routed.push(segment),
+                    );
+                    assert_eq!(flat.clusters, expected.clusters[..k.min(24)]);
+                    assert!(flat
+                        .metrics
+                        .iter()
+                        .all(|m| matches!(m, RouterMetrics::Exact { visited_count: 12 })));
+                    assert_eq!(routed, [0, 1]);
+                    for reads in [&stacked.2, &quantized.2] {
+                        assert_eq!(*reads.lock().unwrap(), vec![0..12 * 8 * 4]);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }

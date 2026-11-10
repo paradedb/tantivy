@@ -25,34 +25,43 @@ impl<S: VectorArena<Elem = f32>> ExactRouter<S> {
     pub(super) fn rank<T: VectorElement>(&self, query: &VectorQuery<T>) -> RouterIter {
         assert_eq!(query.widened().len(), self.dim);
         debug_assert_eq!(query.metric(), self.metric);
-        let mut scores = Vec::with_capacity(self.num_centroids);
-        self.centroids.batch_similarity(
-            query.widened(),
-            query.metric(),
-            query.routing_norm(),
-            0..self.num_centroids,
-            &mut scores,
-        );
-        let mut ranked = scores
-            .into_iter()
-            .enumerate()
-            .map(|(cluster, sim)| Candidate {
-                sim,
-                node: ClusterId::from(cluster),
-            })
-            .collect::<Vec<_>>();
-        ranked.sort_unstable_by(|a, b| b.cmp(a));
-        RouterIter::new(
-            ranked,
-            RouterMetrics::Exact {
-                visited_count: self.num_centroids,
-            },
-        )
+        rank_rows(&self.centroids, self.num_centroids, query)
     }
 
     pub(super) fn serialize_payload<W: Write + ?Sized>(&self, _out: &mut W) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// Scores centroid rows `0..count` against the query and ranks them all, most similar first.
+pub(super) fn rank_rows<S: VectorArena<Elem = f32>, T: VectorElement>(
+    centroids: &S,
+    count: usize,
+    query: &VectorQuery<T>,
+) -> RouterIter {
+    let mut scores = Vec::with_capacity(count);
+    centroids.batch_similarity(
+        query.widened(),
+        query.metric(),
+        query.routing_norm(),
+        0..count,
+        &mut scores,
+    );
+    let mut ranked = scores
+        .into_iter()
+        .enumerate()
+        .map(|(cluster, sim)| Candidate {
+            sim,
+            node: ClusterId::from(cluster),
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_unstable_by(|a, b| b.cmp(a));
+    RouterIter::new(
+        ranked,
+        RouterMetrics::Exact {
+            visited_count: count,
+        },
+    )
 }
 
 pub(super) fn build(
