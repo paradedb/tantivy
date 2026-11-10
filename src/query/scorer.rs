@@ -41,6 +41,45 @@ pub trait PruningScorer: Scorer {
 
 impl_downcast!(PruningScorer);
 
+/// A scorer that bounds its score per posting block, so Block-WAND can skip the blocks that
+/// cannot beat the current threshold. A term scorer reads the bound from its skip data, and a
+/// scorer over several posting lists sums the bounds of its members.
+pub trait BlockMaxScorer: Scorer {
+    /// An upper bound of `score()` for every doc in the current block.
+    fn block_max_score(&mut self) -> Score;
+
+    /// The last doc of the current block, or `TERMINATED` in the last block.
+    fn last_doc_in_block(&self) -> DocId;
+
+    /// Moves to the block that holds `target` without reading it.
+    fn seek_block(&mut self, target: DocId);
+
+    /// An upper bound of `score()` over every doc.
+    fn max_score(&self) -> Score;
+}
+
+impl<TScorer: BlockMaxScorer + ?Sized> BlockMaxScorer for Box<TScorer> {
+    #[inline]
+    fn block_max_score(&mut self) -> Score {
+        self.deref_mut().block_max_score()
+    }
+
+    #[inline]
+    fn last_doc_in_block(&self) -> DocId {
+        (**self).last_doc_in_block()
+    }
+
+    #[inline]
+    fn seek_block(&mut self, target: DocId) {
+        self.deref_mut().seek_block(target)
+    }
+
+    #[inline]
+    fn max_score(&self) -> Score {
+        (**self).max_score()
+    }
+}
+
 impl<TScorer: PruningScorer + ?Sized> PruningScorer for Box<TScorer> {
     #[inline]
     fn set_threshold(&mut self, score: Score) {
