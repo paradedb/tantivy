@@ -25,6 +25,7 @@ pub(crate) enum Source {
 pub(crate) struct PlanReport {
     pub(crate) segment_rows: usize,
     pub(crate) segment_clusters: usize,
+    pub(crate) planned_clusters: usize,
     /// The located-path cap in matches; 0 with the located path off.
     pub(crate) located_cap: usize,
 }

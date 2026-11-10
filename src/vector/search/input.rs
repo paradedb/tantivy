@@ -142,6 +142,7 @@ impl PreparedVectorSearch {
                         let report = PlanReport {
                             segment_rows: index.num_rows(),
                             segment_clusters: index.num_clusters(),
+                            planned_clusters: 0,
                             located_cap: cap,
                         };
                         let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
@@ -248,7 +249,7 @@ impl PreparedVectorSearch {
             })
             .collect();
         let mut seen = HashSet::new();
-        let mut routed = HashSet::new();
+        let mut routed = HashMap::<_, usize>::new();
         for candidate in &candidates {
             let (ordinal, cluster) = candidate.node;
             let clusters = cluster_counts.get(&ordinal).ok_or_else(|| {
@@ -261,13 +262,14 @@ impl PreparedVectorSearch {
                     "invalid or duplicate routing cluster".into(),
                 ));
             }
-            routed.insert(ordinal);
+            *routed.entry(ordinal).or_default() += 1;
         }
         self.segments
-            .retain(|s| !s.routed() || routed.contains(&s.ordinal));
-        if shared_work.is_some() {
-            for segment in &mut self.segments {
-                if let Some(ScanInput::Routed { budget, .. }) = &mut segment.scan {
+            .retain(|s| !s.routed() || routed.contains_key(&s.ordinal));
+        for segment in &mut self.segments {
+            if let Some(ScanInput::Routed { budget, report, .. }) = &mut segment.scan {
+                report.planned_clusters = routed[&segment.ordinal];
+                if shared_work.is_some() {
                     budget.total = self.budget.work.total;
                 }
             }
@@ -445,6 +447,7 @@ mod tests {
                 assert!(fixture.reads().is_empty());
             }
             assert_eq!(fruit.results, fixture.oracle(&filter, &query, 5)?);
+            assert!(fruit.stats.iter().all(|s| s.planned_clusters == 0));
         }
         Ok(())
     }
