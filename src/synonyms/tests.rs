@@ -9,7 +9,7 @@ use columnar::{Column, StrColumn};
 use super::*;
 use crate::collector::DocSetCollector;
 use crate::indexer::NoMergePolicy;
-use crate::query::{DisjunctionMaxQuery, Query, SynonymQuery, TermQuery};
+use crate::query::{DisjunctionMaxQuery, PhraseQuery, Query, SynonymQuery, TermQuery};
 use crate::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, INDEXED, STORED, TEXT,
 };
@@ -308,6 +308,7 @@ fn each_expansion_becomes_the_query_that_matches_its_alternatives() {
             "sofa, couch, divan",
             "sneakers, running shoes",
             "armchair => chair",
+            "trainers => running shoes",
         ],
     );
     let (docs, body) = docs_index(&[
@@ -316,16 +317,13 @@ fn each_expansion_becomes_the_query_that_matches_its_alternatives() {
         "running shoes for sale",
         "shoes for running",
         "a red chair",
+        "a sofa bed",
     ]);
     let searcher = docs.reader().unwrap().searcher();
+    let term = |token: &str| Term::from_field_text(body, token);
     let query = |text: &str| {
         let [expansion] = rules.expand(&[text]).try_into().unwrap();
-        expansion_query(
-            &expansion,
-            |token| Term::from_field_text(body, token),
-            IndexRecordOption::WithFreqsAndPositions,
-        )
-        .unwrap()
+        expansion_query(&expansion, term).unwrap()
     };
     let matches = |query: &dyn Query| {
         let mut docs: Vec<DocId> = searcher
@@ -339,8 +337,11 @@ fn each_expansion_becomes_the_query_that_matches_its_alternatives() {
     };
 
     let sofa = query("sofa");
-    assert!(sofa.downcast_ref::<SynonymQuery>().is_some(), "{sofa:?}");
-    assert_eq!(matches(sofa.as_ref()), vec![0, 1]);
+    let group = sofa
+        .downcast_ref::<SynonymQuery>()
+        .unwrap_or_else(|| panic!("{sofa:?}"));
+    assert_eq!(group.terms().len(), 3);
+    assert_eq!(matches(sofa.as_ref()), vec![0, 1, 5]);
 
     // The phrase alternative matches the words next to each other only.
     let sneakers = query("sneakers");
@@ -360,18 +361,21 @@ fn each_expansion_becomes_the_query_that_matches_its_alternatives() {
     let red = query("red");
     assert!(red.downcast_ref::<TermQuery>().is_some(), "{red:?}");
     assert_eq!(matches(red.as_ref()), vec![0, 4]);
-}
 
-#[test]
-fn a_phrase_alternative_needs_positions() {
-    let expansion = expanded(&["sneakers"], Some(&[&["running", "shoes"], &["sneakers"]]));
-    let term = |token: &str| Term::from_field_text(Field::from_field_id(0), token);
-    let without_positions = expansion_query(&expansion, term, IndexRecordOption::WithFreqs);
+    let trainers = query("trainers");
     assert!(
-        matches!(without_positions, Err(TantivyError::InvalidArgument(_))),
-        "{without_positions:?}"
+        trainers.downcast_ref::<PhraseQuery>().is_some(),
+        "{trainers:?}"
     );
-    assert!(expansion_query(&expansion, term, IndexRecordOption::WithFreqsAndPositions).is_ok());
+    assert_eq!(matches(trainers.as_ref()), vec![2]);
+
+    // A run of several tokens that no rule matched is a phrase too.
+    let shoes_for = expansion_query(&expanded(&["shoes", "for"], None), term).unwrap();
+    assert!(
+        shoes_for.downcast_ref::<PhraseQuery>().is_some(),
+        "{shoes_for:?}"
+    );
+    assert_eq!(matches(shoes_for.as_ref()), vec![2, 3]);
 }
 
 /// The same sequence on every run, so a failing seed replays.
