@@ -2,15 +2,16 @@ use std::any::{Any, TypeId};
 use std::io;
 use std::sync::Arc;
 
+use common::BitSet;
 use tantivy_fst::Automaton;
 
 use super::phrase_prefix_query::prefix_end;
 use super::BufferedUnionScorer;
-use crate::index::SegmentReader;
+use crate::index::{InvertedIndexReader, SegmentReader};
 use crate::postings::TermInfo;
 use crate::query::fuzzy_query::DfaWrapper;
 use crate::query::score_combiner::SumCombiner;
-use crate::query::{ConstScorer, Explanation, Scorer, Weight};
+use crate::query::{BitSetDocSet, ConstScorer, Explanation, Scorer, Weight};
 use crate::schema::{Field, IndexRecordOption};
 use crate::termdict::{TermDictionary, TermWithStateStreamer};
 use crate::{DocId, Score, TantivyError};
@@ -109,35 +110,29 @@ where
         let term_dict = inverted_index.terms();
         let mut term_stream = self.automaton_stream(term_dict)?;
 
-        let mut scorers = vec![];
-        let mut bitmaps: Vec<Box<dyn Scorer>> = Vec::new();
-        while let Some((_term, term_info, state)) = term_stream.next() {
-            if self.bitmap_enabled && !self.scoring_enabled && reader.bitmap_postings_enabled {
-                if let Some(bitmap) =
-                    inverted_index.read_bitmap_from_terminfo(term_info, reader.max_doc())?
-                {
-                    bitmaps.push(Box::new(ConstScorer::new(bitmap, boost)));
-                    continue;
-                }
+        if !self.scoring_enabled {
+            let mut bitset = BitSet::with_max_value(reader.max_doc());
+            while let Some((_term, term_info, _state)) = term_stream.next() {
+                or_term_info_into_bitset(
+                    &inverted_index,
+                    term_info,
+                    &mut bitset,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
+                )?;
             }
+            return Ok(Box::new(ConstScorer::new(
+                BitSetDocSet::from(bitset),
+                boost,
+            )));
+        }
+
+        let mut scorers = vec![];
+        while let Some((_term, term_info, state)) = term_stream.next() {
             let score = automaton_score(self.automaton.as_ref(), state);
             let segment_postings =
                 inverted_index.read_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
             let scorer = ConstScorer::new(segment_postings, boost * score);
             scorers.push(scorer);
-        }
-
-        if !bitmaps.is_empty() {
-            bitmaps.extend(
-                scorers
-                    .into_iter()
-                    .map(|scorer| Box::new(scorer) as Box<dyn Scorer>),
-            );
-            return Ok(Box::new(super::bitmap_combination::BitmapCombination::new(
-                bitmaps,
-                super::bitmap_combination::BitmapOperation::Union,
-                reader.max_doc(),
-            )));
         }
 
         let scorer = BufferedUnionScorer::build(scorers, SumCombiner::default, reader.max_doc());
@@ -154,6 +149,41 @@ where
             ))
         }
     }
+}
+
+pub(crate) fn or_term_info_into_bitset(
+    inverted_index: &InvertedIndexReader,
+    term_info: &TermInfo,
+    bitset: &mut BitSet,
+    bitmap_enabled: bool,
+) -> crate::Result<()> {
+    if let Some(mut bitmap) = if bitmap_enabled {
+        inverted_index.read_bitmap_from_terminfo(term_info, bitset.max_value())?
+    } else {
+        None
+    } {
+        use crate::DocSet;
+        while bitmap.doc() != crate::TERMINATED {
+            let base = bitmap.doc() / crate::BLOCK_WINDOW * crate::BLOCK_WINDOW;
+            let mut mask = [common::TinySet::EMPTY; crate::BLOCK_NUM_TINYBITSETS];
+            bitmap.fill_bitset_block(base, &mut mask);
+            bitset.union_tinysets(base / 64, &mask);
+        }
+        return Ok(());
+    }
+    let mut block_postings =
+        inverted_index.read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
+    loop {
+        let docs = block_postings.docs();
+        if docs.is_empty() {
+            break;
+        }
+        for &doc in docs {
+            bitset.insert(doc);
+        }
+        block_postings.advance();
+    }
+    Ok(())
 }
 
 fn automaton_score<A>(automaton: &A, state: A::State) -> f32
@@ -180,9 +210,10 @@ mod tests {
     use tantivy_fst::Automaton;
 
     use super::AutomatonWeight;
+    use crate::collector::{Count, TopDocs};
     use crate::docset::TERMINATED;
-    use crate::query::Weight;
-    use crate::schema::{Schema, STRING};
+    use crate::query::{Query, RegexQuery, Weight};
+    use crate::schema::{Schema, TextFieldIndexing, TextOptions, STRING};
     use crate::{Index, IndexWriter};
 
     fn create_index() -> crate::Result<Index> {
@@ -230,6 +261,59 @@ mod tests {
                 State::NotMatching => State::NotMatching,
             }
         }
+    }
+
+    #[test]
+    fn test_unscored_automaton_union() -> crate::Result<()> {
+        for stored_bitmaps in [false, true] {
+            let mut schema = Schema::builder();
+            let field = schema.add_text_field(
+                "title",
+                TextOptions::default().set_indexing_options(
+                    TextFieldIndexing::default()
+                        .set_tokenizer("raw")
+                        .set_bitmap_postings(stored_bitmaps),
+                ),
+            );
+            let mut index = Index::create_in_ram(schema.build());
+            index.settings_mut().bitmap_postings.use_for_queries = true;
+            let mut writer: IndexWriter = index.writer_for_tests()?;
+            writer.add_document(doc!(field => "abc", field => "abcd"))?;
+            writer.add_document(doc!(field => "abc"))?;
+            writer.add_document(doc!(field => "bcd"))?;
+            writer.commit()?;
+            writer.delete_term(crate::Term::from_field_text(field, "bcd"));
+            writer.commit()?;
+            let reader = index.reader()?;
+            let searcher = reader.searcher();
+            let query = RegexQuery::from_pattern("a.*", field)?;
+            let scored = searcher.search(&query, &TopDocs::with_limit(3).order_by_score())?;
+            assert_eq!(scored.len(), 2);
+            assert_eq!(scored[0].0, 2.0);
+            assert_eq!(scored[1].0, 1.0);
+            assert_eq!(searcher.search(&query, &Count)?, 2);
+            assert_eq!(
+                searcher.search(&RegexQuery::from_pattern("z.*", field)?, &Count)?,
+                0
+            );
+            assert_eq!(
+                searcher.search(&RegexQuery::from_pattern(".*", field)?, &Count)?,
+                2
+            );
+            for bitmap_enabled in [false, true] {
+                let weight = query.weight(
+                    crate::query::EnableScoring::disabled_from_searcher(&searcher)
+                        .with_bitmap_postings(bitmap_enabled),
+                )?;
+                let mut scorer = weight.scorer(searcher.segment_reader(0), 1.5)?;
+                assert_eq!(scorer.doc(), 0);
+                assert_eq!(scorer.score(), 1.5);
+                assert_eq!(scorer.advance(), 1);
+                assert_eq!(scorer.score(), 1.5);
+                assert_eq!(scorer.advance(), TERMINATED);
+            }
+        }
+        Ok(())
     }
 
     #[test]

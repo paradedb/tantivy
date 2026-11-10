@@ -11,7 +11,10 @@ use std::sync::{Arc, Mutex};
 use tantivy::collector::TopDocs;
 use tantivy::index::IndexSettings;
 use tantivy::indexer::NoMergePolicy;
-use tantivy::query::{AllQuery, Query, TermQuery};
+use tantivy::query::{
+    AllQuery, EnableScoring, FastFieldTermSetQuery, InvertedIndexTermSetQuery, Query, RegexQuery,
+    TermQuery, TermSetQuery,
+};
 use tantivy::schema::{
     Field, IndexRecordOption, Metric, Schema, VectorDType, VectorOptions, STRING,
 };
@@ -489,6 +492,54 @@ fn peak_on_a_large_segment() -> tantivy::Result<()> {
             allocations.bytes,
             allocations.calls
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn term_set_filter_scorer_memory() -> tantivy::Result<()> {
+    let _serial = SERIAL.lock().unwrap();
+    let mut schema = Schema::builder();
+    let field = schema.add_text_field("id", STRING);
+    let index = Index::create_in_ram(schema.build());
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, 50_000_000)?;
+    let num_docs = 20_000u32;
+    for id in 0..num_docs {
+        writer.add_document(tantivy::doc!(field => format!("id{id:08}")))?;
+    }
+    writer.commit()?;
+    drop(writer);
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    assert_eq!(searcher.segment_readers().len(), 1);
+    let segment = searcher.segment_reader(0);
+    let terms: Vec<_> = (0..num_docs)
+        .map(|id| Term::from_field_text(field, &format!("id{id:08}")))
+        .collect();
+    let queries: Vec<Box<dyn Query>> = vec![
+        Box::new(TermSetQuery::new(terms.clone())),
+        Box::new(FastFieldTermSetQuery::new(terms.clone())),
+        Box::new(InvertedIndexTermSetQuery::new(terms)),
+        Box::new(RegexQuery::from_pattern("id.*", field)?),
+    ];
+    for (query_index, query) in queries.into_iter().enumerate() {
+        for bitmap_enabled in [false, true] {
+            let weight = query.weight(
+                EnableScoring::disabled_from_searcher(&searcher)
+                    .with_bitmap_postings(bitmap_enabled),
+            )?;
+            let (scorer, allocations) = count_allocations(|| weight.scorer(segment, 1.0));
+            let mut scorer = scorer?;
+            assert!(
+                allocations.peak <= num_docs.div_ceil(8) as isize + 512 * 1024,
+                "query_index={query_index}, bitmap_enabled={bitmap_enabled}, {allocations:?}",
+            );
+            for id in 0..num_docs {
+                assert_eq!(scorer.doc(), id);
+                scorer.advance();
+            }
+            assert_eq!(scorer.doc(), tantivy::TERMINATED);
+        }
     }
     Ok(())
 }

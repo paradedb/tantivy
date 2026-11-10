@@ -50,6 +50,7 @@ impl TermSetQuery {
     fn build_weight(
         &self,
         schema: &Schema,
+        scoring_enabled: bool,
         bitmap_enabled: bool,
     ) -> crate::Result<BooleanWeight<DoNothingCombiner>> {
         let mut sub_queries: Vec<(_, Box<dyn Weight>)> = Vec::with_capacity(self.terms_map.len());
@@ -72,6 +73,7 @@ impl TermSetQuery {
                 Occur::Should,
                 Box::new(
                     TermSetWeight::new(field, terms, field_type, self.strategy_config.clone())?
+                        .with_scoring_enabled(scoring_enabled)
                         .with_bitmap_postings(bitmap_enabled),
                 ),
             ));
@@ -88,6 +90,7 @@ impl Query for TermSetQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         Ok(Box::new(self.build_weight(
             enable_scoring.schema(),
+            enable_scoring.is_scoring_enabled(),
             enable_scoring.bitmap_postings_enabled(),
         )?))
     }
