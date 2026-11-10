@@ -225,6 +225,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
             .flatten();
         let config = ScanConfig {
             adaptive_probing,
+            source_may_repeat_docs: matches!(input, ScanInput::Routed { .. }),
             top_n,
             capacity,
             exact_plan: self.probe_params.exact_plan,

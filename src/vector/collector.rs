@@ -841,6 +841,7 @@ where
                 adaptive_probing: matches!(&plan, ScanInput::Routed { .. })
                     .then_some(collector.probe_params.adaptive_probing)
                     .flatten(),
+                source_may_repeat_docs: matches!(&plan, ScanInput::Routed { .. }),
                 top_n,
                 capacity,
                 exact_plan: collector.probe_params.exact_plan,

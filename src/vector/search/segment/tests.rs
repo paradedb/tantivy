@@ -2074,6 +2074,67 @@ fn spilled_segment_reads_doc_ids_for_every_opened_cluster() -> crate::Result<()>
     Ok(())
 }
 
+/// A spilled cluster whose filtered rows were all held by the cluster opened before it, but one,
+/// plans its read on that one row: exact, strictly cheaper than any layer-0 read, so its band is
+/// never read.
+fn spilled_cluster_plans_its_unseen_rows() -> crate::Result<()> {
+    let fixture = reads_spec(Metric::L2, &[1, 4], &[]).spill().build()?;
+    let ranges = fixture.column_ranges()?;
+    let clusters = fixture.cluster_docs(0)?;
+    // Two clusters sharing documents, and a document of the second the first lacks.
+    let (first, second, shared, unseen) = (0..clusters.len())
+        .flat_map(|a| (0..clusters.len()).map(move |b| (a, b)))
+        .filter(|(a, b)| a != b)
+        .find_map(|(a, b)| {
+            let shared = clusters[b]
+                .iter()
+                .filter(|doc| clusters[a].contains(doc))
+                .count();
+            let unseen = clusters[b]
+                .iter()
+                .copied()
+                .find(|doc| !clusters[a].contains(doc))?;
+            (shared > 0).then_some((a, b, shared, unseen))
+        })
+        .expect("two clusters sharing documents");
+    // The filter keeps the first cluster whole and, of the second, its shared rows and one more.
+    let mut keep: BTreeSet<DocId> = clusters[first].iter().copied().collect();
+    keep.insert(unseen);
+    let filter = BooleanQuery::new(
+        keep.iter()
+            .map(|&doc| {
+                let ordinal = fixture.ordinal(DocAddress::new(0, doc))?;
+                let term: Box<dyn Query> = Box::new(fixture.filter(&format!("d{ordinal}")));
+                Ok((crate::query::Occur::Should, term))
+            })
+            .collect::<crate::Result<_>>()?,
+    );
+    let params = ProbeParams {
+        exact_plan: true,
+        ..every_cluster()
+    };
+    let query = reads_vector(42);
+    fixture.clear_reads();
+    let fruit = fixture.search_clusters(&[first, second], &filter, &query, 3, params)?;
+    assert_eq!(fruit.results, fixture.oracle(&filter, &query, 3)?);
+    let stats = &fruit.stats[0];
+    assert_eq!(stats.spill_dropped, shared, "{stats:?}");
+    let layer0 = stats.layers.get(0).unwrap();
+    assert_eq!(layer0.exact_clusters(), 1, "{stats:?}");
+    assert_eq!(layer0.exact_rows(), 1, "{stats:?}");
+    assert_eq!(
+        layer0.full_clusters() + layer0.sparse_clusters(),
+        1,
+        "{stats:?}"
+    );
+    let band = ranges.bands[second].as_ref().unwrap();
+    assert!(
+        !fixture.reads().iter().any(|(_, read)| overlaps(read, band)),
+        "the second cluster read its band"
+    );
+    Ok(())
+}
+
 /// With every cluster open, each document's second copy is dropped at admission: the exact
 /// phase scores every live document once, and `spill_dropped` counts one drop per document.
 fn a_doc_in_two_opened_clusters_is_scored_once() -> crate::Result<()> {
@@ -2146,7 +2207,7 @@ type ReadCase = (&'static str, fn() -> crate::Result<()>);
 /// Every plan reads only what it needs, in the documented order.
 #[test]
 fn reads_follow_the_plan() -> crate::Result<()> {
-    let cases: [ReadCase; 17] = [
+    let cases: [ReadCase; 18] = [
         (
             "an empty cluster skips its band",
             empty_cluster_skips_its_band,
@@ -2215,6 +2276,10 @@ fn reads_follow_the_plan() -> crate::Result<()> {
         (
             "a doc whose two clusters are both opened is scored once",
             a_doc_in_two_opened_clusters_is_scored_once,
+        ),
+        (
+            "a spilled cluster with all but one row already seen plans Exact for that row",
+            spilled_cluster_plans_its_unseen_rows,
         ),
     ];
     for (name, case) in cases {
@@ -2389,6 +2454,15 @@ fn spill_recall_and_located_path() -> crate::Result<()> {
                     .stats
                     .iter()
                     .any(|stats| stats.access_path == AccessPath::Located));
+                // A located batch holds one primary row per document: nothing to drop.
+                assert!(
+                    located
+                        .stats
+                        .iter()
+                        .filter(|stats| stats.access_path == AccessPath::Located)
+                        .all(|stats| stats.spill_dropped == 0),
+                    "{metric:?} query {query_ord}"
+                );
                 assert_eq!(routed.results, spilled.oracle(&filter, query, 10)?);
             }
         }

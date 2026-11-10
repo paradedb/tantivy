@@ -54,6 +54,9 @@ pub(crate) struct ScanConfig {
     /// Whether a cluster's rows may be scored exactly before the exact phase.
     pub(crate) exact_plan: bool,
     pub(crate) adaptive_probing: Option<crate::vector::AdaptiveProbeParams>,
+    /// Whether the source may hand over a document twice: a routed source on a spilled segment.
+    /// A located batch holds one primary row per document.
+    pub(crate) source_may_repeat_docs: bool,
     #[cfg(test)]
     pub(crate) plan_override: Option<PlanOverride>,
     /// Disables layer-0 admission pruning, which never changes results; equivalence tests flip it.
@@ -493,9 +496,9 @@ where
     /// The quantized cascade; `None` scores every shortlisted row exactly.
     quantized: Option<QuantizedState<'a>>,
     scratch: ReadScratch,
-    /// The documents held by the clusters opened so far, on a spilled segment: a document's second
-    /// copy is dropped at admission, so each document is decided by the first opened cluster
-    /// holding it and never reaches the bound or the heap twice.
+    /// The documents held by the clusters opened so far, on a routed scan of a spilled segment: a
+    /// document's second copy is dropped before scoring, so each document is decided by the first
+    /// opened cluster holding it and never reaches the bound or the heap twice.
     seen: Option<BitSet>,
     /// Rows dropped as a document's second copy.
     spill_dropped: usize,
@@ -560,8 +563,7 @@ where
             bound,
             quantized,
             scratch: ReadScratch::default(),
-            seen: reader
-                .spilled()
+            seen: (reader.spilled() && config.source_may_repeat_docs)
                 .then(|| BitSet::with_max_value(reader.max_doc())),
             spill_dropped: 0,
             unseen_offsets: Vec::new(),
@@ -728,11 +730,6 @@ where
             rows.local_rows()
                 .map(|row| BlockAddress::new(rows.cluster as u32, row as u32)),
         );
-        // Keep the original exact-versus-quantized choice and probe charge.
-        let read = match &self.quantized {
-            Some(state) => state.read_plan(rows, 0, &mut self.scratch)?,
-            None => Read::Exact,
-        };
         let unseen = self.seen.as_mut().map(|seen| {
             unseen_rows(
                 seen,
@@ -747,6 +744,11 @@ where
             .filter(|unseen| unseen.len() != len)
             .unwrap_or(rows);
         if selected.len() > 0 {
+            // Planned and priced on the rows left to score; `len` stays the probe charge.
+            let read = match &self.quantized {
+                Some(state) => state.read_plan(selected, 0, &mut self.scratch)?,
+                None => Read::Exact,
+            };
             if self.quantized.is_some() {
                 self.report.layers[0].count(read, selected.len());
             }
@@ -765,13 +767,6 @@ where
                 }
                 Read::Layer(read) => {
                     if let Some(state) = &mut self.quantized {
-                        if read == LayerRead::Sparse && selected.len() != len {
-                            state.layers[0].reader.sparse_cost(
-                                selected.cluster,
-                                selected.offsets.expect("deduplicated rows carry offsets"),
-                                &mut self.scratch,
-                            )?;
-                        }
                         state.admit(selected, read, &mut self.bound, &mut self.scratch, fold)?;
                     }
                 }
