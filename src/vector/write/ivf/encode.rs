@@ -19,7 +19,7 @@ use crate::vector::storage::blocks::{
 };
 use crate::vector::storage::header::{VectorEntry, HEADER_LEN};
 use crate::vector::storage::id_map::IdMap;
-use crate::vector::storage::metadata::{Slot, SlotType, VectorColMetadata};
+use crate::vector::storage::metadata::{Assignment, Slot, SlotType, VectorColMetadata};
 use crate::vector::{BlockAddress, ENTRY_ALIGN};
 use crate::TantivyError;
 
@@ -53,13 +53,15 @@ pub(super) fn encode_centroids(
 }
 
 /// Writes the field's Data entry: metadata, then one aligned block per cluster of doc ids, encoded
-/// columns and, for plain storage, the rows themselves. Returns each target document's location.
+/// columns and, for plain storage, the rows themselves. A spill row is encoded against its own
+/// block's centroid like any row. Returns each target document's primary location.
 pub(super) fn write_data_entry(
     merge: &FieldMerge,
     vec_write: &mut CompositeWrite,
     assigned_vectors: &[AssignedVector],
     cluster_offsets: &[u64],
     centroid_bytes: &[u8],
+    assignment: Assignment,
     timings: &mut IvfBuildTimings,
 ) -> crate::Result<Vec<BlockAddress>> {
     let (ctx, opts, quantization) = (merge.ctx, merge.opts, merge.quantization);
@@ -78,7 +80,7 @@ pub(super) fn write_data_entry(
 
     // Data entry: metadata followed by aligned cluster blocks.
     let encode_start = Instant::now();
-    let meta = VectorColMetadata::build_ivf(opts, quantization)?;
+    let meta = VectorColMetadata::build_ivf(opts, quantization)?.with_assignment(assignment);
     let slots = meta.slots();
     // Plain blocks stream their rows first; quantized blocks keep the rows in `ExactRows` and
     // buffer every column.
@@ -147,8 +149,10 @@ pub(super) fn write_data_entry(
             for assigned in tile {
                 timings.encode_reads += 1;
                 bufs[doc_ids_slot].extend_from_slice(&assigned.target_doc_id.to_le_bytes());
-                locations[assigned.target_doc_id as usize] =
-                    BlockAddress::new(cluster as u32, local);
+                if assigned.primary {
+                    locations[assigned.target_doc_id as usize] =
+                        BlockAddress::new(cluster as u32, local);
+                }
                 local += 1;
                 let bytes = merge.readers[assigned.source.segment_ord as usize]
                     .vector_bytes_for_row(assigned.source.block_address)?;
