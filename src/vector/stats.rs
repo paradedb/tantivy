@@ -324,6 +324,8 @@ pub struct ProbeStats {
     pub work_charged: f32,
     /// The work budget the probe loop ran against, in work units; 0 when no loop ran.
     pub work_budget: f32,
+    /// Routed clusters assigned to this segment before probing; 0 for flat or located scans.
+    pub planned_clusters: usize,
     /// Exact scores of this segment's results offered to the query's shared bound.
     pub shared_bound_offers: usize,
     /// Offers that moved the shared bound's k-th.
@@ -410,6 +412,7 @@ impl ProbeStats {
             exact_scan_ns: full_precision.then_some(0),
             segment_rows: Some(plan.segment_rows),
             segment_clusters: Some(plan.segment_clusters),
+            planned_clusters: plan.planned_clusters,
             located_cap: plan.located_cap,
             ..Self::default()
         };
@@ -598,6 +601,7 @@ mod tests {
         "termination",
         "work_charged",
         "work_budget",
+        "planned_clusters",
         "shared_bound_offers",
         "shared_bound_tightenings",
     ];
@@ -642,6 +646,7 @@ mod tests {
         let plan = PlanReport {
             segment_rows: 100,
             segment_clusters: 5,
+            planned_clusters: 3,
             located_cap: 0,
         };
         let quantized = ScanReport {
@@ -663,6 +668,7 @@ mod tests {
         };
         let stats = ProbeStats::new(ivf(quantized), StageTotals::default());
         assert_eq!(keys(&stats), expected(&segment, 2));
+        assert_eq!(serde_json::to_value(&stats).unwrap()["planned_clusters"], 3);
         let layer = stats.layers.get(1).unwrap();
         assert_eq!((layer.scan_ns(), layer.boundary_ns()), (0, 0));
         let full_precision = [&segment[..], &["exact_scan_ns"]].concat();
@@ -675,11 +681,13 @@ mod tests {
         );
         let flat = ProbeStats::new(SegmentReport::Flat { rows_read: 3 }, StageTotals::default());
         assert_eq!(keys(&flat), expected(&["exact_scan_ns"], 0));
+        assert_eq!(serde_json::to_value(&flat).unwrap()["planned_clusters"], 0);
         let empty = ProbeStats::new(
             SegmentReport::Empty { located_cap: 0 },
             StageTotals::default(),
         );
         assert_eq!(keys(&empty), expected(&[], 0));
+        assert_eq!(serde_json::to_value(&empty).unwrap()["planned_clusters"], 0);
     }
 
     #[test]

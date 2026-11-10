@@ -142,6 +142,7 @@ impl PreparedVectorSearch {
                         let report = PlanReport {
                             segment_rows: index.num_rows(),
                             segment_clusters: index.num_clusters(),
+                            planned_clusters: 0,
                             located_cap: cap,
                         };
                         let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
@@ -248,7 +249,7 @@ impl PreparedVectorSearch {
             })
             .collect();
         let mut seen = HashSet::new();
-        let mut routed = HashSet::new();
+        let mut routed = HashMap::<_, usize>::new();
         for candidate in &candidates {
             let (ordinal, cluster) = candidate.node;
             let clusters = cluster_counts.get(&ordinal).ok_or_else(|| {
@@ -261,13 +262,14 @@ impl PreparedVectorSearch {
                     "invalid or duplicate routing cluster".into(),
                 ));
             }
-            routed.insert(ordinal);
+            *routed.entry(ordinal).or_default() += 1;
         }
         self.segments
-            .retain(|s| !s.routed() || routed.contains(&s.ordinal));
-        if shared_work.is_some() {
-            for segment in &mut self.segments {
-                if let Some(ScanInput::Routed { budget, .. }) = &mut segment.scan {
+            .retain(|s| !s.routed() || routed.contains_key(&s.ordinal));
+        for segment in &mut self.segments {
+            if let Some(ScanInput::Routed { budget, report, .. }) = &mut segment.scan {
+                report.planned_clusters = routed[&segment.ordinal];
+                if shared_work.is_some() {
                     budget.total = self.budget.work.total;
                 }
             }
@@ -314,6 +316,76 @@ mod tests {
     use crate::schema::Metric;
     use crate::vector::test_support::{DocsWeight, FixtureSpec};
     use crate::vector::{LocatedPath, TopClustersBySimilarityCollector};
+
+    #[test]
+    fn planned_clusters_distinguishes_short_and_empty_plans() -> Result<()> {
+        let fixture = FixtureSpec::clustered(Metric::L2, 32, 8, 384)
+            .segments(3)
+            .label("matches", |i| i % 8 == 0)
+            .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let segments = searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .map(|(i, reader)| VectorSegment::from((i as u32, reader)))
+            .collect::<Vec<_>>();
+        let params = ProbeParams {
+            max_probe: 8,
+            located: LocatedPath::Off,
+            adaptive_probing: None,
+            ..Default::default()
+        };
+        let query = vec![0.0f32; 32];
+        let weight = fixture.weight(&fixture.filter("matches"))?;
+        let ranked = fixture.candidates(&[0, 1], &query)?;
+        let planned = [2, 1, 0];
+        let candidates = planned
+            .iter()
+            .enumerate()
+            .flat_map(|(ordinal, &count)| {
+                ranked.iter().take(count).map(move |c| Candidate {
+                    sim: c.sim,
+                    node: (ordinal as u32, c.node),
+                })
+            })
+            .collect::<Vec<_>>();
+        for shared in [false, true] {
+            let builder = TopDocs::with_limit(5)
+                .order_by_similarity(fixture.field, query.clone())
+                .with_probe_params(params.clone());
+            let budget = VectorSearchBudget::for_segments(fixture.field, &params, &segments)?;
+            let prepared = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
+            let work = shared.then(|| {
+                Arc::new(crate::vector::AtomicVectorWork::default()) as Arc<dyn SharedVectorWork>
+            });
+            let collector = builder.build(prepared.with_candidates(candidates.clone(), work)?);
+            let fruit = collector.merge_fruits(collector.collect_segments(
+                weight.as_ref(),
+                &segments,
+                |_| {},
+            )?)?;
+            assert_eq!(fruit.stats.len(), planned.len());
+            for (stats, count) in fruit.stats.iter().zip(planned) {
+                assert_eq!(stats.planned_clusters, count);
+                assert_eq!(stats.postings_row + stats.postings_skipped, count);
+                assert_eq!(
+                    stats.termination,
+                    crate::vector::ProbeTermination::Exhausted
+                );
+                if count > 0 {
+                    assert!(stats.work_charged < stats.work_budget);
+                    assert!(count < stats.segment_clusters.unwrap());
+                } else {
+                    assert_eq!(stats.work_charged, 0.0);
+                    assert_eq!(stats.work_budget, 0.0);
+                }
+                assert_eq!(serde_json::to_value(stats)?["planned_clusters"], count);
+            }
+            assert_eq!(fruit.stats[0].postings_skipped, 1);
+        }
+        Ok(())
+    }
 
     #[test]
     fn shared_work_uses_unused_budget_with_skewed_filters() -> Result<()> {
@@ -445,6 +517,7 @@ mod tests {
                 assert!(fixture.reads().is_empty());
             }
             assert_eq!(fruit.results, fixture.oracle(&filter, &query, 5)?);
+            assert!(fruit.stats.iter().all(|s| s.planned_clusters == 0));
         }
         Ok(())
     }

@@ -1884,6 +1884,10 @@ mod ivf_e2e_tests {
             0.0,
         )?;
         let candidates = router.collect_segments(&readers, |_| {})?;
+        let planned = readers
+            .iter()
+            .map(|s| candidates.iter().filter(|c| c.node.0 == s.ordinal).count())
+            .collect::<Vec<_>>();
         assert!(
             fixture.reads().is_empty(),
             "routing read vector rows or document IDs"
@@ -1919,6 +1923,13 @@ mod ivf_e2e_tests {
             .stats
             .iter()
             .any(|s| s.termination == crate::vector::ProbeTermination::Ceiling));
+        for (stats, count) in fruit.stats.iter().zip(planned) {
+            assert_eq!(stats.planned_clusters, count);
+        }
+        assert!(fruit
+            .stats
+            .iter()
+            .any(|s| s.postings_row + s.postings_skipped < s.planned_clusters));
         let exact = fixture.oracle(&filter, &query, 768)?;
         assert_eq!(fruit.results.len(), 5);
         assert!(fruit.results.iter().all(|hit| exact.contains(hit)));
