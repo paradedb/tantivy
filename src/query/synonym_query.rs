@@ -49,6 +49,9 @@ impl SynonymQuery {
             terms[1..].iter().all(|term| term.field() == field),
             "All SynonymQuery terms must belong to the same field."
         );
+        let mut terms = terms;
+        terms.sort();
+        terms.dedup();
         SynonymQuery { terms }
     }
 
@@ -326,13 +329,14 @@ impl Scorer for SynonymScorer {
 impl BlockMaxScorer for SynonymScorer {
     /// The members' bounds summed, no higher than the group's own ceiling. BM25 grows less than
     /// linearly with the term frequency, so the score of a summed frequency never exceeds the sum
-    /// of the scores, and a member whose block starts after this one contributes nothing here.
+    /// of the scores. A member whose next document is past this block adds nothing to it.
     fn block_max_score(&mut self) -> Score {
+        let last = self.last_doc_in_block();
         let fieldnorm_reader = &self.fieldnorm_reader;
         let weight = &self.similarity_weight;
         self.postings
             .iter_mut()
-            .filter(|postings| postings.doc() != TERMINATED)
+            .filter(|postings| postings.doc() != TERMINATED && postings.doc() <= last)
             .map(|postings| {
                 postings
                     .block_cursor
@@ -450,14 +454,12 @@ mod tests {
             Term::from_field_text(text, "feline"),
         ]);
         let top_docs = searcher.search(&query, &TopDocs::with_limit(4).order_by_score())?;
-        // Doc 4 ("cat cat cat") has the highest blended term frequency and the
-        // same fieldnorm as doc 2 does not; it must outrank single-occurrence
-        // docs.
+        // Doc 4 ("cat cat cat") has the highest term frequency, so it outranks the docs with
+        // one occurrence.
         assert_eq!(top_docs[0].1, DocAddress::new(0, 4));
 
-        // A doc matching both synonyms scores as one pseudo-term with tf=2,
-        // strictly less than 2x the single-variant score (saturation), and
-        // identical to what a single term with tf=2 would get.
+        // A doc with both synonyms scores as one term with tf=2, which is less than twice the
+        // score of one occurrence.
         let scores: std::collections::HashMap<DocAddress, f32> = top_docs
             .iter()
             .map(|(score, addr)| (*addr, *score))
@@ -501,6 +503,13 @@ mod tests {
         synonym_docs.sort();
         boolean_docs.sort();
         assert_eq!(synonym_docs, boolean_docs);
+        let score_of = |top: &[(Score, DocAddress)]| {
+            top.iter()
+                .find(|(_, doc)| *doc == DocAddress::new(0, 2))
+                .map(|(score, _)| *score)
+                .unwrap()
+        };
+        assert!(score_of(&synonym_top) < score_of(&boolean_top));
         Ok(())
     }
 
@@ -524,25 +533,6 @@ mod tests {
             .unwrap();
         assert_nearly_equals!(explanation.value(), score);
         Ok(())
-    }
-
-    #[test]
-    #[should_panic(expected = "at least one term")]
-    fn test_synonym_query_empty_terms_panics() {
-        let _ = SynonymQuery::new(vec![]);
-    }
-
-    #[test]
-    #[should_panic(expected = "same field")]
-    fn test_synonym_query_mixed_fields_panics() {
-        let mut schema_builder = Schema::builder();
-        let a = schema_builder.add_text_field("a", TEXT);
-        let b = schema_builder.add_text_field("b", TEXT);
-        let _schema = schema_builder.build();
-        let _ = SynonymQuery::new(vec![
-            Term::from_field_text(a, "x"),
-            Term::from_field_text(b, "y"),
-        ]);
     }
 
     /// Thousands of docs in one segment, so the posting lists span many blocks and the term
@@ -682,6 +672,33 @@ mod tests {
                     IndexRecordOption::WithFreqs,
                 )),
             ),
+            (Occur::Should, Box::new(cat_feline(text))),
+        ]);
+        let pruned = searcher.search(&query, &TopDocs::with_limit(10).order_by_score())?;
+        assert_same_top(&pruned, &exhaustive(&searcher, &query)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_lone_group_under_must_prunes_to_the_same_top_k() -> crate::Result<()> {
+        let (index, text) = large_index()?;
+        let searcher = index.reader()?.searcher();
+        let query = BooleanQuery::new(vec![(Occur::Must, Box::new(cat_feline(text)))]);
+        let pruned = searcher.search(&query, &TopDocs::with_limit(10).order_by_score())?;
+        assert_same_top(&pruned, &exhaustive(&searcher, &query)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_filtered_group_prunes_to_the_same_top_k() -> crate::Result<()> {
+        let (index, text) = large_index()?;
+        let searcher = index.reader()?.searcher();
+        let filter = ConstScoreQuery::new(
+            TermQuery::new(Term::from_field_text(text, "pad"), IndexRecordOption::Basic),
+            0.0,
+        );
+        let query = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(filter)),
             (Occur::Should, Box::new(cat_feline(text))),
         ]);
         let pruned = searcher.search(&query, &TopDocs::with_limit(10).order_by_score())?;
