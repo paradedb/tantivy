@@ -3,6 +3,7 @@ use crate::fieldnorm::FieldNormReader;
 use crate::index::SegmentId;
 use crate::postings::{BlockSegmentPostings, FreqReadingOption, Postings, SegmentPostings};
 use crate::query::bm25::Bm25Weight;
+use crate::query::scorer::BlockMaxScorer;
 use crate::query::{Explanation, Scorer};
 use crate::schema::Field;
 use crate::{DocId, Score};
@@ -189,6 +190,28 @@ impl Scorer for TermScorer {
         let fieldnorm_id = self.fieldnorm_id();
         let term_freq = self.term_freq();
         self.similarity_weight.score(fieldnorm_id, term_freq)
+    }
+}
+
+impl BlockMaxScorer for TermScorer {
+    #[inline]
+    fn block_max_score(&mut self) -> Score {
+        TermScorer::block_max_score(self)
+    }
+
+    #[inline]
+    fn last_doc_in_block(&self) -> DocId {
+        TermScorer::last_doc_in_block(self)
+    }
+
+    #[inline]
+    fn seek_block(&mut self, target: DocId) {
+        TermScorer::seek_block(self, target)
+    }
+
+    #[inline]
+    fn max_score(&self) -> Score {
+        TermScorer::max_score(self)
     }
 }
 

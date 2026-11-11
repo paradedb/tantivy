@@ -20,7 +20,7 @@ pub struct Expansion {
 }
 
 impl Expansion {
-    /// True when a query for this expansion is one term, which Block-WAND prunes.
+    /// True when a query for this expansion is one term.
     pub fn is_single_term(&self) -> bool {
         match &self.alternatives {
             None => true,
