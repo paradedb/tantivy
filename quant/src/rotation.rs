@@ -161,6 +161,85 @@ pub fn debug_apply_count() -> usize {
     APPLY_COUNT.with(Cell::get)
 }
 
+/// One named Hadamard kernel, for benchmarks that time a kernel the dispatcher would not pick on
+/// this CPU.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HadamardKernel {
+    /// The portable reference transform.
+    Portable,
+    /// The x86 AVX2 kernel.
+    Avx2,
+    /// The x86 AVX-512 kernel.
+    Avx512,
+    /// The aarch64 NEON kernel.
+    Neon,
+}
+
+impl HadamardKernel {
+    /// Every kernel, in report order.
+    pub const ALL: [Self; 4] = [Self::Portable, Self::Avx2, Self::Avx512, Self::Neon];
+
+    /// Name for benchmark ids.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Portable => "portable",
+            Self::Avx2 => "avx2",
+            Self::Avx512 => "avx512",
+            Self::Neon => "neon",
+        }
+    }
+
+    /// Whether this build and CPU can run the kernel.
+    pub fn is_available(self) -> bool {
+        match self {
+            Self::Portable => true,
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx2 => std::arch::is_x86_feature_detected!("avx2"),
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx512 => std::arch::is_x86_feature_detected!("avx512f"),
+            #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+            Self::Neon => true,
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
+
+    /// Transforms every block of `x`'s power-of-two decomposition with this kernel, and blocks
+    /// shorter than the kernel accepts with the portable transform.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the kernel is not available.
+    pub fn block_hadamard(self, x: &mut [f32]) {
+        assert!(self.is_available(), "{self:?} is unavailable on this CPU");
+        let mut rest = x;
+        while !rest.is_empty() {
+            let block_len = 1usize << (usize::BITS - 1 - rest.len().leading_zeros());
+            let (block, tail) = rest.split_at_mut(block_len);
+            match self {
+                #[cfg(target_arch = "x86_64")]
+                Self::Avx2 if block_len >= x86::AVX2_MIN_LEN => {
+                    // SAFETY: `is_available` checked that the CPU has avx2.
+                    unsafe { x86::hadamard_avx2(block) }
+                }
+                #[cfg(target_arch = "x86_64")]
+                Self::Avx512 if block_len >= x86::MIN_LEN => {
+                    // SAFETY: `is_available` checked that the CPU has avx512f.
+                    unsafe { x86::hadamard_avx512(block) }
+                }
+                #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+                Self::Neon if block_len >= neon::MIN_LEN => {
+                    // SAFETY: this arm only compiles when NEON is enabled for the whole build.
+                    unsafe { neon::hadamard(block) }
+                }
+                _ => hadamard_portable(block),
+            }
+            rest = tail;
+        }
+    }
+}
+
 fn blocks(mut d: usize) -> Vec<usize> {
     let mut result = Vec::new();
     while d != 0 {

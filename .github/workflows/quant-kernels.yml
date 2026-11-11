@@ -90,6 +90,7 @@ jobs:
         run: ./quant/check_asm_x86.sh
       - name: Run kernel Criterion targets
         run: |
+          grep -m1 'model name' /proc/cpuinfo
           cargo bench -p tantivy-quant --bench rotation -- --noplot
           cargo bench -p tantivy-quant --bench sign_score -- --noplot
           cargo bench -p tantivy-quant --bench grid_kernels -- --noplot
@@ -134,6 +135,8 @@ jobs:
             echo "tantivy_quant::sign assembly does not contain a cnt instruction" >&2
             exit 1
           fi
+      - name: Run rotation tests
+        run: cargo test -p tantivy-quant --release --lib rotation::
 
   kernel-tier-avx512:
     name: AVX-512 tier under Intel SDE
@@ -153,12 +156,12 @@ jobs:
           override: true
       - name: Install Intel SDE
         uses: petarpetrovt/setup-sde@6d2773bc0ef3005fd52e0ae0bb91782321793aec # v6.0
-      - name: Run sign and f16 tests on an emulated Sapphire Rapids CPU
+      - name: Run sign, f16 and rotation tests on an emulated Sapphire Rapids CPU
         run: |
           test_bin=$(cargo test -p tantivy-quant --release --lib --no-run --message-format=json \
             | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable')
           test -n "$test_bin"
-          "$SDE_PATH/sde64" -spr -- "$test_bin" --include-ignored sign::tests:: model::f16::tests::
+          "$SDE_PATH/sde64" -spr -- "$test_bin" --include-ignored sign::tests:: model::f16::tests:: rotation::tests::
 
   tantivy-scan-benches:
     name: Tantivy quantization benchmarks
