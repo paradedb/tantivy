@@ -112,6 +112,10 @@ impl StageTotals {
         for (total, added) in self.time_ns.iter_mut().zip(other.time_ns) {
             *total += added;
         }
+        self.append_counts(other);
+    }
+
+    pub(crate) fn append_counts(&mut self, other: &Self) {
         for (total, added) in self.io.iter_mut().zip(other.io) {
             total.reads += added.reads;
             total.bytes_read += added.bytes_read;

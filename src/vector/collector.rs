@@ -4,7 +4,7 @@
 //! A secondary key is an ordinary `SortKeyComputer` composed into the heap's
 //! `(similarity, tie_break)` order, the same rule as the pull-model path.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -21,6 +21,7 @@ use crate::vector::params::ProbeParams;
 use crate::vector::search::cluster_source::ClusterSource;
 use crate::vector::search::prepared::{invalid_query, QuantizedQueryCtx, VectorQuery};
 use crate::vector::search::scan::bound::{ExactMerge, PruningBound, TopK};
+use crate::vector::search::scan::executor::VectorScanExecutor;
 use crate::vector::search::scan::heap::TieBreakHits;
 use crate::vector::search::scan::{ScanConfig, SegmentScan};
 use crate::vector::search::segment::plan::ScanInput;
@@ -92,6 +93,7 @@ pub struct TopDocsByVectorSimilarityBuilder<T: VectorElement, S = NoTieBreak> {
     max_scan_levels: usize,
     /// Optional slot shared with other collectors searching the same query.
     shared_threshold: Option<SharedThresholdArc<Score>>,
+    scan_executor: Option<Arc<dyn VectorScanExecutor>>,
     tie_break: S,
 }
 
@@ -106,6 +108,7 @@ impl<T: VectorElement> TopDocsByVectorSimilarityBuilder<T, NoTieBreak> {
             probe_params: ProbeParams::default(),
             max_scan_levels: usize::MAX,
             shared_threshold: None,
+            scan_executor: None,
             tie_break: NoTieBreak,
         }
     }
@@ -142,6 +145,12 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
         self
     }
 
+    /// Runs the global probing loop once while helpers score its selected rows.
+    pub fn with_scan_executor(mut self, executor: Arc<dyn VectorScanExecutor>) -> Self {
+        self.scan_executor = Some(executor);
+        self
+    }
+
     /// Orders equal similarities by `tie_break`, as `ORDER BY embedding <=> $1, id` does.
     ///
     /// The tie-break takes part in each segment's eviction but never in routing. Segments cut on
@@ -158,6 +167,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
             probe_params: self.probe_params,
             max_scan_levels: self.max_scan_levels,
             shared_threshold: self.shared_threshold,
+            scan_executor: self.scan_executor,
             tie_break,
         }
     }
@@ -238,6 +248,24 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
         self.build_for_segments(weight.as_ref(), &segments, |_| {})
     }
 
+    /// Scores coordinator-selected rows without preparing filters or routing. Call only on helpers
+    /// after the executor has elected its coordinator.
+    pub fn work_scan_tasks(
+        &self,
+        segments: &[VectorSegment],
+        executor: &dyn VectorScanExecutor,
+        on_segment: impl FnMut(SegmentOrdinal),
+    ) -> Result<()> {
+        work_scan_tasks(
+            self.field,
+            Arc::clone(&self.query),
+            self.max_scan_levels,
+            segments,
+            executor,
+            on_segment,
+        )
+    }
+
     /// Builds the collector. Configuration cannot be changed afterwards.
     pub fn build(self, inputs: VectorScanInputs) -> TopDocsByVectorSimilarity<T, S> {
         let segment_top_n = self.limit.saturating_add(self.offset);
@@ -256,6 +284,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
             prepared: Mutex::new(None),
             collector_topk: Arc::new(Mutex::new(TopK::new(segment_top_n))),
             shared_topk_threshold,
+            scan_executor: self.scan_executor,
             tie_break: self.tie_break,
         }
     }
@@ -287,6 +316,7 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     /// The shared top-k threshold every segment scan of this collector syncs and publishes.
     /// Either the caller's slot or a process-local [`AtomicSharedThreshold`] from `build`.
     shared_topk_threshold: SharedThresholdArc<Score>,
+    scan_executor: Option<Arc<dyn VectorScanExecutor>>,
     tie_break: S,
 }
 
@@ -523,7 +553,9 @@ where
         segments: &[VectorSegment],
         mut on_segment: impl FnMut(SegmentOrdinal),
     ) -> Result<Vec<SegmentVectorFruit<S::SortKey>>> {
-        if segments.is_empty() || self.inputs.shared_work.is_some() {
+        if segments.is_empty()
+            || (self.inputs.shared_work.is_some() && self.scan_executor.is_none())
+        {
             return segments
                 .iter()
                 .map(|segment| {
@@ -535,6 +567,29 @@ where
         }
         for segment in segments {
             self.validate_input(segment.ordinal, &segment.reader)?;
+        }
+        struct Finish<'a>(Option<&'a dyn VectorScanExecutor>);
+        impl Drop for Finish<'_> {
+            fn drop(&mut self) {
+                if let Some(executor) = self.0 {
+                    let _ = executor.finish();
+                }
+            }
+        }
+        let mut finish = Finish(None);
+        if let Some(executor) = &self.scan_executor {
+            if !executor.start()? {
+                work_scan_tasks(
+                    self.field,
+                    Arc::clone(&self.query),
+                    self.max_scan_levels,
+                    segments,
+                    executor.as_ref(),
+                    on_segment,
+                )?;
+                return Ok(Vec::new());
+            }
+            finish.0 = Some(executor.as_ref());
         }
         let mut vectors = Vec::with_capacity(segments.len());
         let mut tie_breaks = Vec::with_capacity(segments.len());
@@ -719,6 +774,68 @@ where
             .collect();
         Ok((results, report, merge))
     }
+}
+
+fn work_scan_tasks<T: VectorElement>(
+    field: Field,
+    query: Arc<Vec<T>>,
+    max_scan_levels: usize,
+    segments: &[VectorSegment],
+    executor: &dyn VectorScanExecutor,
+    mut on_segment: impl FnMut(SegmentOrdinal),
+) -> Result<()> {
+    use crate::vector::search::scan::executor::decode_task;
+    use crate::vector::search::scan::layer_read::LayerSpec;
+    let mut backends = HashMap::new();
+    let mut prepared: Option<Arc<VectorQuery<T>>> = None;
+    let mut quantized_queries = HashMap::new();
+    executor.work(&mut |task| {
+        if let std::collections::hash_map::Entry::Vacant(entry) = backends.entry(task.segment) {
+            let segment = segments
+                .iter()
+                .find(|segment| segment.ordinal == task.segment)
+                .ok_or_else(|| {
+                    TantivyError::InvalidArgument("unknown vector scan segment".into())
+                })?;
+            VectorQuery::check_schema(field, &query, segment.reader.schema())?;
+            let vectors = segment.reader.vector_index(field)?;
+            let metric = vectors.options().metric();
+            let query = Arc::clone(match prepared.as_ref() {
+                Some(prepared) if prepared.metric() == metric => prepared,
+                _ => prepared.insert(Arc::new(VectorQuery::new(metric, Arc::clone(&query)))),
+            });
+            let field = vectors.quantization()?.ok_or_else(|| {
+                TantivyError::InvalidArgument(
+                    "parallel layer scan requires quantized storage".into(),
+                )
+            })?;
+            let ctx = field.index_ctx();
+            let quantized = Arc::clone(
+                quantized_queries
+                    .entry(PreparedKey(Arc::clone(&ctx.meta)))
+                    .or_insert_with(|| {
+                        Arc::new(QuantizedQueryCtx::with_depth(
+                            Arc::clone(ctx),
+                            &query,
+                            max_scan_levels.min(ctx.specs.len()),
+                        ))
+                    }),
+            );
+            entry.insert((vectors, quantized));
+        }
+        let (vectors, query) = &backends[&task.segment];
+        let result = decode_task(
+            &LayerSpec {
+                query,
+                reader: &vectors.quantization()?.unwrap().layers()[0],
+                index: 0,
+                query_error_squared: query.query_error_squared(0) as f32,
+            },
+            task,
+        );
+        on_segment(task.segment);
+        result
+    })
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -919,7 +1036,7 @@ where
     let start_scan = |i: usize, (config, tie_break)| {
         let _init = enter_vector_stage(VectorStage::ScanInit);
         let backend = backend(i)?;
-        SegmentScan::new(
+        let scan = SegmentScan::new(
             backend.reader(),
             backend.reader().index().unwrap(),
             backend.scoring_query(),
@@ -928,7 +1045,8 @@ where
             backend.segment_ord(),
             tie_break,
             collector.tie_break.comparator(),
-        )
+        )?;
+        Ok::<_, TantivyError>(scan)
     };
     let mut meter = WorkMeter::new(
         WorkBudget {
@@ -963,24 +1081,92 @@ where
         .filter(|_| top_n > 0)
         .map(|_| crate::vector::search::scan::RateApsState::default());
     let mut recall_reached = false;
-    for (i, candidate) in candidates {
+    let mut candidates = candidates;
+    let mut pending = VecDeque::new();
+    loop {
         if meter.exhausted() || recall_reached {
             break;
         }
+        let capacity = collector
+            .scan_executor
+            .as_ref()
+            .map_or(1, |executor| executor.capacity().max(1));
+        while pending.len() < capacity {
+            let Some((i, candidate)) = candidates.next() else {
+                break;
+            };
+            if collector.scan_executor.is_none() {
+                pending.push_back((i, candidate, None, None));
+                break;
+            }
+            let Some(GlobalSource::Router(source)) = &mut sources[i] else {
+                unreachable!()
+            };
+            let (result, measured) = measure(|| {
+                if let Some(config) = pending_scans[i].take() {
+                    scans[i] = Some(start_scan(i, config)?);
+                }
+                let scan = scans[i].as_mut().unwrap();
+                let _stage = enter_vector_stage(scan.shortlist_stage());
+                let prepared = source
+                    .probe_global(candidate)?
+                    .map(|rows| scan.prepare_shortlist(&rows))
+                    .transpose()?;
+                let ticket = match (&collector.scan_executor, &prepared) {
+                    (Some(executor), Some(prepared)) if prepared.needs_decode() => {
+                        Some(executor.submit(&prepared.task)?)
+                    }
+                    _ => None,
+                };
+                Ok::<_, TantivyError>((prepared, ticket))
+            });
+            totals[i].append(&measured);
+            on_segment(i);
+            let (prepared, ticket) = result?;
+            pending.push_back((i, candidate, prepared, ticket));
+        }
+        let Some((i, candidate, prepared, ticket)) = pending.pop_front() else {
+            break;
+        };
         let Some(GlobalSource::Router(source)) = &mut sources[i] else {
             unreachable!()
         };
+        let mut decoded_totals = None;
         let (result, measured) = measure(|| {
-            if let Some(pending) = pending_scans[i].take() {
-                scans[i] = Some(start_scan(i, pending)?);
+            if let Some(config) = pending_scans[i].take() {
+                scans[i] = Some(start_scan(i, config)?);
             }
+            let decoded = ticket
+                .map(|ticket| {
+                    collector
+                        .scan_executor
+                        .as_ref()
+                        .unwrap()
+                        .resolve(ticket, &mut |task| {
+                            let segment = ordinals[&task.segment];
+                            let result = backend(segment)?.decode(task);
+                            on_segment(segment);
+                            result
+                        })
+                })
+                .transpose()?;
             let scan = scans[i].as_mut().unwrap();
+            decoded_totals = decoded.as_ref().map(|output| output.totals.clone());
             scan.swap_topk(&mut topk);
             scan.swap_rate(&mut rate);
             let _stage = enter_vector_stage(scan.shortlist_stage());
             meter.open();
-            if let Some(rows) = source.probe_global(candidate)? {
-                let scored = scan.shortlist(&rows)?;
+            let scored = if collector.scan_executor.is_none() {
+                source
+                    .probe_global(candidate)?
+                    .map(|rows| scan.shortlist(&rows))
+                    .transpose()?
+            } else {
+                prepared
+                    .map(|prepared| scan.shortlist_prepared(prepared, decoded))
+                    .transpose()?
+            };
+            if let Some(scored) = scored {
                 source.admitted(scored)?;
                 meter.rows(scored);
                 recall_reached = scan.recall_reached();
@@ -990,6 +1176,9 @@ where
             Ok::<_, TantivyError>(())
         });
         totals[i].append(&measured);
+        if let Some(decoded_totals) = decoded_totals {
+            totals[i].append_counts(&decoded_totals);
+        }
         on_segment(i);
         result?;
         if !recall_reached && rate.as_mut().is_some_and(|rate| rate.refinement_due()) {
@@ -1021,6 +1210,15 @@ where
             recall_reached = scan.recall_reached();
             scan.swap_rate(&mut rate);
         }
+    }
+    for (i, _, prepared, _) in pending {
+        scans[i]
+            .as_mut()
+            .unwrap()
+            .discard_prefetched(prepared.as_ref());
+    }
+    if let Some(executor) = &collector.scan_executor {
+        executor.finish()?;
     }
     for (i, scan) in scans.iter_mut().enumerate() {
         let Some(scan) = scan else {
@@ -1444,6 +1642,158 @@ mod ivf_e2e_tests {
                         .stats
                         .iter()
                         .all(|s| s.termination != ProbeTermination::QuantizedRecall));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cooperative_adaptive_scan_matches_serial_history_and_refinement() -> Result<()> {
+        use crate::vector::search::scan::executor::tests::ThreadExecutor;
+        use crate::vector::{AdaptiveProbeParams, VectorScanExecutor};
+
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            let spec = if metric == Metric::L2 {
+                let vector = |cluster: usize| {
+                    let mut vector = vec![0.0; 64];
+                    vector[0] = cluster as f32 * 10.0;
+                    vector
+                };
+                FixtureSpec::ivf(
+                    metric,
+                    (0..64).map(vector).collect(),
+                    (0..19392)
+                        .map(|i| {
+                            let mut vector = vector(i % 64);
+                            vector[1] = (i * 17 % 101) as f32 * 0.001;
+                            vector
+                        })
+                        .collect(),
+                )
+            } else {
+                FixtureSpec::clustered(metric, 64, 32, 6144).replicated()
+            };
+            let fixture = spec
+                .segments(3)
+                .schedule(&[1, 1])
+                .label("matches", |i| i % 3 != 0)
+                .paged()
+                .build()?;
+            let searcher = fixture.index.reader()?.searcher();
+            let segments: Vec<_> = searcher
+                .segment_readers()
+                .iter()
+                .enumerate()
+                .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
+                .collect();
+            let mut query = vec![0.01; 64];
+            query[2] = 1.0;
+            if metric == Metric::L2 {
+                query.fill(0.0);
+            }
+            for filter in [&AllQuery as &dyn Query, &fixture.filter("matches")] {
+                for top_n in [10, 100] {
+                    let builder = TopDocs::with_limit(top_n)
+                        .order_by_similarity(fixture.field, query.clone())
+                        .with_probe_params(ProbeParams {
+                            adaptive_probing: Some(AdaptiveProbeParams {
+                                admission_fraction: if metric == Metric::L2 { 1e-4 } else { 1e-8 },
+                            }),
+                            located: LocatedPath::Off,
+                            exact_plan: false,
+                            ..exhaustive_params(32)
+                        });
+                    let serial = builder.clone().build_for_searcher(&searcher, filter)?;
+                    let weight = fixture.weight(filter)?;
+                    let expected = serial.merge_fruits(serial.collect_segments(
+                        weight.as_ref(),
+                        &segments,
+                        |_| {},
+                    )?)?;
+                    assert!(expected
+                        .stats
+                        .iter()
+                        .any(|stats| !stats.quantized_trace.refined_topk_rows.is_empty()));
+                    if metric == Metric::L2 {
+                        assert!(expected.stats.iter().all(|stats| stats.termination
+                            == crate::vector::ProbeTermination::QuantizedRecall));
+                    }
+                    for participants in [1, 2, 5] {
+                        let executor = Arc::new(ThreadExecutor::new(participants));
+                        let results = std::thread::scope(|scope| {
+                            let threads: Vec<_> = (0..participants)
+                                .map(|_| {
+                                    let collector = builder
+                                        .clone()
+                                        .with_scan_executor(executor.clone())
+                                        .build(serial.inputs.clone());
+                                    let segments = &segments;
+                                    let weight = weight.as_ref();
+                                    scope.spawn(move || {
+                                        collector.merge_fruits(collector.collect_segments(
+                                            weight,
+                                            segments,
+                                            |_| {},
+                                        )?)
+                                    })
+                                })
+                                .collect();
+                            threads
+                                .into_iter()
+                                .map(|thread| thread.join().unwrap())
+                                .collect::<Result<Vec<_>>>()
+                        })?;
+                        let mut coordinators = results
+                            .into_iter()
+                            .filter(|result| !result.stats.is_empty());
+                        let actual = coordinators.next().expect("one coordinator");
+                        assert!(coordinators.next().is_none());
+                        let discarded: usize = actual
+                            .stats
+                            .iter()
+                            .filter_map(|stats| stats.speculative.as_ref())
+                            .map(|stats| stats.clusters)
+                            .sum();
+                        assert!(discarded < executor.capacity());
+                        assert_eq!(
+                            actual.results, expected.results,
+                            "{metric:?}, k={top_n}, participants={participants}"
+                        );
+                        for (actual, expected) in actual.stats.iter().zip(&expected.stats) {
+                            assert_eq!(actual.termination, expected.termination);
+                            assert_eq!(actual.clusters_probed(), expected.clusters_probed());
+                            assert_eq!(actual.candidates_scored, expected.candidates_scored);
+                            if expected
+                                .layers
+                                .get(0)
+                                .is_some_and(|layer| layer.scored() > 0)
+                            {
+                                assert!(actual.cooperative_decode_ns.is_some());
+                                assert!(actual.layers.get(0).unwrap().io.reads > 0);
+                            }
+                            assert_eq!(
+                                actual.quantized_trace.scored_rows,
+                                expected.quantized_trace.scored_rows
+                            );
+                            assert_eq!(
+                                actual.quantized_trace.estimate_rows,
+                                expected.quantized_trace.estimate_rows
+                            );
+                            assert_eq!(
+                                actual.quantized_trace.refined_topk_rows,
+                                expected.quantized_trace.refined_topk_rows
+                            );
+                            assert_eq!(
+                                actual.quantized_trace.boundary_rows,
+                                expected.quantized_trace.boundary_rows
+                            );
+                            assert_eq!(
+                                actual.quantized_trace.exact_phase_rows,
+                                expected.quantized_trace.exact_phase_rows
+                            );
+                        }
+                    }
                 }
             }
         }

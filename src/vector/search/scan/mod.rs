@@ -5,6 +5,7 @@ pub(crate) mod bound;
 pub(crate) mod columns;
 pub(crate) mod estimate;
 mod exact;
+pub(crate) mod executor;
 pub(crate) mod heap;
 pub(crate) mod histogram;
 pub(crate) mod layer_read;
@@ -19,6 +20,7 @@ use self::bound::{Candidate, PruningBound, TopK};
 use self::columns::{Columns, QuantizedCandidates};
 use self::estimate::{combine_initial, combine_refine, CombineCtx};
 use self::exact::ExactScorer;
+use self::executor::VectorScanTask;
 use self::heap::TieBreakHits;
 use self::histogram::Fold;
 use self::layer_read::{decode_layer, Decoded, LayerRead, LayerSpec};
@@ -107,6 +109,8 @@ pub(crate) struct ScanReport {
     /// Rows shortlisted from the source.
     pub(crate) candidates_scored: usize,
     pub(crate) recall_reached: bool,
+    pub(crate) speculative: Option<crate::vector::stats::SpeculativeScanStats>,
+    pub(crate) cooperative_decode_ns: Option<u64>,
     /// One per active layer on a quantized segment; empty at full precision.
     pub(crate) layers: Vec<LayerReport>,
     /// Rows scored at full precision.
@@ -261,6 +265,7 @@ impl<'a> QuantizedState<'a> {
         bound: &mut PruningBound,
         scratch: &mut ReadScratch,
         fold: Option<Fold<'_>>,
+        decoded: Option<Decoded>,
     ) -> crate::Result<()> {
         let centroid = match rows.centroid {
             Some(centroid) => centroid,
@@ -269,7 +274,11 @@ impl<'a> QuantizedState<'a> {
         // The threshold as of the clusters admitted so far, before this cluster's rows enter.
         let prior = self.admission_threshold(bound);
         let spec = self.layers[0];
-        decode_layer(&spec, rows, read, &mut self.decoded, scratch)?;
+        if let Some(decoded) = decoded {
+            self.decoded = decoded;
+        } else {
+            decode_layer(&spec, rows, read, &mut self.decoded, scratch)?;
+        }
         self.layer0_scored += rows.len();
         let ctx = self.combine_ctx(0, centroid);
         match prior {
@@ -483,6 +492,33 @@ fn unseen_rows<'s>(
     }
 }
 
+pub(crate) struct PreparedCluster {
+    pub(crate) task: VectorScanTask,
+    docs: Option<Vec<DocId>>,
+    centroid: Option<Similarity>,
+    eligible: usize,
+    dropped: usize,
+    read: Read,
+    #[cfg(test)]
+    scored_rows: Vec<BlockAddress>,
+}
+
+impl PreparedCluster {
+    pub(crate) fn needs_decode(&self) -> bool {
+        matches!(self.read, Read::Layer(_)) && self.selected().len() > 0
+    }
+
+    fn selected(&self) -> ClusterRows<'_> {
+        ClusterRows {
+            cluster: self.task.cluster,
+            rows: self.task.rows.clone(),
+            offsets: self.task.offsets.as_deref(),
+            docs: self.docs.as_deref(),
+            centroid: self.centroid,
+        }
+    }
+}
+
 /// One segment's IVF scan. A cluster source supplies each cluster's rows; the scan shortlists them
 /// under the segment's quantization, keeps the pruning bound, and scores what is left exactly.
 pub(crate) struct SegmentScan<'a, T, K, C>
@@ -492,6 +528,7 @@ where
     C: Comparator<K::SegmentSortKey>,
 {
     exact: ExactScorer<'a, T, K, C>,
+    segment_ord: SegmentOrdinal,
     /// The segment's pruning bound.
     bound: PruningBound,
     /// The quantized cascade; `None` scores every shortlisted row exactly.
@@ -561,6 +598,7 @@ where
                 tie_break,
                 tie_comparator,
             ),
+            segment_ord,
             bound,
             quantized,
             scratch: ReadScratch::default(),
@@ -768,7 +806,14 @@ where
                 }
                 Read::Layer(read) => {
                     if let Some(state) = &mut self.quantized {
-                        state.admit(selected, read, &mut self.bound, &mut self.scratch, fold)?;
+                        state.admit(
+                            selected,
+                            read,
+                            &mut self.bound,
+                            &mut self.scratch,
+                            fold,
+                            None,
+                        )?;
                     }
                 }
             }
@@ -776,6 +821,122 @@ where
         self.report.candidates_scored += len;
         self.close_rate_cluster(len);
         Ok(len)
+    }
+
+    pub(crate) fn prepare_shortlist(
+        &mut self,
+        rows: &ClusterRows<'_>,
+    ) -> crate::Result<PreparedCluster> {
+        let _stage = enter_vector_stage(self.shortlist_stage());
+        let len = rows.len();
+        let mut dropped = 0;
+        let unseen = self.seen.as_mut().map(|seen| {
+            unseen_rows(
+                seen,
+                rows,
+                &mut self.unseen_offsets,
+                &mut self.unseen_docs,
+                &mut dropped,
+            )
+        });
+        let selected = unseen
+            .as_ref()
+            .filter(|unseen| unseen.len() != len)
+            .unwrap_or(rows);
+        let read = if selected.len() == 0 {
+            Read::Exact
+        } else {
+            match &self.quantized {
+                Some(state) => state.read_plan(selected, 0, &mut self.scratch)?,
+                None => Read::Exact,
+            }
+        };
+        Ok(PreparedCluster {
+            task: VectorScanTask {
+                segment: self.segment_ord,
+                cluster: selected.cluster,
+                rows: selected.rows.clone(),
+                offsets: selected.offsets.map(<[u32]>::to_vec),
+                sparse: read == Read::Layer(LayerRead::Sparse),
+            },
+            docs: selected.docs.map(<[DocId]>::to_vec),
+            centroid: selected.centroid,
+            eligible: len,
+            dropped,
+            read,
+            #[cfg(test)]
+            scored_rows: rows
+                .local_rows()
+                .map(|row| BlockAddress::new(rows.cluster as u32, row as u32))
+                .collect(),
+        })
+    }
+
+    pub(crate) fn shortlist_prepared(
+        &mut self,
+        prepared: PreparedCluster,
+        decoded: Option<executor::VectorScanOutput>,
+    ) -> crate::Result<usize> {
+        let _stage = enter_vector_stage(self.shortlist_stage());
+        let decoded = decoded.map(|output| {
+            *self.report.cooperative_decode_ns.get_or_insert(0) +=
+                output.totals.time_ns(VectorStage::LayerScan(0));
+            output.decoded
+        });
+        let selected = prepared.selected();
+        if selected.len() > 0 {
+            let read = if decoded.is_none() {
+                match &self.quantized {
+                    Some(state) => state.read_plan(&selected, 0, &mut self.scratch)?,
+                    None => Read::Exact,
+                }
+            } else {
+                prepared.read
+            };
+            if self.quantized.is_some() {
+                self.report.layers[0].count(read, selected.len());
+            }
+            let fold = self.rate.as_mut().map(|rate| match &mut rate.histograms {
+                None => Fold::Prefill(&mut rate.prefill),
+                Some(histograms) => {
+                    let grid = histograms.grid();
+                    Fold::Binned(histograms.cluster_mut(), grid)
+                }
+            });
+            match read {
+                Read::Exact => {
+                    self.report.exact_rows +=
+                        self.exact
+                            .score(&selected, &mut self.scratch, &mut self.bound, fold)?
+                }
+                Read::Layer(read) => {
+                    if let Some(state) = &mut self.quantized {
+                        state.admit(
+                            &selected,
+                            read,
+                            &mut self.bound,
+                            &mut self.scratch,
+                            fold,
+                            decoded,
+                        )?;
+                    }
+                }
+            }
+        }
+        self.replication_dropped += prepared.dropped;
+        #[cfg(test)]
+        self.report.trace.scored_rows.extend(prepared.scored_rows);
+        self.report.candidates_scored += prepared.eligible;
+        self.close_rate_cluster(prepared.eligible);
+        Ok(prepared.eligible)
+    }
+
+    pub(crate) fn discard_prefetched(&mut self, prepared: Option<&PreparedCluster>) {
+        let stats = self.report.speculative.get_or_insert_with(Default::default);
+        stats.clusters += 1;
+        if let Some(prepared) = prepared.filter(|prepared| prepared.needs_decode()) {
+            stats.rows += prepared.selected().len();
+        }
     }
 
     /// Ends the admission-rate measurement's cluster of `len` rows. Once the shared pruning

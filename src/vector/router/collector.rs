@@ -65,7 +65,8 @@ impl<T: VectorElement> TopClustersBySimilarityCollector<T> {
         })
     }
 
-    pub(crate) fn without_candidate_limit(mut self) -> Self {
+    /// Leaves the routed candidate list uncapped so one global scan can enforce its work budget.
+    pub fn without_candidate_limit(mut self) -> Self {
         self.limit_candidates = false;
         self
     }
