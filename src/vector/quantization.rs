@@ -77,7 +77,12 @@ pub(crate) enum VectorNormPolicy {
 impl VectorNormPolicy {
     /// Resolves the normalization policy for vector options.
     pub(crate) fn for_options(options: &VectorOptions) -> Self {
-        if options.needs_normalization() {
+        Self::for_dtype_metric(options.dtype(), options.metric())
+    }
+
+    /// Resolves the normalization policy for vectors of `dtype` under `metric`.
+    pub(crate) fn for_dtype_metric(dtype: VectorDType, metric: Metric) -> Self {
+        if VectorOptions::normalizes(dtype, metric) {
             Self::UnitL2
         } else {
             Self::None
@@ -246,11 +251,9 @@ impl VectorQuantizationConfig {
                 options.dim()
             )));
         }
-        if options.dtype() != VectorDType::F32 {
-            return Err(invalid(format!(
-                "dtype {:?} is unsupported; expected f32",
-                options.dtype()
-            )));
+        // Quantized layers encode f32 rows; a new dtype must decide here.
+        match options.dtype() {
+            VectorDType::F32 => {}
         }
         if self.metric != options.metric() {
             return Err(invalid(format!(
@@ -340,7 +343,7 @@ impl VectorQuantizationConfig {
 
     /// Whether split-form L2 assembly needs per-layer constants.
     pub fn needs_constants(&self) -> bool {
-        self.metric == Metric::L2
+        self.metric.scores_by_distance()
     }
 }
 
@@ -412,7 +415,11 @@ pub(crate) fn corrected_quantized_estimate(
     raw_prefix: f32,
     base: f32,
 ) -> f32 {
-    let metric_factor = if metric == Metric::L2 { 2.0 } else { 1.0 };
+    let metric_factor = if metric.scores_by_distance() {
+        2.0
+    } else {
+        1.0
+    };
     (metric_factor * gamma).mul_add(raw_prefix, base)
 }
 
@@ -482,13 +489,13 @@ impl ArithmeticError {
         cluster_score: f32,
         residual_norm_sq: f32,
     ) -> Self {
-        let raw_variance = if metric == Metric::L2 {
+        let raw_variance = if metric.scores_by_distance() {
             l2_arithmetic_variance(kernel, scale, constant, None)
         } else {
             // c = 1: the initial scale * kernel multiplication.
             rounding_error(scale * kernel, 0.0, 1.0).powi(2)
         };
-        let base_variance = if metric == Metric::L2 {
+        let base_variance = if metric.scores_by_distance() {
             // c = 1: cluster_score - residual_norm_sq.
             rounding_error(cluster_score, residual_norm_sq, 1.0).powi(2)
         } else {
@@ -509,7 +516,7 @@ impl ArithmeticError {
         scale: f32,
         constant: f32,
     ) {
-        self.raw_variance += if metric == Metric::L2 {
+        self.raw_variance += if metric.scores_by_distance() {
             l2_arithmetic_variance(kernel, scale, constant, Some(prefix))
         } else {
             // c = 2: rounded layer contribution plus the refinement addition.
@@ -560,7 +567,7 @@ pub(crate) fn quantized_sigma(
         * corrected_error_ratio
         * score_query_norm_squared;
     let query_variance = gamma * gamma * sign_query_error_term;
-    let (metric_factor, factor) = if metric == Metric::L2 {
+    let (metric_factor, factor) = if metric.scores_by_distance() {
         (2.0, 2.0 * gamma)
     } else {
         (1.0, gamma)
@@ -644,7 +651,7 @@ mod tests {
                 * f64::from(query_norm_squared);
             let query_variance =
                 f64::from(gamma) * f64::from(gamma) * f64::from(sign_query_error_term);
-            let (metric_factor, factor) = if metric == Metric::L2 {
+            let (metric_factor, factor) = if metric.scores_by_distance() {
                 (2.0, 2.0 * f64::from(gamma))
             } else {
                 (1.0, f64::from(gamma))

@@ -113,7 +113,7 @@ mod tests {
             raw: Some(raw.clone()),
         };
         for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
-            let query = VectorQuery::new(metric, Arc::new(vec![0.0; dim]));
+            let query = VectorQuery::new(metric, Arc::new(vec![0.0; dim])).unwrap();
             let mut buffer = ScoreBuffer::default();
             assert!(!score_initial(raw.as_ref(), &query, 0..4, &mut buffer));
             assert_eq!(buffer.similarities.len(), 4);

@@ -17,6 +17,7 @@
 use std::cmp::Ordering;
 
 use crate::schema::{Metric, VectorDType, VectorOptions};
+use crate::vector::quantization::VectorNormPolicy;
 use crate::vector::{Accumulator, VectorElement};
 
 /// A "higher is better" similarity score — the one ranking convention of the
@@ -276,8 +277,18 @@ pub(crate) enum NormalizeOutcome {
 /// arithmetic in f64 (see [`norm_squared_bytes_wide`]). Elements narrow
 /// back to `T` only at write-back, where every value is `<= 1`.
 pub(crate) fn normalize_bytes_inplace<T: VectorElement>(row: &mut [u8]) -> NormalizeOutcome {
+    normalize_with_norm_squared::<T>(row, norm_squared_bytes_wide::<T>(row))
+}
+
+/// [`normalize_bytes_inplace`] with the row's wide squared norm already computed, so a caller
+/// that validated the row does not take a second norm pass.
+#[inline]
+pub(crate) fn normalize_with_norm_squared<T: VectorElement>(
+    row: &mut [u8],
+    norm_squared: f64,
+) -> NormalizeOutcome {
     debug_assert_eq!(row.len() % T::SIZE_BYTES, 0);
-    let norm = norm_squared_bytes_wide::<T>(row).sqrt();
+    let norm = norm_squared.sqrt();
     if norm == 0.0 {
         return NormalizeOutcome::ZeroSkipped;
     }
@@ -309,6 +320,65 @@ pub(crate) fn maybe_normalize_bytes(opts: &VectorOptions, row: &mut [u8]) -> Nor
     match opts.dtype() {
         VectorDType::F32 => normalize_bytes_inplace::<f32>(row),
     } // exhaustive: a new dtype variant must decide its policy here
+}
+
+/// Largest squared norm of a vector stored or scored as given (every metric that does not
+/// normalize, such as L2 and inner product): `f32::MAX / 8`, a norm of about 6.5e18.
+///
+/// Rows and queries with squared norm at most `B^2` keep every centroid, a convex combination of
+/// rows, within `B^2` too. Residual norms, squared distances and the `|x|^2 + |c|^2 - 2 x.c` form
+/// then stay within `4 B^2 = f32::MAX / 2` in f32 arithmetic, which leaves a factor of 2 for
+/// rounding. The bound keeps exact scores and the stored statistics finite in f32. Quantized
+/// error widths come from f32 variances in squared score units and can still overflow to +inf
+/// above roughly a squared norm of 1e19; an infinite width disables pruning for that row, so
+/// results stay correct. Unit-normalized vectors are never bounded.
+pub(crate) const MAX_NORM_SQUARED: f64 = f32::MAX as f64 / 8.0;
+
+/// Why a row or a query vector is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InvalidVector {
+    /// An element is NaN or infinite. With wide accumulation the squared norm is non-finite if and
+    /// only if an element is.
+    NonFinite,
+    /// A vector used as given has a squared norm above [`MAX_NORM_SQUARED`].
+    NormTooLarge,
+}
+
+/// The admission rule for rows and queries, applied to a vector's wide squared norm: every
+/// policy refuses a non-finite norm, and a vector used as given is also refused above
+/// [`MAX_NORM_SQUARED`].
+#[inline]
+pub(crate) fn admit(norm_squared: f64, policy: VectorNormPolicy) -> Result<(), InvalidVector> {
+    if !norm_squared.is_finite() {
+        return Err(InvalidVector::NonFinite);
+    }
+    match policy {
+        VectorNormPolicy::None if norm_squared > MAX_NORM_SQUARED => {
+            Err(InvalidVector::NormTooLarge)
+        }
+        VectorNormPolicy::None | VectorNormPolicy::UnitL2 => Ok(()),
+    }
+}
+
+/// The wide squared norm of a little-endian row of `dtype` elements, from
+/// [`norm_squared_bytes_wide`] over the element's accumulator.
+#[inline]
+pub(crate) fn row_norm_squared(dtype: VectorDType, row: &[u8]) -> f64 {
+    match dtype {
+        VectorDType::F32 => norm_squared_bytes_wide::<f32>(row),
+    }
+}
+
+/// [`normalize_with_norm_squared`] for a row of `dtype` elements.
+#[inline]
+pub(crate) fn normalize_row_with_norm_squared(
+    dtype: VectorDType,
+    row: &mut [u8],
+    norm_squared: f64,
+) -> NormalizeOutcome {
+    match dtype {
+        VectorDType::F32 => normalize_with_norm_squared::<f32>(row, norm_squared),
+    }
 }
 
 /// `cosine` where the doc side is little-endian bytes encoding `T`.
@@ -344,8 +414,9 @@ impl Metric {
         doc: &[T],
         query_norm: f32,
     ) -> Similarity {
-        if self != Metric::Cosine {
-            return self.similarity(query, doc);
+        match self {
+            Metric::Cosine => {}
+            Metric::L2 | Metric::Dot => return self.similarity(query, doc),
         }
         let doc_norm = norm_squared(doc).sqrt();
         Similarity::new(if query_norm == 0.0 || doc_norm == 0.0 {
@@ -362,8 +433,9 @@ impl Metric {
         doc: &[u8],
         query_norm: f32,
     ) -> Similarity {
-        if self != Metric::Cosine {
-            return self.similarity_bytes(query, doc);
+        match self {
+            Metric::Cosine => {}
+            Metric::L2 | Metric::Dot => return self.similarity_bytes(query, doc),
         }
         let doc_norm = norm_squared_bytes::<T>(doc).sqrt();
         Similarity::new(if query_norm == 0.0 || doc_norm == 0.0 {
@@ -394,6 +466,109 @@ impl Metric {
 mod tests {
     use super::*;
     use crate::schema::{Metric, VectorOptions};
+
+    /// The cosine add path writes the same bytes as normalizing with the norm computed inside the
+    /// normalization, which is how rows were normalized before the add path validated them,
+    /// including a row whose squared norm is far above the bound for rows stored as given.
+    #[test]
+    fn checked_cosine_rows_normalize_to_the_same_bytes() {
+        fn reference_normalize(row: &mut [u8]) -> NormalizeOutcome {
+            let norm = norm_squared_bytes_wide::<f32>(row).sqrt();
+            if norm == 0.0 {
+                return NormalizeOutcome::ZeroSkipped;
+            }
+            if !norm.is_finite() {
+                return NormalizeOutcome::NonFinite;
+            }
+            let inv = 1.0 / norm;
+            for chunk in row.chunks_exact_mut(f32::SIZE_BYTES) {
+                let scaled = (f32::decode_le(chunk).to_f32() as f64 * inv) as f32;
+                chunk.copy_from_slice(&scaled.to_le_bytes());
+            }
+            NormalizeOutcome::Normalized
+        }
+
+        let mut state = 0x005e_ed0f_c051_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 40) as f32 / (1_u32 << 24) as f32 - 0.5
+        };
+        let mut cases: Vec<(usize, Vec<f32>)> = vec![(1024, vec![1.0e20; 1024])];
+        for (dim, magnitude) in [(3, 1.0_f32), (768, 0.05), (1024, 7.0), (1025, 3.0e15)] {
+            for _ in 0..8 {
+                cases.push((dim, (0..dim).map(|_| next() * magnitude).collect()));
+            }
+        }
+        for (dim, values) in cases {
+            let opts = VectorOptions::new(dim, Metric::Cosine);
+            let original: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let norm_squared = row_norm_squared(opts.dtype(), &original);
+            assert_eq!(
+                admit(norm_squared, VectorNormPolicy::for_options(&opts)),
+                Ok(()),
+                "dim={dim}"
+            );
+            let mut checked = original.clone();
+            let mut expected = original;
+            assert_eq!(
+                normalize_row_with_norm_squared(opts.dtype(), &mut checked, norm_squared),
+                reference_normalize(&mut expected),
+                "dim={dim}"
+            );
+            assert_eq!(checked, expected, "dim={dim}");
+        }
+    }
+
+    /// A row and a query at the bound, pointing in opposite directions, keep the f32 distance,
+    /// dot product and residual encoding finite: the residual against a centroid at `-x` has
+    /// squared norm `4 * MAX_NORM_SQUARED = f32::MAX / 2`.
+    #[test]
+    fn vectors_at_the_bound_keep_f32_arithmetic_finite() {
+        use quant::cascade::{
+            encode_batch_in_place, prepare_centroid, LayerKind, LayerSpec, Rotation,
+        };
+        use quant::model::build_grid;
+
+        // The smallest dimension the quantization grids accept.
+        const DIM: usize = 64;
+        let mut element = (MAX_NORM_SQUARED / DIM as f64).sqrt() as f32;
+        while norm_squared_wide(&vec![element; DIM]) > MAX_NORM_SQUARED {
+            element = element.next_down();
+        }
+        let x = vec![element; DIM];
+        let y: Vec<f32> = x.iter().map(|value| -value).collect();
+        let norm_squared = norm_squared_wide(&x);
+        assert_eq!(admit(norm_squared, VectorNormPolicy::None), Ok(()));
+        assert!(norm_squared > MAX_NORM_SQUARED * (1.0 - 1e-6));
+
+        assert!(l2_squared(&x, &y).is_finite());
+        assert!(dot(&x, &y).is_finite());
+
+        let layer = |seed| LayerSpec {
+            kind: LayerKind::Sign,
+            bits: 1,
+            rotation: Rotation::SeededFhtChaCha8 { seed },
+        };
+        let specs = [layer(11), layer(22)];
+        let grids = [build_grid(DIM, 1), build_grid(DIM, 1)];
+        let mut rows = x.clone();
+        let batch =
+            encode_batch_in_place(&mut rows, 1, &prepare_centroid(&y, &specs), &specs, &grids);
+        let finite_f16 = |bits: u16| bits & 0x7c00 != 0x7c00;
+        assert!(batch
+            .residual_norms_squared
+            .iter()
+            .all(|value| value.is_finite()));
+        for layer in &batch.layers {
+            assert!(layer.scales.iter().all(|value| value.is_finite()));
+            assert!(layer.constants.iter().all(|value| value.is_finite()));
+            assert!(layer.gammas.iter().copied().all(finite_f16));
+            assert!(layer.corrected_error_ratios.iter().copied().all(finite_f16));
+        }
+        assert!(rows.iter().all(|value| value.is_finite()));
+    }
 
     #[test]
     fn test_l2_squared() {

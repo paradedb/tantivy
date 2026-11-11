@@ -14,7 +14,11 @@ use crate::indexer::segment_updater::CancelSentinel;
 use crate::plugin::{PluginMergeContext, PluginWriter};
 use crate::schema::document::{ErasedDocument, ErasedValue, ReferenceValueLeaf};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
-use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
+use crate::vector::distance::{
+    admit, maybe_normalize_bytes, normalize_row_with_norm_squared, row_norm_squared, InvalidVector,
+    MAX_NORM_SQUARED,
+};
+use crate::vector::quantization::VectorNormPolicy;
 use crate::vector::storage::blocks::{
     align_up, block_align, pad, write_metadata, BlockOffsetsWriter,
 };
@@ -28,21 +32,50 @@ use crate::{DocId, TantivyError};
 
 // --- Writer ---
 
+/// The error for a document whose vector the admission rule refuses.
+fn refused_row(invalid: InvalidVector, field: &str, doc_id: DocId) -> TantivyError {
+    TantivyError::InvalidArgument(match invalid {
+        InvalidVector::NonFinite => format!(
+            "non-finite element in vector field '{field}' (doc {doc_id}): vectors must contain \
+             only finite values"
+        ),
+        InvalidVector::NormTooLarge => format!(
+            "vector in field '{field}' (doc {doc_id}) has a squared norm above the limit of \
+             {MAX_NORM_SQUARED:e}"
+        ),
+    })
+}
+
 /// Buffers one vector field before serialization.
 struct FieldBuffer {
     present_doc_ids: Vec<DocId>,
     row_bytes: Vec<u8>,
     opts: VectorOptions,
+    norm_policy: VectorNormPolicy,
 }
 
 impl FieldBuffer {
-    fn push_bytes(&mut self, doc_id: DocId, bytes: &[u8]) -> NormalizeOutcome {
-        let stride = self.opts.bytes_per_vector();
-        debug_assert_eq!(bytes.len(), stride);
+    /// Admits a document's row and buffers it, normalized when the field stores unit rows. The
+    /// row's one norm pass serves both the admission and the normalization; a refused row leaves
+    /// the buffer unchanged.
+    fn push_bytes(&mut self, doc_id: DocId, bytes: &[u8]) -> Result<(), InvalidVector> {
+        debug_assert_eq!(bytes.len(), self.opts.bytes_per_vector());
+        let norm_squared = row_norm_squared(self.opts.dtype(), bytes);
+        admit(norm_squared, self.norm_policy)?;
         self.present_doc_ids.push(doc_id);
         let start = self.row_bytes.len();
         self.row_bytes.extend_from_slice(bytes);
-        maybe_normalize_bytes(&self.opts, &mut self.row_bytes[start..start + stride])
+        match self.norm_policy {
+            VectorNormPolicy::UnitL2 => {
+                normalize_row_with_norm_squared(
+                    self.opts.dtype(),
+                    &mut self.row_bytes[start..],
+                    norm_squared,
+                );
+            }
+            VectorNormPolicy::None => {}
+        }
+        Ok(())
     }
 
     fn mem_usage(&self) -> usize {
@@ -71,6 +104,7 @@ impl FlatVecWriter {
                         present_doc_ids: Vec::new(),
                         row_bytes: Vec::new(),
                         opts: opts.clone(),
+                        norm_policy: VectorNormPolicy::for_options(opts),
                     },
                 );
             }
@@ -115,13 +149,9 @@ impl PluginWriter for FlatVecWriter {
                     bytes.len(),
                 )));
             }
-            if buf.push_bytes(doc_id, bytes) == NormalizeOutcome::NonFinite {
-                return Err(TantivyError::InvalidArgument(format!(
-                    "non-finite element in vector field '{}' (doc {doc_id}): vectors must contain \
-                     only finite values",
-                    schema.get_field_entry(field).name(),
-                )));
-            }
+            buf.push_bytes(doc_id, bytes).map_err(|invalid| {
+                refused_row(invalid, schema.get_field_entry(field).name(), doc_id)
+            })?;
         }
         Ok(())
     }

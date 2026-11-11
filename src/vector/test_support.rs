@@ -316,10 +316,9 @@ impl FixtureSpec {
         let vectors = (0..docs)
             .map(|ordinal| {
                 let mut rng = Lcg(ordinal as u64 * 7919 + 13);
-                let scale = if metric == Metric::Dot {
-                    0.5 + (ordinal % 7) as f32 * 0.15
-                } else {
-                    1.0
+                let scale = match metric {
+                    Metric::Dot => 0.5 + (ordinal % 7) as f32 * 0.15,
+                    Metric::L2 | Metric::Cosine => 1.0,
                 };
                 centroid(ordinal % clusters)
                     .iter()
@@ -740,7 +739,7 @@ impl Fixture {
         let backend = SegmentSearcher::<f32>::for_segment(
             prepared.clone(),
             self.field,
-            Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec()))),
+            Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec())).unwrap()),
             None,
             params,
         )?
@@ -804,7 +803,7 @@ impl Fixture {
                 ProbeStats::new(SegmentReport::Empty { located_cap: *cap }, totals.clone()),
             ));
         };
-        let query = Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec())));
+        let query = Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec())).unwrap());
         let quantized = segment_reader
             .vector_index(self.field)?
             .quantization()?

@@ -19,7 +19,7 @@ use crate::query::Weight;
 use crate::schema::{Field, Metric, Schema};
 use crate::vector::params::ProbeParams;
 use crate::vector::search::cluster_source::ClusterSource;
-use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
+use crate::vector::search::prepared::{invalid_query, QuantizedQueryCtx, VectorQuery};
 use crate::vector::search::scan::bound::{ExactMerge, PruningBound, TopK};
 use crate::vector::search::scan::heap::TieBreakHits;
 use crate::vector::search::scan::{ScanConfig, SegmentScan};
@@ -322,14 +322,16 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
         self.limit.saturating_add(self.offset)
     }
 
-    /// The query prepared for `metric`, on first use.
-    fn vector_query(&self, metric: Metric) -> Arc<VectorQuery<T>> {
+    /// The query prepared for `metric`, on first use, or the error for a refused query vector.
+    fn vector_query(&self, metric: Metric) -> crate::Result<Arc<VectorQuery<T>>> {
         let mut prepared = self.prepared.lock().unwrap();
         let query = match prepared.as_ref() {
             Some(query) if query.metric() == metric => query,
-            _ => prepared.insert(Arc::new(VectorQuery::new(metric, Arc::clone(&self.query)))),
+            _ => prepared.insert(Arc::new(
+                VectorQuery::new(metric, Arc::clone(&self.query)).map_err(invalid_query)?,
+            )),
         };
-        Arc::clone(query)
+        Ok(Arc::clone(query))
     }
 
     /// Prepares `query` once per metadata key, releasing the map lock before expensive
@@ -543,7 +545,7 @@ where
                 let vectors = {
                     let _prep = enter_vector_stage(VectorStage::QueryPrep);
                     let vectors = segment.reader.vector_index(self.field)?;
-                    self.vector_query(vectors.options().metric());
+                    self.vector_query(vectors.options().metric())?;
                     vectors
                 };
                 Ok::<_, TantivyError>((
@@ -633,7 +635,7 @@ where
         let (query, quantized) = {
             let _prep = enter_vector_stage(VectorStage::QueryPrep);
             let vectors = reader.vector_index(self.field)?;
-            let query = self.vector_query(vectors.options().metric());
+            let query = self.vector_query(vectors.options().metric())?;
             let quantized = if self.max_scan_levels > 0 {
                 vectors
                     .quantization()?
@@ -3088,7 +3090,7 @@ mod prepared_key_tests {
                 .collect();
             handles
                 .into_iter()
-                .map(|handle| handle.join().unwrap())
+                .map(|handle| handle.join().unwrap().unwrap())
                 .collect::<Vec<_>>()
         });
         for query in &queries {

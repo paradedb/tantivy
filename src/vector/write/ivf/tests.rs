@@ -805,7 +805,7 @@ fn assert_quantized_matrix_storage(
                 stored
                     .constant(BlockAddress::new(cluster as u32, row as u32))?
                     .is_some(),
-                metric == Metric::L2,
+                metric.scores_by_distance(),
                 "layer {layer} split-constant presence must follow the metric at row {row}"
             );
         }
@@ -880,7 +880,7 @@ fn run_quantized_matrix_query(
             "{context}: {stats:?}"
         );
     }
-    if metric == Metric::L2 && matches!(scenario, QuantizedMatrixScenario::None) {
+    if metric.scores_by_distance() && matches!(scenario, QuantizedMatrixScenario::None) {
         assert!(
             layer0.survivors() < layer0.scored(),
             "{context}: the unfiltered L2 matrix cell must prove that boundary 0 measurably drops \
@@ -993,7 +993,7 @@ fn assert_quantized_bridge_exactness(dim: usize) -> crate::Result<()> {
     let harness = quant::cascade::prepare_split_query(&query, &specs, &grids, 4);
     let scan = QuantizedQueryCtx::new(
         Arc::clone(quantized.index_ctx()),
-        &VectorQuery::new(quantized.index_ctx().meta.field().metric, Arc::new(query)),
+        &VectorQuery::new(quantized.index_ctx().meta.field().metric, Arc::new(query)).unwrap(),
     );
 
     for (cluster, row) in block_rows(ivf)? {

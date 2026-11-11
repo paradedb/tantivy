@@ -7,6 +7,12 @@ pub enum VectorDType {
 }
 
 impl VectorDType {
+    /// Every dtype. The match fails to compile for a variant missing from the list.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 1] = match Self::F32 {
+        Self::F32 => [Self::F32],
+    };
+
     pub fn size_bytes(self) -> usize {
         match self {
             VectorDType::F32 => 4,
@@ -23,6 +29,31 @@ pub enum Metric {
     L2,
     Cosine,
     Dot,
+}
+
+impl Metric {
+    /// Every metric. The match fails to compile for a variant missing from the list.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 3] = match Self::L2 {
+        Self::L2 | Self::Cosine | Self::Dot => [Self::L2, Self::Cosine, Self::Dot],
+    };
+
+    /// Whether scores are negated squared distances, which depend on where the query sits and not
+    /// only on its direction and scale.
+    pub(crate) fn scores_by_distance(self) -> bool {
+        match self {
+            Metric::L2 => true,
+            Metric::Cosine | Metric::Dot => false,
+        }
+    }
+
+    /// Whether clustering groups vectors by direction (angular k-means) rather than by position.
+    pub(crate) fn clusters_by_angle(self) -> bool {
+        match self {
+            Metric::Cosine | Metric::Dot => true,
+            Metric::L2 => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,14 +93,19 @@ impl VectorOptions {
         self.dim * self.dtype.size_bytes()
     }
 
-    /// Whether this field's `(metric, dtype)` requires write-time
-    /// unit-normalization (see `vector::distance::maybe_normalize_bytes`).
-    /// Currently only `Cosine + F32`.
+    /// Whether this field's rows are stored at unit L2 norm, normalized when they are added
+    /// (see `vector::distance::maybe_normalize_bytes`).
     pub fn needs_normalization(&self) -> bool {
-        matches!(
-            (self.metric, self.dtype),
-            (Metric::Cosine, VectorDType::F32)
-        )
+        Self::normalizes(self.dtype, self.metric)
+    }
+
+    /// Whether vectors of `dtype` under `metric` are stored and scored at unit L2 norm. Every
+    /// `(dtype, metric)` pair is listed, so a new variant must decide here.
+    pub(crate) fn normalizes(dtype: VectorDType, metric: Metric) -> bool {
+        match (dtype, metric) {
+            (VectorDType::F32, Metric::Cosine) => true,
+            (VectorDType::F32, Metric::L2 | Metric::Dot) => false,
+        }
     }
 }
 

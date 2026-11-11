@@ -135,7 +135,7 @@ mod tests {
                     })
                     .collect();
                 expected.sort_unstable_by(|a, b| b.cmp(a));
-                let query = VectorQuery::new(metric, std::sync::Arc::new(query.to_vec()));
+                let query = VectorQuery::new(metric, std::sync::Arc::new(query.to_vec())).unwrap();
                 assert_eq!(router.rank(&query).collect::<Vec<_>>(), expected);
                 assert_eq!(opened.rank(&query).collect::<Vec<_>>(), expected);
             }

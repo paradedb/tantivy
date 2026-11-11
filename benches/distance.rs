@@ -18,8 +18,11 @@
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use tantivy::vector::bench::{cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use tantivy::schema::{Metric, VectorOptions};
+use tantivy::vector::bench::{
+    add_row_check, cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes,
+};
 
 const DIMS: &[usize] = &[1024, 2048];
 
@@ -121,9 +124,38 @@ fn bench_pairwise_bytes(c: &mut Criterion) {
     group.finish();
 }
 
+/// The add path's per-row work on 64 seeded rows: validation for every metric, plus normalization
+/// for cosine. Each iteration starts from fresh copies, since normalization rewrites the rows.
+fn bench_add_row_check(c: &mut Criterion) {
+    const ROWS: usize = 64;
+    let mut group = c.benchmark_group("add_row_check");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    for (name, metric) in [("l2", Metric::L2), ("cosine", Metric::Cosine)] {
+        for dim in [768, 1024, 1536] {
+            let opts = VectorOptions::new(dim, metric);
+            let rows: Vec<u8> = (0..ROWS)
+                .flat_map(|row| f32_to_le_bytes(&make_f32(dim, 100 + row as u64)))
+                .collect();
+            group.bench_with_input(BenchmarkId::new(name, dim), &dim, |bn, _| {
+                bn.iter_batched(
+                    || rows.clone(),
+                    |mut rows| {
+                        for row in rows.chunks_exact_mut(dim * 4) {
+                            black_box(add_row_check(&opts, row));
+                        }
+                        rows
+                    },
+                    BatchSize::SmallInput,
+                )
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(100);
-    targets = bench_pairwise_f32, bench_pairwise_bytes
+    targets = bench_pairwise_f32, bench_pairwise_bytes, bench_add_row_check
 }
 criterion_main!(benches);

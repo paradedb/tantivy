@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn retention_does_not_change_list_request_and_aps_waits_for_full_heap() {
         let level = lists(None);
-        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.0]));
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.0])).unwrap();
         let policy = SearchPolicy {
             aps: false,
             min_fraction: 0.25,
@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn widening_selection_recovers_a_misranked_list_without_growing_retention() {
         let level = lists(Some(11));
-        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.0]));
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.0])).unwrap();
         let policy = SearchPolicy {
             aps: false,
             min_fraction: 0.25,
@@ -455,7 +455,7 @@ mod tests {
             centroids: middle,
             vectors: encoded(raw_members.clone())?,
         };
-        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.8; dim]));
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.8; dim])).unwrap();
         #[cfg(debug_assertions)]
         quant::rotation::debug_reset_apply_count();
         let policy = SearchPolicy {

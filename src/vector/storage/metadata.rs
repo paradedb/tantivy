@@ -356,7 +356,7 @@ impl Quantizer {
                 stride: ElemType::F16.size() as u32,
             },
         ];
-        if metric == Metric::L2 {
+        if metric.scores_by_distance() {
             slots.push(Slot {
                 slot_type: SlotType::QuantLayerConstants { layer },
                 elem: ElemType::F32,
@@ -883,12 +883,12 @@ mod tests {
                             .iter()
                             .any(|slot| matches!(slot.slot_type, SlotType::Rows { .. })));
                     } else {
-                        assert!(matches!(
-                            slots[0].slot_type,
-                            SlotType::Rows {
-                                dtype: VectorDType::F32
-                            }
-                        ));
+                        let SlotType::Rows { dtype } = slots[0].slot_type else {
+                            panic!("the first slot of an unclustered entry holds rows");
+                        };
+                        match dtype {
+                            VectorDType::F32 => {}
+                        }
                         assert_eq!(
                             (slots[0].elem, slots[0].stride, slots[0].slot_type.band()),
                             (ElemType::F32, 400, None)
@@ -904,7 +904,7 @@ mod tests {
                         ),
                         (ElemType::F32, 4, Some(0))
                     );
-                    let per_layer = if metric == Metric::L2 { 5 } else { 4 };
+                    let per_layer = if metric.scores_by_distance() { 5 } else { 4 };
                     assert_eq!(slots.len(), norms + 1 + schedule.len() * per_layer);
                     for (l, &bits) in schedule.iter().enumerate() {
                         let layer = l as u8;
@@ -941,7 +941,7 @@ mod tests {
                             (ElemType::F16, 2),
                             (ElemType::F16, 2),
                         ];
-                        if metric == Metric::L2 {
+                        if metric.scores_by_distance() {
                             assert!(
                                 matches!(cols[4].slot_type, SlotType::QuantLayerConstants { layer: n } if n == layer)
                             );
@@ -976,12 +976,12 @@ mod tests {
                         (ElemType::U32, 4, None)
                     );
                 }
-                assert!(matches!(
-                    plain.slots()[0].slot_type,
-                    SlotType::Rows {
-                        dtype: VectorDType::F32
-                    }
-                ));
+                let SlotType::Rows { dtype } = plain.slots()[0].slot_type else {
+                    panic!("the first slot of a plain entry holds rows");
+                };
+                match dtype {
+                    VectorDType::F32 => {}
+                }
                 assert_eq!(plain.slots()[0].slot_type.band(), None);
                 assert_eq!(plain.slots()[0].stride, 400);
                 assert_eq!(plain.slots()[0].elem, ElemType::F32);

@@ -180,7 +180,16 @@ pub(super) fn write_data_entry(
                     &specs,
                     &grids,
                     encode_workspace.as_mut().unwrap(),
-                    opts.metric() == crate::schema::Metric::L2,
+                    opts.metric().scores_by_distance(),
+                );
+                debug_assert!(
+                    batch.residual_norms_squared.iter().all(|n| n.is_finite())
+                        && batch
+                            .layers
+                            .iter()
+                            .all(|layer| layer.scales.iter().all(|s| s.is_finite())),
+                    "a row outside the admitted range reached encode: non-finite residual norm or \
+                     scale"
                 );
                 append_encoded_columns(&mut bufs, &slots, batch)?;
             }

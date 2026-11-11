@@ -265,9 +265,12 @@ fn matrix_vector(metric: Metric, ordinal: usize) -> Vec<f32> {
     for (value, noise) in vector.iter_mut().zip(rng.vector(MATRIX_DIM, 0.6)) {
         *value += noise;
     }
-    if metric == Metric::Dot {
-        let scale = 0.5 + (ordinal % 7) as f32 * 0.15;
-        vector.iter_mut().for_each(|value| *value *= scale);
+    match metric {
+        Metric::Dot => {
+            let scale = 0.5 + (ordinal % 7) as f32 * 0.15;
+            vector.iter_mut().for_each(|value| *value *= scale);
+        }
+        Metric::L2 | Metric::Cosine => {}
     }
     vector
 }

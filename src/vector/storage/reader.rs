@@ -1540,7 +1540,7 @@ mod tests {
         assert_eq!(batch.read_count(), 2);
         assert!(batch.read_count() < selected.len());
 
-        let query = VectorQuery::<f32>::new(Metric::Dot, Arc::new(vec![2.0, -0.5]));
+        let query = VectorQuery::<f32>::new(Metric::Dot, Arc::new(vec![2.0, -0.5])).unwrap();
         let actual = batch
             .iter()
             .map(|(row, bytes)| (row, query.score_row(bytes).score().to_bits()))
