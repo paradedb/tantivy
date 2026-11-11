@@ -244,12 +244,12 @@ impl<'a> RouterClusters<'a> {
         let Candidate { sim, node } = candidate;
         let cluster = node as usize;
         self.meter.open();
-        let rows = 0..self.index.cluster_num_rows(cluster)?;
+        let rows = 0..self.open_cluster(cluster)?;
         if rows.is_empty() {
             self.skip_empty();
             return Ok(None);
         }
-        let gated = self.gate_cluster(cluster, rows.len())?;
+        let gated = self.gate_cluster(rows.len());
         if !gated.all && self.offsets.is_empty() {
             self.skip_empty();
             return Ok(None);
@@ -279,14 +279,22 @@ impl<'a> RouterClusters<'a> {
         (Some(&self.offsets[..]), Some(&self.selected_docs[..]))
     }
 
-    /// Selects `cluster`'s rows into `offsets` and counts what the gate pruned.
-    fn gate_cluster(&mut self, cluster: usize, rows: usize) -> crate::Result<GatedRows> {
+    /// The row count of `cluster`, with its DocIds column in `docs` when the gate or replication
+    /// needs it: the count then comes from the block lookup that reads the column.
+    fn open_cluster(&mut self, cluster: usize) -> crate::Result<usize> {
         // DocIds alone, then the gate, before any payload read; a replicated segment reads them for
         // every cluster so the scan can drop a document's second copy.
         if !self.gate.is_open() || self.replicated {
             self.reader.read_doc_ids(cluster, &mut self.docs)?;
-            debug_assert_eq!(self.docs.len(), rows);
+            Ok(self.docs.len())
+        } else {
+            self.index.cluster_num_rows(cluster)
         }
+    }
+
+    /// Selects the opened cluster's `rows` into `offsets` and counts what the gate pruned.
+    fn gate_cluster(&mut self, rows: usize) -> GatedRows {
+        debug_assert!((self.gate.is_open() && !self.replicated) || self.docs.len() == rows);
         let gated = {
             let _routing = enter_vector_stage(VectorStage::Routing);
             self.gate.select(&self.docs, &mut self.offsets)
@@ -294,7 +302,7 @@ impl<'a> RouterClusters<'a> {
         self.counters.vectors_visited += rows;
         self.counters.pruned_filter += gated.pruned_filter;
         self.counters.pruned_dead += gated.pruned_dead;
-        Ok(gated)
+        gated
     }
 
     /// Counts an opened cluster that contributes no rows.
@@ -329,13 +337,13 @@ impl ClusterSource for RouterClusters<'_> {
             let cluster = node as usize;
 
             self.meter.open();
-            let rows = 0..self.index.cluster_num_rows(cluster)?;
+            let rows = 0..self.open_cluster(cluster)?;
             if rows.is_empty() {
                 self.skip_empty();
                 continue;
             }
 
-            let gated = self.gate_cluster(cluster, rows.len())?;
+            let gated = self.gate_cluster(rows.len());
             if !gated.all && self.offsets.is_empty() {
                 self.skip_empty();
                 continue;

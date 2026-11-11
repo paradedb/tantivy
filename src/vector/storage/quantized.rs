@@ -448,42 +448,21 @@ impl QuantizedLayerReader {
         self.layer == 0
     }
     /// The cost of reading `cluster`'s whole band in one request.
+    #[cfg(test)]
     pub(crate) fn band_cost(&self, cluster: usize) -> crate::Result<ReadCost> {
-        let band = self.blocks.block(cluster)?.band_slice(self.layer);
-        Ok(range_cost(&band, 0..band.len(), band.storage_block_len()))
+        Ok(self.cluster_in_block(cluster)?.band_cost())
     }
-    /// The cost of reading `cluster`'s rows at `offsets` sparsely: their planned code runs, the
-    /// sidecar span and, with norms, the norms column. Leaves the rows and runs in `scratch`.
+    /// The cost of reading `cluster`'s rows at `offsets` sparsely; see
+    /// [`QuantizedClusterReader::sparse_cost`].
+    #[cfg(test)]
     pub(crate) fn sparse_cost(
         &self,
         cluster: usize,
         offsets: &[u32],
         scratch: &mut ReadScratch,
     ) -> crate::Result<ReadCost> {
-        let reader = self.cluster_in_block(cluster)?;
-        let origin = reader.rows.start;
-        scratch.rows.clear();
-        scratch
-            .rows
-            .extend(offsets.iter().map(|&offset| origin + offset as usize));
-        reader.plan_codes(&scratch.rows, &mut scratch.runs);
-        let stride = self.code_stride;
-        let unit = reader.codes.storage_block_len();
-        let mut cost = ReadCost(0);
-        for run in &scratch.runs {
-            cost += range_cost(
-                &reader.codes,
-                (run.start - origin) * stride..(run.end - origin) * stride,
-                unit,
-            );
-        }
-        let sidecar = reader.sidecar_slice()?;
-        cost += range_cost(&sidecar, 0..sidecar.len(), unit);
-        if self.has_norms() {
-            let norms = reader.norms_slice()?;
-            cost += range_cost(&norms, 0..norms.len(), unit);
-        }
-        Ok(cost)
+        self.cluster_in_block(cluster)?
+            .sparse_cost(offsets, scratch)
     }
     fn validate_codes(&self, bytes: &OwnedBytes, rows: &Range<usize>) -> crate::Result<()> {
         for (local, code) in bytes.chunks_exact(self.code_stride).enumerate() {
@@ -792,6 +771,79 @@ pub(crate) struct QuantizedClusterReader<'a> {
 }
 
 impl QuantizedClusterReader<'_> {
+    // --- Read costs ---
+
+    /// The cost of reading the cluster's whole band in one request.
+    pub(crate) fn band_cost(&self) -> ReadCost {
+        let band = self.block.band_slice(self.layer.layer);
+        range_cost(&band, 0..band.len(), band.storage_block_len())
+    }
+
+    /// The cost of reading the rows at `offsets` sparsely: their planned code runs, the sidecar
+    /// span and, with norms, the norms column. Leaves the rows and runs in `scratch`.
+    pub(crate) fn sparse_cost(
+        &self,
+        offsets: &[u32],
+        scratch: &mut ReadScratch,
+    ) -> crate::Result<ReadCost> {
+        Ok(self.code_runs_cost(offsets, scratch) + self.sparse_spans_cost()?)
+    }
+
+    /// A lower bound on [`Self::sparse_cost`] of `selected` rows: their codes packed into as few
+    /// storage blocks as possible, plus the sidecar and norms spans every sparse read pays.
+    /// `None` without block geometry.
+    pub(crate) fn sparse_cost_floor(&self, selected: usize) -> crate::Result<Option<ReadCost>> {
+        let Some(block_len) = self.codes.storage_block_len() else {
+            return Ok(None);
+        };
+        // Every planned code run covers its selected rows, and a range of `n` bytes spans at
+        // least `ceil(n / block_len)` blocks, so the runs together span at least this many.
+        let codes = ReadCost((selected * self.layer.code_stride).div_ceil(block_len));
+        Ok(Some(codes + self.sparse_spans_cost()?))
+    }
+
+    /// The planned code runs of the rows at `offsets`, priced; leaves the rows and runs in
+    /// `scratch`.
+    fn code_runs_cost(&self, offsets: &[u32], scratch: &mut ReadScratch) -> ReadCost {
+        let origin = self.rows.start;
+        scratch.rows.clear();
+        scratch
+            .rows
+            .extend(offsets.iter().map(|&offset| origin + offset as usize));
+        self.plan_codes(&scratch.rows, &mut scratch.runs);
+        let stride = self.layer.code_stride;
+        let unit = self.codes.storage_block_len();
+        let mut cost = ReadCost(0);
+        for run in &scratch.runs {
+            cost += range_cost(
+                &self.codes,
+                (run.start - origin) * stride..(run.end - origin) * stride,
+                unit,
+            );
+        }
+        cost
+    }
+
+    /// The sidecar span and, with norms, the norms column: what a sparse read pays besides its
+    /// codes, whatever rows it selects.
+    fn sparse_spans_cost(&self) -> crate::Result<ReadCost> {
+        let unit = self.codes.storage_block_len();
+        let sidecar = self.sidecar_slice()?;
+        let mut cost = range_cost(&sidecar, 0..sidecar.len(), unit);
+        if self.layer.has_norms() {
+            let norms = self.norms_slice()?;
+            cost += range_cost(&norms, 0..norms.len(), unit);
+        }
+        Ok(cost)
+    }
+
+    // --- Reads ---
+
+    /// Pins the band's columns for the cluster-local `rows` in one request.
+    pub(crate) fn read_batch(&self, rows: Range<usize>) -> crate::Result<QuantizedLayerBatch> {
+        self.layer.read_batch_from_block(&self.block, rows)
+    }
+
     /// Emits code ranges in row order into reusable scratch, with overlap-only page grouping.
     pub(crate) fn plan_codes(&self, rows: &[usize], ranges: &mut Vec<Range<usize>>) {
         ranges.clear();

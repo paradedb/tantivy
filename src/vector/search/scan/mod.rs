@@ -24,7 +24,7 @@ use self::histogram::Fold;
 use self::layer_read::{decode_layer, Decoded, LayerRead, LayerSpec};
 #[cfg(test)]
 use self::plan::{forced_plan, PlanOverride};
-use self::plan::{price, Read, ReadCosts};
+use self::plan::{price, Read, ReadCosts, SparsePricing};
 use self::rate::AdmissionHistograms;
 use crate::collector::sort_key::Comparator;
 use crate::collector::SegmentSortKeyComputer;
@@ -35,7 +35,9 @@ use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
 use crate::vector::search::interval::{Estimate, Threshold};
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery};
 use crate::vector::storage::centroids::ClusterIndex;
-use crate::vector::storage::quantized::{QuantizedFieldReader, ReadScratch};
+use crate::vector::storage::quantized::{
+    QuantizedClusterReader, QuantizedFieldReader, ReadScratch,
+};
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::enter_vector_stage;
 #[cfg(test)]
@@ -225,15 +227,35 @@ impl<'a> QuantizedState<'a> {
     }
 
     /// Prices the rows of `selected` at `layer`, and exactly when the exact plan is on, and plans
-    /// their read. A sparse plan leaves its rows and code runs in `scratch` for the read.
+    /// their read. Returns the plan and the cluster resolved for it, which the read reuses. A
+    /// sparse plan leaves its rows and code runs in `scratch` for the read.
     fn read_plan(
         &self,
         selected: &ClusterRows<'_>,
         layer: usize,
         scratch: &mut ReadScratch,
-    ) -> crate::Result<Read> {
-        let costs = price(&self.layers[layer], self.exact, selected, scratch)?;
-        Ok(self.choose(&costs, selected, layer))
+    ) -> crate::Result<(Read, QuantizedClusterReader<'a>)> {
+        let cluster = self.layers[layer]
+            .reader
+            .cluster_in_block(selected.cluster)?;
+        let costs = price(
+            &cluster,
+            self.exact,
+            selected,
+            scratch,
+            self.sparse_pricing(),
+        )?;
+        Ok((self.choose(&costs, selected, layer), cluster))
+    }
+
+    /// How sparse reads are priced: in full when a test forces plans, so a forced sparse read
+    /// finds its price.
+    fn sparse_pricing(&self) -> SparsePricing {
+        #[cfg(test)]
+        if self.plan_override.is_some() {
+            return SparsePricing::Full;
+        }
+        SparsePricing::Bounded
     }
 
     /// How `layer`'s decoded rows combine into estimates around `centroid`, the query's centroid
@@ -258,6 +280,7 @@ impl<'a> QuantizedState<'a> {
         &mut self,
         rows: &ClusterRows<'_>,
         read: LayerRead,
+        cluster: &QuantizedClusterReader<'_>,
         bound: &mut PruningBound,
         scratch: &mut ReadScratch,
         fold: Option<Fold<'_>>,
@@ -269,7 +292,7 @@ impl<'a> QuantizedState<'a> {
         // The threshold as of the clusters admitted so far, before this cluster's rows enter.
         let prior = self.admission_threshold(bound);
         let spec = self.layers[0];
-        decode_layer(&spec, rows, read, &mut self.decoded, scratch)?;
+        decode_layer(&spec, rows, read, cluster, &mut self.decoded, scratch)?;
         self.layer0_scored += rows.len();
         let ctx = self.combine_ctx(0, centroid);
         match prior {
@@ -346,12 +369,13 @@ impl<'a> QuantizedState<'a> {
             .map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score)))
     }
 
-    /// Refines block `b`'s candidates with `layer`, read as `read`.
+    /// Refines block `b`'s candidates with `layer`, read as `read` from `cluster`.
     fn refine(
         &mut self,
         layer: usize,
         b: usize,
         read: LayerRead,
+        cluster: &QuantizedClusterReader<'_>,
         scratch: &mut ReadScratch,
     ) -> crate::Result<()> {
         let spec = self.layers[layer];
@@ -359,6 +383,7 @@ impl<'a> QuantizedState<'a> {
             &spec,
             &self.candidates.rows(b),
             read,
+            cluster,
             &mut self.decoded,
             scratch,
         )?;
@@ -746,9 +771,12 @@ where
             .unwrap_or(rows);
         if selected.len() > 0 {
             // Planned and priced on the rows left to score; `len` stays the probe charge.
-            let read = match &self.quantized {
-                Some(state) => state.read_plan(selected, 0, &mut self.scratch)?,
-                None => Read::Exact,
+            let (read, cluster) = match &self.quantized {
+                Some(state) => {
+                    let (read, cluster) = state.read_plan(selected, 0, &mut self.scratch)?;
+                    (read, Some(cluster))
+                }
+                None => (Read::Exact, None),
             };
             if self.quantized.is_some() {
                 self.report.layers[0].count(read, selected.len());
@@ -767,8 +795,15 @@ where
                             .score(selected, &mut self.scratch, &mut self.bound, fold)?;
                 }
                 Read::Layer(read) => {
-                    if let Some(state) = &mut self.quantized {
-                        state.admit(selected, read, &mut self.bound, &mut self.scratch, fold)?;
+                    if let (Some(state), Some(cluster)) = (&mut self.quantized, &cluster) {
+                        state.admit(
+                            selected,
+                            read,
+                            cluster,
+                            &mut self.bound,
+                            &mut self.scratch,
+                            fold,
+                        )?;
                     }
                 }
             }
@@ -814,7 +849,7 @@ where
             if group.len() == 0 {
                 continue;
             }
-            let read = state.read_plan(&group, layer, &mut self.scratch)?;
+            let (read, cluster) = state.read_plan(&group, layer, &mut self.scratch)?;
             self.report.layers[layer].count(read, group.len());
             match read {
                 Read::Exact => {
@@ -823,7 +858,7 @@ where
                             .score(&group, &mut self.scratch, &mut self.bound, None)?;
                     state.candidates.retire(b);
                 }
-                Read::Layer(read) => state.refine(layer, b, read, &mut self.scratch)?,
+                Read::Layer(read) => state.refine(layer, b, read, &cluster, &mut self.scratch)?,
             }
         }
         drop(stage);

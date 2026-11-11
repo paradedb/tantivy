@@ -7,7 +7,8 @@ use crate::schema::Metric;
 use crate::vector::search::cluster_source::ClusterRows;
 use crate::vector::search::prepared::QuantizedQueryCtx;
 use crate::vector::storage::quantized::{
-    validate_decoded_sidecar, QuantizedLayerBatch, QuantizedLayerReader, ReadScratch,
+    validate_decoded_sidecar, QuantizedClusterReader, QuantizedLayerBatch, QuantizedLayerReader,
+    ReadScratch,
 };
 use crate::TantivyError;
 
@@ -66,7 +67,8 @@ impl Decoded {
 
 // --- Decoding ---
 
-/// Decodes `spec` for the rows of `selected` into `out`, reading as `read` says.
+/// Decodes `spec` for the rows of `selected` into `out`, reading as `read` says from `cluster`, the
+/// cluster `selected` names, as pricing resolved it.
 ///
 /// A sparse read uses the rows and runs pricing left in `scratch`; a whole-cluster selection always
 /// reads the band.
@@ -74,14 +76,15 @@ pub(crate) fn decode_layer(
     spec: &LayerSpec<'_>,
     selected: &ClusterRows<'_>,
     read: LayerRead,
+    cluster: &QuantizedClusterReader<'_>,
     out: &mut Decoded,
     scratch: &mut ReadScratch,
 ) -> crate::Result<()> {
     debug_assert!(selected.len() > 0, "empty clusters never reach the scan");
     out.resize(selected.len(), spec.metric());
     match (read, selected.offsets) {
-        (LayerRead::Sparse, Some(_)) => decode_runs(spec, selected, out, scratch),
-        _ => decode_band(spec, selected, out, &mut scratch.offsets),
+        (LayerRead::Sparse, Some(_)) => decode_runs(spec, cluster, out, scratch),
+        _ => decode_band(spec, selected, cluster, out, &mut scratch.offsets),
     }
 }
 
@@ -90,12 +93,11 @@ pub(crate) fn decode_layer(
 fn decode_band(
     spec: &LayerSpec<'_>,
     selected: &ClusterRows<'_>,
+    cluster: &QuantizedClusterReader<'_>,
     out: &mut Decoded,
     kernel_offsets: &mut Vec<usize>,
 ) -> crate::Result<()> {
-    let band = spec
-        .reader
-        .read_batch_in_block(selected.cluster, selected.rows.clone())?;
+    let band = cluster.read_batch(selected.rows.clone())?;
     let metric = spec.metric();
     let count = selected.len();
     match selected.offsets {
@@ -168,7 +170,7 @@ fn decode_band_rows(
 /// the selected rows.
 fn decode_runs(
     spec: &LayerSpec<'_>,
-    selected: &ClusterRows<'_>,
+    cluster: &QuantizedClusterReader<'_>,
     out: &mut Decoded,
     scratch: &mut ReadScratch,
 ) -> crate::Result<()> {
@@ -178,7 +180,6 @@ fn decode_runs(
         offsets,
         ..
     } = scratch;
-    let cluster = spec.reader.cluster_in_block(selected.cluster)?;
     debug_assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
     let mut start = 0;
     for run in runs.iter().cloned() {
