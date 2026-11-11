@@ -11,8 +11,8 @@ use crate::vector::clustering::{
 };
 use crate::TantivyError;
 
-/// Default [`SuperKMeansClusterer::with_target_leaf_size`].
-pub const DEFAULT_TARGET_LEAF_SIZE: usize = 200;
+/// Default [`SuperKMeansClusterer::with_max_leaf_size`].
+pub const DEFAULT_MAX_LEAF_SIZE: usize = 200;
 /// Default [`SuperKMeansClusterer::with_training_sample_ratio`].
 pub const DEFAULT_TRAINING_SAMPLE_RATIO: f64 = 0.32;
 
@@ -127,11 +127,11 @@ impl fmt::Debug for SuperKMeansClusterer {
 }
 
 impl SuperKMeansClusterer {
-    /// Defaults: [`DEFAULT_TARGET_LEAF_SIZE`], [`DEFAULT_TRAINING_SAMPLE_RATIO`], no memory limit.
+    /// Defaults: [`DEFAULT_MAX_LEAF_SIZE`], [`DEFAULT_TRAINING_SAMPLE_RATIO`], no memory limit.
     pub fn new() -> Self {
         let mut config = HierarchicalSuperKMeansConfig::default();
         config.base.suppress_warnings = true;
-        config.target_leaf_size = DEFAULT_TARGET_LEAF_SIZE;
+        config.max_leaf_size = DEFAULT_MAX_LEAF_SIZE;
         Self {
             config,
             training_sample_ratio: DEFAULT_TRAINING_SAMPLE_RATIO as f32,
@@ -140,10 +140,9 @@ impl SuperKMeansClusterer {
         }
     }
 
-    /// Target training vectors per clustering leaf. Splits aim for this size;
-    /// actual leaves may be somewhat larger (about √2× the target).
-    pub fn with_target_leaf_size(mut self, target_leaf_size: usize) -> Self {
-        self.config.target_leaf_size = target_leaf_size;
+    /// Maximum training vectors per clustering leaf.
+    pub fn with_max_leaf_size(mut self, max_leaf_size: usize) -> Self {
+        self.config.max_leaf_size = max_leaf_size;
         self
     }
 
@@ -477,7 +476,7 @@ mod tests {
     fn trains_and_assigns_from_the_source() {
         let (n, dim) = (5_000, 16);
         let mut source = VecSource::new(blobs(n, dim), dim);
-        let clusterer = SuperKMeansClusterer::new().with_target_leaf_size(100);
+        let clusterer = SuperKMeansClusterer::new().with_max_leaf_size(100);
         let options = VectorOptions::new(dim, Metric::L2);
 
         let centroids = train(&clusterer, &mut source);
@@ -497,7 +496,7 @@ mod tests {
     #[test]
     fn a_cancel_stops_training_in_the_meso_and_fine_steps() {
         let (n, dim) = (5_000, 16);
-        let clusterer = SuperKMeansClusterer::new().with_target_leaf_size(100);
+        let clusterer = SuperKMeansClusterer::new().with_max_leaf_size(100);
         let options = VectorOptions::new(dim, Metric::L2);
 
         let mut source = CancellingSource {
@@ -529,7 +528,7 @@ mod tests {
     fn assigns_pairs_off_the_primary_residual() {
         let (n, dim) = (3_000, 16);
         let mut source = VecSource::new(blobs(n, dim), dim);
-        let clusterer = SuperKMeansClusterer::new().with_target_leaf_size(100);
+        let clusterer = SuperKMeansClusterer::new().with_max_leaf_size(100);
         let options = VectorOptions::new(dim, Metric::L2);
         let centroids = train(&clusterer, &mut source);
         let trained = IvfCentroids::F32(centroids.clone());
@@ -606,7 +605,7 @@ mod tests {
         let (n, dim) = (5_000, 16);
         let mut source = VecSource::new(blobs(n, dim), dim);
         train(
-            &SuperKMeansClusterer::new().with_target_leaf_size(100),
+            &SuperKMeansClusterer::new().with_max_leaf_size(100),
             &mut source,
         );
         assert_eq!(source.ranges.len(), 1);
@@ -622,7 +621,7 @@ mod tests {
         let mut source = VecSource::new(blobs(n, dim), dim);
         let options = VectorOptions::new(dim, Metric::L2);
         let clusterer = SuperKMeansClusterer::new()
-            .with_target_leaf_size(100)
+            .with_max_leaf_size(100)
             .with_memory_limit(1_000 * options.bytes_per_vector());
         train(&clusterer, &mut source);
 
@@ -647,7 +646,7 @@ mod tests {
     fn the_memory_limit_does_not_change_the_centroids() {
         let (n, dim) = (5_000, 16);
         let options = VectorOptions::new(dim, Metric::L2);
-        let clusterer = SuperKMeansClusterer::new().with_target_leaf_size(100);
+        let clusterer = SuperKMeansClusterer::new().with_max_leaf_size(100);
         let reference = train(&clusterer, &mut VecSource::new(blobs(n, dim), dim));
         for limit_rows in [n, 1_000] {
             let mut source = VecSource::new(blobs(n, dim), dim);
@@ -689,15 +688,15 @@ mod tests {
     fn settings_default_and_set_independently() {
         let clusterer = SuperKMeansClusterer::new();
         assert_eq!(clusterer.training_sample_ratio(), 0.32);
-        assert_eq!(clusterer.config.target_leaf_size, DEFAULT_TARGET_LEAF_SIZE);
+        assert_eq!(clusterer.config.max_leaf_size, DEFAULT_MAX_LEAF_SIZE);
 
         let clusterer = SuperKMeansClusterer::new()
-            .with_target_leaf_size(20)
+            .with_max_leaf_size(20)
             .with_training_sample_ratio(0.25);
         assert_eq!(clusterer.training_sample_ratio(), 0.25);
-        assert_eq!(clusterer.config.target_leaf_size, 20);
+        assert_eq!(clusterer.config.max_leaf_size, 20);
         let clusterer = clusterer.with_training_sample_ratio(1.0);
         assert_eq!(clusterer.training_sample_ratio(), 1.0);
-        assert_eq!(clusterer.config.target_leaf_size, 20);
+        assert_eq!(clusterer.config.max_leaf_size, 20);
     }
 }

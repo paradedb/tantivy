@@ -180,7 +180,7 @@ pub trait LevelClusterer {
     ) -> (Vec<Self::Elem>, Vec<u32>);
 }
 
-/// [`HierarchicalSuperKMeans`] with `target_leaf_size ≈ n / nlist`. Meso and fine
+/// [`HierarchicalSuperKMeans`] with `max_leaf_size ≈ n / nlist`. Meso and fine
 /// iterations keep the library defaults. [`Self::for_metric`] clusters Cosine
 /// and Dot by angle, the same rule as the segment's IVF.
 #[derive(Clone, Copy, Debug, Default)]
@@ -204,7 +204,7 @@ impl LevelClusterer for SuperKMeansLevelClusterer {
         assert!(n > 0 && dim > 0 && nlist > 0);
         assert_eq!(data.len(), n * dim);
         let nlist = nlist.min(n).max(1);
-        let target_leaf_size = n.div_ceil(nlist).max(1);
+        let max_leaf_size = n.div_ceil(nlist).max(1);
 
         let base = SuperKMeansConfig {
             data_already_rotated: true,
@@ -213,7 +213,7 @@ impl LevelClusterer for SuperKMeansLevelClusterer {
         };
         let cfg = HierarchicalSuperKMeansConfig {
             base,
-            target_leaf_size,
+            max_leaf_size,
             ..Default::default()
         };
         let mut kmeans = HierarchicalSuperKMeans::with_config(dim, cfg);
