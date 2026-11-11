@@ -53,7 +53,7 @@ pub(super) fn encode_centroids(
 }
 
 /// Writes the field's Data entry: metadata, then one aligned block per cluster of doc ids, encoded
-/// columns and, for plain storage, the rows themselves. A spill row is encoded against its own
+/// columns and, for plain storage, the rows themselves. A replica row is encoded against its own
 /// block's centroid like any row. Returns each target document's primary location.
 pub(super) fn write_data_entry(
     merge: &FieldMerge,

@@ -47,7 +47,7 @@ pub type ClusterRef = (SegmentOrdinal, u32);
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct VectorSearchBudget {
     pub(crate) clusters: usize,
-    /// Rows across the snapshot's clusters, a spilled segment's second copies included.
+    /// Rows across the snapshot's clusters, a replicated segment's second copies included.
     pub(crate) rows: usize,
     pub(crate) work: WorkBudget,
 }
@@ -95,7 +95,7 @@ pub struct PreparedVectorSearch {
     pub(crate) field: Field,
     pub(crate) top_n: usize,
     pub(crate) budget: VectorSearchBudget,
-    /// Rows across the prepared segments' clusters, a spilled segment's second copies included.
+    /// Rows across the prepared segments' clusters, a replicated segment's second copies included.
     pub(crate) rows: usize,
     pub(crate) segments: Vec<VectorSegment>,
     pub(crate) scope: HashMap<SegmentOrdinal, (SegmentId, usize, StageTotals)>,

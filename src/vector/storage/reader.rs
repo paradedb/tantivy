@@ -600,8 +600,8 @@ impl VectorIndexReader {
     }
 
     /// Whether a document may have a row in two clusters.
-    pub(crate) fn spilled(&self) -> bool {
-        self.rows_slice.metadata.spilled()
+    pub(crate) fn replicated(&self) -> bool {
+        self.rows_slice.metadata.replicated()
     }
 
     /// One past the segment's largest document id.

@@ -140,7 +140,7 @@ mod tests {
     /// The plan resolves the budget once, builds no bitset for match-all filters, sees an empty
     /// filter or `top_n == 0` as nothing to search, and sizes the scan from the budget. A filter
     /// with at most the located cap of matches, deleted ones included, is located; one more
-    /// spills into the routed bitset, match-all always routes, and every mode reports its cap.
+    /// routes through the bitset, match-all always routes, and every mode reports its cap.
     #[test]
     fn segment_plan() -> crate::Result<()> {
         let fixture = FixtureSpec::ivf(
@@ -262,7 +262,7 @@ mod tests {
                 (true, Some(count)),
             ),
             (
-                "cap + 1 spills",
+                "cap + 1 routes",
                 selective.as_ref(),
                 capped(count - 1),
                 (false, Some(count)),

@@ -54,7 +54,7 @@ pub(crate) struct ScanConfig {
     /// Whether a cluster's rows may be scored exactly before the exact phase.
     pub(crate) exact_plan: bool,
     pub(crate) adaptive_probing: Option<crate::vector::AdaptiveProbeParams>,
-    /// Whether the source may hand over a document twice: a routed source on a spilled segment.
+    /// Whether the source may hand over a document twice: a routed source on a replicated segment.
     /// A located batch holds one primary row per document.
     pub(crate) source_may_repeat_docs: bool,
     #[cfg(test)]
@@ -114,7 +114,7 @@ pub(crate) struct ScanReport {
     /// Survivors of the last boundary dropped before the exact phase read them.
     pub(crate) exact_recheck_dropped: usize,
     /// Rows dropped at admission as the second copy of a document an earlier cluster held.
-    pub(crate) spill_dropped: usize,
+    pub(crate) replication_dropped: usize,
     /// Thresholds the scan stored in the participants' slot.
     pub(crate) cross_bound_publishes: usize,
     /// Centroid rows read for shortlisted clusters without a centroid score.
@@ -157,7 +157,7 @@ struct QuantizedState<'a> {
     admission_columns: Columns,
     /// Scratch for the admitted row indices of one cluster.
     admission_keep: Vec<u32>,
-    /// Rows the layer-0 kernel scored, spills included, before admission pruning.
+    /// Rows the layer-0 kernel scored, replicas included, before admission pruning.
     layer0_scored: usize,
     /// Rows admission pruning dropped.
     layer0_admission_pruned: usize,
@@ -460,7 +460,7 @@ fn unseen_rows<'s>(
 ) -> ClusterRows<'s> {
     let row_docs = rows
         .docs
-        .expect("a spilled segment's rows carry their doc ids");
+        .expect("a replicated segment's rows carry their doc ids");
     offsets.clear();
     docs.clear();
     for (position, local) in rows.local_rows().enumerate() {
@@ -496,13 +496,13 @@ where
     /// The quantized cascade; `None` scores every shortlisted row exactly.
     quantized: Option<QuantizedState<'a>>,
     scratch: ReadScratch,
-    /// The documents held by the clusters opened so far, on a routed scan of a spilled segment: a
-    /// document's second copy is dropped before scoring, so each document is decided by the first
-    /// opened cluster holding it and never reaches the bound or the heap twice.
+    /// The documents held by the clusters opened so far, on a routed scan of a replicated segment:
+    /// a document's second copy is dropped before scoring, so each document is decided by the
+    /// first opened cluster holding it and never reaches the bound or the heap twice.
     seen: Option<BitSet>,
     /// Rows dropped as a document's second copy.
-    spill_dropped: usize,
-    /// A spilled cluster's rows left after dropping previously encountered documents.
+    replication_dropped: usize,
+    /// A replicated cluster's rows left after dropping previously encountered documents.
     unseen_offsets: Vec<u32>,
     unseen_docs: Vec<DocId>,
     /// The candidate blocks by cluster id, which is row order; set when the shortlist closes.
@@ -563,9 +563,9 @@ where
             bound,
             quantized,
             scratch: ReadScratch::default(),
-            seen: (reader.spilled() && config.source_may_repeat_docs)
+            seen: (reader.replicated() && config.source_may_repeat_docs)
                 .then(|| BitSet::with_max_value(reader.max_doc())),
-            spill_dropped: 0,
+            replication_dropped: 0,
             unseen_offsets: Vec::new(),
             unseen_docs: Vec::new(),
             by_cluster: Vec::new(),
@@ -736,7 +736,7 @@ where
                 rows,
                 &mut self.unseen_offsets,
                 &mut self.unseen_docs,
-                &mut self.spill_dropped,
+                &mut self.replication_dropped,
             )
         });
         let selected = unseen
@@ -856,7 +856,7 @@ where
         let _assembly = enter_vector_stage(VectorStage::ResultAssembly);
         let mut report = self.report;
         report.cross_bound_publishes = self.bound.publishes;
-        report.spill_dropped = self.spill_dropped;
+        report.replication_dropped = self.replication_dropped;
         if let Some(state) = &self.quantized {
             report.centroid_reads = state.centroid_reads;
         }

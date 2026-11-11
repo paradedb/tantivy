@@ -289,7 +289,7 @@ fn matrix_fixture(
     metric: Metric,
     representation: Representation,
     deletes: bool,
-    spill: bool,
+    replicated: bool,
 ) -> crate::Result<Fixture> {
     let vectors: Vec<Vec<f32>> = (0..MATRIX_DOCS)
         .map(|ordinal| matrix_vector(metric, ordinal))
@@ -308,8 +308,8 @@ fn matrix_fixture(
     };
     if let Representation::Quantized(schedule) = representation {
         spec = spec.schedule(schedule);
-        if spill {
-            spec = spec.spill();
+        if replicated {
+            spec = spec.replicated();
         }
     }
     spec = spec
@@ -338,7 +338,7 @@ fn assert_identities(stats: &ProbeStats, case: &str) {
     );
     if let Some(layer0) = stats.layers.get(0) {
         assert_eq!(
-            layer0.scored() + layer0.exact_rows() + stats.spill_dropped,
+            layer0.scored() + layer0.exact_rows() + stats.replication_dropped,
             stats.candidates_scored,
             "{case}: each eligible row is scored or dropped as a duplicate ({stats:?})"
         );
@@ -702,14 +702,14 @@ fn assert_case(
             };
             assert!(layer0.exact_clusters() <= stats.postings_row, "{case}");
             assert_eq!(
-                layer0.exact_rows() + stats.spill_dropped,
+                layer0.exact_rows() + stats.replication_dropped,
                 stats.candidates_scored,
                 "{case}"
             );
             assert_eq!(layer0.scored(), 0, "{case}");
             assert_eq!(
                 stats.exact_rows,
-                stats.candidates_scored - stats.spill_dropped,
+                stats.candidates_scored - stats.replication_dropped,
                 "{case}"
             );
         }
@@ -800,17 +800,18 @@ fn scan_matches_oracle() -> crate::Result<()> {
     ];
     for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
         for representation in representations {
-            // Quantized cells also run with every vector spilled into a second cluster.
-            let spills: &[bool] = if matches!(representation, Representation::Quantized(_)) {
+            // Quantized cells also run with every vector replicated into a second cluster.
+            let replications: &[bool] = if matches!(representation, Representation::Quantized(_)) {
                 &[false, true]
             } else {
                 &[false]
             };
-            for (deletes, &spill) in [false, true]
-                .into_iter()
-                .flat_map(|deletes| spills.iter().map(move |spill| (deletes, spill)))
-            {
-                let fixture = matrix_fixture(metric, representation, deletes, spill)?;
+            for (deletes, &replicated) in [false, true].into_iter().flat_map(|deletes| {
+                replications
+                    .iter()
+                    .map(move |replicated| (deletes, replicated))
+            }) {
+                let fixture = matrix_fixture(metric, representation, deletes, replicated)?;
                 let segments = fixture.index.reader()?.searcher().segment_readers().len();
                 assert_eq!(segments, 2, "the matrix index holds two segments");
                 let filters: Vec<(&str, Box<dyn Query>)> = vec![
@@ -827,7 +828,8 @@ fn scan_matches_oracle() -> crate::Result<()> {
                             for k in [10, 1000] {
                                 let case = format!(
                                     "{metric:?} {representation:?} {path} deletes={deletes} \
-                                     spill={spill} query={query_ord} filter={filter_name} k={k}"
+                                     replicated={replicated} query={query_ord} \
+                                     filter={filter_name} k={k}"
                                 );
                                 let stats = assert_case(
                                     &fixture,
@@ -2013,17 +2015,17 @@ fn exact_pricing_and_reads_are_arithmetic() -> crate::Result<()> {
     Ok(())
 }
 
-/// A spilled segment reads every opened cluster's DocIds column, once, with no filter and no
+/// A replicated segment reads every opened cluster's DocIds column, once, with no filter and no
 /// deletes, so the scan can drop a document's second copy.
-fn spilled_segment_reads_doc_ids_for_every_opened_cluster() -> crate::Result<()> {
-    let fixture = reads_spec(Metric::L2, &[1, 4], &[]).spill().build()?;
+fn replicated_segment_reads_doc_ids_for_every_opened_cluster() -> crate::Result<()> {
+    let fixture = reads_spec(Metric::L2, &[1, 4], &[]).replicated().build()?;
     let ranges = fixture.column_ranges()?;
     let query = reads_vector(42);
     fixture.clear_reads();
     let fruit = fixture.search(&AllQuery, &query, 3, every_cluster())?;
     assert_eq!(fruit.results, fixture.oracle(&AllQuery, &query, 3)?);
     let stats = &fruit.stats[0];
-    assert!(stats.spill_dropped > 0, "{stats:?}");
+    assert!(stats.replication_dropped > 0, "{stats:?}");
     let log = fixture.reads();
     let opened: Vec<usize> = fixture
         .cluster_docs(0)?
@@ -2074,11 +2076,11 @@ fn spilled_segment_reads_doc_ids_for_every_opened_cluster() -> crate::Result<()>
     Ok(())
 }
 
-/// A spilled cluster whose filtered rows were all held by the cluster opened before it, but one,
+/// A replicated cluster whose filtered rows were all held by the cluster opened before it, but one,
 /// plans its read on that one row: exact, strictly cheaper than any layer-0 read, so its band is
 /// never read.
-fn spilled_cluster_plans_its_unseen_rows() -> crate::Result<()> {
-    let fixture = reads_spec(Metric::L2, &[1, 4], &[]).spill().build()?;
+fn replicated_cluster_plans_its_unseen_rows() -> crate::Result<()> {
+    let fixture = reads_spec(Metric::L2, &[1, 4], &[]).replicated().build()?;
     let ranges = fixture.column_ranges()?;
     let clusters = fixture.cluster_docs(0)?;
     // Two clusters sharing documents, and a document of the second the first lacks.
@@ -2118,7 +2120,7 @@ fn spilled_cluster_plans_its_unseen_rows() -> crate::Result<()> {
     let fruit = fixture.search_clusters(&[first, second], &filter, &query, 3, params)?;
     assert_eq!(fruit.results, fixture.oracle(&filter, &query, 3)?);
     let stats = &fruit.stats[0];
-    assert_eq!(stats.spill_dropped, shared, "{stats:?}");
+    assert_eq!(stats.replication_dropped, shared, "{stats:?}");
     let layer0 = stats.layers.get(0).unwrap();
     assert_eq!(layer0.exact_clusters(), 1, "{stats:?}");
     assert_eq!(layer0.exact_rows(), 1, "{stats:?}");
@@ -2136,15 +2138,15 @@ fn spilled_cluster_plans_its_unseen_rows() -> crate::Result<()> {
 }
 
 /// With every cluster open, each document's second copy is dropped at admission: the exact
-/// phase scores every live document once, and `spill_dropped` counts one drop per document.
+/// phase scores every live document once, and `replication_dropped` counts one drop per document.
 fn a_doc_in_two_opened_clusters_is_scored_once() -> crate::Result<()> {
     let fixture = reads_spec(Metric::L2, &[1, 4], &[101, 202])
-        .spill()
+        .replicated()
         .build()?;
     let searcher = fixture.index.reader()?.searcher();
     let segment = first_segment(&searcher).1;
     let vectors = segment.vector_index(fixture.field)?;
-    assert!(vectors.spilled());
+    assert!(vectors.replicated());
     let live_docs = (0..segment.max_doc())
         .filter(|&doc| {
             has_vector(doc as usize)
@@ -2178,7 +2180,7 @@ fn a_doc_in_two_opened_clusters_is_scored_once() -> crate::Result<()> {
         false,
     )?;
     assert_eq!(hits, fixture.oracle(&AllQuery, &query, READS_DOCS + 1)?);
-    assert_eq!(stats.spill_dropped, live_docs, "{stats:?}");
+    assert_eq!(stats.replication_dropped, live_docs, "{stats:?}");
     assert_eq!(
         stats.layers.get(0).unwrap().scored(),
         live_docs,
@@ -2270,16 +2272,16 @@ fn reads_follow_the_plan() -> crate::Result<()> {
             plain_exact_reads_touch_the_cluster_block,
         ),
         (
-            "a spilled segment reads DocIds for every opened cluster",
-            spilled_segment_reads_doc_ids_for_every_opened_cluster,
+            "a replicated segment reads DocIds for every opened cluster",
+            replicated_segment_reads_doc_ids_for_every_opened_cluster,
         ),
         (
             "a doc whose two clusters are both opened is scored once",
             a_doc_in_two_opened_clusters_is_scored_once,
         ),
         (
-            "a spilled cluster with all but one row already seen plans Exact for that row",
-            spilled_cluster_plans_its_unseen_rows,
+            "a replicated cluster with all but one row already seen plans Exact for that row",
+            replicated_cluster_plans_its_unseen_rows,
         ),
     ];
     for (name, case) in cases {
@@ -2392,16 +2394,16 @@ fn ann_reads_offsets_only_for_probed_clusters() -> crate::Result<()> {
     Ok(())
 }
 
-// --- Spill ---
+// --- Replication ---
 
-/// At one opened cluster the spilled segment scores that cluster's primaries and the vectors
-/// spilled into it, a superset of the unspilled scan, so recall never drops; at every cluster both
-/// return the oracle's top k, and the located path returns the routed hits.
+/// At one opened cluster the replicated segment scores that cluster's primaries and the vectors
+/// replicated into it, a superset of the unreplicated scan, so recall never drops; at every cluster
+/// both return the oracle's top k, and the located path returns the routed hits.
 #[test]
-fn spill_recall_and_located_path() -> crate::Result<()> {
+fn replication_recall_and_located_path() -> crate::Result<()> {
     let mut improved = 0;
     for metric in [Metric::L2, Metric::Cosine] {
-        let spilled = matrix_fixture(metric, Representation::Quantized(&[1, 4]), false, true)?;
+        let replicated = matrix_fixture(metric, Representation::Quantized(&[1, 4]), false, true)?;
         let plain = matrix_fixture(metric, Representation::Quantized(&[1, 4]), false, false)?;
         // One cluster per segment: a budget of one cluster's work.
         let one_cluster = ProbeParams {
@@ -2426,18 +2428,18 @@ fn spill_recall_and_located_path() -> crate::Result<()> {
                     .collect::<crate::Result<_>>()?;
                 Ok(found.intersection(&truth).count())
             };
-            let (on, off) = (recall(&spilled)?, recall(&plain)?);
+            let (on, off) = (recall(&replicated)?, recall(&plain)?);
             assert!(
                 on >= off,
-                "{metric:?} query {query_ord}: spill recall {on} below {off}"
+                "{metric:?} query {query_ord}: replicated recall {on} below {off}"
             );
             improved += usize::from(on > off);
             let exhaustive = routed_exhaustive_params(MATRIX_CLUSTERS);
-            let fruit = spilled.search(&AllQuery, query, 10, exhaustive.clone())?;
-            assert_eq!(fruit.results, spilled.oracle(&AllQuery, query, 10)?);
-            for filter in [spilled.filter("half"), spilled.filter("rare")] {
-                let routed = spilled.search(&filter, query, 10, exhaustive.clone())?;
-                let located = spilled.search(
+            let fruit = replicated.search(&AllQuery, query, 10, exhaustive.clone())?;
+            assert_eq!(fruit.results, replicated.oracle(&AllQuery, query, 10)?);
+            for filter in [replicated.filter("half"), replicated.filter("rare")] {
+                let routed = replicated.search(&filter, query, 10, exhaustive.clone())?;
+                let located = replicated.search(
                     &filter,
                     query,
                     10,
@@ -2460,30 +2462,30 @@ fn spill_recall_and_located_path() -> crate::Result<()> {
                         .stats
                         .iter()
                         .filter(|stats| stats.access_path == AccessPath::Located)
-                        .all(|stats| stats.spill_dropped == 0),
+                        .all(|stats| stats.replication_dropped == 0),
                     "{metric:?} query {query_ord}"
                 );
-                assert_eq!(routed.results, spilled.oracle(&filter, query, 10)?);
+                assert_eq!(routed.results, replicated.oracle(&filter, query, 10)?);
             }
         }
     }
-    assert!(improved > 0, "no query gained recall from the spill");
+    assert!(improved > 0, "no query gained recall from the replica");
     Ok(())
 }
 
 /// The writer gives every document a row in its nearest cluster, the one its location names, and
 /// one in a second cluster; each block's DocIds stay strictly ascending; a single centroid, or a
-/// clusterer without pairs of its own, writes one row per document and no spill assignment.
+/// clusterer without pairs of its own, writes one row per document and no replicated assignment.
 #[test]
-fn spilled_blocks_hold_each_document_twice() -> crate::Result<()> {
+fn replicated_blocks_hold_each_document_twice() -> crate::Result<()> {
     let centroids: Vec<Vec<f32>> = (0..4).map(|axis| one_hot(READS_DIM, axis, 1.0)).collect();
     let vectors: Vec<Vec<f32>> = (0..300).map(reads_vector).collect();
-    for (name, spec, rows_per_doc, spilled) in [
+    for (name, spec, rows_per_doc, replicated) in [
         (
             "four centroids",
             FixtureSpec::ivf(Metric::L2, centroids.clone(), vectors.clone())
                 .schedule(&[1, 4])
-                .spill(),
+                .replicated(),
             2,
             true,
         ),
@@ -2491,7 +2493,7 @@ fn spilled_blocks_hold_each_document_twice() -> crate::Result<()> {
             "one centroid",
             FixtureSpec::ivf(Metric::L2, centroids[..1].to_vec(), vectors.clone())
                 .schedule(&[1, 4])
-                .spill(),
+                .replicated(),
             1,
             false,
         ),
@@ -2499,13 +2501,13 @@ fn spilled_blocks_hold_each_document_twice() -> crate::Result<()> {
             "nearest only",
             FixtureSpec::ivf(Metric::L2, centroids.clone(), vectors.clone())
                 .schedule(&[1, 4])
-                .spill()
+                .replicated()
                 .nearest_only(),
             1,
             false,
         ),
         (
-            "spill off",
+            "replication off",
             FixtureSpec::ivf(Metric::L2, centroids.clone(), vectors.clone()).schedule(&[1, 4]),
             1,
             false,
@@ -2515,7 +2517,7 @@ fn spilled_blocks_hold_each_document_twice() -> crate::Result<()> {
         let searcher = fixture.index.reader()?.searcher();
         let segment = first_segment(&searcher).1;
         let reader = segment.vector_index(fixture.field)?;
-        assert_eq!(reader.spilled(), spilled, "{name}");
+        assert_eq!(reader.replicated(), replicated, "{name}");
         let ivf = reader.index().unwrap();
         let mut appearances = vec![0usize; segment.max_doc() as usize];
         for cluster in 0..ivf.num_clusters() {

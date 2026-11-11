@@ -334,13 +334,20 @@ pub struct IndexSettings {
     /// quantization. Existing segments retain their own persisted router kind.
     #[serde(default, skip_serializing_if = "is_false")]
     pub vector_centroid_quantization: bool,
-    /// Assign each vector of a quantized IVF field to a second cluster chosen to cover queries
-    /// its first cluster misses, writing its codes there too. Doubles the quantized rows scanned
-    /// per opened cluster and adds about one quantized row per vector to the segment; the probe
-    /// budget counts rows scanned, spills included. Applies to new IVF segments; each segment
-    /// keeps the assignment it was built with.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub vector_spill: bool,
+    /// Number of IVF clusters each vector of a quantized IVF field is assigned to: 1 is the
+    /// nearest cluster alone; 2 adds a second cluster chosen to cover queries the first misses,
+    /// writing the vector's codes there too. Replication doubles the quantized rows scanned per
+    /// opened cluster and adds about one quantized row per vector to the segment; the probe budget
+    /// counts rows scanned, replicas included. Above 2 is rejected. Applies to new IVF segments;
+    /// each segment keeps the assignment it was built with. The boolean `vector_spill` of older
+    /// settings reads as 2 or 1.
+    #[serde(
+        default = "default_vector_replication",
+        alias = "vector_spill",
+        deserialize_with = "deserialize_vector_replication",
+        skip_serializing_if = "is_default_vector_replication"
+    )]
+    pub vector_replication: u8,
     /// Eligibility and storage limits for fields with bitmap postings enabled.
     #[serde(default, skip_serializing_if = "BitmapPostingsConfig::is_default")]
     pub bitmap_postings: BitmapPostingsConfig,
@@ -353,6 +360,32 @@ fn default_docstore_blocksize() -> usize {
 
 fn is_false(value: &bool) -> bool {
     !value
+}
+
+fn default_vector_replication() -> u8 {
+    1
+}
+
+fn is_default_vector_replication(replication: &u8) -> bool {
+    *replication == default_vector_replication()
+}
+
+/// Reads `vector_replication` as a count, or the boolean `vector_spill` of older settings as 2 or
+/// 1.
+fn deserialize_vector_replication<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u8, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Replication {
+        Count(u8),
+        Enabled(bool),
+    }
+    Ok(match Replication::deserialize(deserializer)? {
+        Replication::Count(count) => count,
+        Replication::Enabled(true) => 2,
+        Replication::Enabled(false) => 1,
+    })
 }
 
 fn default_codec_types() -> Vec<columnar::CodecType> {
@@ -383,7 +416,7 @@ impl Default for IndexSettings {
             vector_clustering_threshold: default_vector_clustering_threshold(),
             vector_quantization: Vec::new(),
             vector_centroid_quantization: false,
-            vector_spill: false,
+            vector_replication: default_vector_replication(),
             bitmap_postings: BitmapPostingsConfig::default(),
         }
     }
@@ -404,6 +437,16 @@ impl IndexSettings {
     /// Validate field-keyed quantization metadata before an index is built.
     pub fn validate_vector_quantization(&self, schema: &Schema) -> crate::Result<()> {
         validate_quantization_configs(&self.vector_quantization, schema)
+    }
+
+    /// Fails with `InvalidArgument` when [`IndexSettings::vector_replication`] is above 2.
+    pub fn validate_vector_replication(&self) -> crate::Result<()> {
+        if self.vector_replication > 2 {
+            return Err(crate::TantivyError::InvalidArgument(
+                "replication above 2 is not supported".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -682,7 +725,7 @@ mod tests {
                 vector_clustering_threshold: 10_000,
                 vector_quantization: Vec::new(),
                 vector_centroid_quantization: false,
-                vector_spill: false,
+                vector_replication: 1,
                 bitmap_postings: super::BitmapPostingsConfig::default(),
             }
         );
