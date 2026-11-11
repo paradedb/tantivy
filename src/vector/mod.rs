@@ -107,6 +107,8 @@ pub(crate) mod storage;
 pub(crate) mod write;
 
 #[cfg(test)]
+mod exhaustive_metric_tests;
+#[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]
 pub(crate) mod tests;

@@ -414,8 +414,9 @@ impl Metric {
         doc: &[T],
         query_norm: f32,
     ) -> Similarity {
-        if self != Metric::Cosine {
-            return self.similarity(query, doc);
+        match self {
+            Metric::Cosine => {}
+            Metric::L2 | Metric::Dot => return self.similarity(query, doc),
         }
         let doc_norm = norm_squared(doc).sqrt();
         Similarity::new(if query_norm == 0.0 || doc_norm == 0.0 {
@@ -432,8 +433,9 @@ impl Metric {
         doc: &[u8],
         query_norm: f32,
     ) -> Similarity {
-        if self != Metric::Cosine {
-            return self.similarity_bytes(query, doc);
+        match self {
+            Metric::Cosine => {}
+            Metric::L2 | Metric::Dot => return self.similarity_bytes(query, doc),
         }
         let doc_norm = norm_squared_bytes::<T>(doc).sqrt();
         Similarity::new(if query_norm == 0.0 || doc_norm == 0.0 {

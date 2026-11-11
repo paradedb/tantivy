@@ -316,10 +316,9 @@ impl FixtureSpec {
         let vectors = (0..docs)
             .map(|ordinal| {
                 let mut rng = Lcg(ordinal as u64 * 7919 + 13);
-                let scale = if metric == Metric::Dot {
-                    0.5 + (ordinal % 7) as f32 * 0.15
-                } else {
-                    1.0
+                let scale = match metric {
+                    Metric::Dot => 0.5 + (ordinal % 7) as f32 * 0.15,
+                    Metric::L2 | Metric::Cosine => 1.0,
                 };
                 centroid(ordinal % clusters)
                     .iter()

@@ -402,7 +402,7 @@ impl QuantizedQueryCtx {
     /// The norm the layer error model scales by: the query-to-centroid distance under L2, otherwise
     /// the norm of the vector the estimates score with.
     pub(crate) fn score_query_norm(&self, centroid_score: f32) -> f32 {
-        if self.index.meta.field().metric == Metric::L2 {
+        if self.index.meta.field().metric.scores_by_distance() {
             (-centroid_score).max(0.0).sqrt()
         } else {
             self.prepared.norm

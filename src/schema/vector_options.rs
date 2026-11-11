@@ -46,6 +46,14 @@ impl Metric {
             Metric::Cosine | Metric::Dot => false,
         }
     }
+
+    /// Whether clustering groups vectors by direction (angular k-means) rather than by position.
+    pub(crate) fn clusters_by_angle(self) -> bool {
+        match self {
+            Metric::Cosine | Metric::Dot => true,
+            Metric::L2 => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

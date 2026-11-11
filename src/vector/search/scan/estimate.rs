@@ -597,10 +597,14 @@ mod tests {
             &index.grids,
         );
         let residual_norm_squared = encoded.residual_norms_squared[0];
-        let cluster_score = if metric == Metric::L2 { -1.75 } else { 0.25 };
+        let cluster_score = if metric.scores_by_distance() {
+            -1.75
+        } else {
+            0.25
+        };
         let score_query_norm = query.score_query_norm(cluster_score);
         let score_query_norm_squared = score_query_norm * score_query_norm;
-        let base = if metric == Metric::L2 {
+        let base = if metric.scores_by_distance() {
             cluster_score - residual_norm_squared
         } else {
             cluster_score
@@ -609,7 +613,7 @@ mod tests {
         let first = &encoded.layers[0];
         let first_gamma = f16_to_f32(first.gammas[0]);
         let first_error_ratio = f16_to_f32(first.corrected_error_ratios[0]);
-        let first_constant = (metric == Metric::L2).then_some(first.constants[0]);
+        let first_constant = metric.scores_by_distance().then_some(first.constants[0]);
         let mut diagnostic_arithmetic = ArithmeticError::default();
         let diagnostic_first_raw = diagnostic_advance_raw_prefix(
             &query,
@@ -677,7 +681,9 @@ mod tests {
         let refinement = &encoded.layers[1];
         let refinement_gamma = f16_to_f32(refinement.gammas[0]);
         let refinement_error_ratio = f16_to_f32(refinement.corrected_error_ratios[0]);
-        let refinement_constant = (metric == Metric::L2).then_some(refinement.constants[0]);
+        let refinement_constant = metric
+            .scores_by_distance()
+            .then_some(refinement.constants[0]);
         let diagnostic_refined_raw = diagnostic_advance_raw_prefix(
             &query,
             metric,

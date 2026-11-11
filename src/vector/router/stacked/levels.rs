@@ -192,7 +192,7 @@ impl SuperKMeansLevelClusterer {
     /// Angular clustering for Cosine and Dot; Euclidean for L2.
     pub fn for_metric(metric: Metric) -> Self {
         Self {
-            angular: matches!(metric, Metric::Cosine | Metric::Dot),
+            angular: metric.clusters_by_angle(),
         }
     }
 }

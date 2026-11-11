@@ -364,7 +364,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                 let mut selected_scales = vec![0.0; selected.len()];
                 let mut selected_gammas = vec![0.0; selected.len()];
                 let mut selected_errors = vec![0.0; selected.len()];
-                let mut selected_constants = if metric == Metric::L2 {
+                let mut selected_constants = if metric.scores_by_distance() {
                     vec![0.0; selected.len()]
                 } else {
                     Vec::new()
@@ -638,7 +638,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                         )
                         .score();
                     let norm = encoded.residual_norms_squared[local];
-                    let base = if metric == Metric::L2 {
+                    let base = if metric.scores_by_distance() {
                         score - norm
                     } else {
                         score
@@ -654,7 +654,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                             l,
                             &e.codes[local * stride..(local + 1) * stride],
                             e.scales[local],
-                            (metric == Metric::L2).then(|| e.constants[local]),
+                            metric.scores_by_distance().then(|| e.constants[local]),
                             raw,
                             score,
                             norm,

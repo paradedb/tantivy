@@ -180,7 +180,7 @@ pub(super) fn write_data_entry(
                     &specs,
                     &grids,
                     encode_workspace.as_mut().unwrap(),
-                    opts.metric() == crate::schema::Metric::L2,
+                    opts.metric().scores_by_distance(),
                 );
                 debug_assert!(
                     batch.residual_norms_squared.iter().all(|n| n.is_finite())

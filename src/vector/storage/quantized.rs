@@ -1511,7 +1511,7 @@ mod tests {
                         scales: codes + 1,
                         gammas: codes + 2,
                         errors: codes + 3,
-                        constants: (metric == Metric::L2).then_some(codes + 4),
+                        constants: metric.scores_by_distance().then_some(codes + 4),
                         code_stride: quantized_code_stride(1024, 4),
                         dim: 1024,
                         bits: 4,
@@ -1596,7 +1596,8 @@ mod tests {
                             let n = end - start;
                             let (mut scales, mut gammas, mut errors) =
                                 (vec![0.; n], vec![0.; n], vec![0.; n]);
-                            let mut constants = vec![0.; if metric == Metric::L2 { n } else { 0 }];
+                            let mut constants =
+                                vec![0.; if metric.scores_by_distance() { n } else { 0 }];
                             sidecar.decode_selected(
                                 &local_rows,
                                 &mut scales,
@@ -1626,7 +1627,7 @@ mod tests {
                                         ))?
                                         .to_bits()
                                 );
-                                if metric == Metric::L2 {
+                                if metric.scores_by_distance() {
                                     assert_eq!(
                                         constants[i].to_bits(),
                                         reader

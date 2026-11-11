@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use superkmeans::{Dataset, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, Matrix};
 
-use crate::schema::{Metric, VectorOptions};
+use crate::schema::VectorOptions;
 use crate::vector::clustering::{
     for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
 };
@@ -211,11 +211,6 @@ fn fine_group_end(offsets: &[usize], start: usize, capacity: usize) -> usize {
     end
 }
 
-/// Whether `metric` clusters by angle.
-fn is_angular(metric: Metric) -> bool {
-    matches!(metric, Metric::Cosine | Metric::Dot)
-}
-
 impl IvfClusterer for SuperKMeansClusterer {
     fn training_sample_ratio(&self) -> f32 {
         self.training_sample_ratio
@@ -234,7 +229,7 @@ impl IvfClusterer for SuperKMeansClusterer {
             ));
         }
         let mut config = self.config.clone();
-        if is_angular(options.metric()) {
+        if options.metric().clusters_by_angle() {
             config.base.angular = true;
         }
         let kmeans = HierarchicalSuperKMeans::with_config(dim, config);
@@ -326,7 +321,7 @@ impl IvfClusterer for SuperKMeansClusterer {
         centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>> {
         let mut assignments = Vec::with_capacity(source.num_rows());
-        let kmeans = self.assigner(options.dim(), is_angular(options.metric()));
+        let kmeans = self.assigner(options.dim(), options.metric().clusters_by_angle());
         let IvfCentroids::F32(centroids) = centroids;
         for_each_batch(
             source,
@@ -352,7 +347,7 @@ impl IvfClusterer for SuperKMeansClusterer {
         lambda: f32,
     ) -> crate::Result<Vec<(u32, Option<u32>)>> {
         let mut pairs = Vec::with_capacity(source.num_rows());
-        let kmeans = self.assigner(options.dim(), is_angular(options.metric()));
+        let kmeans = self.assigner(options.dim(), options.metric().clusters_by_angle());
         let IvfCentroids::F32(centroids) = centroids;
         for_each_batch(
             source,
@@ -382,6 +377,7 @@ mod tests {
     use std::ops::Range;
 
     use super::*;
+    use crate::schema::Metric;
     use crate::vector::clustering::IvfTrainingBatch;
 
     /// In-memory [`VectorSource`] that records every range read and counts `read_rows` calls.

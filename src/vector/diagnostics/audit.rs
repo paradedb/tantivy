@@ -544,7 +544,7 @@ impl VectorIndexReader {
                         .score();
                     let query_norm = query.score_query_norm(cluster_score);
                     let query_norm_squared = query_norm * query_norm;
-                    let base = if self.options.metric() == Metric::L2 {
+                    let base = if self.options.metric().scores_by_distance() {
                         cluster_score - residual_norm_squared
                     } else {
                         cluster_score
@@ -591,7 +591,7 @@ impl VectorIndexReader {
                         measurements.depths[depth]
                             .sigma
                             .observe(f64::from(model_sigma));
-                        let metric_factor = if self.options.metric() == Metric::L2 {
+                        let metric_factor = if self.options.metric().scores_by_distance() {
                             2.0
                         } else {
                             1.0
@@ -801,7 +801,7 @@ impl VectorIndexReader {
                         residual_norm_squared,
                         &mut arithmetic,
                     )?;
-                    let base = if metric == Metric::L2 {
+                    let base = if metric.scores_by_distance() {
                         cluster_scores[cluster] - residual_norm_squared
                     } else {
                         cluster_scores[cluster]
@@ -890,7 +890,7 @@ impl VectorIndexReader {
                         }
                         let gamma = gammas[depth][cluster][row];
                         let residual_norm_squared = residual_norms_squared[cluster][row];
-                        let base = if metric == Metric::L2 {
+                        let base = if metric.scores_by_distance() {
                             cluster_scores[cluster] - residual_norm_squared
                         } else {
                             cluster_scores[cluster]
@@ -988,7 +988,7 @@ mod tests {
                 .iter()
                 .zip(&centroid)
                 .map(|(&query, &centroid)| {
-                    let value = if metric == Metric::L2 {
+                    let value = if metric.scores_by_distance() {
                         query - centroid
                     } else {
                         query

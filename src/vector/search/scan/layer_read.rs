@@ -58,7 +58,7 @@ impl Decoded {
         self.scales.resize(rows, 0.0);
         self.gammas.resize(rows, 0.0);
         self.errors.resize(rows, 0.0);
-        if metric == Metric::L2 {
+        if metric.scores_by_distance() {
             self.constants.resize(rows, 0.0);
         }
     }
@@ -118,7 +118,7 @@ fn decode_band(
                 &out.errors[..count],
                 selected.rows.start,
             )?;
-            if metric == Metric::L2 {
+            if metric.scores_by_distance() {
                 decode_f32s(band_constants(&band)?, &mut out.constants);
             }
         }
@@ -146,7 +146,7 @@ fn decode_band_rows(
         offsets,
         &mut out.kernel,
     );
-    let l2 = spec.metric() == Metric::L2;
+    let l2 = spec.metric().scores_by_distance();
     for (i, &row) in offsets.iter().enumerate() {
         out.scales[i] = f32_at(band.scales(), row);
         out.gammas[i] = f16_at(band.gammas(), row);
@@ -197,7 +197,7 @@ fn decode_runs(
         start = end;
     }
     debug_assert_eq!(start, rows.len());
-    let l2 = spec.metric() == Metric::L2;
+    let l2 = spec.metric().scores_by_distance();
     cluster.read_sidecar()?.decode_selected(
         rows,
         &mut out.scales,
