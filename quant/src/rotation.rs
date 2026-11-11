@@ -215,10 +215,18 @@ fn block_hadamard(x: &mut [f32], blocks: &[usize]) {
 fn hadamard(x: &mut [f32]) {
     debug_assert!(x.len().is_power_of_two());
     #[cfg(target_arch = "x86_64")]
-    if x.len() >= x86::MIN_LEN && crate::cpu::tier() == crate::cpu::Tier::Avx512 {
-        // SAFETY: the tier is only reported when the CPU has avx512f.
-        unsafe { x86::hadamard_avx512(x) };
-        return;
+    match crate::cpu::tier() {
+        crate::cpu::Tier::Avx512 if x.len() >= x86::MIN_LEN => {
+            // SAFETY: the tier is only reported when the CPU has avx512f.
+            unsafe { x86::hadamard_avx512(x) };
+            return;
+        }
+        crate::cpu::Tier::Avx2 if x.len() >= x86::AVX2_MIN_LEN => {
+            // SAFETY: the tier is only reported when the CPU has avx2.
+            unsafe { x86::hadamard_avx2(x) };
+            return;
+        }
+        _ => {}
     }
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     if x.len() >= neon::MIN_LEN {
@@ -252,7 +260,7 @@ fn hadamard_portable(x: &mut [f32]) {
     }
 }
 
-/// Runtime-dispatched x86 Hadamard kernel.
+/// Runtime-dispatched x86 Hadamard kernels.
 ///
 /// Every coordinate goes through the same additions, subtractions and final multiply, in the same
 /// level order, as [`hadamard_portable`], so the output is bit-identical and the stored codes do
@@ -260,8 +268,10 @@ fn hadamard_portable(x: &mut [f32]) {
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use std::arch::x86_64::{
-        __m512, _mm512_add_ps, _mm512_loadu_ps, _mm512_mask_sub_ps, _mm512_mul_ps,
-        _mm512_permute_ps, _mm512_set1_ps, _mm512_shuffle_f32x4, _mm512_storeu_ps, _mm512_sub_ps,
+        __m256, __m512, _mm256_add_ps, _mm256_blend_ps, _mm256_loadu_ps, _mm256_mul_ps,
+        _mm256_permute2f128_ps, _mm256_permute_ps, _mm256_set1_ps, _mm256_storeu_ps, _mm256_sub_ps,
+        _mm512_add_ps, _mm512_loadu_ps, _mm512_mask_sub_ps, _mm512_mul_ps, _mm512_permute_ps,
+        _mm512_set1_ps, _mm512_shuffle_f32x4, _mm512_storeu_ps, _mm512_sub_ps,
     };
 
     /// Floats per 512-bit register.
@@ -353,6 +363,97 @@ mod x86 {
         let v = _mm512_mask_sub_ps(_mm512_add_ps(v, swapped), 0xF0F0, swapped, v);
         let swapped = _mm512_shuffle_f32x4::<0b01_00_11_10>(v, v);
         _mm512_mask_sub_ps(_mm512_add_ps(v, swapped), 0xFF00, swapped, v)
+    }
+
+    /// Floats per 256-bit register.
+    const AVX2_LANES: usize = 8;
+
+    /// Shortest block the AVX2 kernel accepts.
+    pub(super) const AVX2_MIN_LEN: usize = AVX2_LANES;
+
+    /// # Safety
+    ///
+    /// The CPU must have AVX2.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `x.len()` is a power of two of at least `AVX2_MIN_LEN`.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn hadamard_avx2(x: &mut [f32]) {
+        assert!(x.len().is_power_of_two() && x.len() >= AVX2_MIN_LEN);
+        let len = x.len();
+        let normalization = _mm256_set1_ps(1.0 / (len as f32).sqrt());
+        let base = x.as_mut_ptr();
+
+        // Widths 1, 2 and 4 pair lanes of the same register.
+        for i in (0..len).step_by(AVX2_LANES) {
+            // SAFETY: `len` is a multiple of `AVX2_LANES`, so `i + AVX2_LANES <= len`.
+            unsafe {
+                let lanes = base.add(i);
+                _mm256_storeu_ps(lanes, lane_levels_avx2(_mm256_loadu_ps(lanes)));
+            }
+        }
+
+        // Wider levels pair whole registers, two levels per pass while two remain.
+        let mut width = AVX2_LANES;
+        while width * 2 < len {
+            for chunk in (0..len).step_by(width * 4) {
+                for i in (chunk..chunk + width).step_by(AVX2_LANES) {
+                    // SAFETY: `width` is a multiple of `AVX2_LANES` and `chunk + 4 * width <= len`,
+                    // so all four registers lie inside the slice and do not overlap.
+                    unsafe {
+                        let a = _mm256_loadu_ps(base.add(i));
+                        let b = _mm256_loadu_ps(base.add(i + width));
+                        let c = _mm256_loadu_ps(base.add(i + 2 * width));
+                        let d = _mm256_loadu_ps(base.add(i + 3 * width));
+                        let (ab_sum, ab_diff) = (_mm256_add_ps(a, b), _mm256_sub_ps(a, b));
+                        let (cd_sum, cd_diff) = (_mm256_add_ps(c, d), _mm256_sub_ps(c, d));
+                        _mm256_storeu_ps(base.add(i), _mm256_add_ps(ab_sum, cd_sum));
+                        _mm256_storeu_ps(base.add(i + width), _mm256_add_ps(ab_diff, cd_diff));
+                        _mm256_storeu_ps(base.add(i + 2 * width), _mm256_sub_ps(ab_sum, cd_sum));
+                        _mm256_storeu_ps(base.add(i + 3 * width), _mm256_sub_ps(ab_diff, cd_diff));
+                    }
+                }
+            }
+            width *= 4;
+        }
+        if width < len {
+            debug_assert_eq!(width * 2, len);
+            for i in (0..width).step_by(AVX2_LANES) {
+                // SAFETY: `i + AVX2_LANES <= width` and `2 * width == len`.
+                unsafe {
+                    let a = _mm256_loadu_ps(base.add(i));
+                    let b = _mm256_loadu_ps(base.add(i + width));
+                    _mm256_storeu_ps(base.add(i), _mm256_add_ps(a, b));
+                    _mm256_storeu_ps(base.add(i + width), _mm256_sub_ps(a, b));
+                }
+            }
+        }
+
+        for i in (0..len).step_by(AVX2_LANES) {
+            // SAFETY: `len` is a multiple of `AVX2_LANES`, so `i + AVX2_LANES <= len`.
+            unsafe {
+                let lanes = base.add(i);
+                _mm256_storeu_ps(lanes, _mm256_mul_ps(_mm256_loadu_ps(lanes), normalization));
+            }
+        }
+    }
+
+    /// Runs the width 1, 2 and 4 butterfly levels inside one register.
+    ///
+    /// Each level swaps the two halves of every pair, adds to get `left + right`, and blends
+    /// `left - right` into the upper half of the pair.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn lane_levels_avx2(v: __m256) -> __m256 {
+        let swapped = _mm256_permute_ps::<0b10_11_00_01>(v);
+        let v =
+            _mm256_blend_ps::<0b1010_1010>(_mm256_add_ps(v, swapped), _mm256_sub_ps(swapped, v));
+        let swapped = _mm256_permute_ps::<0b01_00_11_10>(v);
+        let v =
+            _mm256_blend_ps::<0b1100_1100>(_mm256_add_ps(v, swapped), _mm256_sub_ps(swapped, v));
+        let swapped = _mm256_permute2f128_ps::<0x01>(v, v);
+        _mm256_blend_ps::<0b1111_0000>(_mm256_add_ps(v, swapped), _mm256_sub_ps(swapped, v))
     }
 }
 
@@ -599,6 +700,13 @@ mod tests {
     #[test]
     fn simd_hadamard_is_bit_identical_to_portable() {
         assert_bit_identical_to_portable("dispatched", 1, hadamard);
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 was just detected.
+            assert_bit_identical_to_portable("avx2", x86::AVX2_MIN_LEN, |x| unsafe {
+                x86::hadamard_avx2(x)
+            });
+        }
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("avx512f") {
             // SAFETY: avx512f was just detected.
