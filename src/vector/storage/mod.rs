@@ -11,4 +11,4 @@ pub(crate) mod quantized;
 pub(crate) mod reader;
 
 pub use io::VectorIoStats;
-pub use reader::VectorIndexReader;
+pub use reader::{VectorIndexReader, VectorIndexStats};

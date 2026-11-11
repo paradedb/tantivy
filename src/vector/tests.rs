@@ -308,6 +308,16 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
             // of the framing, not inside a slot.
             CompositeFile::open(&body)?;
 
+            let stats = segment_reader
+                .vector_index_stats(index.embedding_field())?
+                .unwrap();
+            let info = segment_reader
+                .vector_index(index.embedding_field())?
+                .info()?
+                .unwrap();
+            assert_eq!(stats.num_vectors, info.num_vectors);
+            assert_eq!(stats.num_centroids, info.num_centroids);
+
             match format {
                 VectorStorageFormat::Flat => {
                     assert!(

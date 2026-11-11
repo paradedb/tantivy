@@ -160,6 +160,15 @@ impl DeferredIdMap {
     }
 }
 
+/// Stored vector counts, available without opening routing or row payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VectorIndexStats {
+    /// Distinct documents with a vector value.
+    pub num_vectors: usize,
+    /// IVF cluster count, or `None` for flat storage.
+    pub num_centroids: Option<usize>,
+}
+
 /// Per-(segment, field) vector reader: the row store plus, for IVF segments,
 /// the routing index. See the module docs for the layout and the
 /// pinned-vs-deferred split.
@@ -259,6 +268,30 @@ impl VectorFieldReader {
             }),
             search: OnceLock::new(),
         })
+    }
+
+    pub(crate) fn stats(&self) -> crate::Result<Option<VectorIndexStats>> {
+        let Some(source) = &self.source else {
+            return Ok(None);
+        };
+        let blocks = Blocks::from_metadata(source.metadata.clone())?;
+        let stats = if let Some(slots) = &source.centroid_slots {
+            let (num_centroids, num_vectors) =
+                ClusterIndex::read_counts(&self.options, &slots.centroids)?;
+            if num_centroids != blocks.num_blocks() || num_vectors > blocks.num_rows() {
+                return Err(DataCorruption::comment_only("invalid IVF vector counts").into());
+            }
+            VectorIndexStats {
+                num_vectors,
+                num_centroids: Some(num_centroids),
+            }
+        } else {
+            VectorIndexStats {
+                num_vectors: blocks.num_rows(),
+                num_centroids: None,
+            }
+        };
+        Ok(Some(stats))
     }
 
     #[cfg(test)]
@@ -1049,6 +1082,16 @@ mod tests {
         assert!(field.search.get().is_none());
         assert!(id_reads.lock().unwrap().is_empty());
         assert!(data_reads.lock().unwrap().iter().all(|r| r.end <= prefix));
+        assert_eq!(
+            field.stats()?,
+            Some(VectorIndexStats {
+                num_vectors: 1,
+                num_centroids: None
+            })
+        );
+        assert!(field.search.get().is_none());
+        assert!(id_reads.lock().unwrap().is_empty());
+        data_reads.lock().unwrap().clear();
         let readers = std::thread::scope(|scope| {
             (0..8)
                 .map(|_| scope.spawn(|| field.search_reader().unwrap()))
@@ -1085,6 +1128,87 @@ mod tests {
         );
         assert_eq!(readers[0].num_vectors(), 1);
         assert_eq!(readers[0].row_location(1)?, Some(BlockAddress::new(0, 0)));
+        Ok(())
+    }
+
+    #[test]
+    fn ivf_stats_read_counts_without_search_payloads() -> crate::Result<()> {
+        use crate::vector::storage::blocks::{block_len, pad, write_metadata, BlockOffsetsWriter};
+
+        for clusters in [1usize, 4096] {
+            let options = VectorOptions::new(2, Metric::L2);
+            let meta = VectorColMetadata::build_ivf(&options, None)?;
+            let mut data = Vec::new();
+            write_metadata(&mut data, &meta)?;
+            let mut offsets = BlockOffsetsWriter::new(data.len() as u64);
+            for _ in 0..clusters {
+                pad(&mut data, block_len(&meta.slots(), 2))?;
+                offsets.push(data.len() as u64, 2);
+            }
+            offsets.finish(&mut data)?;
+            let footer = data.len() - 32;
+            let data_reads = TrackedReads::default();
+            let centroid_reads = TrackedReads::default();
+            let router_reads = TrackedReads::default();
+            let id_reads = TrackedReads::default();
+            let mut centroids = Vec::new();
+            ClusterIndex::serialize_centroids(
+                clusters,
+                clusters,
+                &vec![0; clusters * 8],
+                &options,
+                &mut centroids,
+            )?;
+            let field = VectorFieldReader {
+                options: options.clone(),
+                source: Some(VectorSource {
+                    metadata: BlockMetadata::open(
+                        FileSlice::new(Arc::new(BlockTrackedBytes {
+                            bytes: data,
+                            reads: Arc::clone(&data_reads),
+                            block_len: 16,
+                        })),
+                        &options,
+                        true,
+                    )?,
+                    composite: tracked_id_composite(vec![0], &id_reads),
+                    field: Field::from_field_id(0),
+                    max_doc: clusters as u32,
+                    centroid_slots: Some(CentroidSlices {
+                        centroids: FileSlice::new(Arc::new(BlockTrackedBytes {
+                            bytes: centroids,
+                            reads: Arc::clone(&centroid_reads),
+                            block_len: 16,
+                        })),
+                        router: FileSlice::new(Arc::new(BlockTrackedBytes {
+                            bytes: vec![0],
+                            reads: Arc::clone(&router_reads),
+                            block_len: 16,
+                        })),
+                    }),
+                }),
+                search: OnceLock::new(),
+            };
+            data_reads.lock().unwrap().clear();
+            assert_eq!(
+                field.stats()?,
+                Some(VectorIndexStats {
+                    num_vectors: clusters,
+                    num_centroids: Some(clusters),
+                })
+            );
+            assert_eq!(*data_reads.lock().unwrap(), [footer..footer + 32]);
+            assert_eq!(*centroid_reads.lock().unwrap(), [0..8]);
+            assert!(router_reads.lock().unwrap().is_empty());
+            assert!(id_reads.lock().unwrap().is_empty());
+            assert!(field.search.get().is_none());
+        }
+        let missing = VectorFieldReader {
+            options: VectorOptions::new(2, Metric::L2),
+            source: None,
+            search: OnceLock::new(),
+        };
+        assert_eq!(missing.stats()?, None);
         Ok(())
     }
 

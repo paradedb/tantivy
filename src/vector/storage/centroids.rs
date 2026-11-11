@@ -76,15 +76,10 @@ impl ClusterIndex {
         out.write_all(centroid_bytes)
     }
 
-    /// Parse a field's `.centroids` slots. Count words and router topology are
-    /// materialized; centroid rows and block offsets remain lazy.
-    /// The router is opened as the kind persisted in `router_slice`.
-    pub(crate) fn open(
+    pub(crate) fn read_counts(
         options: &VectorOptions,
-        centroids_slice: FileSlice,
-        block_offsets: BlockOffsets,
-        router_slice: FileSlice,
-    ) -> crate::Result<Self> {
+        centroids_slice: &FileSlice,
+    ) -> crate::Result<(usize, usize)> {
         let count_words = 2 * mem::size_of::<u32>();
         if centroids_slice.len() < count_words {
             return Err(io::Error::new(
@@ -102,14 +97,28 @@ impl ClusterIndex {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "centroid byte length overflow")
             })?;
-        let centroids_slice = centroids_slice.slice_from(count_words);
-        if centroids_slice.len() != centroid_len {
+        if centroids_slice.len() - count_words != centroid_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "IVF centroid byte length mismatch",
             )
             .into());
         }
+
+        Ok((num_centroids, num_docs))
+    }
+
+    /// Parse a field's `.centroids` slots. Count words and router topology are
+    /// materialized; centroid rows and block offsets remain lazy.
+    /// The router is opened as the kind persisted in `router_slice`.
+    pub(crate) fn open(
+        options: &VectorOptions,
+        centroids_slice: FileSlice,
+        block_offsets: BlockOffsets,
+        router_slice: FileSlice,
+    ) -> crate::Result<Self> {
+        let (num_centroids, num_docs) = Self::read_counts(options, &centroids_slice)?;
+        let centroids_slice = centroids_slice.slice_from(2 * mem::size_of::<u32>());
 
         if num_centroids != block_offsets.num_blocks() {
             return Err(io::Error::new(
