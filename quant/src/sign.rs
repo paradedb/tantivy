@@ -180,6 +180,17 @@ pub fn score_sym(x: &[u64], q: &[u64]) -> u32 {
 ///
 /// Panics when the query is empty or `bq` is outside `1..=8`.
 pub fn prepare_query(u: &[f32], bq: u8) -> QueryPlanes {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("sse4.1") {
+        // SAFETY: the CPU has SSE4.1, checked on the line above.
+        return unsafe { x86::prepare_query_sse41(u, bq) };
+    }
+    prepare_query_body(u, bq)
+}
+
+/// Portable body of [`prepare_query`].
+#[inline(always)]
+fn prepare_query_body(u: &[f32], bq: u8) -> QueryPlanes {
     assert!(!u.is_empty());
     assert!((1..=8).contains(&bq));
     debug_assert!(u.iter().all(|value| value.is_finite()));
@@ -908,8 +919,21 @@ mod neon {
 /// bit-identically.
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::{batch_body, indexed_body, score_asym_body, QueryPlanes};
+    use super::{batch_body, indexed_body, prepare_query_body, score_asym_body, QueryPlanes};
     use crate::cpu::{tier, Tier};
+
+    /// [`prepare_query_body`] with SSE4.1. Each code rounds half away from zero; on baseline
+    /// x86-64 `f32::round` is a `roundf` call per coordinate, under SSE4.1 an add of the largest
+    /// float below one half and a `roundss` truncation, exact for every input. The codes, and so
+    /// the planes and sums, are bit-identical.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must have SSE4.1.
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn prepare_query_sse41(u: &[f32], bq: u8) -> QueryPlanes {
+        prepare_query_body(u, bq)
+    }
 
     pub(super) fn batch(rows: &[u64], words_per_row: usize, q: &QueryPlanes, out: &mut [f32]) {
         match tier() {
@@ -1697,5 +1721,61 @@ mod tests {
 
     fn dot(a: &[f32], b: &[f32]) -> f32 {
         a.iter().zip(b).map(|(&x, &y)| x * y).sum()
+    }
+
+    /// The SSE4.1 compilation of `prepare_query`, called directly, quantizes every query bit for
+    /// bit as the portable body does, on queries with signed zeros, subnormals, values near
+    /// `f32::MAX`, ties at half a step, and a constant query.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn sse41_prepare_query_is_bit_identical_to_the_portable_body() {
+        if !std::arch::is_x86_feature_detected!("sse4.1") {
+            return;
+        }
+        let awkward = [
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE / 8.0,
+            -1e-40,
+            f32::MAX * 0.5,
+            -f32::MAX * 0.5,
+            f32::MAX.next_down() * 0.5,
+            1.0,
+            -2.5,
+            0.5,
+            1.5,
+            -0.5,
+            1e-20,
+            123.456,
+        ];
+        let mut queries: Vec<Vec<f32>> = (0..6)
+            .map(|offset| {
+                (0..131)
+                    .map(|i| awkward[(i * 5 + offset) % awkward.len()])
+                    .collect()
+            })
+            .collect();
+        // Every value on a half step of a 15-level grid over [0, 15]: rounding ties.
+        queries.push((0..130).map(|i| (i % 31) as f32 * 0.5).collect());
+        queries.push((0..97).map(|i| -((i % 31) as f32) * 0.5 - 1e-40).collect());
+        queries.push(vec![-0.0; 64]);
+        queries.push(vec![f32::MIN_POSITIVE / 4.0; 70]);
+        for query in &queries {
+            for bq in 1..=8 {
+                let plain = prepare_query_body(query, bq);
+                // SAFETY: the CPU has SSE4.1, checked at the top of the test.
+                let fused = unsafe { super::x86::prepare_query_sse41(query, bq) };
+                assert_eq!(plain.planes, fused.planes, "bq {bq}");
+                assert_eq!(plain.lo.to_bits(), fused.lo.to_bits(), "bq {bq}");
+                assert_eq!(plain.delta.to_bits(), fused.delta.to_bits(), "bq {bq}");
+                assert_eq!(plain.sum_codes, fused.sum_codes, "bq {bq}");
+                assert_eq!(
+                    plain.error_squared.to_bits(),
+                    fused.error_squared.to_bits(),
+                    "bq {bq}"
+                );
+                assert_eq!(plain.d, fused.d);
+            }
+        }
     }
 }
