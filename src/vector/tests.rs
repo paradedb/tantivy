@@ -748,6 +748,376 @@ fn ingest_bounds_the_squared_norm_of_rows_stored_as_given() -> crate::Result<()>
     Ok(())
 }
 
+/// Admission conformance over every `(dtype, metric)`: each edge vector is refused or accepted,
+/// as a row and as a query, as the rule states; accepted queries over the accepted rows rank as
+/// an f64 brute force does through the flat scan and the IVF full-precision scans, and the IVF
+/// `[1, 1]` quantized scan returns finite scores that agree with it per document. Every cluster
+/// is probed.
+#[test]
+fn admission_conformance_for_every_dtype_and_metric() -> crate::Result<()> {
+    let mut failures = Vec::new();
+    for dtype in VectorDType::ALL {
+        for metric in Metric::ALL {
+            match dtype {
+                VectorDType::F32 => admission_conformance::run_f32(metric, &mut failures)?,
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    Ok(())
+}
+
+mod admission_conformance {
+    use std::sync::Arc;
+
+    use crate::query::AllQuery;
+    use crate::schema::{Metric, Schema, VectorOptions};
+    use crate::vector::distance::{norm_squared_wide, InvalidVector, MAX_NORM_SQUARED};
+    use crate::vector::search::prepared::VectorQuery;
+    use crate::vector::test_support::{Fixture, FixtureSpec, Lcg};
+    use crate::{DocAddress, Index, Score, TantivyDocument, TantivyError};
+
+    /// The smallest dimension the quantization grids accept.
+    const DIM: usize = 64;
+    const NORMAL_ROWS: usize = 200;
+    const NORMAL_QUERIES: usize = 3;
+    const K: usize = 10;
+    const CENTROIDS: usize = 4;
+    /// Scores agree with the f64 oracle to this fraction of the score's magnitude, the sum of
+    /// the absolute values of its terms.
+    const REL: f64 = 1e-4;
+    /// Plus the f32 subnormal spacing once per term, the most a score can lose to underflow.
+    const ABS: f64 = DIM as f64 * 1.401298464324817e-45;
+
+    /// One edge vector and whether each normalization policy refuses it.
+    struct Case {
+        name: &'static str,
+        vector: Vec<f32>,
+        as_given: Option<InvalidVector>,
+        unit: Option<InvalidVector>,
+    }
+
+    fn edge_cases() -> Vec<Case> {
+        use InvalidVector::{NonFinite, NormTooLarge};
+        let seeded = Lcg(7).vector(DIM, 1.0);
+        let with = |value: f32| {
+            let mut vector = seeded.clone();
+            vector[3] = value;
+            vector
+        };
+        let mut one_max = vec![0.0; DIM];
+        one_max[0] = f32::MAX;
+        let mut under = (MAX_NORM_SQUARED / DIM as f64).sqrt() as f32;
+        while norm_squared_wide(&[under; DIM]) > MAX_NORM_SQUARED {
+            under = under.next_down();
+        }
+        let over = under.next_up();
+        assert!(norm_squared_wide(&[over; DIM]) > MAX_NORM_SQUARED);
+        let case = |name, vector, as_given, unit| Case {
+            name,
+            vector,
+            as_given,
+            unit,
+        };
+        vec![
+            case(
+                "NaN element",
+                with(f32::NAN),
+                Some(NonFinite),
+                Some(NonFinite),
+            ),
+            case(
+                "+inf element",
+                with(f32::INFINITY),
+                Some(NonFinite),
+                Some(NonFinite),
+            ),
+            case(
+                "-inf element",
+                with(f32::NEG_INFINITY),
+                Some(NonFinite),
+                Some(NonFinite),
+            ),
+            case("zero", vec![0.0; DIM], None, None),
+            case(
+                "every element 2^-149: tiny cosine and inner-product query",
+                vec![f32::from_bits(1); DIM],
+                None,
+                None,
+            ),
+            case(
+                "every element 1e-25: tiny inner-product query",
+                vec![1e-25; DIM],
+                None,
+                None,
+            ),
+            case(
+                "every element 1e-22: tiny inner-product query",
+                vec![1e-22; DIM],
+                None,
+                None,
+            ),
+            case("one element f32::MAX", one_max, Some(NormTooLarge), None),
+            case(
+                "norm^2 just under the bound: near-bound L2 and inner product",
+                vec![under; DIM],
+                None,
+                None,
+            ),
+            case(
+                "norm^2 just over the bound",
+                vec![over; DIM],
+                Some(NormTooLarge),
+                None,
+            ),
+            case(
+                "every element 1e20",
+                vec![1e20; DIM],
+                Some(NormTooLarge),
+                None,
+            ),
+        ]
+    }
+
+    /// Seeded standard-normal rows.
+    fn normal_rows(seed: u64, count: usize) -> Vec<Vec<f32>> {
+        let mut rng = Lcg(seed);
+        let mut uniform = move || (rng.next_f32() as f64 + 1.0) / 2.0;
+        (0..count)
+            .map(|_| {
+                (0..DIM)
+                    .map(|_| {
+                        let radius = (-2.0 * (1.0 - uniform()).ln()).sqrt();
+                        (radius * (std::f64::consts::TAU * uniform()).cos()) as f32
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The refusal the rule states for `metric`.
+    fn expected(metric: Metric, case: &Case) -> Option<InvalidVector> {
+        match metric {
+            Metric::L2 | Metric::Dot => case.as_given,
+            Metric::Cosine => case.unit,
+        }
+    }
+
+    /// The f64 score of `row` for `query` and its magnitude.
+    fn oracle(metric: Metric, query: &[f32], row: &[f32]) -> (f64, f64) {
+        let pairs = || query.iter().zip(row).map(|(&q, &r)| (q as f64, r as f64));
+        match metric {
+            Metric::L2 => {
+                let distance: f64 = pairs().map(|(q, r)| (q - r) * (q - r)).sum();
+                (-distance, distance)
+            }
+            Metric::Dot => (
+                pairs().map(|(q, r)| q * r).sum(),
+                pairs().map(|(q, r)| (q * r).abs()).sum(),
+            ),
+            Metric::Cosine => {
+                let norm = |v: &[f32]| norm_squared_wide(v).sqrt();
+                let scale = norm(query) * norm(row);
+                if scale == 0.0 {
+                    return (0.0, 0.0);
+                }
+                (
+                    pairs().map(|(q, r)| q * r).sum::<f64>() / scale,
+                    pairs().map(|(q, r)| (q * r).abs()).sum::<f64>() / scale,
+                )
+            }
+        }
+    }
+
+    /// The refusal a single-document index reports for `row`, by its error message.
+    fn row_outcome(metric: Metric, row: &[f32]) -> crate::Result<Option<InvalidVector>> {
+        let mut schema = Schema::builder();
+        let field = schema.add_vector_field("v", VectorOptions::new(DIM, metric));
+        let index = Index::builder().schema(schema.build()).create_in_ram()?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        let mut doc = TantivyDocument::new();
+        doc.add_vector(field, row);
+        match writer.add_document(doc).and_then(|_| writer.commit()) {
+            Ok(_) => Ok(None),
+            Err(TantivyError::InvalidArgument(message))
+                if message.starts_with("non-finite element in vector field 'v'") =>
+            {
+                Ok(Some(InvalidVector::NonFinite))
+            }
+            Err(TantivyError::InvalidArgument(message))
+                if message.contains("has a squared norm above the limit") =>
+            {
+                Ok(Some(InvalidVector::NormTooLarge))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(super) fn run_f32(metric: Metric, failures: &mut Vec<String>) -> crate::Result<()> {
+        let cases = edge_cases();
+        let mut rows = normal_rows(11, NORMAL_ROWS);
+        for case in &cases {
+            let want = expected(metric, case);
+            let got = row_outcome(metric, &case.vector)?;
+            if got != want {
+                failures.push(format!(
+                    "{metric:?} row '{}': expected {want:?}, got {got:?}",
+                    case.name
+                ));
+            }
+            if want.is_none() {
+                rows.push(case.vector.clone());
+            }
+        }
+
+        let centroids: Vec<Vec<f32>> = (0..CENTROIDS)
+            .map(|cluster| {
+                let mut centroid = vec![0.0; DIM];
+                centroid[cluster] = 1.0;
+                centroid
+            })
+            .collect();
+        let flat =
+            FixtureSpec::flat(metric, DIM, rows.iter().cloned().map(Some).collect()).build()?;
+        let ivf = FixtureSpec::ivf(metric, centroids.clone(), rows.clone()).build()?;
+        let quantized = FixtureSpec::ivf(metric, centroids, rows.clone())
+            .schedule(&[1, 1])
+            .build()?;
+        let params = super::exhaustive_params(CENTROIDS);
+
+        let mut queries: Vec<(String, Vec<f32>, Option<InvalidVector>)> =
+            normal_rows(23, NORMAL_QUERIES)
+                .into_iter()
+                .enumerate()
+                .map(|(i, query)| (format!("normal query {i}"), query, None))
+                .collect();
+        queries.extend(cases.iter().map(|case| {
+            (
+                case.name.to_string(),
+                case.vector.clone(),
+                expected(metric, case),
+            )
+        }));
+        for (name, query, want) in &queries {
+            let context = format!("{metric:?} query '{name}'");
+            let got = VectorQuery::new(metric, Arc::new(query.clone())).err();
+            if got != *want {
+                failures.push(format!("{context}: expected {want:?}, got {got:?}"));
+                continue;
+            }
+            if want.is_some() {
+                match flat.search(&AllQuery, query, K, params.clone()) {
+                    Err(TantivyError::InvalidArgument(message))
+                        if message.starts_with("invalid query vector: ") => {}
+                    other => failures.push(format!(
+                        "{context}: search must refuse the query, got {:?}",
+                        other.map(|fruit| fruit.results)
+                    )),
+                }
+                continue;
+            }
+            let scored: Vec<(f64, f64)> =
+                rows.iter().map(|row| oracle(metric, query, row)).collect();
+            let mut best: Vec<usize> = (0..rows.len()).collect();
+            best.sort_by(|&a, &b| scored[b].0.total_cmp(&scored[a].0));
+            best.truncate(K);
+            let exact_paths = [
+                (
+                    "flat",
+                    &flat,
+                    flat.search(&AllQuery, query, K, params.clone()),
+                ),
+                (
+                    "IVF full precision",
+                    &ivf,
+                    ivf.search(&AllQuery, query, K, params.clone()),
+                ),
+                (
+                    "IVF [1, 1] at full precision",
+                    &quantized,
+                    quantized.search_levels(&AllQuery, query, K, params.clone(), 0),
+                ),
+            ];
+            for (path, fixture, result) in exact_paths {
+                let context = format!("{context} {path}");
+                match result {
+                    Ok(fruit) => {
+                        check_ranking(&context, fixture, &fruit.results, &scored, &best, failures)?
+                    }
+                    Err(error) => failures.push(format!("{context}: {error}")),
+                }
+            }
+            let context = format!("{context} IVF [1, 1] quantized");
+            match quantized.search(&AllQuery, query, K, params.clone()) {
+                Ok(fruit) => {
+                    if fruit.results.len() != K {
+                        failures.push(format!(
+                            "{context}: {} results, expected {K}",
+                            fruit.results.len()
+                        ));
+                    }
+                    for &(score, address) in &fruit.results {
+                        check_score(&context, &quantized, score, address, &scored, failures)?;
+                    }
+                }
+                Err(error) => failures.push(format!("{context}: {error}")),
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `score` for the document at `address` is finite and matches the oracle; returns
+    /// the oracle's entry for that document.
+    fn check_score(
+        context: &str,
+        fixture: &Fixture,
+        score: Score,
+        address: DocAddress,
+        scored: &[(f64, f64)],
+        failures: &mut Vec<String>,
+    ) -> crate::Result<(f64, f64)> {
+        let ordinal = fixture.ordinal(address)?;
+        let (want, magnitude) = scored[ordinal];
+        if !score.is_finite() || (score as f64 - want).abs() > REL * magnitude + ABS {
+            failures.push(format!(
+                "{context}: row {ordinal} scored {score:e}, oracle {want:e}"
+            ));
+        }
+        Ok(scored[ordinal])
+    }
+
+    /// Whether `results` are the oracle's top `K`, ties by score allowed.
+    fn check_ranking(
+        context: &str,
+        fixture: &Fixture,
+        results: &[(Score, DocAddress)],
+        scored: &[(f64, f64)],
+        best: &[usize],
+        failures: &mut Vec<String>,
+    ) -> crate::Result<()> {
+        if results.len() != best.len() {
+            failures.push(format!(
+                "{context}: {} results, expected {}",
+                results.len(),
+                best.len()
+            ));
+            return Ok(());
+        }
+        for (rank, (&(score, address), &expected)) in results.iter().zip(best).enumerate() {
+            let (want, magnitude) =
+                check_score(context, fixture, score, address, scored, failures)?;
+            let (rank_score, rank_magnitude) = scored[expected];
+            if (want - rank_score).abs() > REL * magnitude.max(rank_magnitude) + ABS {
+                failures.push(format!(
+                    "{context}: rank {rank} holds a row with oracle score {want:e}, expected \
+                     {rank_score:e}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A zero vector is honest data: ingest accepts it (`ZeroSkipped`), and
 /// at query time it scores exactly 0.0 — behind any non-zero doc.
 #[test]

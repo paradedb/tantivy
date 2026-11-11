@@ -7,6 +7,12 @@ pub enum VectorDType {
 }
 
 impl VectorDType {
+    /// Every dtype. The match fails to compile for a variant missing from the list.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 1] = match Self::F32 {
+        Self::F32 => [Self::F32],
+    };
+
     pub fn size_bytes(self) -> usize {
         match self {
             VectorDType::F32 => 4,
@@ -26,6 +32,12 @@ pub enum Metric {
 }
 
 impl Metric {
+    /// Every metric. The match fails to compile for a variant missing from the list.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 3] = match Self::L2 {
+        Self::L2 | Self::Cosine | Self::Dot => [Self::L2, Self::Cosine, Self::Dot],
+    };
+
     /// Whether scores are negated squared distances, which depend on where the query sits and not
     /// only on its direction and scale.
     pub(crate) fn scores_by_distance(self) -> bool {
