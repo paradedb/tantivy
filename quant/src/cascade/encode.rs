@@ -362,6 +362,9 @@ fn encode_batch_in_place_reusing<F>(
             corrected_error_ratios: Vec::new(),
             constants: Vec::new(),
         });
+    // Prefix reconstructions are all zero until the first layer adds to them, so the first layer
+    // leaves them unrotated.
+    let mut prefix_is_zero = true;
     for (layer, (spec, grid)) in specs.iter().zip(grids).enumerate() {
         if spec.rotation != Rotation::None {
             for row in vectors.chunks_exact_mut(d) {
@@ -369,12 +372,15 @@ fn encode_batch_in_place_reusing<F>(
                     .rotation_plan
                     .rotate_layer_in_place(layer, row, rotation_scratch);
             }
-            for row in prefix_reconstructions.chunks_exact_mut(d) {
-                centroid
-                    .rotation_plan
-                    .rotate_layer_in_place(layer, row, rotation_scratch);
+            if !prefix_is_zero {
+                for row in prefix_reconstructions.chunks_exact_mut(d) {
+                    centroid
+                        .rotation_plan
+                        .rotate_layer_in_place(layer, row, rotation_scratch);
+                }
             }
         }
+        prefix_is_zero = false;
 
         let code_stride = match spec.kind {
             LayerKind::Sign => d.div_ceil(64) * 8,
@@ -399,6 +405,13 @@ fn encode_batch_in_place_reusing<F>(
         if compute_constants {
             constants.reserve(rows);
         }
+        let centroid_layer = &centroid.layers[layer];
+        // Grid points padded to 16 so a four-bit code indexes them without a bounds check; codes
+        // stay below `1 << bits` by construction.
+        let mut grid_points = [0.0_f32; 16];
+        if spec.kind == LayerKind::Grid {
+            grid_points[..grid.points.len()].copy_from_slice(&grid.points);
+        }
 
         for (row_index, (residual, prefix_reconstruction)) in vectors
             .chunks_exact_mut(d)
@@ -408,30 +421,42 @@ fn encode_batch_in_place_reusing<F>(
             match spec.kind {
                 LayerKind::Sign => {
                     let scale = encode_sign(residual, sign_words);
+                    // Equals `scale * 1.0` or `scale * -1.0` for every non-NaN scale.
+                    let scale_bits = scale.to_bits();
+                    let signed_scale = |word: u64, j: usize| {
+                        f32::from_bits(scale_bits ^ (u32::from((word >> j) & 1 == 0) << 31))
+                    };
+                    let chunks = residual
+                        .chunks_mut(64)
+                        .zip(prefix_reconstruction.chunks_mut(64))
+                        .zip(sign_words.iter());
                     let constant = if compute_constants {
                         let mut constant = 0.0_f32;
-                        for i in 0..d {
-                            let sign = if sign_words[i / 64] & (1_u64 << (i % 64)) != 0 {
-                                1.0
-                            } else {
-                                -1.0
-                            };
-                            let reconstruction = scale * sign;
-                            constant += centroid.layers[layer][i] * reconstruction;
-                            prefix_reconstruction[i] += reconstruction;
-                            residual[i] -= reconstruction;
+                        for (((residual, prefix), &word), center) in
+                            chunks.zip(centroid_layer.chunks(64))
+                        {
+                            for (j, ((residual, prefix), &center)) in residual
+                                .iter_mut()
+                                .zip(prefix.iter_mut())
+                                .zip(center)
+                                .enumerate()
+                            {
+                                let reconstruction = signed_scale(word, j);
+                                constant += center * reconstruction;
+                                *prefix += reconstruction;
+                                *residual -= reconstruction;
+                            }
                         }
                         Some(constant)
                     } else {
-                        for i in 0..d {
-                            let sign = if sign_words[i / 64] & (1_u64 << (i % 64)) != 0 {
-                                1.0
-                            } else {
-                                -1.0
-                            };
-                            let reconstruction = scale * sign;
-                            prefix_reconstruction[i] += reconstruction;
-                            residual[i] -= reconstruction;
+                        for ((residual, prefix), &word) in chunks {
+                            for (j, (residual, prefix)) in
+                                residual.iter_mut().zip(prefix.iter_mut()).enumerate()
+                            {
+                                let reconstruction = signed_scale(word, j);
+                                *prefix += reconstruction;
+                                *residual -= reconstruction;
+                            }
                         }
                         None
                     };
@@ -453,22 +478,28 @@ fn encode_batch_in_place_reusing<F>(
                         &mut codes[code_start..],
                         grid_code_scratch,
                     );
+                    let reconstructions = residual
+                        .iter_mut()
+                        .zip(prefix_reconstruction.iter_mut())
+                        .zip(
+                            grid_code_scratch
+                                .iter()
+                                .map(|&code| scale * grid_points[usize::from(code & 15)]),
+                        );
                     let constant = if compute_constants {
                         let mut constant = 0.0_f32;
-                        for i in 0..d {
-                            let point = grid.points[grid_code_scratch[i] as usize];
-                            let reconstruction = scale * point;
-                            constant += centroid.layers[layer][i] * reconstruction;
-                            prefix_reconstruction[i] += reconstruction;
-                            residual[i] -= reconstruction;
+                        for (((residual, prefix), reconstruction), &center) in
+                            reconstructions.zip(centroid_layer)
+                        {
+                            constant += center * reconstruction;
+                            *prefix += reconstruction;
+                            *residual -= reconstruction;
                         }
                         Some(constant)
                     } else {
-                        for i in 0..d {
-                            let point = grid.points[grid_code_scratch[i] as usize];
-                            let reconstruction = scale * point;
-                            prefix_reconstruction[i] += reconstruction;
-                            residual[i] -= reconstruction;
+                        for ((residual, prefix), reconstruction) in reconstructions {
+                            *prefix += reconstruction;
+                            *residual -= reconstruction;
                         }
                         None
                     };
@@ -1257,7 +1288,11 @@ mod tests {
         let context = prepare_centroid(&centroid, &specs);
         encode_batch_in_place(&mut vectors, rows, &context, &specs, &grids);
         let count = crate::rotation::debug_apply_count();
-        assert_eq!(count, 2 * 2 * rows + 2, "Rotation::apply count={count}");
+        assert_eq!(
+            count,
+            (2 + (2 - 1)) * rows + 2,
+            "Rotation::apply count={count}"
+        );
     }
 }
 

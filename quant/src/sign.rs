@@ -85,11 +85,12 @@ fn tail_is_zero(words: &[u64], d: usize) -> bool {
 pub fn pack(y: &[f32], out: &mut [u64]) {
     assert!(!y.is_empty());
     assert_eq!(out.len(), packed_words(y.len()));
-    out.fill(0);
-    for (i, &value) in y.iter().enumerate() {
-        if value > 0.0 {
-            out[i / 64] |= 1_u64 << (i % 64);
-        }
+    // One whole word per 64-coordinate chunk, built without a data-dependent branch.
+    for (word, chunk) in out.iter_mut().zip(y.chunks(64)) {
+        *word = chunk
+            .iter()
+            .enumerate()
+            .fold(0, |word, (j, &value)| word | (u64::from(value > 0.0) << j));
     }
     debug_assert!(tail_is_zero(out, y.len()));
 }
@@ -189,15 +190,20 @@ pub fn prepare_query(u: &[f32], bq: u8) -> QueryPlanes {
     let mut error_squared = 0.0_f64;
 
     if delta != 0.0 {
-        for (i, &value) in u.iter().enumerate() {
-            let code = (((value - lo) / delta).round() as u16).min(levels);
-            sum_codes += u64::from(code);
-            let reconstructed = lo + delta * f32::from(code);
-            error_squared += f64::from(value - reconstructed).powi(2);
-            for bit in 0..bq {
-                if code & (1_u16 << bit) != 0 {
-                    planes[bit as usize][i / 64] |= 1_u64 << (i % 64);
+        for (word_index, chunk) in u.chunks(64).enumerate() {
+            // Codes are at most `levels < 1 << bq`, so planes at or above `bq` stay zero.
+            let mut words = [0_u64; 8];
+            for (j, &value) in chunk.iter().enumerate() {
+                let code = (((value - lo) / delta).round() as u16).min(levels);
+                sum_codes += u64::from(code);
+                let reconstructed = lo + delta * f32::from(code);
+                error_squared += f64::from(value - reconstructed).powi(2);
+                for (bit, word) in words.iter_mut().enumerate() {
+                    *word |= u64::from((code >> bit) & 1) << j;
                 }
+            }
+            for (plane, word) in planes.iter_mut().zip(words) {
+                plane[word_index] = word;
             }
         }
     }

@@ -42,25 +42,51 @@ pub fn pack(codes: &[u8], bits: u8, out: &mut [u8]) {
     assert_eq!(out.len(), packed_len(codes.len(), bits));
     out.fill(0);
     let mask = (1_u8 << bits) - 1;
-    if bits == 3 {
-        for (i, &code) in codes.iter().enumerate() {
-            assert!(code <= mask);
-            let bit_offset = i * 3;
-            let byte = bit_offset / 8;
-            let shift = bit_offset % 8;
-            out[byte] |= code << shift;
-            if shift > 5 {
-                out[byte + 1] |= code >> (8 - shift);
+    // Bits above the mask from any code; checked once after the branch-free loops.
+    let mut out_of_range = 0_u8;
+    match bits {
+        4 => {
+            let pairs = codes.chunks_exact(2);
+            let tail = pairs.remainder();
+            for (byte, pair) in out.iter_mut().zip(pairs) {
+                out_of_range |= (pair[0] | pair[1]) & !mask;
+                *byte = pair[0] | (pair[1] << 4);
+            }
+            if let [code] = tail {
+                out_of_range |= code & !mask;
+                out[codes.len() / 2] = *code;
             }
         }
-        debug_assert!(tail_is_zero(out, codes.len(), bits));
-        return;
+        2 => {
+            let quads = codes.chunks_exact(4);
+            let tail = quads.remainder();
+            for (byte, quad) in out.iter_mut().zip(quads) {
+                out_of_range |= (quad[0] | quad[1] | quad[2] | quad[3]) & !mask;
+                *byte = quad[0] | (quad[1] << 2) | (quad[2] << 4) | (quad[3] << 6);
+            }
+            let mut last = 0_u8;
+            for (j, &code) in tail.iter().enumerate() {
+                out_of_range |= code & !mask;
+                last |= code << (2 * j);
+            }
+            if !tail.is_empty() {
+                out[codes.len() / 4] = last;
+            }
+        }
+        _ => {
+            for (i, &code) in codes.iter().enumerate() {
+                assert!(code <= mask);
+                let bit_offset = i * 3;
+                let byte = bit_offset / 8;
+                let shift = bit_offset % 8;
+                out[byte] |= code << shift;
+                if shift > 5 {
+                    out[byte + 1] |= code >> (8 - shift);
+                }
+            }
+        }
     }
-    let per_byte = 8 / bits as usize;
-    for (i, &code) in codes.iter().enumerate() {
-        assert!(code <= mask);
-        out[i / per_byte] |= code << (bits as usize * (i % per_byte));
-    }
+    assert!(out_of_range == 0, "grid code exceeds {bits} bits");
     debug_assert!(tail_is_zero(out, codes.len(), bits));
 }
 
@@ -146,8 +172,35 @@ pub fn encode_f32_with_scratch(
         *boundary = (pair[0] + pair[1]) * 0.5;
     }
     let boundaries = &boundaries[..grid.len() - 1];
-    for (code, &value) in code_scratch.iter_mut().zip(y) {
-        *code = boundaries.partition_point(|&boundary| value / scale > boundary) as u8;
+    // A code counts the boundaries below `value / scale`; with ascending boundaries that is the
+    // index of the first boundary not below it, and a NaN counts none. Counting in blocks of 16
+    // coordinates keeps the comparisons in vector lanes.
+    const BLOCK: usize = 16;
+    let mut code_blocks = code_scratch.chunks_exact_mut(BLOCK);
+    let mut value_blocks = y.chunks_exact(BLOCK);
+    for (codes, values) in (&mut code_blocks).zip(&mut value_blocks) {
+        let mut normalized = [0.0_f32; BLOCK];
+        for (normalized, &value) in normalized.iter_mut().zip(values) {
+            *normalized = value / scale;
+        }
+        let mut counts = [0_u8; BLOCK];
+        for &boundary in boundaries {
+            for (count, &normalized) in counts.iter_mut().zip(&normalized) {
+                *count += u8::from(normalized > boundary);
+            }
+        }
+        codes.copy_from_slice(&counts);
+    }
+    for (code, &value) in code_blocks
+        .into_remainder()
+        .iter_mut()
+        .zip(value_blocks.remainder())
+    {
+        let normalized = value / scale;
+        *code = boundaries
+            .iter()
+            .map(|&boundary| u8::from(normalized > boundary))
+            .sum();
     }
     pack(code_scratch, bits, out);
     scale
@@ -204,14 +257,12 @@ pub fn build_packed_lut_4(lut: &[f32], d: usize) -> Vec<f32> {
     assert_eq!(lut.len(), d * 16);
     let pairs = d / 2;
     let mut packed_lut = Vec::with_capacity(packed_lut_len_4(d));
-    for pair in 0..pairs {
-        let low_lut = pair * 32;
-        let high_lut = low_lut + 16;
-        for packed in 0_u16..=255 {
-            packed_lut.push(
-                lut[low_lut + (packed as u8 & 0x0f) as usize]
-                    + lut[high_lut + (packed as u8 >> 4) as usize],
-            );
+    // Byte `high << 4 | low` holds `low_table[low] + high_table[high]`: one run of 16 entries
+    // per high nibble.
+    for pair_lut in lut[..pairs * 32].chunks_exact(32) {
+        let (low, high) = pair_lut.split_at(16);
+        for &high in high {
+            packed_lut.extend(low.iter().map(|&low| low + high));
         }
     }
     if !d.is_multiple_of(2) {
