@@ -140,8 +140,7 @@ impl SuperKMeansClusterer {
         }
     }
 
-    /// Target training vectors per clustering leaf. Splits aim for this size;
-    /// actual leaves may be somewhat larger (about √2× the target).
+    /// Target training vectors per clustering leaf, enforced as a hard cap.
     pub fn with_target_leaf_size(mut self, target_leaf_size: usize) -> Self {
         self.config.target_leaf_size = target_leaf_size;
         self
