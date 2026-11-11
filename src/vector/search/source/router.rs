@@ -81,7 +81,7 @@ impl<'a> RowGate<'a> {
     /// Gates a cluster whose DocIds column is `doc_ids`, writing the kept cluster-local offsets.
     pub(crate) fn select(&self, doc_ids: &[DocId], offsets: &mut Vec<u32>) -> GatedRows {
         offsets.clear();
-        let (pruned_filter, pruned_dead) = match self {
+        let verdicts = match self {
             RowGate::Open => {
                 return GatedRows {
                     all: true,
@@ -90,60 +90,67 @@ impl<'a> RowGate<'a> {
                 }
             }
             RowGate::AliveOnly(alive) => gate(doc_ids, offsets, |doc| {
-                if alive.is_alive(doc) {
-                    RowVerdict::Keep
-                } else {
-                    RowVerdict::Dead
+                let alive = alive.is_alive(doc);
+                RowVerdict {
+                    matches: true,
+                    keep: alive,
                 }
             }),
             RowGate::FilterOnly(filter) => gate(doc_ids, offsets, |doc| {
-                if filter.contains(doc) {
-                    RowVerdict::Keep
-                } else {
-                    RowVerdict::Filtered
+                let matches = filter.contains(doc);
+                RowVerdict {
+                    matches,
+                    keep: matches,
                 }
             }),
             RowGate::FilterAndAlive { filter, alive } => gate(doc_ids, offsets, |doc| {
-                if !filter.contains(doc) {
-                    RowVerdict::Filtered
-                } else if alive.is_alive(doc) {
-                    RowVerdict::Keep
-                } else {
-                    RowVerdict::Dead
+                let matches = filter.contains(doc);
+                RowVerdict {
+                    matches,
+                    keep: matches & alive.is_alive(doc),
                 }
             }),
         };
         GatedRows {
             all: false,
-            pruned_filter,
-            pruned_dead,
+            pruned_filter: doc_ids.len() - verdicts.matched,
+            pruned_dead: verdicts.matched - verdicts.kept,
         }
     }
 }
 
-enum RowVerdict {
-    Keep,
-    Filtered,
-    Dead,
+/// One row's verdict: whether it matches the filter, and whether it is kept, which also needs it
+/// alive.
+struct RowVerdict {
+    matches: bool,
+    keep: bool,
 }
 
-/// Keeps the offsets `verdict` accepts; returns `(pruned_filter, pruned_dead)`.
+/// Rows a gate counted: those matching the filter, and those kept.
+struct GateCounts {
+    matched: usize,
+    kept: usize,
+}
+
+/// Keeps the offsets `verdict` accepts. Each row's offset is written at the next free slot and the
+/// slot advances by the verdict, so the loop has no branch on it.
 #[inline(always)]
 fn gate(
     doc_ids: &[DocId],
     offsets: &mut Vec<u32>,
     verdict: impl Fn(DocId) -> RowVerdict,
-) -> (usize, usize) {
-    let mut pruned_filter = 0usize;
-    let mut pruned_dead = 0usize;
+) -> GateCounts {
+    offsets.resize(doc_ids.len(), 0);
+    let mut kept = 0usize;
+    let mut matched = 0usize;
     for (offset, &doc) in (0u32..).zip(doc_ids) {
-        match verdict(doc) {
-            RowVerdict::Keep => offsets.push(offset),
-            RowVerdict::Filtered => pruned_filter += 1,
-            RowVerdict::Dead => pruned_dead += 1,
-        }
+        let RowVerdict { matches, keep } = verdict(doc);
+        offsets[kept] = offset;
+        kept += usize::from(keep);
+        matched += usize::from(matches);
     }
-    (pruned_filter, pruned_dead)
+    offsets.truncate(kept);
+    GateCounts { matched, kept }
 }
 
 // --- Source ---

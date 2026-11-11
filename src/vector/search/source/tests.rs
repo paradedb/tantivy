@@ -338,6 +338,70 @@ fn exhaustive_routing_matches_oracle() -> crate::Result<()> {
     Ok(())
 }
 
+/// Every gate keeps the offsets of the rows that match and are alive, in order, and counts the
+/// rows the filter dropped and the matching rows that are dead, as a branching reference does.
+#[test]
+fn row_gates_match_the_branching_reference() {
+    use crate::fastfield::AliveBitSet;
+
+    let max_doc = 500;
+    let mut rng = Lcg(3);
+    let mut filter = BitSet::with_max_value(max_doc);
+    let mut deleted = Vec::new();
+    for doc in 0..max_doc {
+        if rng.next_f32() > 0.0 {
+            filter.insert(doc);
+        }
+        if rng.next_f32() > 0.6 {
+            deleted.push(doc);
+        }
+    }
+    let alive = AliveBitSet::for_test_from_deleted_docs(&deleted, max_doc);
+    let filter = std::sync::Arc::new(filter);
+    let doc_ids: Vec<DocId> = (0..max_doc).filter(|_| rng.next_f32() > 0.3).collect();
+    let gates = [
+        (true, false, RowGate::AliveOnly(&alive)),
+        (
+            false,
+            true,
+            RowGate::FilterOnly(std::sync::Arc::clone(&filter)),
+        ),
+        (
+            true,
+            true,
+            RowGate::FilterAndAlive {
+                filter: std::sync::Arc::clone(&filter),
+                alive: &alive,
+            },
+        ),
+    ];
+    for (checks_alive, checks_filter, gate) in gates {
+        for docs in [&doc_ids[..], &doc_ids[..1], &[]] {
+            let (mut want, mut pruned_filter, mut pruned_dead) = (Vec::new(), 0, 0);
+            for (offset, &doc) in (0u32..).zip(docs) {
+                if checks_filter && !filter.contains(doc) {
+                    pruned_filter += 1;
+                } else if checks_alive && !alive.is_alive(doc) {
+                    pruned_dead += 1;
+                } else {
+                    want.push(offset);
+                }
+            }
+            let mut offsets = vec![7; 3];
+            let gated = gate.select(docs, &mut offsets);
+            assert_eq!(offsets, want);
+            assert_eq!(
+                gated,
+                GatedRows {
+                    all: false,
+                    pruned_filter,
+                    pruned_dead,
+                }
+            );
+        }
+    }
+}
+
 #[test]
 fn row_gate_bookkeeping() -> crate::Result<()> {
     // The row gate keeps the filter's offsets; an open gate keeps every row unread.

@@ -611,18 +611,35 @@ fn unseen_rows<'s>(
     let row_docs = rows
         .docs
         .expect("a replicated segment's rows carry their doc ids");
+    debug_assert_eq!(row_docs.len(), rows.len());
     offsets.clear();
     docs.clear();
-    for (position, local) in rows.local_rows().enumerate() {
-        let doc = row_docs[position];
-        if seen.contains(doc) {
-            *dropped += 1;
-            continue;
+    offsets.resize(row_docs.len(), 0);
+    docs.resize(row_docs.len(), 0);
+    // Each row is written at the next free slot, which advances only for a document the test-and-
+    // set finds unseen, so the loop has no branch on it.
+    let mut kept = 0usize;
+    let mut keep = |offset: u32, doc: DocId| {
+        let fresh = seen.insert(doc);
+        offsets[kept] = offset;
+        docs[kept] = doc;
+        kept += usize::from(fresh);
+    };
+    match rows.offsets {
+        None => {
+            for (offset, &doc) in (0u32..).zip(row_docs) {
+                keep(offset, doc);
+            }
         }
-        seen.insert(doc);
-        offsets.push((local - rows.rows.start) as u32);
-        docs.push(doc);
+        Some(selected) => {
+            for (&offset, &doc) in selected.iter().zip(row_docs) {
+                keep(offset, doc);
+            }
+        }
     }
+    *dropped += row_docs.len() - kept;
+    offsets.truncate(kept);
+    docs.truncate(kept);
     ClusterRows {
         cluster: rows.cluster,
         rows: rows.rows.clone(),
@@ -1031,5 +1048,69 @@ where
             report.trace.exact_scores = self.exact.exact_scores.clone();
         }
         Ok((self.exact.into_hits(segment_ord), report))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common::BitSet;
+
+    use super::unseen_rows;
+    use crate::vector::search::cluster_source::ClusterRows;
+    use crate::vector::test_support::Lcg;
+    use crate::DocId;
+
+    /// The replica drop keeps the rows whose document no earlier cluster held, in row order, marks
+    /// every document seen and counts the rest, as a branching reference does: for whole clusters
+    /// and gated selections over clusters sharing documents.
+    #[test]
+    fn unseen_rows_match_the_branching_reference() {
+        let max_doc = 300;
+        let mut rng = Lcg(11);
+        let mut seen = BitSet::with_max_value(max_doc);
+        let mut reference = BitSet::with_max_value(max_doc);
+        let (mut offsets, mut docs) = (Vec::new(), Vec::new());
+        let (mut dropped, mut reference_dropped) = (0, 0);
+        for cluster in 0..40 {
+            let cluster_docs: Vec<DocId> = (0..max_doc).filter(|_| rng.next_f32() > 0.8).collect();
+            let rows = 0..cluster_docs.len();
+            let selected: Vec<u32> = (0..cluster_docs.len() as u32)
+                .filter(|_| rng.next_f32() > -0.5)
+                .collect();
+            let selected_docs: Vec<DocId> = selected
+                .iter()
+                .map(|&row| cluster_docs[row as usize])
+                .collect();
+            // Whole clusters and gated selections alternate.
+            let (offsets_in, docs_in) = match cluster % 2 {
+                0 => (None, &cluster_docs),
+                _ => (Some(selected.as_slice()), &selected_docs),
+            };
+            let handed = ClusterRows {
+                cluster,
+                rows: rows.clone(),
+                offsets: offsets_in,
+                docs: Some(docs_in),
+                centroid: None,
+            };
+            let mut want = (Vec::new(), Vec::new());
+            for (position, &doc) in docs_in.iter().enumerate() {
+                if reference.contains(doc) {
+                    reference_dropped += 1;
+                    continue;
+                }
+                reference.insert(doc);
+                want.0
+                    .push(offsets_in.map_or(position as u32, |o| o[position]));
+                want.1.push(doc);
+            }
+            let got = unseen_rows(&mut seen, &handed, &mut offsets, &mut docs, &mut dropped);
+            assert_eq!(got.offsets, Some(want.0.as_slice()), "cluster {cluster}");
+            assert_eq!(got.docs, Some(want.1.as_slice()), "cluster {cluster}");
+            assert_eq!(got.rows, rows);
+            assert_eq!(dropped, reference_dropped, "cluster {cluster}");
+            assert_eq!(seen.len(), reference.len(), "cluster {cluster}");
+        }
+        assert!(dropped > 0 && seen.len() > max_doc as usize / 2);
     }
 }
