@@ -237,7 +237,8 @@ impl PreparedSplitQuery {
     }
 
     /// Scores a contiguous batch without scales or constants. Returns its sign-word fallbacks: 1
-    /// when sign codes require decoding into owned words, else 0. NEON reads unaligned bytes.
+    /// when sign codes require decoding into owned words, else 0. x86 and NEON read unaligned
+    /// bytes.
     ///
     /// # Panics
     ///
@@ -697,7 +698,7 @@ mod tests {
         assert!((layered - direct).abs() < 2e-4, "{layered} != {direct}");
     }
 
-    /// Unaligned sign codes are decoded into owned words and counted; aligned ones are borrowed.
+    /// Sign-word fallbacks count copies; direct byte scorers need none at any alignment.
     #[test]
     fn batch_scoring_returns_sign_word_fallbacks() {
         let d = 128;
@@ -729,10 +730,13 @@ mod tests {
                 fallbacks,
                 u64::from(
                     !aligned
-                        && !cfg!(all(
-                            target_arch = "aarch64",
-                            target_feature = "neon",
-                            target_endian = "little"
+                        && !cfg!(any(
+                            target_arch = "x86_64",
+                            all(
+                                target_arch = "aarch64",
+                                target_feature = "neon",
+                                target_endian = "little"
+                            )
                         ))
                 )
             );
@@ -749,10 +753,13 @@ mod tests {
                 fallbacks,
                 u64::from(
                     !aligned
-                        && !cfg!(all(
-                            target_arch = "aarch64",
-                            target_feature = "neon",
-                            target_endian = "little"
+                        && !cfg!(any(
+                            target_arch = "x86_64",
+                            all(
+                                target_arch = "aarch64",
+                                target_feature = "neon",
+                                target_endian = "little"
+                            )
                         ))
                 )
             );
