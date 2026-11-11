@@ -7,7 +7,8 @@
 //! [`expand`](fn@expand) looks the keys up in every segment and rewrites a list of query tokens
 //! into [`Expansion`]s, the longest key first, the way Lucene's `SynonymGraphFilter` does. The
 //! index keeps only the keys. The caller keeps the text of the rules, and gives it through a
-//! [`SynonymSource`], which can also cache what it reads.
+//! [`SynonymSource`], which can also cache what it reads. [`expansion_query`] turns each
+//! [`Expansion`] into the query that matches it.
 //!
 //! ```
 //! use std::sync::Arc;
@@ -76,6 +77,7 @@
 //! ```
 
 mod expand;
+mod query;
 mod rule;
 #[cfg(test)]
 mod tests;
@@ -85,5 +87,6 @@ pub use self::expand::{
     expand, rule_field_options, Expansion, KeyDocs, SegmentSynonyms, SynonymSource,
     DEFAULT_MAX_RULES_PER_KEY,
 };
+pub use self::query::expansion_query;
 pub use self::rule::{CompiledRule, RuleError, SynonymRule, MAX_RULE_TERMS};
 pub use self::tokenizer::SynonymRuleTokenizer;
