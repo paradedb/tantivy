@@ -847,6 +847,17 @@ impl VectorIndexReader {
         }
     }
 
+    /// The minimum cost of reading `rows` distinct document-ordered vectors, packed into as few
+    /// storage blocks as possible, or their bytes without block geometry.
+    pub(crate) fn exact_rows_cost_lower_bound(&self, rows: usize) -> ReadCost {
+        let bytes = rows.saturating_mul(self.options.bytes_per_vector());
+        ReadCost(
+            self.full_precision_blocks()
+                .storage_block_len()
+                .map_or(bytes, |block_len| bytes.div_ceil(block_len)),
+        )
+    }
+
     /// The cost of [`Self::read_exact_docs`] for ascending `docs`: the distinct storage blocks of
     /// `ExactRows` they touch, or their bytes without block geometry.
     pub(crate) fn exact_docs_cost(

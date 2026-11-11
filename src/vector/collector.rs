@@ -469,12 +469,23 @@ where
             .iter()
             .any(|s| s.ordinal == segment_ord)
         {
+            let mut totals = preparation.clone();
+            let routing = self.inputs.routing_stats.get(&segment_ord);
+            let report = match self.inputs.unplanned.get(&segment_ord) {
+                Some(plan) => {
+                    if let Some(stats) = routing {
+                        totals.append(&stats.totals);
+                    }
+                    SegmentReport::Unplanned {
+                        plan: *plan,
+                        routing: routing.map(|s| s.metrics),
+                    }
+                }
+                None => SegmentReport::Empty { located_cap: *cap },
+            };
             return Ok(SegmentVectorFruit {
                 results: Vec::new(),
-                stats: ProbeStats::new(
-                    SegmentReport::Empty { located_cap: *cap },
-                    preparation.clone(),
-                ),
+                stats: ProbeStats::new(report, totals),
             });
         }
         let (searched, mut totals) = measure(|| self.search_segment(segment_ord, reader));
@@ -904,12 +915,23 @@ where
                     Ok((None, Some((hits, report))))
                 }
                 Some(input) => Ok((Some(input.clone()), None)),
+                // Routing time is already in this segment's totals.
                 None => Ok((
                     None,
                     Some((
                         Vec::new(),
-                        SegmentReport::Empty {
-                            located_cap: collector.inputs.prepared.scope[&segment.ordinal].1,
+                        match collector.inputs.unplanned.get(&segment.ordinal) {
+                            Some(plan) => SegmentReport::Unplanned {
+                                plan: *plan,
+                                routing: collector
+                                    .inputs
+                                    .routing_stats
+                                    .get(&segment.ordinal)
+                                    .map(|s| s.metrics),
+                            },
+                            None => SegmentReport::Empty {
+                                located_cap: collector.inputs.prepared.scope[&segment.ordinal].1,
+                            },
                         },
                     )),
                 )),
@@ -2284,6 +2306,94 @@ mod ivf_e2e_tests {
         let exact = fixture.oracle(&filter, &query, 768)?;
         assert_eq!(fruit.results.len(), 5);
         assert!(fruit.results.iter().all(|hit| exact.contains(hit)));
+        Ok(())
+    }
+
+    /// A routed segment the global ranking gives no cluster still reports its size, its router's
+    /// metrics and its share of the ranking time, on the shared and the local scan paths.
+    #[test]
+    fn unplanned_routed_segments_report_their_routing() -> Result<()> {
+        let fixture = FixtureSpec::clustered(Metric::L2, 32, 8, 384)
+            .segments(3)
+            .label("matches", |_| true)
+            .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let readers: Vec<_> = searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
+            .collect();
+        let query = vec![0.0f32; 32];
+        let params = ProbeParams {
+            max_probe: 1,
+            located: LocatedPath::Off,
+            ..Default::default()
+        };
+        let builder = || {
+            TopDocs::with_limit(5)
+                .order_by_similarity(fixture.field, query.clone())
+                .with_probe_params(params.clone())
+        };
+        let filter = fixture.filter("matches");
+        let weight = fixture.weight(&filter)?;
+        for shared in [true, false] {
+            let router = TopClustersBySimilarityCollector::new(
+                fixture.field,
+                query.clone(),
+                params.clone(),
+                1.0,
+            )?;
+            let candidates = router.collect_segments(&readers, |_| {})?;
+            let statistics = router.take_statistics();
+            let budget = VectorSearchBudget::for_segments(fixture.field, &params, &readers)?;
+            let prepared = builder().prepare(weight.as_ref(), &readers, budget, |_| {})?;
+            let work: Option<Arc<dyn crate::vector::SharedVectorWork>> = if shared {
+                Some(Arc::new(crate::vector::AtomicVectorWork::default()))
+            } else {
+                None
+            };
+            let collector = builder().build(
+                prepared
+                    .with_candidates(candidates.clone(), work)?
+                    .with_routing_statistics(statistics.clone()),
+            );
+            let fruit = collector.merge_fruits(collector.collect_segments(
+                weight.as_ref(),
+                &readers,
+                |_| {},
+            )?)?;
+            let mut unplanned = 0;
+            for (segment, stats) in readers.iter().zip(&fruit.stats) {
+                let clusters = segment
+                    .reader
+                    .vector_index(fixture.field)?
+                    .index()
+                    .unwrap()
+                    .num_clusters();
+                assert_eq!(stats.segment_clusters, Some(clusters), "shared={shared}");
+                assert!(stats.routing.is_some(), "shared={shared}");
+                if candidates.iter().any(|c| c.node.0 == segment.ordinal) {
+                    continue;
+                }
+                unplanned += 1;
+                let routing = statistics
+                    .iter()
+                    .find(|s| s.segment_ordinal == segment.ordinal)
+                    .unwrap();
+                assert_eq!(stats.planned_clusters, 0);
+                assert_eq!(stats.postings_row + stats.postings_skipped, 0);
+                assert_eq!(
+                    serde_json::to_value(stats.routing).unwrap(),
+                    serde_json::to_value(Some(routing.metrics)).unwrap()
+                );
+                assert_eq!(
+                    stats.routing_ns,
+                    routing.totals.time_ns(crate::vector::VectorStage::Routing)
+                );
+            }
+            assert!(unplanned > 0, "shared={shared}");
+        }
         Ok(())
     }
 

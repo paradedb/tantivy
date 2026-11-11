@@ -363,6 +363,12 @@ pub(crate) enum SegmentReport {
     Flat { rows_read: usize },
     /// Nothing could match; the located cap still reports.
     Empty { located_cap: usize },
+    /// A routed IVF segment the global ranking gave no cluster: nothing was probed, but its plan
+    /// and its router's work still report.
+    Unplanned {
+        plan: PlanReport,
+        routing: Option<RouterMetrics>,
+    },
     /// An IVF segment search: its plan, cluster source and scan. The scan's report is boxed, so
     /// the enum stays close to the size of its other variants.
     Ivf {
@@ -389,6 +395,19 @@ impl ProbeStats {
                 located_cap,
                 ..Self::default()
             },
+            SegmentReport::Unplanned { plan, routing } => {
+                let mut stats = Self {
+                    segment_rows: Some(plan.segment_rows),
+                    segment_clusters: Some(plan.segment_clusters),
+                    planned_clusters: plan.planned_clusters,
+                    located_cap: plan.located_cap,
+                    ..Self::default()
+                };
+                if let Some(routing) = routing {
+                    stats.record_routing(routing);
+                }
+                stats
+            }
             SegmentReport::Ivf { plan, source, scan } => Self::ivf(plan, source, *scan, &totals),
         };
         // Every segment search reports its result assembly, an empty one included.
@@ -464,6 +483,13 @@ impl ProbeStats {
         self.pruned_dead = counters.pruned_dead;
         self.postings_row = counters.postings_row;
         self.postings_skipped = counters.postings_skipped;
+        self.record_routing(routing);
+        self.termination = probe.termination;
+        self.work_charged = probe.work_charged;
+        self.work_budget = probe.work_budget;
+    }
+
+    fn record_routing(&mut self, routing: RouterMetrics) {
         self.routing = Some(routing);
         self.routing_visited_count = match routing {
             RouterMetrics::Stacked {
@@ -474,9 +500,6 @@ impl ProbeStats {
                 candidate_count, ..
             } => candidate_count,
         };
-        self.termination = probe.termination;
-        self.work_charged = probe.work_charged;
-        self.work_budget = probe.work_budget;
     }
 
     fn record_matches(&mut self, report: MatchReport) {
@@ -709,6 +732,38 @@ mod tests {
         );
         assert_eq!(keys(&empty), expected(&[], 0));
         assert_eq!(serde_json::to_value(&empty).unwrap()["planned_clusters"], 0);
+        let unplanned = ProbeStats::new(
+            SegmentReport::Unplanned {
+                plan: PlanReport {
+                    planned_clusters: 0,
+                    ..plan
+                },
+                routing: Some(RouterMetrics::Exact { visited_count: 5 }),
+            },
+            StageTotals::default(),
+        );
+        assert_eq!(
+            keys(&unplanned),
+            expected(
+                &[
+                    "segment_rows",
+                    "segment_clusters",
+                    "routing_kind",
+                    "routing_mode",
+                    "routing_exact_scored",
+                    "routing_candidate_count",
+                ],
+                0
+            )
+        );
+        let json = serde_json::to_value(&unplanned).unwrap();
+        assert_eq!(
+            (&json["segment_clusters"], &json["planned_clusters"]),
+            (&serde_json::json!(5), &serde_json::json!(0))
+        );
+        assert_eq!(json["routing_mode"], "flat");
+        assert_eq!(json["access_path"], "Routed");
+        assert_eq!(unplanned.routing_visited_count, 5);
     }
 
     #[test]
