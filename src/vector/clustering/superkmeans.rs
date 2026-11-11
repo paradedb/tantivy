@@ -3,7 +3,9 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use superkmeans::{Dataset, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, Matrix};
+use superkmeans::{
+    Dataset, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, Matrix, SoarAssigner,
+};
 
 use crate::schema::VectorOptions;
 use crate::vector::clustering::{
@@ -193,6 +195,22 @@ impl SuperKMeansClusterer {
     }
 }
 
+/// The SOAR assignment's batch rows and Gram budget for `budget_rows` rows of `row_bytes` and
+/// `centroids` centroids. The Gram budget is a quarter of the memory budget; a Gram matrix that
+/// fits it (and has a second centroid to pick) is held, and the batches give up its bytes.
+fn soar_budget(budget_rows: usize, row_bytes: usize, centroids: usize) -> (usize, usize) {
+    let gram_budget = budget_rows.saturating_mul(row_bytes) / 4;
+    let gram_bytes = centroids
+        .checked_mul(centroids)
+        .and_then(|cells| cells.checked_mul(std::mem::size_of::<f32>()))
+        .filter(|&bytes| bytes <= gram_budget && centroids >= 2)
+        .unwrap_or(0);
+    let batch_rows = budget_rows
+        .saturating_sub(gram_bytes.div_ceil(row_bytes.max(1)))
+        .max(1);
+    (batch_rows, gram_budget)
+}
+
 /// The end of the fine-step group of meso clusters starting at `start`, given the partition's
 /// `offsets`. Clusters join while the group plus the fine step's working copy of its largest
 /// cluster stays within `capacity` rows; a group always holds at least one cluster.
@@ -337,8 +355,12 @@ impl IvfClusterer for SuperKMeansClusterer {
         Ok(assignments)
     }
 
-    /// The nearest centroid and the SOAR secondary over every centroid, from two passes per
-    /// batch; `None` with a single centroid.
+    /// The nearest centroid and the SOAR secondary over every centroid, from one assigner
+    /// prepared for the whole source; `None` with a single centroid.
+    ///
+    /// The assigner holds the centroid Gram matrix when it fits a quarter of the memory budget,
+    /// and each secondary then comes from the nearest-centroid pass's dot products alone. The
+    /// batches shrink by the Gram's size so rows plus Gram stay within the budget.
     fn assign_pairs(
         &self,
         options: &VectorOptions,
@@ -347,26 +369,27 @@ impl IvfClusterer for SuperKMeansClusterer {
         lambda: f32,
     ) -> crate::Result<Vec<(u32, Option<u32>)>> {
         let mut pairs = Vec::with_capacity(source.num_rows());
-        let kmeans = self.assigner(options.dim(), options.metric().clusters_by_angle());
         let IvfCentroids::F32(centroids) = centroids;
-        for_each_batch(
-            source,
+        let (batch_rows, gram_budget) = soar_budget(
             self.budget_rows(options),
-            |IvfTrainingVectors::F32(batch)| {
-                let (primary, secondary) = kmeans.assign_soar(
-                    &batch.matrix.values,
-                    centroids.values.as_slice(),
-                    batch.matrix.rows,
-                    lambda,
-                );
-                pairs.extend(
-                    primary
-                        .into_iter()
-                        .zip(secondary)
-                        .map(|(first, second)| (first, (second != u32::MAX).then_some(second))),
-                );
-            },
-        )?;
+            options.bytes_per_vector(),
+            centroids.rows,
+        );
+        let soar = SoarAssigner::new(
+            Matrix::new(&centroids.values, centroids.rows, centroids.dims),
+            lambda,
+            2,
+            gram_budget,
+        );
+        for_each_batch(source, batch_rows, |IvfTrainingVectors::F32(batch)| {
+            let (primary, secondary) = soar.assign(&batch.matrix.values, batch.matrix.rows);
+            pairs.extend(
+                primary
+                    .into_iter()
+                    .zip(secondary)
+                    .map(|(first, second)| (first, (second != u32::MAX).then_some(second))),
+            );
+        })?;
         Ok(pairs)
     }
 }
@@ -582,6 +605,46 @@ mod tests {
         assert!(pairs
             .iter()
             .all(|&(primary, second)| primary == 0 && second.is_none()));
+    }
+
+    /// A Gram matrix inside a quarter of the budget is held and the batches give up its bytes; a
+    /// larger one is not held and the batches keep the whole budget.
+    #[test]
+    fn soar_batches_leave_room_for_the_gram_matrix() {
+        let (n, dim) = (5_000, 16);
+        let options = VectorOptions::new(dim, Metric::L2);
+        let row_bytes = options.bytes_per_vector();
+        let centroids = train(
+            &SuperKMeansClusterer::new().with_target_leaf_size(100),
+            &mut VecSource::new(blobs(n, dim), dim),
+        );
+        let k = centroids.rows;
+        let gram_rows = (k * k * 4).div_ceil(row_bytes);
+        let trained = IvfCentroids::F32(centroids);
+
+        // Room for the Gram: a quarter of 8 x gram_rows rows is twice its size.
+        let budget_rows = 8 * gram_rows;
+        let mut source = VecSource::new(blobs(n, dim), dim);
+        let pairs = SuperKMeansClusterer::new()
+            .with_memory_limit(budget_rows * row_bytes)
+            .assign_pairs(&options, &mut source, &trained, 2.0)
+            .unwrap();
+        assert_eq!(pairs.len(), n);
+        let batch = budget_rows - gram_rows;
+        assert_eq!(source.ranges[0], 0..batch, "{k} centroids");
+        assert!(source.ranges.iter().all(|range| range.len() <= batch));
+
+        // No room: the batches take every row of the budget.
+        let budget_rows = 2 * gram_rows;
+        let mut source = VecSource::new(blobs(n, dim), dim);
+        let unheld = SuperKMeansClusterer::new()
+            .with_memory_limit(budget_rows * row_bytes)
+            .assign_pairs(&options, &mut source, &trained, 2.0)
+            .unwrap();
+        assert_eq!(source.ranges[0], 0..budget_rows);
+        let primaries =
+            |pairs: &[(u32, Option<u32>)]| pairs.iter().map(|p| p.0).collect::<Vec<_>>();
+        assert_eq!(primaries(&unheld), primaries(&pairs));
     }
 
     #[test]
