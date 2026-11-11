@@ -26,6 +26,10 @@ impl LayerCosts {
         self.sparse
             .map_or(self.band, |sparse| sparse.min(self.band))
     }
+
+    fn exact_bar(&self) -> ReadCost {
+        self.cheapest() + self.centroid
+    }
 }
 
 /// Every way to read a cluster's selected rows, priced from storage geometry.
@@ -84,10 +88,7 @@ impl PlanOverride {
 /// band in one request.
 pub(crate) fn plan(costs: &ReadCosts) -> Read {
     let layer = &costs.layer;
-    if costs
-        .exact
-        .is_some_and(|exact| exact < layer.cheapest() + layer.centroid)
-    {
+    if costs.exact.is_some_and(|exact| exact < layer.exact_bar()) {
         return Read::Exact;
     }
     match costs.layer.sparse {
@@ -131,13 +132,17 @@ pub(crate) fn price(
         (Some(reader), None) => reader.centroid_cost(selected.cluster)?,
         _ => ReadCost(0),
     };
-    let band = spec.reader.band_cost(selected.cluster)?;
+    let mut layer = LayerCosts {
+        sparse: None,
+        band: spec.reader.band_cost(selected.cluster)?,
+        centroid,
+    };
     // Quantized storage reads exact rows by document, so their price is the document-ordered rows
     // those documents touch, bounded from above when the documents are not in hand.
     let exact = match exact {
         None => None,
         Some(reader) if reader.has_exact_rows() => {
-            if reader.exact_rows_cost_lower_bound(selected.len()) >= band + centroid {
+            if reader.exact_rows_cost_lower_bound(selected.len()) >= layer.exact_bar() {
                 None
             } else {
                 Some(match selected.docs {
@@ -148,18 +153,11 @@ pub(crate) fn price(
         }
         Some(reader) => Some(reader.exact_cost(selected.cluster, selected.offsets)?),
     };
-    let sparse = selected
+    layer.sparse = selected
         .offsets
         .map(|offsets| spec.reader.sparse_cost(selected.cluster, offsets, scratch))
         .transpose()?;
-    Ok(ReadCosts {
-        exact,
-        layer: LayerCosts {
-            sparse,
-            band,
-            centroid,
-        },
-    })
+    Ok(ReadCosts { exact, layer })
 }
 
 #[cfg(test)]
