@@ -62,14 +62,19 @@ impl VectorOptions {
         self.dim * self.dtype.size_bytes()
     }
 
-    /// Whether this field's `(metric, dtype)` requires write-time
-    /// unit-normalization (see `vector::distance::maybe_normalize_bytes`).
-    /// Currently only `Cosine + F32`.
+    /// Whether this field's rows are stored at unit L2 norm, normalized when they are added
+    /// (see `vector::distance::maybe_normalize_bytes`).
     pub fn needs_normalization(&self) -> bool {
-        matches!(
-            (self.metric, self.dtype),
-            (Metric::Cosine, VectorDType::F32)
-        )
+        Self::normalizes(self.dtype, self.metric)
+    }
+
+    /// Whether vectors of `dtype` under `metric` are stored and scored at unit L2 norm. Every
+    /// `(dtype, metric)` pair is listed, so a new variant must decide here.
+    pub(crate) fn normalizes(dtype: VectorDType, metric: Metric) -> bool {
+        match (dtype, metric) {
+            (VectorDType::F32, Metric::Cosine) => true,
+            (VectorDType::F32, Metric::L2 | Metric::Dot) => false,
+        }
     }
 }
 

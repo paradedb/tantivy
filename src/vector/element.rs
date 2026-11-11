@@ -87,25 +87,6 @@ impl Accumulator for f64 {
     }
 }
 
-/// Why a row's elements cannot be stored, whatever the metric.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InvalidRow {
-    /// An element is NaN or infinite. With wide accumulation the squared norm is non-finite if and
-    /// only if an element is.
-    NonFinite,
-}
-
-/// The element policy every element type applies to its row's wide squared norm: a non-finite
-/// norm means a NaN or infinite element.
-#[inline]
-pub(crate) fn check_norm_squared(norm_squared: f64) -> Result<f64, InvalidRow> {
-    if norm_squared.is_finite() {
-        Ok(norm_squared)
-    } else {
-        Err(InvalidRow::NonFinite)
-    }
-}
-
 /// A vector element type with the primitives the storage layer and the distance kernels need;
 /// sealed, one per [`VectorDType`].
 ///
@@ -146,11 +127,6 @@ pub trait VectorElement: sealed::Sealed + Copy + Send + Sync + 'static {
     /// Narrowing from `f32`; used at normalization write-back where
     /// values are already `<= 1`.
     fn from_f32(v: f32) -> Self;
-
-    /// The squared norm of a little-endian row in [`Self::Acc`]'s range, or why its elements
-    /// cannot be stored. Every element type states its policy; none is inherited. Limits that
-    /// depend on the metric are applied by the caller.
-    fn checked_norm_squared(row: &[u8]) -> Result<f64, InvalidRow>;
 }
 
 impl VectorElement for f32 {
@@ -193,10 +169,5 @@ impl VectorElement for f32 {
     #[inline(always)]
     fn from_f32(v: f32) -> Self {
         v
-    }
-
-    #[inline]
-    fn checked_norm_squared(row: &[u8]) -> Result<f64, InvalidRow> {
-        check_norm_squared(crate::vector::distance::norm_squared_bytes_wide::<f32>(row))
     }
 }

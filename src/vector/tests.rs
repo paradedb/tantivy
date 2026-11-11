@@ -697,11 +697,11 @@ fn ingest_rejects_non_finite_vector_for_every_metric() -> crate::Result<()> {
 }
 
 /// Metrics that store the row as given (L2, dot product) reject a row whose squared norm exceeds
-/// [`MAX_ROW_NORM_SQUARED`] with its own error and accept one just below it. Cosine normalizes, so
+/// [`MAX_NORM_SQUARED`] with its own error and accept one just below it. Cosine normalizes, so
 /// it accepts any finite row.
 #[test]
 fn ingest_bounds_the_squared_norm_of_rows_stored_as_given() -> crate::Result<()> {
-    use crate::vector::MAX_ROW_NORM_SQUARED;
+    use crate::vector::distance::MAX_NORM_SQUARED;
 
     const DIM: usize = 1024;
     let single_doc_index =
@@ -720,8 +720,8 @@ fn ingest_bounds_the_squared_norm_of_rows_stored_as_given() -> crate::Result<()>
             Ok((index, result))
         };
 
-    let just_under = ((MAX_ROW_NORM_SQUARED / DIM as f64).sqrt() * 0.999) as f32;
-    let just_over = ((MAX_ROW_NORM_SQUARED / DIM as f64).sqrt() * 1.001) as f32;
+    let just_under = ((MAX_NORM_SQUARED / DIM as f64).sqrt() * 0.999) as f32;
+    let just_over = ((MAX_NORM_SQUARED / DIM as f64).sqrt() * 1.001) as f32;
     for metric in [Metric::L2, Metric::Dot] {
         for value in [1.0e20_f32, just_over] {
             let (_, result) = single_doc_index(metric, &[value; DIM])?;
