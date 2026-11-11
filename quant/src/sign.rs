@@ -85,12 +85,19 @@ fn tail_is_zero(words: &[u64], d: usize) -> bool {
 pub fn pack(y: &[f32], out: &mut [u64]) {
     assert!(!y.is_empty());
     assert_eq!(out.len(), packed_words(y.len()));
-    // One whole word per 64-coordinate chunk, built without a data-dependent branch.
+    // One 0/1 flag byte per coordinate, compared in vector lanes; a multiply then moves eight
+    // flags to the eight bits of one code byte.
     for (word, chunk) in out.iter_mut().zip(y.chunks(64)) {
-        *word = chunk
-            .iter()
-            .enumerate()
-            .fold(0, |word, (j, &value)| word | (u64::from(value > 0.0) << j));
+        let mut flags = [0_u8; 64];
+        for (flag, &value) in flags.iter_mut().zip(chunk) {
+            *flag = u8::from(value > 0.0);
+        }
+        let mut packed = [0_u8; 8];
+        for (byte, group) in packed.iter_mut().zip(flags.chunks_exact(8)) {
+            let group = u64::from_le_bytes(group.try_into().unwrap());
+            *byte = (group.wrapping_mul(0x0102_0408_1020_4080) >> 56) as u8;
+        }
+        *word = u64::from_le_bytes(packed);
     }
     debug_assert!(tail_is_zero(out, y.len()));
 }
@@ -1112,6 +1119,29 @@ mod tests {
             assert!(tail_is_zero(&codes, dim));
             assert_eq!(encode_unbiased(&vec![0.0; dim], 0.0, &mut codes), 0.0);
             assert!(codes.iter().all(|&word| word == 0));
+        }
+    }
+
+    /// `pack` sets bit `j % 64` of word `j / 64` exactly when coordinate `j` is above zero, so
+    /// zeros of either sign and NaN pack as zero bits, and the tail stays zero.
+    #[test]
+    fn pack_matches_per_bit_reference() {
+        let values = [1.5_f32, -2.0, 0.0, -0.0, f32::NAN];
+        for d in [1, 63, 64, 65, 127, 1000, 1024] {
+            for offset in 0..values.len() {
+                let y: Vec<f32> = (0..d)
+                    .map(|j| values[(j * 7 + offset + j / 5) % values.len()])
+                    .collect();
+                let mut expected = vec![0_u64; packed_words(d)];
+                for (j, &value) in y.iter().enumerate() {
+                    if value > 0.0 {
+                        expected[j / 64] |= 1 << (j % 64);
+                    }
+                }
+                let mut packed = vec![u64::MAX; packed_words(d)];
+                pack(&y, &mut packed);
+                assert_eq!(packed, expected, "d={d} offset={offset}");
+            }
         }
     }
 
