@@ -8,7 +8,7 @@ use crate::schema::{Field, Schema};
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::global::GlobalRanking;
 use crate::vector::router::{RouterMetrics, RoutingParams};
-use crate::vector::search::prepared::VectorQuery;
+use crate::vector::search::prepared::{invalid_query, VectorQuery};
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::{measure, StageTotals};
 use crate::vector::{ClusterRef, ProbeParams, VectorElement, VectorSearchBudget, VectorSegment};
@@ -168,7 +168,8 @@ impl<T: VectorElement> TopClustersBySimilarityCollector<T> {
         let query = VectorQuery::new(
             segments[0].vectors.options().metric(),
             Arc::clone(&self.query),
-        );
+        )
+        .map_err(invalid_query)?;
         let routers = segments
             .iter()
             .map(|s| s.vectors.index().map(|i| i.opened_router()))

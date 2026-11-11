@@ -519,7 +519,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
     }
     let query = input_vector(42);
     let exact_query =
-        crate::vector::search::prepared::VectorQuery::new(metric, Arc::new(query.clone()));
+        crate::vector::search::prepared::VectorQuery::new(metric, Arc::new(query.clone())).unwrap();
     let prepared = QuantizedQueryCtx::new(Arc::clone(ctx), &exact_query);
     for clusters in [vec![0, 1, 2, 3], vec![0, 1, 3]] {
         for filtered in [false, true] {

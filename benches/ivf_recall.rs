@@ -252,7 +252,7 @@ fn evaluate(
         .into_par_iter()
         .map(|q| {
             let query = &queries[q * d..(q + 1) * d];
-            let (hits, stats) = index.search(query, TOP_K, Metric::L2);
+            let (hits, stats) = index.search(query, TOP_K, Metric::L2).unwrap();
             let found = hits
                 .iter()
                 .filter(|h| truth[q].contains(&inv[usize::from(h.node)]))

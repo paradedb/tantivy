@@ -813,7 +813,7 @@ pub(crate) mod ground_truth {
         query: &[f32],
         top_k: usize,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
-        let query = VectorQuery::<f32>::new(metric, Arc::new(query.to_vec()));
+        let query = VectorQuery::<f32>::new(metric, Arc::new(query.to_vec())).unwrap();
         let searcher = index.reader()?.searcher();
         let mut scored = Vec::new();
         for (seg_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
@@ -1341,11 +1341,12 @@ mod centroid_storage_tests {
             let query = [c[0] + 0.3, 0.2];
             let owned: Vec<_> = stacked
                 .search(&query, 2, Metric::L2)
+                .unwrap()
                 .0
                 .into_iter()
                 .take(2)
                 .collect();
-            let prepared = VectorQuery::new(Metric::L2, Arc::new(query.to_vec()));
+            let prepared = VectorQuery::new(Metric::L2, Arc::new(query.to_vec())).unwrap();
             let lazy: Vec<_> = ivf
                 .opened_router()
                 .rank(&prepared, RoutingParams::default())

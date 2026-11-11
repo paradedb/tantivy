@@ -435,7 +435,8 @@ mod tests {
                         .map(|coordinate| ((coordinate as f32 + 0.25) * 0.173).sin())
                         .collect(),
                 ),
-            ),
+            )
+            .unwrap(),
         );
         let centroid: Vec<f32> = (0..DIM)
             .map(|coordinate| ((coordinate as f32 + 0.5) * 0.071).cos() * 0.1)

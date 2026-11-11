@@ -210,7 +210,7 @@ mod tests {
                 root_header..root_header + 4,
             ]
         );
-        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.15; dim]));
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.15; dim])).unwrap();
         let mut actual = ScoreBuffer::default();
         let mut expected = ScoreBuffer::default();
         reads.lock().unwrap().clear();
@@ -282,7 +282,7 @@ mod tests {
             raw,
             &options,
         )?;
-        let query = VectorQuery::new(Metric::Cosine, Arc::new(vec![0.15; dim]));
+        let query = VectorQuery::new(Metric::Cosine, Arc::new(vec![0.15; dim])).unwrap();
         let params = RoutingParams {
             k: 3,
             min_beam_fraction: 1.0,
@@ -345,7 +345,7 @@ mod tests {
                 reads.lock().unwrap().is_empty(),
                 "opening must not fetch raw rows"
             );
-            let query = VectorQuery::new(metric, Arc::new(vec![0.15; dim]));
+            let query = VectorQuery::new(metric, Arc::new(vec![0.15; dim])).unwrap();
             for (factor, retained) in [
                 (-1.0, 3),
                 (0.0, 3),
@@ -483,7 +483,7 @@ mod tests {
     #[test]
     fn exact_rerank_ignores_estimates_and_never_adds_excluded_members() {
         let raw = InMemoryStore::new(vec![20.0, 1.0, 0.0, 3.0], 1);
-        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.0]));
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.0])).unwrap();
         let candidates = vec![
             Candidate {
                 node: ClusterId(0),
@@ -567,7 +567,7 @@ mod tests {
             encoded_codes(&opened.level.centroids),
             encoded_codes(&opened.level.parent.as_ref().unwrap().vectors)
         ));
-        let query = VectorQuery::new(Metric::L2, Arc::new(vec![2.1; dim]));
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![2.1; dim])).unwrap();
         let ranking = opened.rank(
             &query,
             RoutingParams {
@@ -665,7 +665,7 @@ mod tests {
             FileSlice::from(Vec::<u8>::new()),
             &options,
         )?;
-        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.0; 64]));
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.0; 64])).unwrap();
         assert_eq!(opened.rank(&query, RoutingParams::default()).count(), 0);
         assert_eq!(
             built
@@ -735,7 +735,10 @@ mod tests {
             dims: dim,
         });
         let queries: Vec<_> = (0..queries)
-            .map(|_| VectorQuery::new(Metric::L2, Arc::new((0..dim).map(|_| random()).collect())))
+            .map(|_| {
+                VectorQuery::new(Metric::L2, Arc::new((0..dim).map(|_| random()).collect()))
+                    .unwrap()
+            })
             .collect();
         let options = VectorOptions::new(dim, Metric::L2);
         let index = super::super::stacked::build(&options, &mut rows)?;
@@ -848,7 +851,8 @@ mod tests {
         let query = VectorQuery::new(
             Metric::Cosine,
             Arc::new((0..dim).map(|i| (i as f32 * 0.19).cos()).collect()),
-        );
+        )
+        .unwrap();
         for quantized in [false, true] {
             let start = Instant::now();
             for _ in 0..repeats {

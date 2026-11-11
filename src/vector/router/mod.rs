@@ -298,7 +298,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         };
         let opened = RouterKind::open(FileSlice::from(bytes), FileSlice::from(rows), &options)?;
-        let query = VectorQuery::new(Metric::L2, Arc::new(vec![1.1]));
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![1.1])).unwrap();
         let mut ranking = opened.rank(&query, RoutingParams::default());
         assert_eq!(ranking.next().unwrap().node, 1);
         assert!(matches!(
@@ -362,7 +362,7 @@ mod tests {
             k: 8,
             ..Default::default()
         };
-        let query = VectorQuery::new(Metric::L2, Arc::new(query));
+        let query = VectorQuery::new(Metric::L2, Arc::new(query)).unwrap();
         let ranking = opened.rank(&query, params);
         let (candidates, lists, scored) = stacked_metrics(ranking.metrics());
         assert!(candidates >= 1 && candidates <= 8, "{candidates}");

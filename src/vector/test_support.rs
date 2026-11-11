@@ -740,7 +740,7 @@ impl Fixture {
         let backend = SegmentSearcher::<f32>::for_segment(
             prepared.clone(),
             self.field,
-            Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec()))),
+            Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec())).unwrap()),
             None,
             params,
         )?
@@ -804,7 +804,7 @@ impl Fixture {
                 ProbeStats::new(SegmentReport::Empty { located_cap: *cap }, totals.clone()),
             ));
         };
-        let query = Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec())));
+        let query = Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec())).unwrap());
         let quantized = segment_reader
             .vector_index(self.field)?
             .quantization()?

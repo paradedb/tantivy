@@ -18,7 +18,7 @@ use crate::vector::quantization::{
     refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError, QUANTIZED_BOUNDARY_KAPPA,
 };
 use crate::vector::search::interval::{Estimate, Threshold};
-use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
+use crate::vector::search::prepared::{invalid_query, QuantizedQueryCtx, VectorQuery};
 use crate::vector::storage::metadata::QuantizationSchedule;
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::BlockAddress;
@@ -408,7 +408,8 @@ impl VectorIndexReader {
         let exact_queries: Vec<VectorQuery<f32>> = queries
             .iter()
             .map(|query| VectorQuery::new(self.options.metric(), Arc::new(query.values.clone())))
-            .collect();
+            .collect::<Result<_, _>>()
+            .map_err(invalid_query)?;
         let prepared_queries: Vec<QuantizedQueryCtx> = exact_queries
             .iter()
             .map(|query| QuantizedQueryCtx::new(Arc::clone(&measurement_ctx), query))
@@ -734,7 +735,8 @@ impl VectorIndexReader {
                 .collect(),
         };
         for query_input in queries {
-            let exact_query = VectorQuery::<f32>::new(metric, Arc::new(query_input.values.clone()));
+            let exact_query = VectorQuery::<f32>::new(metric, Arc::new(query_input.values.clone()))
+                .map_err(invalid_query)?;
             let query = QuantizedQueryCtx::new(Arc::clone(&measurement_ctx), &exact_query);
             let mut cluster_scores = Vec::with_capacity(index.num_clusters());
             let mut cluster_query_norms = Vec::with_capacity(index.num_clusters());
@@ -969,7 +971,7 @@ mod tests {
                 vec![crate::vector::quantization::VectorQuantizationLayer { bits: 1, seed: 7 }],
             )
             .unwrap();
-            let vector_query = VectorQuery::new(metric, Arc::new(source_query.clone()));
+            let vector_query = VectorQuery::new(metric, Arc::new(source_query.clone())).unwrap();
             let query = QuantizedQueryCtx::new(
                 Arc::new(QuantizedIndexCtx::from_config(config).unwrap()),
                 &vector_query,

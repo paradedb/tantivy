@@ -172,7 +172,7 @@ mod tests {
                     let ranked = GlobalRanking::from(
                         &routers,
                         &partitions,
-                        &VectorQuery::new(Metric::L2, Arc::new(query.to_vec())),
+                        &VectorQuery::new(Metric::L2, Arc::new(query.to_vec())).unwrap(),
                         RoutingParams {
                             k: 1,
                             ..Default::default()
@@ -184,7 +184,7 @@ mod tests {
                     let full = GlobalRanking::from(
                         &routers,
                         &partitions,
-                        &VectorQuery::new(Metric::L2, Arc::new(query.to_vec())),
+                        &VectorQuery::new(Metric::L2, Arc::new(query.to_vec())).unwrap(),
                         RoutingParams::default(),
                         &mut totals,
                         &mut |_| {},
@@ -192,7 +192,7 @@ mod tests {
                     let plain = GlobalRanking::from(
                         &routers,
                         &[],
-                        &VectorQuery::new(Metric::L2, Arc::new(query.to_vec())),
+                        &VectorQuery::new(Metric::L2, Arc::new(query.to_vec())).unwrap(),
                         RoutingParams::default(),
                         &mut totals,
                         &mut |_| {},
@@ -220,7 +220,7 @@ mod tests {
             FileSlice::from(0.25f32.to_le_bytes().to_vec()),
             &options,
         )?;
-        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.0_f32]));
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.0_f32])).unwrap();
         for (far_nested, near_nested) in
             [(false, false), (true, true), (true, false), (false, true)]
         {
@@ -272,7 +272,7 @@ mod tests {
                 unreachable!()
             };
             for query in [[0.0], [1.5], [200.0]] {
-                let prepared = VectorQuery::new(Metric::L2, Arc::new(query.to_vec()));
+                let prepared = VectorQuery::new(Metric::L2, Arc::new(query.to_vec())).unwrap();
                 for k in [0, 1, 2, 4, 16] {
                     let (segment, stats) = super::super::search::search(
                         &index.level,
@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn patience_follows_global_order_and_counts_work_per_segment() -> crate::Result<()> {
-        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.0_f32]));
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.0_f32])).unwrap();
         for far_base in [0.5, 100.0] {
             let far = open_line_router(far_base, 80, false)?;
             let near = open_line_router(0.0, 80, false)?;
@@ -496,7 +496,7 @@ mod tests {
         for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
             for nested in [false, true] {
                 let (router, _, _) = open_represented_router(metric, nested, Some(ROUTER_SEED))?;
-                let query = VectorQuery::new(metric, Arc::new(vec![0.3; 8]));
+                let query = VectorQuery::new(metric, Arc::new(vec![0.3; 8])).unwrap();
                 #[cfg(debug_assertions)]
                 quant::rotation::debug_reset_apply_count();
                 for k in [1, 3, usize::MAX] {
@@ -546,7 +546,7 @@ mod tests {
             let a = open_represented_router(metric, true, Some(ROUTER_SEED))?;
             let b = open_represented_router(metric, false, None)?;
             let c = open_represented_router(metric, false, Some(ROUTER_SEED + 1))?;
-            let query = VectorQuery::new(metric, Arc::new(vec![0.3; 8]));
+            let query = VectorQuery::new(metric, Arc::new(vec![0.3; 8])).unwrap();
             let mut centroids = IvfCentroids::F32(IvfMatrix {
                 values: vec![0.5; 8],
                 rows: 1,
@@ -637,7 +637,7 @@ mod tests {
         use super::super::source::ROUTER_SEED;
         let a = open_represented_router(Metric::L2, true, Some(ROUTER_SEED))?;
         let b = open_represented_router(Metric::L2, false, Some(ROUTER_SEED))?;
-        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.3; 8]));
+        let query = VectorQuery::new(Metric::L2, Arc::new(vec![0.3; 8])).unwrap();
         let mut totals = vec![StageTotals::default(); 2];
         let ranking = GlobalRanking::from(
             &[Some(&a.0), Some(&b.0)],
@@ -678,10 +678,12 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_global_queries_bypass_sign_scoring() -> crate::Result<()> {
+    fn non_finite_routing_norms_bypass_sign_scoring() -> crate::Result<()> {
         use super::super::source::ROUTER_SEED;
-        let (router, _, reads) = open_represented_router(Metric::L2, true, Some(ROUTER_SEED))?;
-        let query = VectorQuery::new(Metric::L2, Arc::new(vec![f32::NAN; 8]));
+        let (router, _, reads) = open_represented_router(Metric::Cosine, true, Some(ROUTER_SEED))?;
+        // Cosine admits any finite query; this one's squared norm overflows f32.
+        let query = VectorQuery::new(Metric::Cosine, Arc::new(vec![f32::MAX; 8])).unwrap();
+        assert!(!query.routing_norm().is_finite());
         let mut totals = vec![StageTotals::default()];
         let ranking = GlobalRanking::from(
             &[Some(&router)],

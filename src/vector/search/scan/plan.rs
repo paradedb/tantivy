@@ -364,7 +364,7 @@ mod tests {
             let field = reader.quantization()?.unwrap();
             let query = QuantizedQueryCtx::new(
                 Arc::clone(field.index_ctx()),
-                &VectorQuery::new(Metric::L2, Arc::new(vec![0.0f32; 1024])),
+                &VectorQuery::new(Metric::L2, Arc::new(vec![0.0f32; 1024])).unwrap(),
             );
             assert_eq!(reader.exact_rows_cost_lower_bound(0), ReadCost(0));
             for (cluster, docs) in fixture.cluster_docs(0)?.iter().enumerate() {

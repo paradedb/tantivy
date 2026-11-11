@@ -77,7 +77,12 @@ pub(crate) enum VectorNormPolicy {
 impl VectorNormPolicy {
     /// Resolves the normalization policy for vector options.
     pub(crate) fn for_options(options: &VectorOptions) -> Self {
-        if options.needs_normalization() {
+        Self::for_dtype_metric(options.dtype(), options.metric())
+    }
+
+    /// Resolves the normalization policy for vectors of `dtype` under `metric`.
+    pub(crate) fn for_dtype_metric(dtype: VectorDType, metric: Metric) -> Self {
+        if VectorOptions::normalizes(dtype, metric) {
             Self::UnitL2
         } else {
             Self::None

@@ -10,8 +10,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use quant::cascade::{prepare_split_query_with_plan, PreparedSplitQuery, QueryRotationPlan};
 
 use crate::schema::{Field, FieldType, Metric, Schema};
-use crate::vector::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide, Similarity};
-use crate::vector::quantization::SIGN_QUERY_BITS;
+use crate::vector::distance::{
+    admit, dot_bytes, l2_squared_bytes, norm_squared_wide, InvalidVector, Similarity,
+    MAX_NORM_SQUARED,
+};
+use crate::vector::quantization::{VectorNormPolicy, SIGN_QUERY_BITS};
 use crate::vector::storage::quantized::QuantizedIndexCtx;
 use crate::vector::telemetry::charge_fallbacks;
 use crate::vector::VectorElement;
@@ -44,6 +47,18 @@ enum QueryKind {
         inv_norm_q: f32,
         normalized: Vec<f32>,
     },
+}
+
+/// The search error for a query vector refused by [`VectorQuery::new`].
+pub(crate) fn invalid_query(invalid: InvalidVector) -> TantivyError {
+    TantivyError::InvalidArgument(match invalid {
+        InvalidVector::NonFinite => "invalid query vector: it has a non-finite element; vectors \
+                                     must contain only finite values"
+            .to_string(),
+        InvalidVector::NormTooLarge => format!(
+            "invalid query vector: its squared norm is above the limit of {MAX_NORM_SQUARED:e}"
+        ),
+    })
 }
 
 /// The query as one vector set scores it: the query plus that set's quantization, if any.
@@ -84,11 +99,14 @@ impl<T: VectorElement> VectorQuery<T> {
         Ok(())
     }
 
-    /// Prepares `raw` under `metric`.
-    pub(crate) fn new(metric: Metric, raw: Arc<Vec<T>>) -> Self {
-        // Wide accumulation keeps a huge but finite norm finite. Queries are user input, so the
-        // degenerate guard stays.
+    /// Prepares `raw` under `metric`, or refuses it under the rule rows are admitted by.
+    pub(crate) fn new(metric: Metric, raw: Arc<Vec<T>>) -> Result<Self, InvalidVector> {
+        // Wide accumulation keeps a huge but finite norm finite, so admission sees the true norm.
         let norm_squared = norm_squared_wide::<T>(&raw);
+        admit(
+            norm_squared,
+            VectorNormPolicy::for_dtype_metric(T::DTYPE, metric),
+        )?;
         let norm = norm_squared.sqrt();
         let widened: Arc<[f32]> = raw.iter().map(|element| element.to_f32()).collect();
         // Routing preserves the scalar kernels' narrowing before the square root.
@@ -97,12 +115,13 @@ impl<T: VectorElement> VectorQuery<T> {
             Metric::L2 => (QueryKind::L2, routing_norm),
             Metric::Dot => (QueryKind::Dot, routing_norm),
             Metric::Cosine => {
-                let inv_norm_q = if norm == 0.0 || !norm.is_finite() {
+                // A zero query is accepted and scores zero against every row.
+                let inv_norm_q = if norm == 0.0 {
                     0.0
                 } else {
                     (1.0 / norm) as f32
                 };
-                let normalized: Vec<_> = if norm == 0.0 || !norm.is_finite() {
+                let normalized: Vec<_> = if norm == 0.0 {
                     vec![0.0; widened.len()]
                 } else {
                     widened.iter().map(|value| value * inv_norm_q).collect()
@@ -117,7 +136,7 @@ impl<T: VectorElement> VectorQuery<T> {
                 )
             }
         };
-        Self {
+        Ok(Self {
             metric,
             widened,
             routing_norm,
@@ -125,7 +144,7 @@ impl<T: VectorElement> VectorQuery<T> {
             kind,
             raw,
             router_queries: Mutex::new(HashMap::new()),
-        }
+        })
     }
 
     /// Prepares the router's sign query once per rotation seed, across threads.
@@ -358,14 +377,37 @@ mod tests {
 
     use super::{QuantizedIndexCtx, QuantizedQueryCtx, VectorQuery};
     use crate::schema::{Metric, VectorOptions};
-    use crate::vector::distance::{norm_squared, norm_squared_wide};
+    use crate::vector::distance::{
+        norm_squared, norm_squared_wide, InvalidVector, MAX_NORM_SQUARED,
+    };
     use crate::vector::{VectorQuantizationConfig, VectorQuantizationLayer};
+
+    #[test]
+    fn queries_are_admitted_by_the_row_rule() {
+        let refused = |metric, values: Vec<f32>| VectorQuery::new(metric, Arc::new(values)).err();
+        let over = ((MAX_NORM_SQUARED / 4.0).sqrt() as f32).next_up();
+        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                assert_eq!(
+                    refused(metric, vec![1.0, bad, 0.0, 0.0]),
+                    Some(InvalidVector::NonFinite),
+                    "{metric:?} {bad}"
+                );
+            }
+            let expected = match metric {
+                Metric::L2 | Metric::Dot => Some(InvalidVector::NormTooLarge),
+                Metric::Cosine => None,
+            };
+            assert_eq!(refused(metric, vec![over; 4]), expected, "{metric:?}");
+            assert_eq!(refused(metric, vec![0.0; 4]), None, "{metric:?}");
+        }
+    }
 
     #[test]
     fn router_queries_are_lazy_and_shared_across_threads_by_seed() {
         use quant::cascade::{LayerKind, LayerSpec, QueryRotationPlan, Rotation};
 
-        let query = VectorQuery::new(Metric::Cosine, Arc::new(vec![3.0, 4.0, 0.0, 0.0]));
+        let query = VectorQuery::new(Metric::Cosine, Arc::new(vec![3.0, 4.0, 0.0, 0.0])).unwrap();
         let plans: Vec<_> = [17, 23]
             .into_iter()
             .map(|seed| {
@@ -447,7 +489,7 @@ mod tests {
                     .map(|value| value * (1.0 / norm) as f32)
                     .collect()
             };
-            let query = VectorQuery::new(Metric::Cosine, Arc::new(raw.clone()));
+            let query = VectorQuery::new(Metric::Cosine, Arc::new(raw.clone())).unwrap();
             assert_eq!(query.routing_norm(), norm_squared(&raw).sqrt());
             assert_eq!(query.estimate_vector(), expected);
 
@@ -479,7 +521,7 @@ mod tests {
         let first_index = Arc::new(QuantizedIndexCtx::from_config(config.clone()).unwrap());
         let query = QuantizedQueryCtx::new(
             Arc::clone(&first_index),
-            &VectorQuery::new(Metric::Dot, Arc::new(vec![0.5_f32; 100])),
+            &VectorQuery::new(Metric::Dot, Arc::new(vec![0.5_f32; 100])).unwrap(),
         );
         assert!(Arc::ptr_eq(&query.index.meta, &first_index.meta));
 
@@ -534,7 +576,7 @@ mod tests {
         );
         let query = QuantizedQueryCtx::new(
             index,
-            &VectorQuery::new(Metric::Dot, Arc::new(query_values)),
+            &VectorQuery::new(Metric::Dot, Arc::new(query_values)).unwrap(),
         );
 
         assert_eq!(

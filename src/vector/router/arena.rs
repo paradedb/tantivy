@@ -197,7 +197,7 @@ mod tests {
             let mut file_scores = Vec::new();
             for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
                 for query in [&query, &zero] {
-                    let prepared = VectorQuery::new(metric, Arc::new(query.clone()));
+                    let prepared = VectorQuery::new(metric, Arc::new(query.clone())).unwrap();
                     let norm = prepared.routing_norm();
                     for range in [0..3, 1..3, 2..3, 3..3] {
                         let expected: Vec<_> = range
@@ -234,7 +234,7 @@ mod tests {
             reads: reads.clone(),
         })));
         let query = &rows[..DIM];
-        let prepared = VectorQuery::new(Metric::Cosine, Arc::new(query.to_vec()));
+        let prepared = VectorQuery::new(Metric::Cosine, Arc::new(query.to_vec())).unwrap();
         let norm = prepared.routing_norm();
         let mut actual = Vec::new();
         arena.batch_similarity(query, Metric::Cosine, norm, 3..140, &mut actual);

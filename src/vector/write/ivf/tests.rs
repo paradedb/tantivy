@@ -993,7 +993,7 @@ fn assert_quantized_bridge_exactness(dim: usize) -> crate::Result<()> {
     let harness = quant::cascade::prepare_split_query(&query, &specs, &grids, 4);
     let scan = QuantizedQueryCtx::new(
         Arc::clone(quantized.index_ctx()),
-        &VectorQuery::new(quantized.index_ctx().meta.field().metric, Arc::new(query)),
+        &VectorQuery::new(quantized.index_ctx().meta.field().metric, Arc::new(query)).unwrap(),
     );
 
     for (cluster, row) in block_rows(ivf)? {

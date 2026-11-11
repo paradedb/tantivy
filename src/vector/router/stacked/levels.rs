@@ -28,7 +28,7 @@ use crate::vector::router::arena::{FileSliceArena, VectorArena};
 #[cfg(any(test, feature = "unstable"))]
 use crate::vector::router::candidate::Candidate;
 #[cfg(any(test, feature = "unstable"))]
-use crate::vector::search::prepared::VectorQuery;
+use crate::vector::search::prepared::{invalid_query, VectorQuery};
 use crate::vector::VectorElement;
 
 /// List count and member-row ranges for one persisted level.
@@ -948,11 +948,10 @@ where S: VectorArena<Elem = f32>
         query: &[S::Elem],
         k: usize,
         metric: Metric,
-    ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-        self.search_prepared(
-            &VectorQuery::new(metric, std::sync::Arc::new(query.to_vec())),
-            k,
-        )
+    ) -> crate::Result<(Vec<Candidate<ClusterId>>, StackedSearchStats)> {
+        let query =
+            VectorQuery::new(metric, std::sync::Arc::new(query.to_vec())).map_err(invalid_query)?;
+        Ok(self.search_prepared(&query, k))
     }
 
     #[cfg(any(test, feature = "unstable"))]
@@ -1022,7 +1021,7 @@ mod tests {
         assert_eq!(index.depth(), 1);
 
         let query = [1.0f32, 0.0];
-        let (hits, _) = index.search(&query, 4, Metric::L2);
+        let (hits, _) = index.search(&query, 4, Metric::L2).unwrap();
         assert!(!hits.is_empty());
         assert!(
             hits.len() < n,
@@ -1094,8 +1093,8 @@ mod tests {
         );
 
         for query in [[0.0f32, 0.0], [7.5, 0.0], [31.0, 0.0]] {
-            let (expected, _) = index.search(&query, 4, Metric::L2);
-            let (got, _) = decoded.search(&query, 4, Metric::L2);
+            let (expected, _) = index.search(&query, 4, Metric::L2).unwrap();
+            let (got, _) = decoded.search(&query, 4, Metric::L2).unwrap();
             assert_eq!(
                 got.len(),
                 expected.len(),
@@ -1184,7 +1183,7 @@ mod tests {
         let query = [0.0f32, 0.0];
         let k = 16;
         let shortlist = index.lists_to_open(k);
-        let (hits, stats) = index.search(&query, k, Metric::L2);
+        let (hits, stats) = index.search(&query, k, Metric::L2).unwrap();
 
         assert_eq!(hits.len(), k);
         assert!(
@@ -1211,7 +1210,7 @@ mod tests {
         assert_eq!(index.lists_to_open(1), floor);
 
         let query = [0.0f32, 0.0];
-        let (hits, stats) = index.search(&query, 1, Metric::L2);
+        let (hits, stats) = index.search(&query, 1, Metric::L2).unwrap();
         assert!(!hits.is_empty());
         // Cap is the shortlist; patience may stop earlier after five quiet lists.
         assert!(
@@ -1247,7 +1246,7 @@ mod tests {
         assert_eq!(index.lists_to_open(n), nlist);
 
         let query = [0.0f32, 0.0];
-        let (_, stats) = index.search(&query, n, Metric::L2);
+        let (_, stats) = index.search(&query, n, Metric::L2).unwrap();
         assert_eq!(
             stats.lists_scanned, nlist,
             "k covering all members must open every list"
@@ -1317,8 +1316,8 @@ mod tests {
 
         for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
             for query in [[0.0f32, 0.0], [7.5, 0.0], [15.2, 0.0], [31.0, 0.0]] {
-                let (expected, _) = index.search(&query, 4, metric);
-                let (got, _) = opened.search(&query, 4, metric);
+                let (expected, _) = index.search(&query, 4, metric).unwrap();
+                let (got, _) = opened.search(&query, 4, metric).unwrap();
                 assert_eq!(got, expected);
             }
         }
