@@ -11,6 +11,8 @@ pub(crate) mod layer_read;
 pub(crate) mod plan;
 pub(crate) mod rate;
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::ops::Range;
 
 use common::BitSet;
@@ -32,7 +34,7 @@ use crate::error::DataCorruption;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
-use crate::vector::search::interval::{Estimate, Threshold};
+use crate::vector::search::interval::{Estimate, Threshold, UpperEndpoint};
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery};
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::quantized::{
@@ -46,6 +48,13 @@ use crate::vector::{VectorElement, VectorStage};
 use crate::{DocId, SegmentOrdinal};
 
 // --- Contracts ---
+
+#[cfg(test)]
+thread_local! {
+    /// Scores mostly unseen replicated clusters row by row on this thread, so tests can compare
+    /// that path with the whole-band one.
+    pub(crate) static WHOLE_BAND_ADMISSION_OFF: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Sizes for one segment scan.
 #[derive(Clone, Copy, Debug)]
@@ -141,6 +150,8 @@ pub(crate) struct ScanTrace {
     pub(crate) refined_topk_rows: Vec<BlockAddress>,
     /// Every exact score the scan computed, in order.
     pub(crate) exact_scores: Vec<f32>,
+    /// Clusters whose unseen rows were scored from the whole band.
+    pub(crate) whole_band_admissions: usize,
 }
 
 // --- Quantized state ---
@@ -159,6 +170,8 @@ struct QuantizedState<'a> {
     admission_columns: Columns,
     /// Scratch for the admitted row indices of one cluster.
     admission_keep: Vec<u32>,
+    /// Scratch for the upper endpoints of one cluster's unseen rows.
+    admission_upper: Vec<f32>,
     /// Rows the layer-0 kernel scored, replicas included, before admission pruning.
     layer0_scored: usize,
     /// Rows admission pruning dropped.
@@ -169,6 +182,8 @@ struct QuantizedState<'a> {
     segment_ord: SegmentOrdinal,
     /// Centroid rows read for clusters without a centroid score.
     centroid_reads: usize,
+    #[cfg(test)]
+    whole_band_admissions: usize,
     #[cfg(test)]
     plan_override: Option<PlanOverride>,
     #[cfg(test)]
@@ -202,12 +217,15 @@ impl<'a> QuantizedState<'a> {
             decoded: Decoded::default(),
             admission_columns: Columns::default(),
             admission_keep: Vec::new(),
+            admission_upper: Vec::new(),
             layer0_scored: 0,
             layer0_admission_pruned: 0,
             exact: config.exact_plan.then_some(reader),
             index,
             segment_ord,
             centroid_reads: 0,
+            #[cfg(test)]
+            whole_band_admissions: 0,
             #[cfg(test)]
             plan_override: config.plan_override,
             #[cfg(test)]
@@ -275,10 +293,13 @@ impl<'a> QuantizedState<'a> {
     }
 
     /// Scores unseen rows on layer 0 and admits those that can reach the pruning threshold. Every
-    /// row's survival score goes to `fold`, pruned or not.
+    /// row's survival score goes to `fold`, pruned or not. `handed` is the cluster as the source
+    /// handed it, before a replicated segment's seen rows were dropped from `rows`.
+    #[allow(clippy::too_many_arguments)]
     fn admit(
         &mut self,
         rows: &ClusterRows<'_>,
+        handed: &ClusterRows<'_>,
         read: LayerRead,
         cluster: &QuantizedClusterReader<'_>,
         bound: &mut PruningBound,
@@ -291,6 +312,15 @@ impl<'a> QuantizedState<'a> {
         };
         // The threshold as of the clusters admitted so far, before this cluster's rows enter.
         let prior = self.admission_threshold(bound);
+        if let Some(threshold) = prior.filter(|_| scores_whole_band(rows, handed, read)) {
+            let unseen = UnseenRows {
+                whole: handed,
+                unseen: rows,
+            };
+            return self.admit_unseen_from_band(
+                unseen, cluster, centroid, threshold, bound, scratch, fold,
+            );
+        }
         let spec = self.layers[0];
         decode_layer(&spec, rows, read, cluster, &mut self.decoded, scratch)?;
         self.layer0_scored += rows.len();
@@ -339,6 +369,79 @@ impl<'a> QuantizedState<'a> {
                 }
                 bound.offer(self.candidates.entries(at, self.segment_ord));
             }
+        }
+        Ok(())
+    }
+
+    /// Admits the unseen rows of a whole cluster read as a band: the band is decoded and combined
+    /// whole through the contiguous kernel and batch decoders, and a row is kept when it is unseen
+    /// and its upper endpoint reaches `threshold`. Each row's estimate, sigma, fold score and
+    /// candidate entry are the ones the per-row path computes; the seen rows' sidecars are decoded
+    /// and validated too.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_unseen_from_band(
+        &mut self,
+        rows: UnseenRows<'_, '_>,
+        cluster: &QuantizedClusterReader<'_>,
+        centroid: Similarity,
+        threshold: Threshold,
+        bound: &mut PruningBound,
+        scratch: &mut ReadScratch,
+        fold: Option<Fold<'_>>,
+    ) -> crate::Result<()> {
+        let UnseenRows { whole, unseen } = rows;
+        let offsets = unseen
+            .offsets
+            .expect("the unseen rows of a whole cluster carry offsets");
+        let spec = self.layers[0];
+        decode_layer(
+            &spec,
+            whole,
+            LayerRead::Band,
+            cluster,
+            &mut self.decoded,
+            scratch,
+        )?;
+        self.layer0_scored += unseen.len();
+        let ctx = self.combine_ctx(0, centroid);
+        combine_initial(
+            &ctx,
+            &self.decoded,
+            &mut self.admission_columns,
+            0..whole.len(),
+        );
+        let kappa = self.candidates.kappa();
+        let columns = &self.admission_columns;
+        // Unseen rows only, in row order: the scores and order the per-row path folds.
+        self.admission_upper.clear();
+        self.admission_upper.extend(offsets.iter().map(|&row| {
+            let row = row as usize;
+            Estimate(columns.estimates[row])
+                .upper(columns.sigmas[row], kappa)
+                .0
+        }));
+        if let Some(mut fold) = fold {
+            fold.scores(&self.admission_upper);
+        }
+        self.admission_keep.clear();
+        self.admission_keep.extend(
+            offsets
+                .iter()
+                .zip(&self.admission_upper)
+                .filter(|&(_, &upper)| threshold.admits(UpperEndpoint(upper)))
+                .map(|(&row, _)| row),
+        );
+        let at = self.candidates.push_selected(
+            whole,
+            centroid,
+            &self.admission_columns,
+            &self.admission_keep,
+        );
+        self.layer0_admission_pruned += unseen.len() - at.len();
+        bound.offer(self.candidates.entries(at, self.segment_ord));
+        #[cfg(test)]
+        {
+            self.whole_band_admissions += 1;
         }
         Ok(())
     }
@@ -451,6 +554,27 @@ impl<'a> QuantizedState<'a> {
             .boundary_rows
             .push(self.candidates.row_addresses());
     }
+}
+
+/// A whole cluster as the source handed it, and its rows not seen in earlier clusters.
+#[derive(Clone, Copy)]
+struct UnseenRows<'r, 'a> {
+    whole: &'r ClusterRows<'a>,
+    unseen: &'r ClusterRows<'a>,
+}
+
+/// Whether `rows`, the unseen rows of the whole cluster `handed`, are scored from the whole band:
+/// the band is read anyway, and with at least three in four rows unseen the contiguous kernel and
+/// batch decoders over every row cost less than gathering the unseen ones.
+fn scores_whole_band(rows: &ClusterRows<'_>, handed: &ClusterRows<'_>, read: LayerRead) -> bool {
+    #[cfg(test)]
+    if WHOLE_BAND_ADMISSION_OFF.with(Cell::get) {
+        return false;
+    }
+    read == LayerRead::Band
+        && handed.offsets.is_none()
+        && rows.offsets.is_some()
+        && 4 * rows.len() >= 3 * handed.len()
 }
 
 // --- Segment scan ---
@@ -798,6 +922,7 @@ where
                     if let (Some(state), Some(cluster)) = (&mut self.quantized, &cluster) {
                         state.admit(
                             selected,
+                            rows,
                             read,
                             cluster,
                             &mut self.bound,
@@ -895,6 +1020,10 @@ where
         report.replication_dropped = self.replication_dropped;
         if let Some(state) = &self.quantized {
             report.centroid_reads = state.centroid_reads;
+            #[cfg(test)]
+            {
+                report.trace.whole_band_admissions = state.whole_band_admissions;
+            }
         }
         #[cfg(test)]
         {

@@ -15,6 +15,7 @@ use crate::vector::search::interval::Estimate;
 use crate::vector::search::scan::bound::TopK;
 use crate::vector::search::scan::layer_read::LayerRead;
 use crate::vector::search::scan::plan::{ExactRule, PlanOverride};
+use crate::vector::search::scan::WHOLE_BAND_ADMISSION_OFF;
 use crate::vector::stats::{AccessPath, LayerProbeStats};
 use crate::vector::test_support::{
     first_segment, ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg, ReadLog,
@@ -1052,6 +1053,108 @@ fn read_plans_are_bit_identical() -> crate::Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Each layer's counts: what two admission paths of one scan must agree on.
+fn layer_counts(stats: &ProbeStats) -> Vec<[usize; 9]> {
+    (0..)
+        .map_while(|layer| stats.layers.get(layer))
+        .map(|layer| {
+            [
+                layer.scored(),
+                layer.admission_pruned(),
+                layer.survivors(),
+                layer.sparse_clusters(),
+                layer.full_clusters(),
+                layer.exact_clusters(),
+                layer.exact_rows(),
+                layer.recheck_dropped(),
+                layer.io.reads as usize,
+            ]
+        })
+        .collect()
+}
+
+/// A replicated cluster read as a band with at least three in four rows unseen is scored from the
+/// whole band; every estimate, sigma, candidate, boundary, exact score, count and result matches
+/// the per-row path, for every metric, in RAM and on pages, planned or forced to the band.
+#[test]
+fn whole_band_admission_matches_per_row_admission() -> crate::Result<()> {
+    let mut whole_band = 0;
+    for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+        for (dim, clusters, docs, paged) in [(64, 8, 1600, false), (1024, 6, 1800, true)] {
+            let mut spec = FixtureSpec::clustered(metric, dim, clusters, docs)
+                .schedule(&[1, 4])
+                .replicated();
+            if paged {
+                spec = spec.paged();
+            }
+            let fixture = spec.build()?;
+            let query = Lcg(5).vector(dim, 0.5);
+            let weight = fixture.weight(&AllQuery)?;
+            let oracle = fixture.oracle(&AllQuery, &query, 10)?;
+            for plan in [None, Some(PlanOverride::read(LayerRead::Band))] {
+                let case = format!(
+                    "{metric:?} dim={dim} paged={paged} forced={}",
+                    plan.is_some()
+                );
+                let run = |per_row: bool| {
+                    WHOLE_BAND_ADMISSION_OFF.with(|off| off.set(per_row));
+                    let result = fixture.run_planned(
+                        0,
+                        weight.as_ref(),
+                        &query,
+                        10,
+                        routed_exhaustive_params(clusters),
+                        plan,
+                        true,
+                    );
+                    WHOLE_BAND_ADMISSION_OFF.with(|off| off.set(false));
+                    result
+                };
+                let (row_hits, rows) = run(true)?;
+                let (band_hits, band) = run(false)?;
+                assert!(rows.replication_dropped > 0, "{case}");
+                assert_eq!(rows.quantized_trace.whole_band_admissions, 0, "{case}");
+                whole_band += band.quantized_trace.whole_band_admissions;
+                let (a, b) = (&rows.quantized_trace, &band.quantized_trace);
+                assert_eq!(b.scored_rows, a.scored_rows, "{case}");
+                assert_eq!(b.estimate_rows, a.estimate_rows, "{case}");
+                assert_eq!(b.layer_columns, a.layer_columns, "{case}");
+                assert_eq!(b.boundary_rows, a.boundary_rows, "{case}");
+                assert_eq!(b.exact_phase_rows, a.exact_phase_rows, "{case}");
+                assert_eq!(
+                    b.exact_scores
+                        .iter()
+                        .map(|s| s.to_bits())
+                        .collect::<Vec<_>>(),
+                    a.exact_scores
+                        .iter()
+                        .map(|s| s.to_bits())
+                        .collect::<Vec<_>>(),
+                    "{case}"
+                );
+                assert_eq!(layer_counts(&band), layer_counts(&rows), "{case}");
+                assert_eq!(
+                    (
+                        band.replication_dropped,
+                        band.candidates_scored,
+                        band.exact_rows
+                    ),
+                    (
+                        rows.replication_dropped,
+                        rows.candidates_scored,
+                        rows.exact_rows
+                    ),
+                    "{case}"
+                );
+                assert_eq!(band_hits, row_hits, "{case}");
+                assert_eq!(band_hits, oracle, "{case}");
+            }
+        }
+    }
+    assert!(whole_band > 0, "no cluster took the whole-band path");
     Ok(())
 }
 
