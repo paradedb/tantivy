@@ -109,7 +109,7 @@ where
     assert!(!scorers.is_empty());
     if scorers.len() == 1 && !scorers[0].is::<TermScorer>() {
         let scorer = scorers.into_iter().next().unwrap(); //< we checked the size beforehand
-        return match block_max_scorer(scorer) {
+        return match try_into_block_max_scorer(scorer) {
             Ok(scorer) => SpecializedScorer::BlockMaxUnion(vec![scorer]),
             Err(scorer) => SpecializedScorer::Other(scorer),
         };
@@ -153,7 +153,7 @@ where
         let mut block_max = Vec::with_capacity(scorers.len());
         let mut others = Vec::new();
         for scorer in scorers {
-            match block_max_scorer(scorer) {
+            match try_into_block_max_scorer(scorer) {
                 Ok(scorer) => block_max.push(scorer),
                 Err(scorer) => others.push(scorer),
             }
@@ -177,9 +177,11 @@ where
     )))
 }
 
-/// A term or synonym scorer that reads frequencies, which Block-WAND needs. Anything else comes
-/// back as it was.
-fn block_max_scorer(scorer: Box<dyn Scorer>) -> Result<Box<dyn BlockMaxScorer>, Box<dyn Scorer>> {
+/// Block-WAND needs a term or synonym scorer that reads frequencies. `Err` returns any other
+/// scorer unchanged.
+fn try_into_block_max_scorer(
+    scorer: Box<dyn Scorer>,
+) -> Result<Box<dyn BlockMaxScorer>, Box<dyn Scorer>> {
     if scorer
         .downcast_ref::<TermScorer>()
         .is_some_and(|scorer| scorer.freq_reading_option() == FreqReadingOption::ReadFreq)
@@ -551,7 +553,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     && term_scorers.is_empty()
                     && other_scorers.len() == 1
                 {
-                    match block_max_scorer(other_scorers.pop().unwrap()) {
+                    match try_into_block_max_scorer(other_scorers.pop().unwrap()) {
                         Ok(scorer) => Some(scorer),
                         Err(scorer) => {
                             other_scorers.push(scorer);
@@ -882,9 +884,9 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                 BlockWandIntersectionScorer::new(scorers, init_threshold),
             )),
             SpecializedScorer::FilteredTermUnion { terms, filter } => {
-                if !TScoreCombiner::SUPPORTS_BLOCK_WAND
-                    || !self.scoring_enabled
-                    || filter.constant_score().is_none()
+                if !(TScoreCombiner::SUPPORTS_BLOCK_WAND
+                    && self.scoring_enabled
+                    && filter.constant_score().is_some())
                 {
                     let union_scorer = into_box_scorer(
                         SpecializedScorer::FilteredTermUnion { terms, filter },
@@ -917,9 +919,9 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                 }
             }
             SpecializedScorer::FilteredBlockMaxUnion { scorers, filter } => {
-                if !TScoreCombiner::SUPPORTS_BLOCK_WAND
-                    || !self.scoring_enabled
-                    || filter.constant_score().is_none()
+                if !(TScoreCombiner::SUPPORTS_BLOCK_WAND
+                    && self.scoring_enabled
+                    && filter.constant_score().is_some())
                 {
                     let union_scorer = into_box_scorer(
                         SpecializedScorer::FilteredBlockMaxUnion { scorers, filter },
@@ -1143,9 +1145,9 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                 for_each_pruning_scorer(&mut scorer, callback);
             }
             SpecializedScorer::FilteredTermUnion { terms, mut filter } => {
-                if !TScoreCombiner::SUPPORTS_BLOCK_WAND
-                    || !self.scoring_enabled
-                    || filter.constant_score().is_none()
+                if !(TScoreCombiner::SUPPORTS_BLOCK_WAND
+                    && self.scoring_enabled
+                    && filter.constant_score().is_some())
                 {
                     let union_scorer = into_box_scorer(
                         SpecializedScorer::FilteredTermUnion { terms, filter },
@@ -1193,9 +1195,9 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                 }
             }
             SpecializedScorer::FilteredBlockMaxUnion { scorers, filter } => {
-                if !TScoreCombiner::SUPPORTS_BLOCK_WAND
-                    || !self.scoring_enabled
-                    || filter.constant_score().is_none()
+                if !(TScoreCombiner::SUPPORTS_BLOCK_WAND
+                    && self.scoring_enabled
+                    && filter.constant_score().is_some())
                 {
                     let union_scorer = into_box_scorer(
                         SpecializedScorer::FilteredBlockMaxUnion { scorers, filter },
