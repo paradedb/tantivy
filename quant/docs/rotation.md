@@ -35,6 +35,25 @@ still mix well (the tests check impulse spread at `d = 65, 100, 300, 769`).
 The transform is orthogonal: it preserves norms and dot products to fp32
 precision, and `apply_inverse` round-trips.
 
+## Kernels
+
+The sign bits are drawn as a bitmap but held in memory as one XOR mask per
+coordinate (`0x8000_0000` to negate, zero to keep), so the sign step is a
+branch-free XOR of two arrays that the compiler vectorizes on every target.
+
+The Hadamard transform of each block picks a kernel per call:
+
+| Kernel | Used when | Shape |
+| --- | --- | --- |
+| `x86::hadamard_avx512` | x86-64, `cpu::Tier::Avx512`, block ≥ 16 | widths 1–8 inside one 16-lane register, then two levels per pass |
+| `neon::hadamard` | aarch64, block ≥ 16 | widths 1–2 inside a register and 4–8 across four registers, then two levels per pass |
+| `hadamard_portable` | everything else | one level per pass |
+
+Every kernel applies the same additions, subtractions, and final
+normalization multiply to each coordinate in the same level order as
+`hadamard_portable`, so outputs are bit-identical across CPUs and the stored
+codes do not depend on the machine that wrote them.
+
 ## Format stability
 
 The seed and the exact ChaCha8 stream determine the rotation, so the stored
@@ -54,6 +73,7 @@ row.
 ## Tests and benches
 
 Tests cover the block decomposition, the Hadamard against a naive matrix,
+bit-identity of the dispatched and SIMD kernels against `hadamard_portable`,
 norm/dot preservation, inverse round trip, scratch-vs-allocating equality,
 sampler uniformity, and the two snapshots.
 
