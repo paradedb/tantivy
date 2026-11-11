@@ -100,18 +100,19 @@ impl Rotation {
         assert_eq!(scratch.len(), self.d);
         #[cfg(debug_assertions)]
         APPLY_COUNT.with(|count| count.set(count.get() + 1));
+        // Each round gathers into the other buffer and transforms it there, so the result is copied
+        // into `x` at most once, after an odd round count leaves it in `scratch`. Negating then
+        // permuting equals permuting with the signs in gather order.
+        let (mut source, mut target): (&mut [f32], &mut [f32]) = (x, scratch);
         for round in &self.rounds {
-            // Negating then permuting equals permuting with the signs in gather order.
-            for ((target, &source), &sign) in
-                scratch.iter_mut().zip(&round.perm).zip(&round.perm_signs)
-            {
-                // SAFETY: `Rotation::new` asserts `perm` is a permutation of `0..d`, and
-                // `x.len() == d` is asserted above.
-                let value = unsafe { *x.get_unchecked(source as usize) };
-                *target = f32::from_bits(value.to_bits() ^ sign);
-            }
-            x.copy_from_slice(scratch);
-            block_hadamard(x, &self.blocks);
+            // SAFETY: `Rotation::new` asserts `perm` is a permutation of `0..d`, `perm_signs` has
+            // one entry per coordinate, and both buffers have length `d`, asserted above.
+            unsafe { gather_signed(source, &round.perm, &round.perm_signs, target) };
+            block_hadamard(target, &self.blocks);
+            std::mem::swap(&mut source, &mut target);
+        }
+        if self.rounds.len() % 2 == 1 {
+            target.copy_from_slice(source);
         }
     }
 
@@ -282,6 +283,52 @@ fn sign_masks(rng: &mut ChaCha8Rng, d: usize) -> Vec<u32> {
     masks
 }
 
+/// Writes `target[t] = source[perm[t]]` with `signs[t]` XORed into its bits, on the widest gather
+/// the CPU has.
+///
+/// # Safety
+///
+/// `perm`, `signs` and `target` have equal length, and every entry of `perm` is below
+/// `source.len()`.
+unsafe fn gather_signed(source: &[f32], perm: &[u32], signs: &[u32], target: &mut [f32]) {
+    debug_assert!(perm.len() == target.len() && signs.len() == target.len());
+    // The x86 gathers read each index as a signed 32-bit offset.
+    #[cfg(target_arch = "x86_64")]
+    if i32::try_from(source.len()).is_ok() {
+        match crate::cpu::tier() {
+            crate::cpu::Tier::Avx512 => {
+                // SAFETY: the tier is only reported when the CPU has avx512f; the caller upholds
+                // the length and index contract, and every index fits in an i32.
+                unsafe { x86::gather_signed_avx512(source, perm, signs, target) };
+                return;
+            }
+            crate::cpu::Tier::Avx2 => {
+                // SAFETY: the tier is only reported when the CPU has avx2; the caller upholds the
+                // length and index contract, and every index fits in an i32.
+                unsafe { x86::gather_signed_avx2(source, perm, signs, target) };
+                return;
+            }
+            _ => {}
+        }
+    }
+    // SAFETY: the caller upholds the length and index contract.
+    unsafe { gather_signed_portable(source, perm, signs, target) };
+}
+
+/// Portable gather, and the reference the x86 gathers match bit for bit.
+///
+/// # Safety
+///
+/// `perm`, `signs` and `target` have equal length, and every entry of `perm` is below
+/// `source.len()`.
+unsafe fn gather_signed_portable(source: &[f32], perm: &[u32], signs: &[u32], target: &mut [f32]) {
+    for ((target, &index), &sign) in target.iter_mut().zip(perm).zip(signs) {
+        // SAFETY: the caller guarantees `index < source.len()`.
+        let value = unsafe { *source.get_unchecked(index as usize) };
+        *target = f32::from_bits(value.to_bits() ^ sign);
+    }
+}
+
 fn block_hadamard(x: &mut [f32], blocks: &[usize]) {
     let mut offset = 0;
     for &block_len in blocks {
@@ -347,11 +394,90 @@ fn hadamard_portable(x: &mut [f32]) {
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use std::arch::x86_64::{
-        __m256, __m512, _mm256_add_ps, _mm256_blend_ps, _mm256_loadu_ps, _mm256_mul_ps,
-        _mm256_permute2f128_ps, _mm256_permute_ps, _mm256_set1_ps, _mm256_storeu_ps, _mm256_sub_ps,
-        _mm512_add_ps, _mm512_loadu_ps, _mm512_mask_sub_ps, _mm512_mul_ps, _mm512_permute_ps,
-        _mm512_set1_ps, _mm512_shuffle_f32x4, _mm512_storeu_ps, _mm512_sub_ps,
+        __m256, __m512, _mm256_add_ps, _mm256_blend_ps, _mm256_i32gather_ps, _mm256_loadu_ps,
+        _mm256_loadu_si256, _mm256_mul_ps, _mm256_permute2f128_ps, _mm256_permute_ps,
+        _mm256_set1_ps, _mm256_storeu_ps, _mm256_sub_ps, _mm256_xor_ps, _mm512_add_ps,
+        _mm512_castps_si512, _mm512_castsi512_ps, _mm512_i32gather_ps, _mm512_loadu_ps,
+        _mm512_loadu_si512, _mm512_mask_sub_ps, _mm512_mul_ps, _mm512_permute_ps, _mm512_set1_ps,
+        _mm512_shuffle_f32x4, _mm512_storeu_ps, _mm512_sub_ps, _mm512_xor_si512,
     };
+
+    /// Sixteen-lane signed gather: `target[t] = source[perm[t]]` with `signs[t]` XORed into its
+    /// bits, and the tail shorter than a register through the portable gather.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must have AVX-512 F. `perm`, `signs` and `target` have equal length, and every
+    /// entry of `perm` is below `source.len()`, which fits in an i32.
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn gather_signed_avx512(
+        source: &[f32],
+        perm: &[u32],
+        signs: &[u32],
+        target: &mut [f32],
+    ) {
+        let whole = target.len() - target.len() % LANES;
+        for t in (0..whole).step_by(LANES) {
+            // SAFETY: `t + LANES <= whole <= target.len()`, and `perm` and `signs` are as long as
+            // `target`, so every load and the store stay in bounds. Each index in `perm` is below
+            // `source.len()` (`Rotation::new` asserts `perm` is a permutation of `0..d`) and fits
+            // in an i32, so every gathered lane reads inside `source`.
+            unsafe {
+                let index = _mm512_loadu_si512(perm.as_ptr().add(t).cast());
+                let sign = _mm512_loadu_si512(signs.as_ptr().add(t).cast());
+                let value = _mm512_i32gather_ps::<4>(index, source.as_ptr());
+                let flipped =
+                    _mm512_castsi512_ps(_mm512_xor_si512(_mm512_castps_si512(value), sign));
+                _mm512_storeu_ps(target.as_mut_ptr().add(t), flipped);
+            }
+        }
+        // SAFETY: the tails of `perm`, `signs` and `target` have equal length and the same indices.
+        unsafe {
+            super::gather_signed_portable(
+                source,
+                &perm[whole..],
+                &signs[whole..],
+                &mut target[whole..],
+            )
+        };
+    }
+
+    /// Eight-lane signed gather with the contract of [`gather_signed_avx512`].
+    ///
+    /// # Safety
+    ///
+    /// The CPU must have AVX2. `perm`, `signs` and `target` have equal length, and every entry of
+    /// `perm` is below `source.len()`, which fits in an i32.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn gather_signed_avx2(
+        source: &[f32],
+        perm: &[u32],
+        signs: &[u32],
+        target: &mut [f32],
+    ) {
+        let whole = target.len() - target.len() % AVX2_LANES;
+        for t in (0..whole).step_by(AVX2_LANES) {
+            // SAFETY: `t + AVX2_LANES <= whole <= target.len()`, and `perm` and `signs` are as long
+            // as `target`, so every load and the store stay in bounds. Each index in `perm` is
+            // below `source.len()` (`Rotation::new` asserts `perm` is a permutation of
+            // `0..d`) and fits in an i32, so every gathered lane reads inside `source`.
+            unsafe {
+                let index = _mm256_loadu_si256(perm.as_ptr().add(t).cast());
+                let sign = _mm256_loadu_ps(signs.as_ptr().add(t).cast());
+                let value = _mm256_i32gather_ps::<4>(source.as_ptr(), index);
+                _mm256_storeu_ps(target.as_mut_ptr().add(t), _mm256_xor_ps(value, sign));
+            }
+        }
+        // SAFETY: the tails of `perm`, `signs` and `target` have equal length and the same indices.
+        unsafe {
+            super::gather_signed_portable(
+                source,
+                &perm[whole..],
+                &signs[whole..],
+                &mut target[whole..],
+            )
+        };
+    }
 
     /// Floats per 512-bit register.
     const LANES: usize = 16;
@@ -796,6 +922,109 @@ mod tests {
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
         // SAFETY: this line only compiles when NEON is enabled for the whole build.
         assert_bit_identical_to_portable("neon", neon::MIN_LEN, |x| unsafe { neon::hadamard(x) });
+    }
+
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|value| value.to_bits()).collect()
+    }
+
+    /// One signed gather by safe indexing: `source[perm[t]]` with `signs[t]` XORed into its bits.
+    fn gather_reference(source: &[f32], perm: &[u32], signs: &[u32]) -> Vec<f32> {
+        perm.iter()
+            .zip(signs)
+            .map(|(&index, &sign)| f32::from_bits(source[index as usize].to_bits() ^ sign))
+            .collect()
+    }
+
+    /// The portable gather matches the safe reference, and each x86 gather, called directly when
+    /// the CPU has its feature, matches the portable gather bit for bit, NaN and -0.0 included.
+    #[test]
+    fn gathers_are_bit_identical_to_portable() {
+        for len in [1, 7, 8, 9, 15, 16, 17, 100, 768, 1000, 1024] {
+            let rotation = Rotation::new(len, 0x5eed ^ len as u64);
+            let round = &rotation.rounds[0];
+            let source: Vec<f32> = (0..len)
+                .map(|i| match i % 5 {
+                    0 => f32::NAN,
+                    1 => -0.0,
+                    _ => (i as f32 * 0.37).sin(),
+                })
+                .collect();
+            let mut portable = vec![0.0; len];
+            // SAFETY: `Rotation::new` builds `perm` as a permutation of `0..len`, and `perm_signs`,
+            // `portable` and `perm` all have length `len`.
+            unsafe {
+                gather_signed_portable(&source, &round.perm, &round.perm_signs, &mut portable)
+            };
+            assert_eq!(
+                bits(&portable),
+                bits(&gather_reference(&source, &round.perm, &round.perm_signs)),
+                "portable len={len}"
+            );
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    let mut gathered = vec![0.0; len];
+                    // SAFETY: the CPU has avx2; the slices are as for the portable gather and
+                    // `len` fits in an i32.
+                    unsafe {
+                        x86::gather_signed_avx2(
+                            &source,
+                            &round.perm,
+                            &round.perm_signs,
+                            &mut gathered,
+                        )
+                    };
+                    assert_eq!(bits(&gathered), bits(&portable), "avx2 len={len}");
+                }
+                if std::arch::is_x86_feature_detected!("avx512f") {
+                    let mut gathered = vec![0.0; len];
+                    // SAFETY: the CPU has avx512f; the slices are as for the portable gather and
+                    // `len` fits in an i32.
+                    unsafe {
+                        x86::gather_signed_avx512(
+                            &source,
+                            &round.perm,
+                            &round.perm_signs,
+                            &mut gathered,
+                        )
+                    };
+                    assert_eq!(bits(&gathered), bits(&portable), "avx512 len={len}");
+                }
+            }
+        }
+    }
+
+    /// `apply_with_scratch` matches gathering into scratch, copying back into `x` and transforming
+    /// it every round, for the odd round count `Rotation::new` builds and for an even one, where
+    /// the result never leaves `x`'s buffer pair through a final copy.
+    #[test]
+    fn apply_with_scratch_matches_copy_back_reference() {
+        for d in [100, 768, 1024, 1536] {
+            let odd = Rotation::new(d, 0xC0FFEE ^ d as u64);
+            let even = Rotation {
+                d,
+                rounds: odd.rounds[..2].to_vec(),
+                blocks: odd.blocks.clone(),
+            };
+            for rotation in [&odd, &even] {
+                let mut expected = input(d, 0.25);
+                for round in &rotation.rounds {
+                    let scratch = gather_reference(&expected, &round.perm, &round.perm_signs);
+                    expected.copy_from_slice(&scratch);
+                    block_hadamard(&mut expected, &rotation.blocks);
+                }
+                let mut x = input(d, 0.25);
+                let mut scratch = vec![0.0; d];
+                rotation.apply_with_scratch(&mut x, &mut scratch);
+                assert_eq!(
+                    bits(&x),
+                    bits(&expected),
+                    "d={d} rounds={}",
+                    rotation.rounds.len()
+                );
+            }
+        }
     }
 
     #[test]
