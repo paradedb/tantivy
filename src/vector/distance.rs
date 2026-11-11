@@ -311,6 +311,17 @@ pub(crate) fn maybe_normalize_bytes(opts: &VectorOptions, row: &mut [u8]) -> Nor
     } // exhaustive: a new dtype variant must decide its policy here
 }
 
+/// Whether every element of a row is finite. Normalizing metrics learn this from the norm
+/// ([`NormalizeOutcome::NonFinite`]); the others check it here.
+pub(crate) fn row_is_finite(opts: &VectorOptions, row: &[u8]) -> bool {
+    debug_assert_eq!(row.len(), opts.bytes_per_vector());
+    match opts.dtype() {
+        VectorDType::F32 => row
+            .chunks_exact(f32::SIZE_BYTES)
+            .all(|bytes| f32::decode_le(bytes).is_finite()),
+    }
+}
+
 /// `cosine` where the doc side is little-endian bytes encoding `T`.
 #[inline]
 pub fn cosine_bytes<T: VectorElement>(query: &[T], doc_bytes: &[u8]) -> f32 {

@@ -14,7 +14,7 @@ use crate::indexer::segment_updater::CancelSentinel;
 use crate::plugin::{PluginMergeContext, PluginWriter};
 use crate::schema::document::{ErasedDocument, ErasedValue, ReferenceValueLeaf};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
-use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
+use crate::vector::distance::{maybe_normalize_bytes, row_is_finite, NormalizeOutcome};
 use crate::vector::storage::blocks::{
     align_up, block_align, pad, write_metadata, BlockOffsetsWriter,
 };
@@ -42,7 +42,12 @@ impl FieldBuffer {
         self.present_doc_ids.push(doc_id);
         let start = self.row_bytes.len();
         self.row_bytes.extend_from_slice(bytes);
-        maybe_normalize_bytes(&self.opts, &mut self.row_bytes[start..start + stride])
+        let row = &mut self.row_bytes[start..start + stride];
+        // Every metric rejects NaN and infinities; normalization detects them through the norm.
+        if !self.opts.needs_normalization() && !row_is_finite(&self.opts, row) {
+            return NormalizeOutcome::NonFinite;
+        }
+        maybe_normalize_bytes(&self.opts, row)
     }
 
     fn mem_usage(&self) -> usize {

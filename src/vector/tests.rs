@@ -653,42 +653,45 @@ fn ground_truth_orders_by_metric() -> crate::Result<()> {
     Ok(())
 }
 
-/// Non-finite elements are rejected at ingest on normalizing fields
-/// (Cosine+F32) and accepted on non-normalizing ones (L2) — validation
-/// rides the normalize path only. `IndexWriter::add_document` enqueues
-/// to a worker, so the rejection may surface either from the enqueue or
-/// from the following `commit`.
+/// Non-finite elements are rejected at ingest for every metric, with the same error, and finite
+/// vectors are accepted. `IndexWriter::add_document` enqueues to a worker, so the rejection may
+/// surface either from the enqueue or from the following `commit`.
 #[test]
-fn ingest_rejects_non_finite_cosine_vector() -> crate::Result<()> {
-    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-        // L2: same vector is accepted; nothing normalizes, data is stored raw.
-        let mut schema_builder = Schema::builder();
-        let l2_field = schema_builder.add_vector_field("l2", VectorOptions::new(2, Metric::L2));
-        let schema = schema_builder.build();
-        let index = Index::builder().schema(schema).create_in_ram()?;
-        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
-        let mut doc = TantivyDocument::new();
-        doc.add_vector(l2_field, &[bad, 1.0]);
-        writer.add_document(doc)?;
-        writer.commit()?;
-
-        // Cosine: rejected.
-        let mut schema_builder = Schema::builder();
-        let cos_field =
-            schema_builder.add_vector_field("cos", VectorOptions::new(2, Metric::Cosine));
-        let schema = schema_builder.build();
-        let index = Index::builder().schema(schema).create_in_ram()?;
-        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
-        let mut doc = TantivyDocument::new();
-        doc.add_vector(cos_field, &[bad, 1.0]);
-        let err = match writer.add_document(doc) {
-            Err(err) => err.to_string(),
-            Ok(_) => writer
-                .commit()
-                .expect_err("non-finite vector must fail ingest")
-                .to_string(),
+fn ingest_rejects_non_finite_vector_for_every_metric() -> crate::Result<()> {
+    for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+        let single_doc_index = |vector: &[f32]| -> crate::Result<(Index, crate::Result<()>)> {
+            let mut schema_builder = Schema::builder();
+            let field = schema_builder.add_vector_field("v", VectorOptions::new(2, metric));
+            let index = Index::builder()
+                .schema(schema_builder.build())
+                .create_in_ram()?;
+            let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(field, vector);
+            let result = writer
+                .add_document(doc)
+                .and_then(|_| writer.commit().map(|_| ()));
+            Ok((index, result))
         };
-        assert!(err.contains("non-finite"), "bad={bad}, err={err}");
+
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let (_, result) = single_doc_index(&[bad, 1.0])?;
+            let err = result
+                .expect_err("non-finite vector must fail ingest")
+                .to_string();
+            assert!(
+                err.contains("non-finite element in vector field 'v'"),
+                "metric={metric:?}, bad={bad}, err={err}"
+            );
+        }
+
+        let (index, result) = single_doc_index(&[0.6, 0.8])?;
+        result?;
+        assert_eq!(
+            index.reader()?.searcher().num_docs(),
+            1,
+            "metric={metric:?}"
+        );
     }
     Ok(())
 }
