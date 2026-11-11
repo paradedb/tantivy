@@ -696,6 +696,58 @@ fn ingest_rejects_non_finite_vector_for_every_metric() -> crate::Result<()> {
     Ok(())
 }
 
+/// Metrics that store the row as given (L2, dot product) reject a row whose squared norm exceeds
+/// [`MAX_ROW_NORM_SQUARED`] with its own error and accept one just below it. Cosine normalizes, so
+/// it accepts any finite row.
+#[test]
+fn ingest_bounds_the_squared_norm_of_rows_stored_as_given() -> crate::Result<()> {
+    use crate::vector::MAX_ROW_NORM_SQUARED;
+
+    const DIM: usize = 1024;
+    let single_doc_index =
+        |metric: Metric, vector: &[f32]| -> crate::Result<(Index, crate::Result<()>)> {
+            let mut schema_builder = Schema::builder();
+            let field = schema_builder.add_vector_field("v", VectorOptions::new(DIM, metric));
+            let index = Index::builder()
+                .schema(schema_builder.build())
+                .create_in_ram()?;
+            let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(field, vector);
+            let result = writer
+                .add_document(doc)
+                .and_then(|_| writer.commit().map(|_| ()));
+            Ok((index, result))
+        };
+
+    let just_under = ((MAX_ROW_NORM_SQUARED / DIM as f64).sqrt() * 0.999) as f32;
+    let just_over = ((MAX_ROW_NORM_SQUARED / DIM as f64).sqrt() * 1.001) as f32;
+    for metric in [Metric::L2, Metric::Dot] {
+        for value in [1.0e20_f32, just_over] {
+            let (_, result) = single_doc_index(metric, &[value; DIM])?;
+            let err = result
+                .expect_err("an overflowing squared norm must fail ingest")
+                .to_string();
+            assert!(
+                err.contains("vector in field 'v'") && err.contains("squared norm above the limit"),
+                "metric={metric:?}, value={value}, err={err}"
+            );
+        }
+        let (index, result) = single_doc_index(metric, &[just_under; DIM])?;
+        result?;
+        assert_eq!(
+            index.reader()?.searcher().num_docs(),
+            1,
+            "metric={metric:?}"
+        );
+    }
+
+    let (index, result) = single_doc_index(Metric::Cosine, &[1.0e20; DIM])?;
+    result?;
+    assert_eq!(index.reader()?.searcher().num_docs(), 1);
+    Ok(())
+}
+
 /// A zero vector is honest data: ingest accepts it (`ZeroSkipped`), and
 /// at query time it scores exactly 0.0 — behind any non-zero doc.
 #[test]

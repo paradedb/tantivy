@@ -14,7 +14,9 @@ use crate::indexer::segment_updater::CancelSentinel;
 use crate::plugin::{PluginMergeContext, PluginWriter};
 use crate::schema::document::{ErasedDocument, ErasedValue, ReferenceValueLeaf};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
-use crate::vector::distance::{maybe_normalize_bytes, row_is_finite, NormalizeOutcome};
+use crate::vector::distance::{
+    check_and_normalize_row, maybe_normalize_bytes, NormalizeOutcome, MAX_ROW_NORM_SQUARED,
+};
 use crate::vector::storage::blocks::{
     align_up, block_align, pad, write_metadata, BlockOffsetsWriter,
 };
@@ -42,12 +44,7 @@ impl FieldBuffer {
         self.present_doc_ids.push(doc_id);
         let start = self.row_bytes.len();
         self.row_bytes.extend_from_slice(bytes);
-        let row = &mut self.row_bytes[start..start + stride];
-        // Every metric rejects NaN and infinities; normalization detects them through the norm.
-        if !self.opts.needs_normalization() && !row_is_finite(&self.opts, row) {
-            return NormalizeOutcome::NonFinite;
-        }
-        maybe_normalize_bytes(&self.opts, row)
+        check_and_normalize_row(&self.opts, &mut self.row_bytes[start..start + stride])
     }
 
     fn mem_usage(&self) -> usize {
@@ -120,12 +117,22 @@ impl PluginWriter for FlatVecWriter {
                     bytes.len(),
                 )));
             }
-            if buf.push_bytes(doc_id, bytes) == NormalizeOutcome::NonFinite {
-                return Err(TantivyError::InvalidArgument(format!(
-                    "non-finite element in vector field '{}' (doc {doc_id}): vectors must contain \
-                     only finite values",
-                    schema.get_field_entry(field).name(),
-                )));
+            match buf.push_bytes(doc_id, bytes) {
+                NormalizeOutcome::Normalized | NormalizeOutcome::ZeroSkipped => {}
+                NormalizeOutcome::NonFinite => {
+                    return Err(TantivyError::InvalidArgument(format!(
+                        "non-finite element in vector field '{}' (doc {doc_id}): vectors must \
+                         contain only finite values",
+                        schema.get_field_entry(field).name(),
+                    )));
+                }
+                NormalizeOutcome::NormTooLarge => {
+                    return Err(TantivyError::InvalidArgument(format!(
+                        "vector in field '{}' (doc {doc_id}) has a squared norm above the limit \
+                         of {MAX_ROW_NORM_SQUARED:e}",
+                        schema.get_field_entry(field).name(),
+                    )));
+                }
             }
         }
         Ok(())

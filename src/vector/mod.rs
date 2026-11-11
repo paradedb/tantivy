@@ -115,7 +115,8 @@ pub use collector::{
     SegmentVectorFruit, TopDocsByVectorSimilarity, TopDocsByVectorSimilarityBuilder,
     VectorSimilarityFruit,
 };
-pub use element::{Accumulator, VectorElement, ENTRY_ALIGN};
+pub use distance::MAX_ROW_NORM_SQUARED;
+pub use element::{Accumulator, InvalidRow, VectorElement, ENTRY_ALIGN};
 pub use params::{
     AdaptiveProbeParams, LocatedPath, ProbeParams, Selectivity, DEFAULT_FIXED_PROBE_COST_ROWS,
 };

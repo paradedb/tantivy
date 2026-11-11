@@ -17,7 +17,7 @@
 use std::cmp::Ordering;
 
 use crate::schema::{Metric, VectorDType, VectorOptions};
-use crate::vector::{Accumulator, VectorElement};
+use crate::vector::{Accumulator, InvalidRow, VectorElement};
 
 /// A "higher is better" similarity score — the one ranking convention of the
 /// whole vector module.
@@ -270,14 +270,27 @@ pub(crate) enum NormalizeOutcome {
     /// sum to at most ~1.8e80, always finite in f64). Row left
     /// unchanged; the caller decides policy.
     NonFinite,
+    /// A row stored as given whose squared norm exceeds [`MAX_ROW_NORM_SQUARED`]. Row left
+    /// unchanged.
+    NormTooLarge,
 }
 
 /// L2-normalize a little-endian `T` row in place, with all internal
 /// arithmetic in f64 (see [`norm_squared_bytes_wide`]). Elements narrow
 /// back to `T` only at write-back, where every value is `<= 1`.
 pub(crate) fn normalize_bytes_inplace<T: VectorElement>(row: &mut [u8]) -> NormalizeOutcome {
+    normalize_with_norm_squared::<T>(row, norm_squared_bytes_wide::<T>(row))
+}
+
+/// [`normalize_bytes_inplace`] with the row's wide squared norm already computed, so a caller
+/// that validated the row does not take a second norm pass.
+#[inline]
+fn normalize_with_norm_squared<T: VectorElement>(
+    row: &mut [u8],
+    norm_squared: f64,
+) -> NormalizeOutcome {
     debug_assert_eq!(row.len() % T::SIZE_BYTES, 0);
-    let norm = norm_squared_bytes_wide::<T>(row).sqrt();
+    let norm = norm_squared.sqrt();
     if norm == 0.0 {
         return NormalizeOutcome::ZeroSkipped;
     }
@@ -311,14 +324,35 @@ pub(crate) fn maybe_normalize_bytes(opts: &VectorOptions, row: &mut [u8]) -> Nor
     } // exhaustive: a new dtype variant must decide its policy here
 }
 
-/// Whether every element of a row is finite. Normalizing metrics learn this from the norm
-/// ([`NormalizeOutcome::NonFinite`]); the others check it here.
-pub(crate) fn row_is_finite(opts: &VectorOptions, row: &[u8]) -> bool {
+/// Largest squared norm of a row stored as given (every metric that does not normalize, such as
+/// L2 and inner product): `f32::MAX / 8`, a norm of about 6.5e18.
+///
+/// Rows with squared norm at most `B^2` keep every centroid, a convex combination of rows, within
+/// `B^2` too. Residual norms, squared distances and the `|x|^2 + |c|^2 - 2 x.c` form then stay
+/// within `4 B^2 = f32::MAX / 2` in the f32 encode, clustering and scoring arithmetic, which
+/// leaves a factor of 2 for rounding. Normalized rows have unit norm and need no bound.
+pub const MAX_ROW_NORM_SQUARED: f64 = f32::MAX as f64 / 8.0;
+
+/// Checks a row being added and normalizes it in place when `opts` requires it, from the same
+/// norm: one pass over the row for every metric. Every metric rejects NaN and infinite elements
+/// ([`VectorElement::checked_norm_squared`]); a row stored as given is also rejected above
+/// [`MAX_ROW_NORM_SQUARED`].
+pub(crate) fn check_and_normalize_row(opts: &VectorOptions, row: &mut [u8]) -> NormalizeOutcome {
     debug_assert_eq!(row.len(), opts.bytes_per_vector());
     match opts.dtype() {
-        VectorDType::F32 => row
-            .chunks_exact(f32::SIZE_BYTES)
-            .all(|bytes| f32::decode_le(bytes).is_finite()),
+        VectorDType::F32 => check_and_normalize::<f32>(opts, row),
+    } // exhaustive: a new dtype variant must decide its policy here
+}
+
+#[inline]
+fn check_and_normalize<T: VectorElement>(opts: &VectorOptions, row: &mut [u8]) -> NormalizeOutcome {
+    match T::checked_norm_squared(row) {
+        Err(InvalidRow::NonFinite) => NormalizeOutcome::NonFinite,
+        Ok(norm_squared) if opts.needs_normalization() => {
+            normalize_with_norm_squared::<T>(row, norm_squared)
+        }
+        Ok(norm_squared) if norm_squared > MAX_ROW_NORM_SQUARED => NormalizeOutcome::NormTooLarge,
+        Ok(_) => NormalizeOutcome::Normalized,
     }
 }
 
@@ -405,6 +439,54 @@ impl Metric {
 mod tests {
     use super::*;
     use crate::schema::{Metric, VectorOptions};
+
+    /// The cosine add path writes the same bytes as normalizing with the norm computed inside the
+    /// normalization, which is how rows were normalized before the add path validated them,
+    /// including a row whose squared norm is far above the bound for rows stored as given.
+    #[test]
+    fn checked_cosine_rows_normalize_to_the_same_bytes() {
+        fn reference_normalize(row: &mut [u8]) -> NormalizeOutcome {
+            let norm = norm_squared_bytes_wide::<f32>(row).sqrt();
+            if norm == 0.0 {
+                return NormalizeOutcome::ZeroSkipped;
+            }
+            if !norm.is_finite() {
+                return NormalizeOutcome::NonFinite;
+            }
+            let inv = 1.0 / norm;
+            for chunk in row.chunks_exact_mut(f32::SIZE_BYTES) {
+                let scaled = (f32::decode_le(chunk).to_f32() as f64 * inv) as f32;
+                chunk.copy_from_slice(&scaled.to_le_bytes());
+            }
+            NormalizeOutcome::Normalized
+        }
+
+        let mut state = 0x005e_ed0f_c051_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 40) as f32 / (1_u32 << 24) as f32 - 0.5
+        };
+        let mut cases: Vec<(usize, Vec<f32>)> = vec![(1024, vec![1.0e20; 1024])];
+        for (dim, magnitude) in [(3, 1.0_f32), (768, 0.05), (1024, 7.0), (1025, 3.0e15)] {
+            for _ in 0..8 {
+                cases.push((dim, (0..dim).map(|_| next() * magnitude).collect()));
+            }
+        }
+        for (dim, values) in cases {
+            let opts = VectorOptions::new(dim, Metric::Cosine);
+            let original: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let mut checked = original.clone();
+            let mut expected = original;
+            assert_eq!(
+                check_and_normalize_row(&opts, &mut checked),
+                reference_normalize(&mut expected),
+                "dim={dim}"
+            );
+            assert_eq!(checked, expected, "dim={dim}");
+        }
+    }
 
     #[test]
     fn test_l2_squared() {
