@@ -266,6 +266,16 @@ impl PreparedVectorSearch {
             }
             *routed.entry(ordinal).or_default() += 1;
         }
+        // A routed segment the ranking gave no cluster has nothing to scan; its plan still reports.
+        let unplanned = self
+            .segments
+            .iter()
+            .filter(|s| !routed.contains_key(&s.ordinal))
+            .filter_map(|s| match &s.scan {
+                Some(ScanInput::Routed { report, .. }) => Some((s.ordinal, *report)),
+                _ => None,
+            })
+            .collect();
         self.segments
             .retain(|s| !s.routed() || routed.contains_key(&s.ordinal));
         for segment in &mut self.segments {
@@ -279,6 +289,7 @@ impl PreparedVectorSearch {
         Ok(VectorScanInputs {
             prepared: self,
             candidates,
+            unplanned,
             routing_stats: HashMap::new(),
             shared_work,
         })
@@ -291,6 +302,8 @@ impl PreparedVectorSearch {
 pub struct VectorScanInputs {
     pub(crate) prepared: PreparedVectorSearch,
     pub(crate) candidates: Vec<Candidate<ClusterRef>>,
+    /// Plans of the routed segments that received no candidate.
+    pub(crate) unplanned: HashMap<SegmentOrdinal, PlanReport>,
     pub(crate) routing_stats: HashMap<SegmentOrdinal, crate::vector::VectorRoutingStats>,
     pub(crate) shared_work: Option<Arc<dyn SharedVectorWork>>,
 }

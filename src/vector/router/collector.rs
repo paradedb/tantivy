@@ -164,6 +164,7 @@ impl<T: VectorElement> TopClustersBySimilarityCollector<T> {
             rerank_factor: self.params.router_rerank_factor,
             min_beam_fraction: self.params.router_min_beam_fraction,
             aps: self.params.router_aps,
+            flat: self.params.router_flat,
         };
         let query = VectorQuery::new(
             segments[0].vectors.options().metric(),

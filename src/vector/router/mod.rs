@@ -10,11 +10,11 @@ use crate::directory::error::Incompatibility;
 use crate::directory::FileSlice;
 use crate::schema::VectorOptions;
 use crate::vector::clustering::IvfCentroids;
+use crate::vector::router::arena::VectorArena;
 use crate::vector::router::candidate::Candidate;
+use crate::vector::router::source::VectorSource;
 use crate::vector::router::stacked::levels::{ClusterId, InMemoryStore, LazyStore};
-#[cfg(test)]
 use crate::vector::search::prepared::VectorQuery;
-#[cfg(test)]
 use crate::vector::VectorElement;
 use crate::TantivyError;
 
@@ -148,8 +148,8 @@ impl BuiltRouter {
     }
 }
 
-/// Per-query routing knobs. Only the stacked router reads them; the exact router ranks the same
-/// way regardless.
+/// Per-query routing knobs. The stacked router reads the walk knobs; the exact router ranks the
+/// same way regardless.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RoutingParams {
     /// Clusters the caller expects to probe. The stacked router opens
@@ -161,6 +161,9 @@ pub(crate) struct RoutingParams {
     /// List-selection policy, independent of retention; quantized routing only.
     pub(crate) min_beam_fraction: f32,
     pub(crate) aps: bool,
+    /// Ranks every segment's centroids exactly, as the exact router does, instead of walking a
+    /// stacked router. The whole ranking is returned, as for an exact router.
+    pub(crate) flat: bool,
 }
 
 impl Default for RoutingParams {
@@ -170,6 +173,7 @@ impl Default for RoutingParams {
             rerank_factor: 1.0,
             min_beam_fraction: 0.5,
             aps: true,
+            flat: false,
         }
     }
 }
@@ -217,6 +221,25 @@ impl OpenedRouter {
         match self {
             Self::Stacked(router) => router.level_sizes(),
             Self::Exact(_) => Vec::new(),
+        }
+    }
+
+    /// Ranks every centroid of the segment exactly. A stacked router scores its bottom bank,
+    /// which keeps the segment's centroids as raw rows in cluster order, the way the exact router
+    /// scores its centroid rows; its upper levels are not read.
+    pub(crate) fn rank_exhaustive<T: VectorElement>(&self, query: &VectorQuery<T>) -> RouterIter {
+        match self {
+            Self::Exact(router) => router.rank(query),
+            Self::Stacked(router) => {
+                assert_eq!(query.widened().len(), router.dim);
+                debug_assert_eq!(query.metric(), router.metric);
+                let rows = router
+                    .level
+                    .vectors
+                    .raw()
+                    .expect("stacked routers keep raw bottom-bank rows");
+                exact::rank_rows(rows, VectorArena::num_vectors(rows, router.dim), query)
+            }
         }
     }
 
