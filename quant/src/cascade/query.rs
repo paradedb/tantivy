@@ -1,8 +1,6 @@
 //! Query preparation and scoring: the rotation plan, full-precision and split-form queries, and
 //! the per-layer kernels they dispatch to.
 
-use std::borrow::Cow;
-
 use super::encode::Encoded;
 use super::{aligned_le_words, validate, validate_specs, LayerKind, LayerSpec, Rotation};
 use crate::grid::{
@@ -14,10 +12,8 @@ use crate::grid::{
 use crate::model::Grid;
 use crate::rotation::Rotation as FhtRotation;
 use crate::sign::{
-    estimate_asym_batch_unscaled as estimate_sign_batch,
-    estimate_asym_batch_unscaled_indexed as estimate_sign_batch_indexed,
-    estimate_asym_unscaled as estimate_sign_asym, estimate_fp_unscaled as estimate_sign_fp,
-    prepare_query, unpack as unpack_sign, QueryPlanes,
+    estimate_asym_bytes, estimate_asym_unscaled as estimate_sign_asym,
+    estimate_fp_unscaled as estimate_sign_fp, prepare_query, unpack as unpack_sign, QueryPlanes,
 };
 
 #[derive(Clone, Debug)]
@@ -241,7 +237,8 @@ impl PreparedSplitQuery {
     }
 
     /// Scores a contiguous batch without scales or constants. Returns its sign-word fallbacks: 1
-    /// when sign codes aren't `u64`-aligned and are decoded into owned words, else 0.
+    /// when sign codes require decoding into owned words, else 0. x86 and NEON read unaligned
+    /// bytes.
     ///
     /// # Panics
     ///
@@ -260,14 +257,7 @@ impl PreparedSplitQuery {
             PreparedSplitLayer::Sign(query) => {
                 assert_eq!(spec.bits, 1);
                 assert_eq!(code_stride % std::mem::size_of::<u64>(), 0);
-                let words = aligned_le_words(codes);
-                estimate_sign_batch(
-                    words.as_ref(),
-                    code_stride / std::mem::size_of::<u64>(),
-                    query,
-                    out,
-                );
-                u64::from(matches!(words, Cow::Owned(_)))
+                estimate_asym_bytes(codes, code_stride / 8, None, query, out)
             }
             PreparedSplitLayer::Grid { lut, packed_lut_4 } => {
                 assert!(spec.bits > 1);
@@ -302,15 +292,7 @@ impl PreparedSplitQuery {
             PreparedSplitLayer::Sign(query) => {
                 assert_eq!(spec.bits, 1);
                 assert_eq!(code_stride % std::mem::size_of::<u64>(), 0);
-                let words = aligned_le_words(codes);
-                estimate_sign_batch_indexed(
-                    words.as_ref(),
-                    code_stride / std::mem::size_of::<u64>(),
-                    row_offsets,
-                    query,
-                    out,
-                );
-                u64::from(matches!(words, Cow::Owned(_)))
+                estimate_asym_bytes(codes, code_stride / 8, Some(row_offsets), query, out)
             }
             PreparedSplitLayer::Grid {
                 packed_lut_4: Some(packed_lut_4),
@@ -716,7 +698,7 @@ mod tests {
         assert!((layered - direct).abs() < 2e-4, "{layered} != {direct}");
     }
 
-    /// Unaligned sign codes are decoded into owned words and counted; aligned ones are borrowed.
+    /// Sign-word fallbacks count copies; direct byte scorers need none at any alignment.
     #[test]
     fn batch_scoring_returns_sign_word_fallbacks() {
         let d = 128;
@@ -744,7 +726,20 @@ mod tests {
             let mut dense = vec![0.0; rows];
             let fallbacks =
                 prepared.score_layer_batch_unscaled(0, placed, stride, spec, &mut dense);
-            assert_eq!(fallbacks, u64::from(!aligned));
+            assert_eq!(
+                fallbacks,
+                u64::from(
+                    !aligned
+                        && !cfg!(any(
+                            target_arch = "x86_64",
+                            all(
+                                target_arch = "aarch64",
+                                target_feature = "neon",
+                                target_endian = "little"
+                            )
+                        ))
+                )
+            );
             let mut indexed = vec![0.0; 2];
             let fallbacks = prepared.score_layer_batch_unscaled_indexed(
                 0,
@@ -754,7 +749,20 @@ mod tests {
                 spec,
                 &mut indexed,
             );
-            assert_eq!(fallbacks, u64::from(!aligned));
+            assert_eq!(
+                fallbacks,
+                u64::from(
+                    !aligned
+                        && !cfg!(any(
+                            target_arch = "x86_64",
+                            all(
+                                target_arch = "aarch64",
+                                target_feature = "neon",
+                                target_endian = "little"
+                            )
+                        ))
+                )
+            );
             assert_eq!(indexed, [dense[0], dense[2]]);
             scores.push(dense);
         }

@@ -74,9 +74,10 @@ vpopcntq_count() {
 batch_count=$(vpopcntq_count 12batch_avx512)
 indexed_count=$(vpopcntq_count 14indexed_avx512)
 single_count=$(vpopcntq_count 13single_avx512)
-echo "vpopcntq in sign::x86 AVX-512 variants: batch $batch_count, indexed $indexed_count, single $single_count"
-if [ "$batch_count" -eq 0 ] || [ "$indexed_count" -eq 0 ]; then
-    echo "tantivy_quant::sign::x86 batch_avx512 and indexed_avx512 must contain vpopcntq" >&2
+bytes_count=$(vpopcntq_count 12bytes_avx512)
+echo "vpopcntq in sign::x86 AVX-512 variants: batch $batch_count, indexed $indexed_count, bytes $bytes_count, single $single_count"
+if [ "$batch_count" -eq 0 ] || [ "$indexed_count" -eq 0 ] || [ "$bytes_count" -eq 0 ]; then
+    echo "tantivy_quant::sign::x86 batch_avx512, indexed_avx512, and bytes_avx512 must contain vpopcntq" >&2
     exit 1
 fi
 
