@@ -20,6 +20,9 @@ thread_local! {
 struct Round {
     /// One XOR mask per coordinate: `SIGN_BIT` to negate it, zero to keep it.
     signs: Vec<u32>,
+    /// `signs` in gather order, `perm_signs[t] = signs[perm[t]]`, so the forward round flips each
+    /// sign while it gathers.
+    perm_signs: Vec<u32>,
     perm: Vec<u32>,
     inv_perm: Vec<u32>,
 }
@@ -54,8 +57,18 @@ impl Rotation {
             for (i, &source) in perm.iter().enumerate() {
                 inv_perm[source as usize] = i as u32;
             }
+            // The gathers index without bounds checks, so both tables must be permutations of 0..d.
+            assert!(
+                inv_perm
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &position)| perm[position as usize] as usize == i),
+                "rotation permutation is not a bijection"
+            );
+            let perm_signs = perm.iter().map(|&source| signs[source as usize]).collect();
             rounds.push(Round {
                 signs,
+                perm_signs,
                 perm,
                 inv_perm,
             });
@@ -88,9 +101,14 @@ impl Rotation {
         #[cfg(debug_assertions)]
         APPLY_COUNT.with(|count| count.set(count.get() + 1));
         for round in &self.rounds {
-            apply_signs(x, &round.signs);
-            for (target, &source) in round.perm.iter().enumerate() {
-                scratch[target] = x[source as usize];
+            // Negating then permuting equals permuting with the signs in gather order.
+            for ((target, &source), &sign) in
+                scratch.iter_mut().zip(&round.perm).zip(&round.perm_signs)
+            {
+                // SAFETY: `Rotation::new` asserts `perm` is a permutation of `0..d`, and
+                // `x.len() == d` is asserted above.
+                let value = unsafe { *x.get_unchecked(source as usize) };
+                *target = f32::from_bits(value.to_bits() ^ sign);
             }
             x.copy_from_slice(scratch);
             block_hadamard(x, &self.blocks);
@@ -117,11 +135,16 @@ impl Rotation {
         assert_eq!(scratch.len(), self.d);
         for round in self.rounds.iter().rev() {
             block_hadamard(x, &self.blocks);
-            for (target, &source) in round.inv_perm.iter().enumerate() {
-                scratch[target] = x[source as usize];
+            // Permuting back then negating flips each gathered coordinate by its own sign.
+            for ((target, &source), &sign) in
+                scratch.iter_mut().zip(&round.inv_perm).zip(&round.signs)
+            {
+                // SAFETY: `Rotation::new` asserts `inv_perm` is a permutation of `0..d`, and
+                // `x.len() == d` is asserted above.
+                let value = unsafe { *x.get_unchecked(source as usize) };
+                *target = f32::from_bits(value.to_bits() ^ sign);
             }
             x.copy_from_slice(scratch);
-            apply_signs(x, &round.signs);
         }
     }
 }
@@ -178,14 +201,6 @@ fn sign_masks(rng: &mut ChaCha8Rng, d: usize) -> Vec<u32> {
         }));
     }
     masks
-}
-
-/// Negates every coordinate whose mask is `SIGN_BIT`, bit-for-bit like `-x`, without a branch.
-fn apply_signs(x: &mut [f32], signs: &[u32]) {
-    debug_assert_eq!(x.len(), signs.len());
-    for (value, &sign) in x.iter_mut().zip(signs) {
-        *value = f32::from_bits(value.to_bits() ^ sign);
-    }
 }
 
 fn block_hadamard(x: &mut [f32], blocks: &[usize]) {
