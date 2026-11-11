@@ -140,8 +140,10 @@ impl SuperKMeansClusterer {
         }
     }
 
-    /// Target training vectors per clustering leaf. Splits aim for this size;
-    /// actual leaves may be somewhat larger (about √2× the target).
+    /// Target vectors per clustering leaf on the full dataset. Training scales this by
+    /// [`Self::with_training_sample_ratio`] so sampled leaves stay proportional and final
+    /// clusters approximate this size. Splits aim for the scaled size; actual leaves may be
+    /// somewhat larger (about √2× the target).
     pub fn with_target_leaf_size(mut self, target_leaf_size: usize) -> Self {
         self.config.target_leaf_size = target_leaf_size;
         self
@@ -158,6 +160,24 @@ impl SuperKMeansClusterer {
     pub fn with_training_sample_ratio(mut self, ratio: f32) -> Self {
         self.training_sample_ratio = ratio;
         self
+    }
+
+    /// Leaf size passed to SuperKMeans for the training sample.
+    ///
+    /// For example, with defaults (`target_leaf_size=200`, `training_sample_ratio=0.32`)
+    /// this returns `64`.
+    fn training_target_leaf_size(&self) -> usize {
+        ((self.config.target_leaf_size as f64) * f64::from(self.training_sample_ratio))
+            .round()
+            .max(1.0) as usize
+    }
+
+    /// Config for HierarchicalSuperKMeans, with leaf size scaled to the training sample.
+    fn training_config(&self, angular: bool) -> HierarchicalSuperKMeansConfig {
+        let mut config = self.config.clone();
+        config.base.angular = angular;
+        config.target_leaf_size = self.training_target_leaf_size();
+        config
     }
 
     /// Vectors the memory limit holds at once.
@@ -180,9 +200,10 @@ impl SuperKMeansClusterer {
                 Arc::clone(&assigner.kmeans)
             }
             _ => {
-                let mut config = self.config.clone();
-                config.base.angular = angular;
-                let kmeans = Arc::new(HierarchicalSuperKMeans::with_config(dim, config));
+                let kmeans = Arc::new(HierarchicalSuperKMeans::with_config(
+                    dim,
+                    self.training_config(angular),
+                ));
                 *cached = Some(Assigner {
                     dim,
                     angular,
@@ -234,11 +255,8 @@ impl IvfClusterer for SuperKMeansClusterer {
                 "cannot train IVF centroids on zero vectors".to_string(),
             ));
         }
-        let mut config = self.config.clone();
-        if is_angular(options.metric()) {
-            config.base.angular = true;
-        }
-        let kmeans = HierarchicalSuperKMeans::with_config(dim, config);
+        let kmeans =
+            HierarchicalSuperKMeans::with_config(dim, self.training_config(is_angular(options.metric())));
 
         // The meso step keeps as many rows decoded as the budget allows, leaving room for one
         // streamed batch when the sample does not fit.
@@ -684,20 +702,23 @@ mod tests {
         assert_eq!(fine_group_end(&offsets, 0, 1), 1);
     }
 
-    /// The defaults are the documented constants, and the two setters are independent.
+    /// Stored settings are independent; training leaf size is scaled by the sample ratio.
     #[test]
-    fn settings_default_and_set_independently() {
+    fn settings_default_and_scale_training_leaf_size() {
         let clusterer = SuperKMeansClusterer::new();
         assert_eq!(clusterer.training_sample_ratio(), 0.32);
         assert_eq!(clusterer.config.target_leaf_size, DEFAULT_TARGET_LEAF_SIZE);
+        assert_eq!(clusterer.training_target_leaf_size(), 64);
 
         let clusterer = SuperKMeansClusterer::new()
             .with_target_leaf_size(20)
             .with_training_sample_ratio(0.25);
         assert_eq!(clusterer.training_sample_ratio(), 0.25);
         assert_eq!(clusterer.config.target_leaf_size, 20);
+        assert_eq!(clusterer.training_target_leaf_size(), 5);
         let clusterer = clusterer.with_training_sample_ratio(1.0);
         assert_eq!(clusterer.training_sample_ratio(), 1.0);
         assert_eq!(clusterer.config.target_leaf_size, 20);
+        assert_eq!(clusterer.training_target_leaf_size(), 20);
     }
 }
