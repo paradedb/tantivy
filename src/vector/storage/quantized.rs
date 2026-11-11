@@ -464,7 +464,13 @@ impl QuantizedLayerReader {
         self.cluster_in_block(cluster)?
             .sparse_cost(offsets, scratch)
     }
+    /// Rejects codes whose padding bits past the `dim * bits` payload are set.
     fn validate_codes(&self, bytes: &OwnedBytes, rows: &Range<usize>) -> crate::Result<()> {
+        // A stride the payload fills has no padding bits to check. `bits` is 1 for sign layers and
+        // validated to 2..=4 for grid layers when the metadata opens.
+        if self.dim * usize::from(self.bits) == self.code_stride * 8 {
+            return Ok(());
+        }
         for (local, code) in bytes.chunks_exact(self.code_stride).enumerate() {
             if !quantized_code_tail_is_zero(code, self.dim, self.bits) {
                 return Err(DataCorruption::comment_only(format!(
@@ -1268,6 +1274,43 @@ mod tests {
             1,
         );
         assert!(corrupt.code_bytes(BlockAddress::new(0, 0)).is_err());
+        Ok(())
+    }
+
+    /// The code check accepts exactly the rows whose padding bits are zero: every row of a stride
+    /// its payload fills, and on a padded stride only rows with a clear tail.
+    #[test]
+    fn code_check_matches_the_tail_rule_with_and_without_padding() -> crate::Result<()> {
+        for (dim, bits, padded) in [
+            (64, 1, false),
+            (1024, 1, false),
+            (64, 4, false),
+            (65, 1, true),
+            (100, 4, true),
+        ] {
+            let stride = quantized_code_stride(dim, bits);
+            assert_eq!(dim * usize::from(bits) != stride * 8, padded);
+            for fill in [0x00, 0xA5, 0xFF] {
+                let codes = vec![fill; 2 * stride];
+                let layer = test_layer(
+                    FileSlice::from(codes.clone()),
+                    FileSlice::empty(),
+                    None,
+                    &[0, 2],
+                    dim,
+                    bits,
+                );
+                let tails_zero = codes
+                    .chunks_exact(stride)
+                    .all(|row| quantized_code_tail_is_zero(row, dim, bits));
+                assert_eq!(
+                    layer.read_codes(0, 0..2).is_ok(),
+                    tails_zero,
+                    "dim={dim} bits={bits} fill={fill:#x}"
+                );
+                assert_eq!(tails_zero, !padded || fill == 0, "dim={dim} bits={bits}");
+            }
+        }
         Ok(())
     }
 
