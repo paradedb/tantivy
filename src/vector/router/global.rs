@@ -746,7 +746,8 @@ mod tests {
                 let query = VectorQuery::new(
                     metric,
                     Arc::new((0..8).map(|d| 0.1 * d as f32 - 0.3).collect()),
-                );
+                )
+                .unwrap();
                 let mut totals = vec![StageTotals::default(); 2];
                 let expected = GlobalRanking::from(
                     &[Some(&exact[0]), Some(&exact[1])],
