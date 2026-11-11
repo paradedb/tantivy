@@ -134,6 +134,12 @@ impl SuperKMeansClusterer {
         let mut config = HierarchicalSuperKMeansConfig::default();
         config.base.suppress_warnings = true;
         config.target_leaf_size = DEFAULT_TARGET_LEAF_SIZE;
+        // Splits ask for about the square root of the leaf count, far below the 256 clusters at
+        // which SuperKMeans starts pruning, so the pruner's rotated basis is never read: train in
+        // the vectors' own basis and never build the rotation (a d x d QR per trainer and a
+        // d x d GEMM over the sample).
+        config.base.use_blas_only = true;
+        config.base.data_already_rotated = true;
         Self {
             config,
             training_sample_ratio: DEFAULT_TRAINING_SAMPLE_RATIO as f32,
