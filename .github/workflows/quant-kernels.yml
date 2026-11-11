@@ -136,7 +136,8 @@ jobs:
             exit 1
           fi
       - name: Run rotation tests
-        run: cargo test -p tantivy-quant --release --lib rotation::
+        run: |
+          cargo test -p tantivy-quant --release --lib rotation::
 
   kernel-tier-avx512:
     name: AVX-512 tier under Intel SDE
