@@ -359,9 +359,9 @@ impl QuantizedCandidates {
         for block in &self.blocks {
             for index in block.at.clone() {
                 debug_assert!(
-                    self.columns.estimates[index].is_finite()
-                        && self.columns.sigmas[index].is_finite(),
-                    "quantized boundary inputs must be finite"
+                    self.columns.estimates[index].is_finite() && self.columns.sigmas[index] >= 0.0,
+                    "quantized boundary inputs: a finite estimate and a non-negative sigma (+inf \
+                     is an unbounded width)"
                 );
                 out.push(Candidate::interval(
                     RowAddress {

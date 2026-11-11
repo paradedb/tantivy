@@ -33,6 +33,9 @@ pub(crate) struct VectorQuery<T: VectorElement> {
     routing_norm: f32,
     estimate_norm: f32,
     kind: QueryKind,
+    /// Whether the quantized error width of this query is unknown: an inner-product query too
+    /// small for f32 products, whose rows are scored without pruning.
+    width_unknown: bool,
     /// Router preparation is shared by every segment and routing invocation.
     /// Dimension and metric belong to this query; version-1 encodings vary by seed.
     router_queries: Mutex<HashMap<u64, RouterQueryCell>>,
@@ -47,6 +50,22 @@ enum QueryKind {
         inv_norm_q: f32,
         normalized: Vec<f32>,
     },
+}
+
+/// Policy constant: a query whose wide squared norm is positive and below this is too small for
+/// f32 products. A unit-normalized query is scored through its f64 unit vector instead; an
+/// inner-product query keeps its values and is scored without pruning, its quantized error width
+/// unknown. The f32 path fails far below the constant: once `|q|` nears `1 / f32::MAX`, `1 / |q|`
+/// overflows f32, and once `|q|^2` leaves the normal f32 range the f32 variance terms of the error
+/// width lose precision and then reach zero. Queries at or above it are prepared unchanged.
+pub(crate) const TINY_QUERY_NORM_SQUARED: f64 = 1e-30;
+
+/// `raw` scaled to unit L2 norm in f64, given its positive wide squared norm.
+fn unit_vector<T: VectorElement>(raw: &[T], norm_squared: f64) -> Vec<T> {
+    let inv_norm = 1.0 / norm_squared.sqrt();
+    raw.iter()
+        .map(|&element| T::from_f32((f64::from(element.to_f32()) * inv_norm) as f32))
+        .collect()
 }
 
 /// The search error for a query vector refused by [`VectorQuery::new`].
@@ -103,10 +122,24 @@ impl<T: VectorElement> VectorQuery<T> {
     pub(crate) fn new(metric: Metric, raw: Arc<Vec<T>>) -> Result<Self, InvalidVector> {
         // Wide accumulation keeps a huge but finite norm finite, so admission sees the true norm.
         let norm_squared = norm_squared_wide::<T>(&raw);
-        admit(
-            norm_squared,
-            VectorNormPolicy::for_dtype_metric(T::DTYPE, metric),
-        )?;
+        let policy = VectorNormPolicy::for_dtype_metric(T::DTYPE, metric);
+        admit(norm_squared, policy)?;
+        // A unit-normalized ranking ignores the query's scale, so a tiny query is scored through
+        // its unit vector, normalized in f64, with a reciprocal norm of one. An inner product
+        // scales with the query as given, so a tiny one keeps its values and its error width is
+        // unknown. A zero query is neither.
+        let tiny = norm_squared > 0.0 && norm_squared < TINY_QUERY_NORM_SQUARED;
+        let (rescaled, width_unknown) = match policy {
+            VectorNormPolicy::UnitL2 => (tiny, false),
+            VectorNormPolicy::None => (false, tiny && !metric.scores_by_distance()),
+        };
+        let (raw, norm_squared) = if rescaled {
+            let unit = unit_vector(&raw, norm_squared);
+            let unit_norm_squared = norm_squared_wide::<T>(&unit);
+            (Arc::new(unit), unit_norm_squared)
+        } else {
+            (raw, norm_squared)
+        };
         let norm = norm_squared.sqrt();
         let widened: Arc<[f32]> = raw.iter().map(|element| element.to_f32()).collect();
         // Routing preserves the scalar kernels' narrowing before the square root.
@@ -116,7 +149,9 @@ impl<T: VectorElement> VectorQuery<T> {
             Metric::Dot => (QueryKind::Dot, routing_norm),
             Metric::Cosine => {
                 // A zero query is accepted and scores zero against every row.
-                let inv_norm_q = if norm == 0.0 {
+                let inv_norm_q = if rescaled {
+                    1.0
+                } else if norm == 0.0 {
                     0.0
                 } else {
                     (1.0 / norm) as f32
@@ -142,6 +177,7 @@ impl<T: VectorElement> VectorQuery<T> {
             routing_norm,
             estimate_norm,
             kind,
+            width_unknown,
             raw,
             router_queries: Mutex::new(HashMap::new()),
         })
@@ -175,6 +211,11 @@ impl<T: VectorElement> VectorQuery<T> {
 
     pub(crate) fn routing_norm(&self) -> f32 {
         self.routing_norm
+    }
+
+    /// Whether the quantized error width of this query is unknown, so no row may be pruned.
+    pub(crate) fn width_unknown(&self) -> bool {
+        self.width_unknown
     }
 
     pub(crate) fn estimate_vector(&self) -> &[f32] {
@@ -234,6 +275,7 @@ pub(crate) struct QuantizedQueryCtx {
     pub(crate) index: Arc<QuantizedIndexCtx>,
     prepared: QuantizedVectorQuery,
     active_layers: usize,
+    width_unknown: bool,
 }
 
 impl QuantizedQueryCtx {
@@ -263,11 +305,17 @@ impl QuantizedQueryCtx {
             index,
             prepared,
             active_layers,
+            width_unknown: query.width_unknown(),
         }
     }
 
     pub(crate) fn active_layers(&self) -> usize {
         self.active_layers
+    }
+
+    /// Whether the query's error widths are unknown: every sigma is then +inf.
+    pub(crate) fn width_unknown(&self) -> bool {
+        self.width_unknown
     }
 
     /// Squared query-quantization error contributed by this layer alone: the
@@ -375,12 +423,120 @@ impl QuantizedQueryCtx {
 mod tests {
     use std::sync::Arc;
 
-    use super::{QuantizedIndexCtx, QuantizedQueryCtx, VectorQuery};
+    use super::{
+        QuantizedIndexCtx, QuantizedQueryCtx, QueryKind, VectorQuery, TINY_QUERY_NORM_SQUARED,
+    };
     use crate::schema::{Metric, VectorOptions};
     use crate::vector::distance::{
-        norm_squared, norm_squared_wide, InvalidVector, MAX_NORM_SQUARED,
+        dot_bytes, norm_squared, norm_squared_wide, InvalidVector, MAX_NORM_SQUARED,
     };
+    use crate::vector::test_support::Lcg;
     use crate::vector::{VectorQuantizationConfig, VectorQuantizationLayer};
+
+    /// The bits a cosine query is prepared with when it is not rescaled: the reciprocal norm,
+    /// the normalized estimate vector, the routing and estimate norms, and its scores against
+    /// `rows`.
+    fn unscaled_cosine_bits(raw: &[f32], rows: &[Vec<u8>]) -> Vec<u32> {
+        let norm_squared = norm_squared_wide(raw);
+        let norm = norm_squared.sqrt();
+        let inv_norm_q = if norm == 0.0 {
+            0.0
+        } else {
+            (1.0 / norm) as f32
+        };
+        let normalized: Vec<f32> = raw.iter().map(|value| value * inv_norm_q).collect();
+        let mut bits = vec![
+            inv_norm_q.to_bits(),
+            (norm_squared as f32).sqrt().to_bits(),
+            (norm_squared_wide(&normalized) as f32).sqrt().to_bits(),
+        ];
+        bits.extend(normalized.iter().map(|value| value.to_bits()));
+        bits.extend(
+            rows.iter()
+                .map(|row| (dot_bytes::<f32>(raw, row) * inv_norm_q).to_bits()),
+        );
+        bits
+    }
+
+    fn prepared_cosine_bits(query: &VectorQuery<f32>, rows: &[Vec<u8>]) -> Vec<u32> {
+        let QueryKind::Cosine { inv_norm_q, .. } = query.kind else {
+            panic!("cosine query");
+        };
+        let mut bits = vec![
+            inv_norm_q.to_bits(),
+            query.routing_norm().to_bits(),
+            query.estimate_norm.to_bits(),
+        ];
+        bits.extend(query.estimate_vector().iter().map(|value| value.to_bits()));
+        bits.extend(
+            rows.iter()
+                .map(|row| query.score_row(row).score().to_bits()),
+        );
+        bits
+    }
+
+    fn unit_rows(dim: usize) -> Vec<Vec<u8>> {
+        (0..4)
+            .map(|seed| {
+                let row = Lcg(100 + seed).vector(dim, 1.0);
+                let norm = norm_squared_wide(&row).sqrt();
+                row.iter()
+                    .flat_map(|value| ((f64::from(*value) / norm) as f32).to_le_bytes())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cosine_queries_at_or_above_the_rescale_bound_keep_their_bits() {
+        const DIM: usize = 64;
+        let rows = unit_rows(DIM);
+        for (seed, target) in [(1, 1e-30), (2, 1e-12), (3, 1.0), (4, 1e30)] {
+            let mut raw = Lcg(seed).vector(DIM, 1.0);
+            let scale = (target / norm_squared_wide(&raw)).sqrt() as f32;
+            raw.iter_mut().for_each(|value| *value *= scale);
+            while norm_squared_wide(&raw) < target {
+                raw.iter_mut().for_each(|value| *value = value.next_up());
+            }
+            let query = VectorQuery::new(Metric::Cosine, Arc::new(raw.clone())).unwrap();
+            assert_eq!(
+                prepared_cosine_bits(&query, &rows),
+                unscaled_cosine_bits(&raw, &rows),
+                "squared norm {:e}",
+                norm_squared_wide(&raw)
+            );
+        }
+    }
+
+    #[test]
+    fn tiny_cosine_queries_score_through_their_unit_vector() {
+        const DIM: usize = 64;
+        let rows = unit_rows(DIM);
+        for raw in [
+            vec![f32::from_bits(1); DIM],
+            Lcg(5).vector(DIM, 1e-20),
+            Lcg(6).vector(DIM, f32::MIN_POSITIVE),
+        ] {
+            let norm_squared = norm_squared_wide(&raw);
+            assert!(norm_squared > 0.0 && norm_squared < TINY_QUERY_NORM_SQUARED);
+            let unit: Vec<f32> = raw
+                .iter()
+                .map(|value| (f64::from(*value) / norm_squared.sqrt()) as f32)
+                .collect();
+            let query = VectorQuery::new(Metric::Cosine, Arc::new(raw)).unwrap();
+            let QueryKind::Cosine { inv_norm_q, .. } = query.kind else {
+                panic!("cosine query");
+            };
+            assert_eq!(inv_norm_q, 1.0);
+            assert_eq!(query.estimate_vector(), unit.as_slice());
+            for row in &rows {
+                assert_eq!(
+                    query.score_row(row).score().to_bits(),
+                    dot_bytes::<f32>(&unit, row).to_bits()
+                );
+            }
+        }
+    }
 
     #[test]
     fn queries_are_admitted_by_the_row_rule() {
@@ -482,15 +638,26 @@ mod tests {
         for scale in [0.0, 1.0, 1e-30, 1e20] {
             let raw: Vec<f32> = (0..100).map(|i| (i as f32 - 50.5) * scale).collect();
             let norm = norm_squared_wide(&raw).sqrt();
+            let rescaled = norm > 0.0 && norm * norm < TINY_QUERY_NORM_SQUARED;
+            // A rescaled query is its f64 unit vector, scored with a reciprocal norm of one.
+            let scored: Vec<f32> = if rescaled {
+                raw.iter()
+                    .map(|value| (f64::from(*value) / norm) as f32)
+                    .collect()
+            } else {
+                raw.clone()
+            };
             let expected: Vec<_> = if norm == 0.0 {
                 vec![0.0; raw.len()]
+            } else if rescaled {
+                scored.clone()
             } else {
                 raw.iter()
                     .map(|value| value * (1.0 / norm) as f32)
                     .collect()
             };
             let query = VectorQuery::new(Metric::Cosine, Arc::new(raw.clone())).unwrap();
-            assert_eq!(query.routing_norm(), norm_squared(&raw).sqrt());
+            assert_eq!(query.routing_norm(), norm_squared(&scored).sqrt());
             assert_eq!(query.estimate_vector(), expected);
 
             for index in [&first_index, &second_index] {

@@ -248,6 +248,7 @@ impl<'a> QuantizedState<'a> {
             query_norm_squared: query_norm * query_norm,
             query_error_squared: spec.query_error_squared,
             cluster_score,
+            width_unknown: spec.query.width_unknown(),
         }
     }
 

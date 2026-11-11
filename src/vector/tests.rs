@@ -778,6 +778,127 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
     Ok(())
 }
 
+/// Seeded rows for the tiny-query tests, with the IVF centroids they are clustered around.
+fn tiny_query_rows(dim: usize) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    use crate::vector::test_support::Lcg;
+    let rows = (0..200)
+        .map(|row| Lcg(1000 + row).vector(dim, 1.0))
+        .collect();
+    let centroids = (0..4)
+        .map(|cluster| {
+            let mut centroid = vec![0.0; dim];
+            centroid[cluster] = 1.0;
+            centroid
+        })
+        .collect();
+    (rows, centroids)
+}
+
+/// Checks that each search path returns `expected`'s rows, in order, with scores within `tol`.
+fn assert_paths_return(
+    metric: Metric,
+    rows: &[Vec<f32>],
+    centroids: &[Vec<f32>],
+    query: &[f32],
+    expected: &[(usize, f64)],
+    tol: f64,
+) -> crate::Result<()> {
+    use crate::vector::test_support::FixtureSpec;
+    let dim = query.len();
+    let flat = FixtureSpec::flat(metric, dim, rows.iter().cloned().map(Some).collect()).build()?;
+    let ivf = FixtureSpec::ivf(metric, centroids.to_vec(), rows.to_vec()).build()?;
+    let quantized = FixtureSpec::ivf(metric, centroids.to_vec(), rows.to_vec())
+        .schedule(&[1, 1])
+        .build()?;
+    let params = exhaustive_params(centroids.len());
+    for (path, fixture) in [
+        ("flat", &flat),
+        ("IVF full precision", &ivf),
+        ("IVF [1, 1] quantized", &quantized),
+    ] {
+        let results = fixture
+            .search(&AllQuery, query, expected.len(), params.clone())?
+            .results;
+        let got: Vec<usize> = results
+            .iter()
+            .map(|&(_, address)| fixture.ordinal(address))
+            .collect::<crate::Result<_>>()?;
+        let want: Vec<usize> = expected.iter().map(|&(row, _)| row).collect();
+        assert_eq!(got, want, "{metric:?} {path}");
+        for (&(score, _), &(_, oracle)) in results.iter().zip(expected) {
+            assert!(
+                (f64::from(score) - oracle).abs() <= tol,
+                "{metric:?} {path}: {score:e} vs {oracle:e}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Inner-product queries with every element 2^-149, 1e-25 or 1e-22 are below the tiny-query
+/// bound, so the IVF `[1, 1]` quantized scan scores them without pruning and returns the
+/// brute-force top 10. Above 2^-149, f32 resolves their scores and the rows are the f64 top 10.
+#[test]
+fn tiny_dot_queries_return_the_oracle_top_k() -> crate::Result<()> {
+    use crate::vector::test_support::FixtureSpec;
+    const DIM: usize = 64;
+    let (rows, centroids) = tiny_query_rows(DIM);
+    let quantized = FixtureSpec::ivf(Metric::Dot, centroids, rows.clone())
+        .schedule(&[1, 1])
+        .build()?;
+    let mut by_sum: Vec<(usize, f64)> = rows
+        .iter()
+        .enumerate()
+        .map(|(row, values)| (row, values.iter().map(|&v| f64::from(v)).sum()))
+        .collect();
+    by_sum.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let f64_top: Vec<usize> = by_sum[..10].iter().map(|&(row, _)| row).collect();
+    for value in [f32::from_bits(1), 1e-25, 1e-22] {
+        let query = vec![value; DIM];
+        let results = quantized
+            .search(&AllQuery, &query, 10, exhaustive_params(4))?
+            .results;
+        assert_eq!(
+            results,
+            quantized.oracle(&AllQuery, &query, 10)?,
+            "element {value:e}"
+        );
+        if value.is_normal() {
+            let got: Vec<usize> = results
+                .iter()
+                .map(|&(_, address)| quantized.ordinal(address))
+                .collect::<crate::Result<_>>()?;
+            assert_eq!(got, f64_top, "element {value:e}");
+        }
+    }
+    Ok(())
+}
+
+/// A cosine query with every element the smallest subnormal ranks as its unit vector does: the f64
+/// brute-force top 10 on the flat, IVF full-precision and IVF `[1, 1]` quantized scans.
+#[test]
+fn tiny_cosine_query_returns_the_oracle_top_k() -> crate::Result<()> {
+    const DIM: usize = 64;
+    let (rows, centroids) = tiny_query_rows(DIM);
+    let query = vec![f32::from_bits(1); DIM];
+    let mut oracle: Vec<(usize, f64)> = rows
+        .iter()
+        .enumerate()
+        .map(|(row, values)| {
+            let norm = values
+                .iter()
+                .map(|&v| f64::from(v) * f64::from(v))
+                .sum::<f64>()
+                .sqrt();
+            let dot: f64 = values.iter().map(|&v| f64::from(v)).sum();
+            (row, dot / (norm * (DIM as f64).sqrt()))
+        })
+        .collect();
+    oracle.sort_by(|a, b| b.1.total_cmp(&a.1));
+    oracle.truncate(10);
+    assert_paths_return(Metric::Cosine, &rows, &centroids, &query, &oracle, 1e-6)
+}
+
 /// "Scan everything" probe params: the full-capacity ceiling, so the
 /// budget never binds before the stream is exhausted. Used by
 /// oracle-equality tests, where every cluster must be probed.

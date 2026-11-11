@@ -25,6 +25,17 @@ pub enum Metric {
     Dot,
 }
 
+impl Metric {
+    /// Whether scores are negated squared distances, which depend on where the query sits and not
+    /// only on its direction and scale.
+    pub(crate) fn scores_by_distance(self) -> bool {
+        match self {
+            Metric::L2 => true,
+            Metric::Cosine | Metric::Dot => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VectorOptions {
     dim: usize,

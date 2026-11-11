@@ -24,6 +24,8 @@ pub(crate) struct CombineCtx {
     pub(crate) query_error_squared: f32,
     /// The query's similarity to the cluster's centroid.
     pub(crate) cluster_score: f32,
+    /// Whether the query's error widths are unknown: every sigma is +inf.
+    pub(crate) width_unknown: bool,
 }
 
 // --- Combine ---
@@ -187,7 +189,10 @@ pub(crate) fn combine_refine(
 // --- Sigma ---
 
 /// Sets the sigmas at `at`: each row's data-model and arithmetic variance under one square root.
-/// The loop stays free of calls so it vectorizes.
+/// The loop stays free of calls so it vectorizes. The variance is in squared score units, so it
+/// can overflow f32 for admitted rows and queries of large norm; the sigma is then +inf, an
+/// unbounded width, and the row is never pruned. A query whose widths are unknown gets +inf for
+/// every row.
 #[inline(always)]
 fn fill_sigmas(ctx: &CombineCtx, error_ratios: &[f32], columns: &mut Columns, at: Range<usize>) {
     let sigmas = &mut columns.sigmas[at.clone()];
@@ -198,22 +203,27 @@ fn fill_sigmas(ctx: &CombineCtx, error_ratios: &[f32], columns: &mut Columns, at
     let raw_prefixes = &columns.raw_prefixes[at.clone()];
     let bases = &columns.bases[at.clone()];
     debug_assert_eq!(sigmas.len(), error_ratios.len());
-    for (index, sigma) in sigmas.iter_mut().enumerate() {
-        *sigma = quantized_sigma(
-            ctx.metric,
-            ctx.dimension,
-            residual_norms_squared[index],
-            error_ratios[index],
-            gammas[index],
-            ctx.query_norm_squared,
-            sign_query_error_terms[index],
-            arithmetic_variances[index],
-            raw_prefixes[index],
-            bases[index],
-        );
+    if ctx.width_unknown {
+        sigmas.fill(f32::INFINITY);
+    } else {
+        for (index, sigma) in sigmas.iter_mut().enumerate() {
+            *sigma = quantized_sigma(
+                ctx.metric,
+                ctx.dimension,
+                residual_norms_squared[index],
+                error_ratios[index],
+                gammas[index],
+                ctx.query_norm_squared,
+                sign_query_error_terms[index],
+                arithmetic_variances[index],
+                raw_prefixes[index],
+                bases[index],
+            );
+        }
     }
     debug_assert!(
-        columns.estimates[at].iter().all(|e| e.is_finite()) && sigmas.iter().all(|s| s.is_finite())
+        columns.estimates[at].iter().all(|e| e.is_finite()) && sigmas.iter().all(|s| *s >= 0.0),
+        "estimates must be finite and sigmas non-negative (+inf is an unbounded width)"
     );
 }
 
@@ -260,6 +270,7 @@ pub fn quantization_bench_layer0_cosine_cluster(
         query_norm_squared,
         query_error_squared,
         cluster_score,
+        width_unknown: false,
     };
     combine_initial(&ctx, decoded, columns, 0..rows);
     columns.raw_prefixes[rows - 1] + columns.estimates[rows - 1] + columns.sigmas[rows - 1]
@@ -275,7 +286,7 @@ mod tests {
     use super::*;
     use crate::schema::VectorOptions;
     use crate::vector::diagnostics::audit::diagnostic_advance_raw_prefix;
-    use crate::vector::distance::Similarity;
+    use crate::vector::distance::{norm_squared_wide, Similarity};
     use crate::vector::quantization::QUANTIZED_BOUNDARY_KAPPA;
     use crate::vector::search::cluster_source::ClusterRows;
     use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
@@ -296,6 +307,7 @@ mod tests {
             query_norm_squared,
             query_error_squared,
             cluster_score,
+            width_unknown: false,
         }
     }
 
@@ -314,6 +326,136 @@ mod tests {
             errors: errors.to_vec(),
             constants: constants.to_vec(),
             norms: norms.to_vec(),
+        }
+    }
+
+    /// An inner-product query at or above the tiny-query bound of 1e-30 gets every layer-0 estimate
+    /// and sigma from the width formula, bit for bit; a smaller one keeps its estimates and gets
+    /// an unbounded sigma for every row.
+    #[test]
+    fn inner_product_widths_follow_the_formula_at_or_above_the_tiny_query_bound() {
+        const DIM: usize = 64;
+        const ROWS: usize = 32;
+        let config = VectorQuantizationConfig::materialize(
+            "tiny_inner_product".to_string(),
+            &VectorOptions::new(DIM, Metric::Dot),
+            vec![
+                VectorQuantizationLayer { bits: 1, seed: 17 },
+                VectorQuantizationLayer { bits: 1, seed: 23 },
+            ],
+        )
+        .unwrap();
+        let index = Arc::new(QuantizedIndexCtx::from_config(config).unwrap());
+        let centroid: Vec<f32> = (0..DIM)
+            .map(|coordinate| ((coordinate as f32 + 0.5) * 0.071).cos() * 0.1)
+            .collect();
+        let mut rows: Vec<f32> = (0..ROWS * DIM)
+            .map(|i| centroid[i % DIM] + ((i as f32 + 0.75) * 0.113).sin())
+            .collect();
+        let encoded = encode_batch_in_place(
+            &mut rows,
+            ROWS,
+            &prepare_centroid(&centroid, &index.specs),
+            &index.specs,
+            &index.grids,
+        );
+        let layer = &encoded.layers[0];
+        let gammas: Vec<f32> = layer.gammas.iter().copied().map(f16_to_f32).collect();
+        let errors: Vec<f32> = layer
+            .corrected_error_ratios
+            .iter()
+            .copied()
+            .map(f16_to_f32)
+            .collect();
+        let direction: Vec<f32> = (0..DIM)
+            .map(|coordinate| ((coordinate as f32 + 0.25) * 0.173).sin())
+            .collect();
+        for (target, unbounded) in [
+            (1e-31, true),
+            (1e-30, false),
+            (1e-12, false),
+            (1.0, false),
+            (1e30, false),
+        ] {
+            let scale = (target / norm_squared_wide(&direction)).sqrt() as f32;
+            let mut values: Vec<f32> = direction.iter().map(|value| value * scale).collect();
+            while norm_squared_wide(&values) < target {
+                values.iter_mut().for_each(|value| *value = value.next_up());
+            }
+            let vector_query = VectorQuery::new(Metric::Dot, Arc::new(values.clone())).unwrap();
+            let query = QuantizedQueryCtx::new(Arc::clone(&index), &vector_query);
+            let mut kernel = vec![0.0; ROWS];
+            query.score_layer_batch_unscaled(
+                0,
+                &layer.codes,
+                layer.codes.len() / ROWS,
+                &mut kernel,
+            );
+            let cluster_score = Metric::Dot.similarity(&values, &centroid).score();
+            let query_norm = query.score_query_norm(cluster_score);
+            let query_error_squared = query.query_error_squared(0) as f32;
+            let combine = CombineCtx {
+                metric: Metric::Dot,
+                dimension: DIM,
+                query_norm_squared: query_norm * query_norm,
+                query_error_squared,
+                cluster_score,
+                width_unknown: query.width_unknown(),
+            };
+            let mut columns = Columns::default();
+            combine_initial(
+                &combine,
+                &decoded(
+                    &kernel,
+                    &layer.scales,
+                    &gammas,
+                    &errors,
+                    &[],
+                    &encoded.residual_norms_squared,
+                ),
+                &mut columns,
+                0..ROWS,
+            );
+            for row in 0..ROWS {
+                let scale = layer.scales[row];
+                let raw_prefix = initial_dot_raw_prefix(kernel[row], scale);
+                let estimate = corrected_quantized_estimate(
+                    Metric::Dot,
+                    gammas[row],
+                    raw_prefix,
+                    cluster_score,
+                );
+                let sigma = quantized_sigma(
+                    Metric::Dot,
+                    DIM,
+                    encoded.residual_norms_squared[row],
+                    errors[row],
+                    gammas[row],
+                    query_norm * query_norm,
+                    scale * scale * query_error_squared,
+                    ArithmeticError::initial(
+                        Metric::Dot,
+                        kernel[row],
+                        scale,
+                        0.0,
+                        cluster_score,
+                        encoded.residual_norms_squared[row],
+                    ),
+                    raw_prefix,
+                    cluster_score,
+                );
+                let expected_sigma = if unbounded { f32::INFINITY } else { sigma };
+                assert_eq!(
+                    columns.estimates[row].to_bits(),
+                    estimate.to_bits(),
+                    "target {target:e} row {row}"
+                );
+                assert_eq!(
+                    columns.sigmas[row].to_bits(),
+                    expected_sigma.to_bits(),
+                    "target {target:e} row {row}"
+                );
+            }
         }
     }
 

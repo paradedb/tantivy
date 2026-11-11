@@ -328,7 +328,10 @@ pub(crate) fn maybe_normalize_bytes(opts: &VectorOptions, row: &mut [u8]) -> Nor
 /// Rows and queries with squared norm at most `B^2` keep every centroid, a convex combination of
 /// rows, within `B^2` too. Residual norms, squared distances and the `|x|^2 + |c|^2 - 2 x.c` form
 /// then stay within `4 B^2 = f32::MAX / 2` in f32 arithmetic, which leaves a factor of 2 for
-/// rounding. Unit-normalized vectors are never bounded.
+/// rounding. The bound keeps exact scores and the stored statistics finite in f32. Quantized
+/// error widths come from f32 variances in squared score units and can still overflow to +inf
+/// above roughly a squared norm of 1e19; an infinite width disables pruning for that row, so
+/// results stay correct. Unit-normalized vectors are never bounded.
 pub(crate) const MAX_NORM_SQUARED: f64 = f32::MAX as f64 / 8.0;
 
 /// Why a row or a query vector is refused.
