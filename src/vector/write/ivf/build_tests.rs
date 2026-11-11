@@ -457,3 +457,137 @@ fn vector_info_reports_router_levels() -> crate::Result<()> {
     }
     Ok(())
 }
+
+// --- Parallel encode ---
+
+/// A two-segment `[1, 1]` index of 3,000 dimension-64 vectors around 24 one-hot centroids plus one
+/// centroid no vector is nearest to. Cluster 0 takes a third of the docs, so it outgrows a small
+/// group cap.
+fn parallel_encode_index(metric: Metric, replication: u8) -> crate::Result<Index> {
+    const DIM: usize = 64;
+    const CLUSTERS: usize = 24;
+    let centroid = |cluster: usize| {
+        let mut centroid = vec![0.0; DIM];
+        centroid[cluster] = 1.0;
+        centroid
+    };
+    let mut centroids: Vec<Vec<f32>> = (0..CLUSTERS).map(centroid).collect();
+    centroids.push(vec![-1.0; DIM]);
+    let mut schema = Schema::builder();
+    let options = VectorOptions::new(DIM, metric).with_dtype(VectorDType::F32);
+    let field = schema.add_vector_field("embedding", options.clone());
+    let settings = IndexSettings {
+        vector_clustering_threshold: 1,
+        vector_replication: replication,
+        vector_quantization: vec![crate::vector::VectorQuantizationConfig::materialize(
+            "embedding".to_string(),
+            &options,
+            vec![
+                crate::vector::VectorQuantizationLayer { bits: 1, seed: 7 },
+                crate::vector::VectorQuantizationLayer { bits: 1, seed: 11 },
+            ],
+        )?],
+        ..IndexSettings::default()
+    };
+    let index = Index::builder()
+        .schema(schema.build())
+        .settings(settings)
+        .ivf_clusterer(Arc::new(NearestClusterer {
+            centroids,
+            pairs: true,
+        }))
+        .ivf_router(RouterKind::Exact)
+        .create_in_ram()?;
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, 50_000_000)?;
+    writer.set_merge_policy(Box::new(NoMergePolicy));
+    for commit in 0..2 {
+        for ordinal in commit * 1_500..(commit + 1) * 1_500 {
+            let cluster = if ordinal % 3 == 0 {
+                0
+            } else {
+                ordinal % CLUSTERS
+            };
+            let mut rng = crate::vector::test_support::Lcg(ordinal as u64 * 7_919 + 13);
+            let vector: Vec<f32> = centroid(cluster)
+                .iter()
+                .zip(rng.vector(DIM, 0.3))
+                .map(|(center, noise)| center + noise)
+                .collect();
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(field, &vector);
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+    }
+    Ok(index)
+}
+
+/// The `.vec` and `.centroids` bytes of `index`'s segments merged on the calling thread inside a
+/// `threads`-thread rayon pool, encode groups capped at `group_bytes` (0: the default cap).
+fn merged_vector_files(
+    index: &Index,
+    threads: usize,
+    group_bytes: usize,
+) -> crate::Result<(Vec<u8>, Vec<u8>)> {
+    use std::sync::atomic::Ordering;
+
+    use crate::directory::Directory;
+    use crate::index::SegmentComponent;
+    use crate::indexer::merger::IndexMerger;
+    use crate::vector::storage::header::{CENTROIDS_EXT, VEC_EXT};
+
+    let segments = index.searchable_segments()?;
+    assert_eq!(segments.len(), 2);
+    let target = index.new_segment();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap();
+    super::encode::GROUP_DECODED_BYTES_FOR_TESTS.store(group_bytes, Ordering::Relaxed);
+    let written = pool.install(|| {
+        IndexMerger::open(
+            index.schema(),
+            index.settings().clone(),
+            &segments,
+            Box::new(|| false),
+            false,
+        )?
+        .write(&target)
+    });
+    super::encode::GROUP_DECODED_BYTES_FOR_TESTS.store(0, Ordering::Relaxed);
+    written?;
+    let read = |extension: &str| {
+        index
+            .directory()
+            .atomic_read(&target.relative_path(SegmentComponent::Custom(extension.to_string())))
+    };
+    Ok((read(VEC_EXT)?, read(CENTROIDS_EXT)?))
+}
+
+/// Encoding clusters in parallel writes the same bytes as encoding them one at a time: a one-thread
+/// pool, a four-thread pool, groups of a few clusters, and groups of one cluster (blocks written in
+/// cluster order by construction) all give byte-equal `.vec` and `.centroids` files, for cosine and
+/// L2 with and without replication.
+#[test]
+fn parallel_encode_writes_the_same_bytes_as_serial() -> crate::Result<()> {
+    for metric in [Metric::Cosine, Metric::L2] {
+        for replication in [1, 2] {
+            let index = parallel_encode_index(metric, replication)?;
+            let one_cluster_groups = merged_vector_files(&index, 4, 1)?;
+            for (threads, group_bytes) in [(1, 0), (4, 0), (4, 64 << 10)] {
+                let files = merged_vector_files(&index, threads, group_bytes)?;
+                assert!(
+                    files.0 == one_cluster_groups.0,
+                    "{metric:?} replication {replication}: .vec differs with {threads} threads, \
+                     group cap {group_bytes}"
+                );
+                assert!(
+                    files.1 == one_cluster_groups.1,
+                    "{metric:?} replication {replication}: .centroids differs with {threads} \
+                     threads, group cap {group_bytes}"
+                );
+            }
+        }
+    }
+    Ok(())
+}

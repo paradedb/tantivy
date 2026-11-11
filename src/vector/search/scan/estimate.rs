@@ -32,13 +32,24 @@ pub(crate) struct CombineCtx {
 
 /// Turns a shortlisted cluster's decoded layer-0 rows into the candidates at `at`, growing `out` to
 /// `at.end`.
-#[inline(always)]
+#[inline]
 pub(crate) fn combine_initial(
     ctx: &CombineCtx,
     decoded: &Decoded,
     out: &mut Columns,
     at: Range<usize>,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if fma::detected() {
+        // SAFETY: `fma::detected` reports true only when the CPU has AVX2 and FMA.
+        return unsafe { fma::combine_initial(ctx, decoded, out, at) };
+    }
+    combine_initial_body(ctx, decoded, out, at)
+}
+
+/// The loops of [`combine_initial`]; the same body compiles for every feature set.
+#[inline(always)]
+fn combine_initial_body(ctx: &CombineCtx, decoded: &Decoded, out: &mut Columns, at: Range<usize>) {
     let rows = decoded.kernel.len();
     debug_assert_eq!(decoded.norms.len(), rows);
     debug_assert_eq!(at.len(), rows);
@@ -128,8 +139,24 @@ fn seed_initial(ctx: &CombineCtx, decoded: &Decoded, out: &mut Columns, at: Rang
 }
 
 /// Refines the candidates at `at` in place with a later layer's decoded rows.
-#[inline(always)]
+#[inline]
 pub(crate) fn combine_refine(
+    ctx: &CombineCtx,
+    decoded: &Decoded,
+    columns: &mut Columns,
+    at: Range<usize>,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if fma::detected() {
+        // SAFETY: `fma::detected` reports true only when the CPU has AVX2 and FMA.
+        return unsafe { fma::combine_refine(ctx, decoded, columns, at) };
+    }
+    combine_refine_body(ctx, decoded, columns, at)
+}
+
+/// The loops of [`combine_refine`]; the same body compiles for every feature set.
+#[inline(always)]
+fn combine_refine_body(
     ctx: &CombineCtx,
     decoded: &Decoded,
     columns: &mut Columns,
@@ -225,6 +252,65 @@ fn fill_sigmas(ctx: &CombineCtx, error_ratios: &[f32], columns: &mut Columns, at
         columns.estimates[at].iter().all(|e| e.is_finite()) && sigmas.iter().all(|s| *s >= 0.0),
         "estimates must be finite and sigmas non-negative (+inf is an unbounded width)"
     );
+}
+
+// --- x86 FMA ---
+
+/// The combine loops compiled with AVX2 and FMA.
+///
+/// Every estimate goes through `f32::mul_add`. Shipped x86-64 builds carry no target-cpu, so it
+/// lowers to a `fmaf` call per row; under these features it is one fused instruction. Both round
+/// the exact `a * b + c` once, so every estimate and sigma is bit-identical to the plain body's.
+#[cfg(target_arch = "x86_64")]
+mod fma {
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    use super::{combine_initial_body, combine_refine_body, CombineCtx};
+    use crate::vector::search::scan::columns::Columns;
+    use crate::vector::search::scan::layer_read::Decoded;
+
+    /// Whether the CPU has AVX2 and FMA, probed once per process.
+    #[inline]
+    pub(super) fn detected() -> bool {
+        static DETECTED: AtomicU8 = AtomicU8::new(u8::MAX);
+        match DETECTED.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let detected = std::arch::is_x86_feature_detected!("avx2")
+                    && std::arch::is_x86_feature_detected!("fma");
+                DETECTED.store(u8::from(detected), Ordering::Relaxed);
+                detected
+            }
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must have AVX2 and FMA.
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn combine_initial(
+        ctx: &CombineCtx,
+        decoded: &Decoded,
+        out: &mut Columns,
+        at: Range<usize>,
+    ) {
+        combine_initial_body(ctx, decoded, out, at)
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must have AVX2 and FMA.
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn combine_refine(
+        ctx: &CombineCtx,
+        decoded: &Decoded,
+        columns: &mut Columns,
+        at: Range<usize>,
+    ) {
+        combine_refine_body(ctx, decoded, columns, at)
+    }
 }
 
 // --- Benchmark ---
@@ -326,6 +412,125 @@ mod tests {
             errors: errors.to_vec(),
             constants: constants.to_vec(),
             norms: norms.to_vec(),
+        }
+    }
+
+    /// `rows` values cycling through signed zeros, subnormals, magnitudes near `f32::MAX` and
+    /// ordinary values; `scale` keeps a product of two of them finite.
+    #[cfg(target_arch = "x86_64")]
+    fn awkward(rows: usize, offset: usize, scale: f32) -> Vec<f32> {
+        let values = [
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE / 8.0,
+            -f32::MIN_POSITIVE / 1024.0,
+            1e-40,
+            f32::MAX * 0.5,
+            -f32::MAX * 0.25,
+            f32::MAX.next_down(),
+            1.0,
+            -2.5,
+            1e-20,
+            -3e-19,
+            0.75,
+            123.456,
+        ];
+        (0..rows)
+            .map(|row| values[(row * 7 + offset) % values.len()] * scale)
+            .collect()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn assert_columns_bit_equal(plain: &Columns, fused: &Columns, what: &str) {
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for (name, a, b) in [
+            ("bases", &plain.bases, &fused.bases),
+            ("raw_prefixes", &plain.raw_prefixes, &fused.raw_prefixes),
+            ("estimates", &plain.estimates, &fused.estimates),
+            ("sigmas", &plain.sigmas, &fused.sigmas),
+            (
+                "residual_norm_squared",
+                &plain.residual_norm_squared,
+                &fused.residual_norm_squared,
+            ),
+            ("gammas", &plain.gammas, &fused.gammas),
+            (
+                "sign_query_error_terms",
+                &plain.sign_query_error_terms,
+                &fused.sign_query_error_terms,
+            ),
+        ] {
+            assert_eq!(bits(a), bits(b), "{what}: {name}");
+        }
+        let variances = |columns: &Columns| {
+            columns
+                .arithmetic_variances
+                .iter()
+                .map(|e| (e.raw_variance.to_bits(), e.base_variance.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            variances(plain),
+            variances(fused),
+            "{what}: arithmetic_variances"
+        );
+    }
+
+    /// The AVX2+FMA compilation of the combine loops scores every row bit for bit as the plain body
+    /// does, called directly, on rows with signed zeros, subnormals and values near `f32::MAX`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn fma_combine_is_bit_identical_to_the_plain_body() {
+        if !super::fma::detected() {
+            return;
+        }
+        const ROWS: usize = 98;
+        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+            let constants = |offset| {
+                if metric.scores_by_distance() {
+                    awkward(ROWS, offset, 0.5)
+                } else {
+                    Vec::new()
+                }
+            };
+            let layer = |offset| {
+                decoded(
+                    &awkward(ROWS, offset, 1e-3),
+                    &awkward(ROWS, offset + 3, 0.5),
+                    &awkward(ROWS, offset + 5, 1.0)
+                        .iter()
+                        .map(|g| g.abs().min(4.0))
+                        .collect::<Vec<_>>(),
+                    &awkward(ROWS, offset + 1, 1.0)
+                        .iter()
+                        .map(|e| e.abs().min(1.0))
+                        .collect::<Vec<_>>(),
+                    &constants(offset + 2),
+                    &awkward(ROWS, offset + 4, 0.25)
+                        .iter()
+                        .map(|n| n.abs())
+                        .collect::<Vec<_>>(),
+                )
+            };
+            for (cluster_score, query_error_squared) in [
+                (0.5, 1e-3),
+                (-0.0, 0.0),
+                (1e-40, f32::MIN_POSITIVE),
+                (1e30, 2.0),
+            ] {
+                let ctx = ctx(metric, 64, 1.0, query_error_squared, cluster_score);
+                let (mut plain, mut fused) = (Columns::default(), Columns::default());
+                let first = layer(0);
+                combine_initial_body(&ctx, &first, &mut plain, 0..ROWS);
+                // SAFETY: `fma::detected` returned true above, so the CPU has AVX2 and FMA.
+                unsafe { super::fma::combine_initial(&ctx, &first, &mut fused, 0..ROWS) };
+                assert_columns_bit_equal(&plain, &fused, &format!("{metric:?} initial"));
+                let second = layer(6);
+                combine_refine_body(&ctx, &second, &mut plain, 0..ROWS);
+                // SAFETY: as above.
+                unsafe { super::fma::combine_refine(&ctx, &second, &mut fused, 0..ROWS) };
+                assert_columns_bit_equal(&plain, &fused, &format!("{metric:?} refine"));
+            }
         }
     }
 
