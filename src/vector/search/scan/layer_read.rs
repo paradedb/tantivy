@@ -37,7 +37,7 @@ pub(crate) enum LayerRead {
 }
 
 /// One layer decoded for a cluster's selected rows, one entry per row.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct Decoded {
     /// Unscaled kernel scores.
     pub(crate) kernel: Vec<f32>,

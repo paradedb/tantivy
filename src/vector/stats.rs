@@ -241,10 +241,24 @@ pub(crate) enum AccessPath {
 
 // --- Probe stats ---
 
+/// Prefetched clusters discarded at the global stop; rows are an upper bound on unused scoring
+/// work, since a transport may cancel tasks that have not started.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct SpeculativeScanStats {
+    pub clusters: usize,
+    pub rows: usize,
+}
+
 /// One segment's vector search statistics. Counters sum across segments; `termination` and the
 /// `segment_*` fields are per segment.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct ProbeStats {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speculative: Option<SpeculativeScanStats>,
+    /// Sum of consumed cooperative tasks' decode times across participants, not elapsed query
+    /// time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooperative_decode_ns: Option<u64>,
     /// Rows shortlisted from the source, including replica copies dropped before scoring.
     pub candidates_scored: usize,
     /// Rows the routed source admitted and charged, a replicated document's second copy included.
@@ -388,6 +402,8 @@ impl ProbeStats {
         let full_precision = scan.layers.is_empty();
         let mut stats = Self {
             candidates_scored: scan.candidates_scored,
+            speculative: scan.speculative,
+            cooperative_decode_ns: scan.cooperative_decode_ns,
             exact_rows: scan.exact_rows,
             exact_recheck_dropped: scan.exact_recheck_dropped,
             replication_dropped: scan.replication_dropped,

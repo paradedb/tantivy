@@ -126,8 +126,9 @@ pub use router::{RouterKind, RouterMetrics};
 pub use search::input::{
     ClusterRef, PreparedVectorSearch, VectorScanInputs, VectorSearchBudget, VectorSegment,
 };
+pub use search::scan::executor::{VectorScanExecutor, VectorScanOutput, VectorScanTask};
 pub use search::source::controller::{AtomicVectorWork, ProbeTermination, SharedVectorWork};
-pub use stats::ProbeStats;
+pub use stats::{ProbeStats, SpeculativeScanStats};
 pub use storage::blocks::BlockAddress;
 pub use storage::io::{current_vector_read_kind, VectorReadKind};
 pub use storage::{VectorIndexReader, VectorIoStats};

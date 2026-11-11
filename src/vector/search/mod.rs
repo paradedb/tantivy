@@ -37,9 +37,7 @@ use crate::vector::stats::ProbeStats;
 use crate::vector::stats::SegmentReport;
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::reader::VectorIndexReader;
-use crate::vector::telemetry::enter_vector_stage;
-#[cfg(test)]
-use crate::vector::telemetry::measure;
+use crate::vector::telemetry::{enter_vector_stage, measure};
 #[cfg(test)]
 use crate::vector::tie_break::NoTieBreak;
 use crate::vector::{Candidate, RouterMetrics, VectorElement, VectorStage};
@@ -137,6 +135,29 @@ impl<T: VectorElement> SegmentSearcher<T> {
             query: &self.query,
             quantized: self.quantized.as_deref(),
         }
+    }
+
+    pub(crate) fn decode(
+        &self,
+        task: &crate::vector::VectorScanTask,
+    ) -> crate::Result<crate::vector::VectorScanOutput> {
+        use crate::vector::search::scan::executor::decode_task;
+        use crate::vector::search::scan::layer_read::LayerSpec;
+        let query = self.quantized.as_ref().ok_or_else(|| {
+            TantivyError::InvalidArgument("parallel layer scan requires quantization".into())
+        })?;
+        let field = self.reader.quantization()?.ok_or_else(|| {
+            TantivyError::InvalidArgument("parallel layer scan requires quantized storage".into())
+        })?;
+        decode_task(
+            &LayerSpec {
+                query,
+                reader: &field.layers()[0],
+                index: 0,
+                query_error_squared: query.query_error_squared(0) as f32,
+            },
+            task,
+        )
     }
 
     pub(crate) fn reader(&self) -> &VectorIndexReader {
