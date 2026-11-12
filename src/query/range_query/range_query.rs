@@ -93,6 +93,16 @@ impl RangeQuery {
         self.get_term().typ()
     }
 
+    /// Lower bound of the range.
+    pub fn lower_bound(&self) -> &Bound<Term> {
+        &self.bounds.lower_bound
+    }
+
+    /// Upper bound of the range.
+    pub fn upper_bound(&self) -> &Bound<Term> {
+        &self.bounds.upper_bound
+    }
+
     pub(crate) fn get_term(&self) -> &Term {
         self.bounds
             .get_inner()

@@ -33,6 +33,16 @@ impl FastFieldRangeQuery {
             bounds: BoundsRange::new(lower_bound, upper_bound),
         }
     }
+
+    /// Lower bound of the range.
+    pub fn lower_bound(&self) -> &Bound<Term> {
+        &self.bounds.lower_bound
+    }
+
+    /// Upper bound of the range.
+    pub fn upper_bound(&self) -> &Bound<Term> {
+        &self.bounds.upper_bound
+    }
 }
 
 impl Query for FastFieldRangeQuery {
