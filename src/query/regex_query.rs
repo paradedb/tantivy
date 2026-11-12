@@ -158,6 +158,31 @@ mod test {
     }
 
     #[test]
+    pub fn test_regex_query_score_is_constant_across_matching_terms() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let field = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            // Matches `comm.*` via two distinct terms.
+            index_writer.add_document(doc!(field => "common commit"))?;
+            // Matches via one term.
+            index_writer.add_document(doc!(field => "common"))?;
+            index_writer.commit()?;
+        }
+        let searcher = index.reader()?.searcher();
+        let query = RegexQuery::from_pattern("comm.*", field)?;
+
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(2).order_by_score())?;
+        assert_eq!(top_docs.len(), 2);
+        for (score, _) in top_docs {
+            // Constant score per match, not boost × number of matching terms.
+            assert_nearly_equals!(1.0, score);
+        }
+        Ok(())
+    }
+
+    #[test]
     pub fn test_construct_from_regex() -> crate::Result<()> {
         let (reader, field) = build_test_index()?;
 
