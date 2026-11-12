@@ -147,12 +147,14 @@ impl PreparedVectorSearch {
                             located_cap: cap,
                         };
                         let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                        let late = weight.uses_fast_fields()
-                            && params.estimated_filter_matches.is_some_and(|matches| {
-                                matches >= crate::vector::MIN_LATE_FILTER_MATCHES
-                            })
-                            && vectors.quantization()?.is_some();
-                        let source = if late {
+                        let source = if params.filter_strategy
+                            == crate::vector::VectorFilterStrategy::Post
+                        {
+                            if vectors.quantization()?.is_none() {
+                                return Err(TantivyError::InvalidArgument(
+                                    "post-filtering requires quantized IVF segments".into(),
+                                ));
+                            }
                             Source::Router(DocFilter::Candidates {
                                 filter: weight.candidate_filter(&segment.reader)?,
                             })
@@ -182,11 +184,19 @@ impl PreparedVectorSearch {
                     (None, 0)
                 } else {
                     let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                    let Source::Router(filter) =
-                        collect_segment_filter(weight, &segment.reader, max_doc, 0)?
-                    else {
-                        unreachable!()
-                    };
+                    let filter =
+                        if params.filter_strategy == crate::vector::VectorFilterStrategy::Post {
+                            DocFilter::Candidates {
+                                filter: weight.candidate_filter(&segment.reader)?,
+                            }
+                        } else {
+                            let Source::Router(filter) =
+                                collect_segment_filter(weight, &segment.reader, max_doc, 0)?
+                            else {
+                                unreachable!()
+                            };
+                            filter
+                        };
                     (
                         (!filter.is_empty()).then_some(ScanInput::Flat { filter }),
                         0,

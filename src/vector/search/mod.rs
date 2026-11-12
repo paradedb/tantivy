@@ -355,8 +355,9 @@ impl<T: VectorElement> SegmentSearcher<T> {
         drop(init);
         let scan = enter_vector_stage(VectorStage::ExactScan);
         let docs = match filter {
-            DocFilter::Candidates { .. } => unreachable!("late filters require IVF"),
-            DocFilter::All => itertools::Either::Left(0..self.segment.reader.max_doc()),
+            DocFilter::All | DocFilter::Candidates { .. } => {
+                itertools::Either::Left(0..self.segment.reader.max_doc())
+            }
             DocFilter::Docs(docs) => itertools::Either::Right(
                 (0..docs.max_value().div_ceil(64)).flat_map(move |bucket| {
                     docs.tinyset(bucket)
@@ -365,9 +366,21 @@ impl<T: VectorElement> SegmentSearcher<T> {
                 }),
             ),
         };
+        let mut checked = 0..0;
+        let mut matched = Vec::new();
         for doc in docs {
             if let Some(bs) = alive {
                 if !bs.is_alive(doc) {
+                    continue;
+                }
+            }
+            if let DocFilter::Candidates { filter } = filter {
+                if !checked.contains(&doc) {
+                    let _filter = enter_vector_stage(VectorStage::LateFilter);
+                    checked = doc..doc.saturating_add(64).min(self.segment.reader.max_doc());
+                    matched = filter.matches(&checked.clone().collect::<Vec<_>>())?;
+                }
+                if !matched[(doc - checked.start) as usize] {
                     continue;
                 }
             }

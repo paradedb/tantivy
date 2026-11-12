@@ -13,6 +13,30 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 /// of the probe ceiling so increasing recall does not switch access paths mid-sweep.
 pub const MIN_LATE_FILTER_MATCHES: usize = 250_000;
 
+/// Query-wide filter evaluation, selected before worker assignment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum VectorFilterStrategy {
+    /// Materialize the matches before vector search.
+    Pre { is_text_only: bool },
+    /// Check vector candidates against a non-text filter.
+    Post,
+}
+
+impl VectorFilterStrategy {
+    /// Chooses one strategy for the whole query, independently of the probe budget.
+    pub fn from_estimate(
+        is_text_only: bool,
+        estimated_matches: usize,
+        post_filtering_enabled: bool,
+    ) -> Self {
+        if !is_text_only && post_filtering_enabled && estimated_matches >= MIN_LATE_FILTER_MATCHES {
+            Self::Post
+        } else {
+            Self::Pre { is_text_only }
+        }
+    }
+}
+
 /// Query-time probe budget for IVF vector search.
 ///
 /// The budget is in work units: one unit is one average cluster of work, charged per opened
@@ -23,9 +47,8 @@ pub const MIN_LATE_FILTER_MATCHES: usize = 250_000;
 pub struct ProbeParams {
     /// Stop probing when competitive-candidate admission has decayed.
     pub adaptive_probing: Option<AdaptiveProbeParams>,
-    /// Estimated matches across the query's index snapshot. Large fast-field filters may be
-    /// deferred; `None` keeps eager evaluation.
-    pub estimated_filter_matches: Option<usize>,
+    /// How the query's filter is evaluated, consistently across segments.
+    pub filter_strategy: VectorFilterStrategy,
     /// Global work ceiling in average-cluster units. Default 100.
     pub max_probe: usize,
     /// Approximate members retained per requested cluster by the quantized router.
@@ -108,7 +131,9 @@ impl Default for ProbeParams {
     fn default() -> Self {
         Self {
             adaptive_probing: None,
-            estimated_filter_matches: None,
+            filter_strategy: VectorFilterStrategy::Pre {
+                is_text_only: false,
+            },
             max_probe: 100,
             router_rerank_factor: 1.0,
             router_min_beam_fraction: 0.5,
@@ -200,6 +225,32 @@ impl ProbeParams {
 #[cfg(test)]
 mod tests {
     use super::ProbeParams;
+
+    #[test]
+    fn filtering_strategy_respects_query_kind_and_scan_support() {
+        use super::{VectorFilterStrategy, MIN_LATE_FILTER_MATCHES};
+        for matches in [
+            0,
+            MIN_LATE_FILTER_MATCHES - 1,
+            MIN_LATE_FILTER_MATCHES,
+            usize::MAX,
+        ] {
+            assert_eq!(
+                VectorFilterStrategy::from_estimate(true, matches, true),
+                VectorFilterStrategy::Pre { is_text_only: true }
+            );
+            assert_eq!(
+                VectorFilterStrategy::from_estimate(false, matches, false),
+                VectorFilterStrategy::Pre {
+                    is_text_only: false
+                }
+            );
+        }
+        assert_eq!(
+            VectorFilterStrategy::from_estimate(false, MIN_LATE_FILTER_MATCHES, true),
+            VectorFilterStrategy::Post
+        );
+    }
 
     #[test]
     fn adaptive_stopping_preserves_budget_and_routing() -> crate::Result<()> {

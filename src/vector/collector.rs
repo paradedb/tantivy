@@ -171,14 +171,17 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
         budget: VectorSearchBudget,
         on_segment: impl FnMut(SegmentOrdinal),
     ) -> Result<PreparedVectorSearch> {
-        let mut params = self.probe_params.clone();
-        if self.max_scan_levels == 0 {
-            params.estimated_filter_matches = None;
+        if self.max_scan_levels == 0
+            && self.probe_params.filter_strategy == crate::vector::VectorFilterStrategy::Post
+        {
+            return Err(TantivyError::InvalidArgument(
+                "post-filtering requires quantized vector scanning".into(),
+            ));
         }
         PreparedVectorSearch::prepare(
             self.field,
             self.limit.saturating_add(self.offset),
-            &params,
+            &self.probe_params,
             weight,
             segments,
             budget,
@@ -3348,7 +3351,7 @@ mod late_filter_tests {
             // The actual eligibility path must also avoid draining the filter.
             let params = ProbeParams {
                 max_probe: 1,
-                estimated_filter_matches: Some(crate::vector::MIN_LATE_FILTER_MATCHES),
+                filter_strategy: crate::vector::VectorFilterStrategy::Post,
                 ..Default::default()
             };
             let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
@@ -3455,7 +3458,9 @@ mod late_filter_tests {
             ] {
                 let params = ProbeParams {
                     max_probe,
-                    estimated_filter_matches: Some(matches),
+                    filter_strategy: crate::vector::VectorFilterStrategy::from_estimate(
+                        false, matches, true,
+                    ),
                     located: crate::vector::LocatedPath::Off,
                     ..Default::default()
                 };
@@ -3494,7 +3499,7 @@ mod late_filter_tests {
         let query = vec![0.0f32; 64];
         let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
             .with_probe_params(ProbeParams {
-                estimated_filter_matches: Some(crate::vector::MIN_LATE_FILTER_MATCHES),
+                filter_strategy: crate::vector::VectorFilterStrategy::Post,
                 ..crate::vector::tests::exhaustive_params(64)
             });
         let collector = builder.build_for_segments(&weight, &segments, |_| {})?;
@@ -3502,6 +3507,48 @@ mod late_filter_tests {
             collector.merge_fruits(collector.collect_segments(&weight, &segments, |_| {})?)?;
         assert_eq!(fruit.results, fixture.oracle(&filter, &query, 10)?);
         assert_eq!(fruit.stats[0].filter_checks, 32768);
+        Ok(())
+    }
+
+    #[test]
+    fn post_filter_checks_flat_segments_without_enumeration() -> Result<()> {
+        let fixture = FixtureSpec::flat(
+            Metric::L2,
+            64,
+            (0..257).map(|i| Some(vec![i as f32; 64])).collect(),
+        )
+        .segments(2)
+        .label("matches", |i| i % 3 == 0)
+        .deletes(&[0, 3, 6])
+        .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let segments = searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
+            .collect::<Vec<_>>();
+        let filter = fixture.filter("matches");
+        let weight = DeferredWeight {
+            inner: fixture.weight(&filter)?,
+            allow_enumeration: false,
+        };
+        let query = vec![0.0f32; 64];
+        let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
+            .with_probe_params(ProbeParams {
+                filter_strategy: crate::vector::VectorFilterStrategy::Post,
+                ..Default::default()
+            });
+        let collector = builder
+            .clone()
+            .build_for_segments(&weight, &segments, |_| {})?;
+        let fruit =
+            collector.merge_fruits(collector.collect_segments(&weight, &segments, |_| {})?)?;
+        assert_eq!(fruit.results, fixture.oracle(&filter, &query, 10)?);
+        assert!(builder
+            .with_max_scan_levels(0)
+            .build_for_segments(&weight, &segments, |_| {})
+            .is_err());
         Ok(())
     }
 }
