@@ -22,7 +22,7 @@ use crate::columnar::writer::column_writers::{
 use crate::columnar::writer::value_index::{IndexBuilder, PreallocatedIndexBuilders};
 use crate::dictionary::{DictionaryBuilder, TermIdMapping, UnorderedId};
 use crate::value::{Coerce, NumericalType, NumericalValue};
-use crate::{Cardinality, RowId};
+use crate::{CURRENT_VERSION, Cardinality, RowId};
 
 /// This is a set of buffers that are used to temporarily write the values into before passing them
 /// to the fast field codecs.
@@ -537,8 +537,9 @@ fn collect_sort_order_from_ops<V, K: Clone>(
         .collect()
 }
 
-// Serialize [Dictionary, Column, dictionary num bytes U32::LE]
-// Column: [Column Index, Column Values, column index num bytes U32::LE]
+// Serialize [Dictionary, Column, dictionary num bytes LE]
+// Column: [Column Index, Column Values, column index num bytes LE]
+// Both lengths have the width of `CURRENT_VERSION`, see `Version::len_trailer_num_bytes`.
 #[expect(clippy::too_many_arguments)]
 fn serialize_bytes_or_str_column(
     cardinality: Cardinality,
@@ -559,7 +560,7 @@ fn serialize_bytes_or_str_column(
     let mut counting_writer = CountingWriter::wrap(wrt);
     let term_id_mapping: TermIdMapping =
         dictionary_builder.serialize(arena, &mut counting_writer)?;
-    let dictionary_num_bytes: u32 = counting_writer.written_bytes() as u32;
+    let dictionary_num_bytes = counting_writer.written_bytes();
     let mut wrt = counting_writer.finish();
     let operation_iterator = operation_it.map(|symbol: ColumnOperation<UnorderedId>| {
         // We map unordered ids to ordered ids.
@@ -581,8 +582,7 @@ fn serialize_bytes_or_str_column(
         codec_types,
         &mut wrt,
     )?;
-    wrt.write_all(&dictionary_num_bytes.to_le_bytes()[..])?;
-    Ok(())
+    CURRENT_VERSION.write_len_trailer(dictionary_num_bytes, &mut wrt)
 }
 
 fn serialize_numerical_column(
@@ -733,6 +733,7 @@ fn send_to_serialize_column_mappable_to_u128<
         serializable_column_index,
         &&values[..],
         &mut wrt,
+        CURRENT_VERSION,
     )?;
     Ok(())
 }
@@ -784,6 +785,7 @@ fn send_to_serialize_column_mappable_to_u64(
         &&values[..],
         codec_types,
         &mut wrt,
+        CURRENT_VERSION,
     )?;
     Ok(())
 }
