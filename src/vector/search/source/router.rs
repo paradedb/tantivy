@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use common::BitSet;
 
+use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::fastfield::AliveBitSet;
 use crate::query::CandidateFilter;
 use crate::vector::router::candidate::Candidate;
@@ -123,6 +124,30 @@ impl<'a> RowGate<'a> {
                     RowVerdict::Dead
                 }
             }),
+            RowGate::Direct {
+                filter: CandidateFilter::Range { column, bounds },
+                alive,
+            } if column.get_cardinality() == columnar::Cardinality::Full => {
+                let mut values = [0u64; COLLECT_BLOCK_BUFFER_LEN];
+                let mut pruned_filter = 0;
+                let mut pruned_dead = 0;
+                for (batch, docs) in doc_ids.chunks(COLLECT_BLOCK_BUFFER_LEN).enumerate() {
+                    column
+                        .values
+                        .as_ref()
+                        .get_vals(docs, &mut values[..docs.len()]);
+                    for (i, (&doc, value)) in docs.iter().zip(&values).enumerate() {
+                        if !bounds.contains(value) {
+                            pruned_filter += 1;
+                        } else if alive.is_some_and(|alive| !alive.is_alive(doc)) {
+                            pruned_dead += 1;
+                        } else {
+                            offsets.push((batch * COLLECT_BLOCK_BUFFER_LEN + i) as u32);
+                        }
+                    }
+                }
+                (pruned_filter, pruned_dead)
+            }
             RowGate::Direct { filter, alive } => gate(doc_ids, offsets, |doc| {
                 let matches = match filter {
                     CandidateFilter::All => true,

@@ -274,8 +274,9 @@ mod tests {
                     estimate.is_some()
                 );
                 let mut offsets = Vec::new();
-                RowGate::new(filter, segment.alive_bitset()).select(&docs, &mut offsets);
-                kept.push(offsets);
+                let gated =
+                    RowGate::new(filter, segment.alive_bitset()).select(&docs, &mut offsets);
+                kept.push((gated, offsets));
             }
             assert_eq!(kept[0], kept[1]);
 
