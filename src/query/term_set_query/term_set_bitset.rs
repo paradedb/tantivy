@@ -82,6 +82,7 @@ pub(crate) fn bitset_from_postings_scorer(
 
     #[cfg(feature = "quickwit")]
     {
+        use crate::query::bitset::or_term_info_into_bitset;
         use crate::termdict::SortedTermSlice;
 
         // The SSTable backend's `get` pays a zstd block decompress per
