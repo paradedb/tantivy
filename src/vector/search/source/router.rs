@@ -329,6 +329,10 @@ impl<'a> RouterClusters<'a> {
 }
 
 impl ClusterSource for RouterClusters<'_> {
+    fn work_meter(&mut self) -> &mut WorkMeter {
+        &mut self.meter
+    }
+
     fn next(&mut self) -> crate::Result<Option<ClusterRows<'_>>> {
         loop {
             let next = {

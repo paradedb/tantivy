@@ -221,7 +221,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
             ScanInput::Flat { .. } => unreachable!(),
         };
         let adaptive_probing = matches!(input, ScanInput::Routed { .. })
-            .then_some(self.probe_params.adaptive_probing)
+            .then_some(self.probe_params.adaptive_probing())
             .flatten();
         let config = ScanConfig {
             adaptive_probing,
