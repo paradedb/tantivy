@@ -433,7 +433,7 @@ fn transform_from_f64_bounds<T: IntType + MonotonicallyMappableToU64>(
                 return TransformBound::NewBound(Bound::Excluded(T::min().to_u64()));
             }
             if upper_bound > T::max().to_f64() {
-                return TransformBound::NewBound(Bound::Included(u64::MAX));
+                return TransformBound::NewBound(Bound::Unbounded);
             }
             if upper_bound.fract() == 0.0 {
                 TransformBound::Existing(T::from_f64(upper_bound).to_u64())
