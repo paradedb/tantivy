@@ -11,7 +11,7 @@ use crate::vector::search::segment::plan::{
 use crate::vector::search::source::controller::{SharedVectorWork, WorkBudget, WorkUnits};
 use crate::vector::search::source::router::DocFilter;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
-use crate::vector::{ProbeParams, VectorStage};
+use crate::vector::{ProbeParams, VectorFilterStrategy, VectorStage};
 use crate::{Result, SegmentOrdinal, TantivyError};
 
 /// A segment handle shared by preparation, routing and scanning.
@@ -110,6 +110,7 @@ impl PreparedVectorSearch {
         budget: VectorSearchBudget,
         mut on_segment: impl FnMut(SegmentOrdinal),
     ) -> Result<Self> {
+        let filter_strategy = params.filter_strategy()?;
         let mut prepared = Self {
             field,
             top_n,
@@ -147,9 +148,7 @@ impl PreparedVectorSearch {
                             located_cap: cap,
                         };
                         let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                        let source = if params.filter_strategy
-                            == crate::vector::VectorFilterStrategy::Post
-                        {
+                        let source = if filter_strategy == VectorFilterStrategy::Post {
                             if vectors.quantization()?.is_none() {
                                 return Err(TantivyError::InvalidArgument(
                                     "post-filtering requires quantized IVF segments".into(),
@@ -184,19 +183,18 @@ impl PreparedVectorSearch {
                     (None, 0)
                 } else {
                     let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                    let filter =
-                        if params.filter_strategy == crate::vector::VectorFilterStrategy::Post {
-                            DocFilter::Candidates {
-                                filter: weight.candidate_filter(&segment.reader)?,
-                            }
-                        } else {
-                            let Source::Router(filter) =
-                                collect_segment_filter(weight, &segment.reader, max_doc, 0)?
-                            else {
-                                unreachable!()
-                            };
-                            filter
+                    let filter = if filter_strategy == VectorFilterStrategy::Post {
+                        DocFilter::Candidates {
+                            filter: weight.candidate_filter(&segment.reader)?,
+                        }
+                    } else {
+                        let Source::Router(filter) =
+                            collect_segment_filter(weight, &segment.reader, max_doc, 0)?
+                        else {
+                            unreachable!()
                         };
+                        filter
+                    };
                     (
                         (!filter.is_empty()).then_some(ScanInput::Flat { filter }),
                         0,
@@ -378,7 +376,7 @@ mod tests {
             let params = ProbeParams {
                 max_probe,
                 located: LocatedPath::Off,
-                ..Default::default()
+                ..ProbeParams::prefilter()
             };
             let query = vec![0.0f32; 32];
             let builder = TopDocs::with_limit(10)
@@ -452,10 +450,12 @@ mod tests {
             let filter = fixture.filter(label);
             let weight = fixture.weight(&filter)?;
             let query = vec![0.0f32; 32];
-            let builder = TopDocs::with_limit(5).order_by_similarity(fixture.field, query.clone());
+            let builder = TopDocs::with_limit(5)
+                .order_by_similarity(fixture.field, query.clone())
+                .with_probe_params(ProbeParams::prefilter());
             let budget = VectorSearchBudget::for_segments(
                 fixture.field,
-                &ProbeParams::default(),
+                &ProbeParams::prefilter(),
                 &segments,
             )?;
             fixture.clear_reads();
@@ -501,7 +501,7 @@ mod tests {
             .collect::<Vec<_>>();
         let params = ProbeParams {
             max_probe: 2,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
         let builder = TopDocs::with_limit(5)
             .order_by_similarity(fixture.field, vec![0.0f32; 32])
@@ -543,7 +543,7 @@ mod tests {
         let segments = [VectorSegment::from((7, searcher.segment_reader(0)))];
         let params = ProbeParams {
             located: LocatedPath::Off,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
         let query = vec![0.0f32; 32];
         let builder = TopDocs::with_limit(5)

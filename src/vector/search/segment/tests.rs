@@ -209,7 +209,7 @@ fn adaptive_stopping_preserves_router_work_and_path_selection() -> crate::Result
             for max_probe in [1, 2, 7, 16, 64] {
                 let params = ProbeParams {
                     max_probe,
-                    ..Default::default()
+                    ..ProbeParams::prefilter()
                 };
                 let fixed = fixture.search(filter, &query, 6400, params.clone())?;
                 let adaptive = fixture.search(
@@ -240,7 +240,7 @@ fn adaptive_probing_rejects_invalid_admission_fraction() {
     for admission_fraction in [-1.0, 1.01, f64::NAN, f64::INFINITY] {
         assert!(ProbeParams {
             adaptive_probing: Some(AdaptiveProbeParams { admission_fraction }),
-            ..Default::default()
+            ..ProbeParams::prefilter()
         }
         .resolved_work_budget(MATRIX_CLUSTERS, MATRIX_DOCS)
         .is_err());
@@ -909,7 +909,7 @@ fn adaptive_probe_finds_nn_outside_nearest_cluster() -> crate::Result<()> {
     let one_cluster = ProbeParams {
         max_probe: 1,
         min_probe_clusters: 1,
-        ..Default::default()
+        ..ProbeParams::prefilter()
     };
     let missed = fixture.search(&AllQuery, &query, 1, one_cluster)?;
     assert_ne!(
@@ -939,7 +939,7 @@ fn routes_home_below_ceiling() -> crate::Result<()> {
     let fixture = FixtureSpec::ivf(Metric::L2, centroids.clone(), vectors).build()?;
     let params = ProbeParams {
         max_probe: 2,
-        ..Default::default()
+        ..ProbeParams::prefilter()
     };
     for centroid in centroids.iter().step_by(3) {
         let query = [centroid[0] + 0.3, centroid[1] - 0.2];
@@ -968,7 +968,7 @@ fn single_centroid_segment_routes() -> crate::Result<()> {
     )
     .build()?;
     let query = [0.0, 0.0];
-    let fruit = fixture.search(&AllQuery, &query, 3, ProbeParams::default())?;
+    let fruit = fixture.search(&AllQuery, &query, 3, ProbeParams::prefilter())?;
     assert_eq!(fruit.results, fixture.oracle(&AllQuery, &query, 3)?);
     assert_eq!(fruit.stats[0].clusters_probed(), 1);
     Ok(())
@@ -1210,7 +1210,7 @@ fn every_cluster() -> ProbeParams {
         min_probe_clusters: 4,
         exact_plan: false,
         located: LocatedPath::Off,
-        ..Default::default()
+        ..ProbeParams::prefilter()
     }
 }
 
@@ -1571,7 +1571,7 @@ fn flat_path_reads_one_row_per_survivor() -> crate::Result<()> {
         };
         fixture.clear_reads();
         let (hits, stats) =
-            fixture.run_segment(0, &weight, &[0.0, 0.0], docs, Default::default())?;
+            fixture.run_segment(0, &weight, &[0.0, 0.0], docs, ProbeParams::prefilter())?;
         let admitted = weight.docs.len();
         assert_eq!(hits.len(), admitted, "{percent}%");
         assert_eq!(stats.exact_rows, admitted, "{percent}%");
@@ -1904,7 +1904,7 @@ fn located_path_charges_the_work_meter() -> crate::Result<()> {
         max_probe: 1,
         min_probe_clusters: 0,
         fixed_probe_cost_rows: 1000.0,
-        ..Default::default()
+        ..ProbeParams::prefilter()
     };
     let weight = fixture.weight(&filter)?;
     let (hits, stats) =
@@ -2517,7 +2517,7 @@ fn replication_recall_and_located_path() -> crate::Result<()> {
             min_probe_clusters: 1,
             exact_plan: false,
             located: LocatedPath::Off,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
         for (query_ord, query) in matrix_queries().iter().enumerate() {
             let recall = |fixture: &Fixture| -> crate::Result<usize> {

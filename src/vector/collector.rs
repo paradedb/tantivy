@@ -40,7 +40,7 @@ use crate::vector::tie_break::NoTieBreak;
 use crate::vector::write::RowAddress;
 use crate::vector::{
     BlockAddress, PreparedVectorSearch, TopClustersBySimilarityCollector, VectorElement,
-    VectorScanInputs, VectorSearchBudget, VectorSegment, VectorStage,
+    VectorFilterStrategy, VectorScanInputs, VectorSearchBudget, VectorSegment, VectorStage,
 };
 use crate::{DocAddress, DocId, Result, Score, SegmentOrdinal, TantivyError};
 
@@ -119,7 +119,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
         self
     }
 
-    /// Sets the probe parameters; flat segments ignore them.
+    /// Sets the probe parameters, including the required filter strategy.
     pub fn with_probe_params(mut self, params: ProbeParams) -> Self {
         self.probe_params = params;
         self
@@ -172,7 +172,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
         on_segment: impl FnMut(SegmentOrdinal),
     ) -> Result<PreparedVectorSearch> {
         if self.max_scan_levels == 0
-            && self.probe_params.filter_strategy == crate::vector::VectorFilterStrategy::Post
+            && self.probe_params.filter_strategy()? == VectorFilterStrategy::Post
         {
             return Err(TantivyError::InvalidArgument(
                 "post-filtering requires quantized vector scanning".into(),
@@ -1370,7 +1370,7 @@ mod ivf_e2e_tests {
                     min_probe_clusters: 0,
                     exact_plan: false,
                     located: LocatedPath::Off,
-                    ..Default::default()
+                    ..ProbeParams::prefilter()
                 })
                 .build_for_searcher(&searcher, &crate::query::AllQuery)
                 .unwrap();
@@ -1420,6 +1420,7 @@ mod ivf_e2e_tests {
             .collect();
         let collector = TopDocs::with_limit(5)
             .order_by_similarity(fixture.field, query)
+            .with_probe_params(ProbeParams::prefilter())
             .build_for_searcher(&searcher, &fixture.filter("absent"))?;
         let weight = fixture.weight(&fixture.filter("absent"))?;
         let fruit = collector.merge_fruits(collector.collect_segments(
@@ -1644,7 +1645,7 @@ mod ivf_e2e_tests {
         let params = ProbeParams {
             max_probe: 1,
             min_probe_clusters: 3,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
         for planned in [false, true] {
             let builder = TopDocs::with_limit(3)
@@ -1710,7 +1711,7 @@ mod ivf_e2e_tests {
         let params = ProbeParams {
             max_probe: 4,
             located: LocatedPath::Off,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
         for (filter, fraction) in [
             (&AllQuery as &dyn Query, 1.0),
@@ -1956,7 +1957,7 @@ mod ivf_e2e_tests {
             max_probe: 3,
             located: LocatedPath::Off,
             exact_plan: false,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
         let builder = || {
             TopDocs::with_limit(5)
@@ -2042,7 +2043,7 @@ mod ivf_e2e_tests {
         let params = ProbeParams {
             max_probe: 1,
             located: LocatedPath::Off,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
         let builder = || {
             TopDocs::with_limit(5)
@@ -2134,7 +2135,7 @@ mod ivf_e2e_tests {
             let params = ProbeParams {
                 max_probe,
                 located: LocatedPath::Off,
-                ..Default::default()
+                ..ProbeParams::prefilter()
             };
             let builder = TopDocs::with_limit(3)
                 .order_by_similarity(field, vec![0.0f32; 32])
@@ -2175,6 +2176,7 @@ mod ivf_e2e_tests {
             let weight = fixture.weight(filter)?;
             let wrong_length = TopDocs::with_limit(1)
                 .order_by_similarity(fixture.field, vec![0.0f32])
+                .with_probe_params(ProbeParams::prefilter())
                 .build_for_segments(weight.as_ref(), &segments, |_| {})?;
             for error in [
                 wrong_length
@@ -2212,6 +2214,7 @@ mod ivf_e2e_tests {
                 let weight = fixture.weight(&filter)?;
                 let collector = TopDocs::with_limit(2)
                     .order_by_similarity(fixture.field, vec![0.0f32; 32])
+                    .with_probe_params(ProbeParams::prefilter())
                     .build_for_segments(weight.as_ref(), &segments, |_| {})?;
                 assert!(collector.inputs.routing_stats.is_empty());
                 let fruit = collector.merge_fruits(collector.collect_segments(
@@ -2225,7 +2228,7 @@ mod ivf_e2e_tests {
                 .order_by_similarity(fixture.field, vec![0.0f32; 32])
                 .with_probe_params(ProbeParams {
                     located: LocatedPath::Off,
-                    ..Default::default()
+                    ..ProbeParams::prefilter()
                 })
                 .build_for_segments(fixture.all()?.as_ref(), &segments, |_| {})
                 .err()
@@ -2368,7 +2371,7 @@ mod ivf_e2e_tests {
         let params = ProbeParams {
             max_probe: 1,
             min_probe_clusters: 3,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
         let builder = || {
             TopDocs::with_limit(3)
@@ -2442,7 +2445,7 @@ mod ivf_e2e_tests {
                 .with_probe_params(ProbeParams {
                     max_probe: 1,
                     min_probe_clusters: 16,
-                    ..Default::default()
+                    ..ProbeParams::prefilter()
                 })
                 .build_for_searcher(&searcher, &crate::query::AllQuery)
                 .unwrap()
@@ -2518,7 +2521,7 @@ mod ivf_e2e_tests {
                     }),
                     max_probe: 8,
                     located: LocatedPath::Off,
-                    ..Default::default()
+                    ..ProbeParams::prefilter()
                 })
                 .build_for_searcher(&searcher, &crate::query::AllQuery)
                 .unwrap();
@@ -2612,6 +2615,7 @@ mod ivf_e2e_tests {
                 let expected = index.ground_truth(query, k)?;
                 let collector = TopDocs::with_limit(k)
                     .order_by_similarity(index.embedding_field(), query.to_vec())
+                    .with_probe_params(ProbeParams::prefilter())
                     .build_for_searcher(&searcher, &crate::query::AllQuery)
                     .unwrap();
                 let actual = searcher.search(&AllQuery, &collector)?;
@@ -2782,8 +2786,11 @@ mod ivf_e2e_tests {
 
                 // Probe invariance, under the default probe params so the
                 // gate/ceiling logic actually runs.
-                let collector =
-                    || TopDocs::with_limit(k).order_by_similarity(embedding_field, query.to_vec());
+                let collector = || {
+                    TopDocs::with_limit(k)
+                        .order_by_similarity(embedding_field, query.to_vec())
+                        .with_probe_params(ProbeParams::prefilter())
+                };
                 let mut untied = searcher.search(
                     &AllQuery,
                     &collector().build_for_searcher(&searcher, &AllQuery)?,
@@ -2814,6 +2821,7 @@ mod ivf_e2e_tests {
                 &AllQuery,
                 &TopDocs::with_limit(2)
                     .order_by_similarity(embedding_field, vec![0.0_f32, 0.0])
+                    .with_probe_params(ProbeParams::prefilter())
                     .with_tie_break(SortBySimilarityScore::new())
                     .build_for_searcher(&searcher, &crate::query::AllQuery)
                     .unwrap(),
@@ -2985,6 +2993,7 @@ mod ivf_e2e_tests {
                 &AllQuery,
                 &TopDocs::with_limit(k)
                     .order_by_similarity(embedding_field, vec![0.0_f32, 0.0])
+                    .with_probe_params(ProbeParams::prefilter())
                     .with_tie_break((SortByString::for_field("city"), Order::Asc))
                     .build_for_searcher(&searcher, &crate::query::AllQuery)
                     .unwrap(),
@@ -2992,6 +3001,7 @@ mod ivf_e2e_tests {
             assert_eq!(cities(&fruit), want, "k={k}");
             let collector = TopDocs::with_limit(k)
                 .order_by_similarity(embedding_field, vec![0.0_f32, 0.0])
+                .with_probe_params(ProbeParams::prefilter())
                 .with_tie_break((SortByString::for_field("city"), Order::Asc))
                 .build_for_searcher(&searcher, &crate::query::AllQuery)
                 .unwrap();
@@ -3144,6 +3154,7 @@ mod prepared_key_tests {
         let index = crate::Index::create_in_ram(schema.build());
         let searcher = index.reader().unwrap().searcher();
         let collector = TopDocsByVectorSimilarityBuilder::new(field, vec![3.0f32, 4.0, 0.0], 1)
+            .with_probe_params(ProbeParams::prefilter())
             .build_for_searcher(&searcher, &crate::query::AllQuery)
             .unwrap();
         let queries = std::thread::scope(|scope| {
@@ -3286,6 +3297,28 @@ mod late_filter_tests {
     }
 
     #[test]
+    fn missing_filter_strategy_is_an_error() -> Result<()> {
+        let fixture = FixtureSpec::flat(Metric::L2, 2, vec![Some(vec![0.0, 1.0])]).build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let segments = [VectorSegment::from((0, searcher.segment_reader(0)))];
+        let weight = fixture.all()?;
+        for segments in [&[][..], segments.as_slice()] {
+            let params = ProbeParams::default();
+            let budget = VectorSearchBudget::for_segments(fixture.field, &params, segments)?;
+            let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, vec![0.0f32; 2], 1);
+            assert!(matches!(
+                builder.prepare(weight.as_ref(), segments, budget, |_| {}),
+                Err(TantivyError::InvalidArgument(message)) if message.contains("filter strategy")
+            ));
+            assert!(matches!(
+                TopClustersBySimilarityCollector::new(fixture.field, vec![0.0f32; 2], params, 1.0),
+                Err(TantivyError::InvalidArgument(message)) if message.contains("filter strategy")
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn filtering_strategy_respects_query_kind_and_scan_support() -> Result<()> {
         let mut mixed_segments = Vec::new();
         for schedule in [&[][..], &[1][..], &[1, 4][..]] {
@@ -3355,8 +3388,8 @@ mod late_filter_tests {
                         }
                     );
                     let params = ProbeParams {
-                        filter_strategy: strategy,
-                        ..Default::default()
+                        filter_strategy: Some(strategy),
+                        ..ProbeParams::prefilter()
                     };
                     let builder =
                         TopDocsByVectorSimilarityBuilder::new(fixture.field, vec![0.0; 64], 10)
@@ -3442,8 +3475,8 @@ mod late_filter_tests {
             // The actual eligibility path must also avoid draining the filter.
             let params = ProbeParams {
                 max_probe: 1,
-                filter_strategy: crate::vector::VectorFilterStrategy::Post,
-                ..Default::default()
+                filter_strategy: Some(VectorFilterStrategy::Post),
+                ..ProbeParams::prefilter()
             };
             let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
                 .with_probe_params(params);
@@ -3553,15 +3586,15 @@ mod late_filter_tests {
                 };
                 let params = ProbeParams {
                     max_probe,
-                    filter_strategy: VectorFilterStrategy::plan(
+                    filter_strategy: Some(VectorFilterStrategy::plan(
                         fixture.field,
                         &weight,
                         matches,
                         usize::MAX,
                         &segments,
-                    )?,
+                    )?),
                     located: crate::vector::LocatedPath::Off,
-                    ..Default::default()
+                    ..ProbeParams::prefilter()
                 };
                 let builder =
                     TopDocsByVectorSimilarityBuilder::new(fixture.field, vec![0.0f32; 64], 10)
@@ -3594,7 +3627,7 @@ mod late_filter_tests {
         let query = vec![0.0f32; 64];
         let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
             .with_probe_params(ProbeParams {
-                filter_strategy: crate::vector::VectorFilterStrategy::Post,
+                filter_strategy: Some(VectorFilterStrategy::Post),
                 ..crate::vector::tests::exhaustive_params(64)
             });
         let collector = builder.build_for_segments(&weight, &segments, |_| {})?;
@@ -3653,8 +3686,8 @@ mod late_filter_tests {
         let query = vec![0.0f32; 64];
         let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
             .with_probe_params(ProbeParams {
-                filter_strategy: crate::vector::VectorFilterStrategy::Post,
-                ..Default::default()
+                filter_strategy: Some(VectorFilterStrategy::Post),
+                ..ProbeParams::prefilter()
             });
         let collector = builder
             .clone()

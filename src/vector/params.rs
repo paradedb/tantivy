@@ -4,7 +4,7 @@ use crate::query::Weight;
 use crate::schema::Field;
 use crate::vector::search::source::controller::open_share;
 use crate::vector::VectorSegment;
-use crate::Result;
+use crate::{Result, TantivyError};
 
 /// Default [`ProbeParams::fixed_probe_cost_rows`]: the cost of opening a cluster, in rows of full
 /// work, fitted on the reference fixture.
@@ -24,15 +24,6 @@ pub enum VectorFilterStrategy {
     Pre { uses_fast_fields: bool },
     /// Check vector candidates against a fast-field filter.
     Post,
-}
-
-impl Default for VectorFilterStrategy {
-    fn default() -> Self {
-        // Unknown filters must materialize without claiming cheap posting-list enumeration.
-        Self::Pre {
-            uses_fast_fields: true,
-        }
-    }
 }
 
 impl VectorFilterStrategy {
@@ -73,8 +64,8 @@ impl VectorFilterStrategy {
 pub struct ProbeParams {
     /// Stop probing when competitive-candidate admission has decayed.
     pub adaptive_probing: Option<AdaptiveProbeParams>,
-    /// How the query's filter is evaluated, consistently across segments.
-    pub filter_strategy: VectorFilterStrategy,
+    /// Required before routing or preparing filters, consistently across segments.
+    pub filter_strategy: Option<VectorFilterStrategy>,
     /// Global work ceiling in average-cluster units. Default 100.
     pub max_probe: usize,
     /// Approximate members retained per requested cluster by the quantized router.
@@ -157,7 +148,7 @@ impl Default for ProbeParams {
     fn default() -> Self {
         Self {
             adaptive_probing: None,
-            filter_strategy: VectorFilterStrategy::default(),
+            filter_strategy: None,
             max_probe: 100,
             router_rerank_factor: 1.0,
             router_min_beam_fraction: 0.5,
@@ -172,6 +163,24 @@ impl Default for ProbeParams {
 }
 
 impl ProbeParams {
+    #[cfg(test)]
+    pub(crate) fn prefilter() -> Self {
+        Self {
+            filter_strategy: Some(VectorFilterStrategy::Pre {
+                uses_fast_fields: false,
+            }),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn filter_strategy(&self) -> Result<VectorFilterStrategy> {
+        self.filter_strategy.ok_or_else(|| {
+            TantivyError::InvalidArgument(
+                "vector filter strategy must be selected before routing or preparation".into(),
+            )
+        })
+    }
+
     /// The number of clusters the stacked router is asked to rank for a
     /// segment whose resolved work budget is `budget` units.
     ///
@@ -194,7 +203,10 @@ impl ProbeParams {
         match_fraction: f64,
         clusters_in_segment: usize,
     ) -> usize {
-        let match_fraction = match self.filter_strategy {
+        let match_fraction = match self
+            .filter_strategy()
+            .expect("routing requires a filter strategy")
+        {
             VectorFilterStrategy::Post => 1.0,
             VectorFilterStrategy::Pre { .. } => match_fraction.clamp(0.0, 1.0),
         };
@@ -260,7 +272,7 @@ mod tests {
                 let fixed = ProbeParams {
                     max_probe: budget,
                     min_probe_clusters,
-                    ..Default::default()
+                    ..ProbeParams::prefilter()
                 };
                 let adaptive = ProbeParams {
                     adaptive_probing: Some(super::AdaptiveProbeParams::default()),
@@ -287,7 +299,7 @@ mod tests {
         let all = ProbeParams {
             max_probe: usize::MAX,
             min_probe_clusters: 1,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
         for (clusters, docs) in [(1000usize, 20_000usize), (9, 20), (2, 2), (64, 6400)] {
             let (budget, _n_avg, _x) = all.resolved_work_budget(clusters, docs)?;
@@ -303,7 +315,7 @@ mod tests {
     fn budget_is_absolute_and_capped_by_capacity() -> crate::Result<()> {
         let params = ProbeParams {
             max_probe: 10,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
         for (clusters, rows, expected) in [(1000, 20_000, 10.0), (40, 800, 10.0), (2, 40, 2.0)] {
             let (budget, _, _) = params.resolved_work_budget(clusters, rows)?;
@@ -321,7 +333,7 @@ mod tests {
     /// filter stretches it toward `budget / open_share`, capped at the segment's clusters.
     #[test]
     fn router_k_tracks_budget_and_filter_selectivity() {
-        let params = ProbeParams::default();
+        let params = ProbeParams::prefilter();
         let x = 0.2;
         assert_eq!(params.router_k(20.0, x, 1.0, 1000), 20);
         assert_eq!(params.router_k(20.4, x, 1.0, 1000), 21);
@@ -335,7 +347,7 @@ mod tests {
         assert_eq!(params.router_k(20.0, 0.0, 0.0, 1000), 1000);
         assert_eq!(params.router_k(0.0, x, 1.0, 0), 1);
         let post = ProbeParams {
-            filter_strategy: VectorFilterStrategy::Post,
+            filter_strategy: Some(VectorFilterStrategy::Post),
             ..params.clone()
         };
         for budget in [0.01, 2.0, 20.0, 20.4, 1000.0] {
@@ -353,13 +365,13 @@ mod tests {
     fn invalid_budget_params_error() {
         let params = ProbeParams {
             max_probe: 0,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
         assert!(params.resolved_work_budget(9, 180).is_err());
         for cost in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let params = ProbeParams {
                 fixed_probe_cost_rows: cost,
-                ..Default::default()
+                ..ProbeParams::prefilter()
             };
             assert!(params.resolved_work_budget(9, 180).is_err(), "{cost}");
         }

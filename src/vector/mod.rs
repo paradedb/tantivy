@@ -6,9 +6,13 @@
 //! the index requests it. [`TopDocsByVectorSimilarity`] runs the query over either layout.
 //!
 //! ```
-//! use tantivy::collector::TopDocs;
-//! use tantivy::query::TermQuery;
+//! use tantivy::collector::{Collector, TopDocs};
+//! use tantivy::query::{EnableScoring, Query, TermQuery};
 //! use tantivy::schema::{IndexRecordOption, Metric, Schema, VectorOptions, STRING};
+//! use tantivy::vector::{
+//!     ProbeParams, TopClustersBySimilarityCollector, VectorFilterStrategy, VectorSearchBudget,
+//!     VectorSegment,
+//! };
 //! use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 //!
 //! # fn main() -> tantivy::Result<()> {
@@ -37,28 +41,29 @@
 //! );
 //! let query = vec![0.5_f32; 64];
 //! let searcher = index.reader()?.searcher();
+//! let weight = even.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+//! let segments: Vec<_> = searcher.segment_readers().iter().enumerate()
+//!     .map(|(ord, reader)| VectorSegment::from((ord as u32, reader))).collect();
+//! let params = ProbeParams {
+//!     filter_strategy: Some(VectorFilterStrategy::plan(
+//!         embedding, weight.as_ref(), even.count(&searcher)?, usize::MAX, &segments,
+//!     )?),
+//!     ..Default::default()
+//! };
 //! let hits = searcher.search(
 //!     &even,
 //!     &TopDocs::with_limit(10)
 //!         .order_by_similarity(embedding, query)
+//!         .with_probe_params(params.clone())
 //!         .build_for_searcher(&searcher, &even)?,
 //! )?;
 //! assert_eq!(hits.results.len(), 10);
 //!
 //! // The same search with explicit preparation, routing, and document collection.
-//! use tantivy::collector::Collector;
-//! use tantivy::query::{EnableScoring, Query};
-//! use tantivy::vector::{
-//!     ProbeParams, TopClustersBySimilarityCollector, VectorSearchBudget, VectorSegment,
-//! };
-//! let params = ProbeParams::default();
 //! let query = vec![0.5_f32; 64];
 //! let builder = TopDocs::with_limit(10)
 //!     .order_by_similarity(embedding, query.clone())
 //!     .with_probe_params(params.clone());
-//! let weight = even.weight(EnableScoring::disabled_from_searcher(&searcher))?;
-//! let segments: Vec<_> = searcher.segment_readers().iter().enumerate()
-//!     .map(|(ord, reader)| VectorSegment::from((ord as u32, reader))).collect();
 //! let budget = VectorSearchBudget::for_segments(embedding, &params, &segments)?;
 //! let prepared = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
 //! let router = TopClustersBySimilarityCollector::new(
