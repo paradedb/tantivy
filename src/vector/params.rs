@@ -9,6 +9,10 @@ use crate::vector::search::source::controller::open_share;
 /// It covers the open only; routing cost is not modeled.
 pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 
+/// Minimum estimated matches for deferring a fast-field filter. Keep the strategy independent
+/// of the probe ceiling so increasing recall does not switch access paths mid-sweep.
+pub const MIN_LATE_FILTER_MATCHES: usize = 250_000;
+
 /// Query-time probe budget for IVF vector search.
 ///
 /// The budget is in work units: one unit is one average cluster of work, charged per opened
@@ -19,9 +23,9 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 pub struct ProbeParams {
     /// Stop probing when competitive-candidate admission has decayed.
     pub adaptive_probing: Option<AdaptiveProbeParams>,
-    /// Estimated filter match fraction. Enables deferred fast-field filters when materializing
-    /// their estimated match set costs more than locating it. `None` keeps eager evaluation.
-    pub filter_match_fraction: Option<f64>,
+    /// Estimated matches across the query's index snapshot. Large fast-field filters may be
+    /// deferred; `None` keeps eager evaluation.
+    pub estimated_filter_matches: Option<usize>,
     /// Global work ceiling in average-cluster units. Default 100.
     pub max_probe: usize,
     /// Approximate members retained per requested cluster by the quantized router.
@@ -104,7 +108,7 @@ impl Default for ProbeParams {
     fn default() -> Self {
         Self {
             adaptive_probing: None,
-            filter_match_fraction: None,
+            estimated_filter_matches: None,
             max_probe: 100,
             router_rerank_factor: 1.0,
             router_min_beam_fraction: 0.5,

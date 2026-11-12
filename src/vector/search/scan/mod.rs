@@ -33,6 +33,7 @@ use crate::collector::SegmentSortKeyComputer;
 use crate::error::DataCorruption;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
+use crate::vector::router::candidate::Candidate as RankedCandidate;
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
 use crate::vector::search::interval::{Estimate, Threshold, UpperEndpoint};
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery};
@@ -912,46 +913,73 @@ where
 
     fn filter_shortlist(&mut self, seed: bool) -> crate::Result<()> {
         const BATCH_SIZE: usize = 64;
+        if seed && self.bound.shared_threshold().is_some() {
+            return Ok(());
+        }
+        let _stage = enter_vector_stage(VectorStage::LateFilter);
         let filter = self.late_filter.as_ref().unwrap().clone();
-        let mut docs = Vec::new();
+        let threshold = self
+            .bound
+            .shared_threshold()
+            .map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score)));
+        let state = self
+            .quantized
+            .as_mut()
+            .expect("late filters require quantization");
+        state.candidates.band(threshold);
+        let pending: Vec<_> = state
+            .candidates
+            .candidates_with_upper(state.segment_ord)
+            .collect();
+        let mut ranking = std::collections::BinaryHeap::from(
+            pending
+                .iter()
+                .enumerate()
+                .map(|(index, (candidate, _))| RankedCandidate {
+                    sim: Similarity::new(candidate.bound.estimate()),
+                    node: (std::cmp::Reverse(candidate.address), index),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut processed = std::collections::HashMap::<u32, Vec<u32>>::new();
+        let mut cluster_docs = std::collections::HashMap::<u32, Vec<DocId>>::new();
         loop {
             if seed && self.bound.shared_threshold().is_some() {
                 break;
             }
-            let state = self
-                .quantized
-                .as_mut()
-                .expect("late filters require quantization");
-            state.candidates.band(
-                self.bound
-                    .shared_threshold()
-                    .map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score))),
-            );
-            let mut candidates = state.candidates.live_candidates(state.segment_ord);
+            let threshold = self
+                .bound
+                .shared_threshold()
+                .map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score)));
+            let mut candidates: Vec<_> = std::iter::from_fn(|| ranking.pop())
+                .map(|ranked| pending[ranked.node.1])
+                .filter(|(_, upper)| threshold.is_none_or(|threshold| threshold.admits(*upper)))
+                .take(BATCH_SIZE)
+                .map(|(candidate, _)| candidate)
+                .collect();
             if candidates.is_empty() {
                 break;
             }
-            if candidates.len() > BATCH_SIZE {
-                candidates.select_nth_unstable_by(BATCH_SIZE, |a, b| {
-                    b.bound
-                        .estimate()
-                        .total_cmp(&a.bound.estimate())
-                        .then_with(|| a.address.cmp(&b.address))
-                });
-                candidates.truncate(BATCH_SIZE);
-            }
             candidates.sort_unstable_by_key(|c| c.address);
-            let stage = enter_vector_stage(VectorStage::LateFilter);
             let mut indexed = Vec::with_capacity(candidates.len());
-            let mut last = None;
             for (i, candidate) in candidates.iter().enumerate() {
                 let address = candidate.address.block_address;
-                if last != Some(address.block) {
-                    self.reader
-                        .read_doc_ids(address.block as usize, &mut docs)?;
-                    last = Some(address.block);
-                }
+                let docs = match cluster_docs.entry(address.block) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let mut docs = Vec::new();
+                        self.reader
+                            .read_doc_ids(address.block as usize, &mut docs)?;
+                        entry.insert(docs)
+                    }
+                };
                 indexed.push((docs[address.row as usize], i));
+                if seed {
+                    processed
+                        .entry(address.block)
+                        .or_default()
+                        .push(address.row);
+                }
             }
             indexed.sort_unstable_by_key(|&(doc, _)| doc);
             let ids: Vec<_> = indexed.iter().map(|&(doc, _)| doc).collect();
@@ -962,22 +990,25 @@ where
                 .zip(matched)
                 .filter_map(|(&(_, i), yes)| yes.then_some(candidates[i]))
                 .collect();
-            drop(stage);
             self.refine_topk(&passing)?;
-            let state = self.quantized.as_mut().unwrap();
-            // Retire rejects as well as exact-scored matches; no candidate is checked twice.
-            for &b in &self.by_cluster {
+        }
+        let state = self.quantized.as_mut().unwrap();
+        for rows in processed.values_mut() {
+            rows.sort_unstable();
+        }
+        for &b in &self.by_cluster {
+            if seed {
                 let group = state.candidates.rows(b);
-                let offsets: Vec<_> = candidates
-                    .iter()
-                    .filter_map(|c| {
-                        let a = c.address.block_address;
-                        (a.block as usize == group.cluster
-                            && group.rows.contains(&(a.row as usize)))
-                        .then(|| a.row - group.rows.start as u32)
-                    })
-                    .collect();
-                state.candidates.remove_rows(b, &offsets);
+                if let Some(rows) = processed.get(&(group.cluster as u32)) {
+                    let offsets: Vec<_> = rows
+                        .iter()
+                        .filter(|&&row| group.rows.contains(&(row as usize)))
+                        .map(|&row| row - group.rows.start as u32)
+                        .collect();
+                    state.candidates.remove_rows(b, &offsets);
+                }
+            } else {
+                state.candidates.retire(b);
             }
         }
         Ok(())

@@ -52,12 +52,6 @@ pub struct VectorSearchBudget {
 }
 
 impl VectorSearchBudget {
-    /// Match count above which evaluating a column filter on vector candidates avoids
-    /// materializing more matches than the scan budget can score.
-    pub fn filter_materialization_limit(&self) -> usize {
-        (self.work.total.get() / self.work.per_row.get()).floor() as usize
-    }
-
     /// Resolves the global ceiling and minimum once over the complete search snapshot.
     pub fn for_segments(
         field: Field,
@@ -153,20 +147,9 @@ impl PreparedVectorSearch {
                             located_cap: cap,
                         };
                         let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                        let estimate = params
-                            .filter_match_fraction
-                            .filter(|s| s.is_finite() && *s > 0.0 && *s <= 1.0);
                         let late = weight.uses_fast_fields()
-                            && estimate.is_some_and(|s| {
-                                s * f64::from(max_doc)
-                                    > located_cap(
-                                        crate::vector::LocatedPath::Auto,
-                                        max_doc,
-                                        work.total.get(),
-                                        n_avg,
-                                        x,
-                                    )
-                                    .max(top_n) as f64
+                            && params.estimated_filter_matches.is_some_and(|matches| {
+                                matches >= crate::vector::MIN_LATE_FILTER_MATCHES
                             })
                             && vectors.quantization()?.is_some();
                         let source = if late {

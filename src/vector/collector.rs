@@ -173,7 +173,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
     ) -> Result<PreparedVectorSearch> {
         let mut params = self.probe_params.clone();
         if self.max_scan_levels == 0 {
-            params.filter_match_fraction = None;
+            params.estimated_filter_matches = None;
         }
         PreparedVectorSearch::prepare(
             self.field,
@@ -3260,6 +3260,7 @@ mod late_filter_tests {
 
     struct DeferredWeight {
         inner: Box<dyn Weight>,
+        allow_enumeration: bool,
     }
     impl Weight for DeferredWeight {
         fn uses_fast_fields(&self) -> bool {
@@ -3268,8 +3269,12 @@ mod late_filter_tests {
         fn candidate_filter(&self, reader: &SegmentReader) -> Result<CandidateFilter> {
             self.inner.candidate_filter(reader)
         }
-        fn scorer(&self, _: &SegmentReader, _: Score) -> Result<Box<dyn Scorer>> {
-            panic!("late preparation must not enumerate matches")
+        fn scorer(&self, reader: &SegmentReader, boost: Score) -> Result<Box<dyn Scorer>> {
+            assert!(
+                self.allow_enumeration,
+                "late preparation must not enumerate matches"
+            );
+            self.inner.scorer(reader, boost)
         }
         fn explain(&self, reader: &SegmentReader, doc: DocId) -> Result<Explanation> {
             self.inner.explain(reader, doc)
@@ -3281,6 +3286,7 @@ mod late_filter_tests {
         for replicated in [false, true] {
             let mut spec = FixtureSpec::clustered(Metric::L2, 64, 32, 4096)
                 .schedule(&[1, 4])
+                .segments(2)
                 .label("matches", |i| i % 10 == 0)
                 .deletes(&[0, 10, 20]);
             if replicated {
@@ -3300,7 +3306,7 @@ mod late_filter_tests {
             let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
                 .with_probe_params(ProbeParams {
                     located: crate::vector::LocatedPath::Off,
-                    ..crate::vector::tests::exhaustive_params(32)
+                    ..crate::vector::tests::exhaustive_params(64)
                 });
             let budget =
                 VectorSearchBudget::for_segments(fixture.field, &builder.probe_params, &segments)?;
@@ -3335,21 +3341,22 @@ mod late_filter_tests {
                     |_| {},
                 )?)?;
                 assert_eq!(fruit.results, fixture.oracle(&filter, &query, 10)?);
-                assert!(fruit
-                    .stats
-                    .iter()
-                    .all(|s| s.late_filter && s.filter_checks > 0));
+                assert!(fruit.stats.iter().all(|s| s.late_filter));
+                assert!(fruit.stats.iter().any(|s| s.filter_checks > 0));
                 assert!(fruit.stats.iter().all(|s| s.exact_rows <= s.filter_checks));
             }
             // The actual eligibility path must also avoid draining the filter.
             let params = ProbeParams {
                 max_probe: 1,
-                filter_match_fraction: Some(0.1),
+                estimated_filter_matches: Some(crate::vector::MIN_LATE_FILTER_MATCHES),
                 ..Default::default()
             };
             let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
                 .with_probe_params(params);
-            let deferred = DeferredWeight { inner: weight };
+            let deferred = DeferredWeight {
+                inner: weight,
+                allow_enumeration: false,
+            };
             let collector = builder.build_for_segments(&deferred, &segments, |_| {})?;
             let fruit = collector.merge_fruits(collector.collect_segments(
                 &deferred,
@@ -3357,7 +3364,12 @@ mod late_filter_tests {
                 |_| {},
             )?)?;
             assert!(fruit.results.len() <= 10);
-            assert!(fruit.stats.iter().all(|s| s.late_filter));
+            assert!(fruit.stats.iter().any(|s| s.late_filter));
+            assert!(fruit
+                .stats
+                .iter()
+                .filter(|s| s.candidates_scored > 0)
+                .all(|s| s.late_filter));
         }
         Ok(())
     }
@@ -3426,6 +3438,70 @@ mod late_filter_tests {
             assert!(fruit.stats[0].router_retries > 0);
             assert!(fruit.stats[0].candidates_scored <= 4096);
         }
+        Ok(())
+    }
+    #[test]
+    fn late_filter_eligibility_is_independent_of_probe_budget() -> Result<()> {
+        let fixture = FixtureSpec::clustered(Metric::L2, 64, 32, 4096)
+            .schedule(&[1])
+            .label("matches", |i| i % 10 == 0)
+            .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let segments = vec![VectorSegment::from((0, searcher.segment_reader(0)))];
+        for max_probe in [1, 100, 100_000] {
+            for (matches, late) in [
+                (crate::vector::MIN_LATE_FILTER_MATCHES - 1, false),
+                (crate::vector::MIN_LATE_FILTER_MATCHES, true),
+            ] {
+                let params = ProbeParams {
+                    max_probe,
+                    estimated_filter_matches: Some(matches),
+                    located: crate::vector::LocatedPath::Off,
+                    ..Default::default()
+                };
+                let builder =
+                    TopDocsByVectorSimilarityBuilder::new(fixture.field, vec![0.0f32; 64], 10)
+                        .with_probe_params(params.clone());
+                let weight = DeferredWeight {
+                    inner: fixture.weight(&fixture.filter("matches"))?,
+                    allow_enumeration: !late,
+                };
+                let budget = VectorSearchBudget::for_segments(fixture.field, &params, &segments)?;
+                let prepared = builder.prepare(&weight, &segments, budget, |_| {})?;
+                let ScanInput::Routed { filter, .. } = prepared.segments[0].scan.as_ref().unwrap()
+                else {
+                    panic!("routed")
+                };
+                assert_eq!(filter.candidate_filter().is_some(), late);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn late_filter_exhausts_sparse_candidates_once() -> Result<()> {
+        let fixture = FixtureSpec::clustered(Metric::L2, 64, 64, 32768)
+            .schedule(&[1])
+            .label("matches", |i| i < 2)
+            .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let segments = vec![VectorSegment::from((0, searcher.segment_reader(0)))];
+        let filter = fixture.filter("matches");
+        let weight = DeferredWeight {
+            inner: fixture.weight(&filter)?,
+            allow_enumeration: false,
+        };
+        let query = vec![0.0f32; 64];
+        let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
+            .with_probe_params(ProbeParams {
+                estimated_filter_matches: Some(crate::vector::MIN_LATE_FILTER_MATCHES),
+                ..crate::vector::tests::exhaustive_params(64)
+            });
+        let collector = builder.build_for_segments(&weight, &segments, |_| {})?;
+        let fruit =
+            collector.merge_fruits(collector.collect_segments(&weight, &segments, |_| {})?)?;
+        assert_eq!(fruit.results, fixture.oracle(&filter, &query, 10)?);
+        assert_eq!(fruit.stats[0].filter_checks, 32768);
         Ok(())
     }
 }
