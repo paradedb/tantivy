@@ -3259,6 +3259,7 @@ mod late_filter_tests {
     use crate::query::{CandidateFilter, Explanation, Scorer, Weight};
     use crate::schema::Metric;
     use crate::vector::test_support::FixtureSpec;
+    use crate::vector::{VectorFilterStrategy, MIN_LATE_FILTER_MATCHES};
     use crate::{DocId, SegmentReader};
 
     struct DeferredWeight {
@@ -3282,6 +3283,96 @@ mod late_filter_tests {
         fn explain(&self, reader: &SegmentReader, doc: DocId) -> Result<Explanation> {
             self.inner.explain(reader, doc)
         }
+    }
+
+    #[test]
+    fn filtering_strategy_respects_query_kind_and_scan_support() -> Result<()> {
+        let mut mixed_segments = Vec::new();
+        for schedule in [&[][..], &[1][..], &[1, 4][..]] {
+            let fixture = FixtureSpec::clustered(Metric::L2, 64, 16, 1024)
+                .schedule(schedule)
+                .label("matches", |i| i % 2 == 0)
+                .build()?;
+            let searcher = fixture.index.reader()?.searcher();
+            let segments = vec![VectorSegment::from((0, searcher.segment_reader(0)))];
+            let filter = fixture.filter("matches");
+            let posting_weight = fixture.weight(&filter)?;
+            let fast_weight = DeferredWeight {
+                inner: fixture.weight(&filter)?,
+                allow_enumeration: false,
+            };
+            mixed_segments.push(VectorSegment::from((
+                mixed_segments.len() as u32,
+                searcher.segment_reader(0),
+            )));
+            assert_eq!(
+                VectorFilterStrategy::plan(
+                    fixture.field,
+                    &fast_weight,
+                    MIN_LATE_FILTER_MATCHES,
+                    usize::MAX,
+                    &mixed_segments,
+                )?,
+                VectorFilterStrategy::Pre {
+                    uses_fast_fields: true,
+                },
+            );
+            for matches in [
+                0,
+                MIN_LATE_FILTER_MATCHES - 1,
+                MIN_LATE_FILTER_MATCHES,
+                usize::MAX,
+            ] {
+                for levels in [0, 1, usize::MAX] {
+                    assert_eq!(
+                        VectorFilterStrategy::plan(
+                            fixture.field,
+                            posting_weight.as_ref(),
+                            matches,
+                            levels,
+                            &segments
+                        )?,
+                        VectorFilterStrategy::Pre {
+                            uses_fast_fields: false
+                        },
+                    );
+                    let strategy = VectorFilterStrategy::plan(
+                        fixture.field,
+                        &fast_weight,
+                        matches,
+                        levels,
+                        &segments,
+                    )?;
+                    assert_eq!(
+                        strategy,
+                        if !schedule.is_empty() && levels > 0 && matches >= MIN_LATE_FILTER_MATCHES
+                        {
+                            VectorFilterStrategy::Post
+                        } else {
+                            VectorFilterStrategy::Pre {
+                                uses_fast_fields: true,
+                            }
+                        }
+                    );
+                    let params = ProbeParams {
+                        filter_strategy: strategy,
+                        ..Default::default()
+                    };
+                    let builder =
+                        TopDocsByVectorSimilarityBuilder::new(fixture.field, vec![0.0; 64], 10)
+                            .with_probe_params(params.clone())
+                            .with_max_scan_levels(levels);
+                    let weight = DeferredWeight {
+                        inner: fixture.weight(&filter)?,
+                        allow_enumeration: strategy != VectorFilterStrategy::Post,
+                    };
+                    let budget =
+                        VectorSearchBudget::for_segments(fixture.field, &params, &segments)?;
+                    builder.prepare(&weight, &segments, budget, |_| {})?;
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -3456,21 +3547,25 @@ mod late_filter_tests {
                 (crate::vector::MIN_LATE_FILTER_MATCHES - 1, false),
                 (crate::vector::MIN_LATE_FILTER_MATCHES, true),
             ] {
+                let weight = DeferredWeight {
+                    inner: fixture.weight(&fixture.filter("matches"))?,
+                    allow_enumeration: !late,
+                };
                 let params = ProbeParams {
                     max_probe,
-                    filter_strategy: crate::vector::VectorFilterStrategy::from_estimate(
-                        true, matches, true,
-                    ),
+                    filter_strategy: VectorFilterStrategy::plan(
+                        fixture.field,
+                        &weight,
+                        matches,
+                        usize::MAX,
+                        &segments,
+                    )?,
                     located: crate::vector::LocatedPath::Off,
                     ..Default::default()
                 };
                 let builder =
                     TopDocsByVectorSimilarityBuilder::new(fixture.field, vec![0.0f32; 64], 10)
                         .with_probe_params(params.clone());
-                let weight = DeferredWeight {
-                    inner: fixture.weight(&fixture.filter("matches"))?,
-                    allow_enumeration: !late,
-                };
                 let budget = VectorSearchBudget::for_segments(fixture.field, &params, &segments)?;
                 let prepared = builder.prepare(&weight, &segments, budget, |_| {})?;
                 let ScanInput::Routed { filter, .. } = prepared.segments[0].scan.as_ref().unwrap()
@@ -3533,6 +3628,28 @@ mod late_filter_tests {
             inner: fixture.weight(&filter)?,
             allow_enumeration: false,
         };
+        assert_eq!(
+            VectorFilterStrategy::plan(
+                fixture.field,
+                &weight,
+                MIN_LATE_FILTER_MATCHES,
+                usize::MAX,
+                &segments,
+            )?,
+            VectorFilterStrategy::Post,
+        );
+        assert_eq!(
+            VectorFilterStrategy::plan(
+                fixture.field,
+                &weight,
+                MIN_LATE_FILTER_MATCHES,
+                usize::MAX,
+                &[],
+            )?,
+            VectorFilterStrategy::Pre {
+                uses_fast_fields: true,
+            },
+        );
         let query = vec![0.0f32; 64];
         let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
             .with_probe_params(ProbeParams {

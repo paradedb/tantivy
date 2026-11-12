@@ -1,6 +1,10 @@
 //! Query-time probe parameters: the work budget and the located path.
 
+use crate::query::Weight;
+use crate::schema::Field;
 use crate::vector::search::source::controller::open_share;
+use crate::vector::VectorSegment;
+use crate::Result;
 
 /// Default [`ProbeParams::fixed_probe_cost_rows`]: the cost of opening a cluster, in rows of full
 /// work, fitted on the reference fixture.
@@ -22,21 +26,40 @@ pub enum VectorFilterStrategy {
     Post,
 }
 
-impl VectorFilterStrategy {
-    /// Chooses one strategy for the whole query, independently of the probe budget.
-    pub fn from_estimate(
-        uses_fast_fields: bool,
-        estimated_matches: usize,
-        post_filtering_enabled: bool,
-    ) -> Self {
-        if uses_fast_fields
-            && post_filtering_enabled
-            && estimated_matches >= MIN_LATE_FILTER_MATCHES
-        {
-            Self::Post
-        } else {
-            Self::Pre { uses_fast_fields }
+impl Default for VectorFilterStrategy {
+    fn default() -> Self {
+        // Unknown filters must materialize without claiming cheap posting-list enumeration.
+        Self::Pre {
+            uses_fast_fields: true,
         }
+    }
+}
+
+impl VectorFilterStrategy {
+    /// Selects a query-wide strategy from the filter and the actual segment storage.
+    pub fn plan(
+        field: Field,
+        weight: &dyn Weight,
+        estimated_matches: usize,
+        max_scan_levels: usize,
+        segments: &[VectorSegment],
+    ) -> Result<Self> {
+        let uses_fast_fields = weight.uses_fast_fields();
+        let pre = Self::Pre { uses_fast_fields };
+        if !uses_fast_fields
+            || estimated_matches < MIN_LATE_FILTER_MATCHES
+            || max_scan_levels == 0
+            || segments.is_empty()
+        {
+            return Ok(pre);
+        }
+        for segment in segments {
+            let vectors = segment.reader.vector_index(field)?;
+            if vectors.index().is_some() && !vectors.has_exact_rows() {
+                return Ok(pre);
+            }
+        }
+        Ok(Self::Post)
     }
 }
 
@@ -134,9 +157,7 @@ impl Default for ProbeParams {
     fn default() -> Self {
         Self {
             adaptive_probing: None,
-            filter_strategy: VectorFilterStrategy::Pre {
-                uses_fast_fields: true,
-            },
+            filter_strategy: VectorFilterStrategy::default(),
             max_probe: 100,
             router_rerank_factor: 1.0,
             router_min_beam_fraction: 0.5,
@@ -228,34 +249,6 @@ impl ProbeParams {
 #[cfg(test)]
 mod tests {
     use super::ProbeParams;
-
-    #[test]
-    fn filtering_strategy_respects_query_kind_and_scan_support() {
-        use super::{VectorFilterStrategy, MIN_LATE_FILTER_MATCHES};
-        for matches in [
-            0,
-            MIN_LATE_FILTER_MATCHES - 1,
-            MIN_LATE_FILTER_MATCHES,
-            usize::MAX,
-        ] {
-            assert_eq!(
-                VectorFilterStrategy::from_estimate(false, matches, true),
-                VectorFilterStrategy::Pre {
-                    uses_fast_fields: false
-                }
-            );
-            assert_eq!(
-                VectorFilterStrategy::from_estimate(true, matches, false),
-                VectorFilterStrategy::Pre {
-                    uses_fast_fields: true
-                }
-            );
-        }
-        assert_eq!(
-            VectorFilterStrategy::from_estimate(true, MIN_LATE_FILTER_MATCHES, true),
-            VectorFilterStrategy::Post
-        );
-    }
 
     #[test]
     fn adaptive_stopping_preserves_budget_and_routing() -> crate::Result<()> {
