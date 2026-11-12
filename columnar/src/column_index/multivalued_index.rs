@@ -41,7 +41,7 @@ pub fn serialize_multivalued_index(
         &[CodecType::Bitpacked, CodecType::Linear],
         output,
     )?;
-    version.write_len_trailer(optional_len, output)
+    version.write_len_footer(optional_len, output)
 }
 
 pub fn open_multivalued_index(
@@ -57,7 +57,7 @@ pub fn open_multivalued_index(
             }))
         }
         Version::V2 | Version::V3 => {
-            let (body_bytes, optional_index_len) = format_version.split_len_trailer(file_slice)?;
+            let (body_bytes, optional_index_len) = format_version.split_len_footer(file_slice)?;
             let (optional_index_bytes, start_index_bytes) = body_bytes.split(optional_index_len);
             let optional_index = open_optional_index(optional_index_bytes)?;
             let start_index_column: Arc<dyn ColumnValues<RowId>> =

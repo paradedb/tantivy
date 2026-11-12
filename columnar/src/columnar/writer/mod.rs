@@ -539,7 +539,7 @@ fn collect_sort_order_from_ops<V, K: Clone>(
 
 // Serialize [Dictionary, Column, dictionary num bytes LE]
 // Column: [Column Index, Column Values, column index num bytes LE]
-// Both lengths have the width of `CURRENT_VERSION`, see `Version::len_trailer_num_bytes`.
+// Both lengths have the width of `CURRENT_VERSION`, see `Version::len_footer_num_bytes`.
 #[expect(clippy::too_many_arguments)]
 fn serialize_bytes_or_str_column(
     cardinality: Cardinality,
@@ -582,7 +582,7 @@ fn serialize_bytes_or_str_column(
         codec_types,
         &mut wrt,
     )?;
-    CURRENT_VERSION.write_len_trailer(dictionary_num_bytes, &mut wrt)
+    CURRENT_VERSION.write_len_footer(dictionary_num_bytes, &mut wrt)
 }
 
 fn serialize_numerical_column(

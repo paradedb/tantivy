@@ -12,7 +12,7 @@ use crate::{BytesColumn, CURRENT_VERSION, MergeRowOrder, ShuffleMergeOrder};
 
 // Serialize [Dictionary, Column, dictionary num bytes LE]
 // Column: [Column Index, Column Values, column index num bytes LE]
-// Both lengths have the width of `CURRENT_VERSION`, see `Version::len_trailer_num_bytes`.
+// Both lengths have the width of `CURRENT_VERSION`, see `Version::len_footer_num_bytes`.
 pub fn merge_bytes_or_str_column(
     column_index: SerializableColumnIndex<'_>,
     bytes_columns: &[Option<BytesColumn>],
@@ -38,7 +38,7 @@ pub fn merge_bytes_or_str_column(
         output,
         CURRENT_VERSION,
     )?;
-    CURRENT_VERSION.write_len_trailer(dictionary_num_bytes, output)
+    CURRENT_VERSION.write_len_footer(dictionary_num_bytes, output)
 }
 
 /// Computes a per-segment mapping from old term ordinal to merged term ordinal.
