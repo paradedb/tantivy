@@ -103,7 +103,8 @@ mod tests {
     };
     use crate::column_index::{OptionalIndex, SerializableColumnIndex, merge_column_index};
     use crate::{
-        Cardinality, ColumnIndex, MergeRowOrder, RowAddr, RowId, ShuffleMergeOrder, StackMergeOrder,
+        CURRENT_VERSION, Cardinality, ColumnIndex, MergeRowOrder, RowAddr, RowId,
+        ShuffleMergeOrder, StackMergeOrder,
     };
 
     #[test]
@@ -176,9 +177,8 @@ mod tests {
             panic!("Expected a multivalued index")
         };
         let mut output = Vec::new();
-        serialize_multivalued_index(&start_index_iterable, &mut output).unwrap();
-        let multivalue =
-            open_multivalued_index(FileSlice::from(output), crate::Version::V2).unwrap();
+        serialize_multivalued_index(&start_index_iterable, &mut output, CURRENT_VERSION).unwrap();
+        let multivalue = open_multivalued_index(FileSlice::from(output), CURRENT_VERSION).unwrap();
         let start_indexes: Vec<RowId> = multivalue.get_start_index_column().iter().collect();
         assert_eq!(&start_indexes, &[0, 3, 5]);
     }
@@ -214,9 +214,8 @@ mod tests {
             panic!("Expected a multivalued index")
         };
         let mut output = Vec::new();
-        serialize_multivalued_index(&start_index_iterable, &mut output).unwrap();
-        let multivalue =
-            open_multivalued_index(FileSlice::from(output), crate::Version::V2).unwrap();
+        serialize_multivalued_index(&start_index_iterable, &mut output, CURRENT_VERSION).unwrap();
+        let multivalue = open_multivalued_index(FileSlice::from(output), CURRENT_VERSION).unwrap();
         let start_indexes: Vec<RowId> = multivalue.get_start_index_column().iter().collect();
         assert_eq!(&start_indexes, &[0, 3, 5, 6]);
     }
