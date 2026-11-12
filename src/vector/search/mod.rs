@@ -321,6 +321,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
                         .map(move |bit| bucket * 64 + bit)
                 }),
             ),
+            DocFilter::Direct { .. } => unreachable!("direct filters require an IVF index"),
         };
         for doc in docs {
             if let Some(bs) = alive {

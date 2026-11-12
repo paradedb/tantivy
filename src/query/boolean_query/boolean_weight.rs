@@ -799,6 +799,32 @@ fn remove_and_count_all_and_empty_scorers(
 }
 
 impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombiner> {
+    fn candidate_filter(
+        &self,
+        reader: &SegmentReader,
+    ) -> crate::Result<Option<crate::query::CandidateFilter>> {
+        use crate::query::CandidateFilter;
+
+        if self.weights.len() == 1 && self.weights[0].0 != Occur::MustNot {
+            return self.weights[0].1.candidate_filter(reader);
+        }
+        if self.weights.is_empty()
+            || self.minimum_number_should_match != 0
+            || self.weights.iter().any(|(occur, _)| *occur != Occur::Must)
+        {
+            return Ok(None);
+        }
+        let mut filter = CandidateFilter::All;
+        for (_, weight) in &self.weights {
+            match weight.candidate_filter(reader)? {
+                Some(CandidateFilter::All) => {}
+                Some(range) if matches!(filter, CandidateFilter::All) => filter = range,
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(filter))
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let num_docs = reader.num_docs();
         if self.weights.is_empty() {

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use common::BitSet;
 
 use crate::fastfield::AliveBitSet;
+use crate::query::CandidateFilter;
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::{RouterIter, RouterMetrics};
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
@@ -27,6 +28,10 @@ pub(crate) enum DocFilter {
     All,
     /// The matching doc ids.
     Docs(Arc<BitSet>),
+    Direct {
+        filter: CandidateFilter,
+        match_fraction: f64,
+    },
 }
 
 impl DocFilter {
@@ -39,6 +44,7 @@ impl DocFilter {
         match self {
             Self::All => 1.0,
             Self::Docs(docs) => docs.len() as f64 / f64::from(max_doc.max(1)),
+            Self::Direct { match_fraction, .. } => *match_fraction,
         }
     }
 }
@@ -51,6 +57,10 @@ pub(crate) enum RowGate<'a> {
     FilterAndAlive {
         filter: Arc<BitSet>,
         alive: &'a AliveBitSet,
+    },
+    Direct {
+        filter: CandidateFilter,
+        alive: Option<&'a AliveBitSet>,
     },
 }
 
@@ -70,6 +80,7 @@ impl<'a> RowGate<'a> {
             (DocFilter::All, Some(alive)) => RowGate::AliveOnly(alive),
             (DocFilter::Docs(filter), None) => RowGate::FilterOnly(filter),
             (DocFilter::Docs(filter), Some(alive)) => RowGate::FilterAndAlive { filter, alive },
+            (DocFilter::Direct { filter, .. }, alive) => RowGate::Direct { filter, alive },
         }
     }
 
@@ -110,6 +121,21 @@ impl<'a> RowGate<'a> {
                     RowVerdict::Keep
                 } else {
                     RowVerdict::Dead
+                }
+            }),
+            RowGate::Direct { filter, alive } => gate(doc_ids, offsets, |doc| {
+                let matches = match filter {
+                    CandidateFilter::All => true,
+                    CandidateFilter::Range { column, bounds } => column
+                        .values_for_doc(doc)
+                        .any(|value| bounds.contains(&value)),
+                };
+                if !matches {
+                    RowVerdict::Filtered
+                } else if alive.is_some_and(|alive| !alive.is_alive(doc)) {
+                    RowVerdict::Dead
+                } else {
+                    RowVerdict::Keep
                 }
             }),
         };

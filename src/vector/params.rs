@@ -49,6 +49,9 @@ pub struct ProbeParams {
     /// Cost of opening a cluster, in rows of full work; finite and positive. Default
     /// [`DEFAULT_FIXED_PROBE_COST_ROWS`].
     pub fixed_probe_cost_rows: f64,
+    /// Estimated matching document fraction, used to plan candidate filter checks.
+    /// Without an estimate, filters are enumerated as before.
+    pub filter_match_fraction: Option<f64>,
 }
 
 /// Admission-rate stopping within the fixed routing and work budgets.
@@ -110,6 +113,7 @@ impl Default for ProbeParams {
             exact_plan: true,
             located: LocatedPath::Auto,
             fixed_probe_cost_rows: DEFAULT_FIXED_PROBE_COST_ROWS,
+            filter_match_fraction: None,
         }
     }
 }

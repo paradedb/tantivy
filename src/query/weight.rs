@@ -5,6 +5,20 @@ use crate::index::SegmentReader;
 use crate::query::Explanation;
 use crate::{DocId, DocSet, Score, TERMINATED};
 
+/// A filter that can test document IDs in any order without enumerating its matches.
+#[derive(Clone)]
+pub enum CandidateFilter {
+    /// Every document matches.
+    All,
+    /// A numeric fast-field range.
+    Range {
+        /// The column in monotonically encoded value space.
+        column: columnar::Column<u64>,
+        /// Inclusive bounds in the same value space as the column.
+        bounds: std::ops::RangeInclusive<u64>,
+    },
+}
+
 /// Iterates through all of the documents and scores matched by the DocSet
 /// `DocSet`.
 pub(crate) fn for_each_scorer<TScorer: Scorer + ?Sized>(
@@ -75,6 +89,11 @@ pub(crate) fn for_each_pruning_scorer<TScorer: PruningScorer + ?Sized>(
 ///
 /// See [`Query`](crate::query::Query).
 pub trait Weight: Send + Sync + 'static {
+    /// Returns a filter supporting arbitrary-order candidate checks, when available.
+    fn candidate_filter(&self, _reader: &SegmentReader) -> crate::Result<Option<CandidateFilter>> {
+        Ok(None)
+    }
+
     /// Returns the scorer for the given segment.
     ///
     /// `boost` is a multiplier to apply to the score.
