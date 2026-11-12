@@ -17,22 +17,25 @@ pub const MIN_LATE_FILTER_MATCHES: usize = 250_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VectorFilterStrategy {
     /// Materialize the matches before vector search.
-    Pre { is_text_only: bool },
-    /// Check vector candidates against a non-text filter.
+    Pre { uses_fast_fields: bool },
+    /// Check vector candidates against a fast-field filter.
     Post,
 }
 
 impl VectorFilterStrategy {
     /// Chooses one strategy for the whole query, independently of the probe budget.
     pub fn from_estimate(
-        is_text_only: bool,
+        uses_fast_fields: bool,
         estimated_matches: usize,
         post_filtering_enabled: bool,
     ) -> Self {
-        if !is_text_only && post_filtering_enabled && estimated_matches >= MIN_LATE_FILTER_MATCHES {
+        if uses_fast_fields
+            && post_filtering_enabled
+            && estimated_matches >= MIN_LATE_FILTER_MATCHES
+        {
             Self::Post
         } else {
-            Self::Pre { is_text_only }
+            Self::Pre { uses_fast_fields }
         }
     }
 }
@@ -132,7 +135,7 @@ impl Default for ProbeParams {
         Self {
             adaptive_probing: None,
             filter_strategy: VectorFilterStrategy::Pre {
-                is_text_only: false,
+                uses_fast_fields: true,
             },
             max_probe: 100,
             router_rerank_factor: 1.0,
@@ -236,18 +239,20 @@ mod tests {
             usize::MAX,
         ] {
             assert_eq!(
-                VectorFilterStrategy::from_estimate(true, matches, true),
-                VectorFilterStrategy::Pre { is_text_only: true }
+                VectorFilterStrategy::from_estimate(false, matches, true),
+                VectorFilterStrategy::Pre {
+                    uses_fast_fields: false
+                }
             );
             assert_eq!(
-                VectorFilterStrategy::from_estimate(false, matches, false),
+                VectorFilterStrategy::from_estimate(true, matches, false),
                 VectorFilterStrategy::Pre {
-                    is_text_only: false
+                    uses_fast_fields: true
                 }
             );
         }
         assert_eq!(
-            VectorFilterStrategy::from_estimate(false, MIN_LATE_FILTER_MATCHES, true),
+            VectorFilterStrategy::from_estimate(true, MIN_LATE_FILTER_MATCHES, true),
             VectorFilterStrategy::Post
         );
     }

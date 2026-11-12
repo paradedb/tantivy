@@ -3459,7 +3459,7 @@ mod late_filter_tests {
                 let params = ProbeParams {
                     max_probe,
                     filter_strategy: crate::vector::VectorFilterStrategy::from_estimate(
-                        false, matches, true,
+                        true, matches, true,
                     ),
                     located: crate::vector::LocatedPath::Off,
                     ..Default::default()
