@@ -2,8 +2,8 @@
 //! by the storage blocks each read touches. A plan changes reads, never scores.
 
 use crate::vector::search::cluster_source::ClusterRows;
-use crate::vector::search::scan::layer_read::{LayerRead, LayerSpec};
-use crate::vector::storage::quantized::{ReadCost, ReadScratch};
+use crate::vector::search::scan::layer_read::LayerRead;
+use crate::vector::storage::quantized::{QuantizedClusterReader, ReadCost, ReadScratch};
 use crate::vector::storage::reader::VectorIndexReader;
 
 // --- Costs ---
@@ -11,7 +11,8 @@ use crate::vector::storage::reader::VectorIndexReader;
 /// The ways to read a cluster's selected rows at a quantized layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LayerCosts {
-    /// The sparse read; `None` for a whole-cluster selection.
+    /// The sparse read; `None` for a whole-cluster selection, or when its floor already reaches
+    /// the band.
     pub(crate) sparse: Option<ReadCost>,
     /// The whole band.
     pub(crate) band: ReadCost,
@@ -118,15 +119,26 @@ pub(crate) fn forced_plan(
     }
 }
 
-/// Prices the rows of `selected` at `spec`'s layer, and exactly through `exact` when the exact plan
-/// is on. A sparse price leaves its rows and code runs in `scratch` for the read.
-// TODO: Re-write the price method to re-use the block / cluster instead of re-fetching it for each
-// estimate.
+/// How [`price`] treats a sparse read that cannot beat the band.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SparsePricing {
+    /// With block geometry, a sparse read whose floor already reaches the band is left unpriced:
+    /// it can only tie or lose, and a tie reads the band.
+    Bounded,
+    /// Every sparse read is priced, for plans a test forces.
+    #[cfg(test)]
+    Full,
+}
+
+/// Prices the rows of `selected` at `cluster`'s layer, and exactly through `exact` when the exact
+/// plan is on. `cluster` is the cluster `selected` names, resolved once for pricing and the read. A
+/// sparse price leaves its rows and code runs in `scratch` for the read.
 pub(crate) fn price(
-    spec: &LayerSpec<'_>,
+    cluster: &QuantizedClusterReader<'_>,
     exact: Option<&VectorIndexReader>,
     selected: &ClusterRows<'_>,
     scratch: &mut ReadScratch,
+    sparse_pricing: SparsePricing,
 ) -> crate::Result<ReadCosts> {
     let centroid = match (exact, selected.centroid) {
         (Some(reader), None) => reader.centroid_cost(selected.cluster)?,
@@ -134,7 +146,7 @@ pub(crate) fn price(
     };
     let mut layer = LayerCosts {
         sparse: None,
-        band: spec.reader.band_cost(selected.cluster)?,
+        band: cluster.band_cost(),
         centroid,
     };
     // Quantized storage reads exact rows by document, so their price is the document-ordered rows
@@ -153,21 +165,29 @@ pub(crate) fn price(
         }
         Some(reader) => Some(reader.exact_cost(selected.cluster, selected.offsets)?),
     };
-    layer.sparse = selected
-        .offsets
-        .map(|offsets| spec.reader.sparse_cost(selected.cluster, offsets, scratch))
-        .transpose()?;
+    layer.sparse = match selected.offsets {
+        None => None,
+        Some(offsets) => {
+            let floor = match sparse_pricing {
+                SparsePricing::Bounded => cluster.sparse_cost_floor(offsets.len())?,
+                #[cfg(test)]
+                SparsePricing::Full => None,
+            };
+            // sparse >= floor >= band: the band wins without planning the rows.
+            match floor {
+                Some(floor) if floor >= layer.band => None,
+                _ => Some(cluster.sparse_cost(offsets, scratch)?),
+            }
+        }
+    };
     Ok(ReadCosts { exact, layer })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
     use crate::schema::Metric;
     use crate::vector::distance::Similarity;
-    use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
     use crate::vector::test_support::{first_segment, FixtureSpec};
 
     fn costs(band: usize, sparse: Option<usize>) -> ReadCosts {
@@ -346,10 +366,14 @@ mod tests {
         Ok(())
     }
 
+    /// Neither bound changes a plan: an exact read ruled out by its lower bound, nor a sparse read
+    /// ruled out by its floor, for every selection, layer, centroid and doc-id case, in RAM and on
+    /// pages.
     #[test]
     fn exact_cost_bound_preserves_read_plans() -> crate::Result<()> {
         let mut skipped_exact = false;
         let mut selected_exact = false;
+        let mut skipped_sparse = false;
         for paged in [false, true] {
             let mut spec = FixtureSpec::clustered(Metric::L2, 1024, 2, 1200)
                 .schedule(&[1, 4])
@@ -362,10 +386,6 @@ mod tests {
             let searcher = fixture.index.reader()?.searcher();
             let reader = first_segment(&searcher).1.vector_index(fixture.field)?;
             let field = reader.quantization()?.unwrap();
-            let query = QuantizedQueryCtx::new(
-                Arc::clone(field.index_ctx()),
-                &VectorQuery::new(Metric::L2, Arc::new(vec![0.0f32; 1024])).unwrap(),
-            );
             assert_eq!(reader.exact_rows_cost_lower_bound(0), ReadCost(0));
             for (cluster, docs) in fixture.cluster_docs(0)?.iter().enumerate() {
                 let one = [0];
@@ -388,19 +408,27 @@ mod tests {
                                 docs: known_docs,
                                 centroid,
                             };
-                            for (index, layer) in field.layers().iter().enumerate() {
-                                let spec = LayerSpec {
-                                    query: &query,
-                                    reader: layer,
-                                    index,
-                                    query_error_squared: query.query_error_squared(index) as f32,
+                            for layer in field.layers() {
+                                let layer = layer.cluster_in_block(cluster)?;
+                                let price_with = |sparse_pricing| {
+                                    price(
+                                        &layer,
+                                        Some(&reader),
+                                        &selected,
+                                        &mut ReadScratch::default(),
+                                        sparse_pricing,
+                                    )
                                 };
-                                let costs = price(
-                                    &spec,
-                                    Some(&reader),
-                                    &selected,
-                                    &mut ReadScratch::default(),
-                                )?;
+                                let costs = price_with(SparsePricing::Bounded)?;
+                                let full = price_with(SparsePricing::Full)?;
+                                assert_eq!(plan(&costs), plan(&full), "paged={paged}");
+                                match (costs.layer.sparse, full.layer.sparse) {
+                                    (None, Some(sparse)) => {
+                                        assert!(sparse >= costs.layer.band, "paged={paged}");
+                                        skipped_sparse = true;
+                                    }
+                                    (bounded, full) => assert_eq!(bounded, full),
+                                }
                                 let reference = ReadCosts {
                                     exact: Some(known_docs.map_or_else(
                                         || reader.exact_rows_cost_bound(selected.len()),
@@ -422,6 +450,7 @@ mod tests {
         }
         assert!(skipped_exact);
         assert!(selected_exact);
+        assert!(skipped_sparse);
         Ok(())
     }
 }

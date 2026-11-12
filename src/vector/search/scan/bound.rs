@@ -12,6 +12,7 @@
 //! floor via [`PruningBound::shared_threshold`]. An exact score is a zero-width interval. Admission
 //! drops a row only when its upper endpoint is strictly below the floor.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::mem::swap;
 use std::sync::Arc;
@@ -109,6 +110,28 @@ pub(crate) struct ExactMerge {
 pub(crate) struct TopK {
     k: usize,
     by_addr: HashMap<RowAddress, Bound>,
+    /// The worst entry of the full map, computed on first use and cleared by any change.
+    worst: Cell<Option<Worst>>,
+}
+
+/// An exact score is final: an offer that would lower one is a bug.
+#[inline]
+fn debug_assert_exact_not_lowered(address: RowAddress, existing: &Bound, new_lower: f32) {
+    debug_assert!(
+        !matches!(existing, Bound::Exact(_)),
+        "exact score for {address:?} must not be lowered: existing {} new {new_lower}",
+        existing.lower()
+    );
+}
+
+/// A full map's worst entry, by lower endpoint then address.
+#[derive(Clone, Copy, Debug)]
+struct Worst {
+    address: RowAddress,
+    lower: f32,
+    /// Whether no entry's lower endpoint is NaN; only then can an offer below `lower` be turned
+    /// away before the map is searched.
+    ordered: bool,
 }
 
 impl TopK {
@@ -116,6 +139,7 @@ impl TopK {
         Self {
             k,
             by_addr: HashMap::new(),
+            worst: Cell::new(None),
         }
     }
 
@@ -133,14 +157,7 @@ impl TopK {
 
     /// The worst lower endpoint once `k` candidates are in.
     pub(crate) fn kth_lower(&self) -> Option<f32> {
-        if self.k == 0 || self.by_addr.len() != self.k {
-            return None;
-        }
-        let lower = self
-            .by_addr
-            .values()
-            .map(|bound| bound.lower())
-            .min_by(|a, b| a.total_cmp(b))?;
+        let lower = self.full_worst()?.lower;
         lower.is_finite().then_some(lower)
     }
 
@@ -176,46 +193,74 @@ impl TopK {
             return;
         }
         let Candidate { address, bound } = candidate;
+        // An offer strictly below a full map's worst entry changes nothing: a new address cannot
+        // beat the worst, and an address already in the map sits at or above it, so it keeps its
+        // better lower. Turned away before the map is searched.
+        if self
+            .full_worst()
+            .is_some_and(|worst| worst.ordered && bound.lower() < worst.lower)
+        {
+            // Debug builds still check the entry the offer would have lowered.
+            #[cfg(debug_assertions)]
+            if let Some(existing) = self.by_addr.get(&address) {
+                debug_assert_exact_not_lowered(address, existing, bound.lower());
+            }
+            return;
+        }
         if let Some(existing) = self.by_addr.get(&address) {
-            let existing_lower = existing.lower();
             let new_lower = bound.lower();
-            if new_lower < existing_lower {
-                debug_assert!(
-                    !matches!(existing, Bound::Exact(_)),
-                    "exact score for {address:?} must not be lowered: existing {existing_lower} \
-                     new {new_lower}"
-                );
+            if new_lower < existing.lower() {
+                debug_assert_exact_not_lowered(address, existing, new_lower);
                 return;
             }
             self.by_addr.insert(address, bound);
+            self.worst.set(None);
             return;
         }
         if self.by_addr.len() < self.k {
             self.by_addr.insert(address, bound);
+            self.worst.set(None);
             return;
         }
-        // Full map: linear scan for the worst entry is fine while k (= limit + offset) is small.
-        let Some((worst_addr, worst_lower)) = self.worst() else {
+        let Some(worst) = self.full_worst() else {
             return;
         };
-        let lower = bound.lower();
-        let beats = lower
-            .total_cmp(&worst_lower)
-            .then_with(|| worst_addr.cmp(&address))
+        let beats = bound
+            .lower()
+            .total_cmp(&worst.lower)
+            .then_with(|| worst.address.cmp(&address))
             .is_gt();
         if beats {
-            self.by_addr.remove(&worst_addr);
+            self.by_addr.remove(&worst.address);
             self.by_addr.insert(address, bound);
+            self.worst.set(None);
         }
     }
 
-    fn worst(&self) -> Option<(RowAddress, f32)> {
-        self.by_addr
+    /// The worst entry once `k` candidates are in: kept from the last search of the map until
+    /// the map changes. A search is a linear scan, fine while k (= limit + offset) is small.
+    fn full_worst(&self) -> Option<Worst> {
+        if self.k == 0 || self.by_addr.len() != self.k {
+            return None;
+        }
+        if let Some(worst) = self.worst.get() {
+            return Some(worst);
+        }
+        let (address, lower) = self
+            .by_addr
             .iter()
             .map(|(&addr, bound)| (addr, bound.lower()))
             .min_by(|(a_addr, a_lo), (b_addr, b_lo)| {
                 a_lo.total_cmp(b_lo).then_with(|| a_addr.cmp(b_addr))
-            })
+            })?;
+        let ordered = self.by_addr.values().all(|bound| !bound.lower().is_nan());
+        let worst = Worst {
+            address,
+            lower,
+            ordered,
+        };
+        self.worst.set(Some(worst));
+        Some(worst)
     }
 
     /// Takes exact scores from a finished segment. Non-finite scores are skipped.
@@ -248,6 +293,7 @@ impl TopK {
     #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.by_addr.clear();
+        self.worst.set(None);
     }
 }
 
@@ -358,9 +404,124 @@ mod tests {
     }
 
     mod top_k {
+        use std::collections::HashMap;
+
         use super::addr;
-        use crate::vector::search::scan::bound::{Candidate, ExactMerge, TopK};
+        use crate::vector::search::scan::bound::{Bound, Candidate, ExactMerge, TopK};
+        use crate::vector::test_support::Lcg;
+        use crate::vector::write::RowAddress;
         use crate::DocId;
+
+        /// The map's upsert and k-th lower, searching the map on every offer.
+        struct ScanningTopK {
+            k: usize,
+            by_addr: HashMap<RowAddress, Bound>,
+        }
+
+        impl ScanningTopK {
+            fn upsert(&mut self, Candidate { address, bound }: Candidate) {
+                if let Some(existing) = self.by_addr.get(&address) {
+                    if bound.lower() < existing.lower() {
+                        return;
+                    }
+                    self.by_addr.insert(address, bound);
+                    return;
+                }
+                if self.by_addr.len() < self.k {
+                    self.by_addr.insert(address, bound);
+                    return;
+                }
+                let (worst, worst_lower) = self.worst();
+                let beats = bound
+                    .lower()
+                    .total_cmp(&worst_lower)
+                    .then_with(|| worst.cmp(&address))
+                    .is_gt();
+                if beats {
+                    self.by_addr.remove(&worst);
+                    self.by_addr.insert(address, bound);
+                }
+            }
+
+            fn worst(&self) -> (RowAddress, f32) {
+                self.by_addr
+                    .iter()
+                    .map(|(&address, bound)| (address, bound.lower()))
+                    .min_by(|(a, a_lower), (b, b_lower)| {
+                        a_lower.total_cmp(b_lower).then_with(|| a.cmp(b))
+                    })
+                    .unwrap()
+            }
+
+            fn kth_lower(&self) -> Option<f32> {
+                if self.by_addr.len() != self.k {
+                    return None;
+                }
+                Some(self.worst().1).filter(|lower| lower.is_finite())
+            }
+        }
+
+        fn entries(by_addr: &HashMap<RowAddress, Bound>) -> Vec<(RowAddress, u32, u32)> {
+            let mut entries: Vec<_> = by_addr
+                .iter()
+                .map(|(&address, bound)| {
+                    let exact = matches!(bound, Bound::Exact(_));
+                    (
+                        address,
+                        bound.lower().to_bits(),
+                        bound.estimate().to_bits() ^ u32::from(exact),
+                    )
+                })
+                .collect();
+            entries.sort_unstable();
+            entries
+        }
+
+        /// The cached worst entry leaves every upsert as a map searched on each offer leaves it:
+        /// the same entries and k-th lower after every offer, with ties, signed zeros, NaN lowers
+        /// and re-offered addresses.
+        #[test]
+        fn worst_entry_cache_matches_the_scanning_map() {
+            let lowers = [-1.0, -0.0, 0.0, 0.25, 0.5, 1.0, 2.0, f32::NAN];
+            for k in [1, 2, 5, 10] {
+                let mut rng = Lcg(k as u64 + 1);
+                let mut top = TopK::new(k);
+                let mut scanning = ScanningTopK {
+                    k,
+                    by_addr: HashMap::new(),
+                };
+                let mut next_exact = 1_000;
+                for step in 0..20_000 {
+                    let pick = rng.next_f32();
+                    let lower = if pick < 0.0 {
+                        lowers[((pick + 1.0) * lowers.len() as f32) as usize % lowers.len()]
+                    } else {
+                        pick * 3.0 - 1.0
+                    };
+                    // Intervals re-offer a few addresses and may dip; each exact takes its own
+                    // address, so no exact is ever lowered.
+                    let candidate = if rng.next_f32() > 0.6 && lower.is_finite() {
+                        next_exact += 1;
+                        Candidate::exact(addr(next_exact), lower)
+                    } else {
+                        let row = ((rng.next_f32() + 1.0) * 12.0) as u32;
+                        Candidate::interval(addr(row), lower, lower + 0.5)
+                    };
+                    top.upsert(candidate);
+                    scanning.upsert(candidate);
+                    assert_eq!(
+                        entries(&top.by_addr),
+                        entries(&scanning.by_addr),
+                        "k={k} step={step}"
+                    );
+                    assert_eq!(
+                        top.kth_lower().map(f32::to_bits),
+                        scanning.kth_lower().map(f32::to_bits),
+                        "k={k} step={step}"
+                    );
+                }
+            }
+        }
 
         /// Same-address upserts keep the higher lower endpoint and never rewrite with a worse
         /// interval. A raised exact replaces the interval.

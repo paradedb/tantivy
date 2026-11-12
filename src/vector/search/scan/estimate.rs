@@ -412,6 +412,7 @@ mod tests {
             errors: errors.to_vec(),
             constants: constants.to_vec(),
             norms: norms.to_vec(),
+            band_column: Vec::new(),
         }
     }
 

@@ -180,6 +180,18 @@ impl Fold<'_> {
         }
     }
 
+    /// Folds survival scores already computed, in order.
+    pub(crate) fn scores(&mut self, scores: &[f32]) {
+        match self {
+            Fold::Prefill(list) => list.extend_from_slice(scores),
+            Fold::Binned(histogram, grid) => {
+                for &score in scores {
+                    histogram.add_score(*grid, score);
+                }
+            }
+        }
+    }
+
     /// Folds one exact score.
     #[inline]
     pub(crate) fn score(&mut self, score: f32) {

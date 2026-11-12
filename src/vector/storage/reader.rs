@@ -1042,13 +1042,12 @@ impl VectorIndexReader {
             .index()
             .ok_or_else(|| DataCorruption::comment_only("centroid rows need an IVF index"))?;
         let row = index.centroid_row_slice(cluster)?;
-        // Priced in the unit of the cluster's rows, whatever storage the centroids sit on.
-        let unit = self
-            .rows_slice
-            .block(cluster)?
-            .column(0)
-            .storage_block_len();
-        Ok(range_cost(&row, 0..row.len(), unit))
+        // Priced in the unit of the cluster blocks' storage, whatever storage the centroids sit on.
+        Ok(range_cost(
+            &row,
+            0..row.len(),
+            self.rows_slice.storage_block_len(),
+        ))
     }
 
     /// Appends locations for ascending `docs` in block/row order, validating each block once.
