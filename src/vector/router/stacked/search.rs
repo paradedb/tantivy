@@ -1,7 +1,7 @@
 use super::levels::{ClusterId, StackedIvf, StackedSearchStats};
 use crate::vector::router::arena::VectorArena;
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::scoring::score_initial;
+use crate::vector::router::scoring::{score_initial, RouterQueries};
 use crate::vector::router::search::{
     lists_to_open, rerank_exact, OutputPrecision, ScoreBuffer, SearchPolicy, TopCandidates,
 };
@@ -94,10 +94,13 @@ impl<S: VectorSource> RoutingLayer<'_, S> {
     fn score_centroids<T: VectorElement>(
         &self,
         query: &VectorQuery<T>,
+        queries: &mut RouterQueries,
         out: &mut ScoreBuffer<ClusterId>,
     ) -> bool {
         match self {
-            Self::Stored(index) => score_initial(&index.centroids, query, 0..index.nlist(), out),
+            Self::Stored(index) => {
+                score_initial(&index.centroids, query, queries, 0..index.nlist(), out)
+            }
             Self::Partition { centroid, .. } => {
                 out.candidates.clear();
                 out.candidates.push(Candidate {
@@ -117,6 +120,7 @@ impl<S: VectorSource> RoutingLayer<'_, S> {
         &self,
         list: u32,
         query: &VectorQuery<T>,
+        queries: &mut RouterQueries,
         out: &mut ScoreBuffer<ClusterId>,
     ) -> bool {
         let rows = match self {
@@ -126,7 +130,7 @@ impl<S: VectorSource> RoutingLayer<'_, S> {
             }
             Self::Partition { child, .. } => 0..child.nlist(),
         };
-        score_initial(self.members(), query, rows, out)
+        score_initial(self.members(), query, queries, rows, out)
     }
 
     fn child_level(&self, level: usize) -> Option<usize> {
@@ -335,6 +339,7 @@ impl<'a, S: VectorSource> StackedRouting<'a, S> {
         let mut pending = vec![Vec::new(); partition_level.unwrap_or(0)];
         let mut candidates = Vec::new();
         let mut buffer = ScoreBuffer::default();
+        let mut queries = RouterQueries::default();
         for level in (0..depth).rev() {
             if let Some(direct) = pending.get_mut(level) {
                 candidates.append(direct);
@@ -352,8 +357,9 @@ impl<'a, S: VectorSource> StackedRouting<'a, S> {
                 .enumerate()
                 .filter_map(|(i, layer)| layer.map(|l| (i, l)))
             {
-                let approximate =
-                    self.measure(segment, || layer.score_centroids(query, &mut buffer));
+                let approximate = self.measure(segment, || {
+                    layer.score_centroids(query, &mut queries, &mut buffer)
+                });
                 let count = buffer.candidates.len();
                 stats[segment].members_scored += count;
                 if approximate {
@@ -428,8 +434,9 @@ impl<'a, S: VectorSource> StackedRouting<'a, S> {
             for candidate in candidates {
                 let (segment, list) = candidate.node;
                 let layer = levels[segment][level].as_ref().unwrap();
-                let approximate =
-                    self.measure(segment, || layer.score_members(list, query, &mut buffer));
+                let approximate = self.measure(segment, || {
+                    layer.score_members(list, query, &mut queries, &mut buffer)
+                });
                 let scanned = buffer.candidates.len();
                 stats[segment].lists_scanned += 1;
                 stats[segment].members_scored += scanned;
