@@ -36,6 +36,7 @@ use crate::vector::distance::Similarity;
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
 use crate::vector::search::interval::{Estimate, Threshold, UpperEndpoint};
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery};
+use crate::vector::search::source::controller::WorkMeter;
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::quantized::{
     QuantizedClusterReader, QuantizedFieldReader, ReadScratch,
@@ -756,7 +757,7 @@ where
         while let Some(rows) = source.next()? {
             let scored = self.shortlist(&rows)?;
             source.admitted(scored)?;
-            if self.recall_reached() {
+            if self.recall_reached(source.work_meter()) {
                 break;
             }
         }
@@ -768,7 +769,7 @@ where
         std::mem::swap(&mut self.rate, rate);
     }
 
-    pub(crate) fn recall_reached(&mut self) -> bool {
+    pub(crate) fn recall_reached(&mut self, meter: &mut WorkMeter) -> bool {
         let reached = self
             .recall_fraction
             .zip(self.bound.shared_threshold())
@@ -781,6 +782,7 @@ where
                     .map(|reading| reading.reached(fraction))
             })
             .unwrap_or(false);
+        let reached = meter.adaptive_stop(reached);
         self.report.recall_reached |= reached;
         reached
     }

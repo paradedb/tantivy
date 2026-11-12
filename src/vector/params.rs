@@ -17,7 +17,7 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 /// provisional pending real-data benchmarking.
 #[derive(Clone, Debug)]
 pub struct ProbeParams {
-    /// Stop probing when competitive-candidate admission has decayed.
+    /// Stop probing when competitive-candidate admission has decayed. Ignored below max_probe 50.
     pub adaptive_probing: Option<AdaptiveProbeParams>,
     /// Global work ceiling in average-cluster units. Default 100.
     pub max_probe: usize,
@@ -115,6 +115,10 @@ impl Default for ProbeParams {
 }
 
 impl ProbeParams {
+    pub(crate) fn adaptive_probing(&self) -> Option<AdaptiveProbeParams> {
+        self.adaptive_probing.filter(|_| self.max_probe >= 50)
+    }
+
     /// The number of clusters the stacked router is asked to rank for a
     /// segment whose resolved work budget is `budget` units.
     ///

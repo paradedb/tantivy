@@ -130,6 +130,7 @@ pub(crate) struct WorkBudget {
 pub(crate) struct WorkMeter {
     budget: WorkBudget,
     charged: WorkUnits,
+    last_active_work: WorkUnits,
     shared: Option<Arc<dyn SharedVectorWork>>,
 }
 
@@ -138,6 +139,7 @@ impl WorkMeter {
         Self {
             budget,
             charged: WorkUnits::ZERO,
+            last_active_work: WorkUnits::ZERO,
             shared,
         }
     }
@@ -165,6 +167,15 @@ impl WorkMeter {
             .as_ref()
             .map_or(self.charged.get(), |shared| shared.charged())
             >= self.budget.total.get()
+    }
+
+    /// Requires a quiet window worth 5% of this loop's resolved work budget.
+    pub(crate) fn adaptive_stop(&mut self, quiet: bool) -> bool {
+        if !quiet {
+            self.last_active_work = self.charged;
+            return false;
+        }
+        self.charged.get() - self.last_active_work.get() >= 0.05 * self.budget.total.get()
     }
 
     /// The work charged so far.
@@ -239,6 +250,56 @@ pub(crate) struct ProbeOutcome {
 #[cfg(test)]
 mod shared_work_tests {
     use super::*;
+
+    #[test]
+    fn adaptive_patience_uses_work_and_resets_on_activity() {
+        let mut meter = WorkMeter::new(
+            WorkBudget {
+                total: WorkUnits::new(100.0),
+                per_cluster: WorkUnits::new(0.25),
+                per_row: WorkUnits::new(0.75),
+            },
+            None,
+        );
+        meter.open();
+        meter.rows(1);
+        assert!(!meter.adaptive_stop(false));
+        for rows in [1, 2] {
+            meter.open();
+            meter.rows(rows);
+            assert!(!meter.adaptive_stop(true));
+        }
+        for _ in 0..10 {
+            assert!(!meter.adaptive_stop(true));
+        }
+        meter.open();
+        meter.rows(3);
+        assert!(meter.adaptive_stop(true));
+        assert!(!meter.adaptive_stop(false));
+        meter.open();
+        meter.rows(1);
+        assert!(!meter.adaptive_stop(true));
+    }
+
+    #[test]
+    fn adaptive_patience_scales_with_budget_without_changing_ceiling() {
+        for budget in [20, 100, 1000] {
+            let mut meter = WorkMeter::new(
+                WorkBudget {
+                    total: WorkUnits::new(budget as f64),
+                    per_cluster: WorkUnits::new(0.5),
+                    per_row: WorkUnits::new(0.5),
+                },
+                None,
+            );
+            for work in 1..=budget {
+                meter.open();
+                meter.rows(1);
+                assert_eq!(meter.adaptive_stop(true), work >= budget / 20);
+                assert_eq!(meter.exhausted(), work == budget);
+            }
+        }
+    }
 
     #[test]
     fn concurrent_meters_enforce_one_ceiling() {
