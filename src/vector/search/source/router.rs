@@ -27,6 +27,10 @@ pub(crate) enum DocFilter {
     All,
     /// The matching doc ids.
     Docs(Arc<BitSet>),
+    /// A deferred predicate, evaluated after vector shortlisting.
+    Candidates {
+        filter: crate::query::CandidateFilter,
+    },
 }
 
 impl DocFilter {
@@ -34,11 +38,19 @@ impl DocFilter {
         matches!(self, Self::Docs(docs) if docs.len() == 0)
     }
 
+    pub(crate) fn candidate_filter(&self) -> Option<&crate::query::CandidateFilter> {
+        match self {
+            Self::Candidates { filter, .. } => Some(filter),
+            _ => None,
+        }
+    }
+
     /// The share of doc ids below `max_doc` that match.
     pub(crate) fn match_fraction(&self, max_doc: DocId) -> f64 {
         match self {
             Self::All => 1.0,
             Self::Docs(docs) => docs.len() as f64 / f64::from(max_doc.max(1)),
+            Self::Candidates { .. } => 1.0,
         }
     }
 }
@@ -66,8 +78,10 @@ pub(crate) struct GatedRows {
 impl<'a> RowGate<'a> {
     pub(crate) fn new(filter: DocFilter, alive: Option<&'a AliveBitSet>) -> Self {
         match (filter, alive) {
-            (DocFilter::All, None) => RowGate::Open,
-            (DocFilter::All, Some(alive)) => RowGate::AliveOnly(alive),
+            (DocFilter::All | DocFilter::Candidates { .. }, None) => RowGate::Open,
+            (DocFilter::All | DocFilter::Candidates { .. }, Some(alive)) => {
+                RowGate::AliveOnly(alive)
+            }
             (DocFilter::Docs(filter), None) => RowGate::FilterOnly(filter),
             (DocFilter::Docs(filter), Some(alive)) => RowGate::FilterAndAlive { filter, alive },
         }
@@ -170,6 +184,7 @@ pub(crate) struct RouterCounters {
     pub(crate) pruned_dead: usize,
     /// Rows admitted and charged.
     pub(crate) eligible: usize,
+    pub(crate) clusters_reused: usize,
 }
 
 /// A finished router source's report.
@@ -197,6 +212,7 @@ pub(crate) struct RouterClusters<'a> {
     offsets: Vec<u32>,
     selected_docs: Vec<DocId>,
     counters: RouterCounters,
+    visited: BitSet,
 }
 
 impl<'a> RouterClusters<'a> {
@@ -221,7 +237,20 @@ impl<'a> RouterClusters<'a> {
             offsets: Vec::new(),
             selected_docs: Vec::new(),
             counters: RouterCounters::default(),
+            visited: BitSet::with_max_value(index.num_clusters() as u32),
         }
+    }
+
+    pub(crate) fn replace_ranking(&mut self, ranked: RouterIter) {
+        self.ranked = ranked;
+    }
+
+    pub(crate) fn reused_cluster(&mut self) {
+        self.counters.clusters_reused += 1;
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.meter.exhausted()
     }
 
     /// Prepares this segment for a global search across multiple segments.
@@ -338,6 +367,10 @@ impl ClusterSource for RouterClusters<'_> {
             let Some(Candidate { sim, node }) = next else {
                 return Ok(None);
             };
+            if !self.visited.insert(node) {
+                self.counters.clusters_reused += 1;
+                continue;
+            }
             if !self.controller.admit(&self.meter) {
                 return Ok(None);
             }

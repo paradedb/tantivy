@@ -171,10 +171,14 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
         budget: VectorSearchBudget,
         on_segment: impl FnMut(SegmentOrdinal),
     ) -> Result<PreparedVectorSearch> {
+        let mut params = self.probe_params.clone();
+        if self.max_scan_levels == 0 {
+            params.filter_match_fraction = None;
+        }
         PreparedVectorSearch::prepare(
             self.field,
             self.limit.saturating_add(self.offset),
-            &self.probe_params,
+            &params,
             weight,
             segments,
             budget,
@@ -839,6 +843,12 @@ where
             )
         })
     });
+    let mut candidates = candidates.collect::<Vec<_>>();
+    let mut visited = std::collections::HashSet::new();
+    let mut window = candidates.len().max(1);
+    let late_filter = collector.inputs.prepared.segments.iter().any(|s| {
+        matches!(&s.scan, Some(ScanInput::Routed { filter, .. }) if filter.candidate_filter().is_some())
+    });
     let mut reserved = WorkUnits::ZERO;
     let mut scans: Vec<_> = (0..vectors.len()).map(|_| None).collect();
     let mut pending_scans = Vec::with_capacity(vectors.len());
@@ -929,6 +939,7 @@ where
             tie_break,
             collector.tie_break.comparator(),
         )
+        .map(|scan| scan.with_candidate_filter(backend.candidate_filter()))
     };
     let mut meter = WorkMeter::new(
         WorkBudget {
@@ -963,75 +974,123 @@ where
         .filter(|_| top_n > 0)
         .map(|_| crate::vector::search::scan::RateApsState::default());
     let mut recall_reached = false;
-    for (i, candidate) in candidates {
-        if meter.exhausted() || recall_reached {
+    loop {
+        for (i, candidate) in candidates.drain(..) {
+            if !visited.insert((i, candidate.node)) {
+                if let Some(GlobalSource::Router(source)) = &mut sources[i] {
+                    source.reused_cluster();
+                }
+                continue;
+            }
+            if meter.exhausted() || recall_reached {
+                break;
+            }
+            let Some(GlobalSource::Router(source)) = &mut sources[i] else {
+                unreachable!()
+            };
+            let (result, measured) = measure(|| {
+                if let Some(pending) = pending_scans[i].take() {
+                    scans[i] = Some(start_scan(i, pending)?);
+                }
+                let scan = scans[i].as_mut().unwrap();
+                scan.swap_topk(&mut topk);
+                scan.swap_rate(&mut rate);
+                let _stage = enter_vector_stage(scan.shortlist_stage());
+                meter.open();
+                if let Some(rows) = source.probe_global(candidate)? {
+                    let scored = scan.shortlist(&rows)?;
+                    source.admitted(scored)?;
+                    meter.rows(scored);
+                    recall_reached = scan.recall_reached();
+                }
+                scan.swap_rate(&mut rate);
+                scan.swap_topk(&mut topk);
+                Ok::<_, TantivyError>(())
+            });
+            totals[i].append(&measured);
+            on_segment(i);
+            result?;
+            if !recall_reached && rate.as_mut().is_some_and(|rate| rate.refinement_due()) {
+                let mut candidates: Vec<_> = scans
+                    .iter_mut()
+                    .flatten()
+                    .flat_map(|scan| scan.refinement_candidates(top_n))
+                    .collect();
+                if candidates.len() > top_n {
+                    candidates.select_nth_unstable_by(top_n, |a, b| {
+                        b.bound
+                            .estimate()
+                            .total_cmp(&a.bound.estimate())
+                            .then_with(|| a.address.cmp(&b.address))
+                    });
+                    candidates.truncate(top_n);
+                }
+                for (j, scan) in scans.iter_mut().enumerate() {
+                    let Some(scan) = scan else { continue };
+                    scan.swap_topk(&mut topk);
+                    let (result, measured) = measure(|| scan.refine_topk(&candidates));
+                    scan.swap_topk(&mut topk);
+                    totals[j].append(&measured);
+                    on_segment(j);
+                    result?;
+                }
+                let scan = scans[i].as_mut().unwrap();
+                scan.swap_rate(&mut rate);
+                recall_reached = scan.recall_reached();
+                scan.swap_rate(&mut rate);
+            }
+        }
+        for (i, scan) in scans.iter_mut().enumerate() {
+            let Some(scan) = scan else {
+                continue;
+            };
+            scan.swap_topk(&mut topk);
+            let (result, measured) = measure(|| scan.refine_shortlist());
+            scan.swap_topk(&mut topk);
+            totals[i].append(&measured);
+            on_segment(i);
+            result?;
+        }
+        let clusters: usize = vectors
+            .iter()
+            .filter_map(|r| r.index())
+            .map(|i| i.num_clusters())
+            .sum();
+        if !late_filter || meter.exhausted() || topk.kth_lower().is_some() || window >= clusters {
             break;
         }
-        let Some(GlobalSource::Router(source)) = &mut sources[i] else {
-            unreachable!()
-        };
-        let (result, measured) = measure(|| {
-            if let Some(pending) = pending_scans[i].take() {
-                scans[i] = Some(start_scan(i, pending)?);
-            }
-            let scan = scans[i].as_mut().unwrap();
-            scan.swap_topk(&mut topk);
-            scan.swap_rate(&mut rate);
-            let _stage = enter_vector_stage(scan.shortlist_stage());
-            meter.open();
-            if let Some(rows) = source.probe_global(candidate)? {
-                let scored = scan.shortlist(&rows)?;
-                source.admitted(scored)?;
-                meter.rows(scored);
-                recall_reached = scan.recall_reached();
-            }
-            scan.swap_rate(&mut rate);
-            scan.swap_topk(&mut topk);
-            Ok::<_, TantivyError>(())
-        });
-        totals[i].append(&measured);
-        on_segment(i);
-        result?;
-        if !recall_reached && rate.as_mut().is_some_and(|rate| rate.refinement_due()) {
-            let mut candidates: Vec<_> = scans
-                .iter_mut()
-                .flatten()
-                .flat_map(|scan| scan.refinement_candidates(top_n))
-                .collect();
-            if candidates.len() > top_n {
-                candidates.select_nth_unstable_by(top_n, |a, b| {
-                    b.bound
-                        .estimate()
-                        .total_cmp(&a.bound.estimate())
-                        .then_with(|| a.address.cmp(&b.address))
-                });
-                candidates.truncate(top_n);
-            }
-            for (j, scan) in scans.iter_mut().enumerate() {
-                let Some(scan) = scan else { continue };
-                scan.swap_topk(&mut topk);
-                let (result, measured) = measure(|| scan.refine_topk(&candidates));
-                scan.swap_topk(&mut topk);
-                totals[j].append(&measured);
-                on_segment(j);
-                result?;
-            }
-            let scan = scans[i].as_mut().unwrap();
-            scan.swap_rate(&mut rate);
-            recall_reached = scan.recall_reached();
-            scan.swap_rate(&mut rate);
+        window = window.saturating_mul(2).min(clusters);
+        let routers: Vec<_> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                matches!(sources[i], Some(GlobalSource::Router(_)))
+                    .then(|| r.index().unwrap().opened_router())
+            })
+            .collect();
+        let partitions: Vec<_> = segments
+            .iter()
+            .map(|s| s.partition_centroid.as_deref())
+            .collect();
+        let query = collector.vector_query(vectors[0].options().metric())?;
+        let ranking = crate::vector::router::global::GlobalRanking::from(
+            &routers,
+            &partitions,
+            &query,
+            crate::vector::router::RoutingParams {
+                k: window,
+                rerank_factor: collector.probe_params.router_rerank_factor,
+                min_beam_fraction: collector.probe_params.router_min_beam_fraction,
+                aps: collector.probe_params.router_aps,
+                flat: collector.probe_params.router_flat,
+            },
+            totals,
+            on_segment,
+        );
+        candidates = ranking.clusters;
+        for scan in scans.iter_mut().flatten() {
+            scan.retried_router();
         }
-    }
-    for (i, scan) in scans.iter_mut().enumerate() {
-        let Some(scan) = scan else {
-            continue;
-        };
-        scan.swap_topk(&mut topk);
-        let (result, measured) = measure(|| scan.refine_shortlist());
-        scan.swap_topk(&mut topk);
-        totals[i].append(&measured);
-        on_segment(i);
-        result?;
     }
     for (i, ((scan, source), report)) in scans.into_iter().zip(sources).zip(reports).enumerate() {
         let Some(source) = source else {
@@ -3188,5 +3247,185 @@ mod prepared_key_tests {
             grid,
         };
         assert_ne!(quant(g), quant(other));
+    }
+}
+
+#[cfg(test)]
+mod late_filter_tests {
+    use super::*;
+    use crate::query::{CandidateFilter, Explanation, Scorer, Weight};
+    use crate::schema::Metric;
+    use crate::vector::test_support::FixtureSpec;
+    use crate::{DocId, SegmentReader};
+
+    struct DeferredWeight {
+        inner: Box<dyn Weight>,
+    }
+    impl Weight for DeferredWeight {
+        fn uses_fast_fields(&self) -> bool {
+            true
+        }
+        fn candidate_filter(&self, reader: &SegmentReader) -> Result<CandidateFilter> {
+            self.inner.candidate_filter(reader)
+        }
+        fn scorer(&self, _: &SegmentReader, _: Score) -> Result<Box<dyn Scorer>> {
+            panic!("late preparation must not enumerate matches")
+        }
+        fn explain(&self, reader: &SegmentReader, doc: DocId) -> Result<Explanation> {
+            self.inner.explain(reader, doc)
+        }
+    }
+
+    #[test]
+    fn late_filter_never_prunes_on_rejected_neighbors() -> Result<()> {
+        for replicated in [false, true] {
+            let mut spec = FixtureSpec::clustered(Metric::L2, 64, 32, 4096)
+                .schedule(&[1, 4])
+                .label("matches", |i| i % 10 == 0)
+                .deletes(&[0, 10, 20]);
+            if replicated {
+                spec = spec.replicated();
+            }
+            let fixture = spec.build()?;
+            let searcher = fixture.index.reader()?.searcher();
+            let segments: Vec<_> = searcher
+                .segment_readers()
+                .iter()
+                .enumerate()
+                .map(|(i, r)| VectorSegment::from((i as u32, r)))
+                .collect();
+            let filter = fixture.filter("matches");
+            let weight = fixture.weight(&filter)?;
+            let query = vec![0.0f32; 64];
+            let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
+                .with_probe_params(ProbeParams {
+                    located: crate::vector::LocatedPath::Off,
+                    ..crate::vector::tests::exhaustive_params(32)
+                });
+            let budget =
+                VectorSearchBudget::for_segments(fixture.field, &builder.probe_params, &segments)?;
+            let mut prepared = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
+            for segment in &mut prepared.segments {
+                let ScanInput::Routed { filter, .. } = segment.scan.as_mut().unwrap() else {
+                    panic!("routed scan")
+                };
+                *filter = crate::vector::search::source::router::DocFilter::Candidates {
+                    filter: weight.candidate_filter(&segment.reader)?,
+                };
+            }
+            let router = TopClustersBySimilarityCollector::new(
+                fixture.field,
+                query.clone(),
+                builder.probe_params.clone(),
+                0.1,
+            )?
+            .with_budget(budget);
+            let candidates = router.collect_segments(&segments, |_| {})?;
+            for shared in [false, true] {
+                let work = shared.then(|| {
+                    Arc::new(crate::vector::AtomicVectorWork::default())
+                        as Arc<dyn crate::vector::SharedVectorWork>
+                });
+                let collector = builder
+                    .clone()
+                    .build(prepared.clone().with_candidates(candidates.clone(), work)?);
+                let fruit = collector.merge_fruits(collector.collect_segments(
+                    weight.as_ref(),
+                    &segments,
+                    |_| {},
+                )?)?;
+                assert_eq!(fruit.results, fixture.oracle(&filter, &query, 10)?);
+                assert!(fruit
+                    .stats
+                    .iter()
+                    .all(|s| s.late_filter && s.filter_checks > 0));
+                assert!(fruit.stats.iter().all(|s| s.exact_rows <= s.filter_checks));
+            }
+            // The actual eligibility path must also avoid draining the filter.
+            let params = ProbeParams {
+                max_probe: 1,
+                filter_match_fraction: Some(0.1),
+                ..Default::default()
+            };
+            let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
+                .with_probe_params(params);
+            let deferred = DeferredWeight { inner: weight };
+            let collector = builder.build_for_segments(&deferred, &segments, |_| {})?;
+            let fruit = collector.merge_fruits(collector.collect_segments(
+                &deferred,
+                &segments,
+                |_| {},
+            )?)?;
+            assert!(fruit.results.len() <= 10);
+            assert!(fruit.stats.iter().all(|s| s.late_filter));
+        }
+        Ok(())
+    }
+    #[test]
+    fn late_filter_retries_without_rescanning_clusters() -> Result<()> {
+        let fixture = FixtureSpec::clustered(Metric::L2, 64, 32, 4096)
+            .schedule(&[1])
+            .label("matches", |i| i % 32 == 31)
+            .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let segments = vec![VectorSegment::from((0, searcher.segment_reader(0)))];
+        let filter = fixture.filter("matches");
+        let weight = fixture.weight(&filter)?;
+        let query = vec![0.0f32; 64];
+        let params = ProbeParams {
+            located: crate::vector::LocatedPath::Off,
+            ..crate::vector::tests::exhaustive_params(32)
+        };
+        let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
+            .with_probe_params(params.clone());
+        let budget = VectorSearchBudget::for_segments(fixture.field, &params, &segments)?;
+        let mut prepared = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
+        let candidate_filter = weight.candidate_filter(&segments[0].reader)?;
+        let ScanInput::Routed { filter, .. } = prepared.segments[0].scan.as_mut().unwrap() else {
+            panic!("routed")
+        };
+        *filter = crate::vector::search::source::router::DocFilter::Candidates {
+            filter: candidate_filter.clone(),
+        };
+        let router =
+            TopClustersBySimilarityCollector::new(fixture.field, query.clone(), params, 1.0)?
+                .with_budget(budget);
+        let candidates = router.collect_segments(&segments, |_| {})?;
+        let reader = segments[0].reader.vector_index(fixture.field)?;
+        let mut docs = Vec::new();
+        let first = candidates
+            .into_iter()
+            .find(|c| {
+                reader.read_doc_ids(c.node.1 as usize, &mut docs).unwrap();
+                !candidate_filter
+                    .matches(&docs)
+                    .unwrap()
+                    .into_iter()
+                    .any(|yes| yes)
+            })
+            .unwrap();
+        for shared in [false, true] {
+            let work = shared.then(|| {
+                Arc::new(crate::vector::AtomicVectorWork::default())
+                    as Arc<dyn crate::vector::SharedVectorWork>
+            });
+            let collector = builder.clone().build(
+                prepared
+                    .clone()
+                    .with_candidates(vec![first.clone()], work)?,
+            );
+            let fruit = collector.merge_fruits(collector.collect_segments(
+                weight.as_ref(),
+                &segments,
+                |_| {},
+            )?)?;
+            assert_eq!(
+                fruit.results,
+                fixture.oracle(&fixture.filter("matches"), &query, 10)?
+            );
+            assert!(fruit.stats[0].router_retries > 0);
+            assert!(fruit.stats[0].candidates_scored <= 4096);
+        }
+        Ok(())
     }
 }

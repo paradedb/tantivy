@@ -247,6 +247,16 @@ pub(crate) enum AccessPath {
 pub struct ProbeStats {
     /// Rows shortlisted from the source, including replica copies dropped before scoring.
     pub candidates_scored: usize,
+    /// Whether this scan deferred its filter until vector shortlisting.
+    pub late_filter: bool,
+    /// Shortlisted candidates tested against the deferred filter.
+    pub filter_checks: usize,
+    /// Wider router requests made after a deferred filter produced fewer than k matches.
+    pub router_retries: usize,
+    /// Previously scanned clusters skipped on a wider router request.
+    pub clusters_reused: usize,
+    /// Nanoseconds evaluating deferred membership checks.
+    pub late_filter_ns: u64,
     /// Rows the routed source admitted and charged, a replicated document's second copy included.
     pub layer0_eligible: usize,
     /// Rows dropped at admission as the second copy of a document an earlier cluster held.
@@ -407,6 +417,9 @@ impl ProbeStats {
         let full_precision = scan.layers.is_empty();
         let mut stats = Self {
             candidates_scored: scan.candidates_scored,
+            late_filter: scan.late_filter,
+            filter_checks: scan.filter_checks,
+            router_retries: scan.router_retries,
             exact_rows: scan.exact_rows,
             exact_recheck_dropped: scan.exact_recheck_dropped,
             replication_dropped: scan.replication_dropped,
@@ -462,6 +475,7 @@ impl ProbeStats {
         } = report;
         self.layer0_eligible = counters.eligible;
         self.clusters_skipped_empty = counters.clusters_skipped_empty;
+        self.clusters_reused = counters.clusters_reused;
         self.vectors_visited = counters.vectors_visited;
         self.pruned_filter = counters.pruned_filter;
         self.pruned_dead = counters.pruned_dead;
@@ -516,6 +530,7 @@ impl ProbeStats {
     fn apply_timings(&mut self, totals: &StageTotals) {
         self.scan_init_ns = totals.time_ns(VectorStage::ScanInit);
         self.non_vector_search_ns = totals.time_ns(VectorStage::NonVectorSearch);
+        self.late_filter_ns = totals.time_ns(VectorStage::LateFilter);
         self.query_prep_ns = totals.time_ns(VectorStage::QueryPrep);
         self.routing_ns = totals.time_ns(VectorStage::Routing);
         self.locate_ns = totals.time_ns(VectorStage::Locate);
@@ -591,6 +606,11 @@ mod tests {
 
     const COMMON: &[&str] = &[
         "candidates_scored",
+        "late_filter",
+        "filter_checks",
+        "late_filter_ns",
+        "router_retries",
+        "clusters_reused",
         "layer0_eligible",
         "clusters_skipped_empty",
         "exact_reads",

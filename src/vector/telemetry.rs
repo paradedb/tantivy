@@ -22,6 +22,8 @@ pub enum VectorStage {
     ScanInit,
     /// Predicate evaluation and filter-bitset construction.
     NonVectorSearch,
+    /// Membership checks on shortlisted vector candidates.
+    LateFilter,
     /// Query preparation.
     QueryPrep,
     /// Cluster routing.
@@ -51,6 +53,7 @@ impl VectorStage {
             Self::Other => None,
             Self::ScanInit => Some(Cow::Borrowed("scan_init")),
             Self::NonVectorSearch => Some(Cow::Borrowed("non_vector_search")),
+            Self::LateFilter => Some(Cow::Borrowed("late_filter")),
             Self::QueryPrep => Some(Cow::Borrowed("query_prep")),
             Self::Routing => Some(Cow::Borrowed("routing")),
             Self::LayerScan(layer) => Some(Cow::Owned(format!("layer{layer}_scan"))),
@@ -67,7 +70,7 @@ impl VectorStage {
 
 // --- Totals ---
 
-const FIXED_SLOTS: usize = 11;
+const FIXED_SLOTS: usize = 12;
 const STAGE_SLOTS: usize = FIXED_SLOTS + 2 * MAX_QUANTIZATION_LAYERS;
 const FALLBACK_LAYERS: usize = 3;
 
@@ -93,6 +96,7 @@ fn slot(stage: VectorStage) -> usize {
         VectorStage::ResultAssembly => 8,
         VectorStage::Locate => 9,
         VectorStage::Centroid => 10,
+        VectorStage::LateFilter => 11,
         VectorStage::LayerScan(l) => layer(FIXED_SLOTS, l),
         VectorStage::Boundary(l) => layer(FIXED_SLOTS + MAX_QUANTIZATION_LAYERS, l),
     }

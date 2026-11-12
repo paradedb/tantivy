@@ -19,6 +19,9 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 pub struct ProbeParams {
     /// Stop probing when competitive-candidate admission has decayed.
     pub adaptive_probing: Option<AdaptiveProbeParams>,
+    /// Estimated filter match fraction. Enables deferred fast-field filters when materializing
+    /// their estimated match set costs more than locating it. `None` keeps eager evaluation.
+    pub filter_match_fraction: Option<f64>,
     /// Global work ceiling in average-cluster units. Default 100.
     pub max_probe: usize,
     /// Approximate members retained per requested cluster by the quantized router.
@@ -101,6 +104,7 @@ impl Default for ProbeParams {
     fn default() -> Self {
         Self {
             adaptive_probing: None,
+            filter_match_fraction: None,
             max_probe: 100,
             router_rerank_factor: 1.0,
             router_min_beam_fraction: 0.5,

@@ -193,6 +193,7 @@ mod tests {
                         } => {
                             let matches = match filter {
                                 DocFilter::All => None,
+                                DocFilter::Candidates { .. } => unreachable!(),
                                 DocFilter::Docs(docs) => Some(docs.len()),
                             };
                             (budget, report, (false, matches))

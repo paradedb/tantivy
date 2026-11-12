@@ -81,6 +81,17 @@ impl ConstWeight {
 }
 
 impl Weight for ConstWeight {
+    fn candidate_filter(
+        &self,
+        reader: &SegmentReader,
+    ) -> crate::Result<crate::query::CandidateFilter> {
+        self.weight.candidate_filter(reader)
+    }
+
+    fn uses_fast_fields(&self) -> bool {
+        self.weight.uses_fast_fields()
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let inner_scorer = self.weight.scorer(reader, boost)?;
         Ok(Box::new(ConstScorer::new(inner_scorer, boost * self.score)))

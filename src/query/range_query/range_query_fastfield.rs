@@ -45,16 +45,47 @@ impl Query for FastFieldRangeQuery {
 #[derive(Clone, Debug)]
 pub struct FastFieldRangeWeight {
     bounds: BoundsRange<Term>,
+    candidate_mode: bool,
 }
 
 impl FastFieldRangeWeight {
     /// Create a new FastFieldRangeWeight
     pub fn new(bounds: BoundsRange<Term>) -> Self {
-        Self { bounds }
+        Self {
+            bounds,
+            candidate_mode: false,
+        }
     }
 }
 
 impl Weight for FastFieldRangeWeight {
+    fn candidate_filter(
+        &self,
+        reader: &SegmentReader,
+    ) -> crate::Result<crate::query::CandidateFilter> {
+        Ok(crate::query::CandidateFilter::from_weight(
+            self.clone(),
+            reader,
+        ))
+    }
+
+    fn uses_fast_fields(&self) -> bool {
+        true
+    }
+
+    fn scorer_for_candidates_unpositioned(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        _candidate_size: u32,
+    ) -> crate::Result<Box<dyn Scorer>> {
+        let weight = Self {
+            candidate_mode: true,
+            ..self.clone()
+        };
+        weight.scorer(reader, boost)
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         // Check if both bounds are Bound::Unbounded
         if self.bounds.is_unbounded() {
@@ -124,11 +155,17 @@ impl Weight for FastFieldRangeWeight {
                         boost,
                         BoundsRange::new(lower_bound, upper_bound),
                         None,
+                        self.candidate_mode,
                     )
                 }
-                Type::U64 | Type::I64 | Type::F64 => {
-                    search_on_json_numerical_field(reader, &field_name, typ, bounds, boost)
-                }
+                Type::U64 | Type::I64 | Type::F64 => search_on_json_numerical_field(
+                    reader,
+                    &field_name,
+                    typ,
+                    bounds,
+                    boost,
+                    self.candidate_mode,
+                ),
                 Type::Date => {
                     let fast_field_reader = reader.fast_fields();
                     let Some((column, _col_type)) = fast_field_reader
@@ -143,6 +180,7 @@ impl Weight for FastFieldRangeWeight {
                         boost,
                         BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
                         None,
+                        self.candidate_mode,
                     )
                 }
                 Type::Bool
@@ -175,7 +213,11 @@ impl Weight for FastFieldRangeWeight {
                 ip_addr_column.min_value(),
                 ip_addr_column.max_value(),
             );
-            let docset = RangeDocSet::new(value_range, ip_addr_column);
+            let docset = if self.candidate_mode {
+                RangeDocSet::new_unpositioned(value_range, ip_addr_column)
+            } else {
+                RangeDocSet::new(value_range, ip_addr_column)
+            };
             Ok(Box::new(ConstScorer::new(docset, boost)))
         } else if field_type.is_str() {
             let Some(str_dict_column): Option<StrColumn> = reader.fast_fields().str(&field_name)?
@@ -198,6 +240,7 @@ impl Weight for FastFieldRangeWeight {
                 boost,
                 BoundsRange::new(lower_bound, upper_bound),
                 sort_order,
+                self.candidate_mode,
             )
         } else if field_type.is_bytes() {
             let Some(bytes_column): Option<BytesColumn> =
@@ -221,6 +264,7 @@ impl Weight for FastFieldRangeWeight {
                 boost,
                 BoundsRange::new(lower_bound, upper_bound),
                 sort_order,
+                self.candidate_mode,
             )
         } else {
             assert!(
@@ -264,6 +308,7 @@ impl Weight for FastFieldRangeWeight {
                 boost,
                 BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
                 sort_order,
+                self.candidate_mode,
             )
         }
     }
@@ -290,6 +335,7 @@ fn search_on_json_numerical_field(
     typ: Type,
     bounds: BoundsRange<ValueBytes<Vec<u8>>>,
     boost: Score,
+    candidate_mode: bool,
 ) -> crate::Result<Box<dyn Scorer>> {
     // Since we don't know which type was interpolated for the internal column we
     // have to check for all numeric types (only one exists)
@@ -369,6 +415,7 @@ fn search_on_json_numerical_field(
         boost,
         BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
         None,
+        candidate_mode,
     )
 }
 
@@ -450,6 +497,7 @@ fn search_on_u64_ff(
     boost: Score,
     bounds: BoundsRange<u64>,
     sort_order: Option<Order>,
+    candidate_mode: bool,
 ) -> crate::Result<Box<dyn Scorer>> {
     let col_min_value = column.min_value();
     let col_max_value = column.max_value();
@@ -495,7 +543,11 @@ fn search_on_u64_ff(
         }
     }
 
-    let docset = RangeDocSet::new(value_range, column);
+    let docset = if candidate_mode {
+        RangeDocSet::new_unpositioned(value_range, column)
+    } else {
+        RangeDocSet::new(value_range, column)
+    };
     Ok(Box::new(ConstScorer::new(docset, boost)))
 }
 

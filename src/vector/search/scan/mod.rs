@@ -117,6 +117,9 @@ impl LayerReport {
 pub(crate) struct ScanReport {
     /// Rows shortlisted from the source.
     pub(crate) candidates_scored: usize,
+    pub(crate) late_filter: bool,
+    pub(crate) filter_checks: usize,
+    pub(crate) router_retries: usize,
     pub(crate) recall_reached: bool,
     /// One per active layer on a quantized segment; empty at full precision.
     pub(crate) layers: Vec<LayerReport>,
@@ -174,6 +177,7 @@ struct QuantizedState<'a> {
     admission_upper: Vec<f32>,
     /// Rows the layer-0 kernel scored, replicas included, before admission pruning.
     layer0_scored: usize,
+    late_filter: bool,
     /// Rows admission pruning dropped.
     layer0_admission_pruned: usize,
     /// The reader exact reads are priced through; `None` with the exact plan off.
@@ -219,6 +223,7 @@ impl<'a> QuantizedState<'a> {
             admission_keep: Vec::new(),
             admission_upper: Vec::new(),
             layer0_scored: 0,
+            late_filter: false,
             layer0_admission_pruned: 0,
             exact: config.exact_plan.then_some(reader),
             index,
@@ -349,7 +354,9 @@ impl<'a> QuantizedState<'a> {
                     &self.admission_keep,
                 );
                 self.layer0_admission_pruned += rows.len() - at.len();
-                bound.offer(self.candidates.entries(at, self.segment_ord));
+                if !self.late_filter {
+                    bound.offer(self.candidates.entries(at, self.segment_ord));
+                }
             }
             None => {
                 let at = self.candidates.push_block(rows, centroid);
@@ -367,7 +374,9 @@ impl<'a> QuantizedState<'a> {
                         self.candidates.kappa(),
                     );
                 }
-                bound.offer(self.candidates.entries(at, self.segment_ord));
+                if !self.late_filter {
+                    bound.offer(self.candidates.entries(at, self.segment_ord));
+                }
             }
         }
         Ok(())
@@ -438,7 +447,9 @@ impl<'a> QuantizedState<'a> {
             &self.admission_keep,
         );
         self.layer0_admission_pruned += unseen.len() - at.len();
-        bound.offer(self.candidates.entries(at, self.segment_ord));
+        if !self.late_filter {
+            bound.offer(self.candidates.entries(at, self.segment_ord));
+        }
         #[cfg(test)]
         {
             self.whole_band_admissions += 1;
@@ -542,7 +553,9 @@ impl<'a> QuantizedState<'a> {
                 .push(self.candidates.column_trace(row_order));
         }
         let _boundary = enter_vector_stage(VectorStage::Boundary(layer as u8));
-        bound.offer(self.candidates.live_candidates(self.segment_ord));
+        if !self.late_filter {
+            bound.offer(self.candidates.live_candidates(self.segment_ord));
+        }
         let threshold = bound
             .shared_threshold()
             .map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score)));
@@ -678,6 +691,8 @@ where
     rate: Option<RateApsState>,
     recall_fraction: Option<f64>,
     report: ScanReport,
+    late_filter: Option<crate::query::CandidateFilter>,
+    reader: &'a VectorIndexReader,
 }
 
 impl<'a, T, K, C> SegmentScan<'a, T, K, C>
@@ -719,6 +734,8 @@ where
             .filter(|_| config.top_n > 0)
             .map(|p| p.admission_fraction);
         Ok(Self {
+            late_filter: None,
+            reader,
             exact: ExactScorer::new(
                 reader,
                 query.query,
@@ -743,6 +760,29 @@ where
                 ..ScanReport::default()
             },
         })
+    }
+
+    pub(crate) fn with_candidate_filter(
+        mut self,
+        filter: Option<crate::query::CandidateFilter>,
+    ) -> Self {
+        if let Some(state) = &mut self.quantized {
+            state.late_filter = filter.is_some();
+            if state.late_filter {
+                state.exact = None;
+            }
+        }
+        self.report.late_filter = filter.is_some();
+        self.late_filter = filter;
+        self
+    }
+
+    pub(crate) fn needs_more_matches(&self) -> bool {
+        self.late_filter.is_some() && self.bound.shared_threshold().is_none()
+    }
+
+    pub(crate) fn retried_router(&mut self) {
+        self.report.router_retries += 1;
     }
 
     pub(crate) fn swap_topk(&mut self, top: &mut TopK) {
@@ -787,16 +827,26 @@ where
 
     pub(crate) fn refine_shortlist(&mut self) -> crate::Result<()> {
         self.close_shortlist();
+        if self.late_filter.is_some() {
+            self.filter_shortlist(true)?;
+        }
         for layer in self.refining_layers() {
             self.narrow(layer)?;
         }
-        self.score_shortlist()
+        if self.late_filter.is_some() {
+            self.filter_shortlist(false)
+        } else {
+            self.score_shortlist()
+        }
     }
 
     pub(crate) fn refinement_candidates(&self, limit: usize) -> Vec<Candidate> {
         let Some(state) = &self.quantized else {
             return Vec::new();
         };
+        if self.late_filter.is_some() {
+            return Vec::new();
+        }
         let mut candidates = state.candidates.live_candidates(state.segment_ord);
         if let Some(bar) = self.bound.shared_threshold() {
             candidates.retain(|candidate| candidate.bound.estimate() > bar);
@@ -856,6 +906,79 @@ where
                     .map(|row| BlockAddress::new(selected.cluster as u32, row as u32)),
             );
             state.candidates.remove_rows(b, &offsets);
+        }
+        Ok(())
+    }
+
+    fn filter_shortlist(&mut self, seed: bool) -> crate::Result<()> {
+        const BATCH_SIZE: usize = 64;
+        let filter = self.late_filter.as_ref().unwrap().clone();
+        let mut docs = Vec::new();
+        loop {
+            if seed && self.bound.shared_threshold().is_some() {
+                break;
+            }
+            let state = self
+                .quantized
+                .as_mut()
+                .expect("late filters require quantization");
+            state.candidates.band(
+                self.bound
+                    .shared_threshold()
+                    .map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score))),
+            );
+            let mut candidates = state.candidates.live_candidates(state.segment_ord);
+            if candidates.is_empty() {
+                break;
+            }
+            if candidates.len() > BATCH_SIZE {
+                candidates.select_nth_unstable_by(BATCH_SIZE, |a, b| {
+                    b.bound
+                        .estimate()
+                        .total_cmp(&a.bound.estimate())
+                        .then_with(|| a.address.cmp(&b.address))
+                });
+                candidates.truncate(BATCH_SIZE);
+            }
+            candidates.sort_unstable_by_key(|c| c.address);
+            let stage = enter_vector_stage(VectorStage::LateFilter);
+            let mut indexed = Vec::with_capacity(candidates.len());
+            let mut last = None;
+            for (i, candidate) in candidates.iter().enumerate() {
+                let address = candidate.address.block_address;
+                if last != Some(address.block) {
+                    self.reader
+                        .read_doc_ids(address.block as usize, &mut docs)?;
+                    last = Some(address.block);
+                }
+                indexed.push((docs[address.row as usize], i));
+            }
+            indexed.sort_unstable_by_key(|&(doc, _)| doc);
+            let ids: Vec<_> = indexed.iter().map(|&(doc, _)| doc).collect();
+            let matched = filter.matches(&ids)?;
+            self.report.filter_checks += ids.len();
+            let passing: Vec<_> = indexed
+                .iter()
+                .zip(matched)
+                .filter_map(|(&(_, i), yes)| yes.then_some(candidates[i]))
+                .collect();
+            drop(stage);
+            self.refine_topk(&passing)?;
+            let state = self.quantized.as_mut().unwrap();
+            // Retire rejects as well as exact-scored matches; no candidate is checked twice.
+            for &b in &self.by_cluster {
+                let group = state.candidates.rows(b);
+                let offsets: Vec<_> = candidates
+                    .iter()
+                    .filter_map(|c| {
+                        let a = c.address.block_address;
+                        (a.block as usize == group.cluster
+                            && group.rows.contains(&(a.row as usize)))
+                        .then(|| a.row - group.rows.start as u32)
+                    })
+                    .collect();
+                state.candidates.remove_rows(b, &offsets);
+            }
         }
         Ok(())
     }

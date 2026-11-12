@@ -139,6 +139,13 @@ impl<T: VectorElement> SegmentSearcher<T> {
         }
     }
 
+    pub(crate) fn candidate_filter(&self) -> Option<crate::query::CandidateFilter> {
+        match &self.segment.scan {
+            Some(ScanInput::Routed { filter, .. }) => filter.candidate_filter().cloned(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn reader(&self) -> &VectorIndexReader {
         &self.reader
     }
@@ -247,7 +254,8 @@ impl<T: VectorElement> SegmentSearcher<T> {
             self.segment.ordinal,
             tie_break,
             tie_comparator,
-        )?;
+        )?
+        .with_candidate_filter(self.candidate_filter());
         drop(init);
         let source = match input.clone() {
             ScanInput::Routed { filter, budget, .. } => {
@@ -269,6 +277,40 @@ impl<T: VectorElement> SegmentSearcher<T> {
                     self.shared_work.clone(),
                 );
                 scan.run(&mut clusters)?;
+                let mut window = self.ranked.len().max(1);
+                while scan.needs_more_matches()
+                    && !clusters.exhausted()
+                    && window < index.num_clusters()
+                {
+                    window = window.saturating_mul(2).min(index.num_clusters());
+                    let ranking = crate::vector::router::global::GlobalRanking::from(
+                        &[Some(index.opened_router())],
+                        &[self.segment.partition_centroid.as_deref()],
+                        &self.query,
+                        crate::vector::router::RoutingParams {
+                            k: window,
+                            rerank_factor: self.probe_params.router_rerank_factor,
+                            min_beam_fraction: self.probe_params.router_min_beam_fraction,
+                            aps: self.probe_params.router_aps,
+                            flat: self.probe_params.router_flat,
+                        },
+                        &mut [crate::vector::telemetry::StageTotals::default()],
+                        &mut |_| {},
+                    );
+                    clusters.replace_ranking(RouterIter::new(
+                        ranking
+                            .clusters
+                            .into_iter()
+                            .map(|(_, c)| crate::vector::router::candidate::Candidate {
+                                node: c.node.into(),
+                                sim: c.sim,
+                            })
+                            .collect(),
+                        ranking.metrics[0],
+                    ));
+                    scan.retried_router();
+                    scan.run(&mut clusters)?;
+                }
                 SourceReport::Router(clusters.finish())
             }
             ScanInput::Located { docs, budget, .. } => {
@@ -313,6 +355,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
         drop(init);
         let scan = enter_vector_stage(VectorStage::ExactScan);
         let docs = match filter {
+            DocFilter::Candidates { .. } => unreachable!("late filters require IVF"),
             DocFilter::All => itertools::Either::Left(0..self.segment.reader.max_doc()),
             DocFilter::Docs(docs) => itertools::Either::Right(
                 (0..docs.max_value().div_ceil(64)).flat_map(move |bucket| {

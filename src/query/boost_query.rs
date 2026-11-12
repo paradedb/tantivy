@@ -86,6 +86,17 @@ impl BoostWeight {
 }
 
 impl Weight for BoostWeight {
+    fn uses_fast_fields(&self) -> bool {
+        self.weight.uses_fast_fields()
+    }
+
+    fn candidate_filter(
+        &self,
+        reader: &SegmentReader,
+    ) -> crate::Result<crate::query::CandidateFilter> {
+        self.weight.candidate_filter(reader)
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         self.weight.scorer(reader, boost * self.boost)
     }

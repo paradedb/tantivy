@@ -9,7 +9,6 @@ use crate::vector::search::segment::plan::{
     collect_segment_filter, located_cap, PlanReport, ScanInput, Source,
 };
 use crate::vector::search::source::controller::{SharedVectorWork, WorkBudget, WorkUnits};
-#[cfg(test)]
 use crate::vector::search::source::router::DocFilter;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
 use crate::vector::{ProbeParams, VectorStage};
@@ -53,6 +52,12 @@ pub struct VectorSearchBudget {
 }
 
 impl VectorSearchBudget {
+    /// Match count above which evaluating a column filter on vector candidates avoids
+    /// materializing more matches than the scan budget can score.
+    pub fn filter_materialization_limit(&self) -> usize {
+        (self.work.total.get() / self.work.per_row.get()).floor() as usize
+    }
+
     /// Resolves the global ceiling and minimum once over the complete search snapshot.
     pub fn for_segments(
         field: Field,
@@ -148,24 +153,46 @@ impl PreparedVectorSearch {
                             located_cap: cap,
                         };
                         let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                        let scan =
-                            match collect_segment_filter(weight, &segment.reader, max_doc, cap)? {
-                                Source::Router(filter) if !filter.is_empty() => {
-                                    Some(ScanInput::Routed {
-                                        filter,
-                                        budget: work,
-                                        report,
-                                    })
-                                }
-                                Source::FilterMatches(docs) if !docs.is_empty() => {
-                                    Some(ScanInput::Located {
-                                        docs,
-                                        budget: work,
-                                        report,
-                                    })
-                                }
-                                _ => None,
-                            };
+                        let estimate = params
+                            .filter_match_fraction
+                            .filter(|s| s.is_finite() && *s > 0.0 && *s <= 1.0);
+                        let late = weight.uses_fast_fields()
+                            && estimate.is_some_and(|s| {
+                                s * f64::from(max_doc)
+                                    > located_cap(
+                                        crate::vector::LocatedPath::Auto,
+                                        max_doc,
+                                        work.total.get(),
+                                        n_avg,
+                                        x,
+                                    )
+                                    .max(top_n) as f64
+                            })
+                            && vectors.quantization()?.is_some();
+                        let source = if late {
+                            Source::Router(DocFilter::Candidates {
+                                filter: weight.candidate_filter(&segment.reader)?,
+                            })
+                        } else {
+                            collect_segment_filter(weight, &segment.reader, max_doc, cap)?
+                        };
+                        let scan = match source {
+                            Source::Router(filter) if !filter.is_empty() => {
+                                Some(ScanInput::Routed {
+                                    filter,
+                                    budget: work,
+                                    report,
+                                })
+                            }
+                            Source::FilterMatches(docs) if !docs.is_empty() => {
+                                Some(ScanInput::Located {
+                                    docs,
+                                    budget: work,
+                                    report,
+                                })
+                            }
+                            _ => None,
+                        };
                         (scan, cap)
                     }
                 } else if top_n == 0 || max_doc == 0 {
@@ -277,10 +304,10 @@ impl PreparedVectorSearch {
             })
             .collect();
         self.segments
-            .retain(|s| !s.routed() || routed.contains_key(&s.ordinal));
+            .retain(|s| !s.routed() || routed.contains_key(&s.ordinal) || matches!(&s.scan, Some(ScanInput::Routed { filter, .. }) if filter.candidate_filter().is_some()));
         for segment in &mut self.segments {
             if let Some(ScanInput::Routed { budget, report, .. }) = &mut segment.scan {
-                report.planned_clusters = routed[&segment.ordinal];
+                report.planned_clusters = routed.get(&segment.ordinal).copied().unwrap_or(0);
                 if shared_work.is_some() {
                     budget.total = self.budget.work.total;
                 }

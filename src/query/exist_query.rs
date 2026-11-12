@@ -91,6 +91,7 @@ impl Query for ExistsQuery {
 }
 
 /// Weight associated with the `ExistsQuery` query.
+#[derive(Clone)]
 pub struct ExistsWeight {
     field_name: String,
     field_type: Type,
@@ -98,6 +99,40 @@ pub struct ExistsWeight {
 }
 
 impl Weight for ExistsWeight {
+    fn candidate_filter(
+        &self,
+        reader: &SegmentReader,
+    ) -> crate::Result<crate::query::CandidateFilter> {
+        Ok(crate::query::CandidateFilter::from_weight(
+            self.clone(),
+            reader,
+        ))
+    }
+
+    fn uses_fast_fields(&self) -> bool {
+        true
+    }
+
+    fn matches_candidates(
+        &self,
+        reader: &SegmentReader,
+        docs: &[DocId],
+    ) -> crate::Result<Vec<bool>> {
+        let fields = reader.fast_fields();
+        let mut handles = fields.dynamic_column_handles(&self.field_name)?;
+        if self.field_type == Type::Json && self.json_subpaths {
+            handles.extend(fields.dynamic_subpath_column_handles(&self.field_name)?);
+        }
+        let mut matched = vec![false; docs.len()];
+        for handle in handles {
+            let column = handle.open()?;
+            for (matched, &doc) in matched.iter_mut().zip(docs) {
+                *matched |= column.column_index().has_value(doc);
+            }
+        }
+        Ok(matched)
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let fast_field_reader = reader.fast_fields();
         let mut column_handles = fast_field_reader.dynamic_column_handles(&self.field_name)?;

@@ -799,6 +799,60 @@ fn remove_and_count_all_and_empty_scorers(
 }
 
 impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombiner> {
+    fn uses_fast_fields(&self) -> bool {
+        self.weights
+            .iter()
+            .any(|(_, weight)| weight.uses_fast_fields())
+    }
+
+    fn candidate_filter(
+        &self,
+        reader: &SegmentReader,
+    ) -> crate::Result<crate::query::CandidateFilter> {
+        if let [(occur, weight)] = self.weights.as_slice() {
+            return if *occur == Occur::MustNot {
+                Ok(crate::query::CandidateFilter::new(|docs| {
+                    Ok(vec![false; docs.len()])
+                }))
+            } else {
+                weight.candidate_filter(reader)
+            };
+        }
+        let filters = self
+            .weights
+            .iter()
+            .map(|(occur, weight)| Ok((*occur, weight.candidate_filter(reader)?)))
+            .collect::<crate::Result<Vec<_>>>()?;
+        let minimum = self.minimum_number_should_match;
+        let positive = filters.iter().any(|(occur, _)| *occur != Occur::MustNot);
+        let has_must = filters.iter().any(|(occur, _)| *occur == Occur::Must);
+        let has_should = filters.iter().any(|(occur, _)| *occur == Occur::Should);
+        let required = if has_must {
+            minimum
+        } else if has_should {
+            minimum.max(1)
+        } else {
+            0
+        };
+        Ok(crate::query::CandidateFilter::new(move |docs| {
+            let mut matched = vec![positive; docs.len()];
+            let mut should = vec![0; docs.len()];
+            for (occur, filter) in &filters {
+                for (i, found) in filter.matches(docs)?.into_iter().enumerate() {
+                    match occur {
+                        Occur::Must => matched[i] &= found,
+                        Occur::MustNot => matched[i] &= !found,
+                        Occur::Should => should[i] += usize::from(found),
+                    }
+                }
+            }
+            for (matched, count) in matched.iter_mut().zip(should) {
+                *matched &= count >= required;
+            }
+            Ok(matched)
+        }))
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let num_docs = reader.num_docs();
         if self.weights.is_empty() {

@@ -74,17 +74,20 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> RangeDocSet<T> {
             };
         }
 
-        let mut range_docset = Self {
+        let mut range_docset = Self::new_unpositioned(value_range, column);
+        range_docset.fetch_block();
+        range_docset
+    }
+
+    pub(crate) fn new_unpositioned(value_range: RangeInclusive<T>, column: Column<T>) -> Self {
+        Self {
             value_range,
             column,
             loaded_docs: VecCursor::new(),
             next_fetch_start: 0,
             fetch_horizon: DEFAULT_FETCH_HORIZON,
             last_seek_pos_opt: None,
-        };
-        range_docset.reset_fetch_range();
-        range_docset.fetch_block();
-        range_docset
+        }
     }
 
     fn reset_fetch_range(&mut self) {
