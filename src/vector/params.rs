@@ -194,7 +194,10 @@ impl ProbeParams {
         match_fraction: f64,
         clusters_in_segment: usize,
     ) -> usize {
-        let match_fraction = match_fraction.clamp(0.0, 1.0);
+        let match_fraction = match self.filter_strategy {
+            VectorFilterStrategy::Post => 1.0,
+            VectorFilterStrategy::Pre { .. } => match_fraction.clamp(0.0, 1.0),
+        };
         let cluster_cost =
             (open_share + (1.0 - open_share) * match_fraction).max(f64::MIN_POSITIVE);
         let clusters = (budget.max(0.0) / cluster_cost).ceil();
@@ -248,7 +251,7 @@ impl ProbeParams {
 
 #[cfg(test)]
 mod tests {
-    use super::ProbeParams;
+    use super::{ProbeParams, VectorFilterStrategy};
 
     #[test]
     fn adaptive_stopping_preserves_budget_and_routing() -> crate::Result<()> {
@@ -331,6 +334,18 @@ mod tests {
         assert_eq!(params.router_k(20.0, x, 1.0, 18), 18);
         assert_eq!(params.router_k(20.0, 0.0, 0.0, 1000), 1000);
         assert_eq!(params.router_k(0.0, x, 1.0, 0), 1);
+        let post = ProbeParams {
+            filter_strategy: VectorFilterStrategy::Post,
+            ..params.clone()
+        };
+        for budget in [0.01, 2.0, 20.0, 20.4, 1000.0] {
+            for fraction in [0.0, 0.01, 0.5, 1.0] {
+                assert_eq!(
+                    post.router_k(budget, x, fraction, 1000),
+                    params.router_k(budget, x, 1.0, 1000),
+                );
+            }
+        }
     }
 
     /// Budgets and open costs must be finite and positive.
