@@ -102,19 +102,21 @@ pub(crate) struct ExactMerge {
 
 /// The `k` best candidates by lower endpoint, keyed by [`RowAddress`].
 ///
-/// Exact scores and quantized intervals share one map. `offer` / upsert replaces the same address
+/// Exact scores and quantized intervals share an indexed min-heap. Upsert replaces the same address
 /// in place so an exact cannot double-count with a leftover interval. Once every entry is exact,
 /// [`TopK::kth_lower`] is the exact-only k-th.
 #[derive(Clone, Debug)]
 pub(crate) struct TopK {
     k: usize,
-    by_addr: HashMap<RowAddress, Bound>,
+    heap: Vec<Candidate>,
+    by_addr: HashMap<RowAddress, usize>,
 }
 
 impl TopK {
     pub(crate) fn new(k: usize) -> Self {
         Self {
             k,
+            heap: Vec::new(),
             by_addr: HashMap::new(),
         }
     }
@@ -126,43 +128,37 @@ impl TopK {
 
     /// The entries currently held, for seeding another bound.
     pub(crate) fn candidates(&self) -> impl Iterator<Item = Candidate> + '_ {
-        self.by_addr
-            .iter()
-            .map(|(&address, &bound)| Candidate { address, bound })
+        self.heap.iter().copied()
     }
 
     /// The worst lower endpoint once `k` candidates are in.
     pub(crate) fn kth_lower(&self) -> Option<f32> {
-        if self.k == 0 || self.by_addr.len() != self.k {
+        if self.k == 0 || self.heap.len() != self.k {
             return None;
         }
-        let lower = self
-            .by_addr
-            .values()
-            .map(|bound| bound.lower())
-            .min_by(|a, b| a.total_cmp(b))?;
+        let lower = self.heap[0].bound.lower();
         lower.is_finite().then_some(lower)
     }
 
-    /// The k-th of the estimates in the map, once it is full. It carries no confidence margin.
+    /// The k-th of the estimates in the heap, once it is full. It carries no confidence margin.
     #[cfg(test)]
     pub(crate) fn kth_estimate(&self) -> Option<f32> {
-        if self.k == 0 || self.by_addr.len() != self.k {
+        if self.k == 0 || self.heap.len() != self.k {
             return None;
         }
-        self.by_addr
-            .values()
-            .map(|bound| bound.estimate())
+        self.heap
+            .iter()
+            .map(|candidate| candidate.bound.estimate())
             .min_by(|a, b| a.total_cmp(b))
     }
 
-    /// The k-th exact score once the map holds `k` exact scores and nothing else.
+    /// The k-th exact score once the heap holds `k` exact scores and nothing else.
     #[cfg(test)]
     pub(crate) fn exact_kth(&self) -> Option<f32> {
         let exact = self.kth_lower()?;
-        self.by_addr
-            .values()
-            .all(|bound| matches!(bound, Bound::Exact(_)))
+        self.heap
+            .iter()
+            .all(|candidate| matches!(candidate.bound, Bound::Exact(_)))
             .then_some(exact)
     }
 
@@ -176,7 +172,8 @@ impl TopK {
             return;
         }
         let Candidate { address, bound } = candidate;
-        if let Some(existing) = self.by_addr.get(&address) {
+        if let Some(&position) = self.by_addr.get(&address) {
+            let existing = self.heap[position].bound;
             let existing_lower = existing.lower();
             let new_lower = bound.lower();
             if new_lower < existing_lower {
@@ -187,35 +184,80 @@ impl TopK {
                 );
                 return;
             }
-            self.by_addr.insert(address, bound);
+            self.heap[position] = candidate;
+            if new_lower.total_cmp(&existing_lower).is_lt() {
+                self.sift_up(position);
+            } else {
+                self.sift_down(position);
+            }
             return;
         }
-        if self.by_addr.len() < self.k {
-            self.by_addr.insert(address, bound);
+        if self.heap.len() < self.k {
+            let position = self.heap.len();
+            self.heap.push(candidate);
+            self.by_addr.insert(address, position);
+            self.sift_up(position);
             return;
         }
-        // Full map: linear scan for the worst entry is fine while k (= limit + offset) is small.
-        let Some((worst_addr, worst_lower)) = self.worst() else {
-            return;
-        };
+        let worst = self.heap[0];
         let lower = bound.lower();
         let beats = lower
-            .total_cmp(&worst_lower)
-            .then_with(|| worst_addr.cmp(&address))
+            .total_cmp(&worst.bound.lower())
+            .then_with(|| worst.address.cmp(&address))
             .is_gt();
         if beats {
-            self.by_addr.remove(&worst_addr);
-            self.by_addr.insert(address, bound);
+            self.by_addr.remove(&worst.address);
+            self.heap[0] = candidate;
+            self.by_addr.insert(address, 0);
+            self.sift_down(0);
         }
     }
 
-    fn worst(&self) -> Option<(RowAddress, f32)> {
-        self.by_addr
-            .iter()
-            .map(|(&addr, bound)| (addr, bound.lower()))
-            .min_by(|(a_addr, a_lo), (b_addr, b_lo)| {
-                a_lo.total_cmp(b_lo).then_with(|| a_addr.cmp(b_addr))
-            })
+    fn less(&self, left: usize, right: usize) -> bool {
+        let left = self.heap[left];
+        let right = self.heap[right];
+        left.bound
+            .lower()
+            .total_cmp(&right.bound.lower())
+            .then_with(|| left.address.cmp(&right.address))
+            .is_lt()
+    }
+
+    fn swap_entries(&mut self, left: usize, right: usize) {
+        self.heap.swap(left, right);
+        *self.by_addr.get_mut(&self.heap[left].address).unwrap() = left;
+        *self.by_addr.get_mut(&self.heap[right].address).unwrap() = right;
+    }
+
+    fn sift_up(&mut self, mut position: usize) {
+        while position > 0 {
+            let parent = (position - 1) / 2;
+            if !self.less(position, parent) {
+                break;
+            }
+            self.swap_entries(position, parent);
+            position = parent;
+        }
+    }
+
+    fn sift_down(&mut self, mut position: usize) {
+        loop {
+            let left = position * 2 + 1;
+            if left >= self.heap.len() {
+                break;
+            }
+            let right = left + 1;
+            let child = if right < self.heap.len() && self.less(right, left) {
+                right
+            } else {
+                left
+            };
+            if !self.less(child, position) {
+                break;
+            }
+            self.swap_entries(position, child);
+            position = child;
+        }
     }
 
     /// Takes exact scores from a finished segment. Non-finite scores are skipped.
@@ -247,6 +289,7 @@ impl TopK {
     /// Drops every candidate.
     #[cfg(test)]
     pub(crate) fn clear(&mut self) {
+        self.heap.clear();
         self.by_addr.clear();
     }
 }
@@ -358,8 +401,11 @@ mod tests {
     }
 
     mod top_k {
+        use std::collections::BTreeMap;
+
         use super::addr;
-        use crate::vector::search::scan::bound::{Candidate, ExactMerge, TopK};
+        use crate::vector::search::scan::bound::{Bound, Candidate, ExactMerge, TopK};
+        use crate::vector::write::RowAddress;
         use crate::DocId;
 
         /// Same-address upserts keep the higher lower endpoint and never rewrite with a worse
@@ -402,6 +448,130 @@ mod tests {
             let mut top = TopK::new(1);
             top.upsert(Candidate::exact(addr(1), 8.0));
             top.upsert(Candidate::exact(addr(1), 7.0));
+        }
+
+        #[test]
+        fn test_indexed_heap_matches_linear_selection() {
+            for k in [0, 1, 2, 10, 100] {
+                for seed in 0..16 {
+                    let mut rng = fastrand::Rng::with_seed(seed);
+                    let mut top = TopK::new(k);
+                    let mut expected = BTreeMap::new();
+                    for step in 0..1024 {
+                        let address = RowAddress {
+                            segment_ord: rng.u32(0..3),
+                            ..addr(rng.u32(0..150))
+                        };
+                        let mut lower = if seed == 0 && step % 7 == 0 {
+                            rng.choice([
+                                f32::NEG_INFINITY,
+                                -0.0,
+                                0.0,
+                                f32::INFINITY,
+                                f32::NAN,
+                                -f32::NAN,
+                            ])
+                            .unwrap()
+                        } else {
+                            rng.i32(-10..20) as f32
+                        };
+                        if let Some(Bound::Exact(score)) = expected.get(&address) {
+                            if lower < *score {
+                                lower = *score;
+                            }
+                        }
+                        let bound = if rng.bool() {
+                            Bound::Exact(lower)
+                        } else {
+                            Bound::Interval {
+                                lo: lower,
+                                est: lower + rng.f32(),
+                            }
+                        };
+                        let candidate = Candidate { address, bound };
+                        top.upsert(candidate);
+                        linear_upsert(&mut expected, k, candidate);
+                        let actual: BTreeMap<_, _> = top
+                            .candidates()
+                            .map(|candidate| (candidate.address, candidate.bound))
+                            .collect();
+                        let bits = |bound: &Bound| match *bound {
+                            Bound::Exact(score) => (true, score.to_bits(), score.to_bits()),
+                            Bound::Interval { lo, est } => (false, lo.to_bits(), est.to_bits()),
+                        };
+                        assert_eq!(
+                            actual
+                                .iter()
+                                .map(|(a, b)| (*a, bits(b)))
+                                .collect::<Vec<_>>(),
+                            expected
+                                .iter()
+                                .map(|(a, b)| (*a, bits(b)))
+                                .collect::<Vec<_>>(),
+                            "k={k} seed={seed} step={step}"
+                        );
+                        let kth = (k > 0 && expected.len() == k)
+                            .then(|| {
+                                expected
+                                    .values()
+                                    .map(|bound| bound.lower())
+                                    .min_by(f32::total_cmp)
+                                    .unwrap()
+                            })
+                            .filter(|score| score.is_finite());
+                        assert_eq!(top.kth_lower().map(f32::to_bits), kth.map(f32::to_bits));
+                        assert_eq!(top.by_addr.len(), top.heap.len());
+                        for (position, candidate) in top.heap.iter().enumerate() {
+                            assert_eq!(top.by_addr[&candidate.address], position);
+                            if position > 0 {
+                                assert!(!top.less(position, (position - 1) / 2));
+                            }
+                        }
+                        if step % 127 == 0 {
+                            top = top.clone();
+                        }
+                        if step % 257 == 0 {
+                            top.clear();
+                            expected.clear();
+                        }
+                    }
+                }
+            }
+        }
+
+        fn linear_upsert(
+            entries: &mut BTreeMap<RowAddress, Bound>,
+            k: usize,
+            candidate: Candidate,
+        ) {
+            if k == 0 {
+                return;
+            }
+            let Candidate { address, bound } = candidate;
+            if let Some(existing) = entries.get(&address) {
+                if bound.lower() >= existing.lower()
+                    || bound.lower().is_nan()
+                    || existing.lower().is_nan()
+                {
+                    entries.insert(address, bound);
+                }
+            } else if entries.len() < k {
+                entries.insert(address, bound);
+            } else {
+                let (&worst, &worst_bound) = entries
+                    .iter()
+                    .min_by(|(a, x), (b, y)| x.lower().total_cmp(&y.lower()).then_with(|| a.cmp(b)))
+                    .unwrap();
+                if bound
+                    .lower()
+                    .total_cmp(&worst_bound.lower())
+                    .then_with(|| worst.cmp(&address))
+                    .is_gt()
+                {
+                    entries.remove(&worst);
+                    entries.insert(address, bound);
+                }
+            }
         }
 
         /// The collector top-k is unset until `k` scores are in, then holds the k-th best score
