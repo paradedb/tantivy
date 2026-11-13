@@ -43,6 +43,11 @@ where
     segment_ord: SegmentOrdinal,
     /// A cluster's DocIds column, read when its selected rows carry no doc ids.
     cluster_docs: Vec<DocId>,
+    /// DocIds columns kept from a pass that scores part of a cluster, for the later pass over its
+    /// other rows; taken by that pass, so each cluster's column is read from storage once.
+    kept_docs: Vec<(usize, Vec<DocId>)>,
+    /// Whether a column read now is kept for a later pass over the same cluster.
+    keep_docs: bool,
     /// The selected rows' doc ids picked from `cluster_docs`, for a quantized field whose rows are
     /// read by document.
     selected_docs: Vec<DocId>,
@@ -75,12 +80,33 @@ where
             tie_break,
             segment_ord,
             cluster_docs: Vec::new(),
+            kept_docs: Vec::new(),
+            keep_docs: false,
             selected_docs: Vec::new(),
             #[cfg(test)]
             exact_phase_rows: Vec::new(),
             #[cfg(test)]
             exact_scores: Vec::new(),
         }
+    }
+
+    /// Keeps the DocIds columns read from now on for a later pass over the same clusters, or stops.
+    pub(super) fn keep_doc_ids(&mut self, keep: bool) {
+        self.keep_docs = keep;
+    }
+
+    /// Loads `cluster`'s DocIds column into `cluster_docs`: the copy an earlier pass kept, or a
+    /// storage read, kept in turn while [`ExactScorer::keep_doc_ids`] is on.
+    fn load_cluster_docs(&mut self, cluster: usize) -> crate::Result<()> {
+        if let Some(at) = self.kept_docs.iter().position(|(kept, _)| *kept == cluster) {
+            self.cluster_docs = self.kept_docs.swap_remove(at).1;
+            return Ok(());
+        }
+        self.reader.read_doc_ids(cluster, &mut self.cluster_docs)?;
+        if self.keep_docs {
+            self.kept_docs.push((cluster, self.cluster_docs.clone()));
+        }
+        Ok(())
     }
 
     // --- Scoring ---
@@ -250,8 +276,7 @@ where
             (None, None) => {
                 if !*column_read {
                     let _fetch = enter_vector_stage(VectorStage::ExactFetch);
-                    self.reader
-                        .read_doc_ids(selected.cluster, &mut self.cluster_docs)?;
+                    self.load_cluster_docs(selected.cluster)?;
                     *column_read = true;
                 }
                 self.cluster_docs[offset]
@@ -278,8 +303,7 @@ where
             let docs = match selected.docs {
                 Some(docs) => docs,
                 None => {
-                    self.reader
-                        .read_doc_ids(selected.cluster, &mut self.cluster_docs)?;
+                    self.load_cluster_docs(selected.cluster)?;
                     self.selected_docs.clear();
                     match selected.offsets {
                         Some(offsets) => self.selected_docs.extend(
