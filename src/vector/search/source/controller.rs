@@ -7,6 +7,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+const ADAPTIVE_PATIENCE_START_WORK: f64 = 500.0;
+const ADAPTIVE_PATIENCE_END_WORK: f64 = 2000.0;
+const ADAPTIVE_PATIENCE_MAX_FRACTION: f64 = 0.05;
+
 /// Actual routed work charged by all participants in one query. Located scans are separate.
 pub trait SharedVectorWork: Send + Sync {
     /// Adds finite, nonnegative work. Implementations must not lose concurrent charges.
@@ -176,7 +180,9 @@ impl WorkMeter {
             return false;
         }
         let budget = self.budget.total.get();
-        let fraction = 0.05 * ((budget - 500.0) / 1500.0).clamp(0.0, 1.0);
+        let ramp = (budget - ADAPTIVE_PATIENCE_START_WORK)
+            / (ADAPTIVE_PATIENCE_END_WORK - ADAPTIVE_PATIENCE_START_WORK);
+        let fraction = ADAPTIVE_PATIENCE_MAX_FRACTION * ramp.clamp(0.0, 1.0);
         self.charged.get() - self.last_active_work.get() >= fraction * budget
     }
 
