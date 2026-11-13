@@ -423,21 +423,23 @@ fn transform_from_f64_bounds<T: IntType + MonotonicallyMappableToU64>(
             if lower_bound.fract() == 0.0 {
                 TransformBound::Existing(T::from_f64(lower_bound).to_u64())
             } else {
-                TransformBound::NewBound(Bound::Included(T::from_f64(lower_bound.trunc()).to_u64()))
+                // The smallest integer above a fractional lower bound is its ceiling.
+                TransformBound::NewBound(Bound::Included(T::from_f64(lower_bound.ceil()).to_u64()))
             }
         },
         |&upper_bound| {
             if upper_bound < T::min().to_f64() {
-                return TransformBound::NewBound(Bound::Unbounded);
+                // no hits case
+                return TransformBound::NewBound(Bound::Excluded(T::min().to_u64()));
             }
             if upper_bound > T::max().to_f64() {
-                // no hits case
-                return TransformBound::NewBound(Bound::Included(u64::MAX));
+                return TransformBound::NewBound(Bound::Unbounded);
             }
             if upper_bound.fract() == 0.0 {
                 TransformBound::Existing(T::from_f64(upper_bound).to_u64())
             } else {
-                TransformBound::NewBound(Bound::Included(T::from_f64(upper_bound.trunc()).to_u64()))
+                // The largest integer below a fractional upper bound is its floor.
+                TransformBound::NewBound(Bound::Included(T::from_f64(upper_bound.floor()).to_u64()))
             }
         },
     )
@@ -908,6 +910,37 @@ mod tests {
             )),
             1
         );
+    }
+
+    #[test]
+    fn json_f64_bounds_on_int_column() {
+        let mut schema_builder = Schema::builder();
+        let json_field = schema_builder.add_json_field("json", STORED | FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        {
+            let mut index_writer = index.writer_with_num_threads(1, 50_000_000).unwrap();
+            for n in [-5i64, -4, 4, 5] {
+                index_writer
+                    .add_document(doc!(json_field => json!({ "n": n })))
+                    .unwrap();
+            }
+            index_writer.commit().unwrap();
+        }
+        let searcher = index.reader().unwrap().searcher();
+        let count = |lower: Bound<f64>, upper: Bound<f64>| {
+            let term = |v| get_json_term(json_field, "n", v);
+            let query = RangeQuery::new(lower.map(term), upper.map(term));
+            searcher.search(&query, &Count).unwrap()
+        };
+        // The column holds only integers, so it is an I64 column and the F64 bounds are rounded.
+        assert_eq!(count(Bound::Excluded(4.5), Bound::Included(5.0)), 1);
+        assert_eq!(count(Bound::Excluded(4.9), Bound::Excluded(5.1)), 1);
+        assert_eq!(count(Bound::Included(-5.0), Bound::Excluded(-4.5)), 1);
+        assert_eq!(count(Bound::Included(-4.5), Bound::Included(4.5)), 2);
+        // An upper bound below every i64 matches nothing.
+        assert_eq!(count(Bound::Unbounded, Bound::Included(-1e300)), 0);
+        assert_eq!(count(Bound::Unbounded, Bound::Included(1e300)), 4);
     }
 
     #[test]
