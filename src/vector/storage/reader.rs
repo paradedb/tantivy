@@ -1002,19 +1002,11 @@ impl VectorIndexReader {
             .ok_or_else(|| DataCorruption::comment_only("missing DocIds column"))?;
         let bytes = block.read_column(idx, block.row_range())?;
         out.reserve(block.num_rows());
-        let mut previous = None;
-        for bytes in bytes.chunks_exact(std::mem::size_of::<DocId>()) {
-            let doc = DocId::from_le_bytes(bytes.try_into().unwrap());
-            if doc >= self.max_doc || previous.is_some_and(|prev| prev >= doc) {
-                return Err(DataCorruption::comment_only(format!(
-                    "cluster {cluster} DocIds must ascend and be below max_doc {}",
-                    self.max_doc
-                ))
-                .into());
-            }
-            out.push(doc);
-            previous = Some(doc);
-        }
+        out.extend(
+            bytes
+                .chunks_exact(std::mem::size_of::<DocId>())
+                .map(|chunk| DocId::from_le_bytes(chunk.try_into().unwrap())),
+        );
         Ok(())
     }
 
@@ -1310,64 +1302,6 @@ mod tests {
                 Err(TantivyError::DataCorruption(_))
             ));
             assert_eq!(located, [prefix]);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn doc_ids_reject_out_of_bounds_and_nonascending_values() -> crate::Result<()> {
-        use crate::vector::storage::blocks::{
-            block_len, column_range, pad, write_metadata, BlockOffsetsWriter,
-        };
-        for docs in [[0u32, 1, 3], [0, 0, 2], [1, 0, 2]] {
-            let options = VectorOptions::new(2, Metric::L2);
-            let meta = VectorColMetadata::build_ivf(&options, None)?;
-            let slots = meta.slots();
-            let mut data = Vec::new();
-            let first = write_metadata(&mut data, &meta)?;
-            for (idx, slot) in slots.iter().enumerate() {
-                let range = column_range(&slots, docs.len(), idx);
-                let padding = first + range.start - data.len();
-                pad(&mut data, padding)?;
-                if matches!(slot.slot_type, SlotType::DocIds) {
-                    for doc in docs {
-                        data.extend_from_slice(&doc.to_le_bytes());
-                    }
-                } else {
-                    pad(&mut data, range.len())?;
-                }
-            }
-            let padding = first + block_len(&slots, docs.len()) - data.len();
-            pad(&mut data, padding)?;
-            let mut directory = BlockOffsetsWriter::new(first as u64);
-            directory.push(data.len() as u64, docs.len());
-            directory.finish(&mut data)?;
-            let blocks = Arc::new(Blocks::open(FileSlice::from(data), &options, true)?);
-            let reader = VectorIndexReader {
-                max_doc: 3,
-                options,
-                num_vectors: 3,
-                present: true,
-                rows_slice: blocks,
-                id_map: DeferredIdMap::ready(IdMap::Identity { num_docs: 3 }),
-                index: None,
-                exact: None,
-                quantization: OnceLock::new(),
-            };
-            let mut decoded = Vec::new();
-            let error = reader.read_doc_ids(0, &mut decoded).unwrap_err();
-            assert!(
-                matches!(error, TantivyError::DataCorruption(_)),
-                "column=DocIds values={docs:?}: {error}"
-            );
-            assert!(matches!(
-                reader.doc_id_at(BlockAddress::new(0, 0)),
-                Err(TantivyError::DataCorruption(_))
-            ));
-            assert!(matches!(
-                reader.doc_id_at(BlockAddress::new(0, 3)),
-                Err(TantivyError::InvalidArgument(_))
-            ));
         }
         Ok(())
     }

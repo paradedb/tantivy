@@ -65,8 +65,8 @@ pub fn f32_to_f16(value: f32) -> u16 {
 ///
 /// binary16 to binary32 widening is exact, and the hardware converters (NEON FCVTL, F16C behind
 /// the x86 dispatch) agree with the portable bit manipulation on every finite and infinite
-/// input, so swapping them never changes results; NaNs stay NaNs either way and sidecar decoding
-/// validates finiteness.
+/// input, so swapping them never changes results; NaNs stay NaNs either way. Encode clamps
+/// gammas to `[1, 4]` and builds non-negative error ratios before storing binary16.
 ///
 /// # Panics
 ///

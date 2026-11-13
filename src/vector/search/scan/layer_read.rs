@@ -7,8 +7,7 @@ use crate::schema::Metric;
 use crate::vector::search::cluster_source::ClusterRows;
 use crate::vector::search::prepared::QuantizedQueryCtx;
 use crate::vector::storage::quantized::{
-    validate_decoded_sidecar, QuantizedClusterReader, QuantizedLayerBatch, QuantizedLayerReader,
-    ReadScratch,
+    QuantizedClusterReader, QuantizedLayerBatch, QuantizedLayerReader, ReadScratch,
 };
 use crate::TantivyError;
 
@@ -117,11 +116,6 @@ fn decode_band(
             decode_f32s(band.scales(), &mut out.scales);
             decode_f16s(band.gammas(), &mut out.gammas);
             decode_f16s(band.error_ratios(), &mut out.errors);
-            validate_decoded_sidecar(
-                &out.gammas[..count],
-                &out.errors[..count],
-                selected.rows.start,
-            )?;
             if metric.scores_by_distance() {
                 decode_f32s(band_constants(&band)?, &mut out.constants);
             }
@@ -129,19 +123,18 @@ fn decode_band(
         Some(offsets) => {
             kernel_offsets.clear();
             kernel_offsets.extend(offsets.iter().map(|&offset| offset as usize));
-            decode_band_rows(spec, &band, kernel_offsets, out, selected.rows.start)?
+            decode_band_rows(spec, &band, kernel_offsets, out)?
         }
     }
     Ok(())
 }
 
-/// Decodes the rows at `offsets` from a read band; `start` is the band's first row.
+/// Decodes the rows at `offsets` from a read band.
 fn decode_band_rows(
     spec: &LayerSpec<'_>,
     band: &QuantizedLayerBatch,
     offsets: &[usize],
     out: &mut Decoded,
-    start: usize,
 ) -> crate::Result<()> {
     spec.query.score_layer_batch_unscaled_indexed(
         spec.index,
@@ -158,8 +151,7 @@ fn decode_band_rows(
         spec.reader.has_norms(),
         SidecarDecode::for_selection(offsets.len(), band_rows),
         out,
-    )?;
-    validate_decoded_sidecar(&out.gammas, &out.errors, start)
+    )
 }
 
 /// How the sidecar of a band's selected rows is decoded.
@@ -310,8 +302,7 @@ fn decode_runs(
                 .map(|&row| f32_at(&norms, row - cluster.rows.start)),
         );
     }
-    // The reported error row is the first selected row.
-    validate_decoded_sidecar(&out.gammas, &out.errors, rows[0])
+    Ok(())
 }
 
 fn band_norms(band: &QuantizedLayerBatch) -> crate::Result<&[u8]> {
