@@ -1013,7 +1013,10 @@ where
             totals[i].append(&measured);
             on_segment(i);
             result?;
-            if !recall_reached && rate.as_mut().is_some_and(|rate| rate.refinement_due()) {
+            if !late_filter
+                && !recall_reached
+                && rate.as_mut().is_some_and(|rate| rate.refinement_due())
+            {
                 let mut candidates: Vec<_> = scans
                     .iter_mut()
                     .flatten()
@@ -3266,11 +3269,13 @@ mod prepared_key_tests {
 
 #[cfg(test)]
 mod late_filter_tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::query::{CandidateFilter, Explanation, Scorer, Weight};
     use crate::schema::Metric;
     use crate::vector::test_support::FixtureSpec;
-    use crate::vector::{VectorFilterStrategy, MIN_LATE_FILTER_MATCHES};
+    use crate::vector::{AdaptiveProbeParams, VectorFilterStrategy, MIN_LATE_FILTER_MATCHES};
     use crate::{DocId, SegmentReader};
 
     struct DeferredWeight {
@@ -3415,7 +3420,8 @@ mod late_filter_tests {
                 .schedule(&[1, 4])
                 .segments(2)
                 .label("matches", |i| i % 10 == 0)
-                .deletes(&[0, 10, 20]);
+                .deletes(&[0, 10, 20])
+                .paged();
             if replicated {
                 spec = spec.replicated();
             }
@@ -3454,7 +3460,11 @@ mod late_filter_tests {
             )?
             .with_budget(budget);
             let candidates = router.collect_segments(&segments, |_| {})?;
-            for shared in [false, true] {
+            for (shared, adaptive) in [(false, false), (false, true), (true, false), (true, true)] {
+                let mut builder = builder.clone();
+                builder.probe_params.adaptive_probing = adaptive.then_some(AdaptiveProbeParams {
+                    admission_fraction: 1e-16,
+                });
                 let work = shared.then(|| {
                     Arc::new(crate::vector::AtomicVectorWork::default())
                         as Arc<dyn crate::vector::SharedVectorWork>
@@ -3462,6 +3472,7 @@ mod late_filter_tests {
                 let collector = builder
                     .clone()
                     .build(prepared.clone().with_candidates(candidates.clone(), work)?);
+                fixture.clear_reads();
                 let fruit = collector.merge_fruits(collector.collect_segments(
                     weight.as_ref(),
                     &segments,
@@ -3471,6 +3482,21 @@ mod late_filter_tests {
                 assert!(fruit.stats.iter().all(|s| s.late_filter));
                 assert!(fruit.stats.iter().any(|s| s.filter_checks > 0));
                 assert!(fruit.stats.iter().all(|s| s.exact_rows <= s.filter_checks));
+                let reads = fixture.reads();
+                let first_exact = reads
+                    .iter()
+                    .position(|(stage, _)| *stage == VectorStage::ExactFetch)
+                    .unwrap();
+                let last_probe = reads
+                    .iter()
+                    .rposition(|(stage, _)| *stage == VectorStage::LayerScan(0))
+                    .unwrap();
+                assert!(first_exact < last_probe);
+                for stats in &fruit.stats {
+                    let rows = &stats.quantized_trace.refined_topk_rows;
+                    let unique: HashSet<_> = rows.iter().collect();
+                    assert_eq!(rows.len(), unique.len());
+                }
             }
             // The actual eligibility path must also avoid draining the filter.
             let params = ProbeParams {

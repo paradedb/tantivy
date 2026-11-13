@@ -13,6 +13,8 @@ pub(crate) mod rate;
 
 #[cfg(test)]
 use std::cell::Cell;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::ops::Range;
 
 use common::BitSet;
@@ -31,6 +33,7 @@ use self::rate::AdmissionHistograms;
 use crate::collector::sort_key::Comparator;
 use crate::collector::SegmentSortKeyComputer;
 use crate::error::DataCorruption;
+use crate::query::CandidateFilter;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
 use crate::vector::router::candidate::Candidate as RankedCandidate;
@@ -47,6 +50,8 @@ use crate::vector::telemetry::enter_vector_stage;
 use crate::vector::BlockAddress;
 use crate::vector::{VectorElement, VectorStage};
 use crate::{DocId, SegmentOrdinal};
+
+const FILTER_BATCH_SIZE: usize = 64;
 
 // --- Contracts ---
 
@@ -692,7 +697,9 @@ where
     rate: Option<RateApsState>,
     recall_fraction: Option<f64>,
     report: ScanReport,
-    late_filter: Option<crate::query::CandidateFilter>,
+    late_filter: Option<CandidateFilter>,
+    next_filter_refinement: usize,
+    filter_docs: HashMap<u32, Vec<DocId>>,
     reader: &'a VectorIndexReader,
 }
 
@@ -736,6 +743,8 @@ where
             .map(|p| p.admission_fraction);
         Ok(Self {
             late_filter: None,
+            next_filter_refinement: FILTER_BATCH_SIZE,
+            filter_docs: HashMap::new(),
             reader,
             exact: ExactScorer::new(
                 reader,
@@ -763,10 +772,7 @@ where
         })
     }
 
-    pub(crate) fn with_candidate_filter(
-        mut self,
-        filter: Option<crate::query::CandidateFilter>,
-    ) -> Self {
+    pub(crate) fn with_candidate_filter(mut self, filter: Option<CandidateFilter>) -> Self {
         if let Some(state) = &mut self.quantized {
             state.late_filter = filter.is_some();
             if state.late_filter {
@@ -828,14 +834,14 @@ where
 
     pub(crate) fn refine_shortlist(&mut self) -> crate::Result<()> {
         self.close_shortlist();
-        if self.late_filter.is_some() {
-            self.filter_shortlist(true)?;
+        if self.needs_more_matches() {
+            self.filter_shortlist(FILTER_BATCH_SIZE)?;
         }
         for layer in self.refining_layers() {
             self.narrow(layer)?;
         }
         if self.late_filter.is_some() {
-            self.filter_shortlist(false)
+            self.filter_shortlist(usize::MAX)
         } else {
             self.score_shortlist()
         }
@@ -911,11 +917,7 @@ where
         Ok(())
     }
 
-    fn filter_shortlist(&mut self, seed: bool) -> crate::Result<()> {
-        const BATCH_SIZE: usize = 64;
-        if seed && self.bound.shared_threshold().is_some() {
-            return Ok(());
-        }
+    fn filter_shortlist(&mut self, limit: usize) -> crate::Result<()> {
         let _stage = enter_vector_stage(VectorStage::LateFilter);
         let filter = self.late_filter.as_ref().unwrap().clone();
         let threshold = self
@@ -926,78 +928,96 @@ where
             .quantized
             .as_mut()
             .expect("late filters require quantization");
-        state.candidates.band(threshold);
-        let pending: Vec<_> = state
+        let mut pending: Vec<_> = state
             .candidates
             .candidates_with_upper(state.segment_ord)
+            .filter(|(_, upper)| threshold.is_none_or(|threshold| threshold.admits(*upper)))
             .collect();
-        let mut ranking = std::collections::BinaryHeap::from(
+        if pending.len() > limit {
+            pending.select_nth_unstable_by(limit, |(a, _), (b, _)| {
+                b.bound
+                    .estimate()
+                    .total_cmp(&a.bound.estimate())
+                    .then_with(|| a.address.cmp(&b.address))
+            });
+            pending.truncate(limit);
+        }
+        let mut ranking = BinaryHeap::from(
             pending
                 .iter()
                 .enumerate()
                 .map(|(index, (candidate, _))| RankedCandidate {
                     sim: Similarity::new(candidate.bound.estimate()),
-                    node: (std::cmp::Reverse(candidate.address), index),
+                    node: (Reverse(candidate.address), index),
                 })
                 .collect::<Vec<_>>(),
         );
-        let mut processed = std::collections::HashMap::<u32, Vec<u32>>::new();
-        let mut cluster_docs = std::collections::HashMap::<u32, Vec<DocId>>::new();
+        let mut processed = HashMap::<u32, Vec<u32>>::new();
         loop {
-            if seed && self.bound.shared_threshold().is_some() {
-                break;
-            }
             let threshold = self
                 .bound
                 .shared_threshold()
                 .map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score)));
-            let mut candidates: Vec<_> = std::iter::from_fn(|| ranking.pop())
+            let mut indexed = Vec::with_capacity(FILTER_BATCH_SIZE);
+            for address in std::iter::from_fn(|| ranking.pop())
                 .map(|ranked| pending[ranked.node.1])
                 .filter(|(_, upper)| threshold.is_none_or(|threshold| threshold.admits(*upper)))
-                .take(BATCH_SIZE)
-                .map(|(candidate, _)| candidate)
-                .collect();
-            if candidates.is_empty() {
-                break;
-            }
-            candidates.sort_unstable_by_key(|c| c.address);
-            let mut indexed = Vec::with_capacity(candidates.len());
-            for (i, candidate) in candidates.iter().enumerate() {
-                let address = candidate.address.block_address;
-                let docs = match cluster_docs.entry(address.block) {
-                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        let mut docs = Vec::new();
-                        self.reader
-                            .read_doc_ids(address.block as usize, &mut docs)?;
-                        entry.insert(docs)
-                    }
-                };
-                indexed.push((docs[address.row as usize], i));
-                if seed {
+                .take(FILTER_BATCH_SIZE)
+                .map(|(candidate, _)| candidate.address.block_address)
+            {
+                let docs = self.filter_docs.entry(address.block).or_default();
+                if docs.is_empty() {
+                    self.reader.read_doc_ids(address.block as usize, docs)?;
+                }
+                indexed.push((docs[address.row as usize], address));
+                if limit != usize::MAX {
                     processed
                         .entry(address.block)
                         .or_default()
                         .push(address.row);
                 }
             }
+            if indexed.is_empty() {
+                break;
+            }
             indexed.sort_unstable_by_key(|&(doc, _)| doc);
             let ids: Vec<_> = indexed.iter().map(|&(doc, _)| doc).collect();
             let matched = filter.matches(&ids)?;
             self.report.filter_checks += ids.len();
-            let passing: Vec<_> = indexed
+            let mut passing: Vec<_> = indexed
                 .iter()
                 .zip(matched)
-                .filter_map(|(&(_, i), yes)| yes.then_some(candidates[i]))
+                .filter_map(|(&(doc, address), yes)| yes.then_some((address, doc)))
                 .collect();
-            self.refine_topk(&passing)?;
+            passing.sort_unstable_by_key(|&(address, _)| address);
+            for group in passing.chunk_by(|(a, _), (b, _)| a.block == b.block) {
+                let cluster = group[0].0.block as usize;
+                let offsets: Vec<_> = group.iter().map(|(address, _)| address.row).collect();
+                let docs: Vec<_> = group.iter().map(|&(_, doc)| doc).collect();
+                let selected = ClusterRows {
+                    cluster,
+                    rows: 0..self.filter_docs[&group[0].0.block].len(),
+                    offsets: Some(&offsets),
+                    docs: Some(&docs),
+                    centroid: None,
+                };
+                self.report.exact_rows +=
+                    self.exact
+                        .score(&selected, &mut self.scratch, &mut self.bound, None)?;
+                #[cfg(test)]
+                self.report
+                    .trace
+                    .refined_topk_rows
+                    .extend(group.iter().map(|&(address, _)| address));
+            }
         }
         let state = self.quantized.as_mut().unwrap();
+        state.candidates.order_by_cluster(&mut self.by_cluster);
         for rows in processed.values_mut() {
             rows.sort_unstable();
         }
         for &b in &self.by_cluster {
-            if seed {
+            if limit != usize::MAX {
                 let group = state.candidates.rows(b);
                 if let Some(rows) = processed.get(&(group.cluster as u32)) {
                     let offsets: Vec<_> = rows
@@ -1105,6 +1125,14 @@ where
             }
         }
         self.report.candidates_scored += len;
+        if self.late_filter.is_some()
+            && self.report.candidates_scored >= self.next_filter_refinement
+        {
+            // Establish and tighten a filtered cutoff while probing. Doubling bounds the
+            // repeated candidate selection work as the scan grows.
+            self.filter_shortlist(FILTER_BATCH_SIZE)?;
+            self.next_filter_refinement = self.report.candidates_scored.saturating_mul(2);
+        }
         self.close_rate_cluster(len);
         Ok(len)
     }
