@@ -2,6 +2,7 @@
 //! the per-layer kernels they dispatch to.
 
 use std::borrow::Cow;
+use std::sync::OnceLock;
 
 use super::encode::Encoded;
 use super::{aligned_le_words, validate, validate_specs, LayerKind, LayerSpec, Rotation};
@@ -13,6 +14,7 @@ use crate::grid::{
 };
 use crate::model::Grid;
 use crate::rotation::Rotation as FhtRotation;
+use crate::sign::fastscan::FastScanQuery;
 use crate::sign::{
     estimate_asym_batch_unscaled as estimate_sign_batch,
     estimate_asym_batch_unscaled_indexed as estimate_sign_batch_indexed,
@@ -131,6 +133,7 @@ pub(super) enum PreparedSplitLayer {
 pub struct PreparedSplitQuery {
     d: usize,
     pub(super) layers: Vec<PreparedSplitLayer>,
+    fastscan: OnceLock<Option<FastScanQuery>>,
 }
 
 /// Prepares a split-form query.
@@ -191,6 +194,7 @@ fn prepare_layers_with_plan(
     PreparedSplitQuery {
         d: query.len(),
         layers,
+        fastscan: OnceLock::new(),
     }
 }
 
@@ -279,6 +283,36 @@ impl PreparedSplitQuery {
                 0
             }
         }
+    }
+
+    /// Scores an unfiltered batch, using FastScan for supported layer-zero sign batches.
+    /// Other batches use [`Self::score_layer_batch_unscaled`], with the same fallback count.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the layer, codes, stride, specification, or output shape is invalid.
+    #[inline]
+    pub fn score_layer_batch_unscaled_fastscan(
+        &self,
+        layer: usize,
+        codes: &[u8],
+        code_stride: usize,
+        spec: LayerSpec,
+        out: &mut [f32],
+    ) -> u64 {
+        if layer == 0 && out.len() >= FastScanQuery::MIN_ROWS {
+            if let PreparedSplitLayer::Sign(query) = &self.layers[layer] {
+                if let Some(fastscan) = self.fastscan.get_or_init(|| FastScanQuery::new(query)) {
+                    assert_eq!(spec.bits, 1);
+                    assert_eq!(codes.len(), out.len() * code_stride);
+                    assert_eq!(code_stride % size_of::<u64>(), 0);
+                    let words = aligned_le_words(codes);
+                    fastscan.score_batch(words.as_ref(), code_stride / size_of::<u64>(), out);
+                    return u64::from(matches!(words, Cow::Owned(_)));
+                }
+            }
+        }
+        self.score_layer_batch_unscaled(layer, codes, code_stride, spec, out)
     }
 
     /// Scores selected rows without scales or constants. Returns its sign-word fallbacks, as
@@ -731,7 +765,7 @@ mod tests {
             &[build_grid(d, 1)],
             4,
         );
-        let (rows, stride) = (3, d / 8);
+        let (rows, stride) = (FastScanQuery::MIN_ROWS * 2 + 1, d / 8);
         let codes: Vec<u8> = (0..rows * stride).map(|i| (i * 37 % 251) as u8).collect();
         let mut storage = vec![0_u8; codes.len() + 8];
         let mut scores = Vec::new();
@@ -745,6 +779,16 @@ mod tests {
             let fallbacks =
                 prepared.score_layer_batch_unscaled(0, placed, stride, spec, &mut dense);
             assert_eq!(fallbacks, u64::from(!aligned));
+            let mut fastscan = vec![0.0; rows];
+            let fallbacks = prepared.score_layer_batch_unscaled_fastscan(
+                0,
+                placed,
+                stride,
+                spec,
+                &mut fastscan,
+            );
+            assert_eq!(fallbacks, u64::from(!aligned));
+            assert_eq!(fastscan, dense);
             let mut indexed = vec![0.0; 2];
             let fallbacks = prepared.score_layer_batch_unscaled_indexed(
                 0,
@@ -759,6 +803,53 @@ mod tests {
             scores.push(dense);
         }
         assert_eq!(scores[0], scores[1]);
+    }
+
+    #[test]
+    fn fastscan_is_prepared_only_when_requested_for_dense_layer_zero() {
+        let d = 128;
+        let spec = LayerSpec {
+            kind: LayerKind::Sign,
+            bits: 1,
+            rotation: Rotation::None,
+        };
+        let prepared = prepare_split_query(
+            &(0..d).map(|i| (i as f32 * 0.019).cos()).collect::<Vec<_>>(),
+            &[spec, spec],
+            &[build_grid(d, 1), build_grid(d, 1)],
+            4,
+        );
+        let rows = FastScanQuery::MIN_ROWS * 2 + 1;
+        let stride = d / u8::BITS as usize;
+        let codes: Vec<u8> = (0..rows * stride).map(|i| (i * 37 % 251) as u8).collect();
+        let offsets: Vec<usize> = (0..rows).collect();
+        let mut indexed = vec![0.0; rows];
+        let mut dense = indexed.clone();
+        prepared.score_layer_batch_unscaled_indexed(
+            0,
+            &codes,
+            stride,
+            &offsets,
+            spec,
+            &mut indexed,
+        );
+        assert!(prepared.fastscan.get().is_none());
+        prepared.score_layer_batch_unscaled(0, &codes, stride, spec, &mut dense);
+        assert!(prepared.fastscan.get().is_none());
+        prepared.score_layer_batch_unscaled_fastscan(1, &codes, stride, spec, &mut dense);
+        assert!(prepared.fastscan.get().is_none());
+        let small_rows = FastScanQuery::MIN_ROWS - 1;
+        prepared.score_layer_batch_unscaled_fastscan(
+            0,
+            &codes[..small_rows * stride],
+            stride,
+            spec,
+            &mut dense[..small_rows],
+        );
+        assert!(prepared.fastscan.get().is_none());
+        prepared.score_layer_batch_unscaled_fastscan(0, &codes, stride, spec, &mut dense);
+        assert!(prepared.fastscan.get().is_some());
+        assert_eq!(dense, indexed);
     }
 
     #[test]

@@ -377,6 +377,25 @@ impl QuantizedQueryCtx {
         charge_fallbacks(layer, fallbacks);
     }
 
+    /// Scores an unfiltered batch with FastScan where supported, charging sign-word fallbacks.
+    #[inline(always)]
+    pub(crate) fn score_layer_batch_unscaled_fastscan(
+        &self,
+        layer: usize,
+        codes: &[u8],
+        code_stride: usize,
+        out: &mut [f32],
+    ) {
+        let fallbacks = self.prepared.codes.score_layer_batch_unscaled_fastscan(
+            layer,
+            codes,
+            code_stride,
+            self.index.specs[layer],
+            out,
+        );
+        charge_fallbacks(layer, fallbacks);
+    }
+
     /// Scores the rows at `row_offsets` of a code batch, charging its sign-word fallbacks to the
     /// measure in scope.
     #[inline(always)]

@@ -108,7 +108,7 @@ fn decode_band(
                 out.norms.resize(count, 0.0);
                 decode_f32s(band_norms(&band)?, &mut out.norms);
             }
-            spec.query.score_layer_batch_unscaled(
+            spec.query.score_layer_batch_unscaled_fastscan(
                 spec.index,
                 band.codes(),
                 band.code_stride(),

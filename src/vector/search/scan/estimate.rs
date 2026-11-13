@@ -344,7 +344,7 @@ pub fn quantization_bench_layer0_cosine_cluster(
     assert_eq!(error_ratios.len(), rows * std::mem::size_of::<u16>());
     assert_eq!(residual_norms.len(), rows * std::mem::size_of::<f32>());
     decoded.kernel.resize(rows, 0.0);
-    prepared.score_layer_batch_unscaled(0, codes, code_stride, spec, &mut decoded.kernel);
+    prepared.score_layer_batch_unscaled_fastscan(0, codes, code_stride, spec, &mut decoded.kernel);
     decode_f32s(scales, &mut decoded.scales);
     decode_f16s(gammas, &mut decoded.gammas);
     decode_f16s(error_ratios, &mut decoded.errors);

@@ -135,9 +135,9 @@ jobs:
             echo "tantivy_quant::sign assembly does not contain a cnt instruction" >&2
             exit 1
           fi
-      - name: Run rotation tests
+      - name: Run ARM kernel tests
         run: |
-          cargo test -p tantivy-quant --release --lib rotation::
+          cargo test -p tantivy-quant --release --lib
 
   kernel-tier-avx512:
     name: AVX-512 tier under Intel SDE

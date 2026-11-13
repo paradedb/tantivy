@@ -54,6 +54,15 @@ Batch kernels take contiguous fixed-stride rows and write one score per row:
 Both have a specialized path for `bq = 4` (the four planes unrolled in one
 loop) and a generic plane loop otherwise.
 
+On little-endian ARM64, unfiltered dense layer-0 scans use `fastscan::FastScanQuery`
+with four-bit queries and at least 16 rows. It transposes 16 rows in registers
+and uses NEON lookups over four sign bits at a time. The tables contain exact
+integer subset sums of the existing query codes, preserving popcount scores
+and query error. Storage stays row-major. Tables are prepared lazily once per
+query; centroid routing, filtered/indexed scans, and refining layers retain
+popcount. Partial tiles, unsupported CPUs/query widths, and dimensions exceeding
+the u16 accumulator range also retain popcount.
+
 ## Tests and benches
 
 Tests cover packing round trips at even and odd `d` with zero tails, the
@@ -63,5 +72,6 @@ batch equality on sparse selections, and statistical σ against
 `model::isotropic_sigma`.
 
 `cargo bench -p tantivy-quant --bench sign_score` times the single-row and batch
-kernels. `check_asm_x86.sh` and the ARM CI job assert the release build uses
+kernels, FastScan including its transpose, and FastScan table preparation.
+`check_asm_x86.sh` and the ARM CI job assert the release build uses
 hardware `popcnt` / `cnt`.

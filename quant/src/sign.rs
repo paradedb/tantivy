@@ -4,6 +4,8 @@ use std::borrow::Cow;
 
 use crate::model::f16::{f16_to_f32, f32_to_f16};
 
+pub mod fastscan;
+
 #[derive(Clone, Debug)]
 /// Quantized query bitplanes and affine reconstruction parameters.
 pub struct QueryPlanes {
