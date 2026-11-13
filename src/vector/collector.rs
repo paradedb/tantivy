@@ -2442,7 +2442,7 @@ mod ivf_e2e_tests {
                 .collect();
             let weight = fixture.all()?;
             let mut work = Vec::new();
-            for (max_probe, patience) in [(500, 0.0), (1000, 16.66), (2000, 100.0), (4000, 200.0)] {
+            for (max_probe, patience) in [(500, 0.0), (1000, 33.33), (2000, 200.0), (4000, 400.0)] {
                 let collector = TopDocs::with_limit(10)
                     .order_by_similarity(fixture.field, vec![0.0_f32, 0.0])
                     .with_probe_params(ProbeParams {

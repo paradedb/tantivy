@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 const ADAPTIVE_PATIENCE_START_WORK: f64 = 500.0;
 const ADAPTIVE_PATIENCE_END_WORK: f64 = 2000.0;
-const ADAPTIVE_PATIENCE_MAX_FRACTION: f64 = 0.05;
+const ADAPTIVE_PATIENCE_MAX_FRACTION: f64 = 0.10;
 
 /// Actual routed work charged by all participants in one query. Located scans are separate.
 pub trait SharedVectorWork: Send + Sync {
@@ -173,7 +173,7 @@ impl WorkMeter {
             >= self.budget.total.get()
     }
 
-    /// Ramps patience from 0% at 500 work units to 5% at 2,000.
+    /// Ramps patience from 0% at 500 work units to 10% at 2,000.
     pub(crate) fn adaptive_stop(&mut self, quiet: bool) -> bool {
         if !quiet {
             self.last_active_work = self.charged;
@@ -281,7 +281,7 @@ mod shared_work_tests {
             assert!(!meter.adaptive_stop(true));
         }
         meter.open();
-        meter.rows(12);
+        meter.rows(32);
         assert!(meter.adaptive_stop(true));
         assert!(!meter.adaptive_stop(false));
         meter.open();
@@ -298,13 +298,13 @@ mod shared_work_tests {
             (499, 0),
             (500, 0),
             (501, 1),
-            (1000, 17),
-            (1250, 32),
-            (1500, 50),
-            (1999, 100),
-            (2000, 100),
-            (2001, 101),
-            (4000, 200),
+            (1000, 34),
+            (1250, 63),
+            (1500, 100),
+            (1999, 200),
+            (2000, 200),
+            (2001, 201),
+            (4000, 400),
         ] {
             let mut meter = WorkMeter::new(
                 WorkBudget {
