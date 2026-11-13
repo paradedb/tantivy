@@ -61,7 +61,11 @@ impl FastFieldRangeWeight {
 
 impl Weight for FastFieldRangeWeight {
     fn candidate_filter(&self, reader: &SegmentReader) -> crate::Result<CandidateFilter> {
-        let scorer = self.scorer_for_candidates_unpositioned(reader, 1.0, 0)?;
+        let scorer = Self {
+            candidate_mode: true,
+            ..self.clone()
+        }
+        .scorer(reader, 1.0)?;
         Ok(
             CandidateFilter::from_cloned_scorer::<ConstScorer<RangeDocSet<u64>>>(scorer.as_ref())
                 .or_else(|| {
@@ -82,19 +86,6 @@ impl Weight for FastFieldRangeWeight {
 
     fn uses_fast_fields(&self) -> bool {
         true
-    }
-
-    fn scorer_for_candidates_unpositioned(
-        &self,
-        reader: &SegmentReader,
-        boost: Score,
-        _candidate_size: u32,
-    ) -> crate::Result<Box<dyn Scorer>> {
-        let weight = Self {
-            candidate_mode: true,
-            ..self.clone()
-        };
-        weight.scorer(reader, boost)
     }
 
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {

@@ -350,6 +350,13 @@ mod candidate_tests {
                 expected[scorer.doc() as usize] = true;
                 scorer.advance();
             }
+            let mut scorer = weight.scorer_for_candidates_unpositioned(reader, 1.0, 10)?;
+            let lower_bound = scorer.doc();
+            for doc in 0..reader.max_doc() {
+                let matched =
+                    doc >= lower_bound && scorer.seek_danger(doc) == SeekDangerResult::Found;
+                assert_eq!(matched, expected[doc as usize], "{query:?}, doc={doc}");
+            }
             // Each batch is sorted; successive batches intentionally move backwards.
             for docs in [
                 vec![250, 299],
