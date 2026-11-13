@@ -2427,8 +2427,8 @@ mod ivf_e2e_tests {
 
     #[test]
     fn adaptive_patience_applies_to_single_and_global_scans() -> Result<()> {
-        let centroids: Vec<_> = (0..512).map(|c| vec![c as f32 * 10.0, 0.0]).collect();
-        let vectors: Vec<_> = (0..32).flat_map(|_| centroids.clone()).collect();
+        let centroids: Vec<_> = (0..4096).map(|c| vec![c as f32 * 10.0, 0.0]).collect();
+        let vectors: Vec<_> = (0..2).flat_map(|_| centroids.clone()).collect();
         for segments in [1, 2] {
             let fixture = FixtureSpec::ivf(Metric::L2, centroids.clone(), vectors.clone())
                 .segments(segments)
@@ -2442,7 +2442,7 @@ mod ivf_e2e_tests {
                 .collect();
             let weight = fixture.all()?;
             let mut work = Vec::new();
-            for max_probe in [49, 50, 100, 400] {
+            for (max_probe, patience) in [(500, 0.0), (1000, 16.66), (2000, 100.0), (4000, 200.0)] {
                 let collector = TopDocs::with_limit(10)
                     .order_by_similarity(fixture.field, vec![0.0_f32, 0.0])
                     .with_probe_params(ProbeParams {
@@ -2464,7 +2464,7 @@ mod ivf_e2e_tests {
                 let result = collector.merge_fruits(fruits)?;
                 let charged = result.stats.iter().map(|s| s.work_charged).sum::<f32>();
                 assert_eq!(result.results.len(), 10);
-                assert!(charged >= 0.02 * max_probe as f32);
+                assert!(charged >= patience);
                 assert!(charged < max_probe as f32);
                 assert!(result
                     .stats
@@ -2472,7 +2472,10 @@ mod ivf_e2e_tests {
                     .all(|s| s.termination == ProbeTermination::QuantizedRecall));
                 work.push(charged);
             }
-            assert!(work[3] > work[2], "{segments} segments: {work:?}");
+            assert!(
+                work[3] > work[2] && work[2] > work[0],
+                "{segments} segments: {work:?}"
+            );
         }
         Ok(())
     }
