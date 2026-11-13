@@ -23,10 +23,7 @@ mod tests {
         RequiredOptionalScorer, Scorer, SumCombiner, TermQuery,
     };
     use crate::schema::*;
-    use crate::{
-        assert_nearly_equals, DocAddress, DocId, Index, IndexWriter, Score, Searcher,
-        SegmentReader, TERMINATED,
-    };
+    use crate::{assert_nearly_equals, DocAddress, DocId, Index, IndexWriter, Score};
 
     fn aux_test_helper() -> crate::Result<(Index, Field)> {
         let mut schema_builder = Schema::builder();
@@ -677,738 +674,6 @@ mod tests {
 
         Ok(())
     }
-
-    #[test]
-    pub fn test_filtered_pruning_multi_block_skipping() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        let text_field = schema_builder.add_text_field("text", TEXT);
-        let num_field =
-            schema_builder.add_i64_field("num", NumericOptions::default().set_fast().set_indexed());
-        let schema = schema_builder.build();
-        let index = Index::create_in_ram(schema);
-        {
-            let mut index_writer: IndexWriter = index.writer_for_tests()?;
-            // Create 300 docs across multiple 128-doc blocks
-            for i in 0..300 {
-                let text = if i == 10 || i == 150 || i == 260 {
-                    "target"
-                } else {
-                    "other"
-                };
-                index_writer.add_document(doc!(text_field => text, num_field => i as i64))?;
-            }
-            index_writer.commit()?;
-        }
-
-        let searcher = index.reader()?.searcher();
-        let term_query = TermQuery::new(
-            Term::from_field_text(text_field, "target"),
-            IndexRecordOption::WithFreqsAndPositions,
-        );
-        // Filter out doc 10, keeping only docs in [100, 300]
-        let range_query = RangeQuery::new(
-            Bound::Included(Term::from_field_i64(num_field, 100)),
-            Bound::Included(Term::from_field_i64(num_field, 300)),
-        );
-
-        let query = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(term_query)),
-            (Occur::Must, Box::new(range_query)),
-        ]);
-
-        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
-        let mut pruning_scorer = weight.pruning_scorer(searcher.segment_reader(0u32), 1.0, 0.0)?;
-        assert!(pruning_scorer.is::<BlockWandSingleScorer>());
-        // First match must be doc 150 (doc 10 was skipped because filter doc was >= 100)
-        assert_eq!(pruning_scorer.doc(), 150);
-        assert_eq!(pruning_scorer.advance(), 260);
-        assert_eq!(pruning_scorer.advance(), TERMINATED);
-
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(10).order_by_score())?;
-        assert_eq!(top_docs.len(), 2);
-        let doc_ids: Vec<DocId> = top_docs.iter().map(|(_, addr)| addr.doc_id).collect();
-        assert!(doc_ids.contains(&150));
-        assert!(doc_ids.contains(&260));
-
-        Ok(())
-    }
-
-    /// Two segments with disjoint `num` values, 0..300 and 300..600, so that `num >= 200` cuts
-    /// through the first and covers all of the second.
-    fn two_segment_index(
-        text_for: impl Fn(usize) -> &'static str,
-    ) -> crate::Result<(Index, Field, Field)> {
-        let mut schema_builder = Schema::builder();
-        let text_field = schema_builder.add_text_field("text", TEXT);
-        let num_field =
-            schema_builder.add_i64_field("num", NumericOptions::default().set_fast().set_indexed());
-        let schema = schema_builder.build();
-        let index = Index::create_in_ram(schema);
-        let mut index_writer: IndexWriter = index.writer_for_tests()?;
-        index_writer.set_merge_policy(Box::new(crate::indexer::NoMergePolicy));
-        for segment in 0..2 {
-            for i in segment * 300..(segment + 1) * 300 {
-                index_writer
-                    .add_document(doc!(text_field => text_for(i), num_field => i as i64))?;
-            }
-            index_writer.commit()?;
-        }
-        Ok((index, text_field, num_field))
-    }
-
-    /// Returns the segment `num >= 200` partly covers, then the one it fully covers.
-    fn partly_and_fully_covered(searcher: &Searcher) -> (&SegmentReader, &SegmentReader) {
-        let readers = searcher.segment_readers();
-        assert_eq!(readers.len(), 2);
-        let holds_zero = |reader: &SegmentReader| {
-            reader
-                .fast_fields()
-                .i64("num")
-                .expect("num is a fast field")
-                .min_value()
-                == 0
-        };
-        if holds_zero(&readers[0]) {
-            (&readers[0], &readers[1])
-        } else {
-            (&readers[1], &readers[0])
-        }
-    }
-
-    fn num_from_200(num_field: Field) -> RangeQuery {
-        RangeQuery::new(
-            Bound::Included(Term::from_field_i64(num_field, 200)),
-            Bound::Unbounded,
-        )
-    }
-
-    fn text_term(text_field: Field, text: &str) -> TermQuery {
-        TermQuery::new(
-            Term::from_field_text(text_field, text),
-            IndexRecordOption::WithFreqs,
-        )
-    }
-
-    /// A MUST range returns an `AllScorer` on a segment it fully covers. With scoring enabled it
-    /// must still add its score and keep Block-WAND, so equal matches score the same on fully and
-    /// partly covered segments.
-    #[test]
-    pub fn test_must_all_scorer_kept_when_scoring() -> crate::Result<()> {
-        let (index, text_field, num_field) =
-            two_segment_index(|i| if i % 3 == 0 { "target" } else { "other" })?;
-        let searcher = index.reader()?.searcher();
-        let (partly_covered, fully_covered) = partly_and_fully_covered(&searcher);
-
-        let range_query = num_from_200(num_field);
-        let range_weight = range_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
-        assert!(range_weight.scorer(fully_covered, 1.0)?.is::<AllScorer>());
-        assert!(!range_weight.scorer(partly_covered, 1.0)?.is::<AllScorer>());
-
-        let query = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(text_term(text_field, "target"))),
-            (Occur::Must, Box::new(range_query)),
-        ]);
-        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
-
-        for reader in [partly_covered, fully_covered] {
-            let pruning_scorer = weight.pruning_scorer(reader, 1.0, 0.0)?;
-            assert!(pruning_scorer.is::<BlockWandSingleScorer>());
-        }
-
-        // Every match has the same text, so all scores must be equal.
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(1_000).order_by_score())?;
-        let all_docs = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE)?;
-        assert_eq!(top_docs.len(), all_docs.scores().len());
-        let expected = top_docs[0].0;
-        for (score, _) in &top_docs {
-            assert_nearly_equals!(*score, expected);
-        }
-        for score in all_docs.scores() {
-            assert_nearly_equals!(*score, expected);
-        }
-        let segments_hit: std::collections::HashSet<u32> =
-            top_docs.iter().map(|(_, addr)| addr.segment_ord).collect();
-        assert_eq!(segments_hit.len(), 2);
-
-        // Scoring disabled: the match count is unchanged.
-        assert_eq!(searcher.search(&query, &Count)?, top_docs.len());
-
-        Ok(())
-    }
-
-    /// `target AND (extra OR num >= 200)` is flattened to MUST `target` with SHOULD `extra` and
-    /// SHOULD range. On the segment the range fully covers, its `AllScorer` sits in the SHOULD
-    /// list and must keep adding its score there too.
-    #[test]
-    pub fn test_should_all_scorer_kept_when_scoring() -> crate::Result<()> {
-        use std::collections::{HashMap, HashSet};
-
-        let (index, text_field, num_field) =
-            two_segment_index(|i| match (i % 3 == 0, i % 7 == 0) {
-                (true, true) => "target extra",
-                (true, false) => "target",
-                (false, true) => "other extra",
-                (false, false) => "other",
-            })?;
-        let searcher = index.reader()?.searcher();
-
-        let query = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(text_term(text_field, "target"))),
-            (
-                Occur::Must,
-                Box::new(BooleanQuery::new(vec![
-                    (Occur::Should, Box::new(text_term(text_field, "extra"))),
-                    (Occur::Should, Box::new(num_from_200(num_field))),
-                ])),
-            ),
-        ]);
-        let (clauses, minimum_number_should_match) = query.flattened_clauses();
-        assert_eq!(minimum_number_should_match, 1);
-        let should_count = clauses
-            .iter()
-            .filter(|(occur, _)| *occur == Occur::Should)
-            .count();
-        assert_eq!(should_count, 2);
-
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(1_000).order_by_score())?;
-        let all_docs = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE)?;
-        let mut top_scores: Vec<Score> = top_docs.iter().map(|(score, _)| *score).collect();
-        let mut all_scores: Vec<Score> = all_docs.scores().to_vec();
-        top_scores.sort_by(|a, b| a.total_cmp(b));
-        all_scores.sort_by(|a, b| a.total_cmp(b));
-        assert_eq!(top_scores.len(), all_scores.len());
-        for (top, all) in top_scores.iter().zip(&all_scores) {
-            assert_nearly_equals!(*top, *all);
-        }
-
-        // Same text and same matching clauses must score the same on either segment.
-        let mut score_by_group: HashMap<(bool, bool), Score> = HashMap::new();
-        let mut segments_by_group: HashMap<(bool, bool), HashSet<u32>> = HashMap::new();
-        for (score, addr) in &top_docs {
-            let num = searcher
-                .segment_reader(addr.segment_ord)
-                .fast_fields()
-                .i64("num")?
-                .first(addr.doc_id)
-                .unwrap();
-            let group = (num >= 200, num % 7 == 0);
-            let expected = *score_by_group.entry(group).or_insert(*score);
-            assert_nearly_equals!(*score, expected);
-            segments_by_group
-                .entry(group)
-                .or_default()
-                .insert(addr.segment_ord);
-        }
-        // Docs in range appear on both segments. Docs below 200 only match through `extra`.
-        assert_eq!(segments_by_group[&(true, false)].len(), 2);
-        assert_eq!(segments_by_group[&(true, true)].len(), 2);
-        assert_eq!(segments_by_group[&(false, true)].len(), 1);
-        assert!(!segments_by_group.contains_key(&(false, false)));
-
-        // Scoring disabled: the match count is unchanged.
-        assert_eq!(searcher.search(&query, &Count)?, top_docs.len());
-
-        Ok(())
-    }
-
-    /// A MUST_NOT range that fully covers a segment excludes every document on it, with or
-    /// without scoring. On the other segment it only filters, and contributes nothing to the score.
-    #[test]
-    pub fn test_must_not_all_scorer_excludes_segment_when_scoring() -> crate::Result<()> {
-        let (index, text_field, num_field) =
-            two_segment_index(|i| if i % 3 == 0 { "target" } else { "other" })?;
-        let searcher = index.reader()?.searcher();
-        let (partly_covered, fully_covered) = partly_and_fully_covered(&searcher);
-
-        let query = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(text_term(text_field, "target"))),
-            (Occur::MustNot, Box::new(num_from_200(num_field))),
-        ]);
-        for enable_scoring in [
-            EnableScoring::enabled_from_searcher(&searcher),
-            EnableScoring::disabled_from_searcher(&searcher),
-        ] {
-            let weight = query.weight(enable_scoring)?;
-            assert!(weight.scorer(fully_covered, 1.0)?.is::<EmptyScorer>());
-            assert!(!weight.scorer(partly_covered, 1.0)?.is::<EmptyScorer>());
-        }
-
-        // `target` docs with num < 200.
-        let expected_count = (0..200).filter(|i| i % 3 == 0).count();
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(1_000).order_by_score())?;
-        assert_eq!(top_docs.len(), expected_count);
-        assert_eq!(searcher.search(&query, &Count)?, expected_count);
-
-        // The excluded clause adds nothing: scores equal the term query's own.
-        let term_weight = text_term(text_field, "target")
-            .weight(EnableScoring::enabled_from_searcher(&searcher))?;
-        for (score, addr) in &top_docs {
-            let reader = searcher.segment_reader(addr.segment_ord);
-            let mut term_scorer = term_weight.scorer(reader, 1.0)?;
-            assert_eq!(term_scorer.seek(addr.doc_id), addr.doc_id);
-            assert_nearly_equals!(*score, term_scorer.score());
-        }
-
-        Ok(())
-    }
-
-    // Each excluded query sits on its first match, doc 150, while the MUST term starts at doc 0.
-    // `Exclude` must not call `seek_danger` below doc 150: two ranges form an `Intersection`
-    // whose `RangeDocSet`s were seeked to doc 150, and a phrase asserts `target >= doc`.
-    #[test]
-    pub fn test_must_not_starts_after_must() -> crate::Result<()> {
-        use crate::query::PhraseQuery;
-
-        let mut schema_builder = Schema::builder();
-        let text_field = schema_builder.add_text_field("text", TEXT);
-        let tag_field = schema_builder.add_text_field("tag", TEXT);
-        let num_a =
-            schema_builder.add_i64_field("a", NumericOptions::default().set_fast().set_indexed());
-        let num_b =
-            schema_builder.add_i64_field("b", NumericOptions::default().set_fast().set_indexed());
-        let index = Index::create_in_ram(schema_builder.build());
-        {
-            let mut index_writer: IndexWriter = index.writer_for_tests()?;
-            for i in 0..300i64 {
-                let tag = if i >= 150 && i % 10 == 0 {
-                    "red apple"
-                } else {
-                    "apple red"
-                };
-                index_writer.add_document(doc!(
-                    text_field => "target",
-                    tag_field => tag,
-                    num_a => i,
-                    num_b => i,
-                ))?;
-            }
-            index_writer.commit()?;
-        }
-        let searcher = index.reader()?.searcher();
-
-        let must_not = |excluded: Box<dyn Query>| {
-            BooleanQuery::new(vec![
-                (
-                    Occur::Must,
-                    Box::new(TermQuery::new(
-                        Term::from_field_text(text_field, "target"),
-                        IndexRecordOption::WithFreqs,
-                    )) as Box<dyn Query>,
-                ),
-                (Occur::MustNot, excluded),
-            ])
-        };
-        let range = |field: Field, lower: i64| -> Box<dyn Query> {
-            Box::new(RangeQuery::new(
-                Bound::Included(Term::from_field_i64(field, lower)),
-                Bound::Unbounded,
-            ))
-        };
-        let phrase: Box<dyn Query> = Box::new(PhraseQuery::new(vec![
-            Term::from_field_text(tag_field, "red"),
-            Term::from_field_text(tag_field, "apple"),
-        ]));
-        let ranges: Box<dyn Query> = Box::new(BooleanQuery::new(vec![
-            (Occur::Must, range(num_a, 100)),
-            (Occur::Must, range(num_b, 150)),
-        ]));
-
-        for (excluded, expected_count) in [(phrase, 285), (ranges, 150)] {
-            let query = must_not(excluded);
-            assert_eq!(
-                searcher.search(&query, &Count)?,
-                expected_count,
-                "{query:?}"
-            );
-            let top_docs = searcher.search(&query, &TopDocs::with_limit(10).order_by_score())?;
-            assert_eq!(top_docs.len(), 10, "{query:?}");
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    pub fn test_filtered_pruning_initial_threshold() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        let text_field = schema_builder.add_text_field("text", TEXT);
-        let num_field =
-            schema_builder.add_i64_field("num", NumericOptions::default().set_fast().set_indexed());
-        let schema = schema_builder.build();
-        let index = Index::create_in_ram(schema);
-        {
-            let mut index_writer: IndexWriter = index.writer_for_tests()?;
-            index_writer.add_document(doc!(text_field => "target other", num_field => 100i64))?;
-            index_writer.add_document(doc!(text_field => "unrelated", num_field => 0i64))?;
-            index_writer.commit()?;
-        }
-
-        let searcher = index.reader()?.searcher();
-        let term_query1 = TermQuery::new(
-            Term::from_field_text(text_field, "target"),
-            IndexRecordOption::WithFreqsAndPositions,
-        );
-        let term_query2 = TermQuery::new(
-            Term::from_field_text(text_field, "other"),
-            IndexRecordOption::WithFreqsAndPositions,
-        );
-        let range_query = RangeQuery::new(
-            Bound::Included(Term::from_field_i64(num_field, 50)),
-            Bound::Included(Term::from_field_i64(num_field, 150)),
-        );
-
-        // Case 1: Single term + filter
-        let single_query = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(term_query1.clone())),
-            (Occur::Must, Box::new(range_query.clone())),
-        ]);
-        let weight = single_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
-        let mut baseline = weight.pruning_scorer(searcher.segment_reader(0u32), 1.0, 0.0)?;
-        assert_eq!(baseline.doc(), 0);
-        let total_score = baseline.score();
-        let init_threshold = total_score - 0.5;
-        let pruning_scorer =
-            weight.pruning_scorer(searcher.segment_reader(0u32), 1.0, init_threshold)?;
-        assert_eq!(pruning_scorer.doc(), 0);
-
-        // Case 2: Multi-term intersection + filter (FilteredTermIntersection)
-        let intersection_query = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(term_query1.clone())),
-            (Occur::Must, Box::new(term_query2.clone())),
-            (Occur::Must, Box::new(range_query.clone())),
-        ]);
-        let weight = intersection_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
-        let mut baseline = weight.pruning_scorer(searcher.segment_reader(0u32), 1.0, 0.0)?;
-        assert_eq!(baseline.doc(), 0);
-        let total_score = baseline.score();
-        let init_threshold = total_score - 0.5;
-        let pruning_scorer =
-            weight.pruning_scorer(searcher.segment_reader(0u32), 1.0, init_threshold)?;
-        assert_eq!(pruning_scorer.doc(), 0);
-
-        // Case 3: Term union + filter (FilteredTermUnion)
-        let mut union_query = BooleanQuery::new(vec![
-            (Occur::Should, Box::new(term_query1.clone())),
-            (Occur::Should, Box::new(term_query2.clone())),
-            (Occur::Must, Box::new(range_query.clone())),
-        ]);
-        union_query.set_minimum_number_should_match(1);
-        let weight = union_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
-        let mut baseline = weight.pruning_scorer(searcher.segment_reader(0u32), 1.0, 0.0)?;
-        assert_eq!(baseline.doc(), 0);
-        let total_score = baseline.score();
-        let init_threshold = total_score - 0.5;
-        let pruning_scorer =
-            weight.pruning_scorer(searcher.segment_reader(0u32), 1.0, init_threshold)?;
-        assert_eq!(pruning_scorer.doc(), 0);
-
-        // Case 4: Nested BooleanQuery + filter
-        let inner_boolean = BooleanQuery::new(vec![
-            (Occur::Should, Box::new(term_query1)),
-            (Occur::Should, Box::new(term_query2)),
-        ]);
-        let nested_query = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(inner_boolean)),
-            (Occur::Must, Box::new(range_query)),
-        ]);
-        let weight = nested_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
-        let mut baseline = weight.pruning_scorer(searcher.segment_reader(0u32), 1.0, 0.0)?;
-        assert_eq!(baseline.doc(), 0);
-        let total_score = baseline.score();
-        let init_threshold = total_score - 0.5;
-        let pruning_scorer =
-            weight.pruning_scorer(searcher.segment_reader(0u32), 1.0, init_threshold)?;
-        assert_eq!(pruning_scorer.doc(), 0);
-
-        Ok(())
-    }
-
-    #[test]
-    pub fn test_filtered_pruning_constant_vs_dynamic_filter() -> crate::Result<()> {
-        use crate::query::scorer::BasicPruningScorer;
-        use crate::query::{ConstScoreQuery, PhraseQuery, TermSetQuery};
-
-        let mut schema_builder = Schema::builder();
-        let text_field = schema_builder.add_text_field("text", TEXT);
-        let num_field =
-            schema_builder.add_i64_field("num", NumericOptions::default().set_fast().set_indexed());
-        let schema = schema_builder.build();
-        let index = Index::create_in_ram(schema);
-        {
-            let mut index_writer: IndexWriter = index.writer_for_tests()?;
-            index_writer.add_document(doc!(text_field => "quick brown fox", num_field => 10i64))?;
-            index_writer.add_document(doc!(text_field => "quick blue fox", num_field => 20i64))?;
-            index_writer.add_document(doc!(text_field => "lazy brown dog", num_field => 10i64))?;
-            index_writer.commit()?;
-        }
-
-        let searcher = index.reader()?.searcher();
-        let segment_reader = searcher.segment_reader(0u32);
-        let term_query1 = TermQuery::new(
-            Term::from_field_text(text_field, "quick"),
-            IndexRecordOption::WithFreqsAndPositions,
-        );
-        let term_query2 = TermQuery::new(
-            Term::from_field_text(text_field, "fox"),
-            IndexRecordOption::WithFreqsAndPositions,
-        );
-        let phrase_query = PhraseQuery::new(vec![
-            Term::from_field_text(text_field, "brown"),
-            Term::from_field_text(text_field, "fox"),
-        ]);
-
-        // Constant-scoring filter variants to test:
-        // 1. TermSetQuery (constant scorer)
-        // 2. RangeQuery (constant scorer)
-        // 3. ConstScoreQuery (wrapping a dynamic query like PhraseQuery)
-        let constant_filters: [(&str, Box<dyn Query>); 3] = [
-            (
-                "TermSetQuery",
-                Box::new(TermSetQuery::new(vec![Term::from_field_i64(num_field, 10)])),
-            ),
-            (
-                "RangeQuery",
-                Box::new(RangeQuery::new(
-                    Bound::Included(Term::from_field_i64(num_field, 5)),
-                    Bound::Included(Term::from_field_i64(num_field, 15)),
-                )),
-            ),
-            (
-                "ConstScoreQuery",
-                Box::new(ConstScoreQuery::new(phrase_query.clone(), 1.0)),
-            ),
-        ];
-
-        for (name, filter) in &constant_filters {
-            // Case 1: Single term + constant filter -> BlockWandSingleScorer
-            let single_query = BooleanQuery::new(vec![
-                (Occur::Must, Box::new(term_query1.clone())),
-                (Occur::Must, filter.box_clone()),
-            ]);
-            let weight = single_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
-            let pruning = weight.pruning_scorer(segment_reader, 1.0, 0.0)?;
-            assert!(
-                pruning.is::<BlockWandSingleScorer>(),
-                "{name} with single term should enable BlockWandSingleScorer"
-            );
-
-            // Case 2: Term union + constant filter -> BlockWandUnionScorer
-            let mut union_query = BooleanQuery::new(vec![
-                (Occur::Should, Box::new(term_query1.clone())),
-                (Occur::Should, Box::new(term_query2.clone())),
-                (Occur::Must, filter.box_clone()),
-            ]);
-            union_query.set_minimum_number_should_match(1);
-            let weight = union_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
-            let pruning = weight.pruning_scorer(segment_reader, 1.0, 0.0)?;
-            assert!(
-                pruning.is::<BlockWandUnionScorer>(),
-                "{name} with term union should enable BlockWandUnionScorer"
-            );
-
-            // Case 3: Term intersection + constant filter -> BlockWandIntersectionScorer
-            let intersection_query = BooleanQuery::new(vec![
-                (Occur::Must, Box::new(term_query1.clone())),
-                (Occur::Must, Box::new(term_query2.clone())),
-                (Occur::Must, filter.box_clone()),
-            ]);
-            let weight =
-                intersection_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
-            let pruning = weight.pruning_scorer(segment_reader, 1.0, 0.0)?;
-            assert!(
-                pruning.is::<BlockWandIntersectionScorer>(),
-                "{name} with term intersection should enable BlockWandIntersectionScorer"
-            );
-
-            // Case 4: Disabled scoring -> falls back to BasicPruningScorer
-            let disabled_weight =
-                single_query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
-            assert!(
-                disabled_weight
-                    .pruning_scorer(segment_reader, 1.0, 0.0)?
-                    .is::<BasicPruningScorer>(),
-                "{name} with disabled scoring must fall back to BasicPruningScorer"
-            );
-        }
-
-        // Dynamic-scoring filter (PhraseQuery without ConstScoreQuery wrapper).
-        // Must fall back to BasicPruningScorer to prevent false pruning.
-        {
-            let dynamic_single = BooleanQuery::new(vec![
-                (Occur::Must, Box::new(term_query1.clone())),
-                (Occur::Must, Box::new(phrase_query.clone())),
-            ]);
-            let weight = dynamic_single.weight(EnableScoring::enabled_from_searcher(&searcher))?;
-            assert!(
-                weight
-                    .pruning_scorer(segment_reader, 1.0, 0.0)?
-                    .is::<BasicPruningScorer>(),
-                "Single term with dynamic filter must fall back to BasicPruningScorer"
-            );
-
-            let mut dynamic_union = BooleanQuery::new(vec![
-                (Occur::Should, Box::new(term_query1.clone())),
-                (Occur::Should, Box::new(term_query2.clone())),
-                (Occur::Must, Box::new(phrase_query.clone())),
-            ]);
-            dynamic_union.set_minimum_number_should_match(1);
-            let weight = dynamic_union.weight(EnableScoring::enabled_from_searcher(&searcher))?;
-            assert!(
-                weight
-                    .pruning_scorer(segment_reader, 1.0, 0.0)?
-                    .is::<BasicPruningScorer>(),
-                "Union with dynamic filter must fall back to BasicPruningScorer"
-            );
-
-            let dynamic_intersection = BooleanQuery::new(vec![
-                (Occur::Must, Box::new(term_query1.clone())),
-                (Occur::Must, Box::new(term_query2.clone())),
-                (Occur::Must, Box::new(phrase_query.clone())),
-            ]);
-            let weight =
-                dynamic_intersection.weight(EnableScoring::enabled_from_searcher(&searcher))?;
-            assert!(
-                weight
-                    .pruning_scorer(segment_reader, 1.0, 0.0)?
-                    .is::<BasicPruningScorer>(),
-                "Intersection with dynamic filter must fall back to BasicPruningScorer"
-            );
-
-            // PhraseQuery as scoring query with constant filter
-            let phrase_filter_query = BooleanQuery::new(vec![
-                (Occur::Must, Box::new(phrase_query.clone())),
-                (Occur::Must, constant_filters[0].1.box_clone()),
-            ]);
-            let weight =
-                phrase_filter_query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
-            assert!(
-                weight
-                    .pruning_scorer(segment_reader, 1.0, 0.0)?
-                    .is::<BasicPruningScorer>(),
-                "PhraseQuery as scoring query falls back to BasicPruningScorer"
-            );
-
-            // Verify search results still match accurately.
-            let top_docs =
-                searcher.search(&dynamic_single, &TopDocs::with_limit(10).order_by_score())?;
-            assert_eq!(top_docs.len(), 1);
-            assert_eq!(top_docs[0].1.doc_id, 0);
-
-            let top_docs_phrase = searcher.search(
-                &phrase_filter_query,
-                &TopDocs::with_limit(10).order_by_score(),
-            )?;
-            assert_eq!(top_docs_phrase.len(), 1);
-            assert_eq!(top_docs_phrase[0].1.doc_id, 0);
-        }
-
-        Ok(())
-    }
-    // Each filter sits on its first match, doc 150, while the term scorers start at doc 0.
-    // A `seek_danger` target below doc 150 fails in debug builds:
-    // - two range filters form an `Intersection`, which seeks the `RangeDocSet`s to doc 150 on
-    //   construction, so `RangeDocSet::is_last_seek_distance_large` overflows;
-    // - a phrase filter fails the `target >= doc` assert in `PhraseScorer::seek_danger`.
-    #[test]
-    pub fn test_filtered_pruning_starts_at_filter_doc() -> crate::Result<()> {
-        use crate::query::{ConstScoreQuery, DisjunctionPruning, PhraseQuery};
-
-        let mut schema_builder = Schema::builder();
-        let text_field = schema_builder.add_text_field("text", TEXT);
-        let tag_field = schema_builder.add_text_field("tag", TEXT);
-        let num_a =
-            schema_builder.add_i64_field("a", NumericOptions::default().set_fast().set_indexed());
-        let num_b =
-            schema_builder.add_i64_field("b", NumericOptions::default().set_fast().set_indexed());
-        let index = Index::create_in_ram(schema_builder.build());
-        {
-            let mut index_writer: IndexWriter = index.writer_for_tests()?;
-            for i in 0..300i64 {
-                let text = if i % 10 == 0 { "target other" } else { "other" };
-                let tag = if i >= 150 && i % 10 == 0 {
-                    "red apple"
-                } else {
-                    "apple red"
-                };
-                index_writer.add_document(doc!(
-                    text_field => text,
-                    tag_field => tag,
-                    num_a => i,
-                    num_b => i,
-                ))?;
-            }
-            index_writer.commit()?;
-        }
-        let searcher = index.reader()?.searcher();
-        let reader = searcher.segment_reader(0u32);
-
-        let term = |text: &str| -> Box<dyn Query> {
-            Box::new(TermQuery::new(
-                Term::from_field_text(text_field, text),
-                IndexRecordOption::WithFreqs,
-            ))
-        };
-        let range = |field: Field, lower: i64| -> Box<dyn Query> {
-            Box::new(RangeQuery::new(
-                Bound::Included(Term::from_field_i64(field, lower)),
-                Bound::Unbounded,
-            ))
-        };
-        let phrase = PhraseQuery::new(vec![
-            Term::from_field_text(tag_field, "red"),
-            Term::from_field_text(tag_field, "apple"),
-        ]);
-        let every_tenth: Vec<DocId> = (150..300).step_by(10).collect();
-        let all: Vec<DocId> = (150..300).collect();
-
-        let range_filters = vec![
-            (Occur::Must, range(num_a, 100)),
-            (Occur::Must, range(num_b, 150)),
-        ];
-        let phrase_filter: Vec<(Occur, Box<dyn Query>)> = vec![(
-            Occur::Must,
-            Box::new(ConstScoreQuery::new(
-                Box::new(phrase) as Box<dyn Query>,
-                1.0,
-            )),
-        )];
-
-        for (filters, union_expected) in [(range_filters, &all), (phrase_filter, &every_tenth)] {
-            let with_filters = |terms: Vec<(Occur, Box<dyn Query>)>| {
-                BooleanQuery::new([terms, filters.clone()].concat())
-            };
-            let single = with_filters(vec![(Occur::Must, term("target"))]);
-            let intersection = with_filters(vec![
-                (Occur::Must, term("target")),
-                (Occur::Must, term("other")),
-            ]);
-            let mut union = with_filters(vec![
-                (Occur::Should, term("target")),
-                (Occur::Should, term("other")),
-            ]);
-            union.set_minimum_number_should_match(1);
-
-            // `DisjunctionPruning` only selects the algorithm for unions.
-            for (query, pruning, expected) in [
-                (&single, DisjunctionPruning::Auto, &every_tenth),
-                (&intersection, DisjunctionPruning::Auto, &every_tenth),
-                (&union, DisjunctionPruning::BlockWand, union_expected),
-                (&union, DisjunctionPruning::BlockMaxScore, union_expected),
-            ] {
-                let scoring = EnableScoring::enabled_from_searcher(&searcher)
-                    .with_disjunction_pruning(pruning);
-                let weight = query.weight(scoring)?;
-                let mut docs = Vec::new();
-                weight.for_each_pruning(0.0, reader, &mut |doc, _score| {
-                    docs.push(doc);
-                    0.0
-                })?;
-                docs.sort_unstable();
-                assert_eq!(&docs, expected, "{query:?} {pruning:?}");
-            }
-        }
-
-        Ok(())
-    }
 }
 
 /// A proptest which generates arbitrary permutations of a simple boolean AST, and then matches
@@ -1575,5 +840,685 @@ mod proptest_boolean_query {
                 doc_addresses.into_iter().map(|doc_address| doc_address.doc_id).collect();
             prop_assert_eq!(result_docs, matching_docs);
         });
+    }
+}
+
+#[cfg(test)]
+mod pruning_and_equivalence_tests {
+    use std::collections::{HashMap, HashSet};
+    use std::ops::Bound;
+    use std::sync::OnceLock;
+
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::collector::tests::TEST_COLLECTOR_WITH_SCORE;
+    use crate::collector::{Count, DocSetCollector, TopDocs};
+    use crate::indexer::NoMergePolicy;
+    use crate::query::scorer::BasicPruningScorer;
+    use crate::query::{
+        AllQuery, AllScorer, ConstScoreQuery, DisjunctionPruning, EmptyQuery, EmptyScorer,
+        EnableScoring, Occur, PhraseQuery, Query, RangeQuery, Scorer, TermQuery, TermSetQuery,
+    };
+    use crate::schema::{Field, IndexRecordOption, NumericOptions, Schema, TEXT};
+    use crate::{
+        DocAddress, DocId, DocSet, Index, IndexWriter, Score, Searcher, SeekDangerResult,
+        SegmentReader, Term, TERMINATED,
+    };
+
+    const DOCS_PER_SEGMENT: usize = 300;
+    const SCORE_TOL: Score = 1e-4;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Coverage {
+        /// Segment `0..300`: `RangeFrom200` covers `200..300`.
+        Partial,
+        /// Segment `300..600`: `RangeFrom200` covers all docs (`AllScorer`).
+        Full,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ScoringMode {
+        Disabled,
+        Enabled,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum MinShould {
+        Default,
+        Explicit(usize),
+    }
+
+    /// Catalog of leaf queries exercising `EmptyScorer`, `AllScorer` (wrapped and bare, on one or
+    /// both segments), constant-score vs dynamic filters, `TermSetQuery` candidate probing,
+    /// non-freq vs freq `TermScorer`s, and mid-segment (`doc >= 150`) `seek_danger` invariants.
+    macro_rules! leaves {
+        ($($variant:ident),+ $(,)?) => {
+            #[derive(Clone, Copy, Debug)]
+            enum Leaf { $($variant),+ }
+            impl Leaf {
+                const ALL: &[Self] = &[$(Self::$variant),+];
+            }
+        };
+    }
+
+    leaves!(
+        Empty,
+        All,
+        ConstAll,
+        TermMissing,
+        TermCommon,
+        TermTarget,
+        TermExtra,
+        TermSparse,
+        TermBasic,
+        TermSet150,
+        RangeAll,
+        RangeFrom200,
+        RangeAFrom100,
+        RangeBFrom150,
+        PhraseFrom150,
+        ConstPhraseFrom150,
+    );
+
+    #[derive(Clone, Debug)]
+    enum QueryAst {
+        Leaf(Leaf),
+        Boolean(Vec<(Occur, QueryAst)>, MinShould),
+    }
+
+    struct Fixture {
+        _index: Index,
+        searcher: Searcher,
+        segments: [u32; 2],
+        leaves: [Box<dyn Query>; Leaf::ALL.len()],
+        leaf_scores: [[Vec<Option<Score>>; 2]; Leaf::ALL.len()],
+    }
+
+    impl Fixture {
+        fn get() -> &'static Self {
+            static FIXTURE: OnceLock<Fixture> = OnceLock::new();
+            FIXTURE.get_or_init(|| {
+                let mut sb = Schema::builder();
+                let text = sb.add_text_field("text", TEXT);
+                let tag = sb.add_text_field("tag", TEXT);
+                let num_opts = NumericOptions::default().set_fast().set_indexed();
+                let num_a = sb.add_i64_field("num_a", num_opts.clone());
+                let num_b = sb.add_i64_field("num_b", num_opts);
+                let index = Index::create_in_ram(sb.build());
+
+                let mut writer: IndexWriter = index.writer_for_tests().unwrap();
+                writer.set_merge_policy(Box::new(NoMergePolicy));
+                for seg in 0..2 {
+                    for i in (seg * DOCS_PER_SEGMENT)..((seg + 1) * DOCS_PER_SEGMENT) {
+                        let mut words = vec!["common"];
+                        if i % 3 == 0 {
+                            words
+                                .extend(std::iter::repeat_n("target", 1 + usize::from(i % 9 == 0)));
+                        }
+                        if i % 7 == 0 {
+                            words
+                                .extend(std::iter::repeat_n("extra", 1 + usize::from(i % 14 == 0)));
+                        }
+                        if matches!(i, 10 | 150 | 260) {
+                            words.push("sparse");
+                        }
+                        let tag_val = if i >= 150 && i % 10 == 0 {
+                            "red apple"
+                        } else {
+                            "apple red"
+                        };
+                        writer
+                            .add_document(doc!(
+                                text => words.join(" "),
+                                tag => tag_val,
+                                num_a => i as i64,
+                                num_b => i as i64,
+                            ))
+                            .unwrap();
+                    }
+                    writer.commit().unwrap();
+                }
+
+                let searcher = index.reader().unwrap().searcher();
+                assert_eq!(searcher.segment_readers().len(), 2);
+
+                let term = |w: &str, opt: IndexRecordOption| -> Box<dyn Query> {
+                    Box::new(TermQuery::new(Term::from_field_text(text, w), opt))
+                };
+                let range_from = |field: Field, lower: i64| -> Box<dyn Query> {
+                    Box::new(RangeQuery::new(
+                        Bound::Included(Term::from_field_i64(field, lower)),
+                        Bound::Unbounded,
+                    ))
+                };
+                let phrase = || {
+                    PhraseQuery::new(vec![
+                        Term::from_field_text(tag, "red"),
+                        Term::from_field_text(tag, "apple"),
+                    ])
+                };
+                let leaves = std::array::from_fn(|idx| -> Box<dyn Query> {
+                    match Leaf::ALL[idx] {
+                        Leaf::Empty => Box::new(EmptyQuery),
+                        Leaf::All => Box::new(AllQuery),
+                        Leaf::ConstAll => Box::new(ConstScoreQuery::new(AllQuery, 1.25)),
+                        Leaf::TermMissing => term("missing", IndexRecordOption::WithFreqs),
+                        Leaf::TermCommon => term("common", IndexRecordOption::WithFreqs),
+                        Leaf::TermTarget => term("target", IndexRecordOption::WithFreqs),
+                        Leaf::TermExtra => term("extra", IndexRecordOption::WithFreqs),
+                        Leaf::TermSparse => {
+                            term("sparse", IndexRecordOption::WithFreqsAndPositions)
+                        }
+                        Leaf::TermBasic => term("target", IndexRecordOption::Basic),
+                        Leaf::TermSet150 => {
+                            Box::new(TermSetQuery::new(vec![Term::from_field_i64(num_a, 150)]))
+                        }
+                        Leaf::RangeAll => range_from(num_a, 0),
+                        Leaf::RangeFrom200 => range_from(num_a, 200),
+                        Leaf::RangeAFrom100 => range_from(num_a, 100),
+                        Leaf::RangeBFrom150 => range_from(num_b, 150),
+                        Leaf::PhraseFrom150 => Box::new(phrase()),
+                        Leaf::ConstPhraseFrom150 => Box::new(ConstScoreQuery::new(phrase(), 0.75)),
+                    }
+                });
+
+                let leaf_scores = std::array::from_fn(|idx| {
+                    let weight = leaves[idx]
+                        .weight(EnableScoring::enabled_from_searcher(&searcher))
+                        .unwrap();
+                    std::array::from_fn(|seg_ord| {
+                        let reader = searcher.segment_reader(seg_ord as u32);
+                        let mut scores = vec![None; reader.max_doc() as usize];
+                        for (doc, score) in collect_scorer(weight.scorer(reader, 1.0).unwrap()) {
+                            scores[doc as usize] = Some(score);
+                        }
+                        scores
+                    })
+                });
+
+                let seg0_min = searcher
+                    .segment_reader(0)
+                    .fast_fields()
+                    .i64("num_a")
+                    .unwrap()
+                    .min_value();
+                let segments = if seg0_min == 0 { [0, 1] } else { [1, 0] };
+                Self {
+                    _index: index,
+                    searcher,
+                    segments,
+                    leaves,
+                    leaf_scores,
+                }
+            })
+        }
+
+        fn leaf(&self, leaf: Leaf) -> Box<dyn Query> {
+            self.leaves[leaf as usize].box_clone()
+        }
+
+        fn segment(&self, coverage: Coverage) -> &SegmentReader {
+            self.searcher
+                .segment_reader(self.segments[coverage as usize])
+        }
+    }
+
+    impl QueryAst {
+        fn to_boolean_query(&self, fixture: &Fixture) -> BooleanQuery {
+            let Self::Boolean(clauses, min_should) = self else {
+                unreachable!("expected Boolean root")
+            };
+            let subqueries = clauses
+                .iter()
+                .map(|(occur, child)| (*occur, child.to_query(fixture)))
+                .collect();
+            match *min_should {
+                MinShould::Default => BooleanQuery::new(subqueries),
+                MinShould::Explicit(n) => {
+                    BooleanQuery::with_minimum_required_clauses(subqueries, n)
+                }
+            }
+        }
+
+        fn to_query(&self, fixture: &Fixture) -> Box<dyn Query> {
+            match self {
+                Self::Leaf(leaf) => fixture.leaf(*leaf),
+                Self::Boolean(..) => Box::new(self.to_boolean_query(fixture)),
+            }
+        }
+
+        fn eval(&self, fixture: &Fixture, addr: DocAddress) -> Option<Score> {
+            let Self::Boolean(clauses, min_should) = self else {
+                let Self::Leaf(leaf) = self else {
+                    unreachable!()
+                };
+                return fixture.leaf_scores[*leaf as usize][addr.segment_ord as usize]
+                    [addr.doc_id as usize];
+            };
+            let (mut num_must, mut num_should, mut matching_should) = (0usize, 0usize, 0usize);
+            let mut total_score: Score = 0.0;
+            for (occur, child) in clauses {
+                let child_score = child.eval(fixture, addr);
+                match occur {
+                    Occur::Must => {
+                        total_score += child_score?;
+                        num_must += 1;
+                    }
+                    Occur::MustNot if child_score.is_some() => return None,
+                    Occur::MustNot => {}
+                    Occur::Should => {
+                        num_should += 1;
+                        if let Some(s) = child_score {
+                            matching_should += 1;
+                            total_score += s;
+                        }
+                    }
+                }
+            }
+            if num_must == 0 && num_should == 0 {
+                return None;
+            }
+            let specified = match *min_should {
+                MinShould::Explicit(n) => n,
+                MinShould::Default => {
+                    let has_must_or_not = clauses
+                        .iter()
+                        .any(|(o, _)| matches!(o, Occur::Must | Occur::MustNot));
+                    usize::from(!has_must_or_not && num_should > 0)
+                }
+            };
+            let effective_min = if specified > 0 {
+                specified
+            } else {
+                usize::from(num_must == 0)
+            };
+            (matching_should >= effective_min).then_some(total_score)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct ExpectedSegment<'a>(&'a [(DocId, Score)]);
+
+    fn collect_scorer(mut scorer: impl Scorer) -> Vec<(DocId, Score)> {
+        let mut out = Vec::new();
+        while scorer.doc() != TERMINATED {
+            out.push((scorer.doc(), scorer.score()));
+            scorer.advance();
+        }
+        out
+    }
+
+    fn assert_segment_out(
+        mode: ScoringMode,
+        actual: &[(DocId, Score)],
+        expected: ExpectedSegment<'_>,
+        ctx: &dyn std::fmt::Debug,
+    ) {
+        assert_eq!(actual.len(), expected.0.len(), "{mode:?} {ctx:?}");
+        for (&(doc, score), &(exp_doc, exp_score)) in actual.iter().zip(expected.0) {
+            assert_eq!(doc, exp_doc, "{mode:?} {ctx:?}");
+            if matches!(mode, ScoringMode::Enabled) {
+                assert!(
+                    (score - exp_score).abs() <= SCORE_TOL,
+                    "doc {doc}: {score} vs {exp_score} for {ctx:?}"
+                );
+            }
+        }
+    }
+
+    fn assert_pruned_subset(
+        actual: &[(DocId, Score)],
+        expected: ExpectedSegment<'_>,
+        threshold: Score,
+        ctx: &dyn std::fmt::Debug,
+    ) {
+        let exp_map: HashMap<DocId, Score> = expected.0.iter().copied().collect();
+        let mut seen = HashSet::with_capacity(actual.len());
+        for &(doc, score) in actual {
+            let exp_score = exp_map[&doc];
+            assert!(
+                (score - exp_score).abs() <= SCORE_TOL && score > threshold - SCORE_TOL,
+                "{ctx:?}"
+            );
+            assert!(seen.insert(doc), "duplicate doc {doc} for {ctx:?}");
+        }
+        for &(doc, exp_score) in expected.0 {
+            if exp_score > threshold + SCORE_TOL {
+                assert!(
+                    seen.contains(&doc),
+                    "missing doc {doc} ({exp_score} > {threshold}) {ctx:?}"
+                );
+            }
+        }
+    }
+
+    /// Verifies agreement across `Searcher` collectors and `Weight` entry points against
+    /// `QueryAst::eval` on both segments.
+    fn assert_query_invariants(fixture: &Fixture, ast: &QueryAst) -> crate::Result<()> {
+        let searcher = &fixture.searcher;
+        let query = ast.to_boolean_query(fixture);
+        let expected: [Vec<(DocId, Score)>; 2] = std::array::from_fn(|seg_ord| {
+            (0..searcher.segment_reader(seg_ord as u32).max_doc())
+                .filter_map(|doc| {
+                    ast.eval(fixture, DocAddress::new(seg_ord as u32, doc))
+                        .map(|score| (doc, score))
+                })
+                .collect()
+        });
+        let global_exp: HashMap<DocAddress, Score> = (0..2)
+            .flat_map(|s| {
+                expected[s]
+                    .iter()
+                    .map(move |&(d, sc)| (DocAddress::new(s as u32, d), sc))
+            })
+            .collect();
+
+        // 1. Searcher-level collectors.
+        let count = searcher.search(&query, &Count)?;
+        assert_eq!(count, global_exp.len(), "{ast:?}");
+        let doc_set = searcher.search(&query, &DocSetCollector)?;
+        assert_eq!(doc_set, global_exp.keys().copied().collect(), "{ast:?}");
+
+        let fruit = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE)?;
+        assert_eq!(fruit.docs().len(), global_exp.len(), "{ast:?}");
+        for (&addr, &score) in fruit.docs().iter().zip(fruit.scores()) {
+            assert!((score - global_exp[&addr]).abs() <= SCORE_TOL, "{ast:?}");
+        }
+
+        let top5 = searcher.search(&query, &TopDocs::with_limit(5).order_by_score())?;
+        assert_eq!(top5.len(), global_exp.len().min(5), "{ast:?}");
+        let top5_addrs: HashSet<DocAddress> = top5.iter().map(|&(_, a)| a).collect();
+        for &(score, addr) in &top5 {
+            assert!((score - global_exp[&addr]).abs() <= SCORE_TOL, "{ast:?}");
+        }
+        if let Some(&(cutoff, _)) = top5.last().filter(|_| global_exp.len() > 5) {
+            for (&addr, &exp_score) in &global_exp {
+                if !top5_addrs.contains(&addr) {
+                    assert!(exp_score <= cutoff + SCORE_TOL, "{ast:?}");
+                }
+            }
+        }
+
+        // 2. Segment-level Weight entry points across scoring and DisjunctionPruning modes.
+        for (seg_ord, reader) in searcher.segment_readers().iter().enumerate() {
+            let seg_exp = ExpectedSegment(&expected[seg_ord]);
+            let exp_docs: Vec<DocId> = seg_exp.0.iter().map(|&(d, _)| d).collect();
+
+            for mode in [ScoringMode::Disabled, ScoringMode::Enabled] {
+                let weight = query.weight(match mode {
+                    ScoringMode::Disabled => EnableScoring::disabled_from_searcher(searcher),
+                    ScoringMode::Enabled => EnableScoring::enabled_from_searcher(searcher),
+                })?;
+                assert_segment_out(
+                    mode,
+                    &collect_scorer(weight.scorer(reader, 1.0)?),
+                    seg_exp,
+                    &ast,
+                );
+                assert_segment_out(
+                    mode,
+                    &collect_scorer(weight.pruning_scorer(reader, 1.0, Score::MIN)?),
+                    seg_exp,
+                    &ast,
+                );
+
+                let mut batch_docs = Vec::new();
+                weight.for_each_no_score_batch(reader, &mut |batch| {
+                    batch.for_each_doc_block(|docs| batch_docs.extend_from_slice(docs));
+                })?;
+                assert_eq!(batch_docs, exp_docs, "{mode:?} {ast:?}");
+
+                let mut cand = weight.scorer_for_candidates_unpositioned(reader, 1.0, 8)?;
+                let (mut cand_out, mut target) = (Vec::new(), cand.doc());
+                while target < reader.max_doc() {
+                    match cand.seek_danger(target) {
+                        SeekDangerResult::Found => {
+                            cand_out.push((target, cand.score()));
+                            target += 1;
+                        }
+                        SeekDangerResult::SeekLowerBound(bound) => target = bound.max(target + 1),
+                    }
+                }
+                assert_segment_out(mode, &cand_out, seg_exp, &ast);
+            }
+
+            if let Some(max_score) = seg_exp.0.iter().map(|&(_, s)| s).reduce(Score::max) {
+                let scored_weight = query.weight(EnableScoring::enabled_from_searcher(searcher))?;
+                for (&(doc, score), &(exp_doc, exp_score)) in
+                    collect_scorer(scored_weight.scorer(reader, 2.0)?)
+                        .iter()
+                        .zip(seg_exp.0)
+                {
+                    assert_eq!(doc, exp_doc, "{ast:?}");
+                    assert!(
+                        (score - 2.0 * exp_score).abs() <= 2.0 * SCORE_TOL,
+                        "{ast:?}"
+                    );
+                }
+
+                // `max_score - 0.25` lies strictly between `term_score` and `term_score +
+                // filter_boost` for constant filters (`>= 0.75`), catching un-subtracted
+                // `filter_boost` thresholds.
+                let threshold = max_score - 0.25;
+                let pruned = collect_scorer(scored_weight.pruning_scorer(reader, 1.0, threshold)?);
+                assert_pruned_subset(&pruned, seg_exp, threshold, &ast);
+
+                for pruning_mode in [
+                    DisjunctionPruning::Auto,
+                    DisjunctionPruning::BlockWand,
+                    DisjunctionPruning::BlockMaxScore,
+                ] {
+                    let mode_weight = query.weight(
+                        EnableScoring::enabled_from_searcher(searcher)
+                            .with_disjunction_pruning(pruning_mode),
+                    )?;
+                    for init in [Score::MIN, threshold] {
+                        let mut out = Vec::new();
+                        mode_weight.for_each_pruning(init, reader, &mut |doc, score| {
+                            out.push((doc, score));
+                            init
+                        })?;
+                        assert_pruned_subset(&out, seg_exp, init, &(&ast, pruning_mode));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn regression_and_single_clause_invariants() -> crate::Result<()> {
+        use Leaf::*;
+        let fixture = Fixture::get();
+        let l = QueryAst::Leaf;
+        let bq = |clauses: Vec<(Occur, QueryAst)>| QueryAst::Boolean(clauses, MinShould::Default);
+        let and = |qs: &[QueryAst]| bq(qs.iter().cloned().map(|q| (Occur::Must, q)).collect());
+        let must_not = |pos, neg| bq(vec![(Occur::Must, pos), (Occur::MustNot, neg)]);
+        let or_leaves = |ls: &[Leaf]| bq(ls.iter().map(|&x| (Occur::Should, l(x))).collect());
+        let filtered_or = |shoulds: &[Leaf], filters: &[Leaf]| {
+            let clauses = shoulds
+                .iter()
+                .map(|&x| (Occur::Should, l(x)))
+                .chain(filters.iter().map(|&x| (Occur::Must, l(x))))
+                .collect();
+            QueryAst::Boolean(clauses, MinShould::Explicit(1))
+        };
+
+        // Exhaustive 0-clause and 1-clause matrix across `Occur` and `minimum_number_should_match`.
+        for min_should in [
+            MinShould::Default,
+            MinShould::Explicit(0),
+            MinShould::Explicit(1),
+            MinShould::Explicit(2),
+            MinShould::Explicit(usize::MAX),
+        ] {
+            assert_query_invariants(fixture, &QueryAst::Boolean(vec![], min_should))?;
+            for &single in Leaf::ALL {
+                for occur in [Occur::Must, Occur::Should, Occur::MustNot] {
+                    let node = QueryAst::Boolean(vec![(occur, l(single))], min_should);
+                    assert_query_invariants(fixture, &node)?;
+                }
+            }
+        }
+
+        // Flattened `target AND (extra OR num_a >= 200)` keeps `AllScorer` in `Should`.
+        let flattened = and(&[l(TermTarget), or_leaves(&[TermExtra, RangeFrom200])]);
+        let (flat_clauses, flat_min) = flattened.to_boolean_query(fixture).flattened_clauses();
+        assert_eq!(flat_min, 1);
+        let should_count = flat_clauses
+            .iter()
+            .filter(|(o, _)| *o == Occur::Should)
+            .count();
+        assert_eq!(should_count, 2);
+
+        let ranges_150 = and(&[l(RangeAFrom100), l(RangeBFrom150)]);
+        let regressions = [
+            flattened,
+            and(&[l(TermTarget), l(RangeFrom200)]),
+            must_not(l(TermTarget), l(RangeFrom200)),
+            must_not(l(TermCommon), l(PhraseFrom150)),
+            must_not(l(TermCommon), ranges_150),
+            and(&[l(TermTarget), l(TermExtra), l(RangeFrom200)]),
+            filtered_or(&[TermTarget, TermExtra], &[RangeFrom200]),
+            and(&[or_leaves(&[TermTarget, TermExtra]), l(RangeFrom200)]),
+            and(&[l(TermTarget), l(RangeAFrom100), l(RangeBFrom150)]),
+            filtered_or(&[TermTarget, TermCommon], &[RangeAFrom100, RangeBFrom150]),
+            and(&[l(TermTarget), l(TermCommon), l(ConstPhraseFrom150)]),
+            filtered_or(&[TermTarget, TermCommon], &[ConstPhraseFrom150]),
+        ];
+        for ast in &regressions {
+            assert_query_invariants(fixture, ast)?;
+        }
+        Ok(())
+    }
+
+    fn arb_boolean_ast() -> impl Strategy<Value = QueryAst> {
+        let occur = prop_oneof![Just(Occur::Must), Just(Occur::Should), Just(Occur::MustNot)];
+        let min_should = prop_oneof![
+            3 => Just(MinShould::Default),
+            1 => Just(MinShould::Explicit(0)),
+            2 => Just(MinShould::Explicit(1)),
+            2 => Just(MinShould::Explicit(2)),
+            1 => Just(MinShould::Explicit(3)),
+            1 => Just(MinShould::Explicit(usize::MAX)),
+        ];
+        let (root_occur, root_min) = (occur.clone(), min_should.clone());
+        let child = prop::sample::select(Leaf::ALL)
+            .prop_map(QueryAst::Leaf)
+            .prop_recursive(3, 24, 5, move |inner| {
+                (
+                    prop::collection::vec((occur.clone(), inner), 0..=5),
+                    min_should.clone(),
+                )
+                    .prop_map(|(c, m)| QueryAst::Boolean(c, m))
+            });
+        (prop::collection::vec((root_occur, child), 0..=5), root_min)
+            .prop_map(|(c, m)| QueryAst::Boolean(c, m))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn proptest_boolean_query_invariants(ast in arb_boolean_ast()) {
+            assert_query_invariants(Fixture::get(), &ast).unwrap();
+        }
+    }
+
+    /// White-box checks for concrete `Scorer` and `PruningScorer` specializations.
+    #[test]
+    fn pruning_and_segment_scorer_specializations() -> crate::Result<()> {
+        use Leaf::*;
+        use Occur::{Must, MustNot, Should};
+        let fixture = Fixture::get();
+        let searcher = &fixture.searcher;
+        let partial = fixture.segment(Coverage::Partial);
+        let full = fixture.segment(Coverage::Full);
+        let bq = |clauses: &[(Occur, Leaf)]| {
+            BooleanQuery::new(clauses.iter().map(|&(o, l)| (o, fixture.leaf(l))).collect())
+        };
+
+        let range_weight = fixture
+            .leaf(RangeFrom200)
+            .weight(EnableScoring::enabled_from_searcher(searcher))?;
+        assert!(range_weight.scorer(full, 1.0)?.is::<AllScorer>());
+        assert!(!range_weight.scorer(partial, 1.0)?.is::<AllScorer>());
+
+        let must_not_range = bq(&[(Must, TermTarget), (MustNot, RangeFrom200)]);
+        for scoring in [
+            EnableScoring::enabled_from_searcher(searcher),
+            EnableScoring::disabled_from_searcher(searcher),
+        ] {
+            let weight = must_not_range.weight(scoring)?;
+            assert!(weight.scorer(full, 1.0)?.is::<EmptyScorer>());
+            assert!(!weight.scorer(partial, 1.0)?.is::<EmptyScorer>());
+        }
+
+        // Multi-block skipping: `sparse` matches {10, 150, 260}; `num_a >= 100` skips 10.
+        let mut skip_pruning = bq(&[(Must, TermSparse), (Must, RangeAFrom100)])
+            .weight(EnableScoring::enabled_from_searcher(searcher))?
+            .pruning_scorer(partial, 1.0, 0.0)?;
+        assert!(skip_pruning.is::<BlockWandSingleScorer>());
+        assert_eq!(skip_pruning.doc(), 150);
+        assert_eq!(skip_pruning.advance(), 260);
+        assert_eq!(skip_pruning.advance(), TERMINATED);
+
+        let filtered_shapes = |filter: Leaf| {
+            let single = bq(&[(Must, TermTarget), (Must, filter)]);
+            let union = BooleanQuery::with_minimum_required_clauses(
+                vec![
+                    (Should, fixture.leaf(TermTarget)),
+                    (Should, fixture.leaf(TermExtra)),
+                    (Must, fixture.leaf(filter)),
+                ],
+                1,
+            );
+            let intersection = bq(&[(Must, TermTarget), (Must, TermExtra), (Must, filter)]);
+            (single, union, intersection)
+        };
+
+        for (name, reader, filter) in [
+            ("TermSetQuery", partial, TermSet150),
+            ("RangeQuery(partial)", partial, RangeFrom200),
+            ("RangeQuery(AllScorer)", full, RangeFrom200),
+            ("ConstScoreQuery", partial, ConstPhraseFrom150),
+        ] {
+            let (single, union, intersection) = filtered_shapes(filter);
+            let enabled = |q: &BooleanQuery| {
+                q.weight(EnableScoring::enabled_from_searcher(searcher))?
+                    .pruning_scorer(reader, 1.0, 0.0)
+            };
+            assert!(
+                enabled(&single)?.is::<BlockWandSingleScorer>(),
+                "{name} single"
+            );
+            assert!(
+                enabled(&union)?.is::<BlockWandUnionScorer>(),
+                "{name} union"
+            );
+            assert!(
+                enabled(&intersection)?.is::<BlockWandIntersectionScorer>(),
+                "{name} intersection"
+            );
+            let disabled = single
+                .weight(EnableScoring::disabled_from_searcher(searcher))?
+                .pruning_scorer(reader, 1.0, 0.0)?;
+            assert!(disabled.is::<BasicPruningScorer>(), "{name} disabled");
+        }
+
+        let (dyn_single, dyn_union, dyn_intersection) = filtered_shapes(PhraseFrom150);
+        let phrase_main = bq(&[(Must, PhraseFrom150), (Must, TermSet150)]);
+        for (label, query) in [
+            ("dyn_single", &dyn_single),
+            ("dyn_union", &dyn_union),
+            ("dyn_intersection", &dyn_intersection),
+            ("phrase_main", &phrase_main),
+        ] {
+            let s = query
+                .weight(EnableScoring::enabled_from_searcher(searcher))?
+                .pruning_scorer(partial, 1.0, 0.0)?;
+            assert!(s.is::<BasicPruningScorer>(), "{label}");
+        }
+        Ok(())
     }
 }
