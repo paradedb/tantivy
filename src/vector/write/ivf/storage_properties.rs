@@ -832,7 +832,7 @@ fn merge_source_addresses_case(schedule: &[u8]) -> crate::Result<()> {
         .map(|doc| crate::DocAddress::new(0, doc))
         .collect();
     let mapping =
-        SegmentDocIdMapping::new(docs.clone(), MappingType::StackedWithDeletes, vec![None]);
+        SegmentDocIdMapping::new_global(&docs, MappingType::StackedWithDeletes, &[None]);
     let target = index.new_segment();
     let schema = index.schema();
     let context = crate::plugin::PluginMergeContext {

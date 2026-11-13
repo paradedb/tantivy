@@ -138,7 +138,7 @@ pub struct PluginWriterContext<'a> {
 /// Context provided to [`SegmentPlugin::merge`].
 pub struct PluginMergeContext<'a> {
     pub readers: &'a [SegmentReader],
-    pub doc_id_mapping: &'a SegmentDocIdMapping,
+    pub doc_id_mapping: &'a SegmentDocIdMapping<'a>,
     pub target_segment: &'a Segment,
     pub schema: &'a Schema,
     pub settings: &'a IndexSettings,

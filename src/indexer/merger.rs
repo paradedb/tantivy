@@ -1,12 +1,15 @@
+use std::cmp::Reverse;
 use std::sync::Arc;
 
+use allocator_api2::alloc::{Allocator, Global};
+use allocator_api2::vec::Vec as AllocVec;
 use columnar::{compute_merged_term_ord_mapping, BytesColumn, Column};
 use common::ReadOnlyBitSet;
 use itertools::Itertools;
 
 use crate::fastfield::{AliveBitSet, FastFieldNotAvailableError};
-use crate::index::{builtin_plugins, Segment, SegmentReader};
-use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
+use crate::index::{Segment, SegmentReader, BUILTIN_PLUGIN_REFS};
+use crate::indexer::doc_id_mapping::{MappingType, MergeAllocator, SegmentDocIdMapping};
 use crate::indexer::segment_updater::CancelSentinel;
 use crate::plugin::{PluginMergeContext, SegmentPlugin};
 use crate::schema::{Schema, Type};
@@ -42,9 +45,9 @@ impl StrBytesSortFieldAccessor {
 /// - `StrBytes`: ordinal-based access — each segment's local term ordinals are remapped to merged
 ///   global ordinals so that cross-segment lexicographic comparison works without loading term
 ///   bytes.
-enum ReaderSortFieldAccessors {
-    Numeric(Vec<(SegmentOrdinal, Column<u64>)>),
-    StrBytes(Vec<(SegmentOrdinal, StrBytesSortFieldAccessor)>),
+enum ReaderSortFieldAccessors<A: Allocator> {
+    Numeric(AllocVec<(SegmentOrdinal, Column<u64>), A>),
+    StrBytes(AllocVec<(SegmentOrdinal, StrBytesSortFieldAccessor), A>),
 }
 
 /// Segment's max doc must be `< MAX_DOC_LIMIT`.
@@ -52,17 +55,72 @@ enum ReaderSortFieldAccessors {
 /// We do not allow segments with more than
 pub const MAX_DOC_LIMIT: u32 = 1 << 31;
 
-pub struct IndexMerger {
+/// Merges a set of segments into a single new segment.
+///
+/// The merger is generic over the allocator `A` used for every heap allocation it makes
+/// itself: the reader list, the sort accessors, the k-way merge heap, and the doc id mapping
+/// handed to the plugins. Allocations made by collaborators (opening a [`SegmentReader`],
+/// the plugins' own merge logic, `columnar`'s term-ordinal merge, error messages) are outside
+/// the merger's control and keep using the global allocator.
+pub struct IndexMerger<A: Allocator = Global> {
     index_settings: IndexSettings,
     schema: Schema,
-    pub(crate) readers: Vec<SegmentReader>,
+    pub(crate) readers: AllocVec<SegmentReader, A>,
     max_doc: u32,
-    custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
+    custom_plugins: AllocVec<Arc<dyn SegmentPlugin>, A>,
     cancel: Box<dyn CancelSentinel>,
     ignore_store: bool,
+    alloc: A,
 }
 
 impl IndexMerger {
+    /// Opens a merger that allocates from the global allocator.
+    pub fn open(
+        schema: Schema,
+        index_settings: IndexSettings,
+        segments: &[Segment],
+        cancel: Box<dyn CancelSentinel>,
+        ignore_store: bool,
+    ) -> crate::Result<IndexMerger> {
+        Self::open_in(
+            schema,
+            index_settings,
+            segments,
+            cancel,
+            ignore_store,
+            Global,
+        )
+    }
+
+    /// Opens a merger with a custom alive set, allocating from the global allocator.
+    ///
+    /// See [`IndexMerger::open_with_custom_alive_set_in`].
+    pub fn open_with_custom_alive_set(
+        schema: Schema,
+        index_settings: IndexSettings,
+        segments: &[Segment],
+        alive_bitset_opt: Vec<Option<AliveBitSet>>,
+        cancel: Box<dyn CancelSentinel>,
+        ignore_store: bool,
+    ) -> crate::Result<IndexMerger> {
+        Self::open_with_custom_alive_set_in(
+            schema,
+            index_settings,
+            segments,
+            alive_bitset_opt,
+            cancel,
+            ignore_store,
+            Global,
+        )
+    }
+}
+
+impl<A: Allocator + Clone + Sync> IndexMerger<A> {
+    /// The allocator as handed to [`SegmentDocIdMapping`], which plugins see type-erased.
+    fn erased_alloc(&self) -> MergeAllocator<'_> {
+        &self.alloc
+    }
+
     fn total_num_new_docs(&self) -> usize {
         self.readers
             .iter()
@@ -70,15 +128,14 @@ impl IndexMerger {
             .sum()
     }
 
-    fn collect_alive_bitsets(&self) -> Vec<Option<ReadOnlyBitSet>> {
-        self.readers
-            .iter()
-            .map(|reader| {
-                reader
-                    .alive_bitset()
-                    .map(|alive_bitset| alive_bitset.bitset().clone())
-            })
-            .collect()
+    fn collect_alive_bitsets(&self) -> AllocVec<Option<ReadOnlyBitSet>, MergeAllocator<'_>> {
+        let mut alive_bitsets = AllocVec::with_capacity_in(self.readers.len(), self.erased_alloc());
+        alive_bitsets.extend(self.readers.iter().map(|reader| {
+            reader
+                .alive_bitset()
+                .map(|alive_bitset| alive_bitset.bitset().clone())
+        }));
+        alive_bitsets
     }
 
     /// Column cardinality metadata (`Optional`) covers all docs including deleted ones.
@@ -98,21 +155,23 @@ impl IndexMerger {
             .any(|doc_id| col.first(doc_id).is_none())
     }
 
-    pub fn open(
+    /// Opens a merger whose heap allocations go through `alloc`.
+    pub fn open_in(
         schema: Schema,
         index_settings: IndexSettings,
         segments: &[Segment],
         cancel: Box<dyn CancelSentinel>,
         ignore_store: bool,
-    ) -> crate::Result<IndexMerger> {
-        let alive_bitset = segments.iter().map(|_| None).collect_vec();
-        Self::open_with_custom_alive_set(
+        alloc: A,
+    ) -> crate::Result<IndexMerger<A>> {
+        Self::open_with_custom_alive_set_in(
             schema,
             index_settings,
             segments,
-            alive_bitset,
+            segments.iter().map(|_| None),
             cancel,
             ignore_store,
+            alloc,
         )
     }
 
@@ -128,15 +187,18 @@ impl IndexMerger {
     // This can be used to merge but also apply an additional filter.
     // One use case is demux, which is basically taking a list of
     // segments and partitions them e.g. by a value in a field.
-    pub fn open_with_custom_alive_set(
+    //
+    // Heap allocations made by the merger go through `alloc`.
+    pub fn open_with_custom_alive_set_in(
         schema: Schema,
         index_settings: IndexSettings,
         segments: &[Segment],
-        alive_bitset_opt: Vec<Option<AliveBitSet>>,
+        alive_bitset_opt: impl IntoIterator<Item = Option<AliveBitSet>>,
         cancel: Box<dyn CancelSentinel>,
         ignore_store: bool,
-    ) -> crate::Result<IndexMerger> {
-        let mut readers = vec![];
+        alloc: A,
+    ) -> crate::Result<IndexMerger<A>> {
+        let mut readers = AllocVec::with_capacity_in(segments.len(), alloc.clone());
         for (segment, new_alive_bitset_opt) in segments.iter().zip(alive_bitset_opt) {
             if segment.meta().num_docs() > 0 {
                 let reader =
@@ -150,7 +212,8 @@ impl IndexMerger {
             let schema_field = schema.get_field(&sort_by_field.field)?;
             let field_entry = schema.get_field_entry(schema_field);
             let field_type = field_entry.field_type().value_type();
-            readers = Self::sort_readers_by_min_sort_field(readers, sort_by_field, field_type)?;
+            readers =
+                Self::sort_readers_by_min_sort_field(readers, sort_by_field, field_type, &alloc)?;
         }
         // sort segments by their natural sort setting
         if max_doc >= MAX_DOC_LIMIT {
@@ -164,7 +227,8 @@ impl IndexMerger {
         // segment must register the same set — otherwise a later segment's custom component
         // would be silently dropped, or the first index's plugin would read a component the
         // later segment lacks. Fail closed on any mismatch.
-        let custom_plugins = if let Some(first_segment) = segments.first() {
+        let mut custom_plugins = AllocVec::new_in(alloc.clone());
+        if let Some(first_segment) = segments.first() {
             let expected = first_segment.index().custom_extensions();
             for segment in &segments[1..] {
                 if segment.index().custom_extensions() != expected {
@@ -175,10 +239,8 @@ impl IndexMerger {
                     ));
                 }
             }
-            first_segment.index().custom_plugins().to_vec()
-        } else {
-            Vec::new()
-        };
+            custom_plugins.extend_from_slice(first_segment.index().custom_plugins());
+        }
 
         Ok(IndexMerger {
             index_settings,
@@ -188,6 +250,7 @@ impl IndexMerger {
             custom_plugins,
             cancel,
             ignore_store,
+            alloc,
         })
     }
 
@@ -203,10 +266,11 @@ impl IndexMerger {
     }
 
     fn sort_readers_by_min_sort_field(
-        readers: Vec<SegmentReader>,
+        readers: AllocVec<SegmentReader, A>,
         sort_by_field: &IndexSortByField,
         field_type: Type,
-    ) -> crate::Result<Vec<SegmentReader>> {
+        alloc: &A,
+    ) -> crate::Result<AllocVec<SegmentReader, A>> {
         if matches!(field_type, Type::Str | Type::Bytes) {
             // Ordinals are per-segment and not directly comparable, so the "disjunct min/max"
             // shortcut that works for numeric fields does not apply here.
@@ -215,22 +279,29 @@ impl IndexMerger {
 
         // presort the readers by their min_values, so that when they are disjunct, we can use
         // the regular merge logic (implicitly sorted)
-        let mut readers_with_min_sort_values = readers
-            .into_iter()
-            .map(|reader| {
-                let accessor = Self::get_numeric_accessor(&reader, sort_by_field)?;
-                Ok((reader, accessor.min_value()))
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
-        if sort_by_field.order.is_asc() {
-            readers_with_min_sort_values.sort_by_key(|(_, min_val)| *min_val);
-        } else {
-            readers_with_min_sort_values.sort_by_key(|(_, min_val)| std::cmp::Reverse(*min_val));
+        let mut readers_with_min_sort_values =
+            AllocVec::with_capacity_in(readers.len(), alloc.clone());
+        for (ordinal, reader) in readers.into_iter().enumerate() {
+            let min_value = Self::get_numeric_accessor(&reader, sort_by_field)?.min_value();
+            readers_with_min_sort_values.push((reader, min_value, ordinal));
         }
-        Ok(readers_with_min_sort_values
-            .into_iter()
-            .map(|(reader, _)| reader)
-            .collect())
+        // Stable sorts allocate a scratch buffer from the global allocator, so sort unstably
+        // with the original position as a tie-breaker, which yields the same order.
+        if sort_by_field.order.is_asc() {
+            readers_with_min_sort_values
+                .sort_unstable_by_key(|(_, min_val, ordinal)| (*min_val, *ordinal));
+        } else {
+            readers_with_min_sort_values
+                .sort_unstable_by_key(|(_, min_val, ordinal)| (Reverse(*min_val), *ordinal));
+        }
+        let mut sorted_readers =
+            AllocVec::with_capacity_in(readers_with_min_sort_values.len(), alloc.clone());
+        sorted_readers.extend(
+            readers_with_min_sort_values
+                .into_iter()
+                .map(|(reader, _, _)| reader),
+        );
+        Ok(sorted_readers)
     }
 
     /// Checks if segments can use the fast disjunct-stack path (byte concatenation)
@@ -312,30 +383,36 @@ impl IndexMerger {
         &self,
         sort_by_field: &IndexSortByField,
         field_type: Type,
-    ) -> crate::Result<Vec<(SegmentOrdinal, StrBytesSortFieldAccessor)>> {
-        let bytes_columns = self
-            .readers
-            .iter()
-            .map(|reader| Self::get_str_bytes_column(reader, sort_by_field, field_type))
-            .collect::<crate::Result<Vec<_>>>()?;
+    ) -> crate::Result<AllocVec<(SegmentOrdinal, StrBytesSortFieldAccessor), A>> {
+        let mut bytes_columns = AllocVec::with_capacity_in(self.readers.len(), self.alloc.clone());
+        for reader in self.readers.iter() {
+            bytes_columns.push(Self::get_str_bytes_column(
+                reader,
+                sort_by_field,
+                field_type,
+            )?);
+        }
+        // `columnar` allocates the merged mappings from the global allocator.
         let merged_term_ord_mappings = compute_merged_term_ord_mapping(&bytes_columns)?;
         debug_assert_eq!(bytes_columns.len(), merged_term_ord_mappings.len());
-        let accessors = bytes_columns
-            .into_iter()
-            .zip(merged_term_ord_mappings)
-            .enumerate()
-            .map(
-                |(reader_ordinal, (bytes_column, merged_term_ord_mapping))| {
-                    (
-                        reader_ordinal as SegmentOrdinal,
-                        StrBytesSortFieldAccessor {
-                            ords: bytes_column.ords().clone(),
-                            merged_term_ord_mapping,
-                        },
-                    )
-                },
-            )
-            .collect::<Vec<_>>();
+        let mut accessors = AllocVec::with_capacity_in(bytes_columns.len(), self.alloc.clone());
+        accessors.extend(
+            bytes_columns
+                .into_iter()
+                .zip(merged_term_ord_mappings)
+                .enumerate()
+                .map(
+                    |(reader_ordinal, (bytes_column, merged_term_ord_mapping))| {
+                        (
+                            reader_ordinal as SegmentOrdinal,
+                            StrBytesSortFieldAccessor {
+                                ords: bytes_column.ords().clone(),
+                                merged_term_ord_mapping,
+                            },
+                        )
+                    },
+                ),
+        );
         Ok(accessors)
     }
 
@@ -360,17 +437,16 @@ impl IndexMerger {
     fn get_numeric_accessors(
         &self,
         sort_by_field: &IndexSortByField,
-    ) -> crate::Result<Vec<(SegmentOrdinal, Column<u64>)>> {
-        self.readers
-            .iter()
-            .enumerate()
-            .map(|(reader_ordinal, reader)| {
-                let reader_ordinal = reader_ordinal as SegmentOrdinal;
-                let accessor = Self::get_numeric_accessor(reader, sort_by_field)?;
-                Ok((reader_ordinal, accessor))
-            })
-            .collect::<crate::Result<Vec<_>>>()
+    ) -> crate::Result<AllocVec<(SegmentOrdinal, Column<u64>), A>> {
+        let mut accessors = AllocVec::with_capacity_in(self.readers.len(), self.alloc.clone());
+        for (reader_ordinal, reader) in self.readers.iter().enumerate() {
+            let reader_ordinal = reader_ordinal as SegmentOrdinal;
+            let accessor = Self::get_numeric_accessor(reader, sort_by_field)?;
+            accessors.push((reader_ordinal, accessor));
+        }
+        Ok(accessors)
     }
+
     /// Builds owned per-segment sort accessors so they stay alive during merge.
     ///
     /// Dispatches on the sort field's value type: numeric types use direct column value access,
@@ -379,7 +455,7 @@ impl IndexMerger {
     fn get_reader_with_sort_field_accessor(
         &self,
         sort_by_field: &IndexSortByField,
-    ) -> crate::Result<ReaderSortFieldAccessors> {
+    ) -> crate::Result<ReaderSortFieldAccessors<A>> {
         let field_type = self.sort_by_field_type(sort_by_field)?;
 
         if matches!(field_type, Type::Str | Type::Bytes) {
@@ -394,8 +470,8 @@ impl IndexMerger {
     fn extend_sorted_doc_ids<T, F>(
         &self,
         reader_ordinal_and_field_accessors: &[(SegmentOrdinal, T)],
-        mut is_less: F,
-        sorted_doc_ids: &mut Vec<DocAddress>,
+        is_less: F,
+        sorted_doc_ids: &mut AllocVec<DocAddress, MergeAllocator<'_>>,
     ) where
         F: FnMut(&(DocId, &SegmentOrdinal, &T), &(DocId, &SegmentOrdinal, &T)) -> bool,
     {
@@ -409,13 +485,12 @@ impl IndexMerger {
                         .map(move |doc_id| (doc_id, reader_ord, ff_reader))
                 });
         sorted_doc_ids.extend(
-            doc_id_reader_pair
-                .into_iter()
-                .kmerge_by(|a, b| is_less(a, b))
-                .map(|(doc_id, &segment_ord, _)| DocAddress {
+            KMergeByIn::new(doc_id_reader_pair, is_less, self.alloc.clone()).map(
+                |(doc_id, &segment_ord, _)| DocAddress {
                     doc_id,
                     segment_ord,
-                }),
+                },
+            ),
         );
     }
 
@@ -426,13 +501,14 @@ impl IndexMerger {
     pub(crate) fn generate_doc_id_mapping_with_sort_by_field(
         &self,
         sort_by_field: &IndexSortByField,
-    ) -> crate::Result<SegmentDocIdMapping> {
+    ) -> crate::Result<SegmentDocIdMapping<'_>> {
         let sort_field_accessors = self.get_reader_with_sort_field_accessor(sort_by_field)?;
         // Loading the field accessor on demand causes a 15x regression
 
         let total_num_new_docs = self.total_num_new_docs();
 
-        let mut sorted_doc_ids: Vec<DocAddress> = Vec::with_capacity(total_num_new_docs);
+        let mut sorted_doc_ids =
+            AllocVec::with_capacity_in(total_num_new_docs, self.erased_alloc());
 
         // K-way merge of alive doc ids across segments, ordered by the sort field.
         //
@@ -486,10 +562,12 @@ impl IndexMerger {
 
     /// Creates a mapping if the segments are stacked. this is helpful to merge codelines between
     /// index sorting and the others
-    pub(crate) fn get_doc_id_from_concatenated_data(&self) -> crate::Result<SegmentDocIdMapping> {
+    pub(crate) fn get_doc_id_from_concatenated_data(
+        &self,
+    ) -> crate::Result<SegmentDocIdMapping<'_>> {
         let total_num_new_docs = self.total_num_new_docs();
 
-        let mut mapping: Vec<DocAddress> = Vec::with_capacity(total_num_new_docs);
+        let mut mapping = AllocVec::with_capacity_in(total_num_new_docs, self.erased_alloc());
 
         mapping.extend(
             self.readers
@@ -538,10 +616,12 @@ impl IndexMerger {
 
         // Merge plugins in write order (matching `Index::all_plugins`):
         // inverted index, then fast_fields, store, and custom plugins.
-        for plugin in builtin_plugins()
-            .into_iter()
-            .chain(self.custom_plugins.iter().cloned())
-        {
+        // The built-ins are iterated as static references to avoid allocating them.
+        let custom_plugins = self
+            .custom_plugins
+            .iter()
+            .map(|plugin| -> &dyn SegmentPlugin { &**plugin });
+        for plugin in BUILTIN_PLUGIN_REFS.into_iter().chain(custom_plugins) {
             debug!("merge-plugin: {:?}", plugin.extensions());
             plugin.merge(PluginMergeContext {
                 readers: &self.readers,
@@ -558,8 +638,101 @@ impl IndexMerger {
     }
 }
 
+/// One input of [`KMergeByIn`]: its current head and the rest of the iterator.
+struct HeadTail<I: Iterator> {
+    head: I::Item,
+    tail: I,
+}
+
+impl<I: Iterator> HeadTail<I> {
+    fn new(mut it: I) -> Option<Self> {
+        let head = it.next();
+        head.map(|head| Self { head, tail: it })
+    }
+
+    fn next(&mut self) -> Option<I::Item> {
+        let next = self.tail.next()?;
+        Some(std::mem::replace(&mut self.head, next))
+    }
+}
+
+/// Sift down the element at `index` (`heap` is a min-heap w.r.t. `less_than`).
+fn sift_down<T>(heap: &mut [T], index: usize, mut less_than: impl FnMut(&T, &T) -> bool) {
+    debug_assert!(index <= heap.len());
+    let mut pos = index;
+    let mut child = 2 * pos + 1;
+    while child + 1 < heap.len() {
+        // pick the smaller of the two children
+        child += less_than(&heap[child + 1], &heap[child]) as usize;
+        if !less_than(&heap[child], &heap[pos]) {
+            return;
+        }
+        heap.swap(pos, child);
+        pos = child;
+        child = 2 * pos + 1;
+    }
+    // The last (left) child may be an only child.
+    if child + 1 == heap.len() && less_than(&heap[child], &heap[pos]) {
+        heap.swap(pos, child);
+    }
+}
+
+/// K-way merge whose heap is allocated from `A`.
+///
+/// A port of `itertools::kmerge_by` (which always allocates from the global allocator) that
+/// produces exactly the same order, including for ties, so merge output is unchanged.
+struct KMergeByIn<I: Iterator, F, A: Allocator> {
+    heap: AllocVec<HeadTail<I>, A>,
+    less_than: F,
+}
+
+impl<I, F, A> KMergeByIn<I, F, A>
+where
+    I: Iterator,
+    F: FnMut(&I::Item, &I::Item) -> bool,
+    A: Allocator,
+{
+    fn new(iters: impl IntoIterator<Item = I>, mut less_than: F, alloc: A) -> Self {
+        let iters = iters.into_iter();
+        let mut heap = AllocVec::with_capacity_in(iters.size_hint().0, alloc);
+        heap.extend(iters.filter_map(HeadTail::new));
+        for i in (0..heap.len() / 2).rev() {
+            sift_down(&mut heap, i, |a, b| less_than(&a.head, &b.head));
+        }
+        Self { heap, less_than }
+    }
+}
+
+impl<I, F, A> Iterator for KMergeByIn<I, F, A>
+where
+    I: Iterator,
+    F: FnMut(&I::Item, &I::Item) -> bool,
+    A: Allocator,
+{
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<I::Item> {
+        if self.heap.is_empty() {
+            return None;
+        }
+        let result = if let Some(next) = self.heap[0].next() {
+            next
+        } else {
+            self.heap.swap_remove(0).head
+        };
+        let less_than = &mut self.less_than;
+        sift_down(&mut self.heap, 0, |a, b| less_than(&a.head, &b.head));
+        Some(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::ptr::NonNull;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+
+    use allocator_api2::alloc::{AllocError, Allocator, Global, Layout};
     use columnar::Column;
     use proptest::prop_oneof;
     use proptest::strategy::Strategy;
@@ -570,6 +743,7 @@ mod tests {
     };
     use crate::collector::{Count, FacetCollector};
     use crate::index::{Index, SegmentId};
+    use crate::indexer::merger::IndexMerger;
     use crate::indexer::NoMergePolicy;
     use crate::query::{AllQuery, BooleanQuery, EnableScoring, Scorer, TermQuery};
     use crate::schema::{
@@ -1845,6 +2019,92 @@ mod tests {
         let searcher = reader.searcher();
         assert_eq!(searcher.num_docs(), 200);
 
+        Ok(())
+    }
+
+    /// Allocator that forwards to `Global` and counts what goes through it.
+    #[derive(Clone, Default)]
+    struct CountingAlloc {
+        num_allocs: Arc<AtomicUsize>,
+        live_bytes: Arc<AtomicUsize>,
+    }
+
+    unsafe impl Allocator for CountingAlloc {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            self.num_allocs.fetch_add(1, AtomicOrdering::Relaxed);
+            self.live_bytes
+                .fetch_add(layout.size(), AtomicOrdering::Relaxed);
+            Global.allocate(layout)
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            self.live_bytes
+                .fetch_sub(layout.size(), AtomicOrdering::Relaxed);
+            unsafe { Global.deallocate(ptr, layout) }
+        }
+    }
+
+    #[test]
+    fn test_index_merger_uses_custom_allocator() -> crate::Result<()> {
+        let mut schema_builder = schema::Schema::builder();
+        let int_field = schema_builder.add_u64_field("intval", FAST);
+        let sort_by_field = IndexSortByField {
+            field: "intval".to_string(),
+            order: Order::Asc,
+        };
+        let index = Index::builder()
+            .schema(schema_builder.build())
+            .settings(IndexSettings {
+                sort_by_field: Some(sort_by_field.clone()),
+                ..IndexSettings::default()
+            })
+            .create_in_ram()?;
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            index_writer.set_merge_policy(Box::new(NoMergePolicy));
+            // Interleaved values across segments force the k-way merge path.
+            for segment in 0u64..3 {
+                for i in 0u64..50 {
+                    index_writer.add_document(doc!(int_field => i * 3 + segment))?;
+                }
+                index_writer.commit()?;
+            }
+        }
+        let segments = index.searchable_segments()?;
+        assert_eq!(segments.len(), 3);
+
+        let alloc = CountingAlloc::default();
+        let merger = IndexMerger::open_in(
+            index.schema(),
+            index.settings().clone(),
+            &segments,
+            Box::new(|| false),
+            false,
+            alloc.clone(),
+        )?;
+        let global_merger = IndexMerger::open(
+            index.schema(),
+            index.settings().clone(),
+            &segments,
+            Box::new(|| false),
+            false,
+        )?;
+        assert!(alloc.num_allocs.load(AtomicOrdering::Relaxed) > 0);
+
+        let allocs_before_mapping = alloc.num_allocs.load(AtomicOrdering::Relaxed);
+        let mapping = merger.generate_doc_id_mapping_with_sort_by_field(&sort_by_field)?;
+        assert!(alloc.num_allocs.load(AtomicOrdering::Relaxed) > allocs_before_mapping);
+        let global_mapping =
+            global_merger.generate_doc_id_mapping_with_sort_by_field(&sort_by_field)?;
+        assert_eq!(
+            mapping.iter_old_doc_addrs().collect::<Vec<_>>(),
+            global_mapping.iter_old_doc_addrs().collect::<Vec<_>>()
+        );
+        drop(mapping);
+
+        assert_eq!(merger.write(&index.new_segment())?, 150);
+        drop(merger);
+        assert_eq!(alloc.live_bytes.load(AtomicOrdering::Relaxed), 0);
         Ok(())
     }
 }
