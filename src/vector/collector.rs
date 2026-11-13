@@ -891,7 +891,7 @@ where
             };
             let config = ScanConfig {
                 adaptive_probing: matches!(&plan, ScanInput::Routed { .. })
-                    .then_some(collector.probe_params.adaptive_probing())
+                    .then_some(collector.probe_params.adaptive_probing)
                     .flatten(),
                 source_may_repeat_docs: matches!(&plan, ScanInput::Routed { .. }),
                 top_n,
@@ -2500,19 +2500,11 @@ mod ivf_e2e_tests {
                 let charged = result.stats.iter().map(|s| s.work_charged).sum::<f32>();
                 assert_eq!(result.results.len(), 10);
                 assert!(charged >= 0.05 * max_probe as f32);
-                if max_probe < 50 {
-                    assert!(charged >= max_probe as f32);
-                    assert!(result
-                        .stats
-                        .iter()
-                        .all(|s| s.termination != ProbeTermination::QuantizedRecall));
-                } else {
-                    assert!(charged < max_probe as f32);
-                    assert!(result
-                        .stats
-                        .iter()
-                        .all(|s| s.termination == ProbeTermination::QuantizedRecall));
-                }
+                assert!(charged < max_probe as f32);
+                assert!(result
+                    .stats
+                    .iter()
+                    .all(|s| s.termination == ProbeTermination::QuantizedRecall));
                 work.push(charged);
             }
             assert!(work[3] > work[2], "{segments} segments: {work:?}");
