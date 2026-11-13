@@ -79,7 +79,8 @@ pub(crate) fn located_cap(
 
 // --- Filter ---
 
-/// Drains the filter `DocSet` once, in ascending doc order, keeping up to `cap` matches as a list.
+/// Uses candidate checks when requested and supported; otherwise drains the filter `DocSet`
+/// once, in ascending doc order, keeping up to `cap` matches as a list.
 ///
 /// The first match past `cap` moves the list into a bitset and the drain continues there. A
 /// match-all scorer, or a drain that matches every doc, routes unfiltered. The bitset allocates
@@ -90,7 +91,20 @@ pub(crate) fn collect_segment_filter(
     segment_reader: &SegmentReader,
     max_doc: DocId,
     cap: usize,
+    candidate_match_fraction: Option<f64>,
 ) -> crate::Result<Source> {
+    if let Some(match_fraction) = candidate_match_fraction {
+        match weight.candidate_filter(segment_reader)? {
+            Some(crate::query::CandidateFilter::All) => return Ok(Source::Router(DocFilter::All)),
+            Some(filter) => {
+                return Ok(Source::Router(DocFilter::Direct {
+                    filter,
+                    match_fraction,
+                }))
+            }
+            None => {}
+        }
+    }
     let mut scorer = weight.scorer(segment_reader, 1.0)?;
     if scorer.is::<AllScorer>() {
         return Ok(Source::Router(DocFilter::All));
@@ -136,6 +150,198 @@ mod tests {
     use crate::vector::stats::AccessPath;
     use crate::vector::test_support::{first_segment, DocsWeight, FixtureSpec};
     use crate::vector::tests::exhaustive_params;
+
+    #[test]
+    fn candidate_ranges_preserve_filter_and_vector_results() -> crate::Result<()> {
+        use std::ops::Bound::{Excluded, Included};
+        use std::sync::Arc;
+
+        use crate::collector::TopDocs;
+        use crate::index::IndexSettings;
+        use crate::indexer::NoMergePolicy;
+        use crate::query::{EnableScoring, RangeQuery};
+        use crate::schema::{Schema, VectorOptions, FAST, INDEXED};
+        use crate::vector::search::input::PreparedVectorSearch;
+        use crate::vector::search::source::router::RowGate;
+        use crate::vector::test_support::NearestClusterer;
+        use crate::vector::{ProbeParams, RouterKind, VectorSearchBudget, VectorSegment};
+        use crate::{DateTime, Index, IndexWriter, TantivyDocument, Term};
+
+        let mut schema = Schema::builder();
+        let id = schema.add_u64_field("id", FAST | INDEXED);
+        let signed = schema.add_i64_field("signed", FAST);
+        let float = schema.add_f64_field("float", FAST);
+        let date = schema.add_date_field("date", FAST);
+        let vector = schema.add_vector_field("vector", VectorOptions::new(2, Metric::L2));
+        let index = Index::builder()
+            .schema(schema.build())
+            .settings(IndexSettings {
+                vector_clustering_threshold: 1,
+                ..Default::default()
+            })
+            .ivf_clusterer(Arc::new(NearestClusterer {
+                centroids: (0..200).map(|i| vec![i as f32 * 5.0, 0.0]).collect(),
+                pairs: false,
+            }))
+            .ivf_router(RouterKind::Exact)
+            .create_in_ram()?;
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 30_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for i in 0..1000u64 {
+            let mut doc = TantivyDocument::new();
+            doc.add_u64(id, i);
+            doc.add_vector(vector, &[i as f32, 0.0]);
+            if i % 13 != 0 {
+                let value = ((i * 37) % 1000) as i64 - 500;
+                doc.add_i64(signed, value);
+                doc.add_f64(float, value as f64 + 0.5);
+                doc.add_date(date, DateTime::from_timestamp_secs(value));
+                if i % 17 == 0 {
+                    doc.add_i64(signed, 0);
+                    doc.add_f64(float, 0.5);
+                    doc.add_date(date, DateTime::from_timestamp_secs(0));
+                }
+            }
+            writer.add_document(doc)?;
+            if i == 499 || i == 999 {
+                writer.commit()?;
+            }
+        }
+        writer.merge(&index.searchable_segment_ids()?).wait()?;
+        writer.delete_term(Term::from_field_u64(id, 512));
+        writer.commit()?;
+        writer.wait_merging_threads()?;
+        let searcher = index.reader()?.searcher();
+        let segment = &searcher.segment_readers()[0];
+        let segments = [VectorSegment::from((0, segment))];
+        let ranges = [
+            RangeQuery::new(
+                Included(Term::from_field_u64(id, 250)),
+                Excluded(Term::from_field_u64(id, 750)),
+            ),
+            RangeQuery::new(
+                Included(Term::from_field_i64(signed, -250)),
+                Excluded(Term::from_field_i64(signed, 250)),
+            ),
+            RangeQuery::new(
+                Excluded(Term::from_field_f64(float, -249.5)),
+                Included(Term::from_field_f64(float, 250.5)),
+            ),
+            RangeQuery::new(
+                Included(Term::from_field_date(
+                    date,
+                    DateTime::from_timestamp_secs(-250),
+                )),
+                Excluded(Term::from_field_date(
+                    date,
+                    DateTime::from_timestamp_secs(250),
+                )),
+            ),
+        ];
+        for occur in [Occur::Must, Occur::Should, Occur::MustNot] {
+            let query = BooleanQuery::new(vec![
+                (occur, Box::new(ranges[0].clone())),
+                (occur, Box::new(ranges[1].clone())),
+            ]);
+            let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+            assert!(weight.candidate_filter(segment)?.is_none());
+            assert!(!matches!(
+                collect_segment_filter(weight.as_ref(), segment, segment.max_doc(), 0, Some(0.5),)?,
+                Source::Router(DocFilter::Direct { .. })
+            ));
+        }
+        for range in ranges {
+            let query = BooleanQuery::new(vec![
+                (Occur::Must, Box::new(AllQuery)),
+                (Occur::Must, Box::new(range)),
+            ]);
+            let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+            let docs: Vec<_> = (0..segment.max_doc()).rev().collect();
+            let mut kept = Vec::new();
+            for estimate in [None, Some(0.5)] {
+                let Source::Router(filter) = collect_segment_filter(
+                    weight.as_ref(),
+                    segment,
+                    segment.max_doc(),
+                    0,
+                    estimate,
+                )?
+                else {
+                    panic!("expected routed filter")
+                };
+                assert_eq!(
+                    matches!(filter, DocFilter::Direct { .. }),
+                    estimate.is_some()
+                );
+                let mut offsets = Vec::new();
+                let gated =
+                    RowGate::new(filter, segment.alive_bitset()).select(&docs, &mut offsets);
+                kept.push((gated, offsets));
+            }
+            assert_eq!(kept[0], kept[1]);
+
+            let mut results = Vec::new();
+            for estimate in [None, Some(0.5)] {
+                let params = ProbeParams {
+                    max_probe: 1,
+                    located: LocatedPath::Off,
+                    filter_match_fraction: estimate,
+                    ..Default::default()
+                };
+                let budget = VectorSearchBudget::for_segments(vector, &params, &segments)?;
+                let prepared = PreparedVectorSearch::prepare(
+                    vector,
+                    3,
+                    &params,
+                    weight.as_ref(),
+                    &segments,
+                    budget,
+                    |_| {},
+                )?;
+                assert_eq!(
+                    matches!(
+                        prepared.segments[0].scan,
+                        Some(ScanInput::Routed {
+                            filter: DocFilter::Direct { .. },
+                            ..
+                        })
+                    ),
+                    estimate.is_some()
+                );
+                let collector = TopDocs::with_limit(3)
+                    .order_by_similarity(vector, vec![510.0f32, 0.0])
+                    .with_probe_params(params)
+                    .build_for_searcher(&searcher, &query)?;
+                results.push(searcher.search(&query, &collector)?.results);
+            }
+            assert!(!results[0].is_empty());
+            assert_eq!(results[0], results[1]);
+
+            let params = ProbeParams {
+                max_probe: 100,
+                filter_match_fraction: Some(0.5),
+                ..Default::default()
+            };
+            let budget = VectorSearchBudget::for_segments(vector, &params, &segments)?;
+            let prepared = PreparedVectorSearch::prepare(
+                vector,
+                3,
+                &params,
+                weight.as_ref(),
+                &segments,
+                budget,
+                |_| {},
+            )?;
+            assert!(!matches!(
+                prepared.segments[0].scan,
+                Some(ScanInput::Routed {
+                    filter: DocFilter::Direct { .. },
+                    ..
+                })
+            ));
+        }
+        Ok(())
+    }
 
     /// The plan resolves the budget once, builds no bitset for match-all filters, sees an empty
     /// filter or `top_n == 0` as nothing to search, and sizes the scan from the budget. A filter
@@ -194,6 +400,9 @@ mod tests {
                             let matches = match filter {
                                 DocFilter::All => None,
                                 DocFilter::Docs(docs) => Some(docs.len()),
+                                DocFilter::Direct { .. } => {
+                                    unreachable!("fixture uses term filters")
+                                }
                             };
                             (budget, report, (false, matches))
                         }
@@ -286,7 +495,7 @@ mod tests {
             docs: (0..segment.max_doc()).collect(),
         };
         for cap in [0, 90] {
-            let source = collect_segment_filter(&every_doc, segment, segment.max_doc(), cap)?;
+            let source = collect_segment_filter(&every_doc, segment, segment.max_doc(), cap, None)?;
             assert!(
                 matches!(source, Source::Router(DocFilter::All)),
                 "cap {cap}"

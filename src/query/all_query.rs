@@ -25,6 +25,13 @@ impl Query for AllQuery {
 pub struct AllWeight;
 
 impl Weight for AllWeight {
+    fn candidate_filter(
+        &self,
+        _reader: &SegmentReader,
+    ) -> crate::Result<Option<super::CandidateFilter>> {
+        Ok(Some(super::CandidateFilter::All))
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let all_scorer = AllScorer::new(reader.max_doc());
         if boost != 1.0 {

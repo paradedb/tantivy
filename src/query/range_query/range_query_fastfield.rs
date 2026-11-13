@@ -52,9 +52,79 @@ impl FastFieldRangeWeight {
     pub fn new(bounds: BoundsRange<Term>) -> Self {
         Self { bounds }
     }
+    fn numerical_bounds(&self) -> crate::Result<BoundsRange<u64>> {
+        self.bounds.map_bound_res(|term| {
+            let value = term.value();
+            let val = if let Some(val) = value.as_u64() {
+                val
+            } else if let Some(val) = value.as_i64() {
+                val.to_u64()
+            } else if let Some(val) = value.as_f64() {
+                val.to_u64()
+            } else if let Some(val) = value.as_date() {
+                val.to_u64()
+            } else {
+                return Err(TantivyError::InvalidArgument(format!(
+                    "Expected term with u64, i64, f64 or date, but got {term:?}"
+                )));
+            };
+            Ok(val)
+        })
+    }
 }
 
 impl Weight for FastFieldRangeWeight {
+    fn candidate_filter(
+        &self,
+        reader: &SegmentReader,
+    ) -> crate::Result<Option<crate::query::CandidateFilter>> {
+        let Some(term) = self.bounds.get_inner() else {
+            return Ok(Some(crate::query::CandidateFilter::All));
+        };
+        if !matches!(term.typ(), Type::U64 | Type::I64 | Type::F64 | Type::Date)
+            || reader
+                .schema()
+                .get_field_entry(term.field())
+                .field_type()
+                .value_type()
+                != term.typ()
+        {
+            return Ok(None);
+        }
+        let field_name = term.get_full_path(reader.schema());
+        if reader
+            .sort_by_field()
+            .is_some_and(|sort| sort.field == field_name)
+        {
+            return Ok(None);
+        }
+        let Some((column, _)) = reader.fast_fields().u64_lenient_for_type(
+            Some(&[
+                ColumnType::U64,
+                ColumnType::I64,
+                ColumnType::F64,
+                ColumnType::DateTime,
+            ]),
+            &field_name,
+        )?
+        else {
+            return Ok(None);
+        };
+        let bounds = self.numerical_bounds()?;
+        let Some(bounds) = bound_to_value_range(
+            &bounds.lower_bound,
+            &bounds.upper_bound,
+            column.min_value(),
+            column.max_value(),
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::query::CandidateFilter::Range {
+            column,
+            bounds,
+        }))
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         // Check if both bounds are Bound::Unbounded
         if self.bounds.is_unbounded() {
@@ -228,23 +298,7 @@ impl Weight for FastFieldRangeWeight {
                 "{field_type:?}"
             );
 
-            let bounds = self.bounds.map_bound_res(|term| {
-                let value = term.value();
-                let val = if let Some(val) = value.as_u64() {
-                    val
-                } else if let Some(val) = value.as_i64() {
-                    val.to_u64()
-                } else if let Some(val) = value.as_f64() {
-                    val.to_u64()
-                } else if let Some(val) = value.as_date() {
-                    val.to_u64()
-                } else {
-                    return Err(TantivyError::InvalidArgument(format!(
-                        "Expected term with u64, i64, f64 or date, but got {term:?}"
-                    )));
-                };
-                Ok(val)
-            })?;
+            let bounds = self.numerical_bounds()?;
 
             let fast_field_reader = reader.fast_fields();
             let Some((column, _col_type)) = fast_field_reader.u64_lenient_for_type(
