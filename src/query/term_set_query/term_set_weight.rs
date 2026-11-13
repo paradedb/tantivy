@@ -96,6 +96,7 @@ impl Query for FastFieldTermSetQuery {
                 Occur::Should,
                 Box::new(
                     TermSetWeight::new(field, terms, field_type, self.strategy_config.clone())?
+                        .with_scoring_enabled(enable_scoring.is_scoring_enabled())
                         .with_bitmap_postings(enable_scoring.bitmap_postings_enabled()),
                 ),
             ));
@@ -167,6 +168,7 @@ pub struct TermSetWeight {
     is_indexed: bool,
     strategy_config: TermSetStrategyConfig,
     bitmap_enabled: bool,
+    scoring_enabled: bool,
 }
 
 /// Returns whether `field_type` has a fast-field column representation the
@@ -294,7 +296,13 @@ impl TermSetWeight {
             is_indexed,
             strategy_config,
             bitmap_enabled: false,
+            scoring_enabled: true,
         })
+    }
+
+    pub(crate) fn with_scoring_enabled(mut self, enabled: bool) -> Self {
+        self.scoring_enabled = enabled;
+        self
     }
 
     pub(crate) fn with_bitmap_postings(mut self, enabled: bool) -> Self {
@@ -333,7 +341,7 @@ impl TermSetWeight {
             }
         };
         let weight = AutomatonWeight::new(self.field, SetDfaWrapper(map_arc))
-            .with_scoring_enabled(!self.bitmap_enabled)
+            .with_scoring_enabled(self.scoring_enabled && !self.bitmap_enabled)
             .with_bitmap_postings(self.bitmap_enabled);
         weight.scorer(reader, boost)
     }

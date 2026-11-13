@@ -470,7 +470,12 @@ mod tests {
                         .with_bitmap_postings(opt_in),
                     )?;
                     let mut scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
-                    assert_eq!(scorer.has_fast_bitset(), enabled && opt_in && !scoring);
+                    let materialized_union =
+                        query.is::<RegexQuery>() || query.is::<FuzzyTermQuery>();
+                    assert_eq!(
+                        scorer.has_fast_bitset(),
+                        !scoring && (materialized_union || enabled && opt_in),
+                    );
                     if query.is::<TermQuery>() {
                         assert_eq!(scorer.is::<TermScorer>(), !enabled || !opt_in || scoring);
                     }
