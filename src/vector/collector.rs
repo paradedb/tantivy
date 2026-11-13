@@ -172,7 +172,10 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
         on_segment: impl FnMut(SegmentOrdinal),
     ) -> Result<PreparedVectorSearch> {
         if self.max_scan_levels == 0
-            && self.probe_params.filter_strategy()? == VectorFilterStrategy::Post
+            && matches!(
+                self.probe_params.filter_strategy()?,
+                VectorFilterStrategy::Post { .. }
+            )
         {
             return Err(TantivyError::InvalidArgument(
                 "post-filtering requires quantized vector scanning".into(),
@@ -435,7 +438,7 @@ where
 
     fn collect_segment(
         &self,
-        _weight: &dyn Weight,
+        weight: &dyn Weight,
         segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
     ) -> Result<SegmentVectorFruit<S::SortKey>> {
@@ -467,7 +470,7 @@ where
                 stats: ProbeStats::new(report, totals),
             });
         }
-        let (searched, mut totals) = measure(|| self.search_segment(segment_ord, reader));
+        let (searched, mut totals) = measure(|| self.search_segment(segment_ord, reader, weight));
         let (results, report, merge) = searched?;
         totals.append(preparation);
         if let Some(stats) = self.inputs.routing_stats.get(&segment_ord) {
@@ -573,6 +576,7 @@ where
         }
         let results = search_global(
             self,
+            weight,
             &vectors,
             segments,
             &mut tie_breaks,
@@ -688,6 +692,7 @@ where
         &self,
         segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
+        weight: &dyn Weight,
     ) -> Result<(KeyedHits<S::SortKey>, SegmentReport, ExactMerge)> {
         let init = enter_vector_stage(VectorStage::ScanInit);
         let backend = self.segment_searcher(segment_ord)?;
@@ -697,6 +702,7 @@ where
             self.segment_top_n(),
             &mut tie_break,
             self.tie_break.comparator(),
+            weight,
         )?;
         let merge = {
             let _assembly = enter_vector_stage(VectorStage::ResultAssembly);
@@ -738,6 +744,7 @@ enum GlobalSource<'a> {
 /// Returns each segment's hits and statistics so the collector can combine the results.
 fn search_global<T, S>(
     collector: &TopDocsByVectorSimilarity<T, S>,
+    weight: &dyn Weight,
     vectors: &[Arc<VectorIndexReader>],
     segments: &[VectorSegment],
     tie_breaks: &mut [S::Child],
@@ -793,8 +800,12 @@ where
         let (result, measured) = measure(|| -> Result<_> {
             match prepared.map(|segment| segment.scan.as_ref().expect("prepared segment")) {
                 Some(ScanInput::Flat { .. }) => {
-                    let (hits, report) =
-                        backend(i)?.top_n_by(top_n, tie_break, collector.tie_break.comparator())?;
+                    let (hits, report) = backend(i)?.top_n_by(
+                        top_n,
+                        tie_break,
+                        collector.tie_break.comparator(),
+                        weight,
+                    )?;
                     topk.merge_exact(hits.iter().map(|((score, _), address)| {
                         (
                             RowAddress {
@@ -850,7 +861,7 @@ where
     let mut visited = std::collections::HashSet::new();
     let mut window = candidates.len().max(1);
     let late_filter = collector.inputs.prepared.segments.iter().any(|s| {
-        matches!(&s.scan, Some(ScanInput::Routed { filter, .. }) if filter.candidate_filter().is_some())
+        matches!(&s.scan, Some(ScanInput::Routed { filter, .. }) if matches!(filter, crate::vector::search::source::router::DocFilter::Post))
     });
     let mut reserved = WorkUnits::ZERO;
     let mut scans: Vec<_> = (0..vectors.len()).map(|_| None).collect();
@@ -942,7 +953,7 @@ where
             tie_break,
             collector.tie_break.comparator(),
         )
-        .map(|scan| scan.with_candidate_filter(backend.candidate_filter()))
+        .map(|scan| scan.with_post_filter(backend.post_filter(weight)))
     };
     let mut meter = WorkMeter::new(
         WorkBudget {
@@ -3270,13 +3281,19 @@ mod prepared_key_tests {
 #[cfg(test)]
 mod late_filter_tests {
     use std::collections::HashSet;
+    use std::ops::Bound;
 
     use super::*;
-    use crate::query::{CandidateFilter, Explanation, Scorer, Weight};
+    use crate::query::{
+        BooleanQuery, BoostQuery, ConstScoreQuery, ExcludedDocSet, ExclusionSet, Explanation,
+        FastFieldRangeQuery, Occur, Query, Scorer, Weight,
+    };
     use crate::schema::Metric;
+    use crate::vector::search::source::router::DocFilter;
     use crate::vector::test_support::FixtureSpec;
+    use crate::vector::tests::exhaustive_params;
     use crate::vector::{AdaptiveProbeParams, VectorFilterStrategy, MIN_LATE_FILTER_MATCHES};
-    use crate::{DocId, SegmentReader};
+    use crate::{DocId, SegmentReader, Term};
 
     struct DeferredWeight {
         inner: Box<dyn Weight>,
@@ -3286,8 +3303,14 @@ mod late_filter_tests {
         fn uses_fast_fields(&self) -> bool {
             true
         }
-        fn candidate_filter(&self, reader: &SegmentReader) -> Result<CandidateFilter> {
-            self.inner.candidate_filter(reader)
+        fn scorer_for_candidates_unpositioned(
+            &self,
+            reader: &SegmentReader,
+            boost: Score,
+            candidate_size: u32,
+        ) -> Result<Box<dyn Scorer>> {
+            self.inner
+                .scorer_for_candidates_unpositioned(reader, boost, candidate_size)
         }
         fn scorer(&self, reader: &SegmentReader, boost: Score) -> Result<Box<dyn Scorer>> {
             assert!(
@@ -3385,7 +3408,9 @@ mod late_filter_tests {
                         strategy,
                         if !schedule.is_empty() && levels > 0 && matches >= MIN_LATE_FILTER_MATCHES
                         {
-                            VectorFilterStrategy::Post
+                            VectorFilterStrategy::Post {
+                                estimated_selectivity: 1.0,
+                            }
                         } else {
                             VectorFilterStrategy::Pre {
                                 uses_fast_fields: true,
@@ -3402,7 +3427,10 @@ mod late_filter_tests {
                             .with_max_scan_levels(levels);
                     let weight = DeferredWeight {
                         inner: fixture.weight(&filter)?,
-                        allow_enumeration: strategy != VectorFilterStrategy::Post,
+                        allow_enumeration: strategy
+                            != VectorFilterStrategy::Post {
+                                estimated_selectivity: 1.0,
+                            },
                     };
                     let budget =
                         VectorSearchBudget::for_segments(fixture.field, &params, &segments)?;
@@ -3439,7 +3467,7 @@ mod late_filter_tests {
             let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
                 .with_probe_params(ProbeParams {
                     located: crate::vector::LocatedPath::Off,
-                    ..crate::vector::tests::exhaustive_params(64)
+                    ..exhaustive_params(64)
                 });
             let budget =
                 VectorSearchBudget::for_segments(fixture.field, &builder.probe_params, &segments)?;
@@ -3448,9 +3476,7 @@ mod late_filter_tests {
                 let ScanInput::Routed { filter, .. } = segment.scan.as_mut().unwrap() else {
                     panic!("routed scan")
                 };
-                *filter = crate::vector::search::source::router::DocFilter::Candidates {
-                    filter: weight.candidate_filter(&segment.reader)?,
-                };
+                *filter = DocFilter::Post;
             }
             let router = TopClustersBySimilarityCollector::new(
                 fixture.field,
@@ -3462,6 +3488,9 @@ mod late_filter_tests {
             let candidates = router.collect_segments(&segments, |_| {})?;
             for (shared, adaptive) in [(false, false), (false, true), (true, false), (true, true)] {
                 let mut builder = builder.clone();
+                builder.probe_params.filter_strategy = Some(VectorFilterStrategy::Post {
+                    estimated_selectivity: 0.1,
+                });
                 builder.probe_params.adaptive_probing = adaptive.then_some(AdaptiveProbeParams {
                     admission_fraction: 1.0,
                 });
@@ -3488,7 +3517,8 @@ mod late_filter_tests {
                 assert!(fruit.stats.iter().all(|s| s.exact_rows <= s.filter_checks));
                 for stats in &fruit.stats {
                     assert!(stats.filter_candidates >= stats.filter_checks);
-                    assert!(stats.filter_checks <= stats.filter_batches * 64);
+                    assert_eq!(stats.filter_batches as u64, stats.filter_scorers_created);
+                    assert!(stats.late_filter_setup_ns > 0);
                     assert!(stats.filter_batches <= stats.filter_checks);
                     assert_eq!(stats.filter_matches, stats.exact_rows);
                 }
@@ -3501,7 +3531,9 @@ mod late_filter_tests {
                     .iter()
                     .rposition(|(stage, _)| *stage == VectorStage::LayerScan(0))
                     .unwrap();
-                assert!(first_exact < last_probe);
+                if !shared {
+                    assert!(first_exact > last_probe);
+                }
                 for stats in &fruit.stats {
                     let rows = &stats.quantized_trace.refined_topk_rows;
                     let unique: HashSet<_> = rows.iter().collect();
@@ -3511,7 +3543,9 @@ mod late_filter_tests {
             // The actual eligibility path must also avoid draining the filter.
             let params = ProbeParams {
                 max_probe: 1,
-                filter_strategy: Some(VectorFilterStrategy::Post),
+                filter_strategy: Some(VectorFilterStrategy::Post {
+                    estimated_selectivity: 0.1,
+                }),
                 ..ProbeParams::prefilter()
             };
             let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
@@ -3537,6 +3571,109 @@ mod late_filter_tests {
         Ok(())
     }
     #[test]
+    fn deferred_range_and_postings_match_exact_search() -> Result<()> {
+        let fixture = FixtureSpec::clustered(Metric::L2, 64, 32, 8192)
+            .schedule(&[1, 4])
+            .segments(2)
+            .replicated()
+            .label("matches", |i| i % 5 == 0)
+            .deletes(&[0, 5, 100, 2000])
+            .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let segments: Vec<_> = searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .map(|(i, reader)| VectorSegment::from((i as u32, reader)))
+            .collect();
+        let ordinal = searcher.schema().get_field("ordinal")?;
+        let range = || {
+            Box::new(FastFieldRangeQuery::new(
+                Bound::Included(Term::from_field_u64(ordinal, 1000)),
+                Bound::Excluded(Term::from_field_u64(ordinal, 5000)),
+            )) as Box<dyn Query>
+        };
+        let term = || Box::new(fixture.filter("matches")) as Box<dyn Query>;
+        let mut minimum =
+            BooleanQuery::new(vec![(Occur::Should, range()), (Occur::Should, term())]);
+        minimum.set_minimum_number_should_match(2);
+        let filters: Vec<Box<dyn Query>> = vec![
+            range(),
+            Box::new(BoostQuery::new(range(), 2.0)),
+            Box::new(ConstScoreQuery::new(range(), 1.0)),
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, range()),
+                (Occur::Must, term()),
+            ])),
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Should, range()),
+                (Occur::Should, term()),
+            ])),
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, range()),
+                (Occur::MustNot, term()),
+            ])),
+            Box::new(minimum),
+        ];
+        let query = vec![0.0f32; 64];
+        let mut expanded = false;
+        for filter in filters {
+            let weight = fixture.weight(filter.as_ref())?;
+            for levels in [1, usize::MAX] {
+                let builder =
+                    TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
+                        .with_probe_params(ProbeParams {
+                            filter_strategy: Some(VectorFilterStrategy::Post {
+                                estimated_selectivity: 1.0,
+                            }),
+                            ..exhaustive_params(64)
+                        })
+                        .with_max_scan_levels(levels);
+                let collector = builder.build_for_segments(weight.as_ref(), &segments, |_| {})?;
+                let fruit = collector.merge_fruits(collector.collect_segments(
+                    weight.as_ref(),
+                    &segments,
+                    |_| {},
+                )?)?;
+                assert_eq!(
+                    fruit.results,
+                    fixture.oracle(filter.as_ref(), &query, 10)?,
+                    "{filter:?}, levels={levels}"
+                );
+                if levels > 1 {
+                    assert!(
+                        fruit
+                            .stats
+                            .iter()
+                            .map(|s| s.layers.get(1).unwrap().scored())
+                            .sum::<usize>()
+                            < fruit
+                                .stats
+                                .iter()
+                                .map(|s| s.layers.get(0).unwrap().scored())
+                                .sum::<usize>(),
+                        "lazy refinement must not rescan the entire candidate pool"
+                    );
+                }
+                for stats in &fruit.stats {
+                    assert_eq!(stats.filter_scorers_created, stats.filter_batches as u64);
+                    assert_eq!(stats.filter_matches, stats.exact_rows);
+                    if stats.filter_batches > 0 {
+                        assert!(stats.late_filter_setup_ns > 0);
+                    }
+                    assert!(stats.filter_checks <= stats.layer0_eligible);
+                    expanded |= stats.filter_batches > 1;
+                }
+            }
+        }
+        assert!(
+            expanded,
+            "an optimistic selectivity must still expand past the initial batch"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn late_filter_retries_without_rescanning_clusters() -> Result<()> {
         let fixture = FixtureSpec::clustered(Metric::L2, 64, 32, 4096)
             .schedule(&[1])
@@ -3549,19 +3686,21 @@ mod late_filter_tests {
         let query = vec![0.0f32; 64];
         let params = ProbeParams {
             located: crate::vector::LocatedPath::Off,
-            ..crate::vector::tests::exhaustive_params(32)
+            ..exhaustive_params(32)
         };
         let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
-            .with_probe_params(params.clone());
+            .with_probe_params(ProbeParams {
+                filter_strategy: Some(VectorFilterStrategy::Post {
+                    estimated_selectivity: 1.0 / 32.0,
+                }),
+                ..params.clone()
+            });
         let budget = VectorSearchBudget::for_segments(fixture.field, &params, &segments)?;
         let mut prepared = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
-        let candidate_filter = weight.candidate_filter(&segments[0].reader)?;
         let ScanInput::Routed { filter, .. } = prepared.segments[0].scan.as_mut().unwrap() else {
             panic!("routed")
         };
-        *filter = crate::vector::search::source::router::DocFilter::Candidates {
-            filter: candidate_filter.clone(),
-        };
+        *filter = DocFilter::Post;
         let router =
             TopClustersBySimilarityCollector::new(fixture.field, query.clone(), params, 1.0)?
                 .with_budget(budget);
@@ -3572,11 +3711,9 @@ mod late_filter_tests {
             .into_iter()
             .find(|c| {
                 reader.read_doc_ids(c.node.1 as usize, &mut docs).unwrap();
-                !candidate_filter
-                    .matches(&docs)
-                    .unwrap()
-                    .into_iter()
-                    .any(|yes| yes)
+                let mut scorer =
+                    ExcludedDocSet::new(weight.scorer(&segments[0].reader, 1.0).unwrap());
+                !docs.iter().any(|&doc| scorer.contains(doc))
             })
             .unwrap();
         for shared in [false, true] {
@@ -3641,7 +3778,7 @@ mod late_filter_tests {
                 else {
                     panic!("routed")
                 };
-                assert_eq!(filter.candidate_filter().is_some(), late);
+                assert_eq!(matches!(filter, DocFilter::Post), late);
             }
         }
         Ok(())
@@ -3663,8 +3800,10 @@ mod late_filter_tests {
         let query = vec![0.0f32; 64];
         let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
             .with_probe_params(ProbeParams {
-                filter_strategy: Some(VectorFilterStrategy::Post),
-                ..crate::vector::tests::exhaustive_params(64)
+                filter_strategy: Some(VectorFilterStrategy::Post {
+                    estimated_selectivity: 0.1,
+                }),
+                ..exhaustive_params(64)
             });
         let collector = builder.build_for_segments(&weight, &segments, |_| {})?;
         let fruit =
@@ -3705,7 +3844,9 @@ mod late_filter_tests {
                 usize::MAX,
                 &segments,
             )?,
-            VectorFilterStrategy::Post,
+            VectorFilterStrategy::Post {
+                estimated_selectivity: 1.0
+            },
         );
         assert_eq!(
             VectorFilterStrategy::plan(
@@ -3722,7 +3863,9 @@ mod late_filter_tests {
         let query = vec![0.0f32; 64];
         let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
             .with_probe_params(ProbeParams {
-                filter_strategy: Some(VectorFilterStrategy::Post),
+                filter_strategy: Some(VectorFilterStrategy::Post {
+                    estimated_selectivity: 0.1,
+                }),
                 ..ProbeParams::prefilter()
             });
         let collector = builder

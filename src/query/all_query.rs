@@ -43,7 +43,6 @@ impl Weight for AllWeight {
 }
 
 /// Scorer associated with the `AllQuery` query.
-#[derive(Clone)]
 pub struct AllScorer {
     doc: DocId,
     max_doc: DocId,

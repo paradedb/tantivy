@@ -148,15 +148,14 @@ impl PreparedVectorSearch {
                             located_cap: cap,
                         };
                         let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                        let source = if filter_strategy == VectorFilterStrategy::Post {
+                        let source = if matches!(filter_strategy, VectorFilterStrategy::Post { .. })
+                        {
                             if vectors.quantization()?.is_none() {
                                 return Err(TantivyError::InvalidArgument(
                                     "post-filtering requires quantized IVF segments".into(),
                                 ));
                             }
-                            Source::Router(DocFilter::Candidates {
-                                filter: weight.candidate_filter(&segment.reader)?,
-                            })
+                            Source::Router(DocFilter::Post)
                         } else {
                             collect_segment_filter(weight, &segment.reader, max_doc, cap)?
                         };
@@ -183,10 +182,8 @@ impl PreparedVectorSearch {
                     (None, 0)
                 } else {
                     let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                    let filter = if filter_strategy == VectorFilterStrategy::Post {
-                        DocFilter::Candidates {
-                            filter: weight.candidate_filter(&segment.reader)?,
-                        }
+                    let filter = if matches!(filter_strategy, VectorFilterStrategy::Post { .. }) {
+                        DocFilter::Post
                     } else {
                         let Source::Router(filter) =
                             collect_segment_filter(weight, &segment.reader, max_doc, 0)?
@@ -295,7 +292,7 @@ impl PreparedVectorSearch {
             })
             .collect();
         self.segments
-            .retain(|s| !s.routed() || routed.contains_key(&s.ordinal) || matches!(&s.scan, Some(ScanInput::Routed { filter, .. }) if filter.candidate_filter().is_some()));
+            .retain(|s| !s.routed() || routed.contains_key(&s.ordinal) || matches!(&s.scan, Some(ScanInput::Routed { filter, .. }) if matches!(filter, DocFilter::Post)));
         for segment in &mut self.segments {
             if let Some(ScanInput::Routed { budget, report, .. }) = &mut segment.scan {
                 report.planned_clusters = routed.get(&segment.ordinal).copied().unwrap_or(0);

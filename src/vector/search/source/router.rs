@@ -28,9 +28,7 @@ pub(crate) enum DocFilter {
     /// The matching doc ids.
     Docs(Arc<BitSet>),
     /// A deferred predicate, evaluated after vector shortlisting.
-    Candidates {
-        filter: crate::query::CandidateFilter,
-    },
+    Post,
 }
 
 impl DocFilter {
@@ -38,19 +36,12 @@ impl DocFilter {
         matches!(self, Self::Docs(docs) if docs.len() == 0)
     }
 
-    pub(crate) fn candidate_filter(&self) -> Option<&crate::query::CandidateFilter> {
-        match self {
-            Self::Candidates { filter, .. } => Some(filter),
-            _ => None,
-        }
-    }
-
     /// The share of doc ids below `max_doc` that match.
     pub(crate) fn match_fraction(&self, max_doc: DocId) -> f64 {
         match self {
             Self::All => 1.0,
             Self::Docs(docs) => docs.len() as f64 / f64::from(max_doc.max(1)),
-            Self::Candidates { .. } => 1.0,
+            Self::Post => 1.0,
         }
     }
 }
@@ -78,10 +69,8 @@ pub(crate) struct GatedRows {
 impl<'a> RowGate<'a> {
     pub(crate) fn new(filter: DocFilter, alive: Option<&'a AliveBitSet>) -> Self {
         match (filter, alive) {
-            (DocFilter::All | DocFilter::Candidates { .. }, None) => RowGate::Open,
-            (DocFilter::All | DocFilter::Candidates { .. }, Some(alive)) => {
-                RowGate::AliveOnly(alive)
-            }
+            (DocFilter::All | DocFilter::Post, None) => RowGate::Open,
+            (DocFilter::All | DocFilter::Post, Some(alive)) => RowGate::AliveOnly(alive),
             (DocFilter::Docs(filter), None) => RowGate::FilterOnly(filter),
             (DocFilter::Docs(filter), Some(alive)) => RowGate::FilterAndAlive { filter, alive },
         }

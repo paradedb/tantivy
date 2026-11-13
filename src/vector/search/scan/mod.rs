@@ -33,7 +33,7 @@ use self::rate::AdmissionHistograms;
 use crate::collector::sort_key::Comparator;
 use crate::collector::SegmentSortKeyComputer;
 use crate::error::DataCorruption;
-use crate::query::CandidateFilter;
+use crate::query::{ExcludedDocSet, ExclusionSet, Weight};
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
 use crate::vector::router::candidate::Candidate as RankedCandidate;
@@ -46,12 +46,10 @@ use crate::vector::storage::quantized::{
 };
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::enter_vector_stage;
-#[cfg(test)]
-use crate::vector::BlockAddress;
-use crate::vector::{VectorElement, VectorStage};
-use crate::{DocId, SegmentOrdinal};
+use crate::vector::{BlockAddress, VectorElement, VectorStage};
+use crate::{DocId, SegmentOrdinal, SegmentReader};
 
-const FILTER_BATCH_SIZE: usize = 64;
+const FILTER_BATCH_HEADROOM: usize = 2;
 
 // --- Contracts ---
 
@@ -700,9 +698,8 @@ where
     rate: Option<RateApsState>,
     recall_fraction: Option<f64>,
     report: ScanReport,
-    late_filter: Option<CandidateFilter>,
-    next_filter_refinement: usize,
-    filter_docs: HashMap<u32, Vec<DocId>>,
+    late_filter: Option<(&'a dyn Weight, &'a SegmentReader)>,
+    filter_batch_size: usize,
     reader: &'a VectorIndexReader,
 }
 
@@ -746,8 +743,7 @@ where
             .map(|p| p.admission_fraction);
         Ok(Self {
             late_filter: None,
-            next_filter_refinement: FILTER_BATCH_SIZE,
-            filter_docs: HashMap::new(),
+            filter_batch_size: 0,
             reader,
             exact: ExactScorer::new(
                 reader,
@@ -775,7 +771,10 @@ where
         })
     }
 
-    pub(crate) fn with_candidate_filter(mut self, filter: Option<CandidateFilter>) -> Self {
+    pub(crate) fn with_post_filter(
+        mut self,
+        filter: Option<(&'a dyn Weight, &'a SegmentReader, f64)>,
+    ) -> Self {
         if filter.is_some() {
             self.recall_fraction = None;
             self.rate = None;
@@ -787,7 +786,12 @@ where
             }
         }
         self.report.late_filter = filter.is_some();
-        self.late_filter = filter;
+        self.late_filter = filter.map(|(weight, reader, selectivity)| {
+            self.filter_batch_size = (self.bound.k().saturating_mul(FILTER_BATCH_HEADROOM) as f64
+                / selectivity.clamp(f64::EPSILON, 1.0))
+            .ceil() as usize;
+            (weight, reader)
+        });
         self
     }
 
@@ -841,17 +845,13 @@ where
 
     pub(crate) fn refine_shortlist(&mut self) -> crate::Result<()> {
         self.close_shortlist();
-        if self.needs_more_matches() {
-            self.filter_shortlist(FILTER_BATCH_SIZE)?;
+        if self.late_filter.is_some() {
+            return self.filter_shortlist();
         }
         for layer in self.refining_layers() {
             self.narrow(layer)?;
         }
-        if self.late_filter.is_some() {
-            self.filter_shortlist(usize::MAX)
-        } else {
-            self.score_shortlist()
-        }
+        self.score_shortlist()
     }
 
     pub(crate) fn refinement_candidates(&self, limit: usize) -> Vec<Candidate> {
@@ -924,137 +924,155 @@ where
         Ok(())
     }
 
-    fn filter_shortlist(&mut self, limit: usize) -> crate::Result<()> {
+    fn filter_shortlist(&mut self) -> crate::Result<()> {
         let _stage = enter_vector_stage(VectorStage::LateFilter);
-        let selection = enter_vector_stage(VectorStage::LateFilterSelect);
-        let filter = self.late_filter.as_ref().unwrap().clone();
-        let threshold = self
-            .bound
-            .shared_threshold()
-            .map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score)));
+        let (weight, reader) = self.late_filter.unwrap();
         let state = self
             .quantized
             .as_mut()
-            .expect("late filters require quantization");
-        self.report.filter_candidates += state.candidates.len();
-        let mut pending: Vec<_> = state
-            .candidates
-            .candidates_with_upper(state.segment_ord)
-            .filter(|(_, upper)| threshold.is_none_or(|threshold| threshold.admits(*upper)))
-            .collect();
-        if pending.len() > limit {
-            pending.select_nth_unstable_by(limit, |(a, _), (b, _)| {
-                b.bound
-                    .estimate()
-                    .total_cmp(&a.bound.estimate())
-                    .then_with(|| a.address.cmp(&b.address))
-            });
-            pending.truncate(limit);
-        }
-        let mut ranking = BinaryHeap::from(
-            pending
-                .iter()
-                .enumerate()
-                .map(|(index, (candidate, _))| RankedCandidate {
-                    sim: Similarity::new(candidate.bound.estimate()),
-                    node: (Reverse(candidate.address), index),
+            .expect("post-filtering requires quantization");
+        let selection = enter_vector_stage(VectorStage::LateFilterSelect);
+        let threshold = self.bound.shared_threshold();
+        let mut queue = BinaryHeap::from(
+            state
+                .candidates
+                .candidates_with_upper(state.segment_ord)
+                .filter(|(_, _, _, upper)| threshold.is_none_or(|bar| upper.0 >= bar))
+                .map(|(block, index, _, upper)| RankedCandidate {
+                    sim: Similarity::new(upper.0),
+                    node: Reverse((block, index)),
                 })
                 .collect::<Vec<_>>(),
         );
+        self.report.filter_candidates += queue.len();
         drop(selection);
-        let mut processed = HashMap::<u32, Vec<u32>>::new();
-        loop {
-            let selection = enter_vector_stage(VectorStage::LateFilterSelect);
-            let threshold = self
-                .bound
+        let mut batch = Vec::new();
+        let mut indexed = Vec::new();
+        let mut offsets = Vec::new();
+        let mut indices = Vec::new();
+        let mut doc_cache = HashMap::<usize, Vec<DocId>>::new();
+        let mut batch_size = self.filter_batch_size.max(1).min(queue.len());
+        while queue.peek().is_some_and(|next| {
+            self.bound
                 .shared_threshold()
-                .map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score)));
-            let mut indexed = Vec::with_capacity(FILTER_BATCH_SIZE);
-            indexed.extend(
-                std::iter::from_fn(|| ranking.pop())
-                    .map(|ranked| pending[ranked.node.1])
-                    .filter(|(_, upper)| threshold.is_none_or(|threshold| threshold.admits(*upper)))
-                    .take(FILTER_BATCH_SIZE)
-                    .map(|(candidate, _)| (0, candidate.address.block_address)),
-            );
-            drop(selection);
-            let doc_ids = enter_vector_stage(VectorStage::LateFilterDocIds);
-            for (doc, address) in &mut indexed {
-                let docs = self.filter_docs.entry(address.block).or_default();
-                if docs.is_empty() {
-                    self.reader.read_doc_ids(address.block as usize, docs)?;
-                }
-                *doc = docs[address.row as usize];
-                if limit != usize::MAX {
-                    processed
-                        .entry(address.block)
-                        .or_default()
-                        .push(address.row);
-                }
-            }
-            drop(doc_ids);
-            if indexed.is_empty() {
-                break;
-            }
-            self.report.filter_batches += 1;
-            let sorting = enter_vector_stage(VectorStage::LateFilterSort);
-            indexed.sort_unstable_by_key(|&(doc, _)| doc);
-            let ids: Vec<_> = indexed.iter().map(|&(doc, _)| doc).collect();
-            drop(sorting);
-            let matched = {
-                let _predicate = enter_vector_stage(VectorStage::LateFilterPredicate);
-                filter.matches(&ids)?
-            };
-            self.report.filter_checks += ids.len();
-            let sorting = enter_vector_stage(VectorStage::LateFilterSort);
-            let mut passing: Vec<_> = indexed
-                .iter()
-                .zip(matched)
-                .filter_map(|(&(doc, address), yes)| yes.then_some((address, doc)))
-                .collect();
-            self.report.filter_matches += passing.len();
-            passing.sort_unstable_by_key(|&(address, _)| address);
-            drop(sorting);
-            for group in passing.chunk_by(|(a, _), (b, _)| a.block == b.block) {
-                let cluster = group[0].0.block as usize;
-                let offsets: Vec<_> = group.iter().map(|(address, _)| address.row).collect();
-                let docs: Vec<_> = group.iter().map(|&(_, doc)| doc).collect();
-                let selected = ClusterRows {
-                    cluster,
-                    rows: 0..self.filter_docs[&group[0].0.block].len(),
-                    offsets: Some(&offsets),
-                    docs: Some(&docs),
-                    centroid: None,
+                .is_none_or(|bar| next.sim.score() >= bar)
+        }) {
+            let selection = enter_vector_stage(VectorStage::LateFilterSelect);
+            batch.clear();
+            let threshold = self.bound.shared_threshold();
+            while batch.len() < batch_size {
+                let Some(next) = queue.peek() else {
+                    break;
                 };
+                if threshold.is_some_and(|bar| next.sim.score() < bar) {
+                    break;
+                }
+                batch.push(queue.pop().unwrap().node.0);
+            }
+            drop(selection);
+            {
+                let _sort = enter_vector_stage(VectorStage::LateFilterSort);
+                batch.sort_unstable();
+            }
+            indexed.clear();
+            for group in batch.chunk_by(|a, b| a.0 == b.0) {
+                let b = group[0].0;
+                let block = state.candidates.block(b);
+                let cluster = block.cluster;
+                let centroid = block.centroid;
+                let first = block.at.start;
+                let rows = state.candidates.rows(b);
+                offsets.clear();
+                offsets.extend(group.iter().map(|&(_, i)| rows.offsets.unwrap()[i - first]));
+                let selected = ClusterRows {
+                    offsets: Some(&offsets),
+                    ..rows
+                };
+                state.admission_columns.truncate(0);
+                indices.clear();
+                indices.extend(group.iter().map(|&(_, i)| i as u32));
+                state
+                    .admission_columns
+                    .extend_selected(&state.candidates.columns, &indices);
+                for layer in 1..state.layers.len() {
+                    let _layer = enter_vector_stage(VectorStage::LayerScan(layer as u8));
+                    let (read, view) = state.read_plan(&selected, layer, &mut self.scratch)?;
+                    let Read::Layer(read) = read else {
+                        unreachable!("post-filtering defers exact scoring");
+                    };
+                    self.report.layers[layer].scored += selected.len();
+                    self.report.layers[layer].count(Read::Layer(read), selected.len());
+                    decode_layer(
+                        &state.layers[layer],
+                        &selected,
+                        read,
+                        &view,
+                        &mut state.decoded,
+                        &mut self.scratch,
+                    )?;
+                    let ctx = state.combine_ctx(layer, centroid);
+                    combine_refine(
+                        &ctx,
+                        &state.decoded,
+                        &mut state.admission_columns,
+                        0..selected.len(),
+                    );
+                    if layer + 1 < state.layers.len() {
+                        self.report.layers[layer].survivors += selected.len();
+                    }
+                }
+                let doc_ids = enter_vector_stage(VectorStage::LateFilterDocIds);
+                for (i, &offset) in offsets.iter().enumerate() {
+                    let upper = Estimate(state.admission_columns.estimates[i])
+                        .upper(state.admission_columns.sigmas[i], state.candidates.kappa());
+                    if threshold.is_none_or(|bar| upper.0 >= bar) {
+                        let docs = doc_cache.entry(cluster).or_default();
+                        if docs.is_empty() {
+                            self.reader.read_doc_ids(cluster, docs)?;
+                        }
+                        indexed.push((
+                            docs[offset as usize],
+                            BlockAddress::new(cluster as u32, offset),
+                        ));
+                    }
+                }
+                drop(doc_ids);
+            }
+            if self.report.layers.len() > 1 {
+                self.report.layers.last_mut().unwrap().survivors += indexed.len();
+            }
+            if !indexed.is_empty() {
+                self.report.filter_batches += 1;
+                let sorting = enter_vector_stage(VectorStage::LateFilterSort);
+                indexed.sort_unstable_by_key(|&(doc, _)| doc);
+                drop(sorting);
+                let mut scorer = {
+                    let _setup = enter_vector_stage(VectorStage::LateFilterSetup);
+                    ExcludedDocSet::new(weight.scorer_for_candidates_unpositioned(
+                        reader,
+                        1.0,
+                        indexed.len() as u32,
+                    )?)
+                };
+                {
+                    let _predicate = enter_vector_stage(VectorStage::LateFilterPredicate);
+                    self.report.filter_checks += indexed.len();
+                    indexed.retain(|&(doc, _)| scorer.contains(doc));
+                }
+                self.report.filter_matches += indexed.len();
                 self.report.exact_rows +=
                     self.exact
-                        .score(&selected, &mut self.scratch, &mut self.bound, None)?;
+                        .score_candidates(&indexed, &mut self.scratch, &mut self.bound)?;
                 #[cfg(test)]
                 self.report
                     .trace
                     .refined_topk_rows
-                    .extend(group.iter().map(|&(address, _)| address));
+                    .extend(indexed.iter().map(|&(_, address)| address));
             }
-        }
-        let state = self.quantized.as_mut().unwrap();
-        state.candidates.order_by_cluster(&mut self.by_cluster);
-        for rows in processed.values_mut() {
-            rows.sort_unstable();
+            batch_size = batch_size.saturating_mul(2).min(queue.len());
         }
         for &b in &self.by_cluster {
-            if limit != usize::MAX {
-                let group = state.candidates.rows(b);
-                if let Some(rows) = processed.get(&(group.cluster as u32)) {
-                    let offsets: Vec<_> = rows
-                        .iter()
-                        .filter(|&&row| group.rows.contains(&(row as usize)))
-                        .map(|&row| row - group.rows.start as u32)
-                        .collect();
-                    state.candidates.remove_rows(b, &offsets);
-                }
-            } else {
-                state.candidates.retire(b);
-            }
+            state.candidates.retire(b);
         }
         Ok(())
     }
@@ -1150,14 +1168,6 @@ where
             }
         }
         self.report.candidates_scored += len;
-        if self.late_filter.is_some()
-            && self.report.candidates_scored >= self.next_filter_refinement
-        {
-            // Establish and tighten a filtered cutoff while probing. Doubling bounds the
-            // repeated candidate selection work as the scan grows.
-            self.filter_shortlist(FILTER_BATCH_SIZE)?;
-            self.next_filter_refinement = self.report.candidates_scored.saturating_mul(2);
-        }
         self.close_rate_cluster(len);
         Ok(len)
     }

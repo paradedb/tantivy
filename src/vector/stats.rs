@@ -249,7 +249,7 @@ pub struct ProbeStats {
     pub candidates_scored: usize,
     /// Whether this scan deferred its filter until vector shortlisting.
     pub late_filter: bool,
-    /// Live candidates visited across all deferred-filter selection passes.
+    /// Quantized candidates admitted to deferred-filter heaps.
     pub filter_candidates: usize,
     /// Nonempty batches checked against the deferred filter.
     pub filter_batches: usize,
@@ -267,6 +267,10 @@ pub struct ProbeStats {
     pub late_filter_doc_ids_ns: u64,
     pub late_filter_sort_ns: u64,
     pub late_filter_predicate_ns: u64,
+    /// Exclusive nanoseconds constructing deferred-filter scorers.
+    pub late_filter_setup_ns: u64,
+    /// Deferred-filter scorers constructed across batches and router retries.
+    pub filter_scorers_created: u64,
     /// Rows the routed source admitted and charged, a replicated document's second copy included.
     pub layer0_eligible: usize,
     /// Rows dropped at admission as the second copy of a document an earlier cluster held.
@@ -547,6 +551,8 @@ impl ProbeStats {
         self.late_filter_select_ns = totals.time_ns(VectorStage::LateFilterSelect);
         self.late_filter_doc_ids_ns = totals.time_ns(VectorStage::LateFilterDocIds);
         self.late_filter_sort_ns = totals.time_ns(VectorStage::LateFilterSort);
+        self.filter_scorers_created = totals.filter_scorers_created;
+        self.late_filter_setup_ns = totals.time_ns(VectorStage::LateFilterSetup);
         self.late_filter_predicate_ns = totals.time_ns(VectorStage::LateFilterPredicate);
         self.query_prep_ns = totals.time_ns(VectorStage::QueryPrep);
         self.routing_ns = totals.time_ns(VectorStage::Routing);
@@ -633,6 +639,8 @@ mod tests {
         "late_filter_doc_ids_ns",
         "late_filter_sort_ns",
         "late_filter_predicate_ns",
+        "late_filter_setup_ns",
+        "filter_scorers_created",
         "router_retries",
         "clusters_reused",
         "layer0_eligible",

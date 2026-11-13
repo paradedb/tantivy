@@ -81,13 +81,6 @@ impl ConstWeight {
 }
 
 impl Weight for ConstWeight {
-    fn candidate_filter(
-        &self,
-        reader: &SegmentReader,
-    ) -> crate::Result<crate::query::CandidateFilter> {
-        self.weight.candidate_filter(reader)
-    }
-
     fn uses_fast_fields(&self) -> bool {
         self.weight.uses_fast_fields()
     }

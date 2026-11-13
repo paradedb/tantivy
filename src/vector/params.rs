@@ -18,12 +18,12 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 pub const MIN_LATE_FILTER_MATCHES: usize = 250_000;
 
 /// Query-wide filter evaluation, selected before worker assignment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum VectorFilterStrategy {
     /// Materialize the matches before vector search.
     Pre { uses_fast_fields: bool },
     /// Check vector candidates against a fast-field filter.
-    Post,
+    Post { estimated_selectivity: f64 },
 }
 
 impl VectorFilterStrategy {
@@ -50,7 +50,14 @@ impl VectorFilterStrategy {
                 return Ok(pre);
             }
         }
-        Ok(Self::Post)
+        let docs: u64 = segments
+            .iter()
+            .map(|s| u64::from(s.reader.num_docs()))
+            .sum();
+        Ok(Self::Post {
+            estimated_selectivity: (estimated_matches as f64 / docs.max(1) as f64)
+                .clamp(f64::EPSILON, 1.0),
+        })
     }
 }
 
@@ -207,7 +214,7 @@ impl ProbeParams {
             .filter_strategy()
             .expect("routing requires a filter strategy")
         {
-            VectorFilterStrategy::Post => 1.0,
+            VectorFilterStrategy::Post { .. } => 1.0,
             VectorFilterStrategy::Pre { .. } => match_fraction.clamp(0.0, 1.0),
         };
         let cluster_cost =
@@ -347,7 +354,9 @@ mod tests {
         assert_eq!(params.router_k(20.0, 0.0, 0.0, 1000), 1000);
         assert_eq!(params.router_k(0.0, x, 1.0, 0), 1);
         let post = ProbeParams {
-            filter_strategy: Some(VectorFilterStrategy::Post),
+            filter_strategy: Some(VectorFilterStrategy::Post {
+                estimated_selectivity: 0.1,
+            }),
             ..params.clone()
         };
         for budget in [0.01, 2.0, 20.0, 20.4, 1000.0] {

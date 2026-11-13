@@ -48,7 +48,6 @@ impl Weight for EmptyWeight {
 /// `EmptyScorer` is a dummy `Scorer` in which no document matches.
 ///
 /// It is useful for tests and handling edge cases.
-#[derive(Clone)]
 pub struct EmptyScorer;
 
 impl DocSet for EmptyScorer {

@@ -6,7 +6,6 @@ use crate::{DocId, DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
 /// by the query field, binary search on the column identifies the first and last
 /// matching DocIds. Since documents are contiguous in a sorted segment, we can
 /// represent the result as a simple integer range instead of scanning the column.
-#[derive(Clone)]
 pub(crate) struct ContiguousDocSet {
     start: DocId,
     end: DocId,

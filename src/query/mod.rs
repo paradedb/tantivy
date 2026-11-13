@@ -77,8 +77,8 @@ pub use self::term_set_query::*;
 pub use self::union::{BufferedUnionScorer, SimpleUnion};
 #[cfg(test)]
 pub use self::vec_docset::VecDocSet;
+pub use self::weight::Weight;
 pub(crate) use self::weight::{for_each_docset_batch, for_each_docset_buffered};
-pub use self::weight::{CandidateFilter, Weight};
 
 #[cfg(test)]
 mod tests {

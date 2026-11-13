@@ -1,48 +1,9 @@
-use std::sync::Mutex;
-
 use super::scorer::{BasicPruningScorer, PruningScorer};
 use super::Scorer;
-use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
+use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::index::SegmentReader;
 use crate::query::Explanation;
 use crate::{DocId, DocSet, Score, TERMINATED};
-
-/// A prepared membership check over sorted candidate document IDs.
-#[derive(Clone)]
-pub struct CandidateFilter(std::sync::Arc<CandidateCheck>);
-
-type CandidateCheck = dyn Fn(&[DocId]) -> crate::Result<Vec<bool>> + Send + Sync;
-
-impl CandidateFilter {
-    /// Builds a reusable predicate over batches sorted by document ID.
-    pub fn new(
-        check: impl Fn(&[DocId]) -> crate::Result<Vec<bool>> + Send + Sync + 'static,
-    ) -> Self {
-        Self(std::sync::Arc::new(check))
-    }
-
-    pub(crate) fn from_weight<W: Weight + Clone>(weight: W, reader: &SegmentReader) -> Self {
-        let reader = reader.clone();
-        Self::new(move |docs| weight.matches_candidates(&reader, docs))
-    }
-
-    pub(crate) fn from_cloned_scorer<S: Scorer + Clone>(scorer: &dyn Scorer) -> Option<Self> {
-        let scorer = Mutex::new(scorer.downcast_ref::<S>()?.clone());
-        Some(Self::new(move |docs| {
-            let prepared = scorer.lock().unwrap();
-            let mut scorer = prepared.clone();
-            Ok(docs
-                .iter()
-                .map(|&doc| scorer.seek_danger(doc) == SeekDangerResult::Found)
-                .collect())
-        }))
-    }
-
-    /// Tests membership without advancing through intervening matching documents.
-    pub fn matches(&self, docs: &[DocId]) -> crate::Result<Vec<bool>> {
-        (self.0)(docs)
-    }
-}
 
 /// Iterates through all of the documents and scores matched by the DocSet
 /// `DocSet`.
@@ -117,40 +78,6 @@ pub trait Weight: Send + Sync + 'static {
     /// Whether evaluating this filter reads fast-field values rather than only postings.
     fn uses_fast_fields(&self) -> bool {
         false
-    }
-
-    /// Prepares reusable candidate checks. Posting-only leaves may materialize their matches.
-    fn candidate_filter(&self, reader: &SegmentReader) -> crate::Result<CandidateFilter> {
-        let mut scorer = self.scorer(reader, 1.0)?;
-        if scorer.is::<crate::query::AllScorer>() {
-            let max_doc = reader.max_doc();
-            return Ok(CandidateFilter::new(move |docs| {
-                Ok(docs.iter().map(|&doc| doc < max_doc).collect())
-            }));
-        }
-        let mut matched = common::BitSet::with_max_value(reader.max_doc());
-        let mut buffer = [0; COLLECT_BLOCK_BUFFER_LEN];
-        for_each_docset_buffered(scorer.as_mut(), &mut buffer, |docs| {
-            for &doc in docs {
-                matched.insert(doc);
-            }
-        });
-        Ok(CandidateFilter::new(move |docs| {
-            Ok(docs.iter().map(|&doc| matched.contains(doc)).collect())
-        }))
-    }
-
-    /// Tests sorted candidate document IDs without enumerating all matching documents.
-    fn matches_candidates(
-        &self,
-        reader: &SegmentReader,
-        docs: &[DocId],
-    ) -> crate::Result<Vec<bool>> {
-        let mut scorer = self.scorer_for_candidates_unpositioned(reader, 1.0, docs.len() as u32)?;
-        Ok(docs
-            .iter()
-            .map(|&doc| scorer.seek_danger(doc) == crate::docset::SeekDangerResult::Found)
-            .collect())
     }
 
     /// Returns the scorer for the given segment.
@@ -271,102 +198,6 @@ pub trait Weight: Send + Sync + 'static {
     ) -> crate::Result<()> {
         let mut scorer = self.pruning_scorer(reader, 1.0, threshold)?;
         for_each_pruning_scorer(scorer.as_mut(), callback);
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod candidate_tests {
-    use std::ops::Bound;
-
-    use super::*;
-    use crate::query::{
-        BooleanQuery, EnableScoring, ExistsQuery, FastFieldRangeQuery, Occur, Query, TermQuery,
-    };
-    use crate::schema::{IndexRecordOption, Schema, FAST, INDEXED, STRING};
-    use crate::{Index, TantivyDocument, Term};
-
-    #[test]
-    fn candidate_filter_matches_scorer_for_mixed_queries() -> crate::Result<()> {
-        let mut schema = Schema::builder();
-        let number = schema.add_u64_field("number", FAST | INDEXED);
-        let text = schema.add_text_field("text", STRING);
-        let index = Index::create_in_ram(schema.build());
-        let mut writer = index.writer_with_num_threads::<TantivyDocument>(1, 15_000_000)?;
-        for i in 0..300u64 {
-            let mut doc = TantivyDocument::new();
-            if i % 7 != 0 {
-                doc.add_u64(number, i);
-            }
-            if i % 11 == 0 {
-                doc.add_u64(number, 1000 - i);
-            }
-            doc.add_text(text, if i % 3 == 0 { "yes" } else { "no" });
-            writer.add_document(doc)?;
-        }
-        writer.commit()?;
-        let searcher = index.reader()?.searcher();
-        let reader = searcher.segment_reader(0);
-        let range = || {
-            Box::new(FastFieldRangeQuery::new(
-                Bound::Included(Term::from_field_u64(number, 50)),
-                Bound::Excluded(Term::from_field_u64(number, 150)),
-            )) as Box<dyn Query>
-        };
-        let term = || {
-            Box::new(TermQuery::new(
-                Term::from_field_text(text, "yes"),
-                IndexRecordOption::Basic,
-            )) as Box<dyn Query>
-        };
-        let mut queries: Vec<Box<dyn Query>> = vec![
-            range(),
-            Box::new(ExistsQuery::new("number".into(), false)),
-            Box::new(BooleanQuery::new(vec![
-                (Occur::Must, range()),
-                (Occur::Must, term()),
-            ])),
-            Box::new(BooleanQuery::new(vec![
-                (Occur::Should, range()),
-                (Occur::Should, term()),
-            ])),
-            Box::new(BooleanQuery::new(vec![
-                (Occur::Must, range()),
-                (Occur::MustNot, term()),
-            ])),
-            Box::new(BooleanQuery::new(vec![(Occur::MustNot, range())])),
-        ];
-        let mut minimum =
-            BooleanQuery::new(vec![(Occur::Should, range()), (Occur::Should, term())]);
-        minimum.set_minimum_number_should_match(2);
-        queries.push(Box::new(minimum));
-        for query in queries {
-            let weight = query.weight(EnableScoring::disabled_from_schema(searcher.schema()))?;
-            assert!(weight.uses_fast_fields());
-            let prepared = weight.candidate_filter(reader)?;
-            let mut scorer = weight.scorer(reader, 1.0)?;
-            let mut expected = vec![false; reader.max_doc() as usize];
-            while scorer.doc() != TERMINATED {
-                expected[scorer.doc() as usize] = true;
-                scorer.advance();
-            }
-            let mut scorer = weight.scorer_for_candidates_unpositioned(reader, 1.0, 10)?;
-            let lower_bound = scorer.doc();
-            for doc in 0..reader.max_doc() {
-                let matched =
-                    doc >= lower_bound && scorer.seek_danger(doc) == SeekDangerResult::Found;
-                assert_eq!(matched, expected[doc as usize], "{query:?}, doc={doc}");
-            }
-            // Each batch is sorted; successive batches intentionally move backwards.
-            for docs in [
-                vec![250, 299],
-                vec![0, 0, 3, 49, 50, 77, 149, 150, 200],
-                (0..reader.max_doc()).collect(),
-            ] {
-                let wanted: Vec<_> = docs.iter().map(|&doc| expected[doc as usize]).collect();
-                assert_eq!(prepared.matches(&docs)?, wanted, "{query:?}");
-            }
-        }
         Ok(())
     }
 }
