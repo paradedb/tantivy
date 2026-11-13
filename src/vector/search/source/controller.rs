@@ -169,13 +169,13 @@ impl WorkMeter {
             >= self.budget.total.get()
     }
 
-    /// Requires a quiet window worth 5% of this loop's resolved work budget.
+    /// Requires a quiet window worth 2% of this loop's resolved work budget.
     pub(crate) fn adaptive_stop(&mut self, quiet: bool) -> bool {
         if !quiet {
             self.last_active_work = self.charged;
             return false;
         }
-        self.charged.get() - self.last_active_work.get() >= 0.05 * self.budget.total.get()
+        self.charged.get() - self.last_active_work.get() >= 0.02 * self.budget.total.get()
     }
 
     /// The work charged so far.
@@ -255,7 +255,7 @@ mod shared_work_tests {
     fn adaptive_patience_uses_work_and_resets_on_activity() {
         let mut meter = WorkMeter::new(
             WorkBudget {
-                total: WorkUnits::new(100.0),
+                total: WorkUnits::new(250.0),
                 per_cluster: WorkUnits::new(0.25),
                 per_row: WorkUnits::new(0.75),
             },
@@ -295,7 +295,10 @@ mod shared_work_tests {
             for work in 1..=budget {
                 meter.open();
                 meter.rows(1);
-                assert_eq!(meter.adaptive_stop(true), work >= budget / 20);
+                assert_eq!(
+                    meter.adaptive_stop(true),
+                    work as f64 >= 0.02 * budget as f64
+                );
                 assert_eq!(meter.exhausted(), work == budget);
             }
         }
