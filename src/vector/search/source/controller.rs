@@ -169,13 +169,15 @@ impl WorkMeter {
             >= self.budget.total.get()
     }
 
-    /// Requires a quiet window worth 2% of this loop's resolved work budget.
+    /// Ramps patience from 0% at 500 work units to 5% at 2,000.
     pub(crate) fn adaptive_stop(&mut self, quiet: bool) -> bool {
         if !quiet {
             self.last_active_work = self.charged;
             return false;
         }
-        self.charged.get() - self.last_active_work.get() >= 0.02 * self.budget.total.get()
+        let budget = self.budget.total.get();
+        let fraction = 0.05 * ((budget - 500.0) / 1500.0).clamp(0.0, 1.0);
+        self.charged.get() - self.last_active_work.get() >= fraction * budget
     }
 
     /// The work charged so far.
@@ -255,7 +257,7 @@ mod shared_work_tests {
     fn adaptive_patience_uses_work_and_resets_on_activity() {
         let mut meter = WorkMeter::new(
             WorkBudget {
-                total: WorkUnits::new(250.0),
+                total: WorkUnits::new(1000.0),
                 per_cluster: WorkUnits::new(0.25),
                 per_row: WorkUnits::new(0.75),
             },
@@ -264,7 +266,7 @@ mod shared_work_tests {
         meter.open();
         meter.rows(1);
         assert!(!meter.adaptive_stop(false));
-        for rows in [1, 2] {
+        for rows in [4, 8] {
             meter.open();
             meter.rows(rows);
             assert!(!meter.adaptive_stop(true));
@@ -273,7 +275,7 @@ mod shared_work_tests {
             assert!(!meter.adaptive_stop(true));
         }
         meter.open();
-        meter.rows(3);
+        meter.rows(12);
         assert!(meter.adaptive_stop(true));
         assert!(!meter.adaptive_stop(false));
         meter.open();
@@ -283,7 +285,21 @@ mod shared_work_tests {
 
     #[test]
     fn adaptive_patience_scales_with_budget_without_changing_ceiling() {
-        for budget in [20, 100, 1000] {
+        for (budget, stop_at) in [
+            (20, 0),
+            (49, 0),
+            (50, 0),
+            (499, 0),
+            (500, 0),
+            (501, 1),
+            (1000, 17),
+            (1250, 32),
+            (1500, 50),
+            (1999, 100),
+            (2000, 100),
+            (2001, 101),
+            (4000, 200),
+        ] {
             let mut meter = WorkMeter::new(
                 WorkBudget {
                     total: WorkUnits::new(budget as f64),
@@ -292,13 +308,11 @@ mod shared_work_tests {
                 },
                 None,
             );
+            assert_eq!(meter.adaptive_stop(true), stop_at == 0);
             for work in 1..=budget {
                 meter.open();
                 meter.rows(1);
-                assert_eq!(
-                    meter.adaptive_stop(true),
-                    work as f64 >= 0.02 * budget as f64
-                );
+                assert_eq!(meter.adaptive_stop(true), work >= stop_at);
                 assert_eq!(meter.exhausted(), work == budget);
             }
         }
