@@ -3482,6 +3482,12 @@ mod late_filter_tests {
                 assert!(fruit.stats.iter().all(|s| s.late_filter));
                 assert!(fruit.stats.iter().any(|s| s.filter_checks > 0));
                 assert!(fruit.stats.iter().all(|s| s.exact_rows <= s.filter_checks));
+                for stats in &fruit.stats {
+                    assert!(stats.filter_candidates >= stats.filter_checks);
+                    assert!(stats.filter_checks <= stats.filter_batches * 64);
+                    assert!(stats.filter_batches <= stats.filter_checks);
+                    assert_eq!(stats.filter_matches, stats.exact_rows);
+                }
                 let reads = fixture.reads();
                 let first_exact = reads
                     .iter()

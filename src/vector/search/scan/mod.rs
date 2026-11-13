@@ -124,7 +124,10 @@ pub(crate) struct ScanReport {
     /// Rows shortlisted from the source.
     pub(crate) candidates_scored: usize,
     pub(crate) late_filter: bool,
+    pub(crate) filter_candidates: usize,
+    pub(crate) filter_batches: usize,
     pub(crate) filter_checks: usize,
+    pub(crate) filter_matches: usize,
     pub(crate) router_retries: usize,
     pub(crate) recall_reached: bool,
     /// One per active layer on a quantized segment; empty at full precision.
@@ -919,6 +922,7 @@ where
 
     fn filter_shortlist(&mut self, limit: usize) -> crate::Result<()> {
         let _stage = enter_vector_stage(VectorStage::LateFilter);
+        let selection = enter_vector_stage(VectorStage::LateFilterSelect);
         let filter = self.late_filter.as_ref().unwrap().clone();
         let threshold = self
             .bound
@@ -928,6 +932,7 @@ where
             .quantized
             .as_mut()
             .expect("late filters require quantization");
+        self.report.filter_candidates += state.candidates.len();
         let mut pending: Vec<_> = state
             .candidates
             .candidates_with_upper(state.segment_ord)
@@ -952,24 +957,30 @@ where
                 })
                 .collect::<Vec<_>>(),
         );
+        drop(selection);
         let mut processed = HashMap::<u32, Vec<u32>>::new();
         loop {
+            let selection = enter_vector_stage(VectorStage::LateFilterSelect);
             let threshold = self
                 .bound
                 .shared_threshold()
                 .map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score)));
             let mut indexed = Vec::with_capacity(FILTER_BATCH_SIZE);
-            for address in std::iter::from_fn(|| ranking.pop())
-                .map(|ranked| pending[ranked.node.1])
-                .filter(|(_, upper)| threshold.is_none_or(|threshold| threshold.admits(*upper)))
-                .take(FILTER_BATCH_SIZE)
-                .map(|(candidate, _)| candidate.address.block_address)
-            {
+            indexed.extend(
+                std::iter::from_fn(|| ranking.pop())
+                    .map(|ranked| pending[ranked.node.1])
+                    .filter(|(_, upper)| threshold.is_none_or(|threshold| threshold.admits(*upper)))
+                    .take(FILTER_BATCH_SIZE)
+                    .map(|(candidate, _)| (0, candidate.address.block_address)),
+            );
+            drop(selection);
+            let doc_ids = enter_vector_stage(VectorStage::LateFilterDocIds);
+            for (doc, address) in &mut indexed {
                 let docs = self.filter_docs.entry(address.block).or_default();
                 if docs.is_empty() {
                     self.reader.read_doc_ids(address.block as usize, docs)?;
                 }
-                indexed.push((docs[address.row as usize], address));
+                *doc = docs[address.row as usize];
                 if limit != usize::MAX {
                     processed
                         .entry(address.block)
@@ -977,19 +988,29 @@ where
                         .push(address.row);
                 }
             }
+            drop(doc_ids);
             if indexed.is_empty() {
                 break;
             }
+            self.report.filter_batches += 1;
+            let sorting = enter_vector_stage(VectorStage::LateFilterSort);
             indexed.sort_unstable_by_key(|&(doc, _)| doc);
             let ids: Vec<_> = indexed.iter().map(|&(doc, _)| doc).collect();
-            let matched = filter.matches(&ids)?;
+            drop(sorting);
+            let matched = {
+                let _predicate = enter_vector_stage(VectorStage::LateFilterPredicate);
+                filter.matches(&ids)?
+            };
             self.report.filter_checks += ids.len();
+            let sorting = enter_vector_stage(VectorStage::LateFilterSort);
             let mut passing: Vec<_> = indexed
                 .iter()
                 .zip(matched)
                 .filter_map(|(&(doc, address), yes)| yes.then_some((address, doc)))
                 .collect();
+            self.report.filter_matches += passing.len();
             passing.sort_unstable_by_key(|&(address, _)| address);
+            drop(sorting);
             for group in passing.chunk_by(|(a, _), (b, _)| a.block == b.block) {
                 let cluster = group[0].0.block as usize;
                 let offsets: Vec<_> = group.iter().map(|(address, _)| address.row).collect();
