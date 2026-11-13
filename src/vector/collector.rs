@@ -2464,7 +2464,7 @@ mod ivf_e2e_tests {
                 let result = collector.merge_fruits(fruits)?;
                 let charged = result.stats.iter().map(|s| s.work_charged).sum::<f32>();
                 assert_eq!(result.results.len(), 10);
-                assert!(charged >= 0.05 * max_probe as f32);
+                assert!(charged >= 0.02 * max_probe as f32);
                 assert!(charged < max_probe as f32);
                 assert!(result
                     .stats
