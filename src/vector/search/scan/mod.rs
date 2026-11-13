@@ -54,6 +54,46 @@ thread_local! {
     /// Scores mostly unseen replicated clusters row by row on this thread, so tests can compare
     /// that path with the whole-band one.
     pub(crate) static WHOLE_BAND_ADMISSION_OFF: Cell<bool> = const { Cell::new(false) };
+    /// Scores the narrowed shortlist in cluster order without first scoring the best estimates,
+    /// on this thread, so tests can compare the two exact-phase orders.
+    pub(crate) static BEST_ESTIMATES_FIRST_OFF: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the exact phase scores the best `top_n` estimates before the rest of the shortlist:
+/// with the top-k filled by the likeliest hits first, the threshold is at its tightest when the
+/// remaining survivors are rechecked, so fewer of them are read and scored.
+pub(crate) fn best_estimates_first() -> bool {
+    #[cfg(test)]
+    if BEST_ESTIMATES_FIRST_OFF.with(Cell::get) {
+        return false;
+    }
+    true
+}
+
+/// The `limit` candidates with the best estimates across `scans`, ties broken by address.
+pub(crate) fn best_estimates<'s, 'a: 's, T, K, C>(
+    scans: impl IntoIterator<Item = &'s SegmentScan<'a, T, K, C>>,
+    limit: usize,
+) -> Vec<Candidate>
+where
+    T: VectorElement,
+    K: SegmentSortKeyComputer + 's,
+    C: Comparator<K::SegmentSortKey> + 's,
+{
+    let mut candidates: Vec<_> = scans
+        .into_iter()
+        .flat_map(|scan| scan.refinement_candidates(limit))
+        .collect();
+    if candidates.len() > limit {
+        candidates.select_nth_unstable_by(limit, |a, b| {
+            b.bound
+                .estimate()
+                .total_cmp(&a.bound.estimate())
+                .then_with(|| a.address.cmp(&b.address))
+        });
+        candidates.truncate(limit);
+    }
+    candidates
 }
 
 /// Sizes for one segment scan.
@@ -677,6 +717,8 @@ where
     /// The admission-rate measurement; `None` unless the RateAPS is on.
     rate: Option<RateApsState>,
     recall_fraction: Option<f64>,
+    /// The hits the scan returns; the exact phase scores this many best estimates first.
+    top_n: usize,
     report: ScanReport,
 }
 
@@ -738,6 +780,7 @@ where
             by_cluster: Vec::new(),
             recall_fraction,
             rate: recall_fraction.map(|_| RateApsState::default()),
+            top_n: config.top_n,
             report: ScanReport {
                 layers: vec![LayerReport::default(); layers],
                 ..ScanReport::default()
@@ -750,7 +793,7 @@ where
     }
 
     /// Scores one segment: shortlists each cluster `source` supplies, narrows the shortlist one
-    /// quantized layer at a time, then scores what is left exactly.
+    /// quantized layer at a time, then scores what is left exactly, the best estimates first.
     pub(crate) fn run(&mut self, source: &mut impl ClusterSource) -> crate::Result<()> {
         let stage = enter_vector_stage(self.shortlist_stage());
         while let Some(rows) = source.next()? {
@@ -761,7 +804,12 @@ where
             }
         }
         drop(stage);
-        self.refine_shortlist()
+        self.narrow_shortlist()?;
+        if best_estimates_first() {
+            let best = self.refinement_candidates(self.top_n);
+            self.refine_topk(&best)?;
+        }
+        self.score_shortlist()
     }
 
     pub(crate) fn swap_rate(&mut self, rate: &mut Option<RateApsState>) {
@@ -785,12 +833,14 @@ where
         reached
     }
 
-    pub(crate) fn refine_shortlist(&mut self) -> crate::Result<()> {
+    /// Prunes the shortlist at layer 0's boundary, then refines and prunes it with each later
+    /// quantized layer. What survives is scored by [`Self::score_shortlist`].
+    pub(crate) fn narrow_shortlist(&mut self) -> crate::Result<()> {
         self.close_shortlist();
         for layer in self.refining_layers() {
             self.narrow(layer)?;
         }
-        self.score_shortlist()
+        Ok(())
     }
 
     pub(crate) fn refinement_candidates(&self, limit: usize) -> Vec<Candidate> {
@@ -1020,7 +1070,7 @@ where
 
     /// Scores the last boundary's survivors exactly, one block at a time in cluster order, after
     /// dropping each block's candidates the pruning threshold has risen past.
-    fn score_shortlist(&mut self) -> crate::Result<()> {
+    pub(crate) fn score_shortlist(&mut self) -> crate::Result<()> {
         let Some(state) = &mut self.quantized else {
             return Ok(());
         };
