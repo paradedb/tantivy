@@ -19,8 +19,8 @@ use crate::columnar::merge::merge_dict_column::merge_bytes_or_str_column;
 use crate::columnar::writer::CompatibleNumericalTypes;
 use crate::dynamic_column::DynamicColumn;
 use crate::{
-    BytesColumn, CURRENT_VERSION, Column, ColumnIndex, ColumnType, ColumnValues,
-    DynamicColumnHandle, NumericalType, NumericalValue,
+    BytesColumn, Column, ColumnIndex, ColumnType, ColumnValues, DynamicColumnHandle, NumericalType,
+    NumericalValue,
 };
 
 /// Column types are grouped into different categories.
@@ -178,7 +178,6 @@ fn merge_column(
                 &merge_column_values,
                 codec_types,
                 wrt,
-                CURRENT_VERSION,
             )?;
         }
         ColumnType::IpAddr => {
@@ -207,12 +206,7 @@ fn merge_column(
                 merge_row_order,
             };
 
-            serialize_column_mappable_to_u128(
-                merged_column_index,
-                &merge_column_values,
-                wrt,
-                CURRENT_VERSION,
-            )?;
+            serialize_column_mappable_to_u128(merged_column_index, &merge_column_values, wrt)?;
         }
         ColumnType::Bytes | ColumnType::Str => {
             let mut column_indexes: Vec<ColumnIndex> = Vec::with_capacity(columns_to_merge.len());

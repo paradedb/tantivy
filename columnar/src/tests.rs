@@ -28,7 +28,7 @@ fn test_dataframe_writer_str() {
     assert_eq!(columnar.num_columns(), 1);
     let cols: Vec<DynamicColumnHandle> = columnar.read_columns("my_string").unwrap();
     assert_eq!(cols.len(), 1);
-    assert_eq!(cols[0].num_bytes(), 81);
+    assert_eq!(cols[0].num_bytes(), 73);
 }
 
 #[test]
@@ -44,7 +44,7 @@ fn test_dataframe_writer_bytes() {
     assert_eq!(columnar.num_columns(), 1);
     let cols: Vec<DynamicColumnHandle> = columnar.read_columns("my_string").unwrap();
     assert_eq!(cols.len(), 1);
-    assert_eq!(cols[0].num_bytes(), 81);
+    assert_eq!(cols[0].num_bytes(), 73);
 }
 
 #[test]
@@ -60,7 +60,7 @@ fn test_dataframe_writer_bool() {
     assert_eq!(columnar.num_columns(), 1);
     let cols: Vec<DynamicColumnHandle> = columnar.read_columns("bool.value").unwrap();
     assert_eq!(cols.len(), 1);
-    assert_eq!(cols[0].num_bytes(), 26);
+    assert_eq!(cols[0].num_bytes(), 22);
     assert_eq!(cols[0].column_type(), ColumnType::Bool);
     let dyn_bool_col = cols[0].open().unwrap();
     let DynamicColumn::Bool(bool_col) = dyn_bool_col else {
@@ -87,7 +87,7 @@ fn test_dataframe_writer_u64_multivalued() {
     assert_eq!(columnar.num_columns(), 1);
     let cols: Vec<DynamicColumnHandle> = columnar.read_columns("divisor").unwrap();
     assert_eq!(cols.len(), 1);
-    assert_eq!(cols[0].num_bytes(), 58);
+    assert_eq!(cols[0].num_bytes(), 50);
     let dyn_i64_col = cols[0].open().unwrap();
     let DynamicColumn::I64(divisor_col) = dyn_i64_col else {
         panic!();
@@ -112,7 +112,7 @@ fn test_dataframe_writer_ip_addr() {
     assert_eq!(columnar.num_columns(), 1);
     let cols: Vec<DynamicColumnHandle> = columnar.read_columns("ip_addr").unwrap();
     assert_eq!(cols.len(), 1);
-    assert_eq!(cols[0].num_bytes(), 46);
+    assert_eq!(cols[0].num_bytes(), 42);
     assert_eq!(cols[0].column_type(), ColumnType::IpAddr);
     let dyn_bool_col = cols[0].open().unwrap();
     let DynamicColumn::IpAddr(ip_col) = dyn_bool_col else {
@@ -150,7 +150,7 @@ fn test_dataframe_writer_numerical() {
     // - header 14 bytes
     // - vals  8 //< due to padding? could have been 1byte?.
     // - null footer 6 bytes
-    assert_eq!(cols[0].num_bytes(), 37);
+    assert_eq!(cols[0].num_bytes(), 33);
     let column = cols[0].open().unwrap();
     let DynamicColumn::I64(column_i64) = column else {
         panic!();
