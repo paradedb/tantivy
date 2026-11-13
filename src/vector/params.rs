@@ -15,7 +15,7 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 
 /// Minimum estimated matches for deferring a fast-field filter. Keep the strategy independent
 /// of the probe ceiling so increasing recall does not switch access paths mid-sweep.
-pub const MIN_LATE_FILTER_MATCHES: usize = 250_000;
+pub const MIN_LATE_FILTER_MATCHES: usize = 50_000;
 
 /// Query-wide filter evaluation, selected before worker assignment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

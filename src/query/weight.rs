@@ -1,6 +1,8 @@
+use std::sync::Mutex;
+
 use super::scorer::{BasicPruningScorer, PruningScorer};
 use super::Scorer;
-use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
+use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
 use crate::index::SegmentReader;
 use crate::query::Explanation;
 use crate::{DocId, DocSet, Score, TERMINATED};
@@ -22,6 +24,18 @@ impl CandidateFilter {
     pub(crate) fn from_weight<W: Weight + Clone>(weight: W, reader: &SegmentReader) -> Self {
         let reader = reader.clone();
         Self::new(move |docs| weight.matches_candidates(&reader, docs))
+    }
+
+    pub(crate) fn from_cloned_scorer<S: Scorer + Clone>(scorer: &dyn Scorer) -> Option<Self> {
+        let scorer = Mutex::new(scorer.downcast_ref::<S>()?.clone());
+        Some(Self::new(move |docs| {
+            let prepared = scorer.lock().unwrap();
+            let mut scorer = prepared.clone();
+            Ok(docs
+                .iter()
+                .map(|&doc| scorer.seek_danger(doc) == SeekDangerResult::Found)
+                .collect())
+        }))
     }
 
     /// Tests membership without advancing through intervening matching documents.

@@ -16,7 +16,8 @@ use super::fast_field_range_doc_set::RangeDocSet;
 use super::sorted_internals::{binary_search_null_boundary, binary_search_sorted};
 use crate::index::SegmentReader;
 use crate::query::{
-    AllScorer, ConstScorer, EmptyScorer, EnableScoring, Explanation, Query, Scorer, Weight,
+    AllScorer, CandidateFilter, ConstScorer, EmptyScorer, EnableScoring, Explanation, Query,
+    Scorer, Weight,
 };
 use crate::schema::{Type, ValueBytes};
 use crate::{DocId, DocSet, Order, Score, TantivyError, Term};
@@ -59,14 +60,24 @@ impl FastFieldRangeWeight {
 }
 
 impl Weight for FastFieldRangeWeight {
-    fn candidate_filter(
-        &self,
-        reader: &SegmentReader,
-    ) -> crate::Result<crate::query::CandidateFilter> {
-        Ok(crate::query::CandidateFilter::from_weight(
-            self.clone(),
-            reader,
-        ))
+    fn candidate_filter(&self, reader: &SegmentReader) -> crate::Result<CandidateFilter> {
+        let scorer = self.scorer_for_candidates_unpositioned(reader, 1.0, 0)?;
+        Ok(
+            CandidateFilter::from_cloned_scorer::<ConstScorer<RangeDocSet<u64>>>(scorer.as_ref())
+                .or_else(|| {
+                    CandidateFilter::from_cloned_scorer::<ConstScorer<RangeDocSet<Ipv6Addr>>>(
+                        scorer.as_ref(),
+                    )
+                })
+                .or_else(|| {
+                    CandidateFilter::from_cloned_scorer::<ConstScorer<ContiguousDocSet>>(
+                        scorer.as_ref(),
+                    )
+                })
+                .or_else(|| CandidateFilter::from_cloned_scorer::<AllScorer>(scorer.as_ref()))
+                .or_else(|| CandidateFilter::from_cloned_scorer::<EmptyScorer>(scorer.as_ref()))
+                .expect("fast-field ranges use cloneable scorers"),
+        )
     }
 
     fn uses_fast_fields(&self) -> bool {
@@ -1804,6 +1815,11 @@ pub(crate) mod ip_range_tests {
         let count =
             crate::query::weight::Weight::count(&range_weight, searcher.segment_reader(0)).unwrap();
         assert_eq!(count, 2);
+        let prepared = range_weight
+            .candidate_filter(searcher.segment_reader(0))
+            .unwrap();
+        assert_eq!(prepared.matches(&[1, 2]).unwrap(), [true, true]);
+        assert_eq!(prepared.matches(&[0, 1]).unwrap(), [false, true]);
     }
 
     pub fn create_index_from_ip_docs(docs: &[Doc]) -> Index {
@@ -1910,7 +1926,7 @@ mod sorted_range_tests {
     use crate::query::range_query::range_query_fastfield::FastFieldRangeWeight;
     use crate::query::{RangeQuery, Scorer, Weight};
     use crate::schema::{BytesOptions, NumericOptions, SchemaBuilder, FAST};
-    use crate::{IndexWriter, Order, TantivyDocument, Term};
+    use crate::{IndexWriter, Order, TantivyDocument, Term, TERMINATED};
 
     fn create_sorted_index_u64(order: Order, values: &[u64]) -> (Index, crate::schema::Field) {
         let mut schema_builder = SchemaBuilder::new();
@@ -2062,9 +2078,31 @@ mod sorted_range_tests {
     fn assert_sorted_range_cases(order: Order, cases: &[(&str, Bound<u64>, Bound<u64>, usize)]) {
         let (index, field) =
             create_sorted_index_u64(order, &[10, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
+        let searcher = index.reader().unwrap().searcher();
+        let reader = searcher.segment_reader(0);
         for (name, lower, upper, expected) in cases {
             let actual = count_range(&index, field, lower.clone(), upper.clone());
             assert_eq!(actual, *expected, "order={order:?}, case={name}");
+            let weight = FastFieldRangeWeight::new(BoundsRange::new(
+                lower.clone().map(|v| Term::from_field_u64(field, v)),
+                upper.clone().map(|v| Term::from_field_u64(field, v)),
+            ));
+            let prepared = weight.candidate_filter(reader).unwrap();
+            let mut scorer = weight.scorer(reader, 1.0).unwrap();
+            let mut matches = vec![false; reader.max_doc() as usize];
+            while scorer.doc() != TERMINATED {
+                matches[scorer.doc() as usize] = true;
+                scorer.advance();
+            }
+            for docs in [&[8, 9][..], &[0, 1, 4, 5][..], &[0, 1, 8, 9][..]] {
+                assert_eq!(
+                    prepared.matches(docs).unwrap(),
+                    docs.iter()
+                        .map(|&doc| matches[doc as usize])
+                        .collect::<Vec<_>>(),
+                    "order={order:?}, case={name}"
+                );
+            }
         }
     }
 

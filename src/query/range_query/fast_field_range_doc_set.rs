@@ -7,7 +7,7 @@ use crate::docset::SeekDangerResult;
 use crate::{DocId, DocSet, TERMINATED};
 
 /// Helper to have a cursor over a vec of docids
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct VecCursor {
     docs: Vec<u32>,
     current_pos: usize,
@@ -40,6 +40,7 @@ impl VecCursor {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct RangeDocSet<T> {
     /// The range filter on the values.
     value_range: RangeInclusive<T>,
