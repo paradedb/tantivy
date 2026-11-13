@@ -12,7 +12,7 @@ use crate::column_values::{
     CodecType, ColumnValues, load_u64_based_column_values, serialize_u64_based_column_values,
 };
 use crate::iterable::Iterable;
-use crate::{CURRENT_VERSION, DocId, RowId, Version};
+use crate::{DocId, RowId, Version};
 
 pub struct SerializableMultivalueIndex<'a> {
     pub doc_ids_with_values: SerializableOptionalIndex<'a>,
@@ -22,7 +22,6 @@ pub struct SerializableMultivalueIndex<'a> {
 pub fn serialize_multivalued_index(
     multivalued_index: &SerializableMultivalueIndex,
     output: &mut impl Write,
-    version: Version,
 ) -> io::Result<()> {
     let SerializableMultivalueIndex {
         doc_ids_with_values,
@@ -34,14 +33,15 @@ pub fn serialize_multivalued_index(
         num_rows,
     } = doc_ids_with_values;
     serialize_optional_index(&**non_null_row_ids, *num_rows, &mut count_writer)?;
-    let optional_len = count_writer.written_bytes();
+    let optional_len = count_writer.written_bytes() as u32;
     let output = count_writer.finish();
     serialize_u64_based_column_values(
         &**start_offsets,
         &[CodecType::Bitpacked, CodecType::Linear],
         output,
     )?;
-    version.write_len_footer(optional_len, output)
+    output.write_all(&optional_len.to_le_bytes())?;
+    Ok(())
 }
 
 pub fn open_multivalued_index(
@@ -56,9 +56,17 @@ pub fn open_multivalued_index(
                 start_index_column,
             }))
         }
-        Version::V2 | Version::V3 => {
-            let (body_bytes, optional_index_len) = format_version.split_len_footer(file_slice)?;
-            let (optional_index_bytes, start_index_bytes) = body_bytes.split(optional_index_len);
+        Version::V2 => {
+            let (body_bytes, optional_index_len) = file_slice.split_from_end(4);
+            let optional_index_len = u32::from_le_bytes(
+                optional_index_len
+                    .read_bytes()?
+                    .as_slice()
+                    .try_into()
+                    .unwrap(),
+            );
+            let (optional_index_bytes, start_index_bytes) =
+                body_bytes.split(optional_index_len as usize);
             let optional_index = open_optional_index(optional_index_bytes)?;
             let start_index_column: Arc<dyn ColumnValues<RowId>> =
                 load_u64_based_column_values(start_index_bytes)?;
@@ -182,14 +190,9 @@ impl MultiValueIndex {
             start_offsets: Box::new(&compact_start_offsets[..]),
         };
         let mut buffer = Vec::new();
-        serialize_multivalued_index(
-            &serializable_multivalued_index,
-            &mut buffer,
-            CURRENT_VERSION,
-        )
-        .unwrap();
+        serialize_multivalued_index(&serializable_multivalued_index, &mut buffer).unwrap();
         let file_slice = FileSlice::from(buffer);
-        open_multivalued_index(file_slice, CURRENT_VERSION).unwrap()
+        open_multivalued_index(file_slice, Version::V2).unwrap()
     }
 
     pub fn get_start_index_column(&self) -> &Arc<dyn crate::ColumnValues<RowId>> {

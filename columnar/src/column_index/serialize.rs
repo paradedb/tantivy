@@ -46,8 +46,7 @@ impl SerializableColumnIndex<'_> {
 pub fn serialize_column_index(
     column_index: SerializableColumnIndex,
     output: &mut impl Write,
-    version: Version,
-) -> io::Result<u64> {
+) -> io::Result<u32> {
     let mut output = CountingWriter::wrap(output);
     let cardinality = column_index.get_cardinality().to_code();
     output.write_all(&[cardinality])?;
@@ -58,10 +57,11 @@ pub fn serialize_column_index(
             num_rows,
         }) => serialize_optional_index(non_null_row_ids.as_ref(), num_rows, &mut output)?,
         SerializableColumnIndex::Multivalued(multivalued_index) => {
-            serialize_multivalued_index(&multivalued_index, &mut output, version)?
+            serialize_multivalued_index(&multivalued_index, &mut output)?
         }
     }
-    Ok(output.written_bytes())
+    let column_index_num_bytes = output.written_bytes() as u32;
+    Ok(column_index_num_bytes)
 }
 
 /// Open a serialized column index.

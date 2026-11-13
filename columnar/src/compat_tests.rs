@@ -65,12 +65,6 @@ fn test_format_v2() {
     test_format(&path);
 }
 
-#[test]
-fn test_format_v3() {
-    let path = path_for_version("v3");
-    test_format(&path);
-}
-
 fn test_format(path: &str) {
     let file_content = std::fs::read(path).unwrap();
     let reader = ColumnarReader::open(file_content).unwrap();
