@@ -829,20 +829,27 @@ where
         state.candidates.order_by_cluster(&mut self.by_cluster);
         for &b in &self.by_cluster {
             let group = state.candidates.rows(b);
-            let offsets: Vec<_> = rows
-                .iter()
-                .filter(|row| {
-                    row.block as usize == group.cluster && group.rows.contains(&(row.row as usize))
-                })
-                .map(|row| row.row - group.rows.start as u32)
-                .filter(|offset| group.offsets.unwrap().binary_search(offset).is_ok())
-                .collect();
+            let group_offsets = group.offsets.unwrap();
+            // The selected rows' doc ids come with them when the block holds its candidates'.
+            let mut offsets = Vec::new();
+            let mut docs = Vec::new();
+            for row in rows.iter().filter(|row| {
+                row.block as usize == group.cluster && group.rows.contains(&(row.row as usize))
+            }) {
+                let offset = row.row - group.rows.start as u32;
+                if let Ok(at) = group_offsets.binary_search(&offset) {
+                    offsets.push(offset);
+                    if let Some(group_docs) = group.docs {
+                        docs.push(group_docs[at]);
+                    }
+                }
+            }
             if offsets.is_empty() {
                 continue;
             }
             let selected = ClusterRows {
                 offsets: Some(&offsets),
-                docs: None,
+                docs: group.docs.map(|_| docs.as_slice()),
                 ..group
             };
             let scored = self
