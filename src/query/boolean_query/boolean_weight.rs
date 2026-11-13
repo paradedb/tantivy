@@ -422,6 +422,15 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         self
     }
 
+    fn single_positive_weight(&self) -> Option<&dyn Weight> {
+        let &[(occur, ref weight)] = self.weights.as_slice() else {
+            return None;
+        };
+        (occur != Occur::MustNot
+            && self.minimum_number_should_match <= usize::from(occur == Occur::Should))
+        .then_some(weight.as_ref())
+    }
+
     fn should_use_block_maxscore(&self, scorers: &[TermScorer], max_doc: DocId) -> bool {
         match self.disjunction_pruning {
             DisjunctionPruning::Auto => {
@@ -804,11 +813,9 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         if self.weights.is_empty() {
             Ok(Box::new(EmptyScorer))
         } else if self.weights.len() == 1 {
-            let &(occur, ref weight) = &self.weights[0];
-            if occur == Occur::MustNot {
-                Ok(Box::new(EmptyScorer))
-            } else {
-                weight.scorer(reader, boost)
+            match self.single_positive_weight() {
+                Some(weight) => weight.scorer(reader, boost),
+                None => Ok(Box::new(EmptyScorer)),
             }
         } else if self.scoring_enabled {
             self.complex_scorer(reader, boost, &self.score_combiner_fn)
@@ -839,11 +846,8 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         boost: Score,
         candidate_size: u32,
     ) -> crate::Result<Box<dyn Scorer>> {
-        if self.weights.len() == 1 {
-            let &(occur, ref weight) = &self.weights[0];
-            if occur != Occur::MustNot {
-                return weight.scorer_for_candidates_unpositioned(reader, boost, candidate_size);
-            }
+        if let Some(weight) = self.single_positive_weight() {
+            return weight.scorer_for_candidates_unpositioned(reader, boost, candidate_size);
         }
         self.scorer(reader, boost)
     }

@@ -1577,3 +1577,132 @@ mod proptest_boolean_query {
         });
     }
 }
+
+#[cfg(test)]
+mod single_clause_minimum_tests {
+    use super::*;
+    use crate::collector::{Count, DocSetCollector, TopDocs};
+    use crate::query::{
+        AllQuery, ConstScoreQuery, EmptyQuery, EnableScoring, Occur, Query, TermQuery,
+    };
+    use crate::schema::{IndexRecordOption, Schema, TEXT};
+    use crate::{DocId, DocSet, Index, SeekDangerResult, Term, TERMINATED};
+
+    #[test]
+    fn single_clause_minimum_should_match_agrees_across_entry_points() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer_for_tests()?;
+        writer.add_document(doc!(text => "a b"))?;
+        writer.add_document(doc!(text => "b"))?;
+        writer.add_document(doc!(text => "a"))?;
+        writer.commit()?;
+
+        let searcher = index.reader()?.searcher();
+        let segment = searcher.segment_reader(0);
+        let children: Vec<(&str, Box<dyn Query>, Vec<DocId>)> = vec![
+            ("empty", Box::new(EmptyQuery), vec![]),
+            ("all", Box::new(AllQuery), vec![0, 1, 2]),
+            (
+                "const_all",
+                Box::new(ConstScoreQuery::new(
+                    Box::new(AllQuery) as Box<dyn Query>,
+                    1.0,
+                )),
+                vec![0, 1, 2],
+            ),
+            (
+                "term_a",
+                Box::new(TermQuery::new(
+                    Term::from_field_text(text, "a"),
+                    IndexRecordOption::WithFreqs,
+                )),
+                vec![0, 2],
+            ),
+        ];
+
+        for (name, child, child_docs) in &children {
+            for occur in [Occur::Must, Occur::Should, Occur::MustNot] {
+                for min_should in [0, 1, 2, usize::MAX] {
+                    let query = BooleanQuery::with_minimum_required_clauses(
+                        vec![(occur, child.box_clone())],
+                        min_should,
+                    );
+                    let expected: &[DocId] = if occur != Occur::MustNot
+                        && min_should <= usize::from(occur == Occur::Should)
+                    {
+                        child_docs.as_slice()
+                    } else {
+                        &[]
+                    };
+
+                    assert_eq!(
+                        searcher.search(&query, &Count)?,
+                        expected.len(),
+                        "{name} {occur:?} min={min_should}"
+                    );
+                    let mut collected: Vec<DocId> = searcher
+                        .search(&query, &DocSetCollector)?
+                        .into_iter()
+                        .map(|addr| addr.doc_id)
+                        .collect();
+                    collected.sort_unstable();
+                    assert_eq!(collected, expected, "{name} {occur:?} min={min_should}");
+
+                    let mut top_docs: Vec<DocId> = searcher
+                        .search(&query, &TopDocs::with_limit(10).order_by_score())?
+                        .into_iter()
+                        .map(|(_, addr)| addr.doc_id)
+                        .collect();
+                    top_docs.sort_unstable();
+                    assert_eq!(top_docs, expected, "{name} {occur:?} min={min_should}");
+
+                    for scoring in [false, true] {
+                        let weight = query.weight(if scoring {
+                            EnableScoring::enabled_from_searcher(&searcher)
+                        } else {
+                            EnableScoring::disabled_from_searcher(&searcher)
+                        })?;
+
+                        let mut scorer_docs = Vec::new();
+                        let mut scorer = weight.scorer(segment, 1.0)?;
+                        while scorer.doc() != TERMINATED {
+                            scorer_docs.push(scorer.doc());
+                            scorer.advance();
+                        }
+                        assert_eq!(
+                            scorer_docs, expected,
+                            "scorer {name} {occur:?} min={min_should} scoring={scoring}"
+                        );
+
+                        let mut pruning_docs = Vec::new();
+                        let mut pruning = weight.pruning_scorer(segment, 1.0, f32::MIN)?;
+                        while pruning.doc() != TERMINATED {
+                            pruning_docs.push(pruning.doc());
+                            pruning.advance();
+                        }
+                        assert_eq!(
+                            pruning_docs, expected,
+                            "pruning_scorer {name} {occur:?} min={min_should} scoring={scoring}"
+                        );
+
+                        let mut cand_scorer =
+                            weight.scorer_for_candidates_unpositioned(segment, 1.0, 2)?;
+                        let mut cand_docs = Vec::new();
+                        for doc in 0..segment.max_doc() {
+                            if matches!(cand_scorer.seek_danger(doc), SeekDangerResult::Found) {
+                                cand_docs.push(doc);
+                            }
+                        }
+                        assert_eq!(
+                            cand_docs, expected,
+                            "candidates {name} {occur:?} min={min_should} scoring={scoring}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
