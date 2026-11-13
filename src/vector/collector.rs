@@ -974,7 +974,7 @@ where
     let mut rate = collector
         .probe_params
         .adaptive_probing
-        .filter(|_| top_n > 0)
+        .filter(|_| top_n > 0 && !late_filter)
         .map(|_| crate::vector::search::scan::RateApsState::default());
     let mut recall_reached = false;
     loop {
@@ -3463,7 +3463,7 @@ mod late_filter_tests {
             for (shared, adaptive) in [(false, false), (false, true), (true, false), (true, true)] {
                 let mut builder = builder.clone();
                 builder.probe_params.adaptive_probing = adaptive.then_some(AdaptiveProbeParams {
-                    admission_fraction: 1e-16,
+                    admission_fraction: 1.0,
                 });
                 let work = shared.then(|| {
                     Arc::new(crate::vector::AtomicVectorWork::default())
@@ -3480,6 +3480,10 @@ mod late_filter_tests {
                 )?)?;
                 assert_eq!(fruit.results, fixture.oracle(&filter, &query, 10)?);
                 assert!(fruit.stats.iter().all(|s| s.late_filter));
+                assert!(fruit
+                    .stats
+                    .iter()
+                    .all(|s| s.termination != ProbeTermination::QuantizedRecall));
                 assert!(fruit.stats.iter().any(|s| s.filter_checks > 0));
                 assert!(fruit.stats.iter().all(|s| s.exact_rows <= s.filter_checks));
                 for stats in &fruit.stats {

@@ -776,6 +776,10 @@ where
     }
 
     pub(crate) fn with_candidate_filter(mut self, filter: Option<CandidateFilter>) -> Self {
+        if filter.is_some() {
+            self.recall_fraction = None;
+            self.rate = None;
+        }
         if let Some(state) = &mut self.quantized {
             state.late_filter = filter.is_some();
             if state.late_filter {
