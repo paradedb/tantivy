@@ -8,10 +8,11 @@ use crate::column::serialize_column_mappable_to_u64;
 use crate::column_index::SerializableColumnIndex;
 use crate::column_values::CodecType;
 use crate::iterable::Iterable;
-use crate::{BytesColumn, MergeRowOrder, ShuffleMergeOrder};
+use crate::{BytesColumn, CURRENT_VERSION, MergeRowOrder, ShuffleMergeOrder};
 
-// Serialize [Dictionary, Column, dictionary num bytes U32::LE]
-// Column: [Column Index, Column Values, column index num bytes U32::LE]
+// Serialize [Dictionary, Column, dictionary num bytes LE]
+// Column: [Column Index, Column Values, column index num bytes LE]
+// Both lengths have the width of `CURRENT_VERSION`, see `Version::len_footer_num_bytes`.
 pub fn merge_bytes_or_str_column(
     column_index: SerializableColumnIndex<'_>,
     bytes_columns: &[Option<BytesColumn>],
@@ -23,7 +24,7 @@ pub fn merge_bytes_or_str_column(
     let mut output = CountingWriter::wrap(output);
     // TODO !!! Remove useless terms.
     let term_ord_mapping = serialize_merged_dict(bytes_columns, merge_row_order, &mut output)?;
-    let dictionary_num_bytes: u32 = output.written_bytes() as u32;
+    let dictionary_num_bytes = output.written_bytes();
     let output = output.finish();
     let remapped_term_ordinals_values = RemappedTermOrdinalsValues {
         bytes_columns,
@@ -35,9 +36,9 @@ pub fn merge_bytes_or_str_column(
         &remapped_term_ordinals_values,
         codec_types,
         output,
+        CURRENT_VERSION,
     )?;
-    output.write_all(&dictionary_num_bytes.to_le_bytes())?;
-    Ok(())
+    CURRENT_VERSION.write_len_footer(dictionary_num_bytes, output)
 }
 
 /// Computes a per-segment mapping from old term ordinal to merged term ordinal.
