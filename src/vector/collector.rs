@@ -28,7 +28,7 @@ use crate::vector::search::source::controller::{
     ProbeTermination, WorkBudget, WorkMeter, WorkUnits,
 };
 use crate::vector::search::source::matches::MatchClusters;
-use crate::vector::search::source::prefilter::FilterBatch;
+use crate::vector::search::source::prefilter::{filter_batch_scratch, FILTER_BATCH_BYTES};
 use crate::vector::search::source::router::RouterClusters;
 use crate::vector::search::source::SourceReport;
 use crate::vector::search::SegmentSearcher;
@@ -983,46 +983,55 @@ where
         .filter(|_| top_n > 0)
         .map(|_| crate::vector::search::scan::RateApsState::default());
     let mut recall_reached = false;
-    let mut candidates = candidates.peekable();
-    let mut batch = collector
-        .inputs
-        .prepared
-        .filter_match_fraction
-        .map(|_| FilterBatch::new());
-    let mut batch_remaining = 0;
-    while candidates.peek().is_some() {
+    if collector.inputs.prepared.filter_match_fraction.is_some() && !meter.exhausted() {
+        for source in &mut sources {
+            if let Some(GlobalSource::Router(source)) = source {
+                source.clear_filter_batch();
+            }
+        }
+        let (result, measured) = measure(|| {
+            let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
+            filter_batch_scratch(
+                candidates.clone(),
+                vectors,
+                segments
+                    .iter()
+                    .map(|s| s.reader.max_doc())
+                    .max()
+                    .unwrap_or(0),
+                FILTER_BATCH_BYTES,
+            )
+        });
+        totals[0].append(&measured);
+        let scratch_rows = result?;
+        for (j, source) in sources.iter_mut().enumerate() {
+            let Some(GlobalSource::Router(source)) = source else {
+                continue;
+            };
+            let (result, measured) = measure(|| {
+                let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
+                source.filter_batch(
+                    weight,
+                    &segments[j].reader,
+                    scratch_rows.map(|rows| {
+                        (
+                            candidates
+                                .clone()
+                                .filter_map(|(i, c)| (i == j).then_some(c)),
+                            rows,
+                        )
+                    }),
+                )
+            });
+            totals[j].append(&measured);
+            on_segment(j);
+            result?;
+        }
+    }
+    for (i, candidate) in candidates {
         if meter.exhausted() || recall_reached {
             break;
         }
-        if let Some(batch) = &mut batch {
-            if batch_remaining == 0 {
-                for source in &mut sources {
-                    if let Some(GlobalSource::Router(source)) = source {
-                        source.clear_filter_batch();
-                    }
-                }
-                let (result, measured) = measure(|| {
-                    let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                    batch.fill(candidates.clone(), vectors, &mut *on_segment)
-                });
-                totals[0].append(&measured);
-                batch_remaining = result?;
-                for (j, source) in sources.iter_mut().enumerate() {
-                    let Some(GlobalSource::Router(source)) = source else {
-                        continue;
-                    };
-                    let (result, measured) = measure(|| {
-                        let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                        source.filter_batch(weight, &segments[j].reader, batch.docs(j))
-                    });
-                    totals[j].append(&measured);
-                    on_segment(j);
-                    result?;
-                }
-            }
-            batch_remaining -= 1;
-        }
-        let (i, candidate) = candidates.next().unwrap();
         let Some(GlobalSource::Router(source)) = &mut sources[i] else {
             unreachable!()
         };
@@ -2660,6 +2669,25 @@ mod ivf_e2e_tests {
                 |_| {},
             )?)?;
             assert_eq!(actual.results, expected.results, "lower={lower}");
+            if lower == 170 {
+                let located = builder
+                    .clone()
+                    .with_probe_params(ProbeParams {
+                        max_probe: 1,
+                        min_probe_clusters: 1,
+                        located: LocatedPath::Auto,
+                        ..exhaustive_params(2)
+                    })
+                    .with_batched_filtering(0.01)
+                    .build_for_segments(weight.as_ref(), &segments, |_| {})?;
+                assert!(located.inputs.prepared.routing_segments().is_empty());
+                let actual = located.merge_fruits(located.collect_segments(
+                    weight.as_ref(),
+                    &segments,
+                    |_| {},
+                )?)?;
+                assert_eq!(actual.results, expected.results);
+            }
             let direct = builder.with_batched_filtering(0.01).build_for_segments(
                 weight.as_ref(),
                 &segments,

@@ -150,7 +150,9 @@ impl PreparedVectorSearch {
                             located_cap: cap,
                         };
                         let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                        let source = if filter_match_fraction.is_some() {
+                        let source = if filter_match_fraction
+                            .is_some_and(|fraction| fraction * f64::from(max_doc) > cap as f64)
+                        {
                             Source::Router(DocFilter::All)
                         } else {
                             collect_segment_filter(weight, &segment.reader, max_doc, cap)?

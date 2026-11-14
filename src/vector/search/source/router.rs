@@ -6,7 +6,7 @@ use std::sync::Arc;
 use common::BitSet;
 
 use crate::fastfield::AliveBitSet;
-use crate::query::{ExcludedDocSet, ExclusionSet, Weight};
+use crate::query::{BitSetDocSet, ExcludedDocSet, ExclusionSet, Weight};
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::{RouterIter, RouterMetrics};
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
@@ -18,7 +18,7 @@ use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::enter_vector_stage;
 use crate::vector::VectorStage;
-use crate::{DocId, Result, SegmentReader};
+use crate::{DocId, DocSet, Result, SegmentReader, TERMINATED};
 
 // --- Filter and gate ---
 
@@ -264,9 +264,9 @@ impl<'a> RouterClusters<'a> {
         &mut self,
         weight: &dyn Weight,
         segment: &'a SegmentReader,
-        docs: Option<&[(u32, DocId)]>,
+        candidates: Option<(impl Iterator<Item = Candidate>, usize)>,
     ) -> Result<()> {
-        let Some(docs) = docs else {
+        let Some((candidates, scratch_rows)) = candidates else {
             let Source::Router(filter) =
                 collect_segment_filter(weight, segment, segment.max_doc(), 0)?
             else {
@@ -275,18 +275,33 @@ impl<'a> RouterClusters<'a> {
             self.gate = RowGate::new(filter, segment.alive_bitset());
             return Ok(());
         };
+        let mut candidates = candidates.peekable();
         let mut matches = Vec::new();
-        if !docs.is_empty() {
+        if candidates.peek().is_some() {
+            let mut docs = BitSet::with_max_value(segment.max_doc());
+            let mut scratch = Vec::with_capacity(scratch_rows);
+            for candidate in candidates {
+                self.reader
+                    .read_doc_ids(candidate.node as usize, &mut scratch)?;
+                for &doc in &scratch {
+                    docs.insert(doc);
+                }
+            }
+            drop(scratch);
+            let candidate_count = docs.len();
+            let mut docs = BitSetDocSet::from(docs);
             let mut scorer = ExcludedDocSet::new(weight.scorer_for_candidates_unpositioned(
                 segment,
                 1.0,
-                docs.len() as u32,
+                candidate_count as u32,
             )?);
-            matches = Vec::with_capacity(docs.len());
-            for &(_, doc) in docs {
+            matches = Vec::with_capacity(candidate_count);
+            while docs.doc() != TERMINATED {
+                let doc = docs.doc();
                 if scorer.contains(doc) {
                     matches.push(doc);
                 }
+                docs.advance();
             }
         }
         self.gate = RowGate::Candidates {
