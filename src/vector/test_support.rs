@@ -74,6 +74,7 @@ impl SegmentRun<'_> {
             self.weight,
             &segments,
             budget,
+            None,
             |_| {},
         )?;
         Ok(prepared.segments.into_iter().next().and_then(|s| s.scan))

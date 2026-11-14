@@ -17,6 +17,7 @@ use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::{
     AtomicSharedThreshold, SegmentSortKeyComputer, SharedThreshold, TopNComputer,
 };
+use crate::query::Weight;
 use crate::schema::Field;
 use crate::vector::params::ProbeParams;
 use crate::vector::router::RouterIter;
@@ -27,7 +28,7 @@ use crate::vector::search::scan::heap::{tie_break_key, TieBreakHits};
 #[cfg(test)]
 use crate::vector::search::scan::plan::PlanOverride;
 use crate::vector::search::scan::{ScanConfig, SegmentScan};
-use crate::vector::search::segment::plan::ScanInput;
+use crate::vector::search::segment::plan::{collect_segment_filter, ScanInput, Source};
 use crate::vector::search::source::controller::SharedVectorWork;
 use crate::vector::search::source::matches::MatchClusters;
 use crate::vector::search::source::router::{DocFilter, RouterClusters};
@@ -137,6 +138,22 @@ impl<T: VectorElement> SegmentSearcher<T> {
             query: &self.query,
             quantized: self.quantized.as_deref(),
         }
+    }
+
+    pub(crate) fn prepare_filter(&mut self, weight: &dyn Weight) -> crate::Result<()> {
+        if let Some(ScanInput::Routed { filter, .. }) = &mut self.segment.scan {
+            let Source::Router(prepared) = collect_segment_filter(
+                weight,
+                &self.segment.reader,
+                self.segment.reader.max_doc(),
+                0,
+            )?
+            else {
+                unreachable!()
+            };
+            *filter = prepared;
+        }
+        Ok(())
     }
 
     pub(crate) fn reader(&self) -> &VectorIndexReader {

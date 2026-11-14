@@ -6,9 +6,11 @@ use std::sync::Arc;
 use common::BitSet;
 
 use crate::fastfield::AliveBitSet;
+use crate::query::{ExcludedDocSet, ExclusionSet, Weight};
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::{RouterIter, RouterMetrics};
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
+use crate::vector::search::segment::plan::{collect_segment_filter, Source};
 use crate::vector::search::source::controller::{
     ProbeController, ProbeOutcome, SharedVectorWork, WorkBudget, WorkMeter,
 };
@@ -46,6 +48,10 @@ impl DocFilter {
 /// How a cluster row is tested before scoring: against the filter's matches and the alive docs.
 pub(crate) enum RowGate<'a> {
     Open,
+    Candidates {
+        docs: Vec<DocId>,
+        alive: Option<&'a AliveBitSet>,
+    },
     AliveOnly(&'a AliveBitSet),
     FilterOnly(Arc<BitSet>),
     FilterAndAlive {
@@ -89,6 +95,13 @@ impl<'a> RowGate<'a> {
                     pruned_dead: 0,
                 }
             }
+            RowGate::Candidates { docs, alive } => gate(doc_ids, offsets, |doc| {
+                let matches = docs.binary_search(&doc).is_ok();
+                RowVerdict {
+                    matches,
+                    keep: matches && alive.is_none_or(|alive| alive.is_alive(doc)),
+                }
+            }),
             RowGate::AliveOnly(alive) => gate(doc_ids, offsets, |doc| {
                 let alive = alive.is_alive(doc);
                 RowVerdict {
@@ -241,6 +254,46 @@ impl<'a> RouterClusters<'a> {
             segment,
             None,
         )
+    }
+
+    pub(crate) fn clear_filter_batch(&mut self) {
+        self.gate = RowGate::Open;
+    }
+
+    pub(crate) fn filter_batch(
+        &mut self,
+        weight: &dyn Weight,
+        segment: &'a SegmentReader,
+        docs: Option<&[(u32, DocId)]>,
+    ) -> crate::Result<()> {
+        let Some(docs) = docs else {
+            let Source::Router(filter) =
+                collect_segment_filter(weight, segment, segment.max_doc(), 0)?
+            else {
+                unreachable!()
+            };
+            self.gate = RowGate::new(filter, segment.alive_bitset());
+            return Ok(());
+        };
+        let mut matches = Vec::new();
+        if !docs.is_empty() {
+            let mut scorer = ExcludedDocSet::new(weight.scorer_for_candidates_unpositioned(
+                segment,
+                1.0,
+                docs.len() as u32,
+            )?);
+            matches = Vec::with_capacity(docs.len());
+            for &(_, doc) in docs {
+                if scorer.contains(doc) {
+                    matches.push(doc);
+                }
+            }
+        }
+        self.gate = RowGate::Candidates {
+            docs: matches,
+            alive: segment.alive_bitset(),
+        };
+        Ok(())
     }
 
     /// Prepares a cluster chosen by the global router.

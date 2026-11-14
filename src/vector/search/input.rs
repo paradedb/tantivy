@@ -9,7 +9,6 @@ use crate::vector::search::segment::plan::{
     collect_segment_filter, located_cap, PlanReport, ScanInput, Source,
 };
 use crate::vector::search::source::controller::{SharedVectorWork, WorkBudget, WorkUnits};
-#[cfg(test)]
 use crate::vector::search::source::router::DocFilter;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
 use crate::vector::{ProbeParams, VectorStage};
@@ -93,6 +92,7 @@ impl VectorSegment {
 #[derive(Clone)]
 pub struct PreparedVectorSearch {
     pub(crate) field: Field,
+    pub(crate) filter_match_fraction: Option<f64>,
     pub(crate) top_n: usize,
     pub(crate) budget: VectorSearchBudget,
     /// Rows across the prepared segments' clusters, a replicated segment's second copies included.
@@ -109,10 +109,12 @@ impl PreparedVectorSearch {
         weight: &dyn Weight,
         segments: &[VectorSegment],
         budget: VectorSearchBudget,
+        filter_match_fraction: Option<f64>,
         mut on_segment: impl FnMut(SegmentOrdinal),
     ) -> Result<Self> {
         let mut prepared = Self {
             field,
+            filter_match_fraction,
             top_n,
             budget,
             rows: 0,
@@ -148,24 +150,28 @@ impl PreparedVectorSearch {
                             located_cap: cap,
                         };
                         let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                        let scan =
-                            match collect_segment_filter(weight, &segment.reader, max_doc, cap)? {
-                                Source::Router(filter) if !filter.is_empty() => {
-                                    Some(ScanInput::Routed {
-                                        filter,
-                                        budget: work,
-                                        report,
-                                    })
-                                }
-                                Source::FilterMatches(docs) if !docs.is_empty() => {
-                                    Some(ScanInput::Located {
-                                        docs,
-                                        budget: work,
-                                        report,
-                                    })
-                                }
-                                _ => None,
-                            };
+                        let source = if filter_match_fraction.is_some() {
+                            Source::Router(DocFilter::All)
+                        } else {
+                            collect_segment_filter(weight, &segment.reader, max_doc, cap)?
+                        };
+                        let scan = match source {
+                            Source::Router(filter) if !filter.is_empty() => {
+                                Some(ScanInput::Routed {
+                                    filter,
+                                    budget: work,
+                                    report,
+                                })
+                            }
+                            Source::FilterMatches(docs) if !docs.is_empty() => {
+                                Some(ScanInput::Located {
+                                    docs,
+                                    budget: work,
+                                    report,
+                                })
+                            }
+                            _ => None,
+                        };
                         (scan, cap)
                     }
                 } else if top_n == 0 || max_doc == 0 {
@@ -219,6 +225,9 @@ impl PreparedVectorSearch {
 
     /// Observed selectivity across the segments that require routing.
     pub fn match_fraction(&self) -> f64 {
+        if let Some(estimate) = self.filter_match_fraction {
+            return estimate;
+        }
         let mut matched = 0.0;
         let mut docs = 0u64;
         for segment in &self.segments {

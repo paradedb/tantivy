@@ -28,6 +28,7 @@ use crate::vector::search::source::controller::{
     ProbeTermination, WorkBudget, WorkMeter, WorkUnits,
 };
 use crate::vector::search::source::matches::MatchClusters;
+use crate::vector::search::source::prefilter::FilterBatch;
 use crate::vector::search::source::router::RouterClusters;
 use crate::vector::search::source::SourceReport;
 use crate::vector::search::SegmentSearcher;
@@ -89,6 +90,7 @@ pub struct TopDocsByVectorSimilarityBuilder<T: VectorElement, S = NoTieBreak> {
     limit: usize,
     offset: usize,
     probe_params: ProbeParams,
+    filter_match_fraction: Option<f64>,
     max_scan_levels: usize,
     /// Optional slot shared with other collectors searching the same query.
     shared_threshold: Option<SharedThresholdArc<Score>>,
@@ -104,6 +106,7 @@ impl<T: VectorElement> TopDocsByVectorSimilarityBuilder<T, NoTieBreak> {
             limit,
             offset: 0,
             probe_params: ProbeParams::default(),
+            filter_match_fraction: None,
             max_scan_levels: usize::MAX,
             shared_threshold: None,
             tie_break: NoTieBreak,
@@ -122,6 +125,15 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
     /// Sets the probe parameters; flat segments ignore them.
     pub fn with_probe_params(mut self, params: ProbeParams) -> Self {
         self.probe_params = params;
+        self
+    }
+
+    /// Defers routed filters until the global scan can probe bounded batches in doc order.
+    /// Independent segment scans retain eager filtering.
+    pub fn with_batched_filtering(mut self, estimated_match_fraction: f64) -> Self {
+        self.filter_match_fraction = (estimated_match_fraction > 0.0
+            && estimated_match_fraction < 1.0)
+            .then_some(estimated_match_fraction);
         self
     }
 
@@ -156,6 +168,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
             limit: self.limit,
             offset: self.offset,
             probe_params: self.probe_params,
+            filter_match_fraction: self.filter_match_fraction,
             max_scan_levels: self.max_scan_levels,
             shared_threshold: self.shared_threshold,
             tie_break,
@@ -178,6 +191,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
             weight,
             segments,
             budget,
+            self.filter_match_fraction,
             on_segment,
         )
     }
@@ -428,7 +442,7 @@ where
 
     fn collect_segment(
         &self,
-        _weight: &dyn Weight,
+        weight: &dyn Weight,
         segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
     ) -> Result<SegmentVectorFruit<S::SortKey>> {
@@ -460,7 +474,7 @@ where
                 stats: ProbeStats::new(report, totals),
             });
         }
-        let (searched, mut totals) = measure(|| self.search_segment(segment_ord, reader));
+        let (searched, mut totals) = measure(|| self.search_segment(segment_ord, reader, weight));
         let (results, report, merge) = searched?;
         totals.append(preparation);
         if let Some(stats) = self.inputs.routing_stats.get(&segment_ord) {
@@ -566,6 +580,7 @@ where
         }
         let results = search_global(
             self,
+            weight,
             &vectors,
             segments,
             &mut tie_breaks,
@@ -681,9 +696,13 @@ where
         &self,
         segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
+        weight: &dyn Weight,
     ) -> Result<(KeyedHits<S::SortKey>, SegmentReport, ExactMerge)> {
         let init = enter_vector_stage(VectorStage::ScanInit);
-        let backend = self.segment_searcher(segment_ord)?;
+        let mut backend = self.segment_searcher(segment_ord)?;
+        if self.inputs.prepared.filter_match_fraction.is_some() {
+            backend.prepare_filter(weight)?;
+        }
         let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
         drop(init);
         let (hits, report) = backend.top_n_by(
@@ -731,6 +750,7 @@ enum GlobalSource<'a> {
 /// Returns each segment's hits and statistics so the collector can combine the results.
 fn search_global<T, S>(
     collector: &TopDocsByVectorSimilarity<T, S>,
+    weight: &dyn Weight,
     vectors: &[Arc<VectorIndexReader>],
     segments: &[VectorSegment],
     tie_breaks: &mut [S::Child],
@@ -963,10 +983,46 @@ where
         .filter(|_| top_n > 0)
         .map(|_| crate::vector::search::scan::RateApsState::default());
     let mut recall_reached = false;
-    for (i, candidate) in candidates {
+    let mut candidates = candidates.peekable();
+    let mut batch = collector
+        .inputs
+        .prepared
+        .filter_match_fraction
+        .map(|_| FilterBatch::new());
+    let mut batch_remaining = 0;
+    while candidates.peek().is_some() {
         if meter.exhausted() || recall_reached {
             break;
         }
+        if let Some(batch) = &mut batch {
+            if batch_remaining == 0 {
+                for source in &mut sources {
+                    if let Some(GlobalSource::Router(source)) = source {
+                        source.clear_filter_batch();
+                    }
+                }
+                let (result, measured) = measure(|| {
+                    let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
+                    batch.fill(candidates.clone(), vectors, &mut *on_segment)
+                });
+                totals[0].append(&measured);
+                batch_remaining = result?;
+                for (j, source) in sources.iter_mut().enumerate() {
+                    let Some(GlobalSource::Router(source)) = source else {
+                        continue;
+                    };
+                    let (result, measured) = measure(|| {
+                        let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
+                        source.filter_batch(weight, &segments[j].reader, batch.docs(j))
+                    });
+                    totals[j].append(&measured);
+                    on_segment(j);
+                    result?;
+                }
+            }
+            batch_remaining -= 1;
+        }
+        let (i, candidate) = candidates.next().unwrap();
         let Some(GlobalSource::Router(source)) = &mut sources[i] else {
             unreachable!()
         };
@@ -1119,7 +1175,7 @@ mod ivf_e2e_tests {
     //! fixture so the manual flat/ivf scene construction the
     //! pre-consolidation tests carried is gone — `vector_storage_format`
     //! is the only knob.
-    use std::ops::Range;
+    use std::ops::{Bound, Range};
     use std::sync::Arc;
 
     use super::{ScanInput, VectorSegment, VectorSimilarityFruit};
@@ -1127,7 +1183,7 @@ mod ivf_e2e_tests {
     use crate::collector::{AtomicSharedThreshold, Collector, SharedThresholdArc, TopDocs};
     use crate::index::IndexSettings;
     use crate::indexer::NoMergePolicy;
-    use crate::query::{AllQuery, EnableScoring, Query};
+    use crate::query::{AllQuery, EnableScoring, Query, RangeQuery};
     use crate::schema::{Field, Metric, Schema, VectorDType, VectorOptions, FAST, STORED, STRING};
     use crate::vector::diagnostics::VectorStorageFormat;
     use crate::vector::distance::l2_squared_bytes;
@@ -1139,7 +1195,7 @@ mod ivf_e2e_tests {
         Candidate, ClusterRef, RouterKind, TopClustersBySimilarityCollector, VectorSearchBudget,
     };
     use crate::{
-        DocAddress, Index, IndexWriter, Order, Result, Score, TantivyDocument, TantivyError,
+        DocAddress, Index, IndexWriter, Order, Result, Score, TantivyDocument, TantivyError, Term,
     };
 
     fn build_routed<T, S>(
@@ -1240,7 +1296,10 @@ mod ivf_e2e_tests {
                         exact_plan,
                         ..exhaustive_params(8)
                     };
-                    for batch_size in [1, 2, readers.len()] {
+                    for (batch_size, batched) in [1, 2, readers.len()]
+                        .into_iter()
+                        .flat_map(|size| [(size, false), (size, true)])
+                    {
                         let threshold: SharedThresholdArc<Score> =
                             Arc::new(AtomicSharedThreshold::default());
                         let collector = TopDocs::with_limit(7)
@@ -1248,6 +1307,7 @@ mod ivf_e2e_tests {
                             .order_by_similarity(fixture.field, query.clone())
                             .with_probe_params(params.clone())
                             .with_shared_threshold(Arc::clone(&threshold))
+                            .with_batched_filtering(if batched { 0.05 } else { 1.0 })
                             .build_for_searcher(&searcher, filter)?;
                         let weight = fixture.weight(filter)?;
                         let mut fruits = Vec::new();
@@ -2555,6 +2615,57 @@ mod ivf_e2e_tests {
                 let actual = searcher.search(&AllQuery, &collector)?;
                 assert_eq!(actual.results, expected, "Flat query={query:?} k={k}");
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batched_range_filter_matches_eager_filter() -> Result<()> {
+        let ids: Vec<_> = (0..180).map(|id| (id * 79) % 181).collect();
+        let (index, field, value) = tie_heavy_index(&ids)?;
+        let searcher = index.reader()?.searcher();
+        let segments: Vec<_> = searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
+            .collect();
+        for lower in [0, 170, 999] {
+            let filter = RangeQuery::new(
+                Bound::Included(Term::from_field_u64(value, lower)),
+                Bound::Unbounded,
+            );
+            let weight = filter.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+            let builder = TopDocs::with_limit(10)
+                .order_by_similarity(field, vec![0.0, 0.0])
+                .with_probe_params(ProbeParams {
+                    located: LocatedPath::Off,
+                    ..exhaustive_params(2)
+                });
+            let eager = builder
+                .clone()
+                .build_for_segments(weight.as_ref(), &segments, |_| {})?;
+            let expected = eager.merge_fruits(eager.collect_segments(
+                weight.as_ref(),
+                &segments,
+                |_| {},
+            )?)?;
+            let batched = builder
+                .clone()
+                .with_batched_filtering(0.01)
+                .build_for_segments(weight.as_ref(), &segments, |_| {})?;
+            let actual = batched.merge_fruits(batched.collect_segments(
+                weight.as_ref(),
+                &segments,
+                |_| {},
+            )?)?;
+            assert_eq!(actual.results, expected.results, "lower={lower}");
+            let direct = builder.with_batched_filtering(0.01).build_for_segments(
+                weight.as_ref(),
+                &segments,
+                |_| {},
+            )?;
+            assert_eq!(searcher.search(&filter, &direct)?.results, expected.results);
         }
         Ok(())
     }

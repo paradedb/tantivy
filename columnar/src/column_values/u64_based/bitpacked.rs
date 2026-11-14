@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use std::num::NonZeroU64;
 use std::ops::{Range, RangeInclusive};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use common::file_slice::FileSlice;
 use common::{BinarySerializable, HasLen, OwnedBytes};
@@ -18,7 +18,7 @@ pub struct BitpackedReader {
     data: FileSlice,
     bit_unpacker: BitUnpacker,
     stats: ColumnStats,
-    blocks: Arc<[OnceLock<Block>]>,
+    block: Arc<Mutex<Option<(usize, Block)>>>,
 }
 
 impl BitpackedReader {
@@ -26,11 +26,16 @@ impl BitpackedReader {
     fn unpack_val(&self, doc: u32) -> u64 {
         let block_num = self.bit_unpacker.block_num(doc);
 
-        if block_num == 0 && self.blocks.len() == 0 {
+        if self.data.len() == 0 {
             return 0;
         }
 
-        let block = self.blocks[block_num].get_or_init(|| {
+        let mut cache = self.block.lock().unwrap();
+        if cache
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached != block_num)
+        {
+            *cache = None;
             let block_range = self.bit_unpacker.block(block_num, self.data.len());
             let offset = block_range.start;
             let data = self
@@ -38,8 +43,9 @@ impl BitpackedReader {
                 .slice(block_range)
                 .read_bytes()
                 .expect("Failed to read column values.");
-            Block { offset, data }
-        });
+            *cache = Some((block_num, Block { offset, data }));
+        }
+        let (_, block) = cache.as_ref().unwrap();
 
         self.bit_unpacker
             .get_from_subset(doc, block.offset, &block.data)
@@ -112,9 +118,6 @@ impl ColumnValues for BitpackedReader {
             positions.clear();
             return;
         };
-        // TODO: This does not use the `self.blocks` cache, because callers are usually already
-        // doing sequential, and fairly dense reads. Fix it to iterate over blocks if that
-        // assumption turns out to be incorrect!
         let data_range = self
             .bit_unpacker
             .block_oblivious_range(doc_id_range.clone(), self.data.len());
@@ -179,15 +182,11 @@ impl ColumnCodec for BitpackedCodec {
 
         let num_bits = num_bits(&stats);
         let bit_unpacker = BitUnpacker::new(num_bits);
-        let block_count = bit_unpacker.block_count(data.len());
         Ok(BitpackedReader {
             data,
             bit_unpacker,
             stats,
-            blocks: (0..block_count)
-                .into_iter()
-                .map(|_| OnceLock::new())
-                .collect(),
+            block: Arc::new(Mutex::new(None)),
         })
     }
 }
@@ -196,6 +195,28 @@ impl ColumnCodec for BitpackedCodec {
 mod tests {
     use super::*;
     use crate::column_values::u64_based::tests::create_and_validate;
+    use crate::column_values::{
+        CodecType, load_u64_based_column_values, serialize_u64_based_column_values,
+    };
+
+    #[test]
+    fn point_reads_retain_only_the_current_block() {
+        let values: Vec<_> = (0..100_000u64).collect();
+        let mut bytes = Vec::new();
+        serialize_u64_based_column_values(&&values[..], &[CodecType::Bitpacked], &mut bytes)
+            .unwrap();
+        let reader = BitpackedCodec::load(FileSlice::from(bytes).slice(1..)).unwrap();
+        for doc in [0, 50_000, 99_999, 0, 50_001] {
+            assert_eq!(reader.get_val(doc), values[doc as usize]);
+            let cache = reader.block.lock().unwrap();
+            let (id, block) = cache.as_ref().unwrap();
+            assert_eq!(*id, reader.bit_unpacker.block_num(doc));
+            assert_eq!(
+                block.data.len(),
+                reader.bit_unpacker.block(*id, reader.data.len()).len()
+            );
+        }
+    }
 
     #[test]
     fn test_with_codec_data_sets_simple() {
