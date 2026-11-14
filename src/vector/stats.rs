@@ -247,6 +247,30 @@ pub(crate) enum AccessPath {
 pub struct ProbeStats {
     /// Rows shortlisted from the source, including replica copies dropped before scoring.
     pub candidates_scored: usize,
+    /// Whether this scan deferred its filter until vector shortlisting.
+    pub late_filter: bool,
+    /// Quantized candidates admitted to deferred-filter heaps.
+    pub filter_candidates: usize,
+    /// Nonempty batches checked against the deferred filter.
+    pub filter_batches: usize,
+    /// Shortlisted candidates tested against the deferred filter.
+    pub filter_checks: usize,
+    /// Candidate checks that passed the deferred filter.
+    pub filter_matches: usize,
+    /// Wider router requests made after a deferred filter produced fewer than k matches.
+    pub router_retries: usize,
+    /// Previously scanned clusters skipped on a wider router request.
+    pub clusters_reused: usize,
+    /// Exclusive nanoseconds in deferred-filter bookkeeping.
+    pub late_filter_ns: u64,
+    pub late_filter_select_ns: u64,
+    pub late_filter_doc_ids_ns: u64,
+    pub late_filter_sort_ns: u64,
+    pub late_filter_predicate_ns: u64,
+    /// Exclusive nanoseconds constructing deferred-filter scorers.
+    pub late_filter_setup_ns: u64,
+    /// Deferred-filter scorers constructed across batches and router retries.
+    pub filter_scorers_created: u64,
     /// Rows the routed source admitted and charged, a replicated document's second copy included.
     pub layer0_eligible: usize,
     /// Rows dropped at admission as the second copy of a document an earlier cluster held.
@@ -407,6 +431,12 @@ impl ProbeStats {
         let full_precision = scan.layers.is_empty();
         let mut stats = Self {
             candidates_scored: scan.candidates_scored,
+            late_filter: scan.late_filter,
+            filter_candidates: scan.filter_candidates,
+            filter_batches: scan.filter_batches,
+            filter_checks: scan.filter_checks,
+            filter_matches: scan.filter_matches,
+            router_retries: scan.router_retries,
             exact_rows: scan.exact_rows,
             exact_recheck_dropped: scan.exact_recheck_dropped,
             replication_dropped: scan.replication_dropped,
@@ -462,6 +492,7 @@ impl ProbeStats {
         } = report;
         self.layer0_eligible = counters.eligible;
         self.clusters_skipped_empty = counters.clusters_skipped_empty;
+        self.clusters_reused = counters.clusters_reused;
         self.vectors_visited = counters.vectors_visited;
         self.pruned_filter = counters.pruned_filter;
         self.pruned_dead = counters.pruned_dead;
@@ -516,6 +547,13 @@ impl ProbeStats {
     fn apply_timings(&mut self, totals: &StageTotals) {
         self.scan_init_ns = totals.time_ns(VectorStage::ScanInit);
         self.non_vector_search_ns = totals.time_ns(VectorStage::NonVectorSearch);
+        self.late_filter_ns = totals.time_ns(VectorStage::LateFilter);
+        self.late_filter_select_ns = totals.time_ns(VectorStage::LateFilterSelect);
+        self.late_filter_doc_ids_ns = totals.time_ns(VectorStage::LateFilterDocIds);
+        self.late_filter_sort_ns = totals.time_ns(VectorStage::LateFilterSort);
+        self.filter_scorers_created = totals.filter_scorers_created;
+        self.late_filter_setup_ns = totals.time_ns(VectorStage::LateFilterSetup);
+        self.late_filter_predicate_ns = totals.time_ns(VectorStage::LateFilterPredicate);
         self.query_prep_ns = totals.time_ns(VectorStage::QueryPrep);
         self.routing_ns = totals.time_ns(VectorStage::Routing);
         self.locate_ns = totals.time_ns(VectorStage::Locate);
@@ -591,6 +629,20 @@ mod tests {
 
     const COMMON: &[&str] = &[
         "candidates_scored",
+        "late_filter",
+        "filter_candidates",
+        "filter_batches",
+        "filter_checks",
+        "filter_matches",
+        "late_filter_ns",
+        "late_filter_select_ns",
+        "late_filter_doc_ids_ns",
+        "late_filter_sort_ns",
+        "late_filter_predicate_ns",
+        "late_filter_setup_ns",
+        "filter_scorers_created",
+        "router_retries",
+        "clusters_reused",
         "layer0_eligible",
         "clusters_skipped_empty",
         "exact_reads",

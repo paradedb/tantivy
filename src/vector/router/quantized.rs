@@ -618,7 +618,7 @@ mod tests {
                     max_probe: usize::MAX,
                     router_aps: false,
                     located: LocatedPath::Off,
-                    ..Default::default()
+                    ..ProbeParams::prefilter()
                 };
                 let filter = fixture.filter("third");
                 for filter in [&AllQuery as &dyn crate::query::Query, &filter] {

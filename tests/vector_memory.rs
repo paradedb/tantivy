@@ -19,8 +19,8 @@ use tantivy::vector::clustering::{
     for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
 };
 use tantivy::vector::{
-    LocatedPath, ProbeParams, ProbeStats, RouterKind, Selectivity, VectorQuantizationConfig,
-    VectorQuantizationLayer,
+    LocatedPath, ProbeParams, ProbeStats, RouterKind, Selectivity, VectorFilterStrategy,
+    VectorQuantizationConfig, VectorQuantizationLayer,
 };
 use tantivy::{Index, IndexWriter, Searcher, TantivyDocument, Term};
 
@@ -314,6 +314,9 @@ impl Fixture {
 /// Probes about `clusters` clusters: the budget is that many average clusters of work.
 fn probing(clusters: usize, located: LocatedPath) -> ProbeParams {
     ProbeParams {
+        filter_strategy: Some(VectorFilterStrategy::Pre {
+            uses_fast_fields: false,
+        }),
         max_probe: clusters,
         located,
         ..ProbeParams::default()
@@ -474,6 +477,9 @@ fn peak_on_a_large_segment() -> tantivy::Result<()> {
         ("located", located_everything()),
     ] {
         let params = ProbeParams {
+            filter_strategy: Some(VectorFilterStrategy::Pre {
+                uses_fast_fields: false,
+            }),
             max_probe: 64,
             min_probe_clusters: 1,
             located,

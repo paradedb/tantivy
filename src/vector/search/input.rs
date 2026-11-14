@@ -9,10 +9,9 @@ use crate::vector::search::segment::plan::{
     collect_segment_filter, located_cap, PlanReport, ScanInput, Source,
 };
 use crate::vector::search::source::controller::{SharedVectorWork, WorkBudget, WorkUnits};
-#[cfg(test)]
 use crate::vector::search::source::router::DocFilter;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
-use crate::vector::{ProbeParams, VectorStage};
+use crate::vector::{ProbeParams, VectorFilterStrategy, VectorStage};
 use crate::{Result, SegmentOrdinal, TantivyError};
 
 /// A segment handle shared by preparation, routing and scanning.
@@ -111,6 +110,7 @@ impl PreparedVectorSearch {
         budget: VectorSearchBudget,
         mut on_segment: impl FnMut(SegmentOrdinal),
     ) -> Result<Self> {
+        let filter_strategy = params.filter_strategy()?;
         let mut prepared = Self {
             field,
             top_n,
@@ -148,34 +148,49 @@ impl PreparedVectorSearch {
                             located_cap: cap,
                         };
                         let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                        let scan =
-                            match collect_segment_filter(weight, &segment.reader, max_doc, cap)? {
-                                Source::Router(filter) if !filter.is_empty() => {
-                                    Some(ScanInput::Routed {
-                                        filter,
-                                        budget: work,
-                                        report,
-                                    })
-                                }
-                                Source::FilterMatches(docs) if !docs.is_empty() => {
-                                    Some(ScanInput::Located {
-                                        docs,
-                                        budget: work,
-                                        report,
-                                    })
-                                }
-                                _ => None,
-                            };
+                        let source = if matches!(filter_strategy, VectorFilterStrategy::Post { .. })
+                        {
+                            if vectors.quantization()?.is_none() {
+                                return Err(TantivyError::InvalidArgument(
+                                    "post-filtering requires quantized IVF segments".into(),
+                                ));
+                            }
+                            Source::Router(DocFilter::Post)
+                        } else {
+                            collect_segment_filter(weight, &segment.reader, max_doc, cap)?
+                        };
+                        let scan = match source {
+                            Source::Router(filter) if !filter.is_empty() => {
+                                Some(ScanInput::Routed {
+                                    filter,
+                                    budget: work,
+                                    report,
+                                })
+                            }
+                            Source::FilterMatches(docs) if !docs.is_empty() => {
+                                Some(ScanInput::Located {
+                                    docs,
+                                    budget: work,
+                                    report,
+                                })
+                            }
+                            _ => None,
+                        };
                         (scan, cap)
                     }
                 } else if top_n == 0 || max_doc == 0 {
                     (None, 0)
                 } else {
                     let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                    let Source::Router(filter) =
-                        collect_segment_filter(weight, &segment.reader, max_doc, 0)?
-                    else {
-                        unreachable!()
+                    let filter = if matches!(filter_strategy, VectorFilterStrategy::Post { .. }) {
+                        DocFilter::Post
+                    } else {
+                        let Source::Router(filter) =
+                            collect_segment_filter(weight, &segment.reader, max_doc, 0)?
+                        else {
+                            unreachable!()
+                        };
+                        filter
                     };
                     (
                         (!filter.is_empty()).then_some(ScanInput::Flat { filter }),
@@ -277,10 +292,10 @@ impl PreparedVectorSearch {
             })
             .collect();
         self.segments
-            .retain(|s| !s.routed() || routed.contains_key(&s.ordinal));
+            .retain(|s| !s.routed() || routed.contains_key(&s.ordinal) || matches!(&s.scan, Some(ScanInput::Routed { filter, .. }) if matches!(filter, DocFilter::Post)));
         for segment in &mut self.segments {
             if let Some(ScanInput::Routed { budget, report, .. }) = &mut segment.scan {
-                report.planned_clusters = routed[&segment.ordinal];
+                report.planned_clusters = routed.get(&segment.ordinal).copied().unwrap_or(0);
                 if shared_work.is_some() {
                     budget.total = self.budget.work.total;
                 }
@@ -358,7 +373,7 @@ mod tests {
             let params = ProbeParams {
                 max_probe,
                 located: LocatedPath::Off,
-                ..Default::default()
+                ..ProbeParams::prefilter()
             };
             let query = vec![0.0f32; 32];
             let builder = TopDocs::with_limit(10)
@@ -432,10 +447,12 @@ mod tests {
             let filter = fixture.filter(label);
             let weight = fixture.weight(&filter)?;
             let query = vec![0.0f32; 32];
-            let builder = TopDocs::with_limit(5).order_by_similarity(fixture.field, query.clone());
+            let builder = TopDocs::with_limit(5)
+                .order_by_similarity(fixture.field, query.clone())
+                .with_probe_params(ProbeParams::prefilter());
             let budget = VectorSearchBudget::for_segments(
                 fixture.field,
-                &ProbeParams::default(),
+                &ProbeParams::prefilter(),
                 &segments,
             )?;
             fixture.clear_reads();
@@ -481,7 +498,7 @@ mod tests {
             .collect::<Vec<_>>();
         let params = ProbeParams {
             max_probe: 2,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
         let builder = TopDocs::with_limit(5)
             .order_by_similarity(fixture.field, vec![0.0f32; 32])
@@ -523,7 +540,7 @@ mod tests {
         let segments = [VectorSegment::from((7, searcher.segment_reader(0)))];
         let params = ProbeParams {
             located: LocatedPath::Off,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
         let query = vec![0.0f32; 32];
         let builder = TopDocs::with_limit(5)

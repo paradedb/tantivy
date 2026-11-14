@@ -98,6 +98,10 @@ pub struct ExistsWeight {
 }
 
 impl Weight for ExistsWeight {
+    fn uses_fast_fields(&self) -> bool {
+        true
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let fast_field_reader = reader.fast_fields();
         let mut column_handles = fast_field_reader.dynamic_column_handles(&self.field_name)?;

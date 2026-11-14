@@ -63,7 +63,7 @@ impl Columns {
     }
 
     /// Keeps the first `len` entries.
-    fn truncate(&mut self, len: usize) {
+    pub(super) fn truncate(&mut self, len: usize) {
         self.bases.truncate(len);
         self.raw_prefixes.truncate(len);
         self.estimates.truncate(len);
@@ -75,7 +75,7 @@ impl Columns {
     }
 
     /// Appends the entries of `from` that `keep` selects, column by column.
-    fn extend_selected(&mut self, from: &Columns, keep: &[u32]) {
+    pub(super) fn extend_selected(&mut self, from: &Columns, keep: &[u32]) {
         self.bases
             .extend(keep.iter().map(|&i| from.bases[i as usize]));
         self.raw_prefixes
@@ -355,25 +355,40 @@ impl QuantizedCandidates {
 
     /// One interval per live candidate, in admission order, keyed by [`RowAddress`].
     pub(crate) fn live_candidates(&self, segment_ord: SegmentOrdinal) -> Vec<Candidate> {
-        let mut out = Vec::new();
-        for block in &self.blocks {
-            for index in block.at.clone() {
+        self.candidates_with_upper(segment_ord)
+            .map(|(_, _, candidate, _)| candidate)
+            .collect()
+    }
+
+    pub(crate) fn candidates_with_upper(
+        &self,
+        segment_ord: SegmentOrdinal,
+    ) -> impl Iterator<Item = (usize, usize, Candidate, UpperEndpoint)> + '_ {
+        self.blocks.iter().enumerate().flat_map(move |(b, block)| {
+            block.at.clone().map(move |index| {
                 debug_assert!(
                     self.columns.estimates[index].is_finite() && self.columns.sigmas[index] >= 0.0,
                     "quantized boundary inputs: a finite estimate and a non-negative sigma (+inf \
                      is an unbounded width)"
                 );
-                out.push(Candidate::interval(
-                    RowAddress {
-                        segment_ord,
-                        block_address: BlockAddress::new(block.cluster as u32, self.offsets[index]),
-                    },
-                    self.lower(index),
-                    self.columns.estimates[index],
-                ));
-            }
-        }
-        out
+                (
+                    b,
+                    index,
+                    Candidate::interval(
+                        RowAddress {
+                            segment_ord,
+                            block_address: BlockAddress::new(
+                                block.cluster as u32,
+                                self.offsets[index],
+                            ),
+                        },
+                        self.lower(index),
+                        self.columns.estimates[index],
+                    ),
+                    self.upper(index),
+                )
+            })
+        })
     }
 }
 

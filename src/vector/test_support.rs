@@ -15,8 +15,8 @@ use crate::query::{
     Weight,
 };
 use crate::schema::{
-    Field, IndexRecordOption, Metric, Schema, Term, Value, VectorDType, VectorOptions, STORED,
-    STRING,
+    Field, IndexRecordOption, Metric, Schema, Term, Value, VectorDType, VectorOptions, FAST,
+    INDEXED, STORED, STRING,
 };
 use crate::vector::clustering::{
     for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
@@ -445,6 +445,7 @@ impl FixtureSpec {
             VectorOptions::new(self.dim, self.metric).with_dtype(VectorDType::F32),
         );
         let label = schema.add_text_field("label", STRING | STORED);
+        schema.add_u64_field("ordinal", FAST | INDEXED);
         let ivf = matches!(self.layout, Layout::Ivf(_));
         let settings = IndexSettings {
             vector_clustering_threshold: if ivf { 1 } else { usize::MAX },
@@ -472,6 +473,7 @@ impl FixtureSpec {
     /// Writes the docs over the segment commits, merges IVF pairs, then applies the deletes.
     fn write(&self, index: &Index, field: Field, label: Field) -> crate::Result<()> {
         let ivf = matches!(self.layout, Layout::Ivf(_));
+        let ordinal_field = index.schema().get_field("ordinal")?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 30_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
         let commits = if ivf {
@@ -483,6 +485,7 @@ impl FixtureSpec {
         for (ordinal, vector) in self.vectors.iter().enumerate() {
             let mut doc = TantivyDocument::new();
             doc.add_text(label, format!("d{ordinal}"));
+            doc.add_u64(ordinal_field, ordinal as u64);
             for extra in &self.labels[ordinal] {
                 doc.add_text(label, extra);
             }
@@ -744,7 +747,7 @@ impl Fixture {
             params,
         )?
         .with_test_candidates(&inputs);
-        backend.top_n(top_n)
+        backend.top_n(top_n, weight)
     }
 
     /// Searches segment `segment` directly with the quantized query a collector prepares, every
@@ -826,7 +829,7 @@ impl Fixture {
         backend.plan_override = plan;
         backend.admission_pruning_disabled = !admission_pruning;
         backend.collector_topk = collector_topk;
-        backend.top_n(top_n)
+        backend.top_n(top_n, weight)
     }
 
     /// Runs `run` over the first segment's prepared source for the supplied search arguments.

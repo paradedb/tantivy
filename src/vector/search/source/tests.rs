@@ -112,7 +112,7 @@ fn budget_params(max_probe: usize) -> ProbeParams {
         min_probe_clusters: 1,
         exact_plan: false,
         located: LocatedPath::Off,
-        ..Default::default()
+        ..ProbeParams::prefilter()
     }
 }
 

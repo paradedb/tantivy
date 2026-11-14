@@ -17,6 +17,7 @@ use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::{
     AtomicSharedThreshold, SegmentSortKeyComputer, SharedThreshold, TopNComputer,
 };
+use crate::query::{ExcludedDocSet, ExclusionSet, Weight};
 use crate::schema::Field;
 use crate::vector::params::ProbeParams;
 use crate::vector::router::RouterIter;
@@ -42,8 +43,8 @@ use crate::vector::telemetry::enter_vector_stage;
 use crate::vector::telemetry::measure;
 #[cfg(test)]
 use crate::vector::tie_break::NoTieBreak;
-use crate::vector::{Candidate, RouterMetrics, VectorElement, VectorStage};
-use crate::{DocAddress, Score, SegmentOrdinal, TantivyError};
+use crate::vector::{Candidate, RouterMetrics, VectorElement, VectorFilterStrategy, VectorStage};
+use crate::{DocAddress, Score, SegmentOrdinal, SegmentReader, TantivyError};
 
 /// Per-segment vector search state: the segment's [`VectorIndexReader`] and the prepared query.
 /// Build via [`SegmentSearcher::for_segment`].
@@ -139,6 +140,29 @@ impl<T: VectorElement> SegmentSearcher<T> {
         }
     }
 
+    pub(crate) fn post_filter<'a>(
+        &'a self,
+        weight: &'a dyn Weight,
+    ) -> Option<(&'a dyn Weight, &'a SegmentReader, f64)> {
+        if matches!(
+            &self.segment.scan,
+            Some(ScanInput::Routed {
+                filter: DocFilter::Post,
+                ..
+            })
+        ) {
+            let VectorFilterStrategy::Post {
+                estimated_selectivity,
+            } = self.probe_params.filter_strategy().unwrap()
+            else {
+                unreachable!()
+            };
+            Some((weight, &self.segment.reader, estimated_selectivity))
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn reader(&self) -> &VectorIndexReader {
         &self.reader
     }
@@ -158,9 +182,10 @@ impl<T: VectorElement> SegmentSearcher<T> {
     pub(crate) fn top_n(
         &self,
         top_n: usize,
+        weight: &dyn Weight,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let (searched, totals) =
-            measure(|| self.top_n_by(top_n, &mut NoTieBreak, NaturalComparator));
+            measure(|| self.top_n_by(top_n, &mut NoTieBreak, NaturalComparator, weight));
         let (hits, report) = searched?;
         Ok((
             hits.into_iter()
@@ -180,6 +205,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
         top_n: usize,
         tie_break: &mut K,
         tie_comparator: CTail,
+        weight: &dyn Weight,
     ) -> crate::Result<(TieBreakHits<K>, SegmentReport)>
     where
         K: SegmentSortKeyComputer,
@@ -188,7 +214,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
         match self.segment.scan.as_ref().expect("prepared segment") {
             ScanInput::Flat { filter } => {
                 let (hits, rows_read) =
-                    self.flat_top_n(filter, top_n, tie_break, tie_comparator)?;
+                    self.flat_top_n(filter, top_n, tie_break, tie_comparator, weight)?;
                 Ok((hits, SegmentReport::Flat { rows_read }))
             }
             input => self.search_ivf(
@@ -197,6 +223,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
                 top_n,
                 tie_break,
                 tie_comparator,
+                weight,
             ),
         }
     }
@@ -209,6 +236,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
         top_n: usize,
         tie_break: &mut K,
         tie_comparator: C,
+        weight: &dyn Weight,
     ) -> crate::Result<(TieBreakHits<K>, SegmentReport)>
     where
         K: SegmentSortKeyComputer,
@@ -247,7 +275,8 @@ impl<T: VectorElement> SegmentSearcher<T> {
             self.segment.ordinal,
             tie_break,
             tie_comparator,
-        )?;
+        )?
+        .with_post_filter(self.post_filter(weight));
         drop(init);
         let source = match input.clone() {
             ScanInput::Routed { filter, budget, .. } => {
@@ -269,6 +298,40 @@ impl<T: VectorElement> SegmentSearcher<T> {
                     self.shared_work.clone(),
                 );
                 scan.run(&mut clusters)?;
+                let mut window = self.ranked.len().max(1);
+                while scan.needs_more_matches()
+                    && !clusters.exhausted()
+                    && window < index.num_clusters()
+                {
+                    window = window.saturating_mul(2).min(index.num_clusters());
+                    let ranking = crate::vector::router::global::GlobalRanking::from(
+                        &[Some(index.opened_router())],
+                        &[self.segment.partition_centroid.as_deref()],
+                        &self.query,
+                        crate::vector::router::RoutingParams {
+                            k: window,
+                            rerank_factor: self.probe_params.router_rerank_factor,
+                            min_beam_fraction: self.probe_params.router_min_beam_fraction,
+                            aps: self.probe_params.router_aps,
+                            flat: self.probe_params.router_flat,
+                        },
+                        &mut [crate::vector::telemetry::StageTotals::default()],
+                        &mut |_| {},
+                    );
+                    clusters.replace_ranking(RouterIter::new(
+                        ranking
+                            .clusters
+                            .into_iter()
+                            .map(|(_, c)| crate::vector::router::candidate::Candidate {
+                                node: c.node.into(),
+                                sim: c.sim,
+                            })
+                            .collect(),
+                        ranking.metrics[0],
+                    ));
+                    scan.retried_router();
+                    scan.run(&mut clusters)?;
+                }
                 SourceReport::Router(clusters.finish())
             }
             ScanInput::Located { docs, budget, .. } => {
@@ -300,6 +363,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
         top_n: usize,
         tie_break: &mut K,
         tie_comparator: CTail,
+        weight: &dyn Weight,
     ) -> crate::Result<(TieBreakHits<K>, usize)>
     where
         K: SegmentSortKeyComputer,
@@ -313,7 +377,9 @@ impl<T: VectorElement> SegmentSearcher<T> {
         drop(init);
         let scan = enter_vector_stage(VectorStage::ExactScan);
         let docs = match filter {
-            DocFilter::All => itertools::Either::Left(0..self.segment.reader.max_doc()),
+            DocFilter::All | DocFilter::Post => {
+                itertools::Either::Left(0..self.segment.reader.max_doc())
+            }
             DocFilter::Docs(docs) => itertools::Either::Right(
                 (0..docs.max_value().div_ceil(64)).flat_map(move |bucket| {
                     docs.tinyset(bucket)
@@ -322,9 +388,27 @@ impl<T: VectorElement> SegmentSearcher<T> {
                 }),
             ),
         };
+        let mut scorer = if matches!(filter, DocFilter::Post) {
+            let _setup = enter_vector_stage(VectorStage::LateFilterSetup);
+            Some(ExcludedDocSet::new(
+                weight.scorer_for_candidates_unpositioned(
+                    &self.segment.reader,
+                    1.0,
+                    self.segment.reader.max_doc(),
+                )?,
+            ))
+        } else {
+            None
+        };
         for doc in docs {
             if let Some(bs) = alive {
                 if !bs.is_alive(doc) {
+                    continue;
+                }
+            }
+            if let Some(scorer) = &mut scorer {
+                let _predicate = enter_vector_stage(VectorStage::LateFilterPredicate);
+                if !scorer.contains(doc) {
                     continue;
                 }
             }

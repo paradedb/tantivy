@@ -799,6 +799,12 @@ fn remove_and_count_all_and_empty_scorers(
 }
 
 impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombiner> {
+    fn uses_fast_fields(&self) -> bool {
+        self.weights
+            .iter()
+            .any(|(_, weight)| weight.uses_fast_fields())
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let num_docs = reader.num_docs();
         if self.weights.is_empty() {
