@@ -7,9 +7,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-const ADAPTIVE_PATIENCE_START_WORK: f64 = 500.0;
-const ADAPTIVE_PATIENCE_END_WORK: f64 = 2000.0;
-const ADAPTIVE_PATIENCE_MAX_FRACTION: f64 = 0.10;
+const ADAPTIVE_PATIENCE_BUDGET_THRESHOLD: f64 = 1000.0;
+const ADAPTIVE_PATIENCE_FRACTION: f64 = 0.01;
 
 /// Actual routed work charged by all participants in one query. Located scans are separate.
 pub trait SharedVectorWork: Send + Sync {
@@ -173,16 +172,18 @@ impl WorkMeter {
             >= self.budget.total.get()
     }
 
-    /// Ramps patience from 0% at 500 work units to 10% at 2,000.
+    /// Requires 1% quiet work above a budget of 1,000 work units.
     pub(crate) fn adaptive_stop(&mut self, quiet: bool) -> bool {
         if !quiet {
             self.last_active_work = self.charged;
             return false;
         }
         let budget = self.budget.total.get();
-        let ramp = (budget - ADAPTIVE_PATIENCE_START_WORK)
-            / (ADAPTIVE_PATIENCE_END_WORK - ADAPTIVE_PATIENCE_START_WORK);
-        let fraction = ADAPTIVE_PATIENCE_MAX_FRACTION * ramp.clamp(0.0, 1.0);
+        let fraction = if budget > ADAPTIVE_PATIENCE_BUDGET_THRESHOLD {
+            ADAPTIVE_PATIENCE_FRACTION
+        } else {
+            0.0
+        };
         self.charged.get() - self.last_active_work.get() >= fraction * budget
     }
 
@@ -263,7 +264,7 @@ mod shared_work_tests {
     fn adaptive_patience_uses_work_and_resets_on_activity() {
         let mut meter = WorkMeter::new(
             WorkBudget {
-                total: WorkUnits::new(1000.0),
+                total: WorkUnits::new(2000.0),
                 per_cluster: WorkUnits::new(0.25),
                 per_row: WorkUnits::new(0.75),
             },
@@ -297,14 +298,16 @@ mod shared_work_tests {
             (50, 0),
             (499, 0),
             (500, 0),
-            (501, 1),
-            (1000, 34),
-            (1250, 63),
-            (1500, 100),
-            (1999, 200),
-            (2000, 200),
-            (2001, 201),
-            (4000, 400),
+            (501, 0),
+            (999, 0),
+            (1000, 0),
+            (1001, 11),
+            (1250, 13),
+            (1500, 15),
+            (1999, 20),
+            (2000, 20),
+            (2001, 21),
+            (4000, 40),
         ] {
             let mut meter = WorkMeter::new(
                 WorkBudget {
