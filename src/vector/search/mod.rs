@@ -44,7 +44,7 @@ use crate::vector::telemetry::measure;
 #[cfg(test)]
 use crate::vector::tie_break::NoTieBreak;
 use crate::vector::{Candidate, RouterMetrics, VectorElement, VectorStage};
-use crate::{DocAddress, Score, SegmentOrdinal, TantivyError};
+use crate::{DocAddress, Result, Score, SegmentOrdinal, TantivyError};
 
 /// Per-segment vector search state: the segment's [`VectorIndexReader`] and the prepared query.
 /// Build via [`SegmentSearcher::for_segment`].
@@ -140,7 +140,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
         }
     }
 
-    pub(crate) fn prepare_filter(&mut self, weight: &dyn Weight) -> crate::Result<()> {
+    pub(crate) fn prepare_filter(&mut self, weight: &dyn Weight) -> Result<()> {
         if let Some(ScanInput::Routed { filter, .. }) = &mut self.segment.scan {
             let Source::Router(prepared) = collect_segment_filter(
                 weight,
