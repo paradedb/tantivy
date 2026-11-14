@@ -18,7 +18,7 @@ use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::enter_vector_stage;
 use crate::vector::VectorStage;
-use crate::{DocId, SegmentReader};
+use crate::{DocId, Result, SegmentReader};
 
 // --- Filter and gate ---
 
@@ -265,7 +265,7 @@ impl<'a> RouterClusters<'a> {
         weight: &dyn Weight,
         segment: &'a SegmentReader,
         docs: Option<&[(u32, DocId)]>,
-    ) -> crate::Result<()> {
+    ) -> Result<()> {
         let Some(docs) = docs else {
             let Source::Router(filter) =
                 collect_segment_filter(weight, segment, segment.max_doc(), 0)?

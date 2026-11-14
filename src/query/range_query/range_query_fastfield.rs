@@ -19,7 +19,7 @@ use crate::query::{
     AllScorer, ConstScorer, EmptyScorer, EnableScoring, Explanation, Query, Scorer, Weight,
 };
 use crate::schema::{Type, ValueBytes};
-use crate::{DocId, DocSet, Order, Score, TantivyError, Term};
+use crate::{DocId, DocSet, Order, Result, Score, TantivyError, Term};
 
 #[derive(Clone, Debug)]
 /// `FastFieldRangeQuery` is the same as [RangeQuery] but only uses the fast field
@@ -64,7 +64,7 @@ impl Weight for FastFieldRangeWeight {
         reader: &SegmentReader,
         boost: Score,
         _candidate_size: u32,
-    ) -> crate::Result<Box<dyn Scorer>> {
+    ) -> Result<Box<dyn Scorer>> {
         Self {
             candidate_mode: true,
             ..self.clone()

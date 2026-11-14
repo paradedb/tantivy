@@ -182,6 +182,12 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> DocSet for RangeDocSe
         if self.is_last_seek_distance_large(target) {
             self.reset_fetch_range();
         }
+        if self.next_fetch_start == 0 && self.loaded_docs.is_empty() {
+            self.next_fetch_start = target;
+            self.fetch_block();
+            self.last_seek_pos_opt = Some(target);
+            return self.doc();
+        }
         if target > self.next_fetch_start {
             self.next_fetch_start = target;
         }
@@ -376,6 +382,11 @@ mod tests {
                 .copied()
                 .find(|&m| m >= target)
                 .unwrap_or(TERMINATED);
+
+            let column = build_u64_column(num_docs, values_for_doc);
+            let mut unpositioned = RangeDocSet::new_unpositioned(1..=1, column);
+            assert_eq!(unpositioned.seek(target), expected);
+            assert_eq!(unpositioned.doc(), expected);
 
             let mut danger = range_docset(1..=1, num_docs, values_for_doc);
             match danger.seek_danger(target) {
