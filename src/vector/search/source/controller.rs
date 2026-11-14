@@ -7,6 +7,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+const ADAPTIVE_PATIENCE_BUDGET_THRESHOLD: f64 = 1000.0;
+const ADAPTIVE_PATIENCE_FRACTION: f64 = 0.01;
+
 /// Actual routed work charged by all participants in one query. Located scans are separate.
 pub trait SharedVectorWork: Send + Sync {
     /// Adds finite, nonnegative work. Implementations must not lose concurrent charges.
@@ -130,6 +133,7 @@ pub(crate) struct WorkBudget {
 pub(crate) struct WorkMeter {
     budget: WorkBudget,
     charged: WorkUnits,
+    last_active_work: WorkUnits,
     shared: Option<Arc<dyn SharedVectorWork>>,
 }
 
@@ -138,6 +142,7 @@ impl WorkMeter {
         Self {
             budget,
             charged: WorkUnits::ZERO,
+            last_active_work: WorkUnits::ZERO,
             shared,
         }
     }
@@ -165,6 +170,21 @@ impl WorkMeter {
             .as_ref()
             .map_or(self.charged.get(), |shared| shared.charged())
             >= self.budget.total.get()
+    }
+
+    /// Requires 1% quiet work above a budget of 1,000 work units.
+    pub(crate) fn adaptive_stop(&mut self, quiet: bool) -> bool {
+        if !quiet {
+            self.last_active_work = self.charged;
+            return false;
+        }
+        let budget = self.budget.total.get();
+        let fraction = if budget > ADAPTIVE_PATIENCE_BUDGET_THRESHOLD {
+            ADAPTIVE_PATIENCE_FRACTION
+        } else {
+            0.0
+        };
+        self.charged.get() - self.last_active_work.get() >= fraction * budget
     }
 
     /// The work charged so far.
@@ -239,6 +259,73 @@ pub(crate) struct ProbeOutcome {
 #[cfg(test)]
 mod shared_work_tests {
     use super::*;
+
+    #[test]
+    fn adaptive_patience_uses_work_and_resets_on_activity() {
+        let mut meter = WorkMeter::new(
+            WorkBudget {
+                total: WorkUnits::new(2000.0),
+                per_cluster: WorkUnits::new(0.25),
+                per_row: WorkUnits::new(0.75),
+            },
+            None,
+        );
+        meter.open();
+        meter.rows(1);
+        assert!(!meter.adaptive_stop(false));
+        for rows in [4, 8] {
+            meter.open();
+            meter.rows(rows);
+            assert!(!meter.adaptive_stop(true));
+        }
+        for _ in 0..10 {
+            assert!(!meter.adaptive_stop(true));
+        }
+        meter.open();
+        meter.rows(32);
+        assert!(meter.adaptive_stop(true));
+        assert!(!meter.adaptive_stop(false));
+        meter.open();
+        meter.rows(1);
+        assert!(!meter.adaptive_stop(true));
+    }
+
+    #[test]
+    fn adaptive_patience_scales_with_budget_without_changing_ceiling() {
+        for (budget, stop_at) in [
+            (20, 0),
+            (49, 0),
+            (50, 0),
+            (499, 0),
+            (500, 0),
+            (501, 0),
+            (999, 0),
+            (1000, 0),
+            (1001, 11),
+            (1250, 13),
+            (1500, 15),
+            (1999, 20),
+            (2000, 20),
+            (2001, 21),
+            (4000, 40),
+        ] {
+            let mut meter = WorkMeter::new(
+                WorkBudget {
+                    total: WorkUnits::new(budget as f64),
+                    per_cluster: WorkUnits::new(0.5),
+                    per_row: WorkUnits::new(0.5),
+                },
+                None,
+            );
+            assert_eq!(meter.adaptive_stop(true), stop_at == 0);
+            for work in 1..=budget {
+                meter.open();
+                meter.rows(1);
+                assert_eq!(meter.adaptive_stop(true), work >= stop_at);
+                assert_eq!(meter.exhausted(), work == budget);
+            }
+        }
+    }
 
     #[test]
     fn concurrent_meters_enforce_one_ceiling() {

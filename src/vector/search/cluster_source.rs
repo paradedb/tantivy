@@ -4,6 +4,7 @@
 use std::ops::Range;
 
 use crate::vector::distance::Similarity;
+use crate::vector::search::source::controller::WorkMeter;
 use crate::DocId;
 
 /// One cluster's selected rows, with what is already known about them.
@@ -46,6 +47,7 @@ impl ClusterRows<'_> {
 
 /// Supplies a segment scan's clusters in its own order and decides when to stop.
 pub(crate) trait ClusterSource {
+    fn work_meter(&mut self) -> &mut WorkMeter;
     /// The next cluster's rows, or `None` when the source stops.
     fn next(&mut self) -> crate::Result<Option<ClusterRows<'_>>>;
     /// Records that the last cluster was shortlisted with `rows` scored.
