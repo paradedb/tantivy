@@ -3619,12 +3619,14 @@ mod late_filter_tests {
         let mut expanded = false;
         for filter in filters {
             let weight = fixture.weight(filter.as_ref())?;
-            for levels in [1, usize::MAX] {
+            for (levels, estimated_selectivity) in
+                [(1, 1.0), (usize::MAX, 1.0), (1, 0.1), (usize::MAX, 0.1)]
+            {
                 let builder =
                     TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
                         .with_probe_params(ProbeParams {
                             filter_strategy: Some(VectorFilterStrategy::Post {
-                                estimated_selectivity: 1.0,
+                                estimated_selectivity,
                             }),
                             ..exhaustive_params(64)
                         })
@@ -3638,7 +3640,7 @@ mod late_filter_tests {
                 assert_eq!(
                     fruit.results,
                     fixture.oracle(filter.as_ref(), &query, 10)?,
-                    "{filter:?}, levels={levels}"
+                    "{filter:?}, levels={levels}, selectivity={estimated_selectivity}"
                 );
                 if levels > 1 {
                     assert!(

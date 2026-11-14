@@ -948,11 +948,12 @@ where
         self.report.filter_candidates += queue.len();
         drop(selection);
         let mut batch = Vec::new();
+        let mut refined = Vec::new();
         let mut indexed = Vec::new();
         let mut offsets = Vec::new();
         let mut indices = Vec::new();
         let mut doc_cache = HashMap::<usize, Vec<DocId>>::new();
-        let batch_size = self.filter_batch_size.clamp(1, MAX_FILTER_BATCH_SIZE);
+        let batch_size = self.filter_batch_size.max(1);
         while queue.peek().is_some_and(|next| {
             self.bound
                 .shared_threshold()
@@ -975,7 +976,7 @@ where
                 let _sort = enter_vector_stage(VectorStage::LateFilterSort);
                 batch.sort_unstable();
             }
-            indexed.clear();
+            refined.clear();
             for group in batch.chunk_by(|a, b| a.0 == b.0) {
                 let b = group[0].0;
                 let block = state.candidates.block(b);
@@ -1031,18 +1032,38 @@ where
                         if docs.is_empty() {
                             self.reader.read_doc_ids(cluster, docs)?;
                         }
-                        indexed.push((
-                            docs[offset as usize],
-                            BlockAddress::new(cluster as u32, offset),
-                        ));
+                        refined.push(RankedCandidate {
+                            sim: Similarity::new(upper.0),
+                            node: Reverse((
+                                docs[offset as usize],
+                                BlockAddress::new(cluster as u32, offset),
+                            )),
+                        });
                     }
                 }
                 drop(doc_ids);
             }
             if self.report.layers.len() > 1 {
-                self.report.layers.last_mut().unwrap().survivors += indexed.len();
+                self.report.layers.last_mut().unwrap().survivors += refined.len();
             }
-            if !indexed.is_empty() {
+            {
+                let _sort = enter_vector_stage(VectorStage::LateFilterSort);
+                refined.sort_unstable_by_key(|candidate| Reverse(*candidate));
+            }
+            for candidates in refined.chunks(MAX_FILTER_BATCH_SIZE) {
+                let selection = enter_vector_stage(VectorStage::LateFilterSelect);
+                let threshold = self.bound.shared_threshold();
+                indexed.clear();
+                indexed.extend(
+                    candidates
+                        .iter()
+                        .take_while(|next| threshold.is_none_or(|bar| next.sim.score() >= bar))
+                        .map(|next| next.node.0),
+                );
+                drop(selection);
+                if indexed.is_empty() {
+                    break;
+                }
                 self.report.filter_batches += 1;
                 let sorting = enter_vector_stage(VectorStage::LateFilterSort);
                 indexed.sort_unstable_by_key(|&(doc, _)| doc);
