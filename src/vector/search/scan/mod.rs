@@ -50,6 +50,7 @@ use crate::vector::{BlockAddress, VectorElement, VectorStage};
 use crate::{DocId, SegmentOrdinal, SegmentReader};
 
 const FILTER_BATCH_HEADROOM: usize = 2;
+const MAX_FILTER_BATCH_SIZE: usize = 64;
 
 // --- Contracts ---
 
@@ -951,7 +952,7 @@ where
         let mut offsets = Vec::new();
         let mut indices = Vec::new();
         let mut doc_cache = HashMap::<usize, Vec<DocId>>::new();
-        let mut batch_size = self.filter_batch_size.max(1).min(queue.len());
+        let batch_size = self.filter_batch_size.clamp(1, MAX_FILTER_BATCH_SIZE);
         while queue.peek().is_some_and(|next| {
             self.bound
                 .shared_threshold()
@@ -1069,7 +1070,6 @@ where
                     .refined_topk_rows
                     .extend(indexed.iter().map(|&(_, address)| address));
             }
-            batch_size = batch_size.saturating_mul(2).min(queue.len());
         }
         for &b in &self.by_cluster {
             state.candidates.retire(b);
