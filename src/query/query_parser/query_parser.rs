@@ -2023,8 +2023,8 @@ mod test {
             assert_eq!(
                 format!("{query:?}"),
                 "BooleanQuery { subqueries: [(Should, FuzzyTermQuery { term: Term(field=0, \
-                 type=Str, \"abc\"), distance: 1, transposition_cost_one: true, prefix: false }), \
-                 (Should, TermQuery(Term(field=1, type=Str, \"abc\")))], \
+                 type=Str, \"abc\"), distance: 1, transposition_cost_one: true, prefix: false, \
+                 max_expansions: None }), (Should, TermQuery(Term(field=1, type=Str, \"abc\")))], \
                  minimum_number_should_match: 1 }"
             );
         }
@@ -2042,8 +2042,8 @@ mod test {
                 format!("{query:?}"),
                 "BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \
                  \"abc\"))), (Should, FuzzyTermQuery { term: Term(field=1, type=Str, \"abc\"), \
-                 distance: 2, transposition_cost_one: false, prefix: true })], \
-                 minimum_number_should_match: 1 }"
+                 distance: 2, transposition_cost_one: false, prefix: true, max_expansions: None \
+                 })], minimum_number_should_match: 1 }"
             );
         }
     }
