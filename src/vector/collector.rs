@@ -957,11 +957,13 @@ where
         on_segment(i);
         result?;
     }
-    let mut rate = collector
-        .probe_params
-        .adaptive_probing
-        .filter(|_| top_n > 0)
-        .map(|_| crate::vector::search::scan::RateApsState::default());
+    // Refinement during probing tightens the pruning threshold whether or not adaptive probing
+    // measures admission to stop early.
+    let mut rate = (top_n > 0).then(|| {
+        crate::vector::search::scan::RateApsState::new(
+            collector.probe_params.adaptive_probing.is_some(),
+        )
+    });
     let mut recall_reached = false;
     for (i, candidate) in candidates {
         if meter.exhausted() || recall_reached {
@@ -1451,7 +1453,7 @@ mod ivf_e2e_tests {
     }
 
     #[test]
-    fn global_search_refines_during_probing_only_with_adaptive() -> Result<()> {
+    fn global_search_refines_during_probing_with_or_without_adaptive() -> Result<()> {
         use crate::vector::VectorStage;
 
         for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
@@ -1518,10 +1520,10 @@ mod ivf_e2e_tests {
                             )
                         })
                         .expect("refinement reads");
-                    let refines_during_probing = adaptive
-                        && result.stats.iter().any(|stats| {
-                            stats.access_path == crate::vector::stats::AccessPath::Routed
-                        });
+                    let refines_during_probing = result
+                        .stats
+                        .iter()
+                        .any(|stats| stats.access_path == crate::vector::stats::AccessPath::Routed);
                     assert_eq!(
                         first_refinement < last_shortlist,
                         refines_during_probing,
