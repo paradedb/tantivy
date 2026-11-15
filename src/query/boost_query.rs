@@ -86,8 +86,22 @@ impl BoostWeight {
 }
 
 impl Weight for BoostWeight {
+    fn uses_fast_fields(&self) -> bool {
+        self.weight.uses_fast_fields()
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         self.weight.scorer(reader, boost * self.boost)
+    }
+
+    fn scorer_for_candidates_unpositioned(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        candidate_size: u32,
+    ) -> crate::Result<Box<dyn Scorer>> {
+        self.weight
+            .scorer_for_candidates_unpositioned(reader, boost * self.boost, candidate_size)
     }
 
     fn pruning_scorer(

@@ -81,6 +81,10 @@ impl ConstWeight {
 }
 
 impl Weight for ConstWeight {
+    fn uses_fast_fields(&self) -> bool {
+        self.weight.uses_fast_fields()
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let inner_scorer = self.weight.scorer(reader, boost)?;
         Ok(Box::new(ConstScorer::new(inner_scorer, boost * self.score)))
@@ -122,6 +126,7 @@ impl Weight for ConstWeight {
 ///
 /// The `ConstScorer`'s constant score can be set
 /// by calling `.set_score(...)`.
+#[derive(Clone)]
 pub struct ConstScorer<TDocSet: DocSet> {
     docset: TDocSet,
     score: Score,

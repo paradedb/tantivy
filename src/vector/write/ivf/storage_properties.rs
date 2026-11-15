@@ -543,7 +543,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                 min_probe_clusters: 4,
                 exact_plan: false,
                 located: LocatedPath::Off,
-                ..Default::default()
+                ..ProbeParams::prefilter()
             };
             let builder = TopDocsByVectorSimilarityBuilder::new(field, query.clone(), DOCS + 1)
                 .with_probe_params(params.clone());

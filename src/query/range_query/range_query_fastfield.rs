@@ -59,6 +59,10 @@ impl FastFieldRangeWeight {
 }
 
 impl Weight for FastFieldRangeWeight {
+    fn uses_fast_fields(&self) -> bool {
+        true
+    }
+
     fn scorer_for_candidates_unpositioned(
         &self,
         reader: &SegmentReader,

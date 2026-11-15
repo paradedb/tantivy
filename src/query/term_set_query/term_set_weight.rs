@@ -403,6 +403,11 @@ impl TermSetWeight {
 }
 
 impl Weight for TermSetWeight {
+    fn uses_fast_fields(&self) -> bool {
+        matches!(self.repr, TermRepr::Ipv6(_))
+            || (self.fast_strategies_available && matches!(self.repr, TermRepr::Numeric(_)))
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         self.scorer_with_candidates(reader, boost, None)
     }

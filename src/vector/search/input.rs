@@ -11,7 +11,7 @@ use crate::vector::search::segment::plan::{
 use crate::vector::search::source::controller::{SharedVectorWork, WorkBudget, WorkUnits};
 use crate::vector::search::source::router::DocFilter;
 use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
-use crate::vector::{ProbeParams, VectorStage};
+use crate::vector::{ProbeParams, VectorFilterStrategy, VectorStage};
 use crate::{Result, SegmentOrdinal, TantivyError};
 
 /// A segment handle shared by preparation, routing and scanning.
@@ -109,9 +109,14 @@ impl PreparedVectorSearch {
         weight: &dyn Weight,
         segments: &[VectorSegment],
         budget: VectorSearchBudget,
-        filter_match_fraction: Option<f64>,
         mut on_segment: impl FnMut(SegmentOrdinal),
     ) -> Result<Self> {
+        let filter_match_fraction = match params.filter_strategy()? {
+            VectorFilterStrategy::Pre { .. } => None,
+            VectorFilterStrategy::Cluster {
+                estimated_selectivity,
+            } => Some(estimated_selectivity),
+        };
         let mut prepared = Self {
             field,
             filter_match_fraction,

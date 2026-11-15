@@ -462,6 +462,7 @@ fn flat_top_n_returns_nearest_when_more_than_k_docs_per_segment() -> crate::Resu
             &AllQuery,
             &TopDocs::with_limit(top_k)
                 .order_by_similarity(index.embedding_field(), query.to_vec())
+                .with_probe_params(ProbeParams::prefilter())
                 .build_for_searcher(&searcher, &crate::query::AllQuery)
                 .unwrap(),
         )?
@@ -1139,6 +1140,7 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
     let searcher = index.reader()?.searcher();
     let collector = TopDocs::with_limit(2)
         .order_by_similarity(embedding_field, vec![1.0_f32, 0.0])
+        .with_probe_params(ProbeParams::prefilter())
         .build_for_searcher(&searcher, &crate::query::AllQuery)
         .unwrap();
     let hits = searcher.search(&AllQuery, &collector)?.results;
@@ -1276,7 +1278,7 @@ pub(crate) fn exhaustive_params(_num_centroids: usize) -> ProbeParams {
     ProbeParams {
         max_probe: usize::MAX,
         min_probe_clusters: 1,
-        ..Default::default()
+        ..ProbeParams::prefilter()
     }
 }
 
@@ -1530,7 +1532,7 @@ mod centroid_storage_tests {
     use crate::vector::router::RoutingParams;
     use crate::vector::search::prepared::VectorQuery;
     use crate::vector::storage::header::CENTROIDS_EXT;
-    use crate::vector::RouterKind;
+    use crate::vector::{ProbeParams, RouterKind};
     use crate::{Index, IndexWriter, TantivyDocument};
 
     /// A clusterer with deterministic centroids for crafted-geometry
@@ -1867,6 +1869,7 @@ mod centroid_storage_tests {
                     &AllQuery,
                     &TopDocs::with_limit(1)
                         .order_by_similarity(field, query)
+                        .with_probe_params(ProbeParams::prefilter())
                         .build_for_searcher(&searcher, &crate::query::AllQuery)
                         .unwrap(),
                 )?
