@@ -1,24 +1,11 @@
 //! Planning one segment's search: the work budget, the filter, and where clusters come from.
 
-use common::BitSet;
-
-use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
-use crate::query::{for_each_docset_buffered, AllScorer, Weight};
+use crate::vector::filter::DocFilter;
 use crate::vector::params::LocatedPath;
 use crate::vector::search::source::controller::WorkBudget;
-use crate::vector::search::source::router::DocFilter;
-use crate::{DocId, SegmentReader};
+use crate::DocId;
 
 // --- Plan ---
-
-/// Where a segment's clusters come from.
-#[derive(Clone)]
-pub(crate) enum Source {
-    /// The router's ranking, gated by the filter.
-    Router(DocFilter),
-    /// The filter's matches, few enough to look up directly: ascending, deleted ones included.
-    FilterMatches(Vec<DocId>),
-}
 
 /// What planning reports for the segment's statistics.
 #[derive(Clone, Copy, Debug)]
@@ -77,65 +64,17 @@ pub(crate) fn located_cap(
     }
 }
 
-// --- Filter ---
-
-/// Drains the filter `DocSet` once, in ascending doc order, keeping up to `cap` matches as a list.
-///
-/// The first match past `cap` moves the list into a bitset and the drain continues there. A
-/// match-all scorer, or a drain that matches every doc, routes unfiltered. The bitset allocates
-/// `max_doc / 8` bytes whatever the selectivity.
-#[inline(never)]
-pub(crate) fn collect_segment_filter(
-    weight: &dyn Weight,
-    segment_reader: &SegmentReader,
-    max_doc: DocId,
-    cap: usize,
-) -> crate::Result<Source> {
-    let mut scorer = weight.scorer(segment_reader, 1.0)?;
-    if scorer.is::<AllScorer>() {
-        return Ok(Source::Router(DocFilter::All));
-    }
-    let mut sparse = Vec::new();
-    let mut dense = (cap == 0).then(|| BitSet::with_max_value(max_doc));
-    let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
-    for_each_docset_buffered(scorer.as_mut(), &mut buffer, |docs| {
-        for &doc in docs {
-            match &mut dense {
-                Some(filter) => {
-                    filter.insert(doc);
-                }
-                None if sparse.len() < cap => sparse.push(doc),
-                None => {
-                    let mut filter = BitSet::with_max_value(max_doc);
-                    for &doc in &sparse {
-                        filter.insert(doc);
-                    }
-                    filter.insert(doc);
-                    sparse = Vec::new();
-                    dense = Some(filter);
-                }
-            }
-        }
-    });
-    let matched = dense.as_ref().map_or(sparse.len(), BitSet::len);
-    if matched == max_doc as usize {
-        return Ok(Source::Router(DocFilter::All));
-    }
-    Ok(match dense {
-        Some(filter) => Source::Router(DocFilter::Docs(filter.into())),
-        None => Source::FilterMatches(sparse),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::query::{AllQuery, BooleanQuery, Occur, Query};
     use crate::schema::Metric;
+    use crate::vector::filter::{FilterInput, FilterMatches};
     use crate::vector::params::{ProbeParams, Selectivity};
     use crate::vector::stats::AccessPath;
     use crate::vector::test_support::{first_segment, DocsWeight, FixtureSpec};
     use crate::vector::tests::exhaustive_params;
+    use crate::vector::VectorFilterStrategy;
 
     /// The plan resolves the budget once, builds no bitset for match-all filters, sees an empty
     /// filter or `top_n == 0` as nothing to search, and sizes the scan from the budget. A filter
@@ -194,6 +133,7 @@ mod tests {
                             let matches = match filter {
                                 DocFilter::All => None,
                                 DocFilter::Docs(docs) => Some(docs.len()),
+                                DocFilter::Candidates(_) | DocFilter::Pending => unreachable!(),
                             };
                             (budget, report, (false, matches))
                         }
@@ -286,9 +226,19 @@ mod tests {
             docs: (0..segment.max_doc()).collect(),
         };
         for cap in [0, 90] {
-            let source = collect_segment_filter(&every_doc, segment, segment.max_doc(), cap)?;
+            let source = VectorFilterStrategy::Pre {
+                uses_fast_fields: false,
+            }
+            .collect_matches(
+                &every_doc,
+                segment,
+                FilterInput::Segment {
+                    vectors: &vectors,
+                    located_cap: cap,
+                },
+            )?;
             assert!(
-                matches!(source, Source::Router(DocFilter::All)),
+                matches!(source, FilterMatches::Routed(DocFilter::All)),
                 "cap {cap}"
             );
         }

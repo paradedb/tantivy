@@ -17,6 +17,7 @@ use crate::collector::{
 use crate::index::SegmentReader;
 use crate::query::Weight;
 use crate::schema::{Field, Metric, Schema};
+use crate::vector::filter::{FilterInput, FilterMatches};
 use crate::vector::params::ProbeParams;
 use crate::vector::search::cluster_source::ClusterSource;
 use crate::vector::search::prepared::{invalid_query, QuantizedQueryCtx, VectorQuery};
@@ -686,9 +687,7 @@ where
     ) -> Result<(KeyedHits<S::SortKey>, SegmentReport, ExactMerge)> {
         let init = enter_vector_stage(VectorStage::ScanInit);
         let mut backend = self.segment_searcher(segment_ord)?;
-        if self.inputs.prepared.filter_match_fraction.is_some() {
-            backend.prepare_filter(weight)?;
-        }
+        backend.collect_filter_matches(weight)?;
         let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
         drop(init);
         let (hits, report) = backend.top_n_by(
@@ -969,26 +968,34 @@ where
         .filter(|_| top_n > 0)
         .map(|_| crate::vector::search::scan::RateApsState::default());
     let mut recall_reached = false;
-    if let Some(estimated_selectivity) = collector
+    if collector
         .inputs
         .prepared
-        .filter_match_fraction
-        .filter(|_| !meter.exhausted())
+        .filter_strategy
+        .filters_routed_clusters()
+        && !meter.exhausted()
     {
         for (j, source) in sources.iter_mut().enumerate() {
             let Some(GlobalSource::Router(source)) = source else {
                 continue;
             };
             let (result, measured) = measure(|| {
-                let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                source.filter_candidates(
-                    weight,
-                    &segments[j].reader,
-                    candidates
-                        .clone()
-                        .filter_map(|(i, c)| (i == j).then_some(c)),
-                    estimated_selectivity,
-                )
+                let FilterMatches::Routed(matches) =
+                    collector.inputs.prepared.filter_strategy.collect_matches(
+                        weight,
+                        &segments[j].reader,
+                        FilterInput::Clusters {
+                            vectors: &vectors[j],
+                            candidates: &mut candidates
+                                .clone()
+                                .filter_map(|(i, c)| (i == j).then_some(c)),
+                        },
+                    )?
+                else {
+                    unreachable!()
+                };
+                source.set_filter(matches, &segments[j].reader);
+                Ok::<_, TantivyError>(())
             });
             totals[j].append(&measured);
             on_segment(j);

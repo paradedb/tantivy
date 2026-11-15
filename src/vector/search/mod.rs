@@ -19,6 +19,7 @@ use crate::collector::{
 };
 use crate::query::Weight;
 use crate::schema::Field;
+use crate::vector::filter::{DocFilter, FilterInput, FilterMatches};
 use crate::vector::params::ProbeParams;
 use crate::vector::router::RouterIter;
 use crate::vector::search::input::VectorSegment;
@@ -28,10 +29,10 @@ use crate::vector::search::scan::heap::{tie_break_key, TieBreakHits};
 #[cfg(test)]
 use crate::vector::search::scan::plan::PlanOverride;
 use crate::vector::search::scan::{ScanConfig, SegmentScan};
-use crate::vector::search::segment::plan::{collect_segment_filter, ScanInput, Source};
+use crate::vector::search::segment::plan::ScanInput;
 use crate::vector::search::source::controller::SharedVectorWork;
 use crate::vector::search::source::matches::MatchClusters;
-use crate::vector::search::source::router::{DocFilter, RouterClusters};
+use crate::vector::search::source::router::RouterClusters;
 use crate::vector::search::source::SourceReport;
 #[cfg(test)]
 use crate::vector::stats::ProbeStats;
@@ -140,18 +141,28 @@ impl<T: VectorElement> SegmentSearcher<T> {
         }
     }
 
-    pub(crate) fn prepare_filter(&mut self, weight: &dyn Weight) -> Result<()> {
+    pub(crate) fn collect_filter_matches(&mut self, weight: &dyn Weight) -> Result<()> {
+        if !self
+            .probe_params
+            .filter_strategy()?
+            .filters_routed_clusters()
+        {
+            return Ok(());
+        }
         if let Some(ScanInput::Routed { filter, .. }) = &mut self.segment.scan {
-            let Source::Router(prepared) = collect_segment_filter(
-                weight,
-                &self.segment.reader,
-                self.segment.reader.max_doc(),
-                0,
-            )?
+            let FilterMatches::Routed(matches) =
+                self.probe_params.filter_strategy()?.collect_matches(
+                    weight,
+                    &self.segment.reader,
+                    FilterInput::Clusters {
+                        vectors: &self.reader,
+                        candidates: &mut self.ranked.iter().copied(),
+                    },
+                )?
             else {
                 unreachable!()
             };
-            *filter = prepared;
+            *filter = matches;
         }
         Ok(())
     }
@@ -325,26 +336,14 @@ impl<T: VectorElement> SegmentSearcher<T> {
         let init = enter_vector_stage(VectorStage::ScanInit);
         let mut topn =
             TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator));
-        let alive = self.segment.reader.alive_bitset();
         let mut rows_read = 0usize;
         drop(init);
         let scan = enter_vector_stage(VectorStage::ExactScan);
-        let docs = match filter {
-            DocFilter::All => itertools::Either::Left(0..self.segment.reader.max_doc()),
-            DocFilter::Docs(docs) => itertools::Either::Right(
-                (0..docs.max_value().div_ceil(64)).flat_map(move |bucket| {
-                    docs.tinyset(bucket)
-                        .into_iter()
-                        .map(move |bit| bucket * 64 + bit)
-                }),
-            ),
-        };
+        let docs = self
+            .probe_params
+            .filter_strategy()?
+            .flat_matches(&self.segment.reader, filter)?;
         for doc in docs {
-            if let Some(bs) = alive {
-                if !bs.is_alive(doc) {
-                    continue;
-                }
-            }
             let Some(vbytes) = self.reader.vector_bytes(doc)? else {
                 continue;
             };

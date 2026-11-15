@@ -1,9 +1,7 @@
 //! Query-time probe parameters: the work budget and the located path.
 
-use crate::query::Weight;
-use crate::schema::Field;
 use crate::vector::search::source::controller::open_share;
-use crate::vector::VectorSegment;
+use crate::vector::VectorFilterStrategy;
 use crate::{Result, TantivyError};
 
 /// Default [`ProbeParams::fixed_probe_cost_rows`]: the cost of opening a cluster, in rows of full
@@ -12,50 +10,6 @@ use crate::{Result, TantivyError};
 /// Policy constant: the open share `x = cost / (cost + n_avg)` follows the index's granularity.
 /// It covers the open only; routing cost is not modeled.
 pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
-
-/// Minimum estimated matches for deferring a fast-field filter. Keep the strategy independent
-/// of the probe ceiling so increasing recall does not switch access paths mid-sweep.
-pub const MIN_POST_FILTER_MATCHES: usize = 50_000;
-
-/// Query-wide filter evaluation, selected before worker assignment.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum VectorFilterStrategy {
-    /// Materialize the matches before vector search.
-    Pre { uses_fast_fields: bool },
-    /// Filter routed clusters before scoring their vectors.
-    Post { estimated_selectivity: f64 },
-}
-
-impl VectorFilterStrategy {
-    /// Selects a query-wide strategy from the filter and the actual segment storage.
-    pub fn plan(
-        field: Field,
-        weight: &dyn Weight,
-        estimated_matches: usize,
-        segments: &[VectorSegment],
-    ) -> Result<Self> {
-        let uses_fast_fields = weight.uses_fast_fields();
-        let pre = Self::Pre { uses_fast_fields };
-        if !uses_fast_fields || estimated_matches < MIN_POST_FILTER_MATCHES || segments.is_empty() {
-            return Ok(pre);
-        }
-        let mut has_clusters = false;
-        for segment in segments {
-            has_clusters |= segment.reader.vector_index(field)?.index().is_some();
-        }
-        if !has_clusters {
-            return Ok(pre);
-        }
-        let docs: u64 = segments
-            .iter()
-            .map(|s| u64::from(s.reader.num_docs()))
-            .sum();
-        Ok(Self::Post {
-            estimated_selectivity: (estimated_matches as f64 / docs.max(1) as f64)
-                .clamp(f64::EPSILON, 1.0),
-        })
-    }
-}
 
 /// Query-time probe budget for IVF vector search.
 ///
@@ -264,11 +218,11 @@ impl ProbeParams {
 mod tests {
     use std::ops::Bound;
 
-    use super::{ProbeParams, VectorFilterStrategy, MIN_POST_FILTER_MATCHES};
+    use super::ProbeParams;
     use crate::query::{BooleanQuery, BoostQuery, ConstScoreQuery, FastFieldRangeQuery, Query};
     use crate::schema::Metric;
     use crate::vector::test_support::FixtureSpec;
-    use crate::vector::VectorSegment;
+    use crate::vector::{VectorFilterStrategy, VectorSegment, MIN_POST_FILTER_MATCHES};
     use crate::{Result, Term};
 
     #[test]

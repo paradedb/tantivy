@@ -94,6 +94,7 @@
 mod collector;
 mod distance;
 mod element;
+mod filter;
 mod params;
 pub(crate) mod quantization;
 mod rotation_plan;
@@ -123,9 +124,9 @@ pub use collector::{
     VectorSimilarityFruit,
 };
 pub use element::{Accumulator, VectorElement, ENTRY_ALIGN};
+pub use filter::{VectorFilterStrategy, MIN_POST_FILTER_MATCHES};
 pub use params::{
-    AdaptiveProbeParams, LocatedPath, ProbeParams, Selectivity, VectorFilterStrategy,
-    DEFAULT_FIXED_PROBE_COST_ROWS, MIN_POST_FILTER_MATCHES,
+    AdaptiveProbeParams, LocatedPath, ProbeParams, Selectivity, DEFAULT_FIXED_PROBE_COST_ROWS,
 };
 pub use quantization::{VectorQuantizationConfig, VectorQuantizationLayer};
 pub use router::candidate::Candidate;

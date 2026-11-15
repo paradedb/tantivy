@@ -3,10 +3,7 @@
 
 use std::sync::Arc;
 
-use common::BitSet;
-
-use crate::fastfield::AliveBitSet;
-use crate::query::{BitSetDocSet, ExcludedDocSet, ExclusionSet, Weight};
+use crate::vector::filter::{DocFilter, GatedRows, RowGate};
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::{RouterIter, RouterMetrics};
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
@@ -17,153 +14,9 @@ use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::enter_vector_stage;
 use crate::vector::VectorStage;
-use crate::{DocId, DocSet, Result, SegmentReader, TERMINATED};
+use crate::{DocId, SegmentReader};
 
 // --- Filter and gate ---
-
-/// The filter's matches as the router source gates rows with them.
-#[derive(Clone)]
-pub(crate) enum DocFilter {
-    /// Every doc id below `max_doc` matches, deleted docs included; no bitset is built.
-    All,
-    /// The matching doc ids.
-    Docs(Arc<BitSet>),
-}
-
-impl DocFilter {
-    pub(crate) fn is_empty(&self) -> bool {
-        matches!(self, Self::Docs(docs) if docs.len() == 0)
-    }
-
-    /// The share of doc ids below `max_doc` that match.
-    pub(crate) fn match_fraction(&self, max_doc: DocId) -> f64 {
-        match self {
-            Self::All => 1.0,
-            Self::Docs(docs) => docs.len() as f64 / f64::from(max_doc.max(1)),
-        }
-    }
-}
-
-/// How a cluster row is tested before scoring: against the filter's matches and the alive docs.
-pub(crate) enum RowGate<'a> {
-    Open,
-    Candidates {
-        docs: Vec<DocId>,
-        alive: Option<&'a AliveBitSet>,
-    },
-    AliveOnly(&'a AliveBitSet),
-    FilterOnly(Arc<BitSet>),
-    FilterAndAlive {
-        filter: Arc<BitSet>,
-        alive: &'a AliveBitSet,
-    },
-}
-
-/// What a gate kept of one cluster.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct GatedRows {
-    /// Every row is kept; the offsets are left empty.
-    pub(crate) all: bool,
-    pub(crate) pruned_filter: usize,
-    pub(crate) pruned_dead: usize,
-}
-
-impl<'a> RowGate<'a> {
-    pub(crate) fn new(filter: DocFilter, alive: Option<&'a AliveBitSet>) -> Self {
-        match (filter, alive) {
-            (DocFilter::All, None) => RowGate::Open,
-            (DocFilter::All, Some(alive)) => RowGate::AliveOnly(alive),
-            (DocFilter::Docs(filter), None) => RowGate::FilterOnly(filter),
-            (DocFilter::Docs(filter), Some(alive)) => RowGate::FilterAndAlive { filter, alive },
-        }
-    }
-
-    /// Whether every row passes without reading its doc id.
-    pub(crate) fn is_open(&self) -> bool {
-        matches!(self, RowGate::Open)
-    }
-
-    /// Gates a cluster whose DocIds column is `doc_ids`, writing the kept cluster-local offsets.
-    pub(crate) fn select(&self, doc_ids: &[DocId], offsets: &mut Vec<u32>) -> GatedRows {
-        offsets.clear();
-        let verdicts = match self {
-            RowGate::Open => {
-                return GatedRows {
-                    all: true,
-                    pruned_filter: 0,
-                    pruned_dead: 0,
-                }
-            }
-            RowGate::Candidates { docs, alive } => gate(doc_ids, offsets, |doc| {
-                let matches = docs.binary_search(&doc).is_ok();
-                RowVerdict {
-                    matches,
-                    keep: matches && alive.is_none_or(|alive| alive.is_alive(doc)),
-                }
-            }),
-            RowGate::AliveOnly(alive) => gate(doc_ids, offsets, |doc| {
-                let alive = alive.is_alive(doc);
-                RowVerdict {
-                    matches: true,
-                    keep: alive,
-                }
-            }),
-            RowGate::FilterOnly(filter) => gate(doc_ids, offsets, |doc| {
-                let matches = filter.contains(doc);
-                RowVerdict {
-                    matches,
-                    keep: matches,
-                }
-            }),
-            RowGate::FilterAndAlive { filter, alive } => gate(doc_ids, offsets, |doc| {
-                let matches = filter.contains(doc);
-                RowVerdict {
-                    matches,
-                    keep: matches & alive.is_alive(doc),
-                }
-            }),
-        };
-        GatedRows {
-            all: false,
-            pruned_filter: doc_ids.len() - verdicts.matched,
-            pruned_dead: verdicts.matched - verdicts.kept,
-        }
-    }
-}
-
-/// One row's verdict: whether it matches the filter, and whether it is kept, which also needs it
-/// alive.
-struct RowVerdict {
-    matches: bool,
-    keep: bool,
-}
-
-/// Rows a gate counted: those matching the filter, and those kept.
-struct GateCounts {
-    matched: usize,
-    kept: usize,
-}
-
-/// Keeps the offsets `verdict` accepts. Each row's offset is written at the next free slot and the
-/// slot advances by the verdict, so the loop has no branch on it.
-#[inline(always)]
-fn gate(
-    doc_ids: &[DocId],
-    offsets: &mut Vec<u32>,
-    verdict: impl Fn(DocId) -> RowVerdict,
-) -> GateCounts {
-    offsets.resize(doc_ids.len(), 0);
-    let mut kept = 0usize;
-    let mut matched = 0usize;
-    for (offset, &doc) in (0u32..).zip(doc_ids) {
-        let RowVerdict { matches, keep } = verdict(doc);
-        offsets[kept] = offset;
-        kept += usize::from(keep);
-        matched += usize::from(matches);
-    }
-    offsets.truncate(kept);
-    GateCounts { matched, kept }
-}
 
 // --- Source ---
 
@@ -255,49 +108,8 @@ impl<'a> RouterClusters<'a> {
         )
     }
 
-    pub(crate) fn filter_candidates(
-        &mut self,
-        weight: &dyn Weight,
-        segment: &'a SegmentReader,
-        candidates: impl Iterator<Item = Candidate>,
-        estimated_selectivity: f64,
-    ) -> Result<()> {
-        let mut candidates = candidates.peekable();
-        let mut matches = Vec::new();
-        if candidates.peek().is_some() {
-            let mut docs = BitSet::with_max_value(segment.max_doc());
-            let mut scratch = Vec::new();
-            for candidate in candidates {
-                self.reader
-                    .read_doc_ids(candidate.node as usize, &mut scratch)?;
-                for &doc in &scratch {
-                    docs.insert(doc);
-                }
-            }
-            drop(scratch);
-            let candidate_count = docs.len();
-            let mut docs = BitSetDocSet::from(docs);
-            let mut scorer = ExcludedDocSet::new(weight.scorer_for_candidates_unpositioned(
-                segment,
-                1.0,
-                candidate_count as u32,
-            )?);
-            let expected_matches =
-                (candidate_count as f64 * estimated_selectivity.clamp(0.0, 1.0)).ceil() as usize;
-            matches = Vec::with_capacity(expected_matches);
-            while docs.doc() != TERMINATED {
-                let doc = docs.doc();
-                if scorer.contains(doc) {
-                    matches.push(doc);
-                }
-                docs.advance();
-            }
-        }
-        self.gate = RowGate::Candidates {
-            docs: matches,
-            alive: segment.alive_bitset(),
-        };
-        Ok(())
+    pub(crate) fn set_filter(&mut self, filter: DocFilter, segment: &'a SegmentReader) {
+        self.gate = RowGate::new(filter, segment.alive_bitset());
     }
 
     /// Prepares a cluster chosen by the global router.
