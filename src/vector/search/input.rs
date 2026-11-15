@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::index::{SegmentId, SegmentReader};
 use crate::query::Weight;
 use crate::schema::Field;
-use crate::vector::filter::{FilterInput, FilterMatches};
+use crate::vector::filter::{DocFilter, FilterInput, FilterMatches};
 use crate::vector::router::candidate::Candidate;
 use crate::vector::search::segment::plan::{located_cap, PlanReport, ScanInput};
 use crate::vector::search::source::controller::{SharedVectorWork, WorkBudget, WorkUnits};
@@ -291,7 +291,7 @@ impl PreparedVectorSearch {
             })
             .collect();
         self.segments
-            .retain(|s| !s.routed() || routed.contains_key(&s.ordinal));
+            .retain(|s| !s.routed() || routed.contains_key(&s.ordinal) || matches!(&s.scan, Some(ScanInput::Routed { filter, .. }) if matches!(filter, DocFilter::Late)));
         for segment in &mut self.segments {
             if let Some(ScanInput::Routed { budget, report, .. }) = &mut segment.scan {
                 report.planned_clusters = routed[&segment.ordinal];
@@ -343,7 +343,6 @@ mod tests {
     use super::*;
     use crate::collector::{Collector, TopDocs};
     use crate::schema::Metric;
-    use crate::vector::filter::DocFilter;
     use crate::vector::test_support::{DocsWeight, FixtureSpec};
     use crate::vector::{LocatedPath, TopClustersBySimilarityCollector};
 

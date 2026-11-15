@@ -100,6 +100,47 @@ where
         self.score_rows(selected, scratch, bound, &mut fold)
     }
 
+    pub(super) fn score_candidates(
+        &mut self,
+        candidates: &[(DocId, BlockAddress)],
+        scratch: &mut ReadScratch,
+        bound: &mut PruningBound,
+    ) -> crate::Result<usize> {
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        self.selected_docs.clear();
+        self.selected_docs
+            .extend(candidates.iter().map(|&(doc, _)| doc));
+        let rows = {
+            let _fetch = enter_vector_stage(VectorStage::ExactFetch);
+            self.reader.read_exact_docs(&self.selected_docs, scratch)?
+        };
+        let _score = enter_vector_stage(VectorStage::ExactScore);
+        for (&(doc, address), (_, bytes)) in candidates.iter().zip(rows.iter()) {
+            let row = address.row as usize;
+            let selected = ClusterRows {
+                cluster: address.block as usize,
+                rows: row..row + 1,
+                offsets: None,
+                docs: None,
+                centroid: None,
+            };
+            self.offer(
+                &selected,
+                bound,
+                &mut None,
+                &mut false,
+                0,
+                0,
+                row,
+                bytes,
+                Some(doc),
+            )?;
+        }
+        Ok(candidates.len())
+    }
+
     /// Scores the exact phase's survivors in `selected`, as [`ExactScorer::score`] does.
     pub(super) fn score_survivors(
         &mut self,

@@ -132,6 +132,7 @@ mod tests {
                         } => {
                             let matches = match filter {
                                 DocFilter::All => None,
+                                DocFilter::Late => unreachable!(),
                                 DocFilter::Docs(docs) => Some(docs.len()),
                                 DocFilter::Candidates(_) | DocFilter::Pending => unreachable!(),
                             };
@@ -253,7 +254,7 @@ mod tests {
             max_probe: 2,
             min_probe_clusters: 1,
             located: LocatedPath::Auto,
-            ..ProbeParams::default()
+            ..ProbeParams::prefilter()
         };
         let (budget, n_avg, x) = auto.resolved_work_budget(ivf.num_clusters(), ivf_rows)?;
         let cap = (budget * n_avg / (1.0 - x)).floor() as usize;

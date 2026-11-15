@@ -46,7 +46,7 @@
 //!     .map(|(ord, reader)| VectorSegment::from((ord as u32, reader))).collect();
 //! let params = ProbeParams {
 //!     filter_strategy: Some(VectorFilterStrategy::plan(
-//!         embedding, weight.as_ref(), even.count(&searcher)?, &segments,
+//!         embedding, weight.as_ref(), even.count(&searcher)?, usize::MAX, &segments,
 //!     )?),
 //!     ..Default::default()
 //! };
@@ -124,7 +124,7 @@ pub use collector::{
     VectorSimilarityFruit,
 };
 pub use element::{Accumulator, VectorElement, ENTRY_ALIGN};
-pub use filter::{VectorFilterStrategy, MIN_POST_FILTER_MATCHES};
+pub use filter::{VectorFilterStrategy, MIN_LATE_FILTER_MATCHES, MIN_POST_FILTER_MATCHES};
 pub use params::{
     AdaptiveProbeParams, LocatedPath, ProbeParams, Selectivity, DEFAULT_FIXED_PROBE_COST_ROWS,
 };

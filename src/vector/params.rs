@@ -162,7 +162,13 @@ impl ProbeParams {
         match_fraction: f64,
         clusters_in_segment: usize,
     ) -> usize {
-        let match_fraction = match_fraction.clamp(0.0, 1.0);
+        let match_fraction = match self
+            .filter_strategy()
+            .expect("routing requires a filter strategy")
+        {
+            VectorFilterStrategy::Late { .. } => 1.0,
+            _ => match_fraction.clamp(0.0, 1.0),
+        };
         let cluster_cost =
             (open_share + (1.0 - open_share) * match_fraction).max(f64::MIN_POSITIVE);
         let clusters = (budget.max(0.0) / cluster_cost).ceil();
@@ -268,6 +274,7 @@ mod tests {
                         fixture.field,
                         weight.as_ref(),
                         matches,
+                        0,
                         &segments,
                     )?;
                     let expected = if fast && clustered && matches >= MIN_POST_FILTER_MATCHES {
