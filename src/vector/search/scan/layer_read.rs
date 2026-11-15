@@ -85,20 +85,28 @@ pub(crate) fn decode_layer(
     out.resize(selected.len(), spec.metric());
     match (read, selected.offsets) {
         (LayerRead::Sparse, Some(_)) => decode_runs(spec, cluster, out, scratch),
-        _ => decode_band(spec, selected, cluster, out, &mut scratch.offsets),
+        _ => decode_band(
+            spec,
+            selected,
+            cluster,
+            out,
+            &mut scratch.offsets,
+            &mut scratch.bytes,
+        ),
     }
 }
 
-/// Reads the cluster's band and decodes the selected rows from it; `kernel_offsets` holds the
-/// selected rows' offsets as the scoring kernel indexes them.
+/// Reads the cluster's band through `bytes` and decodes the selected rows from it;
+/// `kernel_offsets` holds the selected rows' offsets as the scoring kernel indexes them.
 fn decode_band(
     spec: &LayerSpec<'_>,
     selected: &ClusterRows<'_>,
     cluster: &QuantizedClusterReader<'_>,
     out: &mut Decoded,
     kernel_offsets: &mut Vec<usize>,
+    bytes: &mut Vec<u8>,
 ) -> crate::Result<()> {
-    let band = cluster.read_batch(selected.rows.clone())?;
+    let band = cluster.borrow_batch(selected.rows.clone(), bytes)?;
     let metric = spec.metric();
     let count = selected.len();
     match selected.offsets {
@@ -132,7 +140,7 @@ fn decode_band(
 /// Decodes the rows at `offsets` from a read band.
 fn decode_band_rows(
     spec: &LayerSpec<'_>,
-    band: &QuantizedLayerBatch,
+    band: &QuantizedLayerBatch<&[u8]>,
     offsets: &[usize],
     out: &mut Decoded,
 ) -> crate::Result<()> {
@@ -179,7 +187,7 @@ impl SidecarDecode {
 /// read band into `out`, with the residual norms when the band carries them. Both ways give the
 /// same values: binary16 widens to binary32 exactly.
 fn decode_sidecar_rows(
-    band: &QuantizedLayerBatch,
+    band: &QuantizedLayerBatch<&[u8]>,
     offsets: &[usize],
     l2: bool,
     norms: bool,
@@ -255,7 +263,7 @@ fn gather(
 }
 
 /// Reads the planned code runs, the sidecar span and, at layer 0, the norms column, and decodes
-/// the selected rows.
+/// the selected rows. Each read is decoded before the next replaces it in the scratch bytes.
 fn decode_runs(
     spec: &LayerSpec<'_>,
     cluster: &QuantizedClusterReader<'_>,
@@ -266,6 +274,7 @@ fn decode_runs(
         rows,
         runs,
         offsets,
+        bytes,
         ..
     } = scratch;
     debug_assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
@@ -275,10 +284,10 @@ fn decode_runs(
         debug_assert!(rows[start..end].iter().all(|&row| row >= run.start));
         offsets.clear();
         offsets.extend(rows[start..end].iter().map(|&row| row - run.start));
-        let codes = cluster.read_codes(run)?;
+        let codes = cluster.borrow_codes(run, bytes)?;
         spec.query.score_layer_batch_unscaled_indexed(
             spec.index,
-            codes.as_slice(),
+            codes,
             spec.reader.code_stride(),
             offsets,
             &mut out.kernel[start..end],
@@ -287,7 +296,7 @@ fn decode_runs(
     }
     debug_assert_eq!(start, rows.len());
     let l2 = spec.metric().scores_by_distance();
-    cluster.read_sidecar()?.decode_selected(
+    cluster.borrow_sidecar(bytes)?.decode_selected(
         rows,
         &mut out.scales,
         &mut out.gammas,
@@ -295,25 +304,25 @@ fn decode_runs(
         if l2 { &mut out.constants } else { &mut [] },
     )?;
     if spec.reader.has_norms() {
-        let norms = cluster.read_norms()?;
+        let norms = cluster.borrow_norms(bytes)?;
         out.norms.clear();
         out.norms.extend(
             rows.iter()
-                .map(|&row| f32_at(&norms, row - cluster.rows.start)),
+                .map(|&row| f32_at(norms, row - cluster.rows.start)),
         );
     }
     Ok(())
 }
 
-fn band_norms(band: &QuantizedLayerBatch) -> crate::Result<&[u8]> {
-    band.residual_norms.as_deref().ok_or_else(|| {
+fn band_norms<'a>(band: &'a QuantizedLayerBatch<&[u8]>) -> crate::Result<&'a [u8]> {
+    band.residual_norms.ok_or_else(|| {
         TantivyError::DataCorruption(DataCorruption::comment_only(
             "quantized layer-0 band is missing residual norms",
         ))
     })
 }
 
-fn band_constants(band: &QuantizedLayerBatch) -> crate::Result<&[u8]> {
+fn band_constants<'a>(band: &'a QuantizedLayerBatch<&[u8]>) -> crate::Result<&'a [u8]> {
     band.constants().ok_or_else(|| {
         TantivyError::DataCorruption(DataCorruption::comment_only(
             "quantized L2 field is missing a constants slot",
@@ -372,7 +381,9 @@ mod tests {
             let reader = first_segment(&searcher).1.vector_index(fixture.field)?;
             let rows = reader.index().expect("IVF segment").cluster_num_rows(0)?;
             for layer in reader.quantization()?.unwrap().layers() {
-                let band = layer.cluster_in_block(0)?.read_batch(0..rows)?;
+                let cluster = layer.cluster_in_block(0)?;
+                let mut bytes = Vec::new();
+                let band = cluster.borrow_batch(0..rows, &mut bytes)?;
                 for step in [1, 2, 3, 4, 5, 9, 40] {
                     let offsets: Vec<usize> = (step / 2..rows).step_by(step).collect();
                     let decode = |how| -> crate::Result<Decoded> {

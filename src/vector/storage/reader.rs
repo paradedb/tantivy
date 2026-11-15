@@ -916,7 +916,7 @@ impl VectorIndexReader {
             ));
         }
         let mut docs = Vec::new();
-        self.read_doc_ids_from_block(block, &view, &mut docs)?;
+        self.read_doc_ids_from_block(block, &view, &mut docs, &mut Vec::new())?;
         Ok(docs[row])
     }
 
@@ -969,8 +969,19 @@ impl VectorIndexReader {
     }
     /// Reads a block's document ids from its column or the flat presence map.
     pub(crate) fn read_doc_ids(&self, cluster: usize, out: &mut Vec<DocId>) -> crate::Result<()> {
+        self.read_doc_ids_through(cluster, out, &mut Vec::new())
+    }
+
+    /// [`Self::read_doc_ids`] reading the DocIds column through `scratch`, for a scan that reads
+    /// one cluster after another.
+    pub(crate) fn read_doc_ids_through(
+        &self,
+        cluster: usize,
+        out: &mut Vec<DocId>,
+        scratch: &mut Vec<u8>,
+    ) -> crate::Result<()> {
         let block = self.rows_slice.block(cluster)?;
-        self.read_doc_ids_from_block(cluster, &block, out)
+        self.read_doc_ids_from_block(cluster, &block, out, scratch)
     }
 
     fn read_doc_ids_from_block(
@@ -978,6 +989,7 @@ impl VectorIndexReader {
         cluster: usize,
         block: &Block<'_>,
         out: &mut Vec<DocId>,
+        scratch: &mut Vec<u8>,
     ) -> crate::Result<()> {
         out.clear();
         let blocks = &self.rows_slice;
@@ -1000,7 +1012,7 @@ impl VectorIndexReader {
             .iter()
             .position(|slot| matches!(slot.slot_type, SlotType::DocIds))
             .ok_or_else(|| DataCorruption::comment_only("missing DocIds column"))?;
-        let bytes = block.read_column(idx, block.row_range())?;
+        let bytes = block.borrow_column(idx, block.row_range(), scratch)?;
         out.reserve(block.num_rows());
         out.extend(
             bytes

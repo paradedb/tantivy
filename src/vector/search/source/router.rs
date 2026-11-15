@@ -194,6 +194,8 @@ pub(crate) struct RouterClusters<'a> {
     /// The current cluster's DocIds column; read when the gate is closed or the segment is
     /// replicated.
     docs: Vec<DocId>,
+    /// The bytes `docs` is decoded from, on storage that does not lend its own.
+    doc_bytes: Vec<u8>,
     offsets: Vec<u32>,
     selected_docs: Vec<DocId>,
     counters: RouterCounters,
@@ -218,6 +220,7 @@ impl<'a> RouterClusters<'a> {
             gate: RowGate::new(filter, segment.alive_bitset()),
             replicated: reader.replicated(),
             docs: Vec::new(),
+            doc_bytes: Vec::new(),
             offsets: Vec::new(),
             selected_docs: Vec::new(),
             counters: RouterCounters::default(),
@@ -292,7 +295,8 @@ impl<'a> RouterClusters<'a> {
         // DocIds alone, then the gate, before any payload read; a replicated segment reads them for
         // every cluster so the scan can drop a document's second copy.
         if !self.gate.is_open() || self.replicated {
-            self.reader.read_doc_ids(cluster, &mut self.docs)?;
+            self.reader
+                .read_doc_ids_through(cluster, &mut self.docs, &mut self.doc_bytes)?;
             Ok(self.docs.len())
         } else {
             self.index.cluster_num_rows(cluster)
