@@ -79,6 +79,8 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> RangeDocSet<T> {
         range_docset
     }
 
+    /// Creates an iterator without finding its first matching document.
+    /// The caller must seek to a match before using its current position.
     pub(crate) fn new_unpositioned(value_range: RangeInclusive<T>, column: Column<T>) -> Self {
         Self {
             value_range,
