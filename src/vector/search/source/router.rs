@@ -10,7 +10,6 @@ use crate::query::{BitSetDocSet, ExcludedDocSet, ExclusionSet, Weight};
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::{RouterIter, RouterMetrics};
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
-use crate::vector::search::segment::plan::{collect_segment_filter, Source};
 use crate::vector::search::source::controller::{
     ProbeController, ProbeOutcome, SharedVectorWork, WorkBudget, WorkMeter,
 };
@@ -256,30 +255,18 @@ impl<'a> RouterClusters<'a> {
         )
     }
 
-    pub(crate) fn clear_filter_batch(&mut self) {
-        self.gate = RowGate::Open;
-    }
-
-    pub(crate) fn filter_batch(
+    pub(crate) fn filter_candidates(
         &mut self,
         weight: &dyn Weight,
         segment: &'a SegmentReader,
-        candidates: Option<(impl Iterator<Item = Candidate>, usize)>,
+        candidates: impl Iterator<Item = Candidate>,
+        estimated_selectivity: f64,
     ) -> Result<()> {
-        let Some((candidates, scratch_rows)) = candidates else {
-            let Source::Router(filter) =
-                collect_segment_filter(weight, segment, segment.max_doc(), 0)?
-            else {
-                unreachable!()
-            };
-            self.gate = RowGate::new(filter, segment.alive_bitset());
-            return Ok(());
-        };
         let mut candidates = candidates.peekable();
         let mut matches = Vec::new();
         if candidates.peek().is_some() {
             let mut docs = BitSet::with_max_value(segment.max_doc());
-            let mut scratch = Vec::with_capacity(scratch_rows);
+            let mut scratch = Vec::new();
             for candidate in candidates {
                 self.reader
                     .read_doc_ids(candidate.node as usize, &mut scratch)?;
@@ -295,7 +282,9 @@ impl<'a> RouterClusters<'a> {
                 1.0,
                 candidate_count as u32,
             )?);
-            matches = Vec::with_capacity(candidate_count);
+            let expected_matches =
+                (candidate_count as f64 * estimated_selectivity.clamp(0.0, 1.0)).ceil() as usize;
+            matches = Vec::with_capacity(expected_matches);
             while docs.doc() != TERMINATED {
                 let doc = docs.doc();
                 if scorer.contains(doc) {

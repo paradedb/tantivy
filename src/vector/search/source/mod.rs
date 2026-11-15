@@ -2,7 +2,6 @@
 
 pub(crate) mod controller;
 pub(crate) mod matches;
-pub(crate) mod prefilter;
 pub(crate) mod router;
 #[cfg(test)]
 mod tests;

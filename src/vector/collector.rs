@@ -28,7 +28,6 @@ use crate::vector::search::source::controller::{
     ProbeTermination, WorkBudget, WorkMeter, WorkUnits,
 };
 use crate::vector::search::source::matches::MatchClusters;
-use crate::vector::search::source::prefilter::{filter_batch_scratch, FILTER_BATCH_BYTES};
 use crate::vector::search::source::router::RouterClusters;
 use crate::vector::search::source::SourceReport;
 use crate::vector::search::SegmentSearcher;
@@ -970,44 +969,25 @@ where
         .filter(|_| top_n > 0)
         .map(|_| crate::vector::search::scan::RateApsState::default());
     let mut recall_reached = false;
-    if collector.inputs.prepared.filter_match_fraction.is_some() && !meter.exhausted() {
-        for source in &mut sources {
-            if let Some(GlobalSource::Router(source)) = source {
-                source.clear_filter_batch();
-            }
-        }
-        let (result, measured) = measure(|| {
-            let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-            filter_batch_scratch(
-                candidates.clone(),
-                vectors,
-                segments
-                    .iter()
-                    .map(|s| s.reader.max_doc())
-                    .max()
-                    .unwrap_or(0),
-                FILTER_BATCH_BYTES,
-            )
-        });
-        totals[0].append(&measured);
-        let scratch_rows = result?;
+    if let Some(estimated_selectivity) = collector
+        .inputs
+        .prepared
+        .filter_match_fraction
+        .filter(|_| !meter.exhausted())
+    {
         for (j, source) in sources.iter_mut().enumerate() {
             let Some(GlobalSource::Router(source)) = source else {
                 continue;
             };
             let (result, measured) = measure(|| {
                 let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                source.filter_batch(
+                source.filter_candidates(
                     weight,
                     &segments[j].reader,
-                    scratch_rows.map(|rows| {
-                        (
-                            candidates
-                                .clone()
-                                .filter_map(|(i, c)| (i == j).then_some(c)),
-                            rows,
-                        )
-                    }),
+                    candidates
+                        .clone()
+                        .filter_map(|(i, c)| (i == j).then_some(c)),
+                    estimated_selectivity,
                 )
             });
             totals[j].append(&measured);
@@ -2627,7 +2607,7 @@ mod ivf_e2e_tests {
     }
 
     #[test]
-    fn batched_range_filter_matches_eager_filter() -> Result<()> {
+    fn cluster_range_filter_matches_eager_filter() -> Result<()> {
         let ids: Vec<_> = (0..180).map(|id| (id * 79) % 181).collect();
         let (index, field, value) = tie_heavy_index(&ids)?;
         let searcher = index.reader()?.searcher();
@@ -2637,7 +2617,9 @@ mod ivf_e2e_tests {
             .enumerate()
             .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
             .collect();
-        for lower in [0, 170, 999] {
+        for (lower, estimated_selectivity) in
+            [(0, 0.0), (0, 0.01), (170, 0.01), (170, 1.0), (999, 0.01)]
+        {
             let filter = RangeQuery::new(
                 Bound::Included(Term::from_field_u64(value, lower)),
                 Bound::Unbounded,
@@ -2659,18 +2641,21 @@ mod ivf_e2e_tests {
             )?)?;
             let mut cluster_builder = builder.clone();
             cluster_builder.probe_params.filter_strategy = Some(VectorFilterStrategy::Cluster {
-                estimated_selectivity: 0.01,
+                estimated_selectivity,
             });
-            let batched =
+            let clustered =
                 cluster_builder
                     .clone()
                     .build_for_segments(weight.as_ref(), &segments, |_| {})?;
-            let actual = batched.merge_fruits(batched.collect_segments(
+            let actual = clustered.merge_fruits(clustered.collect_segments(
                 weight.as_ref(),
                 &segments,
                 |_| {},
             )?)?;
-            assert_eq!(actual.results, expected.results, "lower={lower}");
+            assert_eq!(
+                actual.results, expected.results,
+                "lower={lower} estimated_selectivity={estimated_selectivity}"
+            );
             if lower == 170 {
                 let located = cluster_builder
                     .clone()
