@@ -19,7 +19,7 @@ use crate::vector::quantization::{
     QUANTIZED_GAMMA_STRIDE, QUANTIZED_SCALE_STRIDE,
 };
 use crate::vector::storage::blocks::{Block, Blocks};
-use crate::vector::storage::io::{VectorRead, VectorReadKind};
+use crate::vector::storage::io::{ByteScratch, VectorRead, VectorReadKind};
 use crate::vector::storage::metadata::{SlotType, VectorColMetadata};
 use crate::vector::storage::reader::VectorRowChunk;
 use crate::vector::BlockAddress;
@@ -143,9 +143,8 @@ pub(crate) struct ReadScratch {
     /// The row chunks of an exact read, borrowed by its batch.
     pub(crate) chunks: Vec<VectorRowChunk>,
     /// The bytes of the layer read being decoded, on storage that does not lend its own: a
-    /// cluster's band, or one code run, sidecar span or norms column of a sparse read. Each
-    /// read replaces the last, so the scan allocates when this grows, not per read.
-    pub(crate) bytes: Vec<u8>,
+    /// cluster's band, or one code run, sidecar span or norms column of a sparse read.
+    pub(crate) bytes: ByteScratch,
 }
 
 /// SoA ranges for one contiguous cluster posting: pinned by owned bytes, or with `B = &[u8]`
@@ -532,7 +531,7 @@ impl QuantizedLayerReader {
         &self,
         block: &'a Block<'_>,
         rows: Range<usize>,
-        scratch: &'a mut Vec<u8>,
+        scratch: &'a mut ByteScratch,
     ) -> crate::Result<QuantizedLayerBatch<&'a [u8]>> {
         block.check_rows(&rows)?;
         let (span, bytes) = block.borrow_band(self.layer, scratch)?;
@@ -849,7 +848,7 @@ impl QuantizedClusterReader<'_> {
     pub(crate) fn borrow_batch<'s>(
         &'s self,
         rows: Range<usize>,
-        scratch: &'s mut Vec<u8>,
+        scratch: &'s mut ByteScratch,
     ) -> crate::Result<QuantizedLayerBatch<&'s [u8]>> {
         self.layer
             .borrow_batch_from_block(&self.block, rows, scratch)
@@ -872,7 +871,7 @@ impl QuantizedClusterReader<'_> {
     pub(crate) fn borrow_codes<'s>(
         &'s self,
         rows: Range<usize>,
-        scratch: &'s mut Vec<u8>,
+        scratch: &'s mut ByteScratch,
     ) -> crate::Result<&'s [u8]> {
         let stride = self.layer.code_stride;
         let bytes = self.codes.borrow_vector_bytes_slice(
@@ -890,7 +889,7 @@ impl QuantizedClusterReader<'_> {
     /// storage.
     pub(crate) fn borrow_sidecar<'s>(
         &'s self,
-        scratch: &'s mut Vec<u8>,
+        scratch: &'s mut ByteScratch,
     ) -> crate::Result<QuantizedSidecarBatch<&'s [u8]>> {
         use crate::vector::storage::blocks::column_range;
         let layer = self.layer;
@@ -949,7 +948,10 @@ impl QuantizedClusterReader<'_> {
     }
 
     /// Reads the cluster's residual norms in one request, through `scratch`.
-    pub(crate) fn borrow_norms<'s>(&'s self, scratch: &'s mut Vec<u8>) -> crate::Result<&'s [u8]> {
+    pub(crate) fn borrow_norms<'s>(
+        &'s self,
+        scratch: &'s mut ByteScratch,
+    ) -> crate::Result<&'s [u8]> {
         self.block
             .borrow_column(self.norms_column()?, self.block.row_range(), scratch)
     }
@@ -1267,7 +1269,7 @@ mod tests {
             .unwrap();
         let norms = cluster.block.column_range(norms);
         reads.lock().unwrap().clear();
-        let mut bytes = Vec::new();
+        let mut bytes = ByteScratch::default();
         cluster.borrow_codes(0..1, &mut bytes)?;
         cluster.borrow_sidecar(&mut bytes)?;
         cluster.borrow_norms(&mut bytes)?;
@@ -1641,7 +1643,7 @@ mod tests {
                                 &mut Vec::new(),
                             );
                             assert_eq!(ranges, expected);
-                            let mut bytes = Vec::new();
+                            let mut bytes = ByteScratch::default();
                             let (codes, code_totals) = measure(|| {
                                 let _stage = enter_vector_stage(VectorStage::LayerScan(1));
                                 ranges.iter().try_for_each(|rows| {
@@ -1650,7 +1652,7 @@ mod tests {
                             });
                             codes?;
                             let code_io = code_totals.io(VectorStage::LayerScan(1));
-                            let mut sidecar_bytes = Vec::new();
+                            let mut sidecar_bytes = ByteScratch::default();
                             let (sidecar, sidecar_totals) = measure(|| {
                                 let _stage = enter_vector_stage(VectorStage::LayerScan(1));
                                 cluster.borrow_sidecar(&mut sidecar_bytes)

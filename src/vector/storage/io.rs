@@ -47,6 +47,16 @@ pub struct VectorIoStats {
     pub storage_blocks: u64,
 }
 
+/// Where a scan's borrowed reads keep their bytes. Each read replaces the last, so a scan reading
+/// through one scratch allocates when the buffer grows, not on every read.
+#[derive(Default)]
+pub(crate) struct ByteScratch {
+    /// The assembled bytes of a read that spans storage blocks.
+    buf: Vec<u8>,
+    /// The owner of a read served from within one storage block.
+    pinned: Option<OwnedBytes>,
+}
+
 /// Reads vector bytes and charges the request to the running search stage.
 pub(crate) trait VectorRead {
     fn read_vector_bytes(&self, kind: VectorReadKind) -> std::io::Result<OwnedBytes>;
@@ -56,14 +66,16 @@ pub(crate) trait VectorRead {
         kind: VectorReadKind,
     ) -> std::io::Result<OwnedBytes>;
     /// The bytes of `range` for as long as `scratch` stays borrowed, charged as
-    /// [`Self::read_vector_bytes_slice`] charges them. Storage that holds its bytes in memory
-    /// lends them; any other replaces the contents of `scratch` with them, so a scan reading
-    /// through one scratch buffer allocates when the buffer grows, not on every read.
+    /// [`Self::read_vector_bytes_slice`] charges them.
+    ///
+    /// Storage that holds its bytes in memory lends them. On block storage a range within one
+    /// block is read as an owner, which such storage hands out without copying, and `scratch`
+    /// keeps it alive. Any other range is assembled into the buffer `scratch` reuses.
     fn borrow_vector_bytes_slice<'a>(
         &'a self,
         range: Range<usize>,
         kind: VectorReadKind,
-        scratch: &'a mut Vec<u8>,
+        scratch: &'a mut ByteScratch,
     ) -> std::io::Result<&'a [u8]>;
 }
 impl VectorRead for FileSlice {
@@ -87,36 +99,47 @@ impl VectorRead for FileSlice {
         &'a self,
         range: Range<usize>,
         kind: VectorReadKind,
-        scratch: &'a mut Vec<u8>,
+        scratch: &'a mut ByteScratch,
     ) -> std::io::Result<&'a [u8]> {
         assert!(range.start <= range.end, "invalid vector byte range");
         let _kind = ReadKindGuard(READ_KIND.replace(kind));
+        let blocks = storage_blocks(self, &range);
         let bytes = match self.as_slice() {
             Some(bytes) => &bytes[range.clone()],
+            None if blocks == 1 => scratch
+                .pinned
+                .insert(self.read_bytes_slice(range.clone())?)
+                .as_slice(),
             None => {
-                scratch.clear();
-                self.read_bytes_slice_into(range.clone(), scratch)?;
-                &scratch[..]
+                scratch.pinned = None;
+                scratch.buf.clear();
+                self.read_bytes_slice_into(range.clone(), &mut scratch.buf)?;
+                &scratch.buf
             }
         };
-        charge_range(self, &range);
+        charge_read(range.len() as u64, blocks);
         Ok(bytes)
     }
 }
 
-/// Charges one read of `range` in `slice`, with the storage blocks it spans when the storage has
-/// block geometry.
-fn charge_range(slice: &FileSlice, range: &Range<usize>) {
-    let mut storage_blocks = 0;
-    if !range.is_empty() {
-        if let (Some(first), Some(last)) = (
-            slice.storage_block_ord(range.start),
-            slice.storage_block_ord(range.end - 1),
-        ) {
-            storage_blocks = (last - first + 1) as u64;
-        }
+/// The storage blocks `range` spans in `slice`: 0 when it is empty or the storage has no block
+/// geometry.
+fn storage_blocks(slice: &FileSlice, range: &Range<usize>) -> u64 {
+    if range.is_empty() {
+        return 0;
     }
-    charge_read(range.len() as u64, storage_blocks);
+    match (
+        slice.storage_block_ord(range.start),
+        slice.storage_block_ord(range.end - 1),
+    ) {
+        (Some(first), Some(last)) => (last - first + 1) as u64,
+        _ => 0,
+    }
+}
+
+/// Charges one read of `range` in `slice`, with the storage blocks it spans.
+fn charge_range(slice: &FileSlice, range: &Range<usize>) {
+    charge_read(range.len() as u64, storage_blocks(slice, range));
 }
 
 #[cfg(test)]
@@ -157,7 +180,7 @@ mod tests {
         Ok(())
     }
 
-    /// A borrowed read fills the scratch from storage without in-memory bytes, replacing what the
+    /// A borrowed read that spans storage blocks fills the scratch buffer, replacing what the
     /// previous read left, and is requested and charged exactly as an owned read is.
     #[test]
     fn borrowed_reads_reuse_the_scratch_and_charge_like_owned_reads() -> std::io::Result<()> {
@@ -168,7 +191,7 @@ mod tests {
             block_len: 8,
         }))
         .slice(11..53);
-        let mut scratch = Vec::new();
+        let mut scratch = ByteScratch::default();
         let (read, totals) = measure(|| -> std::io::Result<()> {
             let _stage = enter_vector_stage(VectorStage::LayerScan(2));
             let kind = VectorReadKind::QuantizedLayer(2);
@@ -182,7 +205,11 @@ mod tests {
             Ok(())
         });
         read?;
-        assert!(scratch.capacity() >= 13, "the scratch keeps its allocation");
+        assert!(
+            scratch.buf.capacity() >= 13,
+            "the scratch keeps its allocation"
+        );
+        assert!(scratch.pinned.is_none());
         assert_eq!(*reads.lock().unwrap(), [14..27, 31..33, 53..53]);
         let io = totals.io(VectorStage::LayerScan(2));
         assert_eq!((io.reads, io.bytes_read, io.storage_blocks), (3, 15, 5));
@@ -194,11 +221,83 @@ mod tests {
     #[test]
     fn borrowed_reads_of_in_memory_storage_skip_the_scratch() -> std::io::Result<()> {
         let slice = FileSlice::from((0..64).collect::<Vec<u8>>()).slice(11..53);
-        let mut scratch = vec![7_u8; 3];
+        let mut scratch = ByteScratch {
+            buf: vec![7_u8; 3],
+            pinned: None,
+        };
         let bytes =
             slice.borrow_vector_bytes_slice(3..16, VectorReadKind::FullPrecision, &mut scratch)?;
         assert_eq!(bytes, &(14..27).collect::<Vec<u8>>());
-        assert_eq!(scratch, [7, 7, 7]);
+        assert_eq!(scratch.buf, [7, 7, 7]);
+        assert!(scratch.pinned.is_none());
+        Ok(())
+    }
+
+    /// Bytes that log which entry point each read arrives through.
+    #[derive(Debug)]
+    struct EntryTracked {
+        bytes: Vec<u8>,
+        owned: Arc<Mutex<Vec<Range<usize>>>>,
+        into: Arc<Mutex<Vec<Range<usize>>>>,
+    }
+
+    impl HasLen for EntryTracked {
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+    }
+
+    impl crate::directory::FileHandle for EntryTracked {
+        fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
+            self.owned.lock().unwrap().push(range.clone());
+            Ok(OwnedBytes::new(self.bytes[range].to_vec()))
+        }
+
+        fn read_bytes_into(&self, range: Range<usize>, buf: &mut Vec<u8>) -> std::io::Result<()> {
+            self.into.lock().unwrap().push(range.clone());
+            buf.extend_from_slice(&self.bytes[range]);
+            Ok(())
+        }
+
+        fn storage_block_len(&self) -> Option<usize> {
+            Some(8)
+        }
+    }
+
+    /// A read within one storage block takes the handle's owner, which block storage hands out
+    /// without copying; a read that spans blocks is assembled in the scratch buffer. Either
+    /// replaces the read before it.
+    #[test]
+    fn borrowed_reads_copy_only_ranges_that_span_storage_blocks() -> std::io::Result<()> {
+        let (owned, into) = (Arc::default(), Arc::default());
+        let slice = FileSlice::new(Arc::new(EntryTracked {
+            bytes: (0..64).collect(),
+            owned: Arc::clone(&owned),
+            into: Arc::clone(&into),
+        }))
+        .slice(11..53);
+        let mut scratch = ByteScratch::default();
+        let (read, totals) = measure(|| -> std::io::Result<()> {
+            let _stage = enter_vector_stage(VectorStage::LayerScan(1));
+            let kind = VectorReadKind::QuantizedLayer(1);
+            // Absolute 16..24 is exactly block 2.
+            let bytes = slice.borrow_vector_bytes_slice(5..13, kind, &mut scratch)?;
+            assert_eq!(bytes, &(16..24).collect::<Vec<u8>>());
+            assert!(scratch.buf.is_empty() && scratch.pinned.is_some());
+            // One byte further reaches block 3.
+            let bytes = slice.borrow_vector_bytes_slice(5..14, kind, &mut scratch)?;
+            assert_eq!(bytes, &(16..25).collect::<Vec<u8>>());
+            assert!(scratch.pinned.is_none());
+            // The last byte of block 2 alone.
+            let bytes = slice.borrow_vector_bytes_slice(12..13, kind, &mut scratch)?;
+            assert_eq!(bytes, &[23]);
+            Ok(())
+        });
+        read?;
+        assert_eq!(*owned.lock().unwrap(), [16..24, 23..24]);
+        assert_eq!(*into.lock().unwrap(), [16..25]);
+        let io = totals.io(VectorStage::LayerScan(1));
+        assert_eq!((io.reads, io.bytes_read, io.storage_blocks), (3, 18, 4));
         Ok(())
     }
 }

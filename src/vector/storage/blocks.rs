@@ -8,7 +8,7 @@ use common::{HasLen, OwnedBytes};
 use crate::directory::FileSlice;
 use crate::error::DataCorruption;
 use crate::schema::VectorOptions;
-use crate::vector::storage::io::{VectorRead, VectorReadKind};
+use crate::vector::storage::io::{ByteScratch, VectorRead, VectorReadKind};
 use crate::vector::storage::metadata::{Partition, Slot, SlotType, VectorColMetadata};
 use crate::vector::ENTRY_ALIGN;
 
@@ -495,7 +495,7 @@ impl Block<'_> {
         &'a self,
         range: Range<usize>,
         kind: VectorReadKind,
-        scratch: &'a mut Vec<u8>,
+        scratch: &'a mut ByteScratch,
     ) -> crate::Result<&'a [u8]> {
         if range.start > range.end || range.end > self.bytes.len() {
             return Err(DataCorruption::comment_only("byte range crosses block boundary").into());
@@ -532,7 +532,7 @@ impl Block<'_> {
         &'a self,
         idx: usize,
         rows: Range<usize>,
-        scratch: &'a mut Vec<u8>,
+        scratch: &'a mut ByteScratch,
     ) -> crate::Result<&'a [u8]> {
         if rows.is_empty() && rows == self.rows {
             return Ok(&[]);
@@ -593,7 +593,7 @@ impl Block<'_> {
     pub(crate) fn borrow_band<'a>(
         &'a self,
         layer: usize,
-        scratch: &'a mut Vec<u8>,
+        scratch: &'a mut ByteScratch,
     ) -> crate::Result<(Range<usize>, &'a [u8])> {
         let range = self.band_range(layer);
         let bytes = self.blocks.data_slice.borrow_vector_bytes_slice(

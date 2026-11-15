@@ -13,6 +13,7 @@ use crate::vector::search::source::controller::{
     ProbeController, ProbeOutcome, SharedVectorWork, WorkBudget, WorkMeter,
 };
 use crate::vector::storage::centroids::ClusterIndex;
+use crate::vector::storage::io::ByteScratch;
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::enter_vector_stage;
 use crate::vector::VectorStage;
@@ -195,7 +196,7 @@ pub(crate) struct RouterClusters<'a> {
     /// replicated.
     docs: Vec<DocId>,
     /// The bytes `docs` is decoded from, on storage that does not lend its own.
-    doc_bytes: Vec<u8>,
+    doc_bytes: ByteScratch,
     offsets: Vec<u32>,
     selected_docs: Vec<DocId>,
     counters: RouterCounters,
@@ -220,7 +221,7 @@ impl<'a> RouterClusters<'a> {
             gate: RowGate::new(filter, segment.alive_bitset()),
             replicated: reader.replicated(),
             docs: Vec::new(),
-            doc_bytes: Vec::new(),
+            doc_bytes: ByteScratch::default(),
             offsets: Vec::new(),
             selected_docs: Vec::new(),
             counters: RouterCounters::default(),

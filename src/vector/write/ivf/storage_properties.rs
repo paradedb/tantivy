@@ -3,6 +3,7 @@ use crate::schema::Value;
 use crate::vector::clustering::{for_each_batch, IvfTrainingVectors, VectorSource};
 use crate::vector::quantization::{corrected_quantized_estimate, ArithmeticError};
 use crate::vector::storage::io::test_support::{PagedDirectory, PAGE_BYTES};
+use crate::vector::storage::io::ByteScratch;
 use crate::vector::BlockAddress;
 
 const DIM: usize = 64;
@@ -165,7 +166,7 @@ fn vector_read_kinds_follow_data_for_dense_and_sparse_access() -> crate::Result<
     layers[0].read_batch(2, rows.clone())?;
     layers[1].read_batch(2, rows.clone())?;
     let sparse = layers[1].cluster_in_block(2)?;
-    let mut bytes = Vec::new();
+    let mut bytes = ByteScratch::default();
     sparse.borrow_codes(rows.start..rows.start + 1, &mut bytes)?;
     sparse.borrow_sidecar(&mut bytes)?;
     vectors
@@ -357,7 +358,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                 let band = layer.read_batch_in_block(cluster, rows.clone())?;
                 let sidecar_columns = layer.read_sidecar(cluster, rows.clone())?;
                 let sparse = layer.cluster_in_block(cluster)?;
-                let mut sidecar_bytes = Vec::new();
+                let mut sidecar_bytes = ByteScratch::default();
                 let sidecars = sparse.borrow_sidecar(&mut sidecar_bytes)?;
                 let selected: Vec<_> = rows
                     .clone()
@@ -407,7 +408,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                 let mut ranges = Vec::new();
                 sparse.plan_codes(&selected, &mut ranges);
                 let mut covered = Vec::new();
-                let mut code_bytes = Vec::new();
+                let mut code_bytes = ByteScratch::default();
                 for range in ranges {
                     let planned = sparse.borrow_codes(range.clone(), &mut code_bytes)?;
                     for row in selected.iter().copied().filter(|row| range.contains(row)) {

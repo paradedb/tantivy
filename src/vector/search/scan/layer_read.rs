@@ -6,6 +6,7 @@ use crate::error::DataCorruption;
 use crate::schema::Metric;
 use crate::vector::search::cluster_source::ClusterRows;
 use crate::vector::search::prepared::QuantizedQueryCtx;
+use crate::vector::storage::io::ByteScratch;
 use crate::vector::storage::quantized::{
     QuantizedClusterReader, QuantizedLayerBatch, QuantizedLayerReader, ReadScratch,
 };
@@ -104,7 +105,7 @@ fn decode_band(
     cluster: &QuantizedClusterReader<'_>,
     out: &mut Decoded,
     kernel_offsets: &mut Vec<usize>,
-    bytes: &mut Vec<u8>,
+    bytes: &mut ByteScratch,
 ) -> crate::Result<()> {
     let band = cluster.borrow_batch(selected.rows.clone(), bytes)?;
     let metric = spec.metric();
@@ -382,7 +383,7 @@ mod tests {
             let rows = reader.index().expect("IVF segment").cluster_num_rows(0)?;
             for layer in reader.quantization()?.unwrap().layers() {
                 let cluster = layer.cluster_in_block(0)?;
-                let mut bytes = Vec::new();
+                let mut bytes = ByteScratch::default();
                 let band = cluster.borrow_batch(0..rows, &mut bytes)?;
                 for step in [1, 2, 3, 4, 5, 9, 40] {
                     let offsets: Vec<usize> = (step / 2..rows).step_by(step).collect();

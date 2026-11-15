@@ -24,7 +24,7 @@ use crate::vector::storage::header::{
     read_centroid_header, read_vector_header, CentroidSlot, VectorEntry, CENTROIDS_EXT, VEC_EXT,
 };
 use crate::vector::storage::id_map::IdMap;
-use crate::vector::storage::io::{VectorRead, VectorReadKind};
+use crate::vector::storage::io::{ByteScratch, VectorRead, VectorReadKind};
 use crate::vector::storage::metadata::{Partition, SlotType, VectorColMetadata};
 use crate::vector::storage::quantized::{
     exact_read_cost, push_consecutive_runs, range_cost, rows_read_cost, QuantizedFieldReader,
@@ -916,7 +916,7 @@ impl VectorIndexReader {
             ));
         }
         let mut docs = Vec::new();
-        self.read_doc_ids_from_block(block, &view, &mut docs, &mut Vec::new())?;
+        self.read_doc_ids_from_block(block, &view, &mut docs, &mut ByteScratch::default())?;
         Ok(docs[row])
     }
 
@@ -969,7 +969,7 @@ impl VectorIndexReader {
     }
     /// Reads a block's document ids from its column or the flat presence map.
     pub(crate) fn read_doc_ids(&self, cluster: usize, out: &mut Vec<DocId>) -> crate::Result<()> {
-        self.read_doc_ids_through(cluster, out, &mut Vec::new())
+        self.read_doc_ids_through(cluster, out, &mut ByteScratch::default())
     }
 
     /// [`Self::read_doc_ids`] reading the DocIds column through `scratch`, for a scan that reads
@@ -978,7 +978,7 @@ impl VectorIndexReader {
         &self,
         cluster: usize,
         out: &mut Vec<DocId>,
-        scratch: &mut Vec<u8>,
+        scratch: &mut ByteScratch,
     ) -> crate::Result<()> {
         let block = self.rows_slice.block(cluster)?;
         self.read_doc_ids_from_block(cluster, &block, out, scratch)
@@ -989,7 +989,7 @@ impl VectorIndexReader {
         cluster: usize,
         block: &Block<'_>,
         out: &mut Vec<DocId>,
-        scratch: &mut Vec<u8>,
+        scratch: &mut ByteScratch,
     ) -> crate::Result<()> {
         out.clear();
         let blocks = &self.rows_slice;

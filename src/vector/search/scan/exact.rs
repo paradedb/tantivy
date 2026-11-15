@@ -10,6 +10,7 @@ use crate::vector::search::prepared::VectorQuery;
 use crate::vector::search::scan::bound::{Candidate, PruningBound};
 use crate::vector::search::scan::heap::{tie_break_key, TieBreakHeap, TieBreakHits};
 use crate::vector::search::scan::histogram::Fold;
+use crate::vector::storage::io::ByteScratch;
 use crate::vector::storage::quantized::ReadScratch;
 use crate::vector::storage::reader::{VectorIndexReader, VectorRowBatch};
 use crate::vector::telemetry::enter_vector_stage;
@@ -44,7 +45,7 @@ where
     /// A cluster's DocIds column, read when its selected rows carry no doc ids.
     cluster_docs: Vec<DocId>,
     /// The bytes `cluster_docs` is decoded from, on storage that does not lend its own.
-    doc_bytes: Vec<u8>,
+    doc_bytes: ByteScratch,
     /// The selected rows' doc ids picked from `cluster_docs`, for a quantized field whose rows are
     /// read by document.
     selected_docs: Vec<DocId>,
@@ -77,7 +78,7 @@ where
             tie_break,
             segment_ord,
             cluster_docs: Vec::new(),
-            doc_bytes: Vec::new(),
+            doc_bytes: ByteScratch::default(),
             selected_docs: Vec::new(),
             #[cfg(test)]
             exact_phase_rows: Vec::new(),
