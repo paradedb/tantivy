@@ -1,3 +1,5 @@
+use std::collections::BinaryHeap;
+
 use super::levels::{ClusterId, StackedIvf, StackedSearchStats};
 use crate::vector::router::arena::VectorArena;
 use crate::vector::router::candidate::Candidate;
@@ -20,6 +22,26 @@ pub(crate) enum StackedRouting<'a, S> {
         totals: &'a mut [StageTotals],
         on_segment: &'a mut dyn FnMut(usize),
     },
+}
+
+/// A level's lists in descending `Candidate` order, produced as the walk takes them.
+///
+/// The sequence equals a stable descending sort of the same candidates; lists after an early stop
+/// are never ordered.
+struct ListOrder(BinaryHeap<Candidate<(usize, u32)>>);
+
+impl ListOrder {
+    fn new(lists: Vec<Candidate<(usize, u32)>>) -> Self {
+        Self(BinaryHeap::from(lists))
+    }
+}
+
+impl Iterator for ListOrder {
+    type Item = Candidate<(usize, u32)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.pop()
+    }
 }
 
 /// Selects exact leaf output; approximate leaves always pass through bounded refinement.
@@ -388,7 +410,7 @@ impl<'a, S: VectorSource> StackedRouting<'a, S> {
             for candidate in candidates.drain(..) {
                 retained.offer(candidate);
             }
-            candidates = if root_refinement {
+            let ranked = if root_refinement {
                 self.refine(
                     query,
                     retained,
@@ -397,10 +419,10 @@ impl<'a, S: VectorSource> StackedRouting<'a, S> {
                     &mut stats,
                     false,
                 )
-                .into_sorted()
             } else {
-                retained.into_sorted()
+                retained
             };
+            let lists = ListOrder::new(ranked.into_unordered());
             let requested = if partition_level == Some(level) {
                 partition_beam
             } else if level == 0 {
@@ -431,7 +453,7 @@ impl<'a, S: VectorSource> StackedRouting<'a, S> {
             let capacity = padded_capacity(requested, members, refine, policy.rerank_factor);
             let mut probe = super::aps::open();
             let mut best = TopCandidates::new(capacity);
-            for candidate in candidates {
+            for candidate in lists {
                 let (segment, list) = candidate.node;
                 let layer = levels[segment][level].as_ref().unwrap();
                 let approximate = self.measure(segment, || {
@@ -503,4 +525,46 @@ fn padded_capacity(k: usize, available: usize, refine: bool, factor: f32) -> usi
     ((requested as f64 * f64::from(factor)).ceil() as usize)
         .max(requested)
         .min(available)
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::vector::distance::Similarity;
+
+    fn candidates(raw: Vec<(u8, usize, u32)>) -> Vec<Candidate<(usize, u32)>> {
+        raw.into_iter()
+            .map(|(sim, segment, list)| Candidate {
+                sim: Similarity::new(f32::from(sim) - 3.0),
+                node: (segment, list),
+            })
+            .collect()
+    }
+
+    proptest! {
+        /// Few distinct scores and nodes force ties and repeats.
+        #[test]
+        fn list_order_pops_the_stable_descending_sort(
+            raw in proptest::collection::vec((0u8..6, 0usize..3, 0u32..8), 0..200),
+            capacity in 0usize..220,
+        ) {
+            let lists = candidates(raw);
+            let mut sorted = lists.clone();
+            sorted.sort_by(|a, b| b.cmp(a));
+            prop_assert_eq!(ListOrder::new(lists.clone()).collect::<Vec<_>>(), sorted);
+
+            let mut sorted_retained = TopCandidates::new(capacity);
+            let mut popped_retained = TopCandidates::new(capacity);
+            for &candidate in &lists {
+                sorted_retained.offer(candidate);
+                popped_retained.offer(candidate);
+            }
+            prop_assert_eq!(
+                ListOrder::new(popped_retained.into_unordered()).collect::<Vec<_>>(),
+                sorted_retained.into_sorted()
+            );
+        }
+    }
 }
