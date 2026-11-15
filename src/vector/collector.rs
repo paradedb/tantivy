@@ -1285,7 +1285,7 @@ mod ivf_e2e_tests {
                             .with_shared_threshold(Arc::clone(&threshold))
                             .with_probe_params(ProbeParams {
                                 filter_strategy: Some(if batched {
-                                    VectorFilterStrategy::Cluster {
+                                    VectorFilterStrategy::Post {
                                         estimated_selectivity: 0.05,
                                     }
                                 } else {
@@ -2640,7 +2640,7 @@ mod ivf_e2e_tests {
                 |_| {},
             )?)?;
             let mut cluster_builder = builder.clone();
-            cluster_builder.probe_params.filter_strategy = Some(VectorFilterStrategy::Cluster {
+            cluster_builder.probe_params.filter_strategy = Some(VectorFilterStrategy::Post {
                 estimated_selectivity,
             });
             let clustered =
@@ -2663,7 +2663,7 @@ mod ivf_e2e_tests {
                         max_probe: 1,
                         min_probe_clusters: 1,
                         located: LocatedPath::Auto,
-                        filter_strategy: Some(VectorFilterStrategy::Cluster {
+                        filter_strategy: Some(VectorFilterStrategy::Post {
                             estimated_selectivity: 0.01,
                         }),
                         ..exhaustive_params(2)

@@ -15,7 +15,7 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 
 /// Minimum estimated matches for deferring a fast-field filter. Keep the strategy independent
 /// of the probe ceiling so increasing recall does not switch access paths mid-sweep.
-pub const MIN_CLUSTER_FILTER_MATCHES: usize = 50_000;
+pub const MIN_POST_FILTER_MATCHES: usize = 50_000;
 
 /// Query-wide filter evaluation, selected before worker assignment.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -23,7 +23,7 @@ pub enum VectorFilterStrategy {
     /// Materialize the matches before vector search.
     Pre { uses_fast_fields: bool },
     /// Filter routed clusters before scoring their vectors.
-    Cluster { estimated_selectivity: f64 },
+    Post { estimated_selectivity: f64 },
 }
 
 impl VectorFilterStrategy {
@@ -36,10 +36,7 @@ impl VectorFilterStrategy {
     ) -> Result<Self> {
         let uses_fast_fields = weight.uses_fast_fields();
         let pre = Self::Pre { uses_fast_fields };
-        if !uses_fast_fields
-            || estimated_matches < MIN_CLUSTER_FILTER_MATCHES
-            || segments.is_empty()
-        {
+        if !uses_fast_fields || estimated_matches < MIN_POST_FILTER_MATCHES || segments.is_empty() {
             return Ok(pre);
         }
         let mut has_clusters = false;
@@ -53,7 +50,7 @@ impl VectorFilterStrategy {
             .iter()
             .map(|s| u64::from(s.reader.num_docs()))
             .sum();
-        Ok(Self::Cluster {
+        Ok(Self::Post {
             estimated_selectivity: (estimated_matches as f64 / docs.max(1) as f64)
                 .clamp(f64::EPSILON, 1.0),
         })
@@ -267,7 +264,7 @@ impl ProbeParams {
 mod tests {
     use std::ops::Bound;
 
-    use super::{ProbeParams, VectorFilterStrategy, MIN_CLUSTER_FILTER_MATCHES};
+    use super::{ProbeParams, VectorFilterStrategy, MIN_POST_FILTER_MATCHES};
     use crate::query::{BooleanQuery, BoostQuery, ConstScoreQuery, FastFieldRangeQuery, Query};
     use crate::schema::Metric;
     use crate::vector::test_support::FixtureSpec;
@@ -275,7 +272,7 @@ mod tests {
     use crate::{Result, Term};
 
     #[test]
-    fn filter_strategy_preserves_postings_and_selects_cluster_filters() -> Result<()> {
+    fn filter_strategy_preserves_postings_and_selects_post_filters() -> Result<()> {
         for clustered in [false, true] {
             let fixture = if clustered {
                 FixtureSpec::clustered(Metric::L2, 8, 4, 128)
@@ -309,8 +306,8 @@ mod tests {
                 let weight = fixture.weight(filter.as_ref())?;
                 for matches in [
                     0,
-                    MIN_CLUSTER_FILTER_MATCHES - 1,
-                    MIN_CLUSTER_FILTER_MATCHES,
+                    MIN_POST_FILTER_MATCHES - 1,
+                    MIN_POST_FILTER_MATCHES,
                     usize::MAX,
                 ] {
                     let strategy = VectorFilterStrategy::plan(
@@ -319,8 +316,8 @@ mod tests {
                         matches,
                         &segments,
                     )?;
-                    let expected = if fast && clustered && matches >= MIN_CLUSTER_FILTER_MATCHES {
-                        VectorFilterStrategy::Cluster {
+                    let expected = if fast && clustered && matches >= MIN_POST_FILTER_MATCHES {
+                        VectorFilterStrategy::Post {
                             estimated_selectivity: 1.0,
                         }
                     } else {

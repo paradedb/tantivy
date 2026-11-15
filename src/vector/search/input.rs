@@ -113,7 +113,7 @@ impl PreparedVectorSearch {
     ) -> Result<Self> {
         let filter_match_fraction = match params.filter_strategy()? {
             VectorFilterStrategy::Pre { .. } => None,
-            VectorFilterStrategy::Cluster {
+            VectorFilterStrategy::Post {
                 estimated_selectivity,
             } => Some(estimated_selectivity),
         };

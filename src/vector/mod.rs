@@ -125,7 +125,7 @@ pub use collector::{
 pub use element::{Accumulator, VectorElement, ENTRY_ALIGN};
 pub use params::{
     AdaptiveProbeParams, LocatedPath, ProbeParams, Selectivity, VectorFilterStrategy,
-    DEFAULT_FIXED_PROBE_COST_ROWS, MIN_CLUSTER_FILTER_MATCHES,
+    DEFAULT_FIXED_PROBE_COST_ROWS, MIN_POST_FILTER_MATCHES,
 };
 pub use quantization::{VectorQuantizationConfig, VectorQuantizationLayer};
 pub use router::candidate::Candidate;
