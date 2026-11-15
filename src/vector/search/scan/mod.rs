@@ -579,17 +579,29 @@ fn scores_whole_band(rows: &ClusterRows<'_>, handed: &ClusterRows<'_>, read: Lay
 
 // --- Segment scan ---
 
-/// The admission-rate measurement, armed by the segment plan when the RateAPS is on.
+/// A routed scan's progress across clusters: the schedule of the refinements that tighten the
+/// pruning threshold during probing and, when the RateAPS is on, the admission-rate measurement.
 #[derive(Default)]
 pub(crate) struct RateApsState {
+    /// Whether survival scores are measured; off, only the refinement schedule is kept.
+    measures_admission: bool,
     /// Survival scores seen before the fill; they size the grid and nothing else.
     prefill: Vec<f32>,
     rows: usize,
     histograms: Option<AdmissionHistograms>,
+    /// The row count the next refinement is due at; zero until the pruning threshold exists.
     next_refinement: usize,
 }
 
 impl RateApsState {
+    /// The refinement schedule, with the admission-rate measurement when `measures_admission`.
+    pub(crate) fn new(measures_admission: bool) -> Self {
+        Self {
+            measures_admission,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn refinement_due(&mut self) -> bool {
         if self.next_refinement == 0 || self.rows < self.next_refinement {
             return false;
@@ -674,7 +686,8 @@ where
     unseen_docs: Vec<DocId>,
     /// The candidate blocks by cluster id, which is row order; set when the shortlist closes.
     by_cluster: Vec<usize>,
-    /// The admission-rate measurement; `None` unless the RateAPS is on.
+    /// The refinement schedule and admission-rate measurement. The scan's own is `None` unless the
+    /// RateAPS is on; a global search swaps in the one its segments share.
     rate: Option<RateApsState>,
     recall_fraction: Option<f64>,
     report: ScanReport,
@@ -737,7 +750,7 @@ where
             unseen_docs: Vec::new(),
             by_cluster: Vec::new(),
             recall_fraction,
-            rate: recall_fraction.map(|_| RateApsState::default()),
+            rate: recall_fraction.map(|_| RateApsState::new(true)),
             report: ScanReport {
                 layers: vec![LayerReport::default(); layers],
                 ..ScanReport::default()
@@ -922,13 +935,17 @@ where
             if self.quantized.is_some() {
                 self.report.layers[0].count(read, selected.len());
             }
-            let fold = self.rate.as_mut().map(|rate| match &mut rate.histograms {
-                None => Fold::Prefill(&mut rate.prefill),
-                Some(histograms) => {
-                    let grid = histograms.grid();
-                    Fold::Binned(histograms.cluster_mut(), grid)
-                }
-            });
+            let fold = self
+                .rate
+                .as_mut()
+                .filter(|rate| rate.measures_admission)
+                .map(|rate| match &mut rate.histograms {
+                    None => Fold::Prefill(&mut rate.prefill),
+                    Some(histograms) => {
+                        let grid = histograms.grid();
+                        Fold::Binned(histograms.cluster_mut(), grid)
+                    }
+                });
             match read {
                 Read::Exact => {
                     self.report.exact_rows +=
@@ -955,23 +972,29 @@ where
         Ok(len)
     }
 
-    /// Ends the admission-rate measurement's cluster of `len` rows. Once the shared pruning
-    /// threshold exists, the grid is set from it and every survival score so far.
+    /// Ends a cluster of `len` rows for the refinement schedule and the admission-rate
+    /// measurement. Once the shared pruning threshold exists, the first refinement is scheduled
+    /// and, when admission is measured, the grid is set from it and every survival score so far.
     fn close_rate_cluster(&mut self, len: usize) {
         let Some(rate) = &mut self.rate else {
             return;
         };
         rate.rows += len;
-        match &mut rate.histograms {
-            Some(histograms) => histograms.finish_cluster(len),
-            None => {
-                if let Some(bar) = self.bound.shared_threshold() {
-                    let w0 = rate.rows;
-                    rate.histograms = Some(AdmissionHistograms::at_fill(bar, &rate.prefill, w0));
-                    rate.next_refinement = w0.saturating_mul(2);
-                    rate.prefill = Vec::new();
-                }
-            }
+        if let Some(histograms) = &mut rate.histograms {
+            histograms.finish_cluster(len);
+            return;
+        }
+        if rate.next_refinement > 0 {
+            return;
+        }
+        let Some(bar) = self.bound.shared_threshold() else {
+            return;
+        };
+        let w0 = rate.rows;
+        rate.next_refinement = w0.saturating_mul(2);
+        if rate.measures_admission {
+            rate.histograms = Some(AdmissionHistograms::at_fill(bar, &rate.prefill, w0));
+            rate.prefill = Vec::new();
         }
     }
 
