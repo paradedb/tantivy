@@ -69,7 +69,6 @@ impl VectorStage {
 
 const FIXED_SLOTS: usize = 11;
 const STAGE_SLOTS: usize = FIXED_SLOTS + 2 * MAX_QUANTIZATION_LAYERS;
-const FALLBACK_LAYERS: usize = 3;
 
 /// Accounting slot of `stage`; layers past the schedule limit fold into `Other`.
 fn slot(stage: VectorStage) -> usize {
@@ -98,13 +97,11 @@ fn slot(stage: VectorStage) -> usize {
     }
 }
 
-/// Exclusive time and storage reads per stage, and sign-word fallbacks per layer, of one measured
-/// operation.
+/// Exclusive time and storage reads per stage of one measured operation.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct StageTotals {
     time_ns: [u64; STAGE_SLOTS],
     io: [VectorIoStats; STAGE_SLOTS],
-    sign_word_fallbacks: [u64; FALLBACK_LAYERS],
 }
 
 impl StageTotals {
@@ -117,13 +114,6 @@ impl StageTotals {
             total.bytes_read += added.bytes_read;
             total.storage_blocks += added.storage_blocks;
         }
-        for (total, added) in self
-            .sign_word_fallbacks
-            .iter_mut()
-            .zip(other.sign_word_fallbacks)
-        {
-            *total += added;
-        }
     }
 
     /// Nanoseconds spent in `stage` with no inner stage running.
@@ -135,11 +125,6 @@ impl StageTotals {
     pub(crate) fn io(&self, stage: VectorStage) -> VectorIoStats {
         self.io[slot(stage)]
     }
-
-    /// Owned-word decoding fallbacks in layer `layer`'s sign-plane scoring.
-    pub(crate) fn sign_word_fallbacks(&self, layer: usize) -> u64 {
-        self.sign_word_fallbacks.get(layer).copied().unwrap_or(0)
-    }
 }
 
 // --- Meter ---
@@ -148,8 +133,8 @@ thread_local! {
     static SCOPE: RefCell<Option<Meter>> = const { RefCell::new(None) };
 }
 
-/// One operation's telemetry: the running stage, time and reads per stage, and sign-word fallbacks
-/// per layer. It exists only inside [`measure`], which owns it, so there is nothing to reset.
+/// One operation's telemetry: the running stage, and time and reads per stage. It exists only
+/// inside [`measure`], which owns it, so there is nothing to reset.
 struct Meter {
     running: VectorStage,
     since: Instant,
@@ -248,22 +233,6 @@ pub(crate) fn charge_read(bytes: u64, storage_blocks: u64) {
             io.reads += 1;
             io.bytes_read += bytes;
             io.storage_blocks += storage_blocks;
-        }
-    });
-}
-
-/// Charges `count` sign-word fallbacks in `layer`; does nothing outside a [`measure`].
-pub(crate) fn charge_fallbacks(layer: usize, count: u64) {
-    // Aligned codes, the usual case, leave the thread-local untouched.
-    if count == 0 {
-        return;
-    }
-    SCOPE.with_borrow_mut(|scope| {
-        if let Some(fallbacks) = scope
-            .as_mut()
-            .and_then(|meter| meter.totals.sign_word_fallbacks.get_mut(layer))
-        {
-            *fallbacks += count;
         }
     });
 }
@@ -387,20 +356,6 @@ mod tests {
         assert_eq!(totals.io(VectorStage::Other).reads, 0);
         assert_eq!(totals.io(VectorStage::Routing).reads, 0);
         assert_eq!(totals.time_ns(VectorStage::Routing), 0);
-    }
-
-    /// Fallbacks charge the meter in scope by layer, and nothing outside one.
-    #[test]
-    fn fallbacks_charge_the_meter_in_scope() {
-        charge_fallbacks(1, 5);
-        let ((), totals) = measure(|| {
-            charge_fallbacks(1, 2);
-            charge_fallbacks(2, 1);
-        });
-        let fallbacks: Vec<u64> = (0..FALLBACK_LAYERS)
-            .map(|layer| totals.sign_word_fallbacks(layer))
-            .collect();
-        assert_eq!(fallbacks, [0, 2, 1]);
     }
 
     /// A thread without its own measure charges nothing to the parent's meter.
