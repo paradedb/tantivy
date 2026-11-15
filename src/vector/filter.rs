@@ -30,7 +30,9 @@ pub enum VectorFilterStrategy {
 }
 
 impl VectorFilterStrategy {
-    /// Selects a query-wide strategy from the filter and the actual segment storage.
+    /// Chooses when to evaluate the filter, using its estimated match count and segment storage.
+    /// Uses Pre for small match sets or filters without fast fields, and Post for larger match
+    /// sets when clustered storage is available.
     pub fn plan(
         field: Field,
         weight: &dyn Weight,
@@ -81,10 +83,13 @@ pub(crate) enum FilterMatches {
 }
 
 impl VectorFilterStrategy {
+    /// Whether to check the filter on routed clusters before scoring their vectors (Post only).
     pub(crate) fn filters_routed_clusters(self) -> bool {
         matches!(self, Self::Post { .. })
     }
 
+    /// Returns Post's estimated matching fraction for deciding how many clusters to route.
+    /// Otherwise, the router uses the prepared filter's matching fraction.
     pub(crate) fn routing_selectivity(self) -> Option<f64> {
         match self {
             Self::Pre { .. } => None,
@@ -94,6 +99,10 @@ impl VectorFilterStrategy {
         }
     }
 
+    /// Collects matches for this strategy at the supplied search stage.
+    /// Pre checks the whole segment; Post waits for routed clusters and checks only their docs.
+    /// Post also checks the whole segment when it is flat or its estimated matches are few
+    /// enough to look up directly.
     pub(crate) fn collect_matches(
         self,
         weight: &dyn Weight,
@@ -148,6 +157,7 @@ impl VectorFilterStrategy {
         }
     }
 
+    /// Iterates over the prepared filter's matching doc ids in a flat segment, skipping deletions.
     pub(crate) fn flat_matches<'a>(
         self,
         segment: &'a SegmentReader,
@@ -263,11 +273,13 @@ impl VectorFilterStrategy {
 /// The filter's matches as the router source gates rows with them.
 #[derive(Clone)]
 pub(crate) enum DocFilter {
-    /// Every doc id below `max_doc` matches, deleted docs included; no bitset is built.
+    /// Every doc id in the segment matches; deleted docs are excluded separately.
     All,
-    /// The matching doc ids.
+    /// Matches collected across the whole segment, stored as a bitset.
     Docs(Arc<BitSet>),
+    /// Matching doc ids from routed clusters, sorted and deduplicated.
     Candidates(Arc<Vec<DocId>>),
+    /// Post has not checked the routed clusters yet; resolve this before scoring their vectors.
     Pending,
 }
 
