@@ -28,7 +28,9 @@ use crate::vector::search::source::controller::{
     ProbeTermination, WorkBudget, WorkMeter, WorkUnits,
 };
 use crate::vector::search::source::matches::MatchClusters;
-use crate::vector::search::source::prefilter::{filter_batch_scratch, FILTER_BATCH_BYTES};
+use crate::vector::search::source::prefilter::{
+    plan_filter_batch, FILTER_BATCH_MAX_BYTES, FILTER_BATCH_TARGET_DOC_BYTES,
+};
 use crate::vector::search::source::router::RouterClusters;
 use crate::vector::search::source::SourceReport;
 use crate::vector::search::SegmentSearcher;
@@ -983,108 +985,112 @@ where
         .filter(|_| top_n > 0)
         .map(|_| crate::vector::search::scan::RateApsState::default());
     let mut recall_reached = false;
-    if collector.inputs.prepared.filter_match_fraction.is_some() && !meter.exhausted() {
-        for source in &mut sources {
-            if let Some(GlobalSource::Router(source)) = source {
-                source.clear_filter_batch();
-            }
-        }
-        let (result, measured) = measure(|| {
-            let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-            filter_batch_scratch(
-                candidates.clone(),
-                vectors,
-                segments
-                    .iter()
-                    .map(|s| s.reader.max_doc())
-                    .max()
-                    .unwrap_or(0),
-                FILTER_BATCH_BYTES,
-            )
-        });
-        totals[0].append(&measured);
-        let scratch_rows = result?;
-        for (j, source) in sources.iter_mut().enumerate() {
-            let Some(GlobalSource::Router(source)) = source else {
-                continue;
-            };
+    let mut candidates = candidates.peekable();
+    let mut batched_filtering = collector.inputs.prepared.filter_match_fraction.is_some();
+    while !meter.exhausted() && !recall_reached && candidates.peek().is_some() {
+        let mut batch_clusters = usize::MAX;
+        if batched_filtering {
             let (result, measured) = measure(|| {
                 let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                source.filter_batch(
-                    weight,
-                    &segments[j].reader,
-                    scratch_rows.map(|rows| {
-                        (
-                            candidates
-                                .clone()
-                                .filter_map(|(i, c)| (i == j).then_some(c)),
-                            rows,
-                        )
-                    }),
+                plan_filter_batch(
+                    candidates.clone(),
+                    vectors,
+                    FILTER_BATCH_TARGET_DOC_BYTES,
+                    FILTER_BATCH_MAX_BYTES,
                 )
             });
-            totals[j].append(&measured);
-            on_segment(j);
-            result?;
-        }
-    }
-    for (i, candidate) in candidates {
-        if meter.exhausted() || recall_reached {
-            break;
-        }
-        let Some(GlobalSource::Router(source)) = &mut sources[i] else {
-            unreachable!()
-        };
-        let (result, measured) = measure(|| {
-            if let Some(pending) = pending_scans[i].take() {
-                scans[i] = Some(start_scan(i, pending)?);
+            totals[0].append(&measured);
+            let batch = result?;
+            batch_clusters = batch.as_ref().map_or(usize::MAX, |batch| batch.clusters);
+            batched_filtering = batch.is_some();
+            for source in &mut sources {
+                if let Some(GlobalSource::Router(source)) = source {
+                    source.clear_filter_batch();
+                }
             }
-            let scan = scans[i].as_mut().unwrap();
-            scan.swap_topk(&mut topk);
-            scan.swap_rate(&mut rate);
-            let _stage = enter_vector_stage(scan.shortlist_stage());
-            meter.open();
-            if let Some(rows) = source.probe_global(candidate)? {
-                let scored = scan.shortlist(&rows)?;
-                source.admitted(scored)?;
-                meter.rows(scored);
-                recall_reached = scan.recall_reached();
-            }
-            scan.swap_rate(&mut rate);
-            scan.swap_topk(&mut topk);
-            Ok::<_, TantivyError>(())
-        });
-        totals[i].append(&measured);
-        on_segment(i);
-        result?;
-        if !recall_reached && rate.as_mut().is_some_and(|rate| rate.refinement_due()) {
-            let mut candidates: Vec<_> = scans
-                .iter_mut()
-                .flatten()
-                .flat_map(|scan| scan.refinement_candidates(top_n))
-                .collect();
-            if candidates.len() > top_n {
-                candidates.select_nth_unstable_by(top_n, |a, b| {
-                    b.bound
-                        .estimate()
-                        .total_cmp(&a.bound.estimate())
-                        .then_with(|| a.address.cmp(&b.address))
+            for (j, source) in sources.iter_mut().enumerate() {
+                let Some(GlobalSource::Router(source)) = source else {
+                    continue;
+                };
+                let (result, measured) = measure(|| {
+                    let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
+                    source.filter_batch(
+                        weight,
+                        &segments[j].reader,
+                        batch.as_ref().map(|batch| {
+                            (
+                                candidates
+                                    .clone()
+                                    .take(batch.clusters)
+                                    .filter_map(|(i, c)| (i == j).then_some(c)),
+                                batch.scratch_rows,
+                            )
+                        }),
+                    )
                 });
-                candidates.truncate(top_n);
-            }
-            for (j, scan) in scans.iter_mut().enumerate() {
-                let Some(scan) = scan else { continue };
-                scan.swap_topk(&mut topk);
-                let (result, measured) = measure(|| scan.refine_topk(&candidates));
-                scan.swap_topk(&mut topk);
                 totals[j].append(&measured);
                 on_segment(j);
                 result?;
             }
-            let scan = scans[i].as_mut().unwrap();
-            scan.swap_rate(&mut rate);
-            recall_reached = scan.recall_reached();
-            scan.swap_rate(&mut rate);
+        }
+        for (i, candidate) in candidates.by_ref().take(batch_clusters) {
+            if meter.exhausted() || recall_reached {
+                break;
+            }
+            let Some(GlobalSource::Router(source)) = &mut sources[i] else {
+                unreachable!()
+            };
+            let (result, measured) = measure(|| {
+                if let Some(pending) = pending_scans[i].take() {
+                    scans[i] = Some(start_scan(i, pending)?);
+                }
+                let scan = scans[i].as_mut().unwrap();
+                scan.swap_topk(&mut topk);
+                scan.swap_rate(&mut rate);
+                let _stage = enter_vector_stage(scan.shortlist_stage());
+                meter.open();
+                if let Some(rows) = source.probe_global(candidate)? {
+                    let scored = scan.shortlist(&rows)?;
+                    source.admitted(scored)?;
+                    meter.rows(scored);
+                    recall_reached = scan.recall_reached();
+                }
+                scan.swap_rate(&mut rate);
+                scan.swap_topk(&mut topk);
+                Ok::<_, TantivyError>(())
+            });
+            totals[i].append(&measured);
+            on_segment(i);
+            result?;
+            if !recall_reached && rate.as_mut().is_some_and(|rate| rate.refinement_due()) {
+                let mut candidates: Vec<_> = scans
+                    .iter_mut()
+                    .flatten()
+                    .flat_map(|scan| scan.refinement_candidates(top_n))
+                    .collect();
+                if candidates.len() > top_n {
+                    candidates.select_nth_unstable_by(top_n, |a, b| {
+                        b.bound
+                            .estimate()
+                            .total_cmp(&a.bound.estimate())
+                            .then_with(|| a.address.cmp(&b.address))
+                    });
+                    candidates.truncate(top_n);
+                }
+                for (j, scan) in scans.iter_mut().enumerate() {
+                    let Some(scan) = scan else { continue };
+                    scan.swap_topk(&mut topk);
+                    let (result, measured) = measure(|| scan.refine_topk(&candidates));
+                    scan.swap_topk(&mut topk);
+                    totals[j].append(&measured);
+                    on_segment(j);
+                    result?;
+                }
+                let scan = scans[i].as_mut().unwrap();
+                scan.swap_rate(&mut rate);
+                recall_reached = scan.recall_reached();
+                scan.swap_rate(&mut rate);
+            }
         }
     }
     for (i, scan) in scans.iter_mut().enumerate() {
@@ -1197,14 +1203,17 @@ mod ivf_e2e_tests {
     use crate::vector::diagnostics::VectorStorageFormat;
     use crate::vector::distance::l2_squared_bytes;
     use crate::vector::params::{LocatedPath, ProbeParams};
+    use crate::vector::search::source::prefilter::FILTER_BATCH_TARGET_DOC_BYTES;
     use crate::vector::stats::AccessPath;
     use crate::vector::test_support::{FixtureSpec, Layout};
     use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
     use crate::vector::{
         Candidate, ClusterRef, RouterKind, TopClustersBySimilarityCollector, VectorSearchBudget,
+        VectorStage,
     };
     use crate::{
-        DocAddress, Index, IndexWriter, Order, Result, Score, TantivyDocument, TantivyError, Term,
+        DocAddress, DocId, Index, IndexWriter, Order, Result, Score, TantivyDocument, TantivyError,
+        Term,
     };
 
     fn build_routed<T, S>(
@@ -2629,8 +2638,85 @@ mod ivf_e2e_tests {
     }
 
     #[test]
+    fn batched_filtering_interleaves_scoring_and_stops_with_budget() -> Result<()> {
+        const CLUSTERS: usize = 8;
+        const DIM: usize = 64;
+        let docs = FILTER_BATCH_TARGET_DOC_BYTES / size_of::<DocId>() * 3;
+        let fixture = FixtureSpec::clustered(Metric::L2, DIM, CLUSTERS, docs)
+            .paged()
+            .replicated()
+            .schedule(&[1, 1])
+            .label("half", |i| (i / CLUSTERS) % 2 == 0)
+            .deletes(&[0, 8, 16])
+            .without_vectors(|i| i % 23 == 0)
+            .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let segments = [VectorSegment::from((0, searcher.segment_reader(0)))];
+        let query = vec![0.0; DIM];
+        let filter = fixture.filter("half");
+        let weight = fixture.weight(&filter)?;
+        let ranges = fixture.column_ranges()?;
+        let candidates: Vec<_> = fixture
+            .candidates(&(0..CLUSTERS).collect::<Vec<_>>(), &query)?
+            .into_iter()
+            .map(|c| Candidate {
+                sim: c.sim,
+                node: (0, c.node),
+            })
+            .collect();
+        for exhaustive in [false, true] {
+            let params = ProbeParams {
+                max_probe: if exhaustive { usize::MAX } else { 1 },
+                min_probe_clusters: 0,
+                located: LocatedPath::Off,
+                ..exhaustive_params(CLUSTERS)
+            };
+            let budget = VectorSearchBudget::for_segments(fixture.field, &params, &segments)?;
+            let mut results = Vec::new();
+            for fraction in [1.0, 0.5] {
+                let builder = TopDocs::with_limit(10)
+                    .order_by_similarity(fixture.field, query.clone())
+                    .with_probe_params(params.clone())
+                    .with_batched_filtering(fraction);
+                let prepared = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
+                let collector = builder.build(prepared.with_candidates(candidates.clone(), None)?);
+                fixture.clear_reads();
+                let actual = collector.merge_fruits(collector.collect_segments(
+                    weight.as_ref(),
+                    &segments,
+                    |_| {},
+                )?)?;
+                results.push(actual.results);
+            }
+            assert_eq!(results[0], results[1]);
+            let reads = fixture.reads();
+            let filtered: Vec<_> = reads
+                .iter()
+                .enumerate()
+                .filter(|(_, (stage, range))| {
+                    *stage == VectorStage::NonVectorSearch
+                        && ranges.docs.iter().flatten().any(|docs| docs == range)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            assert!(!filtered.is_empty());
+            if exhaustive {
+                assert_eq!(filtered.len(), CLUSTERS);
+                assert!(reads[filtered[0]..*filtered.last().unwrap()]
+                    .iter()
+                    .any(|(stage, _)| *stage != VectorStage::NonVectorSearch));
+                assert_eq!(results[1], fixture.oracle(&filter, &query, 10)?);
+            } else {
+                assert!(filtered.len() < CLUSTERS);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn batched_range_filter_matches_eager_filter() -> Result<()> {
-        let ids: Vec<_> = (0..180).map(|id| (id * 79) % 181).collect();
+        let docs = (FILTER_BATCH_TARGET_DOC_BYTES / size_of::<DocId>() * 3) as u64;
+        let ids: Vec<_> = (0..docs).map(|id| (id * 79) % (docs + 1)).collect();
         let (index, field, value) = tie_heavy_index(&ids)?;
         let searcher = index.reader()?.searcher();
         let segments: Vec<_> = searcher
@@ -2639,7 +2725,7 @@ mod ivf_e2e_tests {
             .enumerate()
             .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
             .collect();
-        for lower in [0, 170, 999] {
+        for lower in [0, docs - 10, docs + 1] {
             let filter = RangeQuery::new(
                 Bound::Included(Term::from_field_u64(value, lower)),
                 Bound::Unbounded,
@@ -2669,7 +2755,7 @@ mod ivf_e2e_tests {
                 |_| {},
             )?)?;
             assert_eq!(actual.results, expected.results, "lower={lower}");
-            if lower == 170 {
+            if lower == docs - 10 {
                 let located = builder
                     .clone()
                     .with_probe_params(ProbeParams {
