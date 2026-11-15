@@ -1203,7 +1203,7 @@ mod ivf_e2e_tests {
     use crate::vector::diagnostics::VectorStorageFormat;
     use crate::vector::distance::l2_squared_bytes;
     use crate::vector::params::{LocatedPath, ProbeParams};
-    use crate::vector::search::source::prefilter::FILTER_BATCH_TARGET_DOC_BYTES;
+    use crate::vector::search::source::prefilter::FILTER_BATCH_MAX_BYTES;
     use crate::vector::stats::AccessPath;
     use crate::vector::test_support::{FixtureSpec, Layout};
     use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
@@ -2641,7 +2641,8 @@ mod ivf_e2e_tests {
     fn batched_filtering_interleaves_scoring_and_stops_with_budget() -> Result<()> {
         const CLUSTERS: usize = 8;
         const DIM: usize = 64;
-        let docs = FILTER_BATCH_TARGET_DOC_BYTES / size_of::<DocId>() * 3;
+        const REPLICATION: usize = 2;
+        let docs = FILTER_BATCH_MAX_BYTES / (REPLICATION * size_of::<DocId>());
         let fixture = FixtureSpec::clustered(Metric::L2, DIM, CLUSTERS, docs)
             .paged()
             .replicated()
@@ -2650,6 +2651,11 @@ mod ivf_e2e_tests {
             .deletes(&[0, 8, 16])
             .without_vectors(|i| i % 23 == 0)
             .build()?;
+        let mut writer: IndexWriter = fixture.index.writer_for_tests()?;
+        writer
+            .merge(&fixture.index.searchable_segment_ids()?)
+            .wait()?;
+        writer.wait_merging_threads()?;
         let searcher = fixture.index.reader()?.searcher();
         let segments = [VectorSegment::from((0, searcher.segment_reader(0)))];
         let query = vec![0.0; DIM];
@@ -2715,7 +2721,7 @@ mod ivf_e2e_tests {
 
     #[test]
     fn batched_range_filter_matches_eager_filter() -> Result<()> {
-        let docs = (FILTER_BATCH_TARGET_DOC_BYTES / size_of::<DocId>() * 3) as u64;
+        let docs = (FILTER_BATCH_MAX_BYTES / size_of::<DocId>()) as u64;
         let ids: Vec<_> = (0..docs).map(|id| (id * 79) % (docs + 1)).collect();
         let (index, field, value) = tie_heavy_index(&ids)?;
         let searcher = index.reader()?.searcher();

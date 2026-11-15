@@ -5,7 +5,7 @@ use crate::vector::Candidate;
 use crate::{DocId, Result};
 
 pub(crate) const FILTER_BATCH_MAX_BYTES: usize = 4 * 1024 * 1024;
-pub(crate) const FILTER_BATCH_TARGET_DOC_BYTES: usize = 64 * 1024;
+pub(crate) const FILTER_BATCH_TARGET_DOC_BYTES: usize = FILTER_BATCH_MAX_BYTES;
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct FilterBatch {
