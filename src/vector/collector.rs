@@ -1252,7 +1252,7 @@ mod ivf_e2e_tests {
     use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
     use crate::vector::{
         Candidate, ClusterRef, RouterKind, TopClustersBySimilarityCollector, VectorFilterStrategy,
-        VectorSearchBudget,
+        VectorSearchBudget, VectorStage,
     };
     use crate::{
         DocAddress, Index, IndexWriter, Order, Result, Score, TantivyDocument, TantivyError, Term,
@@ -2096,7 +2096,8 @@ mod ivf_e2e_tests {
     /// metrics and its share of the ranking time, on the shared and the local scan paths.
     #[test]
     fn unplanned_routed_segments_report_their_routing() -> Result<()> {
-        let fixture = FixtureSpec::clustered(Metric::L2, 32, 8, 384)
+        let fixture = FixtureSpec::clustered(Metric::L2, 64, 8, 384)
+            .schedule(&[1])
             .segments(3)
             .label("matches", |_| true)
             .build()?;
@@ -2107,20 +2108,32 @@ mod ivf_e2e_tests {
             .enumerate()
             .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
             .collect();
-        let query = vec![0.0f32; 32];
+        let query = vec![0.0f32; 64];
         let params = ProbeParams {
             max_probe: 1,
             located: LocatedPath::Off,
             ..ProbeParams::prefilter()
         };
-        let builder = || {
+        let builder = |strategy| {
             TopDocs::with_limit(5)
                 .order_by_similarity(fixture.field, query.clone())
-                .with_probe_params(params.clone())
+                .with_probe_params(ProbeParams {
+                    filter_strategy: Some(strategy),
+                    ..params.clone()
+                })
         };
         let filter = fixture.filter("matches");
         let weight = fixture.weight(&filter)?;
-        for shared in [true, false] {
+        for (shared, late) in [(true, false), (false, false), (true, true), (false, true)] {
+            let strategy = if late {
+                VectorFilterStrategy::Late {
+                    estimated_selectivity: 1.0,
+                }
+            } else {
+                VectorFilterStrategy::Pre {
+                    uses_fast_fields: false,
+                }
+            };
             let router = TopClustersBySimilarityCollector::new(
                 fixture.field,
                 query.clone(),
@@ -2130,13 +2143,13 @@ mod ivf_e2e_tests {
             let candidates = router.collect_segments(&readers, |_| {})?;
             let statistics = router.take_statistics();
             let budget = VectorSearchBudget::for_segments(fixture.field, &params, &readers)?;
-            let prepared = builder().prepare(weight.as_ref(), &readers, budget, |_| {})?;
+            let prepared = builder(strategy).prepare(weight.as_ref(), &readers, budget, |_| {})?;
             let work: Option<Arc<dyn crate::vector::SharedVectorWork>> = if shared {
                 Some(Arc::new(crate::vector::AtomicVectorWork::default()))
             } else {
                 None
             };
-            let collector = builder().build(
+            let collector = builder(strategy).build(
                 prepared
                     .with_candidates(candidates.clone(), work)?
                     .with_routing_statistics(statistics.clone()),
@@ -2146,6 +2159,7 @@ mod ivf_e2e_tests {
                 &readers,
                 |_| {},
             )?)?;
+            assert_eq!(fruit.results.len(), 5);
             let mut unplanned = 0;
             for (segment, stats) in readers.iter().zip(&fruit.stats) {
                 let clusters = segment
@@ -2170,10 +2184,12 @@ mod ivf_e2e_tests {
                     serde_json::to_value(stats.routing).unwrap(),
                     serde_json::to_value(Some(routing.metrics)).unwrap()
                 );
-                assert_eq!(
-                    stats.routing_ns,
-                    routing.totals.time_ns(crate::vector::VectorStage::Routing)
-                );
+                let initial_routing_ns = routing.totals.time_ns(VectorStage::Routing);
+                if late {
+                    assert!(stats.routing_ns >= initial_routing_ns);
+                } else {
+                    assert_eq!(stats.routing_ns, initial_routing_ns);
+                }
             }
             assert!(unplanned > 0, "shared={shared}");
         }
