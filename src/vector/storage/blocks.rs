@@ -488,6 +488,25 @@ impl Block<'_> {
             .slice(self.bytes.start + range.start..self.bytes.start + range.end))
     }
 
+    /// The bytes of a range relative to the block's start, through `scratch` and charged as
+    /// `kind`: what reading [`Self::byte_slice`] whole gives, for as long as `scratch` stays
+    /// borrowed.
+    pub(crate) fn borrow_bytes<'a>(
+        &'a self,
+        range: Range<usize>,
+        kind: VectorReadKind,
+        scratch: &'a mut Vec<u8>,
+    ) -> crate::Result<&'a [u8]> {
+        if range.start > range.end || range.end > self.bytes.len() {
+            return Err(DataCorruption::comment_only("byte range crosses block boundary").into());
+        }
+        Ok(self.blocks.data_slice.borrow_vector_bytes_slice(
+            self.bytes.start + range.start..self.bytes.start + range.end,
+            kind,
+            scratch,
+        )?)
+    }
+
     /// Validates a nonempty range of block-local row numbers against this block.
     pub(crate) fn check_rows(&self, rows: &Range<usize>) -> crate::Result<()> {
         if rows.start < self.rows.start || rows.start >= rows.end || rows.end > self.rows.end {
@@ -501,7 +520,38 @@ impl Block<'_> {
         if rows.is_empty() && rows == self.rows {
             return Ok(OwnedBytes::empty());
         }
-        self.check_rows(&rows)?;
+        let (range, kind) = self.column_rows(idx, &rows)?;
+        Ok(self
+            .blocks
+            .data_slice
+            .read_vector_bytes_slice(range, kind)?)
+    }
+
+    /// [`Self::read_column`] through `scratch`: the rows' bytes for as long as it stays borrowed.
+    pub(crate) fn borrow_column<'a>(
+        &'a self,
+        idx: usize,
+        rows: Range<usize>,
+        scratch: &'a mut Vec<u8>,
+    ) -> crate::Result<&'a [u8]> {
+        if rows.is_empty() && rows == self.rows {
+            return Ok(&[]);
+        }
+        let (range, kind) = self.column_rows(idx, &rows)?;
+        Ok(self
+            .blocks
+            .data_slice
+            .borrow_vector_bytes_slice(range, kind, scratch)?)
+    }
+
+    /// The Data-entry byte range of block-local `rows` in column `idx`, and the kind its read
+    /// charges.
+    fn column_rows(
+        &self,
+        idx: usize,
+        rows: &Range<usize>,
+    ) -> crate::Result<(Range<usize>, VectorReadKind)> {
+        self.check_rows(rows)?;
         let slot = &self.blocks.schema[idx];
         let stride = slot.stride as usize;
         let start = self.column_range(idx).start;
@@ -512,11 +562,11 @@ impl Block<'_> {
                 .map(VectorReadKind::QuantizedLayer)
                 .unwrap_or_default(),
         };
-        Ok(self.blocks.data_slice.read_vector_bytes_slice(
+        Ok((
             start + (rows.start - self.rows.start) * stride
                 ..start + (rows.end - self.rows.start) * stride,
             kind,
-        )?)
+        ))
     }
 
     /// One quantization layer's columns within the Data entry; layer zero includes norms.
@@ -536,6 +586,21 @@ impl Block<'_> {
             .blocks
             .data_slice
             .read_vector_bytes_slice(range.clone(), VectorReadKind::QuantizedLayer(layer as u8))?;
+        Ok((range, bytes))
+    }
+
+    /// [`Self::read_band`] through `scratch`: the band's bytes for as long as it stays borrowed.
+    pub(crate) fn borrow_band<'a>(
+        &'a self,
+        layer: usize,
+        scratch: &'a mut Vec<u8>,
+    ) -> crate::Result<(Range<usize>, &'a [u8])> {
+        let range = self.band_range(layer);
+        let bytes = self.blocks.data_slice.borrow_vector_bytes_slice(
+            range.clone(),
+            VectorReadKind::QuantizedLayer(layer as u8),
+            scratch,
+        )?;
         Ok((range, bytes))
     }
 }

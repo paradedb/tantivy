@@ -25,6 +25,23 @@ pub trait FileHandle: 'static + Send + Sync + HasLen + fmt::Debug {
     /// This method may panic if the range requested is invalid.
     fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes>;
 
+    /// Appends the bytes of `range` to `buf`.
+    ///
+    /// A caller that only needs the bytes for the length of a computation can keep one buffer
+    /// and reuse its allocation across reads, where `read_bytes()` hands back a new owner per
+    /// read. The default implementation goes through `read_bytes()`. Implementations that
+    /// assemble a range from several storage blocks should override it to copy each block
+    /// straight into `buf`.
+    ///
+    /// On error `buf` may hold part of the range.
+    ///
+    /// This method may panic if the range requested is invalid.
+    fn read_bytes_into(&self, range: Range<usize>, buf: &mut Vec<u8>) -> io::Result<()> {
+        let bytes = self.read_bytes(range)?;
+        buf.extend_from_slice(&bytes);
+        Ok(())
+    }
+
     #[doc(hidden)]
     async fn read_bytes_async(&self, _byte_range: Range<usize>) -> io::Result<OwnedBytes> {
         Err(io::Error::new(
@@ -326,6 +343,23 @@ impl FileSlice {
             .read_bytes(self.range.start + range.start..self.range.start + range.end)
     }
 
+    /// Appends a specific slice of data to `buf`; see [`FileHandle::read_bytes_into`].
+    ///
+    /// This is equivalent to `read_bytes_slice()` followed by a copy, without the intermediate
+    /// owner when the underlying handle reads straight into a buffer.
+    pub fn read_bytes_slice_into(&self, range: Range<usize>, buf: &mut Vec<u8>) -> io::Result<()> {
+        assert!(
+            range.end <= self.len(),
+            "end of requested range exceeds the fileslice length ({} > {})",
+            range.end,
+            self.len()
+        );
+        self.data.read_bytes_into(
+            self.range.start + range.start..self.range.start + range.end,
+            buf,
+        )
+    }
+
     #[doc(hidden)]
     pub async fn read_bytes_slice_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
         assert!(
@@ -394,6 +428,10 @@ impl FileHandle for FileSlice {
         self.read_bytes_slice(range)
     }
 
+    fn read_bytes_into(&self, range: Range<usize>, buf: &mut Vec<u8>) -> io::Result<()> {
+        self.read_bytes_slice_into(range, buf)
+    }
+
     async fn read_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
         self.read_bytes_slice_async(byte_range).await
     }
@@ -447,8 +485,8 @@ impl DeferredFileSlice {
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Bound;
-    use std::sync::Arc;
+    use std::ops::{Bound, Range};
+    use std::sync::{Arc, Mutex};
     use std::{fmt, io};
 
     use super::{FileHandle, FileSlice};
@@ -522,6 +560,73 @@ mod tests {
         fn storage_block_len(&self) -> Option<usize> {
             Some(4)
         }
+    }
+
+    /// Counts the reads that arrive through each entry point, with their absolute ranges.
+    #[derive(Debug, Default)]
+    struct IntoHandle {
+        bytes: &'static [u8],
+        owned_reads: Mutex<Vec<Range<usize>>>,
+        into_reads: Mutex<Vec<Range<usize>>>,
+    }
+
+    impl HasLen for IntoHandle {
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FileHandle for IntoHandle {
+        fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+            self.owned_reads.lock().unwrap().push(range.clone());
+            Ok(OwnedBytes::new(&self.bytes[range]))
+        }
+
+        fn read_bytes_into(&self, range: Range<usize>, buf: &mut Vec<u8>) -> io::Result<()> {
+            self.into_reads.lock().unwrap().push(range.clone());
+            buf.extend_from_slice(&self.bytes[range]);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn read_bytes_into_appends_through_the_default_implementation() -> io::Result<()> {
+        let file = FileSlice::new(Arc::new(BlockHandle(b"abcdefghijkl")));
+        let slot = file.slice(3..11);
+        let mut buf = b"xy".to_vec();
+        slot.read_bytes_slice_into(1..4, &mut buf)?;
+        assert_eq!(buf, b"xyefg");
+        slot.read_bytes_slice_into(4..4, &mut buf)?;
+        assert_eq!(buf, b"xyefg");
+        // The trait method of a slice reads relative to the slice, as `read_bytes` does.
+        FileHandle::read_bytes_into(&slot, 0..2, &mut buf)?;
+        assert_eq!(buf, b"xyefgde");
+        Ok(())
+    }
+
+    #[test]
+    fn read_bytes_into_reaches_the_handle_override_through_nested_slices() -> io::Result<()> {
+        let handle = Arc::new(IntoHandle {
+            bytes: b"abcdefghijkl",
+            ..IntoHandle::default()
+        });
+        let inner = FileSlice::new(handle.clone()).slice(2..12);
+        // A slice of a handle that is itself a slice, as composite files nest them.
+        let outer = FileSlice::new(Arc::new(inner)).slice(3..9);
+        let mut buf = Vec::new();
+        outer.read_bytes_slice_into(1..5, &mut buf)?;
+        assert_eq!(buf, b"ghij");
+        assert_eq!(*handle.into_reads.lock().unwrap(), [6..10]);
+        assert!(handle.owned_reads.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[should_panic(expected = "end of requested range exceeds the fileslice length (10 > 6)")]
+    fn read_bytes_slice_into_rejects_a_range_past_the_slice() {
+        let slice = FileSlice::new(Arc::new(&b"abcdef"[..]));
+        let _ = slice.read_bytes_slice_into(0..10, &mut Vec::new());
     }
 
     #[test]

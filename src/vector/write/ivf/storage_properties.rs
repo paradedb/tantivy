@@ -165,8 +165,9 @@ fn vector_read_kinds_follow_data_for_dense_and_sparse_access() -> crate::Result<
     layers[0].read_batch(2, rows.clone())?;
     layers[1].read_batch(2, rows.clone())?;
     let sparse = layers[1].cluster_in_block(2)?;
-    sparse.read_codes(rows.start..rows.start + 1)?;
-    sparse.read_sidecar()?;
+    let mut bytes = Vec::new();
+    sparse.borrow_codes(rows.start..rows.start + 1, &mut bytes)?;
+    sparse.borrow_sidecar(&mut bytes)?;
     vectors
         .quantization()?
         .unwrap()
@@ -356,7 +357,8 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                 let band = layer.read_batch_in_block(cluster, rows.clone())?;
                 let sidecar_columns = layer.read_sidecar(cluster, rows.clone())?;
                 let sparse = layer.cluster_in_block(cluster)?;
-                let sidecars = sparse.read_sidecar()?;
+                let mut sidecar_bytes = Vec::new();
+                let sidecars = sparse.borrow_sidecar(&mut sidecar_bytes)?;
                 let selected: Vec<_> = rows
                     .clone()
                     .filter(|row| row % 17 == 0 || *row == rows.start || *row == rows.end - 1)
@@ -405,8 +407,9 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                 let mut ranges = Vec::new();
                 sparse.plan_codes(&selected, &mut ranges);
                 let mut covered = Vec::new();
+                let mut code_bytes = Vec::new();
                 for range in ranges {
-                    let planned = sparse.read_codes(range.clone())?;
+                    let planned = sparse.borrow_codes(range.clone(), &mut code_bytes)?;
                     for row in selected.iter().copied().filter(|row| range.contains(row)) {
                         let start = (row - range.start) * layer.code_stride();
                         assert_eq!(

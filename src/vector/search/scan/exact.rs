@@ -43,6 +43,8 @@ where
     segment_ord: SegmentOrdinal,
     /// A cluster's DocIds column, read when its selected rows carry no doc ids.
     cluster_docs: Vec<DocId>,
+    /// The bytes `cluster_docs` is decoded from, on storage that does not lend its own.
+    doc_bytes: Vec<u8>,
     /// The selected rows' doc ids picked from `cluster_docs`, for a quantized field whose rows are
     /// read by document.
     selected_docs: Vec<DocId>,
@@ -75,6 +77,7 @@ where
             tie_break,
             segment_ord,
             cluster_docs: Vec::new(),
+            doc_bytes: Vec::new(),
             selected_docs: Vec::new(),
             #[cfg(test)]
             exact_phase_rows: Vec::new(),
@@ -250,8 +253,11 @@ where
             (None, None) => {
                 if !*column_read {
                     let _fetch = enter_vector_stage(VectorStage::ExactFetch);
-                    self.reader
-                        .read_doc_ids(selected.cluster, &mut self.cluster_docs)?;
+                    self.reader.read_doc_ids_through(
+                        selected.cluster,
+                        &mut self.cluster_docs,
+                        &mut self.doc_bytes,
+                    )?;
                     *column_read = true;
                 }
                 self.cluster_docs[offset]
@@ -278,8 +284,11 @@ where
             let docs = match selected.docs {
                 Some(docs) => docs,
                 None => {
-                    self.reader
-                        .read_doc_ids(selected.cluster, &mut self.cluster_docs)?;
+                    self.reader.read_doc_ids_through(
+                        selected.cluster,
+                        &mut self.cluster_docs,
+                        &mut self.doc_bytes,
+                    )?;
                     self.selected_docs.clear();
                     match selected.offsets {
                         Some(offsets) => self.selected_docs.extend(
