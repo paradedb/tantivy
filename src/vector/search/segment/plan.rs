@@ -133,7 +133,7 @@ mod tests {
                             let matches = match filter {
                                 DocFilter::All => None,
                                 DocFilter::Docs(docs) => Some(docs.len()),
-                                DocFilter::Candidates(_) | DocFilter::Pending => unreachable!(),
+                                DocFilter::Pending => unreachable!(),
                             };
                             (budget, report, (false, matches))
                         }
