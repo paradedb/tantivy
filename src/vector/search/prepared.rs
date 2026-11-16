@@ -16,7 +16,6 @@ use crate::vector::distance::{
 };
 use crate::vector::quantization::{VectorNormPolicy, SIGN_QUERY_BITS};
 use crate::vector::storage::quantized::QuantizedIndexCtx;
-use crate::vector::telemetry::charge_fallbacks;
 use crate::vector::VectorElement;
 use crate::TantivyError;
 
@@ -357,8 +356,7 @@ impl QuantizedQueryCtx {
         }
     }
 
-    /// Scores a fixed-stride code batch with the resolved layer kernel, charging its sign-word
-    /// fallbacks to the measure in scope.
+    /// Scores a fixed-stride code batch with the resolved layer kernel.
     #[inline(always)]
     pub(crate) fn score_layer_batch_unscaled(
         &self,
@@ -367,18 +365,16 @@ impl QuantizedQueryCtx {
         code_stride: usize,
         out: &mut [f32],
     ) {
-        let fallbacks = self.prepared.codes.score_layer_batch_unscaled(
+        self.prepared.codes.score_layer_batch_unscaled(
             layer,
             codes,
             code_stride,
             self.index.specs[layer],
             out,
         );
-        charge_fallbacks(layer, fallbacks);
     }
 
-    /// Scores the rows at `row_offsets` of a code batch, charging its sign-word fallbacks to the
-    /// measure in scope.
+    /// Scores the rows at `row_offsets` of a code batch.
     #[inline(always)]
     pub(crate) fn score_layer_batch_unscaled_indexed(
         &self,
@@ -388,7 +384,7 @@ impl QuantizedQueryCtx {
         row_offsets: &[usize],
         out: &mut [f32],
     ) {
-        let fallbacks = self.prepared.codes.score_layer_batch_unscaled_indexed(
+        self.prepared.codes.score_layer_batch_unscaled_indexed(
             layer,
             codes,
             code_stride,
@@ -396,7 +392,6 @@ impl QuantizedQueryCtx {
             self.index.specs[layer],
             out,
         );
-        charge_fallbacks(layer, fallbacks);
     }
 
     /// The norm the layer error model scales by: the query-to-centroid distance under L2, otherwise

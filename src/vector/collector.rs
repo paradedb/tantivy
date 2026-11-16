@@ -9,7 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::collector::sort_key::NaturalComparator;
+use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::{
     compare_for_top_k, AtomicSharedThreshold, Collector, ComparableDoc, SegmentCollector,
     SegmentSortKeyComputer, SharedThresholdArc, SortKeyComputer,
@@ -23,9 +23,13 @@ use crate::vector::router::global::GlobalRanking;
 use crate::vector::router::RoutingParams;
 use crate::vector::search::cluster_source::ClusterSource;
 use crate::vector::search::prepared::{invalid_query, QuantizedQueryCtx, VectorQuery};
-use crate::vector::search::scan::bound::{ExactMerge, PruningBound, TopK};
+use crate::vector::search::scan::bound::{
+    Candidate as ScanCandidate, ExactMerge, PruningBound, TopK,
+};
 use crate::vector::search::scan::heap::TieBreakHits;
-use crate::vector::search::scan::{ScanConfig, SegmentScan};
+use crate::vector::search::scan::{
+    best_estimates, best_estimates_first, RateApsState, ScanConfig, SegmentScan,
+};
 use crate::vector::search::segment::plan::ScanInput;
 use crate::vector::search::source::controller::{
     ProbeTermination, WorkBudget, WorkMeter, WorkUnits,
@@ -744,6 +748,32 @@ enum GlobalSource<'a> {
     RouterBypass(MatchClusters<'a>),
 }
 
+/// Scores `candidates` exactly in the scans holding them, each scan with the shared top-k swapped
+/// in. A scored row leaves its scan's shortlist.
+fn refine_candidates<T, K, C>(
+    scans: &mut [Option<SegmentScan<'_, T, K, C>>],
+    candidates: &[ScanCandidate],
+    topk: &mut TopK,
+    totals: &mut [StageTotals],
+    on_segment: &mut impl FnMut(usize),
+) -> Result<()>
+where
+    T: VectorElement,
+    K: SegmentSortKeyComputer,
+    C: Comparator<K::SegmentSortKey>,
+{
+    for (j, scan) in scans.iter_mut().enumerate() {
+        let Some(scan) = scan else { continue };
+        scan.swap_topk(topk);
+        let (result, measured) = measure(|| scan.refine_topk(candidates));
+        scan.swap_topk(topk);
+        totals[j].append(&measured);
+        on_segment(j);
+        result?;
+    }
+    Ok(())
+}
+
 /// Searches multiple segments with a shared cluster order, work budget, and top-k score threshold.
 /// Returns each segment's hits and statistics so the collector can combine the results.
 fn search_global<T, S>(
@@ -986,11 +1016,8 @@ where
         on_segment(i);
         result?;
     }
-    let mut rate = collector
-        .probe_params
-        .adaptive_probing
-        .filter(|_| top_n > 0 && !late_filter)
-        .map(|_| crate::vector::search::scan::RateApsState::default());
+    let mut rate = (top_n > 0 && !late_filter)
+        .then(|| RateApsState::new(collector.probe_params.adaptive_probing.is_some()));
     let mut recall_reached = false;
     if collector
         .inputs
@@ -1054,7 +1081,7 @@ where
                     let scored = scan.shortlist(&rows)?;
                     source.admitted(scored)?;
                     meter.rows(scored);
-                    recall_reached = scan.recall_reached();
+                    recall_reached = scan.recall_reached(&mut meter);
                 }
                 scan.swap_rate(&mut rate);
                 scan.swap_topk(&mut topk);
@@ -1067,32 +1094,11 @@ where
                 && !recall_reached
                 && rate.as_mut().is_some_and(|rate| rate.refinement_due())
             {
-                let mut candidates: Vec<_> = scans
-                    .iter_mut()
-                    .flatten()
-                    .flat_map(|scan| scan.refinement_candidates(top_n))
-                    .collect();
-                if candidates.len() > top_n {
-                    candidates.select_nth_unstable_by(top_n, |a, b| {
-                        b.bound
-                            .estimate()
-                            .total_cmp(&a.bound.estimate())
-                            .then_with(|| a.address.cmp(&b.address))
-                    });
-                    candidates.truncate(top_n);
-                }
-                for (j, scan) in scans.iter_mut().enumerate() {
-                    let Some(scan) = scan else { continue };
-                    scan.swap_topk(&mut topk);
-                    let (result, measured) = measure(|| scan.refine_topk(&candidates));
-                    scan.swap_topk(&mut topk);
-                    totals[j].append(&measured);
-                    on_segment(j);
-                    result?;
-                }
+                let candidates = best_estimates(scans.iter().flatten(), top_n);
+                refine_candidates(&mut scans, &candidates, &mut topk, totals, &mut *on_segment)?;
                 let scan = scans[i].as_mut().unwrap();
                 scan.swap_rate(&mut rate);
-                recall_reached = scan.recall_reached();
+                recall_reached = scan.recall_reached(&mut meter);
                 scan.swap_rate(&mut rate);
             }
         }
@@ -1101,7 +1107,22 @@ where
                 continue;
             };
             scan.swap_topk(&mut topk);
-            let (result, measured) = measure(|| scan.refine_shortlist());
+            let (result, measured) = measure(|| scan.narrow_shortlist());
+            scan.swap_topk(&mut topk);
+            totals[i].append(&measured);
+            on_segment(i);
+            result?;
+        }
+        if best_estimates_first() {
+            let candidates = best_estimates(scans.iter().flatten(), top_n);
+            refine_candidates(&mut scans, &candidates, &mut topk, totals, &mut *on_segment)?;
+        }
+        for (i, scan) in scans.iter_mut().enumerate() {
+            let Some(scan) = scan else {
+                continue;
+            };
+            scan.swap_topk(&mut topk);
+            let (result, measured) = measure(|| scan.score_shortlist());
             scan.swap_topk(&mut topk);
             totals[i].append(&measured);
             on_segment(i);
@@ -1251,8 +1272,8 @@ mod ivf_e2e_tests {
     use crate::vector::test_support::{FixtureSpec, Layout};
     use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
     use crate::vector::{
-        Candidate, ClusterRef, RouterKind, TopClustersBySimilarityCollector, VectorFilterStrategy,
-        VectorSearchBudget, VectorStage,
+        AdaptiveProbeParams, Candidate, ClusterRef, ProbeTermination, RouterKind,
+        TopClustersBySimilarityCollector, VectorFilterStrategy, VectorSearchBudget, VectorStage,
     };
     use crate::{
         DocAddress, Index, IndexWriter, Order, Result, Score, TantivyDocument, TantivyError, Term,
@@ -1565,7 +1586,7 @@ mod ivf_e2e_tests {
                         .iter()
                         .all(|s| s.termination == ProbeTermination::QuantizedRecall));
                     assert!(
-                        probed < 32,
+                        probed < 64,
                         "global admission history should stop across segment switches: {probed}"
                     );
                     assert!(result.stats.iter().all(|s| s.candidates_scored > 0));
@@ -1582,7 +1603,18 @@ mod ivf_e2e_tests {
     }
 
     #[test]
-    fn global_search_refines_during_probing_only_with_adaptive() -> Result<()> {
+    fn global_search_refines_during_probing_with_or_without_adaptive() -> Result<()> {
+        use crate::vector::search::scan::BEST_ESTIMATES_FIRST_OFF;
+
+        // The shortlist is scored in cluster order after probing, so every refinement counted
+        // here happens during probing.
+        BEST_ESTIMATES_FIRST_OFF.with(|off| off.set(true));
+        let result = global_search_refines_during_probing();
+        BEST_ESTIMATES_FIRST_OFF.with(|off| off.set(false));
+        result
+    }
+
+    fn global_search_refines_during_probing() -> Result<()> {
         use crate::vector::VectorStage;
 
         for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
@@ -1649,10 +1681,10 @@ mod ivf_e2e_tests {
                             )
                         })
                         .expect("refinement reads");
-                    let refines_during_probing = adaptive
-                        && result.stats.iter().any(|stats| {
-                            stats.access_path == crate::vector::stats::AccessPath::Routed
-                        });
+                    let refines_during_probing = result
+                        .stats
+                        .iter()
+                        .any(|stats| stats.access_path == crate::vector::stats::AccessPath::Routed);
                     assert_eq!(
                         first_refinement < last_shortlist,
                         refines_during_probing,
@@ -2570,6 +2602,61 @@ mod ivf_e2e_tests {
             collector.merge_fruits(collector.collect_segments(weight.as_ref(), &[], |_| {})?)?;
         assert!(empty.results.is_empty());
         assert!(empty.stats.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_patience_applies_to_single_and_global_scans() -> Result<()> {
+        let centroids: Vec<_> = (0..4096).map(|c| vec![c as f32 * 10.0, 0.0]).collect();
+        let vectors: Vec<_> = (0..2).flat_map(|_| centroids.clone()).collect();
+        for segments in [1, 2] {
+            let fixture = FixtureSpec::ivf(Metric::L2, centroids.clone(), vectors.clone())
+                .segments(segments)
+                .build()?;
+            let searcher = fixture.index.reader()?.searcher();
+            let readers: Vec<_> = searcher
+                .segment_readers()
+                .iter()
+                .enumerate()
+                .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
+                .collect();
+            let weight = fixture.all()?;
+            let mut work = Vec::new();
+            for (max_probe, patience) in [(500, 0.0), (1000, 16.66), (2000, 100.0), (4000, 200.0)] {
+                let collector = TopDocs::with_limit(10)
+                    .order_by_similarity(fixture.field, vec![0.0_f32, 0.0])
+                    .with_probe_params(ProbeParams {
+                        adaptive_probing: Some(AdaptiveProbeParams::default()),
+                        max_probe,
+                        located: LocatedPath::Off,
+                        ..Default::default()
+                    })
+                    .build_for_searcher(&searcher, &AllQuery)?;
+                let fruits = if segments == 1 {
+                    vec![collector.collect_segment(
+                        weight.as_ref(),
+                        readers[0].ordinal,
+                        &readers[0].reader,
+                    )?]
+                } else {
+                    collector.collect_segments(weight.as_ref(), &readers, |_| {})?
+                };
+                let result = collector.merge_fruits(fruits)?;
+                let charged = result.stats.iter().map(|s| s.work_charged).sum::<f32>();
+                assert_eq!(result.results.len(), 10);
+                assert!(charged >= patience);
+                assert!(charged < max_probe as f32);
+                assert!(result
+                    .stats
+                    .iter()
+                    .all(|s| s.termination == ProbeTermination::QuantizedRecall));
+                work.push(charged);
+            }
+            assert!(
+                work[3] > work[2] && work[2] > work[0],
+                "{segments} segments: {work:?}"
+            );
+        }
         Ok(())
     }
 

@@ -135,7 +135,7 @@ mod tests {
     use crate::directory::FileHandle;
     use crate::vector::clustering::{IvfCentroids, IvfMatrix};
     use crate::vector::router::candidate::Candidate;
-    use crate::vector::router::scoring::score_initial;
+    use crate::vector::router::scoring::{score_initial, RouterQueries};
     use crate::vector::router::search::{
         self, rerank_exact, OutputPrecision, ScoreBuffer, SearchPolicy, TopCandidates,
     };
@@ -218,12 +218,14 @@ mod tests {
         score_initial(
             &opened.level.vectors,
             &query,
+            &mut RouterQueries::default(),
             start as usize..end as usize,
             &mut actual,
         );
         score_initial(
             &built.level.vectors,
             &query,
+            &mut RouterQueries::default(),
             start as usize..end as usize,
             &mut expected,
         );

@@ -26,8 +26,15 @@ impl QueryPlanes {
     }
 }
 
+/// Bytes in one packed sign word.
+const WORD_BYTES: usize = std::mem::size_of::<u64>();
+
 /// Borrows little-endian sign words when their bytes are aligned on a little-endian
 /// host; otherwise decodes only the supplied byte range into owned words.
+///
+/// Storage hands out sign codes at any alignment, so the decode allocates and copies for most
+/// reads. The `_le_bytes` scorers read the bytes in place; keep this for cold paths that need
+/// native words.
 ///
 /// # Panics
 ///
@@ -64,6 +71,38 @@ fn decode_le_words(bytes: &[u8]) -> Vec<u64> {
         .collect()
 }
 
+/// The words of little-endian sign bytes, loaded at any alignment. On little-endian hosts each
+/// word is one unaligned load, which the row kernels vectorize exactly as they do aligned words.
+///
+/// The bytes are viewed as a slice of `[u8; 8]` rather than walked with `chunks_exact`: zipped
+/// against the query planes the latter does not vectorize, and the batch scorers run 3.6x slower
+/// (`sign_batch_*` in `benches/sign_score.rs`).
+#[inline(always)]
+fn le_words(bytes: &[u8]) -> impl Iterator<Item = u64> + '_ {
+    // SAFETY: `[u8; 8]` has no alignment requirement and the whole words lie within `bytes`.
+    let words: &[[u8; WORD_BYTES]] =
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast(), bytes.len() / WORD_BYTES) };
+    words.iter().map(|word| u64::from_le_bytes(*word))
+}
+
+/// Native sign words as the little-endian bytes the kernels read; borrowed on little-endian
+/// hosts.
+#[inline(always)]
+fn words_as_le_bytes(words: &[u64]) -> Cow<'_, [u8]> {
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: the words are initialized, `u8` has no alignment requirement, and the byte
+        // length covers exactly the words borrowed.
+        Cow::Borrowed(unsafe {
+            std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), std::mem::size_of_val(words))
+        })
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        Cow::Owned(words.iter().flat_map(|word| word.to_le_bytes()).collect())
+    }
+}
+
 fn packed_words(d: usize) -> usize {
     assert!(d > 0);
     d.div_ceil(64)
@@ -75,6 +114,15 @@ fn tail_is_zero(words: &[u64], d: usize) -> bool {
     }
     let tail = d % 64;
     tail == 0 || words.last().is_some_and(|word| word >> tail == 0)
+}
+
+/// [`tail_is_zero`] over a row's little-endian bytes.
+fn le_tail_is_zero(bytes: &[u8], d: usize) -> bool {
+    if d == 0 || bytes.len() != packed_words(d) * WORD_BYTES {
+        return false;
+    }
+    let tail = d % 64;
+    tail == 0 || le_words(bytes).last().is_some_and(|word| word >> tail == 0)
 }
 
 /// Packs vector signs into words.
@@ -243,10 +291,22 @@ fn prepare_query_body(u: &[f32], bq: u8) -> QueryPlanes {
 ///
 /// Panics when code and query bitplane shapes disagree.
 pub fn score_asym(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
+    score_asym_le_bytes(&words_as_le_bytes(x), q)
+}
+
+/// [`score_asym`] over the row's little-endian bytes, read in place at any alignment.
+///
+/// # Panics
+///
+/// Panics when code and query bitplane shapes disagree.
+pub fn score_asym_le_bytes(x: &[u8], q: &QueryPlanes) -> (u32, u64) {
     assert!(!x.is_empty());
     assert!(!q.planes.is_empty());
-    assert!(q.planes.iter().all(|plane| plane.len() == x.len()));
-    debug_assert!(tail_is_zero(x, q.d));
+    assert!(q
+        .planes
+        .iter()
+        .all(|plane| plane.len() * WORD_BYTES == x.len()));
+    debug_assert!(le_tail_is_zero(x, q.d));
     debug_assert!(q.planes.iter().all(|plane| tail_is_zero(plane, q.d)));
     #[cfg(target_arch = "x86_64")]
     let totals = x86::single(x, q);
@@ -255,19 +315,18 @@ pub fn score_asym(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
     totals
 }
 
-/// Portable body of [`score_asym`].
+/// Portable body of [`score_asym_le_bytes`].
 #[inline(always)]
-fn score_asym_body(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
-    let positives = x.iter().map(|word| word.count_ones()).sum();
+fn score_asym_body(x: &[u8], q: &QueryPlanes) -> (u32, u64) {
+    let positives = le_words(x).map(|word| word.count_ones()).sum();
     let weighted_sum = q
         .planes
         .iter()
         .enumerate()
         .map(|(bit, plane)| {
-            let intersections: u64 = x
-                .iter()
+            let intersections: u64 = le_words(x)
                 .zip(plane)
-                .map(|(&signs, &query)| u64::from((signs & query).count_ones()))
+                .map(|(signs, &query)| u64::from((signs & query).count_ones()))
                 .sum();
             intersections << bit
         })
@@ -300,7 +359,18 @@ pub fn estimate_asym_f32(x: &[u64], scale: f32, q: &QueryPlanes) -> f32 {
 /// Panics when code and query bitplane shapes disagree.
 #[inline]
 pub fn estimate_asym_unscaled(x: &[u64], q: &QueryPlanes) -> f32 {
-    let (positives, weighted_sum) = score_asym(x, q);
+    estimate_asym_unscaled_le_bytes(&words_as_le_bytes(x), q)
+}
+
+/// [`estimate_asym_unscaled`] over the row's little-endian bytes, read in place at any
+/// alignment.
+///
+/// # Panics
+///
+/// Panics when code and query bitplane shapes disagree.
+#[inline]
+pub fn estimate_asym_unscaled_le_bytes(x: &[u8], q: &QueryPlanes) -> f32 {
+    let (positives, weighted_sum) = score_asym_le_bytes(x, q);
     finish_asym(positives, weighted_sum, q)
 }
 
@@ -315,13 +385,14 @@ fn finish_asym(positives: u32, weighted_sum: u64, q: &QueryPlanes) -> f32 {
     q.lo * sign_sum as f32 + q.delta * code_sum as f32
 }
 
-/// Scalar four-plane row kernel; the portable counterpart of the [`neon`] kernels.
+/// Scalar four-plane row kernel over a row's little-endian bytes; the portable counterpart of
+/// the [`neon`] kernels.
 #[inline(always)]
-fn score_row4(row: &[u64], planes: [&[u64]; 4]) -> (u32, u64) {
+fn score_row4(row: &[u8], planes: [&[u64]; 4]) -> (u32, u64) {
     let [p0, p1, p2, p3] = planes;
     let mut positives = 0_u32;
     let mut weighted_sum = 0_u64;
-    for ((((signs, &q0), &q1), &q2), &q3) in row.iter().copied().zip(p0).zip(p1).zip(p2).zip(p3) {
+    for ((((signs, &q0), &q1), &q2), &q3) in le_words(row).zip(p0).zip(p1).zip(p2).zip(p3) {
         positives += signs.count_ones();
         weighted_sum += u64::from((signs & q0).count_ones());
         weighted_sum += u64::from((signs & q1).count_ones()) << 1;
@@ -333,11 +404,11 @@ fn score_row4(row: &[u64], planes: [&[u64]; 4]) -> (u32, u64) {
 
 /// Scalar three-plane row kernel.
 #[inline(always)]
-fn score_row3(row: &[u64], planes: [&[u64]; 3]) -> (u32, u64) {
+fn score_row3(row: &[u8], planes: [&[u64]; 3]) -> (u32, u64) {
     let [p0, p1, p2] = planes;
     let mut positives = 0_u32;
     let mut weighted_sum = 0_u64;
-    for (((signs, &q0), &q1), &q2) in row.iter().copied().zip(p0).zip(p1).zip(p2) {
+    for (((signs, &q0), &q1), &q2) in le_words(row).zip(p0).zip(p1).zip(p2) {
         positives += signs.count_ones();
         weighted_sum += u64::from((signs & q0).count_ones());
         weighted_sum += u64::from((signs & q1).count_ones()) << 1;
@@ -348,10 +419,10 @@ fn score_row3(row: &[u64], planes: [&[u64]; 3]) -> (u32, u64) {
 
 /// Scalar row kernel for any plane count.
 #[inline(always)]
-fn score_row_any(row: &[u64], planes: &[Vec<u64>]) -> (u32, u64) {
+fn score_row_any(row: &[u8], planes: &[Vec<u64>]) -> (u32, u64) {
     let mut positives = 0_u32;
     let mut weighted_sum = 0_u64;
-    for (word_idx, &signs) in row.iter().enumerate() {
+    for (word_idx, signs) in le_words(row).enumerate() {
         positives += signs.count_ones();
         for (bit, plane) in planes.iter().enumerate() {
             weighted_sum += u64::from((signs & plane[word_idx]).count_ones()) << bit;
@@ -360,26 +431,27 @@ fn score_row_any(row: &[u64], planes: &[Vec<u64>]) -> (u32, u64) {
     (positives, weighted_sum)
 }
 
-/// Portable body of [`estimate_asym_batch_unscaled`].
+/// Portable body of [`estimate_asym_batch_unscaled_le_bytes`].
 #[inline(always)]
-fn batch_body(rows: &[u64], words_per_row: usize, q: &QueryPlanes, out: &mut [f32]) {
+fn batch_body(rows: &[u8], words_per_row: usize, q: &QueryPlanes, out: &mut [f32]) {
+    let row_bytes = words_per_row * WORD_BYTES;
     match q.planes.as_slice() {
         [p0, p1, p2, p3] => {
             let planes = [p0.as_slice(), p1.as_slice(), p2.as_slice(), p3.as_slice()];
-            for (row, score) in rows.chunks_exact(words_per_row).zip(out) {
+            for (row, score) in rows.chunks_exact(row_bytes).zip(out) {
                 let (positives, weighted_sum) = score_row4(row, planes);
                 *score = finish_asym(positives, weighted_sum, q);
             }
         }
         [p0, p1, p2] => {
             let planes = [p0.as_slice(), p1.as_slice(), p2.as_slice()];
-            for (row, score) in rows.chunks_exact(words_per_row).zip(out) {
+            for (row, score) in rows.chunks_exact(row_bytes).zip(out) {
                 let (positives, weighted_sum) = score_row3(row, planes);
                 *score = finish_asym(positives, weighted_sum, q);
             }
         }
         planes => {
-            for (row, score) in rows.chunks_exact(words_per_row).zip(out) {
+            for (row, score) in rows.chunks_exact(row_bytes).zip(out) {
                 let (positives, weighted_sum) = score_row_any(row, planes);
                 *score = finish_asym(positives, weighted_sum, q);
             }
@@ -387,20 +459,21 @@ fn batch_body(rows: &[u64], words_per_row: usize, q: &QueryPlanes, out: &mut [f3
     }
 }
 
-/// Portable body of [`estimate_asym_batch_unscaled_indexed`].
+/// Portable body of [`estimate_asym_batch_unscaled_indexed_le_bytes`].
 #[inline(always)]
 fn indexed_body(
-    rows: &[u64],
+    rows: &[u8],
     words_per_row: usize,
     row_offsets: &[usize],
     q: &QueryPlanes,
     out: &mut [f32],
 ) {
+    let row_bytes = words_per_row * WORD_BYTES;
     match q.planes.as_slice() {
         [p0, p1, p2, p3] => {
             let planes = [p0.as_slice(), p1.as_slice(), p2.as_slice(), p3.as_slice()];
             for (&row_offset, score) in row_offsets.iter().zip(out) {
-                let row = &rows[row_offset * words_per_row..][..words_per_row];
+                let row = &rows[row_offset * row_bytes..][..row_bytes];
                 let (positives, weighted_sum) = score_row4(row, planes);
                 *score = finish_asym(positives, weighted_sum, q);
             }
@@ -408,14 +481,14 @@ fn indexed_body(
         [p0, p1, p2] => {
             let planes = [p0.as_slice(), p1.as_slice(), p2.as_slice()];
             for (&row_offset, score) in row_offsets.iter().zip(out) {
-                let row = &rows[row_offset * words_per_row..][..words_per_row];
+                let row = &rows[row_offset * row_bytes..][..row_bytes];
                 let (positives, weighted_sum) = score_row3(row, planes);
                 *score = finish_asym(positives, weighted_sum, q);
             }
         }
         planes => {
             for (&row_offset, score) in row_offsets.iter().zip(out) {
-                let row = &rows[row_offset * words_per_row..][..words_per_row];
+                let row = &rows[row_offset * row_bytes..][..row_bytes];
                 let (positives, weighted_sum) = score_row_any(row, planes);
                 *score = finish_asym(positives, weighted_sum, q);
             }
@@ -435,12 +508,32 @@ pub fn estimate_asym_batch_unscaled(
     q: &QueryPlanes,
     out: &mut [f32],
 ) {
+    estimate_asym_batch_unscaled_le_bytes(&words_as_le_bytes(rows), words_per_row, q, out);
+}
+
+/// [`estimate_asym_batch_unscaled`] over the rows' little-endian bytes, read in place at any
+/// alignment.
+///
+/// # Panics
+///
+/// Panics when row, bitplane, stride, or output shapes disagree.
+#[inline]
+pub fn estimate_asym_batch_unscaled_le_bytes(
+    rows: &[u8],
+    words_per_row: usize,
+    q: &QueryPlanes,
+    out: &mut [f32],
+) {
     assert!(words_per_row > 0);
-    assert_eq!(rows.len(), out.len() * words_per_row);
+    assert_eq!(rows.len(), out.len() * words_per_row * WORD_BYTES);
     assert!(!q.planes.is_empty());
     assert!(q.planes.iter().all(|plane| plane.len() == words_per_row));
 
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
     match q.planes.as_slice() {
         [p0, p1, p2, p3] => {
             let planes = [p0.as_slice(), p1.as_slice(), p2.as_slice(), p3.as_slice()];
@@ -477,16 +570,42 @@ pub fn estimate_asym_batch_unscaled_indexed(
     q: &QueryPlanes,
     out: &mut [f32],
 ) {
+    estimate_asym_batch_unscaled_indexed_le_bytes(
+        &words_as_le_bytes(rows),
+        words_per_row,
+        row_offsets,
+        q,
+        out,
+    );
+}
+
+/// [`estimate_asym_batch_unscaled_indexed`] over the rows' little-endian bytes, read in place at
+/// any alignment.
+///
+/// # Panics
+///
+/// Panics when row, index, bitplane, stride, or output shapes disagree.
+#[inline]
+pub fn estimate_asym_batch_unscaled_indexed_le_bytes(
+    rows: &[u8],
+    words_per_row: usize,
+    row_offsets: &[usize],
+    q: &QueryPlanes,
+    out: &mut [f32],
+) {
     assert!(words_per_row > 0);
-    assert_eq!(rows.len() % words_per_row, 0);
+    let row_bytes = words_per_row * WORD_BYTES;
+    assert_eq!(rows.len() % row_bytes, 0);
     assert_eq!(row_offsets.len(), out.len());
-    assert!(row_offsets
-        .iter()
-        .all(|&row| row < rows.len() / words_per_row));
+    assert!(row_offsets.iter().all(|&row| row < rows.len() / row_bytes));
     assert!(!q.planes.is_empty());
     assert!(q.planes.iter().all(|plane| plane.len() == words_per_row));
 
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
     match q.planes.as_slice() {
         [p0, p1, p2, p3] => {
             let planes = [p0.as_slice(), p1.as_slice(), p2.as_slice(), p3.as_slice()];
@@ -534,14 +653,22 @@ pub fn estimate_asym_batch_unscaled_indexed(
 /// before they can overflow. Blocks of two rows share each plane load, an odd trailing word is
 /// counted in scalar code, and the exact integer totals feed [`finish_asym`], so scores are
 /// bit-identical to the scalar kernels.
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+///
+/// Rows arrive as little-endian bytes at any alignment and planes as native words; both are
+/// loaded bytewise, which agrees only on little-endian hosts, so big-endian ones take the
+/// portable bodies.
+#[cfg(all(
+    target_arch = "aarch64",
+    target_feature = "neon",
+    target_endian = "little"
+))]
 mod neon {
     use std::arch::aarch64::{
         uint32x4_t, uint8x16_t, vaddlvq_u16, vaddvq_u32, vandq_u8, vcntq_u8, vdupq_n_u16,
         vdupq_n_u32, vdupq_n_u8, vld1q_u8, vpadalq_u8,
     };
 
-    use super::{finish_asym, QueryPlanes};
+    use super::{finish_asym, QueryPlanes, WORD_BYTES};
 
     /// UADALP adds at most 16 to a u16 lane per chunk, so flushing at this cadence keeps every
     /// lane below overflow for any dimension.
@@ -570,10 +697,10 @@ mod neon {
     /// # Safety
     ///
     /// The caller must have checked the batch shape: `words_per_row > 0`, every plane holds
-    /// `words_per_row` words, and `rows.len() == out.len() * words_per_row`.
+    /// `words_per_row` words, and `rows` holds `out.len() * words_per_row` words of bytes.
     pub(super) unsafe fn batch<const P: usize>(
         acc: Accumulator,
-        rows: &[u64],
+        rows: &[u8],
         words_per_row: usize,
         planes: [&[u64]; P],
         q: &QueryPlanes,
@@ -595,11 +722,11 @@ mod neon {
     /// # Safety
     ///
     /// The caller must have checked the batch shape: `words_per_row > 0`, every plane holds
-    /// `words_per_row` words, `row_offsets.len() == out.len()`, and every offset is below
-    /// `rows.len() / words_per_row`.
+    /// `words_per_row` words, `row_offsets.len() == out.len()`, and every offset is below the
+    /// number of `words_per_row`-word rows `rows` holds.
     pub(super) unsafe fn indexed<const P: usize>(
         acc: Accumulator,
-        rows: &[u64],
+        rows: &[u8],
         words_per_row: usize,
         row_offsets: &[usize],
         planes: [&[u64]; P],
@@ -624,10 +751,10 @@ mod neon {
     /// # Safety
     ///
     /// FEAT_DotProd must be present, every plane must hold `words` words, and
-    /// `row_index(i) * words + words <= rows.len()` for every `i < out.len()`.
+    /// `(row_index(i) + 1) * words * WORD_BYTES <= rows.len()` for every `i < out.len()`.
     #[target_feature(enable = "dotprod")]
     unsafe fn drive_dot<const P: usize>(
-        rows: &[u64],
+        rows: &[u8],
         words: usize,
         row_index: impl Fn(usize) -> usize,
         planes: [&[u64]; P],
@@ -635,10 +762,11 @@ mod neon {
         out: &mut [f32],
     ) {
         let base = rows.as_ptr();
+        let row_bytes = words * WORD_BYTES;
         for pair in 0..out.len() / 2 {
             let rows2 = [
-                base.add(row_index(pair * 2) * words),
-                base.add(row_index(pair * 2 + 1) * words),
+                base.add(row_index(pair * 2) * row_bytes),
+                base.add(row_index(pair * 2 + 1) * row_bytes),
             ];
             let [(pos_a, sum_a), (pos_b, sum_b)] = block2_dot(rows2, words, planes);
             out[pair * 2] = finish_asym(pos_a, sum_a, q);
@@ -646,7 +774,8 @@ mod neon {
         }
         if out.len() % 2 == 1 {
             let last = out.len() - 1;
-            let (positives, weighted) = row_dot(base.add(row_index(last) * words), words, planes);
+            let (positives, weighted) =
+                row_dot(base.add(row_index(last) * row_bytes), words, planes);
             out[last] = finish_asym(positives, weighted, q);
         }
     }
@@ -655,10 +784,10 @@ mod neon {
     ///
     /// # Safety
     ///
-    /// Every plane must hold `words` words, and `row_index(i) * words + words <= rows.len()` for
-    /// every `i < out.len()`.
+    /// Every plane must hold `words` words, and
+    /// `(row_index(i) + 1) * words * WORD_BYTES <= rows.len()` for every `i < out.len()`.
     unsafe fn drive_widen<const P: usize>(
-        rows: &[u64],
+        rows: &[u8],
         words: usize,
         row_index: impl Fn(usize) -> usize,
         planes: [&[u64]; P],
@@ -666,10 +795,11 @@ mod neon {
         out: &mut [f32],
     ) {
         let base = rows.as_ptr();
+        let row_bytes = words * WORD_BYTES;
         for pair in 0..out.len() / 2 {
             let rows2 = [
-                base.add(row_index(pair * 2) * words),
-                base.add(row_index(pair * 2 + 1) * words),
+                base.add(row_index(pair * 2) * row_bytes),
+                base.add(row_index(pair * 2 + 1) * row_bytes),
             ];
             let [(pos_a, sum_a), (pos_b, sum_b)] = block2_widen(rows2, words, planes);
             out[pair * 2] = finish_asym(pos_a, sum_a, q);
@@ -677,7 +807,8 @@ mod neon {
         }
         if out.len() % 2 == 1 {
             let last = out.len() - 1;
-            let (positives, weighted) = row_widen(base.add(row_index(last) * words), words, planes);
+            let (positives, weighted) =
+                row_widen(base.add(row_index(last) * row_bytes), words, planes);
             out[last] = finish_asym(positives, weighted, q);
         }
     }
@@ -686,16 +817,15 @@ mod neon {
     ///
     /// # Safety
     ///
-    /// FEAT_DotProd must be present, each row pointer must be readable for `words` words, and
-    /// every plane must hold `words` words.
+    /// FEAT_DotProd must be present, each row pointer must be readable for `words` words of
+    /// bytes, and every plane must hold `words` words.
     #[target_feature(enable = "dotprod")]
     #[inline]
     unsafe fn block2_dot<const P: usize>(
-        rows2: [*const u64; 2],
+        rows2: [*const u8; 2],
         words: usize,
         planes: [&[u64]; P],
     ) -> [(u32, u64); 2] {
-        let row_bytes = rows2.map(|row| row.cast::<u8>());
         let plane_bytes = planes.map(|plane| plane.as_ptr().cast::<u8>());
         let ones = vdupq_n_u8(1);
         let mut acc_p = [vdupq_n_u32(0); 2];
@@ -707,7 +837,7 @@ mod neon {
                 v[b] = vld1q_u8(plane_bytes[b].add(off));
             }
             for r in 0..2 {
-                let s = vld1q_u8(row_bytes[r].add(off));
+                let s = vld1q_u8(rows2[r].add(off));
                 acc_p[r] = udot_ones(acc_p[r], vcntq_u8(s), ones);
                 for b in 0..P {
                     acc[r][b] = udot_ones(acc[r][b], vcntq_u8(vandq_u8(s, v[b])), ones);
@@ -731,23 +861,22 @@ mod neon {
     ///
     /// # Safety
     ///
-    /// FEAT_DotProd must be present, `row` must be readable for `words` words, and every plane
-    /// must hold `words` words.
+    /// FEAT_DotProd must be present, `row` must be readable for `words` words of bytes, and
+    /// every plane must hold `words` words.
     #[target_feature(enable = "dotprod")]
     #[inline]
     unsafe fn row_dot<const P: usize>(
-        row: *const u64,
+        row: *const u8,
         words: usize,
         planes: [&[u64]; P],
     ) -> (u32, u64) {
-        let row_bytes = row.cast::<u8>();
         let plane_bytes = planes.map(|plane| plane.as_ptr().cast::<u8>());
         let ones = vdupq_n_u8(1);
         let mut acc_p = vdupq_n_u32(0);
         let mut acc = [vdupq_n_u32(0); P];
         for chunk in 0..words / 2 {
             let off = chunk * 16;
-            let s = vld1q_u8(row_bytes.add(off));
+            let s = vld1q_u8(row.add(off));
             acc_p = udot_ones(acc_p, vcntq_u8(s), ones);
             for b in 0..P {
                 let masked = vandq_u8(s, vld1q_u8(plane_bytes[b].add(off)));
@@ -767,15 +896,14 @@ mod neon {
     ///
     /// # Safety
     ///
-    /// Each row pointer must be readable for `words` words and every plane must hold `words`
-    /// words.
+    /// Each row pointer must be readable for `words` words of bytes and every plane must hold
+    /// `words` words.
     #[inline]
     unsafe fn block2_widen<const P: usize>(
-        rows2: [*const u64; 2],
+        rows2: [*const u8; 2],
         words: usize,
         planes: [&[u64]; P],
     ) -> [(u32, u64); 2] {
-        let row_bytes = rows2.map(|row| row.cast::<u8>());
         let plane_bytes = planes.map(|plane| plane.as_ptr().cast::<u8>());
         let chunks = words / 2;
         let mut positives = [0_u32; 2];
@@ -792,7 +920,7 @@ mod neon {
                     v[b] = vld1q_u8(plane_bytes[b].add(off));
                 }
                 for r in 0..2 {
-                    let s = vld1q_u8(row_bytes[r].add(off));
+                    let s = vld1q_u8(rows2[r].add(off));
                     acc_p[r] = vpadalq_u8(acc_p[r], vcntq_u8(s));
                     for b in 0..P {
                         acc[r][b] = vpadalq_u8(acc[r][b], vcntq_u8(vandq_u8(s, v[b])));
@@ -819,14 +947,14 @@ mod neon {
     ///
     /// # Safety
     ///
-    /// `row` must be readable for `words` words and every plane must hold `words` words.
+    /// `row` must be readable for `words` words of bytes and every plane must hold `words`
+    /// words.
     #[inline]
     unsafe fn row_widen<const P: usize>(
-        row: *const u64,
+        row: *const u8,
         words: usize,
         planes: [&[u64]; P],
     ) -> (u32, u64) {
-        let row_bytes = row.cast::<u8>();
         let plane_bytes = planes.map(|plane| plane.as_ptr().cast::<u8>());
         let chunks = words / 2;
         let mut positives = 0_u32;
@@ -838,7 +966,7 @@ mod neon {
             let mut acc = [vdupq_n_u16(0); P];
             while chunk < flush_end {
                 let off = chunk * 16;
-                let s = vld1q_u8(row_bytes.add(off));
+                let s = vld1q_u8(row.add(off));
                 acc_p = vpadalq_u8(acc_p, vcntq_u8(s));
                 for b in 0..P {
                     let masked = vandq_u8(s, vld1q_u8(plane_bytes[b].add(off)));
@@ -859,10 +987,11 @@ mod neon {
     ///
     /// # Safety
     ///
-    /// `row` must be readable for `words` words and every plane must hold `words` words.
+    /// `row` must be readable for `words` words of bytes and every plane must hold `words`
+    /// words.
     #[inline(always)]
     unsafe fn tail_word<const P: usize>(
-        row: *const u64,
+        row: *const u8,
         words: usize,
         planes: [&[u64]; P],
         positives: &mut u32,
@@ -870,7 +999,8 @@ mod neon {
     ) {
         if words % 2 == 1 {
             let last = words - 1;
-            let signs = *row.add(last);
+            // `[u8; 8]` has no alignment requirement, so the read is valid at any row address.
+            let signs = u64::from_le_bytes(row.add(last * WORD_BYTES).cast::<[u8; 8]>().read());
             *positives += signs.count_ones();
             for (sum, plane) in sums.iter_mut().zip(planes) {
                 *sum += u64::from((signs & plane[last]).count_ones());
@@ -935,7 +1065,7 @@ mod x86 {
         prepare_query_body(u, bq)
     }
 
-    pub(super) fn batch(rows: &[u64], words_per_row: usize, q: &QueryPlanes, out: &mut [f32]) {
+    pub(super) fn batch(rows: &[u8], words_per_row: usize, q: &QueryPlanes, out: &mut [f32]) {
         match tier() {
             // SAFETY: the tier is only reported when the CPU has every feature the variant enables.
             Tier::Avx512 => unsafe { batch_avx512(rows, words_per_row, q, out) },
@@ -948,7 +1078,7 @@ mod x86 {
     }
 
     pub(super) fn indexed(
-        rows: &[u64],
+        rows: &[u8],
         words_per_row: usize,
         row_offsets: &[usize],
         q: &QueryPlanes,
@@ -965,7 +1095,7 @@ mod x86 {
         }
     }
 
-    pub(super) fn single(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
+    pub(super) fn single(x: &[u8], q: &QueryPlanes) -> (u32, u64) {
         match tier() {
             // SAFETY: the tier is only reported when the CPU has every feature the variant enables.
             Tier::Avx512 => unsafe { single_avx512(x, q) },
@@ -982,7 +1112,7 @@ mod x86 {
     /// The CPU must have POPCNT.
     #[target_feature(enable = "popcnt")]
     pub(super) unsafe fn batch_popcnt(
-        rows: &[u64],
+        rows: &[u8],
         words_per_row: usize,
         q: &QueryPlanes,
         out: &mut [f32],
@@ -995,7 +1125,7 @@ mod x86 {
     /// The CPU must have AVX2, POPCNT and F16C.
     #[target_feature(enable = "avx2,popcnt,f16c")]
     pub(super) unsafe fn batch_avx2(
-        rows: &[u64],
+        rows: &[u8],
         words_per_row: usize,
         q: &QueryPlanes,
         out: &mut [f32],
@@ -1008,7 +1138,7 @@ mod x86 {
     /// The CPU must have AVX-512 F, BW, VL and VPOPCNTDQ, AVX2, POPCNT and F16C.
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vpopcntdq,avx2,popcnt,f16c")]
     pub(super) unsafe fn batch_avx512(
-        rows: &[u64],
+        rows: &[u8],
         words_per_row: usize,
         q: &QueryPlanes,
         out: &mut [f32],
@@ -1021,7 +1151,7 @@ mod x86 {
     /// The CPU must have POPCNT.
     #[target_feature(enable = "popcnt")]
     pub(super) unsafe fn indexed_popcnt(
-        rows: &[u64],
+        rows: &[u8],
         words_per_row: usize,
         row_offsets: &[usize],
         q: &QueryPlanes,
@@ -1035,7 +1165,7 @@ mod x86 {
     /// The CPU must have AVX2, POPCNT and F16C.
     #[target_feature(enable = "avx2,popcnt,f16c")]
     pub(super) unsafe fn indexed_avx2(
-        rows: &[u64],
+        rows: &[u8],
         words_per_row: usize,
         row_offsets: &[usize],
         q: &QueryPlanes,
@@ -1049,7 +1179,7 @@ mod x86 {
     /// The CPU must have AVX-512 F, BW, VL and VPOPCNTDQ, AVX2, POPCNT and F16C.
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vpopcntdq,avx2,popcnt,f16c")]
     pub(super) unsafe fn indexed_avx512(
-        rows: &[u64],
+        rows: &[u8],
         words_per_row: usize,
         row_offsets: &[usize],
         q: &QueryPlanes,
@@ -1062,7 +1192,7 @@ mod x86 {
     ///
     /// The CPU must have POPCNT.
     #[target_feature(enable = "popcnt")]
-    pub(super) unsafe fn single_popcnt(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
+    pub(super) unsafe fn single_popcnt(x: &[u8], q: &QueryPlanes) -> (u32, u64) {
         score_asym_body(x, q)
     }
 
@@ -1070,7 +1200,7 @@ mod x86 {
     ///
     /// The CPU must have AVX2, POPCNT and F16C.
     #[target_feature(enable = "avx2,popcnt,f16c")]
-    pub(super) unsafe fn single_avx2(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
+    pub(super) unsafe fn single_avx2(x: &[u8], q: &QueryPlanes) -> (u32, u64) {
         score_asym_body(x, q)
     }
 
@@ -1078,7 +1208,7 @@ mod x86 {
     ///
     /// The CPU must have AVX-512 F, BW, VL and VPOPCNTDQ, AVX2, POPCNT and F16C.
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vpopcntdq,avx2,popcnt,f16c")]
-    pub(super) unsafe fn single_avx512(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
+    pub(super) unsafe fn single_avx512(x: &[u8], q: &QueryPlanes) -> (u32, u64) {
         score_asym_body(x, q)
     }
 }
@@ -1432,16 +1562,18 @@ mod tests {
                         };
                         let mut got = vec![0.0_f32; rows];
                         let mut got_indexed = vec![0.0_f32; row_offsets.len()];
-                        batch_body(&packed, words, &q, &mut got);
-                        indexed_body(&packed, words, &row_offsets, &q, &mut got_indexed);
+                        let shifted = shifted_le_bytes(&packed);
+                        let packed = &shifted[1..];
+                        batch_body(packed, words, &q, &mut got);
+                        indexed_body(packed, words, &row_offsets, &q, &mut got_indexed);
                         check("baseline batch", &got, &expected);
                         check("baseline indexed", &got_indexed, &expected_indexed);
                         if std::arch::is_x86_feature_detected!("popcnt") {
                             // SAFETY: popcnt was just detected.
                             unsafe {
-                                x86::batch_popcnt(&packed, words, &q, &mut got);
+                                x86::batch_popcnt(packed, words, &q, &mut got);
                                 x86::indexed_popcnt(
-                                    &packed,
+                                    packed,
                                     words,
                                     &row_offsets,
                                     &q,
@@ -1457,9 +1589,9 @@ mod tests {
                         {
                             // SAFETY: avx2, popcnt and f16c were just detected.
                             unsafe {
-                                x86::batch_avx2(&packed, words, &q, &mut got);
+                                x86::batch_avx2(packed, words, &q, &mut got);
                                 x86::indexed_avx2(
-                                    &packed,
+                                    packed,
                                     words,
                                     &row_offsets,
                                     &q,
@@ -1479,9 +1611,9 @@ mod tests {
                         {
                             // SAFETY: every feature the avx512 variants enable was just detected.
                             unsafe {
-                                x86::batch_avx512(&packed, words, &q, &mut got);
+                                x86::batch_avx512(packed, words, &q, &mut got);
                                 x86::indexed_avx512(
-                                    &packed,
+                                    packed,
                                     words,
                                     &row_offsets,
                                     &q,
@@ -1493,11 +1625,15 @@ mod tests {
                         }
                     }
 
-                    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+                    #[cfg(all(
+                        target_arch = "aarch64",
+                        target_feature = "neon",
+                        target_endian = "little"
+                    ))]
                     {
                         fn forced<const P: usize>(
                             planes: [&[u64]; P],
-                            packed: &[u64],
+                            packed: &[u8],
                             words: usize,
                             row_offsets: &[usize],
                             q: &QueryPlanes,
@@ -1544,10 +1680,12 @@ mod tests {
                             }
                         }
                         let context = format!("d={d}, bq={bq}, rows={rows}");
+                        let shifted = shifted_le_bytes(&packed);
+                        let packed = &shifted[1..];
                         match q.planes.as_slice() {
                             [p0, p1, p2, p3] => forced(
                                 [p0.as_slice(), p1.as_slice(), p2.as_slice(), p3.as_slice()],
-                                &packed,
+                                packed,
                                 words,
                                 &row_offsets,
                                 &q,
@@ -1556,7 +1694,7 @@ mod tests {
                             ),
                             [p0, p1, p2] => forced(
                                 [p0.as_slice(), p1.as_slice(), p2.as_slice()],
-                                &packed,
+                                packed,
                                 words,
                                 &row_offsets,
                                 &q,
@@ -1565,6 +1703,76 @@ mod tests {
                             ),
                             _ => {}
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The words' little-endian bytes behind one pad byte, so `[1..]` starts off a word boundary
+    /// of the allocation and the forced tiers read rows the way storage hands them over.
+    fn shifted_le_bytes(words: &[u64]) -> Vec<u8> {
+        std::iter::once(0)
+            .chain(words.iter().flat_map(|word| word.to_le_bytes()))
+            .collect()
+    }
+
+    /// Eight consecutive start offsets cover the aligned address and all seven misaligned ones;
+    /// odd word counts reach the NEON trailing-word read.
+    #[test]
+    fn le_byte_scorers_match_word_scorers_at_every_alignment() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0x554e_414c_4947_4e44);
+        let (rows, row_offsets) = (5, [4, 0, 2, 2, 1]);
+        for d in [64, 65, 768, 1000, 1088] {
+            let words = packed_words(d);
+            let mask = match d % 64 {
+                0 => u64::MAX,
+                tail => (1_u64 << tail) - 1,
+            };
+            let query = random_unit(&mut rng, d);
+            let mut packed = vec![0_u64; rows * words];
+            for word in packed.iter_mut() {
+                *word = rng.next_u64();
+            }
+            for row in packed.chunks_exact_mut(words) {
+                *row.last_mut().unwrap() &= mask;
+            }
+            let encoded: Vec<u8> = packed.iter().flat_map(|word| word.to_le_bytes()).collect();
+            let mut storage = vec![0_u8; encoded.len() + WORD_BYTES];
+            for bq in [1, 3, 4] {
+                let q = prepare_query(&query, bq);
+                let mut want = vec![0.0_f32; rows];
+                estimate_asym_batch_unscaled(&packed, words, &q, &mut want);
+                for offset in 0..WORD_BYTES {
+                    let context = format!("d={d}, bq={bq}, offset={offset}");
+                    storage[offset..offset + encoded.len()].copy_from_slice(&encoded);
+                    let placed = &storage[offset..offset + encoded.len()];
+
+                    let mut contiguous = vec![0.0_f32; rows];
+                    estimate_asym_batch_unscaled_le_bytes(placed, words, &q, &mut contiguous);
+                    let mut indexed = vec![0.0_f32; row_offsets.len()];
+                    estimate_asym_batch_unscaled_indexed_le_bytes(
+                        placed,
+                        words,
+                        &row_offsets,
+                        &q,
+                        &mut indexed,
+                    );
+                    for (row, bytes) in placed.chunks_exact(words * WORD_BYTES).enumerate() {
+                        let single = estimate_asym_unscaled_le_bytes(bytes, &q);
+                        assert_eq!(single.to_bits(), want[row].to_bits(), "single {context}");
+                        assert_eq!(
+                            contiguous[row].to_bits(),
+                            want[row].to_bits(),
+                            "contiguous {context}, row={row}"
+                        );
+                    }
+                    for (i, &row) in row_offsets.iter().enumerate() {
+                        assert_eq!(
+                            indexed[i].to_bits(),
+                            want[row].to_bits(),
+                            "indexed {context}, i={i}"
+                        );
                     }
                 }
             }

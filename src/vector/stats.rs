@@ -19,7 +19,9 @@ use crate::vector::{VectorIoStats, VectorStage};
 /// One quantized layer's instrumentation.
 #[derive(Debug, Default)]
 pub(crate) struct LayerProbeStats {
-    /// Owned-word decoding fallbacks in sign-plane scoring.
+    /// Always zero: sign-plane scoring reads codes in place at any alignment and has no
+    /// owned-word fallback left to count. Still serialized because paradedb and pdbench check
+    /// the Segment Info key set.
     pub(crate) sign_word_fallbacks: u64,
     /// Reads charged to the layer's scan.
     pub(crate) io: VectorIoStats,
@@ -446,7 +448,6 @@ impl ProbeStats {
                     .iter()
                     .enumerate()
                     .map(|(layer, report)| LayerProbeStats {
-                        sign_word_fallbacks: totals.sign_word_fallbacks(layer),
                         io: totals.io(VectorStage::LayerScan(layer as u8)),
                         scored: report.scored,
                         admission_pruned: report.admission_pruned,

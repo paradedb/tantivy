@@ -15,7 +15,7 @@ use crate::vector::search::interval::Estimate;
 use crate::vector::search::scan::bound::TopK;
 use crate::vector::search::scan::layer_read::LayerRead;
 use crate::vector::search::scan::plan::{ExactRule, PlanOverride};
-use crate::vector::search::scan::WHOLE_BAND_ADMISSION_OFF;
+use crate::vector::search::scan::{BEST_ESTIMATES_FIRST_OFF, WHOLE_BAND_ADMISSION_OFF};
 use crate::vector::stats::{AccessPath, LayerProbeStats};
 use crate::vector::test_support::{
     first_segment, ColumnRanges, DocsWeight, Fixture, FixtureSpec, Lcg, ReadLog,
@@ -1158,6 +1158,76 @@ fn whole_band_admission_matches_per_row_admission() -> crate::Result<()> {
     Ok(())
 }
 
+/// Scoring the best estimates exactly before the rest of the shortlist scores no more rows than
+/// scoring the whole shortlist in cluster order, and returns the same hits: on one segment through
+/// the segment scan and the collector, and across segments through the collector, for every
+/// metric.
+#[test]
+fn best_estimates_first_scores_no_more_exact_rows() -> crate::Result<()> {
+    let (dim, clusters, docs, k) = (64, 8, 1600, 10);
+    let mut fewer = 0;
+    for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+        for segments in [1, 3] {
+            let fixture = FixtureSpec::clustered(metric, dim, clusters, docs)
+                .schedule(&[1, 4])
+                .segments(segments)
+                .build()?;
+            let weight = fixture.weight(&AllQuery)?;
+            for seed in 1..=4 {
+                let query = Lcg(seed).vector(dim, 0.5);
+                let oracle = fixture.oracle(&AllQuery, &query, k)?;
+                let in_order = |cluster_order: bool, run: &dyn Fn() -> crate::Result<_>| {
+                    BEST_ESTIMATES_FIRST_OFF.with(|off| off.set(cluster_order));
+                    let result = run();
+                    BEST_ESTIMATES_FIRST_OFF.with(|off| off.set(false));
+                    result
+                };
+                let collect = || -> crate::Result<(Vec<(Score, DocAddress)>, usize)> {
+                    let fruit =
+                        fixture.search(&AllQuery, &query, k, routed_exhaustive_params(clusters))?;
+                    let exact = fruit.stats.iter().map(|stats| stats.exact_rows).sum();
+                    Ok((fruit.results, exact))
+                };
+                let scan = || -> crate::Result<(Vec<(Score, DocAddress)>, usize)> {
+                    let (hits, stats) = fixture.run_planned(
+                        0,
+                        weight.as_ref(),
+                        &query,
+                        k,
+                        routed_exhaustive_params(clusters),
+                        None,
+                        true,
+                    )?;
+                    Ok((hits, stats.exact_rows))
+                };
+                let paths: Vec<(&str, &dyn Fn() -> crate::Result<_>)> = if segments == 1 {
+                    vec![("collector", &collect), ("segment scan", &scan)]
+                } else {
+                    vec![("collector", &collect)]
+                };
+                for (path, run) in paths {
+                    let case = format!("{metric:?} segments={segments} seed={seed} {path}");
+                    let (cluster_hits, cluster_rows) = in_order(true, run)?;
+                    let (best_hits, best_rows) = in_order(false, run)?;
+                    assert!(
+                        best_rows <= cluster_rows,
+                        "{case}: {best_rows} exact rows best first, {cluster_rows} in cluster \
+                         order"
+                    );
+                    fewer += usize::from(best_rows < cluster_rows);
+                    assert_eq!(best_hits, cluster_hits, "{case}");
+                    assert_eq!(best_hits, oracle, "{case}");
+                }
+            }
+        }
+    }
+    assert!(
+        fewer > 0,
+        "scoring the best estimates first never saved an exact row"
+    );
+    Ok(())
+}
+
 // --- Reads ---
 
 const READS_DIM: usize = 64;
@@ -1778,8 +1848,9 @@ fn exact_clusters_never_read_their_band() -> crate::Result<()> {
         let exact_reads = exact_reads.len();
         assert_eq!(stats.exact_io.reads, exact_reads as u64, "{stats:?}");
         assert_eq!(exact_reads > 0, stats.exact_rows > 0, "{stats:?}");
+        // Every survivor is scored exactly or dropped at the exact phase's recheck.
         assert_eq!(
-            stats.exact_rows,
+            stats.exact_rows + stats.exact_recheck_dropped,
             layer0.exact_rows() + layer0.survivors(),
             "{stats:?}"
         );
@@ -2294,17 +2365,18 @@ fn a_doc_in_two_opened_clusters_is_scored_once() -> crate::Result<()> {
     );
     assert_eq!(stats.candidates_scored, 2 * live_docs, "{stats:?}");
     let trace = fixture.doc_trace(&stats.quantized_trace)?;
-    let mut exact = trace.exact_phase_docs.clone();
+    // The exact phase scores the best estimates first, then the rest of the shortlist.
+    let mut exact: Vec<DocId> = trace
+        .refined_docs
+        .iter()
+        .chain(&trace.exact_phase_docs)
+        .copied()
+        .collect();
+    exact.sort_unstable();
+    let scored = exact.len();
     exact.dedup();
-    assert_eq!(
-        exact.len(),
-        trace.exact_phase_docs.len(),
-        "no document scored twice"
-    );
-    assert_eq!(
-        stats.quantized_trace.exact_scores.len(),
-        trace.exact_phase_docs.len()
-    );
+    assert_eq!(exact.len(), scored, "no document scored twice");
+    assert_eq!(stats.quantized_trace.exact_scores.len(), scored);
     assert_eq!(stats.exact_rows, live_docs);
     Ok(())
 }
