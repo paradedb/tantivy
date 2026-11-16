@@ -19,11 +19,16 @@ use crate::{DocId, Result, SegmentReader};
 pub const MIN_POST_FILTER_MATCHES: usize = 50_000;
 
 /// Query-wide filter evaluation, selected before worker assignment.
+///
+/// Pre and Post preserve the existing router bypass: a segment with few enough matches can
+/// look up their vectors directly. Its per-segment `router_bypass_max_matches` comes from
+/// `LocatedPath`, independently of the query-wide [`MIN_POST_FILTER_MATCHES`] threshold.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum VectorFilterStrategy {
     /// Materialize the matches before vector search.
     Pre { uses_fast_fields: bool },
-    /// Filter routed clusters before scoring their vectors.
+    /// Filter routed clusters before scoring their vectors. Flat segments and segments whose
+    /// estimated matches fit the router-bypass limit collect matches upfront instead.
     Post { estimated_selectivity: f64 },
 }
 
@@ -65,7 +70,7 @@ impl VectorFilterStrategy {
 pub(crate) enum FilterMatches {
     /// The router's ranking, gated by the filter.
     Routed(DocFilter),
-    /// The filter's matches, few enough to look up directly: ascending, deleted ones included.
+    /// Bypass the router with these matching doc IDs: ascending, deleted ones included.
     Located(Vec<DocId>),
 }
 
@@ -86,17 +91,17 @@ impl VectorFilterStrategy {
         }
     }
 
-    /// Prepares a segment's filter, deferring Post until routing unless a flat or located scan
-    /// can evaluate it immediately.
+    /// Prepares a segment's filter, deferring Post unless the segment is flat or its estimated
+    /// matches fit `router_bypass_max_matches`. Zero disables the router bypass.
     pub(crate) fn prepare_segment(
         self,
         weight: &dyn Weight,
         segment: &SegmentReader,
         vectors: &VectorIndexReader,
-        located_cap: usize,
+        router_bypass_max_matches: usize,
     ) -> Result<FilterMatches> {
-        let cap = if vectors.index().is_some() {
-            located_cap
+        let router_bypass_max_matches = if vectors.index().is_some() {
+            router_bypass_max_matches
         } else {
             0
         };
@@ -104,13 +109,14 @@ impl VectorFilterStrategy {
             Self::Post {
                 estimated_selectivity,
             } if vectors.index().is_some()
-                && estimated_selectivity * f64::from(segment.max_doc()) > cap as f64 =>
+                && estimated_selectivity * f64::from(segment.max_doc())
+                    > router_bypass_max_matches as f64 =>
             {
                 Ok(FilterMatches::Routed(DocFilter::Pending))
             }
             Self::Pre { .. } | Self::Post { .. } => {
                 let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                Self::collect_pre_matches(weight, segment, cap)
+                Self::collect_pre_matches(weight, segment, router_bypass_max_matches)
             }
         }
     }
