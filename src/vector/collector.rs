@@ -17,7 +17,7 @@ use crate::collector::{
 use crate::index::SegmentReader;
 use crate::query::Weight;
 use crate::schema::{Field, Metric, Schema};
-use crate::vector::filter::{DocFilter, FilterInput, FilterMatches};
+use crate::vector::filter::DocFilter;
 use crate::vector::params::ProbeParams;
 use crate::vector::router::global::GlobalRanking;
 use crate::vector::router::RoutingParams;
@@ -1031,22 +1031,22 @@ where
                 continue;
             };
             let (result, measured) = measure(|| {
-                let FilterMatches::Routed(matches) =
-                    collector.inputs.prepared.filter_strategy.collect_matches(
+                if let Some(matches) = collector
+                    .inputs
+                    .prepared
+                    .filter_strategy
+                    .filter_routed_clusters(
                         weight,
                         &segments[j].reader,
-                        FilterInput::Clusters {
-                            vectors: &vectors[j],
-                            candidates: &mut candidates
-                                .iter()
-                                .copied()
-                                .filter_map(|(i, c)| (i == j).then_some(c)),
-                        },
+                        &vectors[j],
+                        candidates
+                            .iter()
+                            .copied()
+                            .filter_map(|(i, c)| (i == j).then_some(c)),
                     )?
-                else {
-                    unreachable!()
-                };
-                source.set_filter(matches, &segments[j].reader);
+                {
+                    source.set_filter(matches, &segments[j].reader);
+                }
                 Ok::<_, TantivyError>(())
             });
             totals[j].append(&measured);

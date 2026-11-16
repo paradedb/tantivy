@@ -81,20 +81,6 @@ impl VectorFilterStrategy {
     }
 }
 
-pub(crate) enum FilterInput<'a> {
-    Shortlist {
-        candidates: &'a mut Vec<(DocId, BlockAddress)>,
-    },
-    Segment {
-        vectors: &'a VectorIndexReader,
-        located_cap: usize,
-    },
-    Clusters {
-        vectors: &'a VectorIndexReader,
-        candidates: &'a mut dyn Iterator<Item = Candidate>,
-    },
-}
-
 /// Matches collected for the current search stage.
 #[derive(Clone)]
 pub(crate) enum FilterMatches {
@@ -102,10 +88,6 @@ pub(crate) enum FilterMatches {
     Routed(DocFilter),
     /// The filter's matches, few enough to look up directly: ascending, deleted ones included.
     Located(Vec<DocId>),
-    Shortlist {
-        checked: usize,
-        matched: usize,
-    },
 }
 
 impl VectorFilterStrategy {
@@ -125,69 +107,56 @@ impl VectorFilterStrategy {
         }
     }
 
-    /// Collects matches for this strategy at the supplied search stage.
-    /// Pre checks the whole segment; Post waits for routed clusters and checks only their docs.
-    /// Post also checks the whole segment when it is flat or its estimated matches are few
-    /// enough to look up directly.
-    /// Late keeps only the matching docs in the supplied approximate shortlist.
-    pub(crate) fn collect_matches(
+    /// Prepares a segment's filter, deferring Post until routing unless a flat or located scan
+    /// can evaluate it immediately.
+    pub(crate) fn prepare_segment(
         self,
         weight: &dyn Weight,
         segment: &SegmentReader,
-        input: FilterInput<'_>,
+        vectors: &VectorIndexReader,
+        located_cap: usize,
     ) -> Result<FilterMatches> {
-        match input {
-            FilterInput::Shortlist { candidates } => match self {
-                Self::Late { .. } => Self::filter_late_shortlist(weight, segment, candidates),
-                Self::Pre { .. } | Self::Post { .. } => {
-                    unreachable!("only Late filters the shortlist")
+        let cap = if vectors.index().is_some() {
+            located_cap
+        } else {
+            0
+        };
+        match self {
+            Self::Late { .. } => {
+                if vectors.index().is_some() && vectors.quantization()?.is_none() {
+                    return Err(TantivyError::InvalidArgument(
+                        "late filtering requires quantized IVF segments".into(),
+                    ));
                 }
-            },
-            FilterInput::Segment {
-                vectors,
-                located_cap,
-            } => {
-                let cap = if vectors.index().is_some() {
-                    located_cap
-                } else {
-                    0
-                };
-                match self {
-                    Self::Late { .. } => {
-                        if vectors.index().is_some() && vectors.quantization()?.is_none() {
-                            return Err(TantivyError::InvalidArgument(
-                                "late filtering requires quantized IVF segments".into(),
-                            ));
-                        }
-                        Ok(FilterMatches::Routed(DocFilter::Late))
-                    }
-                    Self::Post {
-                        estimated_selectivity,
-                    } if vectors.index().is_some()
-                        && estimated_selectivity * f64::from(segment.max_doc()) > cap as f64 =>
-                    {
-                        Ok(FilterMatches::Routed(DocFilter::Pending))
-                    }
-                    Self::Pre { .. } | Self::Post { .. } => {
-                        let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                        Self::collect_pre_matches(weight, segment, cap)
-                    }
-                }
+                Ok(FilterMatches::Routed(DocFilter::Late))
             }
-            FilterInput::Clusters {
-                vectors,
-                candidates,
-            } => {
-                let filter = match self {
-                    Self::Pre { .. } | Self::Late { .. } => {
-                        unreachable!("only Post filters routed clusters")
-                    }
-                    Self::Post { .. } => {
-                        let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                        Self::filter_post_clusters(vectors, weight, segment, candidates)?
-                    }
-                };
-                Ok(FilterMatches::Routed(filter))
+            Self::Post {
+                estimated_selectivity,
+            } if vectors.index().is_some()
+                && estimated_selectivity * f64::from(segment.max_doc()) > cap as f64 =>
+            {
+                Ok(FilterMatches::Routed(DocFilter::Pending))
+            }
+            Self::Pre { .. } | Self::Post { .. } => {
+                let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
+                Self::collect_pre_matches(weight, segment, cap)
+            }
+        }
+    }
+
+    /// Resolves Post's filter from routed candidates. Other strategies keep their prepared filter.
+    pub(crate) fn filter_routed_clusters(
+        self,
+        weight: &dyn Weight,
+        segment: &SegmentReader,
+        vectors: &VectorIndexReader,
+        candidates: impl Iterator<Item = Candidate>,
+    ) -> Result<Option<DocFilter>> {
+        match self {
+            Self::Pre { .. } | Self::Late { .. } => Ok(None),
+            Self::Post { .. } => {
+                let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
+                Self::filter_post_clusters(vectors, weight, segment, candidates).map(Some)
             }
         }
     }
@@ -205,11 +174,16 @@ impl VectorFilterStrategy {
         .ceil() as usize
     }
 
-    fn filter_late_shortlist(
+    /// Filters Late's shortlist and returns the number of candidates checked and retained.
+    pub(crate) fn filter_shortlist(
+        self,
         weight: &dyn Weight,
         segment: &SegmentReader,
         candidates: &mut Vec<(DocId, BlockAddress)>,
-    ) -> Result<FilterMatches> {
+    ) -> Result<(usize, usize)> {
+        if !matches!(self, Self::Late { .. }) {
+            return Ok((0, candidates.len()));
+        }
         let checked = candidates.len();
         {
             let _sort = enter_vector_stage(VectorStage::LateFilterSort);
@@ -227,10 +201,7 @@ impl VectorFilterStrategy {
             let _predicate = enter_vector_stage(VectorStage::LateFilterPredicate);
             candidates.retain(|&(doc, _)| scorer.contains(doc));
         }
-        Ok(FilterMatches::Shortlist {
-            checked,
-            matched: candidates.len(),
-        })
+        Ok((checked, candidates.len()))
     }
 
     /// Iterates over matching doc ids in a flat segment, skipping deletions.

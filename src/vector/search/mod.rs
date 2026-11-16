@@ -19,7 +19,7 @@ use crate::collector::{
 };
 use crate::query::Weight;
 use crate::schema::Field;
-use crate::vector::filter::{DocFilter, FilterInput, FilterMatches};
+use crate::vector::filter::DocFilter;
 use crate::vector::params::ProbeParams;
 use crate::vector::router::global::GlobalRanking;
 use crate::vector::router::{RouterIter, RoutingParams};
@@ -151,19 +151,18 @@ impl<T: VectorElement> SegmentSearcher<T> {
             return Ok(());
         }
         if let Some(ScanInput::Routed { filter, .. }) = &mut self.segment.scan {
-            let FilterMatches::Routed(matches) =
-                self.probe_params.filter_strategy()?.collect_matches(
+            if let Some(matches) = self
+                .probe_params
+                .filter_strategy()?
+                .filter_routed_clusters(
                     weight,
                     &self.segment.reader,
-                    FilterInput::Clusters {
-                        vectors: &self.reader,
-                        candidates: &mut self.ranked.iter().copied(),
-                    },
+                    &self.reader,
+                    self.ranked.iter().copied(),
                 )?
-            else {
-                unreachable!()
-            };
-            *filter = matches;
+            {
+                *filter = matches;
+            }
         }
         Ok(())
     }

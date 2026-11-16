@@ -36,7 +36,7 @@ use crate::error::DataCorruption;
 use crate::query::Weight;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
-use crate::vector::filter::{FilterInput, FilterMatches, MAX_LATE_FILTER_BATCH_SIZE};
+use crate::vector::filter::MAX_LATE_FILTER_BATCH_SIZE;
 use crate::vector::router::candidate::Candidate as RankedCandidate;
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
 use crate::vector::search::interval::{Estimate, Threshold, UpperEndpoint};
@@ -1138,16 +1138,7 @@ where
                     break;
                 }
                 self.report.filter_batches += 1;
-                let FilterMatches::Shortlist { checked, matched } = strategy.collect_matches(
-                    weight,
-                    reader,
-                    FilterInput::Shortlist {
-                        candidates: &mut indexed,
-                    },
-                )?
-                else {
-                    unreachable!()
-                };
+                let (checked, matched) = strategy.filter_shortlist(weight, reader, &mut indexed)?;
                 self.report.filter_checks += checked;
                 self.report.filter_matches += matched;
                 self.report.exact_rows +=
