@@ -36,6 +36,7 @@ use crate::vector::distance::Similarity;
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
 use crate::vector::search::interval::{Estimate, Threshold, UpperEndpoint};
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery};
+use crate::vector::search::source::controller::WorkMeter;
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::quantized::{
     QuantizedClusterReader, QuantizedFieldReader, ReadScratch,
@@ -54,6 +55,46 @@ thread_local! {
     /// Scores mostly unseen replicated clusters row by row on this thread, so tests can compare
     /// that path with the whole-band one.
     pub(crate) static WHOLE_BAND_ADMISSION_OFF: Cell<bool> = const { Cell::new(false) };
+    /// Scores the narrowed shortlist in cluster order without first scoring the best estimates,
+    /// on this thread, so tests can compare the two exact-phase orders.
+    pub(crate) static BEST_ESTIMATES_FIRST_OFF: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the exact phase scores the best `top_n` estimates before the rest of the shortlist:
+/// with the top-k filled by the likeliest hits first, the threshold is at its tightest when the
+/// remaining survivors are rechecked, so fewer of them are read and scored.
+pub(crate) fn best_estimates_first() -> bool {
+    #[cfg(test)]
+    if BEST_ESTIMATES_FIRST_OFF.with(Cell::get) {
+        return false;
+    }
+    true
+}
+
+/// The `limit` candidates with the best estimates across `scans`, ties broken by address.
+pub(crate) fn best_estimates<'s, 'a: 's, T, K, C>(
+    scans: impl IntoIterator<Item = &'s SegmentScan<'a, T, K, C>>,
+    limit: usize,
+) -> Vec<Candidate>
+where
+    T: VectorElement,
+    K: SegmentSortKeyComputer + 's,
+    C: Comparator<K::SegmentSortKey> + 's,
+{
+    let mut candidates: Vec<_> = scans
+        .into_iter()
+        .flat_map(|scan| scan.refinement_candidates(limit))
+        .collect();
+    if candidates.len() > limit {
+        candidates.select_nth_unstable_by(limit, |a, b| {
+            b.bound
+                .estimate()
+                .total_cmp(&a.bound.estimate())
+                .then_with(|| a.address.cmp(&b.address))
+        });
+        candidates.truncate(limit);
+    }
+    candidates
 }
 
 /// Sizes for one segment scan.
@@ -579,17 +620,29 @@ fn scores_whole_band(rows: &ClusterRows<'_>, handed: &ClusterRows<'_>, read: Lay
 
 // --- Segment scan ---
 
-/// The admission-rate measurement, armed by the segment plan when the RateAPS is on.
+/// A routed scan's progress across clusters: the schedule of the refinements that tighten the
+/// pruning threshold during probing and, when the RateAPS is on, the admission-rate measurement.
 #[derive(Default)]
 pub(crate) struct RateApsState {
+    /// Whether survival scores are measured; off, only the refinement schedule is kept.
+    measures_admission: bool,
     /// Survival scores seen before the fill; they size the grid and nothing else.
     prefill: Vec<f32>,
     rows: usize,
     histograms: Option<AdmissionHistograms>,
+    /// The row count the next refinement is due at; zero until the pruning threshold exists.
     next_refinement: usize,
 }
 
 impl RateApsState {
+    /// The refinement schedule, with the admission-rate measurement when `measures_admission`.
+    pub(crate) fn new(measures_admission: bool) -> Self {
+        Self {
+            measures_admission,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn refinement_due(&mut self) -> bool {
         if self.next_refinement == 0 || self.rows < self.next_refinement {
             return false;
@@ -674,9 +727,12 @@ where
     unseen_docs: Vec<DocId>,
     /// The candidate blocks by cluster id, which is row order; set when the shortlist closes.
     by_cluster: Vec<usize>,
-    /// The admission-rate measurement; `None` unless the RateAPS is on.
+    /// The refinement schedule and admission-rate measurement. The scan's own is `None` unless the
+    /// RateAPS is on; a global search swaps in the one its segments share.
     rate: Option<RateApsState>,
     recall_fraction: Option<f64>,
+    /// The hits the scan returns; the exact phase scores this many best estimates first.
+    top_n: usize,
     report: ScanReport,
 }
 
@@ -737,7 +793,8 @@ where
             unseen_docs: Vec::new(),
             by_cluster: Vec::new(),
             recall_fraction,
-            rate: recall_fraction.map(|_| RateApsState::default()),
+            rate: recall_fraction.map(|_| RateApsState::new(true)),
+            top_n: config.top_n,
             report: ScanReport {
                 layers: vec![LayerReport::default(); layers],
                 ..ScanReport::default()
@@ -750,25 +807,30 @@ where
     }
 
     /// Scores one segment: shortlists each cluster `source` supplies, narrows the shortlist one
-    /// quantized layer at a time, then scores what is left exactly.
+    /// quantized layer at a time, then scores what is left exactly, the best estimates first.
     pub(crate) fn run(&mut self, source: &mut impl ClusterSource) -> crate::Result<()> {
         let stage = enter_vector_stage(self.shortlist_stage());
         while let Some(rows) = source.next()? {
             let scored = self.shortlist(&rows)?;
             source.admitted(scored)?;
-            if self.recall_reached() {
+            if self.recall_reached(source.work_meter()) {
                 break;
             }
         }
         drop(stage);
-        self.refine_shortlist()
+        self.narrow_shortlist()?;
+        if best_estimates_first() {
+            let best = self.refinement_candidates(self.top_n);
+            self.refine_topk(&best)?;
+        }
+        self.score_shortlist()
     }
 
     pub(crate) fn swap_rate(&mut self, rate: &mut Option<RateApsState>) {
         std::mem::swap(&mut self.rate, rate);
     }
 
-    pub(crate) fn recall_reached(&mut self) -> bool {
+    pub(crate) fn recall_reached(&mut self, meter: &mut WorkMeter) -> bool {
         let reached = self
             .recall_fraction
             .zip(self.bound.shared_threshold())
@@ -781,16 +843,19 @@ where
                     .map(|reading| reading.reached(fraction))
             })
             .unwrap_or(false);
+        let reached = meter.adaptive_stop(reached);
         self.report.recall_reached |= reached;
         reached
     }
 
-    pub(crate) fn refine_shortlist(&mut self) -> crate::Result<()> {
+    /// Prunes the shortlist at layer 0's boundary, then refines and prunes it with each later
+    /// quantized layer. What survives is scored by [`Self::score_shortlist`].
+    pub(crate) fn narrow_shortlist(&mut self) -> crate::Result<()> {
         self.close_shortlist();
         for layer in self.refining_layers() {
             self.narrow(layer)?;
         }
-        self.score_shortlist()
+        Ok(())
     }
 
     pub(crate) fn refinement_candidates(&self, limit: usize) -> Vec<Candidate> {
@@ -827,22 +892,33 @@ where
         }
         rows.sort_unstable();
         state.candidates.order_by_cluster(&mut self.by_cluster);
+        let mut offsets = Vec::new();
+        let mut docs = Vec::new();
+        // The rest of a refined cluster is scored later; its DocIds column is kept for that pass.
+        self.exact.keep_doc_ids(true);
         for &b in &self.by_cluster {
             let group = state.candidates.rows(b);
-            let offsets: Vec<_> = rows
-                .iter()
-                .filter(|row| {
-                    row.block as usize == group.cluster && group.rows.contains(&(row.row as usize))
-                })
-                .map(|row| row.row - group.rows.start as u32)
-                .filter(|offset| group.offsets.unwrap().binary_search(offset).is_ok())
-                .collect();
+            let group_offsets = group.offsets.unwrap();
+            // The selected rows' doc ids come with them when the block holds its candidates'.
+            offsets.clear();
+            docs.clear();
+            for row in rows.iter().filter(|row| {
+                row.block as usize == group.cluster && group.rows.contains(&(row.row as usize))
+            }) {
+                let offset = row.row - group.rows.start as u32;
+                if let Ok(at) = group_offsets.binary_search(&offset) {
+                    offsets.push(offset);
+                    if let Some(group_docs) = group.docs {
+                        docs.push(group_docs[at]);
+                    }
+                }
+            }
             if offsets.is_empty() {
                 continue;
             }
             let selected = ClusterRows {
                 offsets: Some(&offsets),
-                docs: None,
+                docs: group.docs.map(|_| docs.as_slice()),
                 ..group
             };
             let scored = self
@@ -857,6 +933,7 @@ where
             );
             state.candidates.remove_rows(b, &offsets);
         }
+        self.exact.keep_doc_ids(false);
         Ok(())
     }
 
@@ -922,13 +999,17 @@ where
             if self.quantized.is_some() {
                 self.report.layers[0].count(read, selected.len());
             }
-            let fold = self.rate.as_mut().map(|rate| match &mut rate.histograms {
-                None => Fold::Prefill(&mut rate.prefill),
-                Some(histograms) => {
-                    let grid = histograms.grid();
-                    Fold::Binned(histograms.cluster_mut(), grid)
-                }
-            });
+            let fold = self
+                .rate
+                .as_mut()
+                .filter(|rate| rate.measures_admission)
+                .map(|rate| match &mut rate.histograms {
+                    None => Fold::Prefill(&mut rate.prefill),
+                    Some(histograms) => {
+                        let grid = histograms.grid();
+                        Fold::Binned(histograms.cluster_mut(), grid)
+                    }
+                });
             match read {
                 Read::Exact => {
                     self.report.exact_rows +=
@@ -955,23 +1036,29 @@ where
         Ok(len)
     }
 
-    /// Ends the admission-rate measurement's cluster of `len` rows. Once the shared pruning
-    /// threshold exists, the grid is set from it and every survival score so far.
+    /// Ends a cluster of `len` rows for the refinement schedule and the admission-rate
+    /// measurement. Once the shared pruning threshold exists, the first refinement is scheduled
+    /// and, when admission is measured, the grid is set from it and every survival score so far.
     fn close_rate_cluster(&mut self, len: usize) {
         let Some(rate) = &mut self.rate else {
             return;
         };
         rate.rows += len;
-        match &mut rate.histograms {
-            Some(histograms) => histograms.finish_cluster(len),
-            None => {
-                if let Some(bar) = self.bound.shared_threshold() {
-                    let w0 = rate.rows;
-                    rate.histograms = Some(AdmissionHistograms::at_fill(bar, &rate.prefill, w0));
-                    rate.next_refinement = w0.saturating_mul(2);
-                    rate.prefill = Vec::new();
-                }
-            }
+        if let Some(histograms) = &mut rate.histograms {
+            histograms.finish_cluster(len);
+            return;
+        }
+        if rate.next_refinement > 0 {
+            return;
+        }
+        let Some(bar) = self.bound.shared_threshold() else {
+            return;
+        };
+        let w0 = rate.rows;
+        rate.next_refinement = w0.saturating_mul(2);
+        if rate.measures_admission {
+            rate.histograms = Some(AdmissionHistograms::at_fill(bar, &rate.prefill, w0));
+            rate.prefill = Vec::new();
         }
     }
 
@@ -1010,7 +1097,7 @@ where
 
     /// Scores the last boundary's survivors exactly, one block at a time in cluster order, after
     /// dropping each block's candidates the pruning threshold has risen past.
-    fn score_shortlist(&mut self) -> crate::Result<()> {
+    pub(crate) fn score_shortlist(&mut self) -> crate::Result<()> {
         let Some(state) = &mut self.quantized else {
             return Ok(());
         };

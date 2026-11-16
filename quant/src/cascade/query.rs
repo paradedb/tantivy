@@ -1,8 +1,6 @@
 //! Query preparation and scoring: the rotation plan, full-precision and split-form queries, and
 //! the per-layer kernels they dispatch to.
 
-use std::borrow::Cow;
-
 use super::encode::Encoded;
 use super::{aligned_le_words, validate, validate_specs, LayerKind, LayerSpec, Rotation};
 use crate::grid::{
@@ -14,10 +12,10 @@ use crate::grid::{
 use crate::model::Grid;
 use crate::rotation::Rotation as FhtRotation;
 use crate::sign::{
-    estimate_asym_batch_unscaled as estimate_sign_batch,
-    estimate_asym_batch_unscaled_indexed as estimate_sign_batch_indexed,
-    estimate_asym_unscaled as estimate_sign_asym, estimate_fp_unscaled as estimate_sign_fp,
-    prepare_query, unpack as unpack_sign, QueryPlanes,
+    estimate_asym_batch_unscaled_indexed_le_bytes as estimate_sign_batch_indexed,
+    estimate_asym_batch_unscaled_le_bytes as estimate_sign_batch,
+    estimate_asym_unscaled_le_bytes as estimate_sign_asym,
+    estimate_fp_unscaled as estimate_sign_fp, prepare_query, unpack as unpack_sign, QueryPlanes,
 };
 
 #[derive(Clone, Debug)]
@@ -230,8 +228,7 @@ impl PreparedSplitQuery {
         match &self.layers[layer] {
             PreparedSplitLayer::Sign(query) => {
                 assert_eq!(spec.bits, 1);
-                let words = aligned_le_words(codes);
-                scale * estimate_sign_asym(words.as_ref(), query)
+                scale * estimate_sign_asym(codes, query)
             }
             PreparedSplitLayer::Grid { lut, .. } => {
                 assert!(spec.bits > 1);
@@ -240,8 +237,8 @@ impl PreparedSplitQuery {
         }
     }
 
-    /// Scores a contiguous batch without scales or constants. Returns its sign-word fallbacks: 1
-    /// when sign codes aren't `u64`-aligned and are decoded into owned words, else 0.
+    /// Scores a contiguous batch without scales or constants. Sign codes are read in place at any
+    /// alignment.
     ///
     /// # Panics
     ///
@@ -254,20 +251,13 @@ impl PreparedSplitQuery {
         code_stride: usize,
         spec: LayerSpec,
         out: &mut [f32],
-    ) -> u64 {
+    ) {
         assert_eq!(codes.len(), out.len() * code_stride);
         match &self.layers[layer] {
             PreparedSplitLayer::Sign(query) => {
                 assert_eq!(spec.bits, 1);
                 assert_eq!(code_stride % std::mem::size_of::<u64>(), 0);
-                let words = aligned_le_words(codes);
-                estimate_sign_batch(
-                    words.as_ref(),
-                    code_stride / std::mem::size_of::<u64>(),
-                    query,
-                    out,
-                );
-                u64::from(matches!(words, Cow::Owned(_)))
+                estimate_sign_batch(codes, code_stride / std::mem::size_of::<u64>(), query, out);
             }
             PreparedSplitLayer::Grid { lut, packed_lut_4 } => {
                 assert!(spec.bits > 1);
@@ -276,13 +266,12 @@ impl PreparedSplitQuery {
                 } else {
                     score_grid_batch(codes, code_stride, lut, self.d, spec.bits, out);
                 }
-                0
             }
         }
     }
 
-    /// Scores selected rows without scales or constants. Returns its sign-word fallbacks, as
-    /// [`Self::score_layer_batch_unscaled`] does.
+    /// Scores selected rows without scales or constants. Sign codes are read in place at any
+    /// alignment.
     ///
     /// # Panics
     ///
@@ -296,21 +285,19 @@ impl PreparedSplitQuery {
         row_offsets: &[usize],
         spec: LayerSpec,
         out: &mut [f32],
-    ) -> u64 {
+    ) {
         assert_eq!(row_offsets.len(), out.len());
         match &self.layers[layer] {
             PreparedSplitLayer::Sign(query) => {
                 assert_eq!(spec.bits, 1);
                 assert_eq!(code_stride % std::mem::size_of::<u64>(), 0);
-                let words = aligned_le_words(codes);
                 estimate_sign_batch_indexed(
-                    words.as_ref(),
+                    codes,
                     code_stride / std::mem::size_of::<u64>(),
                     row_offsets,
                     query,
                     out,
                 );
-                u64::from(matches!(words, Cow::Owned(_)))
             }
             PreparedSplitLayer::Grid {
                 packed_lut_4: Some(packed_lut_4),
@@ -325,7 +312,6 @@ impl PreparedSplitQuery {
                     self.d,
                     out,
                 );
-                0
             }
             PreparedSplitLayer::Grid {
                 lut,
@@ -341,7 +327,6 @@ impl PreparedSplitQuery {
                     spec.bits,
                     out,
                 );
-                0
             }
         }
     }
@@ -716,9 +701,9 @@ mod tests {
         assert!((layered - direct).abs() < 2e-4, "{layered} != {direct}");
     }
 
-    /// Unaligned sign codes are decoded into owned words and counted; aligned ones are borrowed.
+    /// Sign codes score identically from every start offset of a word, aligned or not.
     #[test]
-    fn batch_scoring_returns_sign_word_fallbacks() {
+    fn sign_scoring_reads_codes_at_any_alignment() {
         let d = 128;
         let spec = LayerSpec {
             kind: LayerKind::Sign,
@@ -735,18 +720,14 @@ mod tests {
         let codes: Vec<u8> = (0..rows * stride).map(|i| (i * 37 % 251) as u8).collect();
         let mut storage = vec![0_u8; codes.len() + 8];
         let mut scores = Vec::new();
-        for aligned in [true, false] {
-            let offset = (0..8)
-                .find(|offset| ((storage.as_ptr() as usize + offset) % 8 == 0) == aligned)
-                .expect("eight consecutive offsets hold both aligned and unaligned starts");
+        // Eight consecutive offsets hold the aligned start and all seven unaligned ones.
+        for offset in 0..8 {
             storage[offset..offset + codes.len()].copy_from_slice(&codes);
             let placed = &storage[offset..offset + codes.len()];
             let mut dense = vec![0.0; rows];
-            let fallbacks =
-                prepared.score_layer_batch_unscaled(0, placed, stride, spec, &mut dense);
-            assert_eq!(fallbacks, u64::from(!aligned));
+            prepared.score_layer_batch_unscaled(0, placed, stride, spec, &mut dense);
             let mut indexed = vec![0.0; 2];
-            let fallbacks = prepared.score_layer_batch_unscaled_indexed(
+            prepared.score_layer_batch_unscaled_indexed(
                 0,
                 placed,
                 stride,
@@ -754,11 +735,16 @@ mod tests {
                 spec,
                 &mut indexed,
             );
-            assert_eq!(fallbacks, u64::from(!aligned));
             assert_eq!(indexed, [dense[0], dense[2]]);
+            for (row, code) in placed.chunks_exact(stride).enumerate() {
+                assert_eq!(
+                    prepared.score_layer_without_constant(0, code, 1.0, spec),
+                    dense[row]
+                );
+            }
             scores.push(dense);
         }
-        assert_eq!(scores[0], scores[1]);
+        assert!(scores.iter().all(|dense| dense == &scores[0]));
     }
 
     #[test]

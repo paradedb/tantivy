@@ -110,6 +110,10 @@ impl<'a> MatchClusters<'a> {
 }
 
 impl ClusterSource for MatchClusters<'_> {
+    fn work_meter(&mut self) -> &mut WorkMeter {
+        &mut self.meter
+    }
+
     fn next(&mut self) -> crate::Result<Option<ClusterRows<'_>>> {
         let Some((cluster, positions)) = self.clusters.get(self.next).cloned() else {
             return Ok(None);

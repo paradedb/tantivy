@@ -6,7 +6,7 @@ use std::collections::BinaryHeap;
 use super::arena::VectorArena;
 use super::candidate::Candidate;
 #[cfg(test)]
-use super::scoring::score_initial;
+use super::scoring::{score_initial, RouterQueries};
 use super::source::VectorSource;
 use super::stacked::levels::{ClusterId, StackedIvf, StackedSearchStats};
 use crate::vector::distance::Similarity;
@@ -111,6 +111,7 @@ pub(crate) fn rank_vectors<S: VectorSource, T: VectorElement>(
     let approximate = score_initial(
         source,
         query,
+        &mut RouterQueries::default(),
         0..source.num_vectors(query.widened().len()),
         &mut buffer,
     );
@@ -148,12 +149,14 @@ pub(crate) fn probe_clusters<S: VectorSource, T: VectorElement>(
         return (result, stats);
     }
     let mut buffer = ScoreBuffer::default();
+    let mut queries = RouterQueries::default();
     let mut stop = super::stacked::aps::open();
     for list in lists {
         let (start, end) = level.offsets[usize::from(list.node)];
         let approximate = score_initial(
             &level.vectors,
             query,
+            &mut queries,
             start as usize..end as usize,
             &mut buffer,
         );
