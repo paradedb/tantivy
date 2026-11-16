@@ -435,7 +435,10 @@ mod tests {
     use super::*;
     use crate::collector::{Collector, TopDocs};
     use crate::docset::SeekDangerResult;
-    use crate::query::{ConstScorer, Explanation, Scorer};
+    use crate::query::score_combiner::DoNothingCombiner;
+    use crate::query::{
+        AllQuery, BooleanWeight, ConstScorer, EnableScoring, Explanation, Occur, Query, Scorer,
+    };
     use crate::schema::Metric;
     use crate::vector::test_support::{DocsWeight, FixtureSpec};
     use crate::vector::tests::exhaustive_params;
@@ -447,10 +450,14 @@ mod tests {
     struct ProbeWeight {
         matches: Arc<Vec<DocId>>,
         probes: Arc<Mutex<Vec<DocId>>>,
-        sizes: Mutex<Vec<u32>>,
+        sizes: Arc<Mutex<Vec<u32>>>,
     }
 
     impl Weight for ProbeWeight {
+        fn uses_fast_fields(&self) -> bool {
+            true
+        }
+
         fn scorer(&self, _: &SegmentReader, _: Score) -> Result<Box<dyn Scorer>> {
             panic!("Post must not enumerate the segment's matches")
         }
@@ -561,11 +568,37 @@ mod tests {
                     .build(prepared.with_candidates(routed.clone(), None)?);
                 let expected =
                     pre.merge_fruits(pre.collect_segments(&pre_weight, &segments, |_| {})?)?;
-                for (shared, independent) in [(false, false), (true, false), (false, true)] {
-                    let weight = ProbeWeight {
+                for (shared, independent, wrapped) in [
+                    (false, false, false),
+                    (true, false, false),
+                    (false, true, false),
+                    (false, false, true),
+                    (true, false, true),
+                    (false, true, true),
+                ] {
+                    let probes = Arc::default();
+                    let sizes = Arc::default();
+                    let weight = Box::new(ProbeWeight {
                         matches: Arc::new(matches.clone()),
-                        probes: Arc::default(),
-                        sizes: Mutex::default(),
+                        probes: Arc::clone(&probes),
+                        sizes: Arc::clone(&sizes),
+                    });
+                    let weight: Box<dyn Weight> = if wrapped {
+                        Box::new(BooleanWeight::with_minimum_number_should_match(
+                            vec![
+                                (
+                                    Occur::Must,
+                                    AllQuery
+                                        .weight(EnableScoring::disabled_from_searcher(&searcher))?,
+                                ),
+                                (Occur::Must, weight),
+                            ],
+                            0,
+                            false,
+                            Box::new(DoNothingCombiner::default),
+                        ))
+                    } else {
+                        weight
                     };
                     let post_builder = builder.clone().with_probe_params(ProbeParams {
                         filter_strategy: Some(VectorFilterStrategy::Post {
@@ -573,23 +606,24 @@ mod tests {
                         }),
                         ..params.clone()
                     });
-                    let prepared = post_builder.prepare(&weight, &segments, budget, |_| {})?;
+                    let prepared =
+                        post_builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
                     let work = shared.then(|| {
                         Arc::new(AtomicVectorWork::default()) as Arc<dyn SharedVectorWork>
                     });
                     let post = post_builder.build(prepared.with_candidates(routed.clone(), work)?);
                     let fruits = if independent {
-                        vec![post.collect_segment(&weight, 0, segment)?]
+                        vec![post.collect_segment(weight.as_ref(), 0, segment)?]
                     } else {
-                        post.collect_segments(&weight, &segments, |_| {})?
+                        post.collect_segments(weight.as_ref(), &segments, |_| {})?
                     };
                     let actual = post.merge_fruits(fruits)?;
                     assert_eq!(
                         actual.results, expected.results,
-                        "shared={shared}, independent={independent}"
+                        "shared={shared}, independent={independent}, wrapped={wrapped}"
                     );
-                    assert_eq!(*weight.probes.lock().unwrap(), expected_probes);
-                    let sizes = weight.sizes.lock().unwrap();
+                    assert_eq!(*probes.lock().unwrap(), expected_probes);
+                    let sizes = sizes.lock().unwrap();
                     if expected_probes.is_empty() {
                         assert!(sizes.is_empty());
                     } else {

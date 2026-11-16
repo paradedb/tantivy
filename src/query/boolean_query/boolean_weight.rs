@@ -851,6 +851,29 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                 return weight.scorer_for_candidates_unpositioned(reader, boost, candidate_size);
             }
         }
+        if !self.scoring_enabled
+            && self.minimum_number_should_match == 0
+            && self.weights.iter().all(|(occur, _)| *occur == Occur::Must)
+        {
+            let mut fast_fields = self
+                .weights
+                .iter()
+                .filter(|(_, weight)| weight.uses_fast_fields());
+            if let (Some((_, candidate_weight)), None) = (fast_fields.next(), fast_fields.next()) {
+                for (_, weight) in &self.weights {
+                    if !weight.uses_fast_fields()
+                        && !weight.scorer(reader, boost)?.is::<AllScorer>()
+                    {
+                        return self.scorer(reader, boost);
+                    }
+                }
+                return candidate_weight.scorer_for_candidates_unpositioned(
+                    reader,
+                    boost,
+                    candidate_size,
+                );
+            }
+        }
         self.scorer(reader, boost)
     }
 
@@ -1421,9 +1444,99 @@ fn is_include_occur(occur: Occur) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Bound;
+
     use super::BooleanWeight;
-    use crate::query::{Bm25Weight, DisjunctionPruning, SumCombiner, TermScorer};
-    use crate::Bm25Params;
+    use crate::query::{
+        AllQuery, Bm25Weight, BooleanQuery, DisjunctionPruning, EnableScoring, ExcludedDocSet,
+        ExclusionSet, Occur, Query, RangeQuery, SumCombiner, TermQuery, TermScorer,
+    };
+    use crate::schema::{IndexRecordOption, Schema, FAST, TEXT};
+    use crate::{Bm25Params, Index, Term, TERMINATED};
+
+    #[test]
+    fn candidate_scorer_preserves_boolean_matches_and_scores() -> crate::Result<()> {
+        const DOCUMENTS: u64 = 16;
+        let mut schema = Schema::builder();
+        let value = schema.add_u64_field("value", FAST);
+        let text = schema.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer = index.writer_for_tests()?;
+        for doc in 0..DOCUMENTS {
+            writer.add_document(
+                doc!(value => doc, text => if doc % 2 == 0 { "even" } else { "odd" }),
+            )?;
+        }
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let reader = searcher.segment_reader(0);
+        let range = || -> Box<dyn Query> {
+            Box::new(RangeQuery::new(
+                Bound::Included(Term::from_field_u64(value, 4)),
+                Bound::Excluded(Term::from_field_u64(value, 12)),
+            ))
+        };
+        let term = || -> Box<dyn Query> {
+            Box::new(TermQuery::new(
+                Term::from_field_text(text, "even"),
+                IndexRecordOption::Basic,
+            ))
+        };
+        let queries = [
+            BooleanQuery::new(vec![
+                (Occur::Must, Box::new(AllQuery)),
+                (Occur::Must, range()),
+            ]),
+            BooleanQuery::new(vec![
+                (Occur::Must, range()),
+                (Occur::Must, Box::new(AllQuery)),
+            ]),
+            BooleanQuery::new(vec![(Occur::Must, range()), (Occur::Must, term())]),
+            BooleanQuery::new(vec![(Occur::Must, range()), (Occur::Must, range())]),
+            BooleanQuery::new(vec![(Occur::Must, range()), (Occur::MustNot, term())]),
+            BooleanQuery::new(vec![
+                (Occur::Should, range()),
+                (Occur::Should, Box::new(AllQuery)),
+            ]),
+            BooleanQuery::with_minimum_required_clauses(
+                vec![(Occur::Must, range()), (Occur::Should, term())],
+                1,
+            ),
+            BooleanQuery::with_minimum_required_clauses(
+                vec![(Occur::Must, range()), (Occur::Must, Box::new(AllQuery))],
+                1,
+            ),
+        ];
+        for scoring in [
+            EnableScoring::disabled_from_searcher(&searcher),
+            EnableScoring::enabled_from_searcher(&searcher),
+        ] {
+            for query in &queries {
+                let weight = query.weight(scoring)?;
+                let mut ordinary = weight.scorer(reader, 1.0)?;
+                let mut expected = Vec::new();
+                while ordinary.doc() != TERMINATED {
+                    expected.push((ordinary.doc(), ordinary.score()));
+                    ordinary.advance();
+                }
+                let mut candidates = ExcludedDocSet::new(
+                    weight.scorer_for_candidates_unpositioned(reader, 1.0, reader.max_doc())?,
+                );
+                let actual_docs: Vec<_> = (0..reader.max_doc())
+                    .filter(|&doc| candidates.contains(doc))
+                    .collect();
+                let expected_docs: Vec<_> = expected.iter().map(|&(doc, _)| doc).collect();
+                assert_eq!(actual_docs, expected_docs, "query={query:?}");
+                let mut candidate =
+                    weight.scorer_for_candidates_unpositioned(reader, 1.0, reader.max_doc())?;
+                for (doc, score) in expected {
+                    assert_eq!(candidate.seek(doc), doc, "query={query:?}");
+                    assert_eq!(candidate.score(), score, "query={query:?}");
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn bitmap_combinations_respect_query_setting() -> crate::Result<()> {
