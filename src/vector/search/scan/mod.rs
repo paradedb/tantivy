@@ -877,14 +877,16 @@ where
         }
         rows.sort_unstable();
         state.candidates.order_by_cluster(&mut self.by_cluster);
+        let mut offsets = Vec::new();
+        let mut docs = Vec::new();
         // The rest of a refined cluster is scored later; its DocIds column is kept for that pass.
         self.exact.keep_doc_ids(true);
         for &b in &self.by_cluster {
             let group = state.candidates.rows(b);
             let group_offsets = group.offsets.unwrap();
             // The selected rows' doc ids come with them when the block holds its candidates'.
-            let mut offsets = Vec::new();
-            let mut docs = Vec::new();
+            offsets.clear();
+            docs.clear();
             for row in rows.iter().filter(|row| {
                 row.block as usize == group.cluster && group.rows.contains(&(row.row as usize))
             }) {
