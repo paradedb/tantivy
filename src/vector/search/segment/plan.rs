@@ -69,7 +69,7 @@ mod tests {
     use super::*;
     use crate::query::{AllQuery, BooleanQuery, Occur, Query};
     use crate::schema::Metric;
-    use crate::vector::filter::{FilterInput, FilterMatches};
+    use crate::vector::filter::FilterMatches;
     use crate::vector::params::{ProbeParams, Selectivity};
     use crate::vector::stats::AccessPath;
     use crate::vector::test_support::{first_segment, DocsWeight, FixtureSpec};
@@ -229,14 +229,7 @@ mod tests {
             let source = VectorFilterStrategy::Pre {
                 uses_fast_fields: false,
             }
-            .collect_matches(
-                &every_doc,
-                segment,
-                FilterInput::Segment {
-                    vectors: &vectors,
-                    located_cap: cap,
-                },
-            )?;
+            .prepare_segment(&every_doc, segment, &vectors, cap)?;
             assert!(
                 matches!(source, FilterMatches::Routed(DocFilter::All)),
                 "cap {cap}"

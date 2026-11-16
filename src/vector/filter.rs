@@ -60,17 +60,6 @@ impl VectorFilterStrategy {
     }
 }
 
-pub(crate) enum FilterInput<'a> {
-    Segment {
-        vectors: &'a VectorIndexReader,
-        located_cap: usize,
-    },
-    Clusters {
-        vectors: &'a VectorIndexReader,
-        candidates: &'a mut dyn Iterator<Item = Candidate>,
-    },
-}
-
 /// Matches collected for the current search stage.
 #[derive(Clone)]
 pub(crate) enum FilterMatches {
@@ -97,52 +86,48 @@ impl VectorFilterStrategy {
         }
     }
 
-    /// Collects matches for this strategy at the supplied search stage.
-    /// Pre checks the whole segment; Post waits for routed clusters and checks only their docs.
-    /// Post also checks the whole segment when it is flat or its estimated matches are few
-    /// enough to look up directly.
-    pub(crate) fn collect_matches(
+    /// Prepares a segment's filter, deferring Post until routing unless a flat or located scan
+    /// can evaluate it immediately.
+    pub(crate) fn prepare_segment(
         self,
         weight: &dyn Weight,
         segment: &SegmentReader,
-        input: FilterInput<'_>,
+        vectors: &VectorIndexReader,
+        located_cap: usize,
     ) -> Result<FilterMatches> {
-        match input {
-            FilterInput::Segment {
-                vectors,
-                located_cap,
-            } => {
-                let cap = if vectors.index().is_some() {
-                    located_cap
-                } else {
-                    0
-                };
-                match self {
-                    Self::Post {
-                        estimated_selectivity,
-                    } if vectors.index().is_some()
-                        && estimated_selectivity * f64::from(segment.max_doc()) > cap as f64 =>
-                    {
-                        Ok(FilterMatches::Routed(DocFilter::Pending))
-                    }
-                    Self::Pre { .. } | Self::Post { .. } => {
-                        let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                        Self::collect_pre_matches(weight, segment, cap)
-                    }
-                }
+        let cap = if vectors.index().is_some() {
+            located_cap
+        } else {
+            0
+        };
+        match self {
+            Self::Post {
+                estimated_selectivity,
+            } if vectors.index().is_some()
+                && estimated_selectivity * f64::from(segment.max_doc()) > cap as f64 =>
+            {
+                Ok(FilterMatches::Routed(DocFilter::Pending))
             }
-            FilterInput::Clusters {
-                vectors,
-                candidates,
-            } => {
-                let filter = match self {
-                    Self::Pre { .. } => unreachable!("Pre collects matches before routing"),
-                    Self::Post { .. } => {
-                        let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                        Self::filter_post_clusters(vectors, weight, segment, candidates)?
-                    }
-                };
-                Ok(FilterMatches::Routed(filter))
+            Self::Pre { .. } | Self::Post { .. } => {
+                let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
+                Self::collect_pre_matches(weight, segment, cap)
+            }
+        }
+    }
+
+    /// Resolves Post's filter from routed candidates. Other strategies keep their prepared filter.
+    pub(crate) fn filter_routed_clusters(
+        self,
+        weight: &dyn Weight,
+        segment: &SegmentReader,
+        vectors: &VectorIndexReader,
+        candidates: impl Iterator<Item = Candidate>,
+    ) -> Result<Option<DocFilter>> {
+        match self {
+            Self::Pre { .. } => Ok(None),
+            Self::Post { .. } => {
+                let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
+                Self::filter_post_clusters(vectors, weight, segment, candidates).map(Some)
             }
         }
     }

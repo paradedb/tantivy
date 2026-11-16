@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::index::{SegmentId, SegmentReader};
 use crate::query::Weight;
 use crate::schema::Field;
-use crate::vector::filter::{FilterInput, FilterMatches};
+use crate::vector::filter::FilterMatches;
 use crate::vector::router::candidate::Candidate;
 use crate::vector::search::segment::plan::{located_cap, PlanReport, ScanInput};
 use crate::vector::search::source::controller::{SharedVectorWork, WorkBudget, WorkUnits};
@@ -147,13 +147,11 @@ impl PreparedVectorSearch {
                             planned_clusters: 0,
                             located_cap: cap,
                         };
-                        let source = filter_strategy.collect_matches(
+                        let source = filter_strategy.prepare_segment(
                             weight,
                             &segment.reader,
-                            FilterInput::Segment {
-                                vectors: &vectors,
-                                located_cap: cap,
-                            },
+                            &vectors,
+                            cap,
                         )?;
                         let scan = match source {
                             FilterMatches::Routed(filter) if !filter.is_empty() => {
@@ -177,14 +175,8 @@ impl PreparedVectorSearch {
                 } else if top_n == 0 || max_doc == 0 {
                     (None, 0)
                 } else {
-                    let FilterMatches::Routed(filter) = filter_strategy.collect_matches(
-                        weight,
-                        &segment.reader,
-                        FilterInput::Segment {
-                            vectors: &vectors,
-                            located_cap: 0,
-                        },
-                    )?
+                    let FilterMatches::Routed(filter) =
+                        filter_strategy.prepare_segment(weight, &segment.reader, &vectors, 0)?
                     else {
                         unreachable!()
                     };
