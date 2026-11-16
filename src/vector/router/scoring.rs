@@ -2,24 +2,50 @@
 //! prepare queries and score batches without owning retention or stopping.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use quant::cascade::{LayerKind, LayerSpec, Rotation};
 
 use super::arena::VectorArena;
 use super::candidate::Candidate;
 use super::search::ScoreBuffer;
-use super::source::VectorSource;
+use super::source::{EncodingContext, VectorSource};
 use super::stacked::levels::ClusterId;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
-use crate::vector::search::prepared::VectorQuery;
+use crate::vector::search::prepared::{QuantizedVectorQuery, VectorQuery};
 use crate::vector::VectorElement;
+
+/// Router queries prepared for one ranking, by encoding seed. A ranking scores many lists against
+/// a few encodings, so each encoding's query is taken from the [`VectorQuery`]'s shared cache once.
+#[derive(Default)]
+pub(crate) struct RouterQueries(Vec<(u64, Arc<QuantizedVectorQuery>)>);
+
+impl RouterQueries {
+    /// The router query prepared for `context`'s encoding.
+    fn prepared<T: VectorElement>(
+        &mut self,
+        query: &VectorQuery<T>,
+        context: &EncodingContext,
+    ) -> &QuantizedVectorQuery {
+        let index = match self.0.iter().position(|(seed, _)| *seed == context.seed) {
+            Some(index) => index,
+            None => {
+                let prepared = query.quantized_router_query(context.seed, &context.rotation);
+                self.0.push((context.seed, prepared));
+                self.0.len() - 1
+            }
+        };
+        &self.0[index].1
+    }
+}
 
 /// Produce scores for addressed rows in the source's initial representation.
 /// Returns whether those scores are approximate. Identities remain unchanged.
 pub(crate) fn score_initial<S: VectorSource, T: VectorElement>(
     source: &S,
     query: &VectorQuery<T>,
+    queries: &mut RouterQueries,
     rows: Range<usize>,
     out: &mut ScoreBuffer<ClusterId>,
 ) -> bool {
@@ -31,7 +57,7 @@ pub(crate) fn score_initial<S: VectorSource, T: VectorElement>(
         return approximate;
     }
     if let Some((codes, context)) = source.compressed() {
-        let prepared = query.quantized_router_query(context.seed, &context.rotation);
+        let prepared = queries.prepared(query, context);
         let batch = codes
             .read(rows.clone())
             .expect("failed to read quantized vector rows");
@@ -115,9 +141,22 @@ mod tests {
         for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
             let query = VectorQuery::new(metric, Arc::new(vec![0.0; dim])).unwrap();
             let mut buffer = ScoreBuffer::default();
-            assert!(!score_initial(raw.as_ref(), &query, 0..4, &mut buffer));
+            let mut queries = RouterQueries::default();
+            assert!(!score_initial(
+                raw.as_ref(),
+                &query,
+                &mut queries,
+                0..4,
+                &mut buffer
+            ));
             assert_eq!(buffer.similarities.len(), 4);
-            assert!(score_initial(&encoded, &query, 1..3, &mut buffer));
+            assert!(score_initial(
+                &encoded,
+                &query,
+                &mut queries,
+                1..3,
+                &mut buffer
+            ));
             assert!(buffer.similarities.is_empty());
             let expected: Vec<_> = (1..3)
                 .map(|row| Candidate {
@@ -126,7 +165,13 @@ mod tests {
                 })
                 .collect();
             assert_eq!(buffer.candidates, expected);
-            assert!(score_initial(&encoded, &query, 2..2, &mut buffer));
+            assert!(score_initial(
+                &encoded,
+                &query,
+                &mut queries,
+                2..2,
+                &mut buffer
+            ));
             assert!(buffer.candidates.is_empty());
             assert!(buffer.estimates.is_empty());
             assert!(buffer.similarities.is_empty());

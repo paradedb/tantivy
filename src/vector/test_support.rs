@@ -1061,6 +1061,9 @@ pub(crate) struct DocTrace {
     /// `(row, doc, estimate bits)` after admission and after each refining layer.
     pub(crate) estimates: Vec<Vec<(BlockAddress, DocId, u32)>>,
     pub(crate) exact_phase_docs: Vec<DocId>,
+    /// Documents scored exactly ahead of the rest of the shortlist: the best estimates, or the
+    /// adaptive refinement's picks.
+    pub(crate) refined_docs: Vec<DocId>,
 }
 
 /// The first segment and its ordinal: the one with the lowest id, which the per-segment helpers
@@ -1111,6 +1114,7 @@ pub(crate) fn doc_trace(index: &Index, field: Field, trace: &ScanTrace) -> crate
             })
             .collect(),
         exact_phase_docs: sorted(&trace.exact_phase_rows),
+        refined_docs: sorted(&trace.refined_topk_rows),
     })
 }
 

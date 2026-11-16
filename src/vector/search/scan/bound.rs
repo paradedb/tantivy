@@ -13,9 +13,10 @@
 //! drops a row only when its upper endpoint is strictly below the floor.
 
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::mem::swap;
 use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
 
 use crate::collector::SharedThreshold;
 use crate::vector::write::RowAddress;
@@ -109,7 +110,7 @@ pub(crate) struct ExactMerge {
 #[derive(Clone, Debug)]
 pub(crate) struct TopK {
     k: usize,
-    by_addr: HashMap<RowAddress, Bound>,
+    by_addr: FxHashMap<RowAddress, Bound>,
     /// The worst entry of the full map, computed on first use and cleared by any change.
     worst: Cell<Option<Worst>>,
 }
@@ -138,7 +139,7 @@ impl TopK {
     pub(crate) fn new(k: usize) -> Self {
         Self {
             k,
-            by_addr: HashMap::new(),
+            by_addr: FxHashMap::default(),
             worst: Cell::new(None),
         }
     }
@@ -461,7 +462,7 @@ mod tests {
             }
         }
 
-        fn entries(by_addr: &HashMap<RowAddress, Bound>) -> Vec<(RowAddress, u32, u32)> {
+        fn entries<S>(by_addr: &HashMap<RowAddress, Bound, S>) -> Vec<(RowAddress, u32, u32)> {
             let mut entries: Vec<_> = by_addr
                 .iter()
                 .map(|(&address, bound)| {
