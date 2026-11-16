@@ -2477,13 +2477,7 @@ mod ivf_e2e_tests {
                 .collect();
             let weight = fixture.all()?;
             let mut work = Vec::new();
-            for (max_probe, patience) in [
-                (500, 0.0),
-                (1000, 0.0),
-                (1001, 10.01),
-                (2000, 20.0),
-                (4000, 40.0),
-            ] {
+            for (max_probe, patience) in [(500, 0.0), (1000, 16.66), (2000, 100.0), (4000, 200.0)] {
                 let collector = TopDocs::with_limit(10)
                     .order_by_similarity(fixture.field, vec![0.0_f32, 0.0])
                     .with_probe_params(ProbeParams {
@@ -2514,7 +2508,7 @@ mod ivf_e2e_tests {
                 work.push(charged);
             }
             assert!(
-                work[4] > work[3] && work[3] > work[2] && work[2] > work[0],
+                work[3] > work[2] && work[2] > work[0],
                 "{segments} segments: {work:?}"
             );
         }
