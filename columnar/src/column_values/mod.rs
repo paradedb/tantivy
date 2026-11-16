@@ -27,7 +27,7 @@ mod monotonic_column;
 pub(crate) use merge::MergedColumnValues;
 pub use stats::ColumnStats;
 pub use u64_based::{
-    ALL_U64_CODEC_TYPES, CodecType, load_u64_based_column_values,
+    ALL_U64_CODEC_TYPES, CodecType, ColumnValueCache, load_u64_based_column_values,
     serialize_and_load_u64_based_column_values, serialize_u64_based_column_values,
 };
 pub use u128_based::{
@@ -54,6 +54,12 @@ pub trait ColumnValues<T: PartialOrd = u64>: Send + Sync + DowncastSync {
     ///
     /// May panic if `idx` is greater than the column length.
     fn get_val(&self, idx: u32) -> T;
+
+    /// Reads a value using a caller-owned block cache when supported by the codec.
+    /// Reuse the cache only with this column. Reads in row order avoid reloading blocks.
+    fn get_val_with_cache(&self, idx: u32, _cache: &mut ColumnValueCache) -> T {
+        self.get_val(idx)
+    }
 
     /// Allows to push down multiple fetch calls, to avoid dynamic dispatch overhead.
     ///
@@ -201,6 +207,10 @@ impl<T: Copy + PartialOrd + Debug + 'static> ColumnValues<T> for Arc<dyn ColumnV
     #[inline(always)]
     fn get_val(&self, idx: u32) -> T {
         self.as_ref().get_val(idx)
+    }
+
+    fn get_val_with_cache(&self, idx: u32, cache: &mut ColumnValueCache) -> T {
+        self.as_ref().get_val_with_cache(idx, cache)
     }
 
     #[inline(always)]
