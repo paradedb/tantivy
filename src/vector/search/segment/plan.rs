@@ -134,7 +134,7 @@ mod tests {
                                 DocFilter::All => None,
                                 DocFilter::Late => unreachable!(),
                                 DocFilter::Docs(docs) => Some(docs.len()),
-                                DocFilter::Candidates(_) | DocFilter::Pending => unreachable!(),
+                                DocFilter::Pending => unreachable!(),
                             };
                             (budget, report, (false, matches))
                         }

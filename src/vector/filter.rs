@@ -7,14 +7,12 @@ use itertools::Either;
 
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::fastfield::AliveBitSet;
-use crate::query::{
-    for_each_docset_buffered, AllScorer, BitSetDocSet, ExcludedDocSet, ExclusionSet, Weight,
-};
+use crate::query::{for_each_docset_buffered, AllScorer, ExcludedDocSet, ExclusionSet, Weight};
 use crate::schema::Field;
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::enter_vector_stage;
 use crate::vector::{BlockAddress, Candidate, VectorSegment, VectorStage};
-use crate::{DocId, DocSet, Result, SegmentReader, TantivyError, TERMINATED};
+use crate::{DocId, Result, SegmentReader, TantivyError};
 
 /// Minimum estimated matches for deferring a fast-field filter. Keep the strategy independent
 /// of the probe ceiling so increasing recall does not switch access paths mid-sweep.
@@ -184,17 +182,9 @@ impl VectorFilterStrategy {
                     Self::Pre { .. } | Self::Late { .. } => {
                         unreachable!("only Post filters routed clusters")
                     }
-                    Self::Post {
-                        estimated_selectivity,
-                    } => {
+                    Self::Post { .. } => {
                         let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
-                        Self::filter_post_clusters(
-                            vectors,
-                            weight,
-                            segment,
-                            candidates,
-                            estimated_selectivity,
-                        )?
+                        Self::filter_post_clusters(vectors, weight, segment, candidates)?
                     }
                 };
                 Ok(FilterMatches::Routed(filter))
@@ -260,7 +250,7 @@ impl VectorFilterStrategy {
                         .map(move |bit| bucket * 64 + bit)
                 }))
             }
-            DocFilter::Candidates(_) | DocFilter::Pending => {
+            DocFilter::Pending => {
                 unreachable!("flat filters are prepared before routing")
             }
         };
@@ -340,12 +330,11 @@ impl VectorFilterStrategy {
         weight: &dyn Weight,
         segment: &SegmentReader,
         candidates: impl Iterator<Item = Candidate>,
-        estimated_selectivity: f64,
     ) -> Result<DocFilter> {
         let mut candidates = candidates.peekable();
-        let mut matches = Vec::new();
+        let mut docs = BitSet::with_max_value(0);
         if candidates.peek().is_some() {
-            let mut docs = BitSet::with_max_value(segment.max_doc());
+            docs = BitSet::with_max_value(segment.max_doc());
             let mut scratch = Vec::new();
             for candidate in candidates {
                 vectors.read_doc_ids(candidate.node as usize, &mut scratch)?;
@@ -355,24 +344,23 @@ impl VectorFilterStrategy {
             }
             drop(scratch);
             let candidate_count = docs.len();
-            let mut docs = BitSetDocSet::from(docs);
             let mut scorer = ExcludedDocSet::new(weight.scorer_for_candidates_unpositioned(
                 segment,
                 1.0,
                 candidate_count as u32,
             )?);
-            let expected_matches =
-                (candidate_count as f64 * estimated_selectivity.clamp(0.0, 1.0)).ceil() as usize;
-            matches = Vec::with_capacity(expected_matches);
-            while docs.doc() != TERMINATED {
-                let doc = docs.doc();
-                if scorer.contains(doc) {
-                    matches.push(doc);
+            let mut bucket = docs.first_non_empty_bucket(0);
+            while let Some(current_bucket) = bucket {
+                for bit in docs.tinyset(current_bucket) {
+                    let doc = current_bucket * u64::BITS + bit;
+                    if !scorer.contains(doc) {
+                        docs.remove(doc);
+                    }
                 }
-                docs.advance();
+                bucket = docs.first_non_empty_bucket(current_bucket + 1);
             }
         }
-        Ok(DocFilter::Candidates(Arc::new(matches)))
+        Ok(DocFilter::Docs(Arc::new(docs)))
     }
 }
 
@@ -381,10 +369,8 @@ impl VectorFilterStrategy {
 pub(crate) enum DocFilter {
     /// Every doc id in the segment matches; deleted docs are excluded separately.
     All,
-    /// Matches collected across the whole segment, stored as a bitset.
+    /// Matching document ids, stored as a bitset.
     Docs(Arc<BitSet>),
-    /// Matching doc ids from routed clusters, sorted and deduplicated.
-    Candidates(Arc<Vec<DocId>>),
     /// Post has not checked the routed clusters yet; resolve this before scoring their vectors.
     Pending,
     /// Defer filter checks to the approximate shortlist, or to each doc during a flat scan.
@@ -395,7 +381,6 @@ impl DocFilter {
     pub(crate) fn is_empty(&self) -> bool {
         match self {
             Self::Docs(docs) => docs.len() == 0,
-            Self::Candidates(docs) => docs.is_empty(),
             Self::All | Self::Pending | Self::Late => false,
         }
     }
@@ -405,7 +390,6 @@ impl DocFilter {
         match self {
             Self::All | Self::Late => 1.0,
             Self::Docs(docs) => docs.len() as f64 / f64::from(max_doc.max(1)),
-            Self::Candidates(docs) => docs.len() as f64 / f64::from(max_doc.max(1)),
             Self::Pending => unreachable!("pending filter has no observed selectivity"),
         }
     }
@@ -415,10 +399,6 @@ impl DocFilter {
 pub(crate) enum RowGate<'a> {
     Open,
     Pending,
-    Candidates {
-        docs: Arc<Vec<DocId>>,
-        alive: Option<&'a AliveBitSet>,
-    },
     AliveOnly(&'a AliveBitSet),
     FilterOnly(Arc<BitSet>),
     FilterAndAlive {
@@ -440,7 +420,6 @@ impl<'a> RowGate<'a> {
     pub(crate) fn new(filter: DocFilter, alive: Option<&'a AliveBitSet>) -> Self {
         match (filter, alive) {
             (DocFilter::Pending, _) => RowGate::Pending,
-            (DocFilter::Candidates(docs), alive) => RowGate::Candidates { docs, alive },
             (DocFilter::All | DocFilter::Late, None) => RowGate::Open,
             (DocFilter::All | DocFilter::Late, Some(alive)) => RowGate::AliveOnly(alive),
             (DocFilter::Docs(filter), None) => RowGate::FilterOnly(filter),
@@ -465,13 +444,6 @@ impl<'a> RowGate<'a> {
                     pruned_dead: 0,
                 }
             }
-            RowGate::Candidates { docs, alive } => gate(doc_ids, offsets, |doc| {
-                let matches = docs.binary_search(&doc).is_ok();
-                RowVerdict {
-                    matches,
-                    keep: matches && alive.is_none_or(|alive| alive.is_alive(doc)),
-                }
-            }),
             RowGate::AliveOnly(alive) => gate(doc_ids, offsets, |doc| {
                 let alive = alive.is_alive(doc);
                 RowVerdict {
@@ -553,7 +525,7 @@ mod tests {
     use crate::vector::{
         AtomicVectorWork, LocatedPath, ProbeParams, SharedVectorWork, VectorSearchBudget,
     };
-    use crate::Score;
+    use crate::{DocSet, Score};
 
     struct ProbeWeight {
         matches: Arc<Vec<DocId>>,
@@ -626,7 +598,7 @@ mod tests {
     fn post_only_checks_routed_documents_in_every_executor() -> Result<()> {
         const DIMENSIONS: usize = 8;
         const CLUSTERS: usize = 8;
-        const DOCUMENTS: usize = 128;
+        const DOCUMENTS: usize = 129;
         const TOP_K: usize = 5;
         for replicated in [false, true] {
             let mut spec = FixtureSpec::clustered(Metric::L2, DIMENSIONS, CLUSTERS, DOCUMENTS)
@@ -652,7 +624,8 @@ mod tests {
             let builder = TopDocs::with_limit(TOP_K)
                 .order_by_similarity(fixture.field, vec![0.0f32; DIMENSIONS])
                 .with_probe_params(params.clone());
-            for chosen in [&[][..], &[0, 2][..]] {
+            let all_clusters: Vec<_> = (0..CLUSTERS).collect();
+            for chosen in [&[][..], &[0, 2][..], all_clusters.as_slice()] {
                 let candidates = fixture.candidates(chosen, &[0.0; DIMENSIONS])?;
                 let mut expected_probes = Vec::new();
                 let mut scratch = Vec::new();
@@ -662,7 +635,11 @@ mod tests {
                 }
                 expected_probes.sort_unstable();
                 expected_probes.dedup();
-                assert!(expected_probes.len() < segment.max_doc() as usize);
+                if chosen.len() < CLUSTERS {
+                    assert!(expected_probes.len() < segment.max_doc() as usize);
+                } else {
+                    assert_eq!(expected_probes.len(), segment.max_doc() as usize);
+                }
                 let routed: Vec<_> = candidates
                     .iter()
                     .map(|c| Candidate {
