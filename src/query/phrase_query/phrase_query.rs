@@ -95,6 +95,16 @@ impl PhraseQuery {
             .collect::<Vec<Term>>()
     }
 
+    /// `Term`s in the phrase with their offsets, sorted by offset.
+    pub fn phrase_terms_with_offsets(&self) -> &[(usize, Term)] {
+        &self.phrase_terms
+    }
+
+    /// The slop of the phrase. See [`PhraseQuery::set_slop`].
+    pub fn slop(&self) -> u32 {
+        self.slop
+    }
+
     /// Returns the [`PhraseWeight`] for the given phrase query given a specific `searcher`.
     ///
     /// This function is the same as [`Query::weight()`] except it returns
