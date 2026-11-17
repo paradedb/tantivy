@@ -336,6 +336,22 @@ impl Bm25Weight {
     }
 
     pub fn explain(&self, fieldnorm_id: u8, term_freq: u32) -> Explanation {
+        let freq = Explanation::new(
+            "freq, occurrences of term within document",
+            term_freq as Score,
+        );
+        self.explain_with_freq("TermQuery, product of...", fieldnorm_id, term_freq, freq)
+    }
+
+    /// [`Self::explain`] for a query that scores several terms as one term. `freq` explains
+    /// `term_freq`.
+    pub(crate) fn explain_with_freq(
+        &self,
+        description: &'static str,
+        fieldnorm_id: u8,
+        term_freq: u32,
+        freq: Explanation,
+    ) -> Explanation {
         let score = self.score(fieldnorm_id, term_freq);
 
         let norm = self.cache[fieldnorm_id as usize];
@@ -347,7 +363,7 @@ impl Bm25Weight {
             right_factor,
         );
 
-        tf_explanation.add_const("freq, occurrences of term within document", term_freq);
+        tf_explanation.add_detail(freq);
         tf_explanation.add_const("k1, term saturation parameter", self.params.k1());
         tf_explanation.add_const("b, length normalization parameter", self.params.b());
         tf_explanation.add_const(
@@ -356,7 +372,7 @@ impl Bm25Weight {
         );
         tf_explanation.add_const("avgdl, average length of field", self.average_fieldnorm);
 
-        let mut explanation = Explanation::new("TermQuery, product of...", score);
+        let mut explanation = Explanation::new(description, score);
         explanation.add_detail(Explanation::new("(K1+1)", self.params.k1() + 1.0));
         if let Some(idf_explain) = &self.idf_explain {
             explanation.add_detail(idf_explain.clone());

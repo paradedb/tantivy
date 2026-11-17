@@ -175,6 +175,23 @@ impl SynonymWeight {
         }
         Ok(FieldNormReader::constant(segment_reader.max_doc(), 1))
     }
+
+    /// The terms that `doc` holds, each with its term frequency.
+    fn term_freqs(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Vec<(&Term, u32)>> {
+        let inverted_index = reader.inverted_index(self.terms[0].field())?;
+        let mut term_freqs = Vec::new();
+        for term in &self.terms {
+            let Some(term_info) = inverted_index.get_term_info(term)? else {
+                continue;
+            };
+            let mut postings =
+                inverted_index.read_postings_from_terminfo(&term_info, self.index_record_option)?;
+            if postings.doc() <= doc && postings.seek(doc) == doc {
+                term_freqs.push((term, postings.term_freq()));
+            }
+        }
+        Ok(term_freqs)
+    }
 }
 
 impl Weight for SynonymWeight {
@@ -212,7 +229,22 @@ impl Weight for SynonymWeight {
         }
         let fieldnorm_id = scorer.fieldnorm_id();
         let term_freq = scorer.term_freq();
-        let mut explanation = self.similarity_weight.explain(fieldnorm_id, term_freq);
+        let mut freq = Explanation::new(
+            "freq, sum of the occurrences of the terms within document",
+            term_freq as Score,
+        );
+        for (term, term_freq) in self.term_freqs(reader, doc)? {
+            freq.add_detail(Explanation::new_with_string(
+                format!("occurrences of {term:?}"),
+                term_freq as Score,
+            ));
+        }
+        let mut explanation = self.similarity_weight.explain_with_freq(
+            "SynonymQuery, product of...",
+            fieldnorm_id,
+            term_freq,
+            freq,
+        );
         explanation.add_context(format!(
             "SynonymQuery, blended term_freq across {:?}",
             self.terms
@@ -531,6 +563,56 @@ mod tests {
             .map(|(score, _)| *score)
             .unwrap();
         assert_nearly_equals!(explanation.value(), score);
+        Ok(())
+    }
+
+    #[test]
+    fn test_synonym_query_explain_lists_the_terms_of_the_doc() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        writer.add_document(doc!(text => "cat cat feline"))?;
+        writer.add_document(doc!(text => "kitty"))?;
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let query = SynonymQuery::new(vec![
+            Term::from_field_text(text, "cat"),
+            Term::from_field_text(text, "feline"),
+            Term::from_field_text(text, "kitty"),
+        ]);
+        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let explanation = weight.explain(searcher.segment_reader(0), 0)?;
+        let json: serde_json::Value = serde_json::from_str(&explanation.to_pretty_json()).unwrap();
+
+        assert_eq!(json["description"], "SynonymQuery, product of...");
+        // The explanation has `(K1+1)`, the idf and the term frequency part, in this order.
+        let freq = &json["details"][2]["details"][0];
+        assert_eq!(freq["value"], 3.0);
+        let terms: Vec<(String, f64)> = freq["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|term| {
+                (
+                    term["description"].as_str().unwrap().to_string(),
+                    term["value"].as_f64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            terms,
+            vec![
+                (
+                    format!("occurrences of {:?}", Term::from_field_text(text, "cat")),
+                    2.0
+                ),
+                (
+                    format!("occurrences of {:?}", Term::from_field_text(text, "feline")),
+                    1.0
+                ),
+            ]
+        );
         Ok(())
     }
 
