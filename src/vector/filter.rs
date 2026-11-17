@@ -223,13 +223,13 @@ impl VectorFilterStrategy {
         .ceil() as usize
     }
 
-    /// Filters the approximate shortlist and returns the number of candidates checked and retained.
+    /// Retains approximate shortlist candidates that match the filter.
     pub(crate) fn filter_shortlist(
         self,
         weight: &dyn Weight,
         segment: &SegmentReader,
         candidates: &mut Vec<(DocId, BlockAddress)>,
-    ) -> Result<(usize, usize)> {
+    ) -> Result<()> {
         if !matches!(
             self,
             Self::Post {
@@ -237,26 +237,16 @@ impl VectorFilterStrategy {
                 ..
             }
         ) {
-            return Ok((0, candidates.len()));
+            return Ok(());
         }
-        let checked = candidates.len();
-        {
-            let _sort = enter_vector_stage(VectorStage::LateFilterSort);
-            candidates.sort_unstable_by_key(|&(doc, _)| doc);
-        }
-        let mut scorer = {
-            let _setup = enter_vector_stage(VectorStage::LateFilterSetup);
-            ExcludedDocSet::new(weight.scorer_for_candidates_unpositioned(
-                segment,
-                1.0,
-                checked as u32,
-            )?)
-        };
-        {
-            let _predicate = enter_vector_stage(VectorStage::LateFilterPredicate);
-            candidates.retain(|&(doc, _)| scorer.contains(doc));
-        }
-        Ok((checked, candidates.len()))
+        candidates.sort_unstable_by_key(|&(doc, _)| doc);
+        let mut scorer = ExcludedDocSet::new(weight.scorer_for_candidates_unpositioned(
+            segment,
+            1.0,
+            candidates.len() as u32,
+        )?);
+        candidates.retain(|&(doc, _)| scorer.contains(doc));
+        Ok(())
     }
 
     /// Iterates over matching doc ids in a flat segment, skipping deletions.
@@ -289,7 +279,6 @@ impl VectorFilterStrategy {
             }
         ) && matches!(filter, DocFilter::Shortlist)
         {
-            let _setup = enter_vector_stage(VectorStage::LateFilterSetup);
             Some(ExcludedDocSet::new(
                 weight.scorer_for_candidates_unpositioned(segment, 1.0, segment.max_doc())?,
             ))
@@ -302,7 +291,6 @@ impl VectorFilterStrategy {
                 return false;
             }
             if let Some(scorer) = &mut scorer {
-                let _predicate = enter_vector_stage(VectorStage::LateFilterPredicate);
                 scorer.contains(doc)
             } else {
                 true

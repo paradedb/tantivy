@@ -144,6 +144,7 @@ impl TopK {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn k(&self) -> usize {
         self.k
     }
@@ -372,6 +373,7 @@ impl PruningBound {
         self.top.exact_kth()
     }
 
+    #[cfg(test)]
     pub(super) fn k(&self) -> usize {
         self.top.k()
     }

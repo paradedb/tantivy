@@ -37,7 +37,6 @@ pub(crate) struct RouterCounters {
     pub(crate) pruned_dead: usize,
     /// Rows admitted and charged.
     pub(crate) eligible: usize,
-    pub(crate) clusters_reused: usize,
 }
 
 /// A finished router source's report.
@@ -96,10 +95,6 @@ impl<'a> RouterClusters<'a> {
 
     pub(crate) fn replace_ranking(&mut self, ranked: RouterIter) {
         self.ranked = ranked;
-    }
-
-    pub(crate) fn reused_cluster(&mut self) {
-        self.counters.clusters_reused += 1;
     }
 
     pub(crate) fn exhausted(&self) -> bool {
@@ -229,7 +224,6 @@ impl ClusterSource for RouterClusters<'_> {
                 return Ok(None);
             };
             if !self.visited.insert(node) {
-                self.counters.clusters_reused += 1;
                 continue;
             }
             if !self.controller.admit(&self.meter) {

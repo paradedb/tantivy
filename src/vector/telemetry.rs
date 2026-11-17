@@ -22,18 +22,6 @@ pub enum VectorStage {
     ScanInit,
     /// Predicate evaluation and filter-bitset construction.
     NonVectorSearch,
-    /// Deferred-filter bookkeeping outside the stages below.
-    LateFilter,
-    /// Selecting and ranking deferred-filter candidates.
-    LateFilterSelect,
-    /// Resolving candidate addresses to document IDs.
-    LateFilterDocIds,
-    /// Sorting and preparing candidate batches.
-    LateFilterSort,
-    /// Creating a scorer for a deferred-filter batch.
-    LateFilterSetup,
-    /// Checking candidate membership in the filter.
-    LateFilterPredicate,
     /// Query preparation.
     QueryPrep,
     /// Cluster routing.
@@ -63,12 +51,6 @@ impl VectorStage {
             Self::Other => None,
             Self::ScanInit => Some(Cow::Borrowed("scan_init")),
             Self::NonVectorSearch => Some(Cow::Borrowed("non_vector_search")),
-            Self::LateFilter => Some(Cow::Borrowed("late_filter")),
-            Self::LateFilterSelect => Some(Cow::Borrowed("late_filter_select")),
-            Self::LateFilterDocIds => Some(Cow::Borrowed("late_filter_doc_ids")),
-            Self::LateFilterSort => Some(Cow::Borrowed("late_filter_sort")),
-            Self::LateFilterSetup => Some(Cow::Borrowed("late_filter_setup")),
-            Self::LateFilterPredicate => Some(Cow::Borrowed("late_filter_predicate")),
             Self::QueryPrep => Some(Cow::Borrowed("query_prep")),
             Self::Routing => Some(Cow::Borrowed("routing")),
             Self::LayerScan(layer) => Some(Cow::Owned(format!("layer{layer}_scan"))),
@@ -85,7 +67,7 @@ impl VectorStage {
 
 // --- Totals ---
 
-const FIXED_SLOTS: usize = 17;
+const FIXED_SLOTS: usize = 11;
 const STAGE_SLOTS: usize = FIXED_SLOTS + 2 * MAX_QUANTIZATION_LAYERS;
 
 /// Accounting slot of `stage`; layers past the schedule limit fold into `Other`.
@@ -110,12 +92,6 @@ fn slot(stage: VectorStage) -> usize {
         VectorStage::ResultAssembly => 8,
         VectorStage::Locate => 9,
         VectorStage::Centroid => 10,
-        VectorStage::LateFilter => 11,
-        VectorStage::LateFilterSelect => 12,
-        VectorStage::LateFilterDocIds => 13,
-        VectorStage::LateFilterSort => 14,
-        VectorStage::LateFilterPredicate => 15,
-        VectorStage::LateFilterSetup => 16,
         VectorStage::LayerScan(l) => layer(FIXED_SLOTS, l),
         VectorStage::Boundary(l) => layer(FIXED_SLOTS + MAX_QUANTIZATION_LAYERS, l),
     }
@@ -124,14 +100,12 @@ fn slot(stage: VectorStage) -> usize {
 /// Exclusive time and storage reads per stage of one measured operation.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct StageTotals {
-    pub(crate) filter_scorers_created: u64,
     time_ns: [u64; STAGE_SLOTS],
     io: [VectorIoStats; STAGE_SLOTS],
 }
 
 impl StageTotals {
     pub(crate) fn append(&mut self, other: &Self) {
-        self.filter_scorers_created += other.filter_scorers_created;
         for (total, added) in self.time_ns.iter_mut().zip(other.time_ns) {
             *total += added;
         }
@@ -243,14 +217,7 @@ pub(crate) struct StageGuard(Option<VectorStage>);
 /// Enters `stage` until the guard drops; does nothing outside a [`measure`]. Time accrues only to
 /// the innermost stage.
 pub(crate) fn enter_vector_stage(stage: VectorStage) -> StageGuard {
-    StageGuard(SCOPE.with_borrow_mut(|scope| {
-        scope.as_mut().map(|meter| {
-            if stage == VectorStage::LateFilterSetup {
-                meter.totals.filter_scorers_created += 1;
-            }
-            meter.switch(stage)
-        })
-    }))
+    StageGuard(SCOPE.with_borrow_mut(|scope| scope.as_mut().map(|meter| meter.switch(stage))))
 }
 
 impl Drop for StageGuard {
@@ -291,10 +258,6 @@ mod tests {
             Some("non_vector_search")
         );
         assert_eq!(VectorStage::QueryPrep.name().as_deref(), Some("query_prep"));
-        assert_eq!(
-            VectorStage::LateFilterSetup.name().as_deref(),
-            Some("late_filter_setup")
-        );
         assert_eq!(VectorStage::Routing.name().as_deref(), Some("routing"));
         assert_eq!(
             VectorStage::LayerScan(2).name().as_deref(),
@@ -319,25 +282,6 @@ mod tests {
             VectorStage::ResultAssembly.name().as_deref(),
             Some("result_assembly")
         );
-    }
-
-    #[test]
-    fn scorer_setup_is_exclusive_and_accumulates() {
-        let (_, mut totals) = measure(|| {
-            let _predicate = enter_vector_stage(VectorStage::LateFilterPredicate);
-            for _ in 0..2 {
-                let _setup = enter_vector_stage(VectorStage::LateFilterSetup);
-                charge_read(12, 1);
-            }
-        });
-        assert_eq!(totals.filter_scorers_created, 2);
-        assert_eq!(totals.io(VectorStage::LateFilterSetup).bytes_read, 24);
-        assert_eq!(totals.io(VectorStage::LateFilterPredicate).bytes_read, 0);
-        let (_, extra) = measure(|| {
-            let _setup = enter_vector_stage(VectorStage::LateFilterSetup);
-        });
-        totals.append(&extra);
-        assert_eq!(totals.filter_scorers_created, 3);
     }
 
     /// Time and reads go to the innermost stage; leaving a stage resumes the enclosing one.

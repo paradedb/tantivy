@@ -247,7 +247,7 @@ mod tests {
             max_probe: 2,
             min_probe_clusters: 1,
             located: LocatedPath::Auto,
-            ..ProbeParams::prefilter()
+            ..ProbeParams::default()
         };
         let (budget, n_avg, x) = auto.resolved_work_budget(ivf.num_clusters(), ivf_rows)?;
         let cap = (budget * n_avg / (1.0 - x)).floor() as usize;

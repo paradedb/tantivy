@@ -161,12 +161,6 @@ impl LayerReport {
 pub(crate) struct ScanReport {
     /// Rows shortlisted from the source.
     pub(crate) candidates_scored: usize,
-    pub(crate) late_filter: bool,
-    pub(crate) filter_candidates: usize,
-    pub(crate) filter_batches: usize,
-    pub(crate) filter_checks: usize,
-    pub(crate) filter_matches: usize,
-    pub(crate) router_retries: usize,
     pub(crate) recall_reached: bool,
     /// One per active layer on a quantized segment; empty at full precision.
     pub(crate) layers: Vec<LayerReport>,
@@ -754,7 +748,6 @@ where
     top_n: usize,
     report: ScanReport,
     late_filter: Option<(&'a dyn Weight, &'a SegmentReader, VectorFilterStrategy)>,
-    filter_batch_size: usize,
     reader: &'a VectorIndexReader,
 }
 
@@ -798,7 +791,6 @@ where
             .map(|p| p.admission_fraction);
         Ok(Self {
             late_filter: None,
-            filter_batch_size: 0,
             reader,
             exact: ExactScorer::new(
                 reader,
@@ -841,20 +833,12 @@ where
                 state.exact = None;
             }
         }
-        self.report.late_filter = filter.is_some();
-        self.late_filter = filter.map(|(weight, reader, strategy)| {
-            self.filter_batch_size = strategy.shortlist_batch_size(self.bound.k());
-            (weight, reader, strategy)
-        });
+        self.late_filter = filter;
         self
     }
 
     pub(crate) fn needs_more_matches(&self) -> bool {
         self.late_filter.is_some() && self.bound.shared_threshold().is_none()
-    }
-
-    pub(crate) fn retried_router(&mut self) {
-        self.report.router_retries += 1;
     }
 
     pub(crate) fn swap_topk(&mut self, top: &mut TopK) {
@@ -999,40 +983,42 @@ where
     }
 
     fn filter_shortlist(&mut self) -> Result<()> {
-        let _stage = enter_vector_stage(VectorStage::LateFilter);
         let (weight, reader, strategy) = self.late_filter.unwrap();
         let state = self
             .quantized
             .as_mut()
             .expect("post-filtering requires quantization");
-        let selection = enter_vector_stage(VectorStage::LateFilterSelect);
         let threshold = self.bound.shared_threshold();
         let mut queue = BinaryHeap::from(
-            state
-                .candidates
-                .candidates_with_upper(state.segment_ord)
-                .filter(|(_, _, _, upper)| threshold.is_none_or(|bar| upper.0 >= bar))
-                .map(|(block, index, _, upper)| RankedCandidate {
+            self.by_cluster
+                .iter()
+                .flat_map(|&block| {
+                    let candidates = &state.candidates;
+                    candidates
+                        .block(block)
+                        .at
+                        .clone()
+                        .map(move |index| (block, index, candidates.upper(index)))
+                })
+                .filter(|(_, _, upper)| threshold.is_none_or(|bar| upper.0 >= bar))
+                .map(|(block, index, upper)| RankedCandidate {
                     sim: Similarity::new(upper.0),
                     node: Reverse((block, index)),
                 })
                 .collect::<Vec<_>>(),
         );
-        self.report.filter_candidates += queue.len();
-        drop(selection);
         let mut batch = Vec::new();
         let mut refined = Vec::new();
         let mut indexed = Vec::new();
         let mut offsets = Vec::new();
         let mut indices = Vec::new();
         let mut doc_cache = HashMap::<usize, Vec<DocId>>::new();
-        let batch_size = self.filter_batch_size.max(1);
+        let batch_size = strategy.shortlist_batch_size(self.top_n).max(1);
         while queue.peek().is_some_and(|next| {
             self.bound
                 .shared_threshold()
                 .is_none_or(|bar| next.sim.score() >= bar)
         }) {
-            let selection = enter_vector_stage(VectorStage::LateFilterSelect);
             batch.clear();
             let threshold = self.bound.shared_threshold();
             while batch.len() < batch_size {
@@ -1044,11 +1030,7 @@ where
                 }
                 batch.push(queue.pop().unwrap().node.0);
             }
-            drop(selection);
-            {
-                let _sort = enter_vector_stage(VectorStage::LateFilterSort);
-                batch.sort_unstable();
-            }
+            batch.sort_unstable();
             refined.clear();
             for group in batch.chunk_by(|a, b| a.0 == b.0) {
                 let b = group[0].0;
@@ -1096,7 +1078,6 @@ where
                         self.report.layers[layer].survivors += selected.len();
                     }
                 }
-                let doc_ids = enter_vector_stage(VectorStage::LateFilterDocIds);
                 for (i, &offset) in offsets.iter().enumerate() {
                     let upper = Estimate(state.admission_columns.estimates[i])
                         .upper(state.admission_columns.sigmas[i], state.candidates.kappa());
@@ -1114,17 +1095,12 @@ where
                         });
                     }
                 }
-                drop(doc_ids);
             }
             if self.report.layers.len() > 1 {
                 self.report.layers.last_mut().unwrap().survivors += refined.len();
             }
-            {
-                let _sort = enter_vector_stage(VectorStage::LateFilterSort);
-                refined.sort_unstable_by_key(|candidate| Reverse(*candidate));
-            }
+            refined.sort_unstable_by_key(|candidate| Reverse(*candidate));
             for candidates in refined.chunks(MAX_SHORTLIST_FILTER_BATCH_SIZE) {
-                let selection = enter_vector_stage(VectorStage::LateFilterSelect);
                 let threshold = self.bound.shared_threshold();
                 indexed.clear();
                 indexed.extend(
@@ -1133,14 +1109,10 @@ where
                         .take_while(|next| threshold.is_none_or(|bar| next.sim.score() >= bar))
                         .map(|next| next.node.0),
                 );
-                drop(selection);
                 if indexed.is_empty() {
                     break;
                 }
-                self.report.filter_batches += 1;
-                let (checked, matched) = strategy.filter_shortlist(weight, reader, &mut indexed)?;
-                self.report.filter_checks += checked;
-                self.report.filter_matches += matched;
+                strategy.filter_shortlist(weight, reader, &mut indexed)?;
                 self.report.exact_rows +=
                     self.exact
                         .score_candidates(&indexed, &mut self.scratch, &mut self.bound)?;

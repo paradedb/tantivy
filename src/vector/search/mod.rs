@@ -354,7 +354,6 @@ impl<T: VectorElement> SegmentSearcher<T> {
                             .collect(),
                         ranking.metrics[0],
                     ));
-                    scan.retried_router();
                     scan.run(&mut clusters)?;
                 }
                 SourceReport::Router(clusters.finish())

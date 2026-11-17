@@ -1061,9 +1061,6 @@ where
     loop {
         for (i, candidate) in candidates.drain(..) {
             if late_filter && !visited.insert((i, candidate.node)) {
-                if let Some(GlobalSource::Router(source)) = &mut sources[i] {
-                    source.reused_cluster();
-                }
                 continue;
             }
             if meter.exhausted() || recall_reached {
@@ -1169,9 +1166,6 @@ where
             on_segment,
         );
         candidates = ranking.clusters;
-        for scan in scans.iter_mut().flatten() {
-            scan.retried_router();
-        }
     }
     for (i, ((scan, source), report)) in scans.into_iter().zip(sources).zip(reports).enumerate() {
         let Some(source) = source else {
@@ -1464,7 +1458,7 @@ mod ivf_e2e_tests {
                     min_probe_clusters: 0,
                     exact_plan: false,
                     located: LocatedPath::Off,
-                    ..ProbeParams::prefilter()
+                    ..Default::default()
                 })
                 .build_for_searcher(&searcher, &crate::query::AllQuery)
                 .unwrap();
@@ -1514,7 +1508,6 @@ mod ivf_e2e_tests {
             .collect();
         let collector = TopDocs::with_limit(5)
             .order_by_similarity(fixture.field, query)
-            .with_probe_params(ProbeParams::prefilter())
             .build_for_searcher(&searcher, &fixture.filter("absent"))?;
         let weight = fixture.weight(&fixture.filter("absent"))?;
         let fruit = collector.merge_fruits(collector.collect_segments(
@@ -1750,7 +1743,7 @@ mod ivf_e2e_tests {
         let params = ProbeParams {
             max_probe: 1,
             min_probe_clusters: 3,
-            ..ProbeParams::prefilter()
+            ..Default::default()
         };
         for planned in [false, true] {
             let builder = TopDocs::with_limit(3)
@@ -1816,7 +1809,7 @@ mod ivf_e2e_tests {
         let params = ProbeParams {
             max_probe: 4,
             located: LocatedPath::Off,
-            ..ProbeParams::prefilter()
+            ..Default::default()
         };
         for (filter, fraction) in [
             (&AllQuery as &dyn Query, 1.0),
@@ -2062,7 +2055,7 @@ mod ivf_e2e_tests {
             max_probe: 3,
             located: LocatedPath::Off,
             exact_plan: false,
-            ..ProbeParams::prefilter()
+            ..Default::default()
         };
         let builder = || {
             TopDocs::with_limit(5)
@@ -2257,7 +2250,7 @@ mod ivf_e2e_tests {
             let params = ProbeParams {
                 max_probe,
                 located: LocatedPath::Off,
-                ..ProbeParams::prefilter()
+                ..Default::default()
             };
             let builder = TopDocs::with_limit(3)
                 .order_by_similarity(field, vec![0.0f32; 32])
@@ -2298,7 +2291,6 @@ mod ivf_e2e_tests {
             let weight = fixture.weight(filter)?;
             let wrong_length = TopDocs::with_limit(1)
                 .order_by_similarity(fixture.field, vec![0.0f32])
-                .with_probe_params(ProbeParams::prefilter())
                 .build_for_segments(weight.as_ref(), &segments, |_| {})?;
             for error in [
                 wrong_length
@@ -2336,7 +2328,6 @@ mod ivf_e2e_tests {
                 let weight = fixture.weight(&filter)?;
                 let collector = TopDocs::with_limit(2)
                     .order_by_similarity(fixture.field, vec![0.0f32; 32])
-                    .with_probe_params(ProbeParams::prefilter())
                     .build_for_segments(weight.as_ref(), &segments, |_| {})?;
                 assert!(collector.inputs.routing_stats.is_empty());
                 let fruit = collector.merge_fruits(collector.collect_segments(
@@ -2350,7 +2341,7 @@ mod ivf_e2e_tests {
                 .order_by_similarity(fixture.field, vec![0.0f32; 32])
                 .with_probe_params(ProbeParams {
                     located: LocatedPath::Off,
-                    ..ProbeParams::prefilter()
+                    ..Default::default()
                 })
                 .build_for_segments(fixture.all()?.as_ref(), &segments, |_| {})
                 .err()
@@ -2493,7 +2484,7 @@ mod ivf_e2e_tests {
         let params = ProbeParams {
             max_probe: 1,
             min_probe_clusters: 3,
-            ..ProbeParams::prefilter()
+            ..Default::default()
         };
         let builder = || {
             TopDocs::with_limit(3)
@@ -2567,7 +2558,7 @@ mod ivf_e2e_tests {
                 .with_probe_params(ProbeParams {
                     max_probe: 1,
                     min_probe_clusters: 16,
-                    ..ProbeParams::prefilter()
+                    ..Default::default()
                 })
                 .build_for_searcher(&searcher, &crate::query::AllQuery)
                 .unwrap()
@@ -2698,7 +2689,7 @@ mod ivf_e2e_tests {
                     }),
                     max_probe: 8,
                     located: LocatedPath::Off,
-                    ..ProbeParams::prefilter()
+                    ..Default::default()
                 })
                 .build_for_searcher(&searcher, &crate::query::AllQuery)
                 .unwrap();
@@ -2792,7 +2783,6 @@ mod ivf_e2e_tests {
                 let expected = index.ground_truth(query, k)?;
                 let collector = TopDocs::with_limit(k)
                     .order_by_similarity(index.embedding_field(), query.to_vec())
-                    .with_probe_params(ProbeParams::prefilter())
                     .build_for_searcher(&searcher, &crate::query::AllQuery)
                     .unwrap();
                 let actual = searcher.search(&AllQuery, &collector)?;
@@ -3042,11 +3032,8 @@ mod ivf_e2e_tests {
 
                 // Probe invariance, under the default probe params so the
                 // gate/ceiling logic actually runs.
-                let collector = || {
-                    TopDocs::with_limit(k)
-                        .order_by_similarity(embedding_field, query.to_vec())
-                        .with_probe_params(ProbeParams::prefilter())
-                };
+                let collector =
+                    || TopDocs::with_limit(k).order_by_similarity(embedding_field, query.to_vec());
                 let mut untied = searcher.search(
                     &AllQuery,
                     &collector().build_for_searcher(&searcher, &AllQuery)?,
@@ -3077,7 +3064,6 @@ mod ivf_e2e_tests {
                 &AllQuery,
                 &TopDocs::with_limit(2)
                     .order_by_similarity(embedding_field, vec![0.0_f32, 0.0])
-                    .with_probe_params(ProbeParams::prefilter())
                     .with_tie_break(SortBySimilarityScore::new())
                     .build_for_searcher(&searcher, &crate::query::AllQuery)
                     .unwrap(),
@@ -3249,7 +3235,6 @@ mod ivf_e2e_tests {
                 &AllQuery,
                 &TopDocs::with_limit(k)
                     .order_by_similarity(embedding_field, vec![0.0_f32, 0.0])
-                    .with_probe_params(ProbeParams::prefilter())
                     .with_tie_break((SortByString::for_field("city"), Order::Asc))
                     .build_for_searcher(&searcher, &crate::query::AllQuery)
                     .unwrap(),
@@ -3257,7 +3242,6 @@ mod ivf_e2e_tests {
             assert_eq!(cities(&fruit), want, "k={k}");
             let collector = TopDocs::with_limit(k)
                 .order_by_similarity(embedding_field, vec![0.0_f32, 0.0])
-                .with_probe_params(ProbeParams::prefilter())
                 .with_tie_break((SortByString::for_field("city"), Order::Asc))
                 .build_for_searcher(&searcher, &crate::query::AllQuery)
                 .unwrap();
@@ -3410,7 +3394,6 @@ mod prepared_key_tests {
         let index = crate::Index::create_in_ram(schema.build());
         let searcher = index.reader().unwrap().searcher();
         let collector = TopDocsByVectorSimilarityBuilder::new(field, vec![3.0f32, 4.0, 0.0], 1)
-            .with_probe_params(ProbeParams::prefilter())
             .build_for_searcher(&searcher, &crate::query::AllQuery)
             .unwrap();
         let queries = std::thread::scope(|scope| {
@@ -3567,32 +3550,6 @@ mod late_filter_tests {
         fn explain(&self, reader: &SegmentReader, doc: DocId) -> Result<Explanation> {
             self.inner.explain(reader, doc)
         }
-    }
-
-    #[test]
-    fn missing_filter_strategy_is_an_error() -> Result<()> {
-        let fixture = FixtureSpec::flat(Metric::L2, 2, vec![Some(vec![0.0, 1.0])]).build()?;
-        let searcher = fixture.index.reader()?.searcher();
-        let segments = [VectorSegment::from((0, searcher.segment_reader(0)))];
-        let weight = fixture.all()?;
-        for segments in [&[][..], segments.as_slice()] {
-            let params = ProbeParams {
-                filter_strategy: None,
-                ..Default::default()
-            };
-            let budget = VectorSearchBudget::for_segments(fixture.field, &params, segments)?;
-            let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, vec![0.0f32; 2], 1)
-                .with_probe_params(params.clone());
-            assert!(matches!(
-                builder.prepare(weight.as_ref(), segments, budget, |_| {}),
-                Err(TantivyError::InvalidArgument(message)) if message.contains("filter strategy")
-            ));
-            assert!(matches!(
-                TopClustersBySimilarityCollector::new(fixture.field, vec![0.0f32; 2], params, 1.0),
-                Err(TantivyError::InvalidArgument(message)) if message.contains("filter strategy")
-            ));
-        }
-        Ok(())
     }
 
     #[test]
@@ -3771,20 +3728,10 @@ mod late_filter_tests {
                     |_| {},
                 )?)?;
                 assert_eq!(fruit.results, fixture.oracle(&filter, &query, 10)?);
-                assert!(fruit.stats.iter().all(|s| s.late_filter));
                 assert!(fruit
                     .stats
                     .iter()
                     .all(|s| s.termination != ProbeTermination::QuantizedRecall));
-                assert!(fruit.stats.iter().any(|s| s.filter_checks > 0));
-                assert!(fruit.stats.iter().all(|s| s.exact_rows <= s.filter_checks));
-                for stats in &fruit.stats {
-                    assert!(stats.filter_candidates >= stats.filter_checks);
-                    assert_eq!(stats.filter_batches as u64, stats.filter_scorers_created);
-                    assert!(stats.late_filter_setup_ns > 0);
-                    assert!(stats.filter_batches <= stats.filter_checks);
-                    assert_eq!(stats.filter_matches, stats.exact_rows);
-                }
                 let reads = fixture.reads();
                 let first_exact = reads
                     .iter()
@@ -3825,12 +3772,6 @@ mod late_filter_tests {
                 |_| {},
             )?)?;
             assert!(fruit.results.len() <= 10);
-            assert!(fruit.stats.iter().any(|s| s.late_filter));
-            assert!(fruit
-                .stats
-                .iter()
-                .filter(|s| s.candidates_scored > 0)
-                .all(|s| s.late_filter));
         }
         Ok(())
     }
@@ -3880,7 +3821,6 @@ mod late_filter_tests {
             Box::new(minimum),
         ];
         let query = vec![0.0f32; 64];
-        let mut expanded = false;
         for filter in filters {
             let weight = fixture.weight(filter.as_ref())?;
             for (levels, estimated_selectivity) in
@@ -3922,21 +3862,8 @@ mod late_filter_tests {
                         "lazy refinement must not rescan the entire candidate pool"
                     );
                 }
-                for stats in &fruit.stats {
-                    assert_eq!(stats.filter_scorers_created, stats.filter_batches as u64);
-                    assert_eq!(stats.filter_matches, stats.exact_rows);
-                    if stats.filter_batches > 0 {
-                        assert!(stats.late_filter_setup_ns > 0);
-                    }
-                    assert!(stats.filter_checks <= stats.layer0_eligible);
-                    expanded |= stats.filter_batches > 1;
-                }
             }
         }
-        assert!(
-            expanded,
-            "an optimistic selectivity must still expand past the initial batch"
-        );
         Ok(())
     }
 
@@ -4001,7 +3928,6 @@ mod late_filter_tests {
                 fruit.results,
                 fixture.oracle(&fixture.filter("matches"), &query, 10)?
             );
-            assert!(fruit.stats[0].router_retries > 0);
             assert!(fruit.stats[0].candidates_scored <= 4096);
         }
         Ok(())
@@ -4076,7 +4002,8 @@ mod late_filter_tests {
         let fruit =
             collector.merge_fruits(collector.collect_segments(&weight, &segments, |_| {})?)?;
         assert_eq!(fruit.results, fixture.oracle(&filter, &query, 10)?);
-        assert_eq!(fruit.stats[0].filter_checks, 32768);
+        assert_eq!(fruit.stats[0].candidates_scored, 32768);
+        assert_eq!(fruit.stats[0].exact_rows, 2);
         Ok(())
     }
 

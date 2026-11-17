@@ -300,7 +300,7 @@ impl QuantizedCandidates {
     }
 
     #[inline]
-    fn upper(&self, index: usize) -> UpperEndpoint {
+    pub(super) fn upper(&self, index: usize) -> UpperEndpoint {
         self.estimate(index)
             .upper(self.columns.sigmas[index], self.kappa)
     }
@@ -355,40 +355,25 @@ impl QuantizedCandidates {
 
     /// One interval per live candidate, in admission order, keyed by [`RowAddress`].
     pub(crate) fn live_candidates(&self, segment_ord: SegmentOrdinal) -> Vec<Candidate> {
-        self.candidates_with_upper(segment_ord)
-            .map(|(_, _, candidate, _)| candidate)
-            .collect()
-    }
-
-    pub(crate) fn candidates_with_upper(
-        &self,
-        segment_ord: SegmentOrdinal,
-    ) -> impl Iterator<Item = (usize, usize, Candidate, UpperEndpoint)> + '_ {
-        self.blocks.iter().enumerate().flat_map(move |(b, block)| {
-            block.at.clone().map(move |index| {
+        let mut out = Vec::new();
+        for block in &self.blocks {
+            for index in block.at.clone() {
                 debug_assert!(
                     self.columns.estimates[index].is_finite() && self.columns.sigmas[index] >= 0.0,
                     "quantized boundary inputs: a finite estimate and a non-negative sigma (+inf \
                      is an unbounded width)"
                 );
-                (
-                    b,
-                    index,
-                    Candidate::interval(
-                        RowAddress {
-                            segment_ord,
-                            block_address: BlockAddress::new(
-                                block.cluster as u32,
-                                self.offsets[index],
-                            ),
-                        },
-                        self.lower(index),
-                        self.columns.estimates[index],
-                    ),
-                    self.upper(index),
-                )
-            })
-        })
+                out.push(Candidate::interval(
+                    RowAddress {
+                        segment_ord,
+                        block_address: BlockAddress::new(block.cluster as u32, self.offsets[index]),
+                    },
+                    self.lower(index),
+                    self.columns.estimates[index],
+                ));
+            }
+        }
+        out
     }
 }
 
