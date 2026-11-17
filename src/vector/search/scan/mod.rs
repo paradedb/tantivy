@@ -989,6 +989,8 @@ where
             .as_mut()
             .expect("post-filtering requires quantization");
         let threshold = self.bound.shared_threshold();
+        // Visit the most promising upper bounds first. Only matching, exact-scored candidates
+        // may raise the shared threshold; rejected neighbors must never prune valid results.
         let mut queue = BinaryHeap::from(
             self.by_cluster
                 .iter()
@@ -1030,6 +1032,7 @@ where
                 }
                 batch.push(queue.pop().unwrap().node.0);
             }
+            // Group each score-ranked batch by block so quantization reads stay contiguous.
             batch.sort_unstable();
             refined.clear();
             for group in batch.chunk_by(|a, b| a.0 == b.0) {
@@ -1051,6 +1054,8 @@ where
                 state
                     .admission_columns
                     .extend_selected(&state.candidates.columns, &indices);
+                // Tighten the bounds through the remaining quantized layers before fetching doc
+                // IDs or evaluating the filter. Full-precision scoring waits for filter matches.
                 for layer in 1..state.layers.len() {
                     let _layer = enter_vector_stage(VectorStage::LayerScan(layer as u8));
                     let (read, view) = state.read_plan(&selected, layer, &mut self.scratch)?;
@@ -1099,6 +1104,8 @@ where
             if self.report.layers.len() > 1 {
                 self.report.layers.last_mut().unwrap().survivors += refined.len();
             }
+            // Restore score order after block-local refinement, then recheck the threshold as
+            // each batch's matching exact scores improve the shared top-k.
             refined.sort_unstable_by_key(|candidate| Reverse(*candidate));
             for candidates in refined.chunks(MAX_SHORTLIST_FILTER_BATCH_SIZE) {
                 let threshold = self.bound.shared_threshold();
