@@ -4,7 +4,7 @@
 //! A secondary key is an ordinary `SortKeyComputer` composed into the heap's
 //! `(similarity, tie_break)` order, the same rule as the pull-model path.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -17,14 +17,19 @@ use crate::collector::{
 use crate::index::SegmentReader;
 use crate::query::Weight;
 use crate::schema::{Field, Metric, Schema};
+use crate::vector::filter::DocFilter;
 use crate::vector::params::ProbeParams;
+use crate::vector::router::global::GlobalRanking;
+use crate::vector::router::RoutingParams;
 use crate::vector::search::cluster_source::ClusterSource;
 use crate::vector::search::prepared::{invalid_query, QuantizedQueryCtx, VectorQuery};
 use crate::vector::search::scan::bound::{
     Candidate as ScanCandidate, ExactMerge, PruningBound, TopK,
 };
 use crate::vector::search::scan::heap::TieBreakHits;
-use crate::vector::search::scan::{best_estimates, best_estimates_first, ScanConfig, SegmentScan};
+use crate::vector::search::scan::{
+    best_estimates, best_estimates_first, RateApsState, ScanConfig, SegmentScan,
+};
 use crate::vector::search::segment::plan::ScanInput;
 use crate::vector::search::source::controller::{
     ProbeTermination, WorkBudget, WorkMeter, WorkUnits,
@@ -41,8 +46,9 @@ use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
 use crate::vector::tie_break::NoTieBreak;
 use crate::vector::write::RowAddress;
 use crate::vector::{
-    BlockAddress, PreparedVectorSearch, TopClustersBySimilarityCollector, VectorElement,
-    VectorScanInputs, VectorSearchBudget, VectorSegment, VectorStage,
+    BlockAddress, PostFilterStage, PreparedVectorSearch, TopClustersBySimilarityCollector,
+    VectorElement, VectorFilterStrategy, VectorScanInputs, VectorSearchBudget, VectorSegment,
+    VectorStage,
 };
 use crate::{DocAddress, DocId, Result, Score, SegmentOrdinal, TantivyError};
 
@@ -121,7 +127,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
         self
     }
 
-    /// Sets the probe parameters; flat segments ignore them.
+    /// Sets the probe parameters, including the required filter strategy.
     pub fn with_probe_params(mut self, params: ProbeParams) -> Self {
         self.probe_params = params;
         self
@@ -173,6 +179,19 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
         budget: VectorSearchBudget,
         on_segment: impl FnMut(SegmentOrdinal),
     ) -> Result<PreparedVectorSearch> {
+        if self.max_scan_levels == 0
+            && matches!(
+                self.probe_params.filter_strategy()?,
+                VectorFilterStrategy::Post {
+                    stage: PostFilterStage::AfterQuantizedScoring,
+                    ..
+                }
+            )
+        {
+            return Err(TantivyError::InvalidArgument(
+                "post-filtering requires quantized vector scanning".into(),
+            ));
+        }
         PreparedVectorSearch::prepare(
             self.field,
             self.limit.saturating_add(self.offset),
@@ -695,6 +714,7 @@ where
             self.segment_top_n(),
             &mut tie_break,
             self.tie_break.comparator(),
+            weight,
         )?;
         let merge = {
             let _assembly = enter_vector_stage(VectorStage::ResultAssembly);
@@ -818,8 +838,12 @@ where
         let (result, measured) = measure(|| -> Result<_> {
             match prepared.map(|segment| segment.scan.as_ref().expect("prepared segment")) {
                 Some(ScanInput::Flat { .. }) => {
-                    let (hits, report) =
-                        backend(i)?.top_n_by(top_n, tie_break, collector.tie_break.comparator())?;
+                    let (hits, report) = backend(i)?.top_n_by(
+                        top_n,
+                        tie_break,
+                        collector.tie_break.comparator(),
+                        weight,
+                    )?;
                     topk.merge_exact(hits.iter().map(|((score, _), address)| {
                         (
                             RowAddress {
@@ -870,6 +894,12 @@ where
                 },
             )
         })
+    });
+    let mut candidates = candidates.collect::<Vec<_>>();
+    let mut visited = HashSet::new();
+    let mut window = candidates.len().max(1);
+    let late_filter = collector.inputs.prepared.segments.iter().any(|s| {
+        matches!(&s.scan, Some(ScanInput::Routed { filter, .. }) if matches!(filter, DocFilter::Shortlist))
     });
     let mut reserved = WorkUnits::ZERO;
     let mut scans: Vec<_> = (0..vectors.len()).map(|_| None).collect();
@@ -961,6 +991,7 @@ where
             tie_break,
             collector.tie_break.comparator(),
         )
+        .map(|scan| scan.with_late_filter(backend.late_filter(weight)))
     };
     let mut meter = WorkMeter::new(
         WorkBudget {
@@ -989,13 +1020,8 @@ where
         on_segment(i);
         result?;
     }
-    // Refinement during probing tightens the pruning threshold whether or not adaptive probing
-    // measures admission to stop early.
-    let mut rate = (top_n > 0).then(|| {
-        crate::vector::search::scan::RateApsState::new(
-            collector.probe_params.adaptive_probing.is_some(),
-        )
-    });
+    let mut rate = (top_n > 0 && !late_filter)
+        .then(|| RateApsState::new(collector.probe_params.adaptive_probing.is_some()));
     let mut recall_reached = false;
     if collector
         .inputs
@@ -1018,7 +1044,8 @@ where
                         &segments[j].reader,
                         &vectors[j],
                         candidates
-                            .clone()
+                            .iter()
+                            .copied()
                             .filter_map(|(i, c)| (i == j).then_some(c)),
                     )?
                 {
@@ -1031,69 +1058,119 @@ where
             result?;
         }
     }
-    for (i, candidate) in candidates {
-        if meter.exhausted() || recall_reached {
-            break;
-        }
-        let Some(GlobalSource::Router(source)) = &mut sources[i] else {
-            unreachable!()
-        };
-        let (result, measured) = measure(|| {
-            if let Some(pending) = pending_scans[i].take() {
-                scans[i] = Some(start_scan(i, pending)?);
+    // Shortlist filtering can reject every candidate in the initial routing window. Complete
+    // each window's filtering and exact scoring before deciding whether more clusters are needed.
+    loop {
+        for (i, candidate) in candidates.drain(..) {
+            // Larger routing windows include previously ranked clusters; score each only once.
+            if late_filter && !visited.insert((i, candidate.node)) {
+                continue;
             }
-            let scan = scans[i].as_mut().unwrap();
-            scan.swap_topk(&mut topk);
-            scan.swap_rate(&mut rate);
-            let _stage = enter_vector_stage(scan.shortlist_stage());
-            meter.open();
-            if let Some(rows) = source.probe_global(candidate)? {
-                let scored = scan.shortlist(&rows)?;
-                source.admitted(scored)?;
-                meter.rows(scored);
+            if meter.exhausted() || recall_reached {
+                break;
+            }
+            let Some(GlobalSource::Router(source)) = &mut sources[i] else {
+                unreachable!()
+            };
+            let (result, measured) = measure(|| {
+                if let Some(pending) = pending_scans[i].take() {
+                    scans[i] = Some(start_scan(i, pending)?);
+                }
+                let scan = scans[i].as_mut().unwrap();
+                scan.swap_topk(&mut topk);
+                scan.swap_rate(&mut rate);
+                let _stage = enter_vector_stage(scan.shortlist_stage());
+                meter.open();
+                if let Some(rows) = source.probe_global(candidate)? {
+                    let scored = scan.shortlist(&rows)?;
+                    source.admitted(scored)?;
+                    meter.rows(scored);
+                    recall_reached = scan.recall_reached(&mut meter);
+                }
+                scan.swap_rate(&mut rate);
+                scan.swap_topk(&mut topk);
+                Ok::<_, TantivyError>(())
+            });
+            totals[i].append(&measured);
+            on_segment(i);
+            result?;
+            if !late_filter
+                && !recall_reached
+                && rate.as_mut().is_some_and(|rate| rate.refinement_due())
+            {
+                let candidates = best_estimates(scans.iter().flatten(), top_n);
+                refine_candidates(&mut scans, &candidates, &mut topk, totals, &mut *on_segment)?;
+                let scan = scans[i].as_mut().unwrap();
+                scan.swap_rate(&mut rate);
                 recall_reached = scan.recall_reached(&mut meter);
+                scan.swap_rate(&mut rate);
             }
-            scan.swap_rate(&mut rate);
+        }
+        for (i, scan) in scans.iter_mut().enumerate() {
+            let Some(scan) = scan else {
+                continue;
+            };
             scan.swap_topk(&mut topk);
-            Ok::<_, TantivyError>(())
-        });
-        totals[i].append(&measured);
-        on_segment(i);
-        result?;
-        if !recall_reached && rate.as_mut().is_some_and(|rate| rate.refinement_due()) {
+            let (result, measured) = measure(|| scan.narrow_shortlist());
+            scan.swap_topk(&mut topk);
+            totals[i].append(&measured);
+            on_segment(i);
+            result?;
+        }
+        if best_estimates_first() {
             let candidates = best_estimates(scans.iter().flatten(), top_n);
             refine_candidates(&mut scans, &candidates, &mut topk, totals, &mut *on_segment)?;
-            let scan = scans[i].as_mut().unwrap();
-            scan.swap_rate(&mut rate);
-            recall_reached = scan.recall_reached(&mut meter);
-            scan.swap_rate(&mut rate);
         }
-    }
-    for (i, scan) in scans.iter_mut().enumerate() {
-        let Some(scan) = scan else {
-            continue;
-        };
-        scan.swap_topk(&mut topk);
-        let (result, measured) = measure(|| scan.narrow_shortlist());
-        scan.swap_topk(&mut topk);
-        totals[i].append(&measured);
-        on_segment(i);
-        result?;
-    }
-    if best_estimates_first() {
-        let candidates = best_estimates(scans.iter().flatten(), top_n);
-        refine_candidates(&mut scans, &candidates, &mut topk, totals, &mut *on_segment)?;
-    }
-    for (i, scan) in scans.iter_mut().enumerate() {
-        let Some(scan) = scan else {
-            continue;
-        };
-        scan.swap_topk(&mut topk);
-        let (result, measured) = measure(|| scan.score_shortlist());
-        scan.swap_topk(&mut topk);
-        totals[i].append(&measured);
-        on_segment(i);
-        result?;
+        for (i, scan) in scans.iter_mut().enumerate() {
+            let Some(scan) = scan else {
+                continue;
+            };
+            scan.swap_topk(&mut topk);
+            let (result, measured) = measure(|| scan.score_shortlist());
+            scan.swap_topk(&mut topk);
+            totals[i].append(&measured);
+            on_segment(i);
+            result?;
+        }
+        let clusters: usize = vectors
+            .iter()
+            .filter_map(|r| r.index())
+            .map(|i| i.num_clusters())
+            .sum();
+        if !late_filter || meter.exhausted() || topk.kth_lower().is_some() || window >= clusters {
+            break;
+        }
+        // The filtered top-k is still underfilled. Widen the routing window while preserving
+        // accepted hits and the work already charged to the shared search budget.
+        window = window.saturating_mul(2).min(clusters);
+        let routers: Vec<_> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                matches!(sources[i], Some(GlobalSource::Router(_)))
+                    .then(|| r.index().unwrap().opened_router())
+            })
+            .collect();
+        let partitions: Vec<_> = segments
+            .iter()
+            .map(|s| s.partition_centroid.as_deref())
+            .collect();
+        let query = collector.vector_query(vectors[0].options().metric())?;
+        let ranking = GlobalRanking::from(
+            &routers,
+            &partitions,
+            &query,
+            RoutingParams {
+                k: window,
+                rerank_factor: collector.probe_params.router_rerank_factor,
+                min_beam_fraction: collector.probe_params.router_min_beam_fraction,
+                aps: collector.probe_params.router_aps,
+                flat: collector.probe_params.router_flat,
+            },
+            totals,
+            on_segment,
+        );
+        candidates = ranking.clusters;
     }
     for (i, ((scan, source), report)) in scans.into_iter().zip(sources).zip(reports).enumerate() {
         let Some(source) = source else {
@@ -1198,8 +1275,8 @@ mod ivf_e2e_tests {
     use crate::vector::test_support::{FixtureSpec, Layout};
     use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
     use crate::vector::{
-        AdaptiveProbeParams, Candidate, ClusterRef, ProbeTermination, RouterKind,
-        TopClustersBySimilarityCollector, VectorFilterStrategy, VectorSearchBudget,
+        AdaptiveProbeParams, Candidate, ClusterRef, PostFilterStage, ProbeTermination, RouterKind,
+        TopClustersBySimilarityCollector, VectorFilterStrategy, VectorSearchBudget, VectorStage,
     };
     use crate::{
         DocAddress, Index, IndexWriter, Order, Result, Score, TantivyDocument, TantivyError, Term,
@@ -1316,6 +1393,7 @@ mod ivf_e2e_tests {
                             .with_probe_params(ProbeParams {
                                 filter_strategy: Some(if batched {
                                     VectorFilterStrategy::Post {
+                                        stage: PostFilterStage::BeforeQuantizedScoring,
                                         estimated_selectivity: 0.05,
                                     }
                                 } else {
@@ -2053,7 +2131,8 @@ mod ivf_e2e_tests {
     /// metrics and its share of the ranking time, on the shared and the local scan paths.
     #[test]
     fn unplanned_routed_segments_report_their_routing() -> Result<()> {
-        let fixture = FixtureSpec::clustered(Metric::L2, 32, 8, 384)
+        let fixture = FixtureSpec::clustered(Metric::L2, 64, 8, 384)
+            .schedule(&[1])
             .segments(3)
             .label("matches", |_| true)
             .build()?;
@@ -2064,20 +2143,33 @@ mod ivf_e2e_tests {
             .enumerate()
             .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
             .collect();
-        let query = vec![0.0f32; 32];
+        let query = vec![0.0f32; 64];
         let params = ProbeParams {
             max_probe: 1,
             located: LocatedPath::Off,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
-        let builder = || {
+        let builder = |strategy| {
             TopDocs::with_limit(5)
                 .order_by_similarity(fixture.field, query.clone())
-                .with_probe_params(params.clone())
+                .with_probe_params(ProbeParams {
+                    filter_strategy: Some(strategy),
+                    ..params.clone()
+                })
         };
         let filter = fixture.filter("matches");
         let weight = fixture.weight(&filter)?;
-        for shared in [true, false] {
+        for (shared, late) in [(true, false), (false, false), (true, true), (false, true)] {
+            let strategy = if late {
+                VectorFilterStrategy::Post {
+                    stage: PostFilterStage::AfterQuantizedScoring,
+                    estimated_selectivity: 1.0,
+                }
+            } else {
+                VectorFilterStrategy::Pre {
+                    uses_fast_fields: false,
+                }
+            };
             let router = TopClustersBySimilarityCollector::new(
                 fixture.field,
                 query.clone(),
@@ -2087,13 +2179,13 @@ mod ivf_e2e_tests {
             let candidates = router.collect_segments(&readers, |_| {})?;
             let statistics = router.take_statistics();
             let budget = VectorSearchBudget::for_segments(fixture.field, &params, &readers)?;
-            let prepared = builder().prepare(weight.as_ref(), &readers, budget, |_| {})?;
+            let prepared = builder(strategy).prepare(weight.as_ref(), &readers, budget, |_| {})?;
             let work: Option<Arc<dyn crate::vector::SharedVectorWork>> = if shared {
                 Some(Arc::new(crate::vector::AtomicVectorWork::default()))
             } else {
                 None
             };
-            let collector = builder().build(
+            let collector = builder(strategy).build(
                 prepared
                     .with_candidates(candidates.clone(), work)?
                     .with_routing_statistics(statistics.clone()),
@@ -2103,6 +2195,7 @@ mod ivf_e2e_tests {
                 &readers,
                 |_| {},
             )?)?;
+            assert_eq!(fruit.results.len(), 5);
             let mut unplanned = 0;
             for (segment, stats) in readers.iter().zip(&fruit.stats) {
                 let clusters = segment
@@ -2127,10 +2220,12 @@ mod ivf_e2e_tests {
                     serde_json::to_value(stats.routing).unwrap(),
                     serde_json::to_value(Some(routing.metrics)).unwrap()
                 );
-                assert_eq!(
-                    stats.routing_ns,
-                    routing.totals.time_ns(crate::vector::VectorStage::Routing)
-                );
+                let initial_routing_ns = routing.totals.time_ns(VectorStage::Routing);
+                if late {
+                    assert!(stats.routing_ns >= initial_routing_ns);
+                } else {
+                    assert_eq!(stats.routing_ns, initial_routing_ns);
+                }
             }
             assert!(unplanned > 0, "shared={shared}");
         }
@@ -2737,6 +2832,7 @@ mod ivf_e2e_tests {
             )?)?;
             let mut cluster_builder = builder.clone();
             cluster_builder.probe_params.filter_strategy = Some(VectorFilterStrategy::Post {
+                stage: PostFilterStage::BeforeQuantizedScoring,
                 estimated_selectivity,
             });
             let clustered =
@@ -2760,6 +2856,7 @@ mod ivf_e2e_tests {
                         min_probe_clusters: 1,
                         located: LocatedPath::Auto,
                         filter_strategy: Some(VectorFilterStrategy::Post {
+                            stage: PostFilterStage::BeforeQuantizedScoring,
                             estimated_selectivity: 0.01,
                         }),
                         ..exhaustive_params(2)
@@ -3408,5 +3505,600 @@ mod prepared_key_tests {
             grid,
         };
         assert_ne!(quant(g), quant(other));
+    }
+}
+
+#[cfg(test)]
+mod late_filter_tests {
+    use std::collections::HashSet;
+    use std::ops::Bound;
+
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use proptest::sample::select;
+
+    use super::*;
+    use crate::query::{
+        BooleanQuery, BoostQuery, CandidateHint, ConstScoreQuery, ExcludedDocSet, ExclusionSet,
+        Explanation, FastFieldRangeQuery, Occur, Query, Scorer, UnpositionedScorer, Weight,
+    };
+    use crate::schema::Metric;
+    use crate::vector::filter::DocFilter;
+    use crate::vector::test_support::FixtureSpec;
+    use crate::vector::tests::exhaustive_params;
+    use crate::vector::{
+        AdaptiveProbeParams, AtomicVectorWork, LocatedPath, PostFilterStage, SharedVectorWork,
+        VectorFilterStrategy, MIN_POST_FILTER_MATCHES, MIN_SHORTLIST_FILTER_MATCHES,
+    };
+    use crate::{DocId, SegmentReader, Term};
+
+    struct DeferredWeight {
+        inner: Box<dyn Weight>,
+        allow_enumeration: bool,
+    }
+    impl Weight for DeferredWeight {
+        fn uses_fast_fields(&self) -> bool {
+            true
+        }
+        fn scorer_for_candidates_unpositioned(
+            &self,
+            reader: &SegmentReader,
+            boost: Score,
+            candidate_hint: CandidateHint,
+        ) -> Result<UnpositionedScorer> {
+            self.inner
+                .scorer_for_candidates_unpositioned(reader, boost, candidate_hint)
+        }
+        fn scorer(&self, reader: &SegmentReader, boost: Score) -> Result<Box<dyn Scorer>> {
+            assert!(
+                self.allow_enumeration,
+                "late preparation must not enumerate matches"
+            );
+            self.inner.scorer(reader, boost)
+        }
+        fn explain(&self, reader: &SegmentReader, doc: DocId) -> Result<Explanation> {
+            self.inner.explain(reader, doc)
+        }
+    }
+
+    const FILTER_PROPERTY_CASES: u32 = 32;
+    const FILTER_TEST_DIMENSIONS: usize = 64;
+    const FILTER_TEST_CLUSTERS: usize = FILTER_TEST_DIMENSIONS / 2;
+    const FILTER_TEST_DOCS: usize = 4096;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(FILTER_PROPERTY_CASES))]
+
+        #[test]
+        fn filtering_strategy_respects_query_kind_and_scan_support(
+            schedules in vec(select(vec![vec![], vec![1], vec![1, 4]]), 1..=3),
+            matches in prop_oneof![
+                select(vec![
+                    0,
+                    MIN_POST_FILTER_MATCHES - 1,
+                    MIN_POST_FILTER_MATCHES,
+                    MIN_SHORTLIST_FILTER_MATCHES - 1,
+                    MIN_SHORTLIST_FILTER_MATCHES,
+                    usize::MAX,
+                ]),
+                0..=MIN_SHORTLIST_FILTER_MATCHES * 2,
+                any::<usize>(),
+            ],
+            levels in prop_oneof![Just(0usize), Just(1usize), any::<usize>()],
+        ) {
+            let mut segments = Vec::new();
+            let mut supports_shortlist = levels > 0;
+            for schedule in schedules {
+                let fixture = FixtureSpec::clustered(
+                    Metric::L2,
+                    FILTER_TEST_DIMENSIONS,
+                    FILTER_TEST_CLUSTERS,
+                    FILTER_TEST_DOCS,
+                )
+                .schedule(&schedule)
+                .label("matches", |i| i % 2 == 0)
+                .build()?;
+                let searcher = fixture.index.reader()?.searcher();
+                segments.push(VectorSegment::from((
+                    segments.len() as u32,
+                    searcher.segment_reader(0),
+                )));
+                supports_shortlist &= !schedule.is_empty();
+                let filter = fixture.filter("matches");
+                let posting_weight = fixture.weight(&filter)?;
+                let fast_weight = DeferredWeight {
+                    inner: fixture.weight(&filter)?,
+                    allow_enumeration: false,
+                };
+                prop_assert_eq!(
+                    VectorFilterStrategy::plan(
+                        fixture.field,
+                        posting_weight.as_ref(),
+                        matches,
+                        levels,
+                        &segments,
+                    )?,
+                    VectorFilterStrategy::Pre { uses_fast_fields: false },
+                );
+                let strategy = VectorFilterStrategy::plan(
+                    fixture.field,
+                    &fast_weight,
+                    matches,
+                    levels,
+                    &segments,
+                )?;
+                let roundtrip = serde_json::from_str::<VectorFilterStrategy>(
+                    &serde_json::to_string(&strategy)?,
+                )?;
+                prop_assert_eq!(roundtrip, strategy);
+                prop_assert_eq!(
+                    strategy,
+                    if supports_shortlist && matches >= MIN_SHORTLIST_FILTER_MATCHES {
+                        VectorFilterStrategy::Post {
+                            stage: PostFilterStage::AfterQuantizedScoring,
+                            estimated_selectivity: 1.0,
+                        }
+                    } else if matches >= MIN_POST_FILTER_MATCHES {
+                        VectorFilterStrategy::Post {
+                            stage: PostFilterStage::BeforeQuantizedScoring,
+                            estimated_selectivity: 1.0,
+                        }
+                    } else {
+                        VectorFilterStrategy::Pre { uses_fast_fields: true }
+                    },
+                );
+                let params = ProbeParams {
+                    filter_strategy: Some(strategy),
+                    ..ProbeParams::prefilter()
+                };
+                let builder = TopDocsByVectorSimilarityBuilder::new(
+                    fixture.field,
+                    vec![0.0; FILTER_TEST_DIMENSIONS],
+                    10,
+                )
+                .with_probe_params(params.clone())
+                .with_max_scan_levels(levels);
+                let weight = DeferredWeight {
+                    inner: fixture.weight(&filter)?,
+                    allow_enumeration: !matches!(
+                        strategy,
+                        VectorFilterStrategy::Post {
+                            stage: PostFilterStage::AfterQuantizedScoring,
+                            ..
+                        }
+                    ),
+                };
+                let budget = VectorSearchBudget::for_segments(fixture.field, &params, &segments)?;
+                builder.prepare(&weight, &segments, budget, |_| {})?;
+            }
+        }
+
+        #[test]
+        fn late_filter_never_prunes_on_rejected_neighbors(
+            replicated in any::<bool>(),
+            shared in any::<bool>(),
+            adaptive in any::<bool>(),
+            match_stride in 2usize..=16,
+            deleted_matches in 0usize..=5,
+            top_n in 1usize..=20,
+            query in prop_oneof![
+                Just(vec![0.0f32; FILTER_TEST_DIMENSIONS]),
+                vec(-0.5f32..0.5f32, FILTER_TEST_DIMENSIONS),
+            ],
+        ) {
+            let deletes: Vec<_> = (0..deleted_matches).map(|i| i * match_stride).collect();
+            let mut spec = FixtureSpec::clustered(
+                Metric::L2,
+                FILTER_TEST_DIMENSIONS,
+                FILTER_TEST_CLUSTERS,
+                FILTER_TEST_DOCS,
+            )
+            .schedule(&[1, 4])
+            .segments(2)
+            .label("matches", |i| i % match_stride == 0)
+            .deletes(&deletes)
+            .paged();
+            if replicated {
+                spec = spec.replicated();
+            }
+            let fixture = spec.build()?;
+            let searcher = fixture.index.reader()?.searcher();
+            let segments: Vec<_> = searcher
+                .segment_readers()
+                .iter()
+                .enumerate()
+                .map(|(i, r)| VectorSegment::from((i as u32, r)))
+                .collect();
+            let filter = fixture.filter("matches");
+            let weight = fixture.weight(&filter)?;
+            let mut builder = TopDocsByVectorSimilarityBuilder::new(
+                fixture.field,
+                query.clone(),
+                top_n,
+            )
+            .with_probe_params(ProbeParams {
+                located: LocatedPath::Off,
+                ..exhaustive_params(FILTER_TEST_CLUSTERS * segments.len())
+            });
+            let budget =
+                VectorSearchBudget::for_segments(fixture.field, &builder.probe_params, &segments)?;
+            let mut prepared = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
+            for segment in &mut prepared.segments {
+                let ScanInput::Routed { filter, .. } = segment.scan.as_mut().unwrap() else {
+                    panic!("routed scan")
+                };
+                *filter = DocFilter::Shortlist;
+            }
+            let selectivity = 1.0 / match_stride as f64;
+            let router = TopClustersBySimilarityCollector::new(
+                fixture.field,
+                query.clone(),
+                builder.probe_params.clone(),
+                selectivity,
+            )?
+            .with_budget(budget);
+            let candidates = router.collect_segments(&segments, |_| {})?;
+            builder.probe_params.filter_strategy = Some(VectorFilterStrategy::Post {
+                stage: PostFilterStage::AfterQuantizedScoring,
+                estimated_selectivity: selectivity,
+            });
+            builder.probe_params.adaptive_probing = adaptive.then_some(AdaptiveProbeParams {
+                admission_fraction: 1.0,
+            });
+            let work = shared
+                .then(|| Arc::new(AtomicVectorWork::default()) as Arc<dyn SharedVectorWork>);
+            let collector = builder.build(prepared.with_candidates(candidates, work)?);
+            fixture.clear_reads();
+            let fruit = collector.merge_fruits(collector.collect_segments(
+                weight.as_ref(),
+                &segments,
+                |_| {},
+            )?)?;
+            prop_assert_eq!(fruit.results, fixture.oracle(&filter, &query, top_n)?);
+            prop_assert!(fruit
+                .stats
+                .iter()
+                .all(|s| s.termination != ProbeTermination::QuantizedRecall));
+            let reads = fixture.reads();
+            let first_exact = reads
+                .iter()
+                .position(|(stage, _)| *stage == VectorStage::ExactFetch)
+                .unwrap();
+            let last_probe = reads
+                .iter()
+                .rposition(|(stage, _)| *stage == VectorStage::LayerScan(0))
+                .unwrap();
+            if !shared {
+                prop_assert!(first_exact > last_probe);
+            }
+            for stats in &fruit.stats {
+                let rows = &stats.quantized_trace.refined_topk_rows;
+                let unique: HashSet<_> = rows.iter().collect();
+                prop_assert_eq!(rows.len(), unique.len());
+            }
+            // The actual eligibility path must also avoid draining the filter.
+            let params = ProbeParams {
+                max_probe: 1,
+                filter_strategy: Some(VectorFilterStrategy::Post {
+                    stage: PostFilterStage::AfterQuantizedScoring,
+                    estimated_selectivity: selectivity,
+                }),
+                ..ProbeParams::prefilter()
+            };
+            let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query, top_n)
+                .with_probe_params(params);
+            let deferred = DeferredWeight {
+                inner: weight,
+                allow_enumeration: false,
+            };
+            let collector = builder.build_for_segments(&deferred, &segments, |_| {})?;
+            let fruit = collector.merge_fruits(collector.collect_segments(
+                &deferred,
+                &segments,
+                |_| {},
+            )?)?;
+            prop_assert!(fruit.results.len() <= top_n);
+        }
+    }
+    #[test]
+    fn deferred_range_and_postings_match_exact_search() -> Result<()> {
+        let fixture = FixtureSpec::clustered(Metric::L2, 64, 32, 8192)
+            .schedule(&[1, 4])
+            .segments(2)
+            .replicated()
+            .label("matches", |i| i % 5 == 0)
+            .deletes(&[0, 5, 100, 2000])
+            .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let segments: Vec<_> = searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .map(|(i, reader)| VectorSegment::from((i as u32, reader)))
+            .collect();
+        let ordinal = searcher.schema().get_field("ordinal")?;
+        let range = || {
+            Box::new(FastFieldRangeQuery::new(
+                Bound::Included(Term::from_field_u64(ordinal, 1000)),
+                Bound::Excluded(Term::from_field_u64(ordinal, 5000)),
+            )) as Box<dyn Query>
+        };
+        let term = || Box::new(fixture.filter("matches")) as Box<dyn Query>;
+        let mut minimum =
+            BooleanQuery::new(vec![(Occur::Should, range()), (Occur::Should, term())]);
+        minimum.set_minimum_number_should_match(2);
+        let filters: Vec<Box<dyn Query>> = vec![
+            range(),
+            Box::new(BoostQuery::new(range(), 2.0)),
+            Box::new(ConstScoreQuery::new(range(), 1.0)),
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, range()),
+                (Occur::Must, term()),
+            ])),
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Should, range()),
+                (Occur::Should, term()),
+            ])),
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, range()),
+                (Occur::MustNot, term()),
+            ])),
+            Box::new(minimum),
+        ];
+        let query = vec![0.0f32; 64];
+        for filter in filters {
+            let weight = fixture.weight(filter.as_ref())?;
+            for (levels, estimated_selectivity) in
+                [(1, 1.0), (usize::MAX, 1.0), (1, 0.1), (usize::MAX, 0.1)]
+            {
+                let builder =
+                    TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
+                        .with_probe_params(ProbeParams {
+                            filter_strategy: Some(VectorFilterStrategy::Post {
+                                stage: PostFilterStage::AfterQuantizedScoring,
+                                estimated_selectivity,
+                            }),
+                            ..exhaustive_params(64)
+                        })
+                        .with_max_scan_levels(levels);
+                let collector = builder.build_for_segments(weight.as_ref(), &segments, |_| {})?;
+                let fruit = collector.merge_fruits(collector.collect_segments(
+                    weight.as_ref(),
+                    &segments,
+                    |_| {},
+                )?)?;
+                assert_eq!(
+                    fruit.results,
+                    fixture.oracle(filter.as_ref(), &query, 10)?,
+                    "{filter:?}, levels={levels}, selectivity={estimated_selectivity}"
+                );
+                if levels > 1 {
+                    assert!(
+                        fruit
+                            .stats
+                            .iter()
+                            .map(|s| s.layers.get(1).unwrap().scored())
+                            .sum::<usize>()
+                            < fruit
+                                .stats
+                                .iter()
+                                .map(|s| s.layers.get(0).unwrap().scored())
+                                .sum::<usize>(),
+                        "lazy refinement must not rescan the entire candidate pool"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn late_filter_retries_without_rescanning_clusters() -> Result<()> {
+        let fixture = FixtureSpec::clustered(Metric::L2, 64, 32, 4096)
+            .schedule(&[1])
+            .label("matches", |i| i % 32 == 31)
+            .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let segments = vec![VectorSegment::from((0, searcher.segment_reader(0)))];
+        let filter = fixture.filter("matches");
+        let weight = fixture.weight(&filter)?;
+        let query = vec![0.0f32; 64];
+        let params = ProbeParams {
+            located: LocatedPath::Off,
+            ..exhaustive_params(32)
+        };
+        let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
+            .with_probe_params(ProbeParams {
+                filter_strategy: Some(VectorFilterStrategy::Post {
+                    stage: PostFilterStage::AfterQuantizedScoring,
+                    estimated_selectivity: 1.0 / 32.0,
+                }),
+                ..params.clone()
+            });
+        let budget = VectorSearchBudget::for_segments(fixture.field, &params, &segments)?;
+        let mut prepared = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
+        let ScanInput::Routed { filter, .. } = prepared.segments[0].scan.as_mut().unwrap() else {
+            panic!("routed")
+        };
+        *filter = DocFilter::Shortlist;
+        let router =
+            TopClustersBySimilarityCollector::new(fixture.field, query.clone(), params, 1.0)?
+                .with_budget(budget);
+        let candidates = router.collect_segments(&segments, |_| {})?;
+        let reader = segments[0].reader.vector_index(fixture.field)?;
+        let mut docs = Vec::new();
+        let first = candidates
+            .into_iter()
+            .find(|c| {
+                reader.read_doc_ids(c.node.1 as usize, &mut docs).unwrap();
+                let mut scorer =
+                    ExcludedDocSet::new(weight.scorer(&segments[0].reader, 1.0).unwrap());
+                !docs.iter().any(|&doc| scorer.contains(doc))
+            })
+            .unwrap();
+        for shared in [false, true] {
+            let work =
+                shared.then(|| Arc::new(AtomicVectorWork::default()) as Arc<dyn SharedVectorWork>);
+            let collector = builder.clone().build(
+                prepared
+                    .clone()
+                    .with_candidates(vec![first.clone()], work)?,
+            );
+            let fruit = collector.merge_fruits(collector.collect_segments(
+                weight.as_ref(),
+                &segments,
+                |_| {},
+            )?)?;
+            assert_eq!(
+                fruit.results,
+                fixture.oracle(&fixture.filter("matches"), &query, 10)?
+            );
+            assert!(fruit.stats[0].candidates_scored <= 4096);
+        }
+        Ok(())
+    }
+    #[test]
+    fn late_filter_eligibility_is_independent_of_probe_budget() -> Result<()> {
+        let fixture = FixtureSpec::clustered(Metric::L2, 64, 32, 4096)
+            .schedule(&[1])
+            .label("matches", |i| i % 10 == 0)
+            .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let segments = vec![VectorSegment::from((0, searcher.segment_reader(0)))];
+        for max_probe in [1, 100, 100_000] {
+            for (matches, late) in [
+                (MIN_SHORTLIST_FILTER_MATCHES - 1, false),
+                (MIN_SHORTLIST_FILTER_MATCHES, true),
+            ] {
+                let weight = DeferredWeight {
+                    inner: fixture.weight(&fixture.filter("matches"))?,
+                    allow_enumeration: !late,
+                };
+                let params = ProbeParams {
+                    max_probe,
+                    filter_strategy: Some(VectorFilterStrategy::plan(
+                        fixture.field,
+                        &weight,
+                        matches,
+                        usize::MAX,
+                        &segments,
+                    )?),
+                    located: LocatedPath::Off,
+                    ..ProbeParams::prefilter()
+                };
+                let builder =
+                    TopDocsByVectorSimilarityBuilder::new(fixture.field, vec![0.0f32; 64], 10)
+                        .with_probe_params(params.clone());
+                let budget = VectorSearchBudget::for_segments(fixture.field, &params, &segments)?;
+                let prepared = builder.prepare(&weight, &segments, budget, |_| {})?;
+                let ScanInput::Routed { filter, .. } = prepared.segments[0].scan.as_ref().unwrap()
+                else {
+                    panic!("routed")
+                };
+                assert_eq!(matches!(filter, DocFilter::Shortlist), late);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn late_filter_exhausts_sparse_candidates_once() -> Result<()> {
+        let fixture = FixtureSpec::clustered(Metric::L2, 64, 64, 32768)
+            .schedule(&[1])
+            .label("matches", |i| i < 2)
+            .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let segments = vec![VectorSegment::from((0, searcher.segment_reader(0)))];
+        let filter = fixture.filter("matches");
+        let weight = DeferredWeight {
+            inner: fixture.weight(&filter)?,
+            allow_enumeration: false,
+        };
+        let query = vec![0.0f32; 64];
+        let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
+            .with_probe_params(ProbeParams {
+                filter_strategy: Some(VectorFilterStrategy::Post {
+                    stage: PostFilterStage::AfterQuantizedScoring,
+                    estimated_selectivity: 0.1,
+                }),
+                ..exhaustive_params(64)
+            });
+        let collector = builder.build_for_segments(&weight, &segments, |_| {})?;
+        let fruit =
+            collector.merge_fruits(collector.collect_segments(&weight, &segments, |_| {})?)?;
+        assert_eq!(fruit.results, fixture.oracle(&filter, &query, 10)?);
+        assert_eq!(fruit.stats[0].candidates_scored, 32768);
+        assert_eq!(fruit.stats[0].exact_rows, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn post_filter_checks_flat_segments_without_enumeration() -> Result<()> {
+        let fixture = FixtureSpec::flat(
+            Metric::L2,
+            64,
+            (0..257).map(|i| Some(vec![i as f32; 64])).collect(),
+        )
+        .segments(2)
+        .label("matches", |i| i % 3 == 0)
+        .deletes(&[0, 3, 6])
+        .build()?;
+        let searcher = fixture.index.reader()?.searcher();
+        let segments = searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .map(|(ord, reader)| VectorSegment::from((ord as u32, reader)))
+            .collect::<Vec<_>>();
+        let filter = fixture.filter("matches");
+        let weight = DeferredWeight {
+            inner: fixture.weight(&filter)?,
+            allow_enumeration: false,
+        };
+        assert_eq!(
+            VectorFilterStrategy::plan(
+                fixture.field,
+                &weight,
+                MIN_SHORTLIST_FILTER_MATCHES,
+                usize::MAX,
+                &segments,
+            )?,
+            VectorFilterStrategy::Post {
+                stage: PostFilterStage::AfterQuantizedScoring,
+                estimated_selectivity: 1.0
+            },
+        );
+        assert_eq!(
+            VectorFilterStrategy::plan(
+                fixture.field,
+                &weight,
+                MIN_SHORTLIST_FILTER_MATCHES,
+                usize::MAX,
+                &[],
+            )?,
+            VectorFilterStrategy::Pre {
+                uses_fast_fields: true,
+            },
+        );
+        let query = vec![0.0f32; 64];
+        let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
+            .with_probe_params(ProbeParams {
+                filter_strategy: Some(VectorFilterStrategy::Post {
+                    stage: PostFilterStage::AfterQuantizedScoring,
+                    estimated_selectivity: 0.1,
+                }),
+                ..ProbeParams::prefilter()
+            });
+        let collector = builder
+            .clone()
+            .build_for_segments(&weight, &segments, |_| {})?;
+        let fruit =
+            collector.merge_fruits(collector.collect_segments(&weight, &segments, |_| {})?)?;
+        assert_eq!(fruit.results, fixture.oracle(&filter, &query, 10)?);
+        assert!(builder
+            .with_max_scan_levels(0)
+            .build_for_segments(&weight, &segments, |_| {})
+            .is_err());
+        Ok(())
     }
 }

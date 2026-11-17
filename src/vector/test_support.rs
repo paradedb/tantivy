@@ -747,7 +747,7 @@ impl Fixture {
             params,
         )?
         .with_test_candidates(&inputs);
-        backend.top_n(top_n)
+        backend.top_n(top_n, weight)
     }
 
     /// Searches segment `segment` directly with the quantized query a collector prepares, every
@@ -829,7 +829,7 @@ impl Fixture {
         backend.plan_override = plan;
         backend.admission_pruning_disabled = !admission_pruning;
         backend.collector_topk = collector_topk;
-        backend.top_n(top_n)
+        backend.top_n(top_n, weight)
     }
 
     /// Runs `run` over the first segment's prepared source for the supplied search arguments.

@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+use common::BitSet;
+
 use crate::vector::filter::{DocFilter, GatedRows, RowGate};
 use crate::vector::router::candidate::Candidate;
 use crate::vector::router::{RouterIter, RouterMetrics};
@@ -62,6 +64,7 @@ pub(crate) struct RouterClusters<'a> {
     offsets: Vec<u32>,
     selected_docs: Vec<DocId>,
     counters: RouterCounters,
+    visited: BitSet,
 }
 
 impl<'a> RouterClusters<'a> {
@@ -86,7 +89,16 @@ impl<'a> RouterClusters<'a> {
             offsets: Vec::new(),
             selected_docs: Vec::new(),
             counters: RouterCounters::default(),
+            visited: BitSet::with_max_value(index.num_clusters() as u32),
         }
+    }
+
+    pub(crate) fn replace_ranking(&mut self, ranked: RouterIter) {
+        self.ranked = ranked;
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.meter.exhausted()
     }
 
     /// Prepares this segment for a global search across multiple segments.
@@ -211,6 +223,9 @@ impl ClusterSource for RouterClusters<'_> {
             let Some(Candidate { sim, node }) = next else {
                 return Ok(None);
             };
+            if !self.visited.insert(node) {
+                continue;
+            }
             if !self.controller.admit(&self.meter) {
                 return Ok(None);
             }
