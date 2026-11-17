@@ -363,13 +363,7 @@ impl IvfClusterer for SuperKMeansClusterer {
 
     /// The nearest centroid and the SOAR secondary among the [`SOAR_CANDIDATES`] centroids
     /// nearest to each vector after it, from one assigner prepared for the whole source; `None`
-    /// with a single centroid.
-    ///
-    /// One GEMM pass over every centroid gives the primary and the candidates; the secondary's
-    /// alignment terms come from that pass's dot products and one centroid-centroid dot product
-    /// per candidate, so its cost per row is fixed by [`SOAR_CANDIDATES`], not by the centroid
-    /// count. The assigner holds only the centroids' norms, so batches take the whole memory
-    /// budget.
+    /// with a single centroid. Batches are as large as the memory budget allows.
     fn assign_pairs(
         &self,
         options: &VectorOptions,

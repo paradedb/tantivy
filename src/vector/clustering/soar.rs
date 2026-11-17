@@ -10,4 +10,9 @@
 pub(crate) const SOAR_LAMBDA: f32 = 2.0;
 
 /// Policy constant: each secondary is chosen among this many nearest centroids.
+///
+/// Worst case, for any count: the candidates hold `c2`, the nearest centroid after the primary,
+/// whose score is at most `(1 + lambda) * ||x - c2||^2` since the alignment term never exceeds the
+/// distance, while every centroid scores at least `||x - c2||^2`. The secondary chosen here
+/// therefore scores within a factor `1 + lambda` of the best over every centroid.
 pub(crate) const SOAR_CANDIDATES: usize = 64;
