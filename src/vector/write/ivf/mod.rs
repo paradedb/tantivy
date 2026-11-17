@@ -73,7 +73,7 @@ struct IvfBuildTimings {
     train: Duration,
     router: Duration,
     assign: Duration,
-    rest: Duration,
+    other: Duration,
 }
 
 fn finish_stage(start: &mut Instant) -> Duration {
@@ -199,7 +199,7 @@ pub(crate) fn merge_ivf(
 
         match opts.dtype() {
             VectorDType::F32 => {
-                timings.rest += finish_stage(&mut stage_start);
+                timings.other += finish_stage(&mut stage_start);
                 let trained =
                     train::train(&merge, clusterer, &source_rows, vector_count, &mut timings)?;
                 timings.train += finish_stage(&mut stage_start);
@@ -297,16 +297,16 @@ pub(crate) fn merge_ivf(
     timings.vec_bytes += vec_write.written_bytes() - id_map_start;
     vec_write.close()?;
     centroids_write.close()?;
-    timings.rest += finish_stage(&mut stage_start);
+    timings.other += finish_stage(&mut stage_start);
     log::info!(
         target: "paradedb::ivf_build",
-        "ivf_build timings_ms train={} router={} assign={} rest={} total={} \
+        "ivf_build timings_ms train={} router={} assign={} other={} total={} \
          fields={} centroids={} vectors={} train_reads={} assign_reads={} \
          encode_reads={} exact_reads={} replica_bytes={} vec_bytes={} pad_bytes={}",
         timings.train.as_millis(),
         timings.router.as_millis(),
         timings.assign.as_millis(),
-        timings.rest.as_millis(),
+        timings.other.as_millis(),
         stage_start.duration_since(build_start).as_millis(),
         fields,
         centroids,
