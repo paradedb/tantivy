@@ -351,6 +351,7 @@ impl TermSetWeight {
             return Ok(Box::new(EmptyScorer));
         }
         let weight = AutomatonWeight::new(self.field, SetDfaWrapper(explicit.fst()?))
+            .with_scoring_enabled(!self.bitmap_enabled)
             .with_bitmap_postings(self.bitmap_enabled);
         weight.scorer(reader, boost)
     }

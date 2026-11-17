@@ -214,6 +214,7 @@ impl Query for InvertedIndexTermSetQuery {
                 Occur::Should,
                 Box::new(
                     AutomatonWeight::new(field, SetDfaWrapper(Arc::new(map)))
+                        .with_scoring_enabled(enable_scoring.is_scoring_enabled())
                         .with_bitmap_postings(enable_scoring.bitmap_postings_enabled()),
                 ),
             ));

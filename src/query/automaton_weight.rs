@@ -2,10 +2,12 @@ use std::any::{Any, TypeId};
 use std::io;
 use std::sync::Arc;
 
+use common::BitSet;
 use tantivy_fst::Automaton;
 
+use super::bitset::or_term_info_into_bitset;
 use super::phrase_prefix_query::prefix_end;
-use super::BufferedUnionScorer;
+use super::{BitSetDocSet, BufferedUnionScorer};
 use crate::index::SegmentReader;
 use crate::postings::TermInfo;
 use crate::query::fuzzy_query::DfaWrapper;
@@ -97,6 +99,11 @@ where
         }
         Ok(term_infos)
     }
+
+    // only fuzzy, distance-based scores need per-term scores
+    fn needs_per_term_scores(&self) -> bool {
+        self.scoring_enabled && TypeId::of::<A>() == TypeId::of::<DfaWrapper>()
+    }
 }
 
 impl<A> Weight for AutomatonWeight<A>
@@ -105,43 +112,34 @@ where
     A::State: Clone,
 {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
+        let max_doc = reader.max_doc();
         let inverted_index = reader.inverted_index(self.field)?;
         let term_dict = inverted_index.terms();
         let mut term_stream = self.automaton_stream(term_dict)?;
-
-        let mut scorers = vec![];
-        let mut bitmaps: Vec<Box<dyn Scorer>> = Vec::new();
-        while let Some((_term, term_info, state)) = term_stream.next() {
-            if self.bitmap_enabled && !self.scoring_enabled && reader.bitmap_postings_enabled {
-                if let Some(bitmap) =
-                    inverted_index.read_bitmap_from_terminfo(term_info, reader.max_doc())?
-                {
-                    bitmaps.push(Box::new(ConstScorer::new(bitmap, boost)));
-                    continue;
-                }
+        if self.needs_per_term_scores() {
+            // union of scorer-per-term
+            let mut term_scorers = Vec::new();
+            while let Some((_term, term_info, state)) = term_stream.next() {
+                let term_score = automaton_score(self.automaton.as_ref(), state);
+                let term_segment_postings = inverted_index
+                    .read_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
+                let term_scorer = ConstScorer::new(term_segment_postings, boost * term_score);
+                term_scorers.push(term_scorer);
             }
-            let score = automaton_score(self.automaton.as_ref(), state);
-            let segment_postings =
-                inverted_index.read_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
-            let scorer = ConstScorer::new(segment_postings, boost * score);
-            scorers.push(scorer);
+            let scorer = BufferedUnionScorer::build(term_scorers, SumCombiner::default, max_doc);
+            Ok(Box::new(scorer))
+        } else {
+            // bitmap of matched docs with const score
+            let mut doc_bitset = BitSet::with_max_value(max_doc);
+            let use_bmap = self.bitmap_enabled && reader.bitmap_postings_enabled;
+            while term_stream.advance() {
+                let term_info = term_stream.value();
+                or_term_info_into_bitset(&inverted_index, term_info, &mut doc_bitset, use_bmap)?;
+            }
+            let doc_bitset = BitSetDocSet::from(doc_bitset);
+            let scorer = ConstScorer::new(doc_bitset, boost);
+            Ok(Box::new(scorer))
         }
-
-        if !bitmaps.is_empty() {
-            bitmaps.extend(
-                scorers
-                    .into_iter()
-                    .map(|scorer| Box::new(scorer) as Box<dyn Scorer>),
-            );
-            return Ok(Box::new(super::bitmap_combination::BitmapCombination::new(
-                bitmaps,
-                super::bitmap_combination::BitmapOperation::Union,
-                reader.max_doc(),
-            )));
-        }
-
-        let scorer = BufferedUnionScorer::build(scorers, SumCombiner::default, reader.max_doc());
-        Ok(Box::new(scorer))
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
