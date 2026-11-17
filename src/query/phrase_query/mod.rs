@@ -256,6 +256,16 @@ pub(crate) mod tests {
     }
 
     #[test]
+    pub fn test_phrase_terms_with_offsets_and_slop() {
+        let field = crate::schema::Field::from_field_id(0);
+        let a = Term::from_field_text(field, "a");
+        let b = Term::from_field_text(field, "b");
+        let query = PhraseQuery::new_with_offset_and_slop(vec![(2, b.clone()), (0, a.clone())], 3);
+        assert_eq!(query.phrase_terms_with_offsets(), [(0, a), (2, b)]);
+        assert_eq!(query.slop(), 3);
+    }
+
+    #[test]
     pub fn test_phrase_score_with_slop_ordering() -> crate::Result<()> {
         let index = create_index(&[
             "a e b e c",
