@@ -63,7 +63,7 @@ impl Columns {
     }
 
     /// Keeps the first `len` entries.
-    fn truncate(&mut self, len: usize) {
+    pub(super) fn truncate(&mut self, len: usize) {
         self.bases.truncate(len);
         self.raw_prefixes.truncate(len);
         self.estimates.truncate(len);
@@ -75,7 +75,7 @@ impl Columns {
     }
 
     /// Appends the entries of `from` that `keep` selects, column by column.
-    fn extend_selected(&mut self, from: &Columns, keep: &[u32]) {
+    pub(super) fn extend_selected(&mut self, from: &Columns, keep: &[u32]) {
         self.bases
             .extend(keep.iter().map(|&i| from.bases[i as usize]));
         self.raw_prefixes
@@ -300,7 +300,7 @@ impl QuantizedCandidates {
     }
 
     #[inline]
-    fn upper(&self, index: usize) -> UpperEndpoint {
+    pub(super) fn upper(&self, index: usize) -> UpperEndpoint {
         self.estimate(index)
             .upper(self.columns.sigmas[index], self.kappa)
     }

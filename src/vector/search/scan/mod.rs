@@ -13,6 +13,8 @@ pub(crate) mod rate;
 
 #[cfg(test)]
 use std::cell::Cell;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::ops::Range;
 
 use common::BitSet;
@@ -31,8 +33,11 @@ use self::rate::AdmissionHistograms;
 use crate::collector::sort_key::Comparator;
 use crate::collector::SegmentSortKeyComputer;
 use crate::error::DataCorruption;
+use crate::query::Weight;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
+use crate::vector::filter::MAX_SHORTLIST_FILTER_BATCH_SIZE;
+use crate::vector::router::candidate::Candidate as RankedCandidate;
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
 use crate::vector::search::interval::{Estimate, Threshold, UpperEndpoint};
 use crate::vector::search::prepared::{QuantizedQueryCtx, ScoringQuery};
@@ -43,10 +48,8 @@ use crate::vector::storage::quantized::{
 };
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::enter_vector_stage;
-#[cfg(test)]
-use crate::vector::BlockAddress;
-use crate::vector::{VectorElement, VectorStage};
-use crate::{DocId, SegmentOrdinal};
+use crate::vector::{BlockAddress, VectorElement, VectorFilterStrategy, VectorStage};
+use crate::{DocId, Result, SegmentOrdinal, SegmentReader};
 
 // --- Contracts ---
 
@@ -215,6 +218,7 @@ struct QuantizedState<'a> {
     admission_upper: Vec<f32>,
     /// Rows the layer-0 kernel scored, replicas included, before admission pruning.
     layer0_scored: usize,
+    late_filter: bool,
     /// Rows admission pruning dropped.
     layer0_admission_pruned: usize,
     /// The reader exact reads are priced through; `None` with the exact plan off.
@@ -260,6 +264,7 @@ impl<'a> QuantizedState<'a> {
             admission_keep: Vec::new(),
             admission_upper: Vec::new(),
             layer0_scored: 0,
+            late_filter: false,
             layer0_admission_pruned: 0,
             exact: config.exact_plan.then_some(reader),
             index,
@@ -390,7 +395,9 @@ impl<'a> QuantizedState<'a> {
                     &self.admission_keep,
                 );
                 self.layer0_admission_pruned += rows.len() - at.len();
-                bound.offer(self.candidates.entries(at, self.segment_ord));
+                if !self.late_filter {
+                    bound.offer(self.candidates.entries(at, self.segment_ord));
+                }
             }
             None => {
                 let at = self.candidates.push_block(rows, centroid);
@@ -408,7 +415,9 @@ impl<'a> QuantizedState<'a> {
                         self.candidates.kappa(),
                     );
                 }
-                bound.offer(self.candidates.entries(at, self.segment_ord));
+                if !self.late_filter {
+                    bound.offer(self.candidates.entries(at, self.segment_ord));
+                }
             }
         }
         Ok(())
@@ -479,7 +488,9 @@ impl<'a> QuantizedState<'a> {
             &self.admission_keep,
         );
         self.layer0_admission_pruned += unseen.len() - at.len();
-        bound.offer(self.candidates.entries(at, self.segment_ord));
+        if !self.late_filter {
+            bound.offer(self.candidates.entries(at, self.segment_ord));
+        }
         #[cfg(test)]
         {
             self.whole_band_admissions += 1;
@@ -583,7 +594,9 @@ impl<'a> QuantizedState<'a> {
                 .push(self.candidates.column_trace(row_order));
         }
         let _boundary = enter_vector_stage(VectorStage::Boundary(layer as u8));
-        bound.offer(self.candidates.live_candidates(self.segment_ord));
+        if !self.late_filter {
+            bound.offer(self.candidates.live_candidates(self.segment_ord));
+        }
         let threshold = bound
             .shared_threshold()
             .map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score)));
@@ -734,6 +747,8 @@ where
     /// The hits the scan returns; the exact phase scores this many best estimates first.
     top_n: usize,
     report: ScanReport,
+    late_filter: Option<(&'a dyn Weight, &'a SegmentReader, VectorFilterStrategy)>,
+    reader: &'a VectorIndexReader,
 }
 
 impl<'a, T, K, C> SegmentScan<'a, T, K, C>
@@ -775,6 +790,8 @@ where
             .filter(|_| config.top_n > 0)
             .map(|p| p.admission_fraction);
         Ok(Self {
+            late_filter: None,
+            reader,
             exact: ExactScorer::new(
                 reader,
                 query.query,
@@ -800,6 +817,28 @@ where
                 ..ScanReport::default()
             },
         })
+    }
+
+    pub(crate) fn with_late_filter(
+        mut self,
+        filter: Option<(&'a dyn Weight, &'a SegmentReader, VectorFilterStrategy)>,
+    ) -> Self {
+        if filter.is_some() {
+            self.recall_fraction = None;
+            self.rate = None;
+        }
+        if let Some(state) = &mut self.quantized {
+            state.late_filter = filter.is_some();
+            if state.late_filter {
+                state.exact = None;
+            }
+        }
+        self.late_filter = filter;
+        self
+    }
+
+    pub(crate) fn needs_more_matches(&self) -> bool {
+        self.late_filter.is_some() && self.bound.shared_threshold().is_none()
     }
 
     pub(crate) fn swap_topk(&mut self, top: &mut TopK) {
@@ -852,6 +891,9 @@ where
     /// quantized layer. What survives is scored by [`Self::score_shortlist`].
     pub(crate) fn narrow_shortlist(&mut self) -> crate::Result<()> {
         self.close_shortlist();
+        if self.late_filter.is_some() {
+            return self.filter_shortlist();
+        }
         for layer in self.refining_layers() {
             self.narrow(layer)?;
         }
@@ -862,6 +904,9 @@ where
         let Some(state) = &self.quantized else {
             return Vec::new();
         };
+        if self.late_filter.is_some() {
+            return Vec::new();
+        }
         let mut candidates = state.candidates.live_candidates(state.segment_ord);
         if let Some(bar) = self.bound.shared_threshold() {
             candidates.retain(|candidate| candidate.bound.estimate() > bar);
@@ -934,6 +979,160 @@ where
             state.candidates.remove_rows(b, &offsets);
         }
         self.exact.keep_doc_ids(false);
+        Ok(())
+    }
+
+    fn filter_shortlist(&mut self) -> Result<()> {
+        let (weight, reader, strategy) = self.late_filter.unwrap();
+        let state = self
+            .quantized
+            .as_mut()
+            .expect("post-filtering requires quantization");
+        let threshold = self.bound.shared_threshold();
+        // Visit the most promising upper bounds first. Only matching, exact-scored candidates
+        // may raise the shared threshold; rejected neighbors must never prune valid results.
+        let mut queue = BinaryHeap::from(
+            self.by_cluster
+                .iter()
+                .flat_map(|&block| {
+                    let candidates = &state.candidates;
+                    candidates
+                        .block(block)
+                        .at
+                        .clone()
+                        .map(move |index| (block, index, candidates.upper(index)))
+                })
+                .filter(|(_, _, upper)| threshold.is_none_or(|bar| upper.0 >= bar))
+                .map(|(block, index, upper)| RankedCandidate {
+                    sim: Similarity::new(upper.0),
+                    node: Reverse((block, index)),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut batch = Vec::new();
+        let mut refined = Vec::new();
+        let mut indexed = Vec::new();
+        let mut offsets = Vec::new();
+        let mut indices = Vec::new();
+        let mut doc_cache = HashMap::<usize, Vec<DocId>>::new();
+        let batch_size = strategy.shortlist_batch_size(self.top_n).max(1);
+        while queue.peek().is_some_and(|next| {
+            self.bound
+                .shared_threshold()
+                .is_none_or(|bar| next.sim.score() >= bar)
+        }) {
+            batch.clear();
+            let threshold = self.bound.shared_threshold();
+            while batch.len() < batch_size {
+                let Some(next) = queue.peek() else {
+                    break;
+                };
+                if threshold.is_some_and(|bar| next.sim.score() < bar) {
+                    break;
+                }
+                batch.push(queue.pop().unwrap().node.0);
+            }
+            // Group each score-ranked batch by block so quantization reads stay contiguous.
+            batch.sort_unstable();
+            refined.clear();
+            for group in batch.chunk_by(|a, b| a.0 == b.0) {
+                let b = group[0].0;
+                let block = state.candidates.block(b);
+                let cluster = block.cluster;
+                let centroid = block.centroid;
+                let first = block.at.start;
+                let rows = state.candidates.rows(b);
+                offsets.clear();
+                offsets.extend(group.iter().map(|&(_, i)| rows.offsets.unwrap()[i - first]));
+                let selected = ClusterRows {
+                    offsets: Some(&offsets),
+                    ..rows
+                };
+                state.admission_columns.truncate(0);
+                indices.clear();
+                indices.extend(group.iter().map(|&(_, i)| i as u32));
+                state
+                    .admission_columns
+                    .extend_selected(&state.candidates.columns, &indices);
+                // Tighten the bounds through the remaining quantized layers before fetching doc
+                // IDs or evaluating the filter. Full-precision scoring waits for filter matches.
+                for layer in 1..state.layers.len() {
+                    let _layer = enter_vector_stage(VectorStage::LayerScan(layer as u8));
+                    let (read, view) = state.read_plan(&selected, layer, &mut self.scratch)?;
+                    let Read::Layer(read) = read else {
+                        unreachable!("post-filtering defers exact scoring");
+                    };
+                    self.report.layers[layer].scored += selected.len();
+                    self.report.layers[layer].count(Read::Layer(read), selected.len());
+                    decode_layer(
+                        &state.layers[layer],
+                        &selected,
+                        read,
+                        &view,
+                        &mut state.decoded,
+                        &mut self.scratch,
+                    )?;
+                    let ctx = state.combine_ctx(layer, centroid);
+                    combine_refine(
+                        &ctx,
+                        &state.decoded,
+                        &mut state.admission_columns,
+                        0..selected.len(),
+                    );
+                    if layer + 1 < state.layers.len() {
+                        self.report.layers[layer].survivors += selected.len();
+                    }
+                }
+                for (i, &offset) in offsets.iter().enumerate() {
+                    let upper = Estimate(state.admission_columns.estimates[i])
+                        .upper(state.admission_columns.sigmas[i], state.candidates.kappa());
+                    if threshold.is_none_or(|bar| upper.0 >= bar) {
+                        let docs = doc_cache.entry(cluster).or_default();
+                        if docs.is_empty() {
+                            self.reader.read_doc_ids(cluster, docs)?;
+                        }
+                        refined.push(RankedCandidate {
+                            sim: Similarity::new(upper.0),
+                            node: Reverse((
+                                docs[offset as usize],
+                                BlockAddress::new(cluster as u32, offset),
+                            )),
+                        });
+                    }
+                }
+            }
+            if self.report.layers.len() > 1 {
+                self.report.layers.last_mut().unwrap().survivors += refined.len();
+            }
+            // Restore score order after block-local refinement, then recheck the threshold as
+            // each batch's matching exact scores improve the shared top-k.
+            refined.sort_unstable_by_key(|candidate| Reverse(*candidate));
+            for candidates in refined.chunks(MAX_SHORTLIST_FILTER_BATCH_SIZE) {
+                let threshold = self.bound.shared_threshold();
+                indexed.clear();
+                indexed.extend(
+                    candidates
+                        .iter()
+                        .take_while(|next| threshold.is_none_or(|bar| next.sim.score() >= bar))
+                        .map(|next| next.node.0),
+                );
+                if indexed.is_empty() {
+                    break;
+                }
+                strategy.filter_shortlist(weight, reader, &mut indexed)?;
+                self.report.exact_rows +=
+                    self.exact
+                        .score_candidates(&indexed, &mut self.scratch, &mut self.bound)?;
+                #[cfg(test)]
+                self.report
+                    .trace
+                    .refined_topk_rows
+                    .extend(indexed.iter().map(|&(_, address)| address));
+            }
+        }
+        for &b in &self.by_cluster {
+            state.candidates.retire(b);
+        }
         Ok(())
     }
 

@@ -1,7 +1,7 @@
 //! Query-time probe parameters: the work budget and the located path.
 
 use crate::vector::search::source::controller::open_share;
-use crate::vector::VectorFilterStrategy;
+use crate::vector::{PostFilterStage, VectorFilterStrategy};
 use crate::{Result, TantivyError};
 
 /// Default [`ProbeParams::fixed_probe_cost_rows`]: the cost of opening a cluster, in rows of full
@@ -162,7 +162,16 @@ impl ProbeParams {
         match_fraction: f64,
         clusters_in_segment: usize,
     ) -> usize {
-        let match_fraction = match_fraction.clamp(0.0, 1.0);
+        let match_fraction = match self
+            .filter_strategy()
+            .expect("routing requires a filter strategy")
+        {
+            VectorFilterStrategy::Post {
+                stage: PostFilterStage::AfterQuantizedScoring,
+                ..
+            } => 1.0,
+            _ => match_fraction.clamp(0.0, 1.0),
+        };
         let cluster_cost =
             (open_share + (1.0 - open_share) * match_fraction).max(f64::MIN_POSITIVE);
         let clusters = (budget.max(0.0) / cluster_cost).ceil();
@@ -222,7 +231,9 @@ mod tests {
     use crate::query::{BooleanQuery, BoostQuery, ConstScoreQuery, FastFieldRangeQuery, Query};
     use crate::schema::Metric;
     use crate::vector::test_support::FixtureSpec;
-    use crate::vector::{VectorFilterStrategy, VectorSegment, MIN_POST_FILTER_MATCHES};
+    use crate::vector::{
+        PostFilterStage, VectorFilterStrategy, VectorSegment, MIN_POST_FILTER_MATCHES,
+    };
     use crate::{Result, Term};
 
     #[test]
@@ -268,10 +279,12 @@ mod tests {
                         fixture.field,
                         weight.as_ref(),
                         matches,
+                        0,
                         &segments,
                     )?;
                     let expected = if fast && clustered && matches >= MIN_POST_FILTER_MATCHES {
                         VectorFilterStrategy::Post {
+                            stage: PostFilterStage::BeforeQuantizedScoring,
                             estimated_selectivity: 1.0,
                         }
                     } else {

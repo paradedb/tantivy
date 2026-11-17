@@ -19,8 +19,8 @@ use tantivy::vector::clustering::{
     for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
 };
 use tantivy::vector::{
-    LocatedPath, ProbeParams, ProbeStats, RouterKind, Selectivity, VectorFilterStrategy,
-    VectorQuantizationConfig, VectorQuantizationLayer,
+    LocatedPath, PostFilterStage, ProbeParams, ProbeStats, RouterKind, Selectivity,
+    VectorFilterStrategy, VectorQuantizationConfig, VectorQuantizationLayer,
 };
 use tantivy::{Index, IndexWriter, Searcher, TantivyDocument, Term};
 
@@ -491,6 +491,7 @@ fn peak_on_a_large_segment() -> tantivy::Result<()> {
             "post",
             LocatedPath::Off,
             VectorFilterStrategy::Post {
+                stage: PostFilterStage::BeforeQuantizedScoring,
                 estimated_selectivity: 0.3,
             },
         ),

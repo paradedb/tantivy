@@ -11,35 +11,56 @@ use crate::query::{for_each_docset_buffered, AllScorer, ExcludedDocSet, Exclusio
 use crate::schema::Field;
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::enter_vector_stage;
-use crate::vector::{Candidate, VectorSegment, VectorStage};
-use crate::{DocId, Result, SegmentReader};
+use crate::vector::{BlockAddress, Candidate, VectorSegment, VectorStage};
+use crate::{DocId, Result, SegmentReader, TantivyError};
 
 /// Minimum estimated matches for deferring a fast-field filter. Keep the strategy independent
 /// of the probe ceiling so increasing recall does not switch access paths mid-sweep.
 pub const MIN_POST_FILTER_MATCHES: usize = 50_000;
 
+/// Minimum estimated matches for shortlist filtering.
+pub const MIN_SHORTLIST_FILTER_MATCHES: usize = 250_000;
+
+const SHORTLIST_FILTER_BATCH_HEADROOM: usize = 2;
+pub(crate) const MAX_SHORTLIST_FILTER_BATCH_SIZE: usize = 64;
+
 /// Query-wide filter evaluation, selected before worker assignment.
 ///
-/// Pre and Post preserve the existing router bypass: a segment with few enough matches can
-/// look up their vectors directly. Its per-segment `router_bypass_max_matches` comes from
-/// `LocatedPath`, independently of the query-wide [`MIN_POST_FILTER_MATCHES`] threshold.
+/// Pre and Post before quantized scoring preserve the existing router bypass: a segment with few
+/// enough matches can look up their vectors directly. Its per-segment `router_bypass_max_matches`
+/// comes from `LocatedPath`, independently of the query-wide [`MIN_POST_FILTER_MATCHES`] threshold.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum VectorFilterStrategy {
     /// Materialize the matches before vector search.
     Pre { uses_fast_fields: bool },
-    /// Filter routed clusters before scoring their vectors. Flat segments and segments whose
-    /// estimated matches fit the router-bypass limit collect matches upfront instead.
-    Post { estimated_selectivity: f64 },
+    /// Filter candidates after routing, before quantized scoring or on the approximate shortlist.
+    Post {
+        estimated_selectivity: f64,
+        stage: PostFilterStage,
+    },
+}
+
+/// When post-filtering checks candidates relative to quantized vector scoring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum PostFilterStage {
+    /// Check routed cluster members before scoring; small or flat segments collect matches
+    /// upfront.
+    BeforeQuantizedScoring,
+    /// Check the approximate shortlist before full-precision scoring; flat segments check each
+    /// doc.
+    AfterQuantizedScoring,
 }
 
 impl VectorFilterStrategy {
     /// Chooses when to evaluate the filter, using its estimated match count and segment storage.
     /// Uses Pre for small match sets or filters without fast fields, and Post for larger match
     /// sets when clustered storage is available.
+    /// Defers Post until after quantized scoring for large match sets when refinement is supported.
     pub fn plan(
         field: Field,
         weight: &dyn Weight,
         estimated_matches: usize,
+        max_scan_levels: usize,
         segments: &[VectorSegment],
     ) -> Result<Self> {
         let uses_fast_fields = weight.uses_fast_fields();
@@ -47,21 +68,34 @@ impl VectorFilterStrategy {
         if !uses_fast_fields || estimated_matches < MIN_POST_FILTER_MATCHES || segments.is_empty() {
             return Ok(pre);
         }
+        let mut supports_shortlist = max_scan_levels > 0;
         let mut has_clusters = false;
         for segment in segments {
-            has_clusters |= segment.reader.vector_index(field)?.index().is_some();
-        }
-        if !has_clusters {
-            return Ok(pre);
+            let vectors = segment.reader.vector_index(field)?;
+            has_clusters |= vectors.index().is_some();
+            supports_shortlist &= vectors.index().is_none() || vectors.has_exact_rows();
         }
         let docs: u64 = segments
             .iter()
             .map(|s| u64::from(s.reader.num_docs()))
             .sum();
-        Ok(Self::Post {
-            estimated_selectivity: (estimated_matches as f64 / docs.max(1) as f64)
-                .clamp(f64::EPSILON, 1.0),
-        })
+        let estimated_selectivity =
+            (estimated_matches as f64 / docs.max(1) as f64).clamp(f64::EPSILON, 1.0);
+        Ok(
+            if estimated_matches >= MIN_SHORTLIST_FILTER_MATCHES && supports_shortlist {
+                Self::Post {
+                    stage: PostFilterStage::AfterQuantizedScoring,
+                    estimated_selectivity,
+                }
+            } else if has_clusters {
+                Self::Post {
+                    stage: PostFilterStage::BeforeQuantizedScoring,
+                    estimated_selectivity,
+                }
+            } else {
+                pre
+            },
+        )
     }
 }
 
@@ -75,24 +109,36 @@ pub(crate) enum FilterMatches {
 }
 
 impl VectorFilterStrategy {
-    /// Whether to check the filter on routed clusters before scoring their vectors (Post only).
+    /// Whether Post checks routed cluster members before quantized scoring.
     pub(crate) fn filters_routed_clusters(self) -> bool {
-        matches!(self, Self::Post { .. })
+        matches!(
+            self,
+            Self::Post {
+                stage: PostFilterStage::BeforeQuantizedScoring,
+                ..
+            }
+        )
     }
 
-    /// Returns Post's estimated matching fraction for deciding how many clusters to route.
+    /// Returns the estimated matching fraction when Post checks routed cluster members.
     /// Otherwise, the router uses the prepared filter's matching fraction.
     pub(crate) fn routing_selectivity(self) -> Option<f64> {
         match self {
-            Self::Pre { .. } => None,
+            Self::Pre { .. }
+            | Self::Post {
+                stage: PostFilterStage::AfterQuantizedScoring,
+                ..
+            } => None,
             Self::Post {
+                stage: PostFilterStage::BeforeQuantizedScoring,
                 estimated_selectivity,
             } => Some(estimated_selectivity),
         }
     }
 
-    /// Prepares a segment's filter, deferring Post unless the segment is flat or its estimated
-    /// matches fit `router_bypass_max_matches`. Zero disables the router bypass.
+    /// Prepares a segment's filter. Post before quantized scoring is deferred unless the segment is
+    /// flat or its estimated matches fit `router_bypass_max_matches`. Zero disables the router
+    /// bypass.
     pub(crate) fn prepare_segment(
         self,
         weight: &dyn Weight,
@@ -107,6 +153,19 @@ impl VectorFilterStrategy {
         };
         match self {
             Self::Post {
+                stage: PostFilterStage::AfterQuantizedScoring,
+                ..
+            } => {
+                if vectors.index().is_some() && vectors.quantization()?.is_none() {
+                    return Err(TantivyError::InvalidArgument(
+                        "post-filtering after quantized scoring requires quantized IVF segments"
+                            .into(),
+                    ));
+                }
+                Ok(FilterMatches::Routed(DocFilter::Shortlist))
+            }
+            Self::Post {
+                stage: PostFilterStage::BeforeQuantizedScoring,
                 estimated_selectivity,
             } if vectors.index().is_some()
                 && estimated_selectivity * f64::from(segment.max_doc())
@@ -114,14 +173,19 @@ impl VectorFilterStrategy {
             {
                 Ok(FilterMatches::Routed(DocFilter::Pending))
             }
-            Self::Pre { .. } | Self::Post { .. } => {
+            Self::Pre { .. }
+            | Self::Post {
+                stage: PostFilterStage::BeforeQuantizedScoring,
+                ..
+            } => {
                 let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
                 Self::collect_pre_matches(weight, segment, router_bypass_max_matches)
             }
         }
     }
 
-    /// Resolves Post's filter from routed candidates. Other strategies keep their prepared filter.
+    /// Resolves Post before quantized scoring from routed candidates; other stages keep their
+    /// filter.
     pub(crate) fn filter_routed_clusters(
         self,
         weight: &dyn Weight,
@@ -130,22 +194,72 @@ impl VectorFilterStrategy {
         candidates: impl Iterator<Item = Candidate>,
     ) -> Result<Option<DocFilter>> {
         match self {
-            Self::Pre { .. } => Ok(None),
-            Self::Post { .. } => {
+            Self::Pre { .. }
+            | Self::Post {
+                stage: PostFilterStage::AfterQuantizedScoring,
+                ..
+            } => Ok(None),
+            Self::Post {
+                stage: PostFilterStage::BeforeQuantizedScoring,
+                ..
+            } => {
                 let _filter = enter_vector_stage(VectorStage::NonVectorSearch);
                 Self::filter_post_clusters(vectors, weight, segment, candidates).map(Some)
             }
         }
     }
 
-    /// Iterates over the prepared filter's matching doc ids in a flat segment, skipping deletions.
+    /// Sizes a shortlist batch to leave enough expected matches for `top_k`, with headroom.
+    pub(crate) fn shortlist_batch_size(self, top_k: usize) -> usize {
+        let Self::Post {
+            stage: PostFilterStage::AfterQuantizedScoring,
+            estimated_selectivity,
+        } = self
+        else {
+            unreachable!("only Post after quantized scoring batches shortlist filters")
+        };
+        (top_k.saturating_mul(SHORTLIST_FILTER_BATCH_HEADROOM) as f64
+            / estimated_selectivity.clamp(f64::EPSILON, 1.0))
+        .ceil() as usize
+    }
+
+    /// Retains approximate shortlist candidates that match the filter.
+    pub(crate) fn filter_shortlist(
+        self,
+        weight: &dyn Weight,
+        segment: &SegmentReader,
+        candidates: &mut Vec<(DocId, BlockAddress)>,
+    ) -> Result<()> {
+        if !matches!(
+            self,
+            Self::Post {
+                stage: PostFilterStage::AfterQuantizedScoring,
+                ..
+            }
+        ) {
+            return Ok(());
+        }
+        candidates.sort_unstable_by_key(|&(doc, _)| doc);
+        let mut scorer = ExcludedDocSet::new(weight.scorer_for_candidates_unpositioned(
+            segment,
+            1.0,
+            candidates.len() as u32,
+        )?);
+        candidates.retain(|&(doc, _)| scorer.contains(doc));
+        Ok(())
+    }
+
+    /// Iterates over matching doc ids in a flat segment, skipping deletions.
+    /// Deferred shortlist filters are checked as each doc is visited; other stages use prepared
+    /// matches.
     pub(crate) fn flat_matches<'a>(
         self,
+        weight: &dyn Weight,
         segment: &'a SegmentReader,
         filter: &'a DocFilter,
     ) -> Result<impl Iterator<Item = DocId> + 'a> {
         let docs = match filter {
-            DocFilter::All => Either::Left(0..segment.max_doc()),
+            DocFilter::All | DocFilter::Shortlist => Either::Left(0..segment.max_doc()),
             DocFilter::Docs(docs) => {
                 Either::Right((0..docs.max_value().div_ceil(64)).flat_map(move |bucket| {
                     docs.tinyset(bucket)
@@ -157,8 +271,31 @@ impl VectorFilterStrategy {
                 unreachable!("flat filters are prepared before routing")
             }
         };
+        let mut scorer = if matches!(
+            self,
+            Self::Post {
+                stage: PostFilterStage::AfterQuantizedScoring,
+                ..
+            }
+        ) && matches!(filter, DocFilter::Shortlist)
+        {
+            Some(ExcludedDocSet::new(
+                weight.scorer_for_candidates_unpositioned(segment, 1.0, segment.max_doc())?,
+            ))
+        } else {
+            None
+        };
         let alive = segment.alive_bitset();
-        Ok(docs.filter(move |&doc| alive.is_none_or(|alive| alive.is_alive(doc))))
+        Ok(docs.filter(move |&doc| {
+            if alive.is_some_and(|alive| !alive.is_alive(doc)) {
+                return false;
+            }
+            if let Some(scorer) = &mut scorer {
+                scorer.contains(doc)
+            } else {
+                true
+            }
+        }))
     }
 
     /// Drains the filter `DocSet` once, in ascending doc order, keeping up to `cap` matches as a
@@ -258,20 +395,22 @@ pub(crate) enum DocFilter {
     Docs(Arc<BitSet>),
     /// Post has not checked the routed clusters yet; resolve this before scoring their vectors.
     Pending,
+    /// Defer filter checks to the approximate shortlist, or to each doc during a flat scan.
+    Shortlist,
 }
 
 impl DocFilter {
     pub(crate) fn is_empty(&self) -> bool {
         match self {
             Self::Docs(docs) => docs.len() == 0,
-            Self::All | Self::Pending => false,
+            Self::All | Self::Pending | Self::Shortlist => false,
         }
     }
 
     /// The share of doc ids below `max_doc` that match.
     pub(crate) fn match_fraction(&self, max_doc: DocId) -> f64 {
         match self {
-            Self::All => 1.0,
+            Self::All | Self::Shortlist => 1.0,
             Self::Docs(docs) => docs.len() as f64 / f64::from(max_doc.max(1)),
             Self::Pending => unreachable!("pending filter has no observed selectivity"),
         }
@@ -303,8 +442,8 @@ impl<'a> RowGate<'a> {
     pub(crate) fn new(filter: DocFilter, alive: Option<&'a AliveBitSet>) -> Self {
         match (filter, alive) {
             (DocFilter::Pending, _) => RowGate::Pending,
-            (DocFilter::All, None) => RowGate::Open,
-            (DocFilter::All, Some(alive)) => RowGate::AliveOnly(alive),
+            (DocFilter::All | DocFilter::Shortlist, None) => RowGate::Open,
+            (DocFilter::All | DocFilter::Shortlist, Some(alive)) => RowGate::AliveOnly(alive),
             (DocFilter::Docs(filter), None) => RowGate::FilterOnly(filter),
             (DocFilter::Docs(filter), Some(alive)) => RowGate::FilterAndAlive { filter, alive },
         }
@@ -587,6 +726,7 @@ mod tests {
                     };
                     let post_builder = builder.clone().with_probe_params(ProbeParams {
                         filter_strategy: Some(VectorFilterStrategy::Post {
+                            stage: PostFilterStage::BeforeQuantizedScoring,
                             estimated_selectivity: 1.0,
                         }),
                         ..params.clone()
