@@ -1,7 +1,9 @@
 use common::{BitSet, TinySet};
 
 use crate::docset::{DocSet, BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW, TERMINATED};
-use crate::DocId;
+use crate::postings::TermInfo;
+use crate::schema::IndexRecordOption;
+use crate::{DocId, InvertedIndexReader};
 
 /// A `BitSetDocSet` makes it possible to iterate through a bitset as if it was a `DocSet`.
 ///
@@ -153,6 +155,43 @@ impl DocSet for BitSetDocSet {
     fn size_hint(&self) -> u32 {
         self.docs.len() as u32
     }
+}
+
+/// Open the posting list for `term_info` and OR every matched doc into
+/// `bitset`.
+pub fn or_term_info_into_bitset(
+    inverted_index: &InvertedIndexReader,
+    term_info: &TermInfo,
+    bitset: &mut BitSet,
+    bitmap_enabled: bool,
+) -> crate::Result<()> {
+    if let Some(mut bitmap) = if bitmap_enabled {
+        inverted_index.read_bitmap_from_terminfo(term_info, bitset.max_value())?
+    } else {
+        None
+    } {
+        use crate::DocSet;
+        while bitmap.doc() != crate::TERMINATED {
+            let base = bitmap.doc() / crate::BLOCK_WINDOW * crate::BLOCK_WINDOW;
+            let mut mask = [common::TinySet::EMPTY; crate::BLOCK_NUM_TINYBITSETS];
+            bitmap.fill_bitset_block(base, &mut mask);
+            bitset.union_tinysets(base / 64, &mask);
+        }
+        return Ok(());
+    }
+    let mut block_postings =
+        inverted_index.read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
+    loop {
+        let docs = block_postings.docs();
+        if docs.is_empty() {
+            break;
+        }
+        for &doc in docs {
+            bitset.insert(doc);
+        }
+        block_postings.advance();
+    }
+    Ok(())
 }
 
 #[cfg(test)]

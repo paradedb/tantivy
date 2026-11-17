@@ -429,6 +429,13 @@ mod tests {
         };
         use crate::schema::{IndexRecordOption, Schema, TEXT};
         use crate::{Index, Term};
+
+        enum FastBitsetExpected {
+            Always,
+            Unscored,
+            Optin,
+        }
+
         let mut schema = Schema::builder();
         let field = schema.add_text_field(
             "text",
@@ -450,14 +457,26 @@ mod tests {
             let searcher = index.reader()?.searcher();
             let term = Term::from_field_text(field, "common");
             let query = TermQuery::new(term.clone(), IndexRecordOption::WithFreqs);
-            let queries: Vec<Box<dyn Query>> = vec![
-                Box::new(query.clone()),
-                Box::new(RegexQuery::from_pattern("common", field)?),
-                Box::new(FuzzyTermQuery::new(term, 0, false)),
-                Box::new(BoostQuery::new(query.clone(), 2.0)),
-                Box::new(ConstScoreQuery::new(query, 2.0)),
+            let queries: Vec<(Box<dyn Query>, FastBitsetExpected)> = vec![
+                (Box::new(query.clone()), FastBitsetExpected::Optin),
+                (
+                    Box::new(RegexQuery::from_pattern("common", field)?),
+                    FastBitsetExpected::Always,
+                ),
+                (
+                    Box::new(FuzzyTermQuery::new(term, 0, false)),
+                    FastBitsetExpected::Unscored,
+                ),
+                (
+                    Box::new(BoostQuery::new(query.clone(), 2.0)),
+                    FastBitsetExpected::Optin,
+                ),
+                (
+                    Box::new(ConstScoreQuery::new(query, 2.0)),
+                    FastBitsetExpected::Optin,
+                ),
             ];
-            for query in queries {
+            for (query, expected) in queries {
                 for (scoring, opt_in) in
                     [(false, false), (false, true), (true, false), (true, true)]
                 {
@@ -470,7 +489,16 @@ mod tests {
                         .with_bitmap_postings(opt_in),
                     )?;
                     let mut scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
-                    assert_eq!(scorer.has_fast_bitset(), enabled && opt_in && !scoring);
+                    let expect_fast_bitset = match expected {
+                        FastBitsetExpected::Always => true,
+                        FastBitsetExpected::Unscored => !scoring,
+                        FastBitsetExpected::Optin => enabled && opt_in && !scoring,
+                    };
+                    assert_eq!(
+                        scorer.has_fast_bitset(),
+                        expect_fast_bitset,
+                        "{query:?}, {scoring}"
+                    );
                     if query.is::<TermQuery>() {
                         assert_eq!(scorer.is::<TermScorer>(), !enabled || !opt_in || scoring);
                     }
