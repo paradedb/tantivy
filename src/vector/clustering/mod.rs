@@ -11,18 +11,27 @@ pub(crate) mod soar;
 mod superkmeans;
 
 pub use superkmeans::{
-    SuperKMeansClusterer, DEFAULT_TARGET_LEAF_SIZE, DEFAULT_TRAINING_SAMPLE_RATIO,
+    SuperKMeansClusterer, DEFAULT_TARGET_LEAF_SIZE, DESIRED_TRAINING_VECTORS_PER_LIST,
+    MINIMUM_TRAINING_VECTORS_PER_LIST,
 };
 
 pub trait IvfClusterer: Send + Sync + 'static {
-    /// Fraction of vectors sampled for training, in `(0, 1]`.
-    fn training_sample_ratio(&self) -> f32;
+    /// How many of `population` vectors to train on.
+    ///
+    /// [`SuperKMeansClusterer`] aims for [`DESIRED_TRAINING_VECTORS_PER_LIST`] vectors per list
+    /// and keeps at least [`MINIMUM_TRAINING_VECTORS_PER_LIST`], capping the sample at the rows
+    /// that fit in its memory budget. The default trains on every row.
+    fn training_sample_size(&self, options: &VectorOptions, population: usize) -> usize {
+        let _ = options;
+        population
+    }
 
-    /// Trains centroids.
+    /// Trains centroids on `source`, a sample drawn from `population` vectors.
     fn train(
         &self,
         options: &VectorOptions,
         source: &mut dyn VectorSource,
+        population: usize,
     ) -> crate::Result<IvfCentroids>;
 
     /// Assigns vectors to centroids.

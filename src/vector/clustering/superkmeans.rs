@@ -15,8 +15,10 @@ use crate::TantivyError;
 
 /// Default [`SuperKMeansClusterer::with_target_leaf_size`].
 pub const DEFAULT_TARGET_LEAF_SIZE: usize = 200;
-/// Default [`SuperKMeansClusterer::with_training_sample_ratio`].
-pub const DEFAULT_TRAINING_SAMPLE_RATIO: f64 = 0.32;
+/// Training vectors aimed for at each list (`n / target_leaf_size`).
+pub const DESIRED_TRAINING_VECTORS_PER_LIST: usize = 256;
+/// Fewest training vectors kept per list when the memory budget is smaller than the desired sample.
+pub const MINIMUM_TRAINING_VECTORS_PER_LIST: usize = 64;
 
 /// Rows held at once without a memory limit.
 const DEFAULT_BUDGET_ROWS: usize = 40_960;
@@ -101,10 +103,64 @@ fn permute_rows(values: &mut [f32], dim: usize, order: &[u32]) {
 #[derive(Clone)]
 pub struct SuperKMeansClusterer {
     config: HierarchicalSuperKMeansConfig,
-    training_sample_ratio: f32,
     memory_limit: Option<usize>,
     /// The assigner for the last `(dim, angular)`, reused across a merge's batches.
     assigner: Arc<Mutex<Option<Assigner>>>,
+}
+
+/// The training sample for `population` vectors and `target_leaf_size` indexed vectors per list.
+///
+/// `lists` is `population / target_leaf_size`, at least one. The desired sample is 256 vectors
+/// per list and the minimum is 64, each capped at `population`. With a memory budget the sample
+/// is the budget when that sits between the two, the desired sample when the budget is larger,
+/// and the minimum when the budget is smaller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrainingSample {
+    lists: usize,
+    desired: usize,
+    minimum: usize,
+    budget_rows: Option<usize>,
+    sample: usize,
+}
+
+impl TrainingSample {
+    fn plan(population: usize, target_leaf_size: usize, budget_rows: Option<usize>) -> Self {
+        if population == 0 {
+            return Self {
+                lists: 0,
+                desired: 0,
+                minimum: 0,
+                budget_rows,
+                sample: 0,
+            };
+        }
+        let lists = (population / target_leaf_size.max(1)).max(1);
+        let desired = lists
+            .saturating_mul(DESIRED_TRAINING_VECTORS_PER_LIST)
+            .clamp(1, population);
+        let minimum = lists
+            .saturating_mul(MINIMUM_TRAINING_VECTORS_PER_LIST)
+            .clamp(1, desired);
+        let sample = match budget_rows {
+            Some(budget) => desired.min(budget.max(minimum)),
+            None => desired,
+        };
+        Self {
+            lists,
+            desired,
+            minimum,
+            budget_rows,
+            sample: sample.clamp(1, population),
+        }
+    }
+}
+
+/// Leaf size for a sample of `sample` rows drawn from `population`, so the trained lists still
+/// number about `population / target_leaf_size`.
+fn training_leaf_size(target_leaf_size: usize, population: usize, sample: usize) -> usize {
+    let sample = sample.max(1);
+    let population = population.max(sample);
+    (sample.saturating_mul(target_leaf_size.max(1)) / population).max(1)
 }
 
 struct Assigner {
@@ -123,62 +179,91 @@ impl fmt::Debug for SuperKMeansClusterer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SuperKMeansClusterer")
             .field("config", &self.config)
-            .field("training_sample_ratio", &self.training_sample_ratio)
+            .field("memory_limit", &self.memory_limit)
             .finish_non_exhaustive()
     }
 }
 
 impl SuperKMeansClusterer {
-    /// Defaults: [`DEFAULT_TARGET_LEAF_SIZE`], [`DEFAULT_TRAINING_SAMPLE_RATIO`], no memory limit.
+    /// Defaults: [`DEFAULT_TARGET_LEAF_SIZE`], no memory limit.
+    ///
+    /// The training sample is sized when the population is known: 256 vectors per list, at least
+    /// 64, and no more than fit in the memory limit.
     pub fn new() -> Self {
         let mut config = HierarchicalSuperKMeansConfig::default();
         config.base.suppress_warnings = true;
         config.target_leaf_size = DEFAULT_TARGET_LEAF_SIZE;
         Self {
             config,
-            training_sample_ratio: DEFAULT_TRAINING_SAMPLE_RATIO as f32,
             memory_limit: None,
             assigner: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Target vectors per clustering leaf on the full dataset. Training scales this by
-    /// [`Self::with_training_sample_ratio`] so sampled leaves stay proportional and final
-    /// clusters approximate this size. Splits aim for the scaled size; actual leaves may be
-    /// somewhat larger (about √2× the target).
+    /// Target indexed vectors per clustering leaf. The training sample aims for
+    /// [`DESIRED_TRAINING_VECTORS_PER_LIST`] vectors per list and keeps at least
+    /// [`MINIMUM_TRAINING_VECTORS_PER_LIST`]. Splits aim for the sample's scaled leaf size;
+    /// actual leaves may be somewhat larger (about √2× the target).
     pub fn with_target_leaf_size(mut self, target_leaf_size: usize) -> Self {
         self.config.target_leaf_size = target_leaf_size;
         self
     }
 
     /// Caps the vectors held at once (the meso step's kept and streamed rows, fine-step groups,
-    /// assign batches) at about `memory_limit` bytes.
+    /// assign batches) at about `memory_limit` bytes. The same budget caps the training sample:
+    /// a sample between 64 and 256 vectors per list spends the budget, and a smaller budget still
+    /// trains on the 64-vector minimum.
     pub fn with_memory_limit(mut self, memory_limit: usize) -> Self {
         self.memory_limit = Some(memory_limit);
         self
     }
 
-    /// Trains on `ratio` of the vectors, in `(0, 1]`.
-    pub fn with_training_sample_ratio(mut self, ratio: f32) -> Self {
-        self.training_sample_ratio = ratio;
-        self
+    /// Sample of `population` vectors to train on.
+    fn sample_plan(&self, options: &VectorOptions, population: usize) -> TrainingSample {
+        let budget_rows = self
+            .memory_limit
+            .map(|byte_limit| byte_limit / options.bytes_per_vector().max(1));
+        let plan = TrainingSample::plan(population, self.config.target_leaf_size, budget_rows);
+        if let Some(budget) = plan.budget_rows {
+            if plan.sample > budget {
+                log::warn!(
+                    target: "paradedb::ivf_build",
+                    "ivf training sample of {} vectors exceeds the memory budget of {} vectors; \
+                     desired {} for {} lists over {} vectors",
+                    plan.sample,
+                    budget,
+                    plan.desired,
+                    plan.lists,
+                    population,
+                );
+            } else if plan.sample < plan.desired {
+                log::info!(
+                    target: "paradedb::ivf_build",
+                    "ivf training sample limited to {} vectors by the memory budget of {} vectors; \
+                     desired {} for {} lists over {} vectors",
+                    plan.sample,
+                    budget,
+                    plan.desired,
+                    plan.lists,
+                    population,
+                );
+            }
+        }
+        plan
     }
 
-    /// Leaf size passed to SuperKMeans for the training sample.
-    ///
-    /// For example, with defaults (`target_leaf_size=200`, `training_sample_ratio=0.32`)
-    /// this returns `64`.
-    fn training_target_leaf_size(&self) -> usize {
-        ((self.config.target_leaf_size as f64) * f64::from(self.training_sample_ratio))
-            .round()
-            .max(1.0) as usize
-    }
-
-    /// Config for HierarchicalSuperKMeans, with leaf size scaled to the training sample.
-    fn training_config(&self, angular: bool) -> HierarchicalSuperKMeansConfig {
+    /// Config for HierarchicalSuperKMeans. `sample` rows stand in for `population`, so the leaf
+    /// size shrinks by that fraction and the trained lists still cover the full set.
+    fn training_config(
+        &self,
+        angular: bool,
+        population: usize,
+        sample: usize,
+    ) -> HierarchicalSuperKMeansConfig {
         let mut config = self.config.clone();
         config.base.angular = angular;
-        config.target_leaf_size = self.training_target_leaf_size();
+        config.target_leaf_size =
+            training_leaf_size(self.config.target_leaf_size, population, sample);
         config
     }
 
@@ -202,10 +287,9 @@ impl SuperKMeansClusterer {
                 Arc::clone(&assigner.kmeans)
             }
             _ => {
-                let kmeans = Arc::new(HierarchicalSuperKMeans::with_config(
-                    dim,
-                    self.training_config(angular),
-                ));
+                let mut config = self.config.clone();
+                config.base.angular = angular;
+                let kmeans = Arc::new(HierarchicalSuperKMeans::with_config(dim, config));
                 *cached = Some(Assigner {
                     dim,
                     angular,
@@ -252,14 +336,15 @@ fn fine_group_end(offsets: &[usize], start: usize, capacity: usize) -> usize {
 }
 
 impl IvfClusterer for SuperKMeansClusterer {
-    fn training_sample_ratio(&self) -> f32 {
-        self.training_sample_ratio
+    fn training_sample_size(&self, options: &VectorOptions, population: usize) -> usize {
+        self.sample_plan(options, population).sample
     }
 
     fn train(
         &self,
         options: &VectorOptions,
         source: &mut dyn VectorSource,
+        population: usize,
     ) -> crate::Result<IvfCentroids> {
         let dim = options.dim();
         let num_rows = source.num_rows();
@@ -270,7 +355,7 @@ impl IvfClusterer for SuperKMeansClusterer {
         }
         let kmeans = HierarchicalSuperKMeans::with_config(
             dim,
-            self.training_config(options.metric().clusters_by_angle()),
+            self.training_config(options.metric().clusters_by_angle(), population, num_rows),
         );
 
         // The meso step keeps as many rows decoded as the budget allows, leaving room for one
@@ -508,7 +593,8 @@ mod tests {
 
     fn train(clusterer: &SuperKMeansClusterer, source: &mut VecSource) -> IvfMatrix<f32> {
         let options = VectorOptions::new(source.dim, Metric::L2);
-        let IvfCentroids::F32(centroids) = clusterer.train(&options, source).unwrap();
+        let population = source.num_rows();
+        let IvfCentroids::F32(centroids) = clusterer.train(&options, source, population).unwrap();
         centroids
     }
 
@@ -522,7 +608,8 @@ mod tests {
         let centroids = train(&clusterer, &mut source);
         assert_eq!(centroids.dims, dim);
         assert_eq!(centroids.values.len(), centroids.rows * dim);
-        assert!(centroids.rows >= n / 100, "{} centroids", centroids.rows);
+        // Leaves can run about √2× the target, so the centroid count sits a little under n / 100.
+        assert!(centroids.rows >= n / 200, "{} centroids", centroids.rows);
 
         let assignments = clusterer
             .assign(&options, &mut source, &IvfCentroids::F32(centroids.clone()))
@@ -544,7 +631,7 @@ mod tests {
             polls_before_cancel: usize::MAX,
             polls: Cell::new(0),
         };
-        clusterer.train(&options, &mut source).unwrap();
+        clusterer.train(&options, &mut source, n).unwrap();
         let polls_in_full_run = source.polls.get();
         assert!(polls_in_full_run > 2, "{polls_in_full_run} polls");
 
@@ -554,7 +641,7 @@ mod tests {
                 polls_before_cancel,
                 polls: Cell::new(0),
             };
-            let err = clusterer.train(&options, &mut source).unwrap_err();
+            let err = clusterer.train(&options, &mut source, n).unwrap_err();
             assert!(matches!(err, TantivyError::Cancelled), "{err:?}");
             assert_eq!(source.polls.get(), polls_before_cancel + 1);
             assert_eq!(source.inner.ranges, vec![0..n]);
@@ -635,12 +722,10 @@ mod tests {
         let (n, dim) = (5_000, 16);
         let options = VectorOptions::new(dim, Metric::L2);
         let row_bytes = options.bytes_per_vector();
-        // Train on the full sample so target_leaf_size is not scaled down; a smaller leaf
-        // would raise k enough that the Gram exceeds n rows and this budget check is moot.
+        // Train on the full sample. A smaller leaf would raise k enough that the Gram exceeds
+        // n rows and this budget check is moot.
         let centroids = train(
-            &SuperKMeansClusterer::new()
-                .with_target_leaf_size(100)
-                .with_training_sample_ratio(1.0),
+            &SuperKMeansClusterer::new().with_target_leaf_size(100),
             &mut VecSource::new(blobs(n, dim), dim),
         );
         let k = centroids.rows;
@@ -677,7 +762,7 @@ mod tests {
         let mut source = VecSource::new(Vec::new(), 4);
         let options = VectorOptions::new(4, Metric::L2);
         assert!(SuperKMeansClusterer::new()
-            .train(&options, &mut source)
+            .train(&options, &mut source, 0)
             .is_err());
         assert!(source.ranges.is_empty());
     }
@@ -767,23 +852,64 @@ mod tests {
         assert_eq!(fine_group_end(&offsets, 0, 1), 1);
     }
 
-    /// Stored settings are independent; training leaf size is scaled by the sample ratio.
+    /// Ten thousand lists of 1,000 vectors want 256 training vectors each. A 1 GiB budget of
+    /// 768-d vectors sits under the 64-per-list floor, so the sample stays at that floor. A
+    /// budget between the floor and the target is spent in full. A table smaller than one leaf
+    /// is a single list trained on every row.
     #[test]
-    fn settings_default_and_scale_training_leaf_size() {
-        let clusterer = SuperKMeansClusterer::new();
-        assert_eq!(clusterer.training_sample_ratio(), 0.32);
-        assert_eq!(clusterer.config.target_leaf_size, DEFAULT_TARGET_LEAF_SIZE);
-        assert_eq!(clusterer.training_target_leaf_size(), 64);
+    fn the_training_sample_targets_256_vectors_per_list() {
+        let (population, target) = (10_000_000, 1_000);
+        let open = TrainingSample::plan(population, target, None);
+        assert_eq!(open.lists, 10_000);
+        assert_eq!(open.desired, 2_560_000);
+        assert_eq!(open.minimum, 640_000);
+        assert_eq!(open.sample, 2_560_000);
+        assert_eq!(training_leaf_size(target, population, open.sample), 256);
 
-        let clusterer = SuperKMeansClusterer::new()
-            .with_target_leaf_size(20)
-            .with_training_sample_ratio(0.25);
-        assert_eq!(clusterer.training_sample_ratio(), 0.25);
-        assert_eq!(clusterer.config.target_leaf_size, 20);
-        assert_eq!(clusterer.training_target_leaf_size(), 5);
-        let clusterer = clusterer.with_training_sample_ratio(1.0);
-        assert_eq!(clusterer.training_sample_ratio(), 1.0);
-        assert_eq!(clusterer.config.target_leaf_size, 20);
-        assert_eq!(clusterer.training_target_leaf_size(), 20);
+        let budget = (1usize << 30) / (768 * 4);
+        assert_eq!(budget, 349_525);
+        let capped = TrainingSample::plan(population, target, Some(budget));
+        assert_eq!(capped.sample, 640_000);
+        assert_eq!(training_leaf_size(target, population, capped.sample), 64);
+
+        let mid = TrainingSample::plan(population, target, Some(1_000_000));
+        assert_eq!(mid.sample, 1_000_000);
+        assert_eq!(training_leaf_size(target, population, mid.sample), 100);
+
+        let small = TrainingSample::plan(100, 128, None);
+        assert_eq!(small.lists, 1);
+        assert_eq!(small.desired, 100);
+        assert_eq!(small.minimum, 64);
+        assert_eq!(small.sample, 100);
+        assert_eq!(training_leaf_size(128, 100, small.sample), 128);
+
+        // The default leaf of 200 is under 256, so an uncapped build trains on every row.
+        // The floor is 64 per list, 32% of a million rows.
+        let defaults = TrainingSample::plan(1_000_000, DEFAULT_TARGET_LEAF_SIZE, None);
+        assert_eq!(defaults.lists, 5_000);
+        assert_eq!(defaults.sample, 1_000_000);
+        let tight = TrainingSample::plan(1_000_000, DEFAULT_TARGET_LEAF_SIZE, Some(1_000));
+        assert_eq!(tight.minimum, 320_000);
+        assert_eq!(tight.sample, 320_000);
+        assert_eq!(
+            training_leaf_size(DEFAULT_TARGET_LEAF_SIZE, 1_000_000, tight.sample),
+            64
+        );
+
+        assert_eq!(TrainingSample::plan(0, target, None).sample, 0);
+    }
+
+    /// A 1 GiB budget of 768-d vectors is under the 64-per-list floor, so the clusterer keeps
+    /// that floor. With no memory limit it takes the 256-per-list sample.
+    #[test]
+    fn the_memory_limit_caps_the_training_sample() {
+        let options = VectorOptions::new(768, Metric::L2);
+        let population = 10_000_000;
+        let limited = SuperKMeansClusterer::new()
+            .with_target_leaf_size(1_000)
+            .with_memory_limit(1 << 30);
+        assert_eq!(limited.training_sample_size(&options, population), 640_000);
+        let open = SuperKMeansClusterer::new().with_target_leaf_size(1_000);
+        assert_eq!(open.training_sample_size(&options, population), 2_560_000);
     }
 }

@@ -108,14 +108,11 @@ pub(crate) struct NearestClusterer {
 }
 
 impl IvfClusterer for NearestClusterer {
-    fn training_sample_ratio(&self) -> f32 {
-        1.0
-    }
-
     fn train(
         &self,
         options: &VectorOptions,
         _: &mut dyn VectorSource,
+        _: usize,
     ) -> crate::Result<IvfCentroids> {
         Ok(IvfCentroids::F32(IvfMatrix {
             values: self.centroids.iter().flatten().copied().collect(),

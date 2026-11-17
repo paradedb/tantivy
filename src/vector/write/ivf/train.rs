@@ -29,11 +29,12 @@ pub(super) fn train(
     timings: &mut IvfBuildTimings,
 ) -> crate::Result<Option<Trained>> {
     let opts = merge.opts;
-    let training_sample_size = {
-        let ratio = f64::from(clusterer.training_sample_ratio()).clamp(f64::MIN_POSITIVE, 1.0);
-        let target = ((vector_count as f64) * ratio).ceil() as usize;
-        target.clamp(1, vector_count)
-    };
+    if vector_count == 0 {
+        return Ok(None);
+    }
+    let training_sample_size = clusterer
+        .training_sample_size(opts, vector_count)
+        .clamp(1, vector_count);
     let training_sample_interval = (vector_count / training_sample_size).max(1);
 
     // The sample is picked in target-doc order, then scanned in source storage order so every
@@ -69,7 +70,7 @@ pub(super) fn train(
     let mut training_source =
         MergeVectorSource::new(&merge.readers, training_rows, opts.dim(), merge.ctx.cancel);
     let train_start = Instant::now();
-    let centroids = clusterer.train(opts, &mut training_source)?;
+    let centroids = clusterer.train(opts, &mut training_source, present_vector_ord.max(1))?;
     timings.train = train_start.elapsed();
     timings.train_reads += training_source.reads;
 
