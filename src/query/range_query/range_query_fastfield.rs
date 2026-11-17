@@ -189,7 +189,8 @@ impl FastFieldRangeWeight {
                 ip_addr_column.max_value(),
             );
             if candidate_mode {
-                let docset = RangeDocSet::new_unpositioned(value_range, ip_addr_column);
+                let docset = RangeDocSet::new_unpositioned(value_range, ip_addr_column)
+                    .with_candidate_cache();
                 Ok(UnpositionedScorer::from_unpositioned(Box::new(
                     ConstScorer::new(docset, boost),
                 )))
@@ -541,7 +542,7 @@ fn search_on_u64_ff(
     }
 
     if candidate_mode {
-        let docset = RangeDocSet::new_unpositioned(value_range, column);
+        let docset = RangeDocSet::new_unpositioned(value_range, column).with_candidate_cache();
         Ok(UnpositionedScorer::from_unpositioned(Box::new(
             ConstScorer::new(docset, boost),
         )))

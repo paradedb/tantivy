@@ -1,6 +1,8 @@
 //! Query-time probe parameters: the work budget and the located path.
 
 use crate::vector::search::source::controller::open_share;
+use crate::vector::VectorFilterStrategy;
+use crate::{Result, TantivyError};
 
 /// Default [`ProbeParams::fixed_probe_cost_rows`]: the cost of opening a cluster, in rows of full
 /// work, fitted on the reference fixture.
@@ -19,6 +21,8 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 pub struct ProbeParams {
     /// Stop probing when competitive-candidate admission has decayed.
     pub adaptive_probing: Option<AdaptiveProbeParams>,
+    /// Filter evaluation selected consistently across segments; defaults to full prefiltering.
+    pub filter_strategy: Option<VectorFilterStrategy>,
     /// Global work ceiling in average-cluster units. Default 100.
     pub max_probe: usize,
     /// Approximate members retained per requested cluster by the quantized router.
@@ -101,6 +105,9 @@ impl Default for ProbeParams {
     fn default() -> Self {
         Self {
             adaptive_probing: None,
+            filter_strategy: Some(VectorFilterStrategy::Pre {
+                uses_fast_fields: false,
+            }),
             max_probe: 100,
             router_rerank_factor: 1.0,
             router_min_beam_fraction: 0.5,
@@ -115,6 +122,24 @@ impl Default for ProbeParams {
 }
 
 impl ProbeParams {
+    #[cfg(test)]
+    pub(crate) fn prefilter() -> Self {
+        Self {
+            filter_strategy: Some(VectorFilterStrategy::Pre {
+                uses_fast_fields: false,
+            }),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn filter_strategy(&self) -> Result<VectorFilterStrategy> {
+        self.filter_strategy.ok_or_else(|| {
+            TantivyError::InvalidArgument(
+                "vector filter strategy must be selected before routing or preparation".into(),
+            )
+        })
+    }
+
     /// The number of clusters the stacked router is asked to rank for a
     /// segment whose resolved work budget is `budget` units.
     ///
@@ -191,7 +216,80 @@ impl ProbeParams {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Bound;
+
     use super::ProbeParams;
+    use crate::query::{BooleanQuery, BoostQuery, ConstScoreQuery, FastFieldRangeQuery, Query};
+    use crate::schema::Metric;
+    use crate::vector::test_support::FixtureSpec;
+    use crate::vector::{VectorFilterStrategy, VectorSegment, MIN_POST_FILTER_MATCHES};
+    use crate::{Result, Term};
+
+    #[test]
+    fn filter_strategy_preserves_postings_and_selects_post_filters() -> Result<()> {
+        for clustered in [false, true] {
+            let fixture = if clustered {
+                FixtureSpec::clustered(Metric::L2, 8, 4, 128)
+            } else {
+                FixtureSpec::flat(Metric::L2, 8, vec![Some(vec![0.0; 8]); 128])
+            }
+            .label("matches", |i| i % 2 == 0)
+            .build()?;
+            let searcher = fixture.index.reader()?.searcher();
+            let segments = [VectorSegment::from((0, searcher.segment_reader(0)))];
+            let ordinal = searcher.schema().get_field("ordinal")?;
+            let range = FastFieldRangeQuery::new(
+                Bound::Included(Term::from_field_u64(ordinal, 0)),
+                Bound::Unbounded,
+            );
+            let posting = fixture.filter("matches");
+            let filters: Vec<(Box<dyn Query>, bool)> = vec![
+                (Box::new(posting.clone()), false),
+                (Box::new(range.clone()), true),
+                (Box::new(BoostQuery::new(range.clone(), 2.0)), true),
+                (Box::new(ConstScoreQuery::new(range.clone(), 1.0)), true),
+                (
+                    Box::new(BooleanQuery::intersection(vec![
+                        Box::new(range),
+                        Box::new(posting),
+                    ])),
+                    true,
+                ),
+            ];
+            for (filter, fast) in filters {
+                let weight = fixture.weight(filter.as_ref())?;
+                for matches in [
+                    0,
+                    MIN_POST_FILTER_MATCHES - 1,
+                    MIN_POST_FILTER_MATCHES,
+                    usize::MAX,
+                ] {
+                    let strategy = VectorFilterStrategy::plan(
+                        fixture.field,
+                        weight.as_ref(),
+                        matches,
+                        &segments,
+                    )?;
+                    let expected = if fast && clustered && matches >= MIN_POST_FILTER_MATCHES {
+                        VectorFilterStrategy::Post {
+                            estimated_selectivity: 1.0,
+                        }
+                    } else {
+                        VectorFilterStrategy::Pre {
+                            uses_fast_fields: fast,
+                        }
+                    };
+                    assert_eq!(strategy, expected);
+                    let serialized = serde_json::to_string(&strategy)?;
+                    assert_eq!(
+                        serde_json::from_str::<VectorFilterStrategy>(&serialized)?,
+                        strategy
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn adaptive_stopping_preserves_budget_and_routing() -> crate::Result<()> {
@@ -200,7 +298,7 @@ mod tests {
                 let fixed = ProbeParams {
                     max_probe: budget,
                     min_probe_clusters,
-                    ..Default::default()
+                    ..ProbeParams::prefilter()
                 };
                 let adaptive = ProbeParams {
                     adaptive_probing: Some(super::AdaptiveProbeParams::default()),
@@ -227,7 +325,7 @@ mod tests {
         let all = ProbeParams {
             max_probe: usize::MAX,
             min_probe_clusters: 1,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
         for (clusters, docs) in [(1000usize, 20_000usize), (9, 20), (2, 2), (64, 6400)] {
             let (budget, _n_avg, _x) = all.resolved_work_budget(clusters, docs)?;
@@ -243,7 +341,7 @@ mod tests {
     fn budget_is_absolute_and_capped_by_capacity() -> crate::Result<()> {
         let params = ProbeParams {
             max_probe: 10,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
         for (clusters, rows, expected) in [(1000, 20_000, 10.0), (40, 800, 10.0), (2, 40, 2.0)] {
             let (budget, _, _) = params.resolved_work_budget(clusters, rows)?;
@@ -261,7 +359,7 @@ mod tests {
     /// filter stretches it toward `budget / open_share`, capped at the segment's clusters.
     #[test]
     fn router_k_tracks_budget_and_filter_selectivity() {
-        let params = ProbeParams::default();
+        let params = ProbeParams::prefilter();
         let x = 0.2;
         assert_eq!(params.router_k(20.0, x, 1.0, 1000), 20);
         assert_eq!(params.router_k(20.4, x, 1.0, 1000), 21);
@@ -281,13 +379,13 @@ mod tests {
     fn invalid_budget_params_error() {
         let params = ProbeParams {
             max_probe: 0,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
         assert!(params.resolved_work_budget(9, 180).is_err());
         for cost in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let params = ProbeParams {
                 fixed_probe_cost_rows: cost,
-                ..Default::default()
+                ..ProbeParams::prefilter()
             };
             assert!(params.resolved_work_budget(9, 180).is_err(), "{cost}");
         }

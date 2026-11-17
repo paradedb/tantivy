@@ -48,6 +48,7 @@ impl<T: VectorElement> TopClustersBySimilarityCollector<T> {
         params: ProbeParams,
         match_fraction: f64,
     ) -> Result<Self> {
+        params.filter_strategy()?;
         if !(0.0..=1.0).contains(&match_fraction) {
             return Err(TantivyError::InvalidArgument(
                 "routing match fraction must be between zero and one".into(),
@@ -284,7 +285,7 @@ mod tests {
         let collector = TopClustersBySimilarityCollector::new(
             fixture.field,
             vec![0.0f32; 32],
-            ProbeParams::default(),
+            ProbeParams::prefilter(),
             1.0,
         )?;
         fixture.clear_reads();
@@ -315,7 +316,7 @@ mod tests {
             (fixture.field, vec![0.0f32; 31], "query vector length"),
         ] {
             let collector =
-                TopClustersBySimilarityCollector::new(field, query, ProbeParams::default(), 1.0)?;
+                TopClustersBySimilarityCollector::new(field, query, ProbeParams::prefilter(), 1.0)?;
             let error = collector
                 .collect_segments(std::slice::from_ref(&segment), |_| {})
                 .unwrap_err();
@@ -325,7 +326,7 @@ mod tests {
             assert!(TopClustersBySimilarityCollector::new(
                 fixture.field,
                 vec![0.0f32; 32],
-                ProbeParams::default(),
+                ProbeParams::prefilter(),
                 fraction
             )
             .is_err());
@@ -334,7 +335,7 @@ mod tests {
             let collector = TopClustersBySimilarityCollector::new(
                 fixture.field,
                 vec![0.0f32; 32],
-                ProbeParams::default(),
+                ProbeParams::prefilter(),
                 1.0,
             )?;
             assert!(collector

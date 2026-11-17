@@ -128,6 +128,7 @@ impl Weight for ConstWeight {
 ///
 /// The `ConstScorer`'s constant score can be set
 /// by calling `.set_score(...)`.
+#[derive(Clone)]
 pub struct ConstScorer<TDocSet: DocSet> {
     docset: TDocSet,
     score: Score,

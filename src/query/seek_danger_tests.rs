@@ -542,7 +542,8 @@ fn seek_danger_implementation_inventory() {
     // Trait default (used by TermScorer) and the Box / &mut / UnpositionedScorer forwarding impls.
     covered.insert("docset.rs".to_string(), 3);
     covered.insert("query/scorer.rs".to_string(), 1);
-    // Test-only spies for intersection unit tests.
+    // Test-only spies for routed vector candidate filtering and intersection unit tests.
+    covered.insert("vector/filter.rs".to_string(), 1);
     *covered
         .entry("query/intersection.rs".to_string())
         .or_insert(0) += 2;

@@ -19,8 +19,8 @@ use tantivy::vector::clustering::{
     for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
 };
 use tantivy::vector::{
-    LocatedPath, ProbeParams, ProbeStats, RouterKind, Selectivity, VectorQuantizationConfig,
-    VectorQuantizationLayer,
+    LocatedPath, ProbeParams, ProbeStats, RouterKind, Selectivity, VectorFilterStrategy,
+    VectorQuantizationConfig, VectorQuantizationLayer,
 };
 use tantivy::{Index, IndexWriter, Searcher, TantivyDocument, Term};
 
@@ -314,6 +314,9 @@ impl Fixture {
 /// Probes about `clusters` clusters: the budget is that many average clusters of work.
 fn probing(clusters: usize, located: LocatedPath) -> ProbeParams {
     ProbeParams {
+        filter_strategy: Some(VectorFilterStrategy::Pre {
+            uses_fast_fields: false,
+        }),
         max_probe: clusters,
         located,
         ..ProbeParams::default()
@@ -452,8 +455,8 @@ fn allocations_per_segment() -> tantivy::Result<()> {
 }
 
 /// Peak and total allocated bytes of a search over about 100k 128-dimensional vectors in 256
-/// clusters, probing about a quarter of them under a 30% filter with 5% deleted, on both paths.
-/// Printed only; run with `--ignored --nocapture`.
+/// clusters, probing about a quarter of them under a 30% filter with 5% deleted, on Pre and Post
+/// paths. Printed only; run with `--ignored --nocapture`.
 #[test]
 #[ignore]
 fn peak_on_a_large_segment() -> tantivy::Result<()> {
@@ -469,11 +472,31 @@ fn peak_on_a_large_segment() -> tantivy::Result<()> {
     })?;
     let searcher = fixture.index.reader()?.searcher();
     let filter = fixture.term("p30");
-    for (path, located) in [
-        ("routed", LocatedPath::Off),
-        ("located", located_everything()),
+    for (path, located, filter_strategy) in [
+        (
+            "routed",
+            LocatedPath::Off,
+            VectorFilterStrategy::Pre {
+                uses_fast_fields: false,
+            },
+        ),
+        (
+            "located",
+            located_everything(),
+            VectorFilterStrategy::Pre {
+                uses_fast_fields: false,
+            },
+        ),
+        (
+            "post",
+            LocatedPath::Off,
+            VectorFilterStrategy::Post {
+                estimated_selectivity: 0.3,
+            },
+        ),
     ] {
         let params = ProbeParams {
+            filter_strategy: Some(filter_strategy),
             max_probe: 64,
             min_probe_clusters: 1,
             located,

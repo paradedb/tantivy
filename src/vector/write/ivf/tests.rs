@@ -169,7 +169,7 @@ fn check_two_field_entries(empty_second: bool) -> crate::Result<()> {
                 .with_probe_params(ProbeParams {
                     max_probe: usize::MAX,
                     min_probe_clusters: 2,
-                    ..Default::default()
+                    ..ProbeParams::prefilter()
                 })
                 .build_for_searcher(&searcher, &AllQuery)?,
         )?;
@@ -843,7 +843,7 @@ fn run_quantized_matrix_query(
             min_probe_clusters: 2,
             exact_plan: false,
             located: LocatedPath::Off,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         })
         .with_max_scan_levels(depth)
         .build_for_searcher(&searcher, filter)?;
@@ -912,7 +912,7 @@ fn run_quantized_matrix_query(
             min_probe_clusters: 2,
             exact_plan: false,
             located: LocatedPath::Off,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
         let quantized = searcher.search(
             filter,
@@ -1057,7 +1057,7 @@ fn level_zero_matches_unquantized_ivf() -> crate::Result<()> {
         min_probe_clusters: 1,
         exact_plan: false,
         located: LocatedPath::Off,
-        ..Default::default()
+        ..ProbeParams::prefilter()
     };
     let unquantized = build_quantized_fixture(DIM, false)?;
     let quantized = build_quantized_fixture(DIM, true)?;
@@ -1212,7 +1212,7 @@ fn mixed_segments_share_preparation_by_stored_metadata() -> crate::Result<()> {
                 .with_probe_params(ProbeParams {
                     max_probe: usize::MAX,
                     min_probe_clusters: 2,
-                    ..Default::default()
+                    ..ProbeParams::prefilter()
                 })
                 .build_for_searcher(&searcher, &crate::query::AllQuery)
                 .unwrap()
@@ -1229,7 +1229,7 @@ fn mixed_segments_share_preparation_by_stored_metadata() -> crate::Result<()> {
             .collect::<Vec<_>>();
         let params = ProbeParams {
             max_probe: usize::MAX,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         };
         let budget = crate::vector::VectorSearchBudget::for_segments(field, &params, &segments)?;
         let builder =
@@ -1310,6 +1310,7 @@ fn level_zero_flat_segment_remains_exact() -> crate::Result<()> {
     let fruit = searcher.search(
         &AllQuery,
         &TopDocsByVectorSimilarityBuilder::new(field, query, 3)
+            .with_probe_params(ProbeParams::prefilter())
             .with_max_scan_levels(0)
             .build_for_searcher(&searcher, &crate::query::AllQuery)
             .unwrap(),
@@ -1428,7 +1429,7 @@ fn merge_quantization_matches_kernel_harness_and_is_reproducible() -> crate::Res
             min_probe_clusters: 2,
             exact_plan: false,
             located: LocatedPath::Off,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         })
         .build_for_searcher(&searcher, &crate::query::AllQuery)
         .unwrap();
@@ -1496,7 +1497,7 @@ fn quantized_exhaustive_search_probes_all_clusters() -> crate::Result<()> {
             min_probe_clusters: 1,
             exact_plan: false,
             located: LocatedPath::Off,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         })
         .with_max_scan_levels(1)
         .build_for_searcher(&searcher, &crate::query::AllQuery)
@@ -1524,7 +1525,7 @@ fn quantized_probe_terminates_at_ceiling() -> crate::Result<()> {
             max_probe: 1,
             exact_plan: false,
             located: LocatedPath::Off,
-            ..Default::default()
+            ..ProbeParams::prefilter()
         })
         .with_max_scan_levels(1)
         .build_for_searcher(&searcher, &crate::query::AllQuery)
@@ -1567,7 +1568,7 @@ fn quantized_filtered_rows_are_not_charged() -> crate::Result<()> {
         min_probe_clusters: 2,
         exact_plan: false,
         located: LocatedPath::Off,
-        ..Default::default()
+        ..ProbeParams::prefilter()
     };
     let vector_reader = searcher.segment_readers()[0].vector_index(field)?;
     let ivf = vector_reader.index().expect("merged fixture must be IVF");
@@ -1724,7 +1725,7 @@ fn general_dimension_quantized_bridge_at_d100() -> crate::Result<()> {
                 .with_probe_params(ProbeParams {
                     max_probe: usize::MAX,
                     min_probe_clusters: 2,
-                    ..Default::default()
+                    ..ProbeParams::prefilter()
                 })
                 .build_for_searcher(&searcher, &crate::query::AllQuery)
                 .unwrap(),
@@ -1836,7 +1837,7 @@ fn estimator_measurement_uses_production_path_and_is_centered() -> crate::Result
                 min_probe_clusters: 2,
                 exact_plan: false,
                 located: LocatedPath::Off,
-                ..Default::default()
+                ..ProbeParams::prefilter()
             })
             .build_for_searcher(&searcher, &crate::query::AllQuery)
             .unwrap(),
@@ -1939,7 +1940,7 @@ fn layer_zero_io_matches_requested_page_spans() -> crate::Result<()> {
                 min_probe_clusters: 2,
                 exact_plan: false,
                 located: LocatedPath::Off,
-                ..Default::default()
+                ..ProbeParams::prefilter()
             })
             .build_for_searcher(&searcher, &crate::query::AllQuery)
             .unwrap(),
