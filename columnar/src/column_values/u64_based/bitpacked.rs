@@ -21,7 +21,24 @@ pub struct BitpackedReader {
     blocks: Arc<[OnceLock<Block>]>,
 }
 
+/// A single-block cache for point reads from one column.
+#[derive(Default)]
+pub struct ColumnValueCache {
+    block: Option<(usize, Block)>,
+}
+
 impl BitpackedReader {
+    fn read_block(&self, block_num: usize) -> Block {
+        let block_range = self.bit_unpacker.block(block_num, self.data.len());
+        let offset = block_range.start;
+        let data = self
+            .data
+            .slice(block_range)
+            .read_bytes()
+            .expect("Failed to read column values.");
+        Block { offset, data }
+    }
+
     #[inline(always)]
     fn unpack_val(&self, doc: u32) -> u64 {
         let block_num = self.bit_unpacker.block_num(doc);
@@ -30,16 +47,7 @@ impl BitpackedReader {
             return 0;
         }
 
-        let block = self.blocks[block_num].get_or_init(|| {
-            let block_range = self.bit_unpacker.block(block_num, self.data.len());
-            let offset = block_range.start;
-            let data = self
-                .data
-                .slice(block_range)
-                .read_bytes()
-                .expect("Failed to read column values.");
-            Block { offset, data }
-        });
+        let block = self.blocks[block_num].get_or_init(|| self.read_block(block_num));
 
         self.bit_unpacker
             .get_from_subset(doc, block.offset, &block.data)
@@ -85,6 +93,23 @@ impl ColumnValues for BitpackedReader {
     #[inline(always)]
     fn get_val(&self, doc: u32) -> u64 {
         self.stats.min_value + self.stats.gcd.get() * self.unpack_val(doc)
+    }
+
+    fn get_val_with_cache(&self, doc: u32, cache: &mut ColumnValueCache) -> u64 {
+        if self.data.is_empty() {
+            return self.stats.min_value;
+        }
+        let block_num = self.bit_unpacker.block_num(doc);
+        if cache.block.as_ref().is_none_or(|(id, _)| *id != block_num) {
+            cache.block = None;
+            cache.block = Some((block_num, self.read_block(block_num)));
+        }
+        let (_, block) = cache.block.as_ref().unwrap();
+        self.stats.min_value
+            + self.stats.gcd.get()
+                * self
+                    .bit_unpacker
+                    .get_from_subset(doc, block.offset, &block.data)
     }
 
     #[inline]
@@ -195,7 +220,40 @@ impl ColumnCodec for BitpackedCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::column_values::monotonic_mapping::{
+        StrictlyMonotonicMappingInverter, StrictlyMonotonicMappingToInternal,
+    };
     use crate::column_values::u64_based::tests::create_and_validate;
+    use crate::column_values::{
+        CodecType, monotonic_map_column, serialize_u64_based_column_values,
+    };
+
+    #[test]
+    fn caller_cache_does_not_populate_shared_blocks() {
+        let values: Vec<_> = (0..100_000u64).collect();
+        let mut bytes = Vec::new();
+        serialize_u64_based_column_values(&&values[..], &[CodecType::Bitpacked], &mut bytes)
+            .unwrap();
+        let reader = Arc::new(BitpackedCodec::load(FileSlice::from(bytes).slice(1..)).unwrap());
+        let column: Arc<dyn ColumnValues> = reader.clone();
+        let mapped = monotonic_map_column::<_, _, u64, u64>(
+            column,
+            StrictlyMonotonicMappingInverter::from(StrictlyMonotonicMappingToInternal::<u64>::new()),
+        );
+        let mut cache = ColumnValueCache::default();
+        for doc in [0, 50_000, 99_999, 0, 50_001] {
+            assert_eq!(
+                mapped.get_val_with_cache(doc, &mut cache),
+                values[doc as usize]
+            );
+            assert!(reader.blocks.iter().all(|block| block.get().is_none()));
+            assert_eq!(
+                cache.block.as_ref().unwrap().0,
+                reader.bit_unpacker.block_num(doc)
+            );
+        }
+        assert_eq!(reader.get_val(99_999), values[99_999]);
+    }
 
     #[test]
     fn test_with_codec_data_sets_simple() {

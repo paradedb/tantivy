@@ -2,8 +2,8 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::{Range, RangeInclusive};
 
-use crate::ColumnValues;
 use crate::column_values::monotonic_mapping::StrictlyMonotonicFn;
+use crate::{ColumnValueCache, ColumnValues};
 
 struct MonotonicMappingColumn<C, T, Input> {
     from_column: C,
@@ -54,6 +54,11 @@ where
     fn get_val(&self, idx: u32) -> Output {
         let from_val = self.from_column.get_val(idx);
         self.monotonic_mapping.mapping(from_val)
+    }
+
+    fn get_val_with_cache(&self, idx: u32, cache: &mut ColumnValueCache) -> Output {
+        self.monotonic_mapping
+            .mapping(self.from_column.get_val_with_cache(idx, cache))
     }
 
     fn min_value(&self) -> Output {
@@ -113,8 +118,13 @@ mod tests {
             StrictlyMonotonicMappingInverter::from(StrictlyMonotonicMappingToInternal::<i64>::new()),
         );
         let val_i64s: Vec<u64> = mapped.iter().collect();
+        let mut cache = ColumnValueCache::default();
         for i in 0..100 {
             assert_eq!(val_i64s[i as usize], mapped.get_val(i));
+            assert_eq!(
+                val_i64s[i as usize],
+                mapped.get_val_with_cache(i, &mut cache)
+            );
         }
     }
 }

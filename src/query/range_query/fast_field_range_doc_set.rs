@@ -1,7 +1,7 @@
 use core::fmt::Debug;
 use std::ops::RangeInclusive;
 
-use columnar::Column;
+use columnar::{Column, ColumnValueCache};
 
 use crate::docset::SeekDangerResult;
 use crate::{DocId, DocSet, TERMINATED};
@@ -44,6 +44,7 @@ pub(crate) struct RangeDocSet<T> {
     /// The range filter on the values.
     value_range: RangeInclusive<T>,
     column: Column<T>,
+    candidate_cache: Option<ColumnValueCache>,
     /// The next docid start range to fetch (inclusive).
     next_fetch_start: u32,
     /// Number of docs range checked in a batch.
@@ -67,6 +68,7 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> RangeDocSet<T> {
             return Self {
                 value_range,
                 column,
+                candidate_cache: None,
                 loaded_docs: VecCursor::new(),
                 next_fetch_start: TERMINATED,
                 fetch_horizon: DEFAULT_FETCH_HORIZON,
@@ -74,17 +76,29 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> RangeDocSet<T> {
             };
         }
 
-        let mut range_docset = Self {
+        let mut range_docset = Self::new_unpositioned(value_range, column);
+        range_docset.fetch_block();
+        range_docset
+    }
+
+    /// Creates an iterator without finding its first matching document.
+    /// The caller must seek to a match before using its current position.
+    pub(crate) fn new_unpositioned(value_range: RangeInclusive<T>, column: Column<T>) -> Self {
+        Self {
             value_range,
             column,
+            candidate_cache: None,
             loaded_docs: VecCursor::new(),
             next_fetch_start: 0,
             fetch_horizon: DEFAULT_FETCH_HORIZON,
             last_seek_pos_opt: None,
-        };
-        range_docset.reset_fetch_range();
-        range_docset.fetch_block();
-        range_docset
+        }
+    }
+
+    /// Keeps only the current column block when checking ordered candidates.
+    pub(crate) fn with_candidate_cache(mut self) -> Self {
+        self.candidate_cache = Some(ColumnValueCache::default());
+        self
     }
 
     fn reset_fetch_range(&mut self) {
@@ -157,7 +171,13 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> DocSet for RangeDocSe
 
     #[inline]
     fn doc(&self) -> DocId {
-        self.loaded_docs.current().unwrap_or(TERMINATED)
+        self.loaded_docs.current().unwrap_or_else(|| {
+            if self.next_fetch_start == 0 && self.column.num_docs() > 0 {
+                0
+            } else {
+                TERMINATED
+            }
+        })
     }
 
     /// Advances the `DocSet` forward until reaching the target, or going to the
@@ -172,6 +192,12 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> DocSet for RangeDocSe
     fn seek(&mut self, target: DocId) -> DocId {
         if self.is_last_seek_distance_large(target) {
             self.reset_fetch_range();
+        }
+        if self.next_fetch_start == 0 && self.loaded_docs.is_empty() {
+            self.next_fetch_start = target;
+            self.fetch_block();
+            self.last_seek_pos_opt = Some(target);
+            return self.doc();
         }
         if target > self.next_fetch_start {
             self.next_fetch_start = target;
@@ -199,10 +225,16 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> DocSet for RangeDocSe
         }
         self.last_seek_pos_opt = Some(target);
 
-        let is_match = self
-            .column
-            .values_for_doc(target)
-            .any(|value| self.value_range.contains(&value));
+        let is_match = if let Some(cache) = self.candidate_cache.as_mut() {
+            self.column.index.value_row_ids(target).any(|row_id| {
+                let value = self.column.values.get_val_with_cache(row_id, cache);
+                self.value_range.contains(&value)
+            })
+        } else {
+            self.column
+                .values_for_doc(target)
+                .any(|value| self.value_range.contains(&value))
+        };
         if is_match {
             // Leave the docset in a valid state positioned on `target`, so `doc()` returns it and a
             // following `advance()` resumes the scan right after it.
@@ -367,6 +399,11 @@ mod tests {
                 .copied()
                 .find(|&m| m >= target)
                 .unwrap_or(TERMINATED);
+
+            let column = build_u64_column(num_docs, values_for_doc);
+            let mut unpositioned = RangeDocSet::new_unpositioned(1..=1, column);
+            assert_eq!(unpositioned.seek(target), expected);
+            assert_eq!(unpositioned.doc(), expected);
 
             let mut danger = range_docset(1..=1, num_docs, values_for_doc);
             match danger.seek_danger(target) {

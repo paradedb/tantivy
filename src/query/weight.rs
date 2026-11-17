@@ -75,6 +75,11 @@ pub(crate) fn for_each_pruning_scorer<TScorer: PruningScorer + ?Sized>(
 ///
 /// See [`Query`](crate::query::Query).
 pub trait Weight: Send + Sync + 'static {
+    /// Whether evaluating this filter reads fast-field values rather than only postings.
+    fn uses_fast_fields(&self) -> bool {
+        false
+    }
+
     /// Returns the scorer for the given segment.
     ///
     /// `boost` is a multiplier to apply to the score.

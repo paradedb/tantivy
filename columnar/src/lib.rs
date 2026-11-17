@@ -41,8 +41,8 @@ pub use column::{
 };
 pub use column_index::ColumnIndex;
 pub use column_values::{
-    CodecType, ColumnStats, ColumnValues, EmptyColumnValues, MonotonicallyMappableToU64,
-    MonotonicallyMappableToU128,
+    CodecType, ColumnStats, ColumnValueCache, ColumnValues, EmptyColumnValues,
+    MonotonicallyMappableToU64, MonotonicallyMappableToU128,
 };
 pub use iterable::Iterable;
 

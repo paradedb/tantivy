@@ -101,7 +101,9 @@ pub(crate) fn create_and_validate<TColumnCodec: ColumnCodec>(
     let reader = TColumnCodec::load(FileSlice::from(buffer)).unwrap();
     assert_eq!(reader.num_vals(), vals.len() as u32);
     let mut buffer = Vec::new();
+    let mut cache = ColumnValueCache::default();
     for (doc, orig_val) in vals.iter().copied().enumerate() {
+        assert_eq!(reader.get_val_with_cache(doc as u32, &mut cache), orig_val);
         let val = reader.get_val(doc as u32);
         assert_eq!(
             val, orig_val,

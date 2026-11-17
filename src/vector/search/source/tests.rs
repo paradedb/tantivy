@@ -5,13 +5,12 @@ use common::BitSet;
 use crate::query::{AllQuery, Query};
 use crate::schema::{Metric, VectorDType};
 use crate::vector::diagnostics::VectorStorageFormat;
+use crate::vector::filter::{DocFilter, GatedRows, RowGate};
 use crate::vector::params::{LocatedPath, ProbeParams, DEFAULT_FIXED_PROBE_COST_ROWS};
 use crate::vector::search::cluster_source::ClusterSource;
 use crate::vector::search::segment::plan::ScanInput;
 use crate::vector::search::source::controller::ProbeTermination;
-use crate::vector::search::source::router::{
-    DocFilter, GatedRows, RouterClusters, RouterReport, RowGate,
-};
+use crate::vector::search::source::router::{RouterClusters, RouterReport};
 use crate::vector::test_support::{
     first_segment, DocsWeight, Fixture, FixtureSpec, Lcg, SegmentRun,
 };

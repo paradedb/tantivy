@@ -16,7 +16,7 @@ use common::file_slice::FileSlice;
 use crate::column_values::monotonic_mapping::{
     StrictlyMonotonicMappingInverter, StrictlyMonotonicMappingToInternal,
 };
-pub use crate::column_values::u64_based::bitpacked::BitpackedCodec;
+pub use crate::column_values::u64_based::bitpacked::{BitpackedCodec, ColumnValueCache};
 pub use crate::column_values::u64_based::blockwise_linear::BlockwiseLinearCodec;
 #[cfg(feature = "paradedb")]
 pub(crate) use crate::column_values::u64_based::blockwise_linear_v2::BlockwiseLinearV2Codec;
