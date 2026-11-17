@@ -36,7 +36,7 @@ use crate::error::DataCorruption;
 use crate::query::Weight;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
-use crate::vector::filter::MAX_LATE_FILTER_BATCH_SIZE;
+use crate::vector::filter::MAX_SHORTLIST_FILTER_BATCH_SIZE;
 use crate::vector::router::candidate::Candidate as RankedCandidate;
 use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
 use crate::vector::search::interval::{Estimate, Threshold, UpperEndpoint};
@@ -1123,7 +1123,7 @@ where
                 let _sort = enter_vector_stage(VectorStage::LateFilterSort);
                 refined.sort_unstable_by_key(|candidate| Reverse(*candidate));
             }
-            for candidates in refined.chunks(MAX_LATE_FILTER_BATCH_SIZE) {
+            for candidates in refined.chunks(MAX_SHORTLIST_FILTER_BATCH_SIZE) {
                 let selection = enter_vector_stage(VectorStage::LateFilterSelect);
                 let threshold = self.bound.shared_threshold();
                 indexed.clear();

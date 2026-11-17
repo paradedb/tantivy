@@ -124,7 +124,9 @@ pub use collector::{
     VectorSimilarityFruit,
 };
 pub use element::{Accumulator, VectorElement, ENTRY_ALIGN};
-pub use filter::{VectorFilterStrategy, MIN_LATE_FILTER_MATCHES, MIN_POST_FILTER_MATCHES};
+pub use filter::{
+    PostFilterStage, VectorFilterStrategy, MIN_POST_FILTER_MATCHES, MIN_SHORTLIST_FILTER_MATCHES,
+};
 pub use params::{
     AdaptiveProbeParams, LocatedPath, ProbeParams, Selectivity, DEFAULT_FIXED_PROBE_COST_ROWS,
 };

@@ -132,7 +132,7 @@ mod tests {
                         } => {
                             let matches = match filter {
                                 DocFilter::All => None,
-                                DocFilter::Late => unreachable!(),
+                                DocFilter::Shortlist => unreachable!(),
                                 DocFilter::Docs(docs) => Some(docs.len()),
                                 DocFilter::Pending => unreachable!(),
                             };

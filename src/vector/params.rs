@@ -1,7 +1,7 @@
 //! Query-time probe parameters: the work budget and the located path.
 
 use crate::vector::search::source::controller::open_share;
-use crate::vector::VectorFilterStrategy;
+use crate::vector::{PostFilterStage, VectorFilterStrategy};
 use crate::{Result, TantivyError};
 
 /// Default [`ProbeParams::fixed_probe_cost_rows`]: the cost of opening a cluster, in rows of full
@@ -166,7 +166,10 @@ impl ProbeParams {
             .filter_strategy()
             .expect("routing requires a filter strategy")
         {
-            VectorFilterStrategy::Late { .. } => 1.0,
+            VectorFilterStrategy::Post {
+                stage: PostFilterStage::AfterQuantizedScoring,
+                ..
+            } => 1.0,
             _ => match_fraction.clamp(0.0, 1.0),
         };
         let cluster_cost =
@@ -228,7 +231,9 @@ mod tests {
     use crate::query::{BooleanQuery, BoostQuery, ConstScoreQuery, FastFieldRangeQuery, Query};
     use crate::schema::Metric;
     use crate::vector::test_support::FixtureSpec;
-    use crate::vector::{VectorFilterStrategy, VectorSegment, MIN_POST_FILTER_MATCHES};
+    use crate::vector::{
+        PostFilterStage, VectorFilterStrategy, VectorSegment, MIN_POST_FILTER_MATCHES,
+    };
     use crate::{Result, Term};
 
     #[test]
@@ -279,6 +284,7 @@ mod tests {
                     )?;
                     let expected = if fast && clustered && matches >= MIN_POST_FILTER_MATCHES {
                         VectorFilterStrategy::Post {
+                            stage: PostFilterStage::BeforeQuantizedScoring,
                             estimated_selectivity: 1.0,
                         }
                     } else {

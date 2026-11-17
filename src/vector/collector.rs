@@ -46,8 +46,9 @@ use crate::vector::telemetry::{enter_vector_stage, measure, StageTotals};
 use crate::vector::tie_break::NoTieBreak;
 use crate::vector::write::RowAddress;
 use crate::vector::{
-    BlockAddress, PreparedVectorSearch, TopClustersBySimilarityCollector, VectorElement,
-    VectorFilterStrategy, VectorScanInputs, VectorSearchBudget, VectorSegment, VectorStage,
+    BlockAddress, PostFilterStage, PreparedVectorSearch, TopClustersBySimilarityCollector,
+    VectorElement, VectorFilterStrategy, VectorScanInputs, VectorSearchBudget, VectorSegment,
+    VectorStage,
 };
 use crate::{DocAddress, DocId, Result, Score, SegmentOrdinal, TantivyError};
 
@@ -181,7 +182,10 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarityBuilder<T, S> {
         if self.max_scan_levels == 0
             && matches!(
                 self.probe_params.filter_strategy()?,
-                VectorFilterStrategy::Late { .. }
+                VectorFilterStrategy::Post {
+                    stage: PostFilterStage::AfterQuantizedScoring,
+                    ..
+                }
             )
         {
             return Err(TantivyError::InvalidArgument(
@@ -895,7 +899,7 @@ where
     let mut visited = HashSet::new();
     let mut window = candidates.len().max(1);
     let late_filter = collector.inputs.prepared.segments.iter().any(|s| {
-        matches!(&s.scan, Some(ScanInput::Routed { filter, .. }) if matches!(filter, DocFilter::Late))
+        matches!(&s.scan, Some(ScanInput::Routed { filter, .. }) if matches!(filter, DocFilter::Shortlist))
     });
     let mut reserved = WorkUnits::ZERO;
     let mut scans: Vec<_> = (0..vectors.len()).map(|_| None).collect();
@@ -1272,7 +1276,7 @@ mod ivf_e2e_tests {
     use crate::vector::test_support::{FixtureSpec, Layout};
     use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
     use crate::vector::{
-        AdaptiveProbeParams, Candidate, ClusterRef, ProbeTermination, RouterKind,
+        AdaptiveProbeParams, Candidate, ClusterRef, PostFilterStage, ProbeTermination, RouterKind,
         TopClustersBySimilarityCollector, VectorFilterStrategy, VectorSearchBudget, VectorStage,
     };
     use crate::{
@@ -1390,6 +1394,7 @@ mod ivf_e2e_tests {
                             .with_probe_params(ProbeParams {
                                 filter_strategy: Some(if batched {
                                     VectorFilterStrategy::Post {
+                                        stage: PostFilterStage::BeforeQuantizedScoring,
                                         estimated_selectivity: 0.05,
                                     }
                                 } else {
@@ -2158,7 +2163,8 @@ mod ivf_e2e_tests {
         let weight = fixture.weight(&filter)?;
         for (shared, late) in [(true, false), (false, false), (true, true), (false, true)] {
             let strategy = if late {
-                VectorFilterStrategy::Late {
+                VectorFilterStrategy::Post {
+                    stage: PostFilterStage::AfterQuantizedScoring,
                     estimated_selectivity: 1.0,
                 }
             } else {
@@ -2831,6 +2837,7 @@ mod ivf_e2e_tests {
             )?)?;
             let mut cluster_builder = builder.clone();
             cluster_builder.probe_params.filter_strategy = Some(VectorFilterStrategy::Post {
+                stage: PostFilterStage::BeforeQuantizedScoring,
                 estimated_selectivity,
             });
             let clustered =
@@ -2854,6 +2861,7 @@ mod ivf_e2e_tests {
                         min_probe_clusters: 1,
                         located: LocatedPath::Auto,
                         filter_strategy: Some(VectorFilterStrategy::Post {
+                            stage: PostFilterStage::BeforeQuantizedScoring,
                             estimated_selectivity: 0.01,
                         }),
                         ..exhaustive_params(2)
@@ -3527,8 +3535,8 @@ mod late_filter_tests {
     use crate::vector::test_support::FixtureSpec;
     use crate::vector::tests::exhaustive_params;
     use crate::vector::{
-        AdaptiveProbeParams, AtomicVectorWork, LocatedPath, SharedVectorWork, VectorFilterStrategy,
-        MIN_LATE_FILTER_MATCHES, MIN_POST_FILTER_MATCHES,
+        AdaptiveProbeParams, AtomicVectorWork, LocatedPath, PostFilterStage, SharedVectorWork,
+        VectorFilterStrategy, MIN_POST_FILTER_MATCHES, MIN_SHORTLIST_FILTER_MATCHES,
     };
     use crate::{DocId, SegmentReader, Term};
 
@@ -3611,11 +3619,12 @@ mod late_filter_tests {
                 VectorFilterStrategy::plan(
                     fixture.field,
                     &fast_weight,
-                    MIN_LATE_FILTER_MATCHES,
+                    MIN_SHORTLIST_FILTER_MATCHES,
                     usize::MAX,
                     &mixed_segments,
                 )?,
                 VectorFilterStrategy::Post {
+                    stage: PostFilterStage::BeforeQuantizedScoring,
                     estimated_selectivity: 1.0,
                 },
             );
@@ -3623,8 +3632,8 @@ mod late_filter_tests {
                 0,
                 MIN_POST_FILTER_MATCHES - 1,
                 MIN_POST_FILTER_MATCHES,
-                MIN_LATE_FILTER_MATCHES - 1,
-                MIN_LATE_FILTER_MATCHES,
+                MIN_SHORTLIST_FILTER_MATCHES - 1,
+                MIN_SHORTLIST_FILTER_MATCHES,
                 usize::MAX,
             ] {
                 for levels in [0, 1, usize::MAX] {
@@ -3647,15 +3656,22 @@ mod late_filter_tests {
                         levels,
                         &segments,
                     )?;
+                    let strategy = serde_json::from_str::<VectorFilterStrategy>(
+                        &serde_json::to_string(&strategy)?,
+                    )?;
                     assert_eq!(
                         strategy,
-                        if !schedule.is_empty() && levels > 0 && matches >= MIN_LATE_FILTER_MATCHES
+                        if !schedule.is_empty()
+                            && levels > 0
+                            && matches >= MIN_SHORTLIST_FILTER_MATCHES
                         {
-                            VectorFilterStrategy::Late {
+                            VectorFilterStrategy::Post {
+                                stage: PostFilterStage::AfterQuantizedScoring,
                                 estimated_selectivity: 1.0,
                             }
                         } else if matches >= MIN_POST_FILTER_MATCHES {
                             VectorFilterStrategy::Post {
+                                stage: PostFilterStage::BeforeQuantizedScoring,
                                 estimated_selectivity: 1.0,
                             }
                         } else {
@@ -3675,7 +3691,8 @@ mod late_filter_tests {
                     let weight = DeferredWeight {
                         inner: fixture.weight(&filter)?,
                         allow_enumeration: strategy
-                            != VectorFilterStrategy::Late {
+                            != VectorFilterStrategy::Post {
+                                stage: PostFilterStage::AfterQuantizedScoring,
                                 estimated_selectivity: 1.0,
                             },
                     };
@@ -3723,7 +3740,7 @@ mod late_filter_tests {
                 let ScanInput::Routed { filter, .. } = segment.scan.as_mut().unwrap() else {
                     panic!("routed scan")
                 };
-                *filter = DocFilter::Late;
+                *filter = DocFilter::Shortlist;
             }
             let router = TopClustersBySimilarityCollector::new(
                 fixture.field,
@@ -3735,7 +3752,8 @@ mod late_filter_tests {
             let candidates = router.collect_segments(&segments, |_| {})?;
             for (shared, adaptive) in [(false, false), (false, true), (true, false), (true, true)] {
                 let mut builder = builder.clone();
-                builder.probe_params.filter_strategy = Some(VectorFilterStrategy::Late {
+                builder.probe_params.filter_strategy = Some(VectorFilterStrategy::Post {
+                    stage: PostFilterStage::AfterQuantizedScoring,
                     estimated_selectivity: 0.1,
                 });
                 builder.probe_params.adaptive_probing = adaptive.then_some(AdaptiveProbeParams {
@@ -3788,7 +3806,8 @@ mod late_filter_tests {
             // The actual eligibility path must also avoid draining the filter.
             let params = ProbeParams {
                 max_probe: 1,
-                filter_strategy: Some(VectorFilterStrategy::Late {
+                filter_strategy: Some(VectorFilterStrategy::Post {
+                    stage: PostFilterStage::AfterQuantizedScoring,
                     estimated_selectivity: 0.1,
                 }),
                 ..ProbeParams::prefilter()
@@ -3870,7 +3889,8 @@ mod late_filter_tests {
                 let builder =
                     TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
                         .with_probe_params(ProbeParams {
-                            filter_strategy: Some(VectorFilterStrategy::Late {
+                            filter_strategy: Some(VectorFilterStrategy::Post {
+                                stage: PostFilterStage::AfterQuantizedScoring,
                                 estimated_selectivity,
                             }),
                             ..exhaustive_params(64)
@@ -3937,7 +3957,8 @@ mod late_filter_tests {
         };
         let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
             .with_probe_params(ProbeParams {
-                filter_strategy: Some(VectorFilterStrategy::Late {
+                filter_strategy: Some(VectorFilterStrategy::Post {
+                    stage: PostFilterStage::AfterQuantizedScoring,
                     estimated_selectivity: 1.0 / 32.0,
                 }),
                 ..params.clone()
@@ -3947,7 +3968,7 @@ mod late_filter_tests {
         let ScanInput::Routed { filter, .. } = prepared.segments[0].scan.as_mut().unwrap() else {
             panic!("routed")
         };
-        *filter = DocFilter::Late;
+        *filter = DocFilter::Shortlist;
         let router =
             TopClustersBySimilarityCollector::new(fixture.field, query.clone(), params, 1.0)?
                 .with_budget(budget);
@@ -3995,8 +4016,8 @@ mod late_filter_tests {
         let segments = vec![VectorSegment::from((0, searcher.segment_reader(0)))];
         for max_probe in [1, 100, 100_000] {
             for (matches, late) in [
-                (MIN_LATE_FILTER_MATCHES - 1, false),
-                (MIN_LATE_FILTER_MATCHES, true),
+                (MIN_SHORTLIST_FILTER_MATCHES - 1, false),
+                (MIN_SHORTLIST_FILTER_MATCHES, true),
             ] {
                 let weight = DeferredWeight {
                     inner: fixture.weight(&fixture.filter("matches"))?,
@@ -4023,7 +4044,7 @@ mod late_filter_tests {
                 else {
                     panic!("routed")
                 };
-                assert_eq!(matches!(filter, DocFilter::Late), late);
+                assert_eq!(matches!(filter, DocFilter::Shortlist), late);
             }
         }
         Ok(())
@@ -4045,7 +4066,8 @@ mod late_filter_tests {
         let query = vec![0.0f32; 64];
         let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
             .with_probe_params(ProbeParams {
-                filter_strategy: Some(VectorFilterStrategy::Late {
+                filter_strategy: Some(VectorFilterStrategy::Post {
+                    stage: PostFilterStage::AfterQuantizedScoring,
                     estimated_selectivity: 0.1,
                 }),
                 ..exhaustive_params(64)
@@ -4085,11 +4107,12 @@ mod late_filter_tests {
             VectorFilterStrategy::plan(
                 fixture.field,
                 &weight,
-                MIN_LATE_FILTER_MATCHES,
+                MIN_SHORTLIST_FILTER_MATCHES,
                 usize::MAX,
                 &segments,
             )?,
-            VectorFilterStrategy::Late {
+            VectorFilterStrategy::Post {
+                stage: PostFilterStage::AfterQuantizedScoring,
                 estimated_selectivity: 1.0
             },
         );
@@ -4097,7 +4120,7 @@ mod late_filter_tests {
             VectorFilterStrategy::plan(
                 fixture.field,
                 &weight,
-                MIN_LATE_FILTER_MATCHES,
+                MIN_SHORTLIST_FILTER_MATCHES,
                 usize::MAX,
                 &[],
             )?,
@@ -4108,7 +4131,8 @@ mod late_filter_tests {
         let query = vec![0.0f32; 64];
         let builder = TopDocsByVectorSimilarityBuilder::new(fixture.field, query.clone(), 10)
             .with_probe_params(ProbeParams {
-                filter_strategy: Some(VectorFilterStrategy::Late {
+                filter_strategy: Some(VectorFilterStrategy::Post {
+                    stage: PostFilterStage::AfterQuantizedScoring,
                     estimated_selectivity: 0.1,
                 }),
                 ..ProbeParams::prefilter()

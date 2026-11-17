@@ -284,7 +284,7 @@ impl PreparedVectorSearch {
             })
             .collect();
         self.segments
-            .retain(|s| !s.routed() || routed.contains_key(&s.ordinal) || matches!(&s.scan, Some(ScanInput::Routed { filter, .. }) if matches!(filter, DocFilter::Late)));
+            .retain(|s| !s.routed() || routed.contains_key(&s.ordinal) || matches!(&s.scan, Some(ScanInput::Routed { filter, .. }) if matches!(filter, DocFilter::Shortlist)));
         for segment in &mut self.segments {
             if let Some(ScanInput::Routed { budget, report, .. }) = &mut segment.scan {
                 report.planned_clusters = routed.get(&segment.ordinal).copied().unwrap_or_default();

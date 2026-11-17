@@ -174,7 +174,7 @@ impl<T: VectorElement> SegmentSearcher<T> {
         if matches!(
             &self.segment.scan,
             Some(ScanInput::Routed {
-                filter: DocFilter::Late,
+                filter: DocFilter::Shortlist,
                 ..
             })
         ) {
