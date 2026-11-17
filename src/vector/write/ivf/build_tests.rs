@@ -146,7 +146,7 @@ fn merge_flat_segments_with_deletes_into_ivf() -> crate::Result<()> {
     Ok(())
 }
 
-/// A merge that deletes every vector of one field, while anrest keeps live vectors, writes the
+/// A merge that deletes every vector of one field, while another keeps live vectors, writes the
 /// emptied field's `.vec`/`.centroids` slots as empty, the same as a field with no vectors.
 #[test]
 fn merge_deleting_every_doc_of_one_field_writes_empty_ivf() -> crate::Result<()> {
