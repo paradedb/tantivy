@@ -3,7 +3,6 @@
 
 use std::io::Write;
 use std::sync::Arc;
-use std::time::Instant;
 
 use common::CountingWriter;
 use quant::cascade::{
@@ -97,17 +96,14 @@ pub(super) fn write_data_entry(
     let num_centroids = cluster_offsets.len() - 1;
 
     // IdMaps are emitted after Data so inter-entry padding never enters an id map.
-    let id_map_start = Instant::now();
     if num_centroids >= u32::MAX as usize {
         return Err(TantivyError::InvalidArgument(
             "too many clusters for document locations".into(),
         ));
     }
     let mut locations = IdMap::empty_locations(merge.num_target_docs);
-    timings.id_map_write = id_map_start.elapsed();
 
     // Data entry: metadata followed by aligned cluster blocks.
-    let encode_start = Instant::now();
     let meta = VectorColMetadata::build_ivf(opts, quantization)?.with_assignment(assignment);
     let slots = meta.slots();
     // Plain blocks stream their rows first; quantized blocks keep the rows in `ExactRows` and
@@ -169,7 +165,6 @@ pub(super) fn write_data_entry(
     );
     data.flush()?;
     timings.vec_bytes += vec_write.written_bytes() - data_start;
-    timings.encode = encode_start.elapsed();
     Ok(locations)
 }
 
