@@ -534,6 +534,9 @@ fn gate(
 mod tests {
     use std::sync::Mutex;
 
+    use proptest::collection::{btree_set, vec};
+    use proptest::prelude::*;
+
     use super::*;
     use crate::collector::{Collector, TopDocs};
     use crate::docset::SeekDangerResult;
@@ -616,15 +619,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn post_only_checks_routed_documents_in_every_executor() -> Result<()> {
-        const DIMENSIONS: usize = 8;
-        const CLUSTERS: usize = 8;
-        const DOCUMENTS: usize = 129;
-        const TOP_K: usize = 5;
-        for replicated in [false, true] {
-            let mut spec = FixtureSpec::clustered(Metric::L2, DIMENSIONS, CLUSTERS, DOCUMENTS)
-                .deletes(&[0, 3]);
+    const DIMENSIONS: usize = 8;
+    const CLUSTERS: usize = DIMENSIONS;
+    const MAX_DOCUMENTS: usize = 2 * u64::BITS as usize + 1;
+    const PROPERTY_CASES: u32 = 32;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(PROPERTY_CASES))]
+
+        #[test]
+        fn post_only_checks_routed_documents_in_every_executor(
+            documents in vec((any::<bool>(), any::<bool>()), CLUSTERS..=MAX_DOCUMENTS),
+            chosen in btree_set(0..CLUSTERS, 0..=CLUSTERS),
+            replicated in any::<bool>(),
+            top_k in 1..=MAX_DOCUMENTS,
+        ) {
+            let deletes: Vec<_> = documents.iter().enumerate()
+                .filter(|(doc, (_, deleted))| *deleted && *doc + 1 < documents.len())
+                .map(|(doc, _)| doc)
+                .collect();
+            let mut spec = FixtureSpec::clustered(Metric::L2, DIMENSIONS, CLUSTERS, documents.len())
+                .deletes(&deletes);
             if replicated {
                 spec = spec.replicated();
             }
@@ -633,7 +648,10 @@ mod tests {
             let segment = searcher.segment_reader(0);
             let segments = [VectorSegment::from((0, segment))];
             let vectors = segment.vector_index(fixture.field)?;
-            let matches: Vec<_> = (0..segment.max_doc()).filter(|doc| doc % 3 == 0).collect();
+            let matches: Vec<_> = documents.iter().enumerate()
+                .filter(|(_, (matches, _))| *matches)
+                .map(|(doc, _)| doc as DocId)
+                .collect();
             let pre_weight = DocsWeight {
                 max_doc: segment.max_doc(),
                 docs: matches.clone(),
@@ -643,11 +661,12 @@ mod tests {
                 ..exhaustive_params(CLUSTERS)
             };
             let budget = VectorSearchBudget::for_segments(fixture.field, &params, &segments)?;
-            let builder = TopDocs::with_limit(TOP_K)
+            let builder = TopDocs::with_limit(top_k)
                 .order_by_similarity(fixture.field, vec![0.0f32; DIMENSIONS])
                 .with_probe_params(params.clone());
             let all_clusters: Vec<_> = (0..CLUSTERS).collect();
-            for chosen in [&[][..], &[0, 2][..], all_clusters.as_slice()] {
+            let chosen: Vec<_> = chosen.into_iter().collect();
+            for chosen in [&[][..], chosen.as_slice(), all_clusters.as_slice()] {
                 let candidates = fixture.candidates(chosen, &[0.0; DIMENSIONS])?;
                 let mut expected_probes = Vec::new();
                 let mut scratch = Vec::new();
@@ -657,10 +676,8 @@ mod tests {
                 }
                 expected_probes.sort_unstable();
                 expected_probes.dedup();
-                if chosen.len() < CLUSTERS {
-                    assert!(expected_probes.len() < segment.max_doc() as usize);
-                } else {
-                    assert_eq!(expected_probes.len(), segment.max_doc() as usize);
+                if chosen.len() == CLUSTERS {
+                    prop_assert_eq!(expected_probes.len(), segment.max_doc() as usize);
                 }
                 let routed: Vec<_> = candidates
                     .iter()
@@ -710,7 +727,7 @@ mod tests {
                     let post_builder = builder.clone().with_probe_params(ProbeParams {
                         filter_strategy: Some(VectorFilterStrategy::Post {
                             stage: PostFilterStage::BeforeQuantizedScoring,
-                            estimated_selectivity: 0.1,
+                            estimated_selectivity: 1.0,
                         }),
                         ..params.clone()
                     });
@@ -726,20 +743,19 @@ mod tests {
                         post.collect_segments(weight.as_ref(), &segments, |_| {})?
                     };
                     let actual = post.merge_fruits(fruits)?;
-                    assert_eq!(
-                        actual.results, expected.results,
-                        "shared={shared}, independent={independent}, wrapped={wrapped}"
+                    prop_assert_eq!(
+                        &actual.results, &expected.results,
+                        "shared={}, independent={}, wrapped={}", shared, independent, wrapped
                     );
-                    assert_eq!(*probes.lock().unwrap(), expected_probes);
+                    prop_assert_eq!(&*probes.lock().unwrap(), &expected_probes);
                     let sizes = sizes.lock().unwrap();
                     if expected_probes.is_empty() {
-                        assert!(sizes.is_empty());
+                        prop_assert!(sizes.is_empty());
                     } else {
-                        assert_eq!(*sizes, [expected_probes.len() as u32]);
+                        prop_assert_eq!(sizes.as_slice(), &[expected_probes.len() as u32]);
                     }
                 }
             }
         }
-        Ok(())
     }
 }
