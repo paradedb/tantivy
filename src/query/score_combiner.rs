@@ -30,6 +30,11 @@ pub trait ScoreCombiner: Default + Clone + Send + Copy + 'static {
     fn constant_score() -> Option<Score> {
         None
     }
+
+    /// How the combiner gets one score from the scores of the clauses, for an `Explanation`.
+    fn description(&self) -> String {
+        "BooleanClause. sum of ...".to_string()
+    }
 }
 
 /// Just ignores scores. The `DoNothingCombiner` does not
@@ -113,5 +118,16 @@ impl ScoreCombiner for DisjunctionMaxCombiner {
     #[inline]
     fn score(&self) -> Score {
         self.max + (self.sum - self.max) * self.tie_breaker
+    }
+
+    fn description(&self) -> String {
+        if self.tie_breaker == 0.0 {
+            "DisjunctionMax. max of ...".to_string()
+        } else {
+            format!(
+                "DisjunctionMax. max plus {} times the others of ...",
+                self.tie_breaker
+            )
+        }
     }
 }
