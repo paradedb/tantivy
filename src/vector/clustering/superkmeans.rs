@@ -635,8 +635,12 @@ mod tests {
         let (n, dim) = (5_000, 16);
         let options = VectorOptions::new(dim, Metric::L2);
         let row_bytes = options.bytes_per_vector();
+        // Train on the full sample so target_leaf_size is not scaled down; a smaller leaf
+        // would raise k enough that the Gram exceeds n rows and this budget check is moot.
         let centroids = train(
-            &SuperKMeansClusterer::new().with_target_leaf_size(100),
+            &SuperKMeansClusterer::new()
+                .with_target_leaf_size(100)
+                .with_training_sample_ratio(1.0),
             &mut VecSource::new(blobs(n, dim), dim),
         );
         let k = centroids.rows;
