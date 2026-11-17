@@ -283,7 +283,7 @@ impl log::Log for CaptureLogger {
 
 static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
 
-/// The merge emits one parseable `ivf_build timings_ms ...` line per field, printed under
+/// The merge emits one parseable `ivf_build timings_ms ...` line per merge, printed under
 /// `--nocapture`.
 #[test]
 fn ivf_build_emits_timings_log() -> crate::Result<()> {
@@ -313,8 +313,6 @@ fn ivf_build_emits_timings_log() -> crate::Result<()> {
         .iter()
         .find(|l| l.contains("ivf_build timings_ms") && l.contains("centroids=200"))
         .expect("expected an ivf_build timings line for the 200-centroid build");
-    assert!(line.contains("train="));
-    assert!(line.contains("id_map_write="));
     let field = |key: &str| -> usize {
         line.split_whitespace()
             .find_map(|part| part.strip_prefix(key)?.strip_prefix('='))
@@ -323,6 +321,14 @@ fn ivf_build_emits_timings_log() -> crate::Result<()> {
             .unwrap()
     };
     let vectors = field("vectors");
+    let stages = ["train", "router", "assign", "other"];
+    let measured: usize = stages.iter().map(|stage| field(stage)).sum();
+    let total = field("total");
+    assert!(total >= measured, "overlapping stage timers: {line}");
+    assert!(
+        total - measured < stages.len(),
+        "stages must cover total, allowing millisecond truncation: {line}"
+    );
     assert!(line.contains("train_reads="));
     assert_eq!(field("assign_reads"), vectors);
     assert_eq!(field("encode_reads"), vectors);

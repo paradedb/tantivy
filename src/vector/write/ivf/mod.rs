@@ -54,7 +54,7 @@ struct AssignedVector {
     primary: bool,
 }
 
-/// Per-field IVF build counters and timings, reported on `paradedb::ivf_build`.
+/// Per-merge IVF build counters and timings, reported on `paradedb::ivf_build`.
 #[derive(Default)]
 struct IvfBuildTimings {
     /// Source vectors decoded for training, counting a vector again each time it is re-read.
@@ -67,15 +67,20 @@ struct IvfBuildTimings {
     exact_reads: usize,
     replica_bytes: usize,
     pad_bytes: usize,
-    /// Bytes written to this field's vector entries, including entry padding.
+    /// Bytes written to the merged vector entries, including entry padding.
     /// File headers and the composite footer are excluded.
     vec_bytes: u64,
     train: Duration,
+    router: Duration,
     assign: Duration,
-    id_map_write: Duration,
-    encode: Duration,
-    /// Time writing the document-ordered full-precision rows.
-    exact: Duration,
+    other: Duration,
+}
+
+fn finish_stage(start: &mut Instant) -> Duration {
+    let end = Instant::now();
+    let elapsed = end.duration_since(*start);
+    *start = end;
+    elapsed
 }
 
 /// One vector field's merge inputs.
@@ -107,6 +112,9 @@ pub(crate) fn merge_ivf(
     clusterer: &dyn IvfClusterer,
     router: RouterKind,
 ) -> crate::Result<()> {
+    let build_start = Instant::now();
+    let mut stage_start = build_start;
+    let mut timings = IvfBuildTimings::default();
     if ctx.cancel.wants_cancel() {
         return Err(TantivyError::Cancelled);
     }
@@ -140,12 +148,15 @@ pub(crate) fn merge_ivf(
     let mut centroids_write = CompositeWrite::wrap(centroids_file);
 
     let mut id_maps = Vec::new();
-    let mut build_reports = Vec::new();
+    let mut fields = 0;
+    let mut centroids = 0;
+    let mut vectors = 0;
     for (field, entry) in ctx.schema.fields() {
         let opts = match entry.field_type() {
             FieldType::Vector(opts) => opts,
             _ => continue,
         };
+        fields += 1;
         let quantization = ctx
             .settings
             .vector_quantization
@@ -159,12 +170,12 @@ pub(crate) fn merge_ivf(
             .iter()
             .map(|reader| reader.vector_index(field))
             .collect::<crate::Result<Vec<_>>>()?;
-        let field_build_start = Instant::now();
         let source_rows = merge_source_rows(ctx, &field_readers)?;
         let vector_count = field_readers
             .iter()
             .map(|reader| reader.num_vectors())
             .sum::<usize>();
+        vectors += vector_count;
         let merge = FieldMerge {
             ctx,
             field,
@@ -188,10 +199,11 @@ pub(crate) fn merge_ivf(
 
         match opts.dtype() {
             VectorDType::F32 => {
-                let mut timings = IvfBuildTimings::default();
-                let Some(trained) =
-                    train::train(&merge, clusterer, &source_rows, vector_count, &mut timings)?
-                else {
+                timings.other += finish_stage(&mut stage_start);
+                let trained =
+                    train::train(&merge, clusterer, &source_rows, vector_count, &mut timings)?;
+                timings.train += finish_stage(&mut stage_start);
+                let Some(trained) = trained else {
                     // Every vector-bearing doc was deleted. Write the same empty slots as the
                     // no-vectors path: the reader errors on slots missing from composites the
                     // other fields still write.
@@ -199,9 +211,11 @@ pub(crate) fn merge_ivf(
                     id_maps.push(write::FieldIdMaps::empty(&merge));
                     continue;
                 };
+                centroids += trained.num_centroids;
                 let mut centroids = trained.centroids;
                 let router = train::build_router(router, opts, &mut centroids)?;
                 let num_centroids = trained.num_centroids;
+                timings.router += finish_stage(&mut stage_start);
 
                 let mut assigned_vectors = assign::assign(
                     &merge,
@@ -211,6 +225,7 @@ pub(crate) fn merge_ivf(
                     vector_count,
                     &mut timings,
                 )?;
+                timings.assign += finish_stage(&mut stage_start);
                 // The `.centroids` doc count: one primary row per document.
                 let num_present_docs = assigned_vectors
                     .iter()
@@ -240,7 +255,6 @@ pub(crate) fn merge_ivf(
                 // entry, normalized as the encode pass normalizes the rows it codes; the cluster
                 // blocks carry codes and document ids only.
                 let exact_present = if quantization.is_some() {
-                    let exact_start = Instant::now();
                     timings.pad_bytes += vec_write.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
                     let entry_start = vec_write.written_bytes();
                     let rows_w =
@@ -255,7 +269,6 @@ pub(crate) fn merge_ivf(
                     )?;
                     timings.exact_reads += present.len();
                     timings.vec_bytes += vec_write.written_bytes() - entry_start;
-                    timings.exact = exact_start.elapsed();
                     Some(present)
                 } else {
                     None
@@ -275,21 +288,37 @@ pub(crate) fn merge_ivf(
                     num_centroids,
                     &router,
                 )?;
-
-                build_reports.push((
-                    field,
-                    timings,
-                    field_build_start.elapsed(),
-                    num_centroids,
-                    vector_count,
-                ));
             }
         }
     }
 
-    write::id_maps(&mut vec_write, id_maps, &mut build_reports)?;
+    let id_map_start = vec_write.written_bytes();
+    write::id_maps(&mut vec_write, id_maps)?;
+    timings.vec_bytes += vec_write.written_bytes() - id_map_start;
     vec_write.close()?;
     centroids_write.close()?;
+    timings.other += finish_stage(&mut stage_start);
+    log::info!(
+        target: "paradedb::ivf_build",
+        "ivf_build timings_ms train={} router={} assign={} other={} total={} \
+         fields={} centroids={} vectors={} train_reads={} assign_reads={} \
+         encode_reads={} exact_reads={} replica_bytes={} vec_bytes={} pad_bytes={}",
+        timings.train.as_millis(),
+        timings.router.as_millis(),
+        timings.assign.as_millis(),
+        timings.other.as_millis(),
+        stage_start.duration_since(build_start).as_millis(),
+        fields,
+        centroids,
+        vectors,
+        timings.train_reads,
+        timings.assign_reads,
+        timings.encode_reads,
+        timings.exact_reads,
+        timings.replica_bytes,
+        timings.vec_bytes,
+        timings.pad_bytes,
+    );
     Ok(())
 }
 
