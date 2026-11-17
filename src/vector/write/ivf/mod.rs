@@ -70,18 +70,10 @@ struct IvfBuildTimings {
     /// Bytes written to the merged vector entries, including entry padding.
     /// File headers and the composite footer are excluded.
     vec_bytes: u64,
-    prepare: Duration,
     train: Duration,
     router: Duration,
     assign: Duration,
-    layout: Duration,
-    id_map_write: Duration,
-    encode: Duration,
-    /// Time writing the document-ordered full-precision rows.
-    exact: Duration,
-    centroid_write: Duration,
-    cleanup: Duration,
-    finish: Duration,
+    rest: Duration,
 }
 
 fn finish_stage(start: &mut Instant) -> Duration {
@@ -207,7 +199,7 @@ pub(crate) fn merge_ivf(
 
         match opts.dtype() {
             VectorDType::F32 => {
-                timings.prepare += finish_stage(&mut stage_start);
+                timings.rest += finish_stage(&mut stage_start);
                 let trained =
                     train::train(&merge, clusterer, &source_rows, vector_count, &mut timings)?;
                 timings.train += finish_stage(&mut stage_start);
@@ -250,7 +242,6 @@ pub(crate) fn merge_ivf(
                 } else {
                     Assignment::Nearest
                 };
-                timings.layout += finish_stage(&mut stage_start);
                 let locations = encode::write_data_entry(
                     &merge,
                     &mut vec_write,
@@ -260,7 +251,6 @@ pub(crate) fn merge_ivf(
                     assignment,
                     &mut timings,
                 )?;
-                timings.encode += finish_stage(&mut stage_start);
                 // A quantized field keeps its full-precision rows in document order, in their own
                 // entry, normalized as the encode pass normalizes the rows it codes; the cluster
                 // blocks carry codes and document ids only.
@@ -283,7 +273,6 @@ pub(crate) fn merge_ivf(
                 } else {
                     None
                 };
-                timings.exact += finish_stage(&mut stage_start);
                 id_maps.push(write::FieldIdMaps {
                     field,
                     locations,
@@ -299,39 +288,25 @@ pub(crate) fn merge_ivf(
                     num_centroids,
                     &router,
                 )?;
-                timings.centroid_write += finish_stage(&mut stage_start);
             }
         }
-        drop(source_rows);
-        drop(merge);
-        timings.cleanup += finish_stage(&mut stage_start);
     }
 
-    timings.prepare += finish_stage(&mut stage_start);
     let id_map_start = vec_write.written_bytes();
     write::id_maps(&mut vec_write, id_maps)?;
     timings.vec_bytes += vec_write.written_bytes() - id_map_start;
-    timings.id_map_write = finish_stage(&mut stage_start);
     vec_write.close()?;
     centroids_write.close()?;
-    timings.finish = finish_stage(&mut stage_start);
+    timings.rest += finish_stage(&mut stage_start);
     log::info!(
         target: "paradedb::ivf_build",
-        "ivf_build timings_ms prepare={} train={} router={} assign={} layout={} \
-         encode={} exact={} centroid_write={} cleanup={} id_map_write={} finish={} \
-         total={} fields={} centroids={} vectors={} train_reads={} assign_reads={} \
-         encode_reads={} exact_reads={} replica_bytes={} vec_bytes={} pad_bytes={} encode_ms={}",
-        timings.prepare.as_millis(),
+        "ivf_build timings_ms train={} router={} assign={} rest={} total={} \
+         fields={} centroids={} vectors={} train_reads={} assign_reads={} \
+         encode_reads={} exact_reads={} replica_bytes={} vec_bytes={} pad_bytes={}",
         timings.train.as_millis(),
         timings.router.as_millis(),
         timings.assign.as_millis(),
-        timings.layout.as_millis(),
-        timings.encode.as_millis(),
-        timings.exact.as_millis(),
-        timings.centroid_write.as_millis(),
-        timings.cleanup.as_millis(),
-        timings.id_map_write.as_millis(),
-        timings.finish.as_millis(),
+        timings.rest.as_millis(),
         stage_start.duration_since(build_start).as_millis(),
         fields,
         centroids,
@@ -343,7 +318,6 @@ pub(crate) fn merge_ivf(
         timings.replica_bytes,
         timings.vec_bytes,
         timings.pad_bytes,
-        timings.encode.as_millis(),
     );
     Ok(())
 }

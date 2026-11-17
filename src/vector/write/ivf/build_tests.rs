@@ -313,8 +313,6 @@ fn ivf_build_emits_timings_log() -> crate::Result<()> {
         .iter()
         .find(|l| l.contains("ivf_build timings_ms") && l.contains("centroids=200"))
         .expect("expected an ivf_build timings line for the 200-centroid build");
-    assert!(line.contains("train="));
-    assert!(line.contains("id_map_write="));
     let field = |key: &str| -> usize {
         line.split_whitespace()
             .find_map(|part| part.strip_prefix(key)?.strip_prefix('='))
@@ -323,19 +321,7 @@ fn ivf_build_emits_timings_log() -> crate::Result<()> {
             .unwrap()
     };
     let vectors = field("vectors");
-    let stages = [
-        "prepare",
-        "train",
-        "router",
-        "assign",
-        "layout",
-        "encode",
-        "exact",
-        "centroid_write",
-        "cleanup",
-        "id_map_write",
-        "finish",
-    ];
+    let stages = ["train", "router", "assign", "rest"];
     let measured: usize = stages.iter().map(|stage| field(stage)).sum();
     let total = field("total");
     assert!(total >= measured, "overlapping stage timers: {line}");
