@@ -11,6 +11,7 @@ use quant::cascade::LayerSpec;
 #[cfg(test)]
 use quant::model::Grid;
 
+use self::profile::StageProfile;
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
 use crate::plugin::PluginMergeContext;
@@ -39,6 +40,7 @@ mod assign;
 #[cfg(test)]
 mod build_tests;
 mod encode;
+mod profile;
 mod source;
 #[cfg(test)]
 mod tests;
@@ -200,8 +202,10 @@ pub(crate) fn merge_ivf(
         match opts.dtype() {
             VectorDType::F32 => {
                 timings.other += finish_stage(&mut stage_start);
+                let profile = StageProfile::start();
                 let trained =
                     train::train(&merge, clusterer, &source_rows, vector_count, &mut timings)?;
+                profile.finish("train", vector_count);
                 timings.train += finish_stage(&mut stage_start);
                 let Some(trained) = trained else {
                     // Every vector-bearing doc was deleted. Write the same empty slots as the
@@ -213,10 +217,13 @@ pub(crate) fn merge_ivf(
                 };
                 centroids += trained.num_centroids;
                 let mut centroids = trained.centroids;
+                let profile = StageProfile::start();
                 let router = train::build_router(router, opts, &mut centroids)?;
                 let num_centroids = trained.num_centroids;
+                profile.finish("router", vector_count);
                 timings.router += finish_stage(&mut stage_start);
 
+                let profile = StageProfile::start();
                 let mut assigned_vectors = assign::assign(
                     &merge,
                     clusterer,
@@ -225,7 +232,9 @@ pub(crate) fn merge_ivf(
                     vector_count,
                     &mut timings,
                 )?;
+                profile.finish("assign", vector_count);
                 timings.assign += finish_stage(&mut stage_start);
+                let profile = StageProfile::start();
                 // The `.centroids` doc count: one primary row per document.
                 let num_present_docs = assigned_vectors
                     .iter()
@@ -251,6 +260,8 @@ pub(crate) fn merge_ivf(
                     assignment,
                     &mut timings,
                 )?;
+                profile.finish("encode", vector_count);
+                let profile = StageProfile::start();
                 // A quantized field keeps its full-precision rows in document order, in their own
                 // entry, normalized as the encode pass normalizes the rows it codes; the cluster
                 // blocks carry codes and document ids only.
@@ -280,6 +291,7 @@ pub(crate) fn merge_ivf(
                     num_target_docs,
                 });
 
+                profile.finish("exact", vector_count);
                 write::centroid_slots(
                     &mut centroids_write,
                     &merge,
@@ -292,11 +304,13 @@ pub(crate) fn merge_ivf(
         }
     }
 
+    let profile = StageProfile::start();
     let id_map_start = vec_write.written_bytes();
     write::id_maps(&mut vec_write, id_maps)?;
     timings.vec_bytes += vec_write.written_bytes() - id_map_start;
     vec_write.close()?;
     centroids_write.close()?;
+    profile.finish("finalize", vectors);
     timings.other += finish_stage(&mut stage_start);
     log::info!(
         target: "paradedb::ivf_build",

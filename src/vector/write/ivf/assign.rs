@@ -47,6 +47,9 @@ pub(super) fn assign(
             .collect()
     };
     timings.assign_reads += source.reads;
+    log::info!(target: "paradedb::ivf_build",
+        "ivf_source_profile stage=assign vectors={} reads={} load_ms={}",
+        vector_count, source.reads, source.read_time.as_millis());
 
     if pairs.len() != source.num_rows() {
         return Err(TantivyError::InvalidArgument(format!(
