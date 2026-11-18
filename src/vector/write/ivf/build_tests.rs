@@ -2,15 +2,22 @@
 
 use std::sync::Arc;
 
+use superkmeans::make_blobs;
+
+use crate::collector::TopDocs;
 use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
 use crate::query::AllQuery;
 use crate::schema::{Field, Metric, Schema, Term, VectorDType, VectorOptions, STORED, STRING};
+use crate::vector::clustering::SuperKMeansClusterer;
 use crate::vector::diagnostics::{VectorClusterStats, VectorInfo, VectorStorageFormat};
+use crate::vector::router::MIN_ROUTED_ASSIGNMENT_CENTROIDS;
 use crate::vector::test_support::{Fixture, FixtureSpec, NearestClusterer};
-use crate::vector::tests::{exhaustive_params, TestVectorIndex};
-use crate::vector::RouterKind;
-use crate::{Index, IndexWriter, TantivyDocument};
+use crate::vector::tests::{
+    exhaustive_params, ground_truth, routed_exhaustive_params, TestVectorIndex,
+};
+use crate::vector::{RouterKind, VectorQuantizationConfig, VectorQuantizationLayer};
+use crate::{Index, IndexWriter, Result, TantivyDocument};
 
 const DOCS_PER_CLUSTER: usize = 6;
 
@@ -593,6 +600,70 @@ fn parallel_encode_writes_the_same_bytes_as_serial() -> crate::Result<()> {
                      threads, group cap {group_bytes}"
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn routed_build_preserves_documents_replicas_and_exhaustive_results() -> Result<()> {
+    const DIM: usize = 64;
+    const ROWS: usize = 2 * MIN_ROUTED_ASSIGNMENT_CENTROIDS;
+    let values = make_blobs(ROWS, DIM, 25, false, 1.0, 10.0, 42);
+    for kind in [RouterKind::Stacked, RouterKind::QuantizedStacked] {
+        let mut schema = Schema::builder();
+        let options = VectorOptions::new(DIM, Metric::L2);
+        let field = schema.add_vector_field("embedding", options.clone());
+        let index = Index::builder()
+            .schema(schema.build())
+            .settings(IndexSettings {
+                vector_clustering_threshold: 1,
+                vector_replication: 2,
+                vector_quantization: vec![VectorQuantizationConfig::materialize(
+                    "embedding".to_string(),
+                    &options,
+                    vec![VectorQuantizationLayer { bits: 1, seed: 7 }],
+                )?],
+                ..IndexSettings::default()
+            })
+            .ivf_clusterer(Arc::new(
+                SuperKMeansClusterer::new()
+                    .with_target_leaf_size(2)
+                    .with_training_sample_ratio(1.0)
+                    .with_memory_limit(1024 * 1024),
+            ))
+            .ivf_router(kind)
+            .create_in_ram()?;
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for chunk in values.chunks_exact(ROWS / 2 * DIM) {
+            for vector in chunk.chunks_exact(DIM) {
+                let mut doc = TantivyDocument::new();
+                doc.add_vector(field, vector);
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+        }
+        writer.merge(&index.searchable_segment_ids()?).wait()?;
+        writer.wait_merging_threads()?;
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let vectors = searcher.segment_reader(0).vector_index(field)?;
+        let ivf = vectors.index().expect("merged IVF");
+        assert!(ivf.num_clusters() >= MIN_ROUTED_ASSIGNMENT_CENTROIDS);
+        assert_eq!(vectors.num_vectors(), ROWS);
+        assert_eq!(ivf.num_rows(), 2 * ROWS);
+        for query in values.chunks_exact(DIM).step_by(ROWS / 3) {
+            let expected = ground_truth::top_k(&index, field, Metric::L2, query, 10)?;
+            let actual = searcher.search(
+                &AllQuery,
+                &TopDocs::with_limit(10)
+                    .order_by_similarity(field, query.to_vec())
+                    .with_probe_params(routed_exhaustive_params(0))
+                    .build_for_searcher(&searcher, &AllQuery)
+                    .unwrap(),
+            )?;
+            assert_eq!(actual.results, expected, "{kind:?}");
         }
     }
     Ok(())

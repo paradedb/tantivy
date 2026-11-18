@@ -3,20 +3,23 @@
 
 use std::fmt;
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use common::{BinarySerializable, HasLen};
 
 use crate::directory::error::Incompatibility;
 use crate::directory::FileSlice;
-use crate::schema::VectorOptions;
-use crate::vector::clustering::IvfCentroids;
+use crate::schema::{Metric, VectorOptions};
+use crate::vector::clustering::soar::SOAR_CANDIDATES;
+use crate::vector::clustering::{IvfAssignmentCandidate, IvfCentroids};
 use crate::vector::router::arena::VectorArena;
 use crate::vector::router::candidate::Candidate;
+use crate::vector::router::search::{OutputPrecision, SearchPolicy};
 use crate::vector::router::source::VectorSource;
 use crate::vector::router::stacked::levels::{ClusterId, InMemoryStore, LazyStore};
-use crate::vector::search::prepared::VectorQuery;
+use crate::vector::search::prepared::{invalid_query, VectorQuery};
 use crate::vector::VectorElement;
-use crate::TantivyError;
+use crate::{Result, TantivyError};
 
 pub(crate) mod arena;
 pub(crate) mod candidate;
@@ -132,6 +135,51 @@ pub(crate) type BuiltRouter = Router<InMemoryStore>;
 pub(crate) type OpenedRouter = Router<LazyStore>;
 
 impl BuiltRouter {
+    pub(crate) fn assignment_candidates(
+        &self,
+        vector: &[f32],
+    ) -> Result<Vec<IvfAssignmentCandidate>> {
+        self.assignment_candidates_with(
+            vector,
+            ASSIGNMENT_CANDIDATES,
+            ASSIGNMENT_BEAM_FRACTION,
+            ASSIGNMENT_RERANK_FACTOR,
+        )
+    }
+
+    pub(crate) fn assignment_candidates_with(
+        &self,
+        vector: &[f32],
+        count: usize,
+        beam_fraction: f32,
+        rerank_factor: f32,
+    ) -> Result<Vec<IvfAssignmentCandidate>> {
+        let Self::Stacked(router) = self else {
+            unreachable!("exact routers use exhaustive assignment");
+        };
+        // Assignment minimizes L2, including when training produced angular centroids.
+        let query =
+            VectorQuery::new(Metric::L2, Arc::new(vector.to_vec())).map_err(invalid_query)?;
+        let (candidates, _) = search::search(
+            &router.level,
+            &query,
+            count,
+            SearchPolicy {
+                aps: false,
+                min_fraction: beam_fraction,
+                rerank_factor,
+            },
+            OutputPrecision::Exact,
+        );
+        Ok(candidates
+            .into_iter()
+            .map(|candidate| IvfAssignmentCandidate {
+                centroid: candidate.node.0,
+                distance: -candidate.sim.score(),
+            })
+            .collect())
+    }
+
     pub(crate) fn kind(&self) -> RouterKind {
         match self {
             Self::Stacked(router) => router.kind(),
@@ -147,6 +195,12 @@ impl BuiltRouter {
         }
     }
 }
+
+pub(crate) const ASSIGNMENT_CANDIDATES: usize = SOAR_CANDIDATES + 1;
+/// Keep smaller centroid sets on the batched exhaustive path.
+pub(crate) const MIN_ROUTED_ASSIGNMENT_CENTROIDS: usize = 8192;
+pub(crate) const ASSIGNMENT_RERANK_FACTOR: f32 = 2.0;
+pub(crate) const ASSIGNMENT_BEAM_FRACTION: f32 = 0.125;
 
 /// Per-query routing knobs. The stacked router reads the walk knobs; the exact router ranks the
 /// same way regardless.

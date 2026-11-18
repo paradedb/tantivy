@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use crate::schema::VectorOptions;
 use crate::vector::VectorElement;
-use crate::{DocId, TantivyError};
+use crate::{DocId, Result, TantivyError};
 
 pub(crate) mod soar;
 mod superkmeans;
@@ -13,6 +13,13 @@ mod superkmeans;
 pub use superkmeans::{
     SuperKMeansClusterer, DEFAULT_TARGET_LEAF_SIZE, DEFAULT_TRAINING_SAMPLE_RATIO,
 };
+
+/// A router candidate with its exact squared Euclidean distance to the vector.
+#[derive(Clone, Copy, Debug)]
+pub struct IvfAssignmentCandidate {
+    pub centroid: u32,
+    pub distance: f32,
+}
 
 pub trait IvfClusterer: Send + Sync + 'static {
     /// Fraction of vectors sampled for training, in `(0, 1]`.
@@ -50,6 +57,27 @@ pub trait IvfClusterer: Send + Sync + 'static {
             .into_iter()
             .map(|cluster| (cluster, None))
             .collect())
+    }
+
+    /// Assigns through a bounded shortlist from the index's existing centroid router.
+    /// Candidates must have distinct valid centroid IDs and exact L2 distances.
+    /// Custom clusterers retain their assignment policy unless they override this method.
+    fn assign_routed(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        centroids: &IvfCentroids,
+        lambda: Option<f32>,
+        _candidates: &(dyn Fn(&[f32]) -> Result<Vec<IvfAssignmentCandidate>> + Sync),
+    ) -> Result<Vec<(u32, Option<u32>)>> {
+        match lambda {
+            Some(lambda) => self.assign_pairs(options, source, centroids, lambda),
+            None => Ok(self
+                .assign(options, source, centroids)?
+                .into_iter()
+                .map(|cluster| (cluster, None))
+                .collect()),
+        }
     }
 }
 
