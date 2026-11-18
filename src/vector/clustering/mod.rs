@@ -70,14 +70,24 @@ pub trait IvfClusterer: Send + Sync + 'static {
         lambda: Option<f32>,
         _candidates: &(dyn Fn(&[f32]) -> Result<Vec<IvfAssignmentCandidate>> + Sync),
     ) -> Result<Vec<(u32, Option<u32>)>> {
-        match lambda {
-            Some(lambda) => self.assign_pairs(options, source, centroids, lambda),
-            None => Ok(self
-                .assign(options, source, centroids)?
-                .into_iter()
-                .map(|cluster| (cluster, None))
-                .collect()),
-        }
+        assign_exhaustive(self, options, source, centroids, lambda)
+    }
+}
+
+pub(crate) fn assign_exhaustive<C: IvfClusterer + ?Sized>(
+    clusterer: &C,
+    options: &VectorOptions,
+    source: &mut dyn VectorSource,
+    centroids: &IvfCentroids,
+    lambda: Option<f32>,
+) -> Result<Vec<(u32, Option<u32>)>> {
+    match lambda {
+        Some(lambda) => clusterer.assign_pairs(options, source, centroids, lambda),
+        None => Ok(clusterer
+            .assign(options, source, centroids)?
+            .into_iter()
+            .map(|cluster| (cluster, None))
+            .collect()),
     }
 }
 

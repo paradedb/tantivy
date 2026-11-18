@@ -6,7 +6,7 @@ use itertools::Itertools;
 use super::source::MergeVectorSource;
 use super::{AssignedVector, FieldMerge, IvfBuildTimings};
 use crate::vector::clustering::soar::SOAR_LAMBDA;
-use crate::vector::clustering::{IvfCentroids, IvfClusterer, VectorSource};
+use crate::vector::clustering::{assign_exhaustive, IvfCentroids, IvfClusterer, VectorSource};
 use crate::vector::router::{BuiltRouter, RouterKind, MIN_ROUTED_ASSIGNMENT_CENTROIDS};
 use crate::vector::write::RowAddress;
 use crate::{DocId, TantivyError};
@@ -39,24 +39,16 @@ pub(super) fn assign(
 
     let mut source =
         MergeVectorSource::new(&merge.readers, assign_sources, opts.dim(), merge.ctx.cancel);
-    let pairs: Vec<(u32, Option<u32>)> =
-        if router.kind() != RouterKind::Exact && num_centroids >= MIN_ROUTED_ASSIGNMENT_CENTROIDS {
-            clusterer.assign_routed(
-                opts,
-                &mut source,
-                centroids,
-                (merge.replication >= 2).then_some(SOAR_LAMBDA),
-                &|vector| router.assignment_candidates(vector),
-            )?
-        } else if merge.replication >= 2 {
-            clusterer.assign_pairs(opts, &mut source, centroids, SOAR_LAMBDA)?
-        } else {
-            clusterer
-                .assign(opts, &mut source, centroids)?
-                .into_iter()
-                .map(|cluster| (cluster, None))
-                .collect()
-        };
+    let lambda = (merge.replication >= 2).then_some(SOAR_LAMBDA);
+    let pairs: Vec<(u32, Option<u32>)> = if router.kind() == RouterKind::QuantizedStacked
+        && num_centroids >= MIN_ROUTED_ASSIGNMENT_CENTROIDS
+    {
+        clusterer.assign_routed(opts, &mut source, centroids, lambda, &|vector| {
+            router.assignment_candidates(vector)
+        })?
+    } else {
+        assign_exhaustive(clusterer, opts, &mut source, centroids, lambda)?
+    };
     timings.assign_reads += source.reads;
 
     if pairs.len() != source.num_rows() {

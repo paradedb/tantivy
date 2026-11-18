@@ -15,7 +15,6 @@ use crate::vector::clustering::{
     IvfTrainingVectors, VectorSource,
 };
 use crate::vector::distance::dot;
-use crate::vector::router::ASSIGNMENT_CANDIDATES;
 use crate::{Result, TantivyError};
 
 /// Default [`SuperKMeansClusterer::with_target_leaf_size`].
@@ -405,16 +404,6 @@ impl IvfClusterer for SuperKMeansClusterer {
         candidates: &(dyn Fn(&[f32]) -> Result<Vec<IvfAssignmentCandidate>> + Sync),
     ) -> Result<Vec<(u32, Option<u32>)>> {
         let IvfCentroids::F32(matrix) = centroids;
-        if matrix.rows <= ASSIGNMENT_CANDIDATES {
-            return match lambda {
-                Some(lambda) => self.assign_pairs(options, source, centroids, lambda),
-                None => Ok(self
-                    .assign(options, source, centroids)?
-                    .into_iter()
-                    .map(|cluster| (cluster, None))
-                    .collect()),
-            };
-        }
         let mut pairs = Vec::with_capacity(source.num_rows());
         let batch_rows = self.budget_rows(options);
         for start in (0..source.num_rows()).step_by(batch_rows) {
@@ -448,16 +437,20 @@ fn assign_candidates(
     lambda: Option<f32>,
     residual: &mut [f32],
 ) -> Result<(u32, Option<u32>)> {
-    if candidates.is_empty()
-        || candidates.iter().any(|candidate| {
-            candidate.centroid as usize >= centroids.rows
-                || !candidate.distance.is_finite()
-                || candidate.distance < 0.0
-        })
-    {
-        return Err(TantivyError::InvalidArgument(
-            "invalid centroid assignment shortlist".into(),
+    if candidates.is_empty() {
+        return Err(TantivyError::InternalError(
+            "empty centroid assignment shortlist".into(),
         ));
+    }
+    if let Some(candidate) = candidates.iter().find(|candidate| {
+        candidate.centroid as usize >= centroids.rows
+            || !candidate.distance.is_finite()
+            || candidate.distance < 0.0
+    }) {
+        return Err(TantivyError::InternalError(format!(
+            "invalid centroid assignment candidate: centroid {}, distance {}, with {} centroids",
+            candidate.centroid, candidate.distance, centroids.rows
+        )));
     }
     candidates.sort_unstable_by(|a, b| {
         a.distance
@@ -513,7 +506,10 @@ mod tests {
     use crate::schema::Metric;
     use crate::vector::clustering::IvfTrainingBatch;
     use crate::vector::distance::l2_squared;
-    use crate::vector::router::{RouterKind, ASSIGNMENT_BEAM_FRACTION, ASSIGNMENT_RERANK_FACTOR};
+    use crate::vector::router::{
+        RouterKind, ASSIGNMENT_BEAM_FRACTION, ASSIGNMENT_CANDIDATES, ASSIGNMENT_RERANK_FACTOR,
+    };
+    use crate::vector::test_support::NearestClusterer;
 
     /// In-memory [`VectorSource`] that records every range read and counts `read_rows` calls.
     struct VecSource {
@@ -833,27 +829,58 @@ mod tests {
         };
         assert_eq!(assign(&[2, 0, 1]).unwrap(), (0, Some(1)));
         assert_eq!(assign(&[0]).unwrap(), (0, None));
-        assert!(assign(&[]).is_err());
-        assert!(assign(&[3]).is_err());
+        assert!(matches!(assign(&[]), Err(TantivyError::InternalError(_))));
+        for (id, distance) in [(3, 1.0), (0, -1.0), (1, f32::NAN), (2, f32::INFINITY)] {
+            let error = assign_candidates(
+                &[0.0],
+                &centroids,
+                &mut [IvfAssignmentCandidate {
+                    centroid: id,
+                    distance,
+                }],
+                Some(2.0),
+                &mut [0.0],
+            )
+            .unwrap_err();
+            let TantivyError::InternalError(message) = error else {
+                panic!("expected an internal error, got {error:?}");
+            };
+            assert!(message.contains(&format!("centroid {id}")));
+            assert!(message.contains(&format!("distance {distance}")));
+        }
     }
 
     #[test]
-    fn routed_assignment_preserves_small_fallback_and_cancellation() {
+    fn default_routed_assignment_preserves_custom_clusterer_policy() {
+        let options = VectorOptions::new(1, Metric::L2);
+        let mut source = VecSource::new(vec![0.0, 2.0], 1);
+        for pairs in [false, true] {
+            let clusterer = NearestClusterer {
+                centroids: vec![vec![0.0], vec![2.0]],
+                pairs,
+            };
+            let centroids = clusterer.train(&options, &mut source).unwrap();
+            for lambda in [None, Some(2.0)] {
+                let assigned = clusterer
+                    .assign_routed(&options, &mut source, &centroids, lambda, &|_| {
+                        panic!("default assignment must retain the custom clusterer policy")
+                    })
+                    .unwrap();
+                let replicated = pairs && lambda.is_some();
+                assert_eq!(
+                    assigned,
+                    vec![(0, replicated.then_some(1)), (1, replicated.then_some(0))]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn routed_assignment_checks_cancellation_between_batches() {
         let options = VectorOptions::new(1, Metric::L2);
         let clusterer =
             SuperKMeansClusterer::new().with_memory_limit(3 * options.bytes_per_vector());
-        let mut source = VecSource::new(vec![0.0; 10], 1);
-        let one = IvfCentroids::F32(IvfMatrix {
-            values: vec![0.0],
-            rows: 1,
-            dims: 1,
-        });
-        let pairs = clusterer
-            .assign_routed(&options, &mut source, &one, Some(2.0), &|_| {
-                panic!("small centroid sets remain exhaustive")
-            })
-            .unwrap();
-        assert_eq!(pairs, vec![(0, None); 10]);
+        let source = VecSource::new(vec![0.0; 10], 1);
 
         let count = ASSIGNMENT_CANDIDATES + 1;
         let centroids = IvfCentroids::F32(IvfMatrix {

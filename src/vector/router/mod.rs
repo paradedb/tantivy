@@ -155,7 +155,9 @@ impl BuiltRouter {
         rerank_factor: f32,
     ) -> Result<Vec<IvfAssignmentCandidate>> {
         let Self::Stacked(router) = self else {
-            unreachable!("exact routers use exhaustive assignment");
+            return Err(TantivyError::InternalError(
+                "exact routers use exhaustive assignment".into(),
+            ));
         };
         // Assignment minimizes L2, including when training produced angular centroids.
         let query =
@@ -358,6 +360,17 @@ mod tests {
             rows: 3,
             dims: 1,
         })
+    }
+
+    #[test]
+    fn exact_router_rejects_assignment_candidates() -> Result<()> {
+        let options = VectorOptions::new(1, Metric::L2);
+        let built = RouterKind::Exact.build(&options, &mut centroids())?;
+        assert!(matches!(
+            built.assignment_candidates(&[0.0]),
+            Err(TantivyError::InternalError(_))
+        ));
+        Ok(())
     }
 
     #[test]
