@@ -320,6 +320,36 @@ mod tests {
         Ok(())
     }
 
+    /// A clause whose first document is after the explained one does not match it, and a scorer
+    /// can't seek back.
+    #[test]
+    pub fn test_explain_a_doc_before_the_first_doc_of_a_clause() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        index_writer.add_document(doc!(text => "a"))?;
+        index_writer.add_document(doc!(text => "b c"))?;
+        index_writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let term = |value: &str| -> Box<dyn Query> {
+            Box::new(TermQuery::new(
+                Term::from_field_text(text, value),
+                IndexRecordOption::WithFreqs,
+            ))
+        };
+        let b_and_c: Box<dyn Query> = Box::new(BooleanQuery::from(vec![
+            (Occur::Must, term("b")),
+            (Occur::Must, term("c")),
+        ]));
+        let query = BooleanQuery::from(vec![(Occur::Should, term("a")), (Occur::Should, b_and_c)]);
+        let first_doc = DocAddress::new(0, 0u32);
+        let explanation = query.explain(&searcher, first_doc)?;
+        let only_a = term("a").explain(&searcher, first_doc)?;
+        assert_nearly_equals!(explanation.value(), only_a.value());
+        Ok(())
+    }
+
     #[test]
     pub fn test_boolean_weight_optimization() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();

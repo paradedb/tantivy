@@ -1354,14 +1354,15 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
         let mut scorer = self.scorer(reader, 1.0)?;
-        if scorer.seek(doc) != doc {
+        if scorer.doc() > doc || scorer.seek(doc) != doc {
             return Err(does_not_match(doc));
         }
         if !self.scoring_enabled {
             return Ok(Explanation::new("BooleanQuery with no scoring", 1.0));
         }
 
-        let mut explanation = Explanation::new("BooleanClause. sum of ...", scorer.score());
+        let description = (self.score_combiner_fn)().description();
+        let mut explanation = Explanation::new_with_string(description, scorer.score());
         for (occur, subweight) in &self.weights {
             if is_include_occur(*occur) {
                 if let Ok(child_explanation) = subweight.explain(reader, doc) {
