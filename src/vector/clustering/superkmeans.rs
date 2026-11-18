@@ -25,6 +25,9 @@ pub const MINIMUM_TRAINING_VECTORS_PER_LIST: usize = 16;
 /// Rows held at once without a memory limit.
 const DEFAULT_BUDGET_ROWS: usize = 40_960;
 
+// Fine training retains the sample and copies at most one sample-sized cluster.
+const TRAINING_VECTOR_BUFFERS: usize = 2;
+
 /// Replays a [`VectorSource`] as a SuperKMeans [`Dataset`]. The first pass keeps rows
 /// `0..kept_rows` decoded so later passes skip reading them; the rest stream through batches of
 /// `batch_rows`.
@@ -172,8 +175,9 @@ impl SuperKMeansClusterer {
     /// Resolves the concrete `f32` training sample ratio for `num_rows` vectors.
     ///
     /// When `None`, `nlist = max(1, num_rows / target_leaf_size)` and the sample size is
-    /// `budget_rows` clamped to `[16 * nlist, 128 * nlist]` (or `128 * nlist` when no memory limit
-    /// is configured), capped at `num_rows`.
+    /// half the vector budget clamped to `[16 * nlist, 128 * nlist]` (or `128 * nlist` when no
+    /// memory limit is configured), capped at `num_rows`. The other half holds fine-training
+    /// workspace. The minimum can still force a sample that must stream.
     fn resolve_training_sample_ratio(&self, options: &VectorOptions, num_rows: usize) -> f32 {
         if let Some(ratio) = self.training_sample_ratio {
             return ratio.clamp(f32::MIN_POSITIVE, 1.0);
@@ -193,19 +197,20 @@ impl SuperKMeansClusterer {
         let sample_rows = match self.memory_limit {
             Some(byte_limit) => {
                 let budget_rows = byte_limit / options.bytes_per_vector().max(1);
-                let chosen = budget_rows.clamp(min_rows, desired_rows);
-                if chosen > budget_rows {
+                let sample_budget_rows = budget_rows / TRAINING_VECTOR_BUFFERS;
+                let chosen = sample_budget_rows.clamp(min_rows, desired_rows);
+                if chosen > sample_budget_rows {
                     log::warn!(
                         target: "paradedb::ivf_build",
-                        "ivf minimum training sample of {chosen} vectors exceeds memory budget of \
-                         {budget_rows} vectors (desired {desired_rows} for {nlist} lists over \
+                        "ivf minimum training sample of {chosen} vectors exceeds cached training \
+                         capacity of {sample_budget_rows} vectors (desired {desired_rows} for {nlist} lists over \
                          {num_rows} vectors)"
                     );
                 } else if chosen < desired_rows {
                     log::info!(
                         target: "paradedb::ivf_build",
-                        "ivf training sample limited to {chosen} vectors by memory budget of \
-                         {budget_rows} vectors (desired {desired_rows} for {nlist} lists over \
+                        "ivf training sample limited to {chosen} vectors with fine-training \
+                         workspace reserved ({budget_rows} vector budget, desired {desired_rows} for {nlist} lists over \
                          {num_rows} vectors)"
                     );
                 }
@@ -213,7 +218,12 @@ impl SuperKMeansClusterer {
             }
             None => desired_rows,
         };
-        ((sample_rows as f64 / num_rows as f64).clamp(f64::MIN_POSITIVE, 1.0)) as f32
+        let ratio = ((sample_rows as f64 / num_rows as f64).clamp(f64::MIN_POSITIVE, 1.0)) as f32;
+        if (num_rows as f64 * f64::from(ratio)).ceil() > sample_rows as f64 {
+            ratio.next_down()
+        } else {
+            ratio
+        }
     }
 
     /// Leaf size passed to SuperKMeans for the resolved `training_sample_ratio`.
@@ -686,6 +696,57 @@ mod tests {
         assert_eq!(source.row_reads, 0);
     }
 
+    #[test]
+    fn automatic_sampling_keeps_training_in_memory() {
+        let (num_vectors, dim, budget_rows) = (20_000, 16, 2_000);
+        for metric in [Metric::L2, Metric::Cosine] {
+            let options = VectorOptions::new(dim, metric);
+            let clusterer = SuperKMeansClusterer::new()
+                .with_target_leaf_size(400)
+                .with_memory_limit(budget_rows * options.bytes_per_vector());
+            let ratio = clusterer.training_sample_ratio(&options, num_vectors);
+            let sample_rows = (num_vectors as f64 * f64::from(ratio)).ceil() as usize;
+            assert!(sample_rows * TRAINING_VECTOR_BUFFERS <= budget_rows);
+
+            for values in [blobs(sample_rows, dim), vec![0.0; sample_rows * dim]] {
+                let mut source = VecSource::new(values, dim);
+                let centroids = clusterer.train(&options, &mut source, ratio).unwrap();
+                assert_eq!(source.ranges, vec![0..sample_rows]);
+                assert_eq!(source.row_reads, 0);
+
+                let mut reference_source = VecSource::new(source.values.clone(), dim);
+                let reference = SuperKMeansClusterer::new()
+                    .with_target_leaf_size(400)
+                    .train(&options, &mut reference_source, ratio)
+                    .unwrap();
+                let (IvfCentroids::F32(centroids), IvfCentroids::F32(reference)) =
+                    (centroids, reference);
+                assert_eq!(centroids.values, reference.values);
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_sample_ratio_does_not_round_past_the_row_limit() {
+        let options = VectorOptions::new(1024, Metric::Cosine);
+        let memory_limit_bytes = (1usize << 30) - 1;
+        let sample_budget_rows =
+            memory_limit_bytes / options.bytes_per_vector() / TRAINING_VECTOR_BUFFERS;
+        let clusterer = SuperKMeansClusterer::new()
+            .with_target_leaf_size(400)
+            .with_memory_limit(memory_limit_bytes);
+        for num_vectors in [
+            286_671, 1_195_648, 1_597_409, 1_650_364, 1_111_421, 1_257_155, 1_333_226, 1_568_106,
+        ] {
+            let desired_rows =
+                num_vectors / clusterer.config.target_leaf_size * DESIRED_TRAINING_VECTORS_PER_LIST;
+            let expected_rows = desired_rows.min(sample_budget_rows);
+            let ratio = clusterer.training_sample_ratio(&options, num_vectors);
+            let sample_rows = (num_vectors as f64 * f64::from(ratio)).ceil() as usize;
+            assert_eq!(sample_rows, expected_rows, "{num_vectors} vectors");
+        }
+    }
+
     /// A sample larger than the budget reads its kept prefix once and streams only the rest on
     /// every pass, then reads the fine step's meso clusters in groups.
     #[test]
@@ -760,7 +821,8 @@ mod tests {
     }
 
     /// Stored settings are independent; when `training_sample_ratio` is `None`, the resolved
-    /// ratio clamps `budget_rows` to `[16 * nlist, 128 * nlist]` and scales the training leaf.
+    /// ratio reserves fine-training workspace, clamps to `[16 * nlist, 128 * nlist]`, and scales
+    /// the training leaf.
     #[test]
     fn settings_default_and_scale_training_leaf_size() {
         let options = VectorOptions::new(1024, Metric::L2);
@@ -779,7 +841,7 @@ mod tests {
             .with_target_leaf_size(leaf)
             .with_memory_limit(budget_rows * options.bytes_per_vector());
         let ratio = limited.training_sample_ratio(&options, num_rows);
-        let expected = (budget_rows as f64 / num_rows as f64) as f32;
+        let expected = ((budget_rows / TRAINING_VECTOR_BUFFERS) as f64 / num_rows as f64) as f32;
         assert!((ratio - expected).abs() < 1e-6);
         let training_leaf = limited.training_target_leaf_size(ratio);
         assert!(training_leaf > 16 && training_leaf < 128);

@@ -57,6 +57,7 @@ struct AssignedVector {
 /// Per-merge IVF build counters and timings, reported on `paradedb::ivf_build`.
 #[derive(Default)]
 struct IvfBuildTimings {
+    train_sample_rows: usize,
     /// Source vectors decoded for training, counting a vector again each time it is re-read.
     train_reads: usize,
     /// Source vectors decoded for assignment.
@@ -301,7 +302,7 @@ pub(crate) fn merge_ivf(
     log::info!(
         target: "paradedb::ivf_build",
         "ivf_build timings_ms train={} router={} assign={} other={} total={} \
-         fields={} centroids={} vectors={} train_reads={} assign_reads={} \
+         fields={} centroids={} vectors={} train_sample_rows={} train_reads={} assign_reads={} \
          encode_reads={} exact_reads={} replica_bytes={} vec_bytes={} pad_bytes={}",
         timings.train.as_millis(),
         timings.router.as_millis(),
@@ -311,6 +312,7 @@ pub(crate) fn merge_ivf(
         fields,
         centroids,
         vectors,
+        timings.train_sample_rows,
         timings.train_reads,
         timings.assign_reads,
         timings.encode_reads,
