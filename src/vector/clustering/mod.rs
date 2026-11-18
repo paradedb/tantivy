@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use crate::schema::VectorOptions;
 use crate::vector::VectorElement;
-use crate::{DocId, TantivyError};
+use crate::{DocId, Result, TantivyError};
 
 pub(crate) mod soar;
 mod superkmeans;
@@ -14,6 +14,13 @@ pub use superkmeans::{
     SuperKMeansClusterer, DEFAULT_TARGET_LEAF_SIZE, DESIRED_TRAINING_VECTORS_PER_LIST,
     MINIMUM_TRAINING_VECTORS_PER_LIST,
 };
+
+/// A router candidate with its exact squared Euclidean distance to the vector.
+#[derive(Clone, Copy, Debug)]
+pub struct IvfAssignmentCandidate {
+    pub centroid: u32,
+    pub distance: f32,
+}
 
 pub trait IvfClusterer: Send + Sync + 'static {
     /// Fraction of `num_rows` vectors sampled for training, in `(0, 1]`.
@@ -52,6 +59,37 @@ pub trait IvfClusterer: Send + Sync + 'static {
             .into_iter()
             .map(|cluster| (cluster, None))
             .collect())
+    }
+
+    /// Assigns through a bounded shortlist from the index's existing centroid router.
+    /// Candidates must have distinct valid centroid IDs and exact L2 distances.
+    /// Custom clusterers retain their assignment policy unless they override this method.
+    fn assign_routed(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        centroids: &IvfCentroids,
+        lambda: Option<f32>,
+        _candidates: &(dyn Fn(&[f32]) -> Result<Vec<IvfAssignmentCandidate>> + Sync),
+    ) -> Result<Vec<(u32, Option<u32>)>> {
+        assign_exhaustive(self, options, source, centroids, lambda)
+    }
+}
+
+pub(crate) fn assign_exhaustive<C: IvfClusterer + ?Sized>(
+    clusterer: &C,
+    options: &VectorOptions,
+    source: &mut dyn VectorSource,
+    centroids: &IvfCentroids,
+    lambda: Option<f32>,
+) -> Result<Vec<(u32, Option<u32>)>> {
+    match lambda {
+        Some(lambda) => clusterer.assign_pairs(options, source, centroids, lambda),
+        None => Ok(clusterer
+            .assign(options, source, centroids)?
+            .into_iter()
+            .map(|cluster| (cluster, None))
+            .collect()),
     }
 }
 

@@ -3,6 +3,7 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use rayon::prelude::*;
 use superkmeans::{
     Dataset, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, Matrix, SoarAssigner,
 };
@@ -10,9 +11,11 @@ use superkmeans::{
 use crate::schema::VectorOptions;
 use crate::vector::clustering::soar::SOAR_CANDIDATES;
 use crate::vector::clustering::{
-    for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
+    for_each_batch, IvfAssignmentCandidate, IvfCentroids, IvfClusterer, IvfMatrix,
+    IvfTrainingVectors, VectorSource,
 };
-use crate::TantivyError;
+use crate::vector::distance::dot;
+use crate::{Result, TantivyError};
 
 /// Default [`SuperKMeansClusterer::with_target_leaf_size`].
 pub const DEFAULT_TARGET_LEAF_SIZE: usize = 200;
@@ -100,7 +103,7 @@ fn permute_rows(values: &mut [f32], dim: usize, order: &[u32]) {
     }
 }
 
-/// Trains centroids with hierarchical SuperKMeans and assigns each vector to its nearest one.
+/// Trains hierarchical SuperKMeans centroids, with exhaustive or tree-shortlisted assignment.
 /// Cosine and Dot cluster angularly.
 #[derive(Clone)]
 pub struct SuperKMeansClusterer {
@@ -443,16 +446,122 @@ impl IvfClusterer for SuperKMeansClusterer {
         })?;
         Ok(pairs)
     }
+
+    fn assign_routed(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        centroids: &IvfCentroids,
+        lambda: Option<f32>,
+        candidates: &(dyn Fn(&[f32]) -> Result<Vec<IvfAssignmentCandidate>> + Sync),
+    ) -> Result<Vec<(u32, Option<u32>)>> {
+        let IvfCentroids::F32(matrix) = centroids;
+        let mut pairs = Vec::with_capacity(source.num_rows());
+        let batch_rows = self.budget_rows(options);
+        for start in (0..source.num_rows()).step_by(batch_rows) {
+            if source.wants_cancel() {
+                return Err(TantivyError::Cancelled);
+            }
+            let end = start.saturating_add(batch_rows).min(source.num_rows());
+            let IvfTrainingVectors::F32(batch) = source.read_range(start..end)?;
+            let batch = checked_matrix(batch.matrix, end - start, options.dim())?;
+            let assigned: Result<Vec<_>> = batch
+                .values
+                .par_chunks_exact(options.dim())
+                .map_init(
+                    || vec![0.0; options.dim()],
+                    |residual, vector| {
+                        let mut candidates = candidates(vector)?;
+                        assign_candidates(vector, matrix, &mut candidates, lambda, residual)
+                    },
+                )
+                .collect();
+            pairs.extend(assigned?);
+        }
+        Ok(pairs)
+    }
+}
+
+fn assign_candidates(
+    vector: &[f32],
+    centroids: &IvfMatrix<f32>,
+    candidates: &mut [IvfAssignmentCandidate],
+    lambda: Option<f32>,
+    residual: &mut [f32],
+) -> Result<(u32, Option<u32>)> {
+    if candidates.is_empty() {
+        return Err(TantivyError::InternalError(
+            "empty centroid assignment shortlist".into(),
+        ));
+    }
+    if let Some(candidate) = candidates.iter().find(|candidate| {
+        candidate.centroid as usize >= centroids.rows
+            || !candidate.distance.is_finite()
+            || candidate.distance < 0.0
+    }) {
+        return Err(TantivyError::InternalError(format!(
+            "invalid centroid assignment candidate: centroid {}, distance {}, with {} centroids",
+            candidate.centroid, candidate.distance, centroids.rows
+        )));
+    }
+    candidates.sort_unstable_by(|a, b| {
+        a.distance
+            .total_cmp(&b.distance)
+            .then(a.centroid.cmp(&b.centroid))
+    });
+    let primary = candidates[0];
+    let Some(lambda) = lambda else {
+        return Ok((primary.centroid, None));
+    };
+    let centroid = |id: u32| &centroids.values[id as usize * centroids.dims..][..centroids.dims];
+    let norm = primary.distance.sqrt();
+    if norm > 0.0 && norm.is_finite() {
+        let inv_norm = norm.recip();
+        for ((value, x), c) in residual
+            .iter_mut()
+            .zip(vector)
+            .zip(centroid(primary.centroid))
+        {
+            *value = (x - c) * inv_norm;
+        }
+    } else {
+        residual.fill(0.0);
+    }
+    let along = dot(vector, residual);
+    let secondary = candidates
+        .iter()
+        .filter(|candidate| candidate.centroid != primary.centroid)
+        .take(SOAR_CANDIDATES)
+        .map(|candidate| {
+            let gap = along - dot(residual, centroid(candidate.centroid));
+            (candidate.distance + lambda * gap * gap, candidate.centroid)
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+        .map(|(_, id)| id);
+    Ok((primary.centroid, secondary))
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::env;
+    use std::fs::File;
+    use std::io::Read;
     use std::ops::Range;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    use rayon::current_num_threads;
+    use serde_json::json;
 
     use super::*;
     use crate::schema::Metric;
     use crate::vector::clustering::IvfTrainingBatch;
+    use crate::vector::distance::l2_squared;
+    use crate::vector::router::{
+        RouterKind, ASSIGNMENT_BEAM_FRACTION, ASSIGNMENT_CANDIDATES, ASSIGNMENT_RERANK_FACTOR,
+    };
+    use crate::vector::test_support::NearestClusterer;
 
     /// In-memory [`VectorSource`] that records every range read and counts `read_rows` calls.
     struct VecSource {
@@ -503,6 +612,360 @@ mod tests {
             self.row_reads += 1;
             Ok(self.batch(rows.iter().map(|&row| row as usize)))
         }
+    }
+
+    #[test]
+    #[ignore = "requires IVF_ASSIGNMENT_FIXTURES containing cached Cohere f32 rows and centroids"]
+    fn profile_routed_assignment() {
+        const DIM: usize = 1024;
+        const ROWS: usize = 8192;
+        const ITERATIONS: usize = 3;
+        const MEMORY_BYTES: usize = 256 * 1024 * 1024;
+        const WARMUP_ROWS: usize = 256;
+        const MAX_FIXTURE_CENTROIDS: usize = 5000;
+        let fixtures = PathBuf::from(env::var("IVF_ASSIGNMENT_FIXTURES").unwrap());
+        let read = |name: &str, elements: usize| {
+            let mut bytes = Vec::new();
+            File::open(fixtures.join(name))
+                .unwrap()
+                .take((elements * size_of::<f32>()) as u64)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            bytes
+                .chunks_exact(size_of::<f32>())
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let vectors = read("segment.f32", ROWS * DIM);
+        let mut values = Vec::new();
+        for segment in [7, 6, 5] {
+            values.extend(read(
+                &format!("centroids-{segment}.f32"),
+                MAX_FIXTURE_CENTROIDS * DIM,
+            ));
+        }
+        let candidates: usize = env::var("IVF_ASSIGNMENT_CANDIDATES")
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(ASSIGNMENT_CANDIDATES);
+        let beam: f32 = env::var("IVF_ASSIGNMENT_BEAM")
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(ASSIGNMENT_BEAM_FRACTION);
+        let rerank: f32 = env::var("IVF_ASSIGNMENT_RERANK")
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(ASSIGNMENT_RERANK_FACTOR);
+        let options = VectorOptions::new(DIM, Metric::Cosine);
+        let clusterer = SuperKMeansClusterer::new().with_memory_limit(MEMORY_BYTES);
+        for count in [4096, 9000, 14000] {
+            let mut centroids = IvfCentroids::F32(IvfMatrix {
+                values: values[..count * DIM].to_vec(),
+                rows: count,
+                dims: DIM,
+            });
+            let router = RouterKind::QuantizedStacked
+                .build(&options, &mut centroids)
+                .unwrap();
+            let IvfCentroids::F32(matrix) = &centroids;
+            let mut source = VecSource::new(vectors.clone(), DIM);
+            let mut warmup = VecSource::new(vectors[..WARMUP_ROWS * DIM].to_vec(), DIM);
+            clusterer
+                .assign_pairs(&options, &mut warmup, &centroids, 2.0)
+                .unwrap();
+            clusterer
+                .assign_routed(&options, &mut warmup, &centroids, Some(2.0), &|x| {
+                    router.assignment_candidates_with(x, candidates, beam, rerank)
+                })
+                .unwrap();
+            for iteration in 0..ITERATIONS {
+                let exact = |source: &mut VecSource| {
+                    let start = Instant::now();
+                    let pairs = clusterer
+                        .assign_pairs(&options, source, &centroids, 2.0)
+                        .unwrap();
+                    (start.elapsed().as_secs_f64(), pairs)
+                };
+                let routed = |source: &mut VecSource| {
+                    let start = Instant::now();
+                    let pairs = clusterer
+                        .assign_routed(&options, source, &centroids, Some(2.0), &|x| {
+                            router.assignment_candidates_with(x, candidates, beam, rerank)
+                        })
+                        .unwrap();
+                    (start.elapsed().as_secs_f64(), pairs)
+                };
+                let (exact, routed) = if iteration % 2 == 0 {
+                    (exact(&mut source), routed(&mut source))
+                } else {
+                    let routed = routed(&mut source);
+                    (exact(&mut source), routed)
+                };
+                let (mut primary_agree, mut secondary_agree) = (0, 0);
+                let (mut exact_loss, mut routed_loss) = (0.0_f64, 0.0_f64);
+                let (mut exact_soar, mut routed_soar) = (0.0_f64, 0.0_f64);
+                for ((vector, expected), actual) in
+                    vectors.chunks_exact(DIM).zip(&exact.1).zip(&routed.1)
+                {
+                    primary_agree += usize::from(expected.0 == actual.0);
+                    secondary_agree += usize::from(expected.1 == actual.1);
+                    let score = |&(primary, secondary): &(u32, Option<u32>)| {
+                        let centroid = |id: u32| &matrix.values[id as usize * DIM..][..DIM];
+                        let residual: Vec<_> = vector
+                            .iter()
+                            .zip(centroid(primary))
+                            .map(|(x, c)| x - c)
+                            .collect();
+                        let squared = dot(&residual, &residual);
+                        let other = centroid(secondary.unwrap());
+                        let gap = dot(vector, &residual) - dot(other, &residual);
+                        (
+                            f64::from(squared),
+                            f64::from(
+                                l2_squared(vector, other)
+                                    + if squared > 0.0 {
+                                        2.0 * gap * gap / squared
+                                    } else {
+                                        0.0
+                                    },
+                            ),
+                        )
+                    };
+                    let (loss, cost) = score(expected);
+                    exact_loss += loss;
+                    exact_soar += cost;
+                    let (loss, cost) = score(actual);
+                    routed_loss += loss;
+                    routed_soar += cost;
+                }
+                println!(
+                    "{}",
+                    json!({"centroids":count,"rows":ROWS,"dimension":DIM,"iteration":iteration,
+                    "candidates":candidates,"beam":beam,"rerank":rerank,"threads":current_num_threads(),"exact_seconds":exact.0,"routed_seconds":routed.0,
+                    "speedup":exact.0/routed.0,"primary_agreement":primary_agree as f64/ROWS as f64,
+                    "secondary_agreement":secondary_agree as f64/ROWS as f64,
+                    "primary_loss_ratio":routed_loss/exact_loss,"soar_cost_ratio":routed_soar/exact_soar})
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn routed_assignment_matches_exhaustive_with_all_candidates_and_bounds_batches() {
+        let (n, dim, batch_rows) = (3_000, 16, 17);
+        let options = VectorOptions::new(dim, Metric::L2);
+        let mut source = VecSource::new(blobs(n, dim), dim);
+        let clusterer = SuperKMeansClusterer::new()
+            .with_target_leaf_size(20)
+            .with_memory_limit(batch_rows * options.bytes_per_vector());
+        let ratio = clusterer.training_sample_ratio(&options, source.num_rows());
+        let centroids = clusterer.train(&options, &mut source, ratio).unwrap();
+        let IvfCentroids::F32(matrix) = &centroids;
+        assert!(matrix.rows > ASSIGNMENT_CANDIDATES);
+        for (i, value) in source.values.iter_mut().enumerate() {
+            *value += ((i * 7 % 31) as f32 - 15.0) * 0.03;
+        }
+        let exact = clusterer
+            .assign_pairs(&options, &mut source, &centroids, 2.0)
+            .unwrap();
+        source.ranges.clear();
+        let routed = clusterer
+            .assign_routed(&options, &mut source, &centroids, Some(2.0), &|vector| {
+                Ok((0..matrix.rows as u32)
+                    .rev()
+                    .map(|id| IvfAssignmentCandidate {
+                        centroid: id,
+                        distance: l2_squared(vector, &matrix.values[id as usize * dim..][..dim]),
+                    })
+                    .collect())
+            })
+            .unwrap();
+        for (row, (expected, actual)) in exact.iter().zip(&routed).enumerate() {
+            assert_eq!(expected, actual, "row {row}");
+        }
+        assert_eq!(source.ranges[0], 0..batch_rows);
+        assert!(source.ranges.iter().all(|r| r.len() <= batch_rows));
+    }
+
+    #[test]
+    fn tree_assignment_handles_permutations_metrics_and_replication() {
+        let (n, dim) = (3_000, 16);
+        for metric in Metric::ALL {
+            let options = VectorOptions::new(dim, metric);
+            for kind in [RouterKind::Stacked, RouterKind::QuantizedStacked] {
+                let clusterer = SuperKMeansClusterer::new().with_target_leaf_size(20);
+                let mut source = VecSource::new(blobs(n, dim), dim);
+                let ratio = clusterer.training_sample_ratio(&options, source.num_rows());
+                let mut centroids = clusterer.train(&options, &mut source, ratio).unwrap();
+                let router = kind.build(&options, &mut centroids).unwrap();
+                let IvfCentroids::F32(matrix) = &centroids;
+                for (i, value) in source.values.iter_mut().enumerate() {
+                    *value += ((i * 7 % 31) as f32 - 15.0) * 0.03;
+                }
+                let exact = clusterer
+                    .assign_pairs(&options, &mut source, &centroids, 2.0)
+                    .unwrap();
+                let routed = clusterer
+                    .assign_routed(&options, &mut source, &centroids, Some(2.0), &|v| {
+                        router.assignment_candidates_with(v, matrix.rows, 1.0, 1.0)
+                    })
+                    .unwrap();
+                const RELATIVE_COST_TOLERANCE: f64 = 1e-6;
+                for (row, (expected, actual)) in exact.iter().zip(&routed).enumerate() {
+                    let vector = &source.values[row * dim..][..dim];
+                    let centroid = |id: u32| &matrix.values[id as usize * dim..][..dim];
+                    let costs = |&(primary, secondary): &(u32, Option<u32>)| {
+                        let residual: Vec<_> = vector
+                            .iter()
+                            .zip(centroid(primary))
+                            .map(|(&x, &c)| f64::from(x) - f64::from(c))
+                            .collect();
+                        let distance: f64 = residual.iter().map(|r| r * r).sum();
+                        let secondary = centroid(secondary.unwrap());
+                        let secondary_distance: f64 = vector
+                            .iter()
+                            .zip(secondary)
+                            .map(|(&x, &c)| (f64::from(x) - f64::from(c)).powi(2))
+                            .sum();
+                        let gap: f64 = vector
+                            .iter()
+                            .zip(secondary)
+                            .zip(&residual)
+                            .map(|((&x, &c), r)| (f64::from(x) - f64::from(c)) * r)
+                            .sum();
+                        [
+                            distance,
+                            secondary_distance
+                                + if distance > 0.0 {
+                                    2.0 * gap * gap / distance
+                                } else {
+                                    0.0
+                                },
+                        ]
+                    };
+                    // GEMM and direct distances can choose different centroids at near ties.
+                    for (expected_cost, actual_cost) in
+                        costs(expected).into_iter().zip(costs(actual))
+                    {
+                        assert!(
+                            (expected_cost - actual_cost).abs()
+                                <= RELATIVE_COST_TOLERANCE * expected_cost.abs().max(1.0),
+                            "{metric:?} {kind:?} row {row}: {expected:?} ({expected_cost}) vs \
+                             {actual:?} ({actual_cost})"
+                        );
+                    }
+                }
+                let primary = clusterer
+                    .assign_routed(&options, &mut source, &centroids, None, &|v| {
+                        router.assignment_candidates(v)
+                    })
+                    .unwrap();
+                assert!(primary
+                    .iter()
+                    .all(|&(id, second)| (id as usize) < matrix.rows && second.is_none()));
+            }
+        }
+    }
+
+    #[test]
+    fn shortlisted_soar_handles_zero_residual_ties_and_invalid_ids() {
+        let centroids = IvfMatrix {
+            values: vec![0.0, 1.0, -1.0],
+            rows: 3,
+            dims: 1,
+        };
+        let assign = |ids: &[u32]| {
+            let mut candidates: Vec<_> = ids
+                .iter()
+                .map(|&id| IvfAssignmentCandidate {
+                    centroid: id,
+                    distance: if id == 0 { 0.0 } else { 1.0 },
+                })
+                .collect();
+            assign_candidates(&[0.0], &centroids, &mut candidates, Some(2.0), &mut [0.0])
+        };
+        assert_eq!(assign(&[2, 0, 1]).unwrap(), (0, Some(1)));
+        assert_eq!(assign(&[0]).unwrap(), (0, None));
+        assert!(matches!(assign(&[]), Err(TantivyError::InternalError(_))));
+        for (id, distance) in [(3, 1.0), (0, -1.0), (1, f32::NAN), (2, f32::INFINITY)] {
+            let error = assign_candidates(
+                &[0.0],
+                &centroids,
+                &mut [IvfAssignmentCandidate {
+                    centroid: id,
+                    distance,
+                }],
+                Some(2.0),
+                &mut [0.0],
+            )
+            .unwrap_err();
+            let TantivyError::InternalError(message) = error else {
+                panic!("expected an internal error, got {error:?}");
+            };
+            assert!(message.contains(&format!("centroid {id}")));
+            assert!(message.contains(&format!("distance {distance}")));
+        }
+    }
+
+    #[test]
+    fn default_routed_assignment_preserves_custom_clusterer_policy() {
+        let options = VectorOptions::new(1, Metric::L2);
+        let mut source = VecSource::new(vec![0.0, 2.0], 1);
+        for pairs in [false, true] {
+            let clusterer = NearestClusterer {
+                centroids: vec![vec![0.0], vec![2.0]],
+                pairs,
+            };
+            let ratio = clusterer.training_sample_ratio(&options, source.num_rows());
+            let centroids = clusterer.train(&options, &mut source, ratio).unwrap();
+            for lambda in [None, Some(2.0)] {
+                let assigned = clusterer
+                    .assign_routed(&options, &mut source, &centroids, lambda, &|_| {
+                        panic!("default assignment must retain the custom clusterer policy")
+                    })
+                    .unwrap();
+                let replicated = pairs && lambda.is_some();
+                assert_eq!(
+                    assigned,
+                    vec![(0, replicated.then_some(1)), (1, replicated.then_some(0))]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn routed_assignment_checks_cancellation_between_batches() {
+        let options = VectorOptions::new(1, Metric::L2);
+        let clusterer =
+            SuperKMeansClusterer::new().with_memory_limit(3 * options.bytes_per_vector());
+        let source = VecSource::new(vec![0.0; 10], 1);
+
+        let count = ASSIGNMENT_CANDIDATES + 1;
+        let centroids = IvfCentroids::F32(IvfMatrix {
+            values: (0..count).map(|i| i as f32).collect(),
+            rows: count,
+            dims: 1,
+        });
+        let mut cancelling = CancellingSource {
+            inner: source,
+            polls_before_cancel: 1,
+            polls: Cell::new(0),
+        };
+        cancelling.inner.ranges.clear();
+        let error = clusterer
+            .assign_routed(&options, &mut cancelling, &centroids, Some(2.0), &|_| {
+                Ok(vec![
+                    IvfAssignmentCandidate {
+                        centroid: 0,
+                        distance: 0.0,
+                    },
+                    IvfAssignmentCandidate {
+                        centroid: 1,
+                        distance: 1.0,
+                    },
+                ])
+            })
+            .unwrap_err();
+        assert!(matches!(error, TantivyError::Cancelled));
+        assert_eq!(cancelling.inner.ranges.len(), 1);
+        assert_eq!(cancelling.inner.ranges[0], 0..3);
     }
 
     /// Reports a cancel once it has been polled `polls_before_cancel` times, like a backend

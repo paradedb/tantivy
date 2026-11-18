@@ -222,6 +222,7 @@ pub(crate) fn merge_ivf(
                     clusterer,
                     &source_rows,
                     &centroids,
+                    &router,
                     vector_count,
                     &mut timings,
                 )?;
