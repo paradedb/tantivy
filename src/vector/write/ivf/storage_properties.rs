@@ -10,10 +10,15 @@ const DOCS: usize = 1200;
 
 struct FixedClusters;
 impl IvfClusterer for FixedClusters {
-    fn training_sample_ratio(&self) -> f32 {
+    fn training_sample_ratio(&self, _: &VectorOptions, _: usize) -> f32 {
         1.0
     }
-    fn train(&self, _: &VectorOptions, _: &mut dyn VectorSource) -> crate::Result<IvfCentroids> {
+    fn train(
+        &self,
+        _: &VectorOptions,
+        _: &mut dyn VectorSource,
+        _: f32,
+    ) -> crate::Result<IvfCentroids> {
         let mut values = vec![0.0; 4 * DIM];
         for cluster in 0..4 {
             values[cluster * DIM + cluster] = 1.0;

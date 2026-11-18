@@ -27,8 +27,9 @@ pub(super) fn train(
     timings: &mut IvfBuildTimings,
 ) -> crate::Result<Option<Trained>> {
     let opts = merge.opts;
+    let sample_ratio = clusterer.training_sample_ratio(opts, vector_count);
     let training_sample_size = {
-        let ratio = f64::from(clusterer.training_sample_ratio()).clamp(f64::MIN_POSITIVE, 1.0);
+        let ratio = f64::from(sample_ratio).clamp(f64::MIN_POSITIVE, 1.0);
         let target = ((vector_count as f64) * ratio).ceil() as usize;
         target.clamp(1, vector_count)
     };
@@ -66,7 +67,7 @@ pub(super) fn train(
 
     let mut training_source =
         MergeVectorSource::new(&merge.readers, training_rows, opts.dim(), merge.ctx.cancel);
-    let centroids = clusterer.train(opts, &mut training_source)?;
+    let centroids = clusterer.train(opts, &mut training_source, sample_ratio)?;
     timings.train_reads += training_source.reads;
 
     if merge.ctx.cancel.wants_cancel() {

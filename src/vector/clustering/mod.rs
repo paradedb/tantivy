@@ -11,7 +11,8 @@ pub(crate) mod soar;
 mod superkmeans;
 
 pub use superkmeans::{
-    SuperKMeansClusterer, DEFAULT_TARGET_LEAF_SIZE, DEFAULT_TRAINING_SAMPLE_RATIO,
+    SuperKMeansClusterer, DEFAULT_TARGET_LEAF_SIZE, DESIRED_TRAINING_VECTORS_PER_LIST,
+    MINIMUM_TRAINING_VECTORS_PER_LIST,
 };
 
 /// A router candidate with its exact squared Euclidean distance to the vector.
@@ -22,14 +23,15 @@ pub struct IvfAssignmentCandidate {
 }
 
 pub trait IvfClusterer: Send + Sync + 'static {
-    /// Fraction of vectors sampled for training, in `(0, 1]`.
-    fn training_sample_ratio(&self) -> f32;
+    /// Fraction of `num_rows` vectors sampled for training, in `(0, 1]`.
+    fn training_sample_ratio(&self, options: &VectorOptions, num_rows: usize) -> f32;
 
-    /// Trains centroids.
+    /// Trains centroids using the resolved `training_sample_ratio` for this segment.
     fn train(
         &self,
         options: &VectorOptions,
         source: &mut dyn VectorSource,
+        training_sample_ratio: f32,
     ) -> crate::Result<IvfCentroids>;
 
     /// Assigns vectors to centroids.
