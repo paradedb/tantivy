@@ -342,6 +342,21 @@ fn ivf_build_emits_timings_log() -> crate::Result<()> {
     assert!(line.contains("train_reads="));
     assert_eq!(field("assign_reads"), vectors);
     assert_eq!(field("encode_reads"), vectors);
+    // The Data and ExactRows parts sit inside `other`; truncating each part never exceeds the
+    // truncated whole.
+    let parts = ["encode_read_ms", "encode_ms", "data_write_ms", "exact_ms"];
+    let within_other: usize = parts.iter().map(|part| field(part)).sum();
+    assert!(within_other <= field("other"), "parts exceed other: {line}");
+    assert!(
+        line.ends_with(&format!(
+            "encode_read_ms={} encode_ms={} data_write_ms={} exact_ms={}",
+            field("encode_read_ms"),
+            field("encode_ms"),
+            field("data_write_ms"),
+            field("exact_ms")
+        )),
+        "the stage parts close the line: {line}"
+    );
     eprintln!("IVF_BUILD_SAMPLE {line}");
     Ok(())
 }

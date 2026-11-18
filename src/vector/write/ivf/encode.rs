@@ -3,6 +3,7 @@
 
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Instant;
 
 use common::CountingWriter;
 use quant::cascade::{
@@ -116,6 +117,7 @@ pub(super) fn write_data_entry(
         .iter()
         .position(|slot| matches!(slot.slot_type, SlotType::DocIds))
         .expect("clustered blocks carry document ids");
+    let write_start = Instant::now();
     timings.pad_bytes += vec_write.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
     let data_start = vec_write.written_bytes();
     let data = vec_write.for_field_with_idx(merge.field, VectorEntry::Data.index());
@@ -123,6 +125,7 @@ pub(super) fn write_data_entry(
     let pos = write_metadata(data, &meta)?;
     let mut block_offsets = BlockOffsetsWriter::new(data.written_bytes() - entry_start);
     timings.pad_bytes += pos - 4 - meta.to_bytes().len();
+    timings.data_write += write_start.elapsed();
     let row_bytes = opts.bytes_per_vector();
     let fixed_scratch = row_bytes + opts.dim() + opts.dim().div_ceil(64) * 8;
     let per_row_scratch = 2 * row_bytes + quantization.map_or(0, |c| c.bytes_per_row()) + 16;
@@ -157,6 +160,7 @@ pub(super) fn write_data_entry(
         write_plain_blocks(&reads, &mut blocks, &mut locations, rows_streamed)?;
     }
     let pos = blocks.pos;
+    let write_start = Instant::now();
     let entry_len = block_offsets.finish(data)?;
     timings.pad_bytes += entry_len - pos - (num_centroids + 1) * 8 - 8;
     assert_eq!(
@@ -164,6 +168,7 @@ pub(super) fn write_data_entry(
         0
     );
     data.flush()?;
+    timings.data_write += write_start.elapsed();
     timings.vec_bytes += vec_write.written_bytes() - data_start;
     Ok(locations)
 }
@@ -302,6 +307,7 @@ fn write_plain_blocks(
         let block_start = blocks.pos;
         assert_eq!(blocks.written(), block_start as u64);
         let mut doc_ids = std::mem::take(&mut bufs[reads.doc_ids_slot]);
+        let read_start = Instant::now();
         let BlockWriter {
             data, pos, timings, ..
         } = blocks;
@@ -312,8 +318,11 @@ fn write_plain_blocks(
             }
             Ok(())
         })?;
+        timings.encode_read += read_start.elapsed();
         bufs[reads.doc_ids_slot] = doc_ids;
+        let write_start = Instant::now();
         blocks.finish_block(block_start, n, first_buffered, &mut bufs)?;
+        blocks.timings.data_write += write_start.elapsed();
     }
     Ok(())
 }
@@ -414,6 +423,7 @@ fn write_quantized_blocks(
     let mut group_start = 0;
     while group_start < num_clusters {
         // Calling thread: doc ids, locations, and each cluster's rows read, normalized and decoded.
+        let read_start = Instant::now();
         let mut group_end = group_start;
         let mut group_bytes = 0;
         let mut pending = Vec::new();
@@ -437,8 +447,10 @@ fn write_quantized_blocks(
             pending.push(cluster);
             group_end += 1;
         }
+        blocks.timings.encode_read += read_start.elapsed();
 
         // Pool: one prepared-centroid and batch-encode workspace per thread.
+        let encode_start = Instant::now();
         pending.par_iter_mut().try_for_each_init(
             || EncodeWorkspace {
                 centroid: Vec::with_capacity(dim),
@@ -447,8 +459,10 @@ fn write_quantized_blocks(
             },
             |workspace, cluster| cluster.encode(&spec, workspace),
         )?;
+        blocks.timings.encode += encode_start.elapsed();
 
         // Calling thread: pad, flush the columns and record each block, in cluster order.
+        let write_start = Instant::now();
         for mut cluster in pending {
             if cluster.rows == 0 {
                 blocks.empty();
@@ -458,6 +472,7 @@ fn write_quantized_blocks(
             assert_eq!(blocks.written(), block_start as u64);
             blocks.finish_block(block_start, cluster.rows, 0, &mut cluster.bufs)?;
         }
+        blocks.timings.data_write += write_start.elapsed();
         group_start = group_end;
     }
     Ok(())
