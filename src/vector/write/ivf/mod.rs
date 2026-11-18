@@ -38,6 +38,7 @@ use crate::{DocId, TantivyError};
 mod assign;
 #[cfg(test)]
 mod build_tests;
+mod data;
 mod encode;
 mod source;
 #[cfg(test)]
@@ -253,7 +254,7 @@ pub(crate) fn merge_ivf(
                 } else {
                     Assignment::Nearest
                 };
-                let locations = encode::write_data_entry(
+                let locations = data::write_data_entry(
                     &merge,
                     &mut vec_write,
                     &assigned_vectors,
