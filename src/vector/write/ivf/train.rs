@@ -70,6 +70,9 @@ pub(super) fn train(
         MergeVectorSource::new(&merge.readers, training_rows, opts.dim(), merge.ctx.cancel);
     let centroids = clusterer.train(opts, &mut training_source, sample_ratio)?;
     timings.train_reads += training_source.reads;
+    log::info!(target: "paradedb::ivf_build",
+        "ivf_source_profile stage=train vectors={} reads={} load_ms={}",
+        vector_count, training_source.reads, training_source.read_time.as_millis());
 
     if merge.ctx.cancel.wants_cancel() {
         return Err(TantivyError::Cancelled);

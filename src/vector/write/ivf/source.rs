@@ -2,6 +2,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::indexer::segment_updater::CancelSentinel;
 use crate::vector::clustering::{
@@ -20,6 +21,7 @@ pub(super) struct MergeVectorSource<'a> {
     rows: Vec<(RowAddress, DocId)>,
     reader: RowReader<'a>,
     pub(super) reads: usize,
+    pub(super) read_time: Duration,
 }
 
 impl<'a> MergeVectorSource<'a> {
@@ -39,6 +41,7 @@ impl<'a> MergeVectorSource<'a> {
                 order: Vec::new(),
             },
             reads: 0,
+            read_time: Duration::ZERO,
         }
     }
 
@@ -144,7 +147,9 @@ impl VectorSource for MergeVectorSource<'_> {
                 self.rows.len()
             )));
         };
+        let start = Instant::now();
         let batch = self.reader.load(requested)?;
+        self.read_time += start.elapsed();
         self.reads += requested.len();
         Ok(batch)
     }
@@ -158,7 +163,9 @@ impl VectorSource for MergeVectorSource<'_> {
         }
         let requested: Vec<(RowAddress, DocId)> =
             rows.iter().map(|&row| self.rows[row as usize]).collect();
+        let start = Instant::now();
         let batch = self.reader.load(&requested)?;
+        self.read_time += start.elapsed();
         self.reads += rows.len();
         Ok(batch)
     }
