@@ -132,7 +132,7 @@ struct RoundRobinClusterer {
 }
 
 impl IvfClusterer for RoundRobinClusterer {
-    fn training_sample_ratio(&self) -> f32 {
+    fn training_sample_ratio(&self, _: &VectorOptions, _: usize) -> f32 {
         1.0
     }
 
@@ -140,6 +140,7 @@ impl IvfClusterer for RoundRobinClusterer {
         &self,
         options: &VectorOptions,
         source: &mut dyn VectorSource,
+        _: f32,
     ) -> tantivy::Result<IvfCentroids> {
         let rows: Vec<u32> = (0..self.clusters as u32).collect();
         let IvfTrainingVectors::F32(batch) = source.read_rows(&rows)?;
