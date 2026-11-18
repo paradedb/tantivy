@@ -171,6 +171,13 @@ where TValueReader: value::ValueReader
         DeltaReader::new(OwnedBytes::empty())
     }
 
+    pub(crate) fn reset(&mut self, reader: OwnedBytes) {
+        self.common_prefix_len = 0;
+        self.suffix_range = 0..0;
+        self.idx = 0;
+        self.block_reader.reset(reader);
+    }
+
     fn deserialize_vint(&mut self) -> u64 {
         self.block_reader.deserialize_u64()
     }

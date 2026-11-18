@@ -64,6 +64,29 @@ impl SSTableIndex {
         }
     }
 
+    pub(crate) fn visit_blocks_in_range(
+        &self,
+        range: std::ops::RangeInclusive<u64>,
+        cb: impl FnMut(BlockAddr),
+    ) -> io::Result<()> {
+        match self {
+            Self::V2(index) => {
+                if !range.is_empty() {
+                    index.visit_blocks_in_range(
+                        (*range.start() as usize)..=(*range.end() as usize),
+                        cb,
+                    );
+                }
+                Ok(())
+            }
+            Self::V3(index) => index.visit_blocks_in_range(range, cb),
+            Self::V3Empty(index) => {
+                index.visit_blocks_in_range(range, cb);
+                Ok(())
+            }
+        }
+    }
+
     pub(crate) fn locate_with_key(&self, key: &[u8]) -> io::Result<Option<u64>> {
         match self {
             Self::V2(index) => Ok(index.locate_with_key(key).map(|id| id as u64)),

@@ -3519,8 +3519,8 @@ mod late_filter_tests {
 
     use super::*;
     use crate::query::{
-        BooleanQuery, BoostQuery, ConstScoreQuery, ExcludedDocSet, ExclusionSet, Explanation,
-        FastFieldRangeQuery, Occur, Query, Scorer, Weight,
+        BooleanQuery, BoostQuery, CandidateHint, ConstScoreQuery, ExcludedDocSet, ExclusionSet,
+        Explanation, FastFieldRangeQuery, Occur, Query, Scorer, Weight,
     };
     use crate::schema::Metric;
     use crate::vector::filter::DocFilter;
@@ -3544,10 +3544,10 @@ mod late_filter_tests {
             &self,
             reader: &SegmentReader,
             boost: Score,
-            candidate_size: u32,
+            candidate_hint: CandidateHint,
         ) -> Result<Box<dyn Scorer>> {
             self.inner
-                .scorer_for_candidates_unpositioned(reader, boost, candidate_size)
+                .scorer_for_candidates_unpositioned(reader, boost, candidate_hint)
         }
         fn scorer(&self, reader: &SegmentReader, boost: Score) -> Result<Box<dyn Scorer>> {
             assert!(

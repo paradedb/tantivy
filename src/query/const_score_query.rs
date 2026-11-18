@@ -3,7 +3,7 @@ use std::fmt;
 use common::TinySet;
 
 use crate::docset::{SeekDangerResult, BLOCK_NUM_TINYBITSETS, COLLECT_BLOCK_BUFFER_LEN};
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{CandidateHint, EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::schema::Field;
 use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
 
@@ -94,11 +94,11 @@ impl Weight for ConstWeight {
         &self,
         reader: &SegmentReader,
         boost: Score,
-        candidate_size: u32,
+        candidate_hint: CandidateHint,
     ) -> crate::Result<Box<dyn Scorer>> {
         let inner_scorer =
             self.weight
-                .scorer_for_candidates_unpositioned(reader, boost, candidate_size)?;
+                .scorer_for_candidates_unpositioned(reader, boost, candidate_hint)?;
         Ok(Box::new(ConstScorer::new(inner_scorer, boost * self.score)))
     }
 
@@ -156,6 +156,10 @@ impl<TDocSet: DocSet> DocSet for ConstScorer<TDocSet> {
 
     fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
         self.docset.seek_danger(target)
+    }
+
+    fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
+        self.docset.is_empty_in_range(start, end)
     }
 
     fn has_fast_bitset(&self) -> bool {

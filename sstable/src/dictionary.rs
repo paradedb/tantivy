@@ -15,7 +15,27 @@ use tantivy_fst::Automaton;
 use tantivy_fst::automaton::AlwaysMatch;
 
 use crate::streamer::{Streamer, StreamerBuilder};
+use crate::value::ValueReader;
 use crate::{BlockAddr, DeltaReader, Reader, SSTable, SSTableIndex, TermOrdinal, VoidSSTable};
+
+fn decode_block_slice<TValueReader: ValueReader, E: From<io::Error>>(
+    delta_reader: &mut DeltaReader<TValueReader>,
+    bytes: &mut Vec<u8>,
+    slice: OwnedBytes,
+    first_ordinal: TermOrdinal,
+    cb: &mut impl FnMut(TermOrdinal, &[u8]) -> Result<(), E>,
+) -> Result<(), E> {
+    delta_reader.reset(slice);
+    bytes.clear();
+    let mut cur_ord = first_ordinal;
+    while delta_reader.advance()? {
+        bytes.truncate(delta_reader.common_prefix_len());
+        bytes.extend_from_slice(delta_reader.suffix());
+        cb(cur_ord, bytes)?;
+        cur_ord += 1;
+    }
+    Ok(())
+}
 
 /// An SSTable is a sorted map that associates sorted `&[u8]` keys
 /// to any kind of typed values.
@@ -342,12 +362,133 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         self.num_bytes
     }
 
+    /// Returns the inclusive range of SSTable block IDs spanned by `ord_range`, or `None` when
+    /// `ord_range` is empty or `num_terms() == 0`.
+    pub fn block_ids_for_ord_range(
+        &self,
+        ord_range: std::ops::Range<TermOrdinal>,
+    ) -> io::Result<Option<std::ops::RangeInclusive<u64>>> {
+        if ord_range.is_empty() || self.num_terms == 0 || ord_range.start >= self.num_terms {
+            return Ok(None);
+        }
+        let end_incl = (ord_range.end - 1).min(self.num_terms - 1);
+        let first_block_id = self.sstable_index.locate_with_ord(ord_range.start)?;
+        let last_block_id = if end_incl == ord_range.start {
+            first_block_id
+        } else {
+            self.sstable_index.locate_with_ord(end_incl)?
+        };
+        Ok(Some(first_block_id..=last_block_id))
+    }
+
+    /// Visits the [`BlockAddr`] of every SSTable block in `block_ids` in ascending order.
+    pub fn visit_blocks_in_range(
+        &self,
+        block_ids: std::ops::RangeInclusive<u64>,
+        cb: impl FnMut(BlockAddr),
+    ) -> io::Result<()> {
+        self.sstable_index.visit_blocks_in_range(block_ids, cb)
+    }
+
+    /// Decodes each SSTable block in `block_addrs` (must be in ascending `byte_range.start`
+    /// order), invoking `cb(ord, key)` for every term in each block.
+    ///
+    /// On page-backed storage (`storage_block_len().is_some()`), consecutive blocks that lie
+    /// strictly within the same single storage page are coalesced into one zero-copy
+    /// `read_bytes_slice` call; blocks that themselves straddle a page boundary are read
+    /// individually so neighboring interior blocks remain zero-copy. Untouched blocks between
+    /// requested blocks on the same page are skipped without decompressing them.
+    pub fn visit_blocks_coalesced<E: From<io::Error>>(
+        &self,
+        block_addrs: &[BlockAddr],
+        mut cb: impl FnMut(TermOrdinal, &[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut delta_reader = DeltaReader::<TSSTable::ValueReader>::empty();
+        let mut bytes = Vec::with_capacity(64);
+
+        if self.sstable_slice.storage_block_len().is_none() {
+            for addr in block_addrs {
+                if addr.byte_range.is_empty() {
+                    continue;
+                }
+                let slice = self
+                    .sstable_slice
+                    .read_bytes_slice(addr.byte_range.clone())?;
+                decode_block_slice(
+                    &mut delta_reader,
+                    &mut bytes,
+                    slice,
+                    addr.first_ordinal,
+                    &mut cb,
+                )?;
+            }
+            return Ok(());
+        }
+
+        let mut i = 0;
+        while i < block_addrs.len() {
+            let first = &block_addrs[i];
+            if first.byte_range.is_empty() {
+                i += 1;
+                continue;
+            }
+            let first_page = self.sstable_slice.storage_block_ord(first.byte_range.start);
+            let last_page = self
+                .sstable_slice
+                .storage_block_ord(first.byte_range.end - 1);
+            let mut j = i + 1;
+            let mut group_end = first.byte_range.end;
+            if first_page.is_some() && first_page == last_page {
+                let page = first_page.unwrap();
+                while j < block_addrs.len() {
+                    let next = &block_addrs[j];
+                    if next.byte_range.is_empty() {
+                        j += 1;
+                        continue;
+                    }
+                    if next.byte_range.start >= group_end
+                        && self.sstable_slice.storage_block_ord(next.byte_range.start) == Some(page)
+                        && self
+                            .sstable_slice
+                            .storage_block_ord(next.byte_range.end - 1)
+                            == Some(page)
+                    {
+                        group_end = next.byte_range.end;
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            let group_start = first.byte_range.start;
+            let group_bytes = self
+                .sstable_slice
+                .read_bytes_slice(group_start..group_end)?;
+            for addr in &block_addrs[i..j] {
+                if addr.byte_range.is_empty() {
+                    continue;
+                }
+                let rel_start = addr.byte_range.start - group_start;
+                let rel_end = addr.byte_range.end - group_start;
+                decode_block_slice(
+                    &mut delta_reader,
+                    &mut bytes,
+                    group_bytes.slice(rel_start..rel_end),
+                    addr.first_ordinal,
+                    &mut cb,
+                )?;
+            }
+            i = j;
+        }
+        Ok(())
+    }
+
     /// Decode a DeltaReader up to key, returning the number of terms traversed
     ///
     /// If the key was not found, returns Ok(None).
     /// After calling this function, it is possible to call `DeltaReader::value` to get the
     /// associated value.
-    fn decode_up_to_key<K: AsRef<[u8]>>(
+    pub(crate) fn decode_up_to_key<K: AsRef<[u8]>>(
         &self,
         key: K,
         sstable_delta_reader: &mut DeltaReader<TSSTable::ValueReader>,
@@ -500,6 +641,25 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         Ok(true)
     }
 
+    /// Locates the SSTable block containing `ord`, returning `(block_addr, end_ordinal)` where
+    /// `block_addr.first_ordinal..end_ordinal` is the ordinal range of that block, or `None` if
+    /// `ord >= self.num_terms()`.
+    pub fn block_addr_and_end_ord(
+        &self,
+        ord: TermOrdinal,
+    ) -> io::Result<Option<(BlockAddr, TermOrdinal)>> {
+        if ord >= self.num_terms {
+            return Ok(None);
+        }
+        let (block_addr, block_id) = self.sstable_index.get_and_locate_with_ord(ord)?;
+        let end_ord = self
+            .sstable_index
+            .get_block(block_id + 1)?
+            .map(|next| next.first_ordinal)
+            .unwrap_or(self.num_terms);
+        Ok(Some((block_addr, end_ord)))
+    }
+
     /// Returns the terms for a _sorted_ list of term ordinals.
     ///
     /// Returns true if and only if all terms have been found.
@@ -633,6 +793,19 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         sorted_keys: crate::batch::SortedTermSlice<'a, K>,
     ) -> crate::batch::BatchedTermInfoIter<'a, K, TSSTable> {
         crate::batch::BatchedTermInfoIter::new(self, sorted_keys)
+    }
+
+    /// Batched exact-key ordinal lookup over a sorted input slice, decoding each
+    /// touched SSTable block at most once and yielding `(input_index, term_ord)`.
+    pub fn batch_term_ord_exact<'a, K: AsRef<[u8]>>(
+        &'a self,
+        sorted_keys: crate::batch::SortedTermSlice<'a, K>,
+    ) -> impl Iterator<Item = io::Result<(usize, TermOrdinal)>> + 'a {
+        let mut iter = crate::batch::BatchedTermInfoIter::new(self, sorted_keys);
+        std::iter::from_fn(move || {
+            iter.next_with_ord()
+                .map(|r| r.map(|(idx, ord, _)| (idx, ord)))
+        })
     }
 
     /// Lookups the value corresponding to the key.
