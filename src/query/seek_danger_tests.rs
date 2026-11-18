@@ -29,6 +29,8 @@ enum Kind {
     Phrase,
     PhrasePrefix,
     FastFieldRange,
+    PredicateColumn,
+    CachedDictPredicate,
     ScorerWrapper,
 }
 
@@ -71,6 +73,8 @@ implementations! {
     ("phrase_query/phrase_scorer.rs", Phrase, query_seek_danger_phrase),
     ("phrase_prefix_query/phrase_prefix_scorer.rs", PhrasePrefix, query_seek_danger_phrase_prefix),
     ("range_query/fast_field_range_doc_set.rs", FastFieldRange, query_seek_danger_fast_field_range),
+    ("term_set_query/term_predicate.rs", PredicateColumn, query_seek_danger_predicate_column),
+    ("term_set_query/term_predicate.rs", CachedDictPredicate, query_seek_danger_cached_dict_predicate),
     ("disjunction.rs", ScorerWrapper, query_seek_danger_scorer_wrapper),
 }
 
@@ -87,8 +91,42 @@ enum Expr {
     Node(Kind, Box<Expr>, Box<Expr>),
 }
 
+#[derive(Debug)]
+struct ModuloPredicate;
+
+impl TermPredicate for ModuloPredicate {
+    fn filter_bytes(
+        &self,
+        data: &[u8],
+        offsets: &[u32],
+        out: &mut [common::TinySet],
+    ) -> crate::Result<()> {
+        for i in 0..offsets.len().saturating_sub(1) {
+            let slice = &data[offsets[i] as usize..offsets[i + 1] as usize];
+            if slice.last().is_some_and(|b| b % 2 == 0) {
+                out[i / 64].insert_mut((i % 64) as u32);
+            }
+        }
+        Ok(())
+    }
+
+    fn filter_monotonic_u64s(
+        &self,
+        _col_type: columnar::ColumnType,
+        values: &[u64],
+        out: &mut [common::TinySet],
+    ) -> crate::Result<()> {
+        for (i, &v) in values.iter().enumerate() {
+            if (3..8).contains(&v) {
+                out[i / 64].insert_mut((i % 64) as u32);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Expr {
-    fn query(&self, fields: &[Field; 3], number: Field) -> Box<dyn Query> {
+    fn query(&self, fields: &[Field; 3], number: Field, dict_str: Field) -> Box<dyn Query> {
         let term =
             |field, order| Term::from_field_text(field, if order { "order" } else { "service" });
         let Expr::Node(kind, left, right) = self else {
@@ -100,8 +138,8 @@ impl Expr {
                 IndexRecordOption::WithFreqs,
             ));
         };
-        let left = left.query(fields, number);
-        let right = right.query(fields, number);
+        let left = left.query(fields, number, dict_str);
+        let right = right.query(fields, number, dict_str);
         match kind {
             Kind::Intersection => Box::new(BooleanQuery::intersection(vec![left, right])),
             Kind::BufferedUnion => Box::new(DisjunctionMaxQuery::with_tie_breaker(
@@ -126,6 +164,23 @@ impl Expr {
                 Bound::Included(Term::from_field_u64(number, 3)),
                 Bound::Excluded(Term::from_field_u64(number, 8)),
             )),
+            Kind::PredicateColumn => Box::new(TermPredicateQuery::new(
+                number,
+                std::sync::Arc::new(ModuloPredicate),
+            )),
+            Kind::CachedDictPredicate => {
+                // Intersect with the selective `fields[1]: "order"` term (2 matches out of 11,102)
+                // so `BooleanWeight` routes `dict_str` onto `CachedDictPredicateDocSet`.
+                let rare = Box::new(TermQuery::new(
+                    term(fields[1], true),
+                    IndexRecordOption::WithFreqs,
+                ));
+                let pred = Box::new(
+                    TermPredicateQuery::new(dict_str, std::sync::Arc::new(ModuloPredicate))
+                        .with_exact_postings(ExactPostings::Unavailable),
+                );
+                Box::new(BooleanQuery::intersection(vec![rare, pred]))
+            }
             // ScorerWrapper is private to Disjunction and its override is not
             // called by Disjunction's normal traversal. Exercise it directly.
             Kind::ScorerWrapper => left,
@@ -152,6 +207,7 @@ struct Fixture {
     searcher: Searcher,
     fields: [Field; 3],
     number: Field,
+    dict_str: Field,
 }
 
 fn fixture() -> &'static Fixture {
@@ -164,6 +220,7 @@ fn fixture() -> &'static Fixture {
             schema.add_text_field("mixed", TEXT),
         ];
         let number = schema.add_u64_field("number", FAST);
+        let dict_str = schema.add_text_field("dict_str", crate::schema::STRING | FAST);
         let index = Index::create_in_ram(schema.build());
         let mut writer = index.writer_with_num_threads(1, 50_000_000).unwrap();
         for id in 0..11102u64 {
@@ -183,12 +240,14 @@ fn fixture() -> &'static Fixture {
                 "order",
                 "nothing",
             ][(id % 6) as usize];
+            let s = format!("entry-{id:06}-padding-block");
             writer
                 .add_document(doc!(
                     fields[0] => content,
                     fields[1] => title,
                     fields[2] => mixed,
-                    number => id % 17
+                    number => id % 17,
+                    dict_str => s,
                 ))
                 .unwrap();
         }
@@ -199,13 +258,14 @@ fn fixture() -> &'static Fixture {
             searcher,
             fields,
             number,
+            dict_str,
         }
     })
 }
 
 fn scorer(expr: &Expr, scoring: bool) -> Box<dyn Scorer> {
     let fixture = fixture();
-    let query = expr.query(&fixture.fields, fixture.number);
+    let query = expr.query(&fixture.fields, fixture.number, fixture.dict_str);
     let enable = if scoring {
         EnableScoring::enabled_from_searcher(&fixture.searcher)
     } else {

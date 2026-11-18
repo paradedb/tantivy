@@ -438,13 +438,108 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         boost: Score,
     ) -> crate::Result<HashMap<Occur, Vec<Box<dyn Scorer>>>> {
         let mut per_occur_scorers: HashMap<Occur, Vec<Box<dyn Scorer>>> = HashMap::new();
+        let mut deferred_fast_musts: Vec<&dyn Weight> = Vec::new();
+
         for (occur, subweight) in &self.weights {
+            if *occur == Occur::Must && subweight.uses_fast_fields() {
+                deferred_fast_musts.push(subweight.as_ref());
+                continue;
+            }
             let sub_scorer: Box<dyn Scorer> = subweight.scorer(reader, boost)?;
+            if *occur == Occur::Must && sub_scorer.is::<EmptyScorer>() {
+                per_occur_scorers
+                    .entry(Occur::Must)
+                    .or_default()
+                    .push(sub_scorer);
+                return Ok(per_occur_scorers);
+            }
             per_occur_scorers
                 .entry(*occur)
                 .or_default()
                 .push(sub_scorer);
         }
+
+        if !deferred_fast_musts.is_empty() {
+            let num_docs = reader.num_docs();
+            let max_doc = reader.max_doc();
+            let max_driver_cost = (f64::from(max_doc) * 0.8) as u64;
+
+            let mut candidate_bound: Option<u32> = None;
+            let mut min_driver_cost: Option<u64> = None;
+
+            if let Some(musts) = per_occur_scorers.get(&Occur::Must) {
+                let mut hints = Vec::with_capacity(musts.len());
+                for s in musts {
+                    if !self.scoring_enabled && s.is::<AllScorer>() {
+                        continue;
+                    }
+                    hints.push(s.size_hint());
+                    let c = s.cost();
+                    min_driver_cost = Some(min_driver_cost.map_or(c, |prev| prev.min(c)));
+                }
+                if !hints.is_empty() {
+                    candidate_bound = Some(crate::query::size_hint::estimate_intersection(
+                        hints.into_iter(),
+                        num_docs,
+                    ));
+                }
+            }
+
+            if self.minimum_number_should_match >= 1 {
+                if let Some(shoulds) = per_occur_scorers.get(&Occur::Should) {
+                    let has_removed_all =
+                        !self.scoring_enabled && shoulds.iter().any(|s| s.is::<AllScorer>());
+                    if !has_removed_all {
+                        let non_empty: Vec<&Box<dyn Scorer>> =
+                            shoulds.iter().filter(|s| !s.is::<EmptyScorer>()).collect();
+                        if non_empty.len() < self.minimum_number_should_match {
+                            // Required SHOULD cannot be satisfied; complex_scorer will
+                            // short-circuit.
+                            return Ok(per_occur_scorers);
+                        }
+                        let union_hint = non_empty
+                            .iter()
+                            .map(|s| u64::from(s.size_hint()))
+                            .sum::<u64>()
+                            .min(u64::from(max_doc))
+                            as u32;
+                        let union_cost: u64 = non_empty
+                            .iter()
+                            .map(|s| s.cost())
+                            .fold(0u64, u64::saturating_add);
+                        candidate_bound =
+                            Some(candidate_bound.map_or(union_hint, |prev| prev.min(union_hint)));
+                        min_driver_cost =
+                            Some(min_driver_cost.map_or(union_cost, |prev| prev.min(union_cost)));
+                    }
+                } else {
+                    return Ok(per_occur_scorers);
+                }
+            }
+
+            let selective_candidate_size = match (candidate_bound, min_driver_cost) {
+                (Some(c), Some(cost))
+                    if c.saturating_mul(32) < num_docs && cost < max_driver_cost =>
+                {
+                    Some(c.max(1))
+                }
+                _ => None,
+            };
+
+            let must_entry = per_occur_scorers.entry(Occur::Must).or_default();
+            for subweight in deferred_fast_musts {
+                let sub_scorer = match selective_candidate_size {
+                    Some(c) => subweight.scorer_for_candidates_unpositioned(reader, boost, c)?,
+                    None => subweight.scorer(reader, boost)?,
+                };
+                let is_empty = sub_scorer.is::<EmptyScorer>();
+                must_entry.push(sub_scorer);
+                if is_empty {
+                    return Ok(per_occur_scorers);
+                }
+            }
+        }
+
         Ok(per_occur_scorers)
     }
 

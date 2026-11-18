@@ -1,4 +1,5 @@
-//! Lazy gallop strategy for `FastFieldTermSetQuery` on sorted segments.
+//! Lazy gallop strategy for `TermSetWeight` on sorted segments (numeric values
+//! or dictionary ordinals).
 //!
 //! `TermSetGallopDocSet` is a single-cursor DocSet that gallops the sorted
 //! column on demand inside `advance()` and `seek()`. For each pruned term,

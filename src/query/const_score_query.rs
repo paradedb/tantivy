@@ -158,6 +158,10 @@ impl<TDocSet: DocSet> DocSet for ConstScorer<TDocSet> {
         self.docset.seek_danger(target)
     }
 
+    fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
+        self.docset.is_empty_in_range(start, end)
+    }
+
     fn has_fast_bitset(&self) -> bool {
         self.docset.has_fast_bitset()
     }

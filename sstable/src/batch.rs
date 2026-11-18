@@ -23,16 +23,18 @@ use std::io;
 use std::marker::PhantomData;
 
 use crate::dictionary::Dictionary;
-use crate::{BlockAddr, DeltaReader, SSTable};
+use crate::{BlockAddr, DeltaReader, SSTable, TermOrdinal};
 
 /// A slice of byte-encoded terms guaranteed to be sorted strictly
 /// ascending in byte order with no duplicates.
 ///
-/// Used as the input contract for [`Dictionary::batch_term_info_exact`].
+/// Used as the input contract for [`Dictionary::batch_term_info_exact`] and
+/// [`Dictionary::batch_term_ord_exact`].
 /// Construct via [`SortedTermSlice::new`] (validating, O(n)) or
 /// [`SortedTermSlice::new_assume_sorted`] (debug-assert only, O(1)).
 ///
 /// [`Dictionary::batch_term_info_exact`]: crate::Dictionary::batch_term_info_exact
+/// [`Dictionary::batch_term_ord_exact`]: crate::Dictionary::batch_term_ord_exact
 pub struct SortedTermSlice<'a, K: AsRef<[u8]> = &'a [u8]> {
     inner: &'a [K],
     _phantom: PhantomData<&'a K>,
@@ -97,7 +99,8 @@ pub fn sort_and_dedupe_terms<K: AsRef<[u8]> + Ord>(terms: &mut Vec<K>) {
 
 /// Iterator over batched dictionary lookups for sorted exact keys.
 ///
-/// Constructed via [`Dictionary::batch_term_info_exact`]. Yields
+/// Constructed via [`Dictionary::batch_term_info_exact`] (or driven with ordinals via
+/// [`BatchedTermInfoIter::next_with_ord`] / [`Dictionary::batch_term_ord_exact`]). Yields
 /// `Ok((input_index, value))` for each input key present in the
 /// dictionary in input order; absent keys are silently skipped. I/O
 /// errors during block decode propagate via `Err(_)`; the iterator is
@@ -128,6 +131,7 @@ pub struct BatchedTermInfoIter<'a, K: AsRef<[u8]>, TSSTable: SSTable> {
     next_block_addr: Option<Option<BlockAddr>>,
     delta_reader: Option<DeltaReader<TSSTable::ValueReader>>,
     current_entry_key: Vec<u8>,
+    next_entry_ord: TermOrdinal,
     entry_loaded: bool,
     /// Set when the current block's `DeltaReader` returned `Ok(false)`
     /// (exhausted). Any subsequent input target that maps to the same
@@ -148,21 +152,15 @@ impl<'a, K: AsRef<[u8]>, TSSTable: SSTable> BatchedTermInfoIter<'a, K, TSSTable>
             next_block_addr: None,
             delta_reader: None,
             current_entry_key: Vec::new(),
+            next_entry_ord: 0,
             entry_loaded: false,
             block_exhausted: false,
             errored: false,
         }
     }
-}
 
-impl<K, TSSTable> Iterator for BatchedTermInfoIter<'_, K, TSSTable>
-where
-    K: AsRef<[u8]>,
-    TSSTable: SSTable,
-{
-    type Item = io::Result<(usize, TSSTable::Value)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    /// Advances to the next matched input key, returning `(input_index, term_ord, value)`.
+    pub fn next_with_ord(&mut self) -> Option<io::Result<(usize, TermOrdinal, TSSTable::Value)>> {
         if self.errored {
             return None;
         }
@@ -193,7 +191,7 @@ where
             // `PartialEq`, so direct comparison is correct.
             if self.current_block_addr.as_ref() != Some(&target_block) {
                 match self.dict.sstable_delta_reader_block(target_block.clone()) {
-                    Ok(reader) => {
+                    Ok(mut reader) => {
                         let next_block = match self
                             .sorted_keys
                             .as_slice()
@@ -212,8 +210,15 @@ where
                         if single_key {
                             let index = self.input_cursor;
                             self.input_cursor += 1;
-                            match self.dict.do_get(target, reader) {
-                                Ok(Some(value)) => return Some(Ok((index, value))),
+                            let first_ordinal = target_block.first_ordinal;
+                            match self.dict.decode_up_to_key(target, &mut reader) {
+                                Ok(Some(rel_ord)) => {
+                                    return Some(Ok((
+                                        index,
+                                        first_ordinal + rel_ord,
+                                        reader.value().clone(),
+                                    )));
+                                }
                                 Ok(None) => continue,
                                 Err(error) => {
                                     self.errored = true;
@@ -221,6 +226,7 @@ where
                                 }
                             }
                         }
+                        self.next_entry_ord = target_block.first_ordinal;
                         self.delta_reader = Some(reader);
                         self.current_block_addr = Some(target_block);
                         self.current_entry_key.clear();
@@ -254,6 +260,7 @@ where
                         Ok(true) => {
                             self.current_entry_key.truncate(reader.common_prefix_len());
                             self.current_entry_key.extend_from_slice(reader.suffix());
+                            self.next_entry_ord += 1;
                             self.entry_loaded = true;
                         }
                         Ok(false) => {
@@ -278,12 +285,13 @@ where
                 match self.current_entry_key.as_slice().cmp(target) {
                     Ordering::Equal => {
                         let value = reader.value().clone();
+                        let ord = self.next_entry_ord - 1;
                         let idx = self.input_cursor;
                         self.input_cursor += 1;
                         // Consume the matched entry; next iteration must
                         // advance the reader before comparing again.
                         self.entry_loaded = false;
-                        return Some(Ok((idx, value)));
+                        return Some(Ok((idx, ord, value)));
                     }
                     Ordering::Less => {
                         // Current entry sorts before target — advance.
@@ -300,6 +308,19 @@ where
                 }
             }
         }
+    }
+}
+
+impl<K, TSSTable> Iterator for BatchedTermInfoIter<'_, K, TSSTable>
+where
+    K: AsRef<[u8]>,
+    TSSTable: SSTable,
+{
+    type Item = io::Result<(usize, TSSTable::Value)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_with_ord()
+            .map(|res| res.map(|(idx, _ord, val)| (idx, val)))
     }
 }
 

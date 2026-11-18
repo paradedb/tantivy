@@ -10,9 +10,11 @@
 //! `term_set_gallop`'s shrinking-window cursor advance monotonically through
 //! DocId space.
 
-use columnar::Column;
+use std::ops::{Range, RangeInclusive};
 
-use crate::Order;
+use columnar::{Cardinality, Column};
+
+use crate::{DocId, Order};
 
 /// Binary search for the boundary between NULLs and non-NULLs.
 ///
@@ -226,6 +228,50 @@ where F: FnMut(&T) -> bool {
         prev = probe;
         step = step.saturating_mul(2);
     }
+}
+
+/// Computes the contiguous matching `[start_doc, end_doc)` range on a `Full` or `Optional`
+/// sorted `Column<u64>` for `value_range`, returning `None` if the column is `Multivalued`.
+pub(crate) fn sorted_doc_range_for_bounds(
+    column: &Column<u64>,
+    value_range: &RangeInclusive<u64>,
+    order: Order,
+) -> Option<Range<DocId>> {
+    let num_docs = column.num_docs();
+    if num_docs == 0 || value_range.is_empty() {
+        return Some(0..0);
+    }
+    let (non_null_start, non_null_end) = match column.get_cardinality() {
+        Cardinality::Full => (0, num_docs),
+        Cardinality::Optional => match order {
+            Order::Asc => (
+                binary_search_null_boundary(column, 0, num_docs, Order::Asc),
+                num_docs,
+            ),
+            Order::Desc => (
+                0,
+                binary_search_null_boundary(column, 0, num_docs, Order::Desc),
+            ),
+        },
+        Cardinality::Multivalued => return None,
+    };
+    if non_null_start >= non_null_end {
+        return Some(0..0);
+    }
+    let (start_target, end_target) = match order {
+        Order::Asc => (*value_range.start(), *value_range.end()),
+        Order::Desc => (*value_range.end(), *value_range.start()),
+    };
+    let start_doc = binary_search_sorted(
+        column,
+        non_null_start,
+        non_null_end,
+        start_target,
+        order,
+        false,
+    );
+    let end_doc = binary_search_sorted(column, start_doc, non_null_end, end_target, order, true);
+    Some(start_doc..end_doc)
 }
 
 #[cfg(test)]
