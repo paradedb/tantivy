@@ -329,7 +329,8 @@ fn ivf_build_emits_timings_log() -> crate::Result<()> {
         total - measured < stages.len(),
         "stages must cover total, allowing millisecond truncation: {line}"
     );
-    assert!(line.contains("train_reads="));
+    assert_eq!(field("train_sample_rows"), vectors);
+    assert_eq!(field("train_reads"), 0);
     assert_eq!(field("assign_reads"), vectors);
     assert_eq!(field("encode_reads"), vectors);
     eprintln!("IVF_BUILD_SAMPLE {line}");
