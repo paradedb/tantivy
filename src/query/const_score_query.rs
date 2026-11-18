@@ -104,7 +104,7 @@ impl Weight for ConstWeight {
 
     fn explain(&self, reader: &SegmentReader, doc: u32) -> crate::Result<Explanation> {
         let mut scorer = self.scorer(reader, 1.0)?;
-        if scorer.seek(doc) != doc {
+        if scorer.doc() > doc || scorer.seek(doc) != doc {
             return Err(TantivyError::InvalidArgument(format!(
                 "Document #({doc}) does not match"
             )));

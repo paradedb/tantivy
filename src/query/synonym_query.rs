@@ -175,6 +175,23 @@ impl SynonymWeight {
         }
         Ok(FieldNormReader::constant(segment_reader.max_doc(), 1))
     }
+
+    /// The terms that `doc` holds, each with its term frequency.
+    fn term_freqs(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Vec<(&Term, u32)>> {
+        let inverted_index = reader.inverted_index(self.terms[0].field())?;
+        let mut term_freqs = Vec::new();
+        for term in &self.terms {
+            let Some(term_info) = inverted_index.get_term_info(term)? else {
+                continue;
+            };
+            let mut postings =
+                inverted_index.read_postings_from_terminfo(&term_info, self.index_record_option)?;
+            if postings.doc() <= doc && postings.seek(doc) == doc {
+                term_freqs.push((term, postings.term_freq()));
+            }
+        }
+        Ok(term_freqs)
+    }
 }
 
 impl Weight for SynonymWeight {
@@ -212,7 +229,22 @@ impl Weight for SynonymWeight {
         }
         let fieldnorm_id = scorer.fieldnorm_id();
         let term_freq = scorer.term_freq();
-        let mut explanation = self.similarity_weight.explain(fieldnorm_id, term_freq);
+        let mut freq = Explanation::new(
+            "freq, sum of the occurrences of the terms within document",
+            term_freq as Score,
+        );
+        for (term, term_freq) in self.term_freqs(reader, doc)? {
+            freq.add_detail(Explanation::new_with_string(
+                format!("occurrences of {term:?}"),
+                term_freq as Score,
+            ));
+        }
+        let mut explanation = self.similarity_weight.explain_with_freq(
+            "SynonymQuery, product of...",
+            fieldnorm_id,
+            term_freq,
+            freq,
+        );
         explanation.add_context(format!(
             "SynonymQuery, blended term_freq across {:?}",
             self.terms
