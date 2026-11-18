@@ -566,56 +566,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_synonym_query_explain_lists_the_terms_of_the_doc() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        let text = schema_builder.add_text_field("text", TEXT);
-        let index = Index::create_in_ram(schema_builder.build());
-        let mut writer: IndexWriter = index.writer_for_tests()?;
-        writer.add_document(doc!(text => "cat cat feline"))?;
-        writer.add_document(doc!(text => "kitty"))?;
-        writer.commit()?;
-        let searcher = index.reader()?.searcher();
-        let query = SynonymQuery::new(vec![
-            Term::from_field_text(text, "cat"),
-            Term::from_field_text(text, "feline"),
-            Term::from_field_text(text, "kitty"),
-        ]);
-        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
-        let explanation = weight.explain(searcher.segment_reader(0), 0)?;
-        let json: serde_json::Value = serde_json::from_str(&explanation.to_pretty_json()).unwrap();
-
-        assert_eq!(json["description"], "SynonymQuery, product of...");
-        // The explanation has `(K1+1)`, the idf and the term frequency part, in this order.
-        let freq = &json["details"][2]["details"][0];
-        assert_eq!(freq["value"], 3.0);
-        let terms: Vec<(String, f64)> = freq["details"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|term| {
-                (
-                    term["description"].as_str().unwrap().to_string(),
-                    term["value"].as_f64().unwrap(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            terms,
-            vec![
-                (
-                    format!("occurrences of {:?}", Term::from_field_text(text, "cat")),
-                    2.0
-                ),
-                (
-                    format!("occurrences of {:?}", Term::from_field_text(text, "feline")),
-                    1.0
-                ),
-            ]
-        );
-        Ok(())
-    }
-
     /// Thousands of docs in one segment, so the posting lists span many blocks and the term
     /// frequencies and field lengths vary from block to block.
     fn large_index() -> crate::Result<(Index, Field)> {

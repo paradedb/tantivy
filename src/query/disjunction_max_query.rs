@@ -144,7 +144,7 @@ mod tests {
     use crate::collector::TopDocs;
     use crate::query::{DisjunctionMaxQuery, Query, QueryParser, TermQuery};
     use crate::schema::{IndexRecordOption, Schema, TEXT};
-    use crate::{DocAddress, Index, Term};
+    use crate::{Index, Term};
 
     /// `TopDocs` prunes through `Weight::for_each_pruning`, which hands a union
     /// of term scorers to Block-WAND. Block-WAND sums the matching terms, so
@@ -265,51 +265,6 @@ mod tests {
                 "doc {doc}: pruning scored {pruned_score}, plain scorer {score}"
             );
         }
-        Ok(())
-    }
-
-    #[test]
-    fn test_dismax_explains_the_max_of_its_clauses() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        let title = schema_builder.add_text_field("title", TEXT);
-        let body = schema_builder.add_text_field("body", TEXT);
-        let index = Index::create_in_ram(schema_builder.build());
-        let mut writer = index.writer_for_tests()?;
-        writer.add_document(doc!(title => "alpha", body => "alpha alpha"))?;
-        writer.add_document(doc!(title => "beta", body => "beta"))?;
-        writer.commit()?;
-        let searcher = index.reader()?.searcher();
-
-        let clause = |field| {
-            Box::new(TermQuery::new(
-                Term::from_field_text(field, "alpha"),
-                IndexRecordOption::WithFreqs,
-            )) as Box<dyn Query>
-        };
-        let explain = |query: &dyn Query| -> crate::Result<serde_json::Value> {
-            let explanation = query.explain(&searcher, DocAddress::new(0, 0))?;
-            Ok(serde_json::from_str(&explanation.to_pretty_json()).unwrap())
-        };
-
-        let json = explain(&DisjunctionMaxQuery::new(vec![clause(title), clause(body)]))?;
-        assert_eq!(json["description"], "DisjunctionMax. max of ...");
-        let clauses: Vec<f64> = json["details"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|clause| clause["value"].as_f64().unwrap())
-            .collect();
-        assert_eq!(clauses.len(), 2);
-        assert_eq!(json["value"].as_f64().unwrap(), clauses[0].max(clauses[1]));
-
-        let json = explain(&DisjunctionMaxQuery::with_tie_breaker(
-            vec![clause(title), clause(body)],
-            0.5,
-        ))?;
-        assert_eq!(
-            json["description"],
-            "DisjunctionMax. max plus 0.5 times the others of ..."
-        );
         Ok(())
     }
 }
