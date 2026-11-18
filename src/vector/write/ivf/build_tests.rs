@@ -615,16 +615,17 @@ struct RecordingClusterer {
 }
 
 impl IvfClusterer for RecordingClusterer {
-    fn training_sample_ratio(&self) -> f32 {
-        self.inner.training_sample_ratio()
+    fn training_sample_ratio(&self, options: &VectorOptions, num_rows: usize) -> f32 {
+        self.inner.training_sample_ratio(options, num_rows)
     }
 
     fn train(
         &self,
         options: &VectorOptions,
         source: &mut dyn VectorSource,
+        training_sample_ratio: f32,
     ) -> Result<IvfCentroids> {
-        self.inner.train(options, source)
+        self.inner.train(options, source, training_sample_ratio)
     }
 
     fn assign(
@@ -679,7 +680,7 @@ fn routed_build_preserves_documents_replicas_and_exhaustive_results() -> Result<
         let clusterer = Arc::new(RecordingClusterer {
             inner: SuperKMeansClusterer::new()
                 .with_target_leaf_size(leaf_size)
-                .with_training_sample_ratio(1.0)
+                .with_training_sample_ratio(Some(1.0))
                 .with_memory_limit(MEMORY_LIMIT_BYTES),
             exhaustive_calls: AtomicUsize::new(0),
             routed_calls: AtomicUsize::new(0),

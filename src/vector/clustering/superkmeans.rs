@@ -755,7 +755,8 @@ mod tests {
         let clusterer = SuperKMeansClusterer::new()
             .with_target_leaf_size(20)
             .with_memory_limit(batch_rows * options.bytes_per_vector());
-        let centroids = clusterer.train(&options, &mut source).unwrap();
+        let ratio = clusterer.training_sample_ratio(&options, source.num_rows());
+        let centroids = clusterer.train(&options, &mut source, ratio).unwrap();
         let IvfCentroids::F32(matrix) = &centroids;
         assert!(matrix.rows > ASSIGNMENT_CANDIDATES);
         for (i, value) in source.values.iter_mut().enumerate() {
@@ -791,7 +792,8 @@ mod tests {
             for kind in [RouterKind::Stacked, RouterKind::QuantizedStacked] {
                 let clusterer = SuperKMeansClusterer::new().with_target_leaf_size(20);
                 let mut source = VecSource::new(blobs(n, dim), dim);
-                let mut centroids = clusterer.train(&options, &mut source).unwrap();
+                let ratio = clusterer.training_sample_ratio(&options, source.num_rows());
+                let mut centroids = clusterer.train(&options, &mut source, ratio).unwrap();
                 let router = kind.build(&options, &mut centroids).unwrap();
                 let IvfCentroids::F32(matrix) = &centroids;
                 for (i, value) in source.values.iter_mut().enumerate() {
@@ -911,7 +913,8 @@ mod tests {
                 centroids: vec![vec![0.0], vec![2.0]],
                 pairs,
             };
-            let centroids = clusterer.train(&options, &mut source).unwrap();
+            let ratio = clusterer.training_sample_ratio(&options, source.num_rows());
+            let centroids = clusterer.train(&options, &mut source, ratio).unwrap();
             for lambda in [None, Some(2.0)] {
                 let assigned = clusterer
                     .assign_routed(&options, &mut source, &centroids, lambda, &|_| {
