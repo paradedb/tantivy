@@ -342,12 +342,27 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         self.num_bytes
     }
 
+    /// Returns the exact number of SSTable blocks spanned by the non-empty ordinal
+    /// range `ord_range` (`0` when `ord_range` is empty or `num_terms() == 0`).
+    pub fn num_blocks_for_ord_range(
+        &self,
+        ord_range: std::ops::Range<TermOrdinal>,
+    ) -> io::Result<u64> {
+        if ord_range.is_empty() || self.num_terms == 0 || ord_range.start >= self.num_terms {
+            return Ok(0);
+        }
+        let end_incl = (ord_range.end - 1).min(self.num_terms - 1);
+        let first_block = self.sstable_index.locate_with_ord(ord_range.start)?;
+        let last_block = self.sstable_index.locate_with_ord(end_incl)?;
+        Ok(last_block.saturating_sub(first_block) + 1)
+    }
+
     /// Decode a DeltaReader up to key, returning the number of terms traversed
     ///
     /// If the key was not found, returns Ok(None).
     /// After calling this function, it is possible to call `DeltaReader::value` to get the
     /// associated value.
-    fn decode_up_to_key<K: AsRef<[u8]>>(
+    pub(crate) fn decode_up_to_key<K: AsRef<[u8]>>(
         &self,
         key: K,
         sstable_delta_reader: &mut DeltaReader<TSSTable::ValueReader>,
@@ -633,6 +648,19 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         sorted_keys: crate::batch::SortedTermSlice<'a, K>,
     ) -> crate::batch::BatchedTermInfoIter<'a, K, TSSTable> {
         crate::batch::BatchedTermInfoIter::new(self, sorted_keys)
+    }
+
+    /// Batched exact-key ordinal lookup over a sorted input slice, decoding each
+    /// touched SSTable block at most once and yielding `(input_index, term_ord)`.
+    pub fn batch_term_ord_exact<'a, K: AsRef<[u8]>>(
+        &'a self,
+        sorted_keys: crate::batch::SortedTermSlice<'a, K>,
+    ) -> impl Iterator<Item = io::Result<(usize, TermOrdinal)>> + 'a {
+        let mut iter = crate::batch::BatchedTermInfoIter::new(self, sorted_keys);
+        std::iter::from_fn(move || {
+            iter.next_with_ord()
+                .map(|r| r.map(|(idx, ord, _)| (idx, ord)))
+        })
     }
 
     /// Lookups the value corresponding to the key.

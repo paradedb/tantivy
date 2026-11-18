@@ -67,7 +67,7 @@ pub struct RowAddr {
     pub row_id: RowId,
 }
 
-pub use sstable::{Dictionary, TermOrdHit};
+pub use sstable::{Dictionary, SortedTermSlice, TermOrdHit};
 pub type Streamer<'a> = sstable::Streamer<'a, VoidSSTable>;
 
 pub use common::DateTime;

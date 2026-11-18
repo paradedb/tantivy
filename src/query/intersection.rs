@@ -64,18 +64,34 @@ pub struct Intersection<TDocSet: DocSet, TOtherDocSet: DocSet = Box<dyn Scorer>>
 }
 
 fn go_to_first_doc<TDocSet: DocSet>(docsets: &mut [TDocSet]) -> DocId {
-    assert!(!docsets.is_empty());
-    let mut candidate = docsets.iter().map(TDocSet::doc).max().unwrap();
-    'outer: loop {
-        for docset in docsets.iter_mut() {
-            let seek_doc = docset.seek(candidate);
-            if seek_doc > candidate {
-                candidate = docset.doc();
+    let Some((first, rest)) = docsets.split_first_mut() else {
+        panic!("go_to_first_doc requires at least one docset");
+    };
+    let mut candidate = first.doc();
+    'outer: while candidate < TERMINATED {
+        candidate = first.seek(candidate);
+        if candidate == TERMINATED {
+            break;
+        }
+        for docset in rest.iter_mut() {
+            if let SeekDangerResult::SeekLowerBound(seek_lower_bound) =
+                docset.seek_danger(candidate)
+            {
+                debug_assert!(
+                    seek_lower_bound == TERMINATED || seek_lower_bound > candidate,
+                    "seek_lower_bound {seek_lower_bound} must be greater than candidate \
+                     {candidate}"
+                );
+                candidate = seek_lower_bound;
                 continue 'outer;
             }
         }
         return candidate;
     }
+    for docset in rest.iter_mut() {
+        docset.seek(TERMINATED);
+    }
+    first.seek(TERMINATED)
 }
 
 impl<TDocSet: DocSet> Intersection<TDocSet, TDocSet> {
@@ -234,6 +250,18 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOt
             }
         }
         SeekDangerResult::Found
+    }
+
+    fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
+        if start > end {
+            return true;
+        }
+        self.left.is_empty_in_range(start, end)
+            || self.right.is_empty_in_range(start, end)
+            || self
+                .others
+                .iter_mut()
+                .any(|docset| docset.is_empty_in_range(start, end))
     }
 
     #[inline]

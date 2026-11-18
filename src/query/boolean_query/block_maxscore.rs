@@ -98,12 +98,6 @@ pub(super) fn block_maxscore_filtered<F: DocSet + ?Sized>(
             term.priority = term.bound * term.inv_cost;
             end = end.min(last.saturating_add(1));
         }
-        if let Some(ref mut f) = filter {
-            if f.is_empty_in_range(start, end.saturating_sub(1)) {
-                start = end;
-                continue;
-            }
-        }
         // Low bound per posting cost goes first: these terms are candidates for deferred scoring.
         terms.sort_unstable_by(|a, b| a.priority.total_cmp(&b.priority));
         let mut bound = 0.0;
@@ -118,6 +112,12 @@ pub(super) fn block_maxscore_filtered<F: DocSet + ?Sized>(
         if weak_count == terms.len() {
             start = end;
             continue;
+        }
+        if let Some(ref mut f) = filter {
+            if f.is_empty_in_range(start, end.saturating_sub(1)) {
+                start = end;
+                continue;
+            }
         }
         // The weak prefix cannot beat the threshold alone, so every hit must match a strong term.
         let (weak, strong) = terms.split_at_mut(weak_count);
@@ -169,14 +169,16 @@ pub(super) fn block_maxscore_filtered<F: DocSet + ?Sized>(
                         let doc = base + offset as u32;
                         let score = scores[offset];
                         scores[offset] = 0.0;
+                        if score as f64 * rounding + weak_bound <= inner_threshold {
+                            continue;
+                        }
                         let in_filter = match filter {
                             Some(ref mut f) => f.seek_danger(doc) == SeekDangerResult::Found,
                             None => true,
                         };
                         if in_filter {
-                            let keep = score as f64 * rounding + weak_bound > inner_threshold;
                             matches[matches_len] = (doc, score);
-                            matches_len += keep as usize;
+                            matches_len += 1;
                         }
                     }
                 }

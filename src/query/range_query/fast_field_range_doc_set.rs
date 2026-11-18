@@ -84,12 +84,20 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> RangeDocSet<T> {
     /// Creates an iterator without finding its first matching document.
     /// The caller must seek to a match before using its current position.
     pub(crate) fn new_unpositioned(value_range: RangeInclusive<T>, column: Column<T>) -> Self {
+        let next_fetch_start = if column.num_docs() == 0
+            || *value_range.start() > column.max_value()
+            || *value_range.end() < column.min_value()
+        {
+            TERMINATED
+        } else {
+            0
+        };
         Self {
             value_range,
             column,
             candidate_cache: None,
             loaded_docs: VecCursor::new(),
-            next_fetch_start: 0,
+            next_fetch_start,
             fetch_horizon: DEFAULT_FETCH_HORIZON,
             last_seek_pos_opt: None,
         }
