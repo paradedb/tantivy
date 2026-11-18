@@ -66,7 +66,7 @@ pub(super) fn train(
     }
 
     let mut training_source =
-        MergeVectorSource::new(&merge.readers, training_rows, opts.dim(), merge.ctx.cancel);
+        MergeVectorSource::new(&merge.readers, &training_rows, opts.dim(), merge.ctx.cancel);
     let centroids = clusterer.train(opts, &mut training_source, sample_ratio)?;
     timings.train_reads += training_source.reads;
 

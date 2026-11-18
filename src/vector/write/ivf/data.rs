@@ -1,19 +1,18 @@
 //! The Data entry: metadata, then one aligned block per cluster of document ids, encoded columns
-//! and, for plain storage, the rows themselves.
+//! and, for plain storage, the rows themselves. Plain blocks read their rows from the sources as
+//! they are written; quantized blocks are written from the records the assign pass encoded.
 
 use std::io::Write;
-use std::sync::Arc;
 use std::time::Instant;
 
 use common::CountingWriter;
-use quant::cascade::{BatchEncodeWorkspace, PreparedCentroidWorkspace, QueryRotationPlan};
-use rayon::prelude::*;
 
-use super::encode::{group_decoded_bytes, EncodeSpec, EncodeWorkspace, PendingCluster};
+use super::assign::ClusterRows;
+use super::encode::encode_tile_rows;
+use super::records::{MergedRecords, RecordHeader, RecordLayout};
 use super::{AssignedVector, FieldMerge, IvfBuildTimings};
 use crate::directory::{CompositeWrite, WritePtr};
 use crate::indexer::segment_updater::CancelSentinel;
-use crate::vector::clustering::decode_row_append;
 use crate::vector::distance::maybe_normalize_bytes;
 use crate::vector::storage::blocks::{
     block_len, column_range, pad, write_metadata, BlockOffsetsWriter,
@@ -21,28 +20,21 @@ use crate::vector::storage::blocks::{
 use crate::vector::storage::header::{VectorEntry, HEADER_LEN};
 use crate::vector::storage::id_map::IdMap;
 use crate::vector::storage::metadata::{Assignment, Slot, SlotType, VectorColMetadata};
-use crate::vector::{BlockAddress, VectorElement, ENTRY_ALIGN};
-use crate::{DocId, TantivyError};
+use crate::vector::{BlockAddress, ENTRY_ALIGN};
+use crate::TantivyError;
 
 /// Writes the field's Data entry: metadata, then one aligned block per cluster of doc ids, encoded
 /// columns and, for plain storage, the rows themselves. A replica row is encoded against its own
 /// block's centroid like any row. Returns each target document's primary location.
-///
-/// A quantized field reads, normalizes and decodes a group of clusters on the calling thread,
-/// encodes the group's clusters in parallel on the rayon pool, then writes their blocks in cluster
-/// order on the calling thread. Each cluster encodes in tiles of `tile_rows` against its own
-/// prepared centroid, as a serial loop would, so every byte written is the same.
 pub(super) fn write_data_entry(
     merge: &FieldMerge,
     vec_write: &mut CompositeWrite,
-    assigned_vectors: &[AssignedVector],
-    cluster_offsets: &[u64],
-    centroid_bytes: &[u8],
+    rows: ClusterRows,
+    num_centroids: usize,
     assignment: Assignment,
     timings: &mut IvfBuildTimings,
 ) -> crate::Result<Vec<BlockAddress>> {
     let (ctx, opts, quantization) = (merge.ctx, merge.opts, merge.quantization);
-    let num_centroids = cluster_offsets.len() - 1;
 
     // IdMaps are emitted after Data so inter-entry padding never enters an id map.
     if num_centroids >= u32::MAX as usize {
@@ -74,14 +66,6 @@ pub(super) fn write_data_entry(
     let mut block_offsets = BlockOffsetsWriter::new(data.written_bytes() - entry_start);
     timings.pad_bytes += pos - 4 - meta.to_bytes().len();
     timings.data_write += write_start.elapsed();
-    let row_bytes = opts.bytes_per_vector();
-    let fixed_scratch = row_bytes + opts.dim() + opts.dim().div_ceil(64) * 8;
-    let per_row_scratch = 2 * row_bytes + quantization.map_or(0, |c| c.bytes_per_row()) + 16;
-    let tile_rows = (1usize << 20)
-        .saturating_sub(fixed_scratch)
-        .checked_div(per_row_scratch)
-        .unwrap_or(0)
-        .max(1);
     let mut blocks = BlockWriter {
         data,
         entry_start,
@@ -91,21 +75,30 @@ pub(super) fn write_data_entry(
         cancel: ctx.cancel,
         timings,
     };
-    let reads = ClusterReads {
-        merge,
-        assigned_vectors,
-        cluster_offsets,
-        doc_ids_slot,
-        tile_rows,
-    };
-    if quantization.is_some() {
-        debug_assert!(
-            !rows_streamed,
-            "quantized blocks keep their rows in ExactRows"
-        );
-        write_quantized_blocks(&reads, &mut blocks, &mut locations, centroid_bytes, &meta)?;
-    } else {
-        write_plain_blocks(&reads, &mut blocks, &mut locations, rows_streamed)?;
+    match rows {
+        ClusterRows::Addresses {
+            assigned_vectors,
+            cluster_offsets,
+        } => {
+            debug_assert_eq!(cluster_offsets.len(), num_centroids + 1);
+            let reads = ClusterReads {
+                merge,
+                assigned_vectors: &assigned_vectors,
+                cluster_offsets: &cluster_offsets,
+                doc_ids_slot,
+                tile_rows: encode_tile_rows(opts, quantization),
+            };
+            write_plain_blocks(&reads, &mut blocks, &mut locations, rows_streamed)?;
+        }
+        ClusterRows::Encoded(mut records) => {
+            debug_assert!(
+                !rows_streamed,
+                "quantized blocks keep their rows in ExactRows"
+            );
+            let write_start = Instant::now();
+            write_encoded_blocks(&mut records, &mut blocks, &mut locations, num_centroids)?;
+            blocks.timings.data_write += write_start.elapsed();
+        }
     }
     let pos = blocks.pos;
     let write_start = Instant::now();
@@ -121,7 +114,7 @@ pub(super) fn write_data_entry(
     Ok(locations)
 }
 
-/// Where the Data entry's cluster rows come from.
+/// Where a plain Data entry's cluster rows come from.
 struct ClusterReads<'a> {
     merge: &'a FieldMerge<'a>,
     assigned_vectors: &'a [AssignedVector],
@@ -275,86 +268,68 @@ fn write_plain_blocks(
     Ok(())
 }
 
-/// Quantized blocks, a group of clusters at a time. A group fills up to [`GROUP_DECODED_BYTES`] of
-/// decoded rows, so the pool has at least twice its thread count of clusters to balance whenever
-/// that many fit; a cluster larger than the cap forms a group of its own.
-fn write_quantized_blocks(
-    reads: &ClusterReads,
+/// Quantized blocks from the encoded records, in cluster order: each record appends its document
+/// to the block's DocIds column and its slot bytes to the other columns, and points a primary
+/// document's location at its row. A cluster without records has no block.
+fn write_encoded_blocks(
+    records: &mut MergedRecords,
     blocks: &mut BlockWriter,
     locations: &mut [BlockAddress],
-    centroid_bytes: &[u8],
-    meta: &VectorColMetadata,
+    num_centroids: usize,
 ) -> crate::Result<()> {
-    let merge = reads.merge;
-    let dim = merge.opts.dim();
-    let (specs, grids) = meta.runtime();
-    let plan = Arc::new(QueryRotationPlan::new(dim, &specs));
-    let spec = EncodeSpec {
-        centroid_bytes,
-        dim,
-        specs: &specs,
-        grids: &grids,
-        slots: blocks.slots,
-        tile_rows: reads.tile_rows,
-        scores_by_distance: merge.opts.metric().scores_by_distance(),
-    };
-    let row_bytes = dim * f32::SIZE_BYTES;
-    let cap = group_decoded_bytes();
-    let num_clusters = reads.cluster_offsets.len() - 1;
-    let mut group_start = 0;
-    while group_start < num_clusters {
-        // Calling thread: doc ids, locations, and each cluster's rows read, normalized and decoded.
-        let read_start = Instant::now();
-        let mut group_end = group_start;
-        let mut group_bytes = 0;
-        let mut pending = Vec::new();
-        while group_end < num_clusters {
-            let rows = reads.rows(group_end).len();
-            if group_end > group_start && group_bytes + rows * row_bytes > cap {
-                break;
+    /// Records merged between cancellation polls.
+    const POLL_RECORDS: u32 = 1 << 16;
+    let layout = RecordLayout::new(blocks.slots);
+    let mut bufs: Vec<Vec<u8>> = blocks.slots.iter().map(|_| Vec::new()).collect();
+    // Clusters below `next_cluster` have their block or empty entry; `open` is the cluster being
+    // filled and its block's start.
+    let mut next_cluster = 0usize;
+    let mut open: Option<(usize, usize)> = None;
+    let mut rows = 0u32;
+    while let Some(record) = records.next_record()? {
+        let RecordHeader {
+            cluster,
+            doc,
+            primary,
+        } = RecordHeader::read(record);
+        let cluster = cluster as usize;
+        if open.map(|(open, _)| open) != Some(cluster) {
+            if let Some((open, block_start)) = open.take() {
+                blocks.finish_block(block_start, rows as usize, 0, &mut bufs)?;
+                next_cluster = open + 1;
             }
-            group_bytes += rows * row_bytes;
-            let mut cluster = PendingCluster {
-                cluster: group_end,
-                rows,
-                values: Vec::with_capacity(rows * dim),
-                bufs: blocks.slots.iter().map(|_| Vec::new()).collect(),
-            };
-            let mut doc_ids = Vec::with_capacity(rows * std::mem::size_of::<DocId>());
-            reads.read(group_end, &mut doc_ids, locations, blocks.timings, |row| {
-                decode_row_append::<f32>(row, dim, &mut cluster.values)
-            })?;
-            cluster.bufs[reads.doc_ids_slot] = doc_ids;
-            pending.push(cluster);
-            group_end += 1;
-        }
-        blocks.timings.encode_read += read_start.elapsed();
-
-        // Pool: one prepared-centroid and batch-encode workspace per thread.
-        let encode_start = Instant::now();
-        pending.par_iter_mut().try_for_each_init(
-            || EncodeWorkspace {
-                centroid: Vec::with_capacity(dim),
-                prepared: PreparedCentroidWorkspace::new(Arc::clone(&plan)),
-                batch: BatchEncodeWorkspace::with_capacity(dim, reads.tile_rows, &specs),
-            },
-            |workspace, cluster| cluster.encode(&spec, workspace),
-        )?;
-        blocks.timings.encode += encode_start.elapsed();
-
-        // Calling thread: pad, flush the columns and record each block, in cluster order.
-        let write_start = Instant::now();
-        for mut cluster in pending {
-            if cluster.rows == 0 {
+            assert!(
+                cluster >= next_cluster && cluster < num_centroids,
+                "encoded records out of cluster order"
+            );
+            while next_cluster < cluster {
                 blocks.empty();
-                continue;
+                next_cluster += 1;
             }
             let block_start = blocks.pos;
             assert_eq!(blocks.written(), block_start as u64);
-            blocks.finish_block(block_start, cluster.rows, 0, &mut cluster.bufs)?;
+            open = Some((cluster, block_start));
+            rows = 0;
         }
-        blocks.timings.data_write += write_start.elapsed();
-        group_start = group_end;
+        bufs[layout.doc_ids_slot].extend_from_slice(&doc.to_le_bytes());
+        for &(slot, offset, stride) in &layout.fields {
+            bufs[slot].extend_from_slice(&record[offset..offset + stride]);
+        }
+        if primary {
+            locations[doc as usize] = BlockAddress::new(cluster as u32, rows);
+        }
+        rows += 1;
+        if rows % POLL_RECORDS == 0 && blocks.cancel.wants_cancel() {
+            return Err(TantivyError::Cancelled);
+        }
+    }
+    if let Some((open, block_start)) = open {
+        blocks.finish_block(block_start, rows as usize, 0, &mut bufs)?;
+        next_cluster = open + 1;
+    }
+    while next_cluster < num_centroids {
+        blocks.empty();
+        next_cluster += 1;
     }
     Ok(())
 }
