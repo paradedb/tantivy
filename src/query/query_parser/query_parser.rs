@@ -615,6 +615,8 @@ impl QueryParser {
                 field,
                 json_path,
                 phrase,
+                slop,
+                prefix,
                 &self.tokenizer_manager,
                 json_options,
             ),
@@ -1015,11 +1017,14 @@ fn generate_literals_for_str(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate_literals_for_json_object(
     field_name: &str,
     field: Field,
     json_path: &str,
     phrase: &str,
+    slop: u32,
+    prefix: bool,
     tokenizer_manager: &TokenizerManager,
     json_options: &JsonObjectOptions,
 ) -> Result<Vec<LogicalLiteral>, QueryParserError> {
@@ -1056,6 +1061,12 @@ fn generate_literals_for_json_object(
     });
 
     if positions_and_terms.len() <= 1 {
+        if prefix {
+            return Err(QueryParserError::PhrasePrefixRequiresAtLeastTwoTerms {
+                phrase: phrase.to_owned(),
+                tokenizer: text_options.tokenizer().to_owned(),
+            });
+        }
         for (_, term) in positions_and_terms {
             logical_literals.push(LogicalLiteral::Term(term));
         }
@@ -1068,8 +1079,8 @@ fn generate_literals_for_json_object(
     }
     logical_literals.push(LogicalLiteral::Phrase {
         terms: positions_and_terms,
-        slop: 0,
-        prefix: false,
+        slop,
+        prefix,
     });
     Ok(logical_literals)
 }
@@ -1979,6 +1990,29 @@ mod test {
             err,
             QueryParserError::PhrasePrefixRequiresAtLeastTwoTerms {
                 phrase: "".to_owned(),
+                tokenizer: "default".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    pub fn test_json_phrase_slop_and_prefix() {
+        test_parse_query_to_logical_ast_helper(
+            "json.titi:\"a b\"~2",
+            r#""[(0, Term(field=14, type=Json, path=titi, type=Str, "a")), (1, Term(field=14, type=Json, path=titi, type=Str, "b"))]"~2"#,
+            false,
+        );
+        test_parse_query_to_logical_ast_helper(
+            "json.titi:\"big wo\"*",
+            r#""[(0, Term(field=14, type=Json, path=titi, type=Str, "big")), (1, Term(field=14, type=Json, path=titi, type=Str, "wo"))]"*"#,
+            false,
+        );
+
+        let err = parse_query_to_logical_ast("json.titi:\"wo\"*", true).unwrap_err();
+        assert_eq!(
+            err,
+            QueryParserError::PhrasePrefixRequiresAtLeastTwoTerms {
+                phrase: "wo".to_owned(),
                 tokenizer: "default".to_owned()
             }
         );
