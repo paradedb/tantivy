@@ -3,7 +3,6 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use rayon::prelude::*;
 use superkmeans::{
     Dataset, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, Matrix, SoarAssigner,
 };
@@ -458,6 +457,7 @@ impl IvfClusterer for SuperKMeansClusterer {
         let IvfCentroids::F32(matrix) = centroids;
         let mut pairs = Vec::with_capacity(source.num_rows());
         let batch_rows = self.budget_rows(options);
+        let mut residual = vec![0.0; options.dim()];
         for start in (0..source.num_rows()).step_by(batch_rows) {
             if source.wants_cancel() {
                 return Err(TantivyError::Cancelled);
@@ -465,18 +465,16 @@ impl IvfClusterer for SuperKMeansClusterer {
             let end = start.saturating_add(batch_rows).min(source.num_rows());
             let IvfTrainingVectors::F32(batch) = source.read_range(start..end)?;
             let batch = checked_matrix(batch.matrix, end - start, options.dim())?;
-            let assigned: Result<Vec<_>> = batch
-                .values
-                .par_chunks_exact(options.dim())
-                .map_init(
-                    || vec![0.0; options.dim()],
-                    |residual, vector| {
-                        let mut candidates = candidates(vector)?;
-                        assign_candidates(vector, matrix, &mut candidates, lambda, residual)
-                    },
-                )
-                .collect();
-            pairs.extend(assigned?);
+            for vector in batch.values.chunks_exact(options.dim()) {
+                let mut candidates = candidates(vector)?;
+                pairs.push(assign_candidates(
+                    vector,
+                    matrix,
+                    &mut candidates,
+                    lambda,
+                    &mut residual,
+                )?);
+            }
         }
         Ok(pairs)
     }
@@ -560,17 +558,23 @@ impl BatchAssigner<'_> {
                     .map(|(first, second)| (first, (second != u32::MAX).then_some(second)))
                     .collect())
             }
-            BatchAssigner::Routed { candidates, lambda } => batch
-                .values
-                .par_chunks_exact(batch.dims)
-                .map_init(
-                    || vec![0.0; batch.dims],
-                    |residual, vector| {
+            BatchAssigner::Routed { candidates, lambda } => {
+                let mut residual = vec![0.0; batch.dims];
+                batch
+                    .values
+                    .chunks_exact(batch.dims)
+                    .map(|vector| {
                         let mut candidates = candidates(vector)?;
-                        assign_candidates(vector, centroids, &mut candidates, *lambda, residual)
-                    },
-                )
-                .collect(),
+                        assign_candidates(
+                            vector,
+                            centroids,
+                            &mut candidates,
+                            *lambda,
+                            &mut residual,
+                        )
+                    })
+                    .collect()
+            }
         }
     }
 }

@@ -11,7 +11,6 @@ use quant::cascade::{
     PreparedCentroidWorkspace, QueryRotationPlan,
 };
 use quant::model::Grid;
-use rayon::prelude::*;
 
 use super::records::{MergedRecords, RecordHeader, RecordLayout, RecordRuns, RECORD_SORT_BYTES};
 use super::FieldMerge;
@@ -256,14 +255,14 @@ impl<'a> RowEncoder<'a> {
         self.values.resize(self.copies.len() * spec.dim, 0.0);
         let groups = cluster_groups(&self.copies, &mut self.values, records, spec);
         let vectors = &batch.vectors.values[..];
-        groups.into_par_iter().try_for_each_init(
-            || EncodeWorkspace {
-                centroid: Vec::with_capacity(spec.dim),
-                prepared: PreparedCentroidWorkspace::new(Arc::clone(&spec.plan)),
-                batch: BatchEncodeWorkspace::with_capacity(spec.dim, spec.tile_rows, &spec.specs),
-            },
-            |workspace, group| group.encode(spec, vectors, docs, workspace),
-        )?;
+        let mut workspace = EncodeWorkspace {
+            centroid: Vec::with_capacity(spec.dim),
+            prepared: PreparedCentroidWorkspace::new(Arc::clone(&spec.plan)),
+            batch: BatchEncodeWorkspace::with_capacity(spec.dim, spec.tile_rows, &spec.specs),
+        };
+        for group in groups {
+            group.encode(spec, vectors, docs, &mut workspace)?;
+        }
         self.encode += encode_start.elapsed();
         Ok(())
     }
