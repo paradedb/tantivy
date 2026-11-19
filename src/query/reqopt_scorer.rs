@@ -61,6 +61,11 @@ where
         self.req_scorer.seek_danger(target)
     }
 
+    fn seek_danger_batch(&mut self, docs: &[DocId], mask: &mut [common::TinySet]) -> DocId {
+        self.score_cache = None;
+        self.req_scorer.seek_danger_batch(docs, mask)
+    }
+
     fn doc(&self) -> DocId {
         self.req_scorer.doc()
     }

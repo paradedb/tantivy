@@ -2,17 +2,17 @@
 
 use std::sync::Arc;
 
-use common::BitSet;
+use common::{BitSet, TinySet};
 use itertools::Either;
 
-use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
+use crate::docset::{fill_all_candidates_mask, COLLECT_BLOCK_BUFFER_LEN};
 use crate::fastfield::AliveBitSet;
 use crate::query::{for_each_docset_buffered, AllScorer, ExcludedDocSet, ExclusionSet, Weight};
 use crate::schema::Field;
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::enter_vector_stage;
 use crate::vector::{BlockAddress, Candidate, VectorSegment, VectorStage};
-use crate::{DocId, Result, SegmentReader, TantivyError};
+use crate::{DocId, Result, SegmentReader, TantivyError, TERMINATED};
 
 /// Minimum estimated matches for deferring a fast-field filter. Keep the strategy independent
 /// of the probe ceiling so increasing recall does not switch access paths mid-sweep.
@@ -240,12 +240,41 @@ impl VectorFilterStrategy {
             return Ok(());
         }
         candidates.sort_unstable_by_key(|&(doc, _)| doc);
-        let mut scorer = ExcludedDocSet::new(weight.scorer_for_candidates_unpositioned(
-            segment,
-            1.0,
-            candidates.len() as u32,
-        )?);
-        candidates.retain(|&(doc, _)| scorer.contains(doc));
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let mut scorer =
+            weight.scorer_for_candidates_unpositioned(segment, 1.0, candidates.len() as u32)?;
+        let lower_bound = scorer.doc();
+        if lower_bound == TERMINATED {
+            candidates.clear();
+            return Ok(());
+        }
+        let mut unique_docs: Vec<DocId> = Vec::with_capacity(candidates.len());
+        for &(doc, _) in candidates.iter() {
+            if doc >= lower_bound && unique_docs.last().copied() != Some(doc) {
+                unique_docs.push(doc);
+            }
+        }
+        if unique_docs.is_empty() {
+            candidates.clear();
+            return Ok(());
+        }
+        let words = unique_docs.len().div_ceil(64);
+        let mut mask = vec![TinySet::EMPTY; words];
+        fill_all_candidates_mask(unique_docs.len(), &mut mask);
+        scorer.seek_danger_batch(&unique_docs, &mut mask);
+        let mut uniq_idx = 0usize;
+        candidates.retain(|&(doc, _)| {
+            if doc < lower_bound {
+                return false;
+            }
+            while unique_docs[uniq_idx] < doc {
+                uniq_idx += 1;
+            }
+            debug_assert_eq!(unique_docs[uniq_idx], doc);
+            mask[uniq_idx / 64].contains((uniq_idx % 64) as u32)
+        });
         Ok(())
     }
 
@@ -366,20 +395,70 @@ impl VectorFilterStrategy {
             }
             drop(scratch);
             let candidate_count = docs.len();
-            let mut scorer = ExcludedDocSet::new(weight.scorer_for_candidates_unpositioned(
-                segment,
-                1.0,
-                candidate_count as u32,
-            )?);
+            let mut scorer =
+                weight.scorer_for_candidates_unpositioned(segment, 1.0, candidate_count as u32)?;
+            let mut lower_bound = scorer.doc();
+            if lower_bound == TERMINATED {
+                docs = BitSet::with_max_value(segment.max_doc());
+                return Ok(DocFilter::Docs(Arc::new(docs)));
+            }
+            const POST_CLUSTER_BATCH_SIZE: usize = 512;
+            let mut batch: Vec<DocId> = Vec::with_capacity(POST_CLUSTER_BATCH_SIZE);
+            let mut mask = [TinySet::EMPTY; POST_CLUSTER_BATCH_SIZE / 64];
+            let flush_batch = |batch: &mut Vec<DocId>,
+                               mask: &mut [TinySet],
+                               scorer: &mut dyn crate::DocSet,
+                               docs: &mut BitSet,
+                               lower_bound: &mut DocId| {
+                let words = batch.len().div_ceil(64);
+                fill_all_candidates_mask(batch.len(), &mut mask[..words]);
+                let next_bound = scorer.seek_danger_batch(batch, &mut mask[..words]);
+                for (i, &d) in batch.iter().enumerate() {
+                    if !mask[i / 64].contains((i % 64) as u32) {
+                        docs.remove(d);
+                    }
+                }
+                batch.clear();
+                *lower_bound = (*lower_bound).max(next_bound);
+            };
             let mut bucket = docs.first_non_empty_bucket(0);
             while let Some(current_bucket) = bucket {
+                let bucket_start = current_bucket * u64::BITS;
+                let bucket_end = bucket_start + u64::BITS;
+                if bucket_end <= lower_bound {
+                    for bit in docs.tinyset(current_bucket) {
+                        docs.remove(bucket_start + bit);
+                    }
+                    bucket = docs.first_non_empty_bucket(current_bucket + 1);
+                    continue;
+                }
                 for bit in docs.tinyset(current_bucket) {
-                    let doc = current_bucket * u64::BITS + bit;
-                    if !scorer.contains(doc) {
+                    let doc = bucket_start + bit;
+                    if doc < lower_bound {
                         docs.remove(doc);
+                        continue;
+                    }
+                    batch.push(doc);
+                    if batch.len() == POST_CLUSTER_BATCH_SIZE {
+                        flush_batch(
+                            &mut batch,
+                            &mut mask,
+                            scorer.as_mut(),
+                            &mut docs,
+                            &mut lower_bound,
+                        );
                     }
                 }
                 bucket = docs.first_non_empty_bucket(current_bucket + 1);
+            }
+            if !batch.is_empty() {
+                flush_batch(
+                    &mut batch,
+                    &mut mask,
+                    scorer.as_mut(),
+                    &mut docs,
+                    &mut lower_bound,
+                );
             }
         }
         Ok(DocFilter::Docs(Arc::new(docs)))

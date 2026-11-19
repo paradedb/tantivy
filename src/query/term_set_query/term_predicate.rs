@@ -402,6 +402,28 @@ impl DictKeyProbe {
         }
     }
 
+    fn matches_batch(&self, data: &[u8], offsets: &[u32], out: &mut Vec<TinySet>) {
+        let count = offsets.len().saturating_sub(1);
+        prepare_tinyset_buf(out, count);
+        if count == 0 {
+            return;
+        }
+        match self {
+            DictKeyProbe::SortedTerms(terms) => {
+                for i in 0..count {
+                    let key = &data[offsets[i] as usize..offsets[i + 1] as usize];
+                    if terms.binary_search_by(|k| k.as_slice().cmp(key)).is_ok() {
+                        out[i / 64].insert_mut((i % 64) as u32);
+                    }
+                }
+            }
+            DictKeyProbe::Predicate(pred) => {
+                pred.filter_bytes(data, offsets, out)
+                    .expect("predicate evaluation should succeed");
+            }
+        }
+    }
+
     fn resolve_all(&self, bytes_col: &BytesColumn, ord_range: Range<u64>) -> BitSet {
         match self {
             DictKeyProbe::SortedTerms(terms) => {
@@ -576,6 +598,125 @@ impl DocSet for CachedDictPredicateDocSet {
         }
     }
 
+    fn seek_danger_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) -> DocId {
+        if docs.is_empty() {
+            return 0;
+        }
+        let words = docs.len().div_ceil(64);
+        debug_assert!(mask.len() >= words);
+        let max_doc = self.bytes_col.num_rows();
+        let last = *docs.last().unwrap();
+        let next_bound = if last.saturating_add(1) >= max_doc {
+            TERMINATED
+        } else {
+            last.saturating_add(1).min(TERMINATED)
+        };
+        self.positioned = false;
+
+        if matches!(self.mode, DictLookupMode::FullyPopulated) && self.matched_ords.len() == 0 {
+            mask[..words].fill(TinySet::EMPTY);
+            return TERMINATED;
+        }
+
+        if let DictLookupMode::PointWithFallback { remaining_lookups } = self.mode {
+            let mut uncached_ords: Vec<u32> = Vec::new();
+            let mut promoted = false;
+            'collect: for (word_idx, &word) in mask[..words].iter().enumerate() {
+                if word.is_empty() {
+                    continue;
+                }
+                let base = word_idx * 64;
+                for bit in word {
+                    let doc = docs[base + bit as usize];
+                    if doc >= max_doc {
+                        break 'collect;
+                    }
+                    for ord in self.bytes_col.ords().values_for_doc(doc) {
+                        if !self.ord_range.contains(&ord) {
+                            continue;
+                        }
+                        let Ok(ord_u32) = u32::try_from(ord) else {
+                            continue;
+                        };
+                        if !self.tested_ords.contains(ord_u32) {
+                            if uncached_ords.len() >= remaining_lookups {
+                                promoted = true;
+                                break 'collect;
+                            }
+                            self.tested_ords.insert(ord_u32);
+                            uncached_ords.push(ord_u32);
+                        }
+                    }
+                }
+            }
+            if promoted {
+                self.populate_all();
+            } else if !uncached_ords.is_empty() {
+                if let DictLookupMode::PointWithFallback {
+                    ref mut remaining_lookups,
+                } = self.mode
+                {
+                    *remaining_lookups = remaining_lookups.saturating_sub(uncached_ords.len());
+                }
+                let mut data = Vec::new();
+                let mut offsets = Vec::with_capacity(uncached_ords.len() + 1);
+                offsets.push(0u32);
+                let mut valid_ords = Vec::with_capacity(uncached_ords.len());
+                for ord_u32 in uncached_ords {
+                    let start = data.len();
+                    let found = self
+                        .bytes_col
+                        .ord_to_bytes(u64::from(ord_u32), &mut data)
+                        .expect("dictionary ordinal lookup should succeed");
+                    if found {
+                        offsets.push(data.len() as u32);
+                        valid_ords.push(ord_u32);
+                    } else {
+                        data.truncate(start);
+                    }
+                }
+                let mut batch_out = Vec::new();
+                self.probe.matches_batch(&data, &offsets, &mut batch_out);
+                let matched_ords = &mut self.matched_ords;
+                let _ = try_for_each_set_bit(&batch_out, valid_ords.len(), |idx| {
+                    matched_ords.insert(valid_ords[idx]);
+                    Ok(())
+                });
+            }
+        }
+
+        if matches!(self.mode, DictLookupMode::FullyPopulated) && self.matched_ords.len() == 0 {
+            mask[..words].fill(TinySet::EMPTY);
+            return TERMINATED;
+        }
+
+        let ords = self.bytes_col.ords();
+        for (word_idx, word) in mask[..words].iter_mut().enumerate() {
+            if word.is_empty() {
+                continue;
+            }
+            let base = word_idx * 64;
+            let mut keep = TinySet::EMPTY;
+            for bit in *word {
+                let doc = docs[base + bit as usize];
+                if doc >= max_doc {
+                    break;
+                }
+                let matched = ords.values_for_doc(doc).any(|ord| {
+                    self.ord_range.contains(&ord)
+                        && u32::try_from(ord).is_ok_and(|o| {
+                            o < self.matched_ords.max_value() && self.matched_ords.contains(o)
+                        })
+                });
+                if matched {
+                    keep.insert_mut(bit);
+                }
+            }
+            *word = keep;
+        }
+        next_bound
+    }
+
     fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
         start > end || start >= self.bytes_col.num_rows()
     }
@@ -618,7 +759,7 @@ pub(crate) struct PredicateColumnDocSet {
     scratch_doc_ids: Vec<DocId>,
     scratch_opt_vals: Vec<Option<u64>>,
     scratch_vals: Vec<u64>,
-    scratch_val_docs: Vec<u16>,
+    scratch_val_docs: Vec<u32>,
     scratch_out: Vec<TinySet>,
     doc_id: DocId,
     positioned: bool,
@@ -710,7 +851,7 @@ impl PredicateColumnDocSet {
                     let v = self.scratch_vals[offset];
                     if self.value_range.contains(&v) {
                         self.scratch_vals[compact_len] = v;
-                        self.scratch_val_docs.push(offset as u16);
+                        self.scratch_val_docs.push(offset as u32);
                         compact_len += 1;
                     }
                 }
@@ -728,7 +869,7 @@ impl PredicateColumnDocSet {
                     if let Some(v) = maybe_val {
                         if self.value_range.contains(&v) {
                             self.scratch_vals.push(v);
-                            self.scratch_val_docs.push(offset as u16);
+                            self.scratch_val_docs.push(offset as u32);
                         }
                     }
                 }
@@ -740,7 +881,7 @@ impl PredicateColumnDocSet {
                     for v in self.column.values_for_doc(base + offset as u32) {
                         if self.value_range.contains(&v) {
                             self.scratch_vals.push(v);
-                            self.scratch_val_docs.push(offset as u16);
+                            self.scratch_val_docs.push(offset as u32);
                         }
                     }
                 }
@@ -757,7 +898,7 @@ impl PredicateColumnDocSet {
         let val_docs = &self.scratch_val_docs;
         let window_mask = &mut self.window_mask;
         let _ = try_for_each_set_bit(&self.scratch_out, val_docs.len(), |idx| {
-            let doc_offset = val_docs[idx] as u32;
+            let doc_offset = val_docs[idx];
             window_mask[(doc_offset / 64) as usize].insert_mut(doc_offset % 64);
             Ok(())
         });
@@ -916,6 +1057,212 @@ impl DocSet for PredicateColumnDocSet {
         }
     }
 
+    fn seek_danger_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) -> DocId {
+        if docs.is_empty() {
+            return 0;
+        }
+        let words = docs.len().div_ceil(64);
+        debug_assert!(mask.len() >= words);
+        let first = docs[0];
+        let last = *docs.last().unwrap();
+        let next_bound =
+            if self.doc_bounds.is_empty() || last.saturating_add(1) >= self.doc_bounds.end {
+                TERMINATED
+            } else if last.saturating_add(1) < self.doc_bounds.start {
+                self.doc_bounds.start
+            } else {
+                last.saturating_add(1).min(TERMINATED)
+            };
+        self.positioned = false;
+
+        if self.doc_bounds.is_empty()
+            || last < self.doc_bounds.start
+            || first >= self.doc_bounds.end
+        {
+            mask[..words].fill(TinySet::EMPTY);
+            return next_bound;
+        }
+
+        let active_count: usize = mask[..words].iter().map(|w| w.len() as usize).sum();
+        if active_count == 0 {
+            return next_bound;
+        }
+
+        let all_active_and_in_bounds = active_count == docs.len()
+            && first >= self.doc_bounds.start
+            && last < self.doc_bounds.end;
+        let unconstrained = *self.value_range.start() <= self.column.min_value()
+            && *self.value_range.end() >= self.column.max_value();
+
+        match self.column.get_cardinality() {
+            Cardinality::Full if all_active_and_in_bounds && unconstrained => {
+                self.scratch_vals.resize(docs.len(), 0);
+                if last - first + 1 == docs.len() as u32 {
+                    self.column
+                        .values
+                        .get_range(u64::from(first), &mut self.scratch_vals);
+                } else {
+                    self.column.values.get_vals(docs, &mut self.scratch_vals);
+                }
+                mask[..words].fill(TinySet::EMPTY);
+                self.predicate
+                    .filter_monotonic_u64s(self.col_type, &self.scratch_vals, &mut mask[..words])
+                    .expect("numeric predicate evaluation should succeed");
+                return next_bound;
+            }
+            Cardinality::Full if all_active_and_in_bounds => {
+                self.scratch_vals.resize(docs.len(), 0);
+                if last - first + 1 == docs.len() as u32 {
+                    self.column
+                        .values
+                        .get_range(u64::from(first), &mut self.scratch_vals);
+                } else {
+                    self.column.values.get_vals(docs, &mut self.scratch_vals);
+                }
+                self.scratch_val_docs.clear();
+                let mut compact = 0usize;
+                for pos in 0..docs.len() {
+                    let v = self.scratch_vals[pos];
+                    if self.value_range.contains(&v) {
+                        self.scratch_vals[compact] = v;
+                        self.scratch_val_docs.push(pos as u32);
+                        compact += 1;
+                    }
+                }
+                self.scratch_vals.truncate(compact);
+            }
+            Cardinality::Full => {
+                self.scratch_doc_ids.clear();
+                self.scratch_val_docs.clear();
+                for (word_idx, &word) in mask[..words].iter().enumerate() {
+                    if word.is_empty() {
+                        continue;
+                    }
+                    let base = word_idx * 64;
+                    for bit in word {
+                        let pos = base + bit as usize;
+                        let doc = docs[pos];
+                        if doc >= self.doc_bounds.start && doc < self.doc_bounds.end {
+                            self.scratch_doc_ids.push(doc);
+                            self.scratch_val_docs.push(pos as u32);
+                        }
+                    }
+                }
+                if self.scratch_doc_ids.is_empty() {
+                    mask[..words].fill(TinySet::EMPTY);
+                    return next_bound;
+                }
+                self.scratch_vals.resize(self.scratch_doc_ids.len(), 0);
+                self.column
+                    .values
+                    .get_vals(&self.scratch_doc_ids, &mut self.scratch_vals);
+                if !unconstrained {
+                    let mut compact = 0usize;
+                    for idx in 0..self.scratch_vals.len() {
+                        let v = self.scratch_vals[idx];
+                        if self.value_range.contains(&v) {
+                            self.scratch_vals[compact] = v;
+                            self.scratch_val_docs[compact] = self.scratch_val_docs[idx];
+                            compact += 1;
+                        }
+                    }
+                    self.scratch_vals.truncate(compact);
+                    self.scratch_val_docs.truncate(compact);
+                }
+            }
+            Cardinality::Optional if all_active_and_in_bounds => {
+                self.scratch_opt_vals.resize(docs.len(), None);
+                self.column.first_vals(docs, &mut self.scratch_opt_vals);
+                self.scratch_vals.clear();
+                self.scratch_val_docs.clear();
+                for (pos, maybe_val) in self.scratch_opt_vals.iter().copied().enumerate() {
+                    if let Some(v) = maybe_val {
+                        if self.value_range.contains(&v) {
+                            self.scratch_vals.push(v);
+                            self.scratch_val_docs.push(pos as u32);
+                        }
+                    }
+                }
+            }
+            Cardinality::Optional => {
+                self.scratch_doc_ids.clear();
+                self.scratch_val_docs.clear();
+                for (word_idx, &word) in mask[..words].iter().enumerate() {
+                    if word.is_empty() {
+                        continue;
+                    }
+                    let base = word_idx * 64;
+                    for bit in word {
+                        let pos = base + bit as usize;
+                        let doc = docs[pos];
+                        if doc >= self.doc_bounds.start && doc < self.doc_bounds.end {
+                            self.scratch_doc_ids.push(doc);
+                            self.scratch_val_docs.push(pos as u32);
+                        }
+                    }
+                }
+                if self.scratch_doc_ids.is_empty() {
+                    mask[..words].fill(TinySet::EMPTY);
+                    return next_bound;
+                }
+                self.scratch_opt_vals
+                    .resize(self.scratch_doc_ids.len(), None);
+                self.column
+                    .first_vals(&self.scratch_doc_ids, &mut self.scratch_opt_vals);
+                self.scratch_vals.clear();
+                let mut compact = 0usize;
+                for (idx, maybe_val) in self.scratch_opt_vals.iter().copied().enumerate() {
+                    if let Some(v) = maybe_val {
+                        if self.value_range.contains(&v) {
+                            self.scratch_vals.push(v);
+                            self.scratch_val_docs[compact] = self.scratch_val_docs[idx];
+                            compact += 1;
+                        }
+                    }
+                }
+                self.scratch_val_docs.truncate(compact);
+            }
+            Cardinality::Multivalued => {
+                self.scratch_vals.clear();
+                self.scratch_val_docs.clear();
+                for (word_idx, &word) in mask[..words].iter().enumerate() {
+                    if word.is_empty() {
+                        continue;
+                    }
+                    let base = word_idx * 64;
+                    for bit in word {
+                        let pos = base + bit as usize;
+                        let doc = docs[pos];
+                        if doc >= self.doc_bounds.start && doc < self.doc_bounds.end {
+                            for v in self.column.values_for_doc(doc) {
+                                if self.value_range.contains(&v) {
+                                    self.scratch_vals.push(v);
+                                    self.scratch_val_docs.push(pos as u32);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        mask[..words].fill(TinySet::EMPTY);
+        if self.scratch_vals.is_empty() {
+            return next_bound;
+        }
+        prepare_tinyset_buf(&mut self.scratch_out, self.scratch_vals.len());
+        self.predicate
+            .filter_monotonic_u64s(self.col_type, &self.scratch_vals, &mut self.scratch_out)
+            .expect("numeric predicate evaluation should succeed");
+        let val_docs = &self.scratch_val_docs;
+        let _ = try_for_each_set_bit(&self.scratch_out, val_docs.len(), |idx| {
+            let pos = val_docs[idx];
+            mask[(pos / 64) as usize].insert_mut(pos % 64);
+            Ok(())
+        });
+        next_bound
+    }
+
     fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
         if start > end || start >= self.doc_bounds.end || end < self.doc_bounds.start {
             return true;
@@ -980,6 +1327,7 @@ mod tests {
     struct SetPredicate {
         bytes_set: FxHashSet<Vec<u8>>,
         i64_set: FxHashSet<i64>,
+        bytes_calls: AtomicUsize,
         bytes_items: AtomicUsize,
         u64_telemetry: EvalTelemetry,
     }
@@ -989,6 +1337,7 @@ mod tests {
             Self {
                 bytes_set: items.into_iter().map(|s| s.as_bytes().to_vec()).collect(),
                 i64_set: FxHashSet::default(),
+                bytes_calls: AtomicUsize::new(0),
                 bytes_items: AtomicUsize::new(0),
                 u64_telemetry: EvalTelemetry::default(),
             }
@@ -998,6 +1347,7 @@ mod tests {
             Self {
                 bytes_set: FxHashSet::default(),
                 i64_set: items.into_iter().collect(),
+                bytes_calls: AtomicUsize::new(0),
                 bytes_items: AtomicUsize::new(0),
                 u64_telemetry: EvalTelemetry::default(),
             }
@@ -1012,6 +1362,7 @@ mod tests {
             out: &mut [TinySet],
         ) -> crate::Result<()> {
             let count = offsets.len().saturating_sub(1);
+            self.bytes_calls.fetch_add(1, Ordering::Relaxed);
             self.bytes_items.fetch_add(count, Ordering::Relaxed);
             for i in 0..count {
                 let slice = &data[offsets[i] as usize..offsets[i + 1] as usize];
@@ -1308,6 +1659,457 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn batch_probing_telemetry_and_semantics() -> crate::Result<()> {
+        use crate::query::Query;
+        use crate::TERMINATED;
+
+        let mut sb = SchemaBuilder::new();
+        let body = sb.add_text_field("body", TEXT);
+        let full_col = sb.add_i64_field(
+            "full_col",
+            NumericOptions::default().set_fast().set_indexed(),
+        );
+        let opt_col = sb.add_i64_field(
+            "opt_col",
+            NumericOptions::default().set_fast().set_indexed(),
+        );
+        let multi_col = sb.add_i64_field(
+            "multi_col",
+            NumericOptions::default().set_fast().set_indexed(),
+        );
+        let sorted_owner = sb.add_i64_field(
+            "sorted_owner",
+            NumericOptions::default().set_fast().set_indexed(),
+        );
+        let str_col = sb.add_text_field("str_col", FAST);
+        let index = Index::builder()
+            .schema(sb.build())
+            .settings(IndexSettings {
+                sort_by_field: Some(IndexSortByField {
+                    field: "sorted_owner".to_string(),
+                    order: Order::Asc,
+                }),
+                ..Default::default()
+            })
+            .create_in_ram()?;
+        {
+            let mut w = index.writer_for_tests()?;
+            for i in 0..8_192i64 {
+                let mut d = crate::TantivyDocument::new();
+                let mut tokens = Vec::new();
+                let tf = (i % 4) + 1;
+                if i % 40 == 0 {
+                    for _ in 0..tf {
+                        tokens.push("stride40");
+                    }
+                }
+                if i % 3 == 0 {
+                    for _ in 0..tf {
+                        tokens.push("hit1");
+                    }
+                }
+                if i % 5 == 0 {
+                    for _ in 0..((i / 3) % 4 + 1) {
+                        tokens.push("hit2");
+                    }
+                }
+                if i % 7 == 0 {
+                    for _ in 0..((i / 5) % 4 + 1) {
+                        tokens.push("hit3");
+                    }
+                }
+                if tokens.is_empty() {
+                    tokens.push("filler");
+                }
+                d.add_text(body, &tokens.join(" "));
+                d.add_i64(full_col, i);
+                if i % 3 != 0 {
+                    d.add_i64(opt_col, i);
+                }
+                match i % 4 {
+                    0 | 2 => {
+                        d.add_i64(multi_col, i);
+                        d.add_i64(multi_col, i + 10_000);
+                    }
+                    1 => d.add_i64(multi_col, i),
+                    _ => {}
+                }
+                d.add_i64(sorted_owner, i);
+                d.add_text(str_col, &format!("key-{i:06}-padding-block"));
+                w.add_document(d)?;
+            }
+            w.commit()?;
+        }
+        let searcher = index.reader()?.searcher();
+        let keys: Vec<i64> = (0..18_192i64).step_by(3).collect();
+        let pred = Arc::new(SetPredicate::from_i64s(keys.iter().copied()));
+        let reset = |p: &SetPredicate| {
+            p.u64_telemetry.calls.store(0, Ordering::Relaxed);
+            p.u64_telemetry.items.store(0, Ordering::Relaxed);
+            p.bytes_calls.store(0, Ordering::Relaxed);
+            p.bytes_items.store(0, Ordering::Relaxed);
+        };
+        let term_q = |tok: &str| {
+            Box::new(TermQuery::new(
+                Term::from_field_text(body, tok),
+                IndexRecordOption::WithFreqs,
+            )) as Box<dyn crate::query::Query>
+        };
+
+        // 1. Medium-stride (40) scoring `BatchFilteredScorer` across Full / Optional / Multivalued
+        //    (both unconstrained and value-range constrained) and sorted `doc_bounds`.
+        let unbounded = BoundsRange::new(Bound::Unbounded, Bound::Unbounded);
+        for (field, bounds) in [
+            (full_col, unbounded.clone()),
+            (
+                full_col,
+                BoundsRange::new(
+                    Bound::Included(Term::from_field_i64(full_col, 1_000)),
+                    Bound::Excluded(Term::from_field_i64(full_col, 5_000)),
+                ),
+            ),
+            (opt_col, unbounded.clone()),
+            (multi_col, unbounded),
+            (
+                sorted_owner,
+                BoundsRange::new(
+                    Bound::Included(Term::from_field_i64(sorted_owner, 4_000)),
+                    Bound::Excluded(Term::from_field_i64(sorted_owner, 4_500)),
+                ),
+            ),
+        ] {
+            reset(&pred);
+            let pred_q = BooleanQuery::new(vec![
+                (Occur::Must, term_q("stride40")),
+                (
+                    Occur::Must,
+                    Box::new(
+                        TermPredicateQuery::new(field, pred.clone()).with_bounds(bounds.clone()),
+                    ),
+                ),
+            ]);
+            let ref_terms: Vec<Term> = keys
+                .iter()
+                .copied()
+                .filter(|&k| {
+                    let lo_ok = match &bounds.lower_bound {
+                        Bound::Included(t) => k >= t.value().as_i64().unwrap(),
+                        Bound::Excluded(t) => k > t.value().as_i64().unwrap(),
+                        Bound::Unbounded => true,
+                    };
+                    let hi_ok = match &bounds.upper_bound {
+                        Bound::Included(t) => k <= t.value().as_i64().unwrap(),
+                        Bound::Excluded(t) => k < t.value().as_i64().unwrap(),
+                        Bound::Unbounded => true,
+                    };
+                    lo_ok && hi_ok
+                })
+                .map(|k| Term::from_field_i64(field, k))
+                .collect();
+            let ref_q = BooleanQuery::new(vec![
+                (Occur::Must, term_q("stride40")),
+                (Occur::Must, Box::new(TermSetQuery::new(ref_terms))),
+            ]);
+            // Exercise `BatchFilteredScorer` directly via `weight.scorer()` (draining docs+scores).
+            let enable = crate::query::EnableScoring::enabled_from_searcher(&searcher);
+            let mut got_scored = Vec::new();
+            let mut s = pred_q
+                .weight(enable)?
+                .scorer(searcher.segment_reader(0), 1.0)?;
+            while s.doc() != TERMINATED {
+                got_scored.push((s.doc(), s.score()));
+                s.advance();
+            }
+            let mut exp_scored = Vec::new();
+            let mut ref_s = ref_q
+                .weight(enable)?
+                .scorer(searcher.segment_reader(0), 1.0)?;
+            while ref_s.doc() != TERMINATED {
+                exp_scored.push((ref_s.doc(), ref_s.score()));
+                ref_s.advance();
+            }
+            assert_eq!(
+                got_scored, exp_scored,
+                "score/doc mismatch for field {field:?}"
+            );
+            let calls = pred.u64_telemetry.calls.load(Ordering::Relaxed);
+            let items = pred.u64_telemetry.items.load(Ordering::Relaxed);
+            assert!(
+                calls <= 2,
+                "expected <= 2 batched calls (64 + 141) for stride40 on {field:?}, got {calls}"
+            );
+            if field == sorted_owner {
+                assert!(
+                    items <= 20,
+                    "doc_bounds skip horizon should skip docs outside [4000..4500), got {items} \
+                     items"
+                );
+            } else {
+                assert!(
+                    items <= 410,
+                    "batched seek_danger_batch should not decode skipped neighbors, got {items} \
+                     items"
+                );
+            }
+            // Also verify `TopDocs` (`BlockWandSingleScorer` path) matches exact scores & batches.
+            reset(&pred);
+            let got = searcher.search(&pred_q, &TopDocs::with_limit(256).order_by_score())?;
+            let exp = searcher.search(&ref_q, &TopDocs::with_limit(256).order_by_score())?;
+            assert_eq!(got, exp, "TopDocs score/doc mismatch for field {field:?}");
+            assert!(
+                pred.u64_telemetry.calls.load(Ordering::Relaxed) <= 4,
+                "expected <= 4 BlockWandSingleScorer warmup chunks on {field:?}, got {}",
+                pred.u64_telemetry.calls.load(Ordering::Relaxed)
+            );
+        }
+
+        // 2. Progressive 64-doc ramp on early stop + `seek()` inside and past buffer.
+        reset(&pred);
+        let limit_q = BooleanQuery::new(vec![
+            (Occur::Must, term_q("stride40")),
+            (
+                Occur::Must,
+                Box::new(TermPredicateQuery::new(full_col, pred.clone())),
+            ),
+        ]);
+        let weight = limit_q.weight(crate::query::EnableScoring::enabled_from_searcher(
+            &searcher,
+        ))?;
+        let mut scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
+        let mut first_ten = Vec::new();
+        while first_ten.len() < 10 && scorer.doc() != TERMINATED {
+            first_ten.push((scorer.doc(), scorer.score()));
+            scorer.advance();
+        }
+        assert_eq!(first_ten.len(), 10);
+        assert_eq!(
+            pred.u64_telemetry.calls.load(Ordering::Relaxed),
+            1,
+            "LIMIT 10 should only trigger the initial 64-doc batch"
+        );
+        assert_eq!(
+            pred.u64_telemetry.items.load(Ordering::Relaxed),
+            64,
+            "first batch should be 64 docs, not 1024"
+        );
+        // Seek inside current buffer, then seek past buffer.
+        let target_in_buf = scorer.doc() + 40;
+        let d1 = scorer.seek(target_in_buf);
+        assert!(d1 >= target_in_buf && d1 != TERMINATED);
+        let d2 = scorer.seek(5_000);
+        assert!(d2 >= 5_000 && d2 != TERMINATED);
+
+        // 3. `CachedDictPredicateDocSet` batching via `seek_danger_batch`.
+        let str_targets: Vec<String> = (0..8_192i64)
+            .step_by(40)
+            .filter(|i| i % 3 == 0)
+            .map(|i| format!("key-{i:06}-padding-block"))
+            .collect();
+        let str_pred = Arc::new(SetPredicate::from_strings(
+            str_targets.iter().map(String::as_str),
+        ));
+        let dict_pred_q = BooleanQuery::new(vec![
+            (Occur::Must, term_q("stride40")),
+            (
+                Occur::Must,
+                Box::new(
+                    TermPredicateQuery::new(str_col, str_pred.clone())
+                        .with_exact_postings(ExactPostings::Unavailable),
+                ),
+            ),
+        ]);
+        let dict_ref_q = BooleanQuery::new(vec![
+            (Occur::Must, term_q("stride40")),
+            (
+                Occur::Must,
+                Box::new(FastFieldTermSetQuery::new(
+                    str_targets
+                        .iter()
+                        .map(|s| Term::from_field_text(str_col, s)),
+                )),
+            ),
+        ]);
+        assert_eq!(
+            searcher.search(&dict_pred_q, &DocSetCollector)?,
+            searcher.search(&dict_ref_q, &DocSetCollector)?
+        );
+        assert!(
+            str_pred.bytes_calls.load(Ordering::Relaxed) <= 3,
+            "CachedDictPredicateDocSet should batch filter_bytes calls, got {}",
+            str_pred.bytes_calls.load(Ordering::Relaxed)
+        );
+
+        // 4. WAND callsites: `BlockWandSingleScorer`, `BlockWandIntersectionScorer`,
+        //    `block_maxscore_filtered`, and `BlockWandUnionScorer` via `Weight::pruning_scorer`.
+        let full_ref_terms: Vec<Term> = (0..8_192i64)
+            .step_by(3)
+            .map(|k| Term::from_field_i64(full_col, k))
+            .collect();
+        for (name, terms_q) in [
+            ("single", term_q("hit1")),
+            (
+                "intersection",
+                Box::new(BooleanQuery::intersection(vec![
+                    term_q("hit1"),
+                    term_q("hit2"),
+                ])) as Box<dyn crate::query::Query>,
+            ),
+            (
+                "maxscore",
+                Box::new(BooleanQuery::union(vec![
+                    term_q("hit1"),
+                    term_q("hit2"),
+                    term_q("hit3"),
+                ])) as Box<dyn crate::query::Query>,
+            ),
+        ] {
+            reset(&pred);
+            let q_pred = BooleanQuery::new(vec![
+                (Occur::Must, terms_q.box_clone()),
+                (
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(
+                        TermPredicateQuery::new(full_col, pred.clone()),
+                        0.0,
+                    )),
+                ),
+            ]);
+            let q_ref = BooleanQuery::new(vec![
+                (Occur::Must, terms_q),
+                (
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(
+                        TermSetQuery::new(full_ref_terms.clone()),
+                        0.0,
+                    )),
+                ),
+            ]);
+            let got = searcher.search(&q_pred, &TopDocs::with_limit(10).order_by_score())?;
+            let exp = searcher.search(&q_ref, &TopDocs::with_limit(10).order_by_score())?;
+            assert_eq!(got, exp, "WAND top-10 mismatch for {name}");
+            let calls = pred.u64_telemetry.calls.load(Ordering::Relaxed);
+            assert!(
+                calls <= 64,
+                "WAND {name} should batch filter probes, got {calls} calls"
+            );
+        }
+
+        // 4b. `BlockWandUnionScorer` via `Weight::pruning_scorer` (streaming full-scan path used
+        //     by ParadeDB `Scanner`): verify both direct `PredicateColumnDocSet` and combined
+        //     `BatchFilteredScorer(RangeDocSet, PredicateColumnDocSet)` evaluate only exact
+        //     surviving candidates (zero speculative contiguous window probes) in ramped batches.
+        let enable = crate::query::EnableScoring::enabled_from_searcher(&searcher);
+        let seg_reader = searcher.segment_reader(0);
+        let expected_union_all = (0..8_192i64).filter(|i| i % 5 == 0 || i % 7 == 0).count();
+        let expected_union_range = (2_000..4_000i64)
+            .filter(|i| i % 5 == 0 || i % 7 == 0)
+            .count();
+        for (name, range_filter, expected_items, max_calls) in [
+            ("union_direct", None, expected_union_all, 6usize),
+            (
+                "union_with_range_batch_filtered",
+                Some(crate::query::RangeQuery::new(
+                    Bound::Included(Term::from_field_i64(full_col, 2_000)),
+                    Bound::Excluded(Term::from_field_i64(full_col, 4_000)),
+                )),
+                expected_union_range,
+                6usize,
+            ),
+        ] {
+            reset(&pred);
+            let mut pred_clauses: Vec<(Occur, Box<dyn crate::query::Query>)> = vec![
+                (Occur::Should, term_q("hit2")),
+                (Occur::Should, term_q("hit3")),
+                (
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(
+                        TermPredicateQuery::new(full_col, pred.clone()),
+                        0.0,
+                    )),
+                ),
+            ];
+            let mut ref_clauses: Vec<(Occur, Box<dyn crate::query::Query>)> = vec![
+                (Occur::Should, term_q("hit2")),
+                (Occur::Should, term_q("hit3")),
+                (
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(
+                        TermSetQuery::new(full_ref_terms.clone()),
+                        0.0,
+                    )),
+                ),
+            ];
+            if let Some(rq) = range_filter {
+                pred_clauses.push((Occur::Must, Box::new(ConstScoreQuery::new(rq.clone(), 0.0))));
+                ref_clauses.push((Occur::Must, Box::new(ConstScoreQuery::new(rq, 0.0))));
+            }
+            let mut pred_q = BooleanQuery::new(pred_clauses);
+            pred_q.set_minimum_number_should_match(1);
+            let mut ref_q = BooleanQuery::new(ref_clauses);
+            ref_q.set_minimum_number_should_match(1);
+
+            let mut pred_scorer =
+                pred_q
+                    .weight(enable)?
+                    .pruning_scorer(seg_reader, 1.0, crate::Score::MIN)?;
+            let mut got_docs = Vec::new();
+            while pred_scorer.doc() != TERMINATED {
+                got_docs.push((pred_scorer.doc(), pred_scorer.score()));
+                pred_scorer.advance();
+            }
+            let mut ref_scorer =
+                ref_q
+                    .weight(enable)?
+                    .pruning_scorer(seg_reader, 1.0, crate::Score::MIN)?;
+            let mut exp_docs = Vec::new();
+            while ref_scorer.doc() != TERMINATED {
+                exp_docs.push((ref_scorer.doc(), ref_scorer.score()));
+                ref_scorer.advance();
+            }
+            assert_eq!(got_docs, exp_docs, "pruning_scorer mismatch for {name}");
+            let calls = pred.u64_telemetry.calls.load(Ordering::Relaxed);
+            let items = pred.u64_telemetry.items.load(Ordering::Relaxed);
+            // `PredicateColumnDocSet::new` runs one eager 1,024-doc positioning window when
+            // `union_hint >= num_docs / 32`; every subsequent probe must go through
+            // `seek_danger_batch` on exact surviving candidates (zero speculative windows).
+            assert!(
+                calls > 0 && calls <= max_calls + 1,
+                "{name}: expected <= {} batched calls, got {calls}",
+                max_calls + 1
+            );
+            assert_eq!(
+                items,
+                expected_items + super::COLUMN_WINDOW_DOCS as usize,
+                "{name}: should evaluate only surviving candidates plus initial positioning window"
+            );
+        }
+
+        // 5. `BatchExcludeScorer`: batched `MUST_NOT` with exact scores.
+        reset(&pred);
+        let excl_pred_q = BooleanQuery::new(vec![
+            (Occur::Must, term_q("stride40")),
+            (
+                Occur::MustNot,
+                Box::new(TermPredicateQuery::new(full_col, pred.clone())),
+            ),
+        ]);
+        let excl_ref_q = BooleanQuery::new(vec![
+            (Occur::Must, term_q("stride40")),
+            (Occur::MustNot, Box::new(TermSetQuery::new(full_ref_terms))),
+        ]);
+        let got_excl = searcher.search(&excl_pred_q, &TopDocs::with_limit(256).order_by_score())?;
+        let exp_excl = searcher.search(&excl_ref_q, &TopDocs::with_limit(256).order_by_score())?;
+        assert_eq!(got_excl, exp_excl);
+        assert!(
+            pred.u64_telemetry.calls.load(Ordering::Relaxed) <= 3,
+            "BatchExcludeScorer should batch MUST_NOT probes, got {} calls",
+            pred.u64_telemetry.calls.load(Ordering::Relaxed)
+        );
+        assert_eq!(pred.u64_telemetry.items.load(Ordering::Relaxed), 205);
+        Ok(())
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(24))]
         #[test]
@@ -1428,6 +2230,7 @@ mod tests {
             let pred = Arc::new(SetPredicate {
                 bytes_set: str_strings.iter().map(|s| s.as_bytes().to_vec()).collect(),
                 i64_set: query_vals.iter().copied().collect(),
+                bytes_calls: AtomicUsize::new(0),
                 bytes_items: AtomicUsize::new(0),
                 u64_telemetry: EvalTelemetry::default(),
             });
