@@ -12,20 +12,24 @@ use std::ops::Bound;
 use std::path::Path;
 use std::sync::OnceLock;
 
+use common::TinySet;
 use proptest::prelude::*;
 
 use super::*;
-use crate::docset::SeekDangerResult;
+use crate::docset::{fill_all_candidates_mask, SeekDangerResult};
 use crate::schema::{Field, IndexRecordOption, Schema, FAST, TEXT};
 use crate::{DocId, DocSet, Index, Searcher, Term, TERMINATED};
 
 #[derive(Clone, Copy, Debug)]
 enum Kind {
     Intersection,
+    BatchFiltered,
     BufferedUnion,
     Boost,
     ConstScore,
     RequiredOptional,
+    Exclude,
+    BatchExclude,
     Phrase,
     PhrasePrefix,
     FastFieldRange,
@@ -48,6 +52,7 @@ macro_rules! implementations {
                 right in expressions(),
                 random_targets in prop::collection::vec(0u32..12000, 0..80),
                 scoring in any::<bool>(),
+                sparse_seed in any::<u64>(),
             ) {
                 let mut targets = random_targets;
                 targets.extend([0, 1, 4095, 4096, 4097, 6000, 10200, 11000, 11010, 11101, 11102, TERMINATED]);
@@ -58,6 +63,7 @@ macro_rules! implementations {
                 for (left, right) in [(Expr::Term(2, false), Expr::Term(2, true)), (left, right)] {
                     let expr = Expr::Node(Kind::$kind, Box::new(left), Box::new(right));
                     check(|| scorer(&expr, scoring), &targets);
+                    check_batch(|| scorer(&expr, scoring), &targets, sparse_seed);
                 }
             }
         })*
@@ -66,10 +72,13 @@ macro_rules! implementations {
 
 implementations! {
     ("intersection.rs", Intersection, query_seek_danger_intersection),
+    ("intersection.rs", BatchFiltered, query_seek_danger_batch_filtered),
     ("", BufferedUnion, query_seek_danger_buffered_union),
     ("boost_query.rs", Boost, query_seek_danger_boost),
     ("const_score_query.rs", ConstScore, query_seek_danger_const_score),
     ("reqopt_scorer.rs", RequiredOptional, query_seek_danger_required_optional),
+    ("exclude.rs", Exclude, query_seek_danger_exclude),
+    ("exclude.rs", BatchExclude, query_seek_danger_batch_exclude),
     ("phrase_query/phrase_scorer.rs", Phrase, query_seek_danger_phrase),
     ("phrase_prefix_query/phrase_prefix_scorer.rs", PhrasePrefix, query_seek_danger_phrase_prefix),
     ("range_query/fast_field_range_doc_set.rs", FastFieldRange, query_seek_danger_fast_field_range),
@@ -81,7 +90,6 @@ implementations! {
 // ParadeDB-only overrides not yet covered by the expression generator above.
 const FORK_INVENTORY: &[(&str, usize)] = &[
     ("query/bitmap_docset.rs", 1),
-    ("query/exclude.rs", 1),
     ("query/term_set_query/term_set_weight.rs", 1),
 ];
 
@@ -125,7 +133,7 @@ impl TermPredicate for ModuloPredicate {
     }
 
     fn probe_cost(&self) -> crate::ProbeCost {
-        crate::ProbeCost::per_doc(5)
+        crate::ProbeCost::new(crate::ProbeSetupCost(300), crate::ProbePerDocCost(10))
     }
 }
 
@@ -146,6 +154,13 @@ impl Expr {
         let right = right.query(fields, number, dict_str);
         match kind {
             Kind::Intersection => Box::new(BooleanQuery::intersection(vec![left, right])),
+            Kind::BatchFiltered => Box::new(BooleanQuery::intersection(vec![
+                left,
+                Box::new(TermPredicateQuery::new(
+                    number,
+                    std::sync::Arc::new(ModuloPredicate),
+                )),
+            ])),
             Kind::BufferedUnion => Box::new(DisjunctionMaxQuery::with_tie_breaker(
                 vec![left, right],
                 0.3,
@@ -155,6 +170,20 @@ impl Expr {
             Kind::RequiredOptional => Box::new(BooleanQuery::new(vec![
                 (Occur::Must, left),
                 (Occur::Should, right),
+            ])),
+            Kind::Exclude => Box::new(BooleanQuery::new(vec![
+                (Occur::Must, left),
+                (Occur::MustNot, right),
+            ])),
+            Kind::BatchExclude => Box::new(BooleanQuery::new(vec![
+                (Occur::Must, left),
+                (
+                    Occur::MustNot,
+                    Box::new(TermPredicateQuery::new(
+                        number,
+                        std::sync::Arc::new(ModuloPredicate),
+                    )),
+                ),
             ])),
             Kind::Phrase => Box::new(PhraseQuery::new(vec![
                 term(fields[2], false),
@@ -343,6 +372,116 @@ fn check(mut make: impl FnMut() -> Box<dyn Scorer>, targets: &[DocId]) {
     }
 }
 
+/// Oracle for `seek_danger_batch`: verifies in-place AND semantics (both all-active and sparse
+/// pre-filtered masks), skip-horizon bounds, empty batches, multi-chunk monotonic probing, and
+/// probing after advancing into a buffered scorer.
+fn check_batch(mut make: impl FnMut() -> Box<dyn Scorer>, targets: &[DocId], sparse_seed: u64) {
+    let mut reference = make();
+    let mut expected = Vec::new();
+    while reference.doc() != TERMINATED {
+        expected.push(reference.doc());
+        reference.advance();
+    }
+    let valid_targets: Vec<DocId> = targets
+        .iter()
+        .copied()
+        .filter(|&d| d < TERMINATED)
+        .collect();
+
+    // Test both all-active and sparse pre-filtered masks across varying chunk sizes,
+    // and also test a partially-advanced scorer (straddling any internal buffer).
+    for sparse in [false, true] {
+        for advance_first in [false, true] {
+            let mut tested = make();
+            assert_eq!(tested.seek_danger_batch(&[], &mut []), 0);
+            if advance_first && tested.doc() != TERMINATED {
+                tested.advance();
+            }
+            let mut lower_bound = tested.doc();
+            let mut probe_docs = valid_targets.clone();
+            if lower_bound < TERMINATED {
+                probe_docs.push(lower_bound);
+                if lower_bound + 1 < TERMINATED {
+                    probe_docs.push(lower_bound + 1);
+                }
+                probe_docs.sort_unstable();
+                probe_docs.dedup();
+            }
+
+            let chunk_sizes = if advance_first {
+                &[probe_docs.len().max(1)][..]
+            } else {
+                &[1usize, 7, 64, 65, 130][..]
+            };
+            let mut pos = 0usize;
+            let mut chunk_idx = 0usize;
+            while pos < probe_docs.len() {
+                let size = chunk_sizes[chunk_idx % chunk_sizes.len()];
+                chunk_idx += 1;
+                let end = (pos + size).min(probe_docs.len());
+                let chunk: Vec<DocId> = probe_docs[pos..end]
+                    .iter()
+                    .copied()
+                    .filter(|&d| d >= lower_bound)
+                    .collect();
+                pos = end;
+                if chunk.is_empty() {
+                    continue;
+                }
+                let words = chunk.len().div_ceil(64);
+                let mut mask = vec![TinySet::EMPTY; words];
+                if sparse {
+                    for i in 0..chunk.len() {
+                        let hash = sparse_seed
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add((chunk_idx as u64) << 16)
+                            .wrapping_add(i as u64);
+                        if (hash >> 3) & 1 == 0 {
+                            mask[i / 64].insert_mut((i % 64) as u32);
+                        }
+                    }
+                } else {
+                    fill_all_candidates_mask(chunk.len(), &mut mask);
+                }
+                let initial_mask = mask.clone();
+                let mut borrowed: &mut dyn DocSet = &mut tested;
+                let next_bound = DocSet::seek_danger_batch(&mut borrowed, &chunk, &mut mask);
+
+                for (i, &doc) in chunk.iter().enumerate() {
+                    let was_active = initial_mask[i / 64].contains((i % 64) as u32);
+                    let got = mask[i / 64].contains((i % 64) as u32);
+                    let want = was_active && expected.binary_search(&doc).is_ok();
+                    assert_eq!(
+                        got, want,
+                        "seek_danger_batch mismatch at doc {doc} (sparse={sparse}, \
+                         advance_first={advance_first})"
+                    );
+                }
+                let rem = chunk.len() % 64;
+                if rem > 0 {
+                    assert_eq!(
+                        mask[words - 1].into_u64() >> rem,
+                        0,
+                        "trailing bits beyond chunk.len() must remain 0"
+                    );
+                }
+                let last = *chunk.last().unwrap();
+                assert!(
+                    next_bound > last || next_bound == TERMINATED,
+                    "non-increasing next_bound {next_bound} after {last}"
+                );
+                let next_idx = expected.partition_point(|&d| d <= last);
+                let next_expected = expected.get(next_idx).copied().unwrap_or(TERMINATED);
+                assert!(
+                    next_bound <= next_expected,
+                    "next_bound {next_bound} skips match {next_expected} after {last}"
+                );
+                lower_bound = lower_bound.max(next_bound);
+            }
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
 
@@ -423,5 +562,52 @@ fn seek_danger_implementation_inventory() {
         found, covered,
         "Register new seek_danger implementations in seek_danger_tests.rs and add their \
          query/scorer to the generator"
+    );
+}
+
+#[test]
+fn seek_danger_batch_implementation_inventory() {
+    fn visit(root: &Path, dir: &Path, pattern: &regex::Regex, found: &mut BTreeMap<String, usize>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(root, &path, pattern, found);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path).unwrap();
+                let count = pattern.find_iter(&source).count();
+                if count != 0 {
+                    found.insert(
+                        path.strip_prefix(root)
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .replace('\\', "/"),
+                        count,
+                    );
+                }
+            }
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = BTreeMap::new();
+    let pattern = regex::Regex::new(r"fn\s+seek_danger_batch\s*\(").unwrap();
+    visit(&root, &root, &pattern, &mut found);
+    let expected: BTreeMap<String, usize> = [
+        ("docset.rs", 3),
+        // Test-only spy (`CostedFilter`) in `block_wand_union.rs`.
+        ("query/boolean_query/block_wand_union.rs", 1),
+        ("query/boost_query.rs", 1),
+        ("query/const_score_query.rs", 1),
+        ("query/exclude.rs", 2),
+        ("query/intersection.rs", 2),
+        ("query/reqopt_scorer.rs", 1),
+        ("query/term_set_query/term_predicate.rs", 2),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    assert_eq!(
+        found, expected,
+        "Register new seek_danger_batch implementations in seek_danger_tests.rs"
     );
 }

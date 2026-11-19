@@ -250,6 +250,19 @@ impl DocSetBatch<'_> {
     }
 }
 
+/// Initializes `mask[..len.div_ceil(64)]` with bits `0..len` set (all candidates active).
+#[inline]
+pub fn fill_all_candidates_mask(len: usize, mask: &mut [TinySet]) {
+    let words = len.div_ceil(64);
+    debug_assert!(mask.len() >= words);
+    let full_words = len / 64;
+    let rem = len % 64;
+    mask[..full_words].fill(TinySet::full());
+    if rem > 0 {
+        mask[full_words] = TinySet::range_lower(rem as u32);
+    }
+}
+
 #[inline]
 pub(crate) fn union_bitset_blocks(mask: &mut DocIdBitmap, other: &DocIdBitmap) {
     for (word, other) in mask.iter_mut().zip(other) {
@@ -375,6 +388,76 @@ pub trait DocSet: Send {
         } else {
             SeekDangerResult::SeekLowerBound(doc)
         }
+    }
+
+    /// Intersects `mask` in place with membership of a strictly increasing slice of candidate
+    /// document IDs, returning a lower bound on the next matching document strictly after
+    /// `docs.last()` (capped at [`TERMINATED`], or `0` if `docs` is empty).
+    ///
+    /// Complements [`DocSet::fill_bitset_block`] (which evaluates contiguous 1,024-doc windows):
+    /// `seek_danger_batch` probes sparse externally supplied candidates without evaluating
+    /// unprobed neighbors, amortizing [`ProbeSetupCost`] across the batch. Using an in-place
+    /// AND mask lets conjunctions reuse a single `mask` without scratch buffers, while returning
+    /// the skip horizon preserves `SeekLowerBound` skipping across batches.
+    ///
+    /// `mask` must have length `>= docs.len().div_ceil(64)` with no bits set at positions
+    /// `>= docs.len()` (see [`fill_all_candidates_mask`]). Only candidates `i` whose bit is set
+    /// in `mask` need to be tested; implementations clear bit `(i % 64)` of `mask[i / 64]` for
+    /// any active candidate not present in this `DocSet`, and leave already-cleared bits cleared.
+    ///
+    /// Follows the same monotonicity and danger-zone contract as [`DocSet::seek_danger`]: `docs`
+    /// must be strictly increasing (`docs[0] < docs[1] < ... < TERMINATED`) and monotonically
+    /// increasing relative to prior `seek_danger` / `seek_danger_batch` calls, and the `DocSet`
+    /// may be left in an invalid state afterwards.
+    fn seek_danger_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) -> DocId {
+        if docs.is_empty() {
+            return 0;
+        }
+        let words = docs.len().div_ceil(64);
+        debug_assert!(mask.len() >= words);
+        debug_assert!(
+            docs.windows(2).all(|w| w[0] < w[1]),
+            "seek_danger_batch requires strictly increasing docs"
+        );
+        debug_assert!(
+            *docs.last().unwrap() < TERMINATED,
+            "seek_danger_batch docs must be < TERMINATED"
+        );
+        debug_assert!(
+            docs.len() % 64 == 0
+                || mask[words - 1]
+                    .intersect(TinySet::range_greater_or_equal((docs.len() % 64) as u32))
+                    .is_empty(),
+            "seek_danger_batch mask must not set bits >= docs.len()"
+        );
+        let last = *docs.last().unwrap();
+        let mut lower_bound = 0;
+        for (word_idx, word) in mask[..words].iter_mut().enumerate() {
+            if word.is_empty() {
+                continue;
+            }
+            let base = word_idx * 64;
+            let word_last = docs[(base + 63).min(docs.len() - 1)];
+            if word_last < lower_bound {
+                *word = TinySet::EMPTY;
+                continue;
+            }
+            let mut keep = TinySet::EMPTY;
+            for bit in *word {
+                let doc = docs[base + bit as usize];
+                if doc < lower_bound {
+                    continue;
+                }
+                match self.seek_danger(doc) {
+                    SeekDangerResult::Found => {
+                        keep.insert_mut(bit);
+                    }
+                    SeekDangerResult::SeekLowerBound(bound) => lower_bound = bound,
+                }
+            }
+            *word = keep;
+        }
+        lower_bound.max(last.saturating_add(1)).min(TERMINATED)
     }
 
     /// Fills a given mutable buffer with the next doc ids from the
@@ -530,6 +613,10 @@ impl DocSet for &mut dyn DocSet {
         (**self).seek_danger(target)
     }
 
+    fn seek_danger_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) -> DocId {
+        (**self).seek_danger_batch(docs, mask)
+    }
+
     fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
         (**self).fill_buffer(buffer)
     }
@@ -585,6 +672,11 @@ impl<TDocSet: DocSet + ?Sized> DocSet for Box<TDocSet> {
     fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
         let unboxed: &mut TDocSet = self.borrow_mut();
         unboxed.seek_danger(target)
+    }
+
+    fn seek_danger_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) -> DocId {
+        let unboxed: &mut TDocSet = self.borrow_mut();
+        unboxed.seek_danger_batch(docs, mask)
     }
 
     fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {

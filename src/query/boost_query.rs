@@ -151,6 +151,10 @@ impl<S: Scorer> DocSet for BoostScorer<S> {
         self.underlying.seek_danger(target)
     }
 
+    fn seek_danger_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) -> DocId {
+        self.underlying.seek_danger_batch(docs, mask)
+    }
+
     fn has_fast_bitset(&self) -> bool {
         self.underlying.has_fast_bitset()
     }

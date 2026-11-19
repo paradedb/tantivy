@@ -1,4 +1,4 @@
-use super::block_wand_union::{seek_to_filter_start, FilterPlacement};
+use super::block_wand_union::{seek_to_filter_start, ScoredSurvivorBuffer, WandFilterMode};
 use crate::docset::{ProbeCost, SeekDangerResult};
 use crate::fieldnorm::FieldNormReader;
 use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
@@ -6,6 +6,8 @@ use crate::query::scorer::PruningScorer;
 use crate::query::term_query::TermScorer;
 use crate::query::{Bm25Weight, Scorer};
 use crate::{DocId, DocSet, Score, TERMINATED};
+
+const WARMUP_BATCH_SIZE: usize = 64;
 
 #[cfg(test)]
 pub(crate) fn block_wand_intersection(
@@ -31,8 +33,9 @@ pub(crate) fn block_wand_intersection(
 ///
 /// When an optional non-scoring filter docset is provided, entire windows are skipped
 /// if `filter.is_empty_in_range` indicates no matches, and candidate documents are
-/// tested against the filter either before secondary scoring (for low-probe-cost
-/// filters) or after secondary alignment and threshold pruning based on `filter.cost().probe`.
+/// tested against the filter before secondary scoring (for low-probe-cost filters),
+/// scalar after secondary alignment and threshold pruning, or in batches via
+/// `seek_danger_batch` when `ProbeCost::prefers_batching()` is true.
 ///
 /// # Preconditions
 /// - `scorers` has at least 2 elements
@@ -54,6 +57,7 @@ pub struct BlockWandIntersectionScorer {
     candidate_norms: [u8; COMPRESSION_BLOCK_SIZE],
     num_candidates: usize,
     candidate_idx: usize,
+    survivors: ScoredSurvivorBuffer,
 
     threshold: Score,
     no_score_cutoff_yet: bool,
@@ -65,7 +69,7 @@ pub struct BlockWandIntersectionScorer {
     // TODO: Extend fieldnorm reuse to other scorers.
     shared_fieldnorms: bool,
     filter: Option<Box<dyn DocSet>>,
-    filter_placement: FilterPlacement,
+    filter_mode: WandFilterMode,
     filter_boost: Score,
 }
 impl BlockWandIntersectionScorer {
@@ -122,18 +126,13 @@ impl BlockWandIntersectionScorer {
 
         let secondary_probe_cost =
             (secondaries_len as u64).saturating_mul(ProbeCost::TERM.scalar());
-        let filter_placement = match filter.as_ref() {
-            Some(f) if f.cost().probe.scalar() > secondary_probe_cost => {
-                FilterPlacement::AfterScore
-            }
-            _ => FilterPlacement::Early,
-        };
+        let filter_mode = WandFilterMode::select(filter.as_deref(), secondary_probe_cost);
 
         let mut scorer = Self {
             leader,
             secondaries,
             filter,
-            filter_placement,
+            filter_mode,
             filter_boost,
             maximum_possible_score,
             secondary_block_max_scores: vec![0.0f32; secondaries_len].into_boxed_slice(),
@@ -145,6 +144,7 @@ impl BlockWandIntersectionScorer {
             candidate_norms: [0u8; COMPRESSION_BLOCK_SIZE],
             num_candidates: 0,
             candidate_idx: 0,
+            survivors: ScoredSurvivorBuffer::new(),
             threshold,
             no_score_cutoff_yet: threshold == Score::MIN,
             current: (0, Score::MIN),
@@ -158,9 +158,12 @@ impl BlockWandIntersectionScorer {
 
     /// Finds the next document matching every term, then scores it, without checking score bounds.
     fn advance_without_pruning(&mut self) -> DocId {
+        if self.filter_mode == WandFilterMode::AfterScoreBatch {
+            return self.advance_without_pruning_batched();
+        }
         let mut candidate = self.leader.seek(self.internal_doc);
         'candidate: while candidate != TERMINATED {
-            if self.filter_placement == FilterPlacement::Early {
+            if self.filter_mode == WandFilterMode::Early {
                 if let Some(ref mut filter) = self.filter {
                     match filter.seek_danger(candidate) {
                         SeekDangerResult::Found => {}
@@ -182,7 +185,7 @@ impl BlockWandIntersectionScorer {
                     continue 'candidate;
                 }
             }
-            if self.filter_placement == FilterPlacement::AfterScore {
+            if self.filter_mode == WandFilterMode::AfterScoreScalar {
                 if let Some(ref mut filter) = self.filter {
                     match filter.seek_danger(candidate) {
                         SeekDangerResult::Found => {}
@@ -216,6 +219,57 @@ impl BlockWandIntersectionScorer {
         TERMINATED
     }
 
+    /// Batched warmup counterpart to `advance_without_pruning` for high-setup filters:
+    /// collects up to `WARMUP_BATCH_SIZE` term-intersection matches and evaluates them in a
+    /// single `seek_danger_batch` call.
+    fn advance_without_pruning_batched(&mut self) -> DocId {
+        loop {
+            debug_assert!(self.survivors.is_empty());
+            let mut candidate = self.leader.seek(self.internal_doc);
+            'collect: while candidate != TERMINATED && self.survivors.len() < WARMUP_BATCH_SIZE {
+                for secondary in &mut self.secondaries {
+                    let secondary_doc = if secondary.doc() < candidate {
+                        secondary.seek(candidate)
+                    } else {
+                        secondary.doc()
+                    };
+                    if secondary_doc > candidate {
+                        candidate = self.leader.seek(secondary_doc);
+                        continue 'collect;
+                    }
+                }
+                let norm = self.leader.fieldnorm_id();
+                let mut score = self.bm25_weight.score(norm, self.leader.term_freq());
+                for secondary in &mut self.secondaries {
+                    score += if self.shared_fieldnorms {
+                        secondary.bm25_weight().score(norm, secondary.term_freq())
+                    } else {
+                        secondary.score()
+                    };
+                }
+                let final_score = score + self.filter_boost;
+                if final_score > self.threshold {
+                    self.survivors.push(candidate, final_score);
+                }
+                candidate = self.leader.seek(candidate + 1);
+            }
+            self.internal_doc = candidate;
+            if self.survivors.is_empty() {
+                self.internal_doc = TERMINATED;
+                self.current = (TERMINATED, Score::MIN);
+                return TERMINATED;
+            }
+            if let Some(ref mut filter) = self.filter {
+                let next_bound = self.survivors.filter_with(filter.as_mut());
+                self.internal_doc = self.internal_doc.max(next_bound);
+            }
+            if let Some((doc, score)) = self.survivors.next_above(self.threshold) {
+                self.current = (doc, score);
+                return doc;
+            }
+        }
+    }
+
     fn handle_candidates(&mut self, inner_threshold: Score) -> Option<DocId> {
         if self.shared_fieldnorms {
             self.handle_candidates_with_norms::<true>(inner_threshold)
@@ -228,6 +282,55 @@ impl BlockWandIntersectionScorer {
         &mut self,
         inner_threshold: Score,
     ) -> Option<DocId> {
+        if self.filter_mode == WandFilterMode::AfterScoreBatch {
+            debug_assert!(self.survivors.is_empty());
+            'batch_candidate: while self.candidate_idx < self.num_candidates {
+                let idx = self.candidate_idx;
+                self.candidate_idx += 1;
+                let candidate_doc = self.candidate_doc_ids[idx];
+                let mut total_score: Score = self.candidate_scores[idx];
+                for (secondary_idx, secondary) in self.secondaries.iter_mut().enumerate() {
+                    if secondary.doc() > candidate_doc {
+                        continue 'batch_candidate;
+                    }
+                    let seek_result = secondary.seek(candidate_doc);
+                    if seek_result != candidate_doc {
+                        continue 'batch_candidate;
+                    }
+                    total_score += if SHARED_NORMS {
+                        secondary
+                            .bm25_weight()
+                            .score(self.candidate_norms[idx], secondary.term_freq())
+                    } else {
+                        secondary.score()
+                    };
+                    if total_score + self.secondary_suffix_block_max[secondary_idx]
+                        <= inner_threshold
+                    {
+                        continue 'batch_candidate;
+                    }
+                }
+                let final_score = total_score + self.filter_boost;
+                if final_score > self.threshold {
+                    self.survivors.push(candidate_doc, final_score);
+                }
+            }
+            self.num_candidates = 0;
+            self.internal_doc = self.window_end + 1;
+            if self.survivors.is_empty() {
+                return None;
+            }
+            if let Some(ref mut filter) = self.filter {
+                let next_bound = self.survivors.filter_with(filter.as_mut());
+                self.internal_doc = self.internal_doc.max(next_bound);
+            }
+            if let Some((doc, score)) = self.survivors.next_above(self.threshold) {
+                self.current = (doc, score);
+                return Some(doc);
+            }
+            return None;
+        }
+
         // Pass 2: Check intersection membership only for survivors.
         // score_threshold may be stale (threshold can increase from callbacks),
         // but that's conservative — we may check a few extra candidates, never miss one.
@@ -235,7 +338,7 @@ impl BlockWandIntersectionScorer {
             let candidate_doc = self.candidate_doc_ids[self.candidate_idx];
             let mut total_score: Score = self.candidate_scores[self.candidate_idx];
 
-            if self.filter_placement == FilterPlacement::Early {
+            if self.filter_mode == WandFilterMode::Early {
                 if let Some(ref mut filter) = self.filter {
                     if filter.seek_danger(candidate_doc) != SeekDangerResult::Found {
                         self.candidate_idx += 1;
@@ -276,7 +379,7 @@ impl BlockWandIntersectionScorer {
             // All secondaries matched.
             let final_score = total_score + self.filter_boost;
             if final_score > self.threshold {
-                if self.filter_placement == FilterPlacement::AfterScore {
+                if self.filter_mode == WandFilterMode::AfterScoreScalar {
                     if let Some(ref mut filter) = self.filter {
                         if filter.seek_danger(candidate_doc) != SeekDangerResult::Found {
                             self.candidate_idx += 1;
@@ -309,8 +412,14 @@ impl PruningScorer for BlockWandIntersectionScorer {
 impl DocSet for BlockWandIntersectionScorer {
     fn advance(&mut self) -> DocId {
         if self.maximum_possible_score <= self.threshold {
+            self.survivors.clear();
             self.current = (TERMINATED, Score::MIN);
             return TERMINATED;
+        }
+
+        if let Some((doc, score)) = self.survivors.next_above(self.threshold) {
+            self.current = (doc, score);
+            return doc;
         }
 
         // An unfilled top-k heap has no competitive score to prune against.
@@ -439,8 +548,10 @@ impl DocSet for BlockWandIntersectionScorer {
                 return doc_id;
             }
             // no candidates left, reset and advance internal doc
-            self.num_candidates = 0;
-            self.internal_doc = self.window_end + 1;
+            if self.num_candidates > 0 {
+                self.num_candidates = 0;
+                self.internal_doc = self.window_end + 1;
+            }
         }
 
         self.current = (TERMINATED, Score::MIN);
@@ -452,18 +563,22 @@ impl DocSet for BlockWandIntersectionScorer {
             return self.doc();
         }
         if target == TERMINATED {
+            self.survivors.clear();
+            self.num_candidates = 0;
             self.current = (TERMINATED, Score::MIN);
             return TERMINATED;
         }
-        while self.candidate_idx < self.num_candidates
-            && self.candidate_doc_ids[self.candidate_idx] < target
-        {
-            self.candidate_idx += 1;
-        }
-        if self.candidate_idx == self.num_candidates {
-            self.num_candidates = 0;
-            if self.internal_doc < target {
-                self.internal_doc = target;
+        if !self.survivors.skip_below(target) {
+            while self.candidate_idx < self.num_candidates
+                && self.candidate_doc_ids[self.candidate_idx] < target
+            {
+                self.candidate_idx += 1;
+            }
+            if self.candidate_idx == self.num_candidates {
+                self.num_candidates = 0;
+                if self.internal_doc < target {
+                    self.internal_doc = target;
+                }
             }
         }
         while self.doc() < target {
