@@ -73,7 +73,17 @@ struct IvfBuildTimings {
     train: Duration,
     router: Duration,
     assign: Duration,
+    /// Everything outside train, router and assign; the four durations below are parts of it.
     other: Duration,
+    /// Calling-thread read, normalize and decode of the rows the Data entry's blocks hold; for
+    /// plain blocks, also the rows streamed to the entry as they are read.
+    encode_read: Duration,
+    /// Encoding the Data entry's quantized clusters on the pool.
+    encode: Duration,
+    /// Writing the Data entry: metadata, padded block columns and block offsets.
+    data_write: Duration,
+    /// The ExactRows entry, its reads and its writes.
+    exact: Duration,
 }
 
 fn finish_stage(start: &mut Instant) -> Duration {
@@ -256,6 +266,7 @@ pub(crate) fn merge_ivf(
                 // entry, normalized as the encode pass normalizes the rows it codes; the cluster
                 // blocks carry codes and document ids only.
                 let exact_present = if quantization.is_some() {
+                    let exact_start = Instant::now();
                     timings.pad_bytes += vec_write.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
                     let entry_start = vec_write.written_bytes();
                     let rows_w =
@@ -270,6 +281,7 @@ pub(crate) fn merge_ivf(
                     )?;
                     timings.exact_reads += present.len();
                     timings.vec_bytes += vec_write.written_bytes() - entry_start;
+                    timings.exact += exact_start.elapsed();
                     Some(present)
                 } else {
                     None
@@ -303,7 +315,8 @@ pub(crate) fn merge_ivf(
         target: "paradedb::ivf_build",
         "ivf_build timings_ms train={} router={} assign={} other={} total={} \
          fields={} centroids={} vectors={} train_reads={} assign_reads={} \
-         encode_reads={} exact_reads={} replica_bytes={} vec_bytes={} pad_bytes={}",
+         encode_reads={} exact_reads={} replica_bytes={} vec_bytes={} pad_bytes={} \
+         encode_read_ms={} encode_ms={} data_write_ms={} exact_ms={}",
         timings.train.as_millis(),
         timings.router.as_millis(),
         timings.assign.as_millis(),
@@ -319,6 +332,10 @@ pub(crate) fn merge_ivf(
         timings.replica_bytes,
         timings.vec_bytes,
         timings.pad_bytes,
+        timings.encode_read.as_millis(),
+        timings.encode.as_millis(),
+        timings.data_write.as_millis(),
+        timings.exact.as_millis(),
     );
     Ok(())
 }
