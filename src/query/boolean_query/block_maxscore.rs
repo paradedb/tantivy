@@ -1,4 +1,6 @@
-use crate::docset::{ProbeCost, SeekDangerResult};
+use common::TinySet;
+
+use crate::docset::{fill_all_candidates_mask, ProbeCost, SeekDangerResult};
 use crate::query::term_query::TermScorer;
 use crate::query::Scorer;
 use crate::{DocId, DocSet, Score, TERMINATED};
@@ -61,6 +63,15 @@ enum WindowFilterStage {
     AfterWeakAndThreshold,
 }
 
+#[inline]
+fn compute_inner_threshold(threshold: Score, filter_boost: Score) -> f64 {
+    if threshold == Score::MIN {
+        Score::MIN as f64
+    } else {
+        (threshold - filter_boost) as f64 - (Score::EPSILON * threshold.abs()) as f64
+    }
+}
+
 pub(super) fn block_maxscore_filtered<F: DocSet + ?Sized>(
     scorers: Vec<TermScorer>,
     mut threshold: Score,
@@ -71,11 +82,7 @@ pub(super) fn block_maxscore_filtered<F: DocSet + ?Sized>(
 ) {
     // Keep bounds conservative relative to rounding in the collector's f32 scores.
     let rounding = 1.0 + (scorers.len() + 1) as f64 * Score::EPSILON as f64;
-    let mut inner_threshold: f64 = if threshold == Score::MIN {
-        Score::MIN as f64
-    } else {
-        (threshold - filter_boost) as f64 - (Score::EPSILON * threshold.abs()) as f64
-    };
+    let mut inner_threshold = compute_inner_threshold(threshold, filter_boost);
     let mut terms: Vec<_> = scorers
         .into_iter()
         .map(|scorer| Term {
@@ -89,6 +96,9 @@ pub(super) fn block_maxscore_filtered<F: DocSet + ?Sized>(
     let mut scores = vec![0.0 as Score; WINDOW];
     let mut candidates = [0u64; WINDOW / 64];
     let mut matches = vec![(0, 0.0 as Score); WINDOW];
+    let mut filter_docs: Vec<DocId> = Vec::new();
+    let mut filter_indices: Vec<usize> = Vec::new();
+    let mut filter_mask: Vec<TinySet> = Vec::new();
     let mut start = terms
         .iter()
         .map(|t| t.scorer.doc())
@@ -165,35 +175,21 @@ pub(super) fn block_maxscore_filtered<F: DocSet + ?Sized>(
                 let scorer = &mut strong[0].scorer;
                 while scorer.doc() < window_end {
                     let doc = scorer.doc();
-                    match filter_stage {
-                        WindowFilterStage::None | WindowFilterStage::AfterWeakAndThreshold => {
+                    if filter_stage == WindowFilterStage::BeforeScore {
+                        if filter
+                            .as_deref_mut()
+                            .is_none_or(|f| f.seek_danger(doc) == SeekDangerResult::Found)
+                        {
                             let score = scorer.score();
                             let keep = score as f64 * rounding + weak_bound > inner_threshold;
                             matches[matches_len] = (doc, score);
                             matches_len += keep as usize;
                         }
-                        WindowFilterStage::AfterStrongBound => {
-                            let score = scorer.score();
-                            if score as f64 * rounding + weak_bound > inner_threshold
-                                && filter
-                                    .as_deref_mut()
-                                    .is_none_or(|f| f.seek_danger(doc) == SeekDangerResult::Found)
-                            {
-                                matches[matches_len] = (doc, score);
-                                matches_len += 1;
-                            }
-                        }
-                        WindowFilterStage::BeforeScore => {
-                            if filter
-                                .as_deref_mut()
-                                .is_none_or(|f| f.seek_danger(doc) == SeekDangerResult::Found)
-                            {
-                                let score = scorer.score();
-                                let keep = score as f64 * rounding + weak_bound > inner_threshold;
-                                matches[matches_len] = (doc, score);
-                                matches_len += keep as usize;
-                            }
-                        }
+                    } else {
+                        let score = scorer.score();
+                        let keep = score as f64 * rounding + weak_bound > inner_threshold;
+                        matches[matches_len] = (doc, score);
+                        matches_len += keep as usize;
                     }
                     scorer.advance();
                 }
@@ -219,20 +215,39 @@ pub(super) fn block_maxscore_filtered<F: DocSet + ?Sized>(
                         if score as f64 * rounding + weak_bound <= inner_threshold {
                             continue;
                         }
-                        let in_filter = match filter_stage {
-                            WindowFilterStage::None | WindowFilterStage::AfterWeakAndThreshold => {
-                                true
-                            }
-                            WindowFilterStage::BeforeScore
-                            | WindowFilterStage::AfterStrongBound => filter
+                        let in_filter = if filter_stage == WindowFilterStage::BeforeScore {
+                            filter
                                 .as_deref_mut()
-                                .is_none_or(|f| f.seek_danger(doc) == SeekDangerResult::Found),
+                                .is_none_or(|f| f.seek_danger(doc) == SeekDangerResult::Found)
+                        } else {
+                            true
                         };
                         if in_filter {
                             matches[matches_len] = (doc, score);
                             matches_len += 1;
                         }
                     }
+                }
+            }
+            if filter_stage == WindowFilterStage::AfterStrongBound && matches_len > 0 {
+                if let Some(ref mut f) = filter {
+                    filter_docs.clear();
+                    filter_docs.extend(matches[..matches_len].iter().map(|&(doc, _)| doc));
+                    let words = matches_len.div_ceil(64);
+                    if filter_mask.len() < words {
+                        filter_mask.resize(words, TinySet::EMPTY);
+                    }
+                    fill_all_candidates_mask(matches_len, &mut filter_mask[..words]);
+                    f.seek_danger_batch(&filter_docs, &mut filter_mask[..words]);
+                    let mut write = 0usize;
+                    for (word_idx, &word) in filter_mask[..words].iter().enumerate() {
+                        let base_idx = word_idx * 64;
+                        for bit in word {
+                            matches[write] = matches[base_idx + bit as usize];
+                            write += 1;
+                        }
+                    }
+                    matches_len = write;
                 }
             }
             // Add weak terms in reverse order, pruning with the bounds of the unvisited prefix.
@@ -255,23 +270,58 @@ pub(super) fn block_maxscore_filtered<F: DocSet + ?Sized>(
                 }
                 matches_len = len;
             }
-            for &(doc, score) in &matches[..matches_len] {
-                let final_score = score + filter_boost;
-                if final_score > threshold {
-                    if filter_stage == WindowFilterStage::AfterWeakAndThreshold
-                        && filter
-                            .as_deref_mut()
-                            .is_some_and(|f| f.seek_danger(doc) != SeekDangerResult::Found)
-                    {
-                        continue;
+            if filter_stage == WindowFilterStage::AfterWeakAndThreshold {
+                if let Some(ref mut f) = filter {
+                    let mut cursor = 0usize;
+                    while cursor < matches_len {
+                        // While `threshold == Score::MIN` (initial top-k warmup), probe in 64-doc
+                        // chunks so the heap threshold rises before filtering the whole window.
+                        let chunk_cap = if threshold == Score::MIN {
+                            64
+                        } else {
+                            matches_len - cursor
+                        };
+                        filter_docs.clear();
+                        filter_indices.clear();
+                        while cursor < matches_len && filter_docs.len() < chunk_cap {
+                            let (doc, score) = matches[cursor];
+                            if score + filter_boost > threshold {
+                                filter_docs.push(doc);
+                                filter_indices.push(cursor);
+                            }
+                            cursor += 1;
+                        }
+                        if filter_docs.is_empty() {
+                            break;
+                        }
+                        let n = filter_docs.len();
+                        let words = n.div_ceil(64);
+                        if filter_mask.len() < words {
+                            filter_mask.resize(words, TinySet::EMPTY);
+                        }
+                        fill_all_candidates_mask(n, &mut filter_mask[..words]);
+                        f.seek_danger_batch(&filter_docs, &mut filter_mask[..words]);
+                        for (word_idx, &word) in filter_mask[..words].iter().enumerate() {
+                            let base_idx = word_idx * 64;
+                            for bit in word {
+                                let (doc, score) = matches[filter_indices[base_idx + bit as usize]];
+                                let final_score = score + filter_boost;
+                                if final_score > threshold {
+                                    threshold = callback(doc, final_score);
+                                    inner_threshold =
+                                        compute_inner_threshold(threshold, filter_boost);
+                                }
+                            }
+                        }
                     }
-                    threshold = callback(doc, final_score);
-                    inner_threshold = if threshold == Score::MIN {
-                        Score::MIN as f64
-                    } else {
-                        (threshold - filter_boost) as f64
-                            - (Score::EPSILON * threshold.abs()) as f64
-                    };
+                }
+            } else {
+                for &(doc, score) in &matches[..matches_len] {
+                    let final_score = score + filter_boost;
+                    if final_score > threshold {
+                        threshold = callback(doc, final_score);
+                        inner_threshold = compute_inner_threshold(threshold, filter_boost);
+                    }
                 }
             }
         }
