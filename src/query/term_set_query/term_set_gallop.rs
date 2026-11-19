@@ -207,8 +207,11 @@ impl DocSet for TermSetGallopDocSet {
         self.non_null_end.saturating_sub(self.non_null_start)
     }
 
-    fn cost(&self) -> u64 {
-        self.size_hint() as u64
+    fn cost(&self) -> crate::DocSetCost {
+        crate::DocSetCost::new(
+            crate::DriveCost(self.size_hint() as u64),
+            crate::ProbeCost::GALLOP,
+        )
     }
 }
 

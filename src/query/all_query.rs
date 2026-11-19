@@ -137,6 +137,13 @@ impl DocSet for AllScorer {
     fn size_hint(&self) -> u32 {
         self.max_doc
     }
+
+    fn cost(&self) -> crate::DocSetCost {
+        crate::DocSetCost::new(
+            crate::DriveCost(self.max_doc as u64),
+            crate::ProbeCost::BITSET,
+        )
+    }
 }
 
 impl Scorer for AllScorer {

@@ -231,7 +231,7 @@ impl<TPostings: Postings> DocSet for PhrasePrefixScorer<TPostings> {
         self.phrase_scorer.size_hint()
     }
 
-    fn cost(&self) -> u64 {
+    fn cost(&self) -> crate::DocSetCost {
         self.phrase_scorer.cost()
     }
 }

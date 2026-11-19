@@ -405,8 +405,16 @@ fn seek_danger_implementation_inventory() {
     }
     // Trait default (used by TermScorer) and the Box / &mut forwarding impls.
     covered.insert("docset.rs".to_string(), 3);
-    // ProbeDocs is a test-only spy for routed candidate filtering.
+    // Test-only spies for routed vector candidate filtering and probe-cost unit tests.
     covered.insert("vector/filter.rs".to_string(), 1);
+    *covered
+        .entry("query/intersection.rs".to_string())
+        .or_insert(0) += 1;
+    covered.insert(
+        "query/boolean_query/block_wand_intersection.rs".to_string(),
+        1,
+    );
+    covered.insert("query/boolean_query/block_wand_union.rs".to_string(), 1);
     assert_eq!(
         found, covered,
         "Register new seek_danger implementations in seek_danger_tests.rs and add their \

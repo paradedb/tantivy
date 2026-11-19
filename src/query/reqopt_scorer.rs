@@ -69,7 +69,7 @@ where
         self.req_scorer.size_hint()
     }
 
-    fn cost(&self) -> u64 {
+    fn cost(&self) -> crate::DocSetCost {
         self.req_scorer.cost()
     }
 }
