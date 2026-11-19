@@ -148,6 +148,13 @@ impl DocSet for BitmapDocSet {
         self.doc_freq
     }
 
+    fn cost(&self) -> crate::DocSetCost {
+        crate::DocSetCost::new(
+            crate::DriveCost(self.size_hint() as u64),
+            crate::ProbeCost::BITSET,
+        )
+    }
+
     fn has_fast_bitset(&self) -> bool {
         true
     }

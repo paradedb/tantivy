@@ -146,4 +146,8 @@ impl DocSet for BasicPruningScorer {
     fn size_hint(&self) -> u32 {
         self.scorer.size_hint()
     }
+
+    fn cost(&self) -> crate::DocSetCost {
+        self.scorer.cost()
+    }
 }

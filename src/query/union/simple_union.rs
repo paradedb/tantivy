@@ -107,8 +107,15 @@ impl<TDocSet: DocSet> DocSet for SimpleUnion<TDocSet> {
             .unwrap_or(0u32)
     }
 
-    fn cost(&self) -> u64 {
-        self.docsets.iter().map(|docset| docset.cost()).sum()
+    fn cost(&self) -> crate::DocSetCost {
+        let mut drive = crate::DriveCost::ZERO;
+        let mut probe = crate::ProbeCost::ZERO;
+        for docset in &self.docsets {
+            let cost = docset.cost();
+            drive = drive.saturating_add(cost.drive);
+            probe = probe.saturating_add(cost.probe);
+        }
+        crate::DocSetCost::new(drive, probe)
     }
 
     fn count_including_deleted(&mut self) -> u32 {
