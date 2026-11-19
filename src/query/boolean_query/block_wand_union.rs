@@ -1,12 +1,23 @@
 use std::ops::{Deref, DerefMut};
 
-use crate::docset::SeekDangerResult;
+use crate::docset::{ProbeCost, SeekDangerResult};
 use crate::query::scorer::{BlockMaxScorer, PruningScorer};
 use crate::query::term_query::TermScorer;
 #[cfg(test)]
 use crate::query::weight::for_each_pruning_scorer;
 use crate::query::Scorer;
 use crate::{DocId, DocSet, Score, TERMINATED};
+
+/// Where an embedded WAND filter is evaluated relative to alignment and scoring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FilterPlacement {
+    /// Probe the filter before aligning secondary scorers or computing BM25 scores
+    /// (beneficial for low-probe-cost filters such as bitsets).
+    Early,
+    /// Align/score terms and confirm the score beats the current threshold before probing
+    /// the filter (beneficial when probing the filter is more expensive than alignment/scoring).
+    AfterScore,
+}
 
 /// Seeks `scorer` to `filter.doc()` if it is behind, so the filter is never
 /// asked about a doc below its current one: `PhraseScorer::seek_danger` asserts
@@ -234,6 +245,7 @@ impl<T: BlockMaxScorer> DerefMut for TermScorerWithMaxScore<T> {
 pub struct BlockWandUnionScorer<T: BlockMaxScorer = TermScorer> {
     scorers: Vec<TermScorerWithMaxScore<T>>,
     filter: Option<Box<dyn DocSet>>,
+    filter_placement: FilterPlacement,
     filter_boost: Score,
     threshold: Score,
     current: (DocId, Score),
@@ -278,9 +290,20 @@ impl<T: BlockMaxScorer> BlockWandUnionScorer<T> {
         // At this point we need to ensure that the scorers are sorted!
         scorers.sort_by_key(|scorer| scorer.doc());
 
+        let align_and_score_cost = (scorers.len().saturating_sub(1) as u64)
+            .saturating_mul(ProbeCost::TERM.scalar())
+            .saturating_add(scorers.len() as u64);
+        let filter_placement = match filter.as_ref() {
+            Some(f) if f.cost().probe.scalar() > align_and_score_cost => {
+                FilterPlacement::AfterScore
+            }
+            _ => FilterPlacement::Early,
+        };
+
         let mut scorer = Self {
             scorers,
             filter,
+            filter_placement,
             filter_boost,
             threshold,
             current: (0, Score::MIN),
@@ -340,26 +363,29 @@ impl<T: BlockMaxScorer> DocSet for BlockWandUnionScorer<T> {
             }
 
             // Embedded Filter Check (Early Rejection)
-            // Test filter membership on pivot_doc BEFORE aligning any secondary scorers!
-            if let Some(ref mut filter) = self.filter {
-                match filter.seek_danger(pivot_doc) {
-                    SeekDangerResult::Found => {}
-                    SeekDangerResult::SeekLowerBound(bound) => {
-                        // Crucial win: We DO NOT call align_scorers on secondary scorers.
-                        // We advance or seek the pivot scorer past the non-matching document or
-                        // range.
-                        if bound > pivot_doc + 1 {
-                            self.scorers[before_pivot_len].seek(bound);
-                        } else {
-                            self.scorers[before_pivot_len].advance();
+            // Test filter membership on pivot_doc BEFORE aligning any secondary scorers
+            // when the filter is cheaper to probe than aligning and scoring.
+            if self.filter_placement == FilterPlacement::Early {
+                if let Some(ref mut filter) = self.filter {
+                    match filter.seek_danger(pivot_doc) {
+                        SeekDangerResult::Found => {}
+                        SeekDangerResult::SeekLowerBound(bound) => {
+                            // Crucial win: We DO NOT call align_scorers on secondary scorers.
+                            // We advance or seek the pivot scorer past the non-matching document or
+                            // range.
+                            if bound > pivot_doc + 1 {
+                                self.scorers[before_pivot_len].seek(bound);
+                            } else {
+                                self.scorers[before_pivot_len].advance();
+                            }
+                            if self.scorers[before_pivot_len].doc() == TERMINATED {
+                                self.scorers.swap_remove(before_pivot_len);
+                                self.scorers.sort_by_key(|scorer| scorer.doc());
+                            } else {
+                                restore_ordering(&mut self.scorers, before_pivot_len);
+                            }
+                            continue;
                         }
-                        if self.scorers[before_pivot_len].doc() == TERMINATED {
-                            self.scorers.swap_remove(before_pivot_len);
-                            self.scorers.sort_by_key(|scorer| scorer.doc());
-                        } else {
-                            restore_ordering(&mut self.scorers, before_pivot_len);
-                        }
-                        continue;
                     }
                 }
             }
@@ -383,10 +409,23 @@ impl<T: BlockMaxScorer> DocSet for BlockWandUnionScorer<T> {
                 .sum();
 
             if score > inner_threshold {
-                self.current = (pivot_doc, score + self.filter_boost);
-                // let's advance all of the scorers that are currently positioned on the pivot.
+                let in_filter = if self.filter_placement == FilterPlacement::AfterScore {
+                    match self.filter {
+                        Some(ref mut filter) => {
+                            filter.seek_danger(pivot_doc) == SeekDangerResult::Found
+                        }
+                        None => true,
+                    }
+                } else {
+                    true
+                };
+                // Advance all scorers positioned on the pivot before returning or continuing so
+                // future pivot_docs are strictly greater than this one.
                 advance_all_scorers_on_pivot(&mut self.scorers, pivot_len);
-                return pivot_doc;
+                if in_filter {
+                    self.current = (pivot_doc, score + self.filter_boost);
+                    return pivot_doc;
+                }
             } else {
                 // let's advance all of the scorers that are currently positioned on the pivot.
                 advance_all_scorers_on_pivot(&mut self.scorers, pivot_len);
@@ -432,6 +471,7 @@ impl<T: BlockMaxScorer> DocSet for BlockWandUnionScorer<T> {
 pub struct BlockWandSingleScorer<T: BlockMaxScorer = TermScorer> {
     scorer: T,
     filter: Option<Box<dyn DocSet>>,
+    filter_placement: FilterPlacement,
     filter_boost: Score,
     threshold: Score,
     current: (DocId, Score),
@@ -465,9 +505,16 @@ impl<T: BlockMaxScorer> BlockWandSingleScorer<T> {
         if let Some(filter) = &filter {
             seek_to_filter_start(&mut term_scorer, filter.as_ref());
         }
+        let filter_placement = match filter.as_ref() {
+            Some(f) if f.cost().probe.scalar() > ProbeCost::BITSET.scalar() => {
+                FilterPlacement::AfterScore
+            }
+            _ => FilterPlacement::Early,
+        };
         let mut scorer = Self {
             scorer: term_scorer,
             filter,
+            filter_placement,
             filter_boost,
             threshold,
             current: (0, Score::MIN),
@@ -537,16 +584,33 @@ impl<T: BlockMaxScorer> DocSet for BlockWandSingleScorer<T> {
                 return TERMINATED;
             }
             loop {
-                let in_filter = match self.filter {
-                    Some(ref mut filter) => filter.seek_danger(doc) == SeekDangerResult::Found,
-                    None => true,
-                };
-                if in_filter {
+                if self.filter_placement == FilterPlacement::AfterScore {
                     let score = self.scorer.score();
                     if score > inner_threshold {
-                        self.current = (doc, score + self.filter_boost);
-                        self.scorer.advance();
-                        break 'outer;
+                        let in_filter = match self.filter {
+                            Some(ref mut filter) => {
+                                filter.seek_danger(doc) == SeekDangerResult::Found
+                            }
+                            None => true,
+                        };
+                        if in_filter {
+                            self.current = (doc, score + self.filter_boost);
+                            self.scorer.advance();
+                            break 'outer;
+                        }
+                    }
+                } else {
+                    let in_filter = match self.filter {
+                        Some(ref mut filter) => filter.seek_danger(doc) == SeekDangerResult::Found,
+                        None => true,
+                    };
+                    if in_filter {
+                        let score = self.scorer.score();
+                        if score > inner_threshold {
+                            self.current = (doc, score + self.filter_boost);
+                            self.scorer.advance();
+                            break 'outer;
+                        }
                     }
                 }
                 debug_assert!(doc <= self.scorer.last_doc_in_block());
@@ -605,7 +669,7 @@ mod tests {
     use crate::query::term_query::TermScorer;
     use crate::query::weight::for_each_pruning_scorer;
     use crate::query::{Bm25Weight, BufferedUnionScorer, Scorer};
-    use crate::{DocId, DocSet, Score, TERMINATED};
+    use crate::{DocId, DocSet, ProbeCost, Score, SeekDangerResult, TERMINATED};
 
     #[test]
     fn test_block_wand_single_seek_termination() {
@@ -715,16 +779,77 @@ mod tests {
         ]
     }
 
+    struct CostedFilter {
+        inner: crate::query::VecDocSet,
+        probe: ProbeCost,
+        probes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CostedFilter {
+        fn new(
+            docs: Vec<DocId>,
+            probe: ProbeCost,
+            probes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ) -> Self {
+            Self {
+                inner: crate::query::VecDocSet::from(docs),
+                probe,
+                probes,
+            }
+        }
+    }
+
+    impl DocSet for CostedFilter {
+        fn advance(&mut self) -> DocId {
+            self.inner.advance()
+        }
+
+        fn seek(&mut self, target: DocId) -> DocId {
+            self.inner.seek(target)
+        }
+
+        fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.seek_danger(target)
+        }
+
+        fn doc(&self) -> DocId {
+            self.inner.doc()
+        }
+
+        fn size_hint(&self) -> u32 {
+            self.inner.size_hint()
+        }
+
+        fn cost(&self) -> crate::DocSetCost {
+            crate::DocSetCost::new(crate::DriveCost(self.inner.size_hint() as u64), self.probe)
+        }
+    }
+
     fn compute_checkpoints(
-        mut term_scorers: Vec<TermScorer>,
+        term_scorers: Vec<TermScorer>,
         n: usize,
         max_doc: u32,
         mode: PruningMode,
         filter_docs: Option<&[DocId]>,
     ) -> Vec<(DocId, Score)> {
+        compute_checkpoints_with_probe(term_scorers, n, max_doc, mode, filter_docs, ProbeCost::TERM)
+            .0
+    }
+
+    fn compute_checkpoints_with_probe(
+        mut term_scorers: Vec<TermScorer>,
+        n: usize,
+        max_doc: u32,
+        mode: PruningMode,
+        filter_docs: Option<&[DocId]>,
+        filter_probe: ProbeCost,
+    ) -> (Vec<(DocId, Score)>, usize) {
         let mut heap: BinaryHeap<Float> = BinaryHeap::with_capacity(n);
         let mut checkpoints: Vec<(DocId, Score)> = Vec::new();
         let mut limit: Score = 0.0;
+        let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let callback = &mut |doc, score| {
             heap.push(Float(score));
@@ -742,11 +867,18 @@ mod tests {
 
         match mode {
             PruningMode::NoPruning => {
-                return compute_checkpoints_manual(term_scorers, n, max_doc, filter_docs);
+                return (
+                    compute_checkpoints_manual(term_scorers, n, max_doc, filter_docs),
+                    0,
+                );
             }
             PruningMode::Wand => {
                 if let Some(docs) = filter_docs {
-                    let filter = Box::new(crate::query::VecDocSet::from(docs.to_vec()));
+                    let filter = Box::new(CostedFilter::new(
+                        docs.to_vec(),
+                        filter_probe,
+                        std::sync::Arc::clone(&probes),
+                    ));
                     if term_scorers.len() == 1 {
                         let mut scorer = BlockWandSingleScorer::with_filter(
                             term_scorers.pop().unwrap(),
@@ -770,7 +902,11 @@ mod tests {
             }
             PruningMode::MaxScore(window) => {
                 if let Some(docs) = filter_docs {
-                    let mut filter = crate::query::VecDocSet::from(docs.to_vec());
+                    let mut filter = CostedFilter::new(
+                        docs.to_vec(),
+                        filter_probe,
+                        std::sync::Arc::clone(&probes),
+                    );
                     super::super::block_maxscore::block_maxscore_filtered(
                         term_scorers,
                         Score::MIN,
@@ -789,7 +925,10 @@ mod tests {
                 }
             }
         }
-        checkpoints
+        (
+            checkpoints,
+            probes.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     fn compute_checkpoints_manual(
@@ -928,6 +1067,10 @@ mod tests {
                 gen_term_scorers(10),
             ],
             test_filter in arb_test_filter(),
+            filter_probe in prop_oneof![
+                Just(ProbeCost::BITSET),
+                Just(ProbeCost::VECTORIZED_PREDICATE),
+            ],
         ) {
             let (term_scorers, max_doc) = make_term_scorers(&posting_lists, &fieldnorms);
             let filter_docs = test_filter.to_docs(max_doc);
@@ -941,19 +1084,108 @@ mod tests {
                     PruningMode::MaxScore(4096),
                     PruningMode::MaxScore(super::super::block_maxscore::MIN_BOUND_WINDOW),
                 ] {
-                    let actual = compute_checkpoints(term_scorers.clone(), top_k, max_doc, mode, filter_docs.as_deref());
-                    assert_eq!(actual.len(), no_pruning.len(), "{mode:?}, k={top_k}, filter={test_filter:?}");
+                    let (actual, _) = compute_checkpoints_with_probe(
+                        term_scorers.clone(),
+                        top_k,
+                        max_doc,
+                        mode,
+                        filter_docs.as_deref(),
+                        filter_probe,
+                    );
+                    assert_eq!(actual.len(), no_pruning.len(), "{mode:?}, k={top_k}, filter={test_filter:?}, probe={filter_probe:?}");
                     for (&(doc, score), &(expected_doc, expected_score)) in
                         actual.iter().zip(&no_pruning)
                     {
-                        assert_eq!(doc, expected_doc, "{mode:?}, k={top_k}, filter={test_filter:?}");
+                        assert_eq!(doc, expected_doc, "{mode:?}, k={top_k}, filter={test_filter:?}, probe={filter_probe:?}");
                         assert!(
                             nearly_equals(score, expected_score),
-                            "{mode:?}, k={top_k}, filter={test_filter:?}: {score} != {expected_score}"
+                            "{mode:?}, k={top_k}, filter={test_filter:?}, probe={filter_probe:?}: {score} != {expected_score}"
                         );
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn high_probe_cost_defers_filter_probes_across_wand_and_maxscore() {
+        let num_docs = 8_192u32;
+        let fieldnorms = vec![10u32; num_docs as usize];
+        let make_scorer = |postings: &[(DocId, u32)]| {
+            let bm25 = Bm25Weight::for_one_term(
+                postings.len() as u64,
+                num_docs as u64,
+                10.0,
+                Bm25Params::default(),
+            );
+            TermScorer::create_for_test(postings, &fieldnorms, bm25)
+        };
+        // Dense terms with a few high-TF docs at the start so the top-k threshold warms quickly
+        // while most remaining docs fall below threshold.
+        let postings_a: Vec<(DocId, u32)> = (0..num_docs)
+            .step_by(2)
+            .map(|d| (d, if d < 64 { 20 } else { 1 }))
+            .collect();
+        let postings_b: Vec<(DocId, u32)> = (0..num_docs)
+            .step_by(3)
+            .map(|d| (d, if d < 64 { 20 } else { 1 }))
+            .collect();
+        let postings_c: Vec<(DocId, u32)> = (0..num_docs)
+            .step_by(5)
+            .map(|d| (d, if d < 64 { 20 } else { 1 }))
+            .collect();
+        let postings_d: Vec<(DocId, u32)> = (0..num_docs)
+            .step_by(7)
+            .map(|d| (d, if d < 64 { 20 } else { 1 }))
+            .collect();
+        let filter_docs: Vec<DocId> = (0..num_docs).filter(|d| d % 4 != 3).collect();
+
+        let cases: [(&str, Vec<TermScorer>, PruningMode); 3] = [
+            (
+                "single_wand",
+                vec![make_scorer(&postings_a)],
+                PruningMode::Wand,
+            ),
+            (
+                "union_wand",
+                vec![make_scorer(&postings_a), make_scorer(&postings_b)],
+                PruningMode::Wand,
+            ),
+            (
+                "block_maxscore",
+                vec![
+                    make_scorer(&postings_a),
+                    make_scorer(&postings_b),
+                    make_scorer(&postings_c),
+                    make_scorer(&postings_d),
+                ],
+                PruningMode::MaxScore(super::super::block_maxscore::MIN_BOUND_WINDOW),
+            ),
+        ];
+
+        for (name, scorers, mode) in cases {
+            let (early_cp, early_probes) = compute_checkpoints_with_probe(
+                scorers.clone(),
+                5,
+                num_docs,
+                mode,
+                Some(&filter_docs),
+                ProbeCost::BITSET,
+            );
+            let (deferred_cp, deferred_probes) = compute_checkpoints_with_probe(
+                scorers,
+                5,
+                num_docs,
+                mode,
+                Some(&filter_docs),
+                ProbeCost::VECTORIZED_PREDICATE,
+            );
+            assert_eq!(early_cp.len(), deferred_cp.len(), "{name}");
+            assert!(
+                deferred_probes < early_probes,
+                "{name}: expected deferred filter probes ({deferred_probes}) < early \
+                 ({early_probes})"
+            );
         }
     }
 

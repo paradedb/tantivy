@@ -590,8 +590,15 @@ impl DocSet for CachedDictPredicateDocSet {
             .saturating_sub(self.doc_id.saturating_add(1))
     }
 
-    fn cost(&self) -> u64 {
-        u64::MAX / 2
+    fn cost(&self) -> crate::DocSetCost {
+        let probe = if matches!(self.mode, DictLookupMode::FullyPopulated) {
+            crate::ProbeCost::FAST_FIELD_LOOKUP
+        } else {
+            crate::ProbeCost::VECTORIZED_PREDICATE
+        };
+        let drive =
+            crate::DriveCost(u64::from(self.bytes_col.num_rows()).saturating_mul(probe.per_doc.0));
+        crate::DocSetCost::new(drive, probe)
     }
 }
 
@@ -929,8 +936,13 @@ impl DocSet for PredicateColumnDocSet {
             .saturating_sub(self.doc_id.max(self.doc_bounds.start).saturating_add(1))
     }
 
-    fn cost(&self) -> u64 {
-        u64::MAX / 2
+    fn cost(&self) -> crate::DocSetCost {
+        let window_docs = u64::from(self.doc_bounds.end.saturating_sub(self.doc_bounds.start));
+        let probe = crate::ProbeCost::VECTORIZED_PREDICATE;
+        crate::DocSetCost::new(
+            crate::DriveCost(window_docs.saturating_mul(probe.per_doc.0)),
+            probe,
+        )
     }
 }
 

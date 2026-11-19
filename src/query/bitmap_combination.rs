@@ -18,7 +18,7 @@
 
 use common::TinySet;
 
-use crate::docset::{BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW};
+use crate::docset::{DocSetCost, DriveCost, ProbeCost, BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW};
 use crate::query::size_hint::{estimate_intersection, estimate_union};
 use crate::query::Scorer;
 use crate::{DocId, DocSet, Score, TERMINATED};
@@ -39,7 +39,7 @@ pub(crate) struct BitmapCombination {
     base: DocId,
     doc: DocId,
     size_hint: u32,
-    cost: u64,
+    cost: DocSetCost,
 }
 
 impl BitmapCombination {
@@ -50,7 +50,7 @@ impl BitmapCombination {
     ) -> Self {
         assert!(!children.is_empty());
         if matches!(operation, BitmapOperation::Intersection) {
-            children.sort_by_key(|child| (child.cost(), child.size_hint()));
+            children.sort_by_key(|child| (child.cost().drive, child.size_hint()));
         }
         let sizes = children.iter().map(|child| child.size_hint());
         let size_hint = match operation {
@@ -58,13 +58,23 @@ impl BitmapCombination {
             BitmapOperation::Intersection => estimate_intersection(sizes, num_docs),
             BitmapOperation::Exclude => children[0].size_hint(),
         };
-        let cost = match operation {
-            BitmapOperation::Union => children.iter().map(|child| child.cost()).sum(),
-            BitmapOperation::Intersection => {
-                children.iter().map(|child| child.cost()).min().unwrap()
-            }
-            BitmapOperation::Exclude => children[0].cost(),
+        let drive = match operation {
+            BitmapOperation::Union => children
+                .iter()
+                .map(|child| child.cost().drive)
+                .fold(DriveCost::ZERO, DriveCost::saturating_add),
+            BitmapOperation::Intersection => children
+                .iter()
+                .map(|child| child.cost().drive)
+                .min()
+                .unwrap(),
+            BitmapOperation::Exclude => children[0].cost().drive,
         };
+        let probe = children
+            .iter()
+            .map(|child| child.cost().probe)
+            .fold(ProbeCost::ZERO, ProbeCost::saturating_add);
+        let cost = DocSetCost::new(drive, probe);
         let mut result = Self {
             children,
             operation,
@@ -187,7 +197,7 @@ impl DocSet for BitmapCombination {
     fn size_hint(&self) -> u32 {
         self.size_hint
     }
-    fn cost(&self) -> u64 {
+    fn cost(&self) -> DocSetCost {
         self.cost
     }
     fn has_fast_bitset(&self) -> bool {
@@ -291,8 +301,8 @@ mod tests {
         fn size_hint(&self) -> u32 {
             self.docs.size_hint()
         }
-        fn cost(&self) -> u64 {
-            self.cost
+        fn cost(&self) -> DocSetCost {
+            DocSetCost::new(DriveCost(self.cost), ProbeCost::TERM)
         }
         fn fill_bitset_block(&mut self, base: DocId, mask: &mut Block) -> DocId {
             self.fills.lock().unwrap().push(base);

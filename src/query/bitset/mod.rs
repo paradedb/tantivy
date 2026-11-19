@@ -155,6 +155,13 @@ impl DocSet for BitSetDocSet {
     fn size_hint(&self) -> u32 {
         self.docs.len() as u32
     }
+
+    fn cost(&self) -> crate::DocSetCost {
+        crate::DocSetCost::new(
+            crate::DriveCost(self.size_hint() as u64),
+            crate::ProbeCost::BITSET,
+        )
+    }
 }
 
 /// Open the posting list for `term_info` and OR every matched doc into

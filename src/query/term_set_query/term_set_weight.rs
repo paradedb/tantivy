@@ -1083,6 +1083,13 @@ impl<T: Copy + PartialOrd + std::fmt::Debug + Send + Sync + 'static, S: ValueMem
     fn size_hint(&self) -> u32 {
         self.max_doc.saturating_sub(self.doc_id.saturating_add(1))
     }
+
+    fn cost(&self) -> crate::DocSetCost {
+        crate::DocSetCost::new(
+            crate::DriveCost(u64::from(self.size_hint())),
+            crate::ProbeCost::FAST_FIELD_LOOKUP,
+        )
+    }
 }
 
 #[cfg(test)]
