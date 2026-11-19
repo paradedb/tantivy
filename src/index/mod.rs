@@ -12,7 +12,7 @@ mod segment_component;
 mod segment_id;
 mod segment_reader;
 
-pub(crate) use self::index::{builtin_plugins, list_segment_files};
+pub(crate) use self::index::{list_segment_files, BUILTIN_PLUGIN_REFS};
 pub use self::index::{Index, IndexBuilder};
 pub use self::index_meta::{
     BitmapPostingsConfig, Bm25Params, DeleteMeta, IndexMeta, IndexSettings, IndexSortByField,

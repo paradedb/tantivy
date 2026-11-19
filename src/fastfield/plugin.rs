@@ -157,7 +157,7 @@ impl PluginWriter for FastFieldsPluginWriter {
 
 fn convert_to_merge_order(
     columnars: &[&ColumnarReader],
-    doc_id_mapping: SegmentDocIdMapping,
+    doc_id_mapping: SegmentDocIdMapping<'_>,
 ) -> MergeRowOrder {
     match doc_id_mapping.mapping_type() {
         MappingType::Stacked => MergeRowOrder::Stack(StackMergeOrder::stack(columnars)),
@@ -172,7 +172,7 @@ fn convert_to_merge_order(
                 .collect();
             MergeRowOrder::Shuffled(ShuffleMergeOrder {
                 new_row_id_to_old_row_id,
-                alive_bitsets: doc_id_mapping.alive_bitsets,
+                alive_bitsets: doc_id_mapping.alive_bitsets.into_iter().collect(),
             })
         }
     }

@@ -3,6 +3,8 @@
 use std::convert::Infallible;
 use std::error::Error;
 
+use allocator_api2::alloc::Allocator;
+use allocator_api2::vec::Vec as AllocVec;
 use common::{BitSet, ReadOnlyBitSet};
 use unwrap_infallible::UnwrapInfallible;
 
@@ -17,19 +19,47 @@ pub enum MappingType {
     Shuffled,
 }
 
+/// Type-erased allocator backing a [`SegmentDocIdMapping`].
+///
+/// The mapping is handed to plugins through
+/// [`PluginMergeContext`](crate::plugin::PluginMergeContext), and plugins are trait objects, so the
+/// mapping cannot carry the merger's allocator as a type parameter. Borrowing it as a trait object
+/// keeps the plugin API non-generic without any extra allocation.
+pub type MergeAllocator<'a> = &'a (dyn Allocator + Sync);
+
 /// Struct to provide mapping from new doc_id to old doc_id and segment.
 #[derive(Clone)]
-pub struct SegmentDocIdMapping {
-    pub(crate) new_doc_id_to_old_doc_addr: Vec<DocAddress>,
-    pub(crate) alive_bitsets: Vec<Option<ReadOnlyBitSet>>,
+pub struct SegmentDocIdMapping<'a> {
+    pub(crate) new_doc_id_to_old_doc_addr: AllocVec<DocAddress, MergeAllocator<'a>>,
+    pub(crate) alive_bitsets: AllocVec<Option<ReadOnlyBitSet>, MergeAllocator<'a>>,
     mapping_type: MappingType,
 }
 
-impl SegmentDocIdMapping {
-    pub(crate) fn new(
-        new_doc_id_to_old_doc_addr: Vec<DocAddress>,
+impl SegmentDocIdMapping<'static> {
+    /// Builds a mapping backed by the global allocator.
+    #[cfg(test)]
+    pub(crate) fn new_global(
+        new_doc_id_to_old_doc_addr: &[DocAddress],
         mapping_type: MappingType,
-        alive_bitsets: Vec<Option<ReadOnlyBitSet>>,
+        alive_bitsets: &[Option<ReadOnlyBitSet>],
+    ) -> Self {
+        let mut addrs = AllocVec::with_capacity_in(
+            new_doc_id_to_old_doc_addr.len(),
+            &allocator_api2::alloc::Global as _,
+        );
+        addrs.extend_from_slice(new_doc_id_to_old_doc_addr);
+        let mut bitsets =
+            AllocVec::with_capacity_in(alive_bitsets.len(), &allocator_api2::alloc::Global as _);
+        bitsets.extend_from_slice(alive_bitsets);
+        Self::new(addrs, mapping_type, bitsets)
+    }
+}
+
+impl<'a> SegmentDocIdMapping<'a> {
+    pub(crate) fn new(
+        new_doc_id_to_old_doc_addr: AllocVec<DocAddress, MergeAllocator<'a>>,
+        mapping_type: MappingType,
+        alive_bitsets: AllocVec<Option<ReadOnlyBitSet>, MergeAllocator<'a>>,
     ) -> Self {
         Self {
             new_doc_id_to_old_doc_addr,
