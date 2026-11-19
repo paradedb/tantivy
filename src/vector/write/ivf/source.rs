@@ -17,7 +17,7 @@ const PLANNED_READ_ROWS: usize = 4_096;
 
 /// Merge rows scanned in source storage order.
 pub(super) struct MergeVectorSource<'a> {
-    rows: Vec<(RowAddress, DocId)>,
+    rows: &'a [(RowAddress, DocId)],
     reader: RowReader<'a>,
     pub(super) reads: usize,
 }
@@ -25,7 +25,7 @@ pub(super) struct MergeVectorSource<'a> {
 impl<'a> MergeVectorSource<'a> {
     pub(super) fn new(
         readers: &'a [Arc<VectorIndexReader>],
-        rows: Vec<(RowAddress, DocId)>,
+        rows: &'a [(RowAddress, DocId)],
         dim: usize,
         cancel: &'a dyn CancelSentinel,
     ) -> Self {
@@ -40,10 +40,6 @@ impl<'a> MergeVectorSource<'a> {
             },
             reads: 0,
         }
-    }
-
-    pub(super) fn rows(&self) -> &[(RowAddress, DocId)] {
-        &self.rows
     }
 }
 

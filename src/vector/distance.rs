@@ -306,6 +306,23 @@ pub(crate) fn normalize_with_norm_squared<T: VectorElement>(
     NormalizeOutcome::Normalized
 }
 
+/// [`normalize_bytes_inplace`] for a decoded `f32` row: the same wide norm and the same per-element
+/// scaling, so the values equal the decoded bytes that function leaves.
+pub(crate) fn normalize_f32_inplace(row: &mut [f32]) -> NormalizeOutcome {
+    let norm = norm_squared_wide::<f32>(row).sqrt();
+    if norm == 0.0 {
+        return NormalizeOutcome::ZeroSkipped;
+    }
+    if !norm.is_finite() {
+        return NormalizeOutcome::NonFinite;
+    }
+    let inv = 1.0 / norm;
+    for value in row {
+        *value = (f64::from(*value) * inv) as f32;
+    }
+    NormalizeOutcome::Normalized
+}
+
 /// L2-normalizes `row` in place when `opts` requires write-time unit normalization (see
 /// [`VectorOptions::needs_normalization`]).
 ///
@@ -827,6 +844,31 @@ mod tests {
                     "got={got}, expected={expected}, v={v:?}"
                 );
             }
+        }
+    }
+
+    /// Normalizing a decoded row leaves exactly the values of normalizing its bytes and decoding
+    /// them, including the zero and non-finite rows left as they are.
+    #[test]
+    fn normalize_f32_matches_normalized_bytes() {
+        let mut rng = crate::vector::test_support::Lcg(11);
+        let mut rows: Vec<Vec<f32>> = (1..40).map(|dim| rng.vector(dim, 1e3)).collect();
+        rows.push(vec![0.0; 9]);
+        rows.push(vec![1.0, f32::INFINITY, 2.0]);
+        rows.push(vec![f32::MAX; 4]);
+        rows.push(vec![1e-30; 17]);
+        for row in rows {
+            let mut bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let from_bytes = normalize_bytes_inplace::<f32>(&mut bytes);
+            let mut values = row.clone();
+            let from_values = normalize_f32_inplace(&mut values);
+            assert_eq!(from_values, from_bytes, "{row:?}");
+            let decoded: Vec<u32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+            let values: Vec<u32> = values.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(values, decoded, "{row:?}");
         }
     }
 }

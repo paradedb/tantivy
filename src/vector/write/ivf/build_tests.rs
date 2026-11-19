@@ -6,6 +6,7 @@ use std::sync::Arc;
 use superkmeans::make_blobs;
 
 use crate::collector::TopDocs;
+use crate::directory::error::{DeleteError, OpenReadError, OpenWriteError};
 use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
 use crate::query::AllQuery;
@@ -340,7 +341,10 @@ fn ivf_build_emits_timings_log() -> crate::Result<()> {
         "stages must cover total, allowing millisecond truncation: {line}"
     );
     assert!(line.contains("train_reads="));
-    assert_eq!(field("assign_reads"), vectors);
+    // The test clusterer hands batches over through the trait's default, which assigns the whole
+    // source and then reads it again batch by batch.
+    assert_eq!(field("assign_reads"), 2 * vectors);
+    // A plain field reads its rows again for its blocks.
     assert_eq!(field("encode_reads"), vectors);
     // The Data and ExactRows parts sit inside `other`; truncating each part never exceeds the
     // truncated whole.
@@ -494,7 +498,10 @@ fn vector_info_reports_router_levels() -> crate::Result<()> {
 /// A two-segment `[1, 1]` index of 3,000 dimension-64 vectors around 24 one-hot centroids plus one
 /// centroid no vector is nearest to. Cluster 0 takes a third of the docs, so it outgrows a small
 /// group cap.
-fn parallel_encode_index(metric: Metric, replication: u8) -> crate::Result<Index> {
+fn parallel_encode_index(
+    metric: Metric,
+    replication: u8,
+) -> crate::Result<(Index, Arc<AtomicUsize>)> {
     const DIM: usize = 64;
     const CLUSTERS: usize = 24;
     let centroid = |cluster: usize| {
@@ -504,6 +511,8 @@ fn parallel_encode_index(metric: Metric, replication: u8) -> crate::Result<Index
     };
     let mut centroids: Vec<Vec<f32>> = (0..CLUSTERS).map(centroid).collect();
     centroids.push(vec![-1.0; DIM]);
+    let directory = TempFileCounter::default();
+    let opened = Arc::clone(&directory.opened);
     let mut schema = Schema::builder();
     let options = VectorOptions::new(DIM, metric).with_dtype(VectorDType::F32);
     let field = schema.add_vector_field("embedding", options.clone());
@@ -528,7 +537,7 @@ fn parallel_encode_index(metric: Metric, replication: u8) -> crate::Result<Index
             pairs: true,
         }))
         .ivf_router(RouterKind::Exact)
-        .create_in_ram()?;
+        .create(directory)?;
     let mut writer: IndexWriter = index.writer_with_num_threads(1, 50_000_000)?;
     writer.set_merge_policy(Box::new(NoMergePolicy));
     for commit in 0..2 {
@@ -550,16 +559,66 @@ fn parallel_encode_index(metric: Metric, replication: u8) -> crate::Result<Index
         }
         writer.commit()?;
     }
-    Ok(index)
+    Ok((index, opened))
+}
+
+/// A RAM directory that counts the temporary files opened in it.
+#[derive(Clone, Debug, Default)]
+struct TempFileCounter {
+    inner: crate::directory::RamDirectory,
+    opened: Arc<AtomicUsize>,
+}
+
+impl crate::directory::Directory for TempFileCounter {
+    fn get_file_handle(
+        &self,
+        path: &std::path::Path,
+    ) -> std::result::Result<Arc<dyn crate::directory::FileHandle>, OpenReadError> {
+        self.inner.get_file_handle(path)
+    }
+    fn delete(&self, path: &std::path::Path) -> std::result::Result<(), DeleteError> {
+        self.inner.delete(path)
+    }
+    fn exists(&self, path: &std::path::Path) -> std::result::Result<bool, OpenReadError> {
+        self.inner.exists(path)
+    }
+    fn open_write_inner(
+        &self,
+        path: &std::path::Path,
+    ) -> std::result::Result<crate::directory::InnerWritePtr, OpenWriteError> {
+        self.inner.open_write_inner(path)
+    }
+    fn open_temp_file(&self) -> std::io::Result<crate::directory::TempFilePtr> {
+        self.opened.fetch_add(1, Ordering::Relaxed);
+        self.inner.open_temp_file()
+    }
+    fn atomic_read(&self, path: &std::path::Path) -> std::result::Result<Vec<u8>, OpenReadError> {
+        self.inner.atomic_read(path)
+    }
+    fn atomic_write(&self, path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+        self.inner.atomic_write(path, data)
+    }
+    fn sync_directory(&self) -> std::io::Result<()> {
+        self.inner.sync_directory()
+    }
+    fn watch(
+        &self,
+        callback: crate::directory::WatchCallback,
+    ) -> crate::Result<crate::directory::WatchHandle> {
+        self.inner.watch(callback)
+    }
 }
 
 /// The `.vec` and `.centroids` bytes of `index`'s segments merged on the calling thread inside a
-/// `threads`-thread rayon pool, encode groups capped at `group_bytes` (0: the default cap).
+/// `threads`-thread rayon pool, with the encode budget at `group_bytes` (0: the default), and the
+/// runs of encoded records the merge spilled, counted through `opened`, the temporary files of
+/// `index`'s [`TempFileCounter`].
 fn merged_vector_files(
     index: &Index,
+    opened: &AtomicUsize,
     threads: usize,
     group_bytes: usize,
-) -> crate::Result<(Vec<u8>, Vec<u8>)> {
+) -> crate::Result<(Vec<u8>, Vec<u8>, usize)> {
     use std::sync::atomic::Ordering;
 
     use crate::directory::Directory;
@@ -570,6 +629,7 @@ fn merged_vector_files(
     let segments = index.searchable_segments()?;
     assert_eq!(segments.len(), 2);
     let target = index.new_segment();
+    let opened_before = opened.load(Ordering::Relaxed);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
@@ -592,34 +652,101 @@ fn merged_vector_files(
             .directory()
             .atomic_read(&target.relative_path(SegmentComponent::Custom(extension.to_string())))
     };
-    Ok((read(VEC_EXT)?, read(CENTROIDS_EXT)?))
+    let runs = opened.load(Ordering::Relaxed) - opened_before;
+    Ok((read(VEC_EXT)?, read(CENTROIDS_EXT)?, runs))
 }
 
-/// Encoding clusters in parallel writes the same bytes as encoding them one at a time: a one-thread
-/// pool, a four-thread pool, groups of a few clusters, and groups of one cluster (blocks written in
-/// cluster order by construction) all give byte-equal `.vec` and `.centroids` files, for cosine and
-/// L2 with and without replication.
+/// How rows are split into encode chunks and record runs never changes a byte: a one-thread pool,
+/// a four-thread pool, records that fit in one buffer (no run spilled), a few runs, and one run per
+/// row all give byte-equal `.vec` and `.centroids` files, for cosine and L2 with and without
+/// replication.
 #[test]
-fn parallel_encode_writes_the_same_bytes_as_serial() -> crate::Result<()> {
+fn encode_chunks_and_runs_write_the_same_bytes() -> crate::Result<()> {
     for metric in [Metric::Cosine, Metric::L2] {
         for replication in [1, 2] {
-            let index = parallel_encode_index(metric, replication)?;
-            let one_cluster_groups = merged_vector_files(&index, 4, 1)?;
-            for (threads, group_bytes) in [(1, 0), (4, 0), (4, 64 << 10)] {
-                let files = merged_vector_files(&index, threads, group_bytes)?;
-                assert!(
-                    files.0 == one_cluster_groups.0,
-                    "{metric:?} replication {replication}: .vec differs with {threads} threads, \
-                     group cap {group_bytes}"
+            let (index, opened) = parallel_encode_index(metric, replication)?;
+            let (vec, centroids, runs) = merged_vector_files(&index, &opened, 4, 1)?;
+            // One row per chunk and per run; the last run stays in memory.
+            assert_eq!(runs, 2_999, "{metric:?} replication {replication}");
+            for (threads, group_bytes, spills) in
+                [(1, 0, false), (4, 0, false), (4, 64 << 10, true)]
+            {
+                let files = merged_vector_files(&index, &opened, threads, group_bytes)?;
+                let case = format!(
+                    "{metric:?} replication {replication}, {threads} threads, budget {group_bytes}"
                 );
-                assert!(
-                    files.1 == one_cluster_groups.1,
-                    "{metric:?} replication {replication}: .centroids differs with {threads} \
-                     threads, group cap {group_bytes}"
-                );
+                assert_eq!(files.2 >= 3, spills, "{case}: {} runs", files.2);
+                assert!(files.0 == vec, "{case}: .vec differs");
+                assert!(files.1 == centroids, "{case}: .centroids differs");
             }
         }
     }
+    Ok(())
+}
+
+/// A quantized build reads each source row once for assignment and never again for its Data
+/// entry, with the built-in clusterer.
+#[test]
+fn quantized_build_reads_each_row_once_for_assign_and_encode() -> crate::Result<()> {
+    const DIM: usize = 64;
+    const ROWS: usize = 1_237;
+    let _ = log::set_logger(&CAPTURE_LOGGER);
+    log::set_max_level(log::LevelFilter::Info);
+    let values = make_blobs(ROWS, DIM, 12, false, 1.0, 10.0, 7);
+    let options = VectorOptions::new(DIM, Metric::L2);
+    let mut schema = Schema::builder();
+    let field = schema.add_vector_field("embedding", options.clone());
+    let index = Index::builder()
+        .schema(schema.build())
+        .settings(IndexSettings {
+            vector_clustering_threshold: 1,
+            vector_replication: 2,
+            vector_quantization: vec![VectorQuantizationConfig::materialize(
+                "embedding".to_string(),
+                &options,
+                vec![
+                    VectorQuantizationLayer { bits: 1, seed: 7 },
+                    VectorQuantizationLayer { bits: 4, seed: 11 },
+                ],
+            )?],
+            ..IndexSettings::default()
+        })
+        .ivf_clusterer(Arc::new(
+            SuperKMeansClusterer::new()
+                .with_target_leaf_size(50)
+                .with_memory_limit(200 * options.bytes_per_vector()),
+        ))
+        .ivf_router(RouterKind::Exact)
+        .create_in_ram()?;
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+    writer.set_merge_policy(Box::new(NoMergePolicy));
+    for chunk in values.chunks(ROWS / 2 * DIM) {
+        for vector in chunk.chunks_exact(DIM) {
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(field, vector);
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+    }
+    let before = CAPTURED_IVF_BUILD.lock().unwrap().len();
+    writer.merge(&index.searchable_segment_ids()?).wait()?;
+    writer.wait_merging_threads()?;
+    let lines: Vec<String> = CAPTURED_IVF_BUILD.lock().unwrap()[before..].to_vec();
+    let line = lines
+        .iter()
+        .find(|line| line.contains(&format!(" vectors={ROWS} ")))
+        .expect("an ivf_build line for the merge");
+    let field = |key: &str| -> usize {
+        line.split_whitespace()
+            .find_map(|part| part.strip_prefix(key)?.strip_prefix('='))
+            .unwrap_or_else(|| panic!("no {key} in {line}"))
+            .parse()
+            .unwrap()
+    };
+    assert_eq!(field("assign_reads"), ROWS, "{line}");
+    assert_eq!(field("encode_reads"), 0, "{line}");
+    assert_eq!(field("encode_read_ms"), 0, "{line}");
+    assert_eq!(field("exact_reads"), ROWS, "{line}");
     Ok(())
 }
 

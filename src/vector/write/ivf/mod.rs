@@ -1,5 +1,20 @@
 //! IVF merge: train centroids, assign every vector, encode the cluster blocks, and write the
 //! `.vec` entries and `.centroids` slots.
+//!
+//! Per vector field, `merge_ivf` runs the stages in order:
+//!
+//! 1. `train`: a sample, read through a `MergeVectorSource`, to centroids and a router.
+//! 2. `assign`: every vector to its clusters, one clusterer batch at a time. Each batch, still
+//!    decoded, goes to a plain field's row collector or a quantized field's `RowEncoder`, which
+//!    encodes the batch's rows into `records` sorted by (cluster, document). The stage returns
+//!    `ClusterRows`: source addresses or encoded records.
+//! 3. `data`: the Data entry's blocks, from rows read at those addresses or from the records.
+//! 4. The ExactRows entry of a quantized field, then the IdMap entries and `.centroids` slots
+//!    (`write`).
+//!
+//! Dependencies run one way: `data` reads what `assign` returns, `assign` drives `encode`, and
+//! both write or read `records`, which knows only the block slots and the directory's temporary
+//! files.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,7 +53,9 @@ use crate::{DocId, TantivyError};
 mod assign;
 #[cfg(test)]
 mod build_tests;
+mod data;
 mod encode;
+mod records;
 mod source;
 #[cfg(test)]
 mod tests;
@@ -75,15 +92,26 @@ struct IvfBuildTimings {
     assign: Duration,
     /// Everything outside train, router and assign; the four durations below are parts of it.
     other: Duration,
-    /// Calling-thread read, normalize and decode of the rows the Data entry's blocks hold; for
-    /// plain blocks, also the rows streamed to the entry as they are read.
+    /// Calling-thread read, normalize and decode of a plain field's cluster rows, and the rows
+    /// streamed to the Data entry as they are read.
     encode_read: Duration,
-    /// Encoding the Data entry's quantized clusters on the pool.
+    /// Copying, normalizing and encoding a quantized field's rows during the assign pass.
     encode: Duration,
-    /// Writing the Data entry: metadata, padded block columns and block offsets.
+    /// Writing the Data entry: metadata, block columns and block offsets, and a quantized field's
+    /// record runs, spilled and merged.
     data_write: Duration,
     /// The ExactRows entry, its reads and its writes.
     exact: Duration,
+}
+
+impl IvfBuildTimings {
+    /// Ends the assign stage after `elapsed`, of which `encode_and_write` was spent encoding rows
+    /// and writing their records: that part counts in `other`, with the parts it is made of.
+    fn end_assign(&mut self, elapsed: Duration, encode_and_write: Duration) {
+        let encode_and_write = encode_and_write.min(elapsed);
+        self.assign += elapsed - encode_and_write;
+        self.other += encode_and_write;
+    }
 }
 
 fn finish_stage(start: &mut Instant) -> Duration {
@@ -227,38 +255,33 @@ pub(crate) fn merge_ivf(
                 let num_centroids = trained.num_centroids;
                 timings.router += finish_stage(&mut stage_start);
 
-                let mut assigned_vectors = assign::assign(
+                let centroid_bytes = encode::encode_centroids(&merge, &centroids, num_centroids)?;
+                timings.other += finish_stage(&mut stage_start);
+
+                let assigned = assign::assign(
                     &merge,
                     clusterer,
                     &source_rows,
                     &centroids,
+                    &centroid_bytes,
                     &router,
-                    vector_count,
                     &mut timings,
                 )?;
-                timings.assign += finish_stage(&mut stage_start);
+                timings.end_assign(finish_stage(&mut stage_start), assigned.encode_and_write);
                 // The `.centroids` doc count: one primary row per document.
-                let num_present_docs = assigned_vectors
-                    .iter()
-                    .filter(|assigned| assigned.primary)
-                    .count();
-                debug_assert_eq!(num_present_docs, trained.present_vectors);
-                let cluster_offsets = assign::cluster_offsets(&mut assigned_vectors, num_centroids);
-
-                let centroid_bytes = encode::encode_centroids(&merge, &centroids, num_centroids)?;
+                debug_assert_eq!(assigned.primaries, trained.present_vectors);
                 // The stored assignment says what the blocks hold: replica rows, or one row per
                 // document when the clusterer produced no secondary.
-                let assignment = if assigned_vectors.len() > num_present_docs {
+                let assignment = if assigned.total > assigned.primaries {
                     Assignment::Soar
                 } else {
                     Assignment::Nearest
                 };
-                let locations = encode::write_data_entry(
+                let locations = data::write_data_entry(
                     &merge,
                     &mut vec_write,
-                    &assigned_vectors,
-                    &cluster_offsets,
-                    &centroid_bytes,
+                    assigned.rows,
+                    num_centroids,
                     assignment,
                     &mut timings,
                 )?;
@@ -296,7 +319,7 @@ pub(crate) fn merge_ivf(
                 write::centroid_slots(
                     &mut centroids_write,
                     &merge,
-                    num_present_docs,
+                    assigned.primaries,
                     &centroid_bytes,
                     num_centroids,
                     &router,

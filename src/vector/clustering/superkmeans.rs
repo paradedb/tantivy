@@ -11,8 +11,8 @@ use superkmeans::{
 use crate::schema::VectorOptions;
 use crate::vector::clustering::soar::SOAR_CANDIDATES;
 use crate::vector::clustering::{
-    for_each_batch, IvfAssignmentCandidate, IvfCentroids, IvfClusterer, IvfMatrix,
-    IvfTrainingVectors, VectorSource,
+    for_each_batch, AssignedBatch, AssignmentShortlist, IvfAssignmentCandidate, IvfCentroids,
+    IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
 };
 use crate::vector::distance::dot;
 use crate::{Result, TantivyError};
@@ -480,6 +480,99 @@ impl IvfClusterer for SuperKMeansClusterer {
         }
         Ok(pairs)
     }
+
+    /// Reads each row once: every batch of the memory budget is assigned as [`Self::assign`],
+    /// [`Self::assign_pairs`] or [`Self::assign_routed`] assigns it, then handed to `sink` before
+    /// the next read.
+    fn assign_batches(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        centroids: &IvfCentroids,
+        lambda: Option<f32>,
+        candidates: Option<AssignmentShortlist<'_>>,
+        sink: &mut dyn FnMut(AssignedBatch<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let dim = options.dim();
+        let IvfCentroids::F32(matrix) = centroids;
+        let assigner = match (candidates, lambda) {
+            (Some(candidates), lambda) => BatchAssigner::Routed { candidates, lambda },
+            (None, Some(lambda)) => BatchAssigner::Soar(SoarAssigner::with_candidates(
+                Matrix::new(&matrix.values, matrix.rows, matrix.dims),
+                lambda,
+                2,
+                SOAR_CANDIDATES,
+            )),
+            (None, None) => {
+                BatchAssigner::Nearest(self.assigner(dim, options.metric().clusters_by_angle()))
+            }
+        };
+        let num_rows = source.num_rows();
+        let batch_rows = self.budget_rows(options);
+        for start in (0..num_rows).step_by(batch_rows) {
+            if source.wants_cancel() {
+                return Err(TantivyError::Cancelled);
+            }
+            let end = start.saturating_add(batch_rows).min(num_rows);
+            let IvfTrainingVectors::F32(batch) = source.read_range(start..end)?;
+            let batch = checked_matrix(batch.matrix, end - start, dim)?;
+            let pairs = assigner.assign(&batch, matrix)?;
+            sink(AssignedBatch {
+                rows: start..end,
+                vectors: &batch,
+                pairs: &pairs,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// How [`SuperKMeansClusterer::assign_batches`] assigns one batch.
+enum BatchAssigner<'a> {
+    /// The nearest centroid, as [`SuperKMeansClusterer::assign`].
+    Nearest(Arc<HierarchicalSuperKMeans>),
+    /// The nearest centroid and its SOAR secondary, as [`SuperKMeansClusterer::assign_pairs`].
+    Soar(SoarAssigner<'a>),
+    /// Through the router's shortlist, as [`SuperKMeansClusterer::assign_routed`].
+    Routed {
+        candidates: AssignmentShortlist<'a>,
+        lambda: Option<f32>,
+    },
+}
+
+impl BatchAssigner<'_> {
+    fn assign(
+        &self,
+        batch: &IvfMatrix<f32>,
+        centroids: &IvfMatrix<f32>,
+    ) -> Result<Vec<(u32, Option<u32>)>> {
+        match self {
+            BatchAssigner::Nearest(kmeans) => Ok(kmeans
+                .assign(&batch.values, centroids.values.as_slice(), batch.rows)
+                .into_iter()
+                .map(|cluster| (cluster, None))
+                .collect()),
+            BatchAssigner::Soar(soar) => {
+                let (primary, secondary) = soar.assign(&batch.values, batch.rows);
+                Ok(primary
+                    .into_iter()
+                    .zip(secondary)
+                    .map(|(first, second)| (first, (second != u32::MAX).then_some(second)))
+                    .collect())
+            }
+            BatchAssigner::Routed { candidates, lambda } => batch
+                .values
+                .par_chunks_exact(batch.dims)
+                .map_init(
+                    || vec![0.0; batch.dims],
+                    |residual, vector| {
+                        let mut candidates = candidates(vector)?;
+                        assign_candidates(vector, centroids, &mut candidates, *lambda, residual)
+                    },
+                )
+                .collect(),
+        }
+    }
 }
 
 fn assign_candidates(
@@ -782,6 +875,92 @@ mod tests {
         }
         assert_eq!(source.ranges[0], 0..batch_rows);
         assert!(source.ranges.iter().all(|r| r.len() <= batch_rows));
+    }
+
+    /// `assign_batches` reads each row once and hands every scan position over once, in order,
+    /// with its rows as stored and the clusters the per-mode method assigns: nearest, SOAR pairs,
+    /// and routed through a shortlist.
+    #[test]
+    fn assign_batches_hands_over_what_the_assign_methods_return() {
+        let (n, dim, batch_rows) = (1_000, 16, 64);
+        let options = VectorOptions::new(dim, Metric::L2);
+        let values = blobs(n, dim);
+        // Fixed centroids: every 40th row.
+        let centroids = IvfCentroids::F32(IvfMatrix {
+            values: values
+                .chunks_exact(dim)
+                .step_by(40)
+                .flatten()
+                .copied()
+                .collect(),
+            rows: n.div_ceil(40),
+            dims: dim,
+        });
+        let IvfCentroids::F32(matrix) = &centroids;
+        let shortlist = |vector: &[f32]| -> crate::Result<Vec<IvfAssignmentCandidate>> {
+            Ok((0..matrix.rows as u32)
+                .map(|id| IvfAssignmentCandidate {
+                    centroid: id,
+                    distance: l2_squared(vector, &matrix.values[id as usize * dim..][..dim]),
+                })
+                .collect())
+        };
+        let shortlist: AssignmentShortlist = &shortlist;
+        let clusterer =
+            SuperKMeansClusterer::new().with_memory_limit(batch_rows * options.bytes_per_vector());
+        let mut source = VecSource::new(values.clone(), dim);
+        let nearest: Vec<(u32, Option<u32>)> = clusterer
+            .assign(&options, &mut source, &centroids)
+            .unwrap()
+            .into_iter()
+            .map(|cluster| (cluster, None))
+            .collect();
+        let pairs = clusterer
+            .assign_pairs(&options, &mut source, &centroids, 2.0)
+            .unwrap();
+        let routed = clusterer
+            .assign_routed(&options, &mut source, &centroids, Some(2.0), shortlist)
+            .unwrap();
+        assert!(pairs.iter().all(|(_, secondary)| secondary.is_some()));
+        for (mode, lambda, candidates, expected) in [
+            ("nearest", None, None, &nearest),
+            ("pairs", Some(2.0), None, &pairs),
+            ("routed", Some(2.0), Some(shortlist), &routed),
+        ] {
+            let mut source = VecSource::new(values.clone(), dim);
+            let mut handed_over = Vec::new();
+            clusterer
+                .assign_batches(
+                    &options,
+                    &mut source,
+                    &centroids,
+                    lambda,
+                    candidates,
+                    &mut |batch| {
+                        assert_eq!(batch.rows.start, handed_over.len(), "{mode}");
+                        assert_eq!(
+                            batch.vectors.values,
+                            values[batch.rows.start * dim..batch.rows.end * dim],
+                            "{mode}"
+                        );
+                        handed_over.extend_from_slice(batch.pairs);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert_eq!(&handed_over, expected, "{mode}");
+            let read: Vec<usize> = source
+                .ranges
+                .iter()
+                .flat_map(|range| range.clone())
+                .collect();
+            assert_eq!(
+                read,
+                (0..n).collect::<Vec<_>>(),
+                "{mode}: each row read once"
+            );
+            assert!(source.ranges.len() > 1, "{mode}: several batches");
+        }
     }
 
     #[test]
